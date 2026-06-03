@@ -30,9 +30,10 @@ def test_agent_commit_message_contains_trace_and_metadata():
     assert "backend_session_id: ses-1" in message
     assert "context_tokens: 100" in message
     assert "tokens_since_last_commit_input: 130" in message
-    assert "tokens_since_last_commit_output_no_reasoning: 10" in message
+    assert "tokens_since_last_commit_output: 10" in message
     assert "tokens_since_last_commit_total" not in message
     assert "tokens_since_last_commit_cache_read" not in message
+    assert "token_note" not in message
 
 
 def test_commit_message_masks_secrets_in_subject_and_trace():

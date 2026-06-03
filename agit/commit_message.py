@@ -138,15 +138,10 @@ def _token_metadata_lines(token_usage: dict[str, int | None] | None) -> list[str
         reasoning_tokens = token_usage.get("reasoning") or 0
         if input_tokens:
             lines.append(f"tokens_since_last_commit_input: {input_tokens}")
+        # Only record reasoning/thinking tokens when the backend reports them.
         if reasoning_tokens:
             lines.append(f"tokens_since_last_commit_reasoning: {reasoning_tokens}")
     else:
         lines.append("tokens_since_last_commit_input: unknown")
-    lines.append(f"tokens_since_last_commit_output_no_reasoning: {_token_value(token_usage, 'output')}")
-    lines.extend(
-        _body_lines(
-            "token_note: output excludes reasoning/thinking tokens when the backend "
-            "reports them separately; reasoning may be unavailable from OpenCode export"
-        )
-    )
+    lines.append(f"tokens_since_last_commit_output: {_token_value(token_usage, 'output')}")
     return lines

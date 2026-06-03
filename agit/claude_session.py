@@ -6,13 +6,15 @@ import re
 from pathlib import Path
 
 from agit.backends.base import TokenUsage
-from agit.session import ExportedSession, SessionTurn, turns_after
+from agit.session import ExportedSession, SessionRef, SessionTurn, turns_after
 
 __all__ = [
     "ExportedSession",
+    "SessionRef",
     "SessionTurn",
     "turns_after",
     "latest_session_id",
+    "list_sessions",
     "session_belongs_to_repo",
     "export_session",
     "parse_rows",
@@ -53,14 +55,50 @@ def _session_path(repo: Path, session_id: str) -> Path:
 
 
 def latest_session_id(repo: Path) -> str | None:
+    refs = list_sessions(repo)
+    if not refs:
+        return None
+    return max(refs, key=lambda ref: ref.updated).id
+
+
+def list_sessions(repo: Path) -> list[SessionRef]:
     project_dir = _project_dir(repo)
     if not project_dir.is_dir():
+        return []
+    refs = []
+    for path in project_dir.glob("*.jsonl"):
+        if not path.is_file():
+            continue
+        try:
+            updated = path.stat().st_mtime
+        except OSError:
+            continue
+        refs.append(SessionRef(id=path.stem, updated=updated, label=_session_label(path)))
+    return refs
+
+
+def _session_label(path: Path, *, line_limit: int = 100) -> str | None:
+    # The first real user prompt makes a readable label; it is near the top of
+    # the transcript, so reading only the head keeps listing cheap.
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for index, line in enumerate(handle):
+                if index >= line_limit:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if row.get("type") == "user":
+                    prompt = _user_prompt(row)
+                    if prompt:
+                        return prompt.splitlines()[0]
+    except OSError:
         return None
-    transcripts = [path for path in project_dir.glob("*.jsonl") if path.is_file()]
-    if not transcripts:
-        return None
-    latest = max(transcripts, key=lambda path: path.stat().st_mtime)
-    return latest.stem
+    return None
 
 
 def session_belongs_to_repo(repo: Path, session_id: str) -> bool:

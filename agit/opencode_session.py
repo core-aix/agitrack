@@ -8,13 +8,15 @@ import time
 from pathlib import Path
 
 from agit.backends.base import TokenUsage
-from agit.session import ExportedSession, SessionTurn, turns_after
+from agit.session import ExportedSession, SessionRef, SessionTurn, turns_after
 
 __all__ = [
     "ExportedSession",
+    "SessionRef",
     "SessionTurn",
     "turns_after",
     "latest_session_id",
+    "list_sessions",
     "session_belongs_to_repo",
     "export_session",
     "parse_exported_session",
@@ -22,10 +24,10 @@ __all__ = [
 ]
 
 
-def latest_session_id(repo: Path) -> str | None:
+def _fetch_sessions(repo: Path, max_count: int) -> list[dict]:
     _debug(repo, "opencode session list starting")
     process = subprocess.run(
-        ["opencode", "session", "list", "--format", "json", "--max-count", "10"],
+        ["opencode", "session", "list", "--format", "json", "--max-count", str(max_count)],
         cwd=repo,
         text=True,
         stdout=subprocess.PIPE,
@@ -34,18 +36,39 @@ def latest_session_id(repo: Path) -> str | None:
     )
     _debug(repo, f"opencode session list finished returncode={process.returncode} stdout_bytes={len(process.stdout)} stderr_bytes={len(process.stderr)}")
     if process.returncode != 0:
-        return None
+        return []
     try:
         sessions = json.loads(process.stdout)
     except json.JSONDecodeError:
+        return []
+    resolved = repo.resolve()
+    matching = [session for session in sessions if _same_repo(session.get("directory"), resolved) and session.get("id")]
+    return matching or [session for session in sessions if session.get("id")]
+
+
+def _to_seconds(value: object) -> float:
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0.0
+    # OpenCode reports millisecond timestamps; normalise to seconds.
+    return number / 1000.0 if number > 1e12 else number
+
+
+def list_sessions(repo: Path) -> list[SessionRef]:
+    refs = []
+    for session in _fetch_sessions(repo, 50):
+        updated = session.get("updated") or session.get("created") or 0
+        title = session.get("title")
+        refs.append(SessionRef(id=str(session["id"]), updated=_to_seconds(updated), label=title if isinstance(title, str) else None))
+    return refs
+
+
+def latest_session_id(repo: Path) -> str | None:
+    refs = list_sessions(repo)
+    if not refs:
         return None
-    repo = repo.resolve()
-    matching = [session for session in sessions if _same_repo(session.get("directory"), repo) and session.get("id")]
-    candidates = matching or [session for session in sessions if session.get("id")]
-    if not candidates:
-        return None
-    latest = max(candidates, key=lambda session: session.get("updated") or session.get("created") or 0)
-    return str(latest["id"])
+    return max(refs, key=lambda ref: ref.updated).id
 
 
 def session_belongs_to_repo(repo: Path, session_id: str) -> bool:

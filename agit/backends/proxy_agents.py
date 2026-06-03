@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Protocol
 
 from agit import claude_session, opencode_session
-from agit.session import ExportedSession
+from agit.session import ExportedSession, SessionRef
 
 
 class ProxyAgent(Protocol):
@@ -30,6 +30,9 @@ class ProxyAgent(Protocol):
 
     def latest_session_id(self, repo: Path) -> str | None:
         ...
+
+    def list_sessions(self, repo: Path) -> list[SessionRef]:
+        """Every session recorded for this repository, for listing/switching."""
 
     def export_session(self, repo: Path, session_id: str) -> ExportedSession | None:
         ...
@@ -59,6 +62,9 @@ class OpenCodeProxyAgent:
     def latest_session_id(self, repo: Path) -> str | None:
         return opencode_session.latest_session_id(repo)
 
+    def list_sessions(self, repo: Path) -> list[SessionRef]:
+        return opencode_session.list_sessions(repo)
+
     def export_session(self, repo: Path, session_id: str) -> ExportedSession | None:
         return opencode_session.export_session(repo, session_id)
 
@@ -86,6 +92,9 @@ class ClaudeProxyAgent:
 
     def latest_session_id(self, repo: Path) -> str | None:
         return claude_session.latest_session_id(repo)
+
+    def list_sessions(self, repo: Path) -> list[SessionRef]:
+        return claude_session.list_sessions(repo)
 
     def export_session(self, repo: Path, session_id: str) -> ExportedSession | None:
         return claude_session.export_session(repo, session_id)
