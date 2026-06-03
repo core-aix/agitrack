@@ -28,6 +28,7 @@ aGiT stands for agent + git. It is a Python library and interactive CLI that com
 - Commit subjects and bodies must not contain terminal escape sequences or control characters; strip arrow-key/escape residue both where the prompt is captured and when building the message.
 - Commit bodies include metadata such as backend, backend session ID, aGiT session ID, model, commit type, and timestamps.
 - Agent commit metadata includes the current context token count and token usage accumulated since the last code-changing commit.
+- Record reasoning/thinking token counts in commit metadata only when the backend session record reports them; otherwise omit the reasoning line. Do not add explanatory token notes to the metadata.
 - Proxy mode must baseline continued OpenCode sessions on startup so old turns do not inflate token usage for the next commit.
 
 ## Staging Behavior
@@ -52,7 +53,7 @@ aGiT stands for agent + git. It is a Python library and interactive CLI that com
 - `agit --mode json` uses the structured JSON prompt-loop fallback.
 - `agit --verbose` shows aGiT diagnostic messages; normal mode should avoid debug/status chatter.
 - Plain text input is sent to the active agent backend.
-- In proxy mode, all printable input is forwarded to OpenCode; aGiT controls are opened with `Ctrl-G`.
+- In proxy mode, all printable input is forwarded to the backend; aGiT controls are opened with `Ctrl-G` only. `:` is not an aGiT command trigger in proxy mode and is forwarded to the backend like any other character.
 - Proxy mode command palette previews aGiT commands; Up/Down selects, Tab completes, and Enter runs the selected command.
 - In JSON mode, aGiT commands use `:` instead of `/` so OpenCode-native slash controls are not intercepted.
 - The interactive UI should show status information and contextual command hints for both `:` aGiT controls and `/` OpenCode-native controls.
@@ -60,13 +61,14 @@ aGiT stands for agent + git. It is a Python library and interactive CLI that com
 - Proxy mode renders the backend screen itself, so it must reproduce each cell's colors and attributes (bold/italic/underline/reverse) exactly as the backend emitted them.
 - Proxy mode must re-emit colors in the same encoding/depth the backend used, chosen from the shared terminal color support (truecolor stays 24-bit; 256-color stays a palette index so the host terminal's own palette renders it; named ANSI stays named). Upconverting 256-color output to truecolor breaks terminals without truecolor support (e.g. Apple Terminal) and shifts colors on terminals with customized palettes.
 - Proxy mode must answer the terminal capability queries the backend makes (foreground/background via OSC 10/11, palette via OSC 4, cursor position, device attributes) using the host terminal's real responses, so the backend detects the same theme it would in a native session. Without this the backend cannot match the host terminal's light/dark theme and colors render wrong.
-- Proxy mode commands after `Ctrl-G`: `user-commit`, `stage`, `unstaged`, `status`, `agent-backend`, and `exit`.
-- `:user-commit` creates a user commit.
-- `:stage` reviews and optionally stages untracked files, including previously declined files.
-- `:unstaged` shows intentionally unstaged files.
-- `:status` shows Git status.
-- `:agent-backend <opencode|claude>` selects the agent backend; with no argument it shows a picker. Switching relaunches the backend TUI, restores that backend's previous session for the repo if known, and updates the saved global default.
-- `:exit` exits.
+- Proxy mode commands after `Ctrl-G` (bare names, no `:`): `user-commit`, `stage`, `unstaged`, `status`, `session`, `agent-backend`, and `exit`.
+- `user-commit` creates a user commit.
+- `stage` reviews and optionally stages untracked files, including previously declined files.
+- `unstaged` shows intentionally unstaged files.
+- `status` shows Git status.
+- `session` opens an interactive menu to start a new session, sync tracking to the most recent session, or switch to another existing session. Typed arguments are also accepted (`session new`, `session sync`, `session <id-or-prefix>`).
+- `agent-backend` selects the agent backend (`opencode` or `claude`); with no argument it shows a picker. Switching relaunches the backend TUI, restores that backend's previous session for the repo if known, and updates the saved global default.
+- `exit` exits.
 
 ## OpenCode Backend
 
@@ -82,6 +84,13 @@ aGiT stands for agent + git. It is a Python library and interactive CLI that com
 - Recover metadata by reading the session transcript JSONL under `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl` (override the base directory with `CLAUDE_CONFIG_DIR`); the project directory name is the absolute working directory with every non-alphanumeric character replaced by a dash.
 - Parse turns into user prompts and final assistant text responses; exclude thinking blocks, tool calls, tool results, sidechain (subagent) messages, and slash-command artifacts.
 - Map Claude token usage (input/output/cache-read/cache-creation) onto the shared token model; reasoning/thinking tokens are not reported separately.
+
+## Session Tracking
+
+- aGiT tracks exactly one backend session per repository and pins to the session it launched, rather than chasing whichever session is globally newest.
+- For backends that accept an explicit session id (Claude), aGiT pins at launch. For backends that assign their own id (OpenCode), aGiT snapshots existing session ids before launch and adopts the newly created one on the first parse, then stays pinned to it.
+- The `session` command (proxy) lets the user start a new session, switch the tracked session to another existing one, or sync tracking to the most recently active session (useful after starting a new session inside the backend TUI). Switching or starting a new session relaunches the backend TUI and re-baselines so existing history is not re-committed.
+- Session detection, listing, and switching must work identically for both OpenCode and Claude.
 
 ## Backend Selection and Global Config
 

@@ -93,6 +93,25 @@ def detect_color_mode(environ=None) -> str:
     return "16"
 
 
+def _short_session(session_id: str | None) -> str:
+    if not session_id:
+        return "(none)"
+    return session_id[:8]
+
+
+def _humanize_age(updated: float) -> str:
+    if not updated:
+        return ""
+    delta = max(time.time() - float(updated), 0.0)
+    if delta < 60:
+        return f"{int(delta)}s ago"
+    if delta < 3600:
+        return f"{int(delta // 60)}m ago"
+    if delta < 86400:
+        return f"{int(delta // 3600)}h ago"
+    return f"{int(delta // 86400)}d ago"
+
+
 class RepoChangeHandler(FileSystemEventHandler):
     IGNORED_PARTS = {".agit", ".git", ".pytest_cache", ".venv", "__pycache__"}
 
@@ -121,7 +140,7 @@ def _escape_sequence_complete(sequence: bytes) -> bool:
 
 
 class ProxyInput:
-    COMMANDS = ["status", "stage", "unstaged", "user-commit", "agent-backend", "exit"]
+    COMMANDS = ["status", "stage", "unstaged", "user-commit", "session", "agent-backend", "exit"]
 
     def __init__(self) -> None:
         self.capturing = False
@@ -190,7 +209,7 @@ class ProxyInput:
         return self.buffer.decode(errors="ignore")
 
     def matches(self) -> list[str]:
-        text = self.text().removeprefix(":")
+        text = self.text()
         if not text:
             return self.COMMANDS
         return [command for command in self.COMMANDS if command.startswith(text)] or self.COMMANDS
@@ -265,6 +284,10 @@ class ProxyRunner:
         self.passthrough_escape: bytearray | None = None
         self.pending_forwarded: list[bytes] | None = None
         self.pending_prompt_text = ""
+        # Session ids that existed before aGiT launched a fresh backend session,
+        # used to identify (and then pin to) the session aGiT actually spawned
+        # rather than chasing whichever session is globally newest.
+        self._pre_spawn_session_ids: set[str] | None = None
         # Raw responses captured from the host terminal so we can answer the
         # same queries OpenCode makes (foreground/background/palette colors and
         # device attributes). Without these, OpenCode cannot detect the real
@@ -321,10 +344,17 @@ class ProxyRunner:
         resume = self._should_continue_session()
         if resume:
             session_id = self.state.backend_session_id
+            self._pre_spawn_session_ids = None
         else:
             session_id = self.backend.new_session_id()
             if session_id:
+                # The backend lets aGiT choose the id, so it is pinned already.
                 self.state.backend_session_id = session_id
+                self._pre_spawn_session_ids = None
+            else:
+                # The backend assigns its own id; snapshot existing sessions so
+                # the one it creates can be identified on the first parse.
+                self._pre_spawn_session_ids = {ref.id for ref in self.backend.list_sessions(self.repo.repo)}
         command = self.backend.spawn_command(self.repo.repo, session_id=session_id, resume=resume)
         pid, fd = pty.fork()
         if pid == 0:
@@ -341,10 +371,7 @@ class ProxyRunner:
             return True
         return self.backend.session_belongs_to_repo(self.repo.repo, session_id)
 
-    def _switch_backend(self, name: str) -> None:
-        # Remember the current backend's session, tear down its TUI, then bring
-        # up the newly selected backend (restoring its own session if known).
-        self.state.remember_backend_session()
+    def _teardown_child(self) -> None:
         self._cleanup_child()
         if self.master_fd is not None:
             try:
@@ -354,13 +381,7 @@ class ProxyRunner:
             self.master_fd = None
         self.child_pid = None
 
-        self.global_config.default_backend = name
-        self.state.backend = name
-        self.backend = make_proxy_agent(name)
-        self.state.backend_session_id = self.state.stored_backend_session(name)
-        self.state.last_backend_message_id = None
-        self.state.clear_trace()
-
+    def _reset_agent_tracking(self) -> None:
         self.agent_in_flight = False
         self.agent_parse_thread = None
         self.agent_parse_result = None
@@ -373,13 +394,120 @@ class ProxyRunner:
         self.parse_pending = False
         self.status_check_pending = False
 
+    def _restart_agent(self, message: str) -> None:
+        # Tear down the running TUI and relaunch it for the current backend and
+        # session state, re-baselining so existing history is not re-committed.
+        self._teardown_child()
+        self._reset_agent_tracking()
         self._sanitize_state_trace()
         self._initialize_session_baseline()
         self._init_screen()
         self._spawn()
         self._resize_child()
-        self._set_message(f"Backend set to {name}")
+        self._set_message(message)
         self._render()
+
+    def _switch_backend(self, name: str) -> None:
+        # Remember the current backend's session, then bring up the newly
+        # selected backend (restoring its own session for this repo if known).
+        self.state.remember_backend_session()
+        self.global_config.default_backend = name
+        self.state.backend = name
+        self.backend = make_proxy_agent(name)
+        self.state.backend_session_id = self.state.stored_backend_session(name)
+        self.state.last_backend_message_id = None
+        self.state.clear_trace()
+        self._restart_agent(f"Backend set to {name}")
+
+    def _handle_session_command(self, arg: str) -> None:
+        # Reached via Ctrl-G then "session". With no argument it opens an
+        # interactive menu; typed arguments are also accepted for convenience.
+        arg = arg.strip()
+        if arg in {"new", "fresh"}:
+            self._start_new_session()
+        elif arg in {"sync", "latest", "refresh"}:
+            self._sync_tracked_session()
+        elif arg:
+            target = self._resolve_session_id(arg)
+            if target is None:
+                self._set_message(f"No session matching '{arg}' for {self.backend.name}.")
+                self._render()
+            else:
+                self._switch_to_session(target)
+        else:
+            self._session_menu()
+
+    def _session_menu(self) -> None:
+        refs = sorted(self.backend.list_sessions(self.repo.repo), key=lambda ref: ref.updated, reverse=True)
+        current = self.state.backend_session_id
+        options = ["+ New session"]
+        targets: list[str] = ["__new__"]
+        if refs:
+            options.append("> Sync to most recent")
+            targets.append("__sync__")
+        for ref in refs[:8]:
+            marker = "* " if ref.id == current else "  "
+            label = (ref.label or "").strip().replace("\n", " ")
+            if len(label) > 36:
+                label = label[:35] + "…"
+            options.append(f"{marker}{_short_session(ref.id)}  {_humanize_age(ref.updated)}  {label}".rstrip())
+            targets.append(ref.id)
+        title = f"Sessions ({self.backend.name}) — tracking {_short_session(current) if current else '(new)'}"
+        choice = self._select_popup(title, options)
+        if choice is None:
+            self._set_message("Cancelled.")
+            self._render()
+            return
+        target = targets[options.index(choice)]
+        if target == "__new__":
+            self._start_new_session()
+        elif target == "__sync__":
+            self._sync_tracked_session()
+        else:
+            self._switch_to_session(target)
+
+    def _start_new_session(self) -> None:
+        self.state.backend_session_id = None
+        self.state.last_backend_message_id = None
+        self.state.clear_trace()
+        self._restart_agent("Started a new session.")
+
+    def _switch_to_session(self, session_id: str) -> None:
+        if session_id == self.state.backend_session_id:
+            self._set_message(f"Already tracking session {_short_session(session_id)}.")
+            self._render()
+            return
+        self.state.backend_session_id = session_id
+        self.state.last_backend_message_id = None
+        self.state.clear_trace()
+        self._restart_agent(f"Now tracking session {_short_session(session_id)}")
+
+    def _sync_tracked_session(self) -> None:
+        # Re-point tracking at the most recently active session without
+        # relaunching the TUI, e.g. after the user started a new session inside
+        # the backend itself.
+        refs = self.backend.list_sessions(self.repo.repo)
+        if not refs:
+            self._set_message("No sessions found to sync.")
+            self._render()
+            return
+        newest = max(refs, key=lambda ref: ref.updated)
+        if newest.id == self.state.backend_session_id:
+            self._set_message(f"Already tracking the most recent session ({_short_session(newest.id)}).")
+            self._render()
+            return
+        self.state.backend_session_id = newest.id
+        self.state.last_backend_message_id = None
+        self._initialize_session_baseline()
+        self._set_message(f"Now tracking session {_short_session(newest.id)}")
+        self._render()
+
+    def _resolve_session_id(self, arg: str) -> str | None:
+        ids = [ref.id for ref in self.backend.list_sessions(self.repo.repo)]
+        if arg in ids:
+            return arg
+        matches = [session_id for session_id in ids if session_id.startswith(arg)]
+        return matches[0] if len(matches) == 1 else None
 
     def _start_file_watcher(self) -> None:
         if Observer is None:
@@ -769,8 +897,10 @@ class ProxyRunner:
         os.write(sys.stdout.fileno(), b"\x1b[?1049h\x1b[2J\x1b[H")
 
     def _run_command(self, command: str) -> None:
+        # aGiT commands in proxy mode are triggered via Ctrl-G and are plain
+        # names; ":" is not a command trigger here (it is forwarded to the
+        # backend like any other input).
         name, _, arg = command.partition(" ")
-        name = name.removeprefix(":")
         if name in {"exit", "quit"}:
             self.running = False
             self._exit_child()
@@ -808,6 +938,9 @@ class ProxyRunner:
             else:
                 self._switch_backend(selected)
                 return
+        elif name == "session":
+            self._handle_session_command(arg)
+            return
         elif name == "":
             self._set_message("Select an aGiT command.")
         else:
@@ -1112,6 +1245,19 @@ class ProxyRunner:
         if prompt_text:
             self.state.append_trace("user", prompt_text)
 
+    def _discover_spawned_session(self) -> str | None:
+        # Identify the session aGiT just spawned: the newest one that did not
+        # exist before launch. Falls back to the newest overall when no snapshot
+        # was taken.
+        refs = self.backend.list_sessions(self.repo.repo)
+        if not refs:
+            return None
+        snapshot = self._pre_spawn_session_ids
+        candidates = [ref for ref in refs if ref.id not in snapshot] if snapshot is not None else refs
+        if not candidates:
+            return None
+        return max(candidates, key=lambda ref: ref.updated).id
+
     def _start_agent_parse(self) -> bool:
         parse_lock = getattr(self, "agent_parse_lock", None)
         if parse_lock is None:
@@ -1131,7 +1277,9 @@ class ProxyRunner:
         def worker() -> None:
             try:
                 self._debug("agent parse worker started")
-                session_id = self.backend.latest_session_id(self.repo.repo) or self.state.backend_session_id
+                # Stay pinned to the session aGiT owns; only discover when the id
+                # is not yet known (a freshly spawned backend-assigned session).
+                session_id = self.state.backend_session_id or self._discover_spawned_session()
                 session = self.backend.export_session(self.repo.repo, session_id) if session_id else None
                 turn_count = len(session.turns) if session else 0
                 final_count = len([turn for turn in session.turns if turn.final_response]) if session else 0
@@ -1144,7 +1292,7 @@ class ProxyRunner:
 
         self.last_parse_start = time.monotonic()
         self._debug(f"agent parse started last_message_id={last_message_id}")
-        self.agent_parse_thread = threading.Thread(target=worker, name="agit-opencode-session-parse", daemon=True)
+        self.agent_parse_thread = threading.Thread(target=worker, name="agit-session-parse", daemon=True)
         self.agent_parse_thread.start()
         return True
 

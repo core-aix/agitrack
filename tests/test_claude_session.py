@@ -1,7 +1,7 @@
 import json
 
 from agit import claude_session
-from agit.claude_session import export_session, latest_session_id, parse_rows, session_belongs_to_repo
+from agit.claude_session import export_session, latest_session_id, list_sessions, parse_rows, session_belongs_to_repo
 
 
 def _user(uuid, text, **extra):
@@ -86,6 +86,23 @@ def test_export_session_reads_jsonl_from_project_dir(tmp_path, monkeypatch):
     assert session is not None
     assert session.turns[0].user_prompt == "hello"
     assert session.turns[0].final_response == "hi there"
+
+
+def test_list_sessions_returns_refs_with_labels(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    project_dir = claude_session._project_dir(repo)
+    project_dir.mkdir(parents=True)
+    (project_dir / "s1.jsonl").write_text(json.dumps(_user("u1", "first session prompt")) + "\n")
+    (project_dir / "s2.jsonl").write_text(json.dumps(_user("u2", "second session prompt")) + "\n")
+
+    refs = list_sessions(repo)
+    by_id = {ref.id: ref for ref in refs}
+    assert set(by_id) == {"s1", "s2"}
+    assert by_id["s1"].label == "first session prompt"
+    assert by_id["s2"].updated > 0
+    assert latest_session_id(repo) in {"s1", "s2"}
 
 
 def test_encode_repo_matches_claude_naming():

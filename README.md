@@ -39,6 +39,8 @@ agit --backend opencode
 
 The default backend is read from `~/.agit/config.json` (`default_backend`); a fresh install defaults to OpenCode. You can also switch backends mid-session with the `agent-backend` command below.
 
+aGiT tracks one session per repository and stays pinned to the session it launched (so it does not drift to other sessions you open). Use the `session` command (`Ctrl-G`, then `session`) to start a new session, switch the tracked session to another existing one, or sync tracking to the most recently active session — for example after starting a new conversation inside the backend's own TUI. This works the same for both backends.
+
 Show aGiT diagnostic messages:
 
 ```bash
@@ -58,9 +60,12 @@ status                    show git status
 user-commit               create a user commit
 stage                     review and stage untracked files
 unstaged                  show intentionally unstaged files
-agent-backend <backend>   switch backend (opencode|claude); no arg shows a picker
+session                   start a new session, switch the tracked session, or sync to the latest
+agent-backend             switch backend (opencode|claude); shows a picker
 exit                      exit
 ```
+
+In proxy mode, aGiT commands are triggered with `Ctrl-G` only (not `:`); `:` is forwarded to the backend like any other character.
 
 The command palette previews available commands. Use Up/Down to select a command, Tab to complete it, and Enter to run it.
 

@@ -23,6 +23,16 @@ class ExportedSession:
     turns: list[SessionTurn]
 
 
+@dataclass
+class SessionRef:
+    """A lightweight reference to one of a repository's backend sessions, used
+    to list, discover, and switch the session aGiT tracks."""
+
+    id: str
+    updated: float  # epoch seconds; newest wins
+    label: str | None = None
+
+
 def turns_after(session: ExportedSession, last_message_id: str | None) -> list[SessionTurn]:
     if not last_message_id:
         return session.turns

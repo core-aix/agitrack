@@ -5,8 +5,66 @@ import time
 from agit.backends.base import TokenUsage
 from agit.opencode_session import SessionTurn
 from agit.backends.proxy_agents import make_proxy_agent
-from agit.proxy import ProxyInput, ProxyRunner, _escape_sequence_complete, detect_color_mode
+from agit.proxy import ProxyInput, ProxyRunner, _escape_sequence_complete, _humanize_age, _short_session, detect_color_mode
+from agit.session import SessionRef
 from agit.state import AgitState
+
+
+class _FakeBackend:
+    name = "fake"
+
+    def __init__(self, refs):
+        self._refs = refs
+
+    def list_sessions(self, repo):
+        return list(self._refs)
+
+
+def _runner_with_sessions(refs):
+    runner = ProxyRunner.__new__(ProxyRunner)
+    runner.backend = _FakeBackend(refs)
+    runner.repo = type("Repo", (), {"repo": "/repo"})()
+    return runner
+
+
+def test_discover_spawned_session_picks_the_new_session():
+    refs = [SessionRef("old", 100.0), SessionRef("new", 200.0)]
+    runner = _runner_with_sessions(refs)
+    runner._pre_spawn_session_ids = {"old"}
+    assert runner._discover_spawned_session() == "new"
+
+
+def test_discover_spawned_session_returns_none_when_nothing_new():
+    refs = [SessionRef("old", 100.0), SessionRef("older", 50.0)]
+    runner = _runner_with_sessions(refs)
+    runner._pre_spawn_session_ids = {"old", "older"}
+    assert runner._discover_spawned_session() is None
+
+
+def test_discover_spawned_session_without_snapshot_uses_newest():
+    refs = [SessionRef("a", 100.0), SessionRef("b", 300.0), SessionRef("c", 200.0)]
+    runner = _runner_with_sessions(refs)
+    runner._pre_spawn_session_ids = None
+    assert runner._discover_spawned_session() == "b"
+
+
+def test_resolve_session_id_matches_exact_and_unique_prefix():
+    refs = [SessionRef("abc123", 1.0), SessionRef("abd999", 2.0)]
+    runner = _runner_with_sessions(refs)
+    assert runner._resolve_session_id("abc123") == "abc123"
+    assert runner._resolve_session_id("abc") == "abc123"
+    assert runner._resolve_session_id("ab") is None  # ambiguous prefix
+    assert runner._resolve_session_id("zzz") is None
+
+
+def test_short_session_and_humanize_age():
+    assert _short_session("35e076c5-8653-439c") == "35e076c5"
+    assert _short_session(None) == "(none)"
+    import time
+
+    assert _humanize_age(time.time() - 30).endswith("s ago")
+    assert _humanize_age(time.time() - 3700).endswith("h ago")
+    assert _humanize_age(0) == ""
 
 
 class FakeCommitRepo:
