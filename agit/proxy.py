@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import pty
+import re
 import select
 import signal
 import sys
@@ -26,6 +27,68 @@ from agit.commit_message import build_agent_commit_message, build_user_commit_me
 from agit.git import GitRepo
 from agit.opencode_session import export_session, latest_session_id, session_belongs_to_repo, turns_after
 from agit.state import AgitState
+
+
+# Map every xterm-256 palette colour back to its index so that colours pyte
+# collapsed to hex can be re-emitted in their original 256-colour encoding.
+# First occurrence wins, which keeps the ANSI palette indices (0-15) that
+# OpenCode's "system" theme relies on, so the host terminal's own palette is
+# respected instead of being frozen to fixed RGB values.
+_PALETTE_256: list[tuple[int, int, int]] = []
+_REVERSE_256: dict[str, int] = {}
+
+
+def _build_palette_256() -> None:
+    try:
+        import pyte.graphics as graphics
+    except Exception:  # pragma: no cover - pyte always present in practice
+        return
+    for index in range(256):
+        hex_value = graphics.FG_BG_256[index]
+        _REVERSE_256.setdefault(hex_value, index)
+        _PALETTE_256.append((int(hex_value[0:2], 16), int(hex_value[2:4], 16), int(hex_value[4:6], 16)))
+
+
+_build_palette_256()
+
+
+def _nearest_256(red: int, green: int, blue: int) -> int:
+    best_index = 0
+    best_distance = None
+    for index, (pr, pg, pb) in enumerate(_PALETTE_256):
+        distance = (pr - red) ** 2 + (pg - green) ** 2 + (pb - blue) ** 2
+        if best_distance is None or distance < best_distance:
+            best_distance = distance
+            best_index = index
+    return best_index
+
+
+def _nearest_ansi16(red: int, green: int, blue: int) -> int:
+    best_index = 0
+    best_distance = None
+    for index in range(16):
+        pr, pg, pb = _PALETTE_256[index]
+        distance = (pr - red) ** 2 + (pg - green) ** 2 + (pb - blue) ** 2
+        if best_distance is None or distance < best_distance:
+            best_distance = distance
+            best_index = index
+    return best_index
+
+
+def detect_color_mode(environ=None) -> str:
+    # Mirror the colour-depth detection OpenCode itself uses so that aGiT
+    # re-emits colours in the exact encoding OpenCode produced. aGiT and the
+    # backend share an environment, so the same depth applies to both.
+    env = os.environ if environ is None else environ
+    colorterm = (env.get("COLORTERM") or "").strip().lower()
+    if colorterm in {"truecolor", "24bit"}:
+        return "truecolor"
+    term = (env.get("TERM") or "").strip().lower()
+    if "256" in term:
+        return "256"
+    if colorterm or term:
+        return "16"
+    return "16"
 
 
 class RepoChangeHandler(FileSystemEventHandler):
@@ -191,6 +254,15 @@ class ProxyRunner:
         self.passthrough_prompt = bytearray()
         self.pending_forwarded: list[bytes] | None = None
         self.pending_prompt_text = ""
+        # Raw responses captured from the host terminal so we can answer the
+        # same queries OpenCode makes (foreground/background/palette colors and
+        # device attributes). Without these, OpenCode cannot detect the real
+        # terminal theme and its colors do not match a native session.
+        self.host_fg_value: bytes | None = None
+        self.host_bg_value: bytes | None = None
+        self.host_palette: dict[bytes, bytes] = {}
+        self.host_da: bytes | None = None
+        self.color_mode = detect_color_mode()
         self.debug_proxy = verbose or os.environ.get("AGIT_DEBUG_PROXY", "").strip().lower() in {"1", "true", "yes"}
 
     def run(self) -> int:
@@ -209,6 +281,7 @@ class ProxyRunner:
         try:
             self._enter_host_screen()
             self._set_raw()
+            self._detect_host_terminal()
             self._resize_child()
             self.original_sigwinch = signal.getsignal(signal.SIGWINCH)
             self.original_signal_handlers = {
@@ -282,6 +355,7 @@ class ProxyRunner:
                     break
                 self.last_child_output = time.monotonic()
                 self.last_child_output_sample = (self.last_child_output_sample + output)[-4096:]
+                self._answer_terminal_queries(output)
                 self._sync_terminal_modes(output)
                 self._feed_child_output(output)
                 self._render()
@@ -397,6 +471,78 @@ class ProxyRunner:
             if b"\x1b[?" + mode + b"l" in output:
                 os.write(sys.stdout.fileno(), b"\x1b[?" + mode + b"l")
 
+    def _detect_host_terminal(self) -> None:
+        # Ask the host terminal the same questions OpenCode asks on startup and
+        # cache the raw answers. OpenCode adapts its entire theme to the
+        # reported foreground/background, so relaying the real values is what
+        # makes its colors match a native session.
+        queries = bytearray(b"\x1b]10;?\x07\x1b]11;?\x07")
+        for index in range(16):
+            queries += b"\x1b]4;%d;?\x07" % index
+        queries += b"\x1b[c"  # primary device attributes; also a response sentinel
+        try:
+            os.write(sys.stdout.fileno(), bytes(queries))
+        except OSError:
+            return
+        buffer = bytearray()
+        deadline = time.monotonic() + 0.5
+        stdin_fd = sys.stdin.fileno()
+        while time.monotonic() < deadline:
+            readable, _, _ = select.select([stdin_fd], [], [], deadline - time.monotonic())
+            if stdin_fd not in readable:
+                break
+            try:
+                chunk = os.read(stdin_fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buffer += chunk
+            if re.search(rb"\x1b\[\?[0-9;]*c", bytes(buffer)):
+                break
+        self._parse_host_terminal_responses(bytes(buffer))
+
+    def _parse_host_terminal_responses(self, data: bytes) -> None:
+        if not data:
+            return
+        fg = re.search(rb"\x1b\]10;([^\x07\x1b]*)(?:\x07|\x1b\\)", data)
+        if fg:
+            self.host_fg_value = fg.group(1)
+        bg = re.search(rb"\x1b\]11;([^\x07\x1b]*)(?:\x07|\x1b\\)", data)
+        if bg:
+            self.host_bg_value = bg.group(1)
+        for match in re.finditer(rb"\x1b\]4;(\d+);([^\x07\x1b]*)(?:\x07|\x1b\\)", data):
+            self.host_palette[match.group(1)] = match.group(2)
+        da = re.search(rb"\x1b\[\?[0-9;]*c", data)
+        if da:
+            self.host_da = da.group(0)
+        self._debug(f"host terminal fg={self.host_fg_value!r} bg={self.host_bg_value!r} palette={len(self.host_palette)} da={self.host_da!r}")
+
+    def _answer_terminal_queries(self, output: bytes) -> None:
+        if self.master_fd is None:
+            return
+        response = bytearray()
+        if self.host_fg_value and re.search(rb"\x1b\]10;\?(?:\x07|\x1b\\)", output):
+            response += b"\x1b]10;" + self.host_fg_value + b"\x07"
+        if self.host_bg_value and re.search(rb"\x1b\]11;\?(?:\x07|\x1b\\)", output):
+            response += b"\x1b]11;" + self.host_bg_value + b"\x07"
+        for match in re.finditer(rb"\x1b\]4;(\d+);\?(?:\x07|\x1b\\)", output):
+            value = self.host_palette.get(match.group(1))
+            if value:
+                response += b"\x1b]4;" + match.group(1) + b";" + value + b"\x07"
+        if self.screen is not None:
+            for _ in range(output.count(b"\x1b[6n")):
+                row = min(self.screen.cursor.y + 1, max(self.rows - 1, 1))
+                col = min(self.screen.cursor.x + 1, self.cols)
+                response += b"\x1b[%d;%dR" % (row, col)
+        if self.host_da and re.search(rb"\x1b\[(?:0)?c", output):
+            response += self.host_da
+        if response:
+            try:
+                os.write(self.master_fd, bytes(response))
+            except OSError:
+                pass
+
     def _render(self) -> None:
         if self.screen is None:
             return
@@ -471,30 +617,27 @@ class ProxyRunner:
         assert self.screen is not None
         cells = self.screen.buffer.get(row, {})
         rendered = []
-        highlighting = False
+        current = ""  # SGR body currently applied on the host terminal ("" == default)
         for col in range(self.cols):
             cell = cells.get(col)
             if cell is None:
-                highlight = False
+                style = ""
                 char = " "
             else:
-                highlight = self._is_highlight_cell(cell)
+                style = self._cell_sgr(cell)
                 char = cell.data or " "
-            if highlight != highlighting:
-                rendered.append("\x1b[37;40m" if highlight else "\x1b[0m")
-                highlighting = highlight
+            if style != current:
+                rendered.append("\x1b[" + (style or "0") + "m")
+                current = style
             rendered.append(char)
-        rendered.append("\x1b[0m")
+        if current:
+            rendered.append("\x1b[0m")
         return "".join(rendered)
 
-    def _is_highlight_cell(self, cell) -> bool:
-        if getattr(cell, "reverse", False):
-            return True
-        fg = getattr(cell, "fg", "default")
-        bg = getattr(cell, "bg", "default")
-        return bg == "black" and fg in {"default", "white", "brightwhite"}
-
-    def _cell_style(self, cell) -> str:
+    def _cell_sgr(self, cell) -> str:
+        # Reproduce exactly what OpenCode rendered into this cell, including the
+        # original colour encoding (see _hex_color_code), so the cell is
+        # byte-equivalent in colour to a native session on the same terminal.
         codes = []
         if getattr(cell, "bold", False):
             codes.append("1")
@@ -502,23 +645,19 @@ class ProxyRunner:
             codes.append("3")
         if getattr(cell, "underscore", False):
             codes.append("4")
+        if getattr(cell, "blink", False):
+            codes.append("5")
         if getattr(cell, "reverse", False):
-            codes.extend(["37", "40"])
-        raw_fg = getattr(cell, "fg", "default")
-        raw_bg = getattr(cell, "bg", "default")
-        if getattr(cell, "reverse", False):
-            raw_fg = "default"
-            raw_bg = "default"
-        # Avoid invisible text when a TUI emits the same foreground/background.
-        if raw_fg == raw_bg and raw_fg != "default":
-            raw_fg = "default"
-        fg = self._color_code(raw_fg, foreground=True)
-        bg = self._color_code(raw_bg, foreground=False)
-        if fg and fg != bg:
+            codes.append("7")
+        if getattr(cell, "strikethrough", False):
+            codes.append("9")
+        fg = self._color_code(getattr(cell, "fg", "default"), foreground=True)
+        bg = self._color_code(getattr(cell, "bg", "default"), foreground=False)
+        if fg:
             codes.append(fg)
         if bg:
             codes.append(bg)
-        return "\x1b[" + (";".join(codes) if codes else "0") + "m"
+        return ";".join(codes)
 
     def _color_code(self, color: str, *, foreground: bool) -> str | None:
         if color in {"default", ""}:
@@ -539,15 +678,34 @@ class ProxyRunner:
             "gray": 7,
         }
         if len(color) == 6 and all(char in "0123456789abcdefABCDEF" for char in color):
-            red = int(color[0:2], 16)
-            green = int(color[2:4], 16)
-            blue = int(color[4:6], 16)
-            prefix = "38" if foreground else "48"
-            return f"{prefix};2;{red};{green};{blue}"
+            return self._hex_color_code(color.lower(), foreground=foreground)
         if color.startswith("bright"):
             key = color.removeprefix("bright")
             return str(bright_base + colors[key]) if key in colors else None
         return str(base + colors[color]) if color in colors else None
+
+    def _hex_color_code(self, color: str, *, foreground: bool) -> str:
+        # Re-emit a hex colour in the same encoding OpenCode used, decided by the
+        # shared terminal colour depth. Truecolor terminals get 24-bit colour;
+        # 256-colour terminals (e.g. Apple Terminal) get the original palette
+        # index so their own palette renders it, exactly like a native session.
+        red = int(color[0:2], 16)
+        green = int(color[2:4], 16)
+        blue = int(color[4:6], 16)
+        prefix = "38" if foreground else "48"
+        mode = getattr(self, "color_mode", "truecolor")
+        if mode == "truecolor":
+            return f"{prefix};2;{red};{green};{blue}"
+        index = _REVERSE_256.get(color)
+        if index is None:
+            index = _nearest_256(red, green, blue)
+        if mode == "256":
+            return f"{prefix};5;{index}"
+        # 16-colour terminals: fall back to the nearest ANSI base/bright code.
+        ansi = index if index < 16 else _nearest_ansi16(red, green, blue)
+        base = 30 if foreground else 40
+        bright_base = 90 if foreground else 100
+        return str(base + ansi) if ansi < 8 else str(bright_base + ansi - 8)
 
     def _status_line(self) -> str:
         declined = len([path for path in self.state.declined_untracked() if (self.repo.repo / path).exists()])
