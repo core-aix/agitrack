@@ -366,6 +366,26 @@ def test_proxy_render_row_emits_reverse_video():
     assert runner._render_row(0) == "a\x1b[7mb\x1b[0mc"
 
 
+def test_proxy_passthrough_prompt_drops_escape_sequences():
+    runner = ProxyRunner.__new__(ProxyRunner)
+    runner.passthrough_prompt = bytearray()
+    runner.passthrough_escape = None
+
+    # "fix" + down-arrow (ESC [ B) + " bug" must capture only the typed text.
+    runner._update_passthrough_prompt([b"f", b"i", b"x", b"\x1b", b"[", b"B", b" ", b"b", b"u", b"g"])
+    assert runner.passthrough_prompt.decode() == "fix bug"
+
+
+def test_proxy_passthrough_prompt_handles_escape_split_across_reads():
+    runner = ProxyRunner.__new__(ProxyRunner)
+    runner.passthrough_prompt = bytearray()
+    runner.passthrough_escape = None
+
+    runner._update_passthrough_prompt([b"a", b"\x1b"])
+    runner._update_passthrough_prompt([b"[", b"A", b"b"])  # up-arrow split, then 'b'
+    assert runner.passthrough_prompt.decode() == "ab"
+
+
 def test_proxy_parses_host_terminal_responses():
     runner = ProxyRunner.__new__(ProxyRunner)
     runner.host_fg_value = runner.host_bg_value = runner.host_da = None

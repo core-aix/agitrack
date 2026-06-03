@@ -20,6 +20,16 @@ SECRET_TOKEN_RES = [
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
 ]
 MOUSE_REPORT_RE = re.compile(r"(?:\x1b)?\[<\d+;\d+;\d+[Mm]")
+# Full ANSI/terminal escape sequences (CSI/OSC/DCS and lone two-byte escapes).
+ANSI_SEQUENCE_RE = re.compile(
+    r"\x1b\[[0-9;?]*[ -/]*[@-~]"
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?"
+    r"|\x1b[P-_][^\x1b]*\x1b\\"
+    r"|\x1b[@-Z\\-_]"
+)
+# Control characters that should never appear in a commit message, keeping tab,
+# newline, and carriage return intact.
+CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
 def build_agent_commit_message(
@@ -106,6 +116,8 @@ def _limit_trace_turns(trace: list[dict], turn_limit: int) -> list[dict]:
 def _mask_secrets(text: object) -> str:
     value = str(text or "")
     value = MOUSE_REPORT_RE.sub("", value)
+    value = ANSI_SEQUENCE_RE.sub("", value)
+    value = CONTROL_CHAR_RE.sub("", value)
     value = SECRET_ASSIGNMENT_RE.sub(lambda match: f"{match.group(1)}{match.group(2)}{SECRET_MASK}", value)
     for pattern in SECRET_TOKEN_RES:
         value = pattern.sub(SECRET_MASK, value)
