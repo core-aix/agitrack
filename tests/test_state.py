@@ -51,3 +51,13 @@ def test_state_accumulates_pending_token_usage(tmp_path):
     }
     state.clear_trace()
     assert state.pending_token_usage()["total"] == 0
+
+
+def test_backend_session_is_repo_scoped(tmp_path):
+    state = AgitState(tmp_path)
+    state.backend_session_id = "ses-1"
+
+    assert state.backend_session_matches_repo() is True
+
+    state.data["backend_session_repo"] = str(tmp_path / "other")
+    assert state.backend_session_matches_repo() is False

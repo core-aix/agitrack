@@ -27,6 +27,8 @@ class AgitState:
             "backend": "opencode",
             "model": None,
             "backend_session_id": None,
+            "backend_session_repo": None,
+            "last_backend_message_id": None,
             "declined_untracked_files": [],
             "pending_trace": [],
             "pending_token_usage": {
@@ -90,6 +92,20 @@ class AgitState:
     @backend_session_id.setter
     def backend_session_id(self, value: str | None) -> None:
         self.data["backend_session_id"] = value
+        self.data["backend_session_repo"] = str(self.repo) if value else None
+        self.save()
+
+    def backend_session_matches_repo(self) -> bool:
+        return self.data.get("backend_session_repo") == str(self.repo)
+
+    @property
+    def last_backend_message_id(self) -> str | None:
+        value = self.data.get("last_backend_message_id")
+        return str(value) if value else None
+
+    @last_backend_message_id.setter
+    def last_backend_message_id(self, value: str | None) -> None:
+        self.data["last_backend_message_id"] = value
         self.save()
 
     def declined_untracked(self) -> list[str]:

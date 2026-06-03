@@ -1,0 +1,124 @@
+import json
+import subprocess
+
+from agit.opencode_session import latest_session_id, parse_exported_session, session_belongs_to_repo, turns_after
+
+
+def test_parse_exported_session_turns_model_and_tokens():
+    session = parse_exported_session(
+        {
+            "info": {
+                "id": "ses-1",
+                "model": {"providerID": "openai", "id": "gpt-5.5"},
+                "time": {"updated": 123},
+            },
+            "messages": [
+                {
+                    "info": {"role": "user", "id": "u1"},
+                    "parts": [{"type": "text", "text": "fix it"}],
+                },
+                {
+                    "info": {
+                        "role": "assistant",
+                        "id": "a1",
+                        "parentID": "u1",
+                        "providerID": "openai",
+                        "modelID": "gpt-5.5",
+                        "tokens": {"total": 99, "input": 90, "output": 9},
+                    },
+                    "parts": [
+                        {
+                            "type": "text",
+                            "text": "fixed",
+                            "metadata": {"openai": {"phase": "final_answer"}},
+                        }
+                    ],
+                },
+            ],
+        }
+    )
+
+    assert session.session_id == "ses-1"
+    assert session.model == "openai/gpt-5.5"
+    assert session.updated == 123
+    assert len(session.turns) == 1
+    assert session.turns[0].user_prompt == "fix it"
+    assert session.turns[0].final_response == "fixed"
+    assert session.turns[0].model == "openai/gpt-5.5"
+    assert session.turns[0].tokens.total == 99
+
+
+def test_parse_exported_session_groups_multiple_assistants_until_next_user():
+    session = parse_exported_session(
+        {
+            "info": {"id": "ses-1", "model": {"providerID": "ollama", "id": "qwen"}},
+            "messages": [
+                {"info": {"role": "user", "id": "u1"}, "parts": [{"type": "text", "text": "add timer"}]},
+                {
+                    "info": {"role": "assistant", "id": "a-tools", "parentID": "u1", "finish": "tool-calls", "tokens": {"total": 5}},
+                    "parts": [{"type": "tool", "tool": "edit"}],
+                },
+                {
+                    "info": {"role": "assistant", "id": "a-final", "parentID": "u1", "finish": "stop", "tokens": {"total": 7, "input": 5, "output": 2}},
+                    "parts": [{"type": "text", "text": "Added countdown timer."}],
+                },
+            ],
+        }
+    )
+
+    assert len(session.turns) == 1
+    assert session.turns[0].assistant_message_id == "a-final"
+    assert session.turns[0].final_response == "Added countdown timer."
+    assert session.turns[0].tokens.total == 12
+
+
+def test_turns_after_last_message_id():
+    session = parse_exported_session(
+        {
+            "info": {"id": "ses-1"},
+            "messages": [
+                {"info": {"role": "user", "id": "u1"}, "parts": [{"type": "text", "text": "one"}]},
+                {
+                    "info": {"role": "assistant", "id": "a1", "parentID": "u1"},
+                    "parts": [{"type": "text", "text": "done"}],
+                },
+                {"info": {"role": "user", "id": "u2"}, "parts": [{"type": "text", "text": "two"}]},
+                {
+                    "info": {"role": "assistant", "id": "a2", "parentID": "u2"},
+                    "parts": [{"type": "text", "text": "done"}],
+                },
+            ],
+        }
+    )
+
+    assert [turn.assistant_message_id for turn in turns_after(session, "a1")] == ["a2"]
+
+
+def test_latest_session_id_prefers_most_recent_matching_repo(monkeypatch, tmp_path):
+    old = tmp_path / "old"
+    old.mkdir()
+
+    sessions = [
+        {"id": "other", "directory": str(old), "updated": 300},
+        {"id": "older", "directory": str(tmp_path), "updated": 100},
+        {"id": "newer", "directory": str(tmp_path), "updated": 200},
+    ]
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(args[0], 0, stdout=json.dumps(sessions), stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert latest_session_id(tmp_path) == "newer"
+
+
+def test_session_belongs_to_repo(monkeypatch, tmp_path):
+    sessions = [{"id": "ses-1", "directory": str(tmp_path), "updated": 1}]
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(args[0], 0, stdout=json.dumps(sessions), stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert session_belongs_to_repo(tmp_path, "ses-1") is True
+    assert session_belongs_to_repo(tmp_path, "other") is False

@@ -14,7 +14,7 @@ def test_declined_untracked_files_do_not_count_as_pre_agent_changes(tmp_path):
 
     shell = AgitShell(repo)
 
-    assert shell._has_pre_agent_user_changes() is False
+    assert shell.actions.has_pre_agent_user_changes() is False
 
 
 def test_new_promptable_untracked_files_count_as_pre_agent_changes(tmp_path):
@@ -23,4 +23,4 @@ def test_new_promptable_untracked_files_count_as_pre_agent_changes(tmp_path):
 
     shell = AgitShell(GitRepo.discover(tmp_path))
 
-    assert shell._has_pre_agent_user_changes() is True
+    assert shell.actions.has_pre_agent_user_changes() is True
