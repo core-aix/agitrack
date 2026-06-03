@@ -4,7 +4,7 @@ import time
 
 from agit.backends.base import TokenUsage
 from agit.opencode_session import SessionTurn
-from agit.proxy import ProxyInput, ProxyRunner, _escape_sequence_complete
+from agit.proxy import ProxyInput, ProxyRunner, _escape_sequence_complete, detect_color_mode
 from agit.state import AgitState
 
 
@@ -249,56 +249,203 @@ def test_proxy_plain_row_handles_empty_pyte_cell_data():
     assert runner._plain_row(0) == "  "
 
 
-def test_proxy_reverse_cells_render_white_on_black():
+def _make_cell(data=" ", **attrs):
+    class Cell:
+        pass
+
+    cell = Cell()
+    cell.data = data
+    cell.fg = "default"
+    cell.bg = "default"
+    cell.bold = cell.italics = cell.underscore = cell.blink = cell.reverse = cell.strikethrough = False
+    for key, value in attrs.items():
+        setattr(cell, key, value)
+    return cell
+
+
+def test_proxy_cell_sgr_reproduces_attributes():
     runner = ProxyRunner.__new__(ProxyRunner)
 
-    class Cell:
-        bold = False
-        italics = False
-        underscore = False
-        reverse = True
-        fg = "default"
-        bg = "default"
-
-    assert runner._cell_style(Cell()) == "\x1b[37;40m"
-
-
-def test_proxy_render_row_only_styles_reverse_cells():
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.cols = 3
-
-    class Cell:
-        def __init__(self, data, reverse=False, fg="white", bg="default"):
-            self.data = data
-            self.reverse = reverse
-            self.fg = fg
-            self.bg = bg
-
-    class Screen:
-        buffer = {0: {0: Cell("a"), 1: Cell("b", reverse=True), 2: Cell("c")}}
-
-    runner.screen = Screen()
-
-    assert runner._render_row(0) == "a\x1b[37;40mb\x1b[0mc\x1b[0m"
+    # Default cell carries no styling.
+    assert runner._cell_sgr(_make_cell()) == ""
+    # Reverse video is forwarded verbatim, not flattened to white-on-black.
+    assert runner._cell_sgr(_make_cell(reverse=True)) == "7"
+    # Truecolor and 256-color (which pyte stores as hex) become 24-bit SGR.
+    assert runner._cell_sgr(_make_cell(fg="ff8000")) == "38;2;255;128;0"
+    # Named ANSI colors plus attributes round-trip to their SGR codes.
+    assert runner._cell_sgr(_make_cell(bold=True, fg="red", bg="black")) == "1;31;40"
+    assert runner._cell_sgr(_make_cell(italics=True, fg="brightcyan")) == "3;96"
 
 
-def test_proxy_render_row_styles_explicit_white_on_black_cells():
+def test_proxy_render_row_preserves_colors():
     runner = ProxyRunner.__new__(ProxyRunner)
     runner.cols = 3
 
-    class Cell:
-        def __init__(self, data, fg="default", bg="default", reverse=False):
-            self.data = data
-            self.fg = fg
-            self.bg = bg
-            self.reverse = reverse
-
     class Screen:
-        buffer = {0: {0: Cell("a", fg="white"), 1: Cell("b", fg="white", bg="black"), 2: Cell("c", fg="brightwhite", bg="black")}}
+        buffer = {
+            0: {
+                0: _make_cell("a", fg="ff8000"),
+                1: _make_cell("b", fg="ff8000"),
+                2: _make_cell("c"),
+            }
+        }
 
     runner.screen = Screen()
 
-    assert runner._render_row(0) == "a\x1b[37;40mbc\x1b[0m"
+    # The style is emitted once for the run of matching cells and reset before
+    # the default-styled cell, so OpenCode's colors survive the round-trip.
+    assert runner._render_row(0) == "\x1b[38;2;255;128;0mab\x1b[0mc"
+
+
+def test_detect_color_mode_from_environment():
+    assert detect_color_mode({"COLORTERM": "truecolor"}) == "truecolor"
+    assert detect_color_mode({"COLORTERM": "24bit", "TERM": "xterm"}) == "truecolor"
+    # OpenCode's default macOS env: no COLORTERM, a 256-colour TERM.
+    assert detect_color_mode({"TERM": "xterm-256color"}) == "256"
+    assert detect_color_mode({"TERM": "screen-256color"}) == "256"
+    assert detect_color_mode({"TERM": "xterm"}) == "16"
+    assert detect_color_mode({}) == "16"
+
+
+def test_proxy_hex_color_preserves_256_encoding():
+    runner = ProxyRunner.__new__(ProxyRunner)
+    runner.color_mode = "256"
+    # These hexes are exact xterm-256 palette entries OpenCode emits via 38;5;N.
+    # They must round-trip back to the same palette index so the host terminal
+    # renders them with its own palette, exactly like a native session.
+    assert runner._hex_color_code("080808", foreground=False) == "48;5;232"
+    assert runner._hex_color_code("eeeeee", foreground=True) == "38;5;255"
+    assert runner._hex_color_code("7f7f7f", foreground=True) == "38;5;8"
+    assert runner._hex_color_code("5fafff", foreground=True) == "38;5;75"
+
+
+def test_proxy_hex_color_preserves_truecolor_encoding():
+    runner = ProxyRunner.__new__(ProxyRunner)
+    runner.color_mode = "truecolor"
+    assert runner._hex_color_code("ff8000", foreground=True) == "38;2;255;128;0"
+    assert runner._hex_color_code("0a0a0a", foreground=False) == "48;2;10;10;10"
+
+
+def test_proxy_render_row_emits_256_colors_in_256_mode():
+    runner = ProxyRunner.__new__(ProxyRunner)
+    runner.color_mode = "256"
+    runner.cols = 3
+
+    class Screen:
+        buffer = {
+            0: {
+                0: _make_cell("a", fg="eeeeee", bg="080808"),
+                1: _make_cell("b", fg="eeeeee", bg="080808"),
+                2: _make_cell("c"),
+            }
+        }
+
+    runner.screen = Screen()
+
+    out = runner._render_row(0)
+    assert "38;5;255" in out and "48;5;232" in out
+    assert "38;2;" not in out and "48;2;" not in out  # no truecolor leakage
+
+
+def test_proxy_render_row_emits_reverse_video():
+    runner = ProxyRunner.__new__(ProxyRunner)
+    runner.cols = 3
+
+    class Screen:
+        buffer = {
+            0: {
+                0: _make_cell("a"),
+                1: _make_cell("b", reverse=True),
+                2: _make_cell("c"),
+            }
+        }
+
+    runner.screen = Screen()
+
+    assert runner._render_row(0) == "a\x1b[7mb\x1b[0mc"
+
+
+def test_proxy_parses_host_terminal_responses():
+    runner = ProxyRunner.__new__(ProxyRunner)
+    runner.host_fg_value = runner.host_bg_value = runner.host_da = None
+    runner.host_palette = {}
+    runner.debug_proxy = False
+
+    runner._parse_host_terminal_responses(
+        b"\x1b]10;rgb:1a1a/1a1a/1a1a\x07"
+        b"\x1b]11;rgb:fafa/fafa/fafa\x07"
+        b"\x1b]4;1;rgb:cccc/0000/0000\x07"
+        b"\x1b[?62;c"
+    )
+
+    assert runner.host_fg_value == b"rgb:1a1a/1a1a/1a1a"
+    assert runner.host_bg_value == b"rgb:fafa/fafa/fafa"
+    assert runner.host_palette == {b"1": b"rgb:cccc/0000/0000"}
+    assert runner.host_da == b"\x1b[?62;c"
+
+
+def test_proxy_answers_terminal_queries_from_host_cache(monkeypatch):
+    runner = ProxyRunner.__new__(ProxyRunner)
+    runner.master_fd = 99
+    runner.rows, runner.cols = 30, 100
+    runner.host_fg_value = b"rgb:1a1a/1a1a/1a1a"
+    runner.host_bg_value = b"rgb:fafa/fafa/fafa"
+    runner.host_palette = {b"1": b"rgb:cccc/0000/0000"}
+    runner.host_da = b"\x1b[?62;c"
+
+    class Cursor:
+        x = 4
+        y = 2
+
+    class Screen:
+        cursor = Cursor()
+
+    runner.screen = Screen()
+
+    written = []
+    real_write = os.write
+
+    def fake_write(fd, data):
+        if fd == 99:
+            written.append(data)
+            return len(data)
+        return real_write(fd, data)
+
+    monkeypatch.setattr(os, "write", fake_write)
+    runner._answer_terminal_queries(
+        b"\x1b]10;?\x07\x1b]11;?\x07\x1b]4;1;?\x07\x1b[6n\x1b[0c"
+    )
+
+    reply = b"".join(written)
+    # OpenCode learns the real terminal colors, so it picks the matching theme.
+    assert b"\x1b]10;rgb:1a1a/1a1a/1a1a\x07" in reply
+    assert b"\x1b]11;rgb:fafa/fafa/fafa\x07" in reply
+    assert b"\x1b]4;1;rgb:cccc/0000/0000\x07" in reply
+    assert b"\x1b[3;5R" in reply  # cursor position report (1-based)
+    assert b"\x1b[?62;c" in reply  # device attributes
+
+
+def test_proxy_answers_nothing_without_host_values(monkeypatch):
+    runner = ProxyRunner.__new__(ProxyRunner)
+    runner.master_fd = 99
+    runner.rows, runner.cols = 30, 100
+    runner.host_fg_value = runner.host_bg_value = runner.host_da = None
+    runner.host_palette = {}
+    runner.screen = None
+
+    written = []
+    real_write = os.write
+
+    def fake_write(fd, data):
+        if fd == 99:
+            written.append(data)
+            return len(data)
+        return real_write(fd, data)
+
+    monkeypatch.setattr(os, "write", fake_write)
+    runner._answer_terminal_queries(b"\x1b]10;?\x07\x1b]11;?\x07")
+
+    assert written == []
 
 
 def test_proxy_status_check_runs_after_file_event_only():

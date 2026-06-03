@@ -56,6 +56,9 @@ aGiT stands for agent + git. It is a Python library and interactive CLI that com
 - In JSON mode, aGiT commands use `:` instead of `/` so OpenCode-native slash controls are not intercepted.
 - The interactive UI should show status information and contextual command hints for both `:` aGiT controls and `/` OpenCode-native controls.
 - Intentionally unstaged-file notices should live in the status bar, not in the main transcript.
+- Proxy mode renders the backend screen itself, so it must reproduce each cell's colors and attributes (bold/italic/underline/reverse) exactly as the backend emitted them.
+- Proxy mode must re-emit colors in the same encoding/depth the backend used, chosen from the shared terminal color support (truecolor stays 24-bit; 256-color stays a palette index so the host terminal's own palette renders it; named ANSI stays named). Upconverting 256-color output to truecolor breaks terminals without truecolor support (e.g. Apple Terminal) and shifts colors on terminals with customized palettes.
+- Proxy mode must answer the terminal capability queries the backend makes (foreground/background via OSC 10/11, palette via OSC 4, cursor position, device attributes) using the host terminal's real responses, so the backend detects the same theme it would in a native session. Without this the backend cannot match the host terminal's light/dark theme and colors render wrong.
 - Proxy mode commands after `Ctrl-G`: `user-commit`, `stage`, `unstaged`, `status`, `agent-backend opencode`, and `exit`.
 - `:user-commit` creates a user commit.
 - `:stage` reviews and optionally stages untracked files, including previously declined files.
