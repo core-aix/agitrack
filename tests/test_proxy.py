@@ -7,7 +7,7 @@ def test_proxy_ctrl_g_enters_command_mode():
     forwarded, local_echo, command, should_exit = parser.feed(b"\x07status\r")
 
     assert forwarded == []
-    assert local_echo == b"\r\n[aGiT] status\r\n"
+    assert local_echo == b""
     assert command == "status"
     assert should_exit is False
 
@@ -51,9 +51,53 @@ def test_proxy_ctrl_c_exits_in_command_capture():
     forwarded, local_echo, command, should_exit = parser.feed(b"\x07sta\x03")
 
     assert forwarded == []
-    assert local_echo == b"\r\n[aGiT] sta"
+    assert local_echo == b""
     assert command is None
     assert should_exit is True
+
+
+def test_proxy_tab_completes_command():
+    parser = ProxyInput()
+
+    forwarded, local_echo, command, should_exit = parser.feed(b"\x07sta\t\r")
+
+    assert forwarded == []
+    assert local_echo == b""
+    assert command == "status"
+    assert should_exit is False
+
+
+def test_proxy_arrow_selection_runs_selected_command():
+    parser = ProxyInput()
+
+    forwarded, local_echo, command, should_exit = parser.feed(b"\x07\x1b[B\r")
+
+    assert forwarded == []
+    assert local_echo == b""
+    assert command == "status"
+    assert should_exit is False
+
+
+def test_proxy_tab_completes_selected_command():
+    parser = ProxyInput()
+
+    forwarded, local_echo, command, should_exit = parser.feed(b"\x07\x1b[B\t\r")
+
+    assert forwarded == []
+    assert local_echo == b""
+    assert command == "status"
+    assert should_exit is False
+
+
+def test_proxy_ignores_sgr_mouse_sequences_in_command_mode():
+    parser = ProxyInput()
+
+    forwarded, local_echo, command, should_exit = parser.feed(b"\x07\x1b[<35;88;11Mstatus\r")
+
+    assert forwarded == []
+    assert local_echo == b""
+    assert command == "status"
+    assert should_exit is False
 
 
 def test_proxy_ctrl_c_exits_in_passthrough_mode():

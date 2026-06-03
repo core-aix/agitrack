@@ -28,8 +28,8 @@ class TokenUsage:
     def add(self, other: "TokenUsage") -> None:
         if other.context is not None:
             self.context = other.context
-        self.total += other.total
         self.input += other.input
+        self.total += other.total
         self.output += other.output
         self.reasoning += other.reasoning
         self.cache_read += other.cache_read

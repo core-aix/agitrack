@@ -193,12 +193,14 @@ class OpenCodeBackend:
 
         cache = tokens.get("cache") if isinstance(tokens.get("cache"), dict) else {}
         input_tokens = self._int_value(tokens.get("input"))
+        output_tokens = self._int_value(tokens.get("output"))
+        reasoning_tokens = self._int_value(tokens.get("reasoning"))
         return TokenUsage(
             context=input_tokens or None,
-            total=self._int_value(tokens.get("total")),
+            total=output_tokens + reasoning_tokens,
             input=input_tokens,
-            output=self._int_value(tokens.get("output")),
-            reasoning=self._int_value(tokens.get("reasoning")),
+            output=output_tokens,
+            reasoning=reasoning_tokens,
             cache_read=self._int_value(cache.get("read")),
             cache_write=self._int_value(cache.get("write")),
         )

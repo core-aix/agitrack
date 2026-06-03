@@ -39,17 +39,10 @@ def build_agent_commit_message(
             f"model: {model or 'unknown'}",
             f"agit_session_id: {agit_session_id}",
             f"backend_session_id: {backend_session_id or 'unknown'}",
-            f"context_tokens: {_token_value(token_usage, 'context')}",
-            f"tokens_since_last_commit_total: {_token_value(token_usage, 'total')}",
-            f"tokens_since_last_commit_input: {_token_value(token_usage, 'input')}",
-            f"tokens_since_last_commit_output: {_token_value(token_usage, 'output')}",
-            f"tokens_since_last_commit_reasoning: {_token_value(token_usage, 'reasoning')}",
-            f"tokens_since_last_commit_cache_read: {_token_value(token_usage, 'cache_read')}",
-            f"tokens_since_last_commit_cache_write: {_token_value(token_usage, 'cache_write')}",
-            f"agit_version: {__version__}",
-            f"created_at: {created_at or utc_now()}",
         ]
     )
+    lines.extend(_token_metadata_lines(token_usage))
+    lines.extend([f"agit_version: {__version__}", f"created_at: {created_at or utc_now()}"])
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -86,3 +79,23 @@ def _token_value(token_usage: dict[str, int | None] | None, key: str) -> int | s
         return "unknown"
     value = token_usage.get(key)
     return value if value is not None else "unknown"
+
+
+def _token_metadata_lines(token_usage: dict[str, int | None] | None) -> list[str]:
+    lines = [f"context_tokens: {_token_value(token_usage, 'context')}"]
+    if token_usage:
+        input_tokens = token_usage.get("input")
+        reasoning_tokens = token_usage.get("reasoning") or 0
+        if input_tokens:
+            lines.append(f"tokens_since_last_commit_input: {input_tokens}")
+        if reasoning_tokens:
+            lines.append(f"tokens_since_last_commit_reasoning: {reasoning_tokens}")
+    else:
+        lines.append("tokens_since_last_commit_input: unknown")
+    lines.extend(
+        [
+            f"tokens_since_last_commit_output_excluding_reasoning: {_token_value(token_usage, 'output')}",
+            "token_note: output excludes reasoning/thinking tokens when the backend reports them separately; reasoning may be unavailable from OpenCode export",
+        ]
+    )
+    return lines

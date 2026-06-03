@@ -12,7 +12,6 @@ AGIT_COMMANDS = {
     ":user-commit": "create a <user> commit",
     ":stage": "review untracked files",
     ":unstaged": "show intentionally unstaged files",
-    ":model": "set backend model",
     ":agent": "switch backend",
     ":exit": "exit aGiT",
     ":quit": "exit aGiT",
@@ -63,11 +62,10 @@ class AgitPrompt:
 
     def _bottom_toolbar(self):
         state = self.state_provider()
-        model = state.model or "default"
         right = f"unstaged new: {state.declined_count}  :stage" if state.declined_count else ""
         verbose = " | verbose" if state.verbose else ""
         hint = " | type : for aGiT controls, / for OpenCode controls"
-        left = f" aGiT {state.backend} | {state.repo.name} | model: {model}{verbose}{hint}"
+        left = f" aGiT {state.backend} | {state.repo.name}{verbose}{hint}"
         if not right:
             return [("class:bottom-toolbar", f"{left} ")]
         width = self._terminal_width()

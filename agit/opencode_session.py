@@ -231,12 +231,14 @@ def _token_usage(tokens: object) -> TokenUsage:
         return TokenUsage()
     cache = tokens.get("cache") if isinstance(tokens.get("cache"), dict) else {}
     input_tokens = _int(tokens.get("input"))
+    output_tokens = _int(tokens.get("output"))
+    reasoning_tokens = _int(tokens.get("reasoning"))
     return TokenUsage(
         context=input_tokens or None,
-        total=_int(tokens.get("total")),
+        total=output_tokens + reasoning_tokens,
         input=input_tokens,
-        output=_int(tokens.get("output")),
-        reasoning=_int(tokens.get("reasoning")),
+        output=output_tokens,
+        reasoning=reasoning_tokens,
         cache_read=_int(cache.get("read")),
         cache_write=_int(cache.get("write")),
     )

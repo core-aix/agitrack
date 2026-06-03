@@ -43,7 +43,7 @@ def test_opencode_parse_token_usage():
     _display, _final, session_id, _model, tokens = parsed
     assert session_id == "ses-1"
     assert tokens.context == 8869
-    assert tokens.total == 8883
+    assert tokens.total == 14
     assert tokens.input == 8869
     assert tokens.output == 14
     assert tokens.cache_write == 3
