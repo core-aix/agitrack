@@ -11,6 +11,15 @@ def test_state_is_repository_local(tmp_path):
     assert loaded.declined_untracked() == ["new.py"]
 
 
+def test_state_prunes_declined_untracked_files(tmp_path):
+    state = AgitState(tmp_path)
+    state.add_declined(["ignored.log", "keep.py", "removed.py"])
+
+    state.keep_declined(["keep.py"])
+
+    assert state.declined_untracked() == ["keep.py"]
+
+
 def test_trace_roundtrip(tmp_path):
     state = AgitState(tmp_path)
     state.append_trace("user", "hello")

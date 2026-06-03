@@ -122,6 +122,11 @@ class AgitState:
         self.data["declined_untracked_files"] = [path for path in self.declined_untracked() if path not in remove]
         self.save()
 
+    def keep_declined(self, paths: list[str]) -> None:
+        keep = set(paths)
+        self.data["declined_untracked_files"] = [path for path in self.declined_untracked() if path in keep]
+        self.save()
+
     def pending_trace(self) -> list[dict]:
         return list(self.data.get("pending_trace") or [])
 
