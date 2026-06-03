@@ -23,7 +23,7 @@ class AgitActions:
         message = input("User commit message, or blank for default: ")
         self.repo.commit(build_user_commit_message(message=message, agit_session_id=self.state.session_id))
         self.state.clear_trace()
-        print("Created <user> commit.")
+        print("Created user commit.")
         return True
 
     def create_agent_commit_from_turns(
@@ -93,7 +93,9 @@ class AgitActions:
 
     def has_pre_agent_user_changes(self) -> bool:
         declined = set(self.state.declined_untracked())
-        promptable_untracked = [path for path in self.repo.untracked_files() if path not in declined]
+        untracked = self.repo.untracked_files()
+        self.state.keep_declined(untracked)
+        promptable_untracked = [path for path in untracked if path not in declined]
         return self.repo.has_tracked_changes() or bool(promptable_untracked)
 
     def _select_paths(self, candidates: list[str]) -> list[str]:

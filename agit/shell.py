@@ -121,7 +121,7 @@ class AgitShell:
         print("Commands:")
         print("  :help              show this help")
         print("  :status            show git status")
-        print("  :user-commit       create a <user> commit")
+        print("  :user-commit       create a user commit")
         print("  :stage             review and stage untracked files")
         print("  :unstaged          show intentionally unstaged files")
         print("  :agent opencode    select the OpenCode backend")

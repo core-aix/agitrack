@@ -9,7 +9,7 @@ from pathlib import Path
 AGIT_COMMANDS = {
     ":help": "show aGiT commands",
     ":status": "show Git status",
-    ":user-commit": "create a <user> commit",
+    ":user-commit": "create a user commit",
     ":stage": "review untracked files",
     ":unstaged": "show intentionally unstaged files",
     ":agent": "switch backend",

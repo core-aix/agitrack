@@ -13,14 +13,14 @@ aGiT stands for agent + git. It is a Python library and interactive CLI that com
 ## Commit Types
 
 - Agent commits use the `<agent>` tag.
-- User-triggered commits use the `<user>` tag.
-- Before an agent acts, if user changes already exist, aGiT creates a separate `<user>` commit first.
+- User-triggered commits use the user-provided subject without an aGiT subject tag.
+- Before an agent acts, if user changes already exist, aGiT creates a separate user commit first.
 - A commit is created only when code has changed and staged changes exist.
 
 ## Commit Messages
 
 - Agent commit subjects start with `<agent>` followed immediately by the latest user query for readability.
-- User commit subjects start with `<user>` followed by the user-provided commit message.
+- User commit subjects use the user-provided commit message.
 - If the user leaves the user commit message blank, use `No user message provided`.
 - Agent commit bodies include the full interaction trace since the last code-changing commit.
 - The interaction trace includes full user prompts and final agent responses.
@@ -55,7 +55,7 @@ aGiT stands for agent + git. It is a Python library and interactive CLI that com
 - In JSON mode, aGiT commands use `:` instead of `/` so OpenCode-native slash controls are not intercepted.
 - The interactive UI should show status information and contextual command hints for both `:` aGiT controls and `/` OpenCode-native controls.
 - Intentionally unstaged-file notices should live in the status bar, not in the main transcript.
-- Proxy mode commands after `Ctrl-G`: `help`, `user-commit`, `stage`, `unstaged`, `status`, `agent opencode`, and `exit`.
+- Proxy mode commands after `Ctrl-G`: `user-commit`, `stage`, `unstaged`, `status`, `agent opencode`, and `exit`.
 - `:user-commit` creates a user commit.
 - `:stage` reviews and optionally stages untracked files, including previously declined files.
 - `:unstaged` shows intentionally unstaged files.

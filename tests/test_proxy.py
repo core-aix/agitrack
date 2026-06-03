@@ -1,4 +1,4 @@
-from agit.proxy import ProxyInput
+from agit.proxy import ProxyInput, _escape_sequence_complete
 
 
 def test_proxy_ctrl_g_enters_command_mode():
@@ -74,7 +74,7 @@ def test_proxy_arrow_selection_runs_selected_command():
 
     assert forwarded == []
     assert local_echo == b""
-    assert command == "status"
+    assert command == "stage"
     assert should_exit is False
 
 
@@ -82,6 +82,16 @@ def test_proxy_tab_completes_selected_command():
     parser = ProxyInput()
 
     forwarded, local_echo, command, should_exit = parser.feed(b"\x07\x1b[B\t\r")
+
+    assert forwarded == []
+    assert local_echo == b""
+    assert command == "stage"
+
+
+def test_proxy_enter_runs_selected_partial_match_without_tab():
+    parser = ProxyInput()
+
+    forwarded, local_echo, command, should_exit = parser.feed(b"\x07sta\r")
 
     assert forwarded == []
     assert local_echo == b""
@@ -98,6 +108,14 @@ def test_proxy_ignores_sgr_mouse_sequences_in_command_mode():
     assert local_echo == b""
     assert command == "status"
     assert should_exit is False
+
+
+def test_popup_escape_sequence_consumer_waits_for_mouse_terminator():
+    assert _escape_sequence_complete(b"\x1b[<35;88;11") is False
+    assert _escape_sequence_complete(b"\x1b[<35;88;11M") is True
+    assert _escape_sequence_complete(b"\x1b[<35;88;11m") is True
+    assert _escape_sequence_complete(b"\x1b[35;88;11") is False
+    assert _escape_sequence_complete(b"\x1b[35;88;11M") is True
 
 
 def test_proxy_ctrl_c_exits_in_passthrough_mode():

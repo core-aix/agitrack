@@ -6,6 +6,7 @@ import select
 import signal
 import sys
 import termios
+import threading
 import textwrap
 import time
 import tty
@@ -19,8 +20,18 @@ from agit.opencode_session import export_session, latest_session_id, session_bel
 from agit.state import AgitState
 
 
+def _escape_sequence_complete(sequence: bytes) -> bool:
+    if sequence.startswith(b"\x1b[<"):
+        return sequence[-1:] in {b"M", b"m"}
+    if sequence.startswith(b"\x1b[M"):
+        return len(sequence) >= 6
+    if sequence.startswith(b"\x1b["):
+        return len(sequence) >= 3 and 0x40 <= sequence[-1] <= 0x7E
+    return len(sequence) >= 2
+
+
 class ProxyInput:
-    COMMANDS = ["help", "status", "stage", "unstaged", "user-commit", "agent", "exit"]
+    COMMANDS = ["status", "stage", "unstaged", "user-commit", "agent", "exit"]
 
     def __init__(self) -> None:
         self.capturing = False
@@ -44,13 +55,7 @@ class ProxyInput:
                     if sequence in {b"\x1b[A", b"\x1b[B"}:
                         self._move_selection(-1 if sequence == b"\x1b[A" else 1)
                         self.escape_buffer = None
-                    elif sequence.startswith(b"\x1b[<"):
-                        if sequence[-1:] in {b"M", b"m"}:
-                            self.escape_buffer = None
-                    elif sequence.startswith(b"\x1b[M"):
-                        if len(sequence) >= 6:
-                            self.escape_buffer = None
-                    elif len(sequence) >= 3:
+                    elif _escape_sequence_complete(sequence):
                         self.escape_buffer = None
                     continue
                 if char == b"\x1b":
@@ -58,7 +63,7 @@ class ProxyInput:
                     continue
                 if char in {b"\r", b"\n"}:
                     typed = self.buffer.decode(errors="ignore").strip()
-                    command = typed or (self.selected() or "")
+                    command = self.selected() or typed
                     self.buffer.clear()
                     self.capturing = False
                     self.selected_index = 0
@@ -111,6 +116,10 @@ class ProxyInput:
 
 
 class ProxyRunner:
+    FILE_STABLE_SECONDS = 8.0
+    CHILD_IDLE_SECONDS = 4.0
+    POLL_SECONDS = 2.0
+
     def __init__(self, repo: GitRepo, *, verbose: bool = False) -> None:
         self.repo = repo
         self.state = AgitState(repo.repo)
@@ -132,6 +141,9 @@ class ProxyRunner:
         self.last_status_change = 0.0
         self.message: str | None = None
         self.message_until = 0.0
+        self.agent_parse_thread: threading.Thread | None = None
+        self.agent_parse_result = None
+        self.pre_agent_reconciled_status = ""
 
     def run(self) -> int:
         if not sys.stdin.isatty() or not sys.stdout.isatty():
@@ -209,8 +221,10 @@ class ProxyRunner:
                     self._render()
                 if forwarded:
                     if any(chunk in {b"\r", b"\n"} for chunk in forwarded):
-                        self._pre_agent_commit_if_needed()
-                    os.write(self.master_fd, b"".join(forwarded))
+                        if not self._pre_agent_commit_if_needed():
+                            forwarded = [chunk for chunk in forwarded if chunk not in {b"\r", b"\n"}]
+                    if forwarded:
+                        os.write(self.master_fd, b"".join(forwarded))
                 if command:
                     self._run_command(command)
             self._maybe_agent_commit()
@@ -417,17 +431,17 @@ class ProxyRunner:
 
         if name in {"stage", "user-commit"}:
             if name == "stage":
-                self._review_untracked_popup(include_declined=True)
-                self._set_message("Finished staging review.")
+                self._set_message(self._review_untracked_popup(include_declined=True))
             else:
                 created = self._create_user_commit_popup()
-                self._set_message("Created <user> commit." if created else "No staged user changes to commit.")
+                self._set_message("Created user commit." if created else "No staged user changes to commit.")
             self._render()
             return
 
         if name == "status":
             self._set_message(self.repo.status_short() or "Working tree clean")
         elif name == "unstaged":
+            self._prune_declined_untracked()
             declined = self.state.declined_untracked()
             if declined:
                 self._set_message("Intentionally unstaged: " + ", ".join(declined))
@@ -440,8 +454,8 @@ class ProxyRunner:
                 self._set_message("Backend set to opencode")
             else:
                 self._set_message("Only the opencode backend is available.")
-        elif name in {"help", ""}:
-            self._set_message("Commands: status stage unstaged user-commit agent opencode exit")
+        elif name == "":
+            self._set_message("Select an aGiT command.")
         else:
             self._set_message(f"Unknown aGiT command: {name}")
         self._render()
@@ -457,7 +471,7 @@ class ProxyRunner:
                 char = bytes([byte])
                 if escape_buffer is not None:
                     escape_buffer.extend(char)
-                    if len(escape_buffer) >= 3:
+                    if _escape_sequence_complete(bytes(escape_buffer)):
                         escape_buffer = None
                     continue
                 if char == b"\x03":
@@ -467,7 +481,8 @@ class ProxyRunner:
                     escape_buffer = bytearray(char)
                     continue
                 if char in {b"\r", b"\n"}:
-                    self.message = None
+                    self._clear_message()
+                    self._render()
                     return value
                 if char in {b"\x7f", b"\b"}:
                     value = value[:-1]
@@ -498,7 +513,7 @@ class ProxyRunner:
                     elif sequence == b"\x1b[B":
                         selected = (selected + 1) % len(options)
                         escape_buffer = None
-                    elif len(sequence) >= 3:
+                    elif _escape_sequence_complete(sequence):
                         escape_buffer = None
                     continue
                 if char == b"\x03":
@@ -508,7 +523,8 @@ class ProxyRunner:
                     escape_buffer = bytearray(char)
                     continue
                 if char in {b"\r", b"\n"}:
-                    self.message = None
+                    self._clear_message()
+                    self._render()
                     return options[selected]
 
     def _create_user_commit_popup(self) -> bool:
@@ -521,12 +537,13 @@ class ProxyRunner:
         self.state.clear_trace()
         return True
 
-    def _review_untracked_popup(self, *, include_declined: bool) -> None:
+    def _review_untracked_popup(self, *, include_declined: bool) -> str:
+        self._prune_declined_untracked()
         untracked = self.repo.untracked_files()
         declined = set(self.state.declined_untracked())
         candidates = untracked if include_declined else [path for path in untracked if path not in declined]
         if not candidates:
-            return
+            return "No untracked files to review."
         answer = self._prompt_popup(
             "Untracked Files",
             "Stage all new files? [y/N]\n" + "\n".join(candidates),
@@ -534,8 +551,10 @@ class ProxyRunner:
         if answer in {"y", "yes"}:
             self.repo.stage_paths(candidates)
             self.state.remove_declined(candidates)
+            return f"Staged {len(candidates)} untracked file(s)."
         else:
             self.state.add_declined(candidates)
+            return f"Left {len(candidates)} untracked file(s) unstaged."
 
     def _create_agent_commit_from_turns_popup(self, *, turns, backend: str, backend_session_id: str | None, model: str | None, quiet: bool) -> bool:
         if not turns:
@@ -573,6 +592,10 @@ class ProxyRunner:
         self.message = message
         self.message_until = time.monotonic() + seconds
 
+    def _clear_message(self) -> None:
+        self.message = None
+        self.message_until = 0.0
+
     def _exit_child(self) -> None:
         self.running = False
         if self.child_pid:
@@ -601,22 +624,59 @@ class ProxyRunner:
         except ProcessLookupError:
             return
 
-    def _pre_agent_commit_if_needed(self) -> None:
-        self._commit_available_agent_turns(quiet=True)
+    def _pre_agent_commit_if_needed(self) -> bool:
+        status = self.repo.status_short().strip()
+        finished = self._finish_agent_parse_if_ready(quiet=True)
+        if finished is False:
+            self.pre_agent_reconciled_status = status
+        if status and status != self.pre_agent_reconciled_status:
+            if self.agent_parse_thread and self.agent_parse_thread.is_alive():
+                self._set_message("aGiT is reconciling previous agent changes. Press Enter again shortly.")
+                self._render()
+                return False
+            if self._start_agent_parse():
+                self._set_message("aGiT is reconciling previous agent changes. Press Enter again shortly.")
+                self._render()
+                return False
         if self.actions.has_pre_agent_user_changes():
             self._set_message("User changes detected before agent runs.")
             self._render()
             self._create_user_commit_popup()
+        return True
 
-    def _commit_available_agent_turns(self, *, quiet: bool) -> bool:
-        session_id = latest_session_id(self.repo.repo) or self.state.backend_session_id
-        session = export_session(self.repo.repo, session_id) if session_id else None
+    def _prune_declined_untracked(self) -> None:
+        self.state.keep_declined(self.repo.untracked_files())
+
+    def _start_agent_parse(self) -> bool:
+        if self.agent_parse_thread and self.agent_parse_thread.is_alive():
+            return False
+        if self.agent_parse_result is not None:
+            return False
+
+        last_message_id = self.state.last_backend_message_id
+
+        def worker() -> None:
+            session_id = latest_session_id(self.repo.repo) or self.state.backend_session_id
+            session = export_session(self.repo.repo, session_id) if session_id else None
+            self.agent_parse_result = (session_id, session, last_message_id)
+
+        self.agent_parse_thread = threading.Thread(target=worker, name="agit-opencode-session-parse", daemon=True)
+        self.agent_parse_thread.start()
+        return True
+
+    def _finish_agent_parse_if_ready(self, *, quiet: bool) -> bool | None:
+        if self.agent_parse_thread and self.agent_parse_thread.is_alive():
+            return None
+        if self.agent_parse_result is None:
+            return None
+        session_id, session, last_message_id = self.agent_parse_result
+        self.agent_parse_result = None
         if not session:
             return False
         self.state.backend_session_id = session.session_id or session_id
         if session.model:
             self.state.model = session.model
-        turns = turns_after(session, self.state.last_backend_message_id)
+        turns = turns_after(session, last_message_id)
         complete_turns = [turn for turn in turns if turn.final_response]
         if not complete_turns:
             return False
@@ -632,12 +692,19 @@ class ProxyRunner:
             self.last_status = ""
         return committed
 
+    def _commit_available_agent_turns(self, *, quiet: bool) -> bool:
+        if self._finish_agent_parse_if_ready(quiet=quiet) is True:
+            return True
+        self._start_agent_parse()
+        return False
+
     def _maybe_agent_commit(self) -> None:
         now = time.monotonic()
-        if now - self.last_poll < 2.0:
+        if now - self.last_poll < self.POLL_SECONDS:
             return
         self.last_poll = now
         status = self.repo.status_short()
+        self._prune_declined_untracked()
         if status != self.last_status:
             self.last_status = status
             self.last_status_change = now
@@ -645,7 +712,11 @@ class ProxyRunner:
             if self.verbose:
                 self._render_status("no git changes")
             return
-        if now - self.last_status_change < 3.0 or now - self.last_child_output < 2.0:
+        if self.agent_parse_thread and self.agent_parse_thread.is_alive():
+            if self.verbose:
+                self._render_status("git changes found; parsing OpenCode session")
+            return
+        if now - self.last_status_change < self.FILE_STABLE_SECONDS or now - self.last_child_output < self.CHILD_IDLE_SECONDS:
             if self.verbose:
                 self._render_status("git changes found; waiting for OpenCode to become idle")
             return
