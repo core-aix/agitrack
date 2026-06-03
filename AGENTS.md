@@ -25,6 +25,7 @@ aGiT stands for agent + git. It is a Python library and interactive CLI that com
 - Agent commit bodies include the full interaction trace since the last code-changing commit.
 - The interaction trace includes full user prompts and final agent responses.
 - Do not include thinking tokens or intermediate responses.
+- Commit subjects and bodies must not contain terminal escape sequences or control characters; strip arrow-key/escape residue both where the prompt is captured and when building the message.
 - Commit bodies include metadata such as backend, backend session ID, aGiT session ID, model, commit type, and timestamps.
 - Agent commit metadata includes the current context token count and token usage accumulated since the last code-changing commit.
 - Proxy mode must baseline continued OpenCode sessions on startup so old turns do not inflate token usage for the next commit.

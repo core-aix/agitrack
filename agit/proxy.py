@@ -262,6 +262,7 @@ class ProxyRunner:
         self.last_parse_attempt_status = ""
         self.last_parse_finish = 0.0
         self.passthrough_prompt = bytearray()
+        self.passthrough_escape: bytearray | None = None
         self.pending_forwarded: list[bytes] | None = None
         self.pending_prompt_text = ""
         # Raw responses captured from the host terminal so we can answer the
@@ -367,6 +368,7 @@ class ProxyRunner:
         self.pending_forwarded = None
         self.pending_prompt_text = ""
         self.passthrough_prompt.clear()
+        self.passthrough_escape = None
         self.last_status = ""
         self.parse_pending = False
         self.status_check_pending = False
@@ -437,6 +439,7 @@ class ProxyRunner:
                             submit = False
                     if submit:
                         self.passthrough_prompt.clear()
+                        self.passthrough_escape = None
                     if forwarded:
                         if submit:
                             self.agent_in_flight = True
@@ -1066,6 +1069,7 @@ class ProxyRunner:
         self.pending_forwarded = None
         self.pending_prompt_text = ""
         self.passthrough_prompt.clear()
+        self.passthrough_escape = None
         if prompt_text:
             self._record_user_prompt(prompt_text)
         self.agent_in_flight = True
@@ -1077,6 +1081,17 @@ class ProxyRunner:
 
     def _update_passthrough_prompt(self, forwarded: list[bytes]) -> None:
         for chunk in forwarded:
+            # Drop terminal escape sequences (arrow keys, etc.) so their residue
+            # such as "[B" never leaks into the reconstructed prompt. State is
+            # kept on the instance so sequences split across reads still match.
+            if self.passthrough_escape is not None:
+                self.passthrough_escape.extend(chunk)
+                if _escape_sequence_complete(bytes(self.passthrough_escape)):
+                    self.passthrough_escape = None
+                continue
+            if chunk == b"\x1b":
+                self.passthrough_escape = bytearray(chunk)
+                continue
             if chunk in {b"\r", b"\n"}:
                 continue
             if chunk in {b"\x7f", b"\b"}:

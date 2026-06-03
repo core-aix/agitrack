@@ -203,3 +203,32 @@ def test_agent_commit_trace_is_limited_by_user_turns():
     assert "User:\nuser 1" not in message
     assert "User:\nuser 2" in message
     assert "Agent:\nagent 6" in message
+
+
+def test_subject_strips_terminal_escape_sequences():
+    # Arrow-key residue and SGR colour codes must never reach the subject.
+    message = build_user_commit_message(message="fix \x1b[Bthe \x1b[31mparser\x1b[0m bug", agit_session_id="agit-1")
+    subject = message.splitlines()[0]
+    assert subject == "fix the parser bug"
+    assert "\x1b" not in message
+
+
+def test_agent_subject_strips_orphan_mouse_and_control_chars():
+    message = build_agent_commit_message(
+        latest_prompt="run \x07tests\x1b]0;title\x07 now",
+        trace=[{"role": "user", "content": "run \x1b[Atests now"}],
+        backend="claude",
+        backend_session_id="ses-1",
+        agit_session_id="agit-1",
+        model="claude-opus-4-8",
+    )
+    subject = message.splitlines()[0]
+    assert subject == "<agent> run tests now"
+    assert "\x1b" not in message
+    assert "\x07" not in message
+
+
+def test_legitimate_bracketed_text_is_preserved():
+    # Defensive escape stripping must not damage normal bracketed prose.
+    message = build_user_commit_message(message="handle [Beta] flag and list[B]", agit_session_id="agit-1")
+    assert message.splitlines()[0] == "handle [Beta] flag and list[B]"
