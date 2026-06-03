@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "Apache-2.0"}
 authors = [{name = "aGiT contributors"}]
-dependencies = []
+dependencies = ["prompt_toolkit>=3.0"]
 
 [project.scripts]
 agit = "agit.cli:main"

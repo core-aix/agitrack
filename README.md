@@ -4,6 +4,16 @@ aGiT stands for agent + git. It is an interactive Python CLI that wraps coding-a
 
 The MVP supports OpenCode as the first backend.
 
+## Install
+
+For local development:
+
+```bash
+python3 -m pip install -e .
+```
+
+This installs the `agit` command and the terminal UI dependency used for status bars and contextual command hints.
+
 ## Usage
 
 Run in the current repository:
@@ -18,24 +28,34 @@ Run against another repository:
 agit --repo /path/to/repo
 ```
 
+Show aGiT diagnostic messages:
+
+```bash
+agit --verbose
+```
+
 Inside the interactive CLI, plain text is sent to the active agent backend:
 
 ```text
-aGiT(opencode)> fix the parser bug
+> fix the parser bug
 ```
 
-Slash commands:
+aGiT commands use `:` so OpenCode-native `/` input is not intercepted:
 
 ```text
-/help              show commands
-/status            show git status
-/user-commit       create a <user> commit
-/stage             review and stage untracked files
-/unstaged          show intentionally unstaged files
-/model <model>     set the backend model
-/agent opencode    select the OpenCode backend
-/exit              exit
+:help              show commands
+:status            show git status
+:user-commit       create a <user> commit
+:stage             review and stage untracked files
+:unstaged          show intentionally unstaged files
+:model <model>     set the backend model
+:agent opencode    select the OpenCode backend
+:exit              exit
 ```
+
+The current MVP invokes OpenCode through `opencode run --format json` for each prompt so aGiT can capture the final response and create traceable commits.
+
+When running in a terminal, aGiT shows a bottom status bar with the active backend, target repo, model, and unstaged-new-file count. Typing `:` shows aGiT command completions. Typing `/` shows common OpenCode command completions, and slash commands are forwarded to OpenCode rather than handled by aGiT.
 
 ## Commit Behavior
 
