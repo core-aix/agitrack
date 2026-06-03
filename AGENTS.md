@@ -21,7 +21,7 @@ aGiT stands for agent + git. It is a Python library and interactive CLI that com
 
 - Agent commit subjects start with `<agent>` followed immediately by the latest user query for readability.
 - User commit subjects use the user-provided commit message.
-- If the user leaves the user commit message blank, use `No user message provided`.
+- User commit messages are required; blank user commit messages are rejected.
 - Agent commit bodies include the full interaction trace since the last code-changing commit.
 - The interaction trace includes full user prompts and final agent responses.
 - Do not include thinking tokens or intermediate responses.
@@ -42,6 +42,7 @@ aGiT stands for agent + git. It is a Python library and interactive CLI that com
 - Store state in `.agit/state.json` in the target repository.
 - Ignore `.agit/` by default.
 - State includes the aGiT session ID, selected backend, selected model, backend session ID, declined untracked files, and pending interaction trace.
+- Optional repository-local config lives in `.agit/config.json`; `trace_turn_limit` defaults to `5` and controls the maximum recent user turns included in an agent commit body.
 
 ## MVP Interface
 
@@ -55,12 +56,12 @@ aGiT stands for agent + git. It is a Python library and interactive CLI that com
 - In JSON mode, aGiT commands use `:` instead of `/` so OpenCode-native slash controls are not intercepted.
 - The interactive UI should show status information and contextual command hints for both `:` aGiT controls and `/` OpenCode-native controls.
 - Intentionally unstaged-file notices should live in the status bar, not in the main transcript.
-- Proxy mode commands after `Ctrl-G`: `user-commit`, `stage`, `unstaged`, `status`, `agent opencode`, and `exit`.
+- Proxy mode commands after `Ctrl-G`: `user-commit`, `stage`, `unstaged`, `status`, `agent-backend opencode`, and `exit`.
 - `:user-commit` creates a user commit.
 - `:stage` reviews and optionally stages untracked files, including previously declined files.
 - `:unstaged` shows intentionally unstaged files.
 - `:status` shows Git status.
-- `:agent opencode` selects OpenCode.
+- `:agent-backend opencode` selects OpenCode.
 - `:exit` exits.
 
 ## OpenCode Backend

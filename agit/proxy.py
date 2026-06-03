@@ -31,7 +31,7 @@ def _escape_sequence_complete(sequence: bytes) -> bool:
 
 
 class ProxyInput:
-    COMMANDS = ["status", "stage", "unstaged", "user-commit", "agent", "exit"]
+    COMMANDS = ["status", "stage", "unstaged", "user-commit", "agent-backend", "exit"]
 
     def __init__(self) -> None:
         self.capturing = False
@@ -59,6 +59,12 @@ class ProxyInput:
                         self.escape_buffer = None
                     continue
                 if char == b"\x1b":
+                    if byte == data[-1]:
+                        self.buffer.clear()
+                        self.capturing = False
+                        self.selected_index = 0
+                        self.escape_buffer = None
+                        continue
                     self.escape_buffer = bytearray(char)
                     continue
                 if char in {b"\r", b"\n"}:
@@ -132,6 +138,7 @@ class ProxyRunner:
         self.running = True
         self.old_attrs = None
         self.original_sigwinch = None
+        self.original_signal_handlers = {}
         self.rows = 24
         self.cols = 80
         self.screen: pyte.Screen | None = None
@@ -143,7 +150,9 @@ class ProxyRunner:
         self.message_until = 0.0
         self.agent_parse_thread: threading.Thread | None = None
         self.agent_parse_result = None
+        self.agent_in_flight = False
         self.pre_agent_reconciled_status = ""
+        self.passthrough_prompt = bytearray()
 
     def run(self) -> int:
         if not sys.stdin.isatty() or not sys.stdout.isatty():
@@ -161,11 +170,19 @@ class ProxyRunner:
             self._set_raw()
             self._resize_child()
             self.original_sigwinch = signal.getsignal(signal.SIGWINCH)
+            self.original_signal_handlers = {
+                signal.SIGTERM: signal.getsignal(signal.SIGTERM),
+                signal.SIGHUP: signal.getsignal(signal.SIGHUP),
+            }
             signal.signal(signal.SIGWINCH, lambda _signum, _frame: self._resize_child())
+            signal.signal(signal.SIGTERM, self._handle_exit_signal)
+            signal.signal(signal.SIGHUP, self._handle_exit_signal)
             return self._loop()
         finally:
             if self.original_sigwinch is not None:
                 signal.signal(signal.SIGWINCH, self.original_sigwinch)
+            for signum, handler in self.original_signal_handlers.items():
+                signal.signal(signum, handler)
             self._cleanup_child()
             self._restore_terminal()
             if self.master_fd is not None:
@@ -211,6 +228,7 @@ class ProxyRunner:
                 self._render()
             if sys.stdin.fileno() in readable:
                 data = os.read(sys.stdin.fileno(), 4096)
+                was_capturing = self.input.capturing
                 forwarded, local_echo, command, should_exit = self.input.feed(data)
                 if should_exit:
                     self._exit_child()
@@ -219,11 +237,21 @@ class ProxyRunner:
                     self._render_status(local_echo.decode(errors="ignore"))
                 if self.input.capturing:
                     self._render()
+                elif was_capturing and command is None:
+                    self._render()
                 if forwarded:
-                    if any(chunk in {b"\r", b"\n"} for chunk in forwarded):
-                        if not self._pre_agent_commit_if_needed():
+                    submit = any(chunk in {b"\r", b"\n"} for chunk in forwarded)
+                    self._update_passthrough_prompt(forwarded)
+                    if submit:
+                        prompt_text = self.passthrough_prompt.decode(errors="ignore").strip()
+                        if not self._pre_agent_commit_if_needed(prompt_text):
                             forwarded = [chunk for chunk in forwarded if chunk not in {b"\r", b"\n"}]
+                            submit = False
+                    if submit:
+                        self.passthrough_prompt.clear()
                     if forwarded:
+                        if submit:
+                            self.agent_in_flight = True
                         os.write(self.master_fd, b"".join(forwarded))
                 if command:
                     self._run_command(command)
@@ -272,13 +300,13 @@ class ProxyRunner:
         if self.screen is None:
             return
         parts = ["\x1b[0m\x1b[?25l\x1b[H"]
-        for line in self.screen.display[: max(self.rows - 1, 1)]:
+        for row in range(max(self.rows - 1, 1)):
             # Prefer reliable visibility over partial color fidelity. pyte does
             # not preserve every terminal color/palette mode OpenCode uses, and
             # reconstructing styles cell-by-cell can render text invisible when
             # foreground/background defaults are interpreted differently by the
             # host terminal.
-            parts.append("\x1b[0m" + line[: self.cols].ljust(self.cols))
+            parts.append("\x1b[0m" + self._plain_row(row))
             parts.append("\r\n")
         parts.append(self._status_line())
         if self.input.capturing:
@@ -333,6 +361,15 @@ class ProxyRunner:
             if row + offset >= self.rows:
                 break
             parts.append(f"\x1b[{row + offset};{col}H\x1b[0m{line}")
+
+    def _plain_row(self, row: int) -> str:
+        assert self.screen is not None
+        cells = self.screen.buffer.get(row, {})
+        chars = []
+        for col in range(self.cols):
+            cell = cells.get(col)
+            chars.append((getattr(cell, "data", None) or " ")[:1] if cell is not None else " ")
+        return "".join(chars)
 
     def _render_row(self, row: int) -> str:
         assert self.screen is not None
@@ -447,8 +484,12 @@ class ProxyRunner:
                 self._set_message("Intentionally unstaged: " + ", ".join(declined))
             else:
                 self._set_message("No intentionally unstaged files.")
-        elif name == "agent":
+        elif name == "agent-backend":
             selected = arg.strip() or self._select_popup("Backend Agent", ["opencode"])
+            if selected is None:
+                self._set_message("Cancelled.")
+                self._render()
+                return
             if selected == "opencode":
                 self.state.backend = "opencode"
                 self._set_message("Backend set to opencode")
@@ -460,13 +501,17 @@ class ProxyRunner:
             self._set_message(f"Unknown aGiT command: {name}")
         self._render()
 
-    def _prompt_popup(self, title: str, prompt: str, *, default: str = "") -> str:
+    def _prompt_popup(self, title: str, prompt: str, *, default: str = "") -> str | None:
         value = default
         escape_buffer: bytearray | None = None
         while True:
             self._set_message(f"{title}\n{prompt}\n> {value}", seconds=60)
             self._render()
             data = os.read(sys.stdin.fileno(), 32)
+            if data == b"\x1b":
+                self._clear_message()
+                self._render()
+                return None
             for byte in data:
                 char = bytes([byte])
                 if escape_buffer is not None:
@@ -476,7 +521,7 @@ class ProxyRunner:
                     continue
                 if char == b"\x03":
                     self._exit_child()
-                    return value
+                    return None
                 if char == b"\x1b":
                     escape_buffer = bytearray(char)
                     continue
@@ -489,7 +534,7 @@ class ProxyRunner:
                 elif byte >= 32:
                     value += char.decode(errors="ignore")
 
-    def _select_popup(self, title: str, options: list[str]) -> str:
+    def _select_popup(self, title: str, options: list[str]) -> str | None:
         if not options:
             return ""
         selected = 0
@@ -502,6 +547,10 @@ class ProxyRunner:
             self._set_message("\n".join(lines), seconds=60)
             self._render()
             data = os.read(sys.stdin.fileno(), 32)
+            if data == b"\x1b":
+                self._clear_message()
+                self._render()
+                return None
             for byte in data:
                 char = bytes([byte])
                 if escape_buffer is not None:
@@ -518,7 +567,7 @@ class ProxyRunner:
                     continue
                 if char == b"\x03":
                     self._exit_child()
-                    return options[selected]
+                    return None
                 if char == b"\x1b":
                     escape_buffer = bytearray(char)
                     continue
@@ -532,7 +581,13 @@ class ProxyRunner:
         self._review_untracked_popup(include_declined=False)
         if not self.repo.has_staged_changes():
             return False
-        message = self._prompt_popup("User Commit", "Commit message, or blank for default:")
+        message = ""
+        prompt = "Commit message:"
+        while not message.strip():
+            message = self._prompt_popup("User Commit", prompt)
+            if message is None:
+                return False
+            prompt = "Commit message is required. Enter a commit message:"
         self.repo.commit(build_user_commit_message(message=message, agit_session_id=self.state.session_id))
         self.state.clear_trace()
         return True
@@ -547,7 +602,10 @@ class ProxyRunner:
         answer = self._prompt_popup(
             "Untracked Files",
             "Stage all new files? [y/N]\n" + "\n".join(candidates),
-        ).strip().lower()
+        )
+        if answer is None:
+            return "Cancelled."
+        answer = answer.strip().lower()
         if answer in {"y", "yes"}:
             self.repo.stage_paths(candidates)
             self.state.remove_declined(candidates)
@@ -559,19 +617,31 @@ class ProxyRunner:
     def _create_agent_commit_from_turns_popup(self, *, turns, backend: str, backend_session_id: str | None, model: str | None, quiet: bool) -> bool:
         if not turns:
             return False
+        pending_users = [item.get("content") for item in self.state.pending_trace() if item.get("role") == "user" and item.get("content")]
+        remaining_pending_users = list(pending_users)
+        self.state.data["pending_trace"] = []
+        self.state.save()
+        subject_prompts: list[str] = []
         for turn in turns:
             if turn.user_prompt:
+                subject_prompts.append(turn.user_prompt)
                 self.state.append_trace("user", turn.user_prompt)
+                if turn.user_prompt in remaining_pending_users:
+                    remaining_pending_users.remove(turn.user_prompt)
             if turn.final_response:
                 self.state.append_trace("agent", turn.final_response)
             self.state.add_token_usage(turn.tokens)
+
+        for pending_user in remaining_pending_users:
+            subject_prompts.append(pending_user)
+            self.state.append_trace("user", pending_user)
 
         self.repo.add_tracked()
         self._review_untracked_popup(include_declined=False)
         if not self.repo.has_staged_changes():
             return False
 
-        latest_prompt = next((turn.user_prompt for turn in reversed(turns) if turn.user_prompt), "OpenCode changes")
+        latest_prompt = " / ".join(subject_prompts) or "OpenCode changes"
         self.repo.commit(
             build_agent_commit_message(
                 latest_prompt=latest_prompt,
@@ -581,6 +651,7 @@ class ProxyRunner:
                 agit_session_id=self.state.session_id,
                 model=model or self.state.model,
                 token_usage=self.state.pending_token_usage(),
+                trace_turn_limit=self.state.trace_turn_limit,
             )
         )
         self.state.clear_trace()
@@ -598,11 +669,19 @@ class ProxyRunner:
 
     def _exit_child(self) -> None:
         self.running = False
+        self._disable_host_terminal_modes()
         if self.child_pid:
             try:
                 os.kill(self.child_pid, signal.SIGINT)
             except ProcessLookupError:
                 pass
+
+    def _handle_exit_signal(self, signum, _frame) -> None:
+        self.running = False
+        self._disable_host_terminal_modes()
+        self._cleanup_child()
+        self._restore_terminal()
+        raise SystemExit(128 + int(signum))
 
     def _cleanup_child(self) -> None:
         if not self.child_pid:
@@ -624,9 +703,15 @@ class ProxyRunner:
         except ProcessLookupError:
             return
 
-    def _pre_agent_commit_if_needed(self) -> bool:
+    def _pre_agent_commit_if_needed(self, prompt_text: str = "") -> bool:
+        self._clear_agent_in_flight_if_idle()
         status = self.repo.status_short().strip()
         finished = self._finish_agent_parse_if_ready(quiet=True)
+        if finished is True:
+            self.pre_agent_reconciled_status = ""
+        if status and self._agent_is_active():
+            self._record_user_prompt(prompt_text)
+            return True
         if finished is False:
             self.pre_agent_reconciled_status = status
         if status and status != self.pre_agent_reconciled_status:
@@ -646,6 +731,28 @@ class ProxyRunner:
 
     def _prune_declined_untracked(self) -> None:
         self.state.keep_declined(self.repo.untracked_files())
+
+    def _update_passthrough_prompt(self, forwarded: list[bytes]) -> None:
+        for chunk in forwarded:
+            if chunk in {b"\r", b"\n"}:
+                continue
+            if chunk in {b"\x7f", b"\b"}:
+                if self.passthrough_prompt:
+                    self.passthrough_prompt.pop()
+                continue
+            if len(chunk) == 1 and chunk[0] >= 32:
+                self.passthrough_prompt.extend(chunk)
+
+    def _agent_is_active(self) -> bool:
+        return self.agent_in_flight or (self.agent_parse_thread is not None and self.agent_parse_thread.is_alive())
+
+    def _clear_agent_in_flight_if_idle(self) -> None:
+        if self.agent_in_flight and time.monotonic() - self.last_child_output >= self.CHILD_IDLE_SECONDS:
+            self.agent_in_flight = False
+
+    def _record_user_prompt(self, prompt_text: str) -> None:
+        if prompt_text:
+            self.state.append_trace("user", prompt_text)
 
     def _start_agent_parse(self) -> bool:
         if self.agent_parse_thread and self.agent_parse_thread.is_alive():
@@ -681,13 +788,14 @@ class ProxyRunner:
         if not complete_turns:
             return False
         committed = self._create_agent_commit_from_turns_popup(
-            turns=complete_turns,
+            turns=turns,
             backend="opencode",
             backend_session_id=self.state.backend_session_id,
             model=session.model or self.state.model,
             quiet=quiet,
         )
         if committed:
+            self.agent_in_flight = False
             self.state.last_backend_message_id = complete_turns[-1].assistant_message_id
             self.last_status = ""
         return committed
@@ -703,6 +811,7 @@ class ProxyRunner:
         if now - self.last_poll < self.POLL_SECONDS:
             return
         self.last_poll = now
+        self._clear_agent_in_flight_if_idle()
         status = self.repo.status_short()
         self._prune_declined_untracked()
         if status != self.last_status:
@@ -747,13 +856,19 @@ class ProxyRunner:
 
     def _restore_terminal(self) -> None:
         self._set_cooked()
+        self._disable_host_terminal_modes()
+        os.write(sys.stdout.fileno(), b"\x1b[?1049l\x1b[0m\r\n")
+
+    def _disable_host_terminal_modes(self) -> None:
         # Reset modes commonly enabled by full-screen TUIs: mouse tracking,
-        # bracketed paste, alternate screen, cursor visibility, and styling.
+        # focus reporting, bracketed paste, alternate-scroll, cursor visibility,
+        # and styling. Emit this independently from cooked-mode restoration so it
+        # can also run from signal handlers before Python exits.
         os.write(
             sys.stdout.fileno(),
-            b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l"
-            b"\x1b[?9l\x1b[?1001l\x1b[?1004l\x1b[?1007l\x1b[?1016l\x1b[?2004l"
-            b"\x1b[?25h\x1b[?1049l\x1b[0m\r\n",
+            b"\x1b[?9l\x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l\x1b[?1004l"
+            b"\x1b[?1005l\x1b[?1006l\x1b[?1007l\x1b[?1015l\x1b[?1016l\x1b[?2004l"
+            b"\x1b[?25h\x1b[0m",
         )
 
     def _resize_child(self) -> None:

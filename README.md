@@ -49,7 +49,7 @@ status            show git status
 user-commit       create a user commit
 stage             review and stage untracked files
 unstaged          show intentionally unstaged files
-agent opencode    select the OpenCode backend
+agent-backend opencode select the OpenCode backend
 exit              exit
 ```
 
@@ -69,7 +69,7 @@ JSON mode aGiT commands use `:` so OpenCode-native `/` input is not intercepted:
 :user-commit       create a user commit
 :stage             review and stage untracked files
 :unstaged          show intentionally unstaged files
-:agent opencode    select the OpenCode backend
+:agent-backend opencode select the OpenCode backend
 :exit              exit
 ```
 
@@ -90,3 +90,15 @@ In JSON mode, aGiT shows a bottom status bar with the active backend, target rep
 - Proxy mode preserves OpenCode's selected model in commit metadata when it can be read from exported session data.
 - User commits use the user-provided subject and include aGiT metadata.
 - Commits are created only when staged changes exist.
+
+## Configuration
+
+Repository-local configuration can be stored in `.agit/config.json`:
+
+```json
+{
+  "trace_turn_limit": 5
+}
+```
+
+`trace_turn_limit` controls the maximum number of recent user turns included in an agent commit body. The default is `5`.

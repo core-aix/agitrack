@@ -10,7 +10,9 @@ class AgitState:
     def __init__(self, repo: Path) -> None:
         self.repo = repo
         self.path = repo / ".agit" / "state.json"
+        self.config_path = repo / ".agit" / "config.json"
         self.data = self._load()
+        self.config = self._load_config()
 
     def _load(self) -> dict[str, Any]:
         if not self.path.exists():
@@ -41,6 +43,18 @@ class AgitState:
                 "cache_write": 0,
             },
         }
+
+    def _default_config(self) -> dict[str, Any]:
+        return {"trace_turn_limit": 5}
+
+    def _load_config(self) -> dict[str, Any]:
+        default = self._default_config()
+        if not self.config_path.exists():
+            return default
+        with self.config_path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        default.update(data if isinstance(data, dict) else {})
+        return default
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -129,6 +143,11 @@ class AgitState:
 
     def pending_trace(self) -> list[dict]:
         return list(self.data.get("pending_trace") or [])
+
+    @property
+    def trace_turn_limit(self) -> int:
+        value = self.config.get("trace_turn_limit", 5)
+        return value if isinstance(value, int) and value > 0 else 5
 
     def append_trace(self, role: str, content: str) -> None:
         trace = self.pending_trace()

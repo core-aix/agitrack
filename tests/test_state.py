@@ -70,3 +70,14 @@ def test_backend_session_is_repo_scoped(tmp_path):
 
     state.data["backend_session_repo"] = str(tmp_path / "other")
     assert state.backend_session_matches_repo() is False
+
+
+def test_trace_turn_limit_defaults_and_reads_config(tmp_path):
+    state = AgitState(tmp_path)
+    assert state.trace_turn_limit == 5
+
+    config = tmp_path / ".agit" / "config.json"
+    config.parent.mkdir(parents=True)
+    config.write_text('{"trace_turn_limit": 3}\n', encoding="utf-8")
+
+    assert AgitState(tmp_path).trace_turn_limit == 3
