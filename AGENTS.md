@@ -27,6 +27,7 @@ aGiT stands for agent + git. It is a Python library and interactive CLI that com
 - Do not include thinking tokens or intermediate responses.
 - Commit bodies include metadata such as backend, backend session ID, aGiT session ID, model, commit type, and timestamps.
 - Agent commit metadata includes the current context token count and token usage accumulated since the last code-changing commit.
+- Proxy mode must baseline continued OpenCode sessions on startup so old turns do not inflate token usage for the next commit.
 
 ## Staging Behavior
 
@@ -50,15 +51,15 @@ aGiT stands for agent + git. It is a Python library and interactive CLI that com
 - `agit --verbose` shows aGiT diagnostic messages; normal mode should avoid debug/status chatter.
 - Plain text input is sent to the active agent backend.
 - In proxy mode, all printable input is forwarded to OpenCode; aGiT controls are opened with `Ctrl-G`.
+- Proxy mode command palette previews aGiT commands; Up/Down selects, Tab completes, and Enter runs the selected command.
 - In JSON mode, aGiT commands use `:` instead of `/` so OpenCode-native slash controls are not intercepted.
 - The interactive UI should show status information and contextual command hints for both `:` aGiT controls and `/` OpenCode-native controls.
 - Intentionally unstaged-file notices should live in the status bar, not in the main transcript.
-- Proxy mode commands after `Ctrl-G`: `help`, `user-commit`, `stage`, `unstaged`, `status`, `model <model>`, `agent opencode`, and `exit`.
+- Proxy mode commands after `Ctrl-G`: `help`, `user-commit`, `stage`, `unstaged`, `status`, `agent opencode`, and `exit`.
 - `:user-commit` creates a user commit.
 - `:stage` reviews and optionally stages untracked files, including previously declined files.
 - `:unstaged` shows intentionally unstaged files.
 - `:status` shows Git status.
-- `:model <model>` sets the backend model.
 - `:agent opencode` selects OpenCode.
 - `:exit` exits.
 

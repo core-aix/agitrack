@@ -46,9 +46,6 @@ class AgitShell:
             self._print_help()
         elif command == ":status":
             print(self.repo.status_short() or "Working tree clean")
-        elif command == ":model":
-            self.state.model = arg.strip() or None
-            print(f"Model set to {self.state.model or 'backend default'}")
         elif command == ":agent":
             agent = arg.strip()
             if agent != "opencode":
@@ -127,7 +124,6 @@ class AgitShell:
         print("  :user-commit       create a <user> commit")
         print("  :stage             review and stage untracked files")
         print("  :unstaged          show intentionally unstaged files")
-        print("  :model <model>     set the backend model")
         print("  :agent opencode    select the OpenCode backend")
         print("  :exit              exit")
         print("OpenCode / commands are not reserved by aGiT and are sent to the backend.")

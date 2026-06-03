@@ -50,10 +50,11 @@ status            show git status
 user-commit       create a <user> commit
 stage             review and stage untracked files
 unstaged          show intentionally unstaged files
-model <model>     set the backend model for the next OpenCode launch
 agent opencode    select the OpenCode backend
 exit              exit
 ```
+
+The command palette previews available commands. Use Up/Down to select a command, Tab to complete it, and Enter to run it.
 
 In JSON mode, plain text is sent to the active agent backend:
 
@@ -69,7 +70,6 @@ JSON mode aGiT commands use `:` so OpenCode-native `/` input is not intercepted:
 :user-commit       create a <user> commit
 :stage             review and stage untracked files
 :unstaged          show intentionally unstaged files
-:model <model>     set the backend model
 :agent opencode    select the OpenCode backend
 :exit              exit
 ```
@@ -86,7 +86,8 @@ In JSON mode, aGiT shows a bottom status bar with the active backend, target rep
 - New untracked files require confirmation before staging.
 - Declined untracked files are remembered in repository-local `.agit/state.json`.
 - Agent commits use the `<agent>` tag and include the full interaction trace since the last code-changing commit.
-- Agent commit metadata includes context token count and token usage accumulated since the last code-changing commit.
+- Agent commit metadata includes context token count and generated token usage accumulated since the last code-changing commit.
+- Proxy mode baselines the continued OpenCode session on startup so token metadata only includes turns after aGiT starts tracking new changes.
 - Proxy mode preserves OpenCode's selected model in commit metadata when it can be read from exported session data.
 - User commits use the `<user>` tag and include aGiT metadata.
 - Commits are created only when staged changes exist.

@@ -45,7 +45,7 @@ def test_parse_exported_session_turns_model_and_tokens():
     assert session.turns[0].user_prompt == "fix it"
     assert session.turns[0].final_response == "fixed"
     assert session.turns[0].model == "openai/gpt-5.5"
-    assert session.turns[0].tokens.total == 99
+    assert session.turns[0].tokens.total == 9
 
 
 def test_parse_exported_session_groups_multiple_assistants_until_next_user():
@@ -69,7 +69,32 @@ def test_parse_exported_session_groups_multiple_assistants_until_next_user():
     assert len(session.turns) == 1
     assert session.turns[0].assistant_message_id == "a-final"
     assert session.turns[0].final_response == "Added countdown timer."
-    assert session.turns[0].tokens.total == 12
+    assert session.turns[0].tokens.total == 2
+    assert session.turns[0].tokens.input == 5
+
+
+def test_parse_exported_session_counts_reasoning_part_tokens():
+    session = parse_exported_session(
+        {
+            "info": {"id": "ses-1"},
+            "messages": [
+                {"info": {"role": "user", "id": "u1"}, "parts": [{"type": "text", "text": "think"}]},
+                {
+                    "info": {"role": "assistant", "id": "a1", "finish": "stop"},
+                    "parts": [
+                        {"type": "reasoning", "tokens": {"input": 10, "output": 0, "reasoning": 6, "cache": {"read": 4}}},
+                        {"type": "text", "text": "done", "tokens": {"input": 12, "output": 2, "reasoning": 0}},
+                    ],
+                },
+            ],
+        }
+    )
+
+    assert session.turns[0].tokens.context == 12
+    assert session.turns[0].tokens.input == 22
+    assert session.turns[0].tokens.total == 8
+    assert session.turns[0].tokens.reasoning == 6
+    assert session.turns[0].tokens.cache_read == 4
 
 
 def test_turns_after_last_message_id():
