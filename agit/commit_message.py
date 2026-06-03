@@ -1,12 +1,25 @@
 from __future__ import annotations
 
-from textwrap import shorten
+import re
+from textwrap import shorten, wrap
 
 from agit import __version__
 
-DEFAULT_USER_MESSAGE = "No user message provided"
-MAX_SUBJECT_WIDTH = 72
+DEFAULT_SUBJECT = "No subject provided"
+MAX_SUBJECT_WIDTH = 50
+MAX_BODY_WIDTH = 72
 AGENT_SUBJECT_PREFIX = "<agent> "
+SECRET_MASK = "[REDACTED]"
+SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b(api[_-]?key|access[_-]?token|auth[_-]?token|token|secret|password|passwd|authorization)\b(\s*[:=]\s*)([^\s,;]+)"
+)
+SECRET_TOKEN_RES = [
+    re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{20,}\b"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+]
+MOUSE_REPORT_RE = re.compile(r"(?:\x1b)?\[<\d+;\d+;\d+[Mm]")
 
 
 def build_agent_commit_message(
@@ -18,14 +31,18 @@ def build_agent_commit_message(
     agit_session_id: str,
     model: str | None,
     token_usage: dict[str, int | None] | None = None,
+    trace_turn_limit: int = 5,
 ) -> str:
-    subject_prompt = _subject_text(latest_prompt, width=MAX_SUBJECT_WIDTH - len(AGENT_SUBJECT_PREFIX))
-    lines = [f"{AGENT_SUBJECT_PREFIX}{subject_prompt}", "", "Interaction Trace:"]
-    for item in trace:
+    subject_prompt, full_subject = _subject_parts(_mask_secrets(latest_prompt), width=MAX_SUBJECT_WIDTH - len(AGENT_SUBJECT_PREFIX))
+    lines = [f"{AGENT_SUBJECT_PREFIX}{subject_prompt}", ""]
+    if full_subject:
+        lines.extend(["Full subject:", *_body_lines(full_subject), ""])
+    lines.append("Interaction Trace:")
+    for item in _limit_trace_turns(trace, trace_turn_limit):
         role = item.get("role", "").strip().lower()
-        content = item.get("content", "")
+        content = _mask_secrets(item.get("content", ""))
         label = "User" if role == "user" else "Agent"
-        lines.extend([f"{label}:", content, ""])
+        lines.extend([f"{label}:", *_body_lines(content), ""])
 
     lines.extend(
         [
@@ -47,22 +64,52 @@ def build_user_commit_message(
     message: str | None,
     agit_session_id: str,
 ) -> str:
-    user_message = message.strip() if message and message.strip() else DEFAULT_USER_MESSAGE
+    user_message = message.strip() if message else ""
+    if not user_message:
+        raise ValueError("User commit message is required")
+    subject, full_subject = _subject_parts(_mask_secrets(user_message), width=MAX_SUBJECT_WIDTH)
     lines = [
-        _subject_text(user_message, width=MAX_SUBJECT_WIDTH),
+        subject,
         "",
-        "# aGiT Metadata",
-        "commit_type: user",
-        "backend: agit",
-        f"agit_session_id: {agit_session_id}",
-        f"agit_version: {__version__}",
     ]
+    if full_subject:
+        lines.extend(["Full subject:", *_body_lines(full_subject), ""])
+    lines.extend(["# aGiT Metadata", "commit_type: user", "backend: agit", f"agit_session_id: {agit_session_id}", f"agit_version: {__version__}"])
     return "\n".join(lines).rstrip() + "\n"
 
 
 def _subject_text(text: str, *, width: int) -> str:
-    one_line = " ".join(text.strip().split()) or DEFAULT_USER_MESSAGE
-    return shorten(one_line, width=width, placeholder="...")
+    return _subject_parts(text, width=width)[0]
+
+
+def _subject_parts(text: str, *, width: int) -> tuple[str, str | None]:
+    one_line = " ".join(text.strip().split()) or DEFAULT_SUBJECT
+    subject = shorten(one_line, width=width, placeholder="...")
+    return subject, one_line if subject != one_line else None
+
+
+def _body_lines(text: str) -> list[str]:
+    lines: list[str] = []
+    for raw_line in str(text).splitlines() or [""]:
+        lines.extend(wrap(raw_line, width=MAX_BODY_WIDTH, replace_whitespace=False, drop_whitespace=False) or [""])
+    return lines
+
+
+def _limit_trace_turns(trace: list[dict], turn_limit: int) -> list[dict]:
+    limit = turn_limit if isinstance(turn_limit, int) and turn_limit > 0 else 5
+    user_indexes = [index for index, item in enumerate(trace) if str(item.get("role", "")).strip().lower() == "user"]
+    if len(user_indexes) <= limit:
+        return trace
+    return trace[user_indexes[-limit] :]
+
+
+def _mask_secrets(text: object) -> str:
+    value = str(text or "")
+    value = MOUSE_REPORT_RE.sub("", value)
+    value = SECRET_ASSIGNMENT_RE.sub(lambda match: f"{match.group(1)}{match.group(2)}{SECRET_MASK}", value)
+    for pattern in SECRET_TOKEN_RES:
+        value = pattern.sub(SECRET_MASK, value)
+    return value
 
 
 def _token_value(token_usage: dict[str, int | None] | None, key: str) -> int | str:
@@ -83,10 +130,11 @@ def _token_metadata_lines(token_usage: dict[str, int | None] | None) -> list[str
             lines.append(f"tokens_since_last_commit_reasoning: {reasoning_tokens}")
     else:
         lines.append("tokens_since_last_commit_input: unknown")
+    lines.append(f"tokens_since_last_commit_output_no_reasoning: {_token_value(token_usage, 'output')}")
     lines.extend(
-        [
-            f"tokens_since_last_commit_output_excluding_reasoning: {_token_value(token_usage, 'output')}",
-            "token_note: output excludes reasoning/thinking tokens when the backend reports them separately; reasoning may be unavailable from OpenCode export",
-        ]
+        _body_lines(
+            "token_note: output excludes reasoning/thinking tokens when the backend "
+            "reports them separately; reasoning may be unavailable from OpenCode export"
+        )
     )
     return lines

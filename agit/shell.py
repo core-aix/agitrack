@@ -46,7 +46,7 @@ class AgitShell:
             self._print_help()
         elif command == ":status":
             print(self.repo.status_short() or "Working tree clean")
-        elif command == ":agent":
+        elif command == ":agent-backend":
             agent = arg.strip()
             if agent != "opencode":
                 print("Only the opencode backend is available in the MVP.")
@@ -104,6 +104,7 @@ class AgitShell:
                     agit_session_id=self.state.session_id,
                     model=self.state.model,
                     token_usage=self.state.pending_token_usage(),
+                    trace_turn_limit=self.state.trace_turn_limit,
                 )
             )
             self.state.clear_trace()
@@ -124,7 +125,7 @@ class AgitShell:
         print("  :user-commit       create a user commit")
         print("  :stage             review and stage untracked files")
         print("  :unstaged          show intentionally unstaged files")
-        print("  :agent opencode    select the OpenCode backend")
+        print("  :agent-backend opencode select the OpenCode backend")
         print("  :exit              exit")
         print("OpenCode / commands are not reserved by aGiT and are sent to the backend.")
 

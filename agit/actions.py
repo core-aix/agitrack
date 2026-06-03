@@ -20,7 +20,11 @@ class AgitActions:
             if self.verbose:
                 print("No staged user changes to commit.")
             return False
-        message = input("User commit message, or blank for default: ")
+        message = ""
+        while not message.strip():
+            message = input("User commit message: ")
+            if not message.strip():
+                print("User commit message is required.")
         self.repo.commit(build_user_commit_message(message=message, agit_session_id=self.state.session_id))
         self.state.clear_trace()
         print("Created user commit.")
@@ -58,6 +62,7 @@ class AgitActions:
             agit_session_id=self.state.session_id,
             model=model or self.state.model,
             token_usage=self.state.pending_token_usage(),
+            trace_turn_limit=self.state.trace_turn_limit,
         )
         self.repo.commit(message)
         self.state.clear_trace()

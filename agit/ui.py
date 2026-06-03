@@ -12,7 +12,7 @@ AGIT_COMMANDS = {
     ":user-commit": "create a user commit",
     ":stage": "review untracked files",
     ":unstaged": "show intentionally unstaged files",
-    ":agent": "switch backend",
+    ":agent-backend": "switch backend",
     ":exit": "exit aGiT",
     ":quit": "exit aGiT",
 }
