@@ -22,6 +22,8 @@ Run in the current repository:
 agit
 ```
 
+By default, `agit` runs in proxy mode: it launches the real OpenCode TUI in a pseudo-terminal, renders it through an internal terminal screen, and reserves a bottom status line for aGiT. Press `Ctrl-G` to enter aGiT command mode.
+
 Run against another repository:
 
 ```bash
@@ -34,13 +36,32 @@ Show aGiT diagnostic messages:
 agit --verbose
 ```
 
-Inside the interactive CLI, plain text is sent to the active agent backend:
+Use the structured JSON fallback mode:
+
+```bash
+agit --mode json
+```
+
+In proxy mode, press `Ctrl-G`, then type one of these aGiT commands:
+
+```text
+help              show commands
+status            show git status
+user-commit       create a <user> commit
+stage             review and stage untracked files
+unstaged          show intentionally unstaged files
+model <model>     set the backend model for the next OpenCode launch
+agent opencode    select the OpenCode backend
+exit              exit
+```
+
+In JSON mode, plain text is sent to the active agent backend:
 
 ```text
 > fix the parser bug
 ```
 
-aGiT commands use `:` so OpenCode-native `/` input is not intercepted:
+JSON mode aGiT commands use `:` so OpenCode-native `/` input is not intercepted:
 
 ```text
 :help              show commands
@@ -55,7 +76,9 @@ aGiT commands use `:` so OpenCode-native `/` input is not intercepted:
 
 The current MVP invokes OpenCode through `opencode run --format json` for each prompt so aGiT can capture the final response and create traceable commits.
 
-When running in a terminal, aGiT shows a bottom status bar with the active backend, target repo, model, and unstaged-new-file count. Typing `:` shows aGiT command completions. Typing `/` shows common OpenCode command completions, and slash commands are forwarded to OpenCode rather than handled by aGiT.
+Proxy mode launches OpenCode's native TUI directly and uses `opencode export` to recover session metadata for automatic agent commits.
+
+In JSON mode, aGiT shows a bottom status bar with the active backend, target repo, model, and unstaged-new-file count. Typing `:` shows aGiT command completions. Typing `/` shows common OpenCode command completions, and slash commands are forwarded to OpenCode rather than handled by aGiT.
 
 ## Commit Behavior
 
@@ -64,5 +87,6 @@ When running in a terminal, aGiT shows a bottom status bar with the active backe
 - Declined untracked files are remembered in repository-local `.agit/state.json`.
 - Agent commits use the `<agent>` tag and include the full interaction trace since the last code-changing commit.
 - Agent commit metadata includes context token count and token usage accumulated since the last code-changing commit.
+- Proxy mode preserves OpenCode's selected model in commit metadata when it can be read from exported session data.
 - User commits use the `<user>` tag and include aGiT metadata.
 - Commits are created only when staged changes exist.

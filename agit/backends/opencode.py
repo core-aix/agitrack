@@ -113,7 +113,7 @@ class OpenCodeBackend:
             return None
 
         session_id = self._find_value(event, {"sessionID", "sessionId", "session_id"})
-        model = self._find_value(event, {"model"})
+        model = self._event_model(event)
         tokens = self._event_tokens(event)
         event_type = str(event.get("type", "")).lower()
         part = event.get("part") if isinstance(event.get("part"), dict) else {}
@@ -215,6 +215,22 @@ class OpenCodeBackend:
 
     def _int_value(self, value: object) -> int:
         return value if isinstance(value, int) else 0
+
+    def _event_model(self, event: dict) -> str | None:
+        model = event.get("model")
+        if isinstance(model, dict):
+            provider = model.get("providerID") or model.get("provider")
+            model_id = model.get("modelID") or model.get("id")
+            if provider and model_id:
+                return f"{provider}/{model_id}"
+            return str(model_id) if model_id else None
+        if isinstance(model, str) and model.strip():
+            return model.strip()
+        provider = self._find_value(event, {"providerID", "provider"})
+        model_id = self._find_value(event, {"modelID"})
+        if provider and model_id:
+            return f"{provider}/{model_id}"
+        return model_id
 
     def _find_value(self, value: object, keys: set[str]) -> str | None:
         if isinstance(value, dict):

@@ -44,13 +44,16 @@ aGiT stands for agent + git. It is a Python library and interactive CLI that com
 
 ## MVP Interface
 
-- `agit` starts the interactive CLI in the current repository.
+- `agit` starts proxy mode in the current repository, launching the native OpenCode TUI through a pseudo-terminal and rendering it through an internal terminal screen with an aGiT status line.
 - `agit --repo PATH` starts the interactive CLI for another repository.
+- `agit --mode json` uses the structured JSON prompt-loop fallback.
 - `agit --verbose` shows aGiT diagnostic messages; normal mode should avoid debug/status chatter.
 - Plain text input is sent to the active agent backend.
-- aGiT commands use `:` instead of `/` so OpenCode-native slash controls are not intercepted.
+- In proxy mode, all printable input is forwarded to OpenCode; aGiT controls are opened with `Ctrl-G`.
+- In JSON mode, aGiT commands use `:` instead of `/` so OpenCode-native slash controls are not intercepted.
 - The interactive UI should show status information and contextual command hints for both `:` aGiT controls and `/` OpenCode-native controls.
 - Intentionally unstaged-file notices should live in the status bar, not in the main transcript.
+- Proxy mode commands after `Ctrl-G`: `help`, `user-commit`, `stage`, `unstaged`, `status`, `model <model>`, `agent opencode`, and `exit`.
 - `:user-commit` creates a user commit.
 - `:stage` reviews and optionally stages untracked files, including previously declined files.
 - `:unstaged` shows intentionally unstaged files.
@@ -62,5 +65,6 @@ aGiT stands for agent + git. It is a Python library and interactive CLI that com
 ## OpenCode Backend
 
 - Use the OpenCode CLI, initially through `opencode run --format json`.
+- Proxy mode uses the native OpenCode TUI and recovers metadata through `opencode session list --format json` and `opencode export`.
 - Parse the final response, backend session ID, and model when available.
 - Preserve only the final response in commit messages.

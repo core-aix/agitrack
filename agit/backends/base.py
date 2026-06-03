@@ -14,6 +14,27 @@ class TokenUsage:
     cache_read: int = 0
     cache_write: int = 0
 
+    def to_dict(self) -> dict[str, int | None]:
+        return {
+            "context": self.context,
+            "total": self.total,
+            "input": self.input,
+            "output": self.output,
+            "reasoning": self.reasoning,
+            "cache_read": self.cache_read,
+            "cache_write": self.cache_write,
+        }
+
+    def add(self, other: "TokenUsage") -> None:
+        if other.context is not None:
+            self.context = other.context
+        self.total += other.total
+        self.input += other.input
+        self.output += other.output
+        self.reasoning += other.reasoning
+        self.cache_read += other.cache_read
+        self.cache_write += other.cache_write
+
 
 @dataclass
 class AgentResult:
