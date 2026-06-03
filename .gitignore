@@ -214,5 +214,8 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
+# aGiT repository-local state
+.agit/
+
 # Streamlit
 .streamlit/secrets.toml
