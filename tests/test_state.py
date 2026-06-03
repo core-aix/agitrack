@@ -21,3 +21,14 @@ def test_trace_roundtrip(tmp_path):
     ]
     state.clear_trace()
     assert state.pending_trace() == []
+
+
+def test_state_adds_repo_local_git_exclude(tmp_path):
+    git_info = tmp_path / ".git" / "info"
+    git_info.mkdir(parents=True)
+    exclude = git_info / "exclude"
+    exclude.write_text("", encoding="utf-8")
+
+    AgitState(tmp_path).save()
+
+    assert ".agit/" in exclude.read_text(encoding="utf-8").splitlines()

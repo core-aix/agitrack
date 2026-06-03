@@ -33,9 +33,22 @@ class AgitState:
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_repo_local_ignore()
         with self.path.open("w", encoding="utf-8") as handle:
             json.dump(self.data, handle, indent=2, sort_keys=True)
             handle.write("\n")
+
+    def _ensure_repo_local_ignore(self) -> None:
+        exclude = self.repo / ".git" / "info" / "exclude"
+        if not exclude.exists():
+            return
+        content = exclude.read_text(encoding="utf-8")
+        if ".agit/" in content.splitlines():
+            return
+        with exclude.open("a", encoding="utf-8") as handle:
+            if content and not content.endswith("\n"):
+                handle.write("\n")
+            handle.write(".agit/\n")
 
     @property
     def session_id(self) -> str:

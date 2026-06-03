@@ -45,14 +45,17 @@ aGiT stands for agent + git. It is a Python library and interactive CLI that com
 
 - `agit` starts the interactive CLI in the current repository.
 - `agit --repo PATH` starts the interactive CLI for another repository.
+- `agit --verbose` shows aGiT diagnostic messages; normal mode should avoid debug/status chatter.
 - Plain text input is sent to the active agent backend.
-- `/user-commit` creates a user commit.
-- `/stage` reviews and optionally stages untracked files, including previously declined files.
-- `/unstaged` shows intentionally unstaged files.
-- `/status` shows Git status.
-- `/model <model>` sets the backend model.
-- `/agent opencode` selects OpenCode.
-- `/exit` exits.
+- aGiT commands use `:` instead of `/` so OpenCode-native slash controls are not intercepted.
+- The interactive UI should show status information and contextual command hints for both `:` aGiT controls and `/` OpenCode-native controls.
+- `:user-commit` creates a user commit.
+- `:stage` reviews and optionally stages untracked files, including previously declined files.
+- `:unstaged` shows intentionally unstaged files.
+- `:status` shows Git status.
+- `:model <model>` sets the backend model.
+- `:agent opencode` selects OpenCode.
+- `:exit` exits.
 
 ## OpenCode Backend
 

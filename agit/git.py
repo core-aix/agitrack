@@ -33,6 +33,9 @@ class GitRepo:
     def has_changes(self) -> bool:
         return bool(self.status_short().strip())
 
+    def has_tracked_changes(self) -> bool:
+        return self._diff_has_changes(["git", "diff", "--quiet"]) or self.has_staged_changes()
+
     def add_tracked(self) -> None:
         self._run(["git", "add", "-u"])
 
@@ -42,15 +45,18 @@ class GitRepo:
 
     def untracked_files(self) -> list[str]:
         output = self._run(["git", "ls-files", "--others", "--exclude-standard"]).stdout
-        return [line for line in output.splitlines() if line]
+        return [line for line in output.splitlines() if line and not line.startswith(".agit/")]
 
     def has_staged_changes(self) -> bool:
-        process = self._run(["git", "diff", "--cached", "--quiet"], check=False)
+        return self._diff_has_changes(["git", "diff", "--cached", "--quiet"])
+
+    def _diff_has_changes(self, command: list[str]) -> bool:
+        process = self._run(command, check=False)
         if process.returncode == 0:
             return False
         if process.returncode == 1:
             return True
-        raise GitError(process.stderr.strip() or "Unable to inspect staged changes")
+        raise GitError(process.stderr.strip() or "Unable to inspect changes")
 
     def commit(self, message: str) -> None:
         self._run(["git", "commit", "-F", "-"], input_text=message)
