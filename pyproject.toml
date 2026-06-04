@@ -12,10 +12,10 @@ license = {text = "Apache-2.0"}
 authors = [{name = "aGiT contributors"}]
 dependencies = [
     "coverage>=7.14.1",
-    "prompt_toolkit>=3.0",
-    "pyte>=0.8",
+    "prompt_toolkit>=3.0.52",
+    "pyte>=0.8.2",
     "pytest>=9.0.3",
-    "watchdog>=4.0",
+    "watchdog>=6.0",
 ]
 
 [project.scripts]
