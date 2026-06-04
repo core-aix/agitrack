@@ -7,7 +7,7 @@ name = "agit"
 version = "0.0.1"
 description = "Interactive agent + git commit orchestration."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10, <3.14"
 license = {text = "Apache-2.0"}
 authors = [{name = "aGiT contributors"}]
 dependencies = ["prompt_toolkit>=3.0", "pyte>=0.8", "watchdog>=4.0"]
