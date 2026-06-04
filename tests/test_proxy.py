@@ -1759,6 +1759,67 @@ def test_resume_switches_to_already_live_conversation():
     assert "_created" not in runner.__dict__
 
 
+# --- startup resume + naming ---
+
+def test_resumable_sessions_come_from_backend_repo_record():
+    import types
+
+    refs = [SessionRef(id="a", updated=1.0, label="old"),
+            SessionRef(id="b", updated=3.0, label="new"),
+            SessionRef(id="c", updated=2.0, label="mid")]
+    runner = ProxyRunner.__new__(ProxyRunner)
+    runner.base_repo = types.SimpleNamespace(repo="/repo-root")
+    asked = {}
+
+    def _list(repo):
+        asked["repo"] = repo
+        return list(refs)
+
+    runner.backend = types.SimpleNamespace(list_sessions=_list)
+
+    result = runner._resumable_sessions()
+
+    # Sourced from the repo aGiT launched in (not worktrees), newest first.
+    assert asked["repo"] == "/repo-root"
+    assert [ref.id for ref in result] == ["b", "c", "a"]
+
+
+def _startup_runner():
+    import types
+
+    runner = ProxyRunner.__new__(ProxyRunner)
+    runner._prompt_startup_name = lambda continuing: "prompted-name"
+    runner.root = types.SimpleNamespace(
+        _names={},
+        session_name_for=lambda sid: runner.root._names.get(sid),
+        name_session=lambda sid, name: runner.root._names.__setitem__(sid, name),
+    )
+    return runner
+
+
+def test_startup_name_keeps_stored_name_without_prompting():
+    runner = _startup_runner()
+    runner.root._names["sess-1"] = "alpha"
+
+    assert runner._resolve_startup_session_name(runner.root, "sess-1", None) == "alpha"
+
+
+def test_startup_name_uses_user_given_prior_worktree():
+    runner = _startup_runner()
+
+    # A non-auto prior worktree name counts as a name; an auto one does not.
+    assert runner._resolve_startup_session_name(runner.root, "sess-1", "my-feature") == "my-feature"
+
+
+def test_startup_name_prompts_when_unnamed_and_records_it():
+    runner = _startup_runner()
+
+    name = runner._resolve_startup_session_name(runner.root, "sess-1", "session-3")
+
+    assert name == "prompted-name"
+    assert runner.root._names["sess-1"] == "prompted-name"  # remembered for next time
+
+
 # --- idle worktree base-sync ---
 
 def test_sync_idle_worktrees_aligns_idle_skips_in_flight():

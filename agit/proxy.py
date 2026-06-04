@@ -623,6 +623,10 @@ class ProxyRunner:
                 message_id=self.state.last_backend_message_id,
                 model=self.state.model,
             )
+            # Remember a user-given name (not an auto session-N) keyed by the
+            # backend conversation id, so resuming it later restores the name.
+            if info.name and not self._AUTO_NAME_RE.match(info.name):
+                root.name_session(self.state.backend_session_id, info.name)
         except Exception as error:
             self._debug(f"remember backend session failed: {error!r}")
 
@@ -653,14 +657,22 @@ class ProxyRunner:
         # tree (legacy behaviour, no auto-integration) if neither is possible.
         if not self.tracking_enabled:
             return
-        backend_name = self.state.backend
-        # The repo-root state is the durable "last session" record: a session whose
-        # worktree was removed on exit left its resume pointer here.
-        prior_session_id = self.state.backend_session_id
-        prior_message_id = self.state.last_backend_message_id
-        prior_model = self.state.model
+        root_state = self.state  # the durable repo-root "last session" record
+        backend_name = root_state.backend
+        prior_message_id = root_state.last_backend_message_id
+        prior_model = root_state.model
+        prior_worktree = (root_state.recall_session(backend_name) or {}).get("worktree")
+        # Which conversation to continue at startup: aGiT's own last session if we
+        # have one, otherwise the repo's most recent backend conversation (e.g. one
+        # you ran with plain claude/opencode before aGiT). Resume is by id, which
+        # the backend resolves regardless of which directory it runs in.
+        if getattr(self, "_force_new_session", False):
+            resume_id = None
+        else:
+            resume_id = root_state.backend_session_id or self._repo_latest_session_id()
+        name = self._resolve_startup_session_name(root_state, resume_id, prior_worktree)
         try:
-            info, repo = self._open_session_worktree("session-1")
+            info, repo = self._open_session_worktree(name)
         except Exception as error:
             self._debug(f"base-merge-only setup failed; running on the base tree: {error!r}")
             return
@@ -673,16 +685,70 @@ class ProxyRunner:
         self.state = AgitState(info.path, default_backend=self.global_config.default_backend)
         self.state.backend = backend_name
         # The worktree is recreated fresh each run (its working state is not kept),
-        # so seed its resume pointer from the durable root record to continue the
-        # previous conversation. The worktree path is stable, so the backend still
-        # finds the transcript it stored there.
-        if not self.state.backend_session_id and prior_session_id:
+        # so seed its resume pointer to continue the chosen conversation.
+        if not self.state.backend_session_id and resume_id:
             if prior_model:
                 self.state.model = prior_model
             self.state.last_backend_message_id = prior_message_id
-            self.state.backend_session_id = prior_session_id  # setter records this worktree as its repo
+            self.state.backend_session_id = resume_id  # setter records this worktree as its repo
         self.backend = make_proxy_agent(backend_name)
         self.actions = AgitActions(self.repo, self.state, verbose=self.verbose)
+
+    _AUTO_NAME_RE = re.compile(r"^session-\d+$")
+
+    def _repo_latest_session_id(self) -> str | None:
+        # The conversation a bare `claude -c` / `opencode` would continue in the
+        # repo aGiT was launched in (its most recent recorded session).
+        try:
+            return self.backend.latest_session_id(self.base_repo.repo)
+        except Exception as error:
+            self._debug(f"latest_session_id failed: {error!r}")
+            return None
+
+    def _resolve_startup_session_name(self, root_state, resume_id, prior_worktree) -> str:
+        # Keep the conversation's existing (user-given) name if it has one; only
+        # prompt when there is no real name yet. Auto `session-N` names don't count.
+        existing = root_state.session_name_for(resume_id)
+        if not existing and prior_worktree and not self._AUTO_NAME_RE.match(prior_worktree):
+            existing = prior_worktree
+        if existing:
+            return existing
+        name = self._prompt_startup_name(resume_id is not None)
+        if resume_id:
+            root_state.name_session(resume_id, name)
+        return name
+
+    def _first_free_session_name(self) -> str:
+        # `session-N` not already taken by a worktree on disk. (self.sessions is
+        # not built yet at startup, so this avoids the live-session check.)
+        try:
+            used = {info.name for info in self._worktrees().list()}
+        except Exception:
+            used = set()
+        number = 1
+        while f"session-{number}" in used:
+            number += 1
+        return f"session-{number}"
+
+    def _prompt_startup_name(self, continuing: bool) -> str:
+        # Asked in cooked mode, before the alt-screen is entered.
+        default = self._first_free_session_name()
+        print("Continuing a conversation that has no name yet."
+              if continuing else "Starting a new session.")
+        try:
+            taken = {info.name for info in self._worktrees().list()}
+        except Exception:
+            taken = set()
+        while True:
+            try:
+                raw = input(f"Name this session [{default}]: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                return default
+            name = raw or default
+            if _sanitize_name(name) in taken:
+                print(f"'{name}' is already in use. Choose a different name.")
+                continue
+            return name
 
     def _align_session_to_base(self, repo: GitRepo) -> None:
         # A reused session worktree may sit on a previous run's base branch. If it
@@ -1361,16 +1427,33 @@ class ProxyRunner:
     RESUME_LIST_LIMIT = 20
 
     def _resumable_sessions(self) -> list:
-        # Recency-ordered (worktree_key, SessionRef) for every backend
-        # conversation this repo has ever run, capped for the menu.
-        lister = getattr(self.backend, "list_worktree_sessions", None)
-        if lister is None:
-            return []
+        # Past conversations come straight from the backend agent's own session
+        # record for the repo aGiT was launched in. Worktrees are ephemeral
+        # (emptied on quit), so we never key the list off them; resuming is done
+        # by session id, which the backend resolves regardless of directory.
         try:
-            return lister(self._worktrees().root)[: self.RESUME_LIST_LIMIT]
+            refs = self.backend.list_sessions(self.base_repo.repo)
         except Exception as error:
-            self._debug(f"list_worktree_sessions failed: {error!r}")
+            self._debug(f"list_sessions failed: {error!r}")
             return []
+        refs = sorted(refs, key=lambda ref: getattr(ref, "updated", 0) or 0, reverse=True)
+        return refs[: self.RESUME_LIST_LIMIT]
+
+    def _agit_named_sessions(self) -> dict:
+        # Friendly names for conversations aGiT itself created/named, keyed by
+        # backend session id, recovered from the durable repo-root record. Used
+        # only to label/resume the list that comes from the backend.
+        names: dict = {}
+        record = None
+        try:
+            root = AgitState(self.base_repo.repo, default_backend=self.global_config.default_backend)
+            names.update({str(k): str(v) for k, v in (root.data.get("session_names") or {}).items() if v})
+            record = root.recall_session(self.backend.name)
+        except Exception:
+            record = None
+        if record and record.get("id") and record.get("worktree"):
+            names.setdefault(str(record["id"]), str(record["worktree"]))
+        return names
 
     def _resume_session_menu(self) -> None:
         sessions = self._resumable_sessions()
@@ -1381,31 +1464,31 @@ class ProxyRunner:
         live_ids = {
             getattr(getattr(s, "state", None), "backend_session_id", None) for s in self.sessions
         }
+        names = self._agit_named_sessions()
         options: list[str] = []
-        for worktree_key, ref in sessions:
+        for ref in sessions:
             mark = "● " if ref.id in live_ids else "  "
-            label = (ref.label or "(no prompt recorded)").strip()[:48]
+            label = (names.get(ref.id) or ref.label or "(no prompt recorded)").strip()[:48]
             options.append(f"{mark}{_short_session(ref.id)}  {self._format_age(ref.updated)}  {label}")
         choice = self._select_popup("Resume a conversation (newest first)", options)
         if choice is None:
             self._set_message("Cancelled.")
             self._render()
             return
-        worktree_key, ref = sessions[options.index(choice)]
-        self._resume_conversation(worktree_key, ref.id)
+        ref = sessions[options.index(choice)]
+        self._resume_conversation(names.get(ref.id) or self._next_session_name(), ref.id)
 
-    def _resume_conversation(self, worktree_key: str, session_id: str) -> None:
+    def _resume_conversation(self, name: str, session_id: str) -> None:
         # If this conversation is already live, just switch to it; otherwise
-        # (re)create its worktree and resume the backend there.
+        # create a worktree for it and resume the backend by id there.
         for index, session in enumerate(self.sessions):
             if getattr(getattr(session, "state", None), "backend_session_id", None) == session_id:
                 self._switch_active(index)
                 return
-        name = worktree_key
         if self._live_session_name_taken(name):
-            # The conversation's original worktree name is occupied by a different
-            # live session — resume it under a fresh name so the two don't share a
-            # worktree (which would run two backends in one directory).
+            # The chosen name is occupied by a different live session — resume
+            # under a fresh name so the two don't share a worktree (which would
+            # run two backends in one directory).
             name = self._next_session_name()
         self._new_session(name, resume_session_id=session_id)
 
