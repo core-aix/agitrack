@@ -360,11 +360,15 @@ class ProxyRunner:
         self.sessions: list = []
         self.active_index = 0
         self.worktree_manager: WorktreeManager | None = None
-        self.debug_proxy = verbose or os.environ.get("AGIT_DEBUG_PROXY", "").strip().lower() in {"1", "true", "yes"}
-        # AGIT_DEBUG_RAW additionally records every raw child-output / user-input
-        # chunk to .agit/proxy-raw.log, so an interactive glitch (e.g. Claude's
-        # native session picker) can be replayed byte-for-byte for diagnosis.
+        # AGIT_DEBUG_RAW records every raw child-output / user-input chunk so an
+        # interactive glitch (e.g. Claude's native session picker) can be replayed
+        # byte-for-byte; it implies debug logging too.
         self.raw_capture = os.environ.get("AGIT_DEBUG_RAW", "").strip().lower() in {"1", "true", "yes"}
+        self.debug_proxy = (verbose or self.raw_capture
+                            or os.environ.get("AGIT_DEBUG_PROXY", "").strip().lower() in {"1", "true", "yes"})
+        # One diagnostic-log file per run, in the base repo's .agit/ (survives the
+        # per-run worktree teardown).
+        self._diag_run = time.strftime("%Y%m%d-%H%M%S")
 
     def run(self) -> int:
         if not sys.stdin.isatty() or not sys.stdout.isatty():
@@ -1713,11 +1717,30 @@ class ProxyRunner:
         # Reuse an existing worktree of this name (resuming it) or create a new one.
         worktrees = self._worktrees()
         path = worktrees.worktree_path(name)
-        if path.exists():
+        if self._is_valid_worktree(path):
             repo = GitRepo(path)
             return WorktreeInfo(name=path.name, path=path, branch=repo.current_branch()), repo
+        # A leftover, *invalid* dir (e.g. only `.agit/` recreated by a write after
+        # the previous run tore the worktree down) would otherwise make GitRepo
+        # fail and drop us into a fresh session — the "first restart starts new,
+        # second restart resumes" off-by-one. Clear it so `create` (which prunes
+        # first) can re-add the worktree cleanly.
+        if path.exists():
+            self._debug(f"removing invalid leftover worktree dir {path}")
+            shutil.rmtree(path, ignore_errors=True)
         info = worktrees.create(name, base=self._base_branch or self.base_repo.current_branch())
         return info, GitRepo(info.path)
+
+    def _is_valid_worktree(self, path) -> bool:
+        # A real linked worktree has a `.git` file pointing at its gitdir and a
+        # resolvable current branch; a torn-down leftover (only `.agit/`) has not.
+        if not (path / ".git").exists():
+            return False
+        try:
+            GitRepo(path).current_branch()
+            return True
+        except Exception:
+            return False
 
     def _new_session(self, name: str, *, resume_session_id: str | None = None, backend: str | None = None) -> None:
         try:
@@ -2029,11 +2052,20 @@ class ProxyRunner:
             return None  # EOF or read error with nothing buffered
         return b"".join(chunks)
 
+    def _diag_path(self, kind: str):
+        # Diagnostic logs live in the *base* repo's .agit/ (one file per run), not
+        # the session worktree's — the worktree is removed on exit, which would
+        # both destroy the log and recreate a half-dir that breaks the next resume.
+        base = getattr(self, "base_repo", None)
+        root = (base.repo if base is not None else self.repo.repo) / ".agit"
+        run = getattr(self, "_diag_run", "") or time.strftime("%Y%m%d-%H%M%S")
+        return root / f"{kind}-{run}.log"
+
     def _debug(self, message: str) -> None:
         if not getattr(self, "debug_proxy", False):
             return
         try:
-            path = self.repo.repo / ".agit" / "proxy-debug.log"
+            path = self._diag_path("proxy-debug")
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("a", encoding="utf-8") as handle:
                 handle.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {message}\n")
@@ -2041,12 +2073,12 @@ class ProxyRunner:
             pass
 
     def _raw_capture(self, tag: str, data: bytes) -> None:
-        # Append a raw I/O chunk (child output "<", user input ">", or "EOF") to
-        # .agit/proxy-raw.log for byte-exact replay of an interactive glitch.
+        # Append a raw I/O chunk (child output "<", user input ">", or "EOF") for
+        # byte-exact replay of an interactive glitch.
         if not getattr(self, "raw_capture", False):
             return
         try:
-            path = self.repo.repo / ".agit" / "proxy-raw.log"
+            path = self._diag_path("proxy-raw")
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("a", encoding="utf-8") as handle:
                 handle.write(f"{time.strftime('%H:%M:%S.')}{int(time.time() * 1000) % 1000:03d} {tag} {data!r}\n")

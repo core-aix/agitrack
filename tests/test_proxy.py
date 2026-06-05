@@ -1759,6 +1759,57 @@ def test_resume_switches_to_already_live_conversation():
     assert "_created" not in runner.__dict__
 
 
+# --- corrupted-worktree reuse / diagnostics ---
+
+def test_is_valid_worktree_rejects_leftover_without_git(tmp_path):
+    runner = ProxyRunner.__new__(ProxyRunner)
+    leftover = tmp_path / "session-1"
+    (leftover / ".agit").mkdir(parents=True)  # only .agit/, no .git → invalid
+    assert runner._is_valid_worktree(leftover) is False
+
+
+def test_open_session_worktree_recreates_corrupted_leftover(tmp_path):
+    import types
+
+    runner = ProxyRunner.__new__(ProxyRunner)
+    runner._debug = lambda *a, **k: None
+    runner._base_branch = "dev"
+    leftover = tmp_path / "session-1"
+    (leftover / ".agit").mkdir(parents=True)  # corrupted leftover
+    created = {}
+
+    def _create(name, *, base):
+        created["called"] = (name, base)
+        (tmp_path / name / ".git").parent.mkdir(parents=True, exist_ok=True)
+        return types.SimpleNamespace(name=name, path=tmp_path / name, branch="")
+
+    runner.worktree_manager = types.SimpleNamespace(
+        worktree_path=lambda name: tmp_path / name, create=_create)
+    runner._worktrees = lambda: runner.worktree_manager
+    import agit.proxy as proxymod
+    orig = proxymod.GitRepo
+    proxymod.GitRepo = lambda path: types.SimpleNamespace(current_branch=lambda: "")
+    try:
+        runner._open_session_worktree("session-1")
+    finally:
+        proxymod.GitRepo = orig
+
+    assert created["called"] == ("session-1", "dev")  # recreated, not reused
+    assert not (leftover / ".agit").exists()           # corrupted leftover was cleared first
+
+
+def test_diag_path_uses_base_repo(tmp_path):
+    import types
+
+    runner = ProxyRunner.__new__(ProxyRunner)
+    runner.base_repo = types.SimpleNamespace(repo=tmp_path / "base")
+    runner.repo = types.SimpleNamespace(repo=tmp_path / "base" / ".agit" / "worktrees" / "session-1")
+    runner._diag_run = "20260101-000000"
+    path = runner._diag_path("proxy-raw")
+    # Lands in the *base* .agit/, not the ephemeral worktree's.
+    assert path == tmp_path / "base" / ".agit" / "proxy-raw-20260101-000000.log"
+
+
 # --- worktree confinement ---
 
 def test_confine_to_worktree_wraps_when_enabled(monkeypatch):
