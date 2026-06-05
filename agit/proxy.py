@@ -160,7 +160,7 @@ class ProxyInput:
     # Order matters (shown in the palette). Only "session" starts with "s" so
     # that pressing s+Enter jumps straight to the session picker. Git-specific
     # commands are grouped under a "git-" prefix.
-    COMMANDS = ["session", "agent-backend", "git-base-branch", "git-status", "git-stage", "git-unstaged", "git-user-commit", "exit"]
+    COMMANDS = ["session", "agent-backend", "git-base-branch", "git-status", "git-stage", "git-user-commit", "exit"]
 
     def __init__(self) -> None:
         self.capturing = False
@@ -367,6 +367,10 @@ class ProxyRunner:
         self._last_base_head: str | None = None  # last-polled base HEAD, to catch out-of-band commits
         self._base_poll_at = 0.0  # throttle for the base-HEAD poll
         self._warned_backend_session = False  # one-shot "use agit to start sessions" notice
+        # The user's intentionally-unstaged files belong to the base working tree
+        # (their repo), not the ephemeral session worktree; cache the list so the
+        # status line can show its count without a per-frame disk read.
+        self._user_declined: list[str] = []
         self.sessions: list = []
         self.active_index = 0
         self.worktree_manager: WorktreeManager | None = None
@@ -407,6 +411,7 @@ class ProxyRunner:
         # branch is only advanced by integration, never edited by a live agent.
         self._base_branch = self.base_repo.current_branch()
         self._cleanup_stale_state_on_startup()
+        self._reload_user_declined()  # files the pre-agent flow left intentionally unstaged
         self._setup_base_merge_only_session()
         self._apply_new_session_if_requested()
         self._sanitize_state_trace()
@@ -596,6 +601,7 @@ class ProxyRunner:
         if self._last_base_head is not None and head != self._last_base_head:
             self._base_advanced = True
         self._last_base_head = head
+        self._prune_user_declined()  # keep the status-line count current
 
     def _warn_if_cwd_drifted(self) -> None:
         # `claude --resume` can restore a session's *saved* working directory and
@@ -2873,7 +2879,7 @@ class ProxyRunner:
         return str(base + ansi) if ansi < 8 else str(bright_base + ansi - 8)
 
     def _status_line(self) -> str:
-        declined = len([path for path in self.state.declined_untracked() if (self.repo.repo / path).exists()])
+        declined = len(getattr(self, "_user_declined", []))
         session_id = self.state.backend_session_id
         session = f"{self.name or 'session'}" + (f" [{_short_session(session_id)}]" if session_id else "")
         base = getattr(self, "_base_branch", None)
@@ -2921,22 +2927,16 @@ class ProxyRunner:
 
         if name in {"git-stage", "git-user-commit"}:
             if name == "git-stage":
-                self._set_message(self._review_untracked_popup(include_declined=True))
+                self._set_message(self._stage_files_popup())
             else:
-                created = self._create_user_commit_popup()
+                created = self._create_user_commit_popup(repo=self.base_repo, state=self._user_state())
                 self._set_message("Created user commit." if created else "No staged user changes to commit.")
+            self._reload_user_declined()
             self._render()
             return
 
         if name == "git-status":
-            self._set_message(self.repo.status_short() or "Working tree clean")
-        elif name == "git-unstaged":
-            self._prune_declined_untracked()
-            declined = self.state.declined_untracked()
-            if declined:
-                self._set_message("Intentionally unstaged: " + ", ".join(declined))
-            else:
-                self._set_message("No intentionally unstaged files.")
+            self._set_message(self.base_repo.status() or "Working tree clean")
         elif name == "agent-backend":
             backends = available_backends()
             selected = arg.strip() or self._select_popup("Backend Agent", backends)
@@ -3038,11 +3038,18 @@ class ProxyRunner:
                     self._render()
                     return options[selected]
 
-    def _create_user_commit_popup(self) -> bool:
-        self._ensure_turn_branch()
-        self.repo.add_tracked()
-        self._review_untracked_popup(include_declined=False)
-        if not self.repo.has_staged_changes():
+    def _create_user_commit_popup(self, *, repo: GitRepo | None = None, state: AgitState | None = None) -> bool:
+        # Defaults to the active worktree (capturing uncommitted worktree changes
+        # before the next prompt). The user-facing `git-user-commit` command passes
+        # the base repo/state instead, since the user's own edits live there.
+        on_worktree = repo is None
+        repo = repo or self.repo
+        state = state or self.state
+        if on_worktree:
+            self._ensure_turn_branch()  # turn branches are a worktree concept only
+        repo.add_tracked()
+        self._review_untracked_popup(include_declined=False, repo=repo, state=state)
+        if not repo.has_staged_changes():
             return False
         message = ""
         prompt = "Commit message:"
@@ -3051,14 +3058,16 @@ class ProxyRunner:
             if message is None:
                 return False
             prompt = "Commit message is required. Enter a commit message:"
-        self.repo.commit(build_user_commit_message(message=message, agit_session_id=self.state.session_id))
-        self.state.clear_trace()
+        repo.commit(build_user_commit_message(message=message, agit_session_id=state.session_id))
+        state.clear_trace()
         return True
 
-    def _review_untracked_popup(self, *, include_declined: bool) -> str:
-        self._prune_declined_untracked()
-        untracked = self.repo.untracked_files()
-        declined = set(self.state.declined_untracked())
+    def _review_untracked_popup(self, *, include_declined: bool, repo: GitRepo | None = None, state: AgitState | None = None) -> str:
+        repo = repo or self.repo
+        state = state or self.state
+        self._prune_declined_untracked(repo, state)
+        untracked = repo.untracked_files()
+        declined = set(state.declined_untracked())
         candidates = untracked if include_declined else [path for path in untracked if path not in declined]
         if not candidates:
             return "No untracked files to review."
@@ -3070,12 +3079,63 @@ class ProxyRunner:
             return "Cancelled."
         answer = answer.strip().lower()
         if answer in {"y", "yes"}:
-            self.repo.stage_paths(candidates)
-            self.state.remove_declined(candidates)
+            repo.stage_paths(candidates)
+            state.remove_declined(candidates)
             return f"Staged {len(candidates)} untracked file(s)."
         else:
-            self.state.add_declined(candidates)
+            state.add_declined(candidates)
             return f"Left {len(candidates)} untracked file(s) unstaged."
+
+    def _stage_files_popup(self) -> str:
+        # `git-stage`: one menu for the user's stageable base-tree files, in two
+        # groups — *new* files (untracked, not yet decided) and *intentionally
+        # unstaged* files (previously declined, e.g. at the pre-agent prompt). The
+        # user picks which to stage; chosen files are staged+committed so the
+        # agent's worktree (a checkout of base) can see them. Unpicked files are
+        # left as they are. Selection is per-file (numbers, or 'a' for all).
+        base, state = self.base_repo, self._user_state()
+        self._prune_declined_untracked(base, state)
+        declined = state.declined_untracked()
+        new_files = [path for path in base.untracked_files() if path not in set(declined)]
+        if not new_files and not declined:
+            return "No files to stage."
+        ordered: list[str] = []
+        lines: list[str] = ["Select files to stage:", ""]
+        for header, group in (("New files:", new_files), ("Intentionally unstaged:", declined)):
+            if not group:
+                continue
+            lines.append(header)
+            for path in group:
+                ordered.append(path)
+                lines.append(f"  {len(ordered)}. {path}")
+        lines.append("")
+        lines.append("Enter numbers (e.g. 1 3), 'a' for all, or blank to cancel:")
+        answer = self._prompt_popup("Stage Files", "\n".join(lines))
+        if answer is None:
+            return "Cancelled."
+        answer = answer.strip().lower()
+        if not answer:
+            return "Nothing staged."
+        if answer in {"a", "all"}:
+            selected = list(ordered)
+        else:
+            selected = [ordered[int(token) - 1] for token in answer.replace(",", " ").split()
+                        if token.isdigit() and 1 <= int(token) <= len(ordered)]
+        if not selected:
+            return "No valid selection; nothing staged."
+        return self._commit_user_files(selected, state)
+
+    def _commit_user_files(self, paths: list[str], state: AgitState) -> str:
+        # Stage the chosen base-tree files, drop them from the declined list, and
+        # commit them as a user commit so they reach the session worktree on the
+        # next idle base-sync. If the user cancels the message, leave them staged.
+        self.base_repo.stage_paths(paths)
+        state.remove_declined(paths)
+        message = self._prompt_popup("User Commit", "Commit message for these files:")
+        if message is None or not message.strip():
+            return f"Staged {len(paths)} file(s); run git-user-commit to commit them."
+        self.base_repo.commit(build_user_commit_message(message=message.strip(), agit_session_id=state.session_id))
+        return f"Committed {len(paths)} file(s) to {self._base_branch}."
 
     def _create_agent_commit_from_turns_popup(self, *, turns, backend: str, backend_session_id: str | None, model: str | None, quiet: bool, prompt_untracked: bool = True) -> bool:
         if not turns:
@@ -3111,7 +3171,10 @@ class ProxyRunner:
         if not self.repo.has_staged_changes():
             return False
 
-        latest_prompt = " / ".join(subject_prompts) or f"{backend} changes"
+        # The subject reflects only the most recent prompt; the full interaction
+        # trace below still records every prompt in this commit. Joining them all
+        # here bloated the subject with stale prompts from earlier in the session.
+        latest_prompt = subject_prompts[-1] if subject_prompts else f"{backend} changes"
         self.repo.commit(
             build_agent_commit_message(
                 latest_prompt=latest_prompt,
@@ -3374,8 +3437,28 @@ class ProxyRunner:
         self._clear_message()
         os.write(self.master_fd, b"".join(forwarded))
 
-    def _prune_declined_untracked(self) -> None:
-        self.state.keep_declined(self.repo.untracked_files())
+    def _prune_declined_untracked(self, repo: GitRepo | None = None, state: AgitState | None = None) -> None:
+        repo = repo or self.repo
+        state = state or self.state
+        state.keep_declined(repo.untracked_files())
+
+    def _user_state(self) -> AgitState:
+        # The user's working tree is the base repo (the session worktree is the
+        # agent's sandbox and only holds tracked files). Its intentionally-unstaged
+        # list and user commits live there. A fresh instance reads the latest
+        # on-disk state so transient base-state writers elsewhere aren't clobbered.
+        return AgitState(self.base_repo.repo, default_backend=self.global_config.default_backend)
+
+    def _reload_user_declined(self) -> None:
+        # Re-read the base repo's intentionally-unstaged list (after a command that
+        # may have changed it) and seed the status-line cache.
+        self._user_declined = self._user_state().declined_untracked()
+
+    def _prune_user_declined(self) -> None:
+        # Drop cached entries no longer untracked in the base tree (committed,
+        # staged, or deleted out-of-band). Cheap enough for the base-poll cadence.
+        untracked = set(self.base_repo.untracked_files())
+        self._user_declined = [path for path in getattr(self, "_user_declined", []) if path in untracked]
 
     def _update_passthrough_prompt(self, forwarded: list[bytes]) -> None:
         for chunk in forwarded:
