@@ -1845,13 +1845,63 @@ class ProxyRunner:
         if died:
             self._stop_session(self.sessions.index(session), commit=False)
 
+    def _ensure_worktree_alive(self) -> None:
+        if self.worktree is None:
+            return
+        if self.worktree.path.exists():
+            return
+        self._debug(f"Worktree '{self.name}' directory gone; recovering...")
+        self._teardown_child()
+        self._stop_file_watcher()
+        try:
+            self.base_repo._run(["git", "worktree", "prune"], check=False)
+        except Exception:
+            pass
+        backend_name = self.state.backend
+        try:
+            info, repo = self._open_session_worktree(self.name)
+        except Exception as error:
+            self._debug(f"worktree recovery failed: {error!r}; falling back to base tree")
+            self.worktree = None
+            self.name = "main"
+            self.repo = self.base_repo
+            self.state = AgitState(self.base_repo.repo, default_backend=self.global_config.default_backend)
+            self.state.backend = backend_name
+            self.backend = make_proxy_agent(backend_name)
+            self.actions = AgitActions(self.repo, self.state, verbose=self.verbose)
+            self._reset_agent_tracking()
+            self._sanitize_state_trace()
+            self._initialize_session_baseline()
+            self._init_screen()
+            self._spawn()
+            self._start_file_watcher()
+            self._resize_child()
+            self._enable_host_mouse()
+            self.sessions[self.active_index] = capture_session(self)
+            self._set_message("Worktree was deleted externally; now tracking base repo.", seconds=8.0)
+            self._render()
+            return
+        self.name = info.name
+        self.worktree = info
+        self.repo = repo
+        self.turn = self._turn_from_branch(repo.current_branch())
+        self.state = AgitState(info.path, default_backend=self.global_config.default_backend)
+        self.state.backend = backend_name
+        self.backend = make_proxy_agent(backend_name)
+        self.actions = AgitActions(self.repo, self.state, verbose=self.verbose)
+        self._reset_agent_tracking()
+        self._sanitize_state_trace()
+        self._initialize_session_baseline()
+        self._init_screen()
+        self._spawn()
+        self._start_file_watcher()
+        self.sessions[self.active_index] = capture_session(self)
+        self._resize_child()
+        self._enable_host_mouse()
+        self._set_message(f"Worktree was deleted externally; recreated '{info.name}'.", seconds=8.0)
+        self._render()
+
     def _with_session(self, session, fn):
-        # Run ``fn`` with ``session`` swapped onto self (its repo/state/screen
-        # become the live ones), then copy any mutations back into the snapshot
-        # and restore the previously-active session. Used to service a background
-        # session synchronously (commit/integrate) without disturbing the active
-        # one. The swap is synchronous, so the parse worker (which ``fn`` joins)
-        # never runs against the wrong session.
         if session not in self.sessions:
             return None
         saved = capture_session(self)
@@ -1864,8 +1914,6 @@ class ProxyRunner:
             restore_session(self, saved)
 
     def _commit_and_integrate_background(self) -> str:
-        # Runs with a background session swapped in: commit its finished turn (if
-        # it left changes) and try to fast-forward it into the base.
         if self.repo.has_changes():
             self._commit_latest_turn_sync()
         self._clear_agent_in_flight_if_idle()
@@ -1884,27 +1932,19 @@ class ProxyRunner:
                 continue
             session = self.sessions[index]
             if getattr(session, "merge_ctx", None) is not None:
-                # An agent merge started before this session was backgrounded;
-                # finalize it once the agent has gone idle (git-only, no input).
                 self._with_session(session, self._maybe_complete_agent_merge)
                 continue
             if now - getattr(session, "last_child_output", 0.0) < self.CHILD_IDLE_SECONDS:
-                continue  # still producing output — don't commit a turn mid-flight
+                continue
             if now - getattr(session, "last_poll", 0.0) < self.POLL_SECONDS:
                 continue
             session.last_poll = now
-            # Service every idle background session (not just ones still flagged
-            # in-flight): a finished turn's commit may not be integrated yet, and
-            # the in-flight flag is cleared on idle, so gating on it would strand
-            # the work until the user switched to the session. The body is a cheap
-            # no-op (one `git status`) when there is nothing to commit or integrate.
             if self._with_session(session, self._commit_and_integrate_background) == "conflict":
                 self._switch_active(index)
                 self._prompt_resolve_conflict(self.repo.current_branch())
-                return  # handle one conflict at a time
+                return
 
     def _open_session_worktree(self, name: str) -> tuple[WorktreeInfo, GitRepo]:
-        # Reuse an existing worktree of this name (resuming it) or create a new one.
         worktrees = self._worktrees()
         path = worktrees.worktree_path(name)
         if self._is_valid_worktree(path):
@@ -2227,6 +2267,7 @@ class ProxyRunner:
             else:
                 self._check_base_branch_drift()  # pause merging before any integration runs
                 self._resume_pending_prompt_if_ready()
+                self._ensure_worktree_alive()
                 self._maybe_agent_commit()
                 self._service_background_sessions()
                 self._poll_base_advanced()
