@@ -2211,3 +2211,95 @@ def test_sync_idle_worktrees_aligns_idle_skips_in_flight():
 
     # Active (idle) + idle background are re-pointed; the in-flight one is left alone.
     assert aligned == ["repoA", "repoC"]
+
+
+# --- user-facing git commands operate on the base tree, not the worktree -------
+#
+# A session runs in a worktree that only contains tracked files, but the user's
+# own untracked / intentionally-unstaged files live in the base working tree.
+# These commands (git-stage / git-unstaged / git-user-commit) must therefore read
+# and write the base repo + base state, or the user's files are invisible.
+
+
+def _user_git_runner(tmp_path, answers):
+    from agit.git import GitRepo
+
+    repo = GitRepo.init(tmp_path)  # seeds an initial commit; user files stay untracked
+    runner = ProxyRunner.__new__(ProxyRunner)
+    runner.base_repo = repo
+    runner.repo = repo
+    runner.global_config = type("GC", (), {"default_backend": "claude"})()
+    runner._base_branch = repo.current_branch()
+    runner._user_declined = []
+    scripted = list(answers)
+    runner._prompt_popup = lambda title, body: scripted.pop(0) if scripted else None
+    return runner, repo
+
+
+def test_git_unstaged_stages_and_commits_declined_base_files(tmp_path):
+    runner, repo = _user_git_runner(tmp_path, answers=["y", "add local config"])
+    (tmp_path / "local.txt").write_text("x\n", encoding="utf-8")
+    runner._user_state().add_declined(["local.txt"])  # recorded by the pre-agent flow
+
+    message = runner._stage_declined_files_popup()
+
+    assert "Committed 1 file" in message
+    assert "local.txt" not in repo.untracked_files()          # now tracked
+    assert runner._user_state().declined_untracked() == []    # cleared from declined
+
+
+def test_git_unstaged_lists_without_staging_when_user_declines(tmp_path):
+    runner, repo = _user_git_runner(tmp_path, answers=["n"])
+    (tmp_path / "local.txt").write_text("x\n", encoding="utf-8")
+    runner._user_state().add_declined(["local.txt"])
+
+    message = runner._stage_declined_files_popup()
+
+    assert "Intentionally unstaged: local.txt" in message
+    assert "local.txt" in repo.untracked_files()  # left untracked
+
+
+def test_git_unstaged_reads_base_state_not_worktree_state(tmp_path):
+    # Regression: the user's decline is recorded in BASE state; the menu must read
+    # it there, not from the (empty) ephemeral worktree state.
+    runner, repo = _user_git_runner(tmp_path, answers=["n"])
+    (tmp_path / "local.txt").write_text("x\n", encoding="utf-8")
+    runner._user_state().add_declined(["local.txt"])
+    runner.state = AgitState(tmp_path / "worktree")  # worktree state: nothing declined
+
+    message = runner._stage_declined_files_popup()
+
+    assert "local.txt" in message
+
+
+def test_git_stage_commits_chosen_new_base_files(tmp_path):
+    runner, repo = _user_git_runner(tmp_path, answers=["y", "add new file"])
+    (tmp_path / "new.txt").write_text("hi\n", encoding="utf-8")
+
+    message = runner._stage_new_files_popup()
+
+    assert "Committed 1 file" in message
+    assert "new.txt" not in repo.untracked_files()
+
+
+def test_git_stage_decline_records_into_base_state(tmp_path):
+    runner, repo = _user_git_runner(tmp_path, answers=["n"])
+    (tmp_path / "new.txt").write_text("hi\n", encoding="utf-8")
+
+    message = runner._stage_new_files_popup()
+
+    assert "Left 1 new file(s) unstaged" in message
+    assert "new.txt" in runner._user_state().declined_untracked()
+
+
+def test_status_line_unstaged_count_reflects_base_declined(tmp_path):
+    runner, repo = _user_git_runner(tmp_path, answers=[])
+    runner.name = "s1"
+    runner.backend = type("B", (), {"name": "claude"})()
+    runner.state = type("S", (), {"backend_session_id": None})()
+    runner.worktree = object()
+    runner.scroll_back = 0
+    runner.cols = 120
+    runner._user_declined = ["a.txt", "b.txt"]
+
+    assert "unstaged:2" in runner._status_line()
