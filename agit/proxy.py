@@ -3171,7 +3171,10 @@ class ProxyRunner:
         if not self.repo.has_staged_changes():
             return False
 
-        latest_prompt = " / ".join(subject_prompts) or f"{backend} changes"
+        # The subject reflects only the most recent prompt; the full interaction
+        # trace below still records every prompt in this commit. Joining them all
+        # here bloated the subject with stale prompts from earlier in the session.
+        latest_prompt = subject_prompts[-1] if subject_prompts else f"{backend} changes"
         self.repo.commit(
             build_agent_commit_message(
                 latest_prompt=latest_prompt,

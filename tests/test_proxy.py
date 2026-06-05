@@ -271,7 +271,8 @@ def test_proxy_agent_commit_preserves_incomplete_initial_user_turn(tmp_path):
 
     assert committed is True
     message = runner.repo.message
-    assert message.startswith("<agent> fix it / also handle errors")
+    # The subject is the most recent prompt only; the full trace still keeps both.
+    assert message.startswith("<agent> also handle errors")
     assert message.index("## User\n\nfix it") < message.index("## User\n\nalso handle errors")
     assert message.index("## User\n\nalso handle errors") < message.index("## Agent\n\ndone")
 
