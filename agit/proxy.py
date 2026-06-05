@@ -361,6 +361,10 @@ class ProxyRunner:
         self.active_index = 0
         self.worktree_manager: WorktreeManager | None = None
         self.debug_proxy = verbose or os.environ.get("AGIT_DEBUG_PROXY", "").strip().lower() in {"1", "true", "yes"}
+        # AGIT_DEBUG_RAW additionally records every raw child-output / user-input
+        # chunk to .agit/proxy-raw.log, so an interactive glitch (e.g. Claude's
+        # native session picker) can be replayed byte-for-byte for diagnosis.
+        self.raw_capture = os.environ.get("AGIT_DEBUG_RAW", "").strip().lower() in {"1", "true", "yes"}
 
     def run(self) -> int:
         if not sys.stdin.isatty() or not sys.stdout.isatty():
@@ -1915,11 +1919,13 @@ class ProxyRunner:
                 if output is None:
                     sample = self.last_child_output_sample[-2048:].decode(errors="replace").replace("\x1b", "\\x1b")
                     self._debug(f"master_fd closed (backend gone); last_output={sample!r}")
+                    self._raw_capture("EOF", b"")
                     if self._handle_active_session_exit():
                         continue
                     self._finalize_on_backend_exit()
                     break
                 if output:
+                    self._raw_capture("<", output)
                     self.last_child_output = time.monotonic()
                     self.last_child_output_sample = (self.last_child_output_sample + output)[-4096:]
                     self._answer_terminal_queries(output)
@@ -1929,6 +1935,7 @@ class ProxyRunner:
                     self._render_output()
             if sys.stdin.fileno() in readable:
                 data = os.read(sys.stdin.fileno(), 4096)
+                self._raw_capture(">", data)
                 data = self._input_tail + data
                 data, self._input_tail = self._hold_incomplete_tail(data)
                 data = self._intercept_scroll(data)
@@ -2030,6 +2037,19 @@ class ProxyRunner:
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("a", encoding="utf-8") as handle:
                 handle.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {message}\n")
+        except OSError:
+            pass
+
+    def _raw_capture(self, tag: str, data: bytes) -> None:
+        # Append a raw I/O chunk (child output "<", user input ">", or "EOF") to
+        # .agit/proxy-raw.log for byte-exact replay of an interactive glitch.
+        if not getattr(self, "raw_capture", False):
+            return
+        try:
+            path = self.repo.repo / ".agit" / "proxy-raw.log"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(f"{time.strftime('%H:%M:%S.')}{int(time.time() * 1000) % 1000:03d} {tag} {data!r}\n")
         except OSError:
             pass
 

@@ -60,6 +60,15 @@ def test_sandbox_exec_blocks_base_and_siblings_allows_self(tmp_path):
     s2.mkdir(parents=True)
     profile = sandbox.build_profile(str(base), str(s1))
 
+    # Skip when we can't create a nested sandbox (e.g. the suite is itself running
+    # inside agit's own confinement — macOS forbids nesting, so even an allow-all
+    # profile fails). That's an environment limit, not a behaviour under test.
+    probe = base / "probe"
+    if subprocess.run(["sandbox-exec", "-p", "(version 1)(allow default)",
+                       "/bin/sh", "-c", f"echo ok > {probe}"],
+                      capture_output=True).returncode != 0:
+        pytest.skip("nested sandbox-exec unavailable (already sandboxed)")
+
     def write(path) -> int:
         return subprocess.run(
             ["sandbox-exec", "-p", profile, "/bin/sh", "-c", f"echo hi > {path}"],
