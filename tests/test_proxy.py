@@ -271,7 +271,8 @@ def test_proxy_agent_commit_preserves_incomplete_initial_user_turn(tmp_path):
 
     assert committed is True
     message = runner.repo.message
-    assert message.startswith("<agent> fix it / also handle errors")
+    # The subject is the most recent prompt only; the full trace still keeps both.
+    assert message.startswith("<agent> also handle errors")
     assert message.index("## User\n\nfix it") < message.index("## User\n\nalso handle errors")
     assert message.index("## User\n\nalso handle errors") < message.index("## Agent\n\ndone")
 
@@ -2211,3 +2212,117 @@ def test_sync_idle_worktrees_aligns_idle_skips_in_flight():
 
     # Active (idle) + idle background are re-pointed; the in-flight one is left alone.
     assert aligned == ["repoA", "repoC"]
+
+
+# --- user-facing git commands operate on the base tree, not the worktree -------
+#
+# A session runs in a worktree that only contains tracked files, but the user's
+# own untracked / intentionally-unstaged files live in the base working tree.
+# These commands (git-stage / git-unstaged / git-user-commit) must therefore read
+# and write the base repo + base state, or the user's files are invisible.
+
+
+def _user_git_runner(tmp_path, answers):
+    from agit.git import GitRepo
+
+    repo = GitRepo.init(tmp_path)  # seeds an initial commit; user files stay untracked
+    runner = ProxyRunner.__new__(ProxyRunner)
+    runner.base_repo = repo
+    runner.repo = repo
+    runner.global_config = type("GC", (), {"default_backend": "claude"})()
+    runner._base_branch = repo.current_branch()
+    runner._user_declined = []
+    runner.prompts = []  # (title, body) of each popup shown
+    scripted = list(answers)
+
+    def prompt(title, body):
+        runner.prompts.append((title, body))
+        return scripted.pop(0) if scripted else None
+
+    runner._prompt_popup = prompt
+    return runner, repo
+
+
+def test_stage_files_groups_new_and_declined_and_stages_selection(tmp_path):
+    runner, repo = _user_git_runner(tmp_path, answers=["1", "add new"])
+    (tmp_path / "new.py").write_text("x\n", encoding="utf-8")
+    (tmp_path / "local.txt").write_text("y\n", encoding="utf-8")
+    runner._user_state().add_declined(["local.txt"])  # recorded by the pre-agent flow
+
+    message = runner._stage_files_popup()
+
+    body = runner.prompts[0][1]
+    assert "New files:" in body and "new.py" in body
+    assert "Intentionally unstaged:" in body and "local.txt" in body
+    # #1 is new.py (new files listed first); it is staged+committed, local.txt left.
+    assert "Committed 1 file" in message
+    assert "new.py" not in repo.untracked_files()
+    assert "local.txt" in repo.untracked_files()
+
+
+def test_stage_files_all_stages_every_candidate(tmp_path):
+    runner, repo = _user_git_runner(tmp_path, answers=["a", "add all"])
+    (tmp_path / "new.py").write_text("x\n", encoding="utf-8")
+    (tmp_path / "local.txt").write_text("y\n", encoding="utf-8")
+    runner._user_state().add_declined(["local.txt"])
+
+    message = runner._stage_files_popup()
+
+    assert "Committed 2 file" in message
+    assert repo.untracked_files() == []
+    assert runner._user_state().declined_untracked() == []  # declined cleared too
+
+
+def test_stage_files_reads_declined_from_base_not_worktree_state(tmp_path):
+    # Regression: declines are recorded in BASE state by the pre-agent prompt; the
+    # menu must surface them from there, not from the (empty) worktree state.
+    runner, repo = _user_git_runner(tmp_path, answers=[""])  # view, then cancel
+    (tmp_path / "local.txt").write_text("y\n", encoding="utf-8")
+    runner._user_state().add_declined(["local.txt"])
+    runner.state = AgitState(tmp_path / "worktree")  # worktree state: nothing declined
+
+    message = runner._stage_files_popup()
+
+    assert "local.txt" in runner.prompts[0][1]
+    assert message == "Nothing staged."
+
+
+def test_stage_files_empty_when_nothing_to_stage(tmp_path):
+    runner, repo = _user_git_runner(tmp_path, answers=[])
+    assert runner._stage_files_popup() == "No files to stage."
+    assert runner.prompts == []  # nothing to ask about
+
+
+def test_stage_files_invalid_selection_stages_nothing(tmp_path):
+    runner, repo = _user_git_runner(tmp_path, answers=["9"])  # out of range
+    (tmp_path / "new.py").write_text("x\n", encoding="utf-8")
+
+    message = runner._stage_files_popup()
+
+    assert "nothing staged" in message.lower()
+    assert "new.py" in repo.untracked_files()
+
+
+def test_git_status_returns_full_long_format(tmp_path):
+    from agit.git import GitRepo
+
+    repo = GitRepo.init(tmp_path)
+    (tmp_path / "new.py").write_text("x\n", encoding="utf-8")
+
+    output = repo.status()
+
+    assert "Untracked files" in output  # long format, not --short
+    assert "new.py" in output
+
+
+def test_status_line_unstaged_count_reflects_base_declined(tmp_path):
+    runner, repo = _user_git_runner(tmp_path, answers=[])
+    runner.name = "s1"
+    runner.backend = type("B", (), {"name": "claude"})()
+    runner.state = type("S", (), {"backend_session_id": None})()
+    runner.worktree = object()
+    runner.scroll_back = 0
+    runner.cols = 120
+    runner._user_declined = ["a.txt", "b.txt"]
+
+    assert "unstaged:2" in runner._status_line()
