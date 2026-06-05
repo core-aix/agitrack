@@ -1844,12 +1844,39 @@ class ProxyRunner:
         self._render()
         return True
 
+    def _relaunch_backend_or_exit(self) -> bool:
+        # The only session's backend process exited on its own — most often Claude
+        # quitting when you Esc its native session picker, where Claude restores
+        # the terminal and terminates (its shutdown sequence is in the debug log).
+        # aGiT should stay up and relaunch+resume the conversation rather than
+        # quitting with it. Guard against a crash loop: if the backend keeps dying
+        # quickly, stop relaunching and exit normally.
+        now = time.monotonic()
+        recent = [t for t in getattr(self, "_relaunch_times", []) if now - t < 12.0]
+        if len(recent) >= 3:
+            self._debug("backend exited 3x within 12s; quitting instead of relaunching")
+            self._finalize_on_backend_exit()
+            return False
+        recent.append(now)
+        self._relaunch_times = recent
+        self.child_pid = None  # already gone
+        try:
+            # _restart_agent tears down the dead PTY, re-baselines (so existing
+            # history is not re-committed) and respawns; _spawn resumes the same
+            # conversation via _should_continue_session.
+            self._restart_agent("Backend exited — relaunched and resumed (Ctrl-C to quit aGiT).")
+        except Exception as error:
+            self._debug(f"relaunch failed, exiting: {error!r}")
+            self._finalize_on_backend_exit()
+            return False
+        return True
+
     def _finalize_on_backend_exit(self) -> None:
-        # The only session's backend process is gone — the user quit it, or a
-        # native in-backend session switch exited it. Commit/integrate its last
-        # turn and persist the resume pointer before aGiT leaves, instead of just
-        # dropping out of the loop (which would lose the last commit and leave
-        # resume pointing at a stale session).
+        # The only session's backend process is gone and we are NOT relaunching
+        # (e.g. a real exit, or a crash loop). Commit/integrate its last turn and
+        # persist the resume pointer before aGiT leaves, instead of just dropping
+        # out of the loop (which would lose the last commit and leave resume
+        # pointing at a stale session).
         self.child_pid = None  # already gone; don't signal a dead process
         try:
             self._finalize_pending_work()
@@ -1945,7 +1972,8 @@ class ProxyRunner:
                     self._raw_capture("EOF", b"")
                     if self._handle_active_session_exit():
                         continue
-                    self._finalize_on_backend_exit()
+                    if self._relaunch_backend_or_exit():
+                        continue
                     break
                 if output:
                     self._raw_capture("<", output)

@@ -1881,6 +1881,41 @@ def test_adopt_latest_backend_session_keeps_id_when_unchanged():
     assert runner.state.last_backend_message_id == "m1"  # untouched
 
 
+def test_relaunch_backend_resumes_then_gives_up_on_crash_loop(monkeypatch):
+    runner = ProxyRunner.__new__(ProxyRunner)
+    runner._debug = lambda *a, **k: None
+    calls = []
+    runner._restart_agent = lambda msg: calls.append("relaunch")
+    runner._finalize_on_backend_exit = lambda: calls.append("finalize")
+
+    t = [1000.0]
+    monkeypatch.setattr("agit.proxy.time.monotonic", lambda: t[0])
+
+    # Backend keeps dying quickly: first 3 relaunch, the 4th gives up and exits.
+    assert runner._relaunch_backend_or_exit() is True
+    assert runner._relaunch_backend_or_exit() is True
+    assert runner._relaunch_backend_or_exit() is True
+    assert runner._relaunch_backend_or_exit() is False
+
+    assert calls == ["relaunch", "relaunch", "relaunch", "finalize"]
+
+
+def test_relaunch_backend_resets_loop_guard_after_quiet_period(monkeypatch):
+    runner = ProxyRunner.__new__(ProxyRunner)
+    runner._debug = lambda *a, **k: None
+    relaunches = []
+    runner._restart_agent = lambda msg: relaunches.append(1)
+    runner._finalize_on_backend_exit = lambda: relaunches.append("finalize")
+
+    t = [1000.0]
+    monkeypatch.setattr("agit.proxy.time.monotonic", lambda: t[0])
+    for _ in range(3):
+        runner._relaunch_backend_or_exit()
+    t[0] += 60.0  # a minute later the old exits no longer count
+    assert runner._relaunch_backend_or_exit() is True
+    assert relaunches.count("finalize") == 0  # never gave up
+
+
 def test_finalize_on_backend_exit_finalizes_once_and_clears_pid():
     runner = ProxyRunner.__new__(ProxyRunner)
     runner.child_pid = 4321
