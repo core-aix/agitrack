@@ -3518,6 +3518,12 @@ class ProxyRunner:
             self._set_message("User changes detected before agent runs.")
             self._render()
             self._create_user_commit_popup()
+        # Trace every submitted prompt as a user message. The agent-active path
+        # above already recorded; the held path records in _forward_pending_prompt.
+        # This covers the remaining (clean / user-changes-committed) submits so no
+        # follow-up is dropped from the commit trace. Dedup in the agent-commit
+        # builder collapses this with the backend's own turn.user_prompt.
+        self._record_user_prompt(prompt_text)
         return True
 
     def _resume_pending_prompt_if_ready(self) -> None:
@@ -3527,6 +3533,13 @@ class ProxyRunner:
         if finished is None:
             if self.agent_parse_thread and self.agent_parse_thread.is_alive():
                 self._set_message("aGiT is checking existing git changes before sending your prompt...", seconds=60)
+                return
+            # The parse already ran and deferred (its result is consumed): the
+            # agent's latest turn is still in progress, so the uncommitted changes
+            # belong to the in-flight agent — there is nothing of the user's to
+            # commit before this prompt. Forward it now so the backend queues the
+            # follow-up instead of holding it (and the "checking" message) forever.
+            self._forward_pending_prompt()
             return
         if finished is False and self.actions.has_pre_agent_user_changes():
             self._set_message("User changes detected before agent runs.")

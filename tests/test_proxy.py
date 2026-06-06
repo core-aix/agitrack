@@ -1411,6 +1411,37 @@ def test_proxy_pending_prompt_forwards_after_agent_parse_commit(tmp_path):
         os.close(write_fd)
 
 
+def test_proxy_pending_prompt_forwards_when_agent_mid_turn(tmp_path):
+    # The parse deferred (latest turn still in progress) so its result was
+    # consumed and _finish_agent_parse_if_ready now returns None with no live
+    # thread. The follow-up must be forwarded (queued by the backend), not held
+    # behind the "checking" message forever.
+    runner = ProxyRunner.__new__(ProxyRunner)
+    read_fd, write_fd = os.pipe()
+    try:
+        runner.master_fd = write_fd
+        runner.pending_forwarded = [b"\r"]
+        runner.pending_prompt_text = "and also rename it"
+        runner.passthrough_prompt = bytearray(b"and also rename it")
+        runner.state = AgitState(tmp_path)
+        runner.agent_parse_thread = None
+        runner.agent_in_flight = False
+        runner.message = None
+        runner.message_until = 0.0
+        runner._finish_agent_parse_if_ready = lambda quiet: None
+        runner._ensure_turn_branch = lambda: None
+
+        runner._resume_pending_prompt_if_ready()
+
+        assert os.read(read_fd, 1) == b"\r"
+        assert runner.pending_forwarded is None
+        assert runner.agent_in_flight is True
+        assert runner.state.pending_trace() == [{"role": "user", "content": "and also rename it"}]
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
 def test_proxy_pending_prompt_user_commit_then_forwards(tmp_path):
     runner = ProxyRunner.__new__(ProxyRunner)
     read_fd, write_fd = os.pipe()
