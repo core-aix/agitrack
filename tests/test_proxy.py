@@ -473,6 +473,46 @@ def test_screen_erase_in_line_does_not_carry_underline():
         assert screen.buffer[0][x].underscore is False
 
 
+def test_feed_child_output_strips_xtmodkeys_mistaken_for_underline():
+    # Claude toggles the xterm modifyOtherKeys keyboard mode (CSI > 4 m) when it
+    # enters/leaves the session-choice picker. pyte mis-tokenises the >-private
+    # sequence as the SGR \x1b[4m (underline on), which then sticks to everything
+    # drawn afterwards — the stray horizontal lines. The private sequence must be
+    # stripped from what is fed to pyte so no underline leaks.
+    import pyte
+
+    from agit.proxy import _BackgroundColorEraseScreen
+
+    runner = ProxyRunner.__new__(ProxyRunner)
+    runner.screen = _BackgroundColorEraseScreen(10, 2, history=10, ratio=0.5)
+    runner.stream = pyte.ByteStream(runner.screen)
+
+    runner._feed_child_output(b"\x1b[>4mhello")
+
+    row = runner.screen.buffer[0]
+    assert "".join((row[x].data or " ") for x in range(5)) == "hello"  # not "4mhel.."
+    for x in range(10):
+        assert row[x].underscore is False
+
+
+def test_feed_child_output_preserves_dec_private_modes_and_real_sgr():
+    # The strip must be surgical: real SGR (incl. genuine underline) and DEC
+    # private (?) sequences pass through untouched.
+    import pyte
+
+    from agit.proxy import _BackgroundColorEraseScreen
+
+    runner = ProxyRunner.__new__(ProxyRunner)
+    runner.screen = _BackgroundColorEraseScreen(10, 2, history=10, ratio=0.5)
+    runner.stream = pyte.ByteStream(runner.screen)
+
+    runner._feed_child_output(b"\x1b[?25l\x1b[4mU\x1b[24mP")
+
+    assert runner.screen.buffer[0][0].underscore is True  # genuine underline kept
+    assert runner.screen.buffer[0][1].underscore is False
+    assert runner.screen.cursor.hidden is True  # ?25l honoured
+
+
 def test_drain_child_output_reads_all_available():
     runner = ProxyRunner.__new__(ProxyRunner)
     read_fd, write_fd = os.pipe()
