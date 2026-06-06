@@ -2252,6 +2252,41 @@ def test_adopt_latest_backend_session_keeps_id_when_unchanged():
     assert runner.state.last_backend_message_id == "m1"  # untouched
 
 
+def test_recover_nonempty_session_returns_latest_with_content(tmp_path):
+    import types
+
+    runner = ProxyRunner.__new__(ProxyRunner)
+    runner.state = AgitState(tmp_path)
+    runner.state.backend_session_id = "empty-id"
+    runner.repo = types.SimpleNamespace(repo="/wt")
+    runner._debug = lambda *a, **k: None
+    runner._stage_backend_resume = lambda sid: None
+    real = ExportedSession("real-id", "claude-opus-4-8", None, [SessionTurn("u", "a", "p", "r", TokenUsage(), None)])
+    runner.backend = types.SimpleNamespace(
+        latest_session_id=lambda repo: "real-id",
+        export_session=lambda repo, sid: real if sid == "real-id" else ExportedSession(sid, None, None, []),
+    )
+
+    assert runner._recover_nonempty_session() == ("real-id", real)
+
+
+def test_recover_nonempty_session_none_when_latest_also_empty(tmp_path):
+    import types
+
+    runner = ProxyRunner.__new__(ProxyRunner)
+    runner.state = AgitState(tmp_path)
+    runner.state.backend_session_id = "empty-id"
+    runner.repo = types.SimpleNamespace(repo="/wt")
+    runner._debug = lambda *a, **k: None
+    runner._stage_backend_resume = lambda sid: None
+    runner.backend = types.SimpleNamespace(
+        latest_session_id=lambda repo: "other-empty",
+        export_session=lambda repo, sid: ExportedSession(sid, None, None, []),
+    )
+
+    assert runner._recover_nonempty_session() is None
+
+
 def test_relaunch_backend_resumes_then_gives_up_on_crash_loop(monkeypatch):
     runner = ProxyRunner.__new__(ProxyRunner)
     runner._debug = lambda *a, **k: None

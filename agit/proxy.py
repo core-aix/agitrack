@@ -2421,6 +2421,23 @@ class ProxyRunner:
             self.state.save()
             self._debug("removed raw backend event blob from pending trace")
 
+    def _recover_nonempty_session(self):
+        # When the recorded conversation turns out empty, fall back to this
+        # worktree's newest conversation that has real content. Returns
+        # (session_id, ExportedSession) or None if nothing resumable exists.
+        try:
+            candidate = self.backend.latest_session_id(self.repo.repo)
+        except Exception as error:
+            self._debug(f"recover non-empty session failed: {error!r}")
+            return None
+        if not candidate or candidate == self.state.backend_session_id:
+            return None
+        self._stage_backend_resume(candidate)
+        session = self.backend.export_session(self.repo.repo, candidate)
+        if session and session.turns:
+            return candidate, session
+        return None
+
     def _initialize_session_baseline(self) -> None:
         if not self._should_continue_session():
             self.state.backend_session_id = None
@@ -2433,12 +2450,20 @@ class ProxyRunner:
         self._stage_backend_resume(self.state.backend_session_id)
         session = self.backend.export_session(self.repo.repo, self.state.backend_session_id)
         if not session or not session.turns:
-            # The recorded session has no actual conversation (e.g. it was created
-            # but quit before any message). Resuming it would fail with "no
-            # conversation found", so drop it and let _spawn start a fresh one.
-            self.state.backend_session_id = None
-            self.state.last_backend_message_id = None
-            return
+            # The recorded session has no actual conversation — e.g. a stale pointer
+            # left by a previous run that adopted an empty session Claude spun up on
+            # resume/picker. Rather than drop into a blank session, recover this
+            # worktree's most recent conversation that actually has content (the
+            # backend's latest_session_id skips empty transcripts).
+            recovered = self._recover_nonempty_session()
+            session = recovered[1] if recovered else None
+            if recovered:
+                self._debug(f"recorded session empty; recovered non-empty {recovered[0]}")
+                self.state.backend_session_id = recovered[0]
+            else:
+                self.state.backend_session_id = None
+                self.state.last_backend_message_id = None
+                return
         if session.model:
             self.state.model = session.model
         complete = [turn for turn in session.turns if turn.assistant_message_id]

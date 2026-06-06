@@ -61,9 +61,20 @@ def _session_path(repo: Path, session_id: str) -> Path:
 
 def latest_session_id(repo: Path) -> str | None:
     refs = list_sessions(repo)
-    if not refs:
+    # Prefer the newest conversation that actually has a user prompt. Claude mints
+    # a fresh, EMPTY session id whenever a conversation is resumed or opened from
+    # its session picker; that empty transcript is newest by mtime but has nothing
+    # to resume. Treating it as "latest" makes aGiT adopt/resume it and drop the
+    # user into a blank session on the next start — and only the start after that
+    # recovers (the "first restart starts fresh, second restart resumes it"
+    # off-by-one). A ref's label is its first real user prompt, so `label` is None
+    # exactly when the transcript has no real turn. Fall back to raw recency only
+    # if nothing has content yet (e.g. a brand-new, not-yet-used first session).
+    resumable = [ref for ref in refs if ref.label]
+    pool = resumable or refs
+    if not pool:
         return None
-    return max(refs, key=lambda ref: ref.updated).id
+    return max(pool, key=lambda ref: ref.updated).id
 
 
 def _refs_in_project_dir(project_dir: Path) -> list[SessionRef]:

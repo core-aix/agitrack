@@ -261,6 +261,52 @@ def test_list_sessions_returns_refs_with_labels(tmp_path, monkeypatch):
     assert latest_session_id(repo) in {"s1", "s2"}
 
 
+def test_latest_session_id_skips_empty_resumed_sessions(tmp_path, monkeypatch):
+    import os
+    import time
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    project_dir = claude_session._project_dir(repo)
+    project_dir.mkdir(parents=True)
+
+    real = project_dir / "real.jsonl"
+    real.write_text(json.dumps(_user("u1", "real prompt")) + "\n" + json.dumps(_assistant("m1", "ok")) + "\n")
+    # Claude's resume/picker artifact: a session with no real user prompt.
+    empty = project_dir / "empty.jsonl"
+    empty.write_text(json.dumps(_assistant("m0", "")) + "\n")
+
+    now = time.time()
+    os.utime(real, (now - 100, now - 100))
+    os.utime(empty, (now, now))  # the EMPTY one is newest by mtime
+
+    # Newest by mtime is empty (nothing to resume) → pick the real conversation.
+    assert latest_session_id(repo) == "real"
+
+
+def test_latest_session_id_falls_back_to_recency_when_all_empty(tmp_path, monkeypatch):
+    import os
+    import time
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    project_dir = claude_session._project_dir(repo)
+    project_dir.mkdir(parents=True)
+    older = project_dir / "older.jsonl"
+    older.write_text(json.dumps(_assistant("m0", "")) + "\n")
+    newer = project_dir / "newer.jsonl"
+    newer.write_text(json.dumps(_assistant("m1", "")) + "\n")
+
+    now = time.time()
+    os.utime(older, (now - 100, now - 100))
+    os.utime(newer, (now, now))
+
+    # Nothing has content yet → fall back to plain recency.
+    assert latest_session_id(repo) == "newer"
+
+
 def test_list_worktree_sessions_aggregates_by_recency(tmp_path, monkeypatch):
     import os
     import time
