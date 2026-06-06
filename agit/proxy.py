@@ -3356,8 +3356,23 @@ class ProxyRunner:
         info = getattr(self, "worktree", None)
         if info is None or getattr(self, "_base_branch", None) is None:
             return
+        # Persist the primary session's resume pointer FIRST — before deciding
+        # whether its worktree can be removed. _persist_last_session_record runs
+        # _adopt_latest_backend_session, which captures a conversation the user
+        # switched to inside the backend's own picker (Claude's session view).
+        # Gating it behind a clean worktree removal meant a session that still had
+        # uncommitted or unintegrated work — the usual state right after a mid-work
+        # switch — never updated its resume pointer, so the next start resumed a
+        # stale conversation and only the start after that landed on the right one
+        # (the "first restart starts fresh, second restart resumes it" off-by-one).
+        # Adopting writes both the worktree state (used when the worktree is kept)
+        # and the repo-root state (used when it is removed), so the right
+        # conversation resumes either way.
+        if info.name == getattr(self, "_primary_worktree_name", None):
+            self._persist_last_session_record()
         try:
             if self.merge_ctx or self.repo.merge_in_progress() or self.repo.has_changes():
+                self._debug(f"keeping worktree '{info.name}' on exit: merge or uncommitted changes pending")
                 return
             branch = self.repo.current_branch()
             if branch.startswith("agit/"):
@@ -3368,17 +3383,14 @@ class ProxyRunner:
                 # branch) rather than risk discarding unmerged work.
                 self.base_repo.rev_parse(self._base_branch)
                 if self.base_repo.log_range(self._base_branch, branch):
+                    self._debug(f"keeping worktree '{info.name}' on exit: '{branch}' still ahead of {self._base_branch}")
                     return  # commits still ahead of base → unintegrated; keep it
-        except Exception:
+        except Exception as error:
+            self._debug(f"keeping worktree '{info.name}' on exit: {error!r}")
             return
         # Remember this session's conversation under its backend so switching back
         # to that backend (this run or a later one) resumes it.
         self._remember_session_for_backend()
-        if info.name == getattr(self, "_primary_worktree_name", None):
-            # Persist the primary session's resume pointer to the durable repo-root
-            # state before discarding its worktree, so the conversation auto-resumes
-            # next run even though the worktree (and its working state) are gone.
-            self._persist_last_session_record()
         self._terminate_child()
         try:
             self._worktrees().remove(info.name)

@@ -2011,6 +2011,36 @@ def test_exit_removes_fully_merged_worktree():
     assert runner.removed == ["session-1"]  # normal cleanup of a merged session still happens
 
 
+def test_exit_persists_resume_pointer_even_when_worktree_kept():
+    # A primary session that exits with unintegrated work keeps its worktree, but
+    # its resume pointer (which adopts a backend-native session switch) must still
+    # be persisted. Gating that behind worktree removal caused the off-by-one:
+    # next start resumes a stale conversation, and only the start after that lands
+    # on the one the user switched to.
+    runner = _exit_removal_runner(log_range_result="deadbeef still ahead")
+    runner._primary_worktree_name = "session-1"
+    persisted = []
+    runner._persist_last_session_record = lambda: persisted.append(True)
+
+    runner._remove_worktree_on_exit()
+
+    assert runner.removed == []  # unintegrated → worktree still kept
+    assert persisted == [True]   # ...but the resume pointer was persisted anyway
+
+
+def test_exit_does_not_persist_resume_pointer_for_background_session():
+    # Only the primary session owns the durable resume pointer; a non-primary
+    # (background) session must not overwrite it on exit.
+    runner = _exit_removal_runner(log_range_result="deadbeef still ahead")
+    runner._primary_worktree_name = "session-2"  # this session ("session-1") is not primary
+    persisted = []
+    runner._persist_last_session_record = lambda: persisted.append(True)
+
+    runner._remove_worktree_on_exit()
+
+    assert persisted == []
+
+
 def test_sync_idle_worktrees_skipped_while_paused():
     runner = ProxyRunner.__new__(ProxyRunner)
     runner._integration_paused = True
