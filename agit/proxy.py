@@ -108,6 +108,15 @@ _PAGE_KEY_RE = re.compile(rb"\x1b\[(5|6)(?:;\d+)?~")  # PageUp / PageDown (with 
 # reads). Held back so it is not forwarded as stray bytes. A lone trailing ESC
 # is deliberately NOT matched so the Escape key is never delayed.
 _INCOMPLETE_TAIL_RE = re.compile(rb"\x1b\[[<0-9;]*$")
+# Private-marker CSI sequences (parameter prefix ``>``, ``<`` or ``=``) — xterm
+# keyboard/feature negotiation such as XTMODKEYS (``CSI > Ps m``), XTVERSION
+# (``CSI > Ps q``) and the kitty keyboard protocol (``CSI < Ps u``). pyte cannot
+# model these and, worse, mis-tokenises ``\x1b[>4m`` as the SGR ``\x1b[4m``
+# (underline on), which then sticks to everything drawn afterwards. None of them
+# affect the visible grid, so they are stripped from the copy fed to pyte. The
+# ``?`` (DEC private) forms are deliberately NOT matched — pyte models several of
+# them and aGiT syncs the rest from the raw output separately.
+_PYTE_HOSTILE_CSI_RE = re.compile(rb"\x1b\[[<>=][0-9;:]*[ -/]*[@-~]")
 
 
 def _short_session(session_id: str | None) -> str:
@@ -2471,7 +2480,7 @@ class ProxyRunner:
     def _feed_child_output(self, output: bytes) -> None:
         if self.stream is not None:
             try:
-                self.stream.feed(output)
+                self.stream.feed(_PYTE_HOSTILE_CSI_RE.sub(b"", output))
             except Exception as error:  # never let a parse hiccup kill the session
                 self._debug(f"pyte feed error: {error!r}")
 
