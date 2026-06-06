@@ -4,11 +4,13 @@ import time
 
 import pytest
 
+import types
+
 from agit.backends.base import TokenUsage
 from agit.opencode_session import SessionTurn
 from agit.backends.proxy_agents import make_proxy_agent
 from agit.proxy import ProxyInput, ProxyRunner, _escape_sequence_complete, _humanize_age, _short_session, detect_color_mode
-from agit.session import SessionRef
+from agit.session import ExportedSession, SessionRef
 from agit.state import AgitState
 
 
@@ -302,6 +304,72 @@ def test_proxy_agent_commit_preserves_previous_no_change_trace(tmp_path):
     assert message.index("## User\n\nexplain only") < message.index("## Agent\n\nno code changed")
     assert message.index("## Agent\n\nno code changed") < message.index("## User\n\nnow edit")
     assert message.count("## User\n\nexplain only") == 1
+
+
+def _parse_ready_runner(tmp_path, session, *, last_message_id=None):
+    runner = ProxyRunner.__new__(ProxyRunner)
+    runner.state = AgitState(tmp_path)
+    runner.worktree = None
+    runner.agent_parse_thread = None
+    runner.backend = types.SimpleNamespace(name="claude")
+    runner._debug = lambda *a, **k: None
+    runner._note_backend_session_change = lambda sid: None
+    runner._mirror_session_to_base = lambda sid: None
+    runner._integrate_session_turn = lambda: None
+    runner.commits = []
+    runner._create_agent_commit_from_turns_popup = lambda **k: (runner.commits.append(k), True)[1]
+    runner.agent_parse_result = (session.session_id, session, last_message_id)
+    return runner
+
+
+def test_finish_agent_parse_defers_commit_while_turn_in_progress(tmp_path):
+    # The latest prompt is still being answered (last message was a tool call), so
+    # the idle/file-stable debounce must NOT commit — otherwise one prompt gets
+    # split into several commits (code now, tests later).
+    in_progress = ExportedSession(
+        session_id="ses-9",
+        model="claude-opus-4-8",
+        updated=None,
+        turns=[SessionTurn("u1", "a1", "fix it and add tests", "Let me add a sanitizer.", TokenUsage(), None, complete=False)],
+    )
+    runner = _parse_ready_runner(tmp_path, in_progress)
+
+    result = runner._finish_agent_parse_if_ready(quiet=True)
+
+    assert result is None  # deferred, not committed
+    assert runner.commits == []
+    # The conversation id is still tracked while we wait, so resume stays correct.
+    assert runner.state.backend_session_id == "ses-9"
+
+
+def test_finish_agent_parse_commits_once_turn_is_complete(tmp_path):
+    finished = ExportedSession(
+        session_id="ses-9",
+        model="claude-opus-4-8",
+        updated=None,
+        turns=[SessionTurn("u1", "a1", "fix it and add tests", "Done — code and tests are in.", TokenUsage(total=1, output=1), None, complete=True)],
+    )
+    runner = _parse_ready_runner(tmp_path, finished)
+
+    assert runner._finish_agent_parse_if_ready(quiet=True) is True
+    assert len(runner.commits) == 1
+
+
+def test_finish_agent_parse_forces_in_progress_commit_on_exit(tmp_path):
+    # On exit the worktree is torn down, so an unfinished turn must still be
+    # committed (require_complete=False) rather than lost.
+    in_progress = ExportedSession(
+        session_id="ses-9",
+        model="claude-opus-4-8",
+        updated=None,
+        turns=[SessionTurn("u1", "a1", "fix it and add tests", "Let me add a sanitizer.", TokenUsage(total=1, output=1), None, complete=False)],
+    )
+    runner = _parse_ready_runner(tmp_path, in_progress)
+
+    forced = runner._finish_agent_parse_if_ready(quiet=True, integrate=False, require_complete=False)
+
+    assert forced is True
+    assert len(runner.commits) == 1
 
 
 def test_proxy_plain_row_handles_empty_pyte_cell_data():

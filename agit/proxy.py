@@ -3258,10 +3258,10 @@ class ProxyRunner:
         try:
             if self.agent_parse_thread and self.agent_parse_thread.is_alive():
                 self.agent_parse_thread.join(timeout=20)
-            self._finish_agent_parse_if_ready(quiet=True, prompt_untracked=False, integrate=False)
+            self._finish_agent_parse_if_ready(quiet=True, prompt_untracked=False, integrate=False, require_complete=False)
             if self._start_agent_parse() and self.agent_parse_thread:
                 self.agent_parse_thread.join(timeout=20)
-            self._finish_agent_parse_if_ready(quiet=True, prompt_untracked=False, integrate=False)
+            self._finish_agent_parse_if_ready(quiet=True, prompt_untracked=False, integrate=False, require_complete=False)
         except Exception as error:  # never block on a commit failure
             self._debug(f"sync commit failed: {error!r}")
 
@@ -3599,7 +3599,7 @@ class ProxyRunner:
         self.agent_parse_thread.start()
         return True
 
-    def _finish_agent_parse_if_ready(self, *, quiet: bool, prompt_untracked: bool | None = None, integrate: bool = True) -> bool | None:
+    def _finish_agent_parse_if_ready(self, *, quiet: bool, prompt_untracked: bool | None = None, integrate: bool = True, require_complete: bool = True) -> bool | None:
         if prompt_untracked is None:
             # Worktree sessions are isolated sandboxes, so agent commits there
             # auto-stage everything; only the main working tree prompts.
@@ -3622,6 +3622,15 @@ class ProxyRunner:
         if session.model:
             self.state.model = session.model
         turns = turns_after(session, last_message_id)
+        # Don't commit while the latest prompt is still being answered (the
+        # backend's last message was a tool call, not a final response). The
+        # idle/file-stable debounce can otherwise fire during a mid-turn pause and
+        # carve one prompt into several commits — code first, tests next. Wait for
+        # the turn to finish; forced flushes (exit) pass require_complete=False so
+        # work-in-progress is never lost when the worktree is torn down.
+        if require_complete and turns and not turns[-1].complete:
+            self._debug(f"deferring agent commit: latest turn still in progress session_id={new_session_id}")
+            return None
         complete_turns = [turn for turn in turns if turn.final_response]
         if not complete_turns:
             self._debug(f"agent parse consumed without final response session_id={self.state.backend_session_id} turns={len(turns)}")

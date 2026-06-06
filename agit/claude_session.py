@@ -296,6 +296,7 @@ def parse_rows(session_id: str, rows: list[dict]) -> ExportedSession:
                 "assistant_id": "",
                 "model": model,
                 "tokens": TokenUsage(),
+                "stop_reason": None,
             }
         elif row_type == "assistant" and current is not None and row.get("isSidechain"):
             # Sub-agent (sidechain) turns are not part of the main interaction
@@ -310,6 +311,11 @@ def parse_rows(session_id: str, rows: list[dict]) -> ExportedSession:
             if isinstance(message_model, str) and message_model:
                 current["model"] = message_model
                 model = message_model
+            # Track the most recent assistant message's stop reason; `tool_use`
+            # means the turn is still mid-flight (more messages will follow the
+            # tool result), anything else (end_turn/stop_sequence/max_tokens) is a
+            # finished response.
+            current["stop_reason"] = message.get("stop_reason")
             text = _assistant_text(message)
             if text:
                 current["final"] = text
@@ -326,6 +332,9 @@ def _finalize_turn(turn: dict) -> SessionTurn:
         final_response=turn["final"],
         tokens=turn["tokens"],
         model=turn["model"],
+        # `tool_use` is the only non-terminal stop reason; a missing reason (older
+        # transcripts) is treated as complete so we never stall the commit loop.
+        complete=turn.get("stop_reason") != "tool_use",
     )
 
 

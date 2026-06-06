@@ -80,12 +80,12 @@ def _user(uuid, text, **extra):
     return row
 
 
-def _assistant(msg_id, text, *, model="claude-opus-4-8", usage=None, content=None):
+def _assistant(msg_id, text, *, model="claude-opus-4-8", usage=None, content=None, stop_reason=None):
     blocks = content if content is not None else [{"type": "text", "text": text}]
-    return {
-        "type": "assistant",
-        "message": {"id": msg_id, "role": "assistant", "model": model, "content": blocks, "usage": usage or {}},
-    }
+    message = {"id": msg_id, "role": "assistant", "model": model, "content": blocks, "usage": usage or {}}
+    if stop_reason is not None:
+        message["stop_reason"] = stop_reason
+    return {"type": "assistant", "message": message}
 
 
 def test_parse_rows_groups_turns_with_final_response_and_tokens():
@@ -120,6 +120,46 @@ def test_parse_rows_groups_turns_with_final_response_and_tokens():
 
     assert session.turns[1].user_prompt == "second prompt"
     assert session.turns[1].final_response == "final answer two"
+
+
+def test_parse_rows_marks_turn_incomplete_while_last_message_is_tool_use():
+    # A prompt whose latest assistant message is a tool call is still mid-flight:
+    # the agent paused between writing code and writing tests. aGiT must see this
+    # turn as incomplete so it doesn't commit now and split the prompt in two.
+    rows = [
+        _user("u1", "fix the bug and add tests"),
+        _assistant(
+            "m1",
+            "Let me add a sanitizer.",
+            content=[{"type": "text", "text": "Let me add a sanitizer."}, {"type": "tool_use", "id": "t1", "name": "Edit", "input": {}}],
+            stop_reason="tool_use",
+        ),
+    ]
+
+    turn = parse_rows("sess-mid", rows).turns[0]
+
+    assert turn.final_response == "Let me add a sanitizer."
+    assert turn.complete is False
+
+
+def test_parse_rows_marks_turn_complete_when_last_message_ends_the_turn():
+    rows = [
+        _user("u1", "fix the bug and add tests"),
+        _assistant("m1", "Working on it.", content=[{"type": "text", "text": "Working on it."}, {"type": "tool_use", "id": "t1", "name": "Edit", "input": {}}], stop_reason="tool_use"),
+        _assistant("m2", "Done — code and tests are in.", stop_reason="end_turn"),
+    ]
+
+    turn = parse_rows("sess-done", rows).turns[0]
+
+    assert turn.final_response == "Done — code and tests are in."
+    assert turn.complete is True
+
+
+def test_parse_rows_turn_complete_when_stop_reason_absent():
+    # Older transcripts (or other backends) may omit the stop reason; default to
+    # complete so the commit loop is never stalled.
+    rows = [_user("u1", "hello"), _assistant("m1", "hi")]
+    assert parse_rows("sess-old", rows).turns[0].complete is True
 
 
 def test_parse_rows_excludes_meta_sidechain_tool_results_and_commands():
