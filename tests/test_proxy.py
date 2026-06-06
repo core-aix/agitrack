@@ -373,6 +373,52 @@ def test_finish_agent_parse_forces_in_progress_commit_on_exit(tmp_path):
     assert len(runner.commits) == 1
 
 
+def test_finish_agent_parse_defers_for_queued_followup_not_in_transcript(tmp_path):
+    # Turn 1 is complete, but the user queued a follow-up mid-turn that the backend
+    # hasn't processed yet (absent from the transcript). While the agent is still
+    # active, the commit must wait so the follow-up shares this commit — otherwise
+    # it would land as a separate second commit.
+    session = ExportedSession("ses-1", "m", None, [
+        SessionTurn("u1", "a1", "first prompt", "done one", TokenUsage(total=1, output=1), None, complete=True),
+    ])
+    runner = _parse_ready_runner(tmp_path, session)
+    runner._awaited_followups = ["second prompt"]
+    runner._agent_is_active = lambda: True
+
+    assert runner._finish_agent_parse_if_ready(quiet=True) is None  # deferred
+    assert runner.commits == []
+
+
+def test_finish_agent_parse_commits_both_turns_once_followup_lands(tmp_path):
+    session = ExportedSession("ses-1", "m", None, [
+        SessionTurn("u1", "a1", "first prompt", "done one", TokenUsage(total=1, output=1), None, complete=True),
+        SessionTurn("u2", "a2", "second prompt", "done two", TokenUsage(total=1, output=1), None, complete=True),
+    ])
+    runner = _parse_ready_runner(tmp_path, session)
+    runner._awaited_followups = ["second prompt"]
+    runner._agent_is_active = lambda: True
+
+    assert runner._finish_agent_parse_if_ready(quiet=True) is True
+    assert len(runner.commits) == 1  # ONE commit covering both queued turns
+    # The committed batch carried both prompts; the queue is cleared.
+    assert [t.user_prompt for t in runner.commits[0]["turns"]] == ["first prompt", "second prompt"]
+    assert runner._awaited_followups == []
+
+
+def test_finish_agent_parse_does_not_block_on_cancelled_followup(tmp_path):
+    # The queued prompt never landed and the agent has gone idle (user cancelled
+    # it): commit turn 1 rather than block commits forever.
+    session = ExportedSession("ses-1", "m", None, [
+        SessionTurn("u1", "a1", "first prompt", "done one", TokenUsage(total=1, output=1), None, complete=True),
+    ])
+    runner = _parse_ready_runner(tmp_path, session)
+    runner._awaited_followups = ["cancelled prompt"]
+    runner._agent_is_active = lambda: False
+
+    assert runner._finish_agent_parse_if_ready(quiet=True) is True
+    assert runner._awaited_followups == []
+
+
 def test_agent_commit_popup_includes_commit_id(tmp_path):
     # The auto-commit confirmation names the short SHA so the user can find the
     # commit aGiT just made.
@@ -561,6 +607,25 @@ def test_screen_erase_in_line_does_not_carry_underline():
     assert screen.buffer[0][0].underscore is True  # the drawn char keeps it
     for x in range(1, 6):
         assert screen.buffer[0][x].underscore is False
+
+
+def test_screen_survives_private_device_status_query():
+    # Claude/Ink emits \x1b[?6n (DEC-private cursor-position query) mid-redraw —
+    # e.g. while collapsing an option menu after a selection. pyte's
+    # report_device_status() doesn't accept the private flag and would raise
+    # TypeError, aborting the feed and dropping the rest of the chunk (which
+    # truncated the collapse redraw and left stale menu rows on screen). The screen
+    # must absorb the query and keep applying the bytes that follow it.
+    import pyte
+
+    from agit.proxy import _BackgroundColorEraseScreen
+
+    screen = _BackgroundColorEraseScreen(6, 2, history=10, ratio=0.5)
+    stream = pyte.ByteStream(screen)
+    stream.feed(b"\x1b[1;1HAA\x1b[?6nBB")  # private DSR sandwiched between writes
+
+    row0 = "".join((screen.buffer[0][x].data or " ") for x in range(6)).rstrip()
+    assert row0 == "AABB"  # the text after the query was NOT dropped
 
 
 def test_feed_child_output_strips_xtmodkeys_mistaken_for_underline():
@@ -2124,6 +2189,42 @@ def test_exit_does_not_persist_resume_pointer_for_background_session():
     runner._remove_worktree_on_exit()
 
     assert persisted == []
+
+
+def _bg_confirm_runner(statuses, active_index=0):
+    runner = ProxyRunner.__new__(ProxyRunner)
+    runner.sessions = [object()] * len(statuses)
+    runner.active_index = active_index
+    runner._session_status = lambda i: statuses[i]
+    runner._session_name = lambda i: f"session-{i}"
+    return runner
+
+
+def test_confirm_terminate_background_sessions_no_prompt_when_all_idle():
+    runner = _bg_confirm_runner(["running", "idle", "idle"])  # active(0) running, bg idle
+    popups = []
+    runner._select_popup = lambda *a, **k: popups.append(a) or "unused"
+    # The active session running in the foreground never triggers the prompt.
+    assert runner._confirm_terminate_background_sessions() is True
+    assert popups == []
+
+
+def test_confirm_terminate_background_sessions_prompts_and_names_them():
+    runner = _bg_confirm_runner(["idle", "running", "idle"])  # background session-1 running
+    captured = {}
+
+    def fake_popup(title, options):
+        captured["title"], captured["options"] = title, options
+        return "Yes, terminate them and exit"
+
+    runner._select_popup = fake_popup
+    assert runner._confirm_terminate_background_sessions() is True
+    assert "still running" in captured["title"]
+    assert "session-1" in captured["title"]
+
+    # Declining the second confirmation keeps working (cancels exit).
+    runner._select_popup = lambda *a, **k: "No, keep working"
+    assert runner._confirm_terminate_background_sessions() is False
 
 
 def test_sync_idle_worktrees_skipped_while_paused():
