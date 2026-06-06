@@ -175,6 +175,23 @@ class _BackgroundColorEraseScreen(pyte.HistoryScreen):
         finally:
             self.cursor.attrs = saved
 
+    def report_device_status(self, mode: int = 0, private: bool = False, **kwargs) -> None:
+        # pyte's stream invokes report_device_status(mode, private=True) for
+        # DEC-private DSR queries — notably ``\x1b[?6n`` (cursor-position request),
+        # which Claude/Ink emits while redrawing — but pyte's own
+        # Screen.report_device_status() doesn't accept ``private`` and raises
+        # TypeError mid-parse. aGiT swallows feed errors to stay alive, but that
+        # drops the rest of the output chunk: it truncated Claude's option-menu
+        # collapse redraw, leaving stale menu rows on screen. aGiT answers terminal
+        # queries itself (_answer_terminal_queries), so pyte's report is unused —
+        # just accept ``private`` and never raise so the feed completes.
+        if private:
+            return
+        try:
+            super().report_device_status(mode)
+        except TypeError:
+            pass
+
 
 class RepoChangeHandler(FileSystemEventHandler):
     IGNORED_PARTS = {".agit", ".git", ".pytest_cache", ".venv", "__pycache__"}
@@ -376,6 +393,10 @@ class ProxyRunner:
         # commit work aGiT has already captured).
         self._message_sticky = False
         self._last_agent_commit_id: str | None = None
+        # Prompts the user queued while the agent was busy; the next commit waits
+        # for each to appear as a turn so a queued follow-up shares one commit with
+        # the turn it follows instead of producing a second commit.
+        self._awaited_followups: list[str] = []
         self.agent_parse_thread: threading.Thread | None = None
         self.agent_parse_result = None
         self.agent_parse_active = False
@@ -2290,6 +2311,9 @@ class ProxyRunner:
                     if not self._confirm_exit():
                         self._render()
                         continue
+                    if not self._confirm_terminate_background_sessions():
+                        self._render()
+                        continue
                     self._finalize_pending_work()
                     self._exit_child()
                     break
@@ -3003,6 +3027,9 @@ class ProxyRunner:
             if not self._confirm_exit():
                 self._render()
                 return
+            if not self._confirm_terminate_background_sessions():
+                self._render()
+                return
             self._finalize_pending_work()
             self.running = False
             self._exit_child()
@@ -3254,13 +3281,15 @@ class ProxyRunner:
         if not self.repo.has_staged_changes():
             return False
 
-        # The subject reflects only the most recent prompt; the full interaction
-        # trace below still records every prompt in this commit. Joining them all
-        # here bloated the subject with stale prompts from earlier in the session.
-        latest_prompt = subject_prompts[-1] if subject_prompts else f"{backend} changes"
+        # The subject lists every user prompt that led to this commit, joined by
+        # " / " (a commit can cover several turns — e.g. a prompt queued mid-turn).
+        # subject_prompts holds only this commit's prompts, not the whole session,
+        # so it never accumulates stale earlier prompts; the builder truncates the
+        # joined text to GitHub's subject width and keeps the full text below it.
+        subject_text = " / ".join(subject_prompts) if subject_prompts else f"{backend} changes"
         self._last_agent_commit_id = self.repo.commit(
             build_agent_commit_message(
-                latest_prompt=latest_prompt,
+                latest_prompt=subject_text,
                 trace=self.state.pending_trace(),
                 backend=backend,
                 backend_session_id=backend_session_id,
@@ -3310,6 +3339,30 @@ class ProxyRunner:
     def _confirm_exit(self) -> bool:
         choice = self._select_popup("Exit aGiT?", ["No, keep working", "Yes, exit"])
         return choice == "Yes, exit"
+
+    def _running_background_session_names(self) -> list[str]:
+        # Names of background (non-active) sessions whose backend is still working.
+        return [
+            self._session_name(index)
+            for index in range(len(self.sessions))
+            if index != self.active_index and self._session_status(index) == "running"
+        ]
+
+    def _confirm_terminate_background_sessions(self) -> bool:
+        # Second exit confirmation, shown only when background sessions are still
+        # running: it names them and warns that exiting terminates them (which may
+        # lose in-flight work). Returns True to proceed with exit, False to keep
+        # working. No-op (returns True) when nothing is running in the background.
+        names = self._running_background_session_names()
+        if not names:
+            return True
+        listing = ", ".join(f"'{name}'" for name in names)
+        lead = "background sessions are" if len(names) > 1 else "A background session is"
+        choice = self._select_popup(
+            f"{lead} still running ({listing}). Exiting now terminates them and may lose in-progress work.",
+            ["No, keep working", "Yes, terminate them and exit"],
+        )
+        return choice == "Yes, terminate them and exit"
 
     def _commit_latest_turn_sync(self) -> None:
         # Synchronously (joining the parse worker) commit the latest completed
@@ -3502,6 +3555,7 @@ class ProxyRunner:
             self.pre_agent_reconciled_status = ""
         if status and self._agent_is_active():
             self._record_user_prompt(prompt_text)
+            self._await_followup(prompt_text)
             return True
         if finished is False:
             self.pre_agent_reconciled_status = status
@@ -3518,6 +3572,12 @@ class ProxyRunner:
             self._set_message("User changes detected before agent runs.")
             self._render()
             self._create_user_commit_popup()
+        # Trace every submitted prompt as a user message. The agent-active path
+        # above already recorded; the held path records in _forward_pending_prompt.
+        # This covers the remaining (clean / user-changes-committed) submits so no
+        # follow-up is dropped from the commit trace. Dedup in the agent-commit
+        # builder collapses this with the backend's own turn.user_prompt.
+        self._record_user_prompt(prompt_text)
         return True
 
     def _resume_pending_prompt_if_ready(self) -> None:
@@ -3527,6 +3587,13 @@ class ProxyRunner:
         if finished is None:
             if self.agent_parse_thread and self.agent_parse_thread.is_alive():
                 self._set_message("aGiT is checking existing git changes before sending your prompt...", seconds=60)
+                return
+            # The parse already ran and deferred (its result is consumed): the
+            # agent's latest turn is still in progress, so the uncommitted changes
+            # belong to the in-flight agent — there is nothing of the user's to
+            # commit before this prompt. Forward it now so the backend queues the
+            # follow-up instead of holding it (and the "checking" message) forever.
+            self._forward_pending_prompt()
             return
         if finished is False and self.actions.has_pre_agent_user_changes():
             self._set_message("User changes detected before agent runs.")
@@ -3611,6 +3678,15 @@ class ProxyRunner:
         if prompt_text:
             self.state.append_trace("user", prompt_text)
 
+    def _await_followup(self, prompt_text: str) -> None:
+        # Remember a prompt the user queued while the agent was busy so the next
+        # commit waits for it to land as a turn (see _finish_agent_parse_if_ready),
+        # keeping the queued prompt in the same commit as the turn it follows.
+        norm = " ".join((prompt_text or "").split())
+        if norm:
+            self._awaited_followups = getattr(self, "_awaited_followups", [])
+            self._awaited_followups.append(norm)
+
     def _discover_spawned_session(self) -> str | None:
         # Identify the session aGiT just spawned: the newest one that did not
         # exist before launch. Falls back to the newest overall when no snapshot
@@ -3693,6 +3769,21 @@ class ProxyRunner:
         if session.model:
             self.state.model = session.model
         turns = turns_after(session, last_message_id)
+        # A prompt the user queued WHILE the agent was working belongs in the same
+        # commit as the turn it follows — otherwise the brief idle gap after the
+        # first turn lets the debounce commit it, and the queued prompt then lands
+        # as a second commit. Hold off until every queued prompt has shown up as a
+        # turn in the transcript. Only while the agent is still active, though: a
+        # queued prompt the user cancelled never lands and must not block forever.
+        awaited = getattr(self, "_awaited_followups", [])
+        if awaited:
+            seen = {" ".join((turn.user_prompt or "").split()) for turn in session.turns}
+            awaited = [prompt for prompt in awaited if prompt not in seen]
+            self._awaited_followups = awaited
+            if require_complete and awaited and self._agent_is_active():
+                self._debug(f"deferring agent commit: {len(awaited)} queued follow-up(s) not yet in transcript")
+                return None
+            self._awaited_followups = []  # committing now: drop any cancelled queue entries
         # Don't commit while the latest prompt is still being answered (the
         # backend's last message was a tool call, not a final response). The
         # idle/file-stable debounce can otherwise fire during a mid-turn pause and
