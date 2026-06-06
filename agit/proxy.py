@@ -3281,6 +3281,11 @@ class ProxyRunner:
         # Sticky messages ignore the timeout and persist until the user's next
         # keypress clears them (see _clear_sticky_message_on_input).
         self._message_sticky = sticky
+        # Request a repaint so the popup actually shows. Without this a message set
+        # from the background idle loop (e.g. the auto-commit confirmation, set when
+        # the agent has gone quiet and produces no output to trigger a render) would
+        # never be painted.
+        self._render_pending = True
 
     def _clear_message(self) -> None:
         self.message = None
@@ -3707,6 +3712,14 @@ class ProxyRunner:
             self.state.last_backend_message_id = complete_turns[-1].assistant_message_id
             self.last_status = ""
             self._debug(f"agent commit created session_id={self.state.backend_session_id} assistant_id={self.state.last_backend_message_id}")
+            if not quiet:
+                # Paint the "Created <agent> commit." confirmation NOW, before the
+                # integrate below runs git merge/fast-forward on the main thread.
+                # Otherwise the popup wouldn't appear until that work returned and
+                # the loop got back to a render — making it look like nothing
+                # happened. (quiet covers background/exit commits, which set no
+                # message and may have another session swapped in.)
+                self._render()
             if integrate:
                 # Interactive integration (may prompt / inject an agent merge) only
                 # for the active session. The sync/background commit path passes

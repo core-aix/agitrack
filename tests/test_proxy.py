@@ -731,6 +731,19 @@ def test_keypress_leaves_nonsticky_message_intact():
     assert runner.message == "transient note"
 
 
+def test_set_message_requests_a_render():
+    # The render loop only paints when _render_pending is set (or on child
+    # output). A message set from the background idle loop — e.g. the auto-commit
+    # confirmation, when the agent is quiet — must therefore request a repaint, or
+    # the popup is never drawn.
+    runner = ProxyRunner.__new__(ProxyRunner)
+    runner._render_pending = False
+
+    runner._set_message("Created <agent> commit.", sticky=True)
+
+    assert runner._render_pending is True
+
+
 def test_track_sync_update_defers_then_releases_render():
     runner = ProxyRunner.__new__(ProxyRunner)
     runner._in_sync_update = False
