@@ -375,6 +375,7 @@ class ProxyRunner:
         # sees that aGiT committed (and isn't misled by the backend asking to
         # commit work aGiT has already captured).
         self._message_sticky = False
+        self._last_agent_commit_id: str | None = None
         self.agent_parse_thread: threading.Thread | None = None
         self.agent_parse_result = None
         self.agent_parse_active = False
@@ -3257,7 +3258,7 @@ class ProxyRunner:
         # trace below still records every prompt in this commit. Joining them all
         # here bloated the subject with stale prompts from earlier in the session.
         latest_prompt = subject_prompts[-1] if subject_prompts else f"{backend} changes"
-        self.repo.commit(
+        self._last_agent_commit_id = self.repo.commit(
             build_agent_commit_message(
                 latest_prompt=latest_prompt,
                 trace=self.state.pending_trace(),
@@ -3272,8 +3273,14 @@ class ProxyRunner:
         )
         self.state.clear_trace()
         if not quiet:
-            self._set_message("Created <agent> commit.", sticky=True)
+            self._set_message(self._agent_commit_message(), sticky=True)
         return True
+
+    def _agent_commit_message(self) -> str:
+        # The auto-commit confirmation, including the short SHA of the commit aGiT
+        # just made so the user can find it (e.g. `git show <id>`).
+        commit_id = getattr(self, "_last_agent_commit_id", None)
+        return f"Created <agent> commit {commit_id}." if commit_id else "Created <agent> commit."
 
     def _set_message(self, message: str, *, seconds: float = 4.0, sticky: bool = False) -> None:
         self.message = message
@@ -3797,9 +3804,9 @@ class ProxyRunner:
                 self._render_status("git changes found; no new final response available")
             return
         if self.verbose:
-            self._render_status("Created <agent> commit.")
+            self._render_status(self._agent_commit_message())
         else:
-            self._set_message("Created <agent> commit.", sticky=True)
+            self._set_message(self._agent_commit_message(), sticky=True)
 
     def _pause_child_ui(self) -> None:
         self._set_cooked()

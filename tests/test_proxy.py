@@ -83,6 +83,7 @@ class FakeCommitRepo:
 
     def commit(self, message: str):
         self.message = message
+        return "abc1234"  # mirror GitRepo.commit returning the new short SHA
 
 
 def test_proxy_ctrl_g_enters_command_mode():
@@ -370,6 +371,27 @@ def test_finish_agent_parse_forces_in_progress_commit_on_exit(tmp_path):
 
     assert forced is True
     assert len(runner.commits) == 1
+
+
+def test_agent_commit_popup_includes_commit_id(tmp_path):
+    # The auto-commit confirmation names the short SHA so the user can find the
+    # commit aGiT just made.
+    runner = ProxyRunner.__new__(ProxyRunner)
+    runner.repo = FakeCommitRepo()
+    runner.state = AgitState(tmp_path)
+    runner.verbose = False
+    runner._review_untracked_popup = lambda include_declined: "No untracked files to review."
+
+    committed = runner._create_agent_commit_from_turns_popup(
+        turns=[SessionTurn("u1", "a1", "do the thing", "done", TokenUsage(total=1, output=1), None)],
+        backend="opencode",
+        backend_session_id="ses-1",
+        model="provider/model",
+        quiet=False,
+    )
+
+    assert committed is True
+    assert runner.message == "Created <agent> commit abc1234."
 
 
 def test_proxy_plain_row_handles_empty_pyte_cell_data():
