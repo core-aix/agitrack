@@ -681,6 +681,56 @@ def test_render_wraps_frame_in_synchronized_update(monkeypatch):
     assert "r0" in out and "r1" in out and "r2" in out and "STATUS" in out
 
 
+def test_sticky_message_renders_after_timeout(monkeypatch):
+    runner = _paint_runner()
+    runner.cols = 60  # wide enough that the popup text isn't truncated
+    writes = []
+    monkeypatch.setattr(os, "write", lambda fd, data: writes.append(data) or len(data))
+
+    runner._set_message("Created <agent> commit.", sticky=True)
+    runner.message_until = time.monotonic() - 100  # the timeout passed long ago
+
+    runner._render()
+
+    # A sticky message stays up past its timeout (until the next keypress).
+    assert "Created <agent> commit." in writes[0].decode()
+
+
+def test_nonsticky_message_hidden_after_timeout(monkeypatch):
+    runner = _paint_runner()
+    runner.cols = 60
+    writes = []
+    monkeypatch.setattr(os, "write", lambda fd, data: writes.append(data) or len(data))
+
+    runner.message = "transient note"
+    runner.message_until = time.monotonic() - 100
+    runner._message_sticky = False
+
+    runner._render()
+
+    assert "transient note" not in writes[0].decode()
+
+
+def test_keypress_dismisses_sticky_message():
+    runner = ProxyRunner.__new__(ProxyRunner)
+    runner._set_message("Created <agent> commit.", sticky=True)
+    assert runner._message_sticky is True
+
+    assert runner._clear_sticky_message_on_input() is True
+    assert runner.message is None
+    assert runner._message_sticky is False
+    # A following keypress has nothing sticky to clear.
+    assert runner._clear_sticky_message_on_input() is False
+
+
+def test_keypress_leaves_nonsticky_message_intact():
+    runner = ProxyRunner.__new__(ProxyRunner)
+    runner._set_message("transient note")  # default: not sticky
+
+    assert runner._clear_sticky_message_on_input() is False
+    assert runner.message == "transient note"
+
+
 def test_track_sync_update_defers_then_releases_render():
     runner = ProxyRunner.__new__(ProxyRunner)
     runner._in_sync_update = False

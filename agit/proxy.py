@@ -370,6 +370,11 @@ class ProxyRunner:
         self.last_status_change = 0.0
         self.message: str | None = None
         self.message_until = 0.0
+        # A sticky message stays up until the user's next keypress instead of
+        # timing out — used for the auto-commit confirmation so the user actually
+        # sees that aGiT committed (and isn't misled by the backend asking to
+        # commit work aGiT has already captured).
+        self._message_sticky = False
         self.agent_parse_thread: threading.Thread | None = None
         self.agent_parse_result = None
         self.agent_parse_active = False
@@ -2270,6 +2275,11 @@ class ProxyRunner:
             if sys.stdin.fileno() in readable:
                 data = os.read(sys.stdin.fileno(), 4096)
                 self._raw_capture(">", data)
+                # Any keypress dismisses a sticky message (e.g. the auto-commit
+                # confirmation) so it no longer overlays the live view; repaint to
+                # remove the popup even if the key produces no child echo.
+                if self._clear_sticky_message_on_input():
+                    self._render_pending = True
                 data = self._input_tail + data
                 data, self._input_tail = self._hold_incomplete_tail(data)
                 data = self._intercept_scroll(data)
@@ -2678,7 +2688,7 @@ class ProxyRunner:
         parts.append(self._status_line())
         if self.input.capturing:
             self._append_command_palette(parts)
-        elif self.message and time.monotonic() < self.message_until:
+        elif self.message and (getattr(self, "_message_sticky", False) or time.monotonic() < self.message_until):
             self._append_message_popup(parts, self.message)
         parts.append(self._cursor_sequence())
         parts.append("\x1b[?2026l")
@@ -3262,16 +3272,28 @@ class ProxyRunner:
         )
         self.state.clear_trace()
         if not quiet:
-            self._set_message("Created <agent> commit.")
+            self._set_message("Created <agent> commit.", sticky=True)
         return True
 
-    def _set_message(self, message: str, *, seconds: float = 4.0) -> None:
+    def _set_message(self, message: str, *, seconds: float = 4.0, sticky: bool = False) -> None:
         self.message = message
         self.message_until = time.monotonic() + seconds
+        # Sticky messages ignore the timeout and persist until the user's next
+        # keypress clears them (see _clear_sticky_message_on_input).
+        self._message_sticky = sticky
 
     def _clear_message(self) -> None:
         self.message = None
         self.message_until = 0.0
+        self._message_sticky = False
+
+    def _clear_sticky_message_on_input(self) -> bool:
+        # The next keypress dismisses a sticky message. Returns True if one was
+        # showing (so the caller can repaint to remove the popup).
+        if getattr(self, "_message_sticky", False):
+            self._clear_message()
+            return True
+        return False
 
     def _confirm_exit(self) -> bool:
         choice = self._select_popup("Exit aGiT?", ["No, keep working", "Yes, exit"])
@@ -3764,7 +3786,7 @@ class ProxyRunner:
         if self.verbose:
             self._render_status("Created <agent> commit.")
         else:
-            self._set_message("Created <agent> commit.")
+            self._set_message("Created <agent> commit.", sticky=True)
 
     def _pause_child_ui(self) -> None:
         self._set_cooked()
