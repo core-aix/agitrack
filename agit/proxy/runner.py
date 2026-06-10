@@ -35,6 +35,7 @@ from agit import sandbox
 from agit.state import AgitState
 from agit.worktree import WorktreeInfo, WorktreeManager, _sanitize_name
 from agit.proxy.commit_engine import CommitEngine
+from agit.proxy.integration import IntegrationService, MergeContext, MergePhase
 from agit.proxy.process import BackendProcess
 from agit.proxy.session import Session
 
@@ -340,6 +341,9 @@ class ProxyRunner:
         # this stays empty/identity and the loop is unchanged. `base_repo` is
         # the main working tree (worktrees branch off it).
         self.base_repo = repo
+        # IntegrationService: encapsulates all branch/merge/integration policy.
+        # base_branch is set at startup (run()) and updated by _perform_base_switch.
+        self._integration: IntegrationService = IntegrationService(repo, None)
         self._base_branch: str | None = None  # integration target branch (set at startup)
         self._integration_paused = False  # set when the base repo is switched off _base_branch out-of-band
         self._base_drift_check_at = 0.0
@@ -437,6 +441,26 @@ class ProxyRunner:
         if sessions and 0 <= index < len(sessions) and isinstance(sessions[index], Session):
             self.active = sessions[index]
 
+    @property
+    def _integration(self) -> IntegrationService:
+        """The IntegrationService for this runner.
+
+        Lazily materialised for ``ProxyRunner.__new__``-built test runners that
+        never call ``__init__``.  Production code always has it set in
+        ``__init__``; the property is just a safety net.
+        """
+        svc = self.__dict__.get("_integration_svc")
+        if svc is None:
+            base_repo = self.__dict__.get("base_repo")
+            base_branch = self.__dict__.get("_base_branch")
+            svc = IntegrationService(base_repo, base_branch)
+            self.__dict__["_integration_svc"] = svc
+        return svc
+
+    @_integration.setter
+    def _integration(self, svc: IntegrationService) -> None:
+        self.__dict__["_integration_svc"] = svc
+
     def run(self) -> int:
         if not sys.stdin.isatty() or not sys.stdout.isatty():
             raise RuntimeError("Proxy mode requires an interactive terminal. Use --mode json for non-TTY use.")
@@ -452,6 +476,7 @@ class ProxyRunner:
         # Base-merge-only: run even the first session in a worktree so the base
         # branch is only advanced by integration, never edited by a live agent.
         self._base_branch = self.base_repo.current_branch()
+        self._integration.base_branch = self._base_branch
         self._cleanup_stale_state_on_startup()
         self._reload_user_declined()  # files the pre-agent flow left intentionally unstaged
         self._setup_base_merge_only_session()
@@ -563,36 +588,21 @@ class ProxyRunner:
         # keep running and committing to their own branches throughout.)
         if self._base_branch is None:
             return
-        now = time.monotonic()
-        if now - getattr(self, "_base_drift_check_at", 0.0) < self.BASE_DRIFT_CHECK_SECONDS:
-            return
-        self._base_drift_check_at = now
-        try:
-            current = self.base_repo.current_branch()
-        except Exception:
-            return
-        drifted = current != self._base_branch
-        if drifted and not self._integration_paused:
-            self._integration_paused = True
-            self._debug(f"base branch drift: repo on '{current}', integration target '{self._base_branch}'")
-            self._set_message(
-                f"⚠ Base branch changed outside aGiT — the repo is now on '{current}', but\n"
-                f"aGiT integrates into '{self._base_branch}'. Worktree merging is PAUSED so\n"
-                f"your work isn't merged into the wrong branch (sessions keep running and\n"
-                f"committing to their own branches).\n"
-                f"To resume: run  git checkout {self._base_branch}  in the repo — merging\n"
-                f"continues automatically. To instead make '{current}' the base, quit and\n"
-                f"relaunch aGiT from there.",
-                seconds=30.0,
-            )
-            self._render()
-        elif not drifted and self._integration_paused:
-            self._integration_paused = False
-            self._debug(f"base branch restored to '{self._base_branch}'; integration resumed")
-            self._set_message(
-                f"Base branch back on '{self._base_branch}' — worktree merging resumed.",
-                seconds=8.0,
-            )
+        paused, new_check_at, message = self._integration.check_base_drift(
+            base_branch=self._base_branch,
+            integration_paused=self._integration_paused,
+            last_check_at=getattr(self, "_base_drift_check_at", 0.0),
+            drift_check_seconds=self.BASE_DRIFT_CHECK_SECONDS,
+        )
+        self._base_drift_check_at = new_check_at
+        if message is not None:
+            if paused and not self._integration_paused:
+                self._debug(f"base branch drift: integration target '{self._base_branch}'")
+                self._set_message(message, seconds=30.0)
+            elif not paused and self._integration_paused:
+                self._debug(f"base branch restored to '{self._base_branch}'; integration resumed")
+                self._set_message(message, seconds=8.0)
+            self._integration_paused = paused
             self._render()
 
     def _warn_if_base_edited(self) -> None:
@@ -627,21 +637,19 @@ class ProxyRunner:
         # for any reason, flag a sync so idle worktrees pick the new commits up
         # (`_sync_idle_worktrees_to_base`). The first observation only records the
         # baseline; it never triggers on startup.
-        if self.worktree is None or self._base_branch is None:
-            return
-        now = time.monotonic()
-        if now - self._base_poll_at < self.BASE_POLL_SECONDS:
-            return
-        self._base_poll_at = now
-        try:
-            head = self.base_repo.rev_parse(self._base_branch)
-        except Exception as error:
-            self._debug(f"base-head poll failed: {error!r}")
-            return
-        if self._last_base_head is not None and head != self._last_base_head:
+        new_head, new_poll_at, advanced = self._integration.poll_base_advanced(
+            worktree=self.worktree,
+            last_base_head=self._last_base_head,
+            last_poll_at=self._base_poll_at,
+            base_poll_seconds=self.BASE_POLL_SECONDS,
+        )
+        self._base_poll_at = new_poll_at
+        if new_head is not None:
+            self._last_base_head = new_head
+        if advanced:
             self._base_advanced = True
-        self._last_base_head = head
-        self._prune_user_declined()  # keep the status-line count current
+        if new_head is not None:
+            self._prune_user_declined()  # keep the status-line count current
 
     def _warn_if_cwd_drifted(self) -> None:
         # `claude --resume` can restore a session's *saved* working directory and
@@ -891,8 +899,7 @@ class ProxyRunner:
         self.state.new_agit_session_id()
 
     def _turn_from_branch(self, branch: str) -> int:
-        match = re.search(r"/t(\d+)$", branch or "")
-        return int(match.group(1)) if match else 0
+        return self._integration.turn_from_branch(branch)
 
     def _setup_base_merge_only_session(self) -> None:
         # Move the initial session into its own worktree so the base tree is only
@@ -1007,35 +1014,13 @@ class ProxyRunner:
         if self._base_branch is None:
             return
         try:
-            if repo.merge_in_progress() or repo.has_changes():
-                return
-            branch = repo.current_branch()
-            if branch.startswith("agit/") and self.base_repo.log_range(self._base_branch, branch):
-                # Has its own unintegrated commits: don't re-point (that would
-                # orphan the work). Merge any new base commits in instead, keeping
-                # it current — but only if the merge is clean.
-                if not self.base_repo.log_range(branch, self._base_branch):
-                    return  # already contains the base; nothing to merge
-                if repo.merge(self._base_branch):
-                    self._debug(f"merged base '{self._base_branch}' into session branch {branch}")
-                else:
-                    repo.merge_abort()  # conflicts; leave for integration to resolve
-                    self._debug(f"base '{self._base_branch}' conflicts with {branch}; left for integration")
-                return
-            if repo.rev_parse("HEAD") != self.base_repo.rev_parse(self._base_branch):
-                repo.switch_detach(self._base_branch)
-                self._debug(f"re-pointed session worktree to current base '{self._base_branch}'")
+            self._integration.align_session_to_base(repo)
         except Exception as error:
             self._debug(f"align to base failed: {error!r}")
 
     def _worktree_has_pending_work(self, repo: GitRepo, branch: str) -> bool:
         # Pending = uncommitted changes, or commits on its branch not yet in base.
-        try:
-            if repo.has_changes():
-                return True
-            return bool(self.base_repo.log_range(self._base_branch, branch))
-        except Exception:
-            return True  # err on the side of keeping the worktree
+        return self._integration.worktree_has_pending_work(repo, branch)
 
     def _cleanup_stale_state_on_startup(self) -> None:
         # A non-graceful exit (the backend dying, SIGKILL, a crash) can leave junk
@@ -1124,30 +1109,16 @@ class ProxyRunner:
         # Integrate a dormant worktree's pending commits (if any) and delete it.
         # Returns False (keep + flag) when it has uncommitted changes or its work
         # conflicts with the base and so needs the user/agent to resolve.
-        repo = GitRepo(info.path)
-        if repo.merge_in_progress() or repo.has_changes():
-            return False
-        branch = repo.current_branch()
-        if branch.startswith("agit/") and self.base_repo.log_range(self._base_branch, branch):
-            if not repo.merge(self._base_branch):  # base into the stale branch
-                repo.merge_abort()
-                return False
-            self.base_repo.merge_ff_only(branch)
-        self._worktrees().remove(info.name)
-        self._debug(f"cleaned stale worktree '{info.name}'")
-        return True
+        result = self._integration.cleanup_stale_worktree(info, self._worktrees())
+        if result:
+            self._debug(f"cleaned stale worktree '{info.name}'")
+        return result
 
     def _delete_orphan_merged_branches(self) -> None:
         # Remove agit/* branches that no worktree checks out and that are already
         # contained in the base branch (stale leftovers).
         try:
-            checked_out = {entry.get("branch") for entry in self.base_repo.worktree_list()}
-            for branch in self.base_repo.list_branches("agit/"):
-                if branch in checked_out:
-                    continue
-                if not self.base_repo.log_range(self._base_branch, branch):
-                    self.base_repo.delete_branch(branch, force=True)
-                    self._debug(f"deleted stale merged branch {branch}")
+            self._integration.delete_orphan_merged_branches()
         except Exception as error:
             self._debug(f"orphan branch cleanup failed: {error!r}")
 
@@ -1168,25 +1139,20 @@ class ProxyRunner:
         # Try to fast-forward the current session's turn branch into the base.
         # Returns "integrated" (base advanced), "conflict" (the merge was backed
         # out and needs resolution), or "skip" (nothing to integrate).
-        if self.worktree is None or self._base_branch is None or self.merge_ctx:
-            return "skip"
-        if getattr(self, "_integration_paused", False):
-            return "skip"  # base switched out-of-band; merging is paused
-        turn_branch = self.repo.current_branch()
-        if not turn_branch.startswith("agit/"):
-            return "skip"
-        try:
-            if not self.repo.merge(self._base_branch):
-                # Back out of the conflicted merge so the worktree is clean again;
-                # the chosen resolution path re-starts the merge from here.
-                self.repo.merge_abort()
-                return "conflict"
+        _branch_before = self.repo.current_branch() if self.repo is not None else ""
+        result, turn_branch = self._integration.integrate_turn_or_conflict(
+            repo=self.repo,
+            name=self.name,
+            worktree=self.worktree,
+            merge_ctx=self.merge_ctx,
+            integration_paused=getattr(self, "_integration_paused", False),
+        )
+        if result == "integrated":
             self._advance_base_to(turn_branch)
-            self._debug(f"integrated '{self.name}' {turn_branch} -> {self._base_branch}")
-            return "integrated"
-        except Exception as error:
-            self._debug(f"integration failed for '{self.name}': {error!r}")
-            return "skip"
+            self._debug(f"integrated '{self.name}' {_branch_before} -> {self._base_branch}")
+        elif result == "conflict":
+            self._debug(f"integration conflict for '{self.name}'")
+        return result
 
     def _prompt_resolve_conflict(self, source_branch: str) -> None:
         # A finished turn cannot fast-forward into the base because it conflicts
@@ -1219,20 +1185,8 @@ class ProxyRunner:
         # are left intact for the next startup to surface.
         if self.worktree is None or getattr(self, "_base_branch", None) is None:
             return
-        if self.merge_ctx or self.repo.merge_in_progress() or self.repo.has_changes():
-            return
-        branch = self.repo.current_branch()
-        if not branch.startswith("agit/"):
-            return  # already detached / on no turn branch
         try:
-            if not self.base_repo.log_range(self._base_branch, branch):
-                # Nothing ahead of base: just drop the empty turn branch.
-                self._advance_base_to(branch)
-                return
-            if self.repo.merge(self._base_branch):
-                self._advance_base_to(branch)
-            else:
-                self.repo.merge_abort()
+            self._integration.integrate_session_on_exit(self.repo, self.merge_ctx)
         except Exception as error:
             self._debug(f"exit integration failed for '{self.name}': {error!r}")
 
@@ -1246,15 +1200,7 @@ class ProxyRunner:
         # different branch out-of-band — `git merge --ff-only` advances whatever is
         # currently checked out, so this would move the WRONG branch. Callers wrap
         # this in try/except and treat the failure as "not integrated".
-        current = self.base_repo.current_branch()
-        if current != self._base_branch:
-            raise RuntimeError(
-                f"base repo is on '{current}', not the integration branch '{self._base_branch}'"
-            )
-        self.base_repo.merge_ff_only(source_branch)
-        self.repo.switch_detach(self._base_branch)
-        if self.repo.current_branch() != source_branch:
-            self.base_repo.delete_branch(source_branch, force=True)
+        self._integration.advance_base_to(self.repo, source_branch)
         # The base moved; other idle sessions should fast-forward onto it.
         self._base_advanced = True
 
@@ -1280,21 +1226,26 @@ class ProxyRunner:
         # A merged-and-detached session sits at base between turns. Before its
         # next commit, put it on a fresh turn branch (this preserves the working
         # tree, so the agent's changes carry over).
-        if self.worktree is None or not self.repo.is_detached():
-            return
         # Recovery paths can reset the turn counter (e.g. a recreated worktree
         # starts detached at base, so the counter restarts at 0) while earlier
         # turn branches still exist — deliberately kept when they hold
         # unintegrated commits. Never reuse such a name: resetting it would
         # destroy that work. Skip to the next free turn number instead.
-        self.turn = (self.turn or 0) + 1
-        next_branch = self._worktrees().turn_branch(self.name, self.turn, backend=self.backend.name)
-        while self.repo.branch_exists(next_branch):
-            self.turn += 1
-            next_branch = self._worktrees().turn_branch(self.name, self.turn, backend=self.backend.name)
-        self.repo.switch(next_branch, create=True)
+        if self.worktree is None or not self.repo.is_detached():
+            return
+        new_turn = self._integration.ensure_turn_branch(
+            repo=self.repo,
+            worktree=self.worktree,
+            turn=self.turn,
+            worktree_manager=self._worktrees(),
+            session_name=self.name,
+            backend_name=self.backend.name,
+        )
+        self.turn = new_turn
 
     def _merge_resolution_prompt(self, files: list[str], context: str) -> str:
+        # Delegates to IntegrationService.merge_resolution_prompt indirectly;
+        # kept as a runner method because tests mock it directly.
         listing = ", ".join(files) if files else "the conflicted files"
         commits = context.replace("\n", "; ") if context else "(none recorded)"
         return (
@@ -1337,6 +1288,8 @@ class ProxyRunner:
             return  # Enter never reached the backend; the merge gate stays closed
         if self.merge_ctx is not None and self.master_fd == fd:
             self.merge_ctx["prompt_sent_at"] = time.monotonic()
+            if hasattr(self.merge_ctx, "phase"):
+                self.merge_ctx.phase = MergePhase.RESOLVING
 
     def _begin_agent_merge(self, source_branch: str) -> None:
         # A merge is in progress (conflicted) in the worktree. Ask the session's
@@ -1347,13 +1300,13 @@ class ProxyRunner:
         except Exception:
             context = ""
         self._inject_prompt(self._merge_resolution_prompt(files, context))
-        self.merge_ctx = {
-            "source_branch": source_branch,
-            "context": context,
-            "started": time.monotonic(),
-            "auto_tried": False,
-            "prompt_sent_at": None,  # set once the submit Enter goes out
-        }
+        self.merge_ctx = MergeContext(
+            source_branch=source_branch,
+            context=context,
+            phase=MergePhase.PENDING,
+            auto_tried=False,
+            prompt_sent_at=None,  # set once the submit Enter goes out
+        )
         self.agent_in_flight = True
         self._set_message(
             f"Merge conflict in {', '.join(files) or 'this session'} — asking the agent to resolve it… "
@@ -1386,58 +1339,42 @@ class ProxyRunner:
         # engaged with the injected prompt (produced output after we submitted
         # it) and then gone idle — never before the prompt has even been sent.
         ctx = self.merge_ctx
-        if not ctx or ctx.get("auto_tried"):
+        if not ctx:
             return
-        sent_at = ctx.get("prompt_sent_at")
-        if not sent_at:  # the submit Enter has not gone out yet
+        if not self._integration.should_auto_complete_merge(ctx, self.last_child_output, self.CHILD_IDLE_SECONDS):
             return
-        if self.last_child_output <= sent_at:  # agent has not responded yet
-            return
-        if time.monotonic() - self.last_child_output < self.CHILD_IDLE_SECONDS + 2:
-            return
-        ctx["auto_tried"] = True
+        ctx.auto_tried = True
+        ctx.phase = MergePhase.RESOLVING
         self._finalize_agent_merge()
 
     def _finalize_agent_merge(self) -> bool:
         ctx = self.merge_ctx
         if not ctx:
             return False
-        source_branch = ctx["source_branch"]
-        try:
+        success, message = self._integration.finalize_agent_merge(
+            self.repo,
+            ctx,
+            session_name=self.name,
+            agit_session_id=self.state.session_id,
+            backend_name=self.backend.name,
+            backend_session_id=self.state.backend_session_id,
+        )
+        if success is False and message is None:
+            # merge not in progress — already resolved elsewhere
             if not self.repo.merge_in_progress():
-                self.merge_ctx = None  # already resolved/aborted elsewhere
-                return False
-            self.repo.add_all()
-            if self.repo.has_conflict_markers() or self.repo.unmerged_paths():
-                self._set_message(
-                    "Conflict markers remain. Resolve them (or ask the agent again), "
-                    "then Ctrl-G → session → Complete merge.",
-                    seconds=10.0,
-                )
-                return False
-            self.repo.commit(
-                build_agent_merge_message(
-                    session_name=self.name,
-                    base_branch=self._base_branch,
-                    source_branch=source_branch,
-                    agit_session_id=self.state.session_id,
-                    backend=self.backend.name,
-                    backend_session_id=self.state.backend_session_id,
-                    conflicting_commits=ctx.get("context"),
-                )
-            )
-            self._advance_base_to(source_branch)
+                self.merge_ctx = None
+            return False
+        if message and not success:
+            self._set_message(message, seconds=10.0)
+            return False
+        if success:
             self.merge_ctx = None
             self.agent_in_flight = False
-            self._set_message(
-                f"Merge resolved and committed — integrated '{self.name}' into {self._base_branch}.",
-                seconds=6.0,
-            )
+            self._base_advanced = True  # sync idle worktrees after base advanced
+            self._set_message(message, seconds=6.0)
             self._render()
             return True
-        except Exception as error:
-            self._debug(f"finalize agent merge failed: {error!r}")
-            return False
+        return False
 
     def _session_name(self, index: int) -> str:
         if index == self.active_index:
@@ -1470,11 +1407,7 @@ class ProxyRunner:
 
     def _base_switch_candidates(self) -> list[str]:
         # User branches the base could switch to (never aGiT's transient ones).
-        try:
-            branches = self.base_repo.list_branches()
-        except Exception:
-            return []
-        return [b for b in branches if not b.startswith("agit/") and b != self._base_branch]
+        return self._integration.base_switch_candidates()
 
     def _switch_base_command(self, arg: str = "") -> None:
         if self.worktree is None or self._base_branch is None:
@@ -1506,13 +1439,7 @@ class ProxyRunner:
 
     def _session_unintegrated(self, repo) -> bool:
         # True if a session still has work that did not make it into the base.
-        try:
-            if repo is None or repo.merge_in_progress() or repo.has_changes():
-                return True
-            branch = repo.current_branch()
-            return branch.startswith("agit/") and bool(self.base_repo.log_range(self._base_branch, branch))
-        except Exception:
-            return True
+        return self._integration.session_unintegrated(repo)
 
     def _unintegrated_session_names(self) -> list[str]:
         blocked: list[str] = []
@@ -1549,6 +1476,7 @@ class ProxyRunner:
             self._render()
             return
         self._base_branch = new_base
+        self._integration.base_branch = new_base
         self._repoint_all_sessions_to_base()
         self._exiting = False
         self._set_message(
@@ -1560,15 +1488,11 @@ class ProxyRunner:
     def _repoint_current_to_base(self) -> None:
         # Detach the current session's worktree at the new base so its next turn
         # branches from there. The session and its conversation keep running.
-        if self.worktree is None:
-            return
-        try:
-            if self.repo.has_changes() or self.repo.merge_in_progress():
-                return
-            self.repo.switch_detach(self._base_branch)
-            self.turn = 0
-        except Exception as error:
-            self._debug(f"re-point failed for '{self.name}': {error!r}")
+        new_turn = self._integration.repoint_to_base(self.repo, self.worktree)
+        if new_turn is not None:
+            self.turn = new_turn
+        elif self.worktree is not None:
+            self._debug(f"re-point skipped for '{self.name}' (dirty or error)")
 
     def _repoint_all_sessions_to_base(self) -> None:
         # Re-point every live session at the new base without stopping any of them.
@@ -1635,12 +1559,7 @@ class ProxyRunner:
 
     def _active_has_pending(self) -> bool:
         # True if the active session has committed work not yet in the base.
-        if self.worktree is None or self._base_branch is None:
-            return False
-        try:
-            return bool(self.base_repo.log_range(self._base_branch, self.repo.current_branch()))
-        except Exception:
-            return False
+        return self._integration.active_has_pending(self.repo, self.worktree)
 
     def _integrate_active_session(self) -> None:
         # Selecting the current session offers to integrate its outstanding
@@ -1705,34 +1624,31 @@ class ProxyRunner:
 
     def _start_merge_for_active(self, *, auto: bool) -> None:
         # Begin merging base into the (now active) session's branch.
-        if self.worktree is None or self._base_branch is None:
+        outcome, ctx, message = self._integration.start_merge(
+            repo=self.repo,
+            name=self.name,
+            worktree=self.worktree,
+            auto=auto,
+        )
+        if outcome == "skip":
             return
-        source_branch = self.repo.current_branch()
-        try:
-            clean = self.repo.merge(self._base_branch)
-        except Exception as error:
-            self._set_message(f"Could not start merge: {error}", seconds=8.0)
+        if outcome == "error":
+            self._set_message(message, seconds=8.0)
             self._render()
             return
-        if clean:
-            self._advance_base_to(source_branch)
-            self._set_message(f"Integrated '{self.name}' into {self._base_branch} (no conflicts).", seconds=6.0)
+        if outcome == "clean":
+            # advance_base_to was already called inside the service; set _base_advanced.
+            self._base_advanced = True
+            self._set_message(message, seconds=6.0)
             self._render()
             return
-        if auto:
-            self._begin_agent_merge(source_branch)
-        else:
-            files = self.repo.unmerged_paths()
-            try:
-                context = self.base_repo.log_range(source_branch, self._base_branch, paths=files)
-            except Exception:
-                context = ""
-            self.merge_ctx = {"source_branch": source_branch, "context": context, "started": time.monotonic(), "auto_tried": True}
-            self._set_message(
-                f"Conflicts in {', '.join(files) or 'this session'}. Resolve them here (edit the files or ask the agent), "
-                "then Ctrl-G → session → Complete merge.",
-                seconds=12.0,
-            )
+        # conflict_auto or conflict_manual: ctx is a MergeContext
+        if outcome == "conflict_auto":
+            # Re-enter _begin_agent_merge to inject the prompt (it uses self.repo etc.)
+            self._begin_agent_merge(ctx.source_branch)
+        else:  # conflict_manual
+            self.merge_ctx = ctx
+            self._set_message(message, seconds=12.0)
             self._render()
 
     RESUME_LIST_LIMIT = 20
