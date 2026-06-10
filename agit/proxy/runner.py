@@ -27,14 +27,14 @@ except ImportError:  # pragma: no cover - exercised only without optional depend
 from agit.actions import AgitActions
 from agit.backend_setup import BackendUnavailable, backend_installed, ensure_installed_backend, install_hint
 from agit.backends.proxy_agents import available_backends, make_proxy_agent
-from agit.commit_message import build_agent_commit_message, build_agent_merge_message, build_user_commit_message
+from agit.commit_message import build_agent_merge_message, build_user_commit_message
 from agit.git import GitRepo
 from agit.global_config import GlobalConfig
 from agit.lock import RepoLock, already_running_message
 from agit import sandbox
-from agit.session import turns_after
 from agit.state import AgitState
 from agit.worktree import WorktreeInfo, WorktreeManager, _sanitize_name
+from agit.proxy.commit_engine import CommitEngine
 from agit.proxy.process import BackendProcess
 from agit.proxy.session import Session
 
@@ -2391,68 +2391,24 @@ class ProxyRunner:
             pass
 
     def _sanitize_state_trace(self) -> None:
-        changed = False
-        clean = []
-        for item in self.state.pending_trace():
-            role = item.get("role")
-            content = item.get("content")
-            if role == "agent" and isinstance(content, str) and self.backend.is_event_blob(content):
-                changed = True
-                continue
-            clean.append(item)
-        if changed:
-            self.state.data["pending_trace"] = clean
-            self.state.save()
-            self._debug("removed raw backend event blob from pending trace")
+        CommitEngine(self.repo, self.state, debug_fn=self._debug).sanitize_state_trace(self.backend)
 
     def _recover_nonempty_session(self):
         # When the recorded conversation turns out empty, fall back to this
         # worktree's newest conversation that has real content. Returns
         # (session_id, ExportedSession) or None if nothing resumable exists.
-        try:
-            candidate = self.backend.latest_session_id(self.repo.repo)
-        except Exception as error:
-            self._debug(f"recover non-empty session failed: {error!r}")
-            return None
-        if not candidate or candidate == self.state.backend_session_id:
-            return None
-        self._stage_backend_resume(candidate)
-        session = self.backend.export_session(self.repo.repo, candidate)
-        if session and session.turns:
-            return candidate, session
-        return None
+        return CommitEngine(self.repo, self.state, debug_fn=self._debug).recover_nonempty_session(
+            self.backend, self.repo, self._stage_backend_resume
+        )
 
     def _initialize_session_baseline(self) -> None:
-        if not self._should_continue_session():
-            self.state.backend_session_id = None
-            self.state.last_backend_message_id = None
-            return
-        # Stage the conversation's transcript into this worktree so both the
-        # export below and `--resume` in `_spawn` can find it — the backend may
-        # have recorded it under a different directory (the repo root before aGiT,
-        # or a previous worktree).
-        self._stage_backend_resume(self.state.backend_session_id)
-        session = self.backend.export_session(self.repo.repo, self.state.backend_session_id)
-        if not session or not session.turns:
-            # The recorded session has no actual conversation — e.g. a stale pointer
-            # left by a previous run that adopted an empty session Claude spun up on
-            # resume/picker. Rather than drop into a blank session, recover this
-            # worktree's most recent conversation that actually has content (the
-            # backend's latest_session_id skips empty transcripts).
-            recovered = self._recover_nonempty_session()
-            session = recovered[1] if recovered else None
-            if recovered:
-                self._debug(f"recorded session empty; recovered non-empty {recovered[0]}")
-                self.state.backend_session_id = recovered[0]
-            else:
-                self.state.backend_session_id = None
-                self.state.last_backend_message_id = None
-                return
-        if session.model:
-            self.state.model = session.model
-        complete = [turn for turn in session.turns if turn.assistant_message_id]
-        self.state.last_backend_message_id = complete[-1].assistant_message_id if complete else None
-        self.state.clear_trace()
+        CommitEngine(self.repo, self.state, debug_fn=self._debug).initialize_session_baseline(
+            self.backend,
+            self.repo,
+            should_continue_fn=self._should_continue_session,
+            stage_backend_resume_fn=self._stage_backend_resume,
+            debug_fn=self._debug,
+        )
 
     def _mirror_session_to_base(self, session_id: str | None) -> None:
         # Link an aGiT-born conversation's transcript into the base repo's project
@@ -3040,67 +2996,31 @@ class ProxyRunner:
         return f"Committed {len(paths)} file(s) to {self._base_branch}."
 
     def _create_agent_commit_from_turns_popup(self, *, turns, backend: str, backend_session_id: str | None, model: str | None, quiet: bool, prompt_untracked: bool = True) -> bool:
-        if not turns:
-            return False
-        pending_users = [item.get("content") for item in self.state.pending_trace() if item.get("role") == "user" and item.get("content")]
-        remaining_pending_users = list(pending_users)
-        self.state.data["pending_trace"] = []
-        self.state.save()
-        subject_prompts: list[str] = []
-        for turn in turns:
-            if turn.user_prompt:
-                subject_prompts.append(turn.user_prompt)
-                self.state.append_trace("user", turn.user_prompt)
-                if turn.user_prompt in remaining_pending_users:
-                    remaining_pending_users.remove(turn.user_prompt)
-            if turn.final_response:
-                self.state.append_trace("agent", turn.final_response)
-
-        for pending_user in remaining_pending_users:
-            subject_prompts.append(pending_user)
-            self.state.append_trace("user", pending_user)
-
-        self._ensure_turn_branch()
-        self.repo.add_tracked()
         if prompt_untracked:
-            self._review_untracked_popup(include_declined=False)
+            def stage_untracked_fn(repo, state):
+                self._review_untracked_popup(include_declined=False)
         else:
             # Non-interactive commit (worktree session or exit finalize): stage
             # the agent's new files too, except any the user intentionally declined.
-            declined = set(self.state.declined_untracked())
-            self.repo.stage_paths([path for path in self.repo.untracked_files() if path not in declined])
-        if not self.repo.has_staged_changes():
-            return False
-        # Count tokens only once the commit will actually happen. A failed
-        # attempt (nothing staged) re-processes the same turns on the next parse
-        # — the trace above is rebuilt from scratch each call, but token usage is
-        # cumulative and would be double-counted.
-        for turn in turns:
-            self.state.add_token_usage(turn.tokens)
+            def stage_untracked_fn(repo, state):
+                declined = set(state.declined_untracked())
+                repo.stage_paths([path for path in repo.untracked_files() if path not in declined])
 
-        # The subject lists every user prompt that led to this commit, joined by
-        # " / " (a commit can cover several turns — e.g. a prompt queued mid-turn).
-        # subject_prompts holds only this commit's prompts, not the whole session,
-        # so it never accumulates stale earlier prompts; the builder truncates the
-        # joined text to GitHub's subject width and keeps the full text below it.
-        subject_text = " / ".join(subject_prompts) if subject_prompts else f"{backend} changes"
-        self._last_agent_commit_id = self.repo.commit(
-            build_agent_commit_message(
-                latest_prompt=subject_text,
-                trace=self.state.pending_trace(),
-                backend=backend,
-                backend_session_id=backend_session_id,
-                agit_session_id=self.state.session_id,
-                model=model or self.state.model,
-                token_usage=self.state.pending_token_usage(),
-                trace_turn_limit=self.state.trace_turn_limit,
-                session_name=self.name,
-            )
+        def on_commit_fn(sha):
+            self._last_agent_commit_id = sha
+            if not quiet:
+                self._set_message(self._agent_commit_message(), sticky=True)
+
+        return CommitEngine(self.repo, self.state, debug_fn=self._debug).commit_turns(
+            turns=turns,
+            backend=backend,
+            backend_session_id=backend_session_id,
+            model=model,
+            stage_untracked_fn=stage_untracked_fn,
+            pre_commit_fn=self._ensure_turn_branch,
+            on_commit_fn=on_commit_fn,
+            session_name=self.name,
         )
-        self.state.clear_trace()
-        if not quiet:
-            self._set_message(self._agent_commit_message(), sticky=True)
-        return True
 
     def _agent_commit_message(self) -> str:
         # The auto-commit confirmation, including the short SHA of the commit aGiT
@@ -3572,21 +3492,15 @@ class ProxyRunner:
             self.agent_in_flight = False
 
     def _record_user_prompt(self, prompt_text: str) -> None:
-        if prompt_text:
-            self.state.append_trace("user", prompt_text)
+        CommitEngine(self.repo, self.state).record_user_prompt(prompt_text)
 
     def _await_followup(self, prompt_text: str) -> None:
         # Remember a prompt the user queued while the agent was busy so the next
         # commit waits for it to land as a turn (see _finish_agent_parse_if_ready),
         # keeping the queued prompt in the same commit as the turn it follows.
-        norm = " ".join((prompt_text or "").split())
-        # Never await slash commands (/model, /compact, backend commands): the
-        # transcript records them only as filtered <command-name> rows, so they
-        # never appear as a turn's user prompt — awaiting one deferred every
-        # commit for the rest of the session.
-        if norm and not norm.startswith("/"):
-            self._awaited_followups = getattr(self, "_awaited_followups", [])
-            self._awaited_followups.append(norm)
+        self._awaited_followups = CommitEngine(self.repo, self.state).await_followup(
+            prompt_text, getattr(self, "_awaited_followups", [])
+        )
 
     def _discover_spawned_session(self) -> str | None:
         # Identify the session aGiT just spawned: the newest one that did not
@@ -3602,156 +3516,46 @@ class ProxyRunner:
         return max(candidates, key=lambda ref: ref.updated).id
 
     def _start_agent_parse(self) -> bool:
-        parse_lock = self.agent_parse_lock
-        if parse_lock is None:
-            parse_lock = threading.Lock()
-            self.agent_parse_lock = parse_lock
-        with parse_lock:
-            if self.agent_parse_active:
-                return False
-            if self.agent_parse_thread and self.agent_parse_thread.is_alive():
-                return False
-            if self.agent_parse_result is not None:
-                return False
-            self.agent_parse_active = True
-
-        last_message_id = self.state.last_backend_message_id
         # The worker holds its OWNING Session (issue #15): it can finish after
         # the user switched sessions, and resolving `self.backend` / `self.repo`
-        # at that point would hit the WRONG session — exporting another
-        # session's transcript and pairing it with this one's last_message_id.
-        # Reading identity from — and writing the result to — the owning
-        # Session makes the routing structural; the result is still tagged with
-        # the owning state so a late result is never applied to another session
-        # (_finish_agent_parse_if_ready re-checks ownership).
-        owner = self.active
-        backend = owner.backend
-        repo = owner.repo
-        state = owner.state
-        worktree = owner.worktree
-
-        def worker() -> None:
-            result = None
-            try:
-                self._debug("agent parse worker started")
-                if worktree is not None:
-                    # A worktree's working directory is unique to this aGiT
-                    # session, so the newest backend session there is always this
-                    # session's current conversation — including one the user
-                    # started from inside the backend itself. Track it so its work
-                    # is still committed (to this session's branch).
-                    session_id = backend.latest_session_id(repo.repo) or state.backend_session_id
-                else:
-                    # No worktree isolation (fallback / observer): stay pinned to
-                    # the owned session to avoid drifting to an unrelated one.
-                    session_id = state.backend_session_id or self._discover_spawned_session()
-                session = backend.export_session(repo.repo, session_id) if session_id else None
-                turn_count = len(session.turns) if session else 0
-                final_count = len([turn for turn in session.turns if turn.final_response]) if session else 0
-                self._debug(f"agent parse worker finished session_id={session_id} turns={turn_count} finals={final_count}")
-                result = (session_id, session, last_message_id, state)
-            finally:
-                with parse_lock:
-                    owner.last_parse_finish = time.monotonic()
-                    if result is not None:
-                        owner.agent_parse_result = result
-                    owner.agent_parse_active = False
-
-        self.last_parse_start = time.monotonic()
-        self._debug(f"agent parse started last_message_id={last_message_id}")
-        self.agent_parse_thread = threading.Thread(target=worker, name="agit-session-parse", daemon=True)
-        self.agent_parse_thread.start()
-        return True
+        # at that point would hit the WRONG session. CommitEngine.start_parse
+        # captures the owning session explicitly and writes results back to it.
+        return CommitEngine(self.repo, self.state, debug_fn=self._debug).start_parse(
+            session=self.active,
+            discover_session_id_fn=self._discover_spawned_session,
+            debug_fn=self._debug,
+        )
 
     def _finish_agent_parse_if_ready(self, *, quiet: bool, prompt_untracked: bool | None = None, integrate: bool = True, require_complete: bool = True) -> bool | None:
         if prompt_untracked is None:
             # Worktree sessions are isolated sandboxes, so agent commits there
             # auto-stage everything; only the main working tree prompts.
             prompt_untracked = self.worktree is None
-        if self.agent_parse_thread and self.agent_parse_thread.is_alive():
-            return None
-        if self.agent_parse_result is None:
-            return None
-        session_id, session, last_message_id, owner_state = self.agent_parse_result
-        self.agent_parse_result = None
-        if owner_state is not None and owner_state is not self.state:
-            # A late result from a worker started before this session was swapped
-            # in; applying it would re-commit or cross-attribute turns.
-            self._debug("discarding agent parse result owned by another session")
-            return None
-        if not session:
-            self._debug(f"agent parse consumed without session session_id={session_id}")
-            return False
-        new_session_id = session.session_id or session_id
-        self._note_backend_session_change(new_session_id)
-        self.state.backend_session_id = new_session_id
-        # Surface this worktree conversation in the repo root too, so it can be
-        # continued with a plain `claude` run there (the transcript exists now).
-        self._mirror_session_to_base(new_session_id)
-        if session.model:
-            self.state.model = session.model
-        turns = turns_after(session, last_message_id)
-        # A prompt the user queued WHILE the agent was working belongs in the same
-        # commit as the turn it follows — otherwise the brief idle gap after the
-        # first turn lets the debounce commit it, and the queued prompt then lands
-        # as a second commit. Hold off until every queued prompt has shown up as a
-        # turn in the transcript. Only while the agent is still active, though: a
-        # queued prompt the user cancelled never lands and must not block forever.
-        awaited = getattr(self, "_awaited_followups", [])
-        if awaited and any(getattr(turn, "interrupted", False) for turn in turns):
-            # An Esc interrupt makes the backend discard its queued prompts:
-            # anything still awaited will never land in the transcript, and
-            # waiting for it would defer commits for the rest of the session.
-            awaited = []
-            self._awaited_followups = []
-        if awaited:
-            seen = {" ".join((turn.user_prompt or "").split()) for turn in session.turns}
-            awaited = [prompt for prompt in awaited if prompt not in seen]
-            self._awaited_followups = awaited
-            if require_complete and awaited and self._agent_is_active():
-                self._debug(f"deferring agent commit: {len(awaited)} queued follow-up(s) not yet in transcript")
-                return None
-            self._awaited_followups = []  # committing now: drop any cancelled queue entries
-        # Don't commit while the latest prompt is still being answered (the
-        # backend's last message was a tool call, not a final response). The
-        # idle/file-stable debounce can otherwise fire during a mid-turn pause and
-        # carve one prompt into several commits — code first, tests next. Wait for
-        # the turn to finish; forced flushes (exit) pass require_complete=False so
-        # work-in-progress is never lost when the worktree is torn down.
-        if require_complete and turns and not turns[-1].complete:
-            self._debug(f"deferring agent commit: latest turn still in progress session_id={new_session_id}")
-            return None
-        complete_turns = [turn for turn in turns if turn.final_response]
-        if not complete_turns:
-            self._debug(f"agent parse consumed without final response session_id={self.state.backend_session_id} turns={len(turns)}")
-            return False
-        committed = self._create_agent_commit_from_turns_popup(
-            turns=turns,
-            backend=self.backend.name,
-            backend_session_id=self.state.backend_session_id,
-            model=session.model or self.state.model,
+
+        engine = CommitEngine(self.repo, self.state, debug_fn=self._debug)
+        committed, new_awaited = engine.finish_parse_if_ready(
+            session=self.active,
             quiet=quiet,
             prompt_untracked=prompt_untracked,
+            require_complete=require_complete,
+            awaited_followups=getattr(self, "_awaited_followups", []),
+            agent_is_active_fn=self._agent_is_active,
+            debug_fn=self._debug,
+            note_session_change_fn=self._note_backend_session_change,
+            mirror_fn=self._mirror_session_to_base,
+            commit_fn=self._create_agent_commit_from_turns_popup,
         )
+        self._awaited_followups = new_awaited
         if committed:
             self.agent_in_flight = False
-            self.state.last_backend_message_id = complete_turns[-1].assistant_message_id
             self.last_status = ""
-            self._debug(f"agent commit created session_id={self.state.backend_session_id} assistant_id={self.state.last_backend_message_id}")
             if not quiet:
                 # Paint the "Created <agent> commit." confirmation NOW, before the
                 # integrate below runs git merge/fast-forward on the main thread.
-                # Otherwise the popup wouldn't appear until that work returned and
-                # the loop got back to a render — making it look like nothing
-                # happened. (quiet covers background/exit commits, which set no
-                # message and may have another session swapped in.)
                 self._render()
             if integrate:
-                # Interactive integration (may prompt / inject an agent merge) only
-                # for the active session. The sync/background commit path passes
-                # integrate=False and integrates non-interactively itself, so an
-                # agent merge is never injected into a session that is merely
-                # swapped in — which would mis-target another backend's PTY.
+                # Interactive integration only for the active session. The
+                # sync/background commit path passes integrate=False.
                 self._integrate_session_turn()
         return committed
 
