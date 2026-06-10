@@ -232,17 +232,17 @@ def test_popup_escape_sequence_consumer_waits_for_mouse_terminator():
     assert _escape_sequence_complete(b"\x1b[35;88;11M") is True
 
 
-def test_proxy_ctrl_c_is_forwarded_to_the_backend():
-    # Issue #28: backends own Ctrl-C (interrupt the agent, clear the input box,
-    # their own double-press exit). aGiT must not hijack it as its own exit.
+def test_proxy_ctrl_c_starts_exit_flow_in_passthrough_mode():
+    # A single Ctrl-C opens the exit confirmation popup (via _run_exit_flow);
+    # a second press while that popup is open exits gracefully.
     parser = ProxyInput()
 
     forwarded, local_echo, command, should_exit = parser.feed(b"\x03")
 
-    assert forwarded == [b"\x03"]
+    assert forwarded == []
     assert local_echo == b""
     assert command is None
-    assert should_exit is False
+    assert should_exit is True
 
 
 def test_proxy_agent_commit_preserves_incomplete_initial_user_turn(tmp_path):
@@ -3414,40 +3414,12 @@ def test_sync_terminal_modes_mirrors_keyboard_protocol(monkeypatch):
     assert all(payload.startswith(b"\x1b[") for payload in writes)
 
 
-def test_ctrl_c_clears_passthrough_prompt_and_is_remembered():
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.passthrough_prompt = bytearray(b"half-typed prompt")
-    runner.passthrough_escape = None
-    runner._last_ctrl_c_at = 0.0
-
-    runner._update_passthrough_prompt([b"\x03"])
-
-    assert runner.passthrough_prompt == bytearray(b"")  # backend cleared its input
-    assert runner._last_ctrl_c_at > 0.0
-
-
-def test_backend_exit_after_forwarded_ctrl_c_exits_with_it():
-    # The user quit the backend through its own keybinding (e.g. Claude's
-    # double Ctrl-C): aGiT must follow it out gracefully, not relaunch the
-    # session they just closed.
+def test_backend_exit_relaunches_and_resumes():
+    # Claude exiting via Esc on its native session picker keeps the existing
+    # recover-and-resume behavior.
     runner = ProxyRunner.__new__(ProxyRunner)
     events = []
     runner._debug = lambda *a, **k: None
-    runner._last_ctrl_c_at = time.monotonic()
-    runner._finalize_on_backend_exit = lambda: events.append("finalize")
-    runner._restart_agent = lambda message: events.append("relaunch")
-
-    assert runner._relaunch_backend_or_exit() is False
-    assert events == ["finalize"]
-
-
-def test_backend_exit_without_recent_ctrl_c_still_relaunches():
-    # Claude exiting via Esc on its native session picker (no Ctrl-C involved)
-    # keeps the existing recover-and-resume behavior.
-    runner = ProxyRunner.__new__(ProxyRunner)
-    events = []
-    runner._debug = lambda *a, **k: None
-    runner._last_ctrl_c_at = 0.0
     runner._relaunch_times = []
     runner.child_pid = 1234
     runner._finalize_on_backend_exit = lambda: events.append("finalize")

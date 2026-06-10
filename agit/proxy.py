@@ -236,18 +236,17 @@ class ProxyInput:
             if char == b"\x03":
                 if self.capturing:
                     # Inside aGiT's own command palette, Ctrl-C cancels it
-                    # (like Esc). Everywhere else the backend owns the key.
+                    # (like Esc) rather than starting the exit flow.
                     self.buffer.clear()
                     self.capturing = False
                     self.selected_index = 0
                     self.escape_buffer = None
                     continue
-                # Pass Ctrl-C through: backends rely on it (interrupt the
-                # agent, clear the input box, their own double-press exit) and
-                # aGiT must not change the keybindings users already know.
-                # Exiting aGiT is Ctrl-G → exit, or quitting the backend.
-                forwarded.append(char)
-                continue
+                # Ctrl-C starts aGiT's exit flow: the first press opens the
+                # confirmation popup, and a second press while it is open exits
+                # immediately but still gracefully (see _run_exit_flow).
+                should_exit = True
+                break
             if self.capturing:
                 if self.escape_buffer is not None:
                     self.escape_buffer.extend(char)
@@ -448,7 +447,6 @@ class ProxyRunner:
         self._popup_exit_pending = False  # a popup Ctrl-C exit flow is running
         self._popup_exit_force = False  # second Ctrl-C inside the exit confirmation
         self._reap_pids: list[int] = []  # signalled backends awaiting their waitpid
-        self._last_ctrl_c_at = 0.0  # when a Ctrl-C was last forwarded to the backend
         self._base_poll_at = 0.0  # throttle for the base-HEAD poll
         self._warned_backend_session = False  # one-shot "use agit to start sessions" notice
         # The user's intentionally-unstaged files belong to the base working tree
@@ -2206,14 +2204,6 @@ class ProxyRunner:
         # quitting with it. Guard against a crash loop: if the backend keeps dying
         # quickly, stop relaunching and exit normally.
         now = time.monotonic()
-        if now - getattr(self, "_last_ctrl_c_at", 0.0) < 3.0:
-            # The exit followed a Ctrl-C the user sent THROUGH aGiT to the
-            # backend (e.g. Claude's own double-Ctrl-C quit): they meant to
-            # leave. Follow the backend out — gracefully — instead of
-            # relaunching the session they just closed.
-            self._debug("backend exited right after a forwarded Ctrl-C; exiting with it")
-            self._finalize_on_backend_exit()
-            return False
         recent = [t for t in getattr(self, "_relaunch_times", []) if now - t < 12.0]
         if len(recent) >= 3:
             self._debug("backend exited 3x within 12s; quitting instead of relaunching")
@@ -2226,7 +2216,7 @@ class ProxyRunner:
             # _restart_agent tears down the dead PTY, re-baselines (so existing
             # history is not re-committed) and respawns; _spawn resumes the same
             # conversation via _should_continue_session.
-            self._restart_agent("Backend exited — relaunched and resumed (Ctrl-G → exit to quit aGiT).")
+            self._restart_agent("Backend exited — relaunched and resumed (Ctrl-C to quit aGiT).")
         except Exception as error:
             self._debug(f"relaunch failed, exiting: {error!r}")
             self._finalize_on_backend_exit()
@@ -3850,13 +3840,6 @@ class ProxyRunner:
                 continue
             if chunk == b"\x1b":
                 self.passthrough_escape = bytearray(chunk)
-                continue
-            if chunk == b"\x03":
-                # Ctrl-C reached the backend: it clears any pending input there,
-                # so mirror that here. Remember when, so a backend exiting right
-                # after is recognized as the user quitting it on purpose.
-                self.passthrough_prompt.clear()
-                self._last_ctrl_c_at = time.monotonic()
                 continue
             if chunk in {b"\r", b"\n"}:
                 continue
