@@ -6,6 +6,7 @@ re-exported here so external callers keep importing from ``agit.proxy``. The
 shim is removed in the final phase (P7).
 """
 
+from agit.proxy.commit_engine import CommitEngine
 from agit.proxy.process import BackendProcess
 from agit.proxy.renderer import ScreenRenderer
 from agit.proxy.session import Session
@@ -20,6 +21,7 @@ from agit.proxy.runner import (
 )
 
 __all__ = [
+    "CommitEngine",
     "BackendProcess",
     "ProxyInput",
     "ProxyRunner",
