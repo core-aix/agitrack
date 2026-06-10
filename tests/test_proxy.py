@@ -3188,3 +3188,25 @@ def test_select_popup_ctrl_c_routes_through_exit_flow(monkeypatch):
     monkeypatch.setattr(proxy_mod.os, "read", lambda fd, n: next(feed))
     runner._request_exit_from_popup = lambda: False
     assert runner._select_popup("Pick", ["a", "b"]) == "a"
+
+
+def test_spawn_failed_exec_child_exits_with_127(tmp_path):
+    # Issue #20: if execvp fails in the forked child (binary gone, PATH change,
+    # worktree deleted), the child must die — not keep running aGiT's own
+    # Python code from the fork point as a duplicate process.
+    runner = ProxyRunner.__new__(ProxyRunner)
+    runner.state = AgitState(tmp_path)
+    runner.repo = types.SimpleNamespace(repo=tmp_path)
+    runner.worktree = None  # no confinement wrapping
+    runner.backend = types.SimpleNamespace(
+        new_session_id=lambda: "ses-1",
+        spawn_command=lambda repo, session_id, resume: ["agit-test-binary-that-does-not-exist"],
+        list_sessions=lambda repo: [],
+    )
+    runner._should_continue_session = lambda: False
+
+    runner._spawn()
+
+    _, status = os.waitpid(runner.child_pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 127
+    os.close(runner.master_fd)

@@ -279,3 +279,13 @@ def test_mixed_output_with_any_directory_field_does_not_fall_back(monkeypatch, t
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     assert latest_session_id(tmp_path) is None
+
+
+def test_run_export_pty_failed_exec_exits_child(tmp_path):
+    # Issue #20: a failed chdir/exec in the forked export child must terminate
+    # it (127), not let it keep executing the test suite as a duplicate process.
+    from agit.opencode_session import _run_export_pty
+
+    output, exit_code = _run_export_pty(tmp_path / "missing-dir", "ses-x")
+
+    assert exit_code == 127

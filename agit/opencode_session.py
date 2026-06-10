@@ -182,8 +182,13 @@ def _debug(repo: Path, message: str) -> None:
 def _run_export_pty(repo: Path, session_id: str) -> tuple[str, int]:
     pid, fd = pty.fork()
     if pid == 0:
-        os.chdir(repo)
-        os.execvp("opencode", ["opencode", "export", session_id])
+        # Never let the child survive a failed exec — it would keep running
+        # aGiT's own Python code from the fork point as a duplicate process.
+        try:
+            os.chdir(repo)
+            os.execvp("opencode", ["opencode", "export", session_id])
+        except BaseException:
+            os._exit(127)
 
     chunks: list[bytes] = []
     while True:

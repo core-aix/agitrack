@@ -562,8 +562,15 @@ class ProxyRunner:
         command = self._confine_to_worktree(command)
         pid, fd = pty.fork()
         if pid == 0:
-            os.chdir(self.repo.repo)
-            os.execvp(command[0], command)
+            # The child must never survive a failed exec (backend uninstalled
+            # mid-session, PATH change, worktree deleted): the exception would
+            # otherwise propagate and leave a duplicate aGiT running from the
+            # fork point, sharing state files, locks, and the terminal.
+            try:
+                os.chdir(self.repo.repo)
+                os.execvp(command[0], command)
+            except BaseException:
+                os._exit(127)
         self.child_pid = pid
         self.master_fd = fd
 
