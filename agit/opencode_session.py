@@ -44,7 +44,15 @@ def _fetch_sessions(repo: Path, max_count: int) -> list[dict]:
         return []
     resolved = repo.resolve()
     matching = [session for session in sessions if _same_repo(session.get("directory"), resolved) and session.get("id")]
-    return matching or [session for session in sessions if session.get("id")]
+    if matching:
+        return matching
+    # No session recorded for this directory. Fall back to the unfiltered list
+    # ONLY when the output carries no `directory` fields at all (an OpenCode
+    # version that doesn't report it) — otherwise an empty result here would
+    # adopt and resume the globally newest session from an unrelated project.
+    if any("directory" in session for session in sessions):
+        return []
+    return [session for session in sessions if session.get("id")]
 
 
 def _to_seconds(value: object) -> float:
