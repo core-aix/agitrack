@@ -79,6 +79,12 @@ class GitRepo:
     def has_tracked_changes(self) -> bool:
         return self._diff_has_changes(["git", "diff", "--quiet"]) or self.has_staged_changes()
 
+    def diff_head(self) -> str:
+        # Content of all tracked changes (staged + unstaged) relative to HEAD.
+        # Used as a fingerprint: `status --short` alone cannot tell new edits to
+        # an already-modified file apart from the state a user declined before.
+        return self._run(["git", "diff", "HEAD"], check=False).stdout
+
     def add_tracked(self) -> None:
         self._run(["git", "add", "-u"])
 

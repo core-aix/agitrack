@@ -439,6 +439,7 @@ class ProxyRunner:
         self._pending_enter_fd: int | None = None  # the PTY that injected prompt's Enter must go to
         self._base_advanced = False  # base moved; sync idle sessions onto it on the next loop pass
         self._last_base_head: str | None = None  # last-polled base HEAD, to catch out-of-band commits
+        self._base_edits_declined_status: str | None = None  # base status the user declined to commit
         self._base_poll_at = 0.0  # throttle for the base-HEAD poll
         self._warned_backend_session = False  # one-shot "use agit to start sessions" notice
         # The user's intentionally-unstaged files belong to the base working tree
@@ -3572,6 +3573,7 @@ class ProxyRunner:
             self._set_message("User changes detected before agent runs.")
             self._render()
             self._create_user_commit_popup()
+        self._commit_base_user_edits_if_needed()
         # Trace every submitted prompt as a user message. The agent-active path
         # above already recorded; the held path records in _forward_pending_prompt.
         # This covers the remaining (clean / user-changes-committed) submits so no
@@ -3579,6 +3581,58 @@ class ProxyRunner:
         # builder collapses this with the backend's own turn.user_prompt.
         self._record_user_prompt(prompt_text)
         return True
+
+    def _base_user_edits_pending(self) -> bool:
+        # The user's own edits land in the BASE repo's working tree (the session
+        # worktree is the agent's sandbox), so the worktree-side pre-agent check
+        # never sees them. Detect tracked modifications, or new files the user
+        # has not already declined, so they can be committed and synced into the
+        # worktree before the agent runs.
+        base = getattr(self, "base_repo", None)
+        if base is None or getattr(self, "worktree", None) is None:
+            return False
+        try:
+            if base.has_tracked_changes():
+                return True
+            declined = set(self._user_state().declined_untracked())
+            return any(path not in declined for path in base.untracked_files())
+        except Exception as error:
+            self._debug(f"base user-edit check failed: {error!r}")
+            return False
+
+    def _commit_base_user_edits_if_needed(self) -> None:
+        # Offer to commit the user's uncommitted base-repo edits before the
+        # prompt reaches the agent, then sync the session worktree onto the new
+        # base commit so the agent actually sees those edits. Declining skips
+        # re-prompting until the base working tree changes again.
+        if not self._base_user_edits_pending():
+            self._base_edits_declined_status = None
+            return
+        status = self._base_edits_fingerprint()
+        if status is not None and status == getattr(self, "_base_edits_declined_status", None):
+            return  # already declined for this exact state; don't nag every prompt
+        self._set_message("User changes detected in the base repo before agent runs.")
+        self._render()
+        if self._create_user_commit_popup(repo=self.base_repo, state=self._user_state()):
+            self._base_edits_declined_status = None
+            self._reload_user_declined()
+            # Reflect the new base commit into the session worktrees now — before
+            # the prompt is forwarded — so the agent works from the user's edits
+            # instead of waiting for the next base-HEAD poll.
+            self._base_advanced = False
+            self._sync_idle_worktrees_to_base()
+        else:
+            # Snapshot AFTER the popup: it stages tracked edits (add_tracked), so
+            # the pre-popup fingerprint would never match the declined state.
+            self._base_edits_declined_status = self._base_edits_fingerprint()
+
+    def _base_edits_fingerprint(self) -> str | None:
+        # Status plus the actual diff content, so a decline is remembered for
+        # exactly the edits the user saw — any further edit re-prompts.
+        try:
+            return self.base_repo.status_short() + self.base_repo.diff_head()
+        except Exception:
+            return None
 
     def _resume_pending_prompt_if_ready(self) -> None:
         if self.pending_forwarded is None:
@@ -3604,6 +3658,7 @@ class ProxyRunner:
                 self._set_message("Prompt not sent because existing user changes were not committed.")
                 self._render()
                 return
+        self._commit_base_user_edits_if_needed()
         self._forward_pending_prompt()
 
     def _forward_pending_prompt(self) -> None:

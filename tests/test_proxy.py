@@ -2779,3 +2779,132 @@ def test_status_line_unstaged_count_reflects_base_declined(tmp_path):
     runner._user_declined = ["a.txt", "b.txt"]
 
     assert "unstaged:2" in runner._status_line()
+
+
+# --- issue #12: user edits to the base tree are committed and synced on prompt -
+#
+# The user's editor works in the BASE repo, but the pre-agent check used to look
+# only at the session worktree — so user edits were never committed, and (since
+# the worktree only follows committed base HEAD moves) never reached the agent.
+
+
+def _base_edit_runner(tmp_path, answers):
+    from agit.git import GitRepo
+
+    base = GitRepo.init(tmp_path)
+    (tmp_path / "notes.txt").write_text("original\n", encoding="utf-8")
+    base.stage_paths(["notes.txt"])
+    base.commit("add notes")
+    wt_path = tmp_path / ".agit" / "worktrees" / "session-1"
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+    base.worktree_add_detached(str(wt_path), base=base.current_branch())
+    worktree = GitRepo(wt_path)
+
+    runner = ProxyRunner.__new__(ProxyRunner)
+    runner.base_repo = base
+    runner.repo = worktree
+    runner.worktree = object()
+    runner._base_branch = base.current_branch()
+    runner._base_advanced = False
+    runner._base_edits_declined_status = None
+    runner._integration_paused = False
+    runner.sessions = [types.SimpleNamespace(repo=worktree, agent_in_flight=False)]
+    runner.active_index = 0
+    runner.agent_in_flight = False
+    runner.agent_parse_thread = None
+    runner.state = AgitState(wt_path)
+    runner.global_config = type("GC", (), {"default_backend": "claude"})()
+    runner._user_declined = []
+    runner.message = None
+    runner.message_until = 0.0
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda: None
+    runner._debug = lambda *a, **k: None
+    runner.prompts = []
+    scripted = list(answers)
+
+    def prompt(title, body, **kwargs):
+        runner.prompts.append((title, body))
+        return scripted.pop(0) if scripted else None
+
+    runner._prompt_popup = prompt
+    return runner, base, worktree, wt_path
+
+
+def test_pre_agent_commit_detects_and_syncs_base_user_edits(tmp_path):
+    runner, base, worktree, wt_path = _base_edit_runner(tmp_path, answers=["save notes edit"])
+    runner.pre_agent_reconciled_status = ""
+    runner._finish_agent_parse_if_ready = lambda quiet: False
+    runner.actions = types.SimpleNamespace(has_pre_agent_user_changes=lambda: False)
+
+    # The user edits a tracked file in the BASE repo while the session is open.
+    (tmp_path / "notes.txt").write_text("edited by the user\n", encoding="utf-8")
+
+    assert runner._pre_agent_commit_if_needed("improve the parser") is True
+
+    # The edit was committed to the base branch as a user commit...
+    assert base.has_tracked_changes() is False
+    subject = base._run(["git", "log", "-1", "--format=%s"]).stdout.strip()
+    assert subject == "save notes edit"
+    # ...and the session worktree was synced so the agent sees the edit.
+    assert (wt_path / "notes.txt").read_text(encoding="utf-8") == "edited by the user\n"
+    assert runner._base_edits_declined_status is None
+
+
+def test_base_user_edit_decline_remembered_until_new_edits(tmp_path):
+    runner, base, worktree, wt_path = _base_edit_runner(tmp_path, answers=[None])
+
+    (tmp_path / "notes.txt").write_text("first edit\n", encoding="utf-8")
+    runner._commit_base_user_edits_if_needed()  # popup shown; user cancels
+    assert len(runner.prompts) == 1
+    runner._commit_base_user_edits_if_needed()  # same state: no re-prompt
+    assert len(runner.prompts) == 1
+    # Nothing was committed and the worktree still has the original content.
+    assert base.has_tracked_changes() is True
+    assert (wt_path / "notes.txt").read_text(encoding="utf-8") == "original\n"
+
+    # A FURTHER edit (same file, so `status --short` is unchanged) re-prompts.
+    (tmp_path / "notes.txt").write_text("second edit\n", encoding="utf-8")
+    runner._commit_base_user_edits_if_needed()
+    assert len(runner.prompts) == 2
+
+
+def test_base_user_new_file_counts_as_pending_unless_declined(tmp_path):
+    runner, base, worktree, wt_path = _base_edit_runner(tmp_path, answers=[])
+
+    assert runner._base_user_edits_pending() is False
+    (tmp_path / "added.txt").write_text("new\n", encoding="utf-8")
+    assert runner._base_user_edits_pending() is True
+    # Files the user already declined to stage don't count as pending edits.
+    state = runner._user_state()
+    state.add_declined(["added.txt"])
+    assert runner._base_user_edits_pending() is False
+
+
+def test_resume_pending_prompt_checks_base_user_edits(tmp_path):
+    runner = ProxyRunner.__new__(ProxyRunner)
+    read_fd, write_fd = os.pipe()
+    try:
+        runner.master_fd = write_fd
+        runner.pending_forwarded = [b"\r"]
+        runner.pending_prompt_text = "fix it"
+        runner.passthrough_prompt = bytearray(b"fix it")
+        runner.state = AgitState(tmp_path)
+        runner.agent_parse_thread = None
+        runner.agent_in_flight = False
+        runner.screen = None
+        runner.message = None
+        runner.message_until = 0.0
+        runner._finish_agent_parse_if_ready = lambda quiet: False
+        runner.actions = types.SimpleNamespace(has_pre_agent_user_changes=lambda: False)
+        runner._ensure_turn_branch = lambda: None
+        checked = []
+        runner._commit_base_user_edits_if_needed = lambda: checked.append(True)
+
+        runner._resume_pending_prompt_if_ready()
+
+        assert checked == [True]  # base edits are handled before the prompt goes out
+        assert os.read(read_fd, 1) == b"\r"
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
