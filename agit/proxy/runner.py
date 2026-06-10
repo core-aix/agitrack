@@ -386,6 +386,18 @@ class ProxyRunner:
 
     # --- session pointer -------------------------------------------------
 
+    # NOTE (P3 review): inside temp-swap helpers (_with_session, _pump_background,
+    # _stop_session, _finalize_pending_work) `active` — and therefore
+    # `active_index` and every compat property — refers to the session being
+    # SERVICED, not the user-facing foreground one. Do not call UI or
+    # session-list helpers (_session_name, _session_status, _background_fds,
+    # popups) from code reachable inside those windows; they would classify the
+    # real foreground session as background. Pinned for P4-P6 implementers.
+    #
+    # The lazy Session.bare() below exists only for legacy ProxyRunner.__new__
+    # test construction and is NOT thread-safe (a read materializes state);
+    # production assigns `active` in __init__ before any thread starts. The
+    # whole layer is removed in P7.
     @property
     def active(self) -> Session:
         """The Session whose state the runner currently operates on.
