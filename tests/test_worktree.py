@@ -996,3 +996,41 @@ def test_has_conflict_markers_sees_staged_markers(tmp_path):
     assert repo.has_conflict_markers() is True
     repo.add_all()
     assert repo.has_conflict_markers() is True
+
+def test_ensure_turn_branch_never_resets_existing_branch_with_work(tmp_path):
+    # Issue #16: recovery paths restart the turn counter (a recreated worktree
+    # is detached at base, so _turn_from_branch yields 0) while an earlier turn
+    # branch may still exist holding unintegrated commits. The next
+    # _ensure_turn_branch must not reuse its name — `git switch -C` used to
+    # silently reset the branch and destroy that work.
+    main = _init_repo(tmp_path)
+    base = main.current_branch()
+    info, work = _make_session(main, "s1", base, backend="claude")
+    _commit(work, "kept.txt", "unintegrated work\n", "<agent> kept work")
+    kept_head = work.rev_parse("HEAD")  # tip of agit/claude/s1/t1
+
+    # Simulate recovery: detached at base again, turn counter back at 0.
+    work.switch_detach(base)
+    runner = _integration_runner(main, work, base, "s1")
+    runner.backend = type("B", (), {"name": "claude"})()
+    runner.turn = 0
+
+    runner._ensure_turn_branch()
+
+    # The old branch and its commit survive; the session took the next free
+    # turn number instead of resetting t1.
+    assert main.rev_parse("agit/claude/s1/t1") == kept_head
+    assert work.current_branch() == "agit/claude/s1/t2"
+    assert runner.turn == 2
+
+
+def test_switch_create_refuses_to_reset_existing_branch(tmp_path):
+    from agit.git import GitError
+
+    repo = _init_repo(tmp_path)
+    repo.create_branch("topic", "HEAD")
+    _commit(repo, "x.txt", "x\n", "advance main past topic")
+    with pytest.raises(GitError):
+        repo.switch("topic", create=True)  # -c, not -C: never resets
+    # The branch is untouched and still where it was created.
+    assert repo.rev_parse("topic") != repo.rev_parse("HEAD")

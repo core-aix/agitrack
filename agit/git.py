@@ -137,7 +137,10 @@ class GitRepo:
     def switch(self, branch: str, *, create: bool = False, base: str | None = None) -> None:
         command = ["git", "switch"]
         if create:
-            command.append("-C")
+            # `-c`, never `-C`: create must not silently reset an existing
+            # branch — a leftover turn branch can still hold unintegrated
+            # commits. Callers pick a free name (or handle the GitError).
+            command.append("-c")
         command.append(branch)
         if create and base:
             command.append(base)

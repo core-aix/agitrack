@@ -1317,8 +1317,16 @@ class ProxyRunner:
         # tree, so the agent's changes carry over).
         if getattr(self, "worktree", None) is None or not self.repo.is_detached():
             return
+        # Recovery paths can reset the turn counter (e.g. a recreated worktree
+        # starts detached at base, so the counter restarts at 0) while earlier
+        # turn branches still exist — deliberately kept when they hold
+        # unintegrated commits. Never reuse such a name: resetting it would
+        # destroy that work. Skip to the next free turn number instead.
         self.turn = (self.turn or 0) + 1
         next_branch = self._worktrees().turn_branch(self.name, self.turn, backend=self.backend.name)
+        while self.repo.branch_exists(next_branch):
+            self.turn += 1
+            next_branch = self._worktrees().turn_branch(self.name, self.turn, backend=self.backend.name)
         self.repo.switch(next_branch, create=True)
 
     def _merge_resolution_prompt(self, files: list[str], context: str) -> str:
