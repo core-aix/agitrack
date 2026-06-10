@@ -3427,3 +3427,150 @@ def test_backend_exit_relaunches_and_resumes():
 
     assert runner._relaunch_backend_or_exit() is True
     assert events == ["relaunch"]
+
+
+# --- Esc interrupts and newline keybindings must not stall commits/merges -------
+
+
+def test_await_followup_skips_slash_commands(tmp_path):
+    # /model, /compact etc. never appear as transcript turns (only as filtered
+    # <command-name> rows). Awaiting one deferred every commit for the rest of
+    # the session — the observed "agit stopped merging after I used /model".
+    runner = ProxyRunner.__new__(ProxyRunner)
+    runner._awaited_followups = []
+
+    runner._await_followup("/model")
+    runner._await_followup("/compact some args")
+    assert runner._awaited_followups == []
+
+    runner._await_followup("fix the tests")
+    assert runner._awaited_followups == ["fix the tests"]
+
+
+def test_finish_agent_parse_interrupt_clears_awaited_followups(tmp_path):
+    # Esc makes Claude discard its queued prompts: awaited entries can never
+    # land, so an interrupted turn must clear the queue and let commits flow.
+    interrupted_session = ExportedSession(
+        session_id="ses-1",
+        model="m",
+        updated=None,
+        turns=[SessionTurn("u1", "a1", "fix it", "partial work", TokenUsage(), None, complete=True, interrupted=True)],
+    )
+    runner = _parse_ready_runner(tmp_path, interrupted_session)
+    runner._awaited_followups = ["a prompt that was discarded by the interrupt"]
+    runner.agent_in_flight = True  # agent looks active (e.g. UI repainting)
+    runner.last_child_output = 0.0
+
+    result = runner._finish_agent_parse_if_ready(quiet=True)
+
+    assert result is True  # committed instead of deferring forever
+    assert runner._awaited_followups == []
+    assert len(runner.commits) == 1
+
+
+def test_finish_agent_parse_interrupted_dangling_turn_still_commits(tmp_path):
+    # The interrupted turn parses as complete, so a user who Esc's and walks
+    # away still gets the turn's work committed on the idle debounce.
+    interrupted_session = ExportedSession(
+        session_id="ses-1",
+        model="m",
+        updated=None,
+        turns=[SessionTurn("u1", "a1", "fix it", "got partway", TokenUsage(), None, complete=True, interrupted=True)],
+    )
+    runner = _parse_ready_runner(tmp_path, interrupted_session)
+
+    assert runner._finish_agent_parse_if_ready(quiet=True) is True
+    assert len(runner.commits) == 1
+
+
+def _submit_runner(prompt=b""):
+    runner = ProxyRunner.__new__(ProxyRunner)
+    runner.passthrough_prompt = bytearray(prompt)
+    return runner
+
+
+def test_plain_enter_submits():
+    assert _submit_runner(b"fix it")._forwarded_submits([b"f", b"\r"]) is True
+    assert _submit_runner()._forwarded_submits([b"\r"]) is True
+
+
+def test_alt_enter_is_a_newline_not_a_submit():
+    # Option/Alt+Enter sends ESC CR — Claude's newline-in-input on terminals
+    # without the kitty protocol (e.g. Apple Terminal with Option-as-Meta).
+    assert _submit_runner(b"first line")._forwarded_submits([b"\x1b", b"\r"]) is False
+
+
+def test_backslash_enter_is_a_line_continuation_not_a_submit():
+    # "\<Enter>" typed in one read...
+    chunks = [bytes([byte]) for byte in b"some text\\\r"]
+    assert _submit_runner()._forwarded_submits(chunks) is False
+    # ...and the Enter arriving in its own read after the backslash.
+    assert _submit_runner(b"some text\\")._forwarded_submits([b"\r"]) is False
+
+
+def test_bracketed_paste_newlines_are_content_not_submits():
+    paste = b"\x1b[200~line one\rline two\x1b[201~"
+    chunks = [bytes([byte]) for byte in paste]
+    assert _submit_runner()._forwarded_submits(chunks) is False
+    # An unterminated paste (split across reads) is held too.
+    open_paste = [bytes([byte]) for byte in b"\x1b[200~abc\r"]
+    assert _submit_runner()._forwarded_submits(open_paste) is False
+    # A real Enter after the paste closed still submits.
+    paste_then_enter = [bytes([byte]) for byte in b"\x1b[200~abc\x1b[201~"] + [b"\r"]
+    assert _submit_runner()._forwarded_submits(paste_then_enter) is True
+
+
+def test_idle_clean_worktree_integrates_agent_made_commits():
+    runner = ProxyRunner.__new__(ProxyRunner)
+    runner.worktree = object()
+    runner.merge_ctx = None
+    runner._integration_paused = False
+    runner._base_branch = "main"
+    runner.agent_in_flight = False
+    runner.agent_parse_thread = None
+    runner.last_child_output = 0.0
+    runner.CHILD_IDLE_SECONDS = 4.0
+    runner.BASE_POLL_SECONDS = 3.0
+    runner._idle_integrate_at = 0.0
+    runner._debug = lambda *a, **k: None
+    runner.repo = types.SimpleNamespace(current_branch=lambda: "agit/claude/s1/t1")
+    runner.base_repo = types.SimpleNamespace(log_range=lambda base, head: "abc123 manual agent commit")
+    integrations = []
+    runner._integrate_session_turn = lambda: integrations.append(1)
+
+    runner._integrate_agent_made_commits_if_idle(time.monotonic())
+    assert integrations == [1]
+
+    # Throttled: an immediate second pass does not re-integrate.
+    runner._integrate_agent_made_commits_if_idle(time.monotonic())
+    assert integrations == [1]
+
+
+def test_idle_integration_skips_active_agent_and_clean_branches():
+    runner = ProxyRunner.__new__(ProxyRunner)
+    runner.worktree = object()
+    runner.merge_ctx = None
+    runner._integration_paused = False
+    runner._base_branch = "main"
+    runner.agent_parse_thread = None
+    runner.last_child_output = 0.0
+    runner.CHILD_IDLE_SECONDS = 4.0
+    runner.BASE_POLL_SECONDS = 3.0
+    runner._debug = lambda *a, **k: None
+    runner.repo = types.SimpleNamespace(current_branch=lambda: "agit/claude/s1/t1")
+    integrations = []
+    runner._integrate_session_turn = lambda: integrations.append(1)
+
+    # Agent active: leave the branch alone.
+    runner._idle_integrate_at = 0.0
+    runner.agent_in_flight = True
+    runner.base_repo = types.SimpleNamespace(log_range=lambda base, head: "abc123 pending")
+    runner._integrate_agent_made_commits_if_idle(time.monotonic())
+    assert integrations == []
+
+    # Idle but nothing ahead of base: nothing to do.
+    runner.agent_in_flight = False
+    runner._idle_integrate_at = 0.0
+    runner.base_repo = types.SimpleNamespace(log_range=lambda base, head: "")
+    runner._integrate_agent_made_commits_if_idle(time.monotonic())
+    assert integrations == []

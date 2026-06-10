@@ -125,6 +125,9 @@ _PYTE_HOSTILE_CSI_RE = re.compile(rb"\x1b\[[<>=][0-9;:]*[ -/]*[@-~]")
 # Shift+Enter instead of the disambiguated encoding the backend's keybindings
 # (e.g. Claude's newline-in-input) expect.
 _KEYBOARD_PROTO_RE = re.compile(rb"\x1b\[(?:[><=][0-9;]*u|\?u|>4(?:;[0-9]+)?m)")
+# A bracketed paste (CSI 200~ ... CSI 201~, possibly split across reads, hence
+# the `|$`): newlines inside it are pasted CONTENT, not prompt submissions.
+_BRACKETED_PASTE_RE = re.compile(rb"\x1b\[200~.*?(?:\x1b\[201~|$)", re.S)
 
 
 def _short_session(session_id: str | None) -> str:
@@ -447,6 +450,7 @@ class ProxyRunner:
         self._popup_exit_pending = False  # a popup Ctrl-C exit flow is running
         self._popup_exit_force = False  # second Ctrl-C inside the exit confirmation
         self._reap_pids: list[int] = []  # signalled backends awaiting their waitpid
+        self._idle_integrate_at = 0.0  # throttle for integrating agent-made commits
         self._base_poll_at = 0.0  # throttle for the base-HEAD poll
         self._warned_backend_session = False  # one-shot "use agit to start sessions" notice
         # The user's intentionally-unstaged files belong to the base working tree
@@ -2363,7 +2367,7 @@ class ProxyRunner:
                     self._render()
                 if forwarded:
                     self.scroll_back = 0  # interacting snaps back to the live view
-                    submit = any(chunk in {b"\r", b"\n"} for chunk in forwarded)
+                    submit = self._forwarded_submits(forwarded)
                     self._update_passthrough_prompt(forwarded)
                     submitted_prompt = ""
                     if submit:
@@ -3828,6 +3832,31 @@ class ProxyRunner:
         untracked = set(self.base_repo.untracked_files())
         self._user_declined = [path for path in getattr(self, "_user_declined", []) if path in untracked]
 
+    def _forwarded_submits(self, forwarded: list[bytes]) -> bool:
+        # Not every Enter submits the prompt — several keybindings insert a
+        # NEWLINE in the backend's input box instead, and treating them as
+        # submits ran the pre-agent flow (and could hold the keystroke or queue
+        # a never-landing awaited prompt) on a mere line break:
+        #   * Alt/Option+Enter sends ESC CR (the Apple Terminal / no-protocol
+        #     way to get a newline in Claude's input),
+        #   * a backslash immediately before Enter is Claude's "\<Enter>"
+        #     line continuation,
+        #   * newlines inside a bracketed paste are pasted content.
+        data = b"".join(forwarded)
+        data = _BRACKETED_PASTE_RE.sub(b"", data)
+        data = data.replace(b"\x1b\r", b"").replace(b"\x1b\n", b"")
+        for index, byte in enumerate(data):
+            if byte not in (0x0D, 0x0A):
+                continue
+            if index == 0:
+                # The Enter arrived in its own read; the backslash, if any, is
+                # already at the end of the reconstructed prompt.
+                if not bytes(self.passthrough_prompt).endswith(b"\\"):
+                    return True
+            elif data[index - 1 : index] != b"\\":
+                return True
+        return False
+
     def _update_passthrough_prompt(self, forwarded: list[bytes]) -> None:
         for chunk in forwarded:
             # Drop terminal escape sequences (arrow keys, etc.) so their residue
@@ -3866,7 +3895,11 @@ class ProxyRunner:
         # commit waits for it to land as a turn (see _finish_agent_parse_if_ready),
         # keeping the queued prompt in the same commit as the turn it follows.
         norm = " ".join((prompt_text or "").split())
-        if norm:
+        # Never await slash commands (/model, /compact, backend commands): the
+        # transcript records them only as filtered <command-name> rows, so they
+        # never appear as a turn's user prompt — awaiting one deferred every
+        # commit for the rest of the session.
+        if norm and not norm.startswith("/"):
             self._awaited_followups = getattr(self, "_awaited_followups", [])
             self._awaited_followups.append(norm)
 
@@ -3984,6 +4017,12 @@ class ProxyRunner:
         # turn in the transcript. Only while the agent is still active, though: a
         # queued prompt the user cancelled never lands and must not block forever.
         awaited = getattr(self, "_awaited_followups", [])
+        if awaited and any(getattr(turn, "interrupted", False) for turn in turns):
+            # An Esc interrupt makes the backend discard its queued prompts:
+            # anything still awaited will never land in the transcript, and
+            # waiting for it would defer commits for the rest of the session.
+            awaited = []
+            self._awaited_followups = []
         if awaited:
             seen = {" ".join((turn.user_prompt or "").split()) for turn in session.turns}
             awaited = [prompt for prompt in awaited if prompt not in seen]
@@ -4070,6 +4109,7 @@ class ProxyRunner:
         if not status.strip():
             if self.verbose:
                 self._render_status("no git changes")
+            self._integrate_agent_made_commits_if_idle(now)
             return
         if self.agent_parse_thread and self.agent_parse_thread.is_alive():
             if self.verbose:
@@ -4106,6 +4146,32 @@ class ProxyRunner:
             self._render_status(self._agent_commit_message())
         else:
             self._set_message(self._agent_commit_message(), sticky=True)
+
+    def _integrate_agent_made_commits_if_idle(self, now: float) -> None:
+        # The agent can run `git commit` itself (some workflows ask it to).
+        # Those turns leave the worktree CLEAN, so the auto-commit path — which
+        # integration used to piggyback on exclusively — never runs, and the
+        # turn branch sat ahead of base until exit/restart. When the session is
+        # idle, its tree is clean, and its branch holds unintegrated commits,
+        # integrate them now.
+        if getattr(self, "worktree", None) is None or self.merge_ctx:
+            return
+        if self._base_branch is None or getattr(self, "_integration_paused", False):
+            return
+        if self._agent_is_active() or now - self.last_child_output < self.CHILD_IDLE_SECONDS:
+            return
+        if now - getattr(self, "_idle_integrate_at", 0.0) < self.BASE_POLL_SECONDS:
+            return
+        self._idle_integrate_at = now
+        try:
+            branch = self.repo.current_branch()
+            if not branch.startswith("agit/") or not self.base_repo.log_range(self._base_branch, branch):
+                return
+        except Exception as error:
+            self._debug(f"idle integrate check failed: {error!r}")
+            return
+        self._debug(f"integrating agent-made commits on {branch} (worktree clean and idle)")
+        self._integrate_session_turn()
 
     def _pause_child_ui(self) -> None:
         self._set_cooked()

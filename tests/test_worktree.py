@@ -1030,3 +1030,32 @@ def test_switch_create_refuses_to_reset_existing_branch(tmp_path):
         repo.switch("topic", create=True)  # -c, not -C: never resets
     # The branch is untouched and still where it was created.
     assert repo.rev_parse("topic") != repo.rev_parse("HEAD")
+
+def test_agent_made_commits_integrate_when_idle(tmp_path):
+    # The agent ran `git commit` itself, leaving the worktree clean — the
+    # auto-commit path never fires, so integration must happen on idle instead
+    # of waiting for exit/restart ("agit stopped merging commits").
+    import time as time_mod
+
+    main = _init_repo(tmp_path)
+    base = main.current_branch()
+    info, work = _make_session(main, "s1", base)
+    _commit(work, "agent.txt", "committed by the agent itself\n", "agent's own commit")
+    base_head = main.rev_parse(base)
+
+    runner = _integration_runner(main, work, base, "s1")
+    runner._integration_paused = False
+    runner.agent_parse_thread = None
+    runner.last_child_output = 0.0
+    runner.CHILD_IDLE_SECONDS = 4.0
+    runner.BASE_POLL_SECONDS = 3.0
+    runner._idle_integrate_at = 0.0
+
+    runner._integrate_agent_made_commits_if_idle(time_mod.monotonic())
+
+    # Base fast-forwarded to the agent's manual commit; worktree detached at
+    # base with the turn branch cleaned up, exactly like a normal integration.
+    assert main.rev_parse(base) != base_head
+    assert (main.repo / "agent.txt").read_text() == "committed by the agent itself\n"
+    assert work.is_detached()
+    assert main.list_branches("agit/") == []
