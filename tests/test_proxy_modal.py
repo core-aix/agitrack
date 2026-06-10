@@ -15,6 +15,7 @@ import pytest
 
 from agit.proxy.modal import PromptModal, SelectModal
 from agit.proxy.runner import ProxyRunner
+from proxy_helpers import make_runner
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +154,7 @@ def _modal_runner(monkeypatch, stdin_fd):
     """Build a minimal ProxyRunner for modal/PTY-drain integration tests."""
     import agit.proxy.runner as proxy_mod
 
-    runner = ProxyRunner.__new__(ProxyRunner)
+    runner = make_runner()
     monkeypatch.setattr(proxy_mod.sys, "stdin", types.SimpleNamespace(fileno=lambda: stdin_fd))
     runner.sessions = []
     runner.master_fd = None
@@ -236,7 +237,7 @@ def test_run_modal_pty_drain_real_popup_read_input(monkeypatch):
 
 def test_run_modal_exit_flow_called_on_ctrl_c():
     """Ctrl-C inside a modal calls _run_exit_flow; exit confirmed → returns None."""
-    runner = ProxyRunner.__new__(ProxyRunner)
+    runner = make_runner()
     runner._set_message = lambda *a, **k: None
     runner._render = lambda: None
     runner._clear_message = lambda: None
@@ -252,7 +253,7 @@ def test_run_modal_exit_flow_called_on_ctrl_c():
 
 def test_run_modal_exit_declined_continues():
     """Ctrl-C with exit declined keeps the modal running."""
-    runner = ProxyRunner.__new__(ProxyRunner)
+    runner = make_runner()
     runner._set_message = lambda *a, **k: None
     runner._render = lambda: None
     runner._clear_message = lambda: None
@@ -268,7 +269,7 @@ def test_run_modal_exit_declined_continues():
 
 def test_run_modal_cancel_on_esc():
     """Esc cancels the modal and returns None."""
-    runner = ProxyRunner.__new__(ProxyRunner)
+    runner = make_runner()
     runner._set_message = lambda *a, **k: None
     runner._render = lambda: None
     runner._clear_message = lambda: None
@@ -280,7 +281,7 @@ def test_run_modal_cancel_on_esc():
 
 def test_run_modal_select_navigation():
     """SelectModal navigates with arrows and confirms via _run_modal."""
-    runner = ProxyRunner.__new__(ProxyRunner)
+    runner = make_runner()
     runner._set_message = lambda *a, **k: None
     runner._render = lambda: None
     runner._clear_message = lambda: None
@@ -294,7 +295,7 @@ def test_run_modal_select_navigation():
 
 def test_prompt_popup_facade_delegates_to_run_modal():
     """_prompt_popup is a thin facade: it constructs PromptModal and delegates."""
-    runner = ProxyRunner.__new__(ProxyRunner)
+    runner = make_runner()
     modals_seen = []
     original_run_modal = runner._run_modal if hasattr(runner, "_run_modal") else None
 
@@ -313,7 +314,7 @@ def test_prompt_popup_facade_delegates_to_run_modal():
 
 def test_select_popup_facade_delegates_to_run_modal():
     """_select_popup is a thin facade: it constructs SelectModal and delegates."""
-    runner = ProxyRunner.__new__(ProxyRunner)
+    runner = make_runner()
     modals_seen = []
 
     def fake_run_modal(modal):
@@ -329,7 +330,7 @@ def test_select_popup_facade_delegates_to_run_modal():
 
 def test_select_popup_empty_options_returns_empty_string():
     """_select_popup with no options returns '' without calling _run_modal."""
-    runner = ProxyRunner.__new__(ProxyRunner)
+    runner = make_runner()
     runner._run_modal = lambda modal: (_ for _ in ()).throw(AssertionError("should not be called"))
     assert runner._select_popup("Title", []) == ""
 
@@ -346,7 +347,7 @@ def test_exit_byte_in_modal_reaches_finalize_pending_work():
     This validates the exit-path unification guarantee: no interactive route
     out of aGiT can bypass _finalize_pending_work().
     """
-    runner = ProxyRunner.__new__(ProxyRunner)
+    runner = make_runner()
     runner._set_message = lambda *a, **k: None
     runner._render = lambda: None
     runner._clear_message = lambda: None
@@ -377,7 +378,7 @@ def test_exit_byte_in_modal_reaches_finalize_pending_work():
 
 def test_exit_byte_in_modal_decline_continues_modal():
     """Ctrl-C inside a modal with exit declined keeps the modal running."""
-    runner = ProxyRunner.__new__(ProxyRunner)
+    runner = make_runner()
     runner._set_message = lambda *a, **k: None
     runner._render = lambda: None
     runner._clear_message = lambda: None
