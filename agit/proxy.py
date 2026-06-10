@@ -224,7 +224,7 @@ class ProxyInput:
     # Order matters (shown in the palette). Only "session" starts with "s" so
     # that pressing s+Enter jumps straight to the session picker. Git-specific
     # commands are grouped under a "git-" prefix.
-    COMMANDS = ["session", "agent-backend", "git-base-branch", "git-status", "git-stage", "git-user-commit", "exit"]
+    COMMANDS = ["session", "agent-backend", "git-base-branch", "git-status", "git-stage", "git-unstaged", "git-user-commit", "exit"]
 
     def __init__(self) -> None:
         self.capturing = False
@@ -3088,6 +3088,14 @@ class ProxyRunner:
 
         if name == "git-status":
             self._set_message(self.base_repo.status() or "Working tree clean")
+        elif name == "git-unstaged":
+            self._prune_declined_untracked(self.base_repo, self._user_state())
+            self._reload_user_declined()
+            declined = self._user_declined
+            if declined:
+                self._set_message("Intentionally unstaged files:\n" + "\n".join(f"  {path}" for path in declined))
+            else:
+                self._set_message("No intentionally unstaged files.")
         elif name == "agent-backend":
             backends = available_backends()
             selected = arg.strip() or self._select_popup("Backend Agent", backends)

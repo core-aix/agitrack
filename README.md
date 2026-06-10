@@ -50,6 +50,7 @@ In proxy mode (default), press `Ctrl-G`, then type one of these aGiT commands:
 ```text
 session                   switch / start (own worktree) / stop a live session
 agent-backend             switch backend (opencode|claude); shows a picker
+git-base-branch           switch the branch sessions integrate into
 git-status                show git status
 git-stage                 review and stage untracked files
 git-unstaged              show intentionally unstaged files
@@ -81,7 +82,7 @@ Use the `session` command to start a new session, switch the tracked session to 
 
 ### Worktrees and branches
 
-To let sessions run without stepping on each other or on your working tree, each aGiT session runs in its own git worktree under `.agit/worktrees/<name>`, checked out on its own `agit/<name>` branch. Work within a session is committed on per-turn branches derived from it (`agit/<name>/t<turn>`). All aGiT-managed branches live under the `agit/` prefix so they are easy to recognize for cleanup and never collide with your own branches.
+To let sessions run without stepping on each other or on your working tree, each aGiT session runs in its own git worktree under `.agit/worktrees/<name>`, created *detached* at the base branch — a session has no branch of its own. Work within a session is committed on per-turn branches named `agit/<backend>/<name>/t<turn>`, created lazily on the first commit of each turn; once a turn is integrated its branch is deleted and the worktree is detached at the new base again. All aGiT-managed branches live under the `agit/` prefix so they are easy to recognize for cleanup and never collide with your own branches.
 
 The base working tree (the branch you launched from) is only ever advanced by **integration**: aGiT merges a session's pending commits back into the base branch rather than committing onto it directly. A single-writer lock ensures only one aGiT process auto-commits or integrates at a time, so concurrent sessions stay consistent.
 

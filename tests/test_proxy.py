@@ -3325,3 +3325,36 @@ def test_popup_read_input_survives_child_eof(monkeypatch):
     finally:
         for fd in (stdin_r, stdin_w, child_r):
             os.close(fd)
+
+
+# --- issue #25: proxy commands and README stay in sync --------------------------
+
+
+def test_git_unstaged_command_lists_declined_files(tmp_path):
+    runner, repo = _user_git_runner(tmp_path, answers=[])
+    (tmp_path / "kept.txt").write_text("x\n", encoding="utf-8")
+    state = runner._user_state()
+    state.add_declined(["kept.txt"])
+    messages = []
+    runner._set_message = lambda text, **k: messages.append(text)
+    runner._render = lambda: None
+
+    runner._run_command("git-unstaged")
+
+    assert any("kept.txt" in message for message in messages)
+
+    # Once nothing is declined any more, it says so instead.
+    state.remove_declined(["kept.txt"])
+    runner._run_command("git-unstaged")
+    assert messages[-1] == "No intentionally unstaged files."
+
+
+def test_readme_proxy_command_list_matches_implementation():
+    import re
+    from pathlib import Path
+
+    readme = Path(__file__).resolve().parents[1] / "README.md"
+    block = re.search(r"```text\n(.*?)```", readme.read_text(encoding="utf-8"), re.S).group(1)
+    documented = {line.split()[0] for line in block.strip().splitlines()}
+
+    assert documented == set(ProxyInput.COMMANDS)
