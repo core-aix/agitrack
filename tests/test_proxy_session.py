@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from agit.proxy import ProxyRunner
 from agit.proxy.process import BackendProcess
 from agit.proxy.session import Session
+from proxy_helpers import make_runner
 
 
 def _session_with_distinct_values(tag):
@@ -67,8 +68,8 @@ def test_session_owns_a_backend_process():
 
 
 def test_runner_session_fields_delegate_to_active_session():
-    runner = ProxyRunner.__new__(ProxyRunner)
-    # Lazy bare session: reads see fresh runtime defaults...
+    runner = make_runner()
+    # Fresh session: reads see runtime defaults...
     assert runner.agent_in_flight is False
     assert runner.scroll_back == 0
     # ...and writes land on the owning Session object.
@@ -81,7 +82,7 @@ def test_runner_session_fields_delegate_to_active_session():
 
 
 def test_switching_sessions_is_pointer_assignment_not_copying():
-    runner = ProxyRunner.__new__(ProxyRunner)
+    runner = make_runner()
     a = _session_with_distinct_values("a")
     b = _session_with_distinct_values("b")
     runner.sessions = [a, b]
@@ -101,13 +102,13 @@ def test_switching_sessions_is_pointer_assignment_not_copying():
 
 
 def test_active_index_setter_repoints_the_active_session():
-    runner = ProxyRunner.__new__(ProxyRunner)
+    runner = make_runner()
     a, b = Session.bare(), Session.bare()
     runner.sessions = [a, b]
     runner.active_index = 1
     assert runner.active is b
-    # Placeholder (non-Session) entries are tolerated for __new__-built tests:
-    # the index is recorded but the pointer is left alone.
+    # Placeholder (non-Session) entries in sessions are tolerated: the index
+    # is recorded but the pointer is left alone.
     runner.sessions = [object(), object()]
     runner.active_index = 0
     assert runner.active is b

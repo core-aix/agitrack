@@ -21,6 +21,7 @@ from agit.proxy.integration import (
     MergePhase,
 )
 from agit.worktree import WorktreeManager
+from proxy_helpers import make_runner
 
 
 # ---------------------------------------------------------------------------
@@ -762,14 +763,15 @@ def _flush_runner(ctx):
     import os
     import time
 
-    from agit.proxy.runner import ProxyRunner
+    from proxy_helpers import make_runner
 
-    runner = ProxyRunner.__new__(ProxyRunner)
     read_fd, write_fd = os.pipe()
-    runner.master_fd = write_fd
-    runner.merge_ctx = ctx
-    runner._pending_enter_at = time.monotonic() - 1.0  # due
-    runner._pending_enter_fd = write_fd
+    runner = make_runner(
+        master_fd=write_fd,
+        merge_ctx=ctx,
+        _pending_enter_at=time.monotonic() - 1.0,  # due
+        _pending_enter_fd=write_fd,
+    )
     return runner, read_fd, write_fd
 
 
@@ -809,7 +811,6 @@ def test_maybe_complete_agent_merge_spends_the_auto_attempt():
     import time
 
     from agit.proxy.integration import IntegrationService
-    from agit.proxy.runner import ProxyRunner
 
     now = time.monotonic()
     ctx = MergeContext(
@@ -819,9 +820,10 @@ def test_maybe_complete_agent_merge_spends_the_auto_attempt():
         auto_tried=False,
         prompt_sent_at=now - 20,
     )
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.merge_ctx = ctx
-    runner.last_child_output = now - 10  # responded after the prompt, then idle
+    runner = make_runner(
+        merge_ctx=ctx,
+        last_child_output=now - 10,  # responded after the prompt, then idle
+    )
     runner._integration = IntegrationService.__new__(IntegrationService)
     finalized = []
     runner._finalize_agent_merge = lambda: finalized.append(1) and False
