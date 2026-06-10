@@ -344,7 +344,7 @@ def _parse_ready_runner(tmp_path, session, *, last_message_id=None):
     runner._integrate_session_turn = lambda: None
     runner.commits = []
     runner._create_agent_commit_from_turns_popup = lambda **k: (runner.commits.append(k), True)[1]
-    runner.agent_parse_result = (session.session_id, session, last_message_id)
+    runner.agent_parse_result = (session.session_id, session, last_message_id, runner.state)
     return runner
 
 
@@ -2983,3 +2983,113 @@ def test_actions_agent_commit_failed_attempt_does_not_double_count(tmp_path):
     ) is True
     assert "tokens_since_last_commit_input: 130" in repo.message
     assert repo.message.count("## User\n\nfix it") == 1
+
+
+# --- issue #15: a parse worker must not straddle a session switch ---------------
+
+
+def test_parse_worker_delivers_to_its_own_session_after_switch(tmp_path):
+    from agit.session_runtime import capture_session
+
+    release = threading.Event()
+    state_a = AgitState(tmp_path / "a")
+    state_b = AgitState(tmp_path / "b")
+    exported = ExportedSession(session_id="ses-a", model=None, updated=None, turns=[])
+
+    class Backend:
+        name = "claude"
+
+        def latest_session_id(self, repo):
+            return "ses-a"
+
+        def export_session(self, repo, session_id):
+            release.wait(timeout=5)  # hold the worker mid-flight
+            return exported
+
+    runner = ProxyRunner.__new__(ProxyRunner)
+    runner.backend = Backend()
+    runner.repo = types.SimpleNamespace(repo="/wt-a")
+    runner.state = state_a
+    runner.worktree = object()
+    runner.agent_parse_thread = None
+    runner.agent_parse_result = None
+    runner.agent_parse_active = False
+    runner.agent_parse_lock = threading.Lock()
+    runner._debug = lambda *a, **k: None
+
+    assert runner._start_agent_parse() is True
+
+    # The user switches sessions while the worker is still running: session A's
+    # runtime moves into a snapshot and session B's takes its place.
+    snapshot_a = capture_session(runner)
+    runner.sessions = [snapshot_a]
+    runner.state = state_b
+    runner.backend = types.SimpleNamespace(name="claude")
+    runner.repo = types.SimpleNamespace(repo="/wt-b")
+    runner.agent_parse_thread = None
+    runner.agent_parse_result = None
+    runner.agent_parse_active = False
+    runner.agent_parse_lock = threading.Lock()
+
+    release.set()
+    snapshot_a.agent_parse_thread.join(timeout=5)
+
+    # The result reached session A's snapshot, tagged with A's state — nothing
+    # leaked into the now-active session B.
+    assert snapshot_a.agent_parse_result is not None
+    assert snapshot_a.agent_parse_result[1] is exported
+    assert snapshot_a.agent_parse_result[3] is state_a
+    assert snapshot_a.agent_parse_active is False
+    assert runner.agent_parse_result is None
+    assert runner.agent_parse_active is False
+
+
+def test_finish_agent_parse_discards_result_owned_by_another_session(tmp_path):
+    complete = ExportedSession(
+        session_id="ses-old",
+        model="m",
+        updated=None,
+        turns=[SessionTurn("u1", "a1", "fix it", "done", TokenUsage(), None)],
+    )
+    runner = _parse_ready_runner(tmp_path, complete)
+    # The result was produced for a different session's state (e.g. captured
+    # before a switch); applying it here would re-commit or cross-attribute turns.
+    session_id, session, last_message_id, _ = runner.agent_parse_result
+    runner.agent_parse_result = (session_id, session, last_message_id, AgitState(tmp_path / "other"))
+
+    result = runner._finish_agent_parse_if_ready(quiet=True)
+
+    assert result is None
+    assert runner.commits == []
+    assert runner.agent_parse_result is None  # consumed, not retried forever
+    assert runner.state.backend_session_id is None  # no cross-session adoption
+
+
+def test_switch_active_joins_worker_before_swapping():
+    from agit.session_runtime import capture_session
+
+    runner = ProxyRunner.__new__(ProxyRunner)
+    events = []
+
+    class FakeThread:
+        def is_alive(self):
+            return True
+
+        def join(self, timeout=None):
+            events.append(("join", timeout))
+
+    runner.agent_parse_thread = FakeThread()
+    runner.agent_parse_lock = threading.Lock()
+    runner.sessions = [None, capture_session(ProxyRunner.__new__(ProxyRunner))]
+    runner.active_index = 0
+    runner.scroll_back = 3
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda: None
+    runner._resize_child = lambda: None
+    runner._enable_host_mouse = lambda: None
+    runner._session_name = lambda index: f"s{index}"
+
+    runner._switch_active(1)
+
+    assert events and events[0][0] == "join"  # waited before swapping
+    assert runner.active_index == 1

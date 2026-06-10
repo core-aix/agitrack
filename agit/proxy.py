@@ -1892,14 +1892,30 @@ class ProxyRunner:
     def _switch_active(self, index: int) -> None:
         if not (0 <= index < len(self.sessions)) or index == self.active_index:
             return
-        self.sessions[self.active_index] = capture_session(self)
-        self.active_index = index
-        restore_session(self, self.sessions[index])
+        self._join_parse_worker_before_swap()
+        # Swap under the outgoing session's parse lock: if the join above timed
+        # out, the still-running worker routes its result by comparing states
+        # under this same lock, so it sees either fully-before or fully-after.
+        lock = getattr(self, "agent_parse_lock", None) or threading.Lock()
+        with lock:
+            self.sessions[self.active_index] = capture_session(self)
+            self.active_index = index
+            restore_session(self, self.sessions[index])
         self.scroll_back = 0
         self._resize_child()
         self._enable_host_mouse()
         self._set_message(f"Switched to session '{self._session_name(index)}'")
         self._render()
+
+    def _join_parse_worker_before_swap(self) -> None:
+        # A parse worker started for the active session reads that session's
+        # backend/repo and must not straddle a session swap. The export normally
+        # takes well under a second; wait for it rather than racing it.
+        thread = getattr(self, "agent_parse_thread", None)
+        if thread is not None and thread.is_alive():
+            self._set_message("Finishing this session's transcript export...")
+            self._render()
+            thread.join(timeout=10)
 
     def _pump_background(self, session) -> None:
         # Keep a background session's screen current by draining + feeding its
@@ -2098,7 +2114,11 @@ class ProxyRunner:
             self._render()
             return
         active = index == self.active_index
-        if not active:
+        if active:
+            # Don't let an in-flight parse worker outlive its session's runtime
+            # and write into whichever session is restored next.
+            self._join_parse_worker_before_swap()
+        else:
             saved = capture_session(self)
             restore_session(self, self.sessions[index])
         try:
@@ -3775,30 +3795,50 @@ class ProxyRunner:
             self.agent_parse_active = True
 
         last_message_id = self.state.last_backend_message_id
+        # Capture the session's identity as locals: the worker can finish after
+        # the user switched sessions, and `self.backend` / `self.repo` / state
+        # would then resolve against the WRONG session — exporting another
+        # session's transcript and pairing it with this one's last_message_id.
+        # The result is tagged with the owning state and routed back to wherever
+        # that session's runtime now lives (the runner or its swapped-out
+        # snapshot), so a late result is never applied to another session.
+        backend = self.backend
+        repo = self.repo
+        state = self.state
+        worktree = getattr(self, "worktree", None)
 
         def worker() -> None:
+            result = None
             try:
                 self._debug("agent parse worker started")
-                if getattr(self, "worktree", None) is not None:
+                if worktree is not None:
                     # A worktree's working directory is unique to this aGiT
                     # session, so the newest backend session there is always this
                     # session's current conversation — including one the user
                     # started from inside the backend itself. Track it so its work
                     # is still committed (to this session's branch).
-                    session_id = self.backend.latest_session_id(self.repo.repo) or self.state.backend_session_id
+                    session_id = backend.latest_session_id(repo.repo) or state.backend_session_id
                 else:
                     # No worktree isolation (fallback / observer): stay pinned to
                     # the owned session to avoid drifting to an unrelated one.
-                    session_id = self.state.backend_session_id or self._discover_spawned_session()
-                session = self.backend.export_session(self.repo.repo, session_id) if session_id else None
+                    session_id = state.backend_session_id or self._discover_spawned_session()
+                session = backend.export_session(repo.repo, session_id) if session_id else None
                 turn_count = len(session.turns) if session else 0
                 final_count = len([turn for turn in session.turns if turn.final_response]) if session else 0
                 self._debug(f"agent parse worker finished session_id={session_id} turns={turn_count} finals={final_count}")
-                self.agent_parse_result = (session_id, session, last_message_id)
+                result = (session_id, session, last_message_id, state)
             finally:
-                self.last_parse_finish = time.monotonic()
-                with self.agent_parse_lock:
-                    self.agent_parse_active = False
+                with parse_lock:
+                    if getattr(self, "state", None) is state:
+                        target = self
+                    else:
+                        target = next((snapshot for snapshot in getattr(self, "sessions", [])
+                                       if getattr(snapshot, "state", None) is state), None)
+                    if target is not None:
+                        target.last_parse_finish = time.monotonic()
+                        if result is not None:
+                            target.agent_parse_result = result
+                        target.agent_parse_active = False
 
         self.last_parse_start = time.monotonic()
         self._debug(f"agent parse started last_message_id={last_message_id}")
@@ -3815,8 +3855,13 @@ class ProxyRunner:
             return None
         if self.agent_parse_result is None:
             return None
-        session_id, session, last_message_id = self.agent_parse_result
+        session_id, session, last_message_id, owner_state = self.agent_parse_result
         self.agent_parse_result = None
+        if owner_state is not None and owner_state is not self.state:
+            # A late result from a worker started before this session was swapped
+            # in; applying it would re-commit or cross-attribute turns.
+            self._debug("discarding agent parse result owned by another session")
+            return None
         if not session:
             self._debug(f"agent parse consumed without session session_id={session_id}")
             return False
