@@ -3093,3 +3093,98 @@ def test_switch_active_joins_worker_before_swapping():
 
     assert events and events[0][0] == "join"  # waited before swapping
     assert runner.active_index == 1
+
+
+# --- issue #18: Ctrl-C inside a popup goes through the full exit flow -----------
+
+
+def _popup_exit_runner():
+    runner = ProxyRunner.__new__(ProxyRunner)
+    runner.events = []
+    runner._finalize_pending_work = lambda: runner.events.append("finalize")
+    runner._exit_child = lambda: runner.events.append("exit")
+    return runner
+
+
+def test_popup_exit_flow_declined_keeps_working():
+    runner = _popup_exit_runner()
+    runner._confirm_exit = lambda: False
+
+    assert runner._request_exit_from_popup() is False
+    assert runner.events == []  # neither finalized nor exited
+
+
+def test_popup_exit_flow_confirmed_finalizes_then_exits():
+    runner = _popup_exit_runner()
+    runner._confirm_exit = lambda: True
+    runner._confirm_terminate_background_sessions = lambda: True
+
+    assert runner._request_exit_from_popup() is True
+    assert runner.events == ["finalize", "exit"]  # commits before leaving
+
+
+def test_popup_exit_flow_background_decline_keeps_working():
+    runner = _popup_exit_runner()
+    runner._confirm_exit = lambda: True
+    runner._confirm_terminate_background_sessions = lambda: False
+
+    assert runner._request_exit_from_popup() is False
+    assert runner.events == []
+
+
+def test_popup_exit_flow_double_ctrl_c_still_finalizes():
+    runner = _popup_exit_runner()
+
+    def confirm_via_popup():
+        # A second Ctrl-C arrives inside the confirmation popup itself: the
+        # nested request flags force-exit and the popup returns None (-> False).
+        assert runner._request_exit_from_popup() is True
+        return False
+
+    runner._confirm_exit = confirm_via_popup
+
+    assert runner._request_exit_from_popup() is True
+    # Even the emphatic double Ctrl-C exits gracefully: finalize, then exit.
+    assert runner.events == ["finalize", "exit"]
+
+
+def test_prompt_popup_ctrl_c_routes_through_exit_flow(monkeypatch):
+    import agit.proxy as proxy_mod
+
+    runner = ProxyRunner.__new__(ProxyRunner)
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda: None
+    runner._clear_message = lambda: None
+    monkeypatch.setattr(proxy_mod.sys, "stdin", types.SimpleNamespace(fileno=lambda: -42))
+
+    # Exiting: Ctrl-C makes the popup return None once the exit flow ran.
+    calls = []
+    monkeypatch.setattr(proxy_mod.os, "read", lambda fd, n: b"\x03")
+    runner._request_exit_from_popup = lambda: (calls.append("flow"), True)[1]
+    assert runner._prompt_popup("Title", "Prompt") is None
+    assert calls == ["flow"]
+
+    # Declined: the popup keeps running and still accepts input afterwards.
+    feed = iter([b"\x03", b"o", b"k", b"\r"])
+    monkeypatch.setattr(proxy_mod.os, "read", lambda fd, n: next(feed))
+    runner._request_exit_from_popup = lambda: False
+    assert runner._prompt_popup("Title", "Prompt") == "ok"
+
+
+def test_select_popup_ctrl_c_routes_through_exit_flow(monkeypatch):
+    import agit.proxy as proxy_mod
+
+    runner = ProxyRunner.__new__(ProxyRunner)
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda: None
+    runner._clear_message = lambda: None
+    monkeypatch.setattr(proxy_mod.sys, "stdin", types.SimpleNamespace(fileno=lambda: -42))
+
+    monkeypatch.setattr(proxy_mod.os, "read", lambda fd, n: b"\x03")
+    runner._request_exit_from_popup = lambda: True
+    assert runner._select_popup("Pick", ["a", "b"]) is None
+
+    feed = iter([b"\x03", b"\r"])
+    monkeypatch.setattr(proxy_mod.os, "read", lambda fd, n: next(feed))
+    runner._request_exit_from_popup = lambda: False
+    assert runner._select_popup("Pick", ["a", "b"]) == "a"

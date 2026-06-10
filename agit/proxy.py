@@ -440,6 +440,8 @@ class ProxyRunner:
         self._base_advanced = False  # base moved; sync idle sessions onto it on the next loop pass
         self._last_base_head: str | None = None  # last-polled base HEAD, to catch out-of-band commits
         self._base_edits_declined_status: str | None = None  # base status the user declined to commit
+        self._popup_exit_pending = False  # a popup Ctrl-C exit flow is running
+        self._popup_exit_force = False  # second Ctrl-C inside the exit confirmation
         self._base_poll_at = 0.0  # throttle for the base-HEAD poll
         self._warned_backend_session = False  # one-shot "use agit to start sessions" notice
         # The user's intentionally-unstaged files belong to the base working tree
@@ -3121,8 +3123,9 @@ class ProxyRunner:
                         escape_buffer = None
                     continue
                 if char == b"\x03":
-                    self._exit_child()
-                    return None
+                    if self._request_exit_from_popup():
+                        return None
+                    break  # exit declined: redraw the popup and keep listening
                 if char == b"\x1b":
                     escape_buffer = bytearray(char)
                     continue
@@ -3167,8 +3170,9 @@ class ProxyRunner:
                         escape_buffer = None
                     continue
                 if char == b"\x03":
-                    self._exit_child()
-                    return None
+                    if self._request_exit_from_popup():
+                        return None
+                    break  # exit declined: redraw the popup and keep listening
                 if char == b"\x1b":
                     escape_buffer = bytearray(char)
                     continue
@@ -3373,6 +3377,31 @@ class ProxyRunner:
     def _confirm_exit(self) -> bool:
         choice = self._select_popup("Exit aGiT?", ["No, keep working", "Yes, exit"])
         return choice == "Yes, exit"
+
+    def _request_exit_from_popup(self) -> bool:
+        # Ctrl-C inside a popup used to call _exit_child() directly, skipping
+        # both exit confirmations AND _finalize_pending_work() — quitting from a
+        # popup right after an agent turn lost the auto-commit the debounce had
+        # not made yet. Route it through the same flow as the main loop instead.
+        # Returns True when aGiT is exiting (the popup should return None).
+        if getattr(self, "_popup_exit_pending", False):
+            # A second Ctrl-C, inside one of the exit-confirmation popups: take
+            # it as an emphatic yes — skip the questions, keep the finalize.
+            self._popup_exit_force = True
+            return True
+        self._popup_exit_pending = True
+        self._popup_exit_force = False
+        try:
+            if not self._confirm_exit() and not self._popup_exit_force:
+                return False
+            if not self._popup_exit_force:
+                if not self._confirm_terminate_background_sessions() and not self._popup_exit_force:
+                    return False
+            self._finalize_pending_work()
+            self._exit_child()
+            return True
+        finally:
+            self._popup_exit_pending = False
 
     def _running_background_session_names(self) -> list[str]:
         # Names of background (non-active) sessions whose backend is still working.
