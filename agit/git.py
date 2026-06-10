@@ -215,9 +215,15 @@ class GitRepo:
         return self._run(["git", "rev-parse", "--verify", "--quiet", "MERGE_HEAD"], check=False).returncode == 0
 
     def has_conflict_markers(self) -> bool:
-        # `git diff --check` reports leftover conflict markers (and whitespace errors).
-        output = self._run(["git", "diff", "--check"], check=False).stdout
-        return "conflict marker" in output.lower()
+        # `git diff --check` reports leftover conflict markers, but only in the
+        # worktree vs the index — once `add_all()` stages the files it sees
+        # nothing. `--cached` checks the staged content against HEAD, so markers
+        # are still caught right before they would be committed.
+        for command in (["git", "diff", "--check"], ["git", "diff", "--cached", "--check"]):
+            output = self._run(command, check=False).stdout
+            if "conflict marker" in output.lower():
+                return True
+        return False
 
     def add_all(self) -> None:
         self._run(["git", "add", "-A"])

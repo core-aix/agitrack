@@ -950,3 +950,49 @@ def test_ensure_worktree_alive_falls_back_on_open_session_failure(tmp_path):
     assert runner.name == "main"
     assert runner.repo is runner.base_repo
     assert any("base repo" in m for m in messages), f"messages={messages}"
+
+def test_finalize_agent_merge_refuses_unresolved_conflict_markers(tmp_path):
+    # Issue #13: `add_all()` used to run before the marker check, which cleared
+    # the unmerged index state and made `git diff --check` (worktree vs index)
+    # blind — so a merge the agent FAILED to resolve was committed with raw
+    # <<<<<<< / ======= / >>>>>>> markers and fast-forwarded into the base.
+    main = _init_repo(tmp_path)
+    base = main.current_branch()
+    info, work = _make_session(main, "s1", base, backend="claude")
+    _commit(work, "f.txt", "worktree change\n", "wt change")
+    _commit(main, "f.txt", "base change\n", "base change")
+    base_head = main.rev_parse(base)
+
+    runner = _integration_runner(main, work, base, "s1")
+    runner.state = AgitState(info.path)
+    runner.backend = type("B", (), {"name": "claude"})()
+    runner._integrate_session_turn()  # -> conflict, merge in progress
+    assert runner.merge_ctx is not None
+    assert "<<<<<<<" in (info.path / "f.txt").read_text()
+
+    # The agent failed to resolve: markers are still in the file.
+    messages = []
+    runner._set_message = lambda text, **k: messages.append(text)
+
+    assert runner._finalize_agent_merge() is False
+    # No merge commit, base untouched, the merge stays open for resolution.
+    assert main.rev_parse(base) == base_head
+    assert work.merge_in_progress() is True
+    assert runner.merge_ctx is not None
+    assert any("Conflict markers remain" in message for message in messages)
+
+    # Once the markers ARE resolved a retry finalizes — even though the failed
+    # attempt's add_all() already staged the marker-ridden version.
+    (info.path / "f.txt").write_text("resolved: base + worktree\n")
+    assert runner._finalize_agent_merge() is True
+    assert (main.repo / "f.txt").read_text() == "resolved: base + worktree\n"
+    assert main.rev_parse(base) != base_head
+
+
+def test_has_conflict_markers_sees_staged_markers(tmp_path):
+    # `git add -A` must not blind the marker check (issue #13).
+    repo = _init_repo(tmp_path)
+    (repo.repo / "f.txt").write_text("a\n<<<<<<< HEAD\nb\n=======\nc\n>>>>>>> side\n")
+    assert repo.has_conflict_markers() is True
+    repo.add_all()
+    assert repo.has_conflict_markers() is True
