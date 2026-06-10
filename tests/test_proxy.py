@@ -3574,3 +3574,17 @@ def test_idle_integration_skips_active_agent_and_clean_branches():
     runner.base_repo = types.SimpleNamespace(log_range=lambda base, head: "")
     runner._integrate_agent_made_commits_if_idle(time.monotonic())
     assert integrations == []
+
+
+def test_configured_menu_key_opens_command_capture():
+    # menu_key in ~/.agit/config.json rebinds the aGiT menu (default Ctrl-G).
+    parser = ProxyInput(menu_key=b"\x10")  # ctrl-p
+
+    forwarded, _echo, command, _exit = parser.feed(b"\x10git-status\r")
+    assert forwarded == []
+    assert command == "git-status"
+
+    # The default key is now ordinary input and goes to the backend.
+    forwarded, _echo, command, _exit = parser.feed(b"\x07")
+    assert forwarded == [b"\x07"]
+    assert command is None
