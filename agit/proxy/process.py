@@ -4,18 +4,14 @@ Owns the fork/exec mechanics, PTY drain, window-size ioctl, signal-based
 teardown, and all writes to the child's PTY.  Policy decisions (command
 construction, sandbox wrapping, session selection) stay in ProxyRunner.
 
-Compatibility note
-------------------
-``session_runtime.py`` swaps ``child_pid`` and ``master_fd`` per session, and
-tests built via ``ProxyRunner.__new__`` set/read these fields directly on the
-runner.  To keep that working without any change to call-sites, the runner
-continues to own ``child_pid`` and ``master_fd`` as plain attributes; it passes
-them to ``BackendProcess`` at construction time and reads them back after a
-spawn.  BackendProcess is therefore a *thin mechanic owner*: it receives the
-fd/pid pair, provides the operational methods, but does NOT hold a separate
-independent copy of those values.  The runner remains the single source of
-truth for ``child_pid`` / ``master_fd``, and session capture/restore continues
-to work unchanged.
+Ownership note (P3)
+-------------------
+Each proxy :class:`~agit.proxy.session.Session` owns one BackendProcess
+instance (``session.process``) for its whole lifetime.  ``child_pid`` and
+``master_fd`` remain addressable as plain fields — on the Session via
+properties over its process, and on the runner via the P3 compat properties
+that delegate to the active session — so tests built via
+``ProxyRunner.__new__`` that set/read these fields directly keep working.
 """
 
 from __future__ import annotations

@@ -149,10 +149,10 @@ class ScreenRenderer:
     """Owns the pyte screen/stream and converts the grid to ANSI output.
 
     Per-session display state (screen, stream, scroll_back, sel_active,
-    sel_anchor, sel_point, child_mouse) is kept as plain attributes so
-    session_runtime.SESSION_FIELDS can keep swapping them individually on
-    ProxyRunner — exactly as before the extraction.  The runner forwards them
-    to ScreenRenderer via properties (see runner.py).
+    sel_anchor, sel_point, child_mouse) lives on each proxy Session object
+    (agit.proxy.session); the runner exposes it under the same attribute names
+    via properties that delegate to the active session (see runner.py), so the
+    duck-typed delegation here keeps reading ``self.<attr>`` unchanged.
 
     Render-throttle state (_last_render, _render_pending, _in_sync_update,
     _sync_since) is host-level and is NOT swapped per session.
@@ -169,7 +169,7 @@ class ScreenRenderer:
         self.cols = cols
         self.color_mode = color_mode
 
-        # Per-session display state (swapped by SESSION_FIELDS on runner)
+        # Per-session display state (owned by Session; mirrored here)
         self.screen: pyte.Screen | None = None
         self.stream: pyte.ByteStream | None = None
         self.scroll_back: int = 0
@@ -282,7 +282,10 @@ class ScreenRenderer:
     # ------------------------------------------------------------------
 
     def history_len(self) -> int:
-        history = getattr(getattr(self, "screen", None), "history", None)
+        # `screen` always resolves (ScreenRenderer sets it in __init__; the
+        # runner delegates it to the active Session) but plain pyte.Screen has
+        # no history attribute, hence the getattr on it.
+        history = getattr(self.screen, "history", None)
         return len(history.top) if history is not None else 0
 
     def scroll(self, delta: int, render_fn) -> None:
