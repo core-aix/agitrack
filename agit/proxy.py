@@ -3114,13 +3114,52 @@ class ProxyRunner:
             self._set_message(f"Unknown aGiT command: {name}")
         self._render()
 
+    def _popup_read_input(self) -> bytes:
+        # Read the user's next keypress for a modal popup WITHOUT suspending the
+        # rest of the event loop: every session's PTY keeps being drained while
+        # the popup waits, since back-pressure on a full PTY buffer blocks the
+        # backend's writes and can stall or kill it (a popup can stay open for a
+        # long time, and agents keep streaming behind it).
+        stdin_fd = sys.stdin.fileno()
+        dead: set[int] = set()
+        while True:
+            background = self._background_fds() if getattr(self, "sessions", None) else {}
+            master = getattr(self, "master_fd", None)
+            fds = [stdin_fd]
+            if master is not None and master not in dead:
+                fds.append(master)
+            fds.extend(fd for fd in background if fd not in dead)
+            readable, _, _ = select.select(fds, [], [], 1.0)
+            for fd in readable:
+                if fd == stdin_fd:
+                    continue
+                if fd in background:
+                    # A dead background session is stopped and dropped by
+                    # _pump_background, so the next pass stops selecting on it.
+                    self._pump_background(background[fd])
+                elif fd == master:
+                    output = self._drain_child_output()
+                    if output is None:
+                        dead.add(fd)  # EOF: let the main loop handle the exit
+                        continue
+                    self.last_child_output = time.monotonic()
+                    self.last_child_output_sample = (self.last_child_output_sample + output)[-4096:]
+                    self._answer_terminal_queries(output)
+                    self._sync_terminal_modes(output)
+                    self._track_sync_update(output)
+                    # Feed the screen model but don't render: the popup overlays
+                    # the view; the next normal render shows the updated screen.
+                    self._feed_child_output(output)
+            if stdin_fd in readable:
+                return os.read(stdin_fd, 32)
+
     def _prompt_popup(self, title: str, prompt: str, *, default: str = "") -> str | None:
         value = default
         escape_buffer: bytearray | None = None
         while True:
             self._set_message(f"{title}\n{prompt}\n> {value}", seconds=60)
             self._render()
-            data = os.read(sys.stdin.fileno(), 32)
+            data = self._popup_read_input()
             if data == b"\x1b":
                 self._clear_message()
                 self._render()
@@ -3160,7 +3199,7 @@ class ProxyRunner:
                 lines.append(prefix + option)
             self._set_message("\n".join(lines), seconds=60)
             self._render()
-            data = os.read(sys.stdin.fileno(), 32)
+            data = self._popup_read_input()
             if data == b"\x1b":
                 self._clear_message()
                 self._render()

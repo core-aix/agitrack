@@ -3148,44 +3148,38 @@ def test_popup_exit_flow_double_ctrl_c_still_finalizes():
     assert runner.events == ["finalize", "exit"]
 
 
-def test_prompt_popup_ctrl_c_routes_through_exit_flow(monkeypatch):
-    import agit.proxy as proxy_mod
-
+def test_prompt_popup_ctrl_c_routes_through_exit_flow():
     runner = ProxyRunner.__new__(ProxyRunner)
     runner._set_message = lambda *a, **k: None
     runner._render = lambda: None
     runner._clear_message = lambda: None
-    monkeypatch.setattr(proxy_mod.sys, "stdin", types.SimpleNamespace(fileno=lambda: -42))
 
     # Exiting: Ctrl-C makes the popup return None once the exit flow ran.
     calls = []
-    monkeypatch.setattr(proxy_mod.os, "read", lambda fd, n: b"\x03")
+    runner._popup_read_input = lambda: b"\x03"
     runner._request_exit_from_popup = lambda: (calls.append("flow"), True)[1]
     assert runner._prompt_popup("Title", "Prompt") is None
     assert calls == ["flow"]
 
     # Declined: the popup keeps running and still accepts input afterwards.
     feed = iter([b"\x03", b"o", b"k", b"\r"])
-    monkeypatch.setattr(proxy_mod.os, "read", lambda fd, n: next(feed))
+    runner._popup_read_input = lambda: next(feed)
     runner._request_exit_from_popup = lambda: False
     assert runner._prompt_popup("Title", "Prompt") == "ok"
 
 
-def test_select_popup_ctrl_c_routes_through_exit_flow(monkeypatch):
-    import agit.proxy as proxy_mod
-
+def test_select_popup_ctrl_c_routes_through_exit_flow():
     runner = ProxyRunner.__new__(ProxyRunner)
     runner._set_message = lambda *a, **k: None
     runner._render = lambda: None
     runner._clear_message = lambda: None
-    monkeypatch.setattr(proxy_mod.sys, "stdin", types.SimpleNamespace(fileno=lambda: -42))
 
-    monkeypatch.setattr(proxy_mod.os, "read", lambda fd, n: b"\x03")
+    runner._popup_read_input = lambda: b"\x03"
     runner._request_exit_from_popup = lambda: True
     assert runner._select_popup("Pick", ["a", "b"]) is None
 
     feed = iter([b"\x03", b"\r"])
-    monkeypatch.setattr(proxy_mod.os, "read", lambda fd, n: next(feed))
+    runner._popup_read_input = lambda: next(feed)
     runner._request_exit_from_popup = lambda: False
     assert runner._select_popup("Pick", ["a", "b"]) == "a"
 
@@ -3253,3 +3247,81 @@ def test_reaper_keeps_still_running_children():
 
     os.kill(pid, signal_mod.SIGKILL)
     os.waitpid(pid, 0)
+
+
+# --- issue #22: popups keep draining PTYs while waiting for input ---------------
+
+
+def _popup_io_runner(monkeypatch, stdin_fd):
+    import agit.proxy as proxy_mod
+
+    runner = ProxyRunner.__new__(ProxyRunner)
+    monkeypatch.setattr(proxy_mod.sys, "stdin", types.SimpleNamespace(fileno=lambda: stdin_fd))
+    runner.sessions = []
+    runner.master_fd = None
+    runner.last_child_output = 0.0
+    runner.last_child_output_sample = b""
+    runner._answer_terminal_queries = lambda output: None
+    runner._sync_terminal_modes = lambda output: None
+    runner._track_sync_update = lambda output: None
+    runner._feed_child_output = lambda output: None
+    return runner
+
+
+def test_popup_read_input_drains_active_pty_while_waiting(monkeypatch):
+    stdin_r, stdin_w = os.pipe()
+    child_r, child_w = os.pipe()
+    try:
+        runner = _popup_io_runner(monkeypatch, stdin_r)
+        runner.master_fd = child_r
+        fed = []
+        runner._feed_child_output = lambda output: fed.append(output)
+
+        # The backend streams while the popup is open; without draining, its
+        # writes would eventually block on a full PTY buffer and stall it.
+        os.write(child_w, b"streamed while popup open")
+        os.write(stdin_w, b"x")
+
+        assert runner._popup_read_input() == b"x"
+        assert fed == [b"streamed while popup open"]  # screen model stayed fed
+    finally:
+        for fd in (stdin_r, stdin_w, child_r, child_w):
+            os.close(fd)
+
+
+def test_popup_read_input_pumps_background_sessions(monkeypatch):
+    stdin_r, stdin_w = os.pipe()
+    bg_r, bg_w = os.pipe()
+    try:
+        runner = _popup_io_runner(monkeypatch, stdin_r)
+        background = types.SimpleNamespace(master_fd=bg_r)
+        runner.sessions = [None, background]
+        runner.active_index = 0
+        pumped = []
+        runner._pump_background = lambda session: pumped.append(session)
+
+        os.write(bg_w, b"background output")
+        os.write(stdin_w, b"\r")
+
+        assert runner._popup_read_input() == b"\r"
+        assert pumped == [background]
+    finally:
+        for fd in (stdin_r, stdin_w, bg_r, bg_w):
+            os.close(fd)
+
+
+def test_popup_read_input_survives_child_eof(monkeypatch):
+    stdin_r, stdin_w = os.pipe()
+    child_r, child_w = os.pipe()
+    try:
+        runner = _popup_io_runner(monkeypatch, stdin_r)
+        runner.master_fd = child_r
+        os.close(child_w)  # the backend died while the popup was open
+        os.write(stdin_w, b"y")
+
+        # No crash and no busy loop: the dead fd is dropped and the keypress
+        # still arrives; the main loop handles the exit afterwards.
+        assert runner._popup_read_input() == b"y"
+    finally:
+        for fd in (stdin_r, stdin_w, child_r):
+            os.close(fd)
