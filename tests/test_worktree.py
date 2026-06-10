@@ -833,7 +833,7 @@ def test_ensure_worktree_alive_path_exists_returns_early(tmp_path):
 def test_ensure_worktree_alive_recreates_worktree(tmp_path):
     from agit.backends.proxy_agents import make_proxy_agent
     from agit.proxy import ProxyRunner
-    from agit.session_runtime import default_session_fields
+    from agit.proxy.session import Session
 
     main = _init_repo(tmp_path)
     wm = WorktreeManager(main)
@@ -843,8 +843,7 @@ def test_ensure_worktree_alive_recreates_worktree(tmp_path):
     assert not info.path.exists()
 
     runner = ProxyRunner.__new__(ProxyRunner)
-    for field, value in default_session_fields().items():
-        setattr(runner, field, value)
+    runner.active = Session.bare()
     runner.base_repo = main
     runner.repo = work
     runner.worktree = info
@@ -890,7 +889,7 @@ def test_ensure_worktree_alive_recreates_worktree(tmp_path):
 def test_ensure_worktree_alive_falls_back_on_open_session_failure(tmp_path):
     from agit.backends.proxy_agents import make_proxy_agent
     from agit.proxy import ProxyRunner
-    from agit.session_runtime import default_session_fields
+    from agit.proxy.session import Session
 
     main = _init_repo(tmp_path)
     wm = WorktreeManager(main)
@@ -900,8 +899,7 @@ def test_ensure_worktree_alive_falls_back_on_open_session_failure(tmp_path):
     assert not info.path.exists()
 
     runner = ProxyRunner.__new__(ProxyRunner)
-    for field, value in default_session_fields().items():
-        setattr(runner, field, value)
+    runner.active = Session.bare()
     runner.base_repo = main
     runner.repo = work
     runner.worktree = info

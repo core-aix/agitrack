@@ -1029,8 +1029,7 @@ def test_proxy_refuses_second_instance(monkeypatch, capsys):
 
 
 def _mux_runner():
-    import agit.session_runtime as sr
-    from agit.session_runtime import capture_session
+    from agit.proxy.session import Session
 
     runner = ProxyRunner.__new__(ProxyRunner)
     runner.cols, runner.rows = 20, 5
@@ -1042,20 +1041,18 @@ def _mux_runner():
     runner._enable_host_mouse = lambda: None
     runner._set_message = lambda *a, **k: None
     runner._stop_file_watcher = lambda: None
-    for field, value in sr.default_session_fields().items():
-        setattr(runner, field, value)
+    runner.active = Session.bare()
     runner.name, runner.worktree = "A", None
     runner.repo, runner.state, runner.backend, runner.actions = "repoA", "stateA", "bA", "actA"
-    runner.sessions = [capture_session(runner)]
-    runner.active_index = 0
+    runner.sessions = [runner.active]
     return runner
 
 
 def _bg_session(name):
-    import agit.session_runtime as sr
+    from agit.proxy.session import Session
 
-    return sr.Session(**{**sr.default_session_fields(), "name": name, "repo": f"repo{name}",
-                         "state": f"state{name}", "backend": f"b{name}", "actions": f"act{name}"})
+    return Session(**{**Session.runtime_defaults(), "name": name, "repo": f"repo{name}",
+                      "state": f"state{name}", "backend": f"b{name}", "actions": f"act{name}"})
 
 
 def test_switch_active_swaps_session_state():
@@ -3000,7 +2997,7 @@ def test_actions_agent_commit_failed_attempt_does_not_double_count(tmp_path):
 
 
 def test_parse_worker_delivers_to_its_own_session_after_switch(tmp_path):
-    from agit.session_runtime import capture_session
+    from agit.proxy.session import Session
 
     release = threading.Event()
     state_a = AgitState(tmp_path / "a")
@@ -3031,9 +3028,10 @@ def test_parse_worker_delivers_to_its_own_session_after_switch(tmp_path):
     assert runner._start_agent_parse() is True
 
     # The user switches sessions while the worker is still running: session A's
-    # runtime moves into a snapshot and session B's takes its place.
-    snapshot_a = capture_session(runner)
-    runner.sessions = [snapshot_a]
+    # runtime stays on its own Session object and session B's becomes active.
+    session_a = runner.active
+    runner.sessions = [session_a]
+    runner.active = Session.bare()
     runner.state = state_b
     runner.backend = types.SimpleNamespace(name="claude")
     runner.repo = types.SimpleNamespace(repo="/wt-b")
@@ -3043,14 +3041,14 @@ def test_parse_worker_delivers_to_its_own_session_after_switch(tmp_path):
     runner.agent_parse_lock = threading.Lock()
 
     release.set()
-    snapshot_a.agent_parse_thread.join(timeout=5)
+    session_a.agent_parse_thread.join(timeout=5)
 
-    # The result reached session A's snapshot, tagged with A's state — nothing
-    # leaked into the now-active session B.
-    assert snapshot_a.agent_parse_result is not None
-    assert snapshot_a.agent_parse_result[1] is exported
-    assert snapshot_a.agent_parse_result[3] is state_a
-    assert snapshot_a.agent_parse_active is False
+    # The result reached session A's own Session object, tagged with A's state
+    # — nothing leaked into the now-active session B.
+    assert session_a.agent_parse_result is not None
+    assert session_a.agent_parse_result[1] is exported
+    assert session_a.agent_parse_result[3] is state_a
+    assert session_a.agent_parse_active is False
     assert runner.agent_parse_result is None
     assert runner.agent_parse_active is False
 
@@ -3077,7 +3075,7 @@ def test_finish_agent_parse_discards_result_owned_by_another_session(tmp_path):
 
 
 def test_switch_active_joins_worker_before_swapping():
-    from agit.session_runtime import capture_session
+    from agit.proxy.session import Session
 
     runner = ProxyRunner.__new__(ProxyRunner)
     events = []
@@ -3091,8 +3089,7 @@ def test_switch_active_joins_worker_before_swapping():
 
     runner.agent_parse_thread = FakeThread()
     runner.agent_parse_lock = threading.Lock()
-    runner.sessions = [None, capture_session(ProxyRunner.__new__(ProxyRunner))]
-    runner.active_index = 0
+    runner.sessions = [runner.active, Session.bare()]
     runner.scroll_back = 3
     runner._set_message = lambda *a, **k: None
     runner._render = lambda: None

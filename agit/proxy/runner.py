@@ -33,10 +33,10 @@ from agit.global_config import GlobalConfig
 from agit.lock import RepoLock, already_running_message
 from agit import sandbox
 from agit.session import turns_after
-from agit.session_runtime import SESSION_FIELDS, capture_session, default_session_fields, restore_session
 from agit.state import AgitState
 from agit.worktree import WorktreeInfo, WorktreeManager, _sanitize_name
 from agit.proxy.process import BackendProcess
+from agit.proxy.session import Session
 
 
 # Palette helpers, _BackgroundColorEraseScreen, and detect_color_mode live in
@@ -235,6 +235,9 @@ class ProxyRunner:
     SYNC_MAX_HOLD = 0.05  # cap how long a backend synchronized-update may defer a paint
 
     def __init__(self, repo: GitRepo, *, verbose: bool = False, backend: str | None = None, new_session: bool = False) -> None:
+        # The initial session object. Per-session attribute assignments below
+        # land on it via the compat property layer (see end of this module).
+        self.active = Session.bare()
         self.repo = repo
         self._force_new_session = new_session  # start a fresh conversation, do not resume
         self.name = "main"  # session label (multiplexer assigns names to others)
@@ -331,10 +334,11 @@ class ProxyRunner:
         # Single-writer management: only one aGiT may auto-commit/merge in a
         # working tree. A second instance is refused at startup (see `run`).
         self.management_lock = RepoLock(repo.repo / ".agit" / "lock")
-        # Multiplexer: the active session's live state is on `self`; other
-        # sessions are kept as Session snapshots and swapped on to be serviced.
-        # With a single session this stays empty/identity and the loop is
-        # unchanged. `base_repo` is the main working tree (worktrees branch off it).
+        # Multiplexer: every session (active included) is a Session object in
+        # `self.sessions`; `self.active` points at the one being serviced and
+        # switching sessions is a pointer assignment. With a single session
+        # this stays empty/identity and the loop is unchanged. `base_repo` is
+        # the main working tree (worktrees branch off it).
         self.base_repo = repo
         self._base_branch: str | None = None  # integration target branch (set at startup)
         self._integration_paused = False  # set when the base repo is switched off _base_branch out-of-band
@@ -356,8 +360,7 @@ class ProxyRunner:
         # (their repo), not the ephemeral session worktree; cache the list so the
         # status line can show its count without a per-frame disk read.
         self._user_declined: list[str] = []
-        self.sessions: list = []
-        self.active_index = 0
+        self.sessions: list[Session] = []
         self.worktree_manager: WorktreeManager | None = None
         # AGIT_DEBUG_RAW records every raw child-output / user-input chunk so an
         # interactive glitch (e.g. Claude's native session picker) can be replayed
@@ -380,6 +383,47 @@ class ProxyRunner:
         self.BASE_EDIT_CHECK_SECONDS = timings["base_edit_check_seconds"]
         self.CWD_CHECK_SECONDS = timings["cwd_check_seconds"]
         self.BASE_DRIFT_CHECK_SECONDS = timings["base_drift_check_seconds"]
+
+    # --- session pointer -------------------------------------------------
+
+    @property
+    def active(self) -> Session:
+        """The Session whose state the runner currently operates on.
+
+        Runners built via ``ProxyRunner.__new__`` in tests never run
+        ``__init__``; mirror the old behaviour (where per-session attributes
+        simply lived on the instance) by lazily materialising a bare Session
+        to hold them on first access.
+        """
+        session = self.__dict__.get("_active_session")
+        if session is None:
+            session = Session.bare()
+            self.__dict__["_active_session"] = session
+        return session
+
+    @active.setter
+    def active(self, session: Session) -> None:
+        self.__dict__["_active_session"] = session
+
+    @property
+    def active_index(self) -> int:
+        # Derived from the pointer: the active session's position in
+        # self.sessions. Falls back to the last explicitly-assigned value for
+        # __new__-built tests whose sessions list holds placeholder objects.
+        sessions = self.__dict__.get("sessions")
+        active = self.__dict__.get("_active_session")
+        if sessions and active is not None:
+            for index, session in enumerate(sessions):
+                if session is active:
+                    return index
+        return self.__dict__.get("_active_index_compat", 0)
+
+    @active_index.setter
+    def active_index(self, index: int) -> None:
+        self.__dict__["_active_index_compat"] = index
+        sessions = self.__dict__.get("sessions")
+        if sessions and 0 <= index < len(sessions) and isinstance(sessions[index], Session):
+            self.active = sessions[index]
 
     def run(self) -> int:
         if not sys.stdin.isatty() or not sys.stdout.isatty():
@@ -407,8 +451,7 @@ class ProxyRunner:
         self._start_file_watcher()
         # Register the initial session as the sole (active) entry in the
         # multiplexer. Additional sessions are appended by `_new_session`.
-        self.sessions = [capture_session(self)]
-        self.active_index = 0
+        self.sessions = [self.active]
         self._reconcile_sessions_on_startup()
         self.old_attrs = termios.tcgetattr(sys.stdin.fileno())
         try:
@@ -470,19 +513,17 @@ class ProxyRunner:
         command = self.backend.spawn_command(self.repo.repo, session_id=session_id, resume=resume)
         command = self._confine_to_worktree(command)
         # Fork/exec mechanics delegated to BackendProcess; policy (command
-        # construction, sandbox wrapping) stays here in the runner.
-        proc = BackendProcess.spawn(command, str(self.repo.repo))
-        # Keep child_pid / master_fd on the runner so session_runtime.py and
-        # tests that access these attributes directly continue to work unchanged.
-        self.child_pid = proc.child_pid
-        self.master_fd = proc.master_fd
+        # construction, sandbox wrapping) stays here in the runner. The session
+        # owns its BackendProcess; child_pid / master_fd remain readable on the
+        # runner via the Session-delegating compat properties.
+        self.active.process = BackendProcess.spawn(command, str(self.repo.repo))
 
     def _setup_worktree_confinement_notice(self) -> None:
         # When confinement is requested but the platform can't enforce it (no
         # sandbox), watch the base repo and warn if the agent writes into it, so
         # edits outside the worktree don't silently go untracked.
         self._monitor_base_edits = False
-        if getattr(self, "worktree", None) is None:
+        if self.worktree is None:
             return
         if not (self.global_config.sandbox and sandbox.is_enabled()):
             return  # user disabled confinement
@@ -574,7 +615,7 @@ class ProxyRunner:
         # for any reason, flag a sync so idle worktrees pick the new commits up
         # (`_sync_idle_worktrees_to_base`). The first observation only records the
         # baseline; it never triggers on startup.
-        if getattr(self, "worktree", None) is None or self._base_branch is None:
+        if self.worktree is None or self._base_branch is None:
             return
         now = time.monotonic()
         if now - self._base_poll_at < self.BASE_POLL_SECONDS:
@@ -598,7 +639,7 @@ class ProxyRunner:
         # it from the cwd the backend records, and warn once with how to recover.
         if getattr(self, "_cwd_drift_checked", False):
             return
-        if getattr(self, "worktree", None) is None:
+        if self.worktree is None:
             return
         now = time.monotonic()
         if now - getattr(self, "_cwd_check_at", 0.0) < self.CWD_CHECK_SECONDS:
@@ -637,7 +678,7 @@ class ProxyRunner:
         # the repo's .git), not the base repo it lives in. A no-op when there is
         # no worktree, or when confinement is disabled / unavailable (the loop
         # then warns if the base working tree is touched).
-        if getattr(self, "worktree", None) is None:
+        if self.worktree is None:
             return command
         if not self.global_config.sandbox:
             return command
@@ -802,7 +843,7 @@ class ProxyRunner:
         # Persist the current session's conversation under its backend in the
         # durable repo-root state, so switching back to that backend later resumes
         # it (its worktree is recreated at the same path).
-        info = getattr(self, "worktree", None)
+        info = self.worktree
         if info is None:
             return
         try:
@@ -1140,7 +1181,7 @@ class ProxyRunner:
         # with work another session already integrated. Surface the same resolve
         # options the session menu offers for a conflicting session, labelled
         # with this session and its backend, then dispatch the choice.
-        backend = getattr(getattr(self, "backend", None), "name", "?")
+        backend = getattr(self.backend, "name", "?")
         choice = self._select_popup(
             f"Session '{self.name}' ({backend}) finished, but its changes conflict with '{self._base_branch}'.",
             [
@@ -1164,7 +1205,7 @@ class ProxyRunner:
         # committed-but-unintegrated work into the base, then detach and delete
         # the turn branch (an empty one is dropped too). Conflicts / dirty trees
         # are left intact for the next startup to surface.
-        if getattr(self, "worktree", None) is None or getattr(self, "_base_branch", None) is None:
+        if self.worktree is None or getattr(self, "_base_branch", None) is None:
             return
         if self.merge_ctx or self.repo.merge_in_progress() or self.repo.has_changes():
             return
@@ -1215,7 +1256,7 @@ class ProxyRunner:
             return  # base switched out-of-band; don't re-point worktrees meanwhile
         for index in range(len(self.sessions)):
             if index == self.active_index:
-                repo, in_flight = getattr(self, "repo", None), getattr(self, "agent_in_flight", False)
+                repo, in_flight = self.repo, self.agent_in_flight
             else:
                 snapshot = self.sessions[index]
                 repo, in_flight = getattr(snapshot, "repo", None), getattr(snapshot, "agent_in_flight", False)
@@ -1227,7 +1268,7 @@ class ProxyRunner:
         # A merged-and-detached session sits at base between turns. Before its
         # next commit, put it on a fresh turn branch (this preserves the working
         # tree, so the agent's changes carry over).
-        if getattr(self, "worktree", None) is None or not self.repo.is_detached():
+        if self.worktree is None or not self.repo.is_detached():
             return
         # Recovery paths can reset the turn counter (e.g. a recreated worktree
         # starts detached at base, so the counter restarts at 0) while earlier
@@ -1260,9 +1301,8 @@ class ProxyRunner:
         if self.master_fd is None:
             return
         payload = " ".join(text.split()).encode("utf-8", errors="replace")
-        proc = BackendProcess(self.master_fd, getattr(self, "child_pid", None))
         try:
-            proc.write(payload)
+            self.active.process.write(payload)
         except OSError:
             return  # text never reached the backend; don't schedule its Enter
         self._pending_enter_at = time.monotonic() + 0.4
@@ -1508,7 +1548,7 @@ class ProxyRunner:
     def _repoint_current_to_base(self) -> None:
         # Detach the current session's worktree at the new base so its next turn
         # branches from there. The session and its conversation keep running.
-        if getattr(self, "worktree", None) is None:
+        if self.worktree is None:
             return
         try:
             if self.repo.has_changes() or self.repo.merge_in_progress():
@@ -1521,22 +1561,12 @@ class ProxyRunner:
     def _repoint_all_sessions_to_base(self) -> None:
         # Re-point every live session at the new base without stopping any of them.
         self._repoint_current_to_base()  # active, in place
-        if len(self.sessions) > 1:
-            active_snapshot = capture_session(self)
-            for index, session in enumerate(self.sessions):
-                if index == self.active_index:
-                    continue
-                restore_session(self, session)
-                try:
-                    self._repoint_current_to_base()
-                finally:
-                    for field in SESSION_FIELDS:
-                        setattr(session, field, getattr(self, field))
-            restore_session(self, active_snapshot)
-        self.sessions[self.active_index] = capture_session(self)
+        for session in self.sessions:
+            if session is self.active:
+                continue
+            self._with_session(session, self._repoint_current_to_base)
 
     def _session_menu(self) -> None:
-        self.sessions[self.active_index] = capture_session(self)  # refresh active snapshot
         options: list[str] = []
         actions: list[tuple[str, object]] = []
         if self.merge_ctx or (self.worktree is not None and self.repo.merge_in_progress()):
@@ -1814,13 +1844,11 @@ class ProxyRunner:
             return
         self._join_parse_worker_before_swap()
         # Swap under the outgoing session's parse lock: if the join above timed
-        # out, the still-running worker routes its result by comparing states
+        # out, the still-running worker writes its result to its owning Session
         # under this same lock, so it sees either fully-before or fully-after.
-        lock = getattr(self, "agent_parse_lock", None) or threading.Lock()
+        lock = self.agent_parse_lock or threading.Lock()
         with lock:
-            self.sessions[self.active_index] = capture_session(self)
-            self.active_index = index
-            restore_session(self, self.sessions[index])
+            self.active = self.sessions[index]
         self.scroll_back = 0
         self._resize_child()
         self._enable_host_mouse()
@@ -1831,34 +1859,32 @@ class ProxyRunner:
         # A parse worker started for the active session reads that session's
         # backend/repo and must not straddle a session swap. The export normally
         # takes well under a second; wait for it rather than racing it.
-        thread = getattr(self, "agent_parse_thread", None)
+        thread = self.agent_parse_thread
         if thread is not None and thread.is_alive():
             self._set_message("Finishing this session's transcript export...")
             self._render()
             thread.join(timeout=10)
 
-    def _pump_background(self, session) -> None:
+    def _pump_background(self, session: Session) -> None:
         # Keep a background session's screen current by draining + feeding its
         # output. No render and no commit here — committing happens separately in
         # _service_background_sessions (synchronously, via _with_session), since
-        # the async parse worker is not safe to run while a session is swapped out.
+        # the async parse worker is not safe to run on a background session.
         if session not in self.sessions:
             return
-        saved = capture_session(self)
-        restore_session(self, session)
+        saved = self.active
+        self.active = session
         died = False
         try:
             output = self._drain_child_output()
             if output is None:
                 died = True
             elif output:
-                self.last_child_output = time.monotonic()
+                session.last_child_output = time.monotonic()
                 self._answer_terminal_queries(output)
                 self._feed_child_output(output)
         finally:
-            for field in SESSION_FIELDS:
-                setattr(session, field, getattr(self, field))
-            restore_session(self, saved)
+            self.active = saved
         if died:
             self._stop_session(self.sessions.index(session), commit=False)
 
@@ -1894,7 +1920,6 @@ class ProxyRunner:
             self._start_file_watcher()
             self._resize_child()
             self._enable_host_mouse()
-            self.sessions[self.active_index] = capture_session(self)
             self._set_message("Worktree was deleted externally; now tracking base repo.", seconds=8.0)
             self._render()
             return
@@ -1912,23 +1937,24 @@ class ProxyRunner:
         self._init_screen()
         self._spawn()
         self._start_file_watcher()
-        self.sessions[self.active_index] = capture_session(self)
         self._resize_child()
         self._enable_host_mouse()
         self._set_message(f"Worktree was deleted externally; recreated '{info.name}'.", seconds=8.0)
         self._render()
 
-    def _with_session(self, session, fn):
+    def _with_session(self, session: Session, fn):
+        # Run fn with `session` as the runner's active session: runner methods
+        # (and the compat attribute layer) then read/write that session's state
+        # directly on its own Session object. Pointer re-assignment only — no
+        # field copying — so mutations made by fn persist on the session.
         if session not in self.sessions:
             return None
-        saved = capture_session(self)
-        restore_session(self, session)
+        saved = self.active
+        self.active = session
         try:
             return fn()
         finally:
-            for field in SESSION_FIELDS:
-                setattr(session, field, getattr(self, field))
-            restore_session(self, saved)
+            self.active = saved
 
     def _commit_and_integrate_background(self) -> str:
         if self.repo.has_changes():
@@ -1996,9 +2022,9 @@ class ProxyRunner:
             self._set_message(f"Could not create worktree: {error}", seconds=8.0)
             self._render()
             return
-        self.sessions[self.active_index] = capture_session(self)
-        for field, value in default_session_fields().items():
-            setattr(self, field, value)
+        # Fresh per-session runtime state; the outgoing active session keeps
+        # its state on its own Session object in self.sessions.
+        self.active = Session.bare()
         self.name = info.name
         self.worktree = info
         self.repo = repo
@@ -2019,8 +2045,7 @@ class ProxyRunner:
         self._init_screen()
         self._spawn()
         self._start_file_watcher()
-        self.sessions.append(capture_session(self))
-        self.active_index = len(self.sessions) - 1
+        self.sessions.append(self.active)
         self._resize_child()
         self._enable_host_mouse()
         self._set_message(f"Started session '{info.name}' in .agit/worktrees/{info.path.name}")
@@ -2033,14 +2058,14 @@ class ProxyRunner:
             self._set_message("Cannot stop the only session.")
             self._render()
             return
-        active = index == self.active_index
+        session = self.sessions[index]
+        active = session is self.active
         if active:
             # Don't let an in-flight parse worker outlive its session's runtime
-            # and write into whichever session is restored next.
+            # and write into whichever session becomes active next.
             self._join_parse_worker_before_swap()
-        else:
-            saved = capture_session(self)
-            restore_session(self, self.sessions[index])
+        saved = self.active
+        self.active = session
         try:
             if commit:
                 self._commit_latest_turn_sync()
@@ -2058,16 +2083,12 @@ class ProxyRunner:
                     pass
             worktree = self.worktree
         finally:
-            if not active:
-                restore_session(self, saved)
+            self.active = saved
         # Leave the worktree's branch on disk (recoverable); just drop the live session.
         self._debug(f"stopped session index={index} worktree={getattr(worktree, 'path', None)}")
         self.sessions.pop(index)
-        if index < self.active_index:
-            self.active_index -= 1
-        elif active:
-            self.active_index = min(self.active_index, len(self.sessions) - 1)
-            restore_session(self, self.sessions[self.active_index])
+        if active:
+            self.active = self.sessions[min(index, len(self.sessions) - 1)]
             self.scroll_back = 0
             self._resize_child()
             self._enable_host_mouse()
@@ -2086,9 +2107,9 @@ class ProxyRunner:
                 pass
         self.master_fd = None
         self.child_pid = None
-        self.sessions.pop(self.active_index)
-        self.active_index = min(self.active_index, len(self.sessions) - 1)
-        restore_session(self, self.sessions[self.active_index])
+        index = self.active_index
+        self.sessions.pop(index)
+        self.active = self.sessions[min(index, len(self.sessions) - 1)]
         self.scroll_back = 0
         self._resize_child()
         self._enable_host_mouse()
@@ -2282,7 +2303,7 @@ class ProxyRunner:
                             if submitted_prompt:
                                 # A new prompt starts a turn on its own branch.
                                 self._ensure_turn_branch()
-                        BackendProcess(self.master_fd, getattr(self, "child_pid", None)).write(b"".join(forwarded))
+                        self.active.process.write(b"".join(forwarded))
                 if command:
                     self._run_command(command)
             self._flush_pending_render()
@@ -2321,8 +2342,8 @@ class ProxyRunner:
         return 0
 
     def _drain_child_output(self) -> bytes | None:
-        # Delegate to BackendProcess for the bounded PTY read loop.
-        return BackendProcess(getattr(self, "master_fd", None), getattr(self, "child_pid", None)).drain()
+        # Delegate to the session-owned BackendProcess for the bounded PTY read loop.
+        return self.active.process.drain()
 
     def _diag_path(self, kind: str):
         # Diagnostic logs live in the *base* repo's .agit/ (one file per run), not
@@ -2427,7 +2448,7 @@ class ProxyRunner:
         # (no-op once linked, or when the session already lives at the base, or for
         # backends without per-directory storage).
         fn = getattr(self.backend, "mirror_to_base", None)
-        if fn is None or not session_id or getattr(self, "worktree", None) is None:
+        if fn is None or not session_id or self.worktree is None:
             return
         try:
             fn(self.base_repo.repo, self.repo.repo, session_id)
@@ -2510,7 +2531,7 @@ class ProxyRunner:
             response += self.host_da
         if response:
             try:
-                BackendProcess(self.master_fd, getattr(self, "child_pid", None)).write(bytes(response))
+                self.active.process.write(bytes(response))
             except OSError:
                 pass
 
@@ -2721,8 +2742,8 @@ class ProxyRunner:
             backend_name=self.backend.name,
             session_id=self.state.backend_session_id,
             base_branch=getattr(self, "_base_branch", None),
-            worktree=getattr(self, "worktree", None),
-            scroll_back=getattr(self, "scroll_back", 0),
+            worktree=self.worktree,
+            scroll_back=self.scroll_back,
             user_declined=getattr(self, "_user_declined", []),
             short_session_fn=_short_session,
         )
@@ -2801,7 +2822,7 @@ class ProxyRunner:
         dead: set[int] = set()
         while True:
             background = self._background_fds() if getattr(self, "sessions", None) else {}
-            master = getattr(self, "master_fd", None)
+            master = self.master_fd
             fds = [stdin_fd]
             if master is not None and master not in dead:
                 fds.append(master)
@@ -3061,7 +3082,7 @@ class ProxyRunner:
                 model=model or self.state.model,
                 token_usage=self.state.pending_token_usage(),
                 trace_turn_limit=self.state.trace_turn_limit,
-                session_name=getattr(self, "name", None),
+                session_name=self.name,
             )
         )
         self.state.clear_trace()
@@ -3182,20 +3203,17 @@ class ProxyRunner:
         self._commit_latest_turn_sync()  # active session, in place
         self._integrate_session_on_exit()
         self._remove_worktree_on_exit()
-        if len(self.sessions) > 1:
-            active_snapshot = capture_session(self)
-            for index, session in enumerate(self.sessions):
-                if index == self.active_index:
-                    continue
-                restore_session(self, session)
-                try:
-                    self._commit_latest_turn_sync()
-                    self._integrate_session_on_exit()
-                    self._remove_worktree_on_exit()
-                finally:
-                    for field in SESSION_FIELDS:
-                        setattr(session, field, getattr(self, field))
-            restore_session(self, active_snapshot)
+        for session in list(self.sessions):
+            if session is self.active:
+                continue
+            saved = self.active
+            self.active = session
+            try:
+                self._commit_latest_turn_sync()
+                self._integrate_session_on_exit()
+                self._remove_worktree_on_exit()
+            finally:
+                self.active = saved
         self._delete_orphan_merged_branches()
 
     def _adopt_latest_backend_session(self) -> None:
@@ -3258,14 +3276,11 @@ class ProxyRunner:
     def _terminate_child(self) -> None:
         # Stop the current session's backend process and release its PTY, so its
         # worktree is no longer in use and can be removed.
-        pid = getattr(self, "child_pid", None)
+        pid = self.child_pid
         if pid:
             self._note_pid_for_reaping(pid)
-        proc = BackendProcess(getattr(self, "master_fd", None), pid)
-        proc.terminate()
-        # Sync the nulled fd/pid back to the runner attributes.
-        self.master_fd = proc.master_fd
-        self.child_pid = proc.child_pid
+        # terminate() nulls the fd/pid on the session-owned process in place.
+        self.active.process.terminate()
 
     def _remove_worktree_on_exit(self) -> None:
         # On exit, drop a fully-merged session's worktree so directories do not
@@ -3274,7 +3289,7 @@ class ProxyRunner:
         # keeps its worktree so the next startup can surface it. The backend
         # conversation persists (keyed by the worktree path) and is recreated if
         # the session is resumed, so nothing of value is lost.
-        info = getattr(self, "worktree", None)
+        info = self.worktree
         if info is None or getattr(self, "_base_branch", None) is None:
             return
         # Persist the primary session's resume pointer FIRST — before deciding
@@ -3323,9 +3338,9 @@ class ProxyRunner:
     def _exit_child(self) -> None:
         self.running = False
         self._disable_host_terminal_modes()
-        # SIGINT to child delegated to BackendProcess (does not close fd --
-        # the run() finally block handles that so it always runs).
-        BackendProcess(getattr(self, "master_fd", None), getattr(self, "child_pid", None)).signal_exit()
+        # SIGINT to child delegated to the session's BackendProcess (does not
+        # close fd -- the run() finally block handles that so it always runs).
+        self.active.process.signal_exit()
 
     def _handle_exit_signal(self, signum, _frame) -> None:
         self.running = False
@@ -3335,8 +3350,8 @@ class ProxyRunner:
         raise SystemExit(128 + int(signum))
 
     def _cleanup_child(self) -> None:
-        # Delegate SIGINT -> wait -> SIGTERM escalation to BackendProcess.
-        BackendProcess(getattr(self, "master_fd", None), getattr(self, "child_pid", None)).cleanup()
+        # Delegate SIGINT -> wait -> SIGTERM escalation to the session's BackendProcess.
+        self.active.process.cleanup()
 
     def _pre_agent_commit_if_needed(self, prompt_text: str = "") -> bool:
         self._clear_agent_in_flight_if_idle()
@@ -3379,7 +3394,7 @@ class ProxyRunner:
         # has not already declined, so they can be committed and synced into the
         # worktree before the agent runs.
         base = getattr(self, "base_repo", None)
-        if base is None or getattr(self, "worktree", None) is None:
+        if base is None or self.worktree is None:
             return False
         try:
             if base.has_tracked_changes():
@@ -3465,7 +3480,7 @@ class ProxyRunner:
             self._ensure_turn_branch()  # a new prompt starts a turn on its own branch
         self.agent_in_flight = True
         self._clear_message()
-        BackendProcess(self.master_fd, getattr(self, "child_pid", None)).write(b"".join(forwarded))
+        self.active.process.write(b"".join(forwarded))
 
     def _prune_declined_untracked(self, repo: GitRepo | None = None, state: AgitState | None = None) -> None:
         repo = repo or self.repo
@@ -3575,12 +3590,12 @@ class ProxyRunner:
         return max(candidates, key=lambda ref: ref.updated).id
 
     def _start_agent_parse(self) -> bool:
-        parse_lock = getattr(self, "agent_parse_lock", None)
+        parse_lock = self.agent_parse_lock
         if parse_lock is None:
             parse_lock = threading.Lock()
             self.agent_parse_lock = parse_lock
         with parse_lock:
-            if getattr(self, "agent_parse_active", False):
+            if self.agent_parse_active:
                 return False
             if self.agent_parse_thread and self.agent_parse_thread.is_alive():
                 return False
@@ -3589,17 +3604,19 @@ class ProxyRunner:
             self.agent_parse_active = True
 
         last_message_id = self.state.last_backend_message_id
-        # Capture the session's identity as locals: the worker can finish after
-        # the user switched sessions, and `self.backend` / `self.repo` / state
-        # would then resolve against the WRONG session — exporting another
+        # The worker holds its OWNING Session (issue #15): it can finish after
+        # the user switched sessions, and resolving `self.backend` / `self.repo`
+        # at that point would hit the WRONG session — exporting another
         # session's transcript and pairing it with this one's last_message_id.
-        # The result is tagged with the owning state and routed back to wherever
-        # that session's runtime now lives (the runner or its swapped-out
-        # snapshot), so a late result is never applied to another session.
-        backend = self.backend
-        repo = self.repo
-        state = self.state
-        worktree = getattr(self, "worktree", None)
+        # Reading identity from — and writing the result to — the owning
+        # Session makes the routing structural; the result is still tagged with
+        # the owning state so a late result is never applied to another session
+        # (_finish_agent_parse_if_ready re-checks ownership).
+        owner = self.active
+        backend = owner.backend
+        repo = owner.repo
+        state = owner.state
+        worktree = owner.worktree
 
         def worker() -> None:
             result = None
@@ -3623,16 +3640,10 @@ class ProxyRunner:
                 result = (session_id, session, last_message_id, state)
             finally:
                 with parse_lock:
-                    if getattr(self, "state", None) is state:
-                        target = self
-                    else:
-                        target = next((snapshot for snapshot in getattr(self, "sessions", [])
-                                       if getattr(snapshot, "state", None) is state), None)
-                    if target is not None:
-                        target.last_parse_finish = time.monotonic()
-                        if result is not None:
-                            target.agent_parse_result = result
-                        target.agent_parse_active = False
+                    owner.last_parse_finish = time.monotonic()
+                    if result is not None:
+                        owner.agent_parse_result = result
+                    owner.agent_parse_active = False
 
         self.last_parse_start = time.monotonic()
         self._debug(f"agent parse started last_message_id={last_message_id}")
@@ -3644,7 +3655,7 @@ class ProxyRunner:
         if prompt_untracked is None:
             # Worktree sessions are isolated sandboxes, so agent commits there
             # auto-stage everything; only the main working tree prompts.
-            prompt_untracked = getattr(self, "worktree", None) is None
+            prompt_untracked = self.worktree is None
         if self.agent_parse_thread and self.agent_parse_thread.is_alive():
             return None
         if self.agent_parse_result is None:
@@ -3790,7 +3801,7 @@ class ProxyRunner:
                 if self.verbose:
                     self._render_status("git changes found; waiting for new file changes")
                 return
-            if now - getattr(self, "last_parse_finish", 0.0) < self.PARSE_COOLDOWN_SECONDS:
+            if now - self.last_parse_finish < self.PARSE_COOLDOWN_SECONDS:
                 if self.verbose:
                     self._render_status("git changes found; waiting for parse cooldown")
                 return
@@ -3812,7 +3823,7 @@ class ProxyRunner:
         # turn branch sat ahead of base until exit/restart. When the session is
         # idle, its tree is clean, and its branch holds unintegrated commits,
         # integrate them now.
-        if getattr(self, "worktree", None) is None or self.merge_ctx:
+        if self.worktree is None or self.merge_ctx:
             return
         if self._base_branch is None or getattr(self, "_integration_paused", False):
             return
@@ -3851,11 +3862,44 @@ class ProxyRunner:
             if self.screen is not None:
                 self.screen.resize(max(self.rows - 1, 1), self.cols)
             self.scroll_back = 0  # history geometry changed; return to live view
-            # PTY ioctl delegated to BackendProcess.
-            BackendProcess(self.master_fd, getattr(self, "child_pid", None)).resize(max(self.rows - 1, 1), self.cols)
+            # PTY ioctl delegated to the session-owned BackendProcess.
+            self.active.process.resize(max(self.rows - 1, 1), self.cols)
             self._render()
         except OSError:
             pass
 
     def _terminal_size(self) -> tuple[int, int]:
         return TerminalHost.terminal_size(self)
+
+
+# ---------------------------------------------------------------------------
+# P3 backward-compat layer: per-session state as runner attributes.
+#
+# Hundreds of runner methods (and the ~120 ProxyRunner.__new__-built test
+# sites) still read/write per-session state as plain attributes on the runner
+# (self.agent_in_flight, self.screen, self.master_fd, ...). Each Session field
+# is exposed as a property delegating to ``self.active``, so that code — and
+# the duck-typed ScreenRenderer/TerminalHost delegation from P1, which reads
+# display state via ``self.<attr>`` — keeps working unchanged while the state
+# itself lives on the Session object.
+#
+# P7 removes these properties and moves call sites to ``runner.active.<field>``.
+# ---------------------------------------------------------------------------
+
+def _delegate_to_active_session(field: str) -> property:
+    def getter(self):
+        return getattr(self.active, field)
+
+    def setter(self, value):
+        setattr(self.active, field, value)
+
+    return property(
+        getter,
+        setter,
+        doc=f"Per-session state: delegates to ``self.active.{field}`` (P3 compat; removed in P7).",
+    )
+
+
+for _field in Session.FIELDS:
+    setattr(ProxyRunner, _field, _delegate_to_active_session(_field))
+del _field
