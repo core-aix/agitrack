@@ -442,6 +442,7 @@ class ProxyRunner:
         self._base_edits_declined_status: str | None = None  # base status the user declined to commit
         self._popup_exit_pending = False  # a popup Ctrl-C exit flow is running
         self._popup_exit_force = False  # second Ctrl-C inside the exit confirmation
+        self._reap_pids: list[int] = []  # signalled backends awaiting their waitpid
         self._base_poll_at = 0.0  # throttle for the base-HEAD poll
         self._warned_backend_session = False  # one-shot "use agit to start sessions" notice
         # The user's intentionally-unstaged files belong to the base working tree
@@ -2147,6 +2148,7 @@ class ProxyRunner:
                     os.kill(self.child_pid, signal.SIGINT)
                 except ProcessLookupError:
                     pass
+                self._note_pid_for_reaping(self.child_pid)
             if self.master_fd is not None:
                 try:
                     os.close(self.master_fd)
@@ -2402,6 +2404,7 @@ class ProxyRunner:
             if self._base_advanced:
                 self._base_advanced = False
                 self._sync_idle_worktrees_to_base()
+            self._reap_stopped_children()  # collect SIGINT'd backends as they exit
             if self.child_pid is not None:
                 done, status = os.waitpid(self.child_pid, os.WNOHANG)
                 if done:
@@ -3512,6 +3515,28 @@ class ProxyRunner:
         except Exception as error:
             self._debug(f"persist last session record failed: {error!r}")
 
+    def _note_pid_for_reaping(self, pid: int | None) -> None:
+        # A signalled backend exits asynchronously; remember its pid so the main
+        # loop can wait on it once it dies, instead of leaving a zombie for the
+        # rest of the run. Host-level (shared across sessions), not swapped.
+        if pid:
+            self._reap_pids = getattr(self, "_reap_pids", [])
+            self._reap_pids.append(pid)
+
+    def _reap_stopped_children(self) -> None:
+        pids = getattr(self, "_reap_pids", None)
+        if not pids:
+            return
+        remaining = []
+        for pid in pids:
+            try:
+                done, _status = os.waitpid(pid, os.WNOHANG)
+                if not done:
+                    remaining.append(pid)
+            except (ChildProcessError, OSError):
+                pass  # already reaped elsewhere (or not our child anymore)
+        self._reap_pids = remaining
+
     def _terminate_child(self) -> None:
         # Stop the current session's backend process and release its PTY, so its
         # worktree is no longer in use and can be removed.
@@ -3520,6 +3545,7 @@ class ProxyRunner:
                 os.kill(self.child_pid, signal.SIGINT)
             except ProcessLookupError:
                 pass
+            self._note_pid_for_reaping(self.child_pid)
             self.child_pid = None
         if getattr(self, "master_fd", None) is not None:
             try:

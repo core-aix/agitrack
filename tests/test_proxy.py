@@ -3210,3 +3210,46 @@ def test_spawn_failed_exec_child_exits_with_127(tmp_path):
     _, status = os.waitpid(runner.child_pid, 0)
     assert os.waitstatus_to_exitcode(status) == 127
     os.close(runner.master_fd)
+
+
+# --- issue #21: stopped backends are reaped, not left as zombies ----------------
+
+
+def test_terminate_child_queues_pid_and_reaper_collects_it():
+    runner = ProxyRunner.__new__(ProxyRunner)
+    pid = os.fork()
+    if pid == 0:
+        os._exit(0)  # the "backend" exits as soon as it is signalled
+    runner.child_pid = pid
+    runner.master_fd = None
+
+    runner._terminate_child()
+
+    assert runner.child_pid is None
+    assert pid in runner._reap_pids  # queued for the loop's reaper
+
+    deadline = time.monotonic() + 2.0
+    while pid in runner._reap_pids and time.monotonic() < deadline:
+        runner._reap_stopped_children()
+        time.sleep(0.01)
+    assert runner._reap_pids == []
+    # Fully reaped: the pid is no longer a child (zombie) of this process.
+    with pytest.raises(ChildProcessError):
+        os.waitpid(pid, os.WNOHANG)
+
+
+def test_reaper_keeps_still_running_children():
+    import signal as signal_mod
+
+    runner = ProxyRunner.__new__(ProxyRunner)
+    pid = os.fork()
+    if pid == 0:
+        time.sleep(30)
+        os._exit(0)
+    runner._reap_pids = [pid]
+
+    runner._reap_stopped_children()
+    assert runner._reap_pids == [pid]  # still running: kept for later
+
+    os.kill(pid, signal_mod.SIGKILL)
+    os.waitpid(pid, 0)
