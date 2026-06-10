@@ -458,6 +458,110 @@ class ProxyRunner:
     def _integration(self, svc: IntegrationService) -> None:
         self.__dict__["_integration_svc"] = svc
 
+    # ------------------------------------------------------------------
+    # Test factory: builds a fully-initialised ProxyRunner without the
+    # production __init__ path (which requires a real filesystem, a TTY,
+    # etc.).  Call sites in tests must migrate from ProxyRunner.__new__
+    # to ProxyRunner.for_testing(**overrides).
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def for_testing(cls, **overrides) -> "ProxyRunner":
+        """Return a ProxyRunner suitable for unit tests.
+
+        A real :class:`Session` is attached and all runner-level fields are
+        initialised to safe defaults. Any keyword argument whose name matches
+        a :data:`~agit.proxy.session.Session.FIELDS` entry is routed to the
+        session; all other keyword arguments are set directly on the runner.
+
+        Example::
+
+            runner = ProxyRunner.for_testing(
+                repo=fake_repo,
+                state=AgitState(tmp_path),
+                verbose=False,
+            )
+        """
+        instance = cls.__new__(cls)
+
+        # --- runner-level defaults (fields that live on the runner, not the session) ---
+        instance.__dict__.update({
+            "verbose": False,
+            "input": ProxyInput(),
+            "running": True,
+            "old_attrs": None,
+            "original_sigwinch": None,
+            "original_signal_handlers": {},
+            "rows": 24,
+            "cols": 80,
+            "_last_render": 0.0,
+            "_render_pending": False,
+            "_in_sync_update": False,
+            "_sync_since": 0.0,
+            "message": None,
+            "message_until": 0.0,
+            "_message_sticky": False,
+            "_last_agent_commit_id": None,
+            "_awaited_followups": [],
+            "host_fg_value": None,
+            "host_bg_value": None,
+            "host_palette": {},
+            "host_da": None,
+            "color_mode": "truecolor",
+            "management_lock": None,
+            "base_repo": None,
+            "_base_branch": None,
+            "_integration_paused": False,
+            "_base_drift_check_at": 0.0,
+            "_pending_enter_at": None,
+            "_pending_enter_fd": None,
+            "_base_advanced": False,
+            "_last_base_head": None,
+            "_base_edits_declined_status": None,
+            "_popup_exit_pending": False,
+            "_popup_exit_force": False,
+            "_reap_pids": [],
+            "_idle_integrate_at": 0.0,
+            "_base_poll_at": 0.0,
+            "_warned_backend_session": False,
+            "_user_declined": [],
+            "sessions": [],
+            "worktree_manager": None,
+            "raw_capture": False,
+            "debug_proxy": False,
+            "_diag_run": "test",
+            "_force_new_session": False,
+            "_primary_worktree_name": None,
+            "global_config": None,
+        })
+        # Apply timing class-constant defaults (so CHILD_IDLE_SECONDS etc. resolve).
+        # These stay as class attributes; no instance-level override needed unless
+        # the test provides one via **overrides below.
+
+        # --- Separate session-level overrides from runner-level overrides ---
+        session_fields = set(Session.FIELDS)
+        session_overrides = {k: v for k, v in overrides.items() if k in session_fields}
+        runner_overrides = {k: v for k, v in overrides.items() if k not in session_fields}
+
+        # Build the session with any provided session-level values merged on top of
+        # Session.bare() defaults.
+        session_kwargs = Session.runtime_defaults()
+        session_kwargs.update(session_overrides)
+        session = Session(**session_kwargs)
+        instance.__dict__["_active_session"] = session
+
+        # Apply runner-level overrides.
+        for key, value in runner_overrides.items():
+            instance.__dict__[key] = value
+
+        # base_repo defaults to repo if not explicitly overridden.
+        if instance.__dict__.get("base_repo") is None:
+            repo = getattr(instance.active, "repo", None)
+            if repo is not None:
+                instance.__dict__["base_repo"] = repo
+
+        return instance
+
     def run(self) -> int:
         if not sys.stdin.isatty() or not sys.stdout.isatty():
             raise RuntimeError("Proxy mode requires an interactive terminal. Use --mode json for non-TTY use.")
