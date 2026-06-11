@@ -117,14 +117,8 @@ header{padding:72px 0 40px;position:relative}
 .dot.r{background:#3d2626}.dot.y{background:#3d3526}.dot.g{background:#263d2e}
 .term-bar .title{margin-left:8px}
 .term-body{padding:18px 20px;font-size:14px;overflow-x:auto}
-.term-body img{display:block;width:100%;height:auto}
 pre{font-family:var(--mono);white-space:pre;line-height:1.55}
 .p{color:var(--phosphor)} .o{color:var(--amber)} .d{color:var(--fg-dim)} .w{color:var(--fg)} .e{color:var(--red)}
-
-/* demo placeholder shown until assets/demo.gif exists */
-.demo-fallback{display:none}
-.demo-missing .demo-fallback{display:block}
-.demo-missing .demo-img{display:none}
 
 /* ---- feature grid as a 3-way branch ---- */
 .branches{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:16px;margin-top:8px}
@@ -193,18 +187,19 @@ footer .sha{font-size:12px}
       </div>
       <div class="term" id="demo">
         <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="title">agit — claude · session-1 → main</span></div>
-        <div class="term-body">
-          <img class="demo-img" src="assets/demo.gif" alt="Terminal recording: agit launches Claude Code, a prompt produces code changes, and aGiT auto-commits the turn with its interaction trace"
-               onerror="document.getElementById('demo').classList.add('demo-missing')">
-          <pre class="demo-fallback"><span class="d">$</span> <span class="p">agit</span>
-<span class="d">┌ claude · what shall we build? ────────────────────┐</span>
+        <div class="term-body"><pre><span class="d">$</span> <span class="p">agit</span>
+<span class="d">┌ claude · session-1 ──────────────────────────────────┐</span>
 <span class="w">&gt; add a --version flag to the cli</span>
-<span class="d">  ⠸ editing agit/cli.py …</span>
-<span class="d">└────────────────────────────────────────────────────┘</span>
-<span class="o">✓ Created &lt;agent&gt; commit 4b2f31a.</span>
-<span class="d">$</span> <span class="p">git log --oneline -1</span>
+<span class="d">  · editing agit/cli.py …</span>
+<span class="d">  · added --version using importlib.metadata</span>
+<span class="d">└──────────────────────────────────────────────────────┘</span>
+<span class="o">✓ Created &lt;agent&gt; commit 4b2f31a.</span>            <span class="d">aGiT · Ctrl-G</span>
+<span class="d">$</span> <span class="p">git log --oneline -2</span>
 <span class="o">4b2f31a</span> <span class="w">&lt;agent&gt; add a --version flag to the cli</span>
-<span class="d">(demo.gif lands here — recorded with the checked-in VHS tape)</span></pre>
+<span class="d">a91c07e</span> <span class="w">Initial commit</span>
+<span class="d">$</span> <span class="p">git show 4b2f31a --stat</span>
+<span class="o">&lt;agent&gt;</span> <span class="w">add a --version flag to the cli</span>
+<span class="d"> agit/cli.py | 6 ++++++</span>  <span class="d">— trace + model + token cost in the body ↓</span></pre>
         </div>
       </div>
     </section>
