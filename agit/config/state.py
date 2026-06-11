@@ -73,7 +73,7 @@ class AgitState:
         }
 
     def _default_config(self) -> dict[str, Any]:
-        return {"trace_turn_limit": 5, "summarization_model": None}
+        return {"trace_turn_limit": 5, "summarization_model": None, "summarization_enabled": True}
 
     def _load_config(self) -> dict[str, Any]:
         default = self._default_config()
@@ -292,6 +292,16 @@ class AgitState:
     @summarization_model.setter
     def summarization_model(self, value: str | None) -> None:
         self.config["summarization_model"] = value
+        self._save_config()
+
+    @property
+    def summarization_enabled(self) -> bool:
+        value = self.config.get("summarization_enabled")
+        return True if value is None else bool(value)
+
+    @summarization_enabled.setter
+    def summarization_enabled(self, value: bool) -> None:
+        self.config["summarization_enabled"] = bool(value)
         self._save_config()
 
     def _save_config(self) -> None:

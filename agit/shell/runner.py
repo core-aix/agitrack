@@ -109,9 +109,42 @@ class AgitShell:
                 print("No intentionally unstaged files.")
         elif command == ":stage":
             self.actions.review_untracked(include_declined=True)
+        elif command == ":summarizer":
+            self._handle_summarizer_command(arg.strip())
         else:
             print(f"Unknown command: {command}")
         return False
+
+    def _handle_summarizer_command(self, arg: str) -> None:
+        sub = arg.lower()
+        if sub in ("on", "off"):
+            enabled = sub == "on"
+            self.state.summarization_enabled = enabled
+            print(f"Summarizer {'enabled' if enabled else 'disabled'}.")
+        elif sub == "model":
+            current = self.state.summarization_model or self.global_config.summarization_model or "(same as session)"
+            print(f"Current summarizer model: {current}")
+            new_model = input("Enter model (empty to clear): ").strip()
+            self.state.summarization_model = new_model or None
+            print(f"Summarizer model set to: {self.state.summarization_model or '(same as session)'}")
+        elif sub == "" or sub == "status":
+            enabled = self._summarization_enabled()
+            model = self.state.summarization_model or self.global_config.summarization_model or "(same as session)"
+            print(f"Summarizer: {'ON' if enabled else 'OFF'}")
+            print(f"Model: {model}")
+        else:
+            print(f"Unknown summarizer command: {arg}")
+            print("Usage: :summarizer [on|off|model|status]")
+
+    def _summarization_enabled(self) -> bool:
+        state_enabled = getattr(self.state, "summarization_enabled", None)
+        if state_enabled is not None:
+            return state_enabled
+        if self.global_config is not None:
+            gc_enabled = getattr(self.global_config, "summarization_enabled", None)
+            if gc_enabled is not None:
+                return gc_enabled
+        return True
 
     def _handle_agent_prompt(self, prompt: str) -> None:
         if prompt.startswith("/compact"):
@@ -146,7 +179,7 @@ class AgitShell:
             diff_before_commit = self.repo.diff_head()
             commit_summary = None
             summarizer_model = self.state.summarization_model or self.global_config.summarization_model
-            if summarizer_model or True:
+            if self._summarization_enabled():
                 try:
                     summarizer = Summarizer(backend, model=summarizer_model)
                     from agit.transcripts.types import SessionTurn
@@ -252,6 +285,8 @@ class AgitShell:
         print("  :stage             review and stage untracked files")
         print("  :unstaged          show intentionally unstaged files")
         print(f"  :agent-backend <{'|'.join(BACKENDS)}> select the agent backend")
+        print("  :summarizer [on|off|model|status]")
+        print("                     manage summarization (on/off, set model, show status)")
         print("  :exit              exit")
         print("Backend / commands are not reserved by aGiT and are sent to the backend.")
 

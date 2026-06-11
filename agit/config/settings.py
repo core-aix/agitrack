@@ -132,3 +132,13 @@ class GlobalConfig:
     def summarization_model(self, value: str | None) -> None:
         self.data["summarization_model"] = value
         self.save()
+
+    @property
+    def summarization_enabled(self) -> bool:
+        value = self.data.get("summarization_enabled")
+        return True if value is None else bool(value)
+
+    @summarization_enabled.setter
+    def summarization_enabled(self, value: bool) -> None:
+        self.data["summarization_enabled"] = bool(value)
+        self.save()
