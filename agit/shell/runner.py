@@ -114,6 +114,9 @@ class AgitShell:
         return False
 
     def _handle_agent_prompt(self, prompt: str) -> None:
+        if prompt.startswith("/compact"):
+            self._handle_pre_compaction()
+
         if self.actions.has_pre_agent_user_changes():
             print("User changes detected before agent runs.")
             self.actions.create_user_commit()
@@ -138,8 +141,36 @@ class AgitShell:
         self.actions.review_untracked(include_declined=False)
         if self.repo.has_staged_changes():
             from agit.commits import build_agent_commit_message
+            from agit.summaries import Summarizer
 
-            self.repo.commit(
+            diff_before_commit = self.repo.diff_head()
+            commit_summary = None
+            summarizer_model = self.state.summarization_model or self.global_config.summarization_model
+            if summarizer_model or True:
+                try:
+                    summarizer = Summarizer(backend, model=summarizer_model)
+                    from agit.transcripts.types import SessionTurn
+                    from agit.backends.base import TokenUsage
+                    turns = [SessionTurn(
+                        user_message_id="",
+                        assistant_message_id="",
+                        user_prompt=prompt,
+                        final_response=result.final_response,
+                        tokens=result.tokens,
+                        model=result.model,
+                        complete=True,
+                        interrupted=False,
+                    )]
+                    commit_summary = summarizer.summarize_commit(
+                        turns=turns,
+                        diff=diff_before_commit,
+                        session_summary=self.state.session_summary,
+                    )
+                except Exception as error:
+                    if self.verbose:
+                        print(f"Summarization failed: {error}")
+
+            commit_sha = self.repo.commit(
                 build_agent_commit_message(
                     latest_prompt=prompt,
                     trace=self.state.pending_trace(),
@@ -149,9 +180,27 @@ class AgitShell:
                     model=self.state.model,
                     token_usage=self.state.pending_token_usage(),
                     trace_turn_limit=self.state.trace_turn_limit,
+                    summary=commit_summary,
                 )
             )
             self.state.clear_trace()
+
+            if commit_summary and commit_sha:
+                try:
+                    self.repo.notes_add(commit_sha, commit_summary, namespace="agit/commit-summary")
+                    new_session_summary = summarizer.update_session_summary(
+                        current_summary=self.state.session_summary,
+                        turns=turns,
+                        diff=diff_before_commit,
+                        commit_summary=commit_summary,
+                    )
+                    self.state.session_summary = new_session_summary
+                    self.state.session_summary_commit = commit_sha
+                    self.repo.notes_add(commit_sha, new_session_summary, namespace="agit/session-summary")
+                except Exception as error:
+                    if self.verbose:
+                        print(f"Session summary update failed: {error}")
+
             print("Created <agent> commit.")
         else:
             if self.verbose:
@@ -162,6 +211,38 @@ class AgitShell:
         if backend_class is None:
             raise RuntimeError(f"Unsupported backend: {self.state.backend}")
         return backend_class(self.repo.repo, verbose=self.verbose)
+
+    def _handle_pre_compaction(self) -> None:
+        if self.verbose:
+            print("aGiT: Capturing session summary before compaction...")
+        try:
+            from agit.summaries import Summarizer
+
+            backend = self._backend()
+            model = self.state.summarization_model or self.global_config.summarization_model
+            summarizer = Summarizer(backend, model=model)
+            session_id = self.state.backend_session_id
+            if not session_id:
+                return
+            from agit.backends.proxy_agents import make_proxy_agent
+            proxy_agent = make_proxy_agent(self.state.backend)
+            exported = proxy_agent.export_session(self.repo.repo, session_id)
+            if not exported or not exported.turns:
+                return
+            summary = summarizer.summarize_pre_compaction(
+                exported_session=exported,
+                current_summary=self.state.session_summary,
+            )
+            self.state.session_summary = summary
+            head_sha = self.repo.rev_parse("HEAD")
+            if head_sha:
+                self.state.session_summary_commit = head_sha
+                self.repo.notes_add(head_sha, summary, namespace="agit/session-summary")
+            if self.verbose:
+                print("aGiT: Session summary captured.")
+        except Exception as error:
+            if self.verbose:
+                print(f"aGiT: Pre-compaction summary failed: {error}")
 
     def _print_help(self) -> None:
         print("Commands:")

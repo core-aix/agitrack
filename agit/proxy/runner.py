@@ -2431,6 +2431,8 @@ class ProxyRunner:
             submitted_prompt = ""
             if submit:
                 submitted_prompt = self.passthrough_prompt.decode(errors="ignore").strip()
+                if submitted_prompt.startswith("/compact"):
+                    self._handle_pre_compaction()
                 if not self._pre_agent_commit_if_needed(submitted_prompt):
                     self.pending_forwarded = [chunk for chunk in forwarded if chunk in {b"\r", b"\n"}]
                     self.pending_prompt_text = submitted_prompt
@@ -3452,6 +3454,38 @@ class ProxyRunner:
         # builder collapses this with the backend's own turn.user_prompt.
         self._record_user_prompt(prompt_text)
         return True
+
+    def _handle_pre_compaction(self) -> None:
+        self._set_message("aGiT: Capturing session summary before compaction...")
+        self._render()
+        try:
+            from agit.summaries import Summarizer
+            from agit.backends.claude import ClaudeBackend
+            from agit.backends.opencode import OpenCodeBackend
+
+            backend_class = OpenCodeBackend if self.state.backend == "opencode" else ClaudeBackend
+            backend = backend_class()
+            model = self.state.summarization_model or self.global_config.summarization_model
+            summarizer = Summarizer(backend, model=model)
+            session_id = self.state.backend_session_id
+            if not session_id:
+                return
+            exported = self.active.backend.export_session(self.repo.repo, session_id)
+            if not exported or not exported.turns:
+                return
+            summary = summarizer.summarize_pre_compaction(
+                exported_session=exported,
+                current_summary=self.state.session_summary,
+            )
+            self.state.session_summary = summary
+            head_sha = self.repo.rev_parse("HEAD")
+            if head_sha:
+                self.state.session_summary_commit = head_sha
+                self.repo.notes_add(head_sha, summary, namespace="agit/session-summary")
+            self._set_message("aGiT: Session summary captured.")
+        except Exception as error:
+            self._debug(f"pre-compaction summary failed: {error!r}")
+            self._set_message("aGiT: Pre-compaction summary failed.")
 
     def _base_user_edits_pending(self) -> bool:
         # The user's own edits land in the BASE repo's working tree (the session
