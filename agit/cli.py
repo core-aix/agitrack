@@ -25,7 +25,8 @@ def main(argv: list[str] | None = None) -> int:
         add_help=False,
     )
     parser.add_argument(
-        "-h", "--help",
+        "-h",
+        "--help",
         action="store_true",
         help="show aGiT help and backend help",
     )

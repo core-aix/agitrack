@@ -265,7 +265,9 @@ def test_help_no_backend_selected(monkeypatch, capsys):
 
 def test_backend_help_via_double_dash_runs_directly(monkeypatch):
     """Test that --backend X -- --help runs backend help directly, not combined help."""
-    monkeypatch.setattr(cli, "_discover_or_init", lambda p: (_ for _ in ()).throw(AssertionError("TUI should not launch")))
+    monkeypatch.setattr(
+        cli, "_discover_or_init", lambda p: (_ for _ in ()).throw(AssertionError("TUI should not launch"))
+    )
 
     class Config:
         def has_default_backend(self):
@@ -292,7 +294,9 @@ def test_backend_help_via_double_dash_runs_directly(monkeypatch):
 
 
 def test_backend_help_runs_directly_without_tui(monkeypatch):
-    monkeypatch.setattr(cli, "_discover_or_init", lambda p: (_ for _ in ()).throw(AssertionError("TUI should not launch")))
+    monkeypatch.setattr(
+        cli, "_discover_or_init", lambda p: (_ for _ in ()).throw(AssertionError("TUI should not launch"))
+    )
 
     class Config:
         def has_default_backend(self):
