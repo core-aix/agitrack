@@ -16,6 +16,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The suite shells out to `git commit` in temp repos; the runner has no
+      # default git identity, so configure one or those tests fail with
+      # "Author identity unknown".
+      - name: Configure git identity
+        run: |
+          git config --global user.email "ci@agit.invalid"
+          git config --global user.name "aGiT CI"
+
       # Install uv via its official script rather than a third-party action,
       # so the workflow runs even under an "allow GitHub-owned actions only"
       # policy. uv manages the Python toolchain itself.
