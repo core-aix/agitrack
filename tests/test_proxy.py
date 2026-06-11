@@ -10,8 +10,11 @@ from agit.backends.base import TokenUsage
 from agit.opencode_session import SessionTurn
 from agit.backends.proxy_agents import make_proxy_agent
 from agit.proxy import ProxyInput, ProxyRunner, _escape_sequence_complete, _short_session, detect_color_mode
+from agit.proxy.integration import MergeContext, MergePhase
+from agit.proxy.session import Session
 from agit.session import ExportedSession, SessionRef
 from agit.state import AgitState
+from proxy_helpers import make_runner
 
 
 class _FakeBackend:
@@ -25,9 +28,10 @@ class _FakeBackend:
 
 
 def _runner_with_sessions(refs):
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.backend = _FakeBackend(refs)
-    runner.repo = type("Repo", (), {"repo": "/repo"})()
+    runner = make_runner(
+        repo=type("Repo", (), {"repo": "/repo"})(),
+        backend=_FakeBackend(refs),
+    )
     return runner
 
 
@@ -246,10 +250,11 @@ def test_proxy_ctrl_c_starts_exit_flow_in_passthrough_mode():
 
 
 def test_proxy_agent_commit_preserves_incomplete_initial_user_turn(tmp_path):
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.repo = FakeCommitRepo()
-    runner.state = AgitState(tmp_path)
-    runner.verbose = False
+    runner = make_runner(
+        repo=FakeCommitRepo(),
+        state=AgitState(tmp_path),
+        verbose=False,
+    )
     runner._review_untracked_popup = lambda include_declined: "No untracked files to review."
     runner.state.append_trace("user", "also handle errors")
 
@@ -273,10 +278,11 @@ def test_proxy_agent_commit_preserves_incomplete_initial_user_turn(tmp_path):
 
 
 def test_agent_commit_subject_joins_all_prompts_with_slash(tmp_path):
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.repo = FakeCommitRepo()
-    runner.state = AgitState(tmp_path)
-    runner.verbose = False
+    runner = make_runner(
+        repo=FakeCommitRepo(),
+        state=AgitState(tmp_path),
+        verbose=False,
+    )
     runner._review_untracked_popup = lambda include_declined: "No untracked files to review."
 
     committed = runner._create_agent_commit_from_turns_popup(
@@ -298,10 +304,11 @@ def test_agent_commit_subject_joins_all_prompts_with_slash(tmp_path):
 
 
 def test_proxy_agent_commit_preserves_previous_no_change_trace(tmp_path):
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.repo = FakeCommitRepo()
-    runner.state = AgitState(tmp_path)
-    runner.verbose = False
+    runner = make_runner(
+        repo=FakeCommitRepo(),
+        state=AgitState(tmp_path),
+        verbose=False,
+    )
     runner._review_untracked_popup = lambda include_declined: "No untracked files to review."
     runner.state.append_trace("user", "explain only")
     runner.state.append_trace("agent", "no code changed")
@@ -325,7 +332,7 @@ def test_proxy_agent_commit_preserves_previous_no_change_trace(tmp_path):
 
 
 def _parse_ready_runner(tmp_path, session, *, last_message_id=None):
-    runner = ProxyRunner.__new__(ProxyRunner)
+    runner = make_runner()
     runner.state = AgitState(tmp_path)
     runner.worktree = None
     runner.agent_parse_thread = None
@@ -439,10 +446,11 @@ def test_finish_agent_parse_does_not_block_on_cancelled_followup(tmp_path):
 def test_agent_commit_popup_includes_commit_id(tmp_path):
     # The auto-commit confirmation names the short SHA so the user can find the
     # commit aGiT just made.
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.repo = FakeCommitRepo()
-    runner.state = AgitState(tmp_path)
-    runner.verbose = False
+    runner = make_runner(
+        repo=FakeCommitRepo(),
+        state=AgitState(tmp_path),
+        verbose=False,
+    )
     runner._review_untracked_popup = lambda include_declined: "No untracked files to review."
 
     committed = runner._create_agent_commit_from_turns_popup(
@@ -472,7 +480,7 @@ def _make_cell(data=" ", **attrs):
 
 
 def test_proxy_cell_sgr_reproduces_attributes():
-    runner = ProxyRunner.__new__(ProxyRunner)
+    runner = make_runner()
 
     # Default cell carries no styling.
     assert runner._cell_sgr(_make_cell()) == ""
@@ -486,8 +494,7 @@ def test_proxy_cell_sgr_reproduces_attributes():
 
 
 def test_proxy_render_line_preserves_colors():
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.cols = 3
+    runner = make_runner(cols=3)
 
     class Screen:
         buffer = {
@@ -506,8 +513,7 @@ def test_proxy_render_line_preserves_colors():
 
 
 def test_proxy_render_line_handles_empty_pyte_cell_data():
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.cols = 2
+    runner = make_runner(cols=2)
 
     cells = {0: _make_cell("")}  # pyte can leave a cell with empty data
 
@@ -525,8 +531,7 @@ def test_detect_color_mode_from_environment():
 
 
 def test_proxy_hex_color_preserves_256_encoding():
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.color_mode = "256"
+    runner = make_runner(color_mode="256")
     # These hexes are exact xterm-256 palette entries OpenCode emits via 38;5;N.
     # They must round-trip back to the same palette index so the host terminal
     # renders them with its own palette, exactly like a native session.
@@ -537,16 +542,51 @@ def test_proxy_hex_color_preserves_256_encoding():
 
 
 def test_proxy_hex_color_preserves_truecolor_encoding():
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.color_mode = "truecolor"
+    runner = make_runner(color_mode="truecolor")
     assert runner._hex_color_code("ff8000", foreground=True) == "38;2;255;128;0"
     assert runner._hex_color_code("0a0a0a", foreground=False) == "48;2;10;10;10"
 
 
+def test_proxy_hex_color_falls_back_to_ansi16_in_16_mode():
+    runner = make_runner(color_mode="16")
+    # Exact ANSI palette entries map to their base/bright SGR codes; arbitrary
+    # hexes snap to the nearest of the 16.
+    assert runner._hex_color_code("cd0000", foreground=True) == "31"
+    assert runner._hex_color_code("cd0000", foreground=False) == "41"
+    assert runner._hex_color_code("ff0000", foreground=True) == "91"
+    assert runner._hex_color_code("ffffff", foreground=False) == "107"
+    assert runner._hex_color_code("123456", foreground=True) == "30"
+
+
+def test_proxy_named_color_codes():
+    runner = make_runner()
+    assert runner._color_code("red", foreground=True) == "31"
+    assert runner._color_code("blue", foreground=False) == "44"
+    assert runner._color_code("brightgreen", foreground=True) == "92"
+    assert runner._color_code("brown", foreground=True) == "33"  # pyte's name for yellow
+    assert runner._color_code("default", foreground=True) is None
+    assert runner._color_code("nonsense", foreground=True) is None
+
+
+def test_selection_ranges_span_multiple_rows():
+    runner = make_runner(
+        cols=10,
+        sel_active=True,
+        sel_anchor=(0, 3),
+        sel_point=(2, 1),
+    )
+    # First row runs from the anchor column to the end, middle rows span fully,
+    # last row runs up to the point column.
+    assert runner._selection_ranges() == {0: (3, 9), 1: (0, 9), 2: (0, 1)}
+    # Anchor and point are order-independent.
+    runner.sel_anchor, runner.sel_point = runner.sel_point, runner.sel_anchor
+    assert runner._selection_ranges() == {0: (3, 9), 1: (0, 9), 2: (0, 1)}
+    runner.sel_active = False
+    assert runner._selection_ranges() == {}
+
+
 def test_proxy_render_line_emits_256_colors_in_256_mode():
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.color_mode = "256"
-    runner.cols = 3
+    runner = make_runner(color_mode="256", cols=3)
 
     class Screen:
         buffer = {
@@ -565,8 +605,7 @@ def test_proxy_render_line_emits_256_colors_in_256_mode():
 
 
 def test_proxy_render_line_emits_reverse_video():
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.cols = 3
+    runner = make_runner(cols=3)
 
     class Screen:
         buffer = {
@@ -649,8 +688,10 @@ def test_feed_child_output_strips_xtmodkeys_mistaken_for_underline():
 
     from agit.proxy import _BackgroundColorEraseScreen
 
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.screen = _BackgroundColorEraseScreen(10, 2, history=10, ratio=0.5)
+    import pyte
+    runner = make_runner(
+        screen=_BackgroundColorEraseScreen(10, 2, history=10, ratio=0.5),
+    )
     runner.stream = pyte.ByteStream(runner.screen)
 
     runner._feed_child_output(b"\x1b[>4mhello")
@@ -668,8 +709,10 @@ def test_feed_child_output_preserves_dec_private_modes_and_real_sgr():
 
     from agit.proxy import _BackgroundColorEraseScreen
 
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.screen = _BackgroundColorEraseScreen(10, 2, history=10, ratio=0.5)
+    import pyte
+    runner = make_runner(
+        screen=_BackgroundColorEraseScreen(10, 2, history=10, ratio=0.5),
+    )
     runner.stream = pyte.ByteStream(runner.screen)
 
     runner._feed_child_output(b"\x1b[?25l\x1b[4mU\x1b[24mP")
@@ -680,10 +723,9 @@ def test_feed_child_output_preserves_dec_private_modes_and_real_sgr():
 
 
 def test_drain_child_output_reads_all_available():
-    runner = ProxyRunner.__new__(ProxyRunner)
     read_fd, write_fd = os.pipe()
+    runner = make_runner(master_fd=read_fd)
     try:
-        runner.master_fd = read_fd
         os.write(write_fd, b"hello ")
         os.write(write_fd, b"world")
         assert runner._drain_child_output() == b"hello world"
@@ -693,11 +735,10 @@ def test_drain_child_output_reads_all_available():
 
 
 def test_drain_child_output_returns_none_on_eof():
-    runner = ProxyRunner.__new__(ProxyRunner)
     read_fd, write_fd = os.pipe()
     os.close(write_fd)  # EOF, nothing buffered
+    runner = make_runner(master_fd=read_fd)
     try:
-        runner.master_fd = read_fd
         assert runner._drain_child_output() is None
     finally:
         os.close(read_fd)
@@ -706,14 +747,18 @@ def test_drain_child_output_returns_none_on_eof():
 def _history_runner():
     import pyte
 
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.cols, runner.rows = 12, 5  # 4 visible rows
-    runner.child_mouse = False
-    runner.scroll_back = 0
-    runner.screen = pyte.HistoryScreen(12, 4, history=100, ratio=0.5)
-    stream = pyte.ByteStream(runner.screen)
+    screen = pyte.HistoryScreen(12, 4, history=100, ratio=0.5)
+    stream = pyte.ByteStream(screen)
     for i in range(20):
         stream.feed(f"line{i:02d}\r\n".encode())
+    runner = make_runner(
+        cols=12,
+        rows=5,
+        child_mouse=False,
+        scroll_back=0,
+        screen=screen,
+    )
+    runner.stream = stream
     runner._render = lambda: None
     return runner
 
@@ -744,20 +789,23 @@ def test_scrolled_view_shows_history_lines():
 
 def _paint_runner():
     import types
-
     import pyte
 
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.cols, runner.rows = 8, 4  # 3 visible content rows + 1 status row
-    runner.scroll_back = 0
-    runner.sel_active = False
-    runner.sel_anchor = runner.sel_point = None
-    runner.screen = pyte.HistoryScreen(8, 3, history=50, ratio=0.5)
-    runner.stream = pyte.ByteStream(runner.screen)
+    screen = pyte.HistoryScreen(8, 3, history=50, ratio=0.5)
+    runner = make_runner(
+        cols=8,
+        rows=4,
+        scroll_back=0,
+        sel_active=False,
+        sel_anchor=None,
+        sel_point=None,
+        screen=screen,
+        message=None,
+        message_until=0.0,
+    )
+    runner.stream = pyte.ByteStream(screen)
     runner._in_sync_update = False
     runner._sync_since = 0.0
-    runner.message = None
-    runner.message_until = 0.0
     runner.input = types.SimpleNamespace(capturing=False)
     runner._status_line = lambda: "STATUS".ljust(8)
     return runner
@@ -810,7 +858,7 @@ def test_nonsticky_message_hidden_after_timeout(monkeypatch):
 
 
 def test_keypress_dismisses_sticky_message():
-    runner = ProxyRunner.__new__(ProxyRunner)
+    runner = make_runner()
     runner._set_message("Created <agent> commit.", sticky=True)
     assert runner._message_sticky is True
 
@@ -822,7 +870,7 @@ def test_keypress_dismisses_sticky_message():
 
 
 def test_keypress_leaves_nonsticky_message_intact():
-    runner = ProxyRunner.__new__(ProxyRunner)
+    runner = make_runner()
     runner._set_message("transient note")  # default: not sticky
 
     assert runner._clear_sticky_message_on_input() is False
@@ -834,8 +882,7 @@ def test_set_message_requests_a_render():
     # output). A message set from the background idle loop — e.g. the auto-commit
     # confirmation, when the agent is quiet — must therefore request a repaint, or
     # the popup is never drawn.
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner._render_pending = False
+    runner = make_runner(_render_pending=False)
 
     runner._set_message("Created <agent> commit.", sticky=True)
 
@@ -843,11 +890,12 @@ def test_set_message_requests_a_render():
 
 
 def test_track_sync_update_defers_then_releases_render():
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner._in_sync_update = False
-    runner._sync_since = 0.0
-    runner._render_pending = False
-    runner._last_render = 0.0
+    runner = make_runner(
+        _in_sync_update=False,
+        _sync_since=0.0,
+        _render_pending=False,
+        _last_render=0.0,
+    )
     rendered = []
     runner._render = lambda: rendered.append(1)
 
@@ -869,7 +917,7 @@ def test_track_sync_update_defers_then_releases_render():
 
 
 def test_hold_incomplete_tail_buffers_split_escape_sequence():
-    runner = ProxyRunner.__new__(ProxyRunner)
+    runner = make_runner()
     # A mouse report split across reads must be held back, not leaked as bytes.
     head, tail = runner._hold_incomplete_tail(b"abc\x1b[<35;10;")
     assert head == b"abc"
@@ -940,11 +988,12 @@ def test_mouse_events_are_stripped_from_forwarded_input():
 def test_reset_agent_tracking_reenables_scrollback_for_new_backend():
     # Switching OpenCode -> Claude must clear child_mouse so aGiT reclaims the
     # wheel for scrollback instead of forwarding it to a backend that ignores it.
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.child_mouse = True
-    runner.scroll_back = 7
-    runner.passthrough_prompt = bytearray(b"abc")
-    runner.passthrough_escape = None
+    runner = make_runner(
+        child_mouse=True,
+        scroll_back=7,
+        passthrough_prompt=bytearray(b"abc"),
+        passthrough_escape=None,
+    )
 
     runner._reset_agent_tracking()
 
@@ -963,7 +1012,7 @@ def test_wheel_forwarded_when_backend_manages_mouse():
 def test_apply_timings_overrides_constants():
     from agit.global_config import DEFAULT_TIMINGS
 
-    runner = ProxyRunner.__new__(ProxyRunner)
+    runner = make_runner()
     # Defaults are the class constants until config is applied.
     assert runner.BASE_POLL_SECONDS == DEFAULT_TIMINGS["base_poll_seconds"]
 
@@ -978,7 +1027,7 @@ def test_apply_timings_overrides_constants():
 def test_proxy_refuses_second_instance(monkeypatch, capsys):
     import sys
 
-    runner = ProxyRunner.__new__(ProxyRunner)
+    runner = make_runner()
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
     monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
     runner._ensure_backend_available = lambda: True
@@ -991,33 +1040,31 @@ def test_proxy_refuses_second_instance(monkeypatch, capsys):
 
 
 def _mux_runner():
-    import agit.session_runtime as sr
-    from agit.session_runtime import capture_session
-
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.cols, runner.rows = 20, 5
-    runner.color_mode = "truecolor"
-    runner.host_fg_value = runner.host_bg_value = runner.host_da = None
-    runner.host_palette = {}
+    runner = make_runner(
+        cols=20,
+        rows=5,
+        color_mode="truecolor",
+        name="A",
+        worktree=None,
+        repo="repoA",
+        state="stateA",
+        backend="bA",
+        actions="actA",
+    )
     runner._render = lambda: None
     runner._resize_child = lambda: None
     runner._enable_host_mouse = lambda: None
     runner._set_message = lambda *a, **k: None
     runner._stop_file_watcher = lambda: None
-    for field, value in sr.default_session_fields().items():
-        setattr(runner, field, value)
-    runner.name, runner.worktree = "A", None
-    runner.repo, runner.state, runner.backend, runner.actions = "repoA", "stateA", "bA", "actA"
-    runner.sessions = [capture_session(runner)]
-    runner.active_index = 0
+    runner.sessions = [runner.active]
     return runner
 
 
 def _bg_session(name):
-    import agit.session_runtime as sr
+    from agit.proxy.session import Session
 
-    return sr.Session(**{**sr.default_session_fields(), "name": name, "repo": f"repo{name}",
-                         "state": f"state{name}", "backend": f"b{name}", "actions": f"act{name}"})
+    return Session(**{**Session.runtime_defaults(), "name": name, "repo": f"repo{name}",
+                      "state": f"state{name}", "backend": f"b{name}", "actions": f"act{name}"})
 
 
 def test_switch_active_swaps_session_state():
@@ -1069,10 +1116,11 @@ def test_baseline_drops_session_with_no_conversation(tmp_path):
 
     from agit.session import ExportedSession
 
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.state = AgitState(tmp_path)
+    runner = make_runner(
+        state=AgitState(tmp_path),
+        repo=SimpleNamespace(repo=tmp_path),
+    )
     runner.state.backend_session_id = "ses-empty"
-    runner.repo = SimpleNamespace(repo=tmp_path)
     runner._should_continue_session = lambda: True
     # A session that exists but has no turns must not be resumed.
     runner.backend = SimpleNamespace(export_session=lambda repo, sid: ExportedSession(sid, None, None, []))
@@ -1084,9 +1132,10 @@ def test_baseline_drops_session_with_no_conversation(tmp_path):
 
 
 def test_new_session_flag_clears_backend_session_and_mints_agit_id(tmp_path):
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner._force_new_session = True
-    runner.state = AgitState(tmp_path)
+    runner = make_runner(
+        _force_new_session=True,
+        state=AgitState(tmp_path),
+    )
     runner.state.backend_session_id = "old-session"
     old_agit = runner.state.session_id
 
@@ -1103,16 +1152,18 @@ def test_status_line_shows_base_branch(tmp_path):
     from agit.state import AgitState
 
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.repo = GitRepo(tmp_path)
-    runner.state = AgitState(tmp_path)
-    runner.state.backend_session_id = "abcdef123456"
-    runner.name = "session-1"
-    runner.backend = type("B", (), {"name": "claude"})()
-    runner._base_branch = "main"
-    runner.worktree = object()
-    runner.scroll_back = 0
-    runner.cols = 120
+    state = AgitState(tmp_path)
+    state.backend_session_id = "abcdef123456"
+    runner = make_runner(
+        repo=GitRepo(tmp_path),
+        state=state,
+        name="session-1",
+        backend=type("B", (), {"name": "claude"})(),
+        _base_branch="main",
+        worktree=object(),
+        scroll_back=0,
+        cols=120,
+    )
 
     line = runner._status_line()
     assert "session-1" in line
@@ -1125,10 +1176,11 @@ def test_inject_prompt_defers_enter_until_text_settles():
 
     read_fd, write_fd = os.pipe()
     try:
-        runner = ProxyRunner.__new__(ProxyRunner)
-        runner.master_fd = write_fd
-        runner.merge_ctx = {"prompt_sent_at": None}
-        runner._pending_enter_at = None
+        runner = make_runner(
+            master_fd=write_fd,
+            merge_ctx=MergeContext(source_branch="agit/s/t1", context="", phase=MergePhase.PENDING),
+            _pending_enter_at=None,
+        )
 
         runner._inject_prompt("resolve the\nconflict   now")
         # The text is typed immediately, collapsed to a single line, with NO
@@ -1136,7 +1188,7 @@ def test_inject_prompt_defers_enter_until_text_settles():
         typed = os.read(read_fd, 4096)
         assert typed == b"resolve the conflict now"
         assert runner._pending_enter_at is not None
-        assert runner.merge_ctx["prompt_sent_at"] is None  # not submitted yet
+        assert runner.merge_ctx.prompt_sent_at is None  # not submitted yet
 
         # Too early: the Enter is still pending.
         runner._flush_pending_enter()
@@ -1147,18 +1199,21 @@ def test_inject_prompt_defers_enter_until_text_settles():
         runner._flush_pending_enter()
         assert os.read(read_fd, 16) == b"\r"
         assert runner._pending_enter_at is None
-        assert runner.merge_ctx["prompt_sent_at"] is not None
+        assert runner.merge_ctx.prompt_sent_at is not None
+        assert runner.merge_ctx.phase is MergePhase.RESOLVING  # PENDING → RESOLVING on Enter
     finally:
         os.close(read_fd)
         os.close(write_fd)
 
 
 def test_backend_session_change_warns_once(tmp_path):
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.worktree = object()  # a worktree session
-    runner._warned_backend_session = False
-    runner.state = AgitState(tmp_path)
-    runner.state.backend_session_id = "old"
+    state = AgitState(tmp_path)
+    state.backend_session_id = "old"
+    runner = make_runner(
+        worktree=object(),
+        _warned_backend_session=False,
+        state=state,
+    )
     messages = []
     runner._set_message = lambda message, **kw: messages.append(message)
 
@@ -1174,19 +1229,20 @@ def test_backend_session_change_warns_once(tmp_path):
 
 
 def test_new_session_not_applied_without_flag(tmp_path):
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner._force_new_session = False
-    runner.state = AgitState(tmp_path)
+    runner = make_runner(
+        _force_new_session=False,
+        state=AgitState(tmp_path),
+    )
     runner.state.backend_session_id = "keep-this"
     runner._apply_new_session_if_requested()
     assert runner.state.backend_session_id == "keep-this"
 
 
 def test_finalize_pending_work_commits_non_interactively():
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.agent_parse_thread = None
+    runner = make_runner(
+        agent_parse_thread=None,
+    )
     runner.sessions = []
-    runner.active_index = 0
     runner._set_message = lambda *a, **k: None
     runner._render = lambda: None
     runner._debug = lambda *a, **k: None
@@ -1202,7 +1258,7 @@ def test_finalize_pending_work_commits_non_interactively():
 
 
 def test_confirm_exit_prompts_when_managing(monkeypatch):
-    runner = ProxyRunner.__new__(ProxyRunner)
+    runner = make_runner()
     monkeypatch.setattr(runner, "_select_popup", lambda *a, **k: "Yes, exit")
     assert runner._confirm_exit() is True
     monkeypatch.setattr(runner, "_select_popup", lambda *a, **k: "No, keep working")
@@ -1212,9 +1268,10 @@ def test_confirm_exit_prompts_when_managing(monkeypatch):
 
 
 def test_proxy_passthrough_prompt_drops_escape_sequences():
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.passthrough_prompt = bytearray()
-    runner.passthrough_escape = None
+    runner = make_runner(
+        passthrough_prompt=bytearray(),
+        passthrough_escape=None,
+    )
 
     # "fix" + down-arrow (ESC [ B) + " bug" must capture only the typed text.
     runner._update_passthrough_prompt([b"f", b"i", b"x", b"\x1b", b"[", b"B", b" ", b"b", b"u", b"g"])
@@ -1222,9 +1279,10 @@ def test_proxy_passthrough_prompt_drops_escape_sequences():
 
 
 def test_proxy_passthrough_prompt_handles_escape_split_across_reads():
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.passthrough_prompt = bytearray()
-    runner.passthrough_escape = None
+    runner = make_runner(
+        passthrough_prompt=bytearray(),
+        passthrough_escape=None,
+    )
 
     runner._update_passthrough_prompt([b"a", b"\x1b"])
     runner._update_passthrough_prompt([b"[", b"A", b"b"])  # up-arrow split, then 'b'
@@ -1232,10 +1290,13 @@ def test_proxy_passthrough_prompt_handles_escape_split_across_reads():
 
 
 def test_proxy_parses_host_terminal_responses():
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.host_fg_value = runner.host_bg_value = runner.host_da = None
-    runner.host_palette = {}
-    runner.debug_proxy = False
+    runner = make_runner(
+        host_fg_value=None,
+        host_bg_value=None,
+        host_da=None,
+        host_palette={},
+        debug_proxy=False,
+    )
 
     runner._parse_host_terminal_responses(
         b"\x1b]10;rgb:1a1a/1a1a/1a1a\x07"
@@ -1251,13 +1312,15 @@ def test_proxy_parses_host_terminal_responses():
 
 
 def test_proxy_answers_terminal_queries_from_host_cache(monkeypatch):
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.master_fd = 99
-    runner.rows, runner.cols = 30, 100
-    runner.host_fg_value = b"rgb:1a1a/1a1a/1a1a"
-    runner.host_bg_value = b"rgb:fafa/fafa/fafa"
-    runner.host_palette = {b"1": b"rgb:cccc/0000/0000"}
-    runner.host_da = b"\x1b[?62;c"
+    runner = make_runner(
+        master_fd=99,
+        rows=30,
+        cols=100,
+        host_fg_value=b"rgb:1a1a/1a1a/1a1a",
+        host_bg_value=b"rgb:fafa/fafa/fafa",
+        host_palette={b"1": b"rgb:cccc/0000/0000"},
+        host_da=b"\x1b[?62;c",
+    )
 
     class Cursor:
         x = 4
@@ -1292,12 +1355,16 @@ def test_proxy_answers_terminal_queries_from_host_cache(monkeypatch):
 
 
 def test_proxy_answers_nothing_without_host_values(monkeypatch):
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.master_fd = 99
-    runner.rows, runner.cols = 30, 100
-    runner.host_fg_value = runner.host_bg_value = runner.host_da = None
-    runner.host_palette = {}
-    runner.screen = None
+    runner = make_runner(
+        master_fd=99,
+        rows=30,
+        cols=100,
+        host_fg_value=None,
+        host_bg_value=None,
+        host_da=None,
+        host_palette={},
+        screen=None,
+    )
 
     written = []
     real_write = os.write
@@ -1315,17 +1382,18 @@ def test_proxy_answers_nothing_without_host_values(monkeypatch):
 
 
 def test_proxy_status_check_runs_after_file_event_only():
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.file_change_event = threading.Event()
-    runner.status_check_pending = False
-    runner.last_poll = 0.0
-    runner.agent_in_flight = False
-    runner.agent_parse_thread = None
-    runner.agent_parse_result = None
-    runner.last_child_output = 0.0
-    runner.last_status = ""
-    runner.last_status_change = 0.0
-    runner.verbose = False
+    runner = make_runner(
+        file_change_event=threading.Event(),
+        status_check_pending=False,
+        last_poll=0.0,
+        agent_in_flight=False,
+        agent_parse_thread=None,
+        agent_parse_result=None,
+        last_child_output=0.0,
+        last_status="",
+        last_status_change=0.0,
+        verbose=False,
+    )
     runner.CHILD_IDLE_SECONDS = 4.0
     runner.FILE_STABLE_SECONDS = 8.0
     runner._prune_declined_untracked = lambda: None
@@ -1348,22 +1416,23 @@ def test_proxy_status_check_runs_after_file_event_only():
 
 
 def test_proxy_parse_starts_only_after_cooldown_between_file_events():
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.file_change_event = threading.Event()
-    runner.status_check_pending = False
-    runner.parse_pending = False
-    runner.last_poll = 0.0
-    runner.agent_in_flight = False
-    runner.agent_parse_thread = None
-    runner.agent_parse_result = None
-    runner.agent_parse_active = False
-    runner.last_child_output = 0.0
-    runner.last_status = ""
-    runner.last_status_change = 0.0
-    runner.last_parse_start = 0.0
-    runner.last_parse_finish = 0.0
-    runner.last_parse_attempt_status = ""
-    runner.verbose = False
+    runner = make_runner(
+        file_change_event=threading.Event(),
+        status_check_pending=False,
+        parse_pending=False,
+        last_poll=0.0,
+        agent_in_flight=False,
+        agent_parse_thread=None,
+        agent_parse_result=None,
+        agent_parse_active=False,
+        last_child_output=0.0,
+        last_status="",
+        last_status_change=0.0,
+        last_parse_start=0.0,
+        last_parse_finish=0.0,
+        last_parse_attempt_status="",
+        verbose=False,
+    )
     runner.CHILD_IDLE_SECONDS = 0.0
     runner.FILE_STABLE_SECONDS = 0.0
     runner.PARSE_COOLDOWN_SECONDS = 60.0
@@ -1393,22 +1462,23 @@ def test_proxy_parse_starts_only_after_cooldown_between_file_events():
 
 
 def test_proxy_parse_cooldown_starts_after_parse_finish():
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.file_change_event = threading.Event()
-    runner.status_check_pending = False
-    runner.parse_pending = False
-    runner.last_poll = 0.0
-    runner.agent_in_flight = False
-    runner.agent_parse_thread = None
-    runner.agent_parse_result = None
-    runner.agent_parse_active = False
-    runner.last_child_output = 0.0
-    runner.last_status = ""
-    runner.last_status_change = 0.0
-    runner.last_parse_start = 0.0
-    runner.last_parse_finish = time.monotonic()
-    runner.last_parse_attempt_status = ""
-    runner.verbose = False
+    runner = make_runner(
+        file_change_event=threading.Event(),
+        status_check_pending=False,
+        parse_pending=False,
+        last_poll=0.0,
+        agent_in_flight=False,
+        agent_parse_thread=None,
+        agent_parse_result=None,
+        agent_parse_active=False,
+        last_child_output=0.0,
+        last_status="",
+        last_status_change=0.0,
+        last_parse_start=0.0,
+        last_parse_finish=time.monotonic(),
+        last_parse_attempt_status="",
+        verbose=False,
+    )
     runner.CHILD_IDLE_SECONDS = 0.0
     runner.FILE_STABLE_SECONDS = 0.0
     runner.PARSE_COOLDOWN_SECONDS = 60.0
@@ -1429,22 +1499,24 @@ def test_proxy_parse_cooldown_starts_after_parse_finish():
 
 
 def test_proxy_start_agent_parse_rejects_active_parse(tmp_path):
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.repo = type("Repo", (), {"repo": tmp_path})()
-    runner.state = AgitState(tmp_path)
-    runner.agent_parse_thread = None
-    runner.agent_parse_result = None
-    runner.agent_parse_active = True
+    runner = make_runner(
+        repo=type("Repo", (), {"repo": tmp_path})(),
+        state=AgitState(tmp_path),
+        agent_parse_thread=None,
+        agent_parse_result=None,
+        agent_parse_active=True,
+    )
 
     assert runner._start_agent_parse() is False
 
 
 def test_proxy_sanitizes_raw_opencode_event_agent_trace(tmp_path):
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.repo = type("Repo", (), {"repo": tmp_path})()
-    runner.state = AgitState(tmp_path)
-    runner.backend = make_proxy_agent("opencode")
-    runner.debug_proxy = False
+    runner = make_runner(
+        repo=type("Repo", (), {"repo": tmp_path})(),
+        state=AgitState(tmp_path),
+        backend=make_proxy_agent("opencode"),
+        debug_proxy=False,
+    )
     runner.state.append_trace("user", "hi")
     runner.state.append_trace(
         "agent",
@@ -1462,18 +1534,19 @@ def test_proxy_sanitizes_raw_opencode_event_agent_trace(tmp_path):
 
 
 def test_proxy_pending_prompt_forwards_after_agent_parse_commit(tmp_path):
-    runner = ProxyRunner.__new__(ProxyRunner)
     read_fd, write_fd = os.pipe()
     try:
-        runner.master_fd = write_fd
-        runner.pending_forwarded = [b"\r"]
-        runner.pending_prompt_text = "fix it"
-        runner.passthrough_prompt = bytearray(b"fix it")
-        runner.state = AgitState(tmp_path)
-        runner.agent_parse_thread = None
-        runner.agent_in_flight = False
-        runner.message = "waiting"
-        runner.message_until = 1.0
+        runner = make_runner(
+            master_fd=write_fd,
+            pending_forwarded=[b"\r"],
+            pending_prompt_text="fix it",
+            passthrough_prompt=bytearray(b"fix it"),
+            state=AgitState(tmp_path),
+            agent_parse_thread=None,
+            agent_in_flight=False,
+            message="waiting",
+            message_until=1.0,
+        )
         runner._finish_agent_parse_if_ready = lambda quiet: True
 
         runner._resume_pending_prompt_if_ready()
@@ -1492,18 +1565,19 @@ def test_proxy_pending_prompt_forwards_when_agent_mid_turn(tmp_path):
     # consumed and _finish_agent_parse_if_ready now returns None with no live
     # thread. The follow-up must be forwarded (queued by the backend), not held
     # behind the "checking" message forever.
-    runner = ProxyRunner.__new__(ProxyRunner)
     read_fd, write_fd = os.pipe()
     try:
-        runner.master_fd = write_fd
-        runner.pending_forwarded = [b"\r"]
-        runner.pending_prompt_text = "and also rename it"
-        runner.passthrough_prompt = bytearray(b"and also rename it")
-        runner.state = AgitState(tmp_path)
-        runner.agent_parse_thread = None
-        runner.agent_in_flight = False
-        runner.message = None
-        runner.message_until = 0.0
+        runner = make_runner(
+            master_fd=write_fd,
+            pending_forwarded=[b"\r"],
+            pending_prompt_text="and also rename it",
+            passthrough_prompt=bytearray(b"and also rename it"),
+            state=AgitState(tmp_path),
+            agent_parse_thread=None,
+            agent_in_flight=False,
+            message=None,
+            message_until=0.0,
+        )
         runner._finish_agent_parse_if_ready = lambda quiet: None
         runner._ensure_turn_branch = lambda: None
 
@@ -1519,19 +1593,20 @@ def test_proxy_pending_prompt_forwards_when_agent_mid_turn(tmp_path):
 
 
 def test_proxy_pending_prompt_user_commit_then_forwards(tmp_path):
-    runner = ProxyRunner.__new__(ProxyRunner)
     read_fd, write_fd = os.pipe()
     try:
-        runner.master_fd = write_fd
-        runner.pending_forwarded = [b"\r"]
-        runner.pending_prompt_text = "fix it"
-        runner.passthrough_prompt = bytearray(b"fix it")
-        runner.state = AgitState(tmp_path)
-        runner.agent_parse_thread = None
-        runner.agent_in_flight = False
-        runner.screen = None
-        runner.message = None
-        runner.message_until = 0.0
+        runner = make_runner(
+            master_fd=write_fd,
+            pending_forwarded=[b"\r"],
+            pending_prompt_text="fix it",
+            passthrough_prompt=bytearray(b"fix it"),
+            state=AgitState(tmp_path),
+            agent_parse_thread=None,
+            agent_in_flight=False,
+            screen=None,
+            message=None,
+            message_until=0.0,
+        )
         runner._finish_agent_parse_if_ready = lambda quiet: False
         runner._create_user_commit_popup = lambda: True
 
@@ -1552,20 +1627,21 @@ def test_proxy_pending_prompt_user_commit_then_forwards(tmp_path):
 
 
 def test_proxy_pending_prompt_cancelled_user_commit_does_not_forward(tmp_path):
-    runner = ProxyRunner.__new__(ProxyRunner)
     read_fd, write_fd = os.pipe()
     try:
         os.set_blocking(read_fd, False)
-        runner.master_fd = write_fd
-        runner.pending_forwarded = [b"\r"]
-        runner.pending_prompt_text = "fix it"
-        runner.passthrough_prompt = bytearray(b"fix it")
-        runner.state = AgitState(tmp_path)
-        runner.agent_parse_thread = None
-        runner.agent_in_flight = False
-        runner.screen = None
-        runner.message = None
-        runner.message_until = 0.0
+        runner = make_runner(
+            master_fd=write_fd,
+            pending_forwarded=[b"\r"],
+            pending_prompt_text="fix it",
+            passthrough_prompt=bytearray(b"fix it"),
+            state=AgitState(tmp_path),
+            agent_parse_thread=None,
+            agent_in_flight=False,
+            screen=None,
+            message=None,
+            message_until=0.0,
+        )
         runner._finish_agent_parse_if_ready = lambda quiet: False
         runner._create_user_commit_popup = lambda: False
 
@@ -1590,10 +1666,11 @@ def test_proxy_pending_prompt_cancelled_user_commit_does_not_forward(tmp_path):
 
 
 def test_proxy_agent_active_does_not_depend_on_recent_output():
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.agent_in_flight = False
-    runner.agent_parse_thread = None
-    runner.last_child_output = 999999999.0
+    runner = make_runner(
+        agent_in_flight=False,
+        agent_parse_thread=None,
+        last_child_output=999999999.0,
+    )
 
     assert runner._agent_is_active() is False
 
@@ -1602,9 +1679,10 @@ def test_proxy_agent_active_does_not_depend_on_recent_output():
 
 
 def test_proxy_clears_stale_agent_in_flight_when_idle():
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.agent_in_flight = True
-    runner.last_child_output = 0.0
+    runner = make_runner(
+        agent_in_flight=True,
+        last_child_output=0.0,
+    )
     runner.CHILD_IDLE_SECONDS = 4.0
 
     runner._clear_agent_in_flight_if_idle()
@@ -1613,14 +1691,6 @@ def test_proxy_clears_stale_agent_in_flight_when_idle():
 
 
 def _integration_runner(merge_ok):
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.worktree = object()
-    runner._base_branch = "main"
-    runner.merge_ctx = None
-    runner.name = "session-1"
-    runner._exiting = False
-    runner._debug = lambda *a, **k: None
-
     class FakeRepo:
         def __init__(self):
             self.aborted = False
@@ -1634,7 +1704,15 @@ def _integration_runner(merge_ok):
         def merge_abort(self):
             self.aborted = True
 
-    runner.repo = FakeRepo()
+    runner = make_runner(
+        worktree=object(),
+        _base_branch="main",
+        merge_ctx=None,
+        name="session-1",
+        repo=FakeRepo(),
+    )
+    runner._exiting = False
+    runner._debug = lambda *a, **k: None
     return runner
 
 
@@ -1678,10 +1756,11 @@ def test_integrate_conflict_on_exit_leaves_for_startup():
 def _resolve_runner(choice_index):
     import types
 
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.name = "session-1"
-    runner._base_branch = "main"
-    runner.backend = types.SimpleNamespace(name="opencode")
+    runner = make_runner(
+        name="session-1",
+        _base_branch="main",
+        backend=types.SimpleNamespace(name="opencode"),
+    )
     runner._render = lambda: None
     msgs = []
     runner._set_message = lambda *a, **k: msgs.append(a[0] if a else "")
@@ -1734,7 +1813,7 @@ def _backend_switch_runner(monkeypatch):
     runner.backend = types.SimpleNamespace(name="claude")
     runner.worktree = object()
     runner.global_config = types.SimpleNamespace(default_backend="claude")
-    monkeypatch.setattr("agit.proxy.backend_installed", lambda n: True)
+    monkeypatch.setattr("agit.proxy.runner.backend_installed", lambda n: True)
     return runner
 
 
@@ -1893,7 +1972,7 @@ def test_service_background_finalizes_pending_merge():
     runner = _mux_runner()
     runner.merge_ctx = None
     b = _bg_session("B")
-    b.merge_ctx = {"source_branch": "agit/B/t1"}
+    b.merge_ctx = MergeContext(source_branch="agit/B/t1", context="")
     runner.sessions.append(b)
     called = []
     runner._with_session = lambda session, fn: called.append((session.name, fn.__name__))
@@ -1905,7 +1984,7 @@ def test_service_background_finalizes_pending_merge():
 
 def test_service_background_skips_while_active_merge_in_progress():
     runner = _mux_runner()
-    runner.merge_ctx = {"busy": 1}
+    runner.merge_ctx = MergeContext(source_branch="agit/A/t1", context="")  # any truthy merge_ctx
     b = _bg_session("B")
     b.agent_in_flight = True
     runner.sessions.append(b)
@@ -1950,8 +2029,7 @@ def test_next_session_name_skips_existing_worktrees_and_sessions():
 # --- injected-prompt targeting (cross-backend safety) ---
 
 def test_inject_prompt_records_target_fd(monkeypatch):
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.master_fd = 5
+    runner = make_runner(master_fd=5)
     writes = []
     monkeypatch.setattr(os, "write", lambda fd, data: writes.append((fd, data)) or len(data))
 
@@ -1963,11 +2041,12 @@ def test_inject_prompt_records_target_fd(monkeypatch):
 
 
 def test_flush_pending_enter_targets_injected_fd_not_active(monkeypatch):
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner._pending_enter_at = 0.0  # already due
-    runner._pending_enter_fd = 7  # the backend the prompt was typed into
-    runner.master_fd = 99  # a *different* session became active in the meantime
-    runner.merge_ctx = None
+    runner = make_runner(
+        _pending_enter_at=0.0,
+        _pending_enter_fd=7,
+        master_fd=99,
+        merge_ctx=None,
+    )
     writes = []
     monkeypatch.setattr(os, "write", lambda fd, data: writes.append((fd, data)) or len(data))
 
@@ -1982,18 +2061,26 @@ def test_flush_pending_enter_marks_sent_only_when_still_active(monkeypatch):
     monkeypatch.setattr(os, "write", lambda fd, data: len(data))
 
     # Same session still active -> prompt_sent_at is recorded.
-    active = ProxyRunner.__new__(ProxyRunner)
-    active._pending_enter_at, active._pending_enter_fd, active.master_fd = 0.0, 7, 7
-    active.merge_ctx = {"prompt_sent_at": None}
+    active = make_runner(
+        _pending_enter_at=0.0,
+        _pending_enter_fd=7,
+        master_fd=7,
+        merge_ctx=MergeContext(source_branch="agit/s/t1", context="", phase=MergePhase.PENDING),
+    )
     active._flush_pending_enter()
-    assert active.merge_ctx["prompt_sent_at"] is not None
+    assert active.merge_ctx.prompt_sent_at is not None
+    assert active.merge_ctx.phase is MergePhase.RESOLVING  # PENDING promoted to RESOLVING
 
     # Switched away -> the active session's merge_ctx is NOT marked.
-    switched = ProxyRunner.__new__(ProxyRunner)
-    switched._pending_enter_at, switched._pending_enter_fd, switched.master_fd = 0.0, 7, 99
-    switched.merge_ctx = {"prompt_sent_at": None}
+    switched = make_runner(
+        _pending_enter_at=0.0,
+        _pending_enter_fd=7,
+        master_fd=99,
+        merge_ctx=MergeContext(source_branch="agit/s/t1", context="", phase=MergePhase.PENDING),
+    )
     switched._flush_pending_enter()
-    assert switched.merge_ctx["prompt_sent_at"] is None
+    assert switched.merge_ctx.prompt_sent_at is None
+    assert switched.merge_ctx.phase is MergePhase.PENDING  # not promoted (Enter went to different fd)
 
 
 # --- session name uniqueness + per-backend resume ---
@@ -2058,9 +2145,9 @@ def test_switch_backend_resumes_stored_session(monkeypatch):
 def _resume_runner():
     import types
 
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.name = "session-1"
-    runner.active_index = 0
+    runner = make_runner(
+        name="session-1",
+    )
     s0 = types.SimpleNamespace(name="session-1", state=types.SimpleNamespace(backend_session_id="live-1"))
     runner.sessions = [s0]
     runner._switch_active = lambda i: runner.__dict__.setdefault("_switched", []).append(i)
@@ -2102,11 +2189,12 @@ def test_resume_switches_to_already_live_conversation():
 def _base_drift_runner(current_branch):
     import types
 
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner._base_branch = "dev"
-    runner._integration_paused = False
-    runner._base_drift_check_at = 0.0
-    runner.base_repo = types.SimpleNamespace(current_branch=lambda: current_branch)
+    runner = make_runner(
+        _base_branch="dev",
+        _integration_paused=False,
+        _base_drift_check_at=0.0,
+        base_repo=types.SimpleNamespace(current_branch=lambda: current_branch),
+    )
     runner._debug = lambda *a, **k: None
     runner.messages = []
     runner._set_message = lambda m, **k: runner.messages.append(m)
@@ -2131,22 +2219,28 @@ def test_base_branch_drift_pauses_then_resumes():
 def test_integrate_turn_skips_while_paused():
     import types
 
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.worktree = types.SimpleNamespace()
-    runner._base_branch = "dev"
-    runner.merge_ctx = None
-    runner._integration_paused = True
+    runner = make_runner(
+        worktree=types.SimpleNamespace(),
+        _base_branch="dev",
+        merge_ctx=None,
+        _integration_paused=True,
+    )
     assert runner._integrate_turn_or_conflict() == "skip"
 
 
 def test_advance_base_refuses_when_base_switched_out_of_band():
     import types
 
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner._base_branch = "dev"
+    runner = make_runner(
+        _base_branch="dev",
+        base_repo=types.SimpleNamespace(
+            current_branch=lambda: "feature-x",
+            merge_ff_only=lambda ref: merged.append(ref),
+        ),
+    )
     merged = []
     runner.base_repo = types.SimpleNamespace(
-        current_branch=lambda: "feature-x",            # drifted off the base branch
+        current_branch=lambda: "feature-x",
         merge_ff_only=lambda ref: merged.append(ref),
     )
     with pytest.raises(RuntimeError):
@@ -2157,24 +2251,26 @@ def test_advance_base_refuses_when_base_switched_out_of_band():
 def _exit_removal_runner(*, log_range_result="", rev_parse_raises=False):
     import types
 
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner._base_branch = "dev"
-    runner.merge_ctx = None
-    runner._primary_worktree_name = None
-    runner.worktree = types.SimpleNamespace(name="session-1")
-    runner.repo = types.SimpleNamespace(
-        current_branch=lambda: "agit/claude/session-1/t1",
-        merge_in_progress=lambda: False,
-        has_changes=lambda: False,
-    )
-
     def _rev_parse(ref):
         if rev_parse_raises:
             raise RuntimeError("unknown revision")
         return "abc123"
 
-    runner.base_repo = types.SimpleNamespace(rev_parse=_rev_parse,
-                                             log_range=lambda base, head: log_range_result)
+    runner = make_runner(
+        _base_branch="dev",
+        merge_ctx=None,
+        _primary_worktree_name=None,
+        worktree=types.SimpleNamespace(name="session-1"),
+        repo=types.SimpleNamespace(
+            current_branch=lambda: "agit/claude/session-1/t1",
+            merge_in_progress=lambda: False,
+            has_changes=lambda: False,
+        ),
+    )
+    runner.base_repo = types.SimpleNamespace(
+        rev_parse=_rev_parse,
+        log_range=lambda base, head: log_range_result,
+    )
     runner.removed = []
     runner._worktrees = lambda: types.SimpleNamespace(remove=lambda name: runner.removed.append(name))
     runner._remember_session_for_backend = lambda: None
@@ -2232,10 +2328,9 @@ def test_exit_does_not_persist_resume_pointer_for_background_session():
     assert persisted == []
 
 
-def _bg_confirm_runner(statuses, active_index=0):
-    runner = ProxyRunner.__new__(ProxyRunner)
+def _bg_confirm_runner(statuses):
+    runner = make_runner()
     runner.sessions = [object()] * len(statuses)
-    runner.active_index = active_index
     runner._session_status = lambda i: statuses[i]
     runner._session_name = lambda i: f"session-{i}"
     return runner
@@ -2269,10 +2364,10 @@ def test_confirm_terminate_background_sessions_prompts_and_names_them():
 
 
 def test_sync_idle_worktrees_skipped_while_paused():
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner._integration_paused = True
+    runner = make_runner(
+        _integration_paused=True,
+    )
     runner.sessions = ["would-explode-if-iterated"]  # not a real session; must not be touched
-    runner.active_index = 0
     runner._sync_idle_worktrees_to_base()  # returns early; no AttributeError
 
 
@@ -2288,7 +2383,7 @@ def test_cleanup_stale_state_removes_orphaned_worktree_dirs(tmp_path):
     (orphan / ".agit").mkdir(parents=True)         # only .agit/ → not a valid worktree
     (root / "stray-file").write_text("x")           # a file, not a dir → ignored
 
-    runner = ProxyRunner.__new__(ProxyRunner)
+    runner = make_runner()
     runner._debug = lambda *a, **k: None
     prunes = []
     runner.base_repo = types.SimpleNamespace(worktree_prune=lambda: prunes.append(1))
@@ -2307,7 +2402,7 @@ def test_cleanup_stale_state_removes_orphaned_worktree_dirs(tmp_path):
 
 
 def test_is_valid_worktree_rejects_leftover_without_git(tmp_path):
-    runner = ProxyRunner.__new__(ProxyRunner)
+    runner = make_runner()
     leftover = tmp_path / "session-1"
     (leftover / ".agit").mkdir(parents=True)  # only .agit/, no .git → invalid
     assert runner._is_valid_worktree(leftover) is False
@@ -2316,9 +2411,8 @@ def test_is_valid_worktree_rejects_leftover_without_git(tmp_path):
 def test_open_session_worktree_recreates_corrupted_leftover(tmp_path):
     import types
 
-    runner = ProxyRunner.__new__(ProxyRunner)
+    runner = make_runner(_base_branch="dev")
     runner._debug = lambda *a, **k: None
-    runner._base_branch = "dev"
     leftover = tmp_path / "session-1"
     (leftover / ".agit").mkdir(parents=True)  # corrupted leftover
     created = {}
@@ -2331,7 +2425,7 @@ def test_open_session_worktree_recreates_corrupted_leftover(tmp_path):
     runner.worktree_manager = types.SimpleNamespace(
         worktree_path=lambda name: tmp_path / name, create=_create)
     runner._worktrees = lambda: runner.worktree_manager
-    import agit.proxy as proxymod
+    import agit.proxy.runner as proxymod
     orig = proxymod.GitRepo
     proxymod.GitRepo = lambda path: types.SimpleNamespace(current_branch=lambda: "")
     try:
@@ -2346,9 +2440,10 @@ def test_open_session_worktree_recreates_corrupted_leftover(tmp_path):
 def test_diag_path_uses_base_repo(tmp_path):
     import types
 
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.base_repo = types.SimpleNamespace(repo=tmp_path / "base")
-    runner.repo = types.SimpleNamespace(repo=tmp_path / "base" / ".agit" / "worktrees" / "session-1")
+    runner = make_runner(
+        base_repo=types.SimpleNamespace(repo=tmp_path / "base"),
+        repo=types.SimpleNamespace(repo=tmp_path / "base" / ".agit" / "worktrees" / "session-1"),
+    )
     runner._diag_run = "20260101-000000"
     path = runner._diag_path("proxy-raw")
     # Lands in the *base* .agit/, not the ephemeral worktree's.
@@ -2360,11 +2455,12 @@ def test_diag_path_uses_base_repo(tmp_path):
 def _drift_runner(recorded_cwd, worktree_path):
     import types
 
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.worktree = types.SimpleNamespace(name="session-1")
-    runner.repo = types.SimpleNamespace(repo=worktree_path)
-    runner.state = types.SimpleNamespace(backend_session_id="sess-1")
-    runner.backend = types.SimpleNamespace(recorded_working_dir=lambda sid: recorded_cwd)
+    runner = make_runner(
+        worktree=types.SimpleNamespace(name="session-1"),
+        repo=types.SimpleNamespace(repo=worktree_path),
+        state=types.SimpleNamespace(backend_session_id="sess-1"),
+        backend=types.SimpleNamespace(recorded_working_dir=lambda sid: recorded_cwd),
+    )
     runner._debug = lambda *a, **k: None
     runner._cwd_check_at = 0.0
     runner.messages = []
@@ -2406,11 +2502,12 @@ def test_confine_to_worktree_wraps_when_enabled(monkeypatch):
 
     monkeypatch.setattr(sandbox, "is_available", lambda: True)
     monkeypatch.delenv("AGIT_SANDBOX", raising=False)
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.worktree = types.SimpleNamespace(name="session-1")
+    runner = make_runner(
+        worktree=types.SimpleNamespace(name="session-1"),
+        repo=types.SimpleNamespace(repo="/repo/.agit/worktrees/session-1"),
+    )
     runner.global_config = types.SimpleNamespace(sandbox=True)
     runner.base_repo = types.SimpleNamespace(repo="/repo")
-    runner.repo = types.SimpleNamespace(repo="/repo/.agit/worktrees/session-1")
 
     wrapped = runner._confine_to_worktree(["claude"])
 
@@ -2422,15 +2519,16 @@ def test_confine_to_worktree_noop_without_worktree_or_when_disabled(monkeypatch)
     from agit import sandbox
 
     monkeypatch.setattr(sandbox, "is_available", lambda: True)
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.worktree = None  # no worktree (legacy): nothing to confine
+    runner = make_runner(worktree=None)
     runner.global_config = types.SimpleNamespace(sandbox=True)
     assert runner._confine_to_worktree(["claude"]) == ["claude"]
 
-    runner.worktree = types.SimpleNamespace(name="session-1")
+    runner = make_runner(
+        worktree=types.SimpleNamespace(name="session-1"),
+        repo=types.SimpleNamespace(repo="/repo/.agit/worktrees/session-1"),
+    )
     runner.global_config = types.SimpleNamespace(sandbox=False)  # user opted out
     runner.base_repo = types.SimpleNamespace(repo="/repo")
-    runner.repo = types.SimpleNamespace(repo="/repo/.agit/worktrees/session-1")
     assert runner._confine_to_worktree(["claude"]) == ["claude"]
 
 
@@ -2439,10 +2537,11 @@ def test_confine_to_worktree_noop_without_worktree_or_when_disabled(monkeypatch)
 def test_adopt_latest_backend_session_repoints_after_native_switch():
     import types
 
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.repo = types.SimpleNamespace(repo="/wt")
-    runner.backend = types.SimpleNamespace(latest_session_id=lambda repo: "switched-id")
-    runner.state = types.SimpleNamespace(backend_session_id="pinned-id", last_backend_message_id="m9")
+    runner = make_runner(
+        repo=types.SimpleNamespace(repo="/wt"),
+        backend=types.SimpleNamespace(latest_session_id=lambda repo: "switched-id"),
+        state=types.SimpleNamespace(backend_session_id="pinned-id", last_backend_message_id="m9"),
+    )
     runner._debug = lambda *a, **k: None
 
     runner._adopt_latest_backend_session()
@@ -2455,10 +2554,11 @@ def test_adopt_latest_backend_session_repoints_after_native_switch():
 def test_adopt_latest_backend_session_keeps_id_when_unchanged():
     import types
 
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.repo = types.SimpleNamespace(repo="/wt")
-    runner.backend = types.SimpleNamespace(latest_session_id=lambda repo: "same")
-    runner.state = types.SimpleNamespace(backend_session_id="same", last_backend_message_id="m1")
+    runner = make_runner(
+        repo=types.SimpleNamespace(repo="/wt"),
+        backend=types.SimpleNamespace(latest_session_id=lambda repo: "same"),
+        state=types.SimpleNamespace(backend_session_id="same", last_backend_message_id="m1"),
+    )
     runner._debug = lambda *a, **k: None
 
     runner._adopt_latest_backend_session()
@@ -2470,17 +2570,19 @@ def test_adopt_latest_backend_session_keeps_id_when_unchanged():
 def test_recover_nonempty_session_returns_latest_with_content(tmp_path):
     import types
 
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.state = AgitState(tmp_path)
-    runner.state.backend_session_id = "empty-id"
-    runner.repo = types.SimpleNamespace(repo="/wt")
+    state = AgitState(tmp_path)
+    state.backend_session_id = "empty-id"
+    real = ExportedSession("real-id", "claude-opus-4-8", None, [SessionTurn("u", "a", "p", "r", TokenUsage(), None)])
+    runner = make_runner(
+        state=state,
+        repo=types.SimpleNamespace(repo="/wt"),
+        backend=types.SimpleNamespace(
+            latest_session_id=lambda repo: "real-id",
+            export_session=lambda repo, sid: real if sid == "real-id" else ExportedSession(sid, None, None, []),
+        ),
+    )
     runner._debug = lambda *a, **k: None
     runner._stage_backend_resume = lambda sid: None
-    real = ExportedSession("real-id", "claude-opus-4-8", None, [SessionTurn("u", "a", "p", "r", TokenUsage(), None)])
-    runner.backend = types.SimpleNamespace(
-        latest_session_id=lambda repo: "real-id",
-        export_session=lambda repo, sid: real if sid == "real-id" else ExportedSession(sid, None, None, []),
-    )
 
     assert runner._recover_nonempty_session() == ("real-id", real)
 
@@ -2488,29 +2590,31 @@ def test_recover_nonempty_session_returns_latest_with_content(tmp_path):
 def test_recover_nonempty_session_none_when_latest_also_empty(tmp_path):
     import types
 
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.state = AgitState(tmp_path)
-    runner.state.backend_session_id = "empty-id"
-    runner.repo = types.SimpleNamespace(repo="/wt")
+    state = AgitState(tmp_path)
+    state.backend_session_id = "empty-id"
+    runner = make_runner(
+        state=state,
+        repo=types.SimpleNamespace(repo="/wt"),
+        backend=types.SimpleNamespace(
+            latest_session_id=lambda repo: "other-empty",
+            export_session=lambda repo, sid: ExportedSession(sid, None, None, []),
+        ),
+    )
     runner._debug = lambda *a, **k: None
     runner._stage_backend_resume = lambda sid: None
-    runner.backend = types.SimpleNamespace(
-        latest_session_id=lambda repo: "other-empty",
-        export_session=lambda repo, sid: ExportedSession(sid, None, None, []),
-    )
 
     assert runner._recover_nonempty_session() is None
 
 
 def test_relaunch_backend_resumes_then_gives_up_on_crash_loop(monkeypatch):
-    runner = ProxyRunner.__new__(ProxyRunner)
+    runner = make_runner()
     runner._debug = lambda *a, **k: None
     calls = []
     runner._restart_agent = lambda msg: calls.append("relaunch")
     runner._finalize_on_backend_exit = lambda: calls.append("finalize")
 
     t = [1000.0]
-    monkeypatch.setattr("agit.proxy.time.monotonic", lambda: t[0])
+    monkeypatch.setattr("agit.proxy.runner.time.monotonic", lambda: t[0])
 
     # Backend keeps dying quickly: first 3 relaunch, the 4th gives up and exits.
     assert runner._relaunch_backend_or_exit() is True
@@ -2522,14 +2626,14 @@ def test_relaunch_backend_resumes_then_gives_up_on_crash_loop(monkeypatch):
 
 
 def test_relaunch_backend_resets_loop_guard_after_quiet_period(monkeypatch):
-    runner = ProxyRunner.__new__(ProxyRunner)
+    runner = make_runner()
     runner._debug = lambda *a, **k: None
     relaunches = []
     runner._restart_agent = lambda msg: relaunches.append(1)
     runner._finalize_on_backend_exit = lambda: relaunches.append("finalize")
 
     t = [1000.0]
-    monkeypatch.setattr("agit.proxy.time.monotonic", lambda: t[0])
+    monkeypatch.setattr("agit.proxy.runner.time.monotonic", lambda: t[0])
     for _ in range(3):
         runner._relaunch_backend_or_exit()
     t[0] += 60.0  # a minute later the old exits no longer count
@@ -2538,8 +2642,7 @@ def test_relaunch_backend_resets_loop_guard_after_quiet_period(monkeypatch):
 
 
 def test_finalize_on_backend_exit_finalizes_once_and_clears_pid():
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.child_pid = 4321
+    runner = make_runner(child_pid=4321)
     calls = []
 
     def fake_finalize():  # mirror the real guard inside _finalize_pending_work
@@ -2566,15 +2669,15 @@ def test_resumable_sessions_come_from_backend_repo_record():
     refs = [SessionRef(id="a", updated=1.0, label="old"),
             SessionRef(id="b", updated=3.0, label="new"),
             SessionRef(id="c", updated=2.0, label="mid")]
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.base_repo = types.SimpleNamespace(repo="/repo-root")
-    asked = {}
-
     def _list(repo):
         asked["repo"] = repo
         return list(refs)
 
-    runner.backend = types.SimpleNamespace(list_sessions=_list)
+    runner = make_runner(
+        base_repo=types.SimpleNamespace(repo="/repo-root"),
+        backend=types.SimpleNamespace(list_sessions=_list),
+    )
+    asked = {}
 
     result = runner._resumable_sessions()
 
@@ -2586,7 +2689,7 @@ def test_resumable_sessions_come_from_backend_repo_record():
 def _startup_runner():
     import types
 
-    runner = ProxyRunner.__new__(ProxyRunner)
+    runner = make_runner()
     runner._prompt_startup_name = lambda continuing: "prompted-name"
     runner.root = types.SimpleNamespace(
         _names={},
@@ -2624,10 +2727,10 @@ def test_startup_name_prompts_when_unnamed_and_records_it():
 def test_sync_idle_worktrees_aligns_idle_skips_in_flight():
     import types
 
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.active_index = 0
-    runner.repo = "repoA"
-    runner.agent_in_flight = False  # active session is idle
+    runner = make_runner(
+        repo="repoA",
+        agent_in_flight=False,
+    )
     busy = types.SimpleNamespace(repo="repoB", agent_in_flight=True)   # working -> skip
     idle = types.SimpleNamespace(repo="repoC", agent_in_flight=False)  # idle -> sync
     runner.sessions = [types.SimpleNamespace(repo="repoA", agent_in_flight=False), busy, idle]
@@ -2652,12 +2755,13 @@ def _user_git_runner(tmp_path, answers):
     from agit.git import GitRepo
 
     repo = GitRepo.init(tmp_path)  # seeds an initial commit; user files stay untracked
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.base_repo = repo
-    runner.repo = repo
+    runner = make_runner(
+        repo=repo,
+        base_repo=repo,
+        _base_branch=repo.current_branch(),
+        _user_declined=[],
+    )
     runner.global_config = type("GC", (), {"default_backend": "claude"})()
-    runner._base_branch = repo.current_branch()
-    runner._user_declined = []
     runner.prompts = []  # (title, body) of each popup shown
     scripted = list(answers)
 
@@ -2773,23 +2877,23 @@ def _base_edit_runner(tmp_path, answers):
     base.worktree_add_detached(str(wt_path), base=base.current_branch())
     worktree = GitRepo(wt_path)
 
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.base_repo = base
-    runner.repo = worktree
-    runner.worktree = object()
-    runner._base_branch = base.current_branch()
-    runner._base_advanced = False
-    runner._base_edits_declined_status = None
-    runner._integration_paused = False
+    runner = make_runner(
+        base_repo=base,
+        repo=worktree,
+        worktree=object(),
+        _base_branch=base.current_branch(),
+        _base_advanced=False,
+        _base_edits_declined_status=None,
+        _integration_paused=False,
+        agent_in_flight=False,
+        agent_parse_thread=None,
+        state=AgitState(wt_path),
+        _user_declined=[],
+        message=None,
+        message_until=0.0,
+    )
     runner.sessions = [types.SimpleNamespace(repo=worktree, agent_in_flight=False)]
-    runner.active_index = 0
-    runner.agent_in_flight = False
-    runner.agent_parse_thread = None
-    runner.state = AgitState(wt_path)
     runner.global_config = type("GC", (), {"default_backend": "claude"})()
-    runner._user_declined = []
-    runner.message = None
-    runner.message_until = 0.0
     runner._set_message = lambda *a, **k: None
     runner._render = lambda: None
     runner._debug = lambda *a, **k: None
@@ -2855,19 +2959,20 @@ def test_base_user_new_file_counts_as_pending_unless_declined(tmp_path):
 
 
 def test_resume_pending_prompt_checks_base_user_edits(tmp_path):
-    runner = ProxyRunner.__new__(ProxyRunner)
     read_fd, write_fd = os.pipe()
     try:
-        runner.master_fd = write_fd
-        runner.pending_forwarded = [b"\r"]
-        runner.pending_prompt_text = "fix it"
-        runner.passthrough_prompt = bytearray(b"fix it")
-        runner.state = AgitState(tmp_path)
-        runner.agent_parse_thread = None
-        runner.agent_in_flight = False
-        runner.screen = None
-        runner.message = None
-        runner.message_until = 0.0
+        runner = make_runner(
+            master_fd=write_fd,
+            pending_forwarded=[b"\r"],
+            pending_prompt_text="fix it",
+            passthrough_prompt=bytearray(b"fix it"),
+            state=AgitState(tmp_path),
+            agent_parse_thread=None,
+            agent_in_flight=False,
+            screen=None,
+            message=None,
+            message_until=0.0,
+        )
         runner._finish_agent_parse_if_ready = lambda quiet: False
         runner.actions = types.SimpleNamespace(has_pre_agent_user_changes=lambda: False)
         runner._ensure_turn_branch = lambda: None
@@ -2889,11 +2994,12 @@ def test_agent_commit_failed_attempt_does_not_double_count_tokens(tmp_path):
     # the same turns. Token usage is cumulative state — it must only be added
     # once the commit actually happens, or the metadata overstates real usage
     # once per failed attempt.
-    runner = ProxyRunner.__new__(ProxyRunner)
-    repo = FakeCommitRepo()
-    runner.repo = repo
-    runner.state = AgitState(tmp_path)
-    runner.verbose = False
+    runner = make_runner(
+        repo=FakeCommitRepo(),
+        state=AgitState(tmp_path),
+        verbose=False,
+    )
+    repo = runner.repo
     runner._review_untracked_popup = lambda include_declined: "No untracked files to review."
 
     first_turn = SessionTurn("u1", "a1", "fix it", "done", TokenUsage(total=140, input=130, output=10), None)
@@ -2962,7 +3068,7 @@ def test_actions_agent_commit_failed_attempt_does_not_double_count(tmp_path):
 
 
 def test_parse_worker_delivers_to_its_own_session_after_switch(tmp_path):
-    from agit.session_runtime import capture_session
+    from agit.proxy.session import Session
 
     release = threading.Event()
     state_a = AgitState(tmp_path / "a")
@@ -2979,23 +3085,25 @@ def test_parse_worker_delivers_to_its_own_session_after_switch(tmp_path):
             release.wait(timeout=5)  # hold the worker mid-flight
             return exported
 
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.backend = Backend()
-    runner.repo = types.SimpleNamespace(repo="/wt-a")
-    runner.state = state_a
-    runner.worktree = object()
-    runner.agent_parse_thread = None
-    runner.agent_parse_result = None
-    runner.agent_parse_active = False
-    runner.agent_parse_lock = threading.Lock()
+    runner = make_runner(
+        backend=Backend(),
+        repo=types.SimpleNamespace(repo="/wt-a"),
+        state=state_a,
+        worktree=object(),
+        agent_parse_thread=None,
+        agent_parse_result=None,
+        agent_parse_active=False,
+        agent_parse_lock=threading.Lock(),
+    )
     runner._debug = lambda *a, **k: None
 
     assert runner._start_agent_parse() is True
 
     # The user switches sessions while the worker is still running: session A's
-    # runtime moves into a snapshot and session B's takes its place.
-    snapshot_a = capture_session(runner)
-    runner.sessions = [snapshot_a]
+    # runtime stays on its own Session object and session B's becomes active.
+    session_a = runner.active
+    runner.sessions = [session_a]
+    runner.active = Session.bare()
     runner.state = state_b
     runner.backend = types.SimpleNamespace(name="claude")
     runner.repo = types.SimpleNamespace(repo="/wt-b")
@@ -3005,14 +3113,14 @@ def test_parse_worker_delivers_to_its_own_session_after_switch(tmp_path):
     runner.agent_parse_lock = threading.Lock()
 
     release.set()
-    snapshot_a.agent_parse_thread.join(timeout=5)
+    session_a.agent_parse_thread.join(timeout=5)
 
-    # The result reached session A's snapshot, tagged with A's state — nothing
-    # leaked into the now-active session B.
-    assert snapshot_a.agent_parse_result is not None
-    assert snapshot_a.agent_parse_result[1] is exported
-    assert snapshot_a.agent_parse_result[3] is state_a
-    assert snapshot_a.agent_parse_active is False
+    # The result reached session A's own Session object, tagged with A's state
+    # — nothing leaked into the now-active session B.
+    assert session_a.agent_parse_result is not None
+    assert session_a.agent_parse_result[1] is exported
+    assert session_a.agent_parse_result[3] is state_a
+    assert session_a.agent_parse_active is False
     assert runner.agent_parse_result is None
     assert runner.agent_parse_active is False
 
@@ -3039,9 +3147,8 @@ def test_finish_agent_parse_discards_result_owned_by_another_session(tmp_path):
 
 
 def test_switch_active_joins_worker_before_swapping():
-    from agit.session_runtime import capture_session
+    from agit.proxy.session import Session
 
-    runner = ProxyRunner.__new__(ProxyRunner)
     events = []
 
     class FakeThread:
@@ -3051,11 +3158,12 @@ def test_switch_active_joins_worker_before_swapping():
         def join(self, timeout=None):
             events.append(("join", timeout))
 
-    runner.agent_parse_thread = FakeThread()
-    runner.agent_parse_lock = threading.Lock()
-    runner.sessions = [None, capture_session(ProxyRunner.__new__(ProxyRunner))]
-    runner.active_index = 0
-    runner.scroll_back = 3
+    runner = make_runner(
+        agent_parse_thread=FakeThread(),
+        agent_parse_lock=threading.Lock(),
+        scroll_back=3,
+    )
+    runner.sessions = [runner.active, Session.bare()]
     runner._set_message = lambda *a, **k: None
     runner._render = lambda: None
     runner._resize_child = lambda: None
@@ -3072,7 +3180,7 @@ def test_switch_active_joins_worker_before_swapping():
 
 
 def _popup_exit_runner():
-    runner = ProxyRunner.__new__(ProxyRunner)
+    runner = make_runner()
     runner.events = []
     runner._finalize_pending_work = lambda: runner.events.append("finalize")
     runner._exit_child = lambda: runner.events.append("exit")
@@ -3122,7 +3230,7 @@ def test_popup_exit_flow_double_ctrl_c_still_finalizes():
 
 
 def test_prompt_popup_ctrl_c_routes_through_exit_flow():
-    runner = ProxyRunner.__new__(ProxyRunner)
+    runner = make_runner()
     runner._set_message = lambda *a, **k: None
     runner._render = lambda: None
     runner._clear_message = lambda: None
@@ -3142,7 +3250,7 @@ def test_prompt_popup_ctrl_c_routes_through_exit_flow():
 
 
 def test_select_popup_ctrl_c_routes_through_exit_flow():
-    runner = ProxyRunner.__new__(ProxyRunner)
+    runner = make_runner()
     runner._set_message = lambda *a, **k: None
     runner._render = lambda: None
     runner._clear_message = lambda: None
@@ -3161,14 +3269,15 @@ def test_spawn_failed_exec_child_exits_with_127(tmp_path):
     # Issue #20: if execvp fails in the forked child (binary gone, PATH change,
     # worktree deleted), the child must die — not keep running aGiT's own
     # Python code from the fork point as a duplicate process.
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.state = AgitState(tmp_path)
-    runner.repo = types.SimpleNamespace(repo=tmp_path)
-    runner.worktree = None  # no confinement wrapping
-    runner.backend = types.SimpleNamespace(
-        new_session_id=lambda: "ses-1",
-        spawn_command=lambda repo, session_id, resume: ["agit-test-binary-that-does-not-exist"],
-        list_sessions=lambda repo: [],
+    runner = make_runner(
+        state=AgitState(tmp_path),
+        repo=types.SimpleNamespace(repo=tmp_path),
+        worktree=None,
+        backend=types.SimpleNamespace(
+            new_session_id=lambda: "ses-1",
+            spawn_command=lambda repo, session_id, resume: ["agit-test-binary-that-does-not-exist"],
+            list_sessions=lambda repo: [],
+        ),
     )
     runner._should_continue_session = lambda: False
 
@@ -3183,12 +3292,11 @@ def test_spawn_failed_exec_child_exits_with_127(tmp_path):
 
 
 def test_terminate_child_queues_pid_and_reaper_collects_it():
-    runner = ProxyRunner.__new__(ProxyRunner)
+    runner = make_runner(master_fd=None)
     pid = os.fork()
     if pid == 0:
         os._exit(0)  # the "backend" exits as soon as it is signalled
     runner.child_pid = pid
-    runner.master_fd = None
 
     runner._terminate_child()
 
@@ -3208,7 +3316,7 @@ def test_terminate_child_queues_pid_and_reaper_collects_it():
 def test_reaper_keeps_still_running_children():
     import signal as signal_mod
 
-    runner = ProxyRunner.__new__(ProxyRunner)
+    runner = make_runner()
     pid = os.fork()
     if pid == 0:
         time.sleep(30)
@@ -3226,14 +3334,15 @@ def test_reaper_keeps_still_running_children():
 
 
 def _popup_io_runner(monkeypatch, stdin_fd):
-    import agit.proxy as proxy_mod
+    import agit.proxy.runner as proxy_mod
 
-    runner = ProxyRunner.__new__(ProxyRunner)
+    runner = make_runner(
+        master_fd=None,
+        last_child_output=0.0,
+        last_child_output_sample=b"",
+    )
     monkeypatch.setattr(proxy_mod.sys, "stdin", types.SimpleNamespace(fileno=lambda: stdin_fd))
     runner.sessions = []
-    runner.master_fd = None
-    runner.last_child_output = 0.0
-    runner.last_child_output_sample = b""
     runner._answer_terminal_queries = lambda output: None
     runner._sync_terminal_modes = lambda output: None
     runner._track_sync_update = lambda output: None
@@ -3356,7 +3465,7 @@ def test_sync_tracked_session_skips_empty_newest_session(tmp_path):
 
 
 def test_exit_command_routes_through_unified_exit_flow(tmp_path):
-    runner = ProxyRunner.__new__(ProxyRunner)
+    runner = make_runner()
     events = []
     runner._confirm_exit = lambda: (events.append("confirm"), True)[1]
     runner._confirm_terminate_background_sessions = lambda: True
@@ -3372,7 +3481,7 @@ def test_double_ctrl_c_finalizes_before_exiting():
     # Issue #27: the second Ctrl-C lands inside the exit-confirmation popup; it
     # must exit immediately but still gracefully — finalize runs, nothing is
     # skipped. (The non-graceful path used to call _exit_child() directly.)
-    runner = ProxyRunner.__new__(ProxyRunner)
+    runner = make_runner()
     events = []
     runner._finalize_pending_work = lambda: events.append("finalize")
     runner._exit_child = lambda: events.append("exit")
@@ -3394,10 +3503,9 @@ def test_double_ctrl_c_finalizes_before_exiting():
 
 
 def test_sync_terminal_modes_mirrors_keyboard_protocol(monkeypatch):
-    import agit.proxy as proxy_mod
+    import agit.proxy.runner as proxy_mod
 
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.child_mouse = False
+    runner = make_runner(child_mouse=False)
     writes = []
     monkeypatch.setattr(proxy_mod.os, "write", lambda fd, data: writes.append(data))
 
@@ -3417,11 +3525,9 @@ def test_sync_terminal_modes_mirrors_keyboard_protocol(monkeypatch):
 def test_backend_exit_relaunches_and_resumes():
     # Claude exiting via Esc on its native session picker keeps the existing
     # recover-and-resume behavior.
-    runner = ProxyRunner.__new__(ProxyRunner)
+    runner = make_runner(child_pid=1234)
     events = []
     runner._debug = lambda *a, **k: None
-    runner._relaunch_times = []
-    runner.child_pid = 1234
     runner._finalize_on_backend_exit = lambda: events.append("finalize")
     runner._restart_agent = lambda message: events.append("relaunch")
 
@@ -3436,8 +3542,7 @@ def test_await_followup_skips_slash_commands(tmp_path):
     # /model, /compact etc. never appear as transcript turns (only as filtered
     # <command-name> rows). Awaiting one deferred every commit for the rest of
     # the session — the observed "agit stopped merging after I used /model".
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner._awaited_followups = []
+    runner = make_runner(_awaited_followups=[])
 
     runner._await_followup("/model")
     runner._await_followup("/compact some args")
@@ -3484,8 +3589,7 @@ def test_finish_agent_parse_interrupted_dangling_turn_still_commits(tmp_path):
 
 
 def _submit_runner(prompt=b""):
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.passthrough_prompt = bytearray(prompt)
+    runner = make_runner(passthrough_prompt=bytearray(prompt))
     return runner
 
 
@@ -3521,19 +3625,20 @@ def test_bracketed_paste_newlines_are_content_not_submits():
 
 
 def test_idle_clean_worktree_integrates_agent_made_commits():
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.worktree = object()
-    runner.merge_ctx = None
-    runner._integration_paused = False
-    runner._base_branch = "main"
-    runner.agent_in_flight = False
-    runner.agent_parse_thread = None
-    runner.last_child_output = 0.0
+    runner = make_runner(
+        worktree=object(),
+        merge_ctx=None,
+        _integration_paused=False,
+        _base_branch="main",
+        agent_in_flight=False,
+        agent_parse_thread=None,
+        last_child_output=0.0,
+        repo=types.SimpleNamespace(current_branch=lambda: "agit/claude/s1/t1"),
+    )
     runner.CHILD_IDLE_SECONDS = 4.0
     runner.BASE_POLL_SECONDS = 3.0
     runner._idle_integrate_at = 0.0
     runner._debug = lambda *a, **k: None
-    runner.repo = types.SimpleNamespace(current_branch=lambda: "agit/claude/s1/t1")
     runner.base_repo = types.SimpleNamespace(log_range=lambda base, head: "abc123 manual agent commit")
     integrations = []
     runner._integrate_session_turn = lambda: integrations.append(1)
@@ -3547,17 +3652,18 @@ def test_idle_clean_worktree_integrates_agent_made_commits():
 
 
 def test_idle_integration_skips_active_agent_and_clean_branches():
-    runner = ProxyRunner.__new__(ProxyRunner)
-    runner.worktree = object()
-    runner.merge_ctx = None
-    runner._integration_paused = False
-    runner._base_branch = "main"
-    runner.agent_parse_thread = None
-    runner.last_child_output = 0.0
+    runner = make_runner(
+        worktree=object(),
+        merge_ctx=None,
+        _integration_paused=False,
+        _base_branch="main",
+        agent_parse_thread=None,
+        last_child_output=0.0,
+        repo=types.SimpleNamespace(current_branch=lambda: "agit/claude/s1/t1"),
+    )
     runner.CHILD_IDLE_SECONDS = 4.0
     runner.BASE_POLL_SECONDS = 3.0
     runner._debug = lambda *a, **k: None
-    runner.repo = types.SimpleNamespace(current_branch=lambda: "agit/claude/s1/t1")
     integrations = []
     runner._integrate_session_turn = lambda: integrations.append(1)
 
@@ -3576,6 +3682,241 @@ def test_idle_integration_skips_active_agent_and_clean_branches():
     assert integrations == []
 
 
+# ---------------------------------------------------------------------------
+# ScreenRenderer unit tests (P1 extraction; constructed directly, no
+# ProxyRunner.__new__)
+# ---------------------------------------------------------------------------
+
+from agit.proxy.renderer import ScreenRenderer, _BackgroundColorEraseScreen, detect_color_mode
+
+
+def _make_renderer(rows=24, cols=80, color_mode="truecolor"):
+    """Create a fresh ScreenRenderer with an initialized pyte screen."""
+    r = ScreenRenderer(rows, cols, color_mode=color_mode)
+    r.init_screen(rows, cols)
+    return r
+
+
+def test_screen_renderer_init_screen_creates_screen():
+    r = _make_renderer(10, 40)
+    assert r.screen is not None
+    assert r.stream is not None
+    assert r.scroll_back == 0
+    assert r._in_sync_update is False
+
+
+def test_screen_renderer_cell_sgr_bold_red():
+    r = ScreenRenderer(24, 80, color_mode="truecolor")
+    import pyte.screens
+    cell = pyte.screens.Char("X", fg="red", bg="default", bold=True,
+                              italics=False, underscore=False,
+                              strikethrough=False, reverse=False, blink=False)
+    result = r.cell_sgr(cell)
+    assert "1" in result.split(";")   # bold
+    assert "31" in result.split(";")  # fg red
+
+
+def test_screen_renderer_color_code_named():
+    r = ScreenRenderer(24, 80, color_mode="truecolor")
+    assert r.color_code("red", foreground=True) == "31"
+    assert r.color_code("blue", foreground=False) == "44"
+    assert r.color_code("default", foreground=True) is None
+
+
+def test_screen_renderer_hex_color_code_truecolor():
+    r = ScreenRenderer(24, 80, color_mode="truecolor")
+    result = r.hex_color_code("ff0000", foreground=True)
+    assert result == "38;2;255;0;0"
+
+
+def test_screen_renderer_hex_color_code_256():
+    r = ScreenRenderer(24, 80, color_mode="256")
+    result = r.hex_color_code("ff0000", foreground=True)
+    assert result.startswith("38;5;")
+
+
+def test_screen_renderer_visible_lines_live():
+    r = _make_renderer(5, 20)
+    r.stream.feed(b"Hello\r\n")
+    lines = r.visible_lines(5)
+    assert len(lines) == 4  # rows-1 = 4
+
+
+def test_screen_renderer_visible_lines_scroll_back():
+    r = _make_renderer(5, 10)
+    # Write enough to fill history
+    for i in range(20):
+        r.stream.feed(f"line{i:02d}\r\n".encode())
+    # History should have some lines
+    assert r.history_len() > 0
+    r.scroll_back = 2
+    lines = r.visible_lines(5)
+    # Must still return rows-1 lines
+    assert len(lines) == 4
+
+
+def test_screen_renderer_selection_ranges_empty():
+    r = _make_renderer()
+    assert r.selection_ranges(80) == {}
+
+
+def test_screen_renderer_selection_ranges_span():
+    r = _make_renderer()
+    r.sel_active = True
+    r.sel_anchor = (0, 2)
+    r.sel_point = (1, 5)
+    ranges = r.selection_ranges(80)
+    assert 0 in ranges
+    assert 1 in ranges
+    assert ranges[0] == (2, 79)  # start=2, end=cols-1 on first row
+    assert ranges[1] == (0, 5)   # start=0, end=5 on last row
+
+
+def test_screen_renderer_render_line_empty_cells():
+    r = ScreenRenderer(24, 10, color_mode="truecolor")
+    line = r.render_line({}, cols=10)
+    # Empty cells render as 10 spaces with no styling left active.
+    import re
+    plain = re.sub(r"\x1b\[[^m]*m", "", line)
+    assert plain == " " * 10
+
+
+def test_screen_renderer_track_sync_update_sets_flag():
+    r = _make_renderer()
+    assert r._in_sync_update is False
+    r.track_sync_update(b"\x1b[?2026h")
+    assert r._in_sync_update is True
+    r.track_sync_update(b"\x1b[?2026l")
+    assert r._in_sync_update is False
+
+
+def test_screen_renderer_sync_hold_bounded():
+    import time
+    r = _make_renderer()
+    r._in_sync_update = True
+    r._sync_since = time.monotonic()
+    assert r.sync_hold(time.monotonic(), 0.05) is True
+    # With a very old sync_since it should release
+    r._sync_since = time.monotonic() - 1.0
+    assert r.sync_hold(time.monotonic(), 0.05) is False
+
+
+def test_screen_renderer_cursor_sequence_hidden_when_scrolled():
+    r = _make_renderer(10, 40)
+    r.scroll_back = 3
+    result = r.cursor_sequence(10, 40, 3)
+    assert result == "\x1b[?25l"
+
+
+def test_screen_renderer_cursor_sequence_visible_when_live():
+    r = _make_renderer(10, 40)
+    result = r.cursor_sequence(10, 40, 0)
+    assert "\x1b[?25h" in result
+
+
+def test_screen_renderer_history_len():
+    r = _make_renderer(5, 10)
+    assert r.history_len() == 0
+    for i in range(20):
+        r.stream.feed(f"l{i}\r\n".encode())
+    assert r.history_len() > 0
+
+
+def test_screen_renderer_scroll_changes_scroll_back():
+    r = _make_renderer(5, 10)
+    for i in range(20):
+        r.stream.feed(f"l{i}\r\n".encode())
+    rendered = []
+    r.scroll(3, lambda: rendered.append(1))
+    assert r.scroll_back == 3
+    assert rendered == [1]
+
+
+def test_screen_renderer_scroll_clamps_at_zero():
+    r = _make_renderer(5, 10)
+    r.scroll_back = 2
+    r.stream.feed(b"hello\r\n" * 20)
+    rendered = []
+    r.scroll(-100, lambda: rendered.append(1))
+    assert r.scroll_back == 0
+
+
+def test_screen_renderer_status_line_basic():
+    r = ScreenRenderer(5, 40, color_mode="truecolor")
+    line = r.status_line(
+        cols=40,
+        name="main",
+        backend_name="claude",
+        session_id=None,
+        base_branch=None,
+        worktree=None,
+        scroll_back=0,
+        user_declined=[],
+        short_session_fn=lambda s: "(none)",
+    )
+    assert "aGiT" in line
+    assert "claude" in line
+
+
+def test_screen_renderer_status_line_scrollback():
+    r = ScreenRenderer(5, 60, color_mode="truecolor")
+    line = r.status_line(
+        cols=60,
+        name="s",
+        backend_name="claude",
+        session_id=None,
+        base_branch=None,
+        worktree=None,
+        scroll_back=5,
+        user_declined=[],
+        short_session_fn=lambda s: "(none)",
+    )
+    assert "SCROLLBACK" in line
+
+
+def test_screen_renderer_append_box():
+    r = ScreenRenderer(20, 60, color_mode="truecolor")
+    parts = []
+    r.append_box(parts, 2, 2, 20, ["Line one", "Line two"], rows=20)
+    combined = "".join(parts)
+    assert "Line one" in combined
+    assert "│" in combined  # │ border char
+
+
+def test_screen_renderer_feed_strips_hostile_csi():
+    import re
+    r = _make_renderer(5, 20)
+    hostile = re.compile(rb"\x1b\[[<>=][0-9;:]*[ -/]*[@-~]")
+    # Should not raise even with hostile CSI
+    r.feed(b"\x1b[>4mHello\x1b[>4m", pyte_hostile_csi_re=hostile)
+    lines = r.visible_lines(5)
+    # 'Hello' was written; check it survived
+    row0 = lines[0]
+    chars = [row0.get(c) for c in range(5)]
+    text = "".join((c.data if c else " ") for c in chars)
+    assert text == "Hello"
+
+
+def test_duck_type_aliases_cover_extracted_classes():
+    # ScreenRenderer and TerminalHost methods run with `self` being a
+    # ProxyRunner via unbound delegation. A `self.foo()` inside those classes
+    # therefore resolves on ProxyRunner, not on the class — so every method
+    # name the classes SELF-CALL must exist on ProxyRunner too. A missing
+    # alias crashes at runtime in paths the suite does not exercise (e.g.
+    # run() startup), so pin the contract here.
+    import inspect
+    import re as _re
+
+    from agit.proxy.renderer import ScreenRenderer
+    from agit.proxy.terminal import TerminalHost
+
+    for cls in (ScreenRenderer, TerminalHost):
+        own_methods = {n for n, _ in inspect.getmembers(cls, inspect.isfunction)}
+        self_calls = set(_re.findall(r"self\.([a-zA-Z_][a-zA-Z0-9_]*)\(", inspect.getsource(cls)))
+        for name in sorted(self_calls & own_methods):
+            assert hasattr(ProxyRunner, name), (
+                f"ProxyRunner is missing alias {name!r}, self-called inside {cls.__name__}"
+            )
 def test_configured_menu_key_opens_command_capture():
     # menu_key in ~/.agit/config.json rebinds the aGiT menu (default Ctrl-G).
     parser = ProxyInput(menu_key=b"\x10")  # ctrl-p
@@ -3588,3 +3929,28 @@ def test_configured_menu_key_opens_command_capture():
     forwarded, _echo, command, _exit = parser.feed(b"\x07")
     assert forwarded == [b"\x07"]
     assert command is None
+
+def test_real_init_defines_all_lifecycle_flags(tmp_path):
+    # P7 removed the getattr() guards on these flags; for_testing() seeds them
+    # too, which would mask a missing __init__ initialization from the whole
+    # suite. Build a runner through the REAL __init__ (with injected stubs) and
+    # require every flag to exist, so a future sweep cannot ship a runner that
+    # crashes on its first reactor tick while the tests stay green.
+    import subprocess as sp
+
+    sp.run(["git", "init", "-q", str(tmp_path)], check=True)
+    sp.run(["git", "-C", str(tmp_path), "commit", "-q", "--allow-empty", "-m", "init"], check=True)
+    from agit.git import GitRepo
+
+    runner = ProxyRunner(GitRepo(tmp_path))
+    for flag in (
+        "_monitor_base_edits",
+        "_base_check_at",
+        "_cwd_drift_checked",
+        "_cwd_check_at",
+        "_relaunch_times",
+        "_exiting",
+        "_finalized_on_exit",
+    ):
+        assert flag in runner.__dict__ or hasattr(type(runner), flag), flag
+        getattr(runner, flag)  # must not raise
