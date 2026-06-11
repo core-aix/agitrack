@@ -1454,7 +1454,13 @@ def test_proxy_status_check_runs_after_file_event_only():
     assert runner.repo.calls == 1
 
 
-def test_proxy_parse_starts_only_after_cooldown_between_file_events():
+def test_proxy_parse_starts_only_after_cooldown_between_file_events(monkeypatch):
+    # Pin the clock: the cooldown is measured as now - last_parse_finish, and
+    # last_parse_finish starts at 0.0. With the real monotonic clock this test
+    # only passes when uptime exceeds the 60s cooldown (true on a dev box, false
+    # on a freshly-booted CI runner) — so drive a fixed clock instead.
+    clock = [10_000.0]
+    monkeypatch.setattr("agit.proxy.runner.time.monotonic", lambda: clock[0])
     runner = make_runner(
         file_change_event=threading.Event(),
         status_check_pending=False,
@@ -1485,8 +1491,8 @@ def test_proxy_parse_starts_only_after_cooldown_between_file_events():
     runner.repo = Repo()
 
     def start_parse():
-        runner.last_parse_start = time.monotonic()
-        runner.last_parse_finish = time.monotonic()
+        runner.last_parse_start = clock[0]
+        runner.last_parse_finish = clock[0]  # use the pinned clock, not real time
         starts.append(True)
         return True
 
