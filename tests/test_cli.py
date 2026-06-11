@@ -191,6 +191,13 @@ def test_json_backends_append_backend_args():
 
 def test_help_shows_combined_help(monkeypatch, capsys):
     monkeypatch.setattr(cli, "_discover_or_init", lambda p: object())
+    monkeypatch.setattr(cli.shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
+
+    class FakeResult:
+        stdout = "opencode help output"
+        stderr = ""
+
+    monkeypatch.setattr(cli.subprocess, "run", lambda *args, **kwargs: FakeResult())
 
     class Config:
         def has_default_backend(self):
@@ -207,10 +214,18 @@ def test_help_shows_combined_help(monkeypatch, capsys):
     assert "Interactive agent + git commit orchestration" in out
     assert "--backend" in out
     assert "Backend help (opencode)" in out
+    assert "opencode help output" in out
 
 
 def test_help_short_flag(monkeypatch, capsys):
     monkeypatch.setattr(cli, "_discover_or_init", lambda p: object())
+    monkeypatch.setattr(cli.shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
+
+    class FakeResult:
+        stdout = "claude help output"
+        stderr = ""
+
+    monkeypatch.setattr(cli.subprocess, "run", lambda *args, **kwargs: FakeResult())
 
     class Config:
         def has_default_backend(self):
@@ -225,10 +240,18 @@ def test_help_short_flag(monkeypatch, capsys):
 
     out = capsys.readouterr().out
     assert "Backend help (claude)" in out
+    assert "claude help output" in out
 
 
 def test_help_with_explicit_backend(monkeypatch, capsys):
     monkeypatch.setattr(cli, "_discover_or_init", lambda p: object())
+    monkeypatch.setattr(cli.shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
+
+    class FakeResult:
+        stdout = "opencode help output"
+        stderr = ""
+
+    monkeypatch.setattr(cli.subprocess, "run", lambda *args, **kwargs: FakeResult())
 
     class Config:
         def has_default_backend(self):
@@ -243,6 +266,7 @@ def test_help_with_explicit_backend(monkeypatch, capsys):
 
     out = capsys.readouterr().out
     assert "Backend help (opencode)" in out
+    assert "opencode help output" in out
 
 
 def test_help_no_backend_selected(monkeypatch, capsys):
@@ -268,6 +292,7 @@ def test_backend_help_via_double_dash_runs_directly(monkeypatch):
     monkeypatch.setattr(
         cli, "_discover_or_init", lambda p: (_ for _ in ()).throw(AssertionError("TUI should not launch"))
     )
+    monkeypatch.setattr(cli.shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
 
     class Config:
         def has_default_backend(self):
@@ -297,6 +322,7 @@ def test_backend_help_runs_directly_without_tui(monkeypatch):
     monkeypatch.setattr(
         cli, "_discover_or_init", lambda p: (_ for _ in ()).throw(AssertionError("TUI should not launch"))
     )
+    monkeypatch.setattr(cli.shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
 
     class Config:
         def has_default_backend(self):
