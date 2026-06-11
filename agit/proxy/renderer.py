@@ -12,6 +12,7 @@ import os
 import sys
 import textwrap
 import time
+from typing import Protocol
 
 import pyte
 
@@ -143,6 +144,77 @@ class _BackgroundColorEraseScreen(pyte.HistoryScreen):
 
 
 # ---------------------------------------------------------------------------
+# RendererHost protocol
+# ---------------------------------------------------------------------------
+
+
+class RendererHost(Protocol):
+    """Structural type for whatever ``ScreenRenderer``'s methods run against.
+
+    ``ScreenRenderer`` satisfies this directly; :class:`~agit.proxy.runner.ProxyRunner`
+    satisfies it via its session-backed properties and thin delegator methods, so
+    the runner can call ``ScreenRenderer.method(self, ...)`` unbound and still
+    type-check. It enumerates only the ``self.<attr>`` / ``self.<method>`` surface
+    the renderer methods actually touch.
+    """
+
+    # Per-session display state (owned by Session; mirrored on the renderer)
+    rows: int
+    cols: int
+    color_mode: str
+    screen: pyte.HistoryScreen | None
+    stream: pyte.ByteStream | None
+    scroll_back: int
+    child_mouse: bool
+    sel_active: bool
+    sel_anchor: tuple[int, int] | None
+    sel_point: tuple[int, int] | None
+    # The session stores a _BackgroundColorEraseScreen (a pyte.HistoryScreen
+    # subclass); the renderer and the runner both expose it under the HistoryScreen
+    # type, which is the narrowest shared type that still exposes .history and keeps
+    # the three sites invariant-compatible for this protocol.
+
+    # Render-throttle state (host-level, not swapped per session)
+    _last_render: float
+    _render_pending: bool
+    _in_sync_update: bool
+    _sync_since: float
+
+    # Renderer methods invoked on ``self`` from sibling methods
+    def cell_sgr(self, cell) -> str: ...
+    def color_code(self, color: str, *, foreground: bool) -> str | None: ...
+    def hex_color_code(self, color: str, *, foreground: bool) -> str: ...
+    def history_len(self) -> int: ...
+    def render_line(self, cells, sel: tuple[int, int] | None = ..., *, cols: int) -> str: ...
+    def selection_ranges(self, cols: int) -> dict[int, tuple[int, int]]: ...
+    def sync_hold(self, now: float, sync_max_hold: float) -> bool: ...
+    def visible_lines(self, rows: int) -> list: ...
+    def cursor_sequence(self, rows: int, cols: int, scroll_back: int) -> str: ...
+    def append_box(
+        self,
+        parts: list[str],
+        row: int,
+        col: int,
+        width: int,
+        lines: list[str],
+        highlight: str | None = ...,
+        *,
+        rows: int,
+    ) -> None: ...
+    def append_command_palette(
+        self,
+        parts: list[str],
+        *,
+        rows: int,
+        cols: int,
+        input_text: str,
+        input_matches: list[str],
+        input_selected: str | None,
+    ) -> None: ...
+    def append_message_popup(self, parts: list[str], message: str, *, rows: int, cols: int) -> None: ...
+
+
+# ---------------------------------------------------------------------------
 # ScreenRenderer
 # ---------------------------------------------------------------------------
 
@@ -171,8 +243,10 @@ class ScreenRenderer:
         self.cols = cols
         self.color_mode = color_mode
 
-        # Per-session display state (owned by Session; mirrored here)
-        self.screen: _BackgroundColorEraseScreen | None = None
+        # Per-session display state (owned by Session; mirrored here). Typed as
+        # pyte.HistoryScreen so it matches the runner's annotation for the shared
+        # RendererHost protocol; init_screen assigns a _BackgroundColorEraseScreen.
+        self.screen: pyte.HistoryScreen | None = None
         self.stream: pyte.ByteStream | None = None
         self.scroll_back: int = 0
         self.child_mouse: bool = False
@@ -190,7 +264,7 @@ class ScreenRenderer:
     # Screen initialisation
     # ------------------------------------------------------------------
 
-    def init_screen(self, rows: int, cols: int) -> None:
+    def init_screen(self: RendererHost, rows: int, cols: int) -> None:
         """Create (or replace) the pyte screen for the given terminal size."""
         self.rows = rows
         self.cols = cols
@@ -203,7 +277,7 @@ class ScreenRenderer:
     # Feed
     # ------------------------------------------------------------------
 
-    def feed(self, output: bytes, *, pyte_hostile_csi_re) -> None:
+    def feed(self: RendererHost, output: bytes, *, pyte_hostile_csi_re) -> None:
         """Feed child output into the pyte model (strips pyte-hostile CSI)."""
         if self.stream is not None:
             try:
@@ -215,7 +289,7 @@ class ScreenRenderer:
     # Synchronized-update tracking
     # ------------------------------------------------------------------
 
-    def track_sync_update(self, output: bytes) -> None:
+    def track_sync_update(self: RendererHost, output: bytes) -> None:
         # Honor the synchronized-update mode (DECSET 2026): backends wrap a
         # multi-write repaint in BSU (?2026h) / ESU (?2026l) so consumers can
         # apply it atomically. While inside such an update aGiT defers its own
@@ -231,7 +305,7 @@ class ScreenRenderer:
             self._sync_since = time.monotonic()
         self._in_sync_update = in_update
 
-    def sync_hold(self, now: float, sync_max_hold: float) -> bool:
+    def sync_hold(self: RendererHost, now: float, sync_max_hold: float) -> bool:
         """True while a backend synchronized-update should still defer the paint."""
         return self._in_sync_update and now - self._sync_since < sync_max_hold
 
@@ -239,7 +313,7 @@ class ScreenRenderer:
     # Throttled render dispatch
     # ------------------------------------------------------------------
 
-    def render_output(self, render_fn, render_min_interval: float, sync_max_hold: float) -> None:
+    def render_output(self: RendererHost, render_fn, render_min_interval: float, sync_max_hold: float) -> None:
         """Coalesce repaints driven by a flood of backend output to ~30fps."""
         now = time.monotonic()
         if self.sync_hold(now, sync_max_hold):
@@ -252,7 +326,7 @@ class ScreenRenderer:
         else:
             self._render_pending = True
 
-    def flush_pending_render(self, render_fn, render_min_interval: float, sync_max_hold: float) -> None:
+    def flush_pending_render(self: RendererHost, render_fn, render_min_interval: float, sync_max_hold: float) -> None:
         if not self._render_pending:
             return
         now = time.monotonic()
@@ -267,7 +341,7 @@ class ScreenRenderer:
     # Cursor
     # ------------------------------------------------------------------
 
-    def cursor_sequence(self, rows: int, cols: int, scroll_back: int) -> str:
+    def cursor_sequence(self: RendererHost, rows: int, cols: int, scroll_back: int) -> str:
         """The trailing sequence that positions (and shows) or hides the cursor."""
         assert self.screen is not None
         if scroll_back > 0:
@@ -283,14 +357,14 @@ class ScreenRenderer:
     # Visible lines / history / scrollback
     # ------------------------------------------------------------------
 
-    def history_len(self) -> int:
+    def history_len(self: RendererHost) -> int:
         # `screen` always resolves (ScreenRenderer sets it in __init__; the
         # runner delegates it to the active Session) but plain pyte.Screen has
         # no history attribute, hence the getattr on it.
         history = getattr(self.screen, "history", None)
         return len(history.top) if history is not None else 0
 
-    def scroll(self, delta: int, render_fn) -> None:
+    def scroll(self: RendererHost, delta: int, render_fn) -> None:
         new_back = max(0, min(self.scroll_back + delta, self.history_len()))
         if new_back != self.scroll_back:
             self.scroll_back = new_back
@@ -300,7 +374,7 @@ class ScreenRenderer:
             self.sel_anchor = self.sel_point = None
             render_fn()
 
-    def visible_lines(self, rows: int) -> list:
+    def visible_lines(self: RendererHost, rows: int) -> list:
         """The (rows-1) lines to draw. Splices in history when scrolled back."""
         assert self.screen is not None
         num_rows = max(rows - 1, 1)
@@ -317,7 +391,7 @@ class ScreenRenderer:
     # Selection
     # ------------------------------------------------------------------
 
-    def selection_ranges(self, cols: int) -> dict[int, tuple[int, int]]:
+    def selection_ranges(self: RendererHost, cols: int) -> dict[int, tuple[int, int]]:
         """Map each selected display row to its inclusive (start_col, end_col)."""
         if not (self.sel_active and self.sel_anchor and self.sel_point):
             return {}
@@ -329,7 +403,7 @@ class ScreenRenderer:
             ranges[row] = (start, end)
         return ranges
 
-    def copy_selection(self, rows: int, cols: int, copy_to_clipboard_fn, set_message_fn) -> None:
+    def copy_selection(self: RendererHost, rows: int, cols: int, copy_to_clipboard_fn, set_message_fn) -> None:
         lines = self.visible_lines(rows)
         text_lines = []
         for row, (start, end) in sorted(self.selection_ranges(cols).items()):
@@ -346,7 +420,7 @@ class ScreenRenderer:
     # Cell / line rendering
     # ------------------------------------------------------------------
 
-    def cell_sgr(self, cell) -> str:
+    def cell_sgr(self: RendererHost, cell) -> str:
         """Reproduce exactly what OpenCode rendered into this cell, including
         the original colour encoding, so the cell is byte-equivalent to a
         native session on the same terminal."""
@@ -371,7 +445,7 @@ class ScreenRenderer:
             codes.append(bg)
         return ";".join(codes)
 
-    def color_code(self, color: str, *, foreground: bool) -> str | None:
+    def color_code(self: RendererHost, color: str, *, foreground: bool) -> str | None:
         if color in {"default", ""}:
             return None
         base = 30 if foreground else 40
@@ -396,7 +470,7 @@ class ScreenRenderer:
             return str(bright_base + colors[key]) if key in colors else None
         return str(base + colors[color]) if color in colors else None
 
-    def hex_color_code(self, color: str, *, foreground: bool) -> str:
+    def hex_color_code(self: RendererHost, color: str, *, foreground: bool) -> str:
         # Re-emit a hex colour in the same encoding OpenCode used, decided by the
         # shared terminal colour depth. Truecolor terminals get 24-bit colour;
         # 256-colour terminals (e.g. Apple Terminal) get the original palette
@@ -419,7 +493,7 @@ class ScreenRenderer:
         bright_base = 90 if foreground else 100
         return str(base + ansi) if ansi < 8 else str(bright_base + ansi - 8)
 
-    def render_line(self, cells, sel: tuple[int, int] | None = None, *, cols: int) -> str:
+    def render_line(self: RendererHost, cells, sel: tuple[int, int] | None = None, *, cols: int) -> str:
         rendered = []
         current = ""  # SGR body currently applied on the host terminal ("" == default)
         sel_start, sel_end = sel if sel else (-1, -1)
@@ -444,7 +518,7 @@ class ScreenRenderer:
     # ------------------------------------------------------------------
 
     def status_line(
-        self,
+        self: RendererHost,
         *,
         cols: int,
         name: str,
@@ -474,7 +548,7 @@ class ScreenRenderer:
     # ------------------------------------------------------------------
 
     def append_box(
-        self,
+        self: RendererHost,
         parts: list[str],
         row: int,
         col: int,
@@ -505,7 +579,7 @@ class ScreenRenderer:
             parts.append(f"\x1b[{row + offset};{col}H\x1b[0m{line}")
 
     def append_command_palette(
-        self,
+        self: RendererHost,
         parts: list[str],
         *,
         rows: int,
@@ -527,7 +601,7 @@ class ScreenRenderer:
         self.append_box(parts, row, col, width, lines, highlight=input_selected, rows=rows)
 
     def append_message_popup(
-        self,
+        self: RendererHost,
         parts: list[str],
         message: str,
         *,
@@ -544,7 +618,7 @@ class ScreenRenderer:
     # ------------------------------------------------------------------
 
     def render(
-        self,
+        self: RendererHost,
         *,
         rows: int,
         cols: int,

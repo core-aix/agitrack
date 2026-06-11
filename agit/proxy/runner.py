@@ -287,7 +287,7 @@ class ProxyRunner:
         self.original_signal_handlers: dict = {}
         self.rows = 24
         self.cols = 80
-        self.screen: pyte.Screen | None = None
+        self.screen: pyte.HistoryScreen | None = None
         self.stream: pyte.ByteStream | None = None
         # Scrollback: whether the backend manages the mouse itself (OpenCode) or
         # aGiT must provide wheel-driven scrollback (Claude streams to the normal
