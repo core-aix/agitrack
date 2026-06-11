@@ -252,7 +252,10 @@ class GitRepo:
         for line in output.splitlines():
             parts = line.split(maxsplit=1)
             if len(parts) == 2:
-                entries.append((parts[0], parts[1]))
+                commit_sha = parts[1]
+                note = self.notes_show(commit_sha, namespace=namespace)
+                first_line = (note or "").strip().split("\n")[0] if note else ""
+                entries.append((commit_sha, first_line))
         return entries
 
     def _run(self, command: list[str], *, input_text: str | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
