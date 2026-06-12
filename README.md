@@ -217,6 +217,27 @@ JSON mode aGiT commands use `:` so backend-native `/` input is not intercepted:
 
 In JSON mode, aGiT shows a bottom status bar with the active backend, target repo, model, and unstaged-new-file count. Typing `:` shows aGiT command completions. Typing `/` shows common backend command completions, and slash commands are forwarded to the backend rather than handled by aGiT.
 
+### Scripted runs and the demo
+
+`--prompt` runs JSON mode fully scripted: each prompt is sent to the backend in order (lines starting with `:` are aGiT commands), every turn that changes files becomes a commit, and aGiT exits when the prompts are done.
+
+```bash
+agit --repo path/to/repo --backend claude \
+  --prompt "add input validation to parse()" \
+  --prompt ":status" \
+  --permission-mode acceptEdits
+```
+
+Scripted runs never block on a question: the privacy warning is printed without waiting for acknowledgment, and new untracked files are staged automatically (with a notice) instead of being reviewed interactively. The same non-interactive defaults apply when prompts are piped to `agit --mode json` on stdin. Note that headless Claude needs permission to edit files — forward `--permission-mode acceptEdits` (or your preferred permission flags) through aGiT as shown above; OpenCode's `run` mode edits by default.
+
+`scripts/demo.sh` is a self-contained showcase built on this: it creates a fresh repository in a temporary directory, has the agent write a small program and its tests through aGiT, and leaves the repository behind so you can inspect the `<aGiT>` commit history or continue interactively.
+
+```bash
+scripts/demo.sh                      # drive the demo with claude
+scripts/demo.sh --backend opencode   # ... or with opencode
+scripts/demo.sh --model haiku --dir /tmp/agit-demo
+```
+
 
 ## Configuration
 
