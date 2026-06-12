@@ -242,6 +242,7 @@ class ProxyRunner:
         verbose: bool = False,
         backend: str | None = None,
         new_session: bool = False,
+        use_worktrees: bool = True,
         backend_args: list[str] | None = None,
         # Optional injected collaborators (default to production construction).
         # These keyword arguments are for testing and advanced use; the CLI call
@@ -254,6 +255,7 @@ class ProxyRunner:
         # Attach the initial session; per-session state lives on it.
         self.active = Session.bare()
         self.repo = repo
+        self._use_worktrees = use_worktrees  # #9: when False, run on the current branch directly
         # Extra CLI args forwarded verbatim to every backend spawn (#32).
         self._backend_args = list(backend_args or [])
         self._force_new_session = new_session  # start a fresh conversation, do not resume
@@ -1053,6 +1055,16 @@ class ProxyRunner:
         # ever advanced by integration. Reuses an existing worktree (resuming a
         # previous run) or creates a fresh one; falls back to running on the base
         # tree (legacy behaviour, no auto-integration) if neither is possible.
+        if not self._use_worktrees:
+            # #9: opt-out — run on the current branch directly (worktree stays
+            # None; all the `worktree is None` paths commit straight to it).
+            self._set_message(
+                "Running without a worktree: the agent edits this branch directly (visible live), "
+                "but there's no isolation or auto-integration. Don't run multiple sessions this way "
+                "— they'd all write the same tree.",
+                seconds=12.0,
+            )
+            return
         root_state = self.state  # the durable repo-root "last session" record
         backend_name = root_state.backend
         prior_message_id = root_state.last_backend_message_id
@@ -2112,6 +2124,16 @@ class ProxyRunner:
             return False
 
     def _new_session(self, name: str, *, resume_session_id: str | None = None, backend: str | None = None) -> None:
+        if not self._use_worktrees:
+            # #9: concurrent sessions need worktrees; in no-worktree mode they'd
+            # all write the same tree. Refuse rather than corrupt the checkout.
+            self._set_message(
+                "New sessions need worktrees, which are off (--no-worktree). "
+                "Restart without --no-worktree to run multiple sessions.",
+                seconds=8.0,
+            )
+            self._render()
+            return
         try:
             info, repo = self._open_session_worktree(name)
         except Exception as error:

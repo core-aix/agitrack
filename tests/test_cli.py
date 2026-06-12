@@ -100,7 +100,7 @@ def test_discover_or_init_non_interactive_does_not_prompt(tmp_path, monkeypatch)
 # --- backend passthrough args (#32) -----------------------------------------
 
 
-def _stub_launch(monkeypatch):
+def _stub_launch(monkeypatch, *, use_worktrees: bool = True):
     """Stub the launch surface so cli.main only exercises arg routing.
     Returns the dict the fake runner/shell records its kwargs into."""
     captured: dict = {}
@@ -122,8 +122,24 @@ def _stub_launch(monkeypatch):
 
         default_backend = "opencode"
 
+    Config.use_worktrees = use_worktrees
     monkeypatch.setattr(cli, "GlobalConfig", lambda: Config())
     return captured
+
+
+# --- --no-worktree (#9) -----------------------------------------------------
+
+
+def test_no_worktree_flag_disables_worktrees(monkeypatch):
+    captured = _stub_launch(monkeypatch)
+    cli.main(["--no-worktree"])
+    assert captured["use_worktrees"] is False
+
+
+def test_default_uses_config_use_worktrees(monkeypatch):
+    captured = _stub_launch(monkeypatch, use_worktrees=False)  # config opt-out, no flag
+    cli.main([])
+    assert captured["use_worktrees"] is False
 
 
 def test_unknown_args_forwarded_to_backend(monkeypatch):
