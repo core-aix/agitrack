@@ -56,6 +56,7 @@ def _turn() -> SessionTurn:
 
 def _pre_compaction_runner(tmp_path, monkeypatch, *, turns):
     monkeypatch.setattr("agit.summaries.Summarizer", FakeSummarizer)
+    monkeypatch.setenv("AGIT_CONFIG_DIR", str(tmp_path / "agit-config"))
     FakeSummarizer.last = None
     repo = GitRepo.init(tmp_path)
     runner = make_runner(repo=repo, state=AgitState(tmp_path))
@@ -93,9 +94,14 @@ def test_pre_compaction_captures_summary_to_state_and_notes(tmp_path, monkeypatc
     summarizer = FakeSummarizer.last
     assert summarizer is not None
     # Regression (#47 merge): the summarization backend must be constructed
-    # with the repo path — backend_class() raised TypeError and the whole
-    # capture silently no-opped.
-    assert summarizer.backend.repo == tmp_path
+    # with a directory argument — backend_class() raised TypeError and the
+    # whole capture silently no-opped. Since #56 that directory is the scratch
+    # dir, never the session worktree/repo (its headless runs would otherwise
+    # be recorded as this repo's newest session and get resumed on restart).
+    from agit.summaries import summary_scratch_dir
+
+    assert summarizer.backend.repo == summary_scratch_dir()
+    assert summarizer.backend.repo != tmp_path
     assert summarizer.model == "cheap-model"
     # The previous rolling summary is passed along so the narrative evolves.
     assert summarizer.current_summary == "previous narrative"
