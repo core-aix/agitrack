@@ -27,7 +27,7 @@ except ImportError:  # pragma: no cover - exercised only without optional depend
 from agit.commits import AgitActions
 from agit.backends.setup import BackendUnavailable, backend_installed, ensure_installed_backend, install_hint
 from agit.backends.proxy_agents import available_backends, make_proxy_agent
-from agit.commits import build_user_commit_message
+from agit.commits import METADATA_HEADER, build_user_commit_message
 from agit.git import GitRepo
 from agit.config import GlobalConfig
 from agit.git import RepoLock, already_running_message
@@ -386,6 +386,7 @@ class ProxyRunner:
         self._popup_exit_force = False  # second Ctrl-C inside the exit confirmation
         self._reap_pids: list[int] = []  # signalled backends awaiting their waitpid
         self._idle_integrate_at = 0.0  # throttle for integrating agent-made commits
+        self._attach_uncovered_until = 0.0  # deadline for attaching traces to backend-made commits (#35)
         self._base_poll_at = 0.0  # throttle for the base-HEAD poll
         self._warned_backend_session = False  # one-shot "use agit to start sessions" notice
         # Lifecycle flags read before their first conditional assignment. These
@@ -550,6 +551,7 @@ class ProxyRunner:
                 "_popup_exit_force": False,
                 "_reap_pids": [],
                 "_idle_integrate_at": 0.0,
+                "_attach_uncovered_until": 0.0,
                 "_base_poll_at": 0.0,
                 "_warned_backend_session": False,
                 "_user_declined": [],
@@ -2121,7 +2123,10 @@ class ProxyRunner:
             self.active = saved
 
     def _commit_and_integrate_background(self) -> str:
-        if self.repo.has_changes():
+        # A clean tree can still need the commit pipeline: the backend may have
+        # committed its own work, which the parse then amends with the
+        # trace/metadata before integration (#35).
+        if self.repo.has_changes() or self._uncovered_backend_commits():
             self._commit_latest_turn_sync()
         self._clear_agent_in_flight_if_idle()
         return self._integrate_turn_or_conflict()
@@ -3340,7 +3345,25 @@ class ProxyRunner:
             on_commit_fn=on_commit_fn,
             session_name=self.name,
             summarizer=summarizer,
+            backend_commits=self._uncovered_backend_commits(),
         )
+
+    def _uncovered_backend_commits(self) -> list[str]:
+        """Unintegrated commits on the session's turn branch that the backend
+        created itself — their messages carry no aGiT metadata (#35). Full
+        SHAs, oldest first. Only commits ahead of base qualify, so an amend
+        can never rewrite anything that was already integrated."""
+        if self.worktree is None or self._base_branch is None:
+            return []
+        try:
+            branch = self.repo.current_branch()
+            if not branch.startswith("agit/"):
+                return []
+            shas = self.repo.log_shas(self._base_branch, branch)
+            return [sha for sha in shas if METADATA_HEADER not in self.repo.commit_message(sha)]
+        except Exception as error:
+            self._debug(f"uncovered backend commit check failed: {error!r}")
+            return []
 
     def _agent_commit_message(self) -> str:
         # The auto-commit confirmation, including the short SHA of the commit aGiT
@@ -4033,8 +4056,41 @@ class ProxyRunner:
         except Exception as error:
             self._debug(f"idle integrate check failed: {error!r}")
             return
+        if not self._attach_trace_to_backend_commits(now):
+            return  # parse still in flight — integrate once the trace is attached
         self._debug(f"integrating agent-made commits on {branch} (worktree clean and idle)")
         self._integrate_session_turn()
+
+    def _attach_trace_to_backend_commits(self, now: float) -> bool:
+        """Before integrating commits the backend made itself, give the parse
+        pipeline a chance to amend the trace/metadata onto them (#35).
+
+        Returns True when integration may proceed: the trace was attached, no
+        attachment is needed/possible, or the attach deadline passed (the
+        commits then integrate as-is rather than sit on the branch forever).
+        """
+        if not self._uncovered_backend_commits():
+            self._attach_uncovered_until = 0.0
+            return True
+        if self._attach_uncovered_until == 0.0:
+            self._attach_uncovered_until = now + self.PARSE_COOLDOWN_SECONDS * 3
+        finished = self._finish_agent_parse_if_ready(quiet=not self.verbose, integrate=False)
+        if finished is True:
+            # commit_turns amended the backend's HEAD commit; integrate it now.
+            self._attach_uncovered_until = 0.0
+            return True
+        if finished is False:
+            # Parse consumed with nothing to attach (e.g. the turn was already
+            # committed): there is no trace to recover, integrate as-is.
+            self._debug("no trace available for backend-made commits; integrating as-is")
+            self._attach_uncovered_until = 0.0
+            return True
+        if now >= self._attach_uncovered_until:
+            self._debug("trace attach deadline passed; integrating backend-made commits as-is")
+            self._attach_uncovered_until = 0.0
+            return True
+        self._start_agent_parse()
+        return False
 
     def _pause_child_ui(self) -> None:
         TerminalHost.pause_child_ui(self)

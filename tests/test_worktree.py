@@ -1042,6 +1042,10 @@ def test_agent_made_commits_integrate_when_idle(tmp_path):
     runner.CHILD_IDLE_SECONDS = 4.0
     runner.BASE_POLL_SECONDS = 3.0
     runner._idle_integrate_at = 0.0
+    # The parse pipeline gets a chance to amend the trace onto the agent's own
+    # commit first (#35); "parse consumed, nothing to attach" must still
+    # integrate as-is.
+    runner._finish_agent_parse_if_ready = lambda **kw: False
 
     runner._integrate_agent_made_commits_if_idle(time_mod.monotonic())
 
