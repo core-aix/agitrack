@@ -277,6 +277,58 @@ def test_proxy_agent_commit_preserves_incomplete_initial_user_turn(tmp_path):
     assert message.index("## User\n\nalso handle errors") < message.index("## Agent\n\ndone")
 
 
+def test_proxy_agent_commit_does_not_repeat_whitespace_variant_prompt(tmp_path):
+    # The prompt recorded at submit keeps the user's raw typing (trailing
+    # newline etc.) while the transcript normalizes it; the old exact-string
+    # match failed and re-appended the prompt at the end of the trace (#8).
+    runner = make_runner(
+        repo=FakeCommitRepo(),
+        state=AgitState(tmp_path),
+        verbose=False,
+    )
+    runner._review_untracked_popup = lambda include_declined: "No untracked files to review."
+    runner.state.append_trace("user", "fix the bug \n")
+
+    committed = runner._create_agent_commit_from_turns_popup(
+        turns=[SessionTurn("u1", "a1", "fix the bug", "done", TokenUsage(total=1, output=1), None)],
+        backend="claude",
+        backend_session_id="ses-1",
+        model="m",
+        quiet=True,
+    )
+
+    assert committed is True
+    message = runner.repo.message
+    assert message.splitlines()[0] == "<agent> fix the bug"
+    assert message.count("## User") == 1  # not repeated before the metadata
+
+
+def test_proxy_agent_commit_collapses_double_recorded_prompt(tmp_path):
+    # A prompt recorded twice in the pending trace (two submit paths firing for
+    # one prompt) must appear once, not once per recording (#8).
+    runner = make_runner(
+        repo=FakeCommitRepo(),
+        state=AgitState(tmp_path),
+        verbose=False,
+    )
+    runner._review_untracked_popup = lambda include_declined: "No untracked files to review."
+    runner.state.append_trace("user", "do the thing")
+    runner.state.append_trace("user", "do the thing ")
+
+    committed = runner._create_agent_commit_from_turns_popup(
+        turns=[SessionTurn("u1", "a1", "", "done", TokenUsage(total=1, output=1), None)],
+        backend="claude",
+        backend_session_id="ses-1",
+        model="m",
+        quiet=True,
+    )
+
+    assert committed is True
+    message = runner.repo.message
+    assert message.splitlines()[0] == "<agent> do the thing"
+    assert message.count("## User") == 1
+
+
 def test_agent_commit_subject_joins_all_prompts_with_slash(tmp_path):
     runner = make_runner(
         repo=FakeCommitRepo(),

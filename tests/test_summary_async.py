@@ -117,9 +117,12 @@ def test_apply_summary_is_idempotent():
 
 class FakeSummarizer:
     """Deterministic stand-in; `gate` (if set) blocks the worker so tests can
-    observe the non-blocking window."""
+    observe the non-blocking window; `fail`/`fail_session` (if set) raise from
+    the corresponding call, mimicking an unusable summary (#8)."""
 
     gate: "threading.Event | None" = None
+    fail: "Exception | None" = None
+    fail_session: "Exception | None" = None
 
     def __init__(self, backend, *, model=None):
         self.backend = backend
@@ -130,16 +133,22 @@ class FakeSummarizer:
     def summarize_commit(self, *, turns, diff, session_summary=None):
         if FakeSummarizer.gate is not None:
             FakeSummarizer.gate.wait(timeout=10)
+        if FakeSummarizer.fail is not None:
+            raise FakeSummarizer.fail
         self.diff = diff
         return SUMMARY
 
     def update_session_summary(self, *, current_summary, turns, diff, commit_summary):
+        if FakeSummarizer.fail_session is not None:
+            raise FakeSummarizer.fail_session
         return "rolling narrative v2"
 
 
 def _summary_runner(tmp_path, monkeypatch):
     monkeypatch.setattr("agit.summaries.Summarizer", FakeSummarizer)
     FakeSummarizer.gate = None
+    FakeSummarizer.fail = None
+    FakeSummarizer.fail_session = None
     repo = GitRepo.init(tmp_path)
     base = repo.current_branch()
     repo.switch("agit/test/s1/t1", create=True)
@@ -229,6 +238,43 @@ def test_summary_after_head_moved_lands_as_notes_only(tmp_path, monkeypatch):
     assert repo.commit_message("HEAD").startswith("<agent> second")
     assert repo.commit_message(first_full).startswith("<agent> first")
     assert "widget renderer" in (repo.notes_show(first_full, namespace="agit/commit-summary") or "")
+
+
+def test_unusable_summary_keeps_prompt_led_message(tmp_path, monkeypatch):
+    # The backend answered "You've hit your session limit..." instead of a
+    # summary (#8): the Summarizer raises, no amend happens, and the commit
+    # keeps the user prompt as its subject.
+    from agit.summaries import UnusableSummaryError
+
+    runner, repo = _summary_runner(tmp_path, monkeypatch)
+    FakeSummarizer.fail = UnusableSummaryError("You've hit your session limit.")
+    sha = _commit_change(repo, "a.txt", "<agent> prompt subject")
+
+    runner._start_commit_summary(sha, [_turn()])
+    _finish_summary(runner)
+
+    assert repo.commit_message("HEAD").startswith("<agent> prompt subject")
+    full = repo.rev_parse("HEAD")
+    assert repo.notes_show(full, namespace="agit/commit-summary") is None
+    assert "keeping the prompt-based message" in (runner.message or "")
+    assert runner._summary_pending is None  # integration is not held back
+
+
+def test_failed_rolling_summary_does_not_discard_commit_summary(tmp_path, monkeypatch):
+    runner, repo = _summary_runner(tmp_path, monkeypatch)
+    FakeSummarizer.fail_session = RuntimeError("session summary failed")
+    runner.state.session_summary = "previous narrative"
+    sha = _commit_change(repo, "a.txt", "<agent> prompt subject")
+
+    runner._start_commit_summary(sha, [_turn()])
+    _finish_summary(runner)
+
+    # The commit summary still lands (subject + notes)...
+    assert repo.commit_message("HEAD").startswith("<agent> Implement the widget renderer")
+    full = repo.rev_parse("HEAD")
+    assert "widget renderer" in (repo.notes_show(full, namespace="agit/commit-summary") or "")
+    # ...and the previous rolling summary stays current instead of being lost.
+    assert runner.state.session_summary == "previous narrative"
 
 
 def test_integration_waits_for_summary_until_deadline():

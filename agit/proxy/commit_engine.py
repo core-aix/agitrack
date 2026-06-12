@@ -92,6 +92,12 @@ _DebugFn = Callable[..., None]
 """Logging sink — ``runner._debug``."""
 
 
+def _norm(text: str | None) -> str:
+    """Whitespace-normalized form used to match recorded prompts against
+    transcript turns (the transcript normalizes the user's raw typing)."""
+    return " ".join((text or "").split())
+
+
 class CommitEngine:
     """Stateless agent-commit engine bound to a ``(repo, state)`` pair.
 
@@ -203,7 +209,6 @@ class CommitEngine:
                 for item in self.state.pending_trace()
                 if item.get("role") == "user" and (content := item.get("content"))
             ]
-            remaining_pending_users = list(pending_users)
             self.state.data["pending_trace"] = []
             self.state.save()
 
@@ -212,15 +217,24 @@ class CommitEngine:
                 if turn.user_prompt:
                     subject_prompts.append(turn.user_prompt)
                     self.state.append_trace("user", turn.user_prompt)
-                    if turn.user_prompt in remaining_pending_users:
-                        remaining_pending_users.remove(turn.user_prompt)
                 if turn.final_response:
                     self.state.append_trace("agent", turn.final_response)
 
             # Pending user entries that never showed up as a turn's user_prompt
             # (e.g. an incomplete initial turn that has only partial data) are still
             # added to the subject and trace so they appear in the commit body.
-            for pending_user in remaining_pending_users:
+            # Matching is whitespace-normalized — the prompt recorded at submit
+            # keeps the user's raw typing while the transcript normalizes it, and
+            # an exact-string comparison re-appended the same prompt at the end
+            # of the trace (issue #8). Duplicate recordings of one prompt are
+            # collapsed the same way.
+            turn_prompt_norms = {_norm(t.user_prompt) for t in turns if t.user_prompt}
+            seen_pending: set[str] = set()
+            for pending_user in pending_users:
+                norm = _norm(pending_user)
+                if not norm or norm in turn_prompt_norms or norm in seen_pending:
+                    continue
+                seen_pending.add(norm)
                 subject_prompts.append(pending_user)
                 self.state.append_trace("user", pending_user)
 
