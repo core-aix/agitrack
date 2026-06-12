@@ -3438,14 +3438,20 @@ class ProxyRunner:
         def worker() -> None:
             try:
                 result["summary"] = summarizer.summarize_commit(turns=turns, diff=diff, session_summary=session_summary)
-                result["session_summary"] = summarizer.update_session_summary(
-                    current_summary=session_summary,
-                    turns=turns,
-                    diff=diff,
-                    commit_summary=result["summary"],
-                )
             except Exception as error:  # surfaced by the service tick
                 result["error"] = repr(error)
+            else:
+                try:
+                    result["session_summary"] = summarizer.update_session_summary(
+                        current_summary=session_summary,
+                        turns=turns,
+                        diff=diff,
+                        commit_summary=result["summary"],
+                    )
+                except Exception as error:
+                    # A failed rolling summary must not discard a good commit
+                    # summary; the previous session summary simply stays current.
+                    result["session_summary_error"] = repr(error)
             result["metadata"] = summary_metadata_lines(
                 model=summarizer.model or self.state.model,
                 tokens_input=summarizer.tokens_input,
@@ -3466,8 +3472,11 @@ class ProxyRunner:
         self._summary_result = None
         self._summary_pending = None
         if "error" in result:
+            # Includes UnusableSummaryError (backend returned "You've hit your
+            # session limit..." or similar, issue #8): the commit keeps its
+            # prompt-led message instead of getting the error as a subject.
             self._debug(f"commit summarization failed: {result['error']}")
-            self._set_message("aGiT: commit summarization failed.")
+            self._set_message("aGiT: commit summarization failed; keeping the prompt-based message.")
             return
         sha, summary, repo, state = result["sha"], result["summary"], result["repo"], result["state"]
         try:
@@ -3487,6 +3496,8 @@ class ProxyRunner:
                 state.session_summary = session_summary
                 state.session_summary_commit = target
                 repo.notes_add(target, session_summary, namespace="agit/session-summary")
+            elif "session_summary_error" in result:
+                self._debug(f"session summary update failed: {result['session_summary_error']}")
         except Exception as error:
             self._debug(f"applying commit summary failed: {error!r}")
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING
 
 from agit.summaries.prompts import (
@@ -11,6 +12,41 @@ from agit.summaries.prompts import (
 if TYPE_CHECKING:
     from agit.backends.base import AgentBackend
     from agit.transcripts.types import ExportedSession, SessionTurn
+
+
+class UnusableSummaryError(RuntimeError):
+    """The summarizer backend returned an error instead of a summary."""
+
+
+# Backend error messages that come back through the result text with a zero
+# exit code (issue #8: "You've hit your session limit..." ended up as a commit
+# subject). Matched against the summary's first line only — the would-be
+# subject — with error-shaped phrasings, so a legitimate summary that merely
+# *mentions* limits or errors is never rejected.
+_UNUSABLE_SUMMARY_RE = re.compile(
+    r"(?i)(?:"
+    r"you'?\s*(?:ha)?ve hit your"
+    r"|hit your (?:session|usage|rate|spending) limit"
+    r"|(?:session|usage) limit reached"
+    r"|limit will reset"
+    r"|credit balance is too low"
+    r"|please run /login"
+    r"|invalid api key"
+    r"|not logged in"
+    r"|^\s*api error"
+    r"|overloaded_error"
+    r"|rate_limit_error"
+    r"|authentication_error"
+    r")"
+)
+
+
+def summary_is_usable(text: str | None) -> bool:
+    """True when *text* looks like an actual summary, not a backend error."""
+    first_line = next((line for line in (text or "").strip().splitlines() if line.strip()), "")
+    if not first_line:
+        return False
+    return _UNUSABLE_SUMMARY_RE.search(first_line) is None
 
 
 class Summarizer:
@@ -56,7 +92,15 @@ class Summarizer:
         if tokens is not None:
             self.tokens_input += int(getattr(tokens, "input", 0) or 0)
             self.tokens_output += int(getattr(tokens, "output", 0) or 0)
-        return result.final_response.strip()
+        text = result.final_response.strip()
+        # A failed run must raise rather than return its error text, or the
+        # error becomes the commit subject (issue #8). Callers already treat a
+        # raising summarizer as "no summary" and keep the prompt-led message.
+        if result.exit_code != 0:
+            raise UnusableSummaryError(f"summarizer backend exited with {result.exit_code}: {text[:200]}")
+        if not summary_is_usable(text):
+            raise UnusableSummaryError(f"summarizer returned an error message: {text[:200]}")
+        return text
 
     def _build_commit_prompt(
         self,
