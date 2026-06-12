@@ -1,4 +1,3 @@
-import pytest
 from unittest.mock import Mock
 from agit.summaries import Summarizer
 from agit.backends.base import AgentResult, TokenUsage

@@ -22,8 +22,17 @@ BACKENDS = {
 
 
 class AgitShell:
-    def __init__(self, repo: GitRepo, *, verbose: bool = False, backend: str | None = None, new_session: bool = False) -> None:
+    def __init__(
+        self,
+        repo: GitRepo,
+        *,
+        verbose: bool = False,
+        backend: str | None = None,
+        new_session: bool = False,
+        backend_args: list[str] | None = None,
+    ) -> None:
         self.repo = repo
+        self.backend_args = list(backend_args or [])  # forwarded to the backend CLI (#32)
         self.global_config = GlobalConfig()
         self.state = AgitState(repo.repo, default_backend=self.global_config.default_backend)
         if backend and backend in BACKENDS and backend != self.state.backend:
@@ -183,17 +192,19 @@ class AgitShell:
                 try:
                     summarizer = Summarizer(backend, model=summarizer_model)
                     from agit.transcripts.types import SessionTurn
-                    from agit.backends.base import TokenUsage
-                    turns = [SessionTurn(
-                        user_message_id="",
-                        assistant_message_id="",
-                        user_prompt=prompt,
-                        final_response=result.final_response,
-                        tokens=result.tokens,
-                        model=result.model,
-                        complete=True,
-                        interrupted=False,
-                    )]
+
+                    turns = [
+                        SessionTurn(
+                            user_message_id="",
+                            assistant_message_id="",
+                            user_prompt=prompt,
+                            final_response=result.final_response,
+                            tokens=result.tokens,
+                            model=result.model,
+                            complete=True,
+                            interrupted=False,
+                        )
+                    ]
                     commit_summary = summarizer.summarize_commit(
                         turns=turns,
                         diff=diff_before_commit,
@@ -243,7 +254,7 @@ class AgitShell:
         backend_class = BACKENDS.get(self.state.backend)
         if backend_class is None:
             raise RuntimeError(f"Unsupported backend: {self.state.backend}")
-        return backend_class(self.repo.repo, verbose=self.verbose)
+        return backend_class(self.repo.repo, verbose=self.verbose, backend_args=self.backend_args)
 
     def _handle_pre_compaction(self) -> None:
         if self.verbose:
@@ -258,6 +269,7 @@ class AgitShell:
             if not session_id:
                 return
             from agit.backends.proxy_agents import make_proxy_agent
+
             proxy_agent = make_proxy_agent(self.state.backend)
             exported = proxy_agent.export_session(self.repo.repo, session_id)
             if not exported or not exported.turns:

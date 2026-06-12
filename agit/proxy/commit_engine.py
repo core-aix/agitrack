@@ -68,7 +68,7 @@ import threading
 import time
 from typing import Callable, TYPE_CHECKING
 
-from agit.commits import build_agent_commit_message
+from agit.commits import build_agent_commit_message, build_backend_amend_message
 from agit.git import GitRepo
 from agit.transcripts.opencode import SessionTurn
 from agit.transcripts import turns_after
@@ -131,6 +131,7 @@ class CommitEngine:
         session_name: str | None = None,
         accumulate_trace_only_on_commit: bool = False,
         summarizer: "Summarizer | None" = None,
+        backend_commits: list[str] | None = None,
     ) -> bool:
         """Core of every agent-commit path.
 
@@ -156,13 +157,23 @@ class CommitEngine:
             with fresh staging without a partial trace.  When ``False`` (proxy
             mode, the default), the trace is rebuilt before the stage check so
             the pending-user-merging logic can run even on failed attempts.
+        backend_commits:
+            Unintegrated commits the backend made itself this turn (full SHAs,
+            oldest first), issue #35.  With nothing staged, the latest of them
+            is amended to carry the trace/metadata; with staged changes, the
+            normal commit lists them in its ``covered_commits`` metadata.
 
         Returns ``True`` if a commit was made, ``False`` otherwise.
         """
         if not turns:
             return False
+        backend_commits = list(backend_commits or [])
 
         diff_before_commit = self.repo.diff_head() if summarizer else ""
+        if summarizer and backend_commits and not diff_before_commit.strip():
+            # The backend committed its work itself, so the working tree is
+            # clean — summarize the committed range instead.
+            diff_before_commit = self.repo.diff_range(f"{backend_commits[0]}^", backend_commits[-1])
         commit_summary = None
         if summarizer:
             try:
@@ -184,9 +195,12 @@ class CommitEngine:
                 pre_commit_fn()
             self.repo.add_tracked()
             stage_untracked_fn(self.repo, self.state)
+            amend_backend_head = False
             if not self.repo.has_staged_changes():
-                return False
-            # Commit will happen: accumulate trace and tokens now.
+                if not self._head_is_amendable(backend_commits):
+                    return False
+                amend_backend_head = True
+            # Commit (or amend) will happen: accumulate trace and tokens now.
             for turn in turns:
                 if turn.user_prompt:
                     self.state.append_trace("user", turn.user_prompt)
@@ -199,10 +213,10 @@ class CommitEngine:
             # Proxy mode: rebuild trace from scratch, preserving any pending user
             # entries that hadn't yet landed as a turn (e.g. a queued prompt from
             # before this parse cycle).
-            pending_users = [
-                item.get("content")
+            pending_users: list[str] = [
+                content
                 for item in self.state.pending_trace()
-                if item.get("role") == "user" and item.get("content")
+                if item.get("role") == "user" and (content := item.get("content"))
             ]
             remaining_pending_users = list(pending_users)
             self.state.data["pending_trace"] = []
@@ -232,31 +246,56 @@ class CommitEngine:
             self.repo.add_tracked()
             stage_untracked_fn(self.repo, self.state)
 
+            amend_backend_head = False
             if not self.repo.has_staged_changes():
-                return False
+                if not self._head_is_amendable(backend_commits):
+                    return False
+                amend_backend_head = True
 
-            # Accumulate tokens only once we know the commit will happen.
+            # Accumulate tokens only once we know the commit (or amend) will happen.
             for turn in turns:
                 self.state.add_token_usage(turn.tokens)
 
-            subject_text = (
-                " / ".join(subject_prompts) if subject_prompts else f"{backend} changes"
-            )
+            subject_text = " / ".join(subject_prompts) if subject_prompts else f"{backend} changes"
 
-        commit_sha = self.repo.commit(
-            build_agent_commit_message(
-                latest_prompt=subject_text,
-                trace=self.state.pending_trace(),
-                backend=backend,
-                backend_session_id=backend_session_id,
-                agit_session_id=self.state.session_id,
-                model=model or self.state.model,
-                token_usage=self.state.pending_token_usage(),
-                trace_turn_limit=self.state.trace_turn_limit,
-                session_name=session_name,
-                summary=commit_summary,
+        if amend_backend_head:
+            # The backend committed its own work, leaving the tree clean (#35):
+            # amend its latest commit so the trace/metadata land on the commit
+            # that made the change. The covered_commits metadata records the
+            # pre-amend hashes of every backend commit this turn produced.
+            commit_sha = self.repo.amend_commit(
+                build_backend_amend_message(
+                    original_message=self.repo.commit_message("HEAD"),
+                    trace=self.state.pending_trace(),
+                    backend=backend,
+                    backend_session_id=backend_session_id,
+                    agit_session_id=self.state.session_id,
+                    model=model or self.state.model,
+                    token_usage=self.state.pending_token_usage(),
+                    trace_turn_limit=self.state.trace_turn_limit,
+                    session_name=session_name,
+                    summary=commit_summary,
+                    covered_commits=backend_commits,
+                )
             )
-        )
+        else:
+            commit_sha = self.repo.commit(
+                build_agent_commit_message(
+                    latest_prompt=subject_text,
+                    trace=self.state.pending_trace(),
+                    backend=backend,
+                    backend_session_id=backend_session_id,
+                    agit_session_id=self.state.session_id,
+                    model=model or self.state.model,
+                    token_usage=self.state.pending_token_usage(),
+                    trace_turn_limit=self.state.trace_turn_limit,
+                    session_name=session_name,
+                    summary=commit_summary,
+                    # An aGiT commit accounts for itself; list only the
+                    # backend-made commits it additionally covers (#35).
+                    covered_commits=backend_commits or None,
+                )
+            )
         self.state.clear_trace()
 
         if summarizer and commit_summary and commit_sha:
@@ -278,6 +317,20 @@ class CommitEngine:
             on_commit_fn(commit_sha)
 
         return True
+
+    def _head_is_amendable(self, backend_commits: list[str]) -> bool:
+        """True when HEAD is the latest of the backend's own unintegrated
+        commits, so amending it attaches the trace to the commit that actually
+        made the change (#35). Never true for commits aGiT created (they carry
+        their own metadata) or for anything already integrated into base
+        (``backend_commits`` only ever lists commits ahead of base)."""
+        if not backend_commits:
+            return False
+        try:
+            return self.repo.rev_parse("HEAD") == backend_commits[-1]
+        except Exception as error:
+            self._debug(f"amend check failed: {error!r}")
+            return False
 
     # ------------------------------------------------------------------
     # Parse-result consumption (extracted from _finish_agent_parse_if_ready)
@@ -350,24 +403,15 @@ class CommitEngine:
         if awaited and any(getattr(t, "interrupted", False) for t in all_turns):
             awaited = []
         if awaited:
-            seen = {
-                " ".join((t.user_prompt or "").split())
-                for t in exported_session.turns
-            }
+            seen = {" ".join((t.user_prompt or "").split()) for t in exported_session.turns}
             awaited = [p for p in awaited if p not in seen]
             if require_complete and awaited and agent_is_active_fn():
-                debug_fn(
-                    f"deferring agent commit: {len(awaited)} queued follow-up(s) "
-                    "not yet in transcript"
-                )
+                debug_fn(f"deferring agent commit: {len(awaited)} queued follow-up(s) not yet in transcript")
                 return None, awaited
             awaited = []  # committing now — drop cancelled queue entries
 
         if require_complete and all_turns and not all_turns[-1].complete:
-            debug_fn(
-                f"deferring agent commit: latest turn still in progress "
-                f"session_id={new_session_id}"
-            )
+            debug_fn(f"deferring agent commit: latest turn still in progress session_id={new_session_id}")
             return None, awaited
 
         complete_turns = [t for t in all_turns if t.final_response]
@@ -464,10 +508,7 @@ class CommitEngine:
                 exported = backend.export_session(repo.repo, session_id) if session_id else None
                 turn_count = len(exported.turns) if exported else 0
                 final_count = len([t for t in exported.turns if t.final_response]) if exported else 0
-                debug_fn(
-                    f"agent parse worker finished session_id={session_id} "
-                    f"turns={turn_count} finals={final_count}"
-                )
+                debug_fn(f"agent parse worker finished session_id={session_id} turns={turn_count} finals={final_count}")
                 result = (session_id, exported, last_message_id, state)
             finally:
                 with parse_lock:
@@ -478,9 +519,7 @@ class CommitEngine:
 
         session.last_parse_start = time.monotonic()
         debug_fn(f"agent parse started last_message_id={last_message_id}")
-        session.agent_parse_thread = threading.Thread(
-            target=worker, name="agit-session-parse", daemon=True
-        )
+        session.agent_parse_thread = threading.Thread(target=worker, name="agit-session-parse", daemon=True)
         session.agent_parse_thread.start()
         return True
 
