@@ -182,13 +182,17 @@ class AgitShell:
         self.repo.add_tracked()
         self.actions.review_untracked(include_declined=False)
         if self.repo.has_staged_changes():
-            from agit.commits import build_agent_commit_message
+            from agit.commits import build_agent_commit_message, summary_metadata_lines
             from agit.summaries import Summarizer
 
             diff_before_commit = self.repo.diff_head()
             commit_summary = None
+            summary_metadata = None
             summarizer_model = self.state.summarization_model or self.global_config.summarization_model
             if self._summarization_enabled():
+                # Shell mode is synchronous per prompt, so summarizing inline is
+                # fine — but say so, since the LLM call can take a while.
+                print("aGiT is summarizing the changes before committing...")
                 try:
                     summarizer = Summarizer(backend, model=summarizer_model)
                     from agit.transcripts.types import SessionTurn
@@ -210,6 +214,11 @@ class AgitShell:
                         diff=diff_before_commit,
                         session_summary=self.state.session_summary,
                     )
+                    summary_metadata = summary_metadata_lines(
+                        model=summarizer.model or self.state.model,
+                        tokens_input=summarizer.tokens_input,
+                        tokens_output=summarizer.tokens_output,
+                    )
                 except Exception as error:
                     if self.verbose:
                         print(f"Summarization failed: {error}")
@@ -225,6 +234,7 @@ class AgitShell:
                     token_usage=self.state.pending_token_usage(),
                     trace_turn_limit=self.state.trace_turn_limit,
                     summary=commit_summary,
+                    summary_metadata=summary_metadata,
                 )
             )
             self.state.clear_trace()

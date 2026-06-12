@@ -17,6 +17,11 @@ class Summarizer:
     def __init__(self, backend: AgentBackend, *, model: str | None = None) -> None:
         self.backend = backend
         self.model = model
+        # Tokens this summarizer instance consumed across its LLM calls, so the
+        # cost of summarization can be tracked next to the coding session's own
+        # usage (issue #8).
+        self.tokens_input = 0
+        self.tokens_output = 0
 
     def summarize_commit(
         self,
@@ -25,9 +30,7 @@ class Summarizer:
         diff: str,
         session_summary: str | None = None,
     ) -> str:
-        prompt = self._build_commit_prompt(turns, diff, session_summary)
-        result = self.backend.run(prompt, model=self.model, session_id=None)
-        return result.final_response.strip()
+        return self._run(self._build_commit_prompt(turns, diff, session_summary))
 
     def update_session_summary(
         self,
@@ -37,9 +40,7 @@ class Summarizer:
         diff: str,
         commit_summary: str,
     ) -> str:
-        prompt = self._build_session_update_prompt(current_summary, turns, diff, commit_summary)
-        result = self.backend.run(prompt, model=self.model, session_id=None)
-        return result.final_response.strip()
+        return self._run(self._build_session_update_prompt(current_summary, turns, diff, commit_summary))
 
     def summarize_pre_compaction(
         self,
@@ -47,8 +48,14 @@ class Summarizer:
         exported_session: ExportedSession,
         current_summary: str | None = None,
     ) -> str:
-        prompt = self._build_pre_compaction_prompt(exported_session, current_summary)
+        return self._run(self._build_pre_compaction_prompt(exported_session, current_summary))
+
+    def _run(self, prompt: str) -> str:
         result = self.backend.run(prompt, model=self.model, session_id=None)
+        tokens = getattr(result, "tokens", None)
+        if tokens is not None:
+            self.tokens_input += int(getattr(tokens, "input", 0) or 0)
+            self.tokens_output += int(getattr(tokens, "output", 0) or 0)
         return result.final_response.strip()
 
     def _build_commit_prompt(

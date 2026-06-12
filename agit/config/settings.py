@@ -27,6 +27,7 @@ DEFAULT_TIMINGS: dict[str, float] = {
     "base_edit_check_seconds": 3.0,  # how often to warn about un-sandboxed base-repo edits
     "cwd_check_seconds": 3.0,  # how often to check for the resume-cwd drift bug
     "base_drift_check_seconds": 2.0,  # how often to check the base repo's checked-out branch
+    "summary_wait_seconds": 45.0,  # how long integration waits for a background commit summary (#8)
 }
 
 
