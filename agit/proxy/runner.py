@@ -3394,7 +3394,7 @@ class ProxyRunner:
     def _make_summarizer(self):
         if not self._summarization_enabled():
             return None
-        from agit.summaries import Summarizer
+        from agit.summaries import Summarizer, summary_scratch_dir
         from agit.backends.claude import ClaudeBackend
         from agit.backends.opencode import OpenCodeBackend
 
@@ -3402,10 +3402,11 @@ class ProxyRunner:
         model = self.state.summarization_model
         if model is None and self.global_config is not None:
             model = self.global_config.summarization_model
-        repo_path = getattr(self.repo, "repo", None)
-        if repo_path is None:
-            return None
-        return Summarizer(backend_class(repo_path), model=model)
+        # The summarizer must NOT run in the session worktree (or the repo):
+        # its headless calls record real backend sessions keyed by cwd, which
+        # the parse worker / exit adoption would then resume instead of the
+        # user's conversation (issues #8/#56).
+        return Summarizer(backend_class(summary_scratch_dir()), model=model)
 
     def _start_commit_summary(self, sha: str, turns) -> None:
         summarizer = self._make_summarizer()

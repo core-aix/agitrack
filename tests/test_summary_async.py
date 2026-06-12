@@ -146,6 +146,7 @@ class FakeSummarizer:
 
 def _summary_runner(tmp_path, monkeypatch):
     monkeypatch.setattr("agit.summaries.Summarizer", FakeSummarizer)
+    monkeypatch.setenv("AGIT_CONFIG_DIR", str(tmp_path / "agit-config"))
     FakeSummarizer.gate = None
     FakeSummarizer.fail = None
     FakeSummarizer.fail_session = None

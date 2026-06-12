@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import re
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from agit.summaries.prompts import (
@@ -47,6 +49,25 @@ def summary_is_usable(text: str | None) -> bool:
     if not first_line:
         return False
     return _UNUSABLE_SUMMARY_RE.search(first_line) is None
+
+
+def summary_scratch_dir() -> Path:
+    """A stable directory, outside any repository, for summarizer backends.
+
+    Headless summarizer calls (``claude -p`` / ``opencode run``) record a real
+    session transcript keyed by their working directory. Running them in the
+    session worktree (or the repo root) made the summary conversation that
+    directory's newest non-empty session, which the parse worker and the
+    exit-time adoption then resumed instead of the user's actual conversation
+    (issues #8/#56). Running every summarizer call from this scratch directory
+    keeps summary sessions out of every repository's session records, so they
+    can never be adopted, listed, or resumed as the previous session.
+    """
+    config_dir = os.environ.get("AGIT_CONFIG_DIR")
+    base = Path(config_dir).expanduser() if config_dir else Path.home() / ".agit"
+    path = base / "summarizer"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 class Summarizer:
