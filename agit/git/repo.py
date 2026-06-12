@@ -111,6 +111,17 @@ class GitRepo:
         self._run(["git", "commit", "-F", "-"], input_text=message)
         return self._run(["git", "rev-parse", "--short", "HEAD"]).stdout.strip()
 
+    def amend_commit(self, message: str) -> str:
+        """Rewrite HEAD's message (tree untouched); returns the new short SHA."""
+        self._run(["git", "commit", "--amend", "-F", "-"], input_text=message)
+        return self._run(["git", "rev-parse", "--short", "HEAD"]).stdout.strip()
+
+    def commit_message(self, ref: str = "HEAD") -> str:
+        return self._run(["git", "log", "-1", "--format=%B", ref], check=False).stdout
+
+    def diff_range(self, base: str, head: str) -> str:
+        return self._run(["git", "diff", f"{base}..{head}"], check=False).stdout
+
     # --- branches / worktrees / merges (used by concurrent-session support) ---
 
     def current_branch(self) -> str:
@@ -236,6 +247,11 @@ class GitRepo:
         if paths:
             command.extend(["--", *paths])
         return self._run(command, check=False).stdout.strip()
+
+    def log_shas(self, base: str, head: str) -> list[str]:
+        """Full SHAs of commits in ``base..head``, oldest first."""
+        output = self._run(["git", "log", "--format=%H", "--reverse", f"{base}..{head}"], check=False).stdout
+        return [line for line in output.split() if line]
 
     def notes_add(self, commit: str, message: str, *, namespace: str = "agit") -> None:
         self._run(["git", "notes", "--ref", namespace, "add", "-f", "-m", message, commit])

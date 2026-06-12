@@ -176,6 +176,7 @@ The status bar shows whether summarization is active (`sum:on` / `sum:off`). Use
 - Proxy mode preserves the backend's selected model in commit metadata when it can be read from session data.
 - User commits use the user-provided subject and include aGiT metadata.
 - Commits are created only when staged changes exist.
+- If the backend commits on its own (e.g. the agent runs `git commit` itself, or a hook does), aGiT amends the latest of those commits once the turn finishes, appending the interaction trace and metadata so provenance is not lost. The `covered_commits` metadata line records the original (pre-amend) hashes of every backend-made commit the metadata accounts for; when aGiT also has uncommitted changes to commit, its own commit carries that line instead. Only commits not yet integrated into the base branch are ever amended.
 ## Advanced Usage
 
 Show aGiT diagnostic messages:
