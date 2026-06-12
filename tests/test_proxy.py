@@ -329,6 +329,75 @@ def test_proxy_agent_commit_collapses_double_recorded_prompt(tmp_path):
     assert message.count("## User") == 1
 
 
+def test_proxy_agent_commit_drops_edit_garbled_duplicate_prompt(tmp_path):
+    # Real-world case (commit 62856c7): line editing while typing garbles the
+    # raw recorded prompt relative to the transcript's clean version — same
+    # words, joined/reordered differently — so equality matching re-added it
+    # to the trace as if it were a separate prompt (#8).
+    garbled = (
+        "Check the latest comments in issues 8, 35, and , and 14Fix them one by one "
+        "with one after another. Write test cases to confirm the fixes as needed.  "
+        "carefully Then include things that were not fixed before.Also add what you "
+        "fixed as a new comment in the issues. Don't close the issue yourself though., "
+        "then make a commit"
+    )
+    clean = (
+        "Check the latest comments in issues 8, 35, 56, and 14 carefully. Then include "
+        "things that were not fixed before. Fix them one by one with one after another. "
+        "Write test cases to confirm the fixes as needed. Also add what you fixed as a "
+        "new comment in the issues, then make a commit. Don't close the issue yourself though."
+    )
+    runner = make_runner(
+        repo=FakeCommitRepo(),
+        state=AgitState(tmp_path),
+        verbose=False,
+    )
+    runner._review_untracked_popup = lambda include_declined: "No untracked files to review."
+    runner.state.append_trace("user", garbled)
+
+    committed = runner._create_agent_commit_from_turns_popup(
+        turns=[SessionTurn("u1", "a1", clean, "all done", TokenUsage(total=1, output=1), None)],
+        backend="claude",
+        backend_session_id="ses-1",
+        model="m",
+        quiet=True,
+    )
+
+    assert committed is True
+    message = runner.repo.message
+    assert message.count("## User") == 1  # the garbled near-duplicate is dropped
+    assert "14Fix" not in message
+
+
+def test_proxy_agent_commit_places_followup_notes_before_the_response(tmp_path):
+    # Follow-up notes typed while the agent was working belong between the
+    # turn's prompt and its response — not appended after the response (#8).
+    runner = make_runner(
+        repo=FakeCommitRepo(),
+        state=AgitState(tmp_path),
+        verbose=False,
+    )
+    runner._review_untracked_popup = lambda include_declined: "No untracked files to review."
+    runner.state.append_trace("user", "also read all the comments")
+    runner.state.append_trace("user", "no need to verify the full thread")
+
+    committed = runner._create_agent_commit_from_turns_popup(
+        turns=[SessionTurn("u1", "a1", "fix the open issues", "all fixed", TokenUsage(total=1, output=1), None)],
+        backend="claude",
+        backend_session_id="ses-1",
+        model="m",
+        quiet=True,
+    )
+
+    assert committed is True
+    message = runner.repo.message
+    prompt = message.index("## User\n\nfix the open issues")
+    note_one = message.index("## User\n\nalso read all the comments")
+    note_two = message.index("## User\n\nno need to verify the full thread")
+    response = message.index("## Agent\n\nall fixed")
+    assert prompt < note_one < note_two < response
+
+
 def test_agent_commit_subject_joins_all_prompts_with_slash(tmp_path):
     runner = make_runner(
         repo=FakeCommitRepo(),
