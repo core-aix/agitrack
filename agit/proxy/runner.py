@@ -8,6 +8,8 @@ import shutil
 import signal
 import subprocess
 import sys
+from types import FrameType
+from typing import Any, Callable, cast
 import termios
 import threading
 import time
@@ -18,9 +20,9 @@ try:
     from watchdog.events import FileSystemEvent, FileSystemEventHandler
     from watchdog.observers import Observer
 except ImportError:  # pragma: no cover - exercised only without optional dependency
-    FileSystemEvent = None
-    FileSystemEventHandler = object
-    Observer = None
+    FileSystemEvent = None  # type: ignore[misc, assignment]
+    FileSystemEventHandler = object  # type: ignore[misc, assignment]
+    Observer = None  # type: ignore[misc, assignment]
 
 from agit.commits import AgitActions
 from agit.backends.setup import BackendUnavailable, backend_installed, ensure_installed_backend, install_hint
@@ -97,10 +99,13 @@ class RepoChangeHandler(FileSystemEventHandler):
         self.changed = changed
 
     def on_any_event(self, event: FileSystemEvent) -> None:
+        # watchdog reports src_path as str or bytes depending on how the watch was
+        # set up; normalise to str so the IGNORED_PARTS check is uniform.
+        src_path = os.fsdecode(event.src_path)
         try:
-            relative = os.path.relpath(event.src_path, self.repo_path)
+            relative = os.path.relpath(src_path, self.repo_path)
         except ValueError:
-            relative = event.src_path
+            relative = src_path
         if any(part in self.IGNORED_PARTS for part in relative.split(os.sep)):
             return
         self.changed.set()
@@ -261,7 +266,7 @@ class ProxyRunner:
         self._force_new_session = new_session  # start a fresh conversation, do not resume
         self.name = "main"  # session label (multiplexer assigns names to others)
         self._primary_worktree_name: str | None = None  # session kept across exits for auto-resume
-        self.worktree = None  # set when this session runs in a git worktree
+        self.worktree: WorktreeInfo | None = None  # set when this session runs in a git worktree
         self.global_config = _global_config if _global_config is not None else GlobalConfig()
         self._apply_timings(self.global_config.timings)
         self.state = (
@@ -282,16 +287,16 @@ class ProxyRunner:
         self.last_poll = 0.0
         self.status_check_pending = False
         self.file_change_event = threading.Event()
-        self.file_observer = None
+        self.file_observer: Any = None
         self.parse_pending = False
         self.last_parse_start = 0.0
         self.running = True
-        self.old_attrs = None
-        self.original_sigwinch = None
-        self.original_signal_handlers = {}
+        self.old_attrs: Any = None
+        self.original_sigwinch: Callable[[int, FrameType | None], Any] | int | None = None
+        self.original_signal_handlers: dict = {}
         self.rows = 24
         self.cols = 80
-        self.screen: pyte.Screen | None = None
+        self.screen: pyte.HistoryScreen | None = None
         self.stream: pyte.ByteStream | None = None
         # Scrollback: whether the backend manages the mouse itself (OpenCode) or
         # aGiT must provide wheel-driven scrollback (Claude streams to the normal
@@ -370,7 +375,7 @@ class ProxyRunner:
         self._integration_paused = False  # set when the base repo is switched off _base_branch out-of-band
         self._base_drift_check_at = 0.0
         self.turn = 0  # per-session transient-branch counter
-        self.merge_ctx = None  # in-progress agent merge resolution, if any
+        self.merge_ctx: MergeContext | None = None  # in-progress agent merge resolution
         self._pending_enter_at: float | None = None  # deferred submit of an injected prompt
         self._pending_enter_fd: int | None = None  # the PTY that injected prompt's Enter must go to
         self._base_advanced = False  # base moved; sync idle sessions onto it on the next loop pass
@@ -468,7 +473,10 @@ class ProxyRunner:
         if svc is None:
             base_repo = self.__dict__.get("base_repo")
             base_branch = self.__dict__.get("_base_branch")
-            svc = IntegrationService(base_repo, base_branch, menu_label=self._menu_label())
+            # Production always wires base_repo before _integration is read; this lazy
+            # branch is only a safety net for partially-constructed/test runners, which
+            # may build the service before base_repo is set, so pass it through as-is.
+            svc = IntegrationService(cast("GitRepo", base_repo), base_branch, menu_label=self._menu_label())
             self.__dict__["_integration_svc"] = svc
         return svc
 
@@ -711,7 +719,7 @@ class ProxyRunner:
         self._monitor_base_edits = True
         self._base_check_at = 0.0
         try:
-            self._base_status_baseline = set(self.base_repo.status_short().splitlines())
+            self._base_status_baseline: set[str] = set(self.base_repo.status_short().splitlines())
         except Exception:
             self._base_status_baseline = set()
         self._set_message(
@@ -1389,6 +1397,7 @@ class ProxyRunner:
         # Only idle, clean worktrees are touched, so in-flight work is left alone.
         if self._integration_paused:
             return  # base switched out-of-band; don't re-point worktrees meanwhile
+        repo: GitRepo | None
         for index in range(len(self.sessions)):
             if index == self.active_index:
                 repo, in_flight = self.repo, self.agent_in_flight
@@ -1471,6 +1480,7 @@ class ProxyRunner:
     def _begin_agent_merge(self, source_branch: str) -> None:
         # A merge is in progress (conflicted) in the worktree. Ask the session's
         # agent to resolve it; aGiT finalizes once the conflicts are gone.
+        assert self._base_branch is not None  # a merge only starts once the base is established
         files = self.repo.unmerged_paths()
         try:
             context = self.base_repo.log_range(source_branch, self._base_branch, paths=files)
@@ -1626,6 +1636,7 @@ class ProxyRunner:
 
     def _unintegrated_session_names(self) -> list[str]:
         blocked: list[str] = []
+        repo: GitRepo | None
         for index in range(len(self.sessions)):
             if index == self.active_index:
                 repo, name = self.repo, self.name
@@ -1725,6 +1736,7 @@ class ProxyRunner:
             return
         kind, value = actions[options.index(choice)]
         if kind == "switch":
+            assert isinstance(value, int)  # "switch" pairs with a session index
             if value == self.active_index:
                 self._integrate_active_session()
             else:
@@ -1734,8 +1746,10 @@ class ProxyRunner:
         elif kind == "complete-merge":
             self._finalize_agent_merge()
         elif kind == "resolve":
+            assert isinstance(value, str)  # "resolve" pairs with a worktree name
             self._resolve_dormant_worktree(value)
         elif kind == "resume":
+            assert isinstance(value, str)  # "resume" pairs with a worktree name
             self._new_session(value)
         elif kind == "new":
             self._prompt_new_session()
@@ -1828,6 +1842,7 @@ class ProxyRunner:
             self._render()
             return
         # conflict_auto or conflict_manual: ctx is a MergeContext
+        assert ctx is not None
         if outcome == "conflict_auto":
             # Re-enter _begin_agent_merge to inject the prompt (it uses self.repo etc.)
             self._begin_agent_merge(ctx.source_branch)
@@ -2358,7 +2373,7 @@ class ProxyRunner:
             # --- phase 1: select ------------------------------------------
             background, readable = self._reactor_select_phase()
             # --- phase 2: pty-output --------------------------------------
-            sentinel = self._reactor_pty_output_phase(readable)
+            sentinel: str | int | None = self._reactor_pty_output_phase(readable)
             if sentinel == "continue":
                 continue
             if sentinel == "break":
@@ -3129,9 +3144,10 @@ class ProxyRunner:
         message = ""
         prompt = "Commit message:"
         while not message.strip():
-            message = self._prompt_popup("User Commit", prompt)
-            if message is None:
+            result = self._prompt_popup("User Commit", prompt)
+            if result is None:
                 return False
+            message = result
             prompt = "Commit message is required. Enter a commit message:"
         repo.commit(build_user_commit_message(message=message, agit_session_id=state.session_id))
         state.clear_trace()
@@ -3260,7 +3276,9 @@ class ProxyRunner:
         commit_id = self._last_agent_commit_id
         return f"Created <agent> commit {commit_id}." if commit_id else "Created <agent> commit."
 
-    def _set_message(self, message: str, *, seconds: float = 4.0, sticky: bool = False) -> None:
+    def _set_message(self, message: str | None, *, seconds: float = 4.0, sticky: bool = False) -> None:
+        # message may be None when relayed straight from a service result; storing
+        # None simply leaves no popup to paint (the same state as a cleared message).
         self.message = message
         self.message_until = time.monotonic() + seconds
         # Sticky messages ignore the timeout and persist until the user's next
