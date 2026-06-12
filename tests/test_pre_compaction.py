@@ -7,6 +7,10 @@ the backend without its required repo argument and exporting via a
 nonexistent attribute, so the capture never ran). The fake summarizer keeps
 the real backend construction and real git notes in the loop so regressions
 in either surface as assertion failures, not swallowed exceptions.
+
+Since #8 the summarization runs on a worker thread so the UI never blocks:
+_handle_pre_compaction only exports and spawns, and the result is applied by
+_service_precompact_summary on the main loop.
 """
 
 from types import SimpleNamespace
@@ -70,6 +74,12 @@ def test_pre_compaction_captures_summary_to_state_and_notes(tmp_path, monkeypatc
     runner.state.session_summary = "previous narrative"
 
     runner._handle_pre_compaction()
+    # The export+spawn must not touch state synchronously (the LLM call runs
+    # on a worker thread; the UI thread stays free).
+    assert runner.state.session_summary == "previous narrative"
+    assert runner._precompact_thread is not None
+    runner._precompact_thread.join(timeout=10)
+    runner._service_precompact_summary()
 
     # The summary landed in state and as a git note on HEAD.
     assert runner.state.session_summary == "captured design context"
@@ -97,6 +107,9 @@ def test_pre_compaction_without_tracked_session_is_a_noop(tmp_path, monkeypatch)
     runner.state.backend_session_id = None
 
     runner._handle_pre_compaction()
+    if runner._precompact_thread is not None:
+        runner._precompact_thread.join(timeout=10)
+    runner._service_precompact_summary()
 
     assert runner.state.session_summary is None
     assert repo.notes_show(repo.rev_parse("HEAD"), namespace="agit/session-summary") is None
@@ -107,6 +120,9 @@ def test_pre_compaction_with_empty_session_writes_nothing(tmp_path, monkeypatch)
     runner.state.backend_session_id = "ses-1"
 
     runner._handle_pre_compaction()
+    if runner._precompact_thread is not None:
+        runner._precompact_thread.join(timeout=10)
+    runner._service_precompact_summary()
 
     assert runner.state.session_summary is None
     assert repo.notes_show(repo.rev_parse("HEAD"), namespace="agit/session-summary") is None

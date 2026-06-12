@@ -149,7 +149,7 @@ aGiT commit messages use a consistent Markdown-style structure. The first line i
 
 When summarization is enabled (the default), aGiT runs a second LLM stream alongside the coding session to preserve design context that would otherwise be lost to session compaction or terse commit subjects:
 
-- **Commit summaries** — each agent commit gets an LLM-written summary of what changed and why. It is included in the commit body under the `# Summary` section and stored as a git note in the `agit/commit-summary` namespace.
+- **Commit summaries** — each agent commit gets an LLM-written summary of what changed and why. The summary leads the commit message: its first line becomes the subject and the full text sits in the `# Summary` section (the prompts that used to head the message move to `# Prompts`); it is also stored as a git note in the `agit/commit-summary` namespace.
 - **Session summaries** — a rolling narrative of the session (goals, architectural decisions, design evolution) is updated on every commit and attached as a git note in the `agit/session-summary` namespace.
 - **Pre-compaction capture** — when you run `/compact` in the backend, aGiT first exports the full session transcript and folds it into the session summary, so compaction does not lose the conversation's context.
 
@@ -159,6 +159,8 @@ Because summaries are git notes, they travel with the repository and can be read
 git notes --ref agit/commit-summary show <commit>
 git notes --ref agit/session-summary show <commit>
 ```
+
+Summarization never blocks the session: commits are created immediately with a prompt-based subject, the summary is computed on a background worker (the status line shows "aGiT is summarizing commit ..."), and the commit message is then amended in place. The amend only happens while it is safe — the commit is still the latest, unintegrated, and nothing new is staged; integration waits for the summary up to `summary_wait_seconds` and then proceeds, in which case the summary is recorded in git notes only. The metadata records the summarization cost next to the session's own usage (`summary_model`, `summary_tokens_input`, `summary_tokens_output`).
 
 The status bar shows whether summarization is active (`sum:on` / `sum:off`). Use the `summarizer` command (`Ctrl-G`, then `summarizer`, or `:summarizer` in JSON mode) to toggle it (`summarizer on|off`), set the summarization model (`summarizer model`), or show the current status; changes persist to the repository-local `.agit/config.json` (see Configuration).
 
@@ -264,3 +266,4 @@ User-wide settings live in `~/.agit/config.json` (override the directory with `A
 | `base_edit_check_seconds` | `3.0` | How often aGiT warns about edits to the base repo when the sandbox is unavailable. |
 | `cwd_check_seconds` | `3.0` | How often aGiT checks for the Claude resume-cwd drift bug. |
 | `base_drift_check_seconds` | `2.0` | How often aGiT checks whether the base repo was switched to another branch outside aGiT. |
+| `summary_wait_seconds` | `45.0` | How long integration waits for a background commit summary before proceeding without it. |

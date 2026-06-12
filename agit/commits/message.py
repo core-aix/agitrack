@@ -53,16 +53,24 @@ def build_agent_commit_message(
     trace_turn_limit: int = 5,
     session_name: str | None = None,
     summary: str | None = None,
+    summary_metadata: list[str] | None = None,
     covered_commits: list[str] | None = None,
 ) -> str:
-    subject_prompt, full_subject = _subject_parts(
-        _mask_secrets(latest_prompt), width=MAX_SUBJECT_WIDTH - len(AGENT_SUBJECT_PREFIX)
-    )
-    lines = [f"{AGENT_SUBJECT_PREFIX}{subject_prompt}"]
-    if full_subject:
-        # The truncated subject flows straight into its full text with no blank
-        # line between them, so the extended subject reads as one continued line.
-        lines.extend(_body_lines(full_subject))
+    if summary:
+        # The summary leads (issue #8): its first line becomes the subject and
+        # the prompts move to a # Prompts section instead of heading the message.
+        lines = _summary_subject_lines(summary)
+        prompts: str | None = latest_prompt
+    else:
+        subject_prompt, full_subject = _subject_parts(
+            _mask_secrets(latest_prompt), width=MAX_SUBJECT_WIDTH - len(AGENT_SUBJECT_PREFIX)
+        )
+        lines = [f"{AGENT_SUBJECT_PREFIX}{subject_prompt}"]
+        if full_subject:
+            # The truncated subject flows straight into its full text with no blank
+            # line between them, so the extended subject reads as one continued line.
+            lines.extend(_body_lines(full_subject))
+        prompts = None
     lines.append("")
     lines.extend(
         _trace_and_metadata_lines(
@@ -75,10 +83,74 @@ def build_agent_commit_message(
             trace_turn_limit=trace_turn_limit,
             session_name=session_name,
             summary=summary,
+            prompts=prompts,
+            summary_metadata=summary_metadata,
             covered_commits=covered_commits,
         )
     )
     return "\n".join(lines).rstrip() + "\n"
+
+
+def apply_summary_to_message(
+    message: str,
+    summary: str,
+    *,
+    summary_metadata: list[str] | None = None,
+) -> str:
+    """Rewrite an existing agent commit message so the summary leads (#8).
+
+    The summary's first line becomes the subject, the full summary lands in a
+    ``# Summary`` section, and the original subject (the collected prompts) is
+    preserved under ``# Prompts``. ``summary_metadata`` lines are added to the
+    metadata section. Idempotent: a message that already carries a summary is
+    returned unchanged, so a redundant amend can never happen.
+    """
+    if not summary.strip() or "\n# Summary\n" in message or message.startswith("# Summary"):
+        return message
+    lines = message.splitlines()
+    try:
+        subject_end = lines.index("")
+    except ValueError:
+        subject_end = len(lines)
+    original_subject = "\n".join(lines[:subject_end])
+    if original_subject.startswith(AGENT_SUBJECT_PREFIX):
+        original_subject = original_subject[len(AGENT_SUBJECT_PREFIX) :]
+    rest = lines[subject_end + 1 :]
+
+    new_lines = _summary_subject_lines(summary)
+    new_lines.extend(["", "# Summary", "", *_body_lines(_mask_secrets(summary)), ""])
+    if original_subject.strip():
+        new_lines.extend(["# Prompts", "", *_body_lines(original_subject), ""])
+    new_lines.extend(rest)
+    if summary_metadata:
+        new_lines = _insert_before_version_line(new_lines, summary_metadata)
+    return "\n".join(new_lines).rstrip() + "\n"
+
+
+def summary_metadata_lines(*, model: str | None, tokens_input: int = 0, tokens_output: int = 0) -> list[str]:
+    """Metadata recording what the summarization itself cost (issue #8)."""
+    lines = [f"summary_model: {model or 'unknown'}"]
+    if tokens_input > 0:
+        lines.append(f"summary_tokens_input: {tokens_input}")
+    if tokens_output > 0:
+        lines.append(f"summary_tokens_output: {tokens_output}")
+    return lines
+
+
+def _summary_subject_lines(summary: str) -> list[str]:
+    first_line = next((line for line in summary.strip().splitlines() if line.strip()), DEFAULT_SUBJECT)
+    subject, full = _subject_parts(_mask_secrets(first_line), width=MAX_SUBJECT_WIDTH - len(AGENT_SUBJECT_PREFIX))
+    lines = [f"{AGENT_SUBJECT_PREFIX}{subject}"]
+    if full:
+        lines.extend(_body_lines(full))
+    return lines
+
+
+def _insert_before_version_line(lines: list[str], extra: list[str]) -> list[str]:
+    for index in range(len(lines) - 1, -1, -1):
+        if lines[index].startswith("agit_version:"):
+            return lines[:index] + list(extra) + lines[index:]
+    return lines + list(extra)
 
 
 def build_backend_amend_message(
@@ -142,12 +214,18 @@ def _trace_and_metadata_lines(
     session_name: str | None,
     summary: str | None,
     covered_commits: list[str] | None,
+    prompts: str | None = None,
+    summary_metadata: list[str] | None = None,
 ) -> list[str]:
     lines: list[str] = []
     if summary:
         lines.extend(["# Summary", ""])
-        lines.extend(_body_lines(summary))
+        lines.extend(_body_lines(_mask_secrets(summary)))
         lines.append("")
+    if prompts and prompts.strip():
+        # When the summary takes the subject (#8), the prompts that used to
+        # head the message are preserved here.
+        lines.extend(["# Prompts", "", *_body_lines(_mask_secrets(prompts)), ""])
     lines.extend(["# Interaction Trace", ""])
     for item in _limit_trace_turns(trace, trace_turn_limit):
         role = item.get("role", "").strip().lower()
@@ -171,6 +249,8 @@ def _trace_and_metadata_lines(
         # For an amended backend commit the hash listed is its pre-amend id.
         lines.append(f"covered_commits: {' '.join(covered_commits)}")
     lines.extend(_token_metadata_lines(token_usage))
+    if summary_metadata:
+        lines.extend(summary_metadata)
     lines.append(f"agit_version: {__version__}")
     return lines
 
