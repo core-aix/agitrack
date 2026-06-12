@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
-from typing import TextIO
+from typing import IO
 
 from agit.backends.base import AgentResult, TokenUsage
 
@@ -11,9 +11,10 @@ from agit.backends.base import AgentResult, TokenUsage
 class OpenCodeBackend:
     name = "opencode"
 
-    def __init__(self, repo: Path, *, verbose: bool = False) -> None:
+    def __init__(self, repo: Path, *, verbose: bool = False, backend_args: list[str] | None = None) -> None:
         self.repo = repo
         self.verbose = verbose
+        self.backend_args = list(backend_args or [])  # forwarded verbatim to the backend CLI (#32)
 
     def run(self, prompt: str, *, model: str | None, session_id: str | None) -> AgentResult:
         command = ["opencode", "run", "--format", "json", "--dir", str(self.repo)]
@@ -21,6 +22,8 @@ class OpenCodeBackend:
             command.extend(["--model", model])
         if session_id:
             command.extend(["--session", session_id])
+        # Passthrough options go before the prompt positional (#32).
+        command.extend(self.backend_args)
         if prompt.startswith("/"):
             slash_command, args = self._split_slash_command(prompt)
             if slash_command:
@@ -50,7 +53,7 @@ class OpenCodeBackend:
             tokens=tokens,
         )
 
-    def _read_events(self, output: TextIO | None) -> tuple[str, str | None, str | None, TokenUsage]:
+    def _read_events(self, output: IO[str] | None) -> tuple[str, str | None, str | None, TokenUsage]:
         if output is None:
             return "", None, None, TokenUsage()
 
@@ -150,10 +153,7 @@ class OpenCodeBackend:
         event_type = str(event.get("type", "")).lower()
         part_type = str(part.get("type", "")).lower()
         # opencode sends final responses as "text" type events
-        return (
-            event_type in {"final", "complete", "done", "text"}
-            or part_type in {"final", "complete", "done", "text"}
-        )
+        return event_type in {"final", "complete", "done", "text"} or part_type in {"final", "complete", "done", "text"}
 
     def _event_status(self, event: dict, part: dict) -> str | None:
         event_type = str(event.get("type", "")).lower()
@@ -170,7 +170,9 @@ class OpenCodeBackend:
         if not isinstance(tokens, dict):
             return TokenUsage()
 
-        cache = tokens.get("cache") if isinstance(tokens.get("cache"), dict) else {}
+        cache = tokens.get("cache")
+        if not isinstance(cache, dict):
+            cache = {}
         input_tokens = self._int_value(tokens.get("input"))
         output_tokens = self._int_value(tokens.get("output"))
         reasoning_tokens = self._int_value(tokens.get("reasoning"))

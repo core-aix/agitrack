@@ -35,6 +35,12 @@ ANSI_SEQUENCE_RE = re.compile(
 CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
+# Section header that marks a commit as carrying aGiT metadata. Detection of
+# backend-made commits (issue #35) checks message bodies for this exact text,
+# so keep the builders and the detector on one definition.
+METADATA_HEADER = "# aGiT Metadata"
+
+
 def build_agent_commit_message(
     *,
     latest_prompt: str,
@@ -47,14 +53,97 @@ def build_agent_commit_message(
     trace_turn_limit: int = 5,
     session_name: str | None = None,
     summary: str | None = None,
+    covered_commits: list[str] | None = None,
 ) -> str:
-    subject_prompt, full_subject = _subject_parts(_mask_secrets(latest_prompt), width=MAX_SUBJECT_WIDTH - len(AGENT_SUBJECT_PREFIX))
+    subject_prompt, full_subject = _subject_parts(
+        _mask_secrets(latest_prompt), width=MAX_SUBJECT_WIDTH - len(AGENT_SUBJECT_PREFIX)
+    )
     lines = [f"{AGENT_SUBJECT_PREFIX}{subject_prompt}"]
     if full_subject:
         # The truncated subject flows straight into its full text with no blank
         # line between them, so the extended subject reads as one continued line.
         lines.extend(_body_lines(full_subject))
     lines.append("")
+    lines.extend(
+        _trace_and_metadata_lines(
+            trace=trace,
+            backend=backend,
+            backend_session_id=backend_session_id,
+            agit_session_id=agit_session_id,
+            model=model,
+            token_usage=token_usage,
+            trace_turn_limit=trace_turn_limit,
+            session_name=session_name,
+            summary=summary,
+            covered_commits=covered_commits,
+        )
+    )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def build_backend_amend_message(
+    *,
+    original_message: str,
+    trace: list[dict],
+    backend: str,
+    backend_session_id: str | None,
+    agit_session_id: str,
+    model: str | None,
+    token_usage: dict[str, int | None] | None = None,
+    trace_turn_limit: int = 5,
+    session_name: str | None = None,
+    summary: str | None = None,
+    covered_commits: list[str] | None = None,
+) -> str:
+    """Message for amending a commit the backend made itself (issue #35).
+
+    Keeps the backend's own subject and body (prefixing the subject with
+    ``<agent> `` so the log reads like any other agent commit), then appends
+    the interaction trace and aGiT metadata. ``covered_commits`` records the
+    pre-amend hashes of every backend-made commit this metadata accounts for —
+    the amended commit itself plus any earlier ones in the same turn.
+    """
+    original = _mask_secrets(original_message).strip()
+    subject, _, body = original.partition("\n")
+    if not subject.strip():
+        subject = DEFAULT_SUBJECT
+    if not subject.startswith(AGENT_SUBJECT_PREFIX.strip()):
+        subject = f"{AGENT_SUBJECT_PREFIX}{subject.strip()}"
+    lines = [subject]
+    if body.strip():
+        lines.extend(["", body.strip()])
+    lines.append("")
+    lines.extend(
+        _trace_and_metadata_lines(
+            trace=trace,
+            backend=backend,
+            backend_session_id=backend_session_id,
+            agit_session_id=agit_session_id,
+            model=model,
+            token_usage=token_usage,
+            trace_turn_limit=trace_turn_limit,
+            session_name=session_name,
+            summary=summary,
+            covered_commits=covered_commits,
+        )
+    )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _trace_and_metadata_lines(
+    *,
+    trace: list[dict],
+    backend: str,
+    backend_session_id: str | None,
+    agit_session_id: str,
+    model: str | None,
+    token_usage: dict[str, int | None] | None,
+    trace_turn_limit: int,
+    session_name: str | None,
+    summary: str | None,
+    covered_commits: list[str] | None,
+) -> list[str]:
+    lines: list[str] = []
     if summary:
         lines.extend(["# Summary", ""])
         lines.extend(_body_lines(summary))
@@ -68,7 +157,7 @@ def build_agent_commit_message(
 
     lines.extend(
         [
-            "# aGiT Metadata",
+            METADATA_HEADER,
             "commit_type: agent",
             f"backend: {backend}",
             f"model: {model or 'unknown'}",
@@ -77,9 +166,13 @@ def build_agent_commit_message(
             f"backend_session_id: {backend_session_id or 'unknown'}",
         ]
     )
+    if covered_commits:
+        # Which commit hashes this trace/metadata accounts for (issue #35).
+        # For an amended backend commit the hash listed is its pre-amend id.
+        lines.append(f"covered_commits: {' '.join(covered_commits)}")
     lines.extend(_token_metadata_lines(token_usage))
     lines.append(f"agit_version: {__version__}")
-    return "\n".join(lines).rstrip() + "\n"
+    return lines
 
 
 AGENT_MERGE_SUBJECT_PREFIX = "<agent-merge> "
@@ -132,7 +225,15 @@ def build_user_commit_message(
         # Extended subject continues directly under the subject line (no blank).
         lines.extend(_body_lines(full_subject))
     lines.append("")
-    lines.extend(["# aGiT Metadata", "commit_type: user", "backend: agit", f"agit_session_id: {agit_session_id}", f"agit_version: {__version__}"])
+    lines.extend(
+        [
+            "# aGiT Metadata",
+            "commit_type: user",
+            "backend: agit",
+            f"agit_session_id: {agit_session_id}",
+            f"agit_version: {__version__}",
+        ]
+    )
     return "\n".join(lines).rstrip() + "\n"
 
 

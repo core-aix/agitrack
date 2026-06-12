@@ -1,5 +1,3 @@
-import pytest
-from pathlib import Path
 from agit.config import AgitState, GlobalConfig
 
 
@@ -20,7 +18,7 @@ def test_summarization_enabled_persists(tmp_path):
     state = AgitState(tmp_path)
     state.summarization_enabled = False
     state.save()
-    
+
     state2 = AgitState(tmp_path)
     assert state2.summarization_enabled is False
 
@@ -45,6 +43,6 @@ def test_global_summarization_enabled_persists(tmp_path):
     config = GlobalConfig(config_path)
     config.summarization_enabled = False
     config.save()
-    
+
     config2 = GlobalConfig(config_path)
     assert config2.summarization_enabled is False
