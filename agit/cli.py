@@ -44,6 +44,12 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="start a fresh backend conversation instead of resuming the last one",
     )
+    parser.add_argument(
+        "--no-worktree",
+        action="store_true",
+        help="run the agent against the current branch instead of an isolated worktree "
+        "(edits are visible live; no isolation/integration; unsafe with concurrent sessions)",
+    )
     parser.epilog = (
         "Unrecognized arguments are forwarded verbatim to the backend CLI "
         "(claude / opencode), e.g. `agit --backend opencode --port 12345`. Use "
@@ -83,6 +89,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.backend is None and not config.has_default_backend() and sys.stdin.isatty() and sys.stdout.isatty():
         select_default_backend(config)
 
+    # Worktrees on unless the config opts out or --no-worktree is passed (flag wins).
+    use_worktrees = False if args.no_worktree else config.use_worktrees
+
     if backend_args:
         _warn_reserved_passthrough(args.backend or config.default_backend, backend_args)
 
@@ -104,6 +113,7 @@ def main(argv: list[str] | None = None) -> int:
                 verbose=args.verbose,
                 backend=args.backend,
                 new_session=args.new_session,
+                use_worktrees=use_worktrees,
                 backend_args=backend_args,
             ).run()
     except (GitError, RuntimeError) as error:
