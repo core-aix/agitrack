@@ -151,7 +151,8 @@ def test_clean_tree_amends_latest_backend_commit(tmp_path):
     assert head_message.startswith("<aGiT> backend commit two")
     assert "# Interaction Trace" in head_message
     assert "add the feature" in head_message
-    assert f"covered_commits: {first} {last}" in head_message
+    # Covered hashes are recorded in SHORT form, the amended commit included.
+    assert f"covered_commits: {repo.short_sha(first)} {repo.short_sha(last)}" in head_message
     assert repo.rev_parse("HEAD") != last  # amend rewrote the hash
     # The earlier backend commit is untouched (only HEAD may be amended).
     assert repo.commit_message("HEAD^").startswith("backend commit one")
@@ -192,7 +193,7 @@ def test_staged_changes_commit_lists_backend_commits_as_covered(tmp_path):
     assert committed is True
     head_message = repo.commit_message("HEAD")
     assert head_message.startswith("<agent> add the feature")
-    assert f"covered_commits: {backend_sha}" in head_message
+    assert f"covered_commits: {repo.short_sha(backend_sha)}" in head_message
     # The backend's own commit is preserved below, message intact.
     assert repo.rev_parse("HEAD^") == backend_sha
     assert repo.commit_message("HEAD^").startswith("backend commit")
@@ -209,7 +210,7 @@ def test_commit_turns_honors_tag_backend_commits_off(tmp_path):
     head_message = repo.commit_message("HEAD")
     assert head_message.startswith("backend commit\n")
     assert "<aGiT>" not in head_message
-    assert f"covered_commits: {sha}" in head_message  # metadata still attached
+    assert f"covered_commits: {repo.short_sha(sha)}" in head_message  # metadata still attached
 
 
 def test_summary_amend_preserves_agit_tag():
@@ -242,7 +243,7 @@ def test_amend_in_actions_mode_accumulates_trace_first(tmp_path):
     assert committed is True
     head_message = repo.commit_message("HEAD")
     assert "add the feature" in head_message
-    assert f"covered_commits: {sha}" in head_message
+    assert f"covered_commits: {repo.short_sha(sha)}" in head_message
 
 
 # --- runner detection and attach flow ----------------------------------------
