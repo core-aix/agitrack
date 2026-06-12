@@ -205,7 +205,7 @@ def _show_combined_help(
 
 
 PRIVACY_WARNING = (
-    "WARNING: aGiT records the conversation in git commit messages — every\n"
+    "\nWARNING: aGiT records the conversation in git commit messages — every\n"
     "message you enter in the chat can become part of the repository history.\n"
     "Do not enter passwords, API keys, or other sensitive information in the\n"
     "chat. (Keeping secrets out of prompts is good practice anyway.)"
