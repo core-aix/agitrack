@@ -15,6 +15,28 @@ import sys
 import termios
 import time
 import tty
+from typing import Any, Protocol
+
+
+class TerminalHostState(Protocol):
+    """Structural type for whatever ``TerminalHost``'s methods run against.
+
+    ``TerminalHost`` satisfies this directly; :class:`~agit.proxy.runner.ProxyRunner`
+    satisfies it via its host-terminal attributes and thin delegator methods, so the
+    runner can call ``TerminalHost.method(self, ...)`` unbound and still type-check.
+    """
+
+    old_attrs: Any
+    host_fg_value: bytes | None
+    host_bg_value: bytes | None
+    host_palette: dict[bytes, bytes]
+    host_da: bytes | None
+
+    def set_raw(self) -> None: ...
+    def set_cooked(self) -> None: ...
+    def enable_host_mouse(self) -> None: ...
+    def disable_host_terminal_modes(self) -> None: ...
+    def parse_host_terminal_responses(self, data: bytes, *, debug_fn=...) -> None: ...
 
 
 class TerminalHost:
@@ -43,14 +65,14 @@ class TerminalHost:
     # Terminal mode
     # ------------------------------------------------------------------
 
-    def set_raw(self) -> None:
+    def set_raw(self: TerminalHostState) -> None:
         tty.setraw(sys.stdin.fileno())
 
-    def set_cooked(self) -> None:
+    def set_cooked(self: TerminalHostState) -> None:
         if self.old_attrs is not None:
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self.old_attrs)
 
-    def restore_terminal(self) -> None:
+    def restore_terminal(self: TerminalHostState) -> None:
         # Disable mouse reporting *before* handing the terminal back, then drop any
         # mouse reports the terminal already queued — otherwise those buffered SGR
         # sequences (e.g. "\x1b[<35;..M") leak to the shell as stray hex after exit.
@@ -62,11 +84,11 @@ class TerminalHost:
         self.set_cooked()
         os.write(sys.stdout.fileno(), b"\x1b[?1049l\x1b[0m\r\n")
 
-    def pause_child_ui(self) -> None:
+    def pause_child_ui(self: TerminalHostState) -> None:
         self.set_cooked()
         os.write(sys.stdout.fileno(), b"\x1b[0m\r\n")
 
-    def resume_child_ui(self, render_fn) -> None:
+    def resume_child_ui(self: TerminalHostState, render_fn) -> None:
         self.set_raw()
         render_fn()
 
@@ -74,11 +96,11 @@ class TerminalHost:
     # Alt screen / mouse
     # ------------------------------------------------------------------
 
-    def enter_host_screen(self) -> None:
+    def enter_host_screen(self: TerminalHostState) -> None:
         os.write(sys.stdout.fileno(), b"\x1b[?1049h\x1b[2J\x1b[H")
         self.enable_host_mouse()
 
-    def enable_host_mouse(self) -> None:
+    def enable_host_mouse(self: TerminalHostState) -> None:
         # Enable SGR mouse reporting on the host (1000 = button press/release +
         # wheel) so aGiT receives wheel events for scrollback and press/release
         # for its own copy. This is the minimal mode that reliably reports the
@@ -87,7 +109,7 @@ class TerminalHost:
         # themselves (OpenCode) re-assert their own modes afterwards.
         os.write(sys.stdout.fileno(), b"\x1b[?1000h\x1b[?1006h")
 
-    def disable_host_terminal_modes(self) -> None:
+    def disable_host_terminal_modes(self: TerminalHostState) -> None:
         # Reset modes commonly enabled by full-screen TUIs: mouse tracking,
         # focus reporting, bracketed paste, alternate-scroll, cursor visibility,
         # and styling. Emit this independently from cooked-mode restoration so it
@@ -106,7 +128,7 @@ class TerminalHost:
     # Terminal size
     # ------------------------------------------------------------------
 
-    def terminal_size(self) -> tuple[int, int]:
+    def terminal_size(self: TerminalHostState) -> tuple[int, int]:
         try:
             size = os.get_terminal_size(sys.stdout.fileno())
             return size.lines, size.columns
@@ -117,7 +139,7 @@ class TerminalHost:
     # Host-terminal capability detection
     # ------------------------------------------------------------------
 
-    def detect_host_terminal(self, debug_fn=None) -> None:
+    def detect_host_terminal(self: TerminalHostState, debug_fn=None) -> None:
         # Ask the host terminal the same questions OpenCode asks on startup and
         # cache the raw answers. OpenCode adapts its entire theme to the
         # reported foreground/background, so relaying the real values is what
@@ -148,7 +170,7 @@ class TerminalHost:
                 break
         self.parse_host_terminal_responses(bytes(buffer), debug_fn=debug_fn)
 
-    def parse_host_terminal_responses(self, data: bytes, *, debug_fn=None) -> None:
+    def parse_host_terminal_responses(self: TerminalHostState, data: bytes, *, debug_fn=None) -> None:
         if not data:
             return
         fg = re.search(rb"\x1b\]10;([^\x07\x1b]*)(?:\x07|\x1b\\)", data)

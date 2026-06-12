@@ -148,6 +148,14 @@ class IntegrationService:
         self.menu_label = menu_label
         self.base_branch = base_branch  # mutable; updated by runner on base-switch
 
+    @property
+    def _base(self) -> str:
+        # base_branch is None only before the runner sets it at startup; every
+        # branch/merge/integrate method runs after that. Assert-and-return so
+        # those call sites type-check and the precondition stays loud.
+        assert self.base_branch is not None, "IntegrationService.base_branch is not set"
+        return self.base_branch
+
     # ------------------------------------------------------------------
     # Turn-branch lifecycle
     # ------------------------------------------------------------------
@@ -205,7 +213,7 @@ class IntegrationService:
         if repo.merge_in_progress() or repo.has_changes():
             return "noop"
         branch = repo.current_branch()
-        if branch.startswith("agit/") and self.base_repo.log_range(self.base_branch, branch):
+        if branch.startswith("agit/") and self.base_repo.log_range(self._base, branch):
             if not self.base_repo.log_range(branch, self.base_branch):
                 return "noop"  # already contains the base
             if repo.merge(self.base_branch):
@@ -214,7 +222,7 @@ class IntegrationService:
                 repo.merge_abort()  # conflicts; leave for integration
                 return f"conflict:{branch}"
         if repo.rev_parse("HEAD") != self.base_repo.rev_parse(self.base_branch):
-            repo.switch_detach(self.base_branch)
+            repo.switch_detach(self._base)
             return "repointed"
         return "noop"
 
@@ -223,7 +231,7 @@ class IntegrationService:
         try:
             if repo.has_changes():
                 return True
-            return bool(self.base_repo.log_range(self.base_branch, branch))
+            return bool(self.base_repo.log_range(self._base, branch))
         except Exception:
             return True
 
@@ -258,7 +266,7 @@ class IntegrationService:
         if not turn_branch.startswith("agit/"):
             return SKIP, ""
         try:
-            if not repo.merge(self.base_branch):
+            if not repo.merge(self._base):
                 repo.merge_abort()
                 return CONFLICT, turn_branch
             return INTEGRATED, turn_branch
@@ -276,7 +284,7 @@ class IntegrationService:
         if current != self.base_branch:
             raise RuntimeError(f"base repo is on '{current}', not the integration branch '{self.base_branch}'")
         self.base_repo.merge_ff_only(source_branch)
-        repo.switch_detach(self.base_branch)
+        repo.switch_detach(self._base)
         if repo.current_branch() != source_branch:
             self.base_repo.delete_branch(source_branch, force=True)
 
@@ -324,7 +332,7 @@ class IntegrationService:
         """
         files = repo.unmerged_paths()
         try:
-            context = self.base_repo.log_range(source_branch, self.base_branch, paths=files)
+            context = self.base_repo.log_range(source_branch, self._base, paths=files)
         except Exception:
             context = ""
         phase = MergePhase.MANUAL if manual else MergePhase.PENDING
@@ -339,7 +347,7 @@ class IntegrationService:
         """Build the conflict-resolution prompt text to inject into the agent."""
         files = repo.unmerged_paths()
         try:
-            context = self.base_repo.log_range(source_branch, self.base_branch, paths=files)
+            context = self.base_repo.log_range(source_branch, self._base, paths=files)
         except Exception:
             context = ""
         listing = ", ".join(files) if files else "the conflicted files"
@@ -410,7 +418,7 @@ class IntegrationService:
         repo.commit(
             build_agent_merge_message(
                 session_name=session_name,
-                base_branch=self.base_branch,
+                base_branch=self._base,
                 source_branch=source_branch,
                 agit_session_id=agit_session_id,
                 backend=backend_name,
@@ -451,7 +459,7 @@ class IntegrationService:
         # Conflict: build context (files + log) once
         files = repo.unmerged_paths()
         try:
-            context = self.base_repo.log_range(source_branch, self.base_branch, paths=files)
+            context = self.base_repo.log_range(source_branch, self._base, paths=files)
         except Exception:
             context = ""
         ctx = MergeContext(
@@ -486,8 +494,8 @@ class IntegrationService:
         if repo.merge_in_progress() or repo.has_changes():
             return False
         branch = repo.current_branch()
-        if branch.startswith("agit/") and self.base_repo.log_range(self.base_branch, branch):
-            if not repo.merge(self.base_branch):
+        if branch.startswith("agit/") and self.base_repo.log_range(self._base, branch):
+            if not repo.merge(self._base):
                 repo.merge_abort()
                 return False
             self.base_repo.merge_ff_only(branch)
@@ -503,7 +511,7 @@ class IntegrationService:
         for branch in self.base_repo.list_branches("agit/"):
             if branch in checked_out:
                 continue
-            if not self.base_repo.log_range(self.base_branch, branch):
+            if not self.base_repo.log_range(self._base, branch):
                 self.base_repo.delete_branch(branch, force=True)
                 deleted.append(branch)
         return deleted
@@ -518,7 +526,7 @@ class IntegrationService:
             if repo is None or repo.merge_in_progress() or repo.has_changes():
                 return True
             branch = repo.current_branch()
-            return branch.startswith("agit/") and bool(self.base_repo.log_range(self.base_branch, branch))
+            return branch.startswith("agit/") and bool(self.base_repo.log_range(self._base, branch))
         except Exception:
             return True
 
@@ -551,7 +559,7 @@ class IntegrationService:
             return None
         if repo.has_changes() or repo.merge_in_progress():
             return None
-        repo.switch_detach(self.base_branch)
+        repo.switch_detach(self._base)
         return 0
 
     # ------------------------------------------------------------------
