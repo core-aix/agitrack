@@ -487,6 +487,7 @@ h2.section::before{content:"# ";color:var(--amber)}
 /* ---- time-series chart ---- */
 .chartpanel{padding:14px 16px 10px;position:relative}
 .chart-head{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;flex-wrap:wrap;margin-bottom:10px}
+.chart-controls{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
 .gran{display:flex;align-items:center;gap:7px;color:var(--amber);font-size:11px;letter-spacing:.6px;text-transform:uppercase}
 .gran select{appearance:none;background:var(--ink);color:var(--fg);border:1px solid var(--line);
   font-family:var(--mono);font-size:12.5px;padding:5px 26px 5px 9px;cursor:pointer;text-transform:none;letter-spacing:normal;
@@ -646,12 +647,22 @@ footer{margin-top:46px;padding-top:22px;border-top:1px dashed var(--line);color:
   <div class="panel chartpanel">
     <div class="chart-head">
       <div class="legend" id="ts-legend"></div>
-      <div class="gran"><label for="ts-gran">per</label><select id="ts-gran">
-        <option value="hour">hour</option>
-        <option value="day">day</option>
-        <option value="week">week</option>
-        <option value="month">month</option>
-      </select></div>
+      <div class="chart-controls">
+        <div class="gran"><label for="ts-look">show</label><select id="ts-look">
+          <option value="0">all history</option>
+          <option value="1">last 24 hours</option>
+          <option value="7">last 7 days</option>
+          <option value="30">last 30 days</option>
+          <option value="90">last 90 days</option>
+          <option value="custom" hidden>custom (zoomed)</option>
+        </select></div>
+        <div class="gran"><label for="ts-gran">per</label><select id="ts-gran">
+          <option value="hour">hour</option>
+          <option value="day">day</option>
+          <option value="week">week</option>
+          <option value="month">month</option>
+        </select></div>
+      </div>
     </div>
     <div class="chartwrap"><canvas id="ts-canvas" title="Scroll to zoom the time axis · drag to pan · double-click to reset"></canvas><div class="tip" id="ts-tip" hidden></div></div>
     <div class="chart-empty" id="ts-empty" hidden>no dated commits in view</div>
@@ -1013,7 +1024,7 @@ function onChartMove(e){
   if(tsDrag){  // panning: shift the window opposite the drag
     const span = tsDrag.hi-tsDrag.lo, ddx = (e.clientX-tsDrag.x)/tsPlotW()*span;
     tsSetWindow(tsDrag.lo-ddx, tsDrag.hi-ddx, n);
-    tsHover=-1; $("ts-tip").hidden=true; renderChart(); return;
+    tsHover=-1; $("ts-tip").hidden=true; tsSyncLookSelect(); renderChart(); return;
   }
   const i = n<=1 ? 0 : tsIndexAt(px);
   if(i!==tsHover){ tsHover=i; renderChart(); }
@@ -1029,7 +1040,7 @@ function onChartWheel(e){
   const focus = lo + rel*(hi-lo);                       // bucket under the cursor
   let span = Math.max(1, Math.min(n-1, (hi-lo)*(e.deltaY<0?0.8:1.25)));  // zoom in/out
   tsSetWindow(focus-rel*span, focus-rel*span+span, n);  // keep the cursor anchored
-  tsHover=-1; renderChart();
+  tsHover=-1; tsSyncLookSelect(); renderChart();
 }
 function onChartDown(e){
   const n = (TS.t||[]).length; if(n<=1) return;
@@ -1038,7 +1049,22 @@ function onChartDown(e){
   $("ts-canvas").style.cursor = "grabbing"; $("ts-tip").hidden = true;
 }
 function onChartUp(){ if(tsDrag){ tsDrag=null; $("ts-canvas").style.cursor=""; } }
-function resetZoom(){ tsView=null; tsHover=-1; }
+function resetZoom(){ tsView=null; tsHover=-1; const s=$("ts-look"); if(s) s.value="0"; }
+// Keep the "show" dropdown in sync after a manual wheel/drag zoom: a narrowed
+// window reads as "custom", a full one as "all history".
+function tsSyncLookSelect(){ const s=$("ts-look"); if(s) s.value = tsView ? "custom" : "0"; }
+// The easy zoom: set the visible window to the most recent <days> of history
+// (0 = all). Operates on the already-loaded buckets, like the wheel/drag zoom.
+function applyLookback(days){
+  const t = TS.t||[], n = t.length;
+  if(n<=1 || !days){ tsView = null; }
+  else {
+    const cutoff = t[n-1] - days*DAY;       // bucket starts within the window
+    let lo = 0; while(lo < n-1 && t[lo] < cutoff) lo++;
+    tsView = (lo<=0) ? null : [lo, n-1];
+  }
+  tsHover = -1; renderChart();
+}
 function renderTimeseries(){ renderLegend(); renderChart(); }
 
 function renderLog(){
@@ -1171,6 +1197,8 @@ function init(){
   // Bucket granularity: refetch the (re-bucketed) series, reset zoom, redraw plot.
   $("ts-gran").value = state.granularity;
   $("ts-gran").onchange = async e => { state.granularity = e.target.value; resetZoom(); if(await loadAgg()) renderTimeseries(); };
+  // Easy zoom: pick how far back the plot's x axis looks (over loaded buckets).
+  $("ts-look").onchange = e => { if(e.target.value !== "custom") applyLookback(+e.target.value); };
   // Zoom/pan the x axis over the loaded buckets: wheel zooms (anchored on the
   // cursor), drag pans, double-click resets — all client-side, no refetch.
   const cv = $("ts-canvas");
