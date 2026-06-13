@@ -17,6 +17,7 @@ ref never grows a history.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, field
 
 from agit.git import GitRepo
@@ -24,6 +25,8 @@ from agit.sessions.identity import slug
 
 REF = "refs/agit/shared-sessions"
 DEFAULT_KEEP = 5  # most-recent shared sessions retained per contributor
+_FETCH_TTL = 60.0  # throttle remote fetches when the dashboard polls
+_fetch_at: dict[str, float] = {}
 
 
 @dataclass
@@ -126,6 +129,33 @@ class SharedSessionStore:
         if not self.repo.remote_exists():
             return False
         return self.repo.fetch_ref(f"+{self.ref}:{self.ref}")
+
+    def fetch_throttled(self) -> None:
+        """Best-effort fetch at most once per TTL — for pollers (the dashboard)
+        that want others' newly-shared sessions without hammering the remote."""
+        key = str(self.repo.repo)
+        now = time.monotonic()
+        if now - _fetch_at.get(key, 0.0) < _FETCH_TTL:
+            return
+        _fetch_at[key] = now
+        self.fetch()
+
+    def unshare(self, github_id: str, name: str) -> PublishResult:
+        """Remove one of the contributor's own shared sessions and push the
+        removal. Sync-then-rewrite-then-push, like :meth:`publish`."""
+        gid, nm = slug(github_id), slug(name)
+        base = f"{self._prefix()}{gid}/{nm}/"
+        remote = self.repo.remote_exists()
+        if remote:
+            self.fetch()
+        old = self.repo.ref_sha(self.ref)
+        kept = {k: v for k, v in self.repo.read_tree_paths(self.ref).items() if not k.startswith(base)}
+        self._commit(kept, f"agit: unshare session {gid}/{nm}")
+        if not remote:
+            return PublishResult(remote=False, pushed=False)
+        lease = f"{self.ref}:{old}" if old else None
+        ok, err = self.repo.push_ref(f"{self.ref}:{self.ref}", force_with_lease=lease)
+        return PublishResult(remote=True, pushed=ok, error="" if ok else err.strip())
 
     def publish(
         self, *, github_id: str, name: str, transcript: str, manifest: dict, keep: int = DEFAULT_KEEP

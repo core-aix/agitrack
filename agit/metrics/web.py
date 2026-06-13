@@ -34,11 +34,37 @@ from agit.metrics.collect import CommitStat, Dashboard, build_dashboard
 def render_html(repo: GitRepo, ref: str = "HEAD") -> str:
     from agit.metrics.github import resolve_logins
 
-    return format_html(build_dashboard(repo, ref, sha_logins=resolve_logins(repo)))
+    return format_html(
+        build_dashboard(repo, ref, sha_logins=resolve_logins(repo)),
+        shared_sessions=shared_sessions_for(repo),
+    )
 
 
-def format_html(dash: Dashboard) -> str:
-    payload = json.dumps(initial_payload(dash), separators=(",", ":"))
+def shared_sessions_for(repo: GitRepo) -> list[dict]:
+    """Sessions shared into this repo (issue #55), for the dashboard. Reads the
+    local shared ref plus a throttled remote fetch so teammates' newly-shared
+    sessions appear; never raises (sharing may be unconfigured/offline)."""
+    try:
+        from agit.sessions import SharedSessionStore
+
+        store = SharedSessionStore(repo)
+        store.fetch_throttled()
+        return [
+            {
+                "github_id": entry.github_id,
+                "name": entry.name,
+                "model": entry.manifest.get("model"),
+                "backend": entry.manifest.get("backend"),
+                "updated": entry.manifest.get("updated", 0),
+            }
+            for entry in store.entries()
+        ]
+    except Exception:
+        return []
+
+
+def format_html(dash: Dashboard, *, shared_sessions: list[dict] | None = None) -> str:
+    payload = json.dumps(initial_payload(dash, shared_sessions=shared_sessions), separators=(",", ":"))
     repo_name = dash.repo.rstrip("/").rsplit("/", 1)[-1] or dash.repo
     return (
         _TEMPLATE.replace("__DATA__", payload)
@@ -390,15 +416,16 @@ def log_page(
     }
 
 
-def initial_payload(dash: Dashboard) -> dict:
+def initial_payload(dash: Dashboard, *, shared_sessions: list[dict] | None = None) -> dict:
     """What the page embeds for an instant first paint: unfiltered aggregates,
-    the first log page, repo metadata, and the page size."""
+    the first log page, repo metadata, the page size, and any shared sessions."""
     return {
         "repo": dash.repo,
         "branch": dash.branch,
         "page_size": PAGE_SIZE,
         **aggregates_payload(dash),
         "log": log_page(dash),
+        "shared_sessions": shared_sessions or [],
     }
 
 
@@ -530,6 +557,15 @@ h2.section::before{content:"# ";color:var(--amber)}
 .row .num{text-align:right;color:var(--fg-dim);font-size:12.5px}
 .row .num b{color:var(--phosphor);font-weight:600}
 .empty{padding:16px 18px;color:var(--fg-dim)}
+/* shared sessions list */
+.srow{display:grid;grid-template-columns:minmax(160px,1.6fr) 2fr auto;gap:14px;align-items:baseline;
+  padding:11px 18px;border-bottom:1px solid var(--line)}
+.srow:last-child{border-bottom:none}
+.srow .sid{color:var(--phosphor);font-weight:500;overflow-wrap:anywhere}
+.srow .sid b{color:var(--amber);font-weight:600}
+.srow .smeta{color:var(--fg-dim);font-size:12.5px}
+.srow .sage{color:var(--fg-dim);font-size:12px;text-align:right;white-space:nowrap}
+@media (max-width:760px){.srow{grid-template-columns:1fr;gap:4px}.srow .sage{text-align:left}}
 .hint{padding:8px 18px 0;color:var(--fg-dim);font-size:11.5px;font-style:italic}
 .kindcounts{padding:11px 18px;border-top:1px solid var(--line);font-size:12.5px;color:var(--fg-dim);line-height:1.9}
 .kindcounts .klabel{color:var(--amber);margin-right:4px}
@@ -690,6 +726,9 @@ footer{margin-top:46px;padding-top:22px;border-top:1px dashed var(--line);color:
   <h2 class="section">possible loops</h2>
   <div class="panel" id="loops"></div>
 
+  <h2 class="section">shared sessions</h2>
+  <div class="panel" id="shared"></div>
+
   <h2 class="section">commit log</h2>
   <div class="log" id="commitlog"></div>
 
@@ -712,6 +751,7 @@ const PAGE_SIZE = INIT.page_size || 50;
 let HEAD = INIT.head, AGG = INIT.agg, LOGPAGE = INIT.log, OPTIONS = INIT.options, GENERATED = INIT.generated_at;
 let TS = INIT.timeseries || {t:[]};  // per-period series for the activity-over-time plot
 let SPAN = INIT.span || {from:0, to:0};  // full-history commit-date range (epoch seconds)
+let SHARED = INIT.shared_sessions || [];  // sessions shared into this repo (issue #55)
 let LOG_ENTRIES = [];  // entries of the page currently rendered (for toggleDetail)
 
 // The plottable series and which are currently shown. Each is normalised to its
@@ -763,7 +803,7 @@ function qs(extra){
 async function loadAgg(){
   try{ const r = await fetch("data?"+qs(), {cache:"no-store"}); if(r.ok){
     const d = await r.json(); HEAD=d.head; AGG=d.agg; OPTIONS=d.options; GENERATED=d.generated_at;
-    TS = d.timeseries || {t:[]}; if(d.span) SPAN = d.span;
+    TS = d.timeseries || {t:[]}; if(d.span) SPAN = d.span; if(d.shared_sessions) SHARED = d.shared_sessions;
     setOffline(false); return true; } }
   catch(e){ if(LIVE) setOffline(true); }  // network failure ⇒ server unreachable
   return false;
@@ -896,6 +936,25 @@ function renderAgg(){
 
   tsHover = -1;
   renderTimeseries();
+  renderShared();
+}
+function renderShared(){
+  const el = $("shared"); if(!el) return;
+  if(!SHARED.length){
+    el.innerHTML = `<div class="empty">no sessions shared yet — share one from aGiT (Ctrl-G → session → Share this session)</div>`;
+    return;
+  }
+  el.innerHTML = SHARED.map(s => {
+    const meta = [s.model, s.backend].filter(Boolean).map(esc).join(" · ");
+    const age = s.updated ? sharedAge(s.updated) : "";
+    return `<div class="srow"><span class="sid">${esc(s.github_id)}<b>/</b>${esc(s.name)}</span>`+
+      `<span class="smeta">${meta}</span><span class="sage">${esc(age)}</span></div>`;
+  }).join("");
+}
+function sharedAge(epoch){
+  const d = Math.max(0, Math.floor(Date.now()/1000 - epoch));
+  for(const [s,u] of [[86400,"d"],[3600,"h"],[60,"m"]]) if(d>=s) return `${Math.floor(d/s)}${u} ago`;
+  return "just now";
 }
 function groupPanel(groups){
   const entries = Object.entries(groups).sort((a,b)=>b[1].commits-a[1].commits ||

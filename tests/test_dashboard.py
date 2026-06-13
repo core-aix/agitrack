@@ -617,6 +617,39 @@ def test_aggregates_payload_reports_full_history_span(tmp_path):
     assert aggregates_payload(dash, backend="claude")["span"] == span
 
 
+def test_dashboard_lists_shared_sessions(tmp_path):
+    from agit.metrics.web import render_html, shared_sessions_for
+    from agit.sessions import SharedSessionStore
+
+    repo = _demo_repo(tmp_path)
+    SharedSessionStore(repo).publish(
+        github_id="alice",
+        name="fix-parser",
+        transcript="conversation",
+        manifest={
+            "github_id": "alice",
+            "name": "fix-parser",
+            "session_id": "s1",
+            "model": "claude-opus-4-8",
+            "backend": "claude",
+            "updated": 123,
+        },
+    )
+    listed = shared_sessions_for(repo)
+    assert [f"{s['github_id']}/{s['name']}" for s in listed] == ["alice/fix-parser"]
+    assert listed[0]["model"] == "claude-opus-4-8"
+    # The panel + render hook are wired, and the first paint embeds the list.
+    html = render_html(repo)
+    assert 'id="shared"' in html and "function renderShared" in html
+    assert _embedded_data(html)["shared_sessions"][0]["name"] == "fix-parser"
+
+
+def test_shared_sessions_for_is_safe_without_sharing(tmp_path):
+    from agit.metrics.web import shared_sessions_for
+
+    assert shared_sessions_for(_demo_repo(tmp_path)) == []  # nothing shared ⇒ empty, no error
+
+
 def test_timeseries_respects_filters(tmp_path):
     from agit.metrics.web import aggregates_payload
 
