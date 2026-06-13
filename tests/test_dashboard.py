@@ -627,6 +627,9 @@ def test_render_html_wires_the_activity_chart(tmp_path):
     # x-axis zoom/pan over the loaded buckets: wheel zoom, drag pan, dblclick reset.
     assert "function onChartWheel" in html and 'addEventListener("wheel"' in html
     assert "function tsBounds" in html and 'addEventListener("dblclick"' in html
+    # An easy "look back" dropdown that zooms the x axis to recent history.
+    assert 'id="ts-look"' in html and "function applyLookback" in html
+    assert "last 7 days" in html and "last 30 days" in html
     data = _embedded_data(html)
     assert "timeseries" in data and sum(data["timeseries"]["commits"]) == 7
 
