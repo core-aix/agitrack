@@ -7,7 +7,6 @@ from agit.commits.message import (
     apply_summary_to_message,
     build_agent_commit_message,
     build_agent_merge_message,
-    build_backend_amend_message,
     build_user_commit_message,
     summary_metadata_lines,
 )
@@ -18,7 +17,6 @@ __all__ = [
     "apply_summary_to_message",
     "build_agent_commit_message",
     "build_agent_merge_message",
-    "build_backend_amend_message",
     "build_user_commit_message",
     "summary_metadata_lines",
 ]
