@@ -255,6 +255,19 @@ def test_commit_messages_include_current_agit_version_without_created_at():
     assert "created_at" not in message
 
 
+def test_commit_version_matches_installed_distribution():
+    # The version stamped into commit metadata must equal the aGiT the user has
+    # installed — agit.__version__ derives from the distribution metadata so the
+    # two cannot drift (pyproject.toml is the single version source).
+    from importlib.metadata import version
+
+    from agit import __version__
+
+    assert __version__ == version("agit-ai")
+    message = build_user_commit_message(message="save work", agit_session_id="agit-1")
+    assert f"agit_version: {version('agit-ai')}" in message
+
+
 def test_agent_commit_subject_is_capped_for_github():
     message = build_agent_commit_message(
         latest_prompt="please " * 40,

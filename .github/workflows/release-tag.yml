@@ -35,7 +35,7 @@ jobs:
           VERSION=${GITHUB_REF#refs/tags/v}
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
-      - name: Update version files
+      - name: Update version file
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           python3 <<PY
@@ -43,20 +43,13 @@ jobs:
 
           version = "$VERSION"
 
+          # pyproject.toml is the only version source; agit.__version__ derives
+          # from the installed distribution metadata at runtime.
           pp = pathlib.Path("pyproject.toml")
           pp.write_text(re.sub(
               r'^version = "[^"]+"',
               f'version = "{version}"',
               pp.read_text(),
-              count=1,
-              flags=re.M
-          ))
-
-          ip = pathlib.Path("agit/__init__.py")
-          ip.write_text(re.sub(
-              r'^__version__ = "[^"]+"',
-              f'__version__ = "{version}"',
-              ip.read_text(),
               count=1,
               flags=re.M
           ))
@@ -71,8 +64,8 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git switch -c "$BRANCH"
-          git add pyproject.toml agit/__init__.py
-          # The version files may already match the tag (e.g. the tag was placed
+          git add pyproject.toml
+          # The version file may already match the tag (e.g. the tag was placed
           # on an already-bumped commit). Only open a PR when there's a change —
           # main cannot be pushed to directly, so the sync goes through a PR.
           if git diff --cached --quiet; then
