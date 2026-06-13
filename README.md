@@ -104,12 +104,22 @@ git-status                show git status
 git-stage                 review and stage untracked files
 git-unstaged              show intentionally unstaged files
 git-user-commit           create a user commit
+update                    check for / install an aGiT self-update
 exit                      exit (with confirmation)
 ```
 
 aGiT tracks one session per repository and stays pinned to the session it launched (so it does not drift to other sessions you open). Use the `session` command (`Ctrl-G`, then `session`) to start a new session, switch the tracked session to another existing one, or sync tracking to the most recently active session — for example after starting a new conversation inside the backend's own TUI. This works the same for all backends.
 
 Only `session` starts with `s`, so `Ctrl-G` then `s` + Enter jumps straight to the session picker. The session menu marks each session `running` or `idle`. Git-specific commands share a `git-` prefix.
+
+### Self-update
+
+aGiT keeps itself current. On startup, and then about every five minutes while you work, it checks whether a newer aGiT is available:
+
+- **Source-linked install** (the editable `pip install -e .` from a git checkout): it fetches the checkout's upstream branch and compares it with your current branch.
+- **Package install** (a wheel from a package index): it compares the installed version with the latest published one.
+
+If an update exists, aGiT prompts you at startup and shows a notice during a session (run the `update` command from the `Ctrl-G` menu to act on it). When you accept, aGiT waits until **every session has finished and all commits are integrated**, installs the update, then restarts itself automatically. Source updates are fast-forward-only and are skipped (with a message) if the checkout has uncommitted changes or has diverged from upstream, so an update never disturbs local development. Choose "Stop checking for updates" — or set `"check_for_updates": false` in `~/.agit/config.json` — to turn the checks off; tune the cadence with `timings.update_check_seconds`.
 
 
 Proxy mode launches the backend's native TUI directly and recovers session metadata for automatic agent commits — via `opencode export` for OpenCode, or by reading the session transcript under `~/.claude/projects/` for Claude.

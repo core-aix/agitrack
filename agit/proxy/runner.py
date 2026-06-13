@@ -56,6 +56,7 @@ from agit.proxy.renderer import (
 
 # TerminalHost lives in terminal.py (P1).
 from agit.proxy.terminal import TerminalHost
+from agit.update import Updater, UpdateStatus, restart_agit
 
 # Modal state-machines (P6 Stage 2): PromptModal and SelectModal encode the
 # byte-handling logic for free-text and selection popups.
@@ -129,6 +130,7 @@ class ProxyInput:
         "git-stage",
         "git-unstaged",
         "git-user-commit",
+        "update",
         "exit",
     ]
 
@@ -429,6 +431,18 @@ class ProxyRunner:
         # One diagnostic-log file per run, in the base repo's .agit/ (survives the
         # per-run worktree teardown).
         self._diag_run = time.strftime("%Y%m%d-%H%M%S")
+        # Self-update: a background check runs on a throttle; when the user opts
+        # in, the update is applied once every session is finished and committed,
+        # then aGiT re-execs itself.
+        self._updater = Updater()
+        self._update_status: UpdateStatus | None = None  # latest completed check result
+        self._update_check_at = 0.0  # throttle for the periodic background check
+        self._update_check_thread: threading.Thread | None = None
+        self._update_worker_result: UpdateStatus | None = None  # worker -> main handoff
+        self._update_offered = False  # have we notified the user about the current update?
+        self._update_pending = False  # user accepted; apply once sessions finish
+        self._update_applying = False  # apply+restart in progress
+        self._pending_restart = False  # re-exec aGiT after the loop tears down
 
     def _apply_timings(self, timings: dict[str, float]) -> None:
         # Override the class-constant timing defaults with the user's configured
@@ -442,6 +456,7 @@ class ProxyRunner:
         self.CWD_CHECK_SECONDS = timings["cwd_check_seconds"]
         self.BASE_DRIFT_CHECK_SECONDS = timings["base_drift_check_seconds"]
         self.SUMMARY_WAIT_SECONDS = timings["summary_wait_seconds"]
+        self.UPDATE_CHECK_SECONDS = timings["update_check_seconds"]
 
     # --- session pointer -------------------------------------------------
 
@@ -588,6 +603,17 @@ class ProxyRunner:
                 "_relaunch_times": [],
                 "_exiting": False,
                 "_finalized_on_exit": False,
+                # Self-update fields (production sets these in __init__).
+                "_updater": None,
+                "_update_status": None,
+                "_update_check_at": 0.0,
+                "_update_check_thread": None,
+                "_update_worker_result": None,
+                "_update_offered": False,
+                "_update_pending": False,
+                "_update_applying": False,
+                "_pending_restart": False,
+                "UPDATE_CHECK_SECONDS": 300.0,
             }
         )
         # Apply timing class-constant defaults (so CHILD_IDLE_SECONDS etc. resolve).
@@ -672,7 +698,7 @@ class ProxyRunner:
             signal.signal(signal.SIGTERM, self._handle_exit_signal)
             signal.signal(signal.SIGHUP, self._handle_exit_signal)
             self._setup_worktree_confinement_notice()
-            return self._loop()
+            exit_code = self._loop()
         finally:
             if self.original_sigwinch is not None:
                 signal.signal(signal.SIGWINCH, self.original_sigwinch)
@@ -687,6 +713,11 @@ class ProxyRunner:
                 except OSError:
                     pass
             self.management_lock.release()
+        # A self-update was applied; re-exec aGiT in place now that the terminal
+        # is restored and the management lock is released. Does not return.
+        if self._pending_restart:
+            restart_agit()
+        return exit_code
 
     def _ensure_backend_available(self) -> bool:
         try:
@@ -868,6 +899,168 @@ class ProxyRunner:
             seconds=30.0,
         )
         self._render()
+
+    # ------------------------------------------------------------------
+    # Self-update (#: check periodically, apply once sessions are finished)
+    # ------------------------------------------------------------------
+
+    def _update_checks_enabled(self) -> bool:
+        gc = getattr(self, "global_config", None)
+        return bool(getattr(gc, "check_for_updates", True)) if gc is not None else False
+
+    def _maybe_check_for_update(self) -> None:
+        # Kick off a background self-update check on a throttle, and surface a
+        # finished one. Network I/O (`git fetch`) runs on a worker thread so the
+        # terminal never stalls; the result is handed back and consumed here on
+        # the main thread.
+        self._consume_update_check_result()
+        if self._updater is None or not self._update_checks_enabled():
+            return
+        if self._update_pending or self._update_applying:
+            return  # already decided / in progress — stop nagging
+        if self._update_check_thread is not None and self._update_check_thread.is_alive():
+            return
+        now = time.monotonic()
+        if self._update_check_at and now - self._update_check_at < self.UPDATE_CHECK_SECONDS:
+            return
+        self._update_check_at = now
+        updater = self._updater
+
+        def worker() -> None:
+            try:
+                self._update_worker_result = updater.check()
+            except Exception as error:  # never let a check crash the worker
+                self._debug(f"update check failed: {error!r}")
+                self._update_worker_result = None
+
+        self._update_worker_result = None
+        self._update_check_thread = threading.Thread(target=worker, daemon=True, name="agit-update-check")
+        self._update_check_thread.start()
+
+    def _consume_update_check_result(self) -> None:
+        thread = self._update_check_thread
+        if thread is None or thread.is_alive():
+            return
+        result = self._update_worker_result
+        self._update_check_thread = None
+        self._update_worker_result = None
+        if result is None or not result.ok:
+            return
+        self._update_status = result
+        if result.available and not self._update_offered:
+            # First time we have seen this update: prompt the user (a status-bar
+            # notice pointing at the `update` command, so we don't seize the
+            # screen mid-keystroke).
+            self._update_offered = True
+            self._set_message(
+                f"{result.message}\n{self._menu_label()} → 'update' to install it when your sessions finish.",
+                seconds=12.0,
+            )
+            self._render()
+
+    def _ready_for_update(self) -> bool:
+        # "All sessions finished and commits are in": nothing is mid-turn,
+        # mid-parse, mid-merge, or mid-summary anywhere. The actual commit +
+        # integration of finished work is flushed by _finalize_pending_work()
+        # right before the update is applied.
+        if getattr(self, "merge_ctx", None):
+            return False
+        if getattr(self, "agent_in_flight", False):
+            return False
+        if getattr(self, "agent_parse_active", False):
+            return False
+        if getattr(self, "pending_forwarded", None) or getattr(self, "pending_prompt_text", ""):
+            return False
+        if getattr(self, "_summary_pending", None) is not None:
+            return False
+        summary_thread = getattr(self, "_summary_thread", None)
+        if summary_thread is not None and summary_thread.is_alive():
+            return False
+        if self._running_background_session_names():
+            return False
+        return True
+
+    def _maybe_apply_pending_update(self) -> None:
+        if not self._update_pending or self._update_applying:
+            return
+        if not self._ready_for_update():
+            return
+        self._apply_update_and_restart()
+
+    def _apply_update_and_restart(self) -> None:
+        # Commit + integrate every session's finished work (same path as exit),
+        # install the update, then ask run()'s teardown to re-exec aGiT.
+        self._update_applying = True
+        self._update_pending = False
+        self._set_message("Finishing commits, then updating aGiT…", seconds=30.0)
+        self._render()
+        try:
+            self._finalize_pending_work()
+        except Exception as error:  # don't let a commit hiccup strand the update
+            self._debug(f"finalize before update failed: {error!r}")
+        result = self._updater.apply()
+        if not result.ok:
+            self._update_applying = False
+            self._finalized_on_exit = False  # allow a later clean exit to finalize again
+            self._exiting = False
+            self._set_message(f"aGiT update failed: {result.error}", seconds=12.0)
+            self._render()
+            return
+        # Success: stop the loop and let run()'s finally restore the terminal and
+        # release the lock before _pending_restart triggers the re-exec.
+        self._set_message(f"{result.message} Restarting aGiT…", seconds=10.0)
+        self._render()
+        self._exit_child()
+        self._pending_restart = True
+        self.running = False
+
+    def _handle_update_command(self) -> None:
+        # Ctrl-G → "update": show the current update status and let the user opt
+        # in (applied once sessions finish), postpone, or stop update checks.
+        if self._update_applying:
+            self._set_message("An aGiT update is already in progress.")
+            self._render()
+            return
+        status = self._update_status
+        if status is None:
+            # No completed check yet — make sure one is running and ask the user
+            # to retry, rather than blocking the UI on a network fetch.
+            self._update_check_at = 0.0
+            self._maybe_check_for_update()
+            self._set_message("Checking for aGiT updates… run 'update' again in a moment.")
+            self._render()
+            return
+        if not status.ok:
+            self._set_message(f"Update check failed: {status.error}")
+            self._render()
+            return
+        if not status.available:
+            self._set_message(f"aGiT is up to date ({status.current or 'current'}).")
+            self._render()
+            return
+        choice = self._select_popup(
+            status.message,
+            ["Update when sessions finish", "Not now", "Stop checking for updates"],
+        )
+        if choice == "Stop checking for updates":
+            if self.global_config is not None:
+                self.global_config.check_for_updates = False
+            self._set_message("aGiT will no longer check for updates.")
+            self._render()
+            return
+        if choice != "Update when sessions finish":
+            self._set_message("Update postponed.")
+            self._render()
+            return
+        self._update_pending = True
+        if self._ready_for_update():
+            self._apply_update_and_restart()
+        else:
+            self._set_message(
+                "aGiT will update and restart once all sessions finish and commits are in.",
+                seconds=8.0,
+            )
+            self._render()
 
     def _confine_to_worktree(self, command: list[str]) -> list[str]:
         # Wrap the backend so it can only write inside its session worktree (plus
@@ -2608,6 +2801,8 @@ class ProxyRunner:
             self._poll_base_advanced()
             self._warn_if_base_edited()
             self._warn_if_cwd_drifted()
+            self._maybe_check_for_update()
+            self._maybe_apply_pending_update()
         if self._base_advanced:
             self._base_advanced = False
             self._sync_idle_worktrees_to_base()
@@ -3140,6 +3335,9 @@ class ProxyRunner:
             return
         elif name == "git-base-branch":
             self._switch_base_command(arg)
+            return
+        elif name == "update":
+            self._handle_update_command()
             return
         elif name == "":
             self._set_message("Select an aGiT command.")
