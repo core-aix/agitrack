@@ -4161,6 +4161,22 @@ def test_exit_command_routes_through_unified_exit_flow(tmp_path):
     runner._run_command("exit")
 
     assert events == ["confirm", "finalize", "exit"]
+    # The exit flow must flag the reactor loop to stop. Without this the loop
+    # falls through to the timers phase and runs git in the just-removed worktree
+    # (FileNotFoundError on exit).
+    assert runner._exit_requested is True
+
+
+def test_exit_command_cancelled_does_not_request_exit(tmp_path):
+    # Declining the exit confirmation keeps aGiT running: the loop-break flag
+    # stays clear.
+    runner = make_runner()
+    runner._confirm_exit = lambda: False
+    runner._render = lambda: None
+
+    runner._run_command("exit")
+
+    assert runner._exit_requested is False
 
 
 def test_double_ctrl_c_finalizes_before_exiting():

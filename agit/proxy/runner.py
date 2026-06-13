@@ -493,6 +493,11 @@ class ProxyRunner:
         self._relaunch_times: list[float] = []
         self._exiting = False
         self._finalized_on_exit = False
+        # Set once the interactive exit flow has committed to quitting (worktree
+        # removed). The reactor loop checks this after running a menu command so an
+        # "exit"/"quit" command breaks the loop instead of falling through to the
+        # timers phase and running git in the deleted worktree.
+        self._exit_requested = False
         # The user's intentionally-unstaged files belong to the base working tree
         # (their repo), not the ephemeral session worktree; cache the list so the
         # status line can show its count without a per-frame disk read.
@@ -682,6 +687,7 @@ class ProxyRunner:
                 "_relaunch_times": [],
                 "_exiting": False,
                 "_finalized_on_exit": False,
+                "_exit_requested": False,
                 # Self-update fields (production sets these in __init__).
                 "_updater": None,
                 "_update_status": None,
@@ -3007,6 +3013,13 @@ class ProxyRunner:
                 self.active.process.write(b"".join(forwarded))
         if command:
             self._run_command(command)
+            # An "exit"/"quit" command runs the same finalize-and-teardown flow as
+            # Ctrl-C, which removes the worktree. It must break the loop here just
+            # like the Ctrl-C path above — otherwise this iteration falls through to
+            # the timers phase and _maybe_agent_commit runs git in the deleted
+            # worktree (FileNotFoundError on exit).
+            if self._exit_requested:
+                return "break"
         return None
 
     def _reactor_timers_phase(self) -> None:
@@ -3531,7 +3544,9 @@ class ProxyRunner:
     def _run_command(self, command: str) -> None:
         # aGiT commands in proxy mode are triggered via Ctrl-G and are plain
         # names; ":" is not a command trigger here (it is forwarded to the
-        # backend like any other input).
+        # backend like any other input). On a confirmed "exit"/"quit" this runs
+        # the teardown flow (which sets self._exiting); the caller checks that
+        # flag to break the reactor loop.
         name, _, arg = command.partition(" ")
         if name in {"exit", "quit"}:
             if not self._run_exit_flow():
@@ -4201,6 +4216,7 @@ class ProxyRunner:
             # A second Ctrl-C, inside one of the exit-confirmation popups: take
             # it as an emphatic yes — skip the questions, keep the finalize.
             self._popup_exit_force = True
+            self._exit_requested = True
             return True
         self._popup_exit_pending = True
         self._popup_exit_force = False
@@ -4212,6 +4228,7 @@ class ProxyRunner:
                     return False
             self._finalize_pending_work()
             self._exit_child()
+            self._exit_requested = True
             return True
         finally:
             self._popup_exit_pending = False
