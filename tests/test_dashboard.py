@@ -540,22 +540,69 @@ def test_aggregates_payload_filters_server_side(tmp_path):
     assert full["options"]["backends"] == ["claude"]
 
 
-def test_aggregates_payload_includes_cumulative_timeseries(tmp_path):
+def test_aggregates_payload_includes_per_period_timeseries(tmp_path):
     from agit.metrics.web import aggregates_payload
 
     dash = build_dashboard(_demo_repo(tmp_path))
     ts = aggregates_payload(dash)["timeseries"]
-    # Every series is the same length as the bucket-centre axis.
+    # Every series is the same length as the bucket-start axis; default = per day.
     n = len(ts["t"])
-    assert n >= 1
+    assert n >= 1 and ts["granularity"] == "day"
     for key in ("commits", "ai_lines", "output_tokens", "input_tokens"):
         assert len(ts[key]) == n
-    # Cumulative series are non-decreasing and end at the filtered totals.
-    assert all(b >= a for a, b in zip(ts["commits"], ts["commits"][1:]))
-    assert ts["commits"][-1] == 7  # all seven demo commits
+    # Per-bucket activity: the buckets SUM to the filtered totals (not cumulative).
+    assert sum(ts["commits"]) == 7  # all seven demo commits
     # The two agent turns carry _TOKENS (1000 in / 50 out) each.
-    assert ts["output_tokens"][-1] == 100
-    assert ts["input_tokens"][-1] == 2000
+    assert sum(ts["output_tokens"]) == 100
+    assert sum(ts["input_tokens"]) == 2000
+
+
+def test_timeseries_granularity_buckets_by_calendar_period():
+    from agit.metrics.web import _timeseries
+
+    def stat(day, *, out=0):
+        return CommitStat(
+            sha=f"s{day}",
+            author="a",
+            email="e",
+            subject="s",
+            kind="agent",
+            timestamp=int(__import__("calendar").timegm((2026, 1, day, 12, 0, 0))),
+            tokens={"output": out},
+        )
+
+    # Three commits: Jan 1, Jan 2, Jan 2 again.
+    stats = [stat(1, out=5), stat(2, out=3), stat(2, out=4)]
+    day = _timeseries(stats, granularity="day")
+    assert day["granularity"] == "day"
+    # Two day buckets, contiguous; per-bucket commit counts are 1 then 2.
+    assert day["commits"] == [1, 2]
+    assert day["output_tokens"] == [5, 7]
+    # Month granularity collapses all three into one January bucket.
+    month = _timeseries(stats, granularity="month")
+    assert month["commits"] == [3] and month["output_tokens"] == [12]
+    # An unknown granularity falls back to the default (day).
+    assert _timeseries(stats, granularity="bogus")["granularity"] == "day"
+
+
+def test_timeseries_fills_empty_periods_with_zero():
+    from agit.metrics.web import _timeseries
+
+    cal = __import__("calendar")
+
+    def stat(day):
+        return CommitStat(
+            sha=f"s{day}",
+            author="a",
+            email="e",
+            subject="s",
+            kind="user",
+            timestamp=int(cal.timegm((2026, 1, day, 0, 0, 0))),
+        )
+
+    # Commits on Jan 1 and Jan 4 — the two quiet days between read as zeros.
+    ts = _timeseries([stat(1), stat(4)], granularity="day")
+    assert ts["commits"] == [1, 0, 0, 1]
 
 
 def test_timeseries_respects_filters(tmp_path):
@@ -566,18 +613,19 @@ def test_timeseries_respects_filters(tmp_path):
     # A future-only window filters every commit out — an empty, still-valid series.
     empty = aggregates_payload(dash, frm=4102444800)["timeseries"]  # year 2100
     assert empty["t"] == [] and empty["commits"] == []
-    assert full["commits"][-1] == 7
+    assert sum(full["commits"]) == 7
 
 
 def test_render_html_wires_the_activity_chart(tmp_path):
     html = render_html(_demo_repo(tmp_path))
-    # The plot section, canvas, legend, and toggle/redraw wiring are present, and
-    # the initial payload embeds the series so the first paint needs no fetch.
+    # The plot section, canvas, legend, granularity selector, and toggle/redraw
+    # wiring are present, and the initial payload embeds the series so the first
+    # paint needs no fetch.
     assert "activity over time" in html
     assert 'id="ts-canvas"' in html and 'id="ts-legend"' in html
-    assert "function renderChart" in html and "const tsOn" in html
+    assert 'id="ts-gran"' in html and "function renderChart" in html and "const tsOn" in html
     data = _embedded_data(html)
-    assert "timeseries" in data and data["timeseries"]["commits"][-1] == 7
+    assert "timeseries" in data and sum(data["timeseries"]["commits"]) == 7
 
 
 def test_dashboard_data_serializes_squash_constituents_for_expansion(tmp_path):

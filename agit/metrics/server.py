@@ -48,7 +48,13 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
                 self._respond("text/html; charset=utf-8", format_html(self._dashboard()).encode("utf-8"))
             elif parsed.path == "/data":
                 payload = aggregates_payload(
-                    self._dashboard(), author=author, backend=backend, model=model, frm=frm, to=to
+                    self._dashboard(),
+                    author=author,
+                    backend=backend,
+                    model=model,
+                    frm=frm,
+                    to=to,
+                    granularity=_str(query, "granularity"),
                 )
                 self._respond("application/json", self._json(payload))
             elif parsed.path == "/log":
