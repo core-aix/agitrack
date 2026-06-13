@@ -115,6 +115,26 @@ def test_kitty_ctrl_key_decoding():
     assert _decode_kitty_ctrl_keys(b"hello") == b"hello"
 
 
+def test_kitty_escape_key_decoding():
+    """Test that kitty keyboard protocol Escape key is decoded to plain \\x1b."""
+    from agit.proxy.runner import _decode_kitty_ctrl_keys
+    
+    # Escape key (keycode 27) should decode to \x1b
+    assert _decode_kitty_ctrl_keys(b"\x1b[27u") == b"\x1b"
+    
+    # Escape key with explicit modifier 1 should also decode to \x1b
+    assert _decode_kitty_ctrl_keys(b"\x1b[27;1u") == b"\x1b"
+    
+    # Mixed content: Escape + text
+    assert _decode_kitty_ctrl_keys(b"\x1b[27uhello") == b"\x1bhello"
+    
+    # Multiple Escape keys
+    assert _decode_kitty_ctrl_keys(b"\x1b[27u\x1b[27u") == b"\x1b\x1b"
+    
+    # Plain Escape should pass through unchanged
+    assert _decode_kitty_ctrl_keys(b"\x1b") == b"\x1b"
+
+
 def test_proxy_menu_key_works_with_kitty_encoding():
     """Test that the menu key works even when terminal sends kitty-encoded keys."""
     from agit.proxy.runner import _decode_kitty_ctrl_keys
