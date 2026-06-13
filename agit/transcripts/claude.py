@@ -20,6 +20,8 @@ __all__ = [
     "list_worktree_sessions",
     "session_belongs_to_repo",
     "export_session",
+    "export_session_raw",
+    "import_shared_session",
     "prepare_resume",
     "link_session",
     "session_cwd",
@@ -210,6 +212,64 @@ def link_session(session_id: str, src_repo: Path, dst_repo: Path) -> bool:
     except OSError:
         return False
     return True
+
+
+def export_session_raw(repo: Path, session_id: str) -> str | None:
+    """The full transcript file's text for ``session_id`` under ``repo``'s project
+    dir — the portable artifact shared with collaborators (issue #55). None when
+    the session isn't recorded for this repo."""
+    if not session_id:
+        return None
+    path = _session_path(Path(repo), session_id)
+    if not path.is_file():
+        return None
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def import_shared_session(repo: Path, session_id: str, transcript: str) -> bool:
+    """Write a shared transcript into ``repo``'s Claude project dir as
+    ``<session_id>.jsonl`` so a subsequent ``claude --resume <session_id>`` finds
+    it (the normal resume path then links it into the session worktree). The
+    transcript's ``cwd`` fields are retargeted to ``repo`` so Claude doesn't try to
+    restore the original author's working directory. No-op-True if already present.
+    Returns True when the transcript is in place."""
+    if not session_id or not transcript:
+        return False
+    repo = Path(repo)
+    target_dir = _project_dir(repo)
+    target = target_dir / f"{session_id}.jsonl"
+    if target.is_file():
+        return True  # already have this conversation locally — don't clobber it
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target.write_text(_retarget_cwd(transcript, str(repo.resolve())), encoding="utf-8")
+    except OSError:
+        return False
+    return True
+
+
+def _retarget_cwd(transcript: str, cwd: str) -> str:
+    """Rewrite every row's ``cwd`` to ``cwd``, leaving non-JSON lines untouched."""
+    out: list[str] = []
+    for line in transcript.split("\n"):
+        stripped = line.strip()
+        if not stripped:
+            out.append(line)
+            continue
+        try:
+            row = json.loads(stripped)
+        except json.JSONDecodeError:
+            out.append(line)
+            continue
+        if isinstance(row, dict) and "cwd" in row:
+            row["cwd"] = cwd
+            out.append(json.dumps(row))
+        else:
+            out.append(line)
+    return "\n".join(out)
 
 
 def session_cwd(session_id: str) -> str | None:

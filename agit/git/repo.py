@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import subprocess
+import tempfile
 from pathlib import Path
 
 
@@ -321,8 +323,101 @@ class GitRepo:
                 entries.append((commit_sha, first_line))
         return entries
 
+    # --- low-level object/ref plumbing (shared-session storage, issue #55) ------
+    # These build and move a custom ref (refs/agit/shared-sessions) entirely in
+    # the object database, never touching the working tree or the real index.
+
+    def ref_exists(self, ref: str) -> bool:
+        return self._run(["git", "rev-parse", "--verify", "--quiet", ref], check=False).returncode == 0
+
+    def ref_sha(self, ref: str) -> str | None:
+        result = self._run(["git", "rev-parse", "--verify", "--quiet", ref], check=False)
+        return result.stdout.strip() or None if result.returncode == 0 else None
+
+    def write_blob(self, content: str) -> str:
+        """Write *content* as a blob into the object db; returns its SHA."""
+        return self._run(["git", "hash-object", "-w", "--stdin"], input_text=content).stdout.strip()
+
+    def read_tree_paths(self, ref: str) -> dict[str, str]:
+        """Map ``path -> blob SHA`` for every file reachable from ``ref`` (a tree
+        or commit). Empty when the ref doesn't exist."""
+        if not self.ref_exists(ref):
+            return {}
+        output = self._run(["git", "ls-tree", "-r", "-z", ref], check=False).stdout
+        entries: dict[str, str] = {}
+        for record in output.split("\0"):
+            if not record:
+                continue
+            meta, _, path = record.partition("\t")
+            parts = meta.split()
+            if len(parts) >= 3 and parts[1] == "blob":
+                entries[path] = parts[2]
+        return entries
+
+    def read_ref_blob(self, ref: str, path: str) -> str | None:
+        """Contents of ``path`` within ``ref``'s tree, or None if absent."""
+        result = self._run(["git", "cat-file", "-p", f"{ref}:{path}"], check=False)
+        return result.stdout if result.returncode == 0 else None
+
+    def write_tree_from(self, entries: dict[str, str]) -> str:
+        """Build a tree containing exactly ``entries`` (``path -> blob SHA``) using
+        a throwaway index, so the real index and working tree are untouched.
+        Returns the tree SHA (the empty tree when ``entries`` is empty)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            index = os.path.join(tmp, "index")
+            env = {"GIT_INDEX_FILE": index}
+            for path, blob in entries.items():
+                self._run(
+                    ["git", "update-index", "--add", "--cacheinfo", f"100644,{blob},{path}"],
+                    env=env,
+                )
+            return self._run(["git", "write-tree"], env=env).stdout.strip()
+
+    def commit_tree_orphan(self, tree: str, message: str) -> str:
+        """Commit ``tree`` with NO parents — a standalone, history-free snapshot.
+        Rewriting a ref to such commits keeps only the latest copy (old objects
+        become unreferenced and are GC'd)."""
+        return self._run(["git", "commit-tree", tree, "-F", "-"], input_text=message).stdout.strip()
+
+    def update_ref(self, ref: str, sha: str) -> None:
+        self._run(["git", "update-ref", ref, sha])
+
+    def delete_ref(self, ref: str) -> None:
+        self._run(["git", "update-ref", "-d", ref], check=False)
+
+    def remote_exists(self, name: str = "origin") -> bool:
+        return name in self._run(["git", "remote"], check=False).stdout.split()
+
+    def fetch_ref(self, refspec: str, *, remote: str = "origin") -> bool:
+        """Fetch a single refspec (e.g. ``+refs/agit/x:refs/agit/x``). Returns
+        True on success; False on any failure (offline, no such ref yet, …)."""
+        return self._run(["git", "fetch", remote, refspec], check=False).returncode == 0
+
+    def push_ref(
+        self, refspec: str, *, remote: str = "origin", force_with_lease: str | None = None
+    ) -> tuple[bool, str]:
+        """Push a refspec. Returns ``(ok, stderr)`` — stderr lets the caller spot a
+        non-fast-forward/stale rejection and retry after re-fetching."""
+        command = ["git", "push"]
+        if force_with_lease is not None:
+            command.append(f"--force-with-lease={force_with_lease}" if force_with_lease else "--force-with-lease")
+        command += [remote, refspec]
+        result = self._run(command, check=False)
+        return result.returncode == 0, result.stderr
+
+    def root_commit(self) -> str | None:
+        """The repo's first (root) commit SHA — a clone-stable repo fingerprint.
+        None for an unborn repo. Picks the earliest if history has several roots."""
+        output = self._run(["git", "rev-list", "--max-parents=0", "HEAD"], check=False).stdout.split()
+        return output[-1] if output else None
+
     def _run(
-        self, command: list[str], *, input_text: str | None = None, check: bool = True
+        self,
+        command: list[str],
+        *,
+        input_text: str | None = None,
+        check: bool = True,
+        env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         process = subprocess.run(
             command,
@@ -332,6 +427,7 @@ class GitRepo:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
+            env={**os.environ, **env} if env else None,
         )
         if check and process.returncode != 0:
             detail = process.stderr.strip() or process.stdout.strip()

@@ -2240,6 +2240,11 @@ class ProxyRunner:
         if self._resumable_sessions():
             options.append("↻ Resume a past conversation…")
             actions.append(("resume-past", None))
+        if getattr(self.backend, "supports_session_sharing", False):
+            options.append("⇪ Share this session with collaborators…")
+            actions.append(("share", None))
+            options.append("⇩ Resume a shared session…")
+            actions.append(("resume-shared", None))
         if len(self.sessions) > 1:
             options.append("- Stop a session")
             actions.append(("stop", None))
@@ -2267,6 +2272,10 @@ class ProxyRunner:
             self._new_session(value)
         elif kind == "new":
             self._prompt_new_session()
+        elif kind == "share":
+            self._share_session()
+        elif kind == "resume-shared":
+            self._resume_shared_session_menu()
         else:
             self._stop_session_menu()
 
@@ -2464,6 +2473,114 @@ class ProxyRunner:
     def _live_session_name_taken(self, name: str) -> bool:
         sanitized = _sanitize_name(name)
         return any(_sanitize_name(self._session_name(index)) == sanitized for index in range(len(self.sessions)))
+
+    # --- sharing full sessions via git (issue #55) -------------------------
+
+    def _shared_store(self):
+        from agit.sessions import SharedSessionStore
+
+        # Operates on the base repo: it owns the remote and the shared object db.
+        return SharedSessionStore(self.base_repo)
+
+    def _share_session(self) -> None:
+        backend = self.backend
+        session_id = self.state.backend_session_id
+        if not session_id or not backend.session_belongs_to_repo(self.repo.repo, session_id):
+            self._set_message("No resumable session for this repo to share yet.")
+            self._render()
+            return
+        # One-time informed consent — sharing is opt-in and never automatic.
+        if not self.global_config.session_sharing_acknowledged:
+            choice = self._select_popup(
+                "Share this conversation with collaborators?\n"
+                "A redacted copy is pushed to 'origin' (secrets masked, but it can still\n"
+                "contain file/command output — review before sharing). Only this repo's\n"
+                "sessions are ever uploaded.",
+                ["Yes, share it", "No, cancel"],
+            )
+            if choice != "Yes, share it":
+                self._set_message("Sharing cancelled.")
+                self._render()
+                return
+            self.global_config.acknowledge_session_sharing()
+        from agit.sessions import github_login, redact_transcript
+
+        raw = backend.export_session_raw(self.repo.repo, session_id) or backend.export_session_raw(
+            self.base_repo.repo, session_id
+        )
+        if not raw:
+            self._set_message("Could not read the session transcript to share.")
+            self._render()
+            return
+        login = self.global_config.github_login or github_login(self.base_repo)
+        self.global_config.github_login = login
+        name = self._session_name(self.active_index)
+        manifest = {
+            "github_id": login,
+            "name": name,
+            "backend": backend.name,
+            "model": self.state.model,
+            "session_id": session_id,
+            "agit_session_id": self.state.session_id,
+            "updated": int(time.time()),
+        }
+        self._set_message(f"Sharing '{login}/{name}' — redacting and pushing…", seconds=20)
+        self._render()
+        try:
+            result = self._shared_store().publish(
+                github_id=login, name=name, transcript=redact_transcript(raw), manifest=manifest
+            )
+        except Exception as error:
+            self._set_message(f"Could not share session: {error}", seconds=10.0)
+            self._render()
+            return
+        if not result.remote:
+            message = f"Saved shared session '{login}/{name}' locally (no 'origin' remote to push to)."
+        elif result.pushed:
+            message = f"Shared '{login}/{name}' to origin."
+        else:
+            message = (
+                f"Saved '{login}/{name}' locally, but the push was rejected — someone else may have "
+                f"updated the shared ref. Try sharing again. [{result.error[:80]}]"
+            )
+        if result.pruned:
+            message += f" Pruned {result.pruned} older shared session(s)."
+        self._set_message(message, seconds=10.0)
+        self._render()
+
+    def _resume_shared_session_menu(self) -> None:
+        store = self._shared_store()
+        self._set_message("Fetching shared sessions…", seconds=10.0)
+        self._render()
+        store.fetch()
+        entries = store.entries()
+        if not entries:
+            self._set_message("No shared sessions found for this repo.")
+            self._render()
+            return
+        options: list[str] = []
+        for entry in entries:
+            extra = [str(entry.manifest[k]) for k in ("model",) if entry.manifest.get(k)]
+            if entry.manifest.get("updated"):
+                extra.append(self._format_age(entry.manifest["updated"]))
+            options.append(entry.display + (f"  ({' · '.join(extra)})" if extra else ""))
+        choice = self._select_popup("Resume a shared session (newest first)", options)
+        if choice is None:
+            self._set_message("Cancelled.")
+            self._render()
+            return
+        entry = entries[options.index(choice)]
+        session_id = entry.manifest.get("session_id")
+        transcript = store.read_transcript(entry)
+        if not session_id or not transcript:
+            self._set_message("That shared session is incomplete; cannot resume it.")
+            self._render()
+            return
+        if not self.backend.import_shared_session(self.base_repo.repo, session_id, transcript):
+            self._set_message("Could not install the shared session for resume.")
+            self._render()
+            return
+        self._resume_conversation(f"{entry.github_id}-{entry.name}", session_id)
 
     def _format_age(self, updated: float) -> str:
         delta = max(0, int(time.time() - (updated or 0)))

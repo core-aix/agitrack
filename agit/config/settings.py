@@ -202,3 +202,38 @@ class GlobalConfig:
     def check_for_updates(self, value: bool) -> None:
         self.data["check_for_updates"] = bool(value)
         self.save()
+
+    # --- session sharing (issue #55) ---------------------------------------
+    # Sharing is opt-in: nothing is ever uploaded until the user explicitly shares
+    # a session and acknowledges the one-time consent notice. We remember that
+    # acknowledgement and cache the resolved GitHub login so later shares are quiet.
+
+    @property
+    def session_sharing(self) -> dict[str, Any]:
+        value = self.data.get("session_sharing")
+        return value if isinstance(value, dict) else {}
+
+    @property
+    def session_sharing_acknowledged(self) -> bool:
+        return bool(self.session_sharing.get("acknowledged"))
+
+    def acknowledge_session_sharing(self) -> None:
+        block = dict(self.session_sharing)
+        block["acknowledged"] = True
+        self.data["session_sharing"] = block
+        self.save()
+
+    @property
+    def github_login(self) -> str | None:
+        value = self.session_sharing.get("github_login")
+        return value if isinstance(value, str) and value else None
+
+    @github_login.setter
+    def github_login(self, value: str | None) -> None:
+        block = dict(self.session_sharing)
+        if value:
+            block["github_login"] = value
+        else:
+            block.pop("github_login", None)
+        self.data["session_sharing"] = block
+        self.save()
