@@ -87,6 +87,60 @@ def test_proxy_ctrl_g_enters_command_mode():
     assert should_exit is False
 
 
+def test_proxy_shift_modified_menu_key_enters_command_mode():
+    # Test multi-byte kitty keyboard protocol sequence for Ctrl+Shift+G
+    parser = ProxyInput(menu_key=b"\x1b[103;6u")
+    
+    forwarded, local_echo, command, should_exit = parser.feed(b"\x1b[103;6ugit-status\r")
+    
+    assert forwarded == []
+    assert local_echo == b""
+    assert command == "git-status"
+    assert should_exit is False
+
+
+def test_proxy_shift_modified_menu_key_partial_match():
+    # Test that partial matches are buffered and forwarded if they don't complete
+    parser = ProxyInput(menu_key=b"\x1b[103;6u")
+    
+    # Send partial sequence followed by other data
+    forwarded, local_echo, command, should_exit = parser.feed(b"\x1b[103;7u")
+    
+    # Should forward the partial match since it doesn't match the menu key
+    assert b"".join(forwarded) == b"\x1b[103;7u"
+    assert command is None
+
+
+def test_proxy_shift_modified_menu_key_split_across_reads():
+    # Test that sequences split across multiple feed() calls work correctly
+    parser = ProxyInput(menu_key=b"\x1b[103;6u")
+    
+    # Send first part
+    forwarded1, _, command1, _ = parser.feed(b"\x1b[103")
+    assert forwarded1 == []  # Still buffering
+    assert command1 is None
+    
+    # Send second part
+    forwarded2, _, command2, _ = parser.feed(b";6u")
+    assert forwarded2 == []  # Still buffering, haven't completed yet
+    
+    # Send the command
+    forwarded3, _, command3, _ = parser.feed(b"session\r")
+    assert command3 == "session"
+
+
+def test_proxy_shift_modified_menu_key_non_match_forwards():
+    # Test that non-matching sequences are forwarded immediately
+    parser = ProxyInput(menu_key=b"\x1b[103;6u")
+    
+    # Send a different escape sequence
+    forwarded, local_echo, command, should_exit = parser.feed(b"\x1b[112;6u")
+    
+    # Should forward the non-matching sequence
+    assert b"".join(forwarded) == b"\x1b[112;6u"
+    assert command is None
+
+
 def test_proxy_s_jumps_to_session():
     # Only "session" starts with "s", so s+Enter selects it directly.
     parser = ProxyInput()
