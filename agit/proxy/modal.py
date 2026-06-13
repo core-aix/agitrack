@@ -52,6 +52,12 @@ class PromptModal:
         Tab                 → ignored (not meaningful in a free-text field)
     """
 
+    # Block glyph drawn at the end of the input line. The popup is static text
+    # painted over the backend screen, and the real terminal cursor is hidden
+    # while it is up (it belongs to the backend behind the popup), so the field
+    # draws its own caret — otherwise the input line looks like a read-only label.
+    CARET = "█"
+
     def __init__(self, title: str, prompt: str, *, default: str = "") -> None:
         self.title = title
         self.prompt = prompt
@@ -60,7 +66,7 @@ class PromptModal:
 
     def render_message(self) -> str:
         """Return the message string that should be shown in the popup area."""
-        return f"{self.title}\n{self.prompt}\n> {self.value}"
+        return f"{self.title}\n{self.prompt}\n> {self.value}{self.CARET}"
 
     def feed(self, data: bytes) -> tuple[str, str | None]:
         """Process *data* bytes and return an action tuple.

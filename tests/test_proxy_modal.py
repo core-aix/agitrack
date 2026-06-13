@@ -74,6 +74,14 @@ class TestPromptModal:
         assert "Name:" in msg
         assert "> bar" in msg
 
+    def test_render_message_shows_editable_caret(self):
+        # The input line ends in a caret glyph so the field reads as editable
+        # (the popup is static text; the real terminal cursor is hidden behind it).
+        m = PromptModal("T", "Name:", default="bar")
+        assert m.render_message().endswith(f"> bar{PromptModal.CARET}")
+        empty = PromptModal("T", "Name:")
+        assert empty.render_message().endswith(f"> {PromptModal.CARET}")
+
     def test_multiple_bytes_in_one_feed(self):
         m = PromptModal("T", "P:")
         result = m.feed(b"hello\r")
