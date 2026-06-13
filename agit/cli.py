@@ -43,6 +43,13 @@ def main(argv: list[str] | None = None) -> int:
         "commands, e.g. --prompt ':status'",
     )
     parser.add_argument(
+        "--dashboard",
+        action="store_true",
+        help="print repository metrics computed from aGiT commit metadata "
+        "(coverage, AI vs human line changes, tokens, per-backend/model/"
+        "committer breakdowns, loop detection) and exit",
+    )
+    parser.add_argument(
         "--backend",
         choices=available_backends(),
         default=None,
@@ -77,6 +84,19 @@ def main(argv: list[str] | None = None) -> int:
     # Handle help request before any other processing.
     if args.help:
         _show_combined_help(parser, args.backend, config)
+        return 0
+
+    if args.dashboard:
+        # Read-only: nothing is logged or committed, so no privacy
+        # acknowledgment and no repo initialization offer.
+        from agit.metrics import render_dashboard
+
+        try:
+            print(render_dashboard(GitRepo.discover(Path(args.repo).expanduser())))
+        except (GitError, OSError) as error:
+            # OSError: --repo points at a directory that does not exist.
+            print(error)
+            return 1
         return 0
 
     # If backend is asked for help, run it directly without TUI.

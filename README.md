@@ -238,6 +238,18 @@ scripts/demo.sh --backend opencode   # ... or with opencode
 scripts/demo.sh --model haiku --dir /tmp/agit-demo
 ```
 
+### Repository dashboard
+
+`agit --dashboard` prints repository metrics computed entirely from the aGiT metadata in commit messages — no extra state, so the numbers are identical on every clone:
+
+- **Coverage**: how many commits are aGiT-tracked (agent commits, backend-made commits covered by an aGiT cover commit, agent-resolved merges, user commits) versus untracked.
+- **Code changes**: lines added/removed by AI versus by humans. Cover commits are merges and contribute no line counts of their own, so a turn's lines are never double-counted.
+- **Tokens**: totals per category (input, output, reasoning, cache read/write, sub-agents, summarizer) and an efficiency ratio — AI-changed lines per 1k output tokens.
+- **Breakdowns** by backend, by model (a cover commit's bucket includes the lines of the backend-made commits it covers), and by committer.
+- **Possible loops**: runs of three or more consecutive turns with near-identical prompts (or the same prompt repeated within one turn's trace), with the output tokens they consumed — a sign the conversation is going in circles.
+
+The dashboard is read-only: it never commits, never prompts, and skips the privacy acknowledgment.
+
 
 ## Configuration
 
