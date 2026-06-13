@@ -1,0 +1,87 @@
+name: Release (tag)
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Update version files
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          python3 <<PY
+          import re, pathlib
+
+          version = "$VERSION"
+
+          pp = pathlib.Path("pyproject.toml")
+          pp.write_text(re.sub(
+              r'^version = "[^"]+"',
+              f'version = "{version}"',
+              pp.read_text(),
+              count=1,
+              flags=re.M
+          ))
+
+          ip = pathlib.Path("agit/__init__.py")
+          ip.write_text(re.sub(
+              r'^__version__ = "[^"]+"',
+              f'__version__ = "{version}"',
+              ip.read_text(),
+              count=1,
+              flags=re.M
+          ))
+          PY
+
+      - name: Commit and push to main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml agit/__init__.py
+          git commit -m "Release v${{ steps.version.outputs.version }}"
+          git push origin main
+
+      - name: Build
+        run: uv build
+
+      - name: Publish to PyPI
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_TOKEN }}
+        run: uv publish
+
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF#refs/tags/}" \
+            --title "${GITHUB_REF#refs/tags/}" \
+            --generate-notes \
+            dist/*
