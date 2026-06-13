@@ -62,6 +62,7 @@ class CommitStat:
     covered_commits: list[str] = field(default_factory=list)
     prompt: str = ""  # the turn's prompt text (loop detection)
     user_prompts: list[str] = field(default_factory=list)  # trace ## User entries
+    metadata_block: str = ""  # raw `# aGiT Metadata` text, for duplicate detection
 
     @property
     def short(self) -> str:
@@ -203,6 +204,8 @@ def collect_commit_stats(repo: GitRepo, ref: str = "HEAD") -> list[CommitStat]:
         author, _, body = rest.partition(_FIELD_SEP)
         stats.append(_parse_commit(sha.strip(), author, body))
 
+    stats = _drop_inherited_metadata(repo, ref, stats)
+
     _apply_numstat(repo, ref, {stat.sha: stat for stat in stats})
 
     # Backend-made commits have no metadata of their own; they are AI work if
@@ -214,6 +217,48 @@ def collect_commit_stats(repo: GitRepo, ref: str = "HEAD") -> list[CommitStat]:
 
     stats.reverse()  # oldest first
     return stats
+
+
+def _drop_inherited_metadata(repo: GitRepo, ref: str, stats: list[CommitStat]) -> list[CommitStat]:
+    """Drop commits that merely inherit a parent's aGiT metadata block.
+
+    When a session branch is integrated with a real merge commit (e.g. a GitHub
+    PR merged with "Create a merge commit"), GitHub copies the PR title and body
+    into the merge commit message. The cover commit (#58) at the branch tip is
+    that PR's source, so the merge ends up carrying a byte-identical copy of the
+    cover's metadata — same tokens, same trace. Counting both would double every
+    figure for that turn (tokens, lines-via-covered_commits).
+
+    The fingerprint is a *merge* commit (>1 parent) that shares an identical
+    metadata block with one of its parents: that parent is the cover commit it
+    merges, and the block was copied wholesale. We keep the original (the parent)
+    and discard the inheriting merge. Restricting to merges is what separates this
+    from a genuine run of repeated turns, which is linear — each such commit has a
+    single parent, so an identical neighbouring block is a real (repeated) turn,
+    not a copy. Cover commits and integration merges are themselves merge-shaped
+    but never share a parent's block, so they are untouched."""
+    block_by_sha = {stat.sha: stat.metadata_block for stat in stats if stat.metadata_block}
+    if not block_by_sha:
+        return stats
+    parents = _parents(repo, ref)
+    duplicates = {
+        stat.sha
+        for stat in stats
+        if stat.metadata_block
+        and len(parents.get(stat.sha, ())) > 1
+        and any(block_by_sha.get(parent) == stat.metadata_block for parent in parents[stat.sha])
+    }
+    return [stat for stat in stats if stat.sha not in duplicates]
+
+
+def _parents(repo: GitRepo, ref: str) -> dict[str, list[str]]:
+    output = repo._run(["git", "log", "--format=%H %P", ref], check=False).stdout
+    parents: dict[str, list[str]] = {}
+    for line in output.splitlines():
+        sha, _, rest = line.strip().partition(" ")
+        if sha:
+            parents[sha] = rest.split()
+    return parents
 
 
 def build_dashboard(repo: GitRepo, ref: str = "HEAD") -> Dashboard:
@@ -258,7 +303,23 @@ def _parse_commit(sha: str, author: str, body: str) -> CommitStat:
         covered_commits=(metadata.get("covered_commits") or "").split(),
         prompt=_extract_prompt(body, subject, kind),
         user_prompts=_extract_user_prompts(body),
+        metadata_block=_metadata_block(body),
     )
+
+
+def _metadata_block(body: str) -> str:
+    """The `# aGiT Metadata` section verbatim (it is always the last section).
+
+    A GitHub PR merge commit copies its PR's title and body — and so the whole
+    metadata block — into the merge commit message, byte for byte. Capturing the
+    block lets :func:`collect_commit_stats` recognise such a merge as a duplicate
+    of the cover commit it merges and avoid counting the turn's tokens twice."""
+    lines = body.splitlines()
+    try:
+        start = lines.index(METADATA_HEADER)
+    except ValueError:
+        return ""
+    return "\n".join(lines[start:]).strip()
 
 
 def _parse_metadata(body: str) -> dict[str, str]:

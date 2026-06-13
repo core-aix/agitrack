@@ -147,6 +147,32 @@ def test_render_dashboard_contains_all_sections(tmp_path):
     assert "claude-opus-4-8" in text
 
 
+def test_pr_merge_commit_does_not_double_count_the_cover_turn(tmp_path):
+    """A GitHub-style merge that inherits the cover commit's message (and so its
+    metadata block) must not be counted as a second turn (#58 regression)."""
+    repo = GitRepo.init(tmp_path)
+
+    _write_lines(repo, "agent.txt", 20)
+    cover_message = _agent_message("add the feature", tokens=_TOKENS)
+    repo.commit(cover_message)
+    cover_sha = repo.rev_parse("HEAD")
+
+    base = build_dashboard(repo)
+
+    # Integrate the branch with a real merge commit whose message is a verbatim
+    # copy of the cover commit's — exactly what GitHub does on PR merge.
+    repo._run(["git", "checkout", "-q", "-b", "base", "HEAD~1"])
+    repo._run(
+        ["git", "merge", "--no-ff", "-m", cover_message, cover_sha],
+    )
+
+    merged = build_dashboard(repo)
+
+    assert merged.token_totals == base.token_totals
+    assert merged.count("agent") == base.count("agent")
+    assert merged.by_backend["claude"]["output_tokens"] == base.by_backend["claude"]["output_tokens"]
+
+
 # --- loop detection ------------------------------------------------------------
 
 
