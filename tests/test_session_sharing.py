@@ -189,6 +189,30 @@ def test_publish_without_remote_saves_locally(tmp_path):
     assert result.remote is False and result.pushed is False
 
 
+def test_unshare_removes_only_that_entry(tmp_path):
+    store = SharedSessionStore(_init_repo(tmp_path))
+    store.publish(github_id="alice", name="keep", transcript="k", manifest=_manifest("keep", session_id="k", updated=1))
+    store.publish(github_id="alice", name="drop", transcript="d", manifest=_manifest("drop", session_id="d", updated=2))
+    store.unshare("alice", "drop")
+    assert [e.name for e in store.entries()] == ["keep"]
+
+
+# --- auto-share opt-in state ------------------------------------------------
+
+
+def test_state_auto_share_opt_in(tmp_path):
+    from agit.config import AgitState
+
+    state = AgitState(tmp_path)
+    assert state.auto_share_enabled("sid") is False
+    state.set_auto_share("sid", True)
+    assert state.auto_share_enabled("sid") is True
+    assert "sid" in state.auto_share_session_ids()
+    state.set_auto_share("sid", False)
+    assert state.auto_share_enabled("sid") is False
+    assert state.auto_share_enabled(None) is False
+
+
 # --- Claude transcript export / import --------------------------------------
 
 
@@ -252,6 +276,7 @@ def _runner_with_store(tmp_path, monkeypatch, backend):
     runner.state.backend_session_id = "sid-123"
     runner.global_config = GlobalConfig(path=tmp_path / "config.json")
     runner.global_config.acknowledge_session_sharing()  # skip the consent prompt
+    runner.global_config.github_login = "tester"  # deterministic identity (no gh call)
     runner._render = lambda: None
     runner.messages = []
     runner._set_message = lambda msg, **k: runner.messages.append(msg)
@@ -304,6 +329,53 @@ def test_runner_resume_shared_imports_and_resumes(tmp_path, monkeypatch):
 
     assert backend.imported == ("bob-sid", "bob's chat")  # transcript installed for resume
     assert resumed == [("bob-cool-fix", "bob-sid")]  # resumed under <id>-<name>
+
+
+def test_runner_auto_share_publishes_in_background(tmp_path, monkeypatch):
+    backend = _StubBackend(transcript='{"t":"a new turn"}')
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
+    runner.state.set_auto_share("sid-123", True)
+
+    runner._maybe_auto_share_active()
+    if runner._auto_share_thread is not None:
+        runner._auto_share_thread.join(timeout=10)
+
+    entries = SharedSessionStore(repo).entries()
+    assert len(entries) == 1 and entries[0].manifest["session_id"] == "sid-123"
+    # A second call with unchanged content does not spawn another push.
+    runner._auto_share_thread = None
+    runner._maybe_auto_share_active()
+    assert runner._auto_share_thread is None  # content hash unchanged ⇒ skipped
+
+
+def test_runner_auto_share_skipped_when_not_opted_in(tmp_path, monkeypatch):
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend())
+    runner._maybe_auto_share_active()  # session not opted in
+    assert runner._auto_share_thread is None
+    assert SharedSessionStore(repo).entries() == []
+
+
+def test_runner_manage_unshare_removes_session(tmp_path, monkeypatch):
+    backend = _StubBackend()
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
+    SharedSessionStore(repo).publish(
+        github_id="tester",
+        name="session-1",
+        transcript="t",
+        manifest={
+            "github_id": "tester",
+            "name": "session-1",
+            "session_id": "sid-123",
+            "updated": 1,
+            "content_hash": "h",
+        },
+    )
+    # First popup picks the (only) session; the "Manage" popup picks Unshare (3rd action).
+    runner._select_popup = lambda title, options: options[2] if title.startswith("Manage") else options[0]
+
+    runner._manage_shared_sessions_menu()
+
+    assert SharedSessionStore(repo).entries() == []
 
 
 def test_claude_backend_flags_sharing_support(tmp_path):

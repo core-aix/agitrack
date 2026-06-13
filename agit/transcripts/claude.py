@@ -220,8 +220,13 @@ def export_session_raw(repo: Path, session_id: str) -> str | None:
     the session isn't recorded for this repo."""
     if not session_id:
         return None
-    path = _session_path(Path(repo), session_id)
-    if not path.is_file():
+    path: Path | None = _session_path(Path(repo), session_id)
+    if path is None or not path.is_file():
+        # A session recorded under a (possibly removed) worktree still has its
+        # transcript keyed by path elsewhere — find it so dormant sessions can be
+        # shared / refreshed too.
+        path = _find_session_file(session_id)
+    if path is None or not path.is_file():
         return None
     try:
         return path.read_text(encoding="utf-8")

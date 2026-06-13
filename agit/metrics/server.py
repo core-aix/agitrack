@@ -19,7 +19,7 @@ from typing import Any
 from agit.git import GitRepo
 from agit.metrics.collect import Dashboard, build_dashboard
 from agit.metrics.github import resolve_logins
-from agit.metrics.web import aggregates_payload, format_html, log_page
+from agit.metrics.web import aggregates_payload, format_html, log_page, shared_sessions_for
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
@@ -56,6 +56,7 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
                     to=to,
                     granularity=_str(query, "granularity"),
                 )
+                payload["shared_sessions"] = shared_sessions_for(self.repo)
                 self._respond("application/json", self._json(payload))
             elif parsed.path == "/log":
                 page = log_page(

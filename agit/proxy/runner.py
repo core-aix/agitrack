@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import os
 import re
 import select
@@ -503,6 +504,12 @@ class ProxyRunner:
         self._precompact_result: dict | None = None
         self._base_poll_at = 0.0  # throttle for the base-HEAD poll
         self._warned_backend_session = False  # one-shot "use agit to start sessions" notice
+        # Auto-share (issue #55): for sessions the user opted to keep shared, the
+        # last push time and last-pushed content hash per backend session id, plus
+        # the in-flight background push thread (only one at a time).
+        self._auto_share_at: dict[str, float] = {}
+        self._auto_share_hash: dict[str, str] = {}
+        self._auto_share_thread: threading.Thread | None = None
         # Lifecycle flags read before their first conditional assignment. These
         # MUST be initialized here: their getattr() guards were removed in P7,
         # and for_testing() seeding them alone would hide a missing init from
@@ -691,6 +698,9 @@ class ProxyRunner:
                 "_precompact_result": None,
                 "_base_poll_at": 0.0,
                 "_warned_backend_session": False,
+                "_auto_share_at": {},
+                "_auto_share_hash": {},
+                "_auto_share_thread": None,
                 "_user_declined": [],
                 "sessions": [],
                 "worktree_manager": None,
@@ -2248,6 +2258,8 @@ class ProxyRunner:
         if getattr(self.backend, "supports_session_sharing", False):
             options.append("⇩ Resume a shared session…")
             actions.append(("resume-shared", None))
+            options.append("⚙ Manage shared sessions…")
+            actions.append(("manage-shared", None))
         if len(self.sessions) > 1:
             options.append("- Stop a session")
             actions.append(("stop", None))
@@ -2279,6 +2291,8 @@ class ProxyRunner:
             self._share_session()
         elif kind == "resume-shared":
             self._resume_shared_session_menu()
+        elif kind == "manage-shared":
+            self._manage_shared_sessions_menu()
         else:
             self._stop_session_menu()
 
@@ -2504,9 +2518,9 @@ class ProxyRunner:
         if not self.global_config.session_sharing_acknowledged:
             choice = self._select_popup(
                 "Share this conversation with collaborators?\n"
-                "A redacted copy is pushed to 'origin' (secrets masked, but it can still\n"
-                "contain file/command output — review before sharing). Only this repo's\n"
-                "sessions are ever uploaded.",
+                "The conversation transcript is pushed to 'origin' and shared with the team.\n"
+                "It can contain file contents, command output, and secrets — review what's in\n"
+                "this session before sharing. Only this repo's sessions are ever uploaded.",
                 ["Yes, share it", "No, cancel"],
             )
             if choice != "Yes, share it":
@@ -2514,18 +2528,54 @@ class ProxyRunner:
                 self._render()
                 return
             self.global_config.acknowledge_session_sharing()
-        from agit.sessions import github_login, redact_transcript
+        payload = self._share_payload(session_id, self._session_name(self.active_index))
+        if payload is None:
+            self._set_message("Could not read the session transcript to share.")
+            self._render()
+            return
+        login, name, redacted, digest, manifest = payload
+        self._set_message(f"Sharing '{login}/{name}' — pushing to origin…", seconds=20)
+        self._render()
+        try:
+            result = self._shared_store().publish(github_id=login, name=name, transcript=redacted, manifest=manifest)
+        except Exception as error:
+            self._set_message(f"Could not share session: {error}", seconds=10.0)
+            self._render()
+            return
+        self._auto_share_hash[session_id] = digest  # don't immediately re-push the same content
+        self._set_message(self._share_outcome_message(result, login, name), seconds=12.0)
+        self._render()
+        # Offer to keep it current automatically (the opt-in covers future pushes).
+        if result.pushed and not self.state.auto_share_enabled(session_id):
+            keep = self._select_popup(
+                "Keep this shared session up to date automatically?\n"
+                "New turns will be pushed to the shared copy as the conversation grows.",
+                ["Yes, keep it updated", "No, I'll re-share manually"],
+            )
+            if keep == "Yes, keep it updated":
+                self.state.set_auto_share(session_id, True)
+                self._set_message(
+                    f"'{login}/{name}' will auto-update as you work. Manage it via session → Manage shared.",
+                    seconds=8.0,
+                )
+                self._render()
 
+    def _share_payload(self, session_id: str, name: str):
+        """Read + redact the session transcript and build its manifest (no network,
+        no UI). Returns ``(login, name, redacted, content_hash, manifest)`` or None
+        when the transcript can't be read. Shared by manual share and auto-share."""
+        backend = self.backend
         raw = backend.export_session_raw(self.repo.repo, session_id) or backend.export_session_raw(
             self.base_repo.repo, session_id
         )
         if not raw:
-            self._set_message("Could not read the session transcript to share.")
-            self._render()
-            return
+            return None
+        from agit.sessions import github_login, redact_transcript
+
+        redacted = redact_transcript(raw)
+        digest = hashlib.sha256(redacted.encode("utf-8")).hexdigest()
         login = self.global_config.github_login or github_login(self.base_repo)
         self.global_config.github_login = login
-        name = self._session_name(self.active_index)
         manifest = {
             "github_id": login,
             "name": name,
@@ -2534,21 +2584,21 @@ class ProxyRunner:
             "session_id": session_id,
             "agit_session_id": self.state.session_id,
             "updated": int(time.time()),
+            "content_hash": digest,
         }
-        self._set_message(f"Sharing '{login}/{name}' — redacting and pushing…", seconds=20)
-        self._render()
-        try:
-            result = self._shared_store().publish(
-                github_id=login, name=name, transcript=redact_transcript(raw), manifest=manifest
-            )
-        except Exception as error:
-            self._set_message(f"Could not share session: {error}", seconds=10.0)
-            self._render()
-            return
+        return login, name, redacted, digest, manifest
+
+    def _share_outcome_message(self, result, login: str, name: str) -> str:
         if not result.remote:
             message = f"Saved shared session '{login}/{name}' locally (no 'origin' remote to push to)."
         elif result.pushed:
-            message = f"Shared '{login}/{name}' to origin."
+            # The ref isn't a branch, so GitHub's web UI won't show it; point the
+            # user at how to see/confirm it instead.
+            message = (
+                f"Shared '{login}/{name}' to origin (it lives on the custom ref refs/agit/shared-sessions, "
+                f"so it won't show on GitHub's web page). See it via session → Manage shared sessions, "
+                f"or: git ls-remote origin 'refs/agit/*'."
+            )
         else:
             message = (
                 f"Saved '{login}/{name}' locally, but the push was rejected — someone else may have "
@@ -2556,8 +2606,152 @@ class ProxyRunner:
             )
         if result.pruned:
             message += f" Pruned {result.pruned} older shared session(s)."
+        return message
+
+    def _manage_shared_sessions_menu(self) -> None:
+        store = self._shared_store()
+        store.fetch()
+        login = self.global_config.github_login or self._cached_or_resolve_login()
+        mine = [entry for entry in store.entries() if entry.github_id == login]
+        if not mine:
+            self._set_message("You haven't shared any sessions in this repo yet. Use session → Share this session.")
+            self._render()
+            return
+        options: list[str] = []
+        for entry in mine:
+            sid = entry.manifest.get("session_id", "")
+            status = self._shared_entry_status(entry, sid)
+            auto = " · auto-update on" if self.state.auto_share_enabled(sid) else ""
+            age = self._format_age(entry.manifest["updated"]) if entry.manifest.get("updated") else ""
+            options.append(f"{entry.display}  ({age}{auto}) — {status}")
+        choice = self._select_popup("Your shared sessions — pick one to manage", options)
+        if choice is None:
+            self._set_message("Cancelled.")
+            self._render()
+            return
+        self._manage_one_shared_session(mine[options.index(choice)])
+
+    def _shared_entry_status(self, entry, session_id: str) -> str:
+        raw = self.backend.export_session_raw(self.base_repo.repo, session_id) if session_id else None
+        if not raw:
+            return "shared"
+        from agit.sessions import redact_transcript
+
+        current = hashlib.sha256(redact_transcript(raw).encode("utf-8")).hexdigest()
+        return "shared (up to date)" if current == entry.manifest.get("content_hash") else "local has newer turns"
+
+    def _manage_one_shared_session(self, entry) -> None:
+        sid = entry.manifest.get("session_id", "")
+        auto_on = self.state.auto_share_enabled(sid)
+        actions = [
+            ("update", "↻ Update now (push latest turns)"),
+            ("auto", ("✓ Auto-update is ON — turn it off" if auto_on else "○ Turn ON auto-update")),
+            ("unshare", "✗ Unshare (remove for everyone)"),
+        ]
+        choice = self._select_popup(f"Manage {entry.display}", [label for _, label in actions])
+        if choice is None:
+            self._set_message("Cancelled.")
+            self._render()
+            return
+        kind = actions[[label for _, label in actions].index(choice)][0]
+        if kind == "update":
+            self._update_shared_entry(entry)
+        elif kind == "auto":
+            self.state.set_auto_share(sid, not auto_on)
+            self._set_message(f"Auto-update {'enabled' if not auto_on else 'disabled'} for {entry.display}.")
+            self._render()
+        else:
+            self._unshare_entry(entry)
+
+    def _update_shared_entry(self, entry) -> None:
+        sid = entry.manifest.get("session_id", "")
+        raw = self.backend.export_session_raw(self.base_repo.repo, sid) if sid else None
+        if not raw:
+            self._set_message(f"Can't read the transcript for {entry.display} to update it.")
+            self._render()
+            return
+        from agit.sessions import redact_transcript
+
+        redacted = redact_transcript(raw)
+        manifest = {
+            **entry.manifest,
+            "updated": int(time.time()),
+            "content_hash": hashlib.sha256(redacted.encode("utf-8")).hexdigest(),
+        }
+        try:
+            result = self._shared_store().publish(
+                github_id=entry.github_id, name=entry.name, transcript=redacted, manifest=manifest
+            )
+        except Exception as error:
+            self._set_message(f"Could not update {entry.display}: {error}", seconds=10.0)
+            self._render()
+            return
+        if sid:
+            self._auto_share_hash[sid] = manifest["content_hash"]
+        self._set_message(self._share_outcome_message(result, entry.github_id, entry.name), seconds=12.0)
+        self._render()
+
+    def _unshare_entry(self, entry) -> None:
+        try:
+            result = self._shared_store().unshare(entry.github_id, entry.name)
+        except Exception as error:
+            self._set_message(f"Could not unshare {entry.display}: {error}", seconds=10.0)
+            self._render()
+            return
+        sid = entry.manifest.get("session_id", "")
+        if sid:
+            self.state.set_auto_share(sid, False)
+        if not result.remote:
+            message = f"Removed {entry.display} from the local shared ref (no remote to push the removal to)."
+        elif result.pushed:
+            message = f"Unshared {entry.display} (removed from origin)."
+        else:
+            message = f"Removed {entry.display} locally, but the push was rejected — try again. [{result.error[:80]}]"
         self._set_message(message, seconds=10.0)
         self._render()
+
+    def _cached_or_resolve_login(self) -> str:
+        from agit.sessions import github_login
+
+        login = self.global_config.github_login or github_login(self.base_repo)
+        self.global_config.github_login = login
+        return login
+
+    # --- auto-share: keep an opted-in session's shared copy current ---------
+
+    AUTO_SHARE_MIN_INTERVAL = 45.0  # seconds between background auto-share pushes
+
+    def _maybe_auto_share_active(self) -> None:
+        backend = self.backend
+        if not getattr(backend, "supports_session_sharing", False):
+            return
+        sid = self.state.backend_session_id
+        if not sid or not self.state.auto_share_enabled(sid):
+            return
+        if self._auto_share_thread is not None and self._auto_share_thread.is_alive():
+            return
+        now = time.monotonic()
+        if now - self._auto_share_at.get(sid, 0.0) < self.AUTO_SHARE_MIN_INTERVAL:
+            return
+        payload = self._share_payload(sid, self._session_name(self.active_index))
+        if payload is None:
+            return
+        _login, _name, _redacted, digest, manifest = payload
+        if digest == self._auto_share_hash.get(sid):
+            return  # nothing new since the last push
+        self._auto_share_at[sid] = now
+        self._auto_share_hash[sid] = digest
+        self._auto_share_thread = threading.Thread(
+            target=self._auto_share_publish, args=(manifest["github_id"], _name, _redacted, manifest), daemon=True
+        )
+        self._auto_share_thread.start()
+
+    def _auto_share_publish(self, github_id: str, name: str, transcript: str, manifest: dict) -> None:
+        # Runs off the reactor thread; best-effort, never touches the UI.
+        try:
+            self._shared_store().publish(github_id=github_id, name=name, transcript=transcript, manifest=manifest)
+        except Exception as error:
+            self._debug(f"auto-share failed for {github_id}/{name}: {error!r}")
 
     def _resume_shared_session_menu(self) -> None:
         store = self._shared_store()
@@ -3226,6 +3420,7 @@ class ProxyRunner:
             self._warn_if_cwd_drifted()
             self._maybe_check_for_update()
             self._maybe_apply_pending_update()
+            self._maybe_auto_share_active()  # keep an opted-in shared session current (#55)
         self._service_session_notices()  # expire/refresh per-session status lines
         if self._base_advanced:
             self._base_advanced = False

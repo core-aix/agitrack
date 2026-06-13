@@ -104,6 +104,21 @@ agit -d text            # one-shot plain-text report instead (pipe it, paste it 
 See [Repository dashboard](#repository-dashboard) below for the full breakdown.
 
 
+## Sharing sessions
+
+You can share a full agent conversation with collaborators through the repo's git remote, and resume each other's sessions. It's **opt-in** — nothing is ever uploaded until you explicitly share a session. (Claude only for now: it has a portable transcript; OpenCode does not.)
+
+From the `session` menu (`Ctrl-G` → `session`):
+
+- **Share this session** — publishes the current conversation to the remote. The first time, aGiT asks you to confirm; a transcript can contain file contents, command output, and secrets, so **review what's in the session before sharing** (aGiT also applies best-effort secret masking, but that is *not* a guarantee — don't rely on it). You can choose to keep the shared copy **updated automatically** as you add turns, or re-share manually.
+- **Resume a shared session** — lists teammates' sessions as `<github-id>/<name>` and continues one in a fresh session worktree.
+- **Manage shared sessions** — see what *you've* shared (with "up to date" vs "local has newer turns"), push the latest turns, toggle auto-update, or unshare.
+
+Shared sessions also appear in the [dashboard](#dashboard) under **shared sessions**.
+
+How it's stored: sessions live on a dedicated, history-free git ref `refs/agit/shared-sessions` — a single rewritten commit that keeps only the latest copy (so it never bloats history) and is pushed to `origin`. Because it's a custom ref (not a branch or tag), **it won't appear on GitHub's web UI**; confirm a share with `git ls-remote origin 'refs/agit/*'` or via the menus above. Sessions are scoped by the repo's root commit, so only *this* repo's sessions are ever stored or listed.
+
+
 ## How It Works
 
 ### Backends
