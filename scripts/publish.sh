@@ -4,9 +4,12 @@
 # What it does, in order:
 #   1. Verify the working tree is on `main`, clean, and in sync with origin/main.
 #   2. Run the full local gate (scripts/check.sh) unless --skip-check.
-#   3. Compute the next version: one patch (0.0.1) above the higher of the
-#      committed version and the latest version already on PyPI — so every
-#      publish increments and never collides with an existing release.
+#   3. Compute the next version, starting from the higher of the committed
+#      version and the latest version already on PyPI (so a publish never
+#      collides with an existing release). By default the patch component is
+#      bumped (X.Y.Z -> X.Y.Z+1); --minor bumps the minor and resets the patch
+#      to 0 (X.Y.Z -> X.Y+1.0); --major bumps the major and resets minor and
+#      patch to 0 (X.Y.Z -> X+1.0.0).
 #   4. Write that version to pyproject.toml and agit/__init__.py.
 #   5. Build the sdist + wheel (uv build) and upload them to PyPI (uv publish).
 #   6. Commit "Release vX.Y.Z" on a `release/vX.Y.Z` branch, push it, and open a
@@ -35,6 +38,8 @@
 # Usage:
 #   UV_PUBLISH_TOKEN=pypi-... ./scripts/publish.sh
 #   ./scripts/publish.sh --token pypi-...        # token on the CLI instead
+#   ./scripts/publish.sh --minor                 # bump minor, reset patch to 0
+#   ./scripts/publish.sh --major                 # bump major, reset minor+patch
 #   ./scripts/publish.sh --test                  # upload to TestPyPI (no PR)
 #   ./scripts/publish.sh --dry-run               # build only; no upload, no PR
 #   ./scripts/publish.sh --skip-check            # skip the test/lint/type gate
@@ -49,6 +54,7 @@ RUN_CHECK=1
 DRY_RUN=0
 REPOSITORY="pypi"
 TOKEN="${UV_PUBLISH_TOKEN:-}"
+BUMP="patch"   # which version component to advance: major | minor | patch
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -56,6 +62,9 @@ while [ $# -gt 0 ]; do
     --dry-run) DRY_RUN=1 ;;
     --test) REPOSITORY="testpypi" ;;
     --token) shift; TOKEN="${1:-}" ;;
+    --major) BUMP="major" ;;
+    --minor) BUMP="minor" ;;
+    --patch) BUMP="patch" ;;
     -h|--help) sed -n '2,/^set -euo/p' "$0" | sed '$d'; exit 0 ;;
     *) echo "error: unknown argument '$1'" >&2; exit 2 ;;
   esac
@@ -104,11 +113,12 @@ fi
 
 # --- 3. compute the next version --------------------------------------------
 
-step "Computing the next version"
-NEXT_VERSION="$(python3 - "$DIST_NAME" <<'PY'
+step "Computing the next version ($BUMP bump)"
+NEXT_VERSION="$(python3 - "$DIST_NAME" "$BUMP" <<'PY'
 import json, re, sys, pathlib, urllib.request
 
 dist = sys.argv[1]
+level = sys.argv[2]
 
 def parse(v):
     out = []
@@ -136,8 +146,14 @@ try:
 except Exception:
     pass  # project not published yet, or offline; fall back to the local version
 
-base = max(parse(local), parse(published))
-print("%d.%d.%d" % (base[0], base[1], base[2] + 1))
+maj, minr, pat = max(parse(local), parse(published))
+if level == "major":
+    maj, minr, pat = maj + 1, 0, 0
+elif level == "minor":
+    minr, pat = minr + 1, 0
+else:  # patch
+    pat += 1
+print("%d.%d.%d" % (maj, minr, pat))
 PY
 )"
 [ -n "$NEXT_VERSION" ] || die "could not compute the next version"
