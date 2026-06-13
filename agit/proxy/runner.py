@@ -2846,6 +2846,10 @@ class ProxyRunner:
                     if submitted_prompt:
                         # A new prompt starts a turn on its own branch.
                         self._ensure_turn_branch()
+                        # Drop the previous turn's "created & merged" status line so
+                        # it doesn't linger into — and read as belonging to — the
+                        # new turn (which would show "created" before "summarizing").
+                        self._set_session_notice(self._session_label(), None)
                 self.active.process.write(b"".join(forwarded))
         if command:
             self._run_command(command)
@@ -3812,7 +3816,7 @@ class ProxyRunner:
         owner._summary_thread.start()
         self._set_session_notice(
             self._session_label(),
-            f"aGiT is summarizing commit {sha} in session '{self._session_label()}'…",
+            f"aGiT is summarizing the latest commit in session '{self._session_label()}'…",
             seconds=self.SUMMARY_WAIT_SECONDS,
         )
 
@@ -4434,6 +4438,11 @@ class ProxyRunner:
             self._ensure_turn_branch()  # a new prompt starts a turn on its own branch
         self.agent_in_flight = True
         self._clear_message()
+        if prompt_text:
+            # Drop the previous turn's "created & merged" status line so it does
+            # not linger into the new turn (clearing the registry too, or the
+            # notice service tick would just repaint it).
+            self._set_session_notice(self._session_label(), None)
         self.active.process.write(b"".join(forwarded))
 
     def _prune_declined_untracked(self, repo: GitRepo | None = None, state: AgitState | None = None) -> None:

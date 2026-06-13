@@ -2028,6 +2028,46 @@ def test_proxy_pending_prompt_user_commit_then_forwards(tmp_path):
         os.close(write_fd)
 
 
+def test_new_turn_clears_previous_created_notice(tmp_path):
+    # A new prompt must drop the prior turn's "created & merged" status line, so
+    # the user never sees the previous commit's "created" message lead into the
+    # new turn's "summarizing…".
+    read_fd, write_fd = os.pipe()
+    try:
+        runner = make_runner(
+            master_fd=write_fd,
+            pending_forwarded=[b"\r"],
+            pending_prompt_text="next thing",
+            passthrough_prompt=bytearray(b"next thing"),
+            state=AgitState(tmp_path),
+            name="session-1",
+            agent_parse_thread=None,
+            agent_in_flight=False,
+            screen=None,
+            message=None,
+            message_until=0.0,
+        )
+        runner._record_user_prompt = lambda text: None
+        runner._ensure_turn_branch = lambda: None
+        # The previous turn left a "created & merged" notice for this session.
+        runner._set_session_notice(
+            "session-1", "Created <aGiT> commit abc1234 in session 'session-1' — merged into main."
+        )
+        assert runner.message is not None
+
+        runner._forward_pending_prompt()
+
+        assert os.read(read_fd, 1) == b"\r"
+        # The stale notice is gone from both the popup and the registry, so the
+        # notice service tick can't repaint it.
+        assert "session-1" not in runner._session_notices
+        runner._service_session_notices()
+        assert runner.message is None
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
 def test_proxy_pending_prompt_cancelled_user_commit_does_not_forward(tmp_path):
     read_fd, write_fd = os.pipe()
     try:

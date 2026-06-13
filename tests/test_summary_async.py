@@ -185,7 +185,10 @@ def test_commit_path_does_not_block_on_summarization(tmp_path, monkeypatch):
     runner._start_commit_summary(sha, [_turn()])
     assert time.monotonic() - started < 1.0  # returned while the LLM call hangs
     assert runner._summary_pending is not None
+    # The "summarizing…" popup names the session but NOT the commit hash (the
+    # hash is noise to the user while the summary is in flight).
     assert "summarizing" in (runner.message or "")
+    assert sha not in (runner.message or "")
     assert repo.commit_message("HEAD").startswith("<aGiT> prompt subject")  # commit untouched so far
 
     FakeSummarizer.gate.set()
