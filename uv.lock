@@ -7,7 +7,7 @@ resolution-markers = [
 ]
 
 [[package]]
-name = "agit-cli"
+name = "agit-ai"
 version = "0.0.0"
 source = { editable = "." }
 dependencies = [

@@ -5,11 +5,11 @@ build-backend = "setuptools.build_meta"
 # NOTE: `name` is the PyPI *distribution* name (what `pip install` takes); the
 # import package and the installed command are both `agit`. The plain `agit`
 # name on PyPI is owned by an unrelated project, so aGiT is published as
-# `agit-cli` — `pip install agit-cli` then provides `import agit` and the `agit`
+# `agit-ai` — `pip install agit-ai` then provides `import agit` and the `agit`
 # command. `version` is managed by scripts/publish.sh (auto-incremented per
 # release); 0.0.0 marks an unreleased working tree.
 [project]
-name = "agit-cli"
+name = "agit-ai"
 version = "0.0.0"
 description = "Interactive agent + git commit orchestration. Requires git and a backend CLI (Claude Code or OpenCode); the GitHub CLI (gh) is optional, used for the dashboard's GitHub-ID committer view."
 readme = "README.md"

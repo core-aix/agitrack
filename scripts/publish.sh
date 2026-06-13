@@ -11,9 +11,9 @@
 #   5. Build the sdist + wheel (uv build) and upload them (uv publish).
 #   6. Commit "Release vX.Y.Z", tag it, and push the commit and tag.
 #
-# Distribution name: `agit-cli` (the plain `agit` name on PyPI belongs to an
+# Distribution name: `agit-ai` (the plain `agit` name on PyPI belongs to an
 # unrelated project). The import package and installed command stay `agit`, so
-# users `pip install agit-cli` and then run `agit`.
+# users `pip install agit-ai` and then run `agit`.
 #
 # Authentication: uv publish reads a PyPI API token from $UV_PUBLISH_TOKEN (or
 # pass --token to this script). The token's username is implicitly `__token__`.
@@ -30,7 +30,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-DIST_NAME="agit-cli"   # PyPI distribution name (import name stays `agit`)
+DIST_NAME="agit-ai"   # PyPI distribution name (import name stays `agit`)
 RELEASE_BRANCH="main"
 
 RUN_CHECK=1

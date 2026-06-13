@@ -29,8 +29,8 @@ import agit
 
 # The PyPI distribution name. The import package and the installed command are
 # both ``agit``; the plain ``agit`` name on PyPI belongs to an unrelated project,
-# so aGiT is published as ``agit-cli`` (see pyproject.toml / scripts/publish.sh).
-DIST_NAME = "agit-cli"
+# so aGiT is published as ``agit-ai`` (see pyproject.toml / scripts/publish.sh).
+DIST_NAME = "agit-ai"
 
 # How aGiT was installed, as reported by ``UpdateStatus.kind`` / ``Updater.kind``.
 KIND_SOURCE = "source"
@@ -222,7 +222,7 @@ class Updater:
         prefix = f"{DIST_NAME.lower()} ("
         for line in result.stdout.splitlines():
             line = line.strip()
-            # e.g. "agit-cli (1.2.3)" or "LATEST: 1.2.3"
+            # e.g. "agit-ai (1.2.3)" or "LATEST: 1.2.3"
             if line.upper().startswith("LATEST:"):
                 return line.split(":", 1)[1].strip() or None
             if line.lower().startswith(prefix) and line.endswith(")"):
