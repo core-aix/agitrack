@@ -48,11 +48,8 @@ jobs:
               r'^version = "[^"]+"', f'version = "{new_version}"',
               pp.read_text(), count=1, flags=re.M,
           ))
-          ip = pathlib.Path("agit/__init__.py")
-          ip.write_text(re.sub(
-              r'^__version__ = "[^"]+"', f'__version__ = "{new_version}"',
-              ip.read_text(), count=1, flags=re.M,
-          ))
+          # pyproject.toml is the only version source; agit.__version__ derives
+          # from the installed distribution metadata at runtime.
           print(f"version={new_version}")
           PY
 
@@ -65,7 +62,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git switch -c "$BRANCH"
-          git add pyproject.toml agit/__init__.py
+          git add pyproject.toml
           git commit -m "Release v${VERSION}"
           git push origin "$BRANCH"
           gh pr create --base main --head "$BRANCH" \
