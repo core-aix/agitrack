@@ -56,6 +56,7 @@ from agit.proxy.renderer import (
 
 # TerminalHost lives in terminal.py (P1).
 from agit.proxy.terminal import TerminalHost
+from agit.update import Updater, UpdateStatus, restart_agit
 
 # Modal state-machines (P6 Stage 2): PromptModal and SelectModal encode the
 # byte-handling logic for free-text and selection popups.
@@ -129,6 +130,7 @@ class ProxyInput:
         "git-stage",
         "git-unstaged",
         "git-user-commit",
+        "update",
         "exit",
     ]
 
@@ -334,6 +336,11 @@ class ProxyRunner:
         # sees that aGiT committed (and isn't misled by the backend asking to
         # commit work aGiT has already captured).
         self._message_sticky = False
+        # Per-session status notices (commit/summary lifecycle), keyed by session
+        # name and composed into a multi-line popup so concurrent sessions each
+        # get their own line. Host-level (a display concern shared across sessions).
+        self._session_notices: dict[str, tuple[str, float, bool]] = {}
+        self._notice_shown = False  # True while self.message reflects the notices
         self._last_agent_commit_id: str | None = None
         # Prompts the user queued while the agent was busy; the next commit waits
         # for each to appear as a turn so a queued follow-up shares one commit with
@@ -429,6 +436,18 @@ class ProxyRunner:
         # One diagnostic-log file per run, in the base repo's .agit/ (survives the
         # per-run worktree teardown).
         self._diag_run = time.strftime("%Y%m%d-%H%M%S")
+        # Self-update: a background check runs on a throttle; when the user opts
+        # in, the update is applied once every session is finished and committed,
+        # then aGiT re-execs itself.
+        self._updater = Updater()
+        self._update_status: UpdateStatus | None = None  # latest completed check result
+        self._update_check_at = 0.0  # throttle for the periodic background check
+        self._update_check_thread: threading.Thread | None = None
+        self._update_worker_result: UpdateStatus | None = None  # worker -> main handoff
+        self._update_offered = False  # have we notified the user about the current update?
+        self._update_pending = False  # user accepted; apply once sessions finish
+        self._update_applying = False  # apply+restart in progress
+        self._pending_restart = False  # re-exec aGiT after the loop tears down
 
     def _apply_timings(self, timings: dict[str, float]) -> None:
         # Override the class-constant timing defaults with the user's configured
@@ -442,6 +461,7 @@ class ProxyRunner:
         self.CWD_CHECK_SECONDS = timings["cwd_check_seconds"]
         self.BASE_DRIFT_CHECK_SECONDS = timings["base_drift_check_seconds"]
         self.SUMMARY_WAIT_SECONDS = timings["summary_wait_seconds"]
+        self.UPDATE_CHECK_SECONDS = timings["update_check_seconds"]
 
     # --- session pointer -------------------------------------------------
 
@@ -542,7 +562,8 @@ class ProxyRunner:
                 "message": None,
                 "message_until": 0.0,
                 "_message_sticky": False,
-                "_last_agent_commit_id": None,
+                "_session_notices": {},
+                "_notice_shown": False,
                 "_awaited_followups": [],
                 "host_fg_value": None,
                 "host_bg_value": None,
@@ -564,9 +585,6 @@ class ProxyRunner:
                 "_reap_pids": [],
                 "_idle_integrate_at": 0.0,
                 "_attach_uncovered_until": 0.0,
-                "_summary_thread": None,
-                "_summary_result": None,
-                "_summary_pending": None,
                 "_precompact_thread": None,
                 "_precompact_result": None,
                 "_base_poll_at": 0.0,
@@ -588,6 +606,17 @@ class ProxyRunner:
                 "_relaunch_times": [],
                 "_exiting": False,
                 "_finalized_on_exit": False,
+                # Self-update fields (production sets these in __init__).
+                "_updater": None,
+                "_update_status": None,
+                "_update_check_at": 0.0,
+                "_update_check_thread": None,
+                "_update_worker_result": None,
+                "_update_offered": False,
+                "_update_pending": False,
+                "_update_applying": False,
+                "_pending_restart": False,
+                "UPDATE_CHECK_SECONDS": 300.0,
             }
         )
         # Apply timing class-constant defaults (so CHILD_IDLE_SECONDS etc. resolve).
@@ -672,7 +701,7 @@ class ProxyRunner:
             signal.signal(signal.SIGTERM, self._handle_exit_signal)
             signal.signal(signal.SIGHUP, self._handle_exit_signal)
             self._setup_worktree_confinement_notice()
-            return self._loop()
+            exit_code = self._loop()
         finally:
             if self.original_sigwinch is not None:
                 signal.signal(signal.SIGWINCH, self.original_sigwinch)
@@ -687,6 +716,11 @@ class ProxyRunner:
                 except OSError:
                     pass
             self.management_lock.release()
+        # A self-update was applied; re-exec aGiT in place now that the terminal
+        # is restored and the management lock is released. Does not return.
+        if self._pending_restart:
+            restart_agit()
+        return exit_code
 
     def _ensure_backend_available(self) -> bool:
         try:
@@ -869,6 +903,181 @@ class ProxyRunner:
         )
         self._render()
 
+    # ------------------------------------------------------------------
+    # Self-update (#: check periodically, apply once sessions are finished)
+    # ------------------------------------------------------------------
+
+    def _update_checks_enabled(self) -> bool:
+        gc = getattr(self, "global_config", None)
+        return bool(getattr(gc, "check_for_updates", True)) if gc is not None else False
+
+    def _merge_session_active(self) -> bool:
+        # True while a merge / conflict resolution is in progress in ANY session
+        # (the active one, or a background session integrating its turn). Update
+        # prompts and updates are suppressed for the duration so they never
+        # interrupt a merge the user is in the middle of.
+        if getattr(self, "merge_ctx", None) is not None:
+            return True
+        return any(getattr(session, "merge_ctx", None) is not None for session in getattr(self, "sessions", []))
+
+    def _maybe_check_for_update(self) -> None:
+        # Kick off a background self-update check on a throttle, and surface a
+        # finished one. Network I/O (`git fetch`) runs on a worker thread so the
+        # terminal never stalls; the result is handed back and consumed here on
+        # the main thread.
+        if self._merge_session_active():
+            # Don't prompt mid-merge; a result that lands now stays pending and
+            # is surfaced once the merge is done.
+            return
+        self._consume_update_check_result()
+        if self._updater is None or not self._update_checks_enabled():
+            return
+        if self._update_pending or self._update_applying:
+            return  # already decided / in progress — stop nagging
+        if self._update_check_thread is not None and self._update_check_thread.is_alive():
+            return
+        now = time.monotonic()
+        if self._update_check_at and now - self._update_check_at < self.UPDATE_CHECK_SECONDS:
+            return
+        self._update_check_at = now
+        updater = self._updater
+
+        def worker() -> None:
+            try:
+                self._update_worker_result = updater.check()
+            except Exception as error:  # never let a check crash the worker
+                self._debug(f"update check failed: {error!r}")
+                self._update_worker_result = None
+
+        self._update_worker_result = None
+        self._update_check_thread = threading.Thread(target=worker, daemon=True, name="agit-update-check")
+        self._update_check_thread.start()
+
+    def _consume_update_check_result(self) -> None:
+        thread = self._update_check_thread
+        if thread is None or thread.is_alive():
+            return
+        result = self._update_worker_result
+        self._update_check_thread = None
+        self._update_worker_result = None
+        if result is None or not result.ok:
+            return
+        self._update_status = result
+        if result.available and not self._update_offered:
+            # First time we have seen this update: prompt the user (a status-bar
+            # notice pointing at the `update` command, so we don't seize the
+            # screen mid-keystroke).
+            self._update_offered = True
+            self._set_message(
+                f"{result.message}\n{self._menu_label()} → 'update' to install it when your sessions finish.",
+                seconds=12.0,
+            )
+            self._render()
+
+    def _ready_for_update(self) -> bool:
+        # "All sessions finished and commits are in": nothing is mid-turn,
+        # mid-parse, mid-merge, or mid-summary anywhere. The actual commit +
+        # integration of finished work is flushed by _finalize_pending_work()
+        # right before the update is applied.
+        if self._merge_session_active():
+            return False
+        if getattr(self, "agent_in_flight", False):
+            return False
+        if getattr(self, "agent_parse_active", False):
+            return False
+        if getattr(self, "pending_forwarded", None) or getattr(self, "pending_prompt_text", ""):
+            return False
+        if getattr(self, "_summary_pending", None) is not None:
+            return False
+        summary_thread = getattr(self, "_summary_thread", None)
+        if summary_thread is not None and summary_thread.is_alive():
+            return False
+        if self._running_background_session_names():
+            return False
+        return True
+
+    def _maybe_apply_pending_update(self) -> None:
+        if not self._update_pending or self._update_applying:
+            return
+        if not self._ready_for_update():
+            return
+        self._apply_update_and_restart()
+
+    def _apply_update_and_restart(self) -> None:
+        # Commit + integrate every session's finished work (same path as exit),
+        # install the update, then ask run()'s teardown to re-exec aGiT.
+        self._update_applying = True
+        self._update_pending = False
+        self._set_message("Finishing commits, then updating aGiT…", seconds=30.0)
+        self._render()
+        try:
+            self._finalize_pending_work()
+        except Exception as error:  # don't let a commit hiccup strand the update
+            self._debug(f"finalize before update failed: {error!r}")
+        result = self._updater.apply()
+        if not result.ok:
+            self._update_applying = False
+            self._finalized_on_exit = False  # allow a later clean exit to finalize again
+            self._exiting = False
+            self._set_message(f"aGiT update failed: {result.error}", seconds=12.0)
+            self._render()
+            return
+        # Success: stop the loop and let run()'s finally restore the terminal and
+        # release the lock before _pending_restart triggers the re-exec.
+        self._set_message(f"{result.message} Restarting aGiT…", seconds=10.0)
+        self._render()
+        self._exit_child()
+        self._pending_restart = True
+        self.running = False
+
+    def _handle_update_command(self) -> None:
+        # Ctrl-G → "update": show the current update status and let the user opt
+        # in (applied once sessions finish), postpone, or stop update checks.
+        if self._update_applying:
+            self._set_message("An aGiT update is already in progress.")
+            self._render()
+            return
+        status = self._update_status
+        if status is None:
+            # No completed check yet — make sure one is running and ask the user
+            # to retry, rather than blocking the UI on a network fetch.
+            self._update_check_at = 0.0
+            self._maybe_check_for_update()
+            self._set_message("Checking for aGiT updates… run 'update' again in a moment.")
+            self._render()
+            return
+        if not status.ok:
+            self._set_message(f"Update check failed: {status.error}")
+            self._render()
+            return
+        if not status.available:
+            self._set_message(f"aGiT is up to date ({status.current or 'current'}).")
+            self._render()
+            return
+        choice = self._select_popup(
+            status.message,
+            ["Update when sessions finish", "Not now", "Stop checking for updates"],
+        )
+        if choice == "Stop checking for updates":
+            if self.global_config is not None:
+                self.global_config.check_for_updates = False
+            self._set_message("aGiT will no longer check for updates.")
+            self._render()
+            return
+        if choice != "Update when sessions finish":
+            self._set_message("Update postponed.")
+            self._render()
+            return
+        self._update_pending = True
+        if self._ready_for_update():
+            self._apply_update_and_restart()
+        else:
+            self._set_message(
+                "aGiT will update and restart once all sessions finish and commits are in.",
+                seconds=8.0,
+            )
+            self._render()
+
     def _confine_to_worktree(self, command: list[str]) -> list[str]:
         # Wrap the backend so it can only write inside its session worktree (plus
         # the repo's .git), not the base repo it lives in. A no-op when there is
@@ -990,14 +1199,24 @@ class ProxyRunner:
             return
         self._new_session(session_name, backend=name)
 
+    def _persisted_session_names(self) -> set[str]:
+        # Sanitized names recorded for past conversations — both the durable
+        # repo-root record and the worktree directory names the backend still
+        # knows. A new session must not reuse one of these: resuming that past
+        # conversation later recreates its worktree at worktree_path(name), so a
+        # collision would put two backends in one directory.
+        return {_sanitize_name(name) for name in self._agit_named_sessions().values() if name}
+
     def _taken_session_names(self) -> set[str]:
-        # Sanitized names already in use: live sessions plus on-disk worktrees.
+        # Sanitized names already in use: live sessions, on-disk worktrees, and
+        # names already claimed by a past (named/dormant) conversation.
         used: set[str] = set()
         try:
-            used.update(info.name for info in self._worktrees().list())
+            used.update(_sanitize_name(info.name) for info in self._worktrees().list())
         except Exception:
             pass
         used.update(_sanitize_name(self._session_name(index)) for index in range(len(self.sessions)))
+        used.update(self._persisted_session_names())
         return used
 
     def _next_session_name(self) -> str:
@@ -1175,13 +1394,21 @@ class ProxyRunner:
             root_state.name_session(resume_id, name)
         return name
 
-    def _first_free_session_name(self) -> str:
-        # `session-N` not already taken by a worktree on disk. (self.sessions is
-        # not built yet at startup, so this avoids the live-session check.)
+    def _startup_taken_names(self) -> set[str]:
+        # Sanitized names already claimed when the primary session is set up
+        # (self.sessions is not built yet): on-disk worktrees plus names recorded
+        # for past (named/dormant) conversations, so a fresh session can't reuse
+        # the name of one the user may resume later.
         try:
-            used = {info.name for info in self._worktrees().list()}
+            used = {_sanitize_name(info.name) for info in self._worktrees().list()}
         except Exception:
             used = set()
+        used |= self._persisted_session_names()
+        return used
+
+    def _first_free_session_name(self) -> str:
+        # `session-N` not already taken by a worktree or a past conversation.
+        used = self._startup_taken_names()
         number = 1
         while f"session-{number}" in used:
             number += 1
@@ -1195,10 +1422,7 @@ class ProxyRunner:
         # Do NOT convert this to a modal; modals require the reactor to be live.
         default = self._first_free_session_name()
         print("Continuing a conversation that has no name yet." if continuing else "Starting a new session.")
-        try:
-            taken = {info.name for info in self._worktrees().list()}
-        except Exception:
-            taken = set()
+        taken = self._startup_taken_names()
         while True:
             try:
                 raw = input(f"Name this session [{default}]: ").strip()
@@ -1375,6 +1599,7 @@ class ProxyRunner:
                 return "conflict"
             self._advance_base_to(turn_branch)
             self._debug(f"integrated '{self.name}' {turn_branch} -> {self._base_branch}")
+            self._announce_agent_commit()
             return "integrated"
         except Exception as error:
             self._debug(f"integration failed for '{self.name}': {error!r}")
@@ -1937,23 +2162,50 @@ class ProxyRunner:
 
     RESUME_LIST_LIMIT = 20
 
-    def _resumable_sessions(self) -> list:
-        # Past conversations come straight from the backend agent's own session
-        # record for the repo aGiT was launched in. Worktrees are ephemeral
-        # (emptied on quit), so we never key the list off them; resuming is done
-        # by session id, which the backend resolves regardless of directory.
+    def _worktree_sessions(self) -> list:
+        # (worktree-name, SessionRef) for every conversation this backend recorded
+        # under any of the repo's aGiT worktrees — including ones whose worktree
+        # has since been removed (the backend keeps the transcript keyed by path
+        # or id). The worktree directory name IS the session's user-given name, so
+        # this is how a named session — and its name — survives across runs even
+        # after its worktree is gone.
         try:
-            refs = self.backend.list_sessions(self.base_repo.repo)
+            return list(self.backend.list_worktree_sessions(self._worktrees().root))
+        except Exception as error:
+            self._debug(f"list_worktree_sessions failed: {error!r}")
+            return []
+
+    def _resumable_sessions(self) -> list:
+        # Past conversations to offer for resume: those the backend recorded in
+        # the base repo (a plain claude/opencode run, or --no-worktree mode) plus
+        # every conversation recorded under an aGiT worktree of this repo. The
+        # worktree ones are the named sessions, and they are surfaced here even
+        # once their worktree has been emptied on quit — otherwise a named session
+        # that ran in a worktree (i.e. every normal session) would vanish from the
+        # list on the next run. Resuming is by session id, which the backend
+        # resolves regardless of directory.
+        try:
+            refs = list(self.backend.list_sessions(self.base_repo.repo))
         except Exception as error:
             self._debug(f"list_sessions failed: {error!r}")
-            return []
+            refs = []
+        seen = {ref.id for ref in refs}
+        for _name, ref in self._worktree_sessions():
+            if ref.id not in seen:
+                seen.add(ref.id)
+                refs.append(ref)
         refs = sorted(refs, key=lambda ref: getattr(ref, "updated", 0) or 0, reverse=True)
         return refs[: self.RESUME_LIST_LIMIT]
 
     def _agit_named_sessions(self) -> dict:
         # Friendly names for conversations aGiT itself created/named, keyed by
-        # backend session id, recovered from the durable repo-root record. Used
-        # only to label/resume the list that comes from the backend.
+        # backend session id. Used only to label/resume the list that comes from
+        # the backend. Two sources, in precedence order:
+        #   1. the durable repo-root record (user-given names, which follow id
+        #      drift across resumes), then
+        #   2. the worktree directory name a conversation ran in — which is the
+        #      session's name — recovered for any conversation the record missed
+        #      (its id drifted before being linked, or it was never persisted).
         names: dict = {}
         record = None
         try:
@@ -1964,6 +2216,9 @@ class ProxyRunner:
             record = None
         if record and record.get("id") and record.get("worktree"):
             names.setdefault(str(record["id"]), str(record["worktree"]))
+        for name, ref in self._worktree_sessions():
+            if name:
+                names.setdefault(str(ref.id), name)
         return names
 
     def _resume_session_menu(self) -> None:
@@ -2170,6 +2425,12 @@ class ProxyRunner:
         if self.repo.has_changes() or self._uncovered_backend_commits():
             self._commit_latest_turn_sync()
         self._clear_agent_in_flight_if_idle()
+        # Defer integration while this session's commit summary is still being
+        # computed, exactly as the active path does: it lets the summary be
+        # amended into the message (not notes-only) and keeps this session's
+        # "summarizing…" status line up so concurrent sessions are each visible.
+        if self._summary_blocks_integration(time.monotonic()):
+            return "skip"
         return self._integrate_turn_or_conflict()
 
     def _service_background_sessions(self) -> None:
@@ -2585,6 +2846,10 @@ class ProxyRunner:
                     if submitted_prompt:
                         # A new prompt starts a turn on its own branch.
                         self._ensure_turn_branch()
+                        # Drop the previous turn's "created & merged" status line so
+                        # it doesn't linger into — and read as belonging to — the
+                        # new turn (which would show "created" before "summarizing").
+                        self._set_session_notice(self._session_label(), None)
                 self.active.process.write(b"".join(forwarded))
         if command:
             self._run_command(command)
@@ -2601,13 +2866,16 @@ class ProxyRunner:
             self._check_base_branch_drift()  # pause merging before any integration runs
             self._resume_pending_prompt_if_ready()
             self._ensure_worktree_alive()
-            self._service_commit_summary()  # apply finished background summaries (#8)
+            self._service_commit_summaries()  # apply finished background summaries (#8)
             self._service_precompact_summary()
             self._maybe_agent_commit()
             self._service_background_sessions()
             self._poll_base_advanced()
             self._warn_if_base_edited()
             self._warn_if_cwd_drifted()
+            self._maybe_check_for_update()
+            self._maybe_apply_pending_update()
+        self._service_session_notices()  # expire/refresh per-session status lines
         if self._base_advanced:
             self._base_advanced = False
             self._sync_idle_worktrees_to_base()
@@ -3141,6 +3409,9 @@ class ProxyRunner:
         elif name == "git-base-branch":
             self._switch_base_command(arg)
             return
+        elif name == "update":
+            self._handle_update_command()
+            return
         elif name == "":
             self._set_message("Select an aGiT command.")
         else:
@@ -3368,8 +3639,11 @@ class ProxyRunner:
 
         def on_commit_fn(sha):
             self._last_agent_commit_id = sha
-            if not quiet:
-                self._set_message(self._agent_commit_message(), sticky=True)
+            # Don't announce the commit yet: the "created" popup is shown only once
+            # the commit is merged into the base branch (see _integrate_turn_or_conflict),
+            # so the user is never told a commit landed before it actually has.
+            self._commit_merged_pending = True
+            self._commit_summarized = False
             # The commit is made immediately; the LLM summary is computed in the
             # background and amended in afterwards (#8) so the UI never blocks.
             self._start_commit_summary(sha, turns)
@@ -3420,14 +3694,33 @@ class ProxyRunner:
         return self.name or "main"
 
     def _agent_commit_message(self) -> str:
-        # The auto-commit confirmation, including the short SHA of the commit aGiT
-        # just made so the user can find it (e.g. `git show <id>`). Background
-        # sessions auto-commit too, so the popup must say whose work it announces.
+        # The auto-commit confirmation, shown only once the commit has landed in
+        # the base branch (worktree sessions) or been committed and summarized
+        # (no-worktree sessions). Includes the short SHA so the user can find the
+        # commit (e.g. `git show <id>`), the session it belongs to (background
+        # sessions auto-commit too), the base it landed on, and whether it was
+        # summarized.
         commit_id = self._last_agent_commit_id
         session = self._session_label()
-        if commit_id:
-            return f"Created <aGiT> commit {commit_id} in session '{session}'."
-        return f"Created <aGiT> commit in session '{session}'."
+        base = self._base_branch or "the base branch"
+        summarized = " (summarized)" if self._commit_summarized else ""
+        head = f"Created <aGiT> commit {commit_id}" if commit_id else "Created <aGiT> commit"
+        return f"{head} in session '{session}' — merged into {base}{summarized}."
+
+    def _announce_agent_commit(self) -> None:
+        # Surface the deferred "created" notice for the session whose commit just
+        # landed — at integration time for a worktree session (the commit is now
+        # in the base), or after the commit/summary for a no-worktree session
+        # (which never integrates). Only fires when there is a just-made agent
+        # commit to announce; a base fast-forward with nothing pending, or an
+        # already-announced commit, stays silent. Uses a session notice (not a
+        # sticky message) so it never stomps the "summarizing…" notice and the
+        # ordering — summarizing first, then created — is preserved.
+        if not self._commit_merged_pending:
+            return
+        self._commit_merged_pending = False
+        self._set_session_notice(self._session_label(), self._agent_commit_message())
+        self._commit_summarized = False
 
     # ------------------------------------------------------------------
     # Background commit summarization (#8)
@@ -3463,10 +3756,14 @@ class ProxyRunner:
         summarizer = self._make_summarizer()
         if summarizer is None:
             return
-        if self._summary_thread is not None and self._summary_thread.is_alive():
-            # One summary at a time; a turn committed before the previous
-            # summary finished keeps its prompt-based message (notes only).
-            self._debug(f"summary worker busy; skipping summary for {sha}")
+        # The owning session: summary state is per session (so two sessions can
+        # summarize at once), and the worker writes its result back to THIS
+        # session even if the user switches away before it finishes.
+        owner = self.active
+        if owner._summary_thread is not None and owner._summary_thread.is_alive():
+            # One summary at a time PER SESSION; a turn committed before this
+            # session's previous summary finished keeps its prompt-based message.
+            self._debug(f"summary worker busy for '{self._session_label()}'; skipping summary for {sha}")
             return
         try:
             full_sha = self.repo.rev_parse(sha)
@@ -3491,8 +3788,9 @@ class ProxyRunner:
             "state": self.state,
             "session_name": self._session_label(),
         }
-        self._summary_result = None
-        self._summary_pending = {"sha": full_sha, "since": time.monotonic()}
+        owner._summary_result = None
+        owner._summary_pending = {"sha": full_sha, "since": time.monotonic()}
+        model = self.state.model
 
         def worker() -> None:
             try:
@@ -3512,22 +3810,34 @@ class ProxyRunner:
                     # summary; the previous session summary simply stays current.
                     result["session_summary_error"] = repr(error)
             result["metadata"] = summary_metadata_lines(
-                model=summarizer.model or self.state.model,
+                model=summarizer.model or model,
                 tokens_input=summarizer.tokens_input,
                 tokens_output=summarizer.tokens_output,
             )
-            self._summary_result = result
+            # Write back to the OWNING session (not self.active, which may have
+            # changed): the service tick swaps each session in to apply it.
+            owner._summary_result = result
 
-        self._summary_thread = threading.Thread(target=worker, daemon=True, name="agit-summary")
-        self._summary_thread.start()
-        self._set_message(
-            f"aGiT is summarizing commit {sha} in session '{self._session_label()}'...",
+        owner._summary_thread = threading.Thread(target=worker, daemon=True, name="agit-summary")
+        owner._summary_thread.start()
+        self._set_session_notice(
+            self._session_label(),
+            f"aGiT is summarizing the latest commit in session '{self._session_label()}'…",
             seconds=self.SUMMARY_WAIT_SECONDS,
         )
 
+    def _service_commit_summaries(self) -> None:
+        """Apply finished background summaries for every session. Each session has
+        its own summary worker/result (so two can summarize concurrently), so the
+        active session is serviced in place and the rest via a context swap."""
+        self._service_commit_summary()  # active session, in place
+        for session in list(self.sessions):
+            if session is not self.active:
+                self._with_session(session, self._service_commit_summary)
+
     def _service_commit_summary(self) -> None:
-        """Main-loop tick: apply a finished background summary (#8). All git
-        and state mutations happen here, on the main thread."""
+        """Main-loop tick: apply this session's finished background summary (#8).
+        All git and state mutations happen here, on the main thread."""
         result = self._summary_result
         if result is None:
             return
@@ -3539,8 +3849,9 @@ class ProxyRunner:
             # session limit..." or similar, issue #8): the commit keeps its
             # prompt-led message instead of getting the error as a subject.
             self._debug(f"commit summarization failed: {result['error']}")
-            self._set_message(
-                f"aGiT: commit summarization failed in session '{session}'; keeping the prompt-based message."
+            self._set_session_notice(
+                session,
+                f"aGiT: commit summarization failed in session '{session}'; keeping the prompt-based message.",
             )
             return
         sha, summary, repo, state = result["sha"], result["summary"], result["repo"], result["state"]
@@ -3549,7 +3860,11 @@ class ProxyRunner:
             # added before an amend would hang off the orphaned pre-amend object.
             target = self._amend_summary_into_head(repo, sha, summary, result.get("metadata"))
             if target:
-                self._set_message(f"Summary added to commit {result['short_sha']} in session '{session}'.")
+                # The commit is now summarized; the "created" notice (set at
+                # integration for a worktree session, or just below for a
+                # no-worktree one) will note this. No separate "summary added"
+                # popup — that fired before the merge and confused the ordering.
+                self._commit_summarized = True
             else:
                 # Already integrated or superseded: the summary lives in the
                 # commit's git notes instead of its message.
@@ -3563,6 +3878,12 @@ class ProxyRunner:
                 repo.notes_add(target, session_summary, namespace="agit/session-summary")
             elif "session_summary_error" in result:
                 self._debug(f"session summary update failed: {result['session_summary_error']}")
+            if self.worktree is None:
+                # No integration step will announce a no-worktree commit, and the
+                # summary has now landed, so surface the "created (summarized)"
+                # notice here — replacing the "summarizing…" notice in the right
+                # order. Idempotent: a no-op if the commit was already announced.
+                self._announce_agent_commit()
         except Exception as error:
             self._debug(f"applying commit summary failed: {error!r}")
 
@@ -3615,6 +3936,9 @@ class ProxyRunner:
         # Sticky messages ignore the timeout and persist until the user's next
         # keypress clears them (see _clear_sticky_message_on_input).
         self._message_sticky = sticky
+        # A one-off message takes over the popup from the per-session notices; the
+        # notices reappear (via _service_session_notices) once it expires.
+        self._notice_shown = False
         # Request a repaint so the popup actually shows. Without this a message set
         # from the background idle loop (e.g. the auto-commit confirmation, set when
         # the agent has gone quiet and produces no output to trigger a render) would
@@ -3625,6 +3949,54 @@ class ProxyRunner:
         self.message = None
         self.message_until = 0.0
         self._message_sticky = False
+
+    # ------------------------------------------------------------------
+    # Per-session status notices (commit/summary lifecycle, multi-line)
+    # ------------------------------------------------------------------
+    #
+    # Commit/summary progress is reported per session, keyed by session name, so
+    # several concurrent sessions each get their own line in the popup instead of
+    # clobbering one shared message. The notices compose into ``self.message``;
+    # one-off ``_set_message`` calls (errors, menu results) temporarily take over
+    # and the notices reassert themselves on the next service tick.
+
+    def _set_session_notice(self, name: str, text: str | None, *, seconds: float = 6.0) -> None:
+        """Set, replace, or (text=None) clear the status line for session *name*."""
+        if text is None:
+            self._session_notices.pop(name, None)
+        else:
+            self._session_notices[name] = (text, time.monotonic() + seconds, False)
+        self._refresh_notice_message()
+
+    def _refresh_notice_message(self) -> None:
+        # Drop expired notices, then reflect the live ones into the popup. Skips
+        # over a still-showing one-off message so an error/confirmation is not
+        # stomped; that message's expiry brings the notices back on a later tick.
+        now = time.monotonic()
+        self._session_notices = {n: v for n, v in self._session_notices.items() if v[1] > now}
+        one_off_showing = (
+            not self._notice_shown and self.message is not None and (self._message_sticky or now < self.message_until)
+        )
+        if one_off_showing:
+            return
+        lines = [text for text, _until, _sticky in self._session_notices.values()]
+        if lines:
+            self.message = "\n".join(lines)
+            self.message_until = max(until for _t, until, _s in self._session_notices.values())
+            self._message_sticky = False
+            self._notice_shown = True
+            self._render_pending = True
+        elif self._notice_shown:
+            # The notices just emptied and we owned the popup: clear it.
+            self._clear_message()
+            self._notice_shown = False
+            self._render_pending = True
+
+    def _service_session_notices(self) -> None:
+        # Main-loop tick: expire per-line notices and keep the popup current (so a
+        # finished line disappears even while another session's line lives on).
+        if self._session_notices or self._notice_shown:
+            self._refresh_notice_message()
 
     def _clear_sticky_message_on_input(self) -> bool:
         # The next keypress dismisses a sticky message. Returns True if one was
@@ -3725,14 +4097,7 @@ class ProxyRunner:
         self._set_message("Finalizing commits before exit...", seconds=30)
         self._render()
         self._commit_latest_turn_sync()  # active session, in place
-        # Give an in-flight commit summary a short grace period so it can be
-        # amended in before the final integration; past that it is dropped
-        # rather than holding the exit hostage (#8).
-        if self._summary_thread is not None and self._summary_thread.is_alive():
-            self._summary_thread.join(timeout=10)
-        self._service_commit_summary()
-        self._integrate_session_on_exit()
-        self._remove_worktree_on_exit()
+        self._finalize_summary_then_integrate_on_exit()
         for session in list(self.sessions):
             if session is self.active:
                 continue
@@ -3740,11 +4105,21 @@ class ProxyRunner:
             self.active = session
             try:
                 self._commit_latest_turn_sync()
-                self._integrate_session_on_exit()
-                self._remove_worktree_on_exit()
+                self._finalize_summary_then_integrate_on_exit()
             finally:
                 self.active = saved
         self._delete_orphan_merged_branches()
+
+    def _finalize_summary_then_integrate_on_exit(self) -> None:
+        # Give the current session's in-flight commit summary a short grace period
+        # so it can be amended in before the final integration; past that it is
+        # dropped rather than holding the exit hostage (#8). Runs for the active
+        # session in place and for each background session under a context swap.
+        if self._summary_thread is not None and self._summary_thread.is_alive():
+            self._summary_thread.join(timeout=10)
+        self._service_commit_summary()
+        self._integrate_session_on_exit()
+        self._remove_worktree_on_exit()
 
     def _adopt_latest_backend_session(self) -> None:
         # The user may have switched conversations inside the backend itself (e.g.
@@ -4076,6 +4451,11 @@ class ProxyRunner:
             self._ensure_turn_branch()  # a new prompt starts a turn on its own branch
         self.agent_in_flight = True
         self._clear_message()
+        if prompt_text:
+            # Drop the previous turn's "created & merged" status line so it does
+            # not linger into the new turn (clearing the registry too, or the
+            # notice service tick would just repaint it).
+            self._set_session_notice(self._session_label(), None)
         self.active.process.write(b"".join(forwarded))
 
     def _prune_declined_untracked(self, repo: GitRepo | None = None, state: AgitState | None = None) -> None:
@@ -4221,8 +4601,10 @@ class ProxyRunner:
             self.agent_in_flight = False
             self.last_status = ""
             if not quiet:
-                # Paint the "Created <aGiT> commit." confirmation NOW, before the
-                # integrate below runs git merge/fast-forward on the main thread.
+                # Repaint now so the "summarizing…" notice (set by the commit) is
+                # visible before the integrate below runs git merge/fast-forward on
+                # the main thread; the "created & merged" notice replaces it once
+                # the turn actually lands in the base.
                 self._render()
             if integrate:
                 # Interactive integration only for the active session. The
@@ -4305,10 +4687,17 @@ class ProxyRunner:
             if self.verbose:
                 self._render_status("git changes found; no new final response available")
             return
+        # Do NOT announce the commit here. A worktree session announces it only
+        # once it merges into the base (via _announce_agent_commit at
+        # integration); meanwhile the "summarizing…" notice must stand. A
+        # no-worktree session never integrates, so it announces here — but only
+        # after any summary has landed (so summarizing shows first), which the
+        # summary service handles; if summarization is off there is no summary to
+        # wait for, so announce immediately.
         if self.verbose:
-            self._render_status(self._agent_commit_message())
-        else:
-            self._set_message(self._agent_commit_message(), sticky=True)
+            self._render_status("committed agent turn")
+        elif self.worktree is None and self._summary_pending is None:
+            self._announce_agent_commit()
 
     def _integrate_agent_made_commits_if_idle(self, now: float) -> None:
         # The agent can run `git commit` itself (some workflows ask it to).

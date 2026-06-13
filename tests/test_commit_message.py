@@ -247,9 +247,11 @@ def test_user_commit_message_masks_secret_subject():
 
 
 def test_commit_messages_include_current_agit_version_without_created_at():
+    from agit import __version__
+
     message = build_user_commit_message(message="save work", agit_session_id="agit-1")
 
-    assert "agit_version: 0.0.1" in message
+    assert f"agit_version: {__version__}" in message
     assert "created_at" not in message
 
 
@@ -324,6 +326,34 @@ def test_agent_commit_trace_is_limited_by_user_turns():
     assert "## User\n\nuser 1" not in message
     assert "## User\n\nuser 2" in message
     assert "## Agent\n\nagent 6" in message
+
+
+def test_agent_commit_records_conversation_span_as_utc_iso():
+    message = build_agent_commit_message(
+        latest_prompt="build it",
+        trace=[{"role": "user", "content": "build it"}],
+        backend="claude",
+        backend_session_id="ses-1",
+        agit_session_id="agit-1",
+        model="claude-opus-4-8",
+        started_at=1_718_200_000,
+        ended_at=1_718_200_123,
+    )
+    assert "agent_started_at: 2024-06-12T13:46:40Z" in message
+    assert "agent_ended_at: 2024-06-12T13:48:43Z" in message
+
+
+def test_agent_commit_omits_span_when_timestamps_absent():
+    message = build_agent_commit_message(
+        latest_prompt="build it",
+        trace=[{"role": "user", "content": "build it"}],
+        backend="claude",
+        backend_session_id="ses-1",
+        agit_session_id="agit-1",
+        model="claude-opus-4-8",
+    )
+    assert "agent_started_at" not in message
+    assert "agent_ended_at" not in message
 
 
 def test_subject_strips_terminal_escape_sequences():

@@ -43,6 +43,19 @@ def main(argv: list[str] | None = None) -> int:
         "commands, e.g. --prompt ':status'",
     )
     parser.add_argument(
+        "-d",
+        "--dashboard",
+        nargs="?",
+        const="html",
+        choices=["text", "html"],
+        default=None,
+        help="show repository metrics computed from aGiT commit metadata "
+        "(coverage, AI / human / non-tracked line changes, tokens, per-backend/"
+        "model/committer breakdowns, loop detection). Bare or `html` serves a "
+        "filterable, auto-refreshing dashboard on localhost and opens it in the "
+        "browser (Ctrl-C to stop); `text` prints a one-shot report and exits",
+    )
+    parser.add_argument(
         "--backend",
         choices=available_backends(),
         default=None,
@@ -79,6 +92,24 @@ def main(argv: list[str] | None = None) -> int:
         _show_combined_help(parser, args.backend, config)
         return 0
 
+    if args.dashboard:
+        # Read-only: nothing is logged or committed, so no privacy
+        # acknowledgment and no repo initialization offer.
+        try:
+            dashboard_repo = GitRepo.discover(Path(args.repo).expanduser())
+            if args.dashboard == "text":
+                from agit.metrics import render_dashboard
+
+                print(render_dashboard(dashboard_repo))
+                return 0
+            from agit.metrics import serve_dashboard
+
+            return serve_dashboard(dashboard_repo)
+        except (GitError, OSError) as error:
+            # OSError: --repo points at a directory that does not exist.
+            print(error)
+            return 1
+
     # If backend is asked for help, run it directly without TUI.
     if backend_args and any(arg in ("--help", "-h") for arg in backend_args):
         backend = args.backend or config.default_backend
@@ -98,6 +129,13 @@ def main(argv: list[str] | None = None) -> int:
     scripted = bool(args.prompts)
     if scripted:
         args.mode = "json"  # --prompt drives the non-interactive shell (#53)
+
+    # Offer a self-update before launching anything. Skipped for scripted/non-TTY
+    # runs (no way to answer) and when the user turned update checks off. If the
+    # user accepts, aGiT updates and re-execs immediately — no sessions are
+    # running yet at startup, so there is nothing to finalize first.
+    if not scripted and sys.stdin.isatty() and sys.stdout.isatty():
+        _check_for_update_at_startup(config)
 
     if (
         args.backend is None
@@ -202,6 +240,44 @@ def _show_combined_help(
         print(result.stdout or result.stderr)
     except Exception as error:
         print(f"(Could not run '{backend_cmd} --help': {error})")
+
+
+def _check_for_update_at_startup(config: GlobalConfig) -> None:
+    """At startup, check for a newer aGiT and, if one exists, prompt the user to
+    install it now. Best-effort: any failure (no network, no upstream) is
+    swallowed so it can never block launching aGiT."""
+    # Skip when checks are off, or when the attribute is absent — a config that
+    # doesn't carry the update preference (e.g. a test stub) has nothing to read
+    # or persist, so there is no update flow to run.
+    if not getattr(config, "check_for_updates", None):
+        return
+    try:
+        from agit.update import Updater, restart_agit
+
+        updater = Updater()
+        status = updater.check()
+    except Exception:
+        return
+    if not status.ok or not status.available:
+        return
+    print(f"\n{status.message}")
+    try:
+        answer = input("Update aGiT now? [y]es / [n]o / [never] ask again: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return
+    if answer in {"never", "no ask", "stop"}:
+        config.check_for_updates = False
+        print("aGiT will no longer check for updates (re-enable with check_for_updates in ~/.agit/config.json).")
+        return
+    if answer not in {"y", "yes"}:
+        return
+    print("Updating aGiT...")
+    result = updater.apply()
+    if not result.ok:
+        print(f"Update failed: {result.error}")
+        return
+    print(f"{result.message} Restarting aGiT...")
+    restart_agit()  # does not return on success
 
 
 PRIVACY_WARNING = (

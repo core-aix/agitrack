@@ -4,15 +4,40 @@ aGiT stands for agent + git. It is an interactive Python CLI that wraps coding-a
 
 aGiT supports OpenCode and Claude (Claude Code) as interchangeable backends. Every aGiT feature works the same regardless of the selected backend.
 
+## Dashboard
+
+`agit --dashboard` (or `-d`) opens a **live, auto-refreshing web dashboard** of your repository — who and what wrote the code — served on `localhost` and opened in your browser. Every number is computed from commit metadata alone, so it's identical on every clone; nothing is sent anywhere.
+
+```bash
+agit --dashboard        # serve on localhost and open the browser (Ctrl-C to stop)
+agit -d text            # one-shot plain-text report instead (pipe it, paste it into an issue)
+```
+
+![The aGiT dashboard](docs/images/dashboard.png)
+
+- **aGiT-tracked AI vs non-tracked lines** — what the agents wrote (tracked by aGiT) versus everything else; it never claims a human wrote what the model did.
+- **Filter live** — narrow the whole dashboard to one committer (merged to their GitHub ID), a backend, a model, or a time range.
+- **Tokens, efficiency, and loop detection**, plus a commit log you can click to read the full message and jump to the commit on GitHub.
+
+See [Repository dashboard](#repository-dashboard) below for the full breakdown.
+
+## Requirements
+
+aGiT needs **git** and at least one backend CLI — [Claude Code](https://docs.claude.com/en/docs/claude-code) or [OpenCode](https://opencode.ai) — on your `PATH`. The dashboard's committer view additionally uses the **GitHub CLI (`gh`)** to resolve commit authors to their GitHub logins: install it from [cli.github.com](https://cli.github.com) and run `gh auth login`. `gh` is optional — without it the dashboard still works and falls back to merging committer identities by email and no-reply login.
+
 ## Install
 
-For local development:
+```bash
+pip install agit-ai
+```
+
+This installs the `agit` command and the terminal UI dependency used for status bars and contextual command hints. (The PyPI distribution is named `agit-ai` because the `agit` name is taken by an unrelated project; the command you run and the importable package are both still `agit`.) Once installed, aGiT keeps itself up to date — see [Self-update](#self-update).
+
+For local development, install from a checkout instead:
 
 ```bash
 python3 -m pip install -e .
 ```
-
-This installs the `agit` command and the terminal UI dependency used for status bars and contextual command hints.
 
 ### Contributing
 
@@ -104,12 +129,22 @@ git-status                show git status
 git-stage                 review and stage untracked files
 git-unstaged              show intentionally unstaged files
 git-user-commit           create a user commit
+update                    check for / install an aGiT self-update
 exit                      exit (with confirmation)
 ```
 
 aGiT tracks one session per repository and stays pinned to the session it launched (so it does not drift to other sessions you open). Use the `session` command (`Ctrl-G`, then `session`) to start a new session, switch the tracked session to another existing one, or sync tracking to the most recently active session — for example after starting a new conversation inside the backend's own TUI. This works the same for all backends.
 
 Only `session` starts with `s`, so `Ctrl-G` then `s` + Enter jumps straight to the session picker. The session menu marks each session `running` or `idle`. Git-specific commands share a `git-` prefix.
+
+### Self-update
+
+aGiT keeps itself current. On startup, and then about every five minutes while you work, it checks whether a newer aGiT is available:
+
+- **Source-linked install** (the editable `pip install -e .` from a git checkout): it fetches the checkout's upstream branch and compares it with your current branch.
+- **Package install** (a wheel from a package index): it compares the installed version with the latest published one.
+
+If an update exists, aGiT prompts you at startup and shows a notice during a session (run the `update` command from the `Ctrl-G` menu to act on it). When you accept, aGiT waits until **every session has finished and all commits are integrated**, installs the update, then restarts itself automatically. It never interrupts a merge: while any session is resolving a merge/conflict, the notice is held back and an accepted update is deferred until the merge is done. Source updates are fast-forward-only and are skipped (with a message) if the checkout has uncommitted changes or has diverged from upstream, so an update never disturbs local development. Choose "Stop checking for updates" — or set `"check_for_updates": false` in `~/.agit/config.json` — to turn the checks off; tune the cadence with `timings.update_check_seconds`.
 
 
 Proxy mode launches the backend's native TUI directly and recovers session metadata for automatic agent commits — via `opencode export` for OpenCode, or by reading the session transcript under `~/.claude/projects/` for Claude.
@@ -237,6 +272,24 @@ scripts/demo.sh                      # drive the demo with claude
 scripts/demo.sh --backend opencode   # ... or with opencode
 scripts/demo.sh --model haiku --dir /tmp/agit-demo
 ```
+
+### Repository dashboard
+
+`agit --dashboard` (or `-d`) opens a live web dashboard of repository metrics computed entirely from the aGiT metadata in commit messages — no extra state, so the numbers are identical on every clone. It is served on `localhost`, opens in your browser, and **auto-refreshes** (the page polls the server, which recomputes from `git log` on each request), so you can watch metrics update as an agent commits. Press Ctrl-C to stop.
+
+- **Coverage**: how many commits are aGiT-tracked (agent commits, backend-made commits covered by an aGiT cover commit, agent-resolved merges, user commits, and aGiT's own integration merges) versus non-tracked.
+- **Code changes**: lines added/removed split two ways — **aGiT-tracked AI** (agent commits + the backend-made commits an aGiT cover commit accounts for + agent-resolved merges) and **non-tracked** (everything else: user commits, plain commits with no aGiT metadata, and squash/PR-merge commits whose message concatenates several metadata blocks and so can't be cleanly attributed). There is deliberately no "human" category — even a user-made commit can contain lines an agent produced off the record, so the only honest claim is whether aGiT tracked the lines as AI. Cover commits are merges and contribute no line counts of their own, so a turn's lines are never double-counted.
+- **aGiT-ops**: the integration merge commits aGiT makes itself (e.g. bringing base into a session branch) are shown as their own class, not lumped into non-tracked. They carry no diff, so they add no lines.
+- **Squashed commits**: when several aGiT commits are squashed into one (a squash- or PR-merge concatenates their metadata blocks — git flattens this even across multiple rounds of squashing), the dashboard parses every original back out, so their tokens and per-model/backend usage are still counted instead of lost in the aggregate. In the web commit log such a commit is tagged `⧉ N squashed` and expands on click into its original commits, each itself expandable to its full message.
+- **Tokens**: totals per category (input, output, reasoning, cache read/write, sub-agents, summarizer) and an efficiency ratio — AI-changed lines per 1k output tokens.
+- **Breakdowns** by backend, by model (a cover commit's bucket includes the lines of the backend-made commits it covers), and by committer. Committer identities are merged to **GitHub IDs** via the `gh` CLI when available (every commit GitHub knows is keyed by its real login); without `gh` it falls back to merging by email and no-reply login. Each committer's lines are split into the aGiT-tracked AI they drove versus non-tracked.
+- **Possible loops**: runs of three or more consecutive turns with near-identical prompts (or the same prompt repeated within one turn's trace), with the output tokens they consumed — a sign the conversation is going in circles.
+
+The web page (styled like the [project page](https://github.com/core-aix/agit/tree/main/docs)) lets you **filter live** — narrow the whole dashboard to one committer or view the entire team, slice by backend or model, or restrict to a **time range** (presets or a custom from/to). The server recomputes the metrics for each filter, and the **commit log is paginated** (fetched a page at a time), so the browser never holds the whole history — memory stays bounded no matter how big the repo is. Each log line shows per-line token metrics; clicking a line opens the full commit message **rendered as Markdown** with a link to the commit on GitHub, and a squash expands into its original commits (each itself expandable). Agent commits also record when the AI-driven conversation started and ended (`agent_started_at` / `agent_ended_at` in the metadata block).
+
+`agit --dashboard text` (or `-d text`) prints the same metrics as a one-shot plain-text report instead of serving — handy for piping or pasting into an issue.
+
+The dashboard is read-only in either form: it never commits, never prompts, and skips the privacy acknowledgment.
 
 
 ## Configuration

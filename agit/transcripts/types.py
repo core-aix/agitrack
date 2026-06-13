@@ -23,6 +23,11 @@ class SessionTurn:
     # messages, and any prompts the user had queued behind it were discarded by
     # the backend — so nothing should keep waiting for them.
     interrupted: bool = False
+    # Epoch seconds for when the user's prompt began this turn and when the
+    # agent's last message arrived — the AI-driven conversation's span. None when
+    # the backend transcript carries no timestamps.
+    started_at: int | None = None
+    ended_at: int | None = None
 
 
 @dataclass

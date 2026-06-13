@@ -28,6 +28,7 @@ DEFAULT_TIMINGS: dict[str, float] = {
     "cwd_check_seconds": 3.0,  # how often to check for the resume-cwd drift bug
     "base_drift_check_seconds": 2.0,  # how often to check the base repo's checked-out branch
     "summary_wait_seconds": 45.0,  # how long integration waits for a background commit summary (#8)
+    "update_check_seconds": 300.0,  # how often to re-check for an aGiT self-update (every 5 min)
 }
 
 
@@ -155,4 +156,17 @@ class GlobalConfig:
     @summarization_enabled.setter
     def summarization_enabled(self, value: bool) -> None:
         self.data["summarization_enabled"] = bool(value)
+        self.save()
+
+    @property
+    def check_for_updates(self) -> bool:
+        # Whether aGiT checks for its own updates (at startup and periodically).
+        # On by default; the user can turn it off here or by choosing "don't ask
+        # again" when offered an update.
+        value = self.data.get("check_for_updates")
+        return True if value is None else bool(value)
+
+    @check_for_updates.setter
+    def check_for_updates(self, value: bool) -> None:
+        self.data["check_for_updates"] = bool(value)
         self.save()
