@@ -133,25 +133,37 @@ def test_dashboard_splits_lines_into_tracked_ai_and_nontracked(tmp_path):
     assert nt_ins == 14
 
 
-def test_squash_or_pr_merge_with_many_metadata_blocks_is_non_tracked(tmp_path):
-    # A squash / PR-merge message concatenates several commits' metadata blocks.
-    # Its first block here is an agent commit, which would otherwise credit the
-    # whole squashed diff as aGiT-tracked AI. More than one metadata block ⇒
-    # aggregate of unknown provenance ⇒ non-tracked, not AI.
+def test_squash_parses_constituents_and_counts_their_tokens(tmp_path):
+    # A squash / PR-merge message concatenates several original commits' metadata
+    # blocks. The dashboard parses each one back out so their tokens and
+    # model/backend usage are counted — they are not lost in the aggregate.
     repo = GitRepo.init(tmp_path)
     _write_lines(repo, "squashed.txt", 500)
     message = (
         "Stability improvements (#9)\n\n"
-        "# aGiT Metadata\ncommit_type: agent\nbackend: claude\n\n"
+        "* did agent work\n\n"
+        "# aGiT Metadata\ncommit_type: agent\nbackend: claude\nmodel: claude-opus-4-8\n"
+        "tokens_since_last_commit_output: 1000\ntokens_since_last_commit_input: 500\n\n"
+        "* my own edit\n\n"
         "# aGiT Metadata\ncommit_type: user\nagit_session_id: s1\n"
     )
     repo.commit(message)
 
     dash = build_dashboard(repo)
     squashed = next(s for s in dash.stats if s.subject.startswith("Stability"))
-    assert squashed.kind == "untracked"
-    assert dash.ai_lines == (0, 0)  # none of the 500 lines counted as AI
-    assert dash.nontracked_lines[0] == 500
+    # Two original commits recovered from the concatenated blocks.
+    assert [c.kind for c in squashed.constituents] == ["agent", "user"]
+    # The squash is tracked AI work (it contains agent work) and its single
+    # combined diff counts as AI; the agent original's tokens are counted.
+    assert squashed.kind == "agent"
+    assert squashed.tokens["output"] == 1000
+    assert dash.token_totals["output"] == 1000
+    assert dash.ai_lines[0] == 500
+    assert dash.nontracked_lines == (0, 0)
+    # Usage is attributed to the original's model/backend, not lost.
+    assert dash.by_model["claude-opus-4-8"]["output_tokens"] == 1000
+    assert dash.by_model["claude-opus-4-8"]["commits"] == 1
+    assert dash.by_backend["claude"]["commits"] == 1
 
 
 def test_dashboard_sums_tokens_and_efficiency(tmp_path):
@@ -435,6 +447,28 @@ def test_render_html_is_self_contained_with_embedded_data(tmp_path):
     assert sample["ts"] > 0
     assert sample["message"]
     assert "tokens" in sample
+
+
+def test_dashboard_data_serializes_squash_constituents_for_expansion(tmp_path):
+    repo = GitRepo.init(tmp_path)
+    _write_lines(repo, "s.txt", 30)
+    repo.commit(
+        "Squashed PR (#12)\n\n"
+        "* first turn\n\n"
+        "# aGiT Metadata\ncommit_type: agent\nbackend: claude\nmodel: claude-opus-4-8\n"
+        "tokens_since_last_commit_output: 200\n\n"
+        "* second turn\n\n"
+        "# aGiT Metadata\ncommit_type: agent\nbackend: opencode\nmodel: qwen\n"
+        "tokens_since_last_commit_output: 50\n"
+    )
+
+    data = dashboard_data(build_dashboard(repo))
+    squash = next(c for c in data["commits"] if c["subject"].startswith("Squashed"))
+    # The original commits ride along so the log entry can expand into them.
+    assert len(squash["parts"]) == 2
+    assert [p["model"] for p in squash["parts"]] == ["claude-opus-4-8", "qwen"]
+    assert squash["parts"][0]["tokens"]["output"] == 200
+    assert squash["parts"][0]["message"]  # full text for the nested view
 
 
 def test_dashboard_data_links_commits_to_github_when_remote_present(tmp_path):
