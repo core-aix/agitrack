@@ -3384,24 +3384,30 @@ class ProxyRunner:
             on_commit_fn=on_commit_fn,
             session_name=self.name,
             backend_commits=self._uncovered_backend_commits(),
-            tag_backend_commits=getattr(self.global_config, "tag_backend_commits", True)
-            if self.global_config is not None
-            else True,
         )
 
     def _uncovered_backend_commits(self) -> list[str]:
         """Unintegrated commits on the session's turn branch that the backend
-        created itself — their messages carry no aGiT metadata (#35). Full
-        SHAs, oldest first. Only commits ahead of base qualify, so an amend
-        can never rewrite anything that was already integrated."""
+        created itself and no aGiT commit accounts for yet (#35). Full SHAs,
+        oldest first. Backend commits keep their own messages forever (their
+        hashes must stay stable, #58), so "covered" cannot be read off the
+        commit itself: an aGiT metadata commit covers everything before it on
+        the branch (its ``covered_commits`` named them), leaving only commits
+        NEWER than the newest metadata commit unaccounted for. Only commits
+        ahead of base qualify at all."""
         if self.worktree is None or self._base_branch is None:
             return []
         try:
             branch = self.repo.current_branch()
             if not branch.startswith("agit/"):
                 return []
-            shas = self.repo.log_shas(self._base_branch, branch)
-            return [sha for sha in shas if METADATA_HEADER not in self.repo.commit_message(sha)]
+            uncovered: list[str] = []
+            for sha in self.repo.log_shas(self._base_branch, branch):  # oldest first
+                if METADATA_HEADER in self.repo.commit_message(sha):
+                    uncovered = []
+                else:
+                    uncovered.append(sha)
+            return uncovered
         except Exception as error:
             self._debug(f"uncovered backend commit check failed: {error!r}")
             return []
