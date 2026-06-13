@@ -329,6 +329,10 @@ body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:31;
 a{color:var(--phosphor);text-decoration:none;border-bottom:1px solid var(--phosphor-dim)}
 a:hover{color:var(--ink);background:var(--phosphor)}
 .wrap{max-width:1080px;margin:0 auto;padding:0 24px 80px}
+.neterror{position:fixed;top:0;left:0;right:0;z-index:40;background:#3a0f0f;color:#ffd5d5;
+  border-bottom:2px solid var(--red);padding:10px 18px;font-size:13px;text-align:center;
+  box-shadow:0 6px 20px rgba(0,0,0,.55);animation:rise .25s ease}
+@keyframes rise{from{transform:translateY(-100%)}to{transform:none}}
 
 header{padding:54px 0 22px}
 .brand{font-family:var(--display);font-weight:400;font-size:clamp(56px,11vw,104px);line-height:.85;color:var(--phosphor);
@@ -380,7 +384,7 @@ h2.section::before{content:"# ";color:var(--amber)}
 .row{display:grid;grid-template-columns:minmax(120px,1.4fr) 2.6fr minmax(150px,1fr);gap:14px;align-items:center;
   padding:11px 18px;border-bottom:1px solid var(--line)}
 .row:last-child{border-bottom:none}
-.row .name{color:var(--fg);font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.row .name{color:var(--fg);font-weight:500;overflow-wrap:anywhere}
 .row .name small{color:var(--fg-dim);font-weight:400}
 .bar{position:relative;height:18px;background:var(--ink);border:1px solid var(--line);overflow:hidden}
 .bar i{position:absolute;inset:0 auto 0 0;background:var(--phosphor-dim);box-shadow:0 0 10px rgba(61,255,160,.4)}
@@ -389,6 +393,10 @@ h2.section::before{content:"# ";color:var(--amber)}
 .row .num{text-align:right;color:var(--fg-dim);font-size:12.5px}
 .row .num b{color:var(--phosphor);font-weight:600}
 .empty{padding:16px 18px;color:var(--fg-dim)}
+.kindcounts{padding:11px 18px;border-top:1px solid var(--line);font-size:12.5px;color:var(--fg-dim);line-height:1.9}
+.kindcounts .klabel{color:var(--amber);margin-right:4px}
+.kindcounts .kc{white-space:nowrap;cursor:help;border-bottom:1px dotted var(--fg-dim)}
+.kindcounts .kc b{color:var(--fg)}
 .split{display:grid;grid-template-columns:1fr 1fr;gap:14px}
 @media (max-width:760px){.split{grid-template-columns:1fr}.row{grid-template-columns:1fr;gap:6px}}
 
@@ -396,7 +404,7 @@ h2.section::before{content:"# ";color:var(--amber)}
 .loop{padding:13px 18px;border-bottom:1px solid var(--line)}
 .loop:last-child{border-bottom:none}
 .loop .where{color:var(--red)}
-.loop .q{color:var(--fg);font-style:italic}
+.loop .q{color:var(--fg);font-style:italic;word-break:break-word}
 .loop .cost{color:var(--amber);font-size:12.5px}
 
 /* ---- commit log rail ---- */
@@ -464,6 +472,7 @@ footer{margin-top:46px;padding-top:22px;border-top:1px dashed var(--line);color:
 </style>
 </head>
 <body>
+<div id="neterror" class="neterror" hidden>⚠ Can't reach the aGiT dashboard server — it may have been stopped (Ctrl-C in the terminal). Showing the last loaded data; retrying…</div>
 <div class="wrap">
   <header>
     <div class="brand"><span class="a">a</span>GiT<span class="sub">&nbsp;dashboard</span></div>
@@ -542,11 +551,15 @@ const TOKEN_ORDER = [["input","input"],["output","output"],["reasoning","reasoni
 const REFRESH_MS = 5000, DAY = 86400;
 
 const state = {author:"", backend:"", model:"", fromTs:0, toTs:0};
+// Only a page served over http(s) has a backend to reach; a file:// snapshot has
+// none, so it must never raise a false "server unreachable" alarm.
+const LIVE = location.protocol.indexOf("http") === 0;
 const $ = id => document.getElementById(id);
 const fmt = n => (n||0).toLocaleString("en-US");
 const pct = (a,b) => b ? (a/b*100).toFixed(1)+"%" : "0%";
 const esc = s => (s||"").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
 const kfmt = n => { n=n||0; return n>=1000 ? (n/1000).toFixed(n>=10000?0:1)+"k" : ""+n; };
+function setOffline(on){ const el=$("neterror"); if(el) el.hidden = !on; }
 
 function qs(extra){
   const p = new URLSearchParams();
@@ -560,14 +573,15 @@ function qs(extra){
 }
 async function loadAgg(){
   try{ const r = await fetch("data?"+qs(), {cache:"no-store"}); if(r.ok){
-    const d = await r.json(); HEAD=d.head; AGG=d.agg; OPTIONS=d.options; GENERATED=d.generated_at; return true; } }
-  catch(e){}  // offline / static file: keep the embedded view
+    const d = await r.json(); HEAD=d.head; AGG=d.agg; OPTIONS=d.options; GENERATED=d.generated_at;
+    setOffline(false); return true; } }
+  catch(e){ if(LIVE) setOffline(true); }  // network failure ⇒ server unreachable
   return false;
 }
 async function loadLog(offset){
   try{ const r = await fetch("log?"+qs({offset:offset||0, limit:PAGE_SIZE}), {cache:"no-store"});
-    if(r.ok){ LOGPAGE = await r.json(); return true; } }
-  catch(e){}
+    if(r.ok){ LOGPAGE = await r.json(); setOffline(false); return true; } }
+  catch(e){ if(LIVE) setOffline(true); }
   return false;
 }
 
@@ -602,7 +616,10 @@ function md(src){
 
 function barRow(name, sub, value, max, numHtml, amber){
   const w = max ? Math.max(2, value/max*100) : 0;
-  return `<div class="row"><div class="name">${esc(name)}${sub?` <small>${esc(sub)}</small>`:""}</div>`+
+  // A long name is ellipsized to keep the row tidy, but its full text (and the
+  // sub-label) is always available on hover via the title attribute.
+  const title = esc(name) + (sub ? " — " + esc(sub) : "");
+  return `<div class="row"><div class="name" title="${title}">${esc(name)}${sub?` <small>${esc(sub)}</small>`:""}</div>`+
     `<div class="bar"><i class="${amber?"amber":""}" style="width:${w}%"></i></div>`+
     `<div class="num">${numHtml}</div></div>`;
 }
@@ -639,14 +656,21 @@ function renderAgg(){
   ].join("");
 
   const lineRow = (label, sub, v, amber) =>
-    `<div class="row"><div class="name">${label} <small>${sub}</small></div>`+
+    `<div class="row"><div class="name" title="${esc(label)} — ${esc(sub)}">${label} <small>${sub}</small></div>`+
       `<div class="bar"><i class="${amber?"amber":""}" style="width:${allLines?v.total/allLines*100:0}%"></i></div>`+
       `<div class="num"><b>+${fmt(v.ins)}</b> / −${fmt(v.del)}</div></div>`;
+  const kc = (label, key, tip) => `<span class="kc" title="${tip}">${label} <b>${kinds(key)}</b></span>`;
   $("lines").innerHTML =
     lineRow("aGiT-tracked AI", "agent + covered + merge", ai, false) +
     lineRow("Non-tracked", "user + plain commits", nt, true) +
-    `<div class="row"><div class="name">agent ${kinds("agent")} · covered ${kinds("covered")} · merge ${kinds("agent-merge")} · aGiT-ops ${kinds("agit-ops")}</div>`+
-      `<div class="bar"></div><div class="num">user ${kinds("user")} · untracked ${kinds("untracked")}</div></div>`;
+    `<div class="kindcounts"><span class="klabel">commits by kind:</span> `+
+      kc("agent", "agent", "Commits aGiT made from the agent's work") + " · " +
+      kc("covered", "covered", "Backend-made commits an aGiT cover commit accounts for") + " · " +
+      kc("merge", "agent-merge", "Integration merges whose conflicts an agent resolved") + " · " +
+      kc("aGiT-ops", "agit-ops", "aGiT's own integration merge commits") + " · " +
+      kc("user", "user", "User commits made through aGiT") + " · " +
+      kc("untracked", "untracked", "Commits with no aGiT metadata (made outside aGiT)") +
+    `</div>`;
 
   const shown = TOKEN_ORDER.filter(([k])=>tok[k]);
   const maxTok = Math.max(1, ...shown.map(([k])=>tok[k]));
@@ -670,8 +694,7 @@ function renderAgg(){
   $("loops").innerHTML = AGG.loops.length
     ? AGG.loops.map(l => {
         const where = l.within ? `within commit ${l.shas[0]}` : `${l.shas.length} commits ${l.shas[0]}..${l.shas[l.shas.length-1]}`;
-        const q = l.prompt.length>90 ? l.prompt.slice(0,87)+"…" : l.prompt;
-        return `<div class="loop"><span class="where">${esc(where)}</span> — <span class="q">"${esc(q)}"</span>`+
+        return `<div class="loop"><span class="where">${esc(where)}</span> — <span class="q">"${esc(l.prompt)}"</span>`+
           (l.output?` <span class="cost">${fmt(l.output)} output tokens</span>`:"")+`</div>`;
       }).join("")
     : `<div class="empty">none detected</div>`;
@@ -805,7 +828,9 @@ function init(){
     if(entry) toggleDetail(+entry.dataset.i);
   });
   renderAgg(); renderLog();
-  setInterval(refresh, REFRESH_MS);
+  // Poll only when there's a live backend; the poll also clears the
+  // "unreachable" banner automatically once the server is back.
+  if(LIVE) setInterval(refresh, REFRESH_MS);
 }
 init();
 </script>

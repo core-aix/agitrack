@@ -450,6 +450,20 @@ def test_render_html_embeds_aggregates_and_first_log_page_only(tmp_path):
     assert entry["ts"] > 0 and entry["message"] and "tokens" in entry
 
 
+def test_render_html_has_unreachable_banner_and_clear_kind_labels(tmp_path):
+    html = render_html(_demo_repo(tmp_path))
+    # An error banner exists and is wired to show only when the live backend
+    # can't be reached (never for a static file:// snapshot).
+    assert 'id="neterror"' in html and "Can't reach the aGiT dashboard server" in html
+    assert "function setOffline" in html and "const LIVE" in html
+    assert "if(LIVE) setOffline(true)" in html
+    # The commit-kind counts are labelled so "agent 30" reads as a commit count.
+    assert "commits by kind:" in html
+    # Bar-row labels carry a hover title so any ellipsized cell reveals its full
+    # text instead of dead-ending at "…".
+    assert 'class="name" title=' in html
+
+
 def test_log_page_paginates_and_clamps(tmp_path):
     from agit.metrics.web import log_page
 
