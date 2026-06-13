@@ -508,6 +508,10 @@ def test_render_html_has_unreachable_banner_and_clear_kind_labels(tmp_path):
     # Bar-row labels carry a hover title so any ellipsized cell reveals its full
     # text instead of dead-ending at "…".
     assert 'class="name" title=' in html
+    # Markdown heading levels in the expanded commit message render distinctly so
+    # the role/section/nested-heading relationship is visible, not flattened.
+    for level in ("h3.md-h", "h4.md-h", "h5.md-h", "h6.md-h"):
+        assert level in html
 
 
 def test_log_page_paginates_and_clamps(tmp_path):
