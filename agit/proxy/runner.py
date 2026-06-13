@@ -91,21 +91,31 @@ _KEYBOARD_PROTO_RE = re.compile(rb"\x1b\[(?:[><=][0-9;]*u|\?u|>4(?:;[0-9]+)?m)")
 # We decode these back to plain control bytes (0x01-0x1a) so the menu key works
 # even when the terminal is in kitty keyboard protocol mode.
 _KITTY_CTRL_KEY_RE = re.compile(rb"\x1b\[(\d+);5u")
+# Kitty keyboard protocol encoding for Escape key: CSI 27 u or CSI 27 ; 1 u
+# We decode this back to plain \x1b so Esc handling works in kitty mode.
+_KITTY_ESC_KEY_RE = re.compile(rb"\x1b\[27(?:;1)?u")
 # A bracketed paste (CSI 200~ ... CSI 201~, possibly split across reads, hence
 # the `|$`): newlines inside it are pasted CONTENT, not prompt submissions.
 _BRACKETED_PASTE_RE = re.compile(rb"\x1b\[200~.*?(?:\x1b\[201~|$)", re.S)
 
 
 def _decode_kitty_ctrl_keys(data: bytes) -> bytes:
-    """Decode kitty keyboard protocol control keys to plain bytes.
+    """Decode kitty keyboard protocol control keys and Escape to plain bytes.
     
-    When the terminal is in kitty keyboard protocol mode, Ctrl-A through Ctrl-Z
-    are sent as escape sequences like \\x1b[97;5u (Ctrl-A) instead of plain bytes
-    like \\x01. This function converts them back to plain bytes so the menu key
-    matching works correctly.
+    When the terminal is in kitty keyboard protocol mode:
+    - Ctrl-A through Ctrl-Z are sent as escape sequences like \\x1b[97;5u (Ctrl-A)
+      instead of plain bytes like \\x01.
+    - Escape is sent as \\x1b[27u instead of plain \\x1b.
     
-    Only decodes Ctrl keys (modifier 5 = Ctrl+base). Other keys are left unchanged.
+    This function converts them back to plain bytes so the menu key matching
+    and Esc handling work correctly.
+    
+    Only decodes Ctrl keys (modifier 5 = Ctrl+base) and Escape. Other keys are left unchanged.
     """
+    # First decode Escape key
+    data = _KITTY_ESC_KEY_RE.sub(b"\x1b", data)
+    
+    # Then decode control keys
     def replace_kitty_ctrl(match: re.Match) -> bytes:
         keycode = int(match.group(1))
         # keycode 97-122 = lowercase a-z
