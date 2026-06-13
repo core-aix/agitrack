@@ -25,7 +25,7 @@ and ad-hoc use; the live page does not embed it.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from agit.git import GitRepo
 from agit.metrics.collect import CommitStat, Dashboard, build_dashboard
@@ -201,55 +201,99 @@ def _aggregates(fd: Dashboard) -> dict:
 
 
 _AI_KINDS = ("agent", "covered", "agent-merge")
+GRANULARITIES = ("hour", "day", "week", "month")
+DEFAULT_GRANULARITY = "day"
+# Cap the number of plotted buckets so an extreme granularity/range (e.g. hourly
+# over years) can't bloat the payload; the most recent buckets are kept.
+_MAX_BUCKETS = 1500
 
 
-def _timeseries(stats: list[CommitStat], *, max_buckets: int = 120) -> dict:
-    """Cumulative commits / AI lines / token usage over time for the (already
-    filtered) commits, bucketed into equal time intervals so the plot stays small
-    and smooth however deep the history is. Empty intervals carry the running
-    total forward — a flat segment reads as a quiet period. ``t`` holds the
-    bucket-centre epoch seconds; every series is the same length as ``t``.
+def _period_start(ts: int, granularity: str) -> int:
+    """Epoch seconds of the start of the calendar period (UTC) that ``ts`` falls
+    in, for the chosen granularity — day floors to midnight, week to Monday,
+    month to the 1st, hour to the top of the hour."""
+    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    if granularity == "hour":
+        dt = dt.replace(minute=0, second=0, microsecond=0)
+    elif granularity == "month":
+        dt = dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    elif granularity == "week":
+        dt = dt.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=dt.weekday())
+    else:  # day
+        dt = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    return int(dt.timestamp())
 
-    The series are returned as raw cumulative counts; the browser normalises each
-    to its own peak so wildly different magnitudes (tens of commits vs millions of
-    tokens) share one plot, and shows the real value on hover."""
+
+def _next_period(ts: int, granularity: str) -> int:
+    """Epoch seconds of the start of the period after the one starting at ``ts``."""
+    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    if granularity == "hour":
+        return int((dt + timedelta(hours=1)).timestamp())
+    if granularity == "week":
+        return int((dt + timedelta(days=7)).timestamp())
+    if granularity == "month":
+        year, month = (dt.year + dt.month // 12), (dt.month % 12 + 1)
+        return int(dt.replace(year=year, month=month).timestamp())
+    return int((dt + timedelta(days=1)).timestamp())
+
+
+def _timeseries(stats: list[CommitStat], *, granularity: str = DEFAULT_GRANULARITY) -> dict:
+    """Per-period commits / AI lines / token usage over time for the (already
+    filtered) commits, bucketed by calendar period (the configurable
+    *granularity*). Values are the activity *within* each period — not a running
+    total — so a quiet day reads as a dip to zero. Empty periods between the first
+    and last are filled with zeros so the time axis is continuous. ``t`` holds each
+    bucket's start epoch seconds; every series is the same length as ``t``.
+
+    The browser normalises each series to its own peak so wildly different
+    magnitudes (tens of commits vs millions of tokens) share one plot, and shows
+    the real per-period value on hover."""
+    if granularity not in GRANULARITIES:
+        granularity = DEFAULT_GRANULARITY
     dated = [s for s in stats if s.timestamp]
+    empty: dict = {
+        "t": [],
+        "commits": [],
+        "ai_lines": [],
+        "output_tokens": [],
+        "input_tokens": [],
+        "granularity": granularity,
+    }
     if not dated:
-        empty: dict[str, list[int]] = {"t": [], "commits": [], "ai_lines": [], "output_tokens": [], "input_tokens": []}
         return empty
-    lo = min(s.timestamp for s in dated)
-    hi = max(s.timestamp for s in dated)
-    span = hi - lo
-    n = 1 if span == 0 else min(max_buckets, max(2, len(dated)))
-    width = span / n if span else 1
+    lo = _period_start(min(s.timestamp for s in dated), granularity)
+    hi = _period_start(max(s.timestamp for s in dated), granularity)
+    starts: list[int] = []
+    cur = lo
+    # Forward-fill the period boundaries; the loop is bounded so a pathological
+    # granularity/range can't spin, and the slice keeps the most recent buckets.
+    while cur <= hi and len(starts) <= _MAX_BUCKETS * 12:
+        starts.append(cur)
+        cur = _next_period(cur, granularity)
+    starts = starts[-_MAX_BUCKETS:]
+    index = {start: i for i, start in enumerate(starts)}
+    n = len(starts)
     commits = [0] * n
     lines = [0] * n
     out_tok = [0] * n
     in_tok = [0] * n
     ai = set(_AI_KINDS)
     for s in dated:
-        idx = 0 if span == 0 else min(n - 1, int((s.timestamp - lo) / width))
-        commits[idx] += 1
+        i = index.get(_period_start(s.timestamp, granularity))
+        if i is None:  # in an old bucket dropped by the cap
+            continue
+        commits[i] += 1
         if s.kind in ai:
-            lines[idx] += s.insertions + s.deletions
-        out_tok[idx] += s.tokens.get("output", 0)
-        in_tok[idx] += s.tokens.get("input", 0)
-
-    def _cumulative(values: list[int]) -> list[int]:
-        total = 0
-        running = []
-        for value in values:
-            total += value
-            running.append(total)
-        return running
-
-    centres = [int(lo + (i + 0.5) * width) for i in range(n)] if span else [lo]
+            lines[i] += s.insertions + s.deletions
+        out_tok[i] += s.tokens.get("output", 0)
+        in_tok[i] += s.tokens.get("input", 0)
     return {
-        "t": centres,
-        "commits": _cumulative(commits),
-        "ai_lines": _cumulative(lines),
-        "output_tokens": _cumulative(out_tok),
-        "input_tokens": _cumulative(in_tok),
+        "t": starts,
+        "commits": commits,
+        "ai_lines": lines,
+        "output_tokens": out_tok,
+        "input_tokens": in_tok,
+        "granularity": granularity,
     }
 
 
@@ -271,7 +315,14 @@ def _options(dash: Dashboard) -> dict:
 
 
 def aggregates_payload(
-    dash: Dashboard, *, author: str = "", backend: str = "", model: str = "", frm: int = 0, to: int = 0
+    dash: Dashboard,
+    *,
+    author: str = "",
+    backend: str = "",
+    model: str = "",
+    frm: int = 0,
+    to: int = 0,
+    granularity: str = DEFAULT_GRANULARITY,
 ) -> dict:
     """All the metric panels for the given filters — no per-commit list, so the
     response stays small no matter how large the repository is. Filter options
@@ -282,7 +333,7 @@ def aggregates_payload(
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         "options": _options(dash),
         "agg": _aggregates(_filtered_dashboard(dash, stats)),
-        "timeseries": _timeseries(stats),
+        "timeseries": _timeseries(stats, granularity=granularity),
     }
 
 
@@ -435,7 +486,14 @@ h2.section::before{content:"# ";color:var(--amber)}
 
 /* ---- time-series chart ---- */
 .chartpanel{padding:14px 16px 10px;position:relative}
-.legend{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px}
+.chart-head{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;flex-wrap:wrap;margin-bottom:10px}
+.gran{display:flex;align-items:center;gap:7px;color:var(--amber);font-size:11px;letter-spacing:.6px;text-transform:uppercase}
+.gran select{appearance:none;background:var(--ink);color:var(--fg);border:1px solid var(--line);
+  font-family:var(--mono);font-size:12.5px;padding:5px 26px 5px 9px;cursor:pointer;text-transform:none;letter-spacing:normal;
+  background-image:linear-gradient(45deg,transparent 50%,var(--phosphor-dim) 50%),linear-gradient(135deg,var(--phosphor-dim) 50%,transparent 50%);
+  background-position:calc(100% - 14px) 50%,calc(100% - 9px) 50%;background-size:5px 5px,5px 5px;background-repeat:no-repeat}
+.gran select:focus{outline:none;border-color:var(--phosphor)}
+.legend{display:flex;flex-wrap:wrap;gap:8px}
 .legend .lg{display:inline-flex;align-items:center;gap:7px;cursor:pointer;background:var(--ink);
   border:1px solid var(--line);color:var(--fg);font-family:var(--mono);font-size:12px;padding:5px 10px;transition:opacity .12s}
 .legend .lg .sw{width:11px;height:11px;border:1px solid var(--c);background:var(--c);box-shadow:0 0 7px var(--c)}
@@ -586,7 +644,15 @@ footer{margin-top:46px;padding-top:22px;border-top:1px dashed var(--line);color:
 
   <h2 class="section">activity over time</h2>
   <div class="panel chartpanel">
-    <div class="legend" id="ts-legend"></div>
+    <div class="chart-head">
+      <div class="legend" id="ts-legend"></div>
+      <div class="gran"><label for="ts-gran">per</label><select id="ts-gran">
+        <option value="hour">hour</option>
+        <option value="day">day</option>
+        <option value="week">week</option>
+        <option value="month">month</option>
+      </select></div>
+    </div>
     <div class="chartwrap"><canvas id="ts-canvas"></canvas><div class="tip" id="ts-tip" hidden></div></div>
     <div class="chart-empty" id="ts-empty" hidden>no dated commits in view</div>
   </div>
@@ -629,12 +695,13 @@ footer{margin-top:46px;padding-top:22px;border-top:1px dashed var(--line);color:
 const INIT = JSON.parse(document.getElementById("agit-data").textContent);
 const PAGE_SIZE = INIT.page_size || 50;
 let HEAD = INIT.head, AGG = INIT.agg, LOGPAGE = INIT.log, OPTIONS = INIT.options, GENERATED = INIT.generated_at;
-let TS = INIT.timeseries || {t:[]};  // cumulative series for the activity-over-time plot
+let TS = INIT.timeseries || {t:[]};  // per-period series for the activity-over-time plot
 let LOG_ENTRIES = [];  // entries of the page currently rendered (for toggleDetail)
 
 // The plottable series and which are currently shown. Each is normalised to its
 // own peak so commits, lines, and tokens (orders of magnitude apart) share one
-// plot; the legend and hover tooltip show the real cumulative values.
+// plot; the legend shows the period total and the hover tooltip the real
+// per-period value.
 const SERIES = [
   {key:"commits", label:"commits", color:"#3dffa0"},
   {key:"ai_lines", label:"AI lines", color:"#ffb454"},
@@ -653,7 +720,7 @@ const TOKEN_ORDER = [["input","input"],["output","output"],["reasoning","reasoni
   ["summary_input","summarizer input"],["summary_output","summarizer output"]];
 const REFRESH_MS = 5000, DAY = 86400;
 
-const state = {author:"", backend:"", model:"", fromTs:0, toTs:0};
+const state = {author:"", backend:"", model:"", fromTs:0, toTs:0, granularity:(INIT.timeseries&&INIT.timeseries.granularity)||"day"};
 // Only a page served over http(s) has a backend to reach; a file:// snapshot has
 // none, so it must never raise a false "server unreachable" alarm.
 const LIVE = location.protocol.indexOf("http") === 0;
@@ -671,6 +738,7 @@ function qs(extra){
   if(state.model) p.set("model", state.model);
   if(state.fromTs) p.set("from", state.fromTs);
   if(state.toTs) p.set("to", state.toTs);
+  if(state.granularity) p.set("granularity", state.granularity);
   for(const k in (extra||{})) p.set(k, extra[k]);
   return p.toString();
 }
@@ -821,12 +889,18 @@ function groupPanel(groups){
       `+${fmt(b.insertions)}/−${fmt(b.deletions)}${b.output_tokens?` · <b>${fmt(b.output_tokens)}</b> tok`:""}`)).join("");
 }
 
-// --- activity-over-time plot (multi-series, normalised, toggleable) ---
-const tsDate = e => new Date(e*1000).toISOString().slice(0,10);
+// --- activity-over-time plot (multi-series, per-period, normalised, toggleable) ---
+// A bucket label, formatted to the active granularity (the bucket start).
+function tsLabel(e){
+  const iso = new Date(e*1000).toISOString(), g = TS.granularity||"day";
+  if(g==="hour") return iso.slice(0,13).replace("T"," ")+":00";
+  if(g==="month") return iso.slice(0,7);
+  return iso.slice(0,10);
+}
 
 function renderLegend(){
   $("ts-legend").innerHTML = SERIES.map(s => {
-    const arr = TS[s.key]||[], total = arr.length ? arr[arr.length-1] : 0;
+    const arr = TS[s.key]||[], total = arr.reduce((a,b)=>a+(b||0),0);  // sum across periods
     return `<button class="lg${tsOn[s.key]?"":" off"}" data-key="${esc(s.key)}" style="--c:${s.color}">`+
       `<span class="sw"></span>${esc(s.label)} <b>${kfmt(total)}</b></button>`;
   }).join("");
@@ -846,8 +920,11 @@ function renderChart(){
   const xAt = i => padL + (n<=1 ? W/2 : i/(n-1)*W);
   ctx.strokeStyle="rgba(29,42,33,.9)"; ctx.lineWidth=1;
   for(let g=0; g<=4; g++){ const y=padT+g/4*H; ctx.beginPath(); ctx.moveTo(padL,y); ctx.lineTo(padL+W,y); ctx.stroke(); }
-  // Each series is normalised to its own peak so all of them fit one plot.
+  // Each series is normalised to its own peak so all of them fit one plot. The
+  // values are per-period activity, so a marker is drawn at each bucket (when the
+  // buckets aren't too dense) — that also makes a single/sparse period visible.
   ctx.lineWidth=2; ctx.lineJoin="round";
+  const dots = n<=60;
   for(const s of SERIES){
     if(!tsOn[s.key]) continue;
     const arr = TS[s.key]||[], max = Math.max(1, ...arr);
@@ -855,11 +932,15 @@ function renderChart(){
     ctx.beginPath();
     arr.forEach((v,i)=>{ const x=xAt(i), y=padT+H-(v/max)*H; i?ctx.lineTo(x,y):ctx.moveTo(x,y); });
     ctx.stroke();
+    if(dots){
+      ctx.fillStyle=s.color;
+      arr.forEach((v,i)=>{ const x=xAt(i), y=padT+H-(v/max)*H; ctx.beginPath(); ctx.arc(x,y,2.5,0,Math.PI*2); ctx.fill(); });
+    }
   }
   ctx.shadowBlur=0;
   ctx.fillStyle="#7e998a"; ctx.font="11px IBM Plex Mono, monospace";
-  ctx.textAlign="left";  ctx.fillText(tsDate(t[0]), padL, cssH-7);
-  ctx.textAlign="right"; ctx.fillText(tsDate(t[n-1]), padL+W, cssH-7);
+  ctx.textAlign="left";  ctx.fillText(tsLabel(t[0]), padL, cssH-7);
+  if(n>1){ ctx.textAlign="right"; ctx.fillText(tsLabel(t[n-1]), padL+W, cssH-7); }
   if(tsHover>=0 && tsHover<n){
     const x = xAt(tsHover);
     ctx.strokeStyle="rgba(207,231,216,.28)"; ctx.lineWidth=1;
@@ -882,7 +963,7 @@ function showTip(i){
     const arr = TS[s.key]||[];
     return `<div class="tr" style="--c:${s.color}"><span class="sw"></span>${esc(s.label)}<b>${fmt(arr[i]||0)}</b></div>`;
   }).join("");
-  tip.innerHTML = `<div class="td">${tsDate(t[i])}</div>${rows}`;
+  tip.innerHTML = `<div class="td">${tsLabel(t[i])}</div>${rows}`;
   const wrap = $("ts-canvas").parentElement, n=t.length, padL=10, W=wrap.clientWidth-padL-10;
   const x = padL + (n<=1 ? W/2 : i/(n-1)*W);
   tip.style.left = Math.max(58, Math.min(wrap.clientWidth-58, x))+"px";
@@ -1026,6 +1107,9 @@ function init(){
     const key = btn.dataset.key; tsOn[key] = !tsOn[key];
     renderTimeseries();
   });
+  // Bucket granularity: refetch the (re-bucketed) series and redraw just the plot.
+  $("ts-gran").value = state.granularity;
+  $("ts-gran").onchange = async e => { state.granularity = e.target.value; if(await loadAgg()) renderTimeseries(); };
   const cv = $("ts-canvas");
   cv.addEventListener("mousemove", onChartMove);
   cv.addEventListener("mouseleave", onChartLeave);
