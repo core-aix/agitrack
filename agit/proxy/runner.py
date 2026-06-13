@@ -1726,6 +1726,39 @@ class ProxyRunner:
             # branch for the next startup / session menu to surface.
             self._prompt_resolve_conflict(self.repo.current_branch())
 
+    def _integrate_committed_turn_before_new_turn(self) -> None:
+        # A new prompt is about to start a turn. If the previous turn was already
+        # committed but its integration was deferred — typically because a
+        # background commit summary was still being computed
+        # (_summary_blocks_integration) — merge it into the base NOW, before the
+        # new turn begins, instead of letting it ride along on the same branch and
+        # only land once the whole new turn finishes.
+        #
+        # The merge is attempted directly (bypassing the summary hold): a pending
+        # summary, if any, simply lands as git notes once it finishes
+        # (_amend_summary_into_head sees the commit already in base and records
+        # notes-only). A conflict is left on the branch with no resolve popup — per
+        # the design it waits until the current agent call ends.
+        if self.worktree is None or self.merge_ctx or self._base_branch is None:
+            return
+        if self._integration_paused:
+            return
+        try:
+            if self.repo.has_changes() or self.repo.merge_in_progress():
+                return  # in-flight or mid-merge work; leave it for the normal path
+            branch = self.repo.current_branch()
+            if not branch.startswith("agit/"):
+                return
+            if not self.base_repo.log_range(self._base_branch, branch):
+                return  # nothing committed ahead of base to integrate
+        except Exception as error:
+            self._debug(f"pre-prompt integration check failed: {error!r}")
+            return
+        # Ignore a "conflict" result: integrate_turn_or_conflict already backed the
+        # merge out, leaving the tree clean, and the conflict is surfaced when the
+        # current turn finishes rather than interrupting the new prompt.
+        self._integrate_turn_or_conflict()
+
     def _integrate_turn_or_conflict(self) -> str:
         # Try to fast-forward the current session's turn branch into the base.
         # Returns "integrated" (base advanced), "conflict" (the merge was backed
@@ -3025,7 +3058,9 @@ class ProxyRunner:
                 if submit:
                     self.agent_in_flight = True
                     if submitted_prompt:
-                        # A new prompt starts a turn on its own branch.
+                        # Flush the previous turn's deferred integration first, then
+                        # put this new prompt on its own branch.
+                        self._integrate_committed_turn_before_new_turn()
                         self._ensure_turn_branch()
                         # Drop the previous turn's "created & merged" status line so
                         # it doesn't linger into — and read as belonging to — the
@@ -4658,6 +4693,9 @@ class ProxyRunner:
         self.passthrough_escape = None
         if prompt_text:
             self._record_user_prompt(prompt_text)
+            # Flush the previous turn's deferred integration before starting this
+            # one so it merges now rather than riding along with the new turn.
+            self._integrate_committed_turn_before_new_turn()
             self._ensure_turn_branch()  # a new prompt starts a turn on its own branch
         self.agent_in_flight = True
         self._clear_message()
