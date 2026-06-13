@@ -13,6 +13,7 @@ import json
 import re
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import agit.metrics as metrics
@@ -550,8 +551,10 @@ def test_dashboard_server_serves_aggregates_and_paginated_log(tmp_path):
         refreshed = json.loads(_get(base + "/data"))
         assert refreshed["head"] != first_head and refreshed["agg"]["total"] == 8
 
-        # A filter narrows the aggregates server-side.
-        only_me = json.loads(_get(base + "/data?author=" + data["options"]["committers"][0]))
+        # A filter narrows the aggregates server-side (committer names can carry
+        # spaces, e.g. CI's "aGiT CI", so the query must be URL-encoded).
+        query = urllib.parse.urlencode({"author": data["options"]["committers"][0]})
+        only_me = json.loads(_get(base + "/data?" + query))
         assert only_me["agg"]["total"] <= refreshed["agg"]["total"]
     finally:
         server.shutdown()
