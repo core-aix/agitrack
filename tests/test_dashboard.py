@@ -429,24 +429,50 @@ def test_dashboard_data_covered_commit_inherits_effective_backend(tmp_path):
     assert covered["eff_model"] == "claude-opus-4-8"
 
 
-def test_render_html_is_self_contained_with_embedded_data(tmp_path):
+def test_render_html_embeds_aggregates_and_first_log_page_only(tmp_path):
     html = render_html(_demo_repo(tmp_path))
 
     assert html.startswith("<!DOCTYPE html>")
     assert "aGiT dashboard" in html
-    # The page ships its data inline so it renders instantly, then polls /data
-    # to stay live. The filter UI is present, including the time-range controls.
-    data = _embedded_data(html)
-    assert len(data["commits"]) == 7
     for control in ('id="f-author"', 'id="f-backend"', 'id="f-model"', 'id="f-period"', 'id="f-from"'):
         assert control in html
-    # Each commit carries the data the log view needs: a commit time for the
-    # time filter, the full message for the click-to-open detail, and token
-    # metrics for the per-line figures.
-    sample = data["commits"][-1]
-    assert sample["ts"] > 0
-    assert sample["message"]
-    assert "tokens" in sample
+    # The page embeds server-computed aggregates plus only the FIRST page of the
+    # commit log — never the whole history — so browser memory stays bounded no
+    # matter how big the repo is. Further pages are fetched from the server.
+    data = _embedded_data(html)
+    assert "commits" not in data  # the full per-commit list is never embedded
+    assert data["agg"]["total"] == 7
+    assert data["log"]["total"] == 7
+    assert data["log"]["offset"] == 0
+    assert len(data["log"]["entries"]) == 7  # one small repo fits on the first page
+    entry = data["log"]["entries"][-1]
+    assert entry["ts"] > 0 and entry["message"] and "tokens" in entry
+
+
+def test_log_page_paginates_and_clamps(tmp_path):
+    from agit.metrics.web import log_page
+
+    dash = build_dashboard(_demo_repo(tmp_path))
+    first = log_page(dash, offset=0, limit=3)
+    assert first["total"] == 7 and len(first["entries"]) == 3 and first["offset"] == 0
+    last = log_page(dash, offset=6, limit=3)
+    assert len(last["entries"]) == 1  # only one commit left on the final page
+    # Out-of-range / silly inputs are clamped, never raise.
+    assert log_page(dash, offset=999, limit=3)["entries"] == []
+    assert log_page(dash, offset=-5, limit=0)["offset"] == 0
+
+
+def test_aggregates_payload_filters_server_side(tmp_path):
+    from agit.metrics.web import aggregates_payload
+
+    dash = build_dashboard(_demo_repo(tmp_path))
+    full = aggregates_payload(dash)
+    assert full["agg"]["total"] == 7
+    assert "by_committer" in full["agg"] and "commits" not in full
+    # A backend filter narrows the aggregates; options still list every backend.
+    claude_only = aggregates_payload(dash, backend="claude")
+    assert claude_only["agg"]["total"] <= full["agg"]["total"]
+    assert full["options"]["backends"] == ["claude"]
 
 
 def test_dashboard_data_serializes_squash_constituents_for_expansion(tmp_path):
@@ -499,23 +525,34 @@ def _get(url: str) -> str:
         return response.read().decode("utf-8")
 
 
-def test_dashboard_server_serves_html_and_live_data(tmp_path):
+def test_dashboard_server_serves_aggregates_and_paginated_log(tmp_path):
     repo = _demo_repo(tmp_path)
     server, thread, base = _serve(repo)
     try:
         html = _get(base + "/")
         assert "<!DOCTYPE html>" in html and 'id="f-author"' in html
 
+        # /data returns aggregates only — never the full commit list.
         data = json.loads(_get(base + "/data"))
-        assert len(data["commits"]) == 7
+        assert "commits" not in data and data["agg"]["total"] == 7
         first_head = data["head"]
 
-        # /data is recomputed each request, so a new commit shows up live.
+        # /log paginates the commit log without loading everything at once.
+        page1 = json.loads(_get(base + "/log?limit=3&offset=0"))
+        page2 = json.loads(_get(base + "/log?limit=3&offset=3"))
+        assert page1["total"] == 7 and len(page1["entries"]) == 3
+        assert page2["offset"] == 3
+        assert {e["short"] for e in page1["entries"]}.isdisjoint(e["short"] for e in page2["entries"])
+
+        # Both are recomputed each request, so a new commit shows up live.
         _write_lines(repo, "live.txt", 3)
         repo.commit(_agent_message("add a live change", tokens=_TOKENS))
         refreshed = json.loads(_get(base + "/data"))
-        assert refreshed["head"] != first_head
-        assert len(refreshed["commits"]) == 8
+        assert refreshed["head"] != first_head and refreshed["agg"]["total"] == 8
+
+        # A filter narrows the aggregates server-side.
+        only_me = json.loads(_get(base + "/data?author=" + data["options"]["committers"][0]))
+        assert only_me["agg"]["total"] <= refreshed["agg"]["total"]
     finally:
         server.shutdown()
         server.server_close()
@@ -534,6 +571,25 @@ def test_dashboard_server_404s_unknown_paths(tmp_path):
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def test_dashboard_server_is_threaded_and_swallows_client_disconnects(tmp_path, capsys):
+    import http.server
+
+    server = build_server(GitRepo.init(tmp_path), port=0)
+    try:
+        # Threaded so one slow request (e.g. the first gh lookup) never blocks
+        # the live page's polling.
+        assert isinstance(server, http.server.ThreadingHTTPServer)
+        # A client vanishing mid-response (a superseded poll, a closed tab) must
+        # not spew a BrokenPipeError traceback into aGiT's console.
+        try:
+            raise BrokenPipeError(32, "Broken pipe")
+        except BrokenPipeError:
+            server.handle_error(object(), ("127.0.0.1", 0))
+        assert "Traceback" not in capsys.readouterr().err
+    finally:
+        server.server_close()
 
 
 # --- CLI -----------------------------------------------------------------------

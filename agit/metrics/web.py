@@ -1,14 +1,25 @@
-"""Self-contained HTML dashboard for `agit --dashboard html` (#54).
+"""HTML dashboard for `agit --dashboard` (#54).
 
-Everything the page needs is the per-commit data computed from ``git log``;
-that data is serialized to JSON and embedded in a single static HTML file. All
-aggregation (coverage, tracked-AI vs non-tracked lines, tokens, per-backend/model/committer
-breakdowns, loop detection) happens client-side in JavaScript so the filters —
-"entire team" vs a single committer, by backend, by model — recompute every
-metric live without a server. The file opens straight from disk in any browser
-and, like the text report, shows numbers identical on every clone.
+The page renders from two server endpoints so the browser never holds the whole
+history — memory stays bounded no matter how big the repo is:
 
-The visual language matches docs/index.html: a CRT/phosphor terminal.
+* :func:`aggregates_payload` (served at ``/data?<filters>``) computes every
+  metric panel (coverage, tracked-AI vs non-tracked lines, tokens, per-backend/
+  model/committer breakdowns, loop detection) over the filtered commits and
+  returns just the numbers — no per-commit list.
+* :func:`log_page` (served at ``/log?<filters>&offset=&limit=``) returns one
+  page of the commit log; only that page carries the heavy message / trace /
+  squash constituents.
+
+:func:`format_html` embeds an initial aggregates payload plus the first log page
+for an instant first paint, then the JS fetches ``/data`` and ``/log`` as the
+filters change and the user pages through the log. Everything is computed from
+``git log`` (+ ``gh`` for GitHub IDs when present), so the numbers are identical
+on every clone. The visual language matches docs/index.html: a CRT/phosphor
+terminal.
+
+:func:`dashboard_data` (the full per-commit serialization) is retained for tests
+and ad-hoc use; the live page does not embed it.
 """
 
 from __future__ import annotations
@@ -27,7 +38,7 @@ def render_html(repo: GitRepo, ref: str = "HEAD") -> str:
 
 
 def format_html(dash: Dashboard) -> str:
-    payload = json.dumps(dashboard_data(dash), separators=(",", ":"))
+    payload = json.dumps(initial_payload(dash), separators=(",", ":"))
     repo_name = dash.repo.rstrip("/").rsplit("/", 1)[-1] or dash.repo
     return (
         _TEMPLATE.replace("__DATA__", payload)
@@ -118,6 +129,168 @@ def _effective(stat: CommitStat, covers: dict[str, CommitStat]) -> tuple[str | N
             if stat.sha.startswith(short):
                 return cover.backend, cover.model
     return None, None
+
+
+# ---------------------------------------------------------------------------
+# Server-side aggregation + paginated log (so the browser never holds every
+# commit's full message / trace / squash constituents).
+# ---------------------------------------------------------------------------
+
+PAGE_SIZE = 50
+_KINDS = ("agent", "covered", "agent-merge", "user", "agit-ops", "untracked")
+
+
+def _covers(dash: Dashboard) -> dict[str, CommitStat]:
+    covers: dict[str, CommitStat] = {}
+    for stat in dash.stats:
+        for short in stat.covered_commits:
+            covers[short] = stat
+    return covers
+
+
+def _filter_stats(dash: Dashboard, *, author: str, backend: str, model: str, frm: int, to: int) -> list[CommitStat]:
+    covers = _covers(dash)
+    out: list[CommitStat] = []
+    for stat in dash.stats:
+        if author and dash.label_of(stat) != author:
+            continue
+        eff_backend, eff_model = _effective(stat, covers)
+        if backend and eff_backend != backend:
+            continue
+        if model and eff_model != model:
+            continue
+        if frm and (not stat.timestamp or stat.timestamp < frm):
+            continue
+        if to and (not stat.timestamp or stat.timestamp > to):
+            continue
+        out.append(stat)
+    return out
+
+
+def _filtered_dashboard(dash: Dashboard, stats: list[CommitStat]) -> Dashboard:
+    from agit.metrics.collect import _detect_loops
+
+    return Dashboard(
+        repo=dash.repo,
+        branch=dash.branch,
+        stats=stats,
+        loops=_detect_loops(stats),
+        sha_logins=dash.sha_logins,
+        commit_base=dash.commit_base,
+    )
+
+
+def _aggregates(fd: Dashboard) -> dict:
+    return {
+        "total": fd.total_commits,
+        "tracked": fd.tracked_commits,
+        "coverage": fd.coverage,
+        "kinds": {kind: fd.count(kind) for kind in _KINDS},
+        "ai_lines": list(fd.ai_lines),
+        "nontracked_lines": list(fd.nontracked_lines),
+        "tokens": fd.token_totals,
+        "efficiency": fd.lines_per_1k_output_tokens,
+        "by_backend": fd.by_backend,
+        "by_model": fd.by_model,
+        "by_committer": fd.by_author,
+        "loops": [
+            {"shas": loop.shas, "prompt": loop.prompt, "output": loop.output_tokens, "within": loop.within_commit}
+            for loop in fd.loops
+        ],
+    }
+
+
+def _options(dash: Dashboard) -> dict:
+    covers = _covers(dash)
+    committers, backends, models = set(), set(), set()
+    for stat in dash.stats:
+        committers.add(dash.label_of(stat))
+        eff_backend, eff_model = _effective(stat, covers)
+        if eff_backend:
+            backends.add(eff_backend)
+        if eff_model:
+            models.add(eff_model)
+    return {
+        "committers": sorted(c for c in committers if c),
+        "backends": sorted(backends),
+        "models": sorted(models),
+    }
+
+
+def aggregates_payload(
+    dash: Dashboard, *, author: str = "", backend: str = "", model: str = "", frm: int = 0, to: int = 0
+) -> dict:
+    """All the metric panels for the given filters — no per-commit list, so the
+    response stays small no matter how large the repository is. Filter options
+    come from the full history so the dropdowns never lose entries."""
+    stats = _filter_stats(dash, author=author, backend=backend, model=model, frm=frm, to=to)
+    return {
+        "head": dash.stats[-1].sha if dash.stats else "",
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        "options": _options(dash),
+        "agg": _aggregates(_filtered_dashboard(dash, stats)),
+    }
+
+
+def _log_entry(dash: Dashboard, stat: CommitStat, covers: dict[str, CommitStat]) -> dict:
+    eff_backend, eff_model = _effective(stat, covers)
+    return {
+        "short": stat.short,
+        "author": dash.label_of(stat),
+        "subject": stat.subject,
+        "kind": stat.kind,
+        "eff_backend": eff_backend,
+        "eff_model": eff_model,
+        "tokens": stat.tokens,
+        "ins": stat.insertions,
+        "del": stat.deletions,
+        "ts": stat.timestamp,
+        "started": stat.started_at,
+        "ended": stat.ended_at,
+        "message": stat.message,
+        "url": (dash.commit_base + stat.sha) if dash.commit_base else "",
+        "parts": [_part_payload(part) for part in stat.constituents],
+    }
+
+
+def log_page(
+    dash: Dashboard,
+    *,
+    author: str = "",
+    backend: str = "",
+    model: str = "",
+    frm: int = 0,
+    to: int = 0,
+    offset: int = 0,
+    limit: int = PAGE_SIZE,
+) -> dict:
+    """One page of the commit log (newest first) for the given filters. Only this
+    page's commits carry the heavy message / squash constituents, so memory and
+    payload stay bounded however deep the history is."""
+    stats = _filter_stats(dash, author=author, backend=backend, model=model, frm=frm, to=to)
+    stats.reverse()  # newest first
+    covers = _covers(dash)
+    offset = max(0, offset)
+    limit = max(1, min(limit, 200))
+    page = stats[offset : offset + limit]
+    return {
+        "total": len(stats),
+        "offset": offset,
+        "limit": limit,
+        "entries": [_log_entry(dash, stat, covers) for stat in page],
+    }
+
+
+def initial_payload(dash: Dashboard) -> dict:
+    """What the page embeds for an instant first paint: unfiltered aggregates,
+    the first log page, repo metadata, and the page size."""
+    return {
+        "repo": dash.repo,
+        "branch": dash.branch,
+        "page_size": PAGE_SIZE,
+        **aggregates_payload(dash),
+        "log": log_page(dash),
+    }
 
 
 def _escape(text: str) -> str:
@@ -253,8 +426,17 @@ h2.section::before{content:"# ";color:var(--amber)}
 .entry .detail{flex-basis:100%;width:100%;margin:8px 0 4px;border-left:2px solid var(--phosphor-dim);padding-left:14px;cursor:default}
 .entry .detail .dhead{color:var(--amber);font-size:12.5px;margin-bottom:4px}
 .entry .detail .dmeta{color:var(--ops);font-size:12px;margin-bottom:6px}
-.entry .detail .dmsg{white-space:pre-wrap;word-break:break-word;font-size:12.5px;color:var(--fg-dim);
-  background:var(--ink);border:1px solid var(--line);padding:10px 12px;max-height:420px;overflow:auto}
+.entry .detail .dmsg{font-size:12.5px;color:var(--fg-dim);background:var(--ink);border:1px solid var(--line);
+  padding:4px 12px;max-height:440px;overflow:auto;word-break:break-word}
+/* rendered Markdown inside the expanded message */
+.dmsg.md p{margin:7px 0}
+.dmsg.md .md-h{font-family:var(--mono);color:var(--amber);margin:11px 0 5px;font-size:13px;font-weight:600}
+.dmsg.md ul{margin:6px 0 6px 18px} .dmsg.md li{margin:2px 0}
+.dmsg.md code{background:var(--panel-2);border:1px solid var(--line);padding:0 4px;color:var(--phosphor);font-size:12px}
+.dmsg.md strong{color:var(--fg)} .dmsg.md em{color:var(--fg)}
+.dmsg.md .md-code{white-space:pre-wrap;background:var(--panel-2);border:1px solid var(--line);
+  padding:8px 10px;margin:7px 0;color:var(--fg-dim);font-size:12px}
+.dmsg.md a{color:var(--phosphor)}
 .entry .detail .phead{color:var(--ops);font-size:12px;margin:12px 0 6px}
 .part{border:1px solid var(--line);margin:5px 0;background:var(--panel-2)}
 .part>summary{cursor:pointer;padding:6px 10px;font-size:12.5px;color:var(--fg);list-style:none}
@@ -270,6 +452,12 @@ h2.section::before{content:"# ";color:var(--amber)}
 .part .phead{padding:0 10px}
 .part .part{margin:5px 10px}
 .more{padding:12px 0;color:var(--fg-dim);font-size:12.5px}
+.pager{display:flex;align-items:center;gap:16px;padding:14px 0 2px;color:var(--fg-dim);font-size:12.5px}
+.pager span{min-width:160px}
+.pager button{cursor:pointer;background:transparent;border:1px solid var(--phosphor-dim);color:var(--phosphor);
+  font-family:var(--mono);font-size:12.5px;padding:5px 12px}
+.pager button:hover:not([disabled]){background:var(--phosphor);color:var(--ink)}
+.pager button[disabled]{opacity:.35;cursor:default;border-color:var(--line);color:var(--fg-dim)}
 
 footer{margin-top:46px;padding-top:22px;border-top:1px dashed var(--line);color:var(--fg-dim);font-size:12.5px;
   display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap}
@@ -334,98 +522,82 @@ footer{margin-top:46px;padding-top:22px;border-top:1px dashed var(--line);color:
 <script type="application/json" id="agit-data">__DATA__</script>
 <script>
 "use strict";
-let DATA = JSON.parse(document.getElementById("agit-data").textContent);
-let COMMITS = DATA.commits;
-let LOG_ENTRIES = [];  // the currently rendered (filtered, newest-first) commit log
-const AI_KINDS = new Set(["agent","covered","agent-merge"]);        // aGiT-tracked AI work
-const NONTRACKED_KINDS = new Set(["user","untracked"]);             // everything aGiT didn't track as AI
-const TRACKED = new Set(["agent","covered","agent-merge","user","agit-ops"]); // tracked *commits* (coverage)
-const KIND_LABEL = {"agit-ops":"aGiT-ops","agent-merge":"agent-merge"};       // display names for badges
+// The page embeds an INITIAL payload (unfiltered aggregates + first log page)
+// for an instant first paint, then talks to the server: /data for the metric
+// panels under the active filters, /log for one page of the commit log. The
+// browser never holds every commit's message/trace/constituents — only the
+// current page — so memory stays bounded no matter how deep the history is.
+const INIT = JSON.parse(document.getElementById("agit-data").textContent);
+const PAGE_SIZE = INIT.page_size || 50;
+let HEAD = INIT.head, AGG = INIT.agg, LOGPAGE = INIT.log, OPTIONS = INIT.options, GENERATED = INIT.generated_at;
+let LOG_ENTRIES = [];  // entries of the page currently rendered (for toggleDetail)
+
+const AI_KINDS = new Set(["agent","covered","agent-merge"]);
+const KIND_LABEL = {"agit-ops":"aGiT-ops","agent-merge":"agent-merge"};
 const TOKEN_ORDER = [["input","input"],["output","output"],["reasoning","reasoning"],
   ["cache_read","cache read"],["cache_write","cache write"],
   ["subagent_input","subagent input"],["subagent_output","subagent output"],
   ["subagent_cache_read","subagent cache read"],["subagent_cache_write","subagent cache write"],
   ["summary_input","summarizer input"],["summary_output","summarizer output"]];
-const SIM_THRESHOLD = 0.6, LOOP_MIN_RUN = 3, LOG_CAP = 80, REFRESH_MS = 5000;
+const REFRESH_MS = 5000, DAY = 86400;
 
 const state = {author:"", backend:"", model:"", fromTs:0, toTs:0};
 const $ = id => document.getElementById(id);
 const fmt = n => (n||0).toLocaleString("en-US");
 const pct = (a,b) => b ? (a/b*100).toFixed(1)+"%" : "0%";
 const esc = s => (s||"").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+const kfmt = n => { n=n||0; return n>=1000 ? (n/1000).toFixed(n>=10000?0:1)+"k" : ""+n; };
 
-function filtered(){
-  return COMMITS.filter(c =>
-    (!state.author  || c.author === state.author) &&
-    (!state.backend || c.eff_backend === state.backend) &&
-    (!state.model   || c.eff_model === state.model) &&
-    (!state.fromTs  || (c.ts && c.ts >= state.fromTs)) &&
-    (!state.toTs    || (c.ts && c.ts <= state.toTs)));
+function qs(extra){
+  const p = new URLSearchParams();
+  if(state.author) p.set("author", state.author);
+  if(state.backend) p.set("backend", state.backend);
+  if(state.model) p.set("model", state.model);
+  if(state.fromTs) p.set("from", state.fromTs);
+  if(state.toTs) p.set("to", state.toTs);
+  for(const k in (extra||{})) p.set(k, extra[k]);
+  return p.toString();
 }
-function sumLines(cs, kinds){
-  let ins=0, del=0;
-  for(const c of cs) if(kinds.has(c.kind)){ ins+=c.ins; del+=c.del; }
-  return {ins, del, total:ins+del};
+async function loadAgg(){
+  try{ const r = await fetch("data?"+qs(), {cache:"no-store"}); if(r.ok){
+    const d = await r.json(); HEAD=d.head; AGG=d.agg; OPTIONS=d.options; GENERATED=d.generated_at; return true; } }
+  catch(e){}  // offline / static file: keep the embedded view
+  return false;
 }
-function tokenTotals(cs){
-  const t={};
-  for(const c of cs) for(const k in c.tokens) t[k]=(t[k]||0)+c.tokens[k];
-  return t;
-}
-function groupBy(cs, key){
-  const g={};
-  for(const c of cs){
-    if(c.kind!=="agent" && c.kind!=="covered") continue;
-    const label=c[key]||"unknown";
-    const b=g[label]||(g[label]={commits:0,ins:0,del:0,output:0});
-    if(c.kind==="agent") b.commits+=1;
-    b.ins+=c.ins; b.del+=c.del; b.output+=(c.tokens.output||0);
-  }
-  return g;
-}
-function byCommitter(cs){
-  // Per person: aGiT-tracked AI lines they drove vs everything aGiT did not
-  // track as AI. Agent commits are git-authored by whoever ran aGiT but written
-  // by the model, so they are the person's AI-driven lines, not their own.
-  const g={};
-  for(const c of cs){
-    const label=c.author||"unknown";
-    const b=g[label]||(g[label]={commits:0,agit:0,ai:0,nt:0});
-    b.commits+=1; if(c.kind!=="untracked") b.agit+=1;
-    const lines=c.ins+c.del;
-    if(AI_KINDS.has(c.kind)) b.ai+=lines; else b.nt+=lines;
-  }
-  return g;
+async function loadLog(offset){
+  try{ const r = await fetch("log?"+qs({offset:offset||0, limit:PAGE_SIZE}), {cache:"no-store"});
+    if(r.ok){ LOGPAGE = await r.json(); return true; } }
+  catch(e){}
+  return false;
 }
 
-// --- loop detection: same word-overlap rule as the Python collector ---
-function similar(a,b){
-  a=(a||"").toLowerCase().split(/\s+/).join(" "); b=(b||"").toLowerCase().split(/\s+/).join(" ");
-  if(!a||!b) return false; if(a===b) return true;
-  const wa=new Set(a.match(/[a-z0-9]+/g)||[]), wb=new Set(b.match(/[a-z0-9]+/g)||[]);
-  if(!wa.size||!wb.size) return false;
-  let inter=0; for(const w of wa) if(wb.has(w)) inter++;
-  return inter/(wa.size+wb.size-inter) >= SIM_THRESHOLD;
-}
-function detectLoops(cs){
-  const out=[];
-  const agents=cs.filter(c => c.kind==="agent" && c.prompt);
-  let run=[];
-  const flush=()=>{ if(run.length>=LOOP_MIN_RUN) out.push({
-    shas:run.map(c=>c.short), prompt:run[0].prompt,
-    output:run.reduce((s,c)=>s+(c.tokens.output||0),0), within:false}); };
-  for(const c of agents){
-    if(run.length && similar(run[run.length-1].prompt, c.prompt)){ run.push(c); continue; }
-    flush(); run=[c];
+// --- minimal Markdown for the expanded commit message ---
+function md(src){
+  const lines = (src||"").replace(/\r\n/g,"\n").split("\n");
+  const inline = t => esc(t)
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>")
+    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  let html="", inCode=false, code=[], inList=false;
+  const closeList = () => { if(inList){ html+="</ul>"; inList=false; } };
+  for(const raw of lines){
+    if(raw.trimStart().startsWith("```")){
+      if(inCode){ html+="<pre class=\"md-code\">"+esc(code.join("\n"))+"</pre>"; code=[]; inCode=false; }
+      else { closeList(); inCode=true; }
+      continue;
+    }
+    if(inCode){ code.push(raw); continue; }
+    const h = raw.match(/^(#{1,6})\s+(.*)$/);
+    if(h){ closeList(); const lvl=Math.min(6,h[1].length+2); html+=`<h${lvl} class="md-h">${inline(h[2])}</h${lvl}>`; continue; }
+    const li = raw.match(/^\s*[-*+]\s+(.*)$/);
+    if(li){ if(!inList){ html+="<ul>"; inList=true; } html+="<li>"+inline(li[1])+"</li>"; continue; }
+    if(raw.trim()===""){ closeList(); continue; }
+    html += "<p>"+inline(raw)+"</p>";
   }
-  flush();
-  for(const c of cs){
-    if(c.kind!=="agent" || (c.user_prompts||[]).length<LOOP_MIN_RUN) continue;
-    let longest=1, cur=1;
-    for(let i=1;i<c.user_prompts.length;i++){ cur = similar(c.user_prompts[i-1],c.user_prompts[i]) ? cur+1 : 1; longest=Math.max(longest,cur); }
-    if(longest>=LOOP_MIN_RUN) out.push({shas:[c.short], prompt:c.user_prompts[0], output:(c.tokens.output||0), within:true});
-  }
-  return out;
+  if(inCode){ html+="<pre class=\"md-code\">"+esc(code.join("\n"))+"</pre>"; }
+  closeList();
+  return html;
 }
 
 function barRow(name, sub, value, max, numHtml, amber){
@@ -434,22 +606,29 @@ function barRow(name, sub, value, max, numHtml, amber){
     `<div class="bar"><i class="${amber?"amber":""}" style="width:${w}%"></i></div>`+
     `<div class="num">${numHtml}</div></div>`;
 }
+function card(label, value, note, amber){
+  return `<div class="card"><div class="label">${esc(label)}</div>`+
+    `<div class="value ${amber?"amber":""}">${value}</div><div class="note">${esc(note||"")}</div></div>`;
+}
+function tokenBrief(t){
+  if(!t) return "";
+  const parts=[];
+  if(t.output) parts.push(`<span class="tok out">${kfmt(t.output)} out</span>`);
+  if(t.input) parts.push(`<span class="tok">${kfmt(t.input)} in</span>`);
+  if(t.cache_read) parts.push(`<span class="tok dim">${kfmt(t.cache_read)} cache</span>`);
+  return parts.length ? `<span class="lc">${parts.join(" ")}</span>` : "";
+}
 
-function render(){
-  const cs = filtered();
-  const total = cs.length;
-  const tracked = cs.filter(c=>TRACKED.has(c.kind)).length;
-  const ai = sumLines(cs, AI_KINDS), nt = sumLines(cs, NONTRACKED_KINDS);
-  const allLines = ai.total + nt.total;
-  const tok = tokenTotals(cs);
-  const eff = tok.output ? (ai.total/tok.output*1000) : null;
+function renderAgg(){
+  const total = AGG.total, tracked = AGG.tracked;
+  const ai = {ins:AGG.ai_lines[0], del:AGG.ai_lines[1]}; ai.total = ai.ins+ai.del;
+  const nt = {ins:AGG.nontracked_lines[0], del:AGG.nontracked_lines[1]}; nt.total = nt.ins+nt.del;
+  const allLines = ai.total + nt.total, tok = AGG.tokens, eff = AGG.efficiency, kinds = k => AGG.kinds[k]||0;
 
-  $("genat").textContent = "updated " + DATA.generated_at;
+  $("genat").textContent = "updated " + GENERATED;
   $("scope").innerHTML = state.author ? `scope: <b>${esc(state.author)}</b>` : `scope: <b>entire team</b>`;
-  $("count").textContent = `${fmt(total)} commits shown of ${fmt(COMMITS.length)}`;
+  $("count").textContent = `${fmt(total)} commits in view`;
 
-  // overview cards
-  const kinds = k => cs.filter(c=>c.kind===k).length;
   $("cards").innerHTML = [
     card("commits", fmt(total), `${fmt(tracked)} via aGiT`),
     card("aGiT coverage", pct(tracked,total), `${fmt(total-tracked)} non-tracked`, true),
@@ -459,7 +638,6 @@ function render(){
     card("efficiency", eff===null?"—":eff.toFixed(1), "AI lines / 1k output tok", true),
   ].join("");
 
-  // lines panel: tracked AI vs everything aGiT did not track as AI
   const lineRow = (label, sub, v, amber) =>
     `<div class="row"><div class="name">${label} <small>${sub}</small></div>`+
       `<div class="bar"><i class="${amber?"amber":""}" style="width:${allLines?v.total/allLines*100:0}%"></i></div>`+
@@ -470,43 +648,49 @@ function render(){
     `<div class="row"><div class="name">agent ${kinds("agent")} · covered ${kinds("covered")} · merge ${kinds("agent-merge")} · aGiT-ops ${kinds("agit-ops")}</div>`+
       `<div class="bar"></div><div class="num">user ${kinds("user")} · untracked ${kinds("untracked")}</div></div>`;
 
-  // tokens panel
   const shown = TOKEN_ORDER.filter(([k])=>tok[k]);
   const maxTok = Math.max(1, ...shown.map(([k])=>tok[k]));
   $("tokens").innerHTML = shown.length
     ? shown.map(([k,label]) => barRow(label, "", tok[k], maxTok, `<b>${fmt(tok[k])}</b>`, k==="output")).join("")
     : `<div class="empty">no token metadata recorded</div>`;
 
-  $("by-backend").innerHTML = groupPanel(groupBy(cs,"eff_backend"));
-  $("by-model").innerHTML = groupPanel(groupBy(cs,"eff_model"));
+  $("by-backend").innerHTML = groupPanel(AGG.by_backend);
+  $("by-model").innerHTML = groupPanel(AGG.by_model);
 
-  // committer table: the bar is the aGiT-tracked AI lines each person drove;
-  // non-tracked lines are shown as context.
-  const comm = byCommitter(cs);
-  const maxC = Math.max(1, ...Object.values(comm).map(b=>b.ai));
-  const commEntries = Object.entries(comm).sort((a,b)=>b[1].ai-a[1].ai || b[1].commits-a[1].commits);
-  $("by-committer").innerHTML = commEntries.length
-    ? commEntries.map(([name,b]) =>
-        barRow(name, `${b.commits} commits · ${b.agit} via aGiT`, b.ai, maxC,
-          `AI-driven <b>${fmt(b.ai)}</b> · non-tracked ${fmt(b.nt)}`)).join("")
+  const comm = Object.entries(AGG.by_committer).map(([name,b]) => [name, {
+    commits:b.commits, agit:b.agit_commits||0,
+    ai:(b.ai_insertions||0)+(b.ai_deletions||0), nt:(b.nontracked_insertions||0)+(b.nontracked_deletions||0)}]);
+  const maxC = Math.max(1, ...comm.map(([,b])=>b.ai));
+  comm.sort((a,b)=>b[1].ai-a[1].ai || b[1].commits-a[1].commits);
+  $("by-committer").innerHTML = comm.length
+    ? comm.map(([name,b]) => barRow(name, `${b.commits} commits · ${b.agit} via aGiT`, b.ai, maxC,
+        `AI-driven <b>${fmt(b.ai)}</b> · non-tracked ${fmt(b.nt)}`)).join("")
     : `<div class="empty">no commits</div>`;
 
-  // loops
-  const loops = detectLoops(cs);
-  $("loops").innerHTML = loops.length
-    ? loops.map(l => {
+  $("loops").innerHTML = AGG.loops.length
+    ? AGG.loops.map(l => {
         const where = l.within ? `within commit ${l.shas[0]}` : `${l.shas.length} commits ${l.shas[0]}..${l.shas[l.shas.length-1]}`;
         const q = l.prompt.length>90 ? l.prompt.slice(0,87)+"…" : l.prompt;
         return `<div class="loop"><span class="where">${esc(where)}</span> — <span class="q">"${esc(q)}"</span>`+
           (l.output?` <span class="cost">${fmt(l.output)} output tokens</span>`:"")+`</div>`;
       }).join("")
     : `<div class="empty">none detected</div>`;
+}
+function groupPanel(groups){
+  const entries = Object.entries(groups).sort((a,b)=>b[1].commits-a[1].commits ||
+    ((b[1].insertions+b[1].deletions)-(a[1].insertions+a[1].deletions)));
+  if(!entries.length) return `<div class="empty">no agent commits</div>`;
+  const max = Math.max(1, ...entries.map(([,b])=>b.insertions+b.deletions));
+  return entries.map(([label,b]) =>
+    barRow(label, `${b.commits} commits`, b.insertions+b.deletions, max,
+      `+${fmt(b.insertions)}/−${fmt(b.deletions)}${b.output_tokens?` · <b>${fmt(b.output_tokens)}</b> tok`:""}`)).join("");
+}
 
-  // commit log (newest first). Each line carries key token metrics; clicking
-  // opens the full commit message with a link to the commit on GitHub.
-  const ordered = cs.slice().reverse();
-  LOG_ENTRIES = ordered;
-  const head = ordered.slice(0, LOG_CAP).map((c, i) => {
+function renderLog(){
+  const entries = LOGPAGE.entries || [];
+  LOG_ENTRIES = entries;
+  const total = LOGPAGE.total||0, offset = LOGPAGE.offset||0, limit = LOGPAGE.limit||PAGE_SIZE;
+  const rows = entries.map((c, i) => {
     const cls = AI_KINDS.has(c.kind) ? "ai" : (c.kind==="agit-ops" ? "ops" : "nontracked");
     const badge = `<span class="badge ${cls}">${esc(KIND_LABEL[c.kind]||c.kind)}</span>`;
     const squash = (c.parts&&c.parts.length)?`<span class="squash">⧉ ${c.parts.length} squashed</span>`:"";
@@ -516,19 +700,17 @@ function render(){
       `<span class="ksub">${esc(c.subject)}</span>${lc}${tokenBrief(c.tokens)}${m}`+
       `<div class="detail" id="detail-${i}" hidden></div></div>`;
   }).join("");
-  $("commitlog").innerHTML = (head || `<div class="empty">no commits</div>`) +
-    (ordered.length>LOG_CAP ? `<div class="more">… ${fmt(ordered.length-LOG_CAP)} more (narrow the filters to see them)</div>` : "");
+  const from = total ? offset+1 : 0, to = offset+entries.length;
+  const prevDis = offset<=0 ? "disabled" : "", nextDis = (offset+limit>=total) ? "disabled" : "";
+  const pager = `<div class="pager"><button id="log-prev" ${prevDis}>‹ newer</button>`+
+    `<span>${fmt(from)}–${fmt(to)} of ${fmt(total)} commits</span>`+
+    `<button id="log-next" ${nextDis}>older ›</button></div>`;
+  $("commitlog").innerHTML = (rows || `<div class="empty">no commits</div>`) + pager;
+  const prev = $("log-prev"), next = $("log-next");
+  if(prev) prev.onclick = async () => { if(await loadLog(Math.max(0, offset-limit))) renderLog(); };
+  if(next) next.onclick = async () => { if(offset+limit<total && await loadLog(offset+limit)) renderLog(); };
 }
 
-function kfmt(n){ n=n||0; return n>=1000 ? (n/1000).toFixed(n>=10000?0:1)+"k" : ""+n; }
-function tokenBrief(t){
-  if(!t) return "";
-  const parts=[];
-  if(t.output) parts.push(`<span class="tok out">${kfmt(t.output)} out</span>`);
-  if(t.input) parts.push(`<span class="tok">${kfmt(t.input)} in</span>`);
-  if(t.cache_read) parts.push(`<span class="tok dim">${kfmt(t.cache_read)} cache</span>`);
-  return parts.length ? `<span class="lc">${parts.join(" ")}</span>` : "";
-}
 function partsHtml(parts){
   // Squash constituents as a nested, expandable tree (native <details>, so the
   // nesting works for multiple rounds of squashing with no extra JS).
@@ -539,7 +721,7 @@ function partsHtml(parts){
     const mdl = p.model ? ` · ${esc(p.model)}` : "";
     return `<details class="part"><summary><span class="pkind ${pcls}">${esc(KIND_LABEL[p.kind]||p.kind)}</span> `+
       `${esc(p.subject||"(no subject)")}<span class="pmeta">${mdl}${out}</span></summary>`+
-      `<pre class="dmsg">${esc(p.message||"")}</pre>${partsHtml(p.parts)}</details>`;
+      `<div class="dmsg md">${md(p.message)}</div>${partsHtml(p.parts)}</details>`;
   }).join("");
   return `<div class="phead">squashed from ${parts.length} original commit${parts.length>1?"s":""} `+
     `— tokens &amp; models counted from these:</div>${items}`;
@@ -552,54 +734,42 @@ function toggleDetail(i){
     const span = (c.started||c.ended)
       ? `<div class="dmeta">AI conversation: ${esc(c.started||"?")} → ${esc(c.ended||"?")}</div>` : "";
     detail.innerHTML = `<div class="dhead">${esc(c.short)} ${link}</div>${span}`+
-      `<pre class="dmsg">${esc(c.message||"(no message recorded)")}</pre>${partsHtml(c.parts)}`;
+      `<div class="dmsg md">${md(c.message||"(no message recorded)")}</div>${partsHtml(c.parts)}`;
     detail.hidden = false;
   } else {
     detail.hidden = true;
   }
 }
 
-function card(label, value, note, amber){
-  return `<div class="card"><div class="label">${esc(label)}</div>`+
-    `<div class="value ${amber?"amber":""}">${value}</div><div class="note">${esc(note||"")}</div></div>`;
-}
-function groupPanel(groups){
-  const entries = Object.entries(groups).sort((a,b)=>b[1].commits-a[1].commits || (b[1].ins+b[1].del)-(a[1].ins+a[1].del));
-  if(!entries.length) return `<div class="empty">no agent commits</div>`;
-  const max = Math.max(1, ...entries.map(([,b])=>b.ins+b.del));
-  return entries.map(([label,b]) =>
-    barRow(label, `${b.commits} commits`, b.ins+b.del, max,
-      `+${fmt(b.ins)}/−${fmt(b.del)}${b.output?` · <b>${fmt(b.output)}</b> tok`:""}`)).join("");
-}
-
 function fillSelect(id, values, allLabel, keep){
-  // Repopulate options while preserving the current selection across refreshes.
   const sel = $(id);
   sel.innerHTML = `<option value="">${allLabel}</option>` +
     values.map(v => `<option value="${esc(v)}">${esc(v)}</option>`).join("");
   sel.value = (keep && values.includes(keep)) ? keep : "";
 }
 function syncFilters(){
-  fillSelect("f-author", DATA.committers, "— entire team —", state.author);
-  fillSelect("f-backend", DATA.backends, "— all backends —", state.backend);
-  fillSelect("f-model", DATA.models, "— all models —", state.model);
-  // A selection whose value vanished from the data falls back to "all".
-  if(!DATA.committers.includes(state.author)) state.author = "";
-  if(!DATA.backends.includes(state.backend)) state.backend = "";
-  if(!DATA.models.includes(state.model)) state.model = "";
+  fillSelect("f-author", OPTIONS.committers, "— entire team —", state.author);
+  fillSelect("f-backend", OPTIONS.backends, "— all backends —", state.backend);
+  fillSelect("f-model", OPTIONS.models, "— all models —", state.model);
+  if(!OPTIONS.committers.includes(state.author)) state.author = "";
+  if(!OPTIONS.backends.includes(state.backend)) state.backend = "";
+  if(!OPTIONS.models.includes(state.model)) state.model = "";
+}
+
+// A filter change refetches the aggregates and resets the log to its first page.
+async function applyFilters(){
+  await loadAgg(); await loadLog(0);
+  syncFilters(); renderAgg(); renderLog();
 }
 async function refresh(){
-  try {
-    const r = await fetch("data", {cache:"no-store"});
-    if(!r.ok) return;
-    const next = await r.json();
-    if(next.head === DATA.head) return;  // nothing changed; don't disturb the view
-    DATA = next; COMMITS = next.commits;
-    syncFilters(); render();
-  } catch(e) { /* server stopped or offline (static file): keep the last view */ }
+  const prev = HEAD;
+  if(await loadAgg() && HEAD !== prev){  // new commits landed — refresh the view
+    await loadLog(LOGPAGE.offset||0);
+    syncFilters(); renderAgg(); renderLog();
+  }
 }
+
 // --- time range ---
-const DAY = 86400;
 function dateToTs(value, endOfDay){
   if(!value) return 0;
   const ts = Date.parse(value + "T00:00:00Z")/1000;
@@ -609,34 +779,32 @@ function applyPeriod(){
   const v = $("f-period").value;
   if(v === "" ){ state.fromTs = 0; state.toTs = 0; $("f-from").value=""; $("f-to").value=""; }
   else if(v === "custom"){ state.fromTs = dateToTs($("f-from").value,false); state.toTs = dateToTs($("f-to").value,true); }
-  else {
-    state.fromTs = Math.floor(Date.now()/1000) - (+v)*DAY; state.toTs = 0;
-    $("f-from").value=""; $("f-to").value="";
-  }
+  else { state.fromTs = Math.floor(Date.now()/1000) - (+v)*DAY; state.toTs = 0; $("f-from").value=""; $("f-to").value=""; }
 }
 
 function init(){
   syncFilters();
-  $("f-author").onchange = e => { state.author = e.target.value; render(); };
-  $("f-backend").onchange = e => { state.backend = e.target.value; render(); };
-  $("f-model").onchange = e => { state.model = e.target.value; render(); };
-  $("f-period").onchange = () => { applyPeriod(); render(); };
-  const onDate = () => { $("f-period").value = "custom"; applyPeriod(); render(); };
+  $("f-author").onchange = e => { state.author = e.target.value; applyFilters(); };
+  $("f-backend").onchange = e => { state.backend = e.target.value; applyFilters(); };
+  $("f-model").onchange = e => { state.model = e.target.value; applyFilters(); };
+  $("f-period").onchange = () => { applyPeriod(); applyFilters(); };
+  const onDate = () => { $("f-period").value = "custom"; applyPeriod(); applyFilters(); };
   $("f-from").onchange = onDate;
   $("f-to").onchange = onDate;
   $("reset").onclick = () => {
     state.author=state.backend=state.model=""; state.fromTs=state.toTs=0;
     $("f-period").value=""; $("f-from").value=""; $("f-to").value="";
-    syncFilters(); render();
+    applyFilters();
   };
   // Click a commit-log line to open its full message + GitHub link. Clicks
-  // inside the opened detail (links, the squash <details> tree) are left alone.
+  // inside the opened detail (links, the squash <details> tree, the pager) are
+  // left alone.
   $("commitlog").addEventListener("click", e => {
-    if(e.target.closest("a") || e.target.closest(".detail")) return;
+    if(e.target.closest("a") || e.target.closest(".detail") || e.target.closest(".pager")) return;
     const entry = e.target.closest(".entry");
     if(entry) toggleDetail(+entry.dataset.i);
   });
-  render();
+  renderAgg(); renderLog();
   setInterval(refresh, REFRESH_MS);
 }
 init();
