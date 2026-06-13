@@ -17,6 +17,17 @@ class ProxyAgent(Protocol):
     """
 
     name: str
+    # Whether this backend has a portable transcript that can be shared and
+    # resumed across machines (issue #55). Claude does; OpenCode keeps sessions in
+    # its own store with no portable export, so sharing is disabled for it.
+    supports_session_sharing: bool
+
+    def export_session_raw(self, repo: Path, session_id: str) -> str | None:
+        """The full transcript text to share, or None if unavailable/unsupported."""
+
+    def import_shared_session(self, repo: Path, session_id: str, transcript: str) -> bool:
+        """Install a shared transcript so the session can be resumed in ``repo``.
+        Returns True on success; False if unsupported."""
 
     def new_session_id(self) -> str | None:
         """A session id to start a fresh session with, or None to let the
@@ -60,6 +71,13 @@ class ProxyAgent(Protocol):
 
 class OpenCodeProxyAgent:
     name = "opencode"
+    supports_session_sharing = False
+
+    def export_session_raw(self, repo: Path, session_id: str) -> str | None:
+        return None  # OpenCode has no portable per-session transcript file
+
+    def import_shared_session(self, repo: Path, session_id: str, transcript: str) -> bool:
+        return False
 
     def new_session_id(self) -> str | None:
         # OpenCode assigns its own session id; aGiT discovers it after the run.
@@ -105,6 +123,13 @@ class OpenCodeProxyAgent:
 
 class ClaudeProxyAgent:
     name = "claude"
+    supports_session_sharing = True
+
+    def export_session_raw(self, repo: Path, session_id: str) -> str | None:
+        return claude_session.export_session_raw(repo, session_id)
+
+    def import_shared_session(self, repo: Path, session_id: str, transcript: str) -> bool:
+        return claude_session.import_shared_session(repo, session_id, transcript)
 
     def new_session_id(self) -> str | None:
         # Claude accepts an explicit session id, so aGiT picks one up front and
