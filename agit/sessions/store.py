@@ -96,9 +96,14 @@ class SharedSessionStore:
     # --- writing -----------------------------------------------------------
 
     def _commit(self, entries: dict[str, str], message: str) -> None:
+        old = self.repo.ref_sha(self.ref)
         tree = self.repo.write_tree_from(entries)
         sha = self.repo.commit_tree_orphan(tree, message)
         self.repo.update_ref(self.ref, sha)
+        # Reclaim the just-orphaned previous snapshot's objects right away — large
+        # transcript blobs shouldn't linger until git's auto-gc (issue #55).
+        if old and old != sha:
+            self.repo.delete_orphaned_objects(old)
 
     def _add_session(self, github_id: str, name: str, transcript: str, manifest: dict) -> None:
         base = f"{self._prefix()}{github_id}/{name}/"
@@ -132,6 +137,36 @@ class SharedSessionStore:
         if not self.repo.remote_exists():
             return False
         return self.repo.fetch_ref(f"+{self.ref}:{self.ref}")
+
+    def _is_session_snapshot(self, commit_sha: str) -> bool:
+        # A shared-session snapshot commit is parent-less (an orphan we wrote) and
+        # its tree has the manifest+transcript shape. Both checks together avoid
+        # ever matching an unrelated orphan commit (e.g. an abandoned turn branch).
+        if self.repo.parents(commit_sha):
+            return False
+        paths = self.repo.read_tree_paths(commit_sha)
+        return any(p.endswith("/manifest.json") for p in paths) and any(p.endswith("/transcript.jsonl") for p in paths)
+
+    def cleanup_orphans(self, *, fetch: bool = True) -> int:
+        """Delete every dangling *shared-session* snapshot left by past rewrites —
+        immediately, rather than waiting for git's auto-gc. Only commits that are
+        genuinely shared-session snapshots are touched (see ``_is_session_snapshot``);
+        other unreachable objects are left alone. Returns the count of objects removed.
+        Best-effort; never raises. ``fetch`` first (default) syncs the local ref to the
+        remote so a snapshot that's still the remote's tip is never mistaken for junk;
+        pass ``fetch=False`` to stay offline (e.g. on exit)."""
+        try:
+            if fetch:
+                self.fetch()
+            current = self.repo.ref_sha(self.ref)
+            removed = 0
+            for sha in self.repo.unreachable_commits():
+                if sha == current or not self._is_session_snapshot(sha):
+                    continue
+                removed += self.repo.delete_orphaned_objects(sha)
+            return removed
+        except Exception:
+            return 0
 
     def fetch_throttled(self) -> None:
         """Best-effort fetch at most once per TTL — for pollers (the dashboard)

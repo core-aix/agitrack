@@ -197,6 +197,101 @@ def test_unshare_removes_only_that_entry(tmp_path):
     assert [e.name for e in store.entries()] == ["keep"]
 
 
+def test_update_deletes_old_version_objects_immediately(tmp_path):
+    import subprocess as sp
+
+    repo = _init_repo(tmp_path)
+    store = SharedSessionStore(repo)
+    store.publish(github_id="a", name="s", transcript="OLD", manifest=_manifest("s", session_id="id", updated=1))
+    old_blob = next(
+        line.split()[0]
+        for line in sp.run(
+            ["git", "-C", str(repo.repo), "rev-list", "--objects", store.ref], capture_output=True, text=True
+        ).stdout.splitlines()
+        if "transcript" in line
+    )
+    store.publish(github_id="a", name="s", transcript="NEW", manifest=_manifest("s", session_id="id", updated=2))
+    gone = sp.run(["git", "-C", str(repo.repo), "cat-file", "-e", old_blob], capture_output=True).returncode != 0
+    assert gone  # the previous version's blob is reclaimed right away, not left for auto-gc
+    assert store.read_transcript(store.entries()[0]) == "NEW"
+
+
+def test_update_one_session_keeps_other_sessions_intact(tmp_path):
+    # Regression: the immediate-deletion must never remove objects the current ref
+    # still references (a sibling session's blobs).
+    repo = _init_repo(tmp_path)
+    store = SharedSessionStore(repo)
+    store.publish(github_id="a", name="s1", transcript="one", manifest=_manifest("s1", session_id="i1", updated=1))
+    store.publish(github_id="b", name="s2", transcript="two", manifest=_manifest("s2", session_id="i2", updated=1))
+    store.publish(github_id="a", name="s1", transcript="one-v2", manifest=_manifest("s1", session_id="i1", updated=2))
+    got = {e.display: store.read_transcript(e) for e in store.entries()}
+    assert got == {"a/s1": "one-v2", "b/s2": "two"}
+
+
+def test_cleanup_orphans_removes_only_session_snapshots(tmp_path):
+    import subprocess as sp
+
+    repo = _init_repo(tmp_path)
+    store = SharedSessionStore(repo)
+    store.publish(github_id="a", name="s", transcript="t", manifest=_manifest("s", session_id="id", updated=1))
+    fp = store.fingerprint()
+    # A dangling SESSION snapshot (orphan commit with the manifest/transcript shape).
+    sess_tree = repo.write_tree_from(
+        {f"{fp}/a/old/transcript.jsonl": repo.write_blob("stale"), f"{fp}/a/old/manifest.json": repo.write_blob("{}")}
+    )
+    sess_orphan = repo.commit_tree_orphan(sess_tree, "old shared snapshot")
+    # A NON-session orphan (normal source tree) — must be left untouched.
+    other_blob = repo.write_blob("source code")
+    other_orphan = repo.commit_tree_orphan(repo.write_tree_from({"src/main.py": other_blob}), "abandoned work")
+
+    store.cleanup_orphans(fetch=False)
+
+    def alive(sha):
+        return sp.run(["git", "-C", str(repo.repo), "cat-file", "-e", sha], capture_output=True).returncode == 0
+
+    assert not alive(sess_orphan)  # the session snapshot is reclaimed
+    assert alive(other_orphan) and alive(other_blob)  # the non-session orphan is spared
+    assert [e.display for e in store.entries()] == ["a/s"]  # the live session is unaffected
+
+
+# --- pull-latest on resume (sync between machines) --------------------------
+
+
+def test_import_overwrite_replaces_local(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    from agit.transcripts import claude
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    assert not claude.has_imported_session(repo, "sid")
+    claude.import_shared_session(repo, "sid", '{"cwd":"/x","t":1}\n')
+    assert claude.has_imported_session(repo, "sid")
+    # Default keeps the local copy; overwrite replaces it (pull-latest).
+    assert claude.import_shared_session(repo, "sid", '{"cwd":"/x","t":2}\n')  # no overwrite
+    assert '"t": 1' in (claude._project_dir(repo) / "sid.jsonl").read_text()  # local kept
+    assert claude.import_shared_session(repo, "sid", '{"cwd":"/x","t":2}\n', overwrite=True)
+    assert '"t": 2' in (claude._project_dir(repo) / "sid.jsonl").read_text()  # replaced
+
+
+def test_resume_shared_prompts_to_pull_when_local_exists(tmp_path, monkeypatch):
+    backend = _StubBackend(transcript="bob's chat", has_local=True)  # we already have a local copy
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
+    SharedSessionStore(repo).publish(
+        github_id="me",
+        name="sess",
+        transcript="bob's chat",
+        manifest={"github_id": "me", "name": "sess", "session_id": "sid-x", "updated": 1},
+    )
+    runner.sessions = []  # not live
+    runner._resume_conversation = lambda name, sid: None
+    # First popup selects the session; second is the local-vs-shared choice → Pull.
+    runner._select_popup = lambda title, options: options[0]
+
+    runner._resume_shared_session_menu()
+
+    assert backend.imported == ("sid-x", "bob's chat", True)  # imported with overwrite (pulled latest)
+
+
 # --- auto-share opt-in state ------------------------------------------------
 
 
@@ -248,8 +343,9 @@ class _StubBackend:
     name = "claude"
     supports_session_sharing = True
 
-    def __init__(self, transcript="conversation text"):
+    def __init__(self, transcript="conversation text", has_local=False):
         self._transcript = transcript
+        self._has_local = has_local
         self.imported: tuple | None = None
 
     def session_belongs_to_repo(self, repo, session_id):
@@ -261,8 +357,11 @@ class _StubBackend:
     def transcript_size(self, repo, session_id):
         return len(self._transcript.encode("utf-8"))
 
-    def import_shared_session(self, repo, session_id, transcript):
-        self.imported = (session_id, transcript)
+    def has_local_session(self, repo, session_id):
+        return self._has_local
+
+    def import_shared_session(self, repo, session_id, transcript, *, overwrite=False):
+        self.imported = (session_id, transcript, overwrite)
         return True
 
 
@@ -330,7 +429,7 @@ def test_runner_resume_shared_imports_and_resumes(tmp_path, monkeypatch):
 
     runner._resume_shared_session_menu()
 
-    assert backend.imported == ("bob-sid", "bob's chat")  # transcript installed for resume
+    assert backend.imported == ("bob-sid", "bob's chat", False)  # imported, no overwrite (no local copy)
     assert resumed == [("bob-cool-fix", "bob-sid")]  # resumed under <id>-<name>
 
 

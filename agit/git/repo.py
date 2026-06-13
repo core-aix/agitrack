@@ -405,6 +405,59 @@ class GitRepo:
         result = self._run(command, check=False)
         return result.returncode == 0, result.stderr
 
+    def unreachable_commits(self) -> list[str]:
+        """SHAs of commits reachable from no ref (and no reflog) — dangling objects
+        git's auto-gc would eventually drop. Used to sweep stale shared-session
+        snapshots; the caller filters to genuine sessions before deleting anything."""
+        result = self._run(
+            ["git", "fsck", "--unreachable", "--no-reflogs", "--connectivity-only", "--no-progress"],
+            check=False,
+        )
+        commits = []
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) == 3 and parts[0] == "unreachable" and parts[1] == "commit":
+                commits.append(parts[2])
+        return commits
+
+    def delete_orphaned_objects(self, old_sha: str | None) -> int:
+        """Immediately delete the loose objects reachable from ``old_sha`` but from
+        no current ref — the previous shared-session snapshot's commit/tree/blobs
+        after the ref was rewritten off it. Targeted (it only ever removes objects
+        exclusive to ``old_sha``, never anything another ref reaches), so it's safe
+        to run alongside aGiT's other git writes and doesn't wait for git's auto-gc.
+        Returns the count removed. Best-effort; never raises.
+
+        Uses an explicit object-set difference: ``git rev-list --objects A --not B``
+        does NOT reliably drop trees/blobs A shares with B, which would delete
+        objects the current ref still needs — so we diff the two object sets here."""
+        if not old_sha:
+            return 0
+        old = self._run(["git", "rev-list", "--objects", old_sha], check=False)
+        if old.returncode != 0:
+            return 0
+        old_shas = {line.split(" ", 1)[0] for line in old.stdout.splitlines() if line}
+        if not old_shas:
+            return 0
+        kept = self._run(["git", "rev-list", "--objects", "--all"], check=False)
+        kept_shas = {line.split(" ", 1)[0] for line in kept.stdout.splitlines() if line}
+        orphaned = old_shas - kept_shas  # in old's snapshot, reachable from no ref
+        raw = self._run(["git", "rev-parse", "--git-path", "objects"], check=False).stdout.strip()
+        if not raw:
+            return 0
+        objects = Path(raw) if os.path.isabs(raw) else (self.repo / raw)
+        removed = 0
+        for sha in orphaned:
+            if len(sha) < 4 or any(ch not in "0123456789abcdef" for ch in sha):
+                continue
+            loose = objects / sha[:2] / sha[2:]
+            try:
+                loose.unlink()  # packed objects have no loose file (no-op via OSError)
+                removed += 1
+            except OSError:
+                pass
+        return removed
+
     def root_commit(self) -> str | None:
         """The repo's first (root) commit SHA — a clone-stable repo fingerprint.
         None for an unborn repo. Picks the earliest if history has several roots."""
