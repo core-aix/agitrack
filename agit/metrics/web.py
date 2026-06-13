@@ -21,7 +21,9 @@ from agit.metrics.collect import CommitStat, Dashboard, build_dashboard
 
 
 def render_html(repo: GitRepo, ref: str = "HEAD") -> str:
-    return format_html(build_dashboard(repo, ref))
+    from agit.metrics.github import resolve_logins
+
+    return format_html(build_dashboard(repo, ref, sha_logins=resolve_logins(repo)))
 
 
 def format_html(dash: Dashboard) -> str:
@@ -68,6 +70,11 @@ def dashboard_data(dash: Dashboard) -> dict:
                 "del": stat.deletions,
                 "prompt": stat.prompt,
                 "user_prompts": stat.user_prompts,
+                "ts": stat.timestamp,  # commit time (epoch) for the time filter
+                "started": stat.started_at,  # AI conversation span (ISO, may be "")
+                "ended": stat.ended_at,
+                "message": stat.message,  # full message, shown when a log entry opens
+                "url": (dash.commit_base + stat.sha) if dash.commit_base else "",
             }
         )
 
@@ -116,7 +123,7 @@ _TEMPLATE = r"""<!DOCTYPE html>
 :root{
   --ink:#070b09; --panel:#0c120e; --panel-2:#101813; --line:#1d2a21;
   --phosphor:#3dffa0; --phosphor-dim:#1f7a52; --amber:#ffb454; --amber-dim:#8a5e2a;
-  --fg:#cfe7d8; --fg-dim:#7e998a; --red:#ff6b6b;
+  --fg:#cfe7d8; --fg-dim:#7e998a; --red:#ff6b6b; --ops:#67b8d6;
   --mono:"IBM Plex Mono",ui-monospace,monospace; --display:"VT323",var(--mono);
 }
 *{box-sizing:border-box;margin:0;padding:0}
@@ -151,6 +158,10 @@ header{padding:54px 0 22px}
   background-image:linear-gradient(45deg,transparent 50%,var(--phosphor-dim) 50%),linear-gradient(135deg,var(--phosphor-dim) 50%,transparent 50%);
   background-position:calc(100% - 16px) 50%,calc(100% - 11px) 50%;background-size:5px 5px,5px 5px;background-repeat:no-repeat}
 .field select:focus{outline:none;border-color:var(--phosphor)}
+.field input[type=date]{background:var(--ink);color:var(--fg);border:1px solid var(--line);
+  font-family:var(--mono);font-size:13px;padding:6px 9px;cursor:pointer}
+.field input[type=date]:focus{outline:none;border-color:var(--phosphor)}
+.field input[type=date]::-webkit-calendar-picker-indicator{filter:invert(.7) sepia(1) hue-rotate(90deg)}
 .scope{margin-left:auto;align-self:center;color:var(--fg-dim);font-size:12.5px}
 .scope b{color:var(--phosphor)}
 .reset{cursor:pointer;border:1px solid var(--amber);color:var(--amber);background:transparent;
@@ -165,7 +176,8 @@ h2.section::before{content:"# ";color:var(--amber)}
 .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px}
 .card{background:var(--panel);border:1px solid var(--line);padding:16px 18px;position:relative;transition:border-color .15s}
 .card:hover{border-color:var(--phosphor-dim)}
-.card .label{font-size:11.5px;color:var(--amber);letter-spacing:.5px;text-transform:uppercase}
+/* No text-transform: the "aGiT" brand must never render all-caps. */
+.card .label{font-size:11.5px;color:var(--amber);letter-spacing:.5px}
 .card .value{font-family:var(--display);font-size:42px;line-height:1.05;color:var(--phosphor);margin-top:6px;
   text-shadow:0 0 14px rgba(61,255,160,.3)}
 .card .value.amber{color:var(--amber);text-shadow:0 0 14px rgba(255,180,84,.3)}
@@ -199,19 +211,30 @@ h2.section::before{content:"# ";color:var(--amber)}
 .log{position:relative;padding-left:34px;margin-top:8px}
 .log::before{content:"";position:absolute;left:9px;top:6px;bottom:6px;width:2px;
   background:linear-gradient(var(--phosphor-dim),var(--line) 90%,transparent)}
-.entry{position:relative;padding:9px 0;border-bottom:1px dashed var(--line);display:flex;flex-wrap:wrap;gap:10px;align-items:baseline}
+.entry{position:relative;padding:9px 0;border-bottom:1px dashed var(--line);display:flex;flex-wrap:wrap;gap:10px;align-items:baseline;cursor:pointer}
 .entry:last-child{border-bottom:none}
+.entry:hover{background:rgba(61,255,160,.04)}
 .entry::before{content:"";position:absolute;left:-30px;top:15px;width:9px;height:9px;border-radius:50%;
   background:var(--ink);border:2px solid var(--phosphor-dim)}
 .entry.ai::before{border-color:var(--phosphor);box-shadow:0 0 8px rgba(61,255,160,.5)}
+.entry.ops::before{border-color:var(--ops);box-shadow:0 0 8px rgba(103,184,214,.4)}
 .entry.nontracked::before{border-color:var(--amber)}
 .entry .sha{color:var(--amber);font-size:12.5px}
 .entry .ksub{flex:1;min-width:200px;color:var(--fg)}
-.entry .badge{font-size:10.5px;letter-spacing:.5px;text-transform:uppercase;padding:1px 7px;border:1px solid var(--line);color:var(--fg-dim)}
+.entry .badge{font-size:10.5px;letter-spacing:.5px;padding:1px 7px;border:1px solid var(--line);color:var(--fg-dim)}
 .entry .badge.ai{color:var(--phosphor);border-color:var(--phosphor-dim)}
+.entry .badge.ops{color:var(--ops);border-color:var(--ops)}
 .entry .badge.nontracked{color:var(--amber);border-color:var(--amber-dim)}
 .entry .lc{font-size:12px;color:var(--fg-dim)}
 .entry .lc .add{color:var(--phosphor)} .entry .lc .rem{color:var(--red)}
+.entry .tok{font-size:11px;border:1px solid var(--line);padding:0 5px;color:var(--fg-dim)}
+.entry .tok.out{color:var(--phosphor);border-color:var(--phosphor-dim)}
+.entry .tok.dim{opacity:.7}
+.entry .detail{flex-basis:100%;width:100%;margin:8px 0 4px;border-left:2px solid var(--phosphor-dim);padding-left:14px;cursor:default}
+.entry .detail .dhead{color:var(--amber);font-size:12.5px;margin-bottom:4px}
+.entry .detail .dmeta{color:var(--ops);font-size:12px;margin-bottom:6px}
+.entry .detail .dmsg{white-space:pre-wrap;word-break:break-word;font-size:12.5px;color:var(--fg-dim);
+  background:var(--ink);border:1px solid var(--line);padding:10px 12px;max-height:420px;overflow:auto}
 .more{padding:12px 0;color:var(--fg-dim);font-size:12.5px}
 
 footer{margin-top:46px;padding-top:22px;border-top:1px dashed var(--line);color:var(--fg-dim);font-size:12.5px;
@@ -230,6 +253,16 @@ footer{margin-top:46px;padding-top:22px;border-top:1px dashed var(--line);color:
     <div class="field"><label for="f-author">committer</label><select id="f-author"></select></div>
     <div class="field"><label for="f-backend">backend</label><select id="f-backend"></select></div>
     <div class="field"><label for="f-model">model</label><select id="f-model"></select></div>
+    <div class="field"><label for="f-period">period</label><select id="f-period">
+      <option value="">all time</option>
+      <option value="1">last 24 hours</option>
+      <option value="7">last 7 days</option>
+      <option value="30">last 30 days</option>
+      <option value="90">last 90 days</option>
+      <option value="custom">custom range</option>
+    </select></div>
+    <div class="field"><label for="f-from">from</label><input type="date" id="f-from"></div>
+    <div class="field"><label for="f-to">to</label><input type="date" id="f-to"></div>
     <button class="reset" id="reset">reset</button>
     <span class="scope" id="scope"></span>
   </div>
@@ -269,9 +302,11 @@ footer{margin-top:46px;padding-top:22px;border-top:1px dashed var(--line);color:
 "use strict";
 let DATA = JSON.parse(document.getElementById("agit-data").textContent);
 let COMMITS = DATA.commits;
+let LOG_ENTRIES = [];  // the currently rendered (filtered, newest-first) commit log
 const AI_KINDS = new Set(["agent","covered","agent-merge"]);        // aGiT-tracked AI work
 const NONTRACKED_KINDS = new Set(["user","untracked"]);             // everything aGiT didn't track as AI
-const TRACKED = new Set(["agent","covered","agent-merge","user"]);  // tracked *commits* (for coverage)
+const TRACKED = new Set(["agent","covered","agent-merge","user","agit-ops"]); // tracked *commits* (coverage)
+const KIND_LABEL = {"agit-ops":"aGiT-ops","agent-merge":"agent-merge"};       // display names for badges
 const TOKEN_ORDER = [["input","input"],["output","output"],["reasoning","reasoning"],
   ["cache_read","cache read"],["cache_write","cache write"],
   ["subagent_input","subagent input"],["subagent_output","subagent output"],
@@ -279,7 +314,7 @@ const TOKEN_ORDER = [["input","input"],["output","output"],["reasoning","reasoni
   ["summary_input","summarizer input"],["summary_output","summarizer output"]];
 const SIM_THRESHOLD = 0.6, LOOP_MIN_RUN = 3, LOG_CAP = 80, REFRESH_MS = 5000;
 
-const state = {author:"", backend:"", model:""};
+const state = {author:"", backend:"", model:"", fromTs:0, toTs:0};
 const $ = id => document.getElementById(id);
 const fmt = n => (n||0).toLocaleString("en-US");
 const pct = (a,b) => b ? (a/b*100).toFixed(1)+"%" : "0%";
@@ -289,7 +324,9 @@ function filtered(){
   return COMMITS.filter(c =>
     (!state.author  || c.author === state.author) &&
     (!state.backend || c.eff_backend === state.backend) &&
-    (!state.model   || c.eff_model === state.model));
+    (!state.model   || c.eff_model === state.model) &&
+    (!state.fromTs  || (c.ts && c.ts >= state.fromTs)) &&
+    (!state.toTs    || (c.ts && c.ts <= state.toTs)));
 }
 function sumLines(cs, kinds){
   let ins=0, del=0;
@@ -396,7 +433,7 @@ function render(){
   $("lines").innerHTML =
     lineRow("aGiT-tracked AI", "agent + covered + merge", ai, false) +
     lineRow("Non-tracked", "user + plain commits", nt, true) +
-    `<div class="row"><div class="name">agent ${kinds("agent")} · covered ${kinds("covered")} · merge ${kinds("agent-merge")}</div>`+
+    `<div class="row"><div class="name">agent ${kinds("agent")} · covered ${kinds("covered")} · merge ${kinds("agent-merge")} · aGiT-ops ${kinds("agit-ops")}</div>`+
       `<div class="bar"></div><div class="num">user ${kinds("user")} · untracked ${kinds("untracked")}</div></div>`;
 
   // tokens panel
@@ -431,18 +468,45 @@ function render(){
       }).join("")
     : `<div class="empty">none detected</div>`;
 
-  // commit log (newest first)
+  // commit log (newest first). Each line carries key token metrics; clicking
+  // opens the full commit message with a link to the commit on GitHub.
   const ordered = cs.slice().reverse();
-  const head = ordered.slice(0, LOG_CAP).map(c => {
-    const cls = AI_KINDS.has(c.kind) ? "ai" : "nontracked";
-    const badge = `<span class="badge ${cls}">${c.kind}</span>`;
+  LOG_ENTRIES = ordered;
+  const head = ordered.slice(0, LOG_CAP).map((c, i) => {
+    const cls = AI_KINDS.has(c.kind) ? "ai" : (c.kind==="agit-ops" ? "ops" : "nontracked");
+    const badge = `<span class="badge ${cls}">${esc(KIND_LABEL[c.kind]||c.kind)}</span>`;
     const lc = (c.ins||c.del)?`<span class="lc"><span class="add">+${fmt(c.ins)}</span> <span class="rem">−${fmt(c.del)}</span></span>`:"";
-    const m = c.eff_model?` <span class="lc">${esc(c.eff_model)}</span>`:"";
-    return `<div class="entry ${cls}"><span class="sha">${esc(c.short)}</span>${badge}`+
-      `<span class="ksub">${esc(c.subject)}</span>${lc}${m}</div>`;
+    const m = c.eff_model?`<span class="lc">${esc(c.eff_model)}</span>`:"";
+    return `<div class="entry ${cls}" data-i="${i}"><span class="sha">${esc(c.short)}</span>${badge}`+
+      `<span class="ksub">${esc(c.subject)}</span>${lc}${tokenBrief(c.tokens)}${m}`+
+      `<div class="detail" id="detail-${i}" hidden></div></div>`;
   }).join("");
   $("commitlog").innerHTML = (head || `<div class="empty">no commits</div>`) +
-    (ordered.length>LOG_CAP ? `<div class="more">… ${fmt(ordered.length-LOG_CAP)} more</div>` : "");
+    (ordered.length>LOG_CAP ? `<div class="more">… ${fmt(ordered.length-LOG_CAP)} more (narrow the filters to see them)</div>` : "");
+}
+
+function kfmt(n){ n=n||0; return n>=1000 ? (n/1000).toFixed(n>=10000?0:1)+"k" : ""+n; }
+function tokenBrief(t){
+  if(!t) return "";
+  const parts=[];
+  if(t.output) parts.push(`<span class="tok out">${kfmt(t.output)} out</span>`);
+  if(t.input) parts.push(`<span class="tok">${kfmt(t.input)} in</span>`);
+  if(t.cache_read) parts.push(`<span class="tok dim">${kfmt(t.cache_read)} cache</span>`);
+  return parts.length ? `<span class="lc">${parts.join(" ")}</span>` : "";
+}
+function toggleDetail(i){
+  const c = LOG_ENTRIES[i], detail = $("detail-"+i);
+  if(!c || !detail) return;
+  if(detail.hidden){
+    const link = c.url ? `<a href="${esc(c.url)}" target="_blank" rel="noopener">view on GitHub ↗</a>` : "";
+    const span = (c.started||c.ended)
+      ? `<div class="dmeta">AI conversation: ${esc(c.started||"?")} → ${esc(c.ended||"?")}</div>` : "";
+    detail.innerHTML = `<div class="dhead">${esc(c.short)} ${link}</div>${span}`+
+      `<pre class="dmsg">${esc(c.message||"(no message recorded)")}</pre>`;
+    detail.hidden = false;
+  } else {
+    detail.hidden = true;
+  }
 }
 
 function card(label, value, note, amber){
@@ -484,15 +548,43 @@ async function refresh(){
     syncFilters(); render();
   } catch(e) { /* server stopped or offline (static file): keep the last view */ }
 }
+// --- time range ---
+const DAY = 86400;
+function dateToTs(value, endOfDay){
+  if(!value) return 0;
+  const ts = Date.parse(value + "T00:00:00Z")/1000;
+  return isNaN(ts) ? 0 : (endOfDay ? ts + DAY - 1 : ts);
+}
+function applyPeriod(){
+  const v = $("f-period").value;
+  if(v === "" ){ state.fromTs = 0; state.toTs = 0; $("f-from").value=""; $("f-to").value=""; }
+  else if(v === "custom"){ state.fromTs = dateToTs($("f-from").value,false); state.toTs = dateToTs($("f-to").value,true); }
+  else {
+    state.fromTs = Math.floor(Date.now()/1000) - (+v)*DAY; state.toTs = 0;
+    $("f-from").value=""; $("f-to").value="";
+  }
+}
+
 function init(){
   syncFilters();
   $("f-author").onchange = e => { state.author = e.target.value; render(); };
   $("f-backend").onchange = e => { state.backend = e.target.value; render(); };
   $("f-model").onchange = e => { state.model = e.target.value; render(); };
+  $("f-period").onchange = () => { applyPeriod(); render(); };
+  const onDate = () => { $("f-period").value = "custom"; applyPeriod(); render(); };
+  $("f-from").onchange = onDate;
+  $("f-to").onchange = onDate;
   $("reset").onclick = () => {
-    state.author=state.backend=state.model="";
+    state.author=state.backend=state.model=""; state.fromTs=state.toTs=0;
+    $("f-period").value=""; $("f-from").value=""; $("f-to").value="";
     syncFilters(); render();
   };
+  // Click a commit-log line to open its full message + GitHub link.
+  $("commitlog").addEventListener("click", e => {
+    if(e.target.closest("a")) return;  // let the GitHub link work
+    const entry = e.target.closest(".entry");
+    if(entry) toggleDetail(+entry.dataset.i);
+  });
   render();
   setInterval(refresh, REFRESH_MS);
 }

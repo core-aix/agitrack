@@ -15,6 +15,7 @@ import webbrowser
 
 from agit.git import GitRepo
 from agit.metrics.collect import build_dashboard
+from agit.metrics.github import resolve_logins
 from agit.metrics.web import dashboard_data, format_html
 
 DEFAULT_HOST = "127.0.0.1"
@@ -34,10 +35,15 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(404, "not found")
 
     def _html(self) -> bytes:
-        return format_html(build_dashboard(self.repo)).encode("utf-8")
+        return format_html(self._dashboard()).encode("utf-8")
 
     def _data(self) -> bytes:
-        return json.dumps(dashboard_data(build_dashboard(self.repo))).encode("utf-8")
+        return json.dumps(dashboard_data(self._dashboard())).encode("utf-8")
+
+    def _dashboard(self):
+        # resolve_logins is cached with a TTL, so frequent refreshes don't
+        # re-hit the GitHub API; it returns {} when gh is unavailable.
+        return build_dashboard(self.repo, sha_logins=resolve_logins(self.repo))
 
     def _respond(self, content_type: str, body: bytes) -> None:
         self.send_response(200)

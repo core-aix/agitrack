@@ -119,6 +119,9 @@ header{padding:72px 0 40px;position:relative}
 .dot.r{background:#3d2626}.dot.y{background:#3d3526}.dot.g{background:#263d2e}
 .term-bar .title{margin-left:8px}
 .term-body{padding:18px 20px;font-size:14px;overflow-x:auto}
+.shot{display:block;width:100%;height:auto;border-top:1px solid var(--line)}
+a:has(.shot){border-bottom:none;display:block}
+a:has(.shot):hover{background:none}
 pre{font-family:var(--mono);white-space:pre;line-height:1.55}
 .p{color:var(--phosphor)} .o{color:var(--amber)} .d{color:var(--fg-dim)} .w{color:var(--fg)} .e{color:var(--red)}
 
@@ -177,6 +180,7 @@ footer .sha{font-size:12px}
     <div class="hero-actions reveal r4">
       <a class="btn" href="https://github.com/core-aix/agit">git clone the repo</a>
       <a class="btn alt" href="#install">install &amp; run</a>
+      <a class="btn alt" href="#dashboard">see the dashboard</a>
     </div>
   </header>
 
@@ -265,6 +269,50 @@ Added --version using the package metadata; prints and exits.
           <p>Input, output, and cache token counts per commit, straight from the backend's session
           record: a price tag on every change.</p>
         </div>
+      </div>
+    </section>
+
+    <section class="commit agent" id="dashboard">
+      <div class="commit-head">
+        <span class="sha">b7e1d09</span>
+        <span class="subject"><span class="tag">&lt;agent&gt;</span> see the whole repo at a glance</span>
+      </div>
+      <h2>A live dashboard of what the agents did.</h2>
+      <p>Run <span class="p">agit --dashboard</span> (or <span class="p">agit -d</span>) and aGiT serves a
+      live, auto-refreshing dashboard on <strong>localhost</strong> and opens it in your browser. Every
+      number is computed from commit metadata alone, so it's identical on every clone — no database,
+      no tracking server.</p>
+      <div class="term">
+        <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="title">agit --dashboard · localhost</span></div>
+        <a href="images/dashboard.png" target="_blank"><img class="shot" src="images/dashboard.png" loading="lazy"
+          alt="The aGiT dashboard: coverage, aGiT-tracked AI vs non-tracked lines, token totals, and per-backend / model / committer breakdowns, in a CRT terminal theme."></a>
+      </div>
+      <div class="branches" style="margin-top:18px">
+        <div class="branch" data-ref="tracked AI vs non-tracked">
+          <h3>Honest provenance</h3>
+          <p>Lines aGiT tracked as the agent's, versus everything else — it never claims a human wrote
+          what the model did, even when a person made the commit.</p>
+        </div>
+        <div class="branch" data-ref="committer · backend · model · period">
+          <h3>Filter live</h3>
+          <p>Narrow the whole dashboard to one committer (merged to their GitHub ID), a backend, a
+          model, or a time range — recomputed instantly in the browser.</p>
+        </div>
+        <div class="branch" data-ref="tokens · loops · commit log">
+          <h3>Cost &amp; drill-down</h3>
+          <p>Token totals and an efficiency ratio, a heads-up when a conversation loops, and a commit
+          log you can click to read the full message and jump to the commit on GitHub.</p>
+        </div>
+      </div>
+      <div class="steps" style="margin-top:22px">
+        <div class="step"><div>
+          <code>agit --dashboard</code>
+          <div class="note">serves on localhost and opens your browser; press Ctrl-C to stop</div>
+        </div></div>
+        <div class="step"><div>
+          <code>agit -d text</code>
+          <div class="note">prints a one-shot plain-text report instead — handy for piping or pasting into an issue</div>
+        </div></div>
       </div>
     </section>
 

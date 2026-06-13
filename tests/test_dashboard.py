@@ -89,6 +89,22 @@ def _demo_repo(tmp_path: Path) -> GitRepo:
     return repo
 
 
+def test_agit_integration_merge_is_classified_as_ops_not_untracked(tmp_path):
+    repo = GitRepo.init(tmp_path)
+    # aGiT's own auto-merge bringing base into a session turn branch.
+    repo._run(
+        ["git", "commit", "--allow-empty", "-m", "Merge branch 'dev' into agit/claude/session-1/t2"],
+    )
+
+    dash = build_dashboard(repo)
+    ops = next(s for s in dash.stats if s.subject.startswith("Merge branch"))
+    assert ops.kind == "agit-ops"  # an aGiT control, not stray untracked work
+    assert dash.count("agit-ops") == 1
+    assert ops.kind in ("agent", "covered", "agent-merge", "user", "agit-ops")
+    # It counts toward aGiT coverage, and is not lumped into non-tracked lines.
+    assert dash.nontracked_lines == (0, 0)
+
+
 def test_dashboard_classifies_every_commit_kind(tmp_path):
     dash = build_dashboard(_demo_repo(tmp_path))
 
@@ -262,6 +278,47 @@ def test_resolve_committers_keeps_distinct_people_apart():
     assert len(set(resolve_committers(stats).values())) == 2
 
 
+def test_resolve_committers_uses_github_logins_when_provided():
+    a = _person("Pat", "pat@personal.test")
+    b = _person("Patricia Example", "pat.example@work.test")
+    # gh maps both commits to the same login despite unrelated names/emails.
+    labels = resolve_committers([a, b], {a.sha: "patexample", b.sha: "patexample"})
+    assert set(labels.values()) == {"patexample"}
+
+
+def test_resolve_logins_falls_back_to_empty_without_gh(monkeypatch, tmp_path):
+    from agit.metrics import github
+
+    github._reset_cache_for_tests()
+    monkeypatch.setattr(github.shutil, "which", lambda _name: None)  # gh not installed
+    repo = GitRepo.init(tmp_path)
+    # No gh → empty mapping (never raises), so callers fall back to the heuristic.
+    assert github.resolve_logins(repo) == {}
+
+
+def test_resolve_logins_parses_gh_tsv_and_caches(monkeypatch, tmp_path):
+    from agit.metrics import github
+
+    repo = GitRepo.init(tmp_path)  # before patching subprocess (git uses it too)
+    github._reset_cache_for_tests()
+    monkeypatch.setattr(github.shutil, "which", lambda _name: "/usr/bin/gh")
+    calls = {"n": 0}
+
+    class _Result:
+        returncode = 0
+        stdout = "sha1\toctocat\nsha2\thubber\n"
+
+    def fake_run(*args, **kwargs):
+        calls["n"] += 1
+        return _Result()
+
+    monkeypatch.setattr(github.subprocess, "run", fake_run)
+
+    assert github.resolve_logins(repo) == {"sha1": "octocat", "sha2": "hubber"}
+    github.resolve_logins(repo)  # cached: no second subprocess call
+    assert calls["n"] == 1
+
+
 # --- loop detection ------------------------------------------------------------
 
 
@@ -366,11 +423,30 @@ def test_render_html_is_self_contained_with_embedded_data(tmp_path):
     assert html.startswith("<!DOCTYPE html>")
     assert "aGiT dashboard" in html
     # The page ships its data inline so it renders instantly, then polls /data
-    # to stay live. The filter UI is present.
+    # to stay live. The filter UI is present, including the time-range controls.
     data = _embedded_data(html)
     assert len(data["commits"]) == 7
-    for control in ('id="f-author"', 'id="f-backend"', 'id="f-model"'):
+    for control in ('id="f-author"', 'id="f-backend"', 'id="f-model"', 'id="f-period"', 'id="f-from"'):
         assert control in html
+    # Each commit carries the data the log view needs: a commit time for the
+    # time filter, the full message for the click-to-open detail, and token
+    # metrics for the per-line figures.
+    sample = data["commits"][-1]
+    assert sample["ts"] > 0
+    assert sample["message"]
+    assert "tokens" in sample
+
+
+def test_dashboard_data_links_commits_to_github_when_remote_present(tmp_path):
+    dash = build_dashboard(_demo_repo(tmp_path))
+    dash.commit_base = "https://github.com/core-aix/agit/commit/"  # as a GitHub remote would yield
+    data = dashboard_data(dash)
+    assert all(c["url"].startswith("https://github.com/core-aix/agit/commit/") for c in data["commits"])
+
+
+def test_dashboard_data_omits_links_without_github_remote(tmp_path):
+    data = dashboard_data(build_dashboard(_demo_repo(tmp_path)))  # local repo, no remote
+    assert all(c["url"] == "" for c in data["commits"])
 
 
 # --- live localhost server -----------------------------------------------------

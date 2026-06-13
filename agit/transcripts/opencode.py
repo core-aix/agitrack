@@ -282,7 +282,19 @@ def _build_turn(user_message: dict, assistants: list[dict], session_model: str |
         final_response=final_response,
         tokens=tokens,
         model=model,
+        started_at=_message_time(user_info),
+        ended_at=_message_time(_as_dict(final_info)) or _message_time(user_info),
     )
+
+
+def _message_time(info: dict) -> int | None:
+    """Epoch seconds a message was created, from OpenCode's `time` block."""
+    time_block = info.get("time")
+    if not isinstance(time_block, dict):
+        return None
+    stamp = time_block.get("created") or time_block.get("updated")
+    seconds = _to_seconds(stamp) if stamp is not None else 0.0
+    return int(seconds) or None
 
 
 def _extract_json_object(output: str) -> str | None:

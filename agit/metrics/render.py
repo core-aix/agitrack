@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from agit.git import GitRepo
 from agit.metrics.collect import Dashboard, build_dashboard
+from agit.metrics.github import resolve_logins
 
 _TOKEN_ORDER = [
     ("input", "input"),
@@ -26,7 +27,7 @@ _TOKEN_ORDER = [
 
 
 def render_dashboard(repo: GitRepo, ref: str = "HEAD") -> str:
-    return format_dashboard(build_dashboard(repo, ref))
+    return format_dashboard(build_dashboard(repo, ref, sha_logins=resolve_logins(repo)))
 
 
 def format_dashboard(dash: Dashboard) -> str:
