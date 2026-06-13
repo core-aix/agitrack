@@ -1,18 +1,21 @@
-"""Backend-made commits get aGiT's trace/metadata attached (issue #35).
+"""Backend-made commits get aGiT's trace/metadata attached (issues #35, #58).
 
 Some backends commit on their own (a Claude Code hook, or an agent told to run
 `git commit`). Those commits leave the worktree clean, so aGiT's normal
-stage-and-commit path never runs and the turn's provenance was lost. Option A
-(decided on the issue): amend the backend's latest commit with the interaction
-trace and metadata; the metadata's ``covered_commits`` line records the
-pre-amend hashes of every commit it accounts for.
+stage-and-commit path never runs and the turn's provenance was lost.
+
+Amending the backend's latest commit (the original #35 fix) changed its hash,
+which broke references the agent had already published in PRs and issues
+(#58). The trace/metadata now ride a *cover commit* instead — the GitHub PR
+merge-commit shape: tree of the backend's head, parents (turn start, backend
+head) — so every backend-made hash stays exactly what the agent reported.
 """
 
 from pathlib import Path
 from types import SimpleNamespace
 
 from agit.backends.base import TokenUsage
-from agit.commits import build_agent_commit_message, build_backend_amend_message
+from agit.commits import build_agent_commit_message
 from agit.config import AgitState
 from agit.git import GitRepo
 from agit.proxy.commit_engine import CommitEngine
@@ -63,60 +66,7 @@ def _commit_turns(repo: GitRepo, state: AgitState, backend_commits: list[str], *
     )
 
 
-# --- message builders --------------------------------------------------------
-
-
-def test_amend_message_keeps_original_and_appends_trace_and_metadata():
-    message = build_backend_amend_message(
-        original_message="fix the parser\n\nDetails the agent wrote itself.",
-        trace=[{"role": "user", "content": "fix it"}, {"role": "agent", "content": "fixed"}],
-        backend="claude",
-        backend_session_id="ses-1",
-        agit_session_id="agit-1",
-        model="m1",
-        session_name="s1",
-        covered_commits=["abc123", "def456"],
-    )
-    assert message.startswith("<aGiT> fix the parser\n")
-    assert "Details the agent wrote itself." in message
-    assert "# Interaction Trace" in message
-    assert "## User" in message and "fix it" in message
-    assert "# aGiT Metadata" in message
-    assert "commit_type: agent" in message
-    assert "covered_commits: abc123 def456" in message
-
-
-def test_amend_message_does_not_double_prefix_subject():
-    message = build_backend_amend_message(
-        original_message="<aGiT> already prefixed",
-        trace=[],
-        backend="claude",
-        backend_session_id=None,
-        agit_session_id="agit-1",
-        model=None,
-        covered_commits=["abc123"],
-    )
-    assert message.startswith("<aGiT> already prefixed\n")
-    assert "<aGiT> <aGiT>" not in message
-
-
-def test_amend_message_tag_can_be_disabled():
-    # The tag_backend_commits config option (README: default true) removes the
-    # <aGiT> subject tag while keeping the trace/metadata in the body.
-    message = build_backend_amend_message(
-        original_message="fix the parser",
-        trace=[{"role": "user", "content": "fix it"}],
-        backend="claude",
-        backend_session_id=None,
-        agit_session_id="agit-1",
-        model=None,
-        covered_commits=["abc123"],
-        tag=False,
-    )
-    assert message.startswith("fix the parser\n")
-    assert "<aGiT>" not in message
-    assert "# aGiT Metadata" in message
-    assert "covered_commits: abc123" in message
+# --- message builder ----------------------------------------------------------
 
 
 def test_agent_commit_message_covered_commits_line():
@@ -134,28 +84,50 @@ def test_agent_commit_message_covered_commits_line():
     assert "covered_commits" not in without
 
 
-# --- commit_turns amend path -------------------------------------------------
+# --- commit_turns cover path ---------------------------------------------------
 
 
-def test_clean_tree_amends_latest_backend_commit(tmp_path):
+def test_clean_tree_covers_backend_commits_without_rewriting_them(tmp_path):
     repo, _base = _repo_on_turn_branch(tmp_path)
     state = AgitState(tmp_path)
+    turn_start = repo.rev_parse("HEAD")
     first = _backend_commit(repo, "a.txt", "backend commit one")
     last = _backend_commit(repo, "b.txt", "backend commit two")
 
     committed = _commit_turns(repo, state, [first, last])
 
     assert committed is True
+    # The backend's commits keep their hashes AND their messages (#58): any
+    # reference the agent published (PR/issue comments) stays valid.
+    assert repo.rev_parse("HEAD^2") == last
+    assert repo.commit_message(first).startswith("backend commit one")
+    assert repo.commit_message(last).startswith("backend commit two")
+    # The cover commit is merge-shaped, GitHub-PR style: parents are the turn
+    # start and the backend's head, and its tree is the backend head's tree.
+    assert repo.parents("HEAD") == [turn_start, last]
+    assert repo.rev_parse("HEAD^{tree}") == repo.rev_parse(f"{last}^{{tree}}")
     head_message = repo.commit_message("HEAD")
-    assert head_message.startswith("<aGiT> backend commit two")
+    assert head_message.startswith("<aGiT> add the feature")
     assert "# Interaction Trace" in head_message
-    assert "add the feature" in head_message
-    # Covered hashes are recorded in SHORT form, the amended commit included.
     assert f"covered_commits: {repo.short_sha(first)} {repo.short_sha(last)}" in head_message
-    assert repo.rev_parse("HEAD") != last  # amend rewrote the hash
-    # The earlier backend commit is untouched (only HEAD may be amended).
-    assert repo.commit_message("HEAD^").startswith("backend commit one")
-    assert state.pending_trace() == []  # trace consumed by the amend
+    assert state.pending_trace() == []  # trace consumed by the cover commit
+
+
+def test_cover_commit_makes_first_parent_log_turn_level(tmp_path):
+    # `git log --first-parent` on the branch reads turn-by-turn: one aGiT
+    # cover commit, with the backend's commits reachable via the second parent.
+    repo, base = _repo_on_turn_branch(tmp_path)
+    state = AgitState(tmp_path)
+    first = _backend_commit(repo, "a.txt", "backend commit one")
+    last = _backend_commit(repo, "b.txt", "backend commit two")
+
+    assert _commit_turns(repo, state, [first, last]) is True
+
+    output = repo._run(
+        ["git", "log", "--first-parent", "--format=%s", f"{base}..HEAD"],
+    ).stdout.splitlines()
+    assert len(output) == 1
+    assert output[0].startswith("<aGiT> add the feature")
 
 
 def test_clean_tree_without_backend_commits_does_not_commit(tmp_path):
@@ -167,9 +139,9 @@ def test_clean_tree_without_backend_commits_does_not_commit(tmp_path):
     assert repo.rev_parse("HEAD") == head
 
 
-def test_amend_refused_when_head_is_not_the_latest_backend_commit(tmp_path):
-    # An aGiT commit sits on top of the backend's: amending would rewrite
-    # aGiT's own commit, so the engine must refuse.
+def test_cover_refused_when_head_is_not_the_latest_backend_commit(tmp_path):
+    # An aGiT commit sits on top of the backend's: it already accounts for the
+    # turn, so the engine must not stack another cover commit.
     repo, _base = _repo_on_turn_branch(tmp_path)
     state = AgitState(tmp_path)
     backend_sha = _backend_commit(repo, "a.txt", "backend commit")
@@ -198,41 +170,27 @@ def test_staged_changes_commit_lists_backend_commits_as_covered(tmp_path):
     assert repo.commit_message("HEAD^").startswith("backend commit")
 
 
-def test_commit_turns_honors_tag_backend_commits_off(tmp_path):
-    repo, _base = _repo_on_turn_branch(tmp_path)
-    state = AgitState(tmp_path)
-    sha = _backend_commit(repo, "a.txt", "backend commit")
-
-    committed = _commit_turns(repo, state, [sha], tag_backend_commits=False)
-
-    assert committed is True
-    head_message = repo.commit_message("HEAD")
-    assert head_message.startswith("backend commit\n")
-    assert "<aGiT>" not in head_message
-    assert f"covered_commits: {repo.short_sha(sha)}" in head_message  # metadata still attached
-
-
-def test_summary_amend_preserves_agit_tag():
-    # When a summary is later amended into an amended backend commit, the
-    # subject keeps its <aGiT> tag instead of being relabeled <aGiT>.
+def test_cover_commit_survives_summary_amend_with_parents_intact(tmp_path):
+    # The async summary (#8) amends the COVER commit — aGiT's own commit,
+    # created moments earlier — never the backend's. The amend keeps the merge
+    # shape, so the backend hashes stay reachable and stable.
     from agit.commits import apply_summary_to_message
 
-    message = build_backend_amend_message(
-        original_message="fix the parser",
-        trace=[{"role": "user", "content": "fix it"}],
-        backend="claude",
-        backend_session_id=None,
-        agit_session_id="agit-1",
-        model=None,
-        covered_commits=["abc123"],
-    )
-    summarized = apply_summary_to_message(message, "Rework the parser error paths")
-    assert summarized.startswith("<aGiT> Rework the parser error paths\n")
-    # The original subject is preserved under # Prompts, without its tag.
-    assert "fix the parser" in summarized.split("# Prompts")[1]
+    repo, _base = _repo_on_turn_branch(tmp_path)
+    state = AgitState(tmp_path)
+    turn_start = repo.rev_parse("HEAD")
+    backend_sha = _backend_commit(repo, "a.txt", "backend commit")
+    assert _commit_turns(repo, state, [backend_sha]) is True
+
+    message = repo.commit_message("HEAD")
+    repo.amend_commit(apply_summary_to_message(message, "Rework the parser error paths"))
+
+    assert repo.commit_message("HEAD").startswith("<aGiT> Rework the parser error paths")
+    assert repo.parents("HEAD") == [turn_start, backend_sha]
+    assert repo.commit_message(backend_sha).startswith("backend commit")
 
 
-def test_amend_in_actions_mode_accumulates_trace_first(tmp_path):
+def test_cover_in_actions_mode_accumulates_trace_first(tmp_path):
     repo, _base = _repo_on_turn_branch(tmp_path)
     state = AgitState(tmp_path)
     sha = _backend_commit(repo, "a.txt", "backend commit")
@@ -261,12 +219,26 @@ def _detection_runner(tmp_path):
     return runner, repo
 
 
-def test_uncovered_backend_commits_detects_only_unmarked_commits(tmp_path):
+def test_uncovered_backend_commits_detects_commits_after_last_agit_commit(tmp_path):
     runner, repo = _detection_runner(tmp_path)
-    plain = _backend_commit(repo, "a.txt", "backend's own commit")
-    _backend_commit(repo, "b.txt", AGIT_BODY)  # has metadata: covered
+    _backend_commit(repo, "a.txt", "covered by the aGiT commit after it")
+    _backend_commit(repo, "b.txt", AGIT_BODY)  # an aGiT commit covers everything before it
+    plain = _backend_commit(repo, "c.txt", "backend's own commit, not yet covered")
 
     assert runner._uncovered_backend_commits() == [plain]
+
+
+def test_uncovered_backend_commits_empty_after_cover_commit(tmp_path):
+    # Backend commits keep their metadata-less messages forever (#58), so the
+    # detector must not re-report them once a cover commit accounts for them —
+    # even while integration is still pending.
+    runner, repo = _detection_runner(tmp_path)
+    state = AgitState(tmp_path)
+    first = _backend_commit(repo, "a.txt", "backend commit one")
+    last = _backend_commit(repo, "b.txt", "backend commit two")
+    assert _commit_turns(repo, state, [first, last]) is True
+
+    assert runner._uncovered_backend_commits() == []
 
 
 def test_uncovered_backend_commits_empty_off_turn_branch(tmp_path):
@@ -280,7 +252,7 @@ def test_uncovered_backend_commits_empty_off_turn_branch(tmp_path):
 def test_uncovered_backend_commits_empty_without_worktree(tmp_path):
     runner, repo = _detection_runner(tmp_path)
     _backend_commit(repo, "a.txt", "backend's own commit")
-    runner.worktree = None  # --no-worktree mode: never amend the user's branch
+    runner.worktree = None  # --no-worktree mode: never touch the user's branch
 
     assert runner._uncovered_backend_commits() == []
 
@@ -312,7 +284,7 @@ def test_attach_defers_integration_while_parse_pending():
     assert runner.calls.started == 1  # kicked off the parse that will attach
 
 
-def test_attach_proceeds_after_amend():
+def test_attach_proceeds_after_cover():
     runner = _attach_runner(["abc"])
     runner._finish_agent_parse_if_ready = lambda **kw: True
     assert runner._attach_trace_to_backend_commits(100.0) is True

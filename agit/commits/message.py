@@ -11,10 +11,9 @@ DEFAULT_SUBJECT = "No subject provided"
 # whole subject line (prefix included) to that limit so it's never cut off.
 MAX_SUBJECT_WIDTH = 72
 MAX_BODY_WIDTH = 72
-# Subject tag for agent commits: commits aGiT creates from the agent's work
-# AND backend-made commits aGiT amends with its trace/metadata (issue #35).
-# For amended backend commits the tag is removable via the
-# "tag_backend_commits" config option (on by default).
+# Subject tag for agent commits: every commit aGiT creates from the agent's
+# work, including the cover commits placed on top of backend-made commits to
+# carry their trace/metadata (issues #35/#58).
 AGIT_SUBJECT_PREFIX = "<aGiT> "
 SECRET_MASK = "[REDACTED]"
 SECRET_ASSIGNMENT_RE = re.compile(
@@ -175,57 +174,6 @@ def _insert_before_version_line(lines: list[str], extra: list[str]) -> list[str]
     return lines + list(extra)
 
 
-def build_backend_amend_message(
-    *,
-    original_message: str,
-    trace: list[dict],
-    backend: str,
-    backend_session_id: str | None,
-    agit_session_id: str,
-    model: str | None,
-    token_usage: dict[str, int | None] | None = None,
-    trace_turn_limit: int = 5,
-    session_name: str | None = None,
-    covered_commits: list[str] | None = None,
-    tag: bool = True,
-) -> str:
-    """Message for amending a commit the backend made itself (issue #35).
-
-    Keeps the backend's own subject and body, prefixing the subject with
-    ``<aGiT> `` (unless *tag* is False — the ``tag_backend_commits`` config
-    option) so the log shows the commit was backend-made and aGiT-amended,
-    then appends the interaction trace and aGiT metadata.
-    ``covered_commits`` records the pre-amend hashes of every backend-made
-    commit this metadata accounts for — the amended commit itself plus any
-    earlier ones in the same turn.
-    """
-    original = _mask_secrets(original_message).strip()
-    subject, _, body = original.partition("\n")
-    if not subject.strip():
-        subject = DEFAULT_SUBJECT
-    already_tagged = subject.strip().startswith(AGIT_SUBJECT_PREFIX.strip())
-    if tag and not already_tagged:
-        subject = f"{AGIT_SUBJECT_PREFIX}{subject.strip()}"
-    lines = [subject]
-    if body.strip():
-        lines.extend(["", body.strip()])
-    lines.append("")
-    lines.extend(
-        _trace_and_metadata_lines(
-            trace=trace,
-            backend=backend,
-            backend_session_id=backend_session_id,
-            agit_session_id=agit_session_id,
-            model=model,
-            token_usage=token_usage,
-            trace_turn_limit=trace_turn_limit,
-            session_name=session_name,
-            covered_commits=covered_commits,
-        )
-    )
-    return "\n".join(lines).rstrip() + "\n"
-
-
 def _trace_and_metadata_lines(
     *,
     trace: list[dict],
@@ -264,8 +212,8 @@ def _trace_and_metadata_lines(
         ]
     )
     if covered_commits:
-        # Which commit hashes this trace/metadata accounts for (issue #35).
-        # For an amended backend commit the hash listed is its pre-amend id.
+        # The backend-made commits this trace/metadata accounts for (#35).
+        # Those commits are never rewritten, so the hashes stay valid (#58).
         lines.append(f"covered_commits: {' '.join(covered_commits)}")
     lines.extend(_token_metadata_lines(token_usage))
     if summary_metadata:

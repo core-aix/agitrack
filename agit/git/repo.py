@@ -116,6 +116,26 @@ class GitRepo:
         self._run(["git", "commit", "--amend", "-F", "-"], input_text=message)
         return self.short_sha("HEAD")
 
+    def cover_commit(self, message: str, *, first_parent: str, second_parent: str) -> str:
+        """Create a merge-shaped *cover* commit: the tree of ``second_parent``
+        with parents ``(first_parent, second_parent)`` — the same shape as a
+        GitHub PR merge commit. Used to attach aGiT's message on top of
+        backend-made commits without amending them, since an amend changes
+        their hashes and breaks references already published elsewhere (#58).
+        The checked-out branch (or detached HEAD) moves to the new commit; the
+        working tree is untouched because the tree is identical to HEAD's."""
+        tree = self.rev_parse(f"{second_parent}^{{tree}}")
+        sha = self._run(
+            ["git", "commit-tree", tree, "-p", first_parent, "-p", second_parent],
+            input_text=message,
+        ).stdout.strip()
+        self._run(["git", "reset", "--soft", sha])
+        return self.short_sha(sha)
+
+    def parents(self, ref: str = "HEAD") -> list[str]:
+        output = self._run(["git", "rev-list", "--parents", "-1", ref]).stdout.split()
+        return output[1:]
+
     def short_sha(self, ref: str = "HEAD") -> str:
         return self._run(["git", "rev-parse", "--short", ref]).stdout.strip()
 

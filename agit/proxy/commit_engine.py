@@ -69,7 +69,7 @@ import threading
 import time
 from typing import Callable
 
-from agit.commits import build_agent_commit_message, build_backend_amend_message
+from agit.commits import build_agent_commit_message
 from agit.git import GitRepo
 from agit.transcripts.opencode import SessionTurn
 from agit.transcripts import turns_after
@@ -159,7 +159,6 @@ class CommitEngine:
         session_name: str | None = None,
         accumulate_trace_only_on_commit: bool = False,
         backend_commits: list[str] | None = None,
-        tag_backend_commits: bool = True,
     ) -> bool:
         """Core of every agent-commit path.
 
@@ -187,13 +186,11 @@ class CommitEngine:
             the pending-user-merging logic can run even on failed attempts.
         backend_commits:
             Unintegrated commits the backend made itself this turn (full SHAs,
-            oldest first), issue #35.  With nothing staged, the latest of them
-            is amended to carry the trace/metadata; with staged changes, the
-            normal commit lists them in its ``covered_commits`` metadata.
-        tag_backend_commits:
-            Prefix an amended backend commit's subject with ``<aGiT> ``
-            (issue #35; the ``tag_backend_commits`` config option, on by
-            default).
+            oldest first), issue #35.  With nothing staged, a merge-shaped
+            *cover commit* carrying the trace/metadata is added on top of them
+            (their hashes never change — an amend would break references the
+            agent already published, #58); with staged changes, the normal
+            commit lists them in its ``covered_commits`` metadata.
 
         Commits are created immediately, without any LLM call: summarization
         runs in the background afterwards and is attached by amending the
@@ -216,12 +213,12 @@ class CommitEngine:
                 pre_commit_fn()
             self.repo.add_tracked()
             stage_untracked_fn(self.repo, self.state)
-            amend_backend_head = False
+            cover_backend_head = False
             if not self.repo.has_staged_changes():
-                if not self._head_is_amendable(backend_commits):
+                if not self._head_is_coverable(backend_commits):
                     return False
-                amend_backend_head = True
-            # Commit (or amend) will happen: accumulate trace and tokens now.
+                cover_backend_head = True
+            # Commit (or cover) will happen: accumulate trace and tokens now.
             for turn in turns:
                 if turn.user_prompt:
                     self.state.append_trace("user", turn.user_prompt)
@@ -289,58 +286,49 @@ class CommitEngine:
             self.repo.add_tracked()
             stage_untracked_fn(self.repo, self.state)
 
-            amend_backend_head = False
+            cover_backend_head = False
             if not self.repo.has_staged_changes():
-                if not self._head_is_amendable(backend_commits):
+                if not self._head_is_coverable(backend_commits):
                     return False
-                amend_backend_head = True
+                cover_backend_head = True
 
-            # Accumulate tokens only once we know the commit (or amend) will happen.
+            # Accumulate tokens only once we know the commit (or cover) will happen.
             for turn in turns:
                 self.state.add_token_usage(turn.tokens)
 
             subject_text = " / ".join(subject_prompts) if subject_prompts else f"{backend} changes"
 
         # The metadata lists covered hashes in short form (the full SHAs stay
-        # internal — _head_is_amendable compares them against rev-parse HEAD).
+        # internal — _head_is_coverable compares them against rev-parse HEAD).
+        # An aGiT commit accounts for itself; it lists only the backend-made
+        # commits it additionally covers (#35).
         covered_display = [self._short_sha(sha) for sha in backend_commits]
-        if amend_backend_head:
-            # The backend committed its own work, leaving the tree clean (#35):
-            # amend its latest commit so the trace/metadata land on the commit
-            # that made the change. The covered_commits metadata records the
-            # pre-amend hashes of every backend commit this turn produced.
-            commit_sha = self.repo.amend_commit(
-                build_backend_amend_message(
-                    original_message=self.repo.commit_message("HEAD"),
-                    trace=self.state.pending_trace(),
-                    backend=backend,
-                    backend_session_id=backend_session_id,
-                    agit_session_id=self.state.session_id,
-                    model=model or self.state.model,
-                    token_usage=self.state.pending_token_usage(),
-                    trace_turn_limit=self.state.trace_turn_limit,
-                    session_name=session_name,
-                    covered_commits=covered_display,
-                    tag=tag_backend_commits,
-                )
+        message = build_agent_commit_message(
+            latest_prompt=subject_text,
+            trace=self.state.pending_trace(),
+            backend=backend,
+            backend_session_id=backend_session_id,
+            agit_session_id=self.state.session_id,
+            model=model or self.state.model,
+            token_usage=self.state.pending_token_usage(),
+            trace_turn_limit=self.state.trace_turn_limit,
+            session_name=session_name,
+            covered_commits=covered_display or None,
+        )
+        if cover_backend_head:
+            # The backend committed its own work, leaving the tree clean (#35).
+            # Its commits keep their hashes — amending them broke references
+            # the agent had already published in PRs/issues (#58). Instead the
+            # trace/metadata ride a GitHub-PR-style merge-shaped cover commit
+            # on top: same tree as the backend's head, parents (turn start,
+            # backend head), so `git log --first-parent` reads turn-by-turn.
+            commit_sha = self.repo.cover_commit(
+                message,
+                first_parent=f"{backend_commits[0]}^",
+                second_parent=backend_commits[-1],
             )
         else:
-            commit_sha = self.repo.commit(
-                build_agent_commit_message(
-                    latest_prompt=subject_text,
-                    trace=self.state.pending_trace(),
-                    backend=backend,
-                    backend_session_id=backend_session_id,
-                    agit_session_id=self.state.session_id,
-                    model=model or self.state.model,
-                    token_usage=self.state.pending_token_usage(),
-                    trace_turn_limit=self.state.trace_turn_limit,
-                    session_name=session_name,
-                    # An aGiT commit accounts for itself; list only the
-                    # backend-made commits it additionally covers (#35).
-                    covered_commits=covered_display or None,
-                )
-            )
+            commit_sha = self.repo.commit(message)
         self.state.clear_trace()
 
         if on_commit_fn is not None:
@@ -356,18 +344,19 @@ class CommitEngine:
         except Exception:
             return sha[:7]
 
-    def _head_is_amendable(self, backend_commits: list[str]) -> bool:
+    def _head_is_coverable(self, backend_commits: list[str]) -> bool:
         """True when HEAD is the latest of the backend's own unintegrated
-        commits, so amending it attaches the trace to the commit that actually
-        made the change (#35). Never true for commits aGiT created (they carry
-        their own metadata) or for anything already integrated into base
-        (``backend_commits`` only ever lists commits ahead of base)."""
+        commits, so a cover commit on top attaches the trace to the commits
+        that actually made the change (#35). Never true for commits aGiT
+        created (they carry their own metadata) or for anything already
+        integrated into base (``backend_commits`` only ever lists commits
+        ahead of base)."""
         if not backend_commits:
             return False
         try:
             return self.repo.rev_parse("HEAD") == backend_commits[-1]
         except Exception as error:
-            self._debug(f"amend check failed: {error!r}")
+            self._debug(f"cover check failed: {error!r}")
             return False
 
     # ------------------------------------------------------------------
