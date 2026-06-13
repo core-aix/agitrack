@@ -489,24 +489,35 @@ header{padding:54px 0 22px}
 .meta .tag{color:var(--amber)}
 
 /* ---- filter bar ---- */
+/* Stays a single row while sticky: never wrap, so the frozen panel is one row
+   tall. (No overflow clipping — the custom-range popup hangs below the bar.) */
 .controls{position:sticky;top:0;z-index:20;margin:22px 0 30px;padding:14px 16px;background:var(--panel);
-  border:1px solid var(--line);border-bottom-width:3px;display:flex;flex-wrap:wrap;gap:18px;align-items:flex-end}
-.controls .prompt{color:var(--phosphor);font-weight:600;align-self:center}
+  border:1px solid var(--line);border-bottom-width:3px;display:flex;flex-wrap:nowrap;gap:16px;align-items:flex-end}
+.controls .prompt{color:var(--phosphor);font-weight:600;align-self:center;white-space:nowrap}
 .field{display:flex;flex-direction:column;gap:4px}
-.field label{font-size:11px;color:var(--amber);letter-spacing:.6px;text-transform:uppercase}
+.field label{font-size:11px;color:var(--amber);letter-spacing:.6px;text-transform:uppercase;white-space:nowrap}
 .field select{appearance:none;background:var(--ink);color:var(--fg);border:1px solid var(--line);
-  font-family:var(--mono);font-size:13.5px;padding:7px 30px 7px 11px;cursor:pointer;min-width:170px;
+  font-family:var(--mono);font-size:13.5px;padding:7px 30px 7px 11px;cursor:pointer;min-width:150px;
   background-image:linear-gradient(45deg,transparent 50%,var(--phosphor-dim) 50%),linear-gradient(135deg,var(--phosphor-dim) 50%,transparent 50%);
   background-position:calc(100% - 16px) 50%,calc(100% - 11px) 50%;background-size:5px 5px,5px 5px;background-repeat:no-repeat}
 .field select:focus{outline:none;border-color:var(--phosphor)}
-.field input[type=date]{background:var(--ink);color:var(--fg);border:1px solid var(--line);
+input[type=date]{background:var(--ink);color:var(--fg);border:1px solid var(--line);
   font-family:var(--mono);font-size:13px;padding:6px 9px;cursor:pointer}
-.field input[type=date]:focus{outline:none;border-color:var(--phosphor)}
-.field input[type=date]::-webkit-calendar-picker-indicator{filter:invert(.7) sepia(1) hue-rotate(90deg)}
-.scope{margin-left:auto;align-self:center;color:var(--fg-dim);font-size:12.5px}
-.scope b{color:var(--phosphor)}
+input[type=date]:focus{outline:none;border-color:var(--phosphor)}
+input[type=date]::-webkit-calendar-picker-indicator{filter:invert(.7) sepia(1) hue-rotate(90deg)}
+/* custom date range: a popup anchored under the period select */
+.period-field{position:relative}
+.daterange{position:absolute;top:100%;right:0;z-index:30;margin-top:8px;background:var(--panel);
+  border:1px solid var(--phosphor-dim);padding:12px 14px;display:flex;gap:12px;align-items:flex-end;
+  box-shadow:0 10px 28px rgba(0,0,0,.6)}
+.daterange[hidden]{display:none}
+.dr-field{display:flex;flex-direction:column;gap:4px}
+.dr-field label{font-size:11px;color:var(--amber);letter-spacing:.6px;text-transform:uppercase}
+.dr-done{cursor:pointer;border:1px solid var(--phosphor);color:var(--phosphor);background:transparent;
+  font-family:var(--mono);font-size:12.5px;padding:6px 12px}
+.dr-done:hover{background:var(--phosphor);color:var(--ink)}
 .reset{cursor:pointer;border:1px solid var(--amber);color:var(--amber);background:transparent;
-  font-family:var(--mono);font-size:12.5px;padding:7px 12px;align-self:flex-end}
+  font-family:var(--mono);font-size:12.5px;padding:7px 12px;align-self:flex-end;margin-left:auto;white-space:nowrap}
 .reset:hover{background:var(--amber);color:var(--ink)}
 
 h2.section{font-family:var(--display);font-size:27px;font-weight:400;color:var(--phosphor);letter-spacing:1px;
@@ -675,18 +686,21 @@ footer{margin-top:46px;padding-top:22px;border-top:1px dashed var(--line);color:
     <div class="field"><label for="f-author">committer</label><select id="f-author"></select></div>
     <div class="field"><label for="f-backend">backend</label><select id="f-backend"></select></div>
     <div class="field"><label for="f-model">model</label><select id="f-model"></select></div>
-    <div class="field"><label for="f-period">period</label><select id="f-period">
+    <div class="field period-field"><label for="f-period">period</label><select id="f-period">
       <option value="">all time</option>
       <option value="1">last 24 hours</option>
       <option value="7">last 7 days</option>
       <option value="30">last 30 days</option>
       <option value="90">last 90 days</option>
-      <option value="custom">custom range</option>
-    </select></div>
-    <div class="field"><label for="f-from">from</label><input type="date" id="f-from"></div>
-    <div class="field"><label for="f-to">to</label><input type="date" id="f-to"></div>
+      <option value="custom">custom range…</option>
+    </select>
+      <div class="daterange" id="daterange" hidden>
+        <div class="dr-field"><label for="f-from">from</label><input type="date" id="f-from"></div>
+        <div class="dr-field"><label for="f-to">to</label><input type="date" id="f-to"></div>
+        <button class="dr-done" id="dr-done">done</button>
+      </div>
+    </div>
     <button class="reset" id="reset">reset</button>
-    <span class="scope" id="scope"></span>
   </div>
 
   <h2 class="section">overview</h2>
@@ -882,7 +896,6 @@ function renderAgg(){
   const allLines = ai.total + nt.total, tok = AGG.tokens, eff = AGG.efficiency, kinds = k => AGG.kinds[k]||0;
 
   $("genat").textContent = "updated " + GENERATED;
-  $("scope").innerHTML = state.author ? `scope: <b>${esc(state.author)}</b>` : `scope: <b>entire team</b>`;
   $("count").textContent = `${fmt(total)} commits in view`;
 
   $("cards").innerHTML = [
@@ -1278,13 +1291,21 @@ function init(){
   $("f-author").onchange = e => { state.author = e.target.value; applyFilters(); };
   $("f-backend").onchange = e => { state.backend = e.target.value; applyFilters(); };
   $("f-model").onchange = e => { state.model = e.target.value; applyFilters(); };
-  $("f-period").onchange = () => { applyPeriod(); applyFilters(); };
+  // "custom range…" reveals a date-range popup anchored under the select; the
+  // presets and "all time" hide it.
+  const showDateRange = on => { $("daterange").hidden = !on; };
+  $("f-period").onchange = () => { showDateRange($("f-period").value === "custom"); applyPeriod(); applyFilters(); };
   const onDate = () => { $("f-period").value = "custom"; applyPeriod(); applyFilters(); };
   $("f-from").onchange = onDate;
   $("f-to").onchange = onDate;
+  $("dr-done").onclick = () => showDateRange(false);
+  // Dismiss the popup on a click outside the period control.
+  document.addEventListener("click", e => {
+    if(!$("daterange").hidden && !e.target.closest(".period-field")) showDateRange(false);
+  });
   $("reset").onclick = () => {
     state.author=state.backend=state.model="";
-    $("f-period").value=""; applyPeriod();  // back to all time → from/to show the full span
+    $("f-period").value=""; showDateRange(false); applyPeriod();  // back to all time → full span
     applyFilters();
   };
   // Click a commit-log line to open its full message + GitHub link. Clicks
