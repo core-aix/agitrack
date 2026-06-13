@@ -514,6 +514,14 @@ h2.section::before{content:"# ";color:var(--amber)}
 /* rendered Markdown inside the expanded message */
 .dmsg.md p{margin:7px 0}
 .dmsg.md .md-h{font-family:var(--mono);color:var(--amber);margin:11px 0 5px;font-size:13px;font-weight:600}
+/* Heading depth reads at a glance: structural sections (# …) brightest/largest,
+   the ## User/## Agent role one step down, and a message's own nested headings
+   smaller, dimmer and indented so they sit visibly under their role. md() maps a
+   source level L to <h(L+2)>, so these are # → h3, ## → h4, content → h5/h6. */
+.dmsg.md h3.md-h{font-size:15px;color:var(--amber)}
+.dmsg.md h4.md-h{font-size:13.5px;color:var(--phosphor)}
+.dmsg.md h5.md-h{font-size:12.5px;color:var(--ops);font-weight:500;padding-left:10px;border-left:2px solid var(--line)}
+.dmsg.md h6.md-h{font-size:12px;color:var(--fg-dim);font-weight:500;padding-left:20px;border-left:2px solid var(--line)}
 .dmsg.md ul{margin:6px 0 6px 18px} .dmsg.md li{margin:2px 0}
 .dmsg.md code{background:var(--panel-2);border:1px solid var(--line);padding:0 4px;color:var(--phosphor);font-size:12px}
 .dmsg.md strong{color:var(--fg)} .dmsg.md em{color:var(--fg)}
