@@ -156,8 +156,14 @@ def test_publish_pushes_and_a_clone_can_fetch_and_resume(tmp_path):
     subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
     (tmp_path / "src").mkdir()
     src = _init_repo(tmp_path / "src")
+    # Push the source's default branch (name varies with git's init.defaultBranch:
+    # main vs master) and point the bare remote's HEAD at it, so the clone checks
+    # it out and has a born HEAD — otherwise root_commit() (the fingerprint) is
+    # unborn in CI where the default branch differs.
+    branch = src.current_branch()
     subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=src.repo, check=True)
-    subprocess.run(["git", "push", "-q", "origin", "HEAD:refs/heads/main"], cwd=src.repo, check=True)
+    subprocess.run(["git", "push", "-q", "origin", f"HEAD:refs/heads/{branch}"], cwd=src.repo, check=True)
+    subprocess.run(["git", "-C", str(remote), "symbolic-ref", "HEAD", f"refs/heads/{branch}"], check=True)
 
     result = SharedSessionStore(src).publish(
         github_id="alice",
