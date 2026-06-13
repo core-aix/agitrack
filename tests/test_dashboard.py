@@ -514,6 +514,18 @@ def test_render_html_has_unreachable_banner_and_clear_kind_labels(tmp_path):
         assert level in html
 
 
+def test_filter_bar_is_single_row_with_a_custom_range_popup(tmp_path):
+    html = render_html(_demo_repo(tmp_path))
+    # The sticky filter bar stays a single row (never wraps) when frozen.
+    assert "flex-wrap:nowrap" in html
+    # The redundant "scope" readout (it just echoed the committer filter) is gone.
+    assert 'id="scope"' not in html
+    # from/to are no longer standalone fields — they live in a custom-range popup
+    # revealed by selecting "custom range…".
+    assert 'id="daterange"' in html and 'id="dr-done"' in html
+    assert 'id="f-from"' in html and 'id="f-to"' in html  # still present, inside the popup
+
+
 def test_log_page_paginates_and_clamps(tmp_path):
     from agit.metrics.web import log_page
 
