@@ -29,9 +29,14 @@ class ProxyAgent(Protocol):
         """Byte size of the session transcript (a cheap stat), or None — for a fast
         'is the shared copy current?' check without reading the whole file."""
 
-    def import_shared_session(self, repo: Path, session_id: str, transcript: str) -> bool:
+    def has_local_session(self, repo: Path, session_id: str) -> bool:
+        """Whether ``repo`` already holds this session locally (so resuming it would
+        keep the local copy unless explicitly overwritten)."""
+
+    def import_shared_session(self, repo: Path, session_id: str, transcript: str, *, overwrite: bool = False) -> bool:
         """Install a shared transcript so the session can be resumed in ``repo``.
-        Returns True on success; False if unsupported."""
+        With ``overwrite`` it replaces an existing local copy (pull-latest). Returns
+        True on success; False if unsupported."""
 
     def new_session_id(self) -> str | None:
         """A session id to start a fresh session with, or None to let the
@@ -83,7 +88,10 @@ class OpenCodeProxyAgent:
     def transcript_size(self, repo: Path, session_id: str) -> int | None:
         return None
 
-    def import_shared_session(self, repo: Path, session_id: str, transcript: str) -> bool:
+    def has_local_session(self, repo: Path, session_id: str) -> bool:
+        return False
+
+    def import_shared_session(self, repo: Path, session_id: str, transcript: str, *, overwrite: bool = False) -> bool:
         return False
 
     def new_session_id(self) -> str | None:
@@ -138,8 +146,11 @@ class ClaudeProxyAgent:
     def transcript_size(self, repo: Path, session_id: str) -> int | None:
         return claude_session.session_transcript_size(repo, session_id)
 
-    def import_shared_session(self, repo: Path, session_id: str, transcript: str) -> bool:
-        return claude_session.import_shared_session(repo, session_id, transcript)
+    def has_local_session(self, repo: Path, session_id: str) -> bool:
+        return claude_session.has_imported_session(repo, session_id)
+
+    def import_shared_session(self, repo: Path, session_id: str, transcript: str, *, overwrite: bool = False) -> bool:
+        return claude_session.import_shared_session(repo, session_id, transcript, overwrite=overwrite)
 
     def new_session_id(self) -> str | None:
         # Claude accepts an explicit session id, so aGiT picks one up front and

@@ -797,6 +797,9 @@ class ProxyRunner:
         # multiplexer. Additional sessions are appended by `_new_session`.
         self.sessions = [self.active]
         self._reconcile_sessions_on_startup()
+        # Reclaim dangling shared-session snapshots from prior runs, in the
+        # background so startup never waits on it (issue #55).
+        threading.Thread(target=lambda: self._sweep_orphan_shared_sessions(fetch=True), daemon=True).start()
         self.old_attrs = termios.tcgetattr(sys.stdin.fileno())
         try:
             self._enter_host_screen()
@@ -2504,6 +2507,19 @@ class ProxyRunner:
         # Operates on the base repo: it owns the remote and the shared object db.
         return SharedSessionStore(self.base_repo)
 
+    def _sweep_orphan_shared_sessions(self, *, fetch: bool) -> None:
+        # Reclaim dangling shared-session snapshots (old/unshared versions) left by
+        # rewrites — only when this repo has actually used sharing (the ref exists),
+        # so unrelated repos pay nothing. Only touches genuine session snapshots,
+        # never other unreachable commits. Best-effort.
+        try:
+            store = self._shared_store()
+            if not self.base_repo.ref_exists(store.ref):
+                return
+            store.cleanup_orphans(fetch=fetch)
+        except Exception as error:
+            self._debug(f"orphan-session sweep failed: {error!r}")
+
     def _share_session(self) -> None:
         backend = self.backend
         if not getattr(backend, "supports_session_sharing", False):
@@ -2854,7 +2870,27 @@ class ProxyRunner:
             self._set_message("That shared session is incomplete; cannot resume it.")
             self._render()
             return
-        if not self.backend.import_shared_session(self.base_repo.repo, session_id, transcript):
+        # If this conversation is already live, just switch to it — never overwrite a
+        # running session. Otherwise, if a (dormant) local copy exists, ask whether to
+        # pull the shared version (the "continue on another machine" sync) or keep the
+        # local one. With no local copy, import fresh.
+        already_live = any(
+            getattr(getattr(s, "state", None), "backend_session_id", None) == session_id for s in self.sessions
+        )
+        overwrite = False
+        if not already_live and self.backend.has_local_session(self.base_repo.repo, session_id):
+            age = self._format_age(entry.manifest["updated"]) if entry.manifest.get("updated") else "earlier"
+            pick = self._select_popup(
+                f"You already have a local copy of {entry.display}.\n"
+                f"The shared version was updated {age}. Which do you want to continue?",
+                ["Pull the shared version (replace my local copy)", "Keep my local copy"],
+            )
+            if pick is None:
+                self._set_message("Cancelled.")
+                self._render()
+                return
+            overwrite = pick.startswith("Pull")
+        if not self.backend.import_shared_session(self.base_repo.repo, session_id, transcript, overwrite=overwrite):
             self._set_message("Could not install the shared session for resume.")
             self._render()
             return
@@ -4753,6 +4789,9 @@ class ProxyRunner:
             finally:
                 self.active = saved
         self._delete_orphan_merged_branches()
+        # Reclaim any dangling shared-session snapshots before leaving (offline:
+        # no network on the exit path). Belt-and-suspenders to the startup sweep.
+        self._sweep_orphan_shared_sessions(fetch=False)
 
     def _finalize_summary_then_integrate_on_exit(self) -> None:
         # Give the current session's in-flight commit summary a short grace period
