@@ -114,3 +114,14 @@ This is the design aGiT targets for running several sessions at once. Foundation
 - Check that the backend's CLI is installed (on `PATH`) before launching it. If it is not, show install instructions and let the user install it or choose a different (installed) backend; backend switching is likewise blocked for backends that are not installed.
 - `agit --backend <claude|opencode>` selects the backend for a run and saves it as the new global default.
 - Switching backends saves the current backend's session id and restores the target backend's last session id for the repository, so each backend keeps its own conversation.
+
+## Self-Update
+
+- aGiT can update itself in place. It detects how it was installed: **source-linked** (importable from a git checkout of its own source — the editable `pip install -e .`) or **package** (installed as a wheel). Implemented in `agit/update/`.
+- Source-linked: compare the current branch against its upstream remote branch (after a `git fetch`); an update is available when the local branch is behind. Package: compare the installed version against the latest published one (`pip index versions`).
+- Check for updates at startup and periodically while running (every `timings.update_check_seconds`, default 300s). The periodic check runs on a worker thread so the terminal never blocks on network I/O.
+- When an update is available, prompt the user — at startup (before launching) and during a session (a status-bar notice plus the `update` command in the `Ctrl-G` menu).
+- Never surface an update prompt while a merge / conflict resolution is in progress in any session (active or a background session integrating its turn); the notice is held until the merge is done, and an accepted update is likewise deferred.
+- If the user accepts during a session, apply the update only once **every session has finished and all commits are integrated** (no agent in flight, no pending parse/merge/summary, no running background session), then re-exec aGiT (`python -m agit`) so the new code loads.
+- Source updates are fast-forward only and abort (with a message) when the checkout is dirty or has diverged from upstream, so an automatic update never clobbers local development. Package updates run `pip install --upgrade`.
+- Update checks are on by default; the user can turn them off via the "stop checking" choice or `check_for_updates: false` in `~/.agit/config.json`. Scripted/non-TTY runs never prompt.

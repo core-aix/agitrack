@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 from textwrap import shorten, wrap
 
 from agit import __version__
@@ -58,6 +59,8 @@ def build_agent_commit_message(
     summary: str | None = None,
     summary_metadata: list[str] | None = None,
     covered_commits: list[str] | None = None,
+    started_at: int | None = None,
+    ended_at: int | None = None,
 ) -> str:
     if summary:
         # The summary leads (issue #8): its first line becomes the subject, the
@@ -89,6 +92,8 @@ def build_agent_commit_message(
             prompts=prompts,
             summary_metadata=summary_metadata,
             covered_commits=covered_commits,
+            started_at=started_at,
+            ended_at=ended_at,
         )
     )
     return "\n".join(lines).rstrip() + "\n"
@@ -142,16 +147,27 @@ def summary_metadata_lines(*, model: str | None, tokens_input: int = 0, tokens_o
     return lines
 
 
+def _is_summary_header(line: str) -> bool:
+    """A line that is only the word "summary" plus non-letters — e.g. ``Summary``,
+    ``Summary:``, ``## Summary``, ``**Summary**``. Models sometimes emit such a
+    header as the first line; left alone it becomes a useless commit subject."""
+    return re.sub(r"[^a-zA-Z]", "", line).lower() == "summary"
+
+
 def _summary_lead_lines(summary: str) -> list[str]:
     """Subject + leading body for a summarized message.
 
     Mirrors the prompt-led layout: the summary's first line is the subject
     (a truncated subject flows straight into its full text, no blank line),
     and the rest of the summary follows as the first paragraph of the body —
-    there is no separate ``# Summary`` section.
+    there is no separate ``# Summary`` section. A leading bare "Summary" header
+    line is skipped so the subject is never just the word "summary".
     """
     text_lines = _mask_secrets(summary).strip().splitlines()
-    first_index = next((i for i, line in enumerate(text_lines) if line.strip()), None)
+    first_index = next(
+        (i for i, line in enumerate(text_lines) if line.strip() and not _is_summary_header(line)),
+        None,
+    )
     first_line = text_lines[first_index] if first_index is not None else DEFAULT_SUBJECT
     remainder = text_lines[first_index + 1 :] if first_index is not None else []
     while remainder and not remainder[0].strip():
@@ -187,6 +203,8 @@ def _trace_and_metadata_lines(
     covered_commits: list[str] | None,
     prompts: str | None = None,
     summary_metadata: list[str] | None = None,
+    started_at: int | None = None,
+    ended_at: int | None = None,
 ) -> list[str]:
     lines: list[str] = []
     if prompts and prompts.strip():
@@ -215,6 +233,12 @@ def _trace_and_metadata_lines(
         # The backend-made commits this trace/metadata accounts for (#35).
         # Those commits are never rewritten, so the hashes stay valid (#58).
         lines.append(f"covered_commits: {' '.join(covered_commits)}")
+    # When the AI-driven conversation began and ended (UTC, ISO-8601), so the
+    # dashboard can report durations and filter by time.
+    if started_at is not None:
+        lines.append(f"agent_started_at: {_iso_utc(started_at)}")
+    if ended_at is not None:
+        lines.append(f"agent_ended_at: {_iso_utc(ended_at)}")
     lines.extend(_token_metadata_lines(token_usage))
     if summary_metadata:
         lines.extend(summary_metadata)
@@ -337,6 +361,11 @@ def _append_positive(lines: list[str], key: str, value: object) -> None:
 def _int_value(token_usage: dict[str, int | None], key: str) -> int:
     value = token_usage.get(key)
     return value if isinstance(value, int) else 0
+
+
+def _iso_utc(epoch_seconds: int) -> str:
+    """Epoch seconds → `YYYY-MM-DDTHH:MM:SSZ` in UTC (second precision)."""
+    return datetime.fromtimestamp(epoch_seconds, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _token_metadata_lines(token_usage: dict[str, int | None] | None) -> list[str]:

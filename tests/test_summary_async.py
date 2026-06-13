@@ -185,7 +185,10 @@ def test_commit_path_does_not_block_on_summarization(tmp_path, monkeypatch):
     runner._start_commit_summary(sha, [_turn()])
     assert time.monotonic() - started < 1.0  # returned while the LLM call hangs
     assert runner._summary_pending is not None
+    # The "summarizing…" popup names the session but NOT the commit hash (the
+    # hash is noise to the user while the summary is in flight).
     assert "summarizing" in (runner.message or "")
+    assert sha not in (runner.message or "")
     assert repo.commit_message("HEAD").startswith("<aGiT> prompt subject")  # commit untouched so far
 
     FakeSummarizer.gate.set()
@@ -200,6 +203,50 @@ def test_commit_path_does_not_block_on_summarization(tmp_path, monkeypatch):
     assert "widget renderer" in (repo.notes_show(final, namespace="agit/commit-summary") or "")
     assert runner.state.session_summary == "rolling narrative v2"
     assert (repo.notes_show(final, namespace="agit/session-summary") or "").startswith("rolling narrative")
+
+
+def test_summarizing_notice_precedes_created_popup_worktree(tmp_path, monkeypatch):
+    # The reported bug: the "Created <aGiT> commit … merged" popup appeared
+    # before the "summarizing…" one. A worktree session announces the commit
+    # only at integration, so while the summary is in flight only the
+    # "summarizing…" notice may show — never a premature "Created" popup.
+    runner, repo = _summary_runner(tmp_path, monkeypatch)
+    FakeSummarizer.gate = threading.Event()  # hold the summary open
+    sha = _commit_change(repo, "a.txt", "<aGiT> prompt subject")
+    runner._last_agent_commit_id = repo.short_sha(sha)
+    runner._commit_merged_pending = True  # armed by on_commit_fn at commit time
+
+    runner._start_commit_summary(sha, [_turn()])
+
+    assert "summarizing" in (runner.message or "")
+    assert "Created <aGiT> commit" not in (runner.message or "")
+    # Only at integration does the "created (summarized)" popup appear.
+    FakeSummarizer.gate.set()
+    _finish_summary(runner)
+    runner._announce_agent_commit()
+    assert "Created <aGiT> commit" in (runner.message or "") and "(summarized)" in runner.message
+
+
+def test_no_worktree_commit_announced_only_after_summary(tmp_path, monkeypatch):
+    # A no-worktree session has no integration step to announce its commit, so
+    # the "created" popup is shown after the summary lands — still after, never
+    # before, the "summarizing…" notice.
+    runner, repo = _summary_runner(tmp_path, monkeypatch)
+    runner.worktree = None  # delegates to the active session
+    FakeSummarizer.gate = threading.Event()
+    sha = _commit_change(repo, "a.txt", "<aGiT> prompt subject")
+    runner._last_agent_commit_id = repo.short_sha(sha)
+    runner._commit_merged_pending = True
+
+    runner._start_commit_summary(sha, [_turn()])
+    assert "summarizing" in (runner.message or "")
+    assert "Created <aGiT> commit" not in (runner.message or "")
+
+    FakeSummarizer.gate.set()
+    _finish_summary(runner)
+    # The summary service announced the commit (nothing else would have).
+    assert "Created <aGiT> commit" in (runner.message or "")
+    assert runner._commit_merged_pending is False
 
 
 def test_summary_after_integration_lands_as_notes_only(tmp_path, monkeypatch):
@@ -284,8 +331,9 @@ def test_failed_rolling_summary_does_not_discard_commit_summary(tmp_path, monkey
 
 
 def test_summary_popups_name_the_owning_session(tmp_path, monkeypatch):
-    # Background sessions summarize too, and a summary can land after the user
-    # switched away: every popup must say which session it is about.
+    # Background sessions summarize too: the "summarizing…" popup must say which
+    # session it is about, and a summary that lands after the user switched away
+    # must still be applied to the OWNING session's commit, not the active one.
     runner, repo = _summary_runner(tmp_path, monkeypatch)
     runner.name = "feature-x"
     sha = _commit_change(repo, "a.txt", "<aGiT> prompt subject")
@@ -295,7 +343,11 @@ def test_summary_popups_name_the_owning_session(tmp_path, monkeypatch):
 
     runner.name = "other"  # the user switched sessions before the summary landed
     _finish_summary(runner)
-    assert (runner.message or "").endswith("in session 'feature-x'.")
+    # The summary was amended into the owning session's commit (correct
+    # attribution) and the owning session is flagged as summarized so its
+    # eventual "created & merged" notice can say so.
+    assert repo.commit_message("HEAD").startswith("<aGiT> Implement the widget renderer")
+    assert runner._commit_summarized is True
 
 
 def test_failed_summary_popup_names_the_owning_session(tmp_path, monkeypatch):
