@@ -2240,9 +2240,12 @@ class ProxyRunner:
         if self._resumable_sessions():
             options.append("↻ Resume a past conversation…")
             actions.append(("resume-past", None))
+        # "Share" is offered for every backend so the user gets a clear answer;
+        # unsupported backends (OpenCode has no portable transcript) say so when
+        # chosen. "Resume a shared session" only appears where it can actually work.
+        options.append("⇪ Share this session with collaborators…")
+        actions.append(("share", None))
         if getattr(self.backend, "supports_session_sharing", False):
-            options.append("⇪ Share this session with collaborators…")
-            actions.append(("share", None))
             options.append("⇩ Resume a shared session…")
             actions.append(("resume-shared", None))
         if len(self.sessions) > 1:
@@ -2484,6 +2487,14 @@ class ProxyRunner:
 
     def _share_session(self) -> None:
         backend = self.backend
+        if not getattr(backend, "supports_session_sharing", False):
+            self._set_message(
+                f"Sharing sessions isn't supported for the {backend.name} backend yet — "
+                "only Claude sessions can be shared (they have a portable transcript).",
+                seconds=10.0,
+            )
+            self._render()
+            return
         session_id = self.state.backend_session_id
         if not session_id or not backend.session_belongs_to_repo(self.repo.repo, session_id):
             self._set_message("No resumable session for this repo to share yet.")

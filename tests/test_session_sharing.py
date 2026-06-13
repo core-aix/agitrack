@@ -267,6 +267,19 @@ def test_runner_share_session_publishes_and_redacts(tmp_path, monkeypatch):
     assert any("Saved shared session" in m or "Shared" in m for m in runner.messages)
 
 
+def test_runner_share_unsupported_backend_shows_message(tmp_path, monkeypatch):
+    class _OpenCodeStub:
+        name = "opencode"
+        supports_session_sharing = False
+
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, _OpenCodeStub())
+
+    runner._share_session()
+
+    assert SharedSessionStore(repo).entries() == []  # nothing shared
+    assert any("isn't supported" in m and "opencode" in m for m in runner.messages)
+
+
 def test_runner_resume_shared_imports_and_resumes(tmp_path, monkeypatch):
     backend = _StubBackend()
     runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
