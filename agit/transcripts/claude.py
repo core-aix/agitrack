@@ -319,6 +319,8 @@ def parse_rows(session_id: str, rows: list[dict]) -> ExportedSession:
                 "model": model,
                 "tokens": TokenUsage(),
                 "stop_reason": None,
+                "started_at": stamp,
+                "ended_at": stamp,
             }
         elif row_type == "assistant" and current is not None and row.get("isSidechain"):
             # Sub-agent (sidechain) turns are not part of the main interaction
@@ -328,6 +330,8 @@ def parse_rows(session_id: str, rows: list[dict]) -> ExportedSession:
             current["tokens"].add(_message_tokens(message.get("usage"), sidechain=True))
         elif row_type == "assistant" and current is not None:
             message = _as_dict(row.get("message"))
+            if stamp is not None:
+                current["ended_at"] = stamp
             current["tokens"].add(_message_tokens(message.get("usage")))
             message_model = message.get("model")
             if isinstance(message_model, str) and message_model:
@@ -376,6 +380,8 @@ def _finalize_turn(turn: dict, *, dangling: bool = False) -> SessionTurn:
         model=turn["model"],
         complete=not in_flight,
         interrupted=interrupted,
+        started_at=turn.get("started_at"),
+        ended_at=turn.get("ended_at"),
     )
 
 

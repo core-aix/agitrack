@@ -398,6 +398,29 @@ def test_parse_rows_updated_none_without_timestamps():
     assert parse_rows("sess-1", rows).updated is None
 
 
+def test_parse_rows_records_turn_conversation_span():
+    from datetime import datetime, timezone
+
+    rows = [
+        _user("u1", "first prompt"),
+        _assistant("m1", "answer one", usage={"input_tokens": 1, "output_tokens": 1}),
+        _user("u2", "second prompt"),
+        _assistant("m2", "answer two", usage={"input_tokens": 1, "output_tokens": 1}),
+    ]
+    rows[0]["timestamp"] = "2026-06-10T10:00:00.000Z"
+    rows[1]["timestamp"] = "2026-06-10T10:02:00.000Z"
+    rows[2]["timestamp"] = "2026-06-10T10:05:00.000Z"
+    rows[3]["timestamp"] = "2026-06-10T10:06:30.000Z"
+
+    turns = parse_rows("sess-1", rows).turns
+    epoch = lambda *a: int(datetime(*a, tzinfo=timezone.utc).timestamp())  # noqa: E731
+    # Each turn spans its user prompt to its last assistant message.
+    assert turns[0].started_at == epoch(2026, 6, 10, 10, 0, 0)
+    assert turns[0].ended_at == epoch(2026, 6, 10, 10, 2, 0)
+    assert turns[1].started_at == epoch(2026, 6, 10, 10, 5, 0)
+    assert turns[1].ended_at == epoch(2026, 6, 10, 10, 6, 30)
+
+
 # --- Esc interrupts: the turn completes and the marker is not a prompt ----------
 
 

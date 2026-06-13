@@ -4,6 +4,27 @@ aGiT stands for agent + git. It is an interactive Python CLI that wraps coding-a
 
 aGiT supports OpenCode and Claude (Claude Code) as interchangeable backends. Every aGiT feature works the same regardless of the selected backend.
 
+## Dashboard
+
+`agit --dashboard` (or `-d`) opens a **live, auto-refreshing web dashboard** of your repository — who and what wrote the code — served on `localhost` and opened in your browser. Every number is computed from commit metadata alone, so it's identical on every clone; nothing is sent anywhere.
+
+```bash
+agit --dashboard        # serve on localhost and open the browser (Ctrl-C to stop)
+agit -d text            # one-shot plain-text report instead (pipe it, paste it into an issue)
+```
+
+![The aGiT dashboard](docs/images/dashboard.png)
+
+- **aGiT-tracked AI vs non-tracked lines** — what the agents wrote (tracked by aGiT) versus everything else; it never claims a human wrote what the model did.
+- **Filter live** — narrow the whole dashboard to one committer (merged to their GitHub ID), a backend, a model, or a time range.
+- **Tokens, efficiency, and loop detection**, plus a commit log you can click to read the full message and jump to the commit on GitHub.
+
+See [Repository dashboard](#repository-dashboard) below for the full breakdown.
+
+## Requirements
+
+aGiT needs **git** and at least one backend CLI — [Claude Code](https://docs.claude.com/en/docs/claude-code) or [OpenCode](https://opencode.ai) — on your `PATH`. The dashboard's committer view additionally uses the **GitHub CLI (`gh`)** to resolve commit authors to their GitHub logins: install it from [cli.github.com](https://cli.github.com) and run `gh auth login`. `gh` is optional — without it the dashboard still works and falls back to merging committer identities by email and no-reply login.
+
 ## Install
 
 For local development:
@@ -252,13 +273,14 @@ scripts/demo.sh --model haiku --dir /tmp/agit-demo
 
 `agit --dashboard` (or `-d`) opens a live web dashboard of repository metrics computed entirely from the aGiT metadata in commit messages — no extra state, so the numbers are identical on every clone. It is served on `localhost`, opens in your browser, and **auto-refreshes** (the page polls the server, which recomputes from `git log` on each request), so you can watch metrics update as an agent commits. Press Ctrl-C to stop.
 
-- **Coverage**: how many commits are aGiT-tracked (agent commits, backend-made commits covered by an aGiT cover commit, agent-resolved merges, user commits) versus non-tracked.
+- **Coverage**: how many commits are aGiT-tracked (agent commits, backend-made commits covered by an aGiT cover commit, agent-resolved merges, user commits, and aGiT's own integration merges) versus non-tracked.
 - **Code changes**: lines added/removed split two ways — **aGiT-tracked AI** (agent commits + the backend-made commits an aGiT cover commit accounts for + agent-resolved merges) and **non-tracked** (everything else: user commits, plain commits with no aGiT metadata, and squash/PR-merge commits whose message concatenates several metadata blocks and so can't be cleanly attributed). There is deliberately no "human" category — even a user-made commit can contain lines an agent produced off the record, so the only honest claim is whether aGiT tracked the lines as AI. Cover commits are merges and contribute no line counts of their own, so a turn's lines are never double-counted.
+- **aGiT-ops**: the integration merge commits aGiT makes itself (e.g. bringing base into a session branch) are shown as their own class, not lumped into non-tracked. They carry no diff, so they add no lines.
 - **Tokens**: totals per category (input, output, reasoning, cache read/write, sub-agents, summarizer) and an efficiency ratio — AI-changed lines per 1k output tokens.
-- **Breakdowns** by backend, by model (a cover commit's bucket includes the lines of the backend-made commits it covers), and by committer. Committer identities are merged across name variants by email and GitHub login (parsed from no-reply addresses), all from `git log` — so one person who commits under several names collapses to a single entry, labelled with their GitHub login where known. Each committer's lines are split into the aGiT-tracked AI they drove versus non-tracked.
+- **Breakdowns** by backend, by model (a cover commit's bucket includes the lines of the backend-made commits it covers), and by committer. Committer identities are merged to **GitHub IDs** via the `gh` CLI when available (every commit GitHub knows is keyed by its real login); without `gh` it falls back to merging by email and no-reply login. Each committer's lines are split into the aGiT-tracked AI they drove versus non-tracked.
 - **Possible loops**: runs of three or more consecutive turns with near-identical prompts (or the same prompt repeated within one turn's trace), with the output tokens they consumed — a sign the conversation is going in circles.
 
-The web page (styled like the [project page](https://github.com/core-aix/agit/tree/main/docs)) recomputes every metric client-side, so you can **filter live** — narrow the whole dashboard to one committer or view the entire team, and slice by backend or model — and it includes a filtered commit-log timeline.
+The web page (styled like the [project page](https://github.com/core-aix/agit/tree/main/docs)) recomputes every metric client-side, so you can **filter live** — narrow the whole dashboard to one committer or view the entire team, slice by backend or model, or restrict to a **time range** (presets or a custom from/to). Its commit log shows per-line token metrics, and clicking a line opens the full commit message with a link to the commit on GitHub. Agent commits also record when the AI-driven conversation started and ended (`agent_started_at` / `agent_ended_at` in the metadata block).
 
 `agit --dashboard text` (or `-d text`) prints the same metrics as a one-shot plain-text report instead of serving — handy for piping or pasting into an issue.
 

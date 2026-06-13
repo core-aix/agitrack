@@ -18,9 +18,18 @@ Commit classification:
 ``agent-merge``
     An integration merge whose conflicts an agent resolved.
 ``user``
-    A user commit created through aGiT (``commit_type: user``). Human work.
+    A user commit created through aGiT (``commit_type: user``). Non-tracked
+    lines: even a user-made commit may contain lines an agent produced, so it is
+    not claimed as human work.
+``agit-ops``
+    aGiT's own integration plumbing — the auto-generated merge commits it makes
+    to bring base into a session branch (or back). Tracked, but its merges carry
+    no diff, so it contributes no lines.
 ``untracked``
-    No aGiT metadata and not covered — made outside aGiT. Human work.
+    No aGiT metadata and not covered — made outside aGiT. Non-tracked lines.
+
+Line provenance is reported two ways only: aGiT-tracked AI (agent + covered +
+agent-merge) versus non-tracked (user + untracked); there is no "human" bucket.
 """
 
 from __future__ import annotations
@@ -28,6 +37,7 @@ from __future__ import annotations
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+from functools import cached_property
 
 from agit.commits import METADATA_HEADER
 from agit.git import GitRepo
@@ -36,6 +46,10 @@ _NUMSTAT_RE = re.compile(r"^(\d+|-)\t(\d+|-)\t")
 _TOKEN_KEY_PREFIX = "tokens_since_last_commit_"
 _RECORD_SEP = "\x00"
 _FIELD_SEP = "\x01"
+
+# aGiT turn branches are named `agit/<backend>/<session>/t<n>`; an auto-merge
+# subject naming one is aGiT's own integration plumbing.
+_AGIT_BRANCH_RE = re.compile(r"agit/[^/\s']+/[^/\s']+/t\d+")
 
 # A GitHub no-reply address (optionally `ID+`-prefixed) carries the user's
 # login verbatim — the only GitHub identity that lives in `git log` itself.
@@ -61,7 +75,10 @@ class CommitStat:
     author: str
     email: str
     subject: str
-    kind: str  # agent | covered | agent-merge | user | untracked
+    kind: str  # agent | covered | agent-merge | user | agit-ops | untracked
+    timestamp: int = 0  # commit author date, epoch seconds (every commit has one)
+    started_at: str = ""  # AI conversation start, ISO-8601 UTC (agent commits)
+    ended_at: str = ""  # AI conversation end, ISO-8601 UTC (agent commits)
     backend: str | None = None
     model: str | None = None
     tokens: dict[str, int] = field(default_factory=dict)
@@ -71,6 +88,7 @@ class CommitStat:
     prompt: str = ""  # the turn's prompt text (loop detection)
     user_prompts: list[str] = field(default_factory=list)  # trace ## User entries
     metadata_block: str = ""  # raw `# aGiT Metadata` text, for duplicate detection
+    message: str = ""  # the full commit message (shown when a log entry is opened)
 
     @property
     def short(self) -> str:
@@ -97,6 +115,8 @@ class Dashboard:
     branch: str
     stats: list[CommitStat]  # oldest first
     loops: list[LoopFinding]
+    sha_logins: dict[str, str] = field(default_factory=dict)  # commit SHA → GitHub login (best-effort)
+    commit_base: str = ""  # GitHub commit URL prefix, or "" when no GitHub remote
 
     # --- derived aggregates -------------------------------------------------
 
@@ -109,7 +129,7 @@ class Dashboard:
 
     @property
     def tracked_commits(self) -> int:
-        return self.count("agent", "covered", "agent-merge", "user")
+        return self.count("agent", "covered", "agent-merge", "user", "agit-ops")
 
     @property
     def coverage(self) -> float:
@@ -188,11 +208,12 @@ class Dashboard:
     def by_model(self) -> dict[str, dict[str, int]]:
         return self.group_by(lambda stat: stat.model)
 
-    @property
+    @cached_property
     def committer_labels(self) -> dict[tuple[str, str], str]:
         """Map each ``(author name, email)`` to a merged committer label, so
-        name variants of one person collapse to a single identity."""
-        return resolve_committers(self.stats)
+        name variants of one person collapse to a single identity. Cached: it is
+        read once per commit during serialization."""
+        return resolve_committers(self.stats, self.sha_logins)
 
     def label_of(self, stat: CommitStat) -> str:
         return self.committer_labels.get((stat.author or "", (stat.email or "").strip().lower())) or "unknown"
@@ -214,6 +235,8 @@ class Dashboard:
             if stat.kind in ("agent", "covered", "agent-merge"):
                 bucket["ai_insertions"] += stat.insertions
                 bucket["ai_deletions"] += stat.deletions
+            elif stat.kind == "agit-ops":
+                pass  # operational merges carry no diff; only the commit counts
             else:
                 bucket["nontracked_insertions"] += stat.insertions
                 bucket["nontracked_deletions"] += stat.deletions
@@ -251,28 +274,35 @@ class _Union:
             self._parent[ra] = rb
 
 
-def resolve_committers(stats: list[CommitStat]) -> dict[tuple[str, str], str]:
+def resolve_committers(stats: list[CommitStat], sha_logins: dict[str, str] | None = None) -> dict[tuple[str, str], str]:
     """Map every ``(author name, email)`` pair to a single committer label.
 
-    Identities are merged when they share an email, share a GitHub login (from a
-    no-reply address), or when an email's local-part equals a known login — this
-    is what links ``user@gmail.com`` to ``user@users.noreply.github.com``. The
-    label prefers the GitHub login; otherwise it is the person's most frequent
-    name. All of this is derived from ``git log`` alone, so it stays identical on
-    every clone (no GitHub API, works offline). Two people who genuinely share a
-    name but never a login or email cannot be told apart here and may merge."""
+    ``sha_logins`` (commit SHA → GitHub login, from :mod:`agit.metrics.github`)
+    is the authoritative GitHub identity when available — every commit GitHub
+    knows is merged under its real login. Without it (``gh`` missing, offline, no
+    GitHub remote) we fall back to ``git log`` alone: identities merge when they
+    share an email, a GitHub login parsed from a no-reply address, or an email
+    local-part that equals a known login (linking ``user@host`` to
+    ``user@users.noreply.github.com``). The label prefers the GitHub login;
+    otherwise it is the person's most frequent name. Two people who never share a
+    login or email but share a name cannot be told apart here and may merge."""
+    sha_logins = sha_logins or {}
     union = _Union()
     logins: set[str] = set()
+
+    def login_for(stat: CommitStat, email: str) -> str | None:
+        return sha_logins.get(stat.sha) or _login_of(email)
+
     for stat in stats:
         email = (stat.email or "").strip().lower()
         node = ("pair", stat.author or "", email)
         union.find(node)
         if email:
             union.union(node, ("email", email))
-            login = _login_of(email)
-            if login:
-                union.union(node, ("login", login))
-                logins.add(login)
+        login = login_for(stat, email)
+        if login:
+            union.union(node, ("login", login.lower()))
+            logins.add(login.lower())
     # Bridge a plain email to a login when its local-part is that login.
     for stat in stats:
         email = (stat.email or "").strip().lower()
@@ -287,9 +317,9 @@ def resolve_committers(stats: list[CommitStat]) -> dict[tuple[str, str], str]:
         root = union.find(("pair", stat.author or "", email))
         if stat.author:
             root_names[root][stat.author] += 1
-        login = _login_of(email)
+        login = login_for(stat, email)
         if login:
-            root_logins[root].add(login)
+            root_logins[root].add(login.lower())
 
     labels: dict[tuple[str, str], str] = {}
     for stat in stats:
@@ -310,7 +340,7 @@ def collect_commit_stats(repo: GitRepo, ref: str = "HEAD") -> list[CommitStat]:
     # %x00/%x01 are git's own escapes: a literal NUL is not representable in
     # an argv string, but git happily PRINTS one as a record separator.
     log = repo._run(
-        ["git", "log", "--format=%H%x01%an%x01%ae%x01%B%x00", ref],
+        ["git", "log", "--format=%H%x01%an%x01%ae%x01%at%x01%B%x00", ref],
         check=False,
     ).stdout
     stats: list[CommitStat] = []
@@ -320,8 +350,9 @@ def collect_commit_stats(repo: GitRepo, ref: str = "HEAD") -> list[CommitStat]:
             continue
         sha, _, rest = record.partition(_FIELD_SEP)
         author, _, rest = rest.partition(_FIELD_SEP)
-        email, _, body = rest.partition(_FIELD_SEP)
-        stats.append(_parse_commit(sha.strip(), author, email, body))
+        email, _, rest = rest.partition(_FIELD_SEP)
+        committed_at, _, body = rest.partition(_FIELD_SEP)
+        stats.append(_parse_commit(sha.strip(), author, email, committed_at.strip(), body))
 
     stats = _drop_inherited_metadata(repo, ref, stats)
 
@@ -380,10 +411,19 @@ def _parents(repo: GitRepo, ref: str) -> dict[str, list[str]]:
     return parents
 
 
-def build_dashboard(repo: GitRepo, ref: str = "HEAD") -> Dashboard:
+def build_dashboard(repo: GitRepo, ref: str = "HEAD", *, sha_logins: dict[str, str] | None = None) -> Dashboard:
+    from agit.metrics.github import commit_url_base
+
     stats = collect_commit_stats(repo, ref)
     branch = repo.current_branch()
-    return Dashboard(repo=str(repo.repo), branch=branch, stats=stats, loops=_detect_loops(stats))
+    return Dashboard(
+        repo=str(repo.repo),
+        branch=branch,
+        stats=stats,
+        loops=_detect_loops(stats),
+        sha_logins=sha_logins or {},
+        commit_base=commit_url_base(repo),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -391,8 +431,9 @@ def build_dashboard(repo: GitRepo, ref: str = "HEAD") -> Dashboard:
 # ---------------------------------------------------------------------------
 
 
-def _parse_commit(sha: str, author: str, email: str, body: str) -> CommitStat:
+def _parse_commit(sha: str, author: str, email: str, committed_at: str, body: str) -> CommitStat:
     subject = body.splitlines()[0] if body.splitlines() else ""
+    timestamp = int(committed_at) if committed_at.isdigit() else 0
     # A clean aGiT turn carries exactly one metadata block. More than one means
     # the message is an aggregate — a squash or PR merge that concatenated
     # several commits' blocks — whose first `commit_type` would otherwise credit
@@ -400,7 +441,15 @@ def _parse_commit(sha: str, author: str, email: str, body: str) -> CommitStat:
     # "human" because its first block happened to be a user commit). Its
     # provenance cannot be cleanly attributed, so treat it as non-tracked.
     if body.count(METADATA_HEADER) > 1:
-        return CommitStat(sha=sha, author=author, email=email, subject=subject, kind="untracked")
+        return CommitStat(
+            sha=sha,
+            author=author,
+            email=email,
+            subject=subject,
+            kind="untracked",
+            timestamp=timestamp,
+            message=body.strip(),
+        )
     metadata = _parse_metadata(body)
     commit_type = metadata.get("commit_type")
     if commit_type == "agent":
@@ -411,6 +460,13 @@ def _parse_commit(sha: str, author: str, email: str, body: str) -> CommitStat:
         kind = "user"
     elif METADATA_HEADER in body:
         kind = "agent"  # metadata without commit_type: treat as agent work
+    elif subject.startswith("Merge ") and _AGIT_BRANCH_RE.search(subject):
+        # aGiT's own integration plumbing: the auto-generated merge commits it
+        # makes to bring base into a session turn branch (or back), e.g. "Merge
+        # branch 'dev' into agit/claude/session-1/t2". These carry no metadata
+        # but are aGiT operations, not stray human/untracked work, so they get
+        # their own class (and merges contribute no numstat lines anyway).
+        kind = "agit-ops"
     else:
         kind = "untracked"
     tokens: dict[str, int] = {}
@@ -425,6 +481,9 @@ def _parse_commit(sha: str, author: str, email: str, body: str) -> CommitStat:
         email=email,
         subject=subject,
         kind=kind,
+        timestamp=timestamp,
+        started_at=metadata.get("agent_started_at", ""),
+        ended_at=metadata.get("agent_ended_at", ""),
         backend=metadata.get("backend"),
         model=metadata.get("model"),
         tokens=tokens,
@@ -432,6 +491,7 @@ def _parse_commit(sha: str, author: str, email: str, body: str) -> CommitStat:
         prompt=_extract_prompt(body, subject, kind),
         user_prompts=_extract_user_prompts(body),
         metadata_block=_metadata_block(body),
+        message=body.strip(),
     )
 
 

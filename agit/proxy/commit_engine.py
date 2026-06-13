@@ -303,6 +303,11 @@ class CommitEngine:
         # An aGiT commit accounts for itself; it lists only the backend-made
         # commits it additionally covers (#35).
         covered_display = [self._short_sha(sha) for sha in backend_commits]
+        # The AI-driven conversation's span: earliest prompt to latest response
+        # across the turns this commit accounts for (None when the backend's
+        # transcript carries no timestamps).
+        starts = [turn.started_at for turn in turns if turn.started_at]
+        ends = [turn.ended_at for turn in turns if turn.ended_at]
         message = build_agent_commit_message(
             latest_prompt=subject_text,
             trace=self.state.pending_trace(),
@@ -314,6 +319,8 @@ class CommitEngine:
             trace_turn_limit=self.state.trace_turn_limit,
             session_name=session_name,
             covered_commits=covered_display or None,
+            started_at=min(starts) if starts else None,
+            ended_at=max(ends) if ends else None,
         )
         if cover_backend_head:
             # The backend committed its own work, leaving the tree clean (#35).
