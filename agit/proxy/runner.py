@@ -86,9 +86,36 @@ _PYTE_HOSTILE_CSI_RE = re.compile(rb"\x1b\[[<>=][0-9;:]*[ -/]*[@-~]")
 # Shift+Enter instead of the disambiguated encoding the backend's keybindings
 # (e.g. Claude's newline-in-input) expect.
 _KEYBOARD_PROTO_RE = re.compile(rb"\x1b\[(?:[><=][0-9;]*u|\?u|>4(?:;[0-9]+)?m)")
+# Kitty keyboard protocol encoding for control keys: CSI <keycode> ; <modifiers> u
+# For Ctrl-A through Ctrl-Z: keycode is 97-122 (lowercase a-z), modifier is 5 (Ctrl+base)
+# We decode these back to plain control bytes (0x01-0x1a) so the menu key works
+# even when the terminal is in kitty keyboard protocol mode.
+_KITTY_CTRL_KEY_RE = re.compile(rb"\x1b\[(\d+);5u")
 # A bracketed paste (CSI 200~ ... CSI 201~, possibly split across reads, hence
 # the `|$`): newlines inside it are pasted CONTENT, not prompt submissions.
 _BRACKETED_PASTE_RE = re.compile(rb"\x1b\[200~.*?(?:\x1b\[201~|$)", re.S)
+
+
+def _decode_kitty_ctrl_keys(data: bytes) -> bytes:
+    """Decode kitty keyboard protocol control keys to plain bytes.
+    
+    When the terminal is in kitty keyboard protocol mode, Ctrl-A through Ctrl-Z
+    are sent as escape sequences like \\x1b[97;5u (Ctrl-A) instead of plain bytes
+    like \\x01. This function converts them back to plain bytes so the menu key
+    matching works correctly.
+    
+    Only decodes Ctrl keys (modifier 5 = Ctrl+base). Other keys are left unchanged.
+    """
+    def replace_kitty_ctrl(match: re.Match) -> bytes:
+        keycode = int(match.group(1))
+        # keycode 97-122 = lowercase a-z
+        # Ctrl-A = 0x01, Ctrl-B = 0x02, ..., Ctrl-Z = 0x1a
+        if 97 <= keycode <= 122:
+            return bytes([keycode - 96])
+        # Not a letter, return unchanged
+        return match.group(0)
+    
+    return _KITTY_CTRL_KEY_RE.sub(replace_kitty_ctrl, data)
 
 
 def _short_session(session_id: str | None) -> str:
@@ -2917,6 +2944,12 @@ class ProxyRunner:
         data, self._input_tail = self._hold_incomplete_tail(data)
         data = self._intercept_scroll(data)
         self._debug(f"after intercept: {data!r}")
+        # Decode kitty keyboard protocol control keys back to plain bytes.
+        # When the terminal is in kitty mode (enabled by the backend), Ctrl-A
+        # through Ctrl-Z are sent as escape sequences like \x1b[97;5u instead
+        # of plain bytes like \x01. We decode them so the menu key matching works.
+        data = _decode_kitty_ctrl_keys(data)
+        self._debug(f"after kitty decode: {data!r}")
         was_capturing = self.input.capturing
         forwarded, local_echo, command, should_exit = self.input.feed(data)
         self._debug(f"feed result: forwarded={forwarded!r} command={command!r} capturing={self.input.capturing}")

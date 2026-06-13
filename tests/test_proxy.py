@@ -87,6 +87,54 @@ def test_proxy_ctrl_g_enters_command_mode():
     assert should_exit is False
 
 
+def test_kitty_ctrl_key_decoding():
+    """Test that kitty keyboard protocol control keys are decoded to plain bytes."""
+    from agit.proxy.runner import _decode_kitty_ctrl_keys
+    
+    # Ctrl-O (o=111) should decode to 0x0f
+    assert _decode_kitty_ctrl_keys(b"\x1b[111;5u") == b"\x0f"
+    
+    # Ctrl-G (g=103) should decode to 0x07
+    assert _decode_kitty_ctrl_keys(b"\x1b[103;5u") == b"\x07"
+    
+    # Ctrl-A (a=97) should decode to 0x01
+    assert _decode_kitty_ctrl_keys(b"\x1b[97;5u") == b"\x01"
+    
+    # Ctrl-Z (z=122) should decode to 0x1a
+    assert _decode_kitty_ctrl_keys(b"\x1b[122;5u") == b"\x1a"
+    
+    # Mixed content: text + Ctrl-O + text
+    assert _decode_kitty_ctrl_keys(b"hello\x1b[111;5uworld") == b"hello\x0fworld"
+    
+    # Non-ctrl kitty sequences should not be decoded (modifier != 5)
+    # Shift+O would be modifier 2, so \x1b[111;2u should remain unchanged
+    assert _decode_kitty_ctrl_keys(b"\x1b[111;2u") == b"\x1b[111;2u"
+    
+    # Plain bytes should pass through unchanged
+    assert _decode_kitty_ctrl_keys(b"\x0f") == b"\x0f"
+    assert _decode_kitty_ctrl_keys(b"hello") == b"hello"
+
+
+def test_proxy_menu_key_works_with_kitty_encoding():
+    """Test that the menu key works even when terminal sends kitty-encoded keys."""
+    from agit.proxy.runner import _decode_kitty_ctrl_keys
+    
+    # Simulate what happens in _reactor_stdin_phase:
+    # 1. Terminal sends kitty-encoded Ctrl-O
+    # 2. We decode it to plain byte
+    # 3. ProxyInput matches it as menu key
+    
+    kitty_encoded_ctrl_o = b"\x1b[111;5u"
+    decoded = _decode_kitty_ctrl_keys(kitty_encoded_ctrl_o)
+    
+    parser = ProxyInput(menu_key=b"\x0f")  # Ctrl-O
+    forwarded, local_echo, command, should_exit = parser.feed(decoded + b"git-status\r")
+    
+    assert forwarded == []
+    assert command == "git-status"
+    assert should_exit is False
+
+
 def test_proxy_shift_modified_menu_key_enters_command_mode():
     # Test multi-byte kitty keyboard protocol sequence for Ctrl+Shift+G
     parser = ProxyInput(menu_key=b"\x1b[103;6u")
