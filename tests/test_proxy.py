@@ -4879,6 +4879,33 @@ def test_duck_type_aliases_cover_extracted_classes():
             )
 
 
+def test_restore_terminal_clears_before_leaving_alt_screen(monkeypatch):
+    # #70: on terminals without alt-screen support, leaving the alt screen is a
+    # no-op, so aGiT's UI lingers after exit unless we clear the screen first.
+    # restore_terminal must emit a clear+home BEFORE the `?1049l` leave so the
+    # screen is clean on those terminals (and unchanged where altscreen works).
+    import types
+
+    from agit.proxy import terminal as terminal_mod
+    from agit.proxy.terminal import TerminalHost
+
+    writes: list[bytes] = []
+    monkeypatch.setattr(terminal_mod.os, "write", lambda _fd, data: writes.append(data) or len(data))
+
+    state = types.SimpleNamespace(old_attrs=None)
+    # Stub the cooked/mode + mouse teardown so only the screen bytes matter here.
+    state.disable_host_terminal_modes = lambda: None
+    state.set_cooked = lambda: None
+    monkeypatch.setattr(terminal_mod.termios, "tcflush", lambda *a, **k: None)
+
+    TerminalHost.restore_terminal(state)
+
+    out = b"".join(writes)
+    assert b"\x1b[2J" in out  # clears the screen
+    assert b"\x1b[?1049l" in out  # leaves the alt screen
+    assert out.index(b"\x1b[2J") < out.index(b"\x1b[?1049l")  # clear comes first
+
+
 def test_configured_menu_key_opens_command_capture():
     # menu_key in ~/.agit/config.json rebinds the aGiT menu (default Ctrl-G).
     parser = ProxyInput(menu_key=b"\x10")  # ctrl-p
