@@ -345,3 +345,48 @@ def test_session_update_rejects_echoed_prompt() -> None:
     summarizer = Summarizer(backend)
     with pytest.raises(UnusableSummaryError):
         summarizer.update_session_summary(current_summary=None, turns=[_turn()], diff="+x", commit_summary="x")
+
+
+def test_strip_summary_preamble_removes_meta_lead_ins() -> None:
+    from agit.summaries.summarizer import strip_summary_preamble
+
+    # The exact observed failure: a meta-preamble before the real summary.
+    bad = (
+        "The summary has been written. No further action is needed from me here — "
+        "the conversation turns and diff you provided were the input for "
+        "summarization, and the summary follows below.\n\n"
+        "Multiple committers are now first-class, filterable identities."
+    )
+    assert strip_summary_preamble(bad) == "Multiple committers are now first-class, filterable identities."
+
+    # Other common preamble shapes the model emits despite the instruction.
+    assert strip_summary_preamble("Here is the summary:\n\nAdded OpenCode sharing.") == "Added OpenCode sharing."
+    assert (
+        strip_summary_preamble("Here is a summary of the changes: Added OpenCode sharing.") == "Added OpenCode sharing."
+    )
+    assert strip_summary_preamble("Sure! Here is the summary.\n\nFixed the filter.") == "Fixed the filter."
+    assert strip_summary_preamble("Below is the summary —\n\nRefactored resolution.") == "Refactored resolution."
+
+
+def test_strip_summary_preamble_keeps_genuine_summaries() -> None:
+    from agit.summaries.summarizer import strip_summary_preamble
+
+    # Real topic sentences must never be mistaken for a preamble, even when they
+    # contain words like "summary", "here", or "this".
+    for text in [
+        "Added a summary panel to the dashboard that shows token totals.",
+        "The summarizer now strips meta-preambles before using the text.",
+        "Here-document parsing was fixed in the shell backend.",
+        "This refactor splits the parser into three modules.",
+        "Multiple committers are now first-class, filterable identities.",
+    ]:
+        assert strip_summary_preamble(text) == text
+
+
+def test_summarize_commit_strips_preamble_end_to_end() -> None:
+    # The whole point: a preamble-led model response yields a clean topic-sentence
+    # summary (which becomes the commit subject), not "The summary has been written".
+    backend = Mock()
+    backend.run.return_value = _result("Here is the summary:\n\nAdded the committer filter.")
+    summary = Summarizer(backend).summarize_commit(turns=[_turn()], diff="+x", session_summary=None)
+    assert summary == "Added the committer filter."
