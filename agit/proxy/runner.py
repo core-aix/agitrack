@@ -2046,10 +2046,14 @@ class ProxyRunner:
         # Keep the durable name record pointing at the conversation this session
         # is actually running (ids drift when the backend forks on resume).
         self._persist_session_name(new_session_id)
+        previous = self.state.backend_session_id
+        # Preserve shared-session recognition across the id drift: if this session
+        # was shared/auto-shared under its previous id, remember new→previous so it
+        # still shows as shared (and keeps auto-updating) after resume (#55).
+        self._record_shared_alias_on_drift(previous, new_session_id)
         # If the worktree's active conversation changed to a different backend
         # session that aGiT didn't start, the user likely started it from inside
         # the backend. Warn once that such sessions share this branch.
-        previous = self.state.backend_session_id
         if (
             self.worktree is not None
             and previous
@@ -2312,7 +2316,6 @@ class ProxyRunner:
             options.append("✓ Complete merge for this session")
             actions.append(("complete-merge", None))
         shared_ids = self._my_shared_session_ids()  # mark which sessions are shared (#55)
-        auto_state = self._user_state() if shared_ids else None
         live_names = set()
         for index, session in enumerate(self.sessions):
             live_names.add(self._session_name(index))
@@ -2322,9 +2325,10 @@ class ProxyRunner:
             if index == self.active_index and not self.merge_ctx and self._active_has_pending():
                 label += " — commits to integrate"
             sid = getattr(getattr(session, "state", None), "backend_session_id", None)
-            if sid and auto_state is not None and auto_state.auto_share_enabled(sid):
+            # Recognise a shared session across resume id-drift (lineage-aware).
+            if sid and self._session_auto_shared(sid):
                 label += " · ⇪ auto-share"
-            elif sid and sid in shared_ids:
+            elif sid and self._session_is_shared(sid, shared_ids):
                 label += " · ⇪ shared"
             options.append(label)
             actions.append(("switch", index))
@@ -2841,8 +2845,23 @@ class ProxyRunner:
 
     def _session_auto_shared(self, session_id: str | None) -> bool:
         # Read the opt-in from the BASE repo state (persists across runs); the
-        # session worktree where self.state lives is removed on exit (#55).
-        return bool(session_id) and self._user_state().auto_share_enabled(session_id)
+        # session worktree where self.state lives is removed on exit (#55). Check
+        # the whole id lineage: the backend mints a new id on resume, so a session
+        # opted in under an earlier id must still count after that drift.
+        if not session_id:
+            return False
+        user = self._user_state()
+        return any(user.auto_share_enabled(sid) for sid in user.session_lineage(session_id))
+
+    def _session_is_shared(self, session_id: str | None, shared_ids: set[str]) -> bool:
+        # A session counts as shared if its current id, or any id it drifted from
+        # on resume, is in the shared set (#55) — so a resumed shared session is
+        # still recognised after the backend forks its id.
+        if not session_id:
+            return False
+        if session_id in shared_ids:
+            return True
+        return any(sid in shared_ids for sid in self._user_state().session_lineage(session_id))
 
     def _my_shared_session_ids(self) -> set[str]:
         # session_ids of conversations I've shared in this repo, from the LOCAL ref
@@ -2861,6 +2880,25 @@ class ProxyRunner:
             return ids
         except Exception:
             return set()
+
+    def _record_shared_alias_on_drift(self, previous: str | None, new_id: str | None) -> None:
+        # When the backend forks a new session id on resume, link new→previous so a
+        # session shared/auto-shared under the previous id stays recognised. Only
+        # record it for ids that actually belong to a shared lineage, to keep the
+        # alias map scoped (and avoid recording drift for unshared sessions) (#55).
+        if not previous or not new_id or previous == new_id:
+            return
+        try:
+            user = self._user_state()
+            relevant = (
+                user.auto_share_enabled(previous)
+                or previous in user.shared_session_aliases()
+                or previous in self._my_shared_session_ids()
+            )
+            if relevant:
+                user.add_shared_session_alias(new_id, previous)
+        except Exception as error:
+            self._debug(f"record shared alias failed: {error!r}")
 
     def _set_session_auto_share(self, session_id: str, enabled: bool) -> None:
         self._user_state().set_auto_share(session_id, bool(enabled))
