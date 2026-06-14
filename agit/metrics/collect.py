@@ -64,10 +64,12 @@ _CO_AUTHOR_RE = re.compile(r"(?im)^\s*co-authored-by:\s*(.*?)\s*<([^>]+)>\s*$")
 
 
 def _is_non_human_committer(name: str, email: str) -> bool:
-    """Whether a co-author trailer is the AI assistant or a bot rather than a
-    person — those aren't filterable committers. aGiT itself adds no co-author
-    trailers, so the only ones seen are the Claude credit (``noreply@anthropic.com``)
-    and bot accounts (a ``[bot]`` login, e.g. ``github-actions[bot]``)."""
+    """Whether a commit identity (primary author or a co-author trailer) is the AI
+    assistant or a bot rather than a person — those aren't committers and are kept
+    out of the committer list/filter and the per-committer breakdown. Covers the
+    Claude credit (``noreply@anthropic.com``) and bot accounts, whose login carries
+    a ``[bot]`` suffix in the name and the no-reply email (e.g.
+    ``github-actions[bot]`` / ``41898282+github-actions[bot]@users.noreply.github.com``)."""
     name, email = name.lower(), email.lower()
     return email.endswith("noreply@anthropic.com") or "[bot]" in name or "[bot]" in email
 
@@ -274,11 +276,15 @@ class Dashboard:
         return self.committer_labels.get((stat.author or "", (stat.email or "").strip().lower())) or "unknown"
 
     def committers_of(self, stat: CommitStat) -> list[str]:
-        """Every merged committer label credited on a commit — its primary author
-        first, then any human co-authors — de-duplicated. A commit shows up when
-        filtering on any of these (#54)."""
+        """Every *human* merged committer label credited on a commit — its primary
+        author first, then any co-authors — de-duplicated. A commit shows up when
+        filtering on any of these (#54). The AI assistant and bot accounts (e.g.
+        ``github-actions[bot]``) are excluded even when they are the primary
+        author, so they never appear as committers; such a commit may have none."""
         labels = self.committer_labels
-        out = [self.label_of(stat)]
+        out: list[str] = []
+        if not _is_non_human_committer(stat.author or "", stat.email or ""):
+            out.append(self.label_of(stat))
         for name, email in stat.co_authors:
             label = labels.get((name or "", (email or "").strip().lower()))
             if label and label not in out:
@@ -294,6 +300,10 @@ class Dashboard:
         labels = self.committer_labels
         groups: dict[str, dict[str, int]] = {}
         for stat in self.stats:
+            # Bot/AI authors (e.g. github-actions[bot]) aren't committers — keep
+            # them out of the per-committer breakdown, as for the filter list.
+            if _is_non_human_committer(stat.author or "", stat.email or ""):
+                continue
             label = labels.get((stat.author or "", (stat.email or "").strip().lower())) or "unknown"
             bucket = groups.setdefault(label, defaultdict(int))
             bucket["commits"] += 1
