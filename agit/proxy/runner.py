@@ -803,6 +803,10 @@ class ProxyRunner:
         # Reclaim dangling shared-session snapshots from prior runs, in the
         # background so startup never waits on it (issue #55).
         threading.Thread(target=lambda: self._sweep_orphan_shared_sessions(fetch=True), daemon=True).start()
+        # Recommend installing / logging into gh when it's unavailable, since the
+        # dashboard's committer identities and session sharing depend on it (#76).
+        # Runs in the background so a slow `gh auth status` never blocks startup.
+        threading.Thread(target=self._notify_if_gh_unavailable, daemon=True).start()
         self.old_attrs = termios.tcgetattr(sys.stdin.fileno())
         try:
             self._enter_host_screen()
@@ -881,6 +885,40 @@ class ProxyRunner:
         self._cwd_drift_checked = False
         self._cwd_check_at = 0.0
         self._cwd_launch_at = time.time()
+
+    def _notify_if_gh_unavailable(self) -> None:
+        # Recommend installing / authenticating gh when it isn't usable, so the
+        # user knows why features that depend on it (the dashboard's committer
+        # identities, session sharing) are limited (#76). Best-effort and one-shot;
+        # runs off the startup thread so a slow auth check never blocks the UI.
+        try:
+            from agit.metrics.github import gh_status
+
+            status = gh_status()
+        except Exception as error:
+            self._debug(f"gh availability check failed: {error!r}")
+            return
+        message = self._gh_unavailable_hint(status)
+        if message is None:
+            return  # gh is installed and authenticated — nothing to suggest
+        self._set_message(message, seconds=12.0)
+        self._render()
+
+    @staticmethod
+    def _gh_unavailable_hint(status: str) -> str | None:
+        if status == "missing":
+            return (
+                "GitHub CLI (gh) isn't installed. aGiT features that rely on it are limited —\n"
+                "the dashboard can't resolve committer GitHub identities, and session sharing\n"
+                "is unavailable. Install it from https://cli.github.com then run `gh auth login`."
+            )
+        if status == "unauthenticated":
+            return (
+                "GitHub CLI (gh) isn't logged in. aGiT features that rely on it are limited —\n"
+                "the dashboard can't resolve committer GitHub identities, and session sharing\n"
+                "is unavailable. Run `gh auth login` to enable them."
+            )
+        return None
 
     def _setup_worktree_confinement_notice(self) -> None:
         # When confinement is requested but the platform can't enforce it (no

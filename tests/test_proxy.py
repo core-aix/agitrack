@@ -5010,6 +5010,40 @@ def test_duck_type_aliases_cover_extracted_classes():
             )
 
 
+def test_gh_unavailable_hint_text_by_status():
+    from agit.proxy.runner import ProxyRunner
+
+    missing = ProxyRunner._gh_unavailable_hint("missing")
+    assert missing is not None and "isn't installed" in missing and "cli.github.com" in missing
+    unauth = ProxyRunner._gh_unavailable_hint("unauthenticated")
+    assert unauth is not None and "isn't logged in" in unauth and "gh auth login" in unauth
+    assert ProxyRunner._gh_unavailable_hint("ok") is None
+
+
+def test_notify_if_gh_unavailable_sets_message_when_missing(monkeypatch):
+    runner = make_runner(name="main")
+    runner.messages = []
+    runner._set_message = lambda msg, **k: runner.messages.append(msg)
+    runner._render = lambda: None
+    monkeypatch.setattr("agit.metrics.github.gh_status", lambda: "missing")
+
+    runner._notify_if_gh_unavailable()
+
+    assert runner.messages and "gh" in runner.messages[0]
+
+
+def test_notify_if_gh_unavailable_silent_when_ok(monkeypatch):
+    runner = make_runner(name="main")
+    runner.messages = []
+    runner._set_message = lambda msg, **k: runner.messages.append(msg)
+    runner._render = lambda: None
+    monkeypatch.setattr("agit.metrics.github.gh_status", lambda: "ok")
+
+    runner._notify_if_gh_unavailable()
+
+    assert runner.messages == []
+
+
 def test_restore_terminal_clears_before_leaving_alt_screen(monkeypatch):
     # #70: on terminals without alt-screen support, leaving the alt screen is a
     # no-op, so aGiT's UI lingers after exit unless we clear the screen first.
