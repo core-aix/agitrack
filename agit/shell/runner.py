@@ -206,10 +206,13 @@ class AgitShell:
         self.repo.add_tracked()
         self.actions.review_untracked(include_declined=False)
         if self.repo.has_staged_changes():
-            from agit.commits import build_agent_commit_message, summary_metadata_lines
+            from agit.commits import build_agent_commit_message, render_interaction_trace, summary_metadata_lines
             from agit.summaries import Summarizer
 
-            diff_before_commit = self.repo.diff_head()
+            # The summary is built from ONLY the interaction trace appended to the
+            # commit (the same text the commit carries), and nothing else — so
+            # render it now, before clear_trace below.
+            trace_text = render_interaction_trace(self.state.pending_trace(), self.state.trace_turn_limit)
             commit_summary = None
             summary_metadata = None
             summarizer_model = self.state.summarization_model or self.global_config.summarization_model
@@ -219,24 +222,7 @@ class AgitShell:
                 print("aGiT is summarizing the changes before committing...")
                 try:
                     summarizer = Summarizer(self._summarizer_backend(), model=summarizer_model)
-                    from agit.transcripts.types import SessionTurn
-
-                    turns = [
-                        SessionTurn(
-                            user_message_id="",
-                            assistant_message_id="",
-                            user_prompt=prompt,
-                            final_response=result.final_response,
-                            tokens=result.tokens,
-                            model=result.model,
-                            complete=True,
-                            interrupted=False,
-                        )
-                    ]
-                    commit_summary = summarizer.summarize_commit(
-                        turns=turns,
-                        diff=diff_before_commit,
-                    )
+                    commit_summary = summarizer.summarize_commit(trace=trace_text)
                     summary_metadata = summary_metadata_lines(
                         model=summarizer.model or self.state.model,
                         tokens_input=summarizer.tokens_input,
@@ -267,8 +253,7 @@ class AgitShell:
                     self.repo.notes_add(commit_sha, commit_summary, namespace="agit/commit-summary")
                     new_session_summary = summarizer.update_session_summary(
                         current_summary=self.state.session_summary,
-                        turns=turns,
-                        diff=diff_before_commit,
+                        trace=trace_text,
                         commit_summary=commit_summary,
                     )
                     self.state.session_summary = new_session_summary
