@@ -517,6 +517,7 @@ class ProxyRunner:
         self._base_check_at = 0.0
         self._cwd_drift_checked = False
         self._cwd_check_at = 0.0
+        self._cwd_launch_at = 0.0  # epoch of the latest backend launch (set in _spawn)
         self._relaunch_times: list[float] = []
         self._exiting = False
         self._finalized_on_exit = False
@@ -713,6 +714,7 @@ class ProxyRunner:
                 "_base_check_at": 0.0,
                 "_cwd_drift_checked": False,
                 "_cwd_check_at": 0.0,
+                "_cwd_launch_at": 0.0,
                 "_relaunch_times": [],
                 "_exiting": False,
                 "_finalized_on_exit": False,
@@ -872,6 +874,12 @@ class ProxyRunner:
         # owns its BackendProcess; child_pid / master_fd remain readable on the
         # runner via the Session-delegating compat properties.
         self.active.process = BackendProcess.spawn(command, str(self.repo.repo))
+        # Re-arm the cwd-drift check for this launch, and remember when it started:
+        # only turns recorded at/after this time count, so a stale cwd left in the
+        # transcript before this launch can't trigger a false drift warning (#72).
+        self._cwd_drift_checked = False
+        self._cwd_check_at = 0.0
+        self._cwd_launch_at = time.time()
 
     def _setup_worktree_confinement_notice(self) -> None:
         # When confinement is requested but the platform can't enforce it (no
@@ -1040,6 +1048,13 @@ class ProxyRunner:
         # that happens the agent works in the wrong directory: its turns aren't
         # tracked here and writes outside the worktree are sandbox-blocked. Detect
         # it from the cwd the backend records, and warn once with how to recover.
+        #
+        # Only the cwd of a turn recorded *after* this launch counts (`since`): a
+        # resume — especially of an imported/shared session — leaves a stale cwd in
+        # the transcript that points elsewhere (the base repo, another machine's
+        # path) but is harmless, because the next real turn runs in the worktree.
+        # Without the time gate that stale value latched a confusing false warning
+        # before the agent had done anything (#72).
         if self._cwd_drift_checked:
             return
         if self.worktree is None:
@@ -1053,18 +1068,18 @@ class ProxyRunner:
             self._cwd_drift_checked = True  # backend doesn't record a cwd
             return
         try:
-            recorded = fn(self.state.backend_session_id)
+            recorded = fn(self.state.backend_session_id, since=self._cwd_launch_at or None)
         except Exception as error:
             self._debug(f"cwd drift check failed: {error!r}")
             return
         if not recorded:
-            return  # nothing recorded yet — check again next tick
+            return  # no post-launch turn recorded yet — check again next tick
         self._cwd_drift_checked = True
         if os.path.realpath(recorded) == os.path.realpath(str(self.repo.repo)):
             return  # on the worktree, as intended
         self._debug(f"cwd drift: backend recorded {recorded}, worktree is {self.repo.repo}")
         self._set_message(
-            f"⚠ The agent is working in:\n    {recorded}\n"
+            f"⚠ The agent ran a turn in:\n    {recorded}\n"
             f"not this session's worktree:\n    {self.repo.repo}\n"
             "This is Claude's resume-cwd bug (#58591): turns made there are NOT committed "
             "by aGiT, and edits outside the worktree are blocked by the sandbox.\n"
