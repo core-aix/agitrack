@@ -703,12 +703,14 @@ def test_render_html_wires_the_activity_chart(tmp_path):
     assert "activity over time" in html
     assert 'id="ts-canvas"' in html and 'id="ts-legend"' in html
     assert 'id="ts-gran"' in html and "function renderChart" in html and "const tsOn" in html
-    # x-axis zoom/pan over the loaded buckets: wheel zoom, drag pan, dblclick reset.
+    # Mouse zoom/pan over the loaded buckets is kept (wheel zoom, drag pan,
+    # dblclick reset), with a visible hint to scroll.
     assert "function onChartWheel" in html and 'addEventListener("wheel"' in html
     assert "function tsBounds" in html and 'addEventListener("dblclick"' in html
-    # An easy "look back" dropdown that zooms the x axis to recent history.
-    assert 'id="ts-look"' in html and "function applyLookback" in html
-    assert "last 7 days" in html and "last 30 days" in html
+    assert "scroll to zoom" in html
+    # The redundant per-plot SHOW range dropdown was removed — the filter's "range"
+    # (period) is the single range selector.
+    assert 'id="ts-look"' not in html and "function applyLookback" not in html
     data = _embedded_data(html)
     assert "timeseries" in data and sum(data["timeseries"]["commits"]) == 7
 
