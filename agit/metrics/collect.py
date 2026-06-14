@@ -58,6 +58,37 @@ _NOREPLY_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A `Co-Authored-By: Name <email>` trailer (git's standard multi-author credit;
+# GitHub squash-merges emit one per PR contributor).
+_CO_AUTHOR_RE = re.compile(r"(?im)^\s*co-authored-by:\s*(.*?)\s*<([^>]+)>\s*$")
+
+
+def _is_non_human_committer(name: str, email: str) -> bool:
+    """Whether a co-author trailer is the AI assistant or a bot rather than a
+    person — those aren't filterable committers. aGiT itself adds no co-author
+    trailers, so the only ones seen are the Claude credit (``noreply@anthropic.com``)
+    and bot accounts (a ``[bot]`` login, e.g. ``github-actions[bot]``)."""
+    name, email = name.lower(), email.lower()
+    return email.endswith("noreply@anthropic.com") or "[bot]" in name or "[bot]" in email
+
+
+def _parse_co_authors(body: str) -> list[tuple[str, str]]:
+    """Human co-authors from a commit message's ``Co-Authored-By:`` trailers, as
+    ``(name, lowercased email)`` pairs, de-duplicated and order-preserving."""
+    seen: set[tuple[str, str]] = set()
+    out: list[tuple[str, str]] = []
+    for match in _CO_AUTHOR_RE.finditer(body):
+        name = match.group(1).strip()
+        email = match.group(2).strip().lower()
+        if _is_non_human_committer(name, email):
+            continue
+        key = (name, email)
+        if key not in seen:
+            seen.add(key)
+            out.append(key)
+    return out
+
+
 # Same word-overlap rule as commit_engine._same_prompt: editing artifacts and
 # rephrasings shuffle words, genuinely different prompts share few.
 _WORD_RE = re.compile(r"[a-z0-9]+")
@@ -85,6 +116,10 @@ class CommitStat:
     insertions: int = 0
     deletions: int = 0
     covered_commits: list[str] = field(default_factory=list)
+    # Human co-authors from `Co-Authored-By:` trailers (name, lowercased email),
+    # so a commit credited to several people is filterable under each of them (#54).
+    # The AI assistant and bot accounts are excluded — they aren't committers.
+    co_authors: list[tuple[str, str]] = field(default_factory=list)
     prompt: str = ""  # the turn's prompt text (loop detection)
     user_prompts: list[str] = field(default_factory=list)  # trace ## User entries
     metadata_block: str = ""  # raw `# aGiT Metadata` text, for duplicate detection
@@ -238,6 +273,18 @@ class Dashboard:
     def label_of(self, stat: CommitStat) -> str:
         return self.committer_labels.get((stat.author or "", (stat.email or "").strip().lower())) or "unknown"
 
+    def committers_of(self, stat: CommitStat) -> list[str]:
+        """Every merged committer label credited on a commit — its primary author
+        first, then any human co-authors — de-duplicated. A commit shows up when
+        filtering on any of these (#54)."""
+        labels = self.committer_labels
+        out = [self.label_of(stat)]
+        for name, email in stat.co_authors:
+            label = labels.get((name or "", (email or "").strip().lower()))
+            if label and label not in out:
+                out.append(label)
+        return out
+
     @property
     def by_author(self) -> dict[str, dict[str, int]]:
         """Per committer, lines split into aGiT-tracked AI and non-tracked.
@@ -307,51 +354,55 @@ def resolve_committers(stats: list[CommitStat], sha_logins: dict[str, str] | Non
     otherwise it is the person's most frequent name. Two people who never share a
     login or email but share a name cannot be told apart here and may merge."""
     sha_logins = sha_logins or {}
-    union = _Union()
-    logins: set[str] = set()
-
-    def login_for(stat: CommitStat, email: str) -> str | None:
-        return sha_logins.get(stat.sha) or _login_of(email)
-
+    # Flatten every contribution — each commit's primary author plus its human
+    # co-authors — as (name, lowercased email, login-hint). Only the PRIMARY
+    # author can borrow the commit's GitHub login (``sha_logins`` is keyed by sha
+    # and maps to the author, not a co-author); a co-author resolves to a login
+    # only through a no-reply address. This is what lets a co-authored commit be
+    # filtered under each contributor (#54).
+    contributions: list[tuple[str, str, str | None]] = []
     for stat in stats:
         email = (stat.email or "").strip().lower()
-        node = ("pair", stat.author or "", email)
+        contributions.append((stat.author or "", email, sha_logins.get(stat.sha) or _login_of(email)))
+        for name, co_email in stat.co_authors:
+            ce = (co_email or "").strip().lower()
+            contributions.append((name or "", ce, _login_of(ce)))
+
+    union = _Union()
+    logins: set[str] = set()
+    for name, email, login in contributions:
+        node = ("pair", name, email)
         union.find(node)
         if email:
             union.union(node, ("email", email))
-        login = login_for(stat, email)
         if login:
             union.union(node, ("login", login.lower()))
             logins.add(login.lower())
     # Bridge a plain email to a login when its local-part is that login.
-    for stat in stats:
-        email = (stat.email or "").strip().lower()
+    for _name, email, _login in contributions:
         local = email.split("@", 1)[0]
         if email and local in logins:
             union.union(("email", email), ("login", local))
 
     root_logins: dict[object, set[str]] = defaultdict(set)
     root_names: dict[object, Counter[str]] = defaultdict(Counter)
-    for stat in stats:
-        email = (stat.email or "").strip().lower()
-        root = union.find(("pair", stat.author or "", email))
-        if stat.author:
-            root_names[root][stat.author] += 1
-        login = login_for(stat, email)
+    for name, email, login in contributions:
+        root = union.find(("pair", name, email))
+        if name:
+            root_names[root][name] += 1
         if login:
             root_logins[root].add(login.lower())
 
     labels: dict[tuple[str, str], str] = {}
-    for stat in stats:
-        email = (stat.email or "").strip().lower()
-        root = union.find(("pair", stat.author or "", email))
+    for name, email, _login in contributions:
+        root = union.find(("pair", name, email))
         if root_logins[root]:
             label = sorted(root_logins[root])[0]
         elif root_names[root]:
             label = root_names[root].most_common(1)[0][0]
         else:
             label = email or "unknown"
-        labels[(stat.author or "", email)] = label
+        labels[(name, email)] = label
     return labels
 
 
@@ -478,6 +529,7 @@ def build_dashboard(repo: GitRepo, ref: str = "HEAD", *, sha_logins: dict[str, s
 def _parse_commit(sha: str, author: str, email: str, committed_at: str, body: str) -> CommitStat:
     subject = body.splitlines()[0] if body.splitlines() else ""
     timestamp = int(committed_at) if committed_at.isdigit() else 0
+    co_authors = _parse_co_authors(body)
     # A clean aGiT turn carries exactly one metadata block. More than one means
     # the message is an aggregate — a squash or PR merge that concatenated
     # several commits' blocks (possibly across several rounds of squashing, which
@@ -485,7 +537,7 @@ def _parse_commit(sha: str, author: str, email: str, committed_at: str, body: st
     # usage are still counted, and so the squash can be expanded in the UI.
     if body.count(METADATA_HEADER) > 1:
         constituents = _parse_constituents(body)
-        return _build_squash(sha, author, email, subject, timestamp, body, constituents)
+        return _build_squash(sha, author, email, subject, timestamp, body, constituents, co_authors)
     metadata = _parse_metadata(body)
     commit_type = metadata.get("commit_type")
     if commit_type == "agent":
@@ -518,6 +570,7 @@ def _parse_commit(sha: str, author: str, email: str, committed_at: str, body: st
         model=metadata.get("model"),
         tokens=_parse_tokens(metadata),
         covered_commits=(metadata.get("covered_commits") or "").split(),
+        co_authors=co_authors,
         prompt=_extract_prompt(body, subject, kind),
         user_prompts=_extract_user_prompts(body),
         metadata_block=_metadata_block(body),
@@ -609,6 +662,7 @@ def _build_squash(
     timestamp: int,
     body: str,
     constituents: list[CommitStat],
+    co_authors: list[tuple[str, str]] | None = None,
 ) -> CommitStat:
     """The parent stat for a squash: it keeps the combined diff and carries the
     summed tokens of its constituents, classified by what they contain (any AI
@@ -633,6 +687,7 @@ def _build_squash(
         backend=dominant.backend if dominant else None,
         model=dominant.model if dominant else None,
         tokens=dict(tokens),
+        co_authors=co_authors or [],
         message=body.strip(),
         constituents=constituents,
     )

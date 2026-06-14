@@ -345,6 +345,66 @@ def test_resolve_committers_uses_github_logins_when_provided():
     assert set(labels.values()) == {"patexample"}
 
 
+# --- co-author trailers (multiple committers per commit, #54) ------------------
+
+
+def test_parse_co_authors_extracts_humans_and_drops_ai_and_bots():
+    from agit.metrics.collect import _parse_co_authors
+
+    body = (
+        "Add a feature\n\n"
+        "Co-authored-by: Alice Example <alice@example.com>\n"
+        "Co-Authored-By: Bob Example <bob@users.noreply.github.com>\n"
+        "Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>\n"
+        "Co-authored-by: github-actions[bot] <github-actions[bot]@users.noreply.github.com>\n"
+        "Co-authored-by: Alice Example <alice@example.com>\n"  # duplicate
+    )
+    assert _parse_co_authors(body) == [
+        ("Alice Example", "alice@example.com"),
+        ("Bob Example", "bob@users.noreply.github.com"),
+    ]
+
+
+def _co_authored_dashboard(subject: str):
+    from agit.metrics.collect import Dashboard, _detect_loops
+
+    stat = CommitStat(
+        sha="s1",
+        author="Alex Doe",
+        email="alex@example.com",
+        subject=subject,
+        kind="agent",
+        timestamp=1_700_000_000,
+        co_authors=[("Robin Roe", "robin@example.com")],
+    )
+    return Dashboard(repo="r", branch="main", stats=[stat], loops=_detect_loops([stat])), stat
+
+
+def test_co_authored_commit_is_filterable_under_every_committer():
+    from agit.metrics import dashboard_data
+
+    dash, stat = _co_authored_dashboard("Pair feature")
+    # Both the primary author and the co-author are committers of this one commit.
+    assert set(dash.committers_of(stat)) == {"Alex Doe", "Robin Roe"}
+    data = dashboard_data(dash)
+    # Both surface as filter options, and the commit lists both committers.
+    assert {"Alex Doe", "Robin Roe"} <= set(data["committers"])
+    entry = next(c for c in data["commits"] if c["subject"] == "Pair feature")
+    assert set(entry["committers"]) == {"Alex Doe", "Robin Roe"}
+
+
+def test_filter_stats_matches_any_committer():
+    from agit.metrics.web import _filter_stats, _options
+
+    dash, _ = _co_authored_dashboard("Shared work")
+    # Filtering on the co-author (not the primary git author) still returns it...
+    for who in ("Robin Roe", "Alex Doe"):
+        matched = _filter_stats(dash, author=who, backend="", model="", frm=0, to=0)
+        assert [s.subject for s in matched] == ["Shared work"], who
+    # ...and both names appear as selectable committer options.
+    assert {"Alex Doe", "Robin Roe"} <= set(_options(dash)["committers"])
+
+
 def test_resolve_logins_falls_back_to_empty_without_gh(monkeypatch, tmp_path):
     from agit.metrics import github
 
