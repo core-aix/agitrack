@@ -301,6 +301,42 @@ class AgitState:
         self.data["auto_share_sessions"] = sorted(current)
         self.save()
 
+    # --- shared-session id lineage (#55) -----------------------------------
+    # The backend can mint a new session id when a conversation is resumed
+    # (Claude forks on `--resume`). A session shared or auto-shared under its old
+    # id must still be recognised as shared after that drift, otherwise the
+    # marker and auto-update silently disappear on the next run. We record, for a
+    # drifted live id, the previous id it forked from, so callers can walk back to
+    # the original (shared) id.
+
+    def shared_session_aliases(self) -> dict[str, str]:
+        return {str(k): str(v) for k, v in (self.data.get("shared_session_aliases") or {}).items()}
+
+    def add_shared_session_alias(self, new_id: str | None, previous_id: str | None) -> None:
+        if not new_id or not previous_id or new_id == previous_id:
+            return
+        aliases = self.shared_session_aliases()
+        aliases[str(new_id)] = str(previous_id)
+        self.data["shared_session_aliases"] = aliases
+        self.save()
+
+    def session_lineage(self, session_id: str | None) -> list[str]:
+        """The id plus every ancestor id it forked from across resume drift."""
+        if not session_id:
+            return []
+        aliases = self.shared_session_aliases()
+        chain = [str(session_id)]
+        seen = {str(session_id)}
+        cur = str(session_id)
+        while cur in aliases:
+            parent = aliases[cur]
+            if parent in seen:
+                break  # defensive: never loop on a corrupt chain
+            chain.append(parent)
+            seen.add(parent)
+            cur = parent
+        return chain
+
     def pending_trace(self) -> list[dict]:
         return list(self.data.get("pending_trace") or [])
 

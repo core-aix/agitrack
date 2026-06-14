@@ -309,6 +309,50 @@ def test_state_auto_share_opt_in(tmp_path):
     assert state.auto_share_enabled(None) is False
 
 
+def test_state_shared_session_lineage_chain(tmp_path):
+    from agit.config import AgitState
+
+    state = AgitState(tmp_path)
+    assert state.session_lineage("a") == ["a"]
+    # Two successive resume drifts: a -> b -> c.
+    state.add_shared_session_alias("b", "a")
+    state.add_shared_session_alias("c", "b")
+    assert state.session_lineage("c") == ["c", "b", "a"]
+    assert state.session_lineage("b") == ["b", "a"]
+    # Persists to base state and survives reload.
+    assert AgitState(tmp_path).session_lineage("c") == ["c", "b", "a"]
+    # Defensive: a corrupt self-referential alias never loops.
+    state.add_shared_session_alias("d", "d")  # ignored (new == previous)
+    assert state.session_lineage("d") == ["d"]
+
+
+def test_runner_recognises_shared_session_after_id_drift(tmp_path):
+    # #55: a session shared under id "old" that the backend resumes as "new" must
+    # still be marked shared and keep auto-sharing, via the recorded lineage.
+    from proxy_helpers import make_runner
+    from agit.config import AgitState
+
+    (tmp_path / "repo").mkdir()
+    repo = _init_repo(tmp_path / "repo")
+    runner = make_runner()
+    runner.base_repo = repo
+    runner._debug = lambda *a, **k: None
+    base_state = AgitState(repo.repo)
+    runner._user_state = lambda: AgitState(repo.repo)
+    runner._my_shared_session_ids = lambda: {"old"}
+
+    # Before drift: "old" is recognised directly.
+    assert runner._session_is_shared("old", {"old"}) is True
+    # Auto-share opted in under "old".
+    base_state.set_auto_share("old", True)
+
+    # The backend forks "old" -> "new" on resume.
+    runner._record_shared_alias_on_drift("old", "new")
+
+    assert runner._session_is_shared("new", runner._my_shared_session_ids()) is True
+    assert runner._session_auto_shared("new") is True
+
+
 # --- Claude transcript export / import --------------------------------------
 
 
