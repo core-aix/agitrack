@@ -2048,7 +2048,8 @@ class ProxyRunner:
         previous = self.state.backend_session_id
         # Preserve shared-session recognition across the id drift: if this session
         # was shared/auto-shared under its previous id, remember new→previous so it
-        # still shows as shared (and keeps auto-updating) after resume (#55).
+        # still shows as shared (and keeps auto-updating) after resume (#55). Also
+        # carries the original share name onto the new id (round-trip re-sharing).
         self._record_shared_alias_on_drift(previous, new_session_id)
         # If the worktree's active conversation changed to a different backend
         # session that aGiT didn't start, the user likely started it from inside
@@ -2611,6 +2612,17 @@ class ProxyRunner:
         # Operates on the base repo: it owns the remote and the shared object db.
         return SharedSessionStore(self.base_repo)
 
+    def _share_name_for(self, session_id: str | None) -> str:
+        # Re-share an imported shared session under its ORIGINAL share name (kept
+        # per session and carried across id-drift), so a back-and-forth round-trip
+        # keeps updating the same shared entry. Falls back to the local session
+        # name for a session that originated here (#55).
+        if session_id:
+            origin = self._user_state().shared_origin_name(session_id)
+            if origin:
+                return origin
+        return self._session_name(self.active_index)
+
     def _sweep_orphan_shared_sessions(self, *, fetch: bool) -> None:
         # Reclaim dangling shared-session snapshots (old/unshared versions) left by
         # rewrites — only when this repo has actually used sharing (the ref exists),
@@ -2653,7 +2665,7 @@ class ProxyRunner:
                 self._render()
                 return
             self.global_config.acknowledge_session_sharing()
-        payload = self._share_payload(session_id, self._session_name(self.active_index))
+        payload = self._share_payload(session_id, self._share_name_for(session_id))
         if payload is None:
             self._set_message("Could not read the session transcript to share.")
             self._render()
@@ -2903,6 +2915,11 @@ class ProxyRunner:
             )
             if relevant:
                 user.add_shared_session_alias(new_id, previous)
+            # Carry the original share name onto the new id, so a re-share after the
+            # backend forks the id still updates the same shared entry (#55).
+            origin = user.shared_origin_name(previous)
+            if origin:
+                user.set_shared_origin_name(new_id, origin)
         except Exception as error:
             self._debug(f"record shared alias failed: {error!r}")
 
@@ -2942,7 +2959,7 @@ class ProxyRunner:
         # active session / config, which can change underneath a thread).
         ctx = {
             "session_id": sid,
-            "name": self._session_name(self.active_index),
+            "name": self._share_name_for(sid),
             "login": self._cached_or_resolve_login(),
             "backend": backend,
             "repo_path": self.repo.repo,
@@ -3035,17 +3052,21 @@ class ProxyRunner:
         already_live = any(
             getattr(getattr(s, "state", None), "backend_session_id", None) == session_id for s in self.sessions
         )
+        # Remember the name this session was shared under, so a later re-share (on
+        # this or any machine) updates the SAME shared entry instead of prepending
+        # the sharer id again — which made the name grow on every round-trip and
+        # never converge (#55).
+        self._user_state().set_shared_origin_name(session_id, entry.name)
         if already_live:
-            self._resume_conversation(f"{entry.github_id}-{entry.name}", session_id, backend=entry_backend)
+            self._resume_conversation(entry.name, session_id, backend=entry_backend)
             return
-        # Give the imported session a clear local name (#71): a shared session
-        # arrives identified only by its sharer/name on the remote, so prompt for
-        # a local session name — defaulting to a clean, deduped derivation — the
-        # same way a brand-new session is named, instead of silently adopting the
-        # raw "<sharer>-<name>" slug.
+        # Give the imported session a clear local name (#71): prompt for a local
+        # session name the same way a brand-new session is named. Default to the
+        # original share name (deduped) — NOT a "<sharer>-<name>" slug, which grew
+        # without bound when sharing back and forth (#55).
         name = self._prompt_session_name(
             "Resume shared session",
-            default=self._dedupe_session_name(f"{entry.github_id}-{entry.name}"),
+            default=self._dedupe_session_name(entry.name),
         )
         if name is None:
             self._set_message("Cancelled.")
