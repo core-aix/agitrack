@@ -30,7 +30,6 @@ def test_summarize_commit() -> None:
     summary = summarizer.summarize_commit(
         turns=turns,
         diff="diff --git a/file.py b/file.py\n+new code",
-        session_summary=None,
     )
     assert summary == "This is a commit summary."
     backend.run.assert_called_once()
@@ -39,38 +38,34 @@ def test_summarize_commit() -> None:
     assert call_args[1]["session_id"] is None
 
 
-def test_summarize_commit_with_session_context() -> None:
+def test_commit_summary_prompt_is_self_contained() -> None:
+    # A commit summary must describe ONLY this commit (its turns + diff). It must
+    # not be seeded with any prior/rolling session summary — that contaminated the
+    # commit message with earlier, unrelated work and made the model respond with
+    # "the summary you provided is already complete".
     backend = Mock()
     backend.run.return_value = AgentResult(
         backend="test",
         session_id=None,
         model="test-model",
-        final_response="Updated summary with new changes.",
+        final_response="Fixed the bug in the parser.",
         exit_code=0,
         tokens=TokenUsage(),
     )
     summarizer = Summarizer(backend, model="test-model")
-    turns = [
-        SessionTurn(
-            user_message_id="1",
-            assistant_message_id="2",
-            user_prompt="Fix a bug",
-            final_response="Bug fixed.",
-            tokens=TokenUsage(),
-            model="test-model",
-            complete=True,
-            interrupted=False,
-        )
-    ]
-    summary = summarizer.summarize_commit(
-        turns=turns,
+    # The rolling summary that used to leak in — it must not reach the backend.
+    summarizer.summarize_commit(
+        turns=[_turn()],
         diff="diff --git a/file.py b/file.py\n-buggy code\n+fixed code",
-        session_summary="Previous session: Added new feature.",
     )
-    assert summary == "Updated summary with new changes."
-    call_args = backend.run.call_args
-    prompt = call_args[0][0]
-    assert "Previous session: Added new feature." in prompt
+    prompt = backend.run.call_args[0][0]
+    assert "Add a new feature" in prompt  # this turn's own content is present
+    assert "Previous session" not in prompt
+    assert "Current session context" not in prompt  # the removed injection label
+    # summarize_commit no longer accepts a session_summary argument at all.
+    import inspect
+
+    assert "session_summary" not in inspect.signature(summarizer.summarize_commit).parameters
 
 
 def test_update_session_summary() -> None:
@@ -194,6 +189,25 @@ def test_summarize_pre_compaction() -> None:
     assert "Current summary." in prompt
 
 
+def test_every_summary_call_is_stateless() -> None:
+    # No summary task may continue a previous backend session — every call must
+    # pass session_id=None so the backend starts fresh (no cross-request leak).
+    # This is backend-agnostic: it guards both Claude and OpenCode, which only
+    # resume when handed a session id.
+    backend = Mock()
+    backend.run.return_value = _result("A summary.")
+    summarizer = Summarizer(backend)
+    exported = ExportedSession(session_id="s", model="m", updated=0, turns=[_turn()])
+
+    summarizer.summarize_commit(turns=[_turn()], diff="+x")
+    summarizer.update_session_summary(current_summary="prev", turns=[_turn()], diff="+x", commit_summary="c")
+    summarizer.summarize_pre_compaction(exported_session=exported, current_summary="prev")
+
+    assert backend.run.call_count == 3
+    for call in backend.run.call_args_list:
+        assert call.kwargs["session_id"] is None
+
+
 # --- unsuccessful summaries are rejected, not used as commit subjects (#8) ----
 
 
@@ -229,7 +243,7 @@ def test_summarizer_raises_on_session_limit_error_text() -> None:
     backend.run.return_value = _result("You've hit your session limit. Your limit will reset at 3pm.")
     summarizer = Summarizer(backend)
     with pytest.raises(UnusableSummaryError):
-        summarizer.summarize_commit(turns=[_turn()], diff="+x", session_summary=None)
+        summarizer.summarize_commit(turns=[_turn()], diff="+x")
 
 
 def test_summarizer_raises_on_nonzero_exit_code() -> None:
@@ -240,7 +254,7 @@ def test_summarizer_raises_on_nonzero_exit_code() -> None:
     backend.run.return_value = _result("Looks like a fine summary.", exit_code=1)
     summarizer = Summarizer(backend)
     with pytest.raises(UnusableSummaryError):
-        summarizer.summarize_commit(turns=[_turn()], diff="+x", session_summary=None)
+        summarizer.summarize_commit(turns=[_turn()], diff="+x")
 
 
 def test_summarizer_raises_on_empty_response() -> None:
@@ -251,7 +265,7 @@ def test_summarizer_raises_on_empty_response() -> None:
     backend.run.return_value = _result("   \n  ")
     summarizer = Summarizer(backend)
     with pytest.raises(UnusableSummaryError):
-        summarizer.summarize_commit(turns=[_turn()], diff="+x", session_summary=None)
+        summarizer.summarize_commit(turns=[_turn()], diff="+x")
 
 
 def test_summary_is_usable_detects_error_shapes() -> None:
@@ -314,7 +328,7 @@ def test_summarizer_raises_when_backend_echoes_the_prompt() -> None:
     backend.run.side_effect = echo_run
     summarizer = Summarizer(backend)
     with pytest.raises(UnusableSummaryError):
-        summarizer.summarize_commit(turns=[_turn()], diff="+x", session_summary=None)
+        summarizer.summarize_commit(turns=[_turn()], diff="+x")
     assert captured["prompt"].startswith("You are a technical summarizer")
 
 
@@ -388,5 +402,5 @@ def test_summarize_commit_strips_preamble_end_to_end() -> None:
     # summary (which becomes the commit subject), not "The summary has been written".
     backend = Mock()
     backend.run.return_value = _result("Here is the summary:\n\nAdded the committer filter.")
-    summary = Summarizer(backend).summarize_commit(turns=[_turn()], diff="+x", session_summary=None)
+    summary = Summarizer(backend).summarize_commit(turns=[_turn()], diff="+x")
     assert summary == "Added the committer filter."

@@ -4496,7 +4496,7 @@ class ProxyRunner:
 
         def worker() -> None:
             try:
-                result["summary"] = summarizer.summarize_commit(turns=turns, diff=diff, session_summary=session_summary)
+                result["summary"] = summarizer.summarize_commit(turns=turns, diff=diff)
             except Exception as error:  # surfaced by the service tick
                 result["error"] = repr(error)
             else:

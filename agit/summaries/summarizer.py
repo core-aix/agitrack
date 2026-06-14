@@ -167,9 +167,13 @@ class Summarizer:
         *,
         turns: list[SessionTurn],
         diff: str,
-        session_summary: str | None = None,
     ) -> str:
-        return self._run(self._build_commit_prompt(turns, diff, session_summary))
+        # A commit summary describes ONLY this commit — its own turns and diff. It
+        # is deliberately not seeded with the rolling session summary: feeding a
+        # prior summary in made the model treat it as "the summary you provided"
+        # and fold earlier, unrelated work into this commit's message. The rolling
+        # session summary is maintained separately (update_session_summary).
+        return self._run(self._build_commit_prompt(turns, diff))
 
     def update_session_summary(
         self,
@@ -213,11 +217,8 @@ class Summarizer:
         self,
         turns: list[SessionTurn],
         diff: str,
-        session_summary: str | None,
     ) -> str:
         parts = [COMMIT_SUMMARY_SYSTEM, "\n\n"]
-        if session_summary:
-            parts.extend(["Current session context:\n", session_summary, "\n\n"])
         parts.append("Recent conversation turns:\n")
         for turn in turns:
             if turn.user_prompt:
