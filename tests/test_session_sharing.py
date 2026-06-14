@@ -284,6 +284,7 @@ def test_resume_shared_prompts_to_pull_when_local_exists(tmp_path, monkeypatch):
     )
     runner.sessions = []  # not live
     runner._resume_conversation = lambda name, sid, **k: None
+    runner._prompt_session_name = lambda title, *, default: default  # accept the local name (#71)
     # First popup selects the session; second is the local-vs-shared choice → Pull.
     runner._select_popup = lambda title, options: options[0]
 
@@ -531,12 +532,13 @@ def test_runner_resume_shared_imports_and_resumes(tmp_path, monkeypatch):
     resumed = []
     runner._resume_conversation = lambda name, sid, *, backend=None: resumed.append((name, sid, backend))
     runner._select_popup = lambda title, options: options[0]  # pick the first (only) entry
+    runner._prompt_session_name = lambda title, *, default: default  # accept the offered local name (#71)
 
     runner._resume_shared_session_menu()
 
     assert backend.imported == ("bob-sid", "bob's chat", False)  # imported, no overwrite (no local copy)
-    # Resumed under <id>-<name>, pinned to the entry's backend (defaults to the
-    # active backend when the manifest doesn't record one).
+    # Resumed under the local name (defaulting to <sharer>-<name>), pinned to the
+    # entry's backend (defaults to the active backend when the manifest omits one).
     assert resumed == [("bob-cool-fix", "bob-sid", "claude")]
 
 
@@ -565,6 +567,7 @@ def test_runner_resume_shared_crosses_backends(tmp_path, monkeypatch):
     resumed: list = []
     runner._resume_conversation = lambda name, sid, *, backend=None: resumed.append((name, sid, backend))
     runner._select_popup = lambda title, options: options[0]
+    runner._prompt_session_name = lambda title, *, default: default  # accept the offered local name (#71)
 
     runner._resume_shared_session_menu()
 

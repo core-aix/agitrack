@@ -436,6 +436,45 @@ def test_resolve_logins_falls_back_to_empty_without_gh(monkeypatch, tmp_path):
     assert github.resolve_logins(repo) == {}
 
 
+def test_gh_status_reports_missing_unauth_and_ok(monkeypatch):
+    from agit.metrics import github
+
+    # Not installed.
+    monkeypatch.setattr(github.shutil, "which", lambda _name: None)
+    assert github.gh_status() == "missing"
+    assert github.gh_available() is False
+
+    # Installed but the auth check fails (not logged in).
+    monkeypatch.setattr(github.shutil, "which", lambda _name: "/usr/bin/gh")
+
+    class _Fail:
+        returncode = 1
+
+    monkeypatch.setattr(github.subprocess, "run", lambda *a, **k: _Fail())
+    assert github.gh_status() == "unauthenticated"
+    assert github.gh_available() is False
+
+    # Installed and authenticated.
+    class _Ok:
+        returncode = 0
+
+    monkeypatch.setattr(github.subprocess, "run", lambda *a, **k: _Ok())
+    assert github.gh_status() == "ok"
+    assert github.gh_available() is True
+
+
+def test_gh_status_unauthenticated_when_check_errors(monkeypatch):
+    from agit.metrics import github
+
+    monkeypatch.setattr(github.shutil, "which", lambda _name: "/usr/bin/gh")
+
+    def boom(*a, **k):
+        raise OSError("nope")
+
+    monkeypatch.setattr(github.subprocess, "run", boom)
+    assert github.gh_status() == "unauthenticated"
+
+
 def test_resolve_logins_parses_gh_tsv_and_caches(monkeypatch, tmp_path):
     from agit.metrics import github
 
