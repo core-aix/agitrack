@@ -1825,6 +1825,34 @@ def test_resumable_sessions_dedupes_by_id(tmp_path):
     assert [ref.id for ref in runner._resumable_sessions()] == ["shared"]
 
 
+def test_resumable_sessions_includes_reserved_named_session_without_transcript(tmp_path):
+    # #75: a no-commit session reserves its name in the durable record, but the
+    # backend has no transcript for it (no commits, worktree emptied). It must
+    # still be offered for resume so the reserved name isn't stranded — taken yet
+    # un-resumable.
+    runner, _base = _resume_listing_runner(tmp_path, base_refs=[], worktree_sessions=[])
+    runner._agit_named_sessions = lambda: {"ghost-id": "experiment"}
+
+    refs = runner._resumable_sessions()
+
+    assert [(ref.id, ref.label) for ref in refs] == [("ghost-id", "experiment")]
+    # The very same record reserves the name, so it is both taken AND resumable.
+    assert runner._session_name_taken("experiment") is True
+
+
+def test_resumable_sessions_does_not_duplicate_named_session_with_transcript(tmp_path):
+    # When the backend still enumerates a named conversation, it appears once
+    # (the durable record must not add a second copy).
+    runner, _base = _resume_listing_runner(
+        tmp_path,
+        base_refs=[],
+        worktree_sessions=[("alpha", SessionRef("wt-alpha", 300.0))],
+    )
+    runner._agit_named_sessions = lambda: {"wt-alpha": "alpha"}
+
+    assert [ref.id for ref in runner._resumable_sessions()] == ["wt-alpha"]
+
+
 def test_named_sessions_recovers_name_from_worktree_key(tmp_path):
     # When the persisted record never linked a conversation's name, the worktree
     # directory it ran in (its name) labels it in the resume list.
@@ -2917,6 +2945,76 @@ def test_resume_switches_to_already_live_conversation():
     assert "_created" not in runner.__dict__
 
 
+# --- shared-session resume gives a local name (#71) ---
+
+
+def _shared_resume_runner():
+    import types
+
+    runner = make_runner(name="main")
+    runner.sessions = []
+    runner._render = lambda: None
+    runner._set_message = lambda *a, **k: None
+    runner.base_repo = types.SimpleNamespace(repo="/repo")
+    runner._taken_session_names = lambda: set()
+    entry = types.SimpleNamespace(
+        github_id="alice",
+        name="fix-parser",
+        display="alice/fix-parser",
+        manifest={"session_id": "sid-1", "backend": "claude"},
+    )
+    store = types.SimpleNamespace(
+        fetch=lambda: None,
+        entries=lambda: [entry],
+        read_transcript=lambda e: "transcript-body",
+    )
+    runner._shared_store = lambda: store
+    runner._select_popup = lambda title, options: options[0]  # pick the only entry
+    runner.backend = types.SimpleNamespace(
+        name="claude",
+        has_local_session=lambda *a, **k: False,
+        import_shared_session=lambda *a, **k: True,
+    )
+    runner.__dict__["_resumed"] = []
+    runner._resume_conversation = lambda name, sid, **k: runner.__dict__["_resumed"].append((name, sid, k))
+    return runner
+
+
+def test_shared_resume_prompts_for_local_name():
+    runner = _shared_resume_runner()
+    # The default offered to the prompt is the deduped "<sharer>-<name>"; the user
+    # accepts a local name of their own.
+    seen = {}
+
+    def fake_prompt(title, *, default):
+        seen["default"] = default
+        return "my-copy"
+
+    runner._prompt_session_name = fake_prompt
+
+    runner._resume_shared_session_menu()
+
+    assert seen["default"] == "alice-fix-parser"
+    assert runner.__dict__["_resumed"] == [("my-copy", "sid-1", {"backend": "claude"})]
+
+
+def test_shared_resume_cancel_on_name_prompt_does_not_resume():
+    runner = _shared_resume_runner()
+    runner._prompt_session_name = lambda *a, **k: None  # user cancels naming
+
+    runner._resume_shared_session_menu()
+
+    assert runner.__dict__["_resumed"] == []
+
+
+def test_dedupe_session_name_avoids_collisions():
+    runner = make_runner(name="main")
+    runner._taken_session_names = lambda: {"alice-fix-parser", "alice-fix-parser-2"}
+    assert runner._dedupe_session_name("alice/fix-parser") == "alice-fix-parser-3"
+    runner._taken_session_names = lambda: set()
+    assert runner._dedupe_session_name("alice/fix-parser") == "alice-fix-parser"
+
+
 # --- base branch switched out-of-band ---
 
 
@@ -3222,10 +3320,11 @@ def _drift_runner(recorded_cwd, worktree_path):
         worktree=types.SimpleNamespace(name="session-1"),
         repo=types.SimpleNamespace(repo=worktree_path),
         state=types.SimpleNamespace(backend_session_id="sess-1"),
-        backend=types.SimpleNamespace(recorded_working_dir=lambda sid: recorded_cwd),
+        backend=types.SimpleNamespace(recorded_working_dir=lambda sid, *, since=None: recorded_cwd),
     )
     runner._debug = lambda *a, **k: None
     runner._cwd_check_at = 0.0
+    runner._cwd_launch_at = 1000.0
     runner.messages = []
     runner._set_message = lambda msg, **k: runner.messages.append(msg)
     runner._render = lambda: None
@@ -3257,6 +3356,38 @@ def test_cwd_drift_waits_when_no_cwd_recorded_yet():
     assert getattr(runner, "_cwd_drift_checked", False) is False  # will re-check next tick
 
 
+def test_cwd_drift_forwards_launch_time_as_since(monkeypatch):
+    # The launch epoch is passed through as `since` so the backend can ignore a
+    # stale pre-launch cwd (#72). A backend that only reports a post-launch turn
+    # returns None until one exists, so no false warning is latched.
+    import types
+
+    seen = {}
+
+    def recorded(sid, *, since=None):
+        seen["since"] = since
+        return None  # no post-launch turn yet
+
+    runner = make_runner(
+        worktree=types.SimpleNamespace(name="session-1"),
+        repo=types.SimpleNamespace(repo="/repo/.agit/worktrees/session-1"),
+        state=types.SimpleNamespace(backend_session_id="sess-1"),
+        backend=types.SimpleNamespace(recorded_working_dir=recorded),
+    )
+    runner._debug = lambda *a, **k: None
+    runner._cwd_check_at = 0.0
+    runner._cwd_launch_at = 1234.5
+    runner.messages = []
+    runner._set_message = lambda msg, **k: runner.messages.append(msg)
+    runner._render = lambda: None
+
+    runner._warn_if_cwd_drifted()
+
+    assert seen["since"] == 1234.5
+    assert runner.messages == []
+    assert runner._cwd_drift_checked is False  # nothing post-launch yet → keep checking
+
+
 # --- worktree confinement ---
 
 
@@ -3264,7 +3395,8 @@ def test_confine_to_worktree_wraps_when_enabled(monkeypatch):
     import types
     from agit.proxy import sandbox
 
-    monkeypatch.setattr(sandbox, "is_available", lambda: True)
+    # Force the macOS mechanism so the assertion is platform-independent.
+    monkeypatch.setattr(sandbox, "_have_sandbox_exec", lambda: True)
     monkeypatch.delenv("AGIT_SANDBOX", raising=False)
     runner = make_runner(
         worktree=types.SimpleNamespace(name="session-1"),
@@ -4876,6 +5008,67 @@ def test_duck_type_aliases_cover_extracted_classes():
             assert hasattr(ProxyRunner, name), (
                 f"ProxyRunner is missing alias {name!r}, self-called inside {cls.__name__}"
             )
+
+
+def test_gh_unavailable_hint_text_by_status():
+    from agit.proxy.runner import ProxyRunner
+
+    missing = ProxyRunner._gh_unavailable_hint("missing")
+    assert missing is not None and "isn't installed" in missing and "cli.github.com" in missing
+    unauth = ProxyRunner._gh_unavailable_hint("unauthenticated")
+    assert unauth is not None and "isn't logged in" in unauth and "gh auth login" in unauth
+    assert ProxyRunner._gh_unavailable_hint("ok") is None
+
+
+def test_notify_if_gh_unavailable_sets_message_when_missing(monkeypatch):
+    runner = make_runner(name="main")
+    runner.messages = []
+    runner._set_message = lambda msg, **k: runner.messages.append(msg)
+    runner._render = lambda: None
+    monkeypatch.setattr("agit.metrics.github.gh_status", lambda: "missing")
+
+    runner._notify_if_gh_unavailable()
+
+    assert runner.messages and "gh" in runner.messages[0]
+
+
+def test_notify_if_gh_unavailable_silent_when_ok(monkeypatch):
+    runner = make_runner(name="main")
+    runner.messages = []
+    runner._set_message = lambda msg, **k: runner.messages.append(msg)
+    runner._render = lambda: None
+    monkeypatch.setattr("agit.metrics.github.gh_status", lambda: "ok")
+
+    runner._notify_if_gh_unavailable()
+
+    assert runner.messages == []
+
+
+def test_restore_terminal_clears_before_leaving_alt_screen(monkeypatch):
+    # #70: on terminals without alt-screen support, leaving the alt screen is a
+    # no-op, so aGiT's UI lingers after exit unless we clear the screen first.
+    # restore_terminal must emit a clear+home BEFORE the `?1049l` leave so the
+    # screen is clean on those terminals (and unchanged where altscreen works).
+    import types
+
+    from agit.proxy import terminal as terminal_mod
+    from agit.proxy.terminal import TerminalHost
+
+    writes: list[bytes] = []
+    monkeypatch.setattr(terminal_mod.os, "write", lambda _fd, data: writes.append(data) or len(data))
+
+    state = types.SimpleNamespace(old_attrs=None)
+    # Stub the cooked/mode + mouse teardown so only the screen bytes matter here.
+    state.disable_host_terminal_modes = lambda: None
+    state.set_cooked = lambda: None
+    monkeypatch.setattr(terminal_mod.termios, "tcflush", lambda *a, **k: None)
+
+    TerminalHost.restore_terminal(state)
+
+    out = b"".join(writes)
+    assert b"\x1b[2J" in out  # clears the screen
+    assert b"\x1b[?1049l" in out  # leaves the alt screen
+    assert out.index(b"\x1b[2J") < out.index(b"\x1b[?1049l")  # clear comes first
 
 
 def test_configured_menu_key_opens_command_capture():
