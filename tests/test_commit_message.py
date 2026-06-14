@@ -1,6 +1,39 @@
 import pytest
 
-from agit.commits import build_agent_commit_message, build_user_commit_message
+from agit.commits import build_agent_commit_message, build_user_commit_message, render_interaction_trace
+
+
+def test_render_interaction_trace_matches_committed_trace_and_masks_secrets():
+    # The summarizer's sole input is this rendered trace; it must be the same
+    # "## User"/"## Agent" body that lands in the commit, with secrets masked.
+    trace = [
+        {"role": "user", "content": "ship it, key is sk-ant-api03-SECRETSECRETSECRETSECRET"},
+        {"role": "agent", "content": "Shipped it."},
+    ]
+    rendered = render_interaction_trace(trace, trace_turn_limit=10)
+    assert rendered.startswith("## User")
+    assert "## Agent\n\nShipped it." in rendered
+    assert "SECRETSECRETSECRETSECRET" not in rendered  # masked
+
+    # It is exactly the body the commit carries under "# Interaction Trace".
+    message = build_agent_commit_message(
+        latest_prompt="ship it",
+        trace=trace,
+        backend="claude",
+        backend_session_id="ses-1",
+        agit_session_id="agit-1",
+        model="m",
+    )
+    committed = message.split("# Interaction Trace\n\n", 1)[1].split("\n# aGiT Metadata", 1)[0].strip()
+    assert committed == rendered
+
+
+def test_render_interaction_trace_respects_turn_limit():
+    trace = [{"role": "user", "content": f"turn {i}"} for i in range(5)]
+    rendered = render_interaction_trace(trace, trace_turn_limit=2)
+    # Only the most recent 2 turns are kept (same limiting the commit applies).
+    assert "turn 4" in rendered and "turn 3" in rendered
+    assert "turn 0" not in rendered
 
 
 def test_agent_commit_message_contains_trace_and_metadata():

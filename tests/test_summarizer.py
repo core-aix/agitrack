@@ -3,6 +3,10 @@ from agit.summaries import Summarizer
 from agit.backends.base import AgentResult, TokenUsage
 from agit.transcripts.types import SessionTurn, ExportedSession
 
+# A small interaction trace (the only input the summarizer is now given), shaped
+# like the "## User"/"## Agent" body appended to an aGiT commit.
+_TRACE = "## User\n\ndo the task\n\n## Agent\n\nDid the task and added tests."
+
 
 def test_summarize_commit() -> None:
     backend = Mock()
@@ -15,22 +19,7 @@ def test_summarize_commit() -> None:
         tokens=TokenUsage(),
     )
     summarizer = Summarizer(backend, model="test-model")
-    turns = [
-        SessionTurn(
-            user_message_id="1",
-            assistant_message_id="2",
-            user_prompt="Add a new feature",
-            final_response="I've added the feature.",
-            tokens=TokenUsage(),
-            model="test-model",
-            complete=True,
-            interrupted=False,
-        )
-    ]
-    summary = summarizer.summarize_commit(
-        turns=turns,
-        diff="diff --git a/file.py b/file.py\n+new code",
-    )
+    summary = summarizer.summarize_commit(trace=_TRACE)
     assert summary == "This is a commit summary."
     backend.run.assert_called_once()
     call_args = backend.run.call_args
@@ -39,8 +28,8 @@ def test_summarize_commit() -> None:
 
 
 def test_commit_summary_prompt_is_self_contained() -> None:
-    # A commit summary must describe ONLY this commit (its turns + diff). It must
-    # not be seeded with any prior/rolling session summary — that contaminated the
+    # A commit summary must describe ONLY this commit (its interaction trace). It
+    # must not be seeded with any prior/rolling session summary — that contaminated the
     # commit message with earlier, unrelated work and made the model respond with
     # "the summary you provided is already complete".
     backend = Mock()
@@ -54,12 +43,9 @@ def test_commit_summary_prompt_is_self_contained() -> None:
     )
     summarizer = Summarizer(backend, model="test-model")
     # The rolling summary that used to leak in — it must not reach the backend.
-    summarizer.summarize_commit(
-        turns=[_turn()],
-        diff="diff --git a/file.py b/file.py\n-buggy code\n+fixed code",
-    )
+    summarizer.summarize_commit(trace="## User\n\nAdd a new feature\n\n## Agent\n\nDone.")
     prompt = backend.run.call_args[0][0]
-    assert "Add a new feature" in prompt  # this turn's own content is present
+    assert "Add a new feature" in prompt  # the trace's own content is present
     assert "Previous session" not in prompt
     assert "Current session context" not in prompt  # the removed injection label
     # summarize_commit no longer accepts a session_summary argument at all.
@@ -79,22 +65,9 @@ def test_update_session_summary() -> None:
         tokens=TokenUsage(),
     )
     summarizer = Summarizer(backend, model="test-model")
-    turns = [
-        SessionTurn(
-            user_message_id="1",
-            assistant_message_id="2",
-            user_prompt="Add tests",
-            final_response="Tests added.",
-            tokens=TokenUsage(),
-            model="test-model",
-            complete=True,
-            interrupted=False,
-        )
-    ]
     summary = summarizer.update_session_summary(
         current_summary="Initial summary.",
-        turns=turns,
-        diff="diff --git a/test.py b/test.py\n+new tests",
+        trace=_TRACE,
         commit_summary="Added tests for new feature.",
     )
     assert summary == "Updated session summary."
@@ -115,22 +88,9 @@ def test_update_session_summary_initial() -> None:
         tokens=TokenUsage(),
     )
     summarizer = Summarizer(backend, model="test-model")
-    turns = [
-        SessionTurn(
-            user_message_id="1",
-            assistant_message_id="2",
-            user_prompt="Start project",
-            final_response="Project started.",
-            tokens=TokenUsage(),
-            model="test-model",
-            complete=True,
-            interrupted=False,
-        )
-    ]
     summary = summarizer.update_session_summary(
         current_summary=None,
-        turns=turns,
-        diff="diff --git a/main.py b/main.py\n+initial code",
+        trace=_TRACE,
         commit_summary="Started the project.",
     )
     assert summary == "Initial session summary."
@@ -199,8 +159,8 @@ def test_every_summary_call_is_stateless() -> None:
     summarizer = Summarizer(backend)
     exported = ExportedSession(session_id="s", model="m", updated=0, turns=[_turn()])
 
-    summarizer.summarize_commit(turns=[_turn()], diff="+x")
-    summarizer.update_session_summary(current_summary="prev", turns=[_turn()], diff="+x", commit_summary="c")
+    summarizer.summarize_commit(trace=_TRACE)
+    summarizer.update_session_summary(current_summary="prev", trace=_TRACE, commit_summary="c")
     summarizer.summarize_pre_compaction(exported_session=exported, current_summary="prev")
 
     assert backend.run.call_count == 3
@@ -243,7 +203,7 @@ def test_summarizer_raises_on_session_limit_error_text() -> None:
     backend.run.return_value = _result("You've hit your session limit. Your limit will reset at 3pm.")
     summarizer = Summarizer(backend)
     with pytest.raises(UnusableSummaryError):
-        summarizer.summarize_commit(turns=[_turn()], diff="+x")
+        summarizer.summarize_commit(trace=_TRACE)
 
 
 def test_summarizer_raises_on_nonzero_exit_code() -> None:
@@ -254,7 +214,7 @@ def test_summarizer_raises_on_nonzero_exit_code() -> None:
     backend.run.return_value = _result("Looks like a fine summary.", exit_code=1)
     summarizer = Summarizer(backend)
     with pytest.raises(UnusableSummaryError):
-        summarizer.summarize_commit(turns=[_turn()], diff="+x")
+        summarizer.summarize_commit(trace=_TRACE)
 
 
 def test_summarizer_raises_on_empty_response() -> None:
@@ -265,7 +225,7 @@ def test_summarizer_raises_on_empty_response() -> None:
     backend.run.return_value = _result("   \n  ")
     summarizer = Summarizer(backend)
     with pytest.raises(UnusableSummaryError):
-        summarizer.summarize_commit(turns=[_turn()], diff="+x")
+        summarizer.summarize_commit(trace=_TRACE)
 
 
 def test_summary_is_usable_detects_error_shapes() -> None:
@@ -328,7 +288,7 @@ def test_summarizer_raises_when_backend_echoes_the_prompt() -> None:
     backend.run.side_effect = echo_run
     summarizer = Summarizer(backend)
     with pytest.raises(UnusableSummaryError):
-        summarizer.summarize_commit(turns=[_turn()], diff="+x")
+        summarizer.summarize_commit(trace=_TRACE)
     assert captured["prompt"].startswith("You are a technical summarizer")
 
 
@@ -358,7 +318,7 @@ def test_session_update_rejects_echoed_prompt() -> None:
     backend.run.side_effect = echo_run
     summarizer = Summarizer(backend)
     with pytest.raises(UnusableSummaryError):
-        summarizer.update_session_summary(current_summary=None, turns=[_turn()], diff="+x", commit_summary="x")
+        summarizer.update_session_summary(current_summary=None, trace=_TRACE, commit_summary="x")
 
 
 def test_strip_summary_preamble_removes_meta_lead_ins() -> None:
@@ -402,40 +362,33 @@ def test_summarize_commit_strips_preamble_end_to_end() -> None:
     # summary (which becomes the commit subject), not "The summary has been written".
     backend = Mock()
     backend.run.return_value = _result("Here is the summary:\n\nAdded the committer filter.")
-    summary = Summarizer(backend).summarize_commit(turns=[_turn()], diff="+x")
+    summary = Summarizer(backend).summarize_commit(trace=_TRACE)
     assert summary == "Added the committer filter."
 
 
-def test_commit_prompt_is_bounded_and_reminds_at_the_end() -> None:
-    # Root cause of prompt-echo: an unbounded, huge prompt. The builder must cap
-    # the diff and per-turn responses and restate the instruction next to the
-    # generation cue, so the model stays in summarization mode.
-    from agit.summaries.summarizer import _MAX_DIFF_CHARS, _MAX_RESPONSE_CHARS
+def test_commit_prompt_is_only_the_trace_bounded_and_reminds_at_the_end() -> None:
+    # The commit summary's sole input is the interaction trace (no diff). A huge
+    # trace is capped, and the instruction is restated next to the generation cue
+    # so the model stays in summarization mode.
+    from agit.summaries.summarizer import _MAX_TRACE_CHARS
 
     backend = Mock()
     backend.run.return_value = _result("Bounded summary.")
-    huge_turn = SessionTurn(
-        user_message_id="1",
-        assistant_message_id="2",
-        user_prompt="do it",
-        final_response="X" * (_MAX_RESPONSE_CHARS * 3),
-        tokens=TokenUsage(),
-        model="test-model",
-        complete=True,
-        interrupted=False,
-    )
-    Summarizer(backend).summarize_commit(turns=[huge_turn], diff="D" * (_MAX_DIFF_CHARS * 3))
+    huge_trace = "## User\n\ndo it\n\n## Agent\n\n" + "X" * (_MAX_TRACE_CHARS * 3)
+    Summarizer(backend).summarize_commit(trace=huge_trace)
     prompt = backend.run.call_args[0][0]
 
-    assert "[truncated" in prompt  # both the diff and the response were capped
-    assert "D" * (_MAX_DIFF_CHARS + 1) not in prompt  # diff capped below 3x
-    assert "X" * (_MAX_RESPONSE_CHARS + 1) not in prompt  # response capped
+    assert "Interaction trace:" in prompt  # the trace is the input
+    assert "Code changes (diff)" not in prompt  # the diff is NOT included
+    assert "[truncated" in prompt  # the oversized trace was capped
+    assert "X" * (_MAX_TRACE_CHARS + 1) not in prompt
     # The instruction is restated immediately before the generation cue.
     tail = prompt[-400:]
     assert "output only the summary" in tail and tail.rstrip().endswith("Summary:")
 
 
 def test_turns_block_keeps_most_recent_within_budget() -> None:
+    # Still used for pre-compaction (whole-session) summaries.
     from agit.summaries.summarizer import _turns_block
 
     def turn(tag: str) -> SessionTurn:

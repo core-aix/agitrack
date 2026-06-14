@@ -15,28 +15,17 @@ The reported problems, each pinned by a test here:
 import threading
 import time
 
-from agit.backends.base import TokenUsage
 from agit.commits import apply_summary_to_message, build_agent_commit_message, summary_metadata_lines
 from agit.config import AgitState
 from agit.git import GitRepo
-from agit.transcripts.types import SessionTurn
 
 from proxy_helpers import make_runner
 
 SUMMARY = "Implement the widget renderer with caching\n\nAlso reworks the cache keys."
 
-
-def _turn() -> SessionTurn:
-    return SessionTurn(
-        user_message_id="u1",
-        assistant_message_id="a1",
-        user_prompt="please add the widget renderer",
-        final_response="done",
-        tokens=TokenUsage(),
-        model="m1",
-        complete=True,
-        interrupted=False,
-    )
+# The interaction trace is now the summarizer's sole input (the second arg to
+# _start_commit_summary), in place of the turns list it used to receive.
+_TRACE_TEXT = "## User\n\nplease add the widget renderer\n\n## Agent\n\nImplemented the widget renderer with caching."
 
 
 # --- message format (summary first, subject from summary) ---------------------
@@ -135,15 +124,15 @@ class FakeSummarizer:
         self.tokens_input = 7
         self.tokens_output = 3
 
-    def summarize_commit(self, *, turns, diff, session_summary=None):
+    def summarize_commit(self, *, trace):
         if FakeSummarizer.gate is not None:
             FakeSummarizer.gate.wait(timeout=10)
         if FakeSummarizer.fail is not None:
             raise FakeSummarizer.fail
-        self.diff = diff
+        self.trace = trace
         return SUMMARY
 
-    def update_session_summary(self, *, current_summary, turns, diff, commit_summary):
+    def update_session_summary(self, *, current_summary, trace, commit_summary):
         if FakeSummarizer.fail_session is not None:
             raise FakeSummarizer.fail_session
         return "rolling narrative v2"
@@ -182,7 +171,7 @@ def test_commit_path_does_not_block_on_summarization(tmp_path, monkeypatch):
     sha = _commit_change(repo, "a.txt", "<aGiT> prompt subject")
 
     started = time.monotonic()
-    runner._start_commit_summary(sha, [_turn()])
+    runner._start_commit_summary(sha, _TRACE_TEXT)
     assert time.monotonic() - started < 1.0  # returned while the LLM call hangs
     assert runner._summary_pending is not None
     # The "summarizing…" popup names the session but NOT the commit hash (the
@@ -216,7 +205,7 @@ def test_summarizing_notice_precedes_created_popup_worktree(tmp_path, monkeypatc
     runner._last_agent_commit_id = repo.short_sha(sha)
     runner._commit_merged_pending = True  # armed by on_commit_fn at commit time
 
-    runner._start_commit_summary(sha, [_turn()])
+    runner._start_commit_summary(sha, _TRACE_TEXT)
 
     assert "summarizing" in (runner.message or "")
     assert "Created <aGiT> commit" not in (runner.message or "")
@@ -238,7 +227,7 @@ def test_no_worktree_commit_announced_only_after_summary(tmp_path, monkeypatch):
     runner._last_agent_commit_id = repo.short_sha(sha)
     runner._commit_merged_pending = True
 
-    runner._start_commit_summary(sha, [_turn()])
+    runner._start_commit_summary(sha, _TRACE_TEXT)
     assert "summarizing" in (runner.message or "")
     assert "Created <aGiT> commit" not in (runner.message or "")
 
@@ -252,7 +241,7 @@ def test_no_worktree_commit_announced_only_after_summary(tmp_path, monkeypatch):
 def test_summary_after_integration_lands_as_notes_only(tmp_path, monkeypatch):
     runner, repo = _summary_runner(tmp_path, monkeypatch)
     sha = _commit_change(repo, "a.txt", "<aGiT> prompt subject")
-    runner._start_commit_summary(sha, [_turn()])
+    runner._start_commit_summary(sha, _TRACE_TEXT)
     runner._summary_thread.join(timeout=10)
     # The commit integrated (base advanced) before the summary arrived.
     full = repo.rev_parse("HEAD")
@@ -267,7 +256,7 @@ def test_summary_after_integration_lands_as_notes_only(tmp_path, monkeypatch):
 def test_summary_with_staged_changes_lands_as_notes_only(tmp_path, monkeypatch):
     runner, repo = _summary_runner(tmp_path, monkeypatch)
     sha = _commit_change(repo, "a.txt", "<aGiT> prompt subject")
-    runner._start_commit_summary(sha, [_turn()])
+    runner._start_commit_summary(sha, _TRACE_TEXT)
     runner._summary_thread.join(timeout=10)
     # The next turn already staged work: --amend would swallow it.
     (repo.repo / "next.txt").write_text("next\n", encoding="utf-8")
@@ -281,7 +270,7 @@ def test_summary_with_staged_changes_lands_as_notes_only(tmp_path, monkeypatch):
 def test_summary_after_head_moved_lands_as_notes_only(tmp_path, monkeypatch):
     runner, repo = _summary_runner(tmp_path, monkeypatch)
     sha = _commit_change(repo, "a.txt", "<aGiT> first")
-    runner._start_commit_summary(sha, [_turn()])
+    runner._start_commit_summary(sha, _TRACE_TEXT)
     runner._summary_thread.join(timeout=10)
     first_full = repo.rev_parse("HEAD")
     _commit_change(repo, "b.txt", "<aGiT> second")
@@ -303,7 +292,7 @@ def test_unusable_summary_keeps_prompt_led_message(tmp_path, monkeypatch):
     FakeSummarizer.fail = UnusableSummaryError("You've hit your session limit.")
     sha = _commit_change(repo, "a.txt", "<aGiT> prompt subject")
 
-    runner._start_commit_summary(sha, [_turn()])
+    runner._start_commit_summary(sha, _TRACE_TEXT)
     _finish_summary(runner)
 
     assert repo.commit_message("HEAD").startswith("<aGiT> prompt subject")
@@ -319,7 +308,7 @@ def test_failed_rolling_summary_does_not_discard_commit_summary(tmp_path, monkey
     runner.state.session_summary = "previous narrative"
     sha = _commit_change(repo, "a.txt", "<aGiT> prompt subject")
 
-    runner._start_commit_summary(sha, [_turn()])
+    runner._start_commit_summary(sha, _TRACE_TEXT)
     _finish_summary(runner)
 
     # The commit summary still lands (subject + notes)...
@@ -338,7 +327,7 @@ def test_summary_popups_name_the_owning_session(tmp_path, monkeypatch):
     runner.name = "feature-x"
     sha = _commit_change(repo, "a.txt", "<aGiT> prompt subject")
 
-    runner._start_commit_summary(sha, [_turn()])
+    runner._start_commit_summary(sha, _TRACE_TEXT)
     assert "in session 'feature-x'" in (runner.message or "")
 
     runner.name = "other"  # the user switched sessions before the summary landed
@@ -358,7 +347,7 @@ def test_failed_summary_popup_names_the_owning_session(tmp_path, monkeypatch):
     FakeSummarizer.fail = UnusableSummaryError("You've hit your session limit.")
     sha = _commit_change(repo, "a.txt", "<aGiT> prompt subject")
 
-    runner._start_commit_summary(sha, [_turn()])
+    runner._start_commit_summary(sha, _TRACE_TEXT)
     runner.name = "other"
     _finish_summary(runner)
 
@@ -389,7 +378,7 @@ def test_pending_summary_does_not_block_integration_at_new_prompt(tmp_path, monk
     FakeSummarizer.gate = threading.Event()  # hold the summary open
     sha = _commit_change(repo, "a.txt", "<aGiT> prompt subject")
     full = repo.rev_parse(sha)
-    runner._start_commit_summary(sha, [_turn()])
+    runner._start_commit_summary(sha, _TRACE_TEXT)
 
     # The summary is pending, so the normal post-commit path defers integration.
     assert runner._summary_pending is not None
