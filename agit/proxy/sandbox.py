@@ -138,14 +138,21 @@ def build_bwrap_command(base: str, worktree: str) -> list[str]:
     git_dir = os.path.join(base, ".git")
     args = [
         "bwrap",
-        "--dev-bind", "/", "/",  # mirror the whole host, read-write
-        "--ro-bind", base, base,  # ...but the base repo (and its worktrees) read-only
+        "--dev-bind",
+        "/",
+        "/",  # mirror the whole host, read-write
+        "--ro-bind",
+        base,
+        base,  # ...but the base repo (and its worktrees) read-only
     ]
     if os.path.isdir(git_dir):
         args += ["--bind", git_dir, git_dir]  # re-allow commits into the repo's .git
     args += [
-        "--bind", worktree, worktree,  # re-allow this session's worktree
-        "--chdir", worktree,
+        "--bind",
+        worktree,
+        worktree,  # re-allow this session's worktree
+        "--chdir",
+        worktree,
         "--die-with-parent",
         "--",
     ]
