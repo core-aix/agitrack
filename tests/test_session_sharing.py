@@ -564,6 +564,8 @@ def test_runner_share_unsupported_backend_shows_message(tmp_path, monkeypatch):
 
 
 def test_runner_resume_shared_imports_and_resumes(tmp_path, monkeypatch):
+    from agit.config import AgitState
+
     backend = _StubBackend()
     runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
     # Seed a shared session as if a teammate published it.
@@ -581,9 +583,11 @@ def test_runner_resume_shared_imports_and_resumes(tmp_path, monkeypatch):
     runner._resume_shared_session_menu()
 
     assert backend.imported == ("bob-sid", "bob's chat", False)  # imported, no overwrite (no local copy)
-    # Resumed under the local name (defaulting to <sharer>-<name>), pinned to the
+    # Resumed under the original share name (no sharer prefix, #55), pinned to the
     # entry's backend (defaults to the active backend when the manifest omits one).
-    assert resumed == [("bob-cool-fix", "bob-sid", "claude")]
+    assert resumed == [("cool-fix", "bob-sid", "claude")]
+    # The original share name is remembered for round-trip re-sharing.
+    assert AgitState(repo.repo).shared_origin_name("bob-sid") == "cool-fix"
 
 
 def test_runner_resume_shared_crosses_backends(tmp_path, monkeypatch):
@@ -618,7 +622,7 @@ def test_runner_resume_shared_crosses_backends(tmp_path, monkeypatch):
     assert built == ["opencode"]  # a fresh OpenCode agent was constructed
     assert oc_agent.imported == ("ses_bob", '{"info":{"id":"ses_bob"}}', False)  # OpenCode did the import
     assert active.imported is None  # the active Claude agent was NOT used
-    assert resumed == [("bob-oc-fix", "ses_bob", "opencode")]  # resumed pinned to opencode
+    assert resumed == [("oc-fix", "ses_bob", "opencode")]  # resumed under the share name, pinned to opencode
 
 
 def test_runner_auto_share_pushes_on_change_only(tmp_path, monkeypatch):
@@ -651,6 +655,24 @@ def test_runner_auto_share_pushes_on_change_only(tmp_path, monkeypatch):
     monkeypatch.setattr("time.time", lambda: 10**10)  # would change `updated` IF it pushed
     fire_commit()
     assert SharedSessionStore(repo).entries()[0].manifest["updated"] == last_updated
+
+
+def test_reshare_uses_origin_name_so_round_trip_updates_same_entry(tmp_path, monkeypatch):
+    # A session imported from another machine re-shares under its ORIGINAL share
+    # name, so sharing back and forth keeps updating the SAME entry instead of
+    # prepending the sharer id (and growing the name) on every round-trip (#55).
+    backend = _StubBackend(transcript="resumed work")
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
+    runner.state.set_shared_origin_name("sid-123", "feature")  # remembered when resumed
+    runner.name = "feature-2"  # local name got deduped — must NOT drive the share name
+    runner.state.set_auto_share("sid-123", True)
+
+    runner._maybe_auto_share_active()
+    if runner._auto_share_thread is not None:
+        runner._auto_share_thread.join(timeout=10)
+
+    entries = SharedSessionStore(repo).entries()
+    assert [f"{e.github_id}/{e.name}" for e in entries] == ["tester/feature"]
 
 
 def test_auto_share_main_thread_does_no_heavy_work(tmp_path, monkeypatch):
