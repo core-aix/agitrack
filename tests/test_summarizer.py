@@ -404,3 +404,53 @@ def test_summarize_commit_strips_preamble_end_to_end() -> None:
     backend.run.return_value = _result("Here is the summary:\n\nAdded the committer filter.")
     summary = Summarizer(backend).summarize_commit(turns=[_turn()], diff="+x")
     assert summary == "Added the committer filter."
+
+
+def test_commit_prompt_is_bounded_and_reminds_at_the_end() -> None:
+    # Root cause of prompt-echo: an unbounded, huge prompt. The builder must cap
+    # the diff and per-turn responses and restate the instruction next to the
+    # generation cue, so the model stays in summarization mode.
+    from agit.summaries.summarizer import _MAX_DIFF_CHARS, _MAX_RESPONSE_CHARS
+
+    backend = Mock()
+    backend.run.return_value = _result("Bounded summary.")
+    huge_turn = SessionTurn(
+        user_message_id="1",
+        assistant_message_id="2",
+        user_prompt="do it",
+        final_response="X" * (_MAX_RESPONSE_CHARS * 3),
+        tokens=TokenUsage(),
+        model="test-model",
+        complete=True,
+        interrupted=False,
+    )
+    Summarizer(backend).summarize_commit(turns=[huge_turn], diff="D" * (_MAX_DIFF_CHARS * 3))
+    prompt = backend.run.call_args[0][0]
+
+    assert "[truncated" in prompt  # both the diff and the response were capped
+    assert "D" * (_MAX_DIFF_CHARS + 1) not in prompt  # diff capped below 3x
+    assert "X" * (_MAX_RESPONSE_CHARS + 1) not in prompt  # response capped
+    # The instruction is restated immediately before the generation cue.
+    tail = prompt[-400:]
+    assert "output only the summary" in tail and tail.rstrip().endswith("Summary:")
+
+
+def test_turns_block_keeps_most_recent_within_budget() -> None:
+    from agit.summaries.summarizer import _turns_block
+
+    def turn(tag: str) -> SessionTurn:
+        return SessionTurn(
+            user_message_id=tag,
+            assistant_message_id=tag,
+            user_prompt=f"prompt-{tag}",
+            final_response="Y" * 5_000,
+            tokens=TokenUsage(),
+            model="m",
+            complete=True,
+            interrupted=False,
+        )
+
+    block = _turns_block([turn("old"), turn("mid"), turn("new")], budget=8_000)
+    assert "prompt-new" in block  # most recent kept
+    assert "prompt-old" not in block  # earliest dropped over budget
+    assert "[earlier turns omitted]" in block
