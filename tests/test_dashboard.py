@@ -345,6 +345,87 @@ def test_resolve_committers_uses_github_logins_when_provided():
     assert set(labels.values()) == {"patexample"}
 
 
+# --- co-author trailers (multiple committers per commit, #54) ------------------
+
+
+def test_parse_co_authors_extracts_humans_and_drops_ai_and_bots():
+    from agit.metrics.collect import _parse_co_authors
+
+    body = (
+        "Add a feature\n\n"
+        "Co-authored-by: Alice Example <alice@example.com>\n"
+        "Co-Authored-By: Bob Example <bob@users.noreply.github.com>\n"
+        "Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>\n"
+        "Co-authored-by: github-actions[bot] <github-actions[bot]@users.noreply.github.com>\n"
+        "Co-authored-by: Alice Example <alice@example.com>\n"  # duplicate
+    )
+    assert _parse_co_authors(body) == [
+        ("Alice Example", "alice@example.com"),
+        ("Bob Example", "bob@users.noreply.github.com"),
+    ]
+
+
+def _co_authored_dashboard(subject: str):
+    from agit.metrics.collect import Dashboard, _detect_loops
+
+    stat = CommitStat(
+        sha="s1",
+        author="Alex Doe",
+        email="alex@example.com",
+        subject=subject,
+        kind="agent",
+        timestamp=1_700_000_000,
+        co_authors=[("Robin Roe", "robin@example.com")],
+    )
+    return Dashboard(repo="r", branch="main", stats=[stat], loops=_detect_loops([stat])), stat
+
+
+def test_co_authored_commit_is_filterable_under_every_committer():
+    from agit.metrics import dashboard_data
+
+    dash, stat = _co_authored_dashboard("Pair feature")
+    # Both the primary author and the co-author are committers of this one commit.
+    assert set(dash.committers_of(stat)) == {"Alex Doe", "Robin Roe"}
+    data = dashboard_data(dash)
+    # Both surface as filter options, and the commit lists both committers.
+    assert {"Alex Doe", "Robin Roe"} <= set(data["committers"])
+    entry = next(c for c in data["commits"] if c["subject"] == "Pair feature")
+    assert set(entry["committers"]) == {"Alex Doe", "Robin Roe"}
+
+
+def test_bot_and_ai_primary_authors_are_not_committers():
+    from agit.metrics.collect import Dashboard, _detect_loops
+    from agit.metrics.web import _options
+
+    bot = CommitStat(
+        sha="b1",
+        author="github-actions[bot]",
+        email="41898282+github-actions[bot]@users.noreply.github.com",
+        subject="Automated release",
+        kind="untracked",
+    )
+    human = CommitStat(sha="h1", author="Alex Doe", email="alex@example.com", subject="Real work", kind="agent")
+    dash = Dashboard(repo="r", branch="main", stats=[bot, human], loops=_detect_loops([bot, human]))
+    # The bot is the primary author but is not a committer: empty here, absent
+    # from the filter options and the per-committer breakdown.
+    assert dash.committers_of(bot) == []
+    assert dash.committers_of(human) == ["Alex Doe"]
+    assert _options(dash)["committers"] == ["Alex Doe"]
+    assert "github-actions[bot]" not in dash.by_author
+
+
+def test_filter_stats_matches_any_committer():
+    from agit.metrics.web import _filter_stats, _options
+
+    dash, _ = _co_authored_dashboard("Shared work")
+    # Filtering on the co-author (not the primary git author) still returns it...
+    for who in ("Robin Roe", "Alex Doe"):
+        matched = _filter_stats(dash, author=who, backend="", model="", frm=0, to=0)
+        assert [s.subject for s in matched] == ["Shared work"], who
+    # ...and both names appear as selectable committer options.
+    assert {"Alex Doe", "Robin Roe"} <= set(_options(dash)["committers"])
+
+
 def test_resolve_logins_falls_back_to_empty_without_gh(monkeypatch, tmp_path):
     from agit.metrics import github
 
@@ -508,6 +589,22 @@ def test_render_html_has_unreachable_banner_and_clear_kind_labels(tmp_path):
     # Bar-row labels carry a hover title so any ellipsized cell reveals its full
     # text instead of dead-ending at "…".
     assert 'class="name" title=' in html
+    # Markdown heading levels in the expanded commit message render distinctly so
+    # the role/section/nested-heading relationship is visible, not flattened.
+    for level in ("h3.md-h", "h4.md-h", "h5.md-h", "h6.md-h"):
+        assert level in html
+
+
+def test_filter_bar_is_single_row_with_a_custom_range_popup(tmp_path):
+    html = render_html(_demo_repo(tmp_path))
+    # The sticky filter bar stays a single row (never wraps) when frozen.
+    assert "flex-wrap:nowrap" in html
+    # The redundant "scope" readout (it just echoed the committer filter) is gone.
+    assert 'id="scope"' not in html
+    # from/to are no longer standalone fields — they live in a custom-range popup
+    # revealed by selecting "custom range…".
+    assert 'id="daterange"' in html and 'id="dr-done"' in html
+    assert 'id="f-from"' in html and 'id="f-to"' in html  # still present, inside the popup
 
 
 def test_log_page_paginates_and_clamps(tmp_path):
@@ -534,6 +631,169 @@ def test_aggregates_payload_filters_server_side(tmp_path):
     claude_only = aggregates_payload(dash, backend="claude")
     assert claude_only["agg"]["total"] <= full["agg"]["total"]
     assert full["options"]["backends"] == ["claude"]
+
+
+def test_aggregates_payload_includes_per_period_timeseries(tmp_path):
+    from agit.metrics.web import aggregates_payload
+
+    dash = build_dashboard(_demo_repo(tmp_path))
+    ts = aggregates_payload(dash)["timeseries"]
+    # Every series is the same length as the bucket-start axis; default = per day.
+    n = len(ts["t"])
+    assert n >= 1 and ts["granularity"] == "day"
+    for key in ("commits", "ai_lines", "output_tokens", "input_tokens"):
+        assert len(ts[key]) == n
+    # Per-bucket activity: the buckets SUM to the filtered totals (not cumulative).
+    assert sum(ts["commits"]) == 7  # all seven demo commits
+    # The two agent turns carry _TOKENS (1000 in / 50 out) each.
+    assert sum(ts["output_tokens"]) == 100
+    assert sum(ts["input_tokens"]) == 2000
+
+
+def test_timeseries_granularity_buckets_by_calendar_period():
+    from agit.metrics.web import _timeseries
+
+    def stat(day, *, out=0):
+        return CommitStat(
+            sha=f"s{day}",
+            author="a",
+            email="e",
+            subject="s",
+            kind="agent",
+            timestamp=int(__import__("calendar").timegm((2026, 1, day, 12, 0, 0))),
+            tokens={"output": out},
+        )
+
+    # Three commits: Jan 1, Jan 2, Jan 2 again.
+    stats = [stat(1, out=5), stat(2, out=3), stat(2, out=4)]
+    day = _timeseries(stats, granularity="day")
+    assert day["granularity"] == "day"
+    # Two day buckets, contiguous; per-bucket commit counts are 1 then 2.
+    assert day["commits"] == [1, 2]
+    assert day["output_tokens"] == [5, 7]
+    # Month granularity collapses all three into one January bucket.
+    month = _timeseries(stats, granularity="month")
+    assert month["commits"] == [3] and month["output_tokens"] == [12]
+    # An unknown granularity falls back to the default (day).
+    assert _timeseries(stats, granularity="bogus")["granularity"] == "day"
+
+
+def test_timeseries_fills_empty_periods_with_zero():
+    from agit.metrics.web import _timeseries
+
+    cal = __import__("calendar")
+
+    def stat(day):
+        return CommitStat(
+            sha=f"s{day}",
+            author="a",
+            email="e",
+            subject="s",
+            kind="user",
+            timestamp=int(cal.timegm((2026, 1, day, 0, 0, 0))),
+        )
+
+    # Commits on Jan 1 and Jan 4 — the two quiet days between read as zeros.
+    ts = _timeseries([stat(1), stat(4)], granularity="day")
+    assert ts["commits"] == [1, 0, 0, 1]
+
+
+def test_aggregates_payload_reports_full_history_span(tmp_path):
+    from agit.metrics.web import aggregates_payload
+
+    dash = build_dashboard(_demo_repo(tmp_path))
+    span = aggregates_payload(dash)["span"]
+    times = [s.timestamp for s in dash.stats if s.timestamp]
+    # The from/to date inputs use this to show the real date range, not a blank.
+    assert span == {"from": min(times), "to": max(times)}
+    # The span is the FULL history, so a committer filter does not shrink it.
+    assert aggregates_payload(dash, backend="claude")["span"] == span
+
+
+def test_dashboard_lists_shared_sessions(tmp_path):
+    from agit.metrics.web import render_html, shared_sessions_for
+    from agit.sessions import SharedSessionStore
+
+    repo = _demo_repo(tmp_path)
+    SharedSessionStore(repo).publish(
+        github_id="alice",
+        name="fix-parser",
+        transcript="conversation",
+        manifest={
+            "github_id": "alice",
+            "name": "fix-parser",
+            "session_id": "s1",
+            "model": "claude-opus-4-8",
+            "backend": "claude",
+            "updated": 123,
+        },
+    )
+    listed = shared_sessions_for(repo)
+    assert [f"{s['github_id']}/{s['name']}" for s in listed] == ["alice/fix-parser"]
+    assert listed[0]["model"] == "claude-opus-4-8"
+    # The panel + render hook are wired, and the first paint embeds the list.
+    html = render_html(repo)
+    assert 'id="shared"' in html and "function renderShared" in html
+    assert _embedded_data(html)["shared_sessions"][0]["name"] == "fix-parser"
+
+
+def test_shared_sessions_for_is_safe_without_sharing(tmp_path):
+    from agit.metrics.web import shared_sessions_for
+
+    assert shared_sessions_for(_demo_repo(tmp_path)) == []  # nothing shared ⇒ empty, no error
+
+
+def test_shared_sessions_survive_a_fetch_failure(tmp_path, monkeypatch):
+    # A transient fetch error (e.g. racing a concurrent auto-share push) must NOT
+    # blank the dashboard's list — fall back to the local ref. Regression for the
+    # "shared session disappeared from the dashboard" report.
+    from agit.metrics.web import shared_sessions_for
+    from agit.sessions import SharedSessionStore
+
+    repo = _demo_repo(tmp_path)
+    SharedSessionStore(repo).publish(
+        github_id="alice",
+        name="s",
+        transcript="t",
+        manifest={"github_id": "alice", "name": "s", "session_id": "x", "updated": 1},
+    )
+
+    def boom(self):
+        raise RuntimeError("network hiccup mid-push")
+
+    monkeypatch.setattr(SharedSessionStore, "fetch_throttled", boom)
+    assert [s["name"] for s in shared_sessions_for(repo)] == ["s"]  # still shown from the local ref
+
+
+def test_timeseries_respects_filters(tmp_path):
+    from agit.metrics.web import aggregates_payload
+
+    dash = build_dashboard(_demo_repo(tmp_path))
+    full = aggregates_payload(dash)["timeseries"]
+    # A future-only window filters every commit out — an empty, still-valid series.
+    empty = aggregates_payload(dash, frm=4102444800)["timeseries"]  # year 2100
+    assert empty["t"] == [] and empty["commits"] == []
+    assert sum(full["commits"]) == 7
+
+
+def test_render_html_wires_the_activity_chart(tmp_path):
+    html = render_html(_demo_repo(tmp_path))
+    # The plot section, canvas, legend, granularity selector, and toggle/redraw
+    # wiring are present, and the initial payload embeds the series so the first
+    # paint needs no fetch.
+    assert "activity over time" in html
+    assert 'id="ts-canvas"' in html and 'id="ts-legend"' in html
+    assert 'id="ts-gran"' in html and "function renderChart" in html and "const tsOn" in html
+    # Mouse zoom/pan over the loaded buckets is kept (wheel zoom, drag pan,
+    # dblclick reset), with a visible hint to scroll.
+    assert "function onChartWheel" in html and 'addEventListener("wheel"' in html
+    assert "function tsBounds" in html and 'addEventListener("dblclick"' in html
+    assert "scroll to zoom" in html
+    # The redundant per-plot SHOW range dropdown was removed — the filter's "range"
+    # (period) is the single range selector.
+    assert 'id="ts-look"' not in html and "function applyLookback" not in html
+    data = _embedded_data(html)
+    assert "timeseries" in data and sum(data["timeseries"]["commits"]) == 7
 
 
 def test_dashboard_data_serializes_squash_constituents_for_expansion(tmp_path):
@@ -616,6 +876,32 @@ def test_dashboard_server_serves_aggregates_and_paginated_log(tmp_path):
         query = urllib.parse.urlencode({"author": data["options"]["committers"][0]})
         only_me = json.loads(_get(base + "/data?" + query))
         assert only_me["agg"]["total"] <= refreshed["agg"]["total"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_dashboard_server_index_embeds_shared_sessions(tmp_path):
+    # Regression: the live index page must embed shared sessions on first paint,
+    # not only fill them in on the first /data poll (the bug where the dashboard
+    # showed no shared sessions until a refresh — and never for a file:// snapshot).
+    from agit.sessions import SharedSessionStore
+
+    repo = _demo_repo(tmp_path)
+    SharedSessionStore(repo).publish(
+        github_id="alice",
+        name="s1",
+        transcript="t",
+        manifest={"github_id": "alice", "name": "s1", "session_id": "x", "updated": 1},
+    )
+    server, thread, base = _serve(repo)
+    try:
+        html = _get(base + "/")
+        embedded = json.loads(re.search(r'id="agit-data">(.*?)</script>', html, re.S).group(1))
+        assert [s["name"] for s in embedded["shared_sessions"]] == ["s1"]
+        served = json.loads(_get(base + "/data"))
+        assert [s["name"] for s in served["shared_sessions"]] == ["s1"]
     finally:
         server.shutdown()
         server.server_close()

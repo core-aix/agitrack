@@ -379,3 +379,59 @@ def test_integration_waits_for_summary_until_deadline():
 def test_integration_not_blocked_without_pending_summary():
     runner = make_runner()
     assert runner._summary_blocks_integration(100.0) is False
+
+
+def test_pending_summary_does_not_block_integration_at_new_prompt(tmp_path, monkeypatch):
+    # When a new prompt starts a turn while the previous turn's commit summary is
+    # still in flight, the previous turn integrates NOW rather than riding along
+    # on the same branch and only landing once the whole new turn finishes.
+    runner, repo = _summary_runner(tmp_path, monkeypatch)
+    FakeSummarizer.gate = threading.Event()  # hold the summary open
+    sha = _commit_change(repo, "a.txt", "<aGiT> prompt subject")
+    full = repo.rev_parse(sha)
+    runner._start_commit_summary(sha, [_turn()])
+
+    # The summary is pending, so the normal post-commit path defers integration.
+    assert runner._summary_pending is not None
+    assert runner._summary_blocks_integration(time.monotonic()) is True
+    assert repo.rev_parse(runner._base_branch) != full  # not yet integrated
+
+    # A new prompt arrives: the deferred turn integrates immediately instead of
+    # waiting behind the new agent call.
+    runner._integrate_committed_turn_before_new_turn()
+
+    assert repo.rev_parse(runner._base_branch) == full  # base advanced to the turn
+    assert repo.is_detached()  # worktree re-pointed at base, ready for the next turn
+
+    # The summary, landing afterwards, becomes notes-only (commit already in base).
+    FakeSummarizer.gate.set()
+    _finish_summary(runner)
+    assert repo.commit_message(full).startswith("<aGiT> prompt subject")  # not amended
+    assert "widget renderer" in (repo.notes_show(full, namespace="agit/commit-summary") or "")
+
+
+def test_new_prompt_flush_leaves_conflicting_turn_for_later(tmp_path, monkeypatch):
+    # If the deferred turn conflicts with the base, the flush must NOT pop a
+    # resolve box mid-prompt: it backs the merge out (tree stays clean) and leaves
+    # the work on its branch to be surfaced when the current agent call ends.
+    runner, repo = _summary_runner(tmp_path, monkeypatch)
+    (repo.repo / "a.txt").write_text("session line\n", encoding="utf-8")
+    repo.stage_paths(["a.txt"])
+    sha = repo.commit("<aGiT> session edit")
+    # The base gains a conflicting change to the same line from "another session".
+    base = runner._base_branch
+    repo.switch_detach(base)
+    (repo.repo / "a.txt").write_text("base line\n", encoding="utf-8")
+    repo.stage_paths(["a.txt"])
+    repo.commit("base edit")
+    repo._run(["git", "branch", "-f", base, "HEAD"])
+    repo.switch("agit/test/s1/t1")
+    prompts: list = []
+    runner._prompt_resolve_conflict = lambda *a, **k: prompts.append(a)
+
+    runner._integrate_committed_turn_before_new_turn()
+
+    assert prompts == []  # no resolve popup mid-prompt
+    assert not repo.merge_in_progress() and not repo.has_changes()  # tree clean
+    assert repo.current_branch() == "agit/test/s1/t1"  # work still on its branch
+    assert repo.rev_parse(base) != repo.rev_parse(sha)  # base not advanced
