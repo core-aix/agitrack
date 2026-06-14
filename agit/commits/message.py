@@ -200,6 +200,21 @@ def _insert_before_version_line(lines: list[str], extra: list[str]) -> list[str]
     return lines + list(extra)
 
 
+def render_interaction_trace(trace: list[dict], trace_turn_limit: int) -> str:
+    """The interaction-trace body exactly as it is appended to an aGiT commit:
+    role headings plus masked, heading-nested content (same as the commit's
+    ``# Interaction Trace`` section, without the header). This is the *sole* input
+    given to the summarizer, so the summary reflects the committed trace and
+    nothing else — no diff, no out-of-band context."""
+    lines: list[str] = []
+    for item in _limit_trace_turns(trace, trace_turn_limit):
+        role = item.get("role", "").strip().lower()
+        content = _nest_headings_under_role(_mask_secrets(item.get("content", "")))
+        label = "User" if role == "user" else "Agent"
+        lines.extend([f"## {label}", "", *_body_lines(content), ""])
+    return "\n".join(lines).strip()
+
+
 def _trace_and_metadata_lines(
     *,
     trace: list[dict],

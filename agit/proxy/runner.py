@@ -32,6 +32,7 @@ from agit.commits import (
     METADATA_HEADER,
     apply_summary_to_message,
     build_user_commit_message,
+    render_interaction_trace,
     summary_metadata_lines,
 )
 from agit.git import GitRepo
@@ -4478,6 +4479,11 @@ class ProxyRunner:
                 declined = set(state.declined_untracked())
                 repo.stage_paths([path for path in repo.untracked_files() if path not in declined])
 
+        # Capture the interaction trace BEFORE committing: commit_turns clears the
+        # trace before on_commit_fn runs, and the summary is built from exactly the
+        # trace appended to the commit (and nothing else — no diff).
+        trace_text = render_interaction_trace(self.state.pending_trace(), self.state.trace_turn_limit)
+
         def on_commit_fn(sha):
             self._last_agent_commit_id = sha
             # Don't announce the commit yet: the "created" popup is shown only once
@@ -4487,7 +4493,7 @@ class ProxyRunner:
             self._commit_summarized = False
             # The commit is made immediately; the LLM summary is computed in the
             # background and amended in afterwards (#8) so the UI never blocks.
-            self._start_commit_summary(sha, turns)
+            self._start_commit_summary(sha, trace_text)
 
         return CommitEngine(self.repo, self.state, debug_fn=self._debug).commit_turns(
             turns=turns,
@@ -4597,7 +4603,7 @@ class ProxyRunner:
         # user's conversation (issues #8/#56).
         return Summarizer(backend_class(summary_scratch_dir()), model=model)
 
-    def _start_commit_summary(self, sha: str, turns) -> None:
+    def _start_commit_summary(self, sha: str, trace_text: str) -> None:
         summarizer = self._make_summarizer()
         if summarizer is None:
             return
@@ -4612,13 +4618,6 @@ class ProxyRunner:
             return
         try:
             full_sha = self.repo.rev_parse(sha)
-            # The committed snapshot is immutable, so the summary is computed
-            # from exactly what landed — the whole turn's range when the base
-            # branch is known, otherwise the commit's own diff.
-            if self._base_branch is not None:
-                diff = self.repo.diff_range(self._base_branch, full_sha)
-            else:
-                diff = self.repo.diff_range(f"{full_sha}^", full_sha)
         except Exception as error:
             self._debug(f"summary snapshot failed: {error!r}")
             return
@@ -4639,15 +4638,14 @@ class ProxyRunner:
 
         def worker() -> None:
             try:
-                result["summary"] = summarizer.summarize_commit(turns=turns, diff=diff)
+                result["summary"] = summarizer.summarize_commit(trace=trace_text)
             except Exception as error:  # surfaced by the service tick
                 result["error"] = repr(error)
             else:
                 try:
                     result["session_summary"] = summarizer.update_session_summary(
                         current_summary=session_summary,
-                        turns=turns,
-                        diff=diff,
+                        trace=trace_text,
                         commit_summary=result["summary"],
                     )
                 except Exception as error:
