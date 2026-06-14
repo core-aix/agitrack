@@ -13,7 +13,7 @@ from agit.summaries.prompts import (
 
 if TYPE_CHECKING:
     from agit.backends.base import AgentBackend
-    from agit.transcripts.types import ExportedSession, SessionTurn
+    from agit.transcripts.types import ExportedSession
 
 
 class UnusableSummaryError(RuntimeError):
@@ -21,14 +21,14 @@ class UnusableSummaryError(RuntimeError):
 
 
 # Bound the summarizer prompt. The model is perfectly capable of this task; the
-# prompt-echo failure comes from *how much* we send it. Feeding an unbounded turn
-# (a long conversation plus the whole turn's diff) to `claude -p` puts the "you
-# are a summarizer, output only the summary" instruction at the very top, with the
-# generation cue ("Summary:") far below — so the model brushes its context limit
-# and/or slips into completion/echo mode, continuing the input instead of
-# summarizing. Keeping only the salient, most-recent material (and restating the
-# instruction next to the generation cue) keeps it in summarization mode.
-_MAX_DIFF_CHARS = 60_000
+# prompt-echo failure comes from *how much* we send it. Feeding an unbounded input
+# to `claude -p` puts the "you are a summarizer, output only the summary"
+# instruction at the very top, with the generation cue ("Summary:") far below — so
+# the model brushes its context limit and/or slips into completion/echo mode,
+# continuing the input instead of summarizing. Keeping the input bounded (and
+# restating the instruction next to the generation cue) keeps it in summarization
+# mode.
+_MAX_TRACE_CHARS = 60_000
 _MAX_RESPONSE_CHARS = 6_000
 _MAX_TURNS_CHARS = 60_000
 _MAX_PRIOR_SUMMARY_CHARS = 8_000
@@ -217,25 +217,25 @@ class Summarizer:
     def summarize_commit(
         self,
         *,
-        turns: list[SessionTurn],
-        diff: str,
+        trace: str,
     ) -> str:
-        # A commit summary describes ONLY this commit — its own turns and diff. It
-        # is deliberately not seeded with the rolling session summary: feeding a
-        # prior summary in made the model treat it as "the summary you provided"
-        # and fold earlier, unrelated work into this commit's message. The rolling
-        # session summary is maintained separately (update_session_summary).
-        return self._run(self._build_commit_prompt(turns, diff))
+        # The commit summary is built from ONLY the interaction trace appended to
+        # the commit — the same User/Agent text the commit carries, and nothing
+        # else (no diff, no out-of-band context). The trace already states both the
+        # request and what the agent did, so restricting the input to exactly the
+        # committed trace keeps the summary faithful to it. It is also deliberately
+        # not seeded with the rolling session summary (that folded earlier,
+        # unrelated work in); the rolling summary is maintained separately.
+        return self._run(self._build_commit_prompt(trace))
 
     def update_session_summary(
         self,
         *,
         current_summary: str | None,
-        turns: list[SessionTurn],
-        diff: str,
+        trace: str,
         commit_summary: str,
     ) -> str:
-        return self._run(self._build_session_update_prompt(current_summary, turns, diff, commit_summary))
+        return self._run(self._build_session_update_prompt(current_summary, trace, commit_summary))
 
     def summarize_pre_compaction(
         self,
@@ -265,23 +265,21 @@ class Summarizer:
         # Drop any "Here is the summary…" preamble so the topic sentence leads.
         return strip_summary_preamble(text)
 
-    def _build_commit_prompt(
-        self,
-        turns: list[SessionTurn],
-        diff: str,
-    ) -> str:
-        parts = [COMMIT_SUMMARY_SYSTEM, "\n\n"]
-        parts.append("Recent conversation turns:\n")
-        parts.append(_turns_block(turns))
-        parts.extend(["\n\nCode changes (diff):\n```\n", _truncate(diff, _MAX_DIFF_CHARS), "\n```\n\n"])
-        parts.extend([_GENERATION_REMINDER, "\n\nSummary:"])
+    def _build_commit_prompt(self, trace: str) -> str:
+        parts = [
+            COMMIT_SUMMARY_SYSTEM,
+            "\n\nInteraction trace:\n",
+            _truncate(trace, _MAX_TRACE_CHARS),
+            "\n\n",
+            _GENERATION_REMINDER,
+            "\n\nSummary:",
+        ]
         return "".join(parts)
 
     def _build_session_update_prompt(
         self,
         current_summary: str | None,
-        turns: list[SessionTurn],
-        diff: str,
+        trace: str,
         commit_summary: str,
     ) -> str:
         parts = [SESSION_UPDATE_SYSTEM, "\n\n"]
@@ -290,9 +288,7 @@ class Summarizer:
         else:
             parts.append("No previous session summary exists. Create an initial summary.\n\n")
         parts.extend(["New commit summary:\n", _truncate(commit_summary, _MAX_PRIOR_SUMMARY_CHARS), "\n\n"])
-        parts.append("Recent conversation turns:\n")
-        parts.append(_turns_block(turns))
-        parts.extend(["\n\nCode changes (diff):\n```\n", _truncate(diff, _MAX_DIFF_CHARS), "\n```\n\n"])
+        parts.extend(["Interaction trace:\n", _truncate(trace, _MAX_TRACE_CHARS), "\n\n"])
         parts.extend([_GENERATION_REMINDER, "\n\nUpdated session summary:"])
         return "".join(parts)
 
