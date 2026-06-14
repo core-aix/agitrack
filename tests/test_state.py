@@ -46,10 +46,16 @@ def test_session_name_roundtrip(tmp_path):
     state.name_session("sess-1", "my-feature")
 
     assert AgitState(tmp_path).session_name_for("sess-1") == "my-feature"
-    # A None/empty id is a no-op, and clearing removes the name.
+    # Naming also stamps a real time, so a transcript-less session can be dated.
+    import time
+
+    assert abs(AgitState(tmp_path).session_named_at("sess-1") - time.time()) < 60
+    assert AgitState(tmp_path).session_named_at("unknown") == 0.0
+    # A None/empty id is a no-op, and clearing removes the name and its stamp.
     state.name_session(None, "ignored")
     state.name_session("sess-1", None)
     assert AgitState(tmp_path).session_name_for("sess-1") is None
+    assert AgitState(tmp_path).session_named_at("sess-1") == 0.0
 
 
 def test_trace_roundtrip(tmp_path):

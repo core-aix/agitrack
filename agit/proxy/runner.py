@@ -365,6 +365,7 @@ class ProxyRunner:
         self._force_new_session = new_session  # start a fresh conversation, do not resume
         self.name = "main"  # session label (multiplexer assigns names to others)
         self._primary_worktree_name: str | None = None  # session kept across exits for auto-resume
+        self._exit_resume_worktree: str | None = None  # session active at exit → auto-resumes next start
         self.worktree: WorktreeInfo | None = None  # set when this session runs in a git worktree
         self.global_config = _global_config if _global_config is not None else GlobalConfig()
         self._apply_timings(self.global_config.timings)
@@ -710,6 +711,7 @@ class ProxyRunner:
                 "_diag_run": "test",
                 "_force_new_session": False,
                 "_primary_worktree_name": None,
+                "_exit_resume_worktree": None,
                 "global_config": None,
                 # Lazily-set fields that getattr() guards in production methods:
                 "_monitor_base_edits": False,
@@ -2522,10 +2524,17 @@ class ProxyRunner:
         # reserved name is never stranded — unresumable yet un-reusable (#75).
         # Resuming one recreates its worktree under the saved name and continues the
         # conversation if the backend still has it, or starts fresh there if not.
+        # Date them by when they were last named (not the Unix epoch, which showed
+        # as an absurd "20000d ago").
+        try:
+            root = AgitState(self.base_repo.repo, default_backend=self.global_config.default_backend)
+        except Exception:
+            root = None
         for sid, name in self._agit_named_sessions().items():
             if sid and sid not in seen:
                 seen.add(sid)
-                refs.append(SessionRef(id=sid, updated=0.0, label=name))
+                named_at = root.session_named_at(sid) if root is not None else 0.0
+                refs.append(SessionRef(id=sid, updated=named_at, label=name))
         refs = sorted(refs, key=lambda ref: getattr(ref, "updated", 0) or 0, reverse=True)
         return refs[: self.RESUME_LIST_LIMIT]
 
@@ -3065,7 +3074,11 @@ class ProxyRunner:
         self._resume_conversation(name, session_id, backend=entry_backend)
 
     def _format_age(self, updated: float) -> str:
-        delta = max(0, int(time.time() - (updated or 0)))
+        # An unknown/unset timestamp (0 or None) must not be rendered as a date —
+        # it would show as ~20000d ago (the Unix epoch). Say so honestly instead.
+        if not updated or updated <= 0:
+            return "date unknown"
+        delta = max(0, int(time.time() - updated))
         for size, unit in ((86400, "d"), (3600, "h"), (60, "m")):
             if delta >= size:
                 return f"{delta // size}{unit} ago"
@@ -4939,6 +4952,10 @@ class ProxyRunner:
             return  # already finalized (e.g. the backend exited and we ran this)
         self._finalized_on_exit = True
         self._exiting = True
+        # The session the user was working in when they quit is the one to
+        # auto-resume next start — not necessarily the primary (they may have
+        # switched to a new or shared session). It is finalized first, below.
+        self._exit_resume_worktree = getattr(self.worktree, "name", None)
         self._set_message("Finalizing commits before exit...", seconds=30)
         self._render()
         self._commit_latest_turn_sync()  # active session, in place
@@ -5045,19 +5062,23 @@ class ProxyRunner:
         info = self.worktree
         if info is None or self._base_branch is None:
             return
-        # Persist the primary session's resume pointer FIRST — before deciding
-        # whether its worktree can be removed. _persist_last_session_record runs
-        # _adopt_latest_backend_session, which captures a conversation the user
-        # switched to inside the backend's own picker (Claude's session view).
-        # Gating it behind a clean worktree removal meant a session that still had
-        # uncommitted or unintegrated work — the usual state right after a mid-work
-        # switch — never updated its resume pointer, so the next start resumed a
-        # stale conversation and only the start after that landed on the right one
-        # (the "first restart starts fresh, second restart resumes it" off-by-one).
-        # Adopting writes both the worktree state (used when the worktree is kept)
-        # and the repo-root state (used when it is removed), so the right
-        # conversation resumes either way.
-        if info.name == self._primary_worktree_name:
+        # Persist the resume pointer FIRST — before deciding whether the worktree
+        # can be removed. _persist_last_session_record runs _adopt_latest_backend_session,
+        # which captures a conversation the user switched to inside the backend's
+        # own picker (Claude's session view). Gating it behind a clean worktree
+        # removal meant a session that still had uncommitted or unintegrated work —
+        # the usual state right after a mid-work switch — never updated its resume
+        # pointer, so the next start resumed a stale conversation and only the start
+        # after that landed on the right one (the "first restart starts fresh,
+        # second restart resumes it" off-by-one). Adopting writes both the worktree
+        # state (used when the worktree is kept) and the repo-root state (used when
+        # it is removed), so the right conversation resumes either way.
+        #
+        # Persist for the session the user was actually in when they quit (set in
+        # _finalize_pending_work), so quitting from a freshly-started or resumed
+        # *shared* session auto-resumes THAT next start — not the original primary,
+        # which left the next start prompting for a brand-new session instead.
+        if info.name == (self._exit_resume_worktree or self._primary_worktree_name):
             self._persist_last_session_record()
         try:
             if self.merge_ctx or self.repo.merge_in_progress() or self.repo.has_changes():

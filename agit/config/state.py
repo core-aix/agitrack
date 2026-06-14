@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -242,16 +243,30 @@ class AgitState:
         return str(value) if value else None
 
     def name_session(self, session_id: str | None, name: str | None) -> None:
-        """Record (or clear) the user-given name for a backend conversation."""
+        """Record (or clear) the user-given name for a backend conversation, and
+        stamp when it was last named so a session with no transcript of its own
+        (e.g. a no-commit session surfaced for resume) still has a real date to
+        show instead of the Unix epoch."""
         if not session_id:
             return
         names = dict(self.data.get("session_names") or {})
+        stamps = dict(self.data.get("session_named_at") or {})
         if name:
             names[str(session_id)] = name
+            stamps[str(session_id)] = time.time()
         else:
             names.pop(str(session_id), None)
+            stamps.pop(str(session_id), None)
         self.data["session_names"] = names
+        self.data["session_named_at"] = stamps
         self.save()
+
+    def session_named_at(self, session_id: str | None) -> float:
+        """Epoch when ``session_id`` was last named (0.0 if unknown)."""
+        if not session_id:
+            return 0.0
+        value = (self.data.get("session_named_at") or {}).get(str(session_id))
+        return float(value) if isinstance(value, (int, float)) else 0.0
 
     @property
     def last_backend_message_id(self) -> str | None:
