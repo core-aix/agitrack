@@ -352,6 +352,30 @@ class AgitState:
             cur = parent
         return chain
 
+    # --- shared-session origin name (#55) ----------------------------------
+    # The name a session was originally shared under. Tracked per backend session
+    # id (and carried across resume id-drift) so re-sharing a session imported from
+    # another machine updates the SAME shared entry instead of publishing under the
+    # local session name — which prepended the sharer id on every round-trip, so
+    # the name grew without bound and the back-and-forth never converged.
+
+    def shared_origin_name(self, session_id: str | None) -> str | None:
+        if not session_id:
+            return None
+        value = (self.data.get("shared_origin_names") or {}).get(str(session_id))
+        return str(value) if value else None
+
+    def set_shared_origin_name(self, session_id: str | None, name: str | None) -> None:
+        if not session_id:
+            return
+        origins = dict(self.data.get("shared_origin_names") or {})
+        if name:
+            origins[str(session_id)] = name
+        else:
+            origins.pop(str(session_id), None)
+        self.data["shared_origin_names"] = origins
+        self.save()
+
     def pending_trace(self) -> list[dict]:
         return list(self.data.get("pending_trace") or [])
 

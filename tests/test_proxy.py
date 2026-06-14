@@ -2982,6 +2982,11 @@ def _shared_resume_runner():
     runner._set_message = lambda *a, **k: None
     runner.base_repo = types.SimpleNamespace(repo="/repo")
     runner._taken_session_names = lambda: set()
+    runner.__dict__["_origins"] = {}
+    runner._user_state = lambda: types.SimpleNamespace(
+        set_shared_origin_name=lambda sid, name: runner.__dict__["_origins"].__setitem__(sid, name),
+        shared_origin_name=lambda sid: runner.__dict__["_origins"].get(sid),
+    )
     entry = types.SimpleNamespace(
         github_id="alice",
         name="fix-parser",
@@ -3007,8 +3012,8 @@ def _shared_resume_runner():
 
 def test_shared_resume_prompts_for_local_name():
     runner = _shared_resume_runner()
-    # The default offered to the prompt is the deduped "<sharer>-<name>"; the user
-    # accepts a local name of their own.
+    # The default offered to the prompt is the original share name (deduped, no
+    # sharer prefix); the user accepts a local name of their own.
     seen = {}
 
     def fake_prompt(title, *, default):
@@ -3019,8 +3024,27 @@ def test_shared_resume_prompts_for_local_name():
 
     runner._resume_shared_session_menu()
 
-    assert seen["default"] == "alice-fix-parser"
+    assert seen["default"] == "fix-parser"
     assert runner.__dict__["_resumed"] == [("my-copy", "sid-1", {"backend": "claude"})]
+    # The original share name is remembered so a later re-share updates the same
+    # entry regardless of the local name (#55).
+    assert runner.__dict__["_origins"]["sid-1"] == "fix-parser"
+
+
+def test_share_name_uses_remembered_origin_over_local_name():
+    import types
+
+    runner = make_runner(name="main")
+    runner.active_index = 0
+    runner._session_name = lambda i: "my-local-rename"
+    runner._user_state = lambda: types.SimpleNamespace(
+        shared_origin_name=lambda sid: "fix-parser" if sid == "sid-1" else None
+    )
+    # A resumed shared session re-shares under its origin name, not the local one.
+    assert runner._share_name_for("sid-1") == "fix-parser"
+    # A session that originated here (no origin) falls back to the local name.
+    assert runner._share_name_for("other") == "my-local-rename"
+    assert runner._share_name_for(None) == "my-local-rename"
 
 
 def test_shared_resume_cancel_on_name_prompt_does_not_resume():
