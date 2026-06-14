@@ -946,18 +946,14 @@ class ProxyRunner:
     @staticmethod
     def _sandbox_unavailable_hint() -> str:
         base = (
-            "Agent sandbox unavailable — edits outside the session worktree can't be\n"
-            "prevented; aGiT will warn if the base repo is modified."
+            "Heads up: aGiT can't fully sandbox the agent on this system, so it could\n"
+            "change files outside its workspace. aGiT will warn you if that happens."
         )
-        if sys.platform.startswith("linux"):
-            if shutil.which("bwrap") is None:
-                return base + "\nInstall bubblewrap (e.g. `apt install bubblewrap`) to enforce it."
-            # bwrap is present but the probe failed — almost always blocked userns.
-            return (
-                base + "\nbubblewrap is installed but unprivileged user namespaces are blocked\n"
-                "(e.g. Ubuntu's kernel.apparmor_restrict_unprivileged_userns); enabling them\n"
-                "lets aGiT enforce the worktree sandbox."
-            )
+        # Only offer the one simple, actionable step (installing bubblewrap) — and
+        # only when it's actually missing. No kernel/userns jargon: if the tool is
+        # present but the system still blocks it, the plain warning is enough.
+        if sys.platform.startswith("linux") and shutil.which("bwrap") is None:
+            return base + "\nInstalling the 'bubblewrap' tool (e.g. `apt install bubblewrap`) can turn the sandbox on."
         return base
 
     def _check_base_branch_drift(self) -> None:
