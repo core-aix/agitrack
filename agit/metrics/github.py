@@ -29,10 +29,12 @@ _TTL_SECONDS = 300.0
 _TIMEOUT_SECONDS = 20.0
 
 
-def gh_available() -> bool:
-    """True when the ``gh`` CLI is installed and authenticated."""
+def gh_status() -> str:
+    """Whether the ``gh`` CLI is usable: ``"ok"`` (installed and authenticated),
+    ``"missing"`` (not installed), or ``"unauthenticated"`` (installed but not
+    logged in, or the auth check failed/timed out)."""
     if shutil.which("gh") is None:
-        return False
+        return "missing"
     try:
         result = subprocess.run(
             ["gh", "auth", "status"],
@@ -41,8 +43,13 @@ def gh_available() -> bool:
             timeout=_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.SubprocessError):
-        return False
-    return result.returncode == 0
+        return "unauthenticated"
+    return "ok" if result.returncode == 0 else "unauthenticated"
+
+
+def gh_available() -> bool:
+    """True when the ``gh`` CLI is installed and authenticated."""
+    return gh_status() == "ok"
 
 
 def resolve_logins(repo: GitRepo, *, refresh: bool = False) -> dict[str, str]:
