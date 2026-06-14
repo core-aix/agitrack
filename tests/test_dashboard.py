@@ -393,6 +393,27 @@ def test_co_authored_commit_is_filterable_under_every_committer():
     assert set(entry["committers"]) == {"Alex Doe", "Robin Roe"}
 
 
+def test_bot_and_ai_primary_authors_are_not_committers():
+    from agit.metrics.collect import Dashboard, _detect_loops
+    from agit.metrics.web import _options
+
+    bot = CommitStat(
+        sha="b1",
+        author="github-actions[bot]",
+        email="41898282+github-actions[bot]@users.noreply.github.com",
+        subject="Automated release",
+        kind="untracked",
+    )
+    human = CommitStat(sha="h1", author="Alex Doe", email="alex@example.com", subject="Real work", kind="agent")
+    dash = Dashboard(repo="r", branch="main", stats=[bot, human], loops=_detect_loops([bot, human]))
+    # The bot is the primary author but is not a committer: empty here, absent
+    # from the filter options and the per-committer breakdown.
+    assert dash.committers_of(bot) == []
+    assert dash.committers_of(human) == ["Alex Doe"]
+    assert _options(dash)["committers"] == ["Alex Doe"]
+    assert "github-actions[bot]" not in dash.by_author
+
+
 def test_filter_stats_matches_any_committer():
     from agit.metrics.web import _filter_stats, _options
 
