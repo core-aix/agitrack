@@ -82,7 +82,16 @@ class TerminalHost:
         except (termios.error, OSError, ValueError):
             pass
         self.set_cooked()
-        os.write(sys.stdout.fileno(), b"\x1b[?1049l\x1b[0m\r\n")
+        # Clear+home *before* leaving the alt screen, then leave it. On terminals
+        # that support the alternate screen (macOS, VTE/gnome-terminal) the clear
+        # only touches the alt buffer we're about to discard — `?1049l` still
+        # restores the pre-agit content, so nothing changes. On terminals without
+        # alt-screen support (raw Linux console, some Ubuntu setups, tmux with
+        # altscreen disabled) `?1049h`/`?1049l` are no-ops and aGiT drew straight
+        # onto the main screen, so without this clear its UI would linger after
+        # exit (#70). Doing it in this order fixes that case without nuking the
+        # user's scrollback on terminals where the alt screen does work.
+        os.write(sys.stdout.fileno(), b"\x1b[2J\x1b[H\x1b[?1049l\x1b[0m\r\n")
 
     def pause_child_ui(self: TerminalHostState) -> None:
         self.set_cooked()
