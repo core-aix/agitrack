@@ -2917,6 +2917,76 @@ def test_resume_switches_to_already_live_conversation():
     assert "_created" not in runner.__dict__
 
 
+# --- shared-session resume gives a local name (#71) ---
+
+
+def _shared_resume_runner():
+    import types
+
+    runner = make_runner(name="main")
+    runner.sessions = []
+    runner._render = lambda: None
+    runner._set_message = lambda *a, **k: None
+    runner.base_repo = types.SimpleNamespace(repo="/repo")
+    runner._taken_session_names = lambda: set()
+    entry = types.SimpleNamespace(
+        github_id="alice",
+        name="fix-parser",
+        display="alice/fix-parser",
+        manifest={"session_id": "sid-1", "backend": "claude"},
+    )
+    store = types.SimpleNamespace(
+        fetch=lambda: None,
+        entries=lambda: [entry],
+        read_transcript=lambda e: "transcript-body",
+    )
+    runner._shared_store = lambda: store
+    runner._select_popup = lambda title, options: options[0]  # pick the only entry
+    runner.backend = types.SimpleNamespace(
+        name="claude",
+        has_local_session=lambda *a, **k: False,
+        import_shared_session=lambda *a, **k: True,
+    )
+    runner.__dict__["_resumed"] = []
+    runner._resume_conversation = lambda name, sid, **k: runner.__dict__["_resumed"].append((name, sid, k))
+    return runner
+
+
+def test_shared_resume_prompts_for_local_name():
+    runner = _shared_resume_runner()
+    # The default offered to the prompt is the deduped "<sharer>-<name>"; the user
+    # accepts a local name of their own.
+    seen = {}
+
+    def fake_prompt(title, *, default):
+        seen["default"] = default
+        return "my-copy"
+
+    runner._prompt_session_name = fake_prompt
+
+    runner._resume_shared_session_menu()
+
+    assert seen["default"] == "alice-fix-parser"
+    assert runner.__dict__["_resumed"] == [("my-copy", "sid-1", {"backend": "claude"})]
+
+
+def test_shared_resume_cancel_on_name_prompt_does_not_resume():
+    runner = _shared_resume_runner()
+    runner._prompt_session_name = lambda *a, **k: None  # user cancels naming
+
+    runner._resume_shared_session_menu()
+
+    assert runner.__dict__["_resumed"] == []
+
+
+def test_dedupe_session_name_avoids_collisions():
+    runner = make_runner(name="main")
+    runner._taken_session_names = lambda: {"alice-fix-parser", "alice-fix-parser-2"}
+    assert runner._dedupe_session_name("alice/fix-parser") == "alice-fix-parser-3"
+    runner._taken_session_names = lambda: set()
+    assert runner._dedupe_session_name("alice/fix-parser") == "alice-fix-parser"
+
+
 # --- base branch switched out-of-band ---
 
 

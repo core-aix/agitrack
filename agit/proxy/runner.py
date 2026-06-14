@@ -1404,6 +1404,18 @@ class ProxyRunner:
     def _session_name_taken(self, name: str) -> bool:
         return _sanitize_name(name) in self._taken_session_names()
 
+    def _dedupe_session_name(self, base: str) -> str:
+        # A collision-free local name derived from ``base`` (e.g. a shared
+        # session's "<sharer>-<name>"), so the resume prompt's default can be
+        # accepted as-is even when the same session was imported before.
+        candidate = _sanitize_name(base)
+        if not self._session_name_taken(candidate):
+            return candidate
+        suffix = 2
+        while self._session_name_taken(f"{candidate}-{suffix}"):
+            suffix += 1
+        return f"{candidate}-{suffix}"
+
     def _prompt_session_name(self, title: str, *, default: str) -> str | None:
         # Ask for a session name, rejecting duplicates (a session and its worktree
         # are 1:1, so names must be unique). Returns the chosen name, or None on
@@ -2911,14 +2923,31 @@ class ProxyRunner:
                 self._render()
                 return
         # If this conversation is already live, just switch to it — never overwrite a
-        # running session. Otherwise, if a (dormant) local copy exists, ask whether to
-        # pull the shared version (the "continue on another machine" sync) or keep the
-        # local one. With no local copy, import fresh.
+        # running session.
         already_live = any(
             getattr(getattr(s, "state", None), "backend_session_id", None) == session_id for s in self.sessions
         )
+        if already_live:
+            self._resume_conversation(f"{entry.github_id}-{entry.name}", session_id, backend=entry_backend)
+            return
+        # Give the imported session a clear local name (#71): a shared session
+        # arrives identified only by its sharer/name on the remote, so prompt for
+        # a local session name — defaulting to a clean, deduped derivation — the
+        # same way a brand-new session is named, instead of silently adopting the
+        # raw "<sharer>-<name>" slug.
+        name = self._prompt_session_name(
+            "Resume shared session",
+            default=self._dedupe_session_name(f"{entry.github_id}-{entry.name}"),
+        )
+        if name is None:
+            self._set_message("Cancelled.")
+            self._render()
+            return
+        # If a (dormant) local copy exists, ask whether to pull the shared version
+        # (the "continue on another machine" sync) or keep the local one. With no
+        # local copy, import fresh.
         overwrite = False
-        if not already_live and agent.has_local_session(self.base_repo.repo, session_id):
+        if agent.has_local_session(self.base_repo.repo, session_id):
             age = self._format_age(entry.manifest["updated"]) if entry.manifest.get("updated") else "earlier"
             pick = self._select_popup(
                 f"You already have a local copy of {entry.display}.\n"
@@ -2934,7 +2963,7 @@ class ProxyRunner:
             self._set_message("Could not install the shared session for resume.")
             self._render()
             return
-        self._resume_conversation(f"{entry.github_id}-{entry.name}", session_id, backend=entry_backend)
+        self._resume_conversation(name, session_id, backend=entry_backend)
 
     def _format_age(self, updated: float) -> str:
         delta = max(0, int(time.time() - (updated or 0)))
