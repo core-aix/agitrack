@@ -41,6 +41,47 @@ def test_agent_commit_message_contains_trace_and_metadata():
     assert "token_note" not in message
 
 
+def test_trace_message_headings_are_nested_under_role():
+    # A message's own Markdown headings must be pushed one level below its
+    # "## User"/"## Agent" role heading so they nest (and render) correctly,
+    # instead of a message "# Title" outranking the role it belongs to.
+    message = build_agent_commit_message(
+        latest_prompt="do it",
+        trace=[
+            {"role": "user", "content": "# Big ask\nplease\n## Detail\nmore"},
+            {"role": "agent", "content": "### Already deep\nkept as-is"},
+        ],
+        backend="claude",
+        backend_session_id="ses-1",
+        agit_session_id="agit-1",
+        model="m",
+    )
+    # User content's shallowest heading was level 1, so everything shifts +2: the
+    # role stays "## User" and the message's headings start one level below it.
+    assert "## User\n\n### Big ask" in message
+    assert "#### Detail" in message
+    # The original level-1/level-2 headings must no longer appear as such.
+    assert "\n# Big ask" not in message
+    assert "\n## Detail" not in message
+    # Agent content already started at level 3 (one below the role) — left intact.
+    assert "## Agent\n\n### Already deep" in message
+
+
+def test_trace_heading_nesting_skips_fenced_code_comments():
+    # A leading '#' inside a fenced code block is a comment, not a heading, and
+    # must be left untouched even while real headings around it are shifted.
+    message = build_agent_commit_message(
+        latest_prompt="x",
+        trace=[{"role": "agent", "content": "# Heading\n```sh\n# just a comment\n```"}],
+        backend="claude",
+        backend_session_id="ses-1",
+        agit_session_id="agit-1",
+        model="m",
+    )
+    assert "### Heading" in message
+    assert "# just a comment" in message  # the comment kept its single '#'
+
+
 def test_commit_message_masks_secrets_in_subject_and_trace():
     message = build_agent_commit_message(
         latest_prompt="use api_key=sk-abc12345678901234567890",
@@ -253,6 +294,19 @@ def test_commit_messages_include_current_agit_version_without_created_at():
 
     assert f"agit_version: {__version__}" in message
     assert "created_at" not in message
+
+
+def test_commit_version_matches_installed_distribution():
+    # The version stamped into commit metadata must equal the aGiT the user has
+    # installed — agit.__version__ derives from the distribution metadata so the
+    # two cannot drift (pyproject.toml is the single version source).
+    from importlib.metadata import version
+
+    from agit import __version__
+
+    assert __version__ == version("agit-ai")
+    message = build_user_commit_message(message="save work", agit_session_id="agit-1")
+    assert f"agit_version: {version('agit-ai')}" in message
 
 
 def test_agent_commit_subject_is_capped_for_github():

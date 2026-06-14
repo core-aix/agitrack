@@ -25,7 +25,7 @@ and ad-hoc use; the live page does not embed it.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from agit.git import GitRepo
 from agit.metrics.collect import CommitStat, Dashboard, build_dashboard
@@ -34,11 +34,46 @@ from agit.metrics.collect import CommitStat, Dashboard, build_dashboard
 def render_html(repo: GitRepo, ref: str = "HEAD") -> str:
     from agit.metrics.github import resolve_logins
 
-    return format_html(build_dashboard(repo, ref, sha_logins=resolve_logins(repo)))
+    return format_html(
+        build_dashboard(repo, ref, sha_logins=resolve_logins(repo)),
+        shared_sessions=shared_sessions_for(repo),
+    )
 
 
-def format_html(dash: Dashboard) -> str:
-    payload = json.dumps(initial_payload(dash), separators=(",", ":"))
+def shared_sessions_for(repo: GitRepo) -> list[dict]:
+    """Sessions shared into this repo (issue #55), for the dashboard. Reads the
+    local shared ref plus a throttled remote fetch so teammates' newly-shared
+    sessions appear; never raises (sharing may be unconfigured/offline)."""
+    try:
+        from agit.sessions import SharedSessionStore
+
+        store = SharedSessionStore(repo)
+    except Exception:
+        return []
+    # The remote fetch is a best-effort extra (others' shares); a transient failure
+    # (e.g. racing a concurrent auto-share push) must NOT blank the list — fall back
+    # to the local ref, which always holds your own shared sessions.
+    try:
+        store.fetch_throttled()
+    except Exception:
+        pass
+    try:
+        return [
+            {
+                "github_id": entry.github_id,
+                "name": entry.name,
+                "model": entry.manifest.get("model"),
+                "backend": entry.manifest.get("backend"),
+                "updated": entry.manifest.get("updated", 0),
+            }
+            for entry in store.entries()
+        ]
+    except Exception:
+        return []
+
+
+def format_html(dash: Dashboard, *, shared_sessions: list[dict] | None = None) -> str:
+    payload = json.dumps(initial_payload(dash, shared_sessions=shared_sessions), separators=(",", ":"))
     repo_name = dash.repo.rstrip("/").rsplit("/", 1)[-1] or dash.repo
     return (
         _TEMPLATE.replace("__DATA__", payload)
@@ -70,6 +105,9 @@ def dashboard_data(dash: Dashboard) -> dict:
                 # The merged committer identity, so name variants of one person
                 # collapse to a single filter/breakdown entry (#54).
                 "author": dash.label_of(stat),
+                # Every committer credited (primary author + human co-authors), so
+                # a co-authored commit is filterable under each of them (#54).
+                "committers": dash.committers_of(stat),
                 "subject": stat.subject,
                 "kind": stat.kind,
                 "backend": stat.backend,
@@ -98,7 +136,7 @@ def dashboard_data(dash: Dashboard) -> dict:
         # HEAD sha lets the live page skip re-rendering when nothing changed.
         "head": dash.stats[-1].sha if dash.stats else "",
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-        "committers": sorted({c["author"] for c in commits if c["author"]}),
+        "committers": sorted({a for stat in dash.stats for a in dash.committers_of(stat) if a}),
         "backends": sorted({c["eff_backend"] for c in commits if c["eff_backend"]}),
         "models": sorted({c["eff_model"] for c in commits if c["eff_model"]}),
         "commits": commits,
@@ -152,7 +190,7 @@ def _filter_stats(dash: Dashboard, *, author: str, backend: str, model: str, frm
     covers = _covers(dash)
     out: list[CommitStat] = []
     for stat in dash.stats:
-        if author and dash.label_of(stat) != author:
+        if author and author not in dash.committers_of(stat):
             continue
         eff_backend, eff_model = _effective(stat, covers)
         if backend and eff_backend != backend:
@@ -200,11 +238,108 @@ def _aggregates(fd: Dashboard) -> dict:
     }
 
 
+_AI_KINDS = ("agent", "covered", "agent-merge")
+GRANULARITIES = ("hour", "day", "week", "month")
+DEFAULT_GRANULARITY = "day"
+# Cap the number of plotted buckets so an extreme granularity/range (e.g. hourly
+# over years) can't bloat the payload; the most recent buckets are kept.
+_MAX_BUCKETS = 1500
+
+
+def _period_start(ts: int, granularity: str) -> int:
+    """Epoch seconds of the start of the calendar period (UTC) that ``ts`` falls
+    in, for the chosen granularity — day floors to midnight, week to Monday,
+    month to the 1st, hour to the top of the hour."""
+    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    if granularity == "hour":
+        dt = dt.replace(minute=0, second=0, microsecond=0)
+    elif granularity == "month":
+        dt = dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    elif granularity == "week":
+        dt = dt.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=dt.weekday())
+    else:  # day
+        dt = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    return int(dt.timestamp())
+
+
+def _next_period(ts: int, granularity: str) -> int:
+    """Epoch seconds of the start of the period after the one starting at ``ts``."""
+    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    if granularity == "hour":
+        return int((dt + timedelta(hours=1)).timestamp())
+    if granularity == "week":
+        return int((dt + timedelta(days=7)).timestamp())
+    if granularity == "month":
+        year, month = (dt.year + dt.month // 12), (dt.month % 12 + 1)
+        return int(dt.replace(year=year, month=month).timestamp())
+    return int((dt + timedelta(days=1)).timestamp())
+
+
+def _timeseries(stats: list[CommitStat], *, granularity: str = DEFAULT_GRANULARITY) -> dict:
+    """Per-period commits / AI lines / token usage over time for the (already
+    filtered) commits, bucketed by calendar period (the configurable
+    *granularity*). Values are the activity *within* each period — not a running
+    total — so a quiet day reads as a dip to zero. Empty periods between the first
+    and last are filled with zeros so the time axis is continuous. ``t`` holds each
+    bucket's start epoch seconds; every series is the same length as ``t``.
+
+    The browser normalises each series to its own peak so wildly different
+    magnitudes (tens of commits vs millions of tokens) share one plot, and shows
+    the real per-period value on hover."""
+    if granularity not in GRANULARITIES:
+        granularity = DEFAULT_GRANULARITY
+    dated = [s for s in stats if s.timestamp]
+    empty: dict = {
+        "t": [],
+        "commits": [],
+        "ai_lines": [],
+        "output_tokens": [],
+        "input_tokens": [],
+        "granularity": granularity,
+    }
+    if not dated:
+        return empty
+    lo = _period_start(min(s.timestamp for s in dated), granularity)
+    hi = _period_start(max(s.timestamp for s in dated), granularity)
+    starts: list[int] = []
+    cur = lo
+    # Forward-fill the period boundaries; the loop is bounded so a pathological
+    # granularity/range can't spin, and the slice keeps the most recent buckets.
+    while cur <= hi and len(starts) <= _MAX_BUCKETS * 12:
+        starts.append(cur)
+        cur = _next_period(cur, granularity)
+    starts = starts[-_MAX_BUCKETS:]
+    index = {start: i for i, start in enumerate(starts)}
+    n = len(starts)
+    commits = [0] * n
+    lines = [0] * n
+    out_tok = [0] * n
+    in_tok = [0] * n
+    ai = set(_AI_KINDS)
+    for s in dated:
+        i = index.get(_period_start(s.timestamp, granularity))
+        if i is None:  # in an old bucket dropped by the cap
+            continue
+        commits[i] += 1
+        if s.kind in ai:
+            lines[i] += s.insertions + s.deletions
+        out_tok[i] += s.tokens.get("output", 0)
+        in_tok[i] += s.tokens.get("input", 0)
+    return {
+        "t": starts,
+        "commits": commits,
+        "ai_lines": lines,
+        "output_tokens": out_tok,
+        "input_tokens": in_tok,
+        "granularity": granularity,
+    }
+
+
 def _options(dash: Dashboard) -> dict:
     covers = _covers(dash)
     committers, backends, models = set(), set(), set()
     for stat in dash.stats:
-        committers.add(dash.label_of(stat))
+        committers.update(dash.committers_of(stat))
         eff_backend, eff_model = _effective(stat, covers)
         if eff_backend:
             backends.add(eff_backend)
@@ -218,17 +353,29 @@ def _options(dash: Dashboard) -> dict:
 
 
 def aggregates_payload(
-    dash: Dashboard, *, author: str = "", backend: str = "", model: str = "", frm: int = 0, to: int = 0
+    dash: Dashboard,
+    *,
+    author: str = "",
+    backend: str = "",
+    model: str = "",
+    frm: int = 0,
+    to: int = 0,
+    granularity: str = DEFAULT_GRANULARITY,
 ) -> dict:
     """All the metric panels for the given filters — no per-commit list, so the
     response stays small no matter how large the repository is. Filter options
     come from the full history so the dropdowns never lose entries."""
     stats = _filter_stats(dash, author=author, backend=backend, model=model, frm=frm, to=to)
+    # Full-history commit-date span (unfiltered) so the from/to date inputs can show
+    # — and be bounded to — the real range the dashboard covers.
+    dated = [s.timestamp for s in dash.stats if s.timestamp]
     return {
         "head": dash.stats[-1].sha if dash.stats else "",
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         "options": _options(dash),
+        "span": {"from": min(dated), "to": max(dated)} if dated else {"from": 0, "to": 0},
         "agg": _aggregates(_filtered_dashboard(dash, stats)),
+        "timeseries": _timeseries(stats, granularity=granularity),
     }
 
 
@@ -237,6 +384,7 @@ def _log_entry(dash: Dashboard, stat: CommitStat, covers: dict[str, CommitStat])
     return {
         "short": stat.short,
         "author": dash.label_of(stat),
+        "committers": dash.committers_of(stat),
         "subject": stat.subject,
         "kind": stat.kind,
         "eff_backend": eff_backend,
@@ -281,15 +429,16 @@ def log_page(
     }
 
 
-def initial_payload(dash: Dashboard) -> dict:
+def initial_payload(dash: Dashboard, *, shared_sessions: list[dict] | None = None) -> dict:
     """What the page embeds for an instant first paint: unfiltered aggregates,
-    the first log page, repo metadata, and the page size."""
+    the first log page, repo metadata, the page size, and any shared sessions."""
     return {
         "repo": dash.repo,
         "branch": dash.branch,
         "page_size": PAGE_SIZE,
         **aggregates_payload(dash),
         "log": log_page(dash),
+        "shared_sessions": shared_sessions or [],
     }
 
 
@@ -344,24 +493,35 @@ header{padding:54px 0 22px}
 .meta .tag{color:var(--amber)}
 
 /* ---- filter bar ---- */
+/* Stays a single row while sticky: never wrap, so the frozen panel is one row
+   tall. (No overflow clipping — the custom-range popup hangs below the bar.) */
 .controls{position:sticky;top:0;z-index:20;margin:22px 0 30px;padding:14px 16px;background:var(--panel);
-  border:1px solid var(--line);border-bottom-width:3px;display:flex;flex-wrap:wrap;gap:18px;align-items:flex-end}
-.controls .prompt{color:var(--phosphor);font-weight:600;align-self:center}
+  border:1px solid var(--line);border-bottom-width:3px;display:flex;flex-wrap:nowrap;gap:16px;align-items:flex-end}
+.controls .prompt{color:var(--phosphor);font-weight:600;align-self:center;white-space:nowrap}
 .field{display:flex;flex-direction:column;gap:4px}
-.field label{font-size:11px;color:var(--amber);letter-spacing:.6px;text-transform:uppercase}
+.field label{font-size:11px;color:var(--amber);letter-spacing:.6px;text-transform:uppercase;white-space:nowrap}
 .field select{appearance:none;background:var(--ink);color:var(--fg);border:1px solid var(--line);
-  font-family:var(--mono);font-size:13.5px;padding:7px 30px 7px 11px;cursor:pointer;min-width:170px;
+  font-family:var(--mono);font-size:13.5px;padding:7px 30px 7px 11px;cursor:pointer;min-width:150px;
   background-image:linear-gradient(45deg,transparent 50%,var(--phosphor-dim) 50%),linear-gradient(135deg,var(--phosphor-dim) 50%,transparent 50%);
   background-position:calc(100% - 16px) 50%,calc(100% - 11px) 50%;background-size:5px 5px,5px 5px;background-repeat:no-repeat}
 .field select:focus{outline:none;border-color:var(--phosphor)}
-.field input[type=date]{background:var(--ink);color:var(--fg);border:1px solid var(--line);
+input[type=date]{background:var(--ink);color:var(--fg);border:1px solid var(--line);
   font-family:var(--mono);font-size:13px;padding:6px 9px;cursor:pointer}
-.field input[type=date]:focus{outline:none;border-color:var(--phosphor)}
-.field input[type=date]::-webkit-calendar-picker-indicator{filter:invert(.7) sepia(1) hue-rotate(90deg)}
-.scope{margin-left:auto;align-self:center;color:var(--fg-dim);font-size:12.5px}
-.scope b{color:var(--phosphor)}
+input[type=date]:focus{outline:none;border-color:var(--phosphor)}
+input[type=date]::-webkit-calendar-picker-indicator{filter:invert(.7) sepia(1) hue-rotate(90deg)}
+/* custom date range: a popup anchored under the period select */
+.period-field{position:relative}
+.daterange{position:absolute;top:100%;right:0;z-index:30;margin-top:8px;background:var(--panel);
+  border:1px solid var(--phosphor-dim);padding:12px 14px;display:flex;gap:12px;align-items:flex-end;
+  box-shadow:0 10px 28px rgba(0,0,0,.6)}
+.daterange[hidden]{display:none}
+.dr-field{display:flex;flex-direction:column;gap:4px}
+.dr-field label{font-size:11px;color:var(--amber);letter-spacing:.6px;text-transform:uppercase}
+.dr-done{cursor:pointer;border:1px solid var(--phosphor);color:var(--phosphor);background:transparent;
+  font-family:var(--mono);font-size:12.5px;padding:6px 12px}
+.dr-done:hover{background:var(--phosphor);color:var(--ink)}
 .reset{cursor:pointer;border:1px solid var(--amber);color:var(--amber);background:transparent;
-  font-family:var(--mono);font-size:12.5px;padding:7px 12px;align-self:flex-end}
+  font-family:var(--mono);font-size:12.5px;padding:7px 12px;align-self:flex-end;margin-left:auto;white-space:nowrap}
 .reset:hover{background:var(--amber);color:var(--ink)}
 
 h2.section{font-family:var(--display);font-size:27px;font-weight:400;color:var(--phosphor);letter-spacing:1px;
@@ -379,6 +539,35 @@ h2.section::before{content:"# ";color:var(--amber)}
 .card .value.amber{color:var(--amber);text-shadow:0 0 14px rgba(255,180,84,.3)}
 .card .note{font-size:12px;color:var(--fg-dim);margin-top:4px}
 
+/* ---- time-series chart ---- */
+.chartpanel{padding:14px 16px 10px;position:relative}
+.chart-head{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;flex-wrap:wrap;margin-bottom:10px}
+.chart-controls{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+.zoomhint{color:var(--fg-dim);font-size:11.5px;font-style:italic;white-space:nowrap}
+.gran{display:flex;align-items:center;gap:7px;color:var(--amber);font-size:11px;letter-spacing:.6px;text-transform:uppercase}
+.gran select{appearance:none;background:var(--ink);color:var(--fg);border:1px solid var(--line);
+  font-family:var(--mono);font-size:12.5px;padding:5px 26px 5px 9px;cursor:pointer;text-transform:none;letter-spacing:normal;
+  background-image:linear-gradient(45deg,transparent 50%,var(--phosphor-dim) 50%),linear-gradient(135deg,var(--phosphor-dim) 50%,transparent 50%);
+  background-position:calc(100% - 14px) 50%,calc(100% - 9px) 50%;background-size:5px 5px,5px 5px;background-repeat:no-repeat}
+.gran select:focus{outline:none;border-color:var(--phosphor)}
+.legend{display:flex;flex-wrap:wrap;gap:8px}
+.legend .lg{display:inline-flex;align-items:center;gap:7px;cursor:pointer;background:var(--ink);
+  border:1px solid var(--line);color:var(--fg);font-family:var(--mono);font-size:12px;padding:5px 10px;transition:opacity .12s}
+.legend .lg .sw{width:11px;height:11px;border:1px solid var(--c);background:var(--c);box-shadow:0 0 7px var(--c)}
+.legend .lg b{color:var(--c)}
+.legend .lg.off{opacity:.4}
+.legend .lg.off .sw{background:transparent;box-shadow:none}
+.legend .lg:hover{border-color:var(--c)}
+.chartwrap{position:relative;width:100%;height:280px}
+.chartwrap canvas{display:block;width:100%;height:100%;cursor:crosshair}
+.chart-empty{color:var(--fg-dim);padding:40px 4px;text-align:center}
+.tip{position:absolute;pointer-events:none;z-index:5;background:var(--panel-2);border:1px solid var(--phosphor-dim);
+  padding:7px 10px;font-size:12px;color:var(--fg);white-space:nowrap;box-shadow:0 4px 16px rgba(0,0,0,.6);transform:translateX(-50%)}
+.tip .td{color:var(--amber);margin-bottom:3px}
+.tip .tr{display:flex;align-items:center;gap:6px}
+.tip .tr .sw{width:8px;height:8px;background:var(--c);box-shadow:0 0 6px var(--c)}
+.tip .tr b{color:var(--c);margin-left:auto;padding-left:10px}
+
 /* ---- bar / table ---- */
 .panel{background:var(--panel);border:1px solid var(--line);padding:6px 0}
 .row{display:grid;grid-template-columns:minmax(120px,1.4fr) 2.6fr minmax(150px,1fr);gap:14px;align-items:center;
@@ -393,6 +582,15 @@ h2.section::before{content:"# ";color:var(--amber)}
 .row .num{text-align:right;color:var(--fg-dim);font-size:12.5px}
 .row .num b{color:var(--phosphor);font-weight:600}
 .empty{padding:16px 18px;color:var(--fg-dim)}
+/* shared sessions list */
+.srow{display:grid;grid-template-columns:minmax(160px,1.6fr) 2fr auto;gap:14px;align-items:baseline;
+  padding:11px 18px;border-bottom:1px solid var(--line)}
+.srow:last-child{border-bottom:none}
+.srow .sid{color:var(--phosphor);font-weight:500;overflow-wrap:anywhere}
+.srow .sid b{color:var(--amber);font-weight:600}
+.srow .smeta{color:var(--fg-dim);font-size:12.5px}
+.srow .sage{color:var(--fg-dim);font-size:12px;text-align:right;white-space:nowrap}
+@media (max-width:760px){.srow{grid-template-columns:1fr;gap:4px}.srow .sage{text-align:left}}
 .hint{padding:8px 18px 0;color:var(--fg-dim);font-size:11.5px;font-style:italic}
 .kindcounts{padding:11px 18px;border-top:1px solid var(--line);font-size:12.5px;color:var(--fg-dim);line-height:1.9}
 .kindcounts .klabel{color:var(--amber);margin-right:4px}
@@ -440,6 +638,14 @@ h2.section::before{content:"# ";color:var(--amber)}
 /* rendered Markdown inside the expanded message */
 .dmsg.md p{margin:7px 0}
 .dmsg.md .md-h{font-family:var(--mono);color:var(--amber);margin:11px 0 5px;font-size:13px;font-weight:600}
+/* Heading depth reads at a glance: structural sections (# …) brightest/largest,
+   the ## User/## Agent role one step down, and a message's own nested headings
+   smaller, dimmer and indented so they sit visibly under their role. md() maps a
+   source level L to <h(L+2)>, so these are # → h3, ## → h4, content → h5/h6. */
+.dmsg.md h3.md-h{font-size:15px;color:var(--amber)}
+.dmsg.md h4.md-h{font-size:13.5px;color:var(--phosphor)}
+.dmsg.md h5.md-h{font-size:12.5px;color:var(--ops);font-weight:500;padding-left:10px;border-left:2px solid var(--line)}
+.dmsg.md h6.md-h{font-size:12px;color:var(--fg-dim);font-weight:500;padding-left:20px;border-left:2px solid var(--line)}
 .dmsg.md ul{margin:6px 0 6px 18px} .dmsg.md li{margin:2px 0}
 .dmsg.md code{background:var(--panel-2);border:1px solid var(--line);padding:0 4px;color:var(--phosphor);font-size:12px}
 .dmsg.md strong{color:var(--fg)} .dmsg.md em{color:var(--fg)}
@@ -485,22 +691,43 @@ footer{margin-top:46px;padding-top:22px;border-top:1px dashed var(--line);color:
     <div class="field"><label for="f-author">committer</label><select id="f-author"></select></div>
     <div class="field"><label for="f-backend">backend</label><select id="f-backend"></select></div>
     <div class="field"><label for="f-model">model</label><select id="f-model"></select></div>
-    <div class="field"><label for="f-period">period</label><select id="f-period">
+    <div class="field period-field"><label for="f-period">range</label><select id="f-period">
       <option value="">all time</option>
       <option value="1">last 24 hours</option>
       <option value="7">last 7 days</option>
       <option value="30">last 30 days</option>
       <option value="90">last 90 days</option>
-      <option value="custom">custom range</option>
-    </select></div>
-    <div class="field"><label for="f-from">from</label><input type="date" id="f-from"></div>
-    <div class="field"><label for="f-to">to</label><input type="date" id="f-to"></div>
+      <option value="custom">custom range…</option>
+    </select>
+      <div class="daterange" id="daterange" hidden>
+        <div class="dr-field"><label for="f-from">from</label><input type="date" id="f-from"></div>
+        <div class="dr-field"><label for="f-to">to</label><input type="date" id="f-to"></div>
+        <button class="dr-done" id="dr-done">done</button>
+      </div>
+    </div>
     <button class="reset" id="reset">reset</button>
-    <span class="scope" id="scope"></span>
   </div>
 
   <h2 class="section">overview</h2>
   <div class="cards" id="cards"></div>
+
+  <h2 class="section">activity over time</h2>
+  <div class="panel chartpanel">
+    <div class="chart-head">
+      <div class="legend" id="ts-legend"></div>
+      <div class="chart-controls">
+        <span class="zoomhint">scroll to zoom · drag to pan · double-click to reset</span>
+        <div class="gran"><label for="ts-gran">per</label><select id="ts-gran">
+          <option value="hour">hour</option>
+          <option value="day">day</option>
+          <option value="week">week</option>
+          <option value="month">month</option>
+        </select></div>
+      </div>
+    </div>
+    <div class="chartwrap"><canvas id="ts-canvas" title="Scroll to zoom the time axis · drag to pan · double-click to reset"></canvas><div class="tip" id="ts-tip" hidden></div></div>
+    <div class="chart-empty" id="ts-empty" hidden>no dated commits in view</div>
+  </div>
 
   <h2 class="section">code changes &amp; tokens</h2>
   <div class="split">
@@ -519,6 +746,9 @@ footer{margin-top:46px;padding-top:22px;border-top:1px dashed var(--line);color:
 
   <h2 class="section">possible loops</h2>
   <div class="panel" id="loops"></div>
+
+  <h2 class="section">shared sessions</h2>
+  <div class="panel" id="shared"></div>
 
   <h2 class="section">commit log</h2>
   <div class="log" id="commitlog"></div>
@@ -540,7 +770,25 @@ footer{margin-top:46px;padding-top:22px;border-top:1px dashed var(--line);color:
 const INIT = JSON.parse(document.getElementById("agit-data").textContent);
 const PAGE_SIZE = INIT.page_size || 50;
 let HEAD = INIT.head, AGG = INIT.agg, LOGPAGE = INIT.log, OPTIONS = INIT.options, GENERATED = INIT.generated_at;
+let TS = INIT.timeseries || {t:[]};  // per-period series for the activity-over-time plot
+let SPAN = INIT.span || {from:0, to:0};  // full-history commit-date range (epoch seconds)
+let SHARED = INIT.shared_sessions || [];  // sessions shared into this repo (issue #55)
 let LOG_ENTRIES = [];  // entries of the page currently rendered (for toggleDetail)
+
+// The plottable series and which are currently shown. Each is normalised to its
+// own peak so commits, lines, and tokens (orders of magnitude apart) share one
+// plot; the legend shows the period total and the hover tooltip the real
+// per-period value.
+const SERIES = [
+  {key:"commits", label:"commits", color:"#3dffa0"},
+  {key:"ai_lines", label:"AI lines", color:"#ffb454"},
+  {key:"output_tokens", label:"output tokens", color:"#67b8d6"},
+  {key:"input_tokens", label:"input tokens", color:"#ff6b6b"},
+];
+const tsOn = {commits:true, ai_lines:true, output_tokens:true, input_tokens:false};
+let tsHover = -1;     // hovered bucket index, or -1
+let tsView = null;    // visible x window as [loIdx, hiIdx] floats; null = full range
+let tsDrag = null;    // in-progress pan: {x, lo, hi}; null when not dragging
 
 const AI_KINDS = new Set(["agent","covered","agent-merge"]);
 const KIND_LABEL = {"agit-ops":"aGiT-ops","agent-merge":"agent-merge"};
@@ -551,7 +799,7 @@ const TOKEN_ORDER = [["input","input"],["output","output"],["reasoning","reasoni
   ["summary_input","summarizer input"],["summary_output","summarizer output"]];
 const REFRESH_MS = 5000, DAY = 86400;
 
-const state = {author:"", backend:"", model:"", fromTs:0, toTs:0};
+const state = {author:"", backend:"", model:"", fromTs:0, toTs:0, granularity:(INIT.timeseries&&INIT.timeseries.granularity)||"day"};
 // Only a page served over http(s) has a backend to reach; a file:// snapshot has
 // none, so it must never raise a false "server unreachable" alarm.
 const LIVE = location.protocol.indexOf("http") === 0;
@@ -569,12 +817,14 @@ function qs(extra){
   if(state.model) p.set("model", state.model);
   if(state.fromTs) p.set("from", state.fromTs);
   if(state.toTs) p.set("to", state.toTs);
+  if(state.granularity) p.set("granularity", state.granularity);
   for(const k in (extra||{})) p.set(k, extra[k]);
   return p.toString();
 }
 async function loadAgg(){
   try{ const r = await fetch("data?"+qs(), {cache:"no-store"}); if(r.ok){
     const d = await r.json(); HEAD=d.head; AGG=d.agg; OPTIONS=d.options; GENERATED=d.generated_at;
+    TS = d.timeseries || {t:[]}; if(d.span) SPAN = d.span; if(d.shared_sessions) SHARED = d.shared_sessions;
     setOffline(false); return true; } }
   catch(e){ if(LIVE) setOffline(true); }  // network failure ⇒ server unreachable
   return false;
@@ -644,7 +894,6 @@ function renderAgg(){
   const allLines = ai.total + nt.total, tok = AGG.tokens, eff = AGG.efficiency, kinds = k => AGG.kinds[k]||0;
 
   $("genat").textContent = "updated " + GENERATED;
-  $("scope").innerHTML = state.author ? `scope: <b>${esc(state.author)}</b>` : `scope: <b>entire team</b>`;
   $("count").textContent = `${fmt(total)} commits in view`;
 
   $("cards").innerHTML = [
@@ -704,6 +953,28 @@ function renderAgg(){
           (l.output?` <span class="cost">${fmt(l.output)} output tokens</span>`:"")+`</div>`;
       }).join("")
     : `<div class="empty">none detected</div>`;
+
+  tsHover = -1;
+  renderTimeseries();
+  renderShared();
+}
+function renderShared(){
+  const el = $("shared"); if(!el) return;
+  if(!SHARED.length){
+    el.innerHTML = `<div class="empty">no sessions shared yet — share one from aGiT (Ctrl-G → session → Share this session)</div>`;
+    return;
+  }
+  el.innerHTML = SHARED.map(s => {
+    const meta = [s.model, s.backend].filter(Boolean).map(esc).join(" · ");
+    const age = s.updated ? sharedAge(s.updated) : "";
+    return `<div class="srow"><span class="sid">${esc(s.github_id)}<b>/</b>${esc(s.name)}</span>`+
+      `<span class="smeta">${meta}</span><span class="sage">${esc(age)}</span></div>`;
+  }).join("");
+}
+function sharedAge(epoch){
+  const d = Math.max(0, Math.floor(Date.now()/1000 - epoch));
+  for(const [s,u] of [[86400,"d"],[3600,"h"],[60,"m"]]) if(d>=s) return `${Math.floor(d/s)}${u} ago`;
+  return "just now";
 }
 function groupPanel(groups){
   const entries = Object.entries(groups).sort((a,b)=>b[1].commits-a[1].commits ||
@@ -714,6 +985,156 @@ function groupPanel(groups){
     barRow(label, `${b.commits} commits`, b.insertions+b.deletions, max,
       `+${fmt(b.insertions)}/−${fmt(b.deletions)}${b.output_tokens?` · <b>${fmt(b.output_tokens)}</b> tok`:""}`)).join("");
 }
+
+// --- activity-over-time plot (multi-series, per-period, normalised, toggleable) ---
+// A bucket label, formatted to the active granularity (the bucket start).
+function tsLabel(e){
+  const iso = new Date(e*1000).toISOString(), g = TS.granularity||"day";
+  if(g==="hour") return iso.slice(0,13).replace("T"," ")+":00";
+  if(g==="month") return iso.slice(0,7);
+  return iso.slice(0,10);
+}
+
+function renderLegend(){
+  $("ts-legend").innerHTML = SERIES.map(s => {
+    const arr = TS[s.key]||[], total = arr.reduce((a,b)=>a+(b||0),0);  // sum across periods
+    return `<button class="lg${tsOn[s.key]?"":" off"}" data-key="${esc(s.key)}" style="--c:${s.color}">`+
+      `<span class="sw"></span>${esc(s.label)} <b>${kfmt(total)}</b></button>`;
+  }).join("");
+}
+
+// The visible x window as a clamped [lo, hi] pair of (fractional) bucket indices.
+// null tsView ⇒ the whole range. The period (range) filter selects the DATA range;
+// the mouse wheel/drag just zooms/pans WITHIN it for a closer look (no extra range
+// selector — double-click resets to the full filtered range).
+function tsBounds(){
+  const n = (TS.t||[]).length;
+  if(n<=1 || !tsView) return [0, Math.max(0, n-1)];
+  let lo = Math.max(0, Math.min(tsView[0], n-1));
+  let hi = Math.max(lo, Math.min(tsView[1], n-1));
+  return [lo, hi];
+}
+const PAD_L=10, PAD_R=10;
+function tsPlotW(){ return Math.max(1, $("ts-canvas").parentElement.clientWidth - PAD_L - PAD_R); }
+function tsXAt(i){ const [lo,hi]=tsBounds(), span=hi-lo; return PAD_L + (span<=0 ? tsPlotW()/2 : (i-lo)/span*tsPlotW()); }
+function tsIndexAt(px){ const [lo,hi]=tsBounds(), rel=Math.max(0,Math.min(1,(px-PAD_L)/tsPlotW())); return Math.round(lo+rel*(hi-lo)); }
+
+function renderChart(){
+  const cv = $("ts-canvas"), t = TS.t||[], has = t.length>0;
+  $("ts-empty").hidden = has;
+  cv.parentElement.style.display = has ? "" : "none";
+  if(!has) return;
+  const wrap = cv.parentElement, dpr = window.devicePixelRatio||1;
+  const cssW = wrap.clientWidth, cssH = wrap.clientHeight;
+  cv.width = Math.round(cssW*dpr); cv.height = Math.round(cssH*dpr);
+  const ctx = cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.clearRect(0,0,cssW,cssH);
+  const padT=12, padB=22, W=cssW-PAD_L-PAD_R, H=cssH-padT-padB, n=t.length;
+  const [lo,hi] = tsBounds(), span = hi-lo;
+  const xAt = i => PAD_L + (span<=0 ? W/2 : (i-lo)/span*W);
+  ctx.strokeStyle="rgba(29,42,33,.9)"; ctx.lineWidth=1;
+  for(let g=0; g<=4; g++){ const y=padT+g/4*H; ctx.beginPath(); ctx.moveTo(PAD_L,y); ctx.lineTo(PAD_L+W,y); ctx.stroke(); }
+  // Clip to the plot area so a zoomed-in window doesn't paint points outside it.
+  ctx.save(); ctx.beginPath(); ctx.rect(PAD_L,padT,W,H); ctx.clip();
+  // Each series is normalised to its own peak so all of them fit one plot. Values
+  // are per-period activity; a marker is drawn at each visible bucket (when not
+  // too dense) so a single/sparse period — or a zoomed-in view — stays legible.
+  ctx.lineWidth=2; ctx.lineJoin="round";
+  const dots = span<=60;
+  for(const s of SERIES){
+    if(!tsOn[s.key]) continue;
+    const arr = TS[s.key]||[], max = Math.max(1, ...arr);
+    ctx.strokeStyle=s.color; ctx.shadowColor=s.color; ctx.shadowBlur=6;
+    ctx.beginPath();
+    arr.forEach((v,i)=>{ const x=xAt(i), y=padT+H-(v/max)*H; i?ctx.lineTo(x,y):ctx.moveTo(x,y); });
+    ctx.stroke();
+    if(dots){
+      ctx.fillStyle=s.color;
+      arr.forEach((v,i)=>{ const x=xAt(i), y=padT+H-(v/max)*H; ctx.beginPath(); ctx.arc(x,y,2.5,0,Math.PI*2); ctx.fill(); });
+    }
+  }
+  if(tsHover>=lo-1e-9 && tsHover<=hi+1e-9 && tsHover>=0 && tsHover<n){
+    const x = xAt(tsHover);
+    ctx.strokeStyle="rgba(207,231,216,.28)"; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(x,padT); ctx.lineTo(x,padT+H); ctx.stroke();
+    for(const s of SERIES){
+      if(!tsOn[s.key]) continue;
+      const arr = TS[s.key]||[], max = Math.max(1, ...arr);
+      const y = padT+H-((arr[tsHover]||0)/max)*H;
+      ctx.fillStyle=s.color; ctx.shadowColor=s.color; ctx.shadowBlur=8;
+      ctx.beginPath(); ctx.arc(x,y,3,0,Math.PI*2); ctx.fill(); ctx.shadowBlur=0;
+    }
+  }
+  ctx.restore(); ctx.shadowBlur=0;
+  // Axis labels reflect the *visible* window's first and last bucket.
+  ctx.fillStyle="#7e998a"; ctx.font="11px IBM Plex Mono, monospace";
+  const li = Math.max(0, Math.round(lo)), ri = Math.min(n-1, Math.round(hi));
+  ctx.textAlign="left";  ctx.fillText(tsLabel(t[li]), PAD_L, cssH-7);
+  if(ri>li){ ctx.textAlign="right"; ctx.fillText(tsLabel(t[ri]), PAD_L+W, cssH-7); }
+  // A small "zoomed" cue when the window is narrower than the full range.
+  if(tsView){ ctx.textAlign="center"; ctx.fillStyle="#67b8d6";
+    ctx.fillText("zoomed — double-click to reset", cssW/2, cssH-7); }
+}
+
+function showTip(i){
+  const tip = $("ts-tip"), t = TS.t||[];
+  const live = SERIES.filter(s=>tsOn[s.key]);
+  const [lo,hi] = tsBounds();
+  if(i<lo-1e-9 || i>hi+1e-9 || i<0 || i>=t.length || !live.length){ tip.hidden = true; return; }
+  const rows = live.map(s => {
+    const arr = TS[s.key]||[];
+    return `<div class="tr" style="--c:${s.color}"><span class="sw"></span>${esc(s.label)}<b>${fmt(arr[i]||0)}</b></div>`;
+  }).join("");
+  tip.innerHTML = `<div class="td">${tsLabel(t[i])}</div>${rows}`;
+  const wrap = $("ts-canvas").parentElement, x = tsXAt(i);
+  tip.style.left = Math.max(58, Math.min(wrap.clientWidth-58, x))+"px";
+  tip.style.top = "4px";
+  tip.hidden = false;
+}
+
+// Narrow/widen tsView to [nlo, nhi], clamped into [0, n-1]; clearing it to null
+// (full range) when the window covers everything.
+function tsSetWindow(nlo, nhi, n){
+  if(nlo<0){ nhi -= nlo; nlo = 0; }
+  if(nhi>n-1){ nlo -= (nhi-(n-1)); nhi = n-1; }
+  nlo = Math.max(0, nlo);
+  tsView = (nhi-nlo >= n-1-1e-9) ? null : [nlo, nhi];
+}
+
+function onChartMove(e){
+  const t = TS.t||[]; if(!t.length) return;
+  const rect = $("ts-canvas").getBoundingClientRect();
+  const px = e.clientX-rect.left, n = t.length;
+  if(tsDrag){  // panning: shift the window opposite the drag
+    const span = tsDrag.hi-tsDrag.lo, ddx = (e.clientX-tsDrag.x)/tsPlotW()*span;
+    tsSetWindow(tsDrag.lo-ddx, tsDrag.hi-ddx, n);
+    tsHover=-1; $("ts-tip").hidden=true; renderChart(); return;
+  }
+  const i = n<=1 ? 0 : tsIndexAt(px);
+  if(i!==tsHover){ tsHover=i; renderChart(); }
+  showTip(i);
+}
+function onChartLeave(){ if(tsDrag) return; tsHover=-1; $("ts-tip").hidden=true; renderChart(); }
+
+function onChartWheel(e){
+  const n = (TS.t||[]).length; if(n<=1) return;
+  e.preventDefault();
+  const [lo,hi] = tsBounds(), rect = $("ts-canvas").getBoundingClientRect();
+  const rel = Math.max(0, Math.min(1, (e.clientX-rect.left-PAD_L)/tsPlotW()));
+  const focus = lo + rel*(hi-lo);                       // bucket under the cursor
+  let span = Math.max(1, Math.min(n-1, (hi-lo)*(e.deltaY<0?0.8:1.25)));  // zoom in/out
+  tsSetWindow(focus-rel*span, focus-rel*span+span, n);  // keep the cursor anchored
+  tsHover=-1; renderChart();
+}
+function onChartDown(e){
+  const n = (TS.t||[]).length; if(n<=1) return;
+  const [lo,hi] = tsBounds();
+  tsDrag = {x:e.clientX, lo, hi};
+  $("ts-canvas").style.cursor = "grabbing"; $("ts-tip").hidden = true;
+}
+function onChartUp(){ if(tsDrag){ tsDrag=null; $("ts-canvas").style.cursor=""; } }
+function resetZoom(){ tsView=null; tsHover=-1; }
+function renderTimeseries(){ renderLegend(); renderChart(); }
 
 function renderLog(){
   const entries = LOGPAGE.entries || [];
@@ -762,7 +1183,9 @@ function toggleDetail(i){
     const link = c.url ? `<a href="${esc(c.url)}" target="_blank" rel="noopener">view on GitHub ↗</a>` : "";
     const span = (c.started||c.ended)
       ? `<div class="dmeta">AI conversation: ${esc(c.started||"?")} → ${esc(c.ended||"?")}</div>` : "";
-    detail.innerHTML = `<div class="dhead">${esc(c.short)} ${link}</div>${span}`+
+    const who = (c.committers&&c.committers.length)
+      ? `<div class="dmeta">committer${c.committers.length>1?"s":""}: ${c.committers.map(esc).join(", ")}</div>` : "";
+    detail.innerHTML = `<div class="dhead">${esc(c.short)} ${link}</div>${who}${span}`+
       `<div class="dmsg md">${md(c.message||"(no message recorded)")}</div>${partsHtml(c.parts)}`;
     detail.hidden = false;
   } else {
@@ -786,15 +1209,25 @@ function syncFilters(){
 }
 
 // A filter change refetches the aggregates and resets the log to its first page.
+// PER stays in state; the data range comes from the period filter. A data change
+// re-bucketed the series, so any mouse zoom window is reset to the full range.
 async function applyFilters(){
   await loadAgg(); await loadLog(0);
+  resetZoom(); setDateBounds(); syncPeriodDates();
   syncFilters(); renderAgg(); renderLog();
 }
 async function refresh(){
   const prev = HEAD;
-  if(await loadAgg() && HEAD !== prev){  // new commits landed — refresh the view
+  if(!await loadAgg()) return;
+  if(HEAD !== prev){  // new commits landed — refresh the whole view
+    resetZoom();  // the bucket set changed; an old pixel-zoom window would mis-map
+    setDateBounds(); syncPeriodDates();  // extend the shown range to new commits
     await loadLog(LOGPAGE.offset||0);
-    syncFilters(); renderAgg(); renderLog();
+    syncFilters(); renderAgg(); renderLog();  // renderAgg() also repaints shared sessions
+  } else {
+    // No new commit, but shared sessions (and their "updated" age) still need to
+    // refresh every poll — e.g. an auto-share just bumped a session's timestamp.
+    renderShared();
   }
 }
 
@@ -804,25 +1237,52 @@ function dateToTs(value, endOfDay){
   const ts = Date.parse(value + "T00:00:00Z")/1000;
   return isNaN(ts) ? 0 : (endOfDay ? ts + DAY - 1 : ts);
 }
+const ymd = ts => ts ? new Date(ts*1000).toISOString().slice(0,10) : "";
+// Bound the native date pickers to the actual history span.
+function setDateBounds(){
+  const lo = ymd(SPAN.from), hi = ymd(SPAN.to);
+  for(const id of ["f-from","f-to"]){ const el=$(id); el.min=lo; el.max=hi; }
+}
+// Reflect the active period in the from/to inputs so they always show the real
+// range being viewed — the full history span for "all time", the rolling window
+// for a preset. Hand-picked custom dates are left untouched.
+function syncPeriodDates(){
+  const v = $("f-period").value;
+  if(v === "custom") return;
+  if(v === ""){ $("f-from").value = ymd(SPAN.from); $("f-to").value = ymd(SPAN.to); }
+  else { $("f-from").value = ymd(Math.floor(Date.now()/1000) - (+v)*DAY); $("f-to").value = ymd(SPAN.to || Math.floor(Date.now()/1000)); }
+}
 function applyPeriod(){
   const v = $("f-period").value;
-  if(v === "" ){ state.fromTs = 0; state.toTs = 0; $("f-from").value=""; $("f-to").value=""; }
+  if(v === ""){ state.fromTs = 0; state.toTs = 0; }
   else if(v === "custom"){ state.fromTs = dateToTs($("f-from").value,false); state.toTs = dateToTs($("f-to").value,true); }
-  else { state.fromTs = Math.floor(Date.now()/1000) - (+v)*DAY; state.toTs = 0; $("f-from").value=""; $("f-to").value=""; }
+  else { state.fromTs = Math.floor(Date.now()/1000) - (+v)*DAY; state.toTs = 0; }
+  syncPeriodDates();
 }
 
 function init(){
   syncFilters();
+  // Show the real range from the first paint: bound the pickers to the history
+  // span and fill from/to with it (default period is "all time" = full history).
+  setDateBounds(); applyPeriod();
   $("f-author").onchange = e => { state.author = e.target.value; applyFilters(); };
   $("f-backend").onchange = e => { state.backend = e.target.value; applyFilters(); };
   $("f-model").onchange = e => { state.model = e.target.value; applyFilters(); };
-  $("f-period").onchange = () => { applyPeriod(); applyFilters(); };
+  // "custom range…" reveals a date-range popup anchored under the select; the
+  // presets and "all time" hide it.
+  const showDateRange = on => { $("daterange").hidden = !on; };
+  $("f-period").onchange = () => { showDateRange($("f-period").value === "custom"); applyPeriod(); applyFilters(); };
   const onDate = () => { $("f-period").value = "custom"; applyPeriod(); applyFilters(); };
   $("f-from").onchange = onDate;
   $("f-to").onchange = onDate;
+  $("dr-done").onclick = () => showDateRange(false);
+  // Dismiss the popup on a click outside the period control.
+  document.addEventListener("click", e => {
+    if(!$("daterange").hidden && !e.target.closest(".period-field")) showDateRange(false);
+  });
   $("reset").onclick = () => {
-    state.author=state.backend=state.model=""; state.fromTs=state.toTs=0;
-    $("f-period").value=""; $("f-from").value=""; $("f-to").value="";
+    state.author=state.backend=state.model="";
+    $("f-period").value=""; showDateRange(false); applyPeriod();  // back to all time → full span
     applyFilters();
   };
   // Click a commit-log line to open its full message + GitHub link. Clicks
@@ -833,6 +1293,26 @@ function init(){
     const entry = e.target.closest(".entry");
     if(entry) toggleDetail(+entry.dataset.i);
   });
+  // Toggle a series on/off from the legend; redraw the plot in place.
+  $("ts-legend").addEventListener("click", e => {
+    const btn = e.target.closest(".lg"); if(!btn) return;
+    const key = btn.dataset.key; tsOn[key] = !tsOn[key];
+    renderTimeseries();
+  });
+  // Bucket granularity: refetch the (re-bucketed) series and redraw the plot.
+  $("ts-gran").value = state.granularity;
+  $("ts-gran").onchange = async e => { state.granularity = e.target.value; if(await loadAgg()){ resetZoom(); renderTimeseries(); } };
+  // Zoom/pan the x axis over the loaded buckets: wheel zooms (anchored on the
+  // cursor), drag pans, double-click resets — all client-side, no refetch.
+  const cv = $("ts-canvas");
+  cv.addEventListener("mousemove", onChartMove);
+  cv.addEventListener("mouseleave", onChartLeave);
+  cv.addEventListener("wheel", onChartWheel, {passive:false});
+  cv.addEventListener("mousedown", onChartDown);
+  window.addEventListener("mouseup", onChartUp);
+  cv.addEventListener("dblclick", () => { resetZoom(); renderChart(); });
+  // The canvas backing store is sized in px, so it must be repainted on resize.
+  let rz; window.addEventListener("resize", () => { clearTimeout(rz); rz = setTimeout(renderChart, 120); });
   renderAgg(); renderLog();
   // Poll only when there's a live backend; the poll also clears the
   // "unreachable" banner automatically once the server is back.

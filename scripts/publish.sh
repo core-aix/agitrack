@@ -10,7 +10,8 @@
 #      bumped (X.Y.Z -> X.Y.Z+1); --minor bumps the minor and resets the patch
 #      to 0 (X.Y.Z -> X.Y+1.0); --major bumps the major and resets minor and
 #      patch to 0 (X.Y.Z -> X+1.0.0).
-#   4. Write that version to pyproject.toml and agit/__init__.py.
+#   4. Write that version to pyproject.toml (the only version source;
+#      agit.__version__ derives from the installed distribution metadata).
 #   5. Build the sdist + wheel (uv build) and upload them to PyPI (uv publish).
 #   6. Commit "Release vX.Y.Z" on a `release/vX.Y.Z` branch, push it, and open a
 #      pull request into main with `gh`.
@@ -177,7 +178,7 @@ fi
 COMMITTED=0
 cleanup() {
   if [ "$COMMITTED" = 0 ]; then
-    git checkout -- pyproject.toml agit/__init__.py 2>/dev/null || true
+    git checkout -- pyproject.toml 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
@@ -189,10 +190,10 @@ python3 - "$NEXT_VERSION" <<'PY'
 import re, sys, pathlib
 
 version = sys.argv[1]
+# pyproject.toml is the only version source; agit.__version__ derives from the
+# installed distribution metadata at runtime.
 pp = pathlib.Path("pyproject.toml")
 pp.write_text(re.sub(r'^version = "[^"]+"', f'version = "{version}"', pp.read_text(), count=1, flags=re.M))
-ip = pathlib.Path("agit/__init__.py")
-ip.write_text(re.sub(r'^__version__ = "[^"]+"', f'__version__ = "{version}"', ip.read_text(), count=1, flags=re.M))
 PY
 
 # --- 5. build + upload -------------------------------------------------------
@@ -230,7 +231,7 @@ fi
 
 step "Opening a release pull request"
 git switch -c "$RELEASE_PR_BRANCH"
-git add pyproject.toml agit/__init__.py
+git add pyproject.toml
 git commit -m "Release v$NEXT_VERSION"
 COMMITTED=1  # changes are committed on the release branch; nothing to restore
 git push -u origin "$RELEASE_PR_BRANCH"
@@ -239,7 +240,7 @@ pr_body="$(cat <<EOF
 Release $DIST_NAME v$NEXT_VERSION.
 
 Published to PyPI by scripts/publish.sh; this PR records the matching version
-bump in pyproject.toml and agit/__init__.py. After merging, tag the release:
+bump in pyproject.toml. After merging, tag the release:
 
     git switch $RELEASE_BRANCH && git pull
     git tag -a v$NEXT_VERSION -m "Release v$NEXT_VERSION"

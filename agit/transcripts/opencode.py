@@ -4,6 +4,7 @@ import json
 import os
 import pty
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -20,6 +21,10 @@ __all__ = [
     "list_worktree_sessions",
     "session_belongs_to_repo",
     "export_session",
+    "export_session_raw",
+    "session_transcript_size",
+    "has_imported_session",
+    "import_shared_session",
     "parse_exported_session",
     "looks_like_event_blob",
 ]
@@ -179,6 +184,81 @@ def export_session(repo: Path, session_id: str) -> ExportedSession | None:
     return parse_exported_session(data)
 
 
+def export_session_raw(repo: Path, session_id: str) -> str | None:
+    """The full session serialised as JSON text — the portable artifact shared
+    with collaborators (issue #55). Produced by ``opencode export --sanitize``
+    (OpenCode redacts transcript/file data at the source; aGiT masks secrets and
+    home paths on top). The id is preserved, so a later ``opencode import`` of
+    this text round-trips to the same session. None when it can't be exported."""
+    if not session_id:
+        return None
+    _debug(repo, f"opencode export(raw) starting session_id={session_id}")
+    output, returncode = _run_export_pty(repo, session_id, sanitize=True)
+    _debug(repo, f"opencode export(raw) finished session_id={session_id} returncode={returncode}")
+    if returncode != 0:
+        return None
+    json_text = _extract_json_object(output)
+    if not json_text:
+        return None
+    try:
+        json.loads(json_text)  # only share text OpenCode can import back
+    except json.JSONDecodeError:
+        return None
+    return json_text
+
+
+def session_transcript_size(repo: Path, session_id: str) -> int | None:
+    # OpenCode keeps sessions in a SQLite store with no per-session file to stat,
+    # and exporting purely to measure size would make the manage-shared menu slow
+    # (one spawn per entry). Skip the cheap "is the shared copy current?" hint for
+    # OpenCode — auto-update is content-hash gated and a manual update always pushes.
+    return None
+
+
+def has_imported_session(repo: Path, session_id: str) -> bool:
+    """Whether ``repo`` already holds this session locally. OpenCode preserves the
+    id across import and retargets the session's directory to the import cwd, so a
+    session recorded against this repo means resuming would keep the local copy
+    unless explicitly overwritten."""
+    return bool(session_id) and session_belongs_to_repo(repo, session_id)
+
+
+def import_shared_session(repo: Path, session_id: str, transcript: str, *, overwrite: bool = False) -> bool:
+    """Install a shared session via ``opencode import`` so it can be resumed in
+    ``repo`` (issue #55). OpenCode preserves the session id and retargets the
+    session's directory to the import cwd, so running this with ``repo`` as cwd
+    makes the session belong to — and resume in — this repo.
+
+    By default an existing local copy is kept (no clobber). With ``overwrite`` —
+    the "pull the latest shared version" path for syncing your own session between
+    machines — the import re-runs and replaces the local copy. Returns True when
+    the session is in place."""
+    if not session_id or not transcript:
+        return False
+    repo = Path(repo)
+    if not overwrite and has_imported_session(repo, session_id):
+        return True  # already have this conversation locally — don't clobber it
+    tmp_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as handle:
+            handle.write(transcript)
+            tmp_path = handle.name
+    except OSError:
+        return False
+    try:
+        _debug(repo, f"opencode import starting session_id={session_id}")
+        output, returncode = _run_opencode_pty(repo, ["opencode", "import", tmp_path])
+        _debug(repo, f"opencode import finished session_id={session_id} returncode={returncode}")
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+    # `opencode import` of a *missing* file exits 0 but prints "File not found",
+    # so a clean exit alone isn't proof; require the success line too.
+    return returncode == 0 and "Imported session" in output
+
+
 def _debug(repo: Path, message: str) -> None:
     if os.environ.get("AGIT_DEBUG_PROXY", "").strip().lower() not in {"1", "true", "yes"}:
         return
@@ -191,14 +271,26 @@ def _debug(repo: Path, message: str) -> None:
         pass
 
 
-def _run_export_pty(repo: Path, session_id: str) -> tuple[str, int]:
+def _run_export_pty(repo: Path, session_id: str, *, sanitize: bool = False) -> tuple[str, int]:
+    args = ["opencode", "export", session_id]
+    if sanitize:
+        # OpenCode's own redaction of transcript/file data at the source. aGiT
+        # masks secrets/home paths on top before sharing (issue #55).
+        args.append("--sanitize")
+    return _run_opencode_pty(repo, args)
+
+
+def _run_opencode_pty(repo: Path, args: list[str]) -> tuple[str, int]:
+    """Run ``opencode`` under a pty in ``repo`` (it talks to a TTY) and return
+    its combined output and exit code. A pty is needed because the CLI writes
+    framed/colour output to a terminal, not a plain pipe."""
     pid, fd = pty.fork()
     if pid == 0:
         # Never let the child survive a failed exec — it would keep running
         # aGiT's own Python code from the fork point as a duplicate process.
         try:
             os.chdir(repo)
-            os.execvp("opencode", ["opencode", "export", session_id])
+            os.execvp(args[0], args)
         except BaseException:
             os._exit(127)
 

@@ -236,7 +236,6 @@ class AgitShell:
                     commit_summary = summarizer.summarize_commit(
                         turns=turns,
                         diff=diff_before_commit,
-                        session_summary=self.state.session_summary,
                     )
                     summary_metadata = summary_metadata_lines(
                         model=summarizer.model or self.state.model,

@@ -282,6 +282,25 @@ class AgitState:
         self.data["declined_untracked_files"] = [path for path in self.declined_untracked() if path in keep]
         self.save()
 
+    # --- shared-session auto-update opt-in (issue #55) ---------------------
+    # The backend session ids the user has asked aGiT to keep shared (re-redact
+    # and re-push as the conversation grows). Per-repo, opt-in, off by default.
+
+    def auto_share_session_ids(self) -> list[str]:
+        return list(self.data.get("auto_share_sessions") or [])
+
+    def auto_share_enabled(self, session_id: str | None) -> bool:
+        return bool(session_id) and session_id in self.auto_share_session_ids()
+
+    def set_auto_share(self, session_id: str, enabled: bool) -> None:
+        current = set(self.auto_share_session_ids())
+        if enabled:
+            current.add(session_id)
+        else:
+            current.discard(session_id)
+        self.data["auto_share_sessions"] = sorted(current)
+        self.save()
+
     def pending_trace(self) -> list[dict]:
         return list(self.data.get("pending_trace") or [])
 

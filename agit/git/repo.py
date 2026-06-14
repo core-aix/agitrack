@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import subprocess
+import tempfile
 from pathlib import Path
 
 
@@ -321,8 +323,154 @@ class GitRepo:
                 entries.append((commit_sha, first_line))
         return entries
 
+    # --- low-level object/ref plumbing (shared-session storage, issue #55) ------
+    # These build and move a custom ref (refs/agit/shared-sessions) entirely in
+    # the object database, never touching the working tree or the real index.
+
+    def ref_exists(self, ref: str) -> bool:
+        return self._run(["git", "rev-parse", "--verify", "--quiet", ref], check=False).returncode == 0
+
+    def ref_sha(self, ref: str) -> str | None:
+        result = self._run(["git", "rev-parse", "--verify", "--quiet", ref], check=False)
+        return result.stdout.strip() or None if result.returncode == 0 else None
+
+    def write_blob(self, content: str) -> str:
+        """Write *content* as a blob into the object db; returns its SHA."""
+        return self._run(["git", "hash-object", "-w", "--stdin"], input_text=content).stdout.strip()
+
+    def read_tree_paths(self, ref: str) -> dict[str, str]:
+        """Map ``path -> blob SHA`` for every file reachable from ``ref`` (a tree
+        or commit). Empty when the ref doesn't exist."""
+        if not self.ref_exists(ref):
+            return {}
+        output = self._run(["git", "ls-tree", "-r", "-z", ref], check=False).stdout
+        entries: dict[str, str] = {}
+        for record in output.split("\0"):
+            if not record:
+                continue
+            meta, _, path = record.partition("\t")
+            parts = meta.split()
+            if len(parts) >= 3 and parts[1] == "blob":
+                entries[path] = parts[2]
+        return entries
+
+    def read_ref_blob(self, ref: str, path: str) -> str | None:
+        """Contents of ``path`` within ``ref``'s tree, or None if absent."""
+        result = self._run(["git", "cat-file", "-p", f"{ref}:{path}"], check=False)
+        return result.stdout if result.returncode == 0 else None
+
+    def write_tree_from(self, entries: dict[str, str]) -> str:
+        """Build a tree containing exactly ``entries`` (``path -> blob SHA``) using
+        a throwaway index, so the real index and working tree are untouched.
+        Returns the tree SHA (the empty tree when ``entries`` is empty)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            index = os.path.join(tmp, "index")
+            env = {"GIT_INDEX_FILE": index}
+            for path, blob in entries.items():
+                self._run(
+                    ["git", "update-index", "--add", "--cacheinfo", f"100644,{blob},{path}"],
+                    env=env,
+                )
+            return self._run(["git", "write-tree"], env=env).stdout.strip()
+
+    def commit_tree_orphan(self, tree: str, message: str) -> str:
+        """Commit ``tree`` with NO parents — a standalone, history-free snapshot.
+        Rewriting a ref to such commits keeps only the latest copy (old objects
+        become unreferenced and are GC'd)."""
+        return self._run(["git", "commit-tree", tree, "-F", "-"], input_text=message).stdout.strip()
+
+    def update_ref(self, ref: str, sha: str) -> None:
+        self._run(["git", "update-ref", ref, sha])
+
+    def delete_ref(self, ref: str) -> None:
+        self._run(["git", "update-ref", "-d", ref], check=False)
+
+    def remote_exists(self, name: str = "origin") -> bool:
+        return name in self._run(["git", "remote"], check=False).stdout.split()
+
+    def fetch_ref(self, refspec: str, *, remote: str = "origin") -> bool:
+        """Fetch a single refspec (e.g. ``+refs/agit/x:refs/agit/x``). Returns
+        True on success; False on any failure (offline, no such ref yet, …)."""
+        return self._run(["git", "fetch", remote, refspec], check=False).returncode == 0
+
+    def push_ref(
+        self, refspec: str, *, remote: str = "origin", force_with_lease: str | None = None
+    ) -> tuple[bool, str]:
+        """Push a refspec. Returns ``(ok, stderr)`` — stderr lets the caller spot a
+        non-fast-forward/stale rejection and retry after re-fetching."""
+        command = ["git", "push"]
+        if force_with_lease is not None:
+            command.append(f"--force-with-lease={force_with_lease}" if force_with_lease else "--force-with-lease")
+        command += [remote, refspec]
+        result = self._run(command, check=False)
+        return result.returncode == 0, result.stderr
+
+    def unreachable_commits(self) -> list[str]:
+        """SHAs of commits reachable from no ref (and no reflog) — dangling objects
+        git's auto-gc would eventually drop. Used to sweep stale shared-session
+        snapshots; the caller filters to genuine sessions before deleting anything."""
+        result = self._run(
+            ["git", "fsck", "--unreachable", "--no-reflogs", "--connectivity-only", "--no-progress"],
+            check=False,
+        )
+        commits = []
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) == 3 and parts[0] == "unreachable" and parts[1] == "commit":
+                commits.append(parts[2])
+        return commits
+
+    def delete_orphaned_objects(self, old_sha: str | None) -> int:
+        """Immediately delete the loose objects reachable from ``old_sha`` but from
+        no current ref — the previous shared-session snapshot's commit/tree/blobs
+        after the ref was rewritten off it. Targeted (it only ever removes objects
+        exclusive to ``old_sha``, never anything another ref reaches), so it's safe
+        to run alongside aGiT's other git writes and doesn't wait for git's auto-gc.
+        Returns the count removed. Best-effort; never raises.
+
+        Uses an explicit object-set difference: ``git rev-list --objects A --not B``
+        does NOT reliably drop trees/blobs A shares with B, which would delete
+        objects the current ref still needs — so we diff the two object sets here."""
+        if not old_sha:
+            return 0
+        old = self._run(["git", "rev-list", "--objects", old_sha], check=False)
+        if old.returncode != 0:
+            return 0
+        old_shas = {line.split(" ", 1)[0] for line in old.stdout.splitlines() if line}
+        if not old_shas:
+            return 0
+        kept = self._run(["git", "rev-list", "--objects", "--all"], check=False)
+        kept_shas = {line.split(" ", 1)[0] for line in kept.stdout.splitlines() if line}
+        orphaned = old_shas - kept_shas  # in old's snapshot, reachable from no ref
+        raw = self._run(["git", "rev-parse", "--git-path", "objects"], check=False).stdout.strip()
+        if not raw:
+            return 0
+        objects = Path(raw) if os.path.isabs(raw) else (self.repo / raw)
+        removed = 0
+        for sha in orphaned:
+            if len(sha) < 4 or any(ch not in "0123456789abcdef" for ch in sha):
+                continue
+            loose = objects / sha[:2] / sha[2:]
+            try:
+                loose.unlink()  # packed objects have no loose file (no-op via OSError)
+                removed += 1
+            except OSError:
+                pass
+        return removed
+
+    def root_commit(self) -> str | None:
+        """The repo's first (root) commit SHA — a clone-stable repo fingerprint.
+        None for an unborn repo. Picks the earliest if history has several roots."""
+        output = self._run(["git", "rev-list", "--max-parents=0", "HEAD"], check=False).stdout.split()
+        return output[-1] if output else None
+
     def _run(
-        self, command: list[str], *, input_text: str | None = None, check: bool = True
+        self,
+        command: list[str],
+        *,
+        input_text: str | None = None,
+        check: bool = True,
+        env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         process = subprocess.run(
             command,
@@ -332,6 +480,7 @@ class GitRepo:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
+            env={**os.environ, **env} if env else None,
         )
         if check and process.returncode != 0:
             detail = process.stderr.strip() or process.stdout.strip()

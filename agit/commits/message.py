@@ -37,6 +37,16 @@ ANSI_SEQUENCE_RE = re.compile(
 # Control characters that should never appear in a commit message, keeping tab,
 # newline, and carriage return intact.
 CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+# An ATX Markdown heading: 1–6 leading '#' followed by whitespace (matches the
+# dashboard's own md() parser, so a line is a heading here iff it renders as one
+# there). Used to nest a trace message's own headings under its role heading.
+ATX_HEADING_RE = re.compile(r"^(#{1,6})(\s.*)$")
+# A fenced code block delimiter; a leading '#' inside such a fence is a comment,
+# not a heading, so heading-nesting must skip fenced regions.
+CODE_FENCE_RE = re.compile(r"^\s*(```|~~~)")
+# The role heading for each trace turn ("## User" / "## Agent") is level 2, so a
+# message's own headings are nested one level deeper, starting at level 3.
+TRACE_ROLE_HEADING_LEVEL = 2
 
 
 # Section header that marks a commit as carrying aGiT metadata. Detection of
@@ -214,7 +224,9 @@ def _trace_and_metadata_lines(
     lines.extend(["# Interaction Trace", ""])
     for item in _limit_trace_turns(trace, trace_turn_limit):
         role = item.get("role", "").strip().lower()
-        content = _mask_secrets(item.get("content", ""))
+        # Nest the message's own headings under the "## User"/"## Agent" heading so
+        # a message's "# Title" can't outrank the role it belongs to in the log.
+        content = _nest_headings_under_role(_mask_secrets(item.get("content", "")))
         label = "User" if role == "user" else "Agent"
         lines.extend([f"## {label}", "", *_body_lines(content), ""])
 
@@ -323,6 +335,46 @@ def _body_lines(text: str) -> list[str]:
     for raw_line in str(text).splitlines() or [""]:
         lines.extend(wrap(raw_line, width=MAX_BODY_WIDTH, replace_whitespace=False, drop_whitespace=False) or [""])
     return lines
+
+
+def _nest_headings_under_role(content: str) -> str:
+    """Shift the Markdown headings inside one trace message so the shallowest one
+    sits a single level below its ``## User`` / ``## Agent`` role heading (i.e. at
+    level 3). The relative hierarchy is preserved — every heading moves by the same
+    amount — so the rendered commit log nests the message's own sections under its
+    role instead of letting a message ``#`` outrank the role it belongs to.
+
+    Headings are only ever pushed deeper, never promoted; a message already nested
+    at level 3+ is left as-is. Fenced code blocks are skipped, since a leading
+    ``#`` there is a comment, not a heading. Levels are capped at the Markdown
+    maximum of 6."""
+    lines = content.splitlines()
+    in_fence = False
+    fence_marker = ""
+    headings: list[tuple[int, int, str]] = []  # (line index, level, trailing text)
+    for index, line in enumerate(lines):
+        fence = CODE_FENCE_RE.match(line)
+        if fence:
+            marker = fence.group(1)
+            if not in_fence:
+                in_fence, fence_marker = True, marker
+            elif marker == fence_marker:
+                in_fence, fence_marker = False, ""
+            continue
+        if in_fence:
+            continue
+        heading = ATX_HEADING_RE.match(line)
+        if heading:
+            headings.append((index, len(heading.group(1)), heading.group(2)))
+    if not headings:
+        return content
+    shallowest = min(level for _, level, _ in headings)
+    shift = max(0, (TRACE_ROLE_HEADING_LEVEL + 1) - shallowest)
+    if not shift:
+        return content
+    for index, level, rest in headings:
+        lines[index] = "#" * min(6, level + shift) + rest
+    return "\n".join(lines)
 
 
 def _limit_trace_turns(trace: list[dict], turn_limit: int) -> list[dict]:
