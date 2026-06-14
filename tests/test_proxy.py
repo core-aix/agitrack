@@ -1840,6 +1840,31 @@ def test_resumable_sessions_includes_reserved_named_session_without_transcript(t
     assert runner._session_name_taken("experiment") is True
 
 
+def test_resumable_named_session_dated_when_it_was_named_not_epoch(tmp_path):
+    # A surfaced no-commit session must carry the time it was named, not 0.0 (which
+    # rendered as an absurd "20000d ago").
+    import time as _time
+
+    from agit.config import AgitState
+
+    runner, base = _resume_listing_runner(tmp_path, base_refs=[], worktree_sessions=[])
+    state = AgitState(base)
+    state.name_session("ghost-id", "experiment")  # stamps session_named_at
+    runner._agit_named_sessions = lambda: {"ghost-id": "experiment"}
+
+    ref = runner._resumable_sessions()[0]
+    assert ref.id == "ghost-id"
+    assert abs(ref.updated - _time.time()) < 60  # a real, recent timestamp
+    assert runner._format_age(ref.updated) in ("just now", "0m ago") or ref.updated > 0
+
+
+def test_format_age_handles_unknown_timestamp():
+    runner = make_runner(name="main")
+    assert runner._format_age(0) == "date unknown"
+    assert runner._format_age(0.0) == "date unknown"
+    assert "ago" in runner._format_age(time.time() - 7200)  # a real one still works
+
+
 def test_resumable_sessions_does_not_duplicate_named_session_with_transcript(tmp_path):
     # When the backend still enumerates a named conversation, it appears once
     # (the durable record must not add a second copy).
@@ -3175,16 +3200,34 @@ def test_exit_persists_resume_pointer_even_when_worktree_kept():
 
 
 def test_exit_does_not_persist_resume_pointer_for_background_session():
-    # Only the primary session owns the durable resume pointer; a non-primary
-    # (background) session must not overwrite it on exit.
+    # A non-primary (background) session the user was NOT in at quit must not
+    # overwrite the durable resume pointer. (No exit-active session is set here, so
+    # the gate falls back to the primary, which is a different session.)
     runner = _exit_removal_runner(log_range_result="deadbeef still ahead")
     runner._primary_worktree_name = "session-2"  # this session ("session-1") is not primary
+    runner._exit_resume_worktree = None
     persisted = []
     runner._persist_last_session_record = lambda: persisted.append(True)
 
     runner._remove_worktree_on_exit()
 
     assert persisted == []
+
+
+def test_exit_persists_resume_pointer_for_last_active_session_even_if_not_primary():
+    # The session the user was in at quit (e.g. a resumed shared session) is the
+    # one to auto-resume next start, so its pointer is persisted even though a
+    # different session is the "primary". Without this, quitting from a shared
+    # session left the next start prompting for a brand-new session.
+    runner = _exit_removal_runner(log_range_result="")
+    runner._primary_worktree_name = "session-2"  # primary is a different session
+    runner._exit_resume_worktree = "session-1"  # ...but the user quit from session-1
+    persisted = []
+    runner._persist_last_session_record = lambda: persisted.append(True)
+
+    runner._remove_worktree_on_exit()
+
+    assert persisted == [True]
 
 
 def _bg_confirm_runner(statuses):
