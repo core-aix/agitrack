@@ -18,8 +18,8 @@ class ProxyAgent(Protocol):
 
     name: str
     # Whether this backend has a portable transcript that can be shared and
-    # resumed across machines (issue #55). Claude does; OpenCode keeps sessions in
-    # its own store with no portable export, so sharing is disabled for it.
+    # resumed across machines (issue #55). Both Claude (per-session .jsonl) and
+    # OpenCode (export/import CLI) do.
     supports_session_sharing: bool
 
     def export_session_raw(self, repo: Path, session_id: str) -> str | None:
@@ -80,19 +80,22 @@ class ProxyAgent(Protocol):
 
 class OpenCodeProxyAgent:
     name = "opencode"
-    supports_session_sharing = False
+    # OpenCode's `export`/`import` CLI serialises a whole session to JSON (id
+    # preserved, directory retargeted to the import cwd), so its sessions are
+    # portable and shareable like Claude's (issue #55).
+    supports_session_sharing = True
 
     def export_session_raw(self, repo: Path, session_id: str) -> str | None:
-        return None  # OpenCode has no portable per-session transcript file
+        return opencode_session.export_session_raw(repo, session_id)
 
     def transcript_size(self, repo: Path, session_id: str) -> int | None:
-        return None
+        return opencode_session.session_transcript_size(repo, session_id)
 
     def has_local_session(self, repo: Path, session_id: str) -> bool:
-        return False
+        return opencode_session.has_imported_session(repo, session_id)
 
     def import_shared_session(self, repo: Path, session_id: str, transcript: str, *, overwrite: bool = False) -> bool:
-        return False
+        return opencode_session.import_shared_session(repo, session_id, transcript, overwrite=overwrite)
 
     def new_session_id(self) -> str | None:
         # OpenCode assigns its own session id; aGiT discovers it after the run.

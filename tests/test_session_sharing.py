@@ -6,7 +6,7 @@ through a local bare remote.
 """
 
 import subprocess
-
+from pathlib import Path
 
 from agit.git import GitRepo
 from agit.sessions import SharedSessionStore, github_login, redact_transcript
@@ -283,7 +283,7 @@ def test_resume_shared_prompts_to_pull_when_local_exists(tmp_path, monkeypatch):
         manifest={"github_id": "me", "name": "sess", "session_id": "sid-x", "updated": 1},
     )
     runner.sessions = []  # not live
-    runner._resume_conversation = lambda name, sid: None
+    runner._resume_conversation = lambda name, sid, **k: None
     # First popup selects the session; second is the local-vs-shared choice → Pull.
     runner._select_popup = lambda title, options: options[0]
 
@@ -334,6 +334,111 @@ def test_claude_export_and_import_retargets_cwd(tmp_path, monkeypatch):
     (claude._project_dir(dst) / "sid.jsonl").write_text("LOCAL")
     assert claude.import_shared_session(dst, "sid", raw)
     assert (claude._project_dir(dst) / "sid.jsonl").read_text() == "LOCAL"
+
+
+# --- OpenCode transcript export / import ------------------------------------
+
+
+def test_opencode_export_raw_sanitizes_and_validates_json(monkeypatch, tmp_path):
+    from agit.transcripts import opencode
+
+    seen: dict[str, object] = {}
+
+    def fake_export(repo, session_id, *, sanitize=False):
+        seen["sanitize"] = sanitize
+        seen["session_id"] = session_id
+        return ('noise\n{"info": {"id": "ses_1"}, "messages": []}\n', 0)
+
+    monkeypatch.setattr(opencode, "_run_export_pty", fake_export)
+    raw = opencode.export_session_raw(tmp_path, "ses_1")
+    assert raw is not None and '"ses_1"' in raw
+    assert seen["sanitize"] is True  # OpenCode's own redaction is requested
+    # The surrounding pty noise is stripped to a single parseable JSON object.
+    import json as _json
+
+    assert _json.loads(raw)["info"]["id"] == "ses_1"
+
+
+def test_opencode_export_raw_rejects_unparseable_output(monkeypatch, tmp_path):
+    from agit.transcripts import opencode
+
+    monkeypatch.setattr(opencode, "_run_export_pty", lambda repo, sid, *, sanitize=False: ("{not json", 0))
+    assert opencode.export_session_raw(tmp_path, "ses_1") is None
+    # A non-zero exit code is also treated as a failed export.
+    monkeypatch.setattr(opencode, "_run_export_pty", lambda repo, sid, *, sanitize=False: ('{"info":{}}', 1))
+    assert opencode.export_session_raw(tmp_path, "ses_1") is None
+
+
+def test_opencode_import_runs_cli_and_checks_success(monkeypatch, tmp_path):
+    from agit.transcripts import opencode
+
+    monkeypatch.setattr(opencode, "has_imported_session", lambda repo, sid: False)
+    captured: dict[str, object] = {}
+
+    def fake_run(repo, args):
+        # The transcript was written to a temp file passed to `opencode import`.
+        captured["args"] = args
+        captured["cwd"] = repo
+        captured["content"] = Path(args[-1]).read_text()
+        return ("Imported session: ses_1\n", 0)
+
+    monkeypatch.setattr(opencode, "_run_opencode_pty", fake_run)
+    assert opencode.import_shared_session(tmp_path, "ses_1", '{"info":{"id":"ses_1"}}') is True
+    assert captured["args"][:2] == ["opencode", "import"]
+    assert captured["cwd"] == tmp_path
+    assert captured["content"] == '{"info":{"id":"ses_1"}}'
+    # The temp file is cleaned up afterwards.
+    assert not Path(captured["args"][-1]).exists()
+
+
+def test_opencode_import_failure_paths(monkeypatch, tmp_path):
+    from agit.transcripts import opencode
+
+    monkeypatch.setattr(opencode, "has_imported_session", lambda repo, sid: False)
+    # A clean exit without the success line (e.g. "File not found") is a failure.
+    monkeypatch.setattr(opencode, "_run_opencode_pty", lambda repo, args: ("File not found\n", 0))
+    assert opencode.import_shared_session(tmp_path, "ses_1", "{}") is False
+    # A non-zero exit is a failure too.
+    monkeypatch.setattr(opencode, "_run_opencode_pty", lambda repo, args: ("boom\n", 1))
+    assert opencode.import_shared_session(tmp_path, "ses_1", "{}") is False
+    # Empty inputs short-circuit without spawning anything.
+    assert opencode.import_shared_session(tmp_path, "", "{}") is False
+    assert opencode.import_shared_session(tmp_path, "ses_1", "") is False
+
+
+def test_opencode_import_keeps_local_copy_unless_overwrite(monkeypatch, tmp_path):
+    from agit.transcripts import opencode
+
+    monkeypatch.setattr(opencode, "has_imported_session", lambda repo, sid: True)
+    ran = {"n": 0}
+
+    def fake_run(repo, args):
+        ran["n"] += 1
+        return ("Imported session: ses_1\n", 0)
+
+    monkeypatch.setattr(opencode, "_run_opencode_pty", fake_run)
+    # Already have it locally and not overwriting → no import spawn, reported in place.
+    assert opencode.import_shared_session(tmp_path, "ses_1", "{}") is True
+    assert ran["n"] == 0
+    # Overwrite (pull-latest) re-imports.
+    assert opencode.import_shared_session(tmp_path, "ses_1", "{}", overwrite=True) is True
+    assert ran["n"] == 1
+
+
+def test_opencode_has_imported_session_uses_repo_membership(monkeypatch, tmp_path):
+    from agit.transcripts import opencode
+
+    monkeypatch.setattr(opencode, "session_belongs_to_repo", lambda repo, sid: sid == "mine")
+    assert opencode.has_imported_session(tmp_path, "mine") is True
+    assert opencode.has_imported_session(tmp_path, "other") is False
+    assert opencode.has_imported_session(tmp_path, "") is False
+
+
+def test_opencode_transcript_size_is_unavailable(tmp_path):
+    from agit.transcripts import opencode
+
+    # No cheap per-session stat exists (SQLite store), so size is intentionally None.
+    assert opencode.session_transcript_size(tmp_path, "ses_1") is None
 
 
 # --- runner glue: share + resume-shared through the session menu ------------
@@ -424,13 +529,49 @@ def test_runner_resume_shared_imports_and_resumes(tmp_path, monkeypatch):
         manifest={"github_id": "bob", "name": "cool-fix", "session_id": "bob-sid", "updated": 99},
     )
     resumed = []
-    runner._resume_conversation = lambda name, sid: resumed.append((name, sid))
+    runner._resume_conversation = lambda name, sid, *, backend=None: resumed.append((name, sid, backend))
     runner._select_popup = lambda title, options: options[0]  # pick the first (only) entry
 
     runner._resume_shared_session_menu()
 
     assert backend.imported == ("bob-sid", "bob's chat", False)  # imported, no overwrite (no local copy)
-    assert resumed == [("bob-cool-fix", "bob-sid")]  # resumed under <id>-<name>
+    # Resumed under <id>-<name>, pinned to the entry's backend (defaults to the
+    # active backend when the manifest doesn't record one).
+    assert resumed == [("bob-cool-fix", "bob-sid", "claude")]
+
+
+def test_runner_resume_shared_crosses_backends(tmp_path, monkeypatch):
+    # Active backend is Claude, but the shared entry is an OpenCode session: it
+    # must be imported and resumed by a freshly-built OpenCode agent, not Claude.
+    from agit.proxy import runner as runner_module
+
+    active = _StubBackend()  # name == "claude"
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, active)
+    SharedSessionStore(repo).publish(
+        github_id="bob",
+        name="oc-fix",
+        transcript='{"info":{"id":"ses_bob"}}',
+        manifest={"github_id": "bob", "name": "oc-fix", "backend": "opencode", "session_id": "ses_bob", "updated": 7},
+    )
+    oc_agent = _StubBackend(transcript="oc")
+    oc_agent.name = "opencode"
+    built: list[str] = []
+
+    def fake_make(name):
+        built.append(name)
+        return oc_agent
+
+    monkeypatch.setattr(runner_module, "make_proxy_agent", fake_make)
+    resumed: list = []
+    runner._resume_conversation = lambda name, sid, *, backend=None: resumed.append((name, sid, backend))
+    runner._select_popup = lambda title, options: options[0]
+
+    runner._resume_shared_session_menu()
+
+    assert built == ["opencode"]  # a fresh OpenCode agent was constructed
+    assert oc_agent.imported == ("ses_bob", '{"info":{"id":"ses_bob"}}', False)  # OpenCode did the import
+    assert active.imported is None  # the active Claude agent was NOT used
+    assert resumed == [("bob-oc-fix", "ses_bob", "opencode")]  # resumed pinned to opencode
 
 
 def test_runner_auto_share_pushes_on_change_only(tmp_path, monkeypatch):
@@ -645,12 +786,41 @@ def test_shared_entry_status_is_size_based(tmp_path, monkeypatch):
     assert runner._shared_entry_status(unknown, "sid-123") == "shared"
 
 
-def test_claude_backend_flags_sharing_support(tmp_path):
+def test_both_backends_flag_sharing_support():
     from agit.backends.proxy_agents import make_proxy_agent
 
+    # Claude (per-session .jsonl) and OpenCode (export/import CLI) both have a
+    # portable transcript, so both advertise session sharing (issue #55).
     assert make_proxy_agent("claude").supports_session_sharing is True
-    opencode = make_proxy_agent("opencode")
-    assert opencode.supports_session_sharing is False
-    # OpenCode has no portable transcript, so export/import are inert.
-    assert opencode.export_session_raw(tmp_path, "x") is None
-    assert opencode.import_shared_session(tmp_path, "x", "data") is False
+    assert make_proxy_agent("opencode").supports_session_sharing is True
+
+
+def test_opencode_agent_delegates_sharing_to_transcript_module(tmp_path, monkeypatch):
+    from agit.backends.proxy_agents import make_proxy_agent
+    from agit.transcripts import opencode as opencode_session
+
+    calls: dict[str, object] = {}
+
+    def record(key, value):
+        def fn(*args):
+            calls[key] = args
+            return value
+
+        return fn
+
+    monkeypatch.setattr(opencode_session, "export_session_raw", record("export", "{}"))
+    monkeypatch.setattr(opencode_session, "session_transcript_size", record("size", None))
+    monkeypatch.setattr(opencode_session, "has_imported_session", record("has", True))
+
+    def fake_import(repo, sid, text, *, overwrite=False):
+        calls["import"] = (repo, sid, text, overwrite)
+        return True
+
+    monkeypatch.setattr(opencode_session, "import_shared_session", fake_import)
+    agent = make_proxy_agent("opencode")
+    assert agent.export_session_raw(tmp_path, "ses_1") == "{}"
+    assert agent.transcript_size(tmp_path, "ses_1") is None
+    assert agent.has_local_session(tmp_path, "ses_1") is True
+    assert agent.import_shared_session(tmp_path, "ses_1", "{}", overwrite=True) is True
+    assert calls["export"] == (tmp_path, "ses_1")
+    assert calls["import"] == (tmp_path, "ses_1", "{}", True)
