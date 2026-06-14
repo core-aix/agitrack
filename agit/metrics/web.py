@@ -539,6 +539,7 @@ h2.section::before{content:"# ";color:var(--amber)}
 .chartpanel{padding:14px 16px 10px;position:relative}
 .chart-head{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;flex-wrap:wrap;margin-bottom:10px}
 .chart-controls{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+.zoomhint{color:var(--fg-dim);font-size:11.5px;font-style:italic;white-space:nowrap}
 .gran{display:flex;align-items:center;gap:7px;color:var(--amber);font-size:11px;letter-spacing:.6px;text-transform:uppercase}
 .gran select{appearance:none;background:var(--ink);color:var(--fg);border:1px solid var(--line);
   font-family:var(--mono);font-size:12.5px;padding:5px 26px 5px 9px;cursor:pointer;text-transform:none;letter-spacing:normal;
@@ -686,7 +687,7 @@ footer{margin-top:46px;padding-top:22px;border-top:1px dashed var(--line);color:
     <div class="field"><label for="f-author">committer</label><select id="f-author"></select></div>
     <div class="field"><label for="f-backend">backend</label><select id="f-backend"></select></div>
     <div class="field"><label for="f-model">model</label><select id="f-model"></select></div>
-    <div class="field period-field"><label for="f-period">period</label><select id="f-period">
+    <div class="field period-field"><label for="f-period">range</label><select id="f-period">
       <option value="">all time</option>
       <option value="1">last 24 hours</option>
       <option value="7">last 7 days</option>
@@ -711,14 +712,7 @@ footer{margin-top:46px;padding-top:22px;border-top:1px dashed var(--line);color:
     <div class="chart-head">
       <div class="legend" id="ts-legend"></div>
       <div class="chart-controls">
-        <div class="gran"><label for="ts-look">show</label><select id="ts-look">
-          <option value="0">all history</option>
-          <option value="1">last 24 hours</option>
-          <option value="7">last 7 days</option>
-          <option value="30">last 30 days</option>
-          <option value="90">last 90 days</option>
-          <option value="custom" hidden>custom (zoomed)</option>
-        </select></div>
+        <span class="zoomhint">scroll to zoom · drag to pan · double-click to reset</span>
         <div class="gran"><label for="ts-gran">per</label><select id="ts-gran">
           <option value="hour">hour</option>
           <option value="day">day</option>
@@ -1006,7 +1000,9 @@ function renderLegend(){
 }
 
 // The visible x window as a clamped [lo, hi] pair of (fractional) bucket indices.
-// null tsView ⇒ the whole range; zoom/pan narrow it without refetching.
+// null tsView ⇒ the whole range. The period (range) filter selects the DATA range;
+// the mouse wheel/drag just zooms/pans WITHIN it for a closer look (no extra range
+// selector — double-click resets to the full filtered range).
 function tsBounds(){
   const n = (TS.t||[]).length;
   if(n<=1 || !tsView) return [0, Math.max(0, n-1)];
@@ -1016,9 +1012,7 @@ function tsBounds(){
 }
 const PAD_L=10, PAD_R=10;
 function tsPlotW(){ return Math.max(1, $("ts-canvas").parentElement.clientWidth - PAD_L - PAD_R); }
-// Screen x (CSS px) of bucket index i within the current window.
 function tsXAt(i){ const [lo,hi]=tsBounds(), span=hi-lo; return PAD_L + (span<=0 ? tsPlotW()/2 : (i-lo)/span*tsPlotW()); }
-// Bucket index nearest a screen x (CSS px from the canvas left edge).
 function tsIndexAt(px){ const [lo,hi]=tsBounds(), rel=Math.max(0,Math.min(1,(px-PAD_L)/tsPlotW())); return Math.round(lo+rel*(hi-lo)); }
 
 function renderChart(){
@@ -1110,7 +1104,7 @@ function onChartMove(e){
   if(tsDrag){  // panning: shift the window opposite the drag
     const span = tsDrag.hi-tsDrag.lo, ddx = (e.clientX-tsDrag.x)/tsPlotW()*span;
     tsSetWindow(tsDrag.lo-ddx, tsDrag.hi-ddx, n);
-    tsHover=-1; $("ts-tip").hidden=true; tsSyncLookSelect(); renderChart(); return;
+    tsHover=-1; $("ts-tip").hidden=true; renderChart(); return;
   }
   const i = n<=1 ? 0 : tsIndexAt(px);
   if(i!==tsHover){ tsHover=i; renderChart(); }
@@ -1126,7 +1120,7 @@ function onChartWheel(e){
   const focus = lo + rel*(hi-lo);                       // bucket under the cursor
   let span = Math.max(1, Math.min(n-1, (hi-lo)*(e.deltaY<0?0.8:1.25)));  // zoom in/out
   tsSetWindow(focus-rel*span, focus-rel*span+span, n);  // keep the cursor anchored
-  tsHover=-1; tsSyncLookSelect(); renderChart();
+  tsHover=-1; renderChart();
 }
 function onChartDown(e){
   const n = (TS.t||[]).length; if(n<=1) return;
@@ -1135,30 +1129,7 @@ function onChartDown(e){
   $("ts-canvas").style.cursor = "grabbing"; $("ts-tip").hidden = true;
 }
 function onChartUp(){ if(tsDrag){ tsDrag=null; $("ts-canvas").style.cursor=""; } }
-function resetZoom(){ tsView=null; tsHover=-1; const s=$("ts-look"); if(s) s.value="0"; }
-// Keep the "show" dropdown in sync after a manual wheel/drag zoom: a narrowed
-// window reads as "custom", a full one as "all history".
-function tsSyncLookSelect(){ const s=$("ts-look"); if(s) s.value = tsView ? "custom" : "0"; }
-// The easy zoom: the visible window for "show the most recent <days>" (0 = all),
-// computed from the loaded bucket timestamps. Returns null for the full range.
-function tsLookbackWindow(days){
-  const t = TS.t||[], n = t.length;
-  if(n<=1 || !days) return null;
-  const cutoff = t[n-1] - days*DAY;         // bucket starts within the window
-  let lo = 0; while(lo < n-1 && t[lo] < cutoff) lo++;
-  return (lo<=0) ? null : [lo, n-1];
-}
-function applyLookback(days){ tsView = tsLookbackWindow(days); tsHover = -1; renderChart(); }
-// Re-apply the current SHOW selection to a freshly-loaded bucket set (after a
-// filter/granularity change or a live refresh) WITHOUT resetting it — the old
-// pixel indices can't carry over, but the chosen lookback duration can. A manual
-// "custom" wheel/drag zoom has no duration to re-apply, so it falls back to all.
-function reapplyLookback(){
-  const sel = $("ts-look"), v = sel ? sel.value : "0";
-  if(v === "custom"){ tsView = null; if(sel) sel.value = "0"; }
-  else { tsView = tsLookbackWindow(+v); }
-  tsHover = -1;
-}
+function resetZoom(){ tsView=null; tsHover=-1; }
 function renderTimeseries(){ renderLegend(); renderChart(); }
 
 function renderLog(){
@@ -1232,18 +1203,18 @@ function syncFilters(){
 }
 
 // A filter change refetches the aggregates and resets the log to its first page.
-// The SHOW/PER selections are preserved: PER stays in state, and the SHOW
-// lookback is re-applied to the new bucket set (its old pixel window can't carry).
+// PER stays in state; the data range comes from the period filter. A data change
+// re-bucketed the series, so any mouse zoom window is reset to the full range.
 async function applyFilters(){
   await loadAgg(); await loadLog(0);
-  reapplyLookback(); setDateBounds(); syncPeriodDates();
+  resetZoom(); setDateBounds(); syncPeriodDates();
   syncFilters(); renderAgg(); renderLog();
 }
 async function refresh(){
   const prev = HEAD;
   if(!await loadAgg()) return;
   if(HEAD !== prev){  // new commits landed — refresh the whole view
-    reapplyLookback();  // keep the chosen SHOW window over the new buckets
+    resetZoom();  // the bucket set changed; an old pixel-zoom window would mis-map
     setDateBounds(); syncPeriodDates();  // extend the shown range to new commits
     await loadLog(LOGPAGE.offset||0);
     syncFilters(); renderAgg(); renderLog();  // renderAgg() also repaints shared sessions
@@ -1322,12 +1293,9 @@ function init(){
     const key = btn.dataset.key; tsOn[key] = !tsOn[key];
     renderTimeseries();
   });
-  // Bucket granularity: refetch the (re-bucketed) series and redraw the plot,
-  // keeping the SHOW lookback applied to the new buckets.
+  // Bucket granularity: refetch the (re-bucketed) series and redraw the plot.
   $("ts-gran").value = state.granularity;
-  $("ts-gran").onchange = async e => { state.granularity = e.target.value; if(await loadAgg()){ reapplyLookback(); renderTimeseries(); } };
-  // Easy zoom: pick how far back the plot's x axis looks (over loaded buckets).
-  $("ts-look").onchange = e => { if(e.target.value !== "custom") applyLookback(+e.target.value); };
+  $("ts-gran").onchange = async e => { state.granularity = e.target.value; if(await loadAgg()){ resetZoom(); renderTimeseries(); } };
   // Zoom/pan the x axis over the loaded buckets: wheel zooms (anchored on the
   // cursor), drag pans, double-click resets — all client-side, no refetch.
   const cv = $("ts-canvas");
