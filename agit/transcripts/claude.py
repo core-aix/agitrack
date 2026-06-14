@@ -306,17 +306,24 @@ def _retarget_cwd(transcript: str, cwd: str) -> str:
     return "\n".join(out)
 
 
-def session_cwd(session_id: str) -> str | None:
+def session_cwd(session_id: str, *, since: float | None = None) -> str | None:
     """The working directory Claude most recently recorded for a session. Claude
     writes its `cwd` into (almost) every transcript line, so this reads the last
     one that has it from the newest transcript file. Used to detect a resume that
-    restored the session's old cwd instead of the worktree it was launched in."""
+    restored the session's old cwd instead of the worktree it was launched in.
+
+    When ``since`` (an epoch timestamp) is given, only rows whose `timestamp` is
+    at or after it are considered, so a *stale* cwd recorded before the current
+    launch is ignored — only a directory a post-launch turn actually ran in
+    counts as drift. Returns None when no qualifying row exists yet (the caller
+    then re-checks later instead of latching a premature, false warning)."""
     if not session_id:
         return None
     path = _find_session_file(session_id)
     if path is None:
         return None
     found: str | None = None
+    cutoff = int(since) if since is not None else None
     try:
         with path.open("r", encoding="utf-8") as handle:
             for line in handle:
@@ -324,9 +331,14 @@ def session_cwd(session_id: str) -> str | None:
                 if not line or '"cwd"' not in line:
                     continue
                 try:
-                    cwd = json.loads(line).get("cwd")
+                    row = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if cutoff is not None:
+                    stamp = _row_timestamp(row)
+                    if stamp is None or stamp < cutoff:
+                        continue  # stale (pre-launch) or undatable row — skip
+                cwd = row.get("cwd")
                 if isinstance(cwd, str) and cwd:
                     found = cwd  # keep the last one
     except OSError:

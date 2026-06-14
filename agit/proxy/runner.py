@@ -44,6 +44,7 @@ from agit.proxy.commit_engine import CommitEngine
 from agit.proxy.integration import IntegrationService, MergeContext, MergePhase
 from agit.proxy.process import BackendProcess
 from agit.proxy.session import Session
+from agit.transcripts import SessionRef
 
 
 # Palette helpers, _BackgroundColorEraseScreen, and detect_color_mode live in
@@ -517,6 +518,7 @@ class ProxyRunner:
         self._base_check_at = 0.0
         self._cwd_drift_checked = False
         self._cwd_check_at = 0.0
+        self._cwd_launch_at = 0.0  # epoch of the latest backend launch (set in _spawn)
         self._relaunch_times: list[float] = []
         self._exiting = False
         self._finalized_on_exit = False
@@ -713,6 +715,7 @@ class ProxyRunner:
                 "_base_check_at": 0.0,
                 "_cwd_drift_checked": False,
                 "_cwd_check_at": 0.0,
+                "_cwd_launch_at": 0.0,
                 "_relaunch_times": [],
                 "_exiting": False,
                 "_finalized_on_exit": False,
@@ -800,6 +803,10 @@ class ProxyRunner:
         # Reclaim dangling shared-session snapshots from prior runs, in the
         # background so startup never waits on it (issue #55).
         threading.Thread(target=lambda: self._sweep_orphan_shared_sessions(fetch=True), daemon=True).start()
+        # Recommend installing / logging into gh when it's unavailable, since the
+        # dashboard's committer identities and session sharing depend on it (#76).
+        # Runs in the background so a slow `gh auth status` never blocks startup.
+        threading.Thread(target=self._notify_if_gh_unavailable, daemon=True).start()
         self.old_attrs = termios.tcgetattr(sys.stdin.fileno())
         try:
             self._enter_host_screen()
@@ -872,6 +879,46 @@ class ProxyRunner:
         # owns its BackendProcess; child_pid / master_fd remain readable on the
         # runner via the Session-delegating compat properties.
         self.active.process = BackendProcess.spawn(command, str(self.repo.repo))
+        # Re-arm the cwd-drift check for this launch, and remember when it started:
+        # only turns recorded at/after this time count, so a stale cwd left in the
+        # transcript before this launch can't trigger a false drift warning (#72).
+        self._cwd_drift_checked = False
+        self._cwd_check_at = 0.0
+        self._cwd_launch_at = time.time()
+
+    def _notify_if_gh_unavailable(self) -> None:
+        # Recommend installing / authenticating gh when it isn't usable, so the
+        # user knows why features that depend on it (the dashboard's committer
+        # identities, session sharing) are limited (#76). Best-effort and one-shot;
+        # runs off the startup thread so a slow auth check never blocks the UI.
+        try:
+            from agit.metrics.github import gh_status
+
+            status = gh_status()
+        except Exception as error:
+            self._debug(f"gh availability check failed: {error!r}")
+            return
+        message = self._gh_unavailable_hint(status)
+        if message is None:
+            return  # gh is installed and authenticated — nothing to suggest
+        self._set_message(message, seconds=12.0)
+        self._render()
+
+    @staticmethod
+    def _gh_unavailable_hint(status: str) -> str | None:
+        if status == "missing":
+            return (
+                "GitHub CLI (gh) isn't installed. aGiT features that rely on it are limited —\n"
+                "the dashboard can't resolve committer GitHub identities, and session sharing\n"
+                "is unavailable. Install it from https://cli.github.com then run `gh auth login`."
+            )
+        if status == "unauthenticated":
+            return (
+                "GitHub CLI (gh) isn't logged in. aGiT features that rely on it are limited —\n"
+                "the dashboard can't resolve committer GitHub identities, and session sharing\n"
+                "is unavailable. Run `gh auth login` to enable them."
+            )
+        return None
 
     def _setup_worktree_confinement_notice(self) -> None:
         # When confinement is requested but the platform can't enforce it (no
@@ -891,11 +938,27 @@ class ProxyRunner:
         except Exception:
             self._base_status_baseline = set()
         self._set_message(
-            "Agent sandbox unavailable on this platform — edits outside the session\n"
-            "worktree can't be prevented; aGiT will warn if the base repo is modified.",
+            self._sandbox_unavailable_hint(),
             seconds=8.0,
         )
         self._render()
+
+    @staticmethod
+    def _sandbox_unavailable_hint() -> str:
+        base = (
+            "Agent sandbox unavailable — edits outside the session worktree can't be\n"
+            "prevented; aGiT will warn if the base repo is modified."
+        )
+        if sys.platform.startswith("linux"):
+            if shutil.which("bwrap") is None:
+                return base + "\nInstall bubblewrap (e.g. `apt install bubblewrap`) to enforce it."
+            # bwrap is present but the probe failed — almost always blocked userns.
+            return (
+                base + "\nbubblewrap is installed but unprivileged user namespaces are blocked\n"
+                "(e.g. Ubuntu's kernel.apparmor_restrict_unprivileged_userns); enabling them\n"
+                "lets aGiT enforce the worktree sandbox."
+            )
+        return base
 
     def _check_base_branch_drift(self) -> None:
         # The user can `git checkout` another branch in the directory while aGiT is
@@ -1024,6 +1087,13 @@ class ProxyRunner:
         # that happens the agent works in the wrong directory: its turns aren't
         # tracked here and writes outside the worktree are sandbox-blocked. Detect
         # it from the cwd the backend records, and warn once with how to recover.
+        #
+        # Only the cwd of a turn recorded *after* this launch counts (`since`): a
+        # resume — especially of an imported/shared session — leaves a stale cwd in
+        # the transcript that points elsewhere (the base repo, another machine's
+        # path) but is harmless, because the next real turn runs in the worktree.
+        # Without the time gate that stale value latched a confusing false warning
+        # before the agent had done anything (#72).
         if self._cwd_drift_checked:
             return
         if self.worktree is None:
@@ -1037,18 +1107,18 @@ class ProxyRunner:
             self._cwd_drift_checked = True  # backend doesn't record a cwd
             return
         try:
-            recorded = fn(self.state.backend_session_id)
+            recorded = fn(self.state.backend_session_id, since=self._cwd_launch_at or None)
         except Exception as error:
             self._debug(f"cwd drift check failed: {error!r}")
             return
         if not recorded:
-            return  # nothing recorded yet — check again next tick
+            return  # no post-launch turn recorded yet — check again next tick
         self._cwd_drift_checked = True
         if os.path.realpath(recorded) == os.path.realpath(str(self.repo.repo)):
             return  # on the worktree, as intended
         self._debug(f"cwd drift: backend recorded {recorded}, worktree is {self.repo.repo}")
         self._set_message(
-            f"⚠ The agent is working in:\n    {recorded}\n"
+            f"⚠ The agent ran a turn in:\n    {recorded}\n"
             f"not this session's worktree:\n    {self.repo.repo}\n"
             "This is Claude's resume-cwd bug (#58591): turns made there are NOT committed "
             "by aGiT, and edits outside the worktree are blocked by the sandbox.\n"
@@ -1387,6 +1457,18 @@ class ProxyRunner:
 
     def _session_name_taken(self, name: str) -> bool:
         return _sanitize_name(name) in self._taken_session_names()
+
+    def _dedupe_session_name(self, base: str) -> str:
+        # A collision-free local name derived from ``base`` (e.g. a shared
+        # session's "<sharer>-<name>"), so the resume prompt's default can be
+        # accepted as-is even when the same session was imported before.
+        candidate = _sanitize_name(base)
+        if not self._session_name_taken(candidate):
+            return candidate
+        suffix = 2
+        while self._session_name_taken(f"{candidate}-{suffix}"):
+            suffix += 1
+        return f"{candidate}-{suffix}"
 
     def _prompt_session_name(self, title: str, *, default: str) -> str | None:
         # Ask for a session name, rejecting duplicates (a session and its worktree
@@ -2433,6 +2515,16 @@ class ProxyRunner:
             if ref.id not in seen:
                 seen.add(ref.id)
                 refs.append(ref)
+        # A session that produced no commits still reserves its name in the durable
+        # record, but the backend may no longer enumerate it (no transcript under a
+        # current worktree path). Surface those named conversations too, so a
+        # reserved name is never stranded — unresumable yet un-reusable (#75).
+        # Resuming one recreates its worktree under the saved name and continues the
+        # conversation if the backend still has it, or starts fresh there if not.
+        for sid, name in self._agit_named_sessions().items():
+            if sid and sid not in seen:
+                seen.add(sid)
+                refs.append(SessionRef(id=sid, updated=0.0, label=name))
         refs = sorted(refs, key=lambda ref: getattr(ref, "updated", 0) or 0, reverse=True)
         return refs[: self.RESUME_LIST_LIMIT]
 
@@ -2895,14 +2987,31 @@ class ProxyRunner:
                 self._render()
                 return
         # If this conversation is already live, just switch to it — never overwrite a
-        # running session. Otherwise, if a (dormant) local copy exists, ask whether to
-        # pull the shared version (the "continue on another machine" sync) or keep the
-        # local one. With no local copy, import fresh.
+        # running session.
         already_live = any(
             getattr(getattr(s, "state", None), "backend_session_id", None) == session_id for s in self.sessions
         )
+        if already_live:
+            self._resume_conversation(f"{entry.github_id}-{entry.name}", session_id, backend=entry_backend)
+            return
+        # Give the imported session a clear local name (#71): a shared session
+        # arrives identified only by its sharer/name on the remote, so prompt for
+        # a local session name — defaulting to a clean, deduped derivation — the
+        # same way a brand-new session is named, instead of silently adopting the
+        # raw "<sharer>-<name>" slug.
+        name = self._prompt_session_name(
+            "Resume shared session",
+            default=self._dedupe_session_name(f"{entry.github_id}-{entry.name}"),
+        )
+        if name is None:
+            self._set_message("Cancelled.")
+            self._render()
+            return
+        # If a (dormant) local copy exists, ask whether to pull the shared version
+        # (the "continue on another machine" sync) or keep the local one. With no
+        # local copy, import fresh.
         overwrite = False
-        if not already_live and agent.has_local_session(self.base_repo.repo, session_id):
+        if agent.has_local_session(self.base_repo.repo, session_id):
             age = self._format_age(entry.manifest["updated"]) if entry.manifest.get("updated") else "earlier"
             pick = self._select_popup(
                 f"You already have a local copy of {entry.display}.\n"
@@ -2918,7 +3027,7 @@ class ProxyRunner:
             self._set_message("Could not install the shared session for resume.")
             self._render()
             return
-        self._resume_conversation(f"{entry.github_id}-{entry.name}", session_id, backend=entry_backend)
+        self._resume_conversation(name, session_id, backend=entry_backend)
 
     def _format_age(self, updated: float) -> str:
         delta = max(0, int(time.time() - (updated or 0)))
