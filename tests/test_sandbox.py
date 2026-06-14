@@ -15,14 +15,26 @@ def test_wrap_command_disabled_via_env(monkeypatch):
 
 def test_wrap_command_noop_when_worktree_is_base(monkeypatch, tmp_path):
     monkeypatch.delenv("AGIT_SANDBOX", raising=False)
-    monkeypatch.setattr(sandbox, "is_available", lambda: True)
+    monkeypatch.setattr(sandbox, "_have_sandbox_exec", lambda: True)
     command = ["claude"]
     assert sandbox.wrap_command(command, base=str(tmp_path), worktree=str(tmp_path)) == command
 
 
-def test_wrap_command_wraps_when_available(monkeypatch, tmp_path):
+def test_wrap_command_noop_when_no_mechanism(monkeypatch, tmp_path):
+    # bwrap/sandbox-exec both unavailable -> caller falls back to warn-on-edit.
     monkeypatch.delenv("AGIT_SANDBOX", raising=False)
-    monkeypatch.setattr(sandbox, "is_available", lambda: True)
+    monkeypatch.setattr(sandbox, "_have_sandbox_exec", lambda: False)
+    monkeypatch.setattr(sandbox, "_have_bwrap", lambda: False)
+    base = tmp_path / "repo"
+    wt = base / ".agit" / "worktrees" / "s1"
+    wt.mkdir(parents=True)
+    command = ["claude", "-r", "x"]
+    assert sandbox.wrap_command(command, base=str(base), worktree=str(wt)) is command
+
+
+def test_wrap_command_wraps_with_sandbox_exec(monkeypatch, tmp_path):
+    monkeypatch.delenv("AGIT_SANDBOX", raising=False)
+    monkeypatch.setattr(sandbox, "_have_sandbox_exec", lambda: True)
     base = tmp_path / "repo"
     wt = base / ".agit" / "worktrees" / "s1"
     wt.mkdir(parents=True)
@@ -32,6 +44,21 @@ def test_wrap_command_wraps_when_available(monkeypatch, tmp_path):
     profile = wrapped[2]
     assert "(allow default)" in profile
     assert "(deny file-write*" in profile and str(wt.resolve()) in profile
+
+
+def test_wrap_command_wraps_with_bwrap(monkeypatch, tmp_path):
+    # No sandbox-exec (Linux), bwrap usable -> bubblewrap prefix.
+    monkeypatch.delenv("AGIT_SANDBOX", raising=False)
+    monkeypatch.setattr(sandbox, "_have_sandbox_exec", lambda: False)
+    monkeypatch.setattr(sandbox, "_have_bwrap", lambda: True)
+    base = tmp_path / "repo"
+    (base / ".git").mkdir(parents=True)
+    wt = base / ".agit" / "worktrees" / "s1"
+    wt.mkdir(parents=True)
+    wrapped = sandbox.wrap_command(["claude", "-r", "x"], base=str(base), worktree=str(wt))
+    assert wrapped[0] == "bwrap"
+    assert wrapped[-3:] == ["claude", "-r", "x"]
+    assert wrapped[wrapped.index("--") + 1 :] == ["claude", "-r", "x"]
 
 
 def test_build_profile_denies_siblings_allows_this_worktree(tmp_path):
@@ -46,6 +73,25 @@ def test_build_profile_denies_siblings_allows_this_worktree(tmp_path):
     deny_root = next(i for i, ln in enumerate(lines) if "deny" in ln and str(root.resolve()) in ln)
     allow_wt = next(i for i, ln in enumerate(lines) if "allow" in ln and str((root / "s1").resolve()) in ln)
     assert allow_wt > deny_root  # later rule wins
+
+
+def test_build_bwrap_command_orders_binds(tmp_path):
+    base = tmp_path / "repo"
+    (base / ".git").mkdir(parents=True)
+    wt = base / ".agit" / "worktrees" / "s1"
+    wt.mkdir(parents=True)
+    args = sandbox.build_bwrap_command(str(base), str(wt))
+    assert args[0] == "bwrap"
+    assert args[-1] == "--"
+    # The base read-only bind must precede the .git/worktree read-write re-binds,
+    # otherwise the read-only base would shadow them.
+    ro_base = args.index(str(base.resolve()))  # first occurrence: the --ro-bind src
+    bind_wt = args.index(str(wt.resolve()))
+    assert args[ro_base - 1] == "--ro-bind"
+    assert ro_base < bind_wt
+    # .git is re-bound read-write, and the sandbox chdirs into the worktree.
+    assert "--bind" in args and str((base / ".git").resolve()) in args
+    assert args[args.index("--chdir") + 1] == str(wt.resolve())
 
 
 @pytest.mark.skipif(sys.platform != "darwin" or not shutil.which("sandbox-exec"), reason="sandbox-exec is macOS-only")
@@ -78,6 +124,28 @@ def test_sandbox_exec_blocks_base_and_siblings_allows_self(tmp_path):
         ).returncode
 
     assert write(base / "proxy.py") != 0  # base source: denied
+    assert write(s2 / "edit.py") != 0  # another session's worktree: denied
+    assert write(s1 / "edit.py") == 0  # this session's worktree: allowed
+    assert write(base / ".git" / "x") == 0  # git internals: allowed
+
+
+@pytest.mark.skipif(not sandbox._bwrap_works(), reason="bubblewrap unavailable / unprivileged userns blocked")
+def test_bwrap_blocks_base_and_siblings_allows_self(tmp_path):
+    base = tmp_path / "repo"
+    (base / ".git").mkdir(parents=True)
+    s1 = base / ".agit" / "worktrees" / "s1"
+    s2 = base / ".agit" / "worktrees" / "s2"
+    s1.mkdir(parents=True)
+    s2.mkdir(parents=True)
+    prefix = sandbox.build_bwrap_command(str(base), str(s1))
+
+    def write(path) -> int:
+        return subprocess.run(
+            [*prefix, "/bin/sh", "-c", f"echo hi > {path}"],
+            capture_output=True,
+        ).returncode
+
+    assert write(base / "proxy.py") != 0  # base source: denied (read-only)
     assert write(s2 / "edit.py") != 0  # another session's worktree: denied
     assert write(s1 / "edit.py") == 0  # this session's worktree: allowed
     assert write(base / ".git" / "x") == 0  # git internals: allowed
