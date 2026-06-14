@@ -85,6 +85,54 @@ def _looks_like_prompt_echo(prompt: str, response: str) -> bool:
     return window >= 40 and prompt_norm[:window] == response_norm[:window]
 
 
+# A meta-preamble the model sometimes prepends despite being told not to —
+# "The summary has been written…", "Here is the summary:", "No further action is
+# needed…". It must not become the commit subject; the real summary follows it.
+# An opening acknowledgement a genuine topic sentence never starts with:
+_PREAMBLE_ACK_RE = re.compile(r"(?is)^\s*(?:sure|certainly|of course|okay|ok|absolutely|got it|understood)\b[,!.:\s]")
+# Paragraph that talks ABOUT the summary/the task rather than being the summary:
+_PREAMBLE_META_RE = re.compile(
+    r"(?is)(?:"
+    r"\bsummary (?:has been|is|follows|will follow|below|here|complete|ready|as requested)\b"
+    r"|\bhere(?:'s| is| are)\b[^\n]{0,80}\bsummar"
+    r"|\b(?:provided|wrote|written|prepared|composed|produced|generated)\b[^\n]{0,80}\bsummar"
+    r"|\bno further action\b"
+    r"|\bthe (?:conversation turns|diff|input|changes)\b[^\n]{0,120}\bsummari"
+    r")"
+)
+# "Here is the summary: <real text>" / "Below is the summary — <real text>":
+_PREAMBLE_COLON_RE = re.compile(
+    r"(?is)^\s*(?:here(?:'s| is| are)|below (?:is|are)|the following is)[^:\n]{0,60}[:—-]\s+(?=\S)"
+)
+
+
+def _first_paragraph(text: str) -> tuple[str, str]:
+    """Split off the first blank-line-delimited paragraph: ``(head, rest)``.
+    ``rest`` is empty when there is only one paragraph."""
+    parts = re.split(r"\n[ \t]*\n", text.strip(), maxsplit=1)
+    return (parts[0].strip(), parts[1].strip()) if len(parts) == 2 else (text.strip(), "")
+
+
+def strip_summary_preamble(text: str) -> str:
+    """Drop a leading meta-preamble so the summary's own topic sentence leads (and
+    becomes the commit subject). Conservative: only a first paragraph that is
+    recognisably *about* summarizing (or a bare acknowledgement), only while real
+    content remains after it, and never reducing the text to nothing."""
+    cleaned = text.strip()
+    for _ in range(3):  # peel a few stacked preambles, but bail out quickly
+        before = cleaned
+        colon = _PREAMBLE_COLON_RE.match(cleaned)
+        if colon and cleaned[colon.end() :].strip():
+            cleaned = cleaned[colon.end() :].strip()
+        else:
+            head, rest = _first_paragraph(cleaned)
+            if rest and len(head) <= 500 and (_PREAMBLE_ACK_RE.match(head) or _PREAMBLE_META_RE.search(head)):
+                cleaned = rest
+        if cleaned == before:
+            break
+    return cleaned or text.strip()
+
+
 def summary_scratch_dir() -> Path:
     """A stable directory, outside any repository, for summarizer backends.
 
@@ -158,7 +206,8 @@ class Summarizer:
             raise UnusableSummaryError(f"summarizer echoed its prompt instead of summarizing: {text[:200]}")
         if not summary_is_usable(text):
             raise UnusableSummaryError(f"summarizer returned an error message: {text[:200]}")
-        return text
+        # Drop any "Here is the summary…" preamble so the topic sentence leads.
+        return strip_summary_preamble(text)
 
     def _build_commit_prompt(
         self,
