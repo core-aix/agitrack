@@ -88,6 +88,39 @@ def test_share_lists_and_reads_back(tmp_path):
     assert entries[0].manifest["session_id"] == "id1"
 
 
+def test_fetch_lists_with_filter_and_reads_transcript_on_demand():
+    # Listing fetches only the small manifests (blob filter); a chosen session's
+    # large transcript is fetched on demand the first time it's read.
+    fetches: list = []
+    blobs = {"abc/me/sess/manifest.json": '{"updated": 1}'}  # transcript not local yet
+
+    class FakeRepo:
+        def remote_exists(self, name="origin"):
+            return True
+
+        def root_commit(self):
+            return "abc"
+
+        def read_tree_paths(self, ref):
+            return {"abc/me/sess/manifest.json": "m", "abc/me/sess/transcript.jsonl": "t"}
+
+        def read_ref_blob(self, ref, path):
+            return blobs.get(path)
+
+        def fetch_ref(self, refspec, *, remote="origin", filter_blobs=None):
+            fetches.append(filter_blobs)
+            if filter_blobs is None:  # the on-demand full fetch brings the transcript in
+                blobs["abc/me/sess/transcript.jsonl"] = "the transcript"
+            return True
+
+    store = SharedSessionStore(FakeRepo())  # type: ignore[arg-type]
+    assert store.fetch() is True
+    assert fetches == ["blob:limit=16k"]  # listing used the size filter
+    entry = store.entries()[0]
+    assert store.read_transcript(entry) == "the transcript"
+    assert None in fetches  # a full fetch was triggered on demand for the transcript
+
+
 def test_shared_ref_is_history_free_and_keeps_only_latest(tmp_path):
     repo = _init_repo(tmp_path)
     store = SharedSessionStore(repo)
@@ -285,12 +318,40 @@ def test_resume_shared_prompts_to_pull_when_local_exists(tmp_path, monkeypatch):
     runner.sessions = []  # not live
     runner._resume_conversation = lambda name, sid, **k: None
     runner._prompt_session_name = lambda title, *, default: default  # accept the local name (#71)
-    # First popup selects the session; second is the local-vs-shared choice → Pull.
+    # First popup selects the session; second is the conflict choice → option[0] = Replace.
     runner._select_popup = lambda title, options: options[0]
 
     runner._resume_shared_session_menu()
 
-    assert backend.imported == ("sid-x", "bob's chat", True)  # imported with overwrite (pulled latest)
+    assert backend.imported == ("sid-x", "bob's chat", True)  # imported with overwrite (replaced local)
+
+
+def test_resume_shared_keep_both_imports_under_new_id(tmp_path, monkeypatch):
+    # When a local copy exists, "Keep both" re-imports the shared conversation
+    # under a fresh id and resumes THAT, leaving the original untouched.
+    from agit.config import AgitState
+
+    backend = _StubBackend(transcript="bob's chat", has_local=True)
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
+    SharedSessionStore(repo).publish(
+        github_id="me",
+        name="sess",
+        transcript="bob's chat",
+        manifest={"github_id": "me", "name": "sess", "session_id": "sid-x", "updated": 1},
+    )
+    runner.sessions = []
+    resumed: list = []
+    runner._resume_conversation = lambda name, sid, **k: resumed.append((name, sid))
+    runner._prompt_session_name = lambda title, *, default: default
+    # First popup: pick the entry. Second (conflict): pick "Keep both".
+    picks = iter([lambda opts: opts[0], lambda opts: next(o for o in opts if o.startswith("Keep both"))])
+    runner._select_popup = lambda title, options: next(picks)(options)
+
+    runner._resume_shared_session_menu()
+
+    assert backend.imported_as_id == "claude-copy-id"  # re-imported under the fresh id
+    assert resumed == [("sess", "claude-copy-id")]  # and resumed that copy
+    assert AgitState(repo.repo).shared_origin_name("claude-copy-id") == "sess"
 
 
 # --- auto-share opt-in state ------------------------------------------------
@@ -381,6 +442,26 @@ def test_claude_export_and_import_retargets_cwd(tmp_path, monkeypatch):
     assert (claude._project_dir(dst) / "sid.jsonl").read_text() == "LOCAL"
 
 
+def test_claude_import_as_id_keeps_both_under_a_new_id(tmp_path, monkeypatch):
+    # "Keep both": re-import a shared conversation under a fresh id so it lives
+    # alongside the existing local copy of the same id.
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    from agit.transcripts import claude
+
+    dst = tmp_path / "repo"
+    dst.mkdir()
+    raw = '{"type":"user","sessionId":"sid","cwd":"/old"}\n{"type":"assistant","sessionId":"sid"}\n'
+    claude.import_shared_session(dst, "sid", raw)  # the original copy
+    assert claude.import_shared_session(dst, "sid", raw, as_id="newid")
+
+    # Both copies exist; the new one is re-id'd and cwd-retargeted.
+    assert claude.session_belongs_to_repo(dst, "sid")
+    assert claude.session_belongs_to_repo(dst, "newid")
+    copy = (claude._project_dir(dst) / "newid.jsonl").read_text()
+    assert '"sessionId": "newid"' in copy and '"sid"' not in copy
+    assert str(dst.resolve()) in copy
+
+
 # --- OpenCode transcript export / import ------------------------------------
 
 
@@ -434,6 +515,25 @@ def test_opencode_import_runs_cli_and_checks_success(monkeypatch, tmp_path):
     assert captured["content"] == '{"info":{"id":"ses_1"}}'
     # The temp file is cleaned up afterwards.
     assert not Path(captured["args"][-1]).exists()
+
+
+def test_opencode_import_as_id_reids_for_keep_both(monkeypatch, tmp_path):
+    # "Keep both" for OpenCode: every occurrence of the old id token is swapped
+    # for the new one before import, so it lands as a separate session.
+    from agit.transcripts import opencode
+
+    captured: dict[str, object] = {}
+
+    def fake_run(repo, args):
+        captured["content"] = Path(args[-1]).read_text()
+        return ("Imported session: ses_new\n", 0)
+
+    monkeypatch.setattr(opencode, "_run_opencode_pty", fake_run)
+    raw = '{"info":{"id":"ses_old"},"messages":[{"sessionID":"ses_old"}]}'
+    assert opencode.import_shared_session(tmp_path, "ses_old", raw, as_id="ses_new") is True
+    # The transcript handed to `opencode import` is fully re-id'd.
+    assert "ses_old" not in captured["content"]
+    assert captured["content"].count("ses_new") == 2
 
 
 def test_opencode_import_failure_paths(monkeypatch, tmp_path):
@@ -510,9 +610,13 @@ class _StubBackend:
     def has_local_session(self, repo, session_id):
         return self._has_local
 
-    def import_shared_session(self, repo, session_id, transcript, *, overwrite=False):
+    def import_shared_session(self, repo, session_id, transcript, *, overwrite=False, as_id=None):
         self.imported = (session_id, transcript, overwrite)
+        self.imported_as_id = as_id
         return True
+
+    def new_import_id(self):
+        return "claude-copy-id"
 
 
 def _runner_with_store(tmp_path, monkeypatch, backend):
@@ -881,7 +985,7 @@ def test_opencode_agent_delegates_sharing_to_transcript_module(tmp_path, monkeyp
     monkeypatch.setattr(opencode_session, "session_transcript_size", record("size", None))
     monkeypatch.setattr(opencode_session, "has_imported_session", record("has", True))
 
-    def fake_import(repo, sid, text, *, overwrite=False):
+    def fake_import(repo, sid, text, *, overwrite=False, as_id=None):
         calls["import"] = (repo, sid, text, overwrite)
         return True
 

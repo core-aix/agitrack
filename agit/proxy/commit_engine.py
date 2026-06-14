@@ -69,7 +69,7 @@ import threading
 import time
 from typing import Callable
 
-from agit.commits import build_agent_commit_message
+from agit.commits import build_agent_commit_message, render_interaction_trace
 from agit.git import GitRepo
 from agit.transcripts.opencode import SessionTurn
 from agit.transcripts import turns_after
@@ -86,7 +86,7 @@ _StageUntrackedFn = Callable[[GitRepo, AgitState], None]
 _PreCommitFn = Callable[[], None]
 """Called immediately before the ``git commit`` (e.g. ``_ensure_turn_branch``)."""
 
-_OnCommitFn = Callable[[str | None], None]
+_OnCommitFn = Callable[[str | None, str], None]
 """Called with the short commit SHA after a successful commit (may be None)."""
 
 _DebugFn = Callable[..., None]
@@ -353,10 +353,17 @@ class CommitEngine:
             )
         else:
             commit_sha = self.repo.commit(message)
+        # Render the interaction trace exactly as it landed in the commit, BEFORE
+        # clearing it, and hand it to on_commit_fn — this is the summarizer's sole
+        # input. (Capturing it in the caller before commit_turns was wrong: the
+        # proxy branch above clears pending_trace and rebuilds it from the turns,
+        # so a pre-commit capture saw only stray leftover prompts, which made the
+        # summary empty/garbage and often unusable.)
+        trace_text = render_interaction_trace(self.state.pending_trace(), self.state.trace_turn_limit)
         self.state.clear_trace()
 
         if on_commit_fn is not None:
-            on_commit_fn(commit_sha)
+            on_commit_fn(commit_sha, trace_text)
 
         return True
 

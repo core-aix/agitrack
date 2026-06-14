@@ -33,14 +33,23 @@ class ProxyAgent(Protocol):
         """Whether ``repo`` already holds this session locally (so resuming it would
         keep the local copy unless explicitly overwritten)."""
 
-    def import_shared_session(self, repo: Path, session_id: str, transcript: str, *, overwrite: bool = False) -> bool:
+    def import_shared_session(
+        self, repo: Path, session_id: str, transcript: str, *, overwrite: bool = False, as_id: str | None = None
+    ) -> bool:
         """Install a shared transcript so the session can be resumed in ``repo``.
-        With ``overwrite`` it replaces an existing local copy (pull-latest). Returns
-        True on success; False if unsupported."""
+        With ``overwrite`` it replaces an existing local copy (pull-latest). With
+        ``as_id`` it installs the conversation under a NEW id (the "keep both" path
+        for an id that already exists locally). Returns True on success; False if
+        unsupported."""
 
     def new_session_id(self) -> str | None:
         """A session id to start a fresh session with, or None to let the
         backend choose one that aGiT will discover afterwards."""
+
+    def new_import_id(self) -> str | None:
+        """A fresh id to re-import a shared conversation under, so it can live
+        alongside an existing local copy of the same id ("keep both"). None when
+        the backend can't re-id an imported session."""
 
     def spawn_command(self, repo: Path, *, session_id: str | None, resume: bool) -> list[str]: ...
 
@@ -96,12 +105,19 @@ class OpenCodeProxyAgent:
     def has_local_session(self, repo: Path, session_id: str) -> bool:
         return opencode_session.has_imported_session(repo, session_id)
 
-    def import_shared_session(self, repo: Path, session_id: str, transcript: str, *, overwrite: bool = False) -> bool:
-        return opencode_session.import_shared_session(repo, session_id, transcript, overwrite=overwrite)
+    def import_shared_session(
+        self, repo: Path, session_id: str, transcript: str, *, overwrite: bool = False, as_id: str | None = None
+    ) -> bool:
+        return opencode_session.import_shared_session(repo, session_id, transcript, overwrite=overwrite, as_id=as_id)
 
     def new_session_id(self) -> str | None:
         # OpenCode assigns its own session id; aGiT discovers it after the run.
         return None
+
+    def new_import_id(self) -> str | None:
+        # OpenCode ids are "ses_"-prefixed tokens; mint one so a shared session can
+        # be re-imported alongside an existing local copy ("keep both").
+        return "ses_" + uuid.uuid4().hex
 
     def spawn_command(self, repo: Path, *, session_id: str | None, resume: bool) -> list[str]:
         command = ["opencode"]
@@ -154,12 +170,18 @@ class ClaudeProxyAgent:
     def has_local_session(self, repo: Path, session_id: str) -> bool:
         return claude_session.has_imported_session(repo, session_id)
 
-    def import_shared_session(self, repo: Path, session_id: str, transcript: str, *, overwrite: bool = False) -> bool:
-        return claude_session.import_shared_session(repo, session_id, transcript, overwrite=overwrite)
+    def import_shared_session(
+        self, repo: Path, session_id: str, transcript: str, *, overwrite: bool = False, as_id: str | None = None
+    ) -> bool:
+        return claude_session.import_shared_session(repo, session_id, transcript, overwrite=overwrite, as_id=as_id)
 
     def new_session_id(self) -> str | None:
         # Claude accepts an explicit session id, so aGiT picks one up front and
         # knows exactly which transcript to read.
+        return str(uuid.uuid4())
+
+    def new_import_id(self) -> str | None:
+        # A fresh uuid to re-import a shared conversation under ("keep both").
         return str(uuid.uuid4())
 
     def spawn_command(self, repo: Path, *, session_id: str | None, resume: bool) -> list[str]:

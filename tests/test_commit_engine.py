@@ -149,7 +149,7 @@ def test_commit_turns_calls_pre_commit_fn(tmp_path):
     assert called == [True]
 
 
-def test_commit_turns_calls_on_commit_fn_with_sha(tmp_path):
+def test_commit_turns_calls_on_commit_fn_with_sha_and_trace(tmp_path):
     engine, repo, state = _engine(tmp_path)
     received = []
     engine.commit_turns(
@@ -158,9 +158,15 @@ def test_commit_turns_calls_on_commit_fn_with_sha(tmp_path):
         backend_session_id="s1",
         model="m",
         stage_untracked_fn=_noop_stage,
-        on_commit_fn=lambda sha: received.append(sha),
+        on_commit_fn=lambda sha, trace: received.append((sha, trace)),
     )
-    assert received == ["dead1234"]
+    assert len(received) == 1
+    sha, trace = received[0]
+    assert sha == "dead1234"
+    # The trace handed to the callback is the real, rebuilt interaction trace
+    # (the summarizer's input), not an empty/stale one.
+    assert "## User" in trace and "do it" in trace
+    assert "## Agent" in trace and "done" in trace
 
 
 def test_commit_turns_subject_joins_multiple_prompts(tmp_path):

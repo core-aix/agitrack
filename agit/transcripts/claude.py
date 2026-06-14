@@ -258,7 +258,9 @@ def has_imported_session(repo: Path, session_id: str) -> bool:
     return bool(session_id) and _session_path(Path(repo), session_id).is_file()
 
 
-def import_shared_session(repo: Path, session_id: str, transcript: str, *, overwrite: bool = False) -> bool:
+def import_shared_session(
+    repo: Path, session_id: str, transcript: str, *, overwrite: bool = False, as_id: str | None = None
+) -> bool:
     """Write a shared transcript into ``repo``'s Claude project dir as
     ``<session_id>.jsonl`` so a subsequent ``claude --resume <session_id>`` finds
     it (the normal resume path then links it into the session worktree). The
@@ -268,25 +270,33 @@ def import_shared_session(repo: Path, session_id: str, transcript: str, *, overw
     By default an existing local copy is kept (no clobber). With ``overwrite`` —
     the "pull the latest shared version" path for syncing your own session between
     machines — the local copy is *replaced*; it is unlinked first so a hardlink to
-    a live worktree copy is broken rather than stomped. Returns True when in place."""
+    a live worktree copy is broken rather than stomped.
+
+    With ``as_id`` the conversation is installed under a NEW id instead (its
+    ``sessionId`` fields are rewritten), so it can be resumed as a SEPARATE local
+    session alongside an existing copy of the same conversation — the "keep both"
+    path for an id that already exists locally. Returns True when in place."""
     if not session_id or not transcript:
         return False
     repo = Path(repo)
+    effective_id = as_id or session_id
     target_dir = _project_dir(repo)
-    target = target_dir / f"{session_id}.jsonl"
-    if target.is_file() and not overwrite:
+    target = target_dir / f"{effective_id}.jsonl"
+    if target.is_file() and not overwrite and as_id is None:
         return True  # already have this conversation locally — don't clobber it
     try:
         target_dir.mkdir(parents=True, exist_ok=True)
         target.unlink(missing_ok=True)  # break any hardlink before replacing
-        target.write_text(_retarget_cwd(transcript, str(repo.resolve())), encoding="utf-8")
+        body = _retarget_rows(transcript, cwd=str(repo.resolve()), new_session_id=as_id)
+        target.write_text(body, encoding="utf-8")
     except OSError:
         return False
     return True
 
 
-def _retarget_cwd(transcript: str, cwd: str) -> str:
-    """Rewrite every row's ``cwd`` to ``cwd``, leaving non-JSON lines untouched."""
+def _retarget_rows(transcript: str, *, cwd: str, new_session_id: str | None = None) -> str:
+    """Rewrite every row's ``cwd`` (and, when ``new_session_id`` is given, its
+    ``sessionId``), leaving non-JSON lines untouched."""
     out: list[str] = []
     for line in transcript.split("\n"):
         stripped = line.strip()
@@ -298,8 +308,11 @@ def _retarget_cwd(transcript: str, cwd: str) -> str:
         except json.JSONDecodeError:
             out.append(line)
             continue
-        if isinstance(row, dict) and "cwd" in row:
-            row["cwd"] = cwd
+        if isinstance(row, dict) and ("cwd" in row or (new_session_id and "sessionId" in row)):
+            if "cwd" in row:
+                row["cwd"] = cwd
+            if new_session_id and "sessionId" in row:
+                row["sessionId"] = new_session_id
             out.append(json.dumps(row))
         else:
             out.append(line)

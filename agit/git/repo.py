@@ -399,10 +399,24 @@ class GitRepo:
     def remote_exists(self, name: str = "origin") -> bool:
         return name in self._run(["git", "remote"], check=False).stdout.split()
 
-    def fetch_ref(self, refspec: str, *, remote: str = "origin") -> bool:
+    def fetch_ref(self, refspec: str, *, remote: str = "origin", filter_blobs: str | None = None) -> bool:
         """Fetch a single refspec (e.g. ``+refs/agit/x:refs/agit/x``). Returns
-        True on success; False on any failure (offline, no such ref yet, …)."""
-        return self._run(["git", "fetch", remote, refspec], check=False).returncode == 0
+        True on success; False on any failure (offline, no such ref yet, …).
+
+        With ``filter_blobs`` (e.g. ``blob:limit=16k``) the fetch skips large blobs
+        — used to pull a shared-session ref's small manifests for listing without
+        downloading every transcript; the transcripts are fetched on demand. The
+        one-off partial fetch's persisted filter is then dropped so the user's
+        normal ``git fetch`` stays full."""
+        cmd = ["git", "fetch"]
+        if filter_blobs:
+            cmd.append(f"--filter={filter_blobs}")
+        cmd += [remote, refspec]
+        ok = self._run(cmd, check=False).returncode == 0
+        if filter_blobs and ok:
+            # Don't turn the user's remote into a permanently-filtered clone.
+            self._run(["git", "config", "--unset", f"remote.{remote}.partialclonefilter"], check=False)
+        return ok
 
     def push_ref(
         self, refspec: str, *, remote: str = "origin", force_with_lease: str | None = None

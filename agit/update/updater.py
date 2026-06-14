@@ -61,6 +61,7 @@ class UpdateStatus:
     behind: int = 0  # commits behind upstream (source installs only)
     message: str = ""  # human-readable summary for the UI
     error: str | None = None  # set when the check could not complete
+    restart_only: bool = False  # code is already current on disk; only a restart is needed
 
     @property
     def ok(self) -> bool:
@@ -119,6 +120,12 @@ class Updater:
         self._source_repo: Path | None = (
             detect_source_repo() if source_repo is _DETECT else cast("Path | None", source_repo)
         )
+        # The source HEAD the running process was loaded from, snapshotted on the
+        # first check (≈ process start). After a self-update fast-forwards the
+        # checkout under a still-running process, this lets us see the running code
+        # is older than what's on disk and prompt a restart, instead of reporting
+        # "up to date" off the checkout alone.
+        self._running_rev: str | None = None
 
     @property
     def kind(self) -> str:
@@ -168,14 +175,28 @@ class Updater:
             status.error = behind.stderr.strip() or "could not compare against upstream"
             return status
         status.behind = int(behind.stdout.strip() or "0")
+        head = _git(["rev-parse", "HEAD"], repo).stdout.strip()
+        if self._running_rev is None:  # first check ≈ process start: snapshot the running HEAD
+            self._running_rev = head
+        running_stale = bool(self._running_rev) and self._running_rev != head
         status.current = _git(["rev-parse", "--short", "HEAD"], repo).stdout.strip()
         status.latest = _git(["rev-parse", "--short", upstream], repo).stdout.strip()
-        status.available = status.behind > 0
-        if status.available:
+        if status.behind > 0:
+            status.available = True
             commits = "commit" if status.behind == 1 else "commits"
             status.message = (
                 f"aGiT update available: {status.behind} new {commits} on {upstream} "
                 f"({status.current} → {status.latest})."
+            )
+        elif running_stale:
+            # The checkout was already updated (e.g. by a prior self-update or a
+            # manual pull) but this process is still running the old code.
+            status.available = True
+            status.restart_only = True
+            status.current = self._running_rev[:7]
+            status.message = (
+                f"aGiT was updated on disk but the running copy is older "
+                f"({status.current} → {status.latest}); restart to load it."
             )
         else:
             status.message = "aGiT is up to date."
@@ -183,15 +204,26 @@ class Updater:
 
     def _check_package(self) -> UpdateStatus:
         status = UpdateStatus(kind=KIND_PACKAGE)
-        status.current = self._installed_version()
+        installed = self._installed_version()
+        status.current = installed
         latest = self._latest_package_version()
         if latest is None:
             status.error = "could not determine the latest published aGiT version"
             return status
         status.latest = latest
-        status.available = _version_tuple(latest) > _version_tuple(status.current)
-        if status.available:
-            status.message = f"aGiT update available: {status.current} → {latest}."
+        running = self._running_version()
+        index_newer = _version_tuple(latest) > _version_tuple(installed)
+        running_stale = _version_tuple(installed) > _version_tuple(running)
+        if index_newer:
+            status.available = True
+            status.message = f"aGiT update available: {installed} → {latest}."
+        elif running_stale:
+            # The package on disk was already upgraded (e.g. `pip install -U`) but
+            # this process is still running the old version.
+            status.available = True
+            status.restart_only = True
+            status.current = running
+            status.message = f"aGiT {installed} is installed but the running copy is {running}; restart to load it."
         else:
             status.message = "aGiT is up to date."
         return status
@@ -203,6 +235,12 @@ class Updater:
             return metadata.version(DIST_NAME)
         except Exception:
             return getattr(agit, "__version__", "0")
+
+    def _running_version(self) -> str:
+        # The version this process actually imported at startup. ``agit.__version__``
+        # is read once at import, so after an in-place upgrade it still reflects the
+        # OLD version while :meth:`_installed_version` reads the new one from disk.
+        return getattr(agit, "__version__", "0")
 
     def _latest_package_version(self) -> str | None:
         # `pip index versions` is the most portable way to ask the configured
