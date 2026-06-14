@@ -153,9 +153,15 @@ def test_cover_refused_when_head_is_not_the_latest_backend_commit(tmp_path):
     assert repo.commit_message("HEAD").startswith("internal change")
 
 
-def test_staged_changes_commit_lists_backend_commits_as_covered(tmp_path):
+def test_staged_changes_commit_covers_backend_and_tracks_all_changes(tmp_path):
+    # Backend committed a.txt, then there are further (uncommitted) changes on top.
+    # The aGiT commit must COVER the backend commit AND track all the file changes
+    # — the covered commit's plus the extra staged ones — as a merge-shaped cover,
+    # not hide them behind a plain single-parent commit that only shows the extra
+    # delta (#35).
     repo, _base = _repo_on_turn_branch(tmp_path)
     state = AgitState(tmp_path)
+    turn_start = repo.rev_parse("HEAD")
     backend_sha = _backend_commit(repo, "a.txt", "backend commit")
     (repo.repo / "a.txt").write_text("further uncommitted work\n", encoding="utf-8")
 
@@ -165,9 +171,15 @@ def test_staged_changes_commit_lists_backend_commits_as_covered(tmp_path):
     head_message = repo.commit_message("HEAD")
     assert head_message.startswith("<aGiT> add the feature")
     assert f"covered_commits: {repo.short_sha(backend_sha)}" in head_message
-    # The backend's own commit is preserved below, message intact.
-    assert repo.rev_parse("HEAD^") == backend_sha
-    assert repo.commit_message("HEAD^").startswith("backend commit")
+    # Merge-shaped cover: first parent is the turn start (so --first-parent shows
+    # the whole change), second parent is the backend commit, preserved intact.
+    assert repo.rev_parse("HEAD^1") == turn_start
+    assert repo.rev_parse("HEAD^2") == backend_sha
+    assert repo.commit_message("HEAD^2").startswith("backend commit")
+    # The cover's first-parent diff tracks the full a.txt change, including the
+    # staged work layered on top of the backend's commit.
+    first_parent_diff = repo.diff_range(turn_start, "HEAD")
+    assert "further uncommitted work" in first_parent_diff
 
 
 def test_cover_commit_survives_summary_amend_with_parents_intact(tmp_path):
