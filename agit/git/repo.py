@@ -118,15 +118,26 @@ class GitRepo:
         self._run(["git", "commit", "--amend", "-F", "-"], input_text=message)
         return self.short_sha("HEAD")
 
-    def cover_commit(self, message: str, *, first_parent: str, second_parent: str) -> str:
-        """Create a merge-shaped *cover* commit: the tree of ``second_parent``
-        with parents ``(first_parent, second_parent)`` — the same shape as a
-        GitHub PR merge commit. Used to attach aGiT's message on top of
-        backend-made commits without amending them, since an amend changes
-        their hashes and breaks references already published elsewhere (#58).
-        The checked-out branch (or detached HEAD) moves to the new commit; the
-        working tree is untouched because the tree is identical to HEAD's."""
-        tree = self.rev_parse(f"{second_parent}^{{tree}}")
+    def cover_commit(self, message: str, *, first_parent: str, second_parent: str, include_staged: bool = False) -> str:
+        """Create a merge-shaped *cover* commit with parents ``(first_parent,
+        second_parent)`` — the same shape as a GitHub PR merge commit. Used to
+        attach aGiT's message on top of backend-made commits without amending
+        them, since an amend changes their hashes and breaks references already
+        published elsewhere (#58). The checked-out branch (or detached HEAD)
+        moves to the new commit.
+
+        By default the tree is ``second_parent``'s, so the cover is a pure
+        metadata commit (working tree untouched). With ``include_staged`` the
+        tree is the current index instead, folding any extra staged changes (e.g.
+        files aGiT staged on top of the backend's commits) into the cover — so the
+        cover's first-parent diff shows ALL the covered commits' changes plus the
+        staged ones as one unit, instead of a plain commit that shows only the
+        extra delta and hides the covered changes behind its single parent."""
+        tree = (
+            self._run(["git", "write-tree"]).stdout.strip()
+            if include_staged
+            else self.rev_parse(f"{second_parent}^{{tree}}")
+        )
         sha = self._run(
             ["git", "commit-tree", tree, "-p", first_parent, "-p", second_parent],
             input_text=message,
