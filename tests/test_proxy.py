@@ -2895,7 +2895,7 @@ def test_resume_uses_original_worktree_when_name_is_free():
     runner._resume_conversation("session-2", "past-xyz")
 
     # "session-2" is not a live session, so resume in its original worktree.
-    assert runner.__dict__.get("_created") == [("session-2", {"resume_session_id": "past-xyz"})]
+    assert runner.__dict__.get("_created") == [("session-2", {"resume_session_id": "past-xyz", "backend": None})]
 
 
 def test_resume_uses_fresh_name_when_colliding_with_live_session():
@@ -2905,7 +2905,7 @@ def test_resume_uses_fresh_name_when_colliding_with_live_session():
     # A past conversation that ran in "session-1" — but session-1 is live now.
     runner._resume_conversation("session-1", "past-xyz")
 
-    assert runner.__dict__.get("_created") == [("session-3", {"resume_session_id": "past-xyz"})]
+    assert runner.__dict__.get("_created") == [("session-3", {"resume_session_id": "past-xyz", "backend": None})]
 
 
 def test_resume_switches_to_already_live_conversation():

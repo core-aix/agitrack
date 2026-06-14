@@ -2259,8 +2259,8 @@ class ProxyRunner:
             options.append("↻ Resume a past conversation…")
             actions.append(("resume-past", None))
         # "Share" is offered for every backend so the user gets a clear answer;
-        # unsupported backends (OpenCode has no portable transcript) say so when
-        # chosen. "Resume a shared session" only appears where it can actually work.
+        # a backend without a portable transcript says so when chosen. "Resume a
+        # shared session" only appears where it can actually work.
         options.append("⇪ Share this session with collaborators…")
         actions.append(("share", None))
         if getattr(self.backend, "supports_session_sharing", False):
@@ -2481,9 +2481,11 @@ class ProxyRunner:
         ref = sessions[options.index(choice)]
         self._resume_conversation(names.get(ref.id) or self._next_session_name(), ref.id)
 
-    def _resume_conversation(self, name: str, session_id: str) -> None:
+    def _resume_conversation(self, name: str, session_id: str, *, backend: str | None = None) -> None:
         # If this conversation is already live, just switch to it; otherwise
-        # create a worktree for it and resume the backend by id there.
+        # create a worktree for it and resume the backend by id there. ``backend``
+        # pins the new session to a specific backend (e.g. resuming a shared
+        # OpenCode session while the active backend is Claude).
         for index, session in enumerate(self.sessions):
             if getattr(getattr(session, "state", None), "backend_session_id", None) == session_id:
                 self._switch_active(index)
@@ -2493,7 +2495,7 @@ class ProxyRunner:
             # under a fresh name so the two don't share a worktree (which would
             # run two backends in one directory).
             name = self._next_session_name()
-        self._new_session(name, resume_session_id=session_id)
+        self._new_session(name, resume_session_id=session_id, backend=backend)
 
     def _live_session_name_taken(self, name: str) -> bool:
         sanitized = _sanitize_name(name)
@@ -2525,7 +2527,7 @@ class ProxyRunner:
         if not getattr(backend, "supports_session_sharing", False):
             self._set_message(
                 f"Sharing sessions isn't supported for the {backend.name} backend yet — "
-                "only Claude sessions can be shared (they have a portable transcript).",
+                "it has no portable transcript to share.",
                 seconds=10.0,
             )
             self._render()
@@ -2877,6 +2879,21 @@ class ProxyRunner:
             self._set_message("That shared session is incomplete; cannot resume it.")
             self._render()
             return
+        # Resume with the backend the session was recorded by, not necessarily the
+        # active one — a shared OpenCode session must be imported/resumed by the
+        # OpenCode agent even while Claude is active (and vice versa). Reuse the
+        # active agent when it already matches; only build a fresh one to cross
+        # backends.
+        entry_backend = entry.manifest.get("backend") or self.backend.name
+        if entry_backend == self.backend.name:
+            agent = self.backend
+        else:
+            try:
+                agent = make_proxy_agent(entry_backend)
+            except ValueError:
+                self._set_message(f"Can't resume '{entry.display}': unknown backend '{entry_backend}'.", seconds=8.0)
+                self._render()
+                return
         # If this conversation is already live, just switch to it — never overwrite a
         # running session. Otherwise, if a (dormant) local copy exists, ask whether to
         # pull the shared version (the "continue on another machine" sync) or keep the
@@ -2885,7 +2902,7 @@ class ProxyRunner:
             getattr(getattr(s, "state", None), "backend_session_id", None) == session_id for s in self.sessions
         )
         overwrite = False
-        if not already_live and self.backend.has_local_session(self.base_repo.repo, session_id):
+        if not already_live and agent.has_local_session(self.base_repo.repo, session_id):
             age = self._format_age(entry.manifest["updated"]) if entry.manifest.get("updated") else "earlier"
             pick = self._select_popup(
                 f"You already have a local copy of {entry.display}.\n"
@@ -2897,11 +2914,11 @@ class ProxyRunner:
                 self._render()
                 return
             overwrite = pick.startswith("Pull")
-        if not self.backend.import_shared_session(self.base_repo.repo, session_id, transcript, overwrite=overwrite):
+        if not agent.import_shared_session(self.base_repo.repo, session_id, transcript, overwrite=overwrite):
             self._set_message("Could not install the shared session for resume.")
             self._render()
             return
-        self._resume_conversation(f"{entry.github_id}-{entry.name}", session_id)
+        self._resume_conversation(f"{entry.github_id}-{entry.name}", session_id, backend=entry_backend)
 
     def _format_age(self, updated: float) -> str:
         delta = max(0, int(time.time() - (updated or 0)))
