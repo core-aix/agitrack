@@ -105,6 +105,9 @@ def dashboard_data(dash: Dashboard) -> dict:
                 # The merged committer identity, so name variants of one person
                 # collapse to a single filter/breakdown entry (#54).
                 "author": dash.label_of(stat),
+                # Every committer credited (primary author + human co-authors), so
+                # a co-authored commit is filterable under each of them (#54).
+                "committers": dash.committers_of(stat),
                 "subject": stat.subject,
                 "kind": stat.kind,
                 "backend": stat.backend,
@@ -133,7 +136,7 @@ def dashboard_data(dash: Dashboard) -> dict:
         # HEAD sha lets the live page skip re-rendering when nothing changed.
         "head": dash.stats[-1].sha if dash.stats else "",
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-        "committers": sorted({c["author"] for c in commits if c["author"]}),
+        "committers": sorted({a for stat in dash.stats for a in dash.committers_of(stat) if a}),
         "backends": sorted({c["eff_backend"] for c in commits if c["eff_backend"]}),
         "models": sorted({c["eff_model"] for c in commits if c["eff_model"]}),
         "commits": commits,
@@ -187,7 +190,7 @@ def _filter_stats(dash: Dashboard, *, author: str, backend: str, model: str, frm
     covers = _covers(dash)
     out: list[CommitStat] = []
     for stat in dash.stats:
-        if author and dash.label_of(stat) != author:
+        if author and author not in dash.committers_of(stat):
             continue
         eff_backend, eff_model = _effective(stat, covers)
         if backend and eff_backend != backend:
@@ -336,7 +339,7 @@ def _options(dash: Dashboard) -> dict:
     covers = _covers(dash)
     committers, backends, models = set(), set(), set()
     for stat in dash.stats:
-        committers.add(dash.label_of(stat))
+        committers.update(dash.committers_of(stat))
         eff_backend, eff_model = _effective(stat, covers)
         if eff_backend:
             backends.add(eff_backend)
@@ -381,6 +384,7 @@ def _log_entry(dash: Dashboard, stat: CommitStat, covers: dict[str, CommitStat])
     return {
         "short": stat.short,
         "author": dash.label_of(stat),
+        "committers": dash.committers_of(stat),
         "subject": stat.subject,
         "kind": stat.kind,
         "eff_backend": eff_backend,
@@ -1179,7 +1183,9 @@ function toggleDetail(i){
     const link = c.url ? `<a href="${esc(c.url)}" target="_blank" rel="noopener">view on GitHub ↗</a>` : "";
     const span = (c.started||c.ended)
       ? `<div class="dmeta">AI conversation: ${esc(c.started||"?")} → ${esc(c.ended||"?")}</div>` : "";
-    detail.innerHTML = `<div class="dhead">${esc(c.short)} ${link}</div>${span}`+
+    const who = (c.committers&&c.committers.length)
+      ? `<div class="dmeta">committer${c.committers.length>1?"s":""}: ${c.committers.map(esc).join(", ")}</div>` : "";
+    detail.innerHTML = `<div class="dhead">${esc(c.short)} ${link}</div>${who}${span}`+
       `<div class="dmsg md">${md(c.message||"(no message recorded)")}</div>${partsHtml(c.parts)}`;
     detail.hidden = false;
   } else {
