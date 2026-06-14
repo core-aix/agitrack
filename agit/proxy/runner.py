@@ -44,6 +44,7 @@ from agit.proxy.commit_engine import CommitEngine
 from agit.proxy.integration import IntegrationService, MergeContext, MergePhase
 from agit.proxy.process import BackendProcess
 from agit.proxy.session import Session
+from agit.transcripts import SessionRef
 
 
 # Palette helpers, _BackgroundColorEraseScreen, and detect_color_mode live in
@@ -2476,6 +2477,16 @@ class ProxyRunner:
             if ref.id not in seen:
                 seen.add(ref.id)
                 refs.append(ref)
+        # A session that produced no commits still reserves its name in the durable
+        # record, but the backend may no longer enumerate it (no transcript under a
+        # current worktree path). Surface those named conversations too, so a
+        # reserved name is never stranded — unresumable yet un-reusable (#75).
+        # Resuming one recreates its worktree under the saved name and continues the
+        # conversation if the backend still has it, or starts fresh there if not.
+        for sid, name in self._agit_named_sessions().items():
+            if sid and sid not in seen:
+                seen.add(sid)
+                refs.append(SessionRef(id=sid, updated=0.0, label=name))
         refs = sorted(refs, key=lambda ref: getattr(ref, "updated", 0) or 0, reverse=True)
         return refs[: self.RESUME_LIST_LIMIT]
 
