@@ -91,7 +91,15 @@ class SharedSessionStore:
             return {}
 
     def read_transcript(self, entry: SharedEntry) -> str | None:
-        return self.repo.read_ref_blob(self.ref, f"{self._prefix()}{entry.github_id}/{entry.name}/transcript.jsonl")
+        path = f"{self._prefix()}{entry.github_id}/{entry.name}/transcript.jsonl"
+        blob = self.repo.read_ref_blob(self.ref, path)
+        if blob is None and self.repo.remote_exists():
+            # The listing fetch pulls only the small manifests (see `fetch`), so a
+            # large transcript may not be local yet — fetch the full ref now that
+            # the user has actually chosen this session, then read it.
+            self.repo.fetch_ref(f"+{self.ref}:{self.ref}")
+            blob = self.repo.read_ref_blob(self.ref, path)
+        return blob
 
     # --- writing -----------------------------------------------------------
 
@@ -133,10 +141,18 @@ class SharedSessionStore:
     # --- sync --------------------------------------------------------------
 
     def fetch(self) -> bool:
-        """Pull the latest shared ref from the remote (best-effort)."""
+        """Pull the latest shared ref from the remote (best-effort).
+
+        Fetches only the small manifests (a blob-size filter skips the large
+        transcripts) so listing which sessions exist is fast; the transcript of a
+        chosen session is fetched on demand by :meth:`read_transcript`. Falls back
+        to a full fetch when the remote doesn't support partial fetch."""
         if not self.repo.remote_exists():
             return False
-        return self.repo.fetch_ref(f"+{self.ref}:{self.ref}")
+        refspec = f"+{self.ref}:{self.ref}"
+        if self.repo.fetch_ref(refspec, filter_blobs="blob:limit=16k"):
+            return True
+        return self.repo.fetch_ref(refspec)
 
     def _is_session_snapshot(self, commit_sha: str) -> bool:
         # A shared-session snapshot commit is parent-less (an orphan we wrote) and

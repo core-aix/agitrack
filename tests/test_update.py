@@ -88,6 +88,23 @@ def test_source_check_detects_upstream_commits(source_clone):
     assert "2 new commits" in status.message
 
 
+def test_source_check_restart_when_checkout_updated_under_running_process(source_clone):
+    # The checkout was fast-forwarded (a prior self-update, or a manual pull) while
+    # this process kept running the old code. The check must see the running copy
+    # is stale and offer a restart, even though HEAD is now in sync with upstream.
+    remote, clone = source_clone
+    updater = Updater(source_repo=clone)
+    assert updater.check().available is False  # first check snapshots the running HEAD (in sync)
+
+    _commit(remote, "agit.py", "v2\n", "second")
+    Updater(source_repo=clone).apply()  # a separate actor fast-forwards the checkout
+
+    status = updater.check()  # same process: its running code is now older than disk
+    assert status.available is True
+    assert status.restart_only is True
+    assert "restart" in status.message.lower()
+
+
 def test_source_check_errors_without_upstream(tmp_path: Path):
     repo = tmp_path / "solo"
     _init_repo(repo)
@@ -110,7 +127,11 @@ def test_source_apply_fast_forwards(source_clone):
     assert result.ok, result.error
     # The clone now carries the remote's content and is back in sync.
     assert (clone / "agit.py").read_text() == "v2\n"
-    assert updater.check().available is False
+    # The checkout is current, but THIS process is still running the pre-update
+    # code, so the next check asks for a restart (not another download). In a real
+    # run apply() is immediately followed by a re-exec, so this is never observed.
+    after = updater.check()
+    assert after.available is True and after.restart_only is True
 
 
 def test_source_apply_refuses_dirty_tree(source_clone):
@@ -148,8 +169,22 @@ def test_package_check_available(monkeypatch):
 def test_package_check_up_to_date(monkeypatch):
     updater = Updater(source_repo=None)
     monkeypatch.setattr(updater, "_installed_version", lambda: "1.2.0")
+    monkeypatch.setattr(updater, "_running_version", lambda: "1.2.0")  # running == installed
     monkeypatch.setattr(updater, "_latest_package_version", lambda: "1.2.0")
     assert updater.check().available is False
+
+
+def test_package_check_restart_when_running_is_stale(monkeypatch):
+    # The package on disk was already upgraded, but this process still runs the
+    # old version — the check must offer a restart, not report "up to date".
+    updater = Updater(source_repo=None)
+    monkeypatch.setattr(updater, "_installed_version", lambda: "1.3.0")
+    monkeypatch.setattr(updater, "_running_version", lambda: "1.2.0")
+    monkeypatch.setattr(updater, "_latest_package_version", lambda: "1.3.0")  # index == installed
+    status = updater.check()
+    assert status.available is True
+    assert status.restart_only is True
+    assert "restart" in status.message.lower()
 
 
 def test_package_check_errors_when_index_unreachable(monkeypatch):

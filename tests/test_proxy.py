@@ -3047,6 +3047,46 @@ def test_share_name_uses_remembered_origin_over_local_name():
     assert runner._share_name_for(None) == "my-local-rename"
 
 
+def test_new_session_stages_transcript_before_spawn_when_resuming(tmp_path, monkeypatch):
+    # Resuming a shared session must stage its transcript into the fresh worktree
+    # BEFORE spawning `--resume`, or the backend can't find it and the session
+    # never loads (the transcript was imported under the base repo, not here).
+    import types
+
+    from agit.proxy import runner as runner_module
+
+    runner = make_runner(name="main")
+    runner._use_worktrees = True
+    runner.global_config = types.SimpleNamespace(default_backend="claude")
+    info = types.SimpleNamespace(name="bob-feature", path=tmp_path)
+    repo = types.SimpleNamespace(repo=tmp_path, current_branch=lambda: "agit/claude/bob-feature/t1")
+    runner._open_session_worktree = lambda name: (info, repo)
+    monkeypatch.setattr(runner_module, "make_proxy_agent", lambda name: types.SimpleNamespace(name=name))
+    monkeypatch.setattr(runner_module, "AgitActions", lambda *a, **k: types.SimpleNamespace())
+
+    order: list = []
+    runner._stage_backend_resume = lambda sid: order.append(("stage", sid))
+    runner._spawn = lambda: order.append(("spawn", None))
+    for name in (
+        "_turn_from_branch",
+        "_persist_session_name",
+        "_sanitize_state_trace",
+        "_initialize_session_baseline",
+        "_init_screen",
+        "_start_file_watcher",
+        "_resize_child",
+        "_enable_host_mouse",
+        "_render",
+    ):
+        setattr(runner, name, lambda *a, **k: None)
+    runner._set_message = lambda *a, **k: None
+    runner.sessions = []
+
+    runner._new_session("bob-feature", resume_session_id="sid-Y")
+
+    assert order == [("stage", "sid-Y"), ("spawn", None)]  # staged BEFORE spawn
+
+
 def test_shared_resume_cancel_on_name_prompt_does_not_resume():
     runner = _shared_resume_runner()
     runner._prompt_session_name = lambda *a, **k: None  # user cancels naming

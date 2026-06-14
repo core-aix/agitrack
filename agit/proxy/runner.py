@@ -32,7 +32,6 @@ from agit.commits import (
     METADATA_HEADER,
     apply_summary_to_message,
     build_user_commit_message,
-    render_interaction_trace,
     summary_metadata_lines,
 )
 from agit.git import GitRepo
@@ -1234,23 +1233,35 @@ class ProxyRunner:
         # install the update, then ask run()'s teardown to re-exec aGiT.
         self._update_applying = True
         self._update_pending = False
-        self._set_message("Finishing commits, then updating aGiT…", seconds=30.0)
+        # When the code on disk is already current and only the running process is
+        # stale, there is nothing to install — just finish work and re-exec. (Don't
+        # run apply(): it would fetch/merge or pip-upgrade needlessly, and a dirty
+        # source checkout would even block a pure restart.)
+        restart_only = self._update_status is not None and self._update_status.restart_only
+        self._set_message(
+            "Finishing commits, then restarting aGiT…" if restart_only else "Finishing commits, then updating aGiT…",
+            seconds=30.0,
+        )
         self._render()
         try:
             self._finalize_pending_work()
         except Exception as error:  # don't let a commit hiccup strand the update
             self._debug(f"finalize before update failed: {error!r}")
-        result = self._updater.apply()
-        if not result.ok:
-            self._update_applying = False
-            self._finalized_on_exit = False  # allow a later clean exit to finalize again
-            self._exiting = False
-            self._set_message(f"aGiT update failed: {result.error}", seconds=12.0)
-            self._render()
-            return
+        if restart_only:
+            message = "Restarting aGiT to load the updated code…"
+        else:
+            result = self._updater.apply()
+            if not result.ok:
+                self._update_applying = False
+                self._finalized_on_exit = False  # allow a later clean exit to finalize again
+                self._exiting = False
+                self._set_message(f"aGiT update failed: {result.error}", seconds=12.0)
+                self._render()
+                return
+            message = f"{result.message} Restarting aGiT…"
         # Success: stop the loop and let run()'s finally restore the terminal and
         # release the lock before _pending_restart triggers the re-exec.
-        self._set_message(f"{result.message} Restarting aGiT…", seconds=10.0)
+        self._set_message(message, seconds=10.0)
         self._render()
         self._exit_child()
         self._pending_restart = True
@@ -3072,22 +3083,36 @@ class ProxyRunner:
             self._set_message("Cancelled.")
             self._render()
             return
-        # If a (dormant) local copy exists, ask whether to pull the shared version
-        # (the "continue on another machine" sync) or keep the local one. With no
-        # local copy, import fresh.
+        # If a local copy of this exact conversation already exists, the resumed id
+        # would collide with it. Ask what to do (#55): replace it with the shared
+        # version (sync between your machines), keep both (re-import the shared copy
+        # under a fresh local id), or keep the local one untouched.
         overwrite = False
         if agent.has_local_session(self.base_repo.repo, session_id):
             age = self._format_age(entry.manifest["updated"]) if entry.manifest.get("updated") else "earlier"
+            keep_both_id = getattr(agent, "new_import_id", lambda: None)()
+            options = [f"Replace my local copy with the shared version (updated {age})"]
+            if keep_both_id:
+                options.append("Keep both (import the shared copy as a separate session)")
+            options.append("Keep my local copy")
             pick = self._select_popup(
-                f"You already have a local copy of {entry.display}.\n"
-                f"The shared version was updated {age}. Which do you want to continue?",
-                ["Pull the shared version (replace my local copy)", "Keep my local copy"],
+                f"You already have a local copy of {entry.display}.\nWhich do you want to continue?",
+                options,
             )
             if pick is None:
                 self._set_message("Cancelled.")
                 self._render()
                 return
-            overwrite = pick.startswith("Pull")
+            if pick.startswith("Keep both"):
+                assert keep_both_id is not None  # only offered when the backend can re-id
+                if not agent.import_shared_session(self.base_repo.repo, session_id, transcript, as_id=keep_both_id):
+                    self._set_message("Could not install the shared session copy for resume.")
+                    self._render()
+                    return
+                self._user_state().set_shared_origin_name(keep_both_id, entry.name)
+                self._resume_conversation(name, keep_both_id, backend=entry_backend)
+                return
+            overwrite = pick.startswith("Replace")
         if not agent.import_shared_session(self.base_repo.repo, session_id, transcript, overwrite=overwrite):
             self._set_message("Could not install the shared session for resume.")
             self._render()
@@ -3354,11 +3379,16 @@ class ProxyRunner:
             # backends), independent of the global default.
             self.state.backend = backend
         if resume_session_id:
-            # Resume this exact backend conversation (its transcript lives under
-            # the worktree path, which we have just recreated/reused).
+            # Resume this exact backend conversation.
             self.state.backend_session_id = resume_session_id
             self._persist_session_name(resume_session_id)
         self.backend = make_proxy_agent(self.state.backend)
+        if resume_session_id:
+            # Stage the transcript into THIS worktree before spawning, so a
+            # `--resume` finds it. Crucial for a shared session: its transcript was
+            # imported under the base repo's project dir, not this fresh worktree's,
+            # so without this the resume found nothing and the session never loaded.
+            self._stage_backend_resume(resume_session_id)
         self.actions = AgitActions(self.repo, self.state, verbose=self.verbose)
         self._sanitize_state_trace()
         self._initialize_session_baseline()
@@ -4513,12 +4543,7 @@ class ProxyRunner:
                 declined = set(state.declined_untracked())
                 repo.stage_paths([path for path in repo.untracked_files() if path not in declined])
 
-        # Capture the interaction trace BEFORE committing: commit_turns clears the
-        # trace before on_commit_fn runs, and the summary is built from exactly the
-        # trace appended to the commit (and nothing else — no diff).
-        trace_text = render_interaction_trace(self.state.pending_trace(), self.state.trace_turn_limit)
-
-        def on_commit_fn(sha):
+        def on_commit_fn(sha, trace_text):
             self._last_agent_commit_id = sha
             # Don't announce the commit yet: the "created" popup is shown only once
             # the commit is merged into the base branch (see _integrate_turn_or_conflict),
@@ -4526,7 +4551,9 @@ class ProxyRunner:
             self._commit_merged_pending = True
             self._commit_summarized = False
             # The commit is made immediately; the LLM summary is computed in the
-            # background and amended in afterwards (#8) so the UI never blocks.
+            # background and amended in afterwards (#8) so the UI never blocks. The
+            # trace passed here is exactly the one that landed in the commit (built
+            # inside commit_turns), which is the summarizer's sole input.
             self._start_commit_summary(sha, trace_text)
 
         return CommitEngine(self.repo, self.state, debug_fn=self._debug).commit_turns(
