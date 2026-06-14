@@ -3292,10 +3292,11 @@ def _drift_runner(recorded_cwd, worktree_path):
         worktree=types.SimpleNamespace(name="session-1"),
         repo=types.SimpleNamespace(repo=worktree_path),
         state=types.SimpleNamespace(backend_session_id="sess-1"),
-        backend=types.SimpleNamespace(recorded_working_dir=lambda sid: recorded_cwd),
+        backend=types.SimpleNamespace(recorded_working_dir=lambda sid, *, since=None: recorded_cwd),
     )
     runner._debug = lambda *a, **k: None
     runner._cwd_check_at = 0.0
+    runner._cwd_launch_at = 1000.0
     runner.messages = []
     runner._set_message = lambda msg, **k: runner.messages.append(msg)
     runner._render = lambda: None
@@ -3325,6 +3326,38 @@ def test_cwd_drift_waits_when_no_cwd_recorded_yet():
     runner._warn_if_cwd_drifted()
     assert runner.messages == []
     assert getattr(runner, "_cwd_drift_checked", False) is False  # will re-check next tick
+
+
+def test_cwd_drift_forwards_launch_time_as_since(monkeypatch):
+    # The launch epoch is passed through as `since` so the backend can ignore a
+    # stale pre-launch cwd (#72). A backend that only reports a post-launch turn
+    # returns None until one exists, so no false warning is latched.
+    import types
+
+    seen = {}
+
+    def recorded(sid, *, since=None):
+        seen["since"] = since
+        return None  # no post-launch turn yet
+
+    runner = make_runner(
+        worktree=types.SimpleNamespace(name="session-1"),
+        repo=types.SimpleNamespace(repo="/repo/.agit/worktrees/session-1"),
+        state=types.SimpleNamespace(backend_session_id="sess-1"),
+        backend=types.SimpleNamespace(recorded_working_dir=recorded),
+    )
+    runner._debug = lambda *a, **k: None
+    runner._cwd_check_at = 0.0
+    runner._cwd_launch_at = 1234.5
+    runner.messages = []
+    runner._set_message = lambda msg, **k: runner.messages.append(msg)
+    runner._render = lambda: None
+
+    runner._warn_if_cwd_drifted()
+
+    assert seen["since"] == 1234.5
+    assert runner.messages == []
+    assert runner._cwd_drift_checked is False  # nothing post-launch yet → keep checking
 
 
 # --- worktree confinement ---

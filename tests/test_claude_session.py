@@ -25,6 +25,29 @@ def test_session_cwd_reads_last_recorded_cwd(monkeypatch, tmp_path):
     assert claude_session.session_cwd("missing") is None
 
 
+def test_session_cwd_since_ignores_stale_pre_launch_rows(monkeypatch, tmp_path):
+    # #72: with `since`, only rows recorded at/after the current launch count, so
+    # a stale cwd left by a resume/import doesn't read as drift.
+    config = tmp_path / "config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    proj = config / "projects" / claude_session._encode_repo(tmp_path / "wt")
+    proj.mkdir(parents=True)
+    (proj / "s.jsonl").write_text(
+        '{"type":"user","cwd":"/stale/base","timestamp":"2026-06-14T10:00:00Z"}\n'
+        '{"type":"user","cwd":"/the/worktree","timestamp":"2026-06-14T10:00:30Z"}\n',
+        encoding="utf-8",
+    )
+    from datetime import datetime
+
+    launch = datetime.fromisoformat("2026-06-14T10:00:15+00:00").timestamp()  # between the two rows
+    # Only the post-launch row (the worktree) qualifies; the stale one is ignored.
+    assert claude_session.session_cwd("s", since=launch) == "/the/worktree"
+    # Before any post-launch row exists, nothing qualifies → None (caller waits).
+    assert claude_session.session_cwd("s", since=launch + 3600) is None
+    # Without `since`, the last row still wins (unchanged behavior).
+    assert claude_session.session_cwd("s") == "/the/worktree"
+
+
 def test_prepare_resume_stages_transcript_into_worktree(monkeypatch, tmp_path):
     config = tmp_path / "config"
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
