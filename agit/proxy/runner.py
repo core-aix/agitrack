@@ -891,11 +891,27 @@ class ProxyRunner:
         except Exception:
             self._base_status_baseline = set()
         self._set_message(
-            "Agent sandbox unavailable on this platform — edits outside the session\n"
-            "worktree can't be prevented; aGiT will warn if the base repo is modified.",
+            self._sandbox_unavailable_hint(),
             seconds=8.0,
         )
         self._render()
+
+    @staticmethod
+    def _sandbox_unavailable_hint() -> str:
+        base = (
+            "Agent sandbox unavailable — edits outside the session worktree can't be\n"
+            "prevented; aGiT will warn if the base repo is modified."
+        )
+        if sys.platform.startswith("linux"):
+            if shutil.which("bwrap") is None:
+                return base + "\nInstall bubblewrap (e.g. `apt install bubblewrap`) to enforce it."
+            # bwrap is present but the probe failed — almost always blocked userns.
+            return (
+                base + "\nbubblewrap is installed but unprivileged user namespaces are blocked\n"
+                "(e.g. Ubuntu's kernel.apparmor_restrict_unprivileged_userns); enabling them\n"
+                "lets aGiT enforce the worktree sandbox."
+            )
+        return base
 
     def _check_base_branch_drift(self) -> None:
         # The user can `git checkout` another branch in the directory while aGiT is

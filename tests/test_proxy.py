@@ -3264,7 +3264,8 @@ def test_confine_to_worktree_wraps_when_enabled(monkeypatch):
     import types
     from agit.proxy import sandbox
 
-    monkeypatch.setattr(sandbox, "is_available", lambda: True)
+    # Force the macOS mechanism so the assertion is platform-independent.
+    monkeypatch.setattr(sandbox, "_have_sandbox_exec", lambda: True)
     monkeypatch.delenv("AGIT_SANDBOX", raising=False)
     runner = make_runner(
         worktree=types.SimpleNamespace(name="session-1"),
