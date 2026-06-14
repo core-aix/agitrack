@@ -1825,6 +1825,34 @@ def test_resumable_sessions_dedupes_by_id(tmp_path):
     assert [ref.id for ref in runner._resumable_sessions()] == ["shared"]
 
 
+def test_resumable_sessions_includes_reserved_named_session_without_transcript(tmp_path):
+    # #75: a no-commit session reserves its name in the durable record, but the
+    # backend has no transcript for it (no commits, worktree emptied). It must
+    # still be offered for resume so the reserved name isn't stranded — taken yet
+    # un-resumable.
+    runner, _base = _resume_listing_runner(tmp_path, base_refs=[], worktree_sessions=[])
+    runner._agit_named_sessions = lambda: {"ghost-id": "experiment"}
+
+    refs = runner._resumable_sessions()
+
+    assert [(ref.id, ref.label) for ref in refs] == [("ghost-id", "experiment")]
+    # The very same record reserves the name, so it is both taken AND resumable.
+    assert runner._session_name_taken("experiment") is True
+
+
+def test_resumable_sessions_does_not_duplicate_named_session_with_transcript(tmp_path):
+    # When the backend still enumerates a named conversation, it appears once
+    # (the durable record must not add a second copy).
+    runner, _base = _resume_listing_runner(
+        tmp_path,
+        base_refs=[],
+        worktree_sessions=[("alpha", SessionRef("wt-alpha", 300.0))],
+    )
+    runner._agit_named_sessions = lambda: {"wt-alpha": "alpha"}
+
+    assert [ref.id for ref in runner._resumable_sessions()] == ["wt-alpha"]
+
+
 def test_named_sessions_recovers_name_from_worktree_key(tmp_path):
     # When the persisted record never linked a conversation's name, the worktree
     # directory it ran in (its name) labels it in the resume list.
