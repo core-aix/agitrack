@@ -3,10 +3,12 @@
 aGiT can update itself in place. Two installation shapes are supported:
 
 * **source-linked** — aGiT is importable from a git checkout of its own source
-  (the documented ``pip install -e .`` editable install). Updates are pulled
-  from the checkout's upstream branch with a fast-forward-only merge, so an
-  update can never clobber local development: a dirty or diverged source tree
-  blocks the update with a message instead.
+  (the documented ``pip install -e .`` editable install). Updates merge the
+  upstream branch into the checkout: a clean checkout fast-forwards, and a
+  checkout carrying the user's own commits (aGiT runs on session worktree
+  branches that accumulate commits) gets a normal merge. Only a genuine content
+  conflict, or an uncommitted (dirty) tree, blocks the update — with a message
+  instead of leaving the running source half-merged.
 * **package** — aGiT was installed as a wheel (e.g. ``pip install agit``).
   Updates run ``pip install --upgrade`` and the latest available version is
   discovered with ``pip index versions``.
@@ -168,73 +170,103 @@ class Updater:
         return self._check_package(timeout=timeout)
 
     def _upstream_ref(self, repo: Path) -> str | None:
-        # The current branch's configured upstream (e.g. "origin/main"). Without
-        # one we cannot tell which remote branch to compare against, so the
-        # source updater simply stays quiet.
+        # The current branch's configured upstream (e.g. "origin/main").
         result = _git(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], repo)
         if result.returncode != 0:
             return None
         ref = result.stdout.strip()
         return ref or None
 
+    def _remote_target(self, repo: Path) -> str | None:
+        # The remote-tracking ref to compare/merge against. Prefer the current
+        # branch's configured upstream; when the branch has none — aGiT commonly
+        # runs on a session worktree branch (``agit/...``) that tracks nothing —
+        # fall back to the default branch of ``origin`` so the source still
+        # follows upstream aGiT releases. Returns None only when neither exists.
+        upstream = self._upstream_ref(repo)
+        if upstream is not None:
+            return upstream
+        head = _git(["rev-parse", "--abbrev-ref", "origin/HEAD"], repo)
+        if head.returncode == 0 and head.stdout.strip():
+            return head.stdout.strip()
+        for candidate in ("origin/main", "origin/master"):
+            if _git(["rev-parse", "--verify", "--quiet", candidate], repo).returncode == 0:
+                return candidate
+        return None
+
+    def _count(self, repo: Path, rev_range: str) -> int:
+        # Number of commits in ``rev_range`` (e.g. "HEAD..origin/main"); 0 on error.
+        result = _git(["rev-list", "--count", rev_range], repo)
+        if result.returncode != 0:
+            return 0
+        return int(result.stdout.strip() or "0")
+
     def _check_source(self, *, fetch: bool, timeout: int = _NET_TIMEOUT) -> UpdateStatus:
         repo = self._source_repo
         assert repo is not None
         status = UpdateStatus(kind=KIND_SOURCE)
-        # The HEAD on disk right now (no network). Comparing it against the running rev
-        # catches a LOCAL update the running process hasn't loaded — a manual pull, a
-        # prior self-update, or the source checkout advancing during self-development —
-        # regardless of whether the remote can be reached.
+        # Three commit hashes drive the decision (per the source-install update
+        # contract): the RUNNING process's rev, the LOCAL checkout's HEAD, and the
+        # REMOTE target's tip. If either the local disk or the remote carries code
+        # the running process lacks, an update is available.
         head = _git(["rev-parse", "HEAD"], repo).stdout.strip()
         if self._running_rev is None:  # construction snapshot failed: fall back to now
             self._running_rev = head or None
+        running = self._running_rev
         head_short = _git(["rev-parse", "--short", "HEAD"], repo).stdout.strip()
         status.current = head_short
-        running_stale = bool(self._running_rev) and bool(head) and self._running_rev != head
 
-        # The remote side (needs the network). A missing upstream or a failed fetch is
-        # remembered, not fatal — local staleness above is reported either way.
-        upstream = self._upstream_ref(repo)
+        # The remote side (needs the network). A missing target or a failed fetch is
+        # remembered, not fatal — local staleness below is reported either way.
+        target = self._remote_target(repo)
         fetch_error: str | None = None
-        if upstream is not None:
-            remote = upstream.split("/", 1)[0]
+        remote_head: str | None = None
+        if target is not None:
+            remote = target.split("/", 1)[0]
             if fetch:
                 fetched = _git(["fetch", "--quiet", remote], repo, timeout=timeout)
                 if fetched.returncode != 0:
                     fetch_error = (fetched.stderr.strip() or "git fetch failed").splitlines()[-1]
             if fetch_error is None:
-                behind = _git(["rev-list", "--count", f"HEAD..{upstream}"], repo)
-                if behind.returncode != 0:
-                    fetch_error = behind.stderr.strip() or "could not compare against upstream"
-                else:
-                    status.behind = int(behind.stdout.strip() or "0")
-                    status.latest = _git(["rev-parse", "--short", upstream], repo).stdout.strip()
+                resolved = _git(["rev-parse", "--verify", "--quiet", target], repo)
+                remote_head = resolved.stdout.strip() or None
 
-        if status.behind > 0:
+        # Remote ahead of the local checkout: upstream commits the checkout lacks —
+        # a real update (fetch + merge) is needed.
+        remote_ahead = self._count(repo, f"HEAD..{remote_head}") if remote_head else 0
+        # Local checkout ahead of the running process: the disk already carries code
+        # this process hasn't loaded (a prior self-update, a manual pull, or a session
+        # integration) — only a restart is needed. Detected with NO network.
+        local_ahead = 0
+        if running and head and running != head:
+            local_ahead = self._count(repo, f"{running}..HEAD") or 1  # differ ⇒ at least restart
+
+        if remote_ahead > 0 and remote_head is not None:
             status.available = True
-            commits = "commit" if status.behind == 1 else "commits"
+            status.behind = remote_ahead
+            status.latest = remote_head[:7]  # short sha of the remote target's tip
+            commits = "commit" if remote_ahead == 1 else "commits"
             status.message = (
-                f"aGiT update available: {status.behind} new {commits} on {upstream} "
-                f"({status.current} → {status.latest})."
+                f"aGiT update available: {remote_ahead} new {commits} on {target} ({status.current} → {status.latest})."
             )
             return status
-        if running_stale:
+        if local_ahead > 0:
             # The checkout is already updated but this process still runs the old code.
             # Detected with no network, so an offline local update still prompts a
             # restart. Takes precedence over a fetch error — the user can act on it now.
-            assert self._running_rev is not None
+            assert running is not None
             status.available = True
             status.restart_only = True
-            status.current = self._running_rev[:7]
+            status.current = running[:7]
             status.latest = head_short  # restarting loads the HEAD on disk
             status.message = (
                 f"aGiT was updated on disk but the running copy is older "
                 f"({status.current} → {status.latest}); restart to load it."
             )
             return status
-        # Nothing local is stale. If the remote couldn't be checked, say why; otherwise
-        # we are genuinely current.
-        if upstream is None:
+        # Nothing newer locally or on the running side. If the remote couldn't be
+        # checked, say why; otherwise we are genuinely current.
+        if target is None:
             status.error = "no upstream branch is configured for the aGiT source checkout"
         elif fetch_error is not None:
             status.error = fetch_error
@@ -337,25 +369,28 @@ class Updater:
                 "update skipped (commit or stash them, or update manually)"
             )
             return status
-        upstream = self._upstream_ref(repo)
-        if upstream is None:
+        target = self._remote_target(repo)
+        if target is None:
             status.error = "no upstream branch is configured for the aGiT source checkout"
             return status
-        # Refresh the upstream ref so we fast-forward onto the very latest commit,
-        # even if the periodic check ran a while ago.
-        remote = upstream.split("/", 1)[0]
+        # Refresh the target ref so we merge the very latest commit, even if the
+        # periodic check ran a while ago.
+        remote = target.split("/", 1)[0]
         fetched = _git(["fetch", "--quiet", remote], repo, timeout=_NET_TIMEOUT)
         if fetched.returncode != 0:
             status.error = (fetched.stderr.strip() or "git fetch failed").splitlines()[-1]
             return status
-        # --ff-only: refuse to create a merge commit. A diverged local branch
-        # (the user committed their own work) blocks the auto-update rather than
-        # rewriting their history.
-        merged = _git(["merge", "--ff-only", upstream], repo, timeout=_NET_TIMEOUT)
+        # Merge the upstream code into the checkout: a clean checkout fast-forwards;
+        # a diverged one (the user's own commits — aGiT's session branches accumulate
+        # them) gets a normal merge. Only a genuine content CONFLICT blocks the update.
+        # On conflict we abort so the running source is left clean (no conflict
+        # markers, local work intact) rather than half-merged.
+        merged = _git(["merge", "--no-edit", target], repo, timeout=_NET_TIMEOUT)
         if merged.returncode != 0:
+            _git(["merge", "--abort"], repo)
             status.error = (
-                "could not fast-forward the aGiT source checkout "
-                f"(local branch has diverged from {upstream}); update manually"
+                "automatic update is impossible due to merge conflicts between the "
+                f"local aGiT source and {target}; resolve them manually, then update"
             )
             return status
         status.current = _git(["rev-parse", "--short", "HEAD"], repo).stdout.strip()

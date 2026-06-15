@@ -1340,6 +1340,18 @@ class ProxyRunner:
             self._set_message("An aGiT update is already in progress.")
             self._render()
             return
+        # Run a FRESH check on explicit request. The cached `_update_status` comes
+        # from the periodic background check (up to UPDATE_CHECK_SECONDS old), so it
+        # can miss a remote push or a local-disk update that landed since — which
+        # showed "up to date" even though a newer version already existed. A live
+        # check (compares running vs local HEAD vs remote) reflects reality now.
+        if self._updater is not None:
+            self._set_message("Checking for aGiT updates…")
+            self._render()
+            try:
+                self._update_status = self._updater.check()
+            except Exception as error:  # network/git hiccup: fall back to cached status
+                self._debug(f"on-demand update check failed: {error!r}")
         status = self._update_status
         if status is None:
             # No completed check yet — make sure one is running and ask the user
