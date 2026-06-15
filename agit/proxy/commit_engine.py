@@ -86,8 +86,10 @@ _StageUntrackedFn = Callable[[GitRepo, AgitState], None]
 _PreCommitFn = Callable[[], None]
 """Called immediately before the ``git commit`` (e.g. ``_ensure_turn_branch``)."""
 
-_OnCommitFn = Callable[[str | None, str], None]
-"""Called with the short commit SHA after a successful commit (may be None)."""
+_OnCommitFn = Callable[[str | None, str, bool], None]
+"""Called after a successful commit with: the short commit SHA (may be None), the
+rendered interaction trace, and whether the commit is a *cover* (a merge-shaped
+commit aGiT placed on top of the backend agent's own commits, #35)."""
 
 _DebugFn = Callable[..., None]
 """Logging sink — ``runner._debug``."""
@@ -363,7 +365,7 @@ class CommitEngine:
         self.state.clear_trace()
 
         if on_commit_fn is not None:
-            on_commit_fn(commit_sha, trace_text)
+            on_commit_fn(commit_sha, trace_text, cover_backend_head or cover_with_staged)
 
         return True
 

@@ -158,11 +158,12 @@ def test_commit_turns_calls_on_commit_fn_with_sha_and_trace(tmp_path):
         backend_session_id="s1",
         model="m",
         stage_untracked_fn=_noop_stage,
-        on_commit_fn=lambda sha, trace: received.append((sha, trace)),
+        on_commit_fn=lambda sha, trace, is_cover: received.append((sha, trace, is_cover)),
     )
     assert len(received) == 1
-    sha, trace = received[0]
+    sha, trace, is_cover = received[0]
     assert sha == "dead1234"
+    assert is_cover is False  # a plain commit (no backend commits to cover)
     # The trace handed to the callback is the real, rebuilt interaction trace
     # (the summarizer's input), not an empty/stale one.
     assert "## User" in trace and "do it" in trace
