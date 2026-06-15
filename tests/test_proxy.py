@@ -3016,7 +3016,7 @@ def _shared_resume_runner():
         repo=types.SimpleNamespace(remote_exists=lambda: False),  # no remote ⇒ fetch is inline
         fetch=lambda **k: None,
         entries=lambda: [entry],
-        read_transcript=lambda e: "transcript-body",
+        read_transcript=lambda e, **k: "transcript-body",
     )
     runner._shared_store = lambda: store
     runner._select_popup = lambda title, options: options[0]  # pick the only entry
@@ -3036,6 +3036,51 @@ def _drain_shared_resume(runner):
     if runner._shared_resume_thread is not None:
         runner._shared_resume_thread.join(timeout=10)
     runner._service_shared_resume()
+
+
+def test_resume_shared_menu_stopped_fetch_quits_without_listing():
+    # If the user stops the listing fetch (Esc), the menu must NOT fall through to a
+    # possibly-stale previously-fetched list — it leaves the menu entirely.
+    runner = _shared_resume_runner()
+    runner._fetch_shared_with_cancel = lambda store, message: False  # user stopped it
+    picks: list = []
+    runner._select_popup = lambda *a, **k: picks.append(a) or None
+
+    runner._resume_shared_session_menu()
+
+    assert picks == []  # no session list was shown
+    assert runner._shared_resume_thread is None  # and no transcript fetch began
+
+
+def test_service_shared_resume_drops_result_when_cancelled():
+    # A cancelled (or exit-time) fetch must never complete a switch, even if its
+    # worker already left a result behind.
+    import threading
+
+    runner = _shared_resume_runner()
+    runner._shared_resume_cancel = threading.Event()
+    runner._shared_resume_cancel.set()
+    runner._shared_resume_result = {"action": "import", "name": "x", "session_id": "sid-1"}
+    runner._shared_resume_thread = None
+
+    runner._service_shared_resume()
+
+    assert runner._shared_resume_result is None  # dropped
+    assert runner.__dict__["_resumed"] == []  # no resume happened
+
+
+def test_cancel_inflight_shared_fetches_signals_and_clears():
+    import threading
+
+    runner = _shared_resume_runner()
+    event = threading.Event()
+    runner._shared_resume_cancel = event
+    runner._shared_resume_result = {"action": "import"}
+
+    runner._cancel_inflight_shared_fetches()
+
+    assert event.is_set()  # the worker is told to stop
+    assert runner._shared_resume_result is None  # and any pending result is dropped
 
 
 def test_shared_resume_prompts_for_local_name():

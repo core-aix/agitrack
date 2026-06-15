@@ -90,14 +90,15 @@ class SharedSessionStore:
         except json.JSONDecodeError:
             return {}
 
-    def read_transcript(self, entry: SharedEntry) -> str | None:
+    def read_transcript(self, entry: SharedEntry, *, timeout: float | None = None) -> str | None:
         path = f"{self._prefix()}{entry.github_id}/{entry.name}/transcript.jsonl"
         blob = self.repo.read_ref_blob(self.ref, path)
         if blob is None and self.repo.remote_exists():
             # The listing fetch pulls only the small manifests (see `fetch`), so a
             # large transcript may not be local yet — fetch the full ref now that
-            # the user has actually chosen this session, then read it.
-            self.repo.fetch_ref(f"+{self.ref}:{self.ref}")
+            # the user has actually chosen this session, then read it. ``timeout``
+            # bounds this (potentially large) fetch so it can't wait forever.
+            self.repo.fetch_ref(f"+{self.ref}:{self.ref}", timeout=timeout)
             blob = self.repo.read_ref_blob(self.ref, path)
         return blob
 
