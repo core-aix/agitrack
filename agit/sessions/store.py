@@ -120,22 +120,31 @@ class SharedSessionStore:
 
     # --- writing -----------------------------------------------------------
 
-    def _commit(self, entries: dict[str, str], message: str) -> None:
+    def _commit(self, entries: dict[str, str], message: str, *, reclaim: bool = True) -> str | None:
+        """Rewrite the ref to a new orphan commit of *entries*. Returns the PREVIOUS
+        ref sha (the now-orphaned snapshot), so a caller that pushes can keep it as the
+        push's delta base and reclaim it afterwards.
+
+        ``reclaim`` (default) deletes the orphaned previous snapshot's objects right
+        away — large transcript blobs shouldn't linger until git's auto-gc (#55). Pass
+        ``reclaim=False`` when the previous version must survive a little longer (a
+        publish keeps it as the ``git push`` delta base, then reclaims it post-push)."""
         old = self.repo.ref_sha(self.ref)
         tree = self.repo.write_tree_from(entries)
         sha = self.repo.commit_tree_orphan(tree, message)
         self.repo.update_ref(self.ref, sha)
-        # Reclaim the just-orphaned previous snapshot's objects right away — large
-        # transcript blobs shouldn't linger until git's auto-gc (issue #55).
-        if old and old != sha:
+        if reclaim and old and old != sha:
             self.repo.delete_orphaned_objects(old)
+        return old if old != sha else None
 
-    def _add_session(self, github_id: str, name: str, transcript: str, manifest: dict) -> None:
+    def _add_session(
+        self, github_id: str, name: str, transcript: str, manifest: dict, *, reclaim: bool = True
+    ) -> str | None:
         base = f"{self._prefix()}{github_id}/{name}/"
         entries = {k: v for k, v in self.repo.read_tree_paths(self.ref).items() if not k.startswith(base)}
         entries[base + "transcript.jsonl"] = self.repo.write_blob(transcript)
         entries[base + "manifest.json"] = self.repo.write_blob(json.dumps(manifest, indent=2, sort_keys=True))
-        self._commit(entries, f"agit: share session {github_id}/{name}")
+        return self._commit(entries, f"agit: share session {github_id}/{name}", reclaim=reclaim)
 
     def prune_own_stale(self, github_id: str, *, keep: int = DEFAULT_KEEP) -> int:
         """Drop all but the most-recent ``keep`` sessions belonging to ``github_id``
@@ -291,9 +300,21 @@ class SharedSessionStore:
         timeout: float | None = None,
         cancel: "threading.Event | None" = None,
     ) -> PublishResult:
-        old = self.repo.ref_sha(self.ref)  # tip we believe the remote is at
-        self._add_session(gid, nm, transcript, manifest)
+        old = self.repo.ref_sha(self.ref)  # tip we believe the remote is at = the delta base
+        # Keep the PREVIOUS snapshot's objects (reclaim=False) so they survive until the
+        # push below: ``git push`` deltifies the new transcript against the version the
+        # remote already has (the same blob is still local), so an append-heavy session
+        # re-shared (or auto-shared on every commit) transmits only the new turns, not a
+        # fresh full copy each time. Without this, deleting `old` before the push left no
+        # local delta base, forcing git to send the whole transcript every share.
+        self._add_session(gid, nm, transcript, manifest, reclaim=False)
         pruned = self.prune_own_stale(gid, keep=keep)
         lease = f"{self.ref}:{old}" if old else None  # None ⇒ creating the ref
         ok, err = self.repo.push_ref(f"{self.ref}:{self.ref}", force_with_lease=lease, timeout=timeout, cancel=cancel)
+        # The previous version has served as the push's delta base; reclaim it now so
+        # only the current snapshot stays local (bounded storage; nothing for unshare to
+        # miss). Re-fetchable if a retry needs it. The ref still has no history, so an
+        # unshare that rewrites the orphan commit still fully removes the session.
+        if old:
+            self.repo.delete_orphaned_objects(old)
         return PublishResult(remote=True, pushed=ok, pruned=pruned, error="" if ok else err.strip())

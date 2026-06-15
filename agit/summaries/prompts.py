@@ -9,6 +9,8 @@ Be concise but preserve important context. Focus on the "why" and "how" rather t
 
 The first sentence should be a topic sentence summarizing everything, before explaining the details afterwards. The topic sentence should not say this is a summary or that it is an update. It should be a clear statement of the current state of the session and its progress.
 
+The topic sentence becomes the git commit subject, so it MUST be at most 63 characters long (including spaces) so it displays in full in the commit list without being truncated. Make it a short, self-contained headline and move all detail into the sentences that follow. Do not end it with an ellipsis.
+
 Begin your response immediately with that topic sentence. Do not prepend any preamble, acknowledgement, or meta-commentary — never start with phrasings such as "Here is the summary", "The summary has been written", "No further action is needed", "Below is", "Sure", or anything that describes the act of summarizing. Output only the summary text itself, with no heading and no sentence stating that it is a summary."""
 
 SESSION_UPDATE_SYSTEM = """You are maintaining a running session summary for a coding session. Given the current session summary and new changes, produce an updated summary that:
