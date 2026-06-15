@@ -115,7 +115,7 @@ def test_fetch_lists_with_filter_and_reads_transcript_on_demand():
         def read_ref_blob(self, ref, path):
             return blobs.get(path)
 
-        def fetch_ref(self, refspec, *, remote="origin", filter_blobs=None, timeout=None):
+        def fetch_ref(self, refspec, *, remote="origin", filter_blobs=None, timeout=None, cancel=None):
             fetches.append(filter_blobs)
             if filter_blobs is None:  # the on-demand full fetch brings the transcript in
                 blobs["abc/me/sess/transcript.jsonl"] = "the transcript"
@@ -140,13 +140,61 @@ def test_fetch_passes_timeout_through_to_git(tmp_path):
         def remote_exists(self, name="origin"):
             return True
 
-        def fetch_ref(self, refspec, *, remote="origin", filter_blobs=None, timeout=None):
+        def fetch_ref(self, refspec, *, remote="origin", filter_blobs=None, timeout=None, cancel=None):
             seen.append(timeout)
             return True
 
     store = SharedSessionStore(FakeRepo())  # type: ignore[arg-type]
     assert store.fetch(timeout=12.0) is True
     assert seen == [12.0]
+
+
+def test_run_bounded_cancel_kills_process_promptly(tmp_path):
+    # A set cancel Event must terminate the subprocess at once (not wait it out),
+    # so a user who cancels truly stops the work.
+    import threading
+    import time
+
+    repo = _init_repo(tmp_path)
+    cancel = threading.Event()
+    cancel.set()  # already cancelled before we start
+    started = time.monotonic()
+    rc = repo._run_bounded(["sleep", "10"], cancel=cancel)
+    assert rc == 124
+    assert time.monotonic() - started < 2.0  # killed promptly, did not sleep 10s
+
+
+def test_run_bounded_timeout_kills_process(tmp_path):
+    import time
+
+    repo = _init_repo(tmp_path)
+    started = time.monotonic()
+    rc = repo._run_bounded(["sleep", "10"], timeout=0.3)
+    assert rc == 124
+    assert time.monotonic() - started < 2.0
+
+
+def test_fetch_does_not_start_when_already_cancelled(tmp_path):
+    # "Don't let anything run if the user has already confirmed to cancel."
+    import threading
+
+    seen: list = []
+
+    class FakeRepo:
+        repo = tmp_path
+
+        def remote_exists(self, name="origin"):
+            return True
+
+        def fetch_ref(self, *a, **k):
+            seen.append(1)
+            return True
+
+    store = SharedSessionStore(FakeRepo())  # type: ignore[arg-type]
+    cancel = threading.Event()
+    cancel.set()
+    assert store.fetch(cancel=cancel) is False
+    assert seen == []  # never even started a git fetch
 
 
 def test_read_transcript_passes_timeout_to_on_demand_fetch(tmp_path):
@@ -166,7 +214,7 @@ def test_read_transcript_passes_timeout_to_on_demand_fetch(tmp_path):
         def remote_exists(self, name="origin"):
             return True
 
-        def fetch_ref(self, refspec, *, remote="origin", filter_blobs=None, timeout=None):
+        def fetch_ref(self, refspec, *, remote="origin", filter_blobs=None, timeout=None, cancel=None):
             seen.append(timeout)
             return True
 

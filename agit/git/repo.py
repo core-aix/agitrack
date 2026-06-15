@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 
@@ -405,7 +407,13 @@ class GitRepo:
         return name in self._run(["git", "remote"], check=False).stdout.split()
 
     def fetch_ref(
-        self, refspec: str, *, remote: str = "origin", filter_blobs: str | None = None, timeout: float | None = None
+        self,
+        refspec: str,
+        *,
+        remote: str = "origin",
+        filter_blobs: str | None = None,
+        timeout: float | None = None,
+        cancel: "threading.Event | None" = None,
     ) -> bool:
         """Fetch a single refspec (e.g. ``+refs/agit/x:refs/agit/x``). Returns
         True on success; False on any failure (offline, no such ref yet, …).
@@ -414,20 +422,69 @@ class GitRepo:
         — used to pull a shared-session ref's small manifests for listing without
         downloading every transcript; the transcripts are fetched on demand. The
         one-off partial fetch's persisted filter is then dropped so the user's
-        normal ``git fetch`` stays full."""
+        normal ``git fetch`` stays full.
+
+        ``cancel`` (a ``threading.Event``) stops the fetch the moment it is set —
+        the git subprocess is killed, not merely abandoned — so a user who cancels
+        (or exits) truly stops the network work rather than leaving it running."""
         cmd = ["git", "fetch"]
         if filter_blobs:
             cmd.append(f"--filter={filter_blobs}")
         cmd += [remote, refspec]
         # Never block on an interactive credential prompt — these ref syncs run in
         # the background (and on the exit path), where a prompt would hang with no
-        # way to answer. Cached creds / credential helpers still work. An optional
-        # timeout additionally bounds a stalled fetch on bad internet.
-        ok = self._run(cmd, check=False, env={"GIT_TERMINAL_PROMPT": "0"}, timeout=timeout).returncode == 0
+        # way to answer. Cached creds / credential helpers still work. The timeout
+        # bounds a stalled fetch; cancel kills it immediately on user request.
+        ok = self._run_bounded(cmd, env={"GIT_TERMINAL_PROMPT": "0"}, timeout=timeout, cancel=cancel) == 0
         if filter_blobs and ok:
             # Don't turn the user's remote into a permanently-filtered clone.
             self._run(["git", "config", "--unset", f"remote.{remote}.partialclonefilter"], check=False)
         return ok
+
+    def _run_bounded(
+        self,
+        command: list[str],
+        *,
+        timeout: float | None = None,
+        cancel: "threading.Event | None" = None,
+        env: dict[str, str] | None = None,
+    ) -> int:
+        """Run *command* as a subprocess that can be stopped early — when *cancel*
+        (a ``threading.Event``-like object with ``is_set()``) is set, or *timeout*
+        elapses. The process is terminated (then killed) so the network work really
+        stops. Returns the exit code, or 124 when cancelled/timed out."""
+        # Discard output: callers only use the exit code, and piping a long fetch's
+        # progress (stderr) without reading it would fill the pipe buffer and wedge
+        # the process — the opposite of "bounded".
+        process = subprocess.Popen(
+            command,
+            cwd=self.repo,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env={**os.environ, **env} if env else None,
+        )
+        deadline = time.monotonic() + timeout if timeout is not None else None
+        while True:
+            try:
+                process.wait(timeout=0.1)
+                return process.returncode
+            except subprocess.TimeoutExpired:
+                pass
+            stop = (cancel is not None and cancel.is_set()) or (deadline is not None and time.monotonic() > deadline)
+            if stop:
+                self._terminate_process(process)
+                return 124
+
+    @staticmethod
+    def _terminate_process(process: "subprocess.Popen") -> None:
+        try:
+            process.terminate()
+            process.wait(timeout=2)
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
 
     def push_ref(
         self, refspec: str, *, remote: str = "origin", force_with_lease: str | None = None
