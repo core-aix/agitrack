@@ -4,7 +4,8 @@ The reported problems, each pinned by a test here:
 - the summary LLM call blocked the proxy UI → commits now happen immediately
   and the summary is computed on a worker thread, then amended in;
 - the summary appeared after the prompts → it now leads the message, its
-  first line (72-char budget) is the subject, prompts move to # Prompts;
+  first line (72-char budget) is the subject; the prompts are not duplicated
+  into the message (the interaction trace already carries them);
 - a commit was re-amended although nothing changed → applying a summary is
   idempotent and an already-summarized message is never amended again;
 - integration raced the summary → it waits up to SUMMARY_WAIT_SECONDS, then
@@ -50,11 +51,13 @@ def test_summary_leads_message_and_takes_subject():
     assert message.startswith("<aGiT> Implement the widget renderer with caching\n")
     body = message.split("\n", 1)[1]
     # The rest of the summary is the body's first paragraph (no # Summary
-    # section), followed by the preserved prompts, then the trace.
+    # section), then straight to the trace — no # Prompts duplication.
     assert "# Summary" not in message
+    assert "# Prompts" not in message
     assert body.lstrip("\n").startswith("Also reworks the cache keys.")
-    assert body.index("Also reworks the cache keys.") < body.index("# Prompts") < body.index("# Interaction Trace")
-    assert "please add the widget renderer / and cache it" in body.split("# Prompts")[1]
+    assert body.index("Also reworks the cache keys.") < body.index("# Interaction Trace")
+    # The prompt is recoverable from the trace's ## User section.
+    assert "please add the widget renderer" in body.split("# Interaction Trace")[1]
 
 
 def test_long_summary_first_line_is_truncated_to_subject_width():
@@ -91,9 +94,10 @@ def test_apply_summary_rewrites_subject_and_preserves_everything():
     assert amended.startswith("<aGiT> Implement the widget renderer with caching\n")
     # The rest of the summary is the first paragraph (no # Summary section).
     assert "# Summary" not in amended
-    assert "Also reworks the cache keys." in amended.split("\n", 1)[1].split("# Prompts")[0]
-    # The original subject (the prompts) is preserved under # Prompts.
-    assert "please add the widget renderer / and cache it" in amended.split("# Prompts")[1]
+    assert "# Prompts" not in amended
+    assert "Also reworks the cache keys." in amended.split("\n", 1)[1].split("# Interaction Trace")[0]
+    # The prompt is preserved in the trace, not a separate # Prompts section.
+    assert "please add the widget renderer" in amended.split("# Interaction Trace")[1]
     # Trace and metadata survive; metrics land before the version line.
     assert "# Interaction Trace" in amended
     assert "backend_session_id: ses-1" in amended
@@ -101,8 +105,11 @@ def test_apply_summary_rewrites_subject_and_preserves_everything():
 
 
 def test_apply_summary_is_idempotent():
-    once = apply_summary_to_message(_base_message(), SUMMARY)
-    twice = apply_summary_to_message(once, "a different summary")
+    # A summarized message is marked by its summary_model: metadata (added with the
+    # summary, as in production); a second apply sees it and returns unchanged.
+    meta = summary_metadata_lines(model="m")
+    once = apply_summary_to_message(_base_message(), SUMMARY, summary_metadata=meta)
+    twice = apply_summary_to_message(once, "a different summary", summary_metadata=meta)
     assert twice == once  # an already-summarized message is never rewritten
 
 
@@ -184,7 +191,7 @@ def test_commit_path_does_not_block_on_summarization(tmp_path, monkeypatch):
     _finish_summary(runner)
     head = repo.commit_message("HEAD")
     assert head.startswith("<aGiT> Implement the widget renderer with caching")
-    assert "# Prompts" in head and "prompt subject" in head
+    assert "# Prompts" not in head  # prompts are not duplicated into a section
     assert "summary_tokens_input: 7" in head and "summary_tokens_output: 3" in head
     assert runner._summary_pending is None
     # Summary and rolling session summary are queryable as git notes too.

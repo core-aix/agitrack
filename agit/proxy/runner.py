@@ -3468,15 +3468,78 @@ class ProxyRunner:
         status = self._drain_pty_until_done_or_esc(
             self._shared_resume_thread, deadline=time.monotonic() + self.RESUME_FETCH_TIMEOUT + 2.0
         )
-        if status != "done":
-            # Esc/Ctrl-C or the deadline: stop. The cancel Event makes the (daemon)
-            # worker drop any late result, and the bounded git fetch self-terminates.
-            cancel.set()
-            self._shared_resume_result = None
-            self._shared_resume_thread = None
-            note = "timed out" if status == "timeout" else "cancelled"
-            self._set_message(f"Stopped fetching '{entry.display}' ({note}).", seconds=6.0)
+        if status == "cancel":
+            # The user pressed Esc/Ctrl-C: stop and reset all fetch state so a retry
+            # can start immediately. This is the ONLY path that reports "cancelled".
+            self._abort_shared_resume(cancel)
+            self._set_message(f"Stopped fetching '{entry.display}' (cancelled).", seconds=6.0)
             self._render()
+            return
+        if status == "timeout":
+            # Past the deadline with the worker still stuck (a stalled network its own
+            # timeout didn't unwind in time): a FAILURE, not a user cancel. Say why and
+            # hold the notice until the user acknowledges it.
+            self._abort_shared_resume(cancel)
+            self._await_keypress(
+                f"Couldn't fetch '{entry.display}': the fetch timed out after "
+                f"{int(self.RESUME_FETCH_TIMEOUT)}s. Press any key to continue."
+            )
+            return
+        # The worker finished. If it failed, report WHY and keep the notice up until a
+        # keypress — never let a generic auto-dismissing (or "cancelled") message stand
+        # in for a real failure the user needs to see.
+        result = self._shared_resume_result
+        if result is not None and "error" in result:
+            self._abort_shared_resume(cancel)
+            reason = "the shared transcript is incomplete" if result["error"] == "incomplete" else result["error"]
+            self._await_keypress(f"Couldn't fetch '{entry.display}': {reason}. Press any key to continue.")
+            return
+        # Success: the import + session switch run on the main loop (_service_shared_resume).
+
+    def _abort_shared_resume(self, cancel: "threading.Event") -> None:
+        # Stop the in-flight transcript fetch and clear ALL resume state so the user
+        # can retry at once. Setting *cancel* makes the (daemon) worker drop any late
+        # result and the bounded git fetch self-terminate; nulling the shared cancel
+        # token clears the "fetch in progress" flag so nothing lingers to block or
+        # mis-handle an immediate retry. The next fetch installs a fresh token.
+        cancel.set()
+        self._shared_resume_result = None
+        self._shared_resume_thread = None
+        self._shared_resume_cancel = None
+
+    def _await_keypress(self, message: str) -> None:
+        """Show *message* and block — keeping the PTYs draining so the screen stays
+        live — until the user presses any key, so a failure notice can't scroll past
+        unseen. Headless/non-interactive callers (no real stdin) just set the message
+        and return, since there is no key to wait on."""
+        self._set_message(message, seconds=3600)
+        self._render()
+        try:
+            stdin_fd = sys.stdin.fileno()
+        except (OSError, ValueError):
+            return
+        while self.running:
+            master = self.master_fd
+            background = self._background_fds() if self.sessions else {}
+            fds = [stdin_fd]
+            if master is not None:
+                fds.append(master)
+            fds.extend(background)
+            try:
+                readable, _, _ = select.select(fds, [], [], 0.2)
+            except (OSError, ValueError):
+                return
+            for fd in readable:
+                if fd == stdin_fd:
+                    if os.read(stdin_fd, 32):  # any key dismisses the notice
+                        return
+                elif fd == master:
+                    output = self._drain_child_output()
+                    if output is not None:
+                        self.last_child_output = time.monotonic()
+                        self._feed_child_output(output)
+                elif fd in background:
+                    self._pump_background(background[fd])
 
     def _cancel_inflight_shared_fetches(self) -> None:
         # Stop any in-flight shared-session fetch immediately (used on exit): signal
@@ -3488,27 +3551,27 @@ class ProxyRunner:
         self._shared_resume_result = None
 
     def _service_shared_resume(self) -> None:
-        # A cancelled/abandoned fetch must never complete a switch: drop a late
-        # result the moment its cancel token is set (e.g. the user stopped it or aGiT
-        # is exiting).
-        if self._shared_resume_cancel is not None and self._shared_resume_cancel.is_set():
-            self._shared_resume_result = None
-            self._shared_resume_thread = None
-            return
         result = self._shared_resume_result
         if result is None:
+            return
+        # A cancelled/abandoned fetch must never complete a switch: drop a late result
+        # when there is no active fetch (token cleared by _abort_shared_resume) or its
+        # token is set (the user stopped it, or aGiT is exiting).
+        cancel = self._shared_resume_cancel
+        if cancel is None or cancel.is_set():
+            self._shared_resume_result = None
+            self._shared_resume_thread = None
             return
         if self._shared_resume_thread is not None and self._shared_resume_thread.is_alive():
             return  # still fetching
         self._shared_resume_result = None
         self._shared_resume_thread = None
+        self._shared_resume_cancel = None  # fetch concluded — no token lingers to block a retry
         if result.get("error") == "incomplete":
-            self._set_message("That shared session is incomplete; cannot resume it.", seconds=8.0)
-            self._render()
+            self._await_keypress("That shared session is incomplete; cannot resume it. Press any key to continue.")
             return
         if "error" in result:
-            self._set_message(f"Could not fetch the shared session: {result['error']}", seconds=10.0)
-            self._render()
+            self._await_keypress(f"Could not fetch the shared session: {result['error']}. Press any key to continue.")
             return
         if result["action"] == "update_live":
             self._complete_live_shared_update(result)

@@ -74,10 +74,10 @@ def build_agent_commit_message(
 ) -> str:
     if summary:
         # The summary leads (issue #8): its first line becomes the subject, the
-        # rest of it is the first paragraph of the body (no # Summary section),
-        # and the prompts move to a # Prompts section.
+        # rest of it is the first paragraph of the body (no # Summary section).
+        # The prompts are not duplicated into the message — the interaction trace
+        # below already carries them verbatim.
         lines = _summary_lead_lines(summary)
-        prompts: str | None = latest_prompt
     else:
         subject_prompt, full_subject = _subject_parts(
             _mask_secrets(latest_prompt), width=MAX_SUBJECT_WIDTH - len(AGIT_SUBJECT_PREFIX)
@@ -87,7 +87,6 @@ def build_agent_commit_message(
             # The truncated subject flows straight into its full text with no blank
             # line between them, so the extended subject reads as one continued line.
             lines.extend(_body_lines(full_subject))
-        prompts = None
     lines.append("")
     lines.extend(
         _trace_and_metadata_lines(
@@ -99,7 +98,6 @@ def build_agent_commit_message(
             token_usage=token_usage,
             trace_turn_limit=trace_turn_limit,
             session_name=session_name,
-            prompts=prompts,
             summary_metadata=summary_metadata,
             covered_commits=covered_commits,
             started_at=started_at,
@@ -117,30 +115,26 @@ def apply_summary_to_message(
 ) -> str:
     """Rewrite an existing agent commit message so the summary leads (#8).
 
-    The summary's first line becomes the subject, the rest of the summary
-    becomes the first paragraph of the body (no ``# Summary`` section), and
-    the original subject (the collected prompts) is preserved under
-    ``# Prompts``. ``summary_metadata`` lines are added to the metadata
-    section. Idempotent: a message that already carries a summary (marked by
-    its ``# Prompts`` section) is returned unchanged, so a redundant amend can
-    never happen.
+    The summary's first line becomes the subject and the rest of the summary
+    becomes the first paragraph of the body (no ``# Summary`` section). The
+    original prompt-led subject is dropped, not preserved in a section — the
+    ``# Interaction Trace`` below already carries the prompts verbatim, so a
+    separate ``# Prompts`` block only duplicated them. ``summary_metadata`` lines
+    are added to the metadata section. Idempotent: a message that already carries
+    a summary (marked by its ``summary_model:`` metadata) is returned unchanged,
+    so a redundant amend can never happen.
     """
-    if not summary.strip() or "\n# Prompts\n" in message or message.startswith("# Prompts"):
+    if not summary.strip() or "\nsummary_model:" in message:
         return message
     lines = message.splitlines()
     try:
         subject_end = lines.index("")
     except ValueError:
         subject_end = len(lines)
-    original_subject = "\n".join(lines[:subject_end])
-    if original_subject.startswith(AGIT_SUBJECT_PREFIX):
-        original_subject = original_subject[len(AGIT_SUBJECT_PREFIX) :]
     rest = lines[subject_end + 1 :]
 
     new_lines = _summary_lead_lines(summary)
     new_lines.append("")
-    if original_subject.strip():
-        new_lines.extend(["# Prompts", "", *_body_lines(original_subject), ""])
     new_lines.extend(rest)
     if summary_metadata:
         new_lines = _insert_before_version_line(new_lines, summary_metadata)
@@ -226,17 +220,11 @@ def _trace_and_metadata_lines(
     trace_turn_limit: int,
     session_name: str | None,
     covered_commits: list[str] | None,
-    prompts: str | None = None,
     summary_metadata: list[str] | None = None,
     started_at: int | None = None,
     ended_at: int | None = None,
 ) -> list[str]:
-    lines: list[str] = []
-    if prompts and prompts.strip():
-        # When the summary takes the subject (#8), the prompts that used to
-        # head the message are preserved here.
-        lines.extend(["# Prompts", "", *_body_lines(_mask_secrets(prompts)), ""])
-    lines.extend(["# Interaction Trace", ""])
+    lines: list[str] = ["# Interaction Trace", ""]
     for item in _limit_trace_turns(trace, trace_turn_limit):
         role = item.get("role", "").strip().lower()
         # Nest the message's own headings under the "## User"/"## Agent" heading so

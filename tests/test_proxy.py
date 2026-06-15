@@ -3083,6 +3083,69 @@ def test_cancel_inflight_shared_fetches_signals_and_clears():
     assert runner._shared_resume_result is None  # and any pending result is dropped
 
 
+def _failing_resume_runner(read_transcript):
+    import types
+
+    runner = _shared_resume_runner()
+    runner._prompt_session_name = lambda *a, **k: "my-copy"
+    old = runner._shared_store()
+    failing = types.SimpleNamespace(
+        repo=old.repo, fetch=old.fetch, entries=old.entries, read_transcript=read_transcript
+    )
+    runner._shared_store = lambda: failing
+    notices: list = []
+    runner._await_keypress = lambda msg: notices.append(msg)
+    return runner, notices
+
+
+def test_shared_resume_incomplete_reports_reason_not_cancelled():
+    # A failed full-session fetch (empty transcript ⇒ incomplete) must say WHY via a
+    # persistent notice — never be reported as a "cancelled" message — and must clear
+    # all fetch state so the user can retry immediately.
+    runner, notices = _failing_resume_runner(lambda e, **k: None)
+
+    runner._resume_shared_session_menu()
+
+    assert any("Couldn't fetch" in m and "incomplete" in m for m in notices)
+    assert all("cancel" not in m.lower() for m in notices)  # a failure, not a cancel
+    assert runner.__dict__["_resumed"] == []  # nothing resumed
+    # Timers/state cleared so a retry can start at once.
+    assert runner._shared_resume_cancel is None
+    assert runner._shared_resume_result is None
+    assert runner._shared_resume_thread is None
+
+
+def test_shared_resume_fetch_error_reports_reason():
+    # A raised fetch error surfaces its reason (not a cancel) and clears state.
+    def boom(entry, **kwargs):
+        raise RuntimeError("network unreachable")
+
+    runner, notices = _failing_resume_runner(boom)
+
+    runner._resume_shared_session_menu()
+
+    assert any("Couldn't fetch" in m and "network unreachable" in m for m in notices)
+    assert all("cancel" not in m.lower() for m in notices)
+    assert runner._shared_resume_cancel is None  # cleared for an immediate retry
+
+
+def test_abort_shared_resume_clears_token_for_retry():
+    import threading
+
+    runner = _shared_resume_runner()
+    cancel = threading.Event()
+    runner._shared_resume_cancel = cancel
+    runner._shared_resume_result = {"action": "new"}
+    runner._shared_resume_thread = object()
+
+    runner._abort_shared_resume(cancel)
+
+    assert cancel.is_set()  # the in-flight worker/git fetch is told to stop
+    assert runner._shared_resume_cancel is None  # no token lingers to block a retry
+    assert runner._shared_resume_result is None
+    assert runner._shared_resume_thread is None
+
+
 def test_shared_resume_prompts_for_local_name():
     runner = _shared_resume_runner()
     # The default offered to the prompt is the original share name (deduped, no
