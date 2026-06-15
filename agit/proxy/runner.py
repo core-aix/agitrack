@@ -520,6 +520,10 @@ class ProxyRunner:
         self._cwd_drift_checked = False
         self._cwd_check_at = 0.0
         self._cwd_launch_at = 0.0  # epoch of the latest backend launch (set in _spawn)
+        # Shared-session resume runs the (possibly slow) transcript fetch + import on
+        # a worker thread so the UI never freezes; the main loop completes the resume.
+        self._shared_resume_thread: threading.Thread | None = None
+        self._shared_resume_result: dict | None = None
         self._relaunch_times: list[float] = []
         self._exiting = False
         self._finalized_on_exit = False
@@ -718,6 +722,8 @@ class ProxyRunner:
                 "_cwd_drift_checked": False,
                 "_cwd_check_at": 0.0,
                 "_cwd_launch_at": 0.0,
+                "_shared_resume_thread": None,
+                "_shared_resume_result": None,
                 "_relaunch_times": [],
                 "_exiting": False,
                 "_finalized_on_exit": False,
@@ -3038,8 +3044,7 @@ class ProxyRunner:
             return
         entry = entries[options.index(choice)]
         session_id = entry.manifest.get("session_id")
-        transcript = store.read_transcript(entry)
-        if not session_id or not transcript:
+        if not session_id:
             self._set_message("That shared session is incomplete; cannot resume it.")
             self._render()
             return
@@ -3058,66 +3063,142 @@ class ProxyRunner:
                 self._set_message(f"Can't resume '{entry.display}': unknown backend '{entry_backend}'.", seconds=8.0)
                 self._render()
                 return
-        # If this conversation is already live, just switch to it — never overwrite a
-        # running session.
-        already_live = any(
-            getattr(getattr(s, "state", None), "backend_session_id", None) == session_id for s in self.sessions
-        )
         # Remember the name this session was shared under, so a later re-share (on
         # this or any machine) updates the SAME shared entry instead of prepending
         # the sharer id again — which made the name grow on every round-trip and
         # never converge (#55).
         self._user_state().set_shared_origin_name(session_id, entry.name)
-        if already_live:
-            self._resume_conversation(entry.name, session_id, backend=entry_backend)
-            return
-        # Give the imported session a clear local name (#71): prompt for a local
-        # session name the same way a brand-new session is named. Default to the
-        # original share name (deduped) — NOT a "<sharer>-<name>" slug, which grew
-        # without bound when sharing back and forth (#55).
-        name = self._prompt_session_name(
-            "Resume shared session",
-            default=self._dedupe_session_name(entry.name),
+        # Everything below resolves WHAT to do (interactive popups) WITHOUT touching
+        # the transcript — the transcript fetch (which may hit the network) and the
+        # import then run on a worker thread (_begin_shared_resume) so the UI never
+        # freezes, and the resume itself completes on the main loop once ready.
+        live_index = next(
+            (
+                i
+                for i, s in enumerate(self.sessions)
+                if getattr(getattr(s, "state", None), "backend_session_id", None) == session_id
+            ),
+            None,
         )
+        if live_index is not None:
+            # This exact conversation is already running here.
+            keep_both_id = getattr(agent, "new_import_id", lambda: None)()
+            opts = ["Stay on the running session"]
+            if keep_both_id:
+                opts.append("Keep both (fetch the shared copy as a separate session)")
+            pick = self._select_popup(f"'{entry.display}' is already running here.\nWhat would you like to do?", opts)
+            if pick is None:
+                self._set_message("Cancelled.")
+                self._render()
+                return
+            if pick.startswith("Stay"):
+                self._switch_active(live_index)
+                return
+            assert keep_both_id is not None
+            self._begin_shared_resume(
+                store,
+                entry,
+                agent,
+                name=self._dedupe_session_name(entry.name),
+                resume_id=keep_both_id,
+                overwrite=False,
+                as_id=keep_both_id,
+                backend=entry_backend,
+            )
+            return
+        # Not running locally: pick a clear local name (#71), default to the original
+        # share name (deduped) — NOT a "<sharer>-<name>" slug, which grew without
+        # bound when sharing back and forth (#55).
+        name = self._prompt_session_name("Resume shared session", default=self._dedupe_session_name(entry.name))
         if name is None:
             self._set_message("Cancelled.")
             self._render()
             return
-        # If a local copy of this exact conversation already exists, the resumed id
-        # would collide with it. Ask what to do (#55): replace it with the shared
-        # version (sync between your machines), keep both (re-import the shared copy
-        # under a fresh local id), or keep the local one untouched.
-        overwrite = False
+        overwrite, as_id, resume_id = False, None, session_id
         if agent.has_local_session(self.base_repo.repo, session_id):
             age = self._format_age(entry.manifest["updated"]) if entry.manifest.get("updated") else "earlier"
             keep_both_id = getattr(agent, "new_import_id", lambda: None)()
-            options = [f"Replace my local copy with the shared version (updated {age})"]
+            opts = [f"Replace my local copy with the shared version (updated {age})"]
             if keep_both_id:
-                options.append("Keep both (import the shared copy as a separate session)")
-            options.append("Keep my local copy")
+                opts.append("Keep both (fetch the shared copy as a separate session)")
+            opts.append("Keep my local copy")
             pick = self._select_popup(
-                f"You already have a local copy of {entry.display}.\nWhich do you want to continue?",
-                options,
+                f"You already have a local copy of {entry.display}.\nWhich do you want to continue?", opts
             )
             if pick is None:
                 self._set_message("Cancelled.")
                 self._render()
                 return
             if pick.startswith("Keep both"):
-                assert keep_both_id is not None  # only offered when the backend can re-id
-                if not agent.import_shared_session(self.base_repo.repo, session_id, transcript, as_id=keep_both_id):
-                    self._set_message("Could not install the shared session copy for resume.")
-                    self._render()
-                    return
-                self._user_state().set_shared_origin_name(keep_both_id, entry.name)
-                self._resume_conversation(name, keep_both_id, backend=entry_backend)
+                assert keep_both_id is not None
+                as_id = resume_id = keep_both_id
+            elif pick.startswith("Replace"):
+                overwrite = True
+            else:  # keep the local copy: resume it directly, no fetch/import needed
+                self._resume_conversation(name, session_id, backend=entry_backend)
                 return
-            overwrite = pick.startswith("Replace")
-        if not agent.import_shared_session(self.base_repo.repo, session_id, transcript, overwrite=overwrite):
-            self._set_message("Could not install the shared session for resume.")
+        self._begin_shared_resume(
+            store, entry, agent, name=name, resume_id=resume_id, overwrite=overwrite, as_id=as_id, backend=entry_backend
+        )
+
+    def _begin_shared_resume(self, store, entry, agent, *, name, resume_id, overwrite, as_id, backend) -> None:
+        # Fetch the (possibly large) transcript and import it on a worker thread so
+        # the reactor loop never blocks on the network; _service_shared_resume()
+        # finishes the switch on the main thread once the result lands.
+        if self._shared_resume_thread is not None and self._shared_resume_thread.is_alive():
+            self._set_message("Already fetching a shared session — please wait.")
             self._render()
             return
-        self._resume_conversation(name, session_id, backend=entry_backend)
+        session_id = entry.manifest.get("session_id")
+        base_repo = self.base_repo.repo
+        self._shared_resume_result = None
+
+        def worker() -> None:
+            try:
+                transcript = store.read_transcript(entry)  # may fetch from the remote
+                if not transcript:
+                    self._shared_resume_result = {"error": "incomplete"}
+                    return
+                ok = agent.import_shared_session(base_repo, session_id, transcript, overwrite=overwrite, as_id=as_id)
+                self._shared_resume_result = {
+                    "ok": ok,
+                    "name": name,
+                    "resume_id": resume_id,
+                    "backend": backend,
+                    "as_id": as_id,
+                    "entry_name": entry.name,
+                }
+            except Exception as error:
+                self._shared_resume_result = {"error": repr(error)}
+
+        self._set_message(f"Fetching '{entry.display}'… it will switch in once ready.", seconds=120.0)
+        self._render()
+        self._shared_resume_thread = threading.Thread(target=worker, daemon=True, name="agit-shared-resume")
+        self._shared_resume_thread.start()
+
+    def _service_shared_resume(self) -> None:
+        result = self._shared_resume_result
+        if result is None:
+            return
+        if self._shared_resume_thread is not None and self._shared_resume_thread.is_alive():
+            return  # still fetching
+        self._shared_resume_result = None
+        self._shared_resume_thread = None
+        if result.get("error") == "incomplete":
+            self._set_message("That shared session is incomplete; cannot resume it.", seconds=8.0)
+            self._render()
+            return
+        if "error" in result:
+            self._set_message(f"Could not fetch the shared session: {result['error']}", seconds=10.0)
+            self._render()
+            return
+        if not result.get("ok"):
+            self._set_message("Could not install the shared session for resume.", seconds=8.0)
+            self._render()
+            return
+        if result.get("as_id"):
+            self._user_state().set_shared_origin_name(result["as_id"], result["entry_name"])
+        self._resume_conversation(result["name"], result["resume_id"], backend=result["backend"])
 
     def _format_age(self, updated: float) -> str:
         # An unknown/unset timestamp (0 or None) must not be rendered as a date —
@@ -3754,6 +3835,7 @@ class ProxyRunner:
             self._ensure_worktree_alive()
             self._service_commit_summaries()  # apply finished background summaries (#8)
             self._service_precompact_summary()
+            self._service_shared_resume()  # complete a shared-session resume once fetched
             self._maybe_agent_commit()
             self._service_background_sessions()
             self._poll_base_advanced()
