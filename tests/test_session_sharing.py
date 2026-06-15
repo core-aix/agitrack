@@ -149,6 +149,54 @@ def test_fetch_passes_timeout_through_to_git(tmp_path):
     assert seen == [12.0]
 
 
+def test_read_transcript_passes_timeout_to_on_demand_fetch(tmp_path):
+    # The full-transcript fetch (slow, can be large) must be bounded so it can't
+    # wait forever — read_transcript threads its timeout into the on-demand fetch.
+    seen: list = []
+
+    class FakeRepo:
+        repo = tmp_path
+
+        def root_commit(self):
+            return "abc"
+
+        def read_ref_blob(self, ref, path):
+            return None if not seen else "the transcript"  # missing until the fetch runs
+
+        def remote_exists(self, name="origin"):
+            return True
+
+        def fetch_ref(self, refspec, *, remote="origin", filter_blobs=None, timeout=None):
+            seen.append(timeout)
+            return True
+
+    from agit.sessions import SharedEntry
+
+    store = SharedSessionStore(FakeRepo())  # type: ignore[arg-type]
+    entry = SharedEntry(github_id="me", name="sess", manifest={})
+    assert store.read_transcript(entry, timeout=120.0) == "the transcript"
+    assert seen == [120.0]
+
+
+def test_finalize_on_exit_cancels_inflight_fetches(tmp_path, monkeypatch):
+    # Choosing to exit must stop any unfinished session fetch immediately.
+    backend = _StubBackend()
+    runner, _repo = _runner_with_store(tmp_path, monkeypatch, backend)
+    cancelled = []
+    runner._cancel_inflight_shared_fetches = lambda: cancelled.append(True)
+    # Neutralise the rest of the (heavy) finalize so the test stays a unit.
+    runner.sessions = [runner.active]
+    runner._commit_latest_turn_sync = lambda: None
+    runner._auto_share_on_exit = lambda: None
+    runner._finalize_summary_then_integrate_on_exit = lambda: None
+    runner._delete_orphan_merged_branches = lambda: None
+    runner._sweep_orphan_shared_sessions = lambda **k: None
+
+    runner._finalize_pending_work()
+
+    assert cancelled == [True]
+
+
 def test_fetch_shared_with_cancel_fast_path_when_no_remote(tmp_path, monkeypatch):
     # No remote ⇒ nothing to fetch over the network: the helper runs the cheap
     # local call inline (no thread, no interactive wait) and reports completion.

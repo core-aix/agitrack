@@ -341,6 +341,7 @@ class ProxyRunner:
         45.0  # cap the exit-path auto-share push; long enough for a real push, short enough to never truly hang
     )
     SHARED_FETCH_TIMEOUT = 30.0  # cap the shared-session listing fetch so a slow/offline remote can't hang the menu
+    RESUME_FETCH_TIMEOUT = 120.0  # cap the full-transcript fetch when resuming a shared session (it can be large)
 
     def __init__(
         self,
@@ -530,10 +531,13 @@ class ProxyRunner:
         self._cwd_drift_checked = False
         self._cwd_check_at = 0.0
         self._cwd_launch_at = 0.0  # epoch of the latest backend launch (set in _spawn)
-        # Shared-session resume runs the (possibly slow) transcript fetch + import on
-        # a worker thread so the UI never freezes; the main loop completes the resume.
+        # Shared-session resume runs the (possibly slow) transcript fetch on a worker
+        # thread while the menu waits (cancellably); the main loop completes the
+        # resume. The cancel Event lets the user stop a slow fetch (Esc) and lets the
+        # exit path stop any in-flight fetch immediately.
         self._shared_resume_thread: threading.Thread | None = None
         self._shared_resume_result: dict | None = None
+        self._shared_resume_cancel: "threading.Event | None" = None
         self._relaunch_times: list[float] = []
         self._exiting = False
         self._finalized_on_exit = False
@@ -735,6 +739,7 @@ class ProxyRunner:
                 "_cwd_launch_at": 0.0,
                 "_shared_resume_thread": None,
                 "_shared_resume_result": None,
+                "_shared_resume_cancel": None,
                 "_use_worktrees": True,
                 "_relaunch_times": [],
                 "_exiting": False,
@@ -3176,13 +3181,41 @@ class ProxyRunner:
         thread.start()
         self._set_message(f"{message}   ·   press Esc to stop", seconds=600)
         self._render()
-        stdin_fd = sys.stdin.fileno()
-        deadline = time.monotonic() + self.SHARED_FETCH_TIMEOUT + 2.0
+        status = self._drain_pty_until_done_or_esc(thread, deadline=time.monotonic() + self.SHARED_FETCH_TIMEOUT + 2.0)
+        if status == "timeout":
+            self._set_message("Stopped fetching shared sessions (timed out).", seconds=6.0)
+            self._render()
+            return False
+        if status == "cancel":
+            self._set_message("Stopped fetching shared sessions.", seconds=6.0)
+            self._render()
+            return False
+        if result.get("error"):
+            self._debug(f"shared fetch failed: {result['error']}")
+        return True
+
+    def _drain_pty_until_done_or_esc(self, thread, *, deadline: float | None = None) -> str:
+        """Wait for *thread* while keeping the UI alive (PTYs draining) so the wait
+        is responsive, not a freeze, and the user can press Esc/Ctrl-C to stop.
+        Returns ``"done"`` when the thread finishes, ``"cancel"`` on Esc/Ctrl-C, or
+        ``"timeout"`` if the optional *deadline* passes first. Shared by the two
+        cancellable shared-session fetches (listing and full-transcript)."""
+        thread.join(timeout=0.05)  # fast fetches (and tests) finish without the wait UI
+        if not thread.is_alive():
+            return "done"
+        try:
+            stdin_fd = sys.stdin.fileno()
+        except (OSError, ValueError):
+            # No real stdin (headless/non-interactive): can't offer interactive
+            # cancel, so just wait for the thread, still honouring the deadline.
+            while thread.is_alive():
+                if deadline is not None and time.monotonic() > deadline:
+                    return "timeout"
+                thread.join(timeout=0.2)
+            return "done"
         while thread.is_alive():
-            if time.monotonic() > deadline:
-                self._set_message("Stopped fetching shared sessions (timed out).", seconds=6.0)
-                self._render()
-                return False
+            if deadline is not None and time.monotonic() > deadline:
+                return "timeout"
             master = self.master_fd
             background = self._background_fds() if self.sessions else {}
             fds = [stdin_fd]
@@ -3192,16 +3225,14 @@ class ProxyRunner:
             try:
                 readable, _, _ = select.select(fds, [], [], 0.2)
             except (OSError, ValueError):
-                # stdin/PTY not selectable (headless): just wait for the fetch.
+                # stdin/PTY not selectable (headless): just wait for the thread.
                 thread.join(timeout=0.2)
                 continue
             for fd in readable:
                 if fd == stdin_fd:
                     data = os.read(stdin_fd, 32)
                     if b"\x1b" in data or b"\x03" in data:  # Esc or Ctrl-C ⇒ stop
-                        self._set_message("Stopped fetching shared sessions.", seconds=6.0)
-                        self._render()
-                        return False
+                        return "cancel"
                 elif fd == master:
                     output = self._drain_child_output()
                     if output is not None:
@@ -3209,21 +3240,20 @@ class ProxyRunner:
                         self._feed_child_output(output)
                 elif fd in background:
                     self._pump_background(background[fd])
-        if result.get("error"):
-            self._debug(f"shared fetch failed: {result['error']}")
-        return True
+        return "done"
 
     def _resume_shared_session_menu(self) -> None:
         store = self._shared_store()
         completed = self._fetch_shared_with_cancel(store, "Fetching shared sessions…")
+        if not completed:
+            # The user stopped the fetch: leave the menu entirely rather than
+            # dropping them into a possibly-stale, previously-fetched list (which
+            # would read as if the stop did nothing). _fetch_shared_with_cancel has
+            # already shown the "Stopped fetching…" notice; let it linger.
+            return
         entries = store.entries()
         if not entries:
-            # Distinguish "you stopped a slow fetch (nothing cached yet)" from a
-            # genuine empty result, so the message isn't misleading on bad internet.
-            if completed:
-                self._set_message("No shared sessions found for this repo.")
-            else:
-                self._set_message("Stopped fetching. No shared sessions are cached yet.", seconds=6.0)
+            self._set_message("No shared sessions found for this repo.")
             self._render()
             return
         options: list[str] = []
@@ -3370,19 +3400,25 @@ class ProxyRunner:
         )
 
     def _begin_shared_resume(self, store, entry, agent, *, action, name, resume_id, overwrite, as_id, backend) -> None:
-        # Fetch the (possibly large) transcript on a worker thread so the reactor
-        # loop never blocks on the network; the import + session switch/restart then
-        # happen on the main loop (_service_shared_resume) once the result lands.
+        # Fetch the (possibly large) transcript on a worker thread, then WAIT for it
+        # cancellably: the UI keeps draining (no freeze) and the user can press Esc to
+        # stop a slow fetch. The import + session switch/restart still happen on the
+        # main loop (_service_shared_resume) once the result lands.
         if self._shared_resume_thread is not None and self._shared_resume_thread.is_alive():
             self._set_message("Already fetching a shared session — please wait.")
             self._render()
             return
         session_id = entry.manifest.get("session_id")
         self._shared_resume_result = None
+        cancel = threading.Event()
+        self._shared_resume_cancel = cancel
 
         def worker() -> None:
             try:
-                transcript = store.read_transcript(entry)  # may fetch from the remote
+                # Bound the full fetch (it can be large) so it never waits forever.
+                transcript = store.read_transcript(entry, timeout=self.RESUME_FETCH_TIMEOUT)
+                if cancel.is_set():
+                    return  # cancelled (or exiting) while fetching — drop the result
                 if not transcript:
                     self._shared_resume_result = {"error": "incomplete"}
                     return
@@ -3399,14 +3435,43 @@ class ProxyRunner:
                     "entry_name": entry.name,
                 }
             except Exception as error:
-                self._shared_resume_result = {"error": repr(error)}
+                if not cancel.is_set():
+                    self._shared_resume_result = {"error": repr(error)}
 
-        self._set_message(f"Fetching '{entry.display}'… it will switch in once ready.", seconds=120.0)
+        self._set_message(f"Fetching '{entry.display}'…   press Esc to cancel", seconds=600)
         self._render()
         self._shared_resume_thread = threading.Thread(target=worker, daemon=True, name="agit-shared-resume")
         self._shared_resume_thread.start()
+        status = self._drain_pty_until_done_or_esc(
+            self._shared_resume_thread, deadline=time.monotonic() + self.RESUME_FETCH_TIMEOUT + 2.0
+        )
+        if status != "done":
+            # Esc/Ctrl-C or the deadline: stop. The cancel Event makes the (daemon)
+            # worker drop any late result, and the bounded git fetch self-terminates.
+            cancel.set()
+            self._shared_resume_result = None
+            self._shared_resume_thread = None
+            note = "timed out" if status == "timeout" else "cancelled"
+            self._set_message(f"Stopped fetching '{entry.display}' ({note}).", seconds=6.0)
+            self._render()
+
+    def _cancel_inflight_shared_fetches(self) -> None:
+        # Stop any in-flight shared-session fetch immediately (used on exit): signal
+        # the cancel token so a still-running worker drops its result and never
+        # triggers a late session switch. The bounded git fetch self-terminates, and
+        # the daemon thread dies with the process. Best-effort and idempotent.
+        if self._shared_resume_cancel is not None:
+            self._shared_resume_cancel.set()
+        self._shared_resume_result = None
 
     def _service_shared_resume(self) -> None:
+        # A cancelled/abandoned fetch must never complete a switch: drop a late
+        # result the moment its cancel token is set (e.g. the user stopped it or aGiT
+        # is exiting).
+        if self._shared_resume_cancel is not None and self._shared_resume_cancel.is_set():
+            self._shared_resume_result = None
+            self._shared_resume_thread = None
+            return
         result = self._shared_resume_result
         if result is None:
             return
@@ -5433,6 +5498,7 @@ class ProxyRunner:
             return  # already finalized (e.g. the backend exited and we ran this)
         self._finalized_on_exit = True
         self._exiting = True
+        self._cancel_inflight_shared_fetches()  # stop any unfinished session fetch at once
         # The session the user was working in when they quit is the one to
         # auto-resume next start — not necessarily the primary (they may have
         # switched to a new or shared session). It is finalized first, below.
