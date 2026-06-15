@@ -506,6 +506,81 @@ def test_remote_publish_reclaims_previous_version_but_keeps_latest(tmp_path):
     assert clone_store.read_transcript(clone_store.entries()[0]) == "v1\nv2\n"
 
 
+def test_count_transcript_rows_ignores_blank_lines():
+    from agit.sessions import count_transcript_rows
+
+    assert count_transcript_rows("a\nb\nc\n") == 3
+    assert count_transcript_rows("a\n\n  \nb\n") == 2
+    assert count_transcript_rows("") == 0
+
+
+def test_publish_refuses_to_regress_to_a_shorter_transcript(tmp_path):
+    # Recency guard: a machine that's behind (its transcript has FEWER append-only
+    # turns) must not overwrite the longer shared copy — that was the "resume gives a
+    # much older session" bug, where a stale machine (or its auto-share) rewound the
+    # shared state. The refusal is flagged (behind) and the stored copy is unchanged.
+    store = SharedSessionStore(_init_repo(tmp_path))  # no remote: writes the local ref
+    assert (
+        store.publish(
+            github_id="a", name="s", transcript="t1\nt2\nt3\n", manifest=_manifest("s", session_id="id", updated=1)
+        ).behind
+        is False
+    )
+    behind = store.publish(
+        github_id="a", name="s", transcript="t1\nt2\n", manifest=_manifest("s", session_id="id", updated=2)
+    )
+    assert behind.behind is True
+    assert behind.pushed is False
+    # The longer copy is still intact — the older push was rejected, not applied.
+    assert store.read_transcript(store.entries()[0]) == "t1\nt2\nt3\n"
+
+
+def test_publish_allows_a_longer_transcript(tmp_path):
+    # The normal append case: more rows than the shared copy is accepted (and a new
+    # first share, with no existing entry, is never blocked).
+    store = SharedSessionStore(_init_repo(tmp_path))
+    assert (
+        store.publish(
+            github_id="a", name="s", transcript="t1\n", manifest=_manifest("s", session_id="id", updated=1)
+        ).behind
+        is False
+    )
+    grew = store.publish(
+        github_id="a", name="s", transcript="t1\nt2\n", manifest=_manifest("s", session_id="id", updated=2)
+    )
+    assert grew.behind is False
+    assert store.read_transcript(store.entries()[0]) == "t1\nt2\n"
+
+
+def test_remote_publish_recency_guard_blocks_a_behind_push(tmp_path):
+    # End-to-end through a bare remote: after the lease-fail fetch syncs the remote's
+    # longer copy, a behind machine's retry is refused — the remote is not rewound.
+    import subprocess as sp
+
+    remote = tmp_path / "remote.git"
+    sp.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+    (tmp_path / "src").mkdir()
+    src = _init_repo(tmp_path / "src")
+    branch = src.current_branch()
+    sp.run(["git", "remote", "add", "origin", str(remote)], cwd=src.repo, check=True)
+    sp.run(["git", "push", "-q", "origin", f"HEAD:refs/heads/{branch}"], cwd=src.repo, check=True)
+    sp.run(["git", "-C", str(remote), "symbolic-ref", "HEAD", f"refs/heads/{branch}"], check=True)
+    store = SharedSessionStore(src)
+
+    assert store.publish(
+        github_id="a", name="s", transcript="t1\nt2\nt3\n", manifest=_manifest("s", session_id="id", updated=2)
+    ).pushed
+    # A would-be regression to a shorter transcript is refused and never pushed.
+    behind = store.publish(
+        github_id="a", name="s", transcript="t1\n", manifest=_manifest("s", session_id="id", updated=3)
+    )
+    assert behind.behind is True and behind.pushed is False
+    sp.run(["git", "clone", "-q", str(remote), str(tmp_path / "clone")], check=True)
+    clone_store = SharedSessionStore(GitRepo(tmp_path / "clone"))
+    assert clone_store.fetch()
+    assert clone_store.read_transcript(clone_store.entries()[0]) == "t1\nt2\nt3\n"  # remote intact
+
+
 class _PublishFakeRepo:
     """Records fetch/push calls so the push-first publish path can be asserted.
 
@@ -526,6 +601,9 @@ class _PublishFakeRepo:
 
     def read_tree_paths(self, ref):
         return {}
+
+    def read_ref_blob(self, ref, path):
+        return ""  # no existing entry → the recency guard never blocks these tests
 
     def write_blob(self, content):
         return "blob"
@@ -720,6 +798,42 @@ def test_resume_shared_keep_both_imports_under_new_id(tmp_path, monkeypatch):
     assert backend.imported_as_id == "claude-copy-id"  # re-imported under the fresh id
     assert resumed == [("sess", "claude-copy-id")]  # and resumed that copy
     assert AgitState(repo.repo).shared_origin_name("claude-copy-id") == "sess"
+
+
+def test_resume_shared_defaults_to_local_when_shared_is_older(tmp_path, monkeypatch):
+    # Guard against silent downgrade (the "resume gives a much older session" report):
+    # when the shared copy has FEWER turns than the local one, the conflict prompt
+    # leads with keeping the local (newer) copy, and taking that default resumes
+    # locally WITHOUT importing the older shared version.
+    backend = _StubBackend(transcript="a\nb\nc\n", has_local=True)  # local = 3 rows
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
+    SharedSessionStore(repo).publish(
+        github_id="me",
+        name="sess",
+        transcript="a\n",  # shared = 1 row (older / shorter)
+        manifest={"github_id": "me", "name": "sess", "session_id": "sid-x", "updated": 1, "transcript_rows": 1},
+    )
+    runner.sessions = []
+    resumed: list = []
+    runner._resume_conversation = lambda name, sid, **k: resumed.append((name, sid))
+    runner._prompt_session_name = lambda title, *, default: default
+    captured: dict = {}
+
+    def conflict_pick(title, options):
+        captured["title"] = title
+        captured["options"] = list(options)
+        return options[0]  # take the default (lead) option
+
+    picks = iter([lambda t, o: o[0], conflict_pick])  # 1st popup picks the entry; 2nd is the conflict
+    runner._select_popup = lambda title, options: next(picks)(title, options)
+
+    runner._resume_shared_session_menu()
+    _drain_shared_resume(runner)
+
+    assert backend.imported is None  # the older shared copy was NOT imported
+    assert resumed == [("sess", "sid-x")]  # resumed the local (newer) copy directly
+    assert captured["options"][0].startswith("Keep my local copy")  # the newer copy leads
+    assert "NEWER" in captured["title"]
 
 
 # --- auto-share opt-in state ------------------------------------------------
