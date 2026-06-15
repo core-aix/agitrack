@@ -52,6 +52,16 @@ class PublishResult:
     error: str = ""
 
 
+def _is_stale_lease(error: str) -> bool:
+    """Whether a failed push was *rejected because the remote moved* (a lost race
+    or a never-fetched remote ref) — the only failure publish() retries after a
+    sync. Auth/network errors don't match these markers, so they fail fast instead
+    of looping. Git emits 'stale info' for a broken ``--force-with-lease`` and
+    'fetch first'/'non-fast-forward'/'[rejected]' for an ordinary rejection."""
+    text = error.lower()
+    return any(marker in text for marker in ("stale info", "fetch first", "non-fast-forward", "rejected"))
+
+
 @dataclass
 class SharedSessionStore:
     repo: GitRepo  # the BASE repo (owns the remote and the shared object db)
@@ -225,22 +235,34 @@ class SharedSessionStore:
     def publish(
         self, *, github_id: str, name: str, transcript: str, manifest: dict, keep: int = DEFAULT_KEEP
     ) -> PublishResult:
-        """Share one session: sync from the remote, add it, prune the
-        contributor's stale ones, and push. The local copy is always saved (so it
-        can be pushed later); the push is best-effort and reports its outcome.
+        """Share one session: add it, prune the contributor's stale ones, and push.
+        The local copy is always saved (so it can be pushed later); the push is
+        best-effort and reports its outcome.
 
-        Uses ``--force-with-lease`` against the just-fetched remote tip, so a
-        concurrent contributor's push is never clobbered — it fails cleanly and
-        the user can retry (the retry re-fetches their work first)."""
+        Push-first: build on the local tip and push optimistically, leasing against
+        the tip we last knew. This avoids a fetch round trip in the common case —
+        nobody else pushed since our last sync — so a share is a single network hop.
+        ``--force-with-lease`` still guards against clobbering a concurrent
+        contributor: a stale lease fails cleanly, and only then do we fetch their
+        work, rebuild our entry onto the new tip, and retry. Net effect: one hop
+        normally, two only on a genuine race."""
         gid, nm = slug(github_id), slug(name)
-        remote = self.repo.remote_exists()
-        if remote:
-            self.fetch()
-        old = self.repo.ref_sha(self.ref)  # remote tip we're racing against
+        if not self.repo.remote_exists():
+            self._add_session(gid, nm, transcript, manifest)
+            pruned = self.prune_own_stale(gid, keep=keep)
+            return PublishResult(remote=False, pushed=False, pruned=pruned)
+        result = self._add_and_push(gid, nm, transcript, manifest, keep)
+        if result.pushed or not _is_stale_lease(result.error):
+            return result
+        # Lost the race (or our orphan ref diverged from a remote one we'd never
+        # fetched): sync onto the current remote tip and try once more.
+        self.fetch()
+        return self._add_and_push(gid, nm, transcript, manifest, keep)
+
+    def _add_and_push(self, gid: str, nm: str, transcript: str, manifest: dict, keep: int) -> PublishResult:
+        old = self.repo.ref_sha(self.ref)  # tip we believe the remote is at
         self._add_session(gid, nm, transcript, manifest)
         pruned = self.prune_own_stale(gid, keep=keep)
-        if not remote:
-            return PublishResult(remote=False, pushed=False, pruned=pruned)
         lease = f"{self.ref}:{old}" if old else None  # None ⇒ creating the ref
         ok, err = self.repo.push_ref(f"{self.ref}:{self.ref}", force_with_lease=lease)
         return PublishResult(remote=True, pushed=ok, pruned=pruned, error="" if ok else err.strip())

@@ -356,6 +356,84 @@ def test_publish_without_remote_saves_locally(tmp_path):
     assert result.remote is False and result.pushed is False
 
 
+class _PublishFakeRepo:
+    """Records fetch/push calls so the push-first publish path can be asserted.
+
+    ``push_results`` is consumed one per push attempt (``(ok, stderr)``)."""
+
+    def __init__(self, push_results):
+        self.push_results = list(push_results)
+        self.calls: list = []
+
+    def remote_exists(self, name="origin"):
+        return True
+
+    def root_commit(self):
+        return "fp"
+
+    def ref_sha(self, ref):
+        return "localtip"
+
+    def read_tree_paths(self, ref):
+        return {}
+
+    def write_blob(self, content):
+        return "blob"
+
+    def write_tree_from(self, entries):
+        return "tree"
+
+    def commit_tree_orphan(self, tree, message):
+        return "commit"
+
+    def update_ref(self, ref, sha):
+        pass
+
+    def delete_orphaned_objects(self, old):
+        return 0
+
+    def fetch_ref(self, refspec, *, remote="origin", filter_blobs=None, timeout=None, cancel=None):
+        self.calls.append("fetch")
+        return True
+
+    def push_ref(self, refspec, *, remote="origin", force_with_lease=None):
+        self.calls.append("push")
+        return self.push_results.pop(0)
+
+
+def test_publish_pushes_first_without_a_fetch_in_the_common_case(tmp_path):
+    # Push-first: when the optimistic push lands, publish makes a single network
+    # hop — no pre-fetch — so a share is fast on a good connection.
+    repo = _PublishFakeRepo([(True, "")])
+    result = SharedSessionStore(repo).publish(  # type: ignore[arg-type]
+        github_id="a", name="s", transcript="t", manifest=_manifest("s", session_id="id", updated=1)
+    )
+    assert result.pushed is True
+    assert repo.calls == ["push"]  # no fetch in the common case
+
+
+def test_publish_retries_after_stale_lease(tmp_path):
+    # A concurrent contributor moved the remote: the optimistic push is rejected
+    # with a stale lease, so publish syncs and retries exactly once.
+    repo = _PublishFakeRepo([(False, "! [rejected] shared (stale info)"), (True, "")])
+    result = SharedSessionStore(repo).publish(  # type: ignore[arg-type]
+        github_id="a", name="s", transcript="t", manifest=_manifest("s", session_id="id", updated=1)
+    )
+    assert result.pushed is True
+    assert repo.calls == ["push", "fetch", "push"]  # push-first, sync, retry
+
+
+def test_publish_does_not_retry_on_auth_failure(tmp_path):
+    # A non-race failure (auth) must fail fast: no fetch, no second push, so a
+    # broken credential can't spin the publish into a retry loop.
+    repo = _PublishFakeRepo([(False, "fatal: Authentication failed for 'origin'")])
+    result = SharedSessionStore(repo).publish(  # type: ignore[arg-type]
+        github_id="a", name="s", transcript="t", manifest=_manifest("s", session_id="id", updated=1)
+    )
+    assert result.pushed is False
+    assert repo.calls == ["push"]  # failed fast — no fetch/retry
+
+
 def test_unshare_removes_only_that_entry(tmp_path):
     store = SharedSessionStore(_init_repo(tmp_path))
     store.publish(github_id="alice", name="keep", transcript="k", manifest=_manifest("keep", session_id="k", updated=1))
@@ -773,6 +851,44 @@ def _runner_with_store(tmp_path, monkeypatch, backend):
     runner.messages = []
     runner._set_message = lambda msg, **k: runner.messages.append(msg)
     return runner, repo
+
+
+def test_warm_share_login_resolves_when_sharing_reachable(tmp_path):
+    # Startup warms the login cache so auto-share never shells out mid-share.
+    from types import SimpleNamespace
+    from proxy_helpers import make_runner
+
+    runner = make_runner()
+    runner._debug = lambda *a, **k: None
+    runner.backend = SimpleNamespace(supports_session_sharing=True)
+    runner.global_config = SimpleNamespace(github_login="")
+    runner.base_repo = SimpleNamespace(remote_exists=lambda: True)
+    resolved: list = []
+    runner._cached_or_resolve_login = lambda: resolved.append(True) or "tester"
+
+    runner._warm_share_login()
+    assert resolved == [True]
+
+
+def test_warm_share_login_skips_when_no_remote_or_already_cached(tmp_path):
+    from types import SimpleNamespace
+    from proxy_helpers import make_runner
+
+    runner = make_runner()
+    runner._debug = lambda *a, **k: None
+    runner.backend = SimpleNamespace(supports_session_sharing=True)
+    resolved: list = []
+    runner._cached_or_resolve_login = lambda: resolved.append(True) or "tester"
+
+    # No remote ⇒ sharing can't reach anyone, so don't spend a `gh` call.
+    runner.global_config = SimpleNamespace(github_login="")
+    runner.base_repo = SimpleNamespace(remote_exists=lambda: False)
+    runner._warm_share_login()
+    # Already cached ⇒ nothing to resolve.
+    runner.global_config = SimpleNamespace(github_login="tester")
+    runner.base_repo = SimpleNamespace(remote_exists=lambda: True)
+    runner._warm_share_login()
+    assert resolved == []
 
 
 def test_runner_share_session_publishes_and_redacts(tmp_path, monkeypatch):

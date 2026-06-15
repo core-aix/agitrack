@@ -832,6 +832,10 @@ class ProxyRunner:
         # dashboard's committer identities and session sharing depend on it (#76).
         # Runs in the background so a slow `gh auth status` never blocks startup.
         threading.Thread(target=self._notify_if_gh_unavailable, daemon=True).start()
+        # Resolve the GitHub login now, off the hot path, so neither a live nor an
+        # exit-time auto-share has to shell out to `gh` mid-share (that lookup can
+        # stall and would otherwise eat into the bounded share budget).
+        threading.Thread(target=self._warm_share_login, daemon=True).start()
         self.old_attrs = termios.tcgetattr(sys.stdin.fileno())
         try:
             self._enter_host_screen()
@@ -928,6 +932,19 @@ class ProxyRunner:
             return  # gh is installed and authenticated — nothing to suggest
         self._set_message(message, seconds=12.0)
         self._render()
+
+    def _warm_share_login(self) -> None:
+        # Populate the GitHub-login cache at startup so auto-share never resolves it
+        # mid-share. Only when sharing is actually reachable (backend supports it and
+        # a remote exists), to avoid a pointless `gh` call on solo/offline repos.
+        try:
+            if not getattr(self.backend, "supports_session_sharing", False):
+                return
+            if self.global_config.github_login or not self.base_repo.remote_exists():
+                return
+            self._cached_or_resolve_login()
+        except Exception as error:
+            self._debug(f"warm share login failed: {error!r}")
 
     @staticmethod
     def _gh_unavailable_hint(status: str) -> str | None:
