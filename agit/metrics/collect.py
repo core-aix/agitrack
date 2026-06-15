@@ -742,28 +742,16 @@ def _parse_metadata(body: str) -> dict[str, str]:
     return metadata
 
 
-def _section(body: str, header: str) -> list[str]:
-    lines = body.splitlines()
-    try:
-        start = lines.index(header)
-    except ValueError:
-        return []
-    collected: list[str] = []
-    for line in lines[start + 1 :]:
-        if line.startswith("# ") or line.startswith("## "):
-            break
-        collected.append(line)
-    return collected
-
-
 def _extract_prompt(body: str, subject: str, kind: str) -> str:
     if kind != "agent":
         return ""
-    # When a summary leads the message (#8) the turn's prompts live in the
-    # "# Prompts" section; otherwise the subject IS the prompt.
-    prompts = " ".join(line.strip() for line in _section(body, "# Prompts") if line.strip())
-    if prompts:
-        return prompts
+    # The turn's prompts live in the interaction trace's "## User" sections. When a
+    # summary leads the message (#8) the subject is the summary, not the prompt, so
+    # the trace is the reliable source; fall back to the subject for a prompt-led
+    # message with no trace.
+    user_prompts = _extract_user_prompts(body)
+    if user_prompts:
+        return " ".join(user_prompts)
     return subject.removeprefix("<aGiT> ").strip()
 
 
