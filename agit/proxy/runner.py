@@ -2963,14 +2963,23 @@ class ProxyRunner:
             "content_hash": hashlib.sha256(redacted.encode("utf-8")).hexdigest(),
             "transcript_bytes": self.backend.transcript_size(self.base_repo.repo, sid),
         }
-        try:
-            result = self._shared_store().publish(
-                github_id=entry.github_id, name=entry.name, transcript=redacted, manifest=manifest
+        # Same UX as the initial share: show a "pushing to origin…" notice while the
+        # (potentially slow) push runs, and let the user press Esc to cancel it.
+        self._set_message(f"Updating '{entry.display}' — pushing to origin…   press Esc to cancel", seconds=600)
+        self._render()
+        outcome = self._publish_with_cancel(
+            self._shared_store(), github_id=entry.github_id, name=entry.name, transcript=redacted, manifest=manifest
+        )
+        if outcome.get("cancelled"):
+            self._await_keypress(
+                f"'{entry.display}' was NOT updated — the push to origin was cancelled. Press any key to continue."
             )
-        except Exception as error:
-            self._set_message(f"Could not update {entry.display}: {error}", seconds=10.0)
+            return
+        if "error" in outcome:
+            self._set_message(f"Could not update {entry.display}: {outcome['error']}", seconds=10.0)
             self._render()
             return
+        result = outcome["result"]
         if sid:
             self._auto_share_hash[sid] = manifest["content_hash"]
         self._set_message(self._share_outcome_message(result, entry.github_id, entry.name), seconds=12.0)
