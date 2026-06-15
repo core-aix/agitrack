@@ -897,7 +897,11 @@ class ProxyRunner:
                     os.chdir(self.base_repo.repo)
                 except OSError:
                     pass
-            restart_agit()
+            # This restart follows an in-app (menu) update; the user already saw
+            # and acknowledged the privacy warning when this session started, so
+            # don't make them acknowledge it again. (A startup-time update re-execs
+            # via the CLI without this flag, so that path still shows the warning.)
+            restart_agit(["--skip-privacy-ack"])
         return exit_code
 
     def _ensure_backend_available(self) -> bool:
