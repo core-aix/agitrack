@@ -146,11 +146,35 @@ def test_source_check_snapshots_running_rev_at_construction(source_clone, monkey
 def test_source_check_errors_without_upstream(tmp_path: Path):
     repo = tmp_path / "solo"
     _init_repo(repo)
-    _commit(repo, "agit.py", "v1\n", "first")  # main has no upstream
+    _commit(repo, "agit.py", "v1\n", "first")  # main, no upstream and no remote
     status = Updater(source_repo=repo).check()
     assert not status.ok
     assert status.available is False
     assert "upstream" in (status.error or "")
+
+
+def test_source_check_detects_update_on_branch_without_upstream(source_clone):
+    # aGiT usually runs on a session worktree branch (`agit/...`) that tracks no
+    # upstream of its own. The check must still find updates by comparing against
+    # origin's default branch, not silently report "up to date".
+    remote, clone = source_clone
+    _git(["checkout", "-q", "-b", "agit/session-1"], clone)  # branch with no upstream
+    _commit(remote, "agit.py", "v2\n", "second")  # origin's default branch advances
+    status = Updater(source_repo=clone).check()
+    assert status.ok
+    assert status.available is True
+    assert status.behind == 1
+
+
+def test_source_apply_merges_default_branch_without_upstream(source_clone):
+    # The same no-upstream branch must actually update by merging origin's default
+    # branch when the user applies the update.
+    remote, clone = source_clone
+    _git(["checkout", "-q", "-b", "agit/session-1"], clone)
+    _commit(remote, "agit.py", "v2\n", "second")
+    result = Updater(source_repo=clone).apply()
+    assert result.ok, result.error
+    assert (clone / "agit.py").read_text() == "v2\n"  # upstream default branch merged in
 
 
 # --- source apply -----------------------------------------------------------
@@ -182,13 +206,35 @@ def test_source_apply_refuses_dirty_tree(source_clone):
     assert (clone / "agit.py").read_text() == "local edit\n"  # untouched
 
 
-def test_source_apply_refuses_diverged_branch(source_clone):
+def test_source_apply_merges_diverged_branch_cleanly(source_clone):
+    # aGiT runs on session branches that accumulate the user's own commits, so the
+    # checkout is routinely diverged from upstream. A divergence with NO conflicting
+    # edits must merge cleanly — pulling in upstream while preserving local work —
+    # rather than being refused.
     remote, clone = source_clone
-    _commit(remote, "agit.py", "v2\n", "remote change")
-    _commit(clone, "local.py", "x\n", "local change")  # clone diverged, clean tree
+    _commit(remote, "remote.py", "r\n", "remote change")  # upstream touches a new file
+    _commit(clone, "local.py", "l\n", "local change")  # local touches a different file
+    result = Updater(source_repo=clone).apply()
+    assert result.ok, result.error
+    assert (clone / "remote.py").read_text() == "r\n"  # upstream change pulled in
+    assert (clone / "local.py").read_text() == "l\n"  # local work preserved
+
+
+def test_source_apply_reports_merge_conflict(source_clone):
+    # When upstream and local edit the SAME lines, an automatic merge can't resolve
+    # it: report a clear "merge conflict" message and abort, leaving the running
+    # source clean (no conflict markers, local work intact) instead of half-merged.
+    remote, clone = source_clone
+    _commit(remote, "agit.py", "remote v2\n", "remote change")  # same file...
+    _commit(clone, "agit.py", "local v2\n", "local change")  # ...edited differently
     result = Updater(source_repo=clone).apply()
     assert not result.ok
-    assert "diverged" in (result.error or "")
+    assert "merge conflict" in (result.error or "").lower()
+    assert (clone / "agit.py").read_text() == "local v2\n"  # local kept, merge aborted
+    porcelain = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=str(clone), text=True, stdout=subprocess.PIPE
+    ).stdout
+    assert porcelain.strip() == ""  # no in-progress merge / conflict state left behind
 
 
 # --- package path (mocked index) -------------------------------------------
@@ -359,6 +405,20 @@ def test_handle_update_command_applies_when_ready(monkeypatch):
     runner._handle_update_command()
     assert runner._update_pending is True
     assert applied == [True]
+
+
+def test_handle_update_command_runs_a_fresh_check(monkeypatch):
+    # The menu must NOT trust the (up to 5-min stale) cached status: a fresh check
+    # runs on demand, so a newer version that appeared since the last periodic check
+    # is offered instead of wrongly reporting "up to date".
+    runner = make_runner()
+    runner._update_status = UpdateStatus(kind=KIND_SOURCE, available=False, message="aGiT is up to date.")
+    fresh = _available_status()
+    runner._updater = _FakeUpdater(fresh)
+    monkeypatch.setattr(runner, "_select_popup", lambda *a, **k: "Not now")
+    runner._handle_update_command()
+    assert runner._update_status is fresh  # the cached "up to date" was replaced
+    assert "update postponed" in (runner.message or "").lower()
 
 
 def test_maybe_apply_pending_update_triggers_when_ready(monkeypatch):
