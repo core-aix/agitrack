@@ -542,6 +542,10 @@ class ProxyRunner:
         self._shared_resume_thread: threading.Thread | None = None
         self._shared_resume_result: dict | None = None
         self._shared_resume_cancel: "threading.Event | None" = None
+        # Fire-and-forget network share ops (e.g. unshare) run on daemon threads so the
+        # session never freezes; _service_background_share_ops surfaces each result as a
+        # notice when it finishes. Each entry: {key, thread, box, outcome_fn}.
+        self._background_share_ops: list[dict] = []
         self._relaunch_times: list[float] = []
         self._exiting = False
         self._finalized_on_exit = False
@@ -744,6 +748,7 @@ class ProxyRunner:
                 "_shared_resume_thread": None,
                 "_shared_resume_result": None,
                 "_shared_resume_cancel": None,
+                "_background_share_ops": [],
                 "_use_worktrees": True,
                 "_relaunch_times": [],
                 "_exiting": False,
@@ -2986,23 +2991,69 @@ class ProxyRunner:
         self._render()
 
     def _unshare_entry(self, entry) -> None:
-        try:
-            result = self._shared_store().unshare(entry.github_id, entry.name)
-        except Exception as error:
-            self._set_message(f"Could not unshare {entry.display}: {error}", seconds=10.0)
-            self._render()
-            return
+        # Unsharing is a one-way, fire-and-forget network op with no follow-up, and the
+        # user shouldn't have to wait on it — run it in the BACKGROUND so the session
+        # never freezes, showing a progress notice now and the result when it lands.
+        store = self._shared_store()
         sid = entry.manifest.get("session_id", "")
         if sid:
-            self._set_session_auto_share(sid, False)
-        if not result.remote:
-            message = f"Removed {entry.display} from the local shared ref (no remote to push the removal to)."
-        elif result.pushed:
-            message = f"Unshared {entry.display} (removed from origin)."
-        else:
-            message = f"Removed {entry.display} locally, but the push was rejected — try again. [{result.error[:80]}]"
-        self._set_message(message, seconds=10.0)
+            self._set_session_auto_share(sid, False)  # stop auto-pushing it immediately
+
+        def op():
+            return store.unshare(entry.github_id, entry.name)
+
+        def outcome(box) -> str:
+            if "error" in box:
+                return f"Could not unshare {entry.display}: {box['error']}"
+            result = box["result"]
+            if not result.remote:
+                return f"Removed {entry.display} from the local shared ref (no remote to push the removal to)."
+            if result.pushed:
+                return f"Unshared {entry.display} (removed from origin)."
+            return f"Removed {entry.display} locally, but the push was rejected — try again. [{result.error[:80]}]"
+
+        self._run_share_op_async(
+            f"unshare:{entry.display}", f"Unsharing {entry.display} — removing from origin…", op, outcome
+        )
+
+    def _run_share_op_async(self, key: str, pending_text: str, op, outcome_fn) -> None:
+        """Run a best-effort network share op (e.g. unshare) on a daemon thread so the
+        session never freezes. Shows *pending_text* as a notice now; a later main-loop
+        tick (_service_background_share_ops) replaces it with ``outcome_fn(box)`` once
+        the worker finishes, where ``box`` is ``{"result": ...}`` or ``{"error": str}``.
+        The user keeps working throughout."""
+        self._set_session_notice(key, pending_text, seconds=180.0)
         self._render()
+        box: dict = {}
+
+        def worker() -> None:
+            try:
+                box["result"] = op()
+            except Exception as error:
+                box["error"] = str(error)
+
+        thread = threading.Thread(target=worker, daemon=True, name="agit-share-op")
+        thread.start()
+        self._background_share_ops.append({"key": key, "thread": thread, "box": box, "outcome_fn": outcome_fn})
+
+    def _service_background_share_ops(self) -> None:
+        """Main-loop tick: surface each finished background share op's result as a
+        notice (replacing its in-progress one), and drop it from the pending list."""
+        if not self._background_share_ops:
+            return
+        still: list[dict] = []
+        for entry in self._background_share_ops:
+            if entry["thread"].is_alive():
+                still.append(entry)
+                continue
+            try:
+                text = entry["outcome_fn"](entry["box"])
+            except Exception as error:
+                self._debug(f"background share op outcome failed: {error!r}")
+                text = None
+            if text:
+                self._set_session_notice(entry["key"], text, seconds=10.0)
+        self._background_share_ops = still
 
     def _session_auto_shared(self, session_id: str | None) -> bool:
         # Read the opt-in from the BASE repo state (persists across runs); the
@@ -4443,6 +4494,7 @@ class ProxyRunner:
             # _maybe_apply_pending_update finalized and removed the worktree for a
             # restart; stop before the worktree-touching sync below.
             return
+        self._service_background_share_ops()  # surface finished background unshare/etc. results
         self._service_session_notices()  # expire/refresh per-session status lines
         if self._base_advanced:
             self._base_advanced = False
