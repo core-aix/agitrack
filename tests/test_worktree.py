@@ -247,6 +247,21 @@ def test_open_session_worktree_creates_then_reuses(tmp_path):
     assert info2.path == info1.path
 
 
+def test_worktree_manager_move_renames_directory(tmp_path):
+    main = _init_repo(tmp_path)
+    wm = WorktreeManager(main)
+    info = wm.create("old-name", base=main.current_branch())
+    (info.path / "work.txt").write_text("hi\n")  # some content to carry across the move
+
+    new_info = wm.move("old-name", "new-name")
+
+    assert new_info.name == "new-name"
+    assert new_info.path.is_dir() and new_info.path.name == "new-name"
+    assert (new_info.path / "work.txt").read_text() == "hi\n"  # content moved with it
+    assert not info.path.exists()  # old directory is gone
+    assert GitRepo(new_info.path).current_branch()  # still a valid worktree
+
+
 def test_worktree_has_pending_work(tmp_path):
     main = _init_repo(tmp_path)
     base = main.current_branch()

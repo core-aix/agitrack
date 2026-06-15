@@ -69,7 +69,7 @@ import threading
 import time
 from typing import Callable
 
-from agit.commits import build_agent_commit_message
+from agit.commits import build_agent_commit_message, render_interaction_trace
 from agit.git import GitRepo
 from agit.transcripts.opencode import SessionTurn
 from agit.transcripts import turns_after
@@ -86,8 +86,10 @@ _StageUntrackedFn = Callable[[GitRepo, AgitState], None]
 _PreCommitFn = Callable[[], None]
 """Called immediately before the ``git commit`` (e.g. ``_ensure_turn_branch``)."""
 
-_OnCommitFn = Callable[[str | None], None]
-"""Called with the short commit SHA after a successful commit (may be None)."""
+_OnCommitFn = Callable[[str | None, str, bool], None]
+"""Called after a successful commit with: the short commit SHA (may be None), the
+rendered interaction trace, and whether the commit is a *cover* (a merge-shaped
+commit aGiT placed on top of the backend agent's own commits, #35)."""
 
 _DebugFn = Callable[..., None]
 """Logging sink — ``runner._debug``."""
@@ -214,10 +216,16 @@ class CommitEngine:
             self.repo.add_tracked()
             stage_untracked_fn(self.repo, self.state)
             cover_backend_head = False
+            cover_with_staged = False
             if not self.repo.has_staged_changes():
                 if not self._head_is_coverable(backend_commits):
                     return False
                 cover_backend_head = True
+            elif self._head_is_coverable(backend_commits):
+                # Staged changes on top of coverable backend commits: cover them
+                # together so the covered changes aren't hidden behind a plain
+                # commit's single parent (#35).
+                cover_with_staged = True
             # Commit (or cover) will happen: accumulate trace and tokens now.
             for turn in turns:
                 if turn.user_prompt:
@@ -287,10 +295,16 @@ class CommitEngine:
             stage_untracked_fn(self.repo, self.state)
 
             cover_backend_head = False
+            cover_with_staged = False
             if not self.repo.has_staged_changes():
                 if not self._head_is_coverable(backend_commits):
                     return False
                 cover_backend_head = True
+            elif self._head_is_coverable(backend_commits):
+                # Staged changes on top of coverable backend commits: cover them
+                # together so the covered changes aren't hidden behind a plain
+                # commit's single parent (#35).
+                cover_with_staged = True
 
             # Accumulate tokens only once we know the commit (or cover) will happen.
             for turn in turns:
@@ -322,24 +336,36 @@ class CommitEngine:
             started_at=min(starts) if starts else None,
             ended_at=max(ends) if ends else None,
         )
-        if cover_backend_head:
-            # The backend committed its own work, leaving the tree clean (#35).
-            # Its commits keep their hashes — amending them broke references
-            # the agent had already published in PRs/issues (#58). Instead the
-            # trace/metadata ride a GitHub-PR-style merge-shaped cover commit
-            # on top: same tree as the backend's head, parents (turn start,
-            # backend head), so `git log --first-parent` reads turn-by-turn.
+        if cover_backend_head or cover_with_staged:
+            # The backend committed its own work (#35). Its commits keep their
+            # hashes — amending them broke references the agent had already
+            # published in PRs/issues (#58). Instead the trace/metadata ride a
+            # GitHub-PR-style merge-shaped cover commit on top, parents (turn
+            # start, backend head), so `git log --first-parent` reads turn-by-turn
+            # and the cover's diff shows every covered change. When aGiT also has
+            # extra staged changes on top (e.g. it staged the agent's new files),
+            # `include_staged` folds them into the cover's tree so they're tracked
+            # alongside the covered commits rather than hidden behind a plain
+            # commit's single parent.
             commit_sha = self.repo.cover_commit(
                 message,
                 first_parent=f"{backend_commits[0]}^",
                 second_parent=backend_commits[-1],
+                include_staged=cover_with_staged,
             )
         else:
             commit_sha = self.repo.commit(message)
+        # Render the interaction trace exactly as it landed in the commit, BEFORE
+        # clearing it, and hand it to on_commit_fn — this is the summarizer's sole
+        # input. (Capturing it in the caller before commit_turns was wrong: the
+        # proxy branch above clears pending_trace and rebuilds it from the turns,
+        # so a pre-commit capture saw only stray leftover prompts, which made the
+        # summary empty/garbage and often unusable.)
+        trace_text = render_interaction_trace(self.state.pending_trace(), self.state.trace_turn_limit)
         self.state.clear_trace()
 
         if on_commit_fn is not None:
-            on_commit_fn(commit_sha)
+            on_commit_fn(commit_sha, trace_text, cover_backend_head or cover_with_staged)
 
         return True
 

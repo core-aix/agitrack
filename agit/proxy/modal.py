@@ -127,13 +127,35 @@ class SelectModal:
     def __init__(self, title: str, options: list[str]) -> None:
         self.title = title
         self.options = options
+        # A blank/whitespace-only option is a separator: rendered as a gap and
+        # skipped during navigation (never highlighted, never returned). Start the
+        # selection on the first real option.
         self.selected = 0
+        if self.options and self._is_separator(self.options[self.selected]):
+            self._advance(1)
         self._escape_buffer: bytearray | None = None
+
+    @staticmethod
+    def _is_separator(option: str) -> bool:
+        return option.strip() == ""
+
+    def _advance(self, delta: int) -> None:
+        """Move the selection by *delta*, wrapping and skipping separator rows."""
+        count = len(self.options)
+        index = self.selected
+        for _ in range(count):
+            index = (index + delta) % count
+            if not self._is_separator(self.options[index]):
+                self.selected = index
+                return
 
     def render_message(self) -> str:
         """Return the message string that should be shown in the popup area."""
         lines = [self.title, "Up/Down selects. Enter confirms.", ""]
         for index, option in enumerate(self.options):
+            if self._is_separator(option):
+                lines.append("")  # a blank gap between groups
+                continue
             prefix = "> " if index == self.selected else "  "
             lines.append(prefix + option)
         return "\n".join(lines)
@@ -151,10 +173,10 @@ class SelectModal:
                 self._escape_buffer.extend(char)
                 sequence = bytes(self._escape_buffer)
                 if sequence == b"\x1b[A":
-                    self.selected = (self.selected - 1) % len(self.options)
+                    self._advance(-1)
                     self._escape_buffer = None
                 elif sequence == b"\x1b[B":
-                    self.selected = (self.selected + 1) % len(self.options)
+                    self._advance(1)
                     self._escape_buffer = None
                 elif _escape_sequence_complete(sequence):
                     self._escape_buffer = None

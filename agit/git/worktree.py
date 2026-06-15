@@ -60,6 +60,18 @@ class WorktreeManager:
         self.main_repo.worktree_add_detached(str(path), base=base)
         return WorktreeInfo(name=_sanitize_name(name), path=path, branch="")
 
+    def move(self, old_name: str, new_name: str) -> WorktreeInfo:
+        """Move the worktree directory ``old_name`` → ``new_name`` (a session
+        rename). The caller must have released the worktree first (no running
+        process with its cwd inside). Returns the new :class:`WorktreeInfo`."""
+        old_path = self.worktree_path(old_name)
+        new_path = self.worktree_path(new_name)
+        new_path.parent.mkdir(parents=True, exist_ok=True)
+        self.main_repo.worktree_prune()  # clear any stale admin entry at the target
+        self.main_repo.worktree_move(str(old_path), str(new_path))
+        repo = GitRepo(new_path)
+        return WorktreeInfo(name=_sanitize_name(new_name), path=new_path, branch=repo.current_branch())
+
     def remove(self, name: str, *, force: bool = True) -> None:
         path = self.worktree_path(name)
         try:

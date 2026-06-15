@@ -2,8 +2,9 @@
 
 The summary leads the message like a regular subject does: its first line is
 the subject, the rest of it is the first paragraph of the body — there is no
-separate ``# Summary`` section. The prompts that would otherwise head the
-message move to ``# Prompts``.
+separate ``# Summary`` section. The prompts are not duplicated into the message:
+the ``# Interaction Trace`` already carries them, so there is no ``# Prompts``
+section.
 """
 
 import pytest
@@ -28,12 +29,13 @@ def test_build_agent_commit_message_with_summary() -> None:
     # paragraph, with no # Summary section.
     assert message.startswith("<aGiT> Add a faster feature pipeline.\n")
     assert "# Summary" not in message
+    # No # Prompts section — the prompts live only in the interaction trace now.
+    assert "# Prompts" not in message
     body = message.split("\n", 1)[1]
     assert body.lstrip("\n").startswith("The new path caches lookups, improving performance.")
-    assert "# Interaction Trace" in message
-    assert body.index("The new path caches lookups") < body.index("# Prompts") < body.index("# Interaction Trace")
-    # The prompts that used to head the message are preserved under # Prompts.
-    assert "Add new feature" in body.split("# Prompts")[1]
+    assert body.index("The new path caches lookups") < body.index("# Interaction Trace")
+    # The prompt is still recoverable from the trace's ## User section.
+    assert "Add new feature" in body.split("# Interaction Trace")[1]
 
 
 def test_build_agent_commit_message_without_summary() -> None:
@@ -67,11 +69,11 @@ def test_single_line_summary_has_no_dangling_body_paragraph() -> None:
     )
     lines = message.split("\n")
     assert lines[0] == "<aGiT> Fixed a critical bug in the authentication system."
-    # No leftover summary text floating before # Prompts: the body goes
-    # straight to the sections.
+    # No leftover summary text floating before the sections: the body goes
+    # straight to the interaction trace.
     assert lines[1] == ""
-    assert lines[2] == "# Prompts"
-    assert message.index("# Prompts") < message.index("# Interaction Trace") < message.index("# aGiT Metadata")
+    assert lines[2] == "# Interaction Trace"
+    assert message.index("# Interaction Trace") < message.index("# aGiT Metadata")
 
 
 def _msg(**overrides) -> str:

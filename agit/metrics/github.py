@@ -17,6 +17,7 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+import threading
 import time
 
 from agit.git import GitRepo
@@ -27,12 +28,18 @@ _REMOTE_RE = re.compile(r"github\.com[:/]+(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.
 _CACHE: dict[str, tuple[float, dict[str, str]]] = {}
 _TTL_SECONDS = 300.0
 _TIMEOUT_SECONDS = 20.0
+# Repos with an in-flight background login refresh, so a cold/stale cache spawns at
+# most one gh crawl at a time (the live dashboard polls concurrently).
+_INFLIGHT: set[str] = set()
+_INFLIGHT_LOCK = threading.Lock()
 
 
-def gh_available() -> bool:
-    """True when the ``gh`` CLI is installed and authenticated."""
+def gh_status() -> str:
+    """Whether the ``gh`` CLI is usable: ``"ok"`` (installed and authenticated),
+    ``"missing"`` (not installed), or ``"unauthenticated"`` (installed but not
+    logged in, or the auth check failed/timed out)."""
     if shutil.which("gh") is None:
-        return False
+        return "missing"
     try:
         result = subprocess.run(
             ["gh", "auth", "status"],
@@ -41,8 +48,13 @@ def gh_available() -> bool:
             timeout=_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.SubprocessError):
-        return False
-    return result.returncode == 0
+        return "unauthenticated"
+    return "ok" if result.returncode == 0 else "unauthenticated"
+
+
+def gh_available() -> bool:
+    """True when the ``gh`` CLI is installed and authenticated."""
+    return gh_status() == "ok"
 
 
 def resolve_logins(repo: GitRepo, *, refresh: bool = False) -> dict[str, str]:
@@ -59,9 +71,40 @@ def resolve_logins(repo: GitRepo, *, refresh: bool = False) -> dict[str, str]:
 
     logins = _fetch_logins(repo)
     # Cache even an empty result: it means gh is unavailable here, and we should
-    # not retry on every 5-second dashboard refresh.
+    # not retry on every dashboard refresh.
     _CACHE[key] = (now, logins)
     return logins
+
+
+def cached_logins(repo: GitRepo) -> dict[str, str]:
+    """Non-blocking variant for the live dashboard's hot path: return whatever logins
+    are cached right now (``{}`` when cold), and refresh the cache in the BACKGROUND
+    when it is cold or stale. A page render therefore never waits on the paginated,
+    networked ``gh`` crawl — the resolved logins simply appear on a later poll. The
+    first paint labels committers by the email heuristic until then."""
+    key = str(repo.repo)
+    now = time.monotonic()
+    cached = _CACHE.get(key)
+    if cached is None or now - cached[0] >= _TTL_SECONDS:
+        _refresh_logins_async(repo, key)
+    return cached[1] if cached is not None else {}
+
+
+def _refresh_logins_async(repo: GitRepo, key: str) -> None:
+    with _INFLIGHT_LOCK:
+        if key in _INFLIGHT:
+            return  # a refresh is already running for this repo
+        _INFLIGHT.add(key)
+
+    def worker() -> None:
+        try:
+            logins = _fetch_logins(repo)
+            _CACHE[key] = (time.monotonic(), logins)
+        finally:
+            with _INFLIGHT_LOCK:
+                _INFLIGHT.discard(key)
+
+    threading.Thread(target=worker, daemon=True, name="agit-gh-logins").start()
 
 
 def _fetch_logins(repo: GitRepo) -> dict[str, str]:
@@ -110,3 +153,5 @@ def commit_url_base(repo: GitRepo) -> str:
 
 def _reset_cache_for_tests() -> None:
     _CACHE.clear()
+    with _INFLIGHT_LOCK:
+        _INFLIGHT.clear()

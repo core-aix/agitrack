@@ -797,7 +797,7 @@ const TOKEN_ORDER = [["input","input"],["output","output"],["reasoning","reasoni
   ["subagent_input","subagent input"],["subagent_output","subagent output"],
   ["subagent_cache_read","subagent cache read"],["subagent_cache_write","subagent cache write"],
   ["summary_input","summarizer input"],["summary_output","summarizer output"]];
-const REFRESH_MS = 5000, DAY = 86400;
+const REFRESH_MS = 30000, DAY = 86400;
 
 const state = {author:"", backend:"", model:"", fromTs:0, toTs:0, granularity:(INIT.timeseries&&INIT.timeseries.granularity)||"day"};
 // Only a page served over http(s) has a backend to reach; a file:// snapshot has

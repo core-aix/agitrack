@@ -44,6 +44,7 @@ from agit.proxy.commit_engine import CommitEngine
 from agit.proxy.integration import IntegrationService, MergeContext, MergePhase
 from agit.proxy.process import BackendProcess
 from agit.proxy.session import Session
+from agit.transcripts import SessionRef
 
 
 # Palette helpers, _BackgroundColorEraseScreen, and detect_color_mode live in
@@ -65,6 +66,9 @@ from agit.proxy.modal import PromptModal, SelectModal, _escape_sequence_complete
 
 _SGR_MOUSE_RE = re.compile(rb"\x1b\[<\d+;\d+;\d+[Mm]")
 _SGR_MOUSE_EVENT_RE = re.compile(rb"\x1b\[<(\d+);(\d+);(\d+)([Mm])")
+# Terminal focus in/out reports (CSI I / CSI O), emitted on window focus changes
+# when focus reporting is on. Like mouse reports they are not keystrokes.
+_FOCUS_EVENT_RE = re.compile(rb"\x1b\[[IO]")
 _PAGE_KEY_RE = re.compile(rb"\x1b\[(5|6)(?:;\d+)?~")  # PageUp / PageDown (with optional modifiers)
 # A trailing, not-yet-complete CSI sequence (e.g. a mouse report split across
 # reads). Held back so it is not forwarded as stray bytes. A lone trailing ESC
@@ -336,6 +340,11 @@ class ProxyRunner:
     RENDER_MIN_INTERVAL = 0.033  # coalesce output-driven repaints to ~30fps
     SYNC_MAX_HOLD = 0.05  # cap how long a backend synchronized-update may defer a paint
     SUMMARY_WAIT_SECONDS = 45.0  # how long integration waits for a background commit summary (#8)
+    EXIT_SHARE_TIMEOUT = (
+        45.0  # cap the exit-path auto-share push; long enough for a real push, short enough to never truly hang
+    )
+    SHARED_FETCH_TIMEOUT = 30.0  # cap the shared-session listing fetch so a slow/offline remote can't hang the menu
+    RESUME_FETCH_TIMEOUT = 300.0  # cap the full-transcript fetch when resuming a shared session; generous since the user can cancel manually
 
     def __init__(
         self,
@@ -363,6 +372,7 @@ class ProxyRunner:
         self._force_new_session = new_session  # start a fresh conversation, do not resume
         self.name = "main"  # session label (multiplexer assigns names to others)
         self._primary_worktree_name: str | None = None  # session kept across exits for auto-resume
+        self._exit_resume_worktree: str | None = None  # session active at exit → auto-resumes next start
         self.worktree: WorktreeInfo | None = None  # set when this session runs in a git worktree
         self.global_config = _global_config if _global_config is not None else GlobalConfig()
         self._apply_timings(self.global_config.timings)
@@ -509,6 +519,12 @@ class ProxyRunner:
         # background push thread (only one at a time). Triggered per commit.
         self._auto_share_hash: dict[str, str] = {}
         self._auto_share_thread: threading.Thread | None = None
+        # aGiT session ids (stable, never drift) that saw at least one committed turn
+        # THIS run. The exit-path auto-share consults this so a session that was only
+        # resumed and never typed into is not re-shared — robust where a transcript
+        # digest is not, since Claude's resume id-churn changes the digest across runs
+        # even with no user input.
+        self._sessions_with_activity: set[str] = set()
         # Lifecycle flags read before their first conditional assignment. These
         # MUST be initialized here: their getattr() guards were removed in P7,
         # and for_testing() seeding them alone would hide a missing init from
@@ -517,6 +533,14 @@ class ProxyRunner:
         self._base_check_at = 0.0
         self._cwd_drift_checked = False
         self._cwd_check_at = 0.0
+        self._cwd_launch_at = 0.0  # epoch of the latest backend launch (set in _spawn)
+        # Shared-session resume runs the (possibly slow) transcript fetch on a worker
+        # thread while the menu waits (cancellably); the main loop completes the
+        # resume. The cancel Event lets the user stop a slow fetch (Esc) and lets the
+        # exit path stop any in-flight fetch immediately.
+        self._shared_resume_thread: threading.Thread | None = None
+        self._shared_resume_result: dict | None = None
+        self._shared_resume_cancel: "threading.Event | None" = None
         self._relaunch_times: list[float] = []
         self._exiting = False
         self._finalized_on_exit = False
@@ -699,6 +723,7 @@ class ProxyRunner:
                 "_warned_backend_session": False,
                 "_auto_share_hash": {},
                 "_auto_share_thread": None,
+                "_sessions_with_activity": set(),
                 "_user_declined": [],
                 "sessions": [],
                 "worktree_manager": None,
@@ -707,12 +732,18 @@ class ProxyRunner:
                 "_diag_run": "test",
                 "_force_new_session": False,
                 "_primary_worktree_name": None,
+                "_exit_resume_worktree": None,
                 "global_config": None,
                 # Lazily-set fields that getattr() guards in production methods:
                 "_monitor_base_edits": False,
                 "_base_check_at": 0.0,
                 "_cwd_drift_checked": False,
                 "_cwd_check_at": 0.0,
+                "_cwd_launch_at": 0.0,
+                "_shared_resume_thread": None,
+                "_shared_resume_result": None,
+                "_shared_resume_cancel": None,
+                "_use_worktrees": True,
                 "_relaunch_times": [],
                 "_exiting": False,
                 "_finalized_on_exit": False,
@@ -800,6 +831,14 @@ class ProxyRunner:
         # Reclaim dangling shared-session snapshots from prior runs, in the
         # background so startup never waits on it (issue #55).
         threading.Thread(target=lambda: self._sweep_orphan_shared_sessions(fetch=True), daemon=True).start()
+        # Recommend installing / logging into gh when it's unavailable, since the
+        # dashboard's committer identities and session sharing depend on it (#76).
+        # Runs in the background so a slow `gh auth status` never blocks startup.
+        threading.Thread(target=self._notify_if_gh_unavailable, daemon=True).start()
+        # Resolve the GitHub login now, off the hot path, so neither a live nor an
+        # exit-time auto-share has to shell out to `gh` mid-share (that lookup can
+        # stall and would otherwise eat into the bounded share budget).
+        threading.Thread(target=self._warm_share_login, daemon=True).start()
         self.old_attrs = termios.tcgetattr(sys.stdin.fileno())
         try:
             self._enter_host_screen()
@@ -872,6 +911,59 @@ class ProxyRunner:
         # owns its BackendProcess; child_pid / master_fd remain readable on the
         # runner via the Session-delegating compat properties.
         self.active.process = BackendProcess.spawn(command, str(self.repo.repo))
+        # Re-arm the cwd-drift check for this launch, and remember when it started:
+        # only turns recorded at/after this time count, so a stale cwd left in the
+        # transcript before this launch can't trigger a false drift warning (#72).
+        self._cwd_drift_checked = False
+        self._cwd_check_at = 0.0
+        self._cwd_launch_at = time.time()
+
+    def _notify_if_gh_unavailable(self) -> None:
+        # Recommend installing / authenticating gh when it isn't usable, so the
+        # user knows why features that depend on it (the dashboard's committer
+        # identities, session sharing) are limited (#76). Best-effort and one-shot;
+        # runs off the startup thread so a slow auth check never blocks the UI.
+        try:
+            from agit.metrics.github import gh_status
+
+            status = gh_status()
+        except Exception as error:
+            self._debug(f"gh availability check failed: {error!r}")
+            return
+        message = self._gh_unavailable_hint(status)
+        if message is None:
+            return  # gh is installed and authenticated — nothing to suggest
+        self._set_message(message, seconds=12.0)
+        self._render()
+
+    def _warm_share_login(self) -> None:
+        # Populate the GitHub-login cache at startup so auto-share never resolves it
+        # mid-share. Only when sharing is actually reachable (backend supports it and
+        # a remote exists), to avoid a pointless `gh` call on solo/offline repos.
+        try:
+            if not getattr(self.backend, "supports_session_sharing", False):
+                return
+            if self.global_config.github_login or not self.base_repo.remote_exists():
+                return
+            self._cached_or_resolve_login()
+        except Exception as error:
+            self._debug(f"warm share login failed: {error!r}")
+
+    @staticmethod
+    def _gh_unavailable_hint(status: str) -> str | None:
+        if status == "missing":
+            return (
+                "GitHub CLI (gh) isn't installed. aGiT features that rely on it are limited —\n"
+                "the dashboard can't resolve committer GitHub identities, and session sharing\n"
+                "is unavailable. Install it from https://cli.github.com then run `gh auth login`."
+            )
+        if status == "unauthenticated":
+            return (
+                "GitHub CLI (gh) isn't logged in. aGiT features that rely on it are limited —\n"
+                "the dashboard can't resolve committer GitHub identities, and session sharing\n"
+                "is unavailable. Run `gh auth login` to enable them."
+            )
+        return None
 
     def _setup_worktree_confinement_notice(self) -> None:
         # When confinement is requested but the platform can't enforce it (no
@@ -891,11 +983,23 @@ class ProxyRunner:
         except Exception:
             self._base_status_baseline = set()
         self._set_message(
-            "Agent sandbox unavailable on this platform — edits outside the session\n"
-            "worktree can't be prevented; aGiT will warn if the base repo is modified.",
+            self._sandbox_unavailable_hint(),
             seconds=8.0,
         )
         self._render()
+
+    @staticmethod
+    def _sandbox_unavailable_hint() -> str:
+        base = (
+            "Heads up: aGiT can't fully sandbox the agent on this system, so it could\n"
+            "change files outside its workspace. aGiT will warn you if that happens."
+        )
+        # Only offer the one simple, actionable step (installing bubblewrap) — and
+        # only when it's actually missing. No kernel/userns jargon: if the tool is
+        # present but the system still blocks it, the plain warning is enough.
+        if sys.platform.startswith("linux") and shutil.which("bwrap") is None:
+            return base + "\nInstalling the 'bubblewrap' tool (e.g. `apt install bubblewrap`) can turn the sandbox on."
+        return base
 
     def _check_base_branch_drift(self) -> None:
         # The user can `git checkout` another branch in the directory while aGiT is
@@ -1024,6 +1128,13 @@ class ProxyRunner:
         # that happens the agent works in the wrong directory: its turns aren't
         # tracked here and writes outside the worktree are sandbox-blocked. Detect
         # it from the cwd the backend records, and warn once with how to recover.
+        #
+        # Only the cwd of a turn recorded *after* this launch counts (`since`): a
+        # resume — especially of an imported/shared session — leaves a stale cwd in
+        # the transcript that points elsewhere (the base repo, another machine's
+        # path) but is harmless, because the next real turn runs in the worktree.
+        # Without the time gate that stale value latched a confusing false warning
+        # before the agent had done anything (#72).
         if self._cwd_drift_checked:
             return
         if self.worktree is None:
@@ -1037,18 +1148,18 @@ class ProxyRunner:
             self._cwd_drift_checked = True  # backend doesn't record a cwd
             return
         try:
-            recorded = fn(self.state.backend_session_id)
+            recorded = fn(self.state.backend_session_id, since=self._cwd_launch_at or None)
         except Exception as error:
             self._debug(f"cwd drift check failed: {error!r}")
             return
         if not recorded:
-            return  # nothing recorded yet — check again next tick
+            return  # no post-launch turn recorded yet — check again next tick
         self._cwd_drift_checked = True
         if os.path.realpath(recorded) == os.path.realpath(str(self.repo.repo)):
             return  # on the worktree, as intended
         self._debug(f"cwd drift: backend recorded {recorded}, worktree is {self.repo.repo}")
         self._set_message(
-            f"⚠ The agent is working in:\n    {recorded}\n"
+            f"⚠ The agent ran a turn in:\n    {recorded}\n"
             f"not this session's worktree:\n    {self.repo.repo}\n"
             "This is Claude's resume-cwd bug (#58591): turns made there are NOT committed "
             "by aGiT, and edits outside the worktree are blocked by the sandbox.\n"
@@ -1161,27 +1272,45 @@ class ProxyRunner:
         self._apply_update_and_restart()
 
     def _apply_update_and_restart(self) -> None:
-        # Commit + integrate every session's finished work (same path as exit),
-        # install the update, then ask run()'s teardown to re-exec aGiT.
+        # Install the update, then commit + integrate every session's finished work
+        # (same path as exit) and ask run()'s teardown to re-exec aGiT.
+        #
+        # Order matters: apply the update FIRST, while the session is still fully
+        # intact. If it fails, the user is left exactly where they were — nothing
+        # torn down — and can keep working or retry. Doing the exit-finalize first
+        # (which removes the worktree and terminates the backend) and only THEN
+        # discovering apply() failed left the reactor running against a deleted
+        # worktree, so the next `git status` crashed with FileNotFoundError.
         self._update_applying = True
         self._update_pending = False
-        self._set_message("Finishing commits, then updating aGiT…", seconds=30.0)
+        # When the code on disk is already current and only the running process is
+        # stale, there is nothing to install — just finish work and re-exec. (Don't
+        # run apply(): it would fetch/merge or pip-upgrade needlessly, and a dirty
+        # source checkout would even block a pure restart.)
+        restart_only = self._update_status is not None and self._update_status.restart_only
+        if restart_only:
+            message = "Restarting aGiT to load the updated code…"
+        else:
+            self._set_message("Updating aGiT…", seconds=30.0)
+            self._render()
+            result = self._updater.apply()
+            if not result.ok:
+                self._update_applying = False
+                self._set_message(f"aGiT update failed: {result.error}", seconds=12.0)
+                self._render()
+                return  # session untouched — keep running
+            message = f"{result.message} Restarting aGiT…"
+        # Update is in place (or unnecessary): now finish commits and tear down for
+        # the re-exec.
+        self._set_message("Finishing commits, then restarting aGiT…", seconds=30.0)
         self._render()
         try:
             self._finalize_pending_work()
         except Exception as error:  # don't let a commit hiccup strand the update
-            self._debug(f"finalize before update failed: {error!r}")
-        result = self._updater.apply()
-        if not result.ok:
-            self._update_applying = False
-            self._finalized_on_exit = False  # allow a later clean exit to finalize again
-            self._exiting = False
-            self._set_message(f"aGiT update failed: {result.error}", seconds=12.0)
-            self._render()
-            return
-        # Success: stop the loop and let run()'s finally restore the terminal and
-        # release the lock before _pending_restart triggers the re-exec.
-        self._set_message(f"{result.message} Restarting aGiT…", seconds=10.0)
+            self._debug(f"finalize before update restart failed: {error!r}")
+        # Stop the loop and let run()'s finally restore the terminal and release the
+        # lock before _pending_restart triggers the re-exec.
+        self._set_message(message, seconds=10.0)
         self._render()
         self._exit_child()
         self._pending_restart = True
@@ -1387,6 +1516,18 @@ class ProxyRunner:
 
     def _session_name_taken(self, name: str) -> bool:
         return _sanitize_name(name) in self._taken_session_names()
+
+    def _dedupe_session_name(self, base: str) -> str:
+        # A collision-free local name derived from ``base`` (e.g. a shared
+        # session's "<sharer>-<name>"), so the resume prompt's default can be
+        # accepted as-is even when the same session was imported before.
+        candidate = _sanitize_name(base)
+        if not self._session_name_taken(candidate):
+            return candidate
+        suffix = 2
+        while self._session_name_taken(f"{candidate}-{suffix}"):
+            suffix += 1
+        return f"{candidate}-{suffix}"
 
     def _prompt_session_name(self, title: str, *, default: str) -> str | None:
         # Ask for a session name, rejecting duplicates (a session and its worktree
@@ -1964,10 +2105,15 @@ class ProxyRunner:
         # Keep the durable name record pointing at the conversation this session
         # is actually running (ids drift when the backend forks on resume).
         self._persist_session_name(new_session_id)
+        previous = self.state.backend_session_id
+        # Preserve shared-session recognition across the id drift: if this session
+        # was shared/auto-shared under its previous id, remember new→previous so it
+        # still shows as shared (and keeps auto-updating) after resume (#55). Also
+        # carries the original share name onto the new id (round-trip re-sharing).
+        self._record_shared_alias_on_drift(previous, new_session_id)
         # If the worktree's active conversation changed to a different backend
         # session that aGiT didn't start, the user likely started it from inside
         # the backend. Warn once that such sessions share this branch.
-        previous = self.state.backend_session_id
         if (
             self.worktree is not None
             and previous
@@ -2230,7 +2376,6 @@ class ProxyRunner:
             options.append("✓ Complete merge for this session")
             actions.append(("complete-merge", None))
         shared_ids = self._my_shared_session_ids()  # mark which sessions are shared (#55)
-        auto_state = self._user_state() if shared_ids else None
         live_names = set()
         for index, session in enumerate(self.sessions):
             live_names.add(self._session_name(index))
@@ -2240,9 +2385,10 @@ class ProxyRunner:
             if index == self.active_index and not self.merge_ctx and self._active_has_pending():
                 label += " — commits to integrate"
             sid = getattr(getattr(session, "state", None), "backend_session_id", None)
-            if sid and auto_state is not None and auto_state.auto_share_enabled(sid):
+            # Recognise a shared session across resume id-drift (lineage-aware).
+            if sid and self._session_auto_shared(sid):
                 label += " · ⇪ auto-share"
-            elif sid and sid in shared_ids:
+            elif sid and self._session_is_shared(sid, shared_ids):
                 label += " · ⇪ shared"
             options.append(label)
             actions.append(("switch", index))
@@ -2255,12 +2401,19 @@ class ProxyRunner:
                 actions.append(("resume", info.name))
         options.append("+ New session (own worktree)")
         actions.append(("new", None))
+        if self._use_worktrees and self.sessions:
+            options.append("")  # gap: separate session-creation from session-management
+            actions.append(("separator", None))
+            options.append("✎ Rename a session")
+            actions.append(("rename", None))
         if self._resumable_sessions():
             options.append("↻ Resume a past conversation…")
             actions.append(("resume-past", None))
         # "Share" is offered for every backend so the user gets a clear answer;
         # a backend without a portable transcript says so when chosen. "Resume a
         # shared session" only appears where it can actually work.
+        options.append("")  # gap: set the sharing group apart
+        actions.append(("separator", None))
         options.append("⇪ Share this session with collaborators…")
         actions.append(("share", None))
         if getattr(self.backend, "supports_session_sharing", False):
@@ -2295,6 +2448,8 @@ class ProxyRunner:
             self._new_session(value)
         elif kind == "new":
             self._prompt_new_session()
+        elif kind == "rename":
+            self._rename_session_menu()
         elif kind == "share":
             self._share_session()
         elif kind == "resume-shared":
@@ -2433,6 +2588,23 @@ class ProxyRunner:
             if ref.id not in seen:
                 seen.add(ref.id)
                 refs.append(ref)
+        # A session that produced no commits still reserves its name in the durable
+        # record, but the backend may no longer enumerate it (no transcript under a
+        # current worktree path). Surface those named conversations too, so a
+        # reserved name is never stranded — unresumable yet un-reusable (#75).
+        # Resuming one recreates its worktree under the saved name and continues the
+        # conversation if the backend still has it, or starts fresh there if not.
+        # Date them by when they were last named (not the Unix epoch, which showed
+        # as an absurd "20000d ago").
+        try:
+            root = AgitState(self.base_repo.repo, default_backend=self.global_config.default_backend)
+        except Exception:
+            root = None
+        for sid, name in self._agit_named_sessions().items():
+            if sid and sid not in seen:
+                seen.add(sid)
+                named_at = root.session_named_at(sid) if root is not None else 0.0
+                refs.append(SessionRef(id=sid, updated=named_at, label=name))
         refs = sorted(refs, key=lambda ref: getattr(ref, "updated", 0) or 0, reverse=True)
         return refs[: self.RESUME_LIST_LIMIT]
 
@@ -2509,6 +2681,17 @@ class ProxyRunner:
         # Operates on the base repo: it owns the remote and the shared object db.
         return SharedSessionStore(self.base_repo)
 
+    def _share_name_for(self, session_id: str | None) -> str:
+        # Re-share an imported shared session under its ORIGINAL share name (kept
+        # per session and carried across id-drift), so a back-and-forth round-trip
+        # keeps updating the same shared entry. Falls back to the local session
+        # name for a session that originated here (#55).
+        if session_id:
+            origin = self._user_state().shared_origin_name(session_id)
+            if origin:
+                return origin
+        return self._session_name(self.active_index)
+
     def _sweep_orphan_shared_sessions(self, *, fetch: bool) -> None:
         # Reclaim dangling shared-session snapshots (old/unshared versions) left by
         # rewrites — only when this repo has actually used sharing (the ref exists),
@@ -2551,7 +2734,7 @@ class ProxyRunner:
                 self._render()
                 return
             self.global_config.acknowledge_session_sharing()
-        payload = self._share_payload(session_id, self._session_name(self.active_index))
+        payload = self._share_payload(session_id, self._share_name_for(session_id))
         if payload is None:
             self._set_message("Could not read the session transcript to share.")
             self._render()
@@ -2749,8 +2932,23 @@ class ProxyRunner:
 
     def _session_auto_shared(self, session_id: str | None) -> bool:
         # Read the opt-in from the BASE repo state (persists across runs); the
-        # session worktree where self.state lives is removed on exit (#55).
-        return bool(session_id) and self._user_state().auto_share_enabled(session_id)
+        # session worktree where self.state lives is removed on exit (#55). Check
+        # the whole id lineage: the backend mints a new id on resume, so a session
+        # opted in under an earlier id must still count after that drift.
+        if not session_id:
+            return False
+        user = self._user_state()
+        return any(user.auto_share_enabled(sid) for sid in user.session_lineage(session_id))
+
+    def _session_is_shared(self, session_id: str | None, shared_ids: set[str]) -> bool:
+        # A session counts as shared if its current id, or any id it drifted from
+        # on resume, is in the shared set (#55) — so a resumed shared session is
+        # still recognised after the backend forks its id.
+        if not session_id:
+            return False
+        if session_id in shared_ids:
+            return True
+        return any(sid in shared_ids for sid in self._user_state().session_lineage(session_id))
 
     def _my_shared_session_ids(self) -> set[str]:
         # session_ids of conversations I've shared in this repo, from the LOCAL ref
@@ -2769,6 +2967,30 @@ class ProxyRunner:
             return ids
         except Exception:
             return set()
+
+    def _record_shared_alias_on_drift(self, previous: str | None, new_id: str | None) -> None:
+        # When the backend forks a new session id on resume, link new→previous so a
+        # session shared/auto-shared under the previous id stays recognised. Only
+        # record it for ids that actually belong to a shared lineage, to keep the
+        # alias map scoped (and avoid recording drift for unshared sessions) (#55).
+        if not previous or not new_id or previous == new_id:
+            return
+        try:
+            user = self._user_state()
+            relevant = (
+                user.auto_share_enabled(previous)
+                or previous in user.shared_session_aliases()
+                or previous in self._my_shared_session_ids()
+            )
+            if relevant:
+                user.add_shared_session_alias(new_id, previous)
+            # Carry the original share name onto the new id, so a re-share after the
+            # backend forks the id still updates the same shared entry (#55).
+            origin = user.shared_origin_name(previous)
+            if origin:
+                user.set_shared_origin_name(new_id, origin)
+        except Exception as error:
+            self._debug(f"record shared alias failed: {error!r}")
 
     def _set_session_auto_share(self, session_id: str, enabled: bool) -> None:
         self._user_state().set_auto_share(session_id, bool(enabled))
@@ -2806,7 +3028,7 @@ class ProxyRunner:
         # active session / config, which can change underneath a thread).
         ctx = {
             "session_id": sid,
-            "name": self._session_name(self.active_index),
+            "name": self._share_name_for(sid),
             "login": self._cached_or_resolve_login(),
             "backend": backend,
             "repo_path": self.repo.repo,
@@ -2819,22 +3041,24 @@ class ProxyRunner:
         self._auto_share_thread = threading.Thread(target=self._auto_share_worker, args=(ctx,), daemon=True)
         self._auto_share_thread.start()
 
-    def _auto_share_worker(self, ctx: dict) -> None:
+    def _auto_share_worker(self, ctx: dict):
         # Runs off the reactor thread; best-effort, never touches the UI. Reads and
         # redacts the (possibly large) transcript and pushes here, not on the loop.
+        # Returns the PublishResult on a push, or None when it skipped (no
+        # transcript / unchanged) or hit an error — the exit path inspects it.
         try:
             backend, sid = ctx["backend"], ctx["session_id"]
             raw = backend.export_session_raw(ctx["repo_path"], sid) or backend.export_session_raw(
                 ctx["base_repo_path"], sid
             )
             if not raw:
-                return
+                return None
             from agit.sessions import redact_transcript
 
             redacted = redact_transcript(raw)
             digest = hashlib.sha256(redacted.encode("utf-8")).hexdigest()
             if digest == ctx["last_hash"]:
-                return  # nothing new since the last push — skip the network round-trip
+                return None  # nothing new since the last push — skip the network round-trip
             self._auto_share_hash[sid] = digest
             manifest = {
                 "github_id": ctx["login"],
@@ -2847,15 +3071,230 @@ class ProxyRunner:
                 "content_hash": digest,
                 "transcript_bytes": backend.transcript_size(ctx["base_repo_path"], sid),
             }
-            ctx["store"].publish(github_id=ctx["login"], name=ctx["name"], transcript=redacted, manifest=manifest)
+            return ctx["store"].publish(
+                github_id=ctx["login"], name=ctx["name"], transcript=redacted, manifest=manifest
+            )
         except Exception as error:
             self._debug(f"auto-share failed: {error!r}")
+            return None
+
+    def _auto_share_on_exit(self) -> None:
+        # Exit-path counterpart to _maybe_auto_share_active. The live auto-share
+        # runs in a daemon thread fired on commit; quitting right after a turn
+        # (before that thread is scheduled, or while it is still pushing) would
+        # leave the final conversation unshared, since daemon threads are killed
+        # when the process exits. So push the active session's latest transcript
+        # here — but ONLY when it actually changed since the last share, and ALWAYS
+        # bounded so a stalled network can never hang exit.
+        backend = self.backend
+        if not getattr(backend, "supports_session_sharing", False):
+            return
+        sid = self.state.backend_session_id
+        if not sid or not self._session_auto_shared(sid):
+            return
+        # Nothing happened this run ⇒ nothing to share. This is the ground-truth
+        # gate: it skips a session that was only resumed and never typed into, so
+        # exit stays instant with no "Sharing…" message. It is robust where a
+        # transcript-digest comparison is not — Claude forks a new session id on
+        # resume and rewrites every transcript row, so the digest changes across
+        # runs even when the user did nothing. A turn this run, by contrast, always
+        # routes through on_commit_fn, which records the activity.
+        if self.state.session_id not in self._sessions_with_activity:
+            return
+        # Let a still-running live auto-share finish first, so we don't race it and
+        # so its updated content hash is visible to the change check below.
+        if self._auto_share_thread is not None and self._auto_share_thread.is_alive():
+            self._auto_share_thread.join(timeout=self.EXIT_SHARE_TIMEOUT)
+        # Among sessions that DID see a turn, still avoid a redundant push: compare
+        # the current transcript digest against this run's last live-pushed hash,
+        # then the already-published manifest hash.
+        digest = self._exit_share_digest(backend, sid)
+        if digest is None:
+            return  # transcript unreadable ⇒ nothing to share
+        last = self._auto_share_hash.get(sid) or self._published_content_hash(sid)
+        if digest == last:
+            return  # already shared this exact content ⇒ nothing to do
+        ctx = {
+            "session_id": sid,
+            "name": self._share_name_for(sid),
+            "login": None,  # resolved inside the bounded thread (a gh call can stall)
+            "backend": backend,
+            "repo_path": self.repo.repo,
+            "base_repo_path": self.base_repo.repo,
+            "model": self.state.model,
+            "agit_session_id": self.state.session_id,
+            "store": self._shared_store(),
+            "last_hash": last,
+        }
+        self._set_message(f"Sharing '{ctx['name']}' before exit…", seconds=30)
+        self._render()
+        # Bound the network round-trip: run the push (and the login lookup, which
+        # may shell out to gh) in a thread and wait at most EXIT_SHARE_TIMEOUT. A
+        # stalled push (offline, auth, unreachable remote) can never block exit —
+        # git ref updates are atomic, so an abandoned push simply doesn't land. On
+        # timeout or push failure, warn and continue.
+        outcome: dict = {}
+
+        def push() -> None:
+            ctx["login"] = self._cached_or_resolve_login()
+            outcome["result"] = self._auto_share_worker(ctx)
+
+        thread = threading.Thread(target=push, daemon=True, name="agit-exit-share")
+        thread.start()
+        thread.join(timeout=self.EXIT_SHARE_TIMEOUT)
+        if thread.is_alive():
+            self._set_message("Couldn't share this session before exit (timed out); continuing.", seconds=6.0)
+            self._render()
+            return
+        result = outcome.get("result")
+        if result is not None and result.remote and not result.pushed:
+            self._set_message("Couldn't share this session before exit (push failed); continuing.", seconds=6.0)
+            self._render()
+
+    def _exit_share_digest(self, backend, sid: str) -> str | None:
+        # The redacted-transcript digest for *sid*, matching the worker's gate, so
+        # the exit path can tell whether the latest conversation differs from what
+        # was last shared. None when the transcript can't be read.
+        try:
+            raw = backend.export_session_raw(self.repo.repo, sid) or backend.export_session_raw(
+                self.base_repo.repo, sid
+            )
+            if not raw:
+                return None
+            from agit.sessions import redact_transcript
+
+            return hashlib.sha256(redact_transcript(raw).encode("utf-8")).hexdigest()
+        except Exception as error:
+            self._debug(f"exit share digest failed: {error!r}")
+            return None
+
+    def _published_content_hash(self, sid: str) -> str | None:
+        # The content_hash of this session's already-published shared entry, read
+        # from the LOCAL shared ref (no network), so the exit gate can tell an
+        # unedited resumed session from one with genuinely new turns. Matched by
+        # session id across resume drift (lineage-aware).
+        try:
+            lineage = set(self._user_state().session_lineage(sid))
+            for entry in self._shared_store().entries():
+                if entry.manifest.get("session_id") in lineage:
+                    return entry.manifest.get("content_hash")
+        except Exception as error:
+            self._debug(f"published content hash lookup failed: {error!r}")
+        return None
+
+    def _fetch_shared_with_cancel(self, store, message: str) -> bool:
+        """Fetch the shared-session ref while keeping the UI alive and letting the
+        user press Esc to stop — needed when the fetch stalls on bad internet.
+        Returns True if the fetch finished, False if the user stopped it or it timed
+        out. Either way the LOCAL ref is left usable (possibly stale) for listing.
+
+        No remote ⇒ nothing to fetch over the network: do the cheap local call
+        inline (this also keeps headless/test runs off the interactive wait path)."""
+        if not store.repo.remote_exists():
+            store.fetch()
+            return True
+        result: dict = {}
+        cancel = threading.Event()
+
+        def worker() -> None:
+            try:
+                # Bound the git fetch and make it killable, so a stopped fetch's
+                # subprocess is terminated at once — never left running.
+                result["ok"] = store.fetch(timeout=self.SHARED_FETCH_TIMEOUT, cancel=cancel)
+            except Exception as error:  # never let a fetch failure escape the thread
+                result["error"] = repr(error)
+
+        thread = threading.Thread(target=worker, daemon=True, name="agit-shared-fetch")
+        thread.start()
+        self._set_message(f"{message}   ·   press Esc to stop", seconds=600)
+        self._render()
+        status = self._drain_pty_until_done_or_esc(thread, deadline=time.monotonic() + self.SHARED_FETCH_TIMEOUT + 2.0)
+        if status != "done":
+            cancel.set()  # kill the git fetch subprocess now — don't leave it running
+            note = "timed out" if status == "timeout" else "stopped"
+            self._set_message(f"Stopped fetching shared sessions ({note}).", seconds=6.0)
+            self._render()
+            return False
+        if result.get("error"):
+            self._debug(f"shared fetch failed: {result['error']}")
+        return True
+
+    def _drain_pty_until_done_or_esc(self, thread, *, deadline: float | None = None) -> str:
+        """Wait for *thread* while keeping the UI alive (PTYs draining) so the wait
+        is responsive, not a freeze, and the user can press Esc/Ctrl-C to stop.
+        Returns ``"done"`` when the thread finishes, ``"cancel"`` on Esc/Ctrl-C, or
+        ``"timeout"`` if the optional *deadline* passes first. Shared by the two
+        cancellable shared-session fetches (listing and full-transcript)."""
+        thread.join(timeout=0.05)  # fast fetches (and tests) finish without the wait UI
+        if not thread.is_alive():
+            return "done"
+        try:
+            stdin_fd = sys.stdin.fileno()
+        except (OSError, ValueError):
+            # No real stdin (headless/non-interactive): can't offer interactive
+            # cancel, so just wait for the thread, still honouring the deadline.
+            while thread.is_alive():
+                if deadline is not None and time.monotonic() > deadline:
+                    return "timeout"
+                thread.join(timeout=0.2)
+            return "done"
+        while thread.is_alive():
+            if deadline is not None and time.monotonic() > deadline:
+                return "timeout"
+            master = self.master_fd
+            background = self._background_fds() if self.sessions else {}
+            fds = [stdin_fd]
+            if master is not None:
+                fds.append(master)
+            fds.extend(background)
+            try:
+                readable, _, _ = select.select(fds, [], [], 0.2)
+            except (OSError, ValueError):
+                # stdin/PTY not selectable (headless): just wait for the thread.
+                thread.join(timeout=0.2)
+                continue
+            for fd in readable:
+                if fd == stdin_fd:
+                    if self._stdin_has_cancel(os.read(stdin_fd, 32)):
+                        return "cancel"
+                elif fd == master:
+                    output = self._drain_child_output()
+                    if output is not None:
+                        self.last_child_output = time.monotonic()
+                        self._feed_child_output(output)
+                elif fd in background:
+                    self._pump_background(background[fd])
+        return "done"
+
+    @staticmethod
+    def _stdin_has_cancel(data: bytes) -> bool:
+        """Whether *data* is a genuine cancel keystroke — a lone Esc or Ctrl-C — as
+        opposed to an escape SEQUENCE (mouse report, focus event, arrow key, bracketed
+        paste), every one of which also begins with ESC. With host mouse reporting on,
+        a mere mouse move emits ``\\x1b[<…`` and must NOT be read as the user pressing
+        Esc, or a fetch is cancelled the instant the pointer moves."""
+        if b"\x03" in data:  # Ctrl-C
+            return True
+        return data == b"\x1b"  # a bare Esc, not the lead byte of a longer sequence
+
+    @staticmethod
+    def _is_real_keypress(data: bytes) -> bool:
+        """Whether *data* carries an actual keystroke rather than only terminal-emitted
+        escape sequences (mouse reports, focus in/out). Lets a 'press any key' notice
+        ignore an incidental mouse move while host mouse reporting is on."""
+        stripped = _SGR_MOUSE_RE.sub(b"", data)
+        stripped = _FOCUS_EVENT_RE.sub(b"", stripped)
+        return bool(stripped)
 
     def _resume_shared_session_menu(self) -> None:
         store = self._shared_store()
-        self._set_message("Fetching shared sessions…", seconds=10.0)
-        self._render()
-        store.fetch()
+        completed = self._fetch_shared_with_cancel(store, "Fetching shared sessions…")
+        if not completed:
+            # The user stopped the fetch: leave the menu entirely rather than
+            # dropping them into a possibly-stale, previously-fetched list (which
+            # would read as if the stop did nothing). _fetch_shared_with_cancel has
+            # already shown the "Stopped fetching…" notice; let it linger.
+            return
         entries = store.entries()
         if not entries:
             self._set_message("No shared sessions found for this repo.")
@@ -2874,8 +3313,7 @@ class ProxyRunner:
             return
         entry = entries[options.index(choice)]
         session_id = entry.manifest.get("session_id")
-        transcript = store.read_transcript(entry)
-        if not session_id or not transcript:
+        if not session_id:
             self._set_message("That shared session is incomplete; cannot resume it.")
             self._render()
             return
@@ -2894,34 +3332,315 @@ class ProxyRunner:
                 self._set_message(f"Can't resume '{entry.display}': unknown backend '{entry_backend}'.", seconds=8.0)
                 self._render()
                 return
-        # If this conversation is already live, just switch to it — never overwrite a
-        # running session. Otherwise, if a (dormant) local copy exists, ask whether to
-        # pull the shared version (the "continue on another machine" sync) or keep the
-        # local one. With no local copy, import fresh.
-        already_live = any(
-            getattr(getattr(s, "state", None), "backend_session_id", None) == session_id for s in self.sessions
+        # Remember the name this session was shared under, so a later re-share (on
+        # this or any machine) updates the SAME shared entry instead of prepending
+        # the sharer id again — which made the name grow on every round-trip and
+        # never converge (#55).
+        self._user_state().set_shared_origin_name(session_id, entry.name)
+        # Everything below resolves WHAT to do (interactive popups) WITHOUT touching
+        # the transcript — the transcript fetch (which may hit the network) and the
+        # import then run on a worker thread (_begin_shared_resume) so the UI never
+        # freezes, and the resume itself completes on the main loop once ready.
+        live_index = next(
+            (
+                i
+                for i, s in enumerate(self.sessions)
+                if getattr(getattr(s, "state", None), "backend_session_id", None) == session_id
+            ),
+            None,
         )
-        overwrite = False
-        if not already_live and agent.has_local_session(self.base_repo.repo, session_id):
+        if live_index is not None:
+            # This exact conversation is already running here.
+            keep_both_id = getattr(agent, "new_import_id", lambda: None)()
+            opts = ["Update this session to the shared version"]
+            if keep_both_id:
+                opts.append("Keep both — copy the shared version to a new session")
+            opts.append("Stay as it is (no change)")
+            pick = self._select_popup(f"'{entry.display}' is already running here.\nWhat would you like to do?", opts)
+            if pick is None:
+                self._set_message("Cancelled.")
+                self._render()
+                return
+            if pick.startswith("Stay"):
+                self._switch_active(live_index)
+                return
+            if pick.startswith("Update"):
+                # Pull the shared version into the running session: fetch it, then
+                # (on the main loop) restart the backend so it loads the new
+                # transcript — the agent can't pick up a swapped transcript live.
+                self._begin_shared_resume(
+                    store,
+                    entry,
+                    agent,
+                    action="update_live",
+                    name=None,
+                    resume_id=session_id,
+                    overwrite=True,
+                    as_id=None,
+                    backend=entry_backend,
+                )
+                return
+            assert keep_both_id is not None
+            copy_name = self._prompt_session_name(
+                "Name the copied session", default=self._dedupe_session_name(entry.name)
+            )
+            if copy_name is None:
+                self._set_message("Cancelled.")
+                self._render()
+                return
+            self._begin_shared_resume(
+                store,
+                entry,
+                agent,
+                action="new",
+                name=copy_name,
+                resume_id=keep_both_id,
+                overwrite=False,
+                as_id=keep_both_id,
+                backend=entry_backend,
+            )
+            return
+        # Not running locally: pick a clear local name (#71), default to the original
+        # share name (deduped) — NOT a "<sharer>-<name>" slug, which grew without
+        # bound when sharing back and forth (#55).
+        name = self._prompt_session_name("Resume shared session", default=self._dedupe_session_name(entry.name))
+        if name is None:
+            self._set_message("Cancelled.")
+            self._render()
+            return
+        overwrite, as_id, resume_id = False, None, session_id
+        if agent.has_local_session(self.base_repo.repo, session_id):
             age = self._format_age(entry.manifest["updated"]) if entry.manifest.get("updated") else "earlier"
+            keep_both_id = getattr(agent, "new_import_id", lambda: None)()
+            opts = [f"Replace my local copy with the shared version (updated {age})"]
+            if keep_both_id:
+                opts.append("Keep both (fetch the shared copy as a separate session)")
+            opts.append("Keep my local copy")
             pick = self._select_popup(
-                f"You already have a local copy of {entry.display}.\n"
-                f"The shared version was updated {age}. Which do you want to continue?",
-                ["Pull the shared version (replace my local copy)", "Keep my local copy"],
+                f"You already have a local copy of {entry.display}.\nWhich do you want to continue?", opts
             )
             if pick is None:
                 self._set_message("Cancelled.")
                 self._render()
                 return
-            overwrite = pick.startswith("Pull")
-        if not agent.import_shared_session(self.base_repo.repo, session_id, transcript, overwrite=overwrite):
-            self._set_message("Could not install the shared session for resume.")
+            if pick.startswith("Keep both"):
+                assert keep_both_id is not None
+                as_id = resume_id = keep_both_id
+            elif pick.startswith("Replace"):
+                overwrite = True
+            else:  # keep the local copy: resume it directly, no fetch/import needed
+                self._resume_conversation(name, session_id, backend=entry_backend)
+                return
+        self._begin_shared_resume(
+            store,
+            entry,
+            agent,
+            action="new",
+            name=name,
+            resume_id=resume_id,
+            overwrite=overwrite,
+            as_id=as_id,
+            backend=entry_backend,
+        )
+
+    def _begin_shared_resume(self, store, entry, agent, *, action, name, resume_id, overwrite, as_id, backend) -> None:
+        # Fetch the (possibly large) transcript on a worker thread, then WAIT for it
+        # cancellably: the UI keeps draining (no freeze) and the user can press Esc to
+        # stop a slow fetch. The import + session switch/restart still happen on the
+        # main loop (_service_shared_resume) once the result lands.
+        if self._shared_resume_thread is not None and self._shared_resume_thread.is_alive():
+            self._set_message("Already fetching a shared session — please wait.")
             self._render()
             return
-        self._resume_conversation(f"{entry.github_id}-{entry.name}", session_id, backend=entry_backend)
+        session_id = entry.manifest.get("session_id")
+        self._shared_resume_result = None
+        cancel = threading.Event()
+        self._shared_resume_cancel = cancel
+
+        def worker() -> None:
+            try:
+                # Bound the full fetch (it can be large) and make it killable, so a
+                # cancel/exit terminates the git process at once instead of waiting.
+                transcript = store.read_transcript(entry, timeout=self.RESUME_FETCH_TIMEOUT, cancel=cancel)
+                if cancel.is_set():
+                    return  # cancelled (or exiting) while fetching — drop the result
+                if not transcript:
+                    self._shared_resume_result = {"error": "incomplete"}
+                    return
+                self._shared_resume_result = {
+                    "transcript": transcript,
+                    "action": action,
+                    "agent": agent,
+                    "session_id": session_id,
+                    "name": name,
+                    "resume_id": resume_id,
+                    "overwrite": overwrite,
+                    "as_id": as_id,
+                    "backend": backend,
+                    "entry_name": entry.name,
+                }
+            except Exception as error:
+                if not cancel.is_set():
+                    self._shared_resume_result = {"error": repr(error)}
+
+        self._set_message(f"Fetching '{entry.display}'…   press Esc to cancel", seconds=600)
+        self._render()
+        self._shared_resume_thread = threading.Thread(target=worker, daemon=True, name="agit-shared-resume")
+        self._shared_resume_thread.start()
+        status = self._drain_pty_until_done_or_esc(
+            self._shared_resume_thread, deadline=time.monotonic() + self.RESUME_FETCH_TIMEOUT + 2.0
+        )
+        if status == "cancel":
+            # The user pressed Esc/Ctrl-C: stop and reset all fetch state so a retry
+            # can start immediately. This is the ONLY path that reports "cancelled".
+            self._abort_shared_resume(cancel)
+            self._set_message(f"Stopped fetching '{entry.display}' (cancelled).", seconds=6.0)
+            self._render()
+            return
+        if status == "timeout":
+            # Past the deadline with the worker still stuck (a stalled network its own
+            # timeout didn't unwind in time): a FAILURE, not a user cancel. Say why and
+            # hold the notice until the user acknowledges it.
+            self._abort_shared_resume(cancel)
+            self._await_keypress(
+                f"Couldn't fetch '{entry.display}': the fetch timed out after "
+                f"{int(self.RESUME_FETCH_TIMEOUT)}s. Press any key to continue."
+            )
+            return
+        # The worker finished. If it failed, report WHY and keep the notice up until a
+        # keypress — never let a generic auto-dismissing (or "cancelled") message stand
+        # in for a real failure the user needs to see.
+        result = self._shared_resume_result
+        if result is not None and "error" in result:
+            self._abort_shared_resume(cancel)
+            reason = "the shared transcript is incomplete" if result["error"] == "incomplete" else result["error"]
+            self._await_keypress(f"Couldn't fetch '{entry.display}': {reason}. Press any key to continue.")
+            return
+        # Success: the import + session switch run on the main loop (_service_shared_resume).
+
+    def _abort_shared_resume(self, cancel: "threading.Event") -> None:
+        # Stop the in-flight transcript fetch and clear ALL resume state so the user
+        # can retry at once. Setting *cancel* makes the (daemon) worker drop any late
+        # result and the bounded git fetch self-terminate; nulling the shared cancel
+        # token clears the "fetch in progress" flag so nothing lingers to block or
+        # mis-handle an immediate retry. The next fetch installs a fresh token.
+        cancel.set()
+        self._shared_resume_result = None
+        self._shared_resume_thread = None
+        self._shared_resume_cancel = None
+
+    def _await_keypress(self, message: str) -> None:
+        """Show *message* and block — keeping the PTYs draining so the screen stays
+        live — until the user presses any key, so a failure notice can't scroll past
+        unseen. Headless/non-interactive callers (no real stdin) just set the message
+        and return, since there is no key to wait on."""
+        self._set_message(message, seconds=3600)
+        self._render()
+        try:
+            stdin_fd = sys.stdin.fileno()
+        except (OSError, ValueError):
+            return
+        while self.running:
+            master = self.master_fd
+            background = self._background_fds() if self.sessions else {}
+            fds = [stdin_fd]
+            if master is not None:
+                fds.append(master)
+            fds.extend(background)
+            try:
+                readable, _, _ = select.select(fds, [], [], 0.2)
+            except (OSError, ValueError):
+                return
+            for fd in readable:
+                if fd == stdin_fd:
+                    if self._is_real_keypress(os.read(stdin_fd, 32)):  # a key (not a mouse move) dismisses
+                        return
+                elif fd == master:
+                    output = self._drain_child_output()
+                    if output is not None:
+                        self.last_child_output = time.monotonic()
+                        self._feed_child_output(output)
+                elif fd in background:
+                    self._pump_background(background[fd])
+
+    def _cancel_inflight_shared_fetches(self) -> None:
+        # Stop any in-flight shared-session fetch immediately (used on exit): signal
+        # the cancel token so a still-running worker drops its result and never
+        # triggers a late session switch. The bounded git fetch self-terminates, and
+        # the daemon thread dies with the process. Best-effort and idempotent.
+        if self._shared_resume_cancel is not None:
+            self._shared_resume_cancel.set()
+        self._shared_resume_result = None
+
+    def _service_shared_resume(self) -> None:
+        result = self._shared_resume_result
+        if result is None:
+            return
+        # A cancelled/abandoned fetch must never complete a switch: drop a late result
+        # when there is no active fetch (token cleared by _abort_shared_resume) or its
+        # token is set (the user stopped it, or aGiT is exiting).
+        cancel = self._shared_resume_cancel
+        if cancel is None or cancel.is_set():
+            self._shared_resume_result = None
+            self._shared_resume_thread = None
+            return
+        if self._shared_resume_thread is not None and self._shared_resume_thread.is_alive():
+            return  # still fetching
+        self._shared_resume_result = None
+        self._shared_resume_thread = None
+        self._shared_resume_cancel = None  # fetch concluded — no token lingers to block a retry
+        if result.get("error") == "incomplete":
+            self._await_keypress("That shared session is incomplete; cannot resume it. Press any key to continue.")
+            return
+        if "error" in result:
+            self._await_keypress(f"Could not fetch the shared session: {result['error']}. Press any key to continue.")
+            return
+        if result["action"] == "update_live":
+            self._complete_live_shared_update(result)
+            return
+        # A new (or copied) session: import the transcript and resume it.
+        agent, sid = result["agent"], result["session_id"]
+        if not agent.import_shared_session(
+            self.base_repo.repo, sid, result["transcript"], overwrite=result["overwrite"], as_id=result["as_id"]
+        ):
+            self._set_message("Could not install the shared session for resume.", seconds=8.0)
+            self._render()
+            return
+        if result.get("as_id"):
+            self._user_state().set_shared_origin_name(result["as_id"], result["entry_name"])
+        self._resume_conversation(result["name"], result["resume_id"], backend=result["backend"])
+
+    def _complete_live_shared_update(self, result: dict) -> None:
+        # Update the already-running session to the shared version: switch to it,
+        # overwrite its worktree transcript, then restart the backend so it loads
+        # the new content (a live agent won't pick up a transcript swapped under it).
+        agent, sid = result["agent"], result["session_id"]
+        idx = next(
+            (
+                i
+                for i, s in enumerate(self.sessions)
+                if getattr(getattr(s, "state", None), "backend_session_id", None) == sid
+            ),
+            None,
+        )
+        if idx is None:
+            # It stopped being live while fetching — fall back to a fresh resume.
+            agent.import_shared_session(self.base_repo.repo, sid, result["transcript"], overwrite=True)
+            self._resume_conversation(result["entry_name"], sid, backend=result["backend"])
+            return
+        self._switch_active(idx)
+        if not agent.import_shared_session(self.repo.repo, sid, result["transcript"], overwrite=True):
+            self._set_message("Could not update the session from the shared version.", seconds=8.0)
+            self._render()
+            return
+        self._restart_agent("Updated this session to the shared version.")
 
     def _format_age(self, updated: float) -> str:
-        delta = max(0, int(time.time() - (updated or 0)))
+        # An unknown/unset timestamp (0 or None) must not be rendered as a date —
+        # it would show as ~20000d ago (the Unix epoch). Say so honestly instead.
+        if not updated or updated <= 0:
+            return "date unknown"
+        delta = max(0, int(time.time() - updated))
         for size, unit in ((86400, "d"), (3600, "h"), (60, "m")):
             if delta >= size:
                 return f"{delta // size}{unit} ago"
@@ -2960,6 +3679,80 @@ class ProxyRunner:
             self._render()
             return
         self._stop_session(options.index(choice))
+
+    def _rename_session_menu(self) -> None:
+        options = [self._session_name(index) for index in range(len(self.sessions))]
+        choice = self._select_popup("Rename which session?", options)
+        if choice is None:
+            self._set_message("Cancelled.")
+            self._render()
+            return
+        index = options.index(choice)
+        new_name = self._prompt_popup("Rename session", "New name for this session:", default=self._session_name(index))
+        if new_name is None or not new_name.strip():
+            self._set_message("Cancelled.")
+            self._render()
+            return
+        self._rename_session(index, new_name.strip())
+
+    def _rename_session(self, index: int, new_name: str) -> None:
+        # Rename a session by moving its worktree directory. The worktree is in use
+        # (the backend's cwd is inside it), so release the backend first, move, then
+        # restart it pointing at the new path.
+        if not (0 <= index < len(self.sessions)):
+            return
+        sanitized = _sanitize_name(new_name)
+        if self._session_name_taken(sanitized) and sanitized != _sanitize_name(self._session_name(index)):
+            self._set_message(f"'{sanitized}' is already in use.", seconds=6.0)
+            self._render()
+            return
+        self._switch_active(index)
+        info = self.worktree
+        if info is None or not self._use_worktrees:
+            self._set_message("This session has no worktree to rename.")
+            self._render()
+            return
+        if _sanitize_name(info.name) == sanitized:
+            self._set_message("Name unchanged.")
+            self._render()
+            return
+        old_name = info.name
+        sid = self.state.backend_session_id
+        # Release the worktree (the backend has its cwd inside) before moving it.
+        self._stop_file_watcher()
+        self._teardown_child()
+        try:
+            new_info = self._worktrees().move(old_name, sanitized)
+        except Exception as error:
+            self._debug(f"rename worktree failed: {error!r}")
+            # Recover: respawn in the original worktree so the session isn't stranded.
+            self._init_screen()
+            self._spawn()
+            self._start_file_watcher()
+            self._set_message(f"Could not rename session: {error}", seconds=8.0)
+            self._render()
+            return
+        self.name = new_info.name
+        self.worktree = new_info
+        self.repo = GitRepo(new_info.path)
+        self.turn = self._turn_from_branch(self.repo.current_branch())
+        self.state = AgitState(new_info.path, default_backend=self.global_config.default_backend)
+        if sid:
+            self.state.backend_session_id = sid  # re-point backend_session_repo at the new path
+        self.actions = AgitActions(self.repo, self.state, verbose=self.verbose)
+        if sid:
+            self._stage_backend_resume(sid)  # re-link the transcript under the new path
+            self._persist_session_name(sid)
+        self._reset_agent_tracking()
+        self._sanitize_state_trace()
+        self._initialize_session_baseline()
+        self._init_screen()
+        self._spawn()
+        self._resize_child()
+        self._enable_host_mouse()
+        self._start_file_watcher()
+        self._set_message(f"Renamed session to '{new_info.name}'.")
+        self._render()
 
     def _switch_active(self, index: int) -> None:
         if not (0 <= index < len(self.sessions)) or index == self.active_index:
@@ -3176,11 +3969,16 @@ class ProxyRunner:
             # backends), independent of the global default.
             self.state.backend = backend
         if resume_session_id:
-            # Resume this exact backend conversation (its transcript lives under
-            # the worktree path, which we have just recreated/reused).
+            # Resume this exact backend conversation.
             self.state.backend_session_id = resume_session_id
             self._persist_session_name(resume_session_id)
         self.backend = make_proxy_agent(self.state.backend)
+        if resume_session_id:
+            # Stage the transcript into THIS worktree before spawning, so a
+            # `--resume` finds it. Crucial for a shared session: its transcript was
+            # imported under the base repo's project dir, not this fresh worktree's,
+            # so without this the resume found nothing and the session never loaded.
+            self._stage_backend_resume(resume_session_id)
         self.actions = AgitActions(self.repo, self.state, verbose=self.verbose)
         self._sanitize_state_trace()
         self._initialize_session_baseline()
@@ -3546,6 +4344,7 @@ class ProxyRunner:
             self._ensure_worktree_alive()
             self._service_commit_summaries()  # apply finished background summaries (#8)
             self._service_precompact_summary()
+            self._service_shared_resume()  # complete a shared-session resume once fetched
             self._maybe_agent_commit()
             self._service_background_sessions()
             self._poll_base_advanced()
@@ -4335,16 +5134,32 @@ class ProxyRunner:
                 declined = set(state.declined_untracked())
                 repo.stage_paths([path for path in repo.untracked_files() if path not in declined])
 
-        def on_commit_fn(sha):
+        def on_commit_fn(sha, trace_text, is_cover):
             self._last_agent_commit_id = sha
+            # Mark that this session saw a real turn this run (stable aGiT session id,
+            # not the drift-prone backend id) so the exit-path auto-share knows there
+            # is genuinely something new to push.
+            self._sessions_with_activity.add(self.state.session_id)
             # Don't announce the commit yet: the "created" popup is shown only once
             # the commit is merged into the base branch (see _integrate_turn_or_conflict),
             # so the user is never told a commit landed before it actually has.
             self._commit_merged_pending = True
             self._commit_summarized = False
+            # When the backend agent committed its own work, aGiT puts a merge-shaped
+            # "cover" commit on top instead of amending (which would change the
+            # agent's commit hashes). Tell the user briefly what just happened (#35).
+            if is_cover:
+                self._set_session_notice(
+                    self._session_label(),
+                    "aGiT is committing a cover — a wrapper commit over the agent's own commits "
+                    "that adds the interaction trace without changing their hashes.",
+                    seconds=8.0,
+                )
             # The commit is made immediately; the LLM summary is computed in the
-            # background and amended in afterwards (#8) so the UI never blocks.
-            self._start_commit_summary(sha, turns)
+            # background and amended in afterwards (#8) so the UI never blocks. The
+            # trace passed here is exactly the one that landed in the commit (built
+            # inside commit_turns), which is the summarizer's sole input.
+            self._start_commit_summary(sha, trace_text)
 
         return CommitEngine(self.repo, self.state, debug_fn=self._debug).commit_turns(
             turns=turns,
@@ -4454,7 +5269,7 @@ class ProxyRunner:
         # user's conversation (issues #8/#56).
         return Summarizer(backend_class(summary_scratch_dir()), model=model)
 
-    def _start_commit_summary(self, sha: str, turns) -> None:
+    def _start_commit_summary(self, sha: str, trace_text: str) -> None:
         summarizer = self._make_summarizer()
         if summarizer is None:
             return
@@ -4469,13 +5284,6 @@ class ProxyRunner:
             return
         try:
             full_sha = self.repo.rev_parse(sha)
-            # The committed snapshot is immutable, so the summary is computed
-            # from exactly what landed — the whole turn's range when the base
-            # branch is known, otherwise the commit's own diff.
-            if self._base_branch is not None:
-                diff = self.repo.diff_range(self._base_branch, full_sha)
-            else:
-                diff = self.repo.diff_range(f"{full_sha}^", full_sha)
         except Exception as error:
             self._debug(f"summary snapshot failed: {error!r}")
             return
@@ -4496,15 +5304,14 @@ class ProxyRunner:
 
         def worker() -> None:
             try:
-                result["summary"] = summarizer.summarize_commit(turns=turns, diff=diff)
+                result["summary"] = summarizer.summarize_commit(trace=trace_text)
             except Exception as error:  # surfaced by the service tick
                 result["error"] = repr(error)
             else:
                 try:
                     result["session_summary"] = summarizer.update_session_summary(
                         current_summary=session_summary,
-                        turns=turns,
-                        diff=diff,
+                        trace=trace_text,
                         commit_summary=result["summary"],
                     )
                 except Exception as error:
@@ -4683,11 +5490,22 @@ class ProxyRunner:
             return
         lines = [text for text, _until, _sticky in self._session_notices.values()]
         if lines:
-            self.message = "\n".join(lines)
+            composed = "\n".join(lines)
+            # Only request a repaint when the popup's content actually changes.
+            # _service_session_notices runs every reactor tick, so re-flagging a
+            # render each time (even when the text is unchanged) forces a
+            # full-frame repaint at tick cadence — which flickers the notice popup
+            # on terminals without synchronized-update support while the backend is
+            # also streaming output. message_until is refreshed silently (it only
+            # gates the render's "still showing" check, and the per-notice expiries
+            # are fixed at set time, so updating it never needs a repaint).
+            changed = not self._notice_shown or composed != self.message
+            self.message = composed
             self.message_until = max(until for _t, until, _s in self._session_notices.values())
             self._message_sticky = False
             self._notice_shown = True
-            self._render_pending = True
+            if changed:
+                self._render_pending = True
         elif self._notice_shown:
             # The notices just emptied and we owned the popup: clear it.
             self._clear_message()
@@ -4798,9 +5616,15 @@ class ProxyRunner:
             return  # already finalized (e.g. the backend exited and we ran this)
         self._finalized_on_exit = True
         self._exiting = True
+        self._cancel_inflight_shared_fetches()  # stop any unfinished session fetch at once
+        # The session the user was working in when they quit is the one to
+        # auto-resume next start — not necessarily the primary (they may have
+        # switched to a new or shared session). It is finalized first, below.
+        self._exit_resume_worktree = getattr(self.worktree, "name", None)
         self._set_message("Finalizing commits before exit...", seconds=30)
         self._render()
         self._commit_latest_turn_sync()  # active session, in place
+        self._auto_share_on_exit()  # push the latest conversation if auto-shared
         self._finalize_summary_then_integrate_on_exit()
         for session in list(self.sessions):
             if session is self.active:
@@ -4809,13 +5633,17 @@ class ProxyRunner:
             self.active = session
             try:
                 self._commit_latest_turn_sync()
+                self._auto_share_on_exit()
                 self._finalize_summary_then_integrate_on_exit()
             finally:
                 self.active = saved
         self._delete_orphan_merged_branches()
-        # Reclaim any dangling shared-session snapshots before leaving (offline:
-        # no network on the exit path). Belt-and-suspenders to the startup sweep.
-        self._sweep_orphan_shared_sessions(fetch=False)
+        # NB: deliberately NOT sweeping orphan shared-session snapshots here. That
+        # sweep runs `git fsck` over the whole object graph — seconds on a large
+        # repo — and would block exit (showing "Finalizing commits…") even when the
+        # session made no commits. It is redundant anyway: each publish reclaims its
+        # previous snapshot immediately, and the startup sweep (a background thread)
+        # mops up any stragglers. So leave exit fast.
 
     def _finalize_summary_then_integrate_on_exit(self) -> None:
         # Give the current session's in-flight commit summary a short grace period
@@ -4904,19 +5732,23 @@ class ProxyRunner:
         info = self.worktree
         if info is None or self._base_branch is None:
             return
-        # Persist the primary session's resume pointer FIRST — before deciding
-        # whether its worktree can be removed. _persist_last_session_record runs
-        # _adopt_latest_backend_session, which captures a conversation the user
-        # switched to inside the backend's own picker (Claude's session view).
-        # Gating it behind a clean worktree removal meant a session that still had
-        # uncommitted or unintegrated work — the usual state right after a mid-work
-        # switch — never updated its resume pointer, so the next start resumed a
-        # stale conversation and only the start after that landed on the right one
-        # (the "first restart starts fresh, second restart resumes it" off-by-one).
-        # Adopting writes both the worktree state (used when the worktree is kept)
-        # and the repo-root state (used when it is removed), so the right
-        # conversation resumes either way.
-        if info.name == self._primary_worktree_name:
+        # Persist the resume pointer FIRST — before deciding whether the worktree
+        # can be removed. _persist_last_session_record runs _adopt_latest_backend_session,
+        # which captures a conversation the user switched to inside the backend's
+        # own picker (Claude's session view). Gating it behind a clean worktree
+        # removal meant a session that still had uncommitted or unintegrated work —
+        # the usual state right after a mid-work switch — never updated its resume
+        # pointer, so the next start resumed a stale conversation and only the start
+        # after that landed on the right one (the "first restart starts fresh,
+        # second restart resumes it" off-by-one). Adopting writes both the worktree
+        # state (used when the worktree is kept) and the repo-root state (used when
+        # it is removed), so the right conversation resumes either way.
+        #
+        # Persist for the session the user was actually in when they quit (set in
+        # _finalize_pending_work), so quitting from a freshly-started or resumed
+        # *shared* session auto-resumes THAT next start — not the original primary,
+        # which left the next start prompting for a brand-new session instead.
+        if info.name == (self._exit_resume_worktree or self._primary_worktree_name):
             self._persist_last_session_record()
         try:
             if self.merge_ctx or self.repo.merge_in_progress() or self.repo.has_changes():

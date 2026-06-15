@@ -40,6 +40,9 @@ KIND_UNKNOWN = "unknown"
 # A short network timeout so a startup check never hangs the terminal. The
 # periodic in-session check runs on a worker thread, but keep it bounded anyway.
 _NET_TIMEOUT = 20
+# The startup check blocks launch, so bound it much tighter: an offline user waits
+# at most this long before aGiT starts anyway.
+STARTUP_NET_TIMEOUT = 6
 
 # Sentinel so callers can inject ``source_repo=None`` to mean "no source-linked
 # install" (force the package path), distinct from "not provided -> auto-detect".
@@ -61,6 +64,7 @@ class UpdateStatus:
     behind: int = 0  # commits behind upstream (source installs only)
     message: str = ""  # human-readable summary for the UI
     error: str | None = None  # set when the check could not complete
+    restart_only: bool = False  # code is already current on disk; only a restart is needed
 
     @property
     def ok(self) -> bool:
@@ -68,15 +72,23 @@ class UpdateStatus:
 
 
 def _git(args: list[str], cwd: Path, *, timeout: int | None = None) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", *args],
-        cwd=str(cwd),
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-        timeout=timeout,
-    )
+    # GIT_TERMINAL_PROMPT=0: a network git call (fetch) must never block on a
+    # credential prompt — offline/auth failures should fail fast, not hang launch.
+    # A timeout bounds the rest; on expiry the process is killed and we report it as
+    # a plain non-zero result so callers degrade to "couldn't check" gracefully.
+    try:
+        return subprocess.run(
+            ["git", *args],
+            cwd=str(cwd),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=timeout,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(["git", *args], returncode=124, stdout="", stderr="timed out")
 
 
 def detect_source_repo() -> Path | None:
@@ -119,6 +131,20 @@ class Updater:
         self._source_repo: Path | None = (
             detect_source_repo() if source_repo is _DETECT else cast("Path | None", source_repo)
         )
+        # The source HEAD the running process was loaded from. Snapshotted HERE, at
+        # construction (≈ process start), not on the first successful check: a check
+        # gated on a network fetch could miss a purely-local update — offline, or the
+        # checkout advancing before the first check — and leave the running process
+        # unaware it is stale. Reading HEAD needs no network and is independent of the
+        # upstream/fetch outcome. After the checkout moves on under a still-running
+        # process (a self-update, a manual pull, or, in self-development, the source
+        # advancing), this lets us see the running code is older than disk and prompt
+        # a restart instead of reporting "up to date" off the checkout alone.
+        self._running_rev: str | None = None
+        if self._source_repo is not None:
+            head = _git(["rev-parse", "HEAD"], self._source_repo)
+            if head.returncode == 0:
+                self._running_rev = head.stdout.strip() or None
 
     @property
     def kind(self) -> str:
@@ -132,12 +158,14 @@ class Updater:
 
     # --- checking --------------------------------------------------------
 
-    def check(self, *, fetch: bool = True) -> UpdateStatus:
+    def check(self, *, fetch: bool = True, timeout: int = _NET_TIMEOUT) -> UpdateStatus:
         """Check whether a newer aGiT is available. Blocking (network); run on a
-        worker thread from interactive contexts."""
+        worker thread from interactive contexts. ``timeout`` bounds each network
+        call — pass a short value (``STARTUP_NET_TIMEOUT``) for the launch-time
+        check so an offline user isn't made to wait."""
         if self.kind == KIND_SOURCE:
-            return self._check_source(fetch=fetch)
-        return self._check_package()
+            return self._check_source(fetch=fetch, timeout=timeout)
+        return self._check_package(timeout=timeout)
 
     def _upstream_ref(self, repo: Path) -> str | None:
         # The current branch's configured upstream (e.g. "origin/main"). Without
@@ -149,49 +177,93 @@ class Updater:
         ref = result.stdout.strip()
         return ref or None
 
-    def _check_source(self, *, fetch: bool) -> UpdateStatus:
+    def _check_source(self, *, fetch: bool, timeout: int = _NET_TIMEOUT) -> UpdateStatus:
         repo = self._source_repo
         assert repo is not None
         status = UpdateStatus(kind=KIND_SOURCE)
+        # The HEAD on disk right now (no network). Comparing it against the running rev
+        # catches a LOCAL update the running process hasn't loaded — a manual pull, a
+        # prior self-update, or the source checkout advancing during self-development —
+        # regardless of whether the remote can be reached.
+        head = _git(["rev-parse", "HEAD"], repo).stdout.strip()
+        if self._running_rev is None:  # construction snapshot failed: fall back to now
+            self._running_rev = head or None
+        head_short = _git(["rev-parse", "--short", "HEAD"], repo).stdout.strip()
+        status.current = head_short
+        running_stale = bool(self._running_rev) and bool(head) and self._running_rev != head
+
+        # The remote side (needs the network). A missing upstream or a failed fetch is
+        # remembered, not fatal — local staleness above is reported either way.
         upstream = self._upstream_ref(repo)
-        if upstream is None:
-            status.error = "no upstream branch is configured for the aGiT source checkout"
-            return status
-        remote = upstream.split("/", 1)[0]
-        if fetch:
-            fetched = _git(["fetch", "--quiet", remote], repo, timeout=_NET_TIMEOUT)
-            if fetched.returncode != 0:
-                status.error = (fetched.stderr.strip() or "git fetch failed").splitlines()[-1]
-                return status
-        behind = _git(["rev-list", "--count", f"HEAD..{upstream}"], repo)
-        if behind.returncode != 0:
-            status.error = behind.stderr.strip() or "could not compare against upstream"
-            return status
-        status.behind = int(behind.stdout.strip() or "0")
-        status.current = _git(["rev-parse", "--short", "HEAD"], repo).stdout.strip()
-        status.latest = _git(["rev-parse", "--short", upstream], repo).stdout.strip()
-        status.available = status.behind > 0
-        if status.available:
+        fetch_error: str | None = None
+        if upstream is not None:
+            remote = upstream.split("/", 1)[0]
+            if fetch:
+                fetched = _git(["fetch", "--quiet", remote], repo, timeout=timeout)
+                if fetched.returncode != 0:
+                    fetch_error = (fetched.stderr.strip() or "git fetch failed").splitlines()[-1]
+            if fetch_error is None:
+                behind = _git(["rev-list", "--count", f"HEAD..{upstream}"], repo)
+                if behind.returncode != 0:
+                    fetch_error = behind.stderr.strip() or "could not compare against upstream"
+                else:
+                    status.behind = int(behind.stdout.strip() or "0")
+                    status.latest = _git(["rev-parse", "--short", upstream], repo).stdout.strip()
+
+        if status.behind > 0:
+            status.available = True
             commits = "commit" if status.behind == 1 else "commits"
             status.message = (
                 f"aGiT update available: {status.behind} new {commits} on {upstream} "
                 f"({status.current} → {status.latest})."
             )
+            return status
+        if running_stale:
+            # The checkout is already updated but this process still runs the old code.
+            # Detected with no network, so an offline local update still prompts a
+            # restart. Takes precedence over a fetch error — the user can act on it now.
+            assert self._running_rev is not None
+            status.available = True
+            status.restart_only = True
+            status.current = self._running_rev[:7]
+            status.latest = head_short  # restarting loads the HEAD on disk
+            status.message = (
+                f"aGiT was updated on disk but the running copy is older "
+                f"({status.current} → {status.latest}); restart to load it."
+            )
+            return status
+        # Nothing local is stale. If the remote couldn't be checked, say why; otherwise
+        # we are genuinely current.
+        if upstream is None:
+            status.error = "no upstream branch is configured for the aGiT source checkout"
+        elif fetch_error is not None:
+            status.error = fetch_error
         else:
             status.message = "aGiT is up to date."
         return status
 
-    def _check_package(self) -> UpdateStatus:
+    def _check_package(self, *, timeout: int = _NET_TIMEOUT) -> UpdateStatus:
         status = UpdateStatus(kind=KIND_PACKAGE)
-        status.current = self._installed_version()
-        latest = self._latest_package_version()
+        installed = self._installed_version()
+        status.current = installed
+        latest = self._latest_package_version(timeout=timeout)
         if latest is None:
             status.error = "could not determine the latest published aGiT version"
             return status
         status.latest = latest
-        status.available = _version_tuple(latest) > _version_tuple(status.current)
-        if status.available:
-            status.message = f"aGiT update available: {status.current} → {latest}."
+        running = self._running_version()
+        index_newer = _version_tuple(latest) > _version_tuple(installed)
+        running_stale = _version_tuple(installed) > _version_tuple(running)
+        if index_newer:
+            status.available = True
+            status.message = f"aGiT update available: {installed} → {latest}."
+        elif running_stale:
+            # The package on disk was already upgraded (e.g. `pip install -U`) but
+            # this process is still running the old version.
+            status.available = True
+            status.restart_only = True
+            status.current = running
+            status.message = f"aGiT {installed} is installed but the running copy is {running}; restart to load it."
         else:
             status.message = "aGiT is up to date."
         return status
@@ -204,19 +276,29 @@ class Updater:
         except Exception:
             return getattr(agit, "__version__", "0")
 
-    def _latest_package_version(self) -> str | None:
+    def _running_version(self) -> str:
+        # The version this process actually imported at startup. ``agit.__version__``
+        # is read once at import, so after an in-place upgrade it still reflects the
+        # OLD version while :meth:`_installed_version` reads the new one from disk.
+        return getattr(agit, "__version__", "0")
+
+    def _latest_package_version(self, *, timeout: int = _NET_TIMEOUT) -> str | None:
         # `pip index versions` is the most portable way to ask the configured
         # index without a hard dependency on a PyPI JSON client. It is marked
-        # experimental but degrades gracefully: any failure returns None and the
-        # caller reports "could not determine the latest version".
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "index", "versions", DIST_NAME],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=_NET_TIMEOUT,
-        )
+        # experimental but degrades gracefully: any failure (including a network
+        # timeout) returns None and the caller reports "could not determine the
+        # latest version".
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "index", "versions", DIST_NAME],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return None
         if result.returncode != 0:
             return None
         prefix = f"{DIST_NAME.lower()} ("

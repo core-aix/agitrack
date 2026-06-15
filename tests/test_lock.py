@@ -40,6 +40,27 @@ def test_second_holder_is_blocked_by_live_owner(tmp_path):
     second.release()
 
 
+def test_probe_owner_reports_free_then_holder(tmp_path):
+    # probe_owner is a non-destructive pre-check: None when free, the holder's pid
+    # when another live process holds it — and it never leaves the lock held.
+    path = tmp_path / "lock"
+    probe = RepoLock(path)
+    assert probe.probe_owner() is None  # free
+    assert probe.acquire() is True  # probing didn't leave it held, so we can take it
+    # With a live holder, a fresh probe reports that holder's pid...
+    other = RepoLock(path)
+    assert other.probe_owner() == os.getpid()
+    # ...without acquiring it itself.
+    assert other.is_held_by_self() is False
+    probe.release()
+    assert RepoLock(path).probe_owner() is None  # free again after release
+
+
+def test_probe_owner_on_missing_dir_is_free(tmp_path):
+    # No .agit dir / lock file yet ⇒ nobody is running ⇒ free (acquire is authority).
+    assert RepoLock(tmp_path / "nope" / ".agit" / "lock").probe_owner() is None
+
+
 def test_different_repos_get_independent_locks(tmp_path):
     # The lock is per-repo (its path lives under the repo's .agit/), so aGiT on
     # one repo never blocks aGiT on another — only a second instance on the SAME

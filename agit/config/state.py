@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -242,16 +243,30 @@ class AgitState:
         return str(value) if value else None
 
     def name_session(self, session_id: str | None, name: str | None) -> None:
-        """Record (or clear) the user-given name for a backend conversation."""
+        """Record (or clear) the user-given name for a backend conversation, and
+        stamp when it was last named so a session with no transcript of its own
+        (e.g. a no-commit session surfaced for resume) still has a real date to
+        show instead of the Unix epoch."""
         if not session_id:
             return
         names = dict(self.data.get("session_names") or {})
+        stamps = dict(self.data.get("session_named_at") or {})
         if name:
             names[str(session_id)] = name
+            stamps[str(session_id)] = time.time()
         else:
             names.pop(str(session_id), None)
+            stamps.pop(str(session_id), None)
         self.data["session_names"] = names
+        self.data["session_named_at"] = stamps
         self.save()
+
+    def session_named_at(self, session_id: str | None) -> float:
+        """Epoch when ``session_id`` was last named (0.0 if unknown)."""
+        if not session_id:
+            return 0.0
+        value = (self.data.get("session_named_at") or {}).get(str(session_id))
+        return float(value) if isinstance(value, (int, float)) else 0.0
 
     @property
     def last_backend_message_id(self) -> str | None:
@@ -299,6 +314,66 @@ class AgitState:
         else:
             current.discard(session_id)
         self.data["auto_share_sessions"] = sorted(current)
+        self.save()
+
+    # --- shared-session id lineage (#55) -----------------------------------
+    # The backend can mint a new session id when a conversation is resumed
+    # (Claude forks on `--resume`). A session shared or auto-shared under its old
+    # id must still be recognised as shared after that drift, otherwise the
+    # marker and auto-update silently disappear on the next run. We record, for a
+    # drifted live id, the previous id it forked from, so callers can walk back to
+    # the original (shared) id.
+
+    def shared_session_aliases(self) -> dict[str, str]:
+        return {str(k): str(v) for k, v in (self.data.get("shared_session_aliases") or {}).items()}
+
+    def add_shared_session_alias(self, new_id: str | None, previous_id: str | None) -> None:
+        if not new_id or not previous_id or new_id == previous_id:
+            return
+        aliases = self.shared_session_aliases()
+        aliases[str(new_id)] = str(previous_id)
+        self.data["shared_session_aliases"] = aliases
+        self.save()
+
+    def session_lineage(self, session_id: str | None) -> list[str]:
+        """The id plus every ancestor id it forked from across resume drift."""
+        if not session_id:
+            return []
+        aliases = self.shared_session_aliases()
+        chain = [str(session_id)]
+        seen = {str(session_id)}
+        cur = str(session_id)
+        while cur in aliases:
+            parent = aliases[cur]
+            if parent in seen:
+                break  # defensive: never loop on a corrupt chain
+            chain.append(parent)
+            seen.add(parent)
+            cur = parent
+        return chain
+
+    # --- shared-session origin name (#55) ----------------------------------
+    # The name a session was originally shared under. Tracked per backend session
+    # id (and carried across resume id-drift) so re-sharing a session imported from
+    # another machine updates the SAME shared entry instead of publishing under the
+    # local session name — which prepended the sharer id on every round-trip, so
+    # the name grew without bound and the back-and-forth never converged.
+
+    def shared_origin_name(self, session_id: str | None) -> str | None:
+        if not session_id:
+            return None
+        value = (self.data.get("shared_origin_names") or {}).get(str(session_id))
+        return str(value) if value else None
+
+    def set_shared_origin_name(self, session_id: str | None, name: str | None) -> None:
+        if not session_id:
+            return
+        origins = dict(self.data.get("shared_origin_names") or {})
+        if name:
+            origins[str(session_id)] = name
+        else:
+            origins.pop(str(session_id), None)
+        self.data["shared_origin_names"] = origins
         self.save()
 
     def pending_trace(self) -> list[dict]:
