@@ -3031,6 +3031,60 @@ class ProxyRunner:
         except Exception as error:
             self._debug(f"auto-share failed: {error!r}")
 
+    def _auto_share_on_exit(self) -> None:
+        # Exit-path counterpart to _maybe_auto_share_active. The live auto-share
+        # runs in a daemon thread fired on commit; quitting right after a turn
+        # (before that thread is scheduled, or while it is still pushing) would
+        # leave the final conversation unshared, since daemon threads are killed
+        # when the process exits. So push the active session's latest transcript
+        # synchronously here. The worker's content-hash gate means this is a no-op
+        # when nothing new has been said since the last share. Best-effort: any
+        # failure (offline, auth) is swallowed by _auto_share_worker.
+        backend = self.backend
+        if not getattr(backend, "supports_session_sharing", False):
+            return
+        sid = self.state.backend_session_id
+        if not sid or not self._session_auto_shared(sid):
+            return
+        # Let a still-running live auto-share finish first, so we don't race it and
+        # so its updated content hash is visible to our gate below.
+        if self._auto_share_thread is not None and self._auto_share_thread.is_alive():
+            self._auto_share_thread.join(timeout=10)
+            if self._auto_share_hash.get(sid) == self._exit_share_digest(backend, sid):
+                return  # the live push already covered the latest conversation
+        ctx = {
+            "session_id": sid,
+            "name": self._share_name_for(sid),
+            "login": self._cached_or_resolve_login(),
+            "backend": backend,
+            "repo_path": self.repo.repo,
+            "base_repo_path": self.base_repo.repo,
+            "model": self.state.model,
+            "agit_session_id": self.state.session_id,
+            "store": self._shared_store(),
+            "last_hash": self._auto_share_hash.get(sid),
+        }
+        self._set_message(f"Sharing '{ctx['login']}/{ctx['name']}' before exit…", seconds=30)
+        self._render()
+        self._auto_share_worker(ctx)  # synchronous: read, redact, hash, push (no-op if unchanged)
+
+    def _exit_share_digest(self, backend, sid: str) -> str | None:
+        # The redacted-transcript digest for *sid*, matching the worker's gate, so
+        # the exit path can tell whether a just-finished live push already covered
+        # the latest conversation. None when the transcript can't be read.
+        try:
+            raw = backend.export_session_raw(self.repo.repo, sid) or backend.export_session_raw(
+                self.base_repo.repo, sid
+            )
+            if not raw:
+                return None
+            from agit.sessions import redact_transcript
+
+            return hashlib.sha256(redact_transcript(raw).encode("utf-8")).hexdigest()
+        except Exception as error:
+            self._debug(f"exit share digest failed: {error!r}")
+            return None
+
     def _resume_shared_session_menu(self) -> None:
         store = self._shared_store()
         self._set_message("Fetching shared sessions…", seconds=10.0)
@@ -5251,6 +5305,7 @@ class ProxyRunner:
         self._set_message("Finalizing commits before exit...", seconds=30)
         self._render()
         self._commit_latest_turn_sync()  # active session, in place
+        self._auto_share_on_exit()  # push the latest conversation if auto-shared
         self._finalize_summary_then_integrate_on_exit()
         for session in list(self.sessions):
             if session is self.active:
@@ -5259,6 +5314,7 @@ class ProxyRunner:
             self.active = session
             try:
                 self._commit_latest_turn_sync()
+                self._auto_share_on_exit()
                 self._finalize_summary_then_integrate_on_exit()
             finally:
                 self.active = saved
