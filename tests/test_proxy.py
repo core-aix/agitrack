@@ -3084,6 +3084,37 @@ def test_shared_resume_already_live_stay_switches_without_fetch():
     assert runner._shared_resume_thread is None  # no fetch started
 
 
+def test_shared_resume_update_live_overwrites_worktree_and_restarts_agent():
+    import types
+
+    runner = _shared_resume_runner()
+    live = types.SimpleNamespace(state=types.SimpleNamespace(backend_session_id="sid-1"))
+    runner.sessions = [live]
+    runner.repo = types.SimpleNamespace(repo="/wt")  # the live session's worktree
+    runner.__dict__["_switched"] = []
+    runner._switch_active = lambda i: runner.__dict__["_switched"].append(i)
+    imported: list = []
+    runner.backend.import_shared_session = lambda repo, sid, t, *, overwrite=False, as_id=None: (
+        imported.append((repo, sid, overwrite, as_id)) or True
+    )
+    restarted: list = []
+    runner._restart_agent = lambda msg: restarted.append(msg)
+
+    calls = {"n": 0}
+
+    def popup(title, options):
+        calls["n"] += 1
+        return options[0] if calls["n"] == 1 else next(o for o in options if o.startswith("Update"))
+
+    runner._select_popup = popup
+    runner._resume_shared_session_menu()
+    _drain_shared_resume(runner)
+
+    assert runner.__dict__["_switched"] == [0]  # switched to the live session
+    assert imported == [("/wt", "sid-1", True, None)]  # overwrote the worktree transcript in place
+    assert restarted == ["Updated this session to the shared version."]  # backend restarted to load it
+
+
 def test_share_name_uses_remembered_origin_over_local_name():
     import types
 
@@ -5229,6 +5260,42 @@ def test_restore_terminal_clears_before_leaving_alt_screen(monkeypatch):
     assert b"\x1b[2J" in out  # clears the screen
     assert b"\x1b[?1049l" in out  # leaves the alt screen
     assert out.index(b"\x1b[2J") < out.index(b"\x1b[?1049l")  # clear comes first
+
+
+def test_rename_session_menu_prompts_then_renames():
+    runner = make_runner(name="main")
+    runner.sessions = [object()]
+    runner._session_name = lambda i: "old"
+    runner._select_popup = lambda title, options: options[0]
+    runner._prompt_popup = lambda title, prompt, *, default="": "new-name"
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda: None
+    captured: list = []
+    runner._rename_session = lambda index, name: captured.append((index, name))
+
+    runner._rename_session_menu()
+
+    assert captured == [(0, "new-name")]
+
+
+def test_rename_session_rejects_taken_name_without_moving():
+    import types
+
+    runner = make_runner(name="main")
+    runner.sessions = [object()]
+    runner._session_name = lambda i: "old"
+    runner._session_name_taken = lambda n: True  # the target name is already in use
+    runner._switch_active = lambda i: None
+    moved: list = []
+    runner.worktree_manager = types.SimpleNamespace(move=lambda a, b: moved.append((a, b)))
+    msgs: list = []
+    runner._set_message = lambda msg, **k: msgs.append(msg)
+    runner._render = lambda: None
+
+    runner._rename_session(0, "taken")
+
+    assert moved == []  # nothing moved
+    assert any("already in use" in m for m in msgs)
 
 
 def test_configured_menu_key_opens_command_capture():
