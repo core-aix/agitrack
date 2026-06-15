@@ -66,6 +66,9 @@ from agit.proxy.modal import PromptModal, SelectModal, _escape_sequence_complete
 
 _SGR_MOUSE_RE = re.compile(rb"\x1b\[<\d+;\d+;\d+[Mm]")
 _SGR_MOUSE_EVENT_RE = re.compile(rb"\x1b\[<(\d+);(\d+);(\d+)([Mm])")
+# Terminal focus in/out reports (CSI I / CSI O), emitted on window focus changes
+# when focus reporting is on. Like mouse reports they are not keystrokes.
+_FOCUS_EVENT_RE = re.compile(rb"\x1b\[[IO]")
 _PAGE_KEY_RE = re.compile(rb"\x1b\[(5|6)(?:;\d+)?~")  # PageUp / PageDown (with optional modifiers)
 # A trailing, not-yet-complete CSI sequence (e.g. a mouse report split across
 # reads). Held back so it is not forwarded as stray bytes. A lone trailing ESC
@@ -3252,8 +3255,7 @@ class ProxyRunner:
                 continue
             for fd in readable:
                 if fd == stdin_fd:
-                    data = os.read(stdin_fd, 32)
-                    if b"\x1b" in data or b"\x03" in data:  # Esc or Ctrl-C ⇒ stop
+                    if self._stdin_has_cancel(os.read(stdin_fd, 32)):
                         return "cancel"
                 elif fd == master:
                     output = self._drain_child_output()
@@ -3263,6 +3265,26 @@ class ProxyRunner:
                 elif fd in background:
                     self._pump_background(background[fd])
         return "done"
+
+    @staticmethod
+    def _stdin_has_cancel(data: bytes) -> bool:
+        """Whether *data* is a genuine cancel keystroke — a lone Esc or Ctrl-C — as
+        opposed to an escape SEQUENCE (mouse report, focus event, arrow key, bracketed
+        paste), every one of which also begins with ESC. With host mouse reporting on,
+        a mere mouse move emits ``\\x1b[<…`` and must NOT be read as the user pressing
+        Esc, or a fetch is cancelled the instant the pointer moves."""
+        if b"\x03" in data:  # Ctrl-C
+            return True
+        return data == b"\x1b"  # a bare Esc, not the lead byte of a longer sequence
+
+    @staticmethod
+    def _is_real_keypress(data: bytes) -> bool:
+        """Whether *data* carries an actual keystroke rather than only terminal-emitted
+        escape sequences (mouse reports, focus in/out). Lets a 'press any key' notice
+        ignore an incidental mouse move while host mouse reporting is on."""
+        stripped = _SGR_MOUSE_RE.sub(b"", data)
+        stripped = _FOCUS_EVENT_RE.sub(b"", stripped)
+        return bool(stripped)
 
     def _resume_shared_session_menu(self) -> None:
         store = self._shared_store()
@@ -3531,7 +3553,7 @@ class ProxyRunner:
                 return
             for fd in readable:
                 if fd == stdin_fd:
-                    if os.read(stdin_fd, 32):  # any key dismisses the notice
+                    if self._is_real_keypress(os.read(stdin_fd, 32)):  # a key (not a mouse move) dismisses
                         return
                 elif fd == master:
                     output = self._drain_child_output()
