@@ -140,19 +140,21 @@ class SharedSessionStore:
 
     # --- sync --------------------------------------------------------------
 
-    def fetch(self) -> bool:
+    def fetch(self, *, timeout: float | None = None) -> bool:
         """Pull the latest shared ref from the remote (best-effort).
 
         Fetches only the small manifests (a blob-size filter skips the large
         transcripts) so listing which sessions exist is fast; the transcript of a
         chosen session is fetched on demand by :meth:`read_transcript`. Falls back
-        to a full fetch when the remote doesn't support partial fetch."""
+        to a full fetch when the remote doesn't support partial fetch. An optional
+        ``timeout`` bounds each underlying git fetch so a stalled network call on
+        bad internet can't run unbounded."""
         if not self.repo.remote_exists():
             return False
         refspec = f"+{self.ref}:{self.ref}"
-        if self.repo.fetch_ref(refspec, filter_blobs="blob:limit=16k"):
+        if self.repo.fetch_ref(refspec, filter_blobs="blob:limit=16k", timeout=timeout):
             return True
-        return self.repo.fetch_ref(refspec)
+        return self.repo.fetch_ref(refspec, timeout=timeout)
 
     def _is_session_snapshot(self, commit_sha: str) -> bool:
         # A shared-session snapshot commit is parent-less (an orphan we wrote) and

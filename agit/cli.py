@@ -8,7 +8,7 @@ from pathlib import Path
 
 from agit.backends.setup import select_default_backend
 from agit.backends.proxy_agents import available_backends
-from agit.git import GitError, GitRepo
+from agit.git import GitError, GitRepo, RepoLock, already_running_message
 from agit.config import GlobalConfig
 from agit.proxy import ProxyRunner
 from agit.shell import AgitShell
@@ -152,13 +152,29 @@ def main(argv: list[str] | None = None) -> int:
     if backend_args:
         _warn_reserved_passthrough(args.backend or config.default_backend, backend_args)
 
+    try:
+        repo = _discover_or_init(Path(args.repo).expanduser())
+    except OSError as error:
+        # --repo points at a directory that does not exist / can't be read.
+        print(error)
+        return 1
+    if repo is None:
+        return 1
+
+    # Refuse a second instance on this repo up front — BEFORE the privacy prompt —
+    # so the user isn't asked to acknowledge anything only to be turned away. The
+    # authoritative lock is still taken inside run(); this is just an early, friendly
+    # check (a brief probe-then-acquire race only delays the same refusal, never
+    # lets two instances start).
+    owner = RepoLock(repo.repo / ".agit" / "lock").probe_owner()
+    if owner is not None:
+        print(already_running_message(owner))
+        return 1
+
     if not _acknowledge_privacy_warning(scripted=scripted):
         return 1
 
     try:
-        repo = _discover_or_init(Path(args.repo).expanduser())
-        if repo is None:
-            return 1
         if args.mode == "json":
             AgitShell(
                 repo,
@@ -252,10 +268,13 @@ def _check_for_update_at_startup(config: GlobalConfig) -> None:
     if not getattr(config, "check_for_updates", None):
         return
     try:
-        from agit.update import Updater, restart_agit
+        from agit.update import STARTUP_NET_TIMEOUT, Updater, restart_agit
 
         updater = Updater()
-        status = updater.check()
+        # Bound the launch-time check tightly so an offline / bad-connection user
+        # isn't blocked from starting aGiT (the network call fails fast and we just
+        # skip the offer below).
+        status = updater.check(timeout=STARTUP_NET_TIMEOUT)
     except Exception:
         return
     if not status.ok or not status.available:

@@ -404,7 +404,9 @@ class GitRepo:
     def remote_exists(self, name: str = "origin") -> bool:
         return name in self._run(["git", "remote"], check=False).stdout.split()
 
-    def fetch_ref(self, refspec: str, *, remote: str = "origin", filter_blobs: str | None = None) -> bool:
+    def fetch_ref(
+        self, refspec: str, *, remote: str = "origin", filter_blobs: str | None = None, timeout: float | None = None
+    ) -> bool:
         """Fetch a single refspec (e.g. ``+refs/agit/x:refs/agit/x``). Returns
         True on success; False on any failure (offline, no such ref yet, …).
 
@@ -419,8 +421,9 @@ class GitRepo:
         cmd += [remote, refspec]
         # Never block on an interactive credential prompt — these ref syncs run in
         # the background (and on the exit path), where a prompt would hang with no
-        # way to answer. Cached creds / credential helpers still work.
-        ok = self._run(cmd, check=False, env={"GIT_TERMINAL_PROMPT": "0"}).returncode == 0
+        # way to answer. Cached creds / credential helpers still work. An optional
+        # timeout additionally bounds a stalled fetch on bad internet.
+        ok = self._run(cmd, check=False, env={"GIT_TERMINAL_PROMPT": "0"}, timeout=timeout).returncode == 0
         if filter_blobs and ok:
             # Don't turn the user's remote into a permanently-filtered clone.
             self._run(["git", "config", "--unset", f"remote.{remote}.partialclonefilter"], check=False)
@@ -507,7 +510,26 @@ class GitRepo:
         input_text: str | None = None,
         check: bool = True,
         env: dict[str, str] | None = None,
+        timeout: float | None = None,
     ) -> subprocess.CompletedProcess[str]:
+        # A timeout bounds a network git call (fetch/push over bad internet): on
+        # expiry subprocess.run kills the process and raises, which we surface as a
+        # non-zero result so the caller treats it as a plain failure (e.g. offline).
+        if timeout is not None:
+            try:
+                return subprocess.run(
+                    command,
+                    cwd=self.repo,
+                    input=input_text,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                    env={**os.environ, **env} if env else None,
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired:
+                return subprocess.CompletedProcess(command, returncode=124, stdout="", stderr="timed out")
         process = subprocess.run(
             command,
             cwd=self.repo,

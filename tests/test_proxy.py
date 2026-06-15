@@ -3013,7 +3013,8 @@ def _shared_resume_runner():
         manifest={"session_id": "sid-1", "backend": "claude"},
     )
     store = types.SimpleNamespace(
-        fetch=lambda: None,
+        repo=types.SimpleNamespace(remote_exists=lambda: False),  # no remote ⇒ fetch is inline
+        fetch=lambda **k: None,
         entries=lambda: [entry],
         read_transcript=lambda e: "transcript-body",
     )

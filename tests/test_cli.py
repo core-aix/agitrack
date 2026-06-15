@@ -100,6 +100,24 @@ def test_discover_or_init_non_interactive_does_not_prompt(tmp_path, monkeypatch)
 # --- backend passthrough args (#32) -----------------------------------------
 
 
+def _stub_repo_and_free_lock(monkeypatch):
+    """Stub repo discovery to a lightweight object with a ``.repo`` path and the
+    single-instance pre-check to "free", so cli.main reaches the launch surface."""
+    import pathlib
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(cli, "_discover_or_init", lambda p: SimpleNamespace(repo=pathlib.Path("/tmp/agit-test")))
+
+    class _FreeLock:
+        def __init__(self, _path):
+            pass
+
+        def probe_owner(self):
+            return None
+
+    monkeypatch.setattr(cli, "RepoLock", _FreeLock)
+
+
 def _stub_launch(monkeypatch, *, use_worktrees: bool = True):
     """Stub the launch surface so cli.main only exercises arg routing.
     Returns the dict the fake runner/shell records its kwargs into."""
@@ -114,7 +132,7 @@ def _stub_launch(monkeypatch, *, use_worktrees: bool = True):
 
     monkeypatch.setattr(cli, "ProxyRunner", Fake)
     monkeypatch.setattr(cli, "AgitShell", Fake)
-    monkeypatch.setattr(cli, "_discover_or_init", lambda p: object())
+    _stub_repo_and_free_lock(monkeypatch)
 
     class Config:
         def has_default_backend(self):
@@ -125,6 +143,43 @@ def _stub_launch(monkeypatch, *, use_worktrees: bool = True):
     Config.use_worktrees = use_worktrees
     monkeypatch.setattr(cli, "GlobalConfig", lambda: Config())
     return captured
+
+
+def test_already_running_refused_before_privacy_prompt(monkeypatch, capsys):
+    # A second instance must be turned away BEFORE the privacy acknowledgement, so
+    # the user isn't asked to acknowledge anything only to be refused.
+    import pathlib
+    from types import SimpleNamespace
+
+    events: list[str] = []
+    monkeypatch.setattr(cli, "_discover_or_init", lambda p: SimpleNamespace(repo=pathlib.Path("/tmp/x")))
+
+    class _HeldLock:
+        def __init__(self, _path):
+            pass
+
+        def probe_owner(self):
+            return 4321  # another instance holds it
+
+    monkeypatch.setattr(cli, "RepoLock", _HeldLock)
+    monkeypatch.setattr(cli, "already_running_message", lambda pid: events.append(f"refused:{pid}") or "running")
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: events.append("privacy") or True)
+
+    class Config:
+        check_for_updates = False
+        use_worktrees = True
+
+        def has_default_backend(self):
+            return True
+
+        default_backend = "opencode"
+
+    monkeypatch.setattr(cli, "GlobalConfig", lambda: Config())
+
+    rc = cli.main(["--backend", "opencode"])
+
+    assert rc == 1
+    assert events == ["refused:4321"]  # refused, and the privacy prompt never ran
 
 
 # --- --no-worktree (#9) -----------------------------------------------------
@@ -398,7 +453,7 @@ def test_prompt_flag_implies_json_mode_and_passes_prompts(monkeypatch):
     monkeypatch.setattr(
         cli, "ProxyRunner", lambda *a, **k: (_ for _ in ()).throw(AssertionError("proxy must not launch"))
     )
-    monkeypatch.setattr(cli, "_discover_or_init", lambda p: object())
+    _stub_repo_and_free_lock(monkeypatch)
 
     class Config:
         def has_default_backend(self):
@@ -428,7 +483,7 @@ def test_prompt_flag_never_blocks_on_input_even_with_a_tty(monkeypatch):
             return None
 
     monkeypatch.setattr(cli, "AgitShell", FakeShell)
-    monkeypatch.setattr(cli, "_discover_or_init", lambda p: object())
+    _stub_repo_and_free_lock(monkeypatch)
 
     class Config:
         def has_default_backend(self):
