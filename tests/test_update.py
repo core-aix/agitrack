@@ -105,6 +105,44 @@ def test_source_check_restart_when_checkout_updated_under_running_process(source
     assert "restart" in status.message.lower()
 
 
+def test_source_check_detects_local_update_even_when_offline(source_clone, monkeypatch):
+    # The running process must learn the checkout advanced under it even when the
+    # network fetch fails (offline) — local staleness is detectable with no remote.
+    remote, clone = source_clone
+    updater = Updater(source_repo=clone)
+    assert updater.check().available is False  # snapshots the running HEAD (in sync)
+
+    # Advance the LOCAL checkout directly (no remote push), then make every fetch fail.
+    _commit(clone, "agit.py", "v2\n", "local second")
+    real_run = subprocess.run
+
+    def fail_fetch(args, **kwargs):
+        if "fetch" in args:
+            return subprocess.CompletedProcess(args, 1, "", "could not resolve host")
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr("agit.update.updater.subprocess.run", fail_fetch)
+
+    status = updater.check()
+    assert status.available is True
+    assert status.restart_only is True  # the running copy is older than disk
+    assert "restart" in status.message.lower()
+
+
+def test_source_check_snapshots_running_rev_at_construction(source_clone, monkeypatch):
+    # The running rev is captured when the Updater is built, not on the first check —
+    # so a local update that lands before any successful check is still seen as stale.
+    remote, clone = source_clone
+    updater = Updater(source_repo=clone)  # snapshot taken here (HEAD == v1)
+
+    # The checkout advances before the very first check() ever runs.
+    _commit(clone, "agit.py", "v2\n", "local second")
+
+    status = updater.check(fetch=False)  # no network at all
+    assert status.available is True
+    assert status.restart_only is True
+
+
 def test_source_check_errors_without_upstream(tmp_path: Path):
     repo = tmp_path / "solo"
     _init_repo(repo)

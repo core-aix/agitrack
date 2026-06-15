@@ -131,12 +131,20 @@ class Updater:
         self._source_repo: Path | None = (
             detect_source_repo() if source_repo is _DETECT else cast("Path | None", source_repo)
         )
-        # The source HEAD the running process was loaded from, snapshotted on the
-        # first check (≈ process start). After a self-update fast-forwards the
-        # checkout under a still-running process, this lets us see the running code
-        # is older than what's on disk and prompt a restart, instead of reporting
-        # "up to date" off the checkout alone.
+        # The source HEAD the running process was loaded from. Snapshotted HERE, at
+        # construction (≈ process start), not on the first successful check: a check
+        # gated on a network fetch could miss a purely-local update — offline, or the
+        # checkout advancing before the first check — and leave the running process
+        # unaware it is stale. Reading HEAD needs no network and is independent of the
+        # upstream/fetch outcome. After the checkout moves on under a still-running
+        # process (a self-update, a manual pull, or, in self-development, the source
+        # advancing), this lets us see the running code is older than disk and prompt
+        # a restart instead of reporting "up to date" off the checkout alone.
         self._running_rev: str | None = None
+        if self._source_repo is not None:
+            head = _git(["rev-parse", "HEAD"], self._source_repo)
+            if head.returncode == 0:
+                self._running_rev = head.stdout.strip() or None
 
     @property
     def kind(self) -> str:
@@ -173,27 +181,35 @@ class Updater:
         repo = self._source_repo
         assert repo is not None
         status = UpdateStatus(kind=KIND_SOURCE)
-        upstream = self._upstream_ref(repo)
-        if upstream is None:
-            status.error = "no upstream branch is configured for the aGiT source checkout"
-            return status
-        remote = upstream.split("/", 1)[0]
-        if fetch:
-            fetched = _git(["fetch", "--quiet", remote], repo, timeout=timeout)
-            if fetched.returncode != 0:
-                status.error = (fetched.stderr.strip() or "git fetch failed").splitlines()[-1]
-                return status
-        behind = _git(["rev-list", "--count", f"HEAD..{upstream}"], repo)
-        if behind.returncode != 0:
-            status.error = behind.stderr.strip() or "could not compare against upstream"
-            return status
-        status.behind = int(behind.stdout.strip() or "0")
+        # The HEAD on disk right now (no network). Comparing it against the running rev
+        # catches a LOCAL update the running process hasn't loaded — a manual pull, a
+        # prior self-update, or the source checkout advancing during self-development —
+        # regardless of whether the remote can be reached.
         head = _git(["rev-parse", "HEAD"], repo).stdout.strip()
-        if self._running_rev is None:  # first check ≈ process start: snapshot the running HEAD
-            self._running_rev = head
-        running_stale = bool(self._running_rev) and self._running_rev != head
-        status.current = _git(["rev-parse", "--short", "HEAD"], repo).stdout.strip()
-        status.latest = _git(["rev-parse", "--short", upstream], repo).stdout.strip()
+        if self._running_rev is None:  # construction snapshot failed: fall back to now
+            self._running_rev = head or None
+        head_short = _git(["rev-parse", "--short", "HEAD"], repo).stdout.strip()
+        status.current = head_short
+        running_stale = bool(self._running_rev) and bool(head) and self._running_rev != head
+
+        # The remote side (needs the network). A missing upstream or a failed fetch is
+        # remembered, not fatal — local staleness above is reported either way.
+        upstream = self._upstream_ref(repo)
+        fetch_error: str | None = None
+        if upstream is not None:
+            remote = upstream.split("/", 1)[0]
+            if fetch:
+                fetched = _git(["fetch", "--quiet", remote], repo, timeout=timeout)
+                if fetched.returncode != 0:
+                    fetch_error = (fetched.stderr.strip() or "git fetch failed").splitlines()[-1]
+            if fetch_error is None:
+                behind = _git(["rev-list", "--count", f"HEAD..{upstream}"], repo)
+                if behind.returncode != 0:
+                    fetch_error = behind.stderr.strip() or "could not compare against upstream"
+                else:
+                    status.behind = int(behind.stdout.strip() or "0")
+                    status.latest = _git(["rev-parse", "--short", upstream], repo).stdout.strip()
+
         if status.behind > 0:
             status.available = True
             commits = "commit" if status.behind == 1 else "commits"
@@ -201,16 +217,27 @@ class Updater:
                 f"aGiT update available: {status.behind} new {commits} on {upstream} "
                 f"({status.current} → {status.latest})."
             )
-        elif running_stale:
-            # The checkout was already updated (e.g. by a prior self-update or a
-            # manual pull) but this process is still running the old code.
+            return status
+        if running_stale:
+            # The checkout is already updated but this process still runs the old code.
+            # Detected with no network, so an offline local update still prompts a
+            # restart. Takes precedence over a fetch error — the user can act on it now.
+            assert self._running_rev is not None
             status.available = True
             status.restart_only = True
             status.current = self._running_rev[:7]
+            status.latest = head_short  # restarting loads the HEAD on disk
             status.message = (
                 f"aGiT was updated on disk but the running copy is older "
                 f"({status.current} → {status.latest}); restart to load it."
             )
+            return status
+        # Nothing local is stale. If the remote couldn't be checked, say why; otherwise
+        # we are genuinely current.
+        if upstream is None:
+            status.error = "no upstream branch is configured for the aGiT source checkout"
+        elif fetch_error is not None:
+            status.error = fetch_error
         else:
             status.message = "aGiT is up to date."
         return status
