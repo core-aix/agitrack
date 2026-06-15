@@ -1405,6 +1405,54 @@ def test_manage_enabling_auto_update_syncs_immediately(tmp_path, monkeypatch):
     assert SharedSessionStore(repo).read_transcript(entry) == "newest turns"  # pushed on enable
 
 
+def test_manage_update_now_shows_pushing_message(tmp_path, monkeypatch):
+    # "Update now" must show the same "pushing to origin…" progress notice as the
+    # initial share — not push silently while the user waits.
+    backend = _StubBackend(transcript="newest turns")
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
+    SharedSessionStore(repo).publish(
+        github_id="tester",
+        name="session-1",
+        transcript="stale",
+        manifest={
+            "github_id": "tester",
+            "name": "session-1",
+            "session_id": "sid-123",
+            "updated": 1,
+            "transcript_bytes": 5,
+        },
+    )
+    # Pick the (only) session, then "Update now" (1st action) — both are options[0].
+    runner._select_popup = lambda title, options: options[0]
+
+    runner._manage_shared_sessions_menu()
+
+    assert any("pushing to origin" in m.lower() for m in runner.messages)
+    entry = SharedSessionStore(repo).entries()[0]
+    assert SharedSessionStore(repo).read_transcript(entry) == "newest turns"  # pushed
+
+
+def test_manage_update_cancel_shows_not_updated_until_keypress(tmp_path, monkeypatch):
+    # Cancelling the update push surfaces a key-dismissed "NOT updated" notice, like
+    # the initial share's cancel path.
+    backend = _StubBackend(transcript="newest")
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
+    SharedSessionStore(repo).publish(
+        github_id="tester",
+        name="session-1",
+        transcript="stale",
+        manifest={"github_id": "tester", "name": "session-1", "session_id": "sid-123", "updated": 1},
+    )
+    runner._publish_with_cancel = lambda *a, **k: {"cancelled": True}  # user pressed Esc
+    notices: list = []
+    runner._await_keypress = lambda msg: notices.append(msg)
+    runner._select_popup = lambda title, options: options[0]
+
+    runner._manage_shared_sessions_menu()
+
+    assert any("NOT updated" in m and "cancel" in m.lower() for m in notices)
+
+
 def test_manage_menu_opens_without_fetch_or_transcript_read(tmp_path, monkeypatch):
     # The menu must open instantly: no network fetch, and no transcript read/redact
     # while building the list (the "takes a few seconds" bug).
