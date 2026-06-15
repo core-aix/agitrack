@@ -3129,6 +3129,36 @@ def test_shared_resume_fetch_error_reports_reason():
     assert runner._shared_resume_cancel is None  # cleared for an immediate retry
 
 
+def test_stdin_has_cancel_only_for_lone_esc_or_ctrl_c():
+    runner = _shared_resume_runner()
+    # Genuine cancels.
+    assert runner._stdin_has_cancel(b"\x1b") is True  # a bare Esc keypress
+    assert runner._stdin_has_cancel(b"\x03") is True  # Ctrl-C
+    assert runner._stdin_has_cancel(b"abc\x03") is True
+    # Escape SEQUENCES (begin with ESC) must NOT count as a cancel — this is the
+    # mouse-move-cancels-the-fetch bug: host mouse reporting emits these constantly.
+    assert runner._stdin_has_cancel(b"\x1b[<35;10;20M") is False  # SGR mouse move
+    assert runner._stdin_has_cancel(b"\x1b[A") is False  # up arrow
+    assert runner._stdin_has_cancel(b"\x1b[I") is False  # focus-in
+    assert runner._stdin_has_cancel(b"\x1b[200~hi\x1b[201~") is False  # bracketed paste
+    assert runner._stdin_has_cancel(b"x") is False  # ordinary key
+
+
+def test_is_real_keypress_ignores_mouse_and_focus():
+    runner = _shared_resume_runner()
+    # Mouse reports and focus events are not keystrokes.
+    assert runner._is_real_keypress(b"\x1b[<35;10;20M") is False
+    assert runner._is_real_keypress(b"\x1b[I") is False
+    assert runner._is_real_keypress(b"\x1b[<0;5;5M\x1b[O") is False
+    # Real keys (including arrows and Esc) dismiss a "press any key" notice.
+    assert runner._is_real_keypress(b"q") is True
+    assert runner._is_real_keypress(b"\r") is True
+    assert runner._is_real_keypress(b"\x1b") is True
+    assert runner._is_real_keypress(b"\x1b[A") is True  # an arrow key is still a key
+    # A mouse move bundled with a real key still counts as a key.
+    assert runner._is_real_keypress(b"\x1b[<35;1;1Mx") is True
+
+
 def test_abort_shared_resume_clears_token_for_retry():
     import threading
 

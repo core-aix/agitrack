@@ -206,14 +206,24 @@ class SharedSessionStore:
             return 0
 
     def fetch_throttled(self) -> None:
-        """Best-effort fetch at most once per TTL — for pollers (the dashboard)
-        that want others' newly-shared sessions without hammering the remote."""
+        """Best-effort fetch at most once per TTL, in the BACKGROUND — for pollers (the
+        dashboard) that want others' newly-shared sessions without hammering the remote
+        or blocking the request on a network round trip. Your OWN shared sessions are
+        already in the local ref, so the page renders from it immediately and a
+        teammate's newly-shared session appears on a later poll."""
         key = str(self.repo.repo)
         now = time.monotonic()
         if now - _fetch_at.get(key, 0.0) < _FETCH_TTL:
             return
-        _fetch_at[key] = now
-        self.fetch()
+        _fetch_at[key] = now  # claim the window up front so concurrent polls don't pile on
+
+        def worker() -> None:
+            try:
+                self.fetch()
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, daemon=True, name="agit-shared-fetch-bg").start()
 
     def unshare(self, github_id: str, name: str) -> PublishResult:
         """Remove one of the contributor's own shared sessions and push the
