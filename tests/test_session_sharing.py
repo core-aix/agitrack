@@ -174,6 +174,29 @@ def test_run_bounded_timeout_kills_process(tmp_path):
     assert time.monotonic() - started < 2.0
 
 
+def test_run_bounded_io_cancel_kills_and_captures(tmp_path):
+    # The cancellable push variant kills the subprocess promptly and still returns
+    # (code, stderr) so the caller can report the outcome.
+    import threading
+    import time
+
+    repo = _init_repo(tmp_path)
+    cancel = threading.Event()
+    cancel.set()
+    started = time.monotonic()
+    code, stderr = repo._run_bounded_io(["sleep", "10"], cancel=cancel)
+    assert code == 124
+    assert isinstance(stderr, str)
+    assert time.monotonic() - started < 2.0
+
+
+def test_run_bounded_io_captures_stderr_on_completion(tmp_path):
+    repo = _init_repo(tmp_path)
+    code, stderr = repo._run_bounded_io(["sh", "-c", "echo oops 1>&2; exit 3"], timeout=5)
+    assert code == 3
+    assert "oops" in stderr
+
+
 def test_fetch_does_not_start_when_already_cancelled(tmp_path):
     # "Don't let anything run if the user has already confirmed to cancel."
     import threading
@@ -396,7 +419,7 @@ class _PublishFakeRepo:
         self.calls.append("fetch")
         return True
 
-    def push_ref(self, refspec, *, remote="origin", force_with_lease=None):
+    def push_ref(self, refspec, *, remote="origin", force_with_lease=None, timeout=None, cancel=None):
         self.calls.append("push")
         return self.push_results.pop(0)
 
@@ -845,11 +868,14 @@ def _runner_with_store(tmp_path, monkeypatch, backend):
     runner.backend = backend
     runner.state.backend_session_id = "sid-123"
     runner.global_config = GlobalConfig(path=tmp_path / "config.json")
-    runner.global_config.acknowledge_session_sharing()  # skip the consent prompt
+    runner.global_config.acknowledge_session_sharing()  # use the concise (already-seen) prompt
     runner.global_config.github_login = "tester"  # deterministic identity (no gh call)
     runner._render = lambda: None
     runner.messages = []
     runner._set_message = lambda msg, **k: runner.messages.append(msg)
+    # Confirm any popup (the per-share consent, the keep-updated offer) with its first
+    # option; tests that need other choices override this after construction.
+    runner._select_popup = lambda title, options: options[0]
     return runner, repo
 
 
@@ -904,6 +930,79 @@ def test_runner_share_session_publishes_and_redacts(tmp_path, monkeypatch):
     assert "sk-ABCDEFGHIJKLMNOPQR" not in transcript and "[REDACTED]" in transcript  # redacted
     assert entries[0].manifest["session_id"] == "sid-123"
     assert any("Saved shared session" in m or "Shared" in m for m in runner.messages)
+
+
+def test_share_confirms_every_time_even_after_acknowledged(tmp_path, monkeypatch):
+    # Each manual share uploads a fresh, possibly sensitive transcript, so the
+    # sensitive-information confirmation must appear EVERY time — not only the first.
+    backend = _StubBackend(transcript="hello")
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
+    runner.global_config.acknowledge_session_sharing()  # already acknowledged once
+    prompts: list = []
+
+    def popup(title, options):
+        prompts.append(title)
+        return "No, cancel"  # the user declines this time
+
+    runner._select_popup = popup
+    runner._share_session()
+
+    assert prompts, "a confirmation popup is shown before pushing"
+    assert "secret" in prompts[0].lower()  # it still warns about sensitive content
+    assert SharedSessionStore(repo).entries() == []  # declined ⇒ nothing shared
+    assert any("cancel" in m.lower() for m in runner.messages)
+
+
+def test_share_push_cancel_shows_not_shared_until_keypress(tmp_path, monkeypatch):
+    # Cancelling the push to origin must make the non-result unmistakable, via a
+    # notice that waits for a keypress (not a mouse move) to dismiss.
+    backend = _StubBackend(transcript="hello")
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
+    runner._publish_with_cancel = lambda *a, **k: {"cancelled": True}  # user pressed Esc
+    notices: list = []
+    runner._await_keypress = lambda msg: notices.append(msg)
+
+    runner._share_session()
+
+    assert any("NOT shared" in m and "cancel" in m.lower() for m in notices)
+    assert runner.state.session_id not in runner._auto_share_hash  # not marked as pushed
+
+
+def test_publish_with_cancel_returns_cancelled_when_drain_stops():
+    from proxy_helpers import make_runner
+
+    runner = make_runner()
+    runner._render = lambda: None
+    runner._set_message = lambda *a, **k: None
+    runner._drain_pty_until_done_or_esc = lambda thread, **k: "cancel"  # user/Esc or timeout
+
+    class _SlowStore:
+        def __init__(self):
+            self.cancelled = None
+
+        def publish(self, *, github_id, name, transcript, manifest, timeout=None, cancel=None):
+            self.cancelled = cancel
+            cancel.wait(timeout=5)  # block until told to stop
+            return None
+
+    store = _SlowStore()
+    out = runner._publish_with_cancel(store, github_id="me", name="s", transcript="t", manifest={})
+    assert out == {"cancelled": True}
+
+
+def test_publish_with_cancel_returns_result_on_success():
+    from proxy_helpers import make_runner
+
+    runner = make_runner()
+    runner._render = lambda: None
+    runner._set_message = lambda *a, **k: None
+
+    class _OkStore:
+        def publish(self, *, github_id, name, transcript, manifest, timeout=None, cancel=None):
+            return "PUBLISHED"
+
+    out = runner._publish_with_cancel(_OkStore(), github_id="me", name="s", transcript="t", manifest={})
+    assert out == {"result": "PUBLISHED"}
 
 
 def test_runner_share_unsupported_backend_shows_message(tmp_path, monkeypatch):

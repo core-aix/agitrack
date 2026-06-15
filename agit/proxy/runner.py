@@ -345,6 +345,7 @@ class ProxyRunner:
     )
     SHARED_FETCH_TIMEOUT = 30.0  # cap the shared-session listing fetch so a slow/offline remote can't hang the menu
     RESUME_FETCH_TIMEOUT = 300.0  # cap the full-transcript fetch when resuming a shared session; generous since the user can cancel manually
+    SHARE_PUSH_TIMEOUT = 120.0  # cap a manual share's push to origin; the user can also press Esc to cancel it
 
     def __init__(
         self,
@@ -2720,34 +2721,54 @@ class ProxyRunner:
             self._set_message("No resumable session for this repo to share yet.")
             self._render()
             return
-        # One-time informed consent — sharing is opt-in and never automatic.
+        # Informed consent before EVERY manual share — sharing is opt-in and never
+        # automatic, and each push uploads a fresh, possibly sensitive transcript, so
+        # the warning must appear every time, not just once. The first time it spells
+        # out exactly what is uploaded; afterwards a concise reminder — but the share
+        # never proceeds without an explicit "Yes".
         if not self.global_config.session_sharing_acknowledged:
-            choice = self._select_popup(
+            prompt = (
                 "Share this conversation with collaborators?\n"
                 "The conversation transcript is pushed to 'origin' and shared with the team.\n"
                 "It can contain file contents, command output, and secrets — review what's in\n"
-                "this session before sharing. Only this repo's sessions are ever uploaded.",
-                ["Yes, share it", "No, cancel"],
+                "this session before sharing. Only this repo's sessions are ever uploaded."
             )
-            if choice != "Yes, share it":
-                self._set_message("Sharing cancelled.")
-                self._render()
-                return
-            self.global_config.acknowledge_session_sharing()
+        else:
+            prompt = (
+                "Share this conversation now?\n"
+                "Its transcript — which can contain file contents, command output, and secrets —\n"
+                "will be pushed to 'origin'. Review what's in this session before sharing."
+            )
+        choice = self._select_popup(prompt, ["Yes, share it", "No, cancel"])
+        if choice != "Yes, share it":
+            self._set_message("Sharing cancelled.")
+            self._render()
+            return
+        self.global_config.acknowledge_session_sharing()
         payload = self._share_payload(session_id, self._share_name_for(session_id))
         if payload is None:
             self._set_message("Could not read the session transcript to share.")
             self._render()
             return
         login, name, redacted, digest, manifest = payload
-        self._set_message(f"Sharing '{login}/{name}' — pushing to origin…", seconds=20)
+        self._set_message(f"Sharing '{login}/{name}' — pushing to origin…   press Esc to cancel", seconds=600)
         self._render()
-        try:
-            result = self._shared_store().publish(github_id=login, name=name, transcript=redacted, manifest=manifest)
-        except Exception as error:
-            self._set_message(f"Could not share session: {error}", seconds=10.0)
+        outcome = self._publish_with_cancel(
+            self._shared_store(), github_id=login, name=name, transcript=redacted, manifest=manifest
+        )
+        if outcome.get("cancelled"):
+            # The push was stopped (Esc) or timed out — the git subprocess was killed,
+            # so nothing reached origin. Make the non-result unmistakable and hold the
+            # notice until the user acknowledges it with a key (a mouse move won't).
+            self._await_keypress(
+                f"'{login}/{name}' was NOT shared — the push to origin was cancelled. Press any key to continue."
+            )
+            return
+        if "error" in outcome:
+            self._set_message(f"Could not share session: {outcome['error']}", seconds=10.0)
             self._render()
             return
+        result = outcome["result"]
         self._auto_share_hash[session_id] = digest  # don't immediately re-push the same content
         self._set_message(self._share_outcome_message(result, login, name), seconds=12.0)
         self._render()
@@ -2765,6 +2786,39 @@ class ProxyRunner:
                     seconds=8.0,
                 )
                 self._render()
+
+    def _publish_with_cancel(self, store, *, github_id: str, name: str, transcript: str, manifest: dict) -> dict:
+        """Push a manual share on a worker thread while keeping the UI alive and
+        letting the user press Esc to cancel a slow/stalled upload. Returns one of
+        ``{"result": PublishResult}``, ``{"cancelled": True}``, or ``{"error": str}``.
+        On cancel the underlying ``git push`` subprocess is killed, not merely
+        abandoned, so the upload truly stops."""
+        cancel = threading.Event()
+        box: dict = {}
+
+        def worker() -> None:
+            try:
+                box["result"] = store.publish(
+                    github_id=github_id,
+                    name=name,
+                    transcript=transcript,
+                    manifest=manifest,
+                    timeout=self.SHARE_PUSH_TIMEOUT,
+                    cancel=cancel,
+                )
+            except Exception as error:
+                if not cancel.is_set():
+                    box["error"] = str(error)
+
+        thread = threading.Thread(target=worker, daemon=True, name="agit-share-push")
+        thread.start()
+        status = self._drain_pty_until_done_or_esc(thread, deadline=time.monotonic() + self.SHARE_PUSH_TIMEOUT + 2.0)
+        if status != "done":
+            cancel.set()  # kill the push subprocess now — don't leave it running
+            return {"cancelled": True}
+        if "error" in box:
+            return {"error": box["error"]}
+        return {"result": box["result"]}
 
     def _share_payload(self, session_id: str, name: str):
         """Read + redact the session transcript and build its manifest (no network,

@@ -487,10 +487,21 @@ class GitRepo:
                 pass
 
     def push_ref(
-        self, refspec: str, *, remote: str = "origin", force_with_lease: str | None = None
+        self,
+        refspec: str,
+        *,
+        remote: str = "origin",
+        force_with_lease: str | None = None,
+        timeout: float | None = None,
+        cancel: "threading.Event | None" = None,
     ) -> tuple[bool, str]:
         """Push a refspec. Returns ``(ok, stderr)`` — stderr lets the caller spot a
-        non-fast-forward/stale rejection and retry after re-fetching."""
+        non-fast-forward/stale rejection and retry after re-fetching.
+
+        ``timeout`` bounds a stalled push and ``cancel`` (a ``threading.Event``) stops
+        it the instant it is set — the git subprocess is killed, not abandoned — so a
+        user who cancels a manual share truly stops the upload. When neither is given
+        the push is a plain blocking call (the background/exit paths)."""
         command = ["git", "push"]
         if force_with_lease is not None:
             command.append(f"--force-with-lease={force_with_lease}" if force_with_lease else "--force-with-lease")
@@ -498,8 +509,50 @@ class GitRepo:
         # GIT_TERMINAL_PROMPT=0: fail fast on a missing credential rather than
         # blocking on a prompt no one can answer (e.g. the synchronous exit-path
         # share). Cached creds / credential helpers are unaffected.
-        result = self._run(command, check=False, env={"GIT_TERMINAL_PROMPT": "0"})
-        return result.returncode == 0, result.stderr
+        env = {"GIT_TERMINAL_PROMPT": "0"}
+        if timeout is None and cancel is None:
+            result = self._run(command, check=False, env=env)
+            return result.returncode == 0, result.stderr
+        code, stderr = self._run_bounded_io(command, env=env, timeout=timeout, cancel=cancel)
+        return code == 0, stderr
+
+    def _run_bounded_io(
+        self,
+        command: list[str],
+        *,
+        timeout: float | None = None,
+        cancel: "threading.Event | None" = None,
+        env: dict[str, str] | None = None,
+    ) -> tuple[int, str]:
+        """Like :meth:`_run_bounded` but captures stderr for the caller — used for a
+        cancellable ``git push``, whose output is small (a few status lines), so the
+        pipe can't fill and wedge the process the way an unread fetch progress stream
+        would. Returns ``(exit_code, stderr)``; ``(124, partial-stderr)`` when
+        cancelled or timed out. Retrying ``communicate`` after a ``TimeoutExpired``
+        does not lose output (documented behaviour), so the poll loop is safe."""
+        process = subprocess.Popen(
+            command,
+            cwd=self.repo,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env={**os.environ, **env} if env else None,
+        )
+        deadline = time.monotonic() + timeout if timeout is not None else None
+        while True:
+            try:
+                _out, err = process.communicate(timeout=0.1)
+                return process.returncode, err or ""
+            except subprocess.TimeoutExpired:
+                pass
+            stop = (cancel is not None and cancel.is_set()) or (deadline is not None and time.monotonic() > deadline)
+            if stop:
+                self._terminate_process(process)
+                try:
+                    _out, err = process.communicate(timeout=2)
+                except Exception:
+                    err = ""
+                return 124, err or ""
 
     def unreachable_commits(self) -> list[str]:
         """SHAs of commits reachable from no ref (and no reflog) — dangling objects
