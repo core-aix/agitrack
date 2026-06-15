@@ -40,6 +40,9 @@ KIND_UNKNOWN = "unknown"
 # A short network timeout so a startup check never hangs the terminal. The
 # periodic in-session check runs on a worker thread, but keep it bounded anyway.
 _NET_TIMEOUT = 20
+# The startup check blocks launch, so bound it much tighter: an offline user waits
+# at most this long before aGiT starts anyway.
+STARTUP_NET_TIMEOUT = 6
 
 # Sentinel so callers can inject ``source_repo=None`` to mean "no source-linked
 # install" (force the package path), distinct from "not provided -> auto-detect".
@@ -69,15 +72,23 @@ class UpdateStatus:
 
 
 def _git(args: list[str], cwd: Path, *, timeout: int | None = None) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", *args],
-        cwd=str(cwd),
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-        timeout=timeout,
-    )
+    # GIT_TERMINAL_PROMPT=0: a network git call (fetch) must never block on a
+    # credential prompt — offline/auth failures should fail fast, not hang launch.
+    # A timeout bounds the rest; on expiry the process is killed and we report it as
+    # a plain non-zero result so callers degrade to "couldn't check" gracefully.
+    try:
+        return subprocess.run(
+            ["git", *args],
+            cwd=str(cwd),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=timeout,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(["git", *args], returncode=124, stdout="", stderr="timed out")
 
 
 def detect_source_repo() -> Path | None:
@@ -139,12 +150,14 @@ class Updater:
 
     # --- checking --------------------------------------------------------
 
-    def check(self, *, fetch: bool = True) -> UpdateStatus:
+    def check(self, *, fetch: bool = True, timeout: int = _NET_TIMEOUT) -> UpdateStatus:
         """Check whether a newer aGiT is available. Blocking (network); run on a
-        worker thread from interactive contexts."""
+        worker thread from interactive contexts. ``timeout`` bounds each network
+        call — pass a short value (``STARTUP_NET_TIMEOUT``) for the launch-time
+        check so an offline user isn't made to wait."""
         if self.kind == KIND_SOURCE:
-            return self._check_source(fetch=fetch)
-        return self._check_package()
+            return self._check_source(fetch=fetch, timeout=timeout)
+        return self._check_package(timeout=timeout)
 
     def _upstream_ref(self, repo: Path) -> str | None:
         # The current branch's configured upstream (e.g. "origin/main"). Without
@@ -156,7 +169,7 @@ class Updater:
         ref = result.stdout.strip()
         return ref or None
 
-    def _check_source(self, *, fetch: bool) -> UpdateStatus:
+    def _check_source(self, *, fetch: bool, timeout: int = _NET_TIMEOUT) -> UpdateStatus:
         repo = self._source_repo
         assert repo is not None
         status = UpdateStatus(kind=KIND_SOURCE)
@@ -166,7 +179,7 @@ class Updater:
             return status
         remote = upstream.split("/", 1)[0]
         if fetch:
-            fetched = _git(["fetch", "--quiet", remote], repo, timeout=_NET_TIMEOUT)
+            fetched = _git(["fetch", "--quiet", remote], repo, timeout=timeout)
             if fetched.returncode != 0:
                 status.error = (fetched.stderr.strip() or "git fetch failed").splitlines()[-1]
                 return status
@@ -202,11 +215,11 @@ class Updater:
             status.message = "aGiT is up to date."
         return status
 
-    def _check_package(self) -> UpdateStatus:
+    def _check_package(self, *, timeout: int = _NET_TIMEOUT) -> UpdateStatus:
         status = UpdateStatus(kind=KIND_PACKAGE)
         installed = self._installed_version()
         status.current = installed
-        latest = self._latest_package_version()
+        latest = self._latest_package_version(timeout=timeout)
         if latest is None:
             status.error = "could not determine the latest published aGiT version"
             return status
@@ -242,19 +255,23 @@ class Updater:
         # OLD version while :meth:`_installed_version` reads the new one from disk.
         return getattr(agit, "__version__", "0")
 
-    def _latest_package_version(self) -> str | None:
+    def _latest_package_version(self, *, timeout: int = _NET_TIMEOUT) -> str | None:
         # `pip index versions` is the most portable way to ask the configured
         # index without a hard dependency on a PyPI JSON client. It is marked
-        # experimental but degrades gracefully: any failure returns None and the
-        # caller reports "could not determine the latest version".
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "index", "versions", DIST_NAME],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=_NET_TIMEOUT,
-        )
+        # experimental but degrades gracefully: any failure (including a network
+        # timeout) returns None and the caller reports "could not determine the
+        # latest version".
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "index", "versions", DIST_NAME],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return None
         if result.returncode != 0:
             return None
         prefix = f"{DIST_NAME.lower()} ("

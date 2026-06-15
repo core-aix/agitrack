@@ -340,6 +340,7 @@ class ProxyRunner:
     EXIT_SHARE_TIMEOUT = (
         45.0  # cap the exit-path auto-share push; long enough for a real push, short enough to never truly hang
     )
+    SHARED_FETCH_TIMEOUT = 30.0  # cap the shared-session listing fetch so a slow/offline remote can't hang the menu
 
     def __init__(
         self,
@@ -3150,14 +3151,79 @@ class ProxyRunner:
             self._debug(f"published content hash lookup failed: {error!r}")
         return None
 
+    def _fetch_shared_with_cancel(self, store, message: str) -> bool:
+        """Fetch the shared-session ref while keeping the UI alive and letting the
+        user press Esc to stop — needed when the fetch stalls on bad internet.
+        Returns True if the fetch finished, False if the user stopped it or it timed
+        out. Either way the LOCAL ref is left usable (possibly stale) for listing.
+
+        No remote ⇒ nothing to fetch over the network: do the cheap local call
+        inline (this also keeps headless/test runs off the interactive wait path)."""
+        if not store.repo.remote_exists():
+            store.fetch()
+            return True
+        result: dict = {}
+
+        def worker() -> None:
+            try:
+                # Bound the git fetch itself so an abandoned (stopped) fetch's
+                # subprocess can't linger forever on a dead connection.
+                result["ok"] = store.fetch(timeout=self.SHARED_FETCH_TIMEOUT)
+            except Exception as error:  # never let a fetch failure escape the thread
+                result["error"] = repr(error)
+
+        thread = threading.Thread(target=worker, daemon=True, name="agit-shared-fetch")
+        thread.start()
+        self._set_message(f"{message}   ·   press Esc to stop", seconds=600)
+        self._render()
+        stdin_fd = sys.stdin.fileno()
+        deadline = time.monotonic() + self.SHARED_FETCH_TIMEOUT + 2.0
+        while thread.is_alive():
+            if time.monotonic() > deadline:
+                self._set_message("Stopped fetching shared sessions (timed out).", seconds=6.0)
+                self._render()
+                return False
+            master = self.master_fd
+            background = self._background_fds() if self.sessions else {}
+            fds = [stdin_fd]
+            if master is not None:
+                fds.append(master)
+            fds.extend(background)
+            try:
+                readable, _, _ = select.select(fds, [], [], 0.2)
+            except (OSError, ValueError):
+                # stdin/PTY not selectable (headless): just wait for the fetch.
+                thread.join(timeout=0.2)
+                continue
+            for fd in readable:
+                if fd == stdin_fd:
+                    data = os.read(stdin_fd, 32)
+                    if b"\x1b" in data or b"\x03" in data:  # Esc or Ctrl-C ⇒ stop
+                        self._set_message("Stopped fetching shared sessions.", seconds=6.0)
+                        self._render()
+                        return False
+                elif fd == master:
+                    output = self._drain_child_output()
+                    if output is not None:
+                        self.last_child_output = time.monotonic()
+                        self._feed_child_output(output)
+                elif fd in background:
+                    self._pump_background(background[fd])
+        if result.get("error"):
+            self._debug(f"shared fetch failed: {result['error']}")
+        return True
+
     def _resume_shared_session_menu(self) -> None:
         store = self._shared_store()
-        self._set_message("Fetching shared sessions…", seconds=10.0)
-        self._render()
-        store.fetch()
+        completed = self._fetch_shared_with_cancel(store, "Fetching shared sessions…")
         entries = store.entries()
         if not entries:
-            self._set_message("No shared sessions found for this repo.")
+            # Distinguish "you stopped a slow fetch (nothing cached yet)" from a
+            # genuine empty result, so the message isn't misleading on bad internet.
+            if completed:
+                self._set_message("No shared sessions found for this repo.")
+            else:
+                self._set_message("Stopped fetching. No shared sessions are cached yet.", seconds=6.0)
             self._render()
             return
         options: list[str] = []

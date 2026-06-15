@@ -115,7 +115,7 @@ def test_fetch_lists_with_filter_and_reads_transcript_on_demand():
         def read_ref_blob(self, ref, path):
             return blobs.get(path)
 
-        def fetch_ref(self, refspec, *, remote="origin", filter_blobs=None):
+        def fetch_ref(self, refspec, *, remote="origin", filter_blobs=None, timeout=None):
             fetches.append(filter_blobs)
             if filter_blobs is None:  # the on-demand full fetch brings the transcript in
                 blobs["abc/me/sess/transcript.jsonl"] = "the transcript"
@@ -127,6 +127,36 @@ def test_fetch_lists_with_filter_and_reads_transcript_on_demand():
     entry = store.entries()[0]
     assert store.read_transcript(entry) == "the transcript"
     assert None in fetches  # a full fetch was triggered on demand for the transcript
+
+
+def test_fetch_passes_timeout_through_to_git(tmp_path):
+    # A bad-internet bound: store.fetch(timeout=...) reaches the underlying git
+    # fetch so a stalled network call can't run unbounded.
+    seen: list = []
+
+    class FakeRepo:
+        repo = tmp_path
+
+        def remote_exists(self, name="origin"):
+            return True
+
+        def fetch_ref(self, refspec, *, remote="origin", filter_blobs=None, timeout=None):
+            seen.append(timeout)
+            return True
+
+    store = SharedSessionStore(FakeRepo())  # type: ignore[arg-type]
+    assert store.fetch(timeout=12.0) is True
+    assert seen == [12.0]
+
+
+def test_fetch_shared_with_cancel_fast_path_when_no_remote(tmp_path, monkeypatch):
+    # No remote ⇒ nothing to fetch over the network: the helper runs the cheap
+    # local call inline (no thread, no interactive wait) and reports completion.
+    backend = _StubBackend()
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
+    store = runner._shared_store()
+    assert store.repo.remote_exists() is False
+    assert runner._fetch_shared_with_cancel(store, "Fetching…") is True
 
 
 def test_shared_ref_is_history_free_and_keeps_only_latest(tmp_path):

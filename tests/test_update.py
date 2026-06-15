@@ -159,7 +159,7 @@ def test_source_apply_refuses_diverged_branch(source_clone):
 def test_package_check_available(monkeypatch):
     updater = Updater(source_repo=None)
     monkeypatch.setattr(updater, "_installed_version", lambda: "1.0.0")
-    monkeypatch.setattr(updater, "_latest_package_version", lambda: "1.2.0")
+    monkeypatch.setattr(updater, "_latest_package_version", lambda **k: "1.2.0")
     status = updater.check()
     assert status.kind == KIND_PACKAGE
     assert status.available is True
@@ -170,7 +170,7 @@ def test_package_check_up_to_date(monkeypatch):
     updater = Updater(source_repo=None)
     monkeypatch.setattr(updater, "_installed_version", lambda: "1.2.0")
     monkeypatch.setattr(updater, "_running_version", lambda: "1.2.0")  # running == installed
-    monkeypatch.setattr(updater, "_latest_package_version", lambda: "1.2.0")
+    monkeypatch.setattr(updater, "_latest_package_version", lambda **k: "1.2.0")
     assert updater.check().available is False
 
 
@@ -180,7 +180,7 @@ def test_package_check_restart_when_running_is_stale(monkeypatch):
     updater = Updater(source_repo=None)
     monkeypatch.setattr(updater, "_installed_version", lambda: "1.3.0")
     monkeypatch.setattr(updater, "_running_version", lambda: "1.2.0")
-    monkeypatch.setattr(updater, "_latest_package_version", lambda: "1.3.0")  # index == installed
+    monkeypatch.setattr(updater, "_latest_package_version", lambda **k: "1.3.0")  # index == installed
     status = updater.check()
     assert status.available is True
     assert status.restart_only is True
@@ -190,7 +190,7 @@ def test_package_check_restart_when_running_is_stale(monkeypatch):
 def test_package_check_errors_when_index_unreachable(monkeypatch):
     updater = Updater(source_repo=None)
     monkeypatch.setattr(updater, "_installed_version", lambda: "1.0.0")
-    monkeypatch.setattr(updater, "_latest_package_version", lambda: None)
+    monkeypatch.setattr(updater, "_latest_package_version", lambda **k: None)
     status = updater.check()
     assert not status.ok
 
@@ -342,8 +342,9 @@ class _StartupUpdater:
         self.checked = False
         self.applied = False
 
-    def check(self) -> UpdateStatus:
+    def check(self, *, fetch: bool = True, timeout: int = 20) -> UpdateStatus:
         self.checked = True
+        self.checked_timeout = timeout  # the startup path passes a short bound
         return self._status
 
     def apply(self) -> UpdateStatus:
@@ -361,6 +362,37 @@ def test_startup_prompt_applies_and_restarts(monkeypatch, tmp_path: Path):
     cli._check_for_update_at_startup(config)
     assert updater.applied is True
     assert restarted == [True]
+
+
+def test_startup_check_uses_short_timeout(monkeypatch, tmp_path: Path):
+    # The launch-time check must be tightly bounded so an offline user isn't blocked
+    # from starting aGiT — it passes the short STARTUP_NET_TIMEOUT, not the default.
+    from agit.update import STARTUP_NET_TIMEOUT
+
+    config = GlobalConfig(path=tmp_path / "c.json")
+    updater = _StartupUpdater(UpdateStatus(kind=KIND_SOURCE, available=False))
+    monkeypatch.setattr("agit.update.Updater", lambda *a, **k: updater)
+    cli._check_for_update_at_startup(config)
+    assert updater.checked_timeout == STARTUP_NET_TIMEOUT
+    assert STARTUP_NET_TIMEOUT < 20  # meaningfully shorter than the in-session bound
+
+
+def test_check_survives_network_timeout(monkeypatch, tmp_path: Path):
+    # A git fetch that times out must NOT raise out of check(): the real _git
+    # wrapper catches TimeoutExpired and reports a clean failure, so aGiT starts.
+    repo = tmp_path / "src"
+    repo.mkdir()
+    updater = Updater(source_repo=repo)
+    monkeypatch.setattr(updater, "_upstream_ref", lambda _r: "origin/main")
+
+    def fake_run(args, **kwargs):
+        if "fetch" in args:
+            raise subprocess.TimeoutExpired(cmd="git fetch", timeout=kwargs.get("timeout", 1))
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr("agit.update.updater.subprocess.run", fake_run)
+    status = updater.check(timeout=1)  # must not raise
+    assert not status.ok  # reported as an error, gracefully
 
 
 def test_startup_prompt_defaults_to_update_on_empty_enter(monkeypatch, tmp_path: Path):

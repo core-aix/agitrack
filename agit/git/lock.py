@@ -84,6 +84,34 @@ class RepoLock:
         pid = self._read_info().get("pid")
         return pid if isinstance(pid, int) else None
 
+    def probe_owner(self) -> int | None:
+        """Non-destructively check whether another live process holds this lock.
+
+        Returns the holder's PID (or None if unknown) when the lock is held by
+        someone else, and None when it is free. Used for an early "already running"
+        check *before* the authoritative :meth:`acquire`. There is a tiny window
+        between this probe and ``acquire`` in which another process could take the
+        lock, but ``acquire`` stays the real guard — so the worst case is the
+        refusal appears a moment later, never a false start of two instances."""
+        if self._fd is not None:
+            return None  # we already hold it
+        try:
+            fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o644)
+        except OSError:
+            # No lock file / dir yet ⇒ nobody is running; let acquire() be authority.
+            return None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return self.owner_pid()  # held by another live process
+        # Free: we momentarily grabbed it — release at once so acquire() can take it.
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+        return None
+
     def is_held_by_self(self) -> bool:
         return self._fd is not None
 
