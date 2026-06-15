@@ -341,7 +341,7 @@ class ProxyRunner:
         45.0  # cap the exit-path auto-share push; long enough for a real push, short enough to never truly hang
     )
     SHARED_FETCH_TIMEOUT = 30.0  # cap the shared-session listing fetch so a slow/offline remote can't hang the menu
-    RESUME_FETCH_TIMEOUT = 120.0  # cap the full-transcript fetch when resuming a shared session (it can be large)
+    RESUME_FETCH_TIMEOUT = 300.0  # cap the full-transcript fetch when resuming a shared session; generous since the user can cancel manually
 
     def __init__(
         self,
