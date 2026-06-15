@@ -72,6 +72,14 @@ def main(argv: list[str] | None = None) -> int:
         help="run the agent against the current branch instead of an isolated worktree "
         "(edits are visible live; no isolation/integration; unsafe with concurrent sessions)",
     )
+    parser.add_argument(
+        "--skip-privacy-ack",
+        action="store_true",
+        # Suppress the one-time privacy warning/acknowledgment. Set automatically
+        # when aGiT re-execs itself after an in-app (menu) update — the user already
+        # acknowledged it this session — and not meant for manual use.
+        help=argparse.SUPPRESS,
+    )
     parser.epilog = (
         "Unrecognized arguments are forwarded verbatim to the backend CLI "
         "(claude / opencode), e.g. `agit --backend opencode --port 12345`. Use "
@@ -171,7 +179,7 @@ def main(argv: list[str] | None = None) -> int:
         print(already_running_message(owner))
         return 1
 
-    if not _acknowledge_privacy_warning(scripted=scripted):
+    if not _acknowledge_privacy_warning(scripted=scripted, skip=args.skip_privacy_ack):
         return 1
 
     try:
@@ -309,12 +317,18 @@ PRIVACY_WARNING = (
 )
 
 
-def _acknowledge_privacy_warning(*, scripted: bool = False) -> bool:
+def _acknowledge_privacy_warning(*, scripted: bool = False, skip: bool = False) -> bool:
     """Show the privacy warning at startup; the user must acknowledge it to
     continue. Without a TTY there is no way to acknowledge, and a scripted run
     (``--prompt``) already has its input on the command line, so in both cases
     the warning is printed and aGiT proceeds — never block automation on an
-    ``input()`` that cannot be answered."""
+    ``input()`` that cannot be answered.
+
+    ``skip`` suppresses the warning entirely; aGiT sets it when re-exec'ing
+    itself after an in-app (menu) update, where the user acknowledged the
+    warning earlier this session and should not be prompted again."""
+    if skip:
+        return True
     print(PRIVACY_WARNING)
     if scripted or not (sys.stdin.isatty() and sys.stdout.isatty()):
         return True

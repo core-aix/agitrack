@@ -23,6 +23,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn, cast
@@ -433,13 +434,21 @@ def _version_tuple(version: str) -> tuple:
     return tuple(parts)
 
 
-def restart_agit() -> NoReturn:
+def restart_agit(extra_args: Sequence[str] = ()) -> NoReturn:
     """Re-exec aGiT in place so the freshly updated code is loaded.
 
     Uses ``python -m agit`` with the original CLI arguments so the entry point
     survives a package upgrade that may have rewritten the console script. This
     does not return on success.
+
+    ``extra_args`` are appended to the original argv (de-duplicated) — used to
+    carry ``--skip-privacy-ack`` through a menu-triggered restart so the
+    already-acknowledged privacy warning isn't shown again.
     """
     sys.stdout.flush()
     sys.stderr.flush()
-    os.execv(sys.executable, [sys.executable, "-m", "agit", *sys.argv[1:]])
+    args = list(sys.argv[1:])
+    for arg in extra_args:
+        if arg not in args:
+            args.append(arg)
+    os.execv(sys.executable, [sys.executable, "-m", "agit", *args])

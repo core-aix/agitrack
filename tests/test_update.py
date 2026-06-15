@@ -481,6 +481,51 @@ def test_apply_update_success_finalizes_then_restarts():
     assert runner.running is False
 
 
+# --- restart re-exec args ---------------------------------------------------
+
+
+def _capture_restart(monkeypatch, argv):
+    from agit.update import updater as updater_mod
+
+    monkeypatch.setattr(updater_mod.sys, "argv", argv)
+    captured: list = []
+    monkeypatch.setattr(updater_mod.os, "execv", lambda exe, args: captured.append(args))
+    monkeypatch.setattr(updater_mod.sys.stdout, "flush", lambda: None)
+    monkeypatch.setattr(updater_mod.sys.stderr, "flush", lambda: None)
+    return captured
+
+
+def test_restart_agit_appends_extra_args(monkeypatch):
+    from agit.update import restart_agit
+
+    captured = _capture_restart(monkeypatch, ["agit", "--backend", "claude"])
+    restart_agit(["--skip-privacy-ack"])
+
+    assert captured[0][1:] == ["-m", "agit", "--backend", "claude", "--skip-privacy-ack"]
+
+
+def test_restart_agit_does_not_duplicate_existing_flag(monkeypatch):
+    from agit.update import restart_agit
+
+    captured = _capture_restart(monkeypatch, ["agit", "--skip-privacy-ack"])
+    restart_agit(["--skip-privacy-ack"])
+
+    # The flag is already present from a prior restart; don't accumulate it.
+    assert captured[0].count("--skip-privacy-ack") == 1
+
+
+def test_restart_agit_without_extra_args_preserves_argv(monkeypatch):
+    # The startup-update path passes no extra args, so the restart re-shows the
+    # privacy warning (no --skip-privacy-ack injected).
+    from agit.update import restart_agit
+
+    captured = _capture_restart(monkeypatch, ["agit", "--verbose"])
+    restart_agit()
+
+    assert captured[0][1:] == ["-m", "agit", "--verbose"]
+    assert "--skip-privacy-ack" not in captured[0]
+
+
 # --- CLI startup prompt -----------------------------------------------------
 
 

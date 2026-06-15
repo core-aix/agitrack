@@ -542,6 +542,15 @@ def test_privacy_warning_non_interactive_prints_and_continues(monkeypatch, capsy
     assert "passwords, API keys" in capsys.readouterr().out
 
 
+def test_privacy_warning_skipped_does_not_print_or_prompt(monkeypatch, capsys):
+    # A menu-update restart passes skip=True: no warning, no prompt, just continue.
+    _force_tty(monkeypatch, stdin=True)
+    monkeypatch.setattr("builtins.input", lambda *a: (_ for _ in ()).throw(AssertionError("should not prompt")))
+
+    assert cli._acknowledge_privacy_warning(skip=True) is True
+    assert capsys.readouterr().out == ""
+
+
 def test_main_stops_when_privacy_warning_declined(monkeypatch):
     captured = _stub_launch(monkeypatch)
     _force_tty(monkeypatch, stdin=True)
