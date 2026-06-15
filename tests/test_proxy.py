@@ -3159,6 +3159,67 @@ def test_is_real_keypress_ignores_mouse_and_focus():
     assert runner._is_real_keypress(b"\x1b[<35;1;1Mx") is True
 
 
+def test_timers_phase_noops_when_not_running():
+    # After a menu "update" (or exit) finalizes and REMOVES the worktree, the timers
+    # phase must touch nothing — a stale call would run git in the deleted worktree
+    # and raise FileNotFoundError. The loop also breaks before reaching here.
+    from proxy_helpers import make_runner
+
+    runner = make_runner()
+    runner.running = False
+    touched: list = []
+    runner._flush_pending_render = lambda: touched.append("render")
+    runner._ensure_worktree_alive = lambda: touched.append("alive")
+    runner._maybe_agent_commit = lambda: touched.append("commit")
+
+    runner._reactor_timers_phase()
+
+    assert touched == []  # nothing ran on the torn-down session
+
+
+def test_timers_phase_stops_after_pending_update_teardown():
+    # A deferred update can apply mid-phase (sessions just went idle), finalizing and
+    # removing the worktree; the worktree-touching tail must then be skipped.
+    from proxy_helpers import make_runner
+
+    runner = make_runner()
+    runner.running = True
+    runner.merge_ctx = None
+    runner._base_advanced = True
+    synced: list = []
+    runner._sync_idle_worktrees_to_base = lambda: synced.append(True)
+
+    def noop(*a, **k):
+        return None
+
+    for name in [
+        "_flush_pending_render",
+        "_flush_pending_enter",
+        "_check_base_branch_drift",
+        "_resume_pending_prompt_if_ready",
+        "_ensure_worktree_alive",
+        "_service_commit_summaries",
+        "_service_precompact_summary",
+        "_service_shared_resume",
+        "_maybe_agent_commit",
+        "_service_background_sessions",
+        "_poll_base_advanced",
+        "_warn_if_base_edited",
+        "_warn_if_cwd_drifted",
+        "_maybe_check_for_update",
+        "_service_session_notices",
+    ]:
+        setattr(runner, name, noop)
+
+    def apply_pending():
+        runner.running = False  # finalize removed the worktree and stopped the loop
+
+    runner._maybe_apply_pending_update = apply_pending
+    runner._reactor_timers_phase()
+
+    assert synced == []  # the worktree-sync tail was skipped after teardown
+
+
 def test_abort_shared_resume_clears_token_for_retry():
     import threading
 

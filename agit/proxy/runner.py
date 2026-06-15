@@ -873,6 +873,17 @@ class ProxyRunner:
         # A self-update was applied; re-exec aGiT in place now that the terminal
         # is restored and the management lock is released. Does not return.
         if self._pending_restart:
+            # Finalize may have removed the worktree this process was launched in; the
+            # re-exec'd aGiT would then start with a deleted CWD and crash before it
+            # could discover the repo. Move to the base repo root (which always exists)
+            # first so the restart lands cleanly.
+            try:
+                os.getcwd()
+            except OSError:
+                try:
+                    os.chdir(self.base_repo.repo)
+                except OSError:
+                    pass
             restart_agit()
         return exit_code
 
@@ -4245,8 +4256,19 @@ class ProxyRunner:
                 continue
             if sentinel == "break":
                 break
+            # A stdin action may have torn the session down for a restart/exit (e.g. a
+            # menu "update" → _apply_update_and_restart, which finalizes and REMOVES the
+            # worktree). Stop now rather than fall through to the timers phase, whose
+            # _ensure_worktree_alive / _maybe_agent_commit would run git in the deleted
+            # worktree (FileNotFoundError). Mirrors the exit command's "break" above.
+            if not self.running:
+                break
             # --- phase 4: timers / background tasks -----------------------
             self._reactor_timers_phase()
+            # A deferred update can apply here (sessions just went idle), tearing the
+            # worktree down mid-phase; don't reap/inspect children against it.
+            if not self.running:
+                break
             # --- phase 5: child-exit --------------------------------------
             sentinel = self._reactor_child_exit_phase()
             if sentinel == "continue":
@@ -4387,6 +4409,8 @@ class ProxyRunner:
 
     def _reactor_timers_phase(self) -> None:
         """Phase 4 — flush pending renders, deferred enters, and all background tasks."""
+        if not self.running:
+            return  # a restart/exit is underway; touch no (possibly-removed) worktree
         self._flush_pending_render()
         self._flush_pending_enter()
         if self.merge_ctx:
@@ -4406,6 +4430,10 @@ class ProxyRunner:
             self._warn_if_cwd_drifted()
             self._maybe_check_for_update()
             self._maybe_apply_pending_update()
+        if not self.running:
+            # _maybe_apply_pending_update finalized and removed the worktree for a
+            # restart; stop before the worktree-touching sync below.
+            return
         self._service_session_notices()  # expire/refresh per-session status lines
         if self._base_advanced:
             self._base_advanced = False
