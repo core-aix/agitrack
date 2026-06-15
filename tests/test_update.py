@@ -88,6 +88,61 @@ def test_source_check_detects_upstream_commits(source_clone):
     assert "2 new commits" in status.message
 
 
+def test_source_check_restart_when_checkout_updated_under_running_process(source_clone):
+    # The checkout was fast-forwarded (a prior self-update, or a manual pull) while
+    # this process kept running the old code. The check must see the running copy
+    # is stale and offer a restart, even though HEAD is now in sync with upstream.
+    remote, clone = source_clone
+    updater = Updater(source_repo=clone)
+    assert updater.check().available is False  # first check snapshots the running HEAD (in sync)
+
+    _commit(remote, "agit.py", "v2\n", "second")
+    Updater(source_repo=clone).apply()  # a separate actor fast-forwards the checkout
+
+    status = updater.check()  # same process: its running code is now older than disk
+    assert status.available is True
+    assert status.restart_only is True
+    assert "restart" in status.message.lower()
+
+
+def test_source_check_detects_local_update_even_when_offline(source_clone, monkeypatch):
+    # The running process must learn the checkout advanced under it even when the
+    # network fetch fails (offline) — local staleness is detectable with no remote.
+    remote, clone = source_clone
+    updater = Updater(source_repo=clone)
+    assert updater.check().available is False  # snapshots the running HEAD (in sync)
+
+    # Advance the LOCAL checkout directly (no remote push), then make every fetch fail.
+    _commit(clone, "agit.py", "v2\n", "local second")
+    real_run = subprocess.run
+
+    def fail_fetch(args, **kwargs):
+        if "fetch" in args:
+            return subprocess.CompletedProcess(args, 1, "", "could not resolve host")
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr("agit.update.updater.subprocess.run", fail_fetch)
+
+    status = updater.check()
+    assert status.available is True
+    assert status.restart_only is True  # the running copy is older than disk
+    assert "restart" in status.message.lower()
+
+
+def test_source_check_snapshots_running_rev_at_construction(source_clone, monkeypatch):
+    # The running rev is captured when the Updater is built, not on the first check —
+    # so a local update that lands before any successful check is still seen as stale.
+    remote, clone = source_clone
+    updater = Updater(source_repo=clone)  # snapshot taken here (HEAD == v1)
+
+    # The checkout advances before the very first check() ever runs.
+    _commit(clone, "agit.py", "v2\n", "local second")
+
+    status = updater.check(fetch=False)  # no network at all
+    assert status.available is True
+    assert status.restart_only is True
+
+
 def test_source_check_errors_without_upstream(tmp_path: Path):
     repo = tmp_path / "solo"
     _init_repo(repo)
@@ -110,7 +165,11 @@ def test_source_apply_fast_forwards(source_clone):
     assert result.ok, result.error
     # The clone now carries the remote's content and is back in sync.
     assert (clone / "agit.py").read_text() == "v2\n"
-    assert updater.check().available is False
+    # The checkout is current, but THIS process is still running the pre-update
+    # code, so the next check asks for a restart (not another download). In a real
+    # run apply() is immediately followed by a re-exec, so this is never observed.
+    after = updater.check()
+    assert after.available is True and after.restart_only is True
 
 
 def test_source_apply_refuses_dirty_tree(source_clone):
@@ -138,7 +197,7 @@ def test_source_apply_refuses_diverged_branch(source_clone):
 def test_package_check_available(monkeypatch):
     updater = Updater(source_repo=None)
     monkeypatch.setattr(updater, "_installed_version", lambda: "1.0.0")
-    monkeypatch.setattr(updater, "_latest_package_version", lambda: "1.2.0")
+    monkeypatch.setattr(updater, "_latest_package_version", lambda **k: "1.2.0")
     status = updater.check()
     assert status.kind == KIND_PACKAGE
     assert status.available is True
@@ -148,14 +207,28 @@ def test_package_check_available(monkeypatch):
 def test_package_check_up_to_date(monkeypatch):
     updater = Updater(source_repo=None)
     monkeypatch.setattr(updater, "_installed_version", lambda: "1.2.0")
-    monkeypatch.setattr(updater, "_latest_package_version", lambda: "1.2.0")
+    monkeypatch.setattr(updater, "_running_version", lambda: "1.2.0")  # running == installed
+    monkeypatch.setattr(updater, "_latest_package_version", lambda **k: "1.2.0")
     assert updater.check().available is False
+
+
+def test_package_check_restart_when_running_is_stale(monkeypatch):
+    # The package on disk was already upgraded, but this process still runs the
+    # old version — the check must offer a restart, not report "up to date".
+    updater = Updater(source_repo=None)
+    monkeypatch.setattr(updater, "_installed_version", lambda: "1.3.0")
+    monkeypatch.setattr(updater, "_running_version", lambda: "1.2.0")
+    monkeypatch.setattr(updater, "_latest_package_version", lambda **k: "1.3.0")  # index == installed
+    status = updater.check()
+    assert status.available is True
+    assert status.restart_only is True
+    assert "restart" in status.message.lower()
 
 
 def test_package_check_errors_when_index_unreachable(monkeypatch):
     updater = Updater(source_repo=None)
     monkeypatch.setattr(updater, "_installed_version", lambda: "1.0.0")
-    monkeypatch.setattr(updater, "_latest_package_version", lambda: None)
+    monkeypatch.setattr(updater, "_latest_package_version", lambda **k: None)
     status = updater.check()
     assert not status.ok
 
@@ -298,6 +371,56 @@ def test_maybe_apply_pending_update_triggers_when_ready(monkeypatch):
     assert applied == [True]
 
 
+class _StubUpdater:
+    def __init__(self, status: UpdateStatus):
+        self._status = status
+
+    def apply(self) -> UpdateStatus:
+        return self._status
+
+
+def test_apply_update_failure_leaves_session_intact():
+    # If apply() fails, aGiT must NOT tear the session down — the user keeps working
+    # exactly where they were. (Regression: finalizing/removing the worktree first,
+    # then discovering apply() failed, left the reactor on a deleted worktree and
+    # the next `git status` crashed with FileNotFoundError.)
+    runner = make_runner()
+    runner._update_status = UpdateStatus(kind=KIND_SOURCE, available=True)
+    runner._updater = _StubUpdater(UpdateStatus(kind=KIND_SOURCE, error="not a fast-forward"))
+    runner.running = True
+    runner._pending_restart = False
+    finalized: list = []
+    runner._finalize_pending_work = lambda: finalized.append(True)
+    runner._exit_child = lambda: finalized.append("exit")
+    runner._render = lambda: None
+
+    runner._apply_update_and_restart()
+
+    assert finalized == []  # nothing torn down
+    assert runner.running is True  # still running
+    assert runner._pending_restart is False  # no re-exec scheduled
+    assert runner._update_applying is False  # reset so the user can retry
+    assert "update failed" in (runner.message or "").lower()
+
+
+def test_apply_update_success_finalizes_then_restarts():
+    runner = make_runner()
+    runner._update_status = UpdateStatus(kind=KIND_SOURCE, available=True)
+    runner._updater = _StubUpdater(UpdateStatus(kind=KIND_SOURCE, message="Updated to abc123."))
+    runner.running = True
+    runner._pending_restart = False
+    order: list = []
+    runner._finalize_pending_work = lambda: order.append("finalize")
+    runner._exit_child = lambda: order.append("exit_child")
+    runner._render = lambda: None
+
+    runner._apply_update_and_restart()
+
+    assert order == ["finalize", "exit_child"]  # only torn down AFTER a successful apply
+    assert runner._pending_restart is True
+    assert runner.running is False
+
+
 # --- CLI startup prompt -----------------------------------------------------
 
 
@@ -307,8 +430,9 @@ class _StartupUpdater:
         self.checked = False
         self.applied = False
 
-    def check(self) -> UpdateStatus:
+    def check(self, *, fetch: bool = True, timeout: int = 20) -> UpdateStatus:
         self.checked = True
+        self.checked_timeout = timeout  # the startup path passes a short bound
         return self._status
 
     def apply(self) -> UpdateStatus:
@@ -326,6 +450,60 @@ def test_startup_prompt_applies_and_restarts(monkeypatch, tmp_path: Path):
     cli._check_for_update_at_startup(config)
     assert updater.applied is True
     assert restarted == [True]
+
+
+def test_startup_check_uses_short_timeout(monkeypatch, tmp_path: Path):
+    # The launch-time check must be tightly bounded so an offline user isn't blocked
+    # from starting aGiT — it passes the short STARTUP_NET_TIMEOUT, not the default.
+    from agit.update import STARTUP_NET_TIMEOUT
+
+    config = GlobalConfig(path=tmp_path / "c.json")
+    updater = _StartupUpdater(UpdateStatus(kind=KIND_SOURCE, available=False))
+    monkeypatch.setattr("agit.update.Updater", lambda *a, **k: updater)
+    cli._check_for_update_at_startup(config)
+    assert updater.checked_timeout == STARTUP_NET_TIMEOUT
+    assert STARTUP_NET_TIMEOUT < 20  # meaningfully shorter than the in-session bound
+
+
+def test_check_survives_network_timeout(monkeypatch, tmp_path: Path):
+    # A git fetch that times out must NOT raise out of check(): the real _git
+    # wrapper catches TimeoutExpired and reports a clean failure, so aGiT starts.
+    repo = tmp_path / "src"
+    repo.mkdir()
+    updater = Updater(source_repo=repo)
+    monkeypatch.setattr(updater, "_upstream_ref", lambda _r: "origin/main")
+
+    def fake_run(args, **kwargs):
+        if "fetch" in args:
+            raise subprocess.TimeoutExpired(cmd="git fetch", timeout=kwargs.get("timeout", 1))
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr("agit.update.updater.subprocess.run", fake_run)
+    status = updater.check(timeout=1)  # must not raise
+    assert not status.ok  # reported as an error, gracefully
+
+
+def test_startup_prompt_defaults_to_update_on_empty_enter(monkeypatch, tmp_path: Path):
+    # A bare Enter (empty answer) takes the recommended path: update now.
+    config = GlobalConfig(path=tmp_path / "c.json")
+    updater = _StartupUpdater(_available_status())
+    restarted = []
+    monkeypatch.setattr("agit.update.Updater", lambda *a, **k: updater)
+    monkeypatch.setattr("agit.update.restart_agit", lambda: restarted.append(True))
+    monkeypatch.setattr("builtins.input", lambda *a: "")
+    cli._check_for_update_at_startup(config)
+    assert updater.applied is True
+    assert restarted == [True]
+
+
+def test_startup_prompt_skips_on_explicit_no(monkeypatch, tmp_path: Path):
+    config = GlobalConfig(path=tmp_path / "c.json")
+    updater = _StartupUpdater(_available_status())
+    monkeypatch.setattr("agit.update.Updater", lambda *a, **k: updater)
+    monkeypatch.setattr("builtins.input", lambda *a: "n")
+    cli._check_for_update_at_startup(config)
+    assert updater.applied is False
+    assert config.check_for_updates is True  # "no" this time, but keep asking
 
 
 def test_startup_prompt_never_disables_future_checks(monkeypatch, tmp_path: Path):

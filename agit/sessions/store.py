@@ -17,6 +17,7 @@ ref never grows a history.
 from __future__ import annotations
 
 import json
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -49,6 +50,16 @@ class PublishResult:
     pushed: bool  # whether the push succeeded
     pruned: int = 0  # how many of the contributor's stale sessions were removed
     error: str = ""
+
+
+def _is_stale_lease(error: str) -> bool:
+    """Whether a failed push was *rejected because the remote moved* (a lost race
+    or a never-fetched remote ref) — the only failure publish() retries after a
+    sync. Auth/network errors don't match these markers, so they fail fast instead
+    of looping. Git emits 'stale info' for a broken ``--force-with-lease`` and
+    'fetch first'/'non-fast-forward'/'[rejected]' for an ordinary rejection."""
+    text = error.lower()
+    return any(marker in text for marker in ("stale info", "fetch first", "non-fast-forward", "rejected"))
 
 
 @dataclass
@@ -90,8 +101,20 @@ class SharedSessionStore:
         except json.JSONDecodeError:
             return {}
 
-    def read_transcript(self, entry: SharedEntry) -> str | None:
-        return self.repo.read_ref_blob(self.ref, f"{self._prefix()}{entry.github_id}/{entry.name}/transcript.jsonl")
+    def read_transcript(
+        self, entry: SharedEntry, *, timeout: float | None = None, cancel: "threading.Event | None" = None
+    ) -> str | None:
+        path = f"{self._prefix()}{entry.github_id}/{entry.name}/transcript.jsonl"
+        blob = self.repo.read_ref_blob(self.ref, path)
+        if blob is None and self.repo.remote_exists():
+            # The listing fetch pulls only the small manifests (see `fetch`), so a
+            # large transcript may not be local yet — fetch the full ref now that
+            # the user has actually chosen this session, then read it. ``timeout``
+            # bounds this (potentially large) fetch; ``cancel`` lets the user stop it
+            # outright (the git process is killed, not left running).
+            self.repo.fetch_ref(f"+{self.ref}:{self.ref}", timeout=timeout, cancel=cancel)
+            blob = self.repo.read_ref_blob(self.ref, path)
+        return blob
 
     # --- writing -----------------------------------------------------------
 
@@ -132,11 +155,25 @@ class SharedSessionStore:
 
     # --- sync --------------------------------------------------------------
 
-    def fetch(self) -> bool:
-        """Pull the latest shared ref from the remote (best-effort)."""
+    def fetch(self, *, timeout: float | None = None, cancel: "threading.Event | None" = None) -> bool:
+        """Pull the latest shared ref from the remote (best-effort).
+
+        Fetches only the small manifests (a blob-size filter skips the large
+        transcripts) so listing which sessions exist is fast; the transcript of a
+        chosen session is fetched on demand by :meth:`read_transcript`. Falls back
+        to a full fetch when the remote doesn't support partial fetch. An optional
+        ``timeout`` bounds each underlying git fetch so a stalled network call on
+        bad internet can't run unbounded; ``cancel`` (an Event) stops it at once."""
         if not self.repo.remote_exists():
             return False
-        return self.repo.fetch_ref(f"+{self.ref}:{self.ref}")
+        refspec = f"+{self.ref}:{self.ref}"
+        if cancel is not None and cancel.is_set():
+            return False  # already cancelled: don't even start
+        if self.repo.fetch_ref(refspec, filter_blobs="blob:limit=16k", timeout=timeout, cancel=cancel):
+            return True
+        if cancel is not None and cancel.is_set():
+            return False  # cancelled during the filtered fetch: don't retry
+        return self.repo.fetch_ref(refspec, timeout=timeout, cancel=cancel)
 
     def _is_session_snapshot(self, commit_sha: str) -> bool:
         # A shared-session snapshot commit is parent-less (an orphan we wrote) and
@@ -169,14 +206,24 @@ class SharedSessionStore:
             return 0
 
     def fetch_throttled(self) -> None:
-        """Best-effort fetch at most once per TTL — for pollers (the dashboard)
-        that want others' newly-shared sessions without hammering the remote."""
+        """Best-effort fetch at most once per TTL, in the BACKGROUND — for pollers (the
+        dashboard) that want others' newly-shared sessions without hammering the remote
+        or blocking the request on a network round trip. Your OWN shared sessions are
+        already in the local ref, so the page renders from it immediately and a
+        teammate's newly-shared session appears on a later poll."""
         key = str(self.repo.repo)
         now = time.monotonic()
         if now - _fetch_at.get(key, 0.0) < _FETCH_TTL:
             return
-        _fetch_at[key] = now
-        self.fetch()
+        _fetch_at[key] = now  # claim the window up front so concurrent polls don't pile on
+
+        def worker() -> None:
+            try:
+                self.fetch()
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, daemon=True, name="agit-shared-fetch-bg").start()
 
     def unshare(self, github_id: str, name: str) -> PublishResult:
         """Remove one of the contributor's own shared sessions and push the
@@ -198,22 +245,34 @@ class SharedSessionStore:
     def publish(
         self, *, github_id: str, name: str, transcript: str, manifest: dict, keep: int = DEFAULT_KEEP
     ) -> PublishResult:
-        """Share one session: sync from the remote, add it, prune the
-        contributor's stale ones, and push. The local copy is always saved (so it
-        can be pushed later); the push is best-effort and reports its outcome.
+        """Share one session: add it, prune the contributor's stale ones, and push.
+        The local copy is always saved (so it can be pushed later); the push is
+        best-effort and reports its outcome.
 
-        Uses ``--force-with-lease`` against the just-fetched remote tip, so a
-        concurrent contributor's push is never clobbered — it fails cleanly and
-        the user can retry (the retry re-fetches their work first)."""
+        Push-first: build on the local tip and push optimistically, leasing against
+        the tip we last knew. This avoids a fetch round trip in the common case —
+        nobody else pushed since our last sync — so a share is a single network hop.
+        ``--force-with-lease`` still guards against clobbering a concurrent
+        contributor: a stale lease fails cleanly, and only then do we fetch their
+        work, rebuild our entry onto the new tip, and retry. Net effect: one hop
+        normally, two only on a genuine race."""
         gid, nm = slug(github_id), slug(name)
-        remote = self.repo.remote_exists()
-        if remote:
-            self.fetch()
-        old = self.repo.ref_sha(self.ref)  # remote tip we're racing against
+        if not self.repo.remote_exists():
+            self._add_session(gid, nm, transcript, manifest)
+            pruned = self.prune_own_stale(gid, keep=keep)
+            return PublishResult(remote=False, pushed=False, pruned=pruned)
+        result = self._add_and_push(gid, nm, transcript, manifest, keep)
+        if result.pushed or not _is_stale_lease(result.error):
+            return result
+        # Lost the race (or our orphan ref diverged from a remote one we'd never
+        # fetched): sync onto the current remote tip and try once more.
+        self.fetch()
+        return self._add_and_push(gid, nm, transcript, manifest, keep)
+
+    def _add_and_push(self, gid: str, nm: str, transcript: str, manifest: dict, keep: int) -> PublishResult:
+        old = self.repo.ref_sha(self.ref)  # tip we believe the remote is at
         self._add_session(gid, nm, transcript, manifest)
         pruned = self.prune_own_stale(gid, keep=keep)
-        if not remote:
-            return PublishResult(remote=False, pushed=False, pruned=pruned)
         lease = f"{self.ref}:{old}" if old else None  # None ⇒ creating the ref
         ok, err = self.repo.push_ref(f"{self.ref}:{self.ref}", force_with_lease=lease)
         return PublishResult(remote=True, pushed=ok, pruned=pruned, error="" if ok else err.strip())

@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 
@@ -118,15 +120,26 @@ class GitRepo:
         self._run(["git", "commit", "--amend", "-F", "-"], input_text=message)
         return self.short_sha("HEAD")
 
-    def cover_commit(self, message: str, *, first_parent: str, second_parent: str) -> str:
-        """Create a merge-shaped *cover* commit: the tree of ``second_parent``
-        with parents ``(first_parent, second_parent)`` — the same shape as a
-        GitHub PR merge commit. Used to attach aGiT's message on top of
-        backend-made commits without amending them, since an amend changes
-        their hashes and breaks references already published elsewhere (#58).
-        The checked-out branch (or detached HEAD) moves to the new commit; the
-        working tree is untouched because the tree is identical to HEAD's."""
-        tree = self.rev_parse(f"{second_parent}^{{tree}}")
+    def cover_commit(self, message: str, *, first_parent: str, second_parent: str, include_staged: bool = False) -> str:
+        """Create a merge-shaped *cover* commit with parents ``(first_parent,
+        second_parent)`` — the same shape as a GitHub PR merge commit. Used to
+        attach aGiT's message on top of backend-made commits without amending
+        them, since an amend changes their hashes and breaks references already
+        published elsewhere (#58). The checked-out branch (or detached HEAD)
+        moves to the new commit.
+
+        By default the tree is ``second_parent``'s, so the cover is a pure
+        metadata commit (working tree untouched). With ``include_staged`` the
+        tree is the current index instead, folding any extra staged changes (e.g.
+        files aGiT staged on top of the backend's commits) into the cover — so the
+        cover's first-parent diff shows ALL the covered commits' changes plus the
+        staged ones as one unit, instead of a plain commit that shows only the
+        extra delta and hides the covered changes behind its single parent."""
+        tree = (
+            self._run(["git", "write-tree"]).stdout.strip()
+            if include_staged
+            else self.rev_parse(f"{second_parent}^{{tree}}")
+        )
         sha = self._run(
             ["git", "commit-tree", tree, "-p", first_parent, "-p", second_parent],
             input_text=message,
@@ -194,6 +207,11 @@ class GitRepo:
         # Create a worktree detached at ``base`` with no branch of its own; a turn
         # branch is created lazily on the first commit (see _ensure_turn_branch).
         self._run(["git", "worktree", "add", "--detach", path, base])
+
+    def worktree_move(self, old_path: str, new_path: str) -> None:
+        # Move a worktree's directory and update git's admin record. The worktree
+        # must not be in use (no process with its cwd there) or git refuses.
+        self._run(["git", "worktree", "move", old_path, new_path])
 
     def worktree_remove(self, path: str, *, force: bool = False) -> None:
         command = ["git", "worktree", "remove"]
@@ -388,10 +406,85 @@ class GitRepo:
     def remote_exists(self, name: str = "origin") -> bool:
         return name in self._run(["git", "remote"], check=False).stdout.split()
 
-    def fetch_ref(self, refspec: str, *, remote: str = "origin") -> bool:
+    def fetch_ref(
+        self,
+        refspec: str,
+        *,
+        remote: str = "origin",
+        filter_blobs: str | None = None,
+        timeout: float | None = None,
+        cancel: "threading.Event | None" = None,
+    ) -> bool:
         """Fetch a single refspec (e.g. ``+refs/agit/x:refs/agit/x``). Returns
-        True on success; False on any failure (offline, no such ref yet, …)."""
-        return self._run(["git", "fetch", remote, refspec], check=False).returncode == 0
+        True on success; False on any failure (offline, no such ref yet, …).
+
+        With ``filter_blobs`` (e.g. ``blob:limit=16k``) the fetch skips large blobs
+        — used to pull a shared-session ref's small manifests for listing without
+        downloading every transcript; the transcripts are fetched on demand. The
+        one-off partial fetch's persisted filter is then dropped so the user's
+        normal ``git fetch`` stays full.
+
+        ``cancel`` (a ``threading.Event``) stops the fetch the moment it is set —
+        the git subprocess is killed, not merely abandoned — so a user who cancels
+        (or exits) truly stops the network work rather than leaving it running."""
+        cmd = ["git", "fetch"]
+        if filter_blobs:
+            cmd.append(f"--filter={filter_blobs}")
+        cmd += [remote, refspec]
+        # Never block on an interactive credential prompt — these ref syncs run in
+        # the background (and on the exit path), where a prompt would hang with no
+        # way to answer. Cached creds / credential helpers still work. The timeout
+        # bounds a stalled fetch; cancel kills it immediately on user request.
+        ok = self._run_bounded(cmd, env={"GIT_TERMINAL_PROMPT": "0"}, timeout=timeout, cancel=cancel) == 0
+        if filter_blobs and ok:
+            # Don't turn the user's remote into a permanently-filtered clone.
+            self._run(["git", "config", "--unset", f"remote.{remote}.partialclonefilter"], check=False)
+        return ok
+
+    def _run_bounded(
+        self,
+        command: list[str],
+        *,
+        timeout: float | None = None,
+        cancel: "threading.Event | None" = None,
+        env: dict[str, str] | None = None,
+    ) -> int:
+        """Run *command* as a subprocess that can be stopped early — when *cancel*
+        (a ``threading.Event``-like object with ``is_set()``) is set, or *timeout*
+        elapses. The process is terminated (then killed) so the network work really
+        stops. Returns the exit code, or 124 when cancelled/timed out."""
+        # Discard output: callers only use the exit code, and piping a long fetch's
+        # progress (stderr) without reading it would fill the pipe buffer and wedge
+        # the process — the opposite of "bounded".
+        process = subprocess.Popen(
+            command,
+            cwd=self.repo,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env={**os.environ, **env} if env else None,
+        )
+        deadline = time.monotonic() + timeout if timeout is not None else None
+        while True:
+            try:
+                process.wait(timeout=0.1)
+                return process.returncode
+            except subprocess.TimeoutExpired:
+                pass
+            stop = (cancel is not None and cancel.is_set()) or (deadline is not None and time.monotonic() > deadline)
+            if stop:
+                self._terminate_process(process)
+                return 124
+
+    @staticmethod
+    def _terminate_process(process: "subprocess.Popen") -> None:
+        try:
+            process.terminate()
+            process.wait(timeout=2)
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
 
     def push_ref(
         self, refspec: str, *, remote: str = "origin", force_with_lease: str | None = None
@@ -402,7 +495,10 @@ class GitRepo:
         if force_with_lease is not None:
             command.append(f"--force-with-lease={force_with_lease}" if force_with_lease else "--force-with-lease")
         command += [remote, refspec]
-        result = self._run(command, check=False)
+        # GIT_TERMINAL_PROMPT=0: fail fast on a missing credential rather than
+        # blocking on a prompt no one can answer (e.g. the synchronous exit-path
+        # share). Cached creds / credential helpers are unaffected.
+        result = self._run(command, check=False, env={"GIT_TERMINAL_PROMPT": "0"})
         return result.returncode == 0, result.stderr
 
     def unreachable_commits(self) -> list[str]:
@@ -471,7 +567,26 @@ class GitRepo:
         input_text: str | None = None,
         check: bool = True,
         env: dict[str, str] | None = None,
+        timeout: float | None = None,
     ) -> subprocess.CompletedProcess[str]:
+        # A timeout bounds a network git call (fetch/push over bad internet): on
+        # expiry subprocess.run kills the process and raises, which we surface as a
+        # non-zero result so the caller treats it as a plain failure (e.g. offline).
+        if timeout is not None:
+            try:
+                return subprocess.run(
+                    command,
+                    cwd=self.repo,
+                    input=input_text,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                    env={**os.environ, **env} if env else None,
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired:
+                return subprocess.CompletedProcess(command, returncode=124, stdout="", stderr="timed out")
         process = subprocess.run(
             command,
             cwd=self.repo,

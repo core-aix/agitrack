@@ -27,6 +27,14 @@ def _manifest(name, *, session_id, updated, model="claude-opus-4-8"):
     return {"github_id": "alice", "name": name, "session_id": session_id, "updated": updated, "model": model}
 
 
+def _drain_shared_resume(runner):
+    # The transcript fetch + import run on a worker thread; the resume completes on
+    # the main loop's _service_shared_resume(). Drain both for the test.
+    if runner._shared_resume_thread is not None:
+        runner._shared_resume_thread.join(timeout=10)
+    runner._service_shared_resume()
+
+
 # --- redaction --------------------------------------------------------------
 
 
@@ -86,6 +94,165 @@ def test_share_lists_and_reads_back(tmp_path):
     assert [e.display for e in entries] == ["alice/fix-parser"]
     assert store.read_transcript(entries[0]) == "hello"
     assert entries[0].manifest["session_id"] == "id1"
+
+
+def test_fetch_lists_with_filter_and_reads_transcript_on_demand():
+    # Listing fetches only the small manifests (blob filter); a chosen session's
+    # large transcript is fetched on demand the first time it's read.
+    fetches: list = []
+    blobs = {"abc/me/sess/manifest.json": '{"updated": 1}'}  # transcript not local yet
+
+    class FakeRepo:
+        def remote_exists(self, name="origin"):
+            return True
+
+        def root_commit(self):
+            return "abc"
+
+        def read_tree_paths(self, ref):
+            return {"abc/me/sess/manifest.json": "m", "abc/me/sess/transcript.jsonl": "t"}
+
+        def read_ref_blob(self, ref, path):
+            return blobs.get(path)
+
+        def fetch_ref(self, refspec, *, remote="origin", filter_blobs=None, timeout=None, cancel=None):
+            fetches.append(filter_blobs)
+            if filter_blobs is None:  # the on-demand full fetch brings the transcript in
+                blobs["abc/me/sess/transcript.jsonl"] = "the transcript"
+            return True
+
+    store = SharedSessionStore(FakeRepo())  # type: ignore[arg-type]
+    assert store.fetch() is True
+    assert fetches == ["blob:limit=16k"]  # listing used the size filter
+    entry = store.entries()[0]
+    assert store.read_transcript(entry) == "the transcript"
+    assert None in fetches  # a full fetch was triggered on demand for the transcript
+
+
+def test_fetch_passes_timeout_through_to_git(tmp_path):
+    # A bad-internet bound: store.fetch(timeout=...) reaches the underlying git
+    # fetch so a stalled network call can't run unbounded.
+    seen: list = []
+
+    class FakeRepo:
+        repo = tmp_path
+
+        def remote_exists(self, name="origin"):
+            return True
+
+        def fetch_ref(self, refspec, *, remote="origin", filter_blobs=None, timeout=None, cancel=None):
+            seen.append(timeout)
+            return True
+
+    store = SharedSessionStore(FakeRepo())  # type: ignore[arg-type]
+    assert store.fetch(timeout=12.0) is True
+    assert seen == [12.0]
+
+
+def test_run_bounded_cancel_kills_process_promptly(tmp_path):
+    # A set cancel Event must terminate the subprocess at once (not wait it out),
+    # so a user who cancels truly stops the work.
+    import threading
+    import time
+
+    repo = _init_repo(tmp_path)
+    cancel = threading.Event()
+    cancel.set()  # already cancelled before we start
+    started = time.monotonic()
+    rc = repo._run_bounded(["sleep", "10"], cancel=cancel)
+    assert rc == 124
+    assert time.monotonic() - started < 2.0  # killed promptly, did not sleep 10s
+
+
+def test_run_bounded_timeout_kills_process(tmp_path):
+    import time
+
+    repo = _init_repo(tmp_path)
+    started = time.monotonic()
+    rc = repo._run_bounded(["sleep", "10"], timeout=0.3)
+    assert rc == 124
+    assert time.monotonic() - started < 2.0
+
+
+def test_fetch_does_not_start_when_already_cancelled(tmp_path):
+    # "Don't let anything run if the user has already confirmed to cancel."
+    import threading
+
+    seen: list = []
+
+    class FakeRepo:
+        repo = tmp_path
+
+        def remote_exists(self, name="origin"):
+            return True
+
+        def fetch_ref(self, *a, **k):
+            seen.append(1)
+            return True
+
+    store = SharedSessionStore(FakeRepo())  # type: ignore[arg-type]
+    cancel = threading.Event()
+    cancel.set()
+    assert store.fetch(cancel=cancel) is False
+    assert seen == []  # never even started a git fetch
+
+
+def test_read_transcript_passes_timeout_to_on_demand_fetch(tmp_path):
+    # The full-transcript fetch (slow, can be large) must be bounded so it can't
+    # wait forever — read_transcript threads its timeout into the on-demand fetch.
+    seen: list = []
+
+    class FakeRepo:
+        repo = tmp_path
+
+        def root_commit(self):
+            return "abc"
+
+        def read_ref_blob(self, ref, path):
+            return None if not seen else "the transcript"  # missing until the fetch runs
+
+        def remote_exists(self, name="origin"):
+            return True
+
+        def fetch_ref(self, refspec, *, remote="origin", filter_blobs=None, timeout=None, cancel=None):
+            seen.append(timeout)
+            return True
+
+    from agit.sessions import SharedEntry
+
+    store = SharedSessionStore(FakeRepo())  # type: ignore[arg-type]
+    entry = SharedEntry(github_id="me", name="sess", manifest={})
+    assert store.read_transcript(entry, timeout=120.0) == "the transcript"
+    assert seen == [120.0]
+
+
+def test_finalize_on_exit_cancels_inflight_fetches(tmp_path, monkeypatch):
+    # Choosing to exit must stop any unfinished session fetch immediately.
+    backend = _StubBackend()
+    runner, _repo = _runner_with_store(tmp_path, monkeypatch, backend)
+    cancelled = []
+    runner._cancel_inflight_shared_fetches = lambda: cancelled.append(True)
+    # Neutralise the rest of the (heavy) finalize so the test stays a unit.
+    runner.sessions = [runner.active]
+    runner._commit_latest_turn_sync = lambda: None
+    runner._auto_share_on_exit = lambda: None
+    runner._finalize_summary_then_integrate_on_exit = lambda: None
+    runner._delete_orphan_merged_branches = lambda: None
+    runner._sweep_orphan_shared_sessions = lambda **k: None
+
+    runner._finalize_pending_work()
+
+    assert cancelled == [True]
+
+
+def test_fetch_shared_with_cancel_fast_path_when_no_remote(tmp_path, monkeypatch):
+    # No remote ⇒ nothing to fetch over the network: the helper runs the cheap
+    # local call inline (no thread, no interactive wait) and reports completion.
+    backend = _StubBackend()
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
+    store = runner._shared_store()
+    assert store.repo.remote_exists() is False
+    assert runner._fetch_shared_with_cancel(store, "Fetching…") is True
 
 
 def test_shared_ref_is_history_free_and_keeps_only_latest(tmp_path):
@@ -189,6 +356,84 @@ def test_publish_without_remote_saves_locally(tmp_path):
     assert result.remote is False and result.pushed is False
 
 
+class _PublishFakeRepo:
+    """Records fetch/push calls so the push-first publish path can be asserted.
+
+    ``push_results`` is consumed one per push attempt (``(ok, stderr)``)."""
+
+    def __init__(self, push_results):
+        self.push_results = list(push_results)
+        self.calls: list = []
+
+    def remote_exists(self, name="origin"):
+        return True
+
+    def root_commit(self):
+        return "fp"
+
+    def ref_sha(self, ref):
+        return "localtip"
+
+    def read_tree_paths(self, ref):
+        return {}
+
+    def write_blob(self, content):
+        return "blob"
+
+    def write_tree_from(self, entries):
+        return "tree"
+
+    def commit_tree_orphan(self, tree, message):
+        return "commit"
+
+    def update_ref(self, ref, sha):
+        pass
+
+    def delete_orphaned_objects(self, old):
+        return 0
+
+    def fetch_ref(self, refspec, *, remote="origin", filter_blobs=None, timeout=None, cancel=None):
+        self.calls.append("fetch")
+        return True
+
+    def push_ref(self, refspec, *, remote="origin", force_with_lease=None):
+        self.calls.append("push")
+        return self.push_results.pop(0)
+
+
+def test_publish_pushes_first_without_a_fetch_in_the_common_case(tmp_path):
+    # Push-first: when the optimistic push lands, publish makes a single network
+    # hop — no pre-fetch — so a share is fast on a good connection.
+    repo = _PublishFakeRepo([(True, "")])
+    result = SharedSessionStore(repo).publish(  # type: ignore[arg-type]
+        github_id="a", name="s", transcript="t", manifest=_manifest("s", session_id="id", updated=1)
+    )
+    assert result.pushed is True
+    assert repo.calls == ["push"]  # no fetch in the common case
+
+
+def test_publish_retries_after_stale_lease(tmp_path):
+    # A concurrent contributor moved the remote: the optimistic push is rejected
+    # with a stale lease, so publish syncs and retries exactly once.
+    repo = _PublishFakeRepo([(False, "! [rejected] shared (stale info)"), (True, "")])
+    result = SharedSessionStore(repo).publish(  # type: ignore[arg-type]
+        github_id="a", name="s", transcript="t", manifest=_manifest("s", session_id="id", updated=1)
+    )
+    assert result.pushed is True
+    assert repo.calls == ["push", "fetch", "push"]  # push-first, sync, retry
+
+
+def test_publish_does_not_retry_on_auth_failure(tmp_path):
+    # A non-race failure (auth) must fail fast: no fetch, no second push, so a
+    # broken credential can't spin the publish into a retry loop.
+    repo = _PublishFakeRepo([(False, "fatal: Authentication failed for 'origin'")])
+    result = SharedSessionStore(repo).publish(  # type: ignore[arg-type]
+        github_id="a", name="s", transcript="t", manifest=_manifest("s", session_id="id", updated=1)
+    )
+    assert result.pushed is False
+    assert repo.calls == ["push"]  # failed fast — no fetch/retry
+
+
 def test_unshare_removes_only_that_entry(tmp_path):
     store = SharedSessionStore(_init_repo(tmp_path))
     store.publish(github_id="alice", name="keep", transcript="k", manifest=_manifest("keep", session_id="k", updated=1))
@@ -284,12 +529,43 @@ def test_resume_shared_prompts_to_pull_when_local_exists(tmp_path, monkeypatch):
     )
     runner.sessions = []  # not live
     runner._resume_conversation = lambda name, sid, **k: None
-    # First popup selects the session; second is the local-vs-shared choice → Pull.
+    runner._prompt_session_name = lambda title, *, default: default  # accept the local name (#71)
+    # First popup selects the session; second is the conflict choice → option[0] = Replace.
     runner._select_popup = lambda title, options: options[0]
 
     runner._resume_shared_session_menu()
+    _drain_shared_resume(runner)
 
-    assert backend.imported == ("sid-x", "bob's chat", True)  # imported with overwrite (pulled latest)
+    assert backend.imported == ("sid-x", "bob's chat", True)  # imported with overwrite (replaced local)
+
+
+def test_resume_shared_keep_both_imports_under_new_id(tmp_path, monkeypatch):
+    # When a local copy exists, "Keep both" re-imports the shared conversation
+    # under a fresh id and resumes THAT, leaving the original untouched.
+    from agit.config import AgitState
+
+    backend = _StubBackend(transcript="bob's chat", has_local=True)
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
+    SharedSessionStore(repo).publish(
+        github_id="me",
+        name="sess",
+        transcript="bob's chat",
+        manifest={"github_id": "me", "name": "sess", "session_id": "sid-x", "updated": 1},
+    )
+    runner.sessions = []
+    resumed: list = []
+    runner._resume_conversation = lambda name, sid, **k: resumed.append((name, sid))
+    runner._prompt_session_name = lambda title, *, default: default
+    # First popup: pick the entry. Second (conflict): pick "Keep both".
+    picks = iter([lambda opts: opts[0], lambda opts: next(o for o in opts if o.startswith("Keep both"))])
+    runner._select_popup = lambda title, options: next(picks)(options)
+
+    runner._resume_shared_session_menu()
+    _drain_shared_resume(runner)
+
+    assert backend.imported_as_id == "claude-copy-id"  # re-imported under the fresh id
+    assert resumed == [("sess", "claude-copy-id")]  # and resumed that copy
+    assert AgitState(repo.repo).shared_origin_name("claude-copy-id") == "sess"
 
 
 # --- auto-share opt-in state ------------------------------------------------
@@ -306,6 +582,50 @@ def test_state_auto_share_opt_in(tmp_path):
     state.set_auto_share("sid", False)
     assert state.auto_share_enabled("sid") is False
     assert state.auto_share_enabled(None) is False
+
+
+def test_state_shared_session_lineage_chain(tmp_path):
+    from agit.config import AgitState
+
+    state = AgitState(tmp_path)
+    assert state.session_lineage("a") == ["a"]
+    # Two successive resume drifts: a -> b -> c.
+    state.add_shared_session_alias("b", "a")
+    state.add_shared_session_alias("c", "b")
+    assert state.session_lineage("c") == ["c", "b", "a"]
+    assert state.session_lineage("b") == ["b", "a"]
+    # Persists to base state and survives reload.
+    assert AgitState(tmp_path).session_lineage("c") == ["c", "b", "a"]
+    # Defensive: a corrupt self-referential alias never loops.
+    state.add_shared_session_alias("d", "d")  # ignored (new == previous)
+    assert state.session_lineage("d") == ["d"]
+
+
+def test_runner_recognises_shared_session_after_id_drift(tmp_path):
+    # #55: a session shared under id "old" that the backend resumes as "new" must
+    # still be marked shared and keep auto-sharing, via the recorded lineage.
+    from proxy_helpers import make_runner
+    from agit.config import AgitState
+
+    (tmp_path / "repo").mkdir()
+    repo = _init_repo(tmp_path / "repo")
+    runner = make_runner()
+    runner.base_repo = repo
+    runner._debug = lambda *a, **k: None
+    base_state = AgitState(repo.repo)
+    runner._user_state = lambda: AgitState(repo.repo)
+    runner._my_shared_session_ids = lambda: {"old"}
+
+    # Before drift: "old" is recognised directly.
+    assert runner._session_is_shared("old", {"old"}) is True
+    # Auto-share opted in under "old".
+    base_state.set_auto_share("old", True)
+
+    # The backend forks "old" -> "new" on resume.
+    runner._record_shared_alias_on_drift("old", "new")
+
+    assert runner._session_is_shared("new", runner._my_shared_session_ids()) is True
+    assert runner._session_auto_shared("new") is True
 
 
 # --- Claude transcript export / import --------------------------------------
@@ -334,6 +654,26 @@ def test_claude_export_and_import_retargets_cwd(tmp_path, monkeypatch):
     (claude._project_dir(dst) / "sid.jsonl").write_text("LOCAL")
     assert claude.import_shared_session(dst, "sid", raw)
     assert (claude._project_dir(dst) / "sid.jsonl").read_text() == "LOCAL"
+
+
+def test_claude_import_as_id_keeps_both_under_a_new_id(tmp_path, monkeypatch):
+    # "Keep both": re-import a shared conversation under a fresh id so it lives
+    # alongside the existing local copy of the same id.
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    from agit.transcripts import claude
+
+    dst = tmp_path / "repo"
+    dst.mkdir()
+    raw = '{"type":"user","sessionId":"sid","cwd":"/old"}\n{"type":"assistant","sessionId":"sid"}\n'
+    claude.import_shared_session(dst, "sid", raw)  # the original copy
+    assert claude.import_shared_session(dst, "sid", raw, as_id="newid")
+
+    # Both copies exist; the new one is re-id'd and cwd-retargeted.
+    assert claude.session_belongs_to_repo(dst, "sid")
+    assert claude.session_belongs_to_repo(dst, "newid")
+    copy = (claude._project_dir(dst) / "newid.jsonl").read_text()
+    assert '"sessionId": "newid"' in copy and '"sid"' not in copy
+    assert str(dst.resolve()) in copy
 
 
 # --- OpenCode transcript export / import ------------------------------------
@@ -389,6 +729,25 @@ def test_opencode_import_runs_cli_and_checks_success(monkeypatch, tmp_path):
     assert captured["content"] == '{"info":{"id":"ses_1"}}'
     # The temp file is cleaned up afterwards.
     assert not Path(captured["args"][-1]).exists()
+
+
+def test_opencode_import_as_id_reids_for_keep_both(monkeypatch, tmp_path):
+    # "Keep both" for OpenCode: every occurrence of the old id token is swapped
+    # for the new one before import, so it lands as a separate session.
+    from agit.transcripts import opencode
+
+    captured: dict[str, object] = {}
+
+    def fake_run(repo, args):
+        captured["content"] = Path(args[-1]).read_text()
+        return ("Imported session: ses_new\n", 0)
+
+    monkeypatch.setattr(opencode, "_run_opencode_pty", fake_run)
+    raw = '{"info":{"id":"ses_old"},"messages":[{"sessionID":"ses_old"}]}'
+    assert opencode.import_shared_session(tmp_path, "ses_old", raw, as_id="ses_new") is True
+    # The transcript handed to `opencode import` is fully re-id'd.
+    assert "ses_old" not in captured["content"]
+    assert captured["content"].count("ses_new") == 2
 
 
 def test_opencode_import_failure_paths(monkeypatch, tmp_path):
@@ -465,9 +824,13 @@ class _StubBackend:
     def has_local_session(self, repo, session_id):
         return self._has_local
 
-    def import_shared_session(self, repo, session_id, transcript, *, overwrite=False):
+    def import_shared_session(self, repo, session_id, transcript, *, overwrite=False, as_id=None):
         self.imported = (session_id, transcript, overwrite)
+        self.imported_as_id = as_id
         return True
+
+    def new_import_id(self):
+        return "claude-copy-id"
 
 
 def _runner_with_store(tmp_path, monkeypatch, backend):
@@ -488,6 +851,44 @@ def _runner_with_store(tmp_path, monkeypatch, backend):
     runner.messages = []
     runner._set_message = lambda msg, **k: runner.messages.append(msg)
     return runner, repo
+
+
+def test_warm_share_login_resolves_when_sharing_reachable(tmp_path):
+    # Startup warms the login cache so auto-share never shells out mid-share.
+    from types import SimpleNamespace
+    from proxy_helpers import make_runner
+
+    runner = make_runner()
+    runner._debug = lambda *a, **k: None
+    runner.backend = SimpleNamespace(supports_session_sharing=True)
+    runner.global_config = SimpleNamespace(github_login="")
+    runner.base_repo = SimpleNamespace(remote_exists=lambda: True)
+    resolved: list = []
+    runner._cached_or_resolve_login = lambda: resolved.append(True) or "tester"
+
+    runner._warm_share_login()
+    assert resolved == [True]
+
+
+def test_warm_share_login_skips_when_no_remote_or_already_cached(tmp_path):
+    from types import SimpleNamespace
+    from proxy_helpers import make_runner
+
+    runner = make_runner()
+    runner._debug = lambda *a, **k: None
+    runner.backend = SimpleNamespace(supports_session_sharing=True)
+    resolved: list = []
+    runner._cached_or_resolve_login = lambda: resolved.append(True) or "tester"
+
+    # No remote ⇒ sharing can't reach anyone, so don't spend a `gh` call.
+    runner.global_config = SimpleNamespace(github_login="")
+    runner.base_repo = SimpleNamespace(remote_exists=lambda: False)
+    runner._warm_share_login()
+    # Already cached ⇒ nothing to resolve.
+    runner.global_config = SimpleNamespace(github_login="tester")
+    runner.base_repo = SimpleNamespace(remote_exists=lambda: True)
+    runner._warm_share_login()
+    assert resolved == []
 
 
 def test_runner_share_session_publishes_and_redacts(tmp_path, monkeypatch):
@@ -519,6 +920,8 @@ def test_runner_share_unsupported_backend_shows_message(tmp_path, monkeypatch):
 
 
 def test_runner_resume_shared_imports_and_resumes(tmp_path, monkeypatch):
+    from agit.config import AgitState
+
     backend = _StubBackend()
     runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
     # Seed a shared session as if a teammate published it.
@@ -531,13 +934,17 @@ def test_runner_resume_shared_imports_and_resumes(tmp_path, monkeypatch):
     resumed = []
     runner._resume_conversation = lambda name, sid, *, backend=None: resumed.append((name, sid, backend))
     runner._select_popup = lambda title, options: options[0]  # pick the first (only) entry
+    runner._prompt_session_name = lambda title, *, default: default  # accept the offered local name (#71)
 
     runner._resume_shared_session_menu()
+    _drain_shared_resume(runner)
 
     assert backend.imported == ("bob-sid", "bob's chat", False)  # imported, no overwrite (no local copy)
-    # Resumed under <id>-<name>, pinned to the entry's backend (defaults to the
-    # active backend when the manifest doesn't record one).
-    assert resumed == [("bob-cool-fix", "bob-sid", "claude")]
+    # Resumed under the original share name (no sharer prefix, #55), pinned to the
+    # entry's backend (defaults to the active backend when the manifest omits one).
+    assert resumed == [("cool-fix", "bob-sid", "claude")]
+    # The original share name is remembered for round-trip re-sharing.
+    assert AgitState(repo.repo).shared_origin_name("bob-sid") == "cool-fix"
 
 
 def test_runner_resume_shared_crosses_backends(tmp_path, monkeypatch):
@@ -565,13 +972,15 @@ def test_runner_resume_shared_crosses_backends(tmp_path, monkeypatch):
     resumed: list = []
     runner._resume_conversation = lambda name, sid, *, backend=None: resumed.append((name, sid, backend))
     runner._select_popup = lambda title, options: options[0]
+    runner._prompt_session_name = lambda title, *, default: default  # accept the offered local name (#71)
 
     runner._resume_shared_session_menu()
+    _drain_shared_resume(runner)
 
     assert built == ["opencode"]  # a fresh OpenCode agent was constructed
     assert oc_agent.imported == ("ses_bob", '{"info":{"id":"ses_bob"}}', False)  # OpenCode did the import
     assert active.imported is None  # the active Claude agent was NOT used
-    assert resumed == [("bob-oc-fix", "ses_bob", "opencode")]  # resumed pinned to opencode
+    assert resumed == [("oc-fix", "ses_bob", "opencode")]  # resumed under the share name, pinned to opencode
 
 
 def test_runner_auto_share_pushes_on_change_only(tmp_path, monkeypatch):
@@ -604,6 +1013,159 @@ def test_runner_auto_share_pushes_on_change_only(tmp_path, monkeypatch):
     monkeypatch.setattr("time.time", lambda: 10**10)  # would change `updated` IF it pushed
     fire_commit()
     assert SharedSessionStore(repo).entries()[0].manifest["updated"] == last_updated
+
+
+def test_auto_share_on_exit_pushes_new_conversation(tmp_path, monkeypatch):
+    # Quitting right after a turn (before the live, commit-fired auto-share thread
+    # has pushed) must still share the latest conversation: the exit path pushes
+    # synchronously so the final turns are not lost.
+    backend = _StubBackend(transcript="turn one\nturn two")
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
+    runner.state.set_auto_share("sid-123", True)
+    runner._sessions_with_activity.add(runner.state.session_id)  # a turn happened this run
+
+    runner._auto_share_on_exit()
+
+    store = SharedSessionStore(repo)
+    assert store.read_transcript(store.entries()[0]) == "turn one\nturn two"
+
+
+def test_auto_share_on_exit_skips_when_no_activity_this_run(tmp_path, monkeypatch):
+    # Resuming an auto-shared session and quitting without typing anything must NOT
+    # re-share: no committed turn this run ⇒ no push, no "Sharing…" message, instant
+    # exit. This is robust to Claude's resume id-churn (which would otherwise make a
+    # transcript-digest comparison see a spurious change).
+    backend = _StubBackend(transcript="prior conversation, untouched")
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
+    runner.state.set_auto_share("sid-123", True)
+    # No activity recorded this run (the user only resumed and quit).
+
+    runner._auto_share_on_exit()
+
+    assert SharedSessionStore(repo).entries() == []  # untouched ⇒ no share
+    assert not any("before exit" in m for m in runner.messages)
+
+
+def test_auto_share_on_exit_skipped_when_not_auto_shared(tmp_path, monkeypatch):
+    backend = _StubBackend(transcript="private work")
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
+    runner._sessions_with_activity.add(runner.state.session_id)  # had activity, but not shared
+    # auto-share NOT enabled for this session.
+
+    runner._auto_share_on_exit()
+
+    assert SharedSessionStore(repo).entries() == []  # nothing pushed on exit
+
+
+def test_auto_share_on_exit_no_push_when_already_shared(tmp_path, monkeypatch):
+    # A session that had a turn this run but whose content was already pushed (live)
+    # is a no-op on exit — the content-hash gate avoids a redundant final push.
+    backend = _StubBackend(transcript="all caught up")
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
+    runner.state.set_auto_share("sid-123", True)
+    runner._sessions_with_activity.add(runner.state.session_id)
+
+    runner._auto_share_on_exit()  # first push
+    last_updated = SharedSessionStore(repo).entries()[0].manifest["updated"]
+
+    monkeypatch.setattr("time.time", lambda: 10**10)  # would bump `updated` IF it pushed
+    runner._auto_share_on_exit()  # unchanged ⇒ no push
+
+    assert SharedSessionStore(repo).entries()[0].manifest["updated"] == last_updated
+
+
+def test_auto_share_on_exit_times_out_without_hanging(tmp_path, monkeypatch):
+    # A stalled push (offline / auth / unreachable remote) must never hang exit:
+    # the push is bounded by EXIT_SHARE_TIMEOUT, after which exit continues with a
+    # warning.
+    import threading
+    import time as _time
+
+    backend = _StubBackend(transcript="brand new turns")
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
+    runner.state.set_auto_share("sid-123", True)
+    runner._sessions_with_activity.add(runner.state.session_id)
+    runner.EXIT_SHARE_TIMEOUT = 0.2
+
+    started = threading.Event()
+
+    class _HangStore:
+        def entries(self):  # consulted by the no-edits gate; nothing published yet
+            return []
+
+        def publish(self, **kwargs):
+            started.set()
+            threading.Event().wait(5)  # block well past the timeout
+
+    runner._shared_store = lambda: _HangStore()
+
+    t0 = _time.monotonic()
+    runner._auto_share_on_exit()
+    elapsed = _time.monotonic() - t0
+
+    assert started.is_set()  # the push was attempted
+    assert elapsed < 2.0  # returned promptly — did not hang on the stalled push
+    assert any("timed out" in m for m in runner.messages)
+
+
+def test_auto_share_on_exit_warns_on_push_failure(tmp_path, monkeypatch):
+    # A remote that exists but rejects the push: warn and continue (don't hang,
+    # don't crash). Simulated with a store whose publish reports a failed push.
+    from agit.sessions.store import PublishResult
+
+    backend = _StubBackend(transcript="unpushed turns")
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
+    runner.state.set_auto_share("sid-123", True)
+    runner._sessions_with_activity.add(runner.state.session_id)
+
+    class _FailStore:
+        def entries(self):
+            return []
+
+        def publish(self, **kwargs):
+            return PublishResult(remote=True, pushed=False, error="rejected")
+
+    runner._shared_store = lambda: _FailStore()
+
+    runner._auto_share_on_exit()
+
+    assert any("push failed" in m for m in runner.messages)
+
+
+def test_finalize_on_exit_invokes_auto_share(tmp_path, monkeypatch):
+    # The exit finalize wires the synchronous auto-share in for every session.
+    backend = _StubBackend()
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
+    called = []
+    runner._auto_share_on_exit = lambda: called.append(True)
+    # Neutralise the rest of the (heavy) finalize so the test stays a unit.
+    runner.sessions = [runner.active]
+    runner._commit_latest_turn_sync = lambda: None
+    runner._finalize_summary_then_integrate_on_exit = lambda: None
+    runner._delete_orphan_merged_branches = lambda: None
+    runner._sweep_orphan_shared_sessions = lambda **k: None
+
+    runner._finalize_pending_work()
+
+    assert called == [True]
+
+
+def test_reshare_uses_origin_name_so_round_trip_updates_same_entry(tmp_path, monkeypatch):
+    # A session imported from another machine re-shares under its ORIGINAL share
+    # name, so sharing back and forth keeps updating the SAME entry instead of
+    # prepending the sharer id (and growing the name) on every round-trip (#55).
+    backend = _StubBackend(transcript="resumed work")
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
+    runner.state.set_shared_origin_name("sid-123", "feature")  # remembered when resumed
+    runner.name = "feature-2"  # local name got deduped — must NOT drive the share name
+    runner.state.set_auto_share("sid-123", True)
+
+    runner._maybe_auto_share_active()
+    if runner._auto_share_thread is not None:
+        runner._auto_share_thread.join(timeout=10)
+
+    entries = SharedSessionStore(repo).entries()
+    assert [f"{e.github_id}/{e.name}" for e in entries] == ["tester/feature"]
 
 
 def test_auto_share_main_thread_does_no_heavy_work(tmp_path, monkeypatch):
@@ -812,7 +1374,7 @@ def test_opencode_agent_delegates_sharing_to_transcript_module(tmp_path, monkeyp
     monkeypatch.setattr(opencode_session, "session_transcript_size", record("size", None))
     monkeypatch.setattr(opencode_session, "has_imported_session", record("has", True))
 
-    def fake_import(repo, sid, text, *, overwrite=False):
+    def fake_import(repo, sid, text, *, overwrite=False, as_id=None):
         calls["import"] = (repo, sid, text, overwrite)
         return True
 

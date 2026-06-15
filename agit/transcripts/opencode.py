@@ -223,7 +223,9 @@ def has_imported_session(repo: Path, session_id: str) -> bool:
     return bool(session_id) and session_belongs_to_repo(repo, session_id)
 
 
-def import_shared_session(repo: Path, session_id: str, transcript: str, *, overwrite: bool = False) -> bool:
+def import_shared_session(
+    repo: Path, session_id: str, transcript: str, *, overwrite: bool = False, as_id: str | None = None
+) -> bool:
     """Install a shared session via ``opencode import`` so it can be resumed in
     ``repo`` (issue #55). OpenCode preserves the session id and retargets the
     session's directory to the import cwd, so running this with ``repo`` as cwd
@@ -231,12 +233,20 @@ def import_shared_session(repo: Path, session_id: str, transcript: str, *, overw
 
     By default an existing local copy is kept (no clobber). With ``overwrite`` —
     the "pull the latest shared version" path for syncing your own session between
-    machines — the import re-runs and replaces the local copy. Returns True when
-    the session is in place."""
+    machines — the import re-runs and replaces the local copy. With ``as_id`` the
+    conversation is re-id'd before import (every occurrence of its id token swapped
+    for the new one), so it imports as a SEPARATE local session alongside an
+    existing copy ("keep both"). Returns True when the session is in place."""
     if not session_id or not transcript:
         return False
     repo = Path(repo)
-    if not overwrite and has_imported_session(repo, session_id):
+    if as_id:
+        # The session id is a unique "ses_"-prefixed token; swapping every
+        # occurrence re-ids the whole session (info.id and message refs) so
+        # OpenCode imports it as a brand-new session.
+        transcript = transcript.replace(session_id, as_id)
+        session_id = as_id
+    elif not overwrite and has_imported_session(repo, session_id):
         return True  # already have this conversation locally — don't clobber it
     tmp_path: str | None = None
     try:

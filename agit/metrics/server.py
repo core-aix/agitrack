@@ -18,7 +18,7 @@ from typing import Any
 
 from agit.git import GitRepo
 from agit.metrics.collect import Dashboard, build_dashboard
-from agit.metrics.github import resolve_logins
+from agit.metrics.github import cached_logins
 from agit.metrics.web import aggregates_payload, format_html, log_page, shared_sessions_for
 
 DEFAULT_HOST = "127.0.0.1"
@@ -84,9 +84,10 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
         return json.dumps(payload).encode("utf-8")
 
     def _dashboard(self) -> Dashboard:
-        # resolve_logins is cached with a TTL, so frequent refreshes don't
-        # re-hit the GitHub API; it returns {} when gh is unavailable.
-        return build_dashboard(self.repo, sha_logins=resolve_logins(self.repo))
+        # cached_logins never blocks: it returns the cached GitHub identities (or {}
+        # when cold) and refreshes them in the background, so the first paint and every
+        # poll are fast. Resolved logins appear on a later poll. {} when gh is absent.
+        return build_dashboard(self.repo, sha_logins=cached_logins(self.repo))
 
     def _respond(self, content_type: str, body: bytes) -> None:
         self.send_response(200)

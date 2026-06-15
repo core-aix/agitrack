@@ -33,14 +33,23 @@ class ProxyAgent(Protocol):
         """Whether ``repo`` already holds this session locally (so resuming it would
         keep the local copy unless explicitly overwritten)."""
 
-    def import_shared_session(self, repo: Path, session_id: str, transcript: str, *, overwrite: bool = False) -> bool:
+    def import_shared_session(
+        self, repo: Path, session_id: str, transcript: str, *, overwrite: bool = False, as_id: str | None = None
+    ) -> bool:
         """Install a shared transcript so the session can be resumed in ``repo``.
-        With ``overwrite`` it replaces an existing local copy (pull-latest). Returns
-        True on success; False if unsupported."""
+        With ``overwrite`` it replaces an existing local copy (pull-latest). With
+        ``as_id`` it installs the conversation under a NEW id (the "keep both" path
+        for an id that already exists locally). Returns True on success; False if
+        unsupported."""
 
     def new_session_id(self) -> str | None:
         """A session id to start a fresh session with, or None to let the
         backend choose one that aGiT will discover afterwards."""
+
+    def new_import_id(self) -> str | None:
+        """A fresh id to re-import a shared conversation under, so it can live
+        alongside an existing local copy of the same id ("keep both"). None when
+        the backend can't re-id an imported session."""
 
     def spawn_command(self, repo: Path, *, session_id: str | None, resume: bool) -> list[str]: ...
 
@@ -56,10 +65,12 @@ class ProxyAgent(Protocol):
         from ``base_repo`` (e.g. a plain CLI run in the repo root). Returns True
         if mirrored. No-op for backends without per-directory transcript files."""
 
-    def recorded_working_dir(self, session_id: str) -> str | None:
+    def recorded_working_dir(self, session_id: str, *, since: float | None = None) -> str | None:
         """The working directory the backend most recently recorded for a session,
         or None if it doesn't record one. Used to detect a resume that drifted the
-        cwd away from the worktree it was launched in."""
+        cwd away from the worktree it was launched in. ``since`` (an epoch
+        timestamp) restricts the answer to turns recorded at or after the current
+        launch, so a stale pre-launch cwd isn't mistaken for drift."""
 
     def latest_session_id(self, repo: Path) -> str | None: ...
 
@@ -94,12 +105,19 @@ class OpenCodeProxyAgent:
     def has_local_session(self, repo: Path, session_id: str) -> bool:
         return opencode_session.has_imported_session(repo, session_id)
 
-    def import_shared_session(self, repo: Path, session_id: str, transcript: str, *, overwrite: bool = False) -> bool:
-        return opencode_session.import_shared_session(repo, session_id, transcript, overwrite=overwrite)
+    def import_shared_session(
+        self, repo: Path, session_id: str, transcript: str, *, overwrite: bool = False, as_id: str | None = None
+    ) -> bool:
+        return opencode_session.import_shared_session(repo, session_id, transcript, overwrite=overwrite, as_id=as_id)
 
     def new_session_id(self) -> str | None:
         # OpenCode assigns its own session id; aGiT discovers it after the run.
         return None
+
+    def new_import_id(self) -> str | None:
+        # OpenCode ids are "ses_"-prefixed tokens; mint one so a shared session can
+        # be re-imported alongside an existing local copy ("keep both").
+        return "ses_" + uuid.uuid4().hex
 
     def spawn_command(self, repo: Path, *, session_id: str | None, resume: bool) -> list[str]:
         command = ["opencode"]
@@ -120,7 +138,7 @@ class OpenCodeProxyAgent:
         # anywhere); there's no per-directory transcript file to link.
         return False
 
-    def recorded_working_dir(self, session_id: str) -> str | None:
+    def recorded_working_dir(self, session_id: str, *, since: float | None = None) -> str | None:
         return None  # not tracked for OpenCode
 
     def latest_session_id(self, repo: Path) -> str | None:
@@ -152,12 +170,18 @@ class ClaudeProxyAgent:
     def has_local_session(self, repo: Path, session_id: str) -> bool:
         return claude_session.has_imported_session(repo, session_id)
 
-    def import_shared_session(self, repo: Path, session_id: str, transcript: str, *, overwrite: bool = False) -> bool:
-        return claude_session.import_shared_session(repo, session_id, transcript, overwrite=overwrite)
+    def import_shared_session(
+        self, repo: Path, session_id: str, transcript: str, *, overwrite: bool = False, as_id: str | None = None
+    ) -> bool:
+        return claude_session.import_shared_session(repo, session_id, transcript, overwrite=overwrite, as_id=as_id)
 
     def new_session_id(self) -> str | None:
         # Claude accepts an explicit session id, so aGiT picks one up front and
         # knows exactly which transcript to read.
+        return str(uuid.uuid4())
+
+    def new_import_id(self) -> str | None:
+        # A fresh uuid to re-import a shared conversation under ("keep both").
         return str(uuid.uuid4())
 
     def spawn_command(self, repo: Path, *, session_id: str | None, resume: bool) -> list[str]:
@@ -176,8 +200,8 @@ class ClaudeProxyAgent:
     def mirror_to_base(self, base_repo: Path, worktree: Path, session_id: str) -> bool:
         return claude_session.link_session(session_id, worktree, base_repo)
 
-    def recorded_working_dir(self, session_id: str) -> str | None:
-        return claude_session.session_cwd(session_id)
+    def recorded_working_dir(self, session_id: str, *, since: float | None = None) -> str | None:
+        return claude_session.session_cwd(session_id, since=since)
 
     def latest_session_id(self, repo: Path) -> str | None:
         return claude_session.latest_session_id(repo)

@@ -1353,6 +1353,25 @@ def test_expired_session_notice_line_is_dropped_on_service():
     assert "beta" not in runner._session_notices
 
 
+def test_live_notice_service_does_not_request_repaint_when_unchanged():
+    # _service_session_notices runs every reactor tick. While a notice's text is
+    # unchanged it must NOT keep re-requesting a render — doing so forces a
+    # full-frame repaint at tick cadence and flickers the popup on terminals
+    # without synchronized-update support. Only a content change repaints.
+    runner = make_runner()
+    runner._set_session_notice("alpha", "aGiT is summarizing commit a1 in session 'alpha'…", seconds=30)
+    assert runner._render_pending is True  # first appearance repaints
+
+    runner._render_pending = False
+    runner._service_session_notices()  # same text, later tick
+    runner._service_session_notices()
+    assert runner._render_pending is False  # no churn while unchanged
+
+    # A new line for the session (summarizing -> created) does repaint.
+    runner._set_session_notice("alpha", "Created <aGiT> commit a1 in session 'alpha' — merged into main.")
+    assert runner._render_pending is True
+
+
 def test_all_notices_expiring_clears_the_popup():
     runner = make_runner()
     runner._set_session_notice("alpha", "alpha line", seconds=30)
@@ -1823,6 +1842,59 @@ def test_resumable_sessions_dedupes_by_id(tmp_path):
     )
 
     assert [ref.id for ref in runner._resumable_sessions()] == ["shared"]
+
+
+def test_resumable_sessions_includes_reserved_named_session_without_transcript(tmp_path):
+    # #75: a no-commit session reserves its name in the durable record, but the
+    # backend has no transcript for it (no commits, worktree emptied). It must
+    # still be offered for resume so the reserved name isn't stranded — taken yet
+    # un-resumable.
+    runner, _base = _resume_listing_runner(tmp_path, base_refs=[], worktree_sessions=[])
+    runner._agit_named_sessions = lambda: {"ghost-id": "experiment"}
+
+    refs = runner._resumable_sessions()
+
+    assert [(ref.id, ref.label) for ref in refs] == [("ghost-id", "experiment")]
+    # The very same record reserves the name, so it is both taken AND resumable.
+    assert runner._session_name_taken("experiment") is True
+
+
+def test_resumable_named_session_dated_when_it_was_named_not_epoch(tmp_path):
+    # A surfaced no-commit session must carry the time it was named, not 0.0 (which
+    # rendered as an absurd "20000d ago").
+    import time as _time
+
+    from agit.config import AgitState
+
+    runner, base = _resume_listing_runner(tmp_path, base_refs=[], worktree_sessions=[])
+    state = AgitState(base)
+    state.name_session("ghost-id", "experiment")  # stamps session_named_at
+    runner._agit_named_sessions = lambda: {"ghost-id": "experiment"}
+
+    ref = runner._resumable_sessions()[0]
+    assert ref.id == "ghost-id"
+    assert abs(ref.updated - _time.time()) < 60  # a real, recent timestamp
+    assert runner._format_age(ref.updated) in ("just now", "0m ago") or ref.updated > 0
+
+
+def test_format_age_handles_unknown_timestamp():
+    runner = make_runner(name="main")
+    assert runner._format_age(0) == "date unknown"
+    assert runner._format_age(0.0) == "date unknown"
+    assert "ago" in runner._format_age(time.time() - 7200)  # a real one still works
+
+
+def test_resumable_sessions_does_not_duplicate_named_session_with_transcript(tmp_path):
+    # When the backend still enumerates a named conversation, it appears once
+    # (the durable record must not add a second copy).
+    runner, _base = _resume_listing_runner(
+        tmp_path,
+        base_refs=[],
+        worktree_sessions=[("alpha", SessionRef("wt-alpha", 300.0))],
+    )
+    runner._agit_named_sessions = lambda: {"wt-alpha": "alpha"}
+
+    assert [ref.id for ref in runner._resumable_sessions()] == ["wt-alpha"]
 
 
 def test_named_sessions_recovers_name_from_worktree_key(tmp_path):
@@ -2917,6 +2989,363 @@ def test_resume_switches_to_already_live_conversation():
     assert "_created" not in runner.__dict__
 
 
+# --- shared-session resume gives a local name (#71) ---
+
+
+def _shared_resume_runner():
+    import types
+
+    runner = make_runner(name="main")
+    runner.sessions = []
+    runner._render = lambda: None
+    runner._set_message = lambda *a, **k: None
+    runner.base_repo = types.SimpleNamespace(repo="/repo")
+    runner._taken_session_names = lambda: set()
+    runner.__dict__["_origins"] = {}
+    runner._user_state = lambda: types.SimpleNamespace(
+        set_shared_origin_name=lambda sid, name: runner.__dict__["_origins"].__setitem__(sid, name),
+        shared_origin_name=lambda sid: runner.__dict__["_origins"].get(sid),
+    )
+    entry = types.SimpleNamespace(
+        github_id="alice",
+        name="fix-parser",
+        display="alice/fix-parser",
+        manifest={"session_id": "sid-1", "backend": "claude"},
+    )
+    store = types.SimpleNamespace(
+        repo=types.SimpleNamespace(remote_exists=lambda: False),  # no remote ⇒ fetch is inline
+        fetch=lambda **k: None,
+        entries=lambda: [entry],
+        read_transcript=lambda e, **k: "transcript-body",
+    )
+    runner._shared_store = lambda: store
+    runner._select_popup = lambda title, options: options[0]  # pick the only entry
+    runner.backend = types.SimpleNamespace(
+        name="claude",
+        has_local_session=lambda *a, **k: False,
+        import_shared_session=lambda *a, **k: True,
+    )
+    runner.__dict__["_resumed"] = []
+    runner._resume_conversation = lambda name, sid, **k: runner.__dict__["_resumed"].append((name, sid, k))
+    return runner
+
+
+def _drain_shared_resume(runner):
+    # The transcript fetch + import run on a worker thread; the resume completes on
+    # the main loop's _service_shared_resume(). Drain both for the test.
+    if runner._shared_resume_thread is not None:
+        runner._shared_resume_thread.join(timeout=10)
+    runner._service_shared_resume()
+
+
+def test_resume_shared_menu_stopped_fetch_quits_without_listing():
+    # If the user stops the listing fetch (Esc), the menu must NOT fall through to a
+    # possibly-stale previously-fetched list — it leaves the menu entirely.
+    runner = _shared_resume_runner()
+    runner._fetch_shared_with_cancel = lambda store, message: False  # user stopped it
+    picks: list = []
+    runner._select_popup = lambda *a, **k: picks.append(a) or None
+
+    runner._resume_shared_session_menu()
+
+    assert picks == []  # no session list was shown
+    assert runner._shared_resume_thread is None  # and no transcript fetch began
+
+
+def test_service_shared_resume_drops_result_when_cancelled():
+    # A cancelled (or exit-time) fetch must never complete a switch, even if its
+    # worker already left a result behind.
+    import threading
+
+    runner = _shared_resume_runner()
+    runner._shared_resume_cancel = threading.Event()
+    runner._shared_resume_cancel.set()
+    runner._shared_resume_result = {"action": "import", "name": "x", "session_id": "sid-1"}
+    runner._shared_resume_thread = None
+
+    runner._service_shared_resume()
+
+    assert runner._shared_resume_result is None  # dropped
+    assert runner.__dict__["_resumed"] == []  # no resume happened
+
+
+def test_cancel_inflight_shared_fetches_signals_and_clears():
+    import threading
+
+    runner = _shared_resume_runner()
+    event = threading.Event()
+    runner._shared_resume_cancel = event
+    runner._shared_resume_result = {"action": "import"}
+
+    runner._cancel_inflight_shared_fetches()
+
+    assert event.is_set()  # the worker is told to stop
+    assert runner._shared_resume_result is None  # and any pending result is dropped
+
+
+def _failing_resume_runner(read_transcript):
+    import types
+
+    runner = _shared_resume_runner()
+    runner._prompt_session_name = lambda *a, **k: "my-copy"
+    old = runner._shared_store()
+    failing = types.SimpleNamespace(
+        repo=old.repo, fetch=old.fetch, entries=old.entries, read_transcript=read_transcript
+    )
+    runner._shared_store = lambda: failing
+    notices: list = []
+    runner._await_keypress = lambda msg: notices.append(msg)
+    return runner, notices
+
+
+def test_shared_resume_incomplete_reports_reason_not_cancelled():
+    # A failed full-session fetch (empty transcript ⇒ incomplete) must say WHY via a
+    # persistent notice — never be reported as a "cancelled" message — and must clear
+    # all fetch state so the user can retry immediately.
+    runner, notices = _failing_resume_runner(lambda e, **k: None)
+
+    runner._resume_shared_session_menu()
+
+    assert any("Couldn't fetch" in m and "incomplete" in m for m in notices)
+    assert all("cancel" not in m.lower() for m in notices)  # a failure, not a cancel
+    assert runner.__dict__["_resumed"] == []  # nothing resumed
+    # Timers/state cleared so a retry can start at once.
+    assert runner._shared_resume_cancel is None
+    assert runner._shared_resume_result is None
+    assert runner._shared_resume_thread is None
+
+
+def test_shared_resume_fetch_error_reports_reason():
+    # A raised fetch error surfaces its reason (not a cancel) and clears state.
+    def boom(entry, **kwargs):
+        raise RuntimeError("network unreachable")
+
+    runner, notices = _failing_resume_runner(boom)
+
+    runner._resume_shared_session_menu()
+
+    assert any("Couldn't fetch" in m and "network unreachable" in m for m in notices)
+    assert all("cancel" not in m.lower() for m in notices)
+    assert runner._shared_resume_cancel is None  # cleared for an immediate retry
+
+
+def test_stdin_has_cancel_only_for_lone_esc_or_ctrl_c():
+    runner = _shared_resume_runner()
+    # Genuine cancels.
+    assert runner._stdin_has_cancel(b"\x1b") is True  # a bare Esc keypress
+    assert runner._stdin_has_cancel(b"\x03") is True  # Ctrl-C
+    assert runner._stdin_has_cancel(b"abc\x03") is True
+    # Escape SEQUENCES (begin with ESC) must NOT count as a cancel — this is the
+    # mouse-move-cancels-the-fetch bug: host mouse reporting emits these constantly.
+    assert runner._stdin_has_cancel(b"\x1b[<35;10;20M") is False  # SGR mouse move
+    assert runner._stdin_has_cancel(b"\x1b[A") is False  # up arrow
+    assert runner._stdin_has_cancel(b"\x1b[I") is False  # focus-in
+    assert runner._stdin_has_cancel(b"\x1b[200~hi\x1b[201~") is False  # bracketed paste
+    assert runner._stdin_has_cancel(b"x") is False  # ordinary key
+
+
+def test_is_real_keypress_ignores_mouse_and_focus():
+    runner = _shared_resume_runner()
+    # Mouse reports and focus events are not keystrokes.
+    assert runner._is_real_keypress(b"\x1b[<35;10;20M") is False
+    assert runner._is_real_keypress(b"\x1b[I") is False
+    assert runner._is_real_keypress(b"\x1b[<0;5;5M\x1b[O") is False
+    # Real keys (including arrows and Esc) dismiss a "press any key" notice.
+    assert runner._is_real_keypress(b"q") is True
+    assert runner._is_real_keypress(b"\r") is True
+    assert runner._is_real_keypress(b"\x1b") is True
+    assert runner._is_real_keypress(b"\x1b[A") is True  # an arrow key is still a key
+    # A mouse move bundled with a real key still counts as a key.
+    assert runner._is_real_keypress(b"\x1b[<35;1;1Mx") is True
+
+
+def test_abort_shared_resume_clears_token_for_retry():
+    import threading
+
+    runner = _shared_resume_runner()
+    cancel = threading.Event()
+    runner._shared_resume_cancel = cancel
+    runner._shared_resume_result = {"action": "new"}
+    runner._shared_resume_thread = object()
+
+    runner._abort_shared_resume(cancel)
+
+    assert cancel.is_set()  # the in-flight worker/git fetch is told to stop
+    assert runner._shared_resume_cancel is None  # no token lingers to block a retry
+    assert runner._shared_resume_result is None
+    assert runner._shared_resume_thread is None
+
+
+def test_shared_resume_prompts_for_local_name():
+    runner = _shared_resume_runner()
+    # The default offered to the prompt is the original share name (deduped, no
+    # sharer prefix); the user accepts a local name of their own.
+    seen = {}
+
+    def fake_prompt(title, *, default):
+        seen["default"] = default
+        return "my-copy"
+
+    runner._prompt_session_name = fake_prompt
+
+    runner._resume_shared_session_menu()
+    _drain_shared_resume(runner)
+
+    assert seen["default"] == "fix-parser"
+    assert runner.__dict__["_resumed"] == [("my-copy", "sid-1", {"backend": "claude"})]
+    # The original share name is remembered so a later re-share updates the same
+    # entry regardless of the local name (#55).
+    assert runner.__dict__["_origins"]["sid-1"] == "fix-parser"
+
+
+def test_shared_resume_defers_fetch_to_background_then_completes():
+    # The transcript fetch must NOT run on the reactor thread (it can hit the
+    # network and freeze the UI). The menu returns having only started a worker and
+    # shown a message; the resume completes later, on the main loop.
+    runner = _shared_resume_runner()
+    runner._prompt_session_name = lambda title, *, default: "my-copy"
+    messages: list = []
+    runner._set_message = lambda msg, **k: messages.append(msg)
+
+    runner._resume_shared_session_menu()
+
+    assert runner.__dict__["_resumed"] == []  # nothing resumed synchronously
+    assert runner._shared_resume_thread is not None  # a fetch worker is running
+    assert any("Fetching" in m for m in messages)  # the user is told it's fetching
+
+    _drain_shared_resume(runner)
+    assert runner.__dict__["_resumed"] == [("my-copy", "sid-1", {"backend": "claude"})]
+
+
+def test_shared_resume_already_live_stay_switches_without_fetch():
+    import types
+
+    runner = _shared_resume_runner()
+    live = types.SimpleNamespace(state=types.SimpleNamespace(backend_session_id="sid-1"))
+    runner.sessions = [live]
+    runner.__dict__["_switched"] = []
+    runner._switch_active = lambda i: runner.__dict__["_switched"].append(i)
+
+    calls = {"n": 0}
+
+    def popup(title, options):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return options[0]  # pick the entry
+        return next(o for o in options if o.startswith("Stay"))  # already-live conflict
+
+    runner._select_popup = popup
+    runner._resume_shared_session_menu()
+
+    assert runner.__dict__["_switched"] == [0]  # switched to the running session
+    assert runner.__dict__["_resumed"] == []  # no new resume
+    assert runner._shared_resume_thread is None  # no fetch started
+
+
+def test_shared_resume_update_live_overwrites_worktree_and_restarts_agent():
+    import types
+
+    runner = _shared_resume_runner()
+    live = types.SimpleNamespace(state=types.SimpleNamespace(backend_session_id="sid-1"))
+    runner.sessions = [live]
+    runner.repo = types.SimpleNamespace(repo="/wt")  # the live session's worktree
+    runner.__dict__["_switched"] = []
+    runner._switch_active = lambda i: runner.__dict__["_switched"].append(i)
+    imported: list = []
+    runner.backend.import_shared_session = lambda repo, sid, t, *, overwrite=False, as_id=None: (
+        imported.append((repo, sid, overwrite, as_id)) or True
+    )
+    restarted: list = []
+    runner._restart_agent = lambda msg: restarted.append(msg)
+
+    calls = {"n": 0}
+
+    def popup(title, options):
+        calls["n"] += 1
+        return options[0] if calls["n"] == 1 else next(o for o in options if o.startswith("Update"))
+
+    runner._select_popup = popup
+    runner._resume_shared_session_menu()
+    _drain_shared_resume(runner)
+
+    assert runner.__dict__["_switched"] == [0]  # switched to the live session
+    assert imported == [("/wt", "sid-1", True, None)]  # overwrote the worktree transcript in place
+    assert restarted == ["Updated this session to the shared version."]  # backend restarted to load it
+
+
+def test_share_name_uses_remembered_origin_over_local_name():
+    import types
+
+    runner = make_runner(name="main")
+    runner.active_index = 0
+    runner._session_name = lambda i: "my-local-rename"
+    runner._user_state = lambda: types.SimpleNamespace(
+        shared_origin_name=lambda sid: "fix-parser" if sid == "sid-1" else None
+    )
+    # A resumed shared session re-shares under its origin name, not the local one.
+    assert runner._share_name_for("sid-1") == "fix-parser"
+    # A session that originated here (no origin) falls back to the local name.
+    assert runner._share_name_for("other") == "my-local-rename"
+    assert runner._share_name_for(None) == "my-local-rename"
+
+
+def test_new_session_stages_transcript_before_spawn_when_resuming(tmp_path, monkeypatch):
+    # Resuming a shared session must stage its transcript into the fresh worktree
+    # BEFORE spawning `--resume`, or the backend can't find it and the session
+    # never loads (the transcript was imported under the base repo, not here).
+    import types
+
+    from agit.proxy import runner as runner_module
+
+    runner = make_runner(name="main")
+    runner._use_worktrees = True
+    runner.global_config = types.SimpleNamespace(default_backend="claude")
+    info = types.SimpleNamespace(name="bob-feature", path=tmp_path)
+    repo = types.SimpleNamespace(repo=tmp_path, current_branch=lambda: "agit/claude/bob-feature/t1")
+    runner._open_session_worktree = lambda name: (info, repo)
+    monkeypatch.setattr(runner_module, "make_proxy_agent", lambda name: types.SimpleNamespace(name=name))
+    monkeypatch.setattr(runner_module, "AgitActions", lambda *a, **k: types.SimpleNamespace())
+
+    order: list = []
+    runner._stage_backend_resume = lambda sid: order.append(("stage", sid))
+    runner._spawn = lambda: order.append(("spawn", None))
+    for name in (
+        "_turn_from_branch",
+        "_persist_session_name",
+        "_sanitize_state_trace",
+        "_initialize_session_baseline",
+        "_init_screen",
+        "_start_file_watcher",
+        "_resize_child",
+        "_enable_host_mouse",
+        "_render",
+    ):
+        setattr(runner, name, lambda *a, **k: None)
+    runner._set_message = lambda *a, **k: None
+    runner.sessions = []
+
+    runner._new_session("bob-feature", resume_session_id="sid-Y")
+
+    assert order == [("stage", "sid-Y"), ("spawn", None)]  # staged BEFORE spawn
+
+
+def test_shared_resume_cancel_on_name_prompt_does_not_resume():
+    runner = _shared_resume_runner()
+    runner._prompt_session_name = lambda *a, **k: None  # user cancels naming
+
+    runner._resume_shared_session_menu()
+
+    assert runner.__dict__["_resumed"] == []
+
+
+def test_dedupe_session_name_avoids_collisions():
+    runner = make_runner(name="main")
+    runner._taken_session_names = lambda: {"alice-fix-parser", "alice-fix-parser-2"}
+    assert runner._dedupe_session_name("alice/fix-parser") == "alice-fix-parser-3"
+    runner._taken_session_names = lambda: set()
+    assert runner._dedupe_session_name("alice/fix-parser") == "alice-fix-parser"
+
+
 # --- base branch switched out-of-band ---
 
 
@@ -3077,16 +3506,34 @@ def test_exit_persists_resume_pointer_even_when_worktree_kept():
 
 
 def test_exit_does_not_persist_resume_pointer_for_background_session():
-    # Only the primary session owns the durable resume pointer; a non-primary
-    # (background) session must not overwrite it on exit.
+    # A non-primary (background) session the user was NOT in at quit must not
+    # overwrite the durable resume pointer. (No exit-active session is set here, so
+    # the gate falls back to the primary, which is a different session.)
     runner = _exit_removal_runner(log_range_result="deadbeef still ahead")
     runner._primary_worktree_name = "session-2"  # this session ("session-1") is not primary
+    runner._exit_resume_worktree = None
     persisted = []
     runner._persist_last_session_record = lambda: persisted.append(True)
 
     runner._remove_worktree_on_exit()
 
     assert persisted == []
+
+
+def test_exit_persists_resume_pointer_for_last_active_session_even_if_not_primary():
+    # The session the user was in at quit (e.g. a resumed shared session) is the
+    # one to auto-resume next start, so its pointer is persisted even though a
+    # different session is the "primary". Without this, quitting from a shared
+    # session left the next start prompting for a brand-new session.
+    runner = _exit_removal_runner(log_range_result="")
+    runner._primary_worktree_name = "session-2"  # primary is a different session
+    runner._exit_resume_worktree = "session-1"  # ...but the user quit from session-1
+    persisted = []
+    runner._persist_last_session_record = lambda: persisted.append(True)
+
+    runner._remove_worktree_on_exit()
+
+    assert persisted == [True]
 
 
 def _bg_confirm_runner(statuses):
@@ -3222,10 +3669,11 @@ def _drift_runner(recorded_cwd, worktree_path):
         worktree=types.SimpleNamespace(name="session-1"),
         repo=types.SimpleNamespace(repo=worktree_path),
         state=types.SimpleNamespace(backend_session_id="sess-1"),
-        backend=types.SimpleNamespace(recorded_working_dir=lambda sid: recorded_cwd),
+        backend=types.SimpleNamespace(recorded_working_dir=lambda sid, *, since=None: recorded_cwd),
     )
     runner._debug = lambda *a, **k: None
     runner._cwd_check_at = 0.0
+    runner._cwd_launch_at = 1000.0
     runner.messages = []
     runner._set_message = lambda msg, **k: runner.messages.append(msg)
     runner._render = lambda: None
@@ -3257,6 +3705,38 @@ def test_cwd_drift_waits_when_no_cwd_recorded_yet():
     assert getattr(runner, "_cwd_drift_checked", False) is False  # will re-check next tick
 
 
+def test_cwd_drift_forwards_launch_time_as_since(monkeypatch):
+    # The launch epoch is passed through as `since` so the backend can ignore a
+    # stale pre-launch cwd (#72). A backend that only reports a post-launch turn
+    # returns None until one exists, so no false warning is latched.
+    import types
+
+    seen = {}
+
+    def recorded(sid, *, since=None):
+        seen["since"] = since
+        return None  # no post-launch turn yet
+
+    runner = make_runner(
+        worktree=types.SimpleNamespace(name="session-1"),
+        repo=types.SimpleNamespace(repo="/repo/.agit/worktrees/session-1"),
+        state=types.SimpleNamespace(backend_session_id="sess-1"),
+        backend=types.SimpleNamespace(recorded_working_dir=recorded),
+    )
+    runner._debug = lambda *a, **k: None
+    runner._cwd_check_at = 0.0
+    runner._cwd_launch_at = 1234.5
+    runner.messages = []
+    runner._set_message = lambda msg, **k: runner.messages.append(msg)
+    runner._render = lambda: None
+
+    runner._warn_if_cwd_drifted()
+
+    assert seen["since"] == 1234.5
+    assert runner.messages == []
+    assert runner._cwd_drift_checked is False  # nothing post-launch yet → keep checking
+
+
 # --- worktree confinement ---
 
 
@@ -3264,7 +3744,8 @@ def test_confine_to_worktree_wraps_when_enabled(monkeypatch):
     import types
     from agit.proxy import sandbox
 
-    monkeypatch.setattr(sandbox, "is_available", lambda: True)
+    # Force the macOS mechanism so the assertion is platform-independent.
+    monkeypatch.setattr(sandbox, "_have_sandbox_exec", lambda: True)
     monkeypatch.delenv("AGIT_SANDBOX", raising=False)
     runner = make_runner(
         worktree=types.SimpleNamespace(name="session-1"),
@@ -4876,6 +5357,103 @@ def test_duck_type_aliases_cover_extracted_classes():
             assert hasattr(ProxyRunner, name), (
                 f"ProxyRunner is missing alias {name!r}, self-called inside {cls.__name__}"
             )
+
+
+def test_gh_unavailable_hint_text_by_status():
+    from agit.proxy.runner import ProxyRunner
+
+    missing = ProxyRunner._gh_unavailable_hint("missing")
+    assert missing is not None and "isn't installed" in missing and "cli.github.com" in missing
+    unauth = ProxyRunner._gh_unavailable_hint("unauthenticated")
+    assert unauth is not None and "isn't logged in" in unauth and "gh auth login" in unauth
+    assert ProxyRunner._gh_unavailable_hint("ok") is None
+
+
+def test_notify_if_gh_unavailable_sets_message_when_missing(monkeypatch):
+    runner = make_runner(name="main")
+    runner.messages = []
+    runner._set_message = lambda msg, **k: runner.messages.append(msg)
+    runner._render = lambda: None
+    monkeypatch.setattr("agit.metrics.github.gh_status", lambda: "missing")
+
+    runner._notify_if_gh_unavailable()
+
+    assert runner.messages and "gh" in runner.messages[0]
+
+
+def test_notify_if_gh_unavailable_silent_when_ok(monkeypatch):
+    runner = make_runner(name="main")
+    runner.messages = []
+    runner._set_message = lambda msg, **k: runner.messages.append(msg)
+    runner._render = lambda: None
+    monkeypatch.setattr("agit.metrics.github.gh_status", lambda: "ok")
+
+    runner._notify_if_gh_unavailable()
+
+    assert runner.messages == []
+
+
+def test_restore_terminal_clears_before_leaving_alt_screen(monkeypatch):
+    # #70: on terminals without alt-screen support, leaving the alt screen is a
+    # no-op, so aGiT's UI lingers after exit unless we clear the screen first.
+    # restore_terminal must emit a clear+home BEFORE the `?1049l` leave so the
+    # screen is clean on those terminals (and unchanged where altscreen works).
+    import types
+
+    from agit.proxy import terminal as terminal_mod
+    from agit.proxy.terminal import TerminalHost
+
+    writes: list[bytes] = []
+    monkeypatch.setattr(terminal_mod.os, "write", lambda _fd, data: writes.append(data) or len(data))
+
+    state = types.SimpleNamespace(old_attrs=None)
+    # Stub the cooked/mode + mouse teardown so only the screen bytes matter here.
+    state.disable_host_terminal_modes = lambda: None
+    state.set_cooked = lambda: None
+    monkeypatch.setattr(terminal_mod.termios, "tcflush", lambda *a, **k: None)
+
+    TerminalHost.restore_terminal(state)
+
+    out = b"".join(writes)
+    assert b"\x1b[2J" in out  # clears the screen
+    assert b"\x1b[?1049l" in out  # leaves the alt screen
+    assert out.index(b"\x1b[2J") < out.index(b"\x1b[?1049l")  # clear comes first
+
+
+def test_rename_session_menu_prompts_then_renames():
+    runner = make_runner(name="main")
+    runner.sessions = [object()]
+    runner._session_name = lambda i: "old"
+    runner._select_popup = lambda title, options: options[0]
+    runner._prompt_popup = lambda title, prompt, *, default="": "new-name"
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda: None
+    captured: list = []
+    runner._rename_session = lambda index, name: captured.append((index, name))
+
+    runner._rename_session_menu()
+
+    assert captured == [(0, "new-name")]
+
+
+def test_rename_session_rejects_taken_name_without_moving():
+    import types
+
+    runner = make_runner(name="main")
+    runner.sessions = [object()]
+    runner._session_name = lambda i: "old"
+    runner._session_name_taken = lambda n: True  # the target name is already in use
+    runner._switch_active = lambda i: None
+    moved: list = []
+    runner.worktree_manager = types.SimpleNamespace(move=lambda a, b: moved.append((a, b)))
+    msgs: list = []
+    runner._set_message = lambda msg, **k: msgs.append(msg)
+    runner._render = lambda: None
+
+    runner._rename_session(0, "taken")
+
+    assert moved == []  # nothing moved
+    assert any("already in use" in m for m in msgs)
 
 
 def test_configured_menu_key_opens_command_capture():

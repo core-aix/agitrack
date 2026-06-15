@@ -113,6 +113,26 @@ def test_clean_tree_covers_backend_commits_without_rewriting_them(tmp_path):
     assert state.pending_trace() == []  # trace consumed by the cover commit
 
 
+def test_on_commit_fn_flags_cover_vs_plain(tmp_path):
+    # The callback is told whether the commit is a cover (over the backend's own
+    # commits) so the UI can explain it; a plain aGiT commit is flagged False.
+    repo, _base = _repo_on_turn_branch(tmp_path)
+    state = AgitState(tmp_path)
+    seen: list = []
+    first = _backend_commit(repo, "a.txt", "backend commit one")
+    last = _backend_commit(repo, "b.txt", "backend commit two")
+
+    _commit_turns(repo, state, [first, last], on_commit_fn=lambda sha, trace, is_cover: seen.append(is_cover))
+    assert seen == [True]  # covered the backend's commits
+
+    # A plain aGiT commit (no backend commits to cover) flags False.
+    (repo.repo / "mine.txt").write_text("aGiT-staged\n", encoding="utf-8")
+    repo.stage_paths(["mine.txt"])
+    seen.clear()
+    _commit_turns(repo, state, [], on_commit_fn=lambda sha, trace, is_cover: seen.append(is_cover))
+    assert seen == [False]
+
+
 def test_cover_commit_makes_first_parent_log_turn_level(tmp_path):
     # `git log --first-parent` on the branch reads turn-by-turn: one aGiT
     # cover commit, with the backend's commits reachable via the second parent.
@@ -153,9 +173,15 @@ def test_cover_refused_when_head_is_not_the_latest_backend_commit(tmp_path):
     assert repo.commit_message("HEAD").startswith("internal change")
 
 
-def test_staged_changes_commit_lists_backend_commits_as_covered(tmp_path):
+def test_staged_changes_commit_covers_backend_and_tracks_all_changes(tmp_path):
+    # Backend committed a.txt, then there are further (uncommitted) changes on top.
+    # The aGiT commit must COVER the backend commit AND track all the file changes
+    # — the covered commit's plus the extra staged ones — as a merge-shaped cover,
+    # not hide them behind a plain single-parent commit that only shows the extra
+    # delta (#35).
     repo, _base = _repo_on_turn_branch(tmp_path)
     state = AgitState(tmp_path)
+    turn_start = repo.rev_parse("HEAD")
     backend_sha = _backend_commit(repo, "a.txt", "backend commit")
     (repo.repo / "a.txt").write_text("further uncommitted work\n", encoding="utf-8")
 
@@ -165,9 +191,15 @@ def test_staged_changes_commit_lists_backend_commits_as_covered(tmp_path):
     head_message = repo.commit_message("HEAD")
     assert head_message.startswith("<aGiT> add the feature")
     assert f"covered_commits: {repo.short_sha(backend_sha)}" in head_message
-    # The backend's own commit is preserved below, message intact.
-    assert repo.rev_parse("HEAD^") == backend_sha
-    assert repo.commit_message("HEAD^").startswith("backend commit")
+    # Merge-shaped cover: first parent is the turn start (so --first-parent shows
+    # the whole change), second parent is the backend commit, preserved intact.
+    assert repo.rev_parse("HEAD^1") == turn_start
+    assert repo.rev_parse("HEAD^2") == backend_sha
+    assert repo.commit_message("HEAD^2").startswith("backend commit")
+    # The cover's first-parent diff tracks the full a.txt change, including the
+    # staged work layered on top of the backend's commit.
+    first_parent_diff = repo.diff_range(turn_start, "HEAD")
+    assert "further uncommitted work" in first_parent_diff
 
 
 def test_cover_commit_survives_summary_amend_with_parents_intact(tmp_path):

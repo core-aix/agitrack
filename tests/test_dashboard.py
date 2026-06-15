@@ -436,6 +436,45 @@ def test_resolve_logins_falls_back_to_empty_without_gh(monkeypatch, tmp_path):
     assert github.resolve_logins(repo) == {}
 
 
+def test_gh_status_reports_missing_unauth_and_ok(monkeypatch):
+    from agit.metrics import github
+
+    # Not installed.
+    monkeypatch.setattr(github.shutil, "which", lambda _name: None)
+    assert github.gh_status() == "missing"
+    assert github.gh_available() is False
+
+    # Installed but the auth check fails (not logged in).
+    monkeypatch.setattr(github.shutil, "which", lambda _name: "/usr/bin/gh")
+
+    class _Fail:
+        returncode = 1
+
+    monkeypatch.setattr(github.subprocess, "run", lambda *a, **k: _Fail())
+    assert github.gh_status() == "unauthenticated"
+    assert github.gh_available() is False
+
+    # Installed and authenticated.
+    class _Ok:
+        returncode = 0
+
+    monkeypatch.setattr(github.subprocess, "run", lambda *a, **k: _Ok())
+    assert github.gh_status() == "ok"
+    assert github.gh_available() is True
+
+
+def test_gh_status_unauthenticated_when_check_errors(monkeypatch):
+    from agit.metrics import github
+
+    monkeypatch.setattr(github.shutil, "which", lambda _name: "/usr/bin/gh")
+
+    def boom(*a, **k):
+        raise OSError("nope")
+
+    monkeypatch.setattr(github.subprocess, "run", boom)
+    assert github.gh_status() == "unauthenticated"
+
+
 def test_resolve_logins_parses_gh_tsv_and_caches(monkeypatch, tmp_path):
     from agit.metrics import github
 
@@ -457,6 +496,53 @@ def test_resolve_logins_parses_gh_tsv_and_caches(monkeypatch, tmp_path):
     assert github.resolve_logins(repo) == {"sha1": "octocat", "sha2": "hubber"}
     github.resolve_logins(repo)  # cached: no second subprocess call
     assert calls["n"] == 1
+
+
+def test_cached_logins_non_blocking_then_populates_in_background(monkeypatch, tmp_path):
+    # The live dashboard's hot path must not block on the (paginated, networked) gh
+    # crawl: a cold call returns {} at once and refreshes in the background; the
+    # resolved logins are then served from the cache.
+    import time
+
+    from agit.metrics import github
+
+    repo = GitRepo.init(tmp_path)  # before patching subprocess (git uses it too)
+    github._reset_cache_for_tests()
+    monkeypatch.setattr(github.shutil, "which", lambda _name: "/usr/bin/gh")
+    ran = threading.Event()
+
+    class _Result:
+        returncode = 0
+        stdout = "sha1\toctocat\n"
+
+    def fake_run(*args, **kwargs):
+        ran.set()
+        return _Result()
+
+    monkeypatch.setattr(github.subprocess, "run", fake_run)
+
+    assert github.cached_logins(repo) == {}  # cold: returns immediately, no blocking crawl
+    assert ran.wait(timeout=5)  # the crawl ran on a background thread
+    deadline = time.monotonic() + 5
+    while github.cached_logins(repo) == {} and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert github.cached_logins(repo) == {"sha1": "octocat"}  # served from the warmed cache
+
+
+def test_cached_logins_serves_warm_cache_without_spawning(monkeypatch, tmp_path):
+    import time
+
+    from agit.metrics import github
+
+    repo = GitRepo.init(tmp_path)
+    github._reset_cache_for_tests()
+    github._CACHE[str(repo.repo)] = (time.monotonic(), {"sha1": "octocat"})  # fresh entry
+    calls = {"n": 0}
+    monkeypatch.setattr(github.shutil, "which", lambda _name: "/usr/bin/gh")
+    monkeypatch.setattr(github.subprocess, "run", lambda *a, **k: calls.__setitem__("n", calls["n"] + 1))
+
+    assert github.cached_logins(repo) == {"sha1": "octocat"}
+    assert calls["n"] == 0  # warm cache: no background crawl spawned
 
 
 # --- loop detection ------------------------------------------------------------
