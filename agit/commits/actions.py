@@ -52,7 +52,7 @@ class AgitActions:
         def stage_untracked_fn(repo, state):
             self.review_untracked(include_declined=False)
 
-        def on_commit_fn(sha, _trace):
+        def on_commit_fn(sha, _trace, _is_cover):
             if not quiet:
                 print("Created <aGiT> commit.")
 

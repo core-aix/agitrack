@@ -5032,7 +5032,7 @@ class ProxyRunner:
                 declined = set(state.declined_untracked())
                 repo.stage_paths([path for path in repo.untracked_files() if path not in declined])
 
-        def on_commit_fn(sha, trace_text):
+        def on_commit_fn(sha, trace_text, is_cover):
             self._last_agent_commit_id = sha
             # Mark that this session saw a real turn this run (stable aGiT session id,
             # not the drift-prone backend id) so the exit-path auto-share knows there
@@ -5043,6 +5043,16 @@ class ProxyRunner:
             # so the user is never told a commit landed before it actually has.
             self._commit_merged_pending = True
             self._commit_summarized = False
+            # When the backend agent committed its own work, aGiT puts a merge-shaped
+            # "cover" commit on top instead of amending (which would change the
+            # agent's commit hashes). Tell the user briefly what just happened (#35).
+            if is_cover:
+                self._set_session_notice(
+                    self._session_label(),
+                    "aGiT is committing a cover — a wrapper commit over the agent's own commits "
+                    "that adds the interaction trace without changing their hashes.",
+                    seconds=8.0,
+                )
             # The commit is made immediately; the LLM summary is computed in the
             # background and amended in afterwards (#8) so the UI never blocks. The
             # trace passed here is exactly the one that landed in the commit (built
