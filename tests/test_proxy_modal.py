@@ -150,6 +150,30 @@ class TestSelectModal:
         assert m.selected == 0
         assert m.feed(b"\r") == ("done", "a")
 
+    def test_blank_option_is_a_separator_skipped_on_navigation(self):
+        # A blank ("") row is a visual gap: it is never selected and arrow
+        # navigation steps right over it to the next real option.
+        m = SelectModal("Pick", ["a", "", "b"])
+        assert m.selected == 0
+        m.feed(b"\x1b[B")  # down: skips the gap, lands on "b"
+        assert m.selected == 2
+        assert m.feed(b"\r") == ("done", "b")
+        m.feed(b"\x1b[B")  # down from "b": wraps back to "a", skipping the gap
+        assert m.selected == 0
+
+    def test_initial_selection_skips_a_leading_separator(self):
+        m = SelectModal("Pick", ["", "a", "b"])
+        assert m.selected == 1
+        assert m.feed(b"\r") == ("done", "a")
+
+    def test_separator_renders_as_blank_line(self):
+        m = SelectModal("Pick", ["a", "", "b"])
+        lines = m.render_message().split("\n")
+        # The gap is an empty line — no cursor, no padding, between the two reals.
+        assert "> a" in lines
+        assert "  b" in lines
+        assert "" in lines[3:]  # a blank line among the options
+
 
 # ---------------------------------------------------------------------------
 # ProxyRunner._run_modal — reactor: PTY drains while modal is open
