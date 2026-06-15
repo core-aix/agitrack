@@ -262,14 +262,16 @@ def _check_for_update_at_startup(config: GlobalConfig) -> None:
         return
     print(f"\n{status.message}")
     try:
-        answer = input("Update aGiT now? [y]es / [n]o / [never] ask again: ").strip().lower()
+        # Default (empty Enter) is to update — that's the recommended action, so
+        # make it the path of least resistance and say so in the prompt.
+        answer = input("Update aGiT now? [Y]es / [n]o / [never] ask again: ").strip().lower()
     except (EOFError, KeyboardInterrupt):
         return
     if answer in {"never", "no ask", "stop"}:
         config.check_for_updates = False
         print("aGiT will no longer check for updates (re-enable with check_for_updates in ~/.agit/config.json).")
         return
-    if answer not in {"y", "yes"}:
+    if answer not in {"", "y", "yes"}:
         return
     print("Updating aGiT...")
     result = updater.apply()

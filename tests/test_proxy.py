@@ -1353,6 +1353,25 @@ def test_expired_session_notice_line_is_dropped_on_service():
     assert "beta" not in runner._session_notices
 
 
+def test_live_notice_service_does_not_request_repaint_when_unchanged():
+    # _service_session_notices runs every reactor tick. While a notice's text is
+    # unchanged it must NOT keep re-requesting a render — doing so forces a
+    # full-frame repaint at tick cadence and flickers the popup on terminals
+    # without synchronized-update support. Only a content change repaints.
+    runner = make_runner()
+    runner._set_session_notice("alpha", "aGiT is summarizing commit a1 in session 'alpha'…", seconds=30)
+    assert runner._render_pending is True  # first appearance repaints
+
+    runner._render_pending = False
+    runner._service_session_notices()  # same text, later tick
+    runner._service_session_notices()
+    assert runner._render_pending is False  # no churn while unchanged
+
+    # A new line for the session (summarizing -> created) does repaint.
+    runner._set_session_notice("alpha", "Created <aGiT> commit a1 in session 'alpha' — merged into main.")
+    assert runner._render_pending is True
+
+
 def test_all_notices_expiring_clears_the_popup():
     runner = make_runner()
     runner._set_session_notice("alpha", "alpha line", seconds=30)

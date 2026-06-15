@@ -5114,11 +5114,22 @@ class ProxyRunner:
             return
         lines = [text for text, _until, _sticky in self._session_notices.values()]
         if lines:
-            self.message = "\n".join(lines)
+            composed = "\n".join(lines)
+            # Only request a repaint when the popup's content actually changes.
+            # _service_session_notices runs every reactor tick, so re-flagging a
+            # render each time (even when the text is unchanged) forces a
+            # full-frame repaint at tick cadence — which flickers the notice popup
+            # on terminals without synchronized-update support while the backend is
+            # also streaming output. message_until is refreshed silently (it only
+            # gates the render's "still showing" check, and the per-notice expiries
+            # are fixed at set time, so updating it never needs a repaint).
+            changed = not self._notice_shown or composed != self.message
+            self.message = composed
             self.message_until = max(until for _t, until, _s in self._session_notices.values())
             self._message_sticky = False
             self._notice_shown = True
-            self._render_pending = True
+            if changed:
+                self._render_pending = True
         elif self._notice_shown:
             # The notices just emptied and we owned the popup: clear it.
             self._clear_message()

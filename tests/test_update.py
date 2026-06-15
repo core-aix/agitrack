@@ -363,6 +363,29 @@ def test_startup_prompt_applies_and_restarts(monkeypatch, tmp_path: Path):
     assert restarted == [True]
 
 
+def test_startup_prompt_defaults_to_update_on_empty_enter(monkeypatch, tmp_path: Path):
+    # A bare Enter (empty answer) takes the recommended path: update now.
+    config = GlobalConfig(path=tmp_path / "c.json")
+    updater = _StartupUpdater(_available_status())
+    restarted = []
+    monkeypatch.setattr("agit.update.Updater", lambda *a, **k: updater)
+    monkeypatch.setattr("agit.update.restart_agit", lambda: restarted.append(True))
+    monkeypatch.setattr("builtins.input", lambda *a: "")
+    cli._check_for_update_at_startup(config)
+    assert updater.applied is True
+    assert restarted == [True]
+
+
+def test_startup_prompt_skips_on_explicit_no(monkeypatch, tmp_path: Path):
+    config = GlobalConfig(path=tmp_path / "c.json")
+    updater = _StartupUpdater(_available_status())
+    monkeypatch.setattr("agit.update.Updater", lambda *a, **k: updater)
+    monkeypatch.setattr("builtins.input", lambda *a: "n")
+    cli._check_for_update_at_startup(config)
+    assert updater.applied is False
+    assert config.check_for_updates is True  # "no" this time, but keep asking
+
+
 def test_startup_prompt_never_disables_future_checks(monkeypatch, tmp_path: Path):
     config = GlobalConfig(path=tmp_path / "c.json")
     updater = _StartupUpdater(_available_status())
