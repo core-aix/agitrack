@@ -780,6 +780,7 @@ def test_auto_share_on_exit_pushes_new_conversation(tmp_path, monkeypatch):
     backend = _StubBackend(transcript="turn one\nturn two")
     runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
     runner.state.set_auto_share("sid-123", True)
+    runner._sessions_with_activity.add(runner.state.session_id)  # a turn happened this run
 
     runner._auto_share_on_exit()
 
@@ -787,9 +788,26 @@ def test_auto_share_on_exit_pushes_new_conversation(tmp_path, monkeypatch):
     assert store.read_transcript(store.entries()[0]) == "turn one\nturn two"
 
 
+def test_auto_share_on_exit_skips_when_no_activity_this_run(tmp_path, monkeypatch):
+    # Resuming an auto-shared session and quitting without typing anything must NOT
+    # re-share: no committed turn this run ⇒ no push, no "Sharing…" message, instant
+    # exit. This is robust to Claude's resume id-churn (which would otherwise make a
+    # transcript-digest comparison see a spurious change).
+    backend = _StubBackend(transcript="prior conversation, untouched")
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
+    runner.state.set_auto_share("sid-123", True)
+    # No activity recorded this run (the user only resumed and quit).
+
+    runner._auto_share_on_exit()
+
+    assert SharedSessionStore(repo).entries() == []  # untouched ⇒ no share
+    assert not any("before exit" in m for m in runner.messages)
+
+
 def test_auto_share_on_exit_skipped_when_not_auto_shared(tmp_path, monkeypatch):
     backend = _StubBackend(transcript="private work")
     runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
+    runner._sessions_with_activity.add(runner.state.session_id)  # had activity, but not shared
     # auto-share NOT enabled for this session.
 
     runner._auto_share_on_exit()
@@ -797,12 +815,13 @@ def test_auto_share_on_exit_skipped_when_not_auto_shared(tmp_path, monkeypatch):
     assert SharedSessionStore(repo).entries() == []  # nothing pushed on exit
 
 
-def test_auto_share_on_exit_no_push_when_nothing_new(tmp_path, monkeypatch):
-    # When the latest conversation was already shared during the run, exit is a
-    # no-op — the content-hash gate avoids a redundant final push.
+def test_auto_share_on_exit_no_push_when_already_shared(tmp_path, monkeypatch):
+    # A session that had a turn this run but whose content was already pushed (live)
+    # is a no-op on exit — the content-hash gate avoids a redundant final push.
     backend = _StubBackend(transcript="all caught up")
     runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
     runner.state.set_auto_share("sid-123", True)
+    runner._sessions_with_activity.add(runner.state.session_id)
 
     runner._auto_share_on_exit()  # first push
     last_updated = SharedSessionStore(repo).entries()[0].manifest["updated"]
@@ -811,70 +830,6 @@ def test_auto_share_on_exit_no_push_when_nothing_new(tmp_path, monkeypatch):
     runner._auto_share_on_exit()  # unchanged ⇒ no push
 
     assert SharedSessionStore(repo).entries()[0].manifest["updated"] == last_updated
-
-
-def test_auto_share_on_exit_skips_unedited_resumed_session(tmp_path, monkeypatch):
-    # A session resumed but not edited this run has NO in-memory push hash, yet its
-    # content already matches the published manifest — so exit must NOT re-push.
-    # The gate falls back to the published content_hash to recognise "no edits".
-    backend = _StubBackend(transcript="prior conversation")
-    runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
-    runner.state.set_auto_share("sid-123", True)
-    # Pre-publish the identical content as if shared in an earlier run, then clear
-    # the in-memory hash to simulate a fresh process that only resumed it.
-    runner._auto_share_on_exit()
-    last_updated = SharedSessionStore(repo).entries()[0].manifest["updated"]
-    runner._auto_share_hash.clear()
-
-    monkeypatch.setattr("time.time", lambda: 10**10)  # would bump `updated` IF it pushed
-    runner._auto_share_on_exit()
-
-    assert SharedSessionStore(repo).entries()[0].manifest["updated"] == last_updated
-
-
-def test_auto_share_on_exit_skips_when_only_resumed_not_edited(tmp_path, monkeypatch):
-    # Resuming an auto-shared session and quitting without typing anything must NOT
-    # re-share — even with no in-memory push hash and nothing previously published
-    # (e.g. Claude's resume id-churn would have changed any stored digest). The
-    # baseline digest captured when the session was established recognises that the
-    # content is unchanged, so no "Sharing… before exit" work happens at all.
-    backend = _StubBackend(transcript="prior conversation, untouched")
-    runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
-    runner.state.set_auto_share("sid-123", True)
-    runner._snapshot_share_baseline()  # as _initialize_session_baseline does on resume
-
-    runner._auto_share_on_exit()
-
-    assert SharedSessionStore(repo).entries() == []  # untouched ⇒ no share
-    assert not any("before exit" in m for m in runner.messages)
-
-
-def test_auto_share_on_exit_shares_when_edited_after_baseline(tmp_path, monkeypatch):
-    # A new turn after the baseline (the transcript grew) IS shared on exit.
-    backend = _StubBackend(transcript="prior conversation")
-    runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
-    runner.state.set_auto_share("sid-123", True)
-    runner._snapshot_share_baseline()
-    backend._transcript = "prior conversation\nplus a new turn"  # the user typed something
-
-    runner._auto_share_on_exit()
-
-    store = SharedSessionStore(repo)
-    assert store.read_transcript(store.entries()[0]) == "prior conversation\nplus a new turn"
-
-
-def test_snapshot_share_baseline_only_for_auto_shared(tmp_path, monkeypatch):
-    # The baseline is only captured for auto-shared sessions (it exists solely for
-    # the exit-share gate); a non-auto-shared session records nothing.
-    backend = _StubBackend(transcript="whatever")
-    runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
-
-    runner._snapshot_share_baseline()  # not auto-shared
-    assert "sid-123" not in runner._share_baseline_hash
-
-    runner.state.set_auto_share("sid-123", True)
-    runner._snapshot_share_baseline()
-    assert "sid-123" in runner._share_baseline_hash
 
 
 def test_auto_share_on_exit_times_out_without_hanging(tmp_path, monkeypatch):
@@ -887,6 +842,7 @@ def test_auto_share_on_exit_times_out_without_hanging(tmp_path, monkeypatch):
     backend = _StubBackend(transcript="brand new turns")
     runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
     runner.state.set_auto_share("sid-123", True)
+    runner._sessions_with_activity.add(runner.state.session_id)
     runner.EXIT_SHARE_TIMEOUT = 0.2
 
     started = threading.Event()
@@ -918,6 +874,7 @@ def test_auto_share_on_exit_warns_on_push_failure(tmp_path, monkeypatch):
     backend = _StubBackend(transcript="unpushed turns")
     runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
     runner.state.set_auto_share("sid-123", True)
+    runner._sessions_with_activity.add(runner.state.session_id)
 
     class _FailStore:
         def entries(self):
