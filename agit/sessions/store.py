@@ -17,6 +17,7 @@ ref never grows a history.
 from __future__ import annotations
 
 import json
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -90,15 +91,18 @@ class SharedSessionStore:
         except json.JSONDecodeError:
             return {}
 
-    def read_transcript(self, entry: SharedEntry, *, timeout: float | None = None) -> str | None:
+    def read_transcript(
+        self, entry: SharedEntry, *, timeout: float | None = None, cancel: "threading.Event | None" = None
+    ) -> str | None:
         path = f"{self._prefix()}{entry.github_id}/{entry.name}/transcript.jsonl"
         blob = self.repo.read_ref_blob(self.ref, path)
         if blob is None and self.repo.remote_exists():
             # The listing fetch pulls only the small manifests (see `fetch`), so a
             # large transcript may not be local yet — fetch the full ref now that
             # the user has actually chosen this session, then read it. ``timeout``
-            # bounds this (potentially large) fetch so it can't wait forever.
-            self.repo.fetch_ref(f"+{self.ref}:{self.ref}", timeout=timeout)
+            # bounds this (potentially large) fetch; ``cancel`` lets the user stop it
+            # outright (the git process is killed, not left running).
+            self.repo.fetch_ref(f"+{self.ref}:{self.ref}", timeout=timeout, cancel=cancel)
             blob = self.repo.read_ref_blob(self.ref, path)
         return blob
 
@@ -141,7 +145,7 @@ class SharedSessionStore:
 
     # --- sync --------------------------------------------------------------
 
-    def fetch(self, *, timeout: float | None = None) -> bool:
+    def fetch(self, *, timeout: float | None = None, cancel: "threading.Event | None" = None) -> bool:
         """Pull the latest shared ref from the remote (best-effort).
 
         Fetches only the small manifests (a blob-size filter skips the large
@@ -149,13 +153,17 @@ class SharedSessionStore:
         chosen session is fetched on demand by :meth:`read_transcript`. Falls back
         to a full fetch when the remote doesn't support partial fetch. An optional
         ``timeout`` bounds each underlying git fetch so a stalled network call on
-        bad internet can't run unbounded."""
+        bad internet can't run unbounded; ``cancel`` (an Event) stops it at once."""
         if not self.repo.remote_exists():
             return False
         refspec = f"+{self.ref}:{self.ref}"
-        if self.repo.fetch_ref(refspec, filter_blobs="blob:limit=16k", timeout=timeout):
+        if cancel is not None and cancel.is_set():
+            return False  # already cancelled: don't even start
+        if self.repo.fetch_ref(refspec, filter_blobs="blob:limit=16k", timeout=timeout, cancel=cancel):
             return True
-        return self.repo.fetch_ref(refspec, timeout=timeout)
+        if cancel is not None and cancel.is_set():
+            return False  # cancelled during the filtered fetch: don't retry
+        return self.repo.fetch_ref(refspec, timeout=timeout, cancel=cancel)
 
     def _is_session_snapshot(self, commit_sha: str) -> bool:
         # A shared-session snapshot commit is parent-less (an orphan we wrote) and

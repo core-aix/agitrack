@@ -3168,12 +3168,13 @@ class ProxyRunner:
             store.fetch()
             return True
         result: dict = {}
+        cancel = threading.Event()
 
         def worker() -> None:
             try:
-                # Bound the git fetch itself so an abandoned (stopped) fetch's
-                # subprocess can't linger forever on a dead connection.
-                result["ok"] = store.fetch(timeout=self.SHARED_FETCH_TIMEOUT)
+                # Bound the git fetch and make it killable, so a stopped fetch's
+                # subprocess is terminated at once — never left running.
+                result["ok"] = store.fetch(timeout=self.SHARED_FETCH_TIMEOUT, cancel=cancel)
             except Exception as error:  # never let a fetch failure escape the thread
                 result["error"] = repr(error)
 
@@ -3182,12 +3183,10 @@ class ProxyRunner:
         self._set_message(f"{message}   ·   press Esc to stop", seconds=600)
         self._render()
         status = self._drain_pty_until_done_or_esc(thread, deadline=time.monotonic() + self.SHARED_FETCH_TIMEOUT + 2.0)
-        if status == "timeout":
-            self._set_message("Stopped fetching shared sessions (timed out).", seconds=6.0)
-            self._render()
-            return False
-        if status == "cancel":
-            self._set_message("Stopped fetching shared sessions.", seconds=6.0)
+        if status != "done":
+            cancel.set()  # kill the git fetch subprocess now — don't leave it running
+            note = "timed out" if status == "timeout" else "stopped"
+            self._set_message(f"Stopped fetching shared sessions ({note}).", seconds=6.0)
             self._render()
             return False
         if result.get("error"):
@@ -3415,8 +3414,9 @@ class ProxyRunner:
 
         def worker() -> None:
             try:
-                # Bound the full fetch (it can be large) so it never waits forever.
-                transcript = store.read_transcript(entry, timeout=self.RESUME_FETCH_TIMEOUT)
+                # Bound the full fetch (it can be large) and make it killable, so a
+                # cancel/exit terminates the git process at once instead of waiting.
+                transcript = store.read_transcript(entry, timeout=self.RESUME_FETCH_TIMEOUT, cancel=cancel)
                 if cancel.is_set():
                     return  # cancelled (or exiting) while fetching — drop the result
                 if not transcript:
