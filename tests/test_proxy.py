@@ -2817,15 +2817,19 @@ def test_with_session_swaps_in_and_restores_active():
     assert b.last_status == "touched"  # background snapshot updated
 
 
-def test_next_session_name_skips_existing_worktrees_and_sessions():
+def test_next_session_name_is_a_word_avoiding_taken_names():
     import types
+
+    from agit.proxy.session_names import SESSION_WORDS
 
     runner = _mux_runner()  # one active session named "A"
     runner.worktree_manager = types.SimpleNamespace(
-        list=lambda: [types.SimpleNamespace(name="session-1"), types.SimpleNamespace(name="session-2")]
+        list=lambda: [types.SimpleNamespace(name="maple"), types.SimpleNamespace(name="willow")]
     )
-    # session-1 and session-2 are taken (plus active "A"), so the next is session-3.
-    assert runner._next_session_name() == "session-3"
+    # A neutral word that isn't one of the taken names.
+    name = runner._next_session_name()
+    assert name in SESSION_WORDS
+    assert name not in {"maple", "willow"} | runner._taken_session_names()
 
 
 # --- injected-prompt targeting (cross-backend safety) ---
@@ -3003,12 +3007,15 @@ def _shared_resume_runner():
     runner._taken_session_names = lambda: set()
     runner.__dict__["_origins"] = {}
     runner._user_state = lambda: types.SimpleNamespace(
-        set_shared_origin_name=lambda sid, name: runner.__dict__["_origins"].__setitem__(sid, name),
-        shared_origin_name=lambda sid: runner.__dict__["_origins"].get(sid),
+        set_shared_origin=lambda sid, *, owner, name, contributors=None: runner.__dict__["_origins"].__setitem__(
+            sid, {"owner": owner, "name": name, "contributors": sorted(set(contributors or []))}
+        ),
+        shared_origin=lambda sid: runner.__dict__["_origins"].get(sid),
     )
     entry = types.SimpleNamespace(
         github_id="alice",
         name="fix-parser",
+        contributors=["alice"],
         display="alice/fix-parser",
         manifest={"session_id": "sid-1", "backend": "claude"},
     )
@@ -3254,9 +3261,13 @@ def test_shared_resume_prompts_for_local_name():
 
     assert seen["default"] == "fix-parser"
     assert runner.__dict__["_resumed"] == [("my-copy", "sid-1", {"backend": "claude"})]
-    # The original share name is remembered so a later re-share updates the same
-    # entry regardless of the local name (#55).
-    assert runner.__dict__["_origins"]["sid-1"] == "fix-parser"
+    # The lineage origin (owner + name + contributors) is remembered so a later
+    # re-share updates the same entry regardless of the local name (#55).
+    assert runner.__dict__["_origins"]["sid-1"] == {
+        "owner": "alice",
+        "name": "fix-parser",
+        "contributors": ["alice"],
+    }
 
 
 def test_shared_resume_defers_fetch_to_background_then_completes():
@@ -3334,20 +3345,20 @@ def test_shared_resume_update_live_overwrites_worktree_and_restarts_agent():
     assert restarted == ["Updated this session to the shared version."]  # backend restarted to load it
 
 
-def test_share_name_uses_remembered_origin_over_local_name():
+def test_share_identity_uses_remembered_origin_over_local_name():
     import types
 
     runner = make_runner(name="main")
     runner.active_index = 0
     runner._session_name = lambda i: "my-local-rename"
-    runner._user_state = lambda: types.SimpleNamespace(
-        shared_origin_name=lambda sid: "fix-parser" if sid == "sid-1" else None
-    )
-    # A resumed shared session re-shares under its origin name, not the local one.
-    assert runner._share_name_for("sid-1") == "fix-parser"
-    # A session that originated here (no origin) falls back to the local name.
-    assert runner._share_name_for("other") == "my-local-rename"
-    assert runner._share_name_for(None) == "my-local-rename"
+    origin = {"owner": "alice", "name": "fix-parser", "contributors": ["alice"]}
+    runner._user_state = lambda: types.SimpleNamespace(shared_origin=lambda sid: origin if sid == "sid-1" else None)
+    # A resumed shared session re-shares under its origin owner+name, with the sharer
+    # joining the contributor set — not a fresh `<sharer>/<local-name>`.
+    assert runner._share_identity("sid-1", "bob") == ("alice", "fix-parser", ["alice", "bob"])
+    # A session that originated here (no origin) shares under the sharer + local name.
+    assert runner._share_identity("other", "bob") == ("bob", "my-local-rename", ["bob"])
+    assert runner._share_identity(None, "bob") == ("bob", "my-local-rename", ["bob"])
 
 
 def test_new_session_stages_transcript_before_spawn_when_resuming(tmp_path, monkeypatch):
@@ -5495,6 +5506,28 @@ def test_rename_session_menu_prompts_then_renames():
     runner._rename_session_menu()
 
     assert captured == [(0, "new-name")]
+
+
+def test_rename_forks_shared_lineage(tmp_path):
+    # Rename-as-fork: renaming a session that was resumed/shared drops its tracked
+    # lineage origin, so a later share publishes a new `<you>/<name>` entry instead of
+    # updating the original. A session with no origin is unaffected.
+    import types
+
+    from agit.config import AgitState
+
+    runner = make_runner(name="main")
+    runner.base_repo = types.SimpleNamespace(repo=tmp_path)
+    runner.global_config = types.SimpleNamespace(default_backend="claude")
+    state = AgitState(tmp_path)
+    state.set_shared_origin("sid-1", owner="alice", name="fix-parser", contributors=["alice"])
+
+    runner._fork_lineage_on_rename("sid-1")
+    assert AgitState(tmp_path).shared_origin("sid-1") is None  # origin dropped → next share forks
+
+    # A purely local session (no origin) is a no-op (and never errors).
+    runner._fork_lineage_on_rename("sid-local")
+    assert AgitState(tmp_path).shared_origin("sid-local") is None
 
 
 def test_rename_session_rejects_taken_name_without_moving():

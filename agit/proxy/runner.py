@@ -1543,13 +1543,14 @@ class ProxyRunner:
         return used
 
     def _next_session_name(self) -> str:
-        # The next free ``session-N`` name, avoiding existing worktrees and live
-        # sessions (session names are independent of which backend they run).
-        used = self._taken_session_names()
-        number = 1
-        while f"session-{number}" in used:
-            number += 1
-        return f"session-{number}"
+        # A friendly random word (neutral/harmless), avoiding existing worktrees and
+        # live sessions. A word is easier to remember than ``session-N`` and, since
+        # sessions are tracked/shared as ``<github-id(s)>/<name>``, far less likely to
+        # clash with another contributor's session names. The user can still rename it
+        # or type their own at the new-session prompt.
+        from agit.proxy.session_names import random_session_name
+
+        return random_session_name(self._taken_session_names())
 
     def _session_name_taken(self, name: str) -> bool:
         return _sanitize_name(name) in self._taken_session_names()
@@ -2718,16 +2719,21 @@ class ProxyRunner:
         # Operates on the base repo: it owns the remote and the shared object db.
         return SharedSessionStore(self.base_repo)
 
-    def _share_name_for(self, session_id: str | None) -> str:
-        # Re-share an imported shared session under its ORIGINAL share name (kept
-        # per session and carried across id-drift), so a back-and-forth round-trip
-        # keeps updating the same shared entry. Falls back to the local session
-        # name for a session that originated here (#55).
-        if session_id:
-            origin = self._user_state().shared_origin_name(session_id)
-            if origin:
-                return origin
-        return self._session_name(self.active_index)
+    def _share_identity(self, session_id: str | None, login: str) -> tuple[str, str, list[str]]:
+        """The ``(origin_owner, name, contributors)`` a share/auto-share writes under.
+
+        For a session imported from someone else, this is its recorded lineage origin
+        (owner + name), with the current sharer merged into the contributor set — so the
+        re-share updates the SAME entry (`<id1>+<id2>/<name>`, order-independent) rather
+        than spawning `<sharer>/<name>` on each machine. For a session originated here,
+        it's our own login + local name, contributors = [login]. A fork ("Keep both" or a
+        deliberate copy) records no origin, so it starts a fresh lineage here (#55)."""
+        rec = self._user_state().shared_origin(session_id) if session_id else None
+        if rec and rec.get("name"):
+            owner = rec.get("owner") or login
+            contributors = sorted({*rec.get("contributors", []), owner, login})
+            return owner, str(rec["name"]), contributors
+        return login, self._session_name(self.active_index), [login]
 
     def _sweep_orphan_shared_sessions(self, *, fetch: bool) -> None:
         # Reclaim dangling shared-session snapshots (old/unshared versions) left by
@@ -2781,23 +2787,28 @@ class ProxyRunner:
             self._render()
             return
         self.global_config.acknowledge_session_sharing()
-        payload = self._share_payload(session_id, self._share_name_for(session_id))
+        payload = self._share_payload(session_id)
         if payload is None:
             self._set_message("Could not read the session transcript to share.")
             self._render()
             return
-        login, name, redacted, digest, manifest = payload
-        self._set_message(f"Sharing '{login}/{name}' — pushing to origin…   press Esc to cancel", seconds=600)
+        display = payload["display"]
+        self._set_message(f"Sharing '{display}' — pushing to origin…   press Esc to cancel", seconds=600)
         self._render()
         outcome = self._publish_with_cancel(
-            self._shared_store(), github_id=login, name=name, transcript=redacted, manifest=manifest
+            self._shared_store(),
+            github_id=payload["owner"],
+            name=payload["name"],
+            transcript=payload["redacted"],
+            manifest=payload["manifest"],
+            prune_gid=payload["sharer"],
         )
         if outcome.get("cancelled"):
             # The push was stopped (Esc) or timed out — the git subprocess was killed,
             # so nothing reached origin. Make the non-result unmistakable and hold the
             # notice until the user acknowledges it with a key (a mouse move won't).
             self._await_keypress(
-                f"'{login}/{name}' was NOT shared — the push to origin was cancelled. Press any key to continue."
+                f"'{display}' was NOT shared — the push to origin was cancelled. Press any key to continue."
             )
             return
         if "error" in outcome:
@@ -2805,8 +2816,13 @@ class ProxyRunner:
             self._render()
             return
         result = outcome["result"]
-        self._auto_share_hash[session_id] = digest  # don't immediately re-push the same content
-        self._set_message(self._share_outcome_message(result, login, name), seconds=12.0)
+        self._auto_share_hash[session_id] = payload["digest"]  # don't immediately re-push the same content
+        # Record the lineage origin so a later re-share (here or on another machine)
+        # updates this same entry and keeps accumulating contributors.
+        self._user_state().set_shared_origin(
+            session_id, owner=payload["owner"], name=payload["name"], contributors=payload["contributors"]
+        )
+        self._set_message(self._share_outcome_message(result, display), seconds=12.0)
         self._render()
         # Offer to keep it current automatically (the opt-in covers future pushes).
         if result.pushed and not self._session_auto_shared(session_id):
@@ -2818,12 +2834,14 @@ class ProxyRunner:
             if keep == "Yes, keep it updated":
                 self._set_session_auto_share(session_id, True)
                 self._set_message(
-                    f"'{login}/{name}' will auto-update as you work. Manage it via session → Manage shared.",
+                    f"'{display}' will auto-update as you work. Manage it via session → Manage shared.",
                     seconds=8.0,
                 )
                 self._render()
 
-    def _publish_with_cancel(self, store, *, github_id: str, name: str, transcript: str, manifest: dict) -> dict:
+    def _publish_with_cancel(
+        self, store, *, github_id: str, name: str, transcript: str, manifest: dict, prune_gid: str | None = None
+    ) -> dict:
         """Push a manual share on a worker thread while keeping the UI alive and
         letting the user press Esc to cancel a slow/stalled upload. Returns one of
         ``{"result": PublishResult}``, ``{"cancelled": True}``, or ``{"error": str}``.
@@ -2839,6 +2857,7 @@ class ProxyRunner:
                     name=name,
                     transcript=transcript,
                     manifest=manifest,
+                    prune_gid=prune_gid,
                     timeout=self.SHARE_PUSH_TIMEOUT,
                     cancel=cancel,
                 )
@@ -2856,10 +2875,11 @@ class ProxyRunner:
             return {"error": box["error"]}
         return {"result": box["result"]}
 
-    def _share_payload(self, session_id: str, name: str):
+    def _share_payload(self, session_id: str):
         """Read + redact the session transcript and build its manifest (no network,
-        no UI). Returns ``(login, name, redacted, content_hash, manifest)`` or None
-        when the transcript can't be read. Shared by manual share and auto-share."""
+        no UI). Returns a dict with the lineage identity (``owner``/``name``/
+        ``contributors``/``display``), the actual ``sharer``, ``redacted`` text,
+        ``digest``, and ``manifest`` — or None when the transcript can't be read."""
         backend = self.backend
         raw = backend.export_session_raw(self.repo.repo, session_id) or backend.export_session_raw(
             self.base_repo.repo, session_id
@@ -2872,9 +2892,11 @@ class ProxyRunner:
         digest = hashlib.sha256(redacted.encode("utf-8")).hexdigest()
         login = self.global_config.github_login or github_login(self.base_repo)
         self.global_config.github_login = login
+        owner, name, contributors = self._share_identity(session_id, login)
         manifest = {
-            "github_id": login,
+            "github_id": owner,  # the lineage origin owner = the entry's ref path owner
             "name": name,
+            "contributors": contributors,  # every github id that has shared this session
             "backend": backend.name,
             "model": self.state.model,
             "session_id": session_id,
@@ -2884,29 +2906,38 @@ class ProxyRunner:
             "transcript_bytes": backend.transcript_size(self.base_repo.repo, session_id),
             "transcript_rows": _shared_transcript_rows(redacted),
         }
-        return login, name, redacted, digest, manifest
+        return {
+            "owner": owner,
+            "name": name,
+            "contributors": contributors,
+            "sharer": login,
+            "display": f"{'+'.join(contributors)}/{name}",
+            "redacted": redacted,
+            "digest": digest,
+            "manifest": manifest,
+        }
 
-    def _share_outcome_message(self, result, login: str, name: str) -> str:
+    def _share_outcome_message(self, result, display: str) -> str:
         if result.behind:
             # The shared copy already has newer turns than this machine's copy —
             # sharing would rewind it. Tell the user in plain language (no git jargon).
             return (
-                f"Didn't share '{login}/{name}': the shared copy already has newer changes than "
+                f"Didn't share '{display}': the shared copy already has newer changes than "
                 f"this session. Resume the shared version first to catch up, then share again."
             )
         if not result.remote:
-            message = f"Saved shared session '{login}/{name}' locally (no 'origin' remote to push to)."
+            message = f"Saved shared session '{display}' locally (no 'origin' remote to push to)."
         elif result.pushed:
             # The ref isn't a branch, so GitHub's web UI won't show it; point the
             # user at how to see/confirm it instead.
             message = (
-                f"Shared '{login}/{name}' to origin (it lives on the custom ref refs/agit/shared-sessions, "
+                f"Shared '{display}' to origin (it lives on the custom ref refs/agit/shared-sessions, "
                 f"so it won't show on GitHub's web page). See it via session → Manage shared sessions, "
                 f"or: git ls-remote origin 'refs/agit/*'."
             )
         else:
             message = (
-                f"Saved '{login}/{name}' locally, but the push was rejected — someone else may have "
+                f"Saved '{display}' locally, but the push was rejected — someone else may have "
                 f"updated the shared ref. Try sharing again. [{result.error[:80]}]"
             )
         if result.pruned:
@@ -2990,33 +3021,44 @@ class ProxyRunner:
         from agit.sessions import redact_transcript
 
         redacted = redact_transcript(raw)
+        # Updating from the Manage menu counts as a (re-)share by the current user, so
+        # fold them into the contributor set — the entry stays under its origin owner.
+        login = self._cached_or_resolve_login()
+        contributors = sorted({*entry.contributors, login})
         manifest = {
             **entry.manifest,
+            "contributors": contributors,
             "updated": int(time.time()),
             "content_hash": hashlib.sha256(redacted.encode("utf-8")).hexdigest(),
             "transcript_bytes": self.backend.transcript_size(self.base_repo.repo, sid),
             "transcript_rows": _shared_transcript_rows(redacted),
         }
+        display = f"{'+'.join(contributors)}/{entry.name}"
         # Same UX as the initial share: show a "pushing to origin…" notice while the
         # (potentially slow) push runs, and let the user press Esc to cancel it.
-        self._set_message(f"Updating '{entry.display}' — pushing to origin…   press Esc to cancel", seconds=600)
+        self._set_message(f"Updating '{display}' — pushing to origin…   press Esc to cancel", seconds=600)
         self._render()
         outcome = self._publish_with_cancel(
-            self._shared_store(), github_id=entry.github_id, name=entry.name, transcript=redacted, manifest=manifest
+            self._shared_store(),
+            github_id=entry.github_id,
+            name=entry.name,
+            transcript=redacted,
+            manifest=manifest,
+            prune_gid=login,
         )
         if outcome.get("cancelled"):
             self._await_keypress(
-                f"'{entry.display}' was NOT updated — the push to origin was cancelled. Press any key to continue."
+                f"'{display}' was NOT updated — the push to origin was cancelled. Press any key to continue."
             )
             return
         if "error" in outcome:
-            self._set_message(f"Could not update {entry.display}: {outcome['error']}", seconds=10.0)
+            self._set_message(f"Could not update {display}: {outcome['error']}", seconds=10.0)
             self._render()
             return
         result = outcome["result"]
         if sid:
             self._auto_share_hash[sid] = manifest["content_hash"]
-        self._set_message(self._share_outcome_message(result, entry.github_id, entry.name), seconds=12.0)
+        self._set_message(self._share_outcome_message(result, display), seconds=12.0)
         self._render()
 
     def _unshare_entry(self, entry) -> None:
@@ -3138,11 +3180,14 @@ class ProxyRunner:
             )
             if relevant:
                 user.add_shared_session_alias(new_id, previous)
-            # Carry the original share name onto the new id, so a re-share after the
-            # backend forks the id still updates the same shared entry (#55).
-            origin = user.shared_origin_name(previous)
+            # Carry the full lineage origin (owner + name + contributors) onto the new
+            # id, so a re-share after the backend forks the id still updates the same
+            # shared entry and keeps the contributor set (#55).
+            origin = user.shared_origin(previous)
             if origin:
-                user.set_shared_origin_name(new_id, origin)
+                user.set_shared_origin(
+                    new_id, owner=origin["owner"], name=origin["name"], contributors=origin["contributors"]
+                )
         except Exception as error:
             self._debug(f"record shared alias failed: {error!r}")
 
@@ -3180,10 +3225,14 @@ class ProxyRunner:
             return
         # Snapshot everything the worker needs on the main thread (these touch the
         # active session / config, which can change underneath a thread).
+        login = self._cached_or_resolve_login()
+        owner, name, contributors = self._share_identity(sid, login)
         ctx = {
             "session_id": sid,
-            "name": self._share_name_for(sid),
-            "login": self._cached_or_resolve_login(),
+            "owner": owner,
+            "name": name,
+            "contributors": contributors,
+            "login": login,
             "backend": backend,
             "repo_path": self.repo.repo,
             "base_repo_path": self.base_repo.repo,
@@ -3215,8 +3264,9 @@ class ProxyRunner:
                 return None  # nothing new since the last push — skip the network round-trip
             self._auto_share_hash[sid] = digest
             manifest = {
-                "github_id": ctx["login"],
+                "github_id": ctx["owner"],  # lineage origin owner (entry's ref path owner)
                 "name": ctx["name"],
+                "contributors": ctx["contributors"],
                 "backend": backend.name,
                 "model": ctx["model"],
                 "session_id": sid,
@@ -3227,7 +3277,11 @@ class ProxyRunner:
                 "transcript_rows": _shared_transcript_rows(redacted),
             }
             return ctx["store"].publish(
-                github_id=ctx["login"], name=ctx["name"], transcript=redacted, manifest=manifest
+                github_id=ctx["owner"],
+                name=ctx["name"],
+                transcript=redacted,
+                manifest=manifest,
+                prune_gid=ctx["login"],
             )
         except Exception as error:
             self._debug(f"auto-share failed: {error!r}")
@@ -3271,8 +3325,9 @@ class ProxyRunner:
             return  # already shared this exact content ⇒ nothing to do
         ctx = {
             "session_id": sid,
-            "name": self._share_name_for(sid),
-            "login": None,  # resolved inside the bounded thread (a gh call can stall)
+            # owner/name/contributors are resolved inside the bounded thread, after the
+            # login lookup (a gh call can stall) it depends on.
+            "login": None,
             "backend": backend,
             "repo_path": self.repo.repo,
             "base_repo_path": self.base_repo.repo,
@@ -3281,7 +3336,7 @@ class ProxyRunner:
             "store": self._shared_store(),
             "last_hash": last,
         }
-        self._set_message(f"Sharing '{ctx['name']}' before exit…", seconds=30)
+        self._set_message("Sharing this session before exit…", seconds=30)
         self._render()
         # Bound the network round-trip: run the push (and the login lookup, which
         # may shell out to gh) in a thread and wait at most EXIT_SHARE_TIMEOUT. A
@@ -3291,7 +3346,9 @@ class ProxyRunner:
         outcome: dict = {}
 
         def push() -> None:
-            ctx["login"] = self._cached_or_resolve_login()
+            login = self._cached_or_resolve_login()
+            owner, name, contributors = self._share_identity(sid, login)
+            ctx.update(login=login, owner=owner, name=name, contributors=contributors)
             outcome["result"] = self._auto_share_worker(ctx)
 
         thread = threading.Thread(target=push, daemon=True, name="agit-exit-share")
@@ -3504,11 +3561,13 @@ class ProxyRunner:
                 self._set_message(f"Can't resume '{entry.display}': unknown backend '{entry_backend}'.", seconds=8.0)
                 self._render()
                 return
-        # Remember the name this session was shared under, so a later re-share (on
-        # this or any machine) updates the SAME shared entry instead of prepending
-        # the sharer id again — which made the name grow on every round-trip and
-        # never converge (#55).
-        self._user_state().set_shared_origin_name(session_id, entry.name)
+        # Remember the lineage origin this session was shared under (owner + name +
+        # contributors), so a later re-share (on this or any machine) updates the SAME
+        # shared entry and adds us to the contributor set, instead of spawning a new
+        # `<sharer>/<name>` that never converges (#55).
+        self._user_state().set_shared_origin(
+            session_id, owner=entry.github_id, name=entry.name, contributors=entry.contributors
+        )
         # Everything below resolves WHAT to do (interactive popups) WITHOUT touching
         # the transcript — the transcript fetch (which may hit the network) and the
         # import then run on a worker thread (_begin_shared_resume) so the UI never
@@ -3806,8 +3865,9 @@ class ProxyRunner:
             self._set_message("Could not install the shared session for resume.", seconds=8.0)
             self._render()
             return
-        if result.get("as_id"):
-            self._user_state().set_shared_origin_name(result["as_id"], result["entry_name"])
+        # A "Keep both" fork (as_id set) deliberately starts a SEPARATE lineage: record
+        # no origin for it, so sharing it later publishes a new `<you>/<name>` entry of
+        # its own rather than updating the session it was copied from (#55).
         self._resume_conversation(result["name"], result["resume_id"], backend=result["backend"])
 
     def _complete_live_shared_update(self, result: dict) -> None:
@@ -3880,6 +3940,14 @@ class ProxyRunner:
             return
         self._stop_session(options.index(choice))
 
+    def _fork_lineage_on_rename(self, session_id: str | None) -> None:
+        # Rename-as-fork (#55): a deliberate rename re-identifies the session, so drop
+        # any tracked shared-lineage origin. Sharing it now publishes a NEW
+        # `<you>/<new-name>` entry of its own instead of updating the session it was
+        # resumed from (or first shared as) — a rename means "make a separate copy".
+        if session_id and self._user_state().shared_origin(session_id):
+            self._user_state().set_shared_origin(session_id, owner=None, name=None)
+
     def _rename_session_menu(self) -> None:
         options = [self._session_name(index) for index in range(len(self.sessions))]
         choice = self._select_popup("Rename which session?", options)
@@ -3943,6 +4011,7 @@ class ProxyRunner:
         if sid:
             self._stage_backend_resume(sid)  # re-link the transcript under the new path
             self._persist_session_name(sid)
+            self._fork_lineage_on_rename(sid)
         self._reset_agent_tracking()
         self._sanitize_state_trace()
         self._initialize_session_baseline()

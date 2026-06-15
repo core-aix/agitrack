@@ -60,7 +60,10 @@ def shared_sessions_for(repo: GitRepo) -> list[dict]:
     try:
         return [
             {
-                "github_id": entry.github_id,
+                # "owner" is the lineage origin; "label" is the contributor-set display
+                # (`<id1>+<id2>`) — one logical session shows once however many shared it.
+                "owner": entry.github_id,
+                "label": "+".join(entry.contributors),
                 "name": entry.name,
                 "model": entry.manifest.get("model"),
                 "backend": entry.manifest.get("backend"),
@@ -967,7 +970,7 @@ function renderShared(){
   el.innerHTML = SHARED.map(s => {
     const meta = [s.model, s.backend].filter(Boolean).map(esc).join(" · ");
     const age = s.updated ? sharedAge(s.updated) : "";
-    return `<div class="srow"><span class="sid">${esc(s.github_id)}<b>/</b>${esc(s.name)}</span>`+
+    return `<div class="srow"><span class="sid">${esc(s.label || s.owner)}<b>/</b>${esc(s.name)}</span>`+
       `<span class="smeta">${meta}</span><span class="sage">${esc(age)}</span></div>`;
   }).join("");
 }

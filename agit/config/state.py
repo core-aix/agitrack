@@ -352,29 +352,62 @@ class AgitState:
             cur = parent
         return chain
 
-    # --- shared-session origin name (#55) ----------------------------------
-    # The name a session was originally shared under. Tracked per backend session
-    # id (and carried across resume id-drift) so re-sharing a session imported from
-    # another machine updates the SAME shared entry instead of publishing under the
-    # local session name — which prepended the sharer id on every round-trip, so
-    # the name grew without bound and the back-and-forth never converged.
+    # --- shared-session lineage origin (#55) -------------------------------
+    # The identity a session was first shared under: its origin OWNER (the first
+    # sharer's github id), origin NAME, and the accumulating set of CONTRIBUTORS
+    # (every github id that has shared it). Tracked per backend session id and
+    # carried across resume id-drift so re-sharing a session imported from another
+    # machine updates the SAME shared entry — keyed by (owner, name), not the local
+    # sharer — and merges the sharer into the contributor set. This is what keeps
+    # one logical session as ONE entry whose display is `<id1>+<id2>/<name>` instead
+    # of spawning a fresh `<sharer>/<name>` on every machine it round-trips through.
 
-    def shared_origin_name(self, session_id: str | None) -> str | None:
+    def shared_origin(self, session_id: str | None) -> dict | None:
+        """The lineage origin record ``{owner, name, contributors}`` a session was
+        first shared under, or None. Falls back to the legacy name-only record."""
         if not session_id:
             return None
-        value = (self.data.get("shared_origin_names") or {}).get(str(session_id))
-        return str(value) if value else None
+        rec = (self.data.get("shared_origins") or {}).get(str(session_id))
+        if isinstance(rec, dict) and rec.get("name"):
+            return {
+                "owner": str(rec.get("owner") or ""),
+                "name": str(rec["name"]),
+                "contributors": [str(c) for c in (rec.get("contributors") or [])],
+            }
+        name = (self.data.get("shared_origin_names") or {}).get(str(session_id))
+        if name:  # older state recorded only the name
+            return {"owner": "", "name": str(name), "contributors": []}
+        return None
 
-    def set_shared_origin_name(self, session_id: str | None, name: str | None) -> None:
+    def set_shared_origin(
+        self, session_id: str | None, *, owner: str | None, name: str | None, contributors: list[str] | None = None
+    ) -> None:
         if not session_id:
             return
-        origins = dict(self.data.get("shared_origin_names") or {})
+        origins = dict(self.data.get("shared_origins") or {})
+        legacy = dict(self.data.get("shared_origin_names") or {})
         if name:
-            origins[str(session_id)] = name
+            origins[str(session_id)] = {
+                "owner": str(owner or ""),
+                "name": str(name),
+                "contributors": sorted({str(c) for c in (contributors or []) if c}),
+            }
+            legacy[str(session_id)] = str(name)  # keep the legacy map in sync
         else:
             origins.pop(str(session_id), None)
-        self.data["shared_origin_names"] = origins
+            legacy.pop(str(session_id), None)
+        self.data["shared_origins"] = origins
+        self.data["shared_origin_names"] = legacy
         self.save()
+
+    def shared_origin_name(self, session_id: str | None) -> str | None:
+        rec = self.shared_origin(session_id)
+        return rec["name"] if rec else None
+
+    def set_shared_origin_name(self, session_id: str | None, name: str | None) -> None:
+        # Back-compat shim: record just the name (no owner/contributors). New callers
+        # should use set_shared_origin to capture the full lineage identity.
+        self.set_shared_origin(session_id, owner=None, name=name)
 
     def pending_trace(self) -> list[dict]:
         return list(self.data.get("pending_trace") or [])
