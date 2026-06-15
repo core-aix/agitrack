@@ -249,6 +249,86 @@ def test_read_transcript_passes_timeout_to_on_demand_fetch(tmp_path):
     assert seen == [120.0]
 
 
+def test_read_transcript_refetches_latest_even_when_stale_blob_is_local():
+    # Regression: resuming a shared session returned a STALE local copy when an older
+    # transcript blob was already present (e.g. from a prior resume / the listing
+    # fetch). read_transcript must sync the ref FIRST so the resume reflects the
+    # latest shared state, not whatever happens to be local.
+    fetched: list = []
+    blobs = {"abc/me/sess/transcript.jsonl": "OLD local copy"}  # a stale copy is already here
+
+    class FakeRepo:
+        def remote_exists(self, name="origin"):
+            return True
+
+        def root_commit(self):
+            return "abc"
+
+        def read_ref_blob(self, ref, path):
+            return blobs.get(path)
+
+        def fetch_ref(self, refspec, *, remote="origin", filter_blobs=None, timeout=None, cancel=None):
+            fetched.append(refspec)
+            blobs["abc/me/sess/transcript.jsonl"] = "NEW shared latest"  # the remote tip
+            return True
+
+    from agit.sessions import SharedEntry
+
+    store = SharedSessionStore(FakeRepo())  # type: ignore[arg-type]
+    entry = SharedEntry(github_id="me", name="sess", manifest={})
+    assert store.read_transcript(entry) == "NEW shared latest"
+    assert fetched == ["+refs/agit/shared-sessions:refs/agit/shared-sessions"]  # synced before reading
+
+
+def test_read_transcript_without_remote_reads_local_only():
+    # Offline / no remote: never attempt a fetch; serve the local copy (best available).
+    blobs = {"abc/me/sess/transcript.jsonl": "local only"}
+
+    class FakeRepo:
+        def remote_exists(self, name="origin"):
+            return False
+
+        def root_commit(self):
+            return "abc"
+
+        def read_ref_blob(self, ref, path):
+            return blobs.get(path)
+
+        def fetch_ref(self, *a, **k):
+            raise AssertionError("must not fetch when there is no remote")
+
+    from agit.sessions import SharedEntry
+
+    store = SharedSessionStore(FakeRepo())  # type: ignore[arg-type]
+    entry = SharedEntry(github_id="me", name="sess", manifest={})
+    assert store.read_transcript(entry) == "local only"
+
+
+def test_read_transcript_does_not_fetch_when_already_cancelled():
+    import threading
+
+    class FakeRepo:
+        def remote_exists(self, name="origin"):
+            return True
+
+        def root_commit(self):
+            return "abc"
+
+        def read_ref_blob(self, ref, path):
+            return "whatever is local"
+
+        def fetch_ref(self, *a, **k):
+            raise AssertionError("must not start a fetch once cancelled")
+
+    from agit.sessions import SharedEntry
+
+    store = SharedSessionStore(FakeRepo())  # type: ignore[arg-type]
+    cancel = threading.Event()
+    cancel.set()
+    entry = SharedEntry(github_id="me", name="sess", manifest={})
+    assert store.read_transcript(entry, cancel=cancel) == "whatever is local"
+
+
 def test_finalize_on_exit_cancels_inflight_fetches(tmp_path, monkeypatch):
     # Choosing to exit must stop any unfinished session fetch immediately.
     backend = _StubBackend()
