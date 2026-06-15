@@ -243,7 +243,15 @@ class SharedSessionStore:
         return PublishResult(remote=True, pushed=ok, error="" if ok else err.strip())
 
     def publish(
-        self, *, github_id: str, name: str, transcript: str, manifest: dict, keep: int = DEFAULT_KEEP
+        self,
+        *,
+        github_id: str,
+        name: str,
+        transcript: str,
+        manifest: dict,
+        keep: int = DEFAULT_KEEP,
+        timeout: float | None = None,
+        cancel: "threading.Event | None" = None,
     ) -> PublishResult:
         """Share one session: add it, prune the contributor's stale ones, and push.
         The local copy is always saved (so it can be pushed later); the push is
@@ -261,18 +269,29 @@ class SharedSessionStore:
             self._add_session(gid, nm, transcript, manifest)
             pruned = self.prune_own_stale(gid, keep=keep)
             return PublishResult(remote=False, pushed=False, pruned=pruned)
-        result = self._add_and_push(gid, nm, transcript, manifest, keep)
+        result = self._add_and_push(gid, nm, transcript, manifest, keep, timeout, cancel)
         if result.pushed or not _is_stale_lease(result.error):
             return result
+        if cancel is not None and cancel.is_set():
+            return result  # the user cancelled the push: don't fetch+retry behind their back
         # Lost the race (or our orphan ref diverged from a remote one we'd never
         # fetched): sync onto the current remote tip and try once more.
-        self.fetch()
-        return self._add_and_push(gid, nm, transcript, manifest, keep)
+        self.fetch(timeout=timeout, cancel=cancel)
+        return self._add_and_push(gid, nm, transcript, manifest, keep, timeout, cancel)
 
-    def _add_and_push(self, gid: str, nm: str, transcript: str, manifest: dict, keep: int) -> PublishResult:
+    def _add_and_push(
+        self,
+        gid: str,
+        nm: str,
+        transcript: str,
+        manifest: dict,
+        keep: int,
+        timeout: float | None = None,
+        cancel: "threading.Event | None" = None,
+    ) -> PublishResult:
         old = self.repo.ref_sha(self.ref)  # tip we believe the remote is at
         self._add_session(gid, nm, transcript, manifest)
         pruned = self.prune_own_stale(gid, keep=keep)
         lease = f"{self.ref}:{old}" if old else None  # None ⇒ creating the ref
-        ok, err = self.repo.push_ref(f"{self.ref}:{self.ref}", force_with_lease=lease)
+        ok, err = self.repo.push_ref(f"{self.ref}:{self.ref}", force_with_lease=lease, timeout=timeout, cancel=cancel)
         return PublishResult(remote=True, pushed=ok, pruned=pruned, error="" if ok else err.strip())
