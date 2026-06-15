@@ -773,6 +773,64 @@ def test_runner_auto_share_pushes_on_change_only(tmp_path, monkeypatch):
     assert SharedSessionStore(repo).entries()[0].manifest["updated"] == last_updated
 
 
+def test_auto_share_on_exit_pushes_new_conversation(tmp_path, monkeypatch):
+    # Quitting right after a turn (before the live, commit-fired auto-share thread
+    # has pushed) must still share the latest conversation: the exit path pushes
+    # synchronously so the final turns are not lost.
+    backend = _StubBackend(transcript="turn one\nturn two")
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
+    runner.state.set_auto_share("sid-123", True)
+
+    runner._auto_share_on_exit()
+
+    store = SharedSessionStore(repo)
+    assert store.read_transcript(store.entries()[0]) == "turn one\nturn two"
+
+
+def test_auto_share_on_exit_skipped_when_not_auto_shared(tmp_path, monkeypatch):
+    backend = _StubBackend(transcript="private work")
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
+    # auto-share NOT enabled for this session.
+
+    runner._auto_share_on_exit()
+
+    assert SharedSessionStore(repo).entries() == []  # nothing pushed on exit
+
+
+def test_auto_share_on_exit_no_push_when_nothing_new(tmp_path, monkeypatch):
+    # When the latest conversation was already shared during the run, exit is a
+    # no-op — the content-hash gate avoids a redundant final push.
+    backend = _StubBackend(transcript="all caught up")
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
+    runner.state.set_auto_share("sid-123", True)
+
+    runner._auto_share_on_exit()  # first push
+    last_updated = SharedSessionStore(repo).entries()[0].manifest["updated"]
+
+    monkeypatch.setattr("time.time", lambda: 10**10)  # would bump `updated` IF it pushed
+    runner._auto_share_on_exit()  # unchanged ⇒ no push
+
+    assert SharedSessionStore(repo).entries()[0].manifest["updated"] == last_updated
+
+
+def test_finalize_on_exit_invokes_auto_share(tmp_path, monkeypatch):
+    # The exit finalize wires the synchronous auto-share in for every session.
+    backend = _StubBackend()
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
+    called = []
+    runner._auto_share_on_exit = lambda: called.append(True)
+    # Neutralise the rest of the (heavy) finalize so the test stays a unit.
+    runner.sessions = [runner.active]
+    runner._commit_latest_turn_sync = lambda: None
+    runner._finalize_summary_then_integrate_on_exit = lambda: None
+    runner._delete_orphan_merged_branches = lambda: None
+    runner._sweep_orphan_shared_sessions = lambda **k: None
+
+    runner._finalize_pending_work()
+
+    assert called == [True]
+
+
 def test_reshare_uses_origin_name_so_round_trip_updates_same_entry(tmp_path, monkeypatch):
     # A session imported from another machine re-shares under its ORIGINAL share
     # name, so sharing back and forth keeps updating the SAME entry instead of
