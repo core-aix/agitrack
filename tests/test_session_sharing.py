@@ -581,6 +581,60 @@ def test_remote_publish_recency_guard_blocks_a_behind_push(tmp_path):
     assert clone_store.read_transcript(clone_store.entries()[0]) == "t1\nt2\nt3\n"  # remote intact
 
 
+def test_shared_entry_display_uses_sorted_contributor_set():
+    from agit.sessions.store import SharedEntry
+
+    e = SharedEntry(github_id="alice", name="foo", manifest={"contributors": ["bob", "alice", "bob"]})
+    assert e.contributors == ["alice", "bob"]  # de-duped and sorted (order never matters)
+    assert e.display == "alice+bob/foo"
+    # Back-compat: an entry with no contributor set shows just the origin owner.
+    assert SharedEntry(github_id="alice", name="foo", manifest={}).display == "alice/foo"
+
+
+def test_reshare_under_origin_stays_one_entry_and_accumulates_contributors(tmp_path):
+    # The heart of the redesign: bob re-sharing alice's session (under alice's origin
+    # path) updates the SAME entry and joins the contributor set — `alice+bob/foo` —
+    # instead of spawning a separate `bob/foo`.
+    store = SharedSessionStore(_init_repo(tmp_path))
+    store.publish(
+        github_id="alice",
+        name="foo",
+        transcript="t1\n",
+        manifest={"github_id": "alice", "name": "foo", "session_id": "id", "contributors": ["alice"]},
+    )
+    store.publish(
+        github_id="alice",  # origin owner (where it lives), not the sharer
+        name="foo",
+        transcript="t1\nt2\n",
+        prune_gid="bob",  # the actual sharer
+        manifest={"github_id": "alice", "name": "foo", "session_id": "id", "contributors": ["alice", "bob"]},
+    )
+    entries = store.entries()
+    assert len(entries) == 1  # one logical session, not two
+    assert entries[0].display == "alice+bob/foo"
+
+
+def test_prune_gid_prunes_the_sharer_not_the_origin_owner(tmp_path):
+    # A contributor re-sharing under someone else's origin must prune only THEIR own
+    # stale sessions, never the origin owner's — otherwise bob could evict alice's work.
+    store = SharedSessionStore(_init_repo(tmp_path))
+    for n in ("a", "b"):
+        store.publish(
+            github_id="alice", name=n, transcript="x\n", manifest={"github_id": "alice", "name": n, "session_id": n}
+        )
+    # bob re-shares alice/a with keep=1. Pruning is bob's (who owns nothing), so alice's
+    # other session survives — a prune keyed on the origin owner would have dropped it.
+    store.publish(
+        github_id="alice",
+        name="a",
+        transcript="x\ny\n",
+        prune_gid="bob",
+        keep=1,
+        manifest={"github_id": "alice", "name": "a", "session_id": "a", "contributors": ["alice", "bob"]},
+    )
+    assert sorted(e.name for e in store.entries()) == ["a", "b"]
+
+
 class _PublishFakeRepo:
     """Records fetch/push calls so the push-first publish path can be asserted.
 
@@ -797,7 +851,9 @@ def test_resume_shared_keep_both_imports_under_new_id(tmp_path, monkeypatch):
 
     assert backend.imported_as_id == "claude-copy-id"  # re-imported under the fresh id
     assert resumed == [("sess", "claude-copy-id")]  # and resumed that copy
-    assert AgitState(repo.repo).shared_origin_name("claude-copy-id") == "sess"
+    # A "Keep both" fork starts a SEPARATE lineage: no origin is recorded, so sharing
+    # it later publishes a new `<you>/<name>` entry rather than updating the original.
+    assert AgitState(repo.repo).shared_origin("claude-copy-id") is None
 
 
 def test_resume_shared_defaults_to_local_when_shared_is_older(tmp_path, monkeypatch):
@@ -836,6 +892,48 @@ def test_resume_shared_defaults_to_local_when_shared_is_older(tmp_path, monkeypa
     assert "NEWER" in captured["title"]
 
 
+def test_share_identity_uses_origin_for_imported_and_self_for_local(tmp_path, monkeypatch):
+    backend = _StubBackend()
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
+    runner._session_name = lambda idx: "mylocal"
+    # Originated here: owner is the sharer, contributors is just them.
+    assert runner._share_identity("sid-local", "tester") == ("tester", "mylocal", ["tester"])
+    # Imported (origin recorded): writes under the origin owner, sharer joins the set.
+    runner._user_state().set_shared_origin("sid-imp", owner="alice", name="foo", contributors=["alice"])
+    assert runner._share_identity("sid-imp", "tester") == ("alice", "foo", ["alice", "tester"])
+
+
+def test_resume_records_full_lineage_origin(tmp_path, monkeypatch):
+    # Resuming a shared session records its origin owner + name + contributors, so a
+    # later re-share updates that same entry and keeps the contributor set.
+    from agit.config import AgitState
+
+    backend = _StubBackend(transcript="chat", has_local=False)
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
+    SharedSessionStore(repo).publish(
+        github_id="alice",
+        name="sess",
+        transcript="chat",
+        manifest={
+            "github_id": "alice",
+            "name": "sess",
+            "session_id": "sid-x",
+            "updated": 1,
+            "contributors": ["alice", "carol"],
+        },
+    )
+    runner.sessions = []
+    runner._resume_conversation = lambda name, sid, **k: None
+    runner._prompt_session_name = lambda title, *, default: default
+    runner._select_popup = lambda title, options: options[0]
+
+    runner._resume_shared_session_menu()
+    _drain_shared_resume(runner)
+
+    rec = AgitState(repo.repo).shared_origin("sid-x")
+    assert rec == {"owner": "alice", "name": "sess", "contributors": ["alice", "carol"]}
+
+
 # --- auto-share opt-in state ------------------------------------------------
 
 
@@ -850,6 +948,22 @@ def test_state_auto_share_opt_in(tmp_path):
     state.set_auto_share("sid", False)
     assert state.auto_share_enabled("sid") is False
     assert state.auto_share_enabled(None) is False
+
+
+def test_state_shared_origin_round_trip_and_backcompat(tmp_path):
+    from agit.config import AgitState
+
+    st = AgitState(tmp_path)
+    st.set_shared_origin("sid", owner="alice", name="foo", contributors=["bob", "alice", "bob"])
+    assert st.shared_origin("sid") == {"owner": "alice", "name": "foo", "contributors": ["alice", "bob"]}
+    assert st.shared_origin_name("sid") == "foo"  # legacy accessor still resolves the name
+    assert AgitState(tmp_path).shared_origin("sid")["owner"] == "alice"  # persists across reload
+    # A legacy name-only record (older client) still reads, with an empty owner/set.
+    st.set_shared_origin_name("old", "bar")
+    assert st.shared_origin("old") == {"owner": "", "name": "bar", "contributors": []}
+    # Clearing removes it.
+    st.set_shared_origin("sid", owner=None, name=None)
+    assert st.shared_origin("sid") is None
 
 
 def test_state_shared_session_lineage_chain(tmp_path):
@@ -1243,7 +1357,7 @@ def test_publish_with_cancel_returns_result_on_success():
     runner._set_message = lambda *a, **k: None
 
     class _OkStore:
-        def publish(self, *, github_id, name, transcript, manifest, timeout=None, cancel=None):
+        def publish(self, *, github_id, name, transcript, manifest, prune_gid=None, timeout=None, cancel=None):
             return "PUBLISHED"
 
     out = runner._publish_with_cancel(_OkStore(), github_id="me", name="s", transcript="t", manifest={})

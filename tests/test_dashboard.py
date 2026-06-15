@@ -815,7 +815,8 @@ def test_dashboard_lists_shared_sessions(tmp_path):
         },
     )
     listed = shared_sessions_for(repo)
-    assert [f"{s['github_id']}/{s['name']}" for s in listed] == ["alice/fix-parser"]
+    assert [f"{s['label']}/{s['name']}" for s in listed] == ["alice/fix-parser"]
+    assert listed[0]["owner"] == "alice"
     assert listed[0]["model"] == "claude-opus-4-8"
     # The panel + render hook are wired, and the first paint embeds the list.
     html = render_html(repo)

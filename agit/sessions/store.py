@@ -35,13 +35,25 @@ _fetch_at: dict[str, float] = {}
 
 @dataclass
 class SharedEntry:
-    github_id: str
+    github_id: str  # the lineage origin owner = the ref path's owner component
     name: str
     manifest: dict
 
     @property
+    def contributors(self) -> list[str]:
+        """Every github id that has shared this session, sorted (order-independent).
+        Falls back to just the origin owner for an entry shared by an older client
+        that didn't record the set."""
+        raw = self.manifest.get("contributors")
+        ids = sorted({str(c) for c in raw if c}) if isinstance(raw, list) else []
+        return ids or [self.github_id]
+
+    @property
     def display(self) -> str:
-        return f"{self.github_id}/{self.name}"
+        # `<id1>+<id2>/<name>`: the contributor set (sorted, so order never matters)
+        # before the name. One logical session shows as one entry no matter how many
+        # machines/people have shared it.
+        return f"{'+'.join(self.contributors)}/{self.name}"
 
 
 @dataclass
@@ -285,6 +297,7 @@ class SharedSessionStore:
         name: str,
         transcript: str,
         manifest: dict,
+        prune_gid: str | None = None,
         keep: int = DEFAULT_KEEP,
         timeout: float | None = None,
         cancel: "threading.Event | None" = None,
@@ -292,6 +305,13 @@ class SharedSessionStore:
         """Share one session: add it, prune the contributor's stale ones, and push.
         The local copy is always saved (so it can be pushed later); the push is
         best-effort and reports its outcome.
+
+        ``github_id``/``name`` are the entry's LINEAGE ORIGIN (the path it lives at) —
+        a re-share of an imported session writes under the original owner+name so it
+        stays one entry. ``prune_gid`` is the ACTUAL sharer's id, whose own stale
+        sessions are pruned; it defaults to ``github_id`` for a session originated
+        here. (Pruning the origin owner when a different contributor re-shares would
+        let them prune someone else's sessions — hence the split.)
 
         Push-first: build on the local tip and push optimistically, leasing against
         the tip we last knew. This avoids a fetch round trip in the common case —
@@ -301,13 +321,14 @@ class SharedSessionStore:
         work, rebuild our entry onto the new tip, and retry. Net effect: one hop
         normally, two only on a genuine race."""
         gid, nm = slug(github_id), slug(name)
+        pgid = slug(prune_gid) if prune_gid else gid
         if not self.repo.remote_exists():
             if self._would_regress(gid, nm, transcript):
                 return PublishResult(remote=False, pushed=False, behind=True)
             self._add_session(gid, nm, transcript, manifest)
-            pruned = self.prune_own_stale(gid, keep=keep)
+            pruned = self.prune_own_stale(pgid, keep=keep)
             return PublishResult(remote=False, pushed=False, pruned=pruned)
-        result = self._add_and_push(gid, nm, transcript, manifest, keep, timeout, cancel)
+        result = self._add_and_push(gid, nm, transcript, manifest, keep, timeout, cancel, prune_gid=pgid)
         if result.pushed or not _is_stale_lease(result.error):
             return result
         if cancel is not None and cancel.is_set():
@@ -315,7 +336,7 @@ class SharedSessionStore:
         # Lost the race (or our orphan ref diverged from a remote one we'd never
         # fetched): sync onto the current remote tip and try once more.
         self.fetch(timeout=timeout, cancel=cancel)
-        return self._add_and_push(gid, nm, transcript, manifest, keep, timeout, cancel)
+        return self._add_and_push(gid, nm, transcript, manifest, keep, timeout, cancel, prune_gid=pgid)
 
     def _add_and_push(
         self,
@@ -326,6 +347,8 @@ class SharedSessionStore:
         keep: int,
         timeout: float | None = None,
         cancel: "threading.Event | None" = None,
+        *,
+        prune_gid: str | None = None,
     ) -> PublishResult:
         # Recency guard: never replace a longer shared copy with a shorter (older) one.
         # Runs on the retry too — after a stale-lease fetch the local ref equals the
@@ -341,7 +364,7 @@ class SharedSessionStore:
         # fresh full copy each time. Without this, deleting `old` before the push left no
         # local delta base, forcing git to send the whole transcript every share.
         self._add_session(gid, nm, transcript, manifest, reclaim=False)
-        pruned = self.prune_own_stale(gid, keep=keep)
+        pruned = self.prune_own_stale(prune_gid or gid, keep=keep)
         lease = f"{self.ref}:{old}" if old else None  # None ⇒ creating the ref
         ok, err = self.repo.push_ref(f"{self.ref}:{self.ref}", force_with_lease=lease, timeout=timeout, cancel=cancel)
         # The previous version has served as the push's delta base; reclaim it now so
