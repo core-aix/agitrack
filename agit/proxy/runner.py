@@ -337,7 +337,9 @@ class ProxyRunner:
     RENDER_MIN_INTERVAL = 0.033  # coalesce output-driven repaints to ~30fps
     SYNC_MAX_HOLD = 0.05  # cap how long a backend synchronized-update may defer a paint
     SUMMARY_WAIT_SECONDS = 45.0  # how long integration waits for a background commit summary (#8)
-    EXIT_SHARE_TIMEOUT = 15.0  # cap the synchronous auto-share push on exit so it can never hang
+    EXIT_SHARE_TIMEOUT = (
+        45.0  # cap the exit-path auto-share push; long enough for a real push, short enough to never truly hang
+    )
 
     def __init__(
         self,
@@ -512,13 +514,12 @@ class ProxyRunner:
         # background push thread (only one at a time). Triggered per commit.
         self._auto_share_hash: dict[str, str] = {}
         self._auto_share_thread: threading.Thread | None = None
-        # The transcript digest captured when a session was established THIS run (per
-        # backend session id). The exit-path share compares against it so a session
-        # that was only resumed — and not edited — is recognised as unchanged and
-        # never re-pushed. This is robust to Claude's resume id-churn (which rewrites
-        # every transcript row and so changes the digest across runs): within a run
-        # the id is stable, so an untouched session keeps its baseline digest.
-        self._share_baseline_hash: dict[str, str] = {}
+        # aGiT session ids (stable, never drift) that saw at least one committed turn
+        # THIS run. The exit-path auto-share consults this so a session that was only
+        # resumed and never typed into is not re-shared — robust where a transcript
+        # digest is not, since Claude's resume id-churn changes the digest across runs
+        # even with no user input.
+        self._sessions_with_activity: set[str] = set()
         # Lifecycle flags read before their first conditional assignment. These
         # MUST be initialized here: their getattr() guards were removed in P7,
         # and for_testing() seeding them alone would hide a missing init from
@@ -714,7 +715,7 @@ class ProxyRunner:
                 "_warned_backend_session": False,
                 "_auto_share_hash": {},
                 "_auto_share_thread": None,
-                "_share_baseline_hash": {},
+                "_sessions_with_activity": set(),
                 "_user_declined": [],
                 "sessions": [],
                 "worktree_manager": None,
@@ -3059,21 +3060,28 @@ class ProxyRunner:
         sid = self.state.backend_session_id
         if not sid or not self._session_auto_shared(sid):
             return
+        # Nothing happened this run ⇒ nothing to share. This is the ground-truth
+        # gate: it skips a session that was only resumed and never typed into, so
+        # exit stays instant with no "Sharing…" message. It is robust where a
+        # transcript-digest comparison is not — Claude forks a new session id on
+        # resume and rewrites every transcript row, so the digest changes across
+        # runs even when the user did nothing. A turn this run, by contrast, always
+        # routes through on_commit_fn, which records the activity.
+        if self.state.session_id not in self._sessions_with_activity:
+            return
         # Let a still-running live auto-share finish first, so we don't race it and
         # so its updated content hash is visible to the change check below.
         if self._auto_share_thread is not None and self._auto_share_thread.is_alive():
             self._auto_share_thread.join(timeout=self.EXIT_SHARE_TIMEOUT)
-        # Only share when there are new edits. Compare the current transcript digest
-        # against, in order: this run's last live-pushed hash; the digest captured
-        # when the session was established this run (so a resumed-but-untouched
-        # session is recognised as unchanged despite Claude's cross-run id-churn);
-        # and finally the already-published manifest hash.
+        # Among sessions that DID see a turn, still avoid a redundant push: compare
+        # the current transcript digest against this run's last live-pushed hash,
+        # then the already-published manifest hash.
         digest = self._exit_share_digest(backend, sid)
         if digest is None:
             return  # transcript unreadable ⇒ nothing to share
-        last = self._auto_share_hash.get(sid) or self._share_baseline_hash.get(sid) or self._published_content_hash(sid)
+        last = self._auto_share_hash.get(sid) or self._published_content_hash(sid)
         if digest == last:
-            return  # no edits since the last share ⇒ nothing to do
+            return  # already shared this exact content ⇒ nothing to do
         ctx = {
             "session_id": sid,
             "name": self._share_name_for(sid),
@@ -4192,22 +4200,6 @@ class ProxyRunner:
             stage_backend_resume_fn=self._stage_backend_resume,
             debug_fn=self._debug,
         )
-        self._snapshot_share_baseline()
-
-    def _snapshot_share_baseline(self) -> None:
-        # Record the as-established transcript digest for an auto-shared session, so
-        # the exit-path share can tell "only resumed, nothing typed" (digest matches
-        # the baseline ⇒ skip) from "actually had new turns" (digest differs ⇒ push).
-        # Only auto-shared sessions need it, and it's just a local read + hash.
-        backend = self.backend
-        if not getattr(backend, "supports_session_sharing", False):
-            return
-        sid = self.state.backend_session_id
-        if not sid or not self._session_auto_shared(sid):
-            return
-        digest = self._exit_share_digest(backend, sid)
-        if digest is not None:
-            self._share_baseline_hash[sid] = digest
 
     def _mirror_session_to_base(self, session_id: str | None) -> None:
         # Link an aGiT-born conversation's transcript into the base repo's project
@@ -4905,6 +4897,10 @@ class ProxyRunner:
 
         def on_commit_fn(sha, trace_text):
             self._last_agent_commit_id = sha
+            # Mark that this session saw a real turn this run (stable aGiT session id,
+            # not the drift-prone backend id) so the exit-path auto-share knows there
+            # is genuinely something new to push.
+            self._sessions_with_activity.add(self.state.session_id)
             # Don't announce the commit yet: the "created" popup is shown only once
             # the commit is merged into the base branch (see _integrate_turn_or_conflict),
             # so the user is never told a commit landed before it actually has.
