@@ -417,7 +417,10 @@ class GitRepo:
         if filter_blobs:
             cmd.append(f"--filter={filter_blobs}")
         cmd += [remote, refspec]
-        ok = self._run(cmd, check=False).returncode == 0
+        # Never block on an interactive credential prompt — these ref syncs run in
+        # the background (and on the exit path), where a prompt would hang with no
+        # way to answer. Cached creds / credential helpers still work.
+        ok = self._run(cmd, check=False, env={"GIT_TERMINAL_PROMPT": "0"}).returncode == 0
         if filter_blobs and ok:
             # Don't turn the user's remote into a permanently-filtered clone.
             self._run(["git", "config", "--unset", f"remote.{remote}.partialclonefilter"], check=False)
@@ -432,7 +435,10 @@ class GitRepo:
         if force_with_lease is not None:
             command.append(f"--force-with-lease={force_with_lease}" if force_with_lease else "--force-with-lease")
         command += [remote, refspec]
-        result = self._run(command, check=False)
+        # GIT_TERMINAL_PROMPT=0: fail fast on a missing credential rather than
+        # blocking on a prompt no one can answer (e.g. the synchronous exit-path
+        # share). Cached creds / credential helpers are unaffected.
+        result = self._run(command, check=False, env={"GIT_TERMINAL_PROMPT": "0"})
         return result.returncode == 0, result.stderr
 
     def unreachable_commits(self) -> list[str]:

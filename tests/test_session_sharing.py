@@ -813,6 +813,81 @@ def test_auto_share_on_exit_no_push_when_nothing_new(tmp_path, monkeypatch):
     assert SharedSessionStore(repo).entries()[0].manifest["updated"] == last_updated
 
 
+def test_auto_share_on_exit_skips_unedited_resumed_session(tmp_path, monkeypatch):
+    # A session resumed but not edited this run has NO in-memory push hash, yet its
+    # content already matches the published manifest — so exit must NOT re-push.
+    # The gate falls back to the published content_hash to recognise "no edits".
+    backend = _StubBackend(transcript="prior conversation")
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
+    runner.state.set_auto_share("sid-123", True)
+    # Pre-publish the identical content as if shared in an earlier run, then clear
+    # the in-memory hash to simulate a fresh process that only resumed it.
+    runner._auto_share_on_exit()
+    last_updated = SharedSessionStore(repo).entries()[0].manifest["updated"]
+    runner._auto_share_hash.clear()
+
+    monkeypatch.setattr("time.time", lambda: 10**10)  # would bump `updated` IF it pushed
+    runner._auto_share_on_exit()
+
+    assert SharedSessionStore(repo).entries()[0].manifest["updated"] == last_updated
+
+
+def test_auto_share_on_exit_times_out_without_hanging(tmp_path, monkeypatch):
+    # A stalled push (offline / auth / unreachable remote) must never hang exit:
+    # the push is bounded by EXIT_SHARE_TIMEOUT, after which exit continues with a
+    # warning.
+    import threading
+    import time as _time
+
+    backend = _StubBackend(transcript="brand new turns")
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
+    runner.state.set_auto_share("sid-123", True)
+    runner.EXIT_SHARE_TIMEOUT = 0.2
+
+    started = threading.Event()
+
+    class _HangStore:
+        def entries(self):  # consulted by the no-edits gate; nothing published yet
+            return []
+
+        def publish(self, **kwargs):
+            started.set()
+            threading.Event().wait(5)  # block well past the timeout
+
+    runner._shared_store = lambda: _HangStore()
+
+    t0 = _time.monotonic()
+    runner._auto_share_on_exit()
+    elapsed = _time.monotonic() - t0
+
+    assert started.is_set()  # the push was attempted
+    assert elapsed < 2.0  # returned promptly — did not hang on the stalled push
+    assert any("timed out" in m for m in runner.messages)
+
+
+def test_auto_share_on_exit_warns_on_push_failure(tmp_path, monkeypatch):
+    # A remote that exists but rejects the push: warn and continue (don't hang,
+    # don't crash). Simulated with a store whose publish reports a failed push.
+    from agit.sessions.store import PublishResult
+
+    backend = _StubBackend(transcript="unpushed turns")
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
+    runner.state.set_auto_share("sid-123", True)
+
+    class _FailStore:
+        def entries(self):
+            return []
+
+        def publish(self, **kwargs):
+            return PublishResult(remote=True, pushed=False, error="rejected")
+
+    runner._shared_store = lambda: _FailStore()
+
+    runner._auto_share_on_exit()
+
+    assert any("push failed" in m for m in runner.messages)
+
+
 def test_finalize_on_exit_invokes_auto_share(tmp_path, monkeypatch):
     # The exit finalize wires the synchronous auto-share in for every session.
     backend = _StubBackend()

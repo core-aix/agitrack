@@ -337,6 +337,7 @@ class ProxyRunner:
     RENDER_MIN_INTERVAL = 0.033  # coalesce output-driven repaints to ~30fps
     SYNC_MAX_HOLD = 0.05  # cap how long a backend synchronized-update may defer a paint
     SUMMARY_WAIT_SECONDS = 45.0  # how long integration waits for a background commit summary (#8)
+    EXIT_SHARE_TIMEOUT = 15.0  # cap the synchronous auto-share push on exit so it can never hang
 
     def __init__(
         self,
@@ -2999,22 +3000,24 @@ class ProxyRunner:
         self._auto_share_thread = threading.Thread(target=self._auto_share_worker, args=(ctx,), daemon=True)
         self._auto_share_thread.start()
 
-    def _auto_share_worker(self, ctx: dict) -> None:
+    def _auto_share_worker(self, ctx: dict):
         # Runs off the reactor thread; best-effort, never touches the UI. Reads and
         # redacts the (possibly large) transcript and pushes here, not on the loop.
+        # Returns the PublishResult on a push, or None when it skipped (no
+        # transcript / unchanged) or hit an error — the exit path inspects it.
         try:
             backend, sid = ctx["backend"], ctx["session_id"]
             raw = backend.export_session_raw(ctx["repo_path"], sid) or backend.export_session_raw(
                 ctx["base_repo_path"], sid
             )
             if not raw:
-                return
+                return None
             from agit.sessions import redact_transcript
 
             redacted = redact_transcript(raw)
             digest = hashlib.sha256(redacted.encode("utf-8")).hexdigest()
             if digest == ctx["last_hash"]:
-                return  # nothing new since the last push — skip the network round-trip
+                return None  # nothing new since the last push — skip the network round-trip
             self._auto_share_hash[sid] = digest
             manifest = {
                 "github_id": ctx["login"],
@@ -3027,9 +3030,12 @@ class ProxyRunner:
                 "content_hash": digest,
                 "transcript_bytes": backend.transcript_size(ctx["base_repo_path"], sid),
             }
-            ctx["store"].publish(github_id=ctx["login"], name=ctx["name"], transcript=redacted, manifest=manifest)
+            return ctx["store"].publish(
+                github_id=ctx["login"], name=ctx["name"], transcript=redacted, manifest=manifest
+            )
         except Exception as error:
             self._debug(f"auto-share failed: {error!r}")
+            return None
 
     def _auto_share_on_exit(self) -> None:
         # Exit-path counterpart to _maybe_auto_share_active. The live auto-share
@@ -3037,9 +3043,8 @@ class ProxyRunner:
         # (before that thread is scheduled, or while it is still pushing) would
         # leave the final conversation unshared, since daemon threads are killed
         # when the process exits. So push the active session's latest transcript
-        # synchronously here. The worker's content-hash gate means this is a no-op
-        # when nothing new has been said since the last share. Best-effort: any
-        # failure (offline, auth) is swallowed by _auto_share_worker.
+        # here — but ONLY when it actually changed since the last share, and ALWAYS
+        # bounded so a stalled network can never hang exit.
         backend = self.backend
         if not getattr(backend, "supports_session_sharing", False):
             return
@@ -3047,31 +3052,59 @@ class ProxyRunner:
         if not sid or not self._session_auto_shared(sid):
             return
         # Let a still-running live auto-share finish first, so we don't race it and
-        # so its updated content hash is visible to our gate below.
+        # so its updated content hash is visible to the change check below.
         if self._auto_share_thread is not None and self._auto_share_thread.is_alive():
-            self._auto_share_thread.join(timeout=10)
-            if self._auto_share_hash.get(sid) == self._exit_share_digest(backend, sid):
-                return  # the live push already covered the latest conversation
+            self._auto_share_thread.join(timeout=self.EXIT_SHARE_TIMEOUT)
+        # Only share when there are new edits. Compare the current transcript digest
+        # against this run's last-pushed hash, falling back to the already-published
+        # manifest hash so a resumed-but-unedited session never re-pushes.
+        digest = self._exit_share_digest(backend, sid)
+        if digest is None:
+            return  # transcript unreadable ⇒ nothing to share
+        last = self._auto_share_hash.get(sid) or self._published_content_hash(sid)
+        if digest == last:
+            return  # no edits since the last share ⇒ nothing to do
         ctx = {
             "session_id": sid,
             "name": self._share_name_for(sid),
-            "login": self._cached_or_resolve_login(),
+            "login": None,  # resolved inside the bounded thread (a gh call can stall)
             "backend": backend,
             "repo_path": self.repo.repo,
             "base_repo_path": self.base_repo.repo,
             "model": self.state.model,
             "agit_session_id": self.state.session_id,
             "store": self._shared_store(),
-            "last_hash": self._auto_share_hash.get(sid),
+            "last_hash": last,
         }
-        self._set_message(f"Sharing '{ctx['login']}/{ctx['name']}' before exit…", seconds=30)
+        self._set_message(f"Sharing '{ctx['name']}' before exit…", seconds=30)
         self._render()
-        self._auto_share_worker(ctx)  # synchronous: read, redact, hash, push (no-op if unchanged)
+        # Bound the network round-trip: run the push (and the login lookup, which
+        # may shell out to gh) in a thread and wait at most EXIT_SHARE_TIMEOUT. A
+        # stalled push (offline, auth, unreachable remote) can never block exit —
+        # git ref updates are atomic, so an abandoned push simply doesn't land. On
+        # timeout or push failure, warn and continue.
+        outcome: dict = {}
+
+        def push() -> None:
+            ctx["login"] = self._cached_or_resolve_login()
+            outcome["result"] = self._auto_share_worker(ctx)
+
+        thread = threading.Thread(target=push, daemon=True, name="agit-exit-share")
+        thread.start()
+        thread.join(timeout=self.EXIT_SHARE_TIMEOUT)
+        if thread.is_alive():
+            self._set_message("Couldn't share this session before exit (timed out); continuing.", seconds=6.0)
+            self._render()
+            return
+        result = outcome.get("result")
+        if result is not None and result.remote and not result.pushed:
+            self._set_message("Couldn't share this session before exit (push failed); continuing.", seconds=6.0)
+            self._render()
 
     def _exit_share_digest(self, backend, sid: str) -> str | None:
         # The redacted-transcript digest for *sid*, matching the worker's gate, so
-        # the exit path can tell whether a just-finished live push already covered
-        # the latest conversation. None when the transcript can't be read.
+        # the exit path can tell whether the latest conversation differs from what
+        # was last shared. None when the transcript can't be read.
         try:
             raw = backend.export_session_raw(self.repo.repo, sid) or backend.export_session_raw(
                 self.base_repo.repo, sid
@@ -3084,6 +3117,20 @@ class ProxyRunner:
         except Exception as error:
             self._debug(f"exit share digest failed: {error!r}")
             return None
+
+    def _published_content_hash(self, sid: str) -> str | None:
+        # The content_hash of this session's already-published shared entry, read
+        # from the LOCAL shared ref (no network), so the exit gate can tell an
+        # unedited resumed session from one with genuinely new turns. Matched by
+        # session id across resume drift (lineage-aware).
+        try:
+            lineage = set(self._user_state().session_lineage(sid))
+            for entry in self._shared_store().entries():
+                if entry.manifest.get("session_id") in lineage:
+                    return entry.manifest.get("content_hash")
+        except Exception as error:
+            self._debug(f"published content hash lookup failed: {error!r}")
+        return None
 
     def _resume_shared_session_menu(self) -> None:
         store = self._shared_store()
