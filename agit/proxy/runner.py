@@ -724,6 +724,7 @@ class ProxyRunner:
                 "_cwd_launch_at": 0.0,
                 "_shared_resume_thread": None,
                 "_shared_resume_result": None,
+                "_use_worktrees": True,
                 "_relaunch_times": [],
                 "_exiting": False,
                 "_finalized_on_exit": False,
@@ -2358,6 +2359,9 @@ class ProxyRunner:
                 actions.append(("resume", info.name))
         options.append("+ New session (own worktree)")
         actions.append(("new", None))
+        if self._use_worktrees and self.sessions:
+            options.append("✎ Rename a session")
+            actions.append(("rename", None))
         if self._resumable_sessions():
             options.append("↻ Resume a past conversation…")
             actions.append(("resume-past", None))
@@ -2398,6 +2402,8 @@ class ProxyRunner:
             self._new_session(value)
         elif kind == "new":
             self._prompt_new_session()
+        elif kind == "rename":
+            self._rename_session_menu()
         elif kind == "share":
             self._share_session()
         elif kind == "resume-shared":
@@ -3083,9 +3089,10 @@ class ProxyRunner:
         if live_index is not None:
             # This exact conversation is already running here.
             keep_both_id = getattr(agent, "new_import_id", lambda: None)()
-            opts = ["Stay on the running session"]
+            opts = ["Update this session to the shared version"]
             if keep_both_id:
-                opts.append("Keep both (fetch the shared copy as a separate session)")
+                opts.append("Keep both — copy the shared version to a new session")
+            opts.append("Stay as it is (no change)")
             pick = self._select_popup(f"'{entry.display}' is already running here.\nWhat would you like to do?", opts)
             if pick is None:
                 self._set_message("Cancelled.")
@@ -3094,12 +3101,36 @@ class ProxyRunner:
             if pick.startswith("Stay"):
                 self._switch_active(live_index)
                 return
+            if pick.startswith("Update"):
+                # Pull the shared version into the running session: fetch it, then
+                # (on the main loop) restart the backend so it loads the new
+                # transcript — the agent can't pick up a swapped transcript live.
+                self._begin_shared_resume(
+                    store,
+                    entry,
+                    agent,
+                    action="update_live",
+                    name=None,
+                    resume_id=session_id,
+                    overwrite=True,
+                    as_id=None,
+                    backend=entry_backend,
+                )
+                return
             assert keep_both_id is not None
+            copy_name = self._prompt_session_name(
+                "Name the copied session", default=self._dedupe_session_name(entry.name)
+            )
+            if copy_name is None:
+                self._set_message("Cancelled.")
+                self._render()
+                return
             self._begin_shared_resume(
                 store,
                 entry,
                 agent,
-                name=self._dedupe_session_name(entry.name),
+                action="new",
+                name=copy_name,
                 resume_id=keep_both_id,
                 overwrite=False,
                 as_id=keep_both_id,
@@ -3138,19 +3169,26 @@ class ProxyRunner:
                 self._resume_conversation(name, session_id, backend=entry_backend)
                 return
         self._begin_shared_resume(
-            store, entry, agent, name=name, resume_id=resume_id, overwrite=overwrite, as_id=as_id, backend=entry_backend
+            store,
+            entry,
+            agent,
+            action="new",
+            name=name,
+            resume_id=resume_id,
+            overwrite=overwrite,
+            as_id=as_id,
+            backend=entry_backend,
         )
 
-    def _begin_shared_resume(self, store, entry, agent, *, name, resume_id, overwrite, as_id, backend) -> None:
-        # Fetch the (possibly large) transcript and import it on a worker thread so
-        # the reactor loop never blocks on the network; _service_shared_resume()
-        # finishes the switch on the main thread once the result lands.
+    def _begin_shared_resume(self, store, entry, agent, *, action, name, resume_id, overwrite, as_id, backend) -> None:
+        # Fetch the (possibly large) transcript on a worker thread so the reactor
+        # loop never blocks on the network; the import + session switch/restart then
+        # happen on the main loop (_service_shared_resume) once the result lands.
         if self._shared_resume_thread is not None and self._shared_resume_thread.is_alive():
             self._set_message("Already fetching a shared session — please wait.")
             self._render()
             return
         session_id = entry.manifest.get("session_id")
-        base_repo = self.base_repo.repo
         self._shared_resume_result = None
 
         def worker() -> None:
@@ -3159,13 +3197,16 @@ class ProxyRunner:
                 if not transcript:
                     self._shared_resume_result = {"error": "incomplete"}
                     return
-                ok = agent.import_shared_session(base_repo, session_id, transcript, overwrite=overwrite, as_id=as_id)
                 self._shared_resume_result = {
-                    "ok": ok,
+                    "transcript": transcript,
+                    "action": action,
+                    "agent": agent,
+                    "session_id": session_id,
                     "name": name,
                     "resume_id": resume_id,
-                    "backend": backend,
+                    "overwrite": overwrite,
                     "as_id": as_id,
+                    "backend": backend,
                     "entry_name": entry.name,
                 }
             except Exception as error:
@@ -3192,13 +3233,45 @@ class ProxyRunner:
             self._set_message(f"Could not fetch the shared session: {result['error']}", seconds=10.0)
             self._render()
             return
-        if not result.get("ok"):
+        if result["action"] == "update_live":
+            self._complete_live_shared_update(result)
+            return
+        # A new (or copied) session: import the transcript and resume it.
+        agent, sid = result["agent"], result["session_id"]
+        if not agent.import_shared_session(
+            self.base_repo.repo, sid, result["transcript"], overwrite=result["overwrite"], as_id=result["as_id"]
+        ):
             self._set_message("Could not install the shared session for resume.", seconds=8.0)
             self._render()
             return
         if result.get("as_id"):
             self._user_state().set_shared_origin_name(result["as_id"], result["entry_name"])
         self._resume_conversation(result["name"], result["resume_id"], backend=result["backend"])
+
+    def _complete_live_shared_update(self, result: dict) -> None:
+        # Update the already-running session to the shared version: switch to it,
+        # overwrite its worktree transcript, then restart the backend so it loads
+        # the new content (a live agent won't pick up a transcript swapped under it).
+        agent, sid = result["agent"], result["session_id"]
+        idx = next(
+            (
+                i
+                for i, s in enumerate(self.sessions)
+                if getattr(getattr(s, "state", None), "backend_session_id", None) == sid
+            ),
+            None,
+        )
+        if idx is None:
+            # It stopped being live while fetching — fall back to a fresh resume.
+            agent.import_shared_session(self.base_repo.repo, sid, result["transcript"], overwrite=True)
+            self._resume_conversation(result["entry_name"], sid, backend=result["backend"])
+            return
+        self._switch_active(idx)
+        if not agent.import_shared_session(self.repo.repo, sid, result["transcript"], overwrite=True):
+            self._set_message("Could not update the session from the shared version.", seconds=8.0)
+            self._render()
+            return
+        self._restart_agent("Updated this session to the shared version.")
 
     def _format_age(self, updated: float) -> str:
         # An unknown/unset timestamp (0 or None) must not be rendered as a date —
@@ -3244,6 +3317,80 @@ class ProxyRunner:
             self._render()
             return
         self._stop_session(options.index(choice))
+
+    def _rename_session_menu(self) -> None:
+        options = [self._session_name(index) for index in range(len(self.sessions))]
+        choice = self._select_popup("Rename which session?", options)
+        if choice is None:
+            self._set_message("Cancelled.")
+            self._render()
+            return
+        index = options.index(choice)
+        new_name = self._prompt_popup("Rename session", "New name for this session:", default=self._session_name(index))
+        if new_name is None or not new_name.strip():
+            self._set_message("Cancelled.")
+            self._render()
+            return
+        self._rename_session(index, new_name.strip())
+
+    def _rename_session(self, index: int, new_name: str) -> None:
+        # Rename a session by moving its worktree directory. The worktree is in use
+        # (the backend's cwd is inside it), so release the backend first, move, then
+        # restart it pointing at the new path.
+        if not (0 <= index < len(self.sessions)):
+            return
+        sanitized = _sanitize_name(new_name)
+        if self._session_name_taken(sanitized) and sanitized != _sanitize_name(self._session_name(index)):
+            self._set_message(f"'{sanitized}' is already in use.", seconds=6.0)
+            self._render()
+            return
+        self._switch_active(index)
+        info = self.worktree
+        if info is None or not self._use_worktrees:
+            self._set_message("This session has no worktree to rename.")
+            self._render()
+            return
+        if _sanitize_name(info.name) == sanitized:
+            self._set_message("Name unchanged.")
+            self._render()
+            return
+        old_name = info.name
+        sid = self.state.backend_session_id
+        # Release the worktree (the backend has its cwd inside) before moving it.
+        self._stop_file_watcher()
+        self._teardown_child()
+        try:
+            new_info = self._worktrees().move(old_name, sanitized)
+        except Exception as error:
+            self._debug(f"rename worktree failed: {error!r}")
+            # Recover: respawn in the original worktree so the session isn't stranded.
+            self._init_screen()
+            self._spawn()
+            self._start_file_watcher()
+            self._set_message(f"Could not rename session: {error}", seconds=8.0)
+            self._render()
+            return
+        self.name = new_info.name
+        self.worktree = new_info
+        self.repo = GitRepo(new_info.path)
+        self.turn = self._turn_from_branch(self.repo.current_branch())
+        self.state = AgitState(new_info.path, default_backend=self.global_config.default_backend)
+        if sid:
+            self.state.backend_session_id = sid  # re-point backend_session_repo at the new path
+        self.actions = AgitActions(self.repo, self.state, verbose=self.verbose)
+        if sid:
+            self._stage_backend_resume(sid)  # re-link the transcript under the new path
+            self._persist_session_name(sid)
+        self._reset_agent_tracking()
+        self._sanitize_state_trace()
+        self._initialize_session_baseline()
+        self._init_screen()
+        self._spawn()
+        self._resize_child()
+        self._enable_host_mouse()
+        self._start_file_watcher()
+        self._set_message(f"Renamed session to '{new_info.name}'.")
+        self._render()
 
     def _switch_active(self, index: int) -> None:
         if not (0 <= index < len(self.sessions)) or index == self.active_index:

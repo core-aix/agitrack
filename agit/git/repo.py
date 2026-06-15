@@ -206,6 +206,11 @@ class GitRepo:
         # branch is created lazily on the first commit (see _ensure_turn_branch).
         self._run(["git", "worktree", "add", "--detach", path, base])
 
+    def worktree_move(self, old_path: str, new_path: str) -> None:
+        # Move a worktree's directory and update git's admin record. The worktree
+        # must not be in use (no process with its cwd there) or git refuses.
+        self._run(["git", "worktree", "move", old_path, new_path])
+
     def worktree_remove(self, path: str, *, force: bool = False) -> None:
         command = ["git", "worktree", "remove"]
         if force:
