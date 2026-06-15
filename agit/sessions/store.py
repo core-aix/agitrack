@@ -105,16 +105,18 @@ class SharedSessionStore:
         self, entry: SharedEntry, *, timeout: float | None = None, cancel: "threading.Event | None" = None
     ) -> str | None:
         path = f"{self._prefix()}{entry.github_id}/{entry.name}/transcript.jsonl"
-        blob = self.repo.read_ref_blob(self.ref, path)
-        if blob is None and self.repo.remote_exists():
-            # The listing fetch pulls only the small manifests (see `fetch`), so a
-            # large transcript may not be local yet — fetch the full ref now that
-            # the user has actually chosen this session, then read it. ``timeout``
-            # bounds this (potentially large) fetch; ``cancel`` lets the user stop it
-            # outright (the git process is killed, not left running).
+        # Resuming a SHARED session must reflect the LATEST shared state — so sync the
+        # full ref from the remote FIRST, then read. Reading the local ref blind would
+        # return a stale copy whenever one is already present locally: the listing
+        # fetch pulls small transcripts (and only the manifests for large ones), and a
+        # prior resume may have left an older transcript in the object store. The full
+        # fetch force-updates the ref to the remote tip, so the read below is current.
+        # ``timeout`` bounds this (potentially large) fetch; ``cancel`` kills it (the
+        # git process is terminated, not left running). Offline (fetch fails) we fall
+        # back to whatever is local — the best available.
+        if self.repo.remote_exists() and not (cancel is not None and cancel.is_set()):
             self.repo.fetch_ref(f"+{self.ref}:{self.ref}", timeout=timeout, cancel=cancel)
-            blob = self.repo.read_ref_blob(self.ref, path)
-        return blob
+        return self.repo.read_ref_blob(self.ref, path)
 
     # --- writing -----------------------------------------------------------
 
