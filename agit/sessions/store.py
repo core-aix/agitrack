@@ -50,6 +50,15 @@ class PublishResult:
     pushed: bool  # whether the push succeeded
     pruned: int = 0  # how many of the contributor's stale sessions were removed
     error: str = ""
+    behind: bool = False  # refused: the shared copy already has newer turns than this one
+
+
+def count_transcript_rows(text: str) -> int:
+    """Number of non-empty lines in a JSONL transcript — a monotonic proxy for
+    conversation length. Redaction is line-preserving, so a redacted shared copy
+    and a raw local copy of the same conversation have the same row count, which
+    makes them directly comparable for "which is newer/longer"."""
+    return sum(1 for line in text.splitlines() if line.strip())
 
 
 def _is_stale_lease(error: str) -> bool:
@@ -100,6 +109,22 @@ class SharedSessionStore:
             return json.loads(raw) if raw else {}
         except json.JSONDecodeError:
             return {}
+
+    def _entry_rows(self, gid: str, nm: str) -> int | None:
+        """Row count of the transcript currently stored for ``gid/nm`` in the local
+        ref, or None when there's no such entry yet. Authoritative (reads the blob)
+        so it doesn't depend on a manifest field that an older client may omit."""
+        raw = self.repo.read_ref_blob(self.ref, f"{self._prefix()}{gid}/{nm}/transcript.jsonl")
+        return count_transcript_rows(raw) if raw else None
+
+    def _would_regress(self, gid: str, nm: str, transcript: str) -> bool:
+        """Whether writing ``transcript`` would REPLACE a longer shared copy with a
+        shorter one — i.e. this machine is behind. Claude/OpenCode transcripts are
+        append-only, so fewer rows means an older conversation. Refusing this is what
+        stops a stale machine (or its auto-share, which fires on every commit) from
+        rewinding everyone's shared copy to an earlier state."""
+        existing = self._entry_rows(gid, nm)
+        return existing is not None and count_transcript_rows(transcript) < existing
 
     def read_transcript(
         self, entry: SharedEntry, *, timeout: float | None = None, cancel: "threading.Event | None" = None
@@ -277,6 +302,8 @@ class SharedSessionStore:
         normally, two only on a genuine race."""
         gid, nm = slug(github_id), slug(name)
         if not self.repo.remote_exists():
+            if self._would_regress(gid, nm, transcript):
+                return PublishResult(remote=False, pushed=False, behind=True)
             self._add_session(gid, nm, transcript, manifest)
             pruned = self.prune_own_stale(gid, keep=keep)
             return PublishResult(remote=False, pushed=False, pruned=pruned)
@@ -300,6 +327,12 @@ class SharedSessionStore:
         timeout: float | None = None,
         cancel: "threading.Event | None" = None,
     ) -> PublishResult:
+        # Recency guard: never replace a longer shared copy with a shorter (older) one.
+        # Runs on the retry too — after a stale-lease fetch the local ref equals the
+        # remote, so a machine that's behind is caught here and refuses rather than
+        # rewinding everyone's shared session to its older state.
+        if self._would_regress(gid, nm, transcript):
+            return PublishResult(remote=True, pushed=False, behind=True)
         old = self.repo.ref_sha(self.ref)  # tip we believe the remote is at = the delta base
         # Keep the PREVIOUS snapshot's objects (reclaim=False) so they survive until the
         # push below: ``git push`` deltifies the new transcript against the version the

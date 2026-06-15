@@ -111,6 +111,14 @@ _MODIFY_OTHER_KEYS_RE = re.compile(rb"\x1b\[27;(\d+);(\d+)~")
 _BRACKETED_PASTE_RE = re.compile(rb"\x1b\[200~.*?(?:\x1b\[201~|$)", re.S)
 
 
+def _shared_transcript_rows(transcript: str) -> int:
+    # Recorded in the share manifest so the resume menu can tell at a glance whether
+    # a shared copy is older/newer than the local one without reading either blob.
+    from agit.sessions import count_transcript_rows
+
+    return count_transcript_rows(transcript)
+
+
 def _decode_kitty_ctrl_keys(data: bytes) -> bytes:
     """Decode enhanced-keyboard-protocol control keys and Escape to plain bytes.
 
@@ -2874,10 +2882,18 @@ class ProxyRunner:
             "updated": int(time.time()),
             "content_hash": digest,
             "transcript_bytes": backend.transcript_size(self.base_repo.repo, session_id),
+            "transcript_rows": _shared_transcript_rows(redacted),
         }
         return login, name, redacted, digest, manifest
 
     def _share_outcome_message(self, result, login: str, name: str) -> str:
+        if result.behind:
+            # The shared copy already has newer turns than this machine's copy —
+            # sharing would rewind it. Tell the user in plain language (no git jargon).
+            return (
+                f"Didn't share '{login}/{name}': the shared copy already has newer changes than "
+                f"this session. Resume the shared version first to catch up, then share again."
+            )
         if not result.remote:
             message = f"Saved shared session '{login}/{name}' locally (no 'origin' remote to push to)."
         elif result.pushed:
@@ -2979,6 +2995,7 @@ class ProxyRunner:
             "updated": int(time.time()),
             "content_hash": hashlib.sha256(redacted.encode("utf-8")).hexdigest(),
             "transcript_bytes": self.backend.transcript_size(self.base_repo.repo, sid),
+            "transcript_rows": _shared_transcript_rows(redacted),
         }
         # Same UX as the initial share: show a "pushing to origin…" notice while the
         # (potentially slow) push runs, and let the user press Esc to cancel it.
@@ -3207,6 +3224,7 @@ class ProxyRunner:
                 "updated": int(time.time()),
                 "content_hash": digest,
                 "transcript_bytes": backend.transcript_size(ctx["base_repo_path"], sid),
+                "transcript_rows": _shared_transcript_rows(redacted),
             }
             return ctx["store"].publish(
                 github_id=ctx["login"], name=ctx["name"], transcript=redacted, manifest=manifest
@@ -3423,6 +3441,23 @@ class ProxyRunner:
         stripped = _FOCUS_EVENT_RE.sub(b"", stripped)
         return bool(stripped)
 
+    def _shared_is_older_than_local(self, entry, agent, session_id: str) -> bool:
+        """Whether the shared copy of ``entry`` has FEWER turns than the local copy of
+        ``session_id`` — i.e. resuming it would hand back an older conversation than the
+        user already has. Compares the manifest's recorded row count (cheap, no blob
+        read) against the local transcript's. Returns False when either is unknown (an
+        older manifest without the field, or no local transcript), so we never warn on a
+        guess."""
+        from agit.sessions import count_transcript_rows
+
+        shared_rows = entry.manifest.get("transcript_rows")
+        if not isinstance(shared_rows, int):
+            return False
+        raw = agent.export_session_raw(self.base_repo.repo, session_id)
+        if not raw:
+            return False
+        return shared_rows < count_transcript_rows(raw)
+
     def _resume_shared_session_menu(self) -> None:
         store = self._shared_store()
         completed = self._fetch_shared_with_cancel(store, "Fetching shared sessions…")
@@ -3489,11 +3524,26 @@ class ProxyRunner:
         if live_index is not None:
             # This exact conversation is already running here.
             keep_both_id = getattr(agent, "new_import_id", lambda: None)()
-            opts = ["Update this session to the shared version"]
-            if keep_both_id:
-                opts.append("Keep both — copy the shared version to a new session")
-            opts.append("Stay as it is (no change)")
-            pick = self._select_popup(f"'{entry.display}' is already running here.\nWhat would you like to do?", opts)
+            # Guard against silently downgrading: if the shared copy is OLDER than the
+            # running session (it doesn't have your latest turns), lead with keeping
+            # the newer one so "update" can't quietly throw away recent work.
+            shared_older = self._shared_is_older_than_local(entry, agent, session_id)
+            if shared_older:
+                header = (
+                    f"'{entry.display}' is already running here, and the shared copy is OLDER than "
+                    f"your current session — it doesn't include your latest changes. What would you like to do?"
+                )
+                opts = ["Stay as it is (keep my newer session)"]
+                if keep_both_id:
+                    opts.append("Keep both — copy the older shared version to a new session")
+                opts.append("Update anyway (replace my session with the older shared copy)")
+            else:
+                header = f"'{entry.display}' is already running here.\nWhat would you like to do?"
+                opts = ["Update this session to the shared version"]
+                if keep_both_id:
+                    opts.append("Keep both — copy the shared version to a new session")
+                opts.append("Stay as it is (no change)")
+            pick = self._select_popup(header, opts)
             if pick is None:
                 self._set_message("Cancelled.")
                 self._render()
@@ -3549,13 +3599,26 @@ class ProxyRunner:
         if agent.has_local_session(self.base_repo.repo, session_id):
             age = self._format_age(entry.manifest["updated"]) if entry.manifest.get("updated") else "earlier"
             keep_both_id = getattr(agent, "new_import_id", lambda: None)()
-            opts = [f"Replace my local copy with the shared version (updated {age})"]
-            if keep_both_id:
-                opts.append("Keep both (fetch the shared copy as a separate session)")
-            opts.append("Keep my local copy")
-            pick = self._select_popup(
-                f"You already have a local copy of {entry.display}.\nWhich do you want to continue?", opts
-            )
+            # If the shared copy is OLDER than the local one, default to keeping the
+            # local (newer) copy so the user can't unknowingly replace recent work with
+            # a stale shared version (the "much older after resume" report).
+            shared_older = self._shared_is_older_than_local(entry, agent, session_id)
+            if shared_older:
+                header = (
+                    f"You already have a local copy of {entry.display}, and it's NEWER than the shared "
+                    f"version — the shared copy is missing your latest changes. What do you want to do?"
+                )
+                opts = ["Keep my local copy (the newer one)"]
+                if keep_both_id:
+                    opts.append("Keep both (fetch the older shared copy as a separate session)")
+                opts.append(f"Replace my local copy with the OLDER shared version (updated {age})")
+            else:
+                header = f"You already have a local copy of {entry.display}.\nWhich do you want to continue?"
+                opts = [f"Replace my local copy with the shared version (updated {age})"]
+                if keep_both_id:
+                    opts.append("Keep both (fetch the shared copy as a separate session)")
+                opts.append("Keep my local copy")
+            pick = self._select_popup(header, opts)
             if pick is None:
                 self._set_message("Cancelled.")
                 self._render()

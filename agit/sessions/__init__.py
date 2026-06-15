@@ -11,12 +11,13 @@ import/export (in :mod:`agit.transcripts.claude`) is Claude-specific today.
 
 from agit.sessions.identity import github_login
 from agit.sessions.redact import redact_transcript
-from agit.sessions.store import PublishResult, SharedEntry, SharedSessionStore
+from agit.sessions.store import PublishResult, SharedEntry, SharedSessionStore, count_transcript_rows
 
 __all__ = [
     "PublishResult",
     "SharedEntry",
     "SharedSessionStore",
+    "count_transcript_rows",
     "github_login",
     "redact_transcript",
 ]
