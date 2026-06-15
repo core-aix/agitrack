@@ -342,6 +342,22 @@ def test_commit_version_matches_installed_distribution():
     assert f"agit_version: {version('agit-ai')}" in message
 
 
+def test_source_version_falls_back_to_pyproject_when_metadata_missing():
+    # When distribution metadata is unavailable (e.g. an editable install whose
+    # .dist-info went missing after a failed reinstall), the version must fall back
+    # to the source checkout's pyproject.toml — the real release version — rather
+    # than the 0.0.0 placeholder, so commit metadata stays accurate.
+    import re
+    from pathlib import Path
+
+    from agit import _source_version
+
+    pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    expected = re.search(r'^version = "([^"]+)"', pyproject.read_text(), re.M).group(1)
+    assert _source_version() == expected
+    assert expected != "0.0.0"  # the checkout declares a real release version
+
+
 def test_agent_commit_subject_is_capped_for_github():
     message = build_agent_commit_message(
         latest_prompt="please " * 40,
