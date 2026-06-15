@@ -27,6 +27,14 @@ def _manifest(name, *, session_id, updated, model="claude-opus-4-8"):
     return {"github_id": "alice", "name": name, "session_id": session_id, "updated": updated, "model": model}
 
 
+def _drain_shared_resume(runner):
+    # The transcript fetch + import run on a worker thread; the resume completes on
+    # the main loop's _service_shared_resume(). Drain both for the test.
+    if runner._shared_resume_thread is not None:
+        runner._shared_resume_thread.join(timeout=10)
+    runner._service_shared_resume()
+
+
 # --- redaction --------------------------------------------------------------
 
 
@@ -322,6 +330,7 @@ def test_resume_shared_prompts_to_pull_when_local_exists(tmp_path, monkeypatch):
     runner._select_popup = lambda title, options: options[0]
 
     runner._resume_shared_session_menu()
+    _drain_shared_resume(runner)
 
     assert backend.imported == ("sid-x", "bob's chat", True)  # imported with overwrite (replaced local)
 
@@ -348,6 +357,7 @@ def test_resume_shared_keep_both_imports_under_new_id(tmp_path, monkeypatch):
     runner._select_popup = lambda title, options: next(picks)(options)
 
     runner._resume_shared_session_menu()
+    _drain_shared_resume(runner)
 
     assert backend.imported_as_id == "claude-copy-id"  # re-imported under the fresh id
     assert resumed == [("sess", "claude-copy-id")]  # and resumed that copy
@@ -685,6 +695,7 @@ def test_runner_resume_shared_imports_and_resumes(tmp_path, monkeypatch):
     runner._prompt_session_name = lambda title, *, default: default  # accept the offered local name (#71)
 
     runner._resume_shared_session_menu()
+    _drain_shared_resume(runner)
 
     assert backend.imported == ("bob-sid", "bob's chat", False)  # imported, no overwrite (no local copy)
     # Resumed under the original share name (no sharer prefix, #55), pinned to the
@@ -722,6 +733,7 @@ def test_runner_resume_shared_crosses_backends(tmp_path, monkeypatch):
     runner._prompt_session_name = lambda title, *, default: default  # accept the offered local name (#71)
 
     runner._resume_shared_session_menu()
+    _drain_shared_resume(runner)
 
     assert built == ["opencode"]  # a fresh OpenCode agent was constructed
     assert oc_agent.imported == ("ses_bob", '{"info":{"id":"ses_bob"}}', False)  # OpenCode did the import

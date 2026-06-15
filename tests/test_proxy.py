@@ -3010,6 +3010,14 @@ def _shared_resume_runner():
     return runner
 
 
+def _drain_shared_resume(runner):
+    # The transcript fetch + import run on a worker thread; the resume completes on
+    # the main loop's _service_shared_resume(). Drain both for the test.
+    if runner._shared_resume_thread is not None:
+        runner._shared_resume_thread.join(timeout=10)
+    runner._service_shared_resume()
+
+
 def test_shared_resume_prompts_for_local_name():
     runner = _shared_resume_runner()
     # The default offered to the prompt is the original share name (deduped, no
@@ -3023,12 +3031,57 @@ def test_shared_resume_prompts_for_local_name():
     runner._prompt_session_name = fake_prompt
 
     runner._resume_shared_session_menu()
+    _drain_shared_resume(runner)
 
     assert seen["default"] == "fix-parser"
     assert runner.__dict__["_resumed"] == [("my-copy", "sid-1", {"backend": "claude"})]
     # The original share name is remembered so a later re-share updates the same
     # entry regardless of the local name (#55).
     assert runner.__dict__["_origins"]["sid-1"] == "fix-parser"
+
+
+def test_shared_resume_defers_fetch_to_background_then_completes():
+    # The transcript fetch must NOT run on the reactor thread (it can hit the
+    # network and freeze the UI). The menu returns having only started a worker and
+    # shown a message; the resume completes later, on the main loop.
+    runner = _shared_resume_runner()
+    runner._prompt_session_name = lambda title, *, default: "my-copy"
+    messages: list = []
+    runner._set_message = lambda msg, **k: messages.append(msg)
+
+    runner._resume_shared_session_menu()
+
+    assert runner.__dict__["_resumed"] == []  # nothing resumed synchronously
+    assert runner._shared_resume_thread is not None  # a fetch worker is running
+    assert any("Fetching" in m for m in messages)  # the user is told it's fetching
+
+    _drain_shared_resume(runner)
+    assert runner.__dict__["_resumed"] == [("my-copy", "sid-1", {"backend": "claude"})]
+
+
+def test_shared_resume_already_live_stay_switches_without_fetch():
+    import types
+
+    runner = _shared_resume_runner()
+    live = types.SimpleNamespace(state=types.SimpleNamespace(backend_session_id="sid-1"))
+    runner.sessions = [live]
+    runner.__dict__["_switched"] = []
+    runner._switch_active = lambda i: runner.__dict__["_switched"].append(i)
+
+    calls = {"n": 0}
+
+    def popup(title, options):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return options[0]  # pick the entry
+        return next(o for o in options if o.startswith("Stay"))  # already-live conflict
+
+    runner._select_popup = popup
+    runner._resume_shared_session_menu()
+
+    assert runner.__dict__["_switched"] == [0]  # switched to the running session
+    assert runner.__dict__["_resumed"] == []  # no new resume
+    assert runner._shared_resume_thread is None  # no fetch started
 
 
 def test_share_name_uses_remembered_origin_over_local_name():
