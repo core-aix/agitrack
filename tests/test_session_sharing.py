@@ -459,6 +459,53 @@ def test_publish_without_remote_saves_locally(tmp_path):
     assert result.remote is False and result.pushed is False
 
 
+def test_remote_publish_reclaims_previous_version_but_keeps_latest(tmp_path):
+    # Deferred reclaim: the previous transcript blob survives the push (so git can
+    # deltify the new transcript against it — append-only sessions transmit just the
+    # new turns) and is reclaimed AFTER, so local storage stays bounded to the latest
+    # version. A fresh clone still reads the latest. (Exercises the real git push.)
+    import subprocess as sp
+
+    remote = tmp_path / "remote.git"
+    sp.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+    (tmp_path / "src").mkdir()
+    src = _init_repo(tmp_path / "src")
+    branch = src.current_branch()
+    sp.run(["git", "remote", "add", "origin", str(remote)], cwd=src.repo, check=True)
+    sp.run(["git", "push", "-q", "origin", f"HEAD:refs/heads/{branch}"], cwd=src.repo, check=True)
+    sp.run(["git", "-C", str(remote), "symbolic-ref", "HEAD", f"refs/heads/{branch}"], check=True)
+    store = SharedSessionStore(src)
+
+    def transcript_blob():
+        for line in sp.run(
+            ["git", "-C", str(src.repo), "rev-list", "--objects", store.ref], capture_output=True, text=True
+        ).stdout.splitlines():
+            if "transcript" in line:
+                return line.split()[0]
+        return None
+
+    assert store.publish(
+        github_id="a", name="s", transcript="v1\n", manifest=_manifest("s", session_id="id", updated=1)
+    ).pushed
+    old_blob = transcript_blob()
+    assert store.publish(
+        github_id="a", name="s", transcript="v1\nv2\n", manifest=_manifest("s", session_id="id", updated=2)
+    ).pushed
+
+    # The previous version's blob was reclaimed after the push (bounded local storage)…
+    assert sp.run(["git", "-C", str(src.repo), "cat-file", "-e", old_blob], capture_output=True).returncode != 0
+    # …and the ref stays history-free (a single orphan commit, no parents).
+    parents = sp.run(
+        ["git", "-C", str(src.repo), "rev-list", "--count", store.ref], capture_output=True, text=True
+    ).stdout.strip()
+    assert parents == "1"
+    # …and a fresh clone reads the latest.
+    sp.run(["git", "clone", "-q", str(remote), str(tmp_path / "clone")], check=True)
+    clone_store = SharedSessionStore(GitRepo(tmp_path / "clone"))
+    assert clone_store.fetch()  # custom refs aren't pulled by a plain clone
+    assert clone_store.read_transcript(clone_store.entries()[0]) == "v1\nv2\n"
+
+
 class _PublishFakeRepo:
     """Records fetch/push calls so the push-first publish path can be asserted.
 
@@ -493,6 +540,7 @@ class _PublishFakeRepo:
         pass
 
     def delete_orphaned_objects(self, old):
+        self.calls.append("reclaim")  # must come AFTER push so the old blob is the delta base
         return 0
 
     def fetch_ref(self, refspec, *, remote="origin", filter_blobs=None, timeout=None, cancel=None):
@@ -512,7 +560,9 @@ def test_publish_pushes_first_without_a_fetch_in_the_common_case(tmp_path):
         github_id="a", name="s", transcript="t", manifest=_manifest("s", session_id="id", updated=1)
     )
     assert result.pushed is True
-    assert repo.calls == ["push"]  # no fetch in the common case
+    # No fetch; and the previous snapshot is reclaimed only AFTER the push, so it can
+    # serve as the push's delta base (append-only transcripts transmit just the diff).
+    assert repo.calls == ["push", "reclaim"]
 
 
 def test_publish_retries_after_stale_lease(tmp_path):
@@ -523,7 +573,8 @@ def test_publish_retries_after_stale_lease(tmp_path):
         github_id="a", name="s", transcript="t", manifest=_manifest("s", session_id="id", updated=1)
     )
     assert result.pushed is True
-    assert repo.calls == ["push", "fetch", "push"]  # push-first, sync, retry
+    # push-first (reclaim after the failed attempt), sync, retry, reclaim again.
+    assert repo.calls == ["push", "reclaim", "fetch", "push", "reclaim"]
 
 
 def test_publish_does_not_retry_on_auth_failure(tmp_path):
@@ -534,7 +585,7 @@ def test_publish_does_not_retry_on_auth_failure(tmp_path):
         github_id="a", name="s", transcript="t", manifest=_manifest("s", session_id="id", updated=1)
     )
     assert result.pushed is False
-    assert repo.calls == ["push"]  # failed fast — no fetch/retry
+    assert repo.calls == ["push", "reclaim"]  # failed fast — no fetch/retry (still reclaims locally)
 
 
 def test_unshare_removes_only_that_entry(tmp_path):

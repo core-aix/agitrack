@@ -2,6 +2,14 @@
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
+# Ship ONLY the import package (and its subpackages). Without this, setuptools'
+# flat-layout auto-discovery scans every top-level directory and fails the build
+# the moment a non-excluded one appears (e.g. `dev/` for maintenance docs):
+# "Multiple top-level packages discovered in a flat-layout: ['dev', 'agit']".
+# Pinning the package set keeps the build stable as repo-root dirs come and go.
+[tool.setuptools.packages.find]
+include = ["agit*"]
+
 # NOTE: `name` is the PyPI *distribution* name (what `pip install` takes); the
 # import package and the installed command are both `agit`. The plain `agit`
 # name on PyPI is owned by an unrelated project, so aGiT is published as
