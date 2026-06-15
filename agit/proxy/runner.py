@@ -512,6 +512,13 @@ class ProxyRunner:
         # background push thread (only one at a time). Triggered per commit.
         self._auto_share_hash: dict[str, str] = {}
         self._auto_share_thread: threading.Thread | None = None
+        # The transcript digest captured when a session was established THIS run (per
+        # backend session id). The exit-path share compares against it so a session
+        # that was only resumed — and not edited — is recognised as unchanged and
+        # never re-pushed. This is robust to Claude's resume id-churn (which rewrites
+        # every transcript row and so changes the digest across runs): within a run
+        # the id is stable, so an untouched session keeps its baseline digest.
+        self._share_baseline_hash: dict[str, str] = {}
         # Lifecycle flags read before their first conditional assignment. These
         # MUST be initialized here: their getattr() guards were removed in P7,
         # and for_testing() seeding them alone would hide a missing init from
@@ -707,6 +714,7 @@ class ProxyRunner:
                 "_warned_backend_session": False,
                 "_auto_share_hash": {},
                 "_auto_share_thread": None,
+                "_share_baseline_hash": {},
                 "_user_declined": [],
                 "sessions": [],
                 "worktree_manager": None,
@@ -3056,12 +3064,14 @@ class ProxyRunner:
         if self._auto_share_thread is not None and self._auto_share_thread.is_alive():
             self._auto_share_thread.join(timeout=self.EXIT_SHARE_TIMEOUT)
         # Only share when there are new edits. Compare the current transcript digest
-        # against this run's last-pushed hash, falling back to the already-published
-        # manifest hash so a resumed-but-unedited session never re-pushes.
+        # against, in order: this run's last live-pushed hash; the digest captured
+        # when the session was established this run (so a resumed-but-untouched
+        # session is recognised as unchanged despite Claude's cross-run id-churn);
+        # and finally the already-published manifest hash.
         digest = self._exit_share_digest(backend, sid)
         if digest is None:
             return  # transcript unreadable ⇒ nothing to share
-        last = self._auto_share_hash.get(sid) or self._published_content_hash(sid)
+        last = self._auto_share_hash.get(sid) or self._share_baseline_hash.get(sid) or self._published_content_hash(sid)
         if digest == last:
             return  # no edits since the last share ⇒ nothing to do
         ctx = {
@@ -4182,6 +4192,22 @@ class ProxyRunner:
             stage_backend_resume_fn=self._stage_backend_resume,
             debug_fn=self._debug,
         )
+        self._snapshot_share_baseline()
+
+    def _snapshot_share_baseline(self) -> None:
+        # Record the as-established transcript digest for an auto-shared session, so
+        # the exit-path share can tell "only resumed, nothing typed" (digest matches
+        # the baseline ⇒ skip) from "actually had new turns" (digest differs ⇒ push).
+        # Only auto-shared sessions need it, and it's just a local read + hash.
+        backend = self.backend
+        if not getattr(backend, "supports_session_sharing", False):
+            return
+        sid = self.state.backend_session_id
+        if not sid or not self._session_auto_shared(sid):
+            return
+        digest = self._exit_share_digest(backend, sid)
+        if digest is not None:
+            self._share_baseline_hash[sid] = digest
 
     def _mirror_session_to_base(self, session_id: str | None) -> None:
         # Link an aGiT-born conversation's transcript into the base repo's project
