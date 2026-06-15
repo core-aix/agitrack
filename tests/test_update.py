@@ -333,6 +333,56 @@ def test_maybe_apply_pending_update_triggers_when_ready(monkeypatch):
     assert applied == [True]
 
 
+class _StubUpdater:
+    def __init__(self, status: UpdateStatus):
+        self._status = status
+
+    def apply(self) -> UpdateStatus:
+        return self._status
+
+
+def test_apply_update_failure_leaves_session_intact():
+    # If apply() fails, aGiT must NOT tear the session down — the user keeps working
+    # exactly where they were. (Regression: finalizing/removing the worktree first,
+    # then discovering apply() failed, left the reactor on a deleted worktree and
+    # the next `git status` crashed with FileNotFoundError.)
+    runner = make_runner()
+    runner._update_status = UpdateStatus(kind=KIND_SOURCE, available=True)
+    runner._updater = _StubUpdater(UpdateStatus(kind=KIND_SOURCE, error="not a fast-forward"))
+    runner.running = True
+    runner._pending_restart = False
+    finalized: list = []
+    runner._finalize_pending_work = lambda: finalized.append(True)
+    runner._exit_child = lambda: finalized.append("exit")
+    runner._render = lambda: None
+
+    runner._apply_update_and_restart()
+
+    assert finalized == []  # nothing torn down
+    assert runner.running is True  # still running
+    assert runner._pending_restart is False  # no re-exec scheduled
+    assert runner._update_applying is False  # reset so the user can retry
+    assert "update failed" in (runner.message or "").lower()
+
+
+def test_apply_update_success_finalizes_then_restarts():
+    runner = make_runner()
+    runner._update_status = UpdateStatus(kind=KIND_SOURCE, available=True)
+    runner._updater = _StubUpdater(UpdateStatus(kind=KIND_SOURCE, message="Updated to abc123."))
+    runner.running = True
+    runner._pending_restart = False
+    order: list = []
+    runner._finalize_pending_work = lambda: order.append("finalize")
+    runner._exit_child = lambda: order.append("exit_child")
+    runner._render = lambda: None
+
+    runner._apply_update_and_restart()
+
+    assert order == ["finalize", "exit_child"]  # only torn down AFTER a successful apply
+    assert runner._pending_restart is True
+    assert runner.running is False
+
+
 # --- CLI startup prompt -----------------------------------------------------
 
 

@@ -1252,8 +1252,15 @@ class ProxyRunner:
         self._apply_update_and_restart()
 
     def _apply_update_and_restart(self) -> None:
-        # Commit + integrate every session's finished work (same path as exit),
-        # install the update, then ask run()'s teardown to re-exec aGiT.
+        # Install the update, then commit + integrate every session's finished work
+        # (same path as exit) and ask run()'s teardown to re-exec aGiT.
+        #
+        # Order matters: apply the update FIRST, while the session is still fully
+        # intact. If it fails, the user is left exactly where they were — nothing
+        # torn down — and can keep working or retry. Doing the exit-finalize first
+        # (which removes the worktree and terminates the backend) and only THEN
+        # discovering apply() failed left the reactor running against a deleted
+        # worktree, so the next `git status` crashed with FileNotFoundError.
         self._update_applying = True
         self._update_pending = False
         # When the code on disk is already current and only the running process is
@@ -1261,29 +1268,28 @@ class ProxyRunner:
         # run apply(): it would fetch/merge or pip-upgrade needlessly, and a dirty
         # source checkout would even block a pure restart.)
         restart_only = self._update_status is not None and self._update_status.restart_only
-        self._set_message(
-            "Finishing commits, then restarting aGiT…" if restart_only else "Finishing commits, then updating aGiT…",
-            seconds=30.0,
-        )
+        if restart_only:
+            message = "Restarting aGiT to load the updated code…"
+        else:
+            self._set_message("Updating aGiT…", seconds=30.0)
+            self._render()
+            result = self._updater.apply()
+            if not result.ok:
+                self._update_applying = False
+                self._set_message(f"aGiT update failed: {result.error}", seconds=12.0)
+                self._render()
+                return  # session untouched — keep running
+            message = f"{result.message} Restarting aGiT…"
+        # Update is in place (or unnecessary): now finish commits and tear down for
+        # the re-exec.
+        self._set_message("Finishing commits, then restarting aGiT…", seconds=30.0)
         self._render()
         try:
             self._finalize_pending_work()
         except Exception as error:  # don't let a commit hiccup strand the update
-            self._debug(f"finalize before update failed: {error!r}")
-        if restart_only:
-            message = "Restarting aGiT to load the updated code…"
-        else:
-            result = self._updater.apply()
-            if not result.ok:
-                self._update_applying = False
-                self._finalized_on_exit = False  # allow a later clean exit to finalize again
-                self._exiting = False
-                self._set_message(f"aGiT update failed: {result.error}", seconds=12.0)
-                self._render()
-                return
-            message = f"{result.message} Restarting aGiT…"
-        # Success: stop the loop and let run()'s finally restore the terminal and
-        # release the lock before _pending_restart triggers the re-exec.
+            self._debug(f"finalize before update restart failed: {error!r}")
+        # Stop the loop and let run()'s finally restore the terminal and release the
+        # lock before _pending_restart triggers the re-exec.
         self._set_message(message, seconds=10.0)
         self._render()
         self._exit_child()
@@ -5520,9 +5526,12 @@ class ProxyRunner:
             finally:
                 self.active = saved
         self._delete_orphan_merged_branches()
-        # Reclaim any dangling shared-session snapshots before leaving (offline:
-        # no network on the exit path). Belt-and-suspenders to the startup sweep.
-        self._sweep_orphan_shared_sessions(fetch=False)
+        # NB: deliberately NOT sweeping orphan shared-session snapshots here. That
+        # sweep runs `git fsck` over the whole object graph — seconds on a large
+        # repo — and would block exit (showing "Finalizing commits…") even when the
+        # session made no commits. It is redundant anyway: each publish reclaims its
+        # previous snapshot immediately, and the startup sweep (a background thread)
+        # mops up any stragglers. So leave exit fast.
 
     def _finalize_summary_then_integrate_on_exit(self) -> None:
         # Give the current session's in-flight commit summary a short grace period
