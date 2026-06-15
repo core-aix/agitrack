@@ -1460,8 +1460,52 @@ def test_runner_manage_unshare_removes_session(tmp_path, monkeypatch):
     runner._select_popup = lambda title, options: options[2] if title.startswith("Manage") else options[0]
 
     runner._manage_shared_sessions_menu()
+    # Unsharing runs in the background so the session never freezes; drain it.
+    _drain_background_share_ops(runner)
 
     assert SharedSessionStore(repo).entries() == []
+    assert any("session-1" in n[0] for n in runner._session_notices.values())  # a result notice was shown
+
+
+def _drain_background_share_ops(runner):
+    # The unshare/etc. push runs on a daemon thread; join then service so the result
+    # notice lands, mirroring the main loop's _service_background_share_ops().
+    for op in list(runner._background_share_ops):
+        op["thread"].join(timeout=10)
+    runner._service_background_share_ops()
+
+
+def test_unshare_is_non_blocking_with_progress_and_result_notices(tmp_path, monkeypatch):
+    # The reported freeze: unshare pushed synchronously with no message. It must now
+    # return immediately (session stays usable), show a progress notice, then a result.
+    import threading
+    import time as _time
+
+    from agit.sessions import SharedEntry
+    from agit.sessions.store import PublishResult
+
+    backend = _StubBackend()
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
+    gate = threading.Event()
+
+    class SlowStore:
+        def unshare(self, github_id, name):
+            gate.wait(timeout=5)  # the network removal is slow
+            return PublishResult(remote=True, pushed=True)
+
+    runner._shared_store = lambda: SlowStore()
+    entry = SharedEntry(github_id="tester", name="session-1", manifest={"session_id": "sid-123"})
+
+    started = _time.monotonic()
+    runner._unshare_entry(entry)
+    assert _time.monotonic() - started < 1.0  # returned at once — did NOT wait on the push
+    assert runner._background_share_ops  # the removal is running in the background
+    assert any("Unsharing" in n[0] for n in runner._session_notices.values())  # progress shown
+
+    gate.set()
+    _drain_background_share_ops(runner)
+    assert any("Unshared" in n[0] for n in runner._session_notices.values())  # result shown
+    assert runner._background_share_ops == []  # op cleared once finished
 
 
 def test_manage_enabling_auto_update_syncs_immediately(tmp_path, monkeypatch):
