@@ -2360,6 +2360,8 @@ class ProxyRunner:
         options.append("+ New session (own worktree)")
         actions.append(("new", None))
         if self._use_worktrees and self.sessions:
+            options.append("")  # gap: separate session-creation from session-management
+            actions.append(("separator", None))
             options.append("✎ Rename a session")
             actions.append(("rename", None))
         if self._resumable_sessions():
@@ -2368,6 +2370,8 @@ class ProxyRunner:
         # "Share" is offered for every backend so the user gets a clear answer;
         # a backend without a portable transcript says so when chosen. "Resume a
         # shared session" only appears where it can actually work.
+        options.append("")  # gap: set the sharing group apart
+        actions.append(("separator", None))
         options.append("⇪ Share this session with collaborators…")
         actions.append(("share", None))
         if getattr(self.backend, "supports_session_sharing", False):
