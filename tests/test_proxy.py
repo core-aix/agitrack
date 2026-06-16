@@ -4250,8 +4250,10 @@ def test_summarizer_model_picker_lists_models_and_defaults_to_smallest_for_claud
     # All three tiers plus a "same as session" clear option are offered.
     assert "Same as the agent's session model" in captured["options"]
     assert len(captured["options"]) == 4
-    # Choosing the default sets the summarizer to the Haiku model.
-    assert runner.state.summarization_model == "claude-haiku-4-5-20251001"
+    # Choosing the default persists the Haiku model GLOBALLY (so it survives restarts
+    # and session switches) and clears any per-session override.
+    assert runner.global_config.summarization_model == "claude-haiku-4-5-20251001"
+    assert runner.state.summarization_model is None
 
 
 def test_summarizer_model_picker_clear_resets_to_session_model(tmp_path, monkeypatch):
@@ -4271,7 +4273,8 @@ def test_summarizer_model_picker_clear_resets_to_session_model(tmp_path, monkeyp
     runner._select_popup = lambda title, options: options[-1]  # "Same as the agent's session model"
     runner._handle_summarizer_command("model")
 
-    assert runner.state.summarization_model is None  # cleared → same as the session model
+    assert runner.global_config.summarization_model is None  # cleared globally → same as the session model
+    assert runner.state.summarization_model is None
 
 
 def test_summarizer_model_picker_falls_back_to_text_when_no_models(tmp_path, monkeypatch):
@@ -4291,7 +4294,7 @@ def test_summarizer_model_picker_falls_back_to_text_when_no_models(tmp_path, mon
 
     runner._handle_summarizer_command("model")
 
-    assert runner.state.summarization_model == "some/model"  # typed value accepted
+    assert runner.global_config.summarization_model == "some/model"  # typed value persisted globally
 
 
 def test_status_line_unstaged_count_reflects_base_declined(tmp_path):

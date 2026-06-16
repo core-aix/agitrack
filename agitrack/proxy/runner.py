@@ -2343,8 +2343,8 @@ class ProxyRunner:
             options.append(clear_label)
             choice = self._select_popup(f"Summarizer model (current: {current or 'same as session'})", options)
             if choice is not None:
-                self.state.summarization_model = label_for.get(choice, choice)
-                self._set_message(f"Summarizer model: {self.state.summarization_model or '(same as session)'}")
+                self._persist_summarizer_model(label_for.get(choice, choice))
+                self._set_message(f"Summarizer model: {self.global_config.summarization_model or '(same as session)'}")
             self._render()
             return
         # No model list available (the backend's CLI couldn't be queried) — let the
@@ -2352,12 +2352,19 @@ class ProxyRunner:
         new_model = self._prompt_popup(
             "Summarizer Model",
             f"Current: {current or '(same as session)'}\nEnter model (empty to clear):",
-            default=self.state.summarization_model or "",
+            default=current or "",
         )
         if new_model is not None:
-            self.state.summarization_model = new_model.strip() or None
-            self._set_message(f"Summarizer model: {self.state.summarization_model or '(same as session)'}")
+            self._persist_summarizer_model(new_model.strip() or None)
+            self._set_message(f"Summarizer model: {self.global_config.summarization_model or '(same as session)'}")
         self._render()
+
+    def _persist_summarizer_model(self, value: str | None) -> None:
+        # Persist the choice in the GLOBAL config so it survives restarts, session
+        # switches, and applies across the whole repo; clear any per-session override
+        # (which lives in a transient worktree state) so the global value takes effect.
+        self.global_config.summarization_model = value
+        self.state.summarization_model = None
 
     # --- switch base branch ---
 
@@ -5435,9 +5442,17 @@ class ProxyRunner:
         candidates = untracked if include_declined else [path for path in untracked if path not in declined]
         if not candidates:
             return "No untracked files to review."
+        # Cap the listed files to the terminal height so the question and the input
+        # line (which the modal draws LAST) are never pushed off the popup. The
+        # decision is all-or-none, so a preview plus "…and N more" is enough.
+        limit = max(5, self.rows - 10)
+        preview = candidates[:limit]
+        listing = "\n".join(preview)
+        if len(candidates) > len(preview):
+            listing += f"\n…and {len(candidates) - len(preview)} more"
         answer = self._prompt_popup(
             "Untracked Files",
-            "Stage all new files? [y/N]\n" + "\n".join(candidates),
+            f"Stage all {len(candidates)} new file(s)? [y/N]\n{listing}",
         )
         if answer is None:
             return "Cancelled."

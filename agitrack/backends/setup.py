@@ -62,6 +62,39 @@ def select_default_backend(
         # User asked to choose a different backend: show the menu again.
 
 
+def select_default_summarizer_model(
+    config,
+    backend_name: str,
+    *,
+    input_fn: Callable[[str], str] = input,
+    output_fn: Callable[[str], None] = print,
+) -> None:
+    """First-run prompt (after the backend is chosen): pick the model aGiTrack uses
+    to summarize each commit, saved as the global default. For Claude the smallest
+    (Haiku) tier is the recommended default since summarization is a cheap task.
+    Silently leaves the default unchanged when the backend's models can't be listed."""
+    from agitrack.summaries.model_select import list_available_models, smallest_model
+
+    models = list_available_models(backend_name)
+    if not models:
+        return
+    smallest = smallest_model(backend_name, models)
+    ordered = [smallest, *(m for m in models if m != smallest)] if smallest else list(models)
+    output_fn("\nChoose the model aGiTrack uses to summarize each commit (a cheap task):")
+    for index, model in enumerate(ordered, start=1):
+        tag = "  (smallest — recommended)" if model == smallest else ""
+        output_fn(f"  {index}. {model}{tag}")
+    same_index = len(ordered) + 1
+    output_fn(f"  {same_index}. Same as the agent's session model")
+    raw = input_fn(f"Enter a number [1-{same_index}] (default 1): ").strip()
+    choice = raw or "1"
+    if not choice.isdigit() or not 1 <= int(choice) <= same_index:
+        config.summarization_model = ordered[0]  # invalid input → the recommended default
+        return
+    picked = int(choice)
+    config.summarization_model = None if picked == same_index else ordered[picked - 1]
+
+
 def ensure_installed_backend(
     name: str,
     config,
