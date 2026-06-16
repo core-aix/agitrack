@@ -40,6 +40,7 @@ _COMMAND_TAGS = (
     "<bash-stdout>",
     "<bash-stderr>",
     "<user-prompt-submit-hook>",
+    "<task-notification>",
 )
 
 
