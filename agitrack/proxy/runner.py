@@ -509,6 +509,7 @@ class ProxyRunner:
         # _base_branch is per-session (a Session.FIELDS entry that delegates to the
         # active session); each session integrates into its own branch.
         self._repo_dir_branch: str | None = None  # branch checked out in the repo dir (for the status bar)
+        self._pending_merge_prompt = False  # a dir-change merge-target prompt deferred while a run was in flight
         self._integration_paused = False  # reserved; integration is no longer globally paused
         self._base_drift_check_at = 0.0
         self.turn = 0  # per-session transient-branch counter
@@ -732,6 +733,7 @@ class ProxyRunner:
                 "management_lock": None,
                 "base_repo": None,
                 "_repo_dir_branch": None,
+                "_pending_merge_prompt": False,
                 "_integration_paused": False,
                 "_base_drift_check_at": 0.0,
                 "_pending_enter_at": None,
@@ -1040,6 +1042,11 @@ class ProxyRunner:
         # independent of the directory's checkout and of the other sessions.)
         if self.worktree is None or self._base_branch is None:
             return
+        # A dir-change prompt that was deferred while a run was in flight fires now that
+        # the session is idle (the run finished, so its merge branch can change safely).
+        if self._pending_merge_prompt and not self.agent_in_flight:
+            self._pending_merge_prompt = False
+            self._prompt_merge_targets_on_dir_change()
         now = time.monotonic()
         if now - self._base_drift_check_at < self.BASE_DRIFT_CHECK_SECONDS:
             return
@@ -1051,6 +1058,17 @@ class ProxyRunner:
         if current == self._repo_dir_branch:
             return  # the repo directory hasn't moved since the last poll
         self._repo_dir_branch = current  # keep the status bar's "current dir branch" fresh
+        if self._base_branch != current and self.agent_in_flight:
+            # The session is mid-run — don't change its merge branch now. Warn that this
+            # run still lands on its current branch, and re-ask once it goes idle.
+            self._pending_merge_prompt = True
+            self._set_message(
+                f"Repo is now on '{current}', but this run still merges into '{self._base_branch}'. "
+                f"You'll be asked again when the run finishes.",
+                seconds=10.0,
+            )
+            self._render()
+            return
         self._prompt_merge_targets_on_dir_change()
 
     def _prompt_merge_targets_on_dir_change(self) -> None:
@@ -1094,6 +1112,8 @@ class ProxyRunner:
             return
         if self._base_branch == self._repo_dir_branch:
             return
+        if self.agent_in_flight:
+            return  # a running session's branch can't change mid-run; the status bar bolds the difference
         choice = self._select_popup(
             f"The repo directory is on '{self._repo_dir_branch}', but session '{self.name}' merges into "
             f"'{self._base_branch}'. Where should this session's changes merge?",
@@ -1128,6 +1148,16 @@ class ProxyRunner:
             return False
         if target == self._base_branch:
             return True
+        if self.agent_in_flight:
+            # Never change a running session's merge branch mid-turn — its in-flight
+            # work would split across branches. Only an idle session can be re-pointed.
+            self._set_message(
+                f"'{self.name}' is running a turn — its merge branch can only be changed when idle. "
+                f"This run will merge into '{self._base_branch}'.",
+                seconds=10.0,
+            )
+            self._render()
+            return False
         old = self._base_branch
         self._exiting = True  # suppress the conflict-resolve popup during the flush
         self._set_message(f"Integrating '{self.name}' into '{old}' before re-targeting…", seconds=30)
@@ -1143,6 +1173,8 @@ class ProxyRunner:
             self._render()
             return False
         self._base_branch = target  # the active session's new merge target (syncs the service)
+        if self.state is not None:
+            self.state.merge_branch = target  # keep the worktree's recorded merge branch in step
         self._repoint_current_to_base()
         self._exiting = False
         self._set_message(f"'{self.name}' now merges into '{target}'.", seconds=8.0)
@@ -1742,6 +1774,7 @@ class ProxyRunner:
         self.turn = self._turn_from_branch(repo.current_branch())
         self.state = AgitrackState(info.path, default_backend=self.global_config.default_backend)
         self.state.backend = backend_name
+        self.state.merge_branch = self._base_branch  # record this worktree's own merge branch
         # The worktree is recreated fresh each run (its working state is not kept),
         # so seed its resume pointer to continue the chosen conversation.
         if not self.state.backend_session_id and resume_id:
@@ -1834,6 +1867,20 @@ class ProxyRunner:
         # A worktree mid-merge or with uncommitted changes is left untouched.
         if self._base_branch is None:
             return
+        # Cross-branch safeguard: only ever merge a worktree's OWN recorded merge
+        # branch into it. If the base we're about to merge differs from the branch this
+        # worktree was set up for, refuse and warn loudly — one session's branch must
+        # never be merged into another session's worktree (the demo-video→dev bug).
+        own = self._worktree_merge_branch(repo)
+        if own is not None and own != self._base_branch:
+            self._set_message(
+                f"⚠ Prevented a cross-branch merge: NOT merging '{self._base_branch}' into a session "
+                f"worktree that merges into '{own}'. Sessions on different branches are kept separate.",
+                seconds=15.0,
+            )
+            self._render()
+            self._debug(f"cross-branch align blocked: base '{self._base_branch}' != worktree base '{own}'")
+            return
         try:
             outcome = self._integration.align_session_to_base(repo)
         except Exception as error:
@@ -1847,6 +1894,15 @@ class ProxyRunner:
             self._debug(f"base '{self._base_branch}' conflicts with {branch}; left for integration")
         elif outcome == "repointed":
             self._debug(f"re-pointed session worktree to current base '{self._base_branch}'")
+
+    def _worktree_merge_branch(self, repo: GitRepo) -> str | None:
+        # The merge branch recorded in the worktree's OWN state file — read straight
+        # from disk so it reflects THIS worktree regardless of which session is active.
+        # None when unknown (e.g. a worktree created before this was tracked).
+        try:
+            return AgitrackState(repo.repo).merge_branch
+        except Exception:
+            return None
 
     def _worktree_has_pending_work(self, repo: GitRepo, branch: str) -> bool:
         # Pending = uncommitted changes, or commits on its branch not yet in base.
@@ -2084,16 +2140,18 @@ class ProxyRunner:
         # Only idle, clean worktrees are touched, so in-flight work is left alone.
         if self._integration_paused:
             return  # base switched out-of-band; don't re-point worktrees meanwhile
-        repo: GitRepo | None
         for index in range(len(self.sessions)):
             if index == self.active_index:
-                repo, in_flight = self.repo, self.agent_in_flight
-            else:
-                snapshot = self.sessions[index]
-                repo, in_flight = getattr(snapshot, "repo", None), getattr(snapshot, "agent_in_flight", False)
-            if repo is None or in_flight:
+                if not self.agent_in_flight:
+                    self._align_session_to_base(self.repo)
                 continue
-            self._align_session_to_base(repo)
+            snapshot = self.sessions[index]
+            if getattr(snapshot, "repo", None) is None or getattr(snapshot, "agent_in_flight", False):
+                continue
+            # Switch to the idle session so _base_branch (and the integration service)
+            # reflect ITS OWN merge branch — never the active session's, which would
+            # merge a different branch into this worktree (cross-branch contamination).
+            self._with_session(snapshot, lambda: self._align_session_to_base(self.repo))
 
     def _ensure_turn_branch(self) -> None:
         # A merged-and-detached session sits at base between turns. Before its
@@ -2405,6 +2463,15 @@ class ProxyRunner:
             return
         index = label_for[choice]
         session = self.sessions[index]
+        if getattr(session, "agent_in_flight", False):
+            # A running session's merge branch can't change mid-turn (its in-flight work
+            # would split across branches); only idle sessions can be re-pointed.
+            self._set_message(
+                f"'{self._session_name(index)}' is running a turn — change its merge branch when it's idle.",
+                seconds=8.0,
+            )
+            self._render()
+            return
         current = getattr(session, "_base_branch", None)
         target = self._prompt_merge_branch(f"Merge '{self._session_name(index)}' into which branch?", current)
         if not target:
@@ -4341,6 +4408,7 @@ class ProxyRunner:
         self._base_branch = base  # this session integrates into `base` (per-session)
         self.turn = self._turn_from_branch(repo.current_branch())
         self.state = AgitrackState(info.path, default_backend=self.global_config.default_backend)
+        self.state.merge_branch = base  # record this worktree's own merge branch
         if backend:
             # Pin this session to a specific backend (e.g. created by switching
             # backends), independent of the global default.

@@ -3580,6 +3580,41 @@ def test_session_switch_prompt_keeps_or_switches_active_session():
     assert runner.retargeted == ["feature-x"]
 
 
+def test_repo_dir_change_while_running_defers_prompt_until_idle():
+    # A running session's merge branch must NOT change mid-turn. The dir-change prompt
+    # is deferred (with a warning) and fires once the session is idle.
+    runner = _merge_drift_runner("feature-x", choice="Switch only 's1' to 'feature-x'")
+    runner.agent_in_flight = True  # a turn is in flight
+
+    runner._check_base_branch_drift()
+    assert runner.popups == []  # NOT prompted while running
+    assert runner._pending_merge_prompt is True
+    assert runner.retargeted == []  # nothing re-targeted mid-run
+    assert any("still merges into 'dev'" in m for m in runner.messages)  # the warning
+
+    # The run finishes → on the next poll the deferred prompt fires.
+    runner.agent_in_flight = False
+    runner._base_drift_check_at = 0.0
+    runner._check_base_branch_drift()
+    assert runner.popups  # now it asks
+    assert runner.retargeted == ["feature-x"]
+    assert runner._pending_merge_prompt is False
+
+
+def test_retarget_active_session_refused_while_running():
+    import types
+
+    runner = make_runner(worktree=types.SimpleNamespace(), _base_branch="dev", name="s1")
+    runner.agent_in_flight = True
+    runner.messages = []
+    runner._set_message = lambda m, **k: runner.messages.append(m)
+    runner._render = lambda: None
+
+    assert runner._retarget_active_session("feature-x") is False  # refused
+    assert runner._base_branch == "dev"  # unchanged
+    assert any("running a turn" in m for m in runner.messages)
+
+
 def test_integrate_turn_skips_while_paused():
     import types
 

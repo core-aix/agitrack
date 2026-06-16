@@ -448,6 +448,62 @@ def test_session_unintegrated_flags_conflict_in_progress(tmp_path):
     assert runner._integration.session_unintegrated(work) is True
 
 
+def test_align_refuses_cross_branch_merge(tmp_path):
+    # The guard: aGiTrack must NEVER merge a branch into a worktree other than the
+    # one that worktree records as its own merge branch (the demo-video→dev bug).
+    main = _init_repo(tmp_path)
+    base = main.current_branch()
+    main.create_branch("demo-video", base)
+    info, work = _make_session(main, "s1", base)
+    AgitrackState(info.path).merge_branch = base  # this worktree merges into `base`
+
+    runner = _integration_runner(main, work, base, "s1")
+    runner.worktree = info
+    runner._base_branch = "demo-video"  # but the runner is (wrongly) on another branch
+    aligned: list = []
+    runner._integration.align_session_to_base = lambda r: aligned.append(r) or "repointed"
+    warnings: list = []
+    runner._set_message = lambda m, **k: warnings.append(m)
+
+    runner._align_session_to_base(work)
+
+    assert aligned == []  # the merge was REFUSED, not performed
+    assert any("cross-branch" in w.lower() for w in warnings)  # the user is warned
+
+
+def test_sync_idle_worktrees_aligns_each_session_to_its_own_base(tmp_path):
+    # Two sessions on different merge branches: the idle one must be aligned to ITS
+    # OWN base, never the active session's (which would merge across branches).
+    from agitrack.proxy.session import Session
+
+    main = _init_repo(tmp_path)
+    base = main.current_branch()
+    main.create_branch("demo-video", base)
+    info1, work1 = _make_session(main, "s1", base)
+    info2, work2 = _make_session(main, "s2", "demo-video", backend="test")
+
+    runner = _integration_runner(main, work2, "demo-video", "s2")  # active session merges into demo-video
+    runner.worktree = info2
+    runner.agent_in_flight = False
+
+    idle = Session.bare()
+    idle.repo = work1
+    idle.worktree = info1
+    idle.name = "s1"
+    idle._base_branch = base  # the idle session merges into `base`
+    idle.agent_in_flight = False
+    runner.sessions = [runner.active, idle]
+
+    recorded: list = []
+    runner._align_session_to_base = lambda repo: recorded.append((runner.name, runner._base_branch))
+
+    runner._sync_idle_worktrees_to_base()
+
+    # Each session was aligned with ITS OWN branch — never crossed.
+    assert ("s2", "demo-video") in recorded
+    assert ("s1", base) in recorded
+
+
 def test_repoint_current_to_base_detaches_at_new_base(tmp_path):
     main = _init_repo(tmp_path)
     base = main.current_branch()

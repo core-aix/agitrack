@@ -423,6 +423,20 @@ class AgitrackState:
         return value if isinstance(value, int) and value > 0 else 5
 
     @property
+    def merge_branch(self) -> str | None:
+        # The branch this session's worktree integrates ("merges") into. Persisted
+        # per worktree so aGiTrack can verify it never merges a DIFFERENT branch into
+        # this worktree (cross-branch contamination), independent of which session is
+        # active when a sync runs.
+        value = self.config.get("merge_branch")
+        return str(value) if value else None
+
+    @merge_branch.setter
+    def merge_branch(self, value: str | None) -> None:
+        self.config["merge_branch"] = value
+        self._save_config()
+
+    @property
     def summarization_model(self) -> str | None:
         value = self.config.get("summarization_model")
         return str(value) if value else None
