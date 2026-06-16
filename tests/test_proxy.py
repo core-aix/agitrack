@@ -79,11 +79,11 @@ class FakeCommitRepo:
 def test_proxy_ctrl_g_enters_command_mode():
     parser = ProxyInput()
 
-    forwarded, local_echo, command, should_exit = parser.feed(b"\x07git-status\r")
+    forwarded, local_echo, command, should_exit = parser.feed(b"\x07git-unstaged\r")
 
     assert forwarded == []
     assert local_echo == b""
-    assert command == "git-status"
+    assert command == "git-unstaged"
     assert should_exit is False
 
 
@@ -165,10 +165,10 @@ def test_modify_other_keys_ctrl_g_opens_menu():
 
     decoded = _decode_kitty_ctrl_keys(b"\x1b[27;5;103~")
     parser = ProxyInput(menu_key=b"\x07")  # default Ctrl-G
-    forwarded, _local_echo, command, should_exit = parser.feed(decoded + b"git-status\r")
+    forwarded, _local_echo, command, should_exit = parser.feed(decoded + b"git-unstaged\r")
 
     assert forwarded == []
-    assert command == "git-status"
+    assert command == "git-unstaged"
     assert should_exit is False
 
 
@@ -219,9 +219,11 @@ _CTRL_C_ENCODINGS = {"kitty": b"\x1b[99;5u", "modifyOtherKeys": b"\x1b[27;5;99~"
 def test_menu_key_opens_under_both_keyboard_protocols(protocol):
     runner = make_runner()
     parser = ProxyInput(menu_key=b"\x07")  # default Ctrl-G
-    forwarded, command, should_exit = _drive_host_input(runner, parser, [_CTRL_G_ENCODINGS[protocol] + b"git-status\r"])
+    forwarded, command, should_exit = _drive_host_input(
+        runner, parser, [_CTRL_G_ENCODINGS[protocol] + b"git-unstaged\r"]
+    )
     assert forwarded == []
-    assert command == "git-status"
+    assert command == "git-unstaged"
     assert should_exit is False
 
 
@@ -261,10 +263,10 @@ def test_proxy_menu_key_works_with_kitty_encoding():
     decoded = _decode_kitty_ctrl_keys(kitty_encoded_ctrl_o)
 
     parser = ProxyInput(menu_key=b"\x0f")  # Ctrl-O
-    forwarded, local_echo, command, should_exit = parser.feed(decoded + b"git-status\r")
+    forwarded, local_echo, command, should_exit = parser.feed(decoded + b"git-unstaged\r")
 
     assert forwarded == []
-    assert command == "git-status"
+    assert command == "git-unstaged"
     assert should_exit is False
 
 
@@ -272,11 +274,11 @@ def test_proxy_shift_modified_menu_key_enters_command_mode():
     # Test multi-byte kitty keyboard protocol sequence for Ctrl+Shift+G
     parser = ProxyInput(menu_key=b"\x1b[103;6u")
 
-    forwarded, local_echo, command, should_exit = parser.feed(b"\x1b[103;6ugit-status\r")
+    forwarded, local_echo, command, should_exit = parser.feed(b"\x1b[103;6ugit-unstaged\r")
 
     assert forwarded == []
     assert local_echo == b""
-    assert command == "git-status"
+    assert command == "git-unstaged"
     assert should_exit is False
 
 
@@ -400,11 +402,11 @@ def test_proxy_escape_clears_command_buffer():
 def test_proxy_tab_completes_command():
     parser = ProxyInput()
 
-    forwarded, local_echo, command, should_exit = parser.feed(b"\x07git-stat\t\r")
+    forwarded, local_echo, command, should_exit = parser.feed(b"\x07git-un\t\r")
 
     assert forwarded == []
     assert local_echo == b""
-    assert command == "git-status"
+    assert command == "git-unstaged"
     assert should_exit is False
 
 
@@ -433,11 +435,11 @@ def test_proxy_tab_completes_selected_command():
 def test_proxy_enter_runs_selected_partial_match_without_tab():
     parser = ProxyInput()
 
-    forwarded, local_echo, command, should_exit = parser.feed(b"\x07git-stat\r")
+    forwarded, local_echo, command, should_exit = parser.feed(b"\x07git-un\r")
 
     assert forwarded == []
     assert local_echo == b""
-    assert command == "git-status"
+    assert command == "git-unstaged"
     assert should_exit is False
 
 
@@ -455,11 +457,11 @@ def test_proxy_agent_backend_command_name():
 def test_proxy_ignores_sgr_mouse_sequences_in_command_mode():
     parser = ProxyInput()
 
-    forwarded, local_echo, command, should_exit = parser.feed(b"\x07\x1b[<35;88;11Mgit-status\r")
+    forwarded, local_echo, command, should_exit = parser.feed(b"\x07\x1b[<35;88;11Mgit-unstaged\r")
 
     assert forwarded == []
     assert local_echo == b""
-    assert command == "git-status"
+    assert command == "git-unstaged"
     assert should_exit is False
 
 
@@ -4083,7 +4085,7 @@ def test_sync_idle_worktrees_aligns_idle_skips_in_flight():
 #
 # A session runs in a worktree that only contains tracked files, but the user's
 # own untracked / intentionally-unstaged files live in the base working tree.
-# These commands (git-stage / git-unstaged / git-user-commit) must therefore read
+# These commands (git-unstaged / git-user-commit) must therefore read
 # and write the base repo + base state, or the user's files are invisible.
 
 
@@ -4109,66 +4111,6 @@ def _user_git_runner(tmp_path, answers):
     return runner, repo
 
 
-def test_stage_files_groups_new_and_declined_and_stages_selection(tmp_path):
-    runner, repo = _user_git_runner(tmp_path, answers=["1", "add new"])
-    (tmp_path / "new.py").write_text("x\n", encoding="utf-8")
-    (tmp_path / "local.txt").write_text("y\n", encoding="utf-8")
-    runner._user_state().add_declined(["local.txt"])  # recorded by the pre-agent flow
-
-    message = runner._stage_files_popup()
-
-    body = runner.prompts[0][1]
-    assert "New files:" in body and "new.py" in body
-    assert "Intentionally unstaged:" in body and "local.txt" in body
-    # #1 is new.py (new files listed first); it is staged+committed, local.txt left.
-    assert "Committed 1 file" in message
-    assert "new.py" not in repo.untracked_files()
-    assert "local.txt" in repo.untracked_files()
-
-
-def test_stage_files_all_stages_every_candidate(tmp_path):
-    runner, repo = _user_git_runner(tmp_path, answers=["a", "add all"])
-    (tmp_path / "new.py").write_text("x\n", encoding="utf-8")
-    (tmp_path / "local.txt").write_text("y\n", encoding="utf-8")
-    runner._user_state().add_declined(["local.txt"])
-
-    message = runner._stage_files_popup()
-
-    assert "Committed 2 file" in message
-    assert repo.untracked_files() == []
-    assert runner._user_state().declined_untracked() == []  # declined cleared too
-
-
-def test_stage_files_reads_declined_from_base_not_worktree_state(tmp_path):
-    # Regression: declines are recorded in BASE state by the pre-agent prompt; the
-    # menu must surface them from there, not from the (empty) worktree state.
-    runner, repo = _user_git_runner(tmp_path, answers=[""])  # view, then cancel
-    (tmp_path / "local.txt").write_text("y\n", encoding="utf-8")
-    runner._user_state().add_declined(["local.txt"])
-    runner.state = AgitrackState(tmp_path / "worktree")  # worktree state: nothing declined
-
-    message = runner._stage_files_popup()
-
-    assert "local.txt" in runner.prompts[0][1]
-    assert message == "Nothing staged."
-
-
-def test_stage_files_empty_when_nothing_to_stage(tmp_path):
-    runner, repo = _user_git_runner(tmp_path, answers=[])
-    assert runner._stage_files_popup() == "No files to stage."
-    assert runner.prompts == []  # nothing to ask about
-
-
-def test_stage_files_invalid_selection_stages_nothing(tmp_path):
-    runner, repo = _user_git_runner(tmp_path, answers=["9"])  # out of range
-    (tmp_path / "new.py").write_text("x\n", encoding="utf-8")
-
-    message = runner._stage_files_popup()
-
-    assert "nothing staged" in message.lower()
-    assert "new.py" in repo.untracked_files()
-
-
 def test_git_status_returns_full_long_format(tmp_path):
     from agitrack.git import GitRepo
 
@@ -4179,6 +4121,82 @@ def test_git_status_returns_full_long_format(tmp_path):
 
     assert "Untracked files" in output  # long format, not --short
     assert "new.py" in output
+
+
+def test_summarizer_model_picker_lists_models_and_defaults_to_smallest_for_claude(tmp_path, monkeypatch):
+    import agitrack.summaries.model_select as model_select
+    from proxy_helpers import make_runner
+
+    runner = make_runner(state=AgitrackState(tmp_path))
+    runner.global_config = type("GC", (), {"summarization_model": None})()
+    runner._render = lambda: None
+    runner.messages = []
+    runner._set_message = lambda msg, **k: runner.messages.append(msg)
+    runner.state.backend = "claude"
+    runner.state.summarization_model = None
+
+    monkeypatch.setattr(
+        model_select,
+        "list_available_models",
+        lambda name: ["claude-haiku-4-5-20251001", "claude-sonnet-4-6", "claude-opus-4-8"],
+    )
+    captured: dict = {}
+
+    def popup(title, options):
+        captured["options"] = options
+        return options[0]  # accept the default (smallest)
+
+    runner._select_popup = popup
+    runner._handle_summarizer_command("model")
+
+    # The smallest (Haiku) tier is listed first and flagged as the default.
+    assert captured["options"][0].startswith("claude-haiku-4-5-20251001")
+    assert "smallest" in captured["options"][0].lower()
+    # All three tiers plus a "same as session" clear option are offered.
+    assert "Same as the agent's session model" in captured["options"]
+    assert len(captured["options"]) == 4
+    # Choosing the default sets the summarizer to the Haiku model.
+    assert runner.state.summarization_model == "claude-haiku-4-5-20251001"
+
+
+def test_summarizer_model_picker_clear_resets_to_session_model(tmp_path, monkeypatch):
+    import agitrack.summaries.model_select as model_select
+    from proxy_helpers import make_runner
+
+    runner = make_runner(state=AgitrackState(tmp_path))
+    runner.global_config = type("GC", (), {"summarization_model": None})()
+    runner._render = lambda: None
+    runner._set_message = lambda *a, **k: None
+    runner.state.backend = "claude"
+    runner.state.summarization_model = "claude-opus-4-8"  # previously pinned
+
+    monkeypatch.setattr(
+        model_select, "list_available_models", lambda name: ["claude-haiku-4-5-20251001", "claude-sonnet-4-6"]
+    )
+    runner._select_popup = lambda title, options: options[-1]  # "Same as the agent's session model"
+    runner._handle_summarizer_command("model")
+
+    assert runner.state.summarization_model is None  # cleared → same as the session model
+
+
+def test_summarizer_model_picker_falls_back_to_text_when_no_models(tmp_path, monkeypatch):
+    import agitrack.summaries.model_select as model_select
+    from proxy_helpers import make_runner
+
+    runner = make_runner(state=AgitrackState(tmp_path))
+    runner.global_config = type("GC", (), {"summarization_model": None})()
+    runner._render = lambda: None
+    runner._set_message = lambda *a, **k: None
+    runner.state.backend = "opencode"
+    runner.state.summarization_model = None
+
+    monkeypatch.setattr(model_select, "list_available_models", lambda name: [])  # CLI unavailable
+    runner._select_popup = lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not show a picker"))
+    runner._prompt_popup = lambda title, body, default="": "some/model"
+
+    runner._handle_summarizer_command("model")
+
+    assert runner.state.summarization_model == "some/model"  # typed value accepted
 
 
 def test_status_line_unstaged_count_reflects_base_declined(tmp_path):
@@ -5604,9 +5622,9 @@ def test_configured_menu_key_opens_command_capture():
     # menu_key in ~/.agitrack/config.json rebinds the aGiTrack menu (default Ctrl-G).
     parser = ProxyInput(menu_key=b"\x10")  # ctrl-p
 
-    forwarded, _echo, command, _exit = parser.feed(b"\x10git-status\r")
+    forwarded, _echo, command, _exit = parser.feed(b"\x10git-unstaged\r")
     assert forwarded == []
-    assert command == "git-status"
+    assert command == "git-unstaged"
 
     # The default key is now ordinary input and goes to the backend.
     forwarded, _echo, command, _exit = parser.feed(b"\x07")

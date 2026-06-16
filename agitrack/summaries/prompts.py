@@ -41,12 +41,3 @@ Be comprehensive but organized. This summary will be used to restore context if 
 The first sentence should be a topic sentence summarizing everything, before explaining the details afterwards. The topic sentence should not say this is a summary or that it is an update. It should be a clear statement of the current state of the session and its progress.
 
 Begin your response immediately with that topic sentence. Do not prepend any preamble, acknowledgement, or meta-commentary — never start with phrasings such as "Here is the summary", "The summary has been written", "No further action is needed", "Below is", "Sure", or anything that describes the act of summarizing. Output only the summary text itself, with no heading and no sentence stating that it is a summary."""
-
-MODEL_SELECTION_SYSTEM = """You are helping select the most cost-effective model for summarization tasks. Given a list of available models, identify which one is likely the cheapest to use for text summarization while still being capable of producing quality summaries.
-
-Consider:
-- Smaller models are typically cheaper
-- Models designed for chat/conversation may be more expensive than completion models
-- Newer models may be more expensive than older ones
-
-Return ONLY the model identifier (exact string from the list), nothing else. No explanation, no formatting, just the model name."""
