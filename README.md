@@ -72,8 +72,6 @@ session                   switch / start (own worktree) / stop a live session
 agent-backend             switch backend (opencode|claude); shows a picker
 summarizer                toggle summarization on/off, set model, show status
 git-base-branch           switch the branch sessions integrate into
-git-status                show git status
-git-stage                 review and stage untracked files
 git-unstaged              show intentionally unstaged files
 git-user-commit           create a user commit
 update                    check for / install an aGiTrack self-update

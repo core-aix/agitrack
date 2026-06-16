@@ -198,8 +198,6 @@ class ProxyInput:
         "agent-backend",
         "summarizer",
         "git-base-branch",
-        "git-status",
-        "git-stage",
         "git-unstaged",
         "git-user-commit",
         "update",
@@ -2241,16 +2239,7 @@ class ProxyRunner:
             self._render()
             return
         if sub == "model":
-            current = self.state.summarization_model or self.global_config.summarization_model or "(same as session)"
-            new_model = self._prompt_popup(
-                "Summarizer Model",
-                f"Current: {current}\nEnter model (empty to clear):",
-                default=self.state.summarization_model or "",
-            )
-            if new_model is not None:
-                self.state.summarization_model = new_model.strip() or None
-                self._set_message(f"Summarizer model: {self.state.summarization_model or '(same as session)'}")
-            self._render()
+            self._select_summarizer_model_popup()
             return
         enabled = self._summarization_enabled()
         model = self.state.summarization_model or self.global_config.summarization_model or "(same as session)"
@@ -2270,6 +2259,45 @@ class ProxyRunner:
         elif choice.startswith("Set model"):
             self._handle_summarizer_command("model")
             return
+        self._render()
+
+    def _select_summarizer_model_popup(self) -> None:
+        # List the current backend's models as a picker. For Claude the smallest
+        # (Haiku) tier is offered first as the default, since summarization is a cheap
+        # task. Backends whose models can't be listed fall back to free-text entry.
+        from agitrack.summaries.model_select import list_available_models, smallest_model
+
+        backend_name = self.state.backend
+        current = self.state.summarization_model or self.global_config.summarization_model
+        models = list_available_models(backend_name)
+        if models:
+            smallest = smallest_model(backend_name, models)
+            ordered = [smallest, *(m for m in models if m != smallest)] if smallest else list(models)
+            label_for: dict[str, str | None] = {}
+            options: list[str] = []
+            for model in ordered:
+                label = f"{model}  (smallest — default)" if model == smallest else model
+                label_for[label] = model
+                options.append(label)
+            clear_label = "Same as the agent's session model"
+            label_for[clear_label] = None
+            options.append(clear_label)
+            choice = self._select_popup(f"Summarizer model (current: {current or 'same as session'})", options)
+            if choice is not None:
+                self.state.summarization_model = label_for.get(choice, choice)
+                self._set_message(f"Summarizer model: {self.state.summarization_model or '(same as session)'}")
+            self._render()
+            return
+        # No model list available (the backend's CLI couldn't be queried) — let the
+        # user type a model name, as before.
+        new_model = self._prompt_popup(
+            "Summarizer Model",
+            f"Current: {current or '(same as session)'}\nEnter model (empty to clear):",
+            default=self.state.summarization_model or "",
+        )
+        if new_model is not None:
+            self.state.summarization_model = new_model.strip() or None
+            self._set_message(f"Summarizer model: {self.state.summarization_model or '(same as session)'}")
         self._render()
 
     # --- switch base branch ---
@@ -5112,19 +5140,14 @@ class ProxyRunner:
                 self._render()
             return
 
-        if name in {"git-stage", "git-user-commit"}:
-            if name == "git-stage":
-                self._set_message(self._stage_files_popup())
-            else:
-                created = self._create_user_commit_popup(repo=self.base_repo, state=self._user_state())
-                self._set_message("Created user commit." if created else "No staged user changes to commit.")
+        if name == "git-user-commit":
+            created = self._create_user_commit_popup(repo=self.base_repo, state=self._user_state())
+            self._set_message("Created user commit." if created else "No staged user changes to commit.")
             self._reload_user_declined()
             self._render()
             return
 
-        if name == "git-status":
-            self._set_message(self.base_repo.status() or "Working tree clean")
-        elif name == "git-unstaged":
+        if name == "git-unstaged":
             self._prune_declined_untracked(self.base_repo, self._user_state())
             self._reload_user_declined()
             declined = self._user_declined
@@ -5307,60 +5330,6 @@ class ProxyRunner:
         else:
             state.add_declined(candidates)
             return f"Left {len(candidates)} untracked file(s) unstaged."
-
-    def _stage_files_popup(self) -> str:
-        # `git-stage`: one menu for the user's stageable base-tree files, in two
-        # groups — *new* files (untracked, not yet decided) and *intentionally
-        # unstaged* files (previously declined, e.g. at the pre-agent prompt). The
-        # user picks which to stage; chosen files are staged+committed so the
-        # agent's worktree (a checkout of base) can see them. Unpicked files are
-        # left as they are. Selection is per-file (numbers, or 'a' for all).
-        base, state = self.base_repo, self._user_state()
-        self._prune_declined_untracked(base, state)
-        declined = state.declined_untracked()
-        new_files = [path for path in base.untracked_files() if path not in set(declined)]
-        if not new_files and not declined:
-            return "No files to stage."
-        ordered: list[str] = []
-        lines: list[str] = ["Select files to stage:", ""]
-        for header, group in (("New files:", new_files), ("Intentionally unstaged:", declined)):
-            if not group:
-                continue
-            lines.append(header)
-            for path in group:
-                ordered.append(path)
-                lines.append(f"  {len(ordered)}. {path}")
-        lines.append("")
-        lines.append("Enter numbers (e.g. 1 3), 'a' for all, or blank to cancel:")
-        answer = self._prompt_popup("Stage Files", "\n".join(lines))
-        if answer is None:
-            return "Cancelled."
-        answer = answer.strip().lower()
-        if not answer:
-            return "Nothing staged."
-        if answer in {"a", "all"}:
-            selected = list(ordered)
-        else:
-            selected = [
-                ordered[int(token) - 1]
-                for token in answer.replace(",", " ").split()
-                if token.isdigit() and 1 <= int(token) <= len(ordered)
-            ]
-        if not selected:
-            return "No valid selection; nothing staged."
-        return self._commit_user_files(selected, state)
-
-    def _commit_user_files(self, paths: list[str], state: AgitrackState) -> str:
-        # Stage the chosen base-tree files, drop them from the declined list, and
-        # commit them as a user commit so they reach the session worktree on the
-        # next idle base-sync. If the user cancels the message, leave them staged.
-        self.base_repo.stage_paths(paths)
-        state.remove_declined(paths)
-        message = self._prompt_popup("User Commit", "Commit message for these files:")
-        if message is None or not message.strip():
-            return f"Staged {len(paths)} file(s); run git-user-commit to commit them."
-        self.base_repo.commit(build_user_commit_message(message=message.strip(), agitrack_session_id=state.session_id))
-        return f"Committed {len(paths)} file(s) to {self._base_branch}."
 
     def _create_agent_commit_from_turns_popup(
         self,
