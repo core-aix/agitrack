@@ -439,8 +439,10 @@ def _subagent_tool_use_id(agent_path: Path) -> str | None:
 
 
 def _subagent_file_tokens(agent_path: Path) -> TokenUsage:
-    # Sum a sub-agent transcript's assistant token usage into the sub-agent buckets.
+    # Sum a sub-agent transcript's assistant token usage into the sub-agent buckets,
+    # counting each message id once (the same row-splitting applies to sub-agent files).
     usage = TokenUsage()
+    counted_ids: set[str] = set()
     try:
         with agent_path.open("r", encoding="utf-8") as handle:
             for line in handle:
@@ -453,7 +455,7 @@ def _subagent_file_tokens(agent_path: Path) -> TokenUsage:
                     continue
                 if row.get("type") == "assistant":
                     message = _as_dict(row.get("message"))
-                    usage.add(_message_tokens(message.get("usage"), sidechain=True))
+                    usage.add(_usage_once(message, counted_ids, sidechain=True))
     except OSError:
         pass
     return usage
@@ -513,6 +515,11 @@ def parse_rows(
     current: dict | None = None
     model: str | None = None
     updated: int | None = None
+    # Claude splits one assistant API response (one message.id, one usage) across several
+    # rows — one per content block — each carrying the FULL identical usage. Count each
+    # message id's usage ONCE so tokens aren't multiplied by the block count (issue: the
+    # per-row sum over-counted output by ~95% on real transcripts).
+    counted_ids: set[str] = set()
 
     def flush(*, dangling: bool = False) -> None:
         nonlocal current
@@ -555,12 +562,12 @@ def parse_rows(
             # trace, but their tokens are still consumed — record them under the
             # turn's sub-agent buckets instead of dropping them.
             message = _as_dict(row.get("message"))
-            current["tokens"].add(_message_tokens(message.get("usage"), sidechain=True))
+            current["tokens"].add(_usage_once(message, counted_ids, sidechain=True))
         elif row_type == "assistant" and current is not None:
             message = _as_dict(row.get("message"))
             if stamp is not None:
                 current["ended_at"] = stamp
-            current["tokens"].add(_message_tokens(message.get("usage")))
+            current["tokens"].add(_usage_once(message, counted_ids))
             message_model = message.get("model")
             if isinstance(message_model, str) and message_model:
                 current["model"] = message_model
@@ -578,6 +585,24 @@ def parse_rows(
     flush(dangling=True)
     _attribute_subagent_tokens(turns, tool_ids_per_turn, subagent_tokens)
     return ExportedSession(session_id=session_id, model=model, updated=updated, turns=turns)
+
+
+def _usage_once(message: dict, counted_ids: set[str], *, sidechain: bool = False) -> TokenUsage:
+    # The token usage for an assistant message, counted exactly once across the several
+    # rows Claude splits it into (each row shares the message id and the FULL usage). A row
+    # whose `usage` is absent does NOT mark the id counted, so a later row of the same id
+    # that DOES carry usage is still counted. Messages with no id can't be de-duplicated
+    # and are counted as-is (Claude always assigns ids, so this is just a safe fallback).
+    msg_id = message.get("id")
+    msg_id = msg_id if isinstance(msg_id, str) and msg_id else None
+    if msg_id is not None and msg_id in counted_ids:
+        return TokenUsage()
+    usage = message.get("usage")
+    # Mark the id counted only once a NON-EMPTY usage is seen, so a split whose first row
+    # carries no usage still has the later usage-bearing row of the same id counted.
+    if msg_id is not None and isinstance(usage, dict) and usage:
+        counted_ids.add(msg_id)
+    return _message_tokens(usage, sidechain=sidechain)
 
 
 def _collect_tool_use_ids(message: dict, sink: set[str]) -> None:
