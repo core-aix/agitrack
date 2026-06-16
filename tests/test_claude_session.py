@@ -1,7 +1,7 @@
 import json
 
-from agit.transcripts import claude as claude_session
-from agit.transcripts.claude import (
+from agitrack.transcripts import claude as claude_session
+from agitrack.transcripts.claude import (
     export_session,
     latest_session_id,
     list_sessions,
@@ -52,7 +52,7 @@ def test_prepare_resume_stages_transcript_into_worktree(monkeypatch, tmp_path):
     config = tmp_path / "config"
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
     repo_root = tmp_path / "repo"
-    worktree = repo_root / ".agit" / "worktrees" / "session-1"
+    worktree = repo_root / ".agitrack" / "worktrees" / "session-1"
     repo_root.mkdir()
     worktree.mkdir(parents=True)
 
@@ -80,11 +80,11 @@ def test_link_session_surfaces_worktree_conversation_in_base(monkeypatch, tmp_pa
     config = tmp_path / "config"
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
     repo_root = tmp_path / "repo"
-    worktree = repo_root / ".agit" / "worktrees" / "session-1"
+    worktree = repo_root / ".agitrack" / "worktrees" / "session-1"
     repo_root.mkdir()
     worktree.mkdir(parents=True)
 
-    # A conversation born inside aGiT (recorded under the worktree project dir).
+    # A conversation born inside aGiTrack (recorded under the worktree project dir).
     wt_proj = config / "projects" / claude_session._encode_repo(worktree)
     wt_proj.mkdir(parents=True)
     (wt_proj / "born.jsonl").write_text('{"type":"user"}\n', encoding="utf-8")
@@ -160,7 +160,7 @@ def test_parse_rows_groups_turns_with_final_response_and_tokens():
 
 def test_parse_rows_marks_turn_incomplete_while_last_message_is_tool_use():
     # A prompt whose latest assistant message is a tool call is still mid-flight:
-    # the agent paused between writing code and writing tests. aGiT must see this
+    # the agent paused between writing code and writing tests. aGiTrack must see this
     # turn as incomplete so it doesn't commit now and split the prompt in two.
     rows = [
         _user("u1", "fix the bug and add tests"),
@@ -367,7 +367,7 @@ def test_list_worktree_sessions_aggregates_by_recency(tmp_path, monkeypatch):
     import time
 
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
-    worktrees_root = tmp_path / "repo" / ".agit" / "worktrees"
+    worktrees_root = tmp_path / "repo" / ".agitrack" / "worktrees"
     worktrees_root.mkdir(parents=True)
 
     # Two worktree paths -> two encoded project dirs under Claude's projects root.

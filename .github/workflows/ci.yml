@@ -21,8 +21,8 @@ jobs:
       # "Author identity unknown".
       - name: Configure git identity
         run: |
-          git config --global user.email "ci@agit.invalid"
-          git config --global user.name "aGiT CI"
+          git config --global user.email "ci@agitrack.invalid"
+          git config --global user.name "aGiTrack CI"
 
       # Install uv via its official script rather than a third-party action,
       # so the workflow runs even under an "allow GitHub-owned actions only"
@@ -36,10 +36,10 @@ jobs:
         run: uv sync --group dev
 
       - name: Lint (ruff check)
-        run: uv run ruff check agit/ tests/
+        run: uv run ruff check agitrack/ tests/
 
       - name: Format (ruff format --check)
-        run: uv run ruff format --check agit/ tests/
+        run: uv run ruff format --check agitrack/ tests/
 
       - name: Types (mypy, new errors only)
         # mypy runs against a committed baseline of pre-existing type debt

@@ -48,7 +48,7 @@ jobs:
               r'^version = "[^"]+"', f'version = "{new_version}"',
               pp.read_text(), count=1, flags=re.M,
           ))
-          # pyproject.toml is the only version source; agit.__version__ derives
+          # pyproject.toml is the only version source; agitrack.__version__ derives
           # from the installed distribution metadata at runtime.
           print(f"version={new_version}")
           PY

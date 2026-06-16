@@ -1,4 +1,4 @@
-"""Focused unit tests for agit.proxy.CommitEngine (#29, P4).
+"""Focused unit tests for agitrack.proxy.CommitEngine (#29, P4).
 
 These tests construct CommitEngine directly — no ProxyRunner.__new__ required —
 verifying the core commit pipeline, parse-result consumption, parse-worker
@@ -11,12 +11,12 @@ import threading
 import types
 
 
-from agit.backends.base import TokenUsage
-from agit.transcripts.opencode import SessionTurn
-from agit.proxy.commit_engine import CommitEngine
-from agit.proxy.session import Session
-from agit.transcripts import ExportedSession
-from agit.config import AgitState
+from agitrack.backends.base import TokenUsage
+from agitrack.transcripts.opencode import SessionTurn
+from agitrack.proxy.commit_engine import CommitEngine
+from agitrack.proxy.session import Session
+from agitrack.transcripts import ExportedSession
+from agitrack.config import AgitrackState
 
 
 # ---------------------------------------------------------------------------
@@ -54,9 +54,9 @@ def _noop_stage(repo, state) -> None:
     """No-op stage_untracked_fn for tests that don't care about untracked."""
 
 
-def _engine(tmp_path, *, staged: bool = True) -> tuple[CommitEngine, _Repo, AgitState]:
+def _engine(tmp_path, *, staged: bool = True) -> tuple[CommitEngine, _Repo, AgitrackState]:
     repo = _Repo(staged=staged)
-    state = AgitState(tmp_path)
+    state = AgitrackState(tmp_path)
     engine = CommitEngine(repo, state)
     return engine, repo, state
 
@@ -120,7 +120,7 @@ def test_commit_turns_creates_commit_when_staged(tmp_path):
         is True
     )
     assert repo.message is not None
-    assert repo.message.startswith("<aGiT> fix the bug")
+    assert repo.message.startswith("<aGiTrack> fix the bug")
 
 
 def test_commit_turns_token_not_counted_on_failed_attempt(tmp_path):
@@ -183,7 +183,7 @@ def test_commit_turns_subject_joins_multiple_prompts(tmp_path):
         stage_untracked_fn=_noop_stage,
     )
     subject = repo.message.splitlines()[0]
-    assert subject == "<aGiT> add parser / add tests"
+    assert subject == "<aGiTrack> add parser / add tests"
 
 
 def test_commit_turns_pending_trace_cleared_after_commit(tmp_path):
@@ -369,7 +369,7 @@ def test_sanitize_state_trace_noop_when_clean(tmp_path):
 
 
 def test_start_parse_sets_parse_thread_on_session(tmp_path):
-    state = AgitState(tmp_path)
+    state = AgitrackState(tmp_path)
     session = Session.bare()
     session.state = state
     session.worktree = None
@@ -392,7 +392,7 @@ def test_start_parse_sets_parse_thread_on_session(tmp_path):
 
 
 def test_start_parse_returns_false_when_already_running(tmp_path):
-    state = AgitState(tmp_path)
+    state = AgitrackState(tmp_path)
     session = Session.bare()
     session.state = state
     session.worktree = None
@@ -435,7 +435,7 @@ def test_start_parse_returns_false_when_already_running(tmp_path):
 
 
 def test_start_parse_writes_result_to_owning_session(tmp_path):
-    state = AgitState(tmp_path)
+    state = AgitrackState(tmp_path)
     session = Session.bare()
     session.state = state
     # Use a worktree so the worker calls backend.latest_session_id to find the id.
@@ -476,7 +476,7 @@ def test_start_parse_writes_result_to_owning_session(tmp_path):
 
 def _make_finish_helpers(tmp_path, session, exported_session, *, last_message_id=None):
     """Set up a CommitEngine and helper stubs for finish_parse_if_ready tests."""
-    state = AgitState(tmp_path)
+    state = AgitrackState(tmp_path)
     session.state = state
     session.backend = types.SimpleNamespace(name="claude")
     session.agent_parse_result = (exported_session.session_id, exported_session, last_message_id, state)
@@ -495,7 +495,7 @@ def _make_finish_helpers(tmp_path, session, exported_session, *, last_message_id
 
 
 def test_finish_parse_returns_none_when_no_result(tmp_path):
-    state = AgitState(tmp_path)
+    state = AgitrackState(tmp_path)
     session = Session.bare()
     session.state = state
     session.agent_parse_thread = None
@@ -639,8 +639,8 @@ def test_finish_parse_clears_awaited_on_interrupt(tmp_path):
 
 def test_finish_parse_discards_stale_session_result(tmp_path):
     # A result whose owner_state differs from self.state is silently discarded.
-    state_a = AgitState(tmp_path / "a")
-    state_b = AgitState(tmp_path / "b")
+    state_a = AgitrackState(tmp_path / "a")
+    state_b = AgitrackState(tmp_path / "b")
 
     session = Session.bare()
     session.state = state_a
@@ -670,7 +670,7 @@ def test_finish_parse_discards_stale_session_result(tmp_path):
 
 
 def test_recover_nonempty_session_returns_none_on_exception(tmp_path):
-    state = AgitState(tmp_path)
+    state = AgitrackState(tmp_path)
     engine = CommitEngine(None, state)
 
     class FailBackend:
@@ -686,7 +686,7 @@ def test_recover_nonempty_session_returns_none_on_exception(tmp_path):
 
 
 def test_recover_nonempty_session_returns_none_when_same_id(tmp_path):
-    state = AgitState(tmp_path)
+    state = AgitrackState(tmp_path)
     state.backend_session_id = "ses-1"
     engine = CommitEngine(None, state)
 
@@ -703,7 +703,7 @@ def test_recover_nonempty_session_returns_none_when_same_id(tmp_path):
 
 
 def test_initialize_session_baseline_clears_when_not_continue(tmp_path):
-    state = AgitState(tmp_path)
+    state = AgitrackState(tmp_path)
     state.backend_session_id = "old-ses"
     state.last_backend_message_id = "old-msg"
     engine = CommitEngine(None, state)

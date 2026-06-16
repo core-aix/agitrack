@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>aGiT · agent + git</title>
-<meta name="description" content="aGiT wraps Claude Code and OpenCode with Git: every agent turn becomes a traceable commit with the full interaction trace, model, and token usage.">
+<title>aGiTrack · agent + git</title>
+<meta name="description" content="aGiTrack wraps Claude Code and OpenCode with Git: every agent turn becomes a traceable commit with the full interaction trace, model, and token usage.">
 <link rel="icon" type="image/png" href="images/favicon-64.png">
 <link rel="apple-touch-icon" href="images/apple-touch-icon.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -172,14 +172,14 @@ footer .sha{font-size:12px}
 
 <div class="wrap">
   <header>
-    <div class="brand reveal r1"><span class="a">a</span>GiT</div>
-    <p class="tagline reveal r2"><span class="tag">&lt;aGiT&gt;</span> every agent turn, committed with its story<span class="cursor"></span></p>
-    <p class="sub reveal r3">aGiT wraps <strong>Claude Code</strong> and <strong>OpenCode</strong> with Git. You use the agent's own
-    TUI exactly as before. aGiT watches the session and turns every completed turn into a commit
+    <div class="brand reveal r1"><span class="a">a</span>GiTrack</div>
+    <p class="tagline reveal r2"><span class="tag">&lt;aGiTrack&gt;</span> every agent turn, committed with its story<span class="cursor"></span></p>
+    <p class="sub reveal r3">aGiTrack wraps <strong>Claude Code</strong> and <strong>OpenCode</strong> with Git. You use the agent's own
+    TUI exactly as before. aGiTrack watches the session and turns every completed turn into a commit
     carrying the full interaction trace, the model, and the token bill.</p>
     <div class="hero-actions reveal r4">
-      <a class="btn" href="#install">pip install agit-ai</a>
-      <a class="btn alt" href="https://github.com/core-aix/agit">github.com/core-aix/agit</a>
+      <a class="btn" href="#install">pip install agitrack</a>
+      <a class="btn alt" href="https://github.com/core-aix/agitrack">github.com/core-aix/agitrack</a>
       <a class="btn alt" href="#dashboard">see the dashboard</a>
     </div>
   </header>
@@ -189,23 +189,23 @@ footer .sha{font-size:12px}
     <section class="commit agent reveal r5">
       <div class="commit-head">
         <span class="sha">f3a9c2e</span>
-        <span class="subject"><span class="tag">&lt;aGiT&gt;</span> show, don't tell</span>
+        <span class="subject"><span class="tag">&lt;aGiTrack&gt;</span> show, don't tell</span>
       </div>
       <div class="term" id="demo">
-        <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="title">agit · claude · session-1 → main</span></div>
-        <div class="term-body"><pre><span class="d">$</span> <span class="p">agit</span>
+        <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="title">agitrack · claude · session-1 → main</span></div>
+        <div class="term-body"><pre><span class="d">$</span> <span class="p">agitrack</span>
 <span class="d">┌ claude · session-1 ──────────────────────────────────┐</span>
 <span class="w">&gt; add a --version flag to the cli</span>
-<span class="d">  · editing agit/cli.py …</span>
+<span class="d">  · editing agitrack/cli.py …</span>
 <span class="d">  · added --version using importlib.metadata</span>
 <span class="d">└──────────────────────────────────────────────────────┘</span>
-<span class="o">✓ Created &lt;aGiT&gt; commit 4b2f31a.</span>            <span class="d">aGiT · Ctrl-G</span>
+<span class="o">✓ Created &lt;aGiTrack&gt; commit 4b2f31a.</span>            <span class="d">aGiTrack · Ctrl-G</span>
 <span class="d">$</span> <span class="p">git log --oneline -2</span>
-<span class="o">4b2f31a</span> <span class="w">&lt;aGiT&gt; add a --version flag to the cli</span>
+<span class="o">4b2f31a</span> <span class="w">&lt;aGiTrack&gt; add a --version flag to the cli</span>
 <span class="d">a91c07e</span> <span class="w">Initial commit</span>
 <span class="d">$</span> <span class="p">git show 4b2f31a --stat</span>
-<span class="o">&lt;aGiT&gt;</span> <span class="w">add a --version flag to the cli</span>
-<span class="d"> agit/cli.py | 6 ++++++</span>  <span class="d">trace + model + token cost in the body ↓</span></pre>
+<span class="o">&lt;aGiTrack&gt;</span> <span class="w">add a --version flag to the cli</span>
+<span class="d"> agitrack/cli.py | 6 ++++++</span>  <span class="d">trace + model + token cost in the body ↓</span></pre>
         </div>
       </div>
     </section>
@@ -217,12 +217,12 @@ footer .sha{font-size:12px}
       </div>
       <h2>Agent code without provenance is unreviewable.</h2>
       <p>A coding agent edits twelve files while you get coffee. A week later nobody can say which
-      prompt produced which change, what the model was told, or what it cost. <strong>aGiT makes the unit
+      prompt produced which change, what the model was told, or what it cost. <strong>aGiTrack makes the unit
       of agent work a commit</strong>, so review, blame, bisect, and revert work on agent output the same
       way they work on yours.</p>
       <div class="term specimen">
-        <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="title">git show: an aGiT commit message</span></div>
-        <div class="term-body"><pre><span class="o">&lt;aGiT&gt;</span> <span class="w">add a --version flag to the cli</span>
+        <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="title">git show: an aGiTrack commit message</span></div>
+        <div class="term-body"><pre><span class="o">&lt;aGiTrack&gt;</span> <span class="w">add a --version flag to the cli</span>
 
 <span class="h"># Interaction Trace</span>
 
@@ -232,7 +232,7 @@ add a --version flag to the cli
 <span class="h">## Agent</span>
 Added --version using the package metadata; prints and exits.
 
-<span class="h"># aGiT Metadata</span>
+<span class="h"># aGiTrack Metadata</span>
 <span class="k">commit_type:</span> agent
 <span class="k">backend:</span> claude
 <span class="k">model:</span> claude-opus-4-8
@@ -252,16 +252,16 @@ Added --version using the package metadata; prints and exits.
       <p>Each session runs in its own <strong>git worktree</strong> on its own branch, so concurrent sessions never
       stomp each other or your working tree. Finished turns integrate back into the branch you
       launched from; conflicts are handed to the agent to resolve, and the resolution is itself a
-      traceable <span class="tag">&lt;aGiT-merge&gt;</span> commit.</p>
+      traceable <span class="tag">&lt;aGiTrack-merge&gt;</span> commit.</p>
       <div class="branches">
-        <div class="branch" data-ref="agit/claude/session-1/t3">
+        <div class="branch" data-ref="agitrack/claude/session-1/t3">
           <h3>Isolated sessions</h3>
           <p>One worktree per session, per-turn branches, automatic recovery of anything a crash
           leaves behind. Run several agents side by side.</p>
         </div>
         <div class="branch" data-ref="~/.claude/projects/…jsonl">
           <h3>Backend-native</h3>
-          <p>No model API keys, no proxy of your tokens. aGiT drives the real Claude Code / OpenCode
+          <p>No model API keys, no proxy of your tokens. aGiTrack drives the real Claude Code / OpenCode
           TUI and reads the session's own transcript for the facts.</p>
         </div>
         <div class="branch" data-ref="tokens_since_last_commit">
@@ -275,22 +275,22 @@ Added --version using the package metadata; prints and exits.
     <section class="commit agent" id="dashboard">
       <div class="commit-head">
         <span class="sha">b7e1d09</span>
-        <span class="subject"><span class="tag">&lt;aGiT&gt;</span> see the whole repo at a glance</span>
+        <span class="subject"><span class="tag">&lt;aGiTrack&gt;</span> see the whole repo at a glance</span>
       </div>
       <h2>A live dashboard of what the agents did.</h2>
-      <p>Run <span class="p">agit -d</span> and aGiT serves a
+      <p>Run <span class="p">agit -d</span> and aGiTrack serves a
       live, auto-refreshing dashboard on <strong>localhost</strong> and opens it in your browser. Every
       number is computed from commit metadata alone, so it's identical on every clone — no database,
       no tracking server.</p>
       <div class="term">
-        <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="title">agit -d · localhost</span></div>
+        <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="title">agitrack -d · localhost</span></div>
         <a href="images/dashboard-v2.png" target="_blank"><img class="shot" src="images/dashboard-v2.png" loading="lazy"
-          alt="The aGiT dashboard: coverage, aGiT-tracked AI vs non-tracked lines, token totals, and per-backend / model / committer breakdowns, in a CRT terminal theme."></a>
+          alt="The aGiTrack dashboard: coverage, aGiTrack-tracked AI vs non-tracked lines, token totals, and per-backend / model / committer breakdowns, in a CRT terminal theme."></a>
       </div>
       <div class="branches" style="margin-top:18px">
         <div class="branch" data-ref="tracked AI vs non-tracked">
           <h3>Honest provenance</h3>
-          <p>Lines aGiT tracked as the agent's, versus everything else — it never claims a human wrote
+          <p>Lines aGiTrack tracked as the agent's, versus everything else — it never claims a human wrote
           what the model did, even when a person made the commit.</p>
         </div>
         <div class="branch" data-ref="committer · backend · model · period">
@@ -306,11 +306,11 @@ Added --version using the package metadata; prints and exits.
       </div>
       <div class="steps" style="margin-top:22px">
         <div class="step"><div>
-          <code>agit -d</code>
+          <code>agitrack -d</code>
           <div class="note">serves on localhost and opens your browser; press Ctrl-C to stop</div>
         </div></div>
         <div class="step"><div>
-          <code>agit -d text</code>
+          <code>agitrack -d text</code>
           <div class="note">prints a one-shot plain-text report instead — handy for piping or pasting into an issue</div>
         </div></div>
       </div>
@@ -324,16 +324,16 @@ Added --version using the package metadata; prints and exits.
       <h2>Three commands to the first traced commit.</h2>
       <div class="steps">
         <div class="step"><div>
-          <code>pip install agit-ai</code>
+          <code>pip install agitrack</code>
           <div class="note">Python ≥ 3.10 · to contribute, clone the repo and <span class="p">pip install -e .</span></div>
         </div></div>
         <div class="step"><div>
-          <code>cd your-repo && agit</code>
-          <div class="note">launches your default backend's TUI (Claude Code or OpenCode) under aGiT's watch</div>
+          <code>cd your-repo && agitrack</code>
+          <div class="note">launches your default backend's TUI (Claude Code or OpenCode) under aGiTrack's watch</div>
         </div></div>
         <div class="step"><div>
           <code>Ctrl-G</code>
-          <div class="note">opens the aGiT menu: sessions, backends, staging, user commits, base branch</div>
+          <div class="note">opens the aGiTrack menu: sessions, backends, staging, user commits, base branch</div>
         </div></div>
       </div>
       <p style="margin-top:18px">Prompt the agent as usual. When the turn settles, the commit is already there.
@@ -343,23 +343,23 @@ Added --version using the package metadata; prints and exits.
     <section class="commit agent">
       <div class="commit-head">
         <span class="sha">HEAD</span>
-        <span class="subject"><span class="tag">&lt;aGiT&gt;</span> your move</span>
+        <span class="subject"><span class="tag">&lt;aGiTrack&gt;</span> your move</span>
       </div>
       <h2>Put your agents on the record.</h2>
       <p>Apache-2.0. Issues, ideas, and first contributions welcome. The
-      <a href="https://github.com/core-aix/agit/issues">issue tracker</a> has
+      <a href="https://github.com/core-aix/agitrack/issues">issue tracker</a> has
       <strong>good first issue</strong> tags waiting.</p>
       <div class="hero-actions">
-        <a class="btn" href="https://github.com/core-aix/agit">github.com/core-aix/agit</a>
-        <a class="btn alt" href="https://github.com/core-aix/agit#readme">read the manual</a>
+        <a class="btn" href="https://github.com/core-aix/agitrack">github.com/core-aix/agitrack</a>
+        <a class="btn alt" href="https://github.com/core-aix/agitrack#readme">read the manual</a>
       </div>
     </section>
 
   </main>
 
   <footer>
-    <span><span class="sha">aGiT</span> · agent + git · Apache-2.0</span>
-    <span>this page is a git log · <a href="https://github.com/core-aix/agit/tree/main/docs">view source</a></span>
+    <span><span class="sha">aGiTrack</span> · agent + git · Apache-2.0</span>
+    <span>this page is a git log · <a href="https://github.com/core-aix/agitrack/tree/main/docs">view source</a></span>
   </footer>
 </div>
 

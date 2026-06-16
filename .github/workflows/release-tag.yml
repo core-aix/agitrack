@@ -43,7 +43,7 @@ jobs:
 
           version = "$VERSION"
 
-          # pyproject.toml is the only version source; agit.__version__ derives
+          # pyproject.toml is the only version source; agitrack.__version__ derives
           # from the installed distribution metadata at runtime.
           pp = pathlib.Path("pyproject.toml")
           pp.write_text(re.sub(

@@ -1,4 +1,4 @@
-"""scripts/demo.sh (#53): the runnable showcase of aGiT's scripted JSON mode.
+"""scripts/demo.sh (#53): the runnable showcase of aGiTrack's scripted JSON mode.
 
 The agent-driving happy path needs a real backend CLI, so it cannot run in the
 test suite; these tests pin everything that can break without one — script

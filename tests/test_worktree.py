@@ -3,10 +3,10 @@ import subprocess
 
 import pytest
 
-from agit.commits import AgitActions
-from agit.git import GitRepo
-from agit.config import AgitState
-from agit.git import WorktreeManager, _sanitize_name
+from agitrack.commits import AgitrackActions
+from agitrack.git import GitRepo
+from agitrack.config import AgitrackState
+from agitrack.git import WorktreeManager, _sanitize_name
 from proxy_helpers import make_runner
 
 
@@ -45,8 +45,8 @@ def test_naming_helpers(tmp_path):
     wm = WorktreeManager(repo)
     assert wm.worktree_path("feat x").name == "feat-x"
     # Branches are namespaced by backend then session: agit/<backend>/<name>/tN.
-    assert wm.turn_branch("feat x", 2, backend="open code") == "agit/open-code/feat-x/t2"
-    assert wm.is_agit_branch("agit/claude/feat-x/t0") is True
+    assert wm.turn_branch("feat x", 2, backend="open code") == "agitrack/open-code/feat-x/t2"
+    assert wm.is_agit_branch("agitrack/claude/feat-x/t0") is True
     assert wm.is_agit_branch("main") is False
     assert _sanitize_name("  ") == "session"
 
@@ -66,11 +66,11 @@ def test_create_list_remove_worktree(tmp_path):
     # A turn branch appears only once the session commits.
     work = GitRepo.discover(info.path)
     work.switch(wm.turn_branch("feat", 1, backend="claude"), create=True)
-    assert "agit/claude/feat/t1" in repo.list_branches("agit/")
+    assert "agitrack/claude/feat/t1" in repo.list_branches("agitrack/")
 
     wm.remove("feat")
     assert not info.path.exists()
-    assert "agit/claude/feat/t1" not in repo.list_branches("agit/")
+    assert "agitrack/claude/feat/t1" not in repo.list_branches("agitrack/")
 
 
 def test_turn_branches_coexist_without_df_conflict(tmp_path):
@@ -81,8 +81,8 @@ def test_turn_branches_coexist_without_df_conflict(tmp_path):
     # Successive turn branches must coexist under agit/<backend>/<name>/.
     work.switch(wm.turn_branch("feat", 1, backend="claude"), create=True, base="HEAD")
     work.switch(wm.turn_branch("feat", 2, backend="claude"), create=True, base="HEAD")
-    assert "agit/claude/feat/t1" in repo.list_branches("agit/")
-    assert "agit/claude/feat/t2" in repo.list_branches("agit/")
+    assert "agitrack/claude/feat/t1" in repo.list_branches("agitrack/")
+    assert "agitrack/claude/feat/t2" in repo.list_branches("agitrack/")
 
 
 # --- merge behaviour against real git ---
@@ -131,7 +131,7 @@ def _integration_runner(main_repo, worktree_repo, base_branch, name):
     runner._render = lambda: None
     runner._debug = lambda *a, **k: None
     runner._exiting = False
-    # On a non-fast-forward integration aGiT surfaces a resolve options box;
+    # On a non-fast-forward integration aGiTrack surfaces a resolve options box;
     # default to "Merge automatically" so these tests exercise the agent path.
     runner._select_popup = lambda title, options: options[0]
     return runner
@@ -141,7 +141,7 @@ def test_integrate_clean_merge_advances_base(tmp_path):
     main = _init_repo(tmp_path)
     base = main.current_branch()
     info, work = _make_session(main, "session-1", base)
-    _commit(work, "agent.txt", "agent work\n", "<aGiT> work")
+    _commit(work, "agent.txt", "agent work\n", "<aGiTrack> work")
 
     runner = _integration_runner(main, work, base, "session-1")
     runner._integrate_session_turn()
@@ -150,11 +150,11 @@ def test_integrate_clean_merge_advances_base(tmp_path):
     assert (main.repo / "agent.txt").exists()
     # The transient turn branch is gone and the worktree is left detached at base,
     # so a fully-merged session leaves no branch behind.
-    assert main.list_branches("agit/") == []
+    assert main.list_branches("agitrack/") == []
     assert work.is_detached()
     # A fresh, backend-namespaced turn branch is created only when it next commits.
     runner._ensure_turn_branch()
-    assert work.current_branch() == "agit/test/session-1/t1"
+    assert work.current_branch() == "agitrack/test/session-1/t1"
     assert runner.turn == 1
 
 
@@ -173,7 +173,7 @@ def test_integrate_conflict_prompts_then_starts_agent_merge(tmp_path):
     assert main.rev_parse(base) == base_head
     assert work.merge_in_progress() is True
     assert work.unmerged_paths()  # conflict present
-    assert runner.merge_ctx is not None and runner.merge_ctx["source_branch"] == "agit/test/s1/t1"
+    assert runner.merge_ctx is not None and runner.merge_ctx["source_branch"] == "agitrack/test/s1/t1"
 
 
 def test_integrate_conflict_leave_for_later_keeps_work_unintegrated(tmp_path):
@@ -193,7 +193,7 @@ def test_integrate_conflict_leave_for_later_keeps_work_unintegrated(tmp_path):
     assert main.rev_parse(base) == base_head
     assert work.merge_in_progress() is False
     assert runner.merge_ctx is None
-    assert "agit/test/s1/t1" in main.list_branches("agit/")
+    assert "agitrack/test/s1/t1" in main.list_branches("agitrack/")
 
 
 def test_finalize_agent_merge_commits_and_advances(tmp_path):
@@ -204,7 +204,7 @@ def test_finalize_agent_merge_commits_and_advances(tmp_path):
     _commit(main, "f.txt", "base change\n", "base change")
 
     runner = _integration_runner(main, work, base, "s1")
-    runner.state = AgitState(info.path)
+    runner.state = AgitrackState(info.path)
     runner.backend = type("B", (), {"name": "claude"})()
     runner._integrate_session_turn()  # -> conflict, merge in progress
     assert runner.merge_ctx is not None
@@ -217,16 +217,16 @@ def test_finalize_agent_merge_commits_and_advances(tmp_path):
     # at base with its turn branch deleted.
     assert (main.repo / "f.txt").read_text() == "resolved: base + worktree\n"
     assert work.is_detached()
-    assert main.list_branches("agit/") == []
+    assert main.list_branches("agitrack/") == []
     assert runner.merge_ctx is None
     # The merge commit is tagged for an agent-resolved merge.
-    assert "<aGiT-merge>" in main._run(["git", "log", "-1", "--format=%s"]).stdout
+    assert "<aGiTrack-merge>" in main._run(["git", "log", "-1", "--format=%s"]).stdout
 
 
 def test_turn_from_branch():
     runner = make_runner()
-    assert runner._turn_from_branch("agit/session-1/t0") == 0
-    assert runner._turn_from_branch("agit/feature/t5") == 5
+    assert runner._turn_from_branch("agitrack/session-1/t0") == 0
+    assert runner._turn_from_branch("agitrack/feature/t5") == 5
     assert runner._turn_from_branch("main") == 0
 
 
@@ -350,22 +350,22 @@ def test_ensure_turn_branch_creates_branch_for_detached_session(tmp_path):
     info = WorktreeManager(main).create("s1", base=base)
     work = GitRepo.discover(info.path)
     assert work.is_detached()
-    assert main.list_branches("agit/") == []
+    assert main.list_branches("agitrack/") == []
 
     runner = _integration_runner(main, work, base, "s1")
     runner._ensure_turn_branch()  # a new prompt arrives -> its own backend-namespaced branch
-    assert work.current_branch() == "agit/test/s1/t1"
+    assert work.current_branch() == "agitrack/test/s1/t1"
 
     # Already on a turn branch: no extra branch is created.
     runner._ensure_turn_branch()
-    assert work.current_branch() == "agit/test/s1/t1"
+    assert work.current_branch() == "agitrack/test/s1/t1"
 
 
 def test_integrate_session_on_exit_merges_and_deletes_branch(tmp_path):
     main = _init_repo(tmp_path)
     base = main.current_branch()
     info, work = _make_session(main, "s1", base)
-    _commit(work, "a.txt", "x\n", "<aGiT> work")  # committed but not integrated
+    _commit(work, "a.txt", "x\n", "<aGiTrack> work")  # committed but not integrated
 
     runner = _integration_runner(main, work, base, "s1")
     runner._exiting = True
@@ -374,7 +374,7 @@ def test_integrate_session_on_exit_merges_and_deletes_branch(tmp_path):
     # Work integrated into base; the worktree is detached and its branch gone.
     assert (main.repo / "a.txt").exists()
     assert work.is_detached()
-    assert main.list_branches("agit/") == []
+    assert main.list_branches("agitrack/") == []
 
 
 def test_integrate_session_on_exit_drops_empty_branch(tmp_path):
@@ -388,7 +388,7 @@ def test_integrate_session_on_exit_drops_empty_branch(tmp_path):
     runner._integrate_session_on_exit()
 
     assert work.is_detached()
-    assert main.list_branches("agit/") == []
+    assert main.list_branches("agitrack/") == []
 
 
 def test_active_has_pending_reflects_unintegrated_commits(tmp_path):
@@ -398,7 +398,7 @@ def test_active_has_pending_reflects_unintegrated_commits(tmp_path):
 
     runner = _integration_runner(main, work, base, "s1")
     assert runner._active_has_pending() is False
-    _commit(work, "a.txt", "x\n", "<aGiT> work")
+    _commit(work, "a.txt", "x\n", "<aGiTrack> work")
     assert runner._active_has_pending() is True
 
 
@@ -406,7 +406,7 @@ def test_integrate_active_session_clean_merge(tmp_path):
     main = _init_repo(tmp_path)
     base = main.current_branch()
     info, work = _make_session(main, "s1", base)
-    _commit(work, "a.txt", "x\n", "<aGiT> work")  # an unintegrated commit
+    _commit(work, "a.txt", "x\n", "<aGiTrack> work")  # an unintegrated commit
 
     runner = _integration_runner(main, work, base, "s1")
     runner._select_popup = lambda *a, **k: "Merge manually (you resolve here, then Complete merge)"
@@ -417,7 +417,7 @@ def test_integrate_active_session_clean_merge(tmp_path):
     assert (main.repo / "a.txt").exists()
     assert runner._active_has_pending() is False
     assert work.is_detached()
-    assert main.list_branches("agit/") == []
+    assert main.list_branches("agitrack/") == []
 
 
 def test_session_unintegrated_detects_pending_commits(tmp_path):
@@ -427,7 +427,7 @@ def test_session_unintegrated_detects_pending_commits(tmp_path):
 
     runner = _integration_runner(main, work, base, "s1")
     assert runner._session_unintegrated(work) is False
-    _commit(work, "a.txt", "x\n", "<aGiT> work")
+    _commit(work, "a.txt", "x\n", "<aGiTrack> work")
     assert runner._session_unintegrated(work) is True
     # After integration the worktree is detached and merged -> nothing pending.
     runner._integrate_session_turn()
@@ -485,11 +485,11 @@ def test_base_switch_candidates_excludes_agit_and_current(tmp_path):
     candidates = runner._base_switch_candidates()
     assert "feature" in candidates
     assert base not in candidates
-    assert all(not name.startswith("agit/") for name in candidates)
+    assert all(not name.startswith("agitrack/") for name in candidates)
 
 
 def test_fast_forward_branch_advances_only_on_true_ff(tmp_path):
-    from agit.git import GitError
+    from agitrack.git import GitError
 
     main = _init_repo(tmp_path)
     base = main.current_branch()
@@ -522,7 +522,7 @@ def test_fast_forward_branch_advances_only_on_true_ff(tmp_path):
 
 def test_base_switch_keeps_session_alive(tmp_path):
     # Regression: _perform_base_switch used the EXIT finalizer, which terminated
-    # the agent child and removed the worktree — so switching the base quit aGiT
+    # the agent child and removed the worktree — so switching the base quit aGiTrack
     # with an error. A base switch must keep every session running.
     main = _init_repo(tmp_path)
     base = main.current_branch()
@@ -583,7 +583,7 @@ def test_align_session_to_base_keeps_worktree_with_pending_work(tmp_path):
 
     # Has unintegrated commits, so it is left untouched for integration.
     assert work.rev_parse("HEAD") == head_before
-    assert work.current_branch() == "agit/test/session-1/t1"
+    assert work.current_branch() == "agitrack/test/session-1/t1"
 
 
 def test_align_session_to_base_merges_new_base_commits_into_worktree(tmp_path):
@@ -602,7 +602,7 @@ def test_align_session_to_base_merges_new_base_commits_into_worktree(tmp_path):
     # it stays on its turn branch with no merge left in progress.
     assert (work.repo / "newbase.txt").exists()
     assert (work.repo / "w.txt").exists()
-    assert work.current_branch() == "agit/test/session-1/t1"
+    assert work.current_branch() == "agitrack/test/session-1/t1"
     assert work.merge_in_progress() is False
 
 
@@ -624,7 +624,7 @@ def test_poll_base_advanced_detects_out_of_band_commits(tmp_path):
     assert runner._base_advanced is False
     assert runner._last_base_head == main.rev_parse(base)
 
-    # The user commits straight to the base branch, outside aGiT.
+    # The user commits straight to the base branch, outside aGiTrack.
     _commit(main, "user.txt", "by hand\n", "user commit")
     runner._base_poll_at = 0.0  # bypass the 3s throttle for the test
     runner._poll_base_advanced()
@@ -673,7 +673,7 @@ def test_remove_prunes_orphaned_directory_and_deletes_branches(tmp_path):
     info, work = _make_session(main, "s1", base)
     _commit(work, "a.txt", "x\n", "work")
     branch = work.current_branch()
-    assert branch in main.list_branches("agit/")
+    assert branch in main.list_branches("agitrack/")
 
     # Simulate a half-broken state: the directory vanished out-of-band.
     shutil.rmtree(info.path)
@@ -681,7 +681,7 @@ def test_remove_prunes_orphaned_directory_and_deletes_branches(tmp_path):
 
     # The stale worktree entry is pruned and the branch cleaned up (kept in sync).
     assert not info.path.exists()
-    assert branch not in main.list_branches("agit/")
+    assert branch not in main.list_branches("agitrack/")
     assert info.path.name not in [w.name for w in WorktreeManager(main).list()]
 
 
@@ -707,7 +707,7 @@ def test_remove_worktree_on_exit_drops_merged_extra_session(tmp_path):
     main = _init_repo(tmp_path)
     base = main.current_branch()
     info, work = _make_session(main, "session-2", base)
-    _commit(work, "a.txt", "x\n", "<aGiT> work")
+    _commit(work, "a.txt", "x\n", "<aGiTrack> work")
 
     runner = _integration_runner(main, work, base, "session-2")
     runner.worktree = info  # real WorktreeInfo so removal can find the path
@@ -727,7 +727,7 @@ def test_remove_worktree_on_exit_persists_primary_record_then_removes(tmp_path):
     main = _init_repo(tmp_path)
     base = main.current_branch()
     info, work = _make_session(main, "session-1", base)
-    _commit(work, "a.txt", "x\n", "<aGiT> work")
+    _commit(work, "a.txt", "x\n", "<aGiTrack> work")
 
     runner = _integration_runner(main, work, base, "session-1")
     runner.worktree = info
@@ -735,7 +735,7 @@ def test_remove_worktree_on_exit_persists_primary_record_then_removes(tmp_path):
     runner.child_pid = None
     runner.master_fd = None
     runner.global_config = type("G", (), {"default_backend": "opencode"})()
-    runner.state = AgitState(info.path)
+    runner.state = AgitrackState(info.path)
     runner.state.backend = "opencode"
     runner.state.backend_session_id = "sess-xyz"
 
@@ -747,7 +747,7 @@ def test_remove_worktree_on_exit_persists_primary_record_then_removes(tmp_path):
     assert runner.worktree is None
     # ...but the resume pointer was saved to the durable repo-root state, so the
     # conversation auto-resumes on the next start.
-    root = AgitState(main.repo)
+    root = AgitrackState(main.repo)
     assert root.backend_session_id == "sess-xyz"
     assert root.backend == "opencode"
 
@@ -775,7 +775,7 @@ def test_integrate_active_session_fast_forward_does_not_prompt(tmp_path):
     main = _init_repo(tmp_path)
     base = main.current_branch()
     info, work = _make_session(main, "session-1", base)
-    _commit(work, "a.txt", "x\n", "<aGiT> work")  # base unchanged -> fast-forwardable
+    _commit(work, "a.txt", "x\n", "<aGiTrack> work")  # base unchanged -> fast-forwardable
 
     runner = _integration_runner(main, work, base, "session-1")
     runner.worktree = info
@@ -787,7 +787,7 @@ def test_integrate_active_session_fast_forward_does_not_prompt(tmp_path):
     # Integrated directly with no agent / no prompt.
     assert (main.repo / "a.txt").exists()
     assert work.is_detached()
-    assert main.list_branches("agit/") == []
+    assert main.list_branches("agitrack/") == []
 
 
 def test_integrate_active_session_conflict_prompts(tmp_path):
@@ -805,7 +805,7 @@ def test_integrate_active_session_conflict_prompts(tmp_path):
     runner._integrate_active_session()
 
     # Only a real conflict surfaces the resolve options.
-    assert prompted == ["agit/test/session-1/t1"]
+    assert prompted == ["agitrack/test/session-1/t1"]
 
 
 def test_remember_session_for_backend_persists_to_root(tmp_path):
@@ -816,7 +816,7 @@ def test_remember_session_for_backend_persists_to_root(tmp_path):
     runner = _integration_runner(main, work, base, "session-2")
     runner.worktree = info
     runner.global_config = type("G", (), {"default_backend": "claude"})()
-    runner.state = AgitState(info.path)
+    runner.state = AgitrackState(info.path)
     runner.state.backend = "opencode"
     runner.state.backend_session_id = "sess-77"
 
@@ -824,7 +824,7 @@ def test_remember_session_for_backend_persists_to_root(tmp_path):
 
     # The opencode conversation is remembered in the durable repo-root state, keyed
     # by backend, with the worktree it ran in — so switching back resumes it.
-    rec = AgitState(main.repo).recall_session("opencode")
+    rec = AgitrackState(main.repo).recall_session("opencode")
     assert rec["id"] == "sess-77"
     assert rec["worktree"] == "session-2"
 
@@ -833,7 +833,7 @@ def test_advance_base_to_flags_base_advanced(tmp_path):
     main = _init_repo(tmp_path)
     base = main.current_branch()
     info, work = _make_session(main, "session-1", base)
-    _commit(work, "a.txt", "x\n", "<aGiT> work")
+    _commit(work, "a.txt", "x\n", "<aGiTrack> work")
 
     runner = _integration_runner(main, work, base, "session-1")
     runner._base_advanced = False
@@ -896,7 +896,7 @@ def test_ensure_worktree_alive_path_exists_returns_early(tmp_path):
 
 
 def test_ensure_worktree_alive_recreates_worktree(tmp_path):
-    from agit.backends.proxy_agents import make_proxy_agent
+    from agitrack.backends.proxy_agents import make_proxy_agent
 
     main = _init_repo(tmp_path)
     wm = WorktreeManager(main)
@@ -905,7 +905,7 @@ def test_ensure_worktree_alive_recreates_worktree(tmp_path):
     shutil.rmtree(info.path)
     assert not info.path.exists()
 
-    state = AgitState(info.path, default_backend="opencode")
+    state = AgitrackState(info.path, default_backend="opencode")
     runner = make_runner(
         repo=work,
         base_repo=main,
@@ -914,7 +914,7 @@ def test_ensure_worktree_alive_recreates_worktree(tmp_path):
         _base_branch=main.current_branch(),
         state=state,
         backend=make_proxy_agent("opencode"),
-        actions=AgitActions(work, state),
+        actions=AgitrackActions(work, state),
         child_pid=None,
         master_fd=None,
         file_observer=None,
@@ -951,7 +951,7 @@ def test_ensure_worktree_alive_recreates_worktree(tmp_path):
 
 
 def test_ensure_worktree_alive_falls_back_on_open_session_failure(tmp_path):
-    from agit.backends.proxy_agents import make_proxy_agent
+    from agitrack.backends.proxy_agents import make_proxy_agent
 
     main = _init_repo(tmp_path)
     wm = WorktreeManager(main)
@@ -960,7 +960,7 @@ def test_ensure_worktree_alive_falls_back_on_open_session_failure(tmp_path):
     shutil.rmtree(info.path)
     assert not info.path.exists()
 
-    state2 = AgitState(info.path, default_backend="opencode")
+    state2 = AgitrackState(info.path, default_backend="opencode")
     runner = make_runner(
         repo=work,
         base_repo=main,
@@ -969,7 +969,7 @@ def test_ensure_worktree_alive_falls_back_on_open_session_failure(tmp_path):
         _base_branch=main.current_branch(),
         state=state2,
         backend=make_proxy_agent("opencode"),
-        actions=AgitActions(work, state2),
+        actions=AgitrackActions(work, state2),
         child_pid=None,
         master_fd=None,
         file_observer=None,
@@ -1022,7 +1022,7 @@ def test_finalize_agent_merge_refuses_unresolved_conflict_markers(tmp_path):
     base_head = main.rev_parse(base)
 
     runner = _integration_runner(main, work, base, "s1")
-    runner.state = AgitState(info.path)
+    runner.state = AgitrackState(info.path)
     runner.backend = type("B", (), {"name": "claude"})()
     runner._integrate_session_turn()  # -> conflict, merge in progress
     assert runner.merge_ctx is not None
@@ -1065,7 +1065,7 @@ def test_ensure_turn_branch_never_resets_existing_branch_with_work(tmp_path):
     main = _init_repo(tmp_path)
     base = main.current_branch()
     info, work = _make_session(main, "s1", base, backend="claude")
-    _commit(work, "kept.txt", "unintegrated work\n", "<aGiT> kept work")
+    _commit(work, "kept.txt", "unintegrated work\n", "<aGiTrack> kept work")
     kept_head = work.rev_parse("HEAD")  # tip of agit/claude/s1/t1
 
     # Simulate recovery: detached at base again, turn counter back at 0.
@@ -1078,13 +1078,13 @@ def test_ensure_turn_branch_never_resets_existing_branch_with_work(tmp_path):
 
     # The old branch and its commit survive; the session took the next free
     # turn number instead of resetting t1.
-    assert main.rev_parse("agit/claude/s1/t1") == kept_head
-    assert work.current_branch() == "agit/claude/s1/t2"
+    assert main.rev_parse("agitrack/claude/s1/t1") == kept_head
+    assert work.current_branch() == "agitrack/claude/s1/t2"
     assert runner.turn == 2
 
 
 def test_switch_create_refuses_to_reset_existing_branch(tmp_path):
-    from agit.git import GitError
+    from agitrack.git import GitError
 
     repo = _init_repo(tmp_path)
     repo.create_branch("topic", "HEAD")
@@ -1126,4 +1126,4 @@ def test_agent_made_commits_integrate_when_idle(tmp_path):
     assert main.rev_parse(base) != base_head
     assert (main.repo / "agent.txt").read_text() == "committed by the agent itself\n"
     assert work.is_detached()
-    assert main.list_branches("agit/") == []
+    assert main.list_branches("agitrack/") == []

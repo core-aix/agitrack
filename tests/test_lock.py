@@ -3,7 +3,7 @@ import os
 import subprocess
 import sys
 
-from agit.git import RepoLock, already_running_message
+from agitrack.git import RepoLock, already_running_message
 
 
 def test_already_running_message_names_the_pid():
@@ -57,16 +57,16 @@ def test_probe_owner_reports_free_then_holder(tmp_path):
 
 
 def test_probe_owner_on_missing_dir_is_free(tmp_path):
-    # No .agit dir / lock file yet ⇒ nobody is running ⇒ free (acquire is authority).
-    assert RepoLock(tmp_path / "nope" / ".agit" / "lock").probe_owner() is None
+    # No .agitrack dir / lock file yet ⇒ nobody is running ⇒ free (acquire is authority).
+    assert RepoLock(tmp_path / "nope" / ".agitrack" / "lock").probe_owner() is None
 
 
 def test_different_repos_get_independent_locks(tmp_path):
-    # The lock is per-repo (its path lives under the repo's .agit/), so aGiT on
-    # one repo never blocks aGiT on another — only a second instance on the SAME
+    # The lock is per-repo (its path lives under the repo's .agitrack/), so aGiTrack on
+    # one repo never blocks aGiTrack on another — only a second instance on the SAME
     # repo is refused.
-    repo_a = RepoLock(tmp_path / "a" / ".agit" / "lock")
-    repo_b = RepoLock(tmp_path / "b" / ".agit" / "lock")
+    repo_a = RepoLock(tmp_path / "a" / ".agitrack" / "lock")
+    repo_b = RepoLock(tmp_path / "b" / ".agitrack" / "lock")
     assert repo_a.acquire() is True
     assert repo_b.acquire() is True  # a different repo is unaffected
     repo_a.release()
@@ -135,7 +135,7 @@ def test_lock_released_by_os_when_owner_dies(tmp_path):
             "-c",
             (
                 "import pathlib, sys, time\n"
-                "from agit.git import RepoLock\n"
+                "from agitrack.git import RepoLock\n"
                 "lock = RepoLock(pathlib.Path(sys.argv[1]))\n"
                 "assert lock.acquire()\n"
                 "print('held', flush=True)\n"

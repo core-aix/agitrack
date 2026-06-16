@@ -6,14 +6,14 @@ import pytest
 
 import types
 
-from agit.backends.base import TokenUsage
-from agit.transcripts.opencode import SessionTurn
-from agit.backends.proxy_agents import make_proxy_agent
-from agit.proxy import ProxyInput, ProxyRunner, _escape_sequence_complete, _short_session, detect_color_mode
-from agit.proxy.integration import MergeContext, MergePhase
-from agit.proxy.session import Session
-from agit.transcripts import ExportedSession, SessionRef
-from agit.config import AgitState
+from agitrack.backends.base import TokenUsage
+from agitrack.transcripts.opencode import SessionTurn
+from agitrack.backends.proxy_agents import make_proxy_agent
+from agitrack.proxy import ProxyInput, ProxyRunner, _escape_sequence_complete, _short_session, detect_color_mode
+from agitrack.proxy.integration import MergeContext, MergePhase
+from agitrack.proxy.session import Session
+from agitrack.transcripts import ExportedSession, SessionRef
+from agitrack.config import AgitrackState
 from proxy_helpers import make_runner
 
 
@@ -89,7 +89,7 @@ def test_proxy_ctrl_g_enters_command_mode():
 
 def test_kitty_ctrl_key_decoding():
     """Test that kitty keyboard protocol control keys are decoded to plain bytes."""
-    from agit.proxy.runner import _decode_kitty_ctrl_keys
+    from agitrack.proxy.runner import _decode_kitty_ctrl_keys
 
     # Ctrl-O (o=111) should decode to 0x0f
     assert _decode_kitty_ctrl_keys(b"\x1b[111;5u") == b"\x0f"
@@ -117,7 +117,7 @@ def test_kitty_ctrl_key_decoding():
 
 def test_kitty_escape_key_decoding():
     """Test that kitty keyboard protocol Escape key is decoded to plain \\x1b."""
-    from agit.proxy.runner import _decode_kitty_ctrl_keys
+    from agitrack.proxy.runner import _decode_kitty_ctrl_keys
 
     # Escape key (keycode 27) should decode to \x1b
     assert _decode_kitty_ctrl_keys(b"\x1b[27u") == b"\x1b"
@@ -139,9 +139,9 @@ def test_modify_other_keys_ctrl_decoding():
     """iTerm2 answers modifyOtherKeys with CSI 27 ; mod ; code ~ — decode Ctrl keys.
 
     Regression: in iTerm on macOS Ctrl-C / Ctrl-G arrived in this form and were
-    forwarded to the backend instead of opening aGiT's exit/menu.
+    forwarded to the backend instead of opening aGiTrack's exit/menu.
     """
-    from agit.proxy.runner import _decode_kitty_ctrl_keys
+    from agitrack.proxy.runner import _decode_kitty_ctrl_keys
 
     # Ctrl-C (c=99) → 0x03; Ctrl-G (g=103) → 0x07.
     assert _decode_kitty_ctrl_keys(b"\x1b[27;5;99~") == b"\x03"
@@ -161,7 +161,7 @@ def test_modify_other_keys_ctrl_decoding():
 def test_modify_other_keys_ctrl_g_opens_menu():
     # End-to-end of the iTerm path: the modifyOtherKeys Ctrl-G decodes to \x07 and
     # is matched as the (default) menu key rather than forwarded to the backend.
-    from agit.proxy.runner import _decode_kitty_ctrl_keys
+    from agitrack.proxy.runner import _decode_kitty_ctrl_keys
 
     decoded = _decode_kitty_ctrl_keys(b"\x1b[27;5;103~")
     parser = ProxyInput(menu_key=b"\x07")  # default Ctrl-G
@@ -173,9 +173,9 @@ def test_modify_other_keys_ctrl_g_opens_menu():
 
 
 def test_modify_other_keys_ctrl_c_triggers_exit():
-    # The modifyOtherKeys Ctrl-C decodes to \x03 and starts aGiT's exit flow
+    # The modifyOtherKeys Ctrl-C decodes to \x03 and starts aGiTrack's exit flow
     # instead of being forwarded to the backend.
-    from agit.proxy.runner import _decode_kitty_ctrl_keys
+    from agitrack.proxy.runner import _decode_kitty_ctrl_keys
 
     decoded = _decode_kitty_ctrl_keys(b"\x1b[27;5;99~")
     parser = ProxyInput(menu_key=b"\x07")
@@ -192,7 +192,7 @@ def _drive_host_input(runner, parser, chunks):
     test can exercise the full path (including escape sequences split across
     reads) for either keyboard protocol.
     """
-    from agit.proxy.runner import _decode_kitty_ctrl_keys
+    from agitrack.proxy.runner import _decode_kitty_ctrl_keys
 
     forwarded_all: list[bytes] = []
     command = None
@@ -250,7 +250,7 @@ def test_menu_key_split_across_reads_under_both_protocols(protocol):
 
 def test_proxy_menu_key_works_with_kitty_encoding():
     """Test that the menu key works even when terminal sends kitty-encoded keys."""
-    from agit.proxy.runner import _decode_kitty_ctrl_keys
+    from agitrack.proxy.runner import _decode_kitty_ctrl_keys
 
     # Simulate what happens in _reactor_stdin_phase:
     # 1. Terminal sends kitty-encoded Ctrl-O
@@ -367,7 +367,7 @@ def test_proxy_ctrl_c_cancels_command_capture():
 
     forwarded, local_echo, command, should_exit = parser.feed(b"\x07sta\x03")
 
-    # Inside aGiT's palette Ctrl-C cancels it (like Esc): nothing forwarded,
+    # Inside aGiTrack's palette Ctrl-C cancels it (like Esc): nothing forwarded,
     # no command, no exit — and the parser is back in passthrough mode.
     assert forwarded == []
     assert local_echo == b""
@@ -487,7 +487,7 @@ def test_proxy_ctrl_c_starts_exit_flow_in_passthrough_mode():
 def test_proxy_agent_commit_preserves_incomplete_initial_user_turn(tmp_path):
     runner = make_runner(
         repo=FakeCommitRepo(),
-        state=AgitState(tmp_path),
+        state=AgitrackState(tmp_path),
         verbose=False,
     )
     runner._review_untracked_popup = lambda include_declined: "No untracked files to review."
@@ -507,7 +507,7 @@ def test_proxy_agent_commit_preserves_incomplete_initial_user_turn(tmp_path):
     assert committed is True
     message = runner.repo.message
     # The subject lists every prompt that led to the commit, joined by " / ".
-    assert message.startswith("<aGiT> fix it / also handle errors")
+    assert message.startswith("<aGiTrack> fix it / also handle errors")
     assert message.index("## User\n\nfix it") < message.index("## User\n\nalso handle errors")
     assert message.index("## User\n\nalso handle errors") < message.index("## Agent\n\ndone")
 
@@ -518,7 +518,7 @@ def test_proxy_agent_commit_does_not_repeat_whitespace_variant_prompt(tmp_path):
     # match failed and re-appended the prompt at the end of the trace (#8).
     runner = make_runner(
         repo=FakeCommitRepo(),
-        state=AgitState(tmp_path),
+        state=AgitrackState(tmp_path),
         verbose=False,
     )
     runner._review_untracked_popup = lambda include_declined: "No untracked files to review."
@@ -534,7 +534,7 @@ def test_proxy_agent_commit_does_not_repeat_whitespace_variant_prompt(tmp_path):
 
     assert committed is True
     message = runner.repo.message
-    assert message.splitlines()[0] == "<aGiT> fix the bug"
+    assert message.splitlines()[0] == "<aGiTrack> fix the bug"
     assert message.count("## User") == 1  # not repeated before the metadata
 
 
@@ -543,7 +543,7 @@ def test_proxy_agent_commit_collapses_double_recorded_prompt(tmp_path):
     # one prompt) must appear once, not once per recording (#8).
     runner = make_runner(
         repo=FakeCommitRepo(),
-        state=AgitState(tmp_path),
+        state=AgitrackState(tmp_path),
         verbose=False,
     )
     runner._review_untracked_popup = lambda include_declined: "No untracked files to review."
@@ -560,7 +560,7 @@ def test_proxy_agent_commit_collapses_double_recorded_prompt(tmp_path):
 
     assert committed is True
     message = runner.repo.message
-    assert message.splitlines()[0] == "<aGiT> do the thing"
+    assert message.splitlines()[0] == "<aGiTrack> do the thing"
     assert message.count("## User") == 1
 
 
@@ -584,7 +584,7 @@ def test_proxy_agent_commit_drops_edit_garbled_duplicate_prompt(tmp_path):
     )
     runner = make_runner(
         repo=FakeCommitRepo(),
-        state=AgitState(tmp_path),
+        state=AgitrackState(tmp_path),
         verbose=False,
     )
     runner._review_untracked_popup = lambda include_declined: "No untracked files to review."
@@ -609,7 +609,7 @@ def test_proxy_agent_commit_places_followup_notes_before_the_response(tmp_path):
     # turn's prompt and its response — not appended after the response (#8).
     runner = make_runner(
         repo=FakeCommitRepo(),
-        state=AgitState(tmp_path),
+        state=AgitrackState(tmp_path),
         verbose=False,
     )
     runner._review_untracked_popup = lambda include_declined: "No untracked files to review."
@@ -636,7 +636,7 @@ def test_proxy_agent_commit_places_followup_notes_before_the_response(tmp_path):
 def test_agent_commit_subject_joins_all_prompts_with_slash(tmp_path):
     runner = make_runner(
         repo=FakeCommitRepo(),
-        state=AgitState(tmp_path),
+        state=AgitrackState(tmp_path),
         verbose=False,
     )
     runner._review_untracked_popup = lambda include_declined: "No untracked files to review."
@@ -656,13 +656,13 @@ def test_agent_commit_subject_joins_all_prompts_with_slash(tmp_path):
     assert committed is True
     subject = runner.repo.message.splitlines()[0]
     # Every prompt that led to the commit, in order, joined by " / ".
-    assert subject == "<aGiT> add the parser / now add tests / and fix the lint"
+    assert subject == "<aGiTrack> add the parser / now add tests / and fix the lint"
 
 
 def test_proxy_agent_commit_preserves_previous_no_change_trace(tmp_path):
     runner = make_runner(
         repo=FakeCommitRepo(),
-        state=AgitState(tmp_path),
+        state=AgitrackState(tmp_path),
         verbose=False,
     )
     runner._review_untracked_popup = lambda include_declined: "No untracked files to review."
@@ -689,7 +689,7 @@ def test_proxy_agent_commit_preserves_previous_no_change_trace(tmp_path):
 
 def _parse_ready_runner(tmp_path, session, *, last_message_id=None):
     runner = make_runner()
-    runner.state = AgitState(tmp_path)
+    runner.state = AgitrackState(tmp_path)
     runner.worktree = None
     runner.agent_parse_thread = None
     runner.backend = types.SimpleNamespace(name="claude")
@@ -844,7 +844,7 @@ def test_agent_commit_popup_includes_commit_id_and_session(tmp_path):
     # belongs to (background sessions auto-commit too), and the base it landed on.
     runner = make_runner(
         repo=FakeCommitRepo(),
-        state=AgitState(tmp_path),
+        state=AgitrackState(tmp_path),
         verbose=False,
         name="feature-x",
         _base_branch="main",
@@ -854,13 +854,13 @@ def test_agent_commit_popup_includes_commit_id_and_session(tmp_path):
 
     runner._announce_agent_commit()
 
-    assert runner.message == "Created <aGiT> commit abc1234 in session 'feature-x' — merged into main."
+    assert runner.message == "Created <aGiTrack> commit abc1234 in session 'feature-x' — merged into main."
     # Summarized turns note that in the same line.
     runner._last_agent_commit_id = "def5678"
     runner._commit_merged_pending = True
     runner._commit_summarized = True
     runner._announce_agent_commit()
-    assert runner.message == "Created <aGiT> commit def5678 in session 'feature-x' — merged into main (summarized)."
+    assert runner.message == "Created <aGiTrack> commit def5678 in session 'feature-x' — merged into main (summarized)."
 
 
 def test_agent_commit_not_announced_before_merge(tmp_path):
@@ -868,7 +868,7 @@ def test_agent_commit_not_announced_before_merge(tmp_path):
     # merged into the base. Committing just arms the deferred announcement.
     runner = make_runner(
         repo=FakeCommitRepo(),
-        state=AgitState(tmp_path),
+        state=AgitrackState(tmp_path),
         verbose=False,
         name="feature-x",
     )
@@ -1050,7 +1050,7 @@ def test_screen_erase_does_not_carry_glyph_attributes():
     # render as stray horizontal lines that linger after the view is dismissed.
     import pyte
 
-    from agit.proxy import _BackgroundColorEraseScreen
+    from agitrack.proxy import _BackgroundColorEraseScreen
 
     screen = _BackgroundColorEraseScreen(6, 3, history=10, ratio=0.5)
     stream = pyte.ByteStream(screen)
@@ -1070,7 +1070,7 @@ def test_screen_erase_does_not_carry_glyph_attributes():
 def test_screen_erase_in_line_does_not_carry_underline():
     import pyte
 
-    from agit.proxy import _BackgroundColorEraseScreen
+    from agitrack.proxy import _BackgroundColorEraseScreen
 
     screen = _BackgroundColorEraseScreen(6, 2, history=10, ratio=0.5)
     stream = pyte.ByteStream(screen)
@@ -1091,7 +1091,7 @@ def test_screen_survives_private_device_status_query():
     # must absorb the query and keep applying the bytes that follow it.
     import pyte
 
-    from agit.proxy import _BackgroundColorEraseScreen
+    from agitrack.proxy import _BackgroundColorEraseScreen
 
     screen = _BackgroundColorEraseScreen(6, 2, history=10, ratio=0.5)
     stream = pyte.ByteStream(screen)
@@ -1109,7 +1109,7 @@ def test_feed_child_output_strips_xtmodkeys_mistaken_for_underline():
     # stripped from what is fed to pyte so no underline leaks.
     import pyte
 
-    from agit.proxy import _BackgroundColorEraseScreen
+    from agitrack.proxy import _BackgroundColorEraseScreen
 
     runner = make_runner(
         screen=_BackgroundColorEraseScreen(10, 2, history=10, ratio=0.5),
@@ -1129,7 +1129,7 @@ def test_feed_child_output_preserves_dec_private_modes_and_real_sgr():
     # private (?) sequences pass through untouched.
     import pyte
 
-    from agit.proxy import _BackgroundColorEraseScreen
+    from agitrack.proxy import _BackgroundColorEraseScreen
 
     runner = make_runner(
         screen=_BackgroundColorEraseScreen(10, 2, history=10, ratio=0.5),
@@ -1254,13 +1254,13 @@ def test_sticky_message_renders_after_timeout(monkeypatch):
     writes = []
     monkeypatch.setattr(os, "write", lambda fd, data: writes.append(data) or len(data))
 
-    runner._set_message("Created <aGiT> commit.", sticky=True)
+    runner._set_message("Created <aGiTrack> commit.", sticky=True)
     runner.message_until = time.monotonic() - 100  # the timeout passed long ago
 
     runner._render()
 
     # A sticky message stays up past its timeout (until the next keypress).
-    assert "Created <aGiT> commit." in writes[0].decode()
+    assert "Created <aGiTrack> commit." in writes[0].decode()
 
 
 def test_nonsticky_message_hidden_after_timeout(monkeypatch):
@@ -1280,7 +1280,7 @@ def test_nonsticky_message_hidden_after_timeout(monkeypatch):
 
 def test_keypress_dismisses_sticky_message():
     runner = make_runner()
-    runner._set_message("Created <aGiT> commit.", sticky=True)
+    runner._set_message("Created <aGiTrack> commit.", sticky=True)
     assert runner._message_sticky is True
 
     assert runner._clear_sticky_message_on_input() is True
@@ -1305,7 +1305,7 @@ def test_set_message_requests_a_render():
     # the popup is never drawn.
     runner = make_runner(_render_pending=False)
 
-    runner._set_message("Created <aGiT> commit.", sticky=True)
+    runner._set_message("Created <aGiTrack> commit.", sticky=True)
 
     assert runner._render_pending is True
 
@@ -1313,14 +1313,14 @@ def test_set_message_requests_a_render():
 def test_session_notices_compose_into_multiline_popup():
     # Concurrent sessions each get their own status line; the popup shows both.
     runner = make_runner()
-    runner._set_session_notice("alpha", "aGiT is summarizing commit a1 in session 'alpha'…", seconds=30)
-    runner._set_session_notice("beta", "aGiT is summarizing commit b2 in session 'beta'…", seconds=30)
+    runner._set_session_notice("alpha", "aGiTrack is summarizing commit a1 in session 'alpha'…", seconds=30)
+    runner._set_session_notice("beta", "aGiTrack is summarizing commit b2 in session 'beta'…", seconds=30)
 
     assert runner.message is not None
     lines = runner.message.split("\n")
     assert lines == [
-        "aGiT is summarizing commit a1 in session 'alpha'…",
-        "aGiT is summarizing commit b2 in session 'beta'…",
+        "aGiTrack is summarizing commit a1 in session 'alpha'…",
+        "aGiTrack is summarizing commit b2 in session 'beta'…",
     ]
     assert runner._notice_shown is True
 
@@ -1328,14 +1328,14 @@ def test_session_notices_compose_into_multiline_popup():
 def test_session_notice_replaces_same_session_line():
     # A session's later notice replaces its own line in place (no duplicate line).
     runner = make_runner()
-    runner._set_session_notice("alpha", "aGiT is summarizing commit a1 in session 'alpha'…", seconds=30)
-    runner._set_session_notice("beta", "aGiT is summarizing commit b2 in session 'beta'…", seconds=30)
-    runner._set_session_notice("alpha", "Created <aGiT> commit a1 in session 'alpha' — merged into main.")
+    runner._set_session_notice("alpha", "aGiTrack is summarizing commit a1 in session 'alpha'…", seconds=30)
+    runner._set_session_notice("beta", "aGiTrack is summarizing commit b2 in session 'beta'…", seconds=30)
+    runner._set_session_notice("alpha", "Created <aGiTrack> commit a1 in session 'alpha' — merged into main.")
 
     lines = runner.message.split("\n")
     assert lines == [
-        "Created <aGiT> commit a1 in session 'alpha' — merged into main.",
-        "aGiT is summarizing commit b2 in session 'beta'…",
+        "Created <aGiTrack> commit a1 in session 'alpha' — merged into main.",
+        "aGiTrack is summarizing commit b2 in session 'beta'…",
     ]
 
 
@@ -1359,7 +1359,7 @@ def test_live_notice_service_does_not_request_repaint_when_unchanged():
     # full-frame repaint at tick cadence and flickers the popup on terminals
     # without synchronized-update support. Only a content change repaints.
     runner = make_runner()
-    runner._set_session_notice("alpha", "aGiT is summarizing commit a1 in session 'alpha'…", seconds=30)
+    runner._set_session_notice("alpha", "aGiTrack is summarizing commit a1 in session 'alpha'…", seconds=30)
     assert runner._render_pending is True  # first appearance repaints
 
     runner._render_pending = False
@@ -1368,7 +1368,7 @@ def test_live_notice_service_does_not_request_repaint_when_unchanged():
     assert runner._render_pending is False  # no churn while unchanged
 
     # A new line for the session (summarizing -> created) does repaint.
-    runner._set_session_notice("alpha", "Created <aGiT> commit a1 in session 'alpha' — merged into main.")
+    runner._set_session_notice("alpha", "Created <aGiTrack> commit a1 in session 'alpha' — merged into main.")
     assert runner._render_pending is True
 
 
@@ -1409,7 +1409,7 @@ def test_track_sync_update_defers_then_releases_render():
     rendered = []
     runner._render = lambda: rendered.append(1)
 
-    # Begin-sync with no matching end: aGiT is mid-update and must defer.
+    # Begin-sync with no matching end: aGiTrack is mid-update and must defer.
     runner._track_sync_update(b"\x1b[?2026h")
     assert runner._in_sync_update is True
     runner._render_output()
@@ -1496,7 +1496,7 @@ def test_mouse_events_are_stripped_from_forwarded_input():
 
 
 def test_reset_agent_tracking_reenables_scrollback_for_new_backend():
-    # Switching OpenCode -> Claude must clear child_mouse so aGiT reclaims the
+    # Switching OpenCode -> Claude must clear child_mouse so aGiTrack reclaims the
     # wheel for scrollback instead of forwarding it to a backend that ignores it.
     runner = make_runner(
         child_mouse=True,
@@ -1520,7 +1520,7 @@ def test_wheel_forwarded_when_backend_manages_mouse():
 
 
 def test_apply_timings_overrides_constants():
-    from agit.config import DEFAULT_TIMINGS
+    from agitrack.config import DEFAULT_TIMINGS
 
     runner = make_runner()
     # Defaults are the class constants until config is applied.
@@ -1541,7 +1541,7 @@ def test_proxy_refuses_second_instance(monkeypatch, capsys):
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
     monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
     runner._ensure_backend_available = lambda: True
-    # A live aGiT (PID 4321) already holds the lock: acquire fails.
+    # A live aGiTrack (PID 4321) already holds the lock: acquire fails.
     runner.management_lock = type("L", (), {"acquire": lambda self: False, "owner_pid": lambda self: 4321})()
 
     assert runner.run() == 1
@@ -1631,10 +1631,10 @@ def test_pump_background_feeds_screen_without_disturbing_active():
 def test_baseline_drops_session_with_no_conversation(tmp_path):
     from types import SimpleNamespace
 
-    from agit.transcripts import ExportedSession
+    from agitrack.transcripts import ExportedSession
 
     runner = make_runner(
-        state=AgitState(tmp_path),
+        state=AgitrackState(tmp_path),
         repo=SimpleNamespace(repo=tmp_path),
     )
     runner.state.backend_session_id = "ses-empty"
@@ -1651,7 +1651,7 @@ def test_baseline_drops_session_with_no_conversation(tmp_path):
 def test_new_session_flag_clears_backend_session_and_mints_agit_id(tmp_path):
     runner = make_runner(
         _force_new_session=True,
-        state=AgitState(tmp_path),
+        state=AgitrackState(tmp_path),
     )
     runner.state.backend_session_id = "old-session"
     old_agit = runner.state.session_id
@@ -1665,11 +1665,11 @@ def test_new_session_flag_clears_backend_session_and_mints_agit_id(tmp_path):
 def test_status_line_shows_base_branch(tmp_path):
     import subprocess
 
-    from agit.git import GitRepo
-    from agit.config import AgitState
+    from agitrack.git import GitRepo
+    from agitrack.config import AgitrackState
 
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
-    state = AgitState(tmp_path)
+    state = AgitrackState(tmp_path)
     state.backend_session_id = "abcdef123456"
     runner = make_runner(
         repo=GitRepo(tmp_path),
@@ -1724,7 +1724,7 @@ def test_inject_prompt_defers_enter_until_text_settles():
 
 
 def test_backend_session_change_warns_once(tmp_path):
-    state = AgitState(tmp_path)
+    state = AgitrackState(tmp_path)
     state.backend_session_id = "old"
     runner = make_runner(
         worktree=object(),
@@ -1754,7 +1754,7 @@ def _name_persisting_runner(tmp_path, name):
         worktree=object(),
         _warned_backend_session=True,
         name=name,
-        state=AgitState(worktree),
+        state=AgitrackState(worktree),
         base_repo=types.SimpleNamespace(repo=base),
         global_config=types.SimpleNamespace(default_backend="opencode"),
     ), base
@@ -1768,7 +1768,7 @@ def test_backend_session_change_persists_name_in_root_state(tmp_path):
 
     runner._note_backend_session_change("sess-1")
 
-    assert AgitState(base).session_name_for("sess-1") == "my-feature"
+    assert AgitrackState(base).session_name_for("sess-1") == "my-feature"
 
 
 def test_backend_session_change_follows_id_drift(tmp_path):
@@ -1780,7 +1780,7 @@ def test_backend_session_change_follows_id_drift(tmp_path):
     runner.state.backend_session_id = "sess-1"
     runner._note_backend_session_change("sess-2")
 
-    assert AgitState(base).session_name_for("sess-2") == "my-feature"
+    assert AgitrackState(base).session_name_for("sess-2") == "my-feature"
 
 
 def test_auto_session_names_are_not_persisted(tmp_path):
@@ -1790,7 +1790,7 @@ def test_auto_session_names_are_not_persisted(tmp_path):
 
     runner._note_backend_session_change("sess-1")
 
-    assert AgitState(base).session_name_for("sess-1") is None
+    assert AgitrackState(base).session_name_for("sess-1") is None
 
 
 def _resume_listing_runner(tmp_path, *, base_refs, worktree_sessions, worktree_names=()):
@@ -1864,10 +1864,10 @@ def test_resumable_named_session_dated_when_it_was_named_not_epoch(tmp_path):
     # rendered as an absurd "20000d ago").
     import time as _time
 
-    from agit.config import AgitState
+    from agitrack.config import AgitrackState
 
     runner, base = _resume_listing_runner(tmp_path, base_refs=[], worktree_sessions=[])
-    state = AgitState(base)
+    state = AgitrackState(base)
     state.name_session("ghost-id", "experiment")  # stamps session_named_at
     runner._agit_named_sessions = lambda: {"ghost-id": "experiment"}
 
@@ -1917,7 +1917,7 @@ def test_named_sessions_persisted_name_wins_over_worktree_key(tmp_path):
         base_refs=[],
         worktree_sessions=[("old-dir", SessionRef("wt-1", 300.0))],
     )
-    AgitState(base, default_backend="opencode").name_session("wt-1", "renamed")
+    AgitrackState(base, default_backend="opencode").name_session("wt-1", "renamed")
 
     assert runner._agit_named_sessions().get("wt-1") == "renamed"
 
@@ -1939,7 +1939,7 @@ def test_new_session_name_cannot_clash_with_dormant_named_session(tmp_path):
 def test_new_session_not_applied_without_flag(tmp_path):
     runner = make_runner(
         _force_new_session=False,
-        state=AgitState(tmp_path),
+        state=AgitrackState(tmp_path),
     )
     runner.state.backend_session_id = "keep-this"
     runner._apply_new_session_if_requested()
@@ -2124,7 +2124,7 @@ def test_proxy_parse_starts_only_after_cooldown_between_file_events(monkeypatch)
     # only passes when uptime exceeds the 60s cooldown (true on a dev box, false
     # on a freshly-booted CI runner) — so drive a fixed clock instead.
     clock = [10_000.0]
-    monkeypatch.setattr("agit.proxy.runner.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("agitrack.proxy.runner.time.monotonic", lambda: clock[0])
     runner = make_runner(
         file_change_event=threading.Event(),
         status_check_pending=False,
@@ -2210,7 +2210,7 @@ def test_proxy_parse_cooldown_starts_after_parse_finish():
 def test_proxy_start_agent_parse_rejects_active_parse(tmp_path):
     runner = make_runner(
         repo=type("Repo", (), {"repo": tmp_path})(),
-        state=AgitState(tmp_path),
+        state=AgitrackState(tmp_path),
         agent_parse_thread=None,
         agent_parse_result=None,
         agent_parse_active=True,
@@ -2222,7 +2222,7 @@ def test_proxy_start_agent_parse_rejects_active_parse(tmp_path):
 def test_proxy_sanitizes_raw_opencode_event_agent_trace(tmp_path):
     runner = make_runner(
         repo=type("Repo", (), {"repo": tmp_path})(),
-        state=AgitState(tmp_path),
+        state=AgitrackState(tmp_path),
         backend=make_proxy_agent("opencode"),
         debug_proxy=False,
     )
@@ -2250,7 +2250,7 @@ def test_proxy_pending_prompt_forwards_after_agent_parse_commit(tmp_path):
             pending_forwarded=[b"\r"],
             pending_prompt_text="fix it",
             passthrough_prompt=bytearray(b"fix it"),
-            state=AgitState(tmp_path),
+            state=AgitrackState(tmp_path),
             agent_parse_thread=None,
             agent_in_flight=False,
             message="waiting",
@@ -2281,7 +2281,7 @@ def test_proxy_pending_prompt_forwards_when_agent_mid_turn(tmp_path):
             pending_forwarded=[b"\r"],
             pending_prompt_text="and also rename it",
             passthrough_prompt=bytearray(b"and also rename it"),
-            state=AgitState(tmp_path),
+            state=AgitrackState(tmp_path),
             agent_parse_thread=None,
             agent_in_flight=False,
             message=None,
@@ -2309,7 +2309,7 @@ def test_proxy_pending_prompt_user_commit_then_forwards(tmp_path):
             pending_forwarded=[b"\r"],
             pending_prompt_text="fix it",
             passthrough_prompt=bytearray(b"fix it"),
-            state=AgitState(tmp_path),
+            state=AgitrackState(tmp_path),
             agent_parse_thread=None,
             agent_in_flight=False,
             screen=None,
@@ -2346,7 +2346,7 @@ def test_new_turn_clears_previous_created_notice(tmp_path):
             pending_forwarded=[b"\r"],
             pending_prompt_text="next thing",
             passthrough_prompt=bytearray(b"next thing"),
-            state=AgitState(tmp_path),
+            state=AgitrackState(tmp_path),
             name="session-1",
             agent_parse_thread=None,
             agent_in_flight=False,
@@ -2358,7 +2358,7 @@ def test_new_turn_clears_previous_created_notice(tmp_path):
         runner._ensure_turn_branch = lambda: None
         # The previous turn left a "created & merged" notice for this session.
         runner._set_session_notice(
-            "session-1", "Created <aGiT> commit abc1234 in session 'session-1' — merged into main."
+            "session-1", "Created <aGiTrack> commit abc1234 in session 'session-1' — merged into main."
         )
         assert runner.message is not None
 
@@ -2384,7 +2384,7 @@ def test_proxy_pending_prompt_cancelled_user_commit_does_not_forward(tmp_path):
             pending_forwarded=[b"\r"],
             pending_prompt_text="fix it",
             passthrough_prompt=bytearray(b"fix it"),
-            state=AgitState(tmp_path),
+            state=AgitrackState(tmp_path),
             agent_parse_thread=None,
             agent_in_flight=False,
             screen=None,
@@ -2500,7 +2500,7 @@ def test_created_notice_fires_only_after_merge_into_base():
     result = runner._integrate_turn_or_conflict()
 
     assert result == "integrated"
-    assert runner.message == "Created <aGiT> commit abc1234 in session 'session-1' — merged into main."
+    assert runner.message == "Created <aGiTrack> commit abc1234 in session 'session-1' — merged into main."
     assert runner._commit_merged_pending is False  # consumed, won't repeat
 
 
@@ -2599,7 +2599,7 @@ def _backend_switch_runner(monkeypatch):
     runner.backend = types.SimpleNamespace(name="claude")
     runner.worktree = object()
     runner.global_config = types.SimpleNamespace(default_backend="claude")
-    monkeypatch.setattr("agit.proxy.runner.backend_installed", lambda n: True)
+    monkeypatch.setattr("agitrack.proxy.runner.backend_installed", lambda n: True)
     return runner
 
 
@@ -2817,15 +2817,19 @@ def test_with_session_swaps_in_and_restores_active():
     assert b.last_status == "touched"  # background snapshot updated
 
 
-def test_next_session_name_skips_existing_worktrees_and_sessions():
+def test_next_session_name_is_a_word_avoiding_taken_names():
     import types
+
+    from agitrack.proxy.session_names import SESSION_WORDS
 
     runner = _mux_runner()  # one active session named "A"
     runner.worktree_manager = types.SimpleNamespace(
-        list=lambda: [types.SimpleNamespace(name="session-1"), types.SimpleNamespace(name="session-2")]
+        list=lambda: [types.SimpleNamespace(name="maple"), types.SimpleNamespace(name="willow")]
     )
-    # session-1 and session-2 are taken (plus active "A"), so the next is session-3.
-    assert runner._next_session_name() == "session-3"
+    # A neutral word that isn't one of the taken names.
+    name = runner._next_session_name()
+    assert name in SESSION_WORDS
+    assert name not in {"maple", "willow"} | runner._taken_session_names()
 
 
 # --- injected-prompt targeting (cross-backend safety) ---
@@ -2890,12 +2894,12 @@ def test_flush_pending_enter_marks_sent_only_when_still_active(monkeypatch):
 
 
 def test_state_remember_and_recall_session(tmp_path):
-    s = AgitState(tmp_path)
+    s = AgitrackState(tmp_path)
     assert s.recall_session("opencode") is None
     s.remember_session("opencode", session_id="abc", worktree="session-2", message_id="m1", model="o4")
     assert s.recall_session("opencode") == {"id": "abc", "worktree": "session-2", "message_id": "m1", "model": "o4"}
     # Survives a reload from disk.
-    assert AgitState(tmp_path).recall_session("opencode")["id"] == "abc"
+    assert AgitrackState(tmp_path).recall_session("opencode")["id"] == "abc"
     # Clearing (no id) forgets it.
     s.remember_session("opencode", session_id=None, worktree="session-2")
     assert s.recall_session("opencode") is None
@@ -3003,12 +3007,15 @@ def _shared_resume_runner():
     runner._taken_session_names = lambda: set()
     runner.__dict__["_origins"] = {}
     runner._user_state = lambda: types.SimpleNamespace(
-        set_shared_origin_name=lambda sid, name: runner.__dict__["_origins"].__setitem__(sid, name),
-        shared_origin_name=lambda sid: runner.__dict__["_origins"].get(sid),
+        set_shared_origin=lambda sid, *, owner, name, contributors=None: runner.__dict__["_origins"].__setitem__(
+            sid, {"owner": owner, "name": name, "contributors": sorted(set(contributors or []))}
+        ),
+        shared_origin=lambda sid: runner.__dict__["_origins"].get(sid),
     )
     entry = types.SimpleNamespace(
         github_id="alice",
         name="fix-parser",
+        contributors=["alice"],
         display="alice/fix-parser",
         manifest={"session_id": "sid-1", "backend": "claude"},
     )
@@ -3159,6 +3166,67 @@ def test_is_real_keypress_ignores_mouse_and_focus():
     assert runner._is_real_keypress(b"\x1b[<35;1;1Mx") is True
 
 
+def test_timers_phase_noops_when_not_running():
+    # After a menu "update" (or exit) finalizes and REMOVES the worktree, the timers
+    # phase must touch nothing — a stale call would run git in the deleted worktree
+    # and raise FileNotFoundError. The loop also breaks before reaching here.
+    from proxy_helpers import make_runner
+
+    runner = make_runner()
+    runner.running = False
+    touched: list = []
+    runner._flush_pending_render = lambda: touched.append("render")
+    runner._ensure_worktree_alive = lambda: touched.append("alive")
+    runner._maybe_agent_commit = lambda: touched.append("commit")
+
+    runner._reactor_timers_phase()
+
+    assert touched == []  # nothing ran on the torn-down session
+
+
+def test_timers_phase_stops_after_pending_update_teardown():
+    # A deferred update can apply mid-phase (sessions just went idle), finalizing and
+    # removing the worktree; the worktree-touching tail must then be skipped.
+    from proxy_helpers import make_runner
+
+    runner = make_runner()
+    runner.running = True
+    runner.merge_ctx = None
+    runner._base_advanced = True
+    synced: list = []
+    runner._sync_idle_worktrees_to_base = lambda: synced.append(True)
+
+    def noop(*a, **k):
+        return None
+
+    for name in [
+        "_flush_pending_render",
+        "_flush_pending_enter",
+        "_check_base_branch_drift",
+        "_resume_pending_prompt_if_ready",
+        "_ensure_worktree_alive",
+        "_service_commit_summaries",
+        "_service_precompact_summary",
+        "_service_shared_resume",
+        "_maybe_agent_commit",
+        "_service_background_sessions",
+        "_poll_base_advanced",
+        "_warn_if_base_edited",
+        "_warn_if_cwd_drifted",
+        "_maybe_check_for_update",
+        "_service_session_notices",
+    ]:
+        setattr(runner, name, noop)
+
+    def apply_pending():
+        runner.running = False  # finalize removed the worktree and stopped the loop
+
+    runner._maybe_apply_pending_update = apply_pending
+    runner._reactor_timers_phase()
+
+    assert synced == []  # the worktree-sync tail was skipped after teardown
+
+
 def test_abort_shared_resume_clears_token_for_retry():
     import threading
 
@@ -3193,9 +3261,13 @@ def test_shared_resume_prompts_for_local_name():
 
     assert seen["default"] == "fix-parser"
     assert runner.__dict__["_resumed"] == [("my-copy", "sid-1", {"backend": "claude"})]
-    # The original share name is remembered so a later re-share updates the same
-    # entry regardless of the local name (#55).
-    assert runner.__dict__["_origins"]["sid-1"] == "fix-parser"
+    # The lineage origin (owner + name + contributors) is remembered so a later
+    # re-share updates the same entry regardless of the local name (#55).
+    assert runner.__dict__["_origins"]["sid-1"] == {
+        "owner": "alice",
+        "name": "fix-parser",
+        "contributors": ["alice"],
+    }
 
 
 def test_shared_resume_defers_fetch_to_background_then_completes():
@@ -3273,20 +3345,20 @@ def test_shared_resume_update_live_overwrites_worktree_and_restarts_agent():
     assert restarted == ["Updated this session to the shared version."]  # backend restarted to load it
 
 
-def test_share_name_uses_remembered_origin_over_local_name():
+def test_share_identity_uses_remembered_origin_over_local_name():
     import types
 
     runner = make_runner(name="main")
     runner.active_index = 0
     runner._session_name = lambda i: "my-local-rename"
-    runner._user_state = lambda: types.SimpleNamespace(
-        shared_origin_name=lambda sid: "fix-parser" if sid == "sid-1" else None
-    )
-    # A resumed shared session re-shares under its origin name, not the local one.
-    assert runner._share_name_for("sid-1") == "fix-parser"
-    # A session that originated here (no origin) falls back to the local name.
-    assert runner._share_name_for("other") == "my-local-rename"
-    assert runner._share_name_for(None) == "my-local-rename"
+    origin = {"owner": "alice", "name": "fix-parser", "contributors": ["alice"]}
+    runner._user_state = lambda: types.SimpleNamespace(shared_origin=lambda sid: origin if sid == "sid-1" else None)
+    # A resumed shared session re-shares under its origin owner+name, with the sharer
+    # joining the contributor set — not a fresh `<sharer>/<local-name>`.
+    assert runner._share_identity("sid-1", "bob") == ("alice", "fix-parser", ["alice", "bob"])
+    # A session that originated here (no origin) shares under the sharer + local name.
+    assert runner._share_identity("other", "bob") == ("bob", "my-local-rename", ["bob"])
+    assert runner._share_identity(None, "bob") == ("bob", "my-local-rename", ["bob"])
 
 
 def test_new_session_stages_transcript_before_spawn_when_resuming(tmp_path, monkeypatch):
@@ -3295,7 +3367,7 @@ def test_new_session_stages_transcript_before_spawn_when_resuming(tmp_path, monk
     # never loads (the transcript was imported under the base repo, not here).
     import types
 
-    from agit.proxy import runner as runner_module
+    from agitrack.proxy import runner as runner_module
 
     runner = make_runner(name="main")
     runner._use_worktrees = True
@@ -3304,7 +3376,7 @@ def test_new_session_stages_transcript_before_spawn_when_resuming(tmp_path, monk
     repo = types.SimpleNamespace(repo=tmp_path, current_branch=lambda: "agit/claude/bob-feature/t1")
     runner._open_session_worktree = lambda name: (info, repo)
     monkeypatch.setattr(runner_module, "make_proxy_agent", lambda name: types.SimpleNamespace(name=name))
-    monkeypatch.setattr(runner_module, "AgitActions", lambda *a, **k: types.SimpleNamespace())
+    monkeypatch.setattr(runner_module, "AgitrackActions", lambda *a, **k: types.SimpleNamespace())
 
     order: list = []
     runner._stage_backend_resume = lambda sid: order.append(("stage", sid))
@@ -3585,11 +3657,11 @@ def test_sync_idle_worktrees_skipped_while_paused():
 def test_cleanup_stale_state_removes_orphaned_worktree_dirs(tmp_path):
     import types
 
-    root = tmp_path / ".agit" / "worktrees"
+    root = tmp_path / ".agitrack" / "worktrees"
     registered = root / "session-1"
     registered.mkdir(parents=True)
     orphan = root / "session-2"
-    (orphan / ".agit").mkdir(parents=True)  # only .agit/ → not a valid worktree
+    (orphan / ".agitrack").mkdir(parents=True)  # only .agitrack/ → not a valid worktree
     (root / "stray-file").write_text("x")  # a file, not a dir → ignored
 
     runner = make_runner()
@@ -3605,7 +3677,7 @@ def test_cleanup_stale_state_removes_orphaned_worktree_dirs(tmp_path):
     runner._cleanup_stale_state_on_startup()
 
     assert registered.exists()  # a real registered worktree is kept
-    assert not orphan.exists()  # the orphaned .agit/-only dir is swept
+    assert not orphan.exists()  # the orphaned .agitrack/-only dir is swept
     assert (root / "stray-file").exists()
     assert prunes  # pruned stale git registrations
 
@@ -3613,7 +3685,7 @@ def test_cleanup_stale_state_removes_orphaned_worktree_dirs(tmp_path):
 def test_is_valid_worktree_rejects_leftover_without_git(tmp_path):
     runner = make_runner()
     leftover = tmp_path / "session-1"
-    (leftover / ".agit").mkdir(parents=True)  # only .agit/, no .git → invalid
+    (leftover / ".agitrack").mkdir(parents=True)  # only .agitrack/, no .git → invalid
     assert runner._is_valid_worktree(leftover) is False
 
 
@@ -3623,7 +3695,7 @@ def test_open_session_worktree_recreates_corrupted_leftover(tmp_path):
     runner = make_runner(_base_branch="dev")
     runner._debug = lambda *a, **k: None
     leftover = tmp_path / "session-1"
-    (leftover / ".agit").mkdir(parents=True)  # corrupted leftover
+    (leftover / ".agitrack").mkdir(parents=True)  # corrupted leftover
     created = {}
 
     def _create(name, *, base):
@@ -3633,7 +3705,7 @@ def test_open_session_worktree_recreates_corrupted_leftover(tmp_path):
 
     runner.worktree_manager = types.SimpleNamespace(worktree_path=lambda name: tmp_path / name, create=_create)
     runner._worktrees = lambda: runner.worktree_manager
-    import agit.proxy.runner as proxymod
+    import agitrack.proxy.runner as proxymod
 
     orig = proxymod.GitRepo
     proxymod.GitRepo = lambda path: types.SimpleNamespace(current_branch=lambda: "")
@@ -3643,7 +3715,7 @@ def test_open_session_worktree_recreates_corrupted_leftover(tmp_path):
         proxymod.GitRepo = orig
 
     assert created["called"] == ("session-1", "dev")  # recreated, not reused
-    assert not (leftover / ".agit").exists()  # corrupted leftover was cleared first
+    assert not (leftover / ".agitrack").exists()  # corrupted leftover was cleared first
 
 
 def test_diag_path_uses_base_repo(tmp_path):
@@ -3651,12 +3723,12 @@ def test_diag_path_uses_base_repo(tmp_path):
 
     runner = make_runner(
         base_repo=types.SimpleNamespace(repo=tmp_path / "base"),
-        repo=types.SimpleNamespace(repo=tmp_path / "base" / ".agit" / "worktrees" / "session-1"),
+        repo=types.SimpleNamespace(repo=tmp_path / "base" / ".agitrack" / "worktrees" / "session-1"),
     )
     runner._diag_run = "20260101-000000"
     path = runner._diag_path("proxy-raw")
-    # Lands in the *base* .agit/, not the ephemeral worktree's.
-    assert path == tmp_path / "base" / ".agit" / "proxy-raw-20260101-000000.log"
+    # Lands in the *base* .agitrack/, not the ephemeral worktree's.
+    assert path == tmp_path / "base" / ".agitrack" / "proxy-raw-20260101-000000.log"
 
 
 # --- resume cwd drift guard ---
@@ -3681,7 +3753,7 @@ def _drift_runner(recorded_cwd, worktree_path):
 
 
 def test_cwd_drift_warns_when_backend_left_the_worktree():
-    runner = _drift_runner("/somewhere/else", "/repo/.agit/worktrees/session-1")
+    runner = _drift_runner("/somewhere/else", "/repo/.agitrack/worktrees/session-1")
     runner._warn_if_cwd_drifted()
     assert runner.messages and "#58591" in runner.messages[0]
     assert runner._cwd_drift_checked is True
@@ -3692,14 +3764,14 @@ def test_cwd_drift_warns_when_backend_left_the_worktree():
 
 
 def test_cwd_drift_silent_when_on_the_worktree():
-    runner = _drift_runner("/repo/.agit/worktrees/session-1", "/repo/.agit/worktrees/session-1")
+    runner = _drift_runner("/repo/.agitrack/worktrees/session-1", "/repo/.agitrack/worktrees/session-1")
     runner._warn_if_cwd_drifted()
     assert runner.messages == []
     assert runner._cwd_drift_checked is True
 
 
 def test_cwd_drift_waits_when_no_cwd_recorded_yet():
-    runner = _drift_runner(None, "/repo/.agit/worktrees/session-1")
+    runner = _drift_runner(None, "/repo/.agitrack/worktrees/session-1")
     runner._warn_if_cwd_drifted()
     assert runner.messages == []
     assert getattr(runner, "_cwd_drift_checked", False) is False  # will re-check next tick
@@ -3719,7 +3791,7 @@ def test_cwd_drift_forwards_launch_time_as_since(monkeypatch):
 
     runner = make_runner(
         worktree=types.SimpleNamespace(name="session-1"),
-        repo=types.SimpleNamespace(repo="/repo/.agit/worktrees/session-1"),
+        repo=types.SimpleNamespace(repo="/repo/.agitrack/worktrees/session-1"),
         state=types.SimpleNamespace(backend_session_id="sess-1"),
         backend=types.SimpleNamespace(recorded_working_dir=recorded),
     )
@@ -3742,14 +3814,14 @@ def test_cwd_drift_forwards_launch_time_as_since(monkeypatch):
 
 def test_confine_to_worktree_wraps_when_enabled(monkeypatch):
     import types
-    from agit.proxy import sandbox
+    from agitrack.proxy import sandbox
 
     # Force the macOS mechanism so the assertion is platform-independent.
     monkeypatch.setattr(sandbox, "_have_sandbox_exec", lambda: True)
-    monkeypatch.delenv("AGIT_SANDBOX", raising=False)
+    monkeypatch.delenv("AGITRACK_SANDBOX", raising=False)
     runner = make_runner(
         worktree=types.SimpleNamespace(name="session-1"),
-        repo=types.SimpleNamespace(repo="/repo/.agit/worktrees/session-1"),
+        repo=types.SimpleNamespace(repo="/repo/.agitrack/worktrees/session-1"),
     )
     runner.global_config = types.SimpleNamespace(sandbox=True)
     runner.base_repo = types.SimpleNamespace(repo="/repo")
@@ -3761,7 +3833,7 @@ def test_confine_to_worktree_wraps_when_enabled(monkeypatch):
 
 def test_confine_to_worktree_noop_without_worktree_or_when_disabled(monkeypatch):
     import types
-    from agit.proxy import sandbox
+    from agitrack.proxy import sandbox
 
     monkeypatch.setattr(sandbox, "is_available", lambda: True)
     runner = make_runner(worktree=None)
@@ -3770,7 +3842,7 @@ def test_confine_to_worktree_noop_without_worktree_or_when_disabled(monkeypatch)
 
     runner = make_runner(
         worktree=types.SimpleNamespace(name="session-1"),
-        repo=types.SimpleNamespace(repo="/repo/.agit/worktrees/session-1"),
+        repo=types.SimpleNamespace(repo="/repo/.agitrack/worktrees/session-1"),
     )
     runner.global_config = types.SimpleNamespace(sandbox=False)  # user opted out
     runner.base_repo = types.SimpleNamespace(repo="/repo")
@@ -3816,7 +3888,7 @@ def test_adopt_latest_backend_session_keeps_id_when_unchanged():
 def test_recover_nonempty_session_returns_latest_with_content(tmp_path):
     import types
 
-    state = AgitState(tmp_path)
+    state = AgitrackState(tmp_path)
     state.backend_session_id = "empty-id"
     real = ExportedSession("real-id", "claude-opus-4-8", None, [SessionTurn("u", "a", "p", "r", TokenUsage(), None)])
     runner = make_runner(
@@ -3836,7 +3908,7 @@ def test_recover_nonempty_session_returns_latest_with_content(tmp_path):
 def test_recover_nonempty_session_none_when_latest_also_empty(tmp_path):
     import types
 
-    state = AgitState(tmp_path)
+    state = AgitrackState(tmp_path)
     state.backend_session_id = "empty-id"
     runner = make_runner(
         state=state,
@@ -3860,7 +3932,7 @@ def test_relaunch_backend_resumes_then_gives_up_on_crash_loop(monkeypatch):
     runner._finalize_on_backend_exit = lambda: calls.append("finalize")
 
     t = [1000.0]
-    monkeypatch.setattr("agit.proxy.runner.time.monotonic", lambda: t[0])
+    monkeypatch.setattr("agitrack.proxy.runner.time.monotonic", lambda: t[0])
 
     # Backend keeps dying quickly: first 3 relaunch, the 4th gives up and exits.
     assert runner._relaunch_backend_or_exit() is True
@@ -3879,7 +3951,7 @@ def test_relaunch_backend_resets_loop_guard_after_quiet_period(monkeypatch):
     runner._finalize_on_backend_exit = lambda: relaunches.append("finalize")
 
     t = [1000.0]
-    monkeypatch.setattr("agit.proxy.runner.time.monotonic", lambda: t[0])
+    monkeypatch.setattr("agitrack.proxy.runner.time.monotonic", lambda: t[0])
     for _ in range(3):
         runner._relaunch_backend_or_exit()
     t[0] += 60.0  # a minute later the old exits no longer count
@@ -3931,7 +4003,7 @@ def test_resumable_sessions_come_from_backend_repo_record():
 
     result = runner._resumable_sessions()
 
-    # Sourced from the repo aGiT launched in (not worktrees), newest first.
+    # Sourced from the repo aGiTrack launched in (not worktrees), newest first.
     assert asked["repo"] == "/repo-root"
     assert [ref.id for ref in result] == ["b", "c", "a"]
 
@@ -4006,7 +4078,7 @@ def test_sync_idle_worktrees_aligns_idle_skips_in_flight():
 
 
 def _user_git_runner(tmp_path, answers):
-    from agit.git import GitRepo
+    from agitrack.git import GitRepo
 
     repo = GitRepo.init(tmp_path)  # seeds an initial commit; user files stay untracked
     runner = make_runner(
@@ -4063,7 +4135,7 @@ def test_stage_files_reads_declined_from_base_not_worktree_state(tmp_path):
     runner, repo = _user_git_runner(tmp_path, answers=[""])  # view, then cancel
     (tmp_path / "local.txt").write_text("y\n", encoding="utf-8")
     runner._user_state().add_declined(["local.txt"])
-    runner.state = AgitState(tmp_path / "worktree")  # worktree state: nothing declined
+    runner.state = AgitrackState(tmp_path / "worktree")  # worktree state: nothing declined
 
     message = runner._stage_files_popup()
 
@@ -4088,7 +4160,7 @@ def test_stage_files_invalid_selection_stages_nothing(tmp_path):
 
 
 def test_git_status_returns_full_long_format(tmp_path):
-    from agit.git import GitRepo
+    from agitrack.git import GitRepo
 
     repo = GitRepo.init(tmp_path)
     (tmp_path / "new.py").write_text("x\n", encoding="utf-8")
@@ -4120,13 +4192,13 @@ def test_status_line_unstaged_count_reflects_base_declined(tmp_path):
 
 
 def _base_edit_runner(tmp_path, answers):
-    from agit.git import GitRepo
+    from agitrack.git import GitRepo
 
     base = GitRepo.init(tmp_path)
     (tmp_path / "notes.txt").write_text("original\n", encoding="utf-8")
     base.stage_paths(["notes.txt"])
     base.commit("add notes")
-    wt_path = tmp_path / ".agit" / "worktrees" / "session-1"
+    wt_path = tmp_path / ".agitrack" / "worktrees" / "session-1"
     wt_path.parent.mkdir(parents=True, exist_ok=True)
     base.worktree_add_detached(str(wt_path), base=base.current_branch())
     worktree = GitRepo(wt_path)
@@ -4141,7 +4213,7 @@ def _base_edit_runner(tmp_path, answers):
         _integration_paused=False,
         agent_in_flight=False,
         agent_parse_thread=None,
-        state=AgitState(wt_path),
+        state=AgitrackState(wt_path),
         _user_declined=[],
         message=None,
         message_until=0.0,
@@ -4220,7 +4292,7 @@ def test_resume_pending_prompt_checks_base_user_edits(tmp_path):
             pending_forwarded=[b"\r"],
             pending_prompt_text="fix it",
             passthrough_prompt=bytearray(b"fix it"),
-            state=AgitState(tmp_path),
+            state=AgitrackState(tmp_path),
             agent_parse_thread=None,
             agent_in_flight=False,
             screen=None,
@@ -4250,7 +4322,7 @@ def test_agent_commit_failed_attempt_does_not_double_count_tokens(tmp_path):
     # once per failed attempt.
     runner = make_runner(
         repo=FakeCommitRepo(),
-        state=AgitState(tmp_path),
+        state=AgitrackState(tmp_path),
         verbose=False,
     )
     repo = runner.repo
@@ -4293,7 +4365,7 @@ def test_agent_commit_failed_attempt_does_not_double_count_tokens(tmp_path):
 
 
 def test_actions_agent_commit_failed_attempt_does_not_double_count(tmp_path):
-    from agit.commits import AgitActions
+    from agitrack.commits import AgitrackActions
 
     class Repo:
         def __init__(self):
@@ -4313,8 +4385,8 @@ def test_actions_agent_commit_failed_attempt_does_not_double_count(tmp_path):
             self.message = message
 
     repo = Repo()
-    state = AgitState(tmp_path)
-    actions = AgitActions(repo, state)
+    state = AgitrackState(tmp_path)
+    actions = AgitrackActions(repo, state)
     turn = SessionTurn("u1", "a1", "fix it", "done", TokenUsage(total=140, input=130, output=10), None)
 
     assert (
@@ -4352,8 +4424,8 @@ def test_actions_agent_commit_failed_attempt_does_not_double_count(tmp_path):
 def test_parse_worker_delivers_to_its_own_session_after_switch(tmp_path):
 
     release = threading.Event()
-    state_a = AgitState(tmp_path / "a")
-    state_b = AgitState(tmp_path / "b")
+    state_a = AgitrackState(tmp_path / "a")
+    state_b = AgitrackState(tmp_path / "b")
     exported = ExportedSession(session_id="ses-a", model=None, updated=None, turns=[])
 
     class Backend:
@@ -4417,7 +4489,7 @@ def test_finish_agent_parse_discards_result_owned_by_another_session(tmp_path):
     # The result was produced for a different session's state (e.g. captured
     # before a switch); applying it here would re-commit or cross-attribute turns.
     session_id, session, last_message_id, _ = runner.agent_parse_result
-    runner.agent_parse_result = (session_id, session, last_message_id, AgitState(tmp_path / "other"))
+    runner.agent_parse_result = (session_id, session, last_message_id, AgitrackState(tmp_path / "other"))
 
     result = runner._finish_agent_parse_if_ready(quiet=True)
 
@@ -4547,10 +4619,10 @@ def test_select_popup_ctrl_c_routes_through_exit_flow():
 
 def test_spawn_failed_exec_child_exits_with_127(tmp_path):
     # Issue #20: if execvp fails in the forked child (binary gone, PATH change,
-    # worktree deleted), the child must die — not keep running aGiT's own
+    # worktree deleted), the child must die — not keep running aGiTrack's own
     # Python code from the fork point as a duplicate process.
     runner = make_runner(
-        state=AgitState(tmp_path),
+        state=AgitrackState(tmp_path),
         repo=types.SimpleNamespace(repo=tmp_path),
         worktree=None,
         backend=types.SimpleNamespace(
@@ -4614,7 +4686,7 @@ def test_reaper_keeps_still_running_children():
 
 
 def _popup_io_runner(monkeypatch, stdin_fd):
-    import agit.proxy.runner as proxy_mod
+    import agitrack.proxy.runner as proxy_mod
 
     runner = make_runner(
         master_fd=None,
@@ -4731,7 +4803,7 @@ def test_sync_tracked_session_skips_empty_newest_session(tmp_path):
         SessionRef("empty-newest", 200.0, label=None),
     ]
     runner = _runner_with_sessions(refs)
-    runner.state = AgitState(tmp_path)
+    runner.state = AgitrackState(tmp_path)
     runner._initialize_session_baseline = lambda: None
     runner._set_message = lambda *a, **k: None
     runner._render = lambda: None
@@ -4762,7 +4834,7 @@ def test_exit_command_routes_through_unified_exit_flow(tmp_path):
 
 
 def test_exit_command_cancelled_does_not_request_exit(tmp_path):
-    # Declining the exit confirmation keeps aGiT running: the loop-break flag
+    # Declining the exit confirmation keeps aGiTrack running: the loop-break flag
     # stays clear.
     runner = make_runner()
     runner._confirm_exit = lambda: False
@@ -4799,7 +4871,7 @@ def test_double_ctrl_c_finalizes_before_exiting():
 
 
 def test_sync_terminal_modes_mirrors_keyboard_protocol(monkeypatch):
-    import agit.proxy.runner as proxy_mod
+    import agitrack.proxy.runner as proxy_mod
 
     runner = make_runner(child_mouse=False)
     writes = []
@@ -4983,7 +5055,7 @@ def test_idle_integration_skips_active_agent_and_clean_branches():
 # ProxyRunner.__new__)
 # ---------------------------------------------------------------------------
 
-from agit.proxy.renderer import ScreenRenderer
+from agitrack.proxy.renderer import ScreenRenderer
 
 
 def _make_renderer(rows=24, cols=80, color_mode="truecolor"):
@@ -5201,7 +5273,7 @@ def test_screen_renderer_status_line_basic():
         user_declined=[],
         short_session_fn=lambda s: "(none)",
     )
-    assert "aGiT" in line
+    assert "aGiTrack" in line
     assert "claude" in line
 
 
@@ -5218,10 +5290,10 @@ def test_screen_renderer_status_line_shows_home_abbreviated_cwd(monkeypatch):
         scroll_back=0,
         user_declined=[],
         short_session_fn=lambda s: "(none)",
-        cwd="/Users/dev/code/repo/.agit/worktrees/session-1",
+        cwd="/Users/dev/code/repo/.agitrack/worktrees/session-1",
     )
     # The agent's working directory is visible, home-abbreviated.
-    assert "~/code/repo/.agit/worktrees/session-1" in line
+    assert "~/code/repo/.agitrack/worktrees/session-1" in line
 
 
 def test_screen_renderer_status_line_elides_long_cwd_from_left():
@@ -5248,22 +5320,22 @@ def test_screen_renderer_status_line_elides_long_cwd_from_left():
 
 def test_status_line_shows_base_repo_directory_not_the_worktree(tmp_path):
     # The path identifies the PROJECT (base repo), not the internal
-    # .agit/worktrees/<name> sandbox — the session name next to it already
+    # .agitrack/worktrees/<name> sandbox — the session name next to it already
     # says which worktree is active.
     import subprocess
 
-    from agit.git import GitRepo
-    from agit.config import AgitState
+    from agitrack.git import GitRepo
+    from agitrack.config import AgitrackState
 
     base = tmp_path / "project"
-    worktree = base / ".agit" / "worktrees" / "session-1"
+    worktree = base / ".agitrack" / "worktrees" / "session-1"
     worktree.mkdir(parents=True)
     subprocess.run(["git", "init", "-q"], cwd=base, check=True)
     subprocess.run(["git", "init", "-q"], cwd=worktree, check=True)
     runner = make_runner(
         repo=GitRepo(worktree),
         base_repo=GitRepo(base),
-        state=AgitState(worktree),
+        state=AgitrackState(worktree),
         name="session-1",
         backend=type("B", (), {"name": "claude"})(),
         scroll_back=0,
@@ -5272,7 +5344,7 @@ def test_status_line_shows_base_repo_directory_not_the_worktree(tmp_path):
 
     line = runner._status_line()
     assert f"{tmp_path}/project " in line
-    assert ".agit/worktrees" not in line
+    assert ".agitrack/worktrees" not in line
 
 
 def test_status_line_falls_back_to_repo_directory_without_base(tmp_path):
@@ -5280,13 +5352,13 @@ def test_status_line_falls_back_to_repo_directory_without_base(tmp_path):
     # the repo the agent works in is the project.
     import subprocess
 
-    from agit.git import GitRepo
-    from agit.config import AgitState
+    from agitrack.git import GitRepo
+    from agitrack.config import AgitrackState
 
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
     runner = make_runner(
         repo=GitRepo(tmp_path),
-        state=AgitState(tmp_path),
+        state=AgitrackState(tmp_path),
         name="session-1",
         backend=type("B", (), {"name": "claude"})(),
         scroll_back=0,
@@ -5347,8 +5419,8 @@ def test_duck_type_aliases_cover_extracted_classes():
     import inspect
     import re as _re
 
-    from agit.proxy.renderer import ScreenRenderer
-    from agit.proxy.terminal import TerminalHost
+    from agitrack.proxy.renderer import ScreenRenderer
+    from agitrack.proxy.terminal import TerminalHost
 
     for cls in (ScreenRenderer, TerminalHost):
         own_methods = {n for n, _ in inspect.getmembers(cls, inspect.isfunction)}
@@ -5360,7 +5432,7 @@ def test_duck_type_aliases_cover_extracted_classes():
 
 
 def test_gh_unavailable_hint_text_by_status():
-    from agit.proxy.runner import ProxyRunner
+    from agitrack.proxy.runner import ProxyRunner
 
     missing = ProxyRunner._gh_unavailable_hint("missing")
     assert missing is not None and "isn't installed" in missing and "cli.github.com" in missing
@@ -5374,7 +5446,7 @@ def test_notify_if_gh_unavailable_sets_message_when_missing(monkeypatch):
     runner.messages = []
     runner._set_message = lambda msg, **k: runner.messages.append(msg)
     runner._render = lambda: None
-    monkeypatch.setattr("agit.metrics.github.gh_status", lambda: "missing")
+    monkeypatch.setattr("agitrack.metrics.github.gh_status", lambda: "missing")
 
     runner._notify_if_gh_unavailable()
 
@@ -5386,7 +5458,7 @@ def test_notify_if_gh_unavailable_silent_when_ok(monkeypatch):
     runner.messages = []
     runner._set_message = lambda msg, **k: runner.messages.append(msg)
     runner._render = lambda: None
-    monkeypatch.setattr("agit.metrics.github.gh_status", lambda: "ok")
+    monkeypatch.setattr("agitrack.metrics.github.gh_status", lambda: "ok")
 
     runner._notify_if_gh_unavailable()
 
@@ -5395,13 +5467,13 @@ def test_notify_if_gh_unavailable_silent_when_ok(monkeypatch):
 
 def test_restore_terminal_clears_before_leaving_alt_screen(monkeypatch):
     # #70: on terminals without alt-screen support, leaving the alt screen is a
-    # no-op, so aGiT's UI lingers after exit unless we clear the screen first.
+    # no-op, so aGiTrack's UI lingers after exit unless we clear the screen first.
     # restore_terminal must emit a clear+home BEFORE the `?1049l` leave so the
     # screen is clean on those terminals (and unchanged where altscreen works).
     import types
 
-    from agit.proxy import terminal as terminal_mod
-    from agit.proxy.terminal import TerminalHost
+    from agitrack.proxy import terminal as terminal_mod
+    from agitrack.proxy.terminal import TerminalHost
 
     writes: list[bytes] = []
     monkeypatch.setattr(terminal_mod.os, "write", lambda _fd, data: writes.append(data) or len(data))
@@ -5436,6 +5508,28 @@ def test_rename_session_menu_prompts_then_renames():
     assert captured == [(0, "new-name")]
 
 
+def test_rename_forks_shared_lineage(tmp_path):
+    # Rename-as-fork: renaming a session that was resumed/shared drops its tracked
+    # lineage origin, so a later share publishes a new `<you>/<name>` entry instead of
+    # updating the original. A session with no origin is unaffected.
+    import types
+
+    from agitrack.config import AgitrackState
+
+    runner = make_runner(name="main")
+    runner.base_repo = types.SimpleNamespace(repo=tmp_path)
+    runner.global_config = types.SimpleNamespace(default_backend="claude")
+    state = AgitrackState(tmp_path)
+    state.set_shared_origin("sid-1", owner="alice", name="fix-parser", contributors=["alice"])
+
+    runner._fork_lineage_on_rename("sid-1")
+    assert AgitrackState(tmp_path).shared_origin("sid-1") is None  # origin dropped → next share forks
+
+    # A purely local session (no origin) is a no-op (and never errors).
+    runner._fork_lineage_on_rename("sid-local")
+    assert AgitrackState(tmp_path).shared_origin("sid-local") is None
+
+
 def test_rename_session_rejects_taken_name_without_moving():
     import types
 
@@ -5457,7 +5551,7 @@ def test_rename_session_rejects_taken_name_without_moving():
 
 
 def test_configured_menu_key_opens_command_capture():
-    # menu_key in ~/.agit/config.json rebinds the aGiT menu (default Ctrl-G).
+    # menu_key in ~/.agitrack/config.json rebinds the aGiTrack menu (default Ctrl-G).
     parser = ProxyInput(menu_key=b"\x10")  # ctrl-p
 
     forwarded, _echo, command, _exit = parser.feed(b"\x10git-status\r")
@@ -5480,7 +5574,7 @@ def test_real_init_defines_all_lifecycle_flags(tmp_path):
 
     sp.run(["git", "init", "-q", str(tmp_path)], check=True)
     sp.run(["git", "-C", str(tmp_path), "commit", "-q", "--allow-empty", "-m", "init"], check=True)
-    from agit.git import GitRepo
+    from agitrack.git import GitRepo
 
     runner = ProxyRunner(GitRepo(tmp_path))
     for flag in (
@@ -5502,14 +5596,14 @@ def test_no_worktree_mode_skips_worktree_setup(tmp_path):
 
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
     subprocess.run(["git", "-C", str(tmp_path), "commit", "-q", "--allow-empty", "-m", "init"], check=True)
-    from agit.git import GitRepo
-    from agit.proxy.runner import ProxyRunner
+    from agitrack.git import GitRepo
+    from agitrack.proxy.runner import ProxyRunner
 
     runner = ProxyRunner(GitRepo(tmp_path), use_worktrees=False)
     runner._base_branch = "main"
     runner._setup_base_merge_only_session()
     assert runner.worktree is None
-    assert not (tmp_path / ".agit" / "worktrees").exists()
+    assert not (tmp_path / ".agitrack" / "worktrees").exists()
 
 
 def test_no_worktree_mode_refuses_new_session():
