@@ -644,6 +644,48 @@ def test_efficiency_suggestions_flag_costly_low_yield_turns():
     assert [s.shas[0] for s in suggestions] == ["3" * 7, "4" * 7]
 
 
+def test_suggestion_shas_carry_github_urls_when_remote_present():
+    from agitrack.metrics.collect import Dashboard, _efficiency_suggestions
+    from agitrack.metrics.web import aggregates_payload
+
+    def turn(sha, prompt, output, lines):
+        return CommitStat(
+            sha=sha,
+            author="a",
+            email="a@e",
+            subject=prompt,
+            kind="agent",
+            prompt=prompt,
+            tokens={"output": output},
+            insertions=lines,
+        )
+
+    stats = [
+        turn("1" * 40, "add the parser", 100, 50),
+        turn("2" * 40, "wire the cli", 100, 40),
+        turn("3" * 40, "debug the deadlock", 1000, 5),
+        turn("4" * 40, "chase the flaky timeout", 1000, 2),
+    ]
+    base = "https://github.com/o/r/commit/"
+    dash = Dashboard(
+        repo="r",
+        branch="main",
+        stats=stats,
+        suggestions=_efficiency_suggestions(stats),
+        commit_base=base,
+    )
+    payload = aggregates_payload(dash)["agg"]["suggestions"]
+    assert payload  # the costly turns surfaced
+    # Each SHA chip carries the full-SHA GitHub commit link so it can open it.
+    assert payload[0]["shas"] == ["3" * 7]
+    assert payload[0]["urls"] == [base + "3" * 40]
+
+    # Without a GitHub remote the URLs are blank (the chip becomes a jump-to-log).
+    dash.commit_base = ""
+    no_remote = aggregates_payload(dash)["agg"]["suggestions"]
+    assert no_remote[0]["urls"] == [""]
+
+
 def test_efficiency_suggestions_empty_for_lean_history():
     from agitrack.metrics.collect import _efficiency_suggestions
 
