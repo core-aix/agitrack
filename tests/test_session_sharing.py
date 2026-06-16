@@ -1307,6 +1307,8 @@ def test_runner_share_session_publishes_and_redacts(tmp_path, monkeypatch):
     runner, repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend(transcript=secret))
 
     runner._share_session()
+    # The push runs in the background so the terminal never freezes; drain it.
+    _drain_background_share_ops(runner)
 
     store = SharedSessionStore(repo)
     entries = store.entries()
@@ -1314,7 +1316,9 @@ def test_runner_share_session_publishes_and_redacts(tmp_path, monkeypatch):
     transcript = store.read_transcript(entries[0])
     assert "sk-ABCDEFGHIJKLMNOPQR" not in transcript and "[REDACTED]" in transcript  # redacted
     assert entries[0].manifest["session_id"] == "sid-123"
-    assert any("Saved shared session" in m or "Shared" in m for m in runner.messages)
+    assert any(
+        "Saved shared session" in n[0] or "Shared" in n[0] for n in runner._session_notices.values()
+    )  # result notice
 
 
 def test_share_confirms_every_time_even_after_acknowledged(tmp_path, monkeypatch):
@@ -1338,56 +1342,34 @@ def test_share_confirms_every_time_even_after_acknowledged(tmp_path, monkeypatch
     assert any("cancel" in m.lower() for m in runner.messages)
 
 
-def test_share_push_cancel_shows_not_shared_until_keypress(tmp_path, monkeypatch):
-    # Cancelling the push to origin must make the non-result unmistakable, via a
-    # notice that waits for a keypress (not a mouse move) to dismiss.
+def test_share_runs_in_background_without_blocking(tmp_path, monkeypatch):
+    # A manual share must not freeze the terminal on the push: it kicks the upload
+    # onto a background thread (returning at once) and surfaces the result as a notice.
+    import threading
+    import time as _time
+
+    from agitrack.sessions.store import PublishResult
+
     backend = _StubBackend(transcript="hello")
     runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
-    runner._publish_with_cancel = lambda *a, **k: {"cancelled": True}  # user pressed Esc
-    notices: list = []
-    runner._await_keypress = lambda msg: notices.append(msg)
+    gate = threading.Event()
 
-    runner._share_session()
-
-    assert any("NOT shared" in m and "cancel" in m.lower() for m in notices)
-    assert runner.state.session_id not in runner._auto_share_hash  # not marked as pushed
-
-
-def test_publish_with_cancel_returns_cancelled_when_drain_stops():
-    from proxy_helpers import make_runner
-
-    runner = make_runner()
-    runner._render = lambda: None
-    runner._set_message = lambda *a, **k: None
-    runner._drain_pty_until_done_or_esc = lambda thread, **k: "cancel"  # user/Esc or timeout
-
-    class _SlowStore:
-        def __init__(self):
-            self.cancelled = None
-
-        def publish(self, *, github_id, name, transcript, manifest, timeout=None, cancel=None):
-            self.cancelled = cancel
-            cancel.wait(timeout=5)  # block until told to stop
-            return None
-
-    store = _SlowStore()
-    out = runner._publish_with_cancel(store, github_id="me", name="s", transcript="t", manifest={})
-    assert out == {"cancelled": True}
-
-
-def test_publish_with_cancel_returns_result_on_success():
-    from proxy_helpers import make_runner
-
-    runner = make_runner()
-    runner._render = lambda: None
-    runner._set_message = lambda *a, **k: None
-
-    class _OkStore:
+    class SlowStore:
         def publish(self, *, github_id, name, transcript, manifest, prune_gid=None, timeout=None, cancel=None):
-            return "PUBLISHED"
+            gate.wait(timeout=5)  # the network push is slow
+            return PublishResult(remote=True, pushed=True)
 
-    out = runner._publish_with_cancel(_OkStore(), github_id="me", name="s", transcript="t", manifest={})
-    assert out == {"result": "PUBLISHED"}
+    runner._shared_store = lambda: SlowStore()
+
+    started = _time.monotonic()
+    runner._share_session()
+    assert _time.monotonic() - started < 1.0  # returned at once — did NOT wait on the push
+    assert runner._background_share_ops  # the push is running in the background
+
+    gate.set()
+    _drain_background_share_ops(runner)
+    assert any("Shared" in n[0] for n in runner._session_notices.values())  # result notice landed
+    assert runner._background_share_ops == []  # cleared once finished
 
 
 def test_runner_share_unsupported_backend_shows_message(tmp_path, monkeypatch):
@@ -1828,15 +1810,18 @@ def test_manage_enabling_auto_update_syncs_immediately(tmp_path, monkeypatch):
     runner._select_popup = lambda title, options: options[1] if title.startswith("Manage") else options[0]
 
     runner._manage_shared_sessions_menu()
+    # Enabling auto-update kicks the sync push onto a background thread (it must not
+    # block the terminal); drain it to observe the result.
+    _drain_background_share_ops(runner)
 
     assert runner._session_auto_shared("sid-123") is True  # opt-in persisted
     entry = SharedSessionStore(repo).entries()[0]
     assert SharedSessionStore(repo).read_transcript(entry) == "newest turns"  # pushed on enable
 
 
-def test_manage_update_now_shows_pushing_message(tmp_path, monkeypatch):
-    # "Update now" must show the same "pushing to origin…" progress notice as the
-    # initial share — not push silently while the user waits.
+def test_manage_update_now_pushes_in_background_with_progress_notice(tmp_path, monkeypatch):
+    # "Update now" must show a "pushing to origin…" progress notice and push in the
+    # background — not freeze the terminal while the user waits.
     backend = _StubBackend(transcript="newest turns")
     runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
     SharedSessionStore(repo).publish(
@@ -1856,30 +1841,10 @@ def test_manage_update_now_shows_pushing_message(tmp_path, monkeypatch):
 
     runner._manage_shared_sessions_menu()
 
-    assert any("pushing to origin" in m.lower() for m in runner.messages)
+    assert any("pushing to origin" in n[0].lower() for n in runner._session_notices.values())  # progress
+    _drain_background_share_ops(runner)
     entry = SharedSessionStore(repo).entries()[0]
     assert SharedSessionStore(repo).read_transcript(entry) == "newest turns"  # pushed
-
-
-def test_manage_update_cancel_shows_not_updated_until_keypress(tmp_path, monkeypatch):
-    # Cancelling the update push surfaces a key-dismissed "NOT updated" notice, like
-    # the initial share's cancel path.
-    backend = _StubBackend(transcript="newest")
-    runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
-    SharedSessionStore(repo).publish(
-        github_id="tester",
-        name="session-1",
-        transcript="stale",
-        manifest={"github_id": "tester", "name": "session-1", "session_id": "sid-123", "updated": 1},
-    )
-    runner._publish_with_cancel = lambda *a, **k: {"cancelled": True}  # user pressed Esc
-    notices: list = []
-    runner._await_keypress = lambda msg: notices.append(msg)
-    runner._select_popup = lambda title, options: options[0]
-
-    runner._manage_shared_sessions_menu()
-
-    assert any("NOT updated" in m and "cancel" in m.lower() for m in notices)
 
 
 def test_manage_menu_opens_without_fetch_or_transcript_read(tmp_path, monkeypatch):
