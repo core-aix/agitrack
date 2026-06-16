@@ -194,7 +194,7 @@ def test_resize_is_noop_when_master_fd_is_none():
 # ---------------------------------------------------------------------------
 
 
-def test_backendprocess_importable_from_agit_proxy():
+def test_backendprocess_importable_from_agitrack_proxy():
     from agitrack.proxy import BackendProcess as BP  # noqa: F401
 
     assert BP is BackendProcess

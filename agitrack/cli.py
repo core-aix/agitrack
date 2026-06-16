@@ -6,7 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from agitrack.backends.setup import select_default_backend
+from agitrack.backends.setup import select_default_backend, select_default_summarizer_model
 from agitrack.backends.proxy_agents import available_backends
 from agitrack.git import GitError, GitRepo, RepoLock, already_running_message
 from agitrack.config import GlobalConfig
@@ -152,7 +152,9 @@ def main(argv: list[str] | None = None) -> int:
         and sys.stdin.isatty()
         and sys.stdout.isatty()
     ):
-        select_default_backend(config)
+        chosen_backend = select_default_backend(config)
+        # First run also picks the default summarizer model, saved to the global config.
+        select_default_summarizer_model(config, chosen_backend)
 
     # Worktrees on unless the config opts out or --no-worktree is passed (flag wins).
     use_worktrees = False if args.no_worktree else config.use_worktrees
@@ -282,7 +284,7 @@ def _check_for_update_at_startup(config: GlobalConfig) -> None:
     if not getattr(config, "check_for_updates", None):
         return
     try:
-        from agitrack.update import STARTUP_NET_TIMEOUT, Updater, restart_agit
+        from agitrack.update import STARTUP_NET_TIMEOUT, Updater, restart_agitrack
 
         updater = Updater()
         # Bound the launch-time check tightly so an offline / bad-connection user
@@ -314,7 +316,7 @@ def _check_for_update_at_startup(config: GlobalConfig) -> None:
         print(f"Update failed: {result.error}")
         return
     print(f"{result.message} Restarting aGiTrack...")
-    restart_agit()  # does not return on success
+    restart_agitrack()  # does not return on success
 
 
 PRIVACY_WARNING = (

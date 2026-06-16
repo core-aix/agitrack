@@ -495,32 +495,32 @@ def _capture_restart(monkeypatch, argv):
     return captured
 
 
-def test_restart_agit_appends_extra_args(monkeypatch):
-    from agitrack.update import restart_agit
+def test_restart_agitrack_appends_extra_args(monkeypatch):
+    from agitrack.update import restart_agitrack
 
     captured = _capture_restart(monkeypatch, ["agit", "--backend", "claude"])
-    restart_agit(["--skip-privacy-ack"])
+    restart_agitrack(["--skip-privacy-ack"])
 
     assert captured[0][1:] == ["-m", "agitrack", "--backend", "claude", "--skip-privacy-ack"]
 
 
-def test_restart_agit_does_not_duplicate_existing_flag(monkeypatch):
-    from agitrack.update import restart_agit
+def test_restart_agitrack_does_not_duplicate_existing_flag(monkeypatch):
+    from agitrack.update import restart_agitrack
 
     captured = _capture_restart(monkeypatch, ["agit", "--skip-privacy-ack"])
-    restart_agit(["--skip-privacy-ack"])
+    restart_agitrack(["--skip-privacy-ack"])
 
     # The flag is already present from a prior restart; don't accumulate it.
     assert captured[0].count("--skip-privacy-ack") == 1
 
 
-def test_restart_agit_without_extra_args_preserves_argv(monkeypatch):
+def test_restart_agitrack_without_extra_args_preserves_argv(monkeypatch):
     # The startup-update path passes no extra args, so the restart re-shows the
     # privacy warning (no --skip-privacy-ack injected).
-    from agitrack.update import restart_agit
+    from agitrack.update import restart_agitrack
 
     captured = _capture_restart(monkeypatch, ["agit", "--verbose"])
-    restart_agit()
+    restart_agitrack()
 
     assert captured[0][1:] == ["-m", "agitrack", "--verbose"]
     assert "--skip-privacy-ack" not in captured[0]
@@ -550,7 +550,7 @@ def test_startup_prompt_applies_and_restarts(monkeypatch, tmp_path: Path):
     updater = _StartupUpdater(_available_status())
     restarted = []
     monkeypatch.setattr("agitrack.update.Updater", lambda *a, **k: updater)
-    monkeypatch.setattr("agitrack.update.restart_agit", lambda: restarted.append(True))
+    monkeypatch.setattr("agitrack.update.restart_agitrack", lambda: restarted.append(True))
     monkeypatch.setattr("builtins.input", lambda *a: "y")
     cli._check_for_update_at_startup(config)
     assert updater.applied is True
@@ -594,7 +594,7 @@ def test_startup_prompt_defaults_to_update_on_empty_enter(monkeypatch, tmp_path:
     updater = _StartupUpdater(_available_status())
     restarted = []
     monkeypatch.setattr("agitrack.update.Updater", lambda *a, **k: updater)
-    monkeypatch.setattr("agitrack.update.restart_agit", lambda: restarted.append(True))
+    monkeypatch.setattr("agitrack.update.restart_agitrack", lambda: restarted.append(True))
     monkeypatch.setattr("builtins.input", lambda *a: "")
     cli._check_for_update_at_startup(config)
     assert updater.applied is True

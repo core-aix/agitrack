@@ -183,7 +183,7 @@ def test_save_is_atomic_and_leaves_no_temp_file(tmp_path):
         assert json.load(handle)["agitrack_session_id"] == state.session_id
 
 
-def test_missing_info_exclude_is_created_with_agit_ignore(tmp_path):
+def test_missing_info_exclude_is_created_with_agitrack_ignore(tmp_path):
     # Issue #26: repos created without the default template have no
     # info/exclude; saving state must create it rather than leave .agitrack/
     # unignored.

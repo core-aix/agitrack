@@ -255,7 +255,7 @@ def test_integrate_turn_skips_when_merge_ctx_active(tmp_path):
     assert result == SKIP
 
 
-def test_integrate_turn_skips_non_agit_branch(tmp_path):
+def test_integrate_turn_skips_non_agitrack_branch(tmp_path):
     main = _init_repo(tmp_path)
     base = main.current_branch()
     # main is on 'main' / 'master', not agit/...
@@ -478,7 +478,7 @@ def test_should_auto_complete_merge_not_yet_idle():
 # ---------------------------------------------------------------------------
 
 
-def test_base_switch_candidates_excludes_agit_and_current(tmp_path):
+def test_base_switch_candidates_excludes_agitrack_and_current(tmp_path):
     main = _init_repo(tmp_path)
     base = main.current_branch()
     main.create_branch("feature", base)

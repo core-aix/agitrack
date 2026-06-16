@@ -78,11 +78,12 @@ def shared_sessions_for(repo: GitRepo) -> list[dict]:
 def format_html(dash: Dashboard, *, shared_sessions: list[dict] | None = None) -> str:
     payload = json.dumps(initial_payload(dash, shared_sessions=shared_sessions), separators=(",", ":"))
     repo_name = dash.repo.rstrip("/").rsplit("/", 1)[-1] or dash.repo
+    # The branch is rendered client-side into the meta-line picker (from the
+    # embedded payload), so there's no __BRANCH__ placeholder to substitute.
     return (
         _TEMPLATE.replace("__DATA__", payload)
         .replace("__REPO_NAME__", _escape(repo_name))
         .replace("__REPO__", _escape(dash.repo))
-        .replace("__BRANCH__", _escape(dash.branch))
     )
 
 
@@ -209,13 +210,10 @@ def _filter_stats(dash: Dashboard, *, author: str, backend: str, model: str, frm
 
 
 def _filtered_dashboard(dash: Dashboard, stats: list[CommitStat]) -> Dashboard:
-    from agitrack.metrics.collect import _detect_loops
-
     return Dashboard(
         repo=dash.repo,
         branch=dash.branch,
         stats=stats,
-        loops=_detect_loops(stats),
         sha_logins=dash.sha_logins,
         commit_base=dash.commit_base,
     )
@@ -230,18 +228,18 @@ def _aggregates(fd: Dashboard) -> dict:
         "ai_lines": list(fd.ai_lines),
         "nontracked_lines": list(fd.nontracked_lines),
         "tokens": fd.token_totals,
-        "efficiency": fd.lines_per_1k_output_tokens,
+        "line_yield": fd.lines_per_1k_output_tokens,
         "by_backend": fd.by_backend,
         "by_model": fd.by_model,
         "by_committer": fd.by_author,
-        "loops": [
-            {"shas": loop.shas, "prompt": loop.prompt, "output": loop.output_tokens, "within": loop.within_commit}
-            for loop in fd.loops
-        ],
     }
 
 
-_AI_KINDS = ("agent", "covered", "agent-merge")
+# Kinds whose LINES count as tracked-AI in the time series — kept in step with
+# Dashboard.ai_lines. Agent-resolved merges are deliberately excluded (a merge's
+# lines aren't cleanly attributable), though they remain agent-driven *commits*
+# (see the JS AI_KINDS used only for commit-log colouring).
+_AI_KINDS = ("agent", "covered")
 GRANULARITIES = ("hour", "day", "week", "month")
 DEFAULT_GRANULARITY = "day"
 # Cap the number of plotted buckets so an extreme granularity/range (e.g. hourly
@@ -352,6 +350,7 @@ def _options(dash: Dashboard) -> dict:
         "committers": sorted(c for c in committers if c),
         "backends": sorted(backends),
         "models": sorted(models),
+        "branches": dash.branches,
     }
 
 
@@ -374,12 +373,29 @@ def aggregates_payload(
     dated = [s.timestamp for s in dash.stats if s.timestamp]
     return {
         "head": dash.stats[-1].sha if dash.stats else "",
+        "branch": dash.branch,
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         "options": _options(dash),
         "span": {"from": min(dated), "to": max(dated)} if dated else {"from": 0, "to": 0},
         "agg": _aggregates(_filtered_dashboard(dash, stats)),
         "timeseries": _timeseries(stats, granularity=granularity),
     }
+
+
+# Commit-log sort orders the user can choose (applied after the filter scope).
+LOG_SORTS = ("date", "lines", "tokens")
+DEFAULT_LOG_SORT = "date"
+
+
+def _sorted_for_log(stats: list[CommitStat], sort: str) -> list[CommitStat]:
+    """Order the filtered commits for the log. ``date`` (default) is newest-first;
+    ``lines`` and ``tokens`` rank by magnitude (most changed lines / most output
+    tokens) with the newest commit breaking ties. ``stats`` arrives oldest-first."""
+    if sort == "lines":
+        return sorted(stats, key=lambda s: (s.insertions + s.deletions, s.timestamp), reverse=True)
+    if sort == "tokens":
+        return sorted(stats, key=lambda s: (s.tokens.get("output", 0), s.timestamp), reverse=True)
+    return list(reversed(stats))  # "date": newest first
 
 
 def _log_entry(dash: Dashboard, stat: CommitStat, covers: dict[str, CommitStat]) -> dict:
@@ -414,12 +430,13 @@ def log_page(
     to: int = 0,
     offset: int = 0,
     limit: int = PAGE_SIZE,
+    sort: str = DEFAULT_LOG_SORT,
 ) -> dict:
-    """One page of the commit log (newest first) for the given filters. Only this
+    """One page of the commit log for the given filters and sort order. Only this
     page's commits carry the heavy message / squash constituents, so memory and
     payload stay bounded however deep the history is."""
     stats = _filter_stats(dash, author=author, backend=backend, model=model, frm=frm, to=to)
-    stats.reverse()  # newest first
+    stats = _sorted_for_log(stats, sort)
     covers = _covers(dash)
     offset = max(0, offset)
     limit = max(1, min(limit, 200))
@@ -460,6 +477,8 @@ _TEMPLATE = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>aGiTrack dashboard · __REPO_NAME__</title>
+<!-- Inline SVG favicon (the aGiTrack wordmark mark) — the server only serves /, /data, /log, so it can't host a file. -->
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2064%2064'%3E%3Crect%20width='64'%20height='64'%20rx='13'%20fill='%23070b09'/%3E%3Ctext%20x='32'%20y='45'%20text-anchor='middle'%20font-family='ui-monospace,monospace'%20font-weight='700'%20font-size='42'%20letter-spacing='-1'%3E%3Ctspan%20fill='%23ffb454'%3Ea%3C/tspan%3E%3Ctspan%20fill='%233dffa0'%3EG%3C/tspan%3E%3C/text%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=VT323&family=IBM+Plex+Mono:ital,wght@0,400;0,500;0,600;1,400&display=swap" rel="stylesheet">
@@ -494,6 +513,16 @@ header{padding:54px 0 22px}
 .meta{margin-top:12px;color:var(--fg-dim);font-size:13.5px}
 .meta b{color:var(--fg);font-weight:600}
 .meta .tag{color:var(--amber)}
+/* Branch picker lives inline on the meta line (next to the repo path), styled to
+   read as part of the text rather than as a bulky filter control. */
+.meta select.branchsel{appearance:none;background:var(--ink);color:var(--fg);font-weight:600;vertical-align:baseline;
+  border:1px solid var(--line);font-family:var(--mono);font-size:13px;padding:2px 22px 2px 8px;max-width:min(60vw,520px);cursor:pointer;
+  background-image:linear-gradient(45deg,transparent 50%,var(--phosphor-dim) 50%),linear-gradient(135deg,var(--phosphor-dim) 50%,transparent 50%);
+  background-position:calc(100% - 12px) 50%,calc(100% - 8px) 50%;background-size:5px 5px,5px 5px;background-repeat:no-repeat}
+.meta select.branchsel:focus{outline:none;border-color:var(--phosphor)}
+/* A file:// snapshot (or a single-branch repo) can't switch: render it as plain
+   inline text — no arrow, no box affordance. */
+.meta select.branchsel:disabled{cursor:default;opacity:1;border-color:transparent;padding:2px 0;background-image:none}
 
 /* ---- filter bar ---- */
 /* Stays a single row while sticky: never wrap, so the frozen panel is one row
@@ -530,6 +559,16 @@ input[type=date]::-webkit-calendar-picker-indicator{filter:invert(.7) sepia(1) h
 h2.section{font-family:var(--display);font-size:27px;font-weight:400;color:var(--phosphor);letter-spacing:1px;
   margin:38px 0 14px;text-shadow:0 0 16px rgba(61,255,160,.3)}
 h2.section::before{content:"# ";color:var(--amber)}
+/* commit-log heading row with its sort selector on the right */
+.loghead{display:flex;align-items:baseline;justify-content:space-between;gap:14px;flex-wrap:wrap;margin:38px 0 14px}
+.loghead h2.section{margin:0}
+.logsort{display:flex;align-items:center;gap:8px}
+.logsort label{font-size:11px;color:var(--amber);letter-spacing:.6px;text-transform:uppercase}
+.logsort select{appearance:none;background:var(--ink);color:var(--fg);border:1px solid var(--line);
+  font-family:var(--mono);font-size:13px;padding:5px 26px 5px 10px;cursor:pointer;
+  background-image:linear-gradient(45deg,transparent 50%,var(--phosphor-dim) 50%),linear-gradient(135deg,var(--phosphor-dim) 50%,transparent 50%);
+  background-position:calc(100% - 14px) 50%,calc(100% - 9px) 50%;background-size:5px 5px,5px 5px;background-repeat:no-repeat}
+.logsort select:focus{outline:none;border-color:var(--phosphor)}
 
 /* ---- stat cards ---- */
 .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px}
@@ -602,12 +641,6 @@ h2.section::before{content:"# ";color:var(--amber)}
 .split{display:grid;grid-template-columns:1fr 1fr;gap:14px}
 @media (max-width:760px){.split{grid-template-columns:1fr}.row{grid-template-columns:1fr;gap:6px}}
 
-/* ---- loops ---- */
-.loop{padding:13px 18px;border-bottom:1px solid var(--line)}
-.loop:last-child{border-bottom:none}
-.loop .where{color:var(--red)}
-.loop .q{color:var(--fg);font-style:italic;word-break:break-word}
-.loop .cost{color:var(--amber);font-size:12.5px}
 
 /* ---- commit log rail ---- */
 .log{position:relative;padding-left:34px;margin-top:8px}
@@ -686,7 +719,7 @@ footer{margin-top:46px;padding-top:22px;border-top:1px dashed var(--line);color:
 <div class="wrap">
   <header>
     <div class="brand"><span class="a">a</span>GiTrack<span class="sub">&nbsp;dashboard</span></div>
-    <div class="meta"><span class="tag">repo</span> <b>__REPO__</b> &nbsp;·&nbsp; <span class="tag">branch</span> <b>__BRANCH__</b> &nbsp;·&nbsp; <span id="genat"></span></div>
+    <div class="meta"><span class="tag">repo</span> <b>__REPO__</b> &nbsp;·&nbsp; <span class="tag">branch</span> <select id="f-branch" class="branchsel" title="View statistics and the commit log for a single branch"></select> &nbsp;·&nbsp; <span id="genat"></span></div>
   </header>
 
   <div class="controls">
@@ -747,17 +780,21 @@ footer{margin-top:46px;padding-top:22px;border-top:1px dashed var(--line);color:
   <h2 class="section">by committer</h2>
   <div class="panel" id="by-committer"></div>
 
-  <h2 class="section">possible loops</h2>
-  <div class="panel" id="loops"></div>
-
   <h2 class="section">shared sessions</h2>
   <div class="panel" id="shared"></div>
 
-  <h2 class="section">commit log</h2>
+  <div class="loghead">
+    <h2 class="section">commit log</h2>
+    <div class="logsort"><label for="f-sort">sort</label><select id="f-sort" title="Sort the filtered commits">
+      <option value="date">newest first</option>
+      <option value="lines">most lines changed</option>
+      <option value="tokens">most output tokens</option>
+    </select></div>
+  </div>
   <div class="log" id="commitlog"></div>
 
   <footer>
-    <span>aGiTrack · agent + git · metrics from commit metadata</span>
+    <span>aGiTrack · agent + git tracking · metrics from commit metadata</span>
     <span id="count"></span>
   </footer>
 </div>
@@ -802,7 +839,9 @@ const TOKEN_ORDER = [["input","input"],["output","output"],["reasoning","reasoni
   ["summary_input","summarizer input"],["summary_output","summarizer output"]];
 const REFRESH_MS = 30000, DAY = 86400;
 
-const state = {author:"", backend:"", model:"", fromTs:0, toTs:0, granularity:(INIT.timeseries&&INIT.timeseries.granularity)||"day"};
+// DEFAULT_BRANCH is the branch the page first loaded for; "reset" returns to it.
+const DEFAULT_BRANCH = INIT.branch || "";
+const state = {branch:DEFAULT_BRANCH, author:"", backend:"", model:"", fromTs:0, toTs:0, sort:"date", granularity:(INIT.timeseries&&INIT.timeseries.granularity)||"day"};
 // Only a page served over http(s) has a backend to reach; a file:// snapshot has
 // none, so it must never raise a false "server unreachable" alarm.
 const LIVE = location.protocol.indexOf("http") === 0;
@@ -815,6 +854,8 @@ function setOffline(on){ const el=$("neterror"); if(el) el.hidden = !on; }
 
 function qs(extra){
   const p = new URLSearchParams();
+  // A non-default branch rescopes the whole view (stats + log) server-side.
+  if(state.branch && state.branch !== DEFAULT_BRANCH) p.set("branch", state.branch);
   if(state.author) p.set("author", state.author);
   if(state.backend) p.set("backend", state.backend);
   if(state.model) p.set("model", state.model);
@@ -828,12 +869,15 @@ async function loadAgg(){
   try{ const r = await fetch("data?"+qs(), {cache:"no-store"}); if(r.ok){
     const d = await r.json(); HEAD=d.head; AGG=d.agg; OPTIONS=d.options; GENERATED=d.generated_at;
     TS = d.timeseries || {t:[]}; if(d.span) SPAN = d.span; if(d.shared_sessions) SHARED = d.shared_sessions;
+    // The server reports which branch it actually served (e.g. it fell back to the
+    // default if the requested one vanished); reflect that in the state + header.
+    if(d.branch !== undefined){ state.branch = d.branch; setBranchLabel(d.branch); }
     setOffline(false); return true; } }
   catch(e){ if(LIVE) setOffline(true); }  // network failure ⇒ server unreachable
   return false;
 }
 async function loadLog(offset){
-  try{ const r = await fetch("log?"+qs({offset:offset||0, limit:PAGE_SIZE}), {cache:"no-store"});
+  try{ const r = await fetch("log?"+qs({offset:offset||0, limit:PAGE_SIZE, sort:state.sort}), {cache:"no-store"});
     if(r.ok){ LOGPAGE = await r.json(); setOffline(false); return true; } }
   catch(e){ if(LIVE) setOffline(true); }
   return false;
@@ -894,7 +938,7 @@ function renderAgg(){
   const total = AGG.total, tracked = AGG.tracked;
   const ai = {ins:AGG.ai_lines[0], del:AGG.ai_lines[1]}; ai.total = ai.ins+ai.del;
   const nt = {ins:AGG.nontracked_lines[0], del:AGG.nontracked_lines[1]}; nt.total = nt.ins+nt.del;
-  const allLines = ai.total + nt.total, tok = AGG.tokens, eff = AGG.efficiency, kinds = k => AGG.kinds[k]||0;
+  const allLines = ai.total + nt.total, tok = AGG.tokens, eff = AGG.line_yield, kinds = k => AGG.kinds[k]||0;
 
   $("genat").textContent = "updated " + GENERATED;
   $("count").textContent = `${fmt(total)} commits in view`;
@@ -902,10 +946,10 @@ function renderAgg(){
   $("cards").innerHTML = [
     card("commits", fmt(total), `${fmt(tracked)} via aGiTrack`),
     card("aGiTrack coverage", pct(tracked,total), `${fmt(total-tracked)} non-tracked`, true),
-    card("aGiTrack-tracked AI lines", "+"+fmt(ai.ins), `−${fmt(ai.del)} · ${pct(ai.total, allLines)} of changes`),
+    card("Tracked AI lines", "+"+fmt(ai.ins), `−${fmt(ai.del)} · ${pct(ai.total, allLines)} of changes`),
     card("non-tracked lines", "+"+fmt(nt.ins), `−${fmt(nt.del)} · not tracked as AI`, true),
     card("output tokens", fmt(tok.output||0), `${fmt(tok.input||0)} input`),
-    card("efficiency", eff===null?"—":eff.toFixed(1), "AI lines / 1k output tok", true),
+    card("line yield", eff===null?"—":eff.toFixed(1), "AI lines / 1k output tok", true),
   ].join("");
 
   const lineRow = (label, sub, v, amber) =>
@@ -914,7 +958,7 @@ function renderAgg(){
       `<div class="num"><b>+${fmt(v.ins)}</b> / −${fmt(v.del)}</div></div>`;
   const kc = (label, key, tip) => `<span class="kc" title="${tip}">${label} <b>${kinds(key)}</b></span>`;
   $("lines").innerHTML =
-    lineRow("aGiTrack-tracked AI", "agent + covered + merge", ai, false) +
+    lineRow("Tracked AI", "agent + covered", ai, false) +
     lineRow("Non-tracked", "user + plain commits", nt, true) +
     `<div class="kindcounts"><span class="klabel">commits by kind:</span> `+
       kc("agent", "agent", "Commits aGiTrack made from the agent's work") + " · " +
@@ -940,7 +984,7 @@ function renderAgg(){
   $("by-model").innerHTML = groupPanel(AGG.by_model);
 
   const comm = Object.entries(AGG.by_committer).map(([name,b]) => [name, {
-    commits:b.commits, agit:b.agitrack_commits||0,
+    commits:b.commits, agitrack:b.agitrack_commits||0,
     ai:(b.ai_insertions||0)+(b.ai_deletions||0), nt:(b.nontracked_insertions||0)+(b.nontracked_deletions||0)}]);
   const maxC = Math.max(1, ...comm.map(([,b])=>b.ai));
   comm.sort((a,b)=>b[1].ai-a[1].ai || b[1].commits-a[1].commits);
@@ -948,14 +992,6 @@ function renderAgg(){
     ? comm.map(([name,b]) => barRow(name, `${b.commits} commits · ${b.agitrack} via aGiTrack`, b.ai, maxC,
         `AI-driven <b>${fmt(b.ai)}</b> · non-tracked ${fmt(b.nt)}`)).join("")
     : `<div class="empty">no commits</div>`;
-
-  $("loops").innerHTML = AGG.loops.length
-    ? AGG.loops.map(l => {
-        const where = l.within ? `within commit ${l.shas[0]}` : `${l.shas.length} commits ${l.shas[0]}..${l.shas[l.shas.length-1]}`;
-        return `<div class="loop"><span class="where">${esc(where)}</span> — <span class="q">"${esc(l.prompt)}"</span>`+
-          (l.output?` <span class="cost">${fmt(l.output)} output tokens</span>`:"")+`</div>`;
-      }).join("")
-    : `<div class="empty">none detected</div>`;
 
   tsHover = -1;
   renderTimeseries();
@@ -1202,7 +1238,22 @@ function fillSelect(id, values, allLabel, keep){
     values.map(v => `<option value="${esc(v)}">${esc(v)}</option>`).join("");
   sel.value = (keep && values.includes(keep)) ? keep : "";
 }
+// The branch picker doubles as the branch label on the meta line: keep its shown
+// value in sync with the branch actually being viewed.
+function setBranchLabel(name){ const el=$("f-branch"); if(el && name && [...el.options].some(o=>o.value===name)) el.value = name; }
+// The branch picker is a view switch, not a subset filter, so it has no "all"
+// option — exactly one branch is shown at a time. A file:// snapshot can't reach
+// the server to re-scope, so it's disabled there (only its own branch is shown).
+function fillBranches(){
+  const sel = $("f-branch"), branches = OPTIONS.branches || [];
+  const list = branches.length ? branches : (state.branch ? [state.branch] : []);
+  sel.innerHTML = list.map(v => `<option value="${esc(v)}">${esc(v)}</option>`).join("");
+  sel.value = list.includes(state.branch) ? state.branch : (list[0] || "");
+  state.branch = sel.value;
+  sel.disabled = !LIVE || list.length <= 1;
+}
 function syncFilters(){
+  fillBranches();
   fillSelect("f-author", OPTIONS.committers, "— entire team —", state.author);
   fillSelect("f-backend", OPTIONS.backends, "— all backends —", state.backend);
   fillSelect("f-model", OPTIONS.models, "— all models —", state.model);
@@ -1268,9 +1319,16 @@ function init(){
   // Show the real range from the first paint: bound the pickers to the history
   // span and fill from/to with it (default period is "all time" = full history).
   setDateBounds(); applyPeriod();
+  // Switching branch re-scopes everything; the old branch's committer/backend/
+  // model picks may not exist on the new one, so clear them for a clean view.
+  $("f-branch").onchange = e => { state.branch = e.target.value; state.author=state.backend=state.model=""; applyFilters(); };
   $("f-author").onchange = e => { state.author = e.target.value; applyFilters(); };
   $("f-backend").onchange = e => { state.backend = e.target.value; applyFilters(); };
   $("f-model").onchange = e => { state.model = e.target.value; applyFilters(); };
+  // Sort only reorders the (already filtered) commit log, so it just reloads the
+  // log's first page — no need to recompute the aggregates.
+  $("f-sort").value = state.sort;
+  $("f-sort").onchange = async e => { state.sort = e.target.value; if(await loadLog(0)) renderLog(); };
   // "custom range…" reveals a date-range popup anchored under the select; the
   // presets and "all time" hide it.
   const showDateRange = on => { $("daterange").hidden = !on; };
@@ -1285,6 +1343,8 @@ function init(){
   });
   $("reset").onclick = () => {
     state.author=state.backend=state.model="";
+    state.branch=DEFAULT_BRANCH;  // back to the branch the page loaded for
+    state.sort="date"; $("f-sort").value="date";  // back to newest-first
     $("f-period").value=""; showDateRange(false); applyPeriod();  // back to all time → full span
     applyFilters();
   };

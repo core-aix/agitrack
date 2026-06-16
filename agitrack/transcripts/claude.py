@@ -40,6 +40,7 @@ _COMMAND_TAGS = (
     "<bash-stdout>",
     "<bash-stderr>",
     "<user-prompt-submit-hook>",
+    "<task-notification>",
 )
 
 
@@ -398,11 +399,117 @@ def export_session(repo: Path, session_id: str) -> ExportedSession | None:
                     continue
     except OSError:
         return None
-    return parse_rows(session_id, rows)
+    return parse_rows(session_id, rows, subagent_tokens=_subagent_token_map(path))
 
 
-def parse_rows(session_id: str, rows: list[dict]) -> ExportedSession:
+def _subagent_token_map(session_path: Path) -> dict[str | None, TokenUsage]:
+    """Sub-agent token usage for a Claude session, keyed by the parent Task tool_use id.
+
+    Newer Claude Code records each Task/Agent sub-agent in its OWN transcript file under
+    ``<session>/subagents/agent-*.jsonl`` (with a sibling ``*.meta.json`` naming the
+    ``toolUseId`` of the Task tool that spawned it), separate from the main transcript —
+    so their tokens are invisible to a plain read of ``<session>.jsonl``. Sum each
+    sub-agent's assistant usage into the sub-agent buckets, keyed by that tool id so the
+    caller (`parse_rows`) can attribute it to the turn that launched it. A sub-agent file
+    with no readable tool id is keyed under None (attributed to the latest turn rather
+    than dropped). Returns an empty map when the session has no sub-agents."""
+    subdir = session_path.with_suffix("") / "subagents"
+    if not subdir.is_dir():
+        return {}
+    out: dict[str | None, TokenUsage] = {}
+    try:
+        agent_files = sorted(subdir.glob("agent-*.jsonl"))
+    except OSError:
+        return {}
+    for agent_path in agent_files:
+        out.setdefault(_subagent_tool_use_id(agent_path), TokenUsage()).add(_subagent_file_tokens(agent_path))
+    return out
+
+
+def _subagent_tool_use_id(agent_path: Path) -> str | None:
+    # The Task tool_use id that spawned this sub-agent, read from its sibling
+    # `agent-*.meta.json`. None when the meta is missing/unreadable.
+    meta_path = agent_path.with_name(agent_path.name[: -len(".jsonl")] + ".meta.json")
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    tool_id = meta.get("toolUseId") if isinstance(meta, dict) else None
+    return tool_id if isinstance(tool_id, str) and tool_id else None
+
+
+def _subagent_file_tokens(agent_path: Path) -> TokenUsage:
+    # Sum a sub-agent transcript's assistant token usage into the sub-agent buckets.
+    usage = TokenUsage()
+    try:
+        with agent_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if row.get("type") == "assistant":
+                    message = _as_dict(row.get("message"))
+                    usage.add(_message_tokens(message.get("usage"), sidechain=True))
+    except OSError:
+        pass
+    return usage
+
+
+def subagent_agent_files(repo: Path, session_id: str) -> set[str]:
+    """Names of the sub-agent transcript files currently recorded for a session — a cheap
+    snapshot the headless ``run()`` takes BEFORE a turn, so only the files that turn ADDS
+    are counted afterwards (a resumed session already has prior sub-agents on disk)."""
+    subdir = _subagents_dir(repo, session_id)
+    if subdir is None or not subdir.is_dir():
+        return set()
+    try:
+        return {path.name for path in subdir.glob("agent-*.jsonl")}
+    except OSError:
+        return set()
+
+
+def subagent_tokens_since(repo: Path, session_id: str, prior_files: set[str]) -> TokenUsage:
+    """Sub-agent token usage from transcript files NOT in ``prior_files`` — i.e. the
+    sub-agents a just-finished headless turn spawned. Lets ``run()`` fold sub-agent
+    consumption into its result even though Claude records each sub-agent in its own file,
+    separate from the ``--output-format json`` usage (which covers only the main agent)."""
+    usage = TokenUsage()
+    subdir = _subagents_dir(repo, session_id)
+    if subdir is None or not subdir.is_dir():
+        return usage
+    try:
+        agent_files = sorted(subdir.glob("agent-*.jsonl"))
+    except OSError:
+        return usage
+    for agent_path in agent_files:
+        if agent_path.name not in prior_files:
+            usage.add(_subagent_file_tokens(agent_path))
+    return usage
+
+
+def _subagents_dir(repo: Path, session_id: str) -> Path | None:
+    if not session_id:
+        return None
+    return _session_path(Path(repo), session_id).with_suffix("") / "subagents"
+
+
+def parse_rows(
+    session_id: str,
+    rows: list[dict],
+    *,
+    subagent_tokens: "dict[str | None, TokenUsage] | None" = None,
+) -> ExportedSession:
+    # `subagent_tokens` maps a Task tool_use id -> the sub-agent's token usage (in the
+    # sub-agent buckets), for newer Claude Code where each sub-agent is recorded in its
+    # OWN transcript file rather than inline in `rows` (see `_subagent_token_map`). Each
+    # is added to the turn that launched that tool; the None key (a sub-agent with no
+    # recoverable tool id) is attributed to the latest turn so its tokens are never lost.
     turns: list[SessionTurn] = []
+    tool_ids_per_turn: list[set[str]] = []
     current: dict | None = None
     model: str | None = None
     updated: int | None = None
@@ -411,6 +518,7 @@ def parse_rows(session_id: str, rows: list[dict]) -> ExportedSession:
         nonlocal current
         if current is not None:
             turns.append(_finalize_turn(current, dangling=dangling))
+            tool_ids_per_turn.append(current.get("tool_ids") or set())
             current = None
 
     for row in rows:
@@ -440,6 +548,7 @@ def parse_rows(session_id: str, rows: list[dict]) -> ExportedSession:
                 "stop_reason": None,
                 "started_at": stamp,
                 "ended_at": stamp,
+                "tool_ids": set(),
             }
         elif row_type == "assistant" and current is not None and row.get("isSidechain"):
             # Sub-agent (sidechain) turns are not part of the main interaction
@@ -461,12 +570,47 @@ def parse_rows(session_id: str, rows: list[dict]) -> ExportedSession:
             # tool result), anything else (end_turn/stop_sequence/max_tokens) is a
             # finished response.
             current["stop_reason"] = message.get("stop_reason")
+            _collect_tool_use_ids(message, current["tool_ids"])
             text = _assistant_text(message)
             if text:
                 current["final"] = text
                 current["assistant_id"] = str(message.get("id") or "")
     flush(dangling=True)
+    _attribute_subagent_tokens(turns, tool_ids_per_turn, subagent_tokens)
     return ExportedSession(session_id=session_id, model=model, updated=updated, turns=turns)
+
+
+def _collect_tool_use_ids(message: dict, sink: set[str]) -> None:
+    # Record the ids of `tool_use` blocks in an assistant message, so a sub-agent
+    # transcript (keyed by the Task tool_use id that spawned it) can be attributed to the
+    # turn that launched it.
+    content = message.get("content")
+    if not isinstance(content, list):
+        return
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "tool_use":
+            tool_id = block.get("id")
+            if isinstance(tool_id, str) and tool_id:
+                sink.add(tool_id)
+
+
+def _attribute_subagent_tokens(
+    turns: list[SessionTurn],
+    tool_ids_per_turn: list[set[str]],
+    subagent_tokens: "dict[str | None, TokenUsage] | None",
+) -> None:
+    # Add each sub-agent's token usage to the turn that launched it (matched by Task
+    # tool_use id). A sub-agent whose id matches no turn — or that had none recorded
+    # (the None key) — is attributed to the latest turn, so its tokens are never dropped.
+    if not subagent_tokens or not turns:
+        return
+    for tool_id, usage in subagent_tokens.items():
+        index: int | None = None
+        if tool_id is not None:
+            index = next((i for i, ids in enumerate(tool_ids_per_turn) if tool_id in ids), None)
+        if index is None:
+            index = len(turns) - 1
+        turns[index].tokens.add(usage)
 
 
 def _row_timestamp(row: dict) -> int | None:

@@ -251,7 +251,7 @@ def _detection_runner(tmp_path):
     return runner, repo
 
 
-def test_uncovered_backend_commits_detects_commits_after_last_agit_commit(tmp_path):
+def test_uncovered_backend_commits_detects_commits_after_last_agitrack_commit(tmp_path):
     runner, repo = _detection_runner(tmp_path)
     _backend_commit(repo, "a.txt", "covered by the aGiTrack commit after it")
     _backend_commit(repo, "b.txt", AGITRACK_BODY)  # an aGiTrack commit covers everything before it

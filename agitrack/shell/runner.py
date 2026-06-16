@@ -50,7 +50,7 @@ class AgitrackShell:
         if new_session:
             self.state.backend_session_id = None
             self.state.last_backend_message_id = None
-            self.state.new_agit_session_id()
+            self.state.new_agitrack_session_id()
         self.verbose = verbose
         self.prompt = AgitrackPrompt(self._prompt_state)
         self.actions = AgitrackActions(repo, self.state, verbose=verbose, interactive=self.interactive)
@@ -158,8 +158,11 @@ class AgitrackShell:
             current = self.state.summarization_model or self.global_config.summarization_model or "(same as session)"
             print(f"Current summarizer model: {current}")
             new_model = input("Enter model (empty to clear): ").strip()
-            self.state.summarization_model = new_model or None
-            print(f"Summarizer model set to: {self.state.summarization_model or '(same as session)'}")
+            # Persist globally (survives restarts and applies across the repo); clear the
+            # per-session override so the global value takes effect.
+            self.global_config.summarization_model = new_model or None
+            self.state.summarization_model = None
+            print(f"Summarizer model set to: {self.global_config.summarization_model or '(same as session)'}")
         elif sub == "" or sub == "status":
             enabled = self._summarization_enabled()
             model = self.state.summarization_model or self.global_config.summarization_model or "(same as session)"

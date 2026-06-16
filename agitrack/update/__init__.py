@@ -8,7 +8,7 @@ from agitrack.update.updater import (
     UpdateStatus,
     Updater,
     detect_source_repo,
-    restart_agit,
+    restart_agitrack,
 )
 
 __all__ = [
@@ -19,5 +19,5 @@ __all__ = [
     "UpdateStatus",
     "Updater",
     "detect_source_repo",
-    "restart_agit",
+    "restart_agitrack",
 ]

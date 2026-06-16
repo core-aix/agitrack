@@ -1,4 +1,4 @@
-"""aGiTrack: agent + git."""
+"""aGiTrack: agent + git tracking."""
 
 import re
 from importlib.metadata import PackageNotFoundError, version

@@ -1,37 +1,28 @@
 from __future__ import annotations
 
 import subprocess
-from typing import TYPE_CHECKING
-
-from agitrack.summaries.prompts import MODEL_SELECTION_SYSTEM
-
-if TYPE_CHECKING:
-    from agitrack.backends.base import AgentBackend
 
 
-def detect_cheapest_model(backend: AgentBackend) -> str | None:
-    models = _list_available_models(backend.name)
-    if not models:
-        return None
-    if len(models) == 1:
-        return models[0]
-    prompt = f"{MODEL_SELECTION_SYSTEM}\n\nAvailable models:\n" + "\n".join(models)
-    result = backend.run(prompt, model=None, session_id=None)
-    selected = result.final_response.strip()
-    if selected in models:
-        return selected
-    for model in models:
-        if selected in model or model in selected:
-            return model
-    return None
-
-
-def _list_available_models(backend_name: str) -> list[str]:
+def list_available_models(backend_name: str) -> list[str]:
+    """The models the summarizer can use for the given backend (smallest tier first
+    where we know the ordering, i.e. Claude). Empty when the backend's CLI can't be
+    queried — callers then fall back to free-text model entry."""
     if backend_name == "opencode":
         return _list_opencode_models()
     if backend_name == "claude":
         return _list_claude_models()
     return []
+
+
+def smallest_model(backend_name: str, models: list[str]) -> str | None:
+    """The smallest / cheapest model to default the summarizer to. For Claude that's
+    the Haiku tier; for other backends we don't presume a size ordering, so there is
+    no recommended default."""
+    if backend_name == "claude":
+        for model in models:
+            if "haiku" in model.lower():
+                return model
+    return None
 
 
 def _list_opencode_models() -> list[str]:
@@ -68,6 +59,7 @@ def _list_claude_models() -> list[str]:
         )
         if result.returncode != 0:
             return []
-        return ["claude-3-5-sonnet-20241022", "claude-3-5-haiku-20241022", "claude-3-opus-20240229"]
+        # aGiTrack's curated Claude tiers, smallest (Haiku) → largest (Opus).
+        return ["claude-haiku-4-5-20251001", "claude-sonnet-4-6", "claude-opus-4-8"]
     except (subprocess.TimeoutExpired, OSError):
         return []
