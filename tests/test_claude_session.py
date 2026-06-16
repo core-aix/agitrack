@@ -213,6 +213,8 @@ def test_parse_rows_excludes_meta_sidechain_tool_results_and_commands():
     rows = [
         _user("c", "<local-command-caveat>noise</local-command-caveat>", isMeta=True),
         _user("s", "<command-name>/model</command-name>"),
+        # Harness background-task completion notices are not real prompts either.
+        _user("tn", "<task-notification>\n<task-id>abc</task-id>\n</task-notification>"),
         _user("side", "subagent prompt", isSidechain=True),
         {
             "type": "user",
