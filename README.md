@@ -153,7 +153,11 @@ Each session has its **own** merge destination, independent of the other session
 
 - **Choosing a branch for a new session.** When you start a new session (`Ctrl-G → + New session`), aGiTrack asks which branch its changes should merge into. The default is the branch checked out in your repo directory ("the base branch"); pick another to point that session elsewhere. aGiTrack does **not** check that branch out in your directory — it advances the branch's ref directly via fast-forward, so your working tree stays put.
 - **Status bar emphasis.** The status line shows `session → branch`. When a session merges into a branch *different* from the one checked out in your repo directory, that branch name is shown in **bold**, so it's obvious at a glance that the changes are landing somewhere other than your current directory. The emphasis updates automatically when you check out a different branch in the directory.
-- **Staying in sync.** Whenever the repo directory's branch changes (you `git checkout` something else), and whenever you switch sessions, aGiTrack asks — only if the active session's merge branch differs from the directory's branch — where that session's changes should merge: into the directory's current branch, or keep its own. Picking the directory's branch re-points the session there (flushing its pending work into the old branch first).
+- **Staying in sync.** Sessions keep merging into their own branches by default, even after you check out a different branch in the repo directory. aGiTrack only *asks* — and only when the active session's merge branch differs from the directory's:
+  - When you **`git checkout` a different branch in the repo directory**, it offers three choices: do nothing (the default — every session keeps its own branch), switch only the current session to the directory's branch, or switch **all** sessions to it.
+  - When you **switch sessions** and the one you land on diverges, it offers two: keep that session's branch (default) or switch it to the directory's branch.
+
+  Switching a session re-points it (flushing its pending work into the old branch first). The session list (`Ctrl-G → session`) shows each session's merge branch as `name → branch`.
 - **Changing a session's merge branch.** `Ctrl-G → session → ⤳ Change a session's merge branch` re-points **any** session's merge destination. The session keeps running and only that session is affected (its pending work is flushed into its old branch first).
 
 ### Integration and startup recovery

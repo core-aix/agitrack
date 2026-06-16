@@ -1051,12 +1051,45 @@ class ProxyRunner:
         if current == self._repo_dir_branch:
             return  # the repo directory hasn't moved since the last poll
         self._repo_dir_branch = current  # keep the status bar's "current dir branch" fresh
-        self._prompt_merge_target_if_diverged()
+        self._prompt_merge_targets_on_dir_change()
+
+    def _prompt_merge_targets_on_dir_change(self) -> None:
+        # The repo directory was switched to another branch. Sessions keep merging into
+        # their own branches by default; offer to realign them. The first (default)
+        # option does nothing; then "switch only this session"; then, with more than
+        # one session, "switch ALL sessions" to the directory's branch.
+        if self.worktree is None or self._base_branch is None or self._repo_dir_branch is None:
+            return
+        if self._base_branch == self._repo_dir_branch:
+            return  # the active session already merges into the directory's branch
+        dir_branch = self._repo_dir_branch
+        options = [
+            "Do nothing — keep every session merging into its own branch",
+            f"Switch only '{self.name}' to '{dir_branch}'",
+        ]
+        if len(self.sessions or []) > 1:
+            options.append(f"Switch ALL sessions to '{dir_branch}'")
+        choice = self._select_popup(
+            f"The repo directory is now on '{dir_branch}', but session '{self.name}' merges into "
+            f"'{self._base_branch}'. What should happen?",
+            options,
+        )
+        if not choice or choice.startswith("Do nothing"):
+            self._set_message(
+                f"Sessions keep merging into their own branches (the repo directory is on '{dir_branch}').",
+                seconds=6.0,
+            )
+            self._render()
+            return
+        if choice.startswith("Switch ALL"):
+            self._retarget_all_sessions(dir_branch)
+            return
+        self._retarget_active_session(dir_branch)  # switch only the active session
 
     def _prompt_merge_target_if_diverged(self) -> None:
-        # When the active session merges into a different branch than the one checked
-        # out in the repo directory, ask which branch its changes should merge into.
-        # Called on a repo-directory branch change and on every session switch.
+        # Used on a SESSION SWITCH: when the newly-active session merges into a branch
+        # other than the directory's, ask whether to keep its own branch (default) or
+        # switch it to the directory's.
         if self.worktree is None or self._base_branch is None or self._repo_dir_branch is None:
             return
         if self._base_branch == self._repo_dir_branch:
@@ -1065,11 +1098,11 @@ class ProxyRunner:
             f"The repo directory is on '{self._repo_dir_branch}', but session '{self.name}' merges into "
             f"'{self._base_branch}'. Where should this session's changes merge?",
             [
-                f"Merge into '{self._repo_dir_branch}' (the current directory branch)",
                 f"Keep merging into '{self._base_branch}'",
+                f"Switch to '{self._repo_dir_branch}' (the current directory branch)",
             ],
         )
-        if choice and choice.startswith("Merge into '"):
+        if choice and choice.startswith("Switch to '"):
             self._retarget_active_session(self._repo_dir_branch)
         else:
             self._set_message(
@@ -1078,6 +1111,14 @@ class ProxyRunner:
                 seconds=6.0,
             )
             self._render()
+
+    def _retarget_all_sessions(self, target: str) -> None:
+        # Re-point every live session at `target` (used by "switch ALL sessions").
+        # A session already on `target` is a no-op.
+        self._retarget_active_session(target)  # active, in place
+        for session in list(self.sessions):
+            if session is not self.active:
+                self._with_session(session, lambda: self._retarget_active_session(target))
 
     def _retarget_active_session(self, target: str) -> bool:
         # Change the ACTIVE session's merge destination to `target` — per-session, so
@@ -2409,6 +2450,9 @@ class ProxyRunner:
             marker = "* " if index == self.active_index else "  "
             backend = getattr(getattr(session, "backend", None), "name", "?")
             label = f"{marker}{self._session_name(index)} [{self._session_status(index)}] ({backend})"
+            merge_branch = getattr(session, "_base_branch", None)
+            if merge_branch:
+                label += f" → {merge_branch}"  # the branch this session merges into
             if index == self.active_index and not self.merge_ctx and self._active_has_pending():
                 label += " — commits to integrate"
             sid = getattr(getattr(session, "state", None), "backend_session_id", None)
@@ -3933,8 +3977,11 @@ class ProxyRunner:
         src_id = self.state.backend_session_id
         if not src_id or not getattr(agent, "supports_session_sharing", False):
             return False
-        transcript = agent.export_session_raw(self.base_repo.repo, src_id) or agent.export_session_raw(
-            self.repo.repo, src_id
+        # The LATEST conversation state lives in the active session's worktree (its
+        # cwd), so export from there first; the base repo may only hold an older
+        # mirrored copy. (Same order as the auto-share path.)
+        transcript = agent.export_session_raw(self.repo.repo, src_id) or agent.export_session_raw(
+            self.base_repo.repo, src_id
         )
         new_id = getattr(agent, "new_import_id", lambda: None)() or agent.new_session_id()
         if not transcript or not new_id:

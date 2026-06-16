@@ -3448,10 +3448,17 @@ def test_fork_current_session_copies_under_a_new_id(tmp_path):
     runner._render = lambda: None
     runner._set_message = lambda *a, **k: None
     imported: dict = {}
+    worktree_dir, base_dir = tmp_path / "worktree", tmp_path / "base"
+
+    def export(repo, sid):
+        if sid != "src-1":
+            return None
+        return "LATEST" if repo == worktree_dir else "STALE"  # the worktree holds the latest state
+
     agent = types.SimpleNamespace(
         name="claude",
         supports_session_sharing=True,
-        export_session_raw=lambda repo, sid: "TRANSCRIPT" if sid == "src-1" else None,
+        export_session_raw=export,
         new_import_id=lambda: "fork-2",
         new_session_id=lambda: "fallback",
         import_shared_session=lambda repo, sid, transcript, *, overwrite=False, as_id=None: (
@@ -3460,16 +3467,17 @@ def test_fork_current_session_copies_under_a_new_id(tmp_path):
     )
     runner.backend = agent
     runner.state = types.SimpleNamespace(backend_session_id="src-1", backend="claude")
-    runner.base_repo = types.SimpleNamespace(repo=tmp_path)
-    runner.repo = types.SimpleNamespace(repo=tmp_path)
+    runner.base_repo = types.SimpleNamespace(repo=base_dir)
+    runner.repo = types.SimpleNamespace(repo=worktree_dir)
     created: dict = {}
     runner._new_session = lambda name, **kw: created.update(name=name, **kw)
 
     ok = runner._fork_current_session("forked", base_branch="dev")
 
     assert ok is True
-    # The copy is installed under a NEW id; the original (src-1) transcript is untouched.
-    assert imported == {"sid": "src-1", "as_id": "fork-2", "transcript": "TRANSCRIPT"}
+    # Installed under a NEW id, from the worktree's LATEST state (not the base repo's
+    # older mirror); the original (src-1) transcript is untouched.
+    assert imported == {"sid": "src-1", "as_id": "fork-2", "transcript": "LATEST"}
     # The forked session resumes the new id (not the original), so the two never clash.
     assert created["resume_session_id"] == "fork-2"
     assert created["base_branch"] == "dev"
@@ -3507,7 +3515,7 @@ def test_dedupe_session_name_avoids_collisions():
 # --- base branch switched out-of-band ---
 
 
-def _merge_drift_runner(dir_branch, *, session_target="dev", choice):
+def _merge_drift_runner(dir_branch, *, session_target="dev", choice, sessions=None):
     import types
 
     runner = make_runner(
@@ -3517,6 +3525,7 @@ def _merge_drift_runner(dir_branch, *, session_target="dev", choice):
         base_repo=types.SimpleNamespace(current_branch=lambda: dir_branch),
         name="s1",
     )
+    runner.sessions = sessions if sessions is not None else [runner.active]
     runner._repo_dir_branch = session_target  # start aligned (so no prompt until the dir moves)
     runner._debug = lambda *a, **k: None
     runner.messages = []
@@ -3529,14 +3538,13 @@ def _merge_drift_runner(dir_branch, *, session_target="dev", choice):
     return runner
 
 
-def test_repo_dir_change_prompts_and_keeps_session_merge_branch():
-    # When the repo directory moves to a branch that differs from the active session's
-    # merge branch, the user is prompted; choosing "Keep merging" leaves the session's
-    # branch alone (the status bar then bolds it).
-    runner = _merge_drift_runner("feature-x", session_target="dev", choice="Keep merging into 'dev'")
+def test_repo_dir_change_keeps_all_sessions_on_their_branches_by_default():
+    # The default (first) option does nothing — background sessions keep merging into
+    # their own branches after the directory's branch changes.
+    runner = _merge_drift_runner("feature-x", choice="Do nothing — keep every session merging into its own branch")
     runner._check_base_branch_drift()
     assert runner.popups and "feature-x" in runner.popups[0][0] and "dev" in runner.popups[0][0]
-    assert runner.retargeted == []  # the session keeps merging into its own branch
+    assert runner.retargeted == []  # nothing was re-targeted
     assert runner._base_branch == "dev"
     assert runner._repo_dir_branch == "feature-x"  # cached directory branch updated
 
@@ -3547,13 +3555,29 @@ def test_repo_dir_change_prompts_and_keeps_session_merge_branch():
     assert runner.popups == []
 
 
-def test_repo_dir_change_retargets_session_when_user_picks_dir_branch():
-    # Choosing "Merge into '<dir branch>'" re-targets the session's merge branch to it.
-    runner = _merge_drift_runner(
-        "feature-x", session_target="dev", choice="Merge into 'feature-x' (the current directory branch)"
-    )
+def test_repo_dir_change_can_switch_only_the_current_session():
+    runner = _merge_drift_runner("feature-x", choice="Switch only 's1' to 'feature-x'")
     runner._check_base_branch_drift()
-    assert runner.retargeted == ["feature-x"]  # the session's merge branch follows the directory
+    assert runner.retargeted == ["feature-x"]  # only the active session follows the directory
+
+
+def test_repo_dir_change_can_switch_all_sessions():
+    from agitrack.proxy.session import Session
+
+    runner = _merge_drift_runner("feature-x", choice="Switch ALL sessions to 'feature-x'")
+    other = Session.bare()
+    other._base_branch = "dev"
+    runner.sessions = [runner.active, other]  # two live sessions
+    runner._check_base_branch_drift()
+    assert runner.retargeted == ["feature-x", "feature-x"]  # the active one and the background one
+
+
+def test_session_switch_prompt_keeps_or_switches_active_session():
+    # On a session switch the prompt is two-option (this session only).
+    runner = _merge_drift_runner("feature-x", choice="Switch to 'feature-x' (the current directory branch)")
+    runner._repo_dir_branch = "feature-x"  # directory already on feature-x; session merges into dev
+    runner._prompt_merge_target_if_diverged()
+    assert runner.retargeted == ["feature-x"]
 
 
 def test_integrate_turn_skips_while_paused():
