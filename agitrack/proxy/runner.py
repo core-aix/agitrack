@@ -999,39 +999,23 @@ class ProxyRunner:
 
     def _setup_worktree_confinement_notice(self) -> None:
         # When confinement is requested but the platform can't enforce it (no
-        # sandbox), watch the base repo and warn if the agent writes into it, so
-        # edits outside the worktree don't silently go untracked.
+        # sandbox), silently watch the base repo so we can warn *if and when* the
+        # agent actually writes into it (see _warn_if_base_edited). We no longer show
+        # a proactive "can't sandbox" notice at startup — it confused users by
+        # flagging a capability limitation even when nothing went wrong.
         self._monitor_base_edits = False
         if self.worktree is None:
             return
         if not (self.global_config.sandbox and sandbox.is_enabled()):
             return  # user disabled confinement
         if sandbox.is_available():
-            return  # the sandbox enforces it; no warning needed
+            return  # the sandbox enforces it; nothing to monitor
         self._monitor_base_edits = True
         self._base_check_at = 0.0
         try:
             self._base_status_baseline: set[str] = set(self.base_repo.status_short().splitlines())
         except Exception:
             self._base_status_baseline = set()
-        self._set_message(
-            self._sandbox_unavailable_hint(),
-            seconds=8.0,
-        )
-        self._render()
-
-    @staticmethod
-    def _sandbox_unavailable_hint() -> str:
-        base = (
-            "Heads up: aGiTrack can't fully sandbox the agent on this system, so it could\n"
-            "change files outside its workspace. aGiTrack will warn you if that happens."
-        )
-        # Only offer the one simple, actionable step (installing bubblewrap) — and
-        # only when it's actually missing. No kernel/userns jargon: if the tool is
-        # present but the system still blocks it, the plain warning is enough.
-        if sys.platform.startswith("linux") and shutil.which("bwrap") is None:
-            return base + "\nInstalling the 'bubblewrap' tool (e.g. `apt install bubblewrap`) can turn the sandbox on."
-        return base
 
     def _check_base_branch_drift(self) -> None:
         # The user can `git checkout` another branch in the directory while aGiTrack is

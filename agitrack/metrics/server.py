@@ -73,6 +73,7 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
                     to=to,
                     offset=_int(query, "offset", 0),
                     limit=_int(query, "limit", 50),
+                    sort=_str(query, "sort"),
                 )
                 self._respond("application/json", self._json(page))
             else:

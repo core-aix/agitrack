@@ -1,10 +1,36 @@
 from __future__ import annotations
 
+import platform
 import re
 from datetime import datetime, timezone
 from textwrap import shorten, wrap
 
 from agitrack import __version__
+
+
+def _system_info() -> str:
+    """Host OS and version for the commit metadata. Tool availability differs across
+    macOS / Linux / Windows, so recording the platform helps interpret a session
+    (and any tool-specific behaviour) after the fact."""
+    system = platform.system()
+    info = ""
+    try:
+        if system == "Darwin":
+            info = f"macOS {platform.mac_ver()[0]}"
+        elif system == "Windows":
+            info = f"Windows {platform.release()}"
+        elif system == "Linux":
+            release = platform.freedesktop_os_release()
+            version = release.get("VERSION_ID") or release.get("VERSION", "")
+            info = f"{release.get('NAME', 'Linux')} {version}"
+    except (OSError, AttributeError, KeyError):
+        info = ""
+    if not info.strip():
+        info = f"{system} {platform.release()}"
+    # Keep the metadata line within the 72-char commit-body width even for an
+    # unusually long distro string.
+    return info.strip()[:60] or "unknown"
+
 
 DEFAULT_SUBJECT = "No subject provided"
 # GitHub truncates a commit's subject (its first line) at 72 characters in the
@@ -257,6 +283,7 @@ def _trace_and_metadata_lines(
     lines.extend(_token_metadata_lines(token_usage))
     if summary_metadata:
         lines.extend(summary_metadata)
+    lines.append(f"system: {_system_info()}")
     lines.append(f"agitrack_version: {__version__}")
     return lines
 
@@ -291,6 +318,7 @@ def build_agent_merge_message(
             f"base_branch: {base_branch}",
             f"agitrack_session_id: {agitrack_session_id}",
             f"backend_session_id: {backend_session_id or 'unknown'}",
+            f"system: {_system_info()}",
             f"agitrack_version: {__version__}",
         ]
     )
@@ -317,6 +345,7 @@ def build_user_commit_message(
             "commit_type: user",
             "backend: agit",
             f"agitrack_session_id: {agitrack_session_id}",
+            f"system: {_system_info()}",
             f"agitrack_version: {__version__}",
         ]
     )

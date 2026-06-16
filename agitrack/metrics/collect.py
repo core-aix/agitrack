@@ -111,15 +111,6 @@ def _parse_co_authors(body: str) -> list[tuple[str, str]]:
     return out
 
 
-# Same word-overlap rule as commit_engine._same_prompt: editing artifacts and
-# rephrasings shuffle words, genuinely different prompts share few.
-_WORD_RE = re.compile(r"[a-z0-9]+")
-_SIMILARITY_THRESHOLD = 0.6
-# A prompt repeated twice is a plausible retry; three or more near-identical
-# prompts in a row suggest the conversation is going in circles.
-_LOOP_MIN_RUN = 3
-
-
 @dataclass
 class CommitStat:
     """One commit's contribution to the dashboard."""
@@ -142,7 +133,7 @@ class CommitStat:
     # so a commit credited to several people is filterable under each of them (#54).
     # The AI assistant and bot accounts are excluded — they aren't committers.
     co_authors: list[tuple[str, str]] = field(default_factory=list)
-    prompt: str = ""  # the turn's prompt text (loop detection)
+    prompt: str = ""  # the turn's prompt text (parsed from the trace)
     user_prompts: list[str] = field(default_factory=list)  # trace ## User entries
     metadata_block: str = ""  # raw `# aGiTrack Metadata` text, for duplicate detection
     message: str = ""  # the full commit message (shown when a log entry is opened)
@@ -161,33 +152,10 @@ class CommitStat:
 
 
 @dataclass
-class LoopFinding:
-    """A run of consecutive agent turns with near-identical prompts."""
-
-    shas: list[str]
-    prompt: str
-    output_tokens: int
-    within_commit: bool = False  # the same prompt repeated inside one turn's trace
-
-
-@dataclass
-class Suggestion:
-    """A surfaced opportunity to use the agent more efficiently: a repeated prompt
-    (turns spent re-asking the same thing) or a turn whose token cost bought very
-    few line changes. The dashboard shows only the top few, costliest first."""
-
-    kind: str  # "repeat" | "costly"
-    detail: str  # short, human-readable explanation
-    shas: list[str]
-    output_tokens: int
-
-
-@dataclass
 class Dashboard:
     repo: str
     branch: str  # the ref this dashboard was built for (the current branch by default)
     stats: list[CommitStat]  # oldest first
-    suggestions: list[Suggestion]  # top efficiency-improvement hints
     sha_logins: dict[str, str] = field(default_factory=dict)  # commit SHA → GitHub login (best-effort)
     commit_base: str = ""  # GitHub commit URL prefix, or "" when no GitHub remote
     branches: list[str] = field(default_factory=list)  # every local branch, for the per-branch view selector
@@ -600,7 +568,6 @@ def build_dashboard(repo: GitRepo, ref: str = "HEAD", *, sha_logins: dict[str, s
         repo=_abbreviate_home(str(repo.repo)),
         branch=branch,
         stats=stats,
-        suggestions=_efficiency_suggestions(stats),
         sha_logins=sha_logins or {},
         commit_base=commit_url_base(repo),
         branches=branches,
@@ -869,127 +836,3 @@ def _apply_numstat(repo: GitRepo, ref: str, by_sha: dict[str, CommitStat]) -> No
                 current.insertions += int(match.group(1))
             if match.group(2) != "-":
                 current.deletions += int(match.group(2))
-
-
-# ---------------------------------------------------------------------------
-# Loop detection (#54): near-identical prompts burn tokens without progress
-# ---------------------------------------------------------------------------
-
-
-def _similar(a: str, b: str) -> bool:
-    """Word-overlap match, the same rule as commit_engine._same_prompt."""
-    norm_a, norm_b = " ".join(a.lower().split()), " ".join(b.lower().split())
-    if not norm_a or not norm_b:
-        return False
-    if norm_a == norm_b:
-        return True
-    words_a, words_b = set(_WORD_RE.findall(norm_a)), set(_WORD_RE.findall(norm_b))
-    if not words_a or not words_b:
-        return False
-    return len(words_a & words_b) / len(words_a | words_b) >= _SIMILARITY_THRESHOLD
-
-
-def _detect_loops(stats: list[CommitStat]) -> list[LoopFinding]:
-    findings: list[LoopFinding] = []
-
-    # Across turns: consecutive agent commits re-asking ~the same thing.
-    agents = [stat for stat in stats if stat.kind == "agent" and stat.prompt]
-    run: list[CommitStat] = []
-    for stat in agents:
-        if run and _similar(run[-1].prompt, stat.prompt):
-            run.append(stat)
-            continue
-        if len(run) >= _LOOP_MIN_RUN:
-            findings.append(_finding(run))
-        run = [stat]
-    if len(run) >= _LOOP_MIN_RUN:
-        findings.append(_finding(run))
-
-    # Within a turn: the trace shows the user repeating the same prompt.
-    for stat in stats:
-        if stat.kind != "agent" or len(stat.user_prompts) < _LOOP_MIN_RUN:
-            continue
-        longest = 1
-        current = 1
-        for previous, prompt in zip(stat.user_prompts, stat.user_prompts[1:]):
-            current = current + 1 if _similar(previous, prompt) else 1
-            longest = max(longest, current)
-        if longest >= _LOOP_MIN_RUN:
-            findings.append(
-                LoopFinding(
-                    shas=[stat.short],
-                    prompt=stat.user_prompts[0],
-                    output_tokens=stat.tokens.get("output", 0),
-                    within_commit=True,
-                )
-            )
-    return findings
-
-
-def _finding(run: list[CommitStat]) -> LoopFinding:
-    return LoopFinding(
-        shas=[stat.short for stat in run],
-        prompt=run[0].prompt,
-        output_tokens=sum(stat.tokens.get("output", 0) for stat in run),
-    )
-
-
-# Show at most this many suggestions, so the panel stays a short, scannable list.
-_MAX_SUGGESTIONS = 5
-# A repo needs at least this many costed agent turns before "costly turn" hints are
-# meaningful — below it, one big turn isn't evidence of an inefficiency pattern.
-_MIN_TURNS_FOR_COST = 4
-
-
-def _efficiency_suggestions(stats: list[CommitStat]) -> list[Suggestion]:
-    """Top efficiency-improvement hints for the dashboard, costliest first. Two
-    signals, both grounded in commit metadata: prompts re-asked across turns
-    (wasted round-trips) and turns that spent many output tokens for few changed
-    lines. Thresholds are relative (medians) so they adapt to the repo rather than
-    relying on magic numbers; an efficient history yields an empty list."""
-    loops = _detect_loops(stats)
-    suggestions: list[Suggestion] = []
-    for loop in loops:
-        # The commit SHAs render as clickable chips alongside the detail, so the
-        # text describes the pattern without burying SHAs in prose.
-        where = "within one turn" if loop.within_commit else f"across {len(loop.shas)} turns"
-        suggestions.append(
-            Suggestion(
-                kind="repeat",
-                detail=f"Near-identical prompt repeated {where} — consolidating the ask saves round-trips.",
-                shas=loop.shas,
-                output_tokens=loop.output_tokens,
-            )
-        )
-
-    # Costly, low-yield turns: expensive (>= median output tokens) AND below the
-    # typical lines-per-token yield. Skip turns already flagged as a loop so one
-    # turn isn't reported twice.
-    looped = {sha for loop in loops for sha in loop.shas}
-    turns = [s for s in stats if s.kind == "agent" and s.tokens.get("output", 0) > 0]
-    if len(turns) >= _MIN_TURNS_FOR_COST:
-        outputs = sorted(s.tokens["output"] for s in turns)
-        median_output = outputs[len(outputs) // 2]
-        yields = sorted((s.insertions + s.deletions) / s.tokens["output"] for s in turns)
-        median_yield = yields[len(yields) // 2]
-        costly = [
-            s
-            for s in turns
-            if s.tokens["output"] >= median_output
-            and (s.insertions + s.deletions) / s.tokens["output"] < median_yield
-            and s.short not in looped
-        ]
-        costly.sort(key=lambda s: s.tokens["output"], reverse=True)
-        for s in costly[:3]:
-            lines = s.insertions + s.deletions
-            suggestions.append(
-                Suggestion(
-                    kind="costly",
-                    detail=f"Spent {s.tokens['output']:,} output tokens for {lines:,} changed lines — a candidate to narrow scope.",
-                    shas=[s.short],
-                    output_tokens=s.tokens["output"],
-                )
-            )
-
-    suggestions.sort(key=lambda s: s.output_tokens, reverse=True)
-    return suggestions[:_MAX_SUGGESTIONS]
