@@ -3535,6 +3535,7 @@ def _merge_drift_runner(dir_branch, *, session_target="dev", choice, sessions=No
     runner._select_popup = lambda title, options: runner.popups.append((title, options)) or choice
     runner.retargeted: list = []
     runner._retarget_active_session = lambda target: runner.retargeted.append(target) or True
+    runner._session_work_merged_into_base = lambda: True  # default: nothing pending to merge
     return runner
 
 
@@ -3654,6 +3655,31 @@ def test_reconcile_merge_branch_falls_back_when_prior_branch_deleted():
     assert runner._base_branch == "dev"  # falls back to the directory branch
     assert runner.state.merge_branch == "dev"  # the dangling assignment is reset
     assert runner._pending_merge_prompt is False  # nothing to confirm
+
+
+def test_deferred_merge_prompt_waits_until_run_merged_into_base():
+    # After a running session finishes, the branch-switch dialog must appear only once
+    # the run's changes have merged into the original branch — not while integration is
+    # still pending.
+    runner = _merge_drift_runner("feature-x", choice="Switch only 's1' to 'feature-x'")
+    runner.agent_in_flight = True
+    runner._check_base_branch_drift()  # dir moved mid-run → deferred
+    assert runner._pending_merge_prompt is True and runner.popups == []
+
+    # The run goes idle, but its work hasn't integrated into 'dev' yet — still no dialog.
+    runner.agent_in_flight = False
+    runner._session_work_merged_into_base = lambda: False  # commit/integration still pending
+    runner._base_drift_check_at = 0.0
+    runner._check_base_branch_drift()
+    assert runner._pending_merge_prompt is True  # held back
+    assert runner.popups == []
+
+    # Once the changes have merged into 'dev', the dialog appears.
+    runner._session_work_merged_into_base = lambda: True
+    runner._base_drift_check_at = 0.0
+    runner._check_base_branch_drift()
+    assert runner.popups  # asked now
+    assert runner._pending_merge_prompt is False
 
 
 def test_deferred_merge_prompt_not_swallowed_by_aligned_session():

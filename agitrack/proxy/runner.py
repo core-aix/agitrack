@@ -1042,13 +1042,21 @@ class ProxyRunner:
         # independent of the directory's checkout and of the other sessions.)
         if self.worktree is None or self._base_branch is None:
             return
-        # A dir-change prompt that was deferred while a run was in flight fires now that
-        # the session is idle (the run finished, so its merge branch can change safely).
+        # A dir-change prompt that was deferred while a run was in flight fires once the
+        # run's changes have MERGED into the session's original branch — not the moment the
+        # run goes idle (the just-finished work is still being committed/integrated then,
+        # and must land on the original branch before we ask where future work should go).
+        # A cancelled run leaves nothing to integrate, so the dialog is free to appear.
         # The flag is runner-level (shared across sessions), so only clear it once the
         # ACTIVE session is the diverged one being asked about — otherwise switching to a
         # non-diverged session in the meantime would silently swallow the pending prompt;
-        # it stays set until the diverged session is foreground and idle.
-        if self._pending_merge_prompt and not self.agent_in_flight and self._base_branch != self._repo_dir_branch:
+        # it stays set until the diverged session is foreground, idle, and merged.
+        if (
+            self._pending_merge_prompt
+            and not self.agent_in_flight
+            and self._base_branch != self._repo_dir_branch
+            and self._session_work_merged_into_base()
+        ):
             self._pending_merge_prompt = False
             self._prompt_merge_targets_on_dir_change()
         now = time.monotonic()
@@ -1064,16 +1072,27 @@ class ProxyRunner:
         self._repo_dir_branch = current  # keep the status bar's "current dir branch" fresh
         if self._base_branch != current and self.agent_in_flight:
             # The session is mid-run — don't change its merge branch now. Warn that this
-            # run still lands on its current branch, and re-ask once it goes idle.
+            # run still lands on its current branch, and re-ask once its changes have
+            # merged there (or the run is cancelled, leaving nothing to merge).
             self._pending_merge_prompt = True
             self._set_message(
                 f"Repo is now on '{current}', but this run still merges into '{self._base_branch}'. "
-                f"You'll be asked again when the run finishes.",
+                f"You'll be asked again once its changes have merged into '{self._base_branch}'.",
                 seconds=10.0,
             )
             self._render()
             return
         self._prompt_merge_targets_on_dir_change()
+
+    def _session_work_merged_into_base(self) -> bool:
+        # True once the active session's work has landed on its merge branch — nothing
+        # uncommitted, mid-merge, or committed-but-unintegrated remains. Used to hold the
+        # deferred branch-switch dialog until a just-finished run's changes have merged
+        # into the original branch (a cancelled run leaves nothing pending, so it's True).
+        try:
+            return not self._integration.session_unintegrated(self.repo)
+        except Exception:
+            return True
 
     def _prompt_merge_targets_on_dir_change(self) -> None:
         # The repo directory was switched to another branch. Sessions keep merging into
