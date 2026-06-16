@@ -3623,6 +3623,7 @@ def test_reconcile_merge_branch_honors_prior_assignment_and_defers_confirm():
     # previous run assigned it 'feature-y'. The prior assignment is honored and a
     # confirmation prompt is deferred for the user.
     runner = make_runner(worktree=types.SimpleNamespace(), _base_branch="dev", name="s1")
+    runner.base_repo = types.SimpleNamespace(list_branches=lambda: ["dev", "feature-y"])
     runner.state = types.SimpleNamespace(merge_branch="feature-y")
     runner._reconcile_merge_branch("dev")
     assert runner._base_branch == "feature-y"  # the prior assignment wins
@@ -3639,6 +3640,45 @@ def test_reconcile_merge_branch_records_dir_branch_when_unset():
     assert runner.state.merge_branch == "dev"  # recorded for next time
     assert runner._base_branch == "dev"
     assert runner._pending_merge_prompt is False  # nothing to confirm
+
+
+def test_reconcile_merge_branch_falls_back_when_prior_branch_deleted():
+    import types
+
+    # The prior run assigned 'feature-y', but that branch no longer exists — don't honor
+    # a dangling branch (it would break integration); fall back to the directory branch.
+    runner = make_runner(worktree=types.SimpleNamespace(), _base_branch="dev", name="s1")
+    runner.base_repo = types.SimpleNamespace(list_branches=lambda: ["dev", "main"])
+    runner.state = types.SimpleNamespace(merge_branch="feature-y")
+    runner._reconcile_merge_branch("dev")
+    assert runner._base_branch == "dev"  # falls back to the directory branch
+    assert runner.state.merge_branch == "dev"  # the dangling assignment is reset
+    assert runner._pending_merge_prompt is False  # nothing to confirm
+
+
+def test_deferred_merge_prompt_not_swallowed_by_aligned_session():
+    # The deferred-prompt flag is runner-level. If it's deferred while one session runs,
+    # switching to a DIFFERENT session that's already aligned with the dir branch must not
+    # silently clear it — it stays pending until the diverged session is foreground+idle.
+    runner = _merge_drift_runner("feature-x", choice="Switch only 's1' to 'feature-x'")
+    runner.agent_in_flight = True
+    runner._check_base_branch_drift()  # dir moved mid-run → deferred
+    assert runner._pending_merge_prompt is True and runner.popups == []
+
+    # Now idle, but the active session already merges into the dir branch (aligned).
+    runner.agent_in_flight = False
+    runner._base_branch = "feature-x"
+    runner._base_drift_check_at = 0.0
+    runner._check_base_branch_drift()
+    assert runner._pending_merge_prompt is True  # NOT swallowed
+    assert runner.popups == []  # nothing to ask for the aligned session
+
+    # Back on the diverged, idle session: the prompt finally fires.
+    runner._base_branch = "dev"
+    runner._base_drift_check_at = 0.0
+    runner._check_base_branch_drift()
+    assert runner.popups  # asked at last
+    assert runner._pending_merge_prompt is False
 
 
 def test_retarget_active_session_refused_while_running():
