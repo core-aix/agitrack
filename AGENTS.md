@@ -1,6 +1,6 @@
 # aGiTrack Requirements
 
-aGiTrack stands for agent + git. It is a Python library and interactive CLI that combines coding-agent command line tools with automatic Git commits so agentic code changes are easier to trace.
+aGiTrack stands for agent + git tracking. It is a Python library and interactive CLI that combines coding-agent command line tools with automatic Git commits so agentic code changes are easier to trace.
 
 ## Goals
 
