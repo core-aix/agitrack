@@ -1044,7 +1044,11 @@ class ProxyRunner:
             return
         # A dir-change prompt that was deferred while a run was in flight fires now that
         # the session is idle (the run finished, so its merge branch can change safely).
-        if self._pending_merge_prompt and not self.agent_in_flight:
+        # The flag is runner-level (shared across sessions), so only clear it once the
+        # ACTIVE session is the diverged one being asked about — otherwise switching to a
+        # non-diverged session in the meantime would silently swallow the pending prompt;
+        # it stays set until the diverged session is foreground and idle.
+        if self._pending_merge_prompt and not self.agent_in_flight and self._base_branch != self._repo_dir_branch:
             self._pending_merge_prompt = False
             self._prompt_merge_targets_on_dir_change()
         now = time.monotonic()
@@ -1165,11 +1169,22 @@ class ProxyRunner:
         if self.state is None:
             return
         previous = self.state.merge_branch  # what the previous aGiTrack instance assigned
-        if previous and previous != default_base:
+        if previous and previous != default_base and self._branch_exists(previous):
             self._base_branch = previous  # keep merging where the prior run was pointed
             self._pending_merge_prompt = True  # confirm with the user once the TUI is ready
         elif default_base is not None:
+            # No prior assignment, it already matches, or its branch is gone — record the
+            # directory's current branch as this worktree's merge branch.
             self.state.merge_branch = default_base
+
+    def _branch_exists(self, branch: str) -> bool:
+        # Whether `branch` is a real local branch right now. On any error assume it does,
+        # so a prior merge-branch assignment is never silently dropped on a transient
+        # failure — only when the branch is provably gone.
+        try:
+            return branch in self.base_repo.list_branches()
+        except Exception:
+            return True
 
     def _retarget_active_session(self, target: str) -> bool:
         # Change the ACTIVE session's merge destination to `target` — per-session, so
