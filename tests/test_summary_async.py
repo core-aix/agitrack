@@ -60,12 +60,20 @@ def test_summary_leads_message_and_takes_subject():
     assert "please add the widget renderer" in body.split("# Interaction Trace")[1]
 
 
-def test_long_summary_first_line_is_truncated_to_subject_width():
-    message = _base_message(summary="word " * 40)
-    subject = message.splitlines()[0]
-    assert subject.startswith("<aGiTrack> ")
-    assert len(subject) <= 72
-    assert subject.endswith("...")
+def test_long_summary_first_line_splits_at_first_sentence():
+    # The summary's first sentence becomes the subject; the rest flows to the body.
+    # No "…" truncation — Git shortens the displayed subject if it's long.
+    message = _base_message(summary="Refactored the parser for clarity. It also speeds up large files.")
+    lines = message.splitlines()
+    assert lines[0] == "<aGiTrack> Refactored the parser for clarity."
+    assert "..." not in lines[0]
+    assert lines[1] == "It also speeds up large files."
+
+
+def test_summary_first_line_without_period_is_kept_whole():
+    subject = _base_message(summary="word " * 40).splitlines()[0]
+    assert subject.startswith("<aGiTrack> word word")
+    assert not subject.endswith("...")
 
 
 def test_without_summary_prompts_still_head_the_message():

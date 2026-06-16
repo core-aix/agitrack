@@ -6,7 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from agitrack.backends.setup import select_default_backend
+from agitrack.backends.setup import select_default_backend, select_default_summarizer_model
 from agitrack.backends.proxy_agents import available_backends
 from agitrack.git import GitError, GitRepo, RepoLock, already_running_message
 from agitrack.config import GlobalConfig
@@ -152,7 +152,9 @@ def main(argv: list[str] | None = None) -> int:
         and sys.stdin.isatty()
         and sys.stdout.isatty()
     ):
-        select_default_backend(config)
+        chosen_backend = select_default_backend(config)
+        # First run also picks the default summarizer model, saved to the global config.
+        select_default_summarizer_model(config, chosen_backend)
 
     # Worktrees on unless the config opts out or --no-worktree is passed (flag wins).
     use_worktrees = False if args.no_worktree else config.use_worktrees

@@ -3,7 +3,7 @@ from __future__ import annotations
 import platform
 import re
 from datetime import datetime, timezone
-from textwrap import shorten, wrap
+from textwrap import wrap
 
 from agitrack import __version__
 
@@ -357,9 +357,19 @@ def _subject_text(text: str, *, width: int) -> str:
 
 
 def _subject_parts(text: str, *, width: int) -> tuple[str, str | None]:
+    # The subject is the first sentence: text up to the first period that ends one
+    # (followed by whitespace or the end of the string). The remainder, if any, flows
+    # onto the next line (the body). aGiTrack does NOT truncate with "…" — a long
+    # subject is left intact and Git shortens its DISPLAY when needed. ``width`` is
+    # accepted for caller compatibility but no longer used to truncate.
     one_line = " ".join(text.strip().split()) or DEFAULT_SUBJECT
-    subject = shorten(one_line, width=width, placeholder="...")
-    return subject, one_line if subject != one_line else None
+    match = re.search(r"\.(?=\s|$)", one_line)
+    if match is None:
+        return one_line, None
+    end = match.start() + 1  # include the period that ends the first sentence
+    subject = one_line[:end].rstrip()
+    remainder = one_line[end:].strip()
+    return subject, remainder or None
 
 
 def _body_lines(text: str) -> list[str]:
