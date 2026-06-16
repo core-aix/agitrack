@@ -49,6 +49,10 @@ class Session:
         # so concurrent sessions can target independent branches, decoupled from the
         # branch checked out in the repo directory.
         "_base_branch",
+        # Whether a directory-branch change during THIS session's run deferred a
+        # merge-target prompt. Per-session so one session's pending prompt is never
+        # swallowed (or double-asked) by switching to another session.
+        "_pending_merge_prompt",
         # child process / screen
         "child_pid",
         "master_fd",
@@ -169,6 +173,7 @@ class Session:
             "file_change_event": threading.Event(),
             "file_observer": None,
             "agent_in_flight": False,
+            "_pending_merge_prompt": False,
             "agent_parse_thread": None,
             "agent_parse_result": None,
             "agent_parse_active": False,

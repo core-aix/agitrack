@@ -336,6 +336,9 @@ class ProxyRunner:
     # via a custom property added at the bottom of this module; declared here so mypy
     # knows its type (the property is attached dynamically).
     _base_branch: "str | None"
+    # Per-session flag (a Session.FIELDS entry, delegated like the others); declared here
+    # so mypy can resolve its type at the read sites above its dynamic attachment.
+    _pending_merge_prompt: bool
 
     # Defaults for the tunable timings; overridden per-instance from the global
     # config in __init__ (see GlobalConfig.timings). Kept as class constants so
@@ -509,7 +512,7 @@ class ProxyRunner:
         # _base_branch is per-session (a Session.FIELDS entry that delegates to the
         # active session); each session integrates into its own branch.
         self._repo_dir_branch: str | None = None  # branch checked out in the repo dir (for the status bar)
-        self._pending_merge_prompt = False  # a dir-change merge-target prompt deferred while a run was in flight
+        # _pending_merge_prompt is per-session (a Session field) — see Session.FIELDS.
         self._integration_paused = False  # reserved; integration is no longer globally paused
         self._base_drift_check_at = 0.0
         self.turn = 0  # per-session transient-branch counter
@@ -733,7 +736,6 @@ class ProxyRunner:
                 "management_lock": None,
                 "base_repo": None,
                 "_repo_dir_branch": None,
-                "_pending_merge_prompt": False,
                 "_integration_paused": False,
                 "_base_drift_check_at": 0.0,
                 "_pending_enter_at": None,
@@ -1042,35 +1044,36 @@ class ProxyRunner:
         # independent of the directory's checkout and of the other sessions.)
         if self.worktree is None or self._base_branch is None:
             return
-        # A dir-change prompt that was deferred while a run was in flight fires once the
-        # run's changes have MERGED into the session's original branch — not the moment the
-        # run goes idle (the just-finished work is still being committed/integrated then,
-        # and must land on the original branch before we ask where future work should go).
-        # A cancelled run leaves nothing to integrate, so the dialog is free to appear.
-        # The flag is runner-level (shared across sessions), so only clear it once the
-        # ACTIVE session is the diverged one being asked about — otherwise switching to a
-        # non-diverged session in the meantime would silently swallow the pending prompt;
-        # it stays set until the diverged session is foreground, idle, and merged.
-        if (
-            self._pending_merge_prompt
-            and not self.agent_in_flight
-            and self._base_branch != self._repo_dir_branch
-            and self._session_work_merged_into_base()
-        ):
-            self._pending_merge_prompt = False
-            self._prompt_merge_targets_on_dir_change()
         now = time.monotonic()
         if now - self._base_drift_check_at < self.BASE_DRIFT_CHECK_SECONDS:
             return
         self._base_drift_check_at = now
         try:
-            current = self.base_repo.current_branch()
+            current = self.base_repo.current_branch()  # the branch checked out in the repo dir
         except Exception:
             return
-        if current == self._repo_dir_branch:
-            return  # the repo directory hasn't moved since the last poll
+        moved = current != self._repo_dir_branch
         self._repo_dir_branch = current  # keep the status bar's "current dir branch" fresh
-        if self._base_branch != current and self.agent_in_flight:
+        # A dir-change prompt this session deferred during a run fires once the run is idle
+        # AND its changes have MERGED into the session's original branch — not the moment
+        # the run goes idle (the just-finished work is still committing/integrating then,
+        # and must land on the original branch before we ask where future work should go).
+        # A cancelled run leaves nothing to integrate, so the dialog is free to appear. The
+        # flag is per-session, evaluated against the FRESH dir branch: if the directory has
+        # returned to this session's branch there's nothing to ask, and a different
+        # session's pending prompt is never touched (it has its own flag).
+        if self._pending_merge_prompt:
+            if self._base_branch == current:
+                self._pending_merge_prompt = False  # back in sync — this session's deferral is moot
+            elif not self.agent_in_flight and self._session_work_merged_into_base():
+                self._pending_merge_prompt = False
+                self._prompt_merge_targets_on_dir_change()
+            return  # handled this session's pending deferral; nothing else to do this tick
+        if not moved:
+            return  # the repo directory hasn't moved since the last poll
+        if self._base_branch == current:
+            return  # the session already merges into the directory's branch
+        if self.agent_in_flight:
             # The session is mid-run — don't change its merge branch now. Warn that this
             # run still lands on its current branch, and re-ask once its changes have
             # merged there (or the run is cancelled, leaving nothing to merge).
