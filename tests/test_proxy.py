@@ -2014,6 +2014,16 @@ def test_proxy_parses_host_terminal_responses():
     assert runner.host_bg_value == b"rgb:fafa/fafa/fafa"
     assert runner.host_palette == {b"1": b"rgb:cccc/0000/0000"}
     assert runner.host_da == b"\x1b[?62;c"
+    assert runner.host_kitty_keyboard is False  # no CSI ? u reply in this data
+
+
+def test_proxy_detects_kitty_keyboard_support_from_reply():
+    runner = make_runner(debug_proxy=False)
+    # A ``CSI ? <flags> u`` reply (here flags=1) marks kitty-keyboard support;
+    # it must not be mistaken for the DA reply (which ends in ``c``).
+    runner._parse_host_terminal_responses(b"\x1b[?1u\x1b[?62;c")
+    assert runner.host_kitty_keyboard is True
+    assert runner.host_da == b"\x1b[?62;c"
 
 
 def test_proxy_answers_terminal_queries_from_host_cache(monkeypatch):
@@ -4874,6 +4884,7 @@ def test_sync_terminal_modes_mirrors_keyboard_protocol(monkeypatch):
     import agitrack.proxy.runner as proxy_mod
 
     runner = make_runner(child_mouse=False)
+    runner.host_kitty_keyboard = True  # host speaks the kitty protocol
     writes = []
     monkeypatch.setattr(proxy_mod.os, "write", lambda fd, data: writes.append(data))
 
@@ -4888,6 +4899,45 @@ def test_sync_terminal_modes_mirrors_keyboard_protocol(monkeypatch):
     assert b"\x1b[>4;0m" in writes  # modifyOtherKeys off
     # Only the negotiation sequences are mirrored, never the text around them.
     assert all(payload.startswith(b"\x1b[") for payload in writes)
+
+
+def test_sync_terminal_modes_skips_kitty_on_unsupported_host(monkeypatch):
+    # On a host that doesn't speak the kitty protocol (e.g. the raw Linux console),
+    # the kitty push/pop must NOT be mirrored — they'd leak as visible codes. The
+    # modifyOtherKeys form is an ordinary CSI and is still mirrored.
+    import agitrack.proxy.runner as proxy_mod
+
+    runner = make_runner(child_mouse=False)
+    runner.host_kitty_keyboard = False
+    writes = []
+    monkeypatch.setattr(proxy_mod.os, "write", lambda fd, data: writes.append(data))
+
+    runner._sync_terminal_modes(b"hello\x1b[>1u world \x1b[>4;2m text \x1b[<u\x1b[>4;0m")
+
+    assert b"\x1b[>1u" not in writes  # kitty push suppressed
+    assert b"\x1b[<u" not in writes  # kitty pop suppressed
+    assert b"\x1b[>4;2m" in writes  # modifyOtherKeys still mirrored
+    assert b"\x1b[>4;0m" in writes
+
+
+def test_disable_host_terminal_modes_pops_kitty_only_when_supported(monkeypatch):
+    import agitrack.proxy.runner as proxy_mod
+
+    writes = []
+    monkeypatch.setattr(proxy_mod.os, "write", lambda fd, data: writes.append(data))
+
+    runner = make_runner()
+    runner.host_kitty_keyboard = False
+    runner._disable_host_terminal_modes()
+    blob = b"".join(writes)
+    assert b"\x1b[<u" not in blob  # no kitty pop sent to an unsupporting host
+    assert b"\x1b[?1000l" in blob  # ordinary mode resets still happen
+    assert b"\x1b[>4;0m" in blob  # modifyOtherKeys reset stays unconditional
+
+    writes.clear()
+    runner.host_kitty_keyboard = True
+    runner._disable_host_terminal_modes()
+    assert b"\x1b[<u" in b"".join(writes)  # kitty pop sent when supported
 
 
 def test_backend_exit_relaunches_and_resumes():
