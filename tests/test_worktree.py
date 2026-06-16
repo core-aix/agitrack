@@ -504,6 +504,153 @@ def test_sync_idle_worktrees_aligns_each_session_to_its_own_base(tmp_path):
     assert ("s1", base) in recorded
 
 
+def _real_session(main, name, base, *, backend="test"):
+    # A real, idle concurrent session: its own worktree + first turn branch + the merge
+    # branch recorded in its on-disk state (what the cross-branch guard reads).
+    from agitrack.proxy.session import Session
+
+    info, work = _make_session(main, name, base, backend=backend)
+    state = AgitrackState(info.path)
+    state.backend = backend
+    state.merge_branch = base
+    session = Session.bare()
+    session.repo, session.worktree, session._base_branch = work, info, base
+    session.state, session.name = state, name
+    session.backend = type("B", (), {"name": backend})()
+    session.turn, session.merge_ctx, session.agent_in_flight = 1, None, False
+    return session, info, work
+
+
+def _concurrent_runner(main, sessions):
+    # A runner driving several real, concurrent worktree sessions (active = the first).
+    runner = make_runner(
+        base_repo=main,
+        repo=sessions[0].repo,
+        worktree=sessions[0].worktree,
+        _base_branch=sessions[0]._base_branch,
+        state=sessions[0].state,
+        name=sessions[0].name,
+        turn=1,
+        merge_ctx=None,
+        agent_in_flight=False,
+    )
+    runner.active = sessions[0]
+    runner.sessions = list(sessions)
+    runner.worktree_manager = WorktreeManager(main)
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda: None
+    runner._debug = lambda *a, **k: None
+    runner._exiting = False
+    runner._integration_paused = False
+    runner._select_popup = lambda title, options: options[0]
+    # The agent's own commit is made directly in these tests, so the commit/summary
+    # workers (which need a live backend) are no-ops here.
+    runner._commit_latest_turn_sync = lambda *a, **k: None
+    runner._service_commit_summary = lambda *a, **k: None
+    return runner
+
+
+def test_concurrent_sessions_integrate_into_their_own_branches_no_crosstalk(tmp_path):
+    # Two sessions merging into DIFFERENT branches each commit and integrate; each
+    # branch must receive ONLY its own session's work (the demo-video→dev contamination
+    # class of bug), end to end against real git.
+    main = _init_repo(tmp_path)
+    base = main.current_branch()
+    main.create_branch("dev", base)
+    a, _, aw = _real_session(main, "sessA", base)
+    b, _, bw = _real_session(main, "sessB", "dev")
+    runner = _concurrent_runner(main, [a, b])
+
+    _commit(aw, "a.txt", "from A\n", "<aGiTrack> A work")
+    _commit(bw, "b.txt", "from B\n", "<aGiTrack> B work")
+    runner.active = a
+    runner._integrate_session_turn()
+    runner.active = b
+    runner._integrate_session_turn()
+
+    main_files = {p.name for p in main.repo.iterdir() if p.is_file()}
+    main.switch("dev")
+    dev_files = {p.name for p in main.repo.iterdir() if p.is_file()}
+    main.switch(base)
+    assert "a.txt" in main_files and "b.txt" not in main_files  # main got A only
+    assert "b.txt" in dev_files and "a.txt" not in dev_files  # dev got B only
+
+
+def test_concurrent_idle_sync_really_aligns_each_to_its_own_base(tmp_path):
+    # The REAL _sync_idle_worktrees_to_base (not mocked): after both base branches gain
+    # commits out of band, each idle worktree must pick up ITS OWN base's commit and
+    # never the other's.
+    main = _init_repo(tmp_path)
+    base = main.current_branch()
+    main.create_branch("dev", base)
+    a, _, aw = _real_session(main, "sessA", base)
+    b, _, bw = _real_session(main, "sessB", "dev")
+    # Both sessions are idle and detached at their base (no own work yet).
+    aw.switch_detach(base)
+    bw.switch_detach("dev")
+    runner = _concurrent_runner(main, [a, b])
+
+    main.switch("dev")
+    _commit(main, "dev2.txt", "d2\n", "dev advance")
+    main.switch(base)
+    _commit(main, "main2.txt", "m2\n", "main advance")
+
+    runner.active = a
+    runner._sync_idle_worktrees_to_base()
+
+    assert (aw.repo / "main2.txt").exists() and not (aw.repo / "dev2.txt").exists()
+    assert (bw.repo / "dev2.txt").exists() and not (bw.repo / "main2.txt").exists()
+
+
+def test_concurrent_conflict_on_shared_base_detected_and_base_untouched(tmp_path):
+    # Two sessions on the SAME base with conflicting edits: the first integrates cleanly,
+    # the second is detected as a conflict and the base is left untouched (the merge is
+    # backed out, worktree clean).
+    main = _init_repo(tmp_path)
+    base = main.current_branch()
+    main.create_branch("dev", base)
+    c, _, cw = _real_session(main, "sessC", "dev")
+    d, _, dw = _real_session(main, "sessD", "dev")
+    runner = _concurrent_runner(main, [c, d])
+
+    _commit(cw, "shared.txt", "C version\n", "<aGiTrack> C")
+    _commit(dw, "shared.txt", "D version\n", "<aGiTrack> D")
+    runner.active = c
+    assert runner._integrate_turn_or_conflict() == "integrated"
+    dev_head = main.rev_parse("dev")
+
+    runner.active = d
+    assert runner._integrate_turn_or_conflict() == "conflict"
+    assert main.rev_parse("dev") == dev_head  # base untouched by the conflicting turn
+    assert not dw.merge_in_progress()  # the conflicted merge was backed out
+
+
+def test_concurrent_retarget_flushes_old_base_then_future_work_lands_on_new(tmp_path):
+    # Retargeting a session: its pending work flushes into the OLD branch, and a later
+    # commit integrates into the NEW branch — never leaking across.
+    main = _init_repo(tmp_path)
+    base = main.current_branch()
+    main.create_branch("feature", base)
+    a, _, aw = _real_session(main, "sessA", base)
+    runner = _concurrent_runner(main, [a])
+    runner.active = a
+
+    _commit(aw, "a.txt", "work\n", "<aGiTrack> A")
+    assert runner._retarget_active_session("feature") is True
+    assert runner._base_branch == "feature" and a.state.merge_branch == "feature"
+    assert (main.repo / "a.txt").exists()  # pending work flushed into the OLD base
+
+    # New work after the retarget integrates into feature, not main.
+    aw.switch(WorktreeManager(main).turn_branch("sessA", 2, backend="test"), create=True)
+    _commit(aw, "a2.txt", "feature work\n", "<aGiTrack> A more")
+    runner._integrate_session_turn()
+    main.switch("feature")
+    feature_files = {p.name for p in main.repo.iterdir() if p.is_file()}
+    main.switch(base)
+    assert "a2.txt" in feature_files
+    assert not (main.repo / "a2.txt").exists()  # never leaked back into main
+
+
 def test_repoint_current_to_base_detaches_at_new_base(tmp_path):
     main = _init_repo(tmp_path)
     base = main.current_branch()
