@@ -171,19 +171,23 @@ class SharedSessionStore:
 
     # --- writing -----------------------------------------------------------
 
-    def _commit(self, entries: dict[str, str], message: str, *, reclaim: bool = True) -> str | None:
-        """Rewrite the ref to a new orphan commit of *entries*. Returns the PREVIOUS
-        ref sha (the now-orphaned snapshot), so a caller that pushes can keep it as the
-        push's delta base and reclaim it afterwards.
+    def _commit(
+        self, entries: dict[str, str], message: str, *, reclaim: bool = True, ref: str | None = None
+    ) -> str | None:
+        """Rewrite ``ref`` (default the current ref) to a new orphan commit of
+        *entries*. Returns the PREVIOUS ref sha (the now-orphaned snapshot), so a
+        caller that pushes can keep it as the push's delta base and reclaim it
+        afterwards.
 
         ``reclaim`` (default) deletes the orphaned previous snapshot's objects right
         away — large transcript blobs shouldn't linger until git's auto-gc (#55). Pass
         ``reclaim=False`` when the previous version must survive a little longer (a
         publish keeps it as the ``git push`` delta base, then reclaims it post-push)."""
-        old = self.repo.ref_sha(self.ref)
+        ref = ref or self.ref
+        old = self.repo.ref_sha(ref)
         tree = self.repo.write_tree_from(entries)
         sha = self.repo.commit_tree_orphan(tree, message)
-        self.repo.update_ref(self.ref, sha)
+        self.repo.update_ref(ref, sha)
         if reclaim and old and old != sha:
             self.repo.delete_orphaned_objects(old)
         return old if old != sha else None
@@ -303,21 +307,40 @@ class SharedSessionStore:
         threading.Thread(target=worker, daemon=True, name="agit-shared-fetch-bg").start()
 
     def unshare(self, github_id: str, name: str) -> PublishResult:
-        """Remove one of the contributor's own shared sessions and push the
-        removal. Sync-then-rewrite-then-push, like :meth:`publish`."""
+        """Remove one of the contributor's own shared sessions and push the removal.
+        Sync-then-rewrite-then-push, like :meth:`publish`.
+
+        The entry is removed from BOTH the current ref and the legacy
+        ``refs/agit/shared-sessions`` — a session shared before the aGiT → aGiTrack
+        rename lives only in the legacy ref, so rewriting the current ref alone would
+        leave it visible (it would keep surfacing through :meth:`entries`)."""
         gid, nm = slug(github_id), slug(name)
         base = f"{self._prefix()}{gid}/{nm}/"
         remote = self.repo.remote_exists()
-        if remote:
-            self._fetch_current()
-        old = self.repo.ref_sha(self.ref)
-        kept = {k: v for k, v in self.repo.read_tree_paths(self.ref).items() if not k.startswith(base)}
-        self._commit(kept, f"agit: unshare session {gid}/{nm}")
+        pushed_any = False
+        errors: list[str] = []
+        for ref in (self.ref, LEGACY_REF):
+            if ref != self.ref and not self.repo.ref_exists(ref):
+                continue
+            if remote:
+                # Filtered sync is enough: rewriting only re-references existing blob
+                # SHAs (already on the remote), so the large transcripts need not be local.
+                self.repo.fetch_ref(f"+{ref}:{ref}", filter_blobs="blob:limit=16k")
+            paths = self.repo.read_tree_paths(ref)
+            if not any(k.startswith(base) for k in paths):
+                continue  # this ref doesn't hold the entry
+            old = self.repo.ref_sha(ref)
+            kept = {k: v for k, v in paths.items() if not k.startswith(base)}
+            self._commit(kept, f"agitrack: unshare session {gid}/{nm}", ref=ref)
+            if remote:
+                lease = f"{ref}:{old}" if old else None
+                ok, err = self.repo.push_ref(f"{ref}:{ref}", force_with_lease=lease)
+                pushed_any = pushed_any or ok
+                if not ok and err.strip():
+                    errors.append(err.strip())
         if not remote:
             return PublishResult(remote=False, pushed=False)
-        lease = f"{self.ref}:{old}" if old else None
-        ok, err = self.repo.push_ref(f"{self.ref}:{self.ref}", force_with_lease=lease)
-        return PublishResult(remote=True, pushed=ok, error="" if ok else err.strip())
+        return PublishResult(remote=True, pushed=pushed_any, error="; ".join(errors))
 
     def publish(
         self,

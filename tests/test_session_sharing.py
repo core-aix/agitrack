@@ -736,6 +736,24 @@ def test_unshare_removes_only_that_entry(tmp_path):
     assert [e.name for e in store.entries()] == ["keep"]
 
 
+def test_unshare_removes_a_session_living_in_the_legacy_ref(tmp_path):
+    # A session shared before the aGiT -> aGiTrack rename lives only under the legacy
+    # ref. Unsharing must remove it there too, or it keeps surfacing in entries().
+    from agitrack.sessions.store import LEGACY_REF
+
+    repo = _init_repo(tmp_path)
+    # Seed an entry directly into the legacy ref (as an old aGiT client would have).
+    legacy = SharedSessionStore(repo, ref=LEGACY_REF)
+    legacy._add_session("alice", "old-sess", "t", _manifest("old-sess", session_id="o", updated=1))
+
+    store = SharedSessionStore(repo)  # current-ref store, as the running app uses
+    assert [e.name for e in store.entries()] == ["old-sess"]  # visible via the legacy merge
+
+    store.unshare("alice", "old-sess")
+    assert store.entries() == []  # gone from the legacy ref, not just the current one
+    assert not any(k.startswith(store._prefix()) for k in repo.read_tree_paths(LEGACY_REF))
+
+
 def test_update_deletes_old_version_objects_immediately(tmp_path):
     import subprocess as sp
 
