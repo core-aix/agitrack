@@ -503,6 +503,7 @@ class ProxyRunner:
             _integration if _integration is not None else IntegrationService(repo, None, menu_label=self._menu_label())
         )
         self._base_branch: str | None = None  # integration target branch (set at startup)
+        self._repo_dir_branch: str | None = None  # branch checked out in the repo dir (for the status bar)
         self._integration_paused = False  # set when the base repo is switched off _base_branch out-of-band
         self._base_drift_check_at = 0.0
         # The drifted branch the user has already been prompted about, so the
@@ -720,6 +721,7 @@ class ProxyRunner:
                 "management_lock": None,
                 "base_repo": None,
                 "_base_branch": None,
+                "_repo_dir_branch": None,
                 "_integration_paused": False,
                 "_drift_acknowledged_branch": None,
                 "_base_drift_check_at": 0.0,
@@ -832,6 +834,10 @@ class ProxyRunner:
         # branch is only advanced by integration, never edited by a live agent.
         self._base_branch = self.base_repo.current_branch()
         self._integration.base_branch = self._base_branch
+        # Cached branch checked out in the repo directory, refreshed by the drift
+        # poll. The status bar bolds a session's integration branch when it differs
+        # from this (e.g. after "keep integrating into X while the repo is on Y").
+        self._repo_dir_branch = self._base_branch
         self._cleanup_stale_state_on_startup()
         self._reload_user_declined()  # files the pre-agent flow left intentionally unstaged
         self._setup_base_merge_only_session()
@@ -1035,6 +1041,7 @@ class ProxyRunner:
             current = self.base_repo.current_branch()
         except Exception:
             return
+        self._repo_dir_branch = current  # keep the status bar's "current dir branch" fresh
         if current == self._base_branch:
             # Back on (or never left) the integration branch: clear drift state.
             if self._drift_acknowledged_branch is not None or self._integration_paused:
@@ -2373,7 +2380,11 @@ class ProxyRunner:
             if session is not self.active:
                 self._with_session(session, self._integrate_session_keeping_alive)
 
-    def _perform_base_switch(self, new_base: str) -> None:
+    def _perform_base_switch(self, new_base: str, *, checkout: bool = True) -> bool:
+        # Returns True on success. With ``checkout=False`` the base moves but the repo
+        # directory is left on its current branch (used when a new session targets a
+        # different branch): aGiTrack integrates into the not-checked-out base via
+        # fast-forward, exactly as the drift "keep integrating into X" path does.
         self._exiting = True  # suppress the conflict-resolve popup during integration
         self._set_message("Integrating session work before switching base…", seconds=30)
         self._render()
@@ -2391,23 +2402,42 @@ class ProxyRunner:
                 seconds=14.0,
             )
             self._render()
-            return
-        try:
-            self.base_repo.switch(new_base)
-        except Exception as error:
-            self._exiting = False
-            self._set_message(f"Could not switch base to '{new_base}': {error}", seconds=10.0)
-            self._render()
-            return
+            return False
+        if checkout:
+            try:
+                self.base_repo.switch(new_base)
+            except Exception as error:
+                self._exiting = False
+                self._set_message(f"Could not switch base to '{new_base}': {error}", seconds=10.0)
+                self._render()
+                return False
         self._base_branch = new_base
         self._integration.base_branch = new_base
         self._repoint_all_sessions_to_base()
         self._exiting = False
-        self._set_message(
-            f"Base switched to '{new_base}'. Existing sessions keep running and now merge into it.",
-            seconds=8.0,
-        )
+        if checkout:
+            self._repo_dir_branch = new_base  # repo dir is now on the new base
+            self._drift_acknowledged_branch = None
+            self._set_message(
+                f"Base switched to '{new_base}'. Existing sessions keep running and now merge into it.",
+                seconds=8.0,
+            )
+        else:
+            # The base now differs from the repo dir; pre-acknowledge so the drift
+            # check doesn't prompt, and the status bar bolds the integration branch.
+            current: str | None = self._repo_dir_branch
+            try:
+                current = self.base_repo.current_branch()
+            except Exception:
+                pass
+            self._repo_dir_branch = current
+            self._drift_acknowledged_branch = current if current != new_base else None
+            self._set_message(
+                f"Sessions now integrate into '{new_base}' (the repo directory stays on '{current}').",
+                seconds=8.0,
+            )
         self._render()
+        return True
 
     def _repoint_current_to_base(self) -> None:
         # Detach the current session's worktree at the new base so its next turn
@@ -3909,7 +3939,35 @@ class ProxyRunner:
             self._set_message("Cancelled.")
             self._render()
             return
+        base = self._prompt_new_session_base()
+        if base is None:
+            self._set_message("Cancelled.")
+            self._render()
+            return
+        if base != self._base_branch:
+            # Re-target onto the chosen branch WITHOUT checking it out, so the new
+            # session (and the others, which share the base) integrate into it while
+            # the repo directory stays where it is. Abort if existing work is blocked.
+            if not self._perform_base_switch(base, checkout=False):
+                return
         self._new_session(name)
+
+    def _prompt_new_session_base(self) -> str | None:
+        # Which branch the new session integrates into. Defaults to the current base;
+        # picking a different one lets the session work toward another branch without
+        # checking it out in the repo directory. Returns the chosen branch, or None on
+        # cancel; returns the current base unchanged when there's no choice to offer.
+        if self.worktree is None or self._base_branch is None:
+            return self._base_branch  # branch selection only applies to worktree sessions
+        others = self._base_switch_candidates()  # real branches other than the current base
+        if not others:
+            return self._base_branch
+        default_label = f"{self._base_branch}  (current — default)"
+        options = [default_label, *others]
+        choice = self._select_popup("Integrate the new session into which branch?", options)
+        if choice is None:
+            return None
+        return self._base_branch if choice == default_label else choice
 
     def _stop_session_menu(self) -> None:
         options = [self._session_name(index) for index in range(len(self.sessions))]
@@ -5093,6 +5151,7 @@ class ProxyRunner:
             backend_name=self.backend.name,
             session_id=self.state.backend_session_id,
             base_branch=self._base_branch,
+            current_dir_branch=self._repo_dir_branch,
             worktree=self.worktree,
             scroll_back=self.scroll_back,
             user_declined=self._user_declined,

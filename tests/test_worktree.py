@@ -545,6 +545,50 @@ def test_base_switch_keeps_session_alive(tmp_path):
     assert terminated == []  # the backend child was never killed
 
 
+def test_base_switch_without_checkout_keeps_repo_dir_branch(tmp_path):
+    # Used when a new session targets a different branch: the base moves but the
+    # repo directory is left where it is, so sessions integrate into the
+    # not-checked-out branch (and the status bar bolds it).
+    main = _init_repo(tmp_path)
+    base = main.current_branch()
+    main.create_branch("feature", base)
+    info, work = _make_session(main, "s1", base)
+
+    runner = _integration_runner(main, work, base, "s1")
+    runner.worktree = info
+    runner.sessions = [runner.active]
+    runner._commit_latest_turn_sync = lambda: None
+
+    ok = runner._perform_base_switch("feature", checkout=False)
+
+    assert ok is True
+    assert runner._base_branch == "feature"  # integration target moved
+    assert main.current_branch() == base  # repo directory NOT switched
+    assert runner._repo_dir_branch == base
+    assert runner._drift_acknowledged_branch == base  # pre-acknowledged ⇒ no drift prompt
+
+
+def test_prompt_new_session_base_defaults_to_current_or_picks_another(tmp_path):
+    main = _init_repo(tmp_path)
+    base = main.current_branch()
+    main.create_branch("feature", base)
+    info, work = _make_session(main, "s1", base)
+    runner = _integration_runner(main, work, base, "s1")
+    runner.worktree = info
+
+    # Choosing the first option keeps the current base.
+    runner._select_popup = lambda title, options: options[0]
+    assert runner._prompt_new_session_base() == base
+
+    # Choosing another branch returns it (the new session integrates into it).
+    runner._select_popup = lambda title, options: "feature"
+    assert runner._prompt_new_session_base() == "feature"
+
+    # Cancelling the picker returns None.
+    runner._select_popup = lambda title, options: None
+    assert runner._prompt_new_session_base() is None
+
+
 def test_log_range_lists_commits(tmp_path):
     repo = _init_repo(tmp_path)
     base_sha = repo.rev_parse("HEAD")

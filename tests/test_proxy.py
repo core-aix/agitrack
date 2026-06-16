@@ -1687,6 +1687,34 @@ def test_status_line_shows_base_branch(tmp_path):
     line = runner._status_line()
     assert "session-1" in line
     assert "→ main" in line  # the branch this session's work merges into
+    # Repo dir is on the same branch ⇒ the branch is NOT bolded.
+    assert "\x1b[1mmain" not in line
+
+
+def test_status_line_bolds_base_branch_when_repo_dir_on_another_branch(tmp_path):
+    import subprocess
+
+    from agitrack.config import AgitrackState
+    from agitrack.git import GitRepo
+
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    state = AgitrackState(tmp_path)
+    state.backend_session_id = "abcdef123456"
+    runner = make_runner(
+        repo=GitRepo(tmp_path),
+        state=state,
+        name="session-1",
+        backend=type("B", (), {"name": "claude"})(),
+        _base_branch="feature-x",
+        worktree=object(),
+        scroll_back=0,
+        cols=120,
+    )
+    runner._repo_dir_branch = "main"  # the repo directory is checked out elsewhere
+
+    line = runner._status_line()
+    # The integration branch differs from the repo dir's branch ⇒ it's bolded.
+    assert "→ \x1b[1mfeature-x\x1b[22m" in line
 
 
 def test_inject_prompt_defers_enter_until_text_settles():
