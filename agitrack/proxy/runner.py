@@ -354,7 +354,9 @@ class ProxyRunner:
     )
     SHARED_FETCH_TIMEOUT = 30.0  # cap the shared-session listing fetch so a slow/offline remote can't hang the menu
     RESUME_FETCH_TIMEOUT = 300.0  # cap the full-transcript fetch when resuming a shared session; generous since the user can cancel manually
-    SHARE_PUSH_TIMEOUT = 120.0  # cap a manual share's push to origin; the user can also press Esc to cancel it
+    SHARE_PUSH_TIMEOUT = (
+        120.0  # cap a background share/update push to origin so a stalled remote can't strand the worker thread
+    )
 
     def __init__(
         self,
@@ -2784,39 +2786,37 @@ class ProxyRunner:
             self._render()
             return
         display = payload["display"]
-        self._set_message(f"Sharing '{display}' — pushing to origin…   press Esc to cancel", seconds=600)
-        self._render()
-        outcome = self._publish_with_cancel(
-            self._shared_store(),
-            github_id=payload["owner"],
-            name=payload["name"],
-            transcript=payload["redacted"],
-            manifest=payload["manifest"],
-            prune_gid=payload["sharer"],
-        )
-        if outcome.get("cancelled"):
-            # The push was stopped (Esc) or timed out — the git subprocess was killed,
-            # so nothing reached origin. Make the non-result unmistakable and hold the
-            # notice until the user acknowledges it with a key (a mouse move won't).
-            self._await_keypress(
-                f"'{display}' was NOT shared — the push to origin was cancelled. Press any key to continue."
+        store = self._shared_store()
+
+        def op():
+            return store.publish(
+                github_id=payload["owner"],
+                name=payload["name"],
+                transcript=payload["redacted"],
+                manifest=payload["manifest"],
+                prune_gid=payload["sharer"],
+                timeout=self.SHARE_PUSH_TIMEOUT,
             )
-            return
-        if "error" in outcome:
-            self._set_message(f"Could not share session: {outcome['error']}", seconds=10.0)
-            self._render()
-            return
-        result = outcome["result"]
-        self._auto_share_hash[session_id] = payload["digest"]  # don't immediately re-push the same content
-        # Record the lineage origin so a later re-share (here or on another machine)
-        # updates this same entry and keeps accumulating contributors.
-        self._user_state().set_shared_origin(
-            session_id, owner=payload["owner"], name=payload["name"], contributors=payload["contributors"]
-        )
-        self._set_message(self._share_outcome_message(result, display), seconds=12.0)
-        self._render()
-        # Offer to keep it current automatically (the opt-in covers future pushes).
-        if result.pushed and not self._session_auto_shared(session_id):
+
+        def outcome(box) -> str:
+            if "error" in box:
+                return f"Could not share session: {box['error']}"
+            result = box["result"]
+            self._auto_share_hash[session_id] = payload["digest"]  # don't immediately re-push the same content
+            # Record the lineage origin so a later re-share (here or on another machine)
+            # updates this same entry and keeps accumulating contributors.
+            self._user_state().set_shared_origin(
+                session_id, owner=payload["owner"], name=payload["name"], contributors=payload["contributors"]
+            )
+            return self._share_outcome_message(result, display)
+
+        # The push to origin runs in the BACKGROUND so the terminal never freezes; its
+        # result lands as a notice. Only the exit-path share blocks (it must finish
+        # before the process quits, since daemon threads die with it).
+        self._run_share_op_async(f"share:{display}", f"Sharing '{display}' — pushing to origin…", op, outcome)
+        # Offer to keep it current automatically. This is a quick interactive prompt
+        # (not a network wait), shown while the push proceeds in the background.
+        if not self._session_auto_shared(session_id):
             keep = self._select_popup(
                 "Keep this shared session up to date automatically?\n"
                 "New turns will be pushed to the shared copy as the conversation grows.",
@@ -2829,42 +2829,6 @@ class ProxyRunner:
                     seconds=8.0,
                 )
                 self._render()
-
-    def _publish_with_cancel(
-        self, store, *, github_id: str, name: str, transcript: str, manifest: dict, prune_gid: str | None = None
-    ) -> dict:
-        """Push a manual share on a worker thread while keeping the UI alive and
-        letting the user press Esc to cancel a slow/stalled upload. Returns one of
-        ``{"result": PublishResult}``, ``{"cancelled": True}``, or ``{"error": str}``.
-        On cancel the underlying ``git push`` subprocess is killed, not merely
-        abandoned, so the upload truly stops."""
-        cancel = threading.Event()
-        box: dict = {}
-
-        def worker() -> None:
-            try:
-                box["result"] = store.publish(
-                    github_id=github_id,
-                    name=name,
-                    transcript=transcript,
-                    manifest=manifest,
-                    prune_gid=prune_gid,
-                    timeout=self.SHARE_PUSH_TIMEOUT,
-                    cancel=cancel,
-                )
-            except Exception as error:
-                if not cancel.is_set():
-                    box["error"] = str(error)
-
-        thread = threading.Thread(target=worker, daemon=True, name="agit-share-push")
-        thread.start()
-        status = self._drain_pty_until_done_or_esc(thread, deadline=time.monotonic() + self.SHARE_PUSH_TIMEOUT + 2.0)
-        if status != "done":
-            cancel.set()  # kill the push subprocess now — don't leave it running
-            return {"cancelled": True}
-        if "error" in box:
-            return {"error": box["error"]}
-        return {"result": box["result"]}
 
     def _share_payload(self, session_id: str):
         """Read + redact the session transcript and build its manifest (no network,
@@ -3025,32 +2989,29 @@ class ProxyRunner:
             "transcript_rows": _shared_transcript_rows(redacted),
         }
         display = f"{'+'.join(contributors)}/{entry.name}"
-        # Same UX as the initial share: show a "pushing to origin…" notice while the
-        # (potentially slow) push runs, and let the user press Esc to cancel it.
-        self._set_message(f"Updating '{display}' — pushing to origin…   press Esc to cancel", seconds=600)
-        self._render()
-        outcome = self._publish_with_cancel(
-            self._shared_store(),
-            github_id=entry.github_id,
-            name=entry.name,
-            transcript=redacted,
-            manifest=manifest,
-            prune_gid=login,
-        )
-        if outcome.get("cancelled"):
-            self._await_keypress(
-                f"'{display}' was NOT updated — the push to origin was cancelled. Press any key to continue."
+        store = self._shared_store()
+
+        def op():
+            return store.publish(
+                github_id=entry.github_id,
+                name=entry.name,
+                transcript=redacted,
+                manifest=manifest,
+                prune_gid=login,
+                timeout=self.SHARE_PUSH_TIMEOUT,
             )
-            return
-        if "error" in outcome:
-            self._set_message(f"Could not update {display}: {outcome['error']}", seconds=10.0)
-            self._render()
-            return
-        result = outcome["result"]
-        if sid:
-            self._auto_share_hash[sid] = manifest["content_hash"]
-        self._set_message(self._share_outcome_message(result, display), seconds=12.0)
-        self._render()
+
+        def outcome(box) -> str:
+            if "error" in box:
+                return f"Could not update {display}: {box['error']}"
+            result = box["result"]
+            if sid:
+                self._auto_share_hash[sid] = manifest["content_hash"]
+            return self._share_outcome_message(result, display)
+
+        # Push in the BACKGROUND (same as the initial share) so the terminal never
+        # freezes; a progress notice shows now, the result lands when it finishes.
+        self._run_share_op_async(f"update:{display}", f"Updating '{display}' — pushing to origin…", op, outcome)
 
     def _unshare_entry(self, entry) -> None:
         # Unsharing is a one-way, fire-and-forget network op with no follow-up, and the
