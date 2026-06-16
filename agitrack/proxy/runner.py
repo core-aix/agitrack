@@ -197,7 +197,6 @@ class ProxyInput:
         "session",
         "agent-backend",
         "summarizer",
-        "git-base-branch",
         "git-unstaged",
         "git-user-commit",
         "update",
@@ -2338,24 +2337,6 @@ class ProxyRunner:
         choice = self._select_popup(title, options)
         return None if choice is None else label_for.get(choice, choice)
 
-    def _switch_base_command(self, arg: str = "") -> None:
-        # `git-base-branch`: change the ACTIVE session's merge destination (per session;
-        # the repo directory and other sessions are untouched).
-        if self.worktree is None or self._base_branch is None:
-            self._set_message("Changing the merge branch is unavailable for this session.")
-            self._render()
-            return
-        target = arg.strip() or self._prompt_merge_branch(f"Merge '{self.name}' into which branch?", self._base_branch)
-        if not target:
-            self._set_message("Cancelled.")
-            self._render()
-            return
-        if target == self._base_branch:
-            self._set_message(f"'{self.name}' already merges into '{target}'.")
-            self._render()
-            return
-        self._retarget_active_session(target)
-
     def _change_session_merge_branch_menu(self) -> None:
         # Session-config entry: change the merge destination of ANY session.
         if not self.sessions:
@@ -3900,32 +3881,89 @@ class ProxyRunner:
             self._set_message("Cancelled.")
             self._render()
             return
-        base = self._prompt_new_session_base()
+        # Fork the current conversation, or start a blank one?
+        fork = self._prompt_fork_or_blank()
+        if fork is None:
+            self._set_message("Cancelled.")
+            self._render()
+            return
+        # A fork continues the current session's work, so default its merge branch to
+        # the current session's; a blank session defaults to the repo directory's.
+        base = self._prompt_new_session_base(default=self._base_branch if fork else None)
         if base is None:
             self._set_message("Cancelled.")
             self._render()
             return
         # The new session merges into its OWN branch — independent of the other
         # sessions and of the branch checked out in the repo directory.
+        if fork and self._fork_current_session(name, base_branch=base):
+            return
+        if fork:
+            self._set_message("Couldn't fork the current session; starting a blank one instead.", seconds=8.0)
         self._new_session(name, base_branch=base)
+
+    def _can_fork_active(self) -> bool:
+        # A fork copies the active conversation, so it needs a portable transcript
+        # (the same capability session sharing relies on) and a session to copy.
+        return bool(getattr(self.state, "backend_session_id", None)) and getattr(
+            self.backend, "supports_session_sharing", False
+        )
+
+    def _prompt_fork_or_blank(self) -> bool | None:
+        # True = fork the current session, False = blank, None = cancel. No prompt
+        # (blank) when there's no live conversation to fork.
+        if not self._can_fork_active():
+            return False
+        choice = self._select_popup(
+            "Start the new session as…",
+            [
+                "Blank session — a fresh conversation",
+                f"Fork '{self.name}' — copy this conversation (under a new id)",
+            ],
+        )
+        if choice is None:
+            return None
+        return choice.startswith("Fork")
+
+    def _fork_current_session(self, name: str, *, base_branch: str | None = None) -> bool:
+        # Duplicate the active conversation under a FRESH backend id, so the fork runs
+        # independently and never clashes with the original. Returns False if forking
+        # isn't possible (the caller then starts a blank session).
+        agent = self.backend
+        src_id = self.state.backend_session_id
+        if not src_id or not getattr(agent, "supports_session_sharing", False):
+            return False
+        transcript = agent.export_session_raw(self.base_repo.repo, src_id) or agent.export_session_raw(
+            self.repo.repo, src_id
+        )
+        new_id = getattr(agent, "new_import_id", lambda: None)() or agent.new_session_id()
+        if not transcript or not new_id:
+            return False
+        # Install the copied transcript under the new id (does not touch the original),
+        # then start a session resuming it — same path as a "keep both" shared resume.
+        if not agent.import_shared_session(self.base_repo.repo, src_id, transcript, as_id=new_id):
+            return False
+        self._new_session(name, resume_session_id=new_id, backend=self.state.backend, base_branch=base_branch)
+        return True
 
     def _merge_target_default(self) -> str | None:
         # The default merge destination for a new session: the branch checked out in
         # the repo directory ("the base branch").
         return self._repo_dir_branch or (self.base_repo.current_branch() if self.base_repo is not None else None)
 
-    def _prompt_new_session_base(self) -> str | None:
-        # Which branch the new session merges into. Defaults to the repo directory's
-        # branch ("the base branch"); picking a different one lets the session work
-        # toward another branch without checking it out. Returns the chosen branch, or
-        # None on cancel; returns the default when there's nothing else to offer.
-        default_branch = self._merge_target_default()
+    def _prompt_new_session_base(self, *, default: str | None = None) -> str | None:
+        # Which branch the new session merges into. Defaults to ``default`` (a fork's
+        # current branch) or the repo directory's branch ("the base branch"); picking
+        # another lets the session work toward a different branch without checking it
+        # out. Returns the chosen branch, None on cancel, or the default when there's
+        # nothing else to offer.
+        default_branch = default or self._merge_target_default()
         if not self._use_worktrees or default_branch is None:
             return default_branch
         others = [b for b in self.base_repo.list_branches() if b != default_branch and not is_managed_branch(b)]
         if not others:
             return default_branch
-        default_label = f"{default_branch}  (base branch — default)"
+        default_label = f"{default_branch}  (default)"
         options = [default_label, *others]
         choice = self._select_popup("Merge this session's changes into which branch?", options)
         if choice is None:
@@ -5211,9 +5249,6 @@ class ProxyRunner:
             return
         elif name == "summarizer":
             self._handle_summarizer_command(arg)
-            return
-        elif name == "git-base-branch":
-            self._switch_base_command(arg)
             return
         elif name == "update":
             self._handle_update_command()
