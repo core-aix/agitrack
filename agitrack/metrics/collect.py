@@ -950,11 +950,9 @@ def _efficiency_suggestions(stats: list[CommitStat]) -> list[Suggestion]:
     loops = _detect_loops(stats)
     suggestions: list[Suggestion] = []
     for loop in loops:
-        where = (
-            f"within commit {loop.shas[0]}"
-            if loop.within_commit
-            else f"across {len(loop.shas)} turns ({loop.shas[0]}..{loop.shas[-1]})"
-        )
+        # The commit SHAs render as clickable chips alongside the detail, so the
+        # text describes the pattern without burying SHAs in prose.
+        where = "within one turn" if loop.within_commit else f"across {len(loop.shas)} turns"
         suggestions.append(
             Suggestion(
                 kind="repeat",
@@ -987,7 +985,7 @@ def _efficiency_suggestions(stats: list[CommitStat]) -> list[Suggestion]:
             suggestions.append(
                 Suggestion(
                     kind="costly",
-                    detail=f"Turn {s.short} spent {s.tokens['output']:,} output tokens for {lines:,} changed lines — a candidate to narrow scope.",
+                    detail=f"Spent {s.tokens['output']:,} output tokens for {lines:,} changed lines — a candidate to narrow scope.",
                     shas=[s.short],
                     output_tokens=s.tokens["output"],
                 )

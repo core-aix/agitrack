@@ -235,10 +235,24 @@ def _aggregates(fd: Dashboard) -> dict:
         "by_backend": fd.by_backend,
         "by_model": fd.by_model,
         "by_committer": fd.by_author,
-        "suggestions": [
-            {"kind": s.kind, "detail": s.detail, "shas": s.shas, "output": s.output_tokens} for s in fd.suggestions
-        ],
+        "suggestions": _suggestion_payload(fd),
     }
+
+
+def _suggestion_payload(fd: Dashboard) -> list[dict]:
+    # Map each short SHA to its GitHub commit URL (when the repo has a GitHub remote)
+    # so the dashboard can render a suggestion's SHAs as clickable links.
+    sha_url = {stat.short: fd.commit_base + stat.sha for stat in fd.stats} if fd.commit_base else {}
+    return [
+        {
+            "kind": s.kind,
+            "detail": s.detail,
+            "shas": s.shas,
+            "urls": [sha_url.get(sha, "") for sha in s.shas],
+            "output": s.output_tokens,
+        }
+        for s in fd.suggestions
+    ]
 
 
 # Kinds whose LINES count as tracked-AI in the time series — kept in step with
@@ -618,12 +632,18 @@ h2.section::before{content:"# ";color:var(--amber)}
 .split{display:grid;grid-template-columns:1fr 1fr;gap:14px}
 @media (max-width:760px){.split{grid-template-columns:1fr}.row{grid-template-columns:1fr;gap:6px}}
 
-/* ---- loops ---- */
+/* ---- efficiency suggestions ---- */
 .loop{padding:13px 18px;border-bottom:1px solid var(--line)}
 .loop:last-child{border-bottom:none}
 .loop .where{color:var(--red)}
 .loop .q{color:var(--fg);font-style:italic;word-break:break-word}
 .loop .cost{color:var(--amber);font-size:12.5px}
+/* Clickable commit SHA chips in a suggestion (GitHub link or jump-to-log). */
+.sharefs .sharef{font-family:var(--mono);font-size:12.5px;color:var(--phosphor);background:rgba(61,255,160,.08);
+  border:1px solid var(--phosphor-dim);border-radius:3px;padding:1px 6px;margin-right:4px;cursor:pointer;white-space:nowrap}
+.sharefs a.sharef:hover,.sharefs span.sharef:hover{color:var(--ink);background:var(--phosphor)}
+@keyframes flashrow{from{background:rgba(61,255,160,.28)}to{background:transparent}}
+.entry.flash{animation:flashrow 1.4s ease-out}
 
 /* ---- commit log rail ---- */
 .log{position:relative;padding-left:34px;margin-top:8px}
@@ -975,7 +995,16 @@ function renderAgg(){
   $("suggestions").innerHTML = (AGG.suggestions||[]).length
     ? AGG.suggestions.map(s => {
         const tag = s.kind === "repeat" ? "repeated prompt" : "costly turn";
+        // Each SHA is clickable: a GitHub link when the repo has a remote, else a
+        // chip that scrolls to and opens that commit in the log below.
+        const chips = (s.shas||[]).map((sha,i) => {
+          const url = (s.urls||[])[i];
+          return url
+            ? `<a class="sharef" href="${esc(url)}" target="_blank" rel="noopener" title="View ${esc(sha)} on GitHub">${esc(sha)}</a>`
+            : `<span class="sharef" data-sha="${esc(sha)}" title="Show ${esc(sha)} in the commit log">${esc(sha)}</span>`;
+        }).join(" ");
         return `<div class="loop"><span class="where">${esc(tag)}</span> — <span class="q">${esc(s.detail)}</span>`+
+          (chips?` <span class="sharefs">${chips}</span>`:"")+
           (s.output?` <span class="cost">${fmt(s.output)} output tokens</span>`:"")+`</div>`;
       }).join("")
     : `<div class="empty">nothing notable — no repeated prompts or costly low-yield turns</div>`;
@@ -1219,6 +1248,19 @@ function toggleDetail(i){
   }
 }
 
+// Scroll the commit log into view and, when the SHA is on the loaded page, open
+// and briefly highlight that entry. Used by suggestion SHA chips on repos with no
+// GitHub remote (where the chip can't be a link).
+function jumpToCommit(sha){
+  $("commitlog").scrollIntoView({behavior:"smooth", block:"start"});
+  const i = LOG_ENTRIES.findIndex(c => c.short === sha);
+  if(i < 0) return;
+  const detail = $("detail-"+i);
+  if(detail && detail.hidden) toggleDetail(i);
+  const row = document.querySelector(`#commitlog .entry[data-i="${i}"]`);
+  if(row){ row.classList.add("flash"); setTimeout(() => row.classList.remove("flash"), 1400); }
+}
+
 function fillSelect(id, values, allLabel, keep){
   const sel = $(id);
   sel.innerHTML = `<option value="">${allLabel}</option>` +
@@ -1337,6 +1379,12 @@ function init(){
     if(e.target.closest("a") || e.target.closest(".detail") || e.target.closest(".pager")) return;
     const entry = e.target.closest(".entry");
     if(entry) toggleDetail(+entry.dataset.i);
+  });
+  // A suggestion's non-link SHA chip jumps to that commit in the log (the link
+  // chips are plain <a> and navigate on their own).
+  $("suggestions").addEventListener("click", e => {
+    const chip = e.target.closest(".sharef[data-sha]");
+    if(chip) jumpToCommit(chip.dataset.sha);
   });
   // Toggle a series on/off from the legend; redraw the plot in place.
   $("ts-legend").addEventListener("click", e => {
