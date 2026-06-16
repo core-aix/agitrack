@@ -333,6 +333,11 @@ class ProxyInput:
 
 
 class ProxyRunner:
+    # The active session's integration target. It is a Session.FIELDS entry exposed
+    # via a custom property added at the bottom of this module; declared here so mypy
+    # knows its type (the property is attached dynamically).
+    _base_branch: "str | None"
+
     # Defaults for the tunable timings; overridden per-instance from the global
     # config in __init__ (see GlobalConfig.timings). Kept as class constants so
     # `self.X` still resolves for runners built via __new__ (tests).
@@ -502,13 +507,11 @@ class ProxyRunner:
         self._integration: IntegrationService = (
             _integration if _integration is not None else IntegrationService(repo, None, menu_label=self._menu_label())
         )
-        self._base_branch: str | None = None  # integration target branch (set at startup)
+        # _base_branch is per-session (a Session.FIELDS entry that delegates to the
+        # active session); each session integrates into its own branch.
         self._repo_dir_branch: str | None = None  # branch checked out in the repo dir (for the status bar)
-        self._integration_paused = False  # set when the base repo is switched off _base_branch out-of-band
+        self._integration_paused = False  # reserved; integration is no longer globally paused
         self._base_drift_check_at = 0.0
-        # The drifted branch the user has already been prompted about, so the
-        # drift prompt fires once per checkout rather than every drift check.
-        self._drift_acknowledged_branch: str | None = None
         self.turn = 0  # per-session transient-branch counter
         self.merge_ctx: MergeContext | None = None  # in-progress agent merge resolution
         self._pending_enter_at: float | None = None  # deferred submit of an injected prompt
@@ -627,6 +630,13 @@ class ProxyRunner:
     @active.setter
     def active(self, session: Session) -> None:
         self.__dict__["_active_session"] = session
+        # _base_branch is per-session; keep the single IntegrationService pointed at
+        # whichever session is active (including the temporary actives set by
+        # _with_session during background integration), so each merges into its own
+        # branch. Skipped until the service exists (early construction).
+        svc = self.__dict__.get("_integration_svc")
+        if svc is not None:
+            svc.base_branch = getattr(session, "_base_branch", None)
 
     @property
     def active_index(self) -> int:
@@ -653,7 +663,9 @@ class ProxyRunner:
         svc = self.__dict__.get("_integration_svc")
         if svc is None:
             base_repo = self.__dict__.get("base_repo")
-            base_branch = self.__dict__.get("_base_branch")
+            # _base_branch is per-session now; seed the service from the active session.
+            active = self.__dict__.get("_active_session")
+            base_branch = getattr(active, "_base_branch", None) if active is not None else None
             # Production always wires base_repo before _integration is read; this lazy
             # branch is only a safety net for partially-constructed/test runners, which
             # may build the service before base_repo is set, so pass it through as-is.
@@ -720,10 +732,8 @@ class ProxyRunner:
                 "color_mode": "truecolor",
                 "management_lock": None,
                 "base_repo": None,
-                "_base_branch": None,
                 "_repo_dir_branch": None,
                 "_integration_paused": False,
-                "_drift_acknowledged_branch": None,
                 "_base_drift_check_at": 0.0,
                 "_pending_enter_at": None,
                 "_pending_enter_fd": None,
@@ -1024,14 +1034,12 @@ class ProxyRunner:
             self._base_status_baseline = set()
 
     def _check_base_branch_drift(self) -> None:
-        # The user can `git checkout` another branch in the directory while aGiTrack is
-        # running. aGiTrack integrates session work into the branch it launched on
-        # (`self._base_branch`). When the directory drifts to another branch, ask
-        # the user once what to do: follow the directory (switch the base), keep
-        # integrating into the original (aGiTrack advances its ref directly — a safe
-        # fast-forward — even though it is no longer checked out), or pause.
-        # Sessions keep running and committing to their own branches throughout.
-        if self._base_branch is None:
+        # Poll the branch checked out in the repo directory. The status bar bolds a
+        # session whose merge target differs from it; when the directory MOVES to a
+        # branch that differs from the active session's merge target, ask where this
+        # session's changes should merge. (Each session has its own merge branch,
+        # independent of the directory's checkout and of the other sessions.)
+        if self.worktree is None or self._base_branch is None:
             return
         now = time.monotonic()
         if now - self._base_drift_check_at < self.BASE_DRIFT_CHECK_SECONDS:
@@ -1041,61 +1049,65 @@ class ProxyRunner:
             current = self.base_repo.current_branch()
         except Exception:
             return
+        if current == self._repo_dir_branch:
+            return  # the repo directory hasn't moved since the last poll
         self._repo_dir_branch = current  # keep the status bar's "current dir branch" fresh
-        if current == self._base_branch:
-            # Back on (or never left) the integration branch: clear drift state.
-            if self._drift_acknowledged_branch is not None or self._integration_paused:
-                resumed = self._integration_paused
-                self._drift_acknowledged_branch = None
-                self._integration_paused = False
-                if resumed:
-                    self._debug(f"base restored to '{self._base_branch}'; merging resumed")
-                    self._set_message(f"Repo back on '{self._base_branch}'; merging resumed.", seconds=6.0)
-                    self._render()
-            return
-        if current == self._drift_acknowledged_branch:
-            return  # already handled this drift; nothing to ask again
-        self._handle_base_drift(current)
+        self._prompt_merge_target_if_diverged()
 
-    def _handle_base_drift(self, current: str) -> None:
-        # Prompt once per drifted checkout. Mark it acknowledged up front so a
-        # dismissed prompt (or a switch that re-enters here) does not loop.
-        self._debug(f"base drift: repo on '{current}', integration target '{self._base_branch}'")
-        self._drift_acknowledged_branch = current
+    def _prompt_merge_target_if_diverged(self) -> None:
+        # When the active session merges into a different branch than the one checked
+        # out in the repo directory, ask which branch its changes should merge into.
+        # Called on a repo-directory branch change and on every session switch.
+        if self.worktree is None or self._base_branch is None or self._repo_dir_branch is None:
+            return
+        if self._base_branch == self._repo_dir_branch:
+            return
         choice = self._select_popup(
-            f"The repository was switched to '{current}', but aGiTrack integrates into "
-            f"'{self._base_branch}'. What should aGiTrack do?",
+            f"The repo directory is on '{self._repo_dir_branch}', but session '{self.name}' merges into "
+            f"'{self._base_branch}'. Where should this session's changes merge?",
             [
-                f"Switch base to '{current}' (re-point every session)",
-                f"Keep integrating into '{self._base_branch}'",
-                "Pause merging until I decide",
+                f"Merge into '{self._repo_dir_branch}' (the current directory branch)",
+                f"Keep merging into '{self._base_branch}'",
             ],
         )
-        if choice and choice.startswith("Switch base"):
-            self._drift_acknowledged_branch = None  # the switch resolves the drift
-            self._integration_paused = False
-            self._perform_base_switch(current)
-            return
-        if choice and choice.startswith("Keep integrating"):
-            # Keep landing turns on the original base. Care is taken in
-            # IntegrationService.advance_base_to: with the base no longer checked
-            # out it advances the ref only on a true fast-forward, never a force.
-            self._integration_paused = False
+        if choice and choice.startswith("Merge into '"):
+            self._retarget_active_session(self._repo_dir_branch)
+        else:
             self._set_message(
-                f"Keeping base '{self._base_branch}': aGiTrack integrates into it while the repo is on '{current}'.",
-                seconds=8.0,
+                f"'{self.name}' keeps merging into '{self._base_branch}' "
+                f"(the repo directory is on '{self._repo_dir_branch}').",
+                seconds=6.0,
             )
             self._render()
-            return
-        # Pause (chosen explicitly, or the prompt was dismissed): the safe
-        # default — nothing merges until the user switches back or picks a base.
-        self._integration_paused = True
-        self._set_message(
-            f"Merging PAUSED: repo is on '{current}', not '{self._base_branch}'. "
-            f"Switch base or resume via {self._menu_label()} → git-base-branch.",
-            seconds=12.0,
-        )
+
+    def _retarget_active_session(self, target: str) -> bool:
+        # Change the ACTIVE session's merge destination to `target` — per-session, so
+        # the other sessions and the repo directory are left untouched. Flush its
+        # pending work into the OLD target first, then re-point its worktree there.
+        if self.worktree is None or self._base_branch is None:
+            return False
+        if target == self._base_branch:
+            return True
+        old = self._base_branch
+        self._exiting = True  # suppress the conflict-resolve popup during the flush
+        self._set_message(f"Integrating '{self.name}' into '{old}' before re-targeting…", seconds=30)
         self._render()
+        self._integrate_session_keeping_alive()
+        if self._integration.session_unintegrated(self.repo):
+            self._exiting = False
+            self._set_message(
+                f"Can't change '{self.name}' merge target: it has unresolved work in '{old}'. "
+                f"Resolve it first ({self._menu_label()} → session).",
+                seconds=12.0,
+            )
+            self._render()
+            return False
+        self._base_branch = target  # the active session's new merge target (syncs the service)
+        self._repoint_current_to_base()
+        self._exiting = False
+        self._set_message(f"'{self.name}' now merges into '{target}'.", seconds=8.0)
+        self._render()
+        return True
 
     def _warn_if_base_edited(self) -> None:
         # Fallback for un-sandboxed platforms: detect the agent editing the base
@@ -2309,56 +2321,76 @@ class ProxyRunner:
 
     # --- switch base branch ---
 
-    def _base_switch_candidates(self) -> list[str]:
-        # User branches the base could switch to (never aGiTrack's transient ones).
-        return self._integration.base_switch_candidates()
+    def _prompt_merge_branch(self, title: str, current: str | None) -> str | None:
+        # Pick a real (non-managed) branch as a session's merge destination; the
+        # session's current target is marked. Returns the branch, or None on cancel.
+        branches = [b for b in self.base_repo.list_branches() if not is_managed_branch(b)]
+        if not branches:
+            self._set_message("No branches available to merge into.")
+            self._render()
+            return None
+        label_for: dict[str, str] = {}
+        options: list[str] = []
+        for branch in branches:
+            label = f"{branch}  (current target)" if branch == current else branch
+            label_for[label] = branch
+            options.append(label)
+        choice = self._select_popup(title, options)
+        return None if choice is None else label_for.get(choice, choice)
 
     def _switch_base_command(self, arg: str = "") -> None:
+        # `git-base-branch`: change the ACTIVE session's merge destination (per session;
+        # the repo directory and other sessions are untouched).
         if self.worktree is None or self._base_branch is None:
-            self._set_message("Base switching is unavailable for this session.")
+            self._set_message("Changing the merge branch is unavailable for this session.")
             self._render()
             return
-        candidates = self._base_switch_candidates()
-        if not candidates:
-            self._set_message("No other branches to switch the base to.")
-            self._render()
-            return
-        target = (
-            arg.strip()
-            if arg.strip() in candidates
-            else self._select_popup(f"Switch base from '{self._base_branch}' to:", candidates)
-        )
+        target = arg.strip() or self._prompt_merge_branch(f"Merge '{self.name}' into which branch?", self._base_branch)
         if not target:
             self._set_message("Cancelled.")
             self._render()
             return
-        confirm = self._select_popup(
-            f"Switch base to '{target}'? aGiTrack integrates every session's work into "
-            f"'{self._base_branch}' first, then re-points them at '{target}'.",
-            ["No, cancel", "Yes, switch base"],
-        )
-        if confirm != "Yes, switch base":
+        if target == self._base_branch:
+            self._set_message(f"'{self.name}' already merges into '{target}'.")
+            self._render()
+            return
+        self._retarget_active_session(target)
+
+    def _change_session_merge_branch_menu(self) -> None:
+        # Session-config entry: change the merge destination of ANY session.
+        if not self.sessions:
+            self._set_message("No sessions.")
+            self._render()
+            return
+        label_for: dict[str, int] = {}
+        options: list[str] = []
+        for index in range(len(self.sessions)):
+            target = getattr(self.sessions[index], "_base_branch", None) or "?"
+            label = f"{self._session_name(index)}  → {target}"
+            label_for[label] = index
+            options.append(label)
+        choice = self._select_popup("Change the merge branch of which session?", options)
+        if choice is None:
             self._set_message("Cancelled.")
             self._render()
             return
-        self._perform_base_switch(target)
-
-    def _session_unintegrated(self, repo) -> bool:
-        # True if a session still has work that did not make it into the base.
-        return self._integration.session_unintegrated(repo)
-
-    def _unintegrated_session_names(self) -> list[str]:
-        blocked: list[str] = []
-        repo: GitRepo | None
-        for index in range(len(self.sessions)):
-            if index == self.active_index:
-                repo, name = self.repo, self.name
-            else:
-                session = self.sessions[index]
-                repo, name = getattr(session, "repo", None), self._session_name(index)
-            if self._session_unintegrated(repo):
-                blocked.append(name)
-        return blocked
+        index = label_for[choice]
+        session = self.sessions[index]
+        current = getattr(session, "_base_branch", None)
+        target = self._prompt_merge_branch(f"Merge '{self._session_name(index)}' into which branch?", current)
+        if not target:
+            self._set_message("Cancelled.")
+            self._render()
+            return
+        if target == current:
+            self._set_message(f"'{self._session_name(index)}' already merges into '{target}'.")
+            self._render()
+            return
+        if session is self.active:
+            self._retarget_active_session(target)
+        else:
+            # Re-target a background session by temporarily making it active.
+            self._with_session(session, lambda: self._retarget_active_session(target))
 
     def _integrate_session_keeping_alive(self) -> None:
         # Commit the latest turn and integrate it into the current base WITHOUT
@@ -2372,73 +2404,6 @@ class ProxyRunner:
         self._service_commit_summary()
         self._integrate_session_turn()
 
-    def _integrate_all_sessions_into_base(self) -> None:
-        # Integrate every live session into the CURRENT base, keeping each
-        # session's worktree and backend alive (base-switching is not an exit).
-        self._integrate_session_keeping_alive()  # active, in place
-        for session in list(self.sessions):
-            if session is not self.active:
-                self._with_session(session, self._integrate_session_keeping_alive)
-
-    def _perform_base_switch(self, new_base: str, *, checkout: bool = True) -> bool:
-        # Returns True on success. With ``checkout=False`` the base moves but the repo
-        # directory is left on its current branch (used when a new session targets a
-        # different branch): aGiTrack integrates into the not-checked-out base via
-        # fast-forward, exactly as the drift "keep integrating into X" path does.
-        self._exiting = True  # suppress the conflict-resolve popup during integration
-        self._set_message("Integrating session work before switching base…", seconds=30)
-        self._render()
-        # NB: never _finalize_pending_work() here — that is the EXIT path, which
-        # terminates the agent child and removes the worktree, killing the very
-        # sessions a base switch is meant to keep running (the source of the
-        # "switching base quits with an error" crash).
-        self._integrate_all_sessions_into_base()
-        blocked = self._unintegrated_session_names()
-        if blocked:
-            self._exiting = False
-            self._set_message(
-                f"Cannot switch base: unresolved work in {', '.join(blocked)}. "
-                f"Resolve it ({self._menu_label()} → session), then try again.",
-                seconds=14.0,
-            )
-            self._render()
-            return False
-        if checkout:
-            try:
-                self.base_repo.switch(new_base)
-            except Exception as error:
-                self._exiting = False
-                self._set_message(f"Could not switch base to '{new_base}': {error}", seconds=10.0)
-                self._render()
-                return False
-        self._base_branch = new_base
-        self._integration.base_branch = new_base
-        self._repoint_all_sessions_to_base()
-        self._exiting = False
-        if checkout:
-            self._repo_dir_branch = new_base  # repo dir is now on the new base
-            self._drift_acknowledged_branch = None
-            self._set_message(
-                f"Base switched to '{new_base}'. Existing sessions keep running and now merge into it.",
-                seconds=8.0,
-            )
-        else:
-            # The base now differs from the repo dir; pre-acknowledge so the drift
-            # check doesn't prompt, and the status bar bolds the integration branch.
-            current: str | None = self._repo_dir_branch
-            try:
-                current = self.base_repo.current_branch()
-            except Exception:
-                pass
-            self._repo_dir_branch = current
-            self._drift_acknowledged_branch = current if current != new_base else None
-            self._set_message(
-                f"Sessions now integrate into '{new_base}' (the repo directory stays on '{current}').",
-                seconds=8.0,
-            )
-        self._render()
-        return True
-
     def _repoint_current_to_base(self) -> None:
         # Detach the current session's worktree at the new base so its next turn
         # branches from there. The session and its conversation keep running.
@@ -2449,14 +2414,6 @@ class ProxyRunner:
             return
         if new_turn is not None:
             self.turn = new_turn
-
-    def _repoint_all_sessions_to_base(self) -> None:
-        # Re-point every live session at the new base without stopping any of them.
-        self._repoint_current_to_base()  # active, in place
-        for session in self.sessions:
-            if session is self.active:
-                continue
-            self._with_session(session, self._repoint_current_to_base)
 
     def _session_menu(self) -> None:
         options: list[str] = []
@@ -2495,6 +2452,8 @@ class ProxyRunner:
             actions.append(("separator", None))
             options.append("✎ Rename a session")
             actions.append(("rename", None))
+            options.append("⤳ Change a session's merge branch")
+            actions.append(("merge-branch", None))
         if self._resumable_sessions():
             options.append("↻ Resume a past conversation…")
             actions.append(("resume-past", None))
@@ -2539,6 +2498,8 @@ class ProxyRunner:
             self._prompt_new_session()
         elif kind == "rename":
             self._rename_session_menu()
+        elif kind == "merge-branch":
+            self._change_session_merge_branch_menu()
         elif kind == "share":
             self._share_session()
         elif kind == "resume-shared":
@@ -3944,30 +3905,32 @@ class ProxyRunner:
             self._set_message("Cancelled.")
             self._render()
             return
-        if base != self._base_branch:
-            # Re-target onto the chosen branch WITHOUT checking it out, so the new
-            # session (and the others, which share the base) integrate into it while
-            # the repo directory stays where it is. Abort if existing work is blocked.
-            if not self._perform_base_switch(base, checkout=False):
-                return
-        self._new_session(name)
+        # The new session merges into its OWN branch — independent of the other
+        # sessions and of the branch checked out in the repo directory.
+        self._new_session(name, base_branch=base)
+
+    def _merge_target_default(self) -> str | None:
+        # The default merge destination for a new session: the branch checked out in
+        # the repo directory ("the base branch").
+        return self._repo_dir_branch or (self.base_repo.current_branch() if self.base_repo is not None else None)
 
     def _prompt_new_session_base(self) -> str | None:
-        # Which branch the new session integrates into. Defaults to the current base;
-        # picking a different one lets the session work toward another branch without
-        # checking it out in the repo directory. Returns the chosen branch, or None on
-        # cancel; returns the current base unchanged when there's no choice to offer.
-        if self.worktree is None or self._base_branch is None:
-            return self._base_branch  # branch selection only applies to worktree sessions
-        others = self._base_switch_candidates()  # real branches other than the current base
+        # Which branch the new session merges into. Defaults to the repo directory's
+        # branch ("the base branch"); picking a different one lets the session work
+        # toward another branch without checking it out. Returns the chosen branch, or
+        # None on cancel; returns the default when there's nothing else to offer.
+        default_branch = self._merge_target_default()
+        if not self._use_worktrees or default_branch is None:
+            return default_branch
+        others = [b for b in self.base_repo.list_branches() if b != default_branch and not is_managed_branch(b)]
         if not others:
-            return self._base_branch
-        default_label = f"{self._base_branch}  (current — default)"
+            return default_branch
+        default_label = f"{default_branch}  (base branch — default)"
         options = [default_label, *others]
-        choice = self._select_popup("Integrate the new session into which branch?", options)
+        choice = self._select_popup("Merge this session's changes into which branch?", options)
         if choice is None:
             return None
-        return self._base_branch if choice == default_label else choice
+        return default_branch if choice == default_label else choice
 
     def _stop_session_menu(self) -> None:
         options = [self._session_name(index) for index in range(len(self.sessions))]
@@ -4076,6 +4039,9 @@ class ProxyRunner:
         self._enable_host_mouse()
         self._set_message(f"Switched to session '{self._session_name(index)}'")
         self._render()
+        # The newly-active session may merge into a different branch than the one
+        # checked out in the repo directory — ask where its changes should merge.
+        self._prompt_merge_target_if_diverged()
 
     def _join_parse_worker_before_swap(self) -> None:
         # A parse worker started for the active session reads that session's
@@ -4218,7 +4184,7 @@ class ProxyRunner:
                 self._prompt_resolve_conflict(self.repo.current_branch())
                 return
 
-    def _open_session_worktree(self, name: str) -> tuple[WorktreeInfo, GitRepo]:
+    def _open_session_worktree(self, name: str, *, base_branch: str | None = None) -> tuple[WorktreeInfo, GitRepo]:
         worktrees = self._worktrees()
         path = worktrees.worktree_path(name)
         if self._is_valid_worktree(path):
@@ -4232,7 +4198,8 @@ class ProxyRunner:
         if path.exists():
             self._debug(f"removing invalid leftover worktree dir {path}")
             shutil.rmtree(path, ignore_errors=True)
-        info = worktrees.create(name, base=self._base_branch or self.base_repo.current_branch())
+        base = base_branch or self._base_branch or self.base_repo.current_branch()
+        info = worktrees.create(name, base=base)
         return info, GitRepo(info.path)
 
     def _is_valid_worktree(self, path) -> bool:
@@ -4246,7 +4213,14 @@ class ProxyRunner:
         except Exception:
             return False
 
-    def _new_session(self, name: str, *, resume_session_id: str | None = None, backend: str | None = None) -> None:
+    def _new_session(
+        self,
+        name: str,
+        *,
+        resume_session_id: str | None = None,
+        backend: str | None = None,
+        base_branch: str | None = None,
+    ) -> None:
         if not self._use_worktrees:
             # #9: concurrent sessions need worktrees; in no-worktree mode they'd
             # all write the same tree. Refuse rather than corrupt the checkout.
@@ -4257,8 +4231,11 @@ class ProxyRunner:
             )
             self._render()
             return
+        # The branch this new session merges into — its own, independent of the
+        # other sessions and of the branch checked out in the repo directory.
+        base = base_branch or self._merge_target_default()
         try:
-            info, repo = self._open_session_worktree(name)
+            info, repo = self._open_session_worktree(name, base_branch=base)
         except Exception as error:
             self._set_message(f"Could not create worktree: {error}", seconds=8.0)
             self._render()
@@ -4269,6 +4246,7 @@ class ProxyRunner:
         self.name = info.name
         self.worktree = info
         self.repo = repo
+        self._base_branch = base  # this session integrates into `base` (per-session)
         self.turn = self._turn_from_branch(repo.current_branch())
         self.state = AgitrackState(info.path, default_backend=self.global_config.default_backend)
         if backend:
@@ -6648,5 +6626,31 @@ def _delegate_to_active_session(field: str) -> property:
 
 
 for _field in Session.FIELDS:
+    # _base_branch gets a custom property below (it must also keep the single
+    # IntegrationService in sync on every write), so skip the plain delegation.
+    if _field == "_base_branch":
+        continue
     setattr(ProxyRunner, _field, _delegate_to_active_session(_field))
 del _field
+
+
+def _get_base_branch(self):
+    return self.active._base_branch
+
+
+def _set_base_branch(self, value):
+    # Per-session integration target. Writing it also re-points the single
+    # IntegrationService, so a session always merges into its own branch.
+    self.active._base_branch = value
+    svc = self.__dict__.get("_integration_svc")
+    if svc is not None:
+        svc.base_branch = value
+
+
+# Attached via setattr (not a plain assignment) so mypy uses the class-level
+# annotation above rather than flagging the property vs. str|None mismatch.
+setattr(
+    ProxyRunner,
+    "_base_branch",
+    property(_get_base_branch, _set_base_branch, doc="Per-session integration target (delegates to self.active)."),
+)

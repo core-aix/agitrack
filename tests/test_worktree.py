@@ -426,12 +426,12 @@ def test_session_unintegrated_detects_pending_commits(tmp_path):
     info, work = _make_session(main, "s1", base)
 
     runner = _integration_runner(main, work, base, "s1")
-    assert runner._session_unintegrated(work) is False
+    assert runner._integration.session_unintegrated(work) is False
     _commit(work, "a.txt", "x\n", "<aGiTrack> work")
-    assert runner._session_unintegrated(work) is True
+    assert runner._integration.session_unintegrated(work) is True
     # After integration the worktree is detached and merged -> nothing pending.
     runner._integrate_session_turn()
-    assert runner._session_unintegrated(work) is False
+    assert runner._integration.session_unintegrated(work) is False
 
 
 def test_session_unintegrated_flags_conflict_in_progress(tmp_path):
@@ -445,7 +445,7 @@ def test_session_unintegrated_flags_conflict_in_progress(tmp_path):
     runner = _integration_runner(main, work, base, "s1")
     # Leave a conflicting merge in progress in the worktree.
     assert work.merge(base) is False
-    assert runner._session_unintegrated(work) is True
+    assert runner._integration.session_unintegrated(work) is True
 
 
 def test_repoint_current_to_base_detaches_at_new_base(tmp_path):
@@ -482,7 +482,7 @@ def test_base_switch_candidates_excludes_agitrack_and_current(tmp_path):
         _base_branch=base,
     )
 
-    candidates = runner._base_switch_candidates()
+    candidates = runner._integration.base_switch_candidates()
     assert "feature" in candidates
     assert base not in candidates
     assert all(not name.startswith("agitrack/") for name in candidates)
@@ -520,67 +520,88 @@ def test_fast_forward_branch_advances_only_on_true_ff(tmp_path):
         main.fast_forward_branch("ahead", "diverged")
 
 
-def test_base_switch_keeps_session_alive(tmp_path):
-    # Regression: _perform_base_switch used the EXIT finalizer, which terminated
-    # the agent child and removed the worktree — so switching the base quit aGiTrack
-    # with an error. A base switch must keep every session running.
+def test_retarget_active_session_changes_merge_target_per_session(tmp_path):
+    # The active session's merge branch moves to the new target (its worktree
+    # re-points there); the repo directory is NOT checked out, so a session can merge
+    # into a branch other than the one in the directory.
     main = _init_repo(tmp_path)
     base = main.current_branch()
     main.create_branch("feature", base)
     info, work = _make_session(main, "s1", base)
 
     runner = _integration_runner(main, work, base, "s1")
-    runner.worktree = info  # a real WorktreeInfo so repoint + survival checks work
+    runner.worktree = info
     runner.sessions = [runner.active]
     runner._commit_latest_turn_sync = lambda: None  # no real backend to parse
-    terminated: list[bool] = []
-    runner._terminate_child = lambda *a, **k: terminated.append(True)
 
-    runner._perform_base_switch("feature")
+    ok = runner._retarget_active_session("feature")
 
-    assert runner._base_branch == "feature"
-    assert main.current_branch() == "feature"
-    assert info.path.exists()  # worktree kept
-    assert runner.worktree is not None  # session not torn down
-    assert terminated == []  # the backend child was never killed
+    assert ok is True
+    assert runner._base_branch == "feature"  # this session now merges into feature
+    assert runner._integration.base_branch == "feature"  # the service follows the active session
+    assert main.current_branch() == base  # the repo directory was NOT switched
 
 
-def test_base_switch_without_checkout_keeps_repo_dir_branch(tmp_path):
-    # Used when a new session targets a different branch: the base moves but the
-    # repo directory is left where it is, so sessions integrate into the
-    # not-checked-out branch (and the status bar bolds it).
+def test_each_session_has_its_own_merge_branch(tmp_path):
+    # Concurrent sessions can merge into independent branches. The single
+    # IntegrationService is re-pointed to whichever session is active, so each
+    # integrates into its own branch.
+    from agitrack.proxy.session import Session
+
     main = _init_repo(tmp_path)
     base = main.current_branch()
     main.create_branch("feature", base)
     info, work = _make_session(main, "s1", base)
+    runner = _integration_runner(main, work, base, "s1")
+    runner.sessions = [runner.active]
+    assert runner._integration.base_branch == base  # service follows the active session
 
+    s2 = Session.bare()
+    s2._base_branch = "feature"  # a second session targeting another branch
+    runner.sessions.append(s2)
+    runner.active = s2
+    assert runner._base_branch == "feature"
+    assert runner._integration.base_branch == "feature"  # the service re-points on switch
+
+    runner.active = runner.sessions[0]  # back to the first session
+    assert runner._base_branch == base
+    assert runner._integration.base_branch == base
+
+
+def test_change_session_merge_branch_menu_retargets_chosen_session(tmp_path):
+    main = _init_repo(tmp_path)
+    base = main.current_branch()
+    main.create_branch("feature", base)
+    info, work = _make_session(main, "s1", base)
     runner = _integration_runner(main, work, base, "s1")
     runner.worktree = info
     runner.sessions = [runner.active]
-    runner._commit_latest_turn_sync = lambda: None
 
-    ok = runner._perform_base_switch("feature", checkout=False)
+    retargeted: list = []
+    runner._retarget_active_session = lambda target: retargeted.append(target) or True
+    # Pick the (only) session, then pick "feature" as its new merge branch.
+    picks = iter([lambda title, options: options[0], lambda title, options: "feature"])
+    runner._select_popup = lambda title, options: next(picks)(title, options)
 
-    assert ok is True
-    assert runner._base_branch == "feature"  # integration target moved
-    assert main.current_branch() == base  # repo directory NOT switched
-    assert runner._repo_dir_branch == base
-    assert runner._drift_acknowledged_branch == base  # pre-acknowledged ⇒ no drift prompt
+    runner._change_session_merge_branch_menu()
+
+    assert retargeted == ["feature"]
 
 
-def test_prompt_new_session_base_defaults_to_current_or_picks_another(tmp_path):
+def test_prompt_new_session_base_defaults_to_dir_branch_or_picks_another(tmp_path):
     main = _init_repo(tmp_path)
     base = main.current_branch()
     main.create_branch("feature", base)
     info, work = _make_session(main, "s1", base)
     runner = _integration_runner(main, work, base, "s1")
     runner.worktree = info
+    runner._use_worktrees = True
 
-    # Choosing the first option keeps the current base.
+    # Choosing the first option keeps the directory's branch (the default base).
     runner._select_popup = lambda title, options: options[0]
     assert runner._prompt_new_session_base() == base
 
-    # Choosing another branch returns it (the new session integrates into it).
+    # Choosing another branch returns it (the new session merges into it).
     runner._select_popup = lambda title, options: "feature"
     assert runner._prompt_new_session_base() == "feature"
 

@@ -3414,7 +3414,7 @@ def test_new_session_stages_transcript_before_spawn_when_resuming(tmp_path, monk
     runner.global_config = types.SimpleNamespace(default_backend="claude")
     info = types.SimpleNamespace(name="bob-feature", path=tmp_path)
     repo = types.SimpleNamespace(repo=tmp_path, current_branch=lambda: "agit/claude/bob-feature/t1")
-    runner._open_session_worktree = lambda name: (info, repo)
+    runner._open_session_worktree = lambda name, **kwargs: (info, repo)
     monkeypatch.setattr(runner_module, "make_proxy_agent", lambda name: types.SimpleNamespace(name=name))
     monkeypatch.setattr(runner_module, "AgitrackActions", lambda *a, **k: types.SimpleNamespace())
 
@@ -3461,56 +3461,53 @@ def test_dedupe_session_name_avoids_collisions():
 # --- base branch switched out-of-band ---
 
 
-def _base_drift_runner(current_branch, *, choice="Pause merging until I decide"):
+def _merge_drift_runner(dir_branch, *, session_target="dev", choice):
     import types
 
     runner = make_runner(
-        _base_branch="dev",
-        _integration_paused=False,
+        worktree=types.SimpleNamespace(),
+        _base_branch=session_target,
         _base_drift_check_at=0.0,
-        _drift_acknowledged_branch=None,
-        base_repo=types.SimpleNamespace(current_branch=lambda: current_branch),
+        base_repo=types.SimpleNamespace(current_branch=lambda: dir_branch),
+        name="s1",
     )
+    runner._repo_dir_branch = session_target  # start aligned (so no prompt until the dir moves)
     runner._debug = lambda *a, **k: None
     runner.messages = []
     runner._set_message = lambda m, **k: runner.messages.append(m)
     runner._render = lambda: None
     runner.popups = []
     runner._select_popup = lambda title, options: runner.popups.append((title, options)) or choice
+    runner.retargeted: list = []
+    runner._retarget_active_session = lambda target: runner.retargeted.append(target) or True
     return runner
 
 
-def test_base_branch_drift_prompts_and_pauses_when_dismissed():
-    # On drift the user is prompted; choosing "Pause" keeps the safe default.
-    runner = _base_drift_runner("feature-x", choice="Pause merging until I decide")
+def test_repo_dir_change_prompts_and_keeps_session_merge_branch():
+    # When the repo directory moves to a branch that differs from the active session's
+    # merge branch, the user is prompted; choosing "Keep merging" leaves the session's
+    # branch alone (the status bar then bolds it).
+    runner = _merge_drift_runner("feature-x", session_target="dev", choice="Keep merging into 'dev'")
     runner._check_base_branch_drift()
-    assert runner.popups and "feature-x" in runner.popups[0][0]
-    assert runner._integration_paused is True
-    assert any("PAUSED" in m and "feature-x" in m for m in runner.messages)
+    assert runner.popups and "feature-x" in runner.popups[0][0] and "dev" in runner.popups[0][0]
+    assert runner.retargeted == []  # the session keeps merging into its own branch
+    assert runner._base_branch == "dev"
+    assert runner._repo_dir_branch == "feature-x"  # cached directory branch updated
 
-    # The prompt fires once per checkout, not every drift check.
+    # No re-prompt while the directory branch is unchanged.
     runner.popups.clear()
     runner._base_drift_check_at = 0.0
     runner._check_base_branch_drift()
     assert runner.popups == []
 
-    runner.base_repo.current_branch = lambda: "dev"  # user switches back
-    runner._base_drift_check_at = 0.0  # bypass the throttle
-    runner.messages.clear()
-    runner._check_base_branch_drift()
-    assert runner._integration_paused is False
-    assert runner._drift_acknowledged_branch is None
-    assert any("resumed" in m for m in runner.messages)
 
-
-def test_base_branch_drift_keep_resumes_integration_into_original():
-    # Choosing "Keep integrating" leaves merging ON (into the original base),
-    # never paused — advance_base_to handles the not-checked-out base safely.
-    runner = _base_drift_runner("feature-x", choice="Keep integrating into 'dev'")
+def test_repo_dir_change_retargets_session_when_user_picks_dir_branch():
+    # Choosing "Merge into '<dir branch>'" re-targets the session's merge branch to it.
+    runner = _merge_drift_runner(
+        "feature-x", session_target="dev", choice="Merge into 'feature-x' (the current directory branch)"
+    )
     runner._check_base_branch_drift()
-    assert runner._integration_paused is False
-    assert runner._drift_acknowledged_branch == "feature-x"
-    assert any("Keeping base 'dev'" in m for m in runner.messages)
+    assert runner.retargeted == ["feature-x"]  # the session's merge branch follows the directory
 
 
 def test_integrate_turn_skips_while_paused():
