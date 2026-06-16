@@ -3564,12 +3564,27 @@ def test_repo_dir_change_can_switch_only_the_current_session():
 def test_repo_dir_change_can_switch_all_sessions():
     from agitrack.proxy.session import Session
 
-    runner = _merge_drift_runner("feature-x", choice="Switch ALL sessions to 'feature-x'")
+    choice = "Switch all idle sessions to 'feature-x' (running sessions keep their branch)"
+    runner = _merge_drift_runner("feature-x", choice=choice)
     other = Session.bare()
     other._base_branch = "dev"
     runner.sessions = [runner.active, other]  # two live sessions
     runner._check_base_branch_drift()
     assert runner.retargeted == ["feature-x", "feature-x"]  # the active one and the background one
+
+
+def test_switch_all_idle_sessions_skips_running_ones():
+    from agitrack.proxy.session import Session
+
+    choice = "Switch all idle sessions to 'feature-x' (running sessions keep their branch)"
+    runner = _merge_drift_runner("feature-x", choice=choice)
+    running = Session.bare()
+    running._base_branch = "dev"
+    running.agent_in_flight = True  # mid-turn — must keep its branch
+    runner.sessions = [runner.active, running]
+    runner._check_base_branch_drift()
+    assert runner.retargeted == ["feature-x"]  # only the idle (active) session switched
+    assert any("running a turn" in m for m in runner.messages)  # the skipped one is reported
 
 
 def test_session_switch_prompt_keeps_or_switches_active_session():
@@ -3599,6 +3614,31 @@ def test_repo_dir_change_while_running_defers_prompt_until_idle():
     assert runner.popups  # now it asks
     assert runner.retargeted == ["feature-x"]
     assert runner._pending_merge_prompt is False
+
+
+def test_reconcile_merge_branch_honors_prior_assignment_and_defers_confirm():
+    import types
+
+    # At startup the session is assumed to merge into the directory branch ('dev'), but a
+    # previous run assigned it 'feature-y'. The prior assignment is honored and a
+    # confirmation prompt is deferred for the user.
+    runner = make_runner(worktree=types.SimpleNamespace(), _base_branch="dev", name="s1")
+    runner.state = types.SimpleNamespace(merge_branch="feature-y")
+    runner._reconcile_merge_branch("dev")
+    assert runner._base_branch == "feature-y"  # the prior assignment wins
+    assert runner.state.merge_branch == "feature-y"  # not overwritten with the dir branch
+    assert runner._pending_merge_prompt is True  # the user will be asked to confirm
+
+
+def test_reconcile_merge_branch_records_dir_branch_when_unset():
+    import types
+
+    runner = make_runner(worktree=types.SimpleNamespace(), _base_branch="dev", name="s1")
+    runner.state = types.SimpleNamespace(merge_branch=None)
+    runner._reconcile_merge_branch("dev")
+    assert runner.state.merge_branch == "dev"  # recorded for next time
+    assert runner._base_branch == "dev"
+    assert runner._pending_merge_prompt is False  # nothing to confirm
 
 
 def test_retarget_active_session_refused_while_running():

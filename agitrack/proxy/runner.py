@@ -1086,10 +1086,11 @@ class ProxyRunner:
             f"Switch only '{self.name}' to '{dir_branch}'",
         ]
         if len(self.sessions or []) > 1:
-            options.append(f"Switch ALL sessions to '{dir_branch}'")
+            options.append(f"Switch all idle sessions to '{dir_branch}' (running sessions keep their branch)")
         choice = self._select_popup(
             f"The repo directory is now on '{dir_branch}', but session '{self.name}' merges into "
-            f"'{self._base_branch}'. What should happen?",
+            f"'{self._base_branch}'. What should happen? "
+            f"(Change any session's merge branch later via Ctrl-G → session → Change a session's merge branch.)",
             options,
         )
         if not choice or choice.startswith("Do nothing"):
@@ -1099,7 +1100,7 @@ class ProxyRunner:
             )
             self._render()
             return
-        if choice.startswith("Switch ALL"):
+        if choice.startswith("Switch all idle"):
             self._retarget_all_sessions(dir_branch)
             return
         self._retarget_active_session(dir_branch)  # switch only the active session
@@ -1133,12 +1134,42 @@ class ProxyRunner:
             self._render()
 
     def _retarget_all_sessions(self, target: str) -> None:
-        # Re-point every live session at `target` (used by "switch ALL sessions").
-        # A session already on `target` is a no-op.
-        self._retarget_active_session(target)  # active, in place
-        for session in list(self.sessions):
-            if session is not self.active:
+        # Re-point every IDLE session at `target` (used by "switch all idle sessions").
+        # A running session keeps the branch it started its turn on — its in-flight work
+        # must not split across branches — so it is left untouched and reported.
+        skipped: list[str] = []
+        for index in range(len(self.sessions)):
+            session = self.sessions[index]
+            if getattr(session, "agent_in_flight", False):
+                skipped.append(self._session_name(index))
+                continue
+            if session is self.active:
+                self._retarget_active_session(target)  # active, in place
+            else:
                 self._with_session(session, lambda: self._retarget_active_session(target))
+        if skipped:
+            self._set_message(
+                f"Kept {', '.join(skipped)} on their current branch — they're running a turn; "
+                f"re-point them once idle via Ctrl-G → session → Change a session's merge branch.",
+                seconds=10.0,
+            )
+            self._render()
+
+    def _reconcile_merge_branch(self, default_base: str | None) -> None:
+        # On startup/resume aGiTrack assumes a session merges into the directory's current
+        # branch (`default_base`). If a PRIOR run assigned this worktree a different merge
+        # branch (persisted in its state), honor that assignment instead and flag a
+        # confirmation prompt, so the user confirms the branch change before it takes
+        # effect rather than silently merging into a branch they didn't choose. Otherwise
+        # record `default_base` as this worktree's merge branch.
+        if self.state is None:
+            return
+        previous = self.state.merge_branch  # what the previous aGiTrack instance assigned
+        if previous and previous != default_base:
+            self._base_branch = previous  # keep merging where the prior run was pointed
+            self._pending_merge_prompt = True  # confirm with the user once the TUI is ready
+        elif default_base is not None:
+            self.state.merge_branch = default_base
 
     def _retarget_active_session(self, target: str) -> bool:
         # Change the ACTIVE session's merge destination to `target` — per-session, so
@@ -1770,11 +1801,14 @@ class ProxyRunner:
         self._primary_worktree_name = info.name  # the session that auto-resumes across exits
         self.worktree = info
         self.repo = repo
+        # Load this worktree's state and reconcile its merge branch BEFORE aligning: a
+        # prior run's assignment must be honored (and the cross-branch guard compares the
+        # align target against it), with a confirmation prompt deferred to the TUI.
+        self.state = AgitrackState(info.path, default_backend=self.global_config.default_backend)
+        self._reconcile_merge_branch(self._base_branch)
         self._align_session_to_base(repo)
         self.turn = self._turn_from_branch(repo.current_branch())
-        self.state = AgitrackState(info.path, default_backend=self.global_config.default_backend)
         self.state.backend = backend_name
-        self.state.merge_branch = self._base_branch  # record this worktree's own merge branch
         # The worktree is recreated fresh each run (its working state is not kept),
         # so seed its resume pointer to continue the chosen conversation.
         if not self.state.backend_session_id and resume_id:
@@ -4408,7 +4442,12 @@ class ProxyRunner:
         self._base_branch = base  # this session integrates into `base` (per-session)
         self.turn = self._turn_from_branch(repo.current_branch())
         self.state = AgitrackState(info.path, default_backend=self.global_config.default_backend)
-        self.state.merge_branch = base  # record this worktree's own merge branch
+        if base_branch is None:
+            # No branch was explicitly chosen (e.g. resuming a dormant worktree): honor
+            # any merge branch a prior run assigned it, confirming the change with the user.
+            self._reconcile_merge_branch(base)
+        else:
+            self.state.merge_branch = base  # an explicit choice wins; record it
         if backend:
             # Pin this session to a specific backend (e.g. created by switching
             # backends), independent of the global default.
