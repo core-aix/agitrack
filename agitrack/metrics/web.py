@@ -78,11 +78,12 @@ def shared_sessions_for(repo: GitRepo) -> list[dict]:
 def format_html(dash: Dashboard, *, shared_sessions: list[dict] | None = None) -> str:
     payload = json.dumps(initial_payload(dash, shared_sessions=shared_sessions), separators=(",", ":"))
     repo_name = dash.repo.rstrip("/").rsplit("/", 1)[-1] or dash.repo
+    # The branch is rendered client-side into the meta-line picker (from the
+    # embedded payload), so there's no __BRANCH__ placeholder to substitute.
     return (
         _TEMPLATE.replace("__DATA__", payload)
         .replace("__REPO_NAME__", _escape(repo_name))
         .replace("__REPO__", _escape(dash.repo))
-        .replace("__BRANCH__", _escape(dash.branch))
     )
 
 
@@ -496,6 +497,16 @@ header{padding:54px 0 22px}
 .meta{margin-top:12px;color:var(--fg-dim);font-size:13.5px}
 .meta b{color:var(--fg);font-weight:600}
 .meta .tag{color:var(--amber)}
+/* Branch picker lives inline on the meta line (next to the repo path), styled to
+   read as part of the text rather than as a bulky filter control. */
+.meta select.branchsel{appearance:none;background:var(--ink);color:var(--fg);font-weight:600;vertical-align:baseline;
+  border:1px solid var(--line);font-family:var(--mono);font-size:13px;padding:2px 22px 2px 8px;max-width:min(60vw,520px);cursor:pointer;
+  background-image:linear-gradient(45deg,transparent 50%,var(--phosphor-dim) 50%),linear-gradient(135deg,var(--phosphor-dim) 50%,transparent 50%);
+  background-position:calc(100% - 12px) 50%,calc(100% - 8px) 50%;background-size:5px 5px,5px 5px;background-repeat:no-repeat}
+.meta select.branchsel:focus{outline:none;border-color:var(--phosphor)}
+/* A file:// snapshot (or a single-branch repo) can't switch: render it as plain
+   inline text — no arrow, no box affordance. */
+.meta select.branchsel:disabled{cursor:default;opacity:1;border-color:transparent;padding:2px 0;background-image:none}
 
 /* ---- filter bar ---- */
 /* Stays a single row while sticky: never wrap, so the frozen panel is one row
@@ -688,12 +699,11 @@ footer{margin-top:46px;padding-top:22px;border-top:1px dashed var(--line);color:
 <div class="wrap">
   <header>
     <div class="brand"><span class="a">a</span>GiTrack<span class="sub">&nbsp;dashboard</span></div>
-    <div class="meta"><span class="tag">repo</span> <b>__REPO__</b> &nbsp;·&nbsp; <span class="tag">branch</span> <b id="branchlabel">__BRANCH__</b> &nbsp;·&nbsp; <span id="genat"></span></div>
+    <div class="meta"><span class="tag">repo</span> <b>__REPO__</b> &nbsp;·&nbsp; <span class="tag">branch</span> <select id="f-branch" class="branchsel" title="View statistics and the commit log for a single branch"></select> &nbsp;·&nbsp; <span id="genat"></span></div>
   </header>
 
   <div class="controls">
     <span class="prompt">&gt; filter</span>
-    <div class="field"><label for="f-branch">branch</label><select id="f-branch" title="View statistics and the commit log for a single branch"></select></div>
     <div class="field"><label for="f-author">committer</label><select id="f-author"></select></div>
     <div class="field"><label for="f-backend">backend</label><select id="f-backend"></select></div>
     <div class="field"><label for="f-model">model</label><select id="f-model"></select></div>
@@ -760,7 +770,7 @@ footer{margin-top:46px;padding-top:22px;border-top:1px dashed var(--line);color:
   <div class="log" id="commitlog"></div>
 
   <footer>
-    <span>aGiTrack · agent + git · metrics from commit metadata</span>
+    <span>aGiTrack · agent + git tracking · metrics from commit metadata</span>
     <span id="count"></span>
   </footer>
 </div>
@@ -1212,7 +1222,9 @@ function fillSelect(id, values, allLabel, keep){
     values.map(v => `<option value="${esc(v)}">${esc(v)}</option>`).join("");
   sel.value = (keep && values.includes(keep)) ? keep : "";
 }
-function setBranchLabel(name){ const el=$("branchlabel"); if(el) el.textContent = name || "—"; }
+// The branch picker doubles as the branch label on the meta line: keep its shown
+// value in sync with the branch actually being viewed.
+function setBranchLabel(name){ const el=$("f-branch"); if(el && name && [...el.options].some(o=>o.value===name)) el.value = name; }
 // The branch picker is a view switch, not a subset filter, so it has no "all"
 // option — exactly one branch is shown at a time. A file:// snapshot can't reach
 // the server to re-scope, so it's disabled there (only its own branch is shown).
