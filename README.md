@@ -71,7 +71,6 @@ In proxy mode (default), press `Ctrl-G`, then type one of these aGiTrack command
 session                   switch / start (own worktree) / stop a live session
 agent-backend             switch backend (opencode|claude); shows a picker
 summarizer                toggle summarization on/off, set model, show status
-git-base-branch           change the branch THIS session merges into
 git-unstaged              show intentionally unstaged files
 git-user-commit           create a user commit
 update                    check for / install an aGiTrack self-update
@@ -129,6 +128,8 @@ aGiTrack tracks exactly one backend session per repository and stays pinned to t
 
 Use the `session` command to start a new session, switch the tracked session to another existing one, or sync tracking to the most recently active session (for example after starting a fresh conversation inside the backend's own TUI). The session menu marks each session `running` or `idle`. A new session is given a friendly random word as its default name (e.g. `maple`, `harbor`) — easier to remember than `session-1` and, since sessions are shared as `<github-id(s)>/<name>`, far less likely to clash with a collaborator's; you can accept it or type your own at the prompt, and rename later.
 
+When you start a new session you can make it either a **blank session** (a fresh conversation) or a **fork of the current session** — a copy of the current conversation that runs independently. A fork is installed under a brand-new backend id (so it never clashes with the original) and defaults to the current session's merge branch, so you can branch a conversation to try an alternative direction while the original keeps going.
+
 **Sharing a session across machines and collaborators** (the [Sharing sessions](#sharing-sessions) actions above) builds on the same per-session transcript, with this storage model and these guarantees. **Only sessions you explicitly share are tracked here** — a session you haven't shared stays purely local: it is never uploaded, listed, or tracked in the shared store, and nothing about it leaves your machine.
 
 - **Only the latest copy is kept — git history never grows.** Shared sessions live on a dedicated custom ref `refs/agitrack/shared-sessions`, stored as a *single, parent-less (orphan) commit* built with `git commit-tree` and no parent. Every update (manual or auto) **rewrites** that ref to a brand-new orphan commit holding only the current snapshot. So no matter how many times a session is updated, the ref is always one commit deep — it never accumulates history or bloats the repo, and **unsharing removes the session completely** (there is no older commit anywhere that still holds it). This deliberately avoids a normal commit chain, whose whole point is to *retain* every past version — exactly what we don't want for a privacy-sensitive transcript.
@@ -153,7 +154,7 @@ Each session has its **own** merge destination, independent of the other session
 - **Choosing a branch for a new session.** When you start a new session (`Ctrl-G → + New session`), aGiTrack asks which branch its changes should merge into. The default is the branch checked out in your repo directory ("the base branch"); pick another to point that session elsewhere. aGiTrack does **not** check that branch out in your directory — it advances the branch's ref directly via fast-forward, so your working tree stays put.
 - **Status bar emphasis.** The status line shows `session → branch`. When a session merges into a branch *different* from the one checked out in your repo directory, that branch name is shown in **bold**, so it's obvious at a glance that the changes are landing somewhere other than your current directory. The emphasis updates automatically when you check out a different branch in the directory.
 - **Staying in sync.** Whenever the repo directory's branch changes (you `git checkout` something else), and whenever you switch sessions, aGiTrack asks — only if the active session's merge branch differs from the directory's branch — where that session's changes should merge: into the directory's current branch, or keep its own. Picking the directory's branch re-points the session there (flushing its pending work into the old branch first).
-- **Changing a session's merge branch.** `Ctrl-G → git-base-branch` changes the active session's merge branch; `Ctrl-G → session → ⤳ Change a session's merge branch` does it for **any** session. In both cases the session keeps running and only that session is affected.
+- **Changing a session's merge branch.** `Ctrl-G → session → ⤳ Change a session's merge branch` re-points **any** session's merge destination. The session keeps running and only that session is affected (its pending work is flushed into its old branch first).
 
 ### Integration and startup recovery
 

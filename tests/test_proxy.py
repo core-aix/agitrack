@@ -3441,6 +3441,52 @@ def test_new_session_stages_transcript_before_spawn_when_resuming(tmp_path, monk
     assert order == [("stage", "sid-Y"), ("spawn", None)]  # staged BEFORE spawn
 
 
+def test_fork_current_session_copies_under_a_new_id(tmp_path):
+    import types
+
+    runner = make_runner(name="main")
+    runner._render = lambda: None
+    runner._set_message = lambda *a, **k: None
+    imported: dict = {}
+    agent = types.SimpleNamespace(
+        name="claude",
+        supports_session_sharing=True,
+        export_session_raw=lambda repo, sid: "TRANSCRIPT" if sid == "src-1" else None,
+        new_import_id=lambda: "fork-2",
+        new_session_id=lambda: "fallback",
+        import_shared_session=lambda repo, sid, transcript, *, overwrite=False, as_id=None: (
+            imported.update(sid=sid, as_id=as_id, transcript=transcript) or True
+        ),
+    )
+    runner.backend = agent
+    runner.state = types.SimpleNamespace(backend_session_id="src-1", backend="claude")
+    runner.base_repo = types.SimpleNamespace(repo=tmp_path)
+    runner.repo = types.SimpleNamespace(repo=tmp_path)
+    created: dict = {}
+    runner._new_session = lambda name, **kw: created.update(name=name, **kw)
+
+    ok = runner._fork_current_session("forked", base_branch="dev")
+
+    assert ok is True
+    # The copy is installed under a NEW id; the original (src-1) transcript is untouched.
+    assert imported == {"sid": "src-1", "as_id": "fork-2", "transcript": "TRANSCRIPT"}
+    # The forked session resumes the new id (not the original), so the two never clash.
+    assert created["resume_session_id"] == "fork-2"
+    assert created["base_branch"] == "dev"
+
+
+def test_fork_falls_back_to_blank_when_backend_cannot_share():
+    import types
+
+    runner = make_runner(name="main")
+    runner.backend = types.SimpleNamespace(name="opencode", supports_session_sharing=False)
+    runner.state = types.SimpleNamespace(backend_session_id="src-1", backend="opencode")
+
+    assert runner._can_fork_active() is False
+    assert runner._prompt_fork_or_blank() is False  # no fork option offered
+    assert runner._fork_current_session("x") is False  # forking not possible
+
+
 def test_shared_resume_cancel_on_name_prompt_does_not_resume():
     runner = _shared_resume_runner()
     runner._prompt_session_name = lambda *a, **k: None  # user cancels naming
