@@ -352,6 +352,7 @@ def _options(dash: Dashboard) -> dict:
         "committers": sorted(c for c in committers if c),
         "backends": sorted(backends),
         "models": sorted(models),
+        "branches": dash.branches,
     }
 
 
@@ -374,6 +375,7 @@ def aggregates_payload(
     dated = [s.timestamp for s in dash.stats if s.timestamp]
     return {
         "head": dash.stats[-1].sha if dash.stats else "",
+        "branch": dash.branch,
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         "options": _options(dash),
         "span": {"from": min(dated), "to": max(dated)} if dated else {"from": 0, "to": 0},
@@ -686,11 +688,12 @@ footer{margin-top:46px;padding-top:22px;border-top:1px dashed var(--line);color:
 <div class="wrap">
   <header>
     <div class="brand"><span class="a">a</span>GiTrack<span class="sub">&nbsp;dashboard</span></div>
-    <div class="meta"><span class="tag">repo</span> <b>__REPO__</b> &nbsp;·&nbsp; <span class="tag">branch</span> <b>__BRANCH__</b> &nbsp;·&nbsp; <span id="genat"></span></div>
+    <div class="meta"><span class="tag">repo</span> <b>__REPO__</b> &nbsp;·&nbsp; <span class="tag">branch</span> <b id="branchlabel">__BRANCH__</b> &nbsp;·&nbsp; <span id="genat"></span></div>
   </header>
 
   <div class="controls">
     <span class="prompt">&gt; filter</span>
+    <div class="field"><label for="f-branch">branch</label><select id="f-branch" title="View statistics and the commit log for a single branch"></select></div>
     <div class="field"><label for="f-author">committer</label><select id="f-author"></select></div>
     <div class="field"><label for="f-backend">backend</label><select id="f-backend"></select></div>
     <div class="field"><label for="f-model">model</label><select id="f-model"></select></div>
@@ -802,7 +805,9 @@ const TOKEN_ORDER = [["input","input"],["output","output"],["reasoning","reasoni
   ["summary_input","summarizer input"],["summary_output","summarizer output"]];
 const REFRESH_MS = 30000, DAY = 86400;
 
-const state = {author:"", backend:"", model:"", fromTs:0, toTs:0, granularity:(INIT.timeseries&&INIT.timeseries.granularity)||"day"};
+// DEFAULT_BRANCH is the branch the page first loaded for; "reset" returns to it.
+const DEFAULT_BRANCH = INIT.branch || "";
+const state = {branch:DEFAULT_BRANCH, author:"", backend:"", model:"", fromTs:0, toTs:0, granularity:(INIT.timeseries&&INIT.timeseries.granularity)||"day"};
 // Only a page served over http(s) has a backend to reach; a file:// snapshot has
 // none, so it must never raise a false "server unreachable" alarm.
 const LIVE = location.protocol.indexOf("http") === 0;
@@ -815,6 +820,8 @@ function setOffline(on){ const el=$("neterror"); if(el) el.hidden = !on; }
 
 function qs(extra){
   const p = new URLSearchParams();
+  // A non-default branch rescopes the whole view (stats + log) server-side.
+  if(state.branch && state.branch !== DEFAULT_BRANCH) p.set("branch", state.branch);
   if(state.author) p.set("author", state.author);
   if(state.backend) p.set("backend", state.backend);
   if(state.model) p.set("model", state.model);
@@ -828,6 +835,9 @@ async function loadAgg(){
   try{ const r = await fetch("data?"+qs(), {cache:"no-store"}); if(r.ok){
     const d = await r.json(); HEAD=d.head; AGG=d.agg; OPTIONS=d.options; GENERATED=d.generated_at;
     TS = d.timeseries || {t:[]}; if(d.span) SPAN = d.span; if(d.shared_sessions) SHARED = d.shared_sessions;
+    // The server reports which branch it actually served (e.g. it fell back to the
+    // default if the requested one vanished); reflect that in the state + header.
+    if(d.branch !== undefined){ state.branch = d.branch; setBranchLabel(d.branch); }
     setOffline(false); return true; } }
   catch(e){ if(LIVE) setOffline(true); }  // network failure ⇒ server unreachable
   return false;
@@ -902,7 +912,7 @@ function renderAgg(){
   $("cards").innerHTML = [
     card("commits", fmt(total), `${fmt(tracked)} via aGiTrack`),
     card("aGiTrack coverage", pct(tracked,total), `${fmt(total-tracked)} non-tracked`, true),
-    card("aGiTrack-tracked AI lines", "+"+fmt(ai.ins), `−${fmt(ai.del)} · ${pct(ai.total, allLines)} of changes`),
+    card("Tracked AI lines", "+"+fmt(ai.ins), `−${fmt(ai.del)} · ${pct(ai.total, allLines)} of changes`),
     card("non-tracked lines", "+"+fmt(nt.ins), `−${fmt(nt.del)} · not tracked as AI`, true),
     card("output tokens", fmt(tok.output||0), `${fmt(tok.input||0)} input`),
     card("efficiency", eff===null?"—":eff.toFixed(1), "AI lines / 1k output tok", true),
@@ -914,7 +924,7 @@ function renderAgg(){
       `<div class="num"><b>+${fmt(v.ins)}</b> / −${fmt(v.del)}</div></div>`;
   const kc = (label, key, tip) => `<span class="kc" title="${tip}">${label} <b>${kinds(key)}</b></span>`;
   $("lines").innerHTML =
-    lineRow("aGiTrack-tracked AI", "agent + covered + merge", ai, false) +
+    lineRow("Tracked AI", "agent + covered + merge", ai, false) +
     lineRow("Non-tracked", "user + plain commits", nt, true) +
     `<div class="kindcounts"><span class="klabel">commits by kind:</span> `+
       kc("agent", "agent", "Commits aGiTrack made from the agent's work") + " · " +
@@ -1202,7 +1212,20 @@ function fillSelect(id, values, allLabel, keep){
     values.map(v => `<option value="${esc(v)}">${esc(v)}</option>`).join("");
   sel.value = (keep && values.includes(keep)) ? keep : "";
 }
+function setBranchLabel(name){ const el=$("branchlabel"); if(el) el.textContent = name || "—"; }
+// The branch picker is a view switch, not a subset filter, so it has no "all"
+// option — exactly one branch is shown at a time. A file:// snapshot can't reach
+// the server to re-scope, so it's disabled there (only its own branch is shown).
+function fillBranches(){
+  const sel = $("f-branch"), branches = OPTIONS.branches || [];
+  const list = branches.length ? branches : (state.branch ? [state.branch] : []);
+  sel.innerHTML = list.map(v => `<option value="${esc(v)}">${esc(v)}</option>`).join("");
+  sel.value = list.includes(state.branch) ? state.branch : (list[0] || "");
+  state.branch = sel.value;
+  sel.disabled = !LIVE || list.length <= 1;
+}
 function syncFilters(){
+  fillBranches();
   fillSelect("f-author", OPTIONS.committers, "— entire team —", state.author);
   fillSelect("f-backend", OPTIONS.backends, "— all backends —", state.backend);
   fillSelect("f-model", OPTIONS.models, "— all models —", state.model);
@@ -1268,6 +1291,9 @@ function init(){
   // Show the real range from the first paint: bound the pickers to the history
   // span and fill from/to with it (default period is "all time" = full history).
   setDateBounds(); applyPeriod();
+  // Switching branch re-scopes everything; the old branch's committer/backend/
+  // model picks may not exist on the new one, so clear them for a clean view.
+  $("f-branch").onchange = e => { state.branch = e.target.value; state.author=state.backend=state.model=""; applyFilters(); };
   $("f-author").onchange = e => { state.author = e.target.value; applyFilters(); };
   $("f-backend").onchange = e => { state.backend = e.target.value; applyFilters(); };
   $("f-model").onchange = e => { state.model = e.target.value; applyFilters(); };
@@ -1285,6 +1311,7 @@ function init(){
   });
   $("reset").onclick = () => {
     state.author=state.backend=state.model="";
+    state.branch=DEFAULT_BRANCH;  // back to the branch the page loaded for
     $("f-period").value=""; showDateRange(false); applyPeriod();  // back to all time → full span
     applyFilters();
   };

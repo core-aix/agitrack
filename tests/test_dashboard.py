@@ -784,6 +784,28 @@ def test_timeseries_fills_empty_periods_with_zero():
     assert ts["commits"] == [1, 0, 0, 1]
 
 
+def test_dashboard_repo_path_abbreviates_home(tmp_path, monkeypatch):
+    # A repo under the home directory is shown with ``~`` so the public dashboard
+    # screenshot never leaks an absolute home path. Build the repo before patching
+    # HOME so git still finds the real global identity for the seed commits.
+    home = tmp_path / "home"
+    repo_dir = home / "projects" / "demo"
+    repo_dir.parent.mkdir(parents=True)
+    repo = _demo_repo(repo_dir)
+    monkeypatch.setenv("HOME", str(home))
+
+    dash = build_dashboard(repo)
+    assert dash.repo == "~/projects/demo"
+    assert str(home) not in render_html(repo)
+
+
+def test_dashboard_repo_path_outside_home_is_unchanged(tmp_path, monkeypatch):
+    repo = _demo_repo(tmp_path / "work")
+    monkeypatch.setenv("HOME", str(tmp_path / "elsewhere"))
+    dash = build_dashboard(repo)
+    assert dash.repo == str(repo.repo)
+
+
 def test_aggregates_payload_reports_full_history_span(tmp_path):
     from agitrack.metrics.web import aggregates_payload
 
@@ -963,6 +985,60 @@ def test_dashboard_server_serves_aggregates_and_paginated_log(tmp_path):
         query = urllib.parse.urlencode({"author": data["options"]["committers"][0]})
         only_me = json.loads(_get(base + "/data?" + query))
         assert only_me["agg"]["total"] <= refreshed["agg"]["total"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def _add_feature_branch(repo: GitRepo) -> str:
+    """Branch off the current tip and add one extra agent commit on ``feature``,
+    leaving the original branch checked out. Returns the original branch name."""
+    main = repo.current_branch()
+    repo.create_branch("feature", main)
+    repo.switch("feature")
+    _write_lines(repo, "feat.txt", 5)
+    repo.commit(_agent_message("feature work", tokens=_TOKENS))
+    repo.switch(main)
+    return main
+
+
+def test_build_dashboard_for_explicit_branch_reports_that_branch(tmp_path):
+    repo = _demo_repo(tmp_path)  # 7 commits on the default branch
+    main = _add_feature_branch(repo)
+
+    dash = build_dashboard(repo, "feature")
+    assert dash.branch == "feature"
+    assert dash.total_commits == 8  # the default branch's 7 + the feature commit
+    # The selector lists every branch, with the viewed one first.
+    assert dash.branches[0] == "feature"
+    assert main in dash.branches
+
+    # The default (HEAD) view still reports the current branch and its history.
+    head = build_dashboard(repo)
+    assert head.branch == main and head.total_commits == 7
+    assert set(head.branches) == {main, "feature"}
+
+
+def test_dashboard_server_switches_branches_for_per_branch_views(tmp_path):
+    repo = _demo_repo(tmp_path)
+    main = _add_feature_branch(repo)
+    server, thread, base = _serve(repo)
+    try:
+        # The default view is the checked-out branch; the picker offers every branch.
+        data = json.loads(_get(base + "/data"))
+        assert data["branch"] == main and data["agg"]["total"] == 7
+        assert set(data["options"]["branches"]) == {main, "feature"}
+
+        # ?branch=<name> re-scopes both the aggregates and the commit log to that ref.
+        feat = json.loads(_get(base + "/data?branch=feature"))
+        assert feat["branch"] == "feature" and feat["agg"]["total"] == 8
+        flog = json.loads(_get(base + "/log?branch=feature"))
+        assert any("feature work" in e["subject"] for e in flog["entries"])
+
+        # An unknown or injected ref never reaches git — it falls back to HEAD.
+        bogus = json.loads(_get(base + "/data?branch=" + urllib.parse.quote("main; rm -rf /")))
+        assert bogus["branch"] == main and bogus["agg"]["total"] == 7
     finally:
         server.shutdown()
         server.server_close()

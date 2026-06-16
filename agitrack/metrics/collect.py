@@ -38,6 +38,7 @@ import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from functools import cached_property
+from pathlib import Path
 
 from agitrack.commits import METADATA_HEADER
 from agitrack.git import GitRepo
@@ -172,11 +173,12 @@ class LoopFinding:
 @dataclass
 class Dashboard:
     repo: str
-    branch: str
+    branch: str  # the ref this dashboard was built for (the current branch by default)
     stats: list[CommitStat]  # oldest first
     loops: list[LoopFinding]
     sha_logins: dict[str, str] = field(default_factory=dict)  # commit SHA → GitHub login (best-effort)
     commit_base: str = ""  # GitHub commit URL prefix, or "" when no GitHub remote
+    branches: list[str] = field(default_factory=list)  # every local branch, for the per-branch view selector
 
     # --- derived aggregates -------------------------------------------------
 
@@ -535,18 +537,37 @@ def _parents(repo: GitRepo, ref: str) -> dict[str, list[str]]:
     return parents
 
 
+def _abbreviate_home(path: str) -> str:
+    """Replace a leading home-directory prefix with ``~`` so the dashboard (and
+    its public screenshot) never leaks an absolute home path."""
+    try:
+        home = Path.home()
+        rel = Path(path).relative_to(home)
+    except (ValueError, RuntimeError, OSError):
+        return path
+    return "~" if str(rel) == "." else f"~/{rel.as_posix()}"
+
+
 def build_dashboard(repo: GitRepo, ref: str = "HEAD", *, sha_logins: dict[str, str] | None = None) -> Dashboard:
     from agitrack.metrics.github import commit_url_base
 
     stats = collect_commit_stats(repo, ref)
-    branch = repo.current_branch()
+    # The branch the dashboard *shows*: the explicit ref when one is requested,
+    # otherwise whatever HEAD currently points at.
+    branch = repo.current_branch() if ref == "HEAD" else ref
+    # Every local branch feeds the per-branch view selector. Keep the shown branch
+    # in the list (and first) even if it's detached/HEAD so it's always selectable.
+    branches = repo.list_branches()
+    if branch and branch != "HEAD":
+        branches = [branch, *(b for b in branches if b != branch)]
     return Dashboard(
-        repo=str(repo.repo),
+        repo=_abbreviate_home(str(repo.repo)),
         branch=branch,
         stats=stats,
         loops=_detect_loops(stats),
         sha_logins=sha_logins or {},
         commit_base=commit_url_base(repo),
+        branches=branches,
     )
 
 
