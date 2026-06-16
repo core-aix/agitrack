@@ -327,3 +327,114 @@ def test_run_export_pty_failed_exec_exits_child(tmp_path):
     output, exit_code = _run_export_pty(tmp_path / "missing-dir", "ses-x")
 
     assert exit_code == 127
+
+
+def _task_part(parent_id, child_id):
+    # The shape OpenCode records for a `task` sub-agent tool call: its state.metadata
+    # carries the child session id and the parent session id.
+    return {
+        "type": "tool",
+        "tool": "task",
+        "state": {"metadata": {"parentSessionId": parent_id, "sessionId": child_id, "truncated": False}},
+    }
+
+
+def test_task_child_session_ids_requires_parent_and_child():
+    from agitrack.transcripts.opencode import _task_child_session_ids
+
+    assert _task_child_session_ids([_task_part("P", "C")]) == {"C"}
+    # An ordinary tool that merely carries a sessionId (no parentSessionId) is ignored.
+    assert _task_child_session_ids([{"type": "tool", "state": {"metadata": {"sessionId": "C"}}}]) == set()
+    assert _task_child_session_ids([{"type": "text", "text": "hi"}]) == set()
+
+
+def test_parse_exported_session_attributes_subagent_tokens_to_launching_turn():
+    from agitrack.backends.base import TokenUsage
+
+    data = {
+        "info": {"id": "P", "model": {"providerID": "openai", "id": "gpt-5.5"}},
+        "messages": [
+            {"info": {"role": "user", "id": "u1"}, "parts": [{"type": "text", "text": "plain"}]},
+            {
+                "info": {"role": "assistant", "id": "a1", "tokens": {"total": 9, "input": 90, "output": 9}},
+                "parts": [{"type": "text", "text": "ok", "metadata": {"openai": {"phase": "final_answer"}}}],
+            },
+            {"info": {"role": "user", "id": "u2"}, "parts": [{"type": "text", "text": "delegate"}]},
+            {
+                "info": {"role": "assistant", "id": "a2", "tokens": {"total": 12, "input": 100, "output": 12}},
+                "parts": [
+                    _task_part("P", "C"),
+                    {"type": "text", "text": "done", "metadata": {"openai": {"phase": "final_answer"}}},
+                ],
+            },
+        ],
+    }
+    sub = TokenUsage(total=180, subagent_input=6131, subagent_output=180, subagent_cache_read=9728)
+    session = parse_exported_session(data, subagent_tokens={"C": sub})
+
+    first, second = session.turns
+    assert first.tokens.subagent_output == 0  # the plain turn launched no sub-agent
+    assert second.tokens.subagent_output == 180  # attributed to the turn that ran the task
+    assert second.tokens.subagent_input == 6131
+    assert second.tokens.subagent_cache_read == 9728
+    assert second.tokens.total == 12 + 180  # sub-agent generated tokens roll into the total
+
+
+def test_collect_subagent_tokens_recurses_into_nested_subagents(monkeypatch, tmp_path):
+    # A sub-agent that itself spawns a sub-agent: the grandchild's tokens roll up into
+    # the direct child's bucket (and ultimately the launching turn), and a cycle is safe.
+    from agitrack.transcripts import opencode as O
+
+    child = {
+        "info": {"id": "C"},
+        "messages": [
+            {
+                "info": {"role": "assistant", "tokens": {"total": 50, "input": 5, "output": 50}},
+                "parts": [_task_part("C", "G")],
+            },
+        ],
+    }
+    grand = {
+        "info": {"id": "G"},
+        "messages": [
+            {
+                "info": {"role": "assistant", "tokens": {"total": 7, "input": 2, "output": 7}},
+                "parts": [_task_part("G", "C")],
+            },  # cycle back to C
+        ],
+    }
+    exports = {"C": child, "G": grand}
+    monkeypatch.setattr(O, "_export_data", lambda repo, sid: exports.get(sid))
+
+    parent_data = {"info": {"id": "P"}, "messages": [{"info": {"role": "assistant"}, "parts": [_task_part("P", "C")]}]}
+    token_map = O._collect_subagent_tokens(tmp_path, "P", parent_data)
+
+    assert set(token_map) == {"C"}
+    # child output 50 + grandchild output 7, accounted once despite the C->G->C cycle.
+    assert token_map["C"].subagent_output == 57
+    assert token_map["C"].subagent_input == 7  # 5 + 2
+
+
+def test_read_events_captures_child_session_ids_from_task_events():
+    # The headless run() path captures sub-agent child session ids from the live event
+    # stream (a `task` tool event carries the child sessionId in its part metadata), so it
+    # can export each child and fold its tokens into the run's totals.
+    import io
+
+    from agitrack.backends.opencode import OpenCodeBackend
+
+    backend = OpenCodeBackend(repo=__import__("pathlib").Path("."))
+    task_event = json.dumps(
+        {
+            "type": "tool",
+            "part": {
+                "type": "tool",
+                "tool": "task",
+                "state": {"metadata": {"parentSessionId": "P", "sessionId": "ses_child"}},
+            },
+        }
+    )
+    other = json.dumps({"type": "text", "part": {"type": "text", "text": "hi"}})
+    child_ids: set[str] = set()
+    backend._read_events(io.StringIO(task_event + "\n" + other + "\n"), child_ids=child_ids)
+    assert child_ids == {"ses_child"}
