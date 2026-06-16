@@ -78,14 +78,6 @@ def format_dashboard(dash: Dashboard) -> str:
         lines.append(f"    AI-driven +{ai[0]:,} / -{ai[1]:,} | non-tracked +{nt[0]:,} / -{nt[1]:,}")
     lines.append("")
 
-    lines.append("Efficiency suggestions (repeated prompts and costly low-yield turns)")
-    if dash.suggestions:
-        for s in dash.suggestions:
-            tokens = f" ({s.output_tokens:,} output tokens)" if s.output_tokens else ""
-            lines.append(f"  - {s.detail}{tokens}")
-    else:
-        lines.append("  nothing notable")
-
     return "\n".join(lines)
 
 

@@ -210,13 +210,10 @@ def _filter_stats(dash: Dashboard, *, author: str, backend: str, model: str, frm
 
 
 def _filtered_dashboard(dash: Dashboard, stats: list[CommitStat]) -> Dashboard:
-    from agitrack.metrics.collect import _efficiency_suggestions
-
     return Dashboard(
         repo=dash.repo,
         branch=dash.branch,
         stats=stats,
-        suggestions=_efficiency_suggestions(stats),
         sha_logins=dash.sha_logins,
         commit_base=dash.commit_base,
     )
@@ -235,24 +232,7 @@ def _aggregates(fd: Dashboard) -> dict:
         "by_backend": fd.by_backend,
         "by_model": fd.by_model,
         "by_committer": fd.by_author,
-        "suggestions": _suggestion_payload(fd),
     }
-
-
-def _suggestion_payload(fd: Dashboard) -> list[dict]:
-    # Map each short SHA to its GitHub commit URL (when the repo has a GitHub remote)
-    # so the dashboard can render a suggestion's SHAs as clickable links.
-    sha_url = {stat.short: fd.commit_base + stat.sha for stat in fd.stats} if fd.commit_base else {}
-    return [
-        {
-            "kind": s.kind,
-            "detail": s.detail,
-            "shas": s.shas,
-            "urls": [sha_url.get(sha, "") for sha in s.shas],
-            "output": s.output_tokens,
-        }
-        for s in fd.suggestions
-    ]
 
 
 # Kinds whose LINES count as tracked-AI in the time series — kept in step with
@@ -402,6 +382,22 @@ def aggregates_payload(
     }
 
 
+# Commit-log sort orders the user can choose (applied after the filter scope).
+LOG_SORTS = ("date", "lines", "tokens")
+DEFAULT_LOG_SORT = "date"
+
+
+def _sorted_for_log(stats: list[CommitStat], sort: str) -> list[CommitStat]:
+    """Order the filtered commits for the log. ``date`` (default) is newest-first;
+    ``lines`` and ``tokens`` rank by magnitude (most changed lines / most output
+    tokens) with the newest commit breaking ties. ``stats`` arrives oldest-first."""
+    if sort == "lines":
+        return sorted(stats, key=lambda s: (s.insertions + s.deletions, s.timestamp), reverse=True)
+    if sort == "tokens":
+        return sorted(stats, key=lambda s: (s.tokens.get("output", 0), s.timestamp), reverse=True)
+    return list(reversed(stats))  # "date": newest first
+
+
 def _log_entry(dash: Dashboard, stat: CommitStat, covers: dict[str, CommitStat]) -> dict:
     eff_backend, eff_model = _effective(stat, covers)
     return {
@@ -434,12 +430,13 @@ def log_page(
     to: int = 0,
     offset: int = 0,
     limit: int = PAGE_SIZE,
+    sort: str = DEFAULT_LOG_SORT,
 ) -> dict:
-    """One page of the commit log (newest first) for the given filters. Only this
+    """One page of the commit log for the given filters and sort order. Only this
     page's commits carry the heavy message / squash constituents, so memory and
     payload stay bounded however deep the history is."""
     stats = _filter_stats(dash, author=author, backend=backend, model=model, frm=frm, to=to)
-    stats.reverse()  # newest first
+    stats = _sorted_for_log(stats, sort)
     covers = _covers(dash)
     offset = max(0, offset)
     limit = max(1, min(limit, 200))
@@ -480,6 +477,8 @@ _TEMPLATE = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>aGiTrack dashboard · __REPO_NAME__</title>
+<!-- Inline SVG favicon (the aGiTrack wordmark mark) — the server only serves /, /data, /log, so it can't host a file. -->
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2064%2064'%3E%3Crect%20width='64'%20height='64'%20rx='13'%20fill='%23070b09'/%3E%3Ctext%20x='32'%20y='45'%20text-anchor='middle'%20font-family='ui-monospace,monospace'%20font-weight='700'%20font-size='42'%20letter-spacing='-1'%3E%3Ctspan%20fill='%23ffb454'%3Ea%3C/tspan%3E%3Ctspan%20fill='%233dffa0'%3EG%3C/tspan%3E%3C/text%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=VT323&family=IBM+Plex+Mono:ital,wght@0,400;0,500;0,600;1,400&display=swap" rel="stylesheet">
@@ -560,6 +559,16 @@ input[type=date]::-webkit-calendar-picker-indicator{filter:invert(.7) sepia(1) h
 h2.section{font-family:var(--display);font-size:27px;font-weight:400;color:var(--phosphor);letter-spacing:1px;
   margin:38px 0 14px;text-shadow:0 0 16px rgba(61,255,160,.3)}
 h2.section::before{content:"# ";color:var(--amber)}
+/* commit-log heading row with its sort selector on the right */
+.loghead{display:flex;align-items:baseline;justify-content:space-between;gap:14px;flex-wrap:wrap;margin:38px 0 14px}
+.loghead h2.section{margin:0}
+.logsort{display:flex;align-items:center;gap:8px}
+.logsort label{font-size:11px;color:var(--amber);letter-spacing:.6px;text-transform:uppercase}
+.logsort select{appearance:none;background:var(--ink);color:var(--fg);border:1px solid var(--line);
+  font-family:var(--mono);font-size:13px;padding:5px 26px 5px 10px;cursor:pointer;
+  background-image:linear-gradient(45deg,transparent 50%,var(--phosphor-dim) 50%),linear-gradient(135deg,var(--phosphor-dim) 50%,transparent 50%);
+  background-position:calc(100% - 14px) 50%,calc(100% - 9px) 50%;background-size:5px 5px,5px 5px;background-repeat:no-repeat}
+.logsort select:focus{outline:none;border-color:var(--phosphor)}
 
 /* ---- stat cards ---- */
 .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px}
@@ -632,18 +641,6 @@ h2.section::before{content:"# ";color:var(--amber)}
 .split{display:grid;grid-template-columns:1fr 1fr;gap:14px}
 @media (max-width:760px){.split{grid-template-columns:1fr}.row{grid-template-columns:1fr;gap:6px}}
 
-/* ---- efficiency suggestions ---- */
-.loop{padding:13px 18px;border-bottom:1px solid var(--line)}
-.loop:last-child{border-bottom:none}
-.loop .where{color:var(--red)}
-.loop .q{color:var(--fg);font-style:italic;word-break:break-word}
-.loop .cost{color:var(--amber);font-size:12.5px}
-/* Clickable commit SHA chips in a suggestion (GitHub link or jump-to-log). */
-.sharefs .sharef{font-family:var(--mono);font-size:12.5px;color:var(--phosphor);background:rgba(61,255,160,.08);
-  border:1px solid var(--phosphor-dim);border-radius:3px;padding:1px 6px;margin-right:4px;cursor:pointer;white-space:nowrap}
-.sharefs a.sharef:hover,.sharefs span.sharef:hover{color:var(--ink);background:var(--phosphor)}
-@keyframes flashrow{from{background:rgba(61,255,160,.28)}to{background:transparent}}
-.entry.flash{animation:flashrow 1.4s ease-out}
 
 /* ---- commit log rail ---- */
 .log{position:relative;padding-left:34px;margin-top:8px}
@@ -783,13 +780,17 @@ footer{margin-top:46px;padding-top:22px;border-top:1px dashed var(--line);color:
   <h2 class="section">by committer</h2>
   <div class="panel" id="by-committer"></div>
 
-  <h2 class="section">efficiency suggestions</h2>
-  <div class="panel" id="suggestions"></div>
-
   <h2 class="section">shared sessions</h2>
   <div class="panel" id="shared"></div>
 
-  <h2 class="section">commit log</h2>
+  <div class="loghead">
+    <h2 class="section">commit log</h2>
+    <div class="logsort"><label for="f-sort">sort</label><select id="f-sort" title="Sort the filtered commits">
+      <option value="date">newest first</option>
+      <option value="lines">most lines changed</option>
+      <option value="tokens">most output tokens</option>
+    </select></div>
+  </div>
   <div class="log" id="commitlog"></div>
 
   <footer>
@@ -840,7 +841,7 @@ const REFRESH_MS = 30000, DAY = 86400;
 
 // DEFAULT_BRANCH is the branch the page first loaded for; "reset" returns to it.
 const DEFAULT_BRANCH = INIT.branch || "";
-const state = {branch:DEFAULT_BRANCH, author:"", backend:"", model:"", fromTs:0, toTs:0, granularity:(INIT.timeseries&&INIT.timeseries.granularity)||"day"};
+const state = {branch:DEFAULT_BRANCH, author:"", backend:"", model:"", fromTs:0, toTs:0, sort:"date", granularity:(INIT.timeseries&&INIT.timeseries.granularity)||"day"};
 // Only a page served over http(s) has a backend to reach; a file:// snapshot has
 // none, so it must never raise a false "server unreachable" alarm.
 const LIVE = location.protocol.indexOf("http") === 0;
@@ -876,7 +877,7 @@ async function loadAgg(){
   return false;
 }
 async function loadLog(offset){
-  try{ const r = await fetch("log?"+qs({offset:offset||0, limit:PAGE_SIZE}), {cache:"no-store"});
+  try{ const r = await fetch("log?"+qs({offset:offset||0, limit:PAGE_SIZE, sort:state.sort}), {cache:"no-store"});
     if(r.ok){ LOGPAGE = await r.json(); setOffline(false); return true; } }
   catch(e){ if(LIVE) setOffline(true); }
   return false;
@@ -991,23 +992,6 @@ function renderAgg(){
     ? comm.map(([name,b]) => barRow(name, `${b.commits} commits · ${b.agitrack} via aGiTrack`, b.ai, maxC,
         `AI-driven <b>${fmt(b.ai)}</b> · non-tracked ${fmt(b.nt)}`)).join("")
     : `<div class="empty">no commits</div>`;
-
-  $("suggestions").innerHTML = (AGG.suggestions||[]).length
-    ? AGG.suggestions.map(s => {
-        const tag = s.kind === "repeat" ? "repeated prompt" : "costly turn";
-        // Each SHA is clickable: a GitHub link when the repo has a remote, else a
-        // chip that scrolls to and opens that commit in the log below.
-        const chips = (s.shas||[]).map((sha,i) => {
-          const url = (s.urls||[])[i];
-          return url
-            ? `<a class="sharef" href="${esc(url)}" target="_blank" rel="noopener" title="View ${esc(sha)} on GitHub">${esc(sha)}</a>`
-            : `<span class="sharef" data-sha="${esc(sha)}" title="Show ${esc(sha)} in the commit log">${esc(sha)}</span>`;
-        }).join(" ");
-        return `<div class="loop"><span class="where">${esc(tag)}</span> — <span class="q">${esc(s.detail)}</span>`+
-          (chips?` <span class="sharefs">${chips}</span>`:"")+
-          (s.output?` <span class="cost">${fmt(s.output)} output tokens</span>`:"")+`</div>`;
-      }).join("")
-    : `<div class="empty">nothing notable — no repeated prompts or costly low-yield turns</div>`;
 
   tsHover = -1;
   renderTimeseries();
@@ -1248,19 +1232,6 @@ function toggleDetail(i){
   }
 }
 
-// Scroll the commit log into view and, when the SHA is on the loaded page, open
-// and briefly highlight that entry. Used by suggestion SHA chips on repos with no
-// GitHub remote (where the chip can't be a link).
-function jumpToCommit(sha){
-  $("commitlog").scrollIntoView({behavior:"smooth", block:"start"});
-  const i = LOG_ENTRIES.findIndex(c => c.short === sha);
-  if(i < 0) return;
-  const detail = $("detail-"+i);
-  if(detail && detail.hidden) toggleDetail(i);
-  const row = document.querySelector(`#commitlog .entry[data-i="${i}"]`);
-  if(row){ row.classList.add("flash"); setTimeout(() => row.classList.remove("flash"), 1400); }
-}
-
 function fillSelect(id, values, allLabel, keep){
   const sel = $(id);
   sel.innerHTML = `<option value="">${allLabel}</option>` +
@@ -1354,6 +1325,10 @@ function init(){
   $("f-author").onchange = e => { state.author = e.target.value; applyFilters(); };
   $("f-backend").onchange = e => { state.backend = e.target.value; applyFilters(); };
   $("f-model").onchange = e => { state.model = e.target.value; applyFilters(); };
+  // Sort only reorders the (already filtered) commit log, so it just reloads the
+  // log's first page — no need to recompute the aggregates.
+  $("f-sort").value = state.sort;
+  $("f-sort").onchange = async e => { state.sort = e.target.value; if(await loadLog(0)) renderLog(); };
   // "custom range…" reveals a date-range popup anchored under the select; the
   // presets and "all time" hide it.
   const showDateRange = on => { $("daterange").hidden = !on; };
@@ -1369,6 +1344,7 @@ function init(){
   $("reset").onclick = () => {
     state.author=state.backend=state.model="";
     state.branch=DEFAULT_BRANCH;  // back to the branch the page loaded for
+    state.sort="date"; $("f-sort").value="date";  // back to newest-first
     $("f-period").value=""; showDateRange(false); applyPeriod();  // back to all time → full span
     applyFilters();
   };
@@ -1379,12 +1355,6 @@ function init(){
     if(e.target.closest("a") || e.target.closest(".detail") || e.target.closest(".pager")) return;
     const entry = e.target.closest(".entry");
     if(entry) toggleDetail(+entry.dataset.i);
-  });
-  // A suggestion's non-link SHA chip jumps to that commit in the log (the link
-  // chips are plain <a> and navigate on their own).
-  $("suggestions").addEventListener("click", e => {
-    const chip = e.target.closest(".sharef[data-sha]");
-    if(chip) jumpToCommit(chip.dataset.sha);
   });
   // Toggle a series on/off from the legend; redraw the plot in place.
   $("ts-legend").addEventListener("click", e => {

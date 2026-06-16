@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <rect width="64" height="64" rx="13" fill="#070b09"/>
+  <text x="32" y="45" text-anchor="middle"
+        font-family="'VT323','IBM Plex Mono',ui-monospace,monospace"
+        font-weight="700" font-size="42" letter-spacing="-1">
+    <tspan fill="#ffb454">a</tspan><tspan fill="#3dffa0">G</tspan>
+  </text>
+</svg>

@@ -21,7 +21,7 @@ from agitrack import cli
 from agitrack.commits import build_agent_commit_message, build_agent_merge_message, build_user_commit_message
 from agitrack.git import GitRepo
 from agitrack.metrics import build_dashboard, build_server, dashboard_data, render_dashboard, render_html
-from agitrack.metrics.collect import CommitStat, _detect_loops, resolve_committers
+from agitrack.metrics.collect import CommitStat, resolve_committers
 
 
 def _write_lines(repo: GitRepo, name: str, count: int) -> None:
@@ -251,7 +251,6 @@ def test_render_dashboard_contains_all_sections(tmp_path):
         "By backend",
         "By model",
         "By committer",
-        "Efficiency suggestions",
     ):
         assert heading in text
     assert "aGiTrack-tracked commits: 5/7" in text
@@ -382,7 +381,7 @@ def test_parse_co_authors_extracts_humans_and_drops_ai_and_bots():
 
 
 def _co_authored_dashboard(subject: str):
-    from agitrack.metrics.collect import Dashboard, _efficiency_suggestions
+    from agitrack.metrics.collect import Dashboard
 
     stat = CommitStat(
         sha="s1",
@@ -393,7 +392,7 @@ def _co_authored_dashboard(subject: str):
         timestamp=1_700_000_000,
         co_authors=[("Robin Roe", "robin@example.com")],
     )
-    return Dashboard(repo="r", branch="main", stats=[stat], suggestions=_efficiency_suggestions([stat])), stat
+    return Dashboard(repo="r", branch="main", stats=[stat]), stat
 
 
 def test_co_authored_commit_is_filterable_under_every_committer():
@@ -410,7 +409,7 @@ def test_co_authored_commit_is_filterable_under_every_committer():
 
 
 def test_bot_and_ai_primary_authors_are_not_committers():
-    from agitrack.metrics.collect import Dashboard, _efficiency_suggestions
+    from agitrack.metrics.collect import Dashboard
     from agitrack.metrics.web import _options
 
     bot = CommitStat(
@@ -421,7 +420,7 @@ def test_bot_and_ai_primary_authors_are_not_committers():
         kind="untracked",
     )
     human = CommitStat(sha="h1", author="Alex Doe", email="alex@example.com", subject="Real work", kind="agent")
-    dash = Dashboard(repo="r", branch="main", stats=[bot, human], suggestions=_efficiency_suggestions([bot, human]))
+    dash = Dashboard(repo="r", branch="main", stats=[bot, human])
     # The bot is the primary author but is not a committer: empty here, absent
     # from the filter options and the per-committer breakdown.
     assert dash.committers_of(bot) == []
@@ -561,163 +560,38 @@ def test_cached_logins_serves_warm_cache_without_spawning(monkeypatch, tmp_path)
     assert calls["n"] == 0  # warm cache: no background crawl spawned
 
 
-# --- loop detection ------------------------------------------------------------
+# --- commit-log sort ----------------------------------------------------------
 
 
-def _agent_stat(sha: str, prompt: str, output: int = 10, user_prompts: list[str] | None = None) -> CommitStat:
-    return CommitStat(
-        sha=sha,
-        author="a",
-        email="a@example.com",
-        subject=f"<aGiTrack> {prompt}",
-        kind="agent",
-        tokens={"output": output},
-        prompt=prompt,
-        user_prompts=user_prompts or [],
-    )
+def test_log_page_sorts_by_lines_tokens_or_newest(tmp_path):
+    from agitrack.metrics.web import log_page
+
+    dash = build_dashboard(_demo_repo(tmp_path))
+
+    # Default: newest first (descending commit timestamp).
+    dates = [e["ts"] for e in log_page(dash)["entries"]]
+    assert dates == sorted(dates, reverse=True)
+
+    # By lines changed (insertions + deletions), most first.
+    totals = [e["ins"] + e["del"] for e in log_page(dash, sort="lines")["entries"]]
+    assert totals == sorted(totals, reverse=True)
+
+    # By output tokens, most first.
+    outputs = [e["tokens"].get("output", 0) for e in log_page(dash, sort="tokens")["entries"]]
+    assert outputs == sorted(outputs, reverse=True)
+
+    # Every sort returns the same commits, only reordered.
+    assert {e["short"] for e in log_page(dash, sort="lines")["entries"]} == {
+        e["short"] for e in log_page(dash)["entries"]
+    }
 
 
-def test_loop_detected_across_consecutive_similar_prompts():
-    stats = [
-        _agent_stat("a" * 40, "fix the failing parser test"),
-        _agent_stat("b" * 40, "fix the failing parser test again"),
-        _agent_stat("c" * 40, "please fix the failing parser test"),
-        _agent_stat("d" * 40, "write the changelog"),
-    ]
+def test_log_page_unknown_sort_falls_back_to_newest_first(tmp_path):
+    from agitrack.metrics.web import log_page
 
-    (finding,) = _detect_loops(stats)
-    assert finding.shas == ["a" * 7, "b" * 7, "c" * 7]
-    assert finding.output_tokens == 30
-    assert finding.within_commit is False
-
-
-def test_no_loop_for_two_similar_prompts_or_distinct_prompts():
-    stats = [
-        _agent_stat("a" * 40, "fix the failing parser test"),
-        _agent_stat("b" * 40, "fix the failing parser test again"),  # a retry, not a loop
-        _agent_stat("c" * 40, "add the dashboard renderer"),
-    ]
-    assert _detect_loops(stats) == []
-
-
-def test_loop_detected_within_a_single_commit_trace():
-    stats = [
-        _agent_stat(
-            "a" * 40,
-            "make the tests pass",
-            output=99,
-            user_prompts=["make the tests pass", "make the tests pass", "make the tests pass now"],
-        )
-    ]
-
-    (finding,) = _detect_loops(stats)
-    assert finding.within_commit is True
-    assert finding.output_tokens == 99
-
-
-def test_efficiency_suggestions_flag_costly_low_yield_turns():
-    from agitrack.metrics.collect import _efficiency_suggestions
-
-    def turn(sha, prompt, output, lines):
-        return CommitStat(
-            sha=sha,
-            author="a",
-            email="a@e",
-            subject=prompt,
-            kind="agent",
-            prompt=prompt,
-            tokens={"output": output},
-            insertions=lines,
-            deletions=0,
-        )
-
-    stats = [
-        turn("1" * 40, "add the parser", 100, 50),  # cheap, high yield
-        turn("2" * 40, "wire the cli", 100, 40),  # cheap, high yield
-        turn("3" * 40, "debug the deadlock", 1000, 5),  # expensive, low yield
-        turn("4" * 40, "chase the flaky timeout", 1000, 2),  # expensive, low yield
-    ]
-    suggestions = _efficiency_suggestions(stats)
-    # Distinct prompts ⇒ no repeat loop; only the two expensive low-yield turns
-    # surface, costliest first.
-    assert all(s.kind == "costly" for s in suggestions)
-    assert [s.shas[0] for s in suggestions] == ["3" * 7, "4" * 7]
-
-
-def test_suggestion_shas_carry_github_urls_when_remote_present():
-    from agitrack.metrics.collect import Dashboard, _efficiency_suggestions
-    from agitrack.metrics.web import aggregates_payload
-
-    def turn(sha, prompt, output, lines):
-        return CommitStat(
-            sha=sha,
-            author="a",
-            email="a@e",
-            subject=prompt,
-            kind="agent",
-            prompt=prompt,
-            tokens={"output": output},
-            insertions=lines,
-        )
-
-    stats = [
-        turn("1" * 40, "add the parser", 100, 50),
-        turn("2" * 40, "wire the cli", 100, 40),
-        turn("3" * 40, "debug the deadlock", 1000, 5),
-        turn("4" * 40, "chase the flaky timeout", 1000, 2),
-    ]
-    base = "https://github.com/o/r/commit/"
-    dash = Dashboard(
-        repo="r",
-        branch="main",
-        stats=stats,
-        suggestions=_efficiency_suggestions(stats),
-        commit_base=base,
-    )
-    payload = aggregates_payload(dash)["agg"]["suggestions"]
-    assert payload  # the costly turns surfaced
-    # Each SHA chip carries the full-SHA GitHub commit link so it can open it.
-    assert payload[0]["shas"] == ["3" * 7]
-    assert payload[0]["urls"] == [base + "3" * 40]
-
-    # Without a GitHub remote the URLs are blank (the chip becomes a jump-to-log).
-    dash.commit_base = ""
-    no_remote = aggregates_payload(dash)["agg"]["suggestions"]
-    assert no_remote[0]["urls"] == [""]
-
-
-def test_efficiency_suggestions_empty_for_lean_history():
-    from agitrack.metrics.collect import _efficiency_suggestions
-
-    # Distinct prompts, all with healthy yield → nothing notable to suggest.
-    stats = [
-        CommitStat(
-            sha=str(i) * 40,
-            author="a",
-            email="a@e",
-            subject=p,
-            kind="agent",
-            prompt=p,
-            tokens={"output": 100},
-            insertions=60,
-        )
-        for i, p in enumerate(["add parser", "wire cli", "write docs", "add tests"])
-    ]
-    assert _efficiency_suggestions(stats) == []
-
-
-def test_dashboard_suggestions_flag_repeated_prompts(tmp_path):
-    repo = GitRepo.init(tmp_path)
-    for index, name in enumerate(("a.txt", "b.txt", "c.txt")):
-        _write_lines(repo, name, 2)
-        repo.commit(_agent_message("fix the flaky integration test", tokens=_TOKENS))
-
-    dash = build_dashboard(repo)
-    # Three identical prompts in a row surface as one "repeat" efficiency suggestion.
-    repeats = [s for s in dash.suggestions if s.kind == "repeat"]
-    assert len(repeats) == 1
-    assert len(repeats[0].shas) == 3
-    assert "Efficiency suggestions" in render_dashboard(repo)
+    dash = build_dashboard(_demo_repo(tmp_path))
+    bogus = [e["ts"] for e in log_page(dash, sort="whatever")["entries"]]
+    assert bogus == [e["ts"] for e in log_page(dash, sort="date")["entries"]]
 
 
 # --- HTML dashboard (filterable web view) --------------------------------------
