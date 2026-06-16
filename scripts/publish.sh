@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Publish aGiT to PyPI and open a release pull request.
+# Publish aGiTrack to PyPI and open a release pull request.
 #
 # What it does, in order:
 #   1. Verify the working tree is on `main`, clean, and in sync with origin/main.
@@ -11,7 +11,7 @@
 #      to 0 (X.Y.Z -> X.Y+1.0); --major bumps the major and resets minor and
 #      patch to 0 (X.Y.Z -> X+1.0.0).
 #   4. Write that version to pyproject.toml (the only version source;
-#      agit.__version__ derives from the installed distribution metadata).
+#      agitrack.__version__ derives from the installed distribution metadata).
 #   5. Build the sdist + wheel (uv build) and upload them to PyPI (uv publish).
 #   6. Commit "Release vX.Y.Z" on a `release/vX.Y.Z` branch, push it, and open a
 #      pull request into main with `gh`.
@@ -24,9 +24,14 @@
 # not-yet-merged bump never causes a collision on the next run. Merge the PR
 # (then tag — see the printed instructions) to finish the release.
 #
-# Distribution name: `agit-ai` (the plain `agit` name on PyPI belongs to an
-# unrelated project). The import package and installed command stay `agit`, so
-# users `pip install agit-ai` and then run `agit`.
+# Distribution name: `agitrack`. After the aGiT -> aGiTrack rename the
+# distribution, the import package, and the command are all `agitrack`, so users
+# `pip install agitrack` and then run `agitrack` (with `agit` kept as an alias).
+#
+# NOTE: PyPI projects cannot be renamed, so `agitrack` is a NEW project. The
+# first upload creates it and needs an ACCOUNT-scoped token (a token scoped to
+# the old `agit-ai` project cannot publish here); switch to a project-scoped
+# token once `agitrack` exists.
 #
 # Authentication:
 #   * PyPI:   uv publish reads a token from $UV_PUBLISH_TOKEN (or pass --token).
@@ -48,7 +53,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-DIST_NAME="agit-ai"   # PyPI distribution name (import name stays `agit`)
+DIST_NAME="agitrack"   # PyPI distribution name (== import name == command)
 RELEASE_BRANCH="main"
 
 RUN_CHECK=1
@@ -190,7 +195,7 @@ python3 - "$NEXT_VERSION" <<'PY'
 import re, sys, pathlib
 
 version = sys.argv[1]
-# pyproject.toml is the only version source; agit.__version__ derives from the
+# pyproject.toml is the only version source; agitrack.__version__ derives from the
 # installed distribution metadata at runtime.
 pp = pathlib.Path("pyproject.toml")
 pp.write_text(re.sub(r'^version = "[^"]+"', f'version = "{version}"', pp.read_text(), count=1, flags=re.M))

@@ -16,9 +16,9 @@ The reported problems, each pinned by a test here:
 import threading
 import time
 
-from agit.commits import apply_summary_to_message, build_agent_commit_message, summary_metadata_lines
-from agit.config import AgitState
-from agit.git import GitRepo
+from agitrack.commits import apply_summary_to_message, build_agent_commit_message, summary_metadata_lines
+from agitrack.config import AgitrackState
+from agitrack.git import GitRepo
 
 from proxy_helpers import make_runner
 
@@ -38,7 +38,7 @@ def _base_message(**overrides) -> str:
         trace=[{"role": "user", "content": "please add the widget renderer"}],
         backend="claude",
         backend_session_id="ses-1",
-        agit_session_id="agit-1",
+        agitrack_session_id="agit-1",
         model="m1",
         session_name="s1",
     )
@@ -48,7 +48,7 @@ def _base_message(**overrides) -> str:
 
 def test_summary_leads_message_and_takes_subject():
     message = _base_message(summary=SUMMARY)
-    assert message.startswith("<aGiT> Implement the widget renderer with caching\n")
+    assert message.startswith("<aGiTrack> Implement the widget renderer with caching\n")
     body = message.split("\n", 1)[1]
     # The rest of the summary is the body's first paragraph (no # Summary
     # section), then straight to the trace — no # Prompts duplication.
@@ -63,14 +63,14 @@ def test_summary_leads_message_and_takes_subject():
 def test_long_summary_first_line_is_truncated_to_subject_width():
     message = _base_message(summary="word " * 40)
     subject = message.splitlines()[0]
-    assert subject.startswith("<aGiT> ")
+    assert subject.startswith("<aGiTrack> ")
     assert len(subject) <= 72
     assert subject.endswith("...")
 
 
 def test_without_summary_prompts_still_head_the_message():
     message = _base_message()
-    assert message.startswith("<aGiT> please add the widget renderer / and cache it")
+    assert message.startswith("<aGiTrack> please add the widget renderer / and cache it")
     assert "# Summary" not in message
     assert "# Prompts" not in message
 
@@ -83,7 +83,7 @@ def test_summary_metadata_lines_record_cost():
         "summary_tokens_output: 40",
     ]
     message = _base_message(summary=SUMMARY, summary_metadata=lines)
-    assert message.index("summary_model: cheap-model") < message.index("agit_version:")
+    assert message.index("summary_model: cheap-model") < message.index("agitrack_version:")
 
 
 def test_apply_summary_rewrites_subject_and_preserves_everything():
@@ -91,7 +91,7 @@ def test_apply_summary_rewrites_subject_and_preserves_everything():
     amended = apply_summary_to_message(
         original, SUMMARY, summary_metadata=summary_metadata_lines(model="m", tokens_input=5)
     )
-    assert amended.startswith("<aGiT> Implement the widget renderer with caching\n")
+    assert amended.startswith("<aGiTrack> Implement the widget renderer with caching\n")
     # The rest of the summary is the first paragraph (no # Summary section).
     assert "# Summary" not in amended
     assert "# Prompts" not in amended
@@ -101,7 +101,7 @@ def test_apply_summary_rewrites_subject_and_preserves_everything():
     # Trace and metadata survive; metrics land before the version line.
     assert "# Interaction Trace" in amended
     assert "backend_session_id: ses-1" in amended
-    assert amended.index("summary_tokens_input: 5") < amended.index("agit_version:")
+    assert amended.index("summary_tokens_input: 5") < amended.index("agitrack_version:")
 
 
 def test_apply_summary_is_idempotent():
@@ -146,15 +146,15 @@ class FakeSummarizer:
 
 
 def _summary_runner(tmp_path, monkeypatch):
-    monkeypatch.setattr("agit.summaries.Summarizer", FakeSummarizer)
-    monkeypatch.setenv("AGIT_CONFIG_DIR", str(tmp_path / "agit-config"))
+    monkeypatch.setattr("agitrack.summaries.Summarizer", FakeSummarizer)
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path / "agit-config"))
     FakeSummarizer.gate = None
     FakeSummarizer.fail = None
     FakeSummarizer.fail_session = None
     repo = GitRepo.init(tmp_path)
     base = repo.current_branch()
-    repo.switch("agit/test/s1/t1", create=True)
-    runner = make_runner(repo=repo, state=AgitState(tmp_path), worktree=object(), _base_branch=base)
+    repo.switch("agitrack/test/s1/t1", create=True)
+    runner = make_runner(repo=repo, state=AgitrackState(tmp_path), worktree=object(), _base_branch=base)
     runner.global_config = None
     runner._render = lambda *a, **k: None
     return runner, repo
@@ -175,7 +175,7 @@ def _finish_summary(runner):
 def test_commit_path_does_not_block_on_summarization(tmp_path, monkeypatch):
     runner, repo = _summary_runner(tmp_path, monkeypatch)
     FakeSummarizer.gate = threading.Event()  # summary hangs until released
-    sha = _commit_change(repo, "a.txt", "<aGiT> prompt subject")
+    sha = _commit_change(repo, "a.txt", "<aGiTrack> prompt subject")
 
     started = time.monotonic()
     runner._start_commit_summary(sha, _TRACE_TEXT)
@@ -185,42 +185,42 @@ def test_commit_path_does_not_block_on_summarization(tmp_path, monkeypatch):
     # hash is noise to the user while the summary is in flight).
     assert "summarizing" in (runner.message or "")
     assert sha not in (runner.message or "")
-    assert repo.commit_message("HEAD").startswith("<aGiT> prompt subject")  # commit untouched so far
+    assert repo.commit_message("HEAD").startswith("<aGiTrack> prompt subject")  # commit untouched so far
 
     FakeSummarizer.gate.set()
     _finish_summary(runner)
     head = repo.commit_message("HEAD")
-    assert head.startswith("<aGiT> Implement the widget renderer with caching")
+    assert head.startswith("<aGiTrack> Implement the widget renderer with caching")
     assert "# Prompts" not in head  # prompts are not duplicated into a section
     assert "summary_tokens_input: 7" in head and "summary_tokens_output: 3" in head
     assert runner._summary_pending is None
     # Summary and rolling session summary are queryable as git notes too.
     final = repo.rev_parse("HEAD")
-    assert "widget renderer" in (repo.notes_show(final, namespace="agit/commit-summary") or "")
+    assert "widget renderer" in (repo.notes_show(final, namespace="agitrack/commit-summary") or "")
     assert runner.state.session_summary == "rolling narrative v2"
-    assert (repo.notes_show(final, namespace="agit/session-summary") or "").startswith("rolling narrative")
+    assert (repo.notes_show(final, namespace="agitrack/session-summary") or "").startswith("rolling narrative")
 
 
 def test_summarizing_notice_precedes_created_popup_worktree(tmp_path, monkeypatch):
-    # The reported bug: the "Created <aGiT> commit … merged" popup appeared
+    # The reported bug: the "Created <aGiTrack> commit … merged" popup appeared
     # before the "summarizing…" one. A worktree session announces the commit
     # only at integration, so while the summary is in flight only the
     # "summarizing…" notice may show — never a premature "Created" popup.
     runner, repo = _summary_runner(tmp_path, monkeypatch)
     FakeSummarizer.gate = threading.Event()  # hold the summary open
-    sha = _commit_change(repo, "a.txt", "<aGiT> prompt subject")
+    sha = _commit_change(repo, "a.txt", "<aGiTrack> prompt subject")
     runner._last_agent_commit_id = repo.short_sha(sha)
     runner._commit_merged_pending = True  # armed by on_commit_fn at commit time
 
     runner._start_commit_summary(sha, _TRACE_TEXT)
 
     assert "summarizing" in (runner.message or "")
-    assert "Created <aGiT> commit" not in (runner.message or "")
+    assert "Created <aGiTrack> commit" not in (runner.message or "")
     # Only at integration does the "created (summarized)" popup appear.
     FakeSummarizer.gate.set()
     _finish_summary(runner)
     runner._announce_agent_commit()
-    assert "Created <aGiT> commit" in (runner.message or "") and "(summarized)" in runner.message
+    assert "Created <aGiTrack> commit" in (runner.message or "") and "(summarized)" in runner.message
 
 
 def test_no_worktree_commit_announced_only_after_summary(tmp_path, monkeypatch):
@@ -230,24 +230,24 @@ def test_no_worktree_commit_announced_only_after_summary(tmp_path, monkeypatch):
     runner, repo = _summary_runner(tmp_path, monkeypatch)
     runner.worktree = None  # delegates to the active session
     FakeSummarizer.gate = threading.Event()
-    sha = _commit_change(repo, "a.txt", "<aGiT> prompt subject")
+    sha = _commit_change(repo, "a.txt", "<aGiTrack> prompt subject")
     runner._last_agent_commit_id = repo.short_sha(sha)
     runner._commit_merged_pending = True
 
     runner._start_commit_summary(sha, _TRACE_TEXT)
     assert "summarizing" in (runner.message or "")
-    assert "Created <aGiT> commit" not in (runner.message or "")
+    assert "Created <aGiTrack> commit" not in (runner.message or "")
 
     FakeSummarizer.gate.set()
     _finish_summary(runner)
     # The summary service announced the commit (nothing else would have).
-    assert "Created <aGiT> commit" in (runner.message or "")
+    assert "Created <aGiTrack> commit" in (runner.message or "")
     assert runner._commit_merged_pending is False
 
 
 def test_summary_after_integration_lands_as_notes_only(tmp_path, monkeypatch):
     runner, repo = _summary_runner(tmp_path, monkeypatch)
-    sha = _commit_change(repo, "a.txt", "<aGiT> prompt subject")
+    sha = _commit_change(repo, "a.txt", "<aGiTrack> prompt subject")
     runner._start_commit_summary(sha, _TRACE_TEXT)
     runner._summary_thread.join(timeout=10)
     # The commit integrated (base advanced) before the summary arrived.
@@ -256,13 +256,13 @@ def test_summary_after_integration_lands_as_notes_only(tmp_path, monkeypatch):
 
     runner._service_commit_summary()
 
-    assert repo.commit_message("HEAD").startswith("<aGiT> prompt subject")  # no amend of integrated history
-    assert "widget renderer" in (repo.notes_show(full, namespace="agit/commit-summary") or "")
+    assert repo.commit_message("HEAD").startswith("<aGiTrack> prompt subject")  # no amend of integrated history
+    assert "widget renderer" in (repo.notes_show(full, namespace="agitrack/commit-summary") or "")
 
 
 def test_summary_with_staged_changes_lands_as_notes_only(tmp_path, monkeypatch):
     runner, repo = _summary_runner(tmp_path, monkeypatch)
-    sha = _commit_change(repo, "a.txt", "<aGiT> prompt subject")
+    sha = _commit_change(repo, "a.txt", "<aGiTrack> prompt subject")
     runner._start_commit_summary(sha, _TRACE_TEXT)
     runner._summary_thread.join(timeout=10)
     # The next turn already staged work: --amend would swallow it.
@@ -271,40 +271,40 @@ def test_summary_with_staged_changes_lands_as_notes_only(tmp_path, monkeypatch):
 
     runner._service_commit_summary()
 
-    assert repo.commit_message("HEAD").startswith("<aGiT> prompt subject")
+    assert repo.commit_message("HEAD").startswith("<aGiTrack> prompt subject")
 
 
 def test_summary_after_head_moved_lands_as_notes_only(tmp_path, monkeypatch):
     runner, repo = _summary_runner(tmp_path, monkeypatch)
-    sha = _commit_change(repo, "a.txt", "<aGiT> first")
+    sha = _commit_change(repo, "a.txt", "<aGiTrack> first")
     runner._start_commit_summary(sha, _TRACE_TEXT)
     runner._summary_thread.join(timeout=10)
     first_full = repo.rev_parse("HEAD")
-    _commit_change(repo, "b.txt", "<aGiT> second")
+    _commit_change(repo, "b.txt", "<aGiTrack> second")
 
     runner._service_commit_summary()
 
-    assert repo.commit_message("HEAD").startswith("<aGiT> second")
-    assert repo.commit_message(first_full).startswith("<aGiT> first")
-    assert "widget renderer" in (repo.notes_show(first_full, namespace="agit/commit-summary") or "")
+    assert repo.commit_message("HEAD").startswith("<aGiTrack> second")
+    assert repo.commit_message(first_full).startswith("<aGiTrack> first")
+    assert "widget renderer" in (repo.notes_show(first_full, namespace="agitrack/commit-summary") or "")
 
 
 def test_unusable_summary_keeps_prompt_led_message(tmp_path, monkeypatch):
     # The backend answered "You've hit your session limit..." instead of a
     # summary (#8): the Summarizer raises, no amend happens, and the commit
     # keeps the user prompt as its subject.
-    from agit.summaries import UnusableSummaryError
+    from agitrack.summaries import UnusableSummaryError
 
     runner, repo = _summary_runner(tmp_path, monkeypatch)
     FakeSummarizer.fail = UnusableSummaryError("You've hit your session limit.")
-    sha = _commit_change(repo, "a.txt", "<aGiT> prompt subject")
+    sha = _commit_change(repo, "a.txt", "<aGiTrack> prompt subject")
 
     runner._start_commit_summary(sha, _TRACE_TEXT)
     _finish_summary(runner)
 
-    assert repo.commit_message("HEAD").startswith("<aGiT> prompt subject")
+    assert repo.commit_message("HEAD").startswith("<aGiTrack> prompt subject")
     full = repo.rev_parse("HEAD")
-    assert repo.notes_show(full, namespace="agit/commit-summary") is None
+    assert repo.notes_show(full, namespace="agitrack/commit-summary") is None
     assert "keeping the prompt-based message" in (runner.message or "")
     assert runner._summary_pending is None  # integration is not held back
 
@@ -313,15 +313,15 @@ def test_failed_rolling_summary_does_not_discard_commit_summary(tmp_path, monkey
     runner, repo = _summary_runner(tmp_path, monkeypatch)
     FakeSummarizer.fail_session = RuntimeError("session summary failed")
     runner.state.session_summary = "previous narrative"
-    sha = _commit_change(repo, "a.txt", "<aGiT> prompt subject")
+    sha = _commit_change(repo, "a.txt", "<aGiTrack> prompt subject")
 
     runner._start_commit_summary(sha, _TRACE_TEXT)
     _finish_summary(runner)
 
     # The commit summary still lands (subject + notes)...
-    assert repo.commit_message("HEAD").startswith("<aGiT> Implement the widget renderer")
+    assert repo.commit_message("HEAD").startswith("<aGiTrack> Implement the widget renderer")
     full = repo.rev_parse("HEAD")
-    assert "widget renderer" in (repo.notes_show(full, namespace="agit/commit-summary") or "")
+    assert "widget renderer" in (repo.notes_show(full, namespace="agitrack/commit-summary") or "")
     # ...and the previous rolling summary stays current instead of being lost.
     assert runner.state.session_summary == "previous narrative"
 
@@ -332,7 +332,7 @@ def test_summary_popups_name_the_owning_session(tmp_path, monkeypatch):
     # must still be applied to the OWNING session's commit, not the active one.
     runner, repo = _summary_runner(tmp_path, monkeypatch)
     runner.name = "feature-x"
-    sha = _commit_change(repo, "a.txt", "<aGiT> prompt subject")
+    sha = _commit_change(repo, "a.txt", "<aGiTrack> prompt subject")
 
     runner._start_commit_summary(sha, _TRACE_TEXT)
     assert "in session 'feature-x'" in (runner.message or "")
@@ -342,17 +342,17 @@ def test_summary_popups_name_the_owning_session(tmp_path, monkeypatch):
     # The summary was amended into the owning session's commit (correct
     # attribution) and the owning session is flagged as summarized so its
     # eventual "created & merged" notice can say so.
-    assert repo.commit_message("HEAD").startswith("<aGiT> Implement the widget renderer")
+    assert repo.commit_message("HEAD").startswith("<aGiTrack> Implement the widget renderer")
     assert runner._commit_summarized is True
 
 
 def test_failed_summary_popup_names_the_owning_session(tmp_path, monkeypatch):
-    from agit.summaries import UnusableSummaryError
+    from agitrack.summaries import UnusableSummaryError
 
     runner, repo = _summary_runner(tmp_path, monkeypatch)
     runner.name = "feature-x"
     FakeSummarizer.fail = UnusableSummaryError("You've hit your session limit.")
-    sha = _commit_change(repo, "a.txt", "<aGiT> prompt subject")
+    sha = _commit_change(repo, "a.txt", "<aGiTrack> prompt subject")
 
     runner._start_commit_summary(sha, _TRACE_TEXT)
     runner.name = "other"
@@ -383,7 +383,7 @@ def test_pending_summary_does_not_block_integration_at_new_prompt(tmp_path, monk
     # on the same branch and only landing once the whole new turn finishes.
     runner, repo = _summary_runner(tmp_path, monkeypatch)
     FakeSummarizer.gate = threading.Event()  # hold the summary open
-    sha = _commit_change(repo, "a.txt", "<aGiT> prompt subject")
+    sha = _commit_change(repo, "a.txt", "<aGiTrack> prompt subject")
     full = repo.rev_parse(sha)
     runner._start_commit_summary(sha, _TRACE_TEXT)
 
@@ -402,8 +402,8 @@ def test_pending_summary_does_not_block_integration_at_new_prompt(tmp_path, monk
     # The summary, landing afterwards, becomes notes-only (commit already in base).
     FakeSummarizer.gate.set()
     _finish_summary(runner)
-    assert repo.commit_message(full).startswith("<aGiT> prompt subject")  # not amended
-    assert "widget renderer" in (repo.notes_show(full, namespace="agit/commit-summary") or "")
+    assert repo.commit_message(full).startswith("<aGiTrack> prompt subject")  # not amended
+    assert "widget renderer" in (repo.notes_show(full, namespace="agitrack/commit-summary") or "")
 
 
 def test_new_prompt_flush_leaves_conflicting_turn_for_later(tmp_path, monkeypatch):
@@ -413,7 +413,7 @@ def test_new_prompt_flush_leaves_conflicting_turn_for_later(tmp_path, monkeypatc
     runner, repo = _summary_runner(tmp_path, monkeypatch)
     (repo.repo / "a.txt").write_text("session line\n", encoding="utf-8")
     repo.stage_paths(["a.txt"])
-    sha = repo.commit("<aGiT> session edit")
+    sha = repo.commit("<aGiTrack> session edit")
     # The base gains a conflicting change to the same line from "another session".
     base = runner._base_branch
     repo.switch_detach(base)
@@ -421,7 +421,7 @@ def test_new_prompt_flush_leaves_conflicting_turn_for_later(tmp_path, monkeypatc
     repo.stage_paths(["a.txt"])
     repo.commit("base edit")
     repo._run(["git", "branch", "-f", base, "HEAD"])
-    repo.switch("agit/test/s1/t1")
+    repo.switch("agitrack/test/s1/t1")
     prompts: list = []
     runner._prompt_resolve_conflict = lambda *a, **k: prompts.append(a)
 
@@ -429,5 +429,5 @@ def test_new_prompt_flush_leaves_conflicting_turn_for_later(tmp_path, monkeypatc
 
     assert prompts == []  # no resolve popup mid-prompt
     assert not repo.merge_in_progress() and not repo.has_changes()  # tree clean
-    assert repo.current_branch() == "agit/test/s1/t1"  # work still on its branch
+    assert repo.current_branch() == "agitrack/test/s1/t1"  # work still on its branch
     assert repo.rev_parse(base) != repo.rev_parse(sha)  # base not advanced

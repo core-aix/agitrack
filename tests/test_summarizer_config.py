@@ -1,13 +1,13 @@
-from agit.config import AgitState, GlobalConfig
+from agitrack.config import AgitrackState, GlobalConfig
 
 
 def test_summarization_enabled_default(tmp_path):
-    state = AgitState(tmp_path)
+    state = AgitrackState(tmp_path)
     assert state.summarization_enabled is True
 
 
 def test_summarization_enabled_toggle(tmp_path):
-    state = AgitState(tmp_path)
+    state = AgitrackState(tmp_path)
     state.summarization_enabled = False
     assert state.summarization_enabled is False
     state.summarization_enabled = True
@@ -15,11 +15,11 @@ def test_summarization_enabled_toggle(tmp_path):
 
 
 def test_summarization_enabled_persists(tmp_path):
-    state = AgitState(tmp_path)
+    state = AgitrackState(tmp_path)
     state.summarization_enabled = False
     state.save()
 
-    state2 = AgitState(tmp_path)
+    state2 = AgitrackState(tmp_path)
     assert state2.summarization_enabled is False
 
 

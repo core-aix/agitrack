@@ -1,7 +1,7 @@
-"""Backend-made commits get aGiT's trace/metadata attached (issues #35, #58).
+"""Backend-made commits get aGiTrack's trace/metadata attached (issues #35, #58).
 
 Some backends commit on their own (a Claude Code hook, or an agent told to run
-`git commit`). Those commits leave the worktree clean, so aGiT's normal
+`git commit`). Those commits leave the worktree clean, so aGiTrack's normal
 stage-and-commit path never runs and the turn's provenance was lost.
 
 Amending the backend's latest commit (the original #35 fix) changed its hash,
@@ -14,16 +14,16 @@ head) — so every backend-made hash stays exactly what the agent reported.
 from pathlib import Path
 from types import SimpleNamespace
 
-from agit.backends.base import TokenUsage
-from agit.commits import build_agent_commit_message
-from agit.config import AgitState
-from agit.git import GitRepo
-from agit.proxy.commit_engine import CommitEngine
-from agit.transcripts.types import SessionTurn
+from agitrack.backends.base import TokenUsage
+from agitrack.commits import build_agent_commit_message
+from agitrack.config import AgitrackState
+from agitrack.git import GitRepo
+from agitrack.proxy.commit_engine import CommitEngine
+from agitrack.transcripts.types import SessionTurn
 
 from proxy_helpers import make_runner
 
-AGIT_BODY = "internal change\n\n# aGiT Metadata\ncommit_type: agent\n"
+AGITRACK_BODY = "internal change\n\n# aGiTrack Metadata\ncommit_type: agent\n"
 
 
 def _turn(prompt: str = "add the feature", response: str = "done") -> SessionTurn:
@@ -53,7 +53,7 @@ def _backend_commit(repo: GitRepo, name: str, message: str) -> str:
     return repo.rev_parse("HEAD")
 
 
-def _commit_turns(repo: GitRepo, state: AgitState, backend_commits: list[str], **kwargs) -> bool:
+def _commit_turns(repo: GitRepo, state: AgitrackState, backend_commits: list[str], **kwargs) -> bool:
     return CommitEngine(repo, state).commit_turns(
         turns=[_turn()],
         backend="claude",
@@ -75,7 +75,7 @@ def test_agent_commit_message_covered_commits_line():
         trace=[],
         backend="claude",
         backend_session_id=None,
-        agit_session_id="agit-1",
+        agitrack_session_id="agit-1",
         model=None,
     )
     with_covers = build_agent_commit_message(**kwargs, covered_commits=["abc123"])
@@ -89,7 +89,7 @@ def test_agent_commit_message_covered_commits_line():
 
 def test_clean_tree_covers_backend_commits_without_rewriting_them(tmp_path):
     repo, _base = _repo_on_turn_branch(tmp_path)
-    state = AgitState(tmp_path)
+    state = AgitrackState(tmp_path)
     turn_start = repo.rev_parse("HEAD")
     first = _backend_commit(repo, "a.txt", "backend commit one")
     last = _backend_commit(repo, "b.txt", "backend commit two")
@@ -107,7 +107,7 @@ def test_clean_tree_covers_backend_commits_without_rewriting_them(tmp_path):
     assert repo.parents("HEAD") == [turn_start, last]
     assert repo.rev_parse("HEAD^{tree}") == repo.rev_parse(f"{last}^{{tree}}")
     head_message = repo.commit_message("HEAD")
-    assert head_message.startswith("<aGiT> add the feature")
+    assert head_message.startswith("<aGiTrack> add the feature")
     assert "# Interaction Trace" in head_message
     assert f"covered_commits: {repo.short_sha(first)} {repo.short_sha(last)}" in head_message
     assert state.pending_trace() == []  # trace consumed by the cover commit
@@ -115,9 +115,9 @@ def test_clean_tree_covers_backend_commits_without_rewriting_them(tmp_path):
 
 def test_on_commit_fn_flags_cover_vs_plain(tmp_path):
     # The callback is told whether the commit is a cover (over the backend's own
-    # commits) so the UI can explain it; a plain aGiT commit is flagged False.
+    # commits) so the UI can explain it; a plain aGiTrack commit is flagged False.
     repo, _base = _repo_on_turn_branch(tmp_path)
-    state = AgitState(tmp_path)
+    state = AgitrackState(tmp_path)
     seen: list = []
     first = _backend_commit(repo, "a.txt", "backend commit one")
     last = _backend_commit(repo, "b.txt", "backend commit two")
@@ -125,8 +125,8 @@ def test_on_commit_fn_flags_cover_vs_plain(tmp_path):
     _commit_turns(repo, state, [first, last], on_commit_fn=lambda sha, trace, is_cover: seen.append(is_cover))
     assert seen == [True]  # covered the backend's commits
 
-    # A plain aGiT commit (no backend commits to cover) flags False.
-    (repo.repo / "mine.txt").write_text("aGiT-staged\n", encoding="utf-8")
+    # A plain aGiTrack commit (no backend commits to cover) flags False.
+    (repo.repo / "mine.txt").write_text("aGiTrack-staged\n", encoding="utf-8")
     repo.stage_paths(["mine.txt"])
     seen.clear()
     _commit_turns(repo, state, [], on_commit_fn=lambda sha, trace, is_cover: seen.append(is_cover))
@@ -134,10 +134,10 @@ def test_on_commit_fn_flags_cover_vs_plain(tmp_path):
 
 
 def test_cover_commit_makes_first_parent_log_turn_level(tmp_path):
-    # `git log --first-parent` on the branch reads turn-by-turn: one aGiT
+    # `git log --first-parent` on the branch reads turn-by-turn: one aGiTrack
     # cover commit, with the backend's commits reachable via the second parent.
     repo, base = _repo_on_turn_branch(tmp_path)
-    state = AgitState(tmp_path)
+    state = AgitrackState(tmp_path)
     first = _backend_commit(repo, "a.txt", "backend commit one")
     last = _backend_commit(repo, "b.txt", "backend commit two")
 
@@ -147,12 +147,12 @@ def test_cover_commit_makes_first_parent_log_turn_level(tmp_path):
         ["git", "log", "--first-parent", "--format=%s", f"{base}..HEAD"],
     ).stdout.splitlines()
     assert len(output) == 1
-    assert output[0].startswith("<aGiT> add the feature")
+    assert output[0].startswith("<aGiTrack> add the feature")
 
 
 def test_clean_tree_without_backend_commits_does_not_commit(tmp_path):
     repo, _base = _repo_on_turn_branch(tmp_path)
-    state = AgitState(tmp_path)
+    state = AgitrackState(tmp_path)
     head = repo.rev_parse("HEAD")
 
     assert _commit_turns(repo, state, []) is False
@@ -160,12 +160,12 @@ def test_clean_tree_without_backend_commits_does_not_commit(tmp_path):
 
 
 def test_cover_refused_when_head_is_not_the_latest_backend_commit(tmp_path):
-    # An aGiT commit sits on top of the backend's: it already accounts for the
+    # An aGiTrack commit sits on top of the backend's: it already accounts for the
     # turn, so the engine must not stack another cover commit.
     repo, _base = _repo_on_turn_branch(tmp_path)
-    state = AgitState(tmp_path)
+    state = AgitrackState(tmp_path)
     backend_sha = _backend_commit(repo, "a.txt", "backend commit")
-    _backend_commit(repo, "b.txt", AGIT_BODY)
+    _backend_commit(repo, "b.txt", AGITRACK_BODY)
     head = repo.rev_parse("HEAD")
 
     assert _commit_turns(repo, state, [backend_sha]) is False
@@ -175,12 +175,12 @@ def test_cover_refused_when_head_is_not_the_latest_backend_commit(tmp_path):
 
 def test_staged_changes_commit_covers_backend_and_tracks_all_changes(tmp_path):
     # Backend committed a.txt, then there are further (uncommitted) changes on top.
-    # The aGiT commit must COVER the backend commit AND track all the file changes
+    # The aGiTrack commit must COVER the backend commit AND track all the file changes
     # — the covered commit's plus the extra staged ones — as a merge-shaped cover,
     # not hide them behind a plain single-parent commit that only shows the extra
     # delta (#35).
     repo, _base = _repo_on_turn_branch(tmp_path)
-    state = AgitState(tmp_path)
+    state = AgitrackState(tmp_path)
     turn_start = repo.rev_parse("HEAD")
     backend_sha = _backend_commit(repo, "a.txt", "backend commit")
     (repo.repo / "a.txt").write_text("further uncommitted work\n", encoding="utf-8")
@@ -189,7 +189,7 @@ def test_staged_changes_commit_covers_backend_and_tracks_all_changes(tmp_path):
 
     assert committed is True
     head_message = repo.commit_message("HEAD")
-    assert head_message.startswith("<aGiT> add the feature")
+    assert head_message.startswith("<aGiTrack> add the feature")
     assert f"covered_commits: {repo.short_sha(backend_sha)}" in head_message
     # Merge-shaped cover: first parent is the turn start (so --first-parent shows
     # the whole change), second parent is the backend commit, preserved intact.
@@ -203,13 +203,13 @@ def test_staged_changes_commit_covers_backend_and_tracks_all_changes(tmp_path):
 
 
 def test_cover_commit_survives_summary_amend_with_parents_intact(tmp_path):
-    # The async summary (#8) amends the COVER commit — aGiT's own commit,
+    # The async summary (#8) amends the COVER commit — aGiTrack's own commit,
     # created moments earlier — never the backend's. The amend keeps the merge
     # shape, so the backend hashes stay reachable and stable.
-    from agit.commits import apply_summary_to_message
+    from agitrack.commits import apply_summary_to_message
 
     repo, _base = _repo_on_turn_branch(tmp_path)
-    state = AgitState(tmp_path)
+    state = AgitrackState(tmp_path)
     turn_start = repo.rev_parse("HEAD")
     backend_sha = _backend_commit(repo, "a.txt", "backend commit")
     assert _commit_turns(repo, state, [backend_sha]) is True
@@ -217,14 +217,14 @@ def test_cover_commit_survives_summary_amend_with_parents_intact(tmp_path):
     message = repo.commit_message("HEAD")
     repo.amend_commit(apply_summary_to_message(message, "Rework the parser error paths"))
 
-    assert repo.commit_message("HEAD").startswith("<aGiT> Rework the parser error paths")
+    assert repo.commit_message("HEAD").startswith("<aGiTrack> Rework the parser error paths")
     assert repo.parents("HEAD") == [turn_start, backend_sha]
     assert repo.commit_message(backend_sha).startswith("backend commit")
 
 
 def test_cover_in_actions_mode_accumulates_trace_first(tmp_path):
     repo, _base = _repo_on_turn_branch(tmp_path)
-    state = AgitState(tmp_path)
+    state = AgitrackState(tmp_path)
     sha = _backend_commit(repo, "a.txt", "backend commit")
 
     committed = _commit_turns(repo, state, [sha], accumulate_trace_only_on_commit=True)
@@ -244,7 +244,7 @@ def _detection_runner(tmp_path):
     repo.switch("agit/test/s1/t1", create=True)
     runner = make_runner(
         repo=repo,
-        state=AgitState(tmp_path),
+        state=AgitrackState(tmp_path),
         worktree=object(),
         _base_branch=base,
     )
@@ -253,8 +253,8 @@ def _detection_runner(tmp_path):
 
 def test_uncovered_backend_commits_detects_commits_after_last_agit_commit(tmp_path):
     runner, repo = _detection_runner(tmp_path)
-    _backend_commit(repo, "a.txt", "covered by the aGiT commit after it")
-    _backend_commit(repo, "b.txt", AGIT_BODY)  # an aGiT commit covers everything before it
+    _backend_commit(repo, "a.txt", "covered by the aGiTrack commit after it")
+    _backend_commit(repo, "b.txt", AGITRACK_BODY)  # an aGiTrack commit covers everything before it
     plain = _backend_commit(repo, "c.txt", "backend's own commit, not yet covered")
 
     assert runner._uncovered_backend_commits() == [plain]
@@ -265,7 +265,7 @@ def test_uncovered_backend_commits_empty_after_cover_commit(tmp_path):
     # detector must not re-report them once a cover commit accounts for them —
     # even while integration is still pending.
     runner, repo = _detection_runner(tmp_path)
-    state = AgitState(tmp_path)
+    state = AgitrackState(tmp_path)
     first = _backend_commit(repo, "a.txt", "backend commit one")
     last = _backend_commit(repo, "b.txt", "backend commit two")
     assert _commit_turns(repo, state, [first, last]) is True

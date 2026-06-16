@@ -15,16 +15,16 @@ _service_precompact_summary on the main loop.
 
 from types import SimpleNamespace
 
-from agit.backends.base import TokenUsage
-from agit.config import AgitState
-from agit.git import GitRepo
-from agit.transcripts.types import ExportedSession, SessionTurn
+from agitrack.backends.base import TokenUsage
+from agitrack.config import AgitrackState
+from agitrack.git import GitRepo
+from agitrack.transcripts.types import ExportedSession, SessionTurn
 
 from proxy_helpers import make_runner
 
 
 class FakeSummarizer:
-    """Stands in for agit.summaries.Summarizer; records what it was built with."""
+    """Stands in for agitrack.summaries.Summarizer; records what it was built with."""
 
     last = None
 
@@ -55,11 +55,11 @@ def _turn() -> SessionTurn:
 
 
 def _pre_compaction_runner(tmp_path, monkeypatch, *, turns):
-    monkeypatch.setattr("agit.summaries.Summarizer", FakeSummarizer)
-    monkeypatch.setenv("AGIT_CONFIG_DIR", str(tmp_path / "agit-config"))
+    monkeypatch.setattr("agitrack.summaries.Summarizer", FakeSummarizer)
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path / "agit-config"))
     FakeSummarizer.last = None
     repo = GitRepo.init(tmp_path)
-    runner = make_runner(repo=repo, state=AgitState(tmp_path))
+    runner = make_runner(repo=repo, state=AgitrackState(tmp_path))
     runner.global_config = None
     runner._render = lambda *a, **k: None
     runner.backend = SimpleNamespace(
@@ -86,7 +86,7 @@ def test_pre_compaction_captures_summary_to_state_and_notes(tmp_path, monkeypatc
     assert runner.state.session_summary == "captured design context"
     head = repo.rev_parse("HEAD")
     assert runner.state.session_summary_commit == head
-    note = repo.notes_show(head, namespace="agit/session-summary")
+    note = repo.notes_show(head, namespace="agitrack/session-summary")
     assert note is not None and "captured design context" in note
     # Success, not the swallowed-exception failure message.
     assert "failed" not in (runner.message or "").lower()
@@ -98,7 +98,7 @@ def test_pre_compaction_captures_summary_to_state_and_notes(tmp_path, monkeypatc
     # whole capture silently no-opped. Since #56 that directory is the scratch
     # dir, never the session worktree/repo (its headless runs would otherwise
     # be recorded as this repo's newest session and get resumed on restart).
-    from agit.summaries import summary_scratch_dir
+    from agitrack.summaries import summary_scratch_dir
 
     assert summarizer.backend.repo == summary_scratch_dir()
     assert summarizer.backend.repo != tmp_path
@@ -142,7 +142,7 @@ def test_pre_compaction_without_tracked_session_is_a_noop(tmp_path, monkeypatch)
     runner._service_precompact_summary()
 
     assert runner.state.session_summary is None
-    assert repo.notes_show(repo.rev_parse("HEAD"), namespace="agit/session-summary") is None
+    assert repo.notes_show(repo.rev_parse("HEAD"), namespace="agitrack/session-summary") is None
 
 
 def test_pre_compaction_with_empty_session_writes_nothing(tmp_path, monkeypatch):
@@ -155,4 +155,4 @@ def test_pre_compaction_with_empty_session_writes_nothing(tmp_path, monkeypatch)
     runner._service_precompact_summary()
 
     assert runner.state.session_summary is None
-    assert repo.notes_show(repo.rev_parse("HEAD"), namespace="agit/session-summary") is None
+    assert repo.notes_show(repo.rev_parse("HEAD"), namespace="agitrack/session-summary") is None
