@@ -50,7 +50,7 @@ class AgitrackShell:
         if new_session:
             self.state.backend_session_id = None
             self.state.last_backend_message_id = None
-            self.state.new_agit_session_id()
+            self.state.new_agitrack_session_id()
         self.verbose = verbose
         self.prompt = AgitrackPrompt(self._prompt_state)
         self.actions = AgitrackActions(repo, self.state, verbose=verbose, interactive=self.interactive)

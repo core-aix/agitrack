@@ -1648,7 +1648,7 @@ def test_baseline_drops_session_with_no_conversation(tmp_path):
     assert runner.state.last_backend_message_id is None
 
 
-def test_new_session_flag_clears_backend_session_and_mints_agit_id(tmp_path):
+def test_new_session_flag_clears_backend_session_and_mints_agitrack_id(tmp_path):
     runner = make_runner(
         _force_new_session=True,
         state=AgitrackState(tmp_path),
@@ -1850,7 +1850,7 @@ def test_resumable_sessions_includes_reserved_named_session_without_transcript(t
     # still be offered for resume so the reserved name isn't stranded — taken yet
     # un-resumable.
     runner, _base = _resume_listing_runner(tmp_path, base_refs=[], worktree_sessions=[])
-    runner._agit_named_sessions = lambda: {"ghost-id": "experiment"}
+    runner._agitrack_named_sessions = lambda: {"ghost-id": "experiment"}
 
     refs = runner._resumable_sessions()
 
@@ -1869,7 +1869,7 @@ def test_resumable_named_session_dated_when_it_was_named_not_epoch(tmp_path):
     runner, base = _resume_listing_runner(tmp_path, base_refs=[], worktree_sessions=[])
     state = AgitrackState(base)
     state.name_session("ghost-id", "experiment")  # stamps session_named_at
-    runner._agit_named_sessions = lambda: {"ghost-id": "experiment"}
+    runner._agitrack_named_sessions = lambda: {"ghost-id": "experiment"}
 
     ref = runner._resumable_sessions()[0]
     assert ref.id == "ghost-id"
@@ -1892,7 +1892,7 @@ def test_resumable_sessions_does_not_duplicate_named_session_with_transcript(tmp
         base_refs=[],
         worktree_sessions=[("alpha", SessionRef("wt-alpha", 300.0))],
     )
-    runner._agit_named_sessions = lambda: {"wt-alpha": "alpha"}
+    runner._agitrack_named_sessions = lambda: {"wt-alpha": "alpha"}
 
     assert [ref.id for ref in runner._resumable_sessions()] == ["wt-alpha"]
 
@@ -1906,7 +1906,7 @@ def test_named_sessions_recovers_name_from_worktree_key(tmp_path):
         worktree_sessions=[("alpha", SessionRef("wt-alpha", 300.0))],
     )
 
-    assert runner._agit_named_sessions().get("wt-alpha") == "alpha"
+    assert runner._agitrack_named_sessions().get("wt-alpha") == "alpha"
 
 
 def test_named_sessions_persisted_name_wins_over_worktree_key(tmp_path):
@@ -1919,7 +1919,7 @@ def test_named_sessions_persisted_name_wins_over_worktree_key(tmp_path):
     )
     AgitrackState(base, default_backend="opencode").name_session("wt-1", "renamed")
 
-    assert runner._agit_named_sessions().get("wt-1") == "renamed"
+    assert runner._agitrack_named_sessions().get("wt-1") == "renamed"
 
 
 def test_new_session_name_cannot_clash_with_dormant_named_session(tmp_path):

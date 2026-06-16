@@ -155,7 +155,7 @@ class AgitrackState:
     def session_id(self) -> str:
         return str(self.data["agitrack_session_id"])
 
-    def new_agit_session_id(self) -> str:
+    def new_agitrack_session_id(self) -> str:
         self.data["agitrack_session_id"] = f"agitrack-{uuid.uuid4()}"
         self.save()
         return self.session_id

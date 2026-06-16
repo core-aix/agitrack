@@ -282,7 +282,7 @@ def _check_for_update_at_startup(config: GlobalConfig) -> None:
     if not getattr(config, "check_for_updates", None):
         return
     try:
-        from agitrack.update import STARTUP_NET_TIMEOUT, Updater, restart_agit
+        from agitrack.update import STARTUP_NET_TIMEOUT, Updater, restart_agitrack
 
         updater = Updater()
         # Bound the launch-time check tightly so an offline / bad-connection user
@@ -314,7 +314,7 @@ def _check_for_update_at_startup(config: GlobalConfig) -> None:
         print(f"Update failed: {result.error}")
         return
     print(f"{result.message} Restarting aGiTrack...")
-    restart_agit()  # does not return on success
+    restart_agitrack()  # does not return on success
 
 
 PRIVACY_WARNING = (

@@ -171,11 +171,23 @@ class LoopFinding:
 
 
 @dataclass
+class Suggestion:
+    """A surfaced opportunity to use the agent more efficiently: a repeated prompt
+    (turns spent re-asking the same thing) or a turn whose token cost bought very
+    few line changes. The dashboard shows only the top few, costliest first."""
+
+    kind: str  # "repeat" | "costly"
+    detail: str  # short, human-readable explanation
+    shas: list[str]
+    output_tokens: int
+
+
+@dataclass
 class Dashboard:
     repo: str
     branch: str  # the ref this dashboard was built for (the current branch by default)
     stats: list[CommitStat]  # oldest first
-    loops: list[LoopFinding]
+    suggestions: list[Suggestion]  # top efficiency-improvement hints
     sha_logins: dict[str, str] = field(default_factory=dict)  # commit SHA → GitHub login (best-effort)
     commit_base: str = ""  # GitHub commit URL prefix, or "" when no GitHub remote
     branches: list[str] = field(default_factory=list)  # every local branch, for the per-branch view selector
@@ -204,9 +216,12 @@ class Dashboard:
 
     @property
     def ai_lines(self) -> tuple[int, int]:
-        # aGiTrack-tracked AI work: agent commits, the backend-made commits an aGiTrack
-        # cover commit accounts for (#58), and agent-resolved merges.
-        return self.lines_changed("agent", "covered", "agent-merge")
+        # aGiTrack-tracked AI work: agent commits and the backend-made commits an
+        # aGiTrack cover commit accounts for (#58). Agent-resolved merges are NOT
+        # counted here — a merge's lines can't be cleanly attributed to the AI vs the
+        # person who ran it, so they're left out of the line totals (the commits
+        # still count toward coverage and the by-kind tally).
+        return self.lines_changed("agent", "covered")
 
     @property
     def nontracked_lines(self) -> tuple[int, int]:
@@ -428,13 +443,34 @@ def resolve_committers(stats: list[CommitStat], sha_logins: dict[str, str] | Non
     for name, email, _login in contributions:
         root = union.find(("pair", name, email))
         if root_logins[root]:
-            label = sorted(root_logins[root])[0]
+            # GitHub login is the primary identity; append the person's first name
+            # (from their git author name) when we have one, e.g. "octocat (Mona)".
+            login = sorted(root_logins[root])[0]
+            first = _first_name(root_names[root], login)
+            label = f"{login} ({first})" if first else login
         elif root_names[root]:
             label = root_names[root].most_common(1)[0][0]
         else:
             label = email or "unknown"
         labels[(name, email)] = label
     return labels
+
+
+def _first_name(names: Counter[str], login: str) -> str | None:
+    """A committer's first name for display next to their GitHub login, taken from
+    their git author name. Prefers a "First Last" style name when one exists (so
+    ``Rana Waqas`` beats a bare ``waqas``); returns ``None`` when there is nothing
+    more informative than the login itself."""
+    if not names:
+        return None
+    # max() key: a name containing a space wins over one without; ties break on
+    # frequency. So a real full name is preferred over a one-word handle.
+    best = max(names, key=lambda n: (" " in n.strip(), names[n]))
+    parts = best.strip().split()
+    first = parts[0] if parts else ""
+    if not first or first.lower() == login.lower():
+        return None
+    return first
 
 
 def collect_commit_stats(repo: GitRepo, ref: str = "HEAD") -> list[CommitStat]:
@@ -564,7 +600,7 @@ def build_dashboard(repo: GitRepo, ref: str = "HEAD", *, sha_logins: dict[str, s
         repo=_abbreviate_home(str(repo.repo)),
         branch=branch,
         stats=stats,
-        loops=_detect_loops(stats),
+        suggestions=_efficiency_suggestions(stats),
         sha_logins=sha_logins or {},
         commit_base=commit_url_base(repo),
         branches=branches,
@@ -896,3 +932,66 @@ def _finding(run: list[CommitStat]) -> LoopFinding:
         prompt=run[0].prompt,
         output_tokens=sum(stat.tokens.get("output", 0) for stat in run),
     )
+
+
+# Show at most this many suggestions, so the panel stays a short, scannable list.
+_MAX_SUGGESTIONS = 5
+# A repo needs at least this many costed agent turns before "costly turn" hints are
+# meaningful — below it, one big turn isn't evidence of an inefficiency pattern.
+_MIN_TURNS_FOR_COST = 4
+
+
+def _efficiency_suggestions(stats: list[CommitStat]) -> list[Suggestion]:
+    """Top efficiency-improvement hints for the dashboard, costliest first. Two
+    signals, both grounded in commit metadata: prompts re-asked across turns
+    (wasted round-trips) and turns that spent many output tokens for few changed
+    lines. Thresholds are relative (medians) so they adapt to the repo rather than
+    relying on magic numbers; an efficient history yields an empty list."""
+    loops = _detect_loops(stats)
+    suggestions: list[Suggestion] = []
+    for loop in loops:
+        where = (
+            f"within commit {loop.shas[0]}"
+            if loop.within_commit
+            else f"across {len(loop.shas)} turns ({loop.shas[0]}..{loop.shas[-1]})"
+        )
+        suggestions.append(
+            Suggestion(
+                kind="repeat",
+                detail=f"Near-identical prompt repeated {where} — consolidating the ask saves round-trips.",
+                shas=loop.shas,
+                output_tokens=loop.output_tokens,
+            )
+        )
+
+    # Costly, low-yield turns: expensive (>= median output tokens) AND below the
+    # typical lines-per-token yield. Skip turns already flagged as a loop so one
+    # turn isn't reported twice.
+    looped = {sha for loop in loops for sha in loop.shas}
+    turns = [s for s in stats if s.kind == "agent" and s.tokens.get("output", 0) > 0]
+    if len(turns) >= _MIN_TURNS_FOR_COST:
+        outputs = sorted(s.tokens["output"] for s in turns)
+        median_output = outputs[len(outputs) // 2]
+        yields = sorted((s.insertions + s.deletions) / s.tokens["output"] for s in turns)
+        median_yield = yields[len(yields) // 2]
+        costly = [
+            s
+            for s in turns
+            if s.tokens["output"] >= median_output
+            and (s.insertions + s.deletions) / s.tokens["output"] < median_yield
+            and s.short not in looped
+        ]
+        costly.sort(key=lambda s: s.tokens["output"], reverse=True)
+        for s in costly[:3]:
+            lines = s.insertions + s.deletions
+            suggestions.append(
+                Suggestion(
+                    kind="costly",
+                    detail=f"Turn {s.short} spent {s.tokens['output']:,} output tokens for {lines:,} changed lines — a candidate to narrow scope.",
+                    shas=[s.short],
+                    output_tokens=s.tokens["output"],
+                )
+            )
+
+    suggestions.sort(key=lambda s: s.output_tokens, reverse=True)
+    return suggestions[:_MAX_SUGGESTIONS]
