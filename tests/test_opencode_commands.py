@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from agit.backends.opencode import OpenCodeBackend
+from agitrack.backends.opencode import OpenCodeBackend
 
 
 def test_split_slash_command():

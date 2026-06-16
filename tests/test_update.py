@@ -4,10 +4,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from agit import cli
-from agit.config import DEFAULT_TIMINGS, GlobalConfig
-from agit.update import KIND_PACKAGE, KIND_SOURCE, UpdateStatus, Updater
-from agit.update.updater import _version_tuple
+from agitrack import cli
+from agitrack.config import DEFAULT_TIMINGS, GlobalConfig
+from agitrack.update import KIND_PACKAGE, KIND_SOURCE, UpdateStatus, Updater
+from agitrack.update.updater import _version_tuple
 from proxy_helpers import make_runner
 
 
@@ -31,7 +31,7 @@ def _commit(path: Path, name: str, content: str, message: str) -> None:
 @pytest.fixture
 def source_clone(tmp_path: Path):
     """A 'remote' repo and a clone of it whose `main` tracks `origin/main` —
-    the shape of a source-linked aGiT install. Returns (remote, clone)."""
+    the shape of a source-linked aGiTrack install. Returns (remote, clone)."""
     remote = tmp_path / "remote"
     _init_repo(remote)
     _commit(remote, "agit.py", "v1\n", "first")
@@ -121,7 +121,7 @@ def test_source_check_detects_local_update_even_when_offline(source_clone, monke
             return subprocess.CompletedProcess(args, 1, "", "could not resolve host")
         return real_run(args, **kwargs)
 
-    monkeypatch.setattr("agit.update.updater.subprocess.run", fail_fetch)
+    monkeypatch.setattr("agitrack.update.updater.subprocess.run", fail_fetch)
 
     status = updater.check()
     assert status.available is True
@@ -154,7 +154,7 @@ def test_source_check_errors_without_upstream(tmp_path: Path):
 
 
 def test_source_check_detects_update_on_branch_without_upstream(source_clone):
-    # aGiT usually runs on a session worktree branch (`agit/...`) that tracks no
+    # aGiTrack usually runs on a session worktree branch (`agit/...`) that tracks no
     # upstream of its own. The check must still find updates by comparing against
     # origin's default branch, not silently report "up to date".
     remote, clone = source_clone
@@ -207,7 +207,7 @@ def test_source_apply_refuses_dirty_tree(source_clone):
 
 
 def test_source_apply_merges_diverged_branch_cleanly(source_clone):
-    # aGiT runs on session branches that accumulate the user's own commits, so the
+    # aGiTrack runs on session branches that accumulate the user's own commits, so the
     # checkout is routinely diverged from upstream. A divergence with NO conflicting
     # edits must merge cleanly — pulling in upstream while preserving local work —
     # rather than being refused.
@@ -316,7 +316,7 @@ def _available_status() -> UpdateStatus:
         current="aaaaaaa",
         latest="bbbbbbb",
         behind=1,
-        message="aGiT update available: 1 new commit on origin/main (aaaaaaa → bbbbbbb).",
+        message="aGiTrack update available: 1 new commit on origin/main (aaaaaaa → bbbbbbb).",
     )
 
 
@@ -412,7 +412,7 @@ def test_handle_update_command_runs_a_fresh_check(monkeypatch):
     # runs on demand, so a newer version that appeared since the last periodic check
     # is offered instead of wrongly reporting "up to date".
     runner = make_runner()
-    runner._update_status = UpdateStatus(kind=KIND_SOURCE, available=False, message="aGiT is up to date.")
+    runner._update_status = UpdateStatus(kind=KIND_SOURCE, available=False, message="aGiTrack is up to date.")
     fresh = _available_status()
     runner._updater = _FakeUpdater(fresh)
     monkeypatch.setattr(runner, "_select_popup", lambda *a, **k: "Not now")
@@ -440,7 +440,7 @@ class _StubUpdater:
 
 
 def test_apply_update_failure_leaves_session_intact():
-    # If apply() fails, aGiT must NOT tear the session down — the user keeps working
+    # If apply() fails, aGiTrack must NOT tear the session down — the user keeps working
     # exactly where they were. (Regression: finalizing/removing the worktree first,
     # then discovering apply() failed, left the reactor on a deleted worktree and
     # the next `git status` crashed with FileNotFoundError.)
@@ -485,7 +485,7 @@ def test_apply_update_success_finalizes_then_restarts():
 
 
 def _capture_restart(monkeypatch, argv):
-    from agit.update import updater as updater_mod
+    from agitrack.update import updater as updater_mod
 
     monkeypatch.setattr(updater_mod.sys, "argv", argv)
     captured: list = []
@@ -496,16 +496,16 @@ def _capture_restart(monkeypatch, argv):
 
 
 def test_restart_agit_appends_extra_args(monkeypatch):
-    from agit.update import restart_agit
+    from agitrack.update import restart_agit
 
     captured = _capture_restart(monkeypatch, ["agit", "--backend", "claude"])
     restart_agit(["--skip-privacy-ack"])
 
-    assert captured[0][1:] == ["-m", "agit", "--backend", "claude", "--skip-privacy-ack"]
+    assert captured[0][1:] == ["-m", "agitrack", "--backend", "claude", "--skip-privacy-ack"]
 
 
 def test_restart_agit_does_not_duplicate_existing_flag(monkeypatch):
-    from agit.update import restart_agit
+    from agitrack.update import restart_agit
 
     captured = _capture_restart(monkeypatch, ["agit", "--skip-privacy-ack"])
     restart_agit(["--skip-privacy-ack"])
@@ -517,12 +517,12 @@ def test_restart_agit_does_not_duplicate_existing_flag(monkeypatch):
 def test_restart_agit_without_extra_args_preserves_argv(monkeypatch):
     # The startup-update path passes no extra args, so the restart re-shows the
     # privacy warning (no --skip-privacy-ack injected).
-    from agit.update import restart_agit
+    from agitrack.update import restart_agit
 
     captured = _capture_restart(monkeypatch, ["agit", "--verbose"])
     restart_agit()
 
-    assert captured[0][1:] == ["-m", "agit", "--verbose"]
+    assert captured[0][1:] == ["-m", "agitrack", "--verbose"]
     assert "--skip-privacy-ack" not in captured[0]
 
 
@@ -549,8 +549,8 @@ def test_startup_prompt_applies_and_restarts(monkeypatch, tmp_path: Path):
     config = GlobalConfig(path=tmp_path / "c.json")
     updater = _StartupUpdater(_available_status())
     restarted = []
-    monkeypatch.setattr("agit.update.Updater", lambda *a, **k: updater)
-    monkeypatch.setattr("agit.update.restart_agit", lambda: restarted.append(True))
+    monkeypatch.setattr("agitrack.update.Updater", lambda *a, **k: updater)
+    monkeypatch.setattr("agitrack.update.restart_agit", lambda: restarted.append(True))
     monkeypatch.setattr("builtins.input", lambda *a: "y")
     cli._check_for_update_at_startup(config)
     assert updater.applied is True
@@ -559,12 +559,12 @@ def test_startup_prompt_applies_and_restarts(monkeypatch, tmp_path: Path):
 
 def test_startup_check_uses_short_timeout(monkeypatch, tmp_path: Path):
     # The launch-time check must be tightly bounded so an offline user isn't blocked
-    # from starting aGiT — it passes the short STARTUP_NET_TIMEOUT, not the default.
-    from agit.update import STARTUP_NET_TIMEOUT
+    # from starting aGiTrack — it passes the short STARTUP_NET_TIMEOUT, not the default.
+    from agitrack.update import STARTUP_NET_TIMEOUT
 
     config = GlobalConfig(path=tmp_path / "c.json")
     updater = _StartupUpdater(UpdateStatus(kind=KIND_SOURCE, available=False))
-    monkeypatch.setattr("agit.update.Updater", lambda *a, **k: updater)
+    monkeypatch.setattr("agitrack.update.Updater", lambda *a, **k: updater)
     cli._check_for_update_at_startup(config)
     assert updater.checked_timeout == STARTUP_NET_TIMEOUT
     assert STARTUP_NET_TIMEOUT < 20  # meaningfully shorter than the in-session bound
@@ -572,7 +572,7 @@ def test_startup_check_uses_short_timeout(monkeypatch, tmp_path: Path):
 
 def test_check_survives_network_timeout(monkeypatch, tmp_path: Path):
     # A git fetch that times out must NOT raise out of check(): the real _git
-    # wrapper catches TimeoutExpired and reports a clean failure, so aGiT starts.
+    # wrapper catches TimeoutExpired and reports a clean failure, so aGiTrack starts.
     repo = tmp_path / "src"
     repo.mkdir()
     updater = Updater(source_repo=repo)
@@ -583,7 +583,7 @@ def test_check_survives_network_timeout(monkeypatch, tmp_path: Path):
             raise subprocess.TimeoutExpired(cmd="git fetch", timeout=kwargs.get("timeout", 1))
         return subprocess.CompletedProcess(args, 0, "", "")
 
-    monkeypatch.setattr("agit.update.updater.subprocess.run", fake_run)
+    monkeypatch.setattr("agitrack.update.updater.subprocess.run", fake_run)
     status = updater.check(timeout=1)  # must not raise
     assert not status.ok  # reported as an error, gracefully
 
@@ -593,8 +593,8 @@ def test_startup_prompt_defaults_to_update_on_empty_enter(monkeypatch, tmp_path:
     config = GlobalConfig(path=tmp_path / "c.json")
     updater = _StartupUpdater(_available_status())
     restarted = []
-    monkeypatch.setattr("agit.update.Updater", lambda *a, **k: updater)
-    monkeypatch.setattr("agit.update.restart_agit", lambda: restarted.append(True))
+    monkeypatch.setattr("agitrack.update.Updater", lambda *a, **k: updater)
+    monkeypatch.setattr("agitrack.update.restart_agit", lambda: restarted.append(True))
     monkeypatch.setattr("builtins.input", lambda *a: "")
     cli._check_for_update_at_startup(config)
     assert updater.applied is True
@@ -604,7 +604,7 @@ def test_startup_prompt_defaults_to_update_on_empty_enter(monkeypatch, tmp_path:
 def test_startup_prompt_skips_on_explicit_no(monkeypatch, tmp_path: Path):
     config = GlobalConfig(path=tmp_path / "c.json")
     updater = _StartupUpdater(_available_status())
-    monkeypatch.setattr("agit.update.Updater", lambda *a, **k: updater)
+    monkeypatch.setattr("agitrack.update.Updater", lambda *a, **k: updater)
     monkeypatch.setattr("builtins.input", lambda *a: "n")
     cli._check_for_update_at_startup(config)
     assert updater.applied is False
@@ -614,7 +614,7 @@ def test_startup_prompt_skips_on_explicit_no(monkeypatch, tmp_path: Path):
 def test_startup_prompt_never_disables_future_checks(monkeypatch, tmp_path: Path):
     config = GlobalConfig(path=tmp_path / "c.json")
     updater = _StartupUpdater(_available_status())
-    monkeypatch.setattr("agit.update.Updater", lambda *a, **k: updater)
+    monkeypatch.setattr("agitrack.update.Updater", lambda *a, **k: updater)
     monkeypatch.setattr("builtins.input", lambda *a: "never")
     cli._check_for_update_at_startup(config)
     assert config.check_for_updates is False
@@ -625,7 +625,7 @@ def test_startup_prompt_skipped_when_up_to_date(monkeypatch, tmp_path: Path):
     config = GlobalConfig(path=tmp_path / "c.json")
     updater = _StartupUpdater(UpdateStatus(kind=KIND_SOURCE, available=False))
     prompted = []
-    monkeypatch.setattr("agit.update.Updater", lambda *a, **k: updater)
+    monkeypatch.setattr("agitrack.update.Updater", lambda *a, **k: updater)
     monkeypatch.setattr("builtins.input", lambda *a: prompted.append(True) or "y")
     cli._check_for_update_at_startup(config)
     assert prompted == []  # no prompt when there is nothing to install
@@ -638,5 +638,5 @@ def test_startup_check_skipped_when_disabled(monkeypatch, tmp_path: Path):
     def boom(*a, **k):
         raise AssertionError("update check must not run when disabled")
 
-    monkeypatch.setattr("agit.update.Updater", boom)
+    monkeypatch.setattr("agitrack.update.Updater", boom)
     cli._check_for_update_at_startup(config)  # returns without checking

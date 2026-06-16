@@ -18,10 +18,10 @@ cd "$(dirname "$0")/.."
 step() { printf '\n==> %s\n' "$*"; }
 
 step "ruff check"
-uv run ruff check agit/ tests/
+uv run ruff check agitrack/ tests/
 
 step "ruff format --check"
-uv run ruff format --check agit/ tests/
+uv run ruff format --check agitrack/ tests/
 
 step "mypy (new errors only)"
 # mypy exits non-zero because the committed baseline still carries known errors;

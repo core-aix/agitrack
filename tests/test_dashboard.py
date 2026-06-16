@@ -1,4 +1,4 @@
-"""`agit --dashboard` (#54): repo metrics computed from aGiT commit metadata.
+"""`agit --dashboard` (#54): repo metrics computed from aGiTrack commit metadata.
 
 The collector reads everything from `git log` alone, so the tests build a real
 repository whose history contains every commit kind the classifier knows:
@@ -16,12 +16,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-import agit.metrics as metrics
-from agit import cli
-from agit.commits import build_agent_commit_message, build_agent_merge_message, build_user_commit_message
-from agit.git import GitRepo
-from agit.metrics import build_dashboard, build_server, dashboard_data, render_dashboard, render_html
-from agit.metrics.collect import CommitStat, _detect_loops, resolve_committers
+import agitrack.metrics as metrics
+from agitrack import cli
+from agitrack.commits import build_agent_commit_message, build_agent_merge_message, build_user_commit_message
+from agitrack.git import GitRepo
+from agitrack.metrics import build_dashboard, build_server, dashboard_data, render_dashboard, render_html
+from agitrack.metrics.collect import CommitStat, _detect_loops, resolve_committers
 
 
 def _write_lines(repo: GitRepo, name: str, count: int) -> None:
@@ -35,7 +35,7 @@ def _agent_message(prompt: str, *, tokens: dict | None = None, covered: list[str
         trace=[{"role": "user", "content": prompt}, {"role": "agent", "content": "done"}],
         backend="claude",
         backend_session_id="ses-1",
-        agit_session_id="agit-1",
+        agitrack_session_id="agit-1",
         model="claude-opus-4-8",
         token_usage=tokens,
         covered_commits=covered,
@@ -60,7 +60,7 @@ def _demo_repo(tmp_path: Path) -> GitRepo:
     repo.commit("plain human commit")  # untracked
 
     _write_lines(repo, "user.txt", 4)
-    repo.commit(build_user_commit_message(message="save my edits", agit_session_id="agit-1"))  # user
+    repo.commit(build_user_commit_message(message="save my edits", agitrack_session_id="agit-1"))  # user
 
     _write_lines(repo, "agent.txt", 20)
     repo.commit(_agent_message("add the feature", tokens=_TOKENS))  # agent, 1050 in / 50 out
@@ -83,7 +83,7 @@ def _demo_repo(tmp_path: Path) -> GitRepo:
             session_name="s1",
             base_branch="main",
             source_branch="agit/claude/s1/t1",
-            agit_session_id="agit-1",
+            agitrack_session_id="agit-1",
             backend="claude",
         ),
     )  # agent-merge
@@ -92,17 +92,17 @@ def _demo_repo(tmp_path: Path) -> GitRepo:
 
 def test_agit_integration_merge_is_classified_as_ops_not_untracked(tmp_path):
     repo = GitRepo.init(tmp_path)
-    # aGiT's own auto-merge bringing base into a session turn branch.
+    # aGiTrack's own auto-merge bringing base into a session turn branch.
     repo._run(
         ["git", "commit", "--allow-empty", "-m", "Merge branch 'dev' into agit/claude/session-1/t2"],
     )
 
     dash = build_dashboard(repo)
     ops = next(s for s in dash.stats if s.subject.startswith("Merge branch"))
-    assert ops.kind == "agit-ops"  # an aGiT control, not stray untracked work
-    assert dash.count("agit-ops") == 1
-    assert ops.kind in ("agent", "covered", "agent-merge", "user", "agit-ops")
-    # It counts toward aGiT coverage, and is not lumped into non-tracked lines.
+    assert ops.kind == "agitrack-ops"  # an aGiTrack control, not stray untracked work
+    assert dash.count("agitrack-ops") == 1
+    assert ops.kind in ("agent", "covered", "agent-merge", "user", "agitrack-ops")
+    # It counts toward aGiTrack coverage, and is not lumped into non-tracked lines.
     assert dash.nontracked_lines == (0, 0)
 
 
@@ -124,7 +124,7 @@ def test_dashboard_splits_lines_into_tracked_ai_and_nontracked(tmp_path):
 
     ai_ins, _ = dash.ai_lines
     nt_ins, _ = dash.nontracked_lines
-    # aGiT-tracked AI: agent.txt (20) + backend.txt (8, via the covered commit);
+    # aGiTrack-tracked AI: agent.txt (20) + backend.txt (8, via the covered commit);
     # the cover commit itself is a merge and contributes no numstat — no double
     # count.
     assert ai_ins == 28
@@ -143,10 +143,10 @@ def test_squash_parses_constituents_and_counts_their_tokens(tmp_path):
     message = (
         "Stability improvements (#9)\n\n"
         "* did agent work\n\n"
-        "# aGiT Metadata\ncommit_type: agent\nbackend: claude\nmodel: claude-opus-4-8\n"
+        "# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\nmodel: claude-opus-4-8\n"
         "tokens_since_last_commit_output: 1000\ntokens_since_last_commit_input: 500\n\n"
         "* my own edit\n\n"
-        "# aGiT Metadata\ncommit_type: user\nagit_session_id: s1\n"
+        "# aGiTrack Metadata\ncommit_type: user\nagit_session_id: s1\n"
     )
     repo.commit(message)
 
@@ -175,7 +175,7 @@ def test_same_commit_in_multiple_squashes_counts_tokens_once(tmp_path):
 
     def block(started_at: str, output: int) -> str:
         return (
-            "# aGiT Metadata\ncommit_type: agent\nbackend: claude\nmodel: claude-opus-4-8\n"
+            "# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\nmodel: claude-opus-4-8\n"
             f"agent_started_at: {started_at}\n"
             f"tokens_since_last_commit_output: {output}\ntokens_since_last_commit_input: 1\n"
         )
@@ -232,7 +232,7 @@ def test_dashboard_groups_by_backend_model_and_author(tmp_path):
     assert dash.by_model["claude-opus-4-8"]["commits"] == 2
     (author_stats,) = dash.by_author.values()
     assert author_stats["commits"] == 7
-    assert author_stats["agit_commits"] == 5
+    assert author_stats["agitrack_commits"] == 5
     # The agent/covered lines this committer git-authored are reported as
     # AI-driven (28); their user + plain commits are non-tracked (4 + 10), never
     # claimed as their own human lines.
@@ -244,7 +244,7 @@ def test_render_dashboard_contains_all_sections(tmp_path):
     text = render_dashboard(_demo_repo(tmp_path))
 
     for heading in (
-        "aGiT Dashboard",
+        "aGiTrack Dashboard",
         "Coverage",
         "Code changes",
         "Tokens",
@@ -254,11 +254,11 @@ def test_render_dashboard_contains_all_sections(tmp_path):
         "Possible loops",
     ):
         assert heading in text
-    assert "aGiT-tracked commits: 5/7" in text
+    assert "aGiTrack-tracked commits: 5/7" in text
     assert "claude-opus-4-8" in text
     # Lines are split only two ways now — tracked AI vs non-tracked — with no
     # "human" category, since a user commit's lines may still be AI-produced.
-    assert "aGiT-tracked AI:" in text
+    assert "aGiTrack-tracked AI:" in text
     assert "Non-tracked:" in text
     assert "Human (" not in text and "human (own code)" not in text
 
@@ -349,7 +349,7 @@ def test_resolve_committers_uses_github_logins_when_provided():
 
 
 def test_parse_co_authors_extracts_humans_and_drops_ai_and_bots():
-    from agit.metrics.collect import _parse_co_authors
+    from agitrack.metrics.collect import _parse_co_authors
 
     body = (
         "Add a feature\n\n"
@@ -366,7 +366,7 @@ def test_parse_co_authors_extracts_humans_and_drops_ai_and_bots():
 
 
 def _co_authored_dashboard(subject: str):
-    from agit.metrics.collect import Dashboard, _detect_loops
+    from agitrack.metrics.collect import Dashboard, _detect_loops
 
     stat = CommitStat(
         sha="s1",
@@ -381,7 +381,7 @@ def _co_authored_dashboard(subject: str):
 
 
 def test_co_authored_commit_is_filterable_under_every_committer():
-    from agit.metrics import dashboard_data
+    from agitrack.metrics import dashboard_data
 
     dash, stat = _co_authored_dashboard("Pair feature")
     # Both the primary author and the co-author are committers of this one commit.
@@ -394,8 +394,8 @@ def test_co_authored_commit_is_filterable_under_every_committer():
 
 
 def test_bot_and_ai_primary_authors_are_not_committers():
-    from agit.metrics.collect import Dashboard, _detect_loops
-    from agit.metrics.web import _options
+    from agitrack.metrics.collect import Dashboard, _detect_loops
+    from agitrack.metrics.web import _options
 
     bot = CommitStat(
         sha="b1",
@@ -415,7 +415,7 @@ def test_bot_and_ai_primary_authors_are_not_committers():
 
 
 def test_filter_stats_matches_any_committer():
-    from agit.metrics.web import _filter_stats, _options
+    from agitrack.metrics.web import _filter_stats, _options
 
     dash, _ = _co_authored_dashboard("Shared work")
     # Filtering on the co-author (not the primary git author) still returns it...
@@ -427,7 +427,7 @@ def test_filter_stats_matches_any_committer():
 
 
 def test_resolve_logins_falls_back_to_empty_without_gh(monkeypatch, tmp_path):
-    from agit.metrics import github
+    from agitrack.metrics import github
 
     github._reset_cache_for_tests()
     monkeypatch.setattr(github.shutil, "which", lambda _name: None)  # gh not installed
@@ -437,7 +437,7 @@ def test_resolve_logins_falls_back_to_empty_without_gh(monkeypatch, tmp_path):
 
 
 def test_gh_status_reports_missing_unauth_and_ok(monkeypatch):
-    from agit.metrics import github
+    from agitrack.metrics import github
 
     # Not installed.
     monkeypatch.setattr(github.shutil, "which", lambda _name: None)
@@ -464,7 +464,7 @@ def test_gh_status_reports_missing_unauth_and_ok(monkeypatch):
 
 
 def test_gh_status_unauthenticated_when_check_errors(monkeypatch):
-    from agit.metrics import github
+    from agitrack.metrics import github
 
     monkeypatch.setattr(github.shutil, "which", lambda _name: "/usr/bin/gh")
 
@@ -476,7 +476,7 @@ def test_gh_status_unauthenticated_when_check_errors(monkeypatch):
 
 
 def test_resolve_logins_parses_gh_tsv_and_caches(monkeypatch, tmp_path):
-    from agit.metrics import github
+    from agitrack.metrics import github
 
     repo = GitRepo.init(tmp_path)  # before patching subprocess (git uses it too)
     github._reset_cache_for_tests()
@@ -504,7 +504,7 @@ def test_cached_logins_non_blocking_then_populates_in_background(monkeypatch, tm
     # resolved logins are then served from the cache.
     import time
 
-    from agit.metrics import github
+    from agitrack.metrics import github
 
     repo = GitRepo.init(tmp_path)  # before patching subprocess (git uses it too)
     github._reset_cache_for_tests()
@@ -532,7 +532,7 @@ def test_cached_logins_non_blocking_then_populates_in_background(monkeypatch, tm
 def test_cached_logins_serves_warm_cache_without_spawning(monkeypatch, tmp_path):
     import time
 
-    from agit.metrics import github
+    from agitrack.metrics import github
 
     repo = GitRepo.init(tmp_path)
     github._reset_cache_for_tests()
@@ -553,7 +553,7 @@ def _agent_stat(sha: str, prompt: str, output: int = 10, user_prompts: list[str]
         sha=sha,
         author="a",
         email="a@example.com",
-        subject=f"<aGiT> {prompt}",
+        subject=f"<aGiTrack> {prompt}",
         kind="agent",
         tokens={"output": output},
         prompt=prompt,
@@ -615,7 +615,7 @@ def test_dashboard_loops_from_real_history(tmp_path):
 
 
 def _embedded_data(html: str) -> dict:
-    match = re.search(r'id="agit-data">(.*?)</script>', html, re.S)
+    match = re.search(r'id="agitrack-data">(.*?)</script>', html, re.S)
     assert match is not None
     return json.loads(match.group(1))
 
@@ -647,7 +647,7 @@ def test_render_html_embeds_aggregates_and_first_log_page_only(tmp_path):
     html = render_html(_demo_repo(tmp_path))
 
     assert html.startswith("<!DOCTYPE html>")
-    assert "aGiT dashboard" in html
+    assert "aGiTrack dashboard" in html
     for control in ('id="f-author"', 'id="f-backend"', 'id="f-model"', 'id="f-period"', 'id="f-from"'):
         assert control in html
     # The page embeds server-computed aggregates plus only the FIRST page of the
@@ -667,7 +667,7 @@ def test_render_html_has_unreachable_banner_and_clear_kind_labels(tmp_path):
     html = render_html(_demo_repo(tmp_path))
     # An error banner exists and is wired to show only when the live backend
     # can't be reached (never for a static file:// snapshot).
-    assert 'id="neterror"' in html and "Can't reach the aGiT dashboard server" in html
+    assert 'id="neterror"' in html and "Can't reach the aGiTrack dashboard server" in html
     assert "function setOffline" in html and "const LIVE" in html
     assert "if(LIVE) setOffline(true)" in html
     # The commit-kind counts are labelled so "agent 30" reads as a commit count.
@@ -694,7 +694,7 @@ def test_filter_bar_is_single_row_with_a_custom_range_popup(tmp_path):
 
 
 def test_log_page_paginates_and_clamps(tmp_path):
-    from agit.metrics.web import log_page
+    from agitrack.metrics.web import log_page
 
     dash = build_dashboard(_demo_repo(tmp_path))
     first = log_page(dash, offset=0, limit=3)
@@ -707,7 +707,7 @@ def test_log_page_paginates_and_clamps(tmp_path):
 
 
 def test_aggregates_payload_filters_server_side(tmp_path):
-    from agit.metrics.web import aggregates_payload
+    from agitrack.metrics.web import aggregates_payload
 
     dash = build_dashboard(_demo_repo(tmp_path))
     full = aggregates_payload(dash)
@@ -720,7 +720,7 @@ def test_aggregates_payload_filters_server_side(tmp_path):
 
 
 def test_aggregates_payload_includes_per_period_timeseries(tmp_path):
-    from agit.metrics.web import aggregates_payload
+    from agitrack.metrics.web import aggregates_payload
 
     dash = build_dashboard(_demo_repo(tmp_path))
     ts = aggregates_payload(dash)["timeseries"]
@@ -737,7 +737,7 @@ def test_aggregates_payload_includes_per_period_timeseries(tmp_path):
 
 
 def test_timeseries_granularity_buckets_by_calendar_period():
-    from agit.metrics.web import _timeseries
+    from agitrack.metrics.web import _timeseries
 
     def stat(day, *, out=0):
         return CommitStat(
@@ -765,7 +765,7 @@ def test_timeseries_granularity_buckets_by_calendar_period():
 
 
 def test_timeseries_fills_empty_periods_with_zero():
-    from agit.metrics.web import _timeseries
+    from agitrack.metrics.web import _timeseries
 
     cal = __import__("calendar")
 
@@ -785,7 +785,7 @@ def test_timeseries_fills_empty_periods_with_zero():
 
 
 def test_aggregates_payload_reports_full_history_span(tmp_path):
-    from agit.metrics.web import aggregates_payload
+    from agitrack.metrics.web import aggregates_payload
 
     dash = build_dashboard(_demo_repo(tmp_path))
     span = aggregates_payload(dash)["span"]
@@ -797,8 +797,8 @@ def test_aggregates_payload_reports_full_history_span(tmp_path):
 
 
 def test_dashboard_lists_shared_sessions(tmp_path):
-    from agit.metrics.web import render_html, shared_sessions_for
-    from agit.sessions import SharedSessionStore
+    from agitrack.metrics.web import render_html, shared_sessions_for
+    from agitrack.sessions import SharedSessionStore
 
     repo = _demo_repo(tmp_path)
     SharedSessionStore(repo).publish(
@@ -825,7 +825,7 @@ def test_dashboard_lists_shared_sessions(tmp_path):
 
 
 def test_shared_sessions_for_is_safe_without_sharing(tmp_path):
-    from agit.metrics.web import shared_sessions_for
+    from agitrack.metrics.web import shared_sessions_for
 
     assert shared_sessions_for(_demo_repo(tmp_path)) == []  # nothing shared ⇒ empty, no error
 
@@ -834,8 +834,8 @@ def test_shared_sessions_survive_a_fetch_failure(tmp_path, monkeypatch):
     # A transient fetch error (e.g. racing a concurrent auto-share push) must NOT
     # blank the dashboard's list — fall back to the local ref. Regression for the
     # "shared session disappeared from the dashboard" report.
-    from agit.metrics.web import shared_sessions_for
-    from agit.sessions import SharedSessionStore
+    from agitrack.metrics.web import shared_sessions_for
+    from agitrack.sessions import SharedSessionStore
 
     repo = _demo_repo(tmp_path)
     SharedSessionStore(repo).publish(
@@ -853,7 +853,7 @@ def test_shared_sessions_survive_a_fetch_failure(tmp_path, monkeypatch):
 
 
 def test_timeseries_respects_filters(tmp_path):
-    from agit.metrics.web import aggregates_payload
+    from agitrack.metrics.web import aggregates_payload
 
     dash = build_dashboard(_demo_repo(tmp_path))
     full = aggregates_payload(dash)["timeseries"]
@@ -889,10 +889,10 @@ def test_dashboard_data_serializes_squash_constituents_for_expansion(tmp_path):
     repo.commit(
         "Squashed PR (#12)\n\n"
         "* first turn\n\n"
-        "# aGiT Metadata\ncommit_type: agent\nbackend: claude\nmodel: claude-opus-4-8\n"
+        "# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\nmodel: claude-opus-4-8\n"
         "tokens_since_last_commit_output: 200\n\n"
         "* second turn\n\n"
-        "# aGiT Metadata\ncommit_type: agent\nbackend: opencode\nmodel: qwen\n"
+        "# aGiTrack Metadata\ncommit_type: agent\nbackend: opencode\nmodel: qwen\n"
         "tokens_since_last_commit_output: 50\n"
     )
 
@@ -959,7 +959,7 @@ def test_dashboard_server_serves_aggregates_and_paginated_log(tmp_path):
         assert refreshed["head"] != first_head and refreshed["agg"]["total"] == 8
 
         # A filter narrows the aggregates server-side (committer names can carry
-        # spaces, e.g. CI's "aGiT CI", so the query must be URL-encoded).
+        # spaces, e.g. CI's "aGiTrack CI", so the query must be URL-encoded).
         query = urllib.parse.urlencode({"author": data["options"]["committers"][0]})
         only_me = json.loads(_get(base + "/data?" + query))
         assert only_me["agg"]["total"] <= refreshed["agg"]["total"]
@@ -973,7 +973,7 @@ def test_dashboard_server_index_embeds_shared_sessions(tmp_path):
     # Regression: the live index page must embed shared sessions on first paint,
     # not only fill them in on the first /data poll (the bug where the dashboard
     # showed no shared sessions until a refresh — and never for a file:// snapshot).
-    from agit.sessions import SharedSessionStore
+    from agitrack.sessions import SharedSessionStore
 
     repo = _demo_repo(tmp_path)
     SharedSessionStore(repo).publish(
@@ -985,7 +985,7 @@ def test_dashboard_server_index_embeds_shared_sessions(tmp_path):
     server, thread, base = _serve(repo)
     try:
         html = _get(base + "/")
-        embedded = json.loads(re.search(r'id="agit-data">(.*?)</script>', html, re.S).group(1))
+        embedded = json.loads(re.search(r'id="agitrack-data">(.*?)</script>', html, re.S).group(1))
         assert [s["name"] for s in embedded["shared_sessions"]] == ["s1"]
         served = json.loads(_get(base + "/data"))
         assert [s["name"] for s in served["shared_sessions"]] == ["s1"]
@@ -1018,7 +1018,7 @@ def test_dashboard_server_is_threaded_and_swallows_client_disconnects(tmp_path, 
         # the live page's polling.
         assert isinstance(server, http.server.ThreadingHTTPServer)
         # A client vanishing mid-response (a superseded poll, a closed tab) must
-        # not spew a BrokenPipeError traceback into aGiT's console.
+        # not spew a BrokenPipeError traceback into aGiTrack's console.
         try:
             raise BrokenPipeError(32, "Broken pipe")
         except BrokenPipeError:
@@ -1070,7 +1070,7 @@ def test_cli_dashboard_shorthand_d_accepts_text(tmp_path, capsys, monkeypatch):
     )
 
     assert cli.main(["-d", "text", "--repo", str(tmp_path)]) == 0
-    assert "aGiT Dashboard" in capsys.readouterr().out
+    assert "aGiTrack Dashboard" in capsys.readouterr().out
 
 
 def test_cli_dashboard_text_prints_report_and_exits(tmp_path, capsys, monkeypatch):
@@ -1085,8 +1085,8 @@ def test_cli_dashboard_text_prints_report_and_exits(tmp_path, capsys, monkeypatc
 
     assert rc == 0
     out = capsys.readouterr().out
-    assert "aGiT Dashboard" in out
-    assert "aGiT-tracked commits" in out
+    assert "aGiTrack Dashboard" in out
+    assert "aGiTrack-tracked commits" in out
 
 
 def test_cli_dashboard_outside_repo_fails_cleanly(tmp_path, capsys, monkeypatch):

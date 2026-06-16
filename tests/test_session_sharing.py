@@ -8,9 +8,9 @@ through a local bare remote.
 import subprocess
 from pathlib import Path
 
-from agit.git import GitRepo
-from agit.sessions import SharedSessionStore, github_login, redact_transcript
-from agit.sessions.identity import slug
+from agitrack.git import GitRepo
+from agitrack.sessions import SharedSessionStore, github_login, redact_transcript
+from agitrack.sessions.identity import slug
 
 
 def _init_repo(path):
@@ -55,7 +55,7 @@ def test_redact_leaves_ordinary_text_untouched():
 
 
 def test_github_login_prefers_gh(monkeypatch):
-    import agit.sessions.identity as identity
+    import agitrack.sessions.identity as identity
 
     monkeypatch.setattr(identity.shutil, "which", lambda _: "/usr/bin/gh")
     monkeypatch.setattr(
@@ -67,7 +67,7 @@ def test_github_login_prefers_gh(monkeypatch):
 
 
 def test_github_login_falls_back_to_git_name(tmp_path, monkeypatch):
-    import agit.sessions.identity as identity
+    import agitrack.sessions.identity as identity
 
     monkeypatch.setattr(identity.shutil, "which", lambda _: None)  # no gh
     repo = _init_repo(tmp_path)
@@ -106,6 +106,9 @@ def test_fetch_lists_with_filter_and_reads_transcript_on_demand():
         def remote_exists(self, name="origin"):
             return True
 
+        def ref_exists(self, ref):
+            return False  # no legacy ref
+
         def root_commit(self):
             return "abc"
 
@@ -123,7 +126,9 @@ def test_fetch_lists_with_filter_and_reads_transcript_on_demand():
 
     store = SharedSessionStore(FakeRepo())  # type: ignore[arg-type]
     assert store.fetch() is True
-    assert fetches == ["blob:limit=16k"]  # listing used the size filter
+    # The listing fetches both refs (legacy + current) with the size filter so a
+    # session shared by a pre-rename peer still lists.
+    assert fetches == ["blob:limit=16k", "blob:limit=16k"]
     entry = store.entries()[0]
     assert store.read_transcript(entry) == "the transcript"
     assert None in fetches  # a full fetch was triggered on demand for the transcript
@@ -146,7 +151,7 @@ def test_fetch_passes_timeout_through_to_git(tmp_path):
 
     store = SharedSessionStore(FakeRepo())  # type: ignore[arg-type]
     assert store.fetch(timeout=12.0) is True
-    assert seen == [12.0]
+    assert seen == [12.0, 12.0]  # the same timeout bounds both the legacy and current fetch
 
 
 def test_run_bounded_cancel_kills_process_promptly(tmp_path):
@@ -241,7 +246,7 @@ def test_read_transcript_passes_timeout_to_on_demand_fetch(tmp_path):
             seen.append(timeout)
             return True
 
-    from agit.sessions import SharedEntry
+    from agitrack.sessions import SharedEntry
 
     store = SharedSessionStore(FakeRepo())  # type: ignore[arg-type]
     entry = SharedEntry(github_id="me", name="sess", manifest={})
@@ -272,12 +277,12 @@ def test_read_transcript_refetches_latest_even_when_stale_blob_is_local():
             blobs["abc/me/sess/transcript.jsonl"] = "NEW shared latest"  # the remote tip
             return True
 
-    from agit.sessions import SharedEntry
+    from agitrack.sessions import SharedEntry
 
     store = SharedSessionStore(FakeRepo())  # type: ignore[arg-type]
     entry = SharedEntry(github_id="me", name="sess", manifest={})
     assert store.read_transcript(entry) == "NEW shared latest"
-    assert fetched == ["+refs/agit/shared-sessions:refs/agit/shared-sessions"]  # synced before reading
+    assert fetched == ["+refs/agitrack/shared-sessions:refs/agitrack/shared-sessions"]  # synced before reading
 
 
 def test_read_transcript_without_remote_reads_local_only():
@@ -297,7 +302,7 @@ def test_read_transcript_without_remote_reads_local_only():
         def fetch_ref(self, *a, **k):
             raise AssertionError("must not fetch when there is no remote")
 
-    from agit.sessions import SharedEntry
+    from agitrack.sessions import SharedEntry
 
     store = SharedSessionStore(FakeRepo())  # type: ignore[arg-type]
     entry = SharedEntry(github_id="me", name="sess", manifest={})
@@ -320,7 +325,7 @@ def test_read_transcript_does_not_fetch_when_already_cancelled():
         def fetch_ref(self, *a, **k):
             raise AssertionError("must not start a fetch once cancelled")
 
-    from agit.sessions import SharedEntry
+    from agitrack.sessions import SharedEntry
 
     store = SharedSessionStore(FakeRepo())  # type: ignore[arg-type]
     cancel = threading.Event()
@@ -507,7 +512,7 @@ def test_remote_publish_reclaims_previous_version_but_keeps_latest(tmp_path):
 
 
 def test_count_transcript_rows_ignores_blank_lines():
-    from agit.sessions import count_transcript_rows
+    from agitrack.sessions import count_transcript_rows
 
     assert count_transcript_rows("a\nb\nc\n") == 3
     assert count_transcript_rows("a\n\n  \nb\n") == 2
@@ -582,7 +587,7 @@ def test_remote_publish_recency_guard_blocks_a_behind_push(tmp_path):
 
 
 def test_shared_entry_display_uses_sorted_contributor_set():
-    from agit.sessions.store import SharedEntry
+    from agitrack.sessions.store import SharedEntry
 
     e = SharedEntry(github_id="alice", name="foo", manifest={"contributors": ["bob", "alice", "bob"]})
     assert e.contributors == ["alice", "bob"]  # de-duped and sorted (order never matters)
@@ -646,6 +651,9 @@ class _PublishFakeRepo:
 
     def remote_exists(self, name="origin"):
         return True
+
+    def ref_exists(self, ref):
+        return False  # no legacy ref present
 
     def root_commit(self):
         return "fp"
@@ -790,7 +798,7 @@ def test_cleanup_orphans_removes_only_session_snapshots(tmp_path):
 
 def test_import_overwrite_replaces_local(tmp_path, monkeypatch):
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
-    from agit.transcripts import claude
+    from agitrack.transcripts import claude
 
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -828,7 +836,7 @@ def test_resume_shared_prompts_to_pull_when_local_exists(tmp_path, monkeypatch):
 def test_resume_shared_keep_both_imports_under_new_id(tmp_path, monkeypatch):
     # When a local copy exists, "Keep both" re-imports the shared conversation
     # under a fresh id and resumes THAT, leaving the original untouched.
-    from agit.config import AgitState
+    from agitrack.config import AgitrackState
 
     backend = _StubBackend(transcript="bob's chat", has_local=True)
     runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
@@ -853,7 +861,7 @@ def test_resume_shared_keep_both_imports_under_new_id(tmp_path, monkeypatch):
     assert resumed == [("sess", "claude-copy-id")]  # and resumed that copy
     # A "Keep both" fork starts a SEPARATE lineage: no origin is recorded, so sharing
     # it later publishes a new `<you>/<name>` entry rather than updating the original.
-    assert AgitState(repo.repo).shared_origin("claude-copy-id") is None
+    assert AgitrackState(repo.repo).shared_origin("claude-copy-id") is None
 
 
 def test_resume_shared_defaults_to_local_when_shared_is_older(tmp_path, monkeypatch):
@@ -906,7 +914,7 @@ def test_share_identity_uses_origin_for_imported_and_self_for_local(tmp_path, mo
 def test_resume_records_full_lineage_origin(tmp_path, monkeypatch):
     # Resuming a shared session records its origin owner + name + contributors, so a
     # later re-share updates that same entry and keeps the contributor set.
-    from agit.config import AgitState
+    from agitrack.config import AgitrackState
 
     backend = _StubBackend(transcript="chat", has_local=False)
     runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
@@ -930,7 +938,7 @@ def test_resume_records_full_lineage_origin(tmp_path, monkeypatch):
     runner._resume_shared_session_menu()
     _drain_shared_resume(runner)
 
-    rec = AgitState(repo.repo).shared_origin("sid-x")
+    rec = AgitrackState(repo.repo).shared_origin("sid-x")
     assert rec == {"owner": "alice", "name": "sess", "contributors": ["alice", "carol"]}
 
 
@@ -938,9 +946,9 @@ def test_resume_records_full_lineage_origin(tmp_path, monkeypatch):
 
 
 def test_state_auto_share_opt_in(tmp_path):
-    from agit.config import AgitState
+    from agitrack.config import AgitrackState
 
-    state = AgitState(tmp_path)
+    state = AgitrackState(tmp_path)
     assert state.auto_share_enabled("sid") is False
     state.set_auto_share("sid", True)
     assert state.auto_share_enabled("sid") is True
@@ -951,13 +959,13 @@ def test_state_auto_share_opt_in(tmp_path):
 
 
 def test_state_shared_origin_round_trip_and_backcompat(tmp_path):
-    from agit.config import AgitState
+    from agitrack.config import AgitrackState
 
-    st = AgitState(tmp_path)
+    st = AgitrackState(tmp_path)
     st.set_shared_origin("sid", owner="alice", name="foo", contributors=["bob", "alice", "bob"])
     assert st.shared_origin("sid") == {"owner": "alice", "name": "foo", "contributors": ["alice", "bob"]}
     assert st.shared_origin_name("sid") == "foo"  # legacy accessor still resolves the name
-    assert AgitState(tmp_path).shared_origin("sid")["owner"] == "alice"  # persists across reload
+    assert AgitrackState(tmp_path).shared_origin("sid")["owner"] == "alice"  # persists across reload
     # A legacy name-only record (older client) still reads, with an empty owner/set.
     st.set_shared_origin_name("old", "bar")
     assert st.shared_origin("old") == {"owner": "", "name": "bar", "contributors": []}
@@ -967,9 +975,9 @@ def test_state_shared_origin_round_trip_and_backcompat(tmp_path):
 
 
 def test_state_shared_session_lineage_chain(tmp_path):
-    from agit.config import AgitState
+    from agitrack.config import AgitrackState
 
-    state = AgitState(tmp_path)
+    state = AgitrackState(tmp_path)
     assert state.session_lineage("a") == ["a"]
     # Two successive resume drifts: a -> b -> c.
     state.add_shared_session_alias("b", "a")
@@ -977,7 +985,7 @@ def test_state_shared_session_lineage_chain(tmp_path):
     assert state.session_lineage("c") == ["c", "b", "a"]
     assert state.session_lineage("b") == ["b", "a"]
     # Persists to base state and survives reload.
-    assert AgitState(tmp_path).session_lineage("c") == ["c", "b", "a"]
+    assert AgitrackState(tmp_path).session_lineage("c") == ["c", "b", "a"]
     # Defensive: a corrupt self-referential alias never loops.
     state.add_shared_session_alias("d", "d")  # ignored (new == previous)
     assert state.session_lineage("d") == ["d"]
@@ -987,15 +995,15 @@ def test_runner_recognises_shared_session_after_id_drift(tmp_path):
     # #55: a session shared under id "old" that the backend resumes as "new" must
     # still be marked shared and keep auto-sharing, via the recorded lineage.
     from proxy_helpers import make_runner
-    from agit.config import AgitState
+    from agitrack.config import AgitrackState
 
     (tmp_path / "repo").mkdir()
     repo = _init_repo(tmp_path / "repo")
     runner = make_runner()
     runner.base_repo = repo
     runner._debug = lambda *a, **k: None
-    base_state = AgitState(repo.repo)
-    runner._user_state = lambda: AgitState(repo.repo)
+    base_state = AgitrackState(repo.repo)
+    runner._user_state = lambda: AgitrackState(repo.repo)
     runner._my_shared_session_ids = lambda: {"old"}
 
     # Before drift: "old" is recognised directly.
@@ -1015,7 +1023,7 @@ def test_runner_recognises_shared_session_after_id_drift(tmp_path):
 
 def test_claude_export_and_import_retargets_cwd(tmp_path, monkeypatch):
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
-    from agit.transcripts import claude
+    from agitrack.transcripts import claude
 
     src = tmp_path / "srcrepo"
     src.mkdir()
@@ -1042,7 +1050,7 @@ def test_claude_import_as_id_keeps_both_under_a_new_id(tmp_path, monkeypatch):
     # "Keep both": re-import a shared conversation under a fresh id so it lives
     # alongside the existing local copy of the same id.
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
-    from agit.transcripts import claude
+    from agitrack.transcripts import claude
 
     dst = tmp_path / "repo"
     dst.mkdir()
@@ -1062,7 +1070,7 @@ def test_claude_import_as_id_keeps_both_under_a_new_id(tmp_path, monkeypatch):
 
 
 def test_opencode_export_raw_sanitizes_and_validates_json(monkeypatch, tmp_path):
-    from agit.transcripts import opencode
+    from agitrack.transcripts import opencode
 
     seen: dict[str, object] = {}
 
@@ -1082,7 +1090,7 @@ def test_opencode_export_raw_sanitizes_and_validates_json(monkeypatch, tmp_path)
 
 
 def test_opencode_export_raw_rejects_unparseable_output(monkeypatch, tmp_path):
-    from agit.transcripts import opencode
+    from agitrack.transcripts import opencode
 
     monkeypatch.setattr(opencode, "_run_export_pty", lambda repo, sid, *, sanitize=False: ("{not json", 0))
     assert opencode.export_session_raw(tmp_path, "ses_1") is None
@@ -1092,7 +1100,7 @@ def test_opencode_export_raw_rejects_unparseable_output(monkeypatch, tmp_path):
 
 
 def test_opencode_import_runs_cli_and_checks_success(monkeypatch, tmp_path):
-    from agit.transcripts import opencode
+    from agitrack.transcripts import opencode
 
     monkeypatch.setattr(opencode, "has_imported_session", lambda repo, sid: False)
     captured: dict[str, object] = {}
@@ -1116,7 +1124,7 @@ def test_opencode_import_runs_cli_and_checks_success(monkeypatch, tmp_path):
 def test_opencode_import_as_id_reids_for_keep_both(monkeypatch, tmp_path):
     # "Keep both" for OpenCode: every occurrence of the old id token is swapped
     # for the new one before import, so it lands as a separate session.
-    from agit.transcripts import opencode
+    from agitrack.transcripts import opencode
 
     captured: dict[str, object] = {}
 
@@ -1133,7 +1141,7 @@ def test_opencode_import_as_id_reids_for_keep_both(monkeypatch, tmp_path):
 
 
 def test_opencode_import_failure_paths(monkeypatch, tmp_path):
-    from agit.transcripts import opencode
+    from agitrack.transcripts import opencode
 
     monkeypatch.setattr(opencode, "has_imported_session", lambda repo, sid: False)
     # A clean exit without the success line (e.g. "File not found") is a failure.
@@ -1148,7 +1156,7 @@ def test_opencode_import_failure_paths(monkeypatch, tmp_path):
 
 
 def test_opencode_import_keeps_local_copy_unless_overwrite(monkeypatch, tmp_path):
-    from agit.transcripts import opencode
+    from agitrack.transcripts import opencode
 
     monkeypatch.setattr(opencode, "has_imported_session", lambda repo, sid: True)
     ran = {"n": 0}
@@ -1167,7 +1175,7 @@ def test_opencode_import_keeps_local_copy_unless_overwrite(monkeypatch, tmp_path
 
 
 def test_opencode_has_imported_session_uses_repo_membership(monkeypatch, tmp_path):
-    from agit.transcripts import opencode
+    from agitrack.transcripts import opencode
 
     monkeypatch.setattr(opencode, "session_belongs_to_repo", lambda repo, sid: sid == "mine")
     assert opencode.has_imported_session(tmp_path, "mine") is True
@@ -1176,7 +1184,7 @@ def test_opencode_has_imported_session_uses_repo_membership(monkeypatch, tmp_pat
 
 
 def test_opencode_transcript_size_is_unavailable(tmp_path):
-    from agit.transcripts import opencode
+    from agitrack.transcripts import opencode
 
     # No cheap per-session stat exists (SQLite store), so size is intentionally None.
     assert opencode.session_transcript_size(tmp_path, "ses_1") is None
@@ -1217,11 +1225,11 @@ class _StubBackend:
 
 def _runner_with_store(tmp_path, monkeypatch, backend):
     from proxy_helpers import make_runner
-    from agit.config import AgitState, GlobalConfig
+    from agitrack.config import AgitrackState, GlobalConfig
 
     (tmp_path / "repo").mkdir()
     repo = _init_repo(tmp_path / "repo")
-    state = AgitState(tmp_path / "repo")
+    state = AgitrackState(tmp_path / "repo")
     runner = make_runner(repo=repo, state=state)
     runner.base_repo = repo
     runner.backend = backend
@@ -1378,7 +1386,7 @@ def test_runner_share_unsupported_backend_shows_message(tmp_path, monkeypatch):
 
 
 def test_runner_resume_shared_imports_and_resumes(tmp_path, monkeypatch):
-    from agit.config import AgitState
+    from agitrack.config import AgitrackState
 
     backend = _StubBackend()
     runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
@@ -1402,13 +1410,13 @@ def test_runner_resume_shared_imports_and_resumes(tmp_path, monkeypatch):
     # entry's backend (defaults to the active backend when the manifest omits one).
     assert resumed == [("cool-fix", "bob-sid", "claude")]
     # The original share name is remembered for round-trip re-sharing.
-    assert AgitState(repo.repo).shared_origin_name("bob-sid") == "cool-fix"
+    assert AgitrackState(repo.repo).shared_origin_name("bob-sid") == "cool-fix"
 
 
 def test_runner_resume_shared_crosses_backends(tmp_path, monkeypatch):
     # Active backend is Claude, but the shared entry is an OpenCode session: it
     # must be imported and resumed by a freshly-built OpenCode agent, not Claude.
-    from agit.proxy import runner as runner_module
+    from agitrack.proxy import runner as runner_module
 
     active = _StubBackend()  # name == "claude"
     runner, repo = _runner_with_store(tmp_path, monkeypatch, active)
@@ -1569,7 +1577,7 @@ def test_auto_share_on_exit_times_out_without_hanging(tmp_path, monkeypatch):
 def test_auto_share_on_exit_warns_on_push_failure(tmp_path, monkeypatch):
     # A remote that exists but rejects the push: warn and continue (don't hang,
     # don't crash). Simulated with a store whose publish reports a failed push.
-    from agit.sessions.store import PublishResult
+    from agitrack.sessions.store import PublishResult
 
     backend = _StubBackend(transcript="unpushed turns")
     runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
@@ -1655,18 +1663,18 @@ def test_auto_share_main_thread_does_no_heavy_work(tmp_path, monkeypatch):
 
 
 def test_auto_share_optin_persists_in_base_repo_state(tmp_path, monkeypatch):
-    # The opt-in must survive across aGiT runs: it has to live in the BASE repo
+    # The opt-in must survive across aGiTrack runs: it has to live in the BASE repo
     # state, not the session worktree (which is removed on exit).
-    from agit.config import AgitState
+    from agitrack.config import AgitrackState
 
     runner, repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend())
     (tmp_path / "worktree").mkdir()
-    runner.state = AgitState(tmp_path / "worktree")  # session state lives in the (ephemeral) worktree
+    runner.state = AgitrackState(tmp_path / "worktree")  # session state lives in the (ephemeral) worktree
 
     runner._set_session_auto_share("sid-123", True)
 
-    assert AgitState(repo.repo).auto_share_enabled("sid-123") is True  # base repo → persists
-    assert AgitState(tmp_path / "worktree").auto_share_enabled("sid-123") is False  # not in the worktree
+    assert AgitrackState(repo.repo).auto_share_enabled("sid-123") is True  # base repo → persists
+    assert AgitrackState(tmp_path / "worktree").auto_share_enabled("sid-123") is False  # not in the worktree
     assert runner._session_auto_shared("sid-123") is True
 
 
@@ -1760,8 +1768,8 @@ def test_unshare_is_non_blocking_with_progress_and_result_notices(tmp_path, monk
     import threading
     import time as _time
 
-    from agit.sessions import SharedEntry
-    from agit.sessions.store import PublishResult
+    from agitrack.sessions import SharedEntry
+    from agitrack.sessions.store import PublishResult
 
     backend = _StubBackend()
     runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
@@ -1886,7 +1894,7 @@ def test_manage_menu_opens_without_fetch_or_transcript_read(tmp_path, monkeypatc
 
 
 def test_shared_entry_status_is_size_based(tmp_path, monkeypatch):
-    from agit.sessions import SharedEntry
+    from agitrack.sessions import SharedEntry
 
     backend = _StubBackend(transcript="x" * 100)  # current transcript = 100 bytes
     runner, _repo = _runner_with_store(tmp_path, monkeypatch, backend)
@@ -1899,7 +1907,7 @@ def test_shared_entry_status_is_size_based(tmp_path, monkeypatch):
 
 
 def test_both_backends_flag_sharing_support():
-    from agit.backends.proxy_agents import make_proxy_agent
+    from agitrack.backends.proxy_agents import make_proxy_agent
 
     # Claude (per-session .jsonl) and OpenCode (export/import CLI) both have a
     # portable transcript, so both advertise session sharing (issue #55).
@@ -1908,8 +1916,8 @@ def test_both_backends_flag_sharing_support():
 
 
 def test_opencode_agent_delegates_sharing_to_transcript_module(tmp_path, monkeypatch):
-    from agit.backends.proxy_agents import make_proxy_agent
-    from agit.transcripts import opencode as opencode_session
+    from agitrack.backends.proxy_agents import make_proxy_agent
+    from agitrack.transcripts import opencode as opencode_session
 
     calls: dict[str, object] = {}
 

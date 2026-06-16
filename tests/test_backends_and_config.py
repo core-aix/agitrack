@@ -3,10 +3,10 @@ from pathlib import Path
 
 import pytest
 
-from agit.backends.claude import ClaudeBackend
-from agit.backends.proxy_agents import available_backends, make_proxy_agent
-from agit.config import GlobalConfig
-from agit.config import AgitState
+from agitrack.backends.claude import ClaudeBackend
+from agitrack.backends.proxy_agents import available_backends, make_proxy_agent
+from agitrack.config import GlobalConfig
+from agitrack.config import AgitrackState
 
 
 def test_available_backends_includes_opencode_and_claude():
@@ -24,7 +24,7 @@ def test_opencode_proxy_agent_spawn_command():
 def test_claude_proxy_agent_spawn_command_uses_session_id_and_resume():
     agent = make_proxy_agent("claude")
     assert agent.name == "claude"
-    # Claude picks an explicit session id so aGiT knows which transcript to read.
+    # Claude picks an explicit session id so aGiTrack knows which transcript to read.
     assert len(agent.new_session_id()) == 36
     assert agent.spawn_command(Path("/repo"), session_id="u1", resume=False) == ["claude", "--session-id", "u1"]
     assert agent.spawn_command(Path("/repo"), session_id="u1", resume=True) == ["claude", "--resume", "u1"]
@@ -48,7 +48,7 @@ def test_global_config_default_backend_persists(tmp_path):
 
 
 def test_timings_default_when_unset(tmp_path):
-    from agit.config import DEFAULT_TIMINGS
+    from agitrack.config import DEFAULT_TIMINGS
 
     config = GlobalConfig(tmp_path / "config.json")
     assert config.timings == DEFAULT_TIMINGS
@@ -89,7 +89,7 @@ def test_timings_ignore_invalid_values(tmp_path):
 def test_state_uses_default_backend_and_remembers_sessions(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
-    state = AgitState(repo, default_backend="claude")
+    state = AgitrackState(repo, default_backend="claude")
     assert state.backend == "claude"
 
     state.backend_session_id = "claude-session"
@@ -101,7 +101,7 @@ def test_state_uses_default_backend_and_remembers_sessions(tmp_path):
     assert state.stored_backend_session("claude") == "claude-session"
     assert state.stored_backend_session("opencode") == "opencode-session"
     # Survives a reload from disk.
-    reloaded = AgitState(repo, default_backend="claude")
+    reloaded = AgitrackState(repo, default_backend="claude")
     assert reloaded.stored_backend_session("claude") == "claude-session"
 
 
@@ -211,7 +211,7 @@ def test_claude_backend_model_falls_back_to_total_volume():
 
 
 def test_menu_key_defaults_and_validation(tmp_path):
-    from agit.config import GlobalConfig
+    from agitrack.config import GlobalConfig
 
     config = GlobalConfig(tmp_path / "config.json")
     assert config.menu_key == "ctrl-g"
@@ -234,7 +234,7 @@ def test_menu_key_defaults_and_validation(tmp_path):
 
 
 def test_menu_key_shift_modified(tmp_path):
-    from agit.config import GlobalConfig
+    from agitrack.config import GlobalConfig
 
     config = GlobalConfig(tmp_path / "config.json")
 
@@ -266,11 +266,11 @@ def test_menu_key_shift_modified(tmp_path):
 
 
 def test_use_worktrees_defaults_true(tmp_path, monkeypatch):
-    monkeypatch.setenv("AGIT_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path))
     assert GlobalConfig().use_worktrees is True
 
 
 def test_use_worktrees_config_opt_out(tmp_path, monkeypatch):
-    monkeypatch.setenv("AGIT_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path))
     (tmp_path / "config.json").write_text('{"use_worktrees": false}')
     assert GlobalConfig().use_worktrees is False

@@ -1,6 +1,6 @@
 import pytest
 
-from agit.commits import build_agent_commit_message, build_user_commit_message, render_interaction_trace
+from agitrack.commits import build_agent_commit_message, build_user_commit_message, render_interaction_trace
 
 
 def test_render_interaction_trace_matches_committed_trace_and_masks_secrets():
@@ -21,10 +21,10 @@ def test_render_interaction_trace_matches_committed_trace_and_masks_secrets():
         trace=trace,
         backend="claude",
         backend_session_id="ses-1",
-        agit_session_id="agit-1",
+        agitrack_session_id="agit-1",
         model="m",
     )
-    committed = message.split("# Interaction Trace\n\n", 1)[1].split("\n# aGiT Metadata", 1)[0].strip()
+    committed = message.split("# Interaction Trace\n\n", 1)[1].split("\n# aGiTrack Metadata", 1)[0].strip()
     assert committed == rendered
 
 
@@ -42,7 +42,7 @@ def test_agent_commit_message_contains_trace_and_metadata():
         trace=[{"role": "user", "content": "fix it"}, {"role": "agent", "content": "fixed"}],
         backend="opencode",
         backend_session_id="ses-1",
-        agit_session_id="agit-1",
+        agitrack_session_id="agit-1",
         model="provider/model",
         token_usage={
             "context": 100,
@@ -55,11 +55,11 @@ def test_agent_commit_message_contains_trace_and_metadata():
         },
     )
 
-    assert message.startswith("<aGiT> fix it")
+    assert message.startswith("<aGiTrack> fix it")
     assert "# Interaction Trace" in message
     assert "## User\n\nfix it" in message
     assert "## Agent\n\nfixed" in message
-    assert "# aGiT Metadata" in message
+    assert "# aGiTrack Metadata" in message
     assert "backend: opencode" in message
     assert "backend_session_id: ses-1" in message
     assert "context_tokens: 100" in message
@@ -86,7 +86,7 @@ def test_trace_message_headings_are_nested_under_role():
         ],
         backend="claude",
         backend_session_id="ses-1",
-        agit_session_id="agit-1",
+        agitrack_session_id="agit-1",
         model="m",
     )
     # User content's shallowest heading was level 1, so everything shifts +2: the
@@ -108,7 +108,7 @@ def test_trace_heading_nesting_skips_fenced_code_comments():
         trace=[{"role": "agent", "content": "# Heading\n```sh\n# just a comment\n```"}],
         backend="claude",
         backend_session_id="ses-1",
-        agit_session_id="agit-1",
+        agitrack_session_id="agit-1",
         model="m",
     )
     assert "### Heading" in message
@@ -124,7 +124,7 @@ def test_commit_message_masks_secrets_in_subject_and_trace():
         ],
         backend="opencode",
         backend_session_id="ses-1",
-        agit_session_id="agit-1",
+        agitrack_session_id="agit-1",
         model="provider/model",
     )
 
@@ -140,7 +140,7 @@ def test_commit_message_removes_mouse_coordinate_reports():
         trace=[{"role": "user", "content": "[<35;60;43M[<0;42;39m keep text"}],
         backend="opencode",
         backend_session_id="ses-1",
-        agit_session_id="agit-1",
+        agitrack_session_id="agit-1",
         model="provider/model",
     )
 
@@ -160,7 +160,7 @@ def test_agent_commit_message_preserves_user_trace_order():
         ],
         backend="opencode",
         backend_session_id="ses-1",
-        agit_session_id="agit-1",
+        agitrack_session_id="agit-1",
         model="provider/model",
     )
 
@@ -173,7 +173,7 @@ def test_agent_commit_message_omits_zero_reasoning():
         trace=[],
         backend="opencode",
         backend_session_id="ses-1",
-        agit_session_id="agit-1",
+        agitrack_session_id="agit-1",
         model="provider/model",
         token_usage={
             "context": 100,
@@ -196,7 +196,7 @@ def test_agent_commit_message_includes_nonzero_reasoning():
         trace=[],
         backend="opencode",
         backend_session_id="ses-1",
-        agit_session_id="agit-1",
+        agitrack_session_id="agit-1",
         model="provider/model",
         token_usage={
             "context": 100,
@@ -222,7 +222,7 @@ def test_first_run_input_counts_cache_creation_tokens():
         trace=[],
         backend="claude",
         backend_session_id="ses-1",
-        agit_session_id="agit-1",
+        agitrack_session_id="agit-1",
         model="m",
         token_usage={
             "context": 18250,
@@ -246,7 +246,7 @@ def test_subagent_input_counts_subagent_cache_creation_tokens():
         trace=[],
         backend="claude",
         backend_session_id="ses-1",
-        agit_session_id="agit-1",
+        agitrack_session_id="agit-1",
         model="m",
         token_usage={
             "context": 100,
@@ -274,7 +274,7 @@ def test_agent_commit_message_records_subagent_token_categories():
         trace=[],
         backend="claude",
         backend_session_id="ses-1",
-        agit_session_id="agit-1",
+        agitrack_session_id="agit-1",
         model="claude-opus-4-8",
         token_usage={
             "context": 100,
@@ -302,44 +302,44 @@ def test_agent_commit_message_records_subagent_token_categories():
 
 def test_user_commit_message_rejects_blank_message():
     with pytest.raises(ValueError, match="required"):
-        build_user_commit_message(message="", agit_session_id="agit-1")
+        build_user_commit_message(message="", agitrack_session_id="agit-1")
 
 
 def test_user_commit_message_uses_required_message_subject():
-    message = build_user_commit_message(message="save work", agit_session_id="agit-1")
+    message = build_user_commit_message(message="save work", agitrack_session_id="agit-1")
 
     assert message.startswith("save work")
     assert "User Message:" not in message
-    assert "# aGiT Metadata" in message
+    assert "# aGiTrack Metadata" in message
 
 
 def test_user_commit_message_masks_secret_subject():
-    message = build_user_commit_message(message="save password=secret123", agit_session_id="agit-1")
+    message = build_user_commit_message(message="save password=secret123", agitrack_session_id="agit-1")
 
     assert message.startswith("save password=[REDACTED]")
     assert "secret123" not in message
 
 
 def test_commit_messages_include_current_agit_version_without_created_at():
-    from agit import __version__
+    from agitrack import __version__
 
-    message = build_user_commit_message(message="save work", agit_session_id="agit-1")
+    message = build_user_commit_message(message="save work", agitrack_session_id="agit-1")
 
-    assert f"agit_version: {__version__}" in message
+    assert f"agitrack_version: {__version__}" in message
     assert "created_at" not in message
 
 
 def test_commit_version_matches_installed_distribution():
-    # The version stamped into commit metadata must equal the aGiT the user has
-    # installed — agit.__version__ derives from the distribution metadata so the
+    # The version stamped into commit metadata must equal the aGiTrack the user has
+    # installed — agitrack.__version__ derives from the distribution metadata so the
     # two cannot drift (pyproject.toml is the single version source).
     from importlib.metadata import version
 
-    from agit import __version__
+    from agitrack import __version__
 
-    assert __version__ == version("agit-ai")
-    message = build_user_commit_message(message="save work", agit_session_id="agit-1")
-    assert f"agit_version: {version('agit-ai')}" in message
+    assert __version__ == version("agitrack")
+    message = build_user_commit_message(message="save work", agitrack_session_id="agit-1")
+    assert f"agitrack_version: {version('agitrack')}" in message
 
 
 def test_source_version_falls_back_to_pyproject_when_metadata_missing():
@@ -350,7 +350,7 @@ def test_source_version_falls_back_to_pyproject_when_metadata_missing():
     import re
     from pathlib import Path
 
-    from agit import _source_version
+    from agitrack import _source_version
 
     pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
     expected = re.search(r'^version = "([^"]+)"', pyproject.read_text(), re.M).group(1)
@@ -364,14 +364,14 @@ def test_agent_commit_subject_is_capped_for_github():
         trace=[],
         backend="opencode",
         backend_session_id="ses-1",
-        agit_session_id="agit-1",
+        agitrack_session_id="agit-1",
         model="provider/model",
     )
 
     lines = message.splitlines()
     subject = lines[0]
     assert len(subject) <= 72  # GitHub's subject-line truncation limit
-    assert subject.startswith("<aGiT> ")
+    assert subject.startswith("<aGiTrack> ")
     assert subject.endswith("...")
     # The full (untruncated) text follows the subject line directly — no separate
     # "# Full Subject" header, and no blank line between subject and continuation.
@@ -380,7 +380,7 @@ def test_agent_commit_subject_is_capped_for_github():
 
 
 def test_user_commit_subject_is_capped_for_github():
-    message = build_user_commit_message(message="save " * 40, agit_session_id="agit-1")
+    message = build_user_commit_message(message="save " * 40, agitrack_session_id="agit-1")
 
     lines = message.splitlines()
     subject = lines[0]
@@ -397,7 +397,7 @@ def test_commit_message_body_lines_are_wrapped_to_72():
         trace=[{"role": "agent", "content": "a " * 80}],
         backend="opencode",
         backend_session_id="ses-1",
-        agit_session_id="agit-1",
+        agitrack_session_id="agit-1",
         model="provider/model",
     )
 
@@ -420,7 +420,7 @@ def test_agent_commit_trace_is_limited_by_user_turns():
         trace=trace,
         backend="opencode",
         backend_session_id="ses-1",
-        agit_session_id="agit-1",
+        agitrack_session_id="agit-1",
         model="provider/model",
         trace_turn_limit=5,
     )
@@ -437,7 +437,7 @@ def test_agent_commit_records_conversation_span_as_utc_iso():
         trace=[{"role": "user", "content": "build it"}],
         backend="claude",
         backend_session_id="ses-1",
-        agit_session_id="agit-1",
+        agitrack_session_id="agit-1",
         model="claude-opus-4-8",
         started_at=1_718_200_000,
         ended_at=1_718_200_123,
@@ -452,7 +452,7 @@ def test_agent_commit_omits_span_when_timestamps_absent():
         trace=[{"role": "user", "content": "build it"}],
         backend="claude",
         backend_session_id="ses-1",
-        agit_session_id="agit-1",
+        agitrack_session_id="agit-1",
         model="claude-opus-4-8",
     )
     assert "agent_started_at" not in message
@@ -461,7 +461,7 @@ def test_agent_commit_omits_span_when_timestamps_absent():
 
 def test_subject_strips_terminal_escape_sequences():
     # Arrow-key residue and SGR colour codes must never reach the subject.
-    message = build_user_commit_message(message="fix \x1b[Bthe \x1b[31mparser\x1b[0m bug", agit_session_id="agit-1")
+    message = build_user_commit_message(message="fix \x1b[Bthe \x1b[31mparser\x1b[0m bug", agitrack_session_id="agit-1")
     subject = message.splitlines()[0]
     assert subject == "fix the parser bug"
     assert "\x1b" not in message
@@ -473,34 +473,34 @@ def test_agent_subject_strips_orphan_mouse_and_control_chars():
         trace=[{"role": "user", "content": "run \x1b[Atests now"}],
         backend="claude",
         backend_session_id="ses-1",
-        agit_session_id="agit-1",
+        agitrack_session_id="agit-1",
         model="claude-opus-4-8",
     )
     subject = message.splitlines()[0]
-    assert subject == "<aGiT> run tests now"
+    assert subject == "<aGiTrack> run tests now"
     assert "\x1b" not in message
     assert "\x07" not in message
 
 
 def test_legitimate_bracketed_text_is_preserved():
     # Defensive escape stripping must not damage normal bracketed prose.
-    message = build_user_commit_message(message="handle [Beta] flag and list[B]", agit_session_id="agit-1")
+    message = build_user_commit_message(message="handle [Beta] flag and list[B]", agitrack_session_id="agit-1")
     assert message.splitlines()[0] == "handle [Beta] flag and list[B]"
 
 
 def test_agent_merge_message_format():
-    from agit.commits import build_agent_merge_message
+    from agitrack.commits import build_agent_merge_message
 
     message = build_agent_merge_message(
         session_name="feature-x",
         base_branch="main",
         source_branch="agit/feature-x/t2",
-        agit_session_id="agit-1",
+        agitrack_session_id="agit-1",
         backend="claude",
         backend_session_id="ses-9",
         conflicting_commits="abc123 base edit",
     )
-    assert message.splitlines()[0].startswith("<aGiT-merge> ")
+    assert message.splitlines()[0].startswith("<aGiTrack-merge> ")
     assert "commit_type: agent-merge" in message
     assert "session_name: feature-x" in message
     assert "source_branch: agit/feature-x/t2" in message

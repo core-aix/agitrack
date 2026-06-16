@@ -1,4 +1,4 @@
-"""Unit tests for agit.proxy.modal (P6 Stage 2).
+"""Unit tests for agitrack.proxy.modal (P6 Stage 2).
 
 Covers:
   - PromptModal byte-handling: typing, backspace, Enter, Esc cancel, Ctrl-C exit
@@ -12,7 +12,7 @@ import os
 import types
 
 
-from agit.proxy.modal import PromptModal, SelectModal
+from agitrack.proxy.modal import PromptModal, SelectModal
 from proxy_helpers import make_runner
 
 
@@ -182,7 +182,7 @@ class TestSelectModal:
 
 def _modal_runner(monkeypatch, stdin_fd):
     """Build a minimal ProxyRunner for modal/PTY-drain integration tests."""
-    import agit.proxy.runner as proxy_mod
+    import agitrack.proxy.runner as proxy_mod
 
     runner = make_runner()
     monkeypatch.setattr(proxy_mod.sys, "stdin", types.SimpleNamespace(fileno=lambda: stdin_fd))
@@ -374,7 +374,7 @@ def test_exit_byte_in_modal_reaches_finalize_pending_work():
     """Ctrl-C inside an open modal calls _run_exit_flow → _finalize_pending_work.
 
     This validates the exit-path unification guarantee: no interactive route
-    out of aGiT can bypass _finalize_pending_work().
+    out of aGiTrack can bypass _finalize_pending_work().
     """
     runner = make_runner()
     runner._set_message = lambda *a, **k: None

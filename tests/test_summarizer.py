@@ -1,10 +1,10 @@
 from unittest.mock import Mock
-from agit.summaries import Summarizer
-from agit.backends.base import AgentResult, TokenUsage
-from agit.transcripts.types import SessionTurn, ExportedSession
+from agitrack.summaries import Summarizer
+from agitrack.backends.base import AgentResult, TokenUsage
+from agitrack.transcripts.types import SessionTurn, ExportedSession
 
 # A small interaction trace (the only input the summarizer is now given), shaped
-# like the "## User"/"## Agent" body appended to an aGiT commit.
+# like the "## User"/"## Agent" body appended to an aGiTrack commit.
 _TRACE = "## User\n\ndo the task\n\n## Agent\n\nDid the task and added tests."
 
 
@@ -197,7 +197,7 @@ def _turn() -> SessionTurn:
 
 def test_summarizer_raises_on_session_limit_error_text() -> None:
     import pytest
-    from agit.summaries import UnusableSummaryError
+    from agitrack.summaries import UnusableSummaryError
 
     backend = Mock()
     backend.run.return_value = _result("You've hit your session limit. Your limit will reset at 3pm.")
@@ -208,7 +208,7 @@ def test_summarizer_raises_on_session_limit_error_text() -> None:
 
 def test_summarizer_raises_on_nonzero_exit_code() -> None:
     import pytest
-    from agit.summaries import UnusableSummaryError
+    from agitrack.summaries import UnusableSummaryError
 
     backend = Mock()
     backend.run.return_value = _result("Looks like a fine summary.", exit_code=1)
@@ -219,7 +219,7 @@ def test_summarizer_raises_on_nonzero_exit_code() -> None:
 
 def test_summarizer_raises_on_empty_response() -> None:
     import pytest
-    from agit.summaries import UnusableSummaryError
+    from agitrack.summaries import UnusableSummaryError
 
     backend = Mock()
     backend.run.return_value = _result("   \n  ")
@@ -229,7 +229,7 @@ def test_summarizer_raises_on_empty_response() -> None:
 
 
 def test_summary_is_usable_detects_error_shapes() -> None:
-    from agit.summaries import summary_is_usable
+    from agitrack.summaries import summary_is_usable
 
     for error in [
         "You've hit your session limit. It resets at 3pm.",
@@ -244,7 +244,7 @@ def test_summary_is_usable_detects_error_shapes() -> None:
 
 
 def test_summary_is_usable_keeps_topical_mentions_of_limits_and_errors() -> None:
-    from agit.summaries import summary_is_usable
+    from agitrack.summaries import summary_is_usable
 
     # Legitimate summaries that merely talk about limits/errors must pass.
     for summary in [
@@ -257,8 +257,8 @@ def test_summary_is_usable_keeps_topical_mentions_of_limits_and_errors() -> None
 
 
 def test_summary_is_usable_rejects_echoed_prompt() -> None:
-    from agit.summaries import summary_is_usable
-    from agit.summaries.prompts import COMMIT_SUMMARY_SYSTEM, PRE_COMPACTION_SYSTEM, SESSION_UPDATE_SYSTEM
+    from agitrack.summaries import summary_is_usable
+    from agitrack.summaries.prompts import COMMIT_SUMMARY_SYSTEM, PRE_COMPACTION_SYSTEM, SESSION_UPDATE_SYSTEM
 
     # The exact bug: the backend echoed its own system prompt, which then became
     # the commit subject/body. Every system prompt and the scaffolding must be
@@ -273,7 +273,7 @@ def test_summary_is_usable_rejects_echoed_prompt() -> None:
 
 def test_summarizer_raises_when_backend_echoes_the_prompt() -> None:
     import pytest
-    from agit.summaries import UnusableSummaryError
+    from agitrack.summaries import UnusableSummaryError
 
     # Simulate the backend returning the *entire prompt* it was given (the
     # observed failure mode) — the summarizer must reject it so the commit keeps
@@ -293,7 +293,7 @@ def test_summarizer_raises_when_backend_echoes_the_prompt() -> None:
 
 
 def test_looks_like_prompt_echo_is_marker_independent() -> None:
-    from agit.summaries.summarizer import _looks_like_prompt_echo
+    from agitrack.summaries.summarizer import _looks_like_prompt_echo
 
     # The general (marker-independent) check: a response that restates the prompt
     # from the top is an echo even if no fixed marker matches.
@@ -307,7 +307,7 @@ def test_looks_like_prompt_echo_is_marker_independent() -> None:
 
 def test_session_update_rejects_echoed_prompt() -> None:
     import pytest
-    from agit.summaries import UnusableSummaryError
+    from agitrack.summaries import UnusableSummaryError
 
     # The session-update path goes through the same _run guard; echoing the
     # received prompt must be rejected too.
@@ -322,7 +322,7 @@ def test_session_update_rejects_echoed_prompt() -> None:
 
 
 def test_strip_summary_preamble_removes_meta_lead_ins() -> None:
-    from agit.summaries.summarizer import strip_summary_preamble
+    from agitrack.summaries.summarizer import strip_summary_preamble
 
     # The exact observed failure: a meta-preamble before the real summary.
     bad = (
@@ -343,7 +343,7 @@ def test_strip_summary_preamble_removes_meta_lead_ins() -> None:
 
 
 def test_strip_summary_preamble_keeps_genuine_summaries() -> None:
-    from agit.summaries.summarizer import strip_summary_preamble
+    from agitrack.summaries.summarizer import strip_summary_preamble
 
     # Real topic sentences must never be mistaken for a preamble, even when they
     # contain words like "summary", "here", or "this".
@@ -370,7 +370,7 @@ def test_commit_prompt_is_only_the_trace_bounded_and_reminds_at_the_end() -> Non
     # The commit summary's sole input is the interaction trace (no diff). A huge
     # trace is capped, and the instruction is restated next to the generation cue
     # so the model stays in summarization mode.
-    from agit.summaries.summarizer import _MAX_TRACE_CHARS
+    from agitrack.summaries.summarizer import _MAX_TRACE_CHARS
 
     backend = Mock()
     backend.run.return_value = _result("Bounded summary.")
@@ -389,7 +389,7 @@ def test_commit_prompt_is_only_the_trace_bounded_and_reminds_at_the_end() -> Non
 
 def test_turns_block_keeps_most_recent_within_budget() -> None:
     # Still used for pre-compaction (whole-session) summaries.
-    from agit.summaries.summarizer import _turns_block
+    from agitrack.summaries.summarizer import _turns_block
 
     def turn(tag: str) -> SessionTurn:
         return SessionTurn(

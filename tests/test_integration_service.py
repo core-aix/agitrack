@@ -11,8 +11,8 @@ import time
 import types
 
 
-from agit.git import GitRepo
-from agit.proxy.integration import (
+from agitrack.git import GitRepo
+from agitrack.proxy.integration import (
     CONFLICT,
     INTEGRATED,
     SKIP,
@@ -20,7 +20,7 @@ from agit.proxy.integration import (
     MergeContext,
     MergePhase,
 )
-from agit.git import WorktreeManager
+from agitrack.git import WorktreeManager
 from proxy_helpers import make_runner
 
 
@@ -63,11 +63,11 @@ def _svc(main_repo, base_branch):
 
 
 def test_merge_context_initial_state():
-    ctx = MergeContext(source_branch="agit/s1/t1", context="some commits")
+    ctx = MergeContext(source_branch="agitrack/s1/t1", context="some commits")
     assert ctx.phase is MergePhase.PENDING
     assert ctx.auto_tried is False
     assert ctx.prompt_sent_at is None
-    assert ctx.source_branch == "agit/s1/t1"
+    assert ctx.source_branch == "agitrack/s1/t1"
     assert ctx.context == "some commits"
 
 
@@ -110,8 +110,8 @@ def test_merge_context_manual_phase():
 
 def test_turn_from_branch_parses_number():
     svc = IntegrationService.__new__(IntegrationService)
-    assert svc.turn_from_branch("agit/claude/session-1/t3") == 3
-    assert svc.turn_from_branch("agit/session-1/t0") == 0
+    assert svc.turn_from_branch("agitrack/claude/session-1/t3") == 3
+    assert svc.turn_from_branch("agitrack/session-1/t0") == 0
     assert svc.turn_from_branch("main") == 0
     assert svc.turn_from_branch("") == 0
 
@@ -139,7 +139,7 @@ def test_ensure_turn_branch_creates_branch_on_detached(tmp_path):
         backend_name="test",
     )
     assert new_turn == 1
-    assert work.current_branch() == "agit/test/s1/t1"
+    assert work.current_branch() == "agitrack/test/s1/t1"
 
 
 def test_ensure_turn_branch_skips_if_not_detached(tmp_path):
@@ -154,7 +154,7 @@ def test_ensure_turn_branch_skips_if_not_detached(tmp_path):
     svc = _svc(main, base)
     new_turn = svc.ensure_turn_branch(work, info, 1, wm, "s1", "test")
     assert new_turn == 1  # unchanged
-    assert work.current_branch() == "agit/test/s1/t1"
+    assert work.current_branch() == "agitrack/test/s1/t1"
 
 
 def test_ensure_turn_branch_skips_occupied_numbers(tmp_path):
@@ -175,7 +175,7 @@ def test_ensure_turn_branch_skips_occupied_numbers(tmp_path):
     svc = _svc(main, base)
     new_turn = svc.ensure_turn_branch(work, info, 0, wm, "s1", "test")
     assert new_turn == 3  # skipped t1 and t2
-    assert work.current_branch() == "agit/test/s1/t3"
+    assert work.current_branch() == "agitrack/test/s1/t3"
 
 
 def test_ensure_turn_branch_skips_if_no_worktree(tmp_path):
@@ -197,7 +197,7 @@ def test_integrate_turn_clean_merge(tmp_path):
     main = _init_repo(tmp_path)
     base = main.current_branch()
     _, work = _make_session(main, "s1", base)
-    _commit(work, "a.txt", "x\n", "<aGiT> work")
+    _commit(work, "a.txt", "x\n", "<aGiTrack> work")
 
     svc = _svc(main, base)
     result, branch = svc.integrate_turn_or_conflict(
@@ -208,7 +208,7 @@ def test_integrate_turn_clean_merge(tmp_path):
         integration_paused=False,
     )
     assert result == INTEGRATED
-    assert branch == "agit/test/s1/t1"
+    assert branch == "agitrack/test/s1/t1"
 
 
 def test_integrate_turn_conflict(tmp_path):
@@ -221,7 +221,7 @@ def test_integrate_turn_conflict(tmp_path):
     svc = _svc(main, base)
     result, branch = svc.integrate_turn_or_conflict(work, "s1", object(), None, False)
     assert result == CONFLICT
-    assert branch == "agit/test/s1/t1"
+    assert branch == "agitrack/test/s1/t1"
     assert not work.merge_in_progress()  # aborted cleanly
 
 
@@ -250,7 +250,7 @@ def test_integrate_turn_skips_when_merge_ctx_active(tmp_path):
     _, work = _make_session(main, "s1", base)
     _commit(work, "a.txt", "x\n", "work")
     svc = _svc(main, base)
-    ctx = MergeContext(source_branch="agit/test/s1/t1", context="")
+    ctx = MergeContext(source_branch="agitrack/test/s1/t1", context="")
     result, _ = svc.integrate_turn_or_conflict(work, "s1", object(), ctx, False)
     assert result == SKIP
 
@@ -283,7 +283,7 @@ def test_advance_base_to_fast_forwards_base(tmp_path):
 
     assert (main.repo / "a.txt").exists()
     assert work.is_detached()
-    assert turn not in main.list_branches("agit/")
+    assert turn not in main.list_branches("agitrack/")
 
 
 def test_advance_base_when_base_not_checked_out_fast_forwards_ref(tmp_path):
@@ -482,13 +482,13 @@ def test_base_switch_candidates_excludes_agit_and_current(tmp_path):
     main = _init_repo(tmp_path)
     base = main.current_branch()
     main.create_branch("feature", base)
-    main.create_branch("agit/claude/s1/t1", base)
+    main.create_branch("agitrack/claude/s1/t1", base)
 
     svc = _svc(main, base)
     candidates = svc.base_switch_candidates()
     assert "feature" in candidates
     assert base not in candidates
-    assert "agit/claude/s1/t1" not in candidates
+    assert "agitrack/claude/s1/t1" not in candidates
 
 
 # ---------------------------------------------------------------------------
@@ -589,11 +589,11 @@ def test_merge_resolution_prompt_contains_base_branch(tmp_path):
     fake_repo = types.SimpleNamespace(
         unmerged_paths=lambda: ["conflict.txt"],
     )
-    prompt = svc.merge_resolution_prompt(fake_repo, "agit/test/s1/t1")
+    prompt = svc.merge_resolution_prompt(fake_repo, "agitrack/test/s1/t1")
     assert base in prompt
     assert "conflict.txt" in prompt
     assert "<<<<<<< / ======= / >>>>>>>" in prompt
-    assert "aGiT" in prompt
+    assert "aGiTrack" in prompt
 
 
 # ---------------------------------------------------------------------------
@@ -605,8 +605,8 @@ def test_delete_orphan_merged_branches_removes_merged(tmp_path):
     main = _init_repo(tmp_path)
     base = main.current_branch()
     # Create an agit branch, merge it into base, but leave it around
-    main.create_branch("agit/test/s1/t1", base)
-    main.switch("agit/test/s1/t1")
+    main.create_branch("agitrack/test/s1/t1", base)
+    main.switch("agitrack/test/s1/t1")
     _commit(main, "orphan.txt", "x\n", "orphan work")
     branch = main.current_branch()
     main.switch(base)
@@ -615,14 +615,14 @@ def test_delete_orphan_merged_branches_removes_merged(tmp_path):
 
     svc = _svc(main, base)
     svc.delete_orphan_merged_branches()
-    assert branch not in main.list_branches("agit/")
+    assert branch not in main.list_branches("agitrack/")
 
 
 def test_delete_orphan_merged_branches_keeps_unmerged(tmp_path):
     main = _init_repo(tmp_path)
     base = main.current_branch()
-    main.create_branch("agit/test/s1/t1", base)
-    main.switch("agit/test/s1/t1")
+    main.create_branch("agitrack/test/s1/t1", base)
+    main.switch("agitrack/test/s1/t1")
     _commit(main, "new.txt", "x\n", "unmerged work")
     branch = main.current_branch()
     main.switch(base)
@@ -630,7 +630,7 @@ def test_delete_orphan_merged_branches_keeps_unmerged(tmp_path):
 
     svc = _svc(main, base)
     svc.delete_orphan_merged_branches()
-    assert branch in main.list_branches("agit/")  # kept
+    assert branch in main.list_branches("agitrack/")  # kept
 
 
 # ---------------------------------------------------------------------------
@@ -655,7 +655,7 @@ def test_manual_context_never_auto_finalizes():
     # Simulate everything else looking like it should fire: prompt sent,
     # agent responded, plenty of idle time — but it's a MANUAL context.
     ctx = MergeContext(
-        source_branch="agit/s/t1",
+        source_branch="agitrack/s/t1",
         context="",
         phase=MergePhase.MANUAL,
         auto_tried=True,  # MANUAL always starts True
@@ -671,7 +671,7 @@ def test_auto_context_finalizes_once_after_idle():
     svc = IntegrationService.__new__(IntegrationService)
     now = time.monotonic()
     ctx = MergeContext(
-        source_branch="agit/s/t1",
+        source_branch="agitrack/s/t1",
         context="",
         phase=MergePhase.RESOLVING,
         auto_tried=False,
@@ -694,7 +694,7 @@ def test_pending_context_never_auto_finalizes():
     svc = IntegrationService.__new__(IntegrationService)
     now = time.monotonic()
     ctx = MergeContext(
-        source_branch="agit/s/t1",
+        source_branch="agitrack/s/t1",
         context="",
         phase=MergePhase.PENDING,
         auto_tried=False,
@@ -710,7 +710,7 @@ def test_auto_context_not_idle_yet_does_not_finalize():
     svc = IntegrationService.__new__(IntegrationService)
     now = time.monotonic()
     ctx = MergeContext(
-        source_branch="agit/s/t1",
+        source_branch="agitrack/s/t1",
         context="",
         phase=MergePhase.RESOLVING,
         auto_tried=False,
@@ -742,7 +742,7 @@ def test_manual_context_phase_never_promoted_by_flush():
     """The real _flush_pending_enter must not promote a MANUAL context."""
     import os
 
-    ctx = MergeContext(source_branch="agit/s/t1", context="", phase=MergePhase.MANUAL, auto_tried=True)
+    ctx = MergeContext(source_branch="agitrack/s/t1", context="", phase=MergePhase.MANUAL, auto_tried=True)
     runner, read_fd, write_fd = _flush_runner(ctx)
     try:
         runner._flush_pending_enter()
@@ -757,7 +757,7 @@ def test_pending_context_phase_promoted_to_resolving_by_flush():
     """The real _flush_pending_enter promotes a PENDING (auto) context."""
     import os
 
-    ctx = MergeContext(source_branch="agit/s/t1", context="", phase=MergePhase.PENDING, auto_tried=False)
+    ctx = MergeContext(source_branch="agitrack/s/t1", context="", phase=MergePhase.PENDING, auto_tried=False)
     runner, read_fd, write_fd = _flush_runner(ctx)
     try:
         runner._flush_pending_enter()
@@ -773,11 +773,11 @@ def test_maybe_complete_agent_merge_spends_the_auto_attempt():
     finalizing, so a failed finalize is not retried on every loop tick."""
     import time
 
-    from agit.proxy.integration import IntegrationService
+    from agitrack.proxy.integration import IntegrationService
 
     now = time.monotonic()
     ctx = MergeContext(
-        source_branch="agit/s/t1",
+        source_branch="agitrack/s/t1",
         context="",
         phase=MergePhase.RESOLVING,
         auto_tried=False,

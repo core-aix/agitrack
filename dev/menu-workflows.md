@@ -1,6 +1,6 @@
-# aGiT menu & messaging workflow audit
+# aGiTrack menu & messaging workflow audit
 
-Purpose: enumerate every interactive user workflow reachable from aGiT's menus and
+Purpose: enumerate every interactive user workflow reachable from aGiTrack's menus and
 commands, and record for each one whether it (a) can block the reactor/main thread on
 a slow operation (network/git/`gh`), and (b) gives the user appropriate feedback
 (progress notice, result, cancellation). Use this as the checklist when adding or

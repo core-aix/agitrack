@@ -1,7 +1,7 @@
 import io
 from pathlib import Path
 
-from agit.backends.opencode import OpenCodeBackend
+from agitrack.backends.opencode import OpenCodeBackend
 
 
 def test_opencode_parse_prefers_final_response():
