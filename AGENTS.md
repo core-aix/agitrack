@@ -28,6 +28,7 @@ aGiTrack stands for agent + git tracking. It is a Python library and interactive
 - Commit subjects and bodies must not contain terminal escape sequences or control characters; strip arrow-key/escape residue both where the prompt is captured and when building the message.
 - Commit bodies include metadata such as backend, session name, backend session ID, aGiTrack session ID, model, commit type, and timestamps.
 - Agent commit metadata includes the current context token count and token usage accumulated since the last code-changing commit.
+- Token counts must be exact for every category (input, output, cache read/write, reasoning, and their sub-agent equivalents): count each backend message's reported usage exactly once — not more, not less. Claude splits one assistant response across several transcript rows that repeat the same usage (de-duplicate by message id), and sub-agents are recorded separately (own transcript files for Claude, child sessions for OpenCode) and must be fully included. The token counts are a headline metric, so changes to transcript parsing must be verified against real backend data, not only mocks.
 - Record reasoning/thinking token counts in commit metadata only when the backend session record reports them; otherwise omit the reasoning line. Do not add explanatory token notes to the metadata.
 - Proxy mode must baseline continued OpenCode sessions on startup so old turns do not inflate token usage for the next commit.
 
@@ -125,3 +126,10 @@ This is the design aGiTrack targets for running several sessions at once. Founda
 - If the user accepts during a session, apply the update only once **every session has finished and all commits are integrated** (no agent in flight, no pending parse/merge/summary, no running background session), then re-exec aGiTrack (`python -m agit`) so the new code loads.
 - Source updates are fast-forward only and abort (with a message) when the checkout is dirty or has diverged from upstream, so an automatic update never clobbers local development. Package updates run `pip install --upgrade`.
 - Update checks are on by default; the user can turn them off via the "stop checking" choice or `check_for_updates: false` in `~/.agitrack/config.json`. Scripted/non-TTY runs never prompt.
+
+## Testing
+
+- Make it regular practice to **create temporary git repositories** to test aGiTrack functionality end-to-end against real git, rather than relying only on mocked inputs. Where a feature depends on backend behavior (transcripts, sessions, sub-agents, token usage), also run the actual backend CLIs (`claude`, `opencode`) in a temp repo to produce real data and verify against it. This is the established practice for branch/worktree concurrency, sub-agent token accounting, and token-count precision.
+- Compute expected results independently from the real data and assert **exact** equality — especially for token counts, which must be precise (not more, not less).
+- Capture the verified scenarios as permanent tests under `tests/` so the behavior stays locked in, and clean up any temporary repositories afterwards.
+- `./scripts/check.sh` (ruff check, ruff format, mypy-vs-baseline, pytest + coverage) must pass before a change is considered done.
