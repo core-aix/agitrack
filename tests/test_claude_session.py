@@ -213,6 +213,8 @@ def test_parse_rows_excludes_meta_sidechain_tool_results_and_commands():
     rows = [
         _user("c", "<local-command-caveat>noise</local-command-caveat>", isMeta=True),
         _user("s", "<command-name>/model</command-name>"),
+        # Harness background-task completion notices are not real prompts either.
+        _user("tn", "<task-notification>\n<task-id>abc</task-id>\n</task-notification>"),
         _user("side", "subagent prompt", isSidechain=True),
         {
             "type": "user",
@@ -280,6 +282,152 @@ def test_parse_rows_attributes_sidechain_tokens_to_subagent_buckets():
     assert turn.tokens.subagent_cache_read == 700
     # The sub-agent's context size never overrides the main turn's context.
     assert turn.tokens.context == 30
+
+
+def test_parse_rows_attributes_separate_file_subagent_tokens_by_tool_use_id():
+    # Newer Claude Code records sub-agents in their own files; `export_session` reads
+    # those and passes their tokens (keyed by the Task tool_use id) to parse_rows, which
+    # must add them to the turn whose assistant message launched that tool.
+    from agitrack.backends.base import TokenUsage
+
+    rows = [
+        _user("u1", "first prompt"),
+        _assistant("m1", "done one", usage={"input_tokens": 10, "output_tokens": 20}),
+        _user("u2", "fan out a subagent"),
+        _assistant(
+            "m2",
+            "spawned",
+            usage={"input_tokens": 11, "output_tokens": 22},
+            content=[{"type": "tool_use", "id": "toolu_ABC", "name": "Agent", "input": {}}],
+        ),
+        _assistant("m2b", "all set", usage={"input_tokens": 5, "output_tokens": 7}),
+    ]
+    sub = TokenUsage(total=99, subagent_input=100, subagent_output=99, subagent_cache_read=300)
+    session = parse_rows("sess", rows, subagent_tokens={"toolu_ABC": sub})
+
+    first, second = session.turns
+    # The first turn launched no sub-agent — untouched.
+    assert first.tokens.subagent_output == 0
+    # The second turn owns toolu_ABC, so the sub-agent tokens land there.
+    assert second.tokens.subagent_output == 99
+    assert second.tokens.subagent_input == 100
+    assert second.tokens.subagent_cache_read == 300
+    # The sub-agent's generated tokens roll into the turn's grand total too.
+    assert second.tokens.total == 22 + 7 + 99
+
+
+def test_parse_rows_subagent_with_no_tool_id_falls_back_to_latest_turn():
+    from agitrack.backends.base import TokenUsage
+
+    rows = [_user("u1", "only prompt"), _assistant("m1", "answer", usage={"output_tokens": 5})]
+    session = parse_rows("sess", rows, subagent_tokens={None: TokenUsage(total=12, subagent_output=12)})
+    assert session.turns[-1].tokens.subagent_output == 12  # never dropped
+
+
+def test_subagent_token_map_reads_separate_agent_files(tmp_path):
+    # The on-disk layout newer Claude Code uses: <session>.jsonl plus a sibling
+    # <session>/subagents/agent-*.jsonl (+ .meta.json naming the parent toolUseId).
+    session_path = tmp_path / "sess.jsonl"
+    session_path.write_text("{}\n", encoding="utf-8")
+    sub_dir = tmp_path / "sess" / "subagents"
+    sub_dir.mkdir(parents=True)
+    (sub_dir / "agent-1.meta.json").write_text(json.dumps({"toolUseId": "toolu_ABC"}), encoding="utf-8")
+    (sub_dir / "agent-1.jsonl").write_text(
+        "\n".join(
+            json.dumps(r)
+            for r in [
+                {"type": "user", "isSidechain": True, "message": {"content": "go"}},
+                {
+                    "type": "assistant",
+                    "isSidechain": True,
+                    "message": {"usage": {"input_tokens": 40, "output_tokens": 60, "cache_read_input_tokens": 9}},
+                },
+                {
+                    "type": "assistant",
+                    "isSidechain": True,
+                    "message": {"usage": {"input_tokens": 1, "output_tokens": 3}},
+                },
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    # A second sub-agent whose meta is missing → keyed under None (still counted).
+    (sub_dir / "agent-2.jsonl").write_text(
+        json.dumps({"type": "assistant", "isSidechain": True, "message": {"usage": {"output_tokens": 4}}}) + "\n",
+        encoding="utf-8",
+    )
+
+    token_map = claude_session._subagent_token_map(session_path)
+    assert token_map["toolu_ABC"].subagent_output == 63  # 60 + 3
+    assert token_map["toolu_ABC"].subagent_input == 41  # 40 + 1
+    assert token_map["toolu_ABC"].subagent_cache_read == 9
+    assert token_map[None].subagent_output == 4  # the meta-less agent
+
+
+def test_export_session_accounts_separate_file_subagents_end_to_end(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    project_dir = claude_session._project_dir(repo)
+    project_dir.mkdir(parents=True)
+    rows = [
+        _user("u1", "fan out a subagent"),
+        _assistant(
+            "m1",
+            "delegating",
+            usage={"input_tokens": 10, "output_tokens": 20},
+            content=[{"type": "tool_use", "id": "toolu_XYZ", "name": "Agent", "input": {}}],
+        ),
+        _assistant("m1b", "all done", usage={"output_tokens": 5}, stop_reason="end_turn"),
+    ]
+    (project_dir / "abc.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    sub_dir = project_dir / "abc" / "subagents"
+    sub_dir.mkdir(parents=True)
+    (sub_dir / "agent-1.meta.json").write_text(json.dumps({"toolUseId": "toolu_XYZ"}), encoding="utf-8")
+    (sub_dir / "agent-1.jsonl").write_text(
+        json.dumps(
+            {"type": "assistant", "isSidechain": True, "message": {"usage": {"input_tokens": 70, "output_tokens": 88}}}
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    session = export_session(repo, "abc")
+    assert session is not None
+    turn = session.turns[0]
+    assert turn.tokens.subagent_output == 88  # the separate sub-agent file is read and attributed
+    assert turn.tokens.subagent_input == 70
+    assert turn.tokens.output == 25  # main-line output unaffected (20 + 5)
+
+
+def test_subagent_tokens_since_counts_only_new_files(tmp_path, monkeypatch):
+    # The headless run() path snapshots sub-agent files before a turn and counts only the
+    # ones the turn adds, so a resumed session's prior sub-agents aren't double-counted.
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    sub_dir = claude_session._project_dir(repo) / "abc" / "subagents"
+    sub_dir.mkdir(parents=True)
+
+    def write_agent(name, output):
+        (sub_dir / f"{name}.jsonl").write_text(
+            json.dumps({"type": "assistant", "isSidechain": True, "message": {"usage": {"output_tokens": output}}})
+            + "\n",
+            encoding="utf-8",
+        )
+
+    write_agent("agent-old", 5)
+    prior = claude_session.subagent_agent_files(repo, "abc")
+    assert prior == {"agent-old.jsonl"}
+
+    # The turn spawns two new sub-agents.
+    write_agent("agent-new1", 11)
+    write_agent("agent-new2", 22)
+    usage = claude_session.subagent_tokens_since(repo, "abc", prior)
+    assert usage.subagent_output == 33  # only the two new files, not the old one
+    # With no prior snapshot, every file counts.
+    assert claude_session.subagent_tokens_since(repo, "abc", set()).subagent_output == 38
 
 
 def test_export_session_reads_jsonl_from_project_dir(tmp_path, monkeypatch):

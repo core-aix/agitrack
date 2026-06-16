@@ -432,7 +432,7 @@ def _version_tuple(version: str) -> tuple:
     return tuple(parts)
 
 
-def restart_agit(extra_args: Sequence[str] = ()) -> NoReturn:
+def restart_agitrack(extra_args: Sequence[str] = ()) -> NoReturn:
     """Re-exec aGiTrack in place so the freshly updated code is loaded.
 
     Uses ``python -m agit`` with the original CLI arguments so the entry point

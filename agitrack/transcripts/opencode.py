@@ -167,6 +167,20 @@ def _same_repo(directory: object, repo: Path) -> bool:
 
 
 def export_session(repo: Path, session_id: str) -> ExportedSession | None:
+    data = _export_data(repo, session_id)
+    if data is None:
+        return None
+    # Sub-agents OpenCode spawns via the `task` tool run in their OWN child sessions,
+    # which are absent from this export and hidden from `session list`. Export each (by
+    # the child id the parent's task part records) and fold its tokens into the turn that
+    # launched it, so sub-agent consumption is fully accounted (issue: subagent tokens).
+    subagent_tokens = _collect_subagent_tokens(repo, session_id, data)
+    return parse_exported_session(data, subagent_tokens=subagent_tokens)
+
+
+def _export_data(repo: Path, session_id: str) -> dict | None:
+    """Run ``opencode export <session_id>`` and return the parsed JSON object (the
+    ``{info, messages}`` structure), or None on any failure."""
     _debug(repo, f"opencode export starting session_id={session_id}")
     output, returncode = _run_export_pty(repo, session_id)
     _debug(
@@ -182,7 +196,71 @@ def export_session(repo: Path, session_id: str) -> ExportedSession | None:
         data = json.loads(json_text)
     except json.JSONDecodeError:
         return None
-    return parse_exported_session(data)
+    return data if isinstance(data, dict) else None
+
+
+def _collect_subagent_tokens(repo: Path, session_id: str, data: dict) -> dict[str | None, TokenUsage]:
+    """Token usage of every sub-agent the session spawned, keyed by the DIRECT child
+    session id the parent's ``task`` part references, so `parse_exported_session` can
+    attribute each to the turn that launched it. A child's total rolls up its own
+    consumption plus any nested sub-agents'. Empty (and no extra exports) when the
+    session used no sub-agents — the common case has zero overhead."""
+    out: dict[str | None, TokenUsage] = {}
+    visited: set[str] = {session_id}
+    for message in _as_list(data.get("messages")):
+        for child_id in _task_child_session_ids(message.get("parts")):
+            out.setdefault(child_id, TokenUsage()).add(_subagent_tokens_for_session(repo, child_id, visited))
+    return out
+
+
+def _subagent_tokens_for_session(repo: Path, child_id: str, visited: set[str]) -> TokenUsage:
+    # Sum a sub-agent child session's own assistant token usage PLUS all of its nested
+    # sub-agents', as sub-agent buckets. `visited` guards against cycles / re-exporting.
+    usage = TokenUsage()
+    if not child_id or child_id in visited:
+        return usage
+    visited.add(child_id)
+    data = _export_data(repo, child_id)
+    if data is None:
+        return usage
+    for message in _as_list(data.get("messages")):
+        info = _as_dict(message.get("info"))
+        if info.get("role") == "assistant":
+            usage.add(_subagent_message_tokens(info, message.get("parts")))
+        for grand_id in _task_child_session_ids(message.get("parts")):
+            usage.add(_subagent_tokens_for_session(repo, grand_id, visited))
+    return usage
+
+
+def _task_child_session_ids(parts: object) -> set[str]:
+    # Child session ids referenced by `task` sub-agent tool parts. A sub-agent part
+    # records both the child `sessionId` and its `parentSessionId` in `state.metadata`;
+    # require both so an ordinary tool that merely carries a sessionId is ignored.
+    out: set[str] = set()
+    if not isinstance(parts, list):
+        return out
+    for part in parts:
+        if not isinstance(part, dict) or part.get("type") != "tool":
+            continue
+        meta = _as_dict(_as_dict(part.get("state")).get("metadata"))
+        child = meta.get("sessionId")
+        if isinstance(child, str) and child and meta.get("parentSessionId"):
+            out.add(child)
+    return out
+
+
+def _subagent_message_tokens(info: dict, parts: object) -> TokenUsage:
+    # A sub-agent assistant message's tokens, remapped into the sub-agent buckets. Its
+    # context size isn't the main turn's, so `context` is left untouched (None).
+    main = _tokens(info, parts)
+    return TokenUsage(
+        total=main.total,
+        subagent_input=main.input,
+        subagent_output=main.output,
+        subagent_reasoning=main.reasoning,
+        subagent_cache_read=main.cache_read,
+        subagent_cache_write=main.cache_write,
+    )
 
 
 def export_session_raw(repo: Path, session_id: str) -> str | None:
@@ -319,7 +397,13 @@ def _run_opencode_pty(repo: Path, args: list[str]) -> tuple[str, int]:
     return b"".join(chunks).decode(errors="replace"), os.waitstatus_to_exitcode(status)
 
 
-def parse_exported_session(data: dict) -> ExportedSession:
+def parse_exported_session(
+    data: dict, *, subagent_tokens: "dict[str | None, TokenUsage] | None" = None
+) -> ExportedSession:
+    # `subagent_tokens` maps a sub-agent child session id -> its token usage (in the
+    # sub-agent buckets); each is added to the turn whose `task` part launched that child
+    # (see `_collect_subagent_tokens`). The None key, and any child unmatched to a turn,
+    # is attributed to the latest turn so sub-agent tokens are never dropped.
     info = _as_dict(data.get("info"))
     session_id = str(info.get("id") or "")
     updated = (info.get("time") or {}).get("updated") if isinstance(info.get("time"), dict) else None
@@ -328,6 +412,7 @@ def parse_exported_session(data: dict) -> ExportedSession:
     current_user: dict | None = None
     assistant_group: list[dict] = []
     turns: list[SessionTurn] = []
+    child_ids_per_turn: list[set[str]] = []
 
     def flush() -> None:
         if current_user is None or not assistant_group:
@@ -335,6 +420,10 @@ def parse_exported_session(data: dict) -> ExportedSession:
         turn = _build_turn(current_user, assistant_group, model)
         if turn:
             turns.append(turn)
+            child_ids: set[str] = set()
+            for assistant in assistant_group:
+                child_ids |= _task_child_session_ids(assistant.get("parts"))
+            child_ids_per_turn.append(child_ids)
 
     for message in messages:
         msg_info = _as_dict(message.get("info"))
@@ -353,7 +442,27 @@ def parse_exported_session(data: dict) -> ExportedSession:
                 continue
             assistant_group.append(message)
     flush()
+    _attribute_subagent_tokens(turns, child_ids_per_turn, subagent_tokens)
     return ExportedSession(session_id=session_id, model=model, updated=updated, turns=turns)
+
+
+def _attribute_subagent_tokens(
+    turns: list[SessionTurn],
+    child_ids_per_turn: list[set[str]],
+    subagent_tokens: "dict[str | None, TokenUsage] | None",
+) -> None:
+    # Add each sub-agent's token usage to the turn that launched it (matched by child
+    # session id). A child matching no turn — or the None key — is attributed to the
+    # latest turn, so its tokens are never dropped.
+    if not subagent_tokens or not turns:
+        return
+    for child_id, usage in subagent_tokens.items():
+        index: int | None = None
+        if child_id is not None:
+            index = next((i for i, ids in enumerate(child_ids_per_turn) if child_id in ids), None)
+        if index is None:
+            index = len(turns) - 1
+        turns[index].tokens.add(usage)
 
 
 def _build_turn(user_message: dict, assistants: list[dict], session_model: str | None) -> SessionTurn | None:

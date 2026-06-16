@@ -79,11 +79,11 @@ class FakeCommitRepo:
 def test_proxy_ctrl_g_enters_command_mode():
     parser = ProxyInput()
 
-    forwarded, local_echo, command, should_exit = parser.feed(b"\x07git-status\r")
+    forwarded, local_echo, command, should_exit = parser.feed(b"\x07git-unstaged\r")
 
     assert forwarded == []
     assert local_echo == b""
-    assert command == "git-status"
+    assert command == "git-unstaged"
     assert should_exit is False
 
 
@@ -165,10 +165,10 @@ def test_modify_other_keys_ctrl_g_opens_menu():
 
     decoded = _decode_kitty_ctrl_keys(b"\x1b[27;5;103~")
     parser = ProxyInput(menu_key=b"\x07")  # default Ctrl-G
-    forwarded, _local_echo, command, should_exit = parser.feed(decoded + b"git-status\r")
+    forwarded, _local_echo, command, should_exit = parser.feed(decoded + b"git-unstaged\r")
 
     assert forwarded == []
-    assert command == "git-status"
+    assert command == "git-unstaged"
     assert should_exit is False
 
 
@@ -219,9 +219,11 @@ _CTRL_C_ENCODINGS = {"kitty": b"\x1b[99;5u", "modifyOtherKeys": b"\x1b[27;5;99~"
 def test_menu_key_opens_under_both_keyboard_protocols(protocol):
     runner = make_runner()
     parser = ProxyInput(menu_key=b"\x07")  # default Ctrl-G
-    forwarded, command, should_exit = _drive_host_input(runner, parser, [_CTRL_G_ENCODINGS[protocol] + b"git-status\r"])
+    forwarded, command, should_exit = _drive_host_input(
+        runner, parser, [_CTRL_G_ENCODINGS[protocol] + b"git-unstaged\r"]
+    )
     assert forwarded == []
-    assert command == "git-status"
+    assert command == "git-unstaged"
     assert should_exit is False
 
 
@@ -261,10 +263,10 @@ def test_proxy_menu_key_works_with_kitty_encoding():
     decoded = _decode_kitty_ctrl_keys(kitty_encoded_ctrl_o)
 
     parser = ProxyInput(menu_key=b"\x0f")  # Ctrl-O
-    forwarded, local_echo, command, should_exit = parser.feed(decoded + b"git-status\r")
+    forwarded, local_echo, command, should_exit = parser.feed(decoded + b"git-unstaged\r")
 
     assert forwarded == []
-    assert command == "git-status"
+    assert command == "git-unstaged"
     assert should_exit is False
 
 
@@ -272,11 +274,11 @@ def test_proxy_shift_modified_menu_key_enters_command_mode():
     # Test multi-byte kitty keyboard protocol sequence for Ctrl+Shift+G
     parser = ProxyInput(menu_key=b"\x1b[103;6u")
 
-    forwarded, local_echo, command, should_exit = parser.feed(b"\x1b[103;6ugit-status\r")
+    forwarded, local_echo, command, should_exit = parser.feed(b"\x1b[103;6ugit-unstaged\r")
 
     assert forwarded == []
     assert local_echo == b""
-    assert command == "git-status"
+    assert command == "git-unstaged"
     assert should_exit is False
 
 
@@ -400,11 +402,11 @@ def test_proxy_escape_clears_command_buffer():
 def test_proxy_tab_completes_command():
     parser = ProxyInput()
 
-    forwarded, local_echo, command, should_exit = parser.feed(b"\x07git-stat\t\r")
+    forwarded, local_echo, command, should_exit = parser.feed(b"\x07git-un\t\r")
 
     assert forwarded == []
     assert local_echo == b""
-    assert command == "git-status"
+    assert command == "git-unstaged"
     assert should_exit is False
 
 
@@ -433,11 +435,11 @@ def test_proxy_tab_completes_selected_command():
 def test_proxy_enter_runs_selected_partial_match_without_tab():
     parser = ProxyInput()
 
-    forwarded, local_echo, command, should_exit = parser.feed(b"\x07git-stat\r")
+    forwarded, local_echo, command, should_exit = parser.feed(b"\x07git-un\r")
 
     assert forwarded == []
     assert local_echo == b""
-    assert command == "git-status"
+    assert command == "git-unstaged"
     assert should_exit is False
 
 
@@ -455,11 +457,11 @@ def test_proxy_agent_backend_command_name():
 def test_proxy_ignores_sgr_mouse_sequences_in_command_mode():
     parser = ProxyInput()
 
-    forwarded, local_echo, command, should_exit = parser.feed(b"\x07\x1b[<35;88;11Mgit-status\r")
+    forwarded, local_echo, command, should_exit = parser.feed(b"\x07\x1b[<35;88;11Mgit-unstaged\r")
 
     assert forwarded == []
     assert local_echo == b""
-    assert command == "git-status"
+    assert command == "git-unstaged"
     assert should_exit is False
 
 
@@ -1648,7 +1650,7 @@ def test_baseline_drops_session_with_no_conversation(tmp_path):
     assert runner.state.last_backend_message_id is None
 
 
-def test_new_session_flag_clears_backend_session_and_mints_agit_id(tmp_path):
+def test_new_session_flag_clears_backend_session_and_mints_agitrack_id(tmp_path):
     runner = make_runner(
         _force_new_session=True,
         state=AgitrackState(tmp_path),
@@ -1685,6 +1687,34 @@ def test_status_line_shows_base_branch(tmp_path):
     line = runner._status_line()
     assert "session-1" in line
     assert "→ main" in line  # the branch this session's work merges into
+    # Repo dir is on the same branch ⇒ the branch is NOT bolded.
+    assert "\x1b[1mmain" not in line
+
+
+def test_status_line_bolds_base_branch_when_repo_dir_on_another_branch(tmp_path):
+    import subprocess
+
+    from agitrack.config import AgitrackState
+    from agitrack.git import GitRepo
+
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    state = AgitrackState(tmp_path)
+    state.backend_session_id = "abcdef123456"
+    runner = make_runner(
+        repo=GitRepo(tmp_path),
+        state=state,
+        name="session-1",
+        backend=type("B", (), {"name": "claude"})(),
+        _base_branch="feature-x",
+        worktree=object(),
+        scroll_back=0,
+        cols=120,
+    )
+    runner._repo_dir_branch = "main"  # the repo directory is checked out elsewhere
+
+    line = runner._status_line()
+    # The integration branch differs from the repo dir's branch ⇒ it's bolded.
+    assert "→ \x1b[1mfeature-x\x1b[22m" in line
 
 
 def test_inject_prompt_defers_enter_until_text_settles():
@@ -1850,7 +1880,7 @@ def test_resumable_sessions_includes_reserved_named_session_without_transcript(t
     # still be offered for resume so the reserved name isn't stranded — taken yet
     # un-resumable.
     runner, _base = _resume_listing_runner(tmp_path, base_refs=[], worktree_sessions=[])
-    runner._agit_named_sessions = lambda: {"ghost-id": "experiment"}
+    runner._agitrack_named_sessions = lambda: {"ghost-id": "experiment"}
 
     refs = runner._resumable_sessions()
 
@@ -1869,7 +1899,7 @@ def test_resumable_named_session_dated_when_it_was_named_not_epoch(tmp_path):
     runner, base = _resume_listing_runner(tmp_path, base_refs=[], worktree_sessions=[])
     state = AgitrackState(base)
     state.name_session("ghost-id", "experiment")  # stamps session_named_at
-    runner._agit_named_sessions = lambda: {"ghost-id": "experiment"}
+    runner._agitrack_named_sessions = lambda: {"ghost-id": "experiment"}
 
     ref = runner._resumable_sessions()[0]
     assert ref.id == "ghost-id"
@@ -1892,7 +1922,7 @@ def test_resumable_sessions_does_not_duplicate_named_session_with_transcript(tmp
         base_refs=[],
         worktree_sessions=[("alpha", SessionRef("wt-alpha", 300.0))],
     )
-    runner._agit_named_sessions = lambda: {"wt-alpha": "alpha"}
+    runner._agitrack_named_sessions = lambda: {"wt-alpha": "alpha"}
 
     assert [ref.id for ref in runner._resumable_sessions()] == ["wt-alpha"]
 
@@ -1906,7 +1936,7 @@ def test_named_sessions_recovers_name_from_worktree_key(tmp_path):
         worktree_sessions=[("alpha", SessionRef("wt-alpha", 300.0))],
     )
 
-    assert runner._agit_named_sessions().get("wt-alpha") == "alpha"
+    assert runner._agitrack_named_sessions().get("wt-alpha") == "alpha"
 
 
 def test_named_sessions_persisted_name_wins_over_worktree_key(tmp_path):
@@ -1919,7 +1949,7 @@ def test_named_sessions_persisted_name_wins_over_worktree_key(tmp_path):
     )
     AgitrackState(base, default_backend="opencode").name_session("wt-1", "renamed")
 
-    assert runner._agit_named_sessions().get("wt-1") == "renamed"
+    assert runner._agitrack_named_sessions().get("wt-1") == "renamed"
 
 
 def test_new_session_name_cannot_clash_with_dormant_named_session(tmp_path):
@@ -2013,6 +2043,16 @@ def test_proxy_parses_host_terminal_responses():
     assert runner.host_fg_value == b"rgb:1a1a/1a1a/1a1a"
     assert runner.host_bg_value == b"rgb:fafa/fafa/fafa"
     assert runner.host_palette == {b"1": b"rgb:cccc/0000/0000"}
+    assert runner.host_da == b"\x1b[?62;c"
+    assert runner.host_kitty_keyboard is False  # no CSI ? u reply in this data
+
+
+def test_proxy_detects_kitty_keyboard_support_from_reply():
+    runner = make_runner(debug_proxy=False)
+    # A ``CSI ? <flags> u`` reply (here flags=1) marks kitty-keyboard support;
+    # it must not be mistaken for the DA reply (which ends in ``c``).
+    runner._parse_host_terminal_responses(b"\x1b[?1u\x1b[?62;c")
+    assert runner.host_kitty_keyboard is True
     assert runner.host_da == b"\x1b[?62;c"
 
 
@@ -3374,7 +3414,7 @@ def test_new_session_stages_transcript_before_spawn_when_resuming(tmp_path, monk
     runner.global_config = types.SimpleNamespace(default_backend="claude")
     info = types.SimpleNamespace(name="bob-feature", path=tmp_path)
     repo = types.SimpleNamespace(repo=tmp_path, current_branch=lambda: "agit/claude/bob-feature/t1")
-    runner._open_session_worktree = lambda name: (info, repo)
+    runner._open_session_worktree = lambda name, **kwargs: (info, repo)
     monkeypatch.setattr(runner_module, "make_proxy_agent", lambda name: types.SimpleNamespace(name=name))
     monkeypatch.setattr(runner_module, "AgitrackActions", lambda *a, **k: types.SimpleNamespace())
 
@@ -3401,6 +3441,60 @@ def test_new_session_stages_transcript_before_spawn_when_resuming(tmp_path, monk
     assert order == [("stage", "sid-Y"), ("spawn", None)]  # staged BEFORE spawn
 
 
+def test_fork_current_session_copies_under_a_new_id(tmp_path):
+    import types
+
+    runner = make_runner(name="main")
+    runner._render = lambda: None
+    runner._set_message = lambda *a, **k: None
+    imported: dict = {}
+    worktree_dir, base_dir = tmp_path / "worktree", tmp_path / "base"
+
+    def export(repo, sid):
+        if sid != "src-1":
+            return None
+        return "LATEST" if repo == worktree_dir else "STALE"  # the worktree holds the latest state
+
+    agent = types.SimpleNamespace(
+        name="claude",
+        supports_session_sharing=True,
+        export_session_raw=export,
+        new_import_id=lambda: "fork-2",
+        new_session_id=lambda: "fallback",
+        import_shared_session=lambda repo, sid, transcript, *, overwrite=False, as_id=None: (
+            imported.update(sid=sid, as_id=as_id, transcript=transcript) or True
+        ),
+    )
+    runner.backend = agent
+    runner.state = types.SimpleNamespace(backend_session_id="src-1", backend="claude")
+    runner.base_repo = types.SimpleNamespace(repo=base_dir)
+    runner.repo = types.SimpleNamespace(repo=worktree_dir)
+    created: dict = {}
+    runner._new_session = lambda name, **kw: created.update(name=name, **kw)
+
+    ok = runner._fork_current_session("forked", base_branch="dev")
+
+    assert ok is True
+    # Installed under a NEW id, from the worktree's LATEST state (not the base repo's
+    # older mirror); the original (src-1) transcript is untouched.
+    assert imported == {"sid": "src-1", "as_id": "fork-2", "transcript": "LATEST"}
+    # The forked session resumes the new id (not the original), so the two never clash.
+    assert created["resume_session_id"] == "fork-2"
+    assert created["base_branch"] == "dev"
+
+
+def test_fork_falls_back_to_blank_when_backend_cannot_share():
+    import types
+
+    runner = make_runner(name="main")
+    runner.backend = types.SimpleNamespace(name="opencode", supports_session_sharing=False)
+    runner.state = types.SimpleNamespace(backend_session_id="src-1", backend="opencode")
+
+    assert runner._can_fork_active() is False
+    assert runner._prompt_fork_or_blank() is False  # no fork option offered
+    assert runner._fork_current_session("x") is False  # forking not possible
+
+
 def test_shared_resume_cancel_on_name_prompt_does_not_resume():
     runner = _shared_resume_runner()
     runner._prompt_session_name = lambda *a, **k: None  # user cancels naming
@@ -3421,56 +3515,238 @@ def test_dedupe_session_name_avoids_collisions():
 # --- base branch switched out-of-band ---
 
 
-def _base_drift_runner(current_branch, *, choice="Pause merging until I decide"):
+def _merge_drift_runner(dir_branch, *, session_target="dev", choice, sessions=None):
     import types
 
     runner = make_runner(
-        _base_branch="dev",
-        _integration_paused=False,
+        worktree=types.SimpleNamespace(),
+        _base_branch=session_target,
         _base_drift_check_at=0.0,
-        _drift_acknowledged_branch=None,
-        base_repo=types.SimpleNamespace(current_branch=lambda: current_branch),
+        base_repo=types.SimpleNamespace(current_branch=lambda: dir_branch),
+        name="s1",
     )
+    runner.sessions = sessions if sessions is not None else [runner.active]
+    runner._repo_dir_branch = session_target  # start aligned (so no prompt until the dir moves)
     runner._debug = lambda *a, **k: None
     runner.messages = []
     runner._set_message = lambda m, **k: runner.messages.append(m)
     runner._render = lambda: None
     runner.popups = []
     runner._select_popup = lambda title, options: runner.popups.append((title, options)) or choice
+    runner.retargeted: list = []
+    runner._retarget_active_session = lambda target: runner.retargeted.append(target) or True
+    runner._session_work_merged_into_base = lambda: True  # default: nothing pending to merge
     return runner
 
 
-def test_base_branch_drift_prompts_and_pauses_when_dismissed():
-    # On drift the user is prompted; choosing "Pause" keeps the safe default.
-    runner = _base_drift_runner("feature-x", choice="Pause merging until I decide")
+def test_repo_dir_change_keeps_all_sessions_on_their_branches_by_default():
+    # The default (first) option does nothing — background sessions keep merging into
+    # their own branches after the directory's branch changes.
+    runner = _merge_drift_runner("feature-x", choice="Do nothing — keep every session merging into its own branch")
     runner._check_base_branch_drift()
-    assert runner.popups and "feature-x" in runner.popups[0][0]
-    assert runner._integration_paused is True
-    assert any("PAUSED" in m and "feature-x" in m for m in runner.messages)
+    assert runner.popups and "feature-x" in runner.popups[0][0] and "dev" in runner.popups[0][0]
+    assert runner.retargeted == []  # nothing was re-targeted
+    assert runner._base_branch == "dev"
+    assert runner._repo_dir_branch == "feature-x"  # cached directory branch updated
 
-    # The prompt fires once per checkout, not every drift check.
+    # No re-prompt while the directory branch is unchanged.
     runner.popups.clear()
     runner._base_drift_check_at = 0.0
     runner._check_base_branch_drift()
     assert runner.popups == []
 
-    runner.base_repo.current_branch = lambda: "dev"  # user switches back
-    runner._base_drift_check_at = 0.0  # bypass the throttle
-    runner.messages.clear()
+
+def test_repo_dir_change_can_switch_only_the_current_session():
+    runner = _merge_drift_runner("feature-x", choice="Switch only 's1' to 'feature-x'")
     runner._check_base_branch_drift()
-    assert runner._integration_paused is False
-    assert runner._drift_acknowledged_branch is None
-    assert any("resumed" in m for m in runner.messages)
+    assert runner.retargeted == ["feature-x"]  # only the active session follows the directory
 
 
-def test_base_branch_drift_keep_resumes_integration_into_original():
-    # Choosing "Keep integrating" leaves merging ON (into the original base),
-    # never paused — advance_base_to handles the not-checked-out base safely.
-    runner = _base_drift_runner("feature-x", choice="Keep integrating into 'dev'")
+def test_repo_dir_change_can_switch_all_sessions():
+    from agitrack.proxy.session import Session
+
+    choice = "Switch all idle sessions to 'feature-x' (running sessions keep their branch)"
+    runner = _merge_drift_runner("feature-x", choice=choice)
+    other = Session.bare()
+    other._base_branch = "dev"
+    runner.sessions = [runner.active, other]  # two live sessions
     runner._check_base_branch_drift()
-    assert runner._integration_paused is False
-    assert runner._drift_acknowledged_branch == "feature-x"
-    assert any("Keeping base 'dev'" in m for m in runner.messages)
+    assert runner.retargeted == ["feature-x", "feature-x"]  # the active one and the background one
+
+
+def test_switch_all_idle_sessions_skips_running_ones():
+    from agitrack.proxy.session import Session
+
+    choice = "Switch all idle sessions to 'feature-x' (running sessions keep their branch)"
+    runner = _merge_drift_runner("feature-x", choice=choice)
+    running = Session.bare()
+    running._base_branch = "dev"
+    running.agent_in_flight = True  # mid-turn — must keep its branch
+    runner.sessions = [runner.active, running]
+    runner._check_base_branch_drift()
+    assert runner.retargeted == ["feature-x"]  # only the idle (active) session switched
+    assert any("running a turn" in m for m in runner.messages)  # the skipped one is reported
+
+
+def test_session_switch_prompt_keeps_or_switches_active_session():
+    # On a session switch the prompt is two-option (this session only).
+    runner = _merge_drift_runner("feature-x", choice="Switch to 'feature-x' (the current directory branch)")
+    runner._repo_dir_branch = "feature-x"  # directory already on feature-x; session merges into dev
+    runner._prompt_merge_target_if_diverged()
+    assert runner.retargeted == ["feature-x"]
+
+
+def test_repo_dir_change_while_running_defers_prompt_until_idle():
+    # A running session's merge branch must NOT change mid-turn. The dir-change prompt
+    # is deferred (with a warning) and fires once the session is idle.
+    runner = _merge_drift_runner("feature-x", choice="Switch only 's1' to 'feature-x'")
+    runner.agent_in_flight = True  # a turn is in flight
+
+    runner._check_base_branch_drift()
+    assert runner.popups == []  # NOT prompted while running
+    assert runner._pending_merge_prompt is True
+    assert runner.retargeted == []  # nothing re-targeted mid-run
+    assert any("still merges into 'dev'" in m for m in runner.messages)  # the warning
+
+    # The run finishes → on the next poll the deferred prompt fires.
+    runner.agent_in_flight = False
+    runner._base_drift_check_at = 0.0
+    runner._check_base_branch_drift()
+    assert runner.popups  # now it asks
+    assert runner.retargeted == ["feature-x"]
+    assert runner._pending_merge_prompt is False
+
+
+def test_reconcile_merge_branch_honors_prior_assignment_and_defers_confirm():
+    import types
+
+    # At startup the session is assumed to merge into the directory branch ('dev'), but a
+    # previous run assigned it 'feature-y'. The prior assignment is honored and a
+    # confirmation prompt is deferred for the user.
+    runner = make_runner(worktree=types.SimpleNamespace(), _base_branch="dev", name="s1")
+    runner.base_repo = types.SimpleNamespace(list_branches=lambda: ["dev", "feature-y"])
+    runner.state = types.SimpleNamespace(merge_branch="feature-y")
+    runner._reconcile_merge_branch("dev")
+    assert runner._base_branch == "feature-y"  # the prior assignment wins
+    assert runner.state.merge_branch == "feature-y"  # not overwritten with the dir branch
+    assert runner._pending_merge_prompt is True  # the user will be asked to confirm
+
+
+def test_reconcile_merge_branch_records_dir_branch_when_unset():
+    import types
+
+    runner = make_runner(worktree=types.SimpleNamespace(), _base_branch="dev", name="s1")
+    runner.state = types.SimpleNamespace(merge_branch=None)
+    runner._reconcile_merge_branch("dev")
+    assert runner.state.merge_branch == "dev"  # recorded for next time
+    assert runner._base_branch == "dev"
+    assert runner._pending_merge_prompt is False  # nothing to confirm
+
+
+def test_reconcile_merge_branch_falls_back_when_prior_branch_deleted():
+    import types
+
+    # The prior run assigned 'feature-y', but that branch no longer exists — don't honor
+    # a dangling branch (it would break integration); fall back to the directory branch.
+    runner = make_runner(worktree=types.SimpleNamespace(), _base_branch="dev", name="s1")
+    runner.base_repo = types.SimpleNamespace(list_branches=lambda: ["dev", "main"])
+    runner.state = types.SimpleNamespace(merge_branch="feature-y")
+    runner._reconcile_merge_branch("dev")
+    assert runner._base_branch == "dev"  # falls back to the directory branch
+    assert runner.state.merge_branch == "dev"  # the dangling assignment is reset
+    assert runner._pending_merge_prompt is False  # nothing to confirm
+
+
+def test_deferred_merge_prompt_waits_until_run_merged_into_base():
+    # After a running session finishes, the branch-switch dialog must appear only once
+    # the run's changes have merged into the original branch — not while integration is
+    # still pending.
+    runner = _merge_drift_runner("feature-x", choice="Switch only 's1' to 'feature-x'")
+    runner.agent_in_flight = True
+    runner._check_base_branch_drift()  # dir moved mid-run → deferred
+    assert runner._pending_merge_prompt is True and runner.popups == []
+
+    # The run goes idle, but its work hasn't integrated into 'dev' yet — still no dialog.
+    runner.agent_in_flight = False
+    runner._session_work_merged_into_base = lambda: False  # commit/integration still pending
+    runner._base_drift_check_at = 0.0
+    runner._check_base_branch_drift()
+    assert runner._pending_merge_prompt is True  # held back
+    assert runner.popups == []
+
+    # Once the changes have merged into 'dev', the dialog appears.
+    runner._session_work_merged_into_base = lambda: True
+    runner._base_drift_check_at = 0.0
+    runner._check_base_branch_drift()
+    assert runner.popups  # asked now
+    assert runner._pending_merge_prompt is False
+
+
+def test_deferred_merge_prompt_is_per_session():
+    # The deferred-prompt flag is PER-SESSION. A prompt deferred while session A runs is
+    # never swallowed (or double-asked) by switching to a different, already-aligned
+    # session B — each session carries its own flag.
+    from agitrack.proxy.session import Session
+
+    runner = _merge_drift_runner("feature-x", choice="Switch only 's1' to 'feature-x'")
+    a = runner.active
+    b = Session.bare()
+    b._base_branch = "feature-x"  # B already merges into the dir branch (aligned)
+    runner.sessions = [a, b]
+
+    # A defers a prompt while running.
+    a.agent_in_flight = True
+    runner._check_base_branch_drift()
+    assert a._pending_merge_prompt is True and runner.popups == []
+
+    # Switch to B (idle, aligned): nothing is asked, B has no pending prompt, and A's
+    # deferral is untouched on A's own flag.
+    runner.active = b
+    b.agent_in_flight = False
+    runner._base_drift_check_at = 0.0
+    runner._check_base_branch_drift()
+    assert runner.popups == []
+    assert b._pending_merge_prompt is False
+    assert a._pending_merge_prompt is True  # A's deferral survives
+
+    # Back on A (idle, merged, still diverged): A's deferred prompt finally fires.
+    runner.active = a
+    a.agent_in_flight = False
+    runner._base_drift_check_at = 0.0
+    runner._check_base_branch_drift()
+    assert runner.popups  # asked at last
+    assert a._pending_merge_prompt is False
+
+
+def test_deferred_merge_prompt_dropped_when_dir_returns_to_session_branch():
+    # If, after a run defers a prompt, the directory is checked back onto the session's
+    # OWN branch, the deferral is moot and is dropped without asking (using the fresh dir
+    # branch, not a stale cached one).
+    runner = _merge_drift_runner("feature-x", choice="Switch only 's1' to 'feature-x'")
+    runner.agent_in_flight = True
+    runner._check_base_branch_drift()  # dir → feature-x mid-run → deferred
+    assert runner._pending_merge_prompt is True
+
+    runner.agent_in_flight = False
+    runner.base_repo.current_branch = lambda: "dev"  # user checks the dir back to 'dev'
+    runner._base_drift_check_at = 0.0
+    runner._check_base_branch_drift()
+    assert runner._pending_merge_prompt is False  # dropped — back in sync
+    assert runner.popups == []  # nothing asked
+
+
+def test_retarget_active_session_refused_while_running():
+    import types
+
+    runner = make_runner(worktree=types.SimpleNamespace(), _base_branch="dev", name="s1")
+    runner.agent_in_flight = True
+    runner.messages = []
+    runner._set_message = lambda m, **k: runner.messages.append(m)
+    runner._render = lambda: None
+
+    assert runner._retarget_active_session("feature-x") is False  # refused
+    assert runner._base_branch == "dev"  # unchanged
+    assert any("running a turn" in m for m in runner.messages)
 
 
 def test_integrate_turn_skips_while_paused():
@@ -4073,7 +4349,7 @@ def test_sync_idle_worktrees_aligns_idle_skips_in_flight():
 #
 # A session runs in a worktree that only contains tracked files, but the user's
 # own untracked / intentionally-unstaged files live in the base working tree.
-# These commands (git-stage / git-unstaged / git-user-commit) must therefore read
+# These commands (git-unstaged / git-user-commit) must therefore read
 # and write the base repo + base state, or the user's files are invisible.
 
 
@@ -4099,66 +4375,6 @@ def _user_git_runner(tmp_path, answers):
     return runner, repo
 
 
-def test_stage_files_groups_new_and_declined_and_stages_selection(tmp_path):
-    runner, repo = _user_git_runner(tmp_path, answers=["1", "add new"])
-    (tmp_path / "new.py").write_text("x\n", encoding="utf-8")
-    (tmp_path / "local.txt").write_text("y\n", encoding="utf-8")
-    runner._user_state().add_declined(["local.txt"])  # recorded by the pre-agent flow
-
-    message = runner._stage_files_popup()
-
-    body = runner.prompts[0][1]
-    assert "New files:" in body and "new.py" in body
-    assert "Intentionally unstaged:" in body and "local.txt" in body
-    # #1 is new.py (new files listed first); it is staged+committed, local.txt left.
-    assert "Committed 1 file" in message
-    assert "new.py" not in repo.untracked_files()
-    assert "local.txt" in repo.untracked_files()
-
-
-def test_stage_files_all_stages_every_candidate(tmp_path):
-    runner, repo = _user_git_runner(tmp_path, answers=["a", "add all"])
-    (tmp_path / "new.py").write_text("x\n", encoding="utf-8")
-    (tmp_path / "local.txt").write_text("y\n", encoding="utf-8")
-    runner._user_state().add_declined(["local.txt"])
-
-    message = runner._stage_files_popup()
-
-    assert "Committed 2 file" in message
-    assert repo.untracked_files() == []
-    assert runner._user_state().declined_untracked() == []  # declined cleared too
-
-
-def test_stage_files_reads_declined_from_base_not_worktree_state(tmp_path):
-    # Regression: declines are recorded in BASE state by the pre-agent prompt; the
-    # menu must surface them from there, not from the (empty) worktree state.
-    runner, repo = _user_git_runner(tmp_path, answers=[""])  # view, then cancel
-    (tmp_path / "local.txt").write_text("y\n", encoding="utf-8")
-    runner._user_state().add_declined(["local.txt"])
-    runner.state = AgitrackState(tmp_path / "worktree")  # worktree state: nothing declined
-
-    message = runner._stage_files_popup()
-
-    assert "local.txt" in runner.prompts[0][1]
-    assert message == "Nothing staged."
-
-
-def test_stage_files_empty_when_nothing_to_stage(tmp_path):
-    runner, repo = _user_git_runner(tmp_path, answers=[])
-    assert runner._stage_files_popup() == "No files to stage."
-    assert runner.prompts == []  # nothing to ask about
-
-
-def test_stage_files_invalid_selection_stages_nothing(tmp_path):
-    runner, repo = _user_git_runner(tmp_path, answers=["9"])  # out of range
-    (tmp_path / "new.py").write_text("x\n", encoding="utf-8")
-
-    message = runner._stage_files_popup()
-
-    assert "nothing staged" in message.lower()
-    assert "new.py" in repo.untracked_files()
-
-
 def test_git_status_returns_full_long_format(tmp_path):
     from agitrack.git import GitRepo
 
@@ -4169,6 +4385,85 @@ def test_git_status_returns_full_long_format(tmp_path):
 
     assert "Untracked files" in output  # long format, not --short
     assert "new.py" in output
+
+
+def test_summarizer_model_picker_lists_models_and_defaults_to_smallest_for_claude(tmp_path, monkeypatch):
+    import agitrack.summaries.model_select as model_select
+    from proxy_helpers import make_runner
+
+    runner = make_runner(state=AgitrackState(tmp_path))
+    runner.global_config = type("GC", (), {"summarization_model": None})()
+    runner._render = lambda: None
+    runner.messages = []
+    runner._set_message = lambda msg, **k: runner.messages.append(msg)
+    runner.state.backend = "claude"
+    runner.state.summarization_model = None
+
+    monkeypatch.setattr(
+        model_select,
+        "list_available_models",
+        lambda name: ["claude-haiku-4-5-20251001", "claude-sonnet-4-6", "claude-opus-4-8"],
+    )
+    captured: dict = {}
+
+    def popup(title, options):
+        captured["options"] = options
+        return options[0]  # accept the default (smallest)
+
+    runner._select_popup = popup
+    runner._handle_summarizer_command("model")
+
+    # The smallest (Haiku) tier is listed first and flagged as the default.
+    assert captured["options"][0].startswith("claude-haiku-4-5-20251001")
+    assert "smallest" in captured["options"][0].lower()
+    # All three tiers plus a "same as session" clear option are offered.
+    assert "Same as the agent's session model" in captured["options"]
+    assert len(captured["options"]) == 4
+    # Choosing the default persists the Haiku model GLOBALLY (so it survives restarts
+    # and session switches) and clears any per-session override.
+    assert runner.global_config.summarization_model == "claude-haiku-4-5-20251001"
+    assert runner.state.summarization_model is None
+
+
+def test_summarizer_model_picker_clear_resets_to_session_model(tmp_path, monkeypatch):
+    import agitrack.summaries.model_select as model_select
+    from proxy_helpers import make_runner
+
+    runner = make_runner(state=AgitrackState(tmp_path))
+    runner.global_config = type("GC", (), {"summarization_model": None})()
+    runner._render = lambda: None
+    runner._set_message = lambda *a, **k: None
+    runner.state.backend = "claude"
+    runner.state.summarization_model = "claude-opus-4-8"  # previously pinned
+
+    monkeypatch.setattr(
+        model_select, "list_available_models", lambda name: ["claude-haiku-4-5-20251001", "claude-sonnet-4-6"]
+    )
+    runner._select_popup = lambda title, options: options[-1]  # "Same as the agent's session model"
+    runner._handle_summarizer_command("model")
+
+    assert runner.global_config.summarization_model is None  # cleared globally → same as the session model
+    assert runner.state.summarization_model is None
+
+
+def test_summarizer_model_picker_falls_back_to_text_when_no_models(tmp_path, monkeypatch):
+    import agitrack.summaries.model_select as model_select
+    from proxy_helpers import make_runner
+
+    runner = make_runner(state=AgitrackState(tmp_path))
+    runner.global_config = type("GC", (), {"summarization_model": None})()
+    runner._render = lambda: None
+    runner._set_message = lambda *a, **k: None
+    runner.state.backend = "opencode"
+    runner.state.summarization_model = None
+
+    monkeypatch.setattr(model_select, "list_available_models", lambda name: [])  # CLI unavailable
+    runner._select_popup = lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not show a picker"))
+    runner._prompt_popup = lambda title, body, default="": "some/model"
+
+    runner._handle_summarizer_command("model")
+
+    assert runner.global_config.summarization_model == "some/model"  # typed value persisted globally
 
 
 def test_status_line_unstaged_count_reflects_base_declined(tmp_path):
@@ -4874,6 +5169,7 @@ def test_sync_terminal_modes_mirrors_keyboard_protocol(monkeypatch):
     import agitrack.proxy.runner as proxy_mod
 
     runner = make_runner(child_mouse=False)
+    runner.host_kitty_keyboard = True  # host speaks the kitty protocol
     writes = []
     monkeypatch.setattr(proxy_mod.os, "write", lambda fd, data: writes.append(data))
 
@@ -4888,6 +5184,45 @@ def test_sync_terminal_modes_mirrors_keyboard_protocol(monkeypatch):
     assert b"\x1b[>4;0m" in writes  # modifyOtherKeys off
     # Only the negotiation sequences are mirrored, never the text around them.
     assert all(payload.startswith(b"\x1b[") for payload in writes)
+
+
+def test_sync_terminal_modes_skips_kitty_on_unsupported_host(monkeypatch):
+    # On a host that doesn't speak the kitty protocol (e.g. the raw Linux console),
+    # the kitty push/pop must NOT be mirrored — they'd leak as visible codes. The
+    # modifyOtherKeys form is an ordinary CSI and is still mirrored.
+    import agitrack.proxy.runner as proxy_mod
+
+    runner = make_runner(child_mouse=False)
+    runner.host_kitty_keyboard = False
+    writes = []
+    monkeypatch.setattr(proxy_mod.os, "write", lambda fd, data: writes.append(data))
+
+    runner._sync_terminal_modes(b"hello\x1b[>1u world \x1b[>4;2m text \x1b[<u\x1b[>4;0m")
+
+    assert b"\x1b[>1u" not in writes  # kitty push suppressed
+    assert b"\x1b[<u" not in writes  # kitty pop suppressed
+    assert b"\x1b[>4;2m" in writes  # modifyOtherKeys still mirrored
+    assert b"\x1b[>4;0m" in writes
+
+
+def test_disable_host_terminal_modes_pops_kitty_only_when_supported(monkeypatch):
+    import agitrack.proxy.runner as proxy_mod
+
+    writes = []
+    monkeypatch.setattr(proxy_mod.os, "write", lambda fd, data: writes.append(data))
+
+    runner = make_runner()
+    runner.host_kitty_keyboard = False
+    runner._disable_host_terminal_modes()
+    blob = b"".join(writes)
+    assert b"\x1b[<u" not in blob  # no kitty pop sent to an unsupporting host
+    assert b"\x1b[?1000l" in blob  # ordinary mode resets still happen
+    assert b"\x1b[>4;0m" in blob  # modifyOtherKeys reset stays unconditional
+
+    writes.clear()
+    runner.host_kitty_keyboard = True
+    runner._disable_host_terminal_modes()
+    assert b"\x1b[<u" in b"".join(writes)  # kitty pop sent when supported
 
 
 def test_backend_exit_relaunches_and_resumes():
@@ -5554,9 +5889,9 @@ def test_configured_menu_key_opens_command_capture():
     # menu_key in ~/.agitrack/config.json rebinds the aGiTrack menu (default Ctrl-G).
     parser = ProxyInput(menu_key=b"\x10")  # ctrl-p
 
-    forwarded, _echo, command, _exit = parser.feed(b"\x10git-status\r")
+    forwarded, _echo, command, _exit = parser.feed(b"\x10git-unstaged\r")
     assert forwarded == []
-    assert command == "git-status"
+    assert command == "git-unstaged"
 
     # The default key is now ordinary input and goes to the backend.
     forwarded, _echo, command, _exit = parser.feed(b"\x07")

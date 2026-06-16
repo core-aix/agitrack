@@ -541,9 +541,13 @@ class ScreenRenderer:
         menu_label: str = "Ctrl-G",
         summarizer_on: bool = True,
         cwd: str | None = None,
+        current_dir_branch: str | None = None,
     ) -> str:
         declined = len(user_declined)
         session = f"{name or 'session'}" + (f" [{short_session_fn(session_id)}]" if session_id else "")
+        # When the session integrates into a different branch than the one checked
+        # out in the repo directory, bold that branch so the difference is obvious.
+        bold_base = base_branch is not None and current_dir_branch is not None and base_branch != current_dir_branch
         if base_branch and worktree is not None:
             session += f" → {base_branch}"  # the branch this session's work merges into
         sum_indicator = "sum:on" if summarizer_on else "sum:off"
@@ -564,6 +568,11 @@ class ScreenRenderer:
             if cwd_text:
                 left += f"| {cwd_text} "
         padding = " " * max(cols - len(left) - len(right), 0)
+        if bold_base and worktree is not None:
+            # Add bold around the branch name AFTER the width math above — the escape
+            # codes carry no visible width. \x1b[22m resets only the bold intensity,
+            # leaving the line's reverse-video (\x1b[7m) intact.
+            left = left.replace(f"→ {base_branch}", f"→ \x1b[1m{base_branch}\x1b[22m", 1)
         return f"\x1b[7m{left}{padding}{right}\x1b[0m"
 
     # ------------------------------------------------------------------

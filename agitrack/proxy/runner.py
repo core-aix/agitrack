@@ -59,7 +59,7 @@ from agitrack.proxy.renderer import (
 
 # TerminalHost lives in terminal.py (P1).
 from agitrack.proxy.terminal import TerminalHost
-from agitrack.update import Updater, UpdateStatus, restart_agit
+from agitrack.update import Updater, UpdateStatus, restart_agitrack
 
 # Modal state-machines (P6 Stage 2): PromptModal and SelectModal encode the
 # byte-handling logic for free-text and selection popups.
@@ -197,9 +197,6 @@ class ProxyInput:
         "session",
         "agent-backend",
         "summarizer",
-        "git-base-branch",
-        "git-status",
-        "git-stage",
         "git-unstaged",
         "git-user-commit",
         "update",
@@ -335,6 +332,14 @@ class ProxyInput:
 
 
 class ProxyRunner:
+    # The active session's integration target. It is a Session.FIELDS entry exposed
+    # via a custom property added at the bottom of this module; declared here so mypy
+    # knows its type (the property is attached dynamically).
+    _base_branch: "str | None"
+    # Per-session flag (a Session.FIELDS entry, delegated like the others); declared here
+    # so mypy can resolve its type at the read sites above its dynamic attachment.
+    _pending_merge_prompt: bool
+
     # Defaults for the tunable timings; overridden per-instance from the global
     # config in __init__ (see GlobalConfig.timings). Kept as class constants so
     # `self.X` still resolves for runners built via __new__ (tests).
@@ -354,7 +359,9 @@ class ProxyRunner:
     )
     SHARED_FETCH_TIMEOUT = 30.0  # cap the shared-session listing fetch so a slow/offline remote can't hang the menu
     RESUME_FETCH_TIMEOUT = 300.0  # cap the full-transcript fetch when resuming a shared session; generous since the user can cancel manually
-    SHARE_PUSH_TIMEOUT = 120.0  # cap a manual share's push to origin; the user can also press Esc to cancel it
+    SHARE_PUSH_TIMEOUT = (
+        120.0  # cap a background share/update push to origin so a stalled remote can't strand the worker thread
+    )
 
     def __init__(
         self,
@@ -486,6 +493,7 @@ class ProxyRunner:
         self.host_bg_value: bytes | None = None
         self.host_palette: dict[bytes, bytes] = {}
         self.host_da: bytes | None = None
+        self.host_kitty_keyboard: bool = False
         self.color_mode = detect_color_mode()
         # Single-writer management: only one aGiTrack may auto-commit/merge in a
         # working tree. A second instance is refused at startup (see `run`).
@@ -501,12 +509,12 @@ class ProxyRunner:
         self._integration: IntegrationService = (
             _integration if _integration is not None else IntegrationService(repo, None, menu_label=self._menu_label())
         )
-        self._base_branch: str | None = None  # integration target branch (set at startup)
-        self._integration_paused = False  # set when the base repo is switched off _base_branch out-of-band
+        # _base_branch is per-session (a Session.FIELDS entry that delegates to the
+        # active session); each session integrates into its own branch.
+        self._repo_dir_branch: str | None = None  # branch checked out in the repo dir (for the status bar)
+        # _pending_merge_prompt is per-session (a Session field) — see Session.FIELDS.
+        self._integration_paused = False  # reserved; integration is no longer globally paused
         self._base_drift_check_at = 0.0
-        # The drifted branch the user has already been prompted about, so the
-        # drift prompt fires once per checkout rather than every drift check.
-        self._drift_acknowledged_branch: str | None = None
         self.turn = 0  # per-session transient-branch counter
         self.merge_ctx: MergeContext | None = None  # in-progress agent merge resolution
         self._pending_enter_at: float | None = None  # deferred submit of an injected prompt
@@ -625,6 +633,13 @@ class ProxyRunner:
     @active.setter
     def active(self, session: Session) -> None:
         self.__dict__["_active_session"] = session
+        # _base_branch is per-session; keep the single IntegrationService pointed at
+        # whichever session is active (including the temporary actives set by
+        # _with_session during background integration), so each merges into its own
+        # branch. Skipped until the service exists (early construction).
+        svc = self.__dict__.get("_integration_svc")
+        if svc is not None:
+            svc.base_branch = getattr(session, "_base_branch", None)
 
     @property
     def active_index(self) -> int:
@@ -651,7 +666,9 @@ class ProxyRunner:
         svc = self.__dict__.get("_integration_svc")
         if svc is None:
             base_repo = self.__dict__.get("base_repo")
-            base_branch = self.__dict__.get("_base_branch")
+            # _base_branch is per-session now; seed the service from the active session.
+            active = self.__dict__.get("_active_session")
+            base_branch = getattr(active, "_base_branch", None) if active is not None else None
             # Production always wires base_repo before _integration is read; this lazy
             # branch is only a safety net for partially-constructed/test runners, which
             # may build the service before base_repo is set, so pass it through as-is.
@@ -714,12 +731,12 @@ class ProxyRunner:
                 "host_bg_value": None,
                 "host_palette": {},
                 "host_da": None,
+                "host_kitty_keyboard": False,
                 "color_mode": "truecolor",
                 "management_lock": None,
                 "base_repo": None,
-                "_base_branch": None,
+                "_repo_dir_branch": None,
                 "_integration_paused": False,
-                "_drift_acknowledged_branch": None,
                 "_base_drift_check_at": 0.0,
                 "_pending_enter_at": None,
                 "_pending_enter_fd": None,
@@ -830,6 +847,10 @@ class ProxyRunner:
         # branch is only advanced by integration, never edited by a live agent.
         self._base_branch = self.base_repo.current_branch()
         self._integration.base_branch = self._base_branch
+        # Cached branch checked out in the repo directory, refreshed by the drift
+        # poll. The status bar bolds a session's integration branch when it differs
+        # from this (e.g. after "keep integrating into X while the repo is on Y").
+        self._repo_dir_branch = self._base_branch
         self._cleanup_stale_state_on_startup()
         self._reload_user_declined()  # files the pre-agent flow left intentionally unstaged
         self._setup_base_merge_only_session()
@@ -902,7 +923,7 @@ class ProxyRunner:
             # and acknowledged the privacy warning when this session started, so
             # don't make them acknowledge it again. (A startup-time update re-execs
             # via the CLI without this flag, so that path still shows the warning.)
-            restart_agit(["--skip-privacy-ack"])
+            restart_agitrack(["--skip-privacy-ack"])
         return exit_code
 
     def _ensure_backend_available(self) -> bool:
@@ -997,112 +1018,236 @@ class ProxyRunner:
 
     def _setup_worktree_confinement_notice(self) -> None:
         # When confinement is requested but the platform can't enforce it (no
-        # sandbox), watch the base repo and warn if the agent writes into it, so
-        # edits outside the worktree don't silently go untracked.
+        # sandbox), silently watch the base repo so we can warn *if and when* the
+        # agent actually writes into it (see _warn_if_base_edited). We no longer show
+        # a proactive "can't sandbox" notice at startup — it confused users by
+        # flagging a capability limitation even when nothing went wrong.
         self._monitor_base_edits = False
         if self.worktree is None:
             return
         if not (self.global_config.sandbox and sandbox.is_enabled()):
             return  # user disabled confinement
         if sandbox.is_available():
-            return  # the sandbox enforces it; no warning needed
+            return  # the sandbox enforces it; nothing to monitor
         self._monitor_base_edits = True
         self._base_check_at = 0.0
         try:
             self._base_status_baseline: set[str] = set(self.base_repo.status_short().splitlines())
         except Exception:
             self._base_status_baseline = set()
-        self._set_message(
-            self._sandbox_unavailable_hint(),
-            seconds=8.0,
-        )
-        self._render()
-
-    @staticmethod
-    def _sandbox_unavailable_hint() -> str:
-        base = (
-            "Heads up: aGiTrack can't fully sandbox the agent on this system, so it could\n"
-            "change files outside its workspace. aGiTrack will warn you if that happens."
-        )
-        # Only offer the one simple, actionable step (installing bubblewrap) — and
-        # only when it's actually missing. No kernel/userns jargon: if the tool is
-        # present but the system still blocks it, the plain warning is enough.
-        if sys.platform.startswith("linux") and shutil.which("bwrap") is None:
-            return base + "\nInstalling the 'bubblewrap' tool (e.g. `apt install bubblewrap`) can turn the sandbox on."
-        return base
 
     def _check_base_branch_drift(self) -> None:
-        # The user can `git checkout` another branch in the directory while aGiTrack is
-        # running. aGiTrack integrates session work into the branch it launched on
-        # (`self._base_branch`). When the directory drifts to another branch, ask
-        # the user once what to do: follow the directory (switch the base), keep
-        # integrating into the original (aGiTrack advances its ref directly — a safe
-        # fast-forward — even though it is no longer checked out), or pause.
-        # Sessions keep running and committing to their own branches throughout.
-        if self._base_branch is None:
+        # Poll the branch checked out in the repo directory. The status bar bolds a
+        # session whose merge target differs from it; when the directory MOVES to a
+        # branch that differs from the active session's merge target, ask where this
+        # session's changes should merge. (Each session has its own merge branch,
+        # independent of the directory's checkout and of the other sessions.)
+        if self.worktree is None or self._base_branch is None:
             return
         now = time.monotonic()
         if now - self._base_drift_check_at < self.BASE_DRIFT_CHECK_SECONDS:
             return
         self._base_drift_check_at = now
         try:
-            current = self.base_repo.current_branch()
+            current = self.base_repo.current_branch()  # the branch checked out in the repo dir
         except Exception:
             return
-        if current == self._base_branch:
-            # Back on (or never left) the integration branch: clear drift state.
-            if self._drift_acknowledged_branch is not None or self._integration_paused:
-                resumed = self._integration_paused
-                self._drift_acknowledged_branch = None
-                self._integration_paused = False
-                if resumed:
-                    self._debug(f"base restored to '{self._base_branch}'; merging resumed")
-                    self._set_message(f"Repo back on '{self._base_branch}'; merging resumed.", seconds=6.0)
-                    self._render()
-            return
-        if current == self._drift_acknowledged_branch:
-            return  # already handled this drift; nothing to ask again
-        self._handle_base_drift(current)
-
-    def _handle_base_drift(self, current: str) -> None:
-        # Prompt once per drifted checkout. Mark it acknowledged up front so a
-        # dismissed prompt (or a switch that re-enters here) does not loop.
-        self._debug(f"base drift: repo on '{current}', integration target '{self._base_branch}'")
-        self._drift_acknowledged_branch = current
-        choice = self._select_popup(
-            f"The repository was switched to '{current}', but aGiTrack integrates into "
-            f"'{self._base_branch}'. What should aGiTrack do?",
-            [
-                f"Switch base to '{current}' (re-point every session)",
-                f"Keep integrating into '{self._base_branch}'",
-                "Pause merging until I decide",
-            ],
-        )
-        if choice and choice.startswith("Switch base"):
-            self._drift_acknowledged_branch = None  # the switch resolves the drift
-            self._integration_paused = False
-            self._perform_base_switch(current)
-            return
-        if choice and choice.startswith("Keep integrating"):
-            # Keep landing turns on the original base. Care is taken in
-            # IntegrationService.advance_base_to: with the base no longer checked
-            # out it advances the ref only on a true fast-forward, never a force.
-            self._integration_paused = False
+        moved = current != self._repo_dir_branch
+        self._repo_dir_branch = current  # keep the status bar's "current dir branch" fresh
+        # A dir-change prompt this session deferred during a run fires once the run is idle
+        # AND its changes have MERGED into the session's original branch — not the moment
+        # the run goes idle (the just-finished work is still committing/integrating then,
+        # and must land on the original branch before we ask where future work should go).
+        # A cancelled run leaves nothing to integrate, so the dialog is free to appear. The
+        # flag is per-session, evaluated against the FRESH dir branch: if the directory has
+        # returned to this session's branch there's nothing to ask, and a different
+        # session's pending prompt is never touched (it has its own flag).
+        if self._pending_merge_prompt:
+            if self._base_branch == current:
+                self._pending_merge_prompt = False  # back in sync — this session's deferral is moot
+            elif not self.agent_in_flight and self._session_work_merged_into_base():
+                self._pending_merge_prompt = False
+                self._prompt_merge_targets_on_dir_change()
+            return  # handled this session's pending deferral; nothing else to do this tick
+        if not moved:
+            return  # the repo directory hasn't moved since the last poll
+        if self._base_branch == current:
+            return  # the session already merges into the directory's branch
+        if self.agent_in_flight:
+            # The session is mid-run — don't change its merge branch now. Warn that this
+            # run still lands on its current branch, and re-ask once its changes have
+            # merged there (or the run is cancelled, leaving nothing to merge).
+            self._pending_merge_prompt = True
             self._set_message(
-                f"Keeping base '{self._base_branch}': aGiTrack integrates into it while the repo is on '{current}'.",
-                seconds=8.0,
+                f"Repo is now on '{current}', but this run still merges into '{self._base_branch}'. "
+                f"You'll be asked again once its changes have merged into '{self._base_branch}'.",
+                seconds=10.0,
             )
             self._render()
             return
-        # Pause (chosen explicitly, or the prompt was dismissed): the safe
-        # default — nothing merges until the user switches back or picks a base.
-        self._integration_paused = True
-        self._set_message(
-            f"Merging PAUSED: repo is on '{current}', not '{self._base_branch}'. "
-            f"Switch base or resume via {self._menu_label()} → git-base-branch.",
-            seconds=12.0,
+        self._prompt_merge_targets_on_dir_change()
+
+    def _session_work_merged_into_base(self) -> bool:
+        # True once the active session's work has landed on its merge branch — nothing
+        # uncommitted, mid-merge, or committed-but-unintegrated remains. Used to hold the
+        # deferred branch-switch dialog until a just-finished run's changes have merged
+        # into the original branch (a cancelled run leaves nothing pending, so it's True).
+        try:
+            return not self._integration.session_unintegrated(self.repo)
+        except Exception:
+            return True
+
+    def _prompt_merge_targets_on_dir_change(self) -> None:
+        # The repo directory was switched to another branch. Sessions keep merging into
+        # their own branches by default; offer to realign them. The first (default)
+        # option does nothing; then "switch only this session"; then, with more than
+        # one session, "switch ALL sessions" to the directory's branch.
+        if self.worktree is None or self._base_branch is None or self._repo_dir_branch is None:
+            return
+        if self._base_branch == self._repo_dir_branch:
+            return  # the active session already merges into the directory's branch
+        dir_branch = self._repo_dir_branch
+        options = [
+            "Do nothing — keep every session merging into its own branch",
+            f"Switch only '{self.name}' to '{dir_branch}'",
+        ]
+        if len(self.sessions or []) > 1:
+            options.append(f"Switch all idle sessions to '{dir_branch}' (running sessions keep their branch)")
+        choice = self._select_popup(
+            f"The repo directory is now on '{dir_branch}', but session '{self.name}' merges into "
+            f"'{self._base_branch}'. What should happen? "
+            f"(Change any session's merge branch later via Ctrl-G → session → Change a session's merge branch.)",
+            options,
         )
+        if not choice or choice.startswith("Do nothing"):
+            self._set_message(
+                f"Sessions keep merging into their own branches (the repo directory is on '{dir_branch}').",
+                seconds=6.0,
+            )
+            self._render()
+            return
+        if choice.startswith("Switch all idle"):
+            self._retarget_all_sessions(dir_branch)
+            return
+        self._retarget_active_session(dir_branch)  # switch only the active session
+
+    def _prompt_merge_target_if_diverged(self) -> None:
+        # Used on a SESSION SWITCH: when the newly-active session merges into a branch
+        # other than the directory's, ask whether to keep its own branch (default) or
+        # switch it to the directory's.
+        if self.worktree is None or self._base_branch is None or self._repo_dir_branch is None:
+            return
+        if self._base_branch == self._repo_dir_branch:
+            return
+        if self.agent_in_flight:
+            return  # a running session's branch can't change mid-run; the status bar bolds the difference
+        choice = self._select_popup(
+            f"The repo directory is on '{self._repo_dir_branch}', but session '{self.name}' merges into "
+            f"'{self._base_branch}'. Where should this session's changes merge?",
+            [
+                f"Keep merging into '{self._base_branch}'",
+                f"Switch to '{self._repo_dir_branch}' (the current directory branch)",
+            ],
+        )
+        if choice and choice.startswith("Switch to '"):
+            self._retarget_active_session(self._repo_dir_branch)
+        else:
+            self._set_message(
+                f"'{self.name}' keeps merging into '{self._base_branch}' "
+                f"(the repo directory is on '{self._repo_dir_branch}').",
+                seconds=6.0,
+            )
+            self._render()
+
+    def _retarget_all_sessions(self, target: str) -> None:
+        # Re-point every IDLE session at `target` (used by "switch all idle sessions").
+        # A running session keeps the branch it started its turn on — its in-flight work
+        # must not split across branches — so it is left untouched and reported.
+        skipped: list[str] = []
+        for index in range(len(self.sessions)):
+            session = self.sessions[index]
+            if getattr(session, "agent_in_flight", False):
+                skipped.append(self._session_name(index))
+                continue
+            if session is self.active:
+                self._retarget_active_session(target)  # active, in place
+            else:
+                self._with_session(session, lambda: self._retarget_active_session(target))
+        if skipped:
+            self._set_message(
+                f"Kept {', '.join(skipped)} on their current branch — they're running a turn; "
+                f"re-point them once idle via Ctrl-G → session → Change a session's merge branch.",
+                seconds=10.0,
+            )
+            self._render()
+
+    def _reconcile_merge_branch(self, default_base: str | None) -> None:
+        # On startup/resume aGiTrack assumes a session merges into the directory's current
+        # branch (`default_base`). If a PRIOR run assigned this worktree a different merge
+        # branch (persisted in its state), honor that assignment instead and flag a
+        # confirmation prompt, so the user confirms the branch change before it takes
+        # effect rather than silently merging into a branch they didn't choose. Otherwise
+        # record `default_base` as this worktree's merge branch.
+        if self.state is None:
+            return
+        previous = self.state.merge_branch  # what the previous aGiTrack instance assigned
+        if previous and previous != default_base and self._branch_exists(previous):
+            self._base_branch = previous  # keep merging where the prior run was pointed
+            self._pending_merge_prompt = True  # confirm with the user once the TUI is ready
+        elif default_base is not None:
+            # No prior assignment, it already matches, or its branch is gone — record the
+            # directory's current branch as this worktree's merge branch.
+            self.state.merge_branch = default_base
+
+    def _branch_exists(self, branch: str) -> bool:
+        # Whether `branch` is a real local branch right now. On any error assume it does,
+        # so a prior merge-branch assignment is never silently dropped on a transient
+        # failure — only when the branch is provably gone.
+        try:
+            return branch in self.base_repo.list_branches()
+        except Exception:
+            return True
+
+    def _retarget_active_session(self, target: str) -> bool:
+        # Change the ACTIVE session's merge destination to `target` — per-session, so
+        # the other sessions and the repo directory are left untouched. Flush its
+        # pending work into the OLD target first, then re-point its worktree there.
+        if self.worktree is None or self._base_branch is None:
+            return False
+        if target == self._base_branch:
+            return True
+        if self.agent_in_flight:
+            # Never change a running session's merge branch mid-turn — its in-flight
+            # work would split across branches. Only an idle session can be re-pointed.
+            self._set_message(
+                f"'{self.name}' is running a turn — its merge branch can only be changed when idle. "
+                f"This run will merge into '{self._base_branch}'.",
+                seconds=10.0,
+            )
+            self._render()
+            return False
+        old = self._base_branch
+        self._exiting = True  # suppress the conflict-resolve popup during the flush
+        self._set_message(f"Integrating '{self.name}' into '{old}' before re-targeting…", seconds=30)
         self._render()
+        self._integrate_session_keeping_alive()
+        if self._integration.session_unintegrated(self.repo):
+            self._exiting = False
+            self._set_message(
+                f"Can't change '{self.name}' merge target: it has unresolved work in '{old}'. "
+                f"Resolve it first ({self._menu_label()} → session).",
+                seconds=12.0,
+            )
+            self._render()
+            return False
+        self._base_branch = target  # the active session's new merge target (syncs the service)
+        if self.state is not None:
+            self.state.merge_branch = target  # keep the worktree's recorded merge branch in step
+        self._repoint_current_to_base()
+        self._exiting = False
+        self._set_message(f"'{self.name}' now merges into '{target}'.", seconds=8.0)
+        self._render()
+        return True
 
     def _warn_if_base_edited(self) -> None:
         # Fallback for un-sandboxed platforms: detect the agent editing the base
@@ -1533,7 +1678,7 @@ class ProxyRunner:
         # knows. A new session must not reuse one of these: resuming that past
         # conversation later recreates its worktree at worktree_path(name), so a
         # collision would put two backends in one directory.
-        return {_sanitize_name(name) for name in self._agit_named_sessions().values() if name}
+        return {_sanitize_name(name) for name in self._agitrack_named_sessions().values() if name}
 
     def _taken_session_names(self) -> set[str]:
         # Sanitized names already in use: live sessions, on-disk worktrees, and
@@ -1650,7 +1795,7 @@ class ProxyRunner:
             return
         self.state.backend_session_id = None
         self.state.last_backend_message_id = None
-        self.state.new_agit_session_id()
+        self.state.new_agitrack_session_id()
 
     def _turn_from_branch(self, branch: str) -> int:
         return self._integration.turn_from_branch(branch)
@@ -1693,9 +1838,13 @@ class ProxyRunner:
         self._primary_worktree_name = info.name  # the session that auto-resumes across exits
         self.worktree = info
         self.repo = repo
+        # Load this worktree's state and reconcile its merge branch BEFORE aligning: a
+        # prior run's assignment must be honored (and the cross-branch guard compares the
+        # align target against it), with a confirmation prompt deferred to the TUI.
+        self.state = AgitrackState(info.path, default_backend=self.global_config.default_backend)
+        self._reconcile_merge_branch(self._base_branch)
         self._align_session_to_base(repo)
         self.turn = self._turn_from_branch(repo.current_branch())
-        self.state = AgitrackState(info.path, default_backend=self.global_config.default_backend)
         self.state.backend = backend_name
         # The worktree is recreated fresh each run (its working state is not kept),
         # so seed its resume pointer to continue the chosen conversation.
@@ -1789,6 +1938,20 @@ class ProxyRunner:
         # A worktree mid-merge or with uncommitted changes is left untouched.
         if self._base_branch is None:
             return
+        # Cross-branch safeguard: only ever merge a worktree's OWN recorded merge
+        # branch into it. If the base we're about to merge differs from the branch this
+        # worktree was set up for, refuse and warn loudly — one session's branch must
+        # never be merged into another session's worktree (the demo-video→dev bug).
+        own = self._worktree_merge_branch(repo)
+        if own is not None and own != self._base_branch:
+            self._set_message(
+                f"⚠ Prevented a cross-branch merge: NOT merging '{self._base_branch}' into a session "
+                f"worktree that merges into '{own}'. Sessions on different branches are kept separate.",
+                seconds=15.0,
+            )
+            self._render()
+            self._debug(f"cross-branch align blocked: base '{self._base_branch}' != worktree base '{own}'")
+            return
         try:
             outcome = self._integration.align_session_to_base(repo)
         except Exception as error:
@@ -1802,6 +1965,15 @@ class ProxyRunner:
             self._debug(f"base '{self._base_branch}' conflicts with {branch}; left for integration")
         elif outcome == "repointed":
             self._debug(f"re-pointed session worktree to current base '{self._base_branch}'")
+
+    def _worktree_merge_branch(self, repo: GitRepo) -> str | None:
+        # The merge branch recorded in the worktree's OWN state file — read straight
+        # from disk so it reflects THIS worktree regardless of which session is active.
+        # None when unknown (e.g. a worktree created before this was tracked).
+        try:
+            return AgitrackState(repo.repo).merge_branch
+        except Exception:
+            return None
 
     def _worktree_has_pending_work(self, repo: GitRepo, branch: str) -> bool:
         # Pending = uncommitted changes, or commits on its branch not yet in base.
@@ -2039,16 +2211,18 @@ class ProxyRunner:
         # Only idle, clean worktrees are touched, so in-flight work is left alone.
         if self._integration_paused:
             return  # base switched out-of-band; don't re-point worktrees meanwhile
-        repo: GitRepo | None
         for index in range(len(self.sessions)):
             if index == self.active_index:
-                repo, in_flight = self.repo, self.agent_in_flight
-            else:
-                snapshot = self.sessions[index]
-                repo, in_flight = getattr(snapshot, "repo", None), getattr(snapshot, "agent_in_flight", False)
-            if repo is None or in_flight:
+                if not self.agent_in_flight:
+                    self._align_session_to_base(self.repo)
                 continue
-            self._align_session_to_base(repo)
+            snapshot = self.sessions[index]
+            if getattr(snapshot, "repo", None) is None or getattr(snapshot, "agent_in_flight", False):
+                continue
+            # Switch to the idle session so _base_branch (and the integration service)
+            # reflect ITS OWN merge branch — never the active session's, which would
+            # merge a different branch into this worktree (cross-branch contamination).
+            self._with_session(snapshot, lambda: self._align_session_to_base(self.repo))
 
     def _ensure_turn_branch(self) -> None:
         # A merged-and-detached session sits at base between turns. Before its
@@ -2253,16 +2427,7 @@ class ProxyRunner:
             self._render()
             return
         if sub == "model":
-            current = self.state.summarization_model or self.global_config.summarization_model or "(same as session)"
-            new_model = self._prompt_popup(
-                "Summarizer Model",
-                f"Current: {current}\nEnter model (empty to clear):",
-                default=self.state.summarization_model or "",
-            )
-            if new_model is not None:
-                self.state.summarization_model = new_model.strip() or None
-                self._set_message(f"Summarizer model: {self.state.summarization_model or '(same as session)'}")
-            self._render()
+            self._select_summarizer_model_popup()
             return
         enabled = self._summarization_enabled()
         model = self.state.summarization_model or self.global_config.summarization_model or "(same as session)"
@@ -2284,58 +2449,115 @@ class ProxyRunner:
             return
         self._render()
 
+    def _select_summarizer_model_popup(self) -> None:
+        # List the current backend's models as a picker. For Claude the smallest
+        # (Haiku) tier is offered first as the default, since summarization is a cheap
+        # task. Backends whose models can't be listed fall back to free-text entry.
+        from agitrack.summaries.model_select import list_available_models, smallest_model
+
+        backend_name = self.state.backend
+        current = self.state.summarization_model or self.global_config.summarization_model
+        models = list_available_models(backend_name)
+        if models:
+            smallest = smallest_model(backend_name, models)
+            ordered = [smallest, *(m for m in models if m != smallest)] if smallest else list(models)
+            label_for: dict[str, str | None] = {}
+            options: list[str] = []
+            for model in ordered:
+                label = f"{model}  (smallest — default)" if model == smallest else model
+                label_for[label] = model
+                options.append(label)
+            clear_label = "Same as the agent's session model"
+            label_for[clear_label] = None
+            options.append(clear_label)
+            choice = self._select_popup(f"Summarizer model (current: {current or 'same as session'})", options)
+            if choice is not None:
+                self._persist_summarizer_model(label_for.get(choice, choice))
+                self._set_message(f"Summarizer model: {self.global_config.summarization_model or '(same as session)'}")
+            self._render()
+            return
+        # No model list available (the backend's CLI couldn't be queried) — let the
+        # user type a model name, as before.
+        new_model = self._prompt_popup(
+            "Summarizer Model",
+            f"Current: {current or '(same as session)'}\nEnter model (empty to clear):",
+            default=current or "",
+        )
+        if new_model is not None:
+            self._persist_summarizer_model(new_model.strip() or None)
+            self._set_message(f"Summarizer model: {self.global_config.summarization_model or '(same as session)'}")
+        self._render()
+
+    def _persist_summarizer_model(self, value: str | None) -> None:
+        # Persist the choice in the GLOBAL config so it survives restarts, session
+        # switches, and applies across the whole repo; clear any per-session override
+        # (which lives in a transient worktree state) so the global value takes effect.
+        self.global_config.summarization_model = value
+        self.state.summarization_model = None
+
     # --- switch base branch ---
 
-    def _base_switch_candidates(self) -> list[str]:
-        # User branches the base could switch to (never aGiTrack's transient ones).
-        return self._integration.base_switch_candidates()
+    def _prompt_merge_branch(self, title: str, current: str | None) -> str | None:
+        # Pick a real (non-managed) branch as a session's merge destination; the
+        # session's current target is marked. Returns the branch, or None on cancel.
+        branches = [b for b in self.base_repo.list_branches() if not is_managed_branch(b)]
+        if not branches:
+            self._set_message("No branches available to merge into.")
+            self._render()
+            return None
+        label_for: dict[str, str] = {}
+        options: list[str] = []
+        for branch in branches:
+            label = f"{branch}  (current target)" if branch == current else branch
+            label_for[label] = branch
+            options.append(label)
+        choice = self._select_popup(title, options)
+        return None if choice is None else label_for.get(choice, choice)
 
-    def _switch_base_command(self, arg: str = "") -> None:
-        if self.worktree is None or self._base_branch is None:
-            self._set_message("Base switching is unavailable for this session.")
+    def _change_session_merge_branch_menu(self) -> None:
+        # Session-config entry: change the merge destination of ANY session.
+        if not self.sessions:
+            self._set_message("No sessions.")
             self._render()
             return
-        candidates = self._base_switch_candidates()
-        if not candidates:
-            self._set_message("No other branches to switch the base to.")
+        label_for: dict[str, int] = {}
+        options: list[str] = []
+        for index in range(len(self.sessions)):
+            target = getattr(self.sessions[index], "_base_branch", None) or "?"
+            label = f"{self._session_name(index)}  → {target}"
+            label_for[label] = index
+            options.append(label)
+        choice = self._select_popup("Change the merge branch of which session?", options)
+        if choice is None:
+            self._set_message("Cancelled.")
             self._render()
             return
-        target = (
-            arg.strip()
-            if arg.strip() in candidates
-            else self._select_popup(f"Switch base from '{self._base_branch}' to:", candidates)
-        )
+        index = label_for[choice]
+        session = self.sessions[index]
+        if getattr(session, "agent_in_flight", False):
+            # A running session's merge branch can't change mid-turn (its in-flight work
+            # would split across branches); only idle sessions can be re-pointed.
+            self._set_message(
+                f"'{self._session_name(index)}' is running a turn — change its merge branch when it's idle.",
+                seconds=8.0,
+            )
+            self._render()
+            return
+        current = getattr(session, "_base_branch", None)
+        target = self._prompt_merge_branch(f"Merge '{self._session_name(index)}' into which branch?", current)
         if not target:
             self._set_message("Cancelled.")
             self._render()
             return
-        confirm = self._select_popup(
-            f"Switch base to '{target}'? aGiTrack integrates every session's work into "
-            f"'{self._base_branch}' first, then re-points them at '{target}'.",
-            ["No, cancel", "Yes, switch base"],
-        )
-        if confirm != "Yes, switch base":
-            self._set_message("Cancelled.")
+        if target == current:
+            self._set_message(f"'{self._session_name(index)}' already merges into '{target}'.")
             self._render()
             return
-        self._perform_base_switch(target)
-
-    def _session_unintegrated(self, repo) -> bool:
-        # True if a session still has work that did not make it into the base.
-        return self._integration.session_unintegrated(repo)
-
-    def _unintegrated_session_names(self) -> list[str]:
-        blocked: list[str] = []
-        repo: GitRepo | None
-        for index in range(len(self.sessions)):
-            if index == self.active_index:
-                repo, name = self.repo, self.name
-            else:
-                session = self.sessions[index]
-                repo, name = getattr(session, "repo", None), self._session_name(index)
-            if self._session_unintegrated(repo):
-                blocked.append(name)
-        return blocked
+        if session is self.active:
+            self._retarget_active_session(target)
+        else:
+            # Re-target a background session by temporarily making it active.
+            self._with_session(session, lambda: self._retarget_active_session(target))
 
     def _integrate_session_keeping_alive(self) -> None:
         # Commit the latest turn and integrate it into the current base WITHOUT
@@ -2349,50 +2571,6 @@ class ProxyRunner:
         self._service_commit_summary()
         self._integrate_session_turn()
 
-    def _integrate_all_sessions_into_base(self) -> None:
-        # Integrate every live session into the CURRENT base, keeping each
-        # session's worktree and backend alive (base-switching is not an exit).
-        self._integrate_session_keeping_alive()  # active, in place
-        for session in list(self.sessions):
-            if session is not self.active:
-                self._with_session(session, self._integrate_session_keeping_alive)
-
-    def _perform_base_switch(self, new_base: str) -> None:
-        self._exiting = True  # suppress the conflict-resolve popup during integration
-        self._set_message("Integrating session work before switching base…", seconds=30)
-        self._render()
-        # NB: never _finalize_pending_work() here — that is the EXIT path, which
-        # terminates the agent child and removes the worktree, killing the very
-        # sessions a base switch is meant to keep running (the source of the
-        # "switching base quits with an error" crash).
-        self._integrate_all_sessions_into_base()
-        blocked = self._unintegrated_session_names()
-        if blocked:
-            self._exiting = False
-            self._set_message(
-                f"Cannot switch base: unresolved work in {', '.join(blocked)}. "
-                f"Resolve it ({self._menu_label()} → session), then try again.",
-                seconds=14.0,
-            )
-            self._render()
-            return
-        try:
-            self.base_repo.switch(new_base)
-        except Exception as error:
-            self._exiting = False
-            self._set_message(f"Could not switch base to '{new_base}': {error}", seconds=10.0)
-            self._render()
-            return
-        self._base_branch = new_base
-        self._integration.base_branch = new_base
-        self._repoint_all_sessions_to_base()
-        self._exiting = False
-        self._set_message(
-            f"Base switched to '{new_base}'. Existing sessions keep running and now merge into it.",
-            seconds=8.0,
-        )
-        self._render()
-
     def _repoint_current_to_base(self) -> None:
         # Detach the current session's worktree at the new base so its next turn
         # branches from there. The session and its conversation keep running.
@@ -2403,14 +2581,6 @@ class ProxyRunner:
             return
         if new_turn is not None:
             self.turn = new_turn
-
-    def _repoint_all_sessions_to_base(self) -> None:
-        # Re-point every live session at the new base without stopping any of them.
-        self._repoint_current_to_base()  # active, in place
-        for session in self.sessions:
-            if session is self.active:
-                continue
-            self._with_session(session, self._repoint_current_to_base)
 
     def _session_menu(self) -> None:
         options: list[str] = []
@@ -2425,6 +2595,9 @@ class ProxyRunner:
             marker = "* " if index == self.active_index else "  "
             backend = getattr(getattr(session, "backend", None), "name", "?")
             label = f"{marker}{self._session_name(index)} [{self._session_status(index)}] ({backend})"
+            merge_branch = getattr(session, "_base_branch", None)
+            if merge_branch:
+                label += f" → {merge_branch}"  # the branch this session merges into
             if index == self.active_index and not self.merge_ctx and self._active_has_pending():
                 label += " — commits to integrate"
             sid = getattr(getattr(session, "state", None), "backend_session_id", None)
@@ -2449,6 +2622,8 @@ class ProxyRunner:
             actions.append(("separator", None))
             options.append("✎ Rename a session")
             actions.append(("rename", None))
+            options.append("⤳ Change a session's merge branch")
+            actions.append(("merge-branch", None))
         if self._resumable_sessions():
             options.append("↻ Resume a past conversation…")
             actions.append(("resume-past", None))
@@ -2493,6 +2668,8 @@ class ProxyRunner:
             self._prompt_new_session()
         elif kind == "rename":
             self._rename_session_menu()
+        elif kind == "merge-branch":
+            self._change_session_merge_branch_menu()
         elif kind == "share":
             self._share_session()
         elif kind == "resume-shared":
@@ -2643,7 +2820,7 @@ class ProxyRunner:
             root = AgitrackState(self.base_repo.repo, default_backend=self.global_config.default_backend)
         except Exception:
             root = None
-        for sid, name in self._agit_named_sessions().items():
+        for sid, name in self._agitrack_named_sessions().items():
             if sid and sid not in seen:
                 seen.add(sid)
                 named_at = root.session_named_at(sid) if root is not None else 0.0
@@ -2651,7 +2828,7 @@ class ProxyRunner:
         refs = sorted(refs, key=lambda ref: getattr(ref, "updated", 0) or 0, reverse=True)
         return refs[: self.RESUME_LIST_LIMIT]
 
-    def _agit_named_sessions(self) -> dict:
+    def _agitrack_named_sessions(self) -> dict:
         # Friendly names for conversations aGiTrack itself created/named, keyed by
         # backend session id. Used only to label/resume the list that comes from
         # the backend. Two sources, in precedence order:
@@ -2682,7 +2859,7 @@ class ProxyRunner:
             self._render()
             return
         live_ids = {getattr(getattr(s, "state", None), "backend_session_id", None) for s in self.sessions}
-        names = self._agit_named_sessions()
+        names = self._agitrack_named_sessions()
         options: list[str] = []
         for ref in sessions:
             mark = "● " if ref.id in live_ids else "  "
@@ -2798,39 +2975,37 @@ class ProxyRunner:
             self._render()
             return
         display = payload["display"]
-        self._set_message(f"Sharing '{display}' — pushing to origin…   press Esc to cancel", seconds=600)
-        self._render()
-        outcome = self._publish_with_cancel(
-            self._shared_store(),
-            github_id=payload["owner"],
-            name=payload["name"],
-            transcript=payload["redacted"],
-            manifest=payload["manifest"],
-            prune_gid=payload["sharer"],
-        )
-        if outcome.get("cancelled"):
-            # The push was stopped (Esc) or timed out — the git subprocess was killed,
-            # so nothing reached origin. Make the non-result unmistakable and hold the
-            # notice until the user acknowledges it with a key (a mouse move won't).
-            self._await_keypress(
-                f"'{display}' was NOT shared — the push to origin was cancelled. Press any key to continue."
+        store = self._shared_store()
+
+        def op():
+            return store.publish(
+                github_id=payload["owner"],
+                name=payload["name"],
+                transcript=payload["redacted"],
+                manifest=payload["manifest"],
+                prune_gid=payload["sharer"],
+                timeout=self.SHARE_PUSH_TIMEOUT,
             )
-            return
-        if "error" in outcome:
-            self._set_message(f"Could not share session: {outcome['error']}", seconds=10.0)
-            self._render()
-            return
-        result = outcome["result"]
-        self._auto_share_hash[session_id] = payload["digest"]  # don't immediately re-push the same content
-        # Record the lineage origin so a later re-share (here or on another machine)
-        # updates this same entry and keeps accumulating contributors.
-        self._user_state().set_shared_origin(
-            session_id, owner=payload["owner"], name=payload["name"], contributors=payload["contributors"]
-        )
-        self._set_message(self._share_outcome_message(result, display), seconds=12.0)
-        self._render()
-        # Offer to keep it current automatically (the opt-in covers future pushes).
-        if result.pushed and not self._session_auto_shared(session_id):
+
+        def outcome(box) -> str:
+            if "error" in box:
+                return f"Could not share session: {box['error']}"
+            result = box["result"]
+            self._auto_share_hash[session_id] = payload["digest"]  # don't immediately re-push the same content
+            # Record the lineage origin so a later re-share (here or on another machine)
+            # updates this same entry and keeps accumulating contributors.
+            self._user_state().set_shared_origin(
+                session_id, owner=payload["owner"], name=payload["name"], contributors=payload["contributors"]
+            )
+            return self._share_outcome_message(result, display)
+
+        # The push to origin runs in the BACKGROUND so the terminal never freezes; its
+        # result lands as a notice. Only the exit-path share blocks (it must finish
+        # before the process quits, since daemon threads die with it).
+        self._run_share_op_async(f"share:{display}", f"Sharing '{display}' — pushing to origin…", op, outcome)
+        # Offer to keep it current automatically. This is a quick interactive prompt
+        # (not a network wait), shown while the push proceeds in the background.
+        if not self._session_auto_shared(session_id):
             keep = self._select_popup(
                 "Keep this shared session up to date automatically?\n"
                 "New turns will be pushed to the shared copy as the conversation grows.",
@@ -2843,42 +3018,6 @@ class ProxyRunner:
                     seconds=8.0,
                 )
                 self._render()
-
-    def _publish_with_cancel(
-        self, store, *, github_id: str, name: str, transcript: str, manifest: dict, prune_gid: str | None = None
-    ) -> dict:
-        """Push a manual share on a worker thread while keeping the UI alive and
-        letting the user press Esc to cancel a slow/stalled upload. Returns one of
-        ``{"result": PublishResult}``, ``{"cancelled": True}``, or ``{"error": str}``.
-        On cancel the underlying ``git push`` subprocess is killed, not merely
-        abandoned, so the upload truly stops."""
-        cancel = threading.Event()
-        box: dict = {}
-
-        def worker() -> None:
-            try:
-                box["result"] = store.publish(
-                    github_id=github_id,
-                    name=name,
-                    transcript=transcript,
-                    manifest=manifest,
-                    prune_gid=prune_gid,
-                    timeout=self.SHARE_PUSH_TIMEOUT,
-                    cancel=cancel,
-                )
-            except Exception as error:
-                if not cancel.is_set():
-                    box["error"] = str(error)
-
-        thread = threading.Thread(target=worker, daemon=True, name="agit-share-push")
-        thread.start()
-        status = self._drain_pty_until_done_or_esc(thread, deadline=time.monotonic() + self.SHARE_PUSH_TIMEOUT + 2.0)
-        if status != "done":
-            cancel.set()  # kill the push subprocess now — don't leave it running
-            return {"cancelled": True}
-        if "error" in box:
-            return {"error": box["error"]}
-        return {"result": box["result"]}
 
     def _share_payload(self, session_id: str):
         """Read + redact the session transcript and build its manifest (no network,
@@ -3039,32 +3178,29 @@ class ProxyRunner:
             "transcript_rows": _shared_transcript_rows(redacted),
         }
         display = f"{'+'.join(contributors)}/{entry.name}"
-        # Same UX as the initial share: show a "pushing to origin…" notice while the
-        # (potentially slow) push runs, and let the user press Esc to cancel it.
-        self._set_message(f"Updating '{display}' — pushing to origin…   press Esc to cancel", seconds=600)
-        self._render()
-        outcome = self._publish_with_cancel(
-            self._shared_store(),
-            github_id=entry.github_id,
-            name=entry.name,
-            transcript=redacted,
-            manifest=manifest,
-            prune_gid=login,
-        )
-        if outcome.get("cancelled"):
-            self._await_keypress(
-                f"'{display}' was NOT updated — the push to origin was cancelled. Press any key to continue."
+        store = self._shared_store()
+
+        def op():
+            return store.publish(
+                github_id=entry.github_id,
+                name=entry.name,
+                transcript=redacted,
+                manifest=manifest,
+                prune_gid=login,
+                timeout=self.SHARE_PUSH_TIMEOUT,
             )
-            return
-        if "error" in outcome:
-            self._set_message(f"Could not update {display}: {outcome['error']}", seconds=10.0)
-            self._render()
-            return
-        result = outcome["result"]
-        if sid:
-            self._auto_share_hash[sid] = manifest["content_hash"]
-        self._set_message(self._share_outcome_message(result, display), seconds=12.0)
-        self._render()
+
+        def outcome(box) -> str:
+            if "error" in box:
+                return f"Could not update {display}: {box['error']}"
+            result = box["result"]
+            if sid:
+                self._auto_share_hash[sid] = manifest["content_hash"]
+            return self._share_outcome_message(result, display)
+
+        # Push in the BACKGROUND (same as the initial share) so the terminal never
+        # freezes; a progress notice shows now, the result lands when it finishes.
+        self._run_share_op_async(f"update:{display}", f"Updating '{display}' — pushing to origin…", op, outcome)
 
     def _unshare_entry(self, entry) -> None:
         # Unsharing is a one-way, fire-and-forget network op with no follow-up, and the
@@ -3934,7 +4070,97 @@ class ProxyRunner:
             self._set_message("Cancelled.")
             self._render()
             return
-        self._new_session(name)
+        # Fork the current conversation, or start a blank one?
+        fork = self._prompt_fork_or_blank()
+        if fork is None:
+            self._set_message("Cancelled.")
+            self._render()
+            return
+        # A fork continues the current session's work, so default its merge branch to
+        # the current session's; a blank session defaults to the repo directory's.
+        base = self._prompt_new_session_base(default=self._base_branch if fork else None)
+        if base is None:
+            self._set_message("Cancelled.")
+            self._render()
+            return
+        # The new session merges into its OWN branch — independent of the other
+        # sessions and of the branch checked out in the repo directory.
+        if fork and self._fork_current_session(name, base_branch=base):
+            return
+        if fork:
+            self._set_message("Couldn't fork the current session; starting a blank one instead.", seconds=8.0)
+        self._new_session(name, base_branch=base)
+
+    def _can_fork_active(self) -> bool:
+        # A fork copies the active conversation, so it needs a portable transcript
+        # (the same capability session sharing relies on) and a session to copy.
+        return bool(getattr(self.state, "backend_session_id", None)) and getattr(
+            self.backend, "supports_session_sharing", False
+        )
+
+    def _prompt_fork_or_blank(self) -> bool | None:
+        # True = fork the current session, False = blank, None = cancel. No prompt
+        # (blank) when there's no live conversation to fork.
+        if not self._can_fork_active():
+            return False
+        choice = self._select_popup(
+            "Start the new session as…",
+            [
+                "Blank session — a fresh conversation",
+                f"Fork '{self.name}' — copy this conversation (under a new id)",
+            ],
+        )
+        if choice is None:
+            return None
+        return choice.startswith("Fork")
+
+    def _fork_current_session(self, name: str, *, base_branch: str | None = None) -> bool:
+        # Duplicate the active conversation under a FRESH backend id, so the fork runs
+        # independently and never clashes with the original. Returns False if forking
+        # isn't possible (the caller then starts a blank session).
+        agent = self.backend
+        src_id = self.state.backend_session_id
+        if not src_id or not getattr(agent, "supports_session_sharing", False):
+            return False
+        # The LATEST conversation state lives in the active session's worktree (its
+        # cwd), so export from there first; the base repo may only hold an older
+        # mirrored copy. (Same order as the auto-share path.)
+        transcript = agent.export_session_raw(self.repo.repo, src_id) or agent.export_session_raw(
+            self.base_repo.repo, src_id
+        )
+        new_id = getattr(agent, "new_import_id", lambda: None)() or agent.new_session_id()
+        if not transcript or not new_id:
+            return False
+        # Install the copied transcript under the new id (does not touch the original),
+        # then start a session resuming it — same path as a "keep both" shared resume.
+        if not agent.import_shared_session(self.base_repo.repo, src_id, transcript, as_id=new_id):
+            return False
+        self._new_session(name, resume_session_id=new_id, backend=self.state.backend, base_branch=base_branch)
+        return True
+
+    def _merge_target_default(self) -> str | None:
+        # The default merge destination for a new session: the branch checked out in
+        # the repo directory ("the base branch").
+        return self._repo_dir_branch or (self.base_repo.current_branch() if self.base_repo is not None else None)
+
+    def _prompt_new_session_base(self, *, default: str | None = None) -> str | None:
+        # Which branch the new session merges into. Defaults to ``default`` (a fork's
+        # current branch) or the repo directory's branch ("the base branch"); picking
+        # another lets the session work toward a different branch without checking it
+        # out. Returns the chosen branch, None on cancel, or the default when there's
+        # nothing else to offer.
+        default_branch = default or self._merge_target_default()
+        if not self._use_worktrees or default_branch is None:
+            return default_branch
+        others = [b for b in self.base_repo.list_branches() if b != default_branch and not is_managed_branch(b)]
+        if not others:
+            return default_branch
+        default_label = f"{default_branch}  (default)"
+        options = [default_label, *others]
+        choice = self._select_popup("Merge this session's changes into which branch?", options)
+        if choice is None:
+            return None
+        return default_branch if choice == default_label else choice
 
     def _stop_session_menu(self) -> None:
         options = [self._session_name(index) for index in range(len(self.sessions))]
@@ -4043,6 +4269,9 @@ class ProxyRunner:
         self._enable_host_mouse()
         self._set_message(f"Switched to session '{self._session_name(index)}'")
         self._render()
+        # The newly-active session may merge into a different branch than the one
+        # checked out in the repo directory — ask where its changes should merge.
+        self._prompt_merge_target_if_diverged()
 
     def _join_parse_worker_before_swap(self) -> None:
         # A parse worker started for the active session reads that session's
@@ -4185,7 +4414,7 @@ class ProxyRunner:
                 self._prompt_resolve_conflict(self.repo.current_branch())
                 return
 
-    def _open_session_worktree(self, name: str) -> tuple[WorktreeInfo, GitRepo]:
+    def _open_session_worktree(self, name: str, *, base_branch: str | None = None) -> tuple[WorktreeInfo, GitRepo]:
         worktrees = self._worktrees()
         path = worktrees.worktree_path(name)
         if self._is_valid_worktree(path):
@@ -4199,7 +4428,8 @@ class ProxyRunner:
         if path.exists():
             self._debug(f"removing invalid leftover worktree dir {path}")
             shutil.rmtree(path, ignore_errors=True)
-        info = worktrees.create(name, base=self._base_branch or self.base_repo.current_branch())
+        base = base_branch or self._base_branch or self.base_repo.current_branch()
+        info = worktrees.create(name, base=base)
         return info, GitRepo(info.path)
 
     def _is_valid_worktree(self, path) -> bool:
@@ -4213,7 +4443,14 @@ class ProxyRunner:
         except Exception:
             return False
 
-    def _new_session(self, name: str, *, resume_session_id: str | None = None, backend: str | None = None) -> None:
+    def _new_session(
+        self,
+        name: str,
+        *,
+        resume_session_id: str | None = None,
+        backend: str | None = None,
+        base_branch: str | None = None,
+    ) -> None:
         if not self._use_worktrees:
             # #9: concurrent sessions need worktrees; in no-worktree mode they'd
             # all write the same tree. Refuse rather than corrupt the checkout.
@@ -4224,8 +4461,11 @@ class ProxyRunner:
             )
             self._render()
             return
+        # The branch this new session merges into — its own, independent of the
+        # other sessions and of the branch checked out in the repo directory.
+        base = base_branch or self._merge_target_default()
         try:
-            info, repo = self._open_session_worktree(name)
+            info, repo = self._open_session_worktree(name, base_branch=base)
         except Exception as error:
             self._set_message(f"Could not create worktree: {error}", seconds=8.0)
             self._render()
@@ -4236,8 +4476,15 @@ class ProxyRunner:
         self.name = info.name
         self.worktree = info
         self.repo = repo
+        self._base_branch = base  # this session integrates into `base` (per-session)
         self.turn = self._turn_from_branch(repo.current_branch())
         self.state = AgitrackState(info.path, default_backend=self.global_config.default_backend)
+        if base_branch is None:
+            # No branch was explicitly chosen (e.g. resuming a dormant worktree): honor
+            # any merge branch a prior run assigned it, confirming the change with the user.
+            self._reconcile_merge_branch(base)
+        else:
+            self.state.merge_branch = base  # an explicit choice wins; record it
         if backend:
             # Pin this session to a specific backend (e.g. created by switching
             # backends), independent of the global default.
@@ -4801,7 +5048,13 @@ class ProxyRunner:
         # for — Shift+Enter et al. arrive on stdin already encoded and are
         # forwarded to the backend like any other input.
         for match in _KEYBOARD_PROTO_RE.finditer(output):
-            os.write(sys.stdout.fileno(), match.group(0))
+            seq = match.group(0)
+            # Kitty-protocol sequences end in ``u``; only mirror them to a host that
+            # speaks the protocol, or they leak as visible codes (the modifyOtherKeys
+            # ``...m`` form is an ordinary CSI any terminal consumes, so always mirror it).
+            if seq.endswith(b"u") and not self.host_kitty_keyboard:
+                continue
+            os.write(sys.stdout.fileno(), seq)
 
     def _detect_host_terminal(self) -> None:
         # Pre-reactor: called once during run() startup, before _loop() starts.
@@ -4818,6 +5071,10 @@ class ProxyRunner:
         # Proactively enable the kitty keyboard protocol for shift-modified menu keys.
         # This allows Ctrl+Shift+<letter> to be distinguished from Ctrl+<letter>.
         # The protocol is: CSI > flags u, where flags=1 means "disambiguate escape codes"
+        if not self.host_kitty_keyboard:
+            # The host doesn't speak the protocol; sending CSI > 1 u would just leak
+            # as a visible code at startup without enabling anything.
+            return
         try:
             os.write(sys.stdout.fileno(), b"\x1b[>1u")
             self._kitty_keyboard_enabled = True
@@ -5108,6 +5365,7 @@ class ProxyRunner:
             backend_name=self.backend.name,
             session_id=self.state.backend_session_id,
             base_branch=self._base_branch,
+            current_dir_branch=self._repo_dir_branch,
             worktree=self.worktree,
             scroll_back=self.scroll_back,
             user_declined=self._user_declined,
@@ -5155,19 +5413,14 @@ class ProxyRunner:
                 self._render()
             return
 
-        if name in {"git-stage", "git-user-commit"}:
-            if name == "git-stage":
-                self._set_message(self._stage_files_popup())
-            else:
-                created = self._create_user_commit_popup(repo=self.base_repo, state=self._user_state())
-                self._set_message("Created user commit." if created else "No staged user changes to commit.")
+        if name == "git-user-commit":
+            created = self._create_user_commit_popup(repo=self.base_repo, state=self._user_state())
+            self._set_message("Created user commit." if created else "No staged user changes to commit.")
             self._reload_user_declined()
             self._render()
             return
 
-        if name == "git-status":
-            self._set_message(self.base_repo.status() or "Working tree clean")
-        elif name == "git-unstaged":
+        if name == "git-unstaged":
             self._prune_declined_untracked(self.base_repo, self._user_state())
             self._reload_user_declined()
             declined = self._user_declined
@@ -5194,9 +5447,6 @@ class ProxyRunner:
             return
         elif name == "summarizer":
             self._handle_summarizer_command(arg)
-            return
-        elif name == "git-base-branch":
-            self._switch_base_command(arg)
             return
         elif name == "update":
             self._handle_update_command()
@@ -5336,9 +5586,17 @@ class ProxyRunner:
         candidates = untracked if include_declined else [path for path in untracked if path not in declined]
         if not candidates:
             return "No untracked files to review."
+        # Cap the listed files to the terminal height so the question and the input
+        # line (which the modal draws LAST) are never pushed off the popup. The
+        # decision is all-or-none, so a preview plus "…and N more" is enough.
+        limit = max(5, self.rows - 10)
+        preview = candidates[:limit]
+        listing = "\n".join(preview)
+        if len(candidates) > len(preview):
+            listing += f"\n…and {len(candidates) - len(preview)} more"
         answer = self._prompt_popup(
             "Untracked Files",
-            "Stage all new files? [y/N]\n" + "\n".join(candidates),
+            f"Stage all {len(candidates)} new file(s)? [y/N]\n{listing}",
         )
         if answer is None:
             return "Cancelled."
@@ -5350,60 +5608,6 @@ class ProxyRunner:
         else:
             state.add_declined(candidates)
             return f"Left {len(candidates)} untracked file(s) unstaged."
-
-    def _stage_files_popup(self) -> str:
-        # `git-stage`: one menu for the user's stageable base-tree files, in two
-        # groups — *new* files (untracked, not yet decided) and *intentionally
-        # unstaged* files (previously declined, e.g. at the pre-agent prompt). The
-        # user picks which to stage; chosen files are staged+committed so the
-        # agent's worktree (a checkout of base) can see them. Unpicked files are
-        # left as they are. Selection is per-file (numbers, or 'a' for all).
-        base, state = self.base_repo, self._user_state()
-        self._prune_declined_untracked(base, state)
-        declined = state.declined_untracked()
-        new_files = [path for path in base.untracked_files() if path not in set(declined)]
-        if not new_files and not declined:
-            return "No files to stage."
-        ordered: list[str] = []
-        lines: list[str] = ["Select files to stage:", ""]
-        for header, group in (("New files:", new_files), ("Intentionally unstaged:", declined)):
-            if not group:
-                continue
-            lines.append(header)
-            for path in group:
-                ordered.append(path)
-                lines.append(f"  {len(ordered)}. {path}")
-        lines.append("")
-        lines.append("Enter numbers (e.g. 1 3), 'a' for all, or blank to cancel:")
-        answer = self._prompt_popup("Stage Files", "\n".join(lines))
-        if answer is None:
-            return "Cancelled."
-        answer = answer.strip().lower()
-        if not answer:
-            return "Nothing staged."
-        if answer in {"a", "all"}:
-            selected = list(ordered)
-        else:
-            selected = [
-                ordered[int(token) - 1]
-                for token in answer.replace(",", " ").split()
-                if token.isdigit() and 1 <= int(token) <= len(ordered)
-            ]
-        if not selected:
-            return "No valid selection; nothing staged."
-        return self._commit_user_files(selected, state)
-
-    def _commit_user_files(self, paths: list[str], state: AgitrackState) -> str:
-        # Stage the chosen base-tree files, drop them from the declined list, and
-        # commit them as a user commit so they reach the session worktree on the
-        # next idle base-sync. If the user cancels the message, leave them staged.
-        self.base_repo.stage_paths(paths)
-        state.remove_declined(paths)
-        message = self._prompt_popup("User Commit", "Commit message for these files:")
-        if message is None or not message.strip():
-            return f"Staged {len(paths)} file(s); run git-user-commit to commit them."
-        self.base_repo.commit(build_user_commit_message(message=message.strip(), agitrack_session_id=state.session_id))
-        return f"Committed {len(paths)} file(s) to {self._base_branch}."
 
     def _create_agent_commit_from_turns_popup(
         self,
@@ -6663,5 +6867,31 @@ def _delegate_to_active_session(field: str) -> property:
 
 
 for _field in Session.FIELDS:
+    # _base_branch gets a custom property below (it must also keep the single
+    # IntegrationService in sync on every write), so skip the plain delegation.
+    if _field == "_base_branch":
+        continue
     setattr(ProxyRunner, _field, _delegate_to_active_session(_field))
 del _field
+
+
+def _get_base_branch(self):
+    return self.active._base_branch
+
+
+def _set_base_branch(self, value):
+    # Per-session integration target. Writing it also re-points the single
+    # IntegrationService, so a session always merges into its own branch.
+    self.active._base_branch = value
+    svc = self.__dict__.get("_integration_svc")
+    if svc is not None:
+        svc.base_branch = value
+
+
+# Attached via setattr (not a plain assignment) so mypy uses the class-level
+# annotation above rather than flagging the property vs. str|None mismatch.
+setattr(
+    ProxyRunner,
+    "_base_branch",
+    property(_get_base_branch, _set_base_branch, doc="Per-session integration target (delegates to self.active)."),
+)

@@ -320,7 +320,7 @@ def test_user_commit_message_masks_secret_subject():
     assert "secret123" not in message
 
 
-def test_commit_messages_include_current_agit_version_without_created_at():
+def test_commit_messages_include_current_agitrack_version_without_created_at():
     from agitrack import __version__
 
     message = build_user_commit_message(message="save work", agitrack_session_id="agit-1")
@@ -358,7 +358,28 @@ def test_source_version_falls_back_to_pyproject_when_metadata_missing():
     assert expected != "0.0.0"  # the checkout declares a real release version
 
 
-def test_agent_commit_subject_is_capped_for_github():
+def test_agent_commit_subject_splits_at_first_sentence():
+    # The subject is the first sentence; the rest flows onto the next line. aGiTrack
+    # never adds "…" — Git shortens the displayed subject if it's long.
+    message = build_agent_commit_message(
+        latest_prompt="Fix the failing parser test. Then add coverage and update the docs.",
+        trace=[],
+        backend="opencode",
+        backend_session_id="ses-1",
+        agitrack_session_id="agit-1",
+        model="provider/model",
+    )
+
+    lines = message.splitlines()
+    assert lines[0] == "<aGiTrack> Fix the failing parser test."  # first sentence only
+    assert "..." not in lines[0]
+    # The remainder follows directly on the next line (no blank between).
+    assert lines[1] == "Then add coverage and update the docs."
+
+
+def test_agent_commit_subject_without_period_is_kept_whole():
+    # No sentence-ending period ⇒ the whole prompt is the subject, untruncated, with
+    # no "…" and no continuation line.
     message = build_agent_commit_message(
         latest_prompt="please " * 40,
         trace=[],
@@ -369,26 +390,20 @@ def test_agent_commit_subject_is_capped_for_github():
     )
 
     lines = message.splitlines()
-    subject = lines[0]
-    assert len(subject) <= 72  # GitHub's subject-line truncation limit
-    assert subject.startswith("<aGiTrack> ")
-    assert subject.endswith("...")
-    # The full (untruncated) text follows the subject line directly — no separate
-    # "# Full Subject" header, and no blank line between subject and continuation.
-    assert "# Full Subject" not in message
-    assert lines[1].startswith("please please")
+    assert lines[0].startswith("<aGiTrack> please please")
+    assert not lines[0].endswith("...")
+    assert lines[1] == ""  # straight to the (blank then) trace — no subject continuation
 
 
-def test_user_commit_subject_is_capped_for_github():
-    message = build_user_commit_message(message="save " * 40, agitrack_session_id="agit-1")
+def test_user_commit_subject_splits_at_first_sentence():
+    message = build_user_commit_message(
+        message="Save my parser edits. They also touch the lexer.", agitrack_session_id="agit-1"
+    )
 
     lines = message.splitlines()
-    subject = lines[0]
-    assert len(subject) <= 72  # GitHub's subject-line truncation limit
-    assert subject.endswith("...")
-    # Full text follows the subject directly — no header, no blank line between.
-    assert "# Full Subject" not in message
-    assert lines[1].startswith("save save")
+    assert lines[0] == "Save my parser edits."  # first sentence
+    assert "..." not in lines[0]
+    assert lines[1] == "They also touch the lexer."
 
 
 def test_commit_message_body_lines_are_wrapped_to_72():

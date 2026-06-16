@@ -46,8 +46,8 @@ def test_naming_helpers(tmp_path):
     assert wm.worktree_path("feat x").name == "feat-x"
     # Branches are namespaced by backend then session: agit/<backend>/<name>/tN.
     assert wm.turn_branch("feat x", 2, backend="open code") == "agitrack/open-code/feat-x/t2"
-    assert wm.is_agit_branch("agitrack/claude/feat-x/t0") is True
-    assert wm.is_agit_branch("main") is False
+    assert wm.is_agitrack_branch("agitrack/claude/feat-x/t0") is True
+    assert wm.is_agitrack_branch("main") is False
     assert _sanitize_name("  ") == "session"
 
 
@@ -426,12 +426,12 @@ def test_session_unintegrated_detects_pending_commits(tmp_path):
     info, work = _make_session(main, "s1", base)
 
     runner = _integration_runner(main, work, base, "s1")
-    assert runner._session_unintegrated(work) is False
+    assert runner._integration.session_unintegrated(work) is False
     _commit(work, "a.txt", "x\n", "<aGiTrack> work")
-    assert runner._session_unintegrated(work) is True
+    assert runner._integration.session_unintegrated(work) is True
     # After integration the worktree is detached and merged -> nothing pending.
     runner._integrate_session_turn()
-    assert runner._session_unintegrated(work) is False
+    assert runner._integration.session_unintegrated(work) is False
 
 
 def test_session_unintegrated_flags_conflict_in_progress(tmp_path):
@@ -445,7 +445,210 @@ def test_session_unintegrated_flags_conflict_in_progress(tmp_path):
     runner = _integration_runner(main, work, base, "s1")
     # Leave a conflicting merge in progress in the worktree.
     assert work.merge(base) is False
-    assert runner._session_unintegrated(work) is True
+    assert runner._integration.session_unintegrated(work) is True
+
+
+def test_align_refuses_cross_branch_merge(tmp_path):
+    # The guard: aGiTrack must NEVER merge a branch into a worktree other than the
+    # one that worktree records as its own merge branch (the demo-video→dev bug).
+    main = _init_repo(tmp_path)
+    base = main.current_branch()
+    main.create_branch("demo-video", base)
+    info, work = _make_session(main, "s1", base)
+    AgitrackState(info.path).merge_branch = base  # this worktree merges into `base`
+
+    runner = _integration_runner(main, work, base, "s1")
+    runner.worktree = info
+    runner._base_branch = "demo-video"  # but the runner is (wrongly) on another branch
+    aligned: list = []
+    runner._integration.align_session_to_base = lambda r: aligned.append(r) or "repointed"
+    warnings: list = []
+    runner._set_message = lambda m, **k: warnings.append(m)
+
+    runner._align_session_to_base(work)
+
+    assert aligned == []  # the merge was REFUSED, not performed
+    assert any("cross-branch" in w.lower() for w in warnings)  # the user is warned
+
+
+def test_sync_idle_worktrees_aligns_each_session_to_its_own_base(tmp_path):
+    # Two sessions on different merge branches: the idle one must be aligned to ITS
+    # OWN base, never the active session's (which would merge across branches).
+    from agitrack.proxy.session import Session
+
+    main = _init_repo(tmp_path)
+    base = main.current_branch()
+    main.create_branch("demo-video", base)
+    info1, work1 = _make_session(main, "s1", base)
+    info2, work2 = _make_session(main, "s2", "demo-video", backend="test")
+
+    runner = _integration_runner(main, work2, "demo-video", "s2")  # active session merges into demo-video
+    runner.worktree = info2
+    runner.agent_in_flight = False
+
+    idle = Session.bare()
+    idle.repo = work1
+    idle.worktree = info1
+    idle.name = "s1"
+    idle._base_branch = base  # the idle session merges into `base`
+    idle.agent_in_flight = False
+    runner.sessions = [runner.active, idle]
+
+    recorded: list = []
+    runner._align_session_to_base = lambda repo: recorded.append((runner.name, runner._base_branch))
+
+    runner._sync_idle_worktrees_to_base()
+
+    # Each session was aligned with ITS OWN branch — never crossed.
+    assert ("s2", "demo-video") in recorded
+    assert ("s1", base) in recorded
+
+
+def _real_session(main, name, base, *, backend="test"):
+    # A real, idle concurrent session: its own worktree + first turn branch + the merge
+    # branch recorded in its on-disk state (what the cross-branch guard reads).
+    from agitrack.proxy.session import Session
+
+    info, work = _make_session(main, name, base, backend=backend)
+    state = AgitrackState(info.path)
+    state.backend = backend
+    state.merge_branch = base
+    session = Session.bare()
+    session.repo, session.worktree, session._base_branch = work, info, base
+    session.state, session.name = state, name
+    session.backend = type("B", (), {"name": backend})()
+    session.turn, session.merge_ctx, session.agent_in_flight = 1, None, False
+    return session, info, work
+
+
+def _concurrent_runner(main, sessions):
+    # A runner driving several real, concurrent worktree sessions (active = the first).
+    runner = make_runner(
+        base_repo=main,
+        repo=sessions[0].repo,
+        worktree=sessions[0].worktree,
+        _base_branch=sessions[0]._base_branch,
+        state=sessions[0].state,
+        name=sessions[0].name,
+        turn=1,
+        merge_ctx=None,
+        agent_in_flight=False,
+    )
+    runner.active = sessions[0]
+    runner.sessions = list(sessions)
+    runner.worktree_manager = WorktreeManager(main)
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda: None
+    runner._debug = lambda *a, **k: None
+    runner._exiting = False
+    runner._integration_paused = False
+    runner._select_popup = lambda title, options: options[0]
+    # The agent's own commit is made directly in these tests, so the commit/summary
+    # workers (which need a live backend) are no-ops here.
+    runner._commit_latest_turn_sync = lambda *a, **k: None
+    runner._service_commit_summary = lambda *a, **k: None
+    return runner
+
+
+def test_concurrent_sessions_integrate_into_their_own_branches_no_crosstalk(tmp_path):
+    # Two sessions merging into DIFFERENT branches each commit and integrate; each
+    # branch must receive ONLY its own session's work (the demo-video→dev contamination
+    # class of bug), end to end against real git.
+    main = _init_repo(tmp_path)
+    base = main.current_branch()
+    main.create_branch("dev", base)
+    a, _, aw = _real_session(main, "sessA", base)
+    b, _, bw = _real_session(main, "sessB", "dev")
+    runner = _concurrent_runner(main, [a, b])
+
+    _commit(aw, "a.txt", "from A\n", "<aGiTrack> A work")
+    _commit(bw, "b.txt", "from B\n", "<aGiTrack> B work")
+    runner.active = a
+    runner._integrate_session_turn()
+    runner.active = b
+    runner._integrate_session_turn()
+
+    main_files = {p.name for p in main.repo.iterdir() if p.is_file()}
+    main.switch("dev")
+    dev_files = {p.name for p in main.repo.iterdir() if p.is_file()}
+    main.switch(base)
+    assert "a.txt" in main_files and "b.txt" not in main_files  # main got A only
+    assert "b.txt" in dev_files and "a.txt" not in dev_files  # dev got B only
+
+
+def test_concurrent_idle_sync_really_aligns_each_to_its_own_base(tmp_path):
+    # The REAL _sync_idle_worktrees_to_base (not mocked): after both base branches gain
+    # commits out of band, each idle worktree must pick up ITS OWN base's commit and
+    # never the other's.
+    main = _init_repo(tmp_path)
+    base = main.current_branch()
+    main.create_branch("dev", base)
+    a, _, aw = _real_session(main, "sessA", base)
+    b, _, bw = _real_session(main, "sessB", "dev")
+    # Both sessions are idle and detached at their base (no own work yet).
+    aw.switch_detach(base)
+    bw.switch_detach("dev")
+    runner = _concurrent_runner(main, [a, b])
+
+    main.switch("dev")
+    _commit(main, "dev2.txt", "d2\n", "dev advance")
+    main.switch(base)
+    _commit(main, "main2.txt", "m2\n", "main advance")
+
+    runner.active = a
+    runner._sync_idle_worktrees_to_base()
+
+    assert (aw.repo / "main2.txt").exists() and not (aw.repo / "dev2.txt").exists()
+    assert (bw.repo / "dev2.txt").exists() and not (bw.repo / "main2.txt").exists()
+
+
+def test_concurrent_conflict_on_shared_base_detected_and_base_untouched(tmp_path):
+    # Two sessions on the SAME base with conflicting edits: the first integrates cleanly,
+    # the second is detected as a conflict and the base is left untouched (the merge is
+    # backed out, worktree clean).
+    main = _init_repo(tmp_path)
+    base = main.current_branch()
+    main.create_branch("dev", base)
+    c, _, cw = _real_session(main, "sessC", "dev")
+    d, _, dw = _real_session(main, "sessD", "dev")
+    runner = _concurrent_runner(main, [c, d])
+
+    _commit(cw, "shared.txt", "C version\n", "<aGiTrack> C")
+    _commit(dw, "shared.txt", "D version\n", "<aGiTrack> D")
+    runner.active = c
+    assert runner._integrate_turn_or_conflict() == "integrated"
+    dev_head = main.rev_parse("dev")
+
+    runner.active = d
+    assert runner._integrate_turn_or_conflict() == "conflict"
+    assert main.rev_parse("dev") == dev_head  # base untouched by the conflicting turn
+    assert not dw.merge_in_progress()  # the conflicted merge was backed out
+
+
+def test_concurrent_retarget_flushes_old_base_then_future_work_lands_on_new(tmp_path):
+    # Retargeting a session: its pending work flushes into the OLD branch, and a later
+    # commit integrates into the NEW branch — never leaking across.
+    main = _init_repo(tmp_path)
+    base = main.current_branch()
+    main.create_branch("feature", base)
+    a, _, aw = _real_session(main, "sessA", base)
+    runner = _concurrent_runner(main, [a])
+    runner.active = a
+
+    _commit(aw, "a.txt", "work\n", "<aGiTrack> A")
+    assert runner._retarget_active_session("feature") is True
+    assert runner._base_branch == "feature" and a.state.merge_branch == "feature"
+    assert (main.repo / "a.txt").exists()  # pending work flushed into the OLD base
+
+    # New work after the retarget integrates into feature, not main.
+    aw.switch(WorktreeManager(main).turn_branch("sessA", 2, backend="test"), create=True)
+    _commit(aw, "a2.txt", "feature work\n", "<aGiTrack> A more")
+    runner._integrate_session_turn()
+    main.switch("feature")
+    feature_files = {p.name for p in main.repo.iterdir() if p.is_file()}
+    main.switch(base)
+    assert "a2.txt" in feature_files
+    assert not (main.repo / "a2.txt").exists()  # never leaked back into main
 
 
 def test_repoint_current_to_base_detaches_at_new_base(tmp_path):
@@ -471,7 +674,7 @@ def test_repoint_current_to_base_detaches_at_new_base(tmp_path):
     assert runner.turn == 0
 
 
-def test_base_switch_candidates_excludes_agit_and_current(tmp_path):
+def test_base_switch_candidates_excludes_agitrack_and_current(tmp_path):
     main = _init_repo(tmp_path)
     base = main.current_branch()
     main.create_branch("feature", base)
@@ -482,7 +685,7 @@ def test_base_switch_candidates_excludes_agit_and_current(tmp_path):
         _base_branch=base,
     )
 
-    candidates = runner._base_switch_candidates()
+    candidates = runner._integration.base_switch_candidates()
     assert "feature" in candidates
     assert base not in candidates
     assert all(not name.startswith("agitrack/") for name in candidates)
@@ -520,29 +723,94 @@ def test_fast_forward_branch_advances_only_on_true_ff(tmp_path):
         main.fast_forward_branch("ahead", "diverged")
 
 
-def test_base_switch_keeps_session_alive(tmp_path):
-    # Regression: _perform_base_switch used the EXIT finalizer, which terminated
-    # the agent child and removed the worktree — so switching the base quit aGiTrack
-    # with an error. A base switch must keep every session running.
+def test_retarget_active_session_changes_merge_target_per_session(tmp_path):
+    # The active session's merge branch moves to the new target (its worktree
+    # re-points there); the repo directory is NOT checked out, so a session can merge
+    # into a branch other than the one in the directory.
     main = _init_repo(tmp_path)
     base = main.current_branch()
     main.create_branch("feature", base)
     info, work = _make_session(main, "s1", base)
 
     runner = _integration_runner(main, work, base, "s1")
-    runner.worktree = info  # a real WorktreeInfo so repoint + survival checks work
+    runner.worktree = info
     runner.sessions = [runner.active]
     runner._commit_latest_turn_sync = lambda: None  # no real backend to parse
-    terminated: list[bool] = []
-    runner._terminate_child = lambda *a, **k: terminated.append(True)
 
-    runner._perform_base_switch("feature")
+    ok = runner._retarget_active_session("feature")
 
+    assert ok is True
+    assert runner._base_branch == "feature"  # this session now merges into feature
+    assert runner._integration.base_branch == "feature"  # the service follows the active session
+    assert main.current_branch() == base  # the repo directory was NOT switched
+
+
+def test_each_session_has_its_own_merge_branch(tmp_path):
+    # Concurrent sessions can merge into independent branches. The single
+    # IntegrationService is re-pointed to whichever session is active, so each
+    # integrates into its own branch.
+    from agitrack.proxy.session import Session
+
+    main = _init_repo(tmp_path)
+    base = main.current_branch()
+    main.create_branch("feature", base)
+    info, work = _make_session(main, "s1", base)
+    runner = _integration_runner(main, work, base, "s1")
+    runner.sessions = [runner.active]
+    assert runner._integration.base_branch == base  # service follows the active session
+
+    s2 = Session.bare()
+    s2._base_branch = "feature"  # a second session targeting another branch
+    runner.sessions.append(s2)
+    runner.active = s2
     assert runner._base_branch == "feature"
-    assert main.current_branch() == "feature"
-    assert info.path.exists()  # worktree kept
-    assert runner.worktree is not None  # session not torn down
-    assert terminated == []  # the backend child was never killed
+    assert runner._integration.base_branch == "feature"  # the service re-points on switch
+
+    runner.active = runner.sessions[0]  # back to the first session
+    assert runner._base_branch == base
+    assert runner._integration.base_branch == base
+
+
+def test_change_session_merge_branch_menu_retargets_chosen_session(tmp_path):
+    main = _init_repo(tmp_path)
+    base = main.current_branch()
+    main.create_branch("feature", base)
+    info, work = _make_session(main, "s1", base)
+    runner = _integration_runner(main, work, base, "s1")
+    runner.worktree = info
+    runner.sessions = [runner.active]
+
+    retargeted: list = []
+    runner._retarget_active_session = lambda target: retargeted.append(target) or True
+    # Pick the (only) session, then pick "feature" as its new merge branch.
+    picks = iter([lambda title, options: options[0], lambda title, options: "feature"])
+    runner._select_popup = lambda title, options: next(picks)(title, options)
+
+    runner._change_session_merge_branch_menu()
+
+    assert retargeted == ["feature"]
+
+
+def test_prompt_new_session_base_defaults_to_dir_branch_or_picks_another(tmp_path):
+    main = _init_repo(tmp_path)
+    base = main.current_branch()
+    main.create_branch("feature", base)
+    info, work = _make_session(main, "s1", base)
+    runner = _integration_runner(main, work, base, "s1")
+    runner.worktree = info
+    runner._use_worktrees = True
+
+    # Choosing the first option keeps the directory's branch (the default base).
+    runner._select_popup = lambda title, options: options[0]
+    assert runner._prompt_new_session_base() == base
+
+    # Choosing another branch returns it (the new session merges into it).
+    runner._select_popup = lambda title, options: "feature"
+    assert runner._prompt_new_session_base() == "feature"
+
+    # Cancelling the picker returns None.
+    runner._select_popup = lambda title, options: None
+    assert runner._prompt_new_session_base() is None
 
 
 def test_log_range_lists_commits(tmp_path):

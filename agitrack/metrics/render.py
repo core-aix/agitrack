@@ -60,9 +60,9 @@ def format_dashboard(dash: Dashboard) -> str:
     shown = [(label, totals[key]) for key, label in _TOKEN_ORDER if totals.get(key)]
     if shown:
         lines.extend(f"  {label}: {value:,}" for label, value in shown)
-        efficiency = dash.lines_per_1k_output_tokens
-        if efficiency is not None:
-            lines.append(f"  efficiency: {efficiency:,.1f} AI-changed lines per 1k output tokens")
+        line_yield = dash.lines_per_1k_output_tokens
+        if line_yield is not None:
+            lines.append(f"  line yield: {line_yield:,.1f} AI-changed lines per 1k output tokens")
     else:
         lines.append("  (no token metadata recorded)")
     lines.append("")
@@ -77,20 +77,6 @@ def format_dashboard(dash: Dashboard) -> str:
         lines.append(f"  {author}: {stats['commits']:,} commits ({stats.get('agitrack_commits', 0):,} via aGiTrack)")
         lines.append(f"    AI-driven +{ai[0]:,} / -{ai[1]:,} | non-tracked +{nt[0]:,} / -{nt[1]:,}")
     lines.append("")
-
-    lines.append("Possible loops (near-identical repeated prompts)")
-    if dash.loops:
-        for loop in dash.loops:
-            prompt = loop.prompt if len(loop.prompt) <= 60 else loop.prompt[:57] + "..."
-            where = (
-                f"within commit {loop.shas[0]}"
-                if loop.within_commit
-                else f"{len(loop.shas)} commits {loop.shas[0]}..{loop.shas[-1]}"
-            )
-            tokens = f", {loop.output_tokens:,} output tokens" if loop.output_tokens else ""
-            lines.append(f'  {where}: "{prompt}"{tokens}')
-    else:
-        lines.append("  none detected")
 
     return "\n".join(lines)
 

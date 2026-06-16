@@ -204,14 +204,14 @@ def test_unknown_args_forwarded_to_backend(monkeypatch):
     assert captured["backend_args"] == ["--port", "12345"]
 
 
-def test_double_dash_forwards_agit_defined_flags_and_prompt(monkeypatch):
+def test_double_dash_forwards_agitrack_defined_flags_and_prompt(monkeypatch):
     captured = _stub_launch(monkeypatch)
     cli.main(["--backend", "claude", "--", "--verbose", "fix the bug"])
     # everything after -- goes to the backend, including a flag aGiTrack also owns
     assert captured["backend_args"] == ["--verbose", "fix the bug"]
 
 
-def test_agit_flags_still_bind_before_separator(monkeypatch):
+def test_agitrack_flags_still_bind_before_separator(monkeypatch):
     captured = _stub_launch(monkeypatch)
     cli.main(["--verbose", "--backend", "claude", "--", "--model", "opus"])
     # --verbose before -- is aGiTrack's; only post-separator args pass through

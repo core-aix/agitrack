@@ -10,6 +10,7 @@ class FakeConfig:
     def __init__(self):
         self._backend = None
         self.saved = []
+        self.summarization_model: str | None = None
 
     @property
     def default_backend(self):
@@ -94,3 +95,38 @@ def test_global_config_has_default_backend(tmp_path):
     assert config.has_default_backend() is False
     config.default_backend = "claude"
     assert GlobalConfig(tmp_path / "config.json").has_default_backend() is True
+
+
+def test_select_default_summarizer_model_saves_recommended_smallest(monkeypatch):
+    import agitrack.summaries.model_select as ms
+    from agitrack.backends.setup import select_default_summarizer_model
+
+    monkeypatch.setattr(
+        ms, "list_available_models", lambda name: ["claude-haiku-4-5-20251001", "claude-sonnet-4-6", "claude-opus-4-8"]
+    )
+    config = FakeConfig()
+    # Default (1) is the smallest (Haiku), saved as the global summarizer model.
+    select_default_summarizer_model(config, "claude", input_fn=_inputs(""), output_fn=lambda _s: None)
+    assert config.summarization_model == "claude-haiku-4-5-20251001"
+
+
+def test_select_default_summarizer_model_same_as_session(monkeypatch):
+    import agitrack.summaries.model_select as ms
+    from agitrack.backends.setup import select_default_summarizer_model
+
+    monkeypatch.setattr(ms, "list_available_models", lambda name: ["claude-haiku-4-5-20251001", "claude-sonnet-4-6"])
+    config = FakeConfig()
+    # The last option ("same as session") clears the model → None.
+    select_default_summarizer_model(config, "claude", input_fn=_inputs("3"), output_fn=lambda _s: None)
+    assert config.summarization_model is None
+
+
+def test_select_default_summarizer_model_noop_when_models_unlistable(monkeypatch):
+    import agitrack.summaries.model_select as ms
+    from agitrack.backends.setup import select_default_summarizer_model
+
+    monkeypatch.setattr(ms, "list_available_models", lambda name: [])
+    config = FakeConfig()
+    config.summarization_model = "preset"
+    select_default_summarizer_model(config, "opencode", input_fn=_inputs(), output_fn=lambda _s: None)
+    assert config.summarization_model == "preset"  # left unchanged, no prompt shown

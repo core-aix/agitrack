@@ -38,6 +38,7 @@ import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from functools import cached_property
+from pathlib import Path
 
 from agitrack.commits import METADATA_HEADER
 from agitrack.git import GitRepo
@@ -110,15 +111,6 @@ def _parse_co_authors(body: str) -> list[tuple[str, str]]:
     return out
 
 
-# Same word-overlap rule as commit_engine._same_prompt: editing artifacts and
-# rephrasings shuffle words, genuinely different prompts share few.
-_WORD_RE = re.compile(r"[a-z0-9]+")
-_SIMILARITY_THRESHOLD = 0.6
-# A prompt repeated twice is a plausible retry; three or more near-identical
-# prompts in a row suggest the conversation is going in circles.
-_LOOP_MIN_RUN = 3
-
-
 @dataclass
 class CommitStat:
     """One commit's contribution to the dashboard."""
@@ -141,7 +133,7 @@ class CommitStat:
     # so a commit credited to several people is filterable under each of them (#54).
     # The AI assistant and bot accounts are excluded — they aren't committers.
     co_authors: list[tuple[str, str]] = field(default_factory=list)
-    prompt: str = ""  # the turn's prompt text (loop detection)
+    prompt: str = ""  # the turn's prompt text (parsed from the trace)
     user_prompts: list[str] = field(default_factory=list)  # trace ## User entries
     metadata_block: str = ""  # raw `# aGiTrack Metadata` text, for duplicate detection
     message: str = ""  # the full commit message (shown when a log entry is opened)
@@ -160,23 +152,13 @@ class CommitStat:
 
 
 @dataclass
-class LoopFinding:
-    """A run of consecutive agent turns with near-identical prompts."""
-
-    shas: list[str]
-    prompt: str
-    output_tokens: int
-    within_commit: bool = False  # the same prompt repeated inside one turn's trace
-
-
-@dataclass
 class Dashboard:
     repo: str
-    branch: str
+    branch: str  # the ref this dashboard was built for (the current branch by default)
     stats: list[CommitStat]  # oldest first
-    loops: list[LoopFinding]
     sha_logins: dict[str, str] = field(default_factory=dict)  # commit SHA → GitHub login (best-effort)
     commit_base: str = ""  # GitHub commit URL prefix, or "" when no GitHub remote
+    branches: list[str] = field(default_factory=list)  # every local branch, for the per-branch view selector
 
     # --- derived aggregates -------------------------------------------------
 
@@ -202,9 +184,12 @@ class Dashboard:
 
     @property
     def ai_lines(self) -> tuple[int, int]:
-        # aGiTrack-tracked AI work: agent commits, the backend-made commits an aGiTrack
-        # cover commit accounts for (#58), and agent-resolved merges.
-        return self.lines_changed("agent", "covered", "agent-merge")
+        # aGiTrack-tracked AI work: agent commits and the backend-made commits an
+        # aGiTrack cover commit accounts for (#58). Agent-resolved merges are NOT
+        # counted here — a merge's lines can't be cleanly attributed to the AI vs the
+        # person who ran it, so they're left out of the line totals (the commits
+        # still count toward coverage and the by-kind tally).
+        return self.lines_changed("agent", "covered")
 
     @property
     def nontracked_lines(self) -> tuple[int, int]:
@@ -426,13 +411,34 @@ def resolve_committers(stats: list[CommitStat], sha_logins: dict[str, str] | Non
     for name, email, _login in contributions:
         root = union.find(("pair", name, email))
         if root_logins[root]:
-            label = sorted(root_logins[root])[0]
+            # GitHub login is the primary identity; append the person's first name
+            # (from their git author name) when we have one, e.g. "octocat (Mona)".
+            login = sorted(root_logins[root])[0]
+            first = _first_name(root_names[root], login)
+            label = f"{login} ({first})" if first else login
         elif root_names[root]:
             label = root_names[root].most_common(1)[0][0]
         else:
             label = email or "unknown"
         labels[(name, email)] = label
     return labels
+
+
+def _first_name(names: Counter[str], login: str) -> str | None:
+    """A committer's first name for display next to their GitHub login, taken from
+    their git author name. Prefers a "First Last" style name when one exists (so
+    ``Rana Waqas`` beats a bare ``waqas``); returns ``None`` when there is nothing
+    more informative than the login itself."""
+    if not names:
+        return None
+    # max() key: a name containing a space wins over one without; ties break on
+    # frequency. So a real full name is preferred over a one-word handle.
+    best = max(names, key=lambda n: (" " in n.strip(), names[n]))
+    parts = best.strip().split()
+    first = parts[0] if parts else ""
+    if not first or first.lower() == login.lower():
+        return None
+    return first
 
 
 def collect_commit_stats(repo: GitRepo, ref: str = "HEAD") -> list[CommitStat]:
@@ -535,18 +541,36 @@ def _parents(repo: GitRepo, ref: str) -> dict[str, list[str]]:
     return parents
 
 
+def _abbreviate_home(path: str) -> str:
+    """Replace a leading home-directory prefix with ``~`` so the dashboard (and
+    its public screenshot) never leaks an absolute home path."""
+    try:
+        home = Path.home()
+        rel = Path(path).relative_to(home)
+    except (ValueError, RuntimeError, OSError):
+        return path
+    return "~" if str(rel) == "." else f"~/{rel.as_posix()}"
+
+
 def build_dashboard(repo: GitRepo, ref: str = "HEAD", *, sha_logins: dict[str, str] | None = None) -> Dashboard:
     from agitrack.metrics.github import commit_url_base
 
     stats = collect_commit_stats(repo, ref)
-    branch = repo.current_branch()
+    # The branch the dashboard *shows*: the explicit ref when one is requested,
+    # otherwise whatever HEAD currently points at.
+    branch = repo.current_branch() if ref == "HEAD" else ref
+    # Every local branch feeds the per-branch view selector. Keep the shown branch
+    # in the list (and first) even if it's detached/HEAD so it's always selectable.
+    branches = repo.list_branches()
+    if branch and branch != "HEAD":
+        branches = [branch, *(b for b in branches if b != branch)]
     return Dashboard(
-        repo=str(repo.repo),
+        repo=_abbreviate_home(str(repo.repo)),
         branch=branch,
         stats=stats,
-        loops=_detect_loops(stats),
         sha_logins=sha_logins or {},
         commit_base=commit_url_base(repo),
+        branches=branches,
     )
 
 
@@ -812,66 +836,3 @@ def _apply_numstat(repo: GitRepo, ref: str, by_sha: dict[str, CommitStat]) -> No
                 current.insertions += int(match.group(1))
             if match.group(2) != "-":
                 current.deletions += int(match.group(2))
-
-
-# ---------------------------------------------------------------------------
-# Loop detection (#54): near-identical prompts burn tokens without progress
-# ---------------------------------------------------------------------------
-
-
-def _similar(a: str, b: str) -> bool:
-    """Word-overlap match, the same rule as commit_engine._same_prompt."""
-    norm_a, norm_b = " ".join(a.lower().split()), " ".join(b.lower().split())
-    if not norm_a or not norm_b:
-        return False
-    if norm_a == norm_b:
-        return True
-    words_a, words_b = set(_WORD_RE.findall(norm_a)), set(_WORD_RE.findall(norm_b))
-    if not words_a or not words_b:
-        return False
-    return len(words_a & words_b) / len(words_a | words_b) >= _SIMILARITY_THRESHOLD
-
-
-def _detect_loops(stats: list[CommitStat]) -> list[LoopFinding]:
-    findings: list[LoopFinding] = []
-
-    # Across turns: consecutive agent commits re-asking ~the same thing.
-    agents = [stat for stat in stats if stat.kind == "agent" and stat.prompt]
-    run: list[CommitStat] = []
-    for stat in agents:
-        if run and _similar(run[-1].prompt, stat.prompt):
-            run.append(stat)
-            continue
-        if len(run) >= _LOOP_MIN_RUN:
-            findings.append(_finding(run))
-        run = [stat]
-    if len(run) >= _LOOP_MIN_RUN:
-        findings.append(_finding(run))
-
-    # Within a turn: the trace shows the user repeating the same prompt.
-    for stat in stats:
-        if stat.kind != "agent" or len(stat.user_prompts) < _LOOP_MIN_RUN:
-            continue
-        longest = 1
-        current = 1
-        for previous, prompt in zip(stat.user_prompts, stat.user_prompts[1:]):
-            current = current + 1 if _similar(previous, prompt) else 1
-            longest = max(longest, current)
-        if longest >= _LOOP_MIN_RUN:
-            findings.append(
-                LoopFinding(
-                    shas=[stat.short],
-                    prompt=stat.user_prompts[0],
-                    output_tokens=stat.tokens.get("output", 0),
-                    within_commit=True,
-                )
-            )
-    return findings
-
-
-def _finding(run: list[CommitStat]) -> LoopFinding:
-    return LoopFinding(
-        shas=[stat.short for stat in run],
-        prompt=run[0].prompt,
-        output_tokens=sum(stat.tokens.get("output", 0) for stat in run),
-    )

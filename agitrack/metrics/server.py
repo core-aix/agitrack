@@ -18,7 +18,7 @@ from typing import Any
 
 from agitrack.git import GitRepo
 from agitrack.metrics.collect import Dashboard, build_dashboard
-from agitrack.metrics.github import cached_logins
+from agitrack.metrics.github import cached_logins, resolve_logins
 from agitrack.metrics.web import aggregates_payload, format_html, log_page, shared_sessions_for
 
 DEFAULT_HOST = "127.0.0.1"
@@ -44,12 +44,16 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
             query = urllib.parse.parse_qs(parsed.query)
             author, backend, model = _str(query, "author"), _str(query, "backend"), _str(query, "model")
             frm, to = _int(query, "from", 0), _int(query, "to", 0)
+            ref = self._ref(_str(query, "branch"))
             if parsed.path in ("/", "/index.html"):
-                html = format_html(self._dashboard(), shared_sessions=shared_sessions_for(self.repo))
+                # The initial paint resolves GitHub logins synchronously so committers
+                # show as their GitHub IDs from the first render — not git names that
+                # flip to IDs on the next poll. This warms the cache for those polls.
+                html = format_html(self._dashboard(ref, blocking=True), shared_sessions=shared_sessions_for(self.repo))
                 self._respond("text/html; charset=utf-8", html.encode("utf-8"))
             elif parsed.path == "/data":
                 payload = aggregates_payload(
-                    self._dashboard(),
+                    self._dashboard(ref),
                     author=author,
                     backend=backend,
                     model=model,
@@ -61,7 +65,7 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
                 self._respond("application/json", self._json(payload))
             elif parsed.path == "/log":
                 page = log_page(
-                    self._dashboard(),
+                    self._dashboard(ref),
                     author=author,
                     backend=backend,
                     model=model,
@@ -69,6 +73,7 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
                     to=to,
                     offset=_int(query, "offset", 0),
                     limit=_int(query, "limit", 50),
+                    sort=_str(query, "sort"),
                 )
                 self._respond("application/json", self._json(page))
             else:
@@ -83,11 +88,19 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
     def _json(payload: dict) -> bytes:
         return json.dumps(payload).encode("utf-8")
 
-    def _dashboard(self) -> Dashboard:
+    def _ref(self, branch: str) -> str:
+        # Only an actual local branch may be viewed: an unchecked value would be
+        # interpolated straight into ``git log <ref>``, so anything not in the
+        # branch list (an option string, a bogus name, "") falls back to HEAD.
+        return branch if branch and branch in self.repo.list_branches() else "HEAD"
+
+    def _dashboard(self, ref: str = "HEAD", *, blocking: bool = False) -> Dashboard:
         # cached_logins never blocks: it returns the cached GitHub identities (or {}
-        # when cold) and refreshes them in the background, so the first paint and every
-        # poll are fast. Resolved logins appear on a later poll. {} when gh is absent.
-        return build_dashboard(self.repo, sha_logins=cached_logins(self.repo))
+        # when cold) and refreshes them in the background, so polls stay fast. Resolved
+        # logins appear on a later poll. {} when gh is absent. The initial page render
+        # asks for blocking resolution instead, so committer IDs are right immediately.
+        logins = resolve_logins(self.repo) if blocking else cached_logins(self.repo)
+        return build_dashboard(self.repo, ref, sha_logins=logins)
 
     def _respond(self, content_type: str, body: bytes) -> None:
         self.send_response(200)

@@ -23,6 +23,13 @@ class ClaudeBackend:
             command.extend(["--resume", session_id])
         command.extend(self.backend_args)
 
+        # Sub-agents Claude spawns are recorded in their OWN transcript files, separate
+        # from the --output-format json `usage` (which covers only the main agent). Snapshot
+        # the existing sub-agent files first so only the ones THIS turn adds are counted.
+        from agitrack.transcripts import claude as claude_transcripts
+
+        prior_subagent_files = claude_transcripts.subagent_agent_files(self.repo, session_id or "")
+
         process = subprocess.run(
             command,
             cwd=self.repo,
@@ -35,6 +42,12 @@ class ClaudeBackend:
             print(process.stderr.rstrip())
 
         final_response, parsed_session_id, parsed_model, tokens = self._parse_output(process.stdout)
+        # Fold this turn's sub-agent consumption into the result (issue: subagent tokens).
+        tokens.add(
+            claude_transcripts.subagent_tokens_since(
+                self.repo, parsed_session_id or session_id or "", prior_subagent_files
+            )
+        )
         return AgentResult(
             backend=self.name,
             session_id=parsed_session_id or session_id,

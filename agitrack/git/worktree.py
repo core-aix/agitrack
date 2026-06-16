@@ -50,11 +50,11 @@ class WorktreeManager:
         return self.root / _sanitize_name(name)
 
     def turn_branch(self, name: str, turn: int, *, backend: str) -> str:
-        # Turn branches live under refs/heads/agit/<backend>/<name>/ ; there is
+        # Turn branches live under refs/heads/agitrack/<backend>/<name>/ ; there is
         # deliberately no bare parent ref (it would D/F-conflict with these).
         return f"{BRANCH_PREFIX}{_sanitize_name(backend)}/{_sanitize_name(name)}/t{turn}"
 
-    def is_agit_branch(self, branch: str) -> bool:
+    def is_agitrack_branch(self, branch: str) -> bool:
         return is_managed_branch(branch)
 
     def create(self, name: str, *, base: str) -> WorktreeInfo:
