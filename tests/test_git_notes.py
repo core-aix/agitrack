@@ -1,5 +1,5 @@
 from pathlib import Path
-from agit.git import GitRepo
+from agitrack.git import GitRepo
 
 
 def test_notes_add_and_show(tmp_path: Path) -> None:

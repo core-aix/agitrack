@@ -2,8 +2,8 @@ import subprocess
 
 import pytest
 
-from agit import cli
-from agit.git import GitRepo
+from agitrack import cli
+from agitrack.git import GitRepo
 
 
 def _has_git() -> bool:
@@ -19,7 +19,7 @@ def test_git_init_seeds_usable_repo(tmp_path):
 
     # Valid HEAD (the seed commit) so worktree setup won't choke on an unborn branch.
     assert repo.current_branch() not in ("", "HEAD")
-    # The user's pre-existing file is left untracked for aGiT's user-commit flow.
+    # The user's pre-existing file is left untracked for aGiTrack's user-commit flow.
     assert "file.txt" in repo.status_short()
 
 
@@ -42,7 +42,7 @@ def test_ensure_born_seeds_unborn_repo_and_is_idempotent(tmp_path):
 
 def test_discover_or_init_seeds_empty_initialized_repo(tmp_path, capsys):
     # A user who ran `git init` themselves (unborn HEAD) must start cleanly,
-    # leaving their own files untracked for aGiT's user-commit flow.
+    # leaving their own files untracked for aGiTrack's user-commit flow.
     subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True, check=True)
     (tmp_path / "existing.txt").write_text("mine\n", encoding="utf-8")
 
@@ -85,7 +85,7 @@ def test_discover_or_init_stops_when_user_declines(tmp_path, monkeypatch, capsys
 
     repo = cli._discover_or_init(tmp_path)
 
-    assert repo is None  # caller exits; aGiT can't run outside a git repo
+    assert repo is None  # caller exits; aGiTrack can't run outside a git repo
     assert "cannot run outside a Git repository" in capsys.readouterr().out
     assert not (tmp_path / ".git").exists()  # nothing was created
 
@@ -131,7 +131,7 @@ def _stub_launch(monkeypatch, *, use_worktrees: bool = True):
             return 0
 
     monkeypatch.setattr(cli, "ProxyRunner", Fake)
-    monkeypatch.setattr(cli, "AgitShell", Fake)
+    monkeypatch.setattr(cli, "AgitrackShell", Fake)
     _stub_repo_and_free_lock(monkeypatch)
 
     class Config:
@@ -207,14 +207,14 @@ def test_unknown_args_forwarded_to_backend(monkeypatch):
 def test_double_dash_forwards_agit_defined_flags_and_prompt(monkeypatch):
     captured = _stub_launch(monkeypatch)
     cli.main(["--backend", "claude", "--", "--verbose", "fix the bug"])
-    # everything after -- goes to the backend, including a flag aGiT also owns
+    # everything after -- goes to the backend, including a flag aGiTrack also owns
     assert captured["backend_args"] == ["--verbose", "fix the bug"]
 
 
 def test_agit_flags_still_bind_before_separator(monkeypatch):
     captured = _stub_launch(monkeypatch)
     cli.main(["--verbose", "--backend", "claude", "--", "--model", "opus"])
-    # --verbose before -- is aGiT's; only post-separator args pass through
+    # --verbose before -- is aGiTrack's; only post-separator args pass through
     assert captured["backend_args"] == ["--model", "opus"]
 
 
@@ -237,7 +237,7 @@ def test_proxy_runner_stores_backend_args(tmp_path):
     # passthrough args are stored for _spawn to append.
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
     subprocess.run(["git", "-C", str(tmp_path), "commit", "-q", "--allow-empty", "-m", "init"], check=True)
-    from agit.proxy.runner import ProxyRunner
+    from agitrack.proxy.runner import ProxyRunner
 
     runner = ProxyRunner(GitRepo(tmp_path), backend_args=["--port", "9999"])
     assert runner._backend_args == ["--port", "9999"]
@@ -247,8 +247,8 @@ def test_proxy_runner_stores_backend_args(tmp_path):
 
 
 def test_json_backends_append_backend_args():
-    from agit.backends.claude import ClaudeBackend
-    from agit.backends.opencode import OpenCodeBackend
+    from agitrack.backends.claude import ClaudeBackend
+    from agitrack.backends.opencode import OpenCodeBackend
 
     claude = ClaudeBackend("/repo", backend_args=["--max-budget-usd", "5"])
     assert claude.backend_args == ["--max-budget-usd", "5"]
@@ -449,7 +449,7 @@ def test_prompt_flag_implies_json_mode_and_passes_prompts(monkeypatch):
         def run(self):
             return None
 
-    monkeypatch.setattr(cli, "AgitShell", FakeShell)
+    monkeypatch.setattr(cli, "AgitrackShell", FakeShell)
     monkeypatch.setattr(
         cli, "ProxyRunner", lambda *a, **k: (_ for _ in ()).throw(AssertionError("proxy must not launch"))
     )
@@ -482,7 +482,7 @@ def test_prompt_flag_never_blocks_on_input_even_with_a_tty(monkeypatch):
         def run(self):
             return None
 
-    monkeypatch.setattr(cli, "AgitShell", FakeShell)
+    monkeypatch.setattr(cli, "AgitrackShell", FakeShell)
     _stub_repo_and_free_lock(monkeypatch)
 
     class Config:

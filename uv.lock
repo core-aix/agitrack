@@ -7,7 +7,7 @@ resolution-markers = [
 ]
 
 [[package]]
-name = "agit-ai"
+name = "agitrack"
 version = "0.0.4"
 source = { editable = "." }
 dependencies = [

@@ -2,23 +2,23 @@ import os
 import subprocess
 from pathlib import Path
 
-import agit.shell.runner as shell_mod
-from agit.backends.base import AgentResult, TokenUsage
-from agit.commits import AgitActions
-from agit.git import GitRepo
-from agit.git import RepoLock
-from agit.shell import AgitShell
-from agit.config import AgitState
+import agitrack.shell.runner as shell_mod
+from agitrack.backends.base import AgentResult, TokenUsage
+from agitrack.commits import AgitrackActions
+from agitrack.git import GitRepo
+from agitrack.git import RepoLock
+from agitrack.shell import AgitrackShell
+from agitrack.config import AgitrackState
 
 
 def test_declined_untracked_files_do_not_count_as_pre_agent_changes(tmp_path):
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, stdout=subprocess.PIPE)
     (tmp_path / "declined.txt").write_text("declined", encoding="utf-8")
     repo = GitRepo.discover(tmp_path)
-    state = AgitState(repo.repo)
+    state = AgitrackState(repo.repo)
     state.add_declined(["declined.txt"])
 
-    shell = AgitShell(repo)
+    shell = AgitrackShell(repo)
 
     assert shell.actions.has_pre_agent_user_changes() is False
 
@@ -27,7 +27,7 @@ def test_new_promptable_untracked_files_count_as_pre_agent_changes(tmp_path):
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, stdout=subprocess.PIPE)
     (tmp_path / "new.txt").write_text("new", encoding="utf-8")
 
-    shell = AgitShell(GitRepo.discover(tmp_path))
+    shell = AgitrackShell(GitRepo.discover(tmp_path))
 
     assert shell.actions.has_pre_agent_user_changes() is True
 
@@ -35,10 +35,10 @@ def test_new_promptable_untracked_files_count_as_pre_agent_changes(tmp_path):
 def test_second_instance_is_refused(tmp_path, monkeypatch, capsys):
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, stdout=subprocess.PIPE)
     repo = GitRepo.discover(tmp_path)
-    shell = AgitShell(repo)
+    shell = AgitrackShell(repo)
     monkeypatch.setattr(shell_mod, "ensure_installed_backend", lambda *a, **k: shell.state.backend)
-    # Another live aGiT already holds this repo's management lock.
-    holder = RepoLock(repo.repo / ".agit" / "lock")
+    # Another live aGiTrack already holds this repo's management lock.
+    holder = RepoLock(repo.repo / ".agitrack" / "lock")
     assert holder.acquire() is True
     # The prompt loop must never start when the repo is already taken.
     shell.prompt = type("P", (), {"prompt": lambda self: (_ for _ in ()).throw(AssertionError("should not prompt"))})()
@@ -83,13 +83,13 @@ def _no_input(monkeypatch):
 
 
 def _scripted_shell(tmp_path, monkeypatch, prompts):
-    monkeypatch.setenv("AGIT_CONFIG_DIR", str(tmp_path / "agit-home"))
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path / "agit-home"))
     FakeBackend.runs = []
     monkeypatch.setitem(shell_mod.BACKENDS, "claude", FakeBackend)
     monkeypatch.setattr(shell_mod, "ensure_installed_backend", lambda name, *a, **k: name)
     _no_input(monkeypatch)
     repo = GitRepo.init(tmp_path / "demo")
-    shell = AgitShell(repo, backend="claude", prompts=prompts)
+    shell = AgitrackShell(repo, backend="claude", prompts=prompts)
     shell.state.summarization_enabled = False
     return shell, repo
 
@@ -102,12 +102,12 @@ def test_scripted_prompts_commit_without_any_input(tmp_path, monkeypatch, capsys
     out = capsys.readouterr().out
     # The new file was auto-staged (no interactive review) and committed.
     assert "Staged untracked files: hello.py" in out
-    assert "Created <aGiT> commit." in out
+    assert "Created <aGiTrack> commit." in out
     log = subprocess.run(
         ["git", "-C", str(repo.repo), "log", "-1", "--format=%B"], capture_output=True, text=True
     ).stdout
-    assert log.startswith("<aGiT> write hello.py")
-    assert FakeBackend.runs == ["write hello.py"]  # ':status' is aGiT's, not the agent's
+    assert log.startswith("<aGiTrack> write hello.py")
+    assert FakeBackend.runs == ["write hello.py"]  # ':status' is aGiTrack's, not the agent's
 
 
 def test_scripted_exit_command_stops_the_script(tmp_path, monkeypatch):
@@ -123,7 +123,7 @@ def test_scripted_run_releases_the_repo_lock(tmp_path, monkeypatch):
 
     shell.run()
 
-    assert RepoLock(repo.repo / ".agit" / "lock").acquire() is True
+    assert RepoLock(repo.repo / ".agitrack" / "lock").acquire() is True
 
 
 # --- non-interactive actions fall back to safe defaults (#53) -----------------
@@ -134,7 +134,7 @@ def test_non_interactive_untracked_review_stages_everything(tmp_path, monkeypatc
     (tmp_path / "new.txt").write_text("x", encoding="utf-8")
     _no_input(monkeypatch)
 
-    actions = AgitActions(repo, AgitState(repo.repo), interactive=False)
+    actions = AgitrackActions(repo, AgitrackState(repo.repo), interactive=False)
     actions.review_untracked(include_declined=False)
 
     assert repo.has_staged_changes()
@@ -145,7 +145,7 @@ def test_non_interactive_user_commit_uses_default_message(tmp_path, monkeypatch)
     (tmp_path / "new.txt").write_text("x", encoding="utf-8")
     _no_input(monkeypatch)
 
-    actions = AgitActions(repo, AgitState(repo.repo), interactive=False)
+    actions = AgitrackActions(repo, AgitrackState(repo.repo), interactive=False)
     assert actions.create_user_commit() is True
 
     log = subprocess.run(

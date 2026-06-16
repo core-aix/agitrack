@@ -4,17 +4,17 @@ import sys
 
 import pytest
 
-from agit.proxy import sandbox
+from agitrack.proxy import sandbox
 
 
 def test_wrap_command_disabled_via_env(monkeypatch):
-    monkeypatch.setenv("AGIT_SANDBOX", "0")
+    monkeypatch.setenv("AGITRACK_SANDBOX", "0")
     command = ["claude", "--resume", "x"]
-    assert sandbox.wrap_command(command, base="/repo", worktree="/repo/.agit/worktrees/s1") is command
+    assert sandbox.wrap_command(command, base="/repo", worktree="/repo/.agitrack/worktrees/s1") is command
 
 
 def test_wrap_command_noop_when_worktree_is_base(monkeypatch, tmp_path):
-    monkeypatch.delenv("AGIT_SANDBOX", raising=False)
+    monkeypatch.delenv("AGITRACK_SANDBOX", raising=False)
     monkeypatch.setattr(sandbox, "_have_sandbox_exec", lambda: True)
     command = ["claude"]
     assert sandbox.wrap_command(command, base=str(tmp_path), worktree=str(tmp_path)) == command
@@ -22,21 +22,21 @@ def test_wrap_command_noop_when_worktree_is_base(monkeypatch, tmp_path):
 
 def test_wrap_command_noop_when_no_mechanism(monkeypatch, tmp_path):
     # bwrap/sandbox-exec both unavailable -> caller falls back to warn-on-edit.
-    monkeypatch.delenv("AGIT_SANDBOX", raising=False)
+    monkeypatch.delenv("AGITRACK_SANDBOX", raising=False)
     monkeypatch.setattr(sandbox, "_have_sandbox_exec", lambda: False)
     monkeypatch.setattr(sandbox, "_have_bwrap", lambda: False)
     base = tmp_path / "repo"
-    wt = base / ".agit" / "worktrees" / "s1"
+    wt = base / ".agitrack" / "worktrees" / "s1"
     wt.mkdir(parents=True)
     command = ["claude", "-r", "x"]
     assert sandbox.wrap_command(command, base=str(base), worktree=str(wt)) is command
 
 
 def test_wrap_command_wraps_with_sandbox_exec(monkeypatch, tmp_path):
-    monkeypatch.delenv("AGIT_SANDBOX", raising=False)
+    monkeypatch.delenv("AGITRACK_SANDBOX", raising=False)
     monkeypatch.setattr(sandbox, "_have_sandbox_exec", lambda: True)
     base = tmp_path / "repo"
-    wt = base / ".agit" / "worktrees" / "s1"
+    wt = base / ".agitrack" / "worktrees" / "s1"
     wt.mkdir(parents=True)
     wrapped = sandbox.wrap_command(["claude", "-r", "x"], base=str(base), worktree=str(wt))
     assert wrapped[0] == "sandbox-exec" and wrapped[1] == "-p"
@@ -48,12 +48,12 @@ def test_wrap_command_wraps_with_sandbox_exec(monkeypatch, tmp_path):
 
 def test_wrap_command_wraps_with_bwrap(monkeypatch, tmp_path):
     # No sandbox-exec (Linux), bwrap usable -> bubblewrap prefix.
-    monkeypatch.delenv("AGIT_SANDBOX", raising=False)
+    monkeypatch.delenv("AGITRACK_SANDBOX", raising=False)
     monkeypatch.setattr(sandbox, "_have_sandbox_exec", lambda: False)
     monkeypatch.setattr(sandbox, "_have_bwrap", lambda: True)
     base = tmp_path / "repo"
     (base / ".git").mkdir(parents=True)
-    wt = base / ".agit" / "worktrees" / "s1"
+    wt = base / ".agitrack" / "worktrees" / "s1"
     wt.mkdir(parents=True)
     wrapped = sandbox.wrap_command(["claude", "-r", "x"], base=str(base), worktree=str(wt))
     assert wrapped[0] == "bwrap"
@@ -63,7 +63,7 @@ def test_wrap_command_wraps_with_bwrap(monkeypatch, tmp_path):
 
 def test_build_profile_denies_siblings_allows_this_worktree(tmp_path):
     base = tmp_path / "repo"
-    root = base / ".agit" / "worktrees"
+    root = base / ".agitrack" / "worktrees"
     (root / "s1").mkdir(parents=True)
     profile = sandbox.build_profile(str(base), str(root / "s1"))
     lines = profile.splitlines()
@@ -78,7 +78,7 @@ def test_build_profile_denies_siblings_allows_this_worktree(tmp_path):
 def test_build_bwrap_command_orders_binds(tmp_path):
     base = tmp_path / "repo"
     (base / ".git").mkdir(parents=True)
-    wt = base / ".agit" / "worktrees" / "s1"
+    wt = base / ".agitrack" / "worktrees" / "s1"
     wt.mkdir(parents=True)
     args = sandbox.build_bwrap_command(str(base), str(wt))
     assert args[0] == "bwrap"
@@ -98,8 +98,8 @@ def test_build_bwrap_command_orders_binds(tmp_path):
 def test_sandbox_exec_blocks_base_and_siblings_allows_self(tmp_path):
     base = tmp_path / "repo"
     (base / ".git").mkdir(parents=True)
-    s1 = base / ".agit" / "worktrees" / "s1"
-    s2 = base / ".agit" / "worktrees" / "s2"
+    s1 = base / ".agitrack" / "worktrees" / "s1"
+    s2 = base / ".agitrack" / "worktrees" / "s2"
     s1.mkdir(parents=True)
     s2.mkdir(parents=True)
     profile = sandbox.build_profile(str(base), str(s1))
@@ -133,8 +133,8 @@ def test_sandbox_exec_blocks_base_and_siblings_allows_self(tmp_path):
 def test_bwrap_blocks_base_and_siblings_allows_self(tmp_path):
     base = tmp_path / "repo"
     (base / ".git").mkdir(parents=True)
-    s1 = base / ".agit" / "worktrees" / "s1"
-    s2 = base / ".agit" / "worktrees" / "s2"
+    s1 = base / ".agitrack" / "worktrees" / "s1"
+    s2 = base / ".agitrack" / "worktrees" / "s2"
     s1.mkdir(parents=True)
     s2.mkdir(parents=True)
     prefix = sandbox.build_bwrap_command(str(base), str(s1))

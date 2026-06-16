@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# aGiT demo (#53): set up a brand-new repository, let an agent write a small
-# program through aGiT, and have aGiT commit every step with the full
+# aGiTrack demo (#53): set up a brand-new repository, let an agent write a small
+# program through aGiTrack, and have aGiTrack commit every step with the full
 # interaction trace and metadata in the commit messages.
 #
 #   scripts/demo.sh                          # uses claude
 #   scripts/demo.sh --backend opencode
 #   scripts/demo.sh --backend claude --model haiku
 #
-# The demo drives aGiT's scripted JSON mode (`agit --prompt ...`), which runs
+# The demo drives aGiTrack's scripted JSON mode (`agitrack --prompt ...`), which runs
 # each prompt headlessly (`claude -p` / `opencode run`) and commits after each
 # one. The demo repository is left behind so you can inspect the history or
 # keep going interactively.
@@ -51,19 +51,19 @@ if ! command -v "$BACKEND" >/dev/null 2>&1; then
 fi
 
 # Prefer the checkout this script lives in (so the demo always runs the local
-# code); fall back to an installed `agit`.
+# code); fall back to an installed `agitrack`.
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 if command -v uv >/dev/null 2>&1 && [ -f "$ROOT/pyproject.toml" ]; then
-    AGIT=(uv run --project "$ROOT" agit)
-elif command -v agit >/dev/null 2>&1; then
-    AGIT=(agit)
+    AGITRACK=(uv run --project "" agitrack)
+elif command -v agitrack >/dev/null 2>&1; then
+    AGITRACK=(agitrack)
 else
-    echo "Neither uv (to run the checkout) nor an installed 'agit' was found." >&2
+    echo "Neither uv (to run the checkout) nor an installed 'agitrack' was found." >&2
     exit 1
 fi
 
 if [ -z "$DEMO_DIR" ]; then
-    DEMO_DIR="$(mktemp -d "${TMPDIR:-/tmp}/agit-demo.XXXXXX")"
+    DEMO_DIR="$(mktemp -d "${TMPDIR:-/tmp}/agitrack-demo.XXXXXX")"
 else
     mkdir -p "$DEMO_DIR"
 fi
@@ -72,20 +72,20 @@ echo "==> Setting up a fresh repository in $DEMO_DIR"
 git init -q "$DEMO_DIR"
 # Commits need an identity; provide one locally if git has none configured.
 git -C "$DEMO_DIR" config user.name >/dev/null 2>&1 || {
-    git -C "$DEMO_DIR" config user.name "aGiT Demo"
-    git -C "$DEMO_DIR" config user.email "demo@agit.invalid"
+    git -C "$DEMO_DIR" config user.name "aGiTrack Demo"
+    git -C "$DEMO_DIR" config user.email "demo@agitrack.invalid"
 }
 
-# Keep the demo self-contained: aGiT's global config (default backend,
-# summarizer scratch space) lives in a throwaway directory, not in ~/.agit.
+# Keep the demo self-contained: aGiTrack's global config (default backend,
+# summarizer scratch space) lives in a throwaway directory, not in ~/.agitrack.
 # It must sit OUTSIDE the demo repository or it would show up as untracked
 # user changes there.
-AGIT_HOME="$(mktemp -d "${TMPDIR:-/tmp}/agit-demo-home.XXXXXX")"
-export AGIT_CONFIG_DIR="$AGIT_HOME"
-trap 'rm -rf "$AGIT_HOME"' EXIT
+AGITRACK_HOME="$(mktemp -d "${TMPDIR:-/tmp}/agitrack-demo-home.XXXXXX")"
+export AGITRACK_CONFIG_DIR="$AGITRACK_HOME"
+trap 'rm -rf "$AGITRACK_HOME"' EXIT
 
 # Headless Claude needs permission to edit files; OpenCode's run mode edits by
-# default. The flag is passed through aGiT verbatim to the backend CLI.
+# default. The flag is passed through aGiTrack verbatim to the backend CLI.
 BACKEND_ARGS=()
 if [ "$BACKEND" = "claude" ]; then
     BACKEND_ARGS+=(--permission-mode acceptEdits)
@@ -104,19 +104,19 @@ fizzbuzz function in fizzbuzz.py, covering a multiple of 3, a multiple of 5, \
 a multiple of 15, and a plain number. Create only this file and do not run \
 any shell commands."
 
-echo "==> Running the $BACKEND agent through aGiT (each prompt becomes a commit)"
-"${AGIT[@]}" --repo "$DEMO_DIR" --backend "$BACKEND" --new-session \
+echo "==> Running the $BACKEND agent through aGiTrack (each prompt becomes a commit)"
+"${AGITRACK[@]}" --repo "$DEMO_DIR" --backend "$BACKEND" --new-session \
     --prompt "$PROMPT_1" \
     --prompt "$PROMPT_2" \
     --prompt ":status" \
     ${BACKEND_ARGS[@]+"${BACKEND_ARGS[@]}"}
 
 echo
-echo "==> Commit history aGiT created"
+echo "==> Commit history aGiTrack created"
 git -C "$DEMO_DIR" log --oneline
 
 echo
-echo "==> Full message of the latest <aGiT> commit (prompts, trace, metadata)"
+echo "==> Full message of the latest <aGiTrack> commit (prompts, trace, metadata)"
 git -C "$DEMO_DIR" log -1 --format=%B
 
 if command -v python3 >/dev/null 2>&1 && [ -f "$DEMO_DIR/fizzbuzz.py" ]; then
@@ -132,4 +132,4 @@ fi
 echo
 echo "Demo repository kept at: $DEMO_DIR"
 echo "Explore it (git log shows the full interaction history), or continue"
-echo "interactively with:  ${AGIT[*]} --repo $DEMO_DIR"
+echo "interactively with:  ${AGITRACK[*]} --repo $DEMO_DIR"

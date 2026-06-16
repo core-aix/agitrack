@@ -1,9 +1,9 @@
 import pytest
 
-import agit.backends.setup as bs
-from agit.backends.setup import BackendUnavailable, ensure_installed_backend, select_default_backend
-from agit.backends.proxy_agents import available_backends
-from agit.config import GlobalConfig
+import agitrack.backends.setup as bs
+from agitrack.backends.setup import BackendUnavailable, ensure_installed_backend, select_default_backend
+from agitrack.backends.proxy_agents import available_backends
+from agitrack.config import GlobalConfig
 
 
 class FakeConfig:

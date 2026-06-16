@@ -12,7 +12,7 @@ import time
 
 import pytest
 
-from agit.proxy.process import BackendProcess
+from agitrack.proxy.process import BackendProcess
 
 
 # ---------------------------------------------------------------------------
@@ -190,11 +190,11 @@ def test_resize_is_noop_when_master_fd_is_none():
 
 
 # ---------------------------------------------------------------------------
-# Re-export from agit.proxy
+# Re-export from agitrack.proxy
 # ---------------------------------------------------------------------------
 
 
 def test_backendprocess_importable_from_agit_proxy():
-    from agit.proxy import BackendProcess as BP  # noqa: F401
+    from agitrack.proxy import BackendProcess as BP  # noqa: F401
 
     assert BP is BackendProcess

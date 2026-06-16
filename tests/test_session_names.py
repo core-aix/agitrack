@@ -1,4 +1,4 @@
-from agit.proxy.session_names import SESSION_WORDS, random_session_name
+from agitrack.proxy.session_names import SESSION_WORDS, random_session_name
 
 
 def test_wordlist_is_clean_and_sane():
