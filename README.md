@@ -32,7 +32,7 @@ Run in the current repository:
 agitrack
 ```
 
-By default, `agitrack` runs in proxy mode: it launches the real backend TUI (OpenCode or Claude) in a pseudo-terminal, renders it through an internal terminal screen, and reserves a bottom status line for aGiTrack showing the session (and the base branch it merges into), the backend, the summarizer state, and the repository the agent is working on (the base repository path, home-abbreviated and elided from the left when space is tight). Press `Ctrl-G` to enter aGiTrack command mode (configurable via `menu_key` in `~/.agitrack/config.json` — see Configuration).
+By default, `agitrack` runs in proxy mode: it launches the real backend TUI (OpenCode or Claude) in a pseudo-terminal, renders it through an internal terminal screen, and reserves a bottom status line for aGiTrack showing the session (and the branch it merges into — shown **bold** when that branch differs from the one checked out in the repo directory), the backend, the summarizer state, and the repository the agent is working on (the base repository path, home-abbreviated and elided from the left when space is tight). Press `Ctrl-G` to enter aGiTrack command mode (configurable via `menu_key` in `~/.agitrack/config.json` — see Configuration).
 
 Run against another repository:
 
@@ -71,7 +71,7 @@ In proxy mode (default), press `Ctrl-G`, then type one of these aGiTrack command
 session                   switch / start (own worktree) / stop a live session
 agent-backend             switch backend (opencode|claude); shows a picker
 summarizer                toggle summarization on/off, set model, show status
-git-base-branch           switch the branch sessions integrate into
+git-base-branch           change the branch THIS session merges into
 git-unstaged              show intentionally unstaged files
 git-user-commit           create a user commit
 update                    check for / install an aGiTrack self-update
@@ -142,15 +142,24 @@ Use the `session` command to start a new session, switch the tracked session to 
 
 ### Worktrees and branches
 
-To let sessions run without stepping on each other or on your working tree, each aGiTrack session runs in its own git worktree under `.agitrack/worktrees/<name>`, created *detached* at the base branch — a session has no branch of its own. Work within a session is committed on per-turn branches named `agitrack/<backend>/<name>/t<turn>`, created lazily on the first commit of each turn; once a turn is integrated its branch is deleted and the worktree is detached at the new base again. All aGiTrack-managed branches live under the `agitrack/` prefix so they are easy to recognize for cleanup and never collide with your own branches.
+To let sessions run without stepping on each other or on your working tree, each aGiTrack session runs in its own git worktree under `.agitrack/worktrees/<name>`, created *detached* at its merge branch — a session has no branch of its own. Work within a session is committed on per-turn branches named `agitrack/<backend>/<name>/t<turn>`, created lazily on the first commit of each turn; once a turn is integrated its branch is deleted and the worktree is detached at the merge branch again. All aGiTrack-managed branches live under the `agitrack/` prefix so they are easy to recognize for cleanup and never collide with your own branches.
 
-The base working tree (the branch you launched from) is only ever advanced by **integration**: aGiTrack merges a session's pending commits back into the base branch rather than committing onto it directly. A single-writer lock ensures only one aGiTrack process auto-commits or integrates at a time, so concurrent sessions stay consistent.
+A session's branch is only ever advanced by **integration**: aGiTrack merges a session's pending commits back into its merge branch rather than committing onto it directly. A single-writer lock ensures only one aGiTrack process auto-commits or integrates at a time, so concurrent sessions stay consistent.
+
+#### Per-session merge branches
+
+Each session has its **own** merge destination, independent of the other sessions and of the branch checked out in your repo directory — so you can run concurrent sessions that land on different branches (e.g. one on `main`, one on `feature-x`) without ever switching your working directory.
+
+- **Choosing a branch for a new session.** When you start a new session (`Ctrl-G → + New session`), aGiTrack asks which branch its changes should merge into. The default is the branch checked out in your repo directory ("the base branch"); pick another to point that session elsewhere. aGiTrack does **not** check that branch out in your directory — it advances the branch's ref directly via fast-forward, so your working tree stays put.
+- **Status bar emphasis.** The status line shows `session → branch`. When a session merges into a branch *different* from the one checked out in your repo directory, that branch name is shown in **bold**, so it's obvious at a glance that the changes are landing somewhere other than your current directory. The emphasis updates automatically when you check out a different branch in the directory.
+- **Staying in sync.** Whenever the repo directory's branch changes (you `git checkout` something else), and whenever you switch sessions, aGiTrack asks — only if the active session's merge branch differs from the directory's branch — where that session's changes should merge: into the directory's current branch, or keep its own. Picking the directory's branch re-points the session there (flushing its pending work into the old branch first).
+- **Changing a session's merge branch.** `Ctrl-G → git-base-branch` changes the active session's merge branch; `Ctrl-G → session → ⤳ Change a session's merge branch` does it for **any** session. In both cases the session keeps running and only that session is affected.
 
 ### Integration and startup recovery
 
-When a session's commits are merged into the base branch and the merge has conflicts, the agent backend resolves them, and the resolution is recorded as an `<aGiTrack-merge>` commit listing the base commits it was resolved against.
+When a session's commits are merged into its merge branch and the merge has conflicts, the agent backend resolves them, and the resolution is recorded as an `<aGiTrack-merge>` commit listing the base commits it was resolved against.
 
-On startup, aGiTrack reconciles worktrees left behind by previous runs: it integrates any pending commits into the base branch and then deletes the worktree. Worktrees that cannot be integrated cleanly (a conflict, or uncommitted changes) are kept so no work is lost. The backend conversation itself persists (keyed by the worktree path) and stays resumable.
+On startup, aGiTrack reconciles worktrees left behind by previous runs: it integrates any pending commits into the merge branch and then deletes the worktree. Worktrees that cannot be integrated cleanly (a conflict, or uncommitted changes) are kept so no work is lost. The backend conversation itself persists (keyed by the worktree path) and stays resumable.
 
 ### Commit message format
 

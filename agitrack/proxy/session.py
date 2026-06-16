@@ -45,6 +45,10 @@ class Session:
         "worktree",
         "turn",
         "merge_ctx",
+        # The branch this session integrates ("merges") its work into. Per-session
+        # so concurrent sessions can target independent branches, decoupled from the
+        # branch checked out in the repo directory.
+        "_base_branch",
         # child process / screen
         "child_pid",
         "master_fd",
@@ -199,4 +203,5 @@ class Session:
             "sel_point": None,
             "turn": 0,
             "merge_ctx": None,
+            "_base_branch": None,
         }
