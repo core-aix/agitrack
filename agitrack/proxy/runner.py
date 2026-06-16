@@ -486,6 +486,7 @@ class ProxyRunner:
         self.host_bg_value: bytes | None = None
         self.host_palette: dict[bytes, bytes] = {}
         self.host_da: bytes | None = None
+        self.host_kitty_keyboard: bool = False
         self.color_mode = detect_color_mode()
         # Single-writer management: only one aGiTrack may auto-commit/merge in a
         # working tree. A second instance is refused at startup (see `run`).
@@ -714,6 +715,7 @@ class ProxyRunner:
                 "host_bg_value": None,
                 "host_palette": {},
                 "host_da": None,
+                "host_kitty_keyboard": False,
                 "color_mode": "truecolor",
                 "management_lock": None,
                 "base_repo": None,
@@ -4801,7 +4803,13 @@ class ProxyRunner:
         # for — Shift+Enter et al. arrive on stdin already encoded and are
         # forwarded to the backend like any other input.
         for match in _KEYBOARD_PROTO_RE.finditer(output):
-            os.write(sys.stdout.fileno(), match.group(0))
+            seq = match.group(0)
+            # Kitty-protocol sequences end in ``u``; only mirror them to a host that
+            # speaks the protocol, or they leak as visible codes (the modifyOtherKeys
+            # ``...m`` form is an ordinary CSI any terminal consumes, so always mirror it).
+            if seq.endswith(b"u") and not self.host_kitty_keyboard:
+                continue
+            os.write(sys.stdout.fileno(), seq)
 
     def _detect_host_terminal(self) -> None:
         # Pre-reactor: called once during run() startup, before _loop() starts.
@@ -4818,6 +4826,10 @@ class ProxyRunner:
         # Proactively enable the kitty keyboard protocol for shift-modified menu keys.
         # This allows Ctrl+Shift+<letter> to be distinguished from Ctrl+<letter>.
         # The protocol is: CSI > flags u, where flags=1 means "disambiguate escape codes"
+        if not self.host_kitty_keyboard:
+            # The host doesn't speak the protocol; sending CSI > 1 u would just leak
+            # as a visible code at startup without enabling anything.
+            return
         try:
             os.write(sys.stdout.fileno(), b"\x1b[>1u")
             self._kitty_keyboard_enabled = True

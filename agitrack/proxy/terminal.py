@@ -31,6 +31,7 @@ class TerminalHostState(Protocol):
     host_bg_value: bytes | None
     host_palette: dict[bytes, bytes]
     host_da: bytes | None
+    host_kitty_keyboard: bool
 
     def set_raw(self) -> None: ...
     def set_cooked(self) -> None: ...
@@ -60,6 +61,11 @@ class TerminalHost:
         self.host_bg_value: bytes | None = None
         self.host_palette: dict[bytes, bytes] = {}
         self.host_da: bytes | None = None
+        # Whether the host terminal supports the kitty keyboard protocol (it
+        # answered the ``CSI ? u`` query). Terminals that don't (e.g. the raw
+        # Linux console, some minimal Ubuntu setups) must NOT be sent the
+        # protocol's push/pop sequences — they leak as visible text.
+        self.host_kitty_keyboard: bool = False
 
     # ------------------------------------------------------------------
     # Terminal mode
@@ -123,15 +129,19 @@ class TerminalHost:
         # focus reporting, bracketed paste, alternate-scroll, cursor visibility,
         # and styling. Emit this independently from cooked-mode restoration so it
         # can also run from signal handlers before Python exits.
-        os.write(
-            sys.stdout.fileno(),
+        reset = bytearray(
             b"\x1b[?9l\x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l\x1b[?1004l"
             b"\x1b[?1005l\x1b[?1006l\x1b[?1007l\x1b[?1015l\x1b[?1016l\x1b[?2004l"
-            # Undo any keyboard-protocol state mirrored for the backend: pop the
-            # kitty flags and switch modifyOtherKeys off.
-            b"\x1b[<u\x1b[>4;0m"
-            b"\x1b[?25h\x1b[0m",
         )
+        # Pop any kitty keyboard flags we mirrored for the backend — but ONLY on a
+        # host that speaks the protocol. Sending ``CSI < u`` to a terminal that
+        # doesn't understand it leaks as a stray visible code at exit (the raw Linux
+        # console / some Ubuntu setups). modifyOtherKeys off is left unconditional —
+        # it's an xterm sequence terminals consume as an ordinary CSI.
+        if getattr(self, "host_kitty_keyboard", False):
+            reset += b"\x1b[<u"
+        reset += b"\x1b[>4;0m\x1b[?25h\x1b[0m"
+        os.write(sys.stdout.fileno(), bytes(reset))
 
     # ------------------------------------------------------------------
     # Terminal size
@@ -156,6 +166,7 @@ class TerminalHost:
         queries = bytearray(b"\x1b]10;?\x07\x1b]11;?\x07")
         for index in range(16):
             queries += b"\x1b]4;%d;?\x07" % index
+        queries += b"\x1b[?u"  # kitty keyboard protocol query (answered only if supported)
         queries += b"\x1b[c"  # primary device attributes; also a response sentinel
         try:
             os.write(sys.stdout.fileno(), bytes(queries))
@@ -178,6 +189,12 @@ class TerminalHost:
             if re.search(rb"\x1b\[\?[0-9;]*c", bytes(buffer)):
                 break
         self.parse_host_terminal_responses(bytes(buffer), debug_fn=debug_fn)
+        # Drop any response bytes still queued (a slow/extra reply that arrived after
+        # the DA sentinel) so they don't leak into the session as visible hex codes.
+        try:
+            termios.tcflush(stdin_fd, termios.TCIFLUSH)
+        except (termios.error, OSError, ValueError):
+            pass
 
     def parse_host_terminal_responses(self: TerminalHostState, data: bytes, *, debug_fn=None) -> None:
         if not data:
@@ -193,10 +210,14 @@ class TerminalHost:
         da = re.search(rb"\x1b\[\?[0-9;]*c", data)
         if da:
             self.host_da = da.group(0)
+        # A ``CSI ? <flags> u`` reply means the host speaks the kitty keyboard
+        # protocol (distinct from the DA reply above, which ends in ``c``).
+        if re.search(rb"\x1b\[\?[0-9;]*u", data):
+            self.host_kitty_keyboard = True
         if debug_fn:
             debug_fn(
                 f"host terminal fg={self.host_fg_value!r} bg={self.host_bg_value!r} "
-                f"palette={len(self.host_palette)} da={self.host_da!r}"
+                f"palette={len(self.host_palette)} da={self.host_da!r} kitty={self.host_kitty_keyboard}"
             )
 
     # ------------------------------------------------------------------
