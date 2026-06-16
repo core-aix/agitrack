@@ -3682,29 +3682,57 @@ def test_deferred_merge_prompt_waits_until_run_merged_into_base():
     assert runner._pending_merge_prompt is False
 
 
-def test_deferred_merge_prompt_not_swallowed_by_aligned_session():
-    # The deferred-prompt flag is runner-level. If it's deferred while one session runs,
-    # switching to a DIFFERENT session that's already aligned with the dir branch must not
-    # silently clear it — it stays pending until the diverged session is foreground+idle.
-    runner = _merge_drift_runner("feature-x", choice="Switch only 's1' to 'feature-x'")
-    runner.agent_in_flight = True
-    runner._check_base_branch_drift()  # dir moved mid-run → deferred
-    assert runner._pending_merge_prompt is True and runner.popups == []
+def test_deferred_merge_prompt_is_per_session():
+    # The deferred-prompt flag is PER-SESSION. A prompt deferred while session A runs is
+    # never swallowed (or double-asked) by switching to a different, already-aligned
+    # session B — each session carries its own flag.
+    from agitrack.proxy.session import Session
 
-    # Now idle, but the active session already merges into the dir branch (aligned).
-    runner.agent_in_flight = False
-    runner._base_branch = "feature-x"
+    runner = _merge_drift_runner("feature-x", choice="Switch only 's1' to 'feature-x'")
+    a = runner.active
+    b = Session.bare()
+    b._base_branch = "feature-x"  # B already merges into the dir branch (aligned)
+    runner.sessions = [a, b]
+
+    # A defers a prompt while running.
+    a.agent_in_flight = True
+    runner._check_base_branch_drift()
+    assert a._pending_merge_prompt is True and runner.popups == []
+
+    # Switch to B (idle, aligned): nothing is asked, B has no pending prompt, and A's
+    # deferral is untouched on A's own flag.
+    runner.active = b
+    b.agent_in_flight = False
     runner._base_drift_check_at = 0.0
     runner._check_base_branch_drift()
-    assert runner._pending_merge_prompt is True  # NOT swallowed
-    assert runner.popups == []  # nothing to ask for the aligned session
+    assert runner.popups == []
+    assert b._pending_merge_prompt is False
+    assert a._pending_merge_prompt is True  # A's deferral survives
 
-    # Back on the diverged, idle session: the prompt finally fires.
-    runner._base_branch = "dev"
+    # Back on A (idle, merged, still diverged): A's deferred prompt finally fires.
+    runner.active = a
+    a.agent_in_flight = False
     runner._base_drift_check_at = 0.0
     runner._check_base_branch_drift()
     assert runner.popups  # asked at last
-    assert runner._pending_merge_prompt is False
+    assert a._pending_merge_prompt is False
+
+
+def test_deferred_merge_prompt_dropped_when_dir_returns_to_session_branch():
+    # If, after a run defers a prompt, the directory is checked back onto the session's
+    # OWN branch, the deferral is moot and is dropped without asking (using the fresh dir
+    # branch, not a stale cached one).
+    runner = _merge_drift_runner("feature-x", choice="Switch only 's1' to 'feature-x'")
+    runner.agent_in_flight = True
+    runner._check_base_branch_drift()  # dir → feature-x mid-run → deferred
+    assert runner._pending_merge_prompt is True
+
+    runner.agent_in_flight = False
+    runner.base_repo.current_branch = lambda: "dev"  # user checks the dir back to 'dev'
+    runner._base_drift_check_at = 0.0
+    runner._check_base_branch_drift()
+    assert runner._pending_merge_prompt is False  # dropped — back in sync
+    assert runner.popups == []  # nothing asked
 
 
 def test_retarget_active_session_refused_while_running():
