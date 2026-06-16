@@ -41,8 +41,18 @@ class OpenCodeBackend:
             stderr=subprocess.STDOUT,
             stdout=subprocess.PIPE,
         )
-        final_response, parsed_session_id, parsed_model, tokens = self._read_events(process.stdout)
+        child_ids: set[str] = set()
+        final_response, parsed_session_id, parsed_model, tokens = self._read_events(process.stdout, child_ids=child_ids)
         exit_code = process.wait()
+        # Sub-agents (the `task` tool) run in their OWN child sessions, absent from this
+        # run's token totals. The child session ids streamed through the events above;
+        # export each and fold its consumption in (issue: subagent tokens).
+        if child_ids:
+            from agitrack.transcripts.opencode import _subagent_tokens_for_session
+
+            visited: set[str] = set()
+            for child_id in child_ids:
+                tokens.add(_subagent_tokens_for_session(self.repo, child_id, visited))
 
         return AgentResult(
             backend=self.name,
@@ -53,7 +63,9 @@ class OpenCodeBackend:
             tokens=tokens,
         )
 
-    def _read_events(self, output: IO[str] | None) -> tuple[str, str | None, str | None, TokenUsage]:
+    def _read_events(
+        self, output: IO[str] | None, *, child_ids: set[str] | None = None
+    ) -> tuple[str, str | None, str | None, TokenUsage]:
         if output is None:
             return "", None, None, TokenUsage()
 
@@ -62,6 +74,8 @@ class OpenCodeBackend:
         model = None
         tokens = TokenUsage()
         for line in output:
+            if child_ids is not None:
+                self._collect_child_session_ids(line, child_ids)
             parsed = self._parse_event_line(line)
             if parsed is None:
                 if self.verbose and line.strip():
@@ -78,6 +92,18 @@ class OpenCodeBackend:
                 final_parts.append(final_text)
 
         return "".join(final_parts).strip(), session_id, model, tokens
+
+    def _collect_child_session_ids(self, line: str, sink: set[str]) -> None:
+        # A `task` sub-agent tool event streams the child session id in its part's
+        # state.metadata; capture it so run() can export the child and count its tokens.
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            return
+        part = event.get("part") if isinstance(event, dict) else None
+        from agitrack.transcripts.opencode import _task_child_session_ids
+
+        sink.update(_task_child_session_ids([part] if isinstance(part, dict) else []))
 
     def _split_slash_command(self, prompt: str) -> tuple[str | None, list[str]]:
         parts = prompt[1:].strip().split()
