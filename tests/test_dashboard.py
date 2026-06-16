@@ -90,7 +90,7 @@ def _demo_repo(tmp_path: Path) -> GitRepo:
     return repo
 
 
-def test_agit_integration_merge_is_classified_as_ops_not_untracked(tmp_path):
+def test_agitrack_integration_merge_is_classified_as_ops_not_untracked(tmp_path):
     repo = GitRepo.init(tmp_path)
     # aGiTrack's own auto-merge bringing base into a session turn branch.
     repo._run(
@@ -251,7 +251,7 @@ def test_render_dashboard_contains_all_sections(tmp_path):
         "By backend",
         "By model",
         "By committer",
-        "Possible loops",
+        "Efficiency suggestions",
     ):
         assert heading in text
     assert "aGiTrack-tracked commits: 5/7" in text
@@ -315,8 +315,8 @@ def test_resolve_committers_bridges_personal_and_noreply_via_login():
     labels = resolve_committers(stats)
     # Same GitHub login across a personal email and a no-reply address (the
     # personal email's local-part matches the login) → one identity, labelled
-    # with the login.
-    assert set(labels.values()) == {"octodev"}
+    # with the login plus the person's first name from their git author name.
+    assert set(labels.values()) == {"octodev (Dev)"}
 
 
 def test_resolve_committers_merges_same_name_across_two_emails():
@@ -340,9 +340,25 @@ def test_resolve_committers_keeps_distinct_people_apart():
 def test_resolve_committers_uses_github_logins_when_provided():
     a = _person("Pat", "pat@personal.test")
     b = _person("Patricia Example", "pat.example@work.test")
-    # gh maps both commits to the same login despite unrelated names/emails.
+    # gh maps both commits to the same login despite unrelated names/emails; the
+    # label is the login with the first name (preferring the "First Last" variant).
     labels = resolve_committers([a, b], {a.sha: "patexample", b.sha: "patexample"})
-    assert set(labels.values()) == {"patexample"}
+    assert set(labels.values()) == {"patexample (Patricia)"}
+
+
+def test_committer_label_omits_first_name_when_it_just_repeats_the_login():
+    # When the only git name IS the login (no separate human first name), the label
+    # is the bare login — no redundant "octocat (octocat)".
+    a = _person("octocat", "octocat@personal.test")
+    labels = resolve_committers([a], {a.sha: "octocat"})
+    assert set(labels.values()) == {"octocat"}
+
+
+def test_committer_label_without_a_login_is_just_the_name():
+    # No GitHub login resolvable → fall back to the most frequent git name, with no
+    # parenthetical (the name is already the primary identity).
+    labels = resolve_committers([_person("Sam Sample", "sam@sample.test")])
+    assert set(labels.values()) == {"Sam Sample"}
 
 
 # --- co-author trailers (multiple committers per commit, #54) ------------------
@@ -366,7 +382,7 @@ def test_parse_co_authors_extracts_humans_and_drops_ai_and_bots():
 
 
 def _co_authored_dashboard(subject: str):
-    from agitrack.metrics.collect import Dashboard, _detect_loops
+    from agitrack.metrics.collect import Dashboard, _efficiency_suggestions
 
     stat = CommitStat(
         sha="s1",
@@ -377,7 +393,7 @@ def _co_authored_dashboard(subject: str):
         timestamp=1_700_000_000,
         co_authors=[("Robin Roe", "robin@example.com")],
     )
-    return Dashboard(repo="r", branch="main", stats=[stat], loops=_detect_loops([stat])), stat
+    return Dashboard(repo="r", branch="main", stats=[stat], suggestions=_efficiency_suggestions([stat])), stat
 
 
 def test_co_authored_commit_is_filterable_under_every_committer():
@@ -394,7 +410,7 @@ def test_co_authored_commit_is_filterable_under_every_committer():
 
 
 def test_bot_and_ai_primary_authors_are_not_committers():
-    from agitrack.metrics.collect import Dashboard, _detect_loops
+    from agitrack.metrics.collect import Dashboard, _efficiency_suggestions
     from agitrack.metrics.web import _options
 
     bot = CommitStat(
@@ -405,7 +421,7 @@ def test_bot_and_ai_primary_authors_are_not_committers():
         kind="untracked",
     )
     human = CommitStat(sha="h1", author="Alex Doe", email="alex@example.com", subject="Real work", kind="agent")
-    dash = Dashboard(repo="r", branch="main", stats=[bot, human], loops=_detect_loops([bot, human]))
+    dash = Dashboard(repo="r", branch="main", stats=[bot, human], suggestions=_efficiency_suggestions([bot, human]))
     # The bot is the primary author but is not a committer: empty here, absent
     # from the filter options and the per-committer breakdown.
     assert dash.committers_of(bot) == []
@@ -599,16 +615,67 @@ def test_loop_detected_within_a_single_commit_trace():
     assert finding.output_tokens == 99
 
 
-def test_dashboard_loops_from_real_history(tmp_path):
+def test_efficiency_suggestions_flag_costly_low_yield_turns():
+    from agitrack.metrics.collect import _efficiency_suggestions
+
+    def turn(sha, prompt, output, lines):
+        return CommitStat(
+            sha=sha,
+            author="a",
+            email="a@e",
+            subject=prompt,
+            kind="agent",
+            prompt=prompt,
+            tokens={"output": output},
+            insertions=lines,
+            deletions=0,
+        )
+
+    stats = [
+        turn("1" * 40, "add the parser", 100, 50),  # cheap, high yield
+        turn("2" * 40, "wire the cli", 100, 40),  # cheap, high yield
+        turn("3" * 40, "debug the deadlock", 1000, 5),  # expensive, low yield
+        turn("4" * 40, "chase the flaky timeout", 1000, 2),  # expensive, low yield
+    ]
+    suggestions = _efficiency_suggestions(stats)
+    # Distinct prompts ⇒ no repeat loop; only the two expensive low-yield turns
+    # surface, costliest first.
+    assert all(s.kind == "costly" for s in suggestions)
+    assert [s.shas[0] for s in suggestions] == ["3" * 7, "4" * 7]
+
+
+def test_efficiency_suggestions_empty_for_lean_history():
+    from agitrack.metrics.collect import _efficiency_suggestions
+
+    # Distinct prompts, all with healthy yield → nothing notable to suggest.
+    stats = [
+        CommitStat(
+            sha=str(i) * 40,
+            author="a",
+            email="a@e",
+            subject=p,
+            kind="agent",
+            prompt=p,
+            tokens={"output": 100},
+            insertions=60,
+        )
+        for i, p in enumerate(["add parser", "wire cli", "write docs", "add tests"])
+    ]
+    assert _efficiency_suggestions(stats) == []
+
+
+def test_dashboard_suggestions_flag_repeated_prompts(tmp_path):
     repo = GitRepo.init(tmp_path)
     for index, name in enumerate(("a.txt", "b.txt", "c.txt")):
         _write_lines(repo, name, 2)
         repo.commit(_agent_message("fix the flaky integration test", tokens=_TOKENS))
 
     dash = build_dashboard(repo)
-    assert len(dash.loops) == 1
-    assert len(dash.loops[0].shas) == 3
-    assert "Possible loops" in render_dashboard(repo)
+    # Three identical prompts in a row surface as one "repeat" efficiency suggestion.
+    repeats = [s for s in dash.suggestions if s.kind == "repeat"]
+    assert len(repeats) == 1
+    assert len(repeats[0].shas) == 3
+    assert "Efficiency suggestions" in render_dashboard(repo)
 
 
 # --- HTML dashboard (filterable web view) --------------------------------------

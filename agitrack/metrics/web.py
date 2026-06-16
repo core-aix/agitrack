@@ -210,13 +210,13 @@ def _filter_stats(dash: Dashboard, *, author: str, backend: str, model: str, frm
 
 
 def _filtered_dashboard(dash: Dashboard, stats: list[CommitStat]) -> Dashboard:
-    from agitrack.metrics.collect import _detect_loops
+    from agitrack.metrics.collect import _efficiency_suggestions
 
     return Dashboard(
         repo=dash.repo,
         branch=dash.branch,
         stats=stats,
-        loops=_detect_loops(stats),
+        suggestions=_efficiency_suggestions(stats),
         sha_logins=dash.sha_logins,
         commit_base=dash.commit_base,
     )
@@ -231,18 +231,21 @@ def _aggregates(fd: Dashboard) -> dict:
         "ai_lines": list(fd.ai_lines),
         "nontracked_lines": list(fd.nontracked_lines),
         "tokens": fd.token_totals,
-        "efficiency": fd.lines_per_1k_output_tokens,
+        "line_yield": fd.lines_per_1k_output_tokens,
         "by_backend": fd.by_backend,
         "by_model": fd.by_model,
         "by_committer": fd.by_author,
-        "loops": [
-            {"shas": loop.shas, "prompt": loop.prompt, "output": loop.output_tokens, "within": loop.within_commit}
-            for loop in fd.loops
+        "suggestions": [
+            {"kind": s.kind, "detail": s.detail, "shas": s.shas, "output": s.output_tokens} for s in fd.suggestions
         ],
     }
 
 
-_AI_KINDS = ("agent", "covered", "agent-merge")
+# Kinds whose LINES count as tracked-AI in the time series — kept in step with
+# Dashboard.ai_lines. Agent-resolved merges are deliberately excluded (a merge's
+# lines aren't cleanly attributable), though they remain agent-driven *commits*
+# (see the JS AI_KINDS used only for commit-log colouring).
+_AI_KINDS = ("agent", "covered")
 GRANULARITIES = ("hour", "day", "week", "month")
 DEFAULT_GRANULARITY = "day"
 # Cap the number of plotted buckets so an extreme granularity/range (e.g. hourly
@@ -760,8 +763,8 @@ footer{margin-top:46px;padding-top:22px;border-top:1px dashed var(--line);color:
   <h2 class="section">by committer</h2>
   <div class="panel" id="by-committer"></div>
 
-  <h2 class="section">possible loops</h2>
-  <div class="panel" id="loops"></div>
+  <h2 class="section">efficiency suggestions</h2>
+  <div class="panel" id="suggestions"></div>
 
   <h2 class="section">shared sessions</h2>
   <div class="panel" id="shared"></div>
@@ -914,7 +917,7 @@ function renderAgg(){
   const total = AGG.total, tracked = AGG.tracked;
   const ai = {ins:AGG.ai_lines[0], del:AGG.ai_lines[1]}; ai.total = ai.ins+ai.del;
   const nt = {ins:AGG.nontracked_lines[0], del:AGG.nontracked_lines[1]}; nt.total = nt.ins+nt.del;
-  const allLines = ai.total + nt.total, tok = AGG.tokens, eff = AGG.efficiency, kinds = k => AGG.kinds[k]||0;
+  const allLines = ai.total + nt.total, tok = AGG.tokens, eff = AGG.line_yield, kinds = k => AGG.kinds[k]||0;
 
   $("genat").textContent = "updated " + GENERATED;
   $("count").textContent = `${fmt(total)} commits in view`;
@@ -925,7 +928,7 @@ function renderAgg(){
     card("Tracked AI lines", "+"+fmt(ai.ins), `−${fmt(ai.del)} · ${pct(ai.total, allLines)} of changes`),
     card("non-tracked lines", "+"+fmt(nt.ins), `−${fmt(nt.del)} · not tracked as AI`, true),
     card("output tokens", fmt(tok.output||0), `${fmt(tok.input||0)} input`),
-    card("efficiency", eff===null?"—":eff.toFixed(1), "AI lines / 1k output tok", true),
+    card("line yield", eff===null?"—":eff.toFixed(1), "AI lines / 1k output tok", true),
   ].join("");
 
   const lineRow = (label, sub, v, amber) =>
@@ -934,7 +937,7 @@ function renderAgg(){
       `<div class="num"><b>+${fmt(v.ins)}</b> / −${fmt(v.del)}</div></div>`;
   const kc = (label, key, tip) => `<span class="kc" title="${tip}">${label} <b>${kinds(key)}</b></span>`;
   $("lines").innerHTML =
-    lineRow("Tracked AI", "agent + covered + merge", ai, false) +
+    lineRow("Tracked AI", "agent + covered", ai, false) +
     lineRow("Non-tracked", "user + plain commits", nt, true) +
     `<div class="kindcounts"><span class="klabel">commits by kind:</span> `+
       kc("agent", "agent", "Commits aGiTrack made from the agent's work") + " · " +
@@ -960,7 +963,7 @@ function renderAgg(){
   $("by-model").innerHTML = groupPanel(AGG.by_model);
 
   const comm = Object.entries(AGG.by_committer).map(([name,b]) => [name, {
-    commits:b.commits, agit:b.agitrack_commits||0,
+    commits:b.commits, agitrack:b.agitrack_commits||0,
     ai:(b.ai_insertions||0)+(b.ai_deletions||0), nt:(b.nontracked_insertions||0)+(b.nontracked_deletions||0)}]);
   const maxC = Math.max(1, ...comm.map(([,b])=>b.ai));
   comm.sort((a,b)=>b[1].ai-a[1].ai || b[1].commits-a[1].commits);
@@ -969,13 +972,13 @@ function renderAgg(){
         `AI-driven <b>${fmt(b.ai)}</b> · non-tracked ${fmt(b.nt)}`)).join("")
     : `<div class="empty">no commits</div>`;
 
-  $("loops").innerHTML = AGG.loops.length
-    ? AGG.loops.map(l => {
-        const where = l.within ? `within commit ${l.shas[0]}` : `${l.shas.length} commits ${l.shas[0]}..${l.shas[l.shas.length-1]}`;
-        return `<div class="loop"><span class="where">${esc(where)}</span> — <span class="q">"${esc(l.prompt)}"</span>`+
-          (l.output?` <span class="cost">${fmt(l.output)} output tokens</span>`:"")+`</div>`;
+  $("suggestions").innerHTML = (AGG.suggestions||[]).length
+    ? AGG.suggestions.map(s => {
+        const tag = s.kind === "repeat" ? "repeated prompt" : "costly turn";
+        return `<div class="loop"><span class="where">${esc(tag)}</span> — <span class="q">${esc(s.detail)}</span>`+
+          (s.output?` <span class="cost">${fmt(s.output)} output tokens</span>`:"")+`</div>`;
       }).join("")
-    : `<div class="empty">none detected</div>`;
+    : `<div class="empty">nothing notable — no repeated prompts or costly low-yield turns</div>`;
 
   tsHover = -1;
   renderTimeseries();

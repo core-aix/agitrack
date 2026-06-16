@@ -320,7 +320,7 @@ def test_user_commit_message_masks_secret_subject():
     assert "secret123" not in message
 
 
-def test_commit_messages_include_current_agit_version_without_created_at():
+def test_commit_messages_include_current_agitrack_version_without_created_at():
     from agitrack import __version__
 
     message = build_user_commit_message(message="save work", agitrack_session_id="agit-1")

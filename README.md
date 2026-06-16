@@ -95,7 +95,7 @@ agitrack --dashboard        # serve on localhost and open the browser (Ctrl-C to
 agitrack -d text            # one-shot plain-text report instead (pipe it, paste it into an issue)
 ```
 
-![The aGiTrack dashboard](https://raw.githubusercontent.com/core-aix/agitrack/main/docs/images/dashboard-v3.png)
+![The aGiTrack dashboard](https://raw.githubusercontent.com/core-aix/agitrack/main/docs/images/dashboard-v4.png)
 
 - **aGiTrack-tracked AI vs non-tracked lines** — what the agents wrote (tracked by aGiTrack) versus everything else; it never claims a human wrote what the model did.
 - **Filter live** — narrow the whole dashboard to one committer (merged to their GitHub ID), a backend, a model, or a time range.

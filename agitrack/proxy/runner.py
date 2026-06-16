@@ -59,7 +59,7 @@ from agitrack.proxy.renderer import (
 
 # TerminalHost lives in terminal.py (P1).
 from agitrack.proxy.terminal import TerminalHost
-from agitrack.update import Updater, UpdateStatus, restart_agit
+from agitrack.update import Updater, UpdateStatus, restart_agitrack
 
 # Modal state-machines (P6 Stage 2): PromptModal and SelectModal encode the
 # byte-handling logic for free-text and selection popups.
@@ -904,7 +904,7 @@ class ProxyRunner:
             # and acknowledged the privacy warning when this session started, so
             # don't make them acknowledge it again. (A startup-time update re-execs
             # via the CLI without this flag, so that path still shows the warning.)
-            restart_agit(["--skip-privacy-ack"])
+            restart_agitrack(["--skip-privacy-ack"])
         return exit_code
 
     def _ensure_backend_available(self) -> bool:
@@ -1535,7 +1535,7 @@ class ProxyRunner:
         # knows. A new session must not reuse one of these: resuming that past
         # conversation later recreates its worktree at worktree_path(name), so a
         # collision would put two backends in one directory.
-        return {_sanitize_name(name) for name in self._agit_named_sessions().values() if name}
+        return {_sanitize_name(name) for name in self._agitrack_named_sessions().values() if name}
 
     def _taken_session_names(self) -> set[str]:
         # Sanitized names already in use: live sessions, on-disk worktrees, and
@@ -1652,7 +1652,7 @@ class ProxyRunner:
             return
         self.state.backend_session_id = None
         self.state.last_backend_message_id = None
-        self.state.new_agit_session_id()
+        self.state.new_agitrack_session_id()
 
     def _turn_from_branch(self, branch: str) -> int:
         return self._integration.turn_from_branch(branch)
@@ -2645,7 +2645,7 @@ class ProxyRunner:
             root = AgitrackState(self.base_repo.repo, default_backend=self.global_config.default_backend)
         except Exception:
             root = None
-        for sid, name in self._agit_named_sessions().items():
+        for sid, name in self._agitrack_named_sessions().items():
             if sid and sid not in seen:
                 seen.add(sid)
                 named_at = root.session_named_at(sid) if root is not None else 0.0
@@ -2653,7 +2653,7 @@ class ProxyRunner:
         refs = sorted(refs, key=lambda ref: getattr(ref, "updated", 0) or 0, reverse=True)
         return refs[: self.RESUME_LIST_LIMIT]
 
-    def _agit_named_sessions(self) -> dict:
+    def _agitrack_named_sessions(self) -> dict:
         # Friendly names for conversations aGiTrack itself created/named, keyed by
         # backend session id. Used only to label/resume the list that comes from
         # the backend. Two sources, in precedence order:
@@ -2684,7 +2684,7 @@ class ProxyRunner:
             self._render()
             return
         live_ids = {getattr(getattr(s, "state", None), "backend_session_id", None) for s in self.sessions}
-        names = self._agit_named_sessions()
+        names = self._agitrack_named_sessions()
         options: list[str] = []
         for ref in sessions:
             mark = "● " if ref.id in live_ids else "  "

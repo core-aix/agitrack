@@ -46,8 +46,8 @@ def test_naming_helpers(tmp_path):
     assert wm.worktree_path("feat x").name == "feat-x"
     # Branches are namespaced by backend then session: agit/<backend>/<name>/tN.
     assert wm.turn_branch("feat x", 2, backend="open code") == "agitrack/open-code/feat-x/t2"
-    assert wm.is_agit_branch("agitrack/claude/feat-x/t0") is True
-    assert wm.is_agit_branch("main") is False
+    assert wm.is_agitrack_branch("agitrack/claude/feat-x/t0") is True
+    assert wm.is_agitrack_branch("main") is False
     assert _sanitize_name("  ") == "session"
 
 
@@ -471,7 +471,7 @@ def test_repoint_current_to_base_detaches_at_new_base(tmp_path):
     assert runner.turn == 0
 
 
-def test_base_switch_candidates_excludes_agit_and_current(tmp_path):
+def test_base_switch_candidates_excludes_agitrack_and_current(tmp_path):
     main = _init_repo(tmp_path)
     base = main.current_branch()
     main.create_branch("feature", base)
