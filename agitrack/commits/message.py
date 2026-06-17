@@ -89,6 +89,8 @@ def build_agent_commit_message(
     backend_session_id: str | None,
     agitrack_session_id: str,
     model: str | None,
+    reasoning_effort: str | None = None,
+    conversation_anchor: str | None = None,
     token_usage: dict[str, int | None] | None = None,
     trace_turn_limit: int = 5,
     session_name: str | None = None,
@@ -123,6 +125,8 @@ def build_agent_commit_message(
             backend_session_id=backend_session_id,
             agitrack_session_id=agitrack_session_id,
             model=model,
+            reasoning_effort=reasoning_effort,
+            conversation_anchor=conversation_anchor,
             token_usage=token_usage,
             trace_turn_limit=trace_turn_limit,
             session_name=session_name,
@@ -256,6 +260,8 @@ def _trace_and_metadata_lines(
     model: str | None,
     token_usage: dict[str, int | None] | None,
     trace_turn_limit: int,
+    reasoning_effort: str | None = None,
+    conversation_anchor: str | None = None,
     session_name: str | None,
     covered_commits: list[str] | None,
     summary_metadata: list[str] | None = None,
@@ -283,11 +289,27 @@ def _trace_and_metadata_lines(
             "commit_type: agent",
             f"backend: {backend}",
             f"model: {model or 'unknown'}",
+        ]
+    )
+    # The reasoning effort / thinking level the conversation ran at, only when the
+    # backend transcript revealed it (see SessionTurn.reasoning_effort).
+    if reasoning_effort:
+        lines.append(f"reasoning_effort: {reasoning_effort}")
+    lines.extend(
+        [
             f"session_name: {session_name or 'unknown'}",
             f"agitrack_session_id: {agitrack_session_id}",
             f"backend_session_id: {backend_session_id or 'unknown'}",
         ]
     )
+    # A pointer to the exact place in the backend conversation this commit
+    # accounts for: the backend message id of the last turn it covers. Combined
+    # with backend/backend_session_id it pinpoints where in the transcript to
+    # resume reading, so a shared or locally-kept session can be backtracked to
+    # the moment these changes were made. Recorded only when the transcript
+    # exposes a message id for the turn.
+    if conversation_anchor:
+        lines.append(f"conversation_anchor: {conversation_anchor}")
     if covered_commits:
         # The backend-made commits this trace/metadata accounts for (#35).
         # Those commits are never rewritten, so the hashes stay valid (#58).

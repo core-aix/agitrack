@@ -79,7 +79,12 @@ class AgitrackState:
         }
 
     def _default_config(self) -> dict[str, Any]:
-        return {"trace_turn_limit": 5, "summarization_model": None, "summarization_enabled": True}
+        return {
+            "trace_turn_limit": 5,
+            "summarization_model": None,
+            "summarization_enabled": True,
+            "full_agent_messages": False,
+        }
 
     def _load_config(self) -> dict[str, Any]:
         default = self._default_config()
@@ -455,6 +460,21 @@ class AgitrackState:
     def trace_turn_limit(self) -> int:
         value = self.config.get("trace_turn_limit", 5)
         return value if isinstance(value, int) and value > 0 else 5
+
+    @property
+    def full_agent_messages(self) -> bool:
+        # When on, the interaction trace records every user-facing message the agent
+        # sent during a turn (each as its own "## Agent" block), not just the final
+        # one. Off by default — the latest message is usually the substantive reply,
+        # and intermediate progress notes add length. Tool calls / file edits are
+        # never included either way.
+        value = self.config.get("full_agent_messages")
+        return bool(value)
+
+    @full_agent_messages.setter
+    def full_agent_messages(self, value: bool) -> None:
+        self.config["full_agent_messages"] = bool(value)
+        self._save_config()
 
     @property
     def merge_branch(self) -> str | None:

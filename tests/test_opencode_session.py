@@ -88,6 +88,36 @@ def test_parse_exported_session_groups_multiple_assistants_until_next_user():
     assert session.turns[0].final_response == "Added countdown timer."
     assert session.turns[0].tokens.total == 2
     assert session.turns[0].tokens.input == 5
+    # The single text-bearing assistant message is the turn's only agent message.
+    assert session.turns[0].agent_messages == ["Added countdown timer."]
+
+
+def test_parse_exported_session_collects_all_agent_messages_in_order():
+    # Two assistant messages each emit a user-facing reply (around a tool call);
+    # both are kept on agent_messages, with final_response the last.
+    session = parse_exported_session(
+        {
+            "info": {"id": "ses-1", "model": {"providerID": "ollama", "id": "qwen"}},
+            "messages": [
+                {"info": {"role": "user", "id": "u1"}, "parts": [{"type": "text", "text": "do it"}]},
+                {
+                    "info": {"role": "assistant", "id": "a1", "parentID": "u1", "finish": "stop"},
+                    "parts": [{"type": "text", "text": "On it."}],
+                },
+                {
+                    "info": {"role": "assistant", "id": "a-tool", "parentID": "u1", "finish": "tool-calls"},
+                    "parts": [{"type": "tool", "tool": "edit"}],
+                },
+                {
+                    "info": {"role": "assistant", "id": "a2", "parentID": "u1", "finish": "stop"},
+                    "parts": [{"type": "text", "text": "Done."}],
+                },
+            ],
+        }
+    )
+
+    assert session.turns[0].agent_messages == ["On it.", "Done."]
+    assert session.turns[0].final_response == "Done."
 
 
 def test_parse_exported_session_excludes_compaction_summary():
@@ -195,6 +225,45 @@ def test_parse_exported_session_counts_reasoning_part_tokens():
     assert session.turns[0].tokens.total == 8
     assert session.turns[0].tokens.reasoning == 6
     assert session.turns[0].tokens.cache_read == 4
+    # Reasoning tokens were spent, so the effort signal reads "on".
+    assert session.turns[0].reasoning_effort == "on"
+
+
+def test_parse_exported_session_prefers_named_reasoning_effort():
+    session = parse_exported_session(
+        {
+            "info": {"id": "ses-1"},
+            "messages": [
+                {"info": {"role": "user", "id": "u1"}, "parts": [{"type": "text", "text": "hi"}]},
+                {
+                    "info": {"role": "assistant", "id": "a1", "finish": "stop", "variant": "high"},
+                    "parts": [
+                        {"type": "text", "text": "done", "tokens": {"input": 1, "output": 1, "reasoning": 3}},
+                    ],
+                },
+            ],
+        }
+    )
+
+    # An explicit effort/variant in the export wins over the bare "on" fallback.
+    assert session.turns[0].reasoning_effort == "high"
+
+
+def test_parse_exported_session_omits_reasoning_effort_when_absent():
+    session = parse_exported_session(
+        {
+            "info": {"id": "ses-1"},
+            "messages": [
+                {"info": {"role": "user", "id": "u1"}, "parts": [{"type": "text", "text": "hi"}]},
+                {
+                    "info": {"role": "assistant", "id": "a1", "finish": "stop"},
+                    "parts": [{"type": "text", "text": "done", "tokens": {"input": 1, "output": 1, "reasoning": 0}}],
+                },
+            ],
+        }
+    )
+
+    assert session.turns[0].reasoning_effort is None
 
 
 def test_parse_exported_session_extracts_final_text_from_event_blob():

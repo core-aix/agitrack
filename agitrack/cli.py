@@ -80,6 +80,13 @@ def main(argv: list[str] | None = None) -> int:
         "agent does not create its own git commits unless you explicitly ask",
     )
     parser.add_argument(
+        "--full-agent-messages",
+        action="store_true",
+        help="record every user-facing message the agent sends during a turn in the "
+        "commit's interaction trace, not just the final reply (tool calls and file edits "
+        "are still excluded); also settable per-repo via full_agent_messages in config",
+    )
+    parser.add_argument(
         "--skip-privacy-ack",
         action="store_true",
         # Suppress the one-time privacy warning/acknowledgment. Set automatically
@@ -223,6 +230,7 @@ def main(argv: list[str] | None = None) -> int:
                 use_worktrees=use_worktrees,
                 backend_args=backend_args,
                 commit_guidance=commit_guidance,
+                full_agent_messages=args.full_agent_messages,
             ).run()
     except (GitError, RuntimeError) as error:
         print(error)

@@ -61,16 +61,162 @@ def _engine(tmp_path, *, staged: bool = True) -> tuple[CommitEngine, _Repo, Agit
     return engine, repo, state
 
 
-def _turn(prompt: str, response: str, *, total: int = 1, output: int = 1) -> SessionTurn:
+def _turn(
+    prompt: str,
+    response: str,
+    *,
+    total: int = 1,
+    output: int = 1,
+    reasoning_effort: str | None = None,
+    assistant_id: str = "aid",
+) -> SessionTurn:
     return SessionTurn(
         "uid",
-        "aid",
+        assistant_id,
         prompt,
         response,
         TokenUsage(total=total, output=output, input=total - output),
         None,
         complete=True,
+        reasoning_effort=reasoning_effort,
     )
+
+
+def test_commit_turns_records_latest_reasoning_effort(tmp_path):
+    engine, repo, state = _engine(tmp_path)
+    engine.commit_turns(
+        # The most recent turn that recorded a level wins; a later None doesn't erase it.
+        turns=[
+            _turn("a", "done", reasoning_effort="on"),
+            _turn("b", "done", reasoning_effort="high"),
+            _turn("c", "done"),
+        ],
+        backend="opencode",
+        backend_session_id="s1",
+        model="m",
+        stage_untracked_fn=_noop_stage,
+    )
+    assert repo.message is not None
+    assert "reasoning_effort: high" in repo.message
+
+
+def test_commit_turns_omits_reasoning_effort_when_no_turn_records_it(tmp_path):
+    engine, repo, state = _engine(tmp_path)
+    engine.commit_turns(
+        turns=[_turn("a", "done")],
+        backend="claude",
+        backend_session_id="s1",
+        model="m",
+        stage_untracked_fn=_noop_stage,
+    )
+    assert repo.message is not None
+    assert "reasoning_effort:" not in repo.message
+
+
+def test_commit_turns_records_only_final_agent_message_by_default(tmp_path):
+    engine, repo, state = _engine(tmp_path)
+    turn = _turn("do it", "Done.")
+    turn.agent_messages = ["On it.", "Done."]
+    engine.commit_turns(
+        turns=[turn],
+        backend="claude",
+        backend_session_id="s1",
+        model="m",
+        stage_untracked_fn=_noop_stage,
+    )
+    assert repo.message is not None
+    # Default: only the final reply lands in the trace.
+    assert "Done." in repo.message
+    assert "On it." not in repo.message
+
+
+def test_commit_turns_records_all_agent_messages_when_option_on(tmp_path):
+    engine, repo, state = _engine(tmp_path)
+    state.full_agent_messages = True
+    turn = _turn("do it", "Done.")
+    turn.agent_messages = ["On it.", "Done."]
+    engine.commit_turns(
+        turns=[turn],
+        backend="claude",
+        backend_session_id="s1",
+        model="m",
+        stage_untracked_fn=_noop_stage,
+    )
+    assert repo.message is not None
+    # Every user-facing message appears, each as its own "## Agent" block.
+    assert "On it." in repo.message
+    assert "Done." in repo.message
+    assert repo.message.count("## Agent") == 2
+
+
+def test_commit_turns_full_agent_messages_override_forces_on(tmp_path):
+    # The per-run override (e.g. --full-agent-messages) forces all messages even
+    # when the per-repo config is off.
+    repo = _Repo(staged=True)
+    state = AgitrackState(tmp_path)
+    assert state.full_agent_messages is False
+    engine = CommitEngine(repo, state, full_agent_messages=True)
+    turn = _turn("do it", "Done.")
+    turn.agent_messages = ["On it.", "Done."]
+    engine.commit_turns(
+        turns=[turn],
+        backend="claude",
+        backend_session_id="s1",
+        model="m",
+        stage_untracked_fn=_noop_stage,
+    )
+    assert repo.message is not None
+    assert "On it." in repo.message
+    assert repo.message.count("## Agent") == 2
+
+
+def test_commit_turns_full_agent_messages_override_none_defers_to_config(tmp_path):
+    # With no override (None), the per-repo config decides — here it's on.
+    repo = _Repo(staged=True)
+    state = AgitrackState(tmp_path)
+    state.full_agent_messages = True
+    engine = CommitEngine(repo, state, full_agent_messages=None)
+    turn = _turn("do it", "Done.")
+    turn.agent_messages = ["On it.", "Done."]
+    engine.commit_turns(
+        turns=[turn],
+        backend="claude",
+        backend_session_id="s1",
+        model="m",
+        stage_untracked_fn=_noop_stage,
+    )
+    assert repo.message is not None
+    assert "On it." in repo.message
+
+
+def test_commit_turns_records_conversation_anchor_of_last_turn(tmp_path):
+    engine, repo, state = _engine(tmp_path)
+    engine.commit_turns(
+        # The anchor links to the last covered turn's backend message id.
+        turns=[
+            _turn("a", "done", assistant_id="msg-1"),
+            _turn("b", "done", assistant_id="msg-2"),
+        ],
+        backend="claude",
+        backend_session_id="s1",
+        model="m",
+        stage_untracked_fn=_noop_stage,
+    )
+    assert repo.message is not None
+    assert "conversation_anchor: msg-2" in repo.message
+
+
+def test_commit_turns_omits_conversation_anchor_when_no_message_id(tmp_path):
+    engine, repo, state = _engine(tmp_path)
+    engine.commit_turns(
+        turns=[_turn("a", "done", assistant_id="")],
+        backend="claude",
+        backend_session_id="s1",
+        model="m",
+        stage_untracked_fn=_noop_stage,
+    )
+    assert repo.message is not None
+    assert "conversation_anchor:" not in repo.message
 
 
 # ---------------------------------------------------------------------------
@@ -676,6 +822,99 @@ def test_finish_parse_clears_awaited_on_interrupt(tmp_path):
     )
     assert result is True
     assert new_awaited == []
+
+
+def _cancelled_exported():
+    # A turn the user interrupted before any committable response: interrupted,
+    # empty final_response (so it is not in complete_turns).
+    return ExportedSession(
+        "ses-1",
+        "m",
+        None,
+        [
+            SessionTurn("u1", "a1", "build it", "", TokenUsage(total=1, output=1), None, interrupted=True),
+        ],
+    )
+
+
+def test_finish_parse_invokes_cancel_handler_and_advances_watermark(tmp_path):
+    # A cancelled turn with no committable response routes to on_cancelled_fn; when
+    # it reports it handled the leftover changes, the watermark advances past the
+    # turn so it isn't reconsidered, and no normal commit happens.
+    session = Session.bare()
+    engine, state, commits, commit_fn = _make_finish_helpers(tmp_path, session, _cancelled_exported())
+    seen = []
+
+    result, _ = engine.finish_parse_if_ready(
+        session=session,
+        quiet=True,
+        prompt_untracked=False,
+        require_complete=True,
+        awaited_followups=[],
+        agent_is_active_fn=lambda: False,
+        debug_fn=lambda *a, **k: None,
+        note_session_change_fn=lambda sid: None,
+        mirror_fn=lambda sid: None,
+        commit_fn=commit_fn,
+        on_cancelled_fn=lambda turns: seen.append(turns) or True,
+    )
+    assert result is False
+    assert commits == []  # no normal commit for a response-less turn
+    assert len(seen) == 1
+    assert state.last_backend_message_id == "a1"
+
+
+def test_finish_parse_cancel_handler_keep_does_not_advance_watermark(tmp_path):
+    # If the handler declines (user kept the changes to decide later), the watermark
+    # is left untouched so the turn is still the current tail.
+    session = Session.bare()
+    engine, state, commits, commit_fn = _make_finish_helpers(tmp_path, session, _cancelled_exported())
+
+    result, _ = engine.finish_parse_if_ready(
+        session=session,
+        quiet=True,
+        prompt_untracked=False,
+        require_complete=True,
+        awaited_followups=[],
+        agent_is_active_fn=lambda: False,
+        debug_fn=lambda *a, **k: None,
+        note_session_change_fn=lambda sid: None,
+        mirror_fn=lambda sid: None,
+        commit_fn=commit_fn,
+        on_cancelled_fn=lambda turns: False,
+    )
+    assert result is False
+    assert state.last_backend_message_id is None
+
+
+def test_finish_parse_skips_cancel_handler_when_not_interrupted(tmp_path):
+    # A response-less turn that was NOT interrupted (e.g. still mid-flight) must not
+    # be treated as a cancellation.
+    session = Session.bare()
+    exported = ExportedSession(
+        "ses-1",
+        "m",
+        None,
+        [SessionTurn("u1", "a1", "build it", "", TokenUsage(total=1, output=1), None, interrupted=False)],
+    )
+    engine, state, commits, commit_fn = _make_finish_helpers(tmp_path, session, exported)
+    called = []
+
+    result, _ = engine.finish_parse_if_ready(
+        session=session,
+        quiet=True,
+        prompt_untracked=False,
+        require_complete=True,
+        awaited_followups=[],
+        agent_is_active_fn=lambda: False,
+        debug_fn=lambda *a, **k: None,
+        note_session_change_fn=lambda sid: None,
+        mirror_fn=lambda sid: None,
+        commit_fn=commit_fn,
+        on_cancelled_fn=lambda turns: called.append(turns) or True,
+    )
+    assert result is False
+    assert called == []
 
 
 def test_finish_parse_discards_stale_session_result(tmp_path):

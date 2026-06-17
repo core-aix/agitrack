@@ -30,6 +30,11 @@ __all__ = [
     "looks_like_event_blob",
 ]
 
+# Keys an assistant message's `info` may carry the reasoning effort / model
+# variant under across OpenCode versions. Best-effort — searched recursively and
+# only used when present; absence falls back to the reasoning-token signal.
+_REASONING_EFFORT_KEYS = {"reasoningEffort", "reasoning_effort", "effort", "variant"}
+
 
 def _fetch_sessions(repo: Path, max_count: int) -> list[dict]:
     _debug(repo, "opencode session list starting")
@@ -481,17 +486,23 @@ def _build_turn(user_message: dict, assistants: list[dict], session_model: str |
 
     final_response = ""
     final_assistant: dict | None = None
+    agent_messages: list[str] = []
     tokens = TokenUsage()
     model = session_model
+    effort: str | None = None
     last_assistant = assistants[-1] if assistants else None
     for assistant in assistants:
         assistant_info = _as_dict(assistant.get("info"))
         tokens.add(_tokens(assistant_info, assistant.get("parts")))
         model = _model_name(assistant_info) or model
+        effort = effort or _find_value(assistant_info, _REASONING_EFFORT_KEYS)
         response = _final_response(assistant.get("parts"), finish=assistant_info.get("finish"))
         if response:
             final_response = response
             final_assistant = assistant
+            # Each assistant message's user-facing reply, in order, so the opt-in
+            # full trace can include every message rather than only the last.
+            agent_messages.append(response)
 
     final_info = (final_assistant or last_assistant or {}).get("info", {})
     assistant_id = str(final_info.get("id") or "")
@@ -502,8 +513,13 @@ def _build_turn(user_message: dict, assistants: list[dict], session_model: str |
         final_response=final_response,
         tokens=tokens,
         model=model,
+        # A named effort/variant when the export records one, otherwise "on" when
+        # the turn spent reasoning tokens — the only reasoning signal OpenCode
+        # reliably exposes (the configured level is not in the export).
+        reasoning_effort=effort or ("on" if tokens.reasoning > 0 else None),
         started_at=_message_time(user_info),
         ended_at=_message_time(_as_dict(final_info)) or _message_time(user_info),
+        agent_messages=agent_messages,
     )
 
 
