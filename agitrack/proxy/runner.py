@@ -2422,7 +2422,7 @@ class ProxyRunner:
         sub = arg.strip().lower()
         if sub in ("on", "off"):
             enabled = sub == "on"
-            self.state.summarization_enabled = enabled
+            self._persist_summarizer_enabled(enabled)
             self._set_message(f"Summarizer {'enabled' if enabled else 'disabled'}.")
             self._render()
             return
@@ -2442,7 +2442,7 @@ class ProxyRunner:
             self._render()
             return
         if choice.startswith("Toggle"):
-            self.state.summarization_enabled = not enabled
+            self._persist_summarizer_enabled(not enabled)
             self._set_message(f"Summarizer {'enabled' if not enabled else 'disabled'}.")
         elif choice.startswith("Set model"):
             self._handle_summarizer_command("model")
@@ -2494,6 +2494,16 @@ class ProxyRunner:
         # (which lives in a transient worktree state) so the global value takes effect.
         self.global_config.summarization_model = value
         self.state.summarization_model = None
+
+    def _persist_summarizer_enabled(self, enabled: bool) -> None:
+        # Persist the on/off toggle in the GLOBAL config so it survives restarts, like the
+        # model. The per-session state lives in the session worktree's .agitrack/config.json,
+        # which is removed when the worktree is torn down on exit — a toggle written only
+        # there always reset to the default ("on") on the next launch (the reported bug).
+        if self.global_config is not None:
+            self.global_config.summarization_enabled = enabled
+        # Keep the active session's view consistent for the current run.
+        self.state.summarization_enabled = enabled
 
     # --- switch base branch ---
 
@@ -5406,14 +5416,15 @@ class ProxyRunner:
         )
 
     def _summarization_enabled(self) -> bool:
+        # The GLOBAL config is the durable source of truth (survives restarts and worktree
+        # teardown), so it wins. The per-session worktree state — which always defaults to
+        # "on" on a fresh worktree — must NOT shadow it, or the toggle never persists. Fall
+        # back to the per-session value only when there is no global config (e.g. tests).
+        gc_enabled = getattr(self.global_config, "summarization_enabled", None)
+        if gc_enabled is not None:
+            return bool(gc_enabled)
         state_enabled = getattr(self.state, "summarization_enabled", None)
-        if state_enabled is not None:
-            return state_enabled
-        if self.global_config is not None:
-            gc_enabled = getattr(self.global_config, "summarization_enabled", None)
-            if gc_enabled is not None:
-                return gc_enabled
-        return True
+        return True if state_enabled is None else bool(state_enabled)
 
     def _render_status(self, text: str) -> None:
         prompt = text.replace("\r", "").replace("\n", "")

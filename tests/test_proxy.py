@@ -4505,6 +4505,38 @@ def test_summarizer_model_picker_lists_models_and_defaults_to_smallest_for_claud
     assert runner.state.summarization_model is None
 
 
+def test_summarizer_toggle_persists_to_global_config_across_restart(tmp_path):
+    # Turning the summarizer off must survive an aGiTrack restart: the toggle is written
+    # to the durable GLOBAL config, not the transient per-session worktree state (which is
+    # removed on exit and resets to "on"). Regression for "always starts on".
+    from agitrack.config.settings import GlobalConfig
+    from proxy_helpers import make_runner
+
+    cfg_path = tmp_path / "global" / "config.json"
+    runner = make_runner(state=AgitrackState(tmp_path / "wt"))
+    runner.global_config = GlobalConfig(cfg_path)
+    runner._render = lambda: None
+    runner._set_message = lambda *a, **k: None
+    assert runner._summarization_enabled() is True  # default
+
+    runner._handle_summarizer_command("off")
+    assert runner.global_config.summarization_enabled is False
+    assert runner._summarization_enabled() is False
+
+    # Simulate a restart: a brand-new GlobalConfig reading the same file, and a fresh
+    # session worktree state (which would default to "on" on its own).
+    restarted = make_runner(state=AgitrackState(tmp_path / "wt2"))
+    restarted.global_config = GlobalConfig(cfg_path)
+    assert restarted.global_config.summarization_enabled is False
+    assert restarted._summarization_enabled() is False  # stays OFF, not reset to on
+
+    # And turning it back on persists too.
+    restarted._render = lambda: None
+    restarted._set_message = lambda *a, **k: None
+    restarted._handle_summarizer_command("on")
+    assert GlobalConfig(cfg_path).summarization_enabled is True
+
+
 def test_summarizer_model_picker_clear_resets_to_session_model(tmp_path, monkeypatch):
     import agitrack.summaries.model_select as model_select
     from proxy_helpers import make_runner
