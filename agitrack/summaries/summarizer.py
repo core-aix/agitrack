@@ -255,7 +255,10 @@ class Summarizer:
         return self._run(self._build_pre_compaction_prompt(exported_session, current_summary))
 
     def _run(self, prompt: str) -> str:
-        result = self.backend.run(prompt, model=self.model, session_id=None)
+        # ``bare``: the summarizer must read ONLY its instruction plus the interaction
+        # trace — not the backend's agent system prompt, tool schemas, or project/user
+        # memory, which would add thousands of input tokens the summary never uses.
+        result = self.backend.run(prompt, model=self.model, session_id=None, bare=True)
         tokens = getattr(result, "tokens", None)
         if tokens is not None:
             # Fresh input = uncached input + cache-creation tokens (both are input the
