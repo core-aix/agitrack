@@ -341,6 +341,13 @@ class CommitEngine:
         # fork/copy origin event for this session — both recorded because they reshape
         # the context the token counts run against (issue: track compaction & fork/copy).
         compactions = sum(int(getattr(turn, "compaction_count", 0) or 0) for turn in turns)
+        # Reasoning effort / thinking level for this commit's turns: the most recent
+        # turn that recorded one wins, so the metadata reflects the level in effect
+        # at the end of the span (None when no turn revealed it).
+        reasoning_effort = next(
+            (turn.reasoning_effort for turn in reversed(turns) if getattr(turn, "reasoning_effort", None)),
+            None,
+        )
         origin_event = self.state.session_origin_event()
         message = build_agent_commit_message(
             latest_prompt=subject_text,
@@ -349,6 +356,7 @@ class CommitEngine:
             backend_session_id=backend_session_id,
             agitrack_session_id=self.state.session_id,
             model=model or self.state.model,
+            reasoning_effort=reasoning_effort,
             token_usage=self.state.pending_token_usage(),
             trace_turn_limit=self.state.trace_turn_limit,
             session_name=session_name,

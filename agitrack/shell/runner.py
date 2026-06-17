@@ -258,6 +258,7 @@ class AgitrackShell:
                     backend_session_id=self.state.backend_session_id,
                     agitrack_session_id=self.state.session_id,
                     model=self.state.model,
+                    reasoning_effort="on" if result.tokens.reasoning > 0 else None,
                     token_usage=self.state.pending_token_usage(),
                     trace_turn_limit=self.state.trace_turn_limit,
                     summary=commit_summary,

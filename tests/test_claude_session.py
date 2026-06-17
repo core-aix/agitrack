@@ -158,6 +158,23 @@ def test_parse_rows_groups_turns_with_final_response_and_tokens():
     assert session.turns[1].final_response == "final answer two"
 
 
+def test_parse_rows_records_reasoning_effort_from_thinking_blocks():
+    rows = [
+        _user("u1", "thought prompt"),
+        _assistant("m0", "", content=[{"type": "thinking", "thinking": "..."}]),
+        _assistant("m1", "answer", usage={"input_tokens": 1, "output_tokens": 1}),
+        _user("u2", "plain prompt"),
+        _assistant("m2", "answer", usage={"input_tokens": 1, "output_tokens": 1}),
+    ]
+
+    session = parse_rows("sess-1", rows)
+
+    # A thinking block means extended thinking was active for that turn; a turn
+    # without one reveals nothing about reasoning, so it stays None (never "off").
+    assert session.turns[0].reasoning_effort == "on"
+    assert session.turns[1].reasoning_effort is None
+
+
 def test_parse_rows_marks_turn_incomplete_while_last_message_is_tool_use():
     # A prompt whose latest assistant message is a tool call is still mid-flight:
     # the agent paused between writing code and writing tests. aGiTrack must see this
