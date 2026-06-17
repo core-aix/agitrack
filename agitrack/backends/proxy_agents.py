@@ -8,6 +8,19 @@ from agitrack.transcripts import claude as claude_session, opencode as opencode_
 from agitrack.transcripts import ExportedSession, SessionRef
 
 
+# Appended to the coding agent's own system prompt when the backend CLI supports it (e.g.
+# Claude's --append-system-prompt). aGiTrack already creates a git commit for each turn, so
+# an agent committing on its own duplicates work and breaks the per-turn token/line
+# accounting the commits carry. The note keeps the agent's normal behaviour but stops it
+# from self-committing — unless the user explicitly asks it to.
+AGENT_SYSTEM_NOTE = (
+    "This coding session runs inside aGiTrack, which automatically creates a git commit for "
+    "your changes after each turn. Do NOT create git commits yourself (do not run `git commit`) "
+    "unless the user explicitly asks you to commit — aGiTrack handles version control for this "
+    "session. Otherwise work exactly as normal."
+)
+
+
 class ProxyAgent(Protocol):
     """A coding-agent CLI driven through aGiTrack's proxy (native TUI) mode.
 
@@ -186,10 +199,15 @@ class ClaudeProxyAgent:
 
     def spawn_command(self, repo: Path, *, session_id: str | None, resume: bool) -> list[str]:
         if resume and session_id:
-            return ["claude", "--resume", session_id]
-        if session_id:
-            return ["claude", "--session-id", session_id]
-        return ["claude"]
+            command = ["claude", "--resume", session_id]
+        elif session_id:
+            command = ["claude", "--session-id", session_id]
+        else:
+            command = ["claude"]
+        # Tell the coding agent that aGiTrack auto-commits, so it doesn't self-commit
+        # (Claude supports appending to its system prompt; OpenCode's TUI has no such flag).
+        command.extend(["--append-system-prompt", AGENT_SYSTEM_NOTE])
+        return command
 
     def session_belongs_to_repo(self, repo: Path, session_id: str) -> bool:
         return claude_session.session_belongs_to_repo(repo, session_id)

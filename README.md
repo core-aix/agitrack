@@ -36,6 +36,8 @@ agitrack
 
 By default, `agitrack` runs in proxy mode: it launches the real backend TUI (OpenCode or Claude) in a pseudo-terminal, renders it through an internal terminal screen, and reserves a bottom status line for aGiTrack showing the session (and the branch it merges into — shown **bold** when that branch differs from the one checked out in the repo directory), the backend, the summarizer state, and the repository the agent is working on (the base repository path, home-abbreviated and elided from the left when space is tight). Press `Ctrl-G` to enter aGiTrack command mode (configurable via `menu_key` in `~/.agitrack/config.json` — see Configuration).
 
+When it launches a coding agent, aGiTrack appends a note to the agent's system prompt (where the backend supports it — Claude's `--append-system-prompt`) telling it that aGiTrack auto-commits each turn, so the agent should not create git commits on its own unless you explicitly ask it to. This keeps aGiTrack's per-turn commits (and their token/line metadata) authoritative. The note is added only for coding sessions, never for the background summarizer.
+
 Run against another repository:
 
 ```bash
