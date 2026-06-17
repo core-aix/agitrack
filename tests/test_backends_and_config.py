@@ -1,4 +1,5 @@
 import json
+import types
 from pathlib import Path
 
 import pytest
@@ -130,6 +131,35 @@ def test_claude_backend_parses_json_result():
     assert tokens.output == 34
     assert tokens.context == 12 + 100 + 5
     assert tokens.cache_read == 100
+
+
+def test_claude_backend_bare_run_strips_tools_memory_and_system_prompt(monkeypatch, tmp_path):
+    # A bare run (the summarizer) must add the flags that drop Claude Code's tool schemas,
+    # MCP servers, project/user memory, and the large default system prompt — so the only
+    # input is the caller's prompt. A normal run must NOT add them.
+    import subprocess
+
+    captured: dict = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        return types.SimpleNamespace(
+            stdout=json.dumps({"type": "result", "result": "ok", "session_id": "s"}), stderr="", returncode=0
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    backend = ClaudeBackend(tmp_path)
+
+    backend.run("summarize this", model="claude-haiku-4-5-20251001", session_id=None, bare=True)
+    cmd = captured["command"]
+    assert "--tools" in cmd and cmd[cmd.index("--tools") + 1] == ""  # all tools disabled
+    assert "--strict-mcp-config" in cmd  # no MCP servers
+    assert "--setting-sources" in cmd and cmd[cmd.index("--setting-sources") + 1] == ""  # no CLAUDE.md/skills
+    assert "--system-prompt" in cmd  # default agent system prompt replaced with a minimal one
+
+    backend.run("do real work", model=None, session_id=None)  # bare defaults to False
+    normal = captured["command"]
+    assert "--tools" not in normal and "--system-prompt" not in normal and "--strict-mcp-config" not in normal
 
 
 def test_claude_backend_tolerates_leading_logs():
