@@ -1,4 +1,5 @@
 import json
+import types
 from pathlib import Path
 
 import pytest
@@ -22,12 +23,33 @@ def test_opencode_proxy_agent_spawn_command():
 
 
 def test_claude_proxy_agent_spawn_command_uses_session_id_and_resume():
+    from agitrack.backends.proxy_agents import AGENT_SYSTEM_NOTE
+
     agent = make_proxy_agent("claude")
     assert agent.name == "claude"
     # Claude picks an explicit session id so aGiTrack knows which transcript to read.
     assert len(agent.new_session_id()) == 36
-    assert agent.spawn_command(Path("/repo"), session_id="u1", resume=False) == ["claude", "--session-id", "u1"]
-    assert agent.spawn_command(Path("/repo"), session_id="u1", resume=True) == ["claude", "--resume", "u1"]
+    # The coding agent is told aGiTrack auto-commits (Claude supports --append-system-prompt),
+    # so it doesn't self-commit; the note follows the session/resume flags.
+    note = ["--append-system-prompt", AGENT_SYSTEM_NOTE]
+    assert agent.spawn_command(Path("/repo"), session_id="u1", resume=False) == ["claude", "--session-id", "u1", *note]
+    assert agent.spawn_command(Path("/repo"), session_id="u1", resume=True) == ["claude", "--resume", "u1", *note]
+    assert agent.spawn_command(Path("/repo"), session_id=None, resume=False) == ["claude", *note]
+    assert "aGiTrack" in AGENT_SYSTEM_NOTE and "git commit" in AGENT_SYSTEM_NOTE
+    # commit_guidance=False (--no-commit-guidance) omits the note entirely.
+    assert agent.spawn_command(Path("/repo"), session_id=None, resume=False, commit_guidance=False) == ["claude"]
+    assert "--append-system-prompt" not in agent.spawn_command(
+        Path("/repo"), session_id="u1", resume=True, commit_guidance=False
+    )
+
+
+def test_opencode_proxy_agent_spawn_command_has_no_system_prompt_append():
+    # OpenCode's interactive TUI exposes no flag to append to the system prompt, so the
+    # note is not added there ("if there is this option" — there isn't for OpenCode).
+    agent = make_proxy_agent("opencode")
+    cmd = agent.spawn_command(Path("/repo"), session_id="s1", resume=True)
+    assert "--append-system-prompt" not in cmd
+    assert cmd == ["opencode", "--session", "s1", "/repo"]
 
 
 def test_make_proxy_agent_raises_on_unknown_backend():
@@ -130,6 +152,49 @@ def test_claude_backend_parses_json_result():
     assert tokens.output == 34
     assert tokens.context == 12 + 100 + 5
     assert tokens.cache_read == 100
+
+
+def test_claude_backend_bare_run_strips_tools_memory_and_system_prompt(monkeypatch, tmp_path):
+    # A bare run (the summarizer) must add the flags that drop Claude Code's tool schemas,
+    # MCP servers, project/user memory, and the large default system prompt — so the only
+    # input is the caller's prompt. A normal run must NOT add them.
+    import subprocess
+
+    captured: dict = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        return types.SimpleNamespace(
+            stdout=json.dumps({"type": "result", "result": "ok", "session_id": "s"}), stderr="", returncode=0
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    backend = ClaudeBackend(tmp_path)
+
+    backend.run(
+        "summarize this", model="claude-haiku-4-5-20251001", session_id=None, bare=True, system_prompt="BE A SUMMARIZER"
+    )
+    cmd = captured["command"]
+    assert "--tools" in cmd and cmd[cmd.index("--tools") + 1] == ""  # all tools disabled
+    assert "--strict-mcp-config" in cmd  # no MCP servers
+    assert "--setting-sources" in cmd and cmd[cmd.index("--setting-sources") + 1] == ""  # no CLAUDE.md/skills
+    # The caller's system prompt is used (the summarizer's instruction), replacing the
+    # default agent system prompt.
+    assert cmd[cmd.index("--system-prompt") + 1] == "BE A SUMMARIZER"
+    # The summarizer (bare) is NOT told aGiTrack auto-commits — it isn't a coding run.
+    assert "--append-system-prompt" not in cmd
+
+    backend.run("do real work", model=None, session_id=None)  # bare defaults to False
+    normal = captured["command"]
+    assert "--tools" not in normal and "--system-prompt" not in normal and "--strict-mcp-config" not in normal
+    # A coding run (not bare) IS told aGiTrack auto-commits, so it doesn't self-commit.
+    from agitrack.backends.proxy_agents import AGENT_SYSTEM_NOTE
+
+    assert normal[normal.index("--append-system-prompt") + 1] == AGENT_SYSTEM_NOTE
+
+    # ...but commit_guidance=False (--no-commit-guidance) omits it on a coding run too.
+    backend.run("do real work", model=None, session_id=None, commit_guidance=False)
+    assert "--append-system-prompt" not in captured["command"]
 
 
 def test_claude_backend_tolerates_leading_logs():

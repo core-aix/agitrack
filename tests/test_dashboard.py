@@ -262,6 +262,23 @@ def test_render_dashboard_contains_all_sections(tmp_path):
     assert "Human (" not in text and "human (own code)" not in text
 
 
+def test_text_dashboard_notes_input_includes_cache_write_only_when_nonzero(tmp_path):
+    # When cache-creation happened, the text dashboard spells out that input folds in
+    # cache-write tokens (which diverges from provider billing); otherwise it stays quiet.
+    cached = GitRepo.init(tmp_path / "cached")
+    _write_lines(cached, "a.txt", 5)
+    cached.commit(_agent_message("do it", tokens={**_TOKENS, "cache_write": 800}))
+    text = render_dashboard(cached)
+    assert "cache write: 800" in text
+    assert "note: input includes cache-creation (cache write) tokens" in text
+
+    plain = GitRepo.init(tmp_path / "plain")
+    _write_lines(plain, "b.txt", 5)
+    plain.commit(_agent_message("do it", tokens=_TOKENS))  # cache_write == 0
+    plain_text = render_dashboard(plain)
+    assert "note: input includes cache-creation" not in plain_text
+
+
 def test_pr_merge_commit_does_not_double_count_the_cover_turn(tmp_path):
     """A GitHub-style merge that inherits the cover commit's message (and so its
     metadata block) must not be counted as a second turn (#58 regression)."""
@@ -662,6 +679,36 @@ def test_render_html_has_unreachable_banner_and_clear_kind_labels(tmp_path):
     # the role/section/nested-heading relationship is visible, not flattened.
     for level in ("h3.md-h", "h4.md-h", "h5.md-h", "h6.md-h"):
         assert level in html
+
+
+def test_web_dashboard_truncates_long_commit_subjects(tmp_path):
+    # The commit log caps a displayed subject at 120 chars with an ellipsis; the full
+    # subject stays available (hover title + expanded message). Client-side rendering, so
+    # assert the JS source carries the cap and applies it in renderLog.
+    html = render_html(_demo_repo(tmp_path))
+    assert "SUBJECT_MAX = 120" in html
+    assert "const truncSubject" in html and "SUBJECT_MAX-1" in html  # ellipsis counts toward the cap
+    assert "shown = truncSubject(subj)" in html  # applied to each log row's subject
+    assert 'title="' in html  # full subject preserved on hover when truncated
+
+
+def test_web_dashboard_shows_loading_indicator_on_filter_change(tmp_path):
+    # A "loading…" spinner appears while a filter change re-fetches the data and is
+    # cleared once the panels render (even on a fetch failure, via finally).
+    html = render_html(_demo_repo(tmp_path))
+    assert 'id="loading"' in html and 'class="spin"' in html  # the badge + spinner
+    assert "@keyframes spin" in html  # the animation
+    assert "function showLoading" in html
+    # applyFilters shows it before fetching and clears it in a finally.
+    assert "showLoading(true)" in html and "} finally { showLoading(false); }" in html
+
+
+def test_web_dashboard_embeds_cache_write_input_note(tmp_path):
+    # The web token panel explains aGiTrack's input convention; the note is client-side
+    # gated to show only when cache-write tokens are non-zero.
+    html = render_html(_demo_repo(tmp_path))
+    assert "input includes cache-creation (cache&nbsp;write) tokens" in html
+    assert "(tok.cache_write||0)+(tok.subagent_cache_write||0) > 0" in html  # the gate
 
 
 def test_filter_bar_is_single_row_with_a_custom_range_popup(tmp_path):

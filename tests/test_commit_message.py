@@ -522,3 +522,61 @@ def test_agent_merge_message_format():
     assert "base_branch: main" in message
     assert "backend_session_id: ses-9" in message
     assert "abc123 base edit" in message
+
+
+def _trace():
+    return [{"role": "user", "content": "do it"}, {"role": "agent", "content": "done"}]
+
+
+def _base_message(**kw):
+    return build_agent_commit_message(
+        latest_prompt="do it",
+        trace=_trace(),
+        backend="claude",
+        backend_session_id="ses-1",
+        agitrack_session_id="agitrack-1",
+        model="claude-opus-4-8",
+        token_usage={"context": 100, "input": 10, "output": 5},
+        **kw,
+    )
+
+
+def test_compaction_recorded_in_trace_note_and_metadata():
+    message = _base_message(compactions=2)
+    assert "context_compactions: 2" in message
+    # A human-readable note leads the interaction trace, before the turns.
+    trace_idx = message.index("# Interaction Trace")
+    note_idx = message.index("compacted 2 times")
+    user_idx = message.index("## User")
+    assert trace_idx < note_idx < user_idx
+    assert "> " in message  # rendered as a blockquote
+
+
+def test_no_compaction_emits_no_note_or_metadata():
+    message = _base_message(compactions=0)
+    assert "context_compactions" not in message
+    assert "compacted" not in message
+
+
+def test_fork_origin_recorded_in_trace_and_metadata():
+    message = _base_message(
+        origin_event={"kind": "fork", "source": "ses_parent", "source_name": "main", "collaborator": "", "at": 1}
+    )
+    assert "forked_from: ses_parent (main)" in message
+    assert "copied_from" not in message
+    assert "forked from 'main'" in message
+
+
+def test_copy_origin_records_contributor_in_trace_and_metadata():
+    message = _base_message(
+        origin_event={
+            "kind": "copy",
+            "source": "ses_shared",
+            "source_name": "feature-x",
+            "collaborator": "alice+bob",
+            "at": 1,
+        }
+    )
+    assert "copied_from: ses_shared (feature-x)" in message
+    assert "copied_from_contributor: alice+bob" in message
+    assert "copied from alice+bob's shared session 'feature-x'" in message

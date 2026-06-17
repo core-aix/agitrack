@@ -16,7 +16,24 @@ class OpenCodeBackend:
         self.verbose = verbose
         self.backend_args = list(backend_args or [])  # forwarded verbatim to the backend CLI (#32)
 
-    def run(self, prompt: str, *, model: str | None, session_id: str | None) -> AgentResult:
+    def run(
+        self,
+        prompt: str,
+        *,
+        model: str | None,
+        session_id: str | None,
+        bare: bool = False,
+        system_prompt: str | None = None,
+        commit_guidance: bool = True,
+    ) -> AgentResult:
+        # ``commit_guidance`` is accepted for a uniform interface but unused: OpenCode's CLI
+        # has no flag to append to its system prompt.
+        # ``bare``/``system_prompt`` are honoured best-effort: ``opencode run`` exposes no
+        # flag to drop its tool set or replace its system prompt, so the summarizer's input
+        # stays whatever OpenCode sends. The summarizer is already pointed at a scratch
+        # directory, so at least no repo AGENTS.md is loaded. (Claude, where the bloat is
+        # large and the echo risk real, applies the full reduction.) Accepted for a uniform
+        # backend interface.
         command = ["opencode", "run", "--format", "json", "--dir", str(self.repo)]
         if model:
             command.extend(["--model", model])

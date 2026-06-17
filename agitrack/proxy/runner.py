@@ -372,6 +372,7 @@ class ProxyRunner:
         new_session: bool = False,
         use_worktrees: bool = True,
         backend_args: list[str] | None = None,
+        commit_guidance: bool = True,
         # Optional injected collaborators (default to production construction).
         # These keyword arguments are for testing and advanced use; the CLI call
         # site passes only the first five parameters and is unaffected.
@@ -384,6 +385,10 @@ class ProxyRunner:
         self.active = Session.bare()
         self.repo = repo
         self._use_worktrees = use_worktrees  # #9: when False, run on the current branch directly
+        # When True, tell a coding agent that aGiTrack auto-commits so it doesn't self-commit
+        # (--no-commit-guidance / config turns it off). Appended to the agent's system prompt
+        # where the backend supports it (Claude).
+        self._commit_guidance = commit_guidance
         # Extra CLI args forwarded verbatim to every backend spawn (#32).
         self._backend_args = list(backend_args or [])
         self._force_new_session = new_session  # start a fresh conversation, do not resume
@@ -776,6 +781,7 @@ class ProxyRunner:
                 "_shared_resume_cancel": None,
                 "_background_share_ops": [],
                 "_use_worktrees": True,
+                "_commit_guidance": True,
                 "_relaunch_times": [],
                 "_exiting": False,
                 "_finalized_on_exit": False,
@@ -952,7 +958,9 @@ class ProxyRunner:
                 # The backend assigns its own id; snapshot existing sessions so
                 # the one it creates can be identified on the first parse.
                 self._pre_spawn_session_ids = {ref.id for ref in self.backend.list_sessions(self.repo.repo)}
-        command = self.backend.spawn_command(self.repo.repo, session_id=session_id, resume=resume)
+        command = self.backend.spawn_command(
+            self.repo.repo, session_id=session_id, resume=resume, commit_guidance=self._commit_guidance
+        )
         # Forward any backend-specific args the user passed through aGiTrack (#32),
         # before the sandbox wrapper so they reach the backend, not sandbox-exec.
         command = command + getattr(self, "_backend_args", [])
@@ -1042,7 +1050,16 @@ class ProxyRunner:
         # branch that differs from the active session's merge target, ask where this
         # session's changes should merge. (Each session has its own merge branch,
         # independent of the directory's checkout and of the other sessions.)
-        if self.worktree is None or self._base_branch is None:
+        if self._base_branch is None:
+            return
+        if not self._use_worktrees:
+            # No-worktree mode (#9): the agent edits the directory's branch directly, so a
+            # session can only ever land its work on that current branch — never a different
+            # merge target. There is no merge-target dialog; just warn (and follow) when the
+            # directory's branch is switched.
+            self._check_no_worktree_branch_change()
+            return
+        if self.worktree is None:
             return
         now = time.monotonic()
         if now - self._base_drift_check_at < self.BASE_DRIFT_CHECK_SECONDS:
@@ -1086,6 +1103,37 @@ class ProxyRunner:
             self._render()
             return
         self._prompt_merge_targets_on_dir_change()
+
+    def _check_no_worktree_branch_change(self) -> None:
+        # No-worktree mode: a session always works on (merges into) whatever branch is
+        # checked out in the repo directory and can never target a different one. If the
+        # user switches the directory's branch, future work simply lands on the new branch —
+        # warn so that change is never silent, and follow the directory so the status bar and
+        # accounting stay accurate. The warning fires once per switch (``_base_branch`` is
+        # advanced immediately, so the next poll sees no change).
+        now = time.monotonic()
+        if now - self._base_drift_check_at < self.BASE_DRIFT_CHECK_SECONDS:
+            return
+        self._base_drift_check_at = now
+        try:
+            current = self.base_repo.current_branch()  # the branch checked out in the repo dir
+        except Exception:
+            return
+        if not current or current == self._base_branch:
+            if current:
+                self._repo_dir_branch = current  # keep the status bar fresh
+            return
+        old = self._base_branch
+        self._base_branch = current
+        self._repo_dir_branch = current
+        self._integration.base_branch = current
+        self._set_message(
+            f"The repo directory switched from '{old}' to '{current}'. Running without a "
+            f"worktree, the agent's changes now land on '{current}' — a session always "
+            f"follows the directory's current branch and can't merge into a different one.",
+            seconds=12.0,
+        )
+        self._render()
 
     def _session_work_merged_into_base(self) -> bool:
         # True once the active session's work has landed on its merge branch — nothing
@@ -2422,7 +2470,7 @@ class ProxyRunner:
         sub = arg.strip().lower()
         if sub in ("on", "off"):
             enabled = sub == "on"
-            self.state.summarization_enabled = enabled
+            self._persist_summarizer_enabled(enabled)
             self._set_message(f"Summarizer {'enabled' if enabled else 'disabled'}.")
             self._render()
             return
@@ -2442,7 +2490,7 @@ class ProxyRunner:
             self._render()
             return
         if choice.startswith("Toggle"):
-            self.state.summarization_enabled = not enabled
+            self._persist_summarizer_enabled(not enabled)
             self._set_message(f"Summarizer {'enabled' if not enabled else 'disabled'}.")
         elif choice.startswith("Set model"):
             self._handle_summarizer_command("model")
@@ -2494,6 +2542,16 @@ class ProxyRunner:
         # (which lives in a transient worktree state) so the global value takes effect.
         self.global_config.summarization_model = value
         self.state.summarization_model = None
+
+    def _persist_summarizer_enabled(self, enabled: bool) -> None:
+        # Persist the on/off toggle in the GLOBAL config so it survives restarts, like the
+        # model. The per-session state lives in the session worktree's .agitrack/config.json,
+        # which is removed when the worktree is torn down on exit — a toggle written only
+        # there always reset to the default ("on") on the next launch (the reported bug).
+        if self.global_config is not None:
+            self.global_config.summarization_enabled = enabled
+        # Keep the active session's view consistent for the current run.
+        self.state.summarization_enabled = enabled
 
     # --- switch base branch ---
 
@@ -3878,6 +3936,9 @@ class ProxyRunner:
                     "as_id": as_id,
                     "backend": backend,
                     "entry_name": entry.name,
+                    # Lineage of the shared session being copied here, for the origin
+                    # note the first commit of the new session records.
+                    "origin_contributors": "+".join(entry.contributors),
                 }
             except Exception as error:
                 if not cancel.is_set():
@@ -4009,7 +4070,23 @@ class ProxyRunner:
         # A "Keep both" fork (as_id set) deliberately starts a SEPARATE lineage: record
         # no origin for it, so sharing it later publishes a new `<you>/<name>` entry of
         # its own rather than updating the session it was copied from (#55).
+        live_before = {getattr(getattr(s, "state", None), "backend_session_id", None) for s in self.sessions}
         self._resume_conversation(result["name"], result["resume_id"], backend=result["backend"])
+        state = self.state
+        if (
+            state is not None
+            and result["resume_id"] not in live_before
+            and state.backend_session_id == result["resume_id"]
+        ):
+            # A genuinely new local session copied from a collaborator's shared one
+            # (not a switch to an already-live session): record the copy so its first
+            # commit notes the context/tokens inherited from the shared conversation.
+            state.set_session_origin_event(
+                kind="copy",
+                source=result.get("session_id") or result["resume_id"],
+                source_name=result.get("entry_name"),
+                collaborator=result.get("origin_contributors"),
+            )
 
     def _complete_live_shared_update(self, result: dict) -> None:
         # Update the already-running session to the shared version: switch to it,
@@ -4122,6 +4199,7 @@ class ProxyRunner:
         src_id = self.state.backend_session_id
         if not src_id or not getattr(agent, "supports_session_sharing", False):
             return False
+        source_name = self.name  # the original session's name, captured before switching
         # The LATEST conversation state lives in the active session's worktree (its
         # cwd), so export from there first; the base repo may only hold an older
         # mirrored copy. (Same order as the auto-share path.)
@@ -4136,6 +4214,11 @@ class ProxyRunner:
         if not agent.import_shared_session(self.base_repo.repo, src_id, transcript, as_id=new_id):
             return False
         self._new_session(name, resume_session_id=new_id, backend=self.state.backend, base_branch=base_branch)
+        if self.state.backend_session_id == new_id:
+            # The fork took: record that this session resumes a copy of another
+            # conversation, so its first commit notes the inherited context/tokens
+            # (issue: track fork/copy in the interaction trace).
+            self.state.set_session_origin_event(kind="fork", source=src_id, source_name=source_name)
         return True
 
     def _merge_target_default(self) -> str | None:
@@ -5381,14 +5464,15 @@ class ProxyRunner:
         )
 
     def _summarization_enabled(self) -> bool:
+        # The GLOBAL config is the durable source of truth (survives restarts and worktree
+        # teardown), so it wins. The per-session worktree state — which always defaults to
+        # "on" on a fresh worktree — must NOT shadow it, or the toggle never persists. Fall
+        # back to the per-session value only when there is no global config (e.g. tests).
+        gc_enabled = getattr(self.global_config, "summarization_enabled", None)
+        if gc_enabled is not None:
+            return bool(gc_enabled)
         state_enabled = getattr(self.state, "summarization_enabled", None)
-        if state_enabled is not None:
-            return state_enabled
-        if self.global_config is not None:
-            gc_enabled = getattr(self.global_config, "summarization_enabled", None)
-            if gc_enabled is not None:
-                return gc_enabled
-        return True
+        return True if state_enabled is None else bool(state_enabled)
 
     def _render_status(self, text: str) -> None:
         prompt = text.replace("\r", "").replace("\n", "")
@@ -5818,6 +5902,7 @@ class ProxyRunner:
                 model=summarizer.model or model,
                 tokens_input=summarizer.tokens_input,
                 tokens_output=summarizer.tokens_output,
+                tokens_cache_read=summarizer.tokens_cache_read,
             )
             # Write back to the OWNING session (not self.active, which may have
             # changed): the service tick swaps each session in to apply it.

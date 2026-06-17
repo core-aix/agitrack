@@ -28,7 +28,7 @@ def main(argv: list[str] | None = None) -> int:
         "-h",
         "--help",
         action="store_true",
-        help="show aGiTrack help and backend help",
+        help="show this help message and exit",
     )
     parser.add_argument("--repo", default=".", help="target Git repository path")
     parser.add_argument("--verbose", action="store_true", help="show aGiTrack diagnostic messages")
@@ -73,6 +73,13 @@ def main(argv: list[str] | None = None) -> int:
         "(edits are visible live; no isolation/integration; unsafe with concurrent sessions)",
     )
     parser.add_argument(
+        "--no-commit-guidance",
+        action="store_true",
+        help="do not tell the coding agent that aGiTrack handles commits; by default aGiTrack "
+        "appends a note to the agent's system prompt (where the backend supports it) so the "
+        "agent does not create its own git commits unless you explicitly ask",
+    )
+    parser.add_argument(
         "--skip-privacy-ack",
         action="store_true",
         # Suppress the one-time privacy warning/acknowledgment. Set automatically
@@ -84,7 +91,8 @@ def main(argv: list[str] | None = None) -> int:
         "Unrecognized arguments are forwarded verbatim to the backend CLI "
         "(claude / opencode), e.g. `agitrack --backend opencode --port 12345`. Use "
         "`--` to forward arguments that aGiTrack also defines or a bare prompt, e.g. "
-        '`agitrack -- --verbose "fix the bug"`.'
+        '`agitrack -- --verbose "fix the bug"`. To see the backend CLI\'s own help, run '
+        "`agitrack -- --help` (or invoke the backend directly)."
     )
     # parse_known_args so backend-specific flags pass through instead of erroring.
     args, backend_args = parser.parse_known_args(argv)
@@ -95,9 +103,10 @@ def main(argv: list[str] | None = None) -> int:
     # First run: ask the user to choose a default backend before launching.
     config = GlobalConfig()
 
-    # Handle help request before any other processing.
+    # Handle help request before any other processing. Show ONLY aGiTrack's own options —
+    # not the backend's help (that is available via `agitrack -- --help`, handled below).
     if args.help:
-        _show_combined_help(parser, args.backend, config)
+        parser.print_help()
         return 0
 
     if args.dashboard:
@@ -158,6 +167,10 @@ def main(argv: list[str] | None = None) -> int:
 
     # Worktrees on unless the config opts out or --no-worktree is passed (flag wins).
     use_worktrees = False if args.no_worktree else config.use_worktrees
+    # The agent commit-guidance note is on unless the config opts out or
+    # --no-commit-guidance is passed (flag wins). getattr keeps a config written before
+    # this key existed (or a partial stub) defaulting to on.
+    commit_guidance = False if args.no_commit_guidance else getattr(config, "commit_guidance", True)
 
     if backend_args:
         _warn_reserved_passthrough(args.backend or config.default_backend, backend_args)
@@ -199,6 +212,7 @@ def main(argv: list[str] | None = None) -> int:
                 new_session=args.new_session,
                 backend_args=backend_args,
                 prompts=args.prompts,
+                commit_guidance=commit_guidance,
             ).run()
         else:
             return ProxyRunner(
@@ -208,6 +222,7 @@ def main(argv: list[str] | None = None) -> int:
                 new_session=args.new_session,
                 use_worktrees=use_worktrees,
                 backend_args=backend_args,
+                commit_guidance=commit_guidance,
             ).run()
     except (GitError, RuntimeError) as error:
         print(error)
@@ -232,46 +247,6 @@ def _warn_reserved_passthrough(backend: str, backend_args: list[str]) -> None:
             f"Warning: forwarding {', '.join(hit)} to {backend}; aGiTrack manages "
             "session selection itself, so this may interfere with its session tracking."
         )
-
-
-def _terminal_width() -> int:
-    try:
-        return shutil.get_terminal_size().columns
-    except (AttributeError, ValueError):
-        return 80
-
-
-def _show_combined_help(
-    parser: argparse.ArgumentParser,
-    backend_arg: str | None,
-    config: GlobalConfig,
-) -> None:
-    parser.print_help()
-    backend = backend_arg or config.default_backend
-    if not backend:
-        print("\n(No backend selected yet. Run `agitrack` to choose one.)")
-        return
-    backend_cmd = _BACKEND_COMMANDS.get(backend)
-    if not backend_cmd:
-        print(f"\n(Unknown backend '{backend}'. Cannot show backend help.)")
-        return
-    if not shutil.which(backend_cmd):
-        print(f"\n(Backend '{backend}' not found on PATH. Install it to see its help.)")
-        return
-    width = _terminal_width()
-    print("\n" + "=" * width)
-    print(f"Backend help ({backend})")
-    print("=" * width + "\n")
-    try:
-        result = subprocess.run(
-            [backend_cmd, "--help"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        print(result.stdout or result.stderr)
-    except Exception as error:
-        print(f"(Could not run '{backend_cmd} --help': {error})")
 
 
 def _check_for_update_at_startup(config: GlobalConfig) -> None:

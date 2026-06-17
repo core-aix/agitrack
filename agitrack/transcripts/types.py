@@ -28,6 +28,12 @@ class SessionTurn:
     # the backend transcript carries no timestamps.
     started_at: int | None = None
     ended_at: int | None = None
+    # How many context compactions the backend performed at the start of this turn
+    # (the conversation history was summarized to fit the window). A compaction
+    # resets what "context" means and shrinks the tokens the turn runs against, so
+    # it is recorded to make the turn's token counts interpretable. Almost always 0
+    # or 1; only the boundary before a turn is attributed to it.
+    compaction_count: int = 0
 
 
 @dataclass

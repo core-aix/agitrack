@@ -413,12 +413,16 @@ def parse_exported_session(
     assistant_group: list[dict] = []
     turns: list[SessionTurn] = []
     child_ids_per_turn: list[set[str]] = []
+    # Context compactions OpenCode performed within the current turn (see below).
+    compactions = 0
 
     def flush() -> None:
+        nonlocal compactions
         if current_user is None or not assistant_group:
             return
         turn = _build_turn(current_user, assistant_group, model)
         if turn:
+            turn.compaction_count = compactions
             turns.append(turn)
             child_ids: set[str] = set()
             for assistant in assistant_group:
@@ -432,13 +436,17 @@ def parse_exported_session(
             flush()
             current_user = message
             assistant_group = []
+            compactions = 0
         elif role == "assistant" and current_user is not None:
             # OpenCode injects its conversation summary as an assistant message
             # marked `summary: true` (mode/agent "compaction"). It is bookkeeping,
             # not a real response, so keep it out of the turn's final response and
-            # the interaction trace. (User messages carry an unrelated `summary`
-            # struct of file diffs, which is why this guard is assistant-only.)
+            # the interaction trace — but tally it, since a compaction resets the
+            # turn's context and so bears on its token counts. (User messages carry
+            # an unrelated `summary` struct of file diffs, which is why this guard
+            # is assistant-only.)
             if msg_info.get("summary") is True or msg_info.get("mode") == "compaction":
+                compactions += 1
                 continue
             assistant_group.append(message)
     flush()

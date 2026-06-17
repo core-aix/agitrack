@@ -60,6 +60,12 @@ def format_dashboard(dash: Dashboard) -> str:
     shown = [(label, totals[key]) for key, label in _TOKEN_ORDER if totals.get(key)]
     if shown:
         lines.extend(f"  {label}: {value:,}" for label, value in shown)
+        # Spell out the input convention only when cache-creation actually happened:
+        # input folds in cache-write tokens (fresh input processed once into the cache),
+        # which differs from how the provider bills it (writes/reads are separate rates).
+        if totals.get("cache_write") or totals.get("subagent_cache_write"):
+            lines.append("  note: input includes cache-creation (cache write) tokens — differs from")
+            lines.append("        provider billing; cache write/read are listed separately above")
         line_yield = dash.lines_per_1k_output_tokens
         if line_yield is not None:
             lines.append(f"  line yield: {line_yield:,.1f} AI-changed lines per 1k output tokens")
