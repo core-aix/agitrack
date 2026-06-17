@@ -61,6 +61,13 @@ class ClaudeBackend:
             command.extend(["--resume", session_id])
         if bare:
             command.extend(_bare_args(system_prompt))
+        else:
+            # A coding run (e.g. shell mode): tell the agent aGiTrack auto-commits so it
+            # doesn't self-commit. Deliberately NOT added on a bare run — that is the
+            # summarizer, which must read only its instruction and the trace.
+            from agitrack.backends.proxy_agents import AGENT_SYSTEM_NOTE
+
+            command.extend(["--append-system-prompt", AGENT_SYSTEM_NOTE])
         command.extend(self.backend_args)
 
         # Sub-agents Claude spawns are recorded in their OWN transcript files, separate
