@@ -19,15 +19,22 @@ from agitrack.backends.base import AgentResult, TokenUsage
 # Measured effect on a real summary call: ~18,000 input tokens (system prompt + tools +
 # memory, mostly via cache) collapse to ~225 — just the instruction and the trace.
 _BARE_SYSTEM_PROMPT = "Follow the user's instructions exactly and output only what is requested, with no preamble."
-_BARE_ARGS = [
-    "--tools",
-    "",
-    "--strict-mcp-config",
-    "--setting-sources",
-    "",
-    "--system-prompt",
-    _BARE_SYSTEM_PROMPT,
-]
+
+
+def _bare_args(system_prompt: str | None) -> list[str]:
+    # The caller's ``system_prompt`` (e.g. the summarizer's instruction) replaces the
+    # default agent system prompt; with the directive in the SYSTEM role the model treats
+    # the user message as content to act on rather than an instruction to echo. None falls
+    # back to a minimal generic directive.
+    return [
+        "--tools",
+        "",
+        "--strict-mcp-config",
+        "--setting-sources",
+        "",
+        "--system-prompt",
+        system_prompt or _BARE_SYSTEM_PROMPT,
+    ]
 
 
 class ClaudeBackend:
@@ -38,14 +45,22 @@ class ClaudeBackend:
         self.verbose = verbose
         self.backend_args = list(backend_args or [])  # forwarded verbatim to the backend CLI (#32)
 
-    def run(self, prompt: str, *, model: str | None, session_id: str | None, bare: bool = False) -> AgentResult:
+    def run(
+        self,
+        prompt: str,
+        *,
+        model: str | None,
+        session_id: str | None,
+        bare: bool = False,
+        system_prompt: str | None = None,
+    ) -> AgentResult:
         command = ["claude", "-p", prompt, "--output-format", "json"]
         if model:
             command.extend(["--model", model])
         if session_id:
             command.extend(["--resume", session_id])
         if bare:
-            command.extend(_BARE_ARGS)
+            command.extend(_bare_args(system_prompt))
         command.extend(self.backend_args)
 
         # Sub-agents Claude spawns are recorded in their OWN transcript files, separate
