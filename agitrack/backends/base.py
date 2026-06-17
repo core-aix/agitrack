@@ -70,7 +70,12 @@ class AgentBackend(Protocol):
         session_id: str | None,
         bare: bool = False,
         system_prompt: str | None = None,
+        commit_guidance: bool = True,
     ) -> AgentResult: ...
+
+    # ``commit_guidance``: on a non-bare coding run, append the note telling the agent that
+    # aGiTrack auto-commits (so it doesn't self-commit), where the backend supports it.
+    # Disabled per-run by --no-commit-guidance. Ignored on a bare (summarizer) run.
 
     # ``bare``: run as a plain text completion — no tools, no agent system prompt, no
     # project/user memory or MCP servers — so the only input is the caller's prompt. Used

@@ -372,6 +372,7 @@ class ProxyRunner:
         new_session: bool = False,
         use_worktrees: bool = True,
         backend_args: list[str] | None = None,
+        commit_guidance: bool = True,
         # Optional injected collaborators (default to production construction).
         # These keyword arguments are for testing and advanced use; the CLI call
         # site passes only the first five parameters and is unaffected.
@@ -384,6 +385,10 @@ class ProxyRunner:
         self.active = Session.bare()
         self.repo = repo
         self._use_worktrees = use_worktrees  # #9: when False, run on the current branch directly
+        # When True, tell a coding agent that aGiTrack auto-commits so it doesn't self-commit
+        # (--no-commit-guidance / config turns it off). Appended to the agent's system prompt
+        # where the backend supports it (Claude).
+        self._commit_guidance = commit_guidance
         # Extra CLI args forwarded verbatim to every backend spawn (#32).
         self._backend_args = list(backend_args or [])
         self._force_new_session = new_session  # start a fresh conversation, do not resume
@@ -776,6 +781,7 @@ class ProxyRunner:
                 "_shared_resume_cancel": None,
                 "_background_share_ops": [],
                 "_use_worktrees": True,
+                "_commit_guidance": True,
                 "_relaunch_times": [],
                 "_exiting": False,
                 "_finalized_on_exit": False,
@@ -952,7 +958,9 @@ class ProxyRunner:
                 # The backend assigns its own id; snapshot existing sessions so
                 # the one it creates can be identified on the first parse.
                 self._pre_spawn_session_ids = {ref.id for ref in self.backend.list_sessions(self.repo.repo)}
-        command = self.backend.spawn_command(self.repo.repo, session_id=session_id, resume=resume)
+        command = self.backend.spawn_command(
+            self.repo.repo, session_id=session_id, resume=resume, commit_guidance=self._commit_guidance
+        )
         # Forward any backend-specific args the user passed through aGiTrack (#32),
         # before the sandbox wrapper so they reach the backend, not sandbox-exec.
         command = command + getattr(self, "_backend_args", [])

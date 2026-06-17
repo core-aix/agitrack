@@ -37,7 +37,7 @@ aGiTrack stands for agent + git tracking. It is a Python library and interactive
 
 ## Staging Behavior
 
-- When starting a coding agent, if the backend CLI supports appending to its system prompt (Claude's `--append-system-prompt`; OpenCode's TUI has no such flag), append a note that the session runs inside aGiTrack, which auto-commits each turn, so the agent must not create git commits itself unless the user explicitly asks. Apply this to coding sessions only (interactive proxy spawn and the shell-mode `run`), NOT to the summarizer's bare run.
+- When starting a coding agent, if the backend CLI supports appending to its system prompt (Claude's `--append-system-prompt`; OpenCode's TUI has no such flag), append a note that the session runs inside aGiTrack, which auto-commits each turn, so the agent must not create git commits itself unless the user explicitly asks. Apply this to coding sessions only (interactive proxy spawn and the shell-mode `run`), NOT to the summarizer's bare run. It is on by default but can be disabled per run with `--no-commit-guidance` (or `commit_guidance: false` in the global config), threaded as `commit_guidance` through the runners → `spawn_command`/`run`.
 - Use `git add -u` by default for tracked modifications and deletions.
 - When new untracked files are present, ask whether they should be staged.
 - If the user declines staging untracked files, remember those files in repository-local state and do not ask about them again automatically.

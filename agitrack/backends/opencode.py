@@ -24,7 +24,10 @@ class OpenCodeBackend:
         session_id: str | None,
         bare: bool = False,
         system_prompt: str | None = None,
+        commit_guidance: bool = True,
     ) -> AgentResult:
+        # ``commit_guidance`` is accepted for a uniform interface but unused: OpenCode's CLI
+        # has no flag to append to its system prompt.
         # ``bare``/``system_prompt`` are honoured best-effort: ``opencode run`` exposes no
         # flag to drop its tool set or replace its system prompt, so the summarizer's input
         # stays whatever OpenCode sends. The summarizer is already pointed at a scratch
