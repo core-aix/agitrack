@@ -225,6 +225,24 @@ class GlobalConfig:
         self.data["check_for_updates"] = bool(value)
         self.save()
 
+    @property
+    def pending_manual_update(self) -> str | None:
+        """Version of an update whose *automatic* install failed (or that the user
+        chose not to retry after a failure). While set, aGiTrack shows a one-time
+        manual-update reminder at startup but suppresses the regular in-session
+        update notice, so a user on an older version isn't nagged repeatedly. It is
+        cleared once aGiTrack is running that version or newer."""
+        value = self.data.get("pending_manual_update")
+        return value if isinstance(value, str) and value else None
+
+    @pending_manual_update.setter
+    def pending_manual_update(self, value: str | None) -> None:
+        if value:
+            self.data["pending_manual_update"] = str(value)
+        else:
+            self.data.pop("pending_manual_update", None)
+        self.save()
+
     # --- session sharing (issue #55) ---------------------------------------
     # Sharing is opt-in: nothing is ever uploaded until the user explicitly shares
     # a session and acknowledges the one-time consent notice. We remember that

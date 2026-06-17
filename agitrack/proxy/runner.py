@@ -1402,6 +1402,12 @@ class ProxyRunner:
         gc = getattr(self, "global_config", None)
         return bool(getattr(gc, "check_for_updates", True)) if gc is not None else False
 
+    def _manual_update_pending(self) -> bool:
+        # True when a previous automatic update failed (or wasn't retried). The user
+        # is reminded once at startup, so the periodic in-session notice is held back.
+        gc = getattr(self, "global_config", None)
+        return bool(getattr(gc, "pending_manual_update", None)) if gc is not None else False
+
     def _merge_session_active(self) -> bool:
         # True while a merge / conflict resolution is in progress in ANY session
         # (the active one, or a background session integrating its turn). Update
@@ -1454,10 +1460,12 @@ class ProxyRunner:
         if result is None or not result.ok:
             return
         self._update_status = result
-        if result.available and not self._update_offered:
+        if result.available and not self._update_offered and not self._manual_update_pending():
             # First time we have seen this update: prompt the user (a status-bar
             # notice pointing at the `update` command, so we don't seize the
-            # screen mid-keystroke).
+            # screen mid-keystroke). Suppressed when a manual update is already
+            # pending (a prior automatic attempt failed) — that user is reminded
+            # once at startup instead of being nagged here every check.
             self._update_offered = True
             self._set_message(
                 f"{result.message}\n{self._menu_label()} → 'update' to install it when your sessions finish.",
@@ -1519,7 +1527,20 @@ class ProxyRunner:
             result = self._updater.apply()
             if not result.ok:
                 self._update_applying = False
-                self._set_message(f"aGiTrack update failed: {result.error}", seconds=12.0)
+                # Remember so the next startup reminds the user (once) instead of the
+                # in-session notice re-appearing every check; the message already
+                # carries manual-update instructions. Session untouched — keep running.
+                if self.global_config is not None:
+                    target = (self._update_status.latest if self._update_status else "") or "available"
+                    self.global_config.pending_manual_update = target
+                self._update_offered = True  # stop the periodic notice this session
+                manual = ""
+                if self._updater is not None:
+                    try:
+                        manual = f" {self._updater.manual_update_instructions()}"
+                    except Exception:  # instructions are best-effort, never block the message
+                        manual = ""
+                self._set_message(f"aGiTrack update failed: {result.error}.{manual}", seconds=15.0)
                 self._render()
                 return  # session untouched — keep running
             message = f"{result.message} Restarting aGiTrack…"

@@ -336,6 +336,20 @@ def test_record_user_prompt_noop_on_empty(tmp_path):
     assert state.pending_trace() == []
 
 
+def test_record_user_prompt_skips_slash_commands(tmp_path):
+    # A bare slash command (e.g. the user typing /compact in the TUI) is a backend
+    # directive, not a prompt. It must not be recorded into the trace, or it surfaces
+    # in the commit as a stray '## User /comp' entry — redundant with the compaction
+    # lead-in note the trace already carries.
+    engine, _, state = _engine(tmp_path)
+    for command in ("/compact", "/comp", "  /model opus  ", "/clear"):
+        engine.record_user_prompt(command)
+    assert state.pending_trace() == []  # none recorded
+    # A real prompt that merely mentions a slash mid-sentence is still recorded.
+    engine.record_user_prompt("run /compact after you finish")
+    assert [item["content"] for item in state.pending_trace()] == ["run /compact after you finish"]
+
+
 def test_await_followup_appends_normalized(tmp_path):
     engine, _, _ = _engine(tmp_path)
     result = engine.await_followup("  fix   the bug  ", [])
