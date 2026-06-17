@@ -1,10 +1,17 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
 from agitrack.backends.base import AgentResult, TokenUsage
+
+# The summarizer is a mechanical text-reduction task that gains nothing from extended
+# reasoning, so its bare run turns thinking off entirely rather than using whatever the
+# model defaults to. Claude Code reads the budget from MAX_THINKING_TOKENS; 0 disables
+# thinking on the Anthropic API (it omits the thinking parameter on third-party providers).
+_SUMMARIZER_THINKING_TOKENS = "0"
 
 # Flags that strip Claude Code down to a plain text completion for a ``bare`` run (the
 # summarizer). Each removes a chunk of input the summary never needs:
@@ -79,6 +86,13 @@ class ClaudeBackend:
 
         prior_subagent_files = claude_transcripts.subagent_agent_files(self.repo, session_id or "")
 
+        env = None
+        if bare:
+            # Turn thinking off for the summarizer (see _SUMMARIZER_THINKING_TOKENS);
+            # a caller-set MAX_THINKING_TOKENS still wins so it can be overridden.
+            env = {**os.environ}
+            env.setdefault("MAX_THINKING_TOKENS", _SUMMARIZER_THINKING_TOKENS)
+
         process = subprocess.run(
             command,
             cwd=self.repo,
@@ -86,6 +100,7 @@ class ClaudeBackend:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
+            env=env,
         )
         if self.verbose and process.stderr.strip():
             print(process.stderr.rstrip())
