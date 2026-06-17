@@ -12,7 +12,16 @@ concurrency:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    # aGiTrack is a POSIX TUI (it imports pty/termios/fcntl directly), so the OS axis
+    # that actually matters is macOS (BSD pty/termios) vs Linux (glibc). Run both to
+    # catch platform-specific pty/ioctl/terminal differences. Native Windows is not a
+    # target — the package can't even import there; Windows is supported via WSL, which
+    # is Linux and so is already covered by the ubuntu job.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -35,13 +44,18 @@ jobs:
       - name: Install dependencies
         run: uv sync --group dev
 
+      # Lint, format and type checks are platform-independent — run them once (on
+      # Linux) rather than on every OS in the matrix.
       - name: Lint (ruff check)
+        if: matrix.os == 'ubuntu-latest'
         run: uv run ruff check agitrack/ tests/
 
       - name: Format (ruff format --check)
+        if: matrix.os == 'ubuntu-latest'
         run: uv run ruff format --check agitrack/ tests/
 
       - name: Types (mypy, new errors only)
+        if: matrix.os == 'ubuntu-latest'
         # mypy runs against a committed baseline of pre-existing type debt
         # (mypy-baseline.txt). The build fails only on NEW type errors; the
         # baseline is burned down separately (#42). Regenerate with:

@@ -63,7 +63,7 @@ class FakeBackend:
     def __init__(self, repo, *, verbose=False, backend_args=None):
         self.repo = Path(repo)
 
-    def run(self, prompt, *, model, session_id):
+    def run(self, prompt, *, model, session_id, bare=False, system_prompt=None, commit_guidance=True):
         FakeBackend.runs.append(prompt)
         (self.repo / "hello.py").write_text("print('hi')\n", encoding="utf-8")
         return AgentResult(
@@ -90,7 +90,9 @@ def _scripted_shell(tmp_path, monkeypatch, prompts):
     _no_input(monkeypatch)
     repo = GitRepo.init(tmp_path / "demo")
     shell = AgitrackShell(repo, backend="claude", prompts=prompts)
-    shell.state.summarization_enabled = False
+    # Disable summarization for scripted tests via the durable GLOBAL config (the source
+    # of truth), so commits stay prompt-led rather than going through the summarizer.
+    shell.global_config.summarization_enabled = False
     return shell, repo
 
 

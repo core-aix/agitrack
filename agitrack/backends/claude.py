@@ -6,6 +6,36 @@ from pathlib import Path
 
 from agitrack.backends.base import AgentResult, TokenUsage
 
+# Flags that strip Claude Code down to a plain text completion for a ``bare`` run (the
+# summarizer). Each removes a chunk of input the summary never needs:
+#   --tools ""            no built-in tool schemas (the largest single source of bloat)
+#   --strict-mcp-config   ignore every configured MCP server (no --mcp-config given), so
+#                         no MCP tool schemas are loaded
+#   --setting-sources ""  load no user/project/local settings — no CLAUDE.md, skills,
+#                         plugins or hooks
+#   --system-prompt <…>   replace Claude Code's large agent system prompt with a minimal
+#                         one (the actual summarization instruction rides in the user
+#                         prompt). Without this the default system prompt is still sent.
+# Measured effect on a real summary call: ~18,000 input tokens (system prompt + tools +
+# memory, mostly via cache) collapse to ~225 — just the instruction and the trace.
+_BARE_SYSTEM_PROMPT = "Follow the user's instructions exactly and output only what is requested, with no preamble."
+
+
+def _bare_args(system_prompt: str | None) -> list[str]:
+    # The caller's ``system_prompt`` (e.g. the summarizer's instruction) replaces the
+    # default agent system prompt; with the directive in the SYSTEM role the model treats
+    # the user message as content to act on rather than an instruction to echo. None falls
+    # back to a minimal generic directive.
+    return [
+        "--tools",
+        "",
+        "--strict-mcp-config",
+        "--setting-sources",
+        "",
+        "--system-prompt",
+        system_prompt or _BARE_SYSTEM_PROMPT,
+    ]
+
 
 class ClaudeBackend:
     name = "claude"
@@ -15,12 +45,31 @@ class ClaudeBackend:
         self.verbose = verbose
         self.backend_args = list(backend_args or [])  # forwarded verbatim to the backend CLI (#32)
 
-    def run(self, prompt: str, *, model: str | None, session_id: str | None) -> AgentResult:
+    def run(
+        self,
+        prompt: str,
+        *,
+        model: str | None,
+        session_id: str | None,
+        bare: bool = False,
+        system_prompt: str | None = None,
+        commit_guidance: bool = True,
+    ) -> AgentResult:
         command = ["claude", "-p", prompt, "--output-format", "json"]
         if model:
             command.extend(["--model", model])
         if session_id:
             command.extend(["--resume", session_id])
+        if bare:
+            command.extend(_bare_args(system_prompt))
+        elif commit_guidance:
+            # A coding run (e.g. shell mode): tell the agent aGiTrack auto-commits so it
+            # doesn't self-commit. Deliberately NOT added on a bare run — that is the
+            # summarizer, which must read only its instruction and the trace — and skipped
+            # when commit_guidance is off (--no-commit-guidance).
+            from agitrack.backends.proxy_agents import AGENT_SYSTEM_NOTE
+
+            command.extend(["--append-system-prompt", AGENT_SYSTEM_NOTE])
         command.extend(self.backend_args)
 
         # Sub-agents Claude spawns are recorded in their OWN transcript files, separate

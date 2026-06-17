@@ -530,6 +530,13 @@ header{padding:54px 0 22px}
 .controls{position:sticky;top:0;z-index:20;margin:22px 0 30px;padding:14px 16px;background:var(--panel);
   border:1px solid var(--line);border-bottom-width:3px;display:flex;flex-wrap:nowrap;gap:16px;align-items:flex-end}
 .controls .prompt{color:var(--phosphor);font-weight:600;align-self:center;white-space:nowrap}
+/* "loading…" badge shown while a filter change re-fetches the data. */
+.loading{margin-left:auto;align-self:center;display:inline-flex;align-items:center;gap:8px;
+  color:var(--phosphor);font-size:13px;white-space:nowrap}
+.loading[hidden]{display:none}
+.loading .spin{width:13px;height:13px;border:2px solid var(--phosphor-dim);border-top-color:var(--phosphor);
+  border-radius:50%;animation:spin .7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
 .field{display:flex;flex-direction:column;gap:4px}
 .field label{font-size:11px;color:var(--amber);letter-spacing:.6px;text-transform:uppercase;white-space:nowrap}
 .field select{appearance:none;background:var(--ink);color:var(--fg);border:1px solid var(--line);
@@ -742,6 +749,7 @@ footer{margin-top:46px;padding-top:22px;border-top:1px dashed var(--line);color:
       </div>
     </div>
     <button class="reset" id="reset">reset</button>
+    <span class="loading" id="loading" hidden aria-live="polite"><span class="spin"></span>loading…</span>
   </div>
 
   <h2 class="section">overview</h2>
@@ -850,7 +858,15 @@ const fmt = n => (n||0).toLocaleString("en-US");
 const pct = (a,b) => b ? (a/b*100).toFixed(1)+"%" : "0%";
 const esc = s => (s||"").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
 const kfmt = n => { n=n||0; return n>=1000 ? (n/1000).toFixed(n>=10000?0:1)+"k" : ""+n; };
+// Commit-log subjects can be very long; cap the displayed line at 120 chars with an
+// ellipsis (the full subject stays available via the row's hover title and the expanded
+// commit message). The ellipsis counts toward the cap, so the result never exceeds 120.
+const SUBJECT_MAX = 120;
+const truncSubject = s => { s = s||""; return s.length > SUBJECT_MAX ? s.slice(0, SUBJECT_MAX-1).trimEnd()+"…" : s; };
 function setOffline(on){ const el=$("neterror"); if(el) el.hidden = !on; }
+// Show the "loading…" spinner while a user-initiated filter change re-fetches the data
+// (not during the background refresh poll, which would make it flicker constantly).
+function showLoading(on){ const el=$("loading"); if(el) el.hidden = !on; }
 
 function qs(extra){
   const p = new URLSearchParams();
@@ -975,9 +991,16 @@ function renderAgg(){
   // widths by log10 instead; the numbers shown on each row remain the real counts.
   const logTok = v => Math.log10((v||0)+1);
   const maxLog = Math.max(1, ...shown.map(([k])=>logTok(tok[k])));
+  // Whenever cache-creation happened, spell out aGiTrack's input convention: input folds
+  // in cache-write tokens (fresh input processed once into the cache), which is NOT how
+  // the provider bills it (writes/reads are separate line items at different rates).
+  const cacheNote = (tok.cache_write||0)+(tok.subagent_cache_write||0) > 0
+    ? `<div class="hint" title="aGiTrack counts a turn's input as fresh input = uncached input + cache-creation tokens, so the number reflects how much context was processed rather than the provider's price sheet. cache write and cache read are still listed as their own bars.">input includes cache-creation (cache&nbsp;write) tokens — differs from provider billing, see README</div>`
+    : "";
+  // Notes sit BELOW the bars so the bars lead the panel and the annotations follow.
   $("tokens").innerHTML = shown.length
-    ? `<div class="hint">bar widths are log-scaled</div>` +
-      shown.map(([k,label]) => barRow(label, "", logTok(tok[k]), maxLog, `<b>${fmt(tok[k])}</b>`, k==="output")).join("")
+    ? shown.map(([k,label]) => barRow(label, "", logTok(tok[k]), maxLog, `<b>${fmt(tok[k])}</b>`, k==="output")).join("") +
+      `<div class="hint">bar widths are log-scaled</div>` + cacheNote
     : `<div class="empty">no token metadata recorded</div>`;
 
   $("by-backend").innerHTML = groupPanel(AGG.by_backend);
@@ -1185,8 +1208,10 @@ function renderLog(){
     const squash = (c.parts&&c.parts.length)?`<span class="squash">⧉ ${c.parts.length} squashed</span>`:"";
     const lc = (c.ins||c.del)?`<span class="lc"><span class="add">+${fmt(c.ins)}</span> <span class="rem">−${fmt(c.del)}</span></span>`:"";
     const m = c.eff_model?`<span class="lc">${esc(c.eff_model)}</span>`:"";
+    const subj = c.subject||"", shown = truncSubject(subj);
+    const subjTitle = shown!==subj ? ` title="${esc(subj)}"` : "";  // full subject on hover when cut
     return `<div class="entry ${cls}" data-i="${i}"><span class="sha">${esc(c.short)}</span>${badge}${squash}`+
-      `<span class="ksub">${esc(c.subject)}</span>${lc}${tokenBrief(c.tokens)}${m}`+
+      `<span class="ksub"${subjTitle}>${esc(shown)}</span>${lc}${tokenBrief(c.tokens)}${m}`+
       `<div class="detail" id="detail-${i}" hidden></div></div>`;
   }).join("");
   const from = total ? offset+1 : 0, to = offset+entries.length;
@@ -1266,9 +1291,12 @@ function syncFilters(){
 // PER stays in state; the data range comes from the period filter. A data change
 // re-bucketed the series, so any mouse zoom window is reset to the full range.
 async function applyFilters(){
-  await loadAgg(); await loadLog(0);
-  resetZoom(); setDateBounds(); syncPeriodDates();
-  syncFilters(); renderAgg(); renderLog();
+  showLoading(true);
+  try{
+    await loadAgg(); await loadLog(0);
+    resetZoom(); setDateBounds(); syncPeriodDates();
+    syncFilters(); renderAgg(); renderLog();
+  } finally { showLoading(false); }  // always clear the spinner, even on a fetch failure
 }
 async function refresh(){
   const prev = HEAD;
@@ -1328,7 +1356,8 @@ function init(){
   // Sort only reorders the (already filtered) commit log, so it just reloads the
   // log's first page — no need to recompute the aggregates.
   $("f-sort").value = state.sort;
-  $("f-sort").onchange = async e => { state.sort = e.target.value; if(await loadLog(0)) renderLog(); };
+  $("f-sort").onchange = async e => { state.sort = e.target.value; showLoading(true);
+    try{ if(await loadLog(0)) renderLog(); } finally { showLoading(false); } };
   // "custom range…" reveals a date-range popup anchored under the select; the
   // presets and "all time" hide it.
   const showDateRange = on => { $("daterange").hidden = !on; };
@@ -1364,7 +1393,8 @@ function init(){
   });
   // Bucket granularity: refetch the (re-bucketed) series and redraw the plot.
   $("ts-gran").value = state.granularity;
-  $("ts-gran").onchange = async e => { state.granularity = e.target.value; if(await loadAgg()){ resetZoom(); renderTimeseries(); } };
+  $("ts-gran").onchange = async e => { state.granularity = e.target.value; showLoading(true);
+    try{ if(await loadAgg()){ resetZoom(); renderTimeseries(); } } finally { showLoading(false); } };
   // Zoom/pan the x axis over the loaded buckets: wheel zooms (anchored on the
   // cursor), drag pans, double-click resets — all client-side, no refetch.
   const cv = $("ts-canvas");

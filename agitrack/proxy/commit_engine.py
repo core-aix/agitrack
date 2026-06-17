@@ -322,6 +322,11 @@ class CommitEngine:
         # transcript carries no timestamps).
         starts = [turn.started_at for turn in turns if turn.started_at]
         ends = [turn.ended_at for turn in turns if turn.ended_at]
+        # Context compactions across the turns this commit accounts for, and a one-shot
+        # fork/copy origin event for this session — both recorded because they reshape
+        # the context the token counts run against (issue: track compaction & fork/copy).
+        compactions = sum(int(getattr(turn, "compaction_count", 0) or 0) for turn in turns)
+        origin_event = self.state.session_origin_event()
         message = build_agent_commit_message(
             latest_prompt=subject_text,
             trace=self.state.pending_trace(),
@@ -335,6 +340,8 @@ class CommitEngine:
             covered_commits=covered_display or None,
             started_at=min(starts) if starts else None,
             ended_at=max(ends) if ends else None,
+            compactions=compactions,
+            origin_event=origin_event,
         )
         if cover_backend_head or cover_with_staged:
             # The backend committed its own work (#35). Its commits keep their
@@ -355,6 +362,11 @@ class CommitEngine:
             )
         else:
             commit_sha = self.repo.commit(message)
+        # The fork/copy origin event is a one-shot: it has now been surfaced in this
+        # commit, so clear it (a no-op when there was none) — later commits in the same
+        # session shouldn't keep re-announcing the lineage.
+        if origin_event is not None:
+            self.state.clear_session_origin_event()
         # Render the interaction trace exactly as it landed in the commit, BEFORE
         # clearing it, and hand it to on_commit_fn — this is the summarizer's sole
         # input. (Capturing it in the caller before commit_turns was wrong: the

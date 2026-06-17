@@ -414,6 +414,40 @@ class AgitrackState:
         # should use set_shared_origin to capture the full lineage identity.
         self.set_shared_origin(session_id, owner=None, name=name)
 
+    # --- session origin event (fork / copy) --------------------------------
+    # A one-shot record that THIS session was started by forking or copying another
+    # conversation, set when the fork/copy happens and surfaced by the next agent
+    # commit, then cleared. A forked/copied session resumes a transcript that already
+    # carries prior turns (and the original's token usage), so noting the lineage in
+    # the commit makes the inherited context — and the token counts that ride on it —
+    # interpretable. ``kind`` is "fork" (same user, new lineage) or "copy" (a peer's
+    # shared session brought in here).
+
+    def session_origin_event(self) -> dict | None:
+        rec = self.data.get("session_origin_event")
+        return dict(rec) if isinstance(rec, dict) else None
+
+    def set_session_origin_event(
+        self,
+        *,
+        kind: str,
+        source: str | None,
+        collaborator: str | None = None,
+        source_name: str | None = None,
+    ) -> None:
+        self.data["session_origin_event"] = {
+            "kind": kind,
+            "source": str(source or ""),
+            "collaborator": str(collaborator or ""),
+            "source_name": str(source_name or ""),
+            "at": int(time.time()),
+        }
+        self.save()
+
+    def clear_session_origin_event(self) -> None:
+        if self.data.pop("session_origin_event", None) is not None:
+            self.save()
+
     def pending_trace(self) -> list[dict]:
         return list(self.data.get("pending_trace") or [])
 

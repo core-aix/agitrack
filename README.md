@@ -7,6 +7,8 @@ aGiTrack supports OpenCode and Claude (Claude Code) as interchangeable backends.
 
 ## Requirements
 
+aGiTrack runs on **macOS and Linux**. It is a POSIX terminal application (it drives the terminal through `pty`/`termios`), so it does not run on native Windows; on Windows, use it inside **WSL** (Windows Subsystem for Linux), which is a Linux environment. aGiTrack works across common terminal emulators (e.g. iTerm2, Apple Terminal, Alacritty, kitty, GNOME Terminal, Konsole, tmux, the VS Code integrated terminal, and Windows Terminal driving WSL), degrading gracefully on terminals that lack features such as the alternate screen or the kitty keyboard protocol.
+
 aGiTrack needs **git** and at least one backend CLI — [Claude Code](https://docs.claude.com/en/docs/claude-code) or [OpenCode](https://opencode.ai) — on your `PATH`. The dashboard's committer view additionally uses the **GitHub CLI (`gh`)** to resolve commit authors to their GitHub logins: install it from [cli.github.com](https://cli.github.com) and run `gh auth login`. `gh` is optional — without it the dashboard still works and falls back to merging committer identities by email and no-reply login.
 
 ## Install
@@ -53,13 +55,13 @@ By default aGiTrack resumes the previous conversation for the repository. Start 
 agitrack --new-session
 ```
 
-Run without a worktree (the agent edits the current branch directly, so changes are visible live as it works):
+By default, each session runs in its own [git worktree](https://git-scm.com/docs/git-worktree) — a separate checkout of the repository under `.agitrack/worktrees/`. This isolates the agent's edits from your working copy, lets several sessions run concurrently without colliding, and lets aGiTrack integrate (merge) each session's commits into its target branch on its own. You can opt out of this:
 
 ```bash
 agitrack --no-worktree
 ```
 
-This is for single-session use: there's no isolation or auto-integration, and concurrent sessions are unsafe in this mode (starting a new session is blocked). Set `"use_worktrees": false` in `~/.agitrack/config.json` to make it the default; `--no-worktree` always wins.
+Without a worktree the agent edits the current branch directly, so changes are visible live as it works — but there's no isolation or auto-integration, and concurrent sessions are unsafe in this mode (starting a new session is blocked). Because the agent edits the checked-out branch directly, the session always works on (merges into) the repo directory's **current** branch and can never be pointed at a different one — so the "change a session's merge branch" option isn't offered in this mode. If you switch the directory's branch out-of-band (e.g. `git checkout` in another terminal), aGiTrack warns you and the session follows the new branch (future changes land there). To make this the default, set `"use_worktrees": false` in `~/.agitrack/config.json`.
 
 
 
@@ -180,6 +182,8 @@ Because the conversation is recorded in commit messages, aGiTrack shows a privac
 When summarization is enabled (the default), aGiTrack runs a second LLM stream alongside the coding session to preserve design context that would otherwise be lost to session compaction or terse commit subjects:
 
 - **Commit summaries** — each agent commit gets an LLM-written summary of what changed and why. The summary leads the commit message: its first line becomes the subject and the rest follows as the first paragraph of the body (the prompts that used to head the message move to `# Prompts`); it is also stored as a git note in the `agitrack/commit-summary` namespace.
+
+The summarizer reads **only** its instruction prompt plus the interaction trace — the same `## User` / `## Agent` text the commit carries — and nothing else. To enforce that, aGiTrack runs the summarizer backend as a plain text completion with its agent context stripped (no tools, no project/user memory or MCP servers, and the model's large default system prompt replaced with a one-line directive). Without this, a single Claude summary call loaded ~18,000 input tokens of system prompt and tool schemas it never used; stripped, the same call processes only the few hundred tokens of the instruction and trace, so `summary_tokens_*` reflects the real cost of the summary itself.
 - **Session summaries** — a rolling narrative of the session (goals, architectural decisions, design evolution) is updated on every commit and attached as a git note in the `agitrack/session-summary` namespace.
 - **Pre-compaction capture** — when you run `/compact` in the backend, aGiTrack first exports the full session transcript and folds it into the session summary, so compaction does not lose the conversation's context.
 
@@ -190,12 +194,14 @@ git notes --ref agitrack/commit-summary show <commit>
 git notes --ref agitrack/session-summary show <commit>
 ```
 
-Summarization never blocks the session: commits are created immediately with a prompt-based subject, the summary is computed on a background worker (the status line shows "aGiTrack is summarizing commit ..."), and the commit message is then amended in place. The amend only happens while it is safe — the commit is still the latest, unintegrated, and nothing new is staged; integration waits for the summary up to `summary_wait_seconds` and then proceeds, in which case the summary is recorded in git notes only. The metadata records the summarization cost next to the session's own usage (`summary_model`, `summary_tokens_input`, `summary_tokens_output`).
+Summarization never blocks the session: commits are created immediately with a prompt-based subject, the summary is computed on a background worker (the status line shows "aGiTrack is summarizing commit ..."), and the commit message is then amended in place. The amend only happens while it is safe — the commit is still the latest, unintegrated, and nothing new is staged; integration waits for the summary up to `summary_wait_seconds` and then proceeds, in which case the summary is recorded in git notes only. The metadata records the summarization cost next to the session's own usage (`summary_model`, `summary_tokens_input`, `summary_tokens_output`, and `summary_tokens_cache_read` when the summary prompt was served from cache). `summary_tokens_input` follows the same convention as the session's own `input` — fresh input including cache-creation tokens (see the token-accounting note below) — so a cache-served summary reports the real input it processed rather than just the tiny uncached remainder.
 
-The status bar shows whether summarization is active (`sum:on` / `sum:off`). Use the `summarizer` command (`Ctrl-G`, then `summarizer`, or `:summarizer` in JSON mode) to toggle it (`summarizer on|off`), set the summarization model (`summarizer model`), or show the current status; changes persist to the repository-local `.agitrack/config.json` (see Configuration).
+The status bar shows whether summarization is active (`sum:on` / `sum:off`). Use the `summarizer` command (`Ctrl-G`, then `summarizer`, or `:summarizer` in JSON mode) to toggle it (`summarizer on|off`), set the summarization model (`summarizer model`), or show the current status. Both the on/off toggle and the model are saved to the **global** config (`~/.agitrack/config.json`), so they persist across restarts (a per-session worktree is transient and removed on exit, so a setting written only there would reset on the next launch).
 
 
 ### Commit Behavior
+
+When it launches a coding agent, aGiTrack appends a note to the agent's system prompt (where the backend supports it — Claude's `--append-system-prompt`) telling it that aGiTrack auto-commits each turn, so the agent should not create git commits on its own unless you explicitly ask it to. This keeps aGiTrack's per-turn commits (and their token/line metadata) authoritative. The note is added only for coding sessions, never for the background summarizer. To turn it off, start aGiTrack with `--no-commit-guidance` (or set `commit_guidance: false` in the global config).
 
 - Tracked modifications and deletions are staged with `git add -u`.
 - New untracked files require confirmation before staging.
@@ -203,7 +209,8 @@ The status bar shows whether summarization is active (`sum:on` / `sum:off`). Use
 - Agent commits use the `<aGiTrack>` tag and include the full interaction trace since the last code-changing commit.
 - Agent commit metadata includes context token count and generated token usage accumulated since the last code-changing commit.
   - Token figures are read directly from the backend's session transcript (each assistant message's reported usage) and broken out by category: `input`, `output`, `cache_read`, `cache_write`, and (when the backend reports it) `reasoning`. For Claude, the recorded output count already includes extended-thinking and tool-call tokens. Sub-agent/sidechain turns are counted separately under the matching `subagent_*` categories rather than dropped. Each category is recorded only when the backend reports a non-zero value, so backends that omit a field (e.g. OpenCode does not expose sub-agent usage) simply have no line for it.
-  - The categories are **non-overlapping**: `output` counts only the main agent's generated tokens, and `subagent_output` counts only sub-agent generated tokens — neither includes the other, so nothing is double-counted. For a grand total of generated tokens, sum the matching pairs yourself (e.g. `output + subagent_output`, and `reasoning + subagent_reasoning` for OpenCode). The input side counts every token exactly once: `input` is all *fresh* input processed since the last commit — the uncached remainder plus the cache-creation tokens (so a first run's input reflects the full context instead of looking near zero next to the cache) — with `cache_write` kept as the "of which was written to the cache" breakdown. `cache_read` stays separate because those tokens were already counted as input when first processed; they are replayed from the cache and billed at a different rate.
+  - The **generated-token** categories don't overlap: `output` counts only the main agent's generated tokens and `subagent_output` only the sub-agents' — neither includes the other, so a grand total of generated tokens is just the sum of the matching pairs (e.g. `output + subagent_output`, and `reasoning + subagent_reasoning` for OpenCode). The **input** side is different and deliberately *does* overlap: `input` is all *fresh* input processed since the last commit — the uncached remainder **plus** the cache-creation tokens — so `cache_write` is **already included in** `input` (it's shown on its own line only as the "of which was written to the cache" breakdown, not added on top). Counting input this way keeps a first run's input reflecting the full context instead of looking near zero next to the cache. `cache_read` is the one input figure kept fully separate: those tokens were already counted as input when first written and are merely replayed from the cache, so they are never added into `input`.
+  - **Note — this differs from the provider's billing model, on purpose.** Anthropic bills cache writes, cache reads, and uncached input as three *separate* line items at *different* prices (a cache write costs more than base input; a cache read costs far less). aGiTrack instead folds cache-creation into `input` so each turn's `input` answers one easy-to-reason-about question — *how much fresh context did this turn actually process?* — rather than mirroring the price sheet. The raw breakdown is never lost: `cache_write` (of which was newly cached) and `cache_read` (replayed from cache) are recorded on their own lines, so you can recover the exact per-rate figures and compute cost if you want to. The same convention applies to the summarizer's own cost (`summary_tokens_input` folds in its cache-creation, with `summary_tokens_cache_read` reported separately).
   - The figures should still be treated as a lower bound: any consumption the backend does not record in the transcript (e.g. internal compaction, retried requests, or usage a provider omits) is not captured, so actual tokens consumed may be higher than reported.
 - Proxy mode baselines the continued backend session on startup so token metadata only includes turns after aGiTrack starts tracking new changes.
 - Proxy mode preserves the backend's selected model in commit metadata when it can be read from session data.
@@ -342,6 +349,7 @@ User-wide settings live in `~/.agitrack/config.json` (override the directory wit
   "menu_key": "ctrl-g",
   "sandbox": true,
   "use_worktrees": true,
+  "commit_guidance": true,
   "timings": {
     "base_poll_seconds": 3.0
   }
@@ -352,7 +360,9 @@ User-wide settings live in `~/.agitrack/config.json` (override the directory wit
 
 `sandbox` (default `true`) confines the agent's writes to its own session worktree (via `sandbox-exec` on macOS), keeping the base repository and sibling worktrees read-only to the agent. Set it to `false` to disable confinement; when sandboxing is unavailable, aGiTrack instead warns when the base repository is edited while a session runs.
 
-`use_worktrees` (default `true`) controls whether sessions run in isolated worktrees. Set it to `false` to run the agent directly on the current branch by default — the same behavior as `--no-worktree` (which always wins over the config). See the `--no-worktree` notes under Usage for the trade-offs.
+`use_worktrees` (default `true`) controls whether sessions run in isolated worktrees. Set it to `false` to run the agent directly on the current branch by default — the same behavior as `--no-worktree`, which applies it for a single run. See the `--no-worktree` notes under Usage for the trade-offs.
+
+`commit_guidance` (default `true`) controls whether aGiTrack appends a note to the coding agent's system prompt telling it that aGiTrack auto-commits, so it doesn't create its own git commits. Set it to `false` to disable that note by default — the same as starting aGiTrack with `--no-commit-guidance`, which applies it for a single run. Only affects backends that support appending to the system prompt (Claude), and never the summarizer.
 
 `menu_key` sets the key that opens aGiTrack's command menu in proxy mode. The default is `ctrl-g`; any `ctrl-<letter>` works except keys the terminal or aGiTrack already uses (`ctrl-c` exit flow, `ctrl-h` Backspace, `ctrl-i` Tab, `ctrl-j`/`ctrl-m` Enter). An invalid value falls back to `ctrl-g`, so a typo can never lock you out of the menu. The status line and aGiTrack's messages show whichever key is configured.
 

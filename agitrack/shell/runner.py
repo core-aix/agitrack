@@ -31,9 +31,13 @@ class AgitrackShell:
         new_session: bool = False,
         backend_args: list[str] | None = None,
         prompts: list[str] | None = None,
+        commit_guidance: bool = True,
     ) -> None:
         self.repo = repo
         self.backend_args = list(backend_args or [])  # forwarded to the backend CLI (#32)
+        # Tell the coding agent that aGiTrack auto-commits so it doesn't self-commit
+        # (--no-commit-guidance turns it off). Appended where the backend supports it.
+        self._commit_guidance = commit_guidance
         # Scripted mode (#53): run these prompts in order, then exit. No
         # question can be answered in a scripted or piped run, so everything
         # that would ask one falls back to a safe non-interactive default.
@@ -152,6 +156,10 @@ class AgitrackShell:
         sub = arg.lower()
         if sub in ("on", "off"):
             enabled = sub == "on"
+            # Persist globally so the toggle survives restarts (the per-session worktree
+            # state is transient and reset to "on" each launch); keep the session in sync.
+            if self.global_config is not None:
+                self.global_config.summarization_enabled = enabled
             self.state.summarization_enabled = enabled
             print(f"Summarizer {'enabled' if enabled else 'disabled'}.")
         elif sub == "model":
@@ -173,14 +181,14 @@ class AgitrackShell:
             print("Usage: :summarizer [on|off|model|status]")
 
     def _summarization_enabled(self) -> bool:
+        # The GLOBAL config is the durable source of truth (survives restarts), so it wins
+        # over the per-session worktree state, which always defaults to "on" on a fresh
+        # worktree and would otherwise shadow a persisted "off".
+        gc_enabled = getattr(self.global_config, "summarization_enabled", None)
+        if gc_enabled is not None:
+            return bool(gc_enabled)
         state_enabled = getattr(self.state, "summarization_enabled", None)
-        if state_enabled is not None:
-            return state_enabled
-        if self.global_config is not None:
-            gc_enabled = getattr(self.global_config, "summarization_enabled", None)
-            if gc_enabled is not None:
-                return gc_enabled
-        return True
+        return True if state_enabled is None else bool(state_enabled)
 
     def _handle_agent_prompt(self, prompt: str) -> None:
         if prompt.startswith("/compact"):
@@ -192,7 +200,12 @@ class AgitrackShell:
 
         backend = self._backend()
         self.state.append_trace("user", prompt)
-        result = backend.run(prompt, model=self.state.model, session_id=self.state.backend_session_id)
+        result = backend.run(
+            prompt,
+            model=self.state.model,
+            session_id=self.state.backend_session_id,
+            commit_guidance=self._commit_guidance,
+        )
         if result.session_id:
             self.state.backend_session_id = result.session_id
         if result.model and result.model != self.state.model:
@@ -230,11 +243,13 @@ class AgitrackShell:
                         model=summarizer.model or self.state.model,
                         tokens_input=summarizer.tokens_input,
                         tokens_output=summarizer.tokens_output,
+                        tokens_cache_read=summarizer.tokens_cache_read,
                     )
                 except Exception as error:
                     if self.verbose:
                         print(f"Summarization failed: {error}")
 
+            origin_event = self.state.session_origin_event()
             commit_sha = self.repo.commit(
                 build_agent_commit_message(
                     latest_prompt=prompt,
@@ -247,8 +262,11 @@ class AgitrackShell:
                     trace_turn_limit=self.state.trace_turn_limit,
                     summary=commit_summary,
                     summary_metadata=summary_metadata,
+                    origin_event=origin_event,
                 )
             )
+            if origin_event is not None:
+                self.state.clear_session_origin_event()  # one-shot: surfaced once, then cleared
             self.state.clear_trace()
 
             if commit_summary and commit_sha:

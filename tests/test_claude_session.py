@@ -284,6 +284,82 @@ def test_parse_rows_attributes_sidechain_tokens_to_subagent_buckets():
     assert turn.tokens.context == 30
 
 
+def test_parse_rows_counts_split_message_usage_exactly_once():
+    # Claude splits ONE assistant API response (same message id, same usage) across
+    # several rows — one per content block (thinking/text/tool_use). Its usage must be
+    # counted ONCE, never multiplied by the number of rows (this over-counted output by
+    # ~95% on real transcripts before the fix).
+    usage = {"input_tokens": 100, "output_tokens": 40, "cache_read_input_tokens": 9, "cache_creation_input_tokens": 3}
+    rows = [
+        _user("u1", "do something"),
+        _assistant("m1", "", usage=usage, content=[{"type": "thinking", "thinking": "hmm"}]),
+        _assistant("m1", "", usage=usage, content=[{"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}]),
+        _assistant("m1", "final answer", usage=usage, stop_reason="end_turn"),
+    ]
+    turn = parse_rows("s", rows).turns[0]
+    assert turn.tokens.output == 40  # counted once, not 120
+    assert turn.tokens.input == 100  # not 300
+    assert turn.tokens.cache_read == 9
+    assert turn.tokens.cache_write == 3
+    assert turn.tokens.total == 40
+    assert turn.final_response == "final answer"
+
+
+def test_parse_rows_distinct_messages_still_sum():
+    # Genuinely distinct assistant messages (a multi-step tool turn) DO sum — each id is
+    # counted once, but different ids accumulate.
+    rows = [
+        _user("u1", "go"),
+        _assistant("m1", "", usage={"output_tokens": 10, "input_tokens": 50}, stop_reason="tool_use"),
+        _assistant("m2", "done", usage={"output_tokens": 20, "input_tokens": 5}, stop_reason="end_turn"),
+    ]
+    turn = parse_rows("s", rows).turns[0]
+    assert turn.tokens.output == 30  # 10 + 20
+    assert turn.tokens.input == 55  # 50 + 5
+
+
+def test_parse_rows_counts_later_row_usage_when_first_row_usage_empty():
+    # Robustness: if a split's first row carries no usage and a later row of the SAME id
+    # carries it, the usage is still counted (not lost to a premature "already counted").
+    rows = [
+        _user("u1", "go"),
+        _assistant("m1", "", usage={}, content=[{"type": "thinking", "thinking": "x"}]),
+        _assistant("m1", "done", usage={"output_tokens": 7}, stop_reason="end_turn"),
+    ]
+    turn = parse_rows("s", rows).turns[0]
+    assert turn.tokens.output == 7
+
+
+def test_parse_rows_attributes_compaction_to_following_turn():
+    # Claude injects the compaction summary as an `isCompactSummary` user row that sits
+    # BETWEEN turns — after the prior turn's last message, before the next real prompt.
+    # It must not become a turn of its own, and it is attributed to the NEXT turn (whose
+    # context it shrank), not the prior one.
+    rows = [
+        _user("u1", "first task"),
+        _assistant("m1", "first answer", usage={"output_tokens": 5}, stop_reason="end_turn"),
+        _user("c1", "<conversation summary>", isCompactSummary=True),
+        _user("u2", "second task"),
+        _assistant("m2", "second answer", usage={"output_tokens": 6}, stop_reason="end_turn"),
+    ]
+    turns = parse_rows("s", rows).turns
+    assert [t.user_prompt for t in turns] == ["first task", "second task"]  # no phantom turn
+    assert [t.compaction_count for t in turns] == [0, 1]
+
+
+def test_parse_rows_compaction_with_no_following_turn_is_unrecorded():
+    # A compaction at the very end influenced no subsequent work, so it is not pinned to
+    # the prior turn (which ran against the pre-compaction context).
+    rows = [
+        _user("u1", "task"),
+        _assistant("m1", "answer", usage={"output_tokens": 5}, stop_reason="end_turn"),
+        _user("c1", "<conversation summary>", isCompactSummary=True),
+    ]
+    turns = parse_rows("s", rows).turns
+    assert len(turns) == 1
+    assert turns[0].compaction_count == 0
+
+
 def test_parse_rows_attributes_separate_file_subagent_tokens_by_tool_use_id():
     # Newer Claude Code records sub-agents in their own files; `export_session` reads
     # those and passes their tokens (keyed by the Task tool_use id) to parse_rows, which

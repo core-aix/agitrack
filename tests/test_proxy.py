@@ -3085,6 +3085,86 @@ def _drain_shared_resume(runner):
     runner._service_shared_resume()
 
 
+def test_shared_resume_records_copy_origin_event_on_new_session(tmp_path):
+    # Copying a collaborator's shared session into a NEW local session records a
+    # one-shot "copy" origin event, so its first agent commit notes the inherited
+    # context/tokens. (A switch to an already-live session records nothing.)
+    import threading
+    import types
+
+    from agitrack.config import AgitrackState
+
+    runner = _shared_resume_runner()
+    state = AgitrackState(tmp_path)
+    runner.state = state
+    # A realistic resume: the new session ends up tracking the shared id.
+    runner._resume_conversation = lambda name, sid, **k: setattr(state, "backend_session_id", sid)
+    runner._shared_resume_cancel = threading.Event()
+    runner._shared_resume_thread = None
+    runner._shared_resume_result = {
+        "transcript": "body",
+        "action": "new",
+        "agent": types.SimpleNamespace(import_shared_session=lambda *a, **k: True),
+        "session_id": "sid-1",
+        "name": "fix-parser",
+        "resume_id": "sid-1",
+        "overwrite": False,
+        "as_id": None,
+        "backend": "claude",
+        "entry_name": "fix-parser",
+        "origin_contributors": "alice+bob",
+    }
+
+    runner._service_shared_resume()
+
+    event = state.session_origin_event()
+    assert event is not None
+    assert event["kind"] == "copy"
+    assert event["source"] == "sid-1"
+    assert event["source_name"] == "fix-parser"
+    assert event["collaborator"] == "alice+bob"
+
+
+def test_fork_current_session_records_fork_origin_event(tmp_path):
+    # A local fork resumes a copy of the active conversation under a fresh id, so the
+    # new session records a one-shot "fork" origin event naming the original.
+    import types
+
+    from agitrack.config import AgitrackState
+
+    runner = _shared_resume_runner()
+    runner.name = "original"
+    src_state = AgitrackState(tmp_path / "src")
+    src_state.backend_session_id = "ses_src"
+    runner.state = src_state
+    runner.repo = types.SimpleNamespace(repo="/wt")
+    runner.base_repo = types.SimpleNamespace(repo="/repo")
+    runner.backend = types.SimpleNamespace(
+        supports_session_sharing=True,
+        export_session_raw=lambda repo, sid: "transcript-body",
+        new_import_id=lambda: "ses_fork",
+        new_session_id=lambda: "ses_fork",
+        import_shared_session=lambda *a, **k: True,
+    )
+
+    new_state = AgitrackState(tmp_path / "new")
+
+    def fake_new_session(name, *, resume_session_id=None, backend=None, base_branch=None):
+        new_state.backend_session_id = resume_session_id
+        runner.state = new_state
+
+    runner._new_session = fake_new_session
+
+    assert runner._fork_current_session("forked") is True
+    event = new_state.session_origin_event()
+    assert event is not None
+    assert event["kind"] == "fork"
+    assert event["source"] == "ses_src"
+    assert event["source_name"] == "original"
+    # The original session's state is untouched by the fork.
+    assert src_state.session_origin_event() is None
+
+
 def test_resume_shared_menu_stopped_fetch_quits_without_listing():
     # If the user stops the listing fetch (Esc), the menu must NOT fall through to a
     # possibly-stale previously-fetched list — it leaves the menu entirely.
@@ -3594,6 +3674,53 @@ def test_session_switch_prompt_keeps_or_switches_active_session():
     runner._repo_dir_branch = "feature-x"  # directory already on feature-x; session merges into dev
     runner._prompt_merge_target_if_diverged()
     assert runner.retargeted == ["feature-x"]
+
+
+def test_no_worktree_session_follows_directory_branch_and_warns_on_switch():
+    import types
+
+    # In --no-worktree mode there is no separate merge target: a session always works on
+    # the directory's CURRENT branch and can never be pointed at a different one. When the
+    # directory's branch is switched, the session follows it and a warning is shown — but no
+    # "where should this merge?" dialog is ever offered.
+    dir_branch = ["main"]
+    runner = make_runner(
+        _use_worktrees=False,
+        worktree=None,
+        _base_branch="main",
+        _base_drift_check_at=0.0,
+        base_repo=types.SimpleNamespace(current_branch=lambda: dir_branch[0]),
+        name="s1",
+    )
+    runner._repo_dir_branch = "main"
+    runner._integration = types.SimpleNamespace(base_branch="main")
+    runner.messages = []
+    runner._set_message = lambda m, **k: runner.messages.append(m)
+    runner._render = lambda: None
+    runner.popups = []
+    runner._select_popup = lambda *a, **k: runner.popups.append(a) or None
+
+    # Aligned: no warning, no popup.
+    runner._check_base_branch_drift()
+    assert runner.messages == [] and runner.popups == []
+    assert runner._base_branch == "main"
+
+    # Directory branch switched out-of-band: the session follows it, a warning shows, and
+    # NO merge-target dialog is offered.
+    dir_branch[0] = "feature-y"
+    runner._base_drift_check_at = 0.0  # bypass the poll throttle
+    runner._check_base_branch_drift()
+    assert runner._base_branch == "feature-y"  # follows the directory's current branch
+    assert runner._repo_dir_branch == "feature-y"
+    assert runner._integration.base_branch == "feature-y"
+    assert runner.popups == []  # never asks where to merge — only one branch is allowed
+    assert any("feature-y" in m and "without a worktree" in m for m in runner.messages)
+
+    # No re-warn while the branch stays put.
+    runner.messages.clear()
+    runner._base_drift_check_at = 0.0
+    runner._check_base_branch_drift()
+    assert runner.messages == []
 
 
 def test_repo_dir_change_while_running_defers_prompt_until_idle():
@@ -4425,6 +4552,38 @@ def test_summarizer_model_picker_lists_models_and_defaults_to_smallest_for_claud
     assert runner.state.summarization_model is None
 
 
+def test_summarizer_toggle_persists_to_global_config_across_restart(tmp_path):
+    # Turning the summarizer off must survive an aGiTrack restart: the toggle is written
+    # to the durable GLOBAL config, not the transient per-session worktree state (which is
+    # removed on exit and resets to "on"). Regression for "always starts on".
+    from agitrack.config.settings import GlobalConfig
+    from proxy_helpers import make_runner
+
+    cfg_path = tmp_path / "global" / "config.json"
+    runner = make_runner(state=AgitrackState(tmp_path / "wt"))
+    runner.global_config = GlobalConfig(cfg_path)
+    runner._render = lambda: None
+    runner._set_message = lambda *a, **k: None
+    assert runner._summarization_enabled() is True  # default
+
+    runner._handle_summarizer_command("off")
+    assert runner.global_config.summarization_enabled is False
+    assert runner._summarization_enabled() is False
+
+    # Simulate a restart: a brand-new GlobalConfig reading the same file, and a fresh
+    # session worktree state (which would default to "on" on its own).
+    restarted = make_runner(state=AgitrackState(tmp_path / "wt2"))
+    restarted.global_config = GlobalConfig(cfg_path)
+    assert restarted.global_config.summarization_enabled is False
+    assert restarted._summarization_enabled() is False  # stays OFF, not reset to on
+
+    # And turning it back on persists too.
+    restarted._render = lambda: None
+    restarted._set_message = lambda *a, **k: None
+    restarted._handle_summarizer_command("on")
+    assert GlobalConfig(cfg_path).summarization_enabled is True
+
+
 def test_summarizer_model_picker_clear_resets_to_session_model(tmp_path, monkeypatch):
     import agitrack.summaries.model_select as model_select
     from proxy_helpers import make_runner
@@ -4922,7 +5081,9 @@ def test_spawn_failed_exec_child_exits_with_127(tmp_path):
         worktree=None,
         backend=types.SimpleNamespace(
             new_session_id=lambda: "ses-1",
-            spawn_command=lambda repo, session_id, resume: ["agit-test-binary-that-does-not-exist"],
+            spawn_command=lambda repo, session_id, resume, commit_guidance=True: [
+                "agit-test-binary-that-does-not-exist"
+            ],
             list_sessions=lambda repo: [],
         ),
     )

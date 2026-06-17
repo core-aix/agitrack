@@ -25,6 +25,56 @@ def test_summarize_commit() -> None:
     call_args = backend.run.call_args
     assert call_args[1]["model"] == "test-model"
     assert call_args[1]["session_id"] is None
+    # The summarizer reads only its instruction + trace: the backend is run "bare" (no
+    # agent system prompt, tools, or project memory), so it isn't charged thousands of
+    # input tokens the summary never uses.
+    assert call_args[1]["bare"] is True
+    # The instruction rides in the SYSTEM prompt (not the user message), so a small
+    # model summarizes the trace instead of completing/echoing an instruction-shaped
+    # user prompt (the ~75%-echo regression). The user message is just the trace.
+    assert call_args[1]["system_prompt"].startswith("You are a technical summarizer")
+    user_prompt = call_args[0][0]
+    assert user_prompt.startswith("Interaction trace:")
+    assert "you are a technical summarizer" not in user_prompt.lower()
+
+
+def test_summarizer_input_includes_cache_creation_tokens() -> None:
+    # Regression for the "summary input token is always 20" bug: a cache-served summary
+    # reports a tiny `input_tokens` while the real input sits in cache-creation. Fresh
+    # input must count input + cache_write (matching the main commit line), and cache
+    # reads are tracked separately — not folded in (that would double-count).
+    backend = Mock()
+    backend.run.return_value = AgentResult(
+        backend="test",
+        session_id=None,
+        model="test-model",
+        final_response="A concise summary of the change.",
+        exit_code=0,
+        tokens=TokenUsage(input=20, output=300, cache_write=4500, cache_read=12000),
+    )
+    summarizer = Summarizer(backend, model="test-model")
+    summarizer.summarize_commit(trace=_TRACE)
+    assert summarizer.tokens_input == 4520  # 20 uncached + 4500 cache-creation, not 20
+    assert summarizer.tokens_output == 300
+    assert summarizer.tokens_cache_read == 12000  # separate, never added into input
+
+
+def test_summarizer_token_counts_accumulate_across_calls() -> None:
+    backend = Mock()
+    backend.run.return_value = AgentResult(
+        backend="test",
+        session_id=None,
+        model="m",
+        final_response="ok summary",
+        exit_code=0,
+        tokens=TokenUsage(input=10, output=5, cache_write=100, cache_read=7),
+    )
+    summarizer = Summarizer(backend, model="m")
+    summarizer.summarize_commit(trace=_TRACE)
+    summarizer.update_session_summary(current_summary=None, trace=_TRACE, commit_summary="ok summary")
+    assert summarizer.tokens_input == 220  # (10 + 100) * 2
+    assert summarizer.tokens_output == 10
+    assert summarizer.tokens_cache_read == 14
 
 
 def test_commit_summary_prompt_is_self_contained() -> None:
@@ -275,21 +325,25 @@ def test_summarizer_raises_when_backend_echoes_the_prompt() -> None:
     import pytest
     from agitrack.summaries import UnusableSummaryError
 
-    # Simulate the backend returning the *entire prompt* it was given (the
-    # observed failure mode) — the summarizer must reject it so the commit keeps
-    # its prompt-led message rather than a prompt-dump.
+    # Simulate the backend echoing the SYSTEM instruction it was given (the observed
+    # failure mode with a small model) — the summarizer must reject it so the commit
+    # keeps its prompt-led message rather than a prompt-dump.
     captured: dict[str, str] = {}
 
-    def echo_run(prompt, *, model=None, session_id=None):
-        captured["prompt"] = prompt
-        return _result(prompt)  # echo the prompt back as the response
+    def echo_run(prompt, *, model=None, session_id=None, bare=False, system_prompt=None, commit_guidance=True):
+        captured["user"] = prompt
+        captured["system"] = system_prompt
+        return _result(system_prompt)  # echo the instruction back as the response
 
     backend = Mock()
     backend.run.side_effect = echo_run
     summarizer = Summarizer(backend)
     with pytest.raises(UnusableSummaryError):
         summarizer.summarize_commit(trace=_TRACE)
-    assert captured["prompt"].startswith("You are a technical summarizer")
+    # The instruction rides in the SYSTEM prompt; the user message is just the trace.
+    assert captured["system"].startswith("You are a technical summarizer")
+    assert captured["user"].startswith("Interaction trace:")
+    assert "you are a technical summarizer" not in captured["user"].lower()
 
 
 def test_looks_like_prompt_echo_is_marker_independent() -> None:
@@ -309,9 +363,9 @@ def test_session_update_rejects_echoed_prompt() -> None:
     import pytest
     from agitrack.summaries import UnusableSummaryError
 
-    # The session-update path goes through the same _run guard; echoing the
-    # received prompt must be rejected too.
-    def echo_run(prompt, *, model=None, session_id=None):
+    # The session-update path goes through the same _run guard; echoing the received
+    # USER message (the trace) must be rejected too (the marker-independent check).
+    def echo_run(prompt, *, model=None, session_id=None, bare=False, system_prompt=None, commit_guidance=True):
         return _result(prompt)
 
     backend = Mock()
