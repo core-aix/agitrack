@@ -975,8 +975,14 @@ function renderAgg(){
   // widths by log10 instead; the numbers shown on each row remain the real counts.
   const logTok = v => Math.log10((v||0)+1);
   const maxLog = Math.max(1, ...shown.map(([k])=>logTok(tok[k])));
+  // Whenever cache-creation happened, spell out aGiTrack's input convention: input folds
+  // in cache-write tokens (fresh input processed once into the cache), which is NOT how
+  // the provider bills it (writes/reads are separate line items at different rates).
+  const cacheNote = (tok.cache_write||0)+(tok.subagent_cache_write||0) > 0
+    ? `<div class="hint" title="aGiTrack counts a turn's input as fresh input = uncached input + cache-creation tokens, so the number reflects how much context was processed rather than the provider's price sheet. cache write and cache read are still listed separately below.">input includes cache-creation (cache&nbsp;write) tokens — differs from provider billing, see README</div>`
+    : "";
   $("tokens").innerHTML = shown.length
-    ? `<div class="hint">bar widths are log-scaled</div>` +
+    ? `<div class="hint">bar widths are log-scaled</div>` + cacheNote +
       shown.map(([k,label]) => barRow(label, "", logTok(tok[k]), maxLog, `<b>${fmt(tok[k])}</b>`, k==="output")).join("")
     : `<div class="empty">no token metadata recorded</div>`;
 
