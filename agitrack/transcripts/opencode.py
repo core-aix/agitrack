@@ -486,6 +486,7 @@ def _build_turn(user_message: dict, assistants: list[dict], session_model: str |
 
     final_response = ""
     final_assistant: dict | None = None
+    agent_messages: list[str] = []
     tokens = TokenUsage()
     model = session_model
     effort: str | None = None
@@ -499,6 +500,9 @@ def _build_turn(user_message: dict, assistants: list[dict], session_model: str |
         if response:
             final_response = response
             final_assistant = assistant
+            # Each assistant message's user-facing reply, in order, so the opt-in
+            # full trace can include every message rather than only the last.
+            agent_messages.append(response)
 
     final_info = (final_assistant or last_assistant or {}).get("info", {})
     assistant_id = str(final_info.get("id") or "")
@@ -515,6 +519,7 @@ def _build_turn(user_message: dict, assistants: list[dict], session_model: str |
         reasoning_effort=effort or ("on" if tokens.reasoning > 0 else None),
         started_at=_message_time(user_info),
         ended_at=_message_time(_as_dict(final_info)) or _message_time(user_info),
+        agent_messages=agent_messages,
     )
 
 

@@ -569,6 +569,7 @@ def parse_rows(
                 "tool_ids": set(),
                 "compactions": pending_compactions,
                 "reasoning_effort": None,
+                "messages": [],
             }
             pending_compactions = 0
         elif row_type == "assistant" and current is not None and row.get("isSidechain"):
@@ -601,6 +602,10 @@ def parse_rows(
             if text:
                 current["final"] = text
                 current["assistant_id"] = str(message.get("id") or "")
+                # Each assistant message with user-facing text is a separate reply
+                # (tool calls sit between them); keep them all in order so the
+                # opt-in full trace can show every message, not just the last.
+                current["messages"].append(text)
     flush(dangling=True)
     _attribute_subagent_tokens(turns, tool_ids_per_turn, subagent_tokens)
     return ExportedSession(session_id=session_id, model=model, updated=updated, turns=turns)
@@ -691,6 +696,7 @@ def _finalize_turn(turn: dict, *, dangling: bool = False) -> SessionTurn:
         ended_at=turn.get("ended_at"),
         compaction_count=int(turn.get("compactions") or 0),
         reasoning_effort=turn.get("reasoning_effort"),
+        agent_messages=list(turn.get("messages") or []),
     )
 
 
