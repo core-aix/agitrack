@@ -681,6 +681,17 @@ def test_render_html_has_unreachable_banner_and_clear_kind_labels(tmp_path):
         assert level in html
 
 
+def test_web_dashboard_shows_loading_indicator_on_filter_change(tmp_path):
+    # A "loading…" spinner appears while a filter change re-fetches the data and is
+    # cleared once the panels render (even on a fetch failure, via finally).
+    html = render_html(_demo_repo(tmp_path))
+    assert 'id="loading"' in html and 'class="spin"' in html  # the badge + spinner
+    assert "@keyframes spin" in html  # the animation
+    assert "function showLoading" in html
+    # applyFilters shows it before fetching and clears it in a finally.
+    assert "showLoading(true)" in html and "} finally { showLoading(false); }" in html
+
+
 def test_web_dashboard_embeds_cache_write_input_note(tmp_path):
     # The web token panel explains aGiTrack's input convention; the note is client-side
     # gated to show only when cache-write tokens are non-zero.
