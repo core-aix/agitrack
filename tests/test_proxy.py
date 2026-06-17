@@ -3676,6 +3676,53 @@ def test_session_switch_prompt_keeps_or_switches_active_session():
     assert runner.retargeted == ["feature-x"]
 
 
+def test_no_worktree_session_follows_directory_branch_and_warns_on_switch():
+    import types
+
+    # In --no-worktree mode there is no separate merge target: a session always works on
+    # the directory's CURRENT branch and can never be pointed at a different one. When the
+    # directory's branch is switched, the session follows it and a warning is shown — but no
+    # "where should this merge?" dialog is ever offered.
+    dir_branch = ["main"]
+    runner = make_runner(
+        _use_worktrees=False,
+        worktree=None,
+        _base_branch="main",
+        _base_drift_check_at=0.0,
+        base_repo=types.SimpleNamespace(current_branch=lambda: dir_branch[0]),
+        name="s1",
+    )
+    runner._repo_dir_branch = "main"
+    runner._integration = types.SimpleNamespace(base_branch="main")
+    runner.messages = []
+    runner._set_message = lambda m, **k: runner.messages.append(m)
+    runner._render = lambda: None
+    runner.popups = []
+    runner._select_popup = lambda *a, **k: runner.popups.append(a) or None
+
+    # Aligned: no warning, no popup.
+    runner._check_base_branch_drift()
+    assert runner.messages == [] and runner.popups == []
+    assert runner._base_branch == "main"
+
+    # Directory branch switched out-of-band: the session follows it, a warning shows, and
+    # NO merge-target dialog is offered.
+    dir_branch[0] = "feature-y"
+    runner._base_drift_check_at = 0.0  # bypass the poll throttle
+    runner._check_base_branch_drift()
+    assert runner._base_branch == "feature-y"  # follows the directory's current branch
+    assert runner._repo_dir_branch == "feature-y"
+    assert runner._integration.base_branch == "feature-y"
+    assert runner.popups == []  # never asks where to merge — only one branch is allowed
+    assert any("feature-y" in m and "without a worktree" in m for m in runner.messages)
+
+    # No re-warn while the branch stays put.
+    runner.messages.clear()
+    runner._base_drift_check_at = 0.0
+    runner._check_base_branch_drift()
+    assert runner.messages == []
+
+
 def test_repo_dir_change_while_running_defers_prompt_until_idle():
     # A running session's merge branch must NOT change mid-turn. The dir-change prompt
     # is deferred (with a warning) and fires once the session is idle.

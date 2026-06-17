@@ -1050,7 +1050,16 @@ class ProxyRunner:
         # branch that differs from the active session's merge target, ask where this
         # session's changes should merge. (Each session has its own merge branch,
         # independent of the directory's checkout and of the other sessions.)
-        if self.worktree is None or self._base_branch is None:
+        if self._base_branch is None:
+            return
+        if not self._use_worktrees:
+            # No-worktree mode (#9): the agent edits the directory's branch directly, so a
+            # session can only ever land its work on that current branch — never a different
+            # merge target. There is no merge-target dialog; just warn (and follow) when the
+            # directory's branch is switched.
+            self._check_no_worktree_branch_change()
+            return
+        if self.worktree is None:
             return
         now = time.monotonic()
         if now - self._base_drift_check_at < self.BASE_DRIFT_CHECK_SECONDS:
@@ -1094,6 +1103,37 @@ class ProxyRunner:
             self._render()
             return
         self._prompt_merge_targets_on_dir_change()
+
+    def _check_no_worktree_branch_change(self) -> None:
+        # No-worktree mode: a session always works on (merges into) whatever branch is
+        # checked out in the repo directory and can never target a different one. If the
+        # user switches the directory's branch, future work simply lands on the new branch —
+        # warn so that change is never silent, and follow the directory so the status bar and
+        # accounting stay accurate. The warning fires once per switch (``_base_branch`` is
+        # advanced immediately, so the next poll sees no change).
+        now = time.monotonic()
+        if now - self._base_drift_check_at < self.BASE_DRIFT_CHECK_SECONDS:
+            return
+        self._base_drift_check_at = now
+        try:
+            current = self.base_repo.current_branch()  # the branch checked out in the repo dir
+        except Exception:
+            return
+        if not current or current == self._base_branch:
+            if current:
+                self._repo_dir_branch = current  # keep the status bar fresh
+            return
+        old = self._base_branch
+        self._base_branch = current
+        self._repo_dir_branch = current
+        self._integration.base_branch = current
+        self._set_message(
+            f"The repo directory switched from '{old}' to '{current}'. Running without a "
+            f"worktree, the agent's changes now land on '{current}' — a session always "
+            f"follows the directory's current branch and can't merge into a different one.",
+            seconds=12.0,
+        )
+        self._render()
 
     def _session_work_merged_into_base(self) -> bool:
         # True once the active session's work has landed on its merge branch — nothing
