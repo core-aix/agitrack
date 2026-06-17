@@ -211,9 +211,17 @@ class Summarizer:
         self.model = model
         # Tokens this summarizer instance consumed across its LLM calls, so the
         # cost of summarization can be tracked next to the coding session's own
-        # usage (issue #8).
+        # usage (issue #8). ``tokens_input`` counts fresh input the SAME way the main
+        # commit line does — uncached input PLUS cache-creation tokens, since those
+        # are input processed once and written to the cache. Counting only the bare
+        # ``input_tokens`` made a cache-served summary report a tiny constant (~20)
+        # while the real input sat in the cache fields (the "always 20" bug).
         self.tokens_input = 0
         self.tokens_output = 0
+        # Cache READS are reported separately: those tokens were already counted as
+        # input when first written, so folding them into ``tokens_input`` would
+        # double-count them.
+        self.tokens_cache_read = 0
 
     def summarize_commit(
         self,
@@ -250,8 +258,11 @@ class Summarizer:
         result = self.backend.run(prompt, model=self.model, session_id=None)
         tokens = getattr(result, "tokens", None)
         if tokens is not None:
-            self.tokens_input += int(getattr(tokens, "input", 0) or 0)
+            # Fresh input = uncached input + cache-creation tokens (both are input the
+            # model processed this call); cache reads are tracked on their own line.
+            self.tokens_input += int(getattr(tokens, "input", 0) or 0) + int(getattr(tokens, "cache_write", 0) or 0)
             self.tokens_output += int(getattr(tokens, "output", 0) or 0)
+            self.tokens_cache_read += int(getattr(tokens, "cache_read", 0) or 0)
         text = result.final_response.strip()
         # A failed/echoed run must raise rather than return its text, or the error
         # (or the prompt itself) becomes the commit subject (issue #8). Callers

@@ -5843,6 +5843,7 @@ class ProxyRunner:
                 model=summarizer.model or model,
                 tokens_input=summarizer.tokens_input,
                 tokens_output=summarizer.tokens_output,
+                tokens_cache_read=summarizer.tokens_cache_read,
             )
             # Write back to the OWNING session (not self.active, which may have
             # changed): the service tick swaps each session in to apply it.

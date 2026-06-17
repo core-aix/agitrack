@@ -25,13 +25,31 @@ def _source_version() -> str | None:
     return match.group(1) if match else None
 
 
-try:
-    # Single source of truth: the installed distribution's metadata, built from
-    # the `version` in pyproject.toml. Reading it here (rather than hardcoding a
-    # second copy) guarantees the version stamped into commit metadata is exactly
-    # the aGiTrack the user has installed.
-    __version__ = version("agitrack")
-except PackageNotFoundError:
-    # No distribution metadata: fall back to the source checkout's pyproject.toml,
-    # and only then to 0.0.0 (an unreleased working tree; matches scripts/publish.sh).
-    __version__ = _source_version() or "0.0.0"
+def _installed_version() -> str | None:
+    """The version recorded in this distribution's installed metadata, or None when no
+    metadata is present (a bare source tree that was never installed)."""
+    try:
+        return version("agitrack")
+    except PackageNotFoundError:
+        return None
+
+
+def _resolve_version() -> str:
+    """The version of the aGiTrack *actually running*, stamped into commit metadata.
+
+    A source checkout (the package sitting next to a ``pyproject.toml``) is authoritative
+    for itself: its ``pyproject.toml`` is the live single source of truth. Prefer it over
+    installed distribution metadata, because the two can disagree and the metadata then
+    stamps the WRONG version — e.g. an older aGiTrack also installed in the same
+    environment, or an editable install whose ``.dist-info`` froze the version at install
+    time while the source has since been bumped. Commits stamping a stale ``0.0.4`` while
+    ``pyproject.toml`` said ``0.0.6`` were exactly this: ``version("agitrack")`` returned the
+    old installed metadata instead of the running source.
+
+    A pip-installed wheel has no ``pyproject.toml`` beside the package, so it falls through
+    to its own distribution metadata — the right version for that install. Only with
+    neither available does it fall back to ``0.0.0`` (matches scripts/publish.sh)."""
+    return _source_version() or _installed_version() or "0.0.0"
+
+
+__version__ = _resolve_version()

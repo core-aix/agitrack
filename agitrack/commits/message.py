@@ -171,11 +171,19 @@ def apply_summary_to_message(
     return "\n".join(new_lines).rstrip() + "\n"
 
 
-def summary_metadata_lines(*, model: str | None, tokens_input: int = 0, tokens_output: int = 0) -> list[str]:
-    """Metadata recording what the summarization itself cost (issue #8)."""
+def summary_metadata_lines(
+    *, model: str | None, tokens_input: int = 0, tokens_output: int = 0, tokens_cache_read: int = 0
+) -> list[str]:
+    """Metadata recording what the summarization itself cost (issue #8).
+
+    ``tokens_input`` is fresh input (uncached input + cache-creation), matching the main
+    commit's token accounting; ``tokens_cache_read`` reports cache hits separately and is
+    emitted only when non-zero."""
     lines = [f"summary_model: {model or 'unknown'}"]
     if tokens_input > 0:
         lines.append(f"summary_tokens_input: {tokens_input}")
+    if tokens_cache_read > 0:
+        lines.append(f"summary_tokens_cache_read: {tokens_cache_read}")
     if tokens_output > 0:
         lines.append(f"summary_tokens_output: {tokens_output}")
     return lines

@@ -230,6 +230,7 @@ class AgitrackShell:
                         model=summarizer.model or self.state.model,
                         tokens_input=summarizer.tokens_input,
                         tokens_output=summarizer.tokens_output,
+                        tokens_cache_read=summarizer.tokens_cache_read,
                     )
                 except Exception as error:
                     if self.verbose:
