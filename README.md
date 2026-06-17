@@ -7,6 +7,8 @@ aGiTrack supports OpenCode and Claude (Claude Code) as interchangeable backends.
 
 ## Requirements
 
+aGiTrack runs on **macOS and Linux**. It is a POSIX terminal application (it drives the terminal through `pty`/`termios`), so it does not run on native Windows; on Windows, use it inside **WSL** (Windows Subsystem for Linux), which is a Linux environment. aGiTrack works across common terminal emulators (e.g. iTerm2, Apple Terminal, Alacritty, kitty, GNOME Terminal, Konsole, tmux, the VS Code integrated terminal, and Windows Terminal driving WSL), degrading gracefully on terminals that lack features such as the alternate screen or the kitty keyboard protocol.
+
 aGiTrack needs **git** and at least one backend CLI — [Claude Code](https://docs.claude.com/en/docs/claude-code) or [OpenCode](https://opencode.ai) — on your `PATH`. The dashboard's committer view additionally uses the **GitHub CLI (`gh`)** to resolve commit authors to their GitHub logins: install it from [cli.github.com](https://cli.github.com) and run `gh auth login`. `gh` is optional — without it the dashboard still works and falls back to merging committer identities by email and no-reply login.
 
 ## Install
