@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from agitrack.backends.base import TokenUsage
 
@@ -13,6 +13,13 @@ class SessionTurn:
     final_response: str
     tokens: TokenUsage
     model: str | None
+    # Every user-facing text message the agent emitted during this turn, in order
+    # — the conversational replies a human would read, NOT tool calls, tool
+    # results, reasoning, or file edits. ``final_response`` is the last of these;
+    # this full list backs the opt-in "include all agent messages" commit trace
+    # (off by default). Empty for backends/turns where only the final reply is
+    # recovered, in which case the trace falls back to ``final_response``.
+    agent_messages: list[str] = field(default_factory=list)
     # Whether the agent's response to this prompt has finished. False while the
     # turn is still mid-flight (the backend's last message was a tool call, not a
     # final answer), so aGiTrack can defer committing until the prompt is fully

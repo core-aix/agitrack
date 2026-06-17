@@ -550,6 +550,11 @@ class ProxyRunner:
         # digest is not, since Claude's resume id-churn changes the digest across runs
         # even with no user input.
         self._sessions_with_activity: set[str] = set()
+        # Backend message ids of interrupted (user-cancelled) turns we've already
+        # offered a commit-or-discard choice for, so a "decide later" answer doesn't
+        # re-prompt every parse cycle. In-memory and per-run by design — a restart
+        # offers the choice again if the changes are still sitting there.
+        self._cancel_prompted: set[str] = set()
         # Lifecycle flags read before their first conditional assignment. These
         # MUST be initialized here: their getattr() guards were removed in P7,
         # and for_testing() seeding them alone would hide a missing init from
@@ -760,6 +765,7 @@ class ProxyRunner:
                 "_auto_share_hash": {},
                 "_auto_share_thread": None,
                 "_sessions_with_activity": set(),
+                "_cancel_prompted": set(),
                 "_user_declined": [],
                 "sessions": [],
                 "worktree_manager": None,
@@ -1965,13 +1971,17 @@ class ProxyRunner:
         used |= self._persisted_session_names()
         return used
 
-    def _first_free_session_name(self) -> str:
-        # `session-N` not already taken by a worktree or a past conversation.
-        used = self._startup_taken_names()
-        number = 1
-        while f"session-{number}" in used:
-            number += 1
-        return f"session-{number}"
+    def _startup_default_name(self) -> str:
+        # A friendly random word for the very first session, mirroring
+        # ``_next_session_name`` for in-session new sessions. ``session-N`` is
+        # forgettable and, since sessions are tracked/shared as
+        # ``<github-id(s)>/<name>``, two people each starting ``session-1`` collide;
+        # a random word is easier to remember and far less likely to clash. The
+        # startup taken-set is used because ``self.sessions`` isn't built yet. The
+        # user can still type their own at the new-session prompt.
+        from agitrack.proxy.session_names import random_session_name
+
+        return random_session_name(self._startup_taken_names())
 
     def _prompt_startup_name(self, continuing: bool) -> str:
         # Pre-reactor, cooked mode: the alt-screen has not been entered yet so
@@ -1979,7 +1989,7 @@ class ProxyRunner:
         # here is intentional — the reactor loop is not running, so there are
         # no PTY fds to drain, and the simple cooked readline is the right tool.
         # Do NOT convert this to a modal; modals require the reactor to be live.
-        default = self._first_free_session_name()
+        default = self._startup_default_name()
         print("Continuing a conversation that has no name yet." if continuing else "Starting a new session.")
         taken = self._startup_taken_names()
         while True:
@@ -6741,6 +6751,10 @@ class ProxyRunner:
             note_session_change_fn=self._note_backend_session_change,
             mirror_fn=self._mirror_session_to_base,
             commit_fn=self._create_agent_commit_from_turns_popup,
+            # Only the live interactive path (integrate=True) prompts about a
+            # cancelled turn's leftover changes; the sync/exit finalize paths leave
+            # them as-is rather than raising a modal during teardown.
+            on_cancelled_fn=self._handle_cancelled_turn if integrate else None,
         )
         self._awaited_followups = new_awaited
         if committed:
@@ -6761,6 +6775,75 @@ class ProxyRunner:
                 if not self._summary_blocks_integration(time.monotonic()):
                     self._integrate_session_turn()
         return committed
+
+    def _handle_cancelled_turn(self, turns) -> bool:
+        """Offer commit-or-discard for a user-cancelled turn's leftover changes.
+
+        Called by the commit engine when the user interrupted the agent (Esc) and
+        it produced no committable response — so the normal auto-commit won't fire
+        and the agent's partial edits would otherwise sit uncommitted in the
+        worktree. If there are such changes, ask what to do with them.
+
+        Returns True once the changes were committed or discarded (so the engine
+        advances the parse watermark past the cancelled turn); False to leave the
+        turn untouched — either nothing to act on, or the user chose to keep the
+        changes and decide later (the next real turn's commit will fold them in).
+        """
+        last = turns[-1] if turns else None
+        if last is None:
+            return False
+        turn_id = last.assistant_message_id or last.user_message_id or ""
+        if turn_id and turn_id in self._cancel_prompted:
+            return False  # already offered this turn — don't nag on every parse
+        try:
+            if not self.repo.has_changes():
+                return False  # the cancellation left nothing behind to act on
+        except Exception as error:
+            self._debug(f"cancelled-turn change check failed: {error!r}")
+            return False
+        if turn_id:
+            self._cancel_prompted.add(turn_id)
+        choice = self._select_popup(
+            "The agent was interrupted before finishing, leaving uncommitted changes.",
+            ["Keep them (commit with your next turn)", "Commit the changes now", "Discard the changes"],
+        )
+        if choice is None or choice.startswith("Keep"):
+            self._set_message("Keeping the agent's changes — they'll be committed with your next turn.")
+            self._render()
+            return False
+        if choice.startswith("Commit"):
+            committed = self._create_agent_commit_from_turns_popup(
+                turns=turns,
+                backend=getattr(self.backend, "name", None) or self.state.backend,
+                backend_session_id=self.state.backend_session_id,
+                model=self.state.model,
+                quiet=False,
+                prompt_untracked=self.worktree is None,
+            )
+            self._set_message(
+                "Committed the agent's interrupted changes." if committed else "Nothing staged to commit."
+            )
+            self._render()
+            return committed
+        # Discard — destructive, so confirm before throwing the work away.
+        confirm = self._select_popup(
+            "Discard ALL uncommitted changes from the interrupted turn? This cannot be undone.",
+            ["No, keep them", "Yes, discard"],
+        )
+        if confirm == "Yes, discard":
+            try:
+                self.repo.discard_all_changes()
+            except Exception as error:
+                self._debug(f"discard cancelled-turn changes failed: {error!r}")
+                self._set_message("Could not discard the changes.")
+                self._render()
+                return False
+            self._set_message("Discarded the agent's interrupted changes.")
+            self._render()
+            return True
+        self._set_message("Keeping the agent's changes.")
+        self._render()
+        return False
 
     def _commit_available_agent_turns(self, *, quiet: bool) -> bool:
         if self._finish_agent_parse_if_ready(quiet=quiet) is True:
