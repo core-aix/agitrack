@@ -7,6 +7,12 @@ from typing import IO
 
 from agitrack.backends.base import AgentResult, TokenUsage
 
+# The summarizer is a mechanical text-reduction task that gains nothing from reasoning, so
+# its bare run asks OpenCode for the lowest reasoning effort. OpenCode has no env-var/flag
+# to turn reasoning fully off (Claude's MAX_THINKING_TOKENS=0 has no OpenCode equivalent);
+# `--variant minimal` is the floor its CLI exposes for the provider-specific reasoning effort.
+_SUMMARIZER_REASONING_VARIANT = "minimal"
+
 
 class OpenCodeBackend:
     name = "opencode"
@@ -39,6 +45,11 @@ class OpenCodeBackend:
             command.extend(["--model", model])
         if session_id:
             command.extend(["--session", session_id])
+        if bare:
+            # Summarizer: ask for the lowest reasoning effort the CLI exposes (see
+            # _SUMMARIZER_REASONING_VARIANT). Best-effort — a model/provider that ignores
+            # the variant simply runs as before.
+            command.extend(["--variant", _SUMMARIZER_REASONING_VARIANT])
         # Passthrough options go before the prompt positional (#32).
         command.extend(self.backend_args)
         if prompt.startswith("/"):
