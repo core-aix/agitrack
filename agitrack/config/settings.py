@@ -105,6 +105,19 @@ class GlobalConfig:
         self.save()
 
     @property
+    def commit_guidance(self) -> bool:
+        # Whether to append a note to a coding agent's system prompt telling it that
+        # aGiTrack auto-commits, so it should not create its own commits (on by default;
+        # disable per-run with --no-commit-guidance).
+        value = self.data.get("commit_guidance")
+        return True if value is None else bool(value)
+
+    @commit_guidance.setter
+    def commit_guidance(self, value: bool) -> None:
+        self.data["commit_guidance"] = bool(value)
+        self.save()
+
+    @property
     def use_worktrees(self) -> bool:
         # Run each session in its own git worktree (on by default). When off,
         # the agent edits the current branch directly (#9) — visible live, but

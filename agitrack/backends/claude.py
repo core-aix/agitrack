@@ -53,6 +53,7 @@ class ClaudeBackend:
         session_id: str | None,
         bare: bool = False,
         system_prompt: str | None = None,
+        commit_guidance: bool = True,
     ) -> AgentResult:
         command = ["claude", "-p", prompt, "--output-format", "json"]
         if model:
@@ -61,10 +62,11 @@ class ClaudeBackend:
             command.extend(["--resume", session_id])
         if bare:
             command.extend(_bare_args(system_prompt))
-        else:
+        elif commit_guidance:
             # A coding run (e.g. shell mode): tell the agent aGiTrack auto-commits so it
             # doesn't self-commit. Deliberately NOT added on a bare run — that is the
-            # summarizer, which must read only its instruction and the trace.
+            # summarizer, which must read only its instruction and the trace — and skipped
+            # when commit_guidance is off (--no-commit-guidance).
             from agitrack.backends.proxy_agents import AGENT_SYSTEM_NOTE
 
             command.extend(["--append-system-prompt", AGENT_SYSTEM_NOTE])

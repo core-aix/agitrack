@@ -73,6 +73,13 @@ def main(argv: list[str] | None = None) -> int:
         "(edits are visible live; no isolation/integration; unsafe with concurrent sessions)",
     )
     parser.add_argument(
+        "--no-commit-guidance",
+        action="store_true",
+        help="do not tell the coding agent that aGiTrack handles commits; by default aGiTrack "
+        "appends a note to the agent's system prompt (where the backend supports it) so the "
+        "agent does not create its own git commits unless you explicitly ask",
+    )
+    parser.add_argument(
         "--skip-privacy-ack",
         action="store_true",
         # Suppress the one-time privacy warning/acknowledgment. Set automatically
@@ -158,6 +165,10 @@ def main(argv: list[str] | None = None) -> int:
 
     # Worktrees on unless the config opts out or --no-worktree is passed (flag wins).
     use_worktrees = False if args.no_worktree else config.use_worktrees
+    # The agent commit-guidance note is on unless the config opts out or
+    # --no-commit-guidance is passed (flag wins). getattr keeps a config written before
+    # this key existed (or a partial stub) defaulting to on.
+    commit_guidance = False if args.no_commit_guidance else getattr(config, "commit_guidance", True)
 
     if backend_args:
         _warn_reserved_passthrough(args.backend or config.default_backend, backend_args)
@@ -199,6 +210,7 @@ def main(argv: list[str] | None = None) -> int:
                 new_session=args.new_session,
                 backend_args=backend_args,
                 prompts=args.prompts,
+                commit_guidance=commit_guidance,
             ).run()
         else:
             return ProxyRunner(
@@ -208,6 +220,7 @@ def main(argv: list[str] | None = None) -> int:
                 new_session=args.new_session,
                 use_worktrees=use_worktrees,
                 backend_args=backend_args,
+                commit_guidance=commit_guidance,
             ).run()
     except (GitError, RuntimeError) as error:
         print(error)

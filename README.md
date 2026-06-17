@@ -36,7 +36,7 @@ agitrack
 
 By default, `agitrack` runs in proxy mode: it launches the real backend TUI (OpenCode or Claude) in a pseudo-terminal, renders it through an internal terminal screen, and reserves a bottom status line for aGiTrack showing the session (and the branch it merges into — shown **bold** when that branch differs from the one checked out in the repo directory), the backend, the summarizer state, and the repository the agent is working on (the base repository path, home-abbreviated and elided from the left when space is tight). Press `Ctrl-G` to enter aGiTrack command mode (configurable via `menu_key` in `~/.agitrack/config.json` — see Configuration).
 
-When it launches a coding agent, aGiTrack appends a note to the agent's system prompt (where the backend supports it — Claude's `--append-system-prompt`) telling it that aGiTrack auto-commits each turn, so the agent should not create git commits on its own unless you explicitly ask it to. This keeps aGiTrack's per-turn commits (and their token/line metadata) authoritative. The note is added only for coding sessions, never for the background summarizer.
+When it launches a coding agent, aGiTrack appends a note to the agent's system prompt (where the backend supports it — Claude's `--append-system-prompt`) telling it that aGiTrack auto-commits each turn, so the agent should not create git commits on its own unless you explicitly ask it to. This keeps aGiTrack's per-turn commits (and their token/line metadata) authoritative. The note is added only for coding sessions, never for the background summarizer. To turn it off, start aGiTrack with `--no-commit-guidance` (or set `commit_guidance: false` in the global config).
 
 Run against another repository:
 
@@ -349,6 +349,7 @@ User-wide settings live in `~/.agitrack/config.json` (override the directory wit
   "menu_key": "ctrl-g",
   "sandbox": true,
   "use_worktrees": true,
+  "commit_guidance": true,
   "timings": {
     "base_poll_seconds": 3.0
   }
@@ -360,6 +361,8 @@ User-wide settings live in `~/.agitrack/config.json` (override the directory wit
 `sandbox` (default `true`) confines the agent's writes to its own session worktree (via `sandbox-exec` on macOS), keeping the base repository and sibling worktrees read-only to the agent. Set it to `false` to disable confinement; when sandboxing is unavailable, aGiTrack instead warns when the base repository is edited while a session runs.
 
 `use_worktrees` (default `true`) controls whether sessions run in isolated worktrees. Set it to `false` to run the agent directly on the current branch by default — the same behavior as `--no-worktree` (which always wins over the config). See the `--no-worktree` notes under Usage for the trade-offs.
+
+`commit_guidance` (default `true`) controls whether aGiTrack appends a note to the coding agent's system prompt telling it that aGiTrack auto-commits, so it doesn't create its own git commits. Set it to `false` to disable that note by default — the same as starting aGiTrack with `--no-commit-guidance` (which always wins over the config). Only affects backends that support appending to the system prompt (Claude), and never the summarizer.
 
 `menu_key` sets the key that opens aGiTrack's command menu in proxy mode. The default is `ctrl-g`; any `ctrl-<letter>` works except keys the terminal or aGiTrack already uses (`ctrl-c` exit flow, `ctrl-h` Backspace, `ctrl-i` Tab, `ctrl-j`/`ctrl-m` Enter). An invalid value falls back to `ctrl-g`, so a typo can never lock you out of the menu. The status line and aGiTrack's messages show whichever key is configured.
 

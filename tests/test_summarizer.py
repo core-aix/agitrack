@@ -330,7 +330,7 @@ def test_summarizer_raises_when_backend_echoes_the_prompt() -> None:
     # keeps its prompt-led message rather than a prompt-dump.
     captured: dict[str, str] = {}
 
-    def echo_run(prompt, *, model=None, session_id=None, bare=False, system_prompt=None):
+    def echo_run(prompt, *, model=None, session_id=None, bare=False, system_prompt=None, commit_guidance=True):
         captured["user"] = prompt
         captured["system"] = system_prompt
         return _result(system_prompt)  # echo the instruction back as the response
@@ -365,7 +365,7 @@ def test_session_update_rejects_echoed_prompt() -> None:
 
     # The session-update path goes through the same _run guard; echoing the received
     # USER message (the trace) must be rejected too (the marker-independent check).
-    def echo_run(prompt, *, model=None, session_id=None, bare=False, system_prompt=None):
+    def echo_run(prompt, *, model=None, session_id=None, bare=False, system_prompt=None, commit_guidance=True):
         return _result(prompt)
 
     backend = Mock()

@@ -31,9 +31,13 @@ class AgitrackShell:
         new_session: bool = False,
         backend_args: list[str] | None = None,
         prompts: list[str] | None = None,
+        commit_guidance: bool = True,
     ) -> None:
         self.repo = repo
         self.backend_args = list(backend_args or [])  # forwarded to the backend CLI (#32)
+        # Tell the coding agent that aGiTrack auto-commits so it doesn't self-commit
+        # (--no-commit-guidance turns it off). Appended where the backend supports it.
+        self._commit_guidance = commit_guidance
         # Scripted mode (#53): run these prompts in order, then exit. No
         # question can be answered in a scripted or piped run, so everything
         # that would ask one falls back to a safe non-interactive default.
@@ -196,7 +200,12 @@ class AgitrackShell:
 
         backend = self._backend()
         self.state.append_trace("user", prompt)
-        result = backend.run(prompt, model=self.state.model, session_id=self.state.backend_session_id)
+        result = backend.run(
+            prompt,
+            model=self.state.model,
+            session_id=self.state.backend_session_id,
+            commit_guidance=self._commit_guidance,
+        )
         if result.session_id:
             self.state.backend_session_id = result.session_id
         if result.model and result.model != self.state.model:

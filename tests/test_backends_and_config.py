@@ -36,6 +36,11 @@ def test_claude_proxy_agent_spawn_command_uses_session_id_and_resume():
     assert agent.spawn_command(Path("/repo"), session_id="u1", resume=True) == ["claude", "--resume", "u1", *note]
     assert agent.spawn_command(Path("/repo"), session_id=None, resume=False) == ["claude", *note]
     assert "aGiTrack" in AGENT_SYSTEM_NOTE and "git commit" in AGENT_SYSTEM_NOTE
+    # commit_guidance=False (--no-commit-guidance) omits the note entirely.
+    assert agent.spawn_command(Path("/repo"), session_id=None, resume=False, commit_guidance=False) == ["claude"]
+    assert "--append-system-prompt" not in agent.spawn_command(
+        Path("/repo"), session_id="u1", resume=True, commit_guidance=False
+    )
 
 
 def test_opencode_proxy_agent_spawn_command_has_no_system_prompt_append():
@@ -186,6 +191,10 @@ def test_claude_backend_bare_run_strips_tools_memory_and_system_prompt(monkeypat
     from agitrack.backends.proxy_agents import AGENT_SYSTEM_NOTE
 
     assert normal[normal.index("--append-system-prompt") + 1] == AGENT_SYSTEM_NOTE
+
+    # ...but commit_guidance=False (--no-commit-guidance) omits it on a coding run too.
+    backend.run("do real work", model=None, session_id=None, commit_guidance=False)
+    assert "--append-system-prompt" not in captured["command"]
 
 
 def test_claude_backend_tolerates_leading_logs():

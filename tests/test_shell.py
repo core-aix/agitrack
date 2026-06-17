@@ -63,7 +63,7 @@ class FakeBackend:
     def __init__(self, repo, *, verbose=False, backend_args=None):
         self.repo = Path(repo)
 
-    def run(self, prompt, *, model, session_id, bare=False, system_prompt=None):
+    def run(self, prompt, *, model, session_id, bare=False, system_prompt=None, commit_guidance=True):
         FakeBackend.runs.append(prompt)
         (self.repo / "hello.py").write_text("print('hi')\n", encoding="utf-8")
         return AgentResult(

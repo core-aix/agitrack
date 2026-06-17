@@ -118,7 +118,7 @@ def _stub_repo_and_free_lock(monkeypatch):
     monkeypatch.setattr(cli, "RepoLock", _FreeLock)
 
 
-def _stub_launch(monkeypatch, *, use_worktrees: bool = True):
+def _stub_launch(monkeypatch, *, use_worktrees: bool = True, commit_guidance: bool = True):
     """Stub the launch surface so cli.main only exercises arg routing.
     Returns the dict the fake runner/shell records its kwargs into."""
     captured: dict = {}
@@ -141,6 +141,7 @@ def _stub_launch(monkeypatch, *, use_worktrees: bool = True):
         default_backend = "opencode"
 
     Config.use_worktrees = use_worktrees
+    Config.commit_guidance = commit_guidance
     monkeypatch.setattr(cli, "GlobalConfig", lambda: Config())
     return captured
 
@@ -195,6 +196,27 @@ def test_default_uses_config_use_worktrees(monkeypatch):
     captured = _stub_launch(monkeypatch, use_worktrees=False)  # config opt-out, no flag
     cli.main([])
     assert captured["use_worktrees"] is False
+
+
+# --- --no-commit-guidance ---------------------------------------------------
+
+
+def test_commit_guidance_on_by_default(monkeypatch):
+    captured = _stub_launch(monkeypatch)
+    cli.main([])
+    assert captured["commit_guidance"] is True
+
+
+def test_no_commit_guidance_flag_disables_it(monkeypatch):
+    captured = _stub_launch(monkeypatch)
+    cli.main(["--no-commit-guidance"])
+    assert captured["commit_guidance"] is False
+
+
+def test_default_uses_config_commit_guidance(monkeypatch):
+    captured = _stub_launch(monkeypatch, commit_guidance=False)  # config opt-out, no flag
+    cli.main([])
+    assert captured["commit_guidance"] is False
 
 
 def test_unknown_args_forwarded_to_backend(monkeypatch):

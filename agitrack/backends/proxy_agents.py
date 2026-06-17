@@ -64,7 +64,13 @@ class ProxyAgent(Protocol):
         alongside an existing local copy of the same id ("keep both"). None when
         the backend can't re-id an imported session."""
 
-    def spawn_command(self, repo: Path, *, session_id: str | None, resume: bool) -> list[str]: ...
+    def spawn_command(
+        self, repo: Path, *, session_id: str | None, resume: bool, commit_guidance: bool = True
+    ) -> list[str]: ...
+
+    # ``commit_guidance``: when True (default) and the backend CLI supports appending to its
+    # system prompt, append :data:`AGENT_SYSTEM_NOTE` so the coding agent doesn't self-commit.
+    # Disabled per-run by --no-commit-guidance.
 
     def session_belongs_to_repo(self, repo: Path, session_id: str) -> bool: ...
 
@@ -132,7 +138,11 @@ class OpenCodeProxyAgent:
         # be re-imported alongside an existing local copy ("keep both").
         return "ses_" + uuid.uuid4().hex
 
-    def spawn_command(self, repo: Path, *, session_id: str | None, resume: bool) -> list[str]:
+    def spawn_command(
+        self, repo: Path, *, session_id: str | None, resume: bool, commit_guidance: bool = True
+    ) -> list[str]:
+        # ``commit_guidance`` is accepted for a uniform interface but unused: OpenCode's
+        # interactive TUI has no flag to append to its system prompt.
         command = ["opencode"]
         if resume and session_id:
             command.extend(["--session", session_id])
@@ -197,16 +207,19 @@ class ClaudeProxyAgent:
         # A fresh uuid to re-import a shared conversation under ("keep both").
         return str(uuid.uuid4())
 
-    def spawn_command(self, repo: Path, *, session_id: str | None, resume: bool) -> list[str]:
+    def spawn_command(
+        self, repo: Path, *, session_id: str | None, resume: bool, commit_guidance: bool = True
+    ) -> list[str]:
         if resume and session_id:
             command = ["claude", "--resume", session_id]
         elif session_id:
             command = ["claude", "--session-id", session_id]
         else:
             command = ["claude"]
-        # Tell the coding agent that aGiTrack auto-commits, so it doesn't self-commit
-        # (Claude supports appending to its system prompt; OpenCode's TUI has no such flag).
-        command.extend(["--append-system-prompt", AGENT_SYSTEM_NOTE])
+        # Tell the coding agent that aGiTrack auto-commits, so it doesn't self-commit (Claude
+        # supports appending to its system prompt). Skipped when commit_guidance is off.
+        if commit_guidance:
+            command.extend(["--append-system-prompt", AGENT_SYSTEM_NOTE])
         return command
 
     def session_belongs_to_repo(self, repo: Path, session_id: str) -> bool:
