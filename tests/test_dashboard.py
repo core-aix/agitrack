@@ -681,6 +681,17 @@ def test_render_html_has_unreachable_banner_and_clear_kind_labels(tmp_path):
         assert level in html
 
 
+def test_web_dashboard_truncates_long_commit_subjects(tmp_path):
+    # The commit log caps a displayed subject at 120 chars with an ellipsis; the full
+    # subject stays available (hover title + expanded message). Client-side rendering, so
+    # assert the JS source carries the cap and applies it in renderLog.
+    html = render_html(_demo_repo(tmp_path))
+    assert "SUBJECT_MAX = 120" in html
+    assert "const truncSubject" in html and "SUBJECT_MAX-1" in html  # ellipsis counts toward the cap
+    assert "shown = truncSubject(subj)" in html  # applied to each log row's subject
+    assert 'title="' in html  # full subject preserved on hover when truncated
+
+
 def test_web_dashboard_shows_loading_indicator_on_filter_change(tmp_path):
     # A "loading…" spinner appears while a filter change re-fetches the data and is
     # cleared once the panels render (even on a fetch failure, via finally).

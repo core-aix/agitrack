@@ -858,6 +858,11 @@ const fmt = n => (n||0).toLocaleString("en-US");
 const pct = (a,b) => b ? (a/b*100).toFixed(1)+"%" : "0%";
 const esc = s => (s||"").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
 const kfmt = n => { n=n||0; return n>=1000 ? (n/1000).toFixed(n>=10000?0:1)+"k" : ""+n; };
+// Commit-log subjects can be very long; cap the displayed line at 120 chars with an
+// ellipsis (the full subject stays available via the row's hover title and the expanded
+// commit message). The ellipsis counts toward the cap, so the result never exceeds 120.
+const SUBJECT_MAX = 120;
+const truncSubject = s => { s = s||""; return s.length > SUBJECT_MAX ? s.slice(0, SUBJECT_MAX-1).trimEnd()+"…" : s; };
 function setOffline(on){ const el=$("neterror"); if(el) el.hidden = !on; }
 // Show the "loading…" spinner while a user-initiated filter change re-fetches the data
 // (not during the background refresh poll, which would make it flicker constantly).
@@ -1203,8 +1208,10 @@ function renderLog(){
     const squash = (c.parts&&c.parts.length)?`<span class="squash">⧉ ${c.parts.length} squashed</span>`:"";
     const lc = (c.ins||c.del)?`<span class="lc"><span class="add">+${fmt(c.ins)}</span> <span class="rem">−${fmt(c.del)}</span></span>`:"";
     const m = c.eff_model?`<span class="lc">${esc(c.eff_model)}</span>`:"";
+    const subj = c.subject||"", shown = truncSubject(subj);
+    const subjTitle = shown!==subj ? ` title="${esc(subj)}"` : "";  // full subject on hover when cut
     return `<div class="entry ${cls}" data-i="${i}"><span class="sha">${esc(c.short)}</span>${badge}${squash}`+
-      `<span class="ksub">${esc(c.subject)}</span>${lc}${tokenBrief(c.tokens)}${m}`+
+      `<span class="ksub"${subjTitle}>${esc(shown)}</span>${lc}${tokenBrief(c.tokens)}${m}`+
       `<div class="detail" id="detail-${i}" hidden></div></div>`;
   }).join("");
   const from = total ? offset+1 : 0, to = offset+entries.length;
