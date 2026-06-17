@@ -205,3 +205,22 @@ def test_no_exclude_created_outside_a_git_repo(tmp_path):
     state = AgitrackState(tmp_path)  # tmp_path is not a git repo
     state.save()
     assert not (tmp_path / ".git").exists()
+
+
+def test_session_origin_event_roundtrip_and_one_shot(tmp_path):
+    state = AgitrackState(tmp_path)
+    assert state.session_origin_event() is None  # none by default
+
+    state.set_session_origin_event(kind="copy", source="ses_orig", collaborator="alice", source_name="feature-x")
+    event = state.session_origin_event()
+    assert event["kind"] == "copy"
+    assert event["source"] == "ses_orig"
+    assert event["collaborator"] == "alice"
+    assert event["source_name"] == "feature-x"
+    assert isinstance(event["at"], int)
+
+    # Survives a reload (persisted to state.json), then clears as a one-shot.
+    assert AgitrackState(tmp_path).session_origin_event()["kind"] == "copy"
+    state.clear_session_origin_event()
+    assert state.session_origin_event() is None
+    assert AgitrackState(tmp_path).session_origin_event() is None

@@ -520,6 +520,12 @@ def parse_rows(
     # message id's usage ONCE so tokens aren't multiplied by the block count (issue: the
     # per-row sum over-counted output by ~95% on real transcripts).
     counted_ids: set[str] = set()
+    # Context compactions seen since the last turn began. Claude injects the compaction
+    # summary as an `isCompactSummary` user row that sits BETWEEN turns (after the prior
+    # turn's last message, before the next real prompt), so each is attributed to the
+    # NEXT turn — the one whose context it shrank. A compaction with no following turn
+    # influenced no work and is left unrecorded.
+    pending_compactions = 0
 
     def flush(*, dangling: bool = False) -> None:
         nonlocal current
@@ -541,6 +547,11 @@ def parse_rows(
                 if current is not None:
                     current["interrupted"] = True
                 continue
+            if row.get("isCompactSummary"):
+                # The summary Claude injects when it compacts the conversation: not a
+                # prompt, but a token-affecting event. Tally it for the next turn.
+                pending_compactions += 1
+                continue
             prompt = _user_prompt(row)
             if prompt is None:
                 continue
@@ -556,7 +567,9 @@ def parse_rows(
                 "started_at": stamp,
                 "ended_at": stamp,
                 "tool_ids": set(),
+                "compactions": pending_compactions,
             }
+            pending_compactions = 0
         elif row_type == "assistant" and current is not None and row.get("isSidechain"):
             # Sub-agent (sidechain) turns are not part of the main interaction
             # trace, but their tokens are still consumed — record them under the
@@ -670,6 +683,7 @@ def _finalize_turn(turn: dict, *, dangling: bool = False) -> SessionTurn:
         interrupted=interrupted,
         started_at=turn.get("started_at"),
         ended_at=turn.get("ended_at"),
+        compaction_count=int(turn.get("compactions") or 0),
     )
 
 

@@ -3085,6 +3085,86 @@ def _drain_shared_resume(runner):
     runner._service_shared_resume()
 
 
+def test_shared_resume_records_copy_origin_event_on_new_session(tmp_path):
+    # Copying a collaborator's shared session into a NEW local session records a
+    # one-shot "copy" origin event, so its first agent commit notes the inherited
+    # context/tokens. (A switch to an already-live session records nothing.)
+    import threading
+    import types
+
+    from agitrack.config import AgitrackState
+
+    runner = _shared_resume_runner()
+    state = AgitrackState(tmp_path)
+    runner.state = state
+    # A realistic resume: the new session ends up tracking the shared id.
+    runner._resume_conversation = lambda name, sid, **k: setattr(state, "backend_session_id", sid)
+    runner._shared_resume_cancel = threading.Event()
+    runner._shared_resume_thread = None
+    runner._shared_resume_result = {
+        "transcript": "body",
+        "action": "new",
+        "agent": types.SimpleNamespace(import_shared_session=lambda *a, **k: True),
+        "session_id": "sid-1",
+        "name": "fix-parser",
+        "resume_id": "sid-1",
+        "overwrite": False,
+        "as_id": None,
+        "backend": "claude",
+        "entry_name": "fix-parser",
+        "origin_contributors": "alice+bob",
+    }
+
+    runner._service_shared_resume()
+
+    event = state.session_origin_event()
+    assert event is not None
+    assert event["kind"] == "copy"
+    assert event["source"] == "sid-1"
+    assert event["source_name"] == "fix-parser"
+    assert event["collaborator"] == "alice+bob"
+
+
+def test_fork_current_session_records_fork_origin_event(tmp_path):
+    # A local fork resumes a copy of the active conversation under a fresh id, so the
+    # new session records a one-shot "fork" origin event naming the original.
+    import types
+
+    from agitrack.config import AgitrackState
+
+    runner = _shared_resume_runner()
+    runner.name = "original"
+    src_state = AgitrackState(tmp_path / "src")
+    src_state.backend_session_id = "ses_src"
+    runner.state = src_state
+    runner.repo = types.SimpleNamespace(repo="/wt")
+    runner.base_repo = types.SimpleNamespace(repo="/repo")
+    runner.backend = types.SimpleNamespace(
+        supports_session_sharing=True,
+        export_session_raw=lambda repo, sid: "transcript-body",
+        new_import_id=lambda: "ses_fork",
+        new_session_id=lambda: "ses_fork",
+        import_shared_session=lambda *a, **k: True,
+    )
+
+    new_state = AgitrackState(tmp_path / "new")
+
+    def fake_new_session(name, *, resume_session_id=None, backend=None, base_branch=None):
+        new_state.backend_session_id = resume_session_id
+        runner.state = new_state
+
+    runner._new_session = fake_new_session
+
+    assert runner._fork_current_session("forked") is True
+    event = new_state.session_origin_event()
+    assert event is not None
+    assert event["kind"] == "fork"
+    assert event["source"] == "ses_src"
+    assert event["source_name"] == "original"
+    # The original session's state is untouched by the fork.
+    assert src_state.session_origin_event() is None
+
+
 def test_resume_shared_menu_stopped_fetch_quits_without_listing():
     # If the user stops the listing fetch (Esc), the menu must NOT fall through to a
     # possibly-stale previously-fetched list — it leaves the menu entirely.

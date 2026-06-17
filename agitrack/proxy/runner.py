@@ -3878,6 +3878,9 @@ class ProxyRunner:
                     "as_id": as_id,
                     "backend": backend,
                     "entry_name": entry.name,
+                    # Lineage of the shared session being copied here, for the origin
+                    # note the first commit of the new session records.
+                    "origin_contributors": "+".join(entry.contributors),
                 }
             except Exception as error:
                 if not cancel.is_set():
@@ -4009,7 +4012,23 @@ class ProxyRunner:
         # A "Keep both" fork (as_id set) deliberately starts a SEPARATE lineage: record
         # no origin for it, so sharing it later publishes a new `<you>/<name>` entry of
         # its own rather than updating the session it was copied from (#55).
+        live_before = {getattr(getattr(s, "state", None), "backend_session_id", None) for s in self.sessions}
         self._resume_conversation(result["name"], result["resume_id"], backend=result["backend"])
+        state = self.state
+        if (
+            state is not None
+            and result["resume_id"] not in live_before
+            and state.backend_session_id == result["resume_id"]
+        ):
+            # A genuinely new local session copied from a collaborator's shared one
+            # (not a switch to an already-live session): record the copy so its first
+            # commit notes the context/tokens inherited from the shared conversation.
+            state.set_session_origin_event(
+                kind="copy",
+                source=result.get("session_id") or result["resume_id"],
+                source_name=result.get("entry_name"),
+                collaborator=result.get("origin_contributors"),
+            )
 
     def _complete_live_shared_update(self, result: dict) -> None:
         # Update the already-running session to the shared version: switch to it,
@@ -4122,6 +4141,7 @@ class ProxyRunner:
         src_id = self.state.backend_session_id
         if not src_id or not getattr(agent, "supports_session_sharing", False):
             return False
+        source_name = self.name  # the original session's name, captured before switching
         # The LATEST conversation state lives in the active session's worktree (its
         # cwd), so export from there first; the base repo may only hold an older
         # mirrored copy. (Same order as the auto-share path.)
@@ -4136,6 +4156,11 @@ class ProxyRunner:
         if not agent.import_shared_session(self.base_repo.repo, src_id, transcript, as_id=new_id):
             return False
         self._new_session(name, resume_session_id=new_id, backend=self.state.backend, base_branch=base_branch)
+        if self.state.backend_session_id == new_id:
+            # The fork took: record that this session resumes a copy of another
+            # conversation, so its first commit notes the inherited context/tokens
+            # (issue: track fork/copy in the interaction trace).
+            self.state.set_session_origin_event(kind="fork", source=src_id, source_name=source_name)
         return True
 
     def _merge_target_default(self) -> str | None:

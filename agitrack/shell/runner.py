@@ -235,6 +235,7 @@ class AgitrackShell:
                     if self.verbose:
                         print(f"Summarization failed: {error}")
 
+            origin_event = self.state.session_origin_event()
             commit_sha = self.repo.commit(
                 build_agent_commit_message(
                     latest_prompt=prompt,
@@ -247,8 +248,11 @@ class AgitrackShell:
                     trace_turn_limit=self.state.trace_turn_limit,
                     summary=commit_summary,
                     summary_metadata=summary_metadata,
+                    origin_event=origin_event,
                 )
             )
+            if origin_event is not None:
+                self.state.clear_session_origin_event()  # one-shot: surfaced once, then cleared
             self.state.clear_trace()
 
             if commit_summary and commit_sha:

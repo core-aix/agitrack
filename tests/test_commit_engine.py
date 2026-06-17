@@ -78,6 +78,33 @@ def _turn(prompt: str, response: str, *, total: int = 1, output: int = 1) -> Ses
 # ---------------------------------------------------------------------------
 
 
+def test_commit_turns_surfaces_compactions_and_clears_origin_event(tmp_path):
+    # The commit message records the compaction count (summed across the committed
+    # turns) and the session's fork/copy origin; the origin event is one-shot, cleared
+    # once surfaced so later commits don't keep re-announcing the lineage.
+    engine, repo, state = _engine(tmp_path)
+    state.set_session_origin_event(kind="fork", source="ses_parent", source_name="main")
+    turns = [_turn("first", "a"), _turn("second", "b")]
+    turns[0].compaction_count = 1
+    turns[1].compaction_count = 2
+
+    assert (
+        engine.commit_turns(
+            turns=turns,
+            backend="claude",
+            backend_session_id="s1",
+            model="m",
+            stage_untracked_fn=_noop_stage,
+        )
+        is True
+    )
+    assert "context_compactions: 3" in repo.message
+    assert "forked_from: ses_parent (main)" in repo.message
+    assert "forked from 'main'" in repo.message  # the trace note
+    # One-shot: the event is gone after the commit that surfaced it.
+    assert state.session_origin_event() is None
+
+
 def test_commit_turns_returns_false_for_empty_turns(tmp_path):
     engine, repo, state = _engine(tmp_path)
     assert (
