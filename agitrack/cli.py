@@ -268,7 +268,22 @@ def _check_for_update_at_startup(config: GlobalConfig) -> None:
         status = updater.check(timeout=STARTUP_NET_TIMEOUT)
     except Exception:
         return
+    # A prior automatic update may have failed (or the user chose not to retry). Clear
+    # that reminder the moment aGiTrack is actually current; otherwise honour it below.
+    pending = getattr(config, "pending_manual_update", None)
+    if pending and status.ok and not status.available:
+        config.pending_manual_update = None
+        pending = None
     if not status.ok or not status.available:
+        return
+    if pending:
+        # Don't re-run the interactive auto-update — it already failed. Show a single
+        # startup reminder with how to update by hand; the user keeps running the
+        # current version and can also retry via the Ctrl-G 'update' menu.
+        print(f"\nReminder: {status.message}")
+        print(
+            f"The automatic update did not complete earlier. To update aGiTrack, {updater.manual_update_instructions()}"
+        )
         return
     print(f"\n{status.message}")
     try:
@@ -288,8 +303,14 @@ def _check_for_update_at_startup(config: GlobalConfig) -> None:
     print("Updating aGiTrack...")
     result = updater.apply()
     if not result.ok:
+        # The automatic update failed. Keep aGiTrack running on the current version,
+        # tell the user how to update by hand, and remember to remind (once) at the
+        # next startup rather than nagging during the session.
+        config.pending_manual_update = status.latest or status.current or "available"
         print(f"Update failed: {result.error}")
+        print(f"aGiTrack will keep running the current version. To update it, {updater.manual_update_instructions()}")
         return
+    config.pending_manual_update = None  # a successful update clears any prior reminder
     print(f"{result.message} Restarting aGiTrack...")
     restart_agitrack()  # does not return on success
 

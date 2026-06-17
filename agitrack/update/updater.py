@@ -372,10 +372,28 @@ class Updater:
 
     def apply(self) -> UpdateStatus:
         """Install the available update in place. Blocking. Returns a status
-        whose ``available`` is False on success and ``error`` set on failure."""
-        if self.kind == KIND_SOURCE:
-            return self._apply_source()
-        return self._apply_package()
+        whose ``available`` is False on success and ``error`` set on failure.
+
+        Never raises: any unexpected failure (a subprocess timeout, an OS error,
+        a git/pip crash) is caught and returned as an ``error`` status that already
+        carries manual-update instructions, so a failed update can never take down
+        the running aGiTrack — the user keeps using the current version."""
+        try:
+            if self.kind == KIND_SOURCE:
+                return self._apply_source()
+            return self._apply_package()
+        except Exception as error:  # an update attempt must not crash aGiTrack
+            status = UpdateStatus(kind=self.kind)
+            status.error = f"automatic update failed ({error}); {self.manual_update_instructions()}"
+            return status
+
+    def manual_update_instructions(self) -> str:
+        """How to update aGiTrack by hand — shown when an automatic update is
+        impossible or failed, so the user can finish the upgrade themselves while
+        continuing to run the current version."""
+        if self.kind == KIND_SOURCE and self._source_repo is not None:
+            return f"update manually by running `git pull` in the aGiTrack source checkout at {self._source_repo}"
+        return self._manual_routes()
 
     def _apply_source(self) -> UpdateStatus:
         repo = self._source_repo
@@ -538,7 +556,7 @@ class Updater:
         status.message = f"Updated aGiTrack package to {status.current}."
         return status
 
-    def _manual_upgrade_guidance(self, *, pep668: bool) -> str:
+    def _manual_routes(self) -> str:
         # A full enumeration of every supported upgrade route, since aGiTrack can't tell
         # for certain which one applies once the automatic paths are exhausted.
         routes = (
@@ -548,12 +566,15 @@ class Updater:
             f"externally-managed (PEP 668) Python — reinstall via pipx, or force pip with "
             f"`pip install --upgrade --break-system-packages {DIST_NAME}`",
         )
+        return "update it with whichever tool installed it — " + "; ".join(routes)
+
+    def _manual_upgrade_guidance(self, *, pep668: bool) -> str:
         lead = (
             "this Python is externally managed (PEP 668), so pip won't upgrade aGiTrack in place"
             if pep668
             else "could not upgrade aGiTrack automatically"
         )
-        return lead + "; update it with whichever tool installed it — " + "; ".join(routes)
+        return f"{lead}; {self._manual_routes()}"
 
 
 def _version_tuple(version: str) -> tuple:

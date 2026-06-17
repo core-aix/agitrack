@@ -101,6 +101,19 @@ def _norm(text: str | None) -> str:
     return " ".join((text or "").split())
 
 
+def _is_slash_command(text: str | None) -> bool:
+    """True when a typed prompt is purely a backend/TUI slash command
+    (``/compact``, ``/comp``, ``/model``, ``/clear`` …).
+
+    These are directives to the backend, not conversational prompts: the
+    transcript parser already excludes them and :meth:`await_followup` skips
+    them, so they must not be recorded into the pending trace either — otherwise
+    they surface in the commit's interaction trace as a stray ``## User`` /
+    ``/comp`` entry. A ``/compact`` in particular is redundant there: the trace's
+    compaction lead-in note already records that the context was compacted."""
+    return _norm(text).startswith("/")
+
+
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 
@@ -268,6 +281,8 @@ class CommitEngine:
             for pending_user in pending_users:
                 if not _norm(pending_user):
                     continue
+                if _is_slash_command(pending_user):
+                    continue  # a backend directive (e.g. /compact) recorded earlier — not a prompt
                 if any(_same_prompt(pending_user, prompt) for prompt in turn_prompts):
                     continue
                 if any(_same_prompt(pending_user, prompt) for prompt in leftovers):
@@ -603,8 +618,11 @@ class CommitEngine:
     # ------------------------------------------------------------------
 
     def record_user_prompt(self, prompt_text: str) -> None:
-        """Append a user prompt to the pending trace (no-op if empty)."""
-        if prompt_text:
+        """Append a user prompt to the pending trace (no-op if empty or a bare
+        slash command). Slash commands (``/compact``, ``/model``, …) are backend
+        directives, not prompts, and are kept out of the trace — see
+        :func:`_is_slash_command`."""
+        if prompt_text and not _is_slash_command(prompt_text):
             self.state.append_trace("user", prompt_text)
 
     def await_followup(self, prompt_text: str, awaited: list[str]) -> list[str]:
@@ -615,8 +633,8 @@ class CommitEngine:
         The updated list must be stored by the caller (on the runner or
         wherever ``_awaited_followups`` lives).
         """
-        norm = " ".join((prompt_text or "").split())
-        if norm and not norm.startswith("/"):
+        norm = _norm(prompt_text)
+        if norm and not _is_slash_command(prompt_text):
             return awaited + [norm]
         return awaited
 
