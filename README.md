@@ -63,7 +63,7 @@ Run without a worktree (the agent edits the current branch directly, so changes 
 agitrack --no-worktree
 ```
 
-This is for single-session use: there's no isolation or auto-integration, and concurrent sessions are unsafe in this mode (starting a new session is blocked). Set `"use_worktrees": false` in `~/.agitrack/config.json` to make it the default; `--no-worktree` always wins.
+This is for single-session use: there's no isolation or auto-integration, and concurrent sessions are unsafe in this mode (starting a new session is blocked). Because the agent edits the checked-out branch directly, the session always works on (merges into) the repo directory's **current** branch and can never be pointed at a different one — so the "change a session's merge branch" option isn't offered in this mode. If you switch the directory's branch out-of-band (e.g. `git checkout` in another terminal), aGiTrack warns you and the session follows the new branch (future changes land there). Set `"use_worktrees": false` in `~/.agitrack/config.json` to make this the default; `--no-worktree` always wins.
 
 
 

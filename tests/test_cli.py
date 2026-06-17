@@ -282,15 +282,17 @@ def test_json_backends_append_backend_args():
 # --- combined help (#32) ----------------------------------------------------
 
 
-def test_help_shows_combined_help(monkeypatch, capsys):
-    monkeypatch.setattr(cli, "_discover_or_init", lambda p: object())
+def _no_backend_spawn(monkeypatch):
+    """Record any backend-CLI invocation so a help test can assert none happened."""
+    calls: list = []
+    monkeypatch.setattr(cli.subprocess, "run", lambda *args, **kwargs: calls.append(args) or None)
     monkeypatch.setattr(cli.shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
+    return calls
 
-    class FakeResult:
-        stdout = "opencode help output"
-        stderr = ""
 
-    monkeypatch.setattr(cli.subprocess, "run", lambda *args, **kwargs: FakeResult())
+def test_help_shows_only_agitrack_options(monkeypatch, capsys):
+    # `agitrack --help` shows aGiTrack's OWN options only — never the backend's help.
+    calls = _no_backend_spawn(monkeypatch)
 
     class Config:
         def has_default_backend(self):
@@ -305,20 +307,13 @@ def test_help_shows_combined_help(monkeypatch, capsys):
 
     out = capsys.readouterr().out
     assert "Interactive agent + git commit orchestration" in out
-    assert "--backend" in out
-    assert "Backend help (opencode)" in out
-    assert "opencode help output" in out
+    assert "--backend" in out and "--no-commit-guidance" in out  # aGiTrack's own options
+    assert "Backend help" not in out  # NOT the backend's help section
+    assert calls == []  # the backend CLI was never invoked for help
 
 
-def test_help_short_flag(monkeypatch, capsys):
-    monkeypatch.setattr(cli, "_discover_or_init", lambda p: object())
-    monkeypatch.setattr(cli.shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
-
-    class FakeResult:
-        stdout = "claude help output"
-        stderr = ""
-
-    monkeypatch.setattr(cli.subprocess, "run", lambda *args, **kwargs: FakeResult())
+def test_help_short_flag_shows_only_agitrack_options(monkeypatch, capsys):
+    calls = _no_backend_spawn(monkeypatch)
 
     class Config:
         def has_default_backend(self):
@@ -332,19 +327,14 @@ def test_help_short_flag(monkeypatch, capsys):
     assert rc == 0
 
     out = capsys.readouterr().out
-    assert "Backend help (claude)" in out
-    assert "claude help output" in out
+    assert "Interactive agent + git commit orchestration" in out
+    assert "Backend help" not in out
+    assert calls == []
 
 
-def test_help_with_explicit_backend(monkeypatch, capsys):
-    monkeypatch.setattr(cli, "_discover_or_init", lambda p: object())
-    monkeypatch.setattr(cli.shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
-
-    class FakeResult:
-        stdout = "opencode help output"
-        stderr = ""
-
-    monkeypatch.setattr(cli.subprocess, "run", lambda *args, **kwargs: FakeResult())
+def test_help_with_explicit_backend_still_omits_backend_help(monkeypatch, capsys):
+    # Even with --backend, `--help` shows only aGiTrack's options.
+    calls = _no_backend_spawn(monkeypatch)
 
     class Config:
         def has_default_backend(self):
@@ -358,12 +348,15 @@ def test_help_with_explicit_backend(monkeypatch, capsys):
     assert rc == 0
 
     out = capsys.readouterr().out
-    assert "Backend help (opencode)" in out
-    assert "opencode help output" in out
+    assert "--backend" in out
+    assert "Backend help" not in out
+    assert calls == []
 
 
-def test_help_no_backend_selected(monkeypatch, capsys):
-    monkeypatch.setattr(cli, "_discover_or_init", lambda p: object())
+def test_help_works_with_no_backend_selected(monkeypatch, capsys):
+    # Help is backend-independent now: it shows even when no backend is chosen yet, and
+    # no longer prints the old "No backend selected yet" combined-help note.
+    _no_backend_spawn(monkeypatch)
 
     class Config:
         def has_default_backend(self):
@@ -377,7 +370,8 @@ def test_help_no_backend_selected(monkeypatch, capsys):
     assert rc == 0
 
     out = capsys.readouterr().out
-    assert "No backend selected yet" in out
+    assert "Interactive agent + git commit orchestration" in out
+    assert "No backend selected yet" not in out
 
 
 def test_backend_help_via_double_dash_runs_directly(monkeypatch):
