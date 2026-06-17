@@ -37,6 +37,22 @@ def _make_session(main, name, base, *, backend="test", turn=1):
     return info, work
 
 
+def test_discard_all_changes_resets_tracked_and_removes_untracked(tmp_path):
+    repo = _init_repo(tmp_path)
+    # Edit a tracked file and create an untracked one — the leftovers a cancelled
+    # agent turn might leave behind.
+    (tmp_path / "f.txt").write_text("agent edit\n")
+    (tmp_path / "new.txt").write_text("agent new file\n")
+    repo.stage_paths(["f.txt"])  # one staged, plus an untracked file
+    assert repo.has_changes()
+
+    repo.discard_all_changes()
+
+    assert not repo.has_changes()
+    assert (tmp_path / "f.txt").read_text() == "base\n"  # tracked edit reverted
+    assert not (tmp_path / "new.txt").exists()  # untracked file removed
+
+
 # --- naming (pure) ---
 
 

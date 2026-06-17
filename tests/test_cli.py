@@ -219,6 +219,24 @@ def test_default_uses_config_commit_guidance(monkeypatch):
     assert captured["commit_guidance"] is False
 
 
+def test_full_agent_messages_off_by_default(monkeypatch):
+    captured = _stub_launch(monkeypatch)
+    cli.main([])
+    assert captured["full_agent_messages"] is False
+
+
+def test_full_agent_messages_flag_enables_it(monkeypatch):
+    captured = _stub_launch(monkeypatch)
+    cli.main(["--full-agent-messages"])
+    assert captured["full_agent_messages"] is True
+
+
+def test_full_agent_messages_flag_not_forwarded_to_backend(monkeypatch):
+    captured = _stub_launch(monkeypatch)
+    cli.main(["--full-agent-messages"])
+    assert "--full-agent-messages" not in captured["backend_args"]
+
+
 def test_unknown_args_forwarded_to_backend(monkeypatch):
     captured = _stub_launch(monkeypatch)
     rc = cli.main(["--backend", "opencode", "--port", "12345"])

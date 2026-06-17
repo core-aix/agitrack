@@ -152,10 +152,16 @@ class CommitEngine:
         state: AgitrackState,
         *,
         debug_fn: _DebugFn | None = None,
+        full_agent_messages: bool | None = None,
     ) -> None:
         self.repo = repo
         self.state = state
         self._debug = debug_fn or (lambda *a, **kw: None)
+        # Per-run override for the "include all agent messages" behaviour (e.g. the
+        # --full-agent-messages CLI flag). None defers to the per-repo config
+        # (``state.full_agent_messages``); True/False forces it for this run only,
+        # without touching the persisted config.
+        self._full_agent_messages = full_agent_messages
 
     # ------------------------------------------------------------------
     # Core commit pipeline
@@ -243,8 +249,8 @@ class CommitEngine:
             for turn in turns:
                 if turn.user_prompt:
                     self.state.append_trace("user", turn.user_prompt)
-                if turn.final_response:
-                    self.state.append_trace("agent", turn.final_response)
+                for message in self._agent_messages_for(turn):
+                    self.state.append_trace("agent", message)
                 self.state.add_token_usage(turn.tokens)
             prompts = [t.user_prompt for t in turns if t.user_prompt]
             subject_text = " / ".join(prompts) if prompts else f"{backend} changes"
@@ -266,8 +272,8 @@ class CommitEngine:
                 if turn.user_prompt:
                     subject_prompts.append(turn.user_prompt)
                     entries.append(("user", turn.user_prompt))
-                if turn.final_response:
-                    entries.append(("agent", turn.final_response))
+                for message in self._agent_messages_for(turn):
+                    entries.append(("agent", message))
 
             # Pending user entries that never showed up as a turn's user_prompt
             # (e.g. a follow-up note typed mid-turn) are still added to the
@@ -341,6 +347,21 @@ class CommitEngine:
         # fork/copy origin event for this session — both recorded because they reshape
         # the context the token counts run against (issue: track compaction & fork/copy).
         compactions = sum(int(getattr(turn, "compaction_count", 0) or 0) for turn in turns)
+        # Reasoning effort / thinking level for this commit's turns: the most recent
+        # turn that recorded one wins, so the metadata reflects the level in effect
+        # at the end of the span (None when no turn revealed it).
+        reasoning_effort = next(
+            (turn.reasoning_effort for turn in reversed(turns) if getattr(turn, "reasoning_effort", None)),
+            None,
+        )
+        # Anchor into the backend conversation: the message id of the last turn this
+        # commit covers, so the commit links back to the exact place in the (locally
+        # kept or shared) transcript. The last turn with a recorded assistant message
+        # id wins; None when the backend exposes none.
+        conversation_anchor = next(
+            (turn.assistant_message_id for turn in reversed(turns) if getattr(turn, "assistant_message_id", None)),
+            None,
+        )
         origin_event = self.state.session_origin_event()
         message = build_agent_commit_message(
             latest_prompt=subject_text,
@@ -349,6 +370,8 @@ class CommitEngine:
             backend_session_id=backend_session_id,
             agitrack_session_id=self.state.session_id,
             model=model or self.state.model,
+            reasoning_effort=reasoning_effort,
+            conversation_anchor=conversation_anchor,
             token_usage=self.state.pending_token_usage(),
             trace_turn_limit=self.state.trace_turn_limit,
             session_name=session_name,
@@ -396,6 +419,23 @@ class CommitEngine:
 
         return True
 
+    def _agent_messages_for(self, turn: SessionTurn) -> list[str]:
+        """The agent's user-facing message(s) to record in the trace for *turn*.
+
+        By default just the final response — the substantive reply, and the long-
+        standing behaviour. When the ``full_agent_messages`` option is on, every
+        user-facing message the agent sent during the turn, in order (each becomes
+        its own ``## Agent`` block); tool calls, tool results, and file edits are
+        never included either way. Falls back to the final response when the backend
+        didn't recover the full list, and is empty when the turn has no agent text.
+        """
+        full = self._full_agent_messages
+        if full is None:
+            full = self.state.full_agent_messages
+        if full and turn.agent_messages:
+            return [message for message in turn.agent_messages if message]
+        return [turn.final_response] if turn.final_response else []
+
     def _short_sha(self, sha: str) -> str:
         """Short display form of *sha* (falls back to a 7-char prefix when the
         repo cannot resolve it, e.g. fake repos in tests)."""
@@ -436,6 +476,7 @@ class CommitEngine:
         note_session_change_fn: Callable[[str], None],
         mirror_fn: Callable[[str | None], None],
         commit_fn: Callable,
+        on_cancelled_fn: Callable[[list[SessionTurn]], bool] | None = None,
     ) -> tuple[bool | None, list[str]]:
         """Consume a ready parse result and (conditionally) commit.
 
@@ -506,6 +547,21 @@ class CommitEngine:
 
         complete_turns = [t for t in all_turns if t.final_response]
         if not complete_turns:
+            # A user-cancelled turn (Esc) that produced no committable response
+            # would normally leave the agent's partial edits sitting uncommitted in
+            # the worktree forever. When a cancellation handler is supplied (the
+            # live interactive path), let it decide commit-vs-discard; if it acted,
+            # advance the watermark past the cancelled turn so it isn't reconsidered.
+            last_turn = all_turns[-1] if all_turns else None
+            if (
+                on_cancelled_fn is not None
+                and last_turn is not None
+                and getattr(last_turn, "interrupted", False)
+                and on_cancelled_fn(all_turns)
+            ):
+                self.state.last_backend_message_id = (
+                    last_turn.assistant_message_id or last_turn.user_message_id or self.state.last_backend_message_id
+                )
             debug_fn(
                 f"agent parse consumed without final response "
                 f"session_id={self.state.backend_session_id} turns={len(all_turns)}"

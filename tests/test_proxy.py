@@ -514,6 +514,112 @@ def test_proxy_agent_commit_preserves_incomplete_initial_user_turn(tmp_path):
     assert message.index("## User\n\nalso handle errors") < message.index("## Agent\n\ndone")
 
 
+def test_full_agent_messages_flag_records_all_messages(tmp_path):
+    # The runner's per-run override (set by --full-agent-messages) makes a commit
+    # include every agent message, overriding the default-off per-repo config.
+    runner = make_runner(repo=FakeCommitRepo(), state=AgitrackState(tmp_path), verbose=False)
+    runner._review_untracked_popup = lambda include_declined: "No untracked files to review."
+    runner._full_agent_messages = True
+    turn = SessionTurn("u1", "a1", "do it", "Done.", TokenUsage(total=1, output=1), None)
+    turn.agent_messages = ["On it.", "Done."]
+
+    committed = runner._create_agent_commit_from_turns_popup(
+        turns=[turn],
+        backend="opencode",
+        backend_session_id="ses-1",
+        model="provider/model",
+        quiet=True,
+    )
+
+    assert committed is True
+    assert "On it." in runner.repo.message
+    assert runner.repo.message.count("## Agent") == 2
+
+
+class _CancelRepo:
+    # Minimal repo for _handle_cancelled_turn: reports leftover changes and records
+    # whether they were discarded.
+    def __init__(self, *, changes=True):
+        self._changes = changes
+        self.discarded = False
+
+    def has_changes(self):
+        return self._changes
+
+    def discard_all_changes(self):
+        self.discarded = True
+        self._changes = False
+
+
+def _cancel_runner(tmp_path, *, changes=True):
+    runner = make_runner(repo=_CancelRepo(changes=changes), state=AgitrackState(tmp_path), verbose=False)
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda *a, **k: None
+    return runner
+
+
+def _cancelled_turn():
+    return SessionTurn("u1", "a1", "build it", "", TokenUsage(), None, interrupted=True)
+
+
+def test_handle_cancelled_turn_keep_leaves_changes(tmp_path):
+    runner = _cancel_runner(tmp_path)
+    runner._select_popup = lambda *a, **k: "Keep them (commit with your next turn)"
+    handled = runner._handle_cancelled_turn([_cancelled_turn()])
+    assert handled is False
+    assert runner.repo.discarded is False
+    # The turn was offered, so a second pass won't re-prompt.
+    assert "a1" in runner._cancel_prompted
+
+
+def test_handle_cancelled_turn_commit_commits_changes(tmp_path):
+    runner = _cancel_runner(tmp_path)
+    runner._select_popup = lambda *a, **k: "Commit the changes now"
+    calls = []
+    runner._create_agent_commit_from_turns_popup = lambda **k: (calls.append(k), True)[1]
+    handled = runner._handle_cancelled_turn([_cancelled_turn()])
+    assert handled is True
+    assert len(calls) == 1
+
+
+def test_handle_cancelled_turn_discard_after_confirm(tmp_path):
+    runner = _cancel_runner(tmp_path)
+    answers = iter(["Discard the changes", "Yes, discard"])
+    runner._select_popup = lambda *a, **k: next(answers)
+    handled = runner._handle_cancelled_turn([_cancelled_turn()])
+    assert handled is True
+    assert runner.repo.discarded is True
+
+
+def test_handle_cancelled_turn_discard_declined_keeps_changes(tmp_path):
+    runner = _cancel_runner(tmp_path)
+    answers = iter(["Discard the changes", "No, keep them"])
+    runner._select_popup = lambda *a, **k: next(answers)
+    handled = runner._handle_cancelled_turn([_cancelled_turn()])
+    assert handled is False
+    assert runner.repo.discarded is False
+
+
+def test_handle_cancelled_turn_no_changes_does_not_prompt(tmp_path):
+    runner = _cancel_runner(tmp_path, changes=False)
+    prompted = []
+    runner._select_popup = lambda *a, **k: prompted.append(a) or None
+    handled = runner._handle_cancelled_turn([_cancelled_turn()])
+    assert handled is False
+    assert prompted == []  # nothing to act on → no popup
+    assert runner._cancel_prompted == set()
+
+
+def test_handle_cancelled_turn_skips_already_prompted(tmp_path):
+    runner = _cancel_runner(tmp_path)
+    runner._cancel_prompted.add("a1")
+    prompted = []
+    runner._select_popup = lambda *a, **k: prompted.append(a) or None
+    handled = runner._handle_cancelled_turn([_cancelled_turn()])
+    assert handled is False
+    assert prompted == []
+
+
 def test_proxy_agent_commit_does_not_repeat_whitespace_variant_prompt(tmp_path):
     # The prompt recorded at submit keeps the user's raw typing (trailing
     # newline etc.) while the transcript normalizes it; the old exact-string
@@ -2870,6 +2976,19 @@ def test_next_session_name_is_a_word_avoiding_taken_names():
     name = runner._next_session_name()
     assert name in SESSION_WORDS
     assert name not in {"maple", "willow"} | runner._taken_session_names()
+
+
+def test_startup_default_name_is_a_word_not_session_1():
+    from agitrack.proxy.session_names import SESSION_WORDS
+
+    runner = _mux_runner()
+    # The very first session no longer defaults to the forgettable "session-1";
+    # it picks a friendly random word avoiding any startup-taken name.
+    runner._startup_taken_names = lambda: {"maple", "willow"}
+    name = runner._startup_default_name()
+    assert name in SESSION_WORDS
+    assert name not in {"maple", "willow"}
+    assert not name.startswith("session-")
 
 
 # --- injected-prompt targeting (cross-backend safety) ---

@@ -36,6 +36,62 @@ def test_render_interaction_trace_respects_turn_limit():
     assert "turn 0" not in rendered
 
 
+def test_agent_commit_message_records_reasoning_effort_when_given():
+    message = build_agent_commit_message(
+        latest_prompt="fix it",
+        trace=[{"role": "user", "content": "fix it"}],
+        backend="opencode",
+        backend_session_id="ses-1",
+        agitrack_session_id="agit-1",
+        model="provider/model",
+        reasoning_effort="high",
+    )
+
+    assert "model: provider/model\nreasoning_effort: high\n" in message
+
+
+def test_agent_commit_message_omits_reasoning_effort_when_absent():
+    message = build_agent_commit_message(
+        latest_prompt="fix it",
+        trace=[{"role": "user", "content": "fix it"}],
+        backend="opencode",
+        backend_session_id="ses-1",
+        agitrack_session_id="agit-1",
+        model="provider/model",
+    )
+
+    assert "reasoning_effort:" not in message
+
+
+def test_agent_commit_message_records_conversation_anchor_when_given():
+    message = build_agent_commit_message(
+        latest_prompt="fix it",
+        trace=[{"role": "user", "content": "fix it"}],
+        backend="claude",
+        backend_session_id="ses-1",
+        agitrack_session_id="agit-1",
+        model="provider/model",
+        conversation_anchor="msg-abc",
+    )
+
+    # The anchor sits with the session identity so a reader can locate the
+    # exact place in the transcript referenced by this commit.
+    assert "backend_session_id: ses-1\nconversation_anchor: msg-abc\n" in message
+
+
+def test_agent_commit_message_omits_conversation_anchor_when_absent():
+    message = build_agent_commit_message(
+        latest_prompt="fix it",
+        trace=[{"role": "user", "content": "fix it"}],
+        backend="claude",
+        backend_session_id="ses-1",
+        agitrack_session_id="agit-1",
+        model="provider/model",
+    )
+
+    assert "conversation_anchor:" not in message
+
+
 def test_agent_commit_message_contains_trace_and_metadata():
     message = build_agent_commit_message(
         latest_prompt="fix it",

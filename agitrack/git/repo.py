@@ -92,6 +92,15 @@ class GitRepo:
     def add_tracked(self) -> None:
         self._run(["git", "add", "-u"])
 
+    def discard_all_changes(self) -> None:
+        """Reset the working tree to HEAD, discarding every uncommitted change:
+        staged and unstaged tracked edits (``reset --hard``) plus untracked files
+        (``clean -fd``). ``clean`` is run without ``-x``, so git-ignored paths —
+        aGiTrack's own ``.agitrack/`` among them — are preserved. Destructive and
+        unrecoverable; callers must confirm with the user first."""
+        self._run(["git", "reset", "--hard", "HEAD"])
+        self._run(["git", "clean", "-fd"])
+
     def stage_paths(self, paths: list[str]) -> None:
         if paths:
             self._run(["git", "add", "--", *paths])
