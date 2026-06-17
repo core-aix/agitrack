@@ -195,6 +195,45 @@ def test_parse_exported_session_counts_reasoning_part_tokens():
     assert session.turns[0].tokens.total == 8
     assert session.turns[0].tokens.reasoning == 6
     assert session.turns[0].tokens.cache_read == 4
+    # Reasoning tokens were spent, so the effort signal reads "on".
+    assert session.turns[0].reasoning_effort == "on"
+
+
+def test_parse_exported_session_prefers_named_reasoning_effort():
+    session = parse_exported_session(
+        {
+            "info": {"id": "ses-1"},
+            "messages": [
+                {"info": {"role": "user", "id": "u1"}, "parts": [{"type": "text", "text": "hi"}]},
+                {
+                    "info": {"role": "assistant", "id": "a1", "finish": "stop", "variant": "high"},
+                    "parts": [
+                        {"type": "text", "text": "done", "tokens": {"input": 1, "output": 1, "reasoning": 3}},
+                    ],
+                },
+            ],
+        }
+    )
+
+    # An explicit effort/variant in the export wins over the bare "on" fallback.
+    assert session.turns[0].reasoning_effort == "high"
+
+
+def test_parse_exported_session_omits_reasoning_effort_when_absent():
+    session = parse_exported_session(
+        {
+            "info": {"id": "ses-1"},
+            "messages": [
+                {"info": {"role": "user", "id": "u1"}, "parts": [{"type": "text", "text": "hi"}]},
+                {
+                    "info": {"role": "assistant", "id": "a1", "finish": "stop"},
+                    "parts": [{"type": "text", "text": "done", "tokens": {"input": 1, "output": 1, "reasoning": 0}}],
+                },
+            ],
+        }
+    )
+
+    assert session.turns[0].reasoning_effort is None
 
 
 def test_parse_exported_session_extracts_final_text_from_event_blob():

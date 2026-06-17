@@ -61,7 +61,9 @@ def _engine(tmp_path, *, staged: bool = True) -> tuple[CommitEngine, _Repo, Agit
     return engine, repo, state
 
 
-def _turn(prompt: str, response: str, *, total: int = 1, output: int = 1) -> SessionTurn:
+def _turn(
+    prompt: str, response: str, *, total: int = 1, output: int = 1, reasoning_effort: str | None = None
+) -> SessionTurn:
     return SessionTurn(
         "uid",
         "aid",
@@ -70,7 +72,39 @@ def _turn(prompt: str, response: str, *, total: int = 1, output: int = 1) -> Ses
         TokenUsage(total=total, output=output, input=total - output),
         None,
         complete=True,
+        reasoning_effort=reasoning_effort,
     )
+
+
+def test_commit_turns_records_latest_reasoning_effort(tmp_path):
+    engine, repo, state = _engine(tmp_path)
+    engine.commit_turns(
+        # The most recent turn that recorded a level wins; a later None doesn't erase it.
+        turns=[
+            _turn("a", "done", reasoning_effort="on"),
+            _turn("b", "done", reasoning_effort="high"),
+            _turn("c", "done"),
+        ],
+        backend="opencode",
+        backend_session_id="s1",
+        model="m",
+        stage_untracked_fn=_noop_stage,
+    )
+    assert repo.message is not None
+    assert "reasoning_effort: high" in repo.message
+
+
+def test_commit_turns_omits_reasoning_effort_when_no_turn_records_it(tmp_path):
+    engine, repo, state = _engine(tmp_path)
+    engine.commit_turns(
+        turns=[_turn("a", "done")],
+        backend="claude",
+        backend_session_id="s1",
+        model="m",
+        stage_untracked_fn=_noop_stage,
+    )
+    assert repo.message is not None
+    assert "reasoning_effort:" not in repo.message
 
 
 # ---------------------------------------------------------------------------

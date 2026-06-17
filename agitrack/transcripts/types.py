@@ -28,6 +28,13 @@ class SessionTurn:
     # the backend transcript carries no timestamps.
     started_at: int | None = None
     ended_at: int | None = None
+    # The reasoning effort / thinking level the model used for this turn, when the
+    # backend transcript reveals it. Neither backend records a numeric budget, so
+    # this is a coarse, best-effort signal: a named effort/variant when the export
+    # carries one (OpenCode), otherwise ``"on"`` when the turn shows extended
+    # thinking / reasoning was active (Claude thinking blocks, OpenCode reasoning
+    # tokens). None when nothing about reasoning is recorded — never asserts "off".
+    reasoning_effort: str | None = None
     # How many context compactions the backend performed at the start of this turn
     # (the conversation history was summarized to fit the window). A compaction
     # resets what "context" means and shrinks the tokens the turn runs against, so

@@ -568,6 +568,7 @@ def parse_rows(
                 "ended_at": stamp,
                 "tool_ids": set(),
                 "compactions": pending_compactions,
+                "reasoning_effort": None,
             }
             pending_compactions = 0
         elif row_type == "assistant" and current is not None and row.get("isSidechain"):
@@ -590,6 +591,11 @@ def parse_rows(
             # tool result), anything else (end_turn/stop_sequence/max_tokens) is a
             # finished response.
             current["stop_reason"] = message.get("stop_reason")
+            # Claude Code emits a `thinking` content block whenever extended
+            # thinking is enabled, so its presence is the only signal the transcript
+            # gives that reasoning was active (the budget itself is never recorded).
+            if current["reasoning_effort"] is None and _has_thinking(message):
+                current["reasoning_effort"] = "on"
             _collect_tool_use_ids(message, current["tool_ids"])
             text = _assistant_text(message)
             if text:
@@ -684,7 +690,15 @@ def _finalize_turn(turn: dict, *, dangling: bool = False) -> SessionTurn:
         started_at=turn.get("started_at"),
         ended_at=turn.get("ended_at"),
         compaction_count=int(turn.get("compactions") or 0),
+        reasoning_effort=turn.get("reasoning_effort"),
     )
+
+
+def _has_thinking(message: dict) -> bool:
+    content = message.get("content")
+    if not isinstance(content, list):
+        return False
+    return any(isinstance(block, dict) and block.get("type") == "thinking" for block in content)
 
 
 _INTERRUPT_MARKER = "[Request interrupted by user"
