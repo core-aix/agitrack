@@ -149,6 +149,46 @@ def test_commit_turns_records_all_agent_messages_when_option_on(tmp_path):
     assert repo.message.count("## Agent") == 2
 
 
+def test_commit_turns_full_agent_messages_override_forces_on(tmp_path):
+    # The per-run override (e.g. --full-agent-messages) forces all messages even
+    # when the per-repo config is off.
+    repo = _Repo(staged=True)
+    state = AgitrackState(tmp_path)
+    assert state.full_agent_messages is False
+    engine = CommitEngine(repo, state, full_agent_messages=True)
+    turn = _turn("do it", "Done.")
+    turn.agent_messages = ["On it.", "Done."]
+    engine.commit_turns(
+        turns=[turn],
+        backend="claude",
+        backend_session_id="s1",
+        model="m",
+        stage_untracked_fn=_noop_stage,
+    )
+    assert repo.message is not None
+    assert "On it." in repo.message
+    assert repo.message.count("## Agent") == 2
+
+
+def test_commit_turns_full_agent_messages_override_none_defers_to_config(tmp_path):
+    # With no override (None), the per-repo config decides — here it's on.
+    repo = _Repo(staged=True)
+    state = AgitrackState(tmp_path)
+    state.full_agent_messages = True
+    engine = CommitEngine(repo, state, full_agent_messages=None)
+    turn = _turn("do it", "Done.")
+    turn.agent_messages = ["On it.", "Done."]
+    engine.commit_turns(
+        turns=[turn],
+        backend="claude",
+        backend_session_id="s1",
+        model="m",
+        stage_untracked_fn=_noop_stage,
+    )
+    assert repo.message is not None
+    assert "On it." in repo.message
+
+
 def test_commit_turns_records_conversation_anchor_of_last_turn(tmp_path):
     engine, repo, state = _engine(tmp_path)
     engine.commit_turns(

@@ -514,6 +514,28 @@ def test_proxy_agent_commit_preserves_incomplete_initial_user_turn(tmp_path):
     assert message.index("## User\n\nalso handle errors") < message.index("## Agent\n\ndone")
 
 
+def test_full_agent_messages_flag_records_all_messages(tmp_path):
+    # The runner's per-run override (set by --full-agent-messages) makes a commit
+    # include every agent message, overriding the default-off per-repo config.
+    runner = make_runner(repo=FakeCommitRepo(), state=AgitrackState(tmp_path), verbose=False)
+    runner._review_untracked_popup = lambda include_declined: "No untracked files to review."
+    runner._full_agent_messages = True
+    turn = SessionTurn("u1", "a1", "do it", "Done.", TokenUsage(total=1, output=1), None)
+    turn.agent_messages = ["On it.", "Done."]
+
+    committed = runner._create_agent_commit_from_turns_popup(
+        turns=[turn],
+        backend="opencode",
+        backend_session_id="ses-1",
+        model="provider/model",
+        quiet=True,
+    )
+
+    assert committed is True
+    assert "On it." in runner.repo.message
+    assert runner.repo.message.count("## Agent") == 2
+
+
 class _CancelRepo:
     # Minimal repo for _handle_cancelled_turn: reports leftover changes and records
     # whether they were discarded.

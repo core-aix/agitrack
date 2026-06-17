@@ -152,10 +152,16 @@ class CommitEngine:
         state: AgitrackState,
         *,
         debug_fn: _DebugFn | None = None,
+        full_agent_messages: bool | None = None,
     ) -> None:
         self.repo = repo
         self.state = state
         self._debug = debug_fn or (lambda *a, **kw: None)
+        # Per-run override for the "include all agent messages" behaviour (e.g. the
+        # --full-agent-messages CLI flag). None defers to the per-repo config
+        # (``state.full_agent_messages``); True/False forces it for this run only,
+        # without touching the persisted config.
+        self._full_agent_messages = full_agent_messages
 
     # ------------------------------------------------------------------
     # Core commit pipeline
@@ -423,7 +429,10 @@ class CommitEngine:
         never included either way. Falls back to the final response when the backend
         didn't recover the full list, and is empty when the turn has no agent text.
         """
-        if self.state.full_agent_messages and turn.agent_messages:
+        full = self._full_agent_messages
+        if full is None:
+            full = self.state.full_agent_messages
+        if full and turn.agent_messages:
             return [message for message in turn.agent_messages if message]
         return [turn.final_response] if turn.final_response else []
 
