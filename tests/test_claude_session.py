@@ -330,6 +330,36 @@ def test_parse_rows_counts_later_row_usage_when_first_row_usage_empty():
     assert turn.tokens.output == 7
 
 
+def test_parse_rows_attributes_compaction_to_following_turn():
+    # Claude injects the compaction summary as an `isCompactSummary` user row that sits
+    # BETWEEN turns — after the prior turn's last message, before the next real prompt.
+    # It must not become a turn of its own, and it is attributed to the NEXT turn (whose
+    # context it shrank), not the prior one.
+    rows = [
+        _user("u1", "first task"),
+        _assistant("m1", "first answer", usage={"output_tokens": 5}, stop_reason="end_turn"),
+        _user("c1", "<conversation summary>", isCompactSummary=True),
+        _user("u2", "second task"),
+        _assistant("m2", "second answer", usage={"output_tokens": 6}, stop_reason="end_turn"),
+    ]
+    turns = parse_rows("s", rows).turns
+    assert [t.user_prompt for t in turns] == ["first task", "second task"]  # no phantom turn
+    assert [t.compaction_count for t in turns] == [0, 1]
+
+
+def test_parse_rows_compaction_with_no_following_turn_is_unrecorded():
+    # A compaction at the very end influenced no subsequent work, so it is not pinned to
+    # the prior turn (which ran against the pre-compaction context).
+    rows = [
+        _user("u1", "task"),
+        _assistant("m1", "answer", usage={"output_tokens": 5}, stop_reason="end_turn"),
+        _user("c1", "<conversation summary>", isCompactSummary=True),
+    ]
+    turns = parse_rows("s", rows).turns
+    assert len(turns) == 1
+    assert turns[0].compaction_count == 0
+
+
 def test_parse_rows_attributes_separate_file_subagent_tokens_by_tool_use_id():
     # Newer Claude Code records sub-agents in their own files; `export_session` reads
     # those and passes their tokens (keyed by the Task tool_use id) to parse_rows, which

@@ -128,6 +128,46 @@ def test_parse_exported_session_excludes_compaction_summary():
     assert session.turns[0].final_response == "real response"
     assert session.turns[0].assistant_message_id == "a1"
     assert session.turns[0].tokens.total == 4
+    # The compaction is excluded from the response/tokens but recorded as an event.
+    assert session.turns[0].compaction_count == 1
+
+
+def test_parse_exported_session_compaction_count_resets_per_turn():
+    session = parse_exported_session(
+        {
+            "info": {"id": "ses-1"},
+            "messages": [
+                {"info": {"role": "user", "id": "u1"}, "parts": [{"type": "text", "text": "first"}]},
+                {
+                    "info": {"role": "assistant", "id": "c1", "parentID": "u1", "mode": "compaction", "summary": True},
+                    "parts": [{"type": "text", "text": "summary"}],
+                },
+                {
+                    "info": {
+                        "role": "assistant",
+                        "id": "a1",
+                        "parentID": "u1",
+                        "finish": "stop",
+                        "tokens": {"output": 2},
+                    },
+                    "parts": [{"type": "text", "text": "answer one"}],
+                },
+                {"info": {"role": "user", "id": "u2"}, "parts": [{"type": "text", "text": "second"}]},
+                {
+                    "info": {
+                        "role": "assistant",
+                        "id": "a2",
+                        "parentID": "u2",
+                        "finish": "stop",
+                        "tokens": {"output": 3},
+                    },
+                    "parts": [{"type": "text", "text": "answer two"}],
+                },
+            ],
+        }
+    )
+
+    assert [t.compaction_count for t in session.turns] == [1, 0]
 
 
 def test_parse_exported_session_counts_reasoning_part_tokens():

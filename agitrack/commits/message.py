@@ -97,6 +97,8 @@ def build_agent_commit_message(
     covered_commits: list[str] | None = None,
     started_at: int | None = None,
     ended_at: int | None = None,
+    compactions: int = 0,
+    origin_event: dict | None = None,
 ) -> str:
     if summary:
         # The summary leads (issue #8): its first line becomes the subject, the
@@ -128,6 +130,8 @@ def build_agent_commit_message(
             covered_commits=covered_commits,
             started_at=started_at,
             ended_at=ended_at,
+            compactions=compactions,
+            origin_event=origin_event,
         )
     )
     return "\n".join(lines).rstrip() + "\n"
@@ -249,8 +253,14 @@ def _trace_and_metadata_lines(
     summary_metadata: list[str] | None = None,
     started_at: int | None = None,
     ended_at: int | None = None,
+    compactions: int = 0,
+    origin_event: dict | None = None,
 ) -> list[str]:
     lines: list[str] = ["# Interaction Trace", ""]
+    # Session-level events (a fork/copy this session began from, any context
+    # compactions in these turns) lead the trace as a note, so the conversation log
+    # itself shows when the context — and the token counts riding on it — changed.
+    lines.extend(_session_event_note_lines(compactions=compactions, origin_event=origin_event))
     for item in _limit_trace_turns(trace, trace_turn_limit):
         role = item.get("role", "").strip().lower()
         # Nest the message's own headings under the "## User"/"## Agent" heading so
@@ -281,10 +291,77 @@ def _trace_and_metadata_lines(
     if ended_at is not None:
         lines.append(f"agent_ended_at: {_iso_utc(ended_at)}")
     lines.extend(_token_metadata_lines(token_usage))
+    lines.extend(_session_event_metadata_lines(compactions=compactions, origin_event=origin_event))
     if summary_metadata:
         lines.extend(summary_metadata)
     lines.append(f"system: {_system_info()}")
     lines.append(f"agitrack_version: {__version__}")
+    return lines
+
+
+def _session_event_note_lines(*, compactions: int, origin_event: dict | None) -> list[str]:
+    """Lead-in note for the interaction trace describing fork/copy lineage and any
+    context compactions — the human-readable counterpart to the metadata lines."""
+    notes: list[str] = []
+    if origin_event:
+        notes.append(_origin_event_sentence(origin_event))
+    if isinstance(compactions, int) and compactions > 0:
+        times = "once" if compactions == 1 else f"{compactions} times"
+        notes.append(
+            f"The conversation context was compacted {times} here — earlier history "
+            "was summarized to fit the model's window, so the token counts below run "
+            "against a reset (smaller) context."
+        )
+    lines: list[str] = []
+    for note in notes:
+        lines.extend(_note_block(_mask_secrets(note)))
+        lines.append("")
+    return lines
+
+
+def _origin_event_sentence(origin_event: dict) -> str:
+    kind = origin_event.get("kind")
+    source_name = origin_event.get("source_name") or origin_event.get("source") or "another session"
+    collaborator = origin_event.get("collaborator")
+    if kind == "copy":
+        whose = f"{collaborator}'s shared session" if collaborator else "a shared session"
+        return (
+            f"This session was copied from {whose} '{source_name}'. It resumes that "
+            "conversation, so its starting context — and the token usage inherited with "
+            "it — originated there, not in this session."
+        )
+    return (
+        f"This session was forked from '{source_name}'. It resumes a copy of that "
+        "conversation, so its starting context and the token usage inherited with it "
+        "came from the original session."
+    )
+
+
+def _note_block(text: str) -> list[str]:
+    """Wrap *text* as a Markdown blockquote (``>`` on every line) within the body width.
+    The note is plain prose (no code/indentation to preserve), so collapse whitespace and
+    drop the wrap padding for clean, evenly-filled quote lines."""
+    wrapped = wrap(" ".join(text.split()), width=MAX_BODY_WIDTH - 2) or [""]
+    return [f"> {line}" for line in wrapped]
+
+
+def _session_event_metadata_lines(*, compactions: int, origin_event: dict | None) -> list[str]:
+    """Machine-readable metadata for the session events: a compaction count and the
+    fork/copy lineage, so the dashboard can flag turns whose token counts span a
+    context reset or were inherited from another conversation."""
+    lines: list[str] = []
+    if isinstance(compactions, int) and compactions > 0:
+        lines.append(f"context_compactions: {compactions}")
+    if origin_event:
+        kind = origin_event.get("kind") or "fork"
+        source = origin_event.get("source") or "unknown"
+        source_name = origin_event.get("source_name")
+        detail = f"{source} ({source_name})" if source_name else str(source)
+        key = "copied_from" if kind == "copy" else "forked_from"
+        lines.append(f"{key}: {detail}")
+        collaborator = origin_event.get("collaborator")
+        if kind == "copy" and collaborator:
+            lines.append(f"copied_from_contributor: {collaborator}")
     return lines
 
 
