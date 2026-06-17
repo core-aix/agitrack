@@ -279,6 +279,144 @@ def test_package_check_errors_when_index_unreachable(monkeypatch):
     assert not status.ok
 
 
+# --- package upgrade: pip / pipx / homebrew routing -------------------------
+
+import sys
+
+import agitrack
+from agitrack.update.updater import METHOD_HOMEBREW, METHOD_PIP, METHOD_PIPX
+
+
+def _detect_method(monkeypatch, *, install_path: str, prefix: str = "/usr") -> str:
+    # Drive _install_method purely off where the code "lives": the resolved
+    # agitrack package path plus sys.prefix as a backstop. Pin sys.prefix to a
+    # neutral path so a brew-Python test runner doesn't leak a /Cellar/ marker in.
+    monkeypatch.setattr(agitrack, "__file__", install_path)
+    monkeypatch.setattr(sys, "prefix", prefix)
+    return Updater(source_repo=None)._install_method()
+
+
+def test_install_method_detects_pipx(monkeypatch):
+    path = "/home/u/.local/pipx/venvs/agitrack/lib/python3.12/site-packages/agitrack/__init__.py"
+    assert _detect_method(monkeypatch, install_path=path) == METHOD_PIPX
+
+
+def test_install_method_detects_homebrew(monkeypatch):
+    path = "/opt/homebrew/Cellar/python@3.12/3.12.4/lib/python3.12/site-packages/agitrack/__init__.py"
+    assert _detect_method(monkeypatch, install_path=path) == METHOD_HOMEBREW
+
+
+def test_install_method_defaults_to_pip(monkeypatch):
+    path = "/home/u/venv/lib/python3.12/site-packages/agitrack/__init__.py"
+    assert _detect_method(monkeypatch, install_path=path) == METHOD_PIP
+
+
+def test_install_method_prefers_pipx_over_homebrew(monkeypatch):
+    # A pipx venv created by a brew-installed pipx still upgrades via pipx, not brew.
+    path = "/opt/homebrew/Cellar/pipx/1.0/libexec/pipx/venvs/agitrack/lib/python/site-packages/agitrack/__init__.py"
+    assert _detect_method(monkeypatch, install_path=path) == METHOD_PIPX
+
+
+def _record_run(monkeypatch, *, returncode=0, stdout="", stderr=""):
+    """Stub subprocess.run in the updater, capturing each command it runs."""
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, returncode, stdout=stdout, stderr=stderr)
+
+    monkeypatch.setattr("agitrack.update.updater.subprocess.run", fake_run)
+    return calls
+
+
+def test_apply_package_primary_path_is_running_interpreter_pip(monkeypatch):
+    # The manager-independent path: the running interpreter's own pip, used for a
+    # plain pip / venv / --user / pipx install alike — no pipx/brew shell-out.
+    updater = Updater(source_repo=None)
+    monkeypatch.setattr(updater, "_has_module_pip", lambda python: True)
+    monkeypatch.setattr(updater, "_installed_version", lambda: "2.0.0")
+    calls = _record_run(monkeypatch, returncode=0)
+    status = updater.apply()
+    assert status.ok and status.current == "2.0.0"
+    assert calls == [[sys.executable, "-m", "pip", "install", "--upgrade", "agitrack"]]
+
+
+def test_apply_package_pip_falls_back_to_pip3_on_path(monkeypatch):
+    updater = Updater(source_repo=None)
+    monkeypatch.setattr(updater, "_has_module_pip", lambda python: False)  # no `python -m pip`
+    monkeypatch.setattr(
+        "agitrack.update.updater.shutil.which", lambda name: "/usr/bin/pip3" if name == "pip3" else None
+    )
+    monkeypatch.setattr(updater, "_installed_version", lambda: "2.0.0")
+    calls = _record_run(monkeypatch, returncode=0)
+    assert updater.apply().ok
+    assert calls == [["/usr/bin/pip3", "install", "--upgrade", "agitrack"]]
+
+
+def test_apply_package_pip_failure_reports_last_line(monkeypatch):
+    # A non-PEP668 pip failure surfaces the error tail and does NOT try a manager.
+    updater = Updater(source_repo=None)
+    monkeypatch.setattr(updater, "_has_module_pip", lambda python: True)
+    calls = _record_run(monkeypatch, returncode=1, stderr="boom\nERROR: could not install")
+    status = updater.apply()
+    assert not status.ok
+    assert status.error == "ERROR: could not install"
+    assert len(calls) == 1  # no brew/second attempt
+
+
+def test_apply_package_pep668_under_homebrew_defers_to_brew(monkeypatch):
+    # Externally-managed (PEP 668) pip refusal + a Homebrew-owned install → brew upgrade.
+    updater = Updater(source_repo=None)
+    monkeypatch.setattr(updater, "_has_module_pip", lambda python: True)
+    monkeypatch.setattr(updater, "_install_method", lambda: METHOD_HOMEBREW)
+    monkeypatch.setattr("agitrack.update.updater.shutil.which", lambda name: "/opt/homebrew/bin/brew")
+    monkeypatch.setattr(updater, "_installed_version", lambda: "2.0.0")
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        # pip refuses (PEP 668); brew succeeds.
+        if cmd[-2:] == ["--upgrade", "agitrack"] and "pip" in " ".join(cmd):
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="error: externally-managed-environment")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("agitrack.update.updater.subprocess.run", fake_run)
+    status = updater.apply()
+    assert status.ok and status.current == "2.0.0"
+    assert calls[-1] == ["/opt/homebrew/bin/brew", "upgrade", "agitrack"]
+
+
+def test_apply_package_pep668_without_manager_enumerates_routes(monkeypatch):
+    # PEP 668 refusal but not a recognisable Homebrew install → full enumeration.
+    updater = Updater(source_repo=None)
+    monkeypatch.setattr(updater, "_has_module_pip", lambda python: True)
+    monkeypatch.setattr(updater, "_install_method", lambda: METHOD_PIP)
+    _record_run(monkeypatch, returncode=1, stderr="error: externally-managed-environment")
+    status = updater.apply()
+    assert not status.ok
+    error = status.error or ""
+    assert "externally managed" in error
+    # Every supported route is named.
+    for token in (
+        "pip install --upgrade agitrack",
+        "pipx upgrade agitrack",
+        "brew upgrade agitrack",
+        "break-system-packages",
+    ):
+        assert token in error
+
+
+def test_apply_package_no_pip_enumerates_routes(monkeypatch):
+    # No pip reachable at all and no identifiable manager → enumerated guidance.
+    updater = Updater(source_repo=None)
+    monkeypatch.setattr(updater, "_pip_invocation", lambda: None)
+    monkeypatch.setattr(updater, "_install_method", lambda: METHOD_PIP)
+    status = updater.apply()
+    assert not status.ok
+    assert "could not upgrade aGiTrack automatically" in (status.error or "")
+
+
 # --- config -----------------------------------------------------------------
 
 

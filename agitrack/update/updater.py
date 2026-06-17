@@ -9,9 +9,18 @@ aGiTrack can update itself in place. Two installation shapes are supported:
   branches that accumulate commits) gets a normal merge. Only a genuine content
   conflict, or an uncommitted (dirty) tree, blocks the update — with a message
   instead of leaving the running source half-merged.
-* **package** — aGiTrack was installed as a wheel (e.g. ``pip install agitrack``).
-  Updates run ``pip install --upgrade`` and the latest available version is
-  discovered with ``pip index versions``.
+* **package** — aGiTrack was installed as a wheel (e.g. ``pip install agitrack``,
+  ``pipx install agitrack``, or a Homebrew formula). The latest available version is
+  discovered with ``pip index versions``. The upgrade itself is, by preference,
+  **package-manager-independent**: it runs the *running interpreter's own* pip
+  (``<python> -m pip install --upgrade``), which upgrades a plain pip install, a venv,
+  a ``--user`` install, and a pipx venv identically — no need to detect or shell out to
+  pipx/brew/apt. It falls back to a ``pip3``/``pip`` on ``PATH`` only when that
+  interpreter has no ``pip`` module. The one situation pip can't handle is an
+  externally-managed (PEP 668) Python — Homebrew's or a distro's, where pip refuses to
+  write; there aGiTrack defers to the owning manager (``brew upgrade`` when the install
+  is under Homebrew, the only system manager that ships aGiTrack), and otherwise reports
+  a full enumeration of every manual upgrade route.
 
 The checking logic here is intentionally pure/blocking; callers (the CLI at
 startup, the proxy runner's idle loop) run :meth:`Updater.check` in a background
@@ -21,6 +30,7 @@ thread so the terminal never stalls on a network ``git fetch``.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from collections.abc import Sequence
@@ -39,6 +49,18 @@ DIST_NAME = "agitrack"
 KIND_SOURCE = "source"
 KIND_PACKAGE = "package"
 KIND_UNKNOWN = "unknown"
+
+# How a *package* install can be upgraded (returned by ``Updater._install_method``).
+METHOD_PIP = "pip"
+METHOD_PIPX = "pipx"
+METHOD_HOMEBREW = "homebrew"
+
+# Path fragments that mark where a package install physically lives. ``pipx`` gives each
+# app its own venv under ``<PIPX_HOME>/venvs/<app>``; Homebrew formulae (and their bundled
+# Python) live under the brew prefix — ``…/Cellar/…`` on every platform, plus the
+# ``homebrew``/``linuxbrew`` prefixes. Matched against the *resolved* install path.
+_PIPX_MARKER = f"{os.sep}pipx{os.sep}venvs{os.sep}"
+_HOMEBREW_MARKERS = (f"{os.sep}Cellar{os.sep}", f"{os.sep}homebrew{os.sep}", f"{os.sep}linuxbrew{os.sep}")
 
 # A short network timeout so a startup check never hangs the terminal. The
 # periodic in-session check runs on a worker thread, but keep it bounded anyway.
@@ -318,10 +340,14 @@ class Updater:
         # index without a hard dependency on a PyPI JSON client. It is marked
         # experimental but degrades gracefully: any failure (including a network
         # timeout) returns None and the caller reports "could not determine the
-        # latest version".
+        # latest version". `pip index` only READS the index, so it is safe even on
+        # an externally-managed (PEP 668) Python where `pip install` is refused.
+        pip = self._pip_invocation()
+        if pip is None:
+            return None
         try:
             result = subprocess.run(
-                [sys.executable, "-m", "pip", "index", "versions", DIST_NAME],
+                [*pip, "index", "versions", DIST_NAME],
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -397,23 +423,137 @@ class Updater:
         status.message = f"Updated aGiTrack source checkout to {status.current}."
         return status
 
+    def _install_method(self) -> str:
+        """Identify the manager that owns this *package* install: ``METHOD_PIPX``,
+        ``METHOD_HOMEBREW``, or ``METHOD_PIP``. Only consulted for the PEP 668
+        fallback (to decide whether ``brew upgrade`` is the right hand-off); the
+        primary upgrade path is pip and doesn't need it.
+
+        Decided from where the running code physically lives (the resolved
+        ``agitrack`` package path, with ``sys.prefix`` as a backstop), so it works
+        without consulting any package metadata. pipx is checked before Homebrew:
+        a pipx venv created by a brew-installed pipx still lives under
+        ``…/pipx/venvs/…``, not under the brew Cellar, so the pipx marker is the
+        more specific signal — and a pipx venv isn't externally managed, so it must
+        not be mistaken for a Homebrew install and pushed at ``brew``.
+        """
+        candidates: list[str] = []
+        try:
+            candidates.append(str(Path(agitrack.__file__).resolve()))
+        except (AttributeError, TypeError):
+            pass
+        candidates.append(str(Path(sys.prefix).resolve()))
+        blob = "\n".join(candidates)
+        if _PIPX_MARKER in blob:
+            return METHOD_PIPX
+        if any(marker in blob for marker in _HOMEBREW_MARKERS):
+            return METHOD_HOMEBREW
+        return METHOD_PIP
+
+    def _pip_invocation(self) -> list[str] | None:
+        """The command prefix for a pip call, or ``None`` when no pip is reachable.
+
+        Prefers the *running* interpreter's own pip (``<python> -m pip``) so the
+        SAME environment aGiTrack is imported from is the one upgraded. Only when
+        that interpreter has no ``pip`` module does it fall back to a ``pip3``/``pip``
+        executable on ``PATH`` — a looser match that may target another interpreter,
+        but better than offering no update at all.
+        """
+        if self._has_module_pip(sys.executable):
+            return [sys.executable, "-m", "pip"]
+        for name in ("pip3", "pip"):
+            found = shutil.which(name)
+            if found:
+                return [found]
+        return None
+
+    def _has_module_pip(self, python: str) -> bool:
+        try:
+            result = subprocess.run(
+                [python, "-m", "pip", "--version"],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=_NET_TIMEOUT,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return result.returncode == 0
+
     def _apply_package(self) -> UpdateStatus:
         status = UpdateStatus(kind=KIND_PACKAGE)
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--upgrade", DIST_NAME],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=600,
-        )
-        if result.returncode != 0:
-            status.error = (result.stderr.strip() or result.stdout.strip() or "pip upgrade failed").splitlines()[-1]
-            return status
+        # 1) Primary path — deliberately package-MANAGER-INDEPENDENT. Upgrade with the
+        # running interpreter's OWN pip (``<python> -m pip``). This is the one mechanism
+        # that works the same regardless of how the wheel was put there: a plain
+        # ``pip install``, a venv, a ``--user`` install, and a pipx venv (pipx venvs
+        # ship their own pip) all upgrade through it without invoking pipx/brew/apt. The
+        # sole case it CAN'T handle is an externally-managed (PEP 668) Python — Homebrew's
+        # or a distro's — where pip refuses by design; that falls through to (2).
+        pip = self._pip_invocation()
+        pep668 = False
+        if pip is not None:
+            result = subprocess.run(
+                [*pip, "install", "--upgrade", DIST_NAME],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=600,
+            )
+            if result.returncode == 0:
+                return self._package_upgraded(status)
+            combined = f"{result.stderr}\n{result.stdout}"
+            pep668 = "externally-managed-environment" in combined or "externally managed" in combined
+            if not pep668:
+                status.error = (result.stderr.strip() or result.stdout.strip() or "upgrade failed").splitlines()[-1]
+                return status
+
+        # 2) pip is unavailable or refused (PEP 668). Hand off to the system package
+        # manager that actually OWNS this install, when we can identify it. Homebrew is
+        # the only such manager that ships aGiTrack — distro managers (apt/dnf/pacman)
+        # don't carry it — so Homebrew is the one we can drive automatically.
+        if self._install_method() == METHOD_HOMEBREW:
+            brew = shutil.which("brew")
+            if brew is not None:
+                result = subprocess.run(
+                    [brew, "upgrade", DIST_NAME],
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                    timeout=600,
+                )
+                if result.returncode == 0:
+                    return self._package_upgraded(status)
+
+        # 3) No automatic path worked — enumerate every supported manual route so the
+        # user can finish the upgrade with whichever tool installed aGiTrack.
+        status.error = self._manual_upgrade_guidance(pep668=pep668)
+        return status
+
+    def _package_upgraded(self, status: UpdateStatus) -> UpdateStatus:
         status.current = self._installed_version()
         status.latest = status.current
         status.message = f"Updated aGiTrack package to {status.current}."
         return status
+
+    def _manual_upgrade_guidance(self, *, pep668: bool) -> str:
+        # A full enumeration of every supported upgrade route, since aGiTrack can't tell
+        # for certain which one applies once the automatic paths are exhausted.
+        routes = (
+            f"pip — `pip install --upgrade {DIST_NAME}` (inside the venv/user install it came from)",
+            f"pipx — `pipx upgrade {DIST_NAME}`",
+            f"Homebrew — `brew upgrade {DIST_NAME}`",
+            f"externally-managed (PEP 668) Python — reinstall via pipx, or force pip with "
+            f"`pip install --upgrade --break-system-packages {DIST_NAME}`",
+        )
+        lead = (
+            "this Python is externally managed (PEP 668), so pip won't upgrade aGiTrack in place"
+            if pep668
+            else "could not upgrade aGiTrack automatically"
+        )
+        return lead + "; update it with whichever tool installed it — " + "; ".join(routes)
 
 
 def _version_tuple(version: str) -> tuple:
