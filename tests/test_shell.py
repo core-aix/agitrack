@@ -90,7 +90,9 @@ def _scripted_shell(tmp_path, monkeypatch, prompts):
     _no_input(monkeypatch)
     repo = GitRepo.init(tmp_path / "demo")
     shell = AgitrackShell(repo, backend="claude", prompts=prompts)
-    shell.state.summarization_enabled = False
+    # Disable summarization for scripted tests via the durable GLOBAL config (the source
+    # of truth), so commits stay prompt-led rather than going through the summarizer.
+    shell.global_config.summarization_enabled = False
     return shell, repo
 
 

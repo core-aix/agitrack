@@ -152,6 +152,10 @@ class AgitrackShell:
         sub = arg.lower()
         if sub in ("on", "off"):
             enabled = sub == "on"
+            # Persist globally so the toggle survives restarts (the per-session worktree
+            # state is transient and reset to "on" each launch); keep the session in sync.
+            if self.global_config is not None:
+                self.global_config.summarization_enabled = enabled
             self.state.summarization_enabled = enabled
             print(f"Summarizer {'enabled' if enabled else 'disabled'}.")
         elif sub == "model":
@@ -173,14 +177,14 @@ class AgitrackShell:
             print("Usage: :summarizer [on|off|model|status]")
 
     def _summarization_enabled(self) -> bool:
+        # The GLOBAL config is the durable source of truth (survives restarts), so it wins
+        # over the per-session worktree state, which always defaults to "on" on a fresh
+        # worktree and would otherwise shadow a persisted "off".
+        gc_enabled = getattr(self.global_config, "summarization_enabled", None)
+        if gc_enabled is not None:
+            return bool(gc_enabled)
         state_enabled = getattr(self.state, "summarization_enabled", None)
-        if state_enabled is not None:
-            return state_enabled
-        if self.global_config is not None:
-            gc_enabled = getattr(self.global_config, "summarization_enabled", None)
-            if gc_enabled is not None:
-                return gc_enabled
-        return True
+        return True if state_enabled is None else bool(state_enabled)
 
     def _handle_agent_prompt(self, prompt: str) -> None:
         if prompt.startswith("/compact"):
