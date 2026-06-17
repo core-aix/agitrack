@@ -576,6 +576,9 @@ class _StubUpdater:
     def apply(self) -> UpdateStatus:
         return self._status
 
+    def manual_update_instructions(self) -> str:
+        return "update it with whichever tool installed it — pip — `pip install --upgrade agitrack`"
+
 
 def test_apply_update_failure_leaves_session_intact():
     # If apply() fails, aGiTrack must NOT tear the session down — the user keeps working
@@ -668,8 +671,9 @@ def test_restart_agitrack_without_extra_args_preserves_argv(monkeypatch):
 
 
 class _StartupUpdater:
-    def __init__(self, status: UpdateStatus):
+    def __init__(self, status: UpdateStatus, *, apply_result: UpdateStatus | None = None):
         self._status = status
+        self._apply_result = apply_result
         self.checked = False
         self.applied = False
 
@@ -680,7 +684,12 @@ class _StartupUpdater:
 
     def apply(self) -> UpdateStatus:
         self.applied = True
+        if self._apply_result is not None:
+            return self._apply_result
         return UpdateStatus(kind=self._status.kind, message="updated", current="new")
+
+    def manual_update_instructions(self) -> str:
+        return "update it with whichever tool installed it — pip — `pip install --upgrade agitrack`"
 
 
 def test_startup_prompt_applies_and_restarts(monkeypatch, tmp_path: Path):
@@ -778,3 +787,134 @@ def test_startup_check_skipped_when_disabled(monkeypatch, tmp_path: Path):
 
     monkeypatch.setattr("agitrack.update.Updater", boom)
     cli._check_for_update_at_startup(config)  # returns without checking
+
+
+# --- failed update: keep running, remind (once) instead of nagging ----------
+
+
+def test_apply_catches_exception_and_returns_manual_instructions(monkeypatch):
+    # apply() must never raise — a crash in the install step becomes an error status
+    # carrying manual instructions, so a failed update can't take aGiTrack down.
+    updater = Updater(source_repo=None)
+
+    def boom() -> UpdateStatus:
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(updater, "_apply_package", boom)
+    status = updater.apply()
+    assert not status.ok
+    assert "kaboom" in (status.error or "")
+    assert "pip install --upgrade agitrack" in (status.error or "")  # manual routes included
+
+
+def test_manual_instructions_package_enumerates_routes():
+    text = Updater(source_repo=None).manual_update_instructions()
+    for token in ("pip install --upgrade agitrack", "pipx upgrade agitrack", "brew upgrade agitrack"):
+        assert token in text
+
+
+def test_manual_instructions_source_points_at_git_pull(tmp_path: Path):
+    repo = tmp_path / "src"
+    repo.mkdir()
+    text = Updater(source_repo=repo).manual_update_instructions()
+    assert "git pull" in text and str(repo) in text
+
+
+def test_pending_manual_update_persists_and_clears(tmp_path: Path):
+    path = tmp_path / "c.json"
+    config = GlobalConfig(path=path)
+    assert config.pending_manual_update is None
+    config.pending_manual_update = "1.2.3"
+    assert GlobalConfig(path=path).pending_manual_update == "1.2.3"  # round-trips on disk
+    config.pending_manual_update = None
+    assert GlobalConfig(path=path).pending_manual_update is None  # cleared
+
+
+def test_startup_apply_failure_records_pending_and_keeps_running(monkeypatch, tmp_path: Path, capsys):
+    # A failed automatic update at startup: aGiTrack does NOT restart, remembers the
+    # pending version so the next startup reminds (once), and prints manual instructions.
+    config = GlobalConfig(path=tmp_path / "c.json")
+    failed = UpdateStatus(kind=KIND_SOURCE, error="not a fast-forward")
+    updater = _StartupUpdater(_available_status(), apply_result=failed)
+    restarted: list = []
+    monkeypatch.setattr("agitrack.update.Updater", lambda *a, **k: updater)
+    monkeypatch.setattr("agitrack.update.restart_agitrack", lambda: restarted.append(True))
+    monkeypatch.setattr("builtins.input", lambda *a: "y")
+
+    cli._check_for_update_at_startup(config)
+
+    assert restarted == []  # stayed on the current version
+    assert config.pending_manual_update == "bbbbbbb"  # target version remembered
+    out = capsys.readouterr().out
+    assert "Update failed" in out
+    assert "pip install --upgrade agitrack" in out  # manual instructions shown
+
+
+def test_startup_reminds_without_reprompting_when_pending(monkeypatch, tmp_path: Path, capsys):
+    # With a pending failed update, startup shows a one-time reminder and does NOT
+    # re-run the interactive auto-update (which already failed).
+    config = GlobalConfig(path=tmp_path / "c.json")
+    config.pending_manual_update = "bbbbbbb"
+    updater = _StartupUpdater(_available_status())
+    monkeypatch.setattr("agitrack.update.Updater", lambda *a, **k: updater)
+    monkeypatch.setattr("builtins.input", lambda *a: (_ for _ in ()).throw(AssertionError("must not prompt")))
+
+    cli._check_for_update_at_startup(config)
+
+    assert updater.applied is False  # no retry attempted automatically
+    out = capsys.readouterr().out
+    assert "Reminder" in out
+    assert "pip install --upgrade agitrack" in out
+
+
+def test_startup_clears_pending_once_up_to_date(monkeypatch, tmp_path: Path):
+    # The reminder is cleared the moment aGiTrack is actually current again.
+    config = GlobalConfig(path=tmp_path / "c.json")
+    config.pending_manual_update = "bbbbbbb"
+    updater = _StartupUpdater(UpdateStatus(kind=KIND_SOURCE, available=False))
+    monkeypatch.setattr("agitrack.update.Updater", lambda *a, **k: updater)
+
+    cli._check_for_update_at_startup(config)
+
+    assert config.pending_manual_update is None
+
+
+def test_consume_update_result_suppressed_when_manual_pending(tmp_path: Path):
+    # While a manual update is pending, the periodic in-session notice is held back
+    # (the user is reminded at startup instead) — but the status is still recorded so
+    # the explicit `update` command keeps working.
+    runner = make_runner(global_config=GlobalConfig(path=tmp_path / "c.json"))
+    runner.global_config.pending_manual_update = "9.9.9"
+    runner._update_status = None
+    runner._update_offered = False
+    runner._update_worker_result = _available_status()
+    runner._update_check_thread = SimpleNamespace(is_alive=lambda: False)
+
+    runner._consume_update_check_result()
+
+    assert runner._update_status is not None and runner._update_status.available  # recorded
+    assert runner._update_offered is False  # but not surfaced
+    assert runner.message is None  # no notice shown
+
+
+def test_in_session_apply_failure_records_pending_and_stops_nagging(tmp_path: Path):
+    runner = make_runner(global_config=GlobalConfig(path=tmp_path / "c.json"))
+    runner._update_status = UpdateStatus(kind=KIND_PACKAGE, available=True, latest="2.0.0")
+    runner._updater = _StubUpdater(UpdateStatus(kind=KIND_PACKAGE, error="externally managed"))
+    runner.running = True
+    runner._pending_restart = False
+    torn: list = []
+    runner._finalize_pending_work = lambda: torn.append(True)
+    runner._exit_child = lambda: torn.append("exit")
+    runner._render = lambda: None
+
+    runner._apply_update_and_restart()
+
+    assert torn == []  # session untouched — keep running the current version
+    assert runner.running is True
+    assert runner._update_applying is False
+    assert runner.global_config.pending_manual_update == "2.0.0"  # remembered for the next startup
+    assert runner._update_offered is True  # periodic notice suppressed this session
+    message = (runner.message or "").lower()
+    assert "update failed" in message
+    assert "pip install --upgrade agitrack" in (runner.message or "")  # manual instructions appended
