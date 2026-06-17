@@ -373,6 +373,7 @@ class ProxyRunner:
         use_worktrees: bool = True,
         backend_args: list[str] | None = None,
         commit_guidance: bool = True,
+        full_agent_messages: bool = False,
         # Optional injected collaborators (default to production construction).
         # These keyword arguments are for testing and advanced use; the CLI call
         # site passes only the first five parameters and is unaffected.
@@ -389,6 +390,10 @@ class ProxyRunner:
         # (--no-commit-guidance / config turns it off). Appended to the agent's system prompt
         # where the backend supports it (Claude).
         self._commit_guidance = commit_guidance
+        # Per-run override for the "include all agent messages" trace option
+        # (--full-agent-messages). True forces it on for this run regardless of the
+        # per-repo config; False (the default) defers to ``state.full_agent_messages``.
+        self._full_agent_messages = full_agent_messages
         # Extra CLI args forwarded verbatim to every backend spawn (#32).
         self._backend_args = list(backend_args or [])
         self._force_new_session = new_session  # start a fresh conversation, do not resume
@@ -766,6 +771,7 @@ class ProxyRunner:
                 "_auto_share_thread": None,
                 "_sessions_with_activity": set(),
                 "_cancel_prompted": set(),
+                "_full_agent_messages": False,
                 "_user_declined": [],
                 "sessions": [],
                 "worktree_manager": None,
@@ -5772,7 +5778,14 @@ class ProxyRunner:
             # inside commit_turns), which is the summarizer's sole input.
             self._start_commit_summary(sha, trace_text)
 
-        return CommitEngine(self.repo, self.state, debug_fn=self._debug).commit_turns(
+        return CommitEngine(
+            self.repo,
+            self.state,
+            debug_fn=self._debug,
+            # The --full-agent-messages flag forces the option on for this run; None
+            # otherwise so the per-repo config decides.
+            full_agent_messages=self._full_agent_messages or None,
+        ).commit_turns(
             turns=turns,
             backend=backend,
             backend_session_id=backend_session_id,
