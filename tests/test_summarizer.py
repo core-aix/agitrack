@@ -27,6 +27,45 @@ def test_summarize_commit() -> None:
     assert call_args[1]["session_id"] is None
 
 
+def test_summarizer_input_includes_cache_creation_tokens() -> None:
+    # Regression for the "summary input token is always 20" bug: a cache-served summary
+    # reports a tiny `input_tokens` while the real input sits in cache-creation. Fresh
+    # input must count input + cache_write (matching the main commit line), and cache
+    # reads are tracked separately — not folded in (that would double-count).
+    backend = Mock()
+    backend.run.return_value = AgentResult(
+        backend="test",
+        session_id=None,
+        model="test-model",
+        final_response="A concise summary of the change.",
+        exit_code=0,
+        tokens=TokenUsage(input=20, output=300, cache_write=4500, cache_read=12000),
+    )
+    summarizer = Summarizer(backend, model="test-model")
+    summarizer.summarize_commit(trace=_TRACE)
+    assert summarizer.tokens_input == 4520  # 20 uncached + 4500 cache-creation, not 20
+    assert summarizer.tokens_output == 300
+    assert summarizer.tokens_cache_read == 12000  # separate, never added into input
+
+
+def test_summarizer_token_counts_accumulate_across_calls() -> None:
+    backend = Mock()
+    backend.run.return_value = AgentResult(
+        backend="test",
+        session_id=None,
+        model="m",
+        final_response="ok summary",
+        exit_code=0,
+        tokens=TokenUsage(input=10, output=5, cache_write=100, cache_read=7),
+    )
+    summarizer = Summarizer(backend, model="m")
+    summarizer.summarize_commit(trace=_TRACE)
+    summarizer.update_session_summary(current_summary=None, trace=_TRACE, commit_summary="ok summary")
+    assert summarizer.tokens_input == 220  # (10 + 100) * 2
+    assert summarizer.tokens_output == 10
+    assert summarizer.tokens_cache_read == 14
+
+
 def test_commit_summary_prompt_is_self_contained() -> None:
     # A commit summary must describe ONLY this commit (its interaction trace). It
     # must not be seeded with any prior/rolling session summary — that contaminated the

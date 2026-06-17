@@ -138,6 +138,7 @@ class FakeSummarizer:
         self.model = model
         self.tokens_input = 7
         self.tokens_output = 3
+        self.tokens_cache_read = 11
 
     def summarize_commit(self, *, trace):
         if FakeSummarizer.gate is not None:
@@ -201,6 +202,7 @@ def test_commit_path_does_not_block_on_summarization(tmp_path, monkeypatch):
     assert head.startswith("<aGiTrack> Implement the widget renderer with caching")
     assert "# Prompts" not in head  # prompts are not duplicated into a section
     assert "summary_tokens_input: 7" in head and "summary_tokens_output: 3" in head
+    assert "summary_tokens_cache_read: 11" in head  # cache reads reported separately
     assert runner._summary_pending is None
     # Summary and rolling session summary are queryable as git notes too.
     final = repo.rev_parse("HEAD")
