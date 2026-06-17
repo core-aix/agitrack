@@ -150,12 +150,16 @@ def test_claude_backend_bare_run_strips_tools_memory_and_system_prompt(monkeypat
     monkeypatch.setattr(subprocess, "run", fake_run)
     backend = ClaudeBackend(tmp_path)
 
-    backend.run("summarize this", model="claude-haiku-4-5-20251001", session_id=None, bare=True)
+    backend.run(
+        "summarize this", model="claude-haiku-4-5-20251001", session_id=None, bare=True, system_prompt="BE A SUMMARIZER"
+    )
     cmd = captured["command"]
     assert "--tools" in cmd and cmd[cmd.index("--tools") + 1] == ""  # all tools disabled
     assert "--strict-mcp-config" in cmd  # no MCP servers
     assert "--setting-sources" in cmd and cmd[cmd.index("--setting-sources") + 1] == ""  # no CLAUDE.md/skills
-    assert "--system-prompt" in cmd  # default agent system prompt replaced with a minimal one
+    # The caller's system prompt is used (the summarizer's instruction), replacing the
+    # default agent system prompt.
+    assert cmd[cmd.index("--system-prompt") + 1] == "BE A SUMMARIZER"
 
     backend.run("do real work", model=None, session_id=None)  # bare defaults to False
     normal = captured["command"]

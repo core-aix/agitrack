@@ -235,7 +235,7 @@ class Summarizer:
         # committed trace keeps the summary faithful to it. It is also deliberately
         # not seeded with the rolling session summary (that folded earlier,
         # unrelated work in); the rolling summary is maintained separately.
-        return self._run(self._build_commit_prompt(trace))
+        return self._run(*self._build_commit_prompt(trace))
 
     def update_session_summary(
         self,
@@ -244,7 +244,7 @@ class Summarizer:
         trace: str,
         commit_summary: str,
     ) -> str:
-        return self._run(self._build_session_update_prompt(current_summary, trace, commit_summary))
+        return self._run(*self._build_session_update_prompt(current_summary, trace, commit_summary))
 
     def summarize_pre_compaction(
         self,
@@ -252,13 +252,19 @@ class Summarizer:
         exported_session: ExportedSession,
         current_summary: str | None = None,
     ) -> str:
-        return self._run(self._build_pre_compaction_prompt(exported_session, current_summary))
+        return self._run(*self._build_pre_compaction_prompt(exported_session, current_summary))
 
-    def _run(self, prompt: str) -> str:
-        # ``bare``: the summarizer must read ONLY its instruction plus the interaction
-        # trace — not the backend's agent system prompt, tool schemas, or project/user
-        # memory, which would add thousands of input tokens the summary never uses.
-        result = self.backend.run(prompt, model=self.model, session_id=None, bare=True)
+    def _run(self, system_prompt: str, user_prompt: str) -> str:
+        # ``bare``: the summarizer reads ONLY its instruction plus the interaction trace —
+        # not the backend's agent system prompt, tool schemas, or project/user memory,
+        # which would add thousands of input tokens the summary never uses. The task
+        # instruction is passed as the SYSTEM prompt (not crammed into the user message):
+        # a small model handed an instruction-shaped user message frequently completes/
+        # echoes it instead of summarizing (a ~75% echo rate was measured); in the system
+        # role the model treats the user content as the thing to summarize.
+        result = self.backend.run(
+            user_prompt, model=self.model, session_id=None, bare=True, system_prompt=system_prompt
+        )
         tokens = getattr(result, "tokens", None)
         if tokens is not None:
             # Fresh input = uncached input + cache-creation tokens (both are input the
@@ -270,34 +276,38 @@ class Summarizer:
         # A failed/echoed run must raise rather than return its text, or the error
         # (or the prompt itself) becomes the commit subject (issue #8). Callers
         # already treat a raising summarizer as "no summary" and keep the
-        # prompt-led message.
+        # prompt-led message. Guard against echoing EITHER the user message (the trace)
+        # or the system instruction.
         if result.exit_code != 0:
             raise UnusableSummaryError(f"summarizer backend exited with {result.exit_code}: {text[:200]}")
-        if _looks_like_prompt_echo(prompt, text):
+        if _looks_like_prompt_echo(user_prompt, text) or _looks_like_prompt_echo(system_prompt, text):
             raise UnusableSummaryError(f"summarizer echoed its prompt instead of summarizing: {text[:200]}")
         if not summary_is_usable(text):
             raise UnusableSummaryError(f"summarizer returned an error message: {text[:200]}")
         # Drop any "Here is the summary…" preamble so the topic sentence leads.
         return strip_summary_preamble(text)
 
-    def _build_commit_prompt(self, trace: str) -> str:
-        parts = [
-            COMMIT_SUMMARY_SYSTEM,
-            "\n\nInteraction trace:\n",
-            _truncate(trace, _MAX_TRACE_CHARS),
-            "\n\n",
-            _GENERATION_REMINDER,
-            "\n\nSummary:",
-        ]
-        return "".join(parts)
+    def _build_commit_prompt(self, trace: str) -> tuple[str, str]:
+        # (system, user): the instruction goes in the system role; the user message is the
+        # interaction trace to summarize plus the generation cue.
+        user = "".join(
+            [
+                "Interaction trace:\n",
+                _truncate(trace, _MAX_TRACE_CHARS),
+                "\n\n",
+                _GENERATION_REMINDER,
+                "\n\nSummary:",
+            ]
+        )
+        return COMMIT_SUMMARY_SYSTEM, user
 
     def _build_session_update_prompt(
         self,
         current_summary: str | None,
         trace: str,
         commit_summary: str,
-    ) -> str:
-        parts = [SESSION_UPDATE_SYSTEM, "\n\n"]
+    ) -> tuple[str, str]:
+        parts: list[str] = []
         if current_summary:
             parts.extend(["Current session summary:\n", _truncate(current_summary, _MAX_PRIOR_SUMMARY_CHARS), "\n\n"])
         else:
@@ -305,14 +315,14 @@ class Summarizer:
         parts.extend(["New commit summary:\n", _truncate(commit_summary, _MAX_PRIOR_SUMMARY_CHARS), "\n\n"])
         parts.extend(["Interaction trace:\n", _truncate(trace, _MAX_TRACE_CHARS), "\n\n"])
         parts.extend([_GENERATION_REMINDER, "\n\nUpdated session summary:"])
-        return "".join(parts)
+        return SESSION_UPDATE_SYSTEM, "".join(parts)
 
     def _build_pre_compaction_prompt(
         self,
         exported_session: ExportedSession,
         current_summary: str | None,
-    ) -> str:
-        parts = [PRE_COMPACTION_SYSTEM, "\n\n"]
+    ) -> tuple[str, str]:
+        parts: list[str] = []
         if current_summary:
             parts.extend(["Current session summary:\n", _truncate(current_summary, _MAX_PRIOR_SUMMARY_CHARS), "\n\n"])
         parts.append("Full session transcript:\n")
@@ -321,4 +331,4 @@ class Summarizer:
         # summarization mode rather than echoing a giant prompt.
         parts.append(_turns_block(exported_session.turns, budget=_MAX_TURNS_CHARS * 3))
         parts.extend(["\n\n", _GENERATION_REMINDER, "\n\nComprehensive session summary:"])
-        return "".join(parts)
+        return PRE_COMPACTION_SYSTEM, "".join(parts)
