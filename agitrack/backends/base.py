@@ -62,4 +62,10 @@ class AgentResult:
 class AgentBackend(Protocol):
     name: str
 
-    def run(self, prompt: str, *, model: str | None, session_id: str | None) -> AgentResult: ...
+    def run(self, prompt: str, *, model: str | None, session_id: str | None, bare: bool = False) -> AgentResult: ...
+
+    # ``bare``: run as a plain text completion — no tools, no agent system prompt, no
+    # project/user memory or MCP servers — so the only input is the caller's prompt. Used
+    # by the summarizer, which must read just its instruction plus the interaction trace
+    # and nothing else; the default agent context would otherwise add thousands of input
+    # tokens of system prompt and tool schemas the summary never needs.

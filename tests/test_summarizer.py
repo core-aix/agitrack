@@ -25,6 +25,10 @@ def test_summarize_commit() -> None:
     call_args = backend.run.call_args
     assert call_args[1]["model"] == "test-model"
     assert call_args[1]["session_id"] is None
+    # The summarizer reads only its instruction + trace: the backend is run "bare" (no
+    # agent system prompt, tools, or project memory), so it isn't charged thousands of
+    # input tokens the summary never uses.
+    assert call_args[1]["bare"] is True
 
 
 def test_summarizer_input_includes_cache_creation_tokens() -> None:
@@ -319,7 +323,7 @@ def test_summarizer_raises_when_backend_echoes_the_prompt() -> None:
     # its prompt-led message rather than a prompt-dump.
     captured: dict[str, str] = {}
 
-    def echo_run(prompt, *, model=None, session_id=None):
+    def echo_run(prompt, *, model=None, session_id=None, bare=False):
         captured["prompt"] = prompt
         return _result(prompt)  # echo the prompt back as the response
 
@@ -350,7 +354,7 @@ def test_session_update_rejects_echoed_prompt() -> None:
 
     # The session-update path goes through the same _run guard; echoing the
     # received prompt must be rejected too.
-    def echo_run(prompt, *, model=None, session_id=None):
+    def echo_run(prompt, *, model=None, session_id=None, bare=False):
         return _result(prompt)
 
     backend = Mock()

@@ -182,6 +182,8 @@ Because the conversation is recorded in commit messages, aGiTrack shows a privac
 When summarization is enabled (the default), aGiTrack runs a second LLM stream alongside the coding session to preserve design context that would otherwise be lost to session compaction or terse commit subjects:
 
 - **Commit summaries** — each agent commit gets an LLM-written summary of what changed and why. The summary leads the commit message: its first line becomes the subject and the rest follows as the first paragraph of the body (the prompts that used to head the message move to `# Prompts`); it is also stored as a git note in the `agitrack/commit-summary` namespace.
+
+The summarizer reads **only** its instruction prompt plus the interaction trace — the same `## User` / `## Agent` text the commit carries — and nothing else. To enforce that, aGiTrack runs the summarizer backend as a plain text completion with its agent context stripped (no tools, no project/user memory or MCP servers, and the model's large default system prompt replaced with a one-line directive). Without this, a single Claude summary call loaded ~18,000 input tokens of system prompt and tool schemas it never used; stripped, the same call processes only the few hundred tokens of the instruction and trace, so `summary_tokens_*` reflects the real cost of the summary itself.
 - **Session summaries** — a rolling narrative of the session (goals, architectural decisions, design evolution) is updated on every commit and attached as a git note in the `agitrack/session-summary` namespace.
 - **Pre-compaction capture** — when you run `/compact` in the backend, aGiTrack first exports the full session transcript and folds it into the session summary, so compaction does not lose the conversation's context.
 
