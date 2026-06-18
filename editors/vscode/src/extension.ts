@@ -80,6 +80,26 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
   );
 
+  // Splitting an aGiTrack terminal (the editor's split button, or "Split Terminal")
+  // opens a bare shell with no aGiTrack in it — confusing. Close such a split and say
+  // why. Detection is precise: VSCode reports the terminal a split was created from in
+  // creationOptions.location.parentTerminal, so this only ever fires for terminals split
+  // off one WE created — never the user's own new terminals.
+  context.subscriptions.push(
+    vscode.window.onDidOpenTerminal((opened) => {
+      const parent = splitParentOf(opened);
+      if (!parent || !isAgitrackTerminal(parent)) {
+        return;
+      }
+      opened.dispose();
+      void vscode.window.showInformationMessage(
+        "aGiTrack runs one session per repository, so splitting its terminal just opens an " +
+          "empty shell — that split was closed. Use the existing aGiTrack terminal (or the " +
+          "aGiTrack button to start a session in another folder).",
+      );
+    }),
+  );
+
   if (vscode.workspace.getConfiguration("agitrack").get<boolean>("openOnStartup")) {
     void startSession();
   }
@@ -178,6 +198,29 @@ function findAgitrackTerminal(folder: vscode.WorkspaceFolder): vscode.Terminal |
     vscode.window.terminals.find((t) => t.name === named) ??
     vscode.window.terminals.find((t) => t.name === TERMINAL_NAME)
   );
+}
+
+/** The terminal a newly-opened terminal was split from, if any. VSCode records it in
+ * creationOptions.location as a TerminalSplitLocationOptions ({ parentTerminal }); for a
+ * non-split terminal the location is a plain enum/editor-location with no parent. */
+function splitParentOf(terminal: vscode.Terminal): vscode.Terminal | undefined {
+  const location = (terminal.creationOptions as vscode.TerminalOptions | undefined)?.location;
+  if (location && typeof location === "object" && "parentTerminal" in location) {
+    return location.parentTerminal;
+  }
+  return undefined;
+}
+
+/** True if `terminal` is an aGiTrack session or dashboard terminal we created. */
+function isAgitrackTerminal(terminal: vscode.Terminal): boolean {
+  for (const map of [terminals, dashboards]) {
+    for (const tracked of map.values()) {
+      if (tracked === terminal) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 /** True while `pid` exists; signal 0 only probes (it sends nothing) and throws once
