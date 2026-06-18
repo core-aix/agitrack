@@ -140,6 +140,11 @@
           "type": "boolean",
           "default": true,
           "description": "Prompt before closing the aGiTrack terminal so aGiTrack can exit gracefully (finalizing the latest turn). If VSCode's `terminal.integrated.confirmOnKill` is set to `never`, aGiTrack restores it to `always` so the close is confirmed."
+        },
+        "agitrack.suppressTerminalEnvActivation": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Disable VSCode's automatic Python environment (venv/conda) activation in the aGiTrack terminal. The Python extension activates the env by sending `Ctrl-C` then `source .../activate`, which **interrupts and kills aGiTrack** at launch. The agent runs with its own interpreter and never needs the shell's venv, so this is safe. Implemented by turning off `python.terminal.activateEnvironment` only for the brief launch window, then restoring it. Turn off if you rely on venv activation in the aGiTrack terminal."
         }
       }
     }

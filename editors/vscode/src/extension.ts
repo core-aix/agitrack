@@ -250,6 +250,9 @@ async function startSession(targetUri?: vscode.Uri): Promise<void> {
 
   await ensureCloseConfirmation();
   void maybeShowGracefulExitTip();
+  // Disable VSCode's Python venv activation BEFORE creating the terminal, so the Python
+  // extension doesn't send a process-killing Ctrl-C + `source activate` into aGiTrack.
+  await suppressPythonEnvActivationForLaunch();
 
   // Run aGiTrack inside the shell, but only AFTER the shell has finished its own startup
   // — including any commands VSCode injects automatically (the Python extension's venv
@@ -290,6 +293,51 @@ async function maybeShowGracefulExitTip(): Promise<void> {
     { modal: true },
     "Got it",
   );
+}
+
+// Track an in-flight env-activation suppression so overlapping launches don't clobber
+// the saved prior value or restore it early.
+let envSuppressionActive = false;
+let envSuppressionPriorGlobal: boolean | undefined;
+
+/** Stop VSCode's Python extension from activating a venv/conda env in the aGiTrack
+ * terminal. It does so by sending `Ctrl-C` then `source .../activate`, and that Ctrl-C
+ * kills aGiTrack at launch (the agent uses its own interpreter, so the shell venv is
+ * never needed). We turn `python.terminal.activateEnvironment` off for the brief launch
+ * window, then restore the prior value so other terminals are unaffected. Best-effort and
+ * gated on `agitrack.suppressTerminalEnvActivation`. */
+async function suppressPythonEnvActivationForLaunch(): Promise<void> {
+  if (!vscode.workspace.getConfiguration("agitrack").get<boolean>("suppressTerminalEnvActivation", true)) {
+    return;
+  }
+  if (!vscode.extensions.getExtension("ms-python.python")) {
+    return; // no Python extension installed — nothing activates the env
+  }
+  const py = vscode.workspace.getConfiguration("python.terminal");
+  if (py.get<boolean>("activateEnvironment", true) === false) {
+    return; // already disabled — nothing to do
+  }
+  if (envSuppressionActive) {
+    return; // a prior launch already disabled it; its pending restore will re-enable
+  }
+  envSuppressionActive = true;
+  envSuppressionPriorGlobal = py.inspect<boolean>("activateEnvironment")?.globalValue;
+  await py.update("activateEnvironment", false, vscode.ConfigurationTarget.Global);
+  // Restore once the Python extension's activation window for our terminal has passed,
+  // so terminals opened later still get the user's normal behaviour.
+  setTimeout(() => {
+    void vscode.workspace
+      .getConfiguration("python.terminal")
+      .update("activateEnvironment", envSuppressionPriorGlobal, vscode.ConfigurationTarget.Global)
+      .then(
+        () => {
+          envSuppressionActive = false;
+        },
+        () => {
+          envSuppressionActive = false;
+        },
+      );
+  }, 10_000);
 }
 
 /** Make sure closing the aGiTrack terminal is confirmed (so aGiTrack can exit
@@ -397,13 +445,11 @@ async function runWhenShellReady(terminal: vscode.Terminal, command: string): Pr
     async () => {
       const integration = await waitForShellIntegration(terminal, 6000);
       if (integration) {
-        // Shell integration reports "ready" at the first prompt — which can be BEFORE
-        // VSCode's Python extension injects `source .venv/bin/activate`. aGiTrack is a
-        // long-running foreground process, so launching at "ready" would push that
-        // activation behind aGiTrack (it would only run after aGiTrack exits). Wait for
-        // VSCode's own startup command(s) to run and finish first, so the venv is active
-        // BEFORE aGiTrack starts.
-        await waitForShellSetupToSettle(terminal, 2500);
+        // Let any startup command VSCode runs (conda/direnv, etc.) finish before aGiTrack,
+        // so it isn't queued behind this long-running foreground process. Python venv
+        // activation is handled separately (suppressed before launch), so this is light
+        // insurance with a short grace window.
+        await waitForShellSetupToSettle(terminal, 1200);
         // Keep the notification up until aGiTrack actually starts: executeCommand returns
         // immediately, so we wait for the command's first output chunk (aGiTrack drawing
         // its first frame / prompt). A timeout caps the wait so it can never hang forever
