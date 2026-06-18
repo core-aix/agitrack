@@ -216,6 +216,10 @@ class ProxyInput:
         # Buffer for accumulating partial matches of multi-byte menu key sequences.
         # Only used when menu_key is longer than 1 byte.
         self.menu_key_buffer = bytearray()
+        # Context-dependent commands shown ABOVE the fixed COMMANDS (the runner refreshes
+        # this when the palette opens). Used to surface "merge" at the top when there are
+        # unmerged worktrees the user should rescue.
+        self.extra_commands: list[str] = []
 
     def feed(self, data: bytes) -> tuple[list[bytes], bytes, str | None, bool]:
         forwarded: list[bytes] = []
@@ -314,10 +318,11 @@ class ProxyInput:
         return self.buffer.decode(errors="ignore")
 
     def matches(self) -> list[str]:
+        commands = self.extra_commands + self.COMMANDS
         text = self.text()
         if not text:
-            return self.COMMANDS
-        return [command for command in self.COMMANDS if command.startswith(text)] or self.COMMANDS
+            return commands
+        return [command for command in commands if command.startswith(text)] or commands
 
     def selected(self) -> str | None:
         matches = self.matches()
@@ -2881,6 +2886,131 @@ class ProxyRunner:
         self._set_message(f"'{self.name}' has nothing to integrate.")
         self._render()
 
+    # ------------------------------------------------------------------
+    # Ctrl-G "merge": rescue un-integrated worktrees into a chosen branch
+    # ------------------------------------------------------------------
+
+    def _unmerged_worktrees(self) -> list[tuple[str, str]]:
+        """Worktrees carrying un-integrated work, as ``(label, name)`` — ``name`` is
+        empty for the active session, else the dormant worktree's name.
+
+        "Un-integrated work" is either committed-but-unmerged commits OR uncommitted
+        committable changes (tracked edits / untracked files that are neither
+        git-ignored nor intentionally unstaged). The active session is only offered
+        when idle — mid-turn uncommitted changes are expected and auto-committed, so
+        surfacing "merge" then would be noise."""
+        items: list[tuple[str, str]] = []
+        try:
+            if (
+                self.worktree is not None
+                and not self.merge_ctx
+                and not self.agent_in_flight
+                and (self._active_has_pending() or self._active_has_committable_changes())
+            ):
+                items.append((f"{self.name} (current session)", ""))
+        except Exception:
+            pass
+        live = {self._session_name(index) for index in range(len(self.sessions))}
+        for info in self._dormant_worktrees(live):
+            try:
+                if self._dormant_has_pending(info):  # already counts uncommitted changes
+                    items.append((f"{info.name} (dormant)", info.name))
+            except Exception:
+                continue
+        return items
+
+    def _active_has_committable_changes(self) -> bool:
+        """True if the active worktree has uncommitted changes worth committing: tracked
+        edits, or untracked files that aren't git-ignored and weren't intentionally
+        unstaged. Excludes ignored/declined files so we don't offer to merge noise."""
+        try:
+            if self.repo.has_tracked_changes():
+                return True
+            declined = set(self.state.declined_untracked()) if self.state is not None else set()
+            return any(path not in declined for path in self.repo.untracked_files())
+        except Exception:
+            return False
+
+    def _has_unmerged_work(self) -> bool:
+        """True when some worktree still has work that hasn't been integrated — gates
+        the top-level Ctrl-G "merge" command."""
+        return bool(self._unmerged_worktrees())
+
+    def _handle_merge_command(self) -> None:
+        items = self._unmerged_worktrees()
+        if not items:
+            self._set_message("No unmerged worktrees — everything is integrated.")
+            self._render()
+            return
+        if len(items) == 1:
+            name = items[0][1]
+        else:
+            choice = self._select_popup("Merge which worktree's changes?", [label for label, _ in items])
+            if choice is None:
+                self._set_message("Cancelled.")
+                self._render()
+                return
+            name = next(n for label, n in items if label == choice)
+        target = self._choose_merge_target(name)
+        if target is None:
+            self._set_message("Cancelled.")
+            self._render()
+            return
+        if name == "":
+            self._merge_active_into(target)
+        else:
+            # Load the dormant worktree as the active session, then merge it — this
+            # reuses the integration + conflict-resolution path (the agent can resolve
+            # conflicts in the now-live session, just like the resolve flow).
+            self._new_session(name)
+            self._merge_active_into(target)
+
+    def _choose_merge_target(self, name: str) -> str | None:
+        """Offer the three merge destinations the user asked for: the branch checked out
+        in the working directory, the session's own merge branch, or any other branch.
+        Returns the chosen branch name, or None on cancel."""
+        session_branch = self._base_branch if name == "" else (self._dormant_merge_branch(name) or self._base_branch)
+        current = self._repo_dir_branch or self.base_repo.current_branch()
+        _CUSTOM = "\x00custom"
+        options: list[tuple[str, str]] = [(f"Current branch ({current})", current)]
+        if session_branch and session_branch != current:
+            options.append((f"Session's branch ({session_branch})", session_branch))
+        options.append(("A different branch…", _CUSTOM))
+        choice = self._select_popup("Merge into which branch?", [label for label, _ in options])
+        if choice is None:
+            return None
+        target = next(branch for label, branch in options if label == choice)
+        if target == _CUSTOM:
+            return self._prompt_merge_branch("Merge into which branch?", session_branch)
+        return target
+
+    def _merge_active_into(self, target: str) -> None:
+        """Integrate the active session's un-integrated work into ``target`` (re-pointing
+        the session's merge branch to it). Uncommitted committable changes are committed
+        first (so they aren't left behind), then integrated. Reuses
+        _integrate_active_session so a conflict surfaces the same resolve options."""
+        if self.worktree is None or self._base_branch is None:
+            self._set_message("This session has no worktree to merge.")
+            self._render()
+            return
+        if self._active_has_committable_changes():
+            # Commit the worktree's uncommitted work before merging so nothing is stranded.
+            self._set_message(f"Committing '{self.name}' changes before merging…", seconds=30)
+            self._render()
+            self._commit_latest_turn_sync()
+        self._base_branch = target  # syncs the IntegrationService to the chosen destination
+        self._integrate_active_session()
+
+    def _dormant_merge_branch(self, name: str) -> str | None:
+        """The merge branch a dormant worktree recorded for itself, if any."""
+        try:
+            info = next((i for i in self._worktrees().list() if i.name == name), None)
+            if info is None:
+                return None
+            return getattr(AgitrackState(info.path), "merge_branch", None)
+        except Exception:
+            return None
+
     def _resolve_dormant_worktree(self, name: str) -> None:
         choice = self._select_popup(
             f"Session '{name}' has unmerged changes",
@@ -5081,6 +5211,11 @@ class ProxyRunner:
         was_capturing = self.input.capturing
         forwarded, local_echo, command, should_exit = self.input.feed(data)
         self._debug(f"feed result: forwarded={forwarded!r} command={command!r} capturing={self.input.capturing}")
+        if self.input.capturing and not was_capturing:
+            # The Ctrl-G palette just opened: surface a top-level "merge" command when
+            # there is unmerged worktree work, so the user is reminded to rescue it
+            # before it gets lost. Recomputed each open so it reflects current state.
+            self.input.extra_commands = ["merge"] if self._has_unmerged_work() else []
         if should_exit:
             # One shared flow (also reachable from inside popups): a
             # second Ctrl-C during the confirmation popup exits
@@ -5740,6 +5875,9 @@ class ProxyRunner:
             return
         elif name == "dashboard":
             self._handle_dashboard_command()
+            return
+        elif name == "merge":
+            self._handle_merge_command()
             return
         elif name == "":
             self._set_message("Select an aGiTrack command.")
