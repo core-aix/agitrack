@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 
 from agitrack.commits import AgitrackActions
@@ -32,9 +33,15 @@ class AgitrackShell:
         backend_args: list[str] | None = None,
         prompts: list[str] | None = None,
         commit_guidance: bool = True,
+        json_events: bool = False,
     ) -> None:
         self.repo = repo
         self.backend_args = list(backend_args or [])  # forwarded to the backend CLI (#32)
+        # When True, emit one machine-readable JSON line per turn event (the agent's
+        # response, the commit it produced, errors) so a programmatic driver — the
+        # VSCode chat extension (see editors/vscode) — can render the conversation.
+        # Off by default; the plain human-readable output is unchanged.
+        self._json_events = json_events
         # Tell the coding agent that aGiTrack auto-commits so it doesn't self-commit
         # (--no-commit-guidance turns it off). Appended where the backend supports it.
         self._commit_guidance = commit_guidance
@@ -190,6 +197,13 @@ class AgitrackShell:
         state_enabled = getattr(self.state, "summarization_enabled", None)
         return True if state_enabled is None else bool(state_enabled)
 
+    def _emit(self, event: dict) -> None:
+        """Emit one machine-readable JSON event line for programmatic drivers (the
+        VSCode chat extension). A no-op unless ``--json-events`` is set, so the plain
+        shell output is untouched."""
+        if self._json_events:
+            print(json.dumps(event), flush=True)
+
     def _handle_agent_prompt(self, prompt: str) -> None:
         if prompt.startswith("/compact"):
             self._handle_pre_compaction()
@@ -213,12 +227,27 @@ class AgitrackShell:
         if result.exit_code != 0:
             self.state.append_trace("agent", result.final_response or f"Backend exited with code {result.exit_code}")
             self.state.add_token_usage(result.tokens)
+            self._emit(
+                {
+                    "type": "error",
+                    "message": result.final_response or f"Backend exited with code {result.exit_code}",
+                    "exit_code": result.exit_code,
+                }
+            )
             if self.verbose:
                 print(f"Backend exited with code {result.exit_code}; no automatic agent commit was made.")
             return
 
         self.state.append_trace("agent", result.final_response)
         self.state.add_token_usage(result.tokens)
+        self._emit(
+            {
+                "type": "response",
+                "text": result.final_response,
+                "session": self.state.backend_session_id,
+                "model": self.state.model,
+            }
+        )
         self.repo.add_tracked()
         self.actions.review_untracked(include_declined=False)
         if self.repo.has_staged_changes():
@@ -286,7 +315,9 @@ class AgitrackShell:
                         print(f"Session summary update failed: {error}")
 
             print("Created <aGiTrack> commit.")
+            self._emit({"type": "commit", "sha": commit_sha, "session": self.state.session_id})
         else:
+            self._emit({"type": "no_changes"})
             if self.verbose:
                 print("No code changes detected; interaction trace remains pending.")
 

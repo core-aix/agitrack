@@ -219,6 +219,18 @@ def test_default_uses_config_commit_guidance(monkeypatch):
     assert captured["commit_guidance"] is False
 
 
+def test_json_events_flag_passed_to_shell(monkeypatch):
+    captured = _stub_launch(monkeypatch)
+    cli.main(["--mode", "json", "--json-events", "--prompt", "hi"])
+    assert captured["json_events"] is True
+
+
+def test_json_events_off_by_default(monkeypatch):
+    captured = _stub_launch(monkeypatch)
+    cli.main(["--mode", "json", "--prompt", "hi"])
+    assert captured["json_events"] is False
+
+
 def test_full_agent_messages_off_by_default(monkeypatch):
     captured = _stub_launch(monkeypatch)
     cli.main([])

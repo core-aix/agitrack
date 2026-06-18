@@ -80,6 +80,13 @@ def main(argv: list[str] | None = None) -> int:
         "agent does not create its own git commits unless you explicitly ask",
     )
     parser.add_argument(
+        "--json-events",
+        action="store_true",
+        help="in --mode json, emit one machine-readable JSON line per turn event "
+        "(the agent's response, the commit produced, errors) — used by the VSCode "
+        "chat extension and other programmatic drivers",
+    )
+    parser.add_argument(
         "--full-agent-messages",
         action="store_true",
         help="record every user-facing message the agent sends during a turn in the "
@@ -220,6 +227,7 @@ def main(argv: list[str] | None = None) -> int:
                 backend_args=backend_args,
                 prompts=args.prompts,
                 commit_guidance=commit_guidance,
+                json_events=args.json_events,
             ).run()
         else:
             return ProxyRunner(

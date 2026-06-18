@@ -1,0 +1,59 @@
+{
+  "name": "agitrack-vscode",
+  "displayName": "aGiTrack",
+  "description": "Chat with a coding agent (Claude Code / OpenCode) through aGiTrack, which auto-commits every turn with full provenance.",
+  "version": "0.0.1",
+  "publisher": "core-aix",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/core-aix/agitrack"
+  },
+  "engines": {
+    "vscode": "^1.93.0"
+  },
+  "categories": [
+    "AI",
+    "Chat",
+    "SCM Providers"
+  ],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "chatParticipants": [
+      {
+        "id": "agitrack.chat",
+        "name": "agitrack",
+        "fullName": "aGiTrack",
+        "description": "Run a coding agent through aGiTrack — every turn is auto-committed.",
+        "isSticky": true
+      }
+    ],
+    "configuration": {
+      "title": "aGiTrack",
+      "properties": {
+        "agitrack.path": {
+          "type": "string",
+          "default": "agitrack",
+          "description": "Path to the agitrack executable (on PATH by default)."
+        },
+        "agitrack.backend": {
+          "type": "string",
+          "default": "",
+          "enum": ["", "claude", "opencode"],
+          "description": "Backend to drive. Empty uses aGiTrack's configured default."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run compile"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.93.0",
+    "typescript": "^5.4.0"
+  }
+}

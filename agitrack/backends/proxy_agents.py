@@ -234,6 +234,12 @@ class ClaudeProxyAgent:
     def recorded_working_dir(self, session_id: str, *, since: float | None = None) -> str | None:
         return claude_session.session_cwd(session_id, since=since)
 
+    def retarget_working_dir(self, repo: Path, session_id: str, cwd: str) -> bool:
+        # Align a resumed session's recorded cwd with the launch dir so Claude's
+        # `--resume` doesn't restore an old worktree directory (no-op when already
+        # aligned). OpenCode doesn't record a cwd in its transcript, so it omits this.
+        return claude_session.retarget_session_cwd(repo, session_id, cwd)
+
     def latest_session_id(self, repo: Path) -> str | None:
         return claude_session.latest_session_id(repo)
 

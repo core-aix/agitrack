@@ -536,6 +536,100 @@ def test_full_agent_messages_flag_records_all_messages(tmp_path):
     assert runner.repo.message.count("## Agent") == 2
 
 
+def _copy_runner(tmp_path, status):
+    import types
+
+    base = tmp_path / "base"
+    wt = tmp_path / "wt"
+    base.mkdir()
+    wt.mkdir()
+    runner = make_runner()
+    runner.base_repo = types.SimpleNamespace(repo=base)
+    runner.repo = types.SimpleNamespace(repo=wt, status_short=lambda: status)
+    runner.worktree = types.SimpleNamespace(name="s", path=wt)
+    msgs: list[str] = []
+    runner._set_message = lambda m, **k: msgs.append(m)
+    runner._render = lambda *a, **k: None
+    return runner, base, wt, msgs
+
+
+def test_offer_copy_unstaged_copies_on_consent(tmp_path):
+    runner, base, wt, _ = _copy_runner(tmp_path, "?? new.txt\n")
+    (wt / "new.txt").write_text("hello\n")
+    runner._select_popup = lambda *a, **k: "Yes, copy to the base repo"
+
+    runner._offer_copy_unstaged_to_base()
+
+    assert (base / "new.txt").read_text() == "hello\n"
+
+
+def test_offer_copy_unstaged_declined_leaves_files_and_notifies(tmp_path):
+    runner, base, wt, msgs = _copy_runner(tmp_path, "?? keep.txt\n")
+    (wt / "keep.txt").write_text("x\n")
+    runner._select_popup = lambda *a, **k: "No, leave them in the worktree"
+
+    runner._offer_copy_unstaged_to_base()
+
+    assert not (base / "keep.txt").exists()
+    assert any("remain in this session's worktree" in m and str(wt) in m for m in msgs)
+
+    # An unchanged file is not prompted again.
+    prompted: list = []
+    runner._select_popup = lambda *a, **k: prompted.append(a) or None
+    runner._offer_copy_unstaged_to_base()
+    assert prompted == []
+
+
+def test_offer_copy_unstaged_overwrite_declined_keeps_base(tmp_path):
+    runner, base, wt, msgs = _copy_runner(tmp_path, "?? dup.txt\n")
+    (wt / "dup.txt").write_text("new\n")
+    (base / "dup.txt").write_text("old\n")
+    answers = iter(["Yes, copy to the base repo", "No, keep the base version"])
+    runner._select_popup = lambda *a, **k: next(answers)
+
+    runner._offer_copy_unstaged_to_base()
+
+    assert (base / "dup.txt").read_text() == "old\n"  # not overwritten
+    assert any("remain in this session's worktree" in m for m in msgs)
+
+
+def test_offer_copy_unstaged_overwrite_confirmed(tmp_path):
+    runner, base, wt, _ = _copy_runner(tmp_path, "?? dup.txt\n")
+    (wt / "dup.txt").write_text("new\n")
+    (base / "dup.txt").write_text("old\n")
+    answers = iter(["Yes, copy to the base repo", "Yes, overwrite"])
+    runner._select_popup = lambda *a, **k: next(answers)
+
+    runner._offer_copy_unstaged_to_base()
+
+    assert (base / "dup.txt").read_text() == "new\n"  # overwritten
+
+
+def test_offer_copy_unstaged_noop_without_worktree(tmp_path):
+    runner, base, wt, _ = _copy_runner(tmp_path, "?? x.txt\n")
+    runner.worktree = None  # no-worktree mode: nothing to copy
+    prompted: list = []
+    runner._select_popup = lambda *a, **k: prompted.append(a) or None
+    runner._offer_copy_unstaged_to_base()
+    assert prompted == []
+
+
+def test_stage_backend_resume_retargets_cwd_to_launch_dir(tmp_path):
+    # After staging a resume, the transcript's cwd is realigned to the launch dir
+    # (self.repo.repo), so Claude --resume can't restore an old worktree directory.
+    import types
+
+    runner = make_runner()
+    runner.repo = types.SimpleNamespace(repo=tmp_path)
+    calls = {}
+    runner.backend = types.SimpleNamespace(
+        ensure_resumable=lambda repo, sid: True,
+        retarget_working_dir=lambda repo, sid, cwd: calls.update(repo=repo, sid=sid, cwd=cwd) or True,
+    )
+    runner._stage_backend_resume("sid-1")
+    assert calls == {"repo": tmp_path, "sid": "sid-1", "cwd": str(tmp_path)}
+
+
 class _CancelRepo:
     # Minimal repo for _handle_cancelled_turn: reports leftover changes and records
     # whether they were discarded.
@@ -2976,6 +3070,27 @@ def test_next_session_name_is_a_word_avoiding_taken_names():
     name = runner._next_session_name()
     assert name in SESSION_WORDS
     assert name not in {"maple", "willow"} | runner._taken_session_names()
+
+
+def test_new_session_prompts_for_name_not_inheriting_prior(tmp_path):
+    # --new-session (resume_id is None) starts a fresh conversation, so it must
+    # PROMPT for a new name rather than silently inheriting the prior session's
+    # worktree name.
+    runner = make_runner(state=AgitrackState(tmp_path), verbose=False)
+    runner._prompt_startup_name = lambda continuing: "newname"
+    name = runner._resolve_startup_session_name(runner.state, None, "willow")
+    assert name == "newname"
+
+
+def test_resume_inherits_prior_session_name_without_prompting(tmp_path):
+    # Resuming a conversation (resume_id set) keeps its prior worktree name and
+    # does NOT prompt.
+    runner = make_runner(state=AgitrackState(tmp_path), verbose=False)
+    prompted = []
+    runner._prompt_startup_name = lambda continuing: prompted.append(True) or "unused"
+    name = runner._resolve_startup_session_name(runner.state, "ses-1", "willow")
+    assert name == "willow"
+    assert prompted == []
 
 
 def test_startup_default_name_is_a_word_not_session_1():
@@ -6143,6 +6258,69 @@ def test_rename_forks_shared_lineage(tmp_path):
     # A purely local session (no origin) is a no-op (and never errors).
     runner._fork_lineage_on_rename("sid-local")
     assert AgitrackState(tmp_path).shared_origin("sid-local") is None
+
+
+def _make_rename_runner(tmp_path, *, origin):
+    import subprocess
+    import types
+
+    from agitrack.config import AgitrackState
+
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.email", "t@t"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.name", "t"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-q", "--allow-empty", "-m", "x"], check=True)
+
+    runner = make_runner(name="oldname")
+    runner.global_config = types.SimpleNamespace(default_backend="claude")
+    runner.sessions = [runner.active]
+    runner._use_worktrees = True
+    runner._session_name = lambda i: "oldname"
+    runner._session_name_taken = lambda n: False
+    runner._switch_active = lambda i: None
+    runner.worktree = types.SimpleNamespace(name="oldname", path=tmp_path)
+    st = AgitrackState(tmp_path)
+    st.backend_session_id = "sid-1"
+    runner.state = st
+    new_info = types.SimpleNamespace(name="newname", path=tmp_path)
+    runner._worktrees = lambda: types.SimpleNamespace(move=lambda old, new: new_info)
+    for method in (
+        "_stop_file_watcher",
+        "_teardown_child",
+        "_init_screen",
+        "_spawn",
+        "_resize_child",
+        "_enable_host_mouse",
+        "_start_file_watcher",
+        "_reset_agent_tracking",
+        "_sanitize_state_trace",
+        "_initialize_session_baseline",
+        "_render",
+        "_stage_backend_resume",
+        "_persist_session_name",
+        "_fork_lineage_on_rename",
+    ):
+        setattr(runner, method, lambda *a, **k: None)
+    runner._turn_from_branch = lambda b: 0
+    runner._user_state = lambda: types.SimpleNamespace(shared_origin=lambda sid: origin if sid == "sid-1" else None)
+    msgs: list[str] = []
+    runner._set_message = lambda m, **k: msgs.append(m)
+    return runner, msgs
+
+
+def test_rename_shared_session_warns_it_becomes_a_separate_copy(tmp_path):
+    # Renaming a session that tracked a shared lineage warns that a later share now
+    # creates a NEW shared session rather than updating the original.
+    runner, msgs = _make_rename_runner(tmp_path, origin={"owner": "alice", "name": "x", "contributors": ["alice"]})
+    runner._rename_session(0, "newname")
+    assert any("separate copy" in m and "NEW shared session" in m for m in msgs)
+
+
+def test_rename_unshared_session_uses_plain_message(tmp_path):
+    # A session with no shared lineage gets the plain rename confirmation.
+    runner, msgs = _make_rename_runner(tmp_path, origin=None)
+    runner._rename_session(0, "newname")
+    assert msgs and msgs[-1] == "Renamed session to 'newname'."
 
 
 def test_rename_session_rejects_taken_name_without_moving():
