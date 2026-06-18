@@ -9,8 +9,12 @@ matches the `agitrack` release it launches.
 Launch the full aGiTrack terminal application from VSCode — no terminal typing.
 
 - A brand-icon **aGiTrack button** at the top-right of the editor toolbar that starts
-  a session in one click. Restart and Open Dashboard are Command Palette commands;
-  Start is also on the Explorer folder context menu.
+  a session in one click (**aGiTrack: Start aGiTrack**). Restart and Open Dashboard are
+  Command Palette commands; Start is also on the Explorer folder context menu.
+- **Splitting** an aGiTrack terminal (the editor split button / "Split Terminal") used to
+  open a confusing empty shell with no aGiTrack in it. Such a split is now detected (via
+  the terminal it was split from) and closed automatically, with a one-line explanation —
+  the user's own terminals are never touched.
 - aGiTrack starts only **after** the terminal's automatic startup has run — VSCode's
   venv/conda activation, shell integration, and any other commands it injects — by
   sequencing the launch through shell integration. This fixes those commands being typed
@@ -41,7 +45,7 @@ Launch the full aGiTrack terminal application from VSCode — no terminal typing
   your local machine; `$BROWSER` is honored when set.
 - The Ctrl-G dashboard labels the session's fresh, unpushed commits with the current
   user's GitHub ID (which `gh` can't resolve until they're on the remote).
-- **Start Session** opens aGiTrack in a VSCode terminal for the workspace — the full
+- **Start aGiTrack** opens aGiTrack in a VSCode terminal for the workspace — the full
   experience: the agent's native interface, the `Ctrl-G` command menu, sessions,
   sharing, worktrees, and per-turn auto-commits.
 - **Open Dashboard** launches aGiTrack's metrics dashboard (`agitrack -d`) in its own
@@ -58,7 +62,7 @@ Launch the full aGiTrack terminal application from VSCode — no terminal typing
   backend no longer errors trying to auto-install its VSCode companion extension.
 - The editor-toolbar button is the only launch button (the status-bar button was removed).
 - Re-launching focuses the existing session (aGiTrack allows one per repository);
-  **aGiTrack: Restart Session** stops and restarts it.
+  **aGiTrack: Restart aGiTrack** stops and restarts it.
 - aGiTrack's own self-update works normally in the integrated terminal; if the CLI
   updates past the installed extension, the extension prompts you to update it to
   the matching version.

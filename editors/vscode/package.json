@@ -45,7 +45,7 @@
     "commands": [
       {
         "command": "agitrack.start",
-        "title": "Start Session",
+        "title": "Start aGiTrack",
         "category": "aGiTrack",
         "icon": {
           "light": "media/icon.svg",
@@ -54,12 +54,12 @@
       },
       {
         "command": "agitrack.startHere",
-        "title": "Start Session Here",
+        "title": "Start aGiTrack Here",
         "category": "aGiTrack"
       },
       {
         "command": "agitrack.restart",
-        "title": "Restart Session",
+        "title": "Restart aGiTrack",
         "category": "aGiTrack"
       },
       {
