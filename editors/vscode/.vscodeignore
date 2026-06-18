@@ -3,4 +3,6 @@ src/**
 node_modules/**
 tsconfig.json
 .gitignore
+package-lock.json
 **/*.map
+**/*.ts

@@ -1,14 +1,27 @@
 {
   "name": "agitrack-vscode",
   "displayName": "aGiTrack",
-  "description": "Chat with a coding agent (Claude Code / OpenCode) through aGiTrack, which auto-commits every turn with full provenance.",
-  "version": "0.0.1",
+  "description": "Run a coding agent (Claude Code / OpenCode) through aGiTrack inside VSCode — chat, menus, and confirmations with no terminal, and every turn auto-committed with full provenance.",
+  "version": "0.1.0",
   "publisher": "core-aix",
-  "license": "MIT",
+  "license": "Apache-2.0",
+  "icon": "media/icon.png",
+  "homepage": "https://github.com/core-aix/agitrack",
   "repository": {
     "type": "git",
     "url": "https://github.com/core-aix/agitrack"
   },
+  "bugs": {
+    "url": "https://github.com/core-aix/agitrack/issues"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "claude",
+    "opencode",
+    "git",
+    "commit"
+  ],
   "engines": {
     "vscode": "^1.93.0"
   },
@@ -17,6 +30,10 @@
     "Chat",
     "SCM Providers"
   ],
+  "galleryBanner": {
+    "color": "#1e1e1e",
+    "theme": "dark"
+  },
   "activationEvents": [],
   "main": "./out/extension.js",
   "contributes": {
@@ -27,6 +44,48 @@
         "fullName": "aGiTrack",
         "description": "Run a coding agent through aGiTrack — every turn is auto-committed.",
         "isSticky": true
+      }
+    ],
+    "commands": [
+      {
+        "command": "agitrack.status",
+        "title": "Show Git Status",
+        "category": "aGiTrack"
+      },
+      {
+        "command": "agitrack.stage",
+        "title": "Review & Stage Untracked Files",
+        "category": "aGiTrack"
+      },
+      {
+        "command": "agitrack.userCommit",
+        "title": "Create User Commit",
+        "category": "aGiTrack"
+      },
+      {
+        "command": "agitrack.unstaged",
+        "title": "Show Intentionally Unstaged Files",
+        "category": "aGiTrack"
+      },
+      {
+        "command": "agitrack.switchBackend",
+        "title": "Switch Agent Backend",
+        "category": "aGiTrack"
+      },
+      {
+        "command": "agitrack.newSession",
+        "title": "Start New Session",
+        "category": "aGiTrack"
+      },
+      {
+        "command": "agitrack.summarizer",
+        "title": "Manage Summarizer",
+        "category": "aGiTrack"
+      },
+      {
+        "command": "agitrack.restart",
+        "title": "Restart aGiTrack",
+        "category": "aGiTrack"
       }
     ],
     "configuration": {
@@ -41,6 +100,11 @@
           "type": "string",
           "default": "",
           "enum": ["", "claude", "opencode"],
+          "enumDescriptions": [
+            "Use aGiTrack's configured default backend",
+            "Claude Code",
+            "OpenCode"
+          ],
           "description": "Backend to drive. Empty uses aGiTrack's configured default."
         }
       }
@@ -49,11 +113,14 @@
   "scripts": {
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "vscode:prepublish": "npm run compile"
+    "vscode:prepublish": "npm run compile",
+    "package": "vsce package --no-dependencies",
+    "publish": "vsce publish --no-dependencies"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
     "@types/vscode": "^1.93.0",
+    "@vscode/vsce": "^3.0.0",
     "typescript": "^5.4.0"
   }
 }

@@ -231,6 +231,20 @@ def test_delay_merge_off_by_default(monkeypatch):
     assert captured["delay_merge"] is False
 
 
+def test_ui_bridge_flag_passed_to_shell_and_forces_json_mode(monkeypatch):
+    # --ui-bridge is a json-mode transport: it must reach the shell and select json
+    # mode even without an explicit --mode json (the VSCode extension relies on this).
+    captured = _stub_launch(monkeypatch)
+    cli.main(["--ui-bridge"])
+    assert captured["ui_bridge"] is True
+
+
+def test_ui_bridge_off_by_default(monkeypatch):
+    captured = _stub_launch(monkeypatch)
+    cli.main(["--mode", "json", "--prompt", "hi"])
+    assert captured["ui_bridge"] is False
+
+
 def test_json_events_flag_passed_to_shell(monkeypatch):
     captured = _stub_launch(monkeypatch)
     cli.main(["--mode", "json", "--json-events", "--prompt", "hi"])

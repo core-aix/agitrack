@@ -34,14 +34,24 @@ class AgitrackShell:
         prompts: list[str] | None = None,
         commit_guidance: bool = True,
         json_events: bool = False,
+        ui_bridge: bool = False,
     ) -> None:
         self.repo = repo
         self.backend_args = list(backend_args or [])  # forwarded to the backend CLI (#32)
+        # The VSCode extension runs aGiTrack as a long-lived child with no terminal and
+        # drives it over a bidirectional JSON-RPC bridge (see agitrack/shell/bridge.py):
+        # prompts/commands arrive on stdin, events go out on stdout, and interactive
+        # questions (menus, confirms, text) are asked of the editor instead of a TTY.
+        self._ui_bridge = ui_bridge
+        from agitrack.shell.bridge import BridgeServer, BridgeUI
+
+        self._bridge: BridgeServer | None = BridgeServer() if ui_bridge else None
+        self.ui: BridgeUI | None = BridgeUI(self._bridge) if self._bridge is not None else None
         # When True, emit one machine-readable JSON line per turn event (the agent's
         # response, the commit it produced, errors) so a programmatic driver — the
         # VSCode chat extension (see editors/vscode) — can render the conversation.
-        # Off by default; the plain human-readable output is unchanged.
-        self._json_events = json_events
+        # Bridge mode always emits them; otherwise it follows the --json-events flag.
+        self._json_events = json_events or ui_bridge
         # Tell the coding agent that aGiTrack auto-commits so it doesn't self-commit
         # (--no-commit-guidance turns it off). Appended where the backend supports it.
         self._commit_guidance = commit_guidance
@@ -49,7 +59,9 @@ class AgitrackShell:
         # question can be answered in a scripted or piped run, so everything
         # that would ask one falls back to a safe non-interactive default.
         self.prompts = list(prompts) if prompts is not None else None
-        self.interactive = self.prompts is None and sys.stdin.isatty()
+        # Bridge mode is interactive even though stdin isn't a TTY — questions are
+        # answered by the editor over the bridge rather than by a terminal user.
+        self.interactive = self._ui_bridge or (self.prompts is None and sys.stdin.isatty())
         self.global_config = GlobalConfig()
         self.state = AgitrackState(repo.repo, default_backend=self.global_config.default_backend)
         if backend and backend in BACKENDS and backend != self.state.backend:
@@ -64,7 +76,7 @@ class AgitrackShell:
             self.state.new_agitrack_session_id()
         self.verbose = verbose
         self.prompt = AgitrackPrompt(self._prompt_state)
-        self.actions = AgitrackActions(repo, self.state, verbose=verbose, interactive=self.interactive)
+        self.actions = AgitrackActions(repo, self.state, verbose=verbose, interactive=self.interactive, ui=self.ui)
         self.management_lock = RepoLock(repo.repo / ".agitrack" / "lock")
 
     def run(self) -> None:
@@ -72,11 +84,18 @@ class AgitrackShell:
             resolved = ensure_installed_backend(self.state.backend, self.global_config, interactive=self.interactive)
         except BackendUnavailable as error:
             print(error)
+            if self._bridge is not None:
+                self._bridge.emit({"type": "error", "message": str(error)})
+                self._bridge.emit({"type": "bye"})
             return
         if resolved != self.state.backend:
             self.state.backend = resolved
         if not self.management_lock.acquire():
-            print(already_running_message(self.management_lock.owner_pid()))
+            message = already_running_message(self.management_lock.owner_pid())
+            print(message)
+            if self._bridge is not None:
+                self._bridge.emit({"type": "error", "message": message})
+                self._bridge.emit({"type": "bye"})
             return
         self.state.save()
         if self.verbose:
@@ -85,6 +104,9 @@ class AgitrackShell:
             print(f"Backend: {self.state.backend}")
             print("Type :help for aGiTrack commands. Backend / commands are passed through.")
         try:
+            if self._bridge is not None:
+                self._run_bridge()
+                return
             if self.prompts is not None:
                 self._run_scripted(self.prompts)
                 return
@@ -118,6 +140,102 @@ class AgitrackShell:
                     return
             else:
                 self._handle_agent_prompt(text)
+
+    def _run_bridge(self) -> None:
+        """Long-lived JSON-RPC loop for the VSCode extension. Reads prompt/command
+        requests from stdin, runs each turn (interactive questions are asked of the
+        editor via ``self.ui``), and frames every turn with a ``turn-complete`` so
+        the editor knows when to re-enable input. Exits on an ``exit`` request or
+        when stdin closes."""
+        assert self._bridge is not None
+        bridge = self._bridge
+        bridge.start()
+        bridge.emit(
+            {
+                "type": "ready",
+                "session": self.state.session_id,
+                "backend": self.state.backend,
+                "repo": str(self.repo.repo),
+                "model": self.state.model,
+            }
+        )
+        while True:
+            request = bridge.next_request()
+            kind = request.get("type")
+            if kind == "exit":
+                break
+            try:
+                text = (request.get("text") or "").strip()
+                if not text:
+                    pass
+                elif kind == "command":
+                    if self._bridge_command(text):
+                        break
+                elif kind == "prompt":
+                    if text.startswith(AGITRACK_PREFIX):
+                        if self._bridge_command(text):
+                            break
+                    else:
+                        self._handle_agent_prompt(text)
+            except Exception as error:  # never let one turn kill the session
+                bridge.emit({"type": "error", "message": str(error)})
+            bridge.emit({"type": "turn-complete"})
+        bridge.emit({"type": "bye"})
+
+    def _bridge_command(self, text: str) -> bool:
+        """Handle a ':' command in bridge mode, emitting results as editor notices
+        instead of printing to a terminal. Returns True to end the session."""
+        assert self._bridge is not None and self.ui is not None
+        command, _, arg = text.partition(" ")
+        if command in {":exit", ":quit"}:
+            return True
+        if command == ":status":
+            self.ui.info(self.repo.status_short() or "Working tree clean")
+        elif command == ":user-commit":
+            self.actions.create_user_commit()
+        elif command == ":stage":
+            self.actions.review_untracked(include_declined=True)
+        elif command == ":unstaged":
+            declined = self.state.declined_untracked()
+            if declined:
+                self.ui.info("Intentionally unstaged files:\n" + "\n".join(f"  {p}" for p in declined))
+            else:
+                self.ui.info("No intentionally unstaged files.")
+        elif command == ":new-session":
+            self.state.remember_backend_session()
+            self.state.backend_session_id = None
+            self.state.last_backend_message_id = None
+            self.state.new_agitrack_session_id()
+            self.state.save()
+            self.ui.info(f"Started a new session: {self.state.session_id}")
+            self._bridge.emit({"type": "ready", "session": self.state.session_id, "backend": self.state.backend})
+        elif command == ":agent-backend":
+            self._bridge_switch_backend(arg.strip())
+        elif command == ":summarizer":
+            self._handle_summarizer_command(arg.strip())
+        else:
+            self.ui.info(f"Unknown command: {command}", level="warn")
+        return False
+
+    def _bridge_switch_backend(self, agent: str) -> None:
+        assert self.ui is not None
+        if not agent:
+            agent = self.ui.select("Choose a backend", sorted(BACKENDS)) or ""
+        if agent not in BACKENDS:
+            self.ui.info(
+                f"Unknown backend: {agent or '(none)'}. Available: {', '.join(sorted(BACKENDS))}", level="warn"
+            )
+            return
+        if not backend_installed(agent):
+            self.ui.info(f"'{agent}' is not installed. {install_hint(agent)}", level="warn")
+            return
+        self.state.remember_backend_session()
+        self.state.backend = agent
+        self.global_config.default_backend = agent
+        self.state.backend_session_id = self.state.stored_backend_session(agent)
+        self.state.last_backend_message_id = None
+        self.ui.info(f"Backend set to {agent}")
+        self._bridge.emit({"type": "ready", "session": self.state.session_id, "backend": agent})  # type: ignore[union-attr]
 
     def _handle_command(self, text: str) -> bool:
         command, _, arg = text.partition(" ")
@@ -168,24 +286,36 @@ class AgitrackShell:
             if self.global_config is not None:
                 self.global_config.summarization_enabled = enabled
             self.state.summarization_enabled = enabled
-            print(f"Summarizer {'enabled' if enabled else 'disabled'}.")
+            self._say(f"Summarizer {'enabled' if enabled else 'disabled'}.")
         elif sub == "model":
             current = self.state.summarization_model or self.global_config.summarization_model or "(same as session)"
-            print(f"Current summarizer model: {current}")
-            new_model = input("Enter model (empty to clear): ").strip()
+            if self.ui is not None:
+                entered = self.ui.text(f"Summarizer model (current: {current}; empty to clear):")
+                if entered is None:
+                    return  # cancelled — leave the model unchanged
+                new_model = entered.strip()
+            else:
+                print(f"Current summarizer model: {current}")
+                new_model = input("Enter model (empty to clear): ").strip()
             # Persist globally (survives restarts and applies across the repo); clear the
             # per-session override so the global value takes effect.
             self.global_config.summarization_model = new_model or None
             self.state.summarization_model = None
-            print(f"Summarizer model set to: {self.global_config.summarization_model or '(same as session)'}")
+            self._say(f"Summarizer model set to: {self.global_config.summarization_model or '(same as session)'}")
         elif sub == "" or sub == "status":
             enabled = self._summarization_enabled()
             model = self.state.summarization_model or self.global_config.summarization_model or "(same as session)"
-            print(f"Summarizer: {'ON' if enabled else 'OFF'}")
-            print(f"Model: {model}")
+            self._say(f"Summarizer: {'ON' if enabled else 'OFF'}\nModel: {model}")
         else:
-            print(f"Unknown summarizer command: {arg}")
-            print("Usage: :summarizer [on|off|model|status]")
+            self._say(f"Unknown summarizer command: {arg}\nUsage: :summarizer [on|off|model|status]", level="warn")
+
+    def _say(self, message: str, *, level: str = "info") -> None:
+        """Emit a user-facing message: an editor notice in bridge mode, otherwise a
+        plain print. Terminal output is unchanged when no bridge is attached."""
+        if self.ui is not None:
+            self.ui.info(message, level=level)
+        else:
+            print(message)
 
     def _summarization_enabled(self) -> bool:
         # The GLOBAL config is the durable source of truth (survives restarts), so it wins
@@ -199,9 +329,12 @@ class AgitrackShell:
 
     def _emit(self, event: dict) -> None:
         """Emit one machine-readable JSON event line for programmatic drivers (the
-        VSCode chat extension). A no-op unless ``--json-events`` is set, so the plain
-        shell output is untouched."""
-        if self._json_events:
+        VSCode chat extension). In bridge mode it goes through the bridge (one
+        lock-serialized stdout channel); with plain ``--json-events`` it is printed.
+        A no-op otherwise, so the human-readable shell output is untouched."""
+        if self._bridge is not None:
+            self._bridge.emit(event)
+        elif self._json_events:
             print(json.dumps(event), flush=True)
 
     def _handle_agent_prompt(self, prompt: str) -> None:
@@ -209,7 +342,10 @@ class AgitrackShell:
             self._handle_pre_compaction()
 
         if self.actions.has_pre_agent_user_changes():
-            print("User changes detected before agent runs.")
+            if self.ui is not None:
+                self.ui.info("User changes detected before the agent runs.")
+            else:
+                print("User changes detected before agent runs.")
             self.actions.create_user_commit()
 
         backend = self._backend()
@@ -265,6 +401,8 @@ class AgitrackShell:
                 # Shell mode is synchronous per prompt, so summarizing inline is
                 # fine — but say so, since the LLM call can take a while.
                 print("aGiTrack is summarizing the changes before committing...")
+                if self.ui is not None:
+                    self.ui.info("Summarizing the changes before committing…")
                 try:
                     summarizer = Summarizer(self._summarizer_backend(), model=summarizer_model)
                     commit_summary = summarizer.summarize_commit(trace=trace_text)
