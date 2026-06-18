@@ -88,6 +88,15 @@ as your code. That means:
 When you install the extension in a remote window, VSCode installs it on the remote
 automatically. Locally (no remote), the same extension just runs on your machine.
 
+## Windows
+
+aGiTrack is POSIX-only (it uses pty/termios/fcntl), so it does not run on **native
+Windows**. On Windows, open your project in **WSL** (or a Dev Container / Remote-SSH) and
+run aGiTrack there: because this is a workspace extension, it then runs on the Linux side
+and works exactly as on macOS/Linux. In a native Windows window the extension detects this
+and points you to [Remote-WSL](https://code.visualstudio.com/docs/remote/wsl) instead of
+launching something that can't run.
+
 ## Updates
 
 Because the extension runs the real aGiTrack CLI in a terminal, aGiTrack's own
