@@ -243,6 +243,21 @@ def test_version_flag_prints_version_and_exits(monkeypatch, capsys):
     assert called["discover"] is False  # exits before touching the repo
 
 
+def test_startup_message_printed_for_interactive_proxy(monkeypatch, capsys):
+    # Entering aGiTrack prints immediate feedback so the terminal isn't silent while the
+    # TUI comes up — shown however it was launched (terminal or VSCode).
+    _stub_launch(monkeypatch)
+    cli.main([])
+    assert "aGiTrack is starting..." in capsys.readouterr().out
+
+
+def test_startup_message_suppressed_in_json_mode(monkeypatch, capsys):
+    # json/bridge output is machine-readable; the human "starting" line must not leak in.
+    _stub_launch(monkeypatch)
+    cli.main(["--prompt", ":status"])
+    assert "aGiTrack is starting..." not in capsys.readouterr().out
+
+
 def test_update_check_runs_under_a_tty(monkeypatch):
     # The startup self-update offer is gated only on a TTY (+ config) — NOT on any
     # editor/environment signal — so it runs inside VSCode's integrated terminal,
