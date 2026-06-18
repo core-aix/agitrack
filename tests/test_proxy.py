@@ -5398,7 +5398,7 @@ def test_spawn_failed_exec_child_exits_with_127(tmp_path):
         worktree=None,
         backend=types.SimpleNamespace(
             new_session_id=lambda: "ses-1",
-            spawn_command=lambda repo, session_id, resume, commit_guidance=True: [
+            spawn_command=lambda repo, session_id, resume, commit_guidance=True, use_worktrees=True: [
                 "agit-test-binary-that-does-not-exist"
             ],
             list_sessions=lambda repo: [],
