@@ -37,25 +37,50 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v3
 
-      - name: Bump patch version
+      - name: Bump version
         id: bump
+        # The bump level is taken from the merge commit / squash-PR title: include
+        # "[minor]" to bump the minor and reset patch to 0, or "[major]" to bump the
+        # major and reset minor+patch to 0. With neither marker it's a patch bump (the
+        # default). The message is passed via env (never interpolated into the shell) so
+        # an arbitrary PR title can't inject commands.
+        env:
+          HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
         run: |
           python3 <<'PY' >> "$GITHUB_OUTPUT"
-          import re, pathlib
+          import os, re, pathlib
+
+          message = os.environ.get("HEAD_COMMIT_MESSAGE", "")
+          lowered = message.lower()
+          if "[major]" in lowered:
+              level = "major"
+          elif "[minor]" in lowered:
+              level = "minor"
+          else:
+              level = "patch"
 
           pp = pathlib.Path("pyproject.toml")
           m = re.search(r'^version = "(\d+)\.(\d+)\.(\d+)"', pp.read_text(), re.M)
           if not m:
               raise SystemExit("could not find version in pyproject.toml")
           major, minor, patch = (int(g) for g in m.groups())
-          new_version = f"{major}.{minor}.{patch + 1}"
+          if level == "major":
+              major, minor, patch = major + 1, 0, 0
+          elif level == "minor":
+              minor, patch = minor + 1, 0
+          else:
+              patch += 1
+          new_version = f"{major}.{minor}.{patch}"
 
           pp.write_text(re.sub(
               r'^version = "[^"]+"', f'version = "{new_version}"',
               pp.read_text(), count=1, flags=re.M,
           ))
           # pyproject.toml is the only version source; agitrack.__version__ derives
-          # from the installed distribution metadata at runtime.
+          # from the installed distribution metadata at runtime. The level line goes to
+          # stderr so it shows in the log without landing in $GITHUB_OUTPUT (stdout).
+          import sys
+          print(f"{level} release: bumping to v{new_version}", file=sys.stderr)
           print(f"version={new_version}")
           PY
           # Keep the VSCode extension version in lockstep with the CLI.
