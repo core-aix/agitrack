@@ -11,8 +11,12 @@ Launch the full aGiTrack terminal application from VSCode — no terminal typing
 - A brand-icon **aGiTrack button** at the top-right of the editor toolbar that starts
   a session in one click. Restart and Open Dashboard are Command Palette commands;
   Start is also on the Explorer folder context menu.
-- Closing the session terminal prompts (VSCode's editor-terminal confirmation) and
-  aGiTrack exits **gracefully**, finalizing the latest turn instead of stranding it.
+- Closing the session terminal prompts to confirm and aGiTrack exits **gracefully**,
+  finalizing the latest turn instead of stranding it. The extension raises
+  `terminal.integrated.confirmOnKill` to `always` when your setting wouldn't otherwise
+  prompt for the aGiTrack terminal (opt out with `agitrack.confirmTerminalClose: false`).
+- Exiting aGiTrack from the `Ctrl-G` menu now **closes the terminal automatically**
+  (a non-zero/error exit keeps it open so you can read the message).
 - The dashboard is **remote-aware**: on a remote/SSH/Mosh host it no longer tries to
   open a (headless) remote browser — it relies on port forwarding so the URL opens on
   your local machine; `$BROWSER` is honored when set.

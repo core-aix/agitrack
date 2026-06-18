@@ -3044,6 +3044,18 @@ class ProxyRunner:
         sanitized = _sanitize_name(name)
         return any(_sanitize_name(self._session_name(index)) == sanitized for index in range(len(self.sessions)))
 
+    def _live_session_for_lineage(self, owner: str, name: str) -> int | None:
+        """Index of a live session that is the SAME shared session as ``owner/name`` —
+        matched by its recorded shared-lineage origin, not its backend id (which differs
+        per collaborator). None when no open session shares that lineage."""
+        user = self._user_state()
+        for index, session in enumerate(self.sessions):
+            sid = getattr(getattr(session, "state", None), "backend_session_id", None)
+            rec = user.shared_origin(sid) if sid else None
+            if rec and rec.get("name") == name and (not owner or rec.get("owner") == owner):
+                return index
+        return None
+
     # --- sharing full sessions via git (issue #55) -------------------------
 
     def _shared_store(self):
@@ -3932,6 +3944,50 @@ class ProxyRunner:
                     as_id=None,
                     backend=entry_backend,
                 )
+                return
+            assert keep_both_id is not None
+            copy_name = self._prompt_session_name(
+                "Name the copied session", default=self._dedupe_session_name(entry.name)
+            )
+            if copy_name is None:
+                self._set_message("Cancelled.")
+                self._render()
+                return
+            self._begin_shared_resume(
+                store,
+                entry,
+                agent,
+                action="new",
+                name=copy_name,
+                resume_id=keep_both_id,
+                overwrite=False,
+                as_id=keep_both_id,
+                backend=entry_backend,
+            )
+            return
+        # You may already have this exact shared session open under a DIFFERENT backend
+        # id: a multi-collaborator entry carries the *last sharer's* session_id, not
+        # yours, so the id check above misses your own copy and the resume would mint a
+        # new, differently-named session (the "session name got lost" report). Match by
+        # the shared LINEAGE (origin owner + name) instead and offer to continue your
+        # existing session — keeping its name — rather than duplicating it.
+        lineage_index = self._live_session_for_lineage(entry.github_id, entry.name)
+        if lineage_index is not None:
+            local_name = self._session_name(lineage_index)
+            keep_both_id = getattr(agent, "new_import_id", lambda: None)()
+            opts = [f"Continue my existing '{local_name}' session"]
+            if keep_both_id:
+                opts.append("Fetch the shared version as a separate copy")
+            pick = self._select_popup(
+                f"You already have this shared session open locally as '{local_name}'.\nWhat would you like to do?",
+                opts,
+            )
+            if pick is None:
+                self._set_message("Cancelled.")
+                self._render()
+                return
+            if pick.startswith("Continue"):
+                self._switch_active(lineage_index)
                 return
             assert keep_both_id is not None
             copy_name = self._prompt_session_name(

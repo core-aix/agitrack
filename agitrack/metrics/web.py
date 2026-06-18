@@ -215,6 +215,10 @@ def _filtered_dashboard(dash: Dashboard, stats: list[CommitStat]) -> Dashboard:
         branch=dash.branch,
         stats=stats,
         sha_logins=dash.sha_logins,
+        # Carry the email→login hint too, or the per-committer panels (built from this
+        # filtered copy) lose it and show a bare name while the filter dropdown — built
+        # from the original dashboard — shows the GitHub ID.
+        email_logins=dash.email_logins,
         commit_base=dash.commit_base,
     )
 
