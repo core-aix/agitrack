@@ -22,6 +22,8 @@ import { readFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 
+import { isNativeWindows } from "./platform";
+
 const TERMINAL_NAME = "aGiTrack";
 
 // Held so module-level functions (startSession's one-time tip, deactivate's graceful
@@ -207,15 +209,6 @@ function isAlive(pid: number): boolean {
   } catch {
     return false;
   }
-}
-
-/** aGiTrack is POSIX-only (it imports pty/termios/fcntl at load), so it can't run on a
- * native Windows host. Thanks to `extensionKind: ["workspace"]`, a Windows + WSL /
- * Remote-SSH / Dev Container / Codespaces window runs THIS code on the Linux side
- * (`process.platform` is not "win32") and works normally — only a LOCAL Windows window
- * reaches win32 here, which is exactly the case aGiTrack can't support. */
-function isNativeWindows(): boolean {
-  return process.platform === "win32";
 }
 
 /** Explain that aGiTrack needs WSL on Windows, with a link to set it up. Returns true if
