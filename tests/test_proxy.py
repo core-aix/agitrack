@@ -536,6 +536,89 @@ def test_full_agent_messages_flag_records_all_messages(tmp_path):
     assert runner.repo.message.count("## Agent") == 2
 
 
+def test_delay_merge_defers_integration_and_names_working_dir(tmp_path):
+    import types
+
+    runner = make_runner()
+    runner._delay_merge = True
+    runner._exiting = False
+    runner.worktree = types.SimpleNamespace(name="s", path=tmp_path)
+    runner.repo = types.SimpleNamespace(repo=tmp_path)
+    runner._base_branch = "main"
+    runner._active_has_pending = lambda: True
+    runner._menu_label = lambda: "Ctrl-G"
+    integrated: list = []
+    runner._integrate_turn_or_conflict = lambda: integrated.append(True) or "integrated"
+    msgs: list[str] = []
+    runner._set_message = lambda m, **k: msgs.append(m)
+    runner._render = lambda *a, **k: None
+
+    runner._integrate_session_turn()
+
+    assert integrated == []  # deferred, not merged
+    # The notice names the working directory (the worktree) so the user can find it.
+    assert any(str(tmp_path) in m and "not merged" in m for m in msgs)
+
+
+def test_delay_merge_off_integrates_immediately(tmp_path):
+    import types
+
+    runner = make_runner()
+    runner._delay_merge = False
+    runner._exiting = False
+    runner.worktree = types.SimpleNamespace(name="s", path=tmp_path)
+    runner.repo = types.SimpleNamespace(repo=tmp_path)
+    runner._base_branch = "main"
+    integrated: list = []
+    runner._integrate_turn_or_conflict = lambda: integrated.append(True) or "integrated"
+
+    runner._integrate_session_turn()
+
+    assert integrated == [True]  # merged right away (default behavior unchanged)
+
+
+def _delay_menu_runner(tmp_path):
+    import types
+
+    runner = make_runner()
+    runner._delay_merge = True
+    runner.merge_ctx = None
+    runner.worktree = types.SimpleNamespace(name="s", path=tmp_path)
+    runner.repo = types.SimpleNamespace(repo=tmp_path, merge_in_progress=lambda: False)
+    runner._base_branch = "main"
+    runner._active_has_pending = lambda: True
+    runner.sessions = []
+    runner._my_shared_session_ids = lambda: set()
+    runner._dormant_worktrees = lambda names: []
+    runner._resumable_sessions = lambda: []
+    runner.backend = types.SimpleNamespace(supports_session_sharing=False, name="claude")
+    runner._use_worktrees = True
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda *a, **k: None
+    return runner
+
+
+def test_delay_merge_menu_offers_merge_entry(tmp_path):
+    runner = _delay_menu_runner(tmp_path)
+    seen: list = []
+    runner._select_popup = lambda title, options: seen.append(options) or None  # cancel after building
+
+    runner._session_menu()
+
+    assert any("Merge reviewed changes into main" in opt for opt in seen[0])
+
+
+def test_delay_merge_menu_choice_integrates(tmp_path):
+    runner = _delay_menu_runner(tmp_path)
+    runner._select_popup = lambda title, options: next(o for o in options if "Merge reviewed changes" in o)
+    called: list = []
+    runner._integrate_active_session = lambda: called.append(True)
+
+    runner._session_menu()
+
+    assert called == [True]
+
+
 def _copy_runner(tmp_path, status):
     import types
 

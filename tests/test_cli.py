@@ -219,6 +219,18 @@ def test_default_uses_config_commit_guidance(monkeypatch):
     assert captured["commit_guidance"] is False
 
 
+def test_delay_merge_flag_passed_to_runner(monkeypatch):
+    captured = _stub_launch(monkeypatch)
+    cli.main(["--delay-merge"])
+    assert captured["delay_merge"] is True
+
+
+def test_delay_merge_off_by_default(monkeypatch):
+    captured = _stub_launch(monkeypatch)
+    cli.main([])
+    assert captured["delay_merge"] is False
+
+
 def test_json_events_flag_passed_to_shell(monkeypatch):
     captured = _stub_launch(monkeypatch)
     cli.main(["--mode", "json", "--json-events", "--prompt", "hi"])

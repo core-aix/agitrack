@@ -256,6 +256,14 @@ Show aGiTrack diagnostic messages:
 agitrack --verbose
 ```
 
+Review each turn before it merges, instead of integrating automatically:
+
+```bash
+agitrack --delay-merge
+```
+
+By default aGiTrack merges a turn's committed changes into the base branch as soon as the turn finishes. With `--delay-merge` it holds the merge: after the agent commits, the changes stay in the session's **working directory** (a git worktree when worktrees are enabled — its path is shown in the notice, since you may not know the worktree's location otherwise) so you can review them and make any further edits. When you're ready, open the session menu and choose **"Merge reviewed changes into &lt;base&gt;"** to integrate. Nothing is merged until you confirm (on exit, any still-unmerged work stays on its branch and is offered again next time). This is off by default.
+
 Use the structured JSON fallback mode:
 
 ```bash

@@ -137,6 +137,42 @@ def merge_transcripts(new: str, existing: str) -> str:
     return "\n".join(merged) + "\n"
 
 
+def _transcript_is_readable(text: str, backend: str | None) -> bool:
+    """Whether a transcript still parses into a usable session for its backend.
+
+    Used to guard a union merge before it's uploaded: a merge that combined two
+    diverged copies must not produce a transcript the backend can no longer load.
+    True only when the backend's OWN parser yields at least one turn; False on a
+    parse failure or an empty result. Supported for both backends — Claude
+    (line-oriented JSONL via ``parse_rows``) and OpenCode (a single export object via
+    ``parse_exported_session``). An unknown/unspecified backend has no parser to
+    check, so it is treated as readable (the merge logic only runs for line-mergeable
+    Claude transcripts anyway)."""
+    if not text.strip():
+        return False
+    try:
+        if backend == "claude":
+            from agitrack.transcripts.claude import parse_rows
+
+            rows: list[dict] = []
+            for line in text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue  # mirror the real reader: skip a stray unparsable line
+            return bool(parse_rows("readability-check", rows).turns)
+        if backend == "opencode":
+            from agitrack.transcripts.opencode import parse_exported_session
+
+            return bool(parse_exported_session(json.loads(text)).turns)
+    except (json.JSONDecodeError, ValueError, TypeError, KeyError, AttributeError):
+        return False
+    return True
+
+
 def _is_stale_lease(error: str) -> bool:
     """Whether a failed push was *rejected because the remote moved* (a lost race
     or a never-fetched remote ref) — the only failure publish() retries after a
@@ -473,7 +509,11 @@ class SharedSessionStore:
         existing = self.repo.read_ref_blob(self.ref, f"{self._prefix()}{gid}/{nm}/transcript.jsonl")
         if existing:
             combined = merge_transcripts(transcript, existing)
-            if combined != transcript:
+            # Only accept the merge if its result is still readable by the backend —
+            # the guard that combining two diverged copies didn't corrupt the session.
+            # An unreadable merge falls back to last-write-wins (our own transcript,
+            # which is whole), so a broken merge is never uploaded.
+            if combined != transcript and _transcript_is_readable(combined, manifest.get("backend")):
                 merged_rows = count_transcript_rows(combined) - count_transcript_rows(transcript)
                 transcript = combined
                 manifest = {
