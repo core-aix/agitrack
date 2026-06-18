@@ -191,6 +191,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.ui_bridge:
         args.mode = "json"  # the bridge is a json-mode transport (the VSCode extension)
 
+    # Give immediate feedback that aGiTrack is launching — the interactive TUI takes a
+    # few seconds to come up (update check, backend startup) and otherwise the terminal
+    # looks frozen. Printed for interactive proxy mode only, so it never pollutes the
+    # machine-readable json/bridge output or the cheap --version/--dashboard paths. Shown
+    # however aGiTrack was started (terminal or VSCode), then replaced by the TUI frame.
+    if args.mode == "proxy":
+        print("aGiTrack is starting...", flush=True)
+
     # Offer a self-update before launching anything. Skipped for scripted/non-TTY
     # runs (no way to answer) and when the user turned update checks off. If the
     # user accepts, aGiTrack updates and re-execs immediately — no sessions are
