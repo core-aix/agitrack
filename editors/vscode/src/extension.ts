@@ -302,16 +302,23 @@ async function startSession(targetUri?: vscode.Uri): Promise<void> {
   terminal.show();
 }
 
-/** Once per install, tell the user the reliable way to exit aGiTrack — Ctrl-G → exit —
- * so the in-flight turn is finalized. Closing the window also attempts a graceful exit
- * (see deactivate()), but VSCode bounds how long it waits, so this is the sure path. */
+/** Once per installed version, tell the user the reliable way to exit aGiTrack —
+ * Ctrl-G → exit — so the in-flight turn is finalized. We key the "seen" flag on the
+ * extension version, so the tip re-appears after every update or reinstall (a fresh
+ * version bump is a good moment to re-surface the safe-exit habit). Closing the window
+ * also attempts a graceful exit (see deactivate()), but VSCode bounds how long it waits,
+ * so this is the sure path. */
 async function maybeShowGracefulExitTip(): Promise<void> {
-  const KEY = "agitrack.gracefulExitTipShown";
+  const KEY = "agitrack.gracefulExitTipShownVersion";
   const state = extensionContext?.globalState;
-  if (!state || state.get<boolean>(KEY)) {
+  if (!state) {
     return;
   }
-  await state.update(KEY, true); // remember first, so an immediate close won't re-show it
+  const version = String(extensionContext?.extension.packageJSON.version ?? "");
+  if (state.get<string>(KEY) === version) {
+    return; // already shown for this installed version
+  }
+  await state.update(KEY, version); // remember first, so an immediate close won't re-show it
   void vscode.window.showInformationMessage(
     "To exit aGiTrack and make sure your latest turn is committed and merged, use the " +
       "Ctrl-G menu → exit inside aGiTrack. Closing the terminal or window still tries to " +
