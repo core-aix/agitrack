@@ -17,12 +17,16 @@ Launch the full aGiTrack terminal application from VSCode — no terminal typing
   into aGiTrack instead of the shell (e.g. `source .venv/bin/activate` landing in the
   agent, or a stray newline auto-acknowledging the sensitive-information prompt). aGiTrack
   also drains any pending terminal input right before that prompt as a backstop.
-- Exiting aGiTrack (e.g. the `Ctrl-G` → exit menu) **closes the terminal** automatically
-  (`&& exit` on a clean exit; a non-zero/error exit keeps it open so you can read it).
-- Closing the terminal prompts to confirm and aGiTrack exits **gracefully**, finalizing
-  the latest turn instead of stranding it. The extension raises
-  `terminal.integrated.confirmOnKill` to `always` when your setting wouldn't otherwise
-  prompt for the aGiTrack terminal (opt out with `agitrack.confirmTerminalClose: false`).
+- Exiting aGiTrack (e.g. the `Ctrl-G` → exit menu) **closes the terminal** automatically:
+  the session is launched with `exec`, so when aGiTrack exits the process is gone and the
+  terminal closes.
+- Closing the window/terminal exits aGiTrack **gracefully**, finalizing the latest turn
+  instead of stranding it. On shutdown the extension signals aGiTrack and waits (up to
+  60s) for it to finish; it also raises `terminal.integrated.confirmOnKill` to `always`
+  when your setting wouldn't otherwise prompt for the aGiTrack terminal (opt out with
+  `agitrack.confirmTerminalClose: false`). Because VSCode bounds how long it waits on
+  shutdown, a one-time dialog points you at the reliable path — **`Ctrl-G` → exit** inside
+  aGiTrack — which has no time pressure.
 - The dashboard is **remote-aware**: on a remote/SSH/Mosh host it no longer tries to
   open a (headless) remote browser — it relies on port forwarding so the URL opens on
   your local machine; `$BROWSER` is honored when set.

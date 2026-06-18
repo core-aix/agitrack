@@ -23,6 +23,10 @@ import { join } from "path";
 
 const TERMINAL_NAME = "aGiTrack";
 
+// Held so module-level functions (startSession's one-time tip, deactivate's graceful
+// shutdown) can reach globalState; set in activate().
+let extensionContext: vscode.ExtensionContext | undefined;
+
 // One aGiTrack terminal per workspace folder, keyed by folder path, so re-running
 // the launch command focuses the existing session instead of starting a second
 // instance (which aGiTrack would refuse with its repo lock).
@@ -32,6 +36,7 @@ const terminals = new Map<string, vscode.Terminal>();
 const dashboards = new Map<string, vscode.Terminal>();
 
 export function activate(context: vscode.ExtensionContext): void {
+  extensionContext = context;
   context.subscriptions.push(
     vscode.commands.registerCommand("agitrack.start", () => startSession()),
     vscode.commands.registerCommand("agitrack.startHere", (uri?: vscode.Uri) => startSession(uri)),
@@ -60,9 +65,60 @@ export function activate(context: vscode.ExtensionContext): void {
   void bootstrap(context);
 }
 
-export function deactivate(): void {
-  // Terminals are disposed by VSCode with the window; aGiTrack releases its repo
-  // lock on exit, so there is nothing to clean up here.
+export function deactivate(): Thenable<void> {
+  // VSCode awaits this promise during shutdown (window close, reload, extension
+  // disable), so we use it to give every running aGiTrack a chance to exit
+  // gracefully — finalize and commit the in-flight turn — instead of being
+  // hard-killed when the pty is torn down. We send aGiTrack SIGTERM (its handler
+  // finalizes pending work, then exits) and wait for the process to actually
+  // disappear, up to a generous budget.
+  //
+  // Best-effort, by nature: VSCode caps how long it will wait for deactivation and
+  // owns the pty teardown, so a finalize that runs long can still be cut off. The
+  // reliable path remains Ctrl-G -> exit inside aGiTrack (see the start-up tip).
+  return shutdownSessionsGracefully(60_000);
+}
+
+/** Signal each running aGiTrack session to exit and wait (up to `timeoutMs` each) for
+ * it to finish finalizing. Dashboards are read-only and need no graceful exit, so they
+ * are left to be torn down with the window. */
+async function shutdownSessionsGracefully(timeoutMs: number): Promise<void> {
+  await Promise.all([...terminals.values()].map((terminal) => signalAndWait(terminal, timeoutMs)));
+}
+
+async function signalAndWait(terminal: vscode.Terminal, timeoutMs: number): Promise<void> {
+  let pid: number | undefined;
+  try {
+    pid = await terminal.processId; // aGiTrack's PID — we launch sessions with `exec`
+  } catch {
+    return;
+  }
+  if (!pid) {
+    return;
+  }
+  try {
+    process.kill(pid, "SIGTERM"); // aGiTrack's SIGTERM handler finalizes the turn, then exits
+  } catch {
+    return; // already gone
+  }
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isAlive(pid)) {
+      return; // exited cleanly
+    }
+    await delay(150);
+  }
+}
+
+/** True while `pid` exists; signal 0 only probes (it sends nothing) and throws once
+ * the process is gone. */
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** First-run housekeeping: if the CLI is present, check version parity; if it's
@@ -105,6 +161,7 @@ async function startSession(targetUri?: vscode.Uri): Promise<void> {
   }
 
   await ensureCloseConfirmation();
+  void maybeShowGracefulExitTip();
 
   // Run aGiTrack inside the shell, but only AFTER the shell has finished its own startup
   // — including any commands VSCode injects automatically (the Python extension's venv
@@ -112,16 +169,37 @@ async function startSession(targetUri?: vscode.Uri): Promise<void> {
   // otherwise they get typed into aGiTrack's stdin (e.g. `source .venv/bin/activate`
   // landing in the agent, or a stray newline auto-answering the privacy prompt).
   // spawnAgitrackTerminal sequences the launch via shell integration to guarantee this.
-  // `&& exit` then closes the terminal when aGiTrack exits cleanly (e.g. Ctrl-G → exit);
-  // a non-zero startup error leaves it open so the message stays visible.
+  //
+  // `exec` replaces the shell with aGiTrack, so (a) `terminal.processId` is aGiTrack's
+  // own PID — letting deactivate() signal it directly for a graceful exit — and (b) the
+  // terminal closes when aGiTrack exits (the process is gone), same as a clean quit.
   const terminal = spawnAgitrackTerminal({
     name: terminals.size === 0 ? TERMINAL_NAME : `${TERMINAL_NAME} (${folder.name})`,
     cwd: folder.uri.fsPath,
     icon: "git-commit",
-    command: `${launchCommand(exe)} && exit`,
+    command: `exec ${launchCommand(exe)}`,
   });
   terminals.set(key, terminal);
   terminal.show();
+}
+
+/** Once per install, tell the user the reliable way to exit aGiTrack — Ctrl-G → exit —
+ * so the in-flight turn is finalized. Closing the window also attempts a graceful exit
+ * (see deactivate()), but VSCode bounds how long it waits, so this is the sure path. */
+async function maybeShowGracefulExitTip(): Promise<void> {
+  const KEY = "agitrack.gracefulExitTipShown";
+  const state = extensionContext?.globalState;
+  if (!state || state.get<boolean>(KEY)) {
+    return;
+  }
+  await state.update(KEY, true); // remember first, so an immediate close won't re-show it
+  void vscode.window.showInformationMessage(
+    "To exit aGiTrack and make sure your latest turn is committed and merged, use the " +
+      "Ctrl-G menu → exit inside aGiTrack. Closing the terminal or window still tries to " +
+      "exit cleanly, but Ctrl-G → exit is the reliable way.",
+    { modal: true },
+    "Got it",
+  );
 }
 
 /** Make sure closing the aGiTrack terminal is confirmed (so aGiTrack can exit
