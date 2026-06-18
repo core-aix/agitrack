@@ -190,16 +190,16 @@ class RepoChangeHandler(FileSystemEventHandler):
 
 
 class ProxyInput:
-    # Order matters (shown in the palette). Only "session" starts with "s" so
+    # Order matters (shown in the palette). Only "sessions" starts with "s" so
     # that pressing s+Enter jumps straight to the session picker. Git-specific
     # commands are grouped under a "git-" prefix.
     COMMANDS = [
-        "session",
+        "sessions",
         "agent-backend",
         "summarizer",
-        "dashboard",
         "git-unstaged",
         "git-user-commit",
+        "dashboard",
         "update",
         "exit",
     ]
@@ -2543,7 +2543,7 @@ class ProxyRunner:
         return "running" if working else "idle"
 
     def _handle_session_command(self, arg: str) -> None:
-        # Ctrl-G then "session": manage the live concurrent sessions.
+        # Ctrl-G then "sessions": manage the live concurrent sessions.
         arg = arg.strip()
         if arg in {"new", "fresh"}:
             self._prompt_new_session()
@@ -5658,7 +5658,7 @@ class ProxyRunner:
             else:
                 self._switch_backend(selected)
                 return
-        elif name == "session":
+        elif name == "sessions":
             self._handle_session_command(arg)
             return
         elif name == "summarizer":

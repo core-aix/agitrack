@@ -25,7 +25,6 @@ you already have it elsewhere, point `agitrack.path` at it.
 Open the **aGiTrack menu** (the brand-icon button at the top-right of the editor
 toolbar) and choose **Start Session** or **Open Dashboard**. You can also:
 
-- click the **`$(git-commit) aGiTrack`** button in the status bar to start a session, or
 - run **aGiTrack: Start Session** / **aGiTrack: Open Dashboard** from the Command Palette, or
 - right-click a folder in the Explorer → **aGiTrack: Start Session Here**.
 
@@ -37,6 +36,11 @@ auto-committed. Prefer the bottom panel? Set `agitrack.terminalLocation` to `pan
 **Open Dashboard** runs aGiTrack's metrics dashboard (`agitrack -d`) — it serves a
 filterable, auto-refreshing report on localhost and opens it in your browser. It's
 read-only and can run alongside a session; Ctrl-C in its terminal to stop it.
+
+> The session terminal sets `CLAUDE_CODE_IDE_SKIP_AUTO_INSTALL=1` so the Claude Code
+> backend doesn't try to auto-install its own VSCode companion extension here (that
+> attempt fails in this context and shows a confusing error). If you want Claude's IDE
+> features, install the *Claude Code* extension from the Marketplace yourself.
 
 Running the command again focuses the existing session (aGiTrack only allows one per
 repository). Use **aGiTrack: Restart Session** to stop it and start fresh.

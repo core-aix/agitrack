@@ -53,14 +53,6 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
   );
 
-  // A status-bar button so launching aGiTrack is one click, no Command Palette needed.
-  const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 0);
-  status.text = "$(git-commit) aGiTrack";
-  status.tooltip = "Start an aGiTrack session in this workspace";
-  status.command = "agitrack.start";
-  status.show();
-  context.subscriptions.push(status);
-
   if (vscode.workspace.getConfiguration("agitrack").get<boolean>("openOnStartup")) {
     void startSession();
   }
@@ -169,6 +161,15 @@ function createTerminal(folder: vscode.WorkspaceFolder): vscode.Terminal {
     cwd: folder.uri.fsPath,
     iconPath: new vscode.ThemeIcon("git-commit"),
     location: terminalLocation(),
+    env: {
+      // aGiTrack runs the agent inside its own terminal UI. When the backend is Claude
+      // Code, it otherwise tries to auto-install its VSCode companion extension on
+      // detecting VSCode — which fails in this context (e.g. no `code` on PATH) and
+      // shows a confusing "failed to install the IDE extension" error. Skip that; IDE
+      // *connection* still works if the user installs the Claude Code extension from the
+      // Marketplace. Harmless for the OpenCode backend.
+      CLAUDE_CODE_IDE_SKIP_AUTO_INSTALL: "1",
+    },
   });
 }
 
