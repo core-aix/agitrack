@@ -11,13 +11,14 @@ Launch the full aGiTrack terminal application from VSCode — no terminal typing
 - A brand-icon **aGiTrack button** at the top-right of the editor toolbar that starts
   a session in one click. Restart and Open Dashboard are Command Palette commands;
   Start is also on the Explorer folder context menu.
-- aGiTrack runs as the terminal's **own process** (not a command typed into a shell),
-  so nothing else can type into it. This fixes the sensitive-information prompt being
-  auto-acknowledged: previously a shell command injected by VSCode (shell integration /
-  the Python extension's venv activation) carried a newline that landed on aGiTrack's
-  "Press Enter to acknowledge…" and confirmed it for you.
-- Exiting aGiTrack (e.g. the `Ctrl-G` → exit menu) now **closes the terminal**
-  automatically, since aGiTrack is the terminal's process.
+- aGiTrack starts only **after** the terminal's automatic startup has run — VSCode's
+  venv/conda activation, shell integration, and any other commands it injects — by
+  sequencing the launch through shell integration. This fixes those commands being typed
+  into aGiTrack instead of the shell (e.g. `source .venv/bin/activate` landing in the
+  agent, or a stray newline auto-acknowledging the sensitive-information prompt). aGiTrack
+  also drains any pending terminal input right before that prompt as a backstop.
+- Exiting aGiTrack (e.g. the `Ctrl-G` → exit menu) **closes the terminal** automatically
+  (`&& exit` on a clean exit; a non-zero/error exit keeps it open so you can read it).
 - Closing the terminal prompts to confirm and aGiTrack exits **gracefully**, finalizing
   the latest turn instead of stranding it. The extension raises
   `terminal.integrated.confirmOnKill` to `always` when your setting wouldn't otherwise
