@@ -113,6 +113,15 @@ def main(argv: list[str] | None = None) -> int:
         "are still excluded); also settable per-repo via full_agent_messages in config",
     )
     parser.add_argument(
+        "--recover",
+        action="store_true",
+        help="finalize work left by a session that exited abruptly (e.g. the VSCode window "
+        "was closed mid-turn): for each session worktree, commit a finished turn's "
+        "uncommitted changes and merge it into the base branch (skipping the merge on a "
+        "conflict). Runs headlessly and no-ops if a live aGiTrack holds the repo lock. Used "
+        "by the VSCode extension on close; also runnable manually.",
+    )
+    parser.add_argument(
         "--skip-privacy-ack",
         action="store_true",
         # Suppress the one-time privacy warning/acknowledgment. Set automatically
@@ -168,6 +177,23 @@ def main(argv: list[str] | None = None) -> int:
             # OSError: --repo points at a directory that does not exist.
             print(error)
             return 1
+
+    if args.recover:
+        # Headless finalization of work left by a session that exited abruptly.
+        # It only commits/merges already-produced changes (never starts new agent
+        # work), so — like --dashboard — no privacy prompt and no update check. It
+        # takes the repo lock itself and no-ops if a live aGiTrack holds it.
+        try:
+            recover_repo = GitRepo.discover(Path(args.repo).expanduser())
+        except (GitError, OSError) as error:
+            print(error)
+            return 1
+        from agitrack.config.migrate import migrate_repo_state
+        from agitrack.recovery import RecoveryService
+
+        migrate_repo_state(recover_repo)
+        print(RecoveryService(recover_repo, config).recover().summary())
+        return 0
 
     # If backend is asked for help, run it directly without TUI.
     if backend_args and any(arg in ("--help", "-h") for arg in backend_args):

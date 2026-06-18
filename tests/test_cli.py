@@ -258,6 +258,20 @@ def test_startup_message_suppressed_in_json_mode(monkeypatch, capsys):
     assert "aGiTrack is starting..." not in capsys.readouterr().out
 
 
+def test_recover_flag_finalizes_and_exits(tmp_path, monkeypatch, capsys):
+    # `agitrack --recover` runs headless recovery and exits — no privacy prompt,
+    # no TUI, no "starting" line. With no session worktrees there is nothing to do.
+    from agitrack.git import GitRepo
+
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path / "cfg"))
+    GitRepo.init(tmp_path / "repo")
+    rc = cli.main(["--repo", str(tmp_path / "repo"), "--recover"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Nothing to recover." in out
+    assert "aGiTrack is starting" not in out  # recovery is not an interactive launch
+
+
 def test_update_check_runs_under_a_tty(monkeypatch):
     # The startup self-update offer is gated only on a TTY (+ config) — NOT on any
     # editor/environment signal — so it runs inside VSCode's integrated terminal,
