@@ -424,3 +424,15 @@ make check        # or: ./scripts/check.sh
 ```
 
 This is the definition of "done" for a change — it mirrors CI exactly (`.github/workflows/ci.yml`).
+
+### Releases
+
+Every merge to `main` cuts a release automatically (`.github/workflows/release-patch.yml`): it bumps the version in `pyproject.toml`, syncs the VSCode extension to match, publishes to PyPI and the Marketplace, and creates a GitHub Release.
+
+The bump level is taken from the **merge commit / squash-PR title**:
+
+- `[major]` → bump major, reset minor and patch to 0 (e.g. `0.4.2 → 1.0.0`)
+- `[minor]` → bump minor, reset patch to 0 (e.g. `0.4.2 → 0.5.0`)
+- neither marker → patch bump, the default (e.g. `0.4.2 → 0.4.3`)
+
+The markers are case-insensitive and may appear anywhere in the title. So a normal merge releases a patch, and you opt into a larger bump by titling the PR e.g. `Add session sharing [minor]` — no tags needed.
