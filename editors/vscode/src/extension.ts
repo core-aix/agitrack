@@ -104,10 +104,36 @@ async function startSession(targetUri?: vscode.Uri): Promise<void> {
     return; // not installed and not installed-on-demand
   }
 
+  await ensureCloseConfirmation();
+
   const terminal = createTerminal(folder);
   terminals.set(key, terminal);
   terminal.show();
-  terminal.sendText(launchCommand(exe));
+  // `&& exit` closes the terminal automatically when aGiTrack exits cleanly (e.g. the
+  // user picks "exit" in the Ctrl-G menu). A non-zero exit (a startup error) skips it,
+  // so the message stays visible. aGiTrack still runs as the shell's foreground child,
+  // so VSCode's confirmOnKill prompt for closing the terminal continues to work.
+  terminal.sendText(`${launchCommand(exe)} && exit`);
+}
+
+/** Make sure closing the aGiTrack terminal is confirmed (so aGiTrack can exit
+ * gracefully and finalize the latest turn) rather than killed outright. VSCode gives
+ * no per-terminal close hook, so we lean on `terminal.integrated.confirmOnKill`: if its
+ * current value wouldn't prompt for the terminal we open, raise it to `always`. */
+async function ensureCloseConfirmation(): Promise<void> {
+  const cfg = vscode.workspace.getConfiguration("agitrack");
+  if (!cfg.get<boolean>("confirmTerminalClose", true)) {
+    return;
+  }
+  const termCfg = vscode.workspace.getConfiguration("terminal.integrated");
+  const current = termCfg.get<string>("confirmOnKill") || "editor";
+  const inEditor = (cfg.get<string>("terminalLocation") || "beside") !== "panel";
+  // Editor-area terminals prompt on "editor" or "always"; panel terminals only on
+  // "always". If ours wouldn't prompt, restore confirmation by raising it to "always".
+  const willPrompt = current === "always" || (inEditor && current === "editor");
+  if (!willPrompt) {
+    await termCfg.update("confirmOnKill", "always", vscode.ConfigurationTarget.Global);
+  }
 }
 
 /** Stop the workspace's aGiTrack terminal (if any) and start a fresh one. */

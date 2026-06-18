@@ -135,6 +135,11 @@
             "In the bottom panel (VSCode's default terminal location)"
           ],
           "description": "Where aGiTrack's terminal opens."
+        },
+        "agitrack.confirmTerminalClose": {
+          "type": "boolean",
+          "default": true,
+          "description": "Prompt before closing the aGiTrack terminal so aGiTrack can exit gracefully (finalizing the latest turn). If VSCode's `terminal.integrated.confirmOnKill` is set to `never`, aGiTrack restores it to `always` so the close is confirmed."
         }
       }
     }

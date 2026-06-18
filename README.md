@@ -308,17 +308,17 @@ Scripted runs never block on a question: the privacy warning is printed without 
 
 For a programmatic driver, `agitrack --mode json --json-events` emits one machine-readable JSON line per turn event (`response`, `commit`, `no_changes`, `error`) alongside the plain output, so another process can render the conversation and see which commit each turn produced. For a driver that also needs to *answer* aGiTrack's interactive questions, `agitrack --mode json --ui-bridge` runs a long-lived **bidirectional** JSON-RPC session over stdin/stdout: the driver sends `{"type":"prompt"|"command"|"answer"|"exit", …}` lines and aGiTrack streams back the same turn events plus `ask` events (`kind`: select/multiselect/input/confirm) for the driver to render and reply to.
 
-### Editor integration
-
-A VSCode extension in [`editors/vscode/`](editors/vscode/) lets you **install aGiTrack as a VSCode plugin and launch it inside VSCode with one click** — no opening a terminal and typing `agitrack`. It's a thin launcher: a status-bar button / `aGiTrack:` Command Palette command runs the real aGiTrack CLI in a VSCode integrated terminal, so you get the **complete experience** (the agent's native interface, the `Ctrl-G` command menu, sessions, sharing, worktrees, per-turn auto-commits — everything proxy mode does). The TypeScript side isn't built by the Python CI — see its README to build (`npm install && npm run compile`), run it (F5 → "Run Extension"), package a `.vsix` (`npm run package`), or publish to the Marketplace (`npm run publish`, needs the maintainer's publisher token).
-
-`scripts/demo.sh` is a self-contained showcase built on this: it creates a fresh repository in a temporary directory, has the agent write a small program and its tests through aGiTrack, and leaves the repository behind so you can inspect the `<aGiTrack>` commit history or continue interactively.
+`scripts/demo.sh` is a self-contained showcase of scripted mode: it creates a fresh repository in a temporary directory, has the agent write a small program and its tests through aGiTrack, and leaves the repository behind so you can inspect the `<aGiTrack>` commit history or continue interactively.
 
 ```bash
 scripts/demo.sh                      # drive the demo with claude
 scripts/demo.sh --backend opencode   # ... or with opencode
 scripts/demo.sh --model haiku --dir /tmp/agitrack-demo
 ```
+
+### Editor integration
+
+A VSCode extension in [`editors/vscode/`](editors/vscode/) lets you **install aGiTrack as a VSCode plugin and launch it inside VSCode with one click** — without opening a terminal and typing `agitrack` yourself. It's a thin launcher: a brand-icon button in the editor toolbar (or the `aGiTrack:` Command Palette commands) runs the real aGiTrack CLI in a VSCode terminal, so you get the **complete experience** (the agent's native interface, the `Ctrl-G` command menu, sessions, sharing, worktrees, per-turn auto-commits — everything proxy mode does). It also installs the aGiTrack CLI on first use if it's missing, works over Remote-SSH / WSL / containers (running where the code lives), and routes the dashboard to your local browser. The TypeScript side isn't built by the Python CI — see its README to build (`npm install && npm run compile`), run it (F5 → "Run Extension"), package a `.vsix` (`npm run package`), or publish to the Marketplace (`npm run publish`, needs the maintainer's publisher token).
 
 ### Forwarding arguments to the backend
 

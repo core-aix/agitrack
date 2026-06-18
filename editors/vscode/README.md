@@ -37,9 +37,13 @@ to `panel`.
 Running it again focuses the existing session (aGiTrack only allows one per repository).
 **aGiTrack: Restart Session** stops it and starts fresh.
 
-**Closing the session terminal** prompts you to confirm (VSCode's built-in
-"terminate the running process?" for editor terminals), and aGiTrack then **exits
-gracefully** — finalizing and committing the latest turn rather than dropping it.
+**Closing the session terminal** prompts you to confirm, and aGiTrack then **exits
+gracefully** — finalizing and committing the latest turn rather than dropping it. The
+prompt is VSCode's own "terminate the running process?"; since VSCode has no
+per-terminal close hook, the extension makes sure it appears by raising
+`terminal.integrated.confirmOnKill` to `always` when your current setting wouldn't
+prompt for the aGiTrack terminal. Turn this off with `agitrack.confirmTerminalClose:
+false`.
 
 > The session terminal sets `CLAUDE_CODE_IDE_SKIP_AUTO_INSTALL=1` so the Claude Code
 > backend doesn't try to auto-install its own VSCode companion extension here (that

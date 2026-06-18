@@ -346,6 +346,33 @@ def test_resolve_committers_uses_email_login_hint_for_unpushed_commits():
     assert set(labels.values()) == {"octocat (Mona)"}
 
 
+def test_email_login_hint_reaches_filtered_per_committer_panel(tmp_path):
+    # The filter dropdown reads the unfiltered dashboard while the per-committer panel
+    # reads a *filtered* copy; both must carry the email→login hint, or the panel shows
+    # a bare name while the dropdown shows the GitHub ID (the reported mismatch).
+    from agitrack.metrics.collect import build_dashboard
+    from agitrack.metrics.web import _filtered_dashboard, aggregates_payload
+
+    repo = GitRepo.init(tmp_path)
+    (tmp_path / "f.txt").write_text("x", encoding="utf-8")
+    repo.stage_paths(["f.txt"])
+    repo.commit(build_user_commit_message(message="seed", agitrack_session_id="s"))
+
+    dash = build_dashboard(repo, email_logins={_git_email(repo): "octocat"})
+    # The filtered copy keeps the hint…
+    assert _filtered_dashboard(dash, dash.stats).email_logins == dash.email_logins
+    # …so the by-committer panel keys carry the login, matching the filter list.
+    payload = aggregates_payload(dash)
+    committers = set(payload["options"]["committers"])
+    by_committer = set(payload["agg"]["by_committer"])
+    assert by_committer <= committers  # no panel label is missing from the filter list
+    assert any("octocat" in label for label in by_committer)
+
+
+def _git_email(repo) -> str:
+    return repo._run(["git", "config", "user.email"], check=False).stdout.strip().lower()
+
+
 def test_build_server_accepts_email_logins_hint(tmp_path):
     # The hint threads through build_server → handler → build_dashboard without error.
     repo = GitRepo.init(tmp_path)

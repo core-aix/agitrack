@@ -2091,3 +2091,27 @@ def test_opencode_agent_delegates_sharing_to_transcript_module(tmp_path, monkeyp
     assert agent.import_shared_session(tmp_path, "ses_1", "{}", overwrite=True) is True
     assert calls["export"] == (tmp_path, "ses_1")
     assert calls["import"] == (tmp_path, "ses_1", "{}", True)
+
+
+def test_live_session_for_lineage_matches_by_origin_not_backend_id():
+    # A multi-collaborator shared entry carries the LAST sharer's session id, so a
+    # plain id match misses your own copy. _live_session_for_lineage matches by the
+    # recorded shared lineage (origin owner + name) so resuming recognizes it and keeps
+    # the existing session's name instead of minting a new one.
+    from types import SimpleNamespace
+
+    from proxy_helpers import make_runner
+
+    runner = make_runner()
+    runner.sessions = [
+        SimpleNamespace(state=SimpleNamespace(backend_session_id="my-id")),
+        SimpleNamespace(state=SimpleNamespace(backend_session_id="their-id")),
+    ]
+    origins = {
+        "my-id": {"owner": "alice", "name": "feature", "contributors": ["alice", "bob"]},
+    }
+    runner._user_state = lambda: SimpleNamespace(shared_origin=lambda sid: origins.get(sid))
+
+    assert runner._live_session_for_lineage("alice", "feature") == 0
+    assert runner._live_session_for_lineage("alice", "other") is None
+    assert runner._live_session_for_lineage("carol", "feature") is None  # different owner
