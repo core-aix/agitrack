@@ -918,3 +918,50 @@ def test_in_session_apply_failure_records_pending_and_stops_nagging(tmp_path: Pa
     message = (runner.message or "").lower()
     assert "update failed" in message
     assert "pip install --upgrade agitrack" in (runner.message or "")  # manual instructions appended
+
+
+def test_git_runner_forces_non_interactive_ssh(monkeypatch):
+    # The launch-time update check shells out to `git fetch`; over SSH that must never
+    # wait for a passphrase / host-key prompt (which would hang the start). _git forces
+    # GIT_TERMINAL_PROMPT=0 and an ssh BatchMode transport so auth needs fail fast.
+    import agitrack.update.updater as up
+
+    captured: dict = {}
+
+    def fake_run(args, **kw):
+        captured["env"] = kw.get("env", {})
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(up.subprocess, "run", fake_run)
+    up._git(["fetch", "--quiet", "origin"], Path("."), timeout=6)
+
+    assert captured["env"]["GIT_TERMINAL_PROMPT"] == "0"
+    assert "BatchMode=yes" in captured["env"]["GIT_SSH_COMMAND"]
+
+
+def test_git_runner_preserves_user_ssh_command(monkeypatch):
+    import agitrack.update.updater as up
+
+    captured: dict = {}
+    monkeypatch.setenv("GIT_SSH_COMMAND", "ssh -i /my/key")
+    monkeypatch.setattr(
+        up.subprocess,
+        "run",
+        lambda args, **kw: captured.update(env=kw.get("env", {})) or subprocess.CompletedProcess(args, 0, "", ""),
+    )
+    up._git(["fetch"], Path("."), timeout=6)
+    assert captured["env"]["GIT_SSH_COMMAND"] == "ssh -i /my/key -oBatchMode=yes"
+
+
+def test_startup_update_check_skips_cleanly_on_ctrl_c(monkeypatch, capsys):
+    # A slow `git fetch` that the user Ctrl-C's must skip the check and keep launching,
+    # never propagate a KeyboardInterrupt traceback.
+    import agitrack.update as upd
+
+    class _KbUpdater:
+        def check(self, *a, **k):
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr(upd, "Updater", _KbUpdater)
+    cli._check_for_update_at_startup(SimpleNamespace(check_for_updates=True))
+    assert "Skipped the update check" in capsys.readouterr().out
