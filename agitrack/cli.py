@@ -377,6 +377,21 @@ PRIVACY_WARNING = (
 )
 
 
+def _drain_terminal_input() -> None:
+    """Discard any unread bytes in the controlling terminal's input queue (POSIX tty).
+
+    A no-op when stdin isn't a real tty or termios is unavailable. Used before an
+    interactive acknowledgment so input injected into the terminal by something other
+    than the user (an editor's shell integration, a venv-activation hook) can't answer
+    it. Best-effort: never raise."""
+    try:
+        import termios
+
+        termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+    except Exception:
+        pass
+
+
 def _acknowledge_privacy_warning(*, scripted: bool = False, skip: bool = False) -> bool:
     """Show the privacy warning at startup; the user must acknowledge it to
     continue. Without a TTY there is no way to acknowledge, and a scripted run
@@ -392,6 +407,12 @@ def _acknowledge_privacy_warning(*, scripted: bool = False, skip: bool = False) 
     print(PRIVACY_WARNING)
     if scripted or not (sys.stdin.isatty() and sys.stdout.isatty()):
         return True
+    # Discard anything already sitting in the terminal's input queue before reading, so a
+    # stray newline can't auto-acknowledge this. Editors that host aGiTrack in a terminal
+    # (e.g. the VSCode extension) — or their shell-integration / venv-activation hooks —
+    # can inject a command whose trailing Enter would otherwise answer this prompt for the
+    # user. The acknowledgment must be a deliberate keypress, so flush first.
+    _drain_terminal_input()
     try:
         answer = input("Press Enter to acknowledge and continue (q to quit): ").strip().lower()
     except (EOFError, KeyboardInterrupt):

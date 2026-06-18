@@ -630,6 +630,23 @@ def test_privacy_warning_acknowledged_with_enter(monkeypatch, capsys):
     assert "passwords, API keys" in out
 
 
+def test_privacy_warning_drains_stdin_before_reading(monkeypatch):
+    # A stray newline injected into the terminal (e.g. by an editor's shell integration)
+    # must not auto-acknowledge: pending input is flushed BEFORE the prompt reads, so the
+    # acknowledgment stays a deliberate keypress.
+    events: list[str] = []
+    _force_tty(monkeypatch, stdin=True)
+    monkeypatch.setattr(cli, "_drain_terminal_input", lambda: events.append("drain"))
+    monkeypatch.setattr("builtins.input", lambda *a: events.append("input") or "")
+
+    assert cli._acknowledge_privacy_warning() is True
+    assert events == ["drain", "input"]  # drained first, then read
+
+
+def test_drain_terminal_input_never_raises():
+    cli._drain_terminal_input()  # no real tty under pytest; must be a safe no-op
+
+
 def test_privacy_warning_quit_aborts(monkeypatch, capsys):
     _force_tty(monkeypatch, stdin=True)
     monkeypatch.setattr("builtins.input", lambda *a: "q")
