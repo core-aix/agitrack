@@ -36,13 +36,9 @@ const terminals = new Map<string, vscode.Terminal>();
 // lock), so it can run alongside a session.
 const dashboards = new Map<string, vscode.Terminal>();
 
-// Folders whose session terminal is being disposed for a user-initiated restart,
-// not a real close — recovery is skipped so it doesn't race the relaunch for the
-// repo lock (a held lock would make the new instance think aGiTrack is running).
-const restartingFolders = new Set<string>();
-// True once deactivate() begins (window close / reload): the close handler then
-// skips its own recovery because deactivate() runs it detached so it survives.
-let deactivating = false;
+// Terminals we created, so the split-terminal handler never disposes our own
+// terminals (it fires for every opened terminal, including ours).
+const ourTerminals = new WeakSet<vscode.Terminal>();
 
 export function activate(context: vscode.ExtensionContext): void {
   extensionContext = context;
@@ -54,28 +50,20 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("agitrack.install", () => installAgitrack()),
   );
 
-  // Forget terminals the user closes so the next launch starts a fresh one — and
-  // for a session, finalize anything an abrupt close left behind (the Extension
-  // Host outlives the terminal, so it can run recovery with no time pressure).
+  // Forget terminals the user closes so the next launch starts a fresh one. We do
+  // NOT run recovery here: while the window is open, closing a session's terminal
+  // delivers SIGHUP and aGiTrack finalizes itself (it has time — the host isn't
+  // going away). Recovery is only a backstop for a whole-window close, run detached
+  // from deactivate(); running it on every terminal close would grab the repo lock
+  // and block an immediate relaunch.
   context.subscriptions.push(
     vscode.window.onDidCloseTerminal((closed) => {
-      for (const [key, terminal] of dashboards) {
-        if (terminal === closed) {
-          dashboards.delete(key);
+      for (const map of [terminals, dashboards]) {
+        for (const [key, terminal] of map) {
+          if (terminal === closed) {
+            map.delete(key);
+          }
         }
-      }
-      for (const [key, terminal] of terminals) {
-        if (terminal !== closed) {
-          continue;
-        }
-        terminals.delete(key);
-        if (restartingFolders.delete(key)) {
-          continue; // a relaunch is coming; don't grab the lock out from under it
-        }
-        if (deactivating) {
-          continue; // window closing — deactivate() runs recovery detached instead
-        }
-        runRecovery(key, { detached: false });
       }
     }),
   );
@@ -87,6 +75,9 @@ export function activate(context: vscode.ExtensionContext): void {
   // off one WE created — never the user's own new terminals.
   context.subscriptions.push(
     vscode.window.onDidOpenTerminal((opened) => {
+      if (ourTerminals.has(opened)) {
+        return; // a terminal we launched — never dispose our own
+      }
       const parent = splitParentOf(opened);
       if (!parent || !isAgitrackTerminal(parent)) {
         return;
@@ -116,7 +107,6 @@ export function deactivate(): Thenable<void> {
   // disappear, up to a generous budget; then, as a backstop, kick off a DETACHED
   // `agitrack --recover` that outlives this extension host and finishes any work
   // the graceful exit couldn't (it no-ops if aGiTrack already exited cleanly).
-  deactivating = true;
   return shutdownSessionsGracefully(60_000);
 }
 
@@ -185,21 +175,6 @@ function readAgitrackPid(folderPath: string): number | undefined {
   }
 }
 
-/** Find a surviving aGiTrack terminal for `folder` to reattach to when our map lost it
- * (e.g. after an extension reload). Gated on a live repo-lock PID so we only reattach
- * when a session is genuinely running in that folder — never to an unrelated terminal. */
-function findAgitrackTerminal(folder: vscode.WorkspaceFolder): vscode.Terminal | undefined {
-  const pid = readAgitrackPid(folder.uri.fsPath);
-  if (!pid || !isAlive(pid)) {
-    return undefined; // no live session here — let a fresh one start
-  }
-  const named = `${TERMINAL_NAME} (${folder.name})`;
-  return (
-    vscode.window.terminals.find((t) => t.name === named) ??
-    vscode.window.terminals.find((t) => t.name === TERMINAL_NAME)
-  );
-}
-
 /** The terminal a newly-opened terminal was split from, if any. VSCode records it in
  * creationOptions.location as a TerminalSplitLocationOptions ({ parentTerminal }); for a
  * non-split terminal the location is a plain enum/editor-location with no parent. */
@@ -262,16 +237,10 @@ async function startSession(targetUri?: vscode.Uri): Promise<void> {
   }
 
   const key = folder.uri.fsPath;
-  // Never start a second session in a folder that already has one — just bring the
-  // existing terminal forward, so a still-running job is never interrupted/restarted.
-  // Reattach to a surviving terminal even if our map lost it (e.g. an extension reload
-  // cleared the map but VSCode kept the terminal), and confirm a session is actually
-  // running there via the repo lock before reusing it.
-  const existing = terminals.get(key) ?? findAgitrackTerminal(folder);
+  const existing = terminals.get(key);
   if (existing) {
-    terminals.set(key, existing);
     existing.show();
-    return;
+    return; // aGiTrack already has a terminal here — bring it forward, never restart it.
   }
 
   const exe = await ensureCliAvailable();
@@ -349,9 +318,6 @@ async function restartSession(): Promise<void> {
   if (!folder) {
     return;
   }
-  // Mark this a restart so the close handler doesn't fire recovery and race the
-  // relaunch for the repo lock.
-  restartingFolders.add(folder.uri.fsPath);
   terminals.get(folder.uri.fsPath)?.dispose();
   terminals.delete(folder.uri.fsPath);
   // Give aGiTrack a moment to release its repo lock before relaunching.
@@ -408,6 +374,7 @@ function spawnAgitrackTerminal(opts: { name: string; cwd: string; icon: string; 
       CLAUDE_CODE_IDE_SKIP_AUTO_INSTALL: "1",
     },
   });
+  ourTerminals.add(terminal); // mark before onDidOpenTerminal fires, so we never self-dispose
   void runWhenShellReady(terminal, opts.command);
   return terminal;
 }
@@ -595,6 +562,7 @@ async function installAgitrack(): Promise<string | undefined> {
     );
     if (pick) {
       const terminal = vscode.window.createTerminal({ name: "Install aGiTrack" });
+      ourTerminals.add(terminal);
       terminal.show();
       terminal.sendText([plan.cmd, ...plan.args].map(quote).join(" "));
     }

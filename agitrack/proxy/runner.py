@@ -2747,7 +2747,9 @@ class ProxyRunner:
             # --delay-merge this is the confirm point for reviewed changes; otherwise
             # it surfaces leftover commits (e.g. from a session resumed at startup).
             base = self._base_branch or "the base branch"
-            label = "✓ Merge reviewed changes into " if self._delay_merge else "✓ Integrate this session's commits into "
+            label = (
+                "✓ Merge reviewed changes into " if self._delay_merge else "✓ Integrate this session's commits into "
+            )
             options.append(label + base)
             actions.append(("integrate-active", None))
         shared_ids = self._my_shared_session_ids()  # mark which sessions are shared (#55)
