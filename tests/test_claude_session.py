@@ -25,6 +25,53 @@ def test_session_cwd_reads_last_recorded_cwd(monkeypatch, tmp_path):
     assert claude_session.session_cwd("missing") is None
 
 
+def test_retarget_session_cwd_rewrites_recorded_cwd(monkeypatch, tmp_path):
+    # Resuming under a new launch dir (e.g. --no-worktree on the repo root) must
+    # rewrite the transcript's recorded cwd so Claude's --resume doesn't restore an
+    # old worktree directory.
+    config = tmp_path / "config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    repo = tmp_path / "repo"
+    proj = config / "projects" / claude_session._encode_repo(repo)
+    proj.mkdir(parents=True)
+    (proj / "s.jsonl").write_text(
+        '{"type":"user","cwd":"/old/worktree","sessionId":"s"}\n{"type":"assistant","cwd":"/old/worktree"}\n',
+        encoding="utf-8",
+    )
+
+    assert claude_session.retarget_session_cwd(repo, "s", str(repo)) is True
+    body = (proj / "s.jsonl").read_text(encoding="utf-8")
+    assert "/old/worktree" not in body
+    assert str(repo) in body
+    assert claude_session.session_cwd("s") == str(repo)
+    # Idempotent: a second call (already aligned) makes no change.
+    assert claude_session.retarget_session_cwd(repo, "s", str(repo)) is False
+    # Missing transcript → no-op.
+    assert claude_session.retarget_session_cwd(repo, "missing", str(repo)) is False
+
+
+def test_retarget_session_cwd_breaks_hardlink_to_other_copy(monkeypatch, tmp_path):
+    # Retargeting must not mutate another (hardlinked) copy of the same transcript —
+    # the two diverge because they now run in different directories.
+    import os
+
+    config = tmp_path / "config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    repo = tmp_path / "repo"
+    other = tmp_path / "worktree"
+    repo_proj = config / "projects" / claude_session._encode_repo(repo)
+    other_proj = config / "projects" / claude_session._encode_repo(other)
+    repo_proj.mkdir(parents=True)
+    other_proj.mkdir(parents=True)
+    (other_proj / "s.jsonl").write_text('{"type":"user","cwd":"/old/worktree"}\n', encoding="utf-8")
+    os.link(other_proj / "s.jsonl", repo_proj / "s.jsonl")  # share one inode
+
+    assert claude_session.retarget_session_cwd(repo, "s", str(repo)) is True
+    assert str(repo) in (repo_proj / "s.jsonl").read_text(encoding="utf-8")
+    # The other copy is untouched (hardlink was broken before the rewrite).
+    assert (other_proj / "s.jsonl").read_text(encoding="utf-8") == '{"type":"user","cwd":"/old/worktree"}\n'
+
+
 def test_session_cwd_since_ignores_stale_pre_launch_rows(monkeypatch, tmp_path):
     # #72: with `since`, only rows recorded at/after the current launch count, so
     # a stale cwd left by a resume/import doesn't read as drift.

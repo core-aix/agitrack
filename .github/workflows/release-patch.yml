@@ -16,6 +16,12 @@ jobs:
     # not trigger workflows, so this is also belt-and-suspenders against a loop.)
     if: github.event.head_commit.author.name != 'github-actions[bot]'
 
+    env:
+      # Set this repository secret to a Marketplace Personal Access Token to have the
+      # VSCode extension published automatically on each release. When it's absent the
+      # publish step is skipped (the rest of the release still runs).
+      VSCE_TOKEN: ${{ secrets.VSCE_TOKEN }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -52,6 +58,8 @@ jobs:
           # from the installed distribution metadata at runtime.
           print(f"version={new_version}")
           PY
+          # Keep the VSCode extension version in lockstep with the CLI.
+          python3 scripts/sync_vscode_version.py
 
       - name: Open and merge the version-bump PR
         env:
@@ -62,7 +70,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git switch -c "$BRANCH"
-          git add pyproject.toml
+          git add pyproject.toml editors/vscode/package.json editors/vscode/package-lock.json
           git commit -m "Release v${VERSION}"
           git push origin "$BRANCH"
           gh pr create --base main --head "$BRANCH" \
@@ -106,3 +114,19 @@ jobs:
             --target main \
             --generate-notes \
             dist/*
+
+      # Publish the VSCode extension to the Marketplace at the matching version, so a
+      # CLI release and its extension move together. Skipped when VSCE_TOKEN is unset.
+      - name: Set up Node
+        if: ${{ env.VSCE_TOKEN != '' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Publish VSCode extension
+        if: ${{ env.VSCE_TOKEN != '' }}
+        working-directory: editors/vscode
+        run: |
+          npm install --no-audit --no-fund
+          npm run compile
+          npx --yes @vscode/vsce publish --no-dependencies -p "$VSCE_TOKEN"

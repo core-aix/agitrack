@@ -308,8 +308,8 @@ def test_proxy_shift_modified_menu_key_split_across_reads():
     assert forwarded2 == []  # Still buffering, haven't completed yet
 
     # Send the command
-    forwarded3, _, command3, _ = parser.feed(b"session\r")
-    assert command3 == "session"
+    forwarded3, _, command3, _ = parser.feed(b"sessions\r")
+    assert command3 == "sessions"
 
 
 def test_proxy_shift_modified_menu_key_non_match_forwards():
@@ -325,10 +325,10 @@ def test_proxy_shift_modified_menu_key_non_match_forwards():
 
 
 def test_proxy_s_jumps_to_session():
-    # Only "session" starts with "s", so s+Enter selects it directly.
+    # Only "sessions" starts with "s", so s+Enter selects it directly.
     parser = ProxyInput()
     _f, _e, command, _x = parser.feed(b"\x07s\r")
-    assert command == "session"
+    assert command == "sessions"
 
 
 def test_proxy_forwards_colon_at_line_start():
@@ -534,6 +534,375 @@ def test_full_agent_messages_flag_records_all_messages(tmp_path):
     assert committed is True
     assert "On it." in runner.repo.message
     assert runner.repo.message.count("## Agent") == 2
+
+
+def test_delay_merge_defers_integration_and_names_working_dir(tmp_path):
+    import types
+
+    runner = make_runner()
+    runner._delay_merge = True
+    runner._exiting = False
+    runner.worktree = types.SimpleNamespace(name="s", path=tmp_path)
+    runner.repo = types.SimpleNamespace(repo=tmp_path)
+    runner._base_branch = "main"
+    runner._active_has_pending = lambda: True
+    runner._menu_label = lambda: "Ctrl-G"
+    integrated: list = []
+    runner._integrate_turn_or_conflict = lambda: integrated.append(True) or "integrated"
+    msgs: list[str] = []
+    runner._set_message = lambda m, **k: msgs.append(m)
+    runner._render = lambda *a, **k: None
+
+    runner._integrate_session_turn()
+
+    assert integrated == []  # deferred, not merged
+    # The notice names the working directory (the worktree) so the user can find it.
+    assert any(str(tmp_path) in m and "not merged" in m for m in msgs)
+
+
+def test_delay_merge_off_integrates_immediately(tmp_path):
+    import types
+
+    runner = make_runner()
+    runner._delay_merge = False
+    runner._exiting = False
+    runner.worktree = types.SimpleNamespace(name="s", path=tmp_path)
+    runner.repo = types.SimpleNamespace(repo=tmp_path)
+    runner._base_branch = "main"
+    integrated: list = []
+    runner._integrate_turn_or_conflict = lambda: integrated.append(True) or "integrated"
+
+    runner._integrate_session_turn()
+
+    assert integrated == [True]  # merged right away (default behavior unchanged)
+
+
+def _delay_menu_runner(tmp_path):
+    import types
+
+    runner = make_runner()
+    runner._delay_merge = True
+    runner.merge_ctx = None
+    runner.worktree = types.SimpleNamespace(name="s", path=tmp_path)
+    runner.repo = types.SimpleNamespace(repo=tmp_path, merge_in_progress=lambda: False)
+    runner._base_branch = "main"
+    runner._active_has_pending = lambda: True
+    runner.sessions = []
+    runner._my_shared_session_ids = lambda: set()
+    runner._dormant_worktrees = lambda names: []
+    runner._resumable_sessions = lambda: []
+    runner.backend = types.SimpleNamespace(supports_session_sharing=False, name="claude")
+    runner._use_worktrees = True
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda *a, **k: None
+    return runner
+
+
+# --- Ctrl-G "merge": rescue un-integrated worktrees into a chosen branch -----------
+
+
+def test_proxy_input_matches_puts_extra_commands_first():
+    from agitrack.proxy.runner import ProxyInput
+
+    inp = ProxyInput()
+    inp.extra_commands = ["merge"]
+    assert inp.matches()[0] == "merge"  # surfaced at the very top
+    assert "sessions" in inp.matches()
+    inp.extra_commands = []
+    assert inp.matches()[0] == "sessions"  # default order unchanged when nothing extra
+
+
+def _merge_runner(tmp_path):
+    import types
+
+    runner = make_runner()
+    runner.merge_ctx = None
+    runner.agent_in_flight = False
+    runner.worktree = types.SimpleNamespace(name="s", path=tmp_path)
+    runner.repo = types.SimpleNamespace(
+        repo=tmp_path,
+        has_tracked_changes=lambda: False,
+        untracked_files=lambda: [],
+        current_branch=lambda: "agit/x",
+    )
+    runner.state = types.SimpleNamespace(declined_untracked=lambda: [])
+    runner.name = "feature"
+    runner._base_branch = "session-base"
+    runner._repo_dir_branch = "main"
+    runner._active_has_pending = lambda: True
+    runner.sessions = []
+    runner._dormant_worktrees = lambda live: []
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda *a, **k: None
+    return runner
+
+
+def test_has_unmerged_work_true_when_active_has_pending(tmp_path):
+    runner = _merge_runner(tmp_path)
+    assert runner._unmerged_worktrees() == [("feature (current session)", "")]
+    assert runner._has_unmerged_work() is True
+
+
+def test_has_unmerged_work_false_when_nothing_pending(tmp_path):
+    runner = _merge_runner(tmp_path)
+    runner._active_has_pending = lambda: False
+    assert runner._has_unmerged_work() is False
+
+
+def test_unmerged_includes_active_with_only_uncommitted_changes(tmp_path):
+    # No committed-but-unmerged commits, but the worktree has uncommitted edits — still
+    # offered (and committed before merging), so the work isn't stranded.
+    runner = _merge_runner(tmp_path)
+    runner._active_has_pending = lambda: False
+    runner.repo.has_tracked_changes = lambda: True
+    assert runner._unmerged_worktrees() == [("feature (current session)", "")]
+
+
+def test_unmerged_excludes_active_while_agent_running(tmp_path):
+    # Mid-turn uncommitted changes are expected and auto-committed, so don't nag then.
+    runner = _merge_runner(tmp_path)
+    runner.agent_in_flight = True
+    runner.repo.has_tracked_changes = lambda: True
+    assert runner._unmerged_worktrees() == []
+
+
+def test_committable_changes_ignores_declined_untracked(tmp_path):
+    runner = _merge_runner(tmp_path)
+    runner.repo.has_tracked_changes = lambda: False
+    runner.repo.untracked_files = lambda: ["a.py"]
+    runner.state.declined_untracked = lambda: ["a.py"]  # intentionally unstaged -> not committable
+    assert runner._active_has_committable_changes() is False
+    runner.state.declined_untracked = lambda: []
+    assert runner._active_has_committable_changes() is True
+
+
+def test_merge_active_commits_uncommitted_before_integrating(tmp_path):
+    runner = _merge_runner(tmp_path)
+    runner.repo.has_tracked_changes = lambda: True  # uncommitted work present
+    order: list = []
+    runner._commit_latest_turn_sync = lambda: order.append("commit")
+    runner._integrate_active_session = lambda: order.append("integrate")
+
+    runner._merge_active_into("release")
+
+    assert order == ["commit", "integrate"]  # commit FIRST, then merge
+    assert runner._base_branch == "release"
+
+
+def test_active_has_mergeable_work_excludes_in_flight_turn(tmp_path):
+    runner = _merge_runner(tmp_path)  # _active_has_pending True
+    assert runner._active_has_mergeable_work() is True
+    runner.agent_in_flight = True
+    assert runner._active_has_mergeable_work() is False  # mid-turn: not "stranded"
+
+
+def test_select_current_session_integrates_when_there_is_work(tmp_path):
+    # Picking the session you're already in, with work to merge, runs the integrate
+    # (commit/merge messages pop up) rather than the confusing "nothing to integrate".
+    runner = _merge_runner(tmp_path)  # _active_has_pending True
+    merged: list = []
+    runner._merge_active_into = lambda target: merged.append(target)
+
+    runner._select_current_session()
+
+    assert merged == ["session-base"]  # integrates into the session's own merge branch
+
+
+def test_select_current_session_acknowledges_when_nothing_to_merge(tmp_path):
+    runner = _merge_runner(tmp_path)
+    runner._active_has_pending = lambda: False
+    runner.repo.has_tracked_changes = lambda: False
+    runner.repo.untracked_files = lambda: []
+    messages: list = []
+    runner._set_message = lambda message, **kwargs: messages.append(message)
+
+    runner._select_current_session()
+
+    assert messages and "Already in session 'feature'" in messages[0]
+    assert "nothing to integrate" not in messages[0]
+
+
+def test_merge_command_merges_single_item_into_chosen_target(tmp_path):
+    runner = _merge_runner(tmp_path)
+    runner._choose_merge_target = lambda name: "release"
+    merged: list = []
+    runner._merge_active_into = lambda target: merged.append(target)
+
+    runner._handle_merge_command()
+
+    assert merged == ["release"]  # one unmerged worktree -> straight to target choice + merge
+
+
+def test_choose_merge_target_offers_current_session_and_custom(tmp_path):
+    runner = _merge_runner(tmp_path)
+    seen: list = []
+    runner._select_popup = lambda title, options: seen.append(options) or None  # cancel after building
+
+    assert runner._choose_merge_target("") is None  # cancelled
+    options = seen[0]
+    assert any("Current branch (main)" in opt for opt in options)
+    assert any("Session's branch (session-base)" in opt for opt in options)
+    assert any("different branch" in opt for opt in options)
+
+
+def test_choose_merge_target_custom_prompts_for_any_branch(tmp_path):
+    runner = _merge_runner(tmp_path)
+    runner._select_popup = lambda title, options: next(o for o in options if "different branch" in o)
+    runner._prompt_merge_branch = lambda title, current: "hotfix"
+
+    assert runner._choose_merge_target("") == "hotfix"
+
+
+def test_merge_active_into_retargets_base_then_integrates(tmp_path):
+    runner = _merge_runner(tmp_path)
+    integrated: list = []
+    runner._integrate_active_session = lambda: integrated.append(runner._base_branch)
+
+    runner._merge_active_into("release")
+
+    assert runner._base_branch == "release"  # re-pointed to the chosen destination
+    assert integrated == ["release"]  # then integrated into it (handles conflict via that path)
+
+
+def test_delay_merge_menu_offers_merge_entry(tmp_path):
+    runner = _delay_menu_runner(tmp_path)
+    seen: list = []
+    runner._select_popup = lambda title, options: seen.append(options) or None  # cancel after building
+
+    runner._session_menu()
+
+    assert any("Merge reviewed changes into main" in opt for opt in seen[0])
+
+
+def test_delay_merge_menu_choice_integrates(tmp_path):
+    runner = _delay_menu_runner(tmp_path)
+    runner._select_popup = lambda title, options: next(o for o in options if "Merge reviewed changes" in o)
+    called: list = []
+    runner._integrate_active_session = lambda: called.append(True)
+
+    runner._session_menu()
+
+    assert called == [True]
+
+
+def test_session_menu_offers_explicit_integrate_when_active_has_pending(tmp_path):
+    # Even outside --delay-merge, a session resumed with un-integrated commits gets an
+    # explicit, discoverable "Integrate this session's commits" entry (not just the
+    # non-obvious "re-select the current session" path).
+    runner = _delay_menu_runner(tmp_path)
+    runner._delay_merge = False
+    seen: list = []
+    runner._select_popup = lambda title, options: seen.append(options) or None
+
+    runner._session_menu()
+
+    assert any("Integrate this session's commits into main" in opt for opt in seen[0])
+
+
+def test_session_menu_explicit_integrate_choice_integrates(tmp_path):
+    runner = _delay_menu_runner(tmp_path)
+    runner._delay_merge = False
+    runner._select_popup = lambda title, options: next(o for o in options if "Integrate this session's commits" in o)
+    called: list = []
+    runner._integrate_active_session = lambda: called.append(True)
+
+    runner._session_menu()
+
+    assert called == [True]
+
+
+def _copy_runner(tmp_path, status):
+    import types
+
+    base = tmp_path / "base"
+    wt = tmp_path / "wt"
+    base.mkdir()
+    wt.mkdir()
+    runner = make_runner()
+    runner.base_repo = types.SimpleNamespace(repo=base)
+    runner.repo = types.SimpleNamespace(repo=wt, status_short=lambda: status)
+    runner.worktree = types.SimpleNamespace(name="s", path=wt)
+    msgs: list[str] = []
+    runner._set_message = lambda m, **k: msgs.append(m)
+    runner._render = lambda *a, **k: None
+    return runner, base, wt, msgs
+
+
+def test_offer_copy_unstaged_copies_on_consent(tmp_path):
+    runner, base, wt, _ = _copy_runner(tmp_path, "?? new.txt\n")
+    (wt / "new.txt").write_text("hello\n")
+    runner._select_popup = lambda *a, **k: "Yes, copy to the base repo"
+
+    runner._offer_copy_unstaged_to_base()
+
+    assert (base / "new.txt").read_text() == "hello\n"
+
+
+def test_offer_copy_unstaged_declined_leaves_files_and_notifies(tmp_path):
+    runner, base, wt, msgs = _copy_runner(tmp_path, "?? keep.txt\n")
+    (wt / "keep.txt").write_text("x\n")
+    runner._select_popup = lambda *a, **k: "No, leave them in the worktree"
+
+    runner._offer_copy_unstaged_to_base()
+
+    assert not (base / "keep.txt").exists()
+    assert any("remain in this session's worktree" in m and str(wt) in m for m in msgs)
+
+    # An unchanged file is not prompted again.
+    prompted: list = []
+    runner._select_popup = lambda *a, **k: prompted.append(a) or None
+    runner._offer_copy_unstaged_to_base()
+    assert prompted == []
+
+
+def test_offer_copy_unstaged_overwrite_declined_keeps_base(tmp_path):
+    runner, base, wt, msgs = _copy_runner(tmp_path, "?? dup.txt\n")
+    (wt / "dup.txt").write_text("new\n")
+    (base / "dup.txt").write_text("old\n")
+    answers = iter(["Yes, copy to the base repo", "No, keep the base version"])
+    runner._select_popup = lambda *a, **k: next(answers)
+
+    runner._offer_copy_unstaged_to_base()
+
+    assert (base / "dup.txt").read_text() == "old\n"  # not overwritten
+    assert any("remain in this session's worktree" in m for m in msgs)
+
+
+def test_offer_copy_unstaged_overwrite_confirmed(tmp_path):
+    runner, base, wt, _ = _copy_runner(tmp_path, "?? dup.txt\n")
+    (wt / "dup.txt").write_text("new\n")
+    (base / "dup.txt").write_text("old\n")
+    answers = iter(["Yes, copy to the base repo", "Yes, overwrite"])
+    runner._select_popup = lambda *a, **k: next(answers)
+
+    runner._offer_copy_unstaged_to_base()
+
+    assert (base / "dup.txt").read_text() == "new\n"  # overwritten
+
+
+def test_offer_copy_unstaged_noop_without_worktree(tmp_path):
+    runner, base, wt, _ = _copy_runner(tmp_path, "?? x.txt\n")
+    runner.worktree = None  # no-worktree mode: nothing to copy
+    prompted: list = []
+    runner._select_popup = lambda *a, **k: prompted.append(a) or None
+    runner._offer_copy_unstaged_to_base()
+    assert prompted == []
+
+
+def test_stage_backend_resume_retargets_cwd_to_launch_dir(tmp_path):
+    # After staging a resume, the transcript's cwd is realigned to the launch dir
+    # (self.repo.repo), so Claude --resume can't restore an old worktree directory.
+    import types
+
+    runner = make_runner()
+    runner.repo = types.SimpleNamespace(repo=tmp_path)
+    calls = {}
+    runner.backend = types.SimpleNamespace(
+        ensure_resumable=lambda repo, sid: True,
+        retarget_working_dir=lambda repo, sid, cwd: calls.update(repo=repo, sid=sid, cwd=cwd) or True,
+    )
+    runner._stage_backend_resume("sid-1")
+    assert calls == {"repo": tmp_path, "sid": "sid-1", "cwd": str(tmp_path)}
 
 
 class _CancelRepo:
@@ -2978,6 +3347,27 @@ def test_next_session_name_is_a_word_avoiding_taken_names():
     assert name not in {"maple", "willow"} | runner._taken_session_names()
 
 
+def test_new_session_prompts_for_name_not_inheriting_prior(tmp_path):
+    # --new-session (resume_id is None) starts a fresh conversation, so it must
+    # PROMPT for a new name rather than silently inheriting the prior session's
+    # worktree name.
+    runner = make_runner(state=AgitrackState(tmp_path), verbose=False)
+    runner._prompt_startup_name = lambda continuing: "newname"
+    name = runner._resolve_startup_session_name(runner.state, None, "willow")
+    assert name == "newname"
+
+
+def test_resume_inherits_prior_session_name_without_prompting(tmp_path):
+    # Resuming a conversation (resume_id set) keeps its prior worktree name and
+    # does NOT prompt.
+    runner = make_runner(state=AgitrackState(tmp_path), verbose=False)
+    prompted = []
+    runner._prompt_startup_name = lambda continuing: prompted.append(True) or "unused"
+    name = runner._resolve_startup_session_name(runner.state, "ses-1", "willow")
+    assert name == "willow"
+    assert prompted == []
+
+
 def test_startup_default_name_is_a_word_not_session_1():
     from agitrack.proxy.session_names import SESSION_WORDS
 
@@ -5200,7 +5590,7 @@ def test_spawn_failed_exec_child_exits_with_127(tmp_path):
         worktree=None,
         backend=types.SimpleNamespace(
             new_session_id=lambda: "ses-1",
-            spawn_command=lambda repo, session_id, resume, commit_guidance=True: [
+            spawn_command=lambda repo, session_id, resume, commit_guidance=True, use_worktrees=True: [
                 "agit-test-binary-that-does-not-exist"
             ],
             list_sessions=lambda repo: [],
@@ -6143,6 +6533,69 @@ def test_rename_forks_shared_lineage(tmp_path):
     # A purely local session (no origin) is a no-op (and never errors).
     runner._fork_lineage_on_rename("sid-local")
     assert AgitrackState(tmp_path).shared_origin("sid-local") is None
+
+
+def _make_rename_runner(tmp_path, *, origin):
+    import subprocess
+    import types
+
+    from agitrack.config import AgitrackState
+
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.email", "t@t"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.name", "t"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-q", "--allow-empty", "-m", "x"], check=True)
+
+    runner = make_runner(name="oldname")
+    runner.global_config = types.SimpleNamespace(default_backend="claude")
+    runner.sessions = [runner.active]
+    runner._use_worktrees = True
+    runner._session_name = lambda i: "oldname"
+    runner._session_name_taken = lambda n: False
+    runner._switch_active = lambda i: None
+    runner.worktree = types.SimpleNamespace(name="oldname", path=tmp_path)
+    st = AgitrackState(tmp_path)
+    st.backend_session_id = "sid-1"
+    runner.state = st
+    new_info = types.SimpleNamespace(name="newname", path=tmp_path)
+    runner._worktrees = lambda: types.SimpleNamespace(move=lambda old, new: new_info)
+    for method in (
+        "_stop_file_watcher",
+        "_teardown_child",
+        "_init_screen",
+        "_spawn",
+        "_resize_child",
+        "_enable_host_mouse",
+        "_start_file_watcher",
+        "_reset_agent_tracking",
+        "_sanitize_state_trace",
+        "_initialize_session_baseline",
+        "_render",
+        "_stage_backend_resume",
+        "_persist_session_name",
+        "_fork_lineage_on_rename",
+    ):
+        setattr(runner, method, lambda *a, **k: None)
+    runner._turn_from_branch = lambda b: 0
+    runner._user_state = lambda: types.SimpleNamespace(shared_origin=lambda sid: origin if sid == "sid-1" else None)
+    msgs: list[str] = []
+    runner._set_message = lambda m, **k: msgs.append(m)
+    return runner, msgs
+
+
+def test_rename_shared_session_warns_it_becomes_a_separate_copy(tmp_path):
+    # Renaming a session that tracked a shared lineage warns that a later share now
+    # creates a NEW shared session rather than updating the original.
+    runner, msgs = _make_rename_runner(tmp_path, origin={"owner": "alice", "name": "x", "contributors": ["alice"]})
+    runner._rename_session(0, "newname")
+    assert any("separate copy" in m and "NEW shared session" in m for m in msgs)
+
+
+def test_rename_unshared_session_uses_plain_message(tmp_path):
+    # A session with no shared lineage gets the plain rename confirmation.
+    runner, msgs = _make_rename_runner(tmp_path, origin=None)
+    runner._rename_session(0, "newname")
+    assert msgs and msgs[-1] == "Renamed session to 'newname'."
 
 
 def test_rename_session_rejects_taken_name_without_moving():

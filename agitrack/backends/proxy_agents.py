@@ -13,12 +13,34 @@ from agitrack.transcripts import ExportedSession, SessionRef
 # an agent committing on its own duplicates work and breaks the per-turn token/line
 # accounting the commits carry. The note keeps the agent's normal behaviour but stops it
 # from self-committing — unless the user explicitly asks it to.
-AGENT_SYSTEM_NOTE = (
+_NOTE_INTRO = (
     "This coding session runs inside aGiTrack, which automatically creates a git commit for "
     "your changes after each turn. Do NOT create git commits yourself (do not run `git commit`) "
     "unless the user explicitly asks you to commit — aGiTrack handles version control for this "
-    "session. Otherwise work exactly as normal."
+    "session."
 )
+# Included only in the default worktree model: aGiTrack runs the session in a git worktree
+# under .agitrack/ and merges it into the current branch. Omitted under --no-worktree (and
+# in shell mode), where the agent edits the current branch directly.
+_NOTE_WORKTREE = (
+    " aGiTrack runs this session in a git worktree under `.agitrack/` and automatically merges "
+    "your changes from there into the current branch, so you do not need to create, merge, or "
+    "clean up anything under `.agitrack/`."
+)
+_NOTE_OUTRO = " Otherwise work exactly as normal."
+
+
+def agent_system_note(*, use_worktrees: bool) -> str:
+    """The text appended to the coding agent's system prompt. Tells the agent aGiTrack
+    auto-commits (so it doesn't self-commit); adds the worktree-merge explanation only
+    when aGiTrack actually runs in a worktree (the default model), not under
+    --no-worktree or in shell mode."""
+    return _NOTE_INTRO + (_NOTE_WORKTREE if use_worktrees else "") + _NOTE_OUTRO
+
+
+# The note for the default (worktree) model. Kept as a constant for back-compat and the
+# common case; the no-worktree variant is built via ``agent_system_note``.
+AGENT_SYSTEM_NOTE = agent_system_note(use_worktrees=True)
 
 
 class ProxyAgent(Protocol):
@@ -65,12 +87,19 @@ class ProxyAgent(Protocol):
         the backend can't re-id an imported session."""
 
     def spawn_command(
-        self, repo: Path, *, session_id: str | None, resume: bool, commit_guidance: bool = True
+        self,
+        repo: Path,
+        *,
+        session_id: str | None,
+        resume: bool,
+        commit_guidance: bool = True,
+        use_worktrees: bool = True,
     ) -> list[str]: ...
 
     # ``commit_guidance``: when True (default) and the backend CLI supports appending to its
-    # system prompt, append :data:`AGENT_SYSTEM_NOTE` so the coding agent doesn't self-commit.
-    # Disabled per-run by --no-commit-guidance.
+    # system prompt, append the agent note (see :func:`agent_system_note`) so the coding agent
+    # doesn't self-commit. Disabled per-run by --no-commit-guidance. ``use_worktrees`` selects
+    # the note variant: the worktree-merge clause is added only in the default worktree model.
 
     def session_belongs_to_repo(self, repo: Path, session_id: str) -> bool: ...
 
@@ -139,10 +168,16 @@ class OpenCodeProxyAgent:
         return "ses_" + uuid.uuid4().hex
 
     def spawn_command(
-        self, repo: Path, *, session_id: str | None, resume: bool, commit_guidance: bool = True
+        self,
+        repo: Path,
+        *,
+        session_id: str | None,
+        resume: bool,
+        commit_guidance: bool = True,
+        use_worktrees: bool = True,
     ) -> list[str]:
-        # ``commit_guidance`` is accepted for a uniform interface but unused: OpenCode's
-        # interactive TUI has no flag to append to its system prompt.
+        # ``commit_guidance``/``use_worktrees`` are accepted for a uniform interface but
+        # unused: OpenCode's interactive TUI has no flag to append to its system prompt.
         command = ["opencode"]
         if resume and session_id:
             command.extend(["--session", session_id])
@@ -208,7 +243,13 @@ class ClaudeProxyAgent:
         return str(uuid.uuid4())
 
     def spawn_command(
-        self, repo: Path, *, session_id: str | None, resume: bool, commit_guidance: bool = True
+        self,
+        repo: Path,
+        *,
+        session_id: str | None,
+        resume: bool,
+        commit_guidance: bool = True,
+        use_worktrees: bool = True,
     ) -> list[str]:
         if resume and session_id:
             command = ["claude", "--resume", session_id]
@@ -217,9 +258,10 @@ class ClaudeProxyAgent:
         else:
             command = ["claude"]
         # Tell the coding agent that aGiTrack auto-commits, so it doesn't self-commit (Claude
-        # supports appending to its system prompt). Skipped when commit_guidance is off.
+        # supports appending to its system prompt). Skipped when commit_guidance is off. The
+        # note's worktree clause is included only in the worktree model.
         if commit_guidance:
-            command.extend(["--append-system-prompt", AGENT_SYSTEM_NOTE])
+            command.extend(["--append-system-prompt", agent_system_note(use_worktrees=use_worktrees)])
         return command
 
     def session_belongs_to_repo(self, repo: Path, session_id: str) -> bool:
@@ -233,6 +275,12 @@ class ClaudeProxyAgent:
 
     def recorded_working_dir(self, session_id: str, *, since: float | None = None) -> str | None:
         return claude_session.session_cwd(session_id, since=since)
+
+    def retarget_working_dir(self, repo: Path, session_id: str, cwd: str) -> bool:
+        # Align a resumed session's recorded cwd with the launch dir so Claude's
+        # `--resume` doesn't restore an old worktree directory (no-op when already
+        # aligned). OpenCode doesn't record a cwd in its transcript, so it omits this.
+        return claude_session.retarget_session_cwd(repo, session_id, cwd)
 
     def latest_session_id(self, repo: Path) -> str | None:
         return claude_session.latest_session_id(repo)

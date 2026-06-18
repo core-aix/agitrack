@@ -2,7 +2,12 @@
 
 from agitrack.metrics.collect import CommitStat, Dashboard, build_dashboard, collect_commit_stats
 from agitrack.metrics.render import render_dashboard
-from agitrack.metrics.server import build_server, serve_dashboard
+from agitrack.metrics.server import (
+    build_server,
+    open_dashboard_in_browser,
+    remote_browser_hint,
+    serve_dashboard,
+)
 from agitrack.metrics.web import dashboard_data, render_html
 
 __all__ = [
@@ -12,6 +17,8 @@ __all__ = [
     "build_server",
     "collect_commit_stats",
     "dashboard_data",
+    "open_dashboard_in_browser",
+    "remote_browser_hint",
     "render_dashboard",
     "render_html",
     "serve_dashboard",
