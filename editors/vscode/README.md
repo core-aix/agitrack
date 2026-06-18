@@ -116,6 +116,7 @@ to update it.
 ```bash
 npm install
 npm run compile      # or: npm run watch
+npm test             # unit tests (node:test); covers the native-Windows platform guard
 ```
 
 Press <kbd>F5</kbd> ("Run Extension") to launch an Extension Development Host with the
