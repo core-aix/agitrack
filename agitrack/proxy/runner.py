@@ -2820,7 +2820,7 @@ class ProxyRunner:
         if kind == "switch":
             assert isinstance(value, int)  # "switch" pairs with a session index
             if value == self.active_index:
-                self._integrate_active_session()
+                self._select_current_session()
             else:
                 self._switch_active(value)
         elif kind == "resume-past":
@@ -2853,6 +2853,28 @@ class ProxyRunner:
     def _active_has_pending(self) -> bool:
         # True if the active session has committed work not yet in the base.
         return self._integration.active_has_pending(self.repo, self.worktree)
+
+    def _active_has_mergeable_work(self) -> bool:
+        # True if the (idle) active session has work worth merging now: committed-but-
+        # unmerged commits, or uncommitted committable changes. Excludes mid-turn state,
+        # where uncommitted changes are expected and auto-committed.
+        return (
+            self.worktree is not None
+            and not self.merge_ctx
+            and not self.agent_in_flight
+            and (self._active_has_pending() or self._active_has_committable_changes())
+        )
+
+    def _select_current_session(self) -> None:
+        # Picking the session you're already in: if it has work to merge, integrate it now
+        # (the commit/merge — or conflict-resolve — messages pop up directly); otherwise
+        # just acknowledge you're already here, rather than the confusing "nothing to
+        # integrate".
+        if self._active_has_mergeable_work() and self._base_branch is not None:
+            self._merge_active_into(self._base_branch)
+        else:
+            self._set_message(f"Already in session '{self.name}'.")
+            self._render()
 
     def _integrate_active_session(self) -> None:
         # Selecting the current session offers to integrate its outstanding
@@ -2901,12 +2923,7 @@ class ProxyRunner:
         surfacing "merge" then would be noise."""
         items: list[tuple[str, str]] = []
         try:
-            if (
-                self.worktree is not None
-                and not self.merge_ctx
-                and not self.agent_in_flight
-                and (self._active_has_pending() or self._active_has_committable_changes())
-            ):
+            if self._active_has_mergeable_work():
                 items.append((f"{self.name} (current session)", ""))
         except Exception:
             pass
