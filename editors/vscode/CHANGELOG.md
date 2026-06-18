@@ -59,6 +59,10 @@ Launch the full aGiTrack terminal application from VSCode — no terminal typing
 - **Remote-aware:** runs as a workspace extension, so on Remote-SSH / WSL / Dev
   Containers / Codespaces it launches and (if needed) installs aGiTrack on the remote
   host, where the code lives.
+- **Windows:** aGiTrack is POSIX-only, so on Windows you run it inside **WSL** (or a Dev
+  Container / Remote-SSH) — the workspace extension then runs on the Linux side and works
+  as on macOS/Linux. In a native Windows window the extension detects this and points you
+  to Remote-WSL instead of launching a doomed terminal or offering an install that can't run.
 - Opens **beside the editor** (split to the right) by default; configurable via
   `agitrack.terminalLocation` (`beside` / `editor` / `panel`).
 - Uses the aGiTrack brand mark (the website favicon) as its icon.

@@ -209,9 +209,39 @@ function isAlive(pid: number): boolean {
   }
 }
 
+/** aGiTrack is POSIX-only (it imports pty/termios/fcntl at load), so it can't run on a
+ * native Windows host. Thanks to `extensionKind: ["workspace"]`, a Windows + WSL /
+ * Remote-SSH / Dev Container / Codespaces window runs THIS code on the Linux side
+ * (`process.platform` is not "win32") and works normally — only a LOCAL Windows window
+ * reaches win32 here, which is exactly the case aGiTrack can't support. */
+function isNativeWindows(): boolean {
+  return process.platform === "win32";
+}
+
+/** Explain that aGiTrack needs WSL on Windows, with a link to set it up. Returns true if
+ * we're on native Windows (caller should stop), false otherwise. */
+async function blockOnNativeWindows(): Promise<boolean> {
+  if (!isNativeWindows()) {
+    return false;
+  }
+  const choice = await vscode.window.showWarningMessage(
+    "aGiTrack needs a POSIX environment and can't run on native Windows. Open your project " +
+      "in WSL (or a Dev Container / Remote-SSH) and start aGiTrack there — this extension then " +
+      "runs on the Linux side automatically.",
+    "Set up WSL",
+  );
+  if (choice === "Set up WSL") {
+    void vscode.env.openExternal(vscode.Uri.parse("https://code.visualstudio.com/docs/remote/wsl"));
+  }
+  return true;
+}
+
 /** First-run housekeeping: if the CLI is present, check version parity; if it's
  * missing, offer to install it so the extension is usable out of the box. */
 async function bootstrap(context: vscode.ExtensionContext): Promise<void> {
+  if (isNativeWindows()) {
+    return; // can't run here — stay silent on activation; we explain when they try to start
+  }
   const exe = configuredExe();
   if (await runnable(exe)) {
     await checkVersionParity(context, exe);
@@ -230,6 +260,9 @@ async function bootstrap(context: vscode.ExtensionContext): Promise<void> {
 
 /** Launch (or focus) aGiTrack in a terminal for the chosen workspace folder. */
 async function startSession(targetUri?: vscode.Uri): Promise<void> {
+  if (await blockOnNativeWindows()) {
+    return;
+  }
   const folder = await pickFolder(targetUri);
   if (!folder) {
     void vscode.window.showWarningMessage("aGiTrack: open a folder or repository first.");
@@ -376,6 +409,9 @@ async function restartSession(): Promise<void> {
 /** Open aGiTrack's metrics dashboard for the chosen folder (read-only; `agitrack -d`
  * serves it on localhost and opens the browser, Ctrl-C in the terminal to stop). */
 async function openDashboard(targetUri?: vscode.Uri): Promise<void> {
+  if (await blockOnNativeWindows()) {
+    return;
+  }
   const folder = await pickFolder(targetUri);
   if (!folder) {
     void vscode.window.showWarningMessage("aGiTrack: open a folder or repository first.");
@@ -611,6 +647,9 @@ interface InstallPlan {
 /** Install the aGiTrack CLI with the best available Python tool, then resolve the
  * executable it produced. Returns the path to use, or undefined on failure. */
 async function installAgitrack(): Promise<string | undefined> {
+  if (await blockOnNativeWindows()) {
+    return undefined; // POSIX-only — installing on native Windows would never run
+  }
   const plan = await planInstaller();
   if (!plan) {
     const pick = await vscode.window.showErrorMessage(
