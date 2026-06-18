@@ -214,14 +214,26 @@ function spawnAgitrackTerminal(opts: { name: string; cwd: string; icon: string; 
  * setup (venv/conda activation, shell integration) into a new terminal; sequencing the
  * launch through shell integration guarantees that setup runs in the shell FIRST, so it
  * never gets typed into aGiTrack. Falls back to a delayed sendText if shell integration
- * isn't available (it's then best-effort, with aGiTrack's own stdin-drain as a backstop). */
+ * isn't available (it's then best-effort, with aGiTrack's own stdin-drain as a backstop).
+ *
+ * A progress notification is shown for the whole wait so the user knows the few-second
+ * pause is expected. It is deliberately NOT echoed into the terminal — writing into a
+ * not-yet-ready shell prints literal text before the prompt and garbles the startup. */
 async function runWhenShellReady(terminal: vscode.Terminal, command: string): Promise<void> {
-  const integration = await waitForShellIntegration(terminal, 6000);
-  if (integration) {
-    integration.executeCommand(command);
-  } else {
-    setTimeout(() => terminal.sendText(command), 1200);
-  }
+  await vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Notification,
+      title: "aGiTrack is starting — preparing your terminal (a few seconds)…",
+    },
+    async () => {
+      const integration = await waitForShellIntegration(terminal, 6000);
+      if (integration) {
+        integration.executeCommand(command);
+      } else {
+        setTimeout(() => terminal.sendText(command), 1200);
+      }
+    },
+  );
 }
 
 function waitForShellIntegration(
