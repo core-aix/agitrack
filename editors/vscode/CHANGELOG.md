@@ -15,13 +15,16 @@ Launch the full aGiTrack terminal application from VSCode — no terminal typing
   open a confusing empty shell with no aGiTrack in it. Such a split is now detected (via
   the terminal it was split from) and closed automatically, with a one-line explanation —
   the user's own terminals are never touched.
-- aGiTrack starts only **after** the terminal's automatic startup has fully run — VSCode's
-  venv/conda activation, shell integration, and any other commands it injects. After shell
-  integration is ready, the launch waits for VSCode's own startup command(s) to actually
-  run and finish (tracked via the shell-execution events) before starting aGiTrack, so e.g.
-  `source .venv/bin/activate` runs *before* aGiTrack — not typed into the agent mid-run, and
-  not queued behind aGiTrack to run only after it exits. aGiTrack also drains any pending
-  terminal input right before the sensitive-information prompt as a backstop.
+- **Python venv activation no longer kills aGiTrack.** VSCode's Python extension activates
+  a venv by sending `Ctrl-C` then `source .../activate` into the terminal — and that Ctrl-C
+  would interrupt and kill aGiTrack at launch (you'd see the privacy prompt get `^C`'d and
+  "aGiTrack not started", followed by the venv activating). The extension now disables
+  `python.terminal.activateEnvironment` for the brief launch window and restores it after,
+  so nothing is injected into aGiTrack. The agent runs with its own interpreter, so the
+  shell venv is never needed. Opt out with `agitrack.suppressTerminalEnvActivation: false`.
+- Beyond that, after shell integration is ready the launch waits for any remaining startup
+  command (conda/direnv, etc.) to finish before starting aGiTrack, and aGiTrack drains any
+  pending terminal input right before the sensitive-information prompt as a backstop.
 - Exiting aGiTrack (e.g. the `Ctrl-G` → exit menu) **closes the terminal** automatically —
   but **only on a clean exit** (status 0). If aGiTrack quits with an error the terminal
   stays open so its message is readable. (`agitrack … && exit`.)
@@ -68,7 +71,8 @@ Launch the full aGiTrack terminal application from VSCode — no terminal typing
   updates past the installed extension, the extension prompts you to update it to
   the matching version.
 - Settings: `agitrack.path`, `agitrack.backend`, `agitrack.args`,
-  `agitrack.openOnStartup`.
+  `agitrack.openOnStartup`, `agitrack.terminalLocation`, `agitrack.confirmTerminalClose`,
+  `agitrack.suppressTerminalEnvActivation`.
 
 ## 0.0.1
 
