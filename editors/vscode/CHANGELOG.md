@@ -34,12 +34,13 @@ Launch the full aGiTrack terminal application from VSCode — no terminal typing
   `agitrack.confirmTerminalClose: false`). Because VSCode bounds how long it waits on
   shutdown, a one-time dialog points you at the reliable path — **`Ctrl-G` → exit** inside
   aGiTrack — which has no time pressure.
-- **Abrupt-close recovery backstop:** even if a session is killed before it can finalize,
-  the Extension Host runs `agitrack --recover` to finish the job — committing a *finished*
-  turn's changes and merging them (an aborted/in-flight turn is left untouched; merges are
-  skipped on conflict). It runs in the host when a terminal is closed with the window open,
-  and detached (so it outlives the host) when the whole window closes. No-ops if aGiTrack is
-  still running, so it never races a live session or a restart.
+- **Abrupt-close recovery backstop:** if a whole-window close kills a session before it can
+  finalize, deactivate runs a **detached** `agitrack --recover` (it outlives the extension
+  host) to finish the job — committing a *finished* turn's changes and merging them (an
+  aborted/in-flight turn is left untouched; merges are skipped on conflict). No-ops if
+  aGiTrack is still running, so it never races a live session. (Closing just the terminal
+  while the window stays open needs no backstop: aGiTrack receives SIGHUP and finalizes
+  itself.)
 - The dashboard is **remote-aware**: on a remote/SSH/Mosh host it no longer tries to
   open a (headless) remote browser — it relies on port forwarding so the URL opens on
   your local machine; `$BROWSER` is honored when set.
