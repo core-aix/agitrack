@@ -314,6 +314,12 @@ def _check_for_update_at_startup(config: GlobalConfig) -> None:
         # isn't blocked from starting aGiTrack (the network call fails fast and we just
         # skip the offer below).
         status = updater.check(timeout=STARTUP_NET_TIMEOUT)
+    except KeyboardInterrupt:
+        # The check was slow (e.g. a sluggish `git fetch`) and the user pressed Ctrl-C.
+        # Treat it as "skip the update check and get on with launching" — never dump a
+        # traceback over a best-effort, optional check.
+        print("Skipped the update check.")
+        return
     except Exception:
         return
     # A prior automatic update may have failed (or the user chose not to retry). Clear
