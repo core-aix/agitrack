@@ -8,9 +8,16 @@ matches the `agitrack` release it launches.
 
 Launch the full aGiTrack terminal application from VSCode — no terminal typing.
 
-- An **aGiTrack menu** at the top-right of the editor toolbar (brand-icon dropdown)
-  with **Start Session**, **Restart Session**, and **Open Dashboard**. Also available
-  as Command Palette commands and an Explorer folder context menu.
+- A brand-icon **aGiTrack button** at the top-right of the editor toolbar that starts
+  a session in one click. Restart and Open Dashboard are Command Palette commands;
+  Start is also on the Explorer folder context menu.
+- Closing the session terminal prompts (VSCode's editor-terminal confirmation) and
+  aGiTrack exits **gracefully**, finalizing the latest turn instead of stranding it.
+- The dashboard is **remote-aware**: on a remote/SSH/Mosh host it no longer tries to
+  open a (headless) remote browser — it relies on port forwarding so the URL opens on
+  your local machine; `$BROWSER` is honored when set.
+- The Ctrl-G dashboard labels the session's fresh, unpushed commits with the current
+  user's GitHub ID (which `gh` can't resolve until they're on the remote).
 - **Start Session** opens aGiTrack in a VSCode terminal for the workspace — the full
   experience: the agent's native interface, the `Ctrl-G` command menu, sessions,
   sharing, worktrees, and per-turn auto-commits.

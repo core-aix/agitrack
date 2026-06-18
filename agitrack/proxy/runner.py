@@ -5682,36 +5682,56 @@ class ProxyRunner:
         inside this process (so the TUI keeps running); it's reused if already up and
         shut down on exit."""
         import threading
-        import webbrowser
+
+        from agitrack.metrics import open_dashboard_in_browser, remote_browser_hint
 
         if self._dashboard_server is not None:
             url = self._dashboard_url or ""
-            try:
-                webbrowser.open(url)
-            except Exception:
-                pass
-            self._set_message(f"Dashboard already running at {url}")
+            port = self._dashboard_server.server_address[1]
+            opened = open_dashboard_in_browser(url)
+            self._set_message(
+                f"Dashboard already running at {url}."
+                if opened
+                else f"Dashboard running. {remote_browser_hint(url, port)}"
+            )
             self._render()
             return
         try:
             from agitrack.metrics import build_server
             from agitrack.metrics.server import DEFAULT_HOST
 
-            server = build_server(self.base_repo)
-            url = f"http://{DEFAULT_HOST}:{server.server_address[1]}/"
+            server = build_server(self.base_repo, email_logins=self._dashboard_email_logins())
+            port = server.server_address[1]
+            url = f"http://{DEFAULT_HOST}:{port}/"
             thread = threading.Thread(target=server.serve_forever, name="agitrack-dashboard", daemon=True)
             thread.start()
             self._dashboard_server = server
             self._dashboard_thread = thread
             self._dashboard_url = url
-            try:
-                webbrowser.open(url)
-            except Exception:
-                pass
-            self._set_message(f"Dashboard live at {url} — opening in your browser.")
+            # Only open a browser when it would land on THIS machine; on a remote/SSH/
+            # Mosh host, tell the user how to reach the forwarded URL from their own
+            # machine instead of opening a (headless) browser on the remote.
+            if open_dashboard_in_browser(url):
+                self._set_message(f"Dashboard live at {url} — opening in your browser.")
+            else:
+                self._set_message(f"Dashboard live. {remote_browser_hint(url, port)}")
         except Exception as error:
             self._set_message(f"Could not start the dashboard: {error}")
         self._render()
+
+    def _dashboard_email_logins(self) -> dict[str, str]:
+        """Map the current user's git email → their GitHub login, so the dashboard can
+        label this session's fresh, unpushed commits with a GitHub ID even though `gh`
+        (which only knows commits already on the remote) can't resolve them yet.
+        Best-effort: an empty map just means the email/no-reply heuristics still apply."""
+        try:
+            login = self._cached_or_resolve_login()
+            email = self.base_repo._run(["git", "config", "user.email"], check=False).stdout.strip()
+            if login and email:
+                return {email.lower(): login}
+        except Exception:
+            pass
+        return {}
 
     def _stop_dashboard(self) -> None:
         """Shut the dashboard server down if it was started this session."""
@@ -6563,6 +6583,17 @@ class ProxyRunner:
 
     def _handle_exit_signal(self, signum, _frame) -> None:
         self.running = False
+        # Closing the terminal (the VSCode terminal, an SSH/Mosh session, a `kill`)
+        # delivers SIGHUP/SIGTERM. Finalize pending work first so a just-completed turn
+        # is committed and integrated instead of being stranded — i.e. exit gracefully,
+        # not abruptly. Rendering is suppressed (the terminal may already be gone:
+        # `_render()` no-ops when `screen` is None) and the whole finalize is guarded so
+        # a slow or failing finalize can never stop the process from exiting.
+        self.screen = None
+        try:
+            self._finalize_pending_work()
+        except Exception:
+            pass
         self._disable_host_terminal_modes()
         self._cleanup_child()
         self._restore_terminal()
