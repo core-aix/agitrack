@@ -26,6 +26,7 @@ __all__ = [
     "prepare_resume",
     "link_session",
     "session_cwd",
+    "retarget_session_cwd",
     "parse_rows",
 ]
 
@@ -318,6 +319,39 @@ def _retarget_rows(transcript: str, *, cwd: str, new_session_id: str | None = No
         else:
             out.append(line)
     return "\n".join(out)
+
+
+def retarget_session_cwd(repo: Path, session_id: str, cwd: str) -> bool:
+    """Rewrite the ``cwd`` recorded in ``repo``'s copy of ``session_id``'s transcript
+    to ``cwd``, so a resumed Claude session runs in ``cwd`` instead of a directory the
+    conversation recorded earlier.
+
+    Claude's ``--resume`` restores the working directory stored in the transcript, so
+    a session first run inside a worktree keeps pointing at that worktree even when
+    aGiTrack later launches it elsewhere (e.g. ``--no-worktree`` on the repo root). This
+    aligns the transcript with the launch dir. Any hardlink to another copy (the
+    original worktree's transcript) is broken first via ``unlink`` so ONLY this repo's
+    copy is retargeted — the two then diverge, which is correct: they now run in
+    different directories. No-op (and cheap) when the transcript is absent or already
+    points at ``cwd``. Returns True only when a rewrite actually happened."""
+    if not session_id or not cwd:
+        return False
+    path = _session_path(Path(repo), session_id)
+    if not path.is_file():
+        return False
+    try:
+        original = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    retargeted = _retarget_rows(original, cwd=cwd)
+    if retargeted == original:
+        return False  # already at this cwd — leave the (possibly hardlinked) file alone
+    try:
+        path.unlink(missing_ok=True)  # break any hardlink before replacing
+        path.write_text(retargeted, encoding="utf-8")
+    except OSError:
+        return False
+    return True
 
 
 def session_cwd(session_id: str, *, since: float | None = None) -> str | None:

@@ -219,6 +219,113 @@ def test_default_uses_config_commit_guidance(monkeypatch):
     assert captured["commit_guidance"] is False
 
 
+def test_delay_merge_flag_passed_to_runner(monkeypatch):
+    captured = _stub_launch(monkeypatch)
+    cli.main(["--delay-merge"])
+    assert captured["delay_merge"] is True
+
+
+def test_delay_merge_off_by_default(monkeypatch):
+    captured = _stub_launch(monkeypatch)
+    cli.main([])
+    assert captured["delay_merge"] is False
+
+
+def test_version_flag_prints_version_and_exits(monkeypatch, capsys):
+    # `agitrack --version` is cheap and side-effect-free: no repo discovery, no
+    # privacy prompt. The VSCode extension reads it to detect a self-updated CLI.
+    import agitrack
+
+    called = {"discover": False}
+    monkeypatch.setattr(cli, "_discover_or_init", lambda p: called.__setitem__("discover", True))
+    assert cli.main(["--version"]) == 0
+    assert capsys.readouterr().out.strip() == agitrack.__version__
+    assert called["discover"] is False  # exits before touching the repo
+
+
+def test_startup_message_printed_for_interactive_proxy(monkeypatch, capsys):
+    # Entering aGiTrack prints immediate feedback so the terminal isn't silent while the
+    # TUI comes up — shown however it was launched (terminal or VSCode).
+    _stub_launch(monkeypatch)
+    cli.main([])
+    assert "aGiTrack is starting..." in capsys.readouterr().out
+
+
+def test_startup_message_suppressed_in_json_mode(monkeypatch, capsys):
+    # json/bridge output is machine-readable; the human "starting" line must not leak in.
+    _stub_launch(monkeypatch)
+    cli.main(["--prompt", ":status"])
+    assert "aGiTrack is starting..." not in capsys.readouterr().out
+
+
+def test_recover_flag_finalizes_and_exits(tmp_path, monkeypatch, capsys):
+    # `agitrack --recover` runs headless recovery and exits — no privacy prompt,
+    # no TUI, no "starting" line. With no session worktrees there is nothing to do.
+    from agitrack.git import GitRepo
+
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path / "cfg"))
+    GitRepo.init(tmp_path / "repo")
+    rc = cli.main(["--repo", str(tmp_path / "repo"), "--recover"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Nothing to recover." in out
+    assert "aGiTrack is starting" not in out  # recovery is not an interactive launch
+
+
+def test_update_check_runs_under_a_tty(monkeypatch):
+    # The startup self-update offer is gated only on a TTY (+ config) — NOT on any
+    # editor/environment signal — so it runs inside VSCode's integrated terminal,
+    # which is a real PTY, exactly as in a standalone terminal.
+    captured = _stub_launch(monkeypatch)
+    _force_tty(monkeypatch, stdin=True, stdout=True)
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
+    ran = {"checked": False}
+    monkeypatch.setattr(cli, "_check_for_update_at_startup", lambda config: ran.__setitem__("checked", True))
+
+    cli.main([])  # plain interactive proxy launch
+
+    assert ran["checked"] is True
+    assert captured  # launch still proceeded
+
+
+def test_update_check_skipped_without_a_tty(monkeypatch):
+    _stub_launch(monkeypatch)
+    _force_tty(monkeypatch, stdin=False, stdout=False)
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
+    ran = {"checked": False}
+    monkeypatch.setattr(cli, "_check_for_update_at_startup", lambda config: ran.__setitem__("checked", True))
+
+    cli.main([])
+
+    assert ran["checked"] is False  # no way to answer a prompt without a TTY
+
+
+def test_ui_bridge_flag_passed_to_shell_and_forces_json_mode(monkeypatch):
+    # --ui-bridge is a json-mode transport: it must reach the shell and select json
+    # mode even without an explicit --mode json (the VSCode extension relies on this).
+    captured = _stub_launch(monkeypatch)
+    cli.main(["--ui-bridge"])
+    assert captured["ui_bridge"] is True
+
+
+def test_ui_bridge_off_by_default(monkeypatch):
+    captured = _stub_launch(monkeypatch)
+    cli.main(["--mode", "json", "--prompt", "hi"])
+    assert captured["ui_bridge"] is False
+
+
+def test_json_events_flag_passed_to_shell(monkeypatch):
+    captured = _stub_launch(monkeypatch)
+    cli.main(["--mode", "json", "--json-events", "--prompt", "hi"])
+    assert captured["json_events"] is True
+
+
+def test_json_events_off_by_default(monkeypatch):
+    captured = _stub_launch(monkeypatch)
+    cli.main(["--mode", "json", "--prompt", "hi"])
+    assert captured["json_events"] is False
+
+
 def test_full_agent_messages_off_by_default(monkeypatch):
     captured = _stub_launch(monkeypatch)
     cli.main([])
@@ -550,6 +657,23 @@ def test_privacy_warning_acknowledged_with_enter(monkeypatch, capsys):
     # The warning explains what is logged and what not to enter.
     assert "git commit" in out
     assert "passwords, API keys" in out
+
+
+def test_privacy_warning_drains_stdin_before_reading(monkeypatch):
+    # A stray newline injected into the terminal (e.g. by an editor's shell integration)
+    # must not auto-acknowledge: pending input is flushed BEFORE the prompt reads, so the
+    # acknowledgment stays a deliberate keypress.
+    events: list[str] = []
+    _force_tty(monkeypatch, stdin=True)
+    monkeypatch.setattr(cli, "_drain_terminal_input", lambda: events.append("drain"))
+    monkeypatch.setattr("builtins.input", lambda *a: events.append("input") or "")
+
+    assert cli._acknowledge_privacy_warning() is True
+    assert events == ["drain", "input"]  # drained first, then read
+
+
+def test_drain_terminal_input_never_raises():
+    cli._drain_terminal_input()  # no real tty under pytest; must be a safe no-op
 
 
 def test_privacy_warning_quit_aborts(monkeypatch, capsys):

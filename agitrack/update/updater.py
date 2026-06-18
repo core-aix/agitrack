@@ -97,10 +97,20 @@ class UpdateStatus:
 
 
 def _git(args: list[str], cwd: Path, *, timeout: int | None = None) -> subprocess.CompletedProcess[str]:
-    # GIT_TERMINAL_PROMPT=0: a network git call (fetch) must never block on a
-    # credential prompt — offline/auth failures should fail fast, not hang launch.
-    # A timeout bounds the rest; on expiry the process is killed and we report it as
-    # a plain non-zero result so callers degrade to "couldn't check" gracefully.
+    # A network git call (fetch) must never block on a credential prompt — offline/auth
+    # failures should fail fast, not hang launch. GIT_TERMINAL_PROMPT=0 covers git's own
+    # (HTTP) prompts; SSH remotes ignore it, so also force the ssh transport into batch
+    # mode — otherwise a passphrase-protected key (not in the agent) or an unknown host
+    # key makes `ssh` wait for input the launch-time check can't answer, and the user is
+    # left staring at a hung start until they Ctrl-C. A timeout bounds the rest; on expiry
+    # the process is killed and we report a plain non-zero result so callers degrade to
+    # "couldn't check" gracefully.
+    ssh_cmd = os.environ.get("GIT_SSH_COMMAND") or "ssh"
+    env = {
+        **os.environ,
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_SSH_COMMAND": f"{ssh_cmd} -oBatchMode=yes",
+    }
     try:
         return subprocess.run(
             ["git", *args],
@@ -110,7 +120,7 @@ def _git(args: list[str], cwd: Path, *, timeout: int | None = None) -> subproces
             stderr=subprocess.PIPE,
             check=False,
             timeout=timeout,
-            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+            env=env,
         )
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(["git", *args], returncode=124, stdout="", stderr="timed out")

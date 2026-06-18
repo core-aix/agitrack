@@ -73,10 +73,11 @@ class ClaudeBackend:
             # A coding run (e.g. shell mode): tell the agent aGiTrack auto-commits so it
             # doesn't self-commit. Deliberately NOT added on a bare run — that is the
             # summarizer, which must read only its instruction and the trace — and skipped
-            # when commit_guidance is off (--no-commit-guidance).
-            from agitrack.backends.proxy_agents import AGENT_SYSTEM_NOTE
+            # when commit_guidance is off (--no-commit-guidance). Shell mode runs on the
+            # repo directly (no worktree), so use the no-worktree note variant.
+            from agitrack.backends.proxy_agents import agent_system_note
 
-            command.extend(["--append-system-prompt", AGENT_SYSTEM_NOTE])
+            command.extend(["--append-system-prompt", agent_system_note(use_worktrees=False)])
         command.extend(self.backend_args)
 
         # Sub-agents Claude spawns are recorded in their OWN transcript files, separate

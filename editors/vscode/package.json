@@ -1,0 +1,166 @@
+{
+  "name": "agitrack-vscode",
+  "displayName": "aGiTrack",
+  "description": "Start aGiTrack with the aG button (top-right of the editor) or \"aGiTrack: Start aGiTrack\" in the Command Palette — a coding agent (Claude Code / OpenCode) that auto-commits every turn with full provenance, run inside VSCode with no terminal typing required.",
+  "version": "0.0.9",
+  "publisher": "core-aix",
+  "license": "Apache-2.0",
+  "icon": "media/icon.png",
+  "homepage": "https://github.com/core-aix/agitrack",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/core-aix/agitrack"
+  },
+  "bugs": {
+    "url": "https://github.com/core-aix/agitrack/issues"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "claude",
+    "opencode",
+    "git",
+    "commit"
+  ],
+  "engines": {
+    "vscode": "^1.93.0"
+  },
+  "categories": [
+    "AI",
+    "SCM Providers",
+    "Other"
+  ],
+  "galleryBanner": {
+    "color": "#0d6e63",
+    "theme": "dark"
+  },
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "extensionKind": [
+    "workspace"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "agitrack.start",
+        "title": "Start aGiTrack",
+        "category": "aGiTrack",
+        "icon": {
+          "light": "media/icon.svg",
+          "dark": "media/icon.svg"
+        }
+      },
+      {
+        "command": "agitrack.startHere",
+        "title": "Start aGiTrack Here",
+        "category": "aGiTrack"
+      },
+      {
+        "command": "agitrack.restart",
+        "title": "Restart aGiTrack",
+        "category": "aGiTrack"
+      },
+      {
+        "command": "agitrack.dashboard",
+        "title": "Open Dashboard",
+        "category": "aGiTrack",
+        "icon": "$(graph)"
+      },
+      {
+        "command": "agitrack.install",
+        "title": "Install aGiTrack CLI",
+        "category": "aGiTrack"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "agitrack.start",
+          "group": "navigation@99"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "agitrack.startHere",
+          "group": "navigation@99",
+          "when": "explorerResourceIsFolder"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "agitrack.startHere",
+          "when": "false"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "aGiTrack",
+      "properties": {
+        "agitrack.path": {
+          "type": "string",
+          "default": "agitrack",
+          "description": "Path to the agitrack executable (on PATH by default)."
+        },
+        "agitrack.backend": {
+          "type": "string",
+          "default": "",
+          "enum": ["", "claude", "opencode"],
+          "enumDescriptions": [
+            "Use aGiTrack's configured default backend",
+            "Claude Code",
+            "OpenCode"
+          ],
+          "description": "Backend to drive. Empty uses aGiTrack's configured default."
+        },
+        "agitrack.args": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "markdownDescription": "Any extra command-line arguments to pass to `agitrack` on launch, one per array entry (e.g. `[\"--no-worktree\", \"--delay-merge\"]`). Anything aGiTrack doesn't recognize is forwarded to the backend CLI (claude/opencode), so this is the place to pass backend flags too — e.g. `[\"--\", \"--verbose\"]`. These are appended after `agitrack.backend`."
+        },
+        "agitrack.openOnStartup": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically start an aGiTrack session when a workspace opens."
+        },
+        "agitrack.terminalLocation": {
+          "type": "string",
+          "default": "beside",
+          "enum": ["beside", "editor", "panel"],
+          "enumDescriptions": [
+            "In the editor area, split to the right of the current editor",
+            "In the editor area, as a new editor tab",
+            "In the bottom panel (VSCode's default terminal location)"
+          ],
+          "description": "Where aGiTrack's terminal opens."
+        },
+        "agitrack.confirmTerminalClose": {
+          "type": "boolean",
+          "default": true,
+          "description": "Prompt before closing the aGiTrack terminal so aGiTrack can exit gracefully (finalizing the latest turn). If VSCode's `terminal.integrated.confirmOnKill` is set to `never`, aGiTrack restores it to `always` so the close is confirmed."
+        },
+        "agitrack.suppressTerminalEnvActivation": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Disable VSCode's automatic Python environment (venv/conda) activation in the aGiTrack terminal. The Python extension activates the env by sending `Ctrl-C` then `source .../activate`, which **interrupts and kills aGiTrack** at launch. The agent runs with its own interpreter and never needs the shell's venv, so this is safe. Implemented by turning off `python.terminal.activateEnvironment` only for the brief launch window, then restoring it. Turn off if you rely on venv activation in the aGiTrack terminal."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "test": "tsc -p ./ && node --test out/platform.test.js",
+    "vscode:prepublish": "npm run compile",
+    "package": "vsce package --no-dependencies",
+    "publish": "vsce publish --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.93.0",
+    "@vscode/vsce": "^3.0.0",
+    "typescript": "^5.4.0"
+  }
+}

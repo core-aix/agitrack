@@ -157,6 +157,10 @@ class Dashboard:
     branch: str  # the ref this dashboard was built for (the current branch by default)
     stats: list[CommitStat]  # oldest first
     sha_logins: dict[str, str] = field(default_factory=dict)  # commit SHA → GitHub login (best-effort)
+    # Lowercased author email → GitHub login. A supplemental hint for commits `gh` can't
+    # map because they aren't on the remote yet (e.g. fresh, unpushed session commits):
+    # aGiTrack knows the current user's login, so their local commits still get an ID.
+    email_logins: dict[str, str] = field(default_factory=dict)
     commit_base: str = ""  # GitHub commit URL prefix, or "" when no GitHub remote
     branches: list[str] = field(default_factory=list)  # every local branch, for the per-branch view selector
 
@@ -274,7 +278,7 @@ class Dashboard:
         """Map each ``(author name, email)`` to a merged committer label, so
         name variants of one person collapse to a single identity. Cached: it is
         read once per commit during serialization."""
-        return resolve_committers(self.stats, self.sha_logins)
+        return resolve_committers(self.stats, self.sha_logins, self.email_logins)
 
     def label_of(self, stat: CommitStat) -> str:
         return self.committer_labels.get((stat.author or "", (stat.email or "").strip().lower())) or "unknown"
@@ -355,7 +359,11 @@ class _Union:
             self._parent[ra] = rb
 
 
-def resolve_committers(stats: list[CommitStat], sha_logins: dict[str, str] | None = None) -> dict[tuple[str, str], str]:
+def resolve_committers(
+    stats: list[CommitStat],
+    sha_logins: dict[str, str] | None = None,
+    email_logins: dict[str, str] | None = None,
+) -> dict[tuple[str, str], str]:
     """Map every ``(author name, email)`` pair to a single committer label.
 
     ``sha_logins`` (commit SHA → GitHub login, from :mod:`agitrack.metrics.github`)
@@ -368,6 +376,7 @@ def resolve_committers(stats: list[CommitStat], sha_logins: dict[str, str] | Non
     otherwise it is the person's most frequent name. Two people who never share a
     login or email but share a name cannot be told apart here and may merge."""
     sha_logins = sha_logins or {}
+    email_logins = email_logins or {}
     # Flatten every contribution — each commit's primary author plus its human
     # co-authors — as (name, lowercased email, login-hint). Only the PRIMARY
     # author can borrow the commit's GitHub login (``sha_logins`` is keyed by sha
@@ -377,10 +386,11 @@ def resolve_committers(stats: list[CommitStat], sha_logins: dict[str, str] | Non
     contributions: list[tuple[str, str, str | None]] = []
     for stat in stats:
         email = (stat.email or "").strip().lower()
-        contributions.append((stat.author or "", email, sha_logins.get(stat.sha) or _login_of(email)))
+        primary_login = sha_logins.get(stat.sha) or _login_of(email) or email_logins.get(email)
+        contributions.append((stat.author or "", email, primary_login))
         for name, co_email in stat.co_authors:
             ce = (co_email or "").strip().lower()
-            contributions.append((name or "", ce, _login_of(ce)))
+            contributions.append((name or "", ce, _login_of(ce) or email_logins.get(ce)))
 
     union = _Union()
     logins: set[str] = set()
@@ -552,7 +562,13 @@ def _abbreviate_home(path: str) -> str:
     return "~" if str(rel) == "." else f"~/{rel.as_posix()}"
 
 
-def build_dashboard(repo: GitRepo, ref: str = "HEAD", *, sha_logins: dict[str, str] | None = None) -> Dashboard:
+def build_dashboard(
+    repo: GitRepo,
+    ref: str = "HEAD",
+    *,
+    sha_logins: dict[str, str] | None = None,
+    email_logins: dict[str, str] | None = None,
+) -> Dashboard:
     from agitrack.metrics.github import commit_url_base
 
     stats = collect_commit_stats(repo, ref)
@@ -569,6 +585,7 @@ def build_dashboard(repo: GitRepo, ref: str = "HEAD", *, sha_logins: dict[str, s
         branch=branch,
         stats=stats,
         sha_logins=sha_logins or {},
+        email_logins=email_logins or {},
         commit_base=commit_url_base(repo),
         branches=branches,
     )

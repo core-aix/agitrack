@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -110,6 +111,35 @@ def test_scripted_prompts_commit_without_any_input(tmp_path, monkeypatch, capsys
     ).stdout
     assert log.startswith("<aGiTrack> write hello.py")
     assert FakeBackend.runs == ["write hello.py"]  # ':status' is aGiTrack's, not the agent's
+
+
+def test_json_events_emit_response_and_commit(tmp_path, monkeypatch, capsys):
+    # --json-events makes the headless shell emit one machine-readable JSON line per
+    # turn event, which the VSCode chat extension parses.
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path / "agit-home"))
+    FakeBackend.runs = []
+    monkeypatch.setitem(shell_mod.BACKENDS, "claude", FakeBackend)
+    monkeypatch.setattr(shell_mod, "ensure_installed_backend", lambda name, *a, **k: name)
+    _no_input(monkeypatch)
+    repo = GitRepo.init(tmp_path / "demo")
+    shell = AgitrackShell(repo, backend="claude", prompts=["write hello.py"], json_events=True)
+    shell.global_config.summarization_enabled = False
+
+    shell.run()
+
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith("{")]
+    by_type = {e["type"]: e for e in events}
+    assert by_type["response"]["text"] == "created hello.py"
+    assert by_type["response"]["session"] == "ses-1"
+    assert by_type["commit"]["sha"]  # a commit sha was recorded
+
+
+def test_json_events_off_by_default_keeps_plain_output(tmp_path, monkeypatch, capsys):
+    shell, _ = _scripted_shell(tmp_path, monkeypatch, ["write hello.py"])
+    shell.run()
+    out = capsys.readouterr().out
+    # No JSON event lines when the flag is off.
+    assert not any(line.startswith('{"type"') for line in out.splitlines())
 
 
 def test_scripted_exit_command_stops_the_script(tmp_path, monkeypatch):

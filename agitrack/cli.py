@@ -30,6 +30,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="show this help message and exit",
     )
+    parser.add_argument(
+        "--version",
+        action="store_true",
+        help="print the aGiTrack version and exit",
+    )
     parser.add_argument("--repo", default=".", help="target Git repository path")
     parser.add_argument("--verbose", action="store_true", help="show aGiTrack diagnostic messages")
     parser.add_argument("--mode", choices=["proxy", "json"], default="proxy", help="interactive mode")
@@ -80,11 +85,41 @@ def main(argv: list[str] | None = None) -> int:
         "agent does not create its own git commits unless you explicitly ask",
     )
     parser.add_argument(
+        "--delay-merge",
+        action="store_true",
+        help="don't merge a turn's committed changes into the base branch automatically; "
+        "instead leave them in the session's working directory for you to review/edit, then "
+        "merge on your confirmation via the session menu. Off by default.",
+    )
+    parser.add_argument(
+        "--json-events",
+        action="store_true",
+        help="in --mode json, emit one machine-readable JSON line per turn event "
+        "(the agent's response, the commit produced, errors) — used by the VSCode "
+        "chat extension and other programmatic drivers",
+    )
+    parser.add_argument(
+        "--ui-bridge",
+        action="store_true",
+        help="in --mode json, run a long-lived JSON-RPC session over stdin/stdout where "
+        "interactive questions (menus, confirmations, text input) are asked of the driver "
+        "instead of a terminal — used by the VSCode extension (see editors/vscode)",
+    )
+    parser.add_argument(
         "--full-agent-messages",
         action="store_true",
         help="record every user-facing message the agent sends during a turn in the "
         "commit's interaction trace, not just the final reply (tool calls and file edits "
         "are still excluded); also settable per-repo via full_agent_messages in config",
+    )
+    parser.add_argument(
+        "--recover",
+        action="store_true",
+        help="finalize work left by a session that exited abruptly (e.g. the VSCode window "
+        "was closed mid-turn): for each session worktree, commit a finished turn's "
+        "uncommitted changes and merge it into the base branch (skipping the merge on a "
+        "conflict). Runs headlessly and no-ops if a live aGiTrack holds the repo lock. Used "
+        "by the VSCode extension on close; also runnable manually.",
     )
     parser.add_argument(
         "--skip-privacy-ack",
@@ -116,6 +151,15 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         return 0
 
+    # Print the version and exit. Kept simple and side-effect-free (no repo
+    # discovery, no privacy prompt) so tools — e.g. the VSCode extension checking
+    # whether the installed CLI has self-updated past it — can read it cheaply.
+    if args.version:
+        from agitrack import __version__
+
+        print(__version__)
+        return 0
+
     if args.dashboard:
         # Read-only: nothing is logged or committed, so no privacy
         # acknowledgment and no repo initialization offer.
@@ -133,6 +177,23 @@ def main(argv: list[str] | None = None) -> int:
             # OSError: --repo points at a directory that does not exist.
             print(error)
             return 1
+
+    if args.recover:
+        # Headless finalization of work left by a session that exited abruptly.
+        # It only commits/merges already-produced changes (never starts new agent
+        # work), so — like --dashboard — no privacy prompt and no update check. It
+        # takes the repo lock itself and no-ops if a live aGiTrack holds it.
+        try:
+            recover_repo = GitRepo.discover(Path(args.repo).expanduser())
+        except (GitError, OSError) as error:
+            print(error)
+            return 1
+        from agitrack.config.migrate import migrate_repo_state
+        from agitrack.recovery import RecoveryService
+
+        migrate_repo_state(recover_repo)
+        print(RecoveryService(recover_repo, config).recover().summary())
+        return 0
 
     # If backend is asked for help, run it directly without TUI.
     if backend_args and any(arg in ("--help", "-h") for arg in backend_args):
@@ -153,6 +214,16 @@ def main(argv: list[str] | None = None) -> int:
     scripted = bool(args.prompts)
     if scripted:
         args.mode = "json"  # --prompt drives the non-interactive shell (#53)
+    if args.ui_bridge:
+        args.mode = "json"  # the bridge is a json-mode transport (the VSCode extension)
+
+    # Give immediate feedback that aGiTrack is launching — the interactive TUI takes a
+    # few seconds to come up (update check, backend startup) and otherwise the terminal
+    # looks frozen. Printed for interactive proxy mode only, so it never pollutes the
+    # machine-readable json/bridge output or the cheap --version/--dashboard paths. Shown
+    # however aGiTrack was started (terminal or VSCode), then replaced by the TUI frame.
+    if args.mode == "proxy":
+        print("aGiTrack is starting...", flush=True)
 
     # Offer a self-update before launching anything. Skipped for scripted/non-TTY
     # runs (no way to answer) and when the user turned update checks off. If the
@@ -220,6 +291,8 @@ def main(argv: list[str] | None = None) -> int:
                 backend_args=backend_args,
                 prompts=args.prompts,
                 commit_guidance=commit_guidance,
+                json_events=args.json_events,
+                ui_bridge=args.ui_bridge,
             ).run()
         else:
             return ProxyRunner(
@@ -231,6 +304,7 @@ def main(argv: list[str] | None = None) -> int:
                 backend_args=backend_args,
                 commit_guidance=commit_guidance,
                 full_agent_messages=args.full_agent_messages,
+                delay_merge=args.delay_merge,
             ).run()
     except (GitError, RuntimeError) as error:
         print(error)
@@ -274,6 +348,12 @@ def _check_for_update_at_startup(config: GlobalConfig) -> None:
         # isn't blocked from starting aGiTrack (the network call fails fast and we just
         # skip the offer below).
         status = updater.check(timeout=STARTUP_NET_TIMEOUT)
+    except KeyboardInterrupt:
+        # The check was slow (e.g. a sluggish `git fetch`) and the user pressed Ctrl-C.
+        # Treat it as "skip the update check and get on with launching" — never dump a
+        # traceback over a best-effort, optional check.
+        print("Skipped the update check.")
+        return
     except Exception:
         return
     # A prior automatic update may have failed (or the user chose not to retry). Clear
@@ -331,6 +411,21 @@ PRIVACY_WARNING = (
 )
 
 
+def _drain_terminal_input() -> None:
+    """Discard any unread bytes in the controlling terminal's input queue (POSIX tty).
+
+    A no-op when stdin isn't a real tty or termios is unavailable. Used before an
+    interactive acknowledgment so input injected into the terminal by something other
+    than the user (an editor's shell integration, a venv-activation hook) can't answer
+    it. Best-effort: never raise."""
+    try:
+        import termios
+
+        termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+    except Exception:
+        pass
+
+
 def _acknowledge_privacy_warning(*, scripted: bool = False, skip: bool = False) -> bool:
     """Show the privacy warning at startup; the user must acknowledge it to
     continue. Without a TTY there is no way to acknowledge, and a scripted run
@@ -346,6 +441,12 @@ def _acknowledge_privacy_warning(*, scripted: bool = False, skip: bool = False) 
     print(PRIVACY_WARNING)
     if scripted or not (sys.stdin.isatty() and sys.stdout.isatty()):
         return True
+    # Discard anything already sitting in the terminal's input queue before reading, so a
+    # stray newline can't auto-acknowledge this. Editors that host aGiTrack in a terminal
+    # (e.g. the VSCode extension) — or their shell-integration / venv-activation hooks —
+    # can inject a command whose trailing Enter would otherwise answer this prompt for the
+    # user. The acknowledgment must be a deliberate keypress, so flush first.
+    _drain_terminal_input()
     try:
         answer = input("Press Enter to acknowledge and continue (q to quit): ").strip().lower()
     except (EOFError, KeyboardInterrupt):

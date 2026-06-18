@@ -568,12 +568,20 @@ class ScreenRenderer:
             if cwd_text:
                 left += f"| {cwd_text} "
         padding = " " * max(cols - len(left) - len(right), 0)
-        if bold_base and worktree is not None:
+        line = left + padding + right
+        # The status bar must stay exactly one line no matter how narrow the terminal
+        # is. When left+right are wider than the terminal there is no padding, so the
+        # composed line would overflow and wrap to a second row — clamp it to the
+        # terminal width, cutting the overflow off the end.
+        if len(line) > cols:
+            line = line[:cols]
+        if bold_base and worktree is not None and f"→ {base_branch}" in line:
             # Add bold around the branch name AFTER the width math above — the escape
             # codes carry no visible width. \x1b[22m resets only the bold intensity,
-            # leaving the line's reverse-video (\x1b[7m) intact.
-            left = left.replace(f"→ {base_branch}", f"→ \x1b[1m{base_branch}\x1b[22m", 1)
-        return f"\x1b[7m{left}{padding}{right}\x1b[0m"
+            # leaving the line's reverse-video (\x1b[7m) intact. Guarded by an `in`
+            # check so a narrow-terminal truncation that cut the branch name skips it.
+            line = line.replace(f"→ {base_branch}", f"→ \x1b[1m{base_branch}\x1b[22m", 1)
+        return f"\x1b[7m{line}\x1b[0m"
 
     # ------------------------------------------------------------------
     # Box / popup painting primitives

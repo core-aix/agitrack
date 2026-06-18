@@ -11,6 +11,7 @@ pinned and runs on every OS the CI matrix covers (macOS + Linux; Windows via WSL
 from __future__ import annotations
 
 import os
+import re
 import types
 from pathlib import Path
 
@@ -84,6 +85,42 @@ def test_screen_width_tracks_terminal_columns(tmp_path, cols):
     runner._feed_child_output(line)
     assert runner.screen.display[0] == "X" * cols  # first row filled exactly to the width
     assert runner.screen.display[1].startswith("XXXXX")  # overflow wrapped to the next row
+
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def _visible(text: str) -> str:
+    """The on-screen text with SGR/cursor escapes stripped, for width measurement."""
+    return _ANSI_RE.sub("", text)
+
+
+@pytest.mark.parametrize("cols", [8, 12, 20, 30, 40])
+def test_status_line_stays_one_line_at_any_width(cols):
+    # No matter how narrow the terminal, the status bar must fit on a single row: its
+    # visible width never exceeds the column count and it contains no newline. Content
+    # below is deliberately wider than every `cols` and exercises the bold-branch path.
+    from agitrack.proxy.renderer import ScreenRenderer
+
+    line = ScreenRenderer.status_line(
+        None,  # status_line reads only its keyword args, never `self`
+        cols=cols,
+        name="a-very-long-session-name-that-overflows-narrow-terminals",
+        backend_name="claude",
+        session_id="abcdef1234567890",
+        base_branch="a-long-integration-branch",
+        current_dir_branch="main",  # differs from base -> bold-branch path is taken
+        worktree=object(),
+        scroll_back=42,
+        user_declined=[1, 2, 3],
+        short_session_fn=lambda sid: (sid or "")[:7],
+        menu_label="Ctrl-G",
+        summarizer_on=True,
+        cwd="/home/someone/code/a/deep/nested/project/path",
+    )
+    visible = _visible(line)
+    assert "\n" not in visible and "\r" not in visible  # single row, never wraps
+    assert len(visible) <= cols  # clamped to the terminal width
 
 
 def test_truecolor_sgr_preserved_in_truecolor_mode(tmp_path):

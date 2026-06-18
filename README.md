@@ -70,14 +70,22 @@ On the first run, aGiTrack asks which backend should be the default (listed alph
 In proxy mode (default), press `Ctrl-G`, then type one of these aGiTrack commands:
 
 ```text
-session                   switch / start (own worktree) / stop a live session
+sessions                  switch / start (own worktree) / stop a live session
 agent-backend             switch backend (opencode|claude); shows a picker
 summarizer                toggle summarization on/off, set model, show status
 git-unstaged              show intentionally unstaged files
 git-user-commit           create a user commit
+dashboard                 serve the metrics dashboard and open it in the browser
 update                    check for / install an aGiTrack self-update
 exit                      exit (with confirmation)
 ```
+
+When any worktree still has un-integrated work — committed-but-unmerged commits, **or**
+uncommitted (committable) changes — a **`merge`** command appears at the **top** of the
+`Ctrl-G` palette so the work isn't forgotten. It lets you pick which worktree (if more than
+one) and which branch to merge into: the branch checked out in your directory, that
+session's own merge branch, or any other branch. A worktree with uncommitted changes is
+**committed first, then merged**; a conflict surfaces the usual resolve options.
 
 aGiTrack tracks one session per repository and stays pinned to the session it launched (so it does not drift to other sessions you open). Use the `session` command (`Ctrl-G`, then `session`) to start a new session, switch the tracked session to another existing one, or sync tracking to the most recently active session — for example after starting a new conversation inside the backend's own TUI. This works the same for all backends.
 
@@ -256,6 +264,14 @@ Show aGiTrack diagnostic messages:
 agitrack --verbose
 ```
 
+Review each turn before it merges, instead of integrating automatically:
+
+```bash
+agitrack --delay-merge
+```
+
+By default aGiTrack merges a turn's committed changes into the base branch as soon as the turn finishes. With `--delay-merge` it holds the merge: after the agent commits, the changes stay in the session's **working directory** (a git worktree when worktrees are enabled — its path is shown in the notice, since you may not know the worktree's location otherwise) so you can review them and make any further edits. When you're ready, open the session menu and choose **"Merge reviewed changes into &lt;base&gt;"** to integrate. Nothing is merged until you confirm (on exit, any still-unmerged work stays on its branch and is offered again next time). This is off by default.
+
 Use the structured JSON fallback mode:
 
 ```bash
@@ -297,13 +313,19 @@ agitrack --repo path/to/repo --backend claude \
 
 Scripted runs never block on a question: the privacy warning is printed without waiting for acknowledgment, and new untracked files are staged automatically (with a notice) instead of being reviewed interactively. The same non-interactive defaults apply when prompts are piped to `agitrack --mode json` on stdin. Note that headless Claude needs permission to edit files — forward `--permission-mode acceptEdits` (or your preferred permission flags) through aGiTrack as shown above; OpenCode's `run` mode edits by default.
 
-`scripts/demo.sh` is a self-contained showcase built on this: it creates a fresh repository in a temporary directory, has the agent write a small program and its tests through aGiTrack, and leaves the repository behind so you can inspect the `<aGiTrack>` commit history or continue interactively.
+For a programmatic driver, `agitrack --mode json --json-events` emits one machine-readable JSON line per turn event (`response`, `commit`, `no_changes`, `error`) alongside the plain output, so another process can render the conversation and see which commit each turn produced. For a driver that also needs to *answer* aGiTrack's interactive questions, `agitrack --mode json --ui-bridge` runs a long-lived **bidirectional** JSON-RPC session over stdin/stdout: the driver sends `{"type":"prompt"|"command"|"answer"|"exit", …}` lines and aGiTrack streams back the same turn events plus `ask` events (`kind`: select/multiselect/input/confirm) for the driver to render and reply to.
+
+`scripts/demo.sh` is a self-contained showcase of scripted mode: it creates a fresh repository in a temporary directory, has the agent write a small program and its tests through aGiTrack, and leaves the repository behind so you can inspect the `<aGiTrack>` commit history or continue interactively.
 
 ```bash
 scripts/demo.sh                      # drive the demo with claude
 scripts/demo.sh --backend opencode   # ... or with opencode
 scripts/demo.sh --model haiku --dir /tmp/agitrack-demo
 ```
+
+### Editor integration
+
+A VSCode extension in [`editors/vscode/`](editors/vscode/) lets you **install aGiTrack as a VSCode plugin and launch it inside VSCode with one click** — without opening a terminal and typing `agitrack` yourself. It's a thin launcher: a brand-icon button in the editor toolbar (or the `aGiTrack:` Command Palette commands) runs the real aGiTrack CLI in a VSCode terminal, so you get the **complete experience** (the agent's native interface, the `Ctrl-G` command menu, sessions, sharing, worktrees, per-turn auto-commits — everything proxy mode does). It also installs the aGiTrack CLI on first use if it's missing, works over Remote-SSH / WSL / containers (running where the code lives), and routes the dashboard to your local browser. The TypeScript side isn't built by the Python CI — see its README to build (`npm install && npm run compile`), run it (F5 → "Run Extension"), package a `.vsix` (`npm run package`), or publish to the Marketplace (`npm run publish`, needs the maintainer's publisher token).
 
 ### Forwarding arguments to the backend
 

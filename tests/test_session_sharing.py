@@ -5,6 +5,7 @@ resolution, the Claude transcript import/export, and a push/fetch round-trip
 through a local bare remote.
 """
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -33,6 +34,129 @@ def _drain_shared_resume(runner):
     if runner._shared_resume_thread is not None:
         runner._shared_resume_thread.join(timeout=10)
     runner._service_shared_resume()
+
+
+def _row(uuid, **extra):
+    return json.dumps({"uuid": uuid, **extra})
+
+
+def test_merge_transcripts_unions_divergent_copies():
+    from agitrack.sessions.store import merge_transcripts
+
+    base = _row("a") + "\n" + _row("b") + "\n"
+    mine = base + _row("c1") + "\n"  # I appended c1
+    theirs = base + _row("c2") + "\n"  # a collaborator appended c2
+
+    merged = merge_transcripts(mine, theirs)
+    ids = [json.loads(r)["uuid"] for r in merged.splitlines() if r.strip()]
+    assert ids == ["a", "b", "c1", "c2"]  # shared prefix, then mine's tail, then theirs
+
+    # Idempotent: re-merging a copy that already has the other's rows changes nothing.
+    assert merge_transcripts(mine, merged) == merged
+    assert merge_transcripts(merged, theirs) == merged
+
+
+def test_merge_transcripts_falls_back_when_not_mergeable():
+    from agitrack.sessions.store import merge_transcripts
+
+    # Different first-row id → a different conversation → last-write-wins.
+    assert merge_transcripts(_row("x1") + "\n", _row("y1") + "\n") == _row("x1") + "\n"
+    # No per-row id (OpenCode-style single object) → last-write-wins.
+    assert merge_transcripts('{"info":{},"messages":[]}', '{"info":{"a":1}}') == '{"info":{},"messages":[]}'
+    # Empty sides degrade to the non-empty one.
+    assert merge_transcripts("x", "") == "x"
+    assert merge_transcripts("", "y") == "y"
+
+
+def _claude_user(uuid, text):
+    return json.dumps({"type": "user", "uuid": uuid, "message": {"role": "user", "content": text}})
+
+
+def _claude_assistant(uuid, text):
+    return json.dumps(
+        {
+            "type": "assistant",
+            "uuid": uuid,
+            "message": {"id": uuid, "role": "assistant", "content": [{"type": "text", "text": text}]},
+        }
+    )
+
+
+def test_publish_merges_divergent_local_entry(tmp_path):
+    # When the local ref already holds a diverged copy of the same session (e.g. a
+    # collaborator's version fetched after losing the push race), the store folds both
+    # sides' turns together instead of overwriting one with the other. Real Claude rows
+    # so the merge passes the readability guard.
+    from agitrack.sessions.store import DEFAULT_KEEP
+
+    repo = _init_repo(tmp_path)
+    store = SharedSessionStore(repo)
+    base = _claude_user("u1", "hi") + "\n" + _claude_assistant("a1", "hello") + "\n"
+    theirs = base + _claude_user("u3", "theirs") + "\n" + _claude_assistant("a3", "sure") + "\n"
+    mine = base + _claude_user("u2", "mine") + "\n" + _claude_assistant("a2", "ok") + "\n"
+    manifest = {"session_id": "sid", "content_hash": "h", "backend": "claude"}
+    store._add_session("alice", "s", theirs, manifest)
+
+    result = store._add_and_push("alice", "s", mine, manifest, DEFAULT_KEEP)
+
+    stored = store.repo.read_ref_blob(store.ref, f"{store._prefix()}alice/s/transcript.jsonl")
+    ids = [json.loads(r)["uuid"] for r in stored.splitlines() if r.strip()]
+    assert ids == ["u1", "a1", "u2", "a2", "u3", "a3"]  # union, nothing lost
+    assert result.merged == 2  # the collaborator's two rows folded in
+
+
+def test_publish_skips_unreadable_merge(tmp_path, monkeypatch):
+    # If a merge would produce a transcript the backend can't load, the store falls
+    # back to last-write-wins rather than uploading a broken session.
+    import agitrack.sessions.store as store_mod
+    from agitrack.sessions.store import DEFAULT_KEEP
+
+    repo = _init_repo(tmp_path)
+    store = SharedSessionStore(repo)
+    base = _claude_user("u1", "hi") + "\n" + _claude_assistant("a1", "hello") + "\n"
+    theirs = base + _claude_user("u3", "theirs") + "\n"
+    mine = base + _claude_user("u2", "mine") + "\n"
+    manifest = {"session_id": "sid", "content_hash": "h", "backend": "claude"}
+    store._add_session("alice", "s", theirs, manifest)
+    monkeypatch.setattr(store_mod, "_transcript_is_readable", lambda text, backend: False)
+
+    result = store._add_and_push("alice", "s", mine, manifest, DEFAULT_KEEP)
+
+    stored = store.repo.read_ref_blob(store.ref, f"{store._prefix()}alice/s/transcript.jsonl")
+    ids = [json.loads(r)["uuid"] for r in stored.splitlines() if r.strip()]
+    assert ids == ["u1", "a1", "u2"]  # our own copy, not the union
+    assert result.merged == 0
+
+
+def test_transcript_is_readable_claude():
+    from agitrack.sessions.store import _transcript_is_readable
+
+    good = _claude_user("u1", "hi") + "\n" + _claude_assistant("a1", "hello") + "\n"
+    assert _transcript_is_readable(good, "claude") is True
+    # No real turns (assistant only / empty / garbage) → not readable.
+    assert _transcript_is_readable(_claude_assistant("a1", "hello"), "claude") is False
+    assert _transcript_is_readable("", "claude") is False
+    assert _transcript_is_readable("not json\nstill not", "claude") is False
+
+
+def test_transcript_is_readable_opencode():
+    from agitrack.sessions.store import _transcript_is_readable
+
+    good = json.dumps(
+        {
+            "info": {"id": "ses"},
+            "messages": [
+                {"info": {"role": "user", "id": "u1"}, "parts": [{"type": "text", "text": "hi"}]},
+                {
+                    "info": {"role": "assistant", "id": "a1", "finish": "stop"},
+                    "parts": [{"type": "text", "text": "ok"}],
+                },
+            ],
+        }
+    )
+    assert _transcript_is_readable(good, "opencode") is True
+    assert _transcript_is_readable("{bad json", "opencode") is False
+    assert _transcript_is_readable(json.dumps({"info": {}, "messages": []}), "opencode") is False
 
 
 # --- redaction --------------------------------------------------------------
@@ -1036,6 +1160,37 @@ def test_runner_recognises_shared_session_after_id_drift(tmp_path):
     assert runner._session_auto_shared("new") is True
 
 
+def test_unshare_requires_confirmation():
+    # Unsharing removes the session from origin for everyone, so the manage menu must
+    # confirm before it runs.
+    import types
+
+    from proxy_helpers import make_runner
+
+    runner = make_runner()
+    runner._session_auto_shared = lambda sid: False
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda: None
+    entry = types.SimpleNamespace(display="alice/foo", manifest={"session_id": "sid-1"})
+    unshared: list = []
+    runner._unshare_entry = lambda e: unshared.append(e)
+
+    unshare_label = "✗ Unshare (remove for everyone)"
+
+    # Pick "Unshare", then confirm "Yes, unshare" → unshare runs.
+    answers = iter([unshare_label, "Yes, unshare"])
+    runner._select_popup = lambda *a, **k: next(answers)
+    runner._manage_one_shared_session(entry)
+    assert unshared == [entry]
+
+    # Pick "Unshare", then decline → unshare does NOT run.
+    unshared.clear()
+    answers = iter([unshare_label, "No, keep it"])
+    runner._select_popup = lambda *a, **k: next(answers)
+    runner._manage_one_shared_session(entry)
+    assert unshared == []
+
+
 # --- Claude transcript export / import --------------------------------------
 
 
@@ -1743,8 +1898,17 @@ def test_runner_manage_unshare_removes_session(tmp_path, monkeypatch):
             "content_hash": "h",
         },
     )
-    # First popup picks the (only) session; the "Manage" popup picks Unshare (3rd action).
-    runner._select_popup = lambda title, options: options[2] if title.startswith("Manage") else options[0]
+
+    # First popup picks the (only) session; the "Manage" popup picks Unshare (3rd
+    # action); the "Unshare …?" popup confirms.
+    def _popup(title, options):
+        if title.startswith("Manage"):
+            return options[2]  # Unshare
+        if title.startswith("Unshare"):
+            return "Yes, unshare"  # confirm the destructive removal
+        return options[0]  # the session picker
+
+    runner._select_popup = _popup
 
     runner._manage_shared_sessions_menu()
     # Unsharing runs in the background so the session never freezes; drain it.
@@ -1927,3 +2091,27 @@ def test_opencode_agent_delegates_sharing_to_transcript_module(tmp_path, monkeyp
     assert agent.import_shared_session(tmp_path, "ses_1", "{}", overwrite=True) is True
     assert calls["export"] == (tmp_path, "ses_1")
     assert calls["import"] == (tmp_path, "ses_1", "{}", True)
+
+
+def test_live_session_for_lineage_matches_by_origin_not_backend_id():
+    # A multi-collaborator shared entry carries the LAST sharer's session id, so a
+    # plain id match misses your own copy. _live_session_for_lineage matches by the
+    # recorded shared lineage (origin owner + name) so resuming recognizes it and keeps
+    # the existing session's name instead of minting a new one.
+    from types import SimpleNamespace
+
+    from proxy_helpers import make_runner
+
+    runner = make_runner()
+    runner.sessions = [
+        SimpleNamespace(state=SimpleNamespace(backend_session_id="my-id")),
+        SimpleNamespace(state=SimpleNamespace(backend_session_id="their-id")),
+    ]
+    origins = {
+        "my-id": {"owner": "alice", "name": "feature", "contributors": ["alice", "bob"]},
+    }
+    runner._user_state = lambda: SimpleNamespace(shared_origin=lambda sid: origins.get(sid))
+
+    assert runner._live_session_for_lineage("alice", "feature") == 0
+    assert runner._live_session_for_lineage("alice", "other") is None
+    assert runner._live_session_for_lineage("carol", "feature") is None  # different owner

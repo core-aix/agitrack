@@ -13,6 +13,12 @@ jobs:
   release:
     runs-on: ubuntu-latest
 
+    env:
+      # Set this repository secret to a Marketplace Personal Access Token to have the
+      # VSCode extension published automatically on each release. When it's absent the
+      # publish step is skipped (the rest of the release still runs).
+      VSCE_TOKEN: ${{ secrets.VSCE_TOKEN }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -54,6 +60,8 @@ jobs:
               flags=re.M
           ))
           PY
+          # Keep the VSCode extension version in lockstep with the CLI.
+          python3 scripts/sync_vscode_version.py
 
       - name: Sync version files to main via PR
         env:
@@ -64,7 +72,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git switch -c "$BRANCH"
-          git add pyproject.toml
+          git add pyproject.toml editors/vscode/package.json editors/vscode/package-lock.json
           # The version file may already match the tag (e.g. the tag was placed
           # on an already-bumped commit). Only open a PR when there's a change —
           # main cannot be pushed to directly, so the sync goes through a PR.
@@ -109,3 +117,19 @@ jobs:
             --title "${GITHUB_REF#refs/tags/}" \
             --generate-notes \
             dist/*
+
+      # Publish the VSCode extension to the Marketplace at the matching version, so a
+      # CLI release and its extension move together. Skipped when VSCE_TOKEN is unset.
+      - name: Set up Node
+        if: ${{ env.VSCE_TOKEN != '' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Publish VSCode extension
+        if: ${{ env.VSCE_TOKEN != '' }}
+        working-directory: editors/vscode
+        run: |
+          npm install --no-audit --no-fund
+          npm run compile
+          npx --yes @vscode/vsce publish --no-dependencies -p "$VSCE_TOKEN"

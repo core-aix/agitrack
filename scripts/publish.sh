@@ -183,7 +183,7 @@ fi
 COMMITTED=0
 cleanup() {
   if [ "$COMMITTED" = 0 ]; then
-    git checkout -- pyproject.toml 2>/dev/null || true
+    git checkout -- pyproject.toml editors/vscode/package.json 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
@@ -200,6 +200,9 @@ version = sys.argv[1]
 pp = pathlib.Path("pyproject.toml")
 pp.write_text(re.sub(r'^version = "[^"]+"', f'version = "{version}"', pp.read_text(), count=1, flags=re.M))
 PY
+
+# Keep the VSCode extension version in lockstep — it ships the same version as the CLI.
+python3 scripts/sync_vscode_version.py
 
 # --- 5. build + upload -------------------------------------------------------
 
@@ -236,7 +239,7 @@ fi
 
 step "Opening a release pull request"
 git switch -c "$RELEASE_PR_BRANCH"
-git add pyproject.toml
+git add pyproject.toml editors/vscode/package.json
 git commit -m "Release v$NEXT_VERSION"
 COMMITTED=1  # changes are committed on the release branch; nothing to restore
 git push -u origin "$RELEASE_PR_BRANCH"
