@@ -2174,10 +2174,14 @@ class ProxyRunner:
         if flagged:
             notes.append(f"{len(flagged)} stale session(s) need attention: {', '.join(flagged)}")
         if notes:
-            self._set_message(
-                "⚠ " + "; ".join(notes) + f".\nUse {self._menu_label()} → session (s) to handle them.",
-                seconds=12.0,
-            )
+            if active_pending:
+                instruction = (
+                    f"Open {self._menu_label()} → session and choose "
+                    "'✓ Integrate this session's commits' (or 'resolve' for a flagged session)."
+                )
+            else:
+                instruction = f"Open {self._menu_label()} → session to resolve them."
+            self._set_message("⚠ " + "; ".join(notes) + ".\n" + instruction, seconds=12.0)
 
     def _cleanup_stale_worktree(self, info) -> bool:
         # Integrate a dormant worktree's pending commits (if any) and delete it.
@@ -2736,11 +2740,16 @@ class ProxyRunner:
         if self.merge_ctx or (self.worktree is not None and self.repo.merge_in_progress()):
             options.append("✓ Complete merge for this session")
             actions.append(("complete-merge", None))
-        if self._delay_merge and not self.merge_ctx and self.worktree is not None and self._active_has_pending():
-            # --delay-merge confirm point: integrate the reviewed changes on demand.
+        if not self.merge_ctx and self.worktree is not None and self._active_has_pending():
+            # The active session has committed work not yet in the base — offer an
+            # explicit, discoverable way to integrate it now (otherwise the only path
+            # is re-selecting the current session, which isn't obvious). Under
+            # --delay-merge this is the confirm point for reviewed changes; otherwise
+            # it surfaces leftover commits (e.g. from a session resumed at startup).
             base = self._base_branch or "the base branch"
-            options.append(f"✓ Merge reviewed changes into {base}")
-            actions.append(("delay-merge-now", None))
+            label = "✓ Merge reviewed changes into " if self._delay_merge else "✓ Integrate this session's commits into "
+            options.append(label + base)
+            actions.append(("integrate-active", None))
         shared_ids = self._my_shared_session_ids()  # mark which sessions are shared (#55)
         live_names = set()
         for index, session in enumerate(self.sessions):
@@ -2809,8 +2818,8 @@ class ProxyRunner:
                 self._switch_active(value)
         elif kind == "resume-past":
             self._resume_session_menu()
-        elif kind == "delay-merge-now":
-            self._integrate_active_session()  # user-confirmed merge under --delay-merge
+        elif kind == "integrate-active":
+            self._integrate_active_session()  # explicit "integrate now" for the active session
         elif kind == "complete-merge":
             self._finalize_agent_merge()
         elif kind == "resolve":

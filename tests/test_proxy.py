@@ -619,6 +619,32 @@ def test_delay_merge_menu_choice_integrates(tmp_path):
     assert called == [True]
 
 
+def test_session_menu_offers_explicit_integrate_when_active_has_pending(tmp_path):
+    # Even outside --delay-merge, a session resumed with un-integrated commits gets an
+    # explicit, discoverable "Integrate this session's commits" entry (not just the
+    # non-obvious "re-select the current session" path).
+    runner = _delay_menu_runner(tmp_path)
+    runner._delay_merge = False
+    seen: list = []
+    runner._select_popup = lambda title, options: seen.append(options) or None
+
+    runner._session_menu()
+
+    assert any("Integrate this session's commits into main" in opt for opt in seen[0])
+
+
+def test_session_menu_explicit_integrate_choice_integrates(tmp_path):
+    runner = _delay_menu_runner(tmp_path)
+    runner._delay_merge = False
+    runner._select_popup = lambda title, options: next(o for o in options if "Integrate this session's commits" in o)
+    called: list = []
+    runner._integrate_active_session = lambda: called.append(True)
+
+    runner._session_menu()
+
+    assert called == [True]
+
+
 def _copy_runner(tmp_path, status):
     import types
 
