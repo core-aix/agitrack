@@ -228,12 +228,36 @@ async function runWhenShellReady(terminal: vscode.Terminal, command: string): Pr
     async () => {
       const integration = await waitForShellIntegration(terminal, 6000);
       if (integration) {
-        integration.executeCommand(command);
+        // Keep the notification up until aGiTrack actually starts: executeCommand returns
+        // immediately, so we wait for the command's first output chunk (aGiTrack drawing
+        // its first frame / prompt). A timeout caps the wait so it can never hang forever
+        // if a backend's raw-TUI output isn't captured by shell integration.
+        const execution = integration.executeCommand(command);
+        await waitForFirstOutput(execution, 15000);
       } else {
+        // No shell integration: launch after a short delay, then hold the notification a
+        // few seconds to cover the typical startup since we have no readiness signal.
         setTimeout(() => terminal.sendText(command), 1200);
+        await delay(5000);
       }
     },
   );
+}
+
+/** Resolve when the shell execution produces its first output, or after `timeoutMs`. */
+async function waitForFirstOutput(execution: vscode.TerminalShellExecution, timeoutMs: number): Promise<void> {
+  await Promise.race([
+    (async () => {
+      for await (const _chunk of execution.read()) {
+        return; // first chunk means aGiTrack has started producing output
+      }
+    })(),
+    delay(timeoutMs),
+  ]);
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function waitForShellIntegration(
