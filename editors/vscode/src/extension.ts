@@ -17,7 +17,7 @@
 // run. Locally (no remote) the workspace host is the local machine, so it just works.
 
 import * as vscode from "vscode";
-import { execFile } from "child_process";
+import { execFile, spawn } from "child_process";
 import { homedir } from "os";
 import { join } from "path";
 
@@ -35,6 +35,14 @@ const terminals = new Map<string, vscode.Terminal>();
 // lock), so it can run alongside a session.
 const dashboards = new Map<string, vscode.Terminal>();
 
+// Folders whose session terminal is being disposed for a user-initiated restart,
+// not a real close — recovery is skipped so it doesn't race the relaunch for the
+// repo lock (a held lock would make the new instance think aGiTrack is running).
+const restartingFolders = new Set<string>();
+// True once deactivate() begins (window close / reload): the close handler then
+// skips its own recovery because deactivate() runs it detached so it survives.
+let deactivating = false;
+
 export function activate(context: vscode.ExtensionContext): void {
   extensionContext = context;
   context.subscriptions.push(
@@ -45,15 +53,28 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("agitrack.install", () => installAgitrack()),
   );
 
-  // Forget terminals the user closes so the next launch starts a fresh one.
+  // Forget terminals the user closes so the next launch starts a fresh one — and
+  // for a session, finalize anything an abrupt close left behind (the Extension
+  // Host outlives the terminal, so it can run recovery with no time pressure).
   context.subscriptions.push(
     vscode.window.onDidCloseTerminal((closed) => {
-      for (const map of [terminals, dashboards]) {
-        for (const [key, terminal] of map) {
-          if (terminal === closed) {
-            map.delete(key);
-          }
+      for (const [key, terminal] of dashboards) {
+        if (terminal === closed) {
+          dashboards.delete(key);
         }
+      }
+      for (const [key, terminal] of terminals) {
+        if (terminal !== closed) {
+          continue;
+        }
+        terminals.delete(key);
+        if (restartingFolders.delete(key)) {
+          continue; // a relaunch is coming; don't grab the lock out from under it
+        }
+        if (deactivating) {
+          continue; // window closing — deactivate() runs recovery detached instead
+        }
+        runRecovery(key, { detached: false });
       }
     }),
   );
@@ -71,19 +92,42 @@ export function deactivate(): Thenable<void> {
   // gracefully — finalize and commit the in-flight turn — instead of being
   // hard-killed when the pty is torn down. We send aGiTrack SIGTERM (its handler
   // finalizes pending work, then exits) and wait for the process to actually
-  // disappear, up to a generous budget.
-  //
-  // Best-effort, by nature: VSCode caps how long it will wait for deactivation and
-  // owns the pty teardown, so a finalize that runs long can still be cut off. The
-  // reliable path remains Ctrl-G -> exit inside aGiTrack (see the start-up tip).
+  // disappear, up to a generous budget; then, as a backstop, kick off a DETACHED
+  // `agitrack --recover` that outlives this extension host and finishes any work
+  // the graceful exit couldn't (it no-ops if aGiTrack already exited cleanly).
+  deactivating = true;
   return shutdownSessionsGracefully(60_000);
 }
 
-/** Signal each running aGiTrack session to exit and wait (up to `timeoutMs` each) for
- * it to finish finalizing. Dashboards are read-only and need no graceful exit, so they
- * are left to be torn down with the window. */
+/** Signal each running aGiTrack session to exit, wait (up to `timeoutMs` each) for it
+ * to finish finalizing, then spawn a detached recovery as a backstop. Dashboards are
+ * read-only and need no graceful exit, so they are torn down with the window. */
 async function shutdownSessionsGracefully(timeoutMs: number): Promise<void> {
-  await Promise.all([...terminals.values()].map((terminal) => signalAndWait(terminal, timeoutMs)));
+  await Promise.all(
+    [...terminals.entries()].map(async ([folderPath, terminal]) => {
+      await signalAndWait(terminal, timeoutMs);
+      runRecovery(folderPath, { detached: true });
+    }),
+  );
+}
+
+/** Run `agitrack --recover` for a workspace folder to finalize work an abrupt close
+ * left behind — commit a finished turn and merge it (a no-op if a live session still
+ * holds the repo lock). Detached + unref'd on window close so it outlives the extension
+ * host; foreground otherwise. Best-effort: failures (e.g. CLI not installed) are ignored. */
+function runRecovery(folderPath: string, opts: { detached: boolean }): void {
+  try {
+    const child = spawn(configuredExe(), ["--repo", folderPath, "--recover"], {
+      detached: opts.detached,
+      stdio: "ignore",
+    });
+    child.on("error", () => undefined); // not installed / not runnable — nothing to do
+    if (opts.detached) {
+      child.unref();
+    }
+  } catch {
+    // ignore — recovery is best-effort
+  }
 }
 
 async function signalAndWait(terminal: vscode.Terminal, timeoutMs: number): Promise<void> {
@@ -228,6 +272,9 @@ async function restartSession(): Promise<void> {
   if (!folder) {
     return;
   }
+  // Mark this a restart so the close handler doesn't fire recovery and race the
+  // relaunch for the repo lock.
+  restartingFolders.add(folder.uri.fsPath);
   terminals.get(folder.uri.fsPath)?.dispose();
   terminals.delete(folder.uri.fsPath);
   // Give aGiTrack a moment to release its repo lock before relaunching.
