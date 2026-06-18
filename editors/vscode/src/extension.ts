@@ -18,6 +18,7 @@
 
 import * as vscode from "vscode";
 import { execFile, spawn } from "child_process";
+import { readFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 
@@ -104,8 +105,8 @@ export function deactivate(): Thenable<void> {
  * read-only and need no graceful exit, so they are torn down with the window. */
 async function shutdownSessionsGracefully(timeoutMs: number): Promise<void> {
   await Promise.all(
-    [...terminals.entries()].map(async ([folderPath, terminal]) => {
-      await signalAndWait(terminal, timeoutMs);
+    [...terminals.keys()].map(async (folderPath) => {
+      await signalAndWait(folderPath, timeoutMs);
       runRecovery(folderPath, { detached: true });
     }),
   );
@@ -130,13 +131,12 @@ function runRecovery(folderPath: string, opts: { detached: boolean }): void {
   }
 }
 
-async function signalAndWait(terminal: vscode.Terminal, timeoutMs: number): Promise<void> {
-  let pid: number | undefined;
-  try {
-    pid = await terminal.processId; // aGiTrack's PID — we launch sessions with `exec`
-  } catch {
-    return;
-  }
+async function signalAndWait(folderPath: string, timeoutMs: number): Promise<void> {
+  // aGiTrack runs as a child of the shell, so the terminal's processId is the shell,
+  // not aGiTrack. Read aGiTrack's own PID from the repo lock file it writes while
+  // running (.agitrack/lock). A clean exit truncates that file, so an empty/missing
+  // pid means there's nothing to signal — it already finished.
+  const pid = readAgitrackPid(folderPath);
   if (!pid) {
     return;
   }
@@ -152,6 +152,32 @@ async function signalAndWait(terminal: vscode.Terminal, timeoutMs: number): Prom
     }
     await delay(150);
   }
+}
+
+/** aGiTrack's PID from the repo lock file it holds while running, or undefined when no
+ * session is running there (file missing, or truncated to empty by a clean exit). */
+function readAgitrackPid(folderPath: string): number | undefined {
+  try {
+    const info = JSON.parse(readFileSync(join(folderPath, ".agitrack", "lock"), "utf8"));
+    return typeof info?.pid === "number" ? info.pid : undefined;
+  } catch {
+    return undefined; // no lock / empty / unreadable
+  }
+}
+
+/** Find a surviving aGiTrack terminal for `folder` to reattach to when our map lost it
+ * (e.g. after an extension reload). Gated on a live repo-lock PID so we only reattach
+ * when a session is genuinely running in that folder — never to an unrelated terminal. */
+function findAgitrackTerminal(folder: vscode.WorkspaceFolder): vscode.Terminal | undefined {
+  const pid = readAgitrackPid(folder.uri.fsPath);
+  if (!pid || !isAlive(pid)) {
+    return undefined; // no live session here — let a fresh one start
+  }
+  const named = `${TERMINAL_NAME} (${folder.name})`;
+  return (
+    vscode.window.terminals.find((t) => t.name === named) ??
+    vscode.window.terminals.find((t) => t.name === TERMINAL_NAME)
+  );
 }
 
 /** True while `pid` exists; signal 0 only probes (it sends nothing) and throws once
@@ -193,10 +219,16 @@ async function startSession(targetUri?: vscode.Uri): Promise<void> {
   }
 
   const key = folder.uri.fsPath;
-  const existing = terminals.get(key);
+  // Never start a second session in a folder that already has one — just bring the
+  // existing terminal forward, so a still-running job is never interrupted/restarted.
+  // Reattach to a surviving terminal even if our map lost it (e.g. an extension reload
+  // cleared the map but VSCode kept the terminal), and confirm a session is actually
+  // running there via the repo lock before reusing it.
+  const existing = terminals.get(key) ?? findAgitrackTerminal(folder);
   if (existing) {
+    terminals.set(key, existing);
     existing.show();
-    return; // aGiTrack is already running here — just bring it forward.
+    return;
   }
 
   const exe = await ensureCliAvailable();
@@ -214,14 +246,16 @@ async function startSession(targetUri?: vscode.Uri): Promise<void> {
   // landing in the agent, or a stray newline auto-answering the privacy prompt).
   // spawnAgitrackTerminal sequences the launch via shell integration to guarantee this.
   //
-  // `exec` replaces the shell with aGiTrack, so (a) `terminal.processId` is aGiTrack's
-  // own PID — letting deactivate() signal it directly for a graceful exit — and (b) the
-  // terminal closes when aGiTrack exits (the process is gone), same as a clean quit.
+  // `&& exit` closes the terminal ONLY when aGiTrack exits successfully (status 0, e.g.
+  // Ctrl-G → exit). On a non-zero/error exit the `&& exit` is skipped, so the shell
+  // stays open with aGiTrack's error message still on screen for the user to read.
+  // aGiTrack runs as a child of the shell (not `exec`-ed), so it's a real child process
+  // VSCode can see — which also makes the close-confirmation prompt fire consistently.
   const terminal = spawnAgitrackTerminal({
     name: terminals.size === 0 ? TERMINAL_NAME : `${TERMINAL_NAME} (${folder.name})`,
     cwd: folder.uri.fsPath,
     icon: "git-commit",
-    command: `exec ${launchCommand(exe)}`,
+    command: `${launchCommand(exe)} && exit`,
   });
   terminals.set(key, terminal);
   terminal.show();

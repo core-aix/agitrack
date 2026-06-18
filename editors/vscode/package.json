@@ -118,7 +118,7 @@
           "type": "array",
           "items": { "type": "string" },
           "default": [],
-          "description": "Extra command-line arguments passed to aGiTrack (e.g. [\"--no-worktree\"])."
+          "markdownDescription": "Any extra command-line arguments to pass to `agitrack` on launch, one per array entry (e.g. `[\"--no-worktree\", \"--delay-merge\"]`). Anything aGiTrack doesn't recognize is forwarded to the backend CLI (claude/opencode), so this is the place to pass backend flags too — e.g. `[\"--\", \"--verbose\"]`. These are appended after `agitrack.backend`."
         },
         "agitrack.openOnStartup": {
           "type": "boolean",
