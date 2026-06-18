@@ -17,6 +17,8 @@
 // run. Locally (no remote) the workspace host is the local machine, so it just works.
 
 import * as vscode from "vscode";
+import * as fs from "fs";
+import * as path from "path";
 import { execFile } from "child_process";
 import { homedir } from "os";
 import { join } from "path";
@@ -106,14 +108,21 @@ async function startSession(targetUri?: vscode.Uri): Promise<void> {
 
   await ensureCloseConfirmation();
 
-  const terminal = createTerminal(folder);
+  // Run aGiTrack as the terminal's OWN process (shellPath), not a command typed into a
+  // shell. Crucial: a shell terminal gets other commands injected into it (VSCode shell
+  // integration, the Python extension's venv activation) whose trailing newline would
+  // land on aGiTrack's "Press Enter to acknowledge…" privacy prompt and auto-confirm it.
+  // With no shell, nothing else can type into aGiTrack. It also means the terminal
+  // closes when aGiTrack exits (e.g. Ctrl-G → exit), with no `&& exit` needed.
+  const terminal = spawnAgitrackTerminal({
+    name: terminals.size === 0 ? TERMINAL_NAME : `${TERMINAL_NAME} (${folder.name})`,
+    cwd: folder.uri.fsPath,
+    icon: "git-commit",
+    exe: resolveExePath(exe),
+    args: backendArgs(),
+  });
   terminals.set(key, terminal);
   terminal.show();
-  // `&& exit` closes the terminal automatically when aGiTrack exits cleanly (e.g. the
-  // user picks "exit" in the Ctrl-G menu). A non-zero exit (a startup error) skips it,
-  // so the message stays visible. aGiTrack still runs as the shell's foreground child,
-  // so VSCode's confirmOnKill prompt for closing the terminal continues to work.
-  terminal.sendText(`${launchCommand(exe)} && exit`);
 }
 
 /** Make sure closing the aGiTrack terminal is confirmed (so aGiTrack can exit
@@ -170,23 +179,33 @@ async function openDashboard(targetUri?: vscode.Uri): Promise<void> {
     return;
   }
 
-  const terminal = vscode.window.createTerminal({
+  const terminal = spawnAgitrackTerminal({
     name: dashboards.size === 0 ? `${TERMINAL_NAME} Dashboard` : `${TERMINAL_NAME} Dashboard (${folder.name})`,
     cwd: folder.uri.fsPath,
-    iconPath: new vscode.ThemeIcon("graph"),
-    location: terminalLocation(),
+    icon: "graph",
+    exe: resolveExePath(exe),
+    args: ["--repo", folder.uri.fsPath, "--dashboard"],
   });
   dashboards.set(key, terminal);
   terminal.show();
-  terminal.sendText(`${quote(exe)} --repo ${quote(folder.uri.fsPath)} --dashboard`);
 }
 
-function createTerminal(folder: vscode.WorkspaceFolder): vscode.Terminal {
+/** Create a terminal whose process IS aGiTrack (shellPath), so no shell can inject
+ * input into it. */
+function spawnAgitrackTerminal(opts: {
+  name: string;
+  cwd: string;
+  icon: string;
+  exe: string;
+  args: string[];
+}): vscode.Terminal {
   return vscode.window.createTerminal({
-    name: terminals.size === 0 ? TERMINAL_NAME : `${TERMINAL_NAME} (${folder.name})`,
-    cwd: folder.uri.fsPath,
-    iconPath: new vscode.ThemeIcon("git-commit"),
+    name: opts.name,
+    cwd: opts.cwd,
+    iconPath: new vscode.ThemeIcon(opts.icon),
     location: terminalLocation(),
+    shellPath: opts.exe,
+    shellArgs: opts.args,
     env: {
       // aGiTrack runs the agent inside its own terminal UI. When the backend is Claude
       // Code, it otherwise tries to auto-install its VSCode companion extension on
@@ -197,6 +216,41 @@ function createTerminal(folder: vscode.WorkspaceFolder): vscode.Terminal {
       CLAUDE_CODE_IDE_SKIP_AUTO_INSTALL: "1",
     },
   });
+}
+
+/** Backend / extra CLI arguments from settings, as an argv array (no shell quoting). */
+function backendArgs(): string[] {
+  const config = vscode.workspace.getConfiguration("agitrack");
+  const backend = config.get<string>("backend") || "";
+  const extra = config.get<string[]>("args") || [];
+  const args: string[] = [];
+  if (backend) {
+    args.push("--backend", backend);
+  }
+  args.push(...extra);
+  return args;
+}
+
+/** Absolute path to the aGiTrack executable for use as a terminal `shellPath`. A bare
+ * name is resolved against the same PATH that already located it (we ran `--version`),
+ * since a `shellPath` must point at a real executable. */
+function resolveExePath(exe: string): string {
+  if (exe.includes(path.sep) || exe.includes("/")) {
+    return exe; // already a path
+  }
+  for (const dir of (process.env.PATH || "").split(path.delimiter)) {
+    if (!dir) {
+      continue;
+    }
+    const candidate = path.join(dir, exe);
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return candidate;
+    } catch {
+      // not here — keep looking
+    }
+  }
+  return exe; // fall back to the bare name and let the OS resolve it
 }
 
 /** Where aGiTrack's terminal opens. Default `beside`: in the editor area, split to
@@ -213,23 +267,8 @@ function terminalLocation(): vscode.TerminalOptions["location"] {
   }
 }
 
-/** Build the `agitrack …` command line from the user's settings. */
-function launchCommand(exe: string): string {
-  const config = vscode.workspace.getConfiguration("agitrack");
-  const backend = config.get<string>("backend") || "";
-  const extra = config.get<string[]>("args") || [];
-
-  const parts = [quote(exe)];
-  if (backend) {
-    parts.push("--backend", backend);
-  }
-  for (const arg of extra) {
-    parts.push(quote(arg));
-  }
-  return parts.join(" ");
-}
-
-/** Quote a shell argument only when it contains characters that need it. */
+/** Quote a shell argument only when it contains characters that need it (used for the
+ * install-in-terminal fallback, which runs in a shell). */
 function quote(value: string): string {
   return /[^\w./:-]/.test(value) ? `'${value.replace(/'/g, "'\\''")}'` : value;
 }
