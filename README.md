@@ -80,6 +80,13 @@ update                    check for / install an aGiTrack self-update
 exit                      exit (with confirmation)
 ```
 
+When any worktree still has un-integrated work — committed-but-unmerged commits, **or**
+uncommitted (committable) changes — a **`merge`** command appears at the **top** of the
+`Ctrl-G` palette so the work isn't forgotten. It lets you pick which worktree (if more than
+one) and which branch to merge into: the branch checked out in your directory, that
+session's own merge branch, or any other branch. A worktree with uncommitted changes is
+**committed first, then merged**; a conflict surfaces the usual resolve options.
+
 aGiTrack tracks one session per repository and stays pinned to the session it launched (so it does not drift to other sessions you open). Use the `session` command (`Ctrl-G`, then `session`) to start a new session, switch the tracked session to another existing one, or sync tracking to the most recently active session — for example after starting a new conversation inside the backend's own TUI. This works the same for all backends.
 
 Only `session` starts with `s`, so `Ctrl-G` then `s` + Enter jumps straight to the session picker. The session menu marks each session `running` or `idle`. Git-specific commands share a `git-` prefix.

@@ -598,6 +598,139 @@ def _delay_menu_runner(tmp_path):
     return runner
 
 
+# --- Ctrl-G "merge": rescue un-integrated worktrees into a chosen branch -----------
+
+
+def test_proxy_input_matches_puts_extra_commands_first():
+    from agitrack.proxy.runner import ProxyInput
+
+    inp = ProxyInput()
+    inp.extra_commands = ["merge"]
+    assert inp.matches()[0] == "merge"  # surfaced at the very top
+    assert "sessions" in inp.matches()
+    inp.extra_commands = []
+    assert inp.matches()[0] == "sessions"  # default order unchanged when nothing extra
+
+
+def _merge_runner(tmp_path):
+    import types
+
+    runner = make_runner()
+    runner.merge_ctx = None
+    runner.agent_in_flight = False
+    runner.worktree = types.SimpleNamespace(name="s", path=tmp_path)
+    runner.repo = types.SimpleNamespace(
+        repo=tmp_path,
+        has_tracked_changes=lambda: False,
+        untracked_files=lambda: [],
+        current_branch=lambda: "agit/x",
+    )
+    runner.state = types.SimpleNamespace(declined_untracked=lambda: [])
+    runner.name = "feature"
+    runner._base_branch = "session-base"
+    runner._repo_dir_branch = "main"
+    runner._active_has_pending = lambda: True
+    runner.sessions = []
+    runner._dormant_worktrees = lambda live: []
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda *a, **k: None
+    return runner
+
+
+def test_has_unmerged_work_true_when_active_has_pending(tmp_path):
+    runner = _merge_runner(tmp_path)
+    assert runner._unmerged_worktrees() == [("feature (current session)", "")]
+    assert runner._has_unmerged_work() is True
+
+
+def test_has_unmerged_work_false_when_nothing_pending(tmp_path):
+    runner = _merge_runner(tmp_path)
+    runner._active_has_pending = lambda: False
+    assert runner._has_unmerged_work() is False
+
+
+def test_unmerged_includes_active_with_only_uncommitted_changes(tmp_path):
+    # No committed-but-unmerged commits, but the worktree has uncommitted edits — still
+    # offered (and committed before merging), so the work isn't stranded.
+    runner = _merge_runner(tmp_path)
+    runner._active_has_pending = lambda: False
+    runner.repo.has_tracked_changes = lambda: True
+    assert runner._unmerged_worktrees() == [("feature (current session)", "")]
+
+
+def test_unmerged_excludes_active_while_agent_running(tmp_path):
+    # Mid-turn uncommitted changes are expected and auto-committed, so don't nag then.
+    runner = _merge_runner(tmp_path)
+    runner.agent_in_flight = True
+    runner.repo.has_tracked_changes = lambda: True
+    assert runner._unmerged_worktrees() == []
+
+
+def test_committable_changes_ignores_declined_untracked(tmp_path):
+    runner = _merge_runner(tmp_path)
+    runner.repo.has_tracked_changes = lambda: False
+    runner.repo.untracked_files = lambda: ["a.py"]
+    runner.state.declined_untracked = lambda: ["a.py"]  # intentionally unstaged -> not committable
+    assert runner._active_has_committable_changes() is False
+    runner.state.declined_untracked = lambda: []
+    assert runner._active_has_committable_changes() is True
+
+
+def test_merge_active_commits_uncommitted_before_integrating(tmp_path):
+    runner = _merge_runner(tmp_path)
+    runner.repo.has_tracked_changes = lambda: True  # uncommitted work present
+    order: list = []
+    runner._commit_latest_turn_sync = lambda: order.append("commit")
+    runner._integrate_active_session = lambda: order.append("integrate")
+
+    runner._merge_active_into("release")
+
+    assert order == ["commit", "integrate"]  # commit FIRST, then merge
+    assert runner._base_branch == "release"
+
+
+def test_merge_command_merges_single_item_into_chosen_target(tmp_path):
+    runner = _merge_runner(tmp_path)
+    runner._choose_merge_target = lambda name: "release"
+    merged: list = []
+    runner._merge_active_into = lambda target: merged.append(target)
+
+    runner._handle_merge_command()
+
+    assert merged == ["release"]  # one unmerged worktree -> straight to target choice + merge
+
+
+def test_choose_merge_target_offers_current_session_and_custom(tmp_path):
+    runner = _merge_runner(tmp_path)
+    seen: list = []
+    runner._select_popup = lambda title, options: seen.append(options) or None  # cancel after building
+
+    assert runner._choose_merge_target("") is None  # cancelled
+    options = seen[0]
+    assert any("Current branch (main)" in opt for opt in options)
+    assert any("Session's branch (session-base)" in opt for opt in options)
+    assert any("different branch" in opt for opt in options)
+
+
+def test_choose_merge_target_custom_prompts_for_any_branch(tmp_path):
+    runner = _merge_runner(tmp_path)
+    runner._select_popup = lambda title, options: next(o for o in options if "different branch" in o)
+    runner._prompt_merge_branch = lambda title, current: "hotfix"
+
+    assert runner._choose_merge_target("") == "hotfix"
+
+
+def test_merge_active_into_retargets_base_then_integrates(tmp_path):
+    runner = _merge_runner(tmp_path)
+    integrated: list = []
+    runner._integrate_active_session = lambda: integrated.append(runner._base_branch)
+
+    runner._merge_active_into("release")
+
+    assert runner._base_branch == "release"  # re-pointed to the chosen destination
+    assert integrated == ["release"]  # then integrated into it (handles conflict via that path)
+
+
 def test_delay_merge_menu_offers_merge_entry(tmp_path):
     runner = _delay_menu_runner(tmp_path)
     seen: list = []

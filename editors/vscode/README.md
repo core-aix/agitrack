@@ -1,8 +1,15 @@
 # aGiTrack for VSCode
 
 Install [aGiTrack](https://github.com/core-aix/agitrack) as a VSCode plugin and launch
-it **inside VSCode with one click** — no opening a terminal and typing `agitrack`
-yourself.
+it **inside VSCode** — no opening a terminal and typing `agitrack` yourself.
+
+**To start aGiTrack, do either:**
+
+- Click the **aG button** — the brand icon at the **top-right of the editor toolbar** — or
+- open the **Command Palette** (<kbd>Ctrl/Cmd</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd>) and run
+  **aGiTrack: Start aGiTrack**.
+
+That's it — a session opens in a VSCode terminal.
 
 This extension is a thin **launcher**: it runs the real aGiTrack CLI in a VSCode
 integrated terminal, so you get the **complete aGiTrack experience** — the coding
@@ -22,11 +29,11 @@ you already have it elsewhere, point `agitrack.path` at it.
 
 ## Usage
 
-Click the **aGiTrack** button (the brand icon at the top-right of the editor toolbar)
-to start a session immediately. You can also:
+Start a session in any of these ways:
 
-- run **aGiTrack: Start Session** from the Command Palette, or
-- right-click a folder in the Explorer → **aGiTrack: Start Session Here**.
+- Click the **aG button** (the brand icon at the top-right of the editor toolbar),
+- run **aGiTrack: Start aGiTrack** from the Command Palette, or
+- right-click a folder in the Explorer → **aGiTrack: Start aGiTrack Here**.
 
 A session opens **beside the editor** (a split to the right) by default and starts. From
 there it's the normal aGiTrack app: type to the agent, press `Ctrl-G` for aGiTrack's
@@ -35,7 +42,7 @@ every turn is auto-committed. Prefer the bottom panel? Set `agitrack.terminalLoc
 to `panel`.
 
 Running it again focuses the existing session (aGiTrack only allows one per repository).
-**aGiTrack: Restart Session** stops it and starts fresh.
+**aGiTrack: Restart aGiTrack** stops it and starts fresh.
 
 **Closing the session terminal** prompts you to confirm, and aGiTrack then **exits
 gracefully** — finalizing and committing the latest turn rather than dropping it. The
