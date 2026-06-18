@@ -36,6 +36,19 @@ def test_claude_proxy_agent_spawn_command_uses_session_id_and_resume():
     assert agent.spawn_command(Path("/repo"), session_id="u1", resume=True) == ["claude", "--resume", "u1", *note]
     assert agent.spawn_command(Path("/repo"), session_id=None, resume=False) == ["claude", *note]
     assert "aGiTrack" in AGENT_SYSTEM_NOTE and "git commit" in AGENT_SYSTEM_NOTE
+    # In the default worktree model the note also explains that aGiTrack runs in a worktree
+    # under .agitrack/ and auto-merges it into the current branch (so the agent leaves those
+    # alone); spawn_command defaults to that variant.
+    assert ".agitrack/" in AGENT_SYSTEM_NOTE and "worktree" in AGENT_SYSTEM_NOTE
+    # Under --no-worktree the worktree clause is dropped (the agent edits the branch directly),
+    # but the no-self-commit guidance stays.
+    from agitrack.backends.proxy_agents import agent_system_note
+
+    no_wt = agent_system_note(use_worktrees=False)
+    assert ".agitrack/" not in no_wt and "worktree" not in no_wt
+    assert "git commit" in no_wt
+    cmd = agent.spawn_command(Path("/repo"), session_id="u1", resume=False, use_worktrees=False)
+    assert cmd == ["claude", "--session-id", "u1", "--append-system-prompt", no_wt]
     # commit_guidance=False (--no-commit-guidance) omits the note entirely.
     assert agent.spawn_command(Path("/repo"), session_id=None, resume=False, commit_guidance=False) == ["claude"]
     assert "--append-system-prompt" not in agent.spawn_command(
@@ -188,9 +201,10 @@ def test_claude_backend_bare_run_strips_tools_memory_and_system_prompt(monkeypat
     normal = captured["command"]
     assert "--tools" not in normal and "--system-prompt" not in normal and "--strict-mcp-config" not in normal
     # A coding run (not bare) IS told aGiTrack auto-commits, so it doesn't self-commit.
-    from agitrack.backends.proxy_agents import AGENT_SYSTEM_NOTE
+    # Shell mode runs on the repo directly (no worktree), so the worktree clause is omitted.
+    from agitrack.backends.proxy_agents import agent_system_note
 
-    assert normal[normal.index("--append-system-prompt") + 1] == AGENT_SYSTEM_NOTE
+    assert normal[normal.index("--append-system-prompt") + 1] == agent_system_note(use_worktrees=False)
 
     # ...but commit_guidance=False (--no-commit-guidance) omits it on a coding run too.
     backend.run("do real work", model=None, session_id=None, commit_guidance=False)

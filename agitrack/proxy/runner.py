@@ -994,7 +994,11 @@ class ProxyRunner:
                 # the one it creates can be identified on the first parse.
                 self._pre_spawn_session_ids = {ref.id for ref in self.backend.list_sessions(self.repo.repo)}
         command = self.backend.spawn_command(
-            self.repo.repo, session_id=session_id, resume=resume, commit_guidance=self._commit_guidance
+            self.repo.repo,
+            session_id=session_id,
+            resume=resume,
+            commit_guidance=self._commit_guidance,
+            use_worktrees=self._use_worktrees,
         )
         # Forward any backend-specific args the user passed through aGiTrack (#32),
         # before the sandbox wrapper so they reach the backend, not sandbox-exec.
