@@ -79,6 +79,7 @@ aGiTrack stands for agent + git tracking. It is a Python library and interactive
 - `session` opens an interactive menu of the live concurrent sessions to switch between them, start a new one (in its own worktree), or stop one. Each entry shows whether the session is `running` (a turn is in flight / it produced output recently) or `idle`. Typed forms: `session new`, `session <n>` (switch to the n-th).
 - `agent-backend` selects the agent backend (`opencode` or `claude`); with no argument it shows a picker. Switching relaunches the backend TUI, restores that backend's previous session for the repo if known, and updates the saved global default.
 - `git-status` shows Git status; `git-stage` reviews/stages untracked files; `git-unstaged` shows intentionally unstaged files; `git-user-commit` creates a user commit.
+- `dashboard` serves the metrics dashboard (`agitrack/metrics` `build_server`) on a daemon thread inside the proxy process (read-only, no repo lock) and opens it in the browser; reused if already running and shut down on exit via `_stop_dashboard()` (in the `run()` finally). The same action is exposed in the VSCode extension's aGiTrack menu, which runs `agitrack -d` in a terminal.
 - `exit` exits (with confirmation; finalizes pending commits first).
 
 ## OpenCode Backend

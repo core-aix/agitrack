@@ -12,19 +12,31 @@ aGiTrack does in a terminal, started from VSCode.
 
 ## Requirements
 
-- aGiTrack installed and on your `PATH` (`pipx install agitrack`), or set `agitrack.path`.
+- **Python 3.10+** (so the aGiTrack CLI can be installed — see below).
 - A backend installed (Claude Code or OpenCode), the same as using aGiTrack in a terminal.
 - The workspace is a git repository.
 
+The aGiTrack CLI itself does **not** need to be installed first — if it's missing, the
+extension offers to install it for you (via `pipx`, falling back to `pip --user`). If
+you already have it elsewhere, point `agitrack.path` at it.
+
 ## Usage
 
-- Click the **`$(git-commit) aGiTrack`** button in the status bar, or
-- run **aGiTrack: Start Session** from the Command Palette, or
+Open the **aGiTrack menu** (the brand-icon button at the top-right of the editor
+toolbar) and choose **Start Session** or **Open Dashboard**. You can also:
+
+- click the **`$(git-commit) aGiTrack`** button in the status bar to start a session, or
+- run **aGiTrack: Start Session** / **aGiTrack: Open Dashboard** from the Command Palette, or
 - right-click a folder in the Explorer → **aGiTrack: Start Session Here**.
 
-A terminal opens in your workspace and aGiTrack starts. From there it's the normal
-aGiTrack app: type to the agent, press `Ctrl-G` for aGiTrack's command menu (sessions,
-sharing, summarizer, commits, update, …), and every turn is auto-committed.
+A session opens **beside the editor** (a split to the right) by default and starts. From
+there it's the normal aGiTrack app: type to the agent, press `Ctrl-G` for aGiTrack's
+command menu (sessions, sharing, summarizer, commits, update, …), and every turn is
+auto-committed. Prefer the bottom panel? Set `agitrack.terminalLocation` to `panel`.
+
+**Open Dashboard** runs aGiTrack's metrics dashboard (`agitrack -d`) — it serves a
+filterable, auto-refreshing report on localhost and opens it in your browser. It's
+read-only and can run alongside a session; Ctrl-C in its terminal to stop it.
 
 Running the command again focuses the existing session (aGiTrack only allows one per
 repository). Use **aGiTrack: Restart Session** to stop it and start fresh.
@@ -37,6 +49,22 @@ repository). Use **aGiTrack: Restart Session** to stop it and start fresh.
 | `agitrack.backend` | (aGiTrack default) | `claude` or `opencode`. |
 | `agitrack.args` | `[]` | Extra CLI arguments (e.g. `["--no-worktree"]`). |
 | `agitrack.openOnStartup` | `false` | Start a session automatically when a workspace opens. |
+| `agitrack.terminalLocation` | `beside` | Where the terminal opens: `beside` (right of the editor), `editor` (new editor tab), or `panel` (bottom). |
+
+## Remote development
+
+The extension is a **workspace** extension, so in a **Remote-SSH**, **WSL**, **Dev
+Container**, or **Codespaces** window it runs on the *remote* host — the same machine
+as your code. That means:
+
+- the aGiTrack terminal opens on the remote (where the repo lives and the agent must run);
+- `agitrack` is found on the remote's `PATH` (set `agitrack.path` in your **Remote**
+  settings if needed); and
+- if aGiTrack isn't installed on the remote, the extension installs it **there** (the
+  pipx/pip install runs on the remote host, next to the code).
+
+When you install the extension in a remote window, VSCode installs it on the remote
+automatically. Locally (no remote), the same extension just runs on your machine.
 
 ## Updates
 

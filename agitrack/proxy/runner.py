@@ -197,6 +197,7 @@ class ProxyInput:
         "session",
         "agent-backend",
         "summarizer",
+        "dashboard",
         "git-unstaged",
         "git-user-commit",
         "update",
@@ -593,6 +594,12 @@ class ProxyRunner:
         self._relaunch_times: list[float] = []
         self._exiting = False
         self._finalized_on_exit = False
+        # The metrics dashboard, when started from the Ctrl-G menu, runs on a daemon
+        # thread inside this process (read-only HTTP server) so the TUI keeps running;
+        # shut down on exit. None until first started.
+        self._dashboard_server: Any = None
+        self._dashboard_thread: "threading.Thread | None" = None
+        self._dashboard_url: str | None = None
         # Set once the interactive exit flow has committed to quitting (worktree
         # removed). The reactor loop checks this after running a menu command so an
         # "exit"/"quit" command breaks the loop instead of falling through to the
@@ -809,6 +816,9 @@ class ProxyRunner:
                 "_relaunch_times": [],
                 "_exiting": False,
                 "_finalized_on_exit": False,
+                "_dashboard_server": None,
+                "_dashboard_thread": None,
+                "_dashboard_url": None,
                 "_exit_requested": False,
                 # Self-update fields (production sets these in __init__).
                 "_updater": None,
@@ -927,6 +937,7 @@ class ProxyRunner:
             for signum, handler in self.original_signal_handlers.items():
                 signal.signal(signum, handler)
             self._stop_file_watcher()
+            self._stop_dashboard()
             self._cleanup_child()
             self._restore_terminal()
             if self.master_fd is not None:
@@ -5656,11 +5667,64 @@ class ProxyRunner:
         elif name == "update":
             self._handle_update_command()
             return
+        elif name == "dashboard":
+            self._handle_dashboard_command()
+            return
         elif name == "":
             self._set_message("Select an aGiTrack command.")
         else:
             self._set_message(f"Unknown aGiTrack command: {name}")
         self._render()
+
+    def _handle_dashboard_command(self) -> None:
+        """Ctrl-G → "dashboard": serve aGiTrack's metrics dashboard for this repo and
+        open it in the browser. The dashboard is read-only and runs on a daemon thread
+        inside this process (so the TUI keeps running); it's reused if already up and
+        shut down on exit."""
+        import threading
+        import webbrowser
+
+        if self._dashboard_server is not None:
+            url = self._dashboard_url or ""
+            try:
+                webbrowser.open(url)
+            except Exception:
+                pass
+            self._set_message(f"Dashboard already running at {url}")
+            self._render()
+            return
+        try:
+            from agitrack.metrics import build_server
+            from agitrack.metrics.server import DEFAULT_HOST
+
+            server = build_server(self.base_repo)
+            url = f"http://{DEFAULT_HOST}:{server.server_address[1]}/"
+            thread = threading.Thread(target=server.serve_forever, name="agitrack-dashboard", daemon=True)
+            thread.start()
+            self._dashboard_server = server
+            self._dashboard_thread = thread
+            self._dashboard_url = url
+            try:
+                webbrowser.open(url)
+            except Exception:
+                pass
+            self._set_message(f"Dashboard live at {url} — opening in your browser.")
+        except Exception as error:
+            self._set_message(f"Could not start the dashboard: {error}")
+        self._render()
+
+    def _stop_dashboard(self) -> None:
+        """Shut the dashboard server down if it was started this session."""
+        server = self._dashboard_server
+        if server is None:
+            return
+        self._dashboard_server = None
+        self._dashboard_thread = None
+        try:
+            server.shutdown()
+            server.server_close()
+        except Exception:
+            pass
 
     def _popup_read_input(self) -> bytes:
         # Read the user's next keypress for a modal popup WITHOUT suspending the
