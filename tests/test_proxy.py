@@ -689,6 +689,39 @@ def test_merge_active_commits_uncommitted_before_integrating(tmp_path):
     assert runner._base_branch == "release"
 
 
+def test_active_has_mergeable_work_excludes_in_flight_turn(tmp_path):
+    runner = _merge_runner(tmp_path)  # _active_has_pending True
+    assert runner._active_has_mergeable_work() is True
+    runner.agent_in_flight = True
+    assert runner._active_has_mergeable_work() is False  # mid-turn: not "stranded"
+
+
+def test_select_current_session_integrates_when_there_is_work(tmp_path):
+    # Picking the session you're already in, with work to merge, runs the integrate
+    # (commit/merge messages pop up) rather than the confusing "nothing to integrate".
+    runner = _merge_runner(tmp_path)  # _active_has_pending True
+    merged: list = []
+    runner._merge_active_into = lambda target: merged.append(target)
+
+    runner._select_current_session()
+
+    assert merged == ["session-base"]  # integrates into the session's own merge branch
+
+
+def test_select_current_session_acknowledges_when_nothing_to_merge(tmp_path):
+    runner = _merge_runner(tmp_path)
+    runner._active_has_pending = lambda: False
+    runner.repo.has_tracked_changes = lambda: False
+    runner.repo.untracked_files = lambda: []
+    messages: list = []
+    runner._set_message = lambda message, **kwargs: messages.append(message)
+
+    runner._select_current_session()
+
+    assert messages and "Already in session 'feature'" in messages[0]
+    assert "nothing to integrate" not in messages[0]
+
+
 def test_merge_command_merges_single_item_into_chosen_target(tmp_path):
     runner = _merge_runner(tmp_path)
     runner._choose_merge_target = lambda name: "release"
