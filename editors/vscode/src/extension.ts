@@ -397,6 +397,13 @@ async function runWhenShellReady(terminal: vscode.Terminal, command: string): Pr
     async () => {
       const integration = await waitForShellIntegration(terminal, 6000);
       if (integration) {
+        // Shell integration reports "ready" at the first prompt — which can be BEFORE
+        // VSCode's Python extension injects `source .venv/bin/activate`. aGiTrack is a
+        // long-running foreground process, so launching at "ready" would push that
+        // activation behind aGiTrack (it would only run after aGiTrack exits). Wait for
+        // VSCode's own startup command(s) to run and finish first, so the venv is active
+        // BEFORE aGiTrack starts.
+        await waitForShellSetupToSettle(terminal, 2500);
         // Keep the notification up until aGiTrack actually starts: executeCommand returns
         // immediately, so we wait for the command's first output chunk (aGiTrack drawing
         // its first frame / prompt). A timeout caps the wait so it can never hang forever
@@ -411,6 +418,44 @@ async function runWhenShellReady(terminal: vscode.Terminal, command: string): Pr
       }
     },
   );
+}
+
+/** After shell integration is ready, wait for VSCode's own startup command(s) — venv /
+ * conda activation — to run and finish, so they execute BEFORE aGiTrack instead of being
+ * queued behind it. VSCode is given a grace window of `graceMs` to *kick off* such a
+ * command: if one starts we wait for it to end (and any back-to-back ones), and if none
+ * starts within the window we proceed — activation was via environment variables (no
+ * command to wait for), or there is no venv. */
+function waitForShellSetupToSettle(terminal: vscode.Terminal, graceMs: number): Promise<void> {
+  return new Promise((resolve) => {
+    let active = 0;
+    let graceTimer: ReturnType<typeof setTimeout>;
+    const finish = () => {
+      startSub.dispose();
+      endSub.dispose();
+      clearTimeout(graceTimer);
+      resolve();
+    };
+    const startSub = vscode.window.onDidStartTerminalShellExecution((event) => {
+      if (event.terminal === terminal) {
+        active++;
+        clearTimeout(graceTimer); // a startup command is running — wait for it to finish
+      }
+    });
+    const endSub = vscode.window.onDidEndTerminalShellExecution((event) => {
+      if (event.terminal === terminal) {
+        active = Math.max(0, active - 1);
+        if (active === 0) {
+          finish(); // VSCode's setup command(s) have finished — safe to launch aGiTrack
+        }
+      }
+    });
+    graceTimer = setTimeout(() => {
+      if (active === 0) {
+        finish(); // nothing kicked off in the grace window — nothing to wait for
+      }
+    }, graceMs);
+  });
 }
 
 /** Resolve when the shell execution produces its first output, or after `timeoutMs`. */

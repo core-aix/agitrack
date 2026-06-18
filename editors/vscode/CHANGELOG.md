@@ -15,18 +15,18 @@ Launch the full aGiTrack terminal application from VSCode — no terminal typing
   open a confusing empty shell with no aGiTrack in it. Such a split is now detected (via
   the terminal it was split from) and closed automatically, with a one-line explanation —
   the user's own terminals are never touched.
-- aGiTrack starts only **after** the terminal's automatic startup has run — VSCode's
-  venv/conda activation, shell integration, and any other commands it injects — by
-  sequencing the launch through shell integration. This fixes those commands being typed
-  into aGiTrack instead of the shell (e.g. `source .venv/bin/activate` landing in the
-  agent, or a stray newline auto-acknowledging the sensitive-information prompt). aGiTrack
-  also drains any pending terminal input right before that prompt as a backstop.
+- aGiTrack starts only **after** the terminal's automatic startup has fully run — VSCode's
+  venv/conda activation, shell integration, and any other commands it injects. After shell
+  integration is ready, the launch waits for VSCode's own startup command(s) to actually
+  run and finish (tracked via the shell-execution events) before starting aGiTrack, so e.g.
+  `source .venv/bin/activate` runs *before* aGiTrack — not typed into the agent mid-run, and
+  not queued behind aGiTrack to run only after it exits. aGiTrack also drains any pending
+  terminal input right before the sensitive-information prompt as a backstop.
 - Exiting aGiTrack (e.g. the `Ctrl-G` → exit menu) **closes the terminal** automatically —
   but **only on a clean exit** (status 0). If aGiTrack quits with an error the terminal
   stays open so its message is readable. (`agitrack … && exit`.)
 - Re-launching never restarts a running session: the editor button **focuses the existing
-  aGiTrack terminal**, reattaching to it even if the extension was reloaded (it checks the
-  repo lock to confirm a session is actually running before reusing the terminal).
+  aGiTrack terminal** instead of starting a second one.
 - Closing the window/terminal exits aGiTrack **gracefully**, finalizing the latest turn
   instead of stranding it. On shutdown the extension signals aGiTrack and waits (up to
   60s) for it to finish; it also raises `terminal.integrated.confirmOnKill` to `always`
