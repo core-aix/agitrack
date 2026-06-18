@@ -30,6 +30,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="show this help message and exit",
     )
+    parser.add_argument(
+        "--version",
+        action="store_true",
+        help="print the aGiTrack version and exit",
+    )
     parser.add_argument("--repo", default=".", help="target Git repository path")
     parser.add_argument("--verbose", action="store_true", help="show aGiTrack diagnostic messages")
     parser.add_argument("--mode", choices=["proxy", "json"], default="proxy", help="interactive mode")
@@ -135,6 +140,15 @@ def main(argv: list[str] | None = None) -> int:
     # not the backend's help (that is available via `agitrack -- --help`, handled below).
     if args.help:
         parser.print_help()
+        return 0
+
+    # Print the version and exit. Kept simple and side-effect-free (no repo
+    # discovery, no privacy prompt) so tools — e.g. the VSCode extension checking
+    # whether the installed CLI has self-updated past it — can read it cheaply.
+    if args.version:
+        from agitrack import __version__
+
+        print(__version__)
         return 0
 
     if args.dashboard:

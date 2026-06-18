@@ -231,6 +231,46 @@ def test_delay_merge_off_by_default(monkeypatch):
     assert captured["delay_merge"] is False
 
 
+def test_version_flag_prints_version_and_exits(monkeypatch, capsys):
+    # `agitrack --version` is cheap and side-effect-free: no repo discovery, no
+    # privacy prompt. The VSCode extension reads it to detect a self-updated CLI.
+    import agitrack
+
+    called = {"discover": False}
+    monkeypatch.setattr(cli, "_discover_or_init", lambda p: called.__setitem__("discover", True))
+    assert cli.main(["--version"]) == 0
+    assert capsys.readouterr().out.strip() == agitrack.__version__
+    assert called["discover"] is False  # exits before touching the repo
+
+
+def test_update_check_runs_under_a_tty(monkeypatch):
+    # The startup self-update offer is gated only on a TTY (+ config) — NOT on any
+    # editor/environment signal — so it runs inside VSCode's integrated terminal,
+    # which is a real PTY, exactly as in a standalone terminal.
+    captured = _stub_launch(monkeypatch)
+    _force_tty(monkeypatch, stdin=True, stdout=True)
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
+    ran = {"checked": False}
+    monkeypatch.setattr(cli, "_check_for_update_at_startup", lambda config: ran.__setitem__("checked", True))
+
+    cli.main([])  # plain interactive proxy launch
+
+    assert ran["checked"] is True
+    assert captured  # launch still proceeded
+
+
+def test_update_check_skipped_without_a_tty(monkeypatch):
+    _stub_launch(monkeypatch)
+    _force_tty(monkeypatch, stdin=False, stdout=False)
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
+    ran = {"checked": False}
+    monkeypatch.setattr(cli, "_check_for_update_at_startup", lambda config: ran.__setitem__("checked", True))
+
+    cli.main([])
+
+    assert ran["checked"] is False  # no way to answer a prompt without a TTY
+
+
 def test_ui_bridge_flag_passed_to_shell_and_forces_json_mode(monkeypatch):
     # --ui-bridge is a json-mode transport: it must reach the shell and select json
     # mode even without an explicit --mode json (the VSCode extension relies on this).

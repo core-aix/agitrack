@@ -1,8 +1,8 @@
 {
   "name": "agitrack-vscode",
   "displayName": "aGiTrack",
-  "description": "Run a coding agent (Claude Code / OpenCode) through aGiTrack inside VSCode — chat, menus, and confirmations with no terminal, and every turn auto-committed with full provenance.",
-  "version": "0.1.0",
+  "description": "Launch aGiTrack — a coding agent (Claude Code / OpenCode) that auto-commits every turn with full provenance — inside VSCode, with no terminal typing required.",
+  "version": "0.0.9",
   "publisher": "core-aix",
   "license": "Apache-2.0",
   "icon": "media/icon.png",
@@ -27,67 +27,51 @@
   },
   "categories": [
     "AI",
-    "Chat",
-    "SCM Providers"
+    "SCM Providers",
+    "Other"
   ],
   "galleryBanner": {
-    "color": "#1e1e1e",
+    "color": "#0d6e63",
     "theme": "dark"
   },
-  "activationEvents": [],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./out/extension.js",
   "contributes": {
-    "chatParticipants": [
-      {
-        "id": "agitrack.chat",
-        "name": "agitrack",
-        "fullName": "aGiTrack",
-        "description": "Run a coding agent through aGiTrack — every turn is auto-committed.",
-        "isSticky": true
-      }
-    ],
     "commands": [
       {
-        "command": "agitrack.status",
-        "title": "Show Git Status",
-        "category": "aGiTrack"
+        "command": "agitrack.start",
+        "title": "Start Session",
+        "category": "aGiTrack",
+        "icon": "$(git-commit)"
       },
       {
-        "command": "agitrack.stage",
-        "title": "Review & Stage Untracked Files",
-        "category": "aGiTrack"
-      },
-      {
-        "command": "agitrack.userCommit",
-        "title": "Create User Commit",
-        "category": "aGiTrack"
-      },
-      {
-        "command": "agitrack.unstaged",
-        "title": "Show Intentionally Unstaged Files",
-        "category": "aGiTrack"
-      },
-      {
-        "command": "agitrack.switchBackend",
-        "title": "Switch Agent Backend",
-        "category": "aGiTrack"
-      },
-      {
-        "command": "agitrack.newSession",
-        "title": "Start New Session",
-        "category": "aGiTrack"
-      },
-      {
-        "command": "agitrack.summarizer",
-        "title": "Manage Summarizer",
+        "command": "agitrack.startHere",
+        "title": "Start Session Here",
         "category": "aGiTrack"
       },
       {
         "command": "agitrack.restart",
-        "title": "Restart aGiTrack",
+        "title": "Restart Session",
         "category": "aGiTrack"
       }
     ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "agitrack.startHere",
+          "group": "navigation@99",
+          "when": "explorerResourceIsFolder"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "agitrack.startHere",
+          "when": "false"
+        }
+      ]
+    },
     "configuration": {
       "title": "aGiTrack",
       "properties": {
@@ -106,6 +90,17 @@
             "OpenCode"
           ],
           "description": "Backend to drive. Empty uses aGiTrack's configured default."
+        },
+        "agitrack.args": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Extra command-line arguments passed to aGiTrack (e.g. [\"--no-worktree\"])."
+        },
+        "agitrack.openOnStartup": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically start an aGiTrack session when a workspace opens."
         }
       }
     }

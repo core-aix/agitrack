@@ -1,401 +1,174 @@
 // aGiTrack VSCode extension.
 //
-// Runs the full interactive aGiTrack experience inside VSCode with no terminal.
-// aGiTrack is launched once per workspace as a long-lived child process driven over
-// a bidirectional JSON-RPC bridge (`agitrack --mode json --ui-bridge`):
-//
-//   * prompts and ':' commands are written to the child's stdin as JSON lines;
-//   * the child streams back `response` / `commit` / `notice` / `error` events; and
-//   * when aGiTrack needs an answer (stage which files? pick a backend? commit
-//     message?) it emits an `ask`, which this extension renders as a native VSCode
-//     QuickPick / InputBox / modal — and writes the user's choice back.
-//
-// The agent conversation happens in the native Chat view (`@agitrack`); the other
-// actions (status, stage, user commit, switch backend, new session, summarizer)
-// are Command Palette commands. Every turn aGiTrack auto-commits with full
-// provenance, so each interaction leaves a tracked commit behind.
+// A thin wrapper that lets you install aGiTrack as a VSCode plugin and launch the
+// full aGiTrack terminal application (proxy mode) inside VSCode — without opening a
+// terminal and typing `agitrack` yourself. Because it runs the real CLI in an
+// integrated terminal, you get the complete aGiTrack experience (the backend's
+// native TUI, the Ctrl-G command menu, sessions, sharing, worktrees, auto-commits —
+// everything), just started from a VSCode command or the status-bar button.
 
 import * as vscode from "vscode";
-import { ChildProcessWithoutNullStreams, spawn } from "child_process";
-import * as readline from "readline";
+import { execFile } from "child_process";
 
-let manager: BridgeManager;
+const TERMINAL_NAME = "aGiTrack";
+
+// One aGiTrack terminal per workspace folder, keyed by folder path, so re-running
+// the launch command focuses the existing session instead of starting a second
+// instance (which aGiTrack would refuse with its repo lock).
+const terminals = new Map<string, vscode.Terminal>();
 
 export function activate(context: vscode.ExtensionContext): void {
-  manager = new BridgeManager();
-  context.subscriptions.push(manager);
+  context.subscriptions.push(
+    vscode.commands.registerCommand("agitrack.start", () => startSession()),
+    vscode.commands.registerCommand("agitrack.startHere", (uri?: vscode.Uri) => startSession(uri)),
+    vscode.commands.registerCommand("agitrack.restart", () => restartSession()),
+  );
 
-  const participant = vscode.chat.createChatParticipant("agitrack.chat", chatHandler);
-  participant.iconPath = new vscode.ThemeIcon("git-commit");
-  context.subscriptions.push(participant);
+  // Forget terminals the user closes so the next launch starts a fresh one.
+  context.subscriptions.push(
+    vscode.window.onDidCloseTerminal((closed) => {
+      for (const [key, terminal] of terminals) {
+        if (terminal === closed) {
+          terminals.delete(key);
+        }
+      }
+    }),
+  );
 
-  const register = (id: string, run: () => Promise<void> | void) =>
-    context.subscriptions.push(vscode.commands.registerCommand(id, run));
+  // A status-bar button so launching aGiTrack is one click, no Command Palette needed.
+  const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 0);
+  status.text = "$(git-commit) aGiTrack";
+  status.tooltip = "Start an aGiTrack session in this workspace";
+  status.command = "agitrack.start";
+  status.show();
+  context.subscriptions.push(status);
 
-  register("agitrack.status", () => manager.runCommand(":status"));
-  register("agitrack.stage", () => manager.runCommand(":stage"));
-  register("agitrack.userCommit", () => manager.runCommand(":user-commit"));
-  register("agitrack.unstaged", () => manager.runCommand(":unstaged"));
-  register("agitrack.switchBackend", () => manager.runCommand(":agent-backend"));
-  register("agitrack.newSession", () => manager.runCommand(":new-session"));
-  register("agitrack.summarizer", () => summarizerCommand());
-  register("agitrack.restart", () => manager.restartActive());
+  if (vscode.workspace.getConfiguration("agitrack").get<boolean>("openOnStartup")) {
+    void startSession();
+  }
+
+  // aGiTrack auto-updates itself (you're prompted in the terminal at startup or via
+  // Ctrl-G). The extension and the CLI ship in lockstep, so if the CLI has updated
+  // past the installed extension, nudge the user to update the extension to match.
+  void checkVersionParity(context);
 }
 
 export function deactivate(): void {
-  manager?.dispose();
+  // Terminals are disposed by VSCode with the window; aGiTrack releases its repo
+  // lock on exit, so there is nothing to clean up here.
 }
 
-// --- Chat participant ----------------------------------------------------------
-
-async function chatHandler(
-  request: vscode.ChatRequest,
-  _context: vscode.ChatContext,
-  stream: vscode.ChatResponseStream,
-  token: vscode.CancellationToken,
-): Promise<void> {
-  const folder = workspaceFolder();
+/** Launch (or focus) aGiTrack in an integrated terminal for the chosen workspace folder. */
+async function startSession(targetUri?: vscode.Uri): Promise<void> {
+  const folder = await pickFolder(targetUri);
   if (!folder) {
-    stream.markdown("Open a folder or repository first — aGiTrack tracks a git repo.");
+    void vscode.window.showWarningMessage("aGiTrack: open a folder or repository first.");
     return;
   }
-  const text = request.prompt.trim();
-  if (!text) {
-    stream.markdown("Type a prompt for the coding agent, or run an `aGiTrack:` command from the Command Palette.");
+
+  const key = folder.uri.fsPath;
+  const existing = terminals.get(key);
+  if (existing) {
+    existing.show();
+    return; // aGiTrack is already running here — just bring it forward.
+  }
+
+  const terminal = createTerminal(folder);
+  terminals.set(key, terminal);
+  terminal.show();
+  terminal.sendText(launchCommand());
+}
+
+/** Stop the workspace's aGiTrack terminal (if any) and start a fresh one. */
+async function restartSession(): Promise<void> {
+  const folder = await pickFolder();
+  if (!folder) {
     return;
   }
+  terminals.get(folder.uri.fsPath)?.dispose();
+  terminals.delete(folder.uri.fsPath);
+  // Give aGiTrack a moment to release its repo lock before relaunching.
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  await startSession(folder.uri);
+}
+
+function createTerminal(folder: vscode.WorkspaceFolder): vscode.Terminal {
+  return vscode.window.createTerminal({
+    name: terminals.size === 0 ? TERMINAL_NAME : `${TERMINAL_NAME} (${folder.name})`,
+    cwd: folder.uri.fsPath,
+    iconPath: new vscode.ThemeIcon("git-commit"),
+  });
+}
+
+/** Build the `agitrack …` command line from the user's settings. */
+function launchCommand(): string {
+  const config = vscode.workspace.getConfiguration("agitrack");
+  const exe = config.get<string>("path") || "agitrack";
+  const backend = config.get<string>("backend") || "";
+  const extra = config.get<string[]>("args") || [];
+
+  const parts = [quote(exe)];
+  if (backend) {
+    parts.push("--backend", backend);
+  }
+  for (const arg of extra) {
+    parts.push(quote(arg));
+  }
+  return parts.join(" ");
+}
+
+/** Quote a shell argument only when it contains characters that need it. */
+function quote(value: string): string {
+  return /[^\w./:-]/.test(value) ? `'${value.replace(/'/g, "'\\''")}'` : value;
+}
+
+/** Warn when the installed CLI has self-updated past this extension (they ship in
+ * lockstep). Best-effort: if the CLI can't be run (e.g. not on the extension host's
+ * PATH), stay silent — launching uses the integrated terminal's shell PATH instead. */
+async function checkVersionParity(context: vscode.ExtensionContext): Promise<void> {
+  const extensionVersion = String(context.extension.packageJSON.version ?? "");
+  const exe = vscode.workspace.getConfiguration("agitrack").get<string>("path") || "agitrack";
+  let cliVersion: string;
   try {
-    const bridge = await manager.bridgeFor(folder);
-    stream.progress("Running the agent through aGiTrack…");
-    await bridge.runTurn({ type: "prompt", text }, stream, token);
-  } catch (err) {
-    stream.markdown(`\n\n**aGiTrack error:** ${errorText(err)}`);
+    cliVersion = await agitrackVersion(exe);
+  } catch {
+    return; // CLI not found / not runnable here — don't raise a false alarm
   }
-}
-
-async function summarizerCommand(): Promise<void> {
-  const pick = await vscode.window.showQuickPick(
-    [
-      { label: "Status", value: "status" },
-      { label: "Turn on", value: "on" },
-      { label: "Turn off", value: "off" },
-      { label: "Set model…", value: "model" },
-    ],
-    { title: "aGiTrack summarizer", placeHolder: "Manage commit summarization" },
+  if (!cliVersion || !extensionVersion || cliVersion === extensionVersion) {
+    return;
+  }
+  const choice = await vscode.window.showInformationMessage(
+    `aGiTrack CLI is v${cliVersion} but the aGiTrack extension is v${extensionVersion}. ` +
+      "They ship in lockstep — update the extension to match.",
+    "Check for Extension Updates",
   );
-  if (pick) {
-    await manager.runCommand(`:summarizer ${pick.value}`);
+  if (choice) {
+    void vscode.commands.executeCommand("workbench.extensions.action.checkForUpdates");
   }
 }
 
-// --- Bridge manager: one child process per workspace folder --------------------
-
-class BridgeManager implements vscode.Disposable {
-  private readonly bridges = new Map<string, AgitrackBridge>();
-
-  async bridgeFor(folder: vscode.WorkspaceFolder): Promise<AgitrackBridge> {
-    const key = folder.uri.fsPath;
-    let bridge = this.bridges.get(key);
-    if (!bridge || !bridge.alive) {
-      bridge = new AgitrackBridge(folder);
-      this.bridges.set(key, bridge);
-      await bridge.start();
-    }
-    return bridge;
-  }
-
-  /** Run a ':' command against the active workspace, surfacing results as popups. */
-  async runCommand(text: string): Promise<void> {
-    const folder = workspaceFolder();
-    if (!folder) {
-      void vscode.window.showWarningMessage("aGiTrack: open a folder or repository first.");
-      return;
-    }
-    try {
-      const bridge = await this.bridgeFor(folder);
-      await bridge.runTurn({ type: "command", text });
-    } catch (err) {
-      void vscode.window.showErrorMessage(`aGiTrack: ${errorText(err)}`);
-    }
-  }
-
-  async restartActive(): Promise<void> {
-    const folder = workspaceFolder();
-    if (!folder) {
-      return;
-    }
-    this.bridges.get(folder.uri.fsPath)?.dispose();
-    this.bridges.delete(folder.uri.fsPath);
-    await this.bridgeFor(folder);
-    void vscode.window.showInformationMessage("aGiTrack restarted.");
-  }
-
-  dispose(): void {
-    for (const bridge of this.bridges.values()) {
-      bridge.dispose();
-    }
-    this.bridges.clear();
-  }
-}
-
-// --- A single aGiTrack child process and its JSON-RPC conversation --------------
-
-interface OutgoingRequest {
-  type: "prompt" | "command";
-  text: string;
-}
-
-interface BridgeEvent {
-  type: string;
-  [key: string]: unknown;
-}
-
-class AgitrackBridge {
-  private proc: ChildProcessWithoutNullStreams | undefined;
-  private ready = false;
-  private session = "";
-  private backend = "";
-  alive = false;
-
-  // Only one turn runs at a time; later requests queue behind the current one.
-  private queue: Promise<void> = Promise.resolve();
-  // Resolver for the turn currently in flight, fired on `turn-complete`/`bye`.
-  private turnDone: (() => void) | undefined;
-  // The chat stream to render into while a chat turn is active (undefined for
-  // command turns, whose output is shown as popups instead).
-  private activeStream: vscode.ChatResponseStream | undefined;
-
-  constructor(private readonly folder: vscode.WorkspaceFolder) {}
-
-  start(): Promise<void> {
-    const config = vscode.workspace.getConfiguration("agitrack");
-    const exe = config.get<string>("path") || "agitrack";
-    const backend = config.get<string>("backend") || "";
-
-    const args = ["--repo", this.folder.uri.fsPath, "--mode", "json", "--ui-bridge", "--skip-privacy-ack"];
-    if (backend) {
-      args.push("--backend", backend);
-    }
-
-    return new Promise<void>((resolve, reject) => {
-      let proc: ChildProcessWithoutNullStreams;
-      try {
-        proc = spawn(exe, args, { cwd: this.folder.uri.fsPath });
-      } catch (err) {
-        reject(new Error(`failed to launch aGiTrack (\`${exe}\`): ${errorText(err)}`));
-        return;
+/** Read `agitrack --version` (cheap, side-effect-free). */
+function agitrackVersion(exe: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(exe, ["--version"], { timeout: 5000 }, (err, stdout) => {
+      if (err) {
+        reject(err);
+      } else {
+        resolve(stdout.trim());
       }
-      this.proc = proc;
-      this.alive = true;
-
-      let stderr = "";
-      proc.stderr.on("data", (chunk: Buffer) => {
-        stderr += chunk.toString();
-      });
-      proc.on("error", (err: Error) => {
-        this.alive = false;
-        reject(new Error(`failed to launch aGiTrack (\`${exe}\`): ${err.message}. Set \`agitrack.path\` if it isn't on PATH.`));
-      });
-      proc.on("close", (code: number | null) => {
-        this.alive = false;
-        this.ready = false;
-        this.finishTurn();
-        if (!this.everReady && code !== 0) {
-          reject(new Error(`aGiTrack exited (code ${code ?? "?"}).${stderr ? ` ${stderr.trim()}` : ""}`));
-        }
-      });
-
-      const rl = readline.createInterface({ input: proc.stdout });
-      rl.on("line", (line: string) => this.onLine(line, resolve));
     });
-  }
-
-  private everReady = false;
-
-  private onLine(line: string, onReady: () => void): void {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith("{")) {
-      return; // ignore any human-readable lines; only JSON events are consumed
-    }
-    let event: BridgeEvent;
-    try {
-      event = JSON.parse(trimmed) as BridgeEvent;
-    } catch {
-      return;
-    }
-    void this.handleEvent(event, onReady);
-  }
-
-  private async handleEvent(event: BridgeEvent, onReady: () => void): Promise<void> {
-    switch (event.type) {
-      case "ready":
-        this.ready = true;
-        this.session = str(event.session) || this.session;
-        this.backend = str(event.backend) || this.backend;
-        if (!this.everReady) {
-          this.everReady = true;
-          onReady();
-        }
-        break;
-      case "response":
-        this.toStream(str(event.text));
-        break;
-      case "commit":
-        this.toStream(`\n\n_aGiTrack committed this turn: \`${str(event.sha)}\`_`);
-        break;
-      case "no_changes":
-        this.toStream("\n\n_No file changes this turn._");
-        break;
-      case "notice":
-        this.notice(str(event.level) || "info", str(event.message));
-        break;
-      case "error":
-        if (this.activeStream) {
-          this.activeStream.markdown(`\n\n**aGiTrack error:** ${str(event.message)}`);
-        } else {
-          void vscode.window.showErrorMessage(`aGiTrack: ${str(event.message)}`);
-        }
-        break;
-      case "ask":
-        await this.answer(event);
-        break;
-      case "turn-complete":
-        this.finishTurn();
-        break;
-      case "bye":
-        this.alive = false;
-        this.finishTurn();
-        break;
-      default:
-        break;
-    }
-  }
-
-  /** Run one prompt/command turn to completion (resolves on `turn-complete`). */
-  runTurn(
-    request: OutgoingRequest,
-    stream?: vscode.ChatResponseStream,
-    token?: vscode.CancellationToken,
-  ): Promise<void> {
-    const task = () =>
-      new Promise<void>((resolve) => {
-        if (!this.alive || !this.proc) {
-          stream?.markdown("aGiTrack is not running.");
-          resolve();
-          return;
-        }
-        this.activeStream = stream;
-        this.turnDone = () => {
-          this.activeStream = undefined;
-          this.turnDone = undefined;
-          resolve();
-        };
-        token?.onCancellationRequested(() => this.finishTurn());
-        this.send(request);
-      });
-    // Serialize turns: each waits for the previous to finish.
-    this.queue = this.queue.then(task, task);
-    return this.queue;
-  }
-
-  private finishTurn(): void {
-    this.turnDone?.();
-  }
-
-  private send(message: object): void {
-    this.proc?.stdin.write(JSON.stringify(message) + "\n");
-  }
-
-  private toStream(text: string): void {
-    if (text && this.activeStream) {
-      this.activeStream.markdown(text + "\n");
-    }
-  }
-
-  private notice(level: string, message: string): void {
-    if (!message) {
-      return;
-    }
-    // During a chat turn, fold the notice into the conversation; otherwise pop it up.
-    if (this.activeStream && level === "info") {
-      this.activeStream.markdown(`\n_${message}_\n`);
-      return;
-    }
-    if (level === "error") {
-      void vscode.window.showErrorMessage(`aGiTrack: ${message}`);
-    } else if (level === "warn") {
-      void vscode.window.showWarningMessage(`aGiTrack: ${message}`);
-    } else {
-      void vscode.window.showInformationMessage(`aGiTrack: ${message}`);
-    }
-  }
-
-  /** Render an `ask` as native VSCode UI and write the chosen value back. */
-  private async answer(event: BridgeEvent): Promise<void> {
-    const id = str(event.id);
-    const message = str(event.message);
-    const detail = str(event.detail);
-    const options = Array.isArray(event.options) ? (event.options as unknown[]).map(str) : [];
-    let value: unknown = null;
-
-    switch (str(event.kind)) {
-      case "select": {
-        const choice = await vscode.window.showQuickPick(options, {
-          title: message,
-          placeHolder: detail || message,
-          ignoreFocusOut: true,
-        });
-        value = choice ?? null;
-        break;
-      }
-      case "multiselect": {
-        const choices = await vscode.window.showQuickPick(options, {
-          title: message,
-          placeHolder: detail || message,
-          canPickMany: true,
-          ignoreFocusOut: true,
-        });
-        value = choices ?? [];
-        break;
-      }
-      case "input": {
-        const entered = await vscode.window.showInputBox({
-          title: message,
-          prompt: message,
-          value: str(event.default),
-          ignoreFocusOut: true,
-        });
-        value = entered === undefined ? null : entered;
-        break;
-      }
-      case "confirm": {
-        const choice = await vscode.window.showWarningMessage(message, { modal: true }, "Yes", "No");
-        value = choice === "Yes";
-        break;
-      }
-      default:
-        value = null;
-    }
-    this.send({ type: "answer", id, value });
-  }
-
-  dispose(): void {
-    if (this.proc && this.alive) {
-      try {
-        this.send({ type: "exit" });
-      } catch {
-        // ignore — we kill below anyway
-      }
-      this.proc.kill();
-    }
-    this.alive = false;
-    this.proc = undefined;
-  }
+  });
 }
 
-// --- helpers -------------------------------------------------------------------
-
-function workspaceFolder(): vscode.WorkspaceFolder | undefined {
+/** Resolve which workspace folder to run in: the invoking resource, the active
+ * editor's folder, the only folder, or a picker when the choice is ambiguous. */
+async function pickFolder(targetUri?: vscode.Uri): Promise<vscode.WorkspaceFolder | undefined> {
+  if (targetUri) {
+    const folder = vscode.workspace.getWorkspaceFolder(targetUri);
+    if (folder) {
+      return folder;
+    }
+  }
   const active = vscode.window.activeTextEditor?.document.uri;
   if (active) {
     const folder = vscode.workspace.getWorkspaceFolder(active);
@@ -403,13 +176,9 @@ function workspaceFolder(): vscode.WorkspaceFolder | undefined {
       return folder;
     }
   }
-  return vscode.workspace.workspaceFolders?.[0];
-}
-
-function str(value: unknown): string {
-  return typeof value === "string" ? value : value == null ? "" : String(value);
-}
-
-function errorText(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+  const folders = vscode.workspace.workspaceFolders ?? [];
+  if (folders.length <= 1) {
+    return folders[0];
+  }
+  return vscode.window.showWorkspaceFolderPick({ placeHolder: "Start aGiTrack in which folder?" });
 }
