@@ -73,6 +73,7 @@ In proxy mode (default), press `Ctrl-G`, then type one of these aGiTrack command
 session                   switch / start (own worktree) / stop a live session
 agent-backend             switch backend (opencode|claude); shows a picker
 summarizer                toggle summarization on/off, set model, show status
+dashboard                 serve the metrics dashboard and open it in the browser
 git-unstaged              show intentionally unstaged files
 git-user-commit           create a user commit
 update                    check for / install an aGiTrack self-update

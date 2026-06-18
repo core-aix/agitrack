@@ -8,10 +8,22 @@ matches the `agitrack` release it launches.
 
 Launch the full aGiTrack terminal application from VSCode — no terminal typing.
 
-- **aGiTrack: Start Session** (status-bar button, Command Palette, or Explorer
-  folder context menu) opens aGiTrack in a VSCode integrated terminal for the
-  workspace. You get the complete experience: the agent's native interface, the
-  `Ctrl-G` command menu, sessions, sharing, worktrees, and per-turn auto-commits.
+- An **aGiTrack menu** at the top-right of the editor toolbar (brand-icon dropdown)
+  with **Start Session**, **Restart Session**, and **Open Dashboard**. Also available
+  as a status-bar button, Command Palette commands, and an Explorer folder context menu.
+- **Start Session** opens aGiTrack in a VSCode terminal for the workspace — the full
+  experience: the agent's native interface, the `Ctrl-G` command menu, sessions,
+  sharing, worktrees, and per-turn auto-commits.
+- **Open Dashboard** launches aGiTrack's metrics dashboard (`agitrack -d`) in its own
+  terminal; read-only, runs alongside a session.
+- **Auto-installs the aGiTrack CLI** when it's missing (via `pipx`, falling back to
+  `pip --user`), so the extension works on a machine that's never had aGiTrack.
+- **Remote-aware:** runs as a workspace extension, so on Remote-SSH / WSL / Dev
+  Containers / Codespaces it launches and (if needed) installs aGiTrack on the remote
+  host, where the code lives.
+- Opens **beside the editor** (split to the right) by default; configurable via
+  `agitrack.terminalLocation` (`beside` / `editor` / `panel`).
+- Uses the aGiTrack brand mark (the website favicon) as its icon.
 - Re-launching focuses the existing session (aGiTrack allows one per repository);
   **aGiTrack: Restart Session** stops and restarts it.
 - aGiTrack's own self-update works normally in the integrated terminal; if the CLI
