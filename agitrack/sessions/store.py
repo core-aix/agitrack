@@ -16,6 +16,7 @@ ref never grows a history.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import time
@@ -67,6 +68,7 @@ class PublishResult:
     pruned: int = 0  # how many of the contributor's stale sessions were removed
     error: str = ""
     behind: bool = False  # refused: the shared copy already has newer turns than this one
+    merged: int = 0  # rows folded in from a concurrent contributor's diverged copy
 
 
 def count_transcript_rows(text: str) -> int:
@@ -75,6 +77,64 @@ def count_transcript_rows(text: str) -> int:
     and a raw local copy of the same conversation have the same row count, which
     makes them directly comparable for "which is newer/longer"."""
     return sum(1 for line in text.splitlines() if line.strip())
+
+
+def _row_id(raw: str) -> str | None:
+    """The stable id of one JSONL transcript row (Claude rows carry a ``uuid``), or
+    None when the line isn't a JSON object with an id — which also marks a transcript
+    that can't be line-merged (e.g. OpenCode's single-object export)."""
+    try:
+        row = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if isinstance(row, dict):
+        rid = row.get("uuid")
+        return rid if isinstance(rid, str) and rid else None
+    return None
+
+
+def merge_transcripts(new: str, existing: str) -> str:
+    """Union two divergent copies of the SAME conversation so neither side's turns
+    are lost, rather than one overwriting the other (parallel shares).
+
+    Claude transcripts are append-only with a shared head, so when two people each
+    add different turns the copies share a common prefix and diverge only in the
+    tail. This keeps the shared prefix, then appends the rows unique to each side —
+    ``new`` first, then ``existing`` — deduplicated by row id. The result is a
+    superset of both: lossless and order-stable (and idempotent: merging a copy that
+    already contains the other's rows changes nothing).
+
+    Only line-oriented JSONL with per-row ids can be merged this way. When lineage
+    can't be established — the first rows have no id or differ (a different
+    conversation, or OpenCode's single-object export) — it falls back to ``new``
+    (last-write-wins), the prior behaviour."""
+    new_rows = [line for line in new.splitlines() if line.strip()]
+    old_rows = [line for line in existing.splitlines() if line.strip()]
+    if not old_rows:
+        return new
+    if not new_rows:
+        return existing
+    head = _row_id(new_rows[0])
+    if head is None or head != _row_id(old_rows[0]):
+        return new  # not the same line-mergeable conversation → last-write-wins
+    # Longest common prefix (rows identical by id, in order).
+    prefix_len = 0
+    for a, b in zip(new_rows, old_rows):
+        a_id = _row_id(a)
+        if a_id is not None and a_id == _row_id(b):
+            prefix_len += 1
+        else:
+            break
+    merged = list(new_rows[:prefix_len])
+    seen = {rid for row in merged if (rid := _row_id(row)) is not None}
+    for row in new_rows[prefix_len:] + old_rows[prefix_len:]:
+        rid = _row_id(row)
+        key = rid if rid is not None else row
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(row)
+    return "\n".join(merged) + "\n"
 
 
 def _is_stale_lease(error: str) -> bool:
@@ -402,10 +462,31 @@ class SharedSessionStore:
         *,
         prune_gid: str | None = None,
     ) -> PublishResult:
+        # Best-effort union merge: if a copy already sits in the local ref and it has
+        # DIVERGED from ours — e.g. a concurrent contributor's version we just fetched
+        # after losing the push race — combine both sides' turns so neither's work is
+        # dropped, instead of overwriting one with the other. A no-op for the common
+        # cases: our copy is a superset of what's there (append-only re-share), or the
+        # transcript isn't line-mergeable (OpenCode), in which case last-write-wins and
+        # the recency guard below still applies.
+        merged_rows = 0
+        existing = self.repo.read_ref_blob(self.ref, f"{self._prefix()}{gid}/{nm}/transcript.jsonl")
+        if existing:
+            combined = merge_transcripts(transcript, existing)
+            if combined != transcript:
+                merged_rows = count_transcript_rows(combined) - count_transcript_rows(transcript)
+                transcript = combined
+                manifest = {
+                    **manifest,
+                    "content_hash": hashlib.sha256(combined.encode("utf-8")).hexdigest(),
+                    "transcript_rows": count_transcript_rows(combined),
+                    "transcript_bytes": len(combined.encode("utf-8")),
+                }
         # Recency guard: never replace a longer shared copy with a shorter (older) one.
         # Runs on the retry too — after a stale-lease fetch the local ref equals the
         # remote, so a machine that's behind is caught here and refuses rather than
-        # rewinding everyone's shared session to its older state.
+        # rewinding everyone's shared session to its older state. (After a merge above
+        # the transcript is a superset, so this never trips for a genuine divergence.)
         if self._would_regress(gid, nm, transcript):
             return PublishResult(remote=True, pushed=False, behind=True)
         old = self.repo.ref_sha(self.ref)  # tip we believe the remote is at = the delta base
@@ -425,4 +506,4 @@ class SharedSessionStore:
         # unshare that rewrites the orphan commit still fully removes the session.
         if old:
             self.repo.delete_orphaned_objects(old)
-        return PublishResult(remote=True, pushed=ok, pruned=pruned, error="" if ok else err.strip())
+        return PublishResult(remote=True, pushed=ok, pruned=pruned, error="" if ok else err.strip(), merged=merged_rows)

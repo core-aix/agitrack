@@ -560,6 +560,10 @@ class ProxyRunner:
         # re-prompt every parse cycle. In-memory and per-run by design — a restart
         # offers the choice again if the changes are still sitting there.
         self._cancel_prompted: set[str] = set()
+        # Worktree files we've already offered to copy into the base repo, keyed by
+        # repo-relative path → content fingerprint, so a file the user left in place
+        # is re-offered only once its content changes again (per-run, in-memory).
+        self._copy_prompted: dict[str, tuple[int, int]] = {}
         # Lifecycle flags read before their first conditional assignment. These
         # MUST be initialized here: their getattr() guards were removed in P7,
         # and for_testing() seeding them alone would hide a missing init from
@@ -771,6 +775,7 @@ class ProxyRunner:
                 "_auto_share_thread": None,
                 "_sessions_with_activity": set(),
                 "_cancel_prompted": set(),
+                "_copy_prompted": {},
                 "_full_agent_messages": False,
                 "_user_declined": [],
                 "sessions": [],
@@ -1951,13 +1956,16 @@ class ProxyRunner:
     def _resolve_startup_session_name(self, root_state, resume_id, prior_worktree) -> str:
         # Keep the conversation's existing (user-given) name if it has one; only
         # prompt when there is no real name yet. Auto `session-N` names don't count.
+        # A fresh conversation (``--new-session``, so ``resume_id`` is None) always
+        # prompts for its own name — it must NOT inherit the prior session's name,
+        # since it is a brand-new conversation, not a continuation of that one.
         existing = root_state.session_name_for(resume_id)
-        if not existing and prior_worktree and not self._AUTO_NAME_RE.match(prior_worktree):
-            # The name only lived in the last-session record; key it by the
-            # conversation id too so it stays linked once that record moves on.
+        if not existing and resume_id and prior_worktree and not self._AUTO_NAME_RE.match(prior_worktree):
+            # Resuming a conversation whose name only lived in the last-session
+            # record; key it by the conversation id too so it stays linked once that
+            # record moves on.
             existing = prior_worktree
-            if resume_id:
-                root_state.name_session(resume_id, existing)
+            root_state.name_session(resume_id, existing)
         if existing:
             return existing
         name = self._prompt_startup_name(resume_id is not None)
@@ -2001,7 +2009,9 @@ class ProxyRunner:
         while True:
             try:
                 raw = input(f"Name this session [{default}]: ").strip()
-            except (EOFError, KeyboardInterrupt):
+            except (EOFError, KeyboardInterrupt, OSError):
+                # No interactive stdin (piped/scripted run, or a closed/uncaptured
+                # fd): accept the default name rather than failing startup.
                 return default
             name = raw or default
             if _sanitize_name(name) in taken:
@@ -3179,6 +3189,10 @@ class ProxyRunner:
                 f"Saved '{display}' locally, but the push was rejected — someone else may have "
                 f"updated the shared ref. Try sharing again. [{result.error[:80]}]"
             )
+        if getattr(result, "merged", 0):
+            # A concurrent contributor's diverged copy was folded in rather than
+            # overwritten, so neither side's turns were lost.
+            message += f" Merged {result.merged} turn(s) shared by a collaborator."
         if result.pruned:
             message += f" Pruned {result.pruned} older shared session(s)."
         return message
@@ -3248,7 +3262,18 @@ class ProxyRunner:
                 self._render()
                 self._update_shared_entry(entry)
         else:
-            self._unshare_entry(entry)
+            # Unsharing removes the session from origin for every collaborator and
+            # can't be undone, so confirm before doing it (mirrors the discard-confirm
+            # flow).
+            confirm = self._select_popup(
+                f"Unshare '{entry.display}'? This removes it from origin for everyone and can't be undone.",
+                ["No, keep it", "Yes, unshare"],
+            )
+            if confirm == "Yes, unshare":
+                self._unshare_entry(entry)
+            else:
+                self._set_message("Kept the shared session.")
+                self._render()
 
     def _update_shared_entry(self, entry) -> None:
         sid = entry.manifest.get("session_id", "")
@@ -4359,6 +4384,10 @@ class ProxyRunner:
         if sid:
             self.state.backend_session_id = sid  # re-point backend_session_repo at the new path
         self.actions = AgitrackActions(self.repo, self.state, verbose=self.verbose)
+        # Whether this session was tracking a shared lineage BEFORE the rename forks
+        # it (the fork below clears that origin). Used to warn the user that a later
+        # share now creates a new shared entry instead of updating the original.
+        shared_before_rename = bool(sid and self._user_state().shared_origin(sid))
         if sid:
             self._stage_backend_resume(sid)  # re-link the transcript under the new path
             self._persist_session_name(sid)
@@ -4371,7 +4400,14 @@ class ProxyRunner:
         self._resize_child()
         self._enable_host_mouse()
         self._start_file_watcher()
-        self._set_message(f"Renamed session to '{new_info.name}'.")
+        if shared_before_rename:
+            self._set_message(
+                f"Renamed session to '{new_info.name}'. This makes it a separate copy — sharing it now "
+                "creates a NEW shared session rather than updating the one it came from.",
+                seconds=12.0,
+            )
+        else:
+            self._set_message(f"Renamed session to '{new_info.name}'.")
         self._render()
 
     def _switch_active(self, index: int) -> None:
@@ -5121,6 +5157,19 @@ class ProxyRunner:
                 self._debug(f"resume transcript not found for {session_id}")
         except Exception as error:
             self._debug(f"ensure_resumable failed: {error!r}")
+        # The backend spawns with its cwd at self.repo.repo, but a resumed transcript
+        # can carry an OLD recorded cwd (e.g. a worktree this session previously ran
+        # in) that Claude's --resume would restore — leaving it operating in the wrong
+        # directory, most visibly under --no-worktree. Align the transcript's cwd with
+        # the launch dir (a no-op when they already match, so the normal in-worktree
+        # resume is untouched and its shared hardlink is preserved).
+        retarget = getattr(self.backend, "retarget_working_dir", None)
+        if retarget is not None:
+            try:
+                if retarget(self.repo.repo, session_id, str(self.repo.repo)):
+                    self._debug(f"retargeted resumed session {session_id} cwd to {self.repo.repo}")
+            except Exception as error:
+                self._debug(f"retarget_working_dir failed: {error!r}")
 
     def _init_screen(self) -> None:
         self.rows, self.cols = self._terminal_size()
@@ -6940,6 +6989,113 @@ class ProxyRunner:
             self._render_status("committed agent turn")
         elif self.worktree is None and self._summary_pending is None:
             self._announce_agent_commit()
+        # The turn's committed changes integrate into the base branch, but any files
+        # the agent left UNCOMMITTED in the worktree (e.g. untracked files the user
+        # declined to stage) never reach the base working directory. Offer to copy
+        # those over so they aren't stranded in the session's worktree.
+        self._offer_copy_unstaged_to_base()
+
+    def _offer_copy_unstaged_to_base(self) -> None:
+        """Offer to copy the turn's uncommitted worktree files into the base repo dir.
+
+        Only relevant for an isolated worktree session: changes committed this turn
+        integrate into the base branch, but files the agent modified and left
+        uncommitted (declined untracked files, unstaged edits) live only in the
+        worktree and the user — working in the base directory — never sees them.
+
+        Files are tracked by a content fingerprint, so a file the user chose to leave
+        is not prompted again until it changes. With consent each file is copied; an
+        existing base file is overwritten only on a per-file confirmation. Anything not
+        copied is reported as remaining in the worktree, with the worktree path."""
+        if self.worktree is None or self.base_repo is None:
+            return
+        base_dir = self.base_repo.repo
+        wt_dir = self.repo.repo
+        if base_dir == wt_dir:
+            return
+        # Files modified since we last offered them (new content → re-offer; unchanged
+        # declined files are skipped so the user isn't nagged).
+        fresh: list[tuple[str, tuple[int, int]]] = []
+        for rel in self._uncommitted_worktree_files():
+            fingerprint = self._file_fingerprint(wt_dir / rel)
+            if fingerprint is None or self._copy_prompted.get(rel) == fingerprint:
+                continue
+            fresh.append((rel, fingerprint))
+        if not fresh:
+            return
+        # Record the fingerprints up front so a declined file isn't re-prompted while
+        # it stays unchanged (re-offered only once its content changes again).
+        for rel, fingerprint in fresh:
+            self._copy_prompted[rel] = fingerprint
+        names = ", ".join(rel for rel, _ in fresh[:5]) + (" …" if len(fresh) > 5 else "")
+        choice = self._select_popup(
+            f"The agent left {len(fresh)} uncommitted file(s) in this session's worktree "
+            f"({names}). Copy them into the base repo directory?",
+            ["No, leave them in the worktree", "Yes, copy to the base repo"],
+        )
+        if choice is None or choice.startswith("No"):
+            self._notice_files_remain(wt_dir, [rel for rel, _ in fresh])
+            return
+        remained: list[str] = []
+        copied = 0
+        for rel, _ in fresh:
+            src, dst = wt_dir / rel, base_dir / rel
+            if dst.exists():
+                overwrite = self._select_popup(
+                    f"'{rel}' already exists in the base repo. Overwrite it?",
+                    ["No, keep the base version", "Yes, overwrite"],
+                )
+                if overwrite != "Yes, overwrite":
+                    remained.append(rel)
+                    continue
+            try:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+                copied += 1
+            except OSError as error:
+                self._debug(f"copy {rel} to base failed: {error!r}")
+                remained.append(rel)
+        if remained:
+            self._notice_files_remain(wt_dir, remained)
+        elif copied:
+            self._set_message(f"Copied {copied} file(s) into the base repo directory.")
+            self._render()
+
+    def _uncommitted_worktree_files(self) -> list[str]:
+        """Repo-relative paths of files left uncommitted in the worktree (unstaged
+        tracked edits and untracked files), excluding aGiTrack's own ``.agitrack/``."""
+        files: list[str] = []
+        try:
+            status = self.repo.status_short()
+        except Exception as error:
+            self._debug(f"status for uncommitted-files check failed: {error!r}")
+            return files
+        for line in status.splitlines():
+            if len(line) < 4:
+                continue
+            path = line[3:].strip()
+            if " -> " in path:  # a rename: take the destination
+                path = path.split(" -> ", 1)[1]
+            path = path.strip().strip('"')
+            if path and not path.startswith(".agitrack/"):
+                files.append(path)
+        return files
+
+    @staticmethod
+    def _file_fingerprint(path) -> tuple[int, int] | None:
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        return (stat.st_size, stat.st_mtime_ns)
+
+    def _notice_files_remain(self, wt_dir, files: list[str]) -> None:
+        listing = ", ".join(files[:5]) + (" …" if len(files) > 5 else "")
+        self._set_message(
+            f"{len(files)} file(s) remain in this session's worktree directory: {listing}. Worktree: {wt_dir}",
+            seconds=15.0,
+        )
+        self._render()
 
     def _integrate_agent_made_commits_if_idle(self, now: float) -> None:
         # The agent can run `git commit` itself (some workflows ask it to).

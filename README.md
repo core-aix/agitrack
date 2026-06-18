@@ -297,6 +297,12 @@ agitrack --repo path/to/repo --backend claude \
 
 Scripted runs never block on a question: the privacy warning is printed without waiting for acknowledgment, and new untracked files are staged automatically (with a notice) instead of being reviewed interactively. The same non-interactive defaults apply when prompts are piped to `agitrack --mode json` on stdin. Note that headless Claude needs permission to edit files — forward `--permission-mode acceptEdits` (or your preferred permission flags) through aGiTrack as shown above; OpenCode's `run` mode edits by default.
 
+For a programmatic driver, `agitrack --mode json --json-events` emits one machine-readable JSON line per turn event (`response`, `commit`, `no_changes`, `error`) alongside the plain output, so another process can render the conversation and see which commit each turn produced.
+
+### Editor integration
+
+A VSCode extension in [`editors/vscode/`](editors/vscode/) adds an `@agitrack` **Chat participant**: chat with a coding agent from VSCode's Chat window while aGiTrack auto-commits every turn. It's a thin client over `agitrack --mode json --json-events` and isn't built by the Python CI — see its README to build (`npm install && npm run compile`) and run it (F5 → "Run Extension").
+
 `scripts/demo.sh` is a self-contained showcase built on this: it creates a fresh repository in a temporary directory, has the agent write a small program and its tests through aGiTrack, and leaves the repository behind so you can inspect the `<aGiTrack>` commit history or continue interactively.
 
 ```bash
