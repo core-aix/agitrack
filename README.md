@@ -70,12 +70,12 @@ On the first run, aGiTrack asks which backend should be the default (listed alph
 In proxy mode (default), press `Ctrl-G`, then type one of these aGiTrack commands:
 
 ```text
-session                   switch / start (own worktree) / stop a live session
+sessions                  switch / start (own worktree) / stop a live session
 agent-backend             switch backend (opencode|claude); shows a picker
 summarizer                toggle summarization on/off, set model, show status
-dashboard                 serve the metrics dashboard and open it in the browser
 git-unstaged              show intentionally unstaged files
 git-user-commit           create a user commit
+dashboard                 serve the metrics dashboard and open it in the browser
 update                    check for / install an aGiTrack self-update
 exit                      exit (with confirmation)
 ```

@@ -10,7 +10,7 @@ Launch the full aGiTrack terminal application from VSCode — no terminal typing
 
 - An **aGiTrack menu** at the top-right of the editor toolbar (brand-icon dropdown)
   with **Start Session**, **Restart Session**, and **Open Dashboard**. Also available
-  as a status-bar button, Command Palette commands, and an Explorer folder context menu.
+  as Command Palette commands and an Explorer folder context menu.
 - **Start Session** opens aGiTrack in a VSCode terminal for the workspace — the full
   experience: the agent's native interface, the `Ctrl-G` command menu, sessions,
   sharing, worktrees, and per-turn auto-commits.
@@ -24,6 +24,9 @@ Launch the full aGiTrack terminal application from VSCode — no terminal typing
 - Opens **beside the editor** (split to the right) by default; configurable via
   `agitrack.terminalLocation` (`beside` / `editor` / `panel`).
 - Uses the aGiTrack brand mark (the website favicon) as its icon.
+- Sets `CLAUDE_CODE_IDE_SKIP_AUTO_INSTALL=1` on the session terminal so the Claude Code
+  backend no longer errors trying to auto-install its VSCode companion extension.
+- The editor-toolbar button is the only launch button (the status-bar button was removed).
 - Re-launching focuses the existing session (aGiTrack allows one per repository);
   **aGiTrack: Restart Session** stops and restarts it.
 - aGiTrack's own self-update works normally in the integrated terminal; if the CLI

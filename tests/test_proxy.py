@@ -308,8 +308,8 @@ def test_proxy_shift_modified_menu_key_split_across_reads():
     assert forwarded2 == []  # Still buffering, haven't completed yet
 
     # Send the command
-    forwarded3, _, command3, _ = parser.feed(b"session\r")
-    assert command3 == "session"
+    forwarded3, _, command3, _ = parser.feed(b"sessions\r")
+    assert command3 == "sessions"
 
 
 def test_proxy_shift_modified_menu_key_non_match_forwards():
@@ -325,10 +325,10 @@ def test_proxy_shift_modified_menu_key_non_match_forwards():
 
 
 def test_proxy_s_jumps_to_session():
-    # Only "session" starts with "s", so s+Enter selects it directly.
+    # Only "sessions" starts with "s", so s+Enter selects it directly.
     parser = ProxyInput()
     _f, _e, command, _x = parser.feed(b"\x07s\r")
-    assert command == "session"
+    assert command == "sessions"
 
 
 def test_proxy_forwards_colon_at_line_start():
