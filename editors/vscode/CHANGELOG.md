@@ -35,8 +35,10 @@ Launch the full aGiTrack terminal application from VSCode — no terminal typing
   60s) for it to finish; it also raises `terminal.integrated.confirmOnKill` to `always`
   when your setting wouldn't otherwise prompt for the aGiTrack terminal (opt out with
   `agitrack.confirmTerminalClose: false`). Because VSCode bounds how long it waits on
-  shutdown, a one-time dialog points you at the reliable path — **`Ctrl-G` → exit** inside
-  aGiTrack — which has no time pressure.
+  shutdown, a dialog points you at the reliable path — **`Ctrl-G` → exit** inside
+  aGiTrack — which has no time pressure. It re-appears once after every extension update
+  or reinstall (keyed on the installed version), so the safe-exit habit is re-surfaced
+  with each new release rather than shown only on first install.
 - **Abrupt-close recovery backstop:** if a whole-window close kills a session before it can
   finalize, deactivate runs a **detached** `agitrack --recover` (it outlives the extension
   host) to finish the job — committing a *finished* turn's changes and merging them (an
