@@ -335,6 +335,31 @@ def test_resolve_committers_bridges_personal_and_noreply_via_login():
     assert set(labels.values()) == {"octodev (Dev)"}
 
 
+def test_resolve_committers_uses_email_login_hint_for_unpushed_commits():
+    # `gh` can't map a fresh, unpushed commit (no sha_logins entry) and the email is
+    # not a no-reply address, so without a hint it stays a bare name. The email→login
+    # hint (the current user's known GitHub ID, supplied by the proxy dashboard) labels
+    # it with their login anyway.
+    stats = [_person("Mona", "mona@personal.test")]
+    assert set(resolve_committers(stats).values()) == {"Mona"}
+    labels = resolve_committers(stats, None, {"mona@personal.test": "octocat"})
+    assert set(labels.values()) == {"octocat (Mona)"}
+
+
+def test_build_server_accepts_email_logins_hint(tmp_path):
+    # The hint threads through build_server → handler → build_dashboard without error.
+    repo = GitRepo.init(tmp_path)
+    (tmp_path / "f.txt").write_text("x", encoding="utf-8")
+    repo.stage_paths(["f.txt"])
+    repo.commit(build_user_commit_message(message="seed", agitrack_session_id="s"))
+    server = build_server(repo, email_logins={"Someone@Example.com": "octocat"})
+    try:
+        # Emails are lowercased so the hint matches git's lowercased author email.
+        assert server.RequestHandlerClass.email_logins == {"someone@example.com": "octocat"}
+    finally:
+        server.server_close()
+
+
 def test_resolve_committers_merges_same_name_across_two_emails():
     stats = [
         _person("Sam Sample", "sam@sample.test"),

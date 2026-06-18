@@ -22,28 +22,42 @@ you already have it elsewhere, point `agitrack.path` at it.
 
 ## Usage
 
-Open the **aGiTrack menu** (the brand-icon button at the top-right of the editor
-toolbar) and choose **Start Session** or **Open Dashboard**. You can also:
+Click the **aGiTrack** button (the brand icon at the top-right of the editor toolbar)
+to start a session immediately. You can also:
 
-- run **aGiTrack: Start Session** / **aGiTrack: Open Dashboard** from the Command Palette, or
+- run **aGiTrack: Start Session** from the Command Palette, or
 - right-click a folder in the Explorer → **aGiTrack: Start Session Here**.
 
 A session opens **beside the editor** (a split to the right) by default and starts. From
 there it's the normal aGiTrack app: type to the agent, press `Ctrl-G` for aGiTrack's
-command menu (sessions, sharing, summarizer, commits, update, …), and every turn is
-auto-committed. Prefer the bottom panel? Set `agitrack.terminalLocation` to `panel`.
+command menu (sessions, sharing, summarizer, **dashboard**, commits, update, …), and
+every turn is auto-committed. Prefer the bottom panel? Set `agitrack.terminalLocation`
+to `panel`.
 
-**Open Dashboard** runs aGiTrack's metrics dashboard (`agitrack -d`) — it serves a
-filterable, auto-refreshing report on localhost and opens it in your browser. It's
-read-only and can run alongside a session; Ctrl-C in its terminal to stop it.
+Running it again focuses the existing session (aGiTrack only allows one per repository).
+**aGiTrack: Restart Session** stops it and starts fresh.
+
+**Closing the session terminal** prompts you to confirm (VSCode's built-in
+"terminate the running process?" for editor terminals), and aGiTrack then **exits
+gracefully** — finalizing and committing the latest turn rather than dropping it.
 
 > The session terminal sets `CLAUDE_CODE_IDE_SKIP_AUTO_INSTALL=1` so the Claude Code
 > backend doesn't try to auto-install its own VSCode companion extension here (that
 > attempt fails in this context and shows a confusing error). If you want Claude's IDE
 > features, install the *Claude Code* extension from the Marketplace yourself.
 
-Running the command again focuses the existing session (aGiTrack only allows one per
-repository). Use **aGiTrack: Restart Session** to stop it and start fresh.
+### Dashboard
+
+**aGiTrack: Open Dashboard** (Command Palette) — or the `dashboard` item in the
+`Ctrl-G` menu inside a session — runs aGiTrack's metrics dashboard. It serves a
+filterable, auto-refreshing report and opens it in your browser; read-only, runs
+alongside a session, Ctrl-C in its terminal to stop.
+
+When the workspace is **remote** (Remote-SSH / WSL / container / Codespaces) or you're
+in an SSH/Mosh session, the dashboard never tries to open a browser on the remote host
+(which would be headless). VSCode automatically forwards the port so the printed URL
+opens on **your** machine; over plain SSH, forward it yourself (e.g.
+`ssh -L 8765:127.0.0.1:8765 <host>`). An explicit `$BROWSER` is always honored.
 
 ## Settings
 

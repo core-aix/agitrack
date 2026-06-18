@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import http.server
 import json
+import os
 import sys
 import urllib.parse
 import webbrowser
@@ -37,6 +38,7 @@ def _int(query: dict[str, list[str]], key: str, default: int) -> int:
 
 class _DashboardHandler(http.server.BaseHTTPRequestHandler):
     repo: GitRepo  # set on the per-server subclass
+    email_logins: dict[str, str] = {}  # lowercased email → login hint (set on the subclass)
 
     def do_GET(self) -> None:  # noqa: N802 (http.server API)
         try:
@@ -100,7 +102,7 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
         # logins appear on a later poll. {} when gh is absent. The initial page render
         # asks for blocking resolution instead, so committer IDs are right immediately.
         logins = resolve_logins(self.repo) if blocking else cached_logins(self.repo)
-        return build_dashboard(self.repo, ref, sha_logins=logins)
+        return build_dashboard(self.repo, ref, sha_logins=logins, email_logins=self.email_logins)
 
     def _respond(self, content_type: str, body: bytes) -> None:
         self.send_response(200)
@@ -127,14 +129,73 @@ class _DashboardServer(http.server.ThreadingHTTPServer):
             super().handle_error(request, client_address)
 
 
-def build_server(repo: GitRepo, *, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> http.server.HTTPServer:
+def build_server(
+    repo: GitRepo,
+    *,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+    email_logins: dict[str, str] | None = None,
+) -> http.server.HTTPServer:
     """An HTTP server bound to ``host:port`` serving the dashboard for ``repo``.
-    Falls back to an OS-assigned free port if the preferred one is taken."""
-    handler = type("DashboardHandler", (_DashboardHandler,), {"repo": repo})
+    Falls back to an OS-assigned free port if the preferred one is taken.
+
+    ``email_logins`` (lowercased author email → GitHub login) supplements ``gh`` for
+    commits not yet on the remote — e.g. fresh session commits — so the current user's
+    local work still shows their GitHub ID."""
+    handler = type(
+        "DashboardHandler",
+        (_DashboardHandler,),
+        {"repo": repo, "email_logins": {k.lower(): v for k, v in (email_logins or {}).items()}},
+    )
     try:
         return _DashboardServer((host, port), handler)
     except OSError:
         return _DashboardServer((host, 0), handler)
+
+
+def browser_is_local() -> bool:
+    """Whether a browser opened here would land on the user's *current* machine.
+
+    The dashboard binds to localhost on whatever host aGiTrack runs on. When that
+    host is a remote one — a Remote-SSH / WSL / container shell, or a plain SSH/Mosh
+    session — calling ``webbrowser.open`` would try to launch a browser on the remote
+    (which is usually headless, so it fails or opens the wrong screen). In that case we
+    must NOT open it here and instead let the user reach the forwarded URL from their
+    own machine.
+
+    An explicit ``$BROWSER`` is always honored — editors that forward a local browser
+    set it, and a user can point it at their own tunnel — so respecting it routes to the
+    current machine. Otherwise a remote shell (``SSH_*``) or a headless Linux box (no
+    ``DISPLAY``/``WAYLAND_DISPLAY``) is treated as not-local."""
+    if os.environ.get("BROWSER"):
+        return True
+    if os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_CLIENT") or os.environ.get("SSH_TTY"):
+        return False
+    if sys.platform.startswith("linux") and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return False
+    return True
+
+
+def open_dashboard_in_browser(url: str) -> bool:
+    """Open ``url`` in the user's browser when it is on this machine; return whether a
+    browser was launched. On a remote/headless host it does nothing (the caller should
+    tell the user to open the forwarded URL from their own machine)."""
+    if not browser_is_local():
+        return False
+    try:
+        return webbrowser.open(url)
+    except (webbrowser.Error, OSError):
+        return False
+
+
+def remote_browser_hint(url: str, port: int) -> str:
+    """A one-line hint for opening the dashboard from the user's own machine when
+    aGiTrack runs on a remote host."""
+    return (
+        f"Open {url} from your own machine. If aGiTrack is on a remote host, your editor's "
+        f"automatic port forwarding should make the link work; over plain SSH, forward the "
+        f"port first, e.g. `ssh -L {port}:127.0.0.1:{port} <host>`."
+    )
 
 
 def serve_dashboard(
@@ -145,13 +206,11 @@ def serve_dashboard(
     open_browser: bool = True,
 ) -> int:
     server = build_server(repo, host=host, port=port)
-    url = f"http://{host}:{server.server_address[1]}/"
+    bound_port = server.server_address[1]
+    url = f"http://{host}:{bound_port}/"
     print(f"aGiTrack dashboard live at {url}\nRecomputed from commit metadata; auto-refreshes. Press Ctrl-C to stop.")
-    if open_browser:
-        try:
-            webbrowser.open(url)
-        except webbrowser.Error:
-            print("Could not open a browser automatically; open the URL above manually.")
+    if open_browser and not open_dashboard_in_browser(url):
+        print(remote_browser_hint(url, bound_port))
     try:
         server.serve_forever()
     except KeyboardInterrupt:

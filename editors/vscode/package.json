@@ -74,35 +74,11 @@
         "category": "aGiTrack"
       }
     ],
-    "submenus": [
-      {
-        "id": "agitrack.menu",
-        "label": "aGiTrack",
-        "icon": {
-          "light": "media/icon.svg",
-          "dark": "media/icon.svg"
-        }
-      }
-    ],
     "menus": {
       "editor/title": [
         {
-          "submenu": "agitrack.menu",
-          "group": "navigation@99"
-        }
-      ],
-      "agitrack.menu": [
-        {
           "command": "agitrack.start",
-          "group": "1_session@1"
-        },
-        {
-          "command": "agitrack.restart",
-          "group": "1_session@2"
-        },
-        {
-          "command": "agitrack.dashboard",
-          "group": "2_tools@1"
+          "group": "navigation@99"
         }
       ],
       "explorer/context": [
