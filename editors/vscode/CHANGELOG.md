@@ -17,9 +17,12 @@ Launch the full aGiTrack terminal application from VSCode — no terminal typing
   into aGiTrack instead of the shell (e.g. `source .venv/bin/activate` landing in the
   agent, or a stray newline auto-acknowledging the sensitive-information prompt). aGiTrack
   also drains any pending terminal input right before that prompt as a backstop.
-- Exiting aGiTrack (e.g. the `Ctrl-G` → exit menu) **closes the terminal** automatically:
-  the session is launched with `exec`, so when aGiTrack exits the process is gone and the
-  terminal closes.
+- Exiting aGiTrack (e.g. the `Ctrl-G` → exit menu) **closes the terminal** automatically —
+  but **only on a clean exit** (status 0). If aGiTrack quits with an error the terminal
+  stays open so its message is readable. (`agitrack … && exit`.)
+- Re-launching never restarts a running session: the editor button **focuses the existing
+  aGiTrack terminal**, reattaching to it even if the extension was reloaded (it checks the
+  repo lock to confirm a session is actually running before reusing the terminal).
 - Closing the window/terminal exits aGiTrack **gracefully**, finalizing the latest turn
   instead of stranding it. On shutdown the extension signals aGiTrack and waits (up to
   60s) for it to finish; it also raises `terminal.integrated.confirmOnKill` to `always`
