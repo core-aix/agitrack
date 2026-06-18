@@ -307,9 +307,11 @@ Scripted runs never block on a question: the privacy warning is printed without 
 
 For a programmatic driver, `agitrack --mode json --json-events` emits one machine-readable JSON line per turn event (`response`, `commit`, `no_changes`, `error`) alongside the plain output, so another process can render the conversation and see which commit each turn produced.
 
+For a driver that also needs to *answer* aGiTrack's interactive questions (which untracked files to stage, which backend to use, a commit message), `agitrack --mode json --ui-bridge` runs a long-lived **bidirectional** JSON-RPC session over stdin/stdout: the driver sends `{"type":"prompt"|"command"|"answer"|"exit", …}` lines, and aGiTrack streams back the same turn events plus `ask` events (`kind`: select/multiselect/input/confirm) that the driver renders and replies to. This is the transport the VSCode extension uses to present menus and dialogs with no terminal.
+
 ### Editor integration
 
-A VSCode extension in [`editors/vscode/`](editors/vscode/) adds an `@agitrack` **Chat participant**: chat with a coding agent from VSCode's Chat window while aGiTrack auto-commits every turn. It's a thin client over `agitrack --mode json --json-events` and isn't built by the Python CI — see its README to build (`npm install && npm run compile`) and run it (F5 → "Run Extension").
+A VSCode extension in [`editors/vscode/`](editors/vscode/) runs the **full interactive aGiTrack experience inside VSCode, with no terminal**. It launches `agitrack --mode json --ui-bridge` once per workspace and renders the agent conversation in the native Chat view (`@agitrack`), aGiTrack's questions as native menus / input boxes / modal confirmations, and the rest of the actions (status, stage, user commit, switch backend, new session, summarizer) as `aGiTrack:` Command Palette commands. The TypeScript side isn't built by the Python CI — see its README to build (`npm install && npm run compile`), run it (F5 → "Run Extension"), package a `.vsix` (`npm run package`), or publish to the Marketplace (`npm run publish`, needs the maintainer's publisher token).
 
 `scripts/demo.sh` is a self-contained showcase built on this: it creates a fresh repository in a temporary directory, has the agent write a small program and its tests through aGiTrack, and leaves the repository behind so you can inspect the `<aGiTrack>` commit history or continue interactively.
 

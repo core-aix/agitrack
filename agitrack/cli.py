@@ -94,6 +94,13 @@ def main(argv: list[str] | None = None) -> int:
         "chat extension and other programmatic drivers",
     )
     parser.add_argument(
+        "--ui-bridge",
+        action="store_true",
+        help="in --mode json, run a long-lived JSON-RPC session over stdin/stdout where "
+        "interactive questions (menus, confirmations, text input) are asked of the driver "
+        "instead of a terminal — used by the VSCode extension (see editors/vscode)",
+    )
+    parser.add_argument(
         "--full-agent-messages",
         action="store_true",
         help="record every user-facing message the agent sends during a turn in the "
@@ -167,6 +174,8 @@ def main(argv: list[str] | None = None) -> int:
     scripted = bool(args.prompts)
     if scripted:
         args.mode = "json"  # --prompt drives the non-interactive shell (#53)
+    if args.ui_bridge:
+        args.mode = "json"  # the bridge is a json-mode transport (the VSCode extension)
 
     # Offer a self-update before launching anything. Skipped for scripted/non-TTY
     # runs (no way to answer) and when the user turned update checks off. If the
@@ -235,6 +244,7 @@ def main(argv: list[str] | None = None) -> int:
                 prompts=args.prompts,
                 commit_guidance=commit_guidance,
                 json_events=args.json_events,
+                ui_bridge=args.ui_bridge,
             ).run()
         else:
             return ProxyRunner(
