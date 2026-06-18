@@ -80,6 +80,13 @@ def main(argv: list[str] | None = None) -> int:
         "agent does not create its own git commits unless you explicitly ask",
     )
     parser.add_argument(
+        "--delay-merge",
+        action="store_true",
+        help="don't merge a turn's committed changes into the base branch automatically; "
+        "instead leave them in the session's working directory for you to review/edit, then "
+        "merge on your confirmation via the session menu. Off by default.",
+    )
+    parser.add_argument(
         "--json-events",
         action="store_true",
         help="in --mode json, emit one machine-readable JSON line per turn event "
@@ -239,6 +246,7 @@ def main(argv: list[str] | None = None) -> int:
                 backend_args=backend_args,
                 commit_guidance=commit_guidance,
                 full_agent_messages=args.full_agent_messages,
+                delay_merge=args.delay_merge,
             ).run()
     except (GitError, RuntimeError) as error:
         print(error)

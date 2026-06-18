@@ -101,6 +101,7 @@ aGiTrack stands for agent + git tracking. It is a Python library and interactive
 - For backends that accept an explicit session id (Claude), aGiTrack pins at launch. For backends that assign their own id (OpenCode), aGiTrack snapshots existing session ids before launch and adopts the newly created one on the first parse, then stays pinned to it.
 - The `session` command (proxy) lets the user start a new session, switch the tracked session to another existing one, or sync tracking to the most recently active session (useful after starting a new session inside the backend TUI). Switching or starting a new session relaunches the backend TUI and re-baselines so existing history is not re-committed.
 - Session detection, listing, and switching must work identically for both OpenCode and Claude.
+- Shared-session conflicts (two contributors pushing the same session concurrently) are resolved by a best-effort **union merge** of the diverged copies rather than silent last-write-wins: `merge_transcripts` keeps the shared prefix and appends each side's unique rows by id (Claude JSONL; OpenCode's single-object export isn't line-mergeable, so it falls back to last-write-wins). **Before a merged transcript is uploaded** it must pass `_transcript_is_readable(text, backend)` — the backend's own parser (`parse_rows` / `parse_exported_session`) must still yield ≥1 turn — or the merge is discarded and last-write-wins is used, so a corrupt merge is never pushed. This runs in `store._add_and_push` before the push, for both backends.
 
 ## Concurrency and Locking
 
@@ -117,6 +118,7 @@ This is the design aGiTrack targets for running several sessions at once. Founda
 - A session creates a transient turn branch (`agitrack/<name>/t<n>`) when it receives a prompt; on the turn's final agent message the branch is integrated into the base and deleted.
 - Integration is serialized and completion-ordered. It runs inside the owning session's worktree (merge base into the turn branch) so the agent can resolve conflicts in place; aGiTrack auto-prompts the agent with the conflicting commits' context and pauses for the user if it cannot resolve.
 - A `session` view shows running/idle/merging status and can stop sessions; a `base` command switches the base branch after stopping sessions and draining pending integrations; on restart aGiTrack offers recovery for stale `agitrack/*` branches and worktrees.
+- The `--delay-merge` flag (`ProxyRunner._delay_merge`, off by default) holds automatic integration: after a turn commits, the in-session auto-merge paths (`_integrate_session_turn`, `_integrate_committed_turn_before_new_turn`, `_integrate_agent_made_commits_if_idle`) defer and a notice names the **working directory** (the worktree path, which the user may not otherwise know) so they can review/edit. The merge runs only on explicit confirmation via the session menu ("Merge reviewed changes into &lt;base&gt;" → `_integrate_active_session`). Exit still finalizes (`_integrate_session_on_exit` is not gated) so committed work isn't stranded, and unmerged work is surfaced again next run.
 
 ## Backend Selection and Global Config
 

@@ -68,25 +68,95 @@ def test_merge_transcripts_falls_back_when_not_mergeable():
     assert merge_transcripts("", "y") == "y"
 
 
+def _claude_user(uuid, text):
+    return json.dumps({"type": "user", "uuid": uuid, "message": {"role": "user", "content": text}})
+
+
+def _claude_assistant(uuid, text):
+    return json.dumps(
+        {
+            "type": "assistant",
+            "uuid": uuid,
+            "message": {"id": uuid, "role": "assistant", "content": [{"type": "text", "text": text}]},
+        }
+    )
+
+
 def test_publish_merges_divergent_local_entry(tmp_path):
     # When the local ref already holds a diverged copy of the same session (e.g. a
     # collaborator's version fetched after losing the push race), the store folds both
-    # sides' turns together instead of overwriting one with the other.
+    # sides' turns together instead of overwriting one with the other. Real Claude rows
+    # so the merge passes the readability guard.
     from agitrack.sessions.store import DEFAULT_KEEP
 
     repo = _init_repo(tmp_path)
     store = SharedSessionStore(repo)
-    base = _row("a") + "\n" + _row("b") + "\n"
-    theirs = base + _row("c2") + "\n"
-    mine = base + _row("c1") + "\n"
-    store._add_session("alice", "s", theirs, {"session_id": "sid", "content_hash": "h"})
+    base = _claude_user("u1", "hi") + "\n" + _claude_assistant("a1", "hello") + "\n"
+    theirs = base + _claude_user("u3", "theirs") + "\n" + _claude_assistant("a3", "sure") + "\n"
+    mine = base + _claude_user("u2", "mine") + "\n" + _claude_assistant("a2", "ok") + "\n"
+    manifest = {"session_id": "sid", "content_hash": "h", "backend": "claude"}
+    store._add_session("alice", "s", theirs, manifest)
 
-    result = store._add_and_push("alice", "s", mine, {"session_id": "sid", "content_hash": "h"}, DEFAULT_KEEP)
+    result = store._add_and_push("alice", "s", mine, manifest, DEFAULT_KEEP)
 
     stored = store.repo.read_ref_blob(store.ref, f"{store._prefix()}alice/s/transcript.jsonl")
     ids = [json.loads(r)["uuid"] for r in stored.splitlines() if r.strip()]
-    assert ids == ["a", "b", "c1", "c2"]  # union, nothing lost
-    assert result.merged == 1  # one row folded in from the other copy
+    assert ids == ["u1", "a1", "u2", "a2", "u3", "a3"]  # union, nothing lost
+    assert result.merged == 2  # the collaborator's two rows folded in
+
+
+def test_publish_skips_unreadable_merge(tmp_path, monkeypatch):
+    # If a merge would produce a transcript the backend can't load, the store falls
+    # back to last-write-wins rather than uploading a broken session.
+    import agitrack.sessions.store as store_mod
+    from agitrack.sessions.store import DEFAULT_KEEP
+
+    repo = _init_repo(tmp_path)
+    store = SharedSessionStore(repo)
+    base = _claude_user("u1", "hi") + "\n" + _claude_assistant("a1", "hello") + "\n"
+    theirs = base + _claude_user("u3", "theirs") + "\n"
+    mine = base + _claude_user("u2", "mine") + "\n"
+    manifest = {"session_id": "sid", "content_hash": "h", "backend": "claude"}
+    store._add_session("alice", "s", theirs, manifest)
+    monkeypatch.setattr(store_mod, "_transcript_is_readable", lambda text, backend: False)
+
+    result = store._add_and_push("alice", "s", mine, manifest, DEFAULT_KEEP)
+
+    stored = store.repo.read_ref_blob(store.ref, f"{store._prefix()}alice/s/transcript.jsonl")
+    ids = [json.loads(r)["uuid"] for r in stored.splitlines() if r.strip()]
+    assert ids == ["u1", "a1", "u2"]  # our own copy, not the union
+    assert result.merged == 0
+
+
+def test_transcript_is_readable_claude():
+    from agitrack.sessions.store import _transcript_is_readable
+
+    good = _claude_user("u1", "hi") + "\n" + _claude_assistant("a1", "hello") + "\n"
+    assert _transcript_is_readable(good, "claude") is True
+    # No real turns (assistant only / empty / garbage) → not readable.
+    assert _transcript_is_readable(_claude_assistant("a1", "hello"), "claude") is False
+    assert _transcript_is_readable("", "claude") is False
+    assert _transcript_is_readable("not json\nstill not", "claude") is False
+
+
+def test_transcript_is_readable_opencode():
+    from agitrack.sessions.store import _transcript_is_readable
+
+    good = json.dumps(
+        {
+            "info": {"id": "ses"},
+            "messages": [
+                {"info": {"role": "user", "id": "u1"}, "parts": [{"type": "text", "text": "hi"}]},
+                {
+                    "info": {"role": "assistant", "id": "a1", "finish": "stop"},
+                    "parts": [{"type": "text", "text": "ok"}],
+                },
+            ],
+        }
+    )
+    assert _transcript_is_readable(good, "opencode") is True
+    assert _transcript_is_readable("{bad json", "opencode") is False
+    assert _transcript_is_readable(json.dumps({"info": {}, "messages": []}), "opencode") is False
 
 
 # --- redaction --------------------------------------------------------------

@@ -374,6 +374,7 @@ class ProxyRunner:
         backend_args: list[str] | None = None,
         commit_guidance: bool = True,
         full_agent_messages: bool = False,
+        delay_merge: bool = False,
         # Optional injected collaborators (default to production construction).
         # These keyword arguments are for testing and advanced use; the CLI call
         # site passes only the first five parameters and is unaffected.
@@ -394,6 +395,11 @@ class ProxyRunner:
         # (--full-agent-messages). True forces it on for this run regardless of the
         # per-repo config; False (the default) defers to ``state.full_agent_messages``.
         self._full_agent_messages = full_agent_messages
+        # --delay-merge: when True, a turn's committed changes are NOT auto-integrated
+        # into the base branch. Instead the user is told to review/edit them in the
+        # working directory and merge on their confirmation (session menu → "Merge
+        # reviewed changes"). Off by default (aGiTrack integrates each turn immediately).
+        self._delay_merge = delay_merge
         # Extra CLI args forwarded verbatim to every backend spawn (#32).
         self._backend_args = list(backend_args or [])
         self._force_new_session = new_session  # start a fresh conversation, do not resume
@@ -777,6 +783,7 @@ class ProxyRunner:
                 "_cancel_prompted": set(),
                 "_copy_prompted": {},
                 "_full_agent_messages": False,
+                "_delay_merge": False,
                 "_user_declined": [],
                 "sessions": [],
                 "worktree_manager": None,
@@ -2182,11 +2189,32 @@ class ProxyRunner:
         # branch. When it cannot fast-forward (the base gained conflicting work
         # from another session), surface the resolve options box and let the
         # user choose how to handle it.
+        if self._delay_merge and self.worktree is not None and not self._exiting:
+            # --delay-merge: hold the merge so the user can review/edit first and
+            # confirm it themselves. (Exit still finalizes via _integrate_session_on_exit
+            # so committed work isn't stranded across runs.)
+            self._notify_merge_deferred()
+            return
         result = self._integrate_turn_or_conflict()
         if result == "conflict" and not self._exiting:
             # On exit there is no UI to drive a resolution; the work stays on its
             # branch for the next startup / session menu to surface.
             self._prompt_resolve_conflict(self.repo.current_branch())
+
+    def _notify_merge_deferred(self) -> None:
+        # Tell the user their turn was committed but not merged (only under
+        # --delay-merge), naming the WORKING DIRECTORY so they know where to review —
+        # crucial when it's a worktree, whose location they may not otherwise know.
+        if not self._active_has_pending():
+            return
+        base = self._base_branch or "the base branch"
+        self._set_message(
+            f"Changes committed but not merged into {base} yet (--delay-merge). Review and edit them in "
+            f"{self.repo.repo}, then merge via {self._menu_label()} → session → "
+            f'"Merge reviewed changes into {base}".',
+            seconds=30.0,
+        )
+        self._render()
 
     def _integrate_committed_turn_before_new_turn(self) -> None:
         # A new prompt is about to start a turn. If the previous turn was already
@@ -2203,8 +2231,8 @@ class ProxyRunner:
         # the design it waits until the current agent call ends.
         if self.worktree is None or self.merge_ctx or self._base_branch is None:
             return
-        if self._integration_paused:
-            return
+        if self._integration_paused or self._delay_merge:
+            return  # --delay-merge: the user merges on their own confirmation
         try:
             if self.repo.has_changes() or self.repo.merge_in_progress():
                 return  # in-flight or mid-merge work; leave it for the normal path
@@ -2693,6 +2721,11 @@ class ProxyRunner:
         if self.merge_ctx or (self.worktree is not None and self.repo.merge_in_progress()):
             options.append("✓ Complete merge for this session")
             actions.append(("complete-merge", None))
+        if self._delay_merge and not self.merge_ctx and self.worktree is not None and self._active_has_pending():
+            # --delay-merge confirm point: integrate the reviewed changes on demand.
+            base = self._base_branch or "the base branch"
+            options.append(f"✓ Merge reviewed changes into {base}")
+            actions.append(("delay-merge-now", None))
         shared_ids = self._my_shared_session_ids()  # mark which sessions are shared (#55)
         live_names = set()
         for index, session in enumerate(self.sessions):
@@ -2761,6 +2794,8 @@ class ProxyRunner:
                 self._switch_active(value)
         elif kind == "resume-past":
             self._resume_session_menu()
+        elif kind == "delay-merge-now":
+            self._integrate_active_session()  # user-confirmed merge under --delay-merge
         elif kind == "complete-merge":
             self._finalize_agent_merge()
         elif kind == "resolve":
@@ -7106,8 +7141,8 @@ class ProxyRunner:
         # integrate them now.
         if self.worktree is None or self.merge_ctx:
             return
-        if self._base_branch is None or self._integration_paused:
-            return
+        if self._base_branch is None or self._integration_paused or self._delay_merge:
+            return  # --delay-merge: don't integrate idle commits behind the user's back
         if self._agent_is_active() or now - self.last_child_output < self.CHILD_IDLE_SECONDS:
             return
         if now - self._idle_integrate_at < self.BASE_POLL_SECONDS:
