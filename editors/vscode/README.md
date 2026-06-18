@@ -1,66 +1,33 @@
 # aGiTrack for VSCode
 
-Run a coding agent (Claude Code / OpenCode) through
-[aGiTrack](https://github.com/core-aix/agitrack) **inside VSCode, with no terminal**.
-Chat with the agent in the native Chat view, answer aGiTrack's questions as native
-menus and dialogs, and let aGiTrack auto-commit every turn with full provenance.
+Install [aGiTrack](https://github.com/core-aix/agitrack) as a VSCode plugin and launch
+it **inside VSCode with one click** — no opening a terminal and typing `agitrack`
+yourself.
 
-Unlike a plain terminal wrapper, this extension drives aGiTrack's **full interactive
-experience** in the editor: when aGiTrack needs to ask something — *stage which
-untracked files? pick a backend? what's the commit message?* — it pops up a VSCode
-QuickPick, input box, or modal, and feeds your answer back.
-
-## How it works
-
-aGiTrack is launched once per workspace as a long-lived child process driven over a
-bidirectional JSON-RPC bridge:
-
-```
-agitrack --repo <workspace> --mode json --ui-bridge --skip-privacy-ack
-```
-
-- Prompts and `:` commands are written to the child's **stdin** as JSON lines.
-- aGiTrack streams back `response`, `commit`, `notice`, and `error` events on **stdout**.
-- When aGiTrack needs input it emits an `ask` event; the extension shows the matching
-  native UI (menu / multi-select / input box / confirm) and writes the answer back.
-
-aGiTrack does all the real work — session tracking, backend orchestration, summaries,
-and commits. The extension is the editor-side UI for it.
+This extension is a thin **launcher**: it runs the real aGiTrack CLI in a VSCode
+integrated terminal, so you get the **complete aGiTrack experience** — the coding
+agent's native interface (Claude Code / OpenCode), the `Ctrl-G` command menu, sessions,
+sharing, worktrees, and auto-commits with full provenance on every turn. Everything
+aGiTrack does in a terminal, started from VSCode.
 
 ## Requirements
 
 - aGiTrack installed and on your `PATH` (`pipx install agitrack`), or set `agitrack.path`.
-- A backend installed (Claude Code or OpenCode), same as using aGiTrack in a terminal.
+- A backend installed (Claude Code or OpenCode), the same as using aGiTrack in a terminal.
 - The workspace is a git repository.
 
 ## Usage
 
-### Chat
+- Click the **`$(git-commit) aGiTrack`** button in the status bar, or
+- run **aGiTrack: Start Session** from the Command Palette, or
+- right-click a folder in the Explorer → **aGiTrack: Start Session Here**.
 
-Open the Chat view and address the participant:
+A terminal opens in your workspace and aGiTrack starts. From there it's the normal
+aGiTrack app: type to the agent, press `Ctrl-G` for aGiTrack's command menu (sessions,
+sharing, summarizer, commits, update, …), and every turn is auto-committed.
 
-```
-@agitrack add a healthcheck endpoint and a test for it
-```
-
-Responses stream into the chat. If aGiTrack asks whether to stage new files, a menu
-appears; your reply continues the turn. When the turn changes files, the chat shows
-the short commit SHA aGiTrack created.
-
-### Commands
-
-From the Command Palette (`aGiTrack:` prefix):
-
-| Command | What it does |
-| --- | --- |
-| Show Git Status | Current working-tree status |
-| Review & Stage Untracked Files | Menu to stage all / pick / skip untracked files |
-| Create User Commit | Commit your own (non-agent) changes with a message |
-| Show Intentionally Unstaged Files | Files you chose not to stage |
-| Switch Agent Backend | Pick Claude Code or OpenCode |
-| Start New Session | Begin a fresh agent conversation |
-| Manage Summarizer | Turn commit summarization on/off, set its model |
-| Restart aGiTrack | Restart the background aGiTrack process |
+Running the command again focuses the existing session (aGiTrack only allows one per
+repository). Use **aGiTrack: Restart Session** to stop it and start fresh.
 
 ## Settings
 
@@ -68,6 +35,22 @@ From the Command Palette (`aGiTrack:` prefix):
 | --- | --- | --- |
 | `agitrack.path` | `agitrack` | Path to the aGiTrack executable. |
 | `agitrack.backend` | (aGiTrack default) | `claude` or `opencode`. |
+| `agitrack.args` | `[]` | Extra CLI arguments (e.g. `["--no-worktree"]`). |
+| `agitrack.openOnStartup` | `false` | Start a session automatically when a workspace opens. |
+
+## Updates
+
+Because the extension runs the real aGiTrack CLI in a terminal, aGiTrack's own
+**self-update works here exactly as in a standalone terminal** — you're offered the
+update at startup, or any time via the `Ctrl-G` → *update* menu, and aGiTrack restarts
+itself in place.
+
+The extension and the CLI ship in **lockstep** (the extension's version always equals
+the `agitrack` release it launches). The extension is published to the Marketplace at
+that matching version, and VSCode auto-updates it like any extension. If the CLI ever
+runs ahead of the installed extension (e.g. the CLI self-updated and the new extension
+hasn't been pulled yet), the extension detects the mismatch on startup and prompts you
+to update it.
 
 ## Develop
 
@@ -77,7 +60,7 @@ npm run compile      # or: npm run watch
 ```
 
 Press <kbd>F5</kbd> ("Run Extension") to launch an Extension Development Host with the
-extension loaded. Open a git repo, open the Chat view, and talk to `@agitrack`.
+extension loaded, then use the status-bar button or Command Palette.
 
 ## Package & publish
 
@@ -105,30 +88,3 @@ npm run publish          # vsce publish
 
 > The `publisher` field in `package.json` (`core-aix`) must match the Marketplace
 > publisher that owns the PAT. Publishing cannot be done without that token.
-
-## Protocol reference
-
-Newline-delimited JSON in both directions.
-
-**Editor → aGiTrack (stdin):**
-
-| Message | Meaning |
-| --- | --- |
-| `{"type":"prompt","text":"…"}` | Run one agent turn |
-| `{"type":"command","text":":status"}` | Run an aGiTrack `:` command |
-| `{"type":"answer","id":"ask-3","value":…}` | Reply to an `ask` |
-| `{"type":"exit"}` | Shut the session down |
-
-**aGiTrack → editor (stdout):**
-
-| Event | Meaning |
-| --- | --- |
-| `ready` | Session started (`session`, `backend`, `repo`) |
-| `response` | Agent reply text |
-| `commit` | A commit was created (`sha`) |
-| `no_changes` | The turn changed no files |
-| `notice` | Informational message (`level`: info/warn/error) |
-| `error` | Something failed (`message`) |
-| `ask` | Needs input (`kind`: select/multiselect/input/confirm) |
-| `turn-complete` | The current prompt/command finished |
-| `bye` | The session is exiting |
