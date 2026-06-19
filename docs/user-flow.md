@@ -214,12 +214,20 @@ never see them (`_offer_copy_unstaged_to_base`). It runs for the **active** sess
 (a background session is never interrupted mid-run); its files are caught instead when you
 **switch to it** or on **aGiTrack exit**, just before the worktree is deleted.
 
+First, though, aGiTrack offers to **commit** any of the user's own uncommitted edits in
+the worktree (`_offer_user_commit_for_worktree_edits`) — those belong in git, not just
+copied. So when both a user edit and copy-able leftovers exist, **both prompts appear**: a
+commit prompt for the edits, then the copy prompt for the leftovers.
+
 ```mermaid
 flowchart TD
   start(["Trigger: active session idle after a turn (committed or not), OR switched to this session, OR aGiTrack exiting"]) --> wtq{"Worktree session? (no-op under --no-worktree)"}
   wtq -->|No| done(["Nothing to do"])
-  wtq -->|Yes| gather[["List worktree files that won't merge: intentionally unstaged or git-ignored (new agent files are auto-staged + committed). Skip .agitrack/ and names starting with _ or ."]]
-  gather --> any{"Any candidate files?"}
+  wtq -->|Yes| useredit{"User's OWN uncommitted edits in the worktree? (tracked changes / new non-declined files)"}
+  useredit -->|Yes| ucommit[/"Uncommitted changes in this worktree — commit them? (the normal user-commit prompt; see git-user-commit). Then continue to the copy offer"/]
+  useredit -->|No| gather
+  ucommit --> gather[["List worktree files that won't merge: intentionally unstaged or git-ignored (new agent files are auto-staged + committed). Skip .agitrack/ and names starting with _ or ."]]
+  gather --> any{"Any candidate files left to copy?"}
   any -->|No| done
   any -->|Yes| muted{"This whole SET already declined, AND no genuinely new file? (applies in EVERY context, incl. exit)"}
   muted -->|Yes| done
@@ -246,6 +254,8 @@ flowchart TD
   skipc --> tally
   copyall --> tally[["Report copied count; anything not copied gets the 'files remain' notice"]]
   tally --> done
+
+  click ucommit "#8-git-user-commit"
 ```
 
 > A file already accepted or left in place isn't re-offered until its content changes
