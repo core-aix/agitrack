@@ -85,8 +85,8 @@ flowchart TD
   priv -->|Yes, or --skip-privacy-ack| lock
 
   lock{"Acquire single-writer repo lock .agitrack/lock?"}
-  lock -->|Held by another aGiTrack process| ro[["Run READ-ONLY: render TUI, make no commits, show 'another process manages this repo' banner"]]
-  ro --> spawn
+  lock -->|Held by another aGiTrack process| busy[["Refuse to start: name the holding process (PID) and tell the user to stop it first"]]
+  busy --> quit
   lock -->|Acquired, or stale owner reclaimed| backend
 
   backend{"Selected backend CLI installed on PATH?"}
@@ -437,7 +437,6 @@ flowchart TD
   term -->|Yes| fin
 
   how -->|Terminal or window closed, SIGHUP/SIGTERM| sig[["_handle_exit_signal: best-effort finalize pending work, render suppressed (non-interactive)"]]
-  how -->|Read-only instance| roexit[["Torn down with the window; no finalize needed"]]
 
   fin[["Finalize each session: commit a just-completed turn, integrate committed work"]]
   fin --> copy2["Per session, before deleting its worktree: offer to copy its leftover files (see Copy)"]
@@ -446,7 +445,6 @@ flowchart TD
   esc -->|No| rm[["Remove the (fully-integrated) worktree(s), stop the dashboard"]]
   sig --> fin
   rm --> bye(["aGiTrack exits"])
-  roexit --> bye
 
   click copy2 "#6-after-the-turn-copy-worktree-only-files-to-base"
 ```
