@@ -828,13 +828,43 @@ def test_session_menu_esc_signals_up_and_reopens_palette(tmp_path):
 
 
 def test_session_menu_transition_signals_done(tmp_path):
-    # Starting a new session is a context transition: it returns _MENU_DONE so the menu
-    # unwinds straight to the agent (the palette is NOT re-opened).
+    # Starting a new session is a context transition: _prompt_new_session reports _MENU_DONE
+    # and the sessions menu unwinds straight to the agent (the palette is NOT re-opened).
     runner = _delay_menu_runner(tmp_path)
-    runner._prompt_new_session = lambda: None
+    runner._prompt_new_session = lambda: runner._MENU_DONE
     runner._select_popup = lambda title, options: next(o for o in options if o.startswith("+ New session"))
 
     assert runner._session_menu() == runner._MENU_DONE
+
+
+def test_session_menu_new_session_cancel_returns_to_list(tmp_path):
+    # Backing out of the new-session prompts (_prompt_new_session → _MENU_UP) must NOT drop
+    # to the agent: the sessions list re-shows so Esc lands one level up here.
+    runner = _delay_menu_runner(tmp_path)
+    runner._prompt_new_session = lambda: runner._MENU_UP
+    shown: list[bool] = []
+
+    def select(title, options):
+        shown.append(True)
+        if len(shown) == 1:
+            return next(o for o in options if o.startswith("+ New session"))
+        return None  # second visit → Esc closes the menu
+
+    runner._select_popup = select
+    assert runner._session_menu() == runner._MENU_UP
+    assert len(shown) == 2  # list re-shown after the cancelled new-session prompt
+
+
+def test_session_menu_back_out_shows_no_message(tmp_path):
+    # Backing out of a menu is silent — no "closed"/"cancelled" flash before the parent
+    # (here, the palette) re-appears.
+    runner = _delay_menu_runner(tmp_path)
+    msgs: list = []
+    runner._set_message = lambda *a, **k: msgs.append(a[0] if a else k.get("message"))
+    runner._select_popup = lambda title, options: None  # Esc immediately
+
+    assert runner._session_menu() == runner._MENU_UP
+    assert msgs == []  # nothing announced on the way up
 
 
 def _copy_runner(tmp_path, status):

@@ -207,6 +207,27 @@ class TestSelectModal:
         assert "↑" not in msg and "↓" not in msg
         assert "PgUp/PgDn" not in msg  # no scroll instruction when everything fits
 
+    def test_long_option_list_is_windowed_around_selection(self):
+        # More options than the terminal can show must scroll WITH the selection, never
+        # truncating it off-screen.
+        options = [f"opt-{i}" for i in range(40)]
+        m = SelectModal("Pick one", options, viewport_rows=12)
+        # Move the selection far down the list.
+        for _ in range(30):
+            m.feed(b"\x1b[B")
+        assert m.selected == 30
+        msg = m.render_message()
+        assert "> opt-30" in msg  # the selected row is visible
+        assert "more above" in msg  # earlier options are scrolled off the top
+        shown = [ln for ln in msg.splitlines() if ln.startswith(("> opt-", "  opt-"))]
+        assert len(shown) < len(options)  # genuinely windowed, not the whole list
+
+    def test_short_option_list_is_not_windowed(self):
+        m = SelectModal("Pick", ["a", "b", "c"], viewport_rows=40)
+        msg = m.render_message()
+        assert "more above" not in msg and "more below" not in msg
+        assert "> a" in msg and "  b" in msg and "  c" in msg
+
 
 # ---------------------------------------------------------------------------
 # ProxyRunner._run_modal — reactor: PTY drains while modal is open

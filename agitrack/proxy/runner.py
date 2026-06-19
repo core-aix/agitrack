@@ -480,6 +480,10 @@ class ProxyRunner:
         self.last_status_change = 0.0
         self.message: str | None = None
         self.message_until = 0.0
+        # Scroll position of an over-tall popup message and how far it can scroll (set on
+        # render). 0/0 = the message fits, so PgUp/PgDn pass through to history scrolling.
+        self._message_scroll = 0
+        self._message_max_scroll = 0
         # Track whether we proactively enabled the kitty keyboard protocol for
         # shift-modified menu keys. Used for cleanup on exit.
         self._kitty_keyboard_enabled = False
@@ -778,6 +782,8 @@ class ProxyRunner:
                 "_sync_since": 0.0,
                 "message": None,
                 "message_until": 0.0,
+                "_message_scroll": 0,
+                "_message_max_scroll": 0,
                 "_message_sticky": False,
                 "_session_notices": {},
                 "_notice_shown": False,
@@ -5271,6 +5277,18 @@ class ProxyRunner:
         data = os.read(sys.stdin.fileno(), 4096)
         self._raw_capture(">", data)
         self._debug(f"stdin: {data!r} menu_key={self.input.menu_key!r}")
+        # A popup message taller than the screen scrolls with PgUp/PgDn, handled before
+        # anything else so a long notice can be read in full (and isn't dismissed mid-read).
+        if self._message_max_scroll > 0 and not self.input.capturing and _PAGE_KEY_RE.search(data):
+            page = max(self.rows - 4, 1)
+            for match in _PAGE_KEY_RE.finditer(data):
+                step = page if match.group(1) == b"6" else -page  # PgDn scrolls down, PgUp up
+                self._message_scroll = max(0, min(self._message_scroll + step, self._message_max_scroll))
+            data = _PAGE_KEY_RE.sub(b"", data)
+            self.message_until = time.monotonic() + 30  # keep the notice up while scrolling
+            self._render()
+            if not data:
+                return None
         # Any keypress dismisses a sticky message (e.g. the auto-commit
         # confirmation) so it no longer overlays the live view; repaint to
         # remove the popup even if the key produces no child echo.
@@ -5651,6 +5669,7 @@ class ProxyRunner:
             message=self.message,
             message_sticky=self._message_sticky,
             message_until=self.message_until,
+            message_scroll=self._message_scroll,
         )
 
     def _append_command_palette(self, parts: list[str]) -> None:
@@ -5665,7 +5684,9 @@ class ProxyRunner:
         )
 
     def _append_message_popup(self, parts: list[str], message: str) -> None:
-        ScreenRenderer.append_message_popup(self, parts, message, rows=self.rows, cols=self.cols)
+        ScreenRenderer.append_message_popup(
+            self, parts, message, rows=self.rows, cols=self.cols, scroll=self._message_scroll
+        )
 
     def _append_box(
         self, parts: list[str], row: int, col: int, width: int, lines: list[str], highlight: str | None = None
@@ -5794,8 +5815,12 @@ class ProxyRunner:
     def render_line(self, cells, sel=None, *, cols: int) -> str:
         return ScreenRenderer.render_line(self, cells, sel, cols=cols)
 
-    def append_box(self, parts, row, col, width, lines, highlight=None, *, rows: int) -> None:
-        ScreenRenderer.append_box(self, parts, row, col, width, lines, highlight, rows=rows)
+    def append_box(
+        self, parts, row, col, width, lines, highlight=None, *, rows: int, scrollable: bool = False, scroll: int = 0
+    ) -> None:
+        ScreenRenderer.append_box(
+            self, parts, row, col, width, lines, highlight, rows=rows, scrollable=scrollable, scroll=scroll
+        )
 
     def append_command_palette(
         self, parts, *, rows: int, cols: int, input_text: str, input_matches, input_selected
@@ -5810,8 +5835,11 @@ class ProxyRunner:
             input_selected=input_selected,
         )
 
-    def append_message_popup(self, parts, message: str, *, rows: int, cols: int) -> None:
-        ScreenRenderer.append_message_popup(self, parts, message, rows=rows, cols=cols)
+    def append_message_popup(self, parts, message: str, *, rows: int, cols: int, scroll: int = 0) -> None:
+        ScreenRenderer.append_message_popup(self, parts, message, rows=rows, cols=cols, scroll=scroll)
+
+    def wrapped_message_height(self, lines, cols: int) -> int:
+        return ScreenRenderer.wrapped_message_height(self, lines, cols)
 
     def cursor_sequence(self, rows: int, cols: int, scroll_back: int) -> str:
         return ScreenRenderer.cursor_sequence(self, rows, cols, scroll_back)
@@ -6864,6 +6892,7 @@ class ProxyRunner:
         # None simply leaves no popup to paint (the same state as a cleared message).
         self.message = message
         self.message_until = time.monotonic() + seconds
+        self._message_scroll = 0  # a fresh message starts at the top
         # Sticky messages ignore the timeout and persist until the user's next
         # keypress clears them (see _clear_sticky_message_on_input).
         self._message_sticky = sticky
