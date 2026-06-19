@@ -17,7 +17,7 @@ aGiTrack needs **git** and at least one backend CLI — [Claude Code](https://do
 pip install agitrack
 ```
 
-This installs the `agitrack` command and the terminal UI dependency used for status bars and contextual command hints. The PyPI distribution, the importable package, and the command are all named `agitrack` (the legacy `agit` command name still works as an alias). Once installed, aGiTrack keeps itself up to date — see [Self-update](#self-update).
+This installs the `agitrack` command and the terminal UI dependency used for status bars and contextual command hints. The PyPI distribution, the importable package, and the command are all named `agitrack`. Once installed, aGiTrack keeps itself up to date — see [Self-update](#self-update).
 
 For local development, install from a checkout instead:
 

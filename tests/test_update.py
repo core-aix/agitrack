@@ -639,7 +639,7 @@ def _capture_restart(monkeypatch, argv):
 def test_restart_agitrack_appends_extra_args(monkeypatch):
     from agitrack.update import restart_agitrack
 
-    captured = _capture_restart(monkeypatch, ["agit", "--backend", "claude"])
+    captured = _capture_restart(monkeypatch, ["agitrack", "--backend", "claude"])
     restart_agitrack(["--skip-privacy-ack"])
 
     assert captured[0][1:] == ["-m", "agitrack", "--backend", "claude", "--skip-privacy-ack"]
@@ -648,7 +648,7 @@ def test_restart_agitrack_appends_extra_args(monkeypatch):
 def test_restart_agitrack_does_not_duplicate_existing_flag(monkeypatch):
     from agitrack.update import restart_agitrack
 
-    captured = _capture_restart(monkeypatch, ["agit", "--skip-privacy-ack"])
+    captured = _capture_restart(monkeypatch, ["agitrack", "--skip-privacy-ack"])
     restart_agitrack(["--skip-privacy-ack"])
 
     # The flag is already present from a prior restart; don't accumulate it.
@@ -660,7 +660,7 @@ def test_restart_agitrack_without_extra_args_preserves_argv(monkeypatch):
     # privacy warning (no --skip-privacy-ack injected).
     from agitrack.update import restart_agitrack
 
-    captured = _capture_restart(monkeypatch, ["agit", "--verbose"])
+    captured = _capture_restart(monkeypatch, ["agitrack", "--verbose"])
     restart_agitrack()
 
     assert captured[0][1:] == ["-m", "agitrack", "--verbose"]
