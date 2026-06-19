@@ -1810,8 +1810,6 @@ class ProxyRunner:
         # Otherwise start fresh, confirming the session name first.
         session_name = self._prompt_session_name(f"New {name} session", default=self._next_session_name())
         if session_name is None:
-            self._set_message("Cancelled.")
-            self._render()
             return
         self._new_session(session_name, backend=name)
 
@@ -2589,8 +2587,7 @@ class ProxyRunner:
         # Ctrl-G then "sessions": manage the live concurrent sessions.
         arg = arg.strip()
         if arg in {"new", "fresh"}:
-            self._prompt_new_session()
-            return self._MENU_DONE
+            return self._prompt_new_session()
         if arg.isdigit():
             self._switch_active(int(arg) - 1)
             return self._MENU_DONE
@@ -2719,8 +2716,6 @@ class ProxyRunner:
             options.append(label)
         choice = self._select_popup("Change the merge branch of which session?", options)
         if choice is None:
-            self._set_message("Cancelled.")
-            self._render()
             return
         index = label_for[choice]
         session = self.sessions[index]
@@ -2736,8 +2731,6 @@ class ProxyRunner:
         current = getattr(session, "_base_branch", None)
         target = self._prompt_merge_branch(f"Merge '{self._session_name(index)}' into which branch?", current)
         if not target:
-            self._set_message("Cancelled.")
-            self._render()
             return
         if target == current:
             self._set_message(f"'{self._session_name(index)}' already merges into '{target}'.")
@@ -2773,142 +2766,142 @@ class ProxyRunner:
             self.turn = new_turn
 
     def _session_menu(self) -> str:
-        # A configuration sub-action (rename, change merge branch, share, manage shared,
-        # stop) returns to THIS menu so Esc inside it lands one level up here; an action
-        # that switches you into a different session context (switch/new/resume/integrate)
-        # ends with _MENU_DONE. Esc on this list returns _MENU_UP (one level up to the
-        # Ctrl-G palette).
+        # One loop, two outcomes: Esc on the list → _MENU_UP (one level up to the Ctrl-G
+        # palette); a context transition (switch/new/resume/integrate) → _MENU_DONE (unwind
+        # to the agent). A configuration sub-action (rename, change merge branch, share,
+        # manage shared, stop) or a child menu the user backed out of falls through to
+        # ``continue``, re-showing this list so Esc inside it lands one level up here.
         while True:
-            signal = self._session_menu_once()
-            if signal != self._MENU_STAY:
-                return signal
-
-    def _session_menu_once(self) -> str:
-        """Show the sessions list once; return _MENU_UP/_MENU_DONE to close, or _MENU_STAY
-        to re-show it."""
-        options: list[str] = []
-        actions: list[tuple[str, object]] = []
-        if self.merge_ctx or (self.worktree is not None and self.repo.merge_in_progress()):
-            options.append("✓ Complete merge for this session")
-            actions.append(("complete-merge", None))
-        if not self.merge_ctx and self.worktree is not None and self._active_has_pending():
-            # The active session has committed work not yet in the base — offer an
-            # explicit, discoverable way to integrate it now (otherwise the only path
-            # is re-selecting the current session, which isn't obvious). Under
-            # --delay-merge this is the confirm point for reviewed changes; otherwise
-            # it surfaces leftover commits (e.g. from a session resumed at startup).
-            base = self._base_branch or "the base branch"
-            label = (
-                "✓ Merge reviewed changes into " if self._delay_merge else "✓ Integrate this session's commits into "
+            options: list[str] = []
+            actions: list[tuple[str, object]] = []
+            if self.merge_ctx or (self.worktree is not None and self.repo.merge_in_progress()):
+                options.append("✓ Complete merge for this session")
+                actions.append(("complete-merge", None))
+            if not self.merge_ctx and self.worktree is not None and self._active_has_pending():
+                # The active session has committed work not yet in the base — offer an
+                # explicit, discoverable way to integrate it now (otherwise the only path
+                # is re-selecting the current session, which isn't obvious). Under
+                # --delay-merge this is the confirm point for reviewed changes; otherwise
+                # it surfaces leftover commits (e.g. from a session resumed at startup).
+                base = self._base_branch or "the base branch"
+                label = (
+                    "✓ Merge reviewed changes into "
+                    if self._delay_merge
+                    else "✓ Integrate this session's commits into "
+                )
+                options.append(label + base)
+                actions.append(("integrate-active", None))
+            shared_ids = self._my_shared_session_ids()  # mark which sessions are shared (#55)
+            live_names = set()
+            for index, session in enumerate(self.sessions):
+                live_names.add(self._session_name(index))
+                marker = "* " if index == self.active_index else "  "
+                backend = getattr(getattr(session, "backend", None), "name", "?")
+                label = f"{marker}{self._session_name(index)} [{self._session_status(index)}] ({backend})"
+                merge_branch = getattr(session, "_base_branch", None)
+                if merge_branch:
+                    label += f" → {merge_branch}"  # the branch this session merges into
+                if index == self.active_index and not self.merge_ctx and self._active_has_pending():
+                    label += " — commits to integrate"
+                sid = getattr(getattr(session, "state", None), "backend_session_id", None)
+                # Recognise a shared session across resume id-drift (lineage-aware).
+                if sid and self._session_auto_shared(sid):
+                    label += " · ⇪ auto-share"
+                elif sid and self._session_is_shared(sid, shared_ids):
+                    label += " · ⇪ shared"
+                options.append(label)
+                actions.append(("switch", index))
+            for info in self._dormant_worktrees(live_names):
+                if self._dormant_has_pending(info):
+                    options.append(f"  {info.name} [unmerged changes — resolve]")
+                    actions.append(("resolve", info.name))
+                else:
+                    options.append(f"  {info.name} [idle — resume]")
+                    actions.append(("resume", info.name))
+            options.append(
+                "+ New session (own worktree)" if self._use_worktrees else "+ New session (shares this directory)"
             )
-            options.append(label + base)
-            actions.append(("integrate-active", None))
-        shared_ids = self._my_shared_session_ids()  # mark which sessions are shared (#55)
-        live_names = set()
-        for index, session in enumerate(self.sessions):
-            live_names.add(self._session_name(index))
-            marker = "* " if index == self.active_index else "  "
-            backend = getattr(getattr(session, "backend", None), "name", "?")
-            label = f"{marker}{self._session_name(index)} [{self._session_status(index)}] ({backend})"
-            merge_branch = getattr(session, "_base_branch", None)
-            if merge_branch:
-                label += f" → {merge_branch}"  # the branch this session merges into
-            if index == self.active_index and not self.merge_ctx and self._active_has_pending():
-                label += " — commits to integrate"
-            sid = getattr(getattr(session, "state", None), "backend_session_id", None)
-            # Recognise a shared session across resume id-drift (lineage-aware).
-            if sid and self._session_auto_shared(sid):
-                label += " · ⇪ auto-share"
-            elif sid and self._session_is_shared(sid, shared_ids):
-                label += " · ⇪ shared"
-            options.append(label)
-            actions.append(("switch", index))
-        for info in self._dormant_worktrees(live_names):
-            if self._dormant_has_pending(info):
-                options.append(f"  {info.name} [unmerged changes — resolve]")
-                actions.append(("resolve", info.name))
-            else:
-                options.append(f"  {info.name} [idle — resume]")
-                actions.append(("resume", info.name))
-        options.append(
-            "+ New session (own worktree)" if self._use_worktrees else "+ New session (shares this directory)"
-        )
-        actions.append(("new", None))
-        if self._use_worktrees and self.sessions:
-            options.append("")  # gap: separate session-creation from session-management
+            actions.append(("new", None))
+            if self._use_worktrees and self.sessions:
+                options.append("")  # gap: separate session-creation from session-management
+                actions.append(("separator", None))
+                options.append("✎ Rename a session")
+                actions.append(("rename", None))
+                options.append("⤳ Change a session's merge branch")
+                actions.append(("merge-branch", None))
+            if self._resumable_sessions():
+                options.append("↻ Resume a past conversation…")
+                actions.append(("resume-past", None))
+            # "Share" is offered for every backend so the user gets a clear answer;
+            # a backend without a portable transcript says so when chosen. "Resume a
+            # shared session" only appears where it can actually work.
+            options.append("")  # gap: set the sharing group apart
             actions.append(("separator", None))
-            options.append("✎ Rename a session")
-            actions.append(("rename", None))
-            options.append("⤳ Change a session's merge branch")
-            actions.append(("merge-branch", None))
-        if self._resumable_sessions():
-            options.append("↻ Resume a past conversation…")
-            actions.append(("resume-past", None))
-        # "Share" is offered for every backend so the user gets a clear answer;
-        # a backend without a portable transcript says so when chosen. "Resume a
-        # shared session" only appears where it can actually work.
-        options.append("")  # gap: set the sharing group apart
-        actions.append(("separator", None))
-        options.append("⇪ Share this session with collaborators…")
-        actions.append(("share", None))
-        if getattr(self.backend, "supports_session_sharing", False):
-            options.append("⇩ Resume a shared session…")
-            actions.append(("resume-shared", None))
-            options.append("⚙ Manage shared sessions…")
-            actions.append(("manage-shared", None))
-        if len(self.sessions) > 1:
-            options.append("- Stop a session")
-            actions.append(("stop", None))
-        choice = self._select_popup("Sessions", options)
-        if choice is None:  # Esc on the list → up one level (to the Ctrl-G palette)
-            self._set_message("Closed the sessions menu.")
-            self._render()
-            return self._MENU_UP
-        kind, value = actions[options.index(choice)]
-        if kind == "separator":
-            return self._MENU_STAY  # the blank spacer row isn't an action; re-show the list
-        # Context transitions — these move you into a different session, so unwind to the agent.
-        if kind == "switch":
-            assert isinstance(value, int)  # "switch" pairs with a session index
-            if value == self.active_index:
-                self._select_current_session()
+            options.append("⇪ Share this session with collaborators…")
+            actions.append(("share", None))
+            if getattr(self.backend, "supports_session_sharing", False):
+                options.append("⇩ Resume a shared session…")
+                actions.append(("resume-shared", None))
+                options.append("⚙ Manage shared sessions…")
+                actions.append(("manage-shared", None))
+            if len(self.sessions) > 1:
+                options.append("- Stop a session")
+                actions.append(("stop", None))
+            choice = self._select_popup("Sessions", options)
+            if choice is None:  # Esc → up one level (to the Ctrl-G palette), silently
+                return self._MENU_UP
+            kind, value = actions[options.index(choice)]
+            if kind == "separator":
+                continue  # the blank spacer row isn't an action; re-show the list
+            # Context transitions — these move you into a different session, so unwind to the agent.
+            if kind == "switch":
+                assert isinstance(value, int)  # "switch" pairs with a session index
+                if value == self.active_index:
+                    self._select_current_session()
+                else:
+                    self._switch_active(value)
+                return self._MENU_DONE
+            if kind == "integrate-active":
+                self._integrate_active_session()  # explicit "integrate now" for the active session
+                return self._MENU_DONE
+            if kind == "complete-merge":
+                self._finalize_agent_merge()
+                return self._MENU_DONE
+            if kind == "resolve":
+                assert isinstance(value, str)  # "resolve" pairs with a worktree name
+                self._resolve_dormant_worktree(value)
+                return self._MENU_DONE
+            if kind == "resume":
+                assert isinstance(value, str)  # "resume" pairs with a worktree name
+                self._new_session(value)
+                return self._MENU_DONE
+            if kind == "new":
+                if self._prompt_new_session() == self._MENU_DONE:
+                    return self._MENU_DONE
+                continue
+            # Sub-menus that may transition (resume) OR be backed out of: a transition
+            # unwinds to the agent; backing out re-shows this list (Esc lands here).
+            if kind == "resume-past":
+                if self._resume_session_menu() == self._MENU_DONE:
+                    return self._MENU_DONE
+                continue
+            if kind == "resume-shared":
+                if self._resume_shared_session_menu() == self._MENU_DONE:
+                    return self._MENU_DONE
+                continue
+            if kind == "manage-shared":
+                if self._manage_shared_sessions_menu() == self._MENU_DONE:
+                    return self._MENU_DONE
+                continue
+            # Configuration actions: run, then re-show this list (so their Esc lands here).
+            if kind == "rename":
+                self._rename_session_menu()
+            elif kind == "merge-branch":
+                self._change_session_merge_branch_menu()
+            elif kind == "share":
+                self._share_session()
             else:
-                self._switch_active(value)
-            return self._MENU_DONE
-        if kind == "integrate-active":
-            self._integrate_active_session()  # explicit "integrate now" for the active session
-            return self._MENU_DONE
-        if kind == "complete-merge":
-            self._finalize_agent_merge()
-            return self._MENU_DONE
-        if kind == "resolve":
-            assert isinstance(value, str)  # "resolve" pairs with a worktree name
-            self._resolve_dormant_worktree(value)
-            return self._MENU_DONE
-        if kind == "resume":
-            assert isinstance(value, str)  # "resume" pairs with a worktree name
-            self._new_session(value)
-            return self._MENU_DONE
-        if kind == "new":
-            self._prompt_new_session()
-            return self._MENU_DONE
-        # Sub-menus that may transition (resume) OR be backed out of: their Esc returns here.
-        if kind == "resume-past":
-            return self._descend(self._resume_session_menu())
-        if kind == "resume-shared":
-            return self._descend(self._resume_shared_session_menu())
-        # Configuration actions: run, then re-show this list (so their Esc lands here).
-        if kind == "rename":
-            self._rename_session_menu()
-        elif kind == "merge-branch":
-            self._change_session_merge_branch_menu()
-        elif kind == "share":
-            self._share_session()
-        elif kind == "manage-shared":
-            return self._descend(self._manage_shared_sessions_menu())
-        else:
-            self._stop_session_menu()
-        return self._MENU_STAY
+                self._stop_session_menu()
 
     def _active_has_pending(self) -> bool:
         # True if the active session has committed work not yet in the base.
@@ -3024,14 +3017,10 @@ class ProxyRunner:
         else:
             choice = self._select_popup("Merge which worktree's changes?", [label for label, _ in items])
             if choice is None:
-                self._set_message("Cancelled.")
-                self._render()
                 return
             name = next(n for label, n in items if label == choice)
         target = self._choose_merge_target(name)
         if target is None:
-            self._set_message("Cancelled.")
-            self._render()
             return
         if name == "":
             self._merge_active_into(target)
@@ -3098,8 +3087,6 @@ class ProxyRunner:
             ],
         )
         if choice is None:
-            self._set_message("Cancelled.")
-            self._render()
             return
         if choice.startswith("Discard"):
             confirm = self._select_popup(
@@ -3523,8 +3510,6 @@ class ProxyRunner:
         ]
         choice = self._select_popup(f"Manage {entry.display}", [label for _, label in actions])
         if choice is None:
-            self._set_message("Cancelled.")
-            self._render()
             return
         kind = actions[[label for _, label in actions].index(choice)][0]
         if kind == "update":
@@ -4513,32 +4498,29 @@ class ProxyRunner:
         except Exception:
             return True  # err toward offering the resolve flow
 
-    def _prompt_new_session(self) -> None:
+    def _prompt_new_session(self) -> str:
+        # Returns _MENU_DONE once a session is actually started (a transition → agent), or
+        # _MENU_UP if any prompt is backed out of (silently re-show the sessions menu).
         name = self._prompt_session_name("New Session", default=self._next_session_name())
         if name is None:
-            self._set_message("Cancelled.")
-            self._render()
-            return
+            return self._MENU_UP
         # Fork the current conversation, or start a blank one?
         fork = self._prompt_fork_or_blank()
         if fork is None:
-            self._set_message("Cancelled.")
-            self._render()
-            return
+            return self._MENU_UP
         # A fork continues the current session's work, so default its merge branch to
         # the current session's; a blank session defaults to the repo directory's.
         base = self._prompt_new_session_base(default=self._base_branch if fork else None)
         if base is None:
-            self._set_message("Cancelled.")
-            self._render()
-            return
+            return self._MENU_UP
         # The new session merges into its OWN branch — independent of the other
         # sessions and of the branch checked out in the repo directory.
         if fork and self._fork_current_session(name, base_branch=base):
-            return
+            return self._MENU_DONE
         if fork:
             self._set_message("Couldn't fork the current session; starting a blank one instead.", seconds=8.0)
         self._new_session(name, base_branch=base)
+        return self._MENU_DONE
 
     def _can_fork_active(self) -> bool:
         # A fork copies the active conversation, so it needs a portable transcript
@@ -4621,8 +4603,6 @@ class ProxyRunner:
         options = [self._session_name(index) for index in range(len(self.sessions))]
         choice = self._select_popup("Stop which session?", options)
         if choice is None:
-            self._set_message("Cancelled.")
-            self._render()
             return
         self._stop_session(options.index(choice))
 
@@ -4638,14 +4618,10 @@ class ProxyRunner:
         options = [self._session_name(index) for index in range(len(self.sessions))]
         choice = self._select_popup("Rename which session?", options)
         if choice is None:
-            self._set_message("Cancelled.")
-            self._render()
             return
         index = options.index(choice)
         new_name = self._prompt_popup("Rename session", "New name for this session:", default=self._session_name(index))
         if new_name is None or not new_name.strip():
-            self._set_message("Cancelled.")
-            self._render()
             return
         self._rename_session(index, new_name.strip())
 
@@ -5927,22 +5903,23 @@ class ProxyRunner:
 
     # --- menu navigation convention -----------------------------------------
     #
-    # Every Ctrl-G menu returns one of three signals so that **Esc always moves up exactly
-    # one level**, and the code's call hierarchy mirrors the on-screen hierarchy:
+    # Every Ctrl-G menu is one ``while True`` loop and returns just TWO signals, so **Esc
+    # always moves up exactly one level** and the code's call hierarchy mirrors the on-screen
+    # hierarchy. To author a menu: build options → ``_select_popup`` → dispatch, where
     #
-    #   _MENU_UP    the user backed out (Esc / "← Back"): the CALLER shows itself again, one
-    #               level up. The Ctrl-G command palette is the parent of every top-level
-    #               command menu, so UP from e.g. the sessions list re-opens the palette;
-    #               UP from the palette returns to the agent.
-    #   _MENU_DONE  a context transition happened (switch / new / resume a session): unwind
-    #               ALL the way back to the agent — there is no level to come back to.
-    #   _MENU_STAY  internal to one menu's own loop: re-show this same menu.
+    #   Esc (``_select_popup`` returns None)  → ``return self._MENU_UP``  (back out one level)
+    #   a context transition (switch/new/resume a session)
+    #                                         → ``return self._MENU_DONE`` (unwind to the agent)
+    #   any other action (config, or a child menu the user backed out of)
+    #                                         → ``continue``               (re-show this menu)
     #
-    # A menu is a ``while True`` loop: build options → ``_select_popup`` → dispatch. Esc
-    # (``None``) returns _MENU_UP. A child menu is entered by CALLING it and routing its
-    # result through ``_descend``: a child's UP becomes the parent's STAY (the child closed,
-    # so re-show the parent), while a child's DONE propagates as DONE (a transition unwinds
-    # past every level). ``_run_command`` turns a top menu's UP into "re-open the palette".
+    # A child menu is entered by CALLING it; the parent does
+    # ``if child() == self._MENU_DONE: return self._MENU_DONE`` else ``continue`` — so the
+    # child's Esc lands back on this parent, while a transition unwinds past every level.
+    # ``_after_menu_command`` turns a top-level menu's UP into "re-open the Ctrl-G palette",
+    # the parent of every command menu. Navigation is silent — no "closed"/"cancelled"
+    # message on the way up — and modal closes don't repaint the bare screen (see
+    # ``_run_modal``), so stepping between levels is instant and flicker-free.
     #
     # Parent → child today: _run_command → {_session_menu, _settings_menu, summarizer menu,
     # backend picker}; _session_menu → {_rename_session_menu, _change_session_merge_branch_menu,
@@ -5951,13 +5928,6 @@ class ProxyRunner:
     # _settings_menu → {_edit_one_setting, _settings_timings_menu → _edit_one_timing}.
     _MENU_UP = "up"
     _MENU_DONE = "done"
-    _MENU_STAY = "stay"
-
-    def _descend(self, child_signal: str) -> str:
-        """Route a child menu's result for a parent menu: the child's DONE (a transition)
-        propagates up as DONE; anything else (the child was Esc'd/closed) means "re-show me",
-        i.e. _MENU_STAY — so the child's Esc lands back on this parent, one level up."""
-        return self._MENU_DONE if child_signal == self._MENU_DONE else self._MENU_STAY
 
     def _after_menu_command(self, signal: str) -> None:
         """A top-level command menu closed. Esc/back (UP) goes up one level to the Ctrl-G
@@ -6432,11 +6402,19 @@ class ProxyRunner:
              session PTY so back-pressure never builds up while the popup is open.
           3. Passes the bytes to ``modal.feed()`` and acts on the returned action:
 
-             ``("done",   value)``  — clears the message, renders, and returns value.
-             ``("cancel", None)``   — clears the message, renders, and returns None.
+             ``("done",   value)``  — clears the message and returns value.
+             ``("cancel", None)``   — clears the message and returns None.
              ``("exit",   None)``   — calls ``_run_exit_flow()``; returns None on
                                       confirmed exit, otherwise redraws and continues.
              ``("redraw", None)``   — redraws and continues.
+
+        On ``done``/``cancel`` we deliberately do NOT repaint here: the modal's last
+        frame stays on screen and we only flag ``_render_pending``. When this modal was
+        opened from a parent menu, the parent's next ``_select_popup`` paints the next
+        menu straight over this one — so stepping between menu levels never flashes the
+        bare backend screen in between (smooth, instant navigation). When nothing follows
+        (the interaction returns to the agent), the reactor flushes that one pending frame
+        within a few ms, clearing the popup cleanly.
 
         The call-shape is synchronous, which preserves the ~25 existing call
         sites unmodified.  ``_prompt_popup`` and ``_select_popup`` are thin
@@ -6449,11 +6427,11 @@ class ProxyRunner:
             action, value = modal.feed(data)
             if action == "done":
                 self._clear_message()
-                self._render()
+                self._render_pending = True
                 return value
             if action == "cancel":
                 self._clear_message()
-                self._render()
+                self._render_pending = True
                 return None
             if action == "exit":
                 if self._run_exit_flow():
