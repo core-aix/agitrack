@@ -4021,6 +4021,88 @@ def test_timers_phase_stops_after_pending_update_teardown():
     assert synced == []  # the worktree-sync tail was skipped after teardown
 
 
+def test_ensure_worktree_alive_recreates_externally_deleted_worktree(tmp_path):
+    # If a live session's worktree directory disappears out from under it (an external
+    # delete — a backup/indexer/cloud-sync, or a stray `git worktree` elsewhere), the
+    # recovery must recreate it at the SAME path, keep it a worktree session (not the
+    # base-tree fallback), and respawn the backend there — never silently keep running
+    # git in a gone directory. (Pins the path the agent's "worktree re-synced (cwd
+    # reset)" narration came from.)
+    import shutil
+
+    from agitrack.git import GitRepo
+    from agitrack.git.worktree import WorktreeManager
+
+    base = GitRepo.init(tmp_path / "base")
+    (tmp_path / "base" / "seed.txt").write_text("seed\n", encoding="utf-8")
+    base.stage_paths(["seed.txt"])
+    base.commit("seed")
+    manager = WorktreeManager(base)
+    info = manager.create("session-1", base=base.current_branch())
+
+    runner = make_runner(
+        name="session-1",
+        base_repo=base,
+        repo=GitRepo(info.path),
+        worktree=info,
+        _base_branch=base.current_branch(),
+        state=AgitrackState(info.path, default_backend="claude"),
+    )
+    runner.global_config = type("GC", (), {"default_backend": "claude"})()
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda *a, **k: None
+    runner._debug = lambda *a, **k: None
+    # Stub the process/screen lifecycle so no real backend is spawned.
+    events: list = []
+    runner._teardown_child = lambda: events.append("teardown")
+    runner._stop_file_watcher = lambda: None
+    runner._reset_agent_tracking = lambda: None
+    runner._sanitize_state_trace = lambda: None
+    runner._initialize_session_baseline = lambda: None
+    runner._init_screen = lambda: None
+    runner._spawn = lambda: events.append("spawn")
+    runner._start_file_watcher = lambda: None
+    runner._resize_child = lambda: None
+    runner._enable_host_mouse = lambda: None
+
+    # The worktree directory vanishes externally.
+    shutil.rmtree(info.path)
+    assert not info.path.exists()
+
+    runner._ensure_worktree_alive()
+
+    # Recreated at the same path as a real linked worktree, still a worktree session,
+    # with the backend torn down and respawned (in that order).
+    assert runner.worktree is not None  # not the base-tree fallback
+    assert runner.worktree.path == info.path
+    assert info.path.exists()
+    assert (info.path / ".git").exists()  # a real linked worktree again
+    assert runner.repo.repo == info.path
+    assert events == ["teardown", "spawn"]
+
+
+def test_ensure_worktree_alive_noop_when_directory_present(tmp_path):
+    # The common case: the worktree is fine, so recovery must do nothing (no teardown,
+    # no respawn) — it only acts when the directory is genuinely gone.
+    from agitrack.git import GitRepo
+    from agitrack.git.worktree import WorktreeManager
+
+    base = GitRepo.init(tmp_path / "base")
+    (tmp_path / "base" / "seed.txt").write_text("seed\n", encoding="utf-8")
+    base.stage_paths(["seed.txt"])
+    base.commit("seed")
+    info = WorktreeManager(base).create("session-1", base=base.current_branch())
+
+    runner = make_runner(name="session-1", base_repo=base, repo=GitRepo(info.path), worktree=info)
+    touched: list = []
+    runner._teardown_child = lambda: touched.append("teardown")
+    runner._spawn = lambda: touched.append("spawn")
+
+    runner._ensure_worktree_alive()
+
+    assert touched == []  # directory present → recovery is a no-op
+
+
 def test_abort_shared_resume_clears_token_for_retry():
     import threading
 
