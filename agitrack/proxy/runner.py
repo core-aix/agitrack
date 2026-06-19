@@ -587,6 +587,10 @@ class ProxyRunner:
         # re-asked even as its contents change. A genuinely new path un-mutes the whole
         # set (ask about all again); cleared on session switch and aGiTrack restart.
         self._copy_declined: set[str] = set()
+        # Settings-menu scratch: edits collected as pending changes (each with its chosen
+        # scope) and written only when the user confirms "save" on the way out.
+        self._settings_pending: dict[str, tuple[object, str, bool]] = {}
+        self._settings_pending_timings: dict[str, tuple[float, str]] = {}
         # Lifecycle flags read before their first conditional assignment. These
         # MUST be initialized here: their getattr() guards were removed in P7,
         # and for_testing() seeding them alone would hide a missing init from
@@ -809,6 +813,8 @@ class ProxyRunner:
                 "_cancel_prompted": set(),
                 "_copy_prompted": {},
                 "_copy_declined": set(),
+                "_settings_pending": {},
+                "_settings_pending_timings": {},
                 "_full_agent_messages": False,
                 "_delay_merge": False,
                 "_user_declined": [],
@@ -2600,25 +2606,27 @@ class ProxyRunner:
         if sub == "model":
             self._select_summarizer_model_popup()
             return
-        enabled = self._summarization_enabled()
-        model = self.state.summarization_model or self.global_config.summarization_model or "(same as session)"
-        choice = self._select_popup(
-            "Summarizer",
-            [
-                f"Toggle ({'ON' if enabled else 'OFF'})",
-                f"Set model (current: {model})",
-            ],
-        )
-        if choice is None:
+        # Interactive menu: "Set model" opens the model picker, whose Esc returns here
+        # (one level up); Esc on this list closes the menu.
+        while True:
+            enabled = self._summarization_enabled()
+            model = self.state.summarization_model or self.global_config.summarization_model or "(same as session)"
+            choice = self._select_popup(
+                "Summarizer",
+                [
+                    f"Toggle ({'ON' if enabled else 'OFF'})",
+                    f"Set model (current: {model})",
+                ],
+            )
+            if choice is None:
+                self._render()
+                return
+            if choice.startswith("Toggle"):
+                self._persist_summarizer_enabled(not enabled)
+                self._set_message(f"Summarizer {'enabled' if not enabled else 'disabled'}.")
+            elif choice.startswith("Set model"):
+                self._select_summarizer_model_popup()
             self._render()
-            return
-        if choice.startswith("Toggle"):
-            self._persist_summarizer_enabled(not enabled)
-            self._set_message(f"Summarizer {'enabled' if not enabled else 'disabled'}.")
-        elif choice.startswith("Set model"):
-            self._handle_summarizer_command("model")
-            return
-        self._render()
 
     def _select_summarizer_model_popup(self) -> None:
         # List the current backend's models as a picker. For Claude the smallest
@@ -2764,6 +2772,16 @@ class ProxyRunner:
             self.turn = new_turn
 
     def _session_menu(self) -> None:
+        # A configuration sub-action (rename, change merge branch, share, manage shared,
+        # stop) returns to THIS menu so Esc inside it lands one level up here; an action
+        # that switches you into a different session context (switch/new/resume/integrate)
+        # closes the menu. Esc on this list closes the menu (one level up to the agent).
+        while True:
+            if self._session_menu_once():
+                return
+
+    def _session_menu_once(self) -> bool:
+        """Show the sessions list once; return True to close the menu, False to re-show it."""
         options: list[str] = []
         actions: list[tuple[str, object]] = []
         if self.merge_ctx or (self.worktree is not None and self.repo.merge_in_progress()):
@@ -2838,43 +2856,55 @@ class ProxyRunner:
             options.append("- Stop a session")
             actions.append(("stop", None))
         choice = self._select_popup("Sessions", options)
-        if choice is None:
-            self._set_message("Cancelled.")
+        if choice is None:  # Esc on the list → close the menu (one level up to the agent)
+            self._set_message("Closed the sessions menu.")
             self._render()
-            return
+            return True
         kind, value = actions[options.index(choice)]
+        if kind == "separator":
+            return False  # the blank spacer row isn't an action; re-show the list
         if kind == "switch":
             assert isinstance(value, int)  # "switch" pairs with a session index
             if value == self.active_index:
                 self._select_current_session()
             else:
                 self._switch_active(value)
-        elif kind == "resume-past":
+            return True
+        if kind == "resume-past":
             self._resume_session_menu()
-        elif kind == "integrate-active":
+            return True
+        if kind == "integrate-active":
             self._integrate_active_session()  # explicit "integrate now" for the active session
-        elif kind == "complete-merge":
+            return True
+        if kind == "complete-merge":
             self._finalize_agent_merge()
-        elif kind == "resolve":
+            return True
+        if kind == "resolve":
             assert isinstance(value, str)  # "resolve" pairs with a worktree name
             self._resolve_dormant_worktree(value)
-        elif kind == "resume":
+            return True
+        if kind == "resume":
             assert isinstance(value, str)  # "resume" pairs with a worktree name
             self._new_session(value)
-        elif kind == "new":
+            return True
+        if kind == "new":
             self._prompt_new_session()
-        elif kind == "rename":
+            return True
+        if kind == "resume-shared":
+            self._resume_shared_session_menu()
+            return True
+        # Configuration actions return here so Esc inside them lands back on this list.
+        if kind == "rename":
             self._rename_session_menu()
         elif kind == "merge-branch":
             self._change_session_merge_branch_menu()
         elif kind == "share":
             self._share_session()
-        elif kind == "resume-shared":
-            self._resume_shared_session_menu()
         elif kind == "manage-shared":
             self._manage_shared_sessions_menu()
         else:
             self._stop_session_menu()
+        return False
 
     def _active_has_pending(self) -> bool:
         # True if the active session has committed work not yet in the base.
@@ -3449,25 +3479,27 @@ class ProxyRunner:
         # (manifest + a stat-sized "newer?" check), never a transcript read/redact.
         store = self._shared_store()
         login = self.global_config.github_login or self._cached_or_resolve_login()
-        mine = [entry for entry in store.entries() if entry.github_id == login]
-        if not mine:
-            self._set_message("You haven't shared any sessions in this repo yet. Use session → Share this session.")
-            self._render()
-            return
-        auto_state = self._user_state()  # base-repo opt-in, read once for the whole list
-        options: list[str] = []
-        for entry in mine:
-            sid = entry.manifest.get("session_id", "")
-            status = self._shared_entry_status(entry, sid)
-            auto = " · auto-update on" if auto_state.auto_share_enabled(sid) else ""
-            age = self._format_age(entry.manifest["updated"]) if entry.manifest.get("updated") else ""
-            options.append(f"{entry.display}  ({age}{auto}) — {status}")
-        choice = self._select_popup("Your shared sessions — pick one to manage", options)
-        if choice is None:
-            self._set_message("Cancelled.")
-            self._render()
-            return
-        self._manage_one_shared_session(mine[options.index(choice)])
+        while True:
+            mine = [entry for entry in store.entries() if entry.github_id == login]
+            if not mine:
+                self._set_message("You haven't shared any sessions in this repo yet. Use session → Share this session.")
+                self._render()
+                return
+            auto_state = self._user_state()  # base-repo opt-in, read once for the whole list
+            options: list[str] = []
+            for entry in mine:
+                sid = entry.manifest.get("session_id", "")
+                status = self._shared_entry_status(entry, sid)
+                auto = " · auto-update on" if auto_state.auto_share_enabled(sid) else ""
+                age = self._format_age(entry.manifest["updated"]) if entry.manifest.get("updated") else ""
+                options.append(f"{entry.display}  ({age}{auto}) — {status}")
+            choice = self._select_popup("Your shared sessions — pick one to manage", options)
+            if choice is None:  # Esc → up one level (back to the sessions menu)
+                self._set_message("Closed the shared-sessions menu.")
+                self._render()
+                return
+            # The per-entry menu returns here, so its Esc re-shows this list (one level up).
+            self._manage_one_shared_session(mine[options.index(choice)])
 
     def _shared_entry_status(self, entry, session_id: str) -> str:
         # Cheap "is the shared copy current?" — compare the transcript's byte size
@@ -5905,6 +5937,25 @@ class ProxyRunner:
     def _enable_host_mouse(self) -> None:
         TerminalHost.enable_host_mouse(self)
 
+    # --- menu navigation convention -----------------------------------------
+    #
+    # All Ctrl-G menus follow one shape so the hierarchy is traceable from the code:
+    #   * A menu is a method that runs ``while True``: build options → ``_select_popup`` →
+    #     dispatch.
+    #   * Esc (``_select_popup`` returns ``None``) means "go up one level": the method
+    #     RETURNS, unwinding to whichever menu called it. So Esc steps the call stack up
+    #     one frame at a time, and the on-screen hierarchy mirrors the call hierarchy.
+    #   * A child menu is reached by simply CALLING its method; when that call returns
+    #     (the child was closed/Esc'd), the parent's loop re-shows itself — i.e. the child's
+    #     Esc lands back on the parent.
+    #   * A choice that moves to a different context (switch/new/resume a session) RETURNS
+    #     from the menu instead of looping, since there is nothing to come back to.
+    # Parent → child today: _run_command → {_session_menu, _settings_menu, summarizer menu,
+    # _handle_merge_command, _handle_dashboard_command}; _session_menu → {_rename_session_menu,
+    # _change_session_merge_branch_menu, _share_session, _manage_shared_sessions_menu, …};
+    # _manage_shared_sessions_menu → _manage_one_shared_session; _settings_menu →
+    # {_edit_one_setting, _settings_timings_menu → _edit_one_timing}.
+
     def _run_command(self, command: str) -> None:
         # aGiTrack commands in proxy mode are triggered via Ctrl-G and are plain
         # names; ":" is not a command trigger here (it is forwarded to the
@@ -5975,11 +6026,37 @@ class ProxyRunner:
         self._render()
 
     # --- settings menu ------------------------------------------------------
+    #
+    # The menu is a small form: edits accumulate as PENDING changes (each with the scope
+    # the user chose — repo-local or global) and are written only when the user confirms
+    # "save" on the way out. Esc always goes up ONE level (value editor → list, scope →
+    # value editor, sub-list → main list, main list → close), and closing with unsaved
+    # changes asks whether to save or discard them.
 
-    # Esc anywhere in the settings menu quits the whole menu (a sub-step returns this
-    # sentinel so the loop breaks and shows ONE unified close message). "← Back" returns
-    # None instead, navigating back a level so several settings can be edited in one visit.
-    _SETTINGS_QUIT = "quit"
+    @staticmethod
+    def _fmt_setting(value: object) -> str:
+        if isinstance(value, bool):
+            return "on" if value else "off"
+        if isinstance(value, list):
+            return ", ".join(str(p) for p in value) if value else "(none)"
+        return str(value) if value not in (None, "") else "(unset)"
+
+    def _pending_count(self) -> int:
+        return len(self._settings_pending) + len(self._settings_pending_timings)
+
+    def _choose_scope(self, label: str) -> str | None:
+        """Ask whether an edit applies repo-locally or globally. None = Esc/Back."""
+        pick = self._select_popup(
+            f"Apply '{label}' to:",
+            [
+                "This repository only (.agitrack/config.json)",
+                "Global — all repositories (~/.agitrack/config.json)",
+                "← Back",
+            ],
+        )
+        if pick is None or pick.startswith("←"):
+            return None
+        return "repo" if pick.startswith("This repository") else "global"
 
     def _settings_specs(self) -> list[dict]:
         """Declarative registry of the user-editable config options shown in the
@@ -6034,7 +6111,11 @@ class ProxyRunner:
     def _setting_value_display(self, spec: dict) -> str:
         key, kind = spec["key"], spec["kind"]
         if kind == "timings":
-            return ""
+            n = len(self._settings_pending_timings)
+            return f"{n} unsaved change(s)" if n else ""
+        if key in self._settings_pending:  # a pending (unsaved) edit shows its new value
+            value, scope, _ = self._settings_pending[key]
+            return f"{self._fmt_setting(value)}  · UNSAVED → {scope}"
         if kind == "bool":
             text = "on" if bool(getattr(self.global_config, key)) else "off"
         elif kind == "paths":
@@ -6047,100 +6128,115 @@ class ProxyRunner:
         return f"{text}{suffix}"
 
     def _settings_menu(self) -> None:
-        """Ctrl-G → "settings": browse and edit ALL config options. Editing returns to
-        this list (so several settings can be changed in one visit); each save asks whether
-        to write repo-local or global settings. "← Back" navigates back a level; Esc quits
-        the whole menu with one unified message."""
+        """Ctrl-G → "settings": browse and edit ALL config options. Changes are collected
+        as PENDING edits (each with its chosen scope) and written only when you confirm on
+        the way out. Esc goes up one level; closing with unsaved changes asks to save them."""
+        self._settings_pending = {}
+        self._settings_pending_timings = {}
         while True:
             specs = self._settings_specs()
             options = []
             for spec in specs:
                 disp = self._setting_value_display(spec)
                 options.append(f"{spec['label']}: {disp}" if disp else spec["label"])
-            options += ["", "← Done"]
-            choice = self._select_popup("Settings — pick one to change (Esc closes)", options)
-            if choice is None or choice == "← Done" or not choice.strip():
+            pending = self._pending_count()
+            close = f"← Close (save {pending} change(s))" if pending else "← Close"
+            options += ["", close]
+            title = "Settings — Esc = back; edits are saved only when you close"
+            choice = self._select_popup(title, options)
+            if choice is None or choice.startswith("← Close") or not choice.strip():
+                # Leaving the top level: offer to save/discard any unsaved edits.
+                if pending and self._confirm_save_pending() == "keep":
+                    continue  # "Keep editing" → stay in the menu
                 break
             spec = specs[options.index(choice)]
-            step = self._settings_timings_menu() if spec["kind"] == "timings" else self._edit_one_setting(spec)
-            if step == self._SETTINGS_QUIT:
-                break  # Esc inside a sub-step quits the whole menu
+            if spec["kind"] == "timings":
+                self._settings_timings_menu()
+            else:
+                self._edit_one_setting(spec)
         self._set_message("Settings closed.")
         self._render()
 
-    def _edit_one_setting(self, spec: dict) -> str | None:
+    def _edit_one_setting(self, spec: dict) -> None:
+        """Edit one setting into a PENDING change. Esc at the value prompt returns to the
+        list; Esc at the scope prompt returns to the value prompt (one level up each time)."""
         key, kind, label = spec["key"], spec["kind"], spec["label"]
-        if kind == "bool":
-            pick = self._select_popup(label, ["Turn ON", "Turn OFF", "← Back"])
-            if pick is None:
-                return self._SETTINGS_QUIT
-            if pick.startswith("←"):
-                return None
-            value: object = pick == "Turn ON"
-        elif kind == "choice":
-            pick = self._select_popup(label, [*spec["options"], "← Back"])
-            if pick is None:
-                return self._SETTINGS_QUIT
-            if pick.startswith("←"):
-                return None
-            value = pick
-        elif kind == "paths":
-            current = self.global_config.allowed_edit_paths
-            raw = self._prompt_popup(
-                label, f"Paths separated by '{os.pathsep}' (blank = none):", default=os.pathsep.join(current)
+        while True:
+            if kind == "bool":
+                pick = self._select_popup(label, ["Turn ON", "Turn OFF", "← Back"])
+                if pick is None or pick.startswith("←"):
+                    return
+                value: object = pick == "Turn ON"
+            elif kind == "choice":
+                pick = self._select_popup(label, [*spec["options"], "← Back"])
+                if pick is None or pick.startswith("←"):
+                    return
+                value = pick
+            elif kind == "paths":
+                current = self._pending_paths(key)
+                raw = self._prompt_popup(
+                    label, f"Paths separated by '{os.pathsep}' (blank = none):", default=os.pathsep.join(current)
+                )
+                if raw is None:
+                    return
+                value = [p.strip() for p in raw.split(os.pathsep) if p.strip()]
+            else:  # text
+                raw = self._prompt_popup(label, "New value (blank = unset):", default=self._pending_text(key))
+                if raw is None:
+                    return
+                value = raw.strip() or None
+            scope = self._choose_scope(label)
+            if scope is None:  # Esc at scope → one level up: re-edit the value
+                continue
+            self._settings_pending[key] = (value, scope, bool(spec.get("restart")))
+            self._set_message(
+                f"'{label}' → {self._fmt_setting(value)} ({scope}) — unsaved; choose Close to save.", seconds=7.0
             )
-            if raw is None:
-                return self._SETTINGS_QUIT
-            value = [p.strip() for p in raw.split(os.pathsep) if p.strip()]
-        else:  # text
-            current_text = getattr(self.global_config, key, None) or ""
-            raw = self._prompt_popup(label, "New value (blank = unset):", default=str(current_text))
-            if raw is None:
-                return self._SETTINGS_QUIT
-            value = raw.strip() or None
-        return self._save_setting_scoped(key, value, label, restart=bool(spec.get("restart")))
+            self._render()
+            return
 
-    def _save_setting_scoped(self, key: str, value: object, label: str, *, restart: bool) -> str | None:
-        pick = self._select_popup(
-            f"Save '{label}' where?",
-            ["This repository (.agitrack/config.json)", "Global (all repositories)", "← Back (don't save)"],
-        )
-        if pick is None:
-            return self._SETTINGS_QUIT
-        if pick.startswith("←"):
-            return None
-        scope = "repo" if pick.startswith("This repository") else "global"
-        self.global_config.set(key, value, scope=scope)
-        # Some settings are resolved at launch and aren't re-read by the running process,
-        # so they only take effect after a restart — which aGiTrack never does on its own.
-        note = (
-            " It won't take effect until you restart aGiTrack yourself (aGiTrack won't restart automatically)."
-            if restart
-            else ""
-        )
-        self._set_message(f"Saved '{label}' to {scope} settings.{note}", seconds=10.0)
-        self._render()
-        return None
+    def _pending_paths(self, key: str) -> list[str]:
+        if key in self._settings_pending:
+            pending = self._settings_pending[key][0]
+            if isinstance(pending, list):
+                return [str(p) for p in pending]
+        return self.global_config.allowed_edit_paths
 
-    def _settings_timings_menu(self) -> str | None:
+    def _pending_text(self, key: str) -> str:
+        if key in self._settings_pending:
+            return self._fmt_setting(self._settings_pending[key][0]).replace("(unset)", "")
+        return str(getattr(self.global_config, key, None) or "")
+
+    def _settings_timings_menu(self) -> None:
         from agitrack.config.settings import DEFAULT_TIMINGS
 
+        keys = list(DEFAULT_TIMINGS)
         while True:
             timings = self.global_config.timings
-            keys = list(DEFAULT_TIMINGS)
-            options = [f"{k}: {timings[k]:g}s" for k in keys]
+            options = []
+            for k in keys:
+                if k in self._settings_pending_timings:
+                    v, scope = self._settings_pending_timings[k]
+                    options.append(f"{k}: {v:g}s  · UNSAVED → {scope}")
+                else:
+                    options.append(f"{k}: {timings[k]:g}s")
             options += ["", "← Back"]
-            choice = self._select_popup("Timings (seconds) — pick one to change", options)
-            if choice is None:
-                return self._SETTINGS_QUIT
-            if choice == "← Back" or not choice.strip():
-                return None
+            choice = self._select_popup("Timings (seconds) — Esc/← Back returns to settings", options)
+            if choice is None or choice == "← Back" or not choice.strip():
+                return  # one level up: back to the settings list
             tkey = keys[options.index(choice)]
-            raw = self._prompt_popup(
-                tkey, f"New value in seconds (current {timings[tkey]:g}):", default=str(timings[tkey])
+            self._edit_one_timing(tkey, timings[tkey])
+
+    def _edit_one_timing(self, tkey: str, current: float) -> None:
+        while True:
+            default = (
+                f"{self._settings_pending_timings[tkey][0]:g}"
+                if tkey in self._settings_pending_timings
+                else str(current)
             )
+            raw = self._prompt_popup(tkey, f"New value in seconds (current {current:g}):", default=default)
             if raw is None:
-                return self._SETTINGS_QUIT
+                return  # back to the timings list
             try:
                 seconds = float(raw)
                 if seconds <= 0:
@@ -6149,29 +6245,54 @@ class ProxyRunner:
                 self._set_message("Enter a positive number of seconds.")
                 self._render()
                 continue
-            if self._save_timing_scoped(tkey, seconds) == self._SETTINGS_QUIT:
-                return self._SETTINGS_QUIT
+            scope = self._choose_scope(tkey)
+            if scope is None:  # Esc at scope → re-edit the value
+                continue
+            self._settings_pending_timings[tkey] = (seconds, scope)
+            self._set_message(f"'{tkey}' → {seconds:g}s ({scope}) — unsaved; choose Close to save.", seconds=7.0)
+            self._render()
+            return
 
-    def _save_timing_scoped(self, tkey: str, seconds: float) -> str | None:
+    def _confirm_save_pending(self) -> str:
+        """Prompt to save/discard pending settings edits when closing. Returns 'keep' if the
+        user chose to keep editing (the menu should stay open), else 'saved'/'discarded'."""
+        n = self._pending_count()
         pick = self._select_popup(
-            f"Save timing '{tkey}' = {seconds:g}s where?",
-            ["This repository (.agitrack/config.json)", "Global (all repositories)", "← Back (don't save)"],
+            f"You have {n} unsaved settings change(s). Save them?",
+            ["Yes, save them", "No, discard them", "← Keep editing"],
         )
-        if pick is None:
-            return self._SETTINGS_QUIT
-        if pick.startswith("←"):
-            return None
-        scope = "repo" if pick.startswith("This repository") else "global"
-        store = self.global_config.repo_data if scope == "repo" else self.global_config.data
-        merged = dict(store.get("timings") or {})
-        merged[tkey] = seconds
-        self.global_config.set("timings", merged, scope=scope)
-        self._set_message(
-            f"Saved timing '{tkey}' to {scope} settings. It won't take effect until you restart aGiTrack yourself.",
-            seconds=10.0,
+        if pick is None or pick.startswith("←"):
+            return "keep"
+        if pick.startswith("No"):
+            self._settings_pending = {}
+            self._settings_pending_timings = {}
+            self._set_message(f"Discarded {n} unsaved settings change(s).", seconds=6.0)
+            self._render()
+            return "discarded"
+        # Write every pending edit to its chosen scope.
+        needs_restart = False
+        for key, (value, scope, restart) in self._settings_pending.items():
+            self.global_config.set(key, value, scope=scope)
+            needs_restart = needs_restart or restart
+        by_scope: dict[str, dict[str, float]] = {}
+        for tkey, (value, scope) in self._settings_pending_timings.items():
+            by_scope.setdefault(scope, {})[tkey] = value
+        for scope, changes in by_scope.items():
+            store = self.global_config.repo_data if scope == "repo" else self.global_config.data
+            merged = dict(store.get("timings") or {})
+            merged.update(changes)
+            self.global_config.set("timings", merged, scope=scope)
+            needs_restart = True  # timings are read at launch
+        self._settings_pending = {}
+        self._settings_pending_timings = {}
+        note = (
+            " Some changes won't take effect until you restart aGiTrack yourself (it won't restart on its own)."
+            if needs_restart
+            else ""
         )
+        self._set_message(f"Saved {n} settings change(s).{note}", seconds=10.0)
         self._render()
-        return None
+        return "saved"
 
     def _handle_dashboard_command(self) -> None:
         """Ctrl-G → "dashboard": serve aGiTrack's metrics dashboard for this repo and
