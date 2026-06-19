@@ -42,6 +42,7 @@ def _session_with_worktree(tmp_path):
     runner.base_repo = types.SimpleNamespace(repo=base.repo)
     runner.repo = wt
     runner.worktree = types.SimpleNamespace(name="sess", path=info.path)
+    runner._offer_user_commit_for_worktree_edits = lambda: None  # tested separately
     messages: list[str] = []
     runner._set_message = lambda m, **k: messages.append(m)
     runner._render = lambda *a, **k: None

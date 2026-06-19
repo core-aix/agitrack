@@ -7700,13 +7700,35 @@ class ProxyRunner:
             return
         self._offer_copy_unstaged_to_base()
 
+    def _offer_user_commit_for_worktree_edits(self) -> None:
+        """Offer to COMMIT the user's own uncommitted edits in this worktree (tracked
+        changes, or new files they haven't declined) — those belong in git, not just
+        copied to the base directory. Run right before the copy offer so that when a user
+        edit AND copy-able leftovers both exist, BOTH prompts appear: a commit prompt for
+        the edits here, and the copy prompt (for declined/ignored files) afterwards.
+        A no-op in the normal case, where the turn's auto-commit already committed the
+        user's tracked edits and only declined/ignored files remain."""
+        actions = getattr(self, "actions", None)
+        check = getattr(actions, "has_pre_agent_user_changes", None)
+        if check is None:
+            return
+        try:
+            if check():
+                self._set_message("Uncommitted changes in this session's worktree — commit them?")
+                self._render()
+                self._create_user_commit_popup()
+        except Exception as error:
+            self._debug(f"pre-copy user-commit offer failed: {error!r}")
+
     def _offer_copy_unstaged_to_base(self, *, context: str = "turn") -> None:
         """Offer to copy the worktree's would-be-stranded files into the base repo dir.
 
         Only relevant for an isolated worktree session: changes committed this turn
         integrate into the base branch, but files the agent left uncommitted (declined
-        untracked files, unstaged edits) or that are git-ignored live only in the worktree
-        and the user — working in the base directory — never sees them.
+        untracked files) or that are git-ignored live only in the worktree and the user —
+        working in the base directory — never sees them. The user's OWN uncommitted edits
+        are offered for a git commit first (`_offer_user_commit_for_worktree_edits`), so a
+        commit prompt and the copy prompt can both appear when both apply.
 
         ``context``:
           - ``"turn"``   — after an idle turn in the ACTIVE session (default). Background
@@ -7727,6 +7749,8 @@ class ProxyRunner:
         wt_dir = self.repo.repo
         if base_dir == wt_dir:
             return
+        # First commit the user's own edits (if any), then offer to copy the leftovers.
+        self._offer_user_commit_for_worktree_edits()
         candidates = self._uncommitted_worktree_files()
         if not candidates:
             return

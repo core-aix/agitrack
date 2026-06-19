@@ -823,6 +823,7 @@ def _copy_runner(tmp_path, status):
     # The copy offer reads ignored entries too (git status --short --ignored).
     runner.repo = types.SimpleNamespace(repo=wt, status_short=lambda: status, status_short_ignored=lambda: status)
     runner.worktree = types.SimpleNamespace(name="s", path=wt)
+    runner._offer_user_commit_for_worktree_edits = lambda: None  # tested separately
     msgs: list[str] = []
     runner._set_message = lambda m, **k: msgs.append(m)
     runner._render = lambda *a, **k: None
@@ -837,6 +838,41 @@ def test_offer_copy_unstaged_copies_on_consent(tmp_path):
     runner._offer_copy_unstaged_to_base()
 
     assert (base / "new.txt").read_text() == "hello\n"
+
+
+def test_copy_offer_also_offers_user_commit_for_edits(tmp_path):
+    # When the worktree has the user's own uncommitted edits AND copy-able leftovers, BOTH
+    # prompts show: a commit prompt for the edits, then the copy prompt for the leftovers.
+    import types
+
+    runner, base, wt, _ = _copy_runner(tmp_path, "?? leftover.txt\n")
+    (wt / "leftover.txt").write_text("x\n")
+    runner.actions = types.SimpleNamespace(has_pre_agent_user_changes=lambda: True)
+    events: list[str] = []
+    runner._create_user_commit_popup = lambda *a, **k: events.append("user-commit")
+    runner._select_popup = lambda *a, **k: events.append("copy") or "No, leave them in the worktree"
+    del runner._offer_user_commit_for_worktree_edits  # use the real method
+
+    runner._offer_copy_unstaged_to_base()
+
+    assert events == ["user-commit", "copy"]  # both shown, commit prompt first
+
+
+def test_copy_offer_skips_user_commit_when_no_edits(tmp_path):
+    # No committable user edits → no commit prompt, just the copy offer.
+    import types
+
+    runner, base, wt, _ = _copy_runner(tmp_path, "?? leftover.txt\n")
+    (wt / "leftover.txt").write_text("x\n")
+    runner.actions = types.SimpleNamespace(has_pre_agent_user_changes=lambda: False)
+    events: list[str] = []
+    runner._create_user_commit_popup = lambda *a, **k: events.append("user-commit")
+    runner._select_popup = lambda *a, **k: events.append("copy") or "No, leave them in the worktree"
+    del runner._offer_user_commit_for_worktree_edits
+
+    runner._offer_copy_unstaged_to_base()
+
+    assert events == ["copy"]  # only the copy offer
 
 
 def test_offer_copy_decline_mutes_same_set_reasks_on_new_file(tmp_path):
