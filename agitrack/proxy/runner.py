@@ -2585,29 +2585,30 @@ class ProxyRunner:
         working = in_flight or (last and time.monotonic() - last < self.CHILD_IDLE_SECONDS)
         return "running" if working else "idle"
 
-    def _handle_session_command(self, arg: str) -> None:
+    def _handle_session_command(self, arg: str) -> str:
         # Ctrl-G then "sessions": manage the live concurrent sessions.
         arg = arg.strip()
         if arg in {"new", "fresh"}:
             self._prompt_new_session()
-        elif arg.isdigit():
+            return self._MENU_DONE
+        if arg.isdigit():
             self._switch_active(int(arg) - 1)
-        else:
-            self._session_menu()
+            return self._MENU_DONE
+        return self._session_menu()
 
-    def _handle_summarizer_command(self, arg: str) -> None:
+    def _handle_summarizer_command(self, arg: str) -> str:
         sub = arg.strip().lower()
         if sub in ("on", "off"):
             enabled = sub == "on"
             self._persist_summarizer_enabled(enabled)
             self._set_message(f"Summarizer {'enabled' if enabled else 'disabled'}.")
             self._render()
-            return
+            return self._MENU_DONE
         if sub == "model":
             self._select_summarizer_model_popup()
-            return
+            return self._MENU_DONE
         # Interactive menu: "Set model" opens the model picker, whose Esc returns here
-        # (one level up); Esc on this list closes the menu.
+        # (one level up); Esc on this list goes up one level to the Ctrl-G palette.
         while True:
             enabled = self._summarization_enabled()
             model = self.state.summarization_model or self.global_config.summarization_model or "(same as session)"
@@ -2618,9 +2619,9 @@ class ProxyRunner:
                     f"Set model (current: {model})",
                 ],
             )
-            if choice is None:
+            if choice is None:  # Esc → up one level to the palette
                 self._render()
-                return
+                return self._MENU_UP
             if choice.startswith("Toggle"):
                 self._persist_summarizer_enabled(not enabled)
                 self._set_message(f"Summarizer {'enabled' if not enabled else 'disabled'}.")
@@ -2771,17 +2772,20 @@ class ProxyRunner:
         if new_turn is not None:
             self.turn = new_turn
 
-    def _session_menu(self) -> None:
+    def _session_menu(self) -> str:
         # A configuration sub-action (rename, change merge branch, share, manage shared,
         # stop) returns to THIS menu so Esc inside it lands one level up here; an action
         # that switches you into a different session context (switch/new/resume/integrate)
-        # closes the menu. Esc on this list closes the menu (one level up to the agent).
+        # ends with _MENU_DONE. Esc on this list returns _MENU_UP (one level up to the
+        # Ctrl-G palette).
         while True:
-            if self._session_menu_once():
-                return
+            signal = self._session_menu_once()
+            if signal != self._MENU_STAY:
+                return signal
 
-    def _session_menu_once(self) -> bool:
-        """Show the sessions list once; return True to close the menu, False to re-show it."""
+    def _session_menu_once(self) -> str:
+        """Show the sessions list once; return _MENU_UP/_MENU_DONE to close, or _MENU_STAY
+        to re-show it."""
         options: list[str] = []
         actions: list[tuple[str, object]] = []
         if self.merge_ctx or (self.worktree is not None and self.repo.merge_in_progress()):
@@ -2856,44 +2860,44 @@ class ProxyRunner:
             options.append("- Stop a session")
             actions.append(("stop", None))
         choice = self._select_popup("Sessions", options)
-        if choice is None:  # Esc on the list → close the menu (one level up to the agent)
+        if choice is None:  # Esc on the list → up one level (to the Ctrl-G palette)
             self._set_message("Closed the sessions menu.")
             self._render()
-            return True
+            return self._MENU_UP
         kind, value = actions[options.index(choice)]
         if kind == "separator":
-            return False  # the blank spacer row isn't an action; re-show the list
+            return self._MENU_STAY  # the blank spacer row isn't an action; re-show the list
+        # Context transitions — these move you into a different session, so unwind to the agent.
         if kind == "switch":
             assert isinstance(value, int)  # "switch" pairs with a session index
             if value == self.active_index:
                 self._select_current_session()
             else:
                 self._switch_active(value)
-            return True
-        if kind == "resume-past":
-            self._resume_session_menu()
-            return True
+            return self._MENU_DONE
         if kind == "integrate-active":
             self._integrate_active_session()  # explicit "integrate now" for the active session
-            return True
+            return self._MENU_DONE
         if kind == "complete-merge":
             self._finalize_agent_merge()
-            return True
+            return self._MENU_DONE
         if kind == "resolve":
             assert isinstance(value, str)  # "resolve" pairs with a worktree name
             self._resolve_dormant_worktree(value)
-            return True
+            return self._MENU_DONE
         if kind == "resume":
             assert isinstance(value, str)  # "resume" pairs with a worktree name
             self._new_session(value)
-            return True
+            return self._MENU_DONE
         if kind == "new":
             self._prompt_new_session()
-            return True
+            return self._MENU_DONE
+        # Sub-menus that may transition (resume) OR be backed out of: their Esc returns here.
+        if kind == "resume-past":
+            return self._descend(self._resume_session_menu())
         if kind == "resume-shared":
-            self._resume_shared_session_menu()
-            return True
-        # Configuration actions return here so Esc inside them lands back on this list.
+            return self._descend(self._resume_shared_session_menu())
+        # Configuration actions: run, then re-show this list (so their Esc lands here).
         if kind == "rename":
             self._rename_session_menu()
         elif kind == "merge-branch":
@@ -2901,10 +2905,10 @@ class ProxyRunner:
         elif kind == "share":
             self._share_session()
         elif kind == "manage-shared":
-            self._manage_shared_sessions_menu()
+            return self._descend(self._manage_shared_sessions_menu())
         else:
             self._stop_session_menu()
-        return False
+        return self._MENU_STAY
 
     def _active_has_pending(self) -> bool:
         # True if the active session has committed work not yet in the base.
@@ -3221,12 +3225,12 @@ class ProxyRunner:
                 names.setdefault(str(ref.id), name)
         return names
 
-    def _resume_session_menu(self) -> None:
+    def _resume_session_menu(self) -> str:
         sessions = self._resumable_sessions()
         if not sessions:
             self._set_message("No past conversations found to resume.")
             self._render()
-            return
+            return self._MENU_UP
         live_ids = {getattr(getattr(s, "state", None), "backend_session_id", None) for s in self.sessions}
         names = self._agitrack_named_sessions()
         options: list[str] = []
@@ -3235,12 +3239,11 @@ class ProxyRunner:
             label = (names.get(ref.id) or ref.label or "(no prompt recorded)").strip()[:48]
             options.append(f"{mark}{_short_session(ref.id)}  {self._format_age(ref.updated)}  {label}")
         choice = self._select_popup("Resume a conversation (newest first)", options)
-        if choice is None:
-            self._set_message("Cancelled.")
-            self._render()
-            return
+        if choice is None:  # Esc → back up one level to the sessions menu
+            return self._MENU_UP
         ref = sessions[options.index(choice)]
         self._resume_conversation(names.get(ref.id) or self._next_session_name(), ref.id)
+        return self._MENU_DONE
 
     def _resume_conversation(self, name: str, session_id: str, *, backend: str | None = None) -> None:
         # If this conversation is already live, just switch to it; otherwise
@@ -3484,7 +3487,7 @@ class ProxyRunner:
             if not mine:
                 self._set_message("You haven't shared any sessions in this repo yet. Use session → Share this session.")
                 self._render()
-                return
+                return self._MENU_UP
             auto_state = self._user_state()  # base-repo opt-in, read once for the whole list
             options: list[str] = []
             for entry in mine:
@@ -3495,9 +3498,7 @@ class ProxyRunner:
                 options.append(f"{entry.display}  ({age}{auto}) — {status}")
             choice = self._select_popup("Your shared sessions — pick one to manage", options)
             if choice is None:  # Esc → up one level (back to the sessions menu)
-                self._set_message("Closed the shared-sessions menu.")
-                self._render()
-                return
+                return self._MENU_UP
             # The per-entry menu returns here, so its Esc re-shows this list (one level up).
             self._manage_one_shared_session(mine[options.index(choice)])
 
@@ -4054,7 +4055,7 @@ class ProxyRunner:
             return False
         return shared_rows < count_transcript_rows(raw)
 
-    def _resume_shared_session_menu(self) -> None:
+    def _resume_shared_session_menu(self) -> str:
         store = self._shared_store()
         completed = self._fetch_shared_with_cancel(store, "Fetching shared sessions…")
         if not completed:
@@ -4062,12 +4063,12 @@ class ProxyRunner:
             # dropping them into a possibly-stale, previously-fetched list (which
             # would read as if the stop did nothing). _fetch_shared_with_cancel has
             # already shown the "Stopped fetching…" notice; let it linger.
-            return
+            return self._MENU_UP
         entries = store.entries()
         if not entries:
             self._set_message("No shared sessions found for this repo.")
             self._render()
-            return
+            return self._MENU_UP
         options: list[str] = []
         for entry in entries:
             extra = [str(entry.manifest[k]) for k in ("model",) if entry.manifest.get(k)]
@@ -4075,16 +4076,14 @@ class ProxyRunner:
                 extra.append(self._format_age(entry.manifest["updated"]))
             options.append(entry.display + (f"  ({' · '.join(extra)})" if extra else ""))
         choice = self._select_popup("Resume a shared session (newest first)", options)
-        if choice is None:
-            self._set_message("Cancelled.")
-            self._render()
-            return
+        if choice is None:  # Esc → up one level to the sessions menu
+            return self._MENU_UP
         entry = entries[options.index(choice)]
         session_id = entry.manifest.get("session_id")
         if not session_id:
             self._set_message("That shared session is incomplete; cannot resume it.")
             self._render()
-            return
+            return self._MENU_UP
         # Resume with the backend the session was recorded by, not necessarily the
         # active one — a shared OpenCode session must be imported/resumed by the
         # OpenCode agent even while Claude is active (and vice versa). Reuse the
@@ -4099,7 +4098,7 @@ class ProxyRunner:
             except ValueError:
                 self._set_message(f"Can't resume '{entry.display}': unknown backend '{entry_backend}'.", seconds=8.0)
                 self._render()
-                return
+                return self._MENU_UP
         # Remember the lineage origin this session was shared under (owner + name +
         # contributors), so a later re-share (on this or any machine) updates the SAME
         # shared entry and adds us to the contributor set, instead of spawning a new
@@ -4142,13 +4141,11 @@ class ProxyRunner:
                     opts.append("Keep both — copy the shared version to a new session")
                 opts.append("Stay as it is (no change)")
             pick = self._select_popup(header, opts)
-            if pick is None:
-                self._set_message("Cancelled.")
-                self._render()
-                return
+            if pick is None:  # Esc → up one level to the sessions menu
+                return self._MENU_UP
             if pick.startswith("Stay"):
                 self._switch_active(live_index)
-                return
+                return self._MENU_DONE
             if pick.startswith("Update"):
                 # Pull the shared version into the running session: fetch it, then
                 # (on the main loop) restart the backend so it loads the new
@@ -4164,15 +4161,13 @@ class ProxyRunner:
                     as_id=None,
                     backend=entry_backend,
                 )
-                return
+                return self._MENU_DONE
             assert keep_both_id is not None
             copy_name = self._prompt_session_name(
                 "Name the copied session", default=self._dedupe_session_name(entry.name)
             )
-            if copy_name is None:
-                self._set_message("Cancelled.")
-                self._render()
-                return
+            if copy_name is None:  # Esc → up one level
+                return self._MENU_UP
             self._begin_shared_resume(
                 store,
                 entry,
@@ -4184,7 +4179,7 @@ class ProxyRunner:
                 as_id=keep_both_id,
                 backend=entry_backend,
             )
-            return
+            return self._MENU_DONE
         # You may already have this exact shared session open under a DIFFERENT backend
         # id: a multi-collaborator entry carries the *last sharer's* session_id, not
         # yours, so the id check above misses your own copy and the resume would mint a
@@ -4202,21 +4197,17 @@ class ProxyRunner:
                 f"You already have this shared session open locally as '{local_name}'.\nWhat would you like to do?",
                 opts,
             )
-            if pick is None:
-                self._set_message("Cancelled.")
-                self._render()
-                return
+            if pick is None:  # Esc → up one level to the sessions menu
+                return self._MENU_UP
             if pick.startswith("Continue"):
                 self._switch_active(lineage_index)
-                return
+                return self._MENU_DONE
             assert keep_both_id is not None
             copy_name = self._prompt_session_name(
                 "Name the copied session", default=self._dedupe_session_name(entry.name)
             )
-            if copy_name is None:
-                self._set_message("Cancelled.")
-                self._render()
-                return
+            if copy_name is None:  # Esc → up one level
+                return self._MENU_UP
             self._begin_shared_resume(
                 store,
                 entry,
@@ -4228,15 +4219,13 @@ class ProxyRunner:
                 as_id=keep_both_id,
                 backend=entry_backend,
             )
-            return
+            return self._MENU_DONE
         # Not running locally: pick a clear local name (#71), default to the original
         # share name (deduped) — NOT a "<sharer>-<name>" slug, which grew without
         # bound when sharing back and forth (#55).
         name = self._prompt_session_name("Resume shared session", default=self._dedupe_session_name(entry.name))
-        if name is None:
-            self._set_message("Cancelled.")
-            self._render()
-            return
+        if name is None:  # Esc → up one level to the sessions menu
+            return self._MENU_UP
         overwrite, as_id, resume_id = False, None, session_id
         if agent.has_local_session(self.base_repo.repo, session_id):
             age = self._format_age(entry.manifest["updated"]) if entry.manifest.get("updated") else "earlier"
@@ -4261,10 +4250,8 @@ class ProxyRunner:
                     opts.append("Keep both (fetch the shared copy as a separate session)")
                 opts.append("Keep my local copy")
             pick = self._select_popup(header, opts)
-            if pick is None:
-                self._set_message("Cancelled.")
-                self._render()
-                return
+            if pick is None:  # Esc → up one level to the sessions menu
+                return self._MENU_UP
             if pick.startswith("Keep both"):
                 assert keep_both_id is not None
                 as_id = resume_id = keep_both_id
@@ -4272,7 +4259,7 @@ class ProxyRunner:
                 overwrite = True
             else:  # keep the local copy: resume it directly, no fetch/import needed
                 self._resume_conversation(name, session_id, backend=entry_backend)
-                return
+                return self._MENU_DONE
         self._begin_shared_resume(
             store,
             entry,
@@ -4284,6 +4271,7 @@ class ProxyRunner:
             as_id=as_id,
             backend=entry_backend,
         )
+        return self._MENU_DONE
 
     def _begin_shared_resume(self, store, entry, agent, *, action, name, resume_id, overwrite, as_id, backend) -> None:
         # Fetch the (possibly large) transcript on a worker thread, then WAIT for it
@@ -5939,22 +5927,54 @@ class ProxyRunner:
 
     # --- menu navigation convention -----------------------------------------
     #
-    # All Ctrl-G menus follow one shape so the hierarchy is traceable from the code:
-    #   * A menu is a method that runs ``while True``: build options → ``_select_popup`` →
-    #     dispatch.
-    #   * Esc (``_select_popup`` returns ``None``) means "go up one level": the method
-    #     RETURNS, unwinding to whichever menu called it. So Esc steps the call stack up
-    #     one frame at a time, and the on-screen hierarchy mirrors the call hierarchy.
-    #   * A child menu is reached by simply CALLING its method; when that call returns
-    #     (the child was closed/Esc'd), the parent's loop re-shows itself — i.e. the child's
-    #     Esc lands back on the parent.
-    #   * A choice that moves to a different context (switch/new/resume a session) RETURNS
-    #     from the menu instead of looping, since there is nothing to come back to.
+    # Every Ctrl-G menu returns one of three signals so that **Esc always moves up exactly
+    # one level**, and the code's call hierarchy mirrors the on-screen hierarchy:
+    #
+    #   _MENU_UP    the user backed out (Esc / "← Back"): the CALLER shows itself again, one
+    #               level up. The Ctrl-G command palette is the parent of every top-level
+    #               command menu, so UP from e.g. the sessions list re-opens the palette;
+    #               UP from the palette returns to the agent.
+    #   _MENU_DONE  a context transition happened (switch / new / resume a session): unwind
+    #               ALL the way back to the agent — there is no level to come back to.
+    #   _MENU_STAY  internal to one menu's own loop: re-show this same menu.
+    #
+    # A menu is a ``while True`` loop: build options → ``_select_popup`` → dispatch. Esc
+    # (``None``) returns _MENU_UP. A child menu is entered by CALLING it and routing its
+    # result through ``_descend``: a child's UP becomes the parent's STAY (the child closed,
+    # so re-show the parent), while a child's DONE propagates as DONE (a transition unwinds
+    # past every level). ``_run_command`` turns a top menu's UP into "re-open the palette".
+    #
     # Parent → child today: _run_command → {_session_menu, _settings_menu, summarizer menu,
-    # _handle_merge_command, _handle_dashboard_command}; _session_menu → {_rename_session_menu,
-    # _change_session_merge_branch_menu, _share_session, _manage_shared_sessions_menu, …};
-    # _manage_shared_sessions_menu → _manage_one_shared_session; _settings_menu →
-    # {_edit_one_setting, _settings_timings_menu → _edit_one_timing}.
+    # backend picker}; _session_menu → {_rename_session_menu, _change_session_merge_branch_menu,
+    # _share_session, _manage_shared_sessions_menu, _resume_session_menu,
+    # _resume_shared_session_menu, …}; _manage_shared_sessions_menu → _manage_one_shared_session;
+    # _settings_menu → {_edit_one_setting, _settings_timings_menu → _edit_one_timing}.
+    _MENU_UP = "up"
+    _MENU_DONE = "done"
+    _MENU_STAY = "stay"
+
+    def _descend(self, child_signal: str) -> str:
+        """Route a child menu's result for a parent menu: the child's DONE (a transition)
+        propagates up as DONE; anything else (the child was Esc'd/closed) means "re-show me",
+        i.e. _MENU_STAY — so the child's Esc lands back on this parent, one level up."""
+        return self._MENU_DONE if child_signal == self._MENU_DONE else self._MENU_STAY
+
+    def _after_menu_command(self, signal: str) -> None:
+        """A top-level command menu closed. Esc/back (UP) goes up one level to the Ctrl-G
+        command palette; a transition (DONE) drops through to the agent."""
+        if signal == self._MENU_UP:
+            self._reopen_command_palette()
+
+    def _reopen_command_palette(self) -> None:
+        # Re-open the input-layer Ctrl-G palette (the parent of every command menu) so Esc
+        # out of a command lands back here rather than at the agent. Mirrors the state reset
+        # the palette does when first opened with the menu key.
+        self.input.capturing = True
+        self.input.buffer.clear()
+        self.input.selected_index = 0
+        self.input.escape_buffer = None
+        self.input.extra_commands = ["merge"] if self._has_unmerged_work() else []
+        self._render()
 
     def _run_command(self, command: str) -> None:
         # aGiTrack commands in proxy mode are triggered via Ctrl-G and are plain
@@ -5990,9 +6010,8 @@ class ProxyRunner:
         elif name == "agent-backend":
             backends = available_backends()
             selected = arg.strip() or self._select_popup("Backend Agent", backends)
-            if selected is None:
-                self._set_message("Cancelled.")
-                self._render()
+            if selected is None:  # Esc on the picker → up one level to the palette
+                self._after_menu_command(self._MENU_UP)
                 return
             if selected not in backends:
                 self._set_message(f"Unknown backend: {selected}. Available: {', '.join(backends)}")
@@ -6002,13 +6021,13 @@ class ProxyRunner:
                 self._switch_backend(selected)
                 return
         elif name == "sessions":
-            self._handle_session_command(arg)
+            self._after_menu_command(self._handle_session_command(arg))
             return
         elif name == "summarizer":
-            self._handle_summarizer_command(arg)
+            self._after_menu_command(self._handle_summarizer_command(arg))
             return
         elif name == "settings":
-            self._settings_menu()
+            self._after_menu_command(self._settings_menu())
             return
         elif name == "update":
             self._handle_update_command()
@@ -6127,10 +6146,11 @@ class ProxyRunner:
         suffix = {"repo": " · repo", "global": " · global", "default": ""}[self.global_config.source(key)]
         return f"{text}{suffix}"
 
-    def _settings_menu(self) -> None:
+    def _settings_menu(self) -> str:
         """Ctrl-G → "settings": browse and edit ALL config options. Changes are collected
         as PENDING edits (each with its chosen scope) and written only when you confirm on
-        the way out. Esc goes up one level; closing with unsaved changes asks to save them."""
+        the way out. Esc goes up one level; closing with unsaved changes asks to save them.
+        Returns _MENU_UP so closing the menu lands back on the Ctrl-G palette."""
         self._settings_pending = {}
         self._settings_pending_timings = {}
         while True:
@@ -6148,14 +6168,14 @@ class ProxyRunner:
                 # Leaving the top level: offer to save/discard any unsaved edits.
                 if pending and self._confirm_save_pending() == "keep":
                     continue  # "Keep editing" → stay in the menu
-                break
+                self._set_message("Settings closed.")
+                self._render()
+                return self._MENU_UP
             spec = specs[options.index(choice)]
             if spec["kind"] == "timings":
                 self._settings_timings_menu()
             else:
                 self._edit_one_setting(spec)
-        self._set_message("Settings closed.")
-        self._render()
 
     def _edit_one_setting(self, spec: dict) -> None:
         """Edit one setting into a PENDING change. Esc at the value prompt returns to the

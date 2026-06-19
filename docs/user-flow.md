@@ -271,14 +271,19 @@ flowchart TD
 `Ctrl-G` opens the command palette (type a prefix, Up/Down to select, Tab to complete,
 Enter to run). Commands, in palette order:
 
-> **One rule across every menu: Esc goes up one level.** Esc in a sub-menu returns to the
-> menu that opened it; Esc on a top-level menu (the palette, the sessions list, the settings
-> list) closes it back to the agent. A menu re-shows itself after a child menu returns, so a
-> child's Esc lands you back on its parent rather than dumping you all the way out. Picking a
-> choice that moves you into a different context (switch / new / resume a session) closes the
-> menu instead, since there is nothing to step back to. (Implementation: each menu is a
-> `while True` loop whose Esc `return`s, so Esc unwinds the call stack one frame at a time —
-> the on-screen hierarchy mirrors the code's call hierarchy.)
+> **One rule across every menu: Esc goes up exactly one level.** The **command palette is
+> the parent of every command menu**, so Esc on a command menu (the sessions list, the
+> settings list, the summarizer menu…) returns you **to the palette** — not to the agent.
+> Esc on the palette returns to the agent. Esc in a sub-menu returns to the menu that opened
+> it (e.g. Esc in *Manage <one shared session>* → the shared-sessions list → the sessions
+> menu → the palette → the agent — one step per Esc). The only thing that unwinds further is
+> a choice that moves you into a **different session** (switch / new / resume): that drops
+> straight to the agent, since there is no level to come back to.
+>
+> Internally each menu returns `UP` (Esc/back → caller re-shows itself), `DONE` (a session
+> transition → unwind to the agent), or stays in its own loop; a child's `UP` becomes the
+> parent's "re-show me". So Esc unwinds the call stack one frame at a time and the on-screen
+> hierarchy mirrors the code's call hierarchy.
 
 ```mermaid
 flowchart TD
