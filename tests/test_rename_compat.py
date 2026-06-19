@@ -175,7 +175,9 @@ def test_new_ref_wins_over_legacy_on_name_collision():
 # --- packaging back-compat --------------------------------------------------
 
 
-def test_both_console_scripts_point_at_agitrack():
+def test_console_script_is_agitrack_only():
+    # aGiTrack installs a single command, `agitrack`. The legacy `agit` alias has been
+    # removed, so it must NOT be registered as a console script.
     scripts = {e.name: e.value for e in entry_points(group="console_scripts")}
     assert scripts.get("agitrack") == "agitrack.cli:main"
-    assert scripts.get("agit") == "agitrack.cli:main"  # legacy alias kept
+    assert "agit" not in scripts
