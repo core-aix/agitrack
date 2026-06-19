@@ -174,6 +174,39 @@ class TestSelectModal:
         assert "  b" in lines
         assert "" in lines[3:]  # a blank line among the options
 
+    def test_detail_lines_render_between_title_and_options(self):
+        m = SelectModal("Pick", ["yes", "no"], detail=["file-a", "file-b"])
+        lines = m.render_message().split("\n")
+        assert "  file-a" in lines and "  file-b" in lines
+        # The detail sits above the option rows.
+        assert lines.index("  file-a") < lines.index("> yes")
+
+    def test_long_detail_is_windowed_and_pagedown_scrolls(self):
+        detail = [f"f{i}" for i in range(40)]
+        m = SelectModal("Pick", ["yes", "no"], detail=detail, viewport_rows=20)
+        window = m._detail_window()
+        assert window < len(detail)  # too many to show at once
+        first = m.render_message()
+        assert "  f0" in first and "↓" in first  # window starts at the top, more below
+        m.feed(b"\x1b[6~")  # PageDown
+        assert m.detail_scroll > 0
+        scrolled = m.render_message()
+        assert "↑" in scrolled  # now there's content above
+        # Navigation still selects options, independent of the detail scroll.
+        m.feed(b"\x1b[B")
+        assert m.selected == 1
+
+    def test_pageup_clamps_at_top(self):
+        m = SelectModal("Pick", ["yes", "no"], detail=[f"f{i}" for i in range(40)], viewport_rows=20)
+        m.feed(b"\x1b[5~")  # PageUp at the top is a no-op
+        assert m.detail_scroll == 0
+
+    def test_short_detail_shows_no_scroll_hint(self):
+        m = SelectModal("Pick", ["yes", "no"], detail=["only-one"], viewport_rows=40)
+        msg = m.render_message()
+        assert "↑" not in msg and "↓" not in msg
+        assert "PgUp/PgDn" not in msg  # no scroll instruction when everything fits
+
 
 # ---------------------------------------------------------------------------
 # ProxyRunner._run_modal — reactor: PTY drains while modal is open

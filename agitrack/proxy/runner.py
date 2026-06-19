@@ -574,9 +574,13 @@ class ProxyRunner:
         # offers the choice again if the changes are still sitting there.
         self._cancel_prompted: set[str] = set()
         # Worktree files we've already offered to copy into the base repo, keyed by
-        # repo-relative path → content fingerprint, so a file the user left in place
-        # is re-offered only once its content changes again (per-run, in-memory).
+        # repo-relative path → content fingerprint, so a file the user accepted/left in
+        # place is re-offered only once its content changes again (per-run, in-memory).
         self._copy_prompted: dict[str, tuple[int, int]] = {}
+        # Repo-relative paths the user declined to copy: muted so the SAME set isn't
+        # re-asked even as its contents change. A genuinely new path un-mutes the whole
+        # set (ask about all again); cleared on session switch and aGiTrack restart.
+        self._copy_declined: set[str] = set()
         # Lifecycle flags read before their first conditional assignment. These
         # MUST be initialized here: their getattr() guards were removed in P7,
         # and for_testing() seeding them alone would hide a missing init from
@@ -795,6 +799,7 @@ class ProxyRunner:
                 "_sessions_with_activity": set(),
                 "_cancel_prompted": set(),
                 "_copy_prompted": {},
+                "_copy_declined": set(),
                 "_full_agent_messages": False,
                 "_delay_merge": False,
                 "_user_declined": [],
@@ -4693,6 +4698,13 @@ class ProxyRunner:
         self._enable_host_mouse()
         self._set_message(f"Switched to session '{self._session_name(index)}'")
         self._render()
+        # The copy-back mute is per active-session-visit: a switch resets it so the
+        # session we just landed on gets offered its own worktree-only files (background
+        # sessions are never interrupted mid-run; this is where we catch up). Only when
+        # it's idle — a session still mid-turn gets offered by the turn path once it settles.
+        self._copy_declined = set()
+        if not self._agent_is_active():
+            self._offer_copy_unstaged_to_base(context="switch")
         # The newly-active session may merge into a different branch than the one
         # checked out in the repo directory — ask where its changes should merge.
         self._prompt_merge_target_if_diverged()
@@ -6095,15 +6107,17 @@ class ProxyRunner:
         """
         return self._run_modal(PromptModal(title, prompt, default=default))
 
-    def _select_popup(self, title: str, options: list[str]) -> str | None:
+    def _select_popup(self, title: str, options: list[str], *, detail: list[str] | None = None) -> str | None:
         """Selection popup.  Thin facade over ``_run_modal(SelectModal(...))``.
 
         Tests stub this method heavily; the name and signature are stable.
         Returns ``""`` immediately when *options* is empty (unchanged behaviour).
+        ``detail`` is an optional list of lines (e.g. a file list) shown between the
+        title and the options, windowed and PgUp/PgDn-scrollable when it overflows.
         """
         if not options:
             return ""
-        return self._run_modal(SelectModal(title, options))
+        return self._run_modal(SelectModal(title, options, detail=detail, viewport_rows=self.rows))
 
     def _create_user_commit_popup(
         self,
@@ -6840,6 +6854,12 @@ class ProxyRunner:
         except Exception as error:
             self._debug(f"keeping worktree '{info.name}' on exit: {error!r}")
             return
+        # The worktree (and any uncommitted/ignored files in it) is about to be deleted.
+        # Offer to copy those out first — but only on an interactive exit (Ctrl-G → exit),
+        # never a signal teardown (terminal/window close sets screen=None), where there is
+        # no UI to prompt with. The "exit" context warns that declining discards them.
+        if self.screen is not None:
+            self._offer_copy_unstaged_to_base(context="exit")
         # Remember this session's conversation under its backend so switching back
         # to that backend (this run or a later one) resumes it.
         self._remember_session_for_backend()
@@ -7437,61 +7457,92 @@ class ProxyRunner:
             return
         self._offer_copy_unstaged_to_base()
 
-    def _offer_copy_unstaged_to_base(self) -> None:
+    def _offer_copy_unstaged_to_base(self, *, context: str = "turn") -> None:
         """Offer to copy the worktree's would-be-stranded files into the base repo dir.
 
         Only relevant for an isolated worktree session: changes committed this turn
-        integrate into the base branch, but files the agent modified and left
-        uncommitted (declined untracked files, unstaged edits) or that are git-ignored
-        live only in the worktree and the user — working in the base directory — never
-        sees them. This runs **whether or not the turn produced a commit**: a turn that
-        only touched ignored files stages nothing, yet those files may still need to
-        come across (see the callers in ``_maybe_agent_commit``).
+        integrate into the base branch, but files the agent left uncommitted (declined
+        untracked files, unstaged edits) or that are git-ignored live only in the worktree
+        and the user — working in the base directory — never sees them.
 
-        Files are tracked by a content fingerprint, so a file the user chose to leave
-        is not prompted again until it changes. With consent each file is copied; an
-        existing base file is overwritten only on a per-file confirmation. Anything not
-        copied is reported as remaining in the worktree, with the worktree path."""
+        ``context``:
+          - ``"turn"``   — after an idle turn in the ACTIVE session (default). Background
+            sessions are never interrupted; their files are offered on switch/exit instead.
+          - ``"switch"`` — when the user switches TO this session.
+          - ``"exit"``   — last offer before the worktree (and these files) are deleted: the
+            decline mute is ignored and the prompt warns that declining discards them.
+
+        A file already accepted/left in place isn't re-offered until its content changes
+        (fingerprint). Declining mutes the whole current SET of paths: aGiTrack won't ask
+        again while only those files keep changing — only a genuinely NEW path re-opens the
+        set (ask about all again). The mute clears on session switch and aGiTrack restart."""
         if self.worktree is None or self.base_repo is None:
             return
         base_dir = self.base_repo.repo
         wt_dir = self.repo.repo
         if base_dir == wt_dir:
             return
-        # Files modified since we last offered them (new content → re-offer; unchanged
-        # declined files are skipped so the user isn't nagged).
+        candidates = self._uncommitted_worktree_files()
+        if not candidates:
+            return
+        current = set(candidates)
+        on_exit = context == "exit"
+        # A genuinely new path (one we haven't muted) re-opens the whole set: drop the
+        # decline mute and the per-file fingerprint memory so "all files" means all again.
+        if not on_exit and self._copy_declined and (current - self._copy_declined):
+            self._copy_declined.clear()
+            self._copy_prompted.clear()
         fresh: list[tuple[str, tuple[int, int]]] = []
-        for rel in self._uncommitted_worktree_files():
+        for rel in candidates:
             fingerprint = self._file_fingerprint(wt_dir / rel)
-            if fingerprint is None or self._copy_prompted.get(rel) == fingerprint:
+            if fingerprint is None:
                 continue
+            if not on_exit:
+                if rel in self._copy_declined:
+                    continue  # muted by a prior decline; its contents can change freely
+                if self._copy_prompted.get(rel) == fingerprint:
+                    continue  # already offered/copied at this exact content
             fresh.append((rel, fingerprint))
         if not fresh:
             return
-        # Record the fingerprints up front so a declined file isn't re-prompted while
-        # it stays unchanged (re-offered only once its content changes again).
         for rel, fingerprint in fresh:
             self._copy_prompted[rel] = fingerprint
-        names = ", ".join(rel for rel, _ in fresh[:5]) + (" …" if len(fresh) > 5 else "")
-        choice = self._select_popup(
-            f"This session's worktree ({wt_dir}) has {len(fresh)} file(s) that won't be "
-            f"merged into the base — uncommitted or git-ignored ({names}). Copy them into "
-            f"the base repo directory ({base_dir})?",
-            ["No, leave them in the worktree", "Yes, copy to the base repo"],
-        )
+        rels = [rel for rel, _ in fresh]
+        # The file list is shown vertically (one per line) and scrolls (PgUp/PgDn) when long.
+        if on_exit:
+            title = (
+                f"This session's worktree ({wt_dir}) has {len(rels)} file(s) not in the base repo "
+                f"that will be DELETED when the worktree is removed on exit. Copy them into the base "
+                f"repo ({base_dir}) first?"
+            )
+            options = ["No, discard them with the worktree", "Yes, copy to the base repo"]
+        else:
+            title = (
+                f"This session's worktree ({wt_dir}) has {len(rels)} file(s) that won't be merged "
+                f"into the base — uncommitted or git-ignored. Copy them into the base repo ({base_dir})?\n"
+                f"(Decline and aGiTrack won't ask about this set again until the files change as a set "
+                f"or you switch sessions.)"
+            )
+            options = ["No, leave them in the worktree", "Yes, copy to the base repo"]
+        choice = self._select_popup(title, options, detail=rels)
         if choice is None or choice.startswith("No"):
-            self._notice_files_remain(wt_dir, [rel for rel, _ in fresh])
+            if on_exit:
+                self._set_message(f"Discarding {len(rels)} file(s) with the worktree.", seconds=6.0)
+                self._render()
+            else:
+                self._copy_declined |= current  # mute the whole set until it changes / switch
+                self._notice_files_remain(wt_dir, rels)
             return
         # Files that would overwrite something already in the base are handled in one
         # up-front choice: overwrite them all, keep them all (the new files still copy),
         # or confirm each one individually.
-        conflicts = [rel for rel, _ in fresh if (base_dir / rel).exists()]
+        conflicts = [rel for rel in rels if (base_dir / rel).exists()]
         overwrite_mode = "all"  # no conflicts → moot
         if conflicts:
-            preview = ", ".join(conflicts[:5]) + (" …" if len(conflicts) > 5 else "")
             answer = self._select_popup(
-                f"{len(conflicts)} of these already exist in the base repo ({preview}). Overwrite them?",
+                f"{len(conflicts)} of these already exist in the base repo. Overwrite them?",
                 ["No, keep the base versions", "Yes, overwrite all", "Let me confirm each one"],
+                detail=conflicts,
             )
             if answer == "Yes, overwrite all":
                 overwrite_mode = "all"

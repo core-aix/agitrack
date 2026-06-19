@@ -114,19 +114,33 @@ class SelectModal:
         title    — displayed as the popup heading
         options  — the list of selectable strings
         selected — index of the currently-highlighted option
+        detail   — optional extra lines shown between the title and the options
+                   (e.g. a file list). When they don't all fit, a window of them is
+                   shown and PgUp/PgDn scroll it.
 
     Byte handling:
         Esc (lone)      → cancel
         Ctrl-C          → exit request
         Arrow-Up        → move selection up (wraps)
         Arrow-Down      → move selection down (wraps)
+        PgUp / PgDn     → scroll the detail list (when it overflows)
         Enter/\\r/\\n   → confirm with ``options[selected]``
         Other escapes   → consumed silently
     """
 
-    def __init__(self, title: str, options: list[str]) -> None:
+    def __init__(
+        self,
+        title: str,
+        options: list[str],
+        *,
+        detail: list[str] | None = None,
+        viewport_rows: int | None = None,
+    ) -> None:
         self.title = title
         self.options = options
+        self.detail = list(detail or [])
+        self.viewport_rows = viewport_rows
+        self.detail_scroll = 0
         # A blank/whitespace-only option is a separator: rendered as a gap and
         # skipped during navigation (never highlighted, never returned). Start the
         # selection on the first real option.
@@ -149,9 +163,37 @@ class SelectModal:
                 self.selected = index
                 return
 
+    def _detail_window(self) -> int:
+        """How many detail lines fit at once. Without a known terminal height, show them
+        all (the box still clamps); otherwise leave room for the title, the scroll hints,
+        the instruction line, and the options."""
+        if not self.detail:
+            return 0
+        if not self.viewport_rows:
+            return len(self.detail)
+        title_lines = self.title.count("\n") + 1
+        overhead = title_lines + len(self.options) + 5  # instructions, gaps, 2 scroll hints
+        return max(3, self.viewport_rows - 4 - overhead)
+
     def render_message(self) -> str:
         """Return the message string that should be shown in the popup area."""
-        lines = [self.title, "Up/Down selects. Enter confirms.", ""]
+        lines = [self.title]
+        window = self._detail_window()
+        if self.detail:
+            total = len(self.detail)
+            start = max(0, min(self.detail_scroll, max(0, total - window)))
+            self.detail_scroll = start  # clamp persisted so PgDn past the end is a no-op
+            if start > 0:
+                lines.append(f"  ↑ {start} more above")
+            lines.extend("  " + line for line in self.detail[start : start + window])
+            below = total - (start + window)
+            if below > 0:
+                lines.append(f"  ↓ {below} more below")
+        scrollable = bool(self.detail) and len(self.detail) > window
+        lines.append(
+            "Up/Down selects. PgUp/PgDn scroll. Enter confirms." if scrollable else "Up/Down selects. Enter confirms."
+        )
+        lines.append("")
         for index, option in enumerate(self.options):
             if self._is_separator(option):
                 lines.append("")  # a blank gap between groups
@@ -177,6 +219,12 @@ class SelectModal:
                     self._escape_buffer = None
                 elif sequence == b"\x1b[B":
                     self._advance(1)
+                    self._escape_buffer = None
+                elif sequence == b"\x1b[5~":  # PageUp — scroll the detail list up
+                    self.detail_scroll = max(0, self.detail_scroll - max(1, self._detail_window() - 1))
+                    self._escape_buffer = None
+                elif sequence == b"\x1b[6~":  # PageDown — scroll the detail list down
+                    self.detail_scroll += max(1, self._detail_window() - 1)
                     self._escape_buffer = None
                 elif _escape_sequence_complete(sequence):
                     self._escape_buffer = None

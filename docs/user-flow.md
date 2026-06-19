@@ -210,33 +210,48 @@ flowchart TD
 
 Only for a worktree session. Catches files the agent left UNCOMMITTED or that are
 git-ignored — they integrate into nothing, so the user working in the base dir would
-never see them (`_offer_copy_unstaged_to_base`). Runs whether or not the turn committed.
+never see them (`_offer_copy_unstaged_to_base`). It runs for the **active** session only
+(a background session is never interrupted mid-run); its files are caught instead when you
+**switch to it** or on **aGiTrack exit**, just before the worktree is deleted.
 
 ```mermaid
 flowchart TD
-  start(["Turn finished, worktree session"]) --> gather[["List worktree files that won't merge: uncommitted or git-ignored. Skip .agitrack/ and names starting with _ or ."]]
-  gather --> fresh{"Any with NEW content since last offered? Fingerprint gate"}
-  fresh -->|No| done(["Nothing to do"])
-  fresh -->|Yes| offer[/"N file(s) won't be merged. Copy them into the base repo dir? • No, leave them in the worktree • Yes, copy to the base repo"/]
+  start(["Trigger: active session idle after a turn (committed or not), OR switched to this session, OR aGiTrack exiting"]) --> wtq{"Worktree session? (no-op under --no-worktree)"}
+  wtq -->|No| done(["Nothing to do"])
+  wtq -->|Yes| gather[["List worktree files that won't merge: uncommitted or git-ignored. Skip .agitrack/ and names starting with _ or ."]]
+  gather --> any{"Any candidate files?"}
+  any -->|No| done
+  any -->|Yes| ctx{"Context?"}
 
-  offer -->|No, or cancel| remain[/"Notice: the files remain in the worktree, with the worktree path; they're deleted when aGiTrack exits or the session integrates"/]
-  remain --> done
+  ctx -->|Exiting| offerx[/"N file(s) will be DELETED when this worktree is removed on exit. Copy them into the base repo first? (files listed vertically, PgUp/PgDn scrolls) • No, discard them with the worktree • Yes, copy to the base repo"/]
+  ctx -->|Turn or switch| muted{"This whole SET already declined this visit, AND no genuinely new file?"}
+  muted -->|Yes| done
+  muted -->|No: first ask, or a NEW path re-opens the whole set| offer[/"N file(s) won't be merged. Copy them into the base repo? (listed vertically, scrollable) Note: declining won't re-ask until the fileset changes or you switch sessions. • No, leave them in the worktree • Yes, copy to the base repo"/]
 
-  offer -->|Yes, copy| conflictq{"Any would overwrite an existing base file?"}
+  offer -->|No| mute[["Mute this whole set of paths (re-opened only by a new file / switch / restart); notice names the worktree path"]]
+  offerx -->|No, discard| disc[["Files are discarded with the worktree"]]
+  mute --> done
+  disc --> done
+
+  offer -->|Yes| conflictq{"Any would overwrite an existing base file?"}
+  offerx -->|Yes| conflictq
   conflictq -->|No conflicts| copyall[["Copy every file into the base dir"]]
   conflictq -->|Yes| ow[/"N already exist in the base repo. Overwrite them? • No, keep the base versions • Yes, overwrite all • Let me confirm each one"/]
 
   ow -->|No, keep the base versions| skipc[["Skip the conflicting files; still copy the non-conflicting new ones"]]
   ow -->|Yes, overwrite all| copyall
-  ow -->|Let me confirm each one| each[/"Per conflicting file: 'file' already exists. Overwrite it? • No, keep the base version • Yes, overwrite"/]
-  each -->|No, keep| skip1[["Keep the base copy"]]
-  each -->|Yes, overwrite| ov1[["Overwrite that file"]]
-  skip1 --> tally
-  ov1 --> tally
+  ow -->|Let me confirm each one| each[/"Per conflicting file: overwrite it? • No, keep the base version • Yes, overwrite"/]
+  each --> tally
   skipc --> tally
   copyall --> tally[["Report copied count; anything not copied gets the 'files remain' notice"]]
   tally --> done
 ```
+
+> A file already accepted or left in place isn't re-offered until its content changes
+> (fingerprint). Declining mutes the whole current **set of paths** — aGiTrack won't ask
+> again while only those files keep changing; a genuinely new path re-opens the whole set
+> (ask about all again). The mute clears on session switch and aGiTrack restart. The
+> **exit** offer ignores the mute (the files are about to be deleted) and warns as much.
 
 ---
 
@@ -257,12 +272,21 @@ flowchart TD
   pal --> update["update"]
   pal --> exit["exit"]
 
-  sessions --> smenu[/"Live sessions menu: each shows running or idle"/]
-  smenu -->|Switch to one| sswitch[["Show that session, relaunch TUI, re-baseline so history isn't re-committed"]]
-  smenu -->|sessions new| snew["Start a new session: own worktree, or shared base dir under --no-worktree"]
-  smenu -->|Stop one| sstop[["Stop the session"]]
-  smenu -->|Merge reviewed changes| smerge[/"Pick base branch, then integrate that session's changes"/]
+  sessions --> smenu[/"Sessions menu (live sessions show running/idle; dormant worktrees and shared markers listed too)"/]
+  smenu -->|Switch to a live session| sswitch[["Show it, relaunch TUI, re-baseline so history isn't re-committed; then offer to copy its worktree-only files"]]
+  smenu -->|Resume an idle/dormant worktree| sresume[["Reopen that session in its worktree; continue the backend conversation if still recorded"]]
+  smenu -->|Resolve an unmerged dormant worktree| sresolve[/"Integrate its pending commits, or discard the worktree (confirmed)"/]
+  smenu -->|+ New session| snew["Start a new session: own worktree, or shared base dir under --no-worktree"]
+  smenu -->|✎ Rename a session| srename[["Rename = fork: clears the shared lineage, so a later share creates a NEW shared entry"]]
+  smenu -->|⤳ Change a session's merge branch| smb[/"Pick the branch this idle session integrates into (flushes its pending work into the old branch first)"/]
+  smenu -->|↻ Resume a past conversation| spast[/"Pick from past conversations of this repo, newest first"/]
+  smenu -->|⇪ Share this session with collaborators| sshare["Session sharing"]
+  smenu -->|⇩ Resume a shared session| srshare["Session sharing"]
+  smenu -->|⚙ Manage shared sessions| smanage["Session sharing"]
+  smenu -->|✓ Integrate this session's commits / Merge reviewed changes| smerge[/"Integrate this session's committed work into its base branch (pick the branch under --delay-merge)"/]
+  smenu -->|- Stop a session| sstop[["Stop the session"]]
   snew --> mode3["See Worktrees vs no-worktree"]
+  sswitch --> scopy["See After the turn: copy worktree-only files"]
 
   backend -->|No arg, picker| bpick[/"Pick claude or opencode"/]
   bpick --> bswitch[["Save current backend's session, relaunch target backend, restore its last session, update global default"]]
@@ -284,6 +308,10 @@ flowchart TD
   click uflow "#9-self-update-flow"
   click exflow "#10-exit-and-terminal-close"
   click mode3 "#3-worktrees-vs-no-worktree"
+  click sshare "#11-session-sharing"
+  click srshare "#11-session-sharing"
+  click smanage "#11-session-sharing"
+  click scopy "#6-after-the-turn-copy-worktree-only-files-to-base"
 ```
 
 ---
@@ -382,8 +410,74 @@ flowchart TD
 
 ---
 
+## 11. Session sharing
+
+Sharing pushes a session's **redacted** backend transcript to `origin` on a custom ref
+(`refs/agitrack/shared-sessions`), keyed by repo + your GitHub id + a name, so collaborators
+on the same repo can resume your conversation. Opt-in, with informed consent on every share
+(`_share_session`, `_resume_shared_session_menu`, `_manage_shared_sessions_menu`). Only
+backends with a portable transcript (Claude) support it.
+
+### Share this session
+
+```mermaid
+flowchart TD
+  s(["⇪ Share this session"]) --> sup{"Backend supports sharing AND a resumable session exists?"}
+  sup -->|No| nope[/"Not supported / nothing to share yet — explain why"/]
+  sup -->|Yes| consent[/"Consent, shown EVERY time: the transcript can contain file contents, command output, and secrets — review first (the first time spells out exactly what is uploaded). • Yes, share it • No, cancel"/]
+  consent -->|No| cancel(["Cancelled"])
+  consent -->|Yes| redact[["Export + REDACT the transcript, build the manifest, record the lineage origin: owner + name + contributors"]]
+  redact --> push[["Push to origin in the BACKGROUND so the terminal never freezes; the result lands as a notice"]]
+  push --> behind{"Shared copy already has NEWER turns than this machine?"}
+  behind -->|Yes| skip[["Refuse to rewind it: tell the user to resume the shared version first, then share again"]]
+  behind -->|No| okp[["Shared (or saved locally if there is no remote). A diverged collaborator's turns are union-merged in, never lost"]]
+  redact --> autoq{"Already auto-shared?"}
+  autoq -->|No| autop[/"Keep this shared session up to date automatically? • Yes, keep it updated • No, I'll re-share manually"/]
+  autop -->|Yes| auton[["Auto-update ON: every new turn (and exit) re-pushes the latest"]]
+```
+
+### Resume a shared session
+
+```mermaid
+flowchart TD
+  r(["⇩ Resume a shared session"]) --> fetch[["Fetch shared sessions from origin (cancellable)"]]
+  fetch --> anyr{"Any found for this repo?"}
+  anyr -->|No| noner(["None found"])
+  anyr -->|Yes| pickr[/"Pick one (newest first; shows model + age)"/]
+  pickr --> origin[["Record its lineage origin, so a later re-share updates the SAME entry and adds you to the contributors"]]
+  origin --> wherer{"Is this conversation already open locally?"}
+  wherer -->|Running here, same id| livr[/"Update this session to the shared version / Keep both (copy to a new session) / Stay as it is — guards against replacing newer local work with an older shared copy"/]
+  wherer -->|Open under the same shared lineage, different backend id| linr[/"Continue my existing session / Fetch the shared version as a separate copy"/]
+  wherer -->|Not open here| namer[/"Name the local session (defaults to the share name)"/]
+  livr --> bgr[["Fetch transcript + import on a worker thread; the resume completes on the main loop so the UI never freezes"]]
+  linr --> bgr
+  namer --> bgr
+```
+
+### Manage / unshare
+
+```mermaid
+flowchart TD
+  mg(["⚙ Manage shared sessions"]) --> mine{"You've shared any in this repo?"}
+  mine -->|No| nonem(["Nothing to manage"])
+  mine -->|Yes| pickm[/"Pick one (shows age, auto-update state, and a 'local has newer turns' hint)"/]
+  pickm --> act[/"• ↻ Update now (push latest turns) • Toggle auto-update • ✗ Unshare (remove for everyone)"/]
+  act -->|Update now| upd[["Re-push the latest transcript in the background; folds you into the contributor set"]]
+  act -->|Toggle auto-update| tog[["Turn auto-update on (pushes once immediately) or off"]]
+  act -->|Unshare| uconf[/"Unshare '…'? Removes it from origin for everyone and can't be undone. • No, keep it • Yes, unshare"/]
+  uconf -->|Yes| undo[["Delete the shared ref entry (background)"]]
+  uconf -->|No| keepm(["Kept"])
+```
+
+> Renaming a session **forks** it (`_fork_lineage_on_rename`): the shared lineage origin is
+> cleared, so sharing the renamed session creates a NEW `<you>/<new-name>` shared entry rather
+> than updating the one it came from. The whole feature is opt-in; nothing is uploaded without
+> an explicit "Yes" each time.
+
+---
+
 ### Cross-references
 
-- Prose spec: [`AGENTS.md`](../AGENTS.md) — Staging Behavior, Concurrent Sessions, Self-Update, Concurrency and Locking.
-- User-facing docs: [`README.md`](../README.md).
-- Sandbox / confinement: `agitrack/proxy/sandbox.py`; per-turn commit and copy logic: `agitrack/proxy/runner.py`.
+- Prose spec: [`AGENTS.md`](../AGENTS.md) — Staging Behavior, Concurrent Sessions, Session Sharing, Self-Update, Concurrency and Locking.
+- User-facing docs: [`README.md`](../README.md) — including [Sharing sessions](../README.md#sharing-sessions).
+- Sandbox / confinement: `agitrack/proxy/sandbox.py`; per-turn commit and copy logic: `agitrack/proxy/runner.py`; sharing store: `agitrack/sessions/store.py`.
