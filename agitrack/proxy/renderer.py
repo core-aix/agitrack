@@ -9,12 +9,78 @@ existing import sites (tests, shim) keep working unchanged.
 from __future__ import annotations
 
 import os
+import re
 import sys
 import textwrap
 import time
 from typing import Protocol
 
 import pyte
+
+# Lightweight inline emphasis for box text: ``**bold**`` marks a run that should be
+# rendered bold. Only balanced pairs count, so stray ``*``/``**`` stay literal.
+_BOLD_MARKUP_RE = re.compile(r"\*\*(.+?)\*\*")
+
+
+def _markup_words(line: str) -> list[tuple[str, bool]]:
+    """Split *line* into ``(word, bold)`` tokens, dropping the ``**`` markers. Bold
+    runs are assumed to fall on whole-word boundaries (true for aGiTrack's notices)."""
+    words: list[tuple[str, bool]] = []
+    pos = 0
+    for match in _BOLD_MARKUP_RE.finditer(line):
+        for chunk, bold in ((line[pos : match.start()], False), (match.group(1), True)):
+            words.extend((word, bold) for word in chunk.split(" ") if word)
+        pos = match.end()
+    words.extend((word, False) for word in line[pos:].split(" ") if word)
+    return words
+
+
+def _wrap_markup(line: str, inner: int) -> list[str]:
+    """Word-wrap *line* (which contains ``**bold**`` markup) to *inner* visible columns,
+    returning rendered rows padded to ``inner`` with the markers turned into SGR bold
+    (``\\x1b[1m`` … ``\\x1b[22m``). Width math uses the *visible* text only, so the box
+    borders stay aligned, and a bold run that crosses a wrap re-opens on the next row."""
+    rows: list[list[tuple[str, bool]]] = []
+    current: list[tuple[str, bool]] = []
+    used = 0
+    for word, bold in _markup_words(line):
+        extra = len(word) + (1 if current else 0)
+        if current and used + extra > inner:
+            rows.append(current)
+            current, used = [], 0
+            extra = len(word)
+        current.append((word, bold))
+        used += extra
+    if current:
+        rows.append(current)
+    rendered: list[str] = []
+    for words in rows:
+        buf: list[str] = []
+        visible = 0
+        bold_open = False
+        for index, (word, bold) in enumerate(words):
+            if index:
+                # Close bold before the separating space when leaving a bold run, so the
+                # space itself isn't styled (a run of bold words keeps a bold space).
+                if bold_open and not bold:
+                    buf.append("\x1b[22m")
+                    bold_open = False
+                buf.append(" ")
+                visible += 1
+            if bold and not bold_open:
+                buf.append("\x1b[1m")
+                bold_open = True
+            elif not bold and bold_open:
+                buf.append("\x1b[22m")
+                bold_open = False
+            buf.append(word)
+            visible += len(word)
+        if bold_open:
+            buf.append("\x1b[22m")
+        if visible < inner:
+            buf.append(" " * (inner - visible))
+        rendered.append("".join(buf))
+    return rendered
 
 
 # ---------------------------------------------------------------------------
@@ -602,11 +668,20 @@ class ScreenRenderer:
         border_top = "┌" + "─" * inner + "┐"
         border_bottom = "└" + "─" * inner + "┘"
         box_lines = [border_top]
-        wrapped_lines: list[str] = []
+        # Each wrapped row is (text, pre_rendered): a row carrying **bold** markup is
+        # wrapped + padded + SGR-rendered up front (its escapes have no visible width,
+        # so it must skip the plain truncate/pad below); every other row is plain text.
+        wrapped_lines: list[tuple[str, bool]] = []
         for line in lines:
-            wrapped_lines.extend(textwrap.wrap(line, width=inner) or [""])
+            if _BOLD_MARKUP_RE.search(line):
+                wrapped_lines.extend((rendered, True) for rendered in _wrap_markup(line, inner))
+            else:
+                wrapped_lines.extend((w, False) for w in (textwrap.wrap(line, width=inner) or [""]))
         max_body = max(rows - row - 2, 1)
-        for line in wrapped_lines[:max_body]:
+        for line, pre_rendered in wrapped_lines[:max_body]:
+            if pre_rendered:
+                box_lines.append("│" + line + "│")
+                continue
             content = line[:inner].ljust(inner)
             if highlight and line == highlight:
                 box_lines.append("│" + "\x1b[7m" + content + "\x1b[0m" + "│")

@@ -1,3 +1,4 @@
+import os
 import shutil
 import subprocess
 import sys
@@ -95,13 +96,16 @@ def test_build_bwrap_command_orders_binds(tmp_path):
 
 
 @pytest.mark.skipif(sys.platform != "darwin" or not shutil.which("sandbox-exec"), reason="sandbox-exec is macOS-only")
-def test_sandbox_exec_blocks_base_and_siblings_allows_self(tmp_path):
+def test_sandbox_exec_blocks_base_and_siblings_allows_self(tmp_path, monkeypatch):
     base = tmp_path / "repo"
     (base / ".git").mkdir(parents=True)
     s1 = base / ".agitrack" / "worktrees" / "s1"
     s2 = base / ".agitrack" / "worktrees" / "s2"
     s1.mkdir(parents=True)
     s2.mkdir(parents=True)
+    agent_dir = base / "vendor" / ".claude"  # a backend installed under the repo
+    agent_dir.mkdir(parents=True)
+    monkeypatch.setattr(sandbox, "agent_writable_dirs", lambda: [str(agent_dir.resolve())])
     profile = sandbox.build_profile(str(base), str(s1))
 
     # Skip when we can't create a nested sandbox (e.g. the suite is itself running
@@ -127,16 +131,20 @@ def test_sandbox_exec_blocks_base_and_siblings_allows_self(tmp_path):
     assert write(s2 / "edit.py") != 0  # another session's worktree: denied
     assert write(s1 / "edit.py") == 0  # this session's worktree: allowed
     assert write(base / ".git" / "x") == 0  # git internals: allowed
+    assert write(agent_dir / "update") == 0  # backend self-update under the repo: allowed
 
 
 @pytest.mark.skipif(not sandbox._bwrap_works(), reason="bubblewrap unavailable / unprivileged userns blocked")
-def test_bwrap_blocks_base_and_siblings_allows_self(tmp_path):
+def test_bwrap_blocks_base_and_siblings_allows_self(tmp_path, monkeypatch):
     base = tmp_path / "repo"
     (base / ".git").mkdir(parents=True)
     s1 = base / ".agitrack" / "worktrees" / "s1"
     s2 = base / ".agitrack" / "worktrees" / "s2"
     s1.mkdir(parents=True)
     s2.mkdir(parents=True)
+    agent_dir = base / "vendor" / ".claude"  # a backend installed under the repo
+    agent_dir.mkdir(parents=True)
+    monkeypatch.setattr(sandbox, "agent_writable_dirs", lambda: [str(agent_dir.resolve())])
     prefix = sandbox.build_bwrap_command(str(base), str(s1))
 
     def write(path) -> int:
@@ -149,3 +157,95 @@ def test_bwrap_blocks_base_and_siblings_allows_self(tmp_path):
     assert write(s2 / "edit.py") != 0  # another session's worktree: denied
     assert write(s1 / "edit.py") == 0  # this session's worktree: allowed
     assert write(base / ".git" / "x") == 0  # git internals: allowed
+    assert write(agent_dir / "update") == 0  # backend self-update under the repo: allowed
+
+
+# ---------------------------------------------------------------------------
+# Backend agent self-update carve-out
+# ---------------------------------------------------------------------------
+
+
+def test_agent_writable_dirs_covers_known_roots(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    for var in ("XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(sandbox.shutil, "which", lambda _name: None)
+
+    dirs = sandbox.agent_writable_dirs()
+    # Both backends' install/config/state roots are present (realpath-resolved).
+    assert str((home / ".claude").resolve()) in dirs
+    assert str(home / ".opencode") in dirs
+    assert str(home / ".local" / "share" / "claude") in dirs
+    assert str(home / ".local" / "state" / "opencode") in dirs
+    assert str(home / ".local" / "bin") in dirs  # native launcher symlink dir
+    # No bare "/" ever, and no duplicates.
+    assert os.sep not in [d for d in dirs if d == os.sep]
+    assert len(dirs) == len(set(dirs))
+
+
+def test_agent_writable_dirs_follows_resolved_executable(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    # claude resolved like the native install: a launcher symlink -> versioned binary.
+    install = home / "tools" / "claude" / "versions" / "9.9.9"
+    install.parent.mkdir(parents=True)
+    install.write_text("#!/bin/sh\n")
+    launcher = home / ".local" / "bin" / "claude"
+    launcher.parent.mkdir(parents=True)
+    launcher.symlink_to(install)
+    monkeypatch.setattr(sandbox.shutil, "which", lambda name: str(launcher) if name == "claude" else None)
+
+    dirs = sandbox.agent_writable_dirs()
+    assert str(launcher.parent.resolve()) in dirs  # the launcher dir
+    assert str(install.parent.resolve()) in dirs  # the dir the launcher resolves into
+
+
+def test_build_profile_allows_agent_update_dir_under_repo(monkeypatch, tmp_path):
+    # An agent installed *under* the base repo must still be writable for updates:
+    # its allow rule has to come after the base deny so it wins.
+    base = tmp_path / "repo"
+    wt = base / ".agitrack" / "worktrees" / "s1"
+    wt.mkdir(parents=True)
+    agent_dir = base / "vendor" / ".claude"
+    agent_dir.mkdir(parents=True)
+    monkeypatch.setattr(sandbox, "agent_writable_dirs", lambda: [str(agent_dir.resolve())])
+
+    lines = sandbox.build_profile(str(base), str(wt)).splitlines()
+    deny_base = next(i for i, ln in enumerate(lines) if "deny" in ln and str(base.resolve()) in ln)
+    allow_agent = next(i for i, ln in enumerate(lines) if "allow" in ln and str(agent_dir.resolve()) in ln)
+    assert allow_agent > deny_base  # later rule wins -> updates allowed
+
+
+def test_build_bwrap_command_rebinds_agent_dir_under_base(monkeypatch, tmp_path):
+    base = tmp_path / "repo"
+    (base / ".git").mkdir(parents=True)
+    wt = base / ".agitrack" / "worktrees" / "s1"
+    wt.mkdir(parents=True)
+    under = base / "vendor" / ".claude"
+    under.mkdir(parents=True)
+    outside = tmp_path / "home" / ".opencode"
+    outside.mkdir(parents=True)
+    monkeypatch.setattr(sandbox, "agent_writable_dirs", lambda: [str(under.resolve()), str(outside.resolve())])
+
+    args = sandbox.build_bwrap_command(str(base), str(wt))
+    # The under-base agent dir is re-bound read-write after the read-only base bind.
+    ro_base = args.index(str(base.resolve()))
+    bind_under = args.index(str(under.resolve()))
+    assert args[bind_under - 1] == "--bind" and bind_under > ro_base
+    # The outside-base dir is already read-write via --dev-bind / / -> not re-bound.
+    assert str(outside.resolve()) not in args
+
+
+def test_build_bwrap_command_skips_missing_agent_dir(monkeypatch, tmp_path):
+    base = tmp_path / "repo"
+    (base / ".git").mkdir(parents=True)
+    wt = base / ".agitrack" / "worktrees" / "s1"
+    wt.mkdir(parents=True)
+    missing = base / "vendor" / ".claude"  # under base but does not exist
+    monkeypatch.setattr(sandbox, "agent_writable_dirs", lambda: [str(missing)])
+    # bwrap errors on a missing bind source, so a non-existent agent dir is skipped.
+    args = sandbox.build_bwrap_command(str(base), str(wt))
+    assert str(missing) not in args

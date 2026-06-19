@@ -4,6 +4,7 @@ aGiTrack stands for agent + git tracking. It is an interactive Python CLI that w
 
 aGiTrack supports OpenCode and Claude (Claude Code) as interchangeable backends. Every aGiTrack feature works the same regardless of the selected backend.
 
+> 📊 **[User Flow Diagram](docs/user-flow.md)** — a complete, graph-rendered map of aGiTrack's interactive logic: which file/commit status triggers which prompt, and where every option (and nested option) leads. Read it to understand exactly how aGiTrack behaves.
 
 ## Requirements
 
@@ -19,11 +20,23 @@ pip install agitrack
 
 This installs the `agitrack` command and the terminal UI dependency used for status bars and contextual command hints. The PyPI distribution, the importable package, and the command are all named `agitrack`. Once installed, aGiTrack keeps itself up to date — see [Self-update](#self-update).
 
+On systems where Python comes from a system package manager (many Linux distributions, or Homebrew on macOS), `pip` may refuse to install into the system environment with an "externally-managed-environment" error ([PEP 668](https://peps.python.org/pep-0668/)). In that case install with [`pipx`](https://pipx.pypa.io) instead, which puts `agitrack` in its own isolated environment and on your PATH:
+
+```bash
+pipx install agitrack
+```
+
 For local development, install from a checkout instead:
 
 ```bash
 python3 -m pip install -e .
 ```
+
+### VS Code extension
+
+aGiTrack is also available as a **[VS Code extension](https://marketplace.visualstudio.com/items?itemName=core-aix.agitrack-vscode)**. Install it from the Marketplace and launch aGiTrack inside VS Code with one click — the **aG** button in the editor toolbar (top-right), or the `aGiTrack:` commands in the Command Palette. It runs the real aGiTrack CLI in an integrated terminal (installing the CLI on first use if it's missing), so you get the complete experience — the agent's native interface, the `Ctrl-G` menu, sessions, sharing, worktrees, and per-turn auto-commits. See [Editor integration](#editor-integration) for details.
+
+![aGiTrack running inside VS Code via the extension](https://raw.githubusercontent.com/core-aix/agitrack/main/docs/images/vs-code-with-extension.png)
 
 
 ## Usage
@@ -165,7 +178,7 @@ A session's committed work reaches your directory through integration, but files
 
 - The offer appears when a turn finishes, **whether or not it produced a commit** — a turn that only touches ignored files stages nothing, yet those files may still need to come across.
 - Files whose name starts with `_` or `.` are treated as generated/hidden scaffolding (`__pycache__`, `.venv`, `.env`, editor dotfiles) and are **never** offered; if a turn changed only such files, you aren't asked at all.
-- Each file is tracked by a content fingerprint, so a file you choose to leave isn't offered again until it changes. If copying a file would overwrite one that already exists in the base directory, aGiTrack asks again per file before replacing it.
+- Each file is tracked by a content fingerprint, so a file you choose to leave isn't offered again until it changes. If any of the files would overwrite ones that already exist in the base directory, aGiTrack asks up front whether to **overwrite them all**, **keep the base versions** (skip just those — the new files still copy), or **confirm each one** individually.
 - If you decline, the files stay in the worktree and aGiTrack tells you **where** (the worktree path is spelled out) and reminds you that the worktree is removed when aGiTrack exits or the session integrates — so copy out anything you want to keep.
 
 #### Per-session merge branches
@@ -336,7 +349,7 @@ scripts/demo.sh --model haiku --dir /tmp/agitrack-demo
 
 ### Editor integration
 
-A VSCode extension in [`editors/vscode/`](editors/vscode/) lets you **install aGiTrack as a VSCode plugin and launch it inside VSCode with one click** — without opening a terminal and typing `agitrack` yourself. It's a thin launcher: a brand-icon button in the editor toolbar (or the `aGiTrack:` Command Palette commands) runs the real aGiTrack CLI in a VSCode terminal, so you get the **complete experience** (the agent's native interface, the `Ctrl-G` command menu, sessions, sharing, worktrees, per-turn auto-commits — everything proxy mode does). It also installs the aGiTrack CLI on first use if it's missing, works over Remote-SSH / WSL / containers (running where the code lives), and routes the dashboard to your local browser. The TypeScript side isn't built by the Python CI — see its README to build (`npm install && npm run compile`), run it (F5 → "Run Extension"), package a `.vsix` (`npm run package`), or publish to the Marketplace (`npm run publish`, needs the maintainer's publisher token).
+The VSCode extension — on the [Marketplace](https://marketplace.visualstudio.com/items?itemName=core-aix.agitrack-vscode), source in [`editors/vscode/`](editors/vscode/) — lets you **install aGiTrack as a VSCode plugin and launch it inside VSCode with one click** — without opening a terminal and typing `agitrack` yourself. It's a thin launcher: a brand-icon button in the editor toolbar (or the `aGiTrack:` Command Palette commands) runs the real aGiTrack CLI in a VSCode terminal, so you get the **complete experience** (the agent's native interface, the `Ctrl-G` command menu, sessions, sharing, worktrees, per-turn auto-commits — everything proxy mode does). It also installs the aGiTrack CLI on first use if it's missing, works over Remote-SSH / WSL / containers (running where the code lives), and routes the dashboard to your local browser. The TypeScript side isn't built by the Python CI — see its README to build (`npm install && npm run compile`), run it (F5 → "Run Extension"), package a `.vsix` (`npm run package`), or publish to the Marketplace (`npm run publish`, needs the maintainer's publisher token).
 
 ### Forwarding arguments to the backend
 
@@ -391,7 +404,7 @@ User-wide settings live in `~/.agitrack/config.json` (override the directory wit
 
 `default_backend` (`opencode` or `claude`) is used for repositories that have no backend recorded yet. It is updated whenever you pass `--backend` or switch backends with `agent-backend`.
 
-`sandbox` (default `true`) confines the agent's writes to its own session worktree (via `sandbox-exec` on macOS), keeping the base repository and sibling worktrees read-only to the agent. Set it to `false` to disable confinement; when sandboxing is unavailable, aGiTrack instead warns when the base repository is edited while a session runs.
+`sandbox` (default `true`) confines the agent's writes to its own session worktree (via `sandbox-exec` on macOS and `bubblewrap` on Linux), keeping the base repository and sibling worktrees read-only to the agent. The backend agent's own install/update directories stay writable, so the agent (Claude Code or OpenCode) can still update itself in place while running under aGiTrack. Set it to `false` to disable confinement; when sandboxing is unavailable, aGiTrack instead warns when the base repository is edited while a session runs.
 
 `use_worktrees` (default `true`) controls whether sessions run in isolated worktrees. Set it to `false` to run the agent directly on the current branch by default — the same behavior as `--no-worktree`, which applies it for a single run. See the `--no-worktree` notes under Usage for the trade-offs.
 

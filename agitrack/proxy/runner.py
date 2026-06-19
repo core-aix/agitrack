@@ -5889,8 +5889,12 @@ class ProxyRunner:
             return
 
         if name == "git-user-commit":
-            created = self._create_user_commit_popup(repo=self.base_repo, state=self._user_state())
-            self._set_message("Created user commit." if created else "No staged user changes to commit.")
+            created = self._create_user_commit_popup(
+                repo=self.base_repo, state=self._user_state(), include_declined=True
+            )
+            self._set_message(
+                "Committed your changes to the base repo." if created else "No changes to commit in the base repo."
+            )
             self._reload_user_declined()
             self._render()
             return
@@ -6101,17 +6105,28 @@ class ProxyRunner:
             return ""
         return self._run_modal(SelectModal(title, options))
 
-    def _create_user_commit_popup(self, *, repo: GitRepo | None = None, state: AgitrackState | None = None) -> bool:
+    def _create_user_commit_popup(
+        self,
+        *,
+        repo: GitRepo | None = None,
+        state: AgitrackState | None = None,
+        include_declined: bool = False,
+    ) -> bool:
         # Defaults to the active worktree (capturing uncommitted worktree changes
         # before the next prompt). The user-facing `git-user-commit` command passes
         # the base repo/state instead, since the user's own edits live there.
+        # ``include_declined`` re-offers every untracked (added-but-unstaged) file at the
+        # stage prompt — used for the base-repo paths, where the user is explicitly
+        # committing, so a file is always offer-able and never permanently un-stageable.
+        # The automatic worktree capture keeps it False so the agent's own untracked
+        # decline still sticks.
         on_worktree = repo is None
         repo = repo or self.repo
         state = state or self.state
         if on_worktree:
             self._ensure_turn_branch()  # turn branches are a worktree concept only
         repo.add_tracked()
-        self._review_untracked_popup(include_declined=False, repo=repo, state=state)
+        self._review_untracked_popup(include_declined=include_declined, repo=repo, state=state)
         if not repo.has_staged_changes():
             return False
         message = ""
@@ -6886,8 +6901,12 @@ class ProxyRunner:
                 self._set_message("aGiTrack is checking existing git changes before sending your prompt...", seconds=60)
                 self._render()
                 return False
+        # Commit the user's own uncommitted work before the agent runs, from whichever
+        # tree holds it: this session's worktree (the agent's tree) and/or the base repo
+        # (your working directory) — both, when both are dirty. The base commit is then
+        # merged into the worktree so the agent starts from your edits.
         if self.actions.has_pre_agent_user_changes():
-            self._set_message("User changes detected before agent runs.")
+            self._set_message("Uncommitted changes in this session's worktree — committing them before the agent runs.")
             self._render()
             self._create_user_commit_popup()
         self._commit_base_user_edits_if_needed()
@@ -6968,17 +6987,24 @@ class ProxyRunner:
     def _base_user_edits_pending(self) -> bool:
         # The user's own edits land in the BASE repo's working tree (the session
         # worktree is the agent's sandbox), so the worktree-side pre-agent check
-        # never sees them. Detect tracked modifications, or new files the user
-        # has not already declined, so they can be committed and synced into the
-        # worktree before the agent runs.
+        # never sees them. Any uncommitted change there — tracked edit OR new
+        # (non-ignored) file — counts, so it can be committed and synced into the
+        # worktree before the agent runs. Re-prompt nagging is avoided by the
+        # fingerprint gate in `_commit_base_user_edits_if_needed` (decline is
+        # remembered until the base tree changes again), NOT by permanently
+        # excluding a once-declined file — which used to strand it (the user could
+        # never get it committed/synced through aGiTrack).
         base = self.base_repo
         if base is None or self.worktree is None:
             return False
         try:
-            if base.has_tracked_changes():
-                return True
-            declined = set(self._user_state().declined_untracked())
-            return any(path not in declined for path in base.untracked_files())
+            # Any uncommitted work counts: a tracked-file edit, OR a new untracked
+            # (added-but-unstaged) file — `untracked_files()` lists those (and already
+            # excludes aGiTrack's own `.agitrack/`). The user is offered to stage and
+            # commit it; a "don't stage" answer only suppresses re-prompting for the
+            # same tree state via the fingerprint gate, never permanently, so a file is
+            # always offer-able.
+            return base.has_tracked_changes() or bool(base.untracked_files())
         except Exception as error:
             self._debug(f"base user-edit check failed: {error!r}")
             return False
@@ -6994,9 +7020,12 @@ class ProxyRunner:
         status = self._base_edits_fingerprint()
         if status is not None and status == self._base_edits_declined_status:
             return  # already declined for this exact state; don't nag every prompt
-        self._set_message("User changes detected in the base repo before agent runs.")
+        self._set_message(
+            "Uncommitted changes in the base repo (your working directory) — committing them onto "
+            "the base branch and syncing them into this session's worktree so the agent sees them."
+        )
         self._render()
-        if self._create_user_commit_popup(repo=self.base_repo, state=self._user_state()):
+        if self._create_user_commit_popup(repo=self.base_repo, state=self._user_state(), include_declined=True):
             self._base_edits_declined_status = None
             self._reload_user_declined()
             # Reflect the new base commit into the session worktrees now — before
@@ -7453,18 +7482,39 @@ class ProxyRunner:
         if choice is None or choice.startswith("No"):
             self._notice_files_remain(wt_dir, [rel for rel, _ in fresh])
             return
+        # Files that would overwrite something already in the base are handled in one
+        # up-front choice: overwrite them all, keep them all (the new files still copy),
+        # or confirm each one individually.
+        conflicts = [rel for rel, _ in fresh if (base_dir / rel).exists()]
+        overwrite_mode = "all"  # no conflicts → moot
+        if conflicts:
+            preview = ", ".join(conflicts[:5]) + (" …" if len(conflicts) > 5 else "")
+            answer = self._select_popup(
+                f"{len(conflicts)} of these already exist in the base repo ({preview}). Overwrite them?",
+                ["No, keep the base versions", "Yes, overwrite all", "Let me confirm each one"],
+            )
+            if answer == "Yes, overwrite all":
+                overwrite_mode = "all"
+            elif answer == "Let me confirm each one":
+                overwrite_mode = "each"
+            else:  # "No, keep the base versions" or cancelled
+                overwrite_mode = "none"
         remained: list[str] = []
         copied = 0
         for rel, _ in fresh:
             src, dst = wt_dir / rel, base_dir / rel
             if dst.exists():
-                overwrite = self._select_popup(
-                    f"'{rel}' already exists in the base repo. Overwrite it?",
-                    ["No, keep the base version", "Yes, overwrite"],
-                )
-                if overwrite != "Yes, overwrite":
-                    remained.append(rel)
+                if overwrite_mode == "none":
+                    remained.append(rel)  # keep all base versions
                     continue
+                if overwrite_mode == "each":
+                    per = self._select_popup(
+                        f"'{rel}' already exists in the base repo. Overwrite it?",
+                        ["No, keep the base version", "Yes, overwrite"],
+                    )
+                    if per != "Yes, overwrite":
+                        remained.append(rel)
+                        continue
             try:
                 if src.is_dir():  # a wholly-ignored directory, reported as `dir/`
                     shutil.copytree(src, dst, dirs_exist_ok=True)
@@ -7530,8 +7580,8 @@ class ProxyRunner:
         listing = ", ".join(files[:5]) + (" …" if len(files) > 5 else "")
         self._set_message(
             f"{len(files)} file(s) left in this session's worktree: {listing}. They're available at "
-            f"{wt_dir} for now, but the worktree is removed when aGiTrack exits (or the session "
-            f"integrates), so copy out anything you want to keep.",
+            f"{wt_dir} for now, but **the worktree is removed when aGiTrack exits or the session "
+            f"integrates,** so copy out anything you want to keep.",
             seconds=15.0,
         )
         self._render()

@@ -123,6 +123,41 @@ def test_status_line_stays_one_line_at_any_width(cols):
     assert len(visible) <= cols  # clamped to the terminal width
 
 
+@pytest.mark.parametrize("inner", [20, 30, 50, 80])
+def test_wrap_markup_bolds_without_breaking_box_width(inner):
+    # A popup line carrying **bold** markup must wrap to the box's inner width using the
+    # *visible* text only: every rendered row is padded to exactly `inner` visible
+    # columns (escapes carry no width), the `**` markers never leak as literal text, and
+    # the bold run is emitted with SGR — reopened on each row it spans across a wrap.
+    from agitrack.proxy.renderer import _wrap_markup
+
+    line = (
+        "Some files were left in the worktree. "
+        "**the worktree is removed when aGiTrack exits or the session integrates,** "
+        "so copy out anything you want to keep."
+    )
+    rows = _wrap_markup(line, inner)
+
+    assert rows  # produced at least one row
+    for row in rows:
+        assert "**" not in row  # markers consumed, never shown literally
+        assert len(_visible(row)) == inner  # padded to the box width exactly
+    joined = "".join(rows)
+    assert "\x1b[1m" in joined and "\x1b[22m" in joined  # bold opened and closed
+    # Bold opens and closes are balanced across however many rows it spans.
+    assert joined.count("\x1b[1m") == joined.count("\x1b[22m")
+
+
+def test_wrap_markup_only_bolds_the_marked_run():
+    # Text outside the markers stays plain; only the marked words are bold.
+    from agitrack.proxy.renderer import _wrap_markup
+
+    [row] = _wrap_markup("keep this **bold part** plain", 60)
+    assert row.startswith("keep this ")  # leading text is not bold
+    assert "\x1b[1mbold part\x1b[22m" in row  # exactly the marked words are bold
+    assert _visible(row).rstrip() == "keep this bold part plain"
+
+
 def test_truecolor_sgr_preserved_in_truecolor_mode(tmp_path):
     runner = _render_runner(tmp_path, color_mode="truecolor")
     rendered = _feed_and_render(runner, b"\x1b[38;2;255;128;0mORANGE\x1b[0m\r\n")
