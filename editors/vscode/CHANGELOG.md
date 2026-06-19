@@ -8,6 +8,8 @@ matches the `agitrack` release it launches.
 
 Launch the full aGiTrack terminal application from VSCode — no terminal typing.
 
+- The graceful-exit reminder now opens with **"When exiting aGiTrack later…"** so it
+  can't be misread, at startup, as aGiTrack exiting immediately.
 - **Fixed: the aG button stopped opening a new session after a previous one stopped.**
   aGiTrack only auto-closes its terminal on a clean exit (`… && exit`); a non-zero exit
   leaves the shell open, so the terminal lingered in the tracking map and the aG button
