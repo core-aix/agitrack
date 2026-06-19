@@ -1,0 +1,291 @@
+"""Settings: the repo-local overlay on GlobalConfig and the Ctrl-G settings menu.
+
+The overlay lets a setting be written for a single repository (its
+``.agitrack/config.json``) and take precedence over the global file. The menu edits
+any config option as a PENDING change (each picking repo-local vs global), writing them
+only when the user confirms "save" on close. Esc goes up one level at every step.
+"""
+
+from __future__ import annotations
+
+import json
+
+from agitrack.config.settings import GlobalConfig
+
+from proxy_helpers import make_runner
+
+
+def _config(tmp_path):
+    gc = GlobalConfig(path=tmp_path / "global" / "config.json")
+    gc.load_repo_overlay(tmp_path / "repo")
+    return gc
+
+
+# --- repo-local overlay -----------------------------------------------------
+
+
+def test_repo_overlay_overrides_global(tmp_path):
+    gc = _config(tmp_path)
+    gc.set("sandbox", False, scope="global")
+    assert gc.sandbox is False and gc.source("sandbox") == "global"
+    gc.set("sandbox", True, scope="repo")  # repo wins
+    assert gc.sandbox is True and gc.source("sandbox") == "repo"
+    # The repo value lives in the repo file; the global file keeps its own.
+    assert json.loads((tmp_path / "repo" / ".agitrack" / "config.json").read_text())["sandbox"] is True
+    assert json.loads((tmp_path / "global" / "config.json").read_text())["sandbox"] is False
+
+
+def test_unset_repo_reveals_global(tmp_path):
+    gc = _config(tmp_path)
+    gc.set("use_worktrees", False, scope="global")
+    gc.set("use_worktrees", True, scope="repo")
+    assert gc.use_worktrees is True
+    gc.unset("use_worktrees", scope="repo")
+    assert gc.use_worktrees is False and gc.source("use_worktrees") == "global"
+
+
+def test_save_repo_preserves_other_keys(tmp_path):
+    # The repo config.json is shared with AgitrackState (summarization etc.); writing a
+    # setting must not clobber unrelated keys already in the file.
+    repo_cfg = tmp_path / "repo" / ".agitrack" / "config.json"
+    repo_cfg.parent.mkdir(parents=True)
+    repo_cfg.write_text(json.dumps({"summarization_enabled": False, "trace_turn_limit": 9}))
+    gc = _config(tmp_path)
+    gc.set("sandbox", False, scope="repo")
+    data = json.loads(repo_cfg.read_text())
+    assert data == {"summarization_enabled": False, "trace_turn_limit": 9, "sandbox": False}
+
+
+def test_allowed_edit_paths_parsing(tmp_path):
+    gc = _config(tmp_path)
+    gc.set("allowed_edit_paths", ["/a", "/b"], scope="repo")
+    assert gc.allowed_edit_paths == ["/a", "/b"]
+    # A hand-written ":"-joined string is tolerated.
+    gc.set("allowed_edit_paths", "/x:/y", scope="global")
+    gc.unset("allowed_edit_paths", scope="repo")
+    assert gc.allowed_edit_paths == ["/x", "/y"]
+
+
+# --- settings menu ----------------------------------------------------------
+
+
+def _settings_runner(tmp_path):
+    runner = make_runner()
+    runner.global_config = _config(tmp_path)
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda *a, **k: None
+    return runner
+
+
+def _drive(runner, steps):
+    """Drive _select_popup/_prompt_popup with a scripted list of (title-substring, fn)."""
+    it = iter(steps)
+
+    def select(title, options, **k):
+        key, fn = next(it)
+        assert key in title, f"expected step '{key}', got popup '{title}'"
+        return fn(options) if callable(fn) else fn
+
+    def prompt(title, body, *, default=""):
+        key, fn = next(it)
+        assert key in title, f"expected step '{key}', got prompt '{title}'"
+        return fn(default) if callable(fn) else fn
+
+    runner._select_popup = select
+    runner._prompt_popup = prompt
+
+
+# Edits are PENDING until the user confirms "save" when closing. Each edit picks its own
+# scope (repo / global) via the "Apply '<label>' to:" prompt; closing with unsaved changes
+# asks Yes/No/Keep editing. Esc goes up one level (value→list, scope→value, list→close).
+
+
+def test_settings_menu_saves_bool_to_repo(tmp_path):
+    runner = _settings_runner(tmp_path)
+    assert runner.global_config.commit_guidance is True
+    _drive(
+        runner,
+        [
+            ("Settings", lambda opts: next(o for o in opts if o.startswith("Ask the agent"))),
+            ("Ask the agent", "Turn OFF"),
+            ("Apply", lambda opts: next(o for o in opts if o.startswith("This repository"))),
+            ("Settings", lambda opts: next(o for o in opts if o.startswith("← Close"))),  # close → save prompt
+            ("unsaved settings change", "Yes, save them"),
+        ],
+    )
+    runner._settings_menu()
+    assert runner.global_config.commit_guidance is False
+    assert runner.global_config.source("commit_guidance") == "repo"
+
+
+def test_settings_menu_saves_choice_to_global(tmp_path):
+    runner = _settings_runner(tmp_path)
+    _drive(
+        runner,
+        [
+            ("Settings", lambda opts: next(o for o in opts if o.startswith("Default coding agent"))),
+            ("Default coding agent", "claude"),
+            ("Apply", lambda opts: next(o for o in opts if o.startswith("Global"))),
+            ("Settings", lambda opts: next(o for o in opts if o.startswith("← Close"))),
+            ("unsaved settings change", "Yes, save them"),
+        ],
+    )
+    runner._settings_menu()
+    assert runner.global_config.default_backend == "claude"
+    assert runner.global_config.source("default_backend") == "global"
+
+
+def test_settings_menu_discard_on_close_writes_nothing(tmp_path):
+    # Change a setting, then choose "No, discard" at the close prompt → nothing persists.
+    runner = _settings_runner(tmp_path)
+    _drive(
+        runner,
+        [
+            ("Settings", lambda opts: next(o for o in opts if o.startswith("Confine the agent"))),
+            ("Confine the agent", "Turn OFF"),
+            ("Apply", lambda opts: next(o for o in opts if o.startswith("Global"))),
+            ("Settings", lambda opts: next(o for o in opts if o.startswith("← Close"))),
+            ("unsaved settings change", "No, discard them"),
+        ],
+    )
+    runner._settings_menu()
+    assert runner.global_config.source("sandbox") == "default"  # nothing written
+
+
+def test_settings_menu_esc_in_editor_returns_to_list(tmp_path):
+    # Esc in the value editor goes up ONE level (back to the list), it does NOT quit the menu.
+    runner = _settings_runner(tmp_path)
+    lists_shown = []
+
+    def select(title, options, **k):
+        if "Settings" in title:
+            lists_shown.append(True)
+            if len(lists_shown) == 1:
+                return next(o for o in options if o.startswith("Confine the agent"))  # open editor
+            return next(o for o in options if o.startswith("← Close"))  # second visit → close
+        return None  # Esc in the editor (and the empty close → no pending, just closes)
+
+    runner._select_popup = select
+    runner._settings_menu()
+    assert lists_shown == [True, True]  # list re-shown after Esc in the editor
+    assert runner.global_config.source("sandbox") == "default"  # nothing changed
+
+
+def test_settings_menu_esc_in_scope_returns_to_value(tmp_path):
+    # Esc at the scope prompt goes up one level — back to the value editor, not the list.
+    runner = _settings_runner(tmp_path)
+    value_prompts = []
+
+    def select(title, options, **k):
+        if "Settings" in title:
+            if value_prompts:  # second visit to the list → close (no pending kept)
+                return next(o for o in options if o.startswith("← Close"))
+            return next(o for o in options if o.startswith("Default coding agent"))
+        if "Apply" in title:  # the scope prompt embeds the label, so check it first
+            return None  # Esc at scope → re-edit the value
+        if "Default coding agent" in title:
+            value_prompts.append(True)
+            return "claude" if len(value_prompts) == 1 else "← Back"  # re-offered after scope Esc
+        return None
+
+    runner._select_popup = select
+    runner._settings_menu()
+    assert len(value_prompts) == 2  # value editor shown again after Esc at the scope prompt
+    assert runner.global_config.source("default_backend") == "default"  # never saved
+
+
+def test_settings_menu_edits_allowed_paths(tmp_path):
+    runner = _settings_runner(tmp_path)
+    _drive(
+        runner,
+        [
+            ("Settings", lambda opts: next(o for o in opts if o.startswith("Extra folders/files"))),
+            ("Extra folders/files", lambda default: "/data/shared:/srv/x"),
+            ("Apply", lambda opts: next(o for o in opts if o.startswith("This repository"))),
+            ("Settings", lambda opts: next(o for o in opts if o.startswith("← Close"))),
+            ("unsaved settings change", "Yes, save them"),
+        ],
+    )
+    runner._settings_menu()
+    # Saved to config; it takes effect on the next launch (no live runtime mutation).
+    assert runner.global_config.allowed_edit_paths == ["/data/shared", "/srv/x"]
+
+
+def test_settings_timings_submenu_saves(tmp_path):
+    runner = _settings_runner(tmp_path)
+    # Drive the whole menu so the close → save prompt actually writes the pending timing.
+    _drive(
+        runner,
+        [
+            ("Settings", lambda opts: next(o for o in opts if o.startswith("Polling & debounce"))),
+            ("Timings", lambda opts: next(o for o in opts if o.startswith("file_stable_seconds"))),
+            ("file_stable_seconds", lambda default: "12"),
+            ("Apply", lambda opts: next(o for o in opts if o.startswith("Global"))),
+            ("Timings", "← Back"),  # back to the settings list
+            ("Settings", lambda opts: next(o for o in opts if o.startswith("← Close"))),
+            ("unsaved settings change", "Yes, save them"),
+        ],
+    )
+    runner._settings_menu()
+    assert runner.global_config.timings["file_stable_seconds"] == 12.0
+
+
+def test_settings_restart_setting_warns_to_restart(tmp_path):
+    runner = _settings_runner(tmp_path)
+    msgs: list[str] = []
+    runner._set_message = lambda m, **k: msgs.append(m)
+    _drive(
+        runner,
+        [
+            ("Settings", lambda opts: next(o for o in opts if o.startswith("Confine the agent"))),  # sandbox (restart)
+            ("Confine the agent", "Turn OFF"),
+            ("Apply", lambda opts: next(o for o in opts if o.startswith("Global"))),
+            ("Settings", lambda opts: next(o for o in opts if o.startswith("← Close"))),
+            ("unsaved settings change", "Yes, save them"),
+        ],
+    )
+    runner._settings_menu()
+    assert any("restart aGiTrack yourself" in m for m in msgs)
+
+
+def test_settings_live_setting_has_no_restart_warning(tmp_path):
+    runner = _settings_runner(tmp_path)
+    msgs: list[str] = []
+    runner._set_message = lambda m, **k: msgs.append(m)
+    _drive(
+        runner,
+        [
+            # check_for_updates is read live, so changing it takes effect immediately.
+            ("Settings", lambda opts: next(o for o in opts if o.startswith("Automatically check"))),
+            ("Automatically check", "Turn OFF"),
+            ("Apply", lambda opts: next(o for o in opts if o.startswith("Global"))),
+            ("Settings", lambda opts: next(o for o in opts if o.startswith("← Close"))),
+            ("unsaved settings change", "Yes, save them"),
+        ],
+    )
+    runner._settings_menu()
+    assert any("Saved" in m for m in msgs)
+    assert not any("restart" in m.lower() for m in msgs)
+
+
+def test_settings_menu_esc_on_list_with_pending_prompts_save(tmp_path):
+    # Esc on the top list (rather than picking "← Close") still triggers the save prompt.
+    runner = _settings_runner(tmp_path)
+
+    def select(title, options, **k):
+        if "Settings" in title and runner._pending_count() == 0:
+            return next(o for o in options if o.startswith("Confine the agent"))
+        if "Confine the agent" in title:
+            return "Turn OFF"
+        if "Apply" in title:
+            return next(o for o in options if o.startswith("Global"))
+        if "Settings" in title:  # back on the list with a pending change → press Esc
+            return None
+        if "unsaved settings change" in title:
+            return "Yes, save them"
+        return None
+
+    runner._select_popup = select
+    runner._settings_menu()
+    assert runner.global_config.sandbox is False
+    assert runner.global_config.source("sandbox") == "global"

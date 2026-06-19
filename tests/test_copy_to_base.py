@@ -42,6 +42,7 @@ def _session_with_worktree(tmp_path):
     runner.base_repo = types.SimpleNamespace(repo=base.repo)
     runner.repo = wt
     runner.worktree = types.SimpleNamespace(name="sess", path=info.path)
+    runner._offer_user_commit_for_worktree_edits = lambda: None  # tested separately
     messages: list[str] = []
     runner._set_message = lambda m, **k: messages.append(m)
     runner._render = lambda *a, **k: None
@@ -61,7 +62,7 @@ def test_copies_untracked_and_ignored_skips_hidden_and_scaffolding(tmp_path):
     # Real git decides what's untracked vs ignored; only the offered set should appear.
     assert sorted(runner._uncommitted_worktree_files()) == ["builddir/", "ignored.txt", "result.txt"]
 
-    runner._select_popup = lambda title, opts: next(o for o in opts if o.startswith("Yes"))
+    runner._select_popup = lambda title, opts, **k: next(o for o in opts if o.startswith("Yes"))
     runner._offer_copy_unstaged_to_base()
 
     assert (base_dir / "result.txt").read_text(encoding="utf-8") == "KEEP-ME\n"
@@ -88,7 +89,7 @@ def test_only_hidden_or_scaffolding_changed_prompts_nothing(tmp_path):
 def test_decline_notice_gives_worktree_path_and_deletion_warning(tmp_path):
     runner, base_dir, wt_dir, messages = _session_with_worktree(tmp_path)
     (wt_dir / "keep.txt").write_text("x\n", encoding="utf-8")
-    runner._select_popup = lambda title, opts: "No, leave them in the worktree"
+    runner._select_popup = lambda title, opts, **k: "No, leave them in the worktree"
 
     runner._offer_copy_unstaged_to_base()
 
@@ -105,7 +106,7 @@ def test_overwrite_is_confirmed_before_replacing_base_files(tmp_path):
     (base_dir / "dup.txt").write_text("OLD\n", encoding="utf-8")
     # Consent to copy, then decline the (single) overwrite confirmation → base version survives.
     answers = iter(["Yes, copy to the base repo", "No, keep the base versions"])
-    runner._select_popup = lambda title, opts: next(answers)
+    runner._select_popup = lambda title, opts, **k: next(answers)
 
     runner._offer_copy_unstaged_to_base()
 
@@ -115,10 +116,10 @@ def test_overwrite_is_confirmed_before_replacing_base_files(tmp_path):
 def test_unchanged_declined_file_is_not_reprompted(tmp_path):
     runner, _base_dir, wt_dir, _ = _session_with_worktree(tmp_path)
     (wt_dir / "again.txt").write_text("y\n", encoding="utf-8")
-    runner._select_popup = lambda title, opts: "No, leave them in the worktree"
+    runner._select_popup = lambda title, opts, **k: "No, leave them in the worktree"
     runner._offer_copy_unstaged_to_base()
 
     seen: list = []
-    runner._select_popup = lambda title, opts: seen.append(title) or None
+    runner._select_popup = lambda title, opts, **k: seen.append(title) or None
     runner._offer_copy_unstaged_to_base()  # same file, unchanged
     assert seen == []  # fingerprint dedup: not offered again until it changes

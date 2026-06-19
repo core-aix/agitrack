@@ -158,6 +158,41 @@ def test_wrap_markup_only_bolds_the_marked_run():
     assert _visible(row).rstrip() == "keep this bold part plain"
 
 
+def test_wrap_markup_breaks_a_long_unspaced_path():
+    # A single token longer than the row (e.g. a long path with no spaces) must break
+    # across rows instead of overflowing the box; every row fits the inner width exactly.
+    from agitrack.proxy.renderer import _wrap_markup
+
+    inner = 24
+    path = "/Users/someone/Code/agitrack/.agitrack/worktrees/session-1/very/deep/file.py"
+    rows = _wrap_markup(f"Saved to **{path}** now", inner)
+    assert len(rows) > 1  # the path forced a wrap
+    for row in rows:
+        assert len(_visible(row)) == inner  # padded/clamped to the box, never overflowing
+    # The path's characters all survive across the wrapped rows (nothing truncated).
+    assert path.replace("/", "") in _visible("".join(rows)).replace("/", "").replace(" ", "")
+
+
+def test_append_box_scrolls_a_message_taller_than_the_screen(tmp_path):
+    # A message with more lines than the terminal must not be silently truncated: it
+    # windows with ↑/↓ "more" hints, and the scroll offset moves the window.
+    from agitrack.proxy.renderer import ScreenRenderer
+
+    runner = _render_runner(tmp_path, rows=10, cols=60)
+    message = "\n".join(f"line-{i}" for i in range(40))
+
+    parts: list[str] = []
+    ScreenRenderer.append_message_popup(runner, parts, message, rows=10, cols=60, scroll=0)
+    top = "".join(parts)
+    assert "line-0" in top and "more below" in top  # top of the message + a hint
+    assert runner._message_max_scroll > 0  # render recorded that it overflows
+
+    parts2: list[str] = []
+    ScreenRenderer.append_message_popup(runner, parts2, message, rows=10, cols=60, scroll=runner._message_max_scroll)
+    bottom = "".join(parts2)
+    assert "line-39" in bottom and "more above" in bottom  # scrolled to the end
+
+
 def test_truecolor_sgr_preserved_in_truecolor_mode(tmp_path):
     runner = _render_runner(tmp_path, color_mode="truecolor")
     rendered = _feed_and_render(runner, b"\x1b[38;2;255;128;0mORANGE\x1b[0m\r\n")

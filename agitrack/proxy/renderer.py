@@ -44,6 +44,17 @@ def _wrap_markup(line: str, inner: int) -> list[str]:
     current: list[tuple[str, bool]] = []
     used = 0
     for word, bold in _markup_words(line):
+        # Break a single token longer than the row (e.g. a long path with no spaces) so it
+        # wraps within the box instead of spilling past the border. textwrap handles this
+        # for plain lines; the markup path must do it explicitly.
+        while len(word) > inner:
+            if current:
+                rows.append(current)
+                current, used = [], 0
+            rows.append([(word[:inner], bold)])
+            word = word[inner:]
+        if not word:
+            continue
         extra = len(word) + (1 if current else 0)
         if current and used + extra > inner:
             rows.append(current)
@@ -254,6 +265,9 @@ class RendererHost(Protocol):
     _render_pending: bool
     _in_sync_update: bool
     _sync_since: float
+    # How far the current popup message can still scroll (0 = it fits on screen); set
+    # during render so the input loop knows whether PgUp/PgDn should scroll the message.
+    _message_max_scroll: int
 
     # Renderer methods invoked on ``self`` from sibling methods
     def cell_sgr(self, cell) -> str: ...
@@ -275,7 +289,10 @@ class RendererHost(Protocol):
         highlight: str | None = ...,
         *,
         rows: int,
+        scrollable: bool = ...,
+        scroll: int = ...,
     ) -> None: ...
+    def wrapped_message_height(self, lines: list[str], cols: int) -> int: ...
     def append_command_palette(
         self,
         parts: list[str],
@@ -286,7 +303,9 @@ class RendererHost(Protocol):
         input_matches: list[str],
         input_selected: str | None,
     ) -> None: ...
-    def append_message_popup(self, parts: list[str], message: str, *, rows: int, cols: int) -> None: ...
+    def append_message_popup(
+        self, parts: list[str], message: str, *, rows: int, cols: int, scroll: int = ...
+    ) -> None: ...
 
 
 # ---------------------------------------------------------------------------
@@ -663,6 +682,8 @@ class ScreenRenderer:
         highlight: str | None = None,
         *,
         rows: int,
+        scrollable: bool = False,
+        scroll: int = 0,
     ) -> None:
         inner = max(width - 2, 1)
         border_top = "┌" + "─" * inner + "┐"
@@ -678,6 +699,15 @@ class ScreenRenderer:
             else:
                 wrapped_lines.extend((w, False) for w in (textwrap.wrap(line, width=inner) or [""]))
         max_body = max(rows - row - 2, 1)
+        # When the caller owns scrolling (a long message), window the wrapped rows so the
+        # whole thing is reachable instead of silently truncated, with ↑/↓ "more" hints.
+        if scrollable and len(wrapped_lines) > max_body:
+            body = max(1, max_body - 2)
+            start = max(0, min(scroll, len(wrapped_lines) - body))
+            head = [(f"↑ {start} more above", False)] if start > 0 else []
+            below = len(wrapped_lines) - start - body
+            tail = [(f"↓ {below} more below", False)] if below > 0 else []
+            wrapped_lines = head + wrapped_lines[start : start + body] + tail
         for line, pre_rendered in wrapped_lines[:max_body]:
             if pre_rendered:
                 box_lines.append("│" + line + "│")
@@ -709,7 +739,7 @@ class ScreenRenderer:
         header = [
             "aGiTrack commands",
             f"> {input_text}",
-            "Up/Down selects. Tab completes. Enter runs. Esc/Ctrl-C cancels.",
+            "Up/Down selects. Tab completes. Enter runs. Esc cancels.",
             "",
         ]
         # Size the match window to whatever fits below the header: append_box caps
@@ -737,11 +767,33 @@ class ScreenRenderer:
         *,
         rows: int,
         cols: int,
+        scroll: int = 0,
     ) -> None:
         width = min(max(52, cols // 2), cols - 4)
         row = 2
         col = max(2, (cols - width) // 2)
-        self.append_box(parts, row, col, width, message.splitlines() or [message], rows=rows)
+        lines = message.splitlines() or [message]
+        # Record how far this message can scroll so the input loop knows whether to treat
+        # PgUp/PgDn as message scrolling (0 = it fits, no scrolling needed). Must match
+        # append_box's windowing: it shows ``body = max_body - 2`` content rows (the other
+        # two are reserved for the ↑/↓ hints), so the last scroll position is height - body.
+        max_body = max(rows - row - 2, 1)
+        body = max(1, max_body - 2)
+        self._message_max_scroll = max(0, self.wrapped_message_height(lines, cols) - body)
+        self.append_box(parts, row, col, width, lines, rows=rows, scrollable=True, scroll=scroll)
+
+    def wrapped_message_height(self: RendererHost, lines: list[str], cols: int) -> int:
+        """Total wrapped row count a message occupies at the popup width — used to decide
+        whether it overflows the screen and therefore needs scrolling."""
+        width = min(max(52, cols // 2), cols - 4)
+        inner = max(width - 2, 1)
+        total = 0
+        for line in lines:
+            if _BOLD_MARKUP_RE.search(line):
+                total += len(_wrap_markup(line, inner))
+            else:
+                total += len(textwrap.wrap(line, width=inner) or [""])
+        return total
 
     # ------------------------------------------------------------------
     # Full-frame render
@@ -761,6 +813,7 @@ class ScreenRenderer:
         message: str | None,
         message_sticky: bool,
         message_until: float,
+        message_scroll: int = 0,
     ) -> None:
         if self.screen is None:
             return
@@ -784,7 +837,9 @@ class ScreenRenderer:
                 input_selected=input_selected,
             )
         elif message and (message_sticky or time.monotonic() < message_until):
-            self.append_message_popup(parts, message, rows=rows, cols=cols)
+            self.append_message_popup(parts, message, rows=rows, cols=cols, scroll=message_scroll)
+        else:
+            self._message_max_scroll = 0  # no message shown → nothing to scroll
         parts.append(self.cursor_sequence(rows, cols, scroll_back))
         parts.append("\x1b[?2026l")
         os.write(sys.stdout.fileno(), "".join(parts).encode())

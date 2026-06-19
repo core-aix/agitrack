@@ -200,8 +200,12 @@ class ProxyInput:
         "git-unstaged",
         "git-user-commit",
         "dashboard",
+        "settings",
         "update",
-        "exit",
+        # Reads "exit aGiTrack" so it is never mistaken for "exit the menu" (Esc does that).
+        # `_run_command` parses the command name from the first word, so the trailing word is
+        # ignored and "exit"/"quit" still work when typed directly.
+        "exit aGiTrack",
     ]
 
     def __init__(self, menu_key: bytes = b"\x07") -> None:
@@ -381,6 +385,8 @@ class ProxyRunner:
         commit_guidance: bool = True,
         full_agent_messages: bool = False,
         delay_merge: bool = False,
+        sandbox: bool = True,
+        allowed_edit_paths: list[str] | None = None,
         # Optional injected collaborators (default to production construction).
         # These keyword arguments are for testing and advanced use; the CLI call
         # site passes only the first five parameters and is unaffected.
@@ -398,6 +404,9 @@ class ProxyRunner:
         # (--no-commit-guidance / config turns it off). Appended to the agent's system prompt
         # where the backend supports it (Claude).
         self._commit_guidance = commit_guidance
+        # Effective sandbox settings (CLI flag wins over config; resolved in cli.py).
+        self._sandbox = sandbox
+        self._allowed_edit_paths = list(allowed_edit_paths or [])
         # Per-run override for the "include all agent messages" trace option
         # (--full-agent-messages). True forces it on for this run regardless of the
         # per-repo config; False (the default) defers to ``state.full_agent_messages``.
@@ -474,6 +483,10 @@ class ProxyRunner:
         self.last_status_change = 0.0
         self.message: str | None = None
         self.message_until = 0.0
+        # Scroll position of an over-tall popup message and how far it can scroll (set on
+        # render). 0/0 = the message fits, so PgUp/PgDn pass through to history scrolling.
+        self._message_scroll = 0
+        self._message_max_scroll = 0
         # Track whether we proactively enabled the kitty keyboard protocol for
         # shift-modified menu keys. Used for cleanup on exit.
         self._kitty_keyboard_enabled = False
@@ -574,9 +587,17 @@ class ProxyRunner:
         # offers the choice again if the changes are still sitting there.
         self._cancel_prompted: set[str] = set()
         # Worktree files we've already offered to copy into the base repo, keyed by
-        # repo-relative path → content fingerprint, so a file the user left in place
-        # is re-offered only once its content changes again (per-run, in-memory).
+        # repo-relative path → content fingerprint, so a file the user accepted/left in
+        # place is re-offered only once its content changes again (per-run, in-memory).
         self._copy_prompted: dict[str, tuple[int, int]] = {}
+        # Repo-relative paths the user declined to copy: muted so the SAME set isn't
+        # re-asked even as its contents change. A genuinely new path un-mutes the whole
+        # set (ask about all again); cleared on session switch and aGiTrack restart.
+        self._copy_declined: set[str] = set()
+        # Settings-menu scratch: edits collected as pending changes (each with its chosen
+        # scope) and written only when the user confirms "save" on the way out.
+        self._settings_pending: dict[str, tuple[object, str, bool]] = {}
+        self._settings_pending_timings: dict[str, tuple[float, str]] = {}
         # Lifecycle flags read before their first conditional assignment. These
         # MUST be initialized here: their getattr() guards were removed in P7,
         # and for_testing() seeding them alone would hide a missing init from
@@ -600,6 +621,9 @@ class ProxyRunner:
         self._relaunch_times: list[float] = []
         self._exiting = False
         self._finalized_on_exit = False
+        # Set when the user presses Esc on the on-exit copy offer: aborts the in-progress
+        # exit so they can deal with the worktree files themselves (see _run_exit_flow).
+        self._exit_aborted = False
         # The metrics dashboard, when started from the Ctrl-G menu, runs on a daemon
         # thread inside this process (read-only HTTP server) so the TUI keeps running;
         # shut down on exit. None until first started.
@@ -761,6 +785,8 @@ class ProxyRunner:
                 "_sync_since": 0.0,
                 "message": None,
                 "message_until": 0.0,
+                "_message_scroll": 0,
+                "_message_max_scroll": 0,
                 "_message_sticky": False,
                 "_session_notices": {},
                 "_notice_shown": False,
@@ -795,6 +821,9 @@ class ProxyRunner:
                 "_sessions_with_activity": set(),
                 "_cancel_prompted": set(),
                 "_copy_prompted": {},
+                "_copy_declined": set(),
+                "_settings_pending": {},
+                "_settings_pending_timings": {},
                 "_full_agent_messages": False,
                 "_delay_merge": False,
                 "_user_declined": [],
@@ -819,10 +848,13 @@ class ProxyRunner:
                 "_background_share_ops": [],
                 "_use_worktrees": True,
                 "_warned_parallel_no_worktree": False,
+                "_sandbox": True,
+                "_allowed_edit_paths": [],
                 "_commit_guidance": True,
                 "_relaunch_times": [],
                 "_exiting": False,
                 "_finalized_on_exit": False,
+                "_exit_aborted": False,
                 "_dashboard_server": None,
                 "_dashboard_thread": None,
                 "_dashboard_url": None,
@@ -1079,7 +1111,7 @@ class ProxyRunner:
         self._monitor_base_edits = False
         if self.worktree is None:
             return
-        if not (self.global_config.sandbox and sandbox.is_enabled()):
+        if not (self._sandbox and sandbox.is_enabled()):
             return  # user disabled confinement
         if sandbox.is_available():
             return  # the sandbox enforces it; nothing to monitor
@@ -1673,12 +1705,17 @@ class ProxyRunner:
         # then warns if the base working tree is touched).
         if self.worktree is None:
             return command
-        if not self.global_config.sandbox:
+        if not self._sandbox:
             return command
         base = self.base_repo
         if base is None:
             return command
-        return sandbox.wrap_command(command, base=str(base.repo), worktree=str(self.repo.repo))
+        return sandbox.wrap_command(
+            command,
+            base=str(base.repo),
+            worktree=str(self.repo.repo),
+            allowed_paths=self._allowed_edit_paths,
+        )
 
     def _should_continue_session(self) -> bool:
         session_id = self.state.backend_session_id
@@ -1782,8 +1819,6 @@ class ProxyRunner:
         # Otherwise start fresh, confirming the session name first.
         session_name = self._prompt_session_name(f"New {name} session", default=self._next_session_name())
         if session_name is None:
-            self._set_message("Cancelled.")
-            self._render()
             return
         self._new_session(session_name, backend=name)
 
@@ -2557,46 +2592,48 @@ class ProxyRunner:
         working = in_flight or (last and time.monotonic() - last < self.CHILD_IDLE_SECONDS)
         return "running" if working else "idle"
 
-    def _handle_session_command(self, arg: str) -> None:
+    def _handle_session_command(self, arg: str) -> str:
         # Ctrl-G then "sessions": manage the live concurrent sessions.
         arg = arg.strip()
         if arg in {"new", "fresh"}:
-            self._prompt_new_session()
-        elif arg.isdigit():
+            return self._prompt_new_session()
+        if arg.isdigit():
             self._switch_active(int(arg) - 1)
-        else:
-            self._session_menu()
+            return self._MENU_DONE
+        return self._session_menu()
 
-    def _handle_summarizer_command(self, arg: str) -> None:
+    def _handle_summarizer_command(self, arg: str) -> str:
         sub = arg.strip().lower()
         if sub in ("on", "off"):
             enabled = sub == "on"
             self._persist_summarizer_enabled(enabled)
             self._set_message(f"Summarizer {'enabled' if enabled else 'disabled'}.")
             self._render()
-            return
+            return self._MENU_DONE
         if sub == "model":
             self._select_summarizer_model_popup()
-            return
-        enabled = self._summarization_enabled()
-        model = self.state.summarization_model or self.global_config.summarization_model or "(same as session)"
-        choice = self._select_popup(
-            "Summarizer",
-            [
-                f"Toggle ({'ON' if enabled else 'OFF'})",
-                f"Set model (current: {model})",
-            ],
-        )
-        if choice is None:
+            return self._MENU_DONE
+        # Interactive menu: "Set model" opens the model picker, whose Esc returns here
+        # (one level up); Esc on this list goes up one level to the Ctrl-G palette.
+        while True:
+            enabled = self._summarization_enabled()
+            model = self.state.summarization_model or self.global_config.summarization_model or "(same as session)"
+            choice = self._select_popup(
+                "Summarizer",
+                [
+                    f"Toggle ({'ON' if enabled else 'OFF'})",
+                    f"Set model (current: {model})",
+                ],
+            )
+            if choice is None:  # Esc → up one level to the palette
+                self._render()
+                return self._MENU_UP
+            if choice.startswith("Toggle"):
+                self._persist_summarizer_enabled(not enabled)
+                self._set_message(f"Summarizer {'enabled' if not enabled else 'disabled'}.")
+            elif choice.startswith("Set model"):
+                self._select_summarizer_model_popup()
             self._render()
-            return
-        if choice.startswith("Toggle"):
-            self._persist_summarizer_enabled(not enabled)
-            self._set_message(f"Summarizer {'enabled' if not enabled else 'disabled'}.")
-        elif choice.startswith("Set model"):
-            self._handle_summarizer_command("model")
-            return
-        self._render()
 
     def _select_summarizer_model_popup(self) -> None:
         # List the current backend's models as a picker. For Claude the smallest
@@ -2688,8 +2725,6 @@ class ProxyRunner:
             options.append(label)
         choice = self._select_popup("Change the merge branch of which session?", options)
         if choice is None:
-            self._set_message("Cancelled.")
-            self._render()
             return
         index = label_for[choice]
         session = self.sessions[index]
@@ -2705,8 +2740,6 @@ class ProxyRunner:
         current = getattr(session, "_base_branch", None)
         target = self._prompt_merge_branch(f"Merge '{self._session_name(index)}' into which branch?", current)
         if not target:
-            self._set_message("Cancelled.")
-            self._render()
             return
         if target == current:
             self._set_message(f"'{self._session_name(index)}' already merges into '{target}'.")
@@ -2741,118 +2774,143 @@ class ProxyRunner:
         if new_turn is not None:
             self.turn = new_turn
 
-    def _session_menu(self) -> None:
-        options: list[str] = []
-        actions: list[tuple[str, object]] = []
-        if self.merge_ctx or (self.worktree is not None and self.repo.merge_in_progress()):
-            options.append("✓ Complete merge for this session")
-            actions.append(("complete-merge", None))
-        if not self.merge_ctx and self.worktree is not None and self._active_has_pending():
-            # The active session has committed work not yet in the base — offer an
-            # explicit, discoverable way to integrate it now (otherwise the only path
-            # is re-selecting the current session, which isn't obvious). Under
-            # --delay-merge this is the confirm point for reviewed changes; otherwise
-            # it surfaces leftover commits (e.g. from a session resumed at startup).
-            base = self._base_branch or "the base branch"
-            label = (
-                "✓ Merge reviewed changes into " if self._delay_merge else "✓ Integrate this session's commits into "
+    def _session_menu(self) -> str:
+        # One loop, two outcomes: Esc on the list → _MENU_UP (one level up to the Ctrl-G
+        # palette); a context transition (switch/new/resume/integrate) → _MENU_DONE (unwind
+        # to the agent). A configuration sub-action (rename, change merge branch, share,
+        # manage shared, stop) or a child menu the user backed out of falls through to
+        # ``continue``, re-showing this list so Esc inside it lands one level up here.
+        while True:
+            options: list[str] = []
+            actions: list[tuple[str, object]] = []
+            if self.merge_ctx or (self.worktree is not None and self.repo.merge_in_progress()):
+                options.append("✓ Complete merge for this session")
+                actions.append(("complete-merge", None))
+            if not self.merge_ctx and self.worktree is not None and self._active_has_pending():
+                # The active session has committed work not yet in the base — offer an
+                # explicit, discoverable way to integrate it now (otherwise the only path
+                # is re-selecting the current session, which isn't obvious). Under
+                # --delay-merge this is the confirm point for reviewed changes; otherwise
+                # it surfaces leftover commits (e.g. from a session resumed at startup).
+                base = self._base_branch or "the base branch"
+                label = (
+                    "✓ Merge reviewed changes into "
+                    if self._delay_merge
+                    else "✓ Integrate this session's commits into "
+                )
+                options.append(label + base)
+                actions.append(("integrate-active", None))
+            shared_ids = self._my_shared_session_ids()  # mark which sessions are shared (#55)
+            live_names = set()
+            for index, session in enumerate(self.sessions):
+                live_names.add(self._session_name(index))
+                marker = "* " if index == self.active_index else "  "
+                backend = getattr(getattr(session, "backend", None), "name", "?")
+                label = f"{marker}{self._session_name(index)} [{self._session_status(index)}] ({backend})"
+                merge_branch = getattr(session, "_base_branch", None)
+                if merge_branch:
+                    label += f" → {merge_branch}"  # the branch this session merges into
+                if index == self.active_index and not self.merge_ctx and self._active_has_pending():
+                    label += " — commits to integrate"
+                sid = getattr(getattr(session, "state", None), "backend_session_id", None)
+                # Recognise a shared session across resume id-drift (lineage-aware).
+                if sid and self._session_auto_shared(sid):
+                    label += " · ⇪ auto-share"
+                elif sid and self._session_is_shared(sid, shared_ids):
+                    label += " · ⇪ shared"
+                options.append(label)
+                actions.append(("switch", index))
+            for info in self._dormant_worktrees(live_names):
+                if self._dormant_has_pending(info):
+                    options.append(f"  {info.name} [unmerged changes — resolve]")
+                    actions.append(("resolve", info.name))
+                else:
+                    options.append(f"  {info.name} [idle — resume]")
+                    actions.append(("resume", info.name))
+            options.append(
+                "+ New session (own worktree)" if self._use_worktrees else "+ New session (shares this directory)"
             )
-            options.append(label + base)
-            actions.append(("integrate-active", None))
-        shared_ids = self._my_shared_session_ids()  # mark which sessions are shared (#55)
-        live_names = set()
-        for index, session in enumerate(self.sessions):
-            live_names.add(self._session_name(index))
-            marker = "* " if index == self.active_index else "  "
-            backend = getattr(getattr(session, "backend", None), "name", "?")
-            label = f"{marker}{self._session_name(index)} [{self._session_status(index)}] ({backend})"
-            merge_branch = getattr(session, "_base_branch", None)
-            if merge_branch:
-                label += f" → {merge_branch}"  # the branch this session merges into
-            if index == self.active_index and not self.merge_ctx and self._active_has_pending():
-                label += " — commits to integrate"
-            sid = getattr(getattr(session, "state", None), "backend_session_id", None)
-            # Recognise a shared session across resume id-drift (lineage-aware).
-            if sid and self._session_auto_shared(sid):
-                label += " · ⇪ auto-share"
-            elif sid and self._session_is_shared(sid, shared_ids):
-                label += " · ⇪ shared"
-            options.append(label)
-            actions.append(("switch", index))
-        for info in self._dormant_worktrees(live_names):
-            if self._dormant_has_pending(info):
-                options.append(f"  {info.name} [unmerged changes — resolve]")
-                actions.append(("resolve", info.name))
-            else:
-                options.append(f"  {info.name} [idle — resume]")
-                actions.append(("resume", info.name))
-        options.append(
-            "+ New session (own worktree)" if self._use_worktrees else "+ New session (shares this directory)"
-        )
-        actions.append(("new", None))
-        if self._use_worktrees and self.sessions:
-            options.append("")  # gap: separate session-creation from session-management
+            actions.append(("new", None))
+            if self._use_worktrees and self.sessions:
+                options.append("")  # gap: separate session-creation from session-management
+                actions.append(("separator", None))
+                options.append("✎ Rename a session")
+                actions.append(("rename", None))
+                options.append("⤳ Change a session's merge branch")
+                actions.append(("merge-branch", None))
+            if self._resumable_sessions():
+                options.append("↻ Resume a past conversation…")
+                actions.append(("resume-past", None))
+            # "Share" is offered for every backend so the user gets a clear answer;
+            # a backend without a portable transcript says so when chosen. "Resume a
+            # shared session" only appears where it can actually work.
+            options.append("")  # gap: set the sharing group apart
             actions.append(("separator", None))
-            options.append("✎ Rename a session")
-            actions.append(("rename", None))
-            options.append("⤳ Change a session's merge branch")
-            actions.append(("merge-branch", None))
-        if self._resumable_sessions():
-            options.append("↻ Resume a past conversation…")
-            actions.append(("resume-past", None))
-        # "Share" is offered for every backend so the user gets a clear answer;
-        # a backend without a portable transcript says so when chosen. "Resume a
-        # shared session" only appears where it can actually work.
-        options.append("")  # gap: set the sharing group apart
-        actions.append(("separator", None))
-        options.append("⇪ Share this session with collaborators…")
-        actions.append(("share", None))
-        if getattr(self.backend, "supports_session_sharing", False):
-            options.append("⇩ Resume a shared session…")
-            actions.append(("resume-shared", None))
-            options.append("⚙ Manage shared sessions…")
-            actions.append(("manage-shared", None))
-        if len(self.sessions) > 1:
-            options.append("- Stop a session")
-            actions.append(("stop", None))
-        choice = self._select_popup("Sessions", options)
-        if choice is None:
-            self._set_message("Cancelled.")
-            self._render()
-            return
-        kind, value = actions[options.index(choice)]
-        if kind == "switch":
-            assert isinstance(value, int)  # "switch" pairs with a session index
-            if value == self.active_index:
-                self._select_current_session()
+            options.append("⇪ Share this session with collaborators…")
+            actions.append(("share", None))
+            if getattr(self.backend, "supports_session_sharing", False):
+                options.append("⇩ Resume a shared session…")
+                actions.append(("resume-shared", None))
+                options.append("⚙ Manage shared sessions…")
+                actions.append(("manage-shared", None))
+            if len(self.sessions) > 1:
+                options.append("- Stop a session")
+                actions.append(("stop", None))
+            choice = self._select_popup("Sessions", options)
+            if choice is None:  # Esc → up one level (to the Ctrl-G palette), silently
+                return self._MENU_UP
+            kind, value = actions[options.index(choice)]
+            if kind == "separator":
+                continue  # the blank spacer row isn't an action; re-show the list
+            # Context transitions — these move you into a different session, so unwind to the agent.
+            if kind == "switch":
+                assert isinstance(value, int)  # "switch" pairs with a session index
+                if value == self.active_index:
+                    self._select_current_session()
+                else:
+                    self._switch_active(value)
+                return self._MENU_DONE
+            if kind == "integrate-active":
+                self._integrate_active_session()  # explicit "integrate now" for the active session
+                return self._MENU_DONE
+            if kind == "complete-merge":
+                self._finalize_agent_merge()
+                return self._MENU_DONE
+            if kind == "resolve":
+                assert isinstance(value, str)  # "resolve" pairs with a worktree name
+                self._resolve_dormant_worktree(value)
+                return self._MENU_DONE
+            if kind == "resume":
+                assert isinstance(value, str)  # "resume" pairs with a worktree name
+                self._new_session(value)
+                return self._MENU_DONE
+            if kind == "new":
+                if self._prompt_new_session() == self._MENU_DONE:
+                    return self._MENU_DONE
+                continue
+            # Sub-menus that may transition (resume) OR be backed out of: a transition
+            # unwinds to the agent; backing out re-shows this list (Esc lands here).
+            if kind == "resume-past":
+                if self._resume_session_menu() == self._MENU_DONE:
+                    return self._MENU_DONE
+                continue
+            if kind == "resume-shared":
+                if self._resume_shared_session_menu() == self._MENU_DONE:
+                    return self._MENU_DONE
+                continue
+            if kind == "manage-shared":
+                if self._manage_shared_sessions_menu() == self._MENU_DONE:
+                    return self._MENU_DONE
+                continue
+            # Configuration actions: run, then re-show this list (so their Esc lands here).
+            if kind == "rename":
+                self._rename_session_menu()
+            elif kind == "merge-branch":
+                self._change_session_merge_branch_menu()
+            elif kind == "share":
+                self._share_session()
             else:
-                self._switch_active(value)
-        elif kind == "resume-past":
-            self._resume_session_menu()
-        elif kind == "integrate-active":
-            self._integrate_active_session()  # explicit "integrate now" for the active session
-        elif kind == "complete-merge":
-            self._finalize_agent_merge()
-        elif kind == "resolve":
-            assert isinstance(value, str)  # "resolve" pairs with a worktree name
-            self._resolve_dormant_worktree(value)
-        elif kind == "resume":
-            assert isinstance(value, str)  # "resume" pairs with a worktree name
-            self._new_session(value)
-        elif kind == "new":
-            self._prompt_new_session()
-        elif kind == "rename":
-            self._rename_session_menu()
-        elif kind == "merge-branch":
-            self._change_session_merge_branch_menu()
-        elif kind == "share":
-            self._share_session()
-        elif kind == "resume-shared":
-            self._resume_shared_session_menu()
-        elif kind == "manage-shared":
-            self._manage_shared_sessions_menu()
-        else:
-            self._stop_session_menu()
+                self._stop_session_menu()
 
     def _active_has_pending(self) -> bool:
         # True if the active session has committed work not yet in the base.
@@ -2968,14 +3026,10 @@ class ProxyRunner:
         else:
             choice = self._select_popup("Merge which worktree's changes?", [label for label, _ in items])
             if choice is None:
-                self._set_message("Cancelled.")
-                self._render()
                 return
             name = next(n for label, n in items if label == choice)
         target = self._choose_merge_target(name)
         if target is None:
-            self._set_message("Cancelled.")
-            self._render()
             return
         if name == "":
             self._merge_active_into(target)
@@ -3042,8 +3096,6 @@ class ProxyRunner:
             ],
         )
         if choice is None:
-            self._set_message("Cancelled.")
-            self._render()
             return
         if choice.startswith("Discard"):
             confirm = self._select_popup(
@@ -3169,12 +3221,12 @@ class ProxyRunner:
                 names.setdefault(str(ref.id), name)
         return names
 
-    def _resume_session_menu(self) -> None:
+    def _resume_session_menu(self) -> str:
         sessions = self._resumable_sessions()
         if not sessions:
             self._set_message("No past conversations found to resume.")
             self._render()
-            return
+            return self._MENU_UP
         live_ids = {getattr(getattr(s, "state", None), "backend_session_id", None) for s in self.sessions}
         names = self._agitrack_named_sessions()
         options: list[str] = []
@@ -3183,12 +3235,11 @@ class ProxyRunner:
             label = (names.get(ref.id) or ref.label or "(no prompt recorded)").strip()[:48]
             options.append(f"{mark}{_short_session(ref.id)}  {self._format_age(ref.updated)}  {label}")
         choice = self._select_popup("Resume a conversation (newest first)", options)
-        if choice is None:
-            self._set_message("Cancelled.")
-            self._render()
-            return
+        if choice is None:  # Esc → back up one level to the sessions menu
+            return self._MENU_UP
         ref = sessions[options.index(choice)]
         self._resume_conversation(names.get(ref.id) or self._next_session_name(), ref.id)
+        return self._MENU_DONE
 
     def _resume_conversation(self, name: str, session_id: str, *, backend: str | None = None) -> None:
         # If this conversation is already live, just switch to it; otherwise
@@ -3421,31 +3472,31 @@ class ProxyRunner:
             message += f" Pruned {result.pruned} older shared session(s)."
         return message
 
-    def _manage_shared_sessions_menu(self) -> None:
+    def _manage_shared_sessions_menu(self) -> str:
         # Must open instantly: read only the LOCAL ref (no network fetch — your own
         # shares are already here) and label each entry from cheap data only
         # (manifest + a stat-sized "newer?" check), never a transcript read/redact.
         store = self._shared_store()
         login = self.global_config.github_login or self._cached_or_resolve_login()
-        mine = [entry for entry in store.entries() if entry.github_id == login]
-        if not mine:
-            self._set_message("You haven't shared any sessions in this repo yet. Use session → Share this session.")
-            self._render()
-            return
-        auto_state = self._user_state()  # base-repo opt-in, read once for the whole list
-        options: list[str] = []
-        for entry in mine:
-            sid = entry.manifest.get("session_id", "")
-            status = self._shared_entry_status(entry, sid)
-            auto = " · auto-update on" if auto_state.auto_share_enabled(sid) else ""
-            age = self._format_age(entry.manifest["updated"]) if entry.manifest.get("updated") else ""
-            options.append(f"{entry.display}  ({age}{auto}) — {status}")
-        choice = self._select_popup("Your shared sessions — pick one to manage", options)
-        if choice is None:
-            self._set_message("Cancelled.")
-            self._render()
-            return
-        self._manage_one_shared_session(mine[options.index(choice)])
+        while True:
+            mine = [entry for entry in store.entries() if entry.github_id == login]
+            if not mine:
+                self._set_message("You haven't shared any sessions in this repo yet. Use session → Share this session.")
+                self._render()
+                return self._MENU_UP
+            auto_state = self._user_state()  # base-repo opt-in, read once for the whole list
+            options: list[str] = []
+            for entry in mine:
+                sid = entry.manifest.get("session_id", "")
+                status = self._shared_entry_status(entry, sid)
+                auto = " · auto-update on" if auto_state.auto_share_enabled(sid) else ""
+                age = self._format_age(entry.manifest["updated"]) if entry.manifest.get("updated") else ""
+                options.append(f"{entry.display}  ({age}{auto}) — {status}")
+            choice = self._select_popup("Your shared sessions — pick one to manage", options)
+            if choice is None:  # Esc → up one level (back to the sessions menu)
+                return self._MENU_UP
+            # The per-entry menu returns here, so its Esc re-shows this list (one level up).
+            self._manage_one_shared_session(mine[options.index(choice)])
 
     def _shared_entry_status(self, entry, session_id: str) -> str:
         # Cheap "is the shared copy current?" — compare the transcript's byte size
@@ -3468,8 +3519,6 @@ class ProxyRunner:
         ]
         choice = self._select_popup(f"Manage {entry.display}", [label for _, label in actions])
         if choice is None:
-            self._set_message("Cancelled.")
-            self._render()
             return
         kind = actions[[label for _, label in actions].index(choice)][0]
         if kind == "update":
@@ -3918,8 +3967,8 @@ class ProxyRunner:
 
     def _drain_pty_until_done_or_esc(self, thread, *, deadline: float | None = None) -> str:
         """Wait for *thread* while keeping the UI alive (PTYs draining) so the wait
-        is responsive, not a freeze, and the user can press Esc/Ctrl-C to stop.
-        Returns ``"done"`` when the thread finishes, ``"cancel"`` on Esc/Ctrl-C, or
+        is responsive, not a freeze, and the user can press Esc to stop.
+        Returns ``"done"`` when the thread finishes, ``"cancel"`` on Esc, or
         ``"timeout"`` if the optional *deadline* passes first. Shared by the two
         cancellable shared-session fetches (listing and full-transcript)."""
         thread.join(timeout=0.05)  # fast fetches (and tests) finish without the wait UI
@@ -4000,7 +4049,7 @@ class ProxyRunner:
             return False
         return shared_rows < count_transcript_rows(raw)
 
-    def _resume_shared_session_menu(self) -> None:
+    def _resume_shared_session_menu(self) -> str:
         store = self._shared_store()
         completed = self._fetch_shared_with_cancel(store, "Fetching shared sessions…")
         if not completed:
@@ -4008,12 +4057,12 @@ class ProxyRunner:
             # dropping them into a possibly-stale, previously-fetched list (which
             # would read as if the stop did nothing). _fetch_shared_with_cancel has
             # already shown the "Stopped fetching…" notice; let it linger.
-            return
+            return self._MENU_UP
         entries = store.entries()
         if not entries:
             self._set_message("No shared sessions found for this repo.")
             self._render()
-            return
+            return self._MENU_UP
         options: list[str] = []
         for entry in entries:
             extra = [str(entry.manifest[k]) for k in ("model",) if entry.manifest.get(k)]
@@ -4021,16 +4070,14 @@ class ProxyRunner:
                 extra.append(self._format_age(entry.manifest["updated"]))
             options.append(entry.display + (f"  ({' · '.join(extra)})" if extra else ""))
         choice = self._select_popup("Resume a shared session (newest first)", options)
-        if choice is None:
-            self._set_message("Cancelled.")
-            self._render()
-            return
+        if choice is None:  # Esc → up one level to the sessions menu
+            return self._MENU_UP
         entry = entries[options.index(choice)]
         session_id = entry.manifest.get("session_id")
         if not session_id:
             self._set_message("That shared session is incomplete; cannot resume it.")
             self._render()
-            return
+            return self._MENU_UP
         # Resume with the backend the session was recorded by, not necessarily the
         # active one — a shared OpenCode session must be imported/resumed by the
         # OpenCode agent even while Claude is active (and vice versa). Reuse the
@@ -4045,7 +4092,7 @@ class ProxyRunner:
             except ValueError:
                 self._set_message(f"Can't resume '{entry.display}': unknown backend '{entry_backend}'.", seconds=8.0)
                 self._render()
-                return
+                return self._MENU_UP
         # Remember the lineage origin this session was shared under (owner + name +
         # contributors), so a later re-share (on this or any machine) updates the SAME
         # shared entry and adds us to the contributor set, instead of spawning a new
@@ -4088,13 +4135,11 @@ class ProxyRunner:
                     opts.append("Keep both — copy the shared version to a new session")
                 opts.append("Stay as it is (no change)")
             pick = self._select_popup(header, opts)
-            if pick is None:
-                self._set_message("Cancelled.")
-                self._render()
-                return
+            if pick is None:  # Esc → up one level to the sessions menu
+                return self._MENU_UP
             if pick.startswith("Stay"):
                 self._switch_active(live_index)
-                return
+                return self._MENU_DONE
             if pick.startswith("Update"):
                 # Pull the shared version into the running session: fetch it, then
                 # (on the main loop) restart the backend so it loads the new
@@ -4110,15 +4155,13 @@ class ProxyRunner:
                     as_id=None,
                     backend=entry_backend,
                 )
-                return
+                return self._MENU_DONE
             assert keep_both_id is not None
             copy_name = self._prompt_session_name(
                 "Name the copied session", default=self._dedupe_session_name(entry.name)
             )
-            if copy_name is None:
-                self._set_message("Cancelled.")
-                self._render()
-                return
+            if copy_name is None:  # Esc → up one level
+                return self._MENU_UP
             self._begin_shared_resume(
                 store,
                 entry,
@@ -4130,7 +4173,7 @@ class ProxyRunner:
                 as_id=keep_both_id,
                 backend=entry_backend,
             )
-            return
+            return self._MENU_DONE
         # You may already have this exact shared session open under a DIFFERENT backend
         # id: a multi-collaborator entry carries the *last sharer's* session_id, not
         # yours, so the id check above misses your own copy and the resume would mint a
@@ -4148,21 +4191,17 @@ class ProxyRunner:
                 f"You already have this shared session open locally as '{local_name}'.\nWhat would you like to do?",
                 opts,
             )
-            if pick is None:
-                self._set_message("Cancelled.")
-                self._render()
-                return
+            if pick is None:  # Esc → up one level to the sessions menu
+                return self._MENU_UP
             if pick.startswith("Continue"):
                 self._switch_active(lineage_index)
-                return
+                return self._MENU_DONE
             assert keep_both_id is not None
             copy_name = self._prompt_session_name(
                 "Name the copied session", default=self._dedupe_session_name(entry.name)
             )
-            if copy_name is None:
-                self._set_message("Cancelled.")
-                self._render()
-                return
+            if copy_name is None:  # Esc → up one level
+                return self._MENU_UP
             self._begin_shared_resume(
                 store,
                 entry,
@@ -4174,15 +4213,13 @@ class ProxyRunner:
                 as_id=keep_both_id,
                 backend=entry_backend,
             )
-            return
+            return self._MENU_DONE
         # Not running locally: pick a clear local name (#71), default to the original
         # share name (deduped) — NOT a "<sharer>-<name>" slug, which grew without
         # bound when sharing back and forth (#55).
         name = self._prompt_session_name("Resume shared session", default=self._dedupe_session_name(entry.name))
-        if name is None:
-            self._set_message("Cancelled.")
-            self._render()
-            return
+        if name is None:  # Esc → up one level to the sessions menu
+            return self._MENU_UP
         overwrite, as_id, resume_id = False, None, session_id
         if agent.has_local_session(self.base_repo.repo, session_id):
             age = self._format_age(entry.manifest["updated"]) if entry.manifest.get("updated") else "earlier"
@@ -4207,10 +4244,8 @@ class ProxyRunner:
                     opts.append("Keep both (fetch the shared copy as a separate session)")
                 opts.append("Keep my local copy")
             pick = self._select_popup(header, opts)
-            if pick is None:
-                self._set_message("Cancelled.")
-                self._render()
-                return
+            if pick is None:  # Esc → up one level to the sessions menu
+                return self._MENU_UP
             if pick.startswith("Keep both"):
                 assert keep_both_id is not None
                 as_id = resume_id = keep_both_id
@@ -4218,7 +4253,7 @@ class ProxyRunner:
                 overwrite = True
             else:  # keep the local copy: resume it directly, no fetch/import needed
                 self._resume_conversation(name, session_id, backend=entry_backend)
-                return
+                return self._MENU_DONE
         self._begin_shared_resume(
             store,
             entry,
@@ -4230,6 +4265,7 @@ class ProxyRunner:
             as_id=as_id,
             backend=entry_backend,
         )
+        return self._MENU_DONE
 
     def _begin_shared_resume(self, store, entry, agent, *, action, name, resume_id, overwrite, as_id, backend) -> None:
         # Fetch the (possibly large) transcript on a worker thread, then WAIT for it
@@ -4282,7 +4318,7 @@ class ProxyRunner:
             self._shared_resume_thread, deadline=time.monotonic() + self.RESUME_FETCH_TIMEOUT + 2.0
         )
         if status == "cancel":
-            # The user pressed Esc/Ctrl-C: stop and reset all fetch state so a retry
+            # The user pressed Esc: stop and reset all fetch state so a retry
             # can start immediately. This is the ONLY path that reports "cancelled".
             self._abort_shared_resume(cancel)
             self._set_message(f"Stopped fetching '{entry.display}' (cancelled).", seconds=6.0)
@@ -4471,32 +4507,29 @@ class ProxyRunner:
         except Exception:
             return True  # err toward offering the resolve flow
 
-    def _prompt_new_session(self) -> None:
+    def _prompt_new_session(self) -> str:
+        # Returns _MENU_DONE once a session is actually started (a transition → agent), or
+        # _MENU_UP if any prompt is backed out of (silently re-show the sessions menu).
         name = self._prompt_session_name("New Session", default=self._next_session_name())
         if name is None:
-            self._set_message("Cancelled.")
-            self._render()
-            return
+            return self._MENU_UP
         # Fork the current conversation, or start a blank one?
         fork = self._prompt_fork_or_blank()
         if fork is None:
-            self._set_message("Cancelled.")
-            self._render()
-            return
+            return self._MENU_UP
         # A fork continues the current session's work, so default its merge branch to
         # the current session's; a blank session defaults to the repo directory's.
         base = self._prompt_new_session_base(default=self._base_branch if fork else None)
         if base is None:
-            self._set_message("Cancelled.")
-            self._render()
-            return
+            return self._MENU_UP
         # The new session merges into its OWN branch — independent of the other
         # sessions and of the branch checked out in the repo directory.
         if fork and self._fork_current_session(name, base_branch=base):
-            return
+            return self._MENU_DONE
         if fork:
             self._set_message("Couldn't fork the current session; starting a blank one instead.", seconds=8.0)
         self._new_session(name, base_branch=base)
+        return self._MENU_DONE
 
     def _can_fork_active(self) -> bool:
         # A fork copies the active conversation, so it needs a portable transcript
@@ -4579,8 +4612,6 @@ class ProxyRunner:
         options = [self._session_name(index) for index in range(len(self.sessions))]
         choice = self._select_popup("Stop which session?", options)
         if choice is None:
-            self._set_message("Cancelled.")
-            self._render()
             return
         self._stop_session(options.index(choice))
 
@@ -4596,14 +4627,10 @@ class ProxyRunner:
         options = [self._session_name(index) for index in range(len(self.sessions))]
         choice = self._select_popup("Rename which session?", options)
         if choice is None:
-            self._set_message("Cancelled.")
-            self._render()
             return
         index = options.index(choice)
         new_name = self._prompt_popup("Rename session", "New name for this session:", default=self._session_name(index))
         if new_name is None or not new_name.strip():
-            self._set_message("Cancelled.")
-            self._render()
             return
         self._rename_session(index, new_name.strip())
 
@@ -4693,6 +4720,13 @@ class ProxyRunner:
         self._enable_host_mouse()
         self._set_message(f"Switched to session '{self._session_name(index)}'")
         self._render()
+        # The copy-back mute is per active-session-visit: a switch resets it so the
+        # session we just landed on gets offered its own worktree-only files (background
+        # sessions are never interrupted mid-run; this is where we catch up). Only when
+        # it's idle — a session still mid-turn gets offered by the turn path once it settles.
+        self._copy_declined = set()
+        if not self._agent_is_active():
+            self._offer_copy_unstaged_to_base(context="switch")
         # The newly-active session may merge into a different branch than the one
         # checked out in the repo directory — ask where its changes should merge.
         self._prompt_merge_target_if_diverged()
@@ -5246,6 +5280,18 @@ class ProxyRunner:
         data = os.read(sys.stdin.fileno(), 4096)
         self._raw_capture(">", data)
         self._debug(f"stdin: {data!r} menu_key={self.input.menu_key!r}")
+        # A popup message taller than the screen scrolls with PgUp/PgDn, handled before
+        # anything else so a long notice can be read in full (and isn't dismissed mid-read).
+        if self._message_max_scroll > 0 and not self.input.capturing and _PAGE_KEY_RE.search(data):
+            page = max(self.rows - 4, 1)
+            for match in _PAGE_KEY_RE.finditer(data):
+                step = page if match.group(1) == b"6" else -page  # PgDn scrolls down, PgUp up
+                self._message_scroll = max(0, min(self._message_scroll + step, self._message_max_scroll))
+            data = _PAGE_KEY_RE.sub(b"", data)
+            self.message_until = time.monotonic() + 30  # keep the notice up while scrolling
+            self._render()
+            if not data:
+                return None
         # Any keypress dismisses a sticky message (e.g. the auto-commit
         # confirmation) so it no longer overlays the live view; repaint to
         # remove the popup even if the key produces no child echo.
@@ -5626,6 +5672,7 @@ class ProxyRunner:
             message=self.message,
             message_sticky=self._message_sticky,
             message_until=self.message_until,
+            message_scroll=self._message_scroll,
         )
 
     def _append_command_palette(self, parts: list[str]) -> None:
@@ -5640,7 +5687,9 @@ class ProxyRunner:
         )
 
     def _append_message_popup(self, parts: list[str], message: str) -> None:
-        ScreenRenderer.append_message_popup(self, parts, message, rows=self.rows, cols=self.cols)
+        ScreenRenderer.append_message_popup(
+            self, parts, message, rows=self.rows, cols=self.cols, scroll=self._message_scroll
+        )
 
     def _append_box(
         self, parts: list[str], row: int, col: int, width: int, lines: list[str], highlight: str | None = None
@@ -5769,8 +5818,12 @@ class ProxyRunner:
     def render_line(self, cells, sel=None, *, cols: int) -> str:
         return ScreenRenderer.render_line(self, cells, sel, cols=cols)
 
-    def append_box(self, parts, row, col, width, lines, highlight=None, *, rows: int) -> None:
-        ScreenRenderer.append_box(self, parts, row, col, width, lines, highlight, rows=rows)
+    def append_box(
+        self, parts, row, col, width, lines, highlight=None, *, rows: int, scrollable: bool = False, scroll: int = 0
+    ) -> None:
+        ScreenRenderer.append_box(
+            self, parts, row, col, width, lines, highlight, rows=rows, scrollable=scrollable, scroll=scroll
+        )
 
     def append_command_palette(
         self, parts, *, rows: int, cols: int, input_text: str, input_matches, input_selected
@@ -5785,8 +5838,11 @@ class ProxyRunner:
             input_selected=input_selected,
         )
 
-    def append_message_popup(self, parts, message: str, *, rows: int, cols: int) -> None:
-        ScreenRenderer.append_message_popup(self, parts, message, rows=rows, cols=cols)
+    def append_message_popup(self, parts, message: str, *, rows: int, cols: int, scroll: int = 0) -> None:
+        ScreenRenderer.append_message_popup(self, parts, message, rows=rows, cols=cols, scroll=scroll)
+
+    def wrapped_message_height(self, lines, cols: int) -> int:
+        return ScreenRenderer.wrapped_message_height(self, lines, cols)
 
     def cursor_sequence(self, rows: int, cols: int, scroll_back: int) -> str:
         return ScreenRenderer.cursor_sequence(self, rows, cols, scroll_back)
@@ -5876,6 +5932,51 @@ class ProxyRunner:
     def _enable_host_mouse(self) -> None:
         TerminalHost.enable_host_mouse(self)
 
+    # --- menu navigation convention -----------------------------------------
+    #
+    # Every Ctrl-G menu is one ``while True`` loop and returns just TWO signals, so **Esc
+    # always moves up exactly one level** and the code's call hierarchy mirrors the on-screen
+    # hierarchy. To author a menu: build options → ``_select_popup`` → dispatch, where
+    #
+    #   Esc (``_select_popup`` returns None)  → ``return self._MENU_UP``  (back out one level)
+    #   a context transition (switch/new/resume a session)
+    #                                         → ``return self._MENU_DONE`` (unwind to the agent)
+    #   any other action (config, or a child menu the user backed out of)
+    #                                         → ``continue``               (re-show this menu)
+    #
+    # A child menu is entered by CALLING it; the parent does
+    # ``if child() == self._MENU_DONE: return self._MENU_DONE`` else ``continue`` — so the
+    # child's Esc lands back on this parent, while a transition unwinds past every level.
+    # ``_after_menu_command`` turns a top-level menu's UP into "re-open the Ctrl-G palette",
+    # the parent of every command menu. Navigation is silent — no "closed"/"cancelled"
+    # message on the way up — and modal closes don't repaint the bare screen (see
+    # ``_run_modal``), so stepping between levels is instant and flicker-free.
+    #
+    # Parent → child today: _run_command → {_session_menu, _settings_menu, summarizer menu,
+    # backend picker}; _session_menu → {_rename_session_menu, _change_session_merge_branch_menu,
+    # _share_session, _manage_shared_sessions_menu, _resume_session_menu,
+    # _resume_shared_session_menu, …}; _manage_shared_sessions_menu → _manage_one_shared_session;
+    # _settings_menu → {_edit_one_setting, _settings_timings_menu → _edit_one_timing}.
+    _MENU_UP = "up"
+    _MENU_DONE = "done"
+
+    def _after_menu_command(self, signal: str) -> None:
+        """A top-level command menu closed. Esc/back (UP) goes up one level to the Ctrl-G
+        command palette; a transition (DONE) drops through to the agent."""
+        if signal == self._MENU_UP:
+            self._reopen_command_palette()
+
+    def _reopen_command_palette(self) -> None:
+        # Re-open the input-layer Ctrl-G palette (the parent of every command menu) so Esc
+        # out of a command lands back here rather than at the agent. Mirrors the state reset
+        # the palette does when first opened with the menu key.
+        self.input.capturing = True
+        self.input.buffer.clear()
+        self.input.selected_index = 0
+        self.input.escape_buffer = None
+        self.input.extra_commands = ["merge"] if self._has_unmerged_work() else []
+        self._render()
+
     def _run_command(self, command: str) -> None:
         # aGiTrack commands in proxy mode are triggered via Ctrl-G and are plain
         # names; ":" is not a command trigger here (it is forwarded to the
@@ -5910,9 +6011,8 @@ class ProxyRunner:
         elif name == "agent-backend":
             backends = available_backends()
             selected = arg.strip() or self._select_popup("Backend Agent", backends)
-            if selected is None:
-                self._set_message("Cancelled.")
-                self._render()
+            if selected is None:  # Esc on the picker → up one level to the palette
+                self._after_menu_command(self._MENU_UP)
                 return
             if selected not in backends:
                 self._set_message(f"Unknown backend: {selected}. Available: {', '.join(backends)}")
@@ -5922,10 +6022,13 @@ class ProxyRunner:
                 self._switch_backend(selected)
                 return
         elif name == "sessions":
-            self._handle_session_command(arg)
+            self._after_menu_command(self._handle_session_command(arg))
             return
         elif name == "summarizer":
-            self._handle_summarizer_command(arg)
+            self._after_menu_command(self._handle_summarizer_command(arg))
+            return
+        elif name == "settings":
+            self._after_menu_command(self._settings_menu())
             return
         elif name == "update":
             self._handle_update_command()
@@ -5941,6 +6044,276 @@ class ProxyRunner:
         else:
             self._set_message(f"Unknown aGiTrack command: {name}")
         self._render()
+
+    # --- settings menu ------------------------------------------------------
+    #
+    # The menu is a small form: edits accumulate as PENDING changes (each with the scope
+    # the user chose — repo-local or global) and are written only when the user confirms
+    # "save" on the way out. Esc always goes up ONE level (value editor → list, scope →
+    # value editor, sub-list → main list, main list → close), and closing with unsaved
+    # changes asks whether to save or discard them.
+
+    @staticmethod
+    def _fmt_setting(value: object) -> str:
+        if isinstance(value, bool):
+            return "on" if value else "off"
+        if isinstance(value, list):
+            return ", ".join(str(p) for p in value) if value else "(none)"
+        return str(value) if value not in (None, "") else "(unset)"
+
+    def _pending_count(self) -> int:
+        return len(self._settings_pending) + len(self._settings_pending_timings)
+
+    def _choose_scope(self, label: str) -> str | None:
+        """Ask whether an edit applies repo-locally or globally. None = Esc/Back."""
+        pick = self._select_popup(
+            f"Apply '{label}' to:",
+            [
+                "This repository only (.agitrack/config.json)",
+                "Global — all repositories (~/.agitrack/config.json)",
+                "← Back",
+            ],
+        )
+        if pick is None or pick.startswith("←"):
+            return None
+        return "repo" if pick.startswith("This repository") else "global"
+
+    def _settings_specs(self) -> list[dict]:
+        """Declarative registry of the user-editable config options shown in the
+        settings menu. Labels are written to be self-explanatory. ``kind`` drives the
+        editor; ``restart`` marks settings resolved at launch (so a change applies to new
+        sessions / the next launch). Effective values are read from ``global_config``
+        (repo overlay > global > built-in default)."""
+        return [
+            {
+                "key": "default_backend",
+                "label": "Default coding agent (Claude Code or OpenCode)",
+                "kind": "choice",
+                "options": ["claude", "opencode"],
+                "restart": True,
+            },
+            {
+                "key": "sandbox",
+                "label": "Confine the agent's file writes to its session worktree",
+                "kind": "bool",
+                "restart": True,
+            },
+            {
+                "key": "allowed_edit_paths",
+                "label": "Extra folders/files the agent may write to (besides its worktree)",
+                "kind": "paths",
+                "restart": True,
+            },
+            {
+                "key": "use_worktrees",
+                "label": "Run each session in its own isolated git worktree",
+                "kind": "bool",
+                "restart": True,
+            },
+            {
+                "key": "commit_guidance",
+                "label": "Ask the agent not to make its own git commits (aGiTrack commits each turn)",
+                "kind": "bool",
+                "restart": True,
+            },
+            {"key": "summarization_enabled", "label": "Write an AI summary for each commit", "kind": "bool"},
+            {"key": "summarization_model", "label": "Model used to write commit summaries", "kind": "text"},
+            {"key": "check_for_updates", "label": "Automatically check for aGiTrack updates", "kind": "bool"},
+            {
+                "key": "menu_key",
+                "label": "Key that opens this aGiTrack menu (e.g. ctrl-g)",
+                "kind": "text",
+                "restart": True,
+            },
+            {"key": "timings", "label": "Polling & debounce timings (advanced) …", "kind": "timings"},
+        ]
+
+    def _setting_value_display(self, spec: dict) -> str:
+        key, kind = spec["key"], spec["kind"]
+        if kind == "timings":
+            n = len(self._settings_pending_timings)
+            return f"{n} unsaved change(s)" if n else ""
+        if key in self._settings_pending:  # a pending (unsaved) edit shows its new value
+            value, scope, _ = self._settings_pending[key]
+            return f"{self._fmt_setting(value)}  · UNSAVED → {scope}"
+        if kind == "bool":
+            text = "on" if bool(getattr(self.global_config, key)) else "off"
+        elif kind == "paths":
+            paths = self.global_config.allowed_edit_paths
+            text = ", ".join(paths) if paths else "(none)"
+        else:
+            value = getattr(self.global_config, key, None)
+            text = str(value) if value not in (None, "") else "(default)"
+        suffix = {"repo": " · repo", "global": " · global", "default": ""}[self.global_config.source(key)]
+        return f"{text}{suffix}"
+
+    def _settings_menu(self) -> str:
+        """Ctrl-G → "settings": browse and edit ALL config options. Changes are collected
+        as PENDING edits (each with its chosen scope) and written only when you confirm on
+        the way out. Esc goes up one level; closing with unsaved changes asks to save them.
+        Returns _MENU_UP so closing the menu lands back on the Ctrl-G palette."""
+        self._settings_pending = {}
+        self._settings_pending_timings = {}
+        while True:
+            specs = self._settings_specs()
+            options = []
+            for spec in specs:
+                disp = self._setting_value_display(spec)
+                options.append(f"{spec['label']}: {disp}" if disp else spec["label"])
+            pending = self._pending_count()
+            close = f"← Close (save {pending} change(s))" if pending else "← Close"
+            options += ["", close]
+            title = "Settings — Esc = back; edits are saved only when you close"
+            choice = self._select_popup(title, options)
+            if choice is None or choice.startswith("← Close") or not choice.strip():
+                # Leaving the top level: offer to save/discard any unsaved edits.
+                if pending and self._confirm_save_pending() == "keep":
+                    continue  # "Keep editing" → stay in the menu
+                self._set_message("Settings closed.")
+                self._render()
+                return self._MENU_UP
+            spec = specs[options.index(choice)]
+            if spec["kind"] == "timings":
+                self._settings_timings_menu()
+            else:
+                self._edit_one_setting(spec)
+
+    def _edit_one_setting(self, spec: dict) -> None:
+        """Edit one setting into a PENDING change. Esc at the value prompt returns to the
+        list; Esc at the scope prompt returns to the value prompt (one level up each time)."""
+        key, kind, label = spec["key"], spec["kind"], spec["label"]
+        while True:
+            if kind == "bool":
+                pick = self._select_popup(label, ["Turn ON", "Turn OFF", "← Back"])
+                if pick is None or pick.startswith("←"):
+                    return
+                value: object = pick == "Turn ON"
+            elif kind == "choice":
+                pick = self._select_popup(label, [*spec["options"], "← Back"])
+                if pick is None or pick.startswith("←"):
+                    return
+                value = pick
+            elif kind == "paths":
+                current = self._pending_paths(key)
+                raw = self._prompt_popup(
+                    label, f"Paths separated by '{os.pathsep}' (blank = none):", default=os.pathsep.join(current)
+                )
+                if raw is None:
+                    return
+                value = [p.strip() for p in raw.split(os.pathsep) if p.strip()]
+            else:  # text
+                raw = self._prompt_popup(label, "New value (blank = unset):", default=self._pending_text(key))
+                if raw is None:
+                    return
+                value = raw.strip() or None
+            scope = self._choose_scope(label)
+            if scope is None:  # Esc at scope → one level up: re-edit the value
+                continue
+            self._settings_pending[key] = (value, scope, bool(spec.get("restart")))
+            self._set_message(
+                f"'{label}' → {self._fmt_setting(value)} ({scope}) — unsaved; choose Close to save.", seconds=7.0
+            )
+            self._render()
+            return
+
+    def _pending_paths(self, key: str) -> list[str]:
+        if key in self._settings_pending:
+            pending = self._settings_pending[key][0]
+            if isinstance(pending, list):
+                return [str(p) for p in pending]
+        return self.global_config.allowed_edit_paths
+
+    def _pending_text(self, key: str) -> str:
+        if key in self._settings_pending:
+            return self._fmt_setting(self._settings_pending[key][0]).replace("(unset)", "")
+        return str(getattr(self.global_config, key, None) or "")
+
+    def _settings_timings_menu(self) -> None:
+        from agitrack.config.settings import DEFAULT_TIMINGS
+
+        keys = list(DEFAULT_TIMINGS)
+        while True:
+            timings = self.global_config.timings
+            options = []
+            for k in keys:
+                if k in self._settings_pending_timings:
+                    v, scope = self._settings_pending_timings[k]
+                    options.append(f"{k}: {v:g}s  · UNSAVED → {scope}")
+                else:
+                    options.append(f"{k}: {timings[k]:g}s")
+            options += ["", "← Back"]
+            choice = self._select_popup("Timings (seconds) — Esc/← Back returns to settings", options)
+            if choice is None or choice == "← Back" or not choice.strip():
+                return  # one level up: back to the settings list
+            tkey = keys[options.index(choice)]
+            self._edit_one_timing(tkey, timings[tkey])
+
+    def _edit_one_timing(self, tkey: str, current: float) -> None:
+        while True:
+            default = (
+                f"{self._settings_pending_timings[tkey][0]:g}"
+                if tkey in self._settings_pending_timings
+                else str(current)
+            )
+            raw = self._prompt_popup(tkey, f"New value in seconds (current {current:g}):", default=default)
+            if raw is None:
+                return  # back to the timings list
+            try:
+                seconds = float(raw)
+                if seconds <= 0:
+                    raise ValueError
+            except ValueError:
+                self._set_message("Enter a positive number of seconds.")
+                self._render()
+                continue
+            scope = self._choose_scope(tkey)
+            if scope is None:  # Esc at scope → re-edit the value
+                continue
+            self._settings_pending_timings[tkey] = (seconds, scope)
+            self._set_message(f"'{tkey}' → {seconds:g}s ({scope}) — unsaved; choose Close to save.", seconds=7.0)
+            self._render()
+            return
+
+    def _confirm_save_pending(self) -> str:
+        """Prompt to save/discard pending settings edits when closing. Returns 'keep' if the
+        user chose to keep editing (the menu should stay open), else 'saved'/'discarded'."""
+        n = self._pending_count()
+        pick = self._select_popup(
+            f"You have {n} unsaved settings change(s). Save them?",
+            ["Yes, save them", "No, discard them", "← Keep editing"],
+        )
+        if pick is None or pick.startswith("←"):
+            return "keep"
+        if pick.startswith("No"):
+            self._settings_pending = {}
+            self._settings_pending_timings = {}
+            self._set_message(f"Discarded {n} unsaved settings change(s).", seconds=6.0)
+            self._render()
+            return "discarded"
+        # Write every pending edit to its chosen scope.
+        needs_restart = False
+        for key, (value, scope, restart) in self._settings_pending.items():
+            self.global_config.set(key, value, scope=scope)
+            needs_restart = needs_restart or restart
+        by_scope: dict[str, dict[str, float]] = {}
+        for tkey, (value, scope) in self._settings_pending_timings.items():
+            by_scope.setdefault(scope, {})[tkey] = value
+        for scope, changes in by_scope.items():
+            store = self.global_config.repo_data if scope == "repo" else self.global_config.data
+            merged = dict(store.get("timings") or {})
+            merged.update(changes)
+            self.global_config.set("timings", merged, scope=scope)
+            needs_restart = True  # timings are read at launch
+        self._settings_pending = {}
+        self._settings_pending_timings = {}
+        note = (
+            " Some changes won't take effect until you restart aGiTrack yourself (it won't restart on its own)."
+            if needs_restart
+            else ""
+        )
+        self._set_message(f"Saved {n} settings change(s).{note}", seconds=10.0)
+        self._render()
+        return "saved"
 
     def _handle_dashboard_command(self) -> None:
         """Ctrl-G → "dashboard": serve aGiTrack's metrics dashboard for this repo and
@@ -6060,11 +6433,19 @@ class ProxyRunner:
              session PTY so back-pressure never builds up while the popup is open.
           3. Passes the bytes to ``modal.feed()`` and acts on the returned action:
 
-             ``("done",   value)``  — clears the message, renders, and returns value.
-             ``("cancel", None)``   — clears the message, renders, and returns None.
+             ``("done",   value)``  — clears the message and returns value.
+             ``("cancel", None)``   — clears the message and returns None.
              ``("exit",   None)``   — calls ``_run_exit_flow()``; returns None on
                                       confirmed exit, otherwise redraws and continues.
              ``("redraw", None)``   — redraws and continues.
+
+        On ``done``/``cancel`` we deliberately do NOT repaint here: the modal's last
+        frame stays on screen and we only flag ``_render_pending``. When this modal was
+        opened from a parent menu, the parent's next ``_select_popup`` paints the next
+        menu straight over this one — so stepping between menu levels never flashes the
+        bare backend screen in between (smooth, instant navigation). When nothing follows
+        (the interaction returns to the agent), the reactor flushes that one pending frame
+        within a few ms, clearing the popup cleanly.
 
         The call-shape is synchronous, which preserves the ~25 existing call
         sites unmodified.  ``_prompt_popup`` and ``_select_popup`` are thin
@@ -6077,11 +6458,11 @@ class ProxyRunner:
             action, value = modal.feed(data)
             if action == "done":
                 self._clear_message()
-                self._render()
+                self._render_pending = True
                 return value
             if action == "cancel":
                 self._clear_message()
-                self._render()
+                self._render_pending = True
                 return None
             if action == "exit":
                 if self._run_exit_flow():
@@ -6095,15 +6476,17 @@ class ProxyRunner:
         """
         return self._run_modal(PromptModal(title, prompt, default=default))
 
-    def _select_popup(self, title: str, options: list[str]) -> str | None:
+    def _select_popup(self, title: str, options: list[str], *, detail: list[str] | None = None) -> str | None:
         """Selection popup.  Thin facade over ``_run_modal(SelectModal(...))``.
 
         Tests stub this method heavily; the name and signature are stable.
         Returns ``""`` immediately when *options* is empty (unchanged behaviour).
+        ``detail`` is an optional list of lines (e.g. a file list) shown between the
+        title and the options, windowed and PgUp/PgDn-scrollable when it overflows.
         """
         if not options:
             return ""
-        return self._run_modal(SelectModal(title, options))
+        return self._run_modal(SelectModal(title, options, detail=detail, viewport_rows=self.rows))
 
     def _create_user_commit_popup(
         self,
@@ -6512,6 +6895,7 @@ class ProxyRunner:
         # None simply leaves no popup to paint (the same state as a cleared message).
         self.message = message
         self.message_until = time.monotonic() + seconds
+        self._message_scroll = 0  # a fresh message starts at the top
         # Sticky messages ignore the timeout and persist until the user's next
         # keypress clears them (see _clear_sticky_message_on_input).
         self._message_sticky = sticky
@@ -6623,13 +7007,31 @@ class ProxyRunner:
             return True
         self._popup_exit_pending = True
         self._popup_exit_force = False
+        self._exit_aborted = False
         try:
             if not self._confirm_exit() and not self._popup_exit_force:
+                self._set_message("Exit cancelled — still running; nothing was shut down.")
+                self._render()
                 return False
             if not self._popup_exit_force:
                 if not self._confirm_terminate_background_sessions() and not self._popup_exit_force:
+                    self._set_message("Exit cancelled — kept working; the background sessions are still running.")
+                    self._render()
                     return False
             self._finalize_pending_work()
+            if self._exit_aborted and not self._popup_exit_force:
+                # Esc on the on-exit copy offer: undo the "we're exiting" state and stay
+                # running so the user can deal with the files. Already-made commits/merges
+                # stand (they never lose work); nothing was deleted.
+                self._exiting = False
+                self._finalized_on_exit = False
+                self._set_message(
+                    "Exit cancelled. Your worktree and its files were NOT deleted — copy/move what you "
+                    "need, then exit again. (Commits already made this exit were kept.)",
+                    seconds=12.0,
+                )
+                self._render()
+                return False
             self._exit_child()
             self._exit_requested = True
             return True
@@ -6696,6 +7098,8 @@ class ProxyRunner:
         self._commit_latest_turn_sync()  # active session, in place
         self._auto_share_on_exit()  # push the latest conversation if auto-shared
         self._finalize_summary_then_integrate_on_exit()
+        if self._exit_aborted:
+            return  # Esc on the active session's copy offer — leave the rest untouched
         for session in list(self.sessions):
             if session is self.active:
                 continue
@@ -6707,6 +7111,8 @@ class ProxyRunner:
                 self._finalize_summary_then_integrate_on_exit()
             finally:
                 self.active = saved
+            if self._exit_aborted:
+                return  # Esc on a session's copy offer — stop finalizing the rest
         self._delete_orphan_merged_branches()
         # NB: deliberately NOT sweeping orphan shared-session snapshots here. That
         # sweep runs `git fsck` over the whole object graph — seconds on a large
@@ -6840,6 +7246,14 @@ class ProxyRunner:
         except Exception as error:
             self._debug(f"keeping worktree '{info.name}' on exit: {error!r}")
             return
+        # The worktree (and any uncommitted/ignored files in it) is about to be deleted.
+        # Offer to copy those out first — but only on an interactive exit (Ctrl-G → exit),
+        # never a signal teardown (terminal/window close sets screen=None), where there is
+        # no UI to prompt with. The "exit" context warns that declining discards them.
+        if self.screen is not None:
+            self._offer_copy_unstaged_to_base(context="exit")
+            if self._exit_aborted:
+                return  # Esc on the copy offer: keep this worktree + files, abort the exit
         # Remember this session's conversation under its backend so switching back
         # to that backend (this run or a later one) resumes it.
         self._remember_session_for_backend()
@@ -7437,61 +7851,128 @@ class ProxyRunner:
             return
         self._offer_copy_unstaged_to_base()
 
-    def _offer_copy_unstaged_to_base(self) -> None:
+    def _offer_user_commit_for_worktree_edits(self) -> None:
+        """Offer to COMMIT the user's own uncommitted edits in this worktree (tracked
+        changes, or new files they haven't declined) — those belong in git, not just
+        copied to the base directory. Run right before the copy offer so that when a user
+        edit AND copy-able leftovers both exist, BOTH prompts appear: a commit prompt for
+        the edits here, and the copy prompt (for declined/ignored files) afterwards.
+        A no-op in the normal case, where the turn's auto-commit already committed the
+        user's tracked edits and only declined/ignored files remain."""
+        actions = getattr(self, "actions", None)
+        check = getattr(actions, "has_pre_agent_user_changes", None)
+        if check is None:
+            return
+        try:
+            if check():
+                self._set_message("Uncommitted changes in this session's worktree — commit them?")
+                self._render()
+                self._create_user_commit_popup()
+        except Exception as error:
+            self._debug(f"pre-copy user-commit offer failed: {error!r}")
+
+    def _offer_copy_unstaged_to_base(self, *, context: str = "turn") -> None:
         """Offer to copy the worktree's would-be-stranded files into the base repo dir.
 
         Only relevant for an isolated worktree session: changes committed this turn
-        integrate into the base branch, but files the agent modified and left
-        uncommitted (declined untracked files, unstaged edits) or that are git-ignored
-        live only in the worktree and the user — working in the base directory — never
-        sees them. This runs **whether or not the turn produced a commit**: a turn that
-        only touched ignored files stages nothing, yet those files may still need to
-        come across (see the callers in ``_maybe_agent_commit``).
+        integrate into the base branch, but files the agent left uncommitted (declined
+        untracked files) or that are git-ignored live only in the worktree and the user —
+        working in the base directory — never sees them. The user's OWN uncommitted edits
+        are offered for a git commit first (`_offer_user_commit_for_worktree_edits`), so a
+        commit prompt and the copy prompt can both appear when both apply.
 
-        Files are tracked by a content fingerprint, so a file the user chose to leave
-        is not prompted again until it changes. With consent each file is copied; an
-        existing base file is overwritten only on a per-file confirmation. Anything not
-        copied is reported as remaining in the worktree, with the worktree path."""
+        ``context``:
+          - ``"turn"``   — after an idle turn in the ACTIVE session (default). Background
+            sessions are never interrupted; their files are offered on switch/exit instead.
+          - ``"switch"`` — when the user switches TO this session.
+          - ``"exit"``   — last offer before the worktree (and these files) are deleted: the
+            prompt warns that discarding them is permanent, and pressing Esc aborts the exit
+            so the user can deal with the files themselves.
+
+        A file already accepted/left in place isn't re-offered until its content changes
+        (fingerprint). Declining mutes the whole current SET of paths: aGiTrack won't ask
+        again while only those files keep changing — only a genuinely NEW path re-opens the
+        set (ask about all again), in EVERY context including exit. The mute clears on
+        session switch and aGiTrack restart."""
         if self.worktree is None or self.base_repo is None:
             return
         base_dir = self.base_repo.repo
         wt_dir = self.repo.repo
         if base_dir == wt_dir:
             return
-        # Files modified since we last offered them (new content → re-offer; unchanged
-        # declined files are skipped so the user isn't nagged).
+        # First commit the user's own edits (if any), then offer to copy the leftovers.
+        self._offer_user_commit_for_worktree_edits()
+        candidates = self._uncommitted_worktree_files()
+        if not candidates:
+            return
+        current = set(candidates)
+        on_exit = context == "exit"
+        # A genuinely new path (one we haven't muted) re-opens the whole set: drop the
+        # decline mute and the per-file fingerprint memory so "all files" means all again.
+        if self._copy_declined and (current - self._copy_declined):
+            self._copy_declined.clear()
+            self._copy_prompted.clear()
         fresh: list[tuple[str, tuple[int, int]]] = []
-        for rel in self._uncommitted_worktree_files():
+        for rel in candidates:
             fingerprint = self._file_fingerprint(wt_dir / rel)
-            if fingerprint is None or self._copy_prompted.get(rel) == fingerprint:
+            if fingerprint is None:
                 continue
+            if rel in self._copy_declined:
+                continue  # muted by a prior decline; not re-asked even on exit (no new file)
+            if self._copy_prompted.get(rel) == fingerprint:
+                continue  # already offered/copied at this exact content
             fresh.append((rel, fingerprint))
         if not fresh:
             return
-        # Record the fingerprints up front so a declined file isn't re-prompted while
-        # it stays unchanged (re-offered only once its content changes again).
         for rel, fingerprint in fresh:
             self._copy_prompted[rel] = fingerprint
-        names = ", ".join(rel for rel, _ in fresh[:5]) + (" …" if len(fresh) > 5 else "")
-        choice = self._select_popup(
-            f"This session's worktree ({wt_dir}) has {len(fresh)} file(s) that won't be "
-            f"merged into the base — uncommitted or git-ignored ({names}). Copy them into "
-            f"the base repo directory ({base_dir})?",
-            ["No, leave them in the worktree", "Yes, copy to the base repo"],
-        )
+        rels = [rel for rel, _ in fresh]
+        # The file list is shown vertically (one per line, scrolls with PgUp/PgDn), led by
+        # a "File(s):" line so it's clear the message refers to these names.
+        if on_exit:
+            title = (
+                f"This session's worktree ({wt_dir}) has {len(rels)} file(s) not in the base repo "
+                f"that will be DELETED when the worktree is removed on exit. Copy them into the base "
+                f"repo ({base_dir}) first? (Press Esc to cancel the exit and handle them yourself.)\n"
+                f"File(s):"
+            )
+            options = ["No, discard them with the worktree", "Yes, copy to the base repo"]
+        else:
+            title = (
+                f"This session's worktree ({wt_dir}) has {len(rels)} file(s) that won't be merged "
+                f"into the base — intentionally unstaged or git-ignored. Copy them into the base repo ({base_dir})?\n"
+                f"(Decline and aGiTrack won't ask about this set again until the files change as a set "
+                f"or you switch sessions.)\n"
+                f"File(s):"
+            )
+            options = ["No, leave them in the worktree", "Yes, copy to the base repo"]
+        choice = self._select_popup(title, options, detail=rels)
+        if on_exit and choice is None:
+            # Esc on the exit offer cancels the exit entirely (handled by the caller) so the
+            # user can copy/move the files themselves — nothing is discarded or removed. Forget
+            # we offered them so the NEXT exit re-offers (the user didn't actually resolve them).
+            for rel in rels:
+                self._copy_prompted.pop(rel, None)
+            self._exit_aborted = True
+            return
         if choice is None or choice.startswith("No"):
-            self._notice_files_remain(wt_dir, [rel for rel, _ in fresh])
+            if on_exit:
+                self._set_message(f"Discarding {len(rels)} file(s) with the worktree.", seconds=6.0)
+                self._render()
+            else:
+                self._copy_declined |= current  # mute the whole set until it changes / switch
+                self._notice_files_remain(wt_dir, rels)
             return
         # Files that would overwrite something already in the base are handled in one
         # up-front choice: overwrite them all, keep them all (the new files still copy),
         # or confirm each one individually.
-        conflicts = [rel for rel, _ in fresh if (base_dir / rel).exists()]
+        conflicts = [rel for rel in rels if (base_dir / rel).exists()]
         overwrite_mode = "all"  # no conflicts → moot
         if conflicts:
-            preview = ", ".join(conflicts[:5]) + (" …" if len(conflicts) > 5 else "")
             answer = self._select_popup(
-                f"{len(conflicts)} of these already exist in the base repo ({preview}). Overwrite them?",
+                f"{len(conflicts)} of these already exist in the base repo. Overwrite them?",
                 ["No, keep the base versions", "Yes, overwrite all", "Let me confirm each one"],
+                detail=conflicts,
             )
             if answer == "Yes, overwrite all":
                 overwrite_mode = "all"

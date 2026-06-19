@@ -246,7 +246,7 @@ def test_menu_key_split_across_reads_under_both_protocols(protocol):
     split = len(seq) - 2  # cut mid-sequence, before the final u / ~
     forwarded, command, should_exit = _drive_host_input(runner, parser, [seq[:split], seq[split:] + b"exit\r"])
     assert forwarded == []
-    assert command == "exit"
+    assert command == "exit aGiTrack"  # typing "exit" selects the "exit aGiTrack" entry
     assert should_exit is False
 
 
@@ -811,6 +811,62 @@ def test_session_menu_explicit_integrate_choice_integrates(tmp_path):
     assert called == [True]
 
 
+def test_session_menu_esc_signals_up_and_reopens_palette(tmp_path):
+    # Esc on the sessions list goes UP one level — to the Ctrl-G command palette — not all
+    # the way to the agent. _session_menu returns _MENU_UP; _run_command re-opens the palette.
+    runner = _delay_menu_runner(tmp_path)
+    runner._select_popup = lambda title, options: None  # Esc on the list
+
+    assert runner._session_menu() == runner._MENU_UP
+
+    # Going through the command dispatch, an UP signal re-opens the input-layer palette.
+    runner.input.capturing = False
+    runner._render = lambda *a, **k: None
+    runner._has_unmerged_work = lambda: False
+    runner._after_menu_command(runner._MENU_UP)
+    assert runner.input.capturing is True  # back at the palette, one level up
+
+
+def test_session_menu_transition_signals_done(tmp_path):
+    # Starting a new session is a context transition: _prompt_new_session reports _MENU_DONE
+    # and the sessions menu unwinds straight to the agent (the palette is NOT re-opened).
+    runner = _delay_menu_runner(tmp_path)
+    runner._prompt_new_session = lambda: runner._MENU_DONE
+    runner._select_popup = lambda title, options: next(o for o in options if o.startswith("+ New session"))
+
+    assert runner._session_menu() == runner._MENU_DONE
+
+
+def test_session_menu_new_session_cancel_returns_to_list(tmp_path):
+    # Backing out of the new-session prompts (_prompt_new_session → _MENU_UP) must NOT drop
+    # to the agent: the sessions list re-shows so Esc lands one level up here.
+    runner = _delay_menu_runner(tmp_path)
+    runner._prompt_new_session = lambda: runner._MENU_UP
+    shown: list[bool] = []
+
+    def select(title, options):
+        shown.append(True)
+        if len(shown) == 1:
+            return next(o for o in options if o.startswith("+ New session"))
+        return None  # second visit → Esc closes the menu
+
+    runner._select_popup = select
+    assert runner._session_menu() == runner._MENU_UP
+    assert len(shown) == 2  # list re-shown after the cancelled new-session prompt
+
+
+def test_session_menu_back_out_shows_no_message(tmp_path):
+    # Backing out of a menu is silent — no "closed"/"cancelled" flash before the parent
+    # (here, the palette) re-appears.
+    runner = _delay_menu_runner(tmp_path)
+    msgs: list = []
+    runner._set_message = lambda *a, **k: msgs.append(a[0] if a else k.get("message"))
+    runner._select_popup = lambda title, options: None  # Esc immediately
+
+    assert runner._session_menu() == runner._MENU_UP
+    assert msgs == []  # nothing announced on the way up
+
+
 def _copy_runner(tmp_path, status):
     import types
 
@@ -823,6 +879,7 @@ def _copy_runner(tmp_path, status):
     # The copy offer reads ignored entries too (git status --short --ignored).
     runner.repo = types.SimpleNamespace(repo=wt, status_short=lambda: status, status_short_ignored=lambda: status)
     runner.worktree = types.SimpleNamespace(name="s", path=wt)
+    runner._offer_user_commit_for_worktree_edits = lambda: None  # tested separately
     msgs: list[str] = []
     runner._set_message = lambda m, **k: msgs.append(m)
     runner._render = lambda *a, **k: None
@@ -837,6 +894,122 @@ def test_offer_copy_unstaged_copies_on_consent(tmp_path):
     runner._offer_copy_unstaged_to_base()
 
     assert (base / "new.txt").read_text() == "hello\n"
+
+
+def test_copy_offer_also_offers_user_commit_for_edits(tmp_path):
+    # When the worktree has the user's own uncommitted edits AND copy-able leftovers, BOTH
+    # prompts show: a commit prompt for the edits, then the copy prompt for the leftovers.
+    import types
+
+    runner, base, wt, _ = _copy_runner(tmp_path, "?? leftover.txt\n")
+    (wt / "leftover.txt").write_text("x\n")
+    runner.actions = types.SimpleNamespace(has_pre_agent_user_changes=lambda: True)
+    events: list[str] = []
+    runner._create_user_commit_popup = lambda *a, **k: events.append("user-commit")
+    runner._select_popup = lambda *a, **k: events.append("copy") or "No, leave them in the worktree"
+    del runner._offer_user_commit_for_worktree_edits  # use the real method
+
+    runner._offer_copy_unstaged_to_base()
+
+    assert events == ["user-commit", "copy"]  # both shown, commit prompt first
+
+
+def test_copy_offer_skips_user_commit_when_no_edits(tmp_path):
+    # No committable user edits → no commit prompt, just the copy offer.
+    import types
+
+    runner, base, wt, _ = _copy_runner(tmp_path, "?? leftover.txt\n")
+    (wt / "leftover.txt").write_text("x\n")
+    runner.actions = types.SimpleNamespace(has_pre_agent_user_changes=lambda: False)
+    events: list[str] = []
+    runner._create_user_commit_popup = lambda *a, **k: events.append("user-commit")
+    runner._select_popup = lambda *a, **k: events.append("copy") or "No, leave them in the worktree"
+    del runner._offer_user_commit_for_worktree_edits
+
+    runner._offer_copy_unstaged_to_base()
+
+    assert events == ["copy"]  # only the copy offer
+
+
+def test_offer_copy_decline_mutes_same_set_reasks_on_new_file(tmp_path):
+    # Declining mutes the SET of files: it isn't re-asked even as the same files keep
+    # changing — but a genuinely NEW file re-opens the whole set (ask about all again).
+    runner, base, wt, _ = _copy_runner(tmp_path, "?? a.txt\n?? b.txt\n")
+    (wt / "a.txt").write_text("1\n")
+    (wt / "b.txt").write_text("1\n")
+    titles: list[str] = []
+    details: list = []
+
+    def decline(title, options, **k):
+        titles.append(title)
+        details.append(k.get("detail"))
+        return "No, leave them in the worktree"
+
+    runner._select_popup = decline
+    runner._offer_copy_unstaged_to_base()
+    assert len(titles) == 1  # asked once
+    assert sorted(details[0]) == ["a.txt", "b.txt"]  # file list passed as scrollable detail
+
+    # The same set keeps changing content → NOT re-asked.
+    (wt / "a.txt").write_text("2\n")
+    (wt / "b.txt").write_text("2\n")
+    runner._offer_copy_unstaged_to_base()
+    assert len(titles) == 1  # still muted
+
+    # A new file appears → re-ask about ALL of them.
+    runner.repo.status_short_ignored = lambda: "?? a.txt\n?? b.txt\n?? c.txt\n"
+    (wt / "c.txt").write_text("1\n")
+    runner._offer_copy_unstaged_to_base()
+    assert len(titles) == 2
+    assert sorted(details[1]) == ["a.txt", "b.txt", "c.txt"]
+
+
+def test_offer_copy_turn_popup_explains_the_decline_mute(tmp_path):
+    # The offer popup tells the user that declining is sticky until the fileset changes
+    # or they switch sessions, so they know why they won't be re-asked.
+    runner, base, wt, _ = _copy_runner(tmp_path, "?? a.txt\n")
+    (wt / "a.txt").write_text("x\n")
+    seen: list[str] = []
+    runner._select_popup = lambda title, options, **k: seen.append(title) or "No, leave them in the worktree"
+
+    runner._offer_copy_unstaged_to_base()
+
+    assert "switch sessions" in seen[0] and "change as a set" in seen[0]
+
+
+def test_offer_copy_on_exit_respects_mute_unless_new_file(tmp_path):
+    # On exit, a set the user already declined (and no new file) is NOT re-prompted —
+    # the mute is respected. A genuinely new file re-opens the whole set.
+    runner, base, wt, _ = _copy_runner(tmp_path, "?? a.txt\n")
+    (wt / "a.txt").write_text("x\n")
+    runner._copy_declined = {"a.txt"}  # already muted by a prior in-session decline
+    seen: list[str] = []
+    runner._select_popup = lambda title, options, **k: seen.append(title) or "Yes, copy to the base repo"
+
+    runner._offer_copy_unstaged_to_base(context="exit")
+    assert seen == []  # same set, already declined → not asked again, even on exit
+
+    # A new file appears → re-offer all of them on exit, with the deletion warning.
+    runner.repo.status_short_ignored = lambda: "?? a.txt\n?? b.txt\n"
+    (wt / "b.txt").write_text("y\n")
+    runner._offer_copy_unstaged_to_base(context="exit")
+    assert len(seen) == 1 and "DELETED" in seen[0]
+    assert (base / "a.txt").read_text() == "x\n" and (base / "b.txt").read_text() == "y\n"
+
+
+def test_offer_copy_on_exit_esc_aborts_exit(tmp_path):
+    # Esc on the exit copy offer aborts the exit (the caller checks _exit_aborted) and
+    # discards nothing; the just-recorded fingerprints are forgotten so the next exit re-asks.
+    runner, base, wt, _ = _copy_runner(tmp_path, "?? a.txt\n")
+    (wt / "a.txt").write_text("x\n")
+    runner._exit_aborted = False
+    runner._select_popup = lambda title, options, **k: None  # Esc
+
+    runner._offer_copy_unstaged_to_base(context="exit")
+
+    assert runner._exit_aborted is True
+    assert not (base / "a.txt").exists()  # nothing copied/discarded
+    assert "a.txt" not in runner._copy_prompted  # re-offered on the next exit
 
 
 def test_offer_copy_unstaged_declined_leaves_files_and_notifies(tmp_path):
@@ -891,7 +1064,7 @@ def test_offer_copy_unstaged_overwrite_all_prompts_once(tmp_path):
     (base / "b.txt").write_text("old\n")
     titles: list[str] = []
 
-    def popup(title, options):
+    def popup(title, options, **k):
         titles.append(title)
         return "Yes, copy to the base repo" if "Copy them" in title else "Yes, overwrite all"
 
@@ -915,7 +1088,7 @@ def test_offer_copy_unstaged_overwrite_confirm_each_one(tmp_path):
     (base / "a.txt").write_text("old\n")
     (base / "b.txt").write_text("old\n")
 
-    def popup(title, options):
+    def popup(title, options, **k):
         if "Copy them" in title:
             return "Yes, copy to the base repo"
         if title.startswith(f"{2} of these"):  # the up-front overwrite question
@@ -4230,7 +4403,7 @@ def test_shared_resume_already_live_stay_switches_without_fetch():
 
     calls = {"n": 0}
 
-    def popup(title, options):
+    def popup(title, options, **k):
         calls["n"] += 1
         if calls["n"] == 1:
             return options[0]  # pick the entry
@@ -4262,7 +4435,7 @@ def test_shared_resume_update_live_overwrites_worktree_and_restarts_agent():
 
     calls = {"n": 0}
 
-    def popup(title, options):
+    def popup(title, options, **k):
         calls["n"] += 1
         return options[0] if calls["n"] == 1 else next(o for o in options if o.startswith("Update"))
 
@@ -5050,14 +5223,14 @@ def test_confine_to_worktree_noop_without_worktree_or_when_disabled(monkeypatch)
 
     monkeypatch.setattr(sandbox, "is_available", lambda: True)
     runner = make_runner(worktree=None)
-    runner.global_config = types.SimpleNamespace(sandbox=True)
+    runner._sandbox = True
     assert runner._confine_to_worktree(["claude"]) == ["claude"]
 
     runner = make_runner(
         worktree=types.SimpleNamespace(name="session-1"),
         repo=types.SimpleNamespace(repo="/repo/.agitrack/worktrees/session-1"),
     )
-    runner.global_config = types.SimpleNamespace(sandbox=False)  # user opted out
+    runner._sandbox = False  # user opted out (config or --no-sandbox)
     runner.base_repo = types.SimpleNamespace(repo="/repo")
     assert runner._confine_to_worktree(["claude"]) == ["claude"]
 
@@ -5343,7 +5516,7 @@ def test_summarizer_model_picker_lists_models_and_defaults_to_smallest_for_claud
     )
     captured: dict = {}
 
-    def popup(title, options):
+    def popup(title, options, **k):
         captured["options"] = options
         return options[0]  # accept the default (smallest)
 
@@ -5360,6 +5533,48 @@ def test_summarizer_model_picker_lists_models_and_defaults_to_smallest_for_claud
     # and session switches) and clears any per-session override.
     assert runner.global_config.summarization_model == "claude-haiku-4-5-20251001"
     assert runner.state.summarization_model is None
+
+
+def test_summarizer_menu_set_model_returns_to_menu_then_esc_closes(tmp_path):
+    # Esc goes up ONE level: opening "Set model" then Esc'ing the picker lands back on the
+    # Summarizer menu (not all the way out); Esc on the Summarizer menu then closes it.
+    from agitrack.config.settings import GlobalConfig
+    from proxy_helpers import make_runner
+
+    runner = make_runner(state=AgitrackState(tmp_path))
+    runner.global_config = GlobalConfig(tmp_path / "global" / "config.json")
+    runner._render = lambda *a, **k: None
+    runner._set_message = lambda *a, **k: None
+    runner._select_summarizer_model_popup = lambda: None  # simulate the picker being Esc'd
+    titles: list[str] = []
+
+    def select(title, options, **k):
+        titles.append(title)
+        if title == "Summarizer" and titles.count("Summarizer") == 1:
+            return next(o for o in options if o.startswith("Set model"))
+        return None  # second visit to the Summarizer menu → Esc closes it
+
+    runner._select_popup = select
+    runner._handle_summarizer_command("")
+    assert titles.count("Summarizer") == 2  # menu re-shown after the picker returned
+
+
+def test_session_menu_config_action_loops_back_then_esc_closes(tmp_path):
+    # A configuration action (Share) returns to the sessions list so its Esc lands one
+    # level up here; Esc on the list then closes the whole menu.
+    runner = _delay_menu_runner(tmp_path)
+    runner._share_session = lambda: None
+    shown: list[bool] = []
+
+    def select(title, options):
+        shown.append(True)
+        if len(shown) == 1:
+            return next(o for o in options if o.startswith("⇪ Share"))
+        return None  # close on the second visit
+
+    runner._select_popup = select
+    runner._session_menu()
+    assert len(shown) == 2  # the list re-showed after Share, then Esc closed it
 
 
 def test_summarizer_toggle_persists_to_global_config_across_restart(tmp_path):
@@ -5872,6 +6087,30 @@ def test_popup_exit_flow_background_decline_keeps_working():
     assert runner.events == []
 
 
+def test_popup_exit_flow_aborted_by_esc_on_copy_offer_stays_running():
+    # Esc on the on-exit copy offer sets _exit_aborted; the exit flow then stays running
+    # (no _exit_child), restores the exiting state, and shows a clear "Exit cancelled" message.
+    runner = _popup_exit_runner()
+    runner._confirm_exit = lambda: True
+    runner._confirm_terminate_background_sessions = lambda: True
+    runner._exiting = True
+    runner._finalized_on_exit = True
+    msgs: list[str] = []
+    runner._set_message = lambda m, **k: msgs.append(m)
+    runner._render = lambda *a, **k: None
+
+    def finalize():
+        runner.events.append("finalize")
+        runner._exit_aborted = True  # simulate Esc on the copy offer deep in finalize
+
+    runner._finalize_pending_work = finalize
+
+    assert runner._run_exit_flow() is False  # exit cancelled
+    assert runner.events == ["finalize"]  # finalized (commits stand) but did NOT exit
+    assert runner._exiting is False and runner._finalized_on_exit is False  # state restored
+    assert any("Exit cancelled" in m for m in msgs)
+
+
 def test_popup_exit_flow_double_ctrl_c_still_finalizes():
     runner = _popup_exit_runner()
 
@@ -6098,7 +6337,9 @@ def test_readme_proxy_command_list_matches_implementation():
 
     readme = Path(__file__).resolve().parents[1] / "README.md"
     block = re.search(r"```text\n(.*?)```", readme.read_text(encoding="utf-8"), re.S).group(1)
-    documented = {line.split()[0] for line in block.strip().splitlines()}
+    # The command is the field before the 2+-space column gap, so multi-word commands
+    # (e.g. "exit aGiTrack") are captured whole rather than truncated to their first word.
+    documented = {re.split(r"\s{2,}", line.strip(), maxsplit=1)[0] for line in block.strip().splitlines()}
 
     assert documented == set(ProxyInput.COMMANDS)
 

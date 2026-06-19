@@ -114,19 +114,33 @@ class SelectModal:
         title    — displayed as the popup heading
         options  — the list of selectable strings
         selected — index of the currently-highlighted option
+        detail   — optional extra lines shown between the title and the options
+                   (e.g. a file list). When they don't all fit, a window of them is
+                   shown and PgUp/PgDn scroll it.
 
     Byte handling:
         Esc (lone)      → cancel
         Ctrl-C          → exit request
         Arrow-Up        → move selection up (wraps)
         Arrow-Down      → move selection down (wraps)
+        PgUp / PgDn     → scroll the detail list (when it overflows)
         Enter/\\r/\\n   → confirm with ``options[selected]``
         Other escapes   → consumed silently
     """
 
-    def __init__(self, title: str, options: list[str]) -> None:
+    def __init__(
+        self,
+        title: str,
+        options: list[str],
+        *,
+        detail: list[str] | None = None,
+        viewport_rows: int | None = None,
+    ) -> None:
         self.title = title
         self.options = options
+        self.detail = list(detail or [])
+        self.viewport_rows = viewport_rows
+        self.detail_scroll = 0
         # A blank/whitespace-only option is a separator: rendered as a gap and
         # skipped during navigation (never highlighted, never returned). Start the
         # selection on the first real option.
@@ -149,15 +163,67 @@ class SelectModal:
                 self.selected = index
                 return
 
+    def _detail_window(self) -> int:
+        """How many detail lines fit at once. Without a known terminal height, show them
+        all (the box still clamps); otherwise leave room for the title, the scroll hints,
+        the instruction line, and the options."""
+        if not self.detail:
+            return 0
+        if not self.viewport_rows:
+            return len(self.detail)
+        title_lines = self.title.count("\n") + 1
+        overhead = title_lines + len(self.options) + 5  # instructions, gaps, 2 scroll hints
+        return max(3, self.viewport_rows - 4 - overhead)
+
+    def _option_window(self, used_rows: int) -> tuple[int, int]:
+        """The half-open ``[start, end)`` slice of options to show so the SELECTED row stays
+        visible when the list is taller than the terminal. ``used_rows`` is everything else
+        the popup already spends (title, detail, instruction, blank). Without a known
+        terminal height, show every option (the box still clamps)."""
+        count = len(self.options)
+        if not self.viewport_rows:
+            return 0, count
+        budget = max(3, self.viewport_rows - 4 - used_rows - 2)  # 2 rows reserved for hints
+        if count <= budget:
+            return 0, count
+        start = min(max(self.selected - budget // 2, 0), count - budget)
+        return start, start + budget
+
     def render_message(self) -> str:
         """Return the message string that should be shown in the popup area."""
-        lines = [self.title, "Up/Down selects. Enter confirms.", ""]
-        for index, option in enumerate(self.options):
+        lines = [self.title]
+        window = self._detail_window()
+        if self.detail:
+            total = len(self.detail)
+            start = max(0, min(self.detail_scroll, max(0, total - window)))
+            self.detail_scroll = start  # clamp persisted so PgDn past the end is a no-op
+            if start > 0:
+                lines.append(f"  ↑ {start} more above")
+            lines.extend("  " + line for line in self.detail[start : start + window])
+            below = total - (start + window)
+            if below > 0:
+                lines.append(f"  ↓ {below} more below")
+        scrollable = bool(self.detail) and len(self.detail) > window
+        lines.append(
+            "Up/Down selects. PgUp/PgDn scroll. Enter confirms." if scrollable else "Up/Down selects. Enter confirms."
+        )
+        lines.append("")
+        # Window the options so a list taller than the terminal scrolls with the selection
+        # (otherwise the box would truncate it and hide the highlighted row). Rows used so
+        # far = the title's own height plus every line after it (detail, instruction, blank).
+        title_rows = self.title.count("\n") + 1
+        start, end = self._option_window(title_rows + (len(lines) - 1))
+        if start > 0:
+            lines.append(f"  ↑ {start} more above")
+        for index in range(start, end):
+            option = self.options[index]
             if self._is_separator(option):
                 lines.append("")  # a blank gap between groups
                 continue
             prefix = "> " if index == self.selected else "  "
             lines.append(prefix + option)
+        if end < len(self.options):
+            lines.append(f"  ↓ {len(self.options) - end} more below")
         return "\n".join(lines)
 
     def feed(self, data: bytes) -> tuple[str, str | None]:
@@ -177,6 +243,12 @@ class SelectModal:
                     self._escape_buffer = None
                 elif sequence == b"\x1b[B":
                     self._advance(1)
+                    self._escape_buffer = None
+                elif sequence == b"\x1b[5~":  # PageUp — scroll the detail list up
+                    self.detail_scroll = max(0, self.detail_scroll - max(1, self._detail_window() - 1))
+                    self._escape_buffer = None
+                elif sequence == b"\x1b[6~":  # PageDown — scroll the detail list down
+                    self.detail_scroll += max(1, self._detail_window() - 1)
                     self._escape_buffer = None
                 elif _escape_sequence_complete(sequence):
                     self._escape_buffer = None
