@@ -317,6 +317,27 @@ Added --version using the package metadata; prints and exits.
       </div>
     </section>
 
+    <section class="commit agent" id="vscode">
+      <div class="commit-head">
+        <span class="sha">c0de1de</span>
+        <span class="subject"><span class="tag">&lt;aGiTrack&gt;</span> right inside your editor</span>
+      </div>
+      <h2>Or run it in VS Code, one click away.</h2>
+      <p>aGiTrack is also a <strong>VS Code extension</strong>. Install it from the Marketplace and launch
+      aGiTrack inside the editor with the <strong>aG</strong> button in the toolbar (or the
+      <span class="p">aGiTrack:</span> Command Palette commands). It runs the real CLI in an integrated
+      terminal — the agent's native interface, the <span class="p">Ctrl-G</span> menu, sessions, worktrees,
+      and per-turn auto-commits, all without leaving your editor.</p>
+      <div class="term">
+        <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="title">VS Code · aGiTrack extension</span></div>
+        <a href="images/vs-code-with-extension.png" target="_blank"><img class="shot" src="images/vs-code-with-extension.png" loading="lazy"
+          alt="aGiTrack running inside Visual Studio Code via the extension: the agent's terminal UI in an integrated terminal alongside the editor."></a>
+      </div>
+      <div class="hero-actions" style="margin-top:22px">
+        <a class="btn" href="https://marketplace.visualstudio.com/items?itemName=core-aix.agitrack-vscode">Get the VS Code extension</a>
+      </div>
+    </section>
+
     <section class="commit" id="install">
       <div class="commit-head">
         <span class="sha">e8d2fa0</span>
@@ -326,7 +347,7 @@ Added --version using the package metadata; prints and exits.
       <div class="steps">
         <div class="step"><div>
           <code>pip install agitrack</code>
-          <div class="note">Python ≥ 3.10 · to contribute, clone the repo and <span class="p">pip install -e .</span></div>
+          <div class="note">Python ≥ 3.10 · system-package Python? use <span class="p">pipx install agitrack</span> (PEP 668) · to contribute, clone the repo and <span class="p">pip install -e .</span></div>
         </div></div>
         <div class="step"><div>
           <code>cd your-repo && agitrack</code>
@@ -338,7 +359,8 @@ Added --version using the package metadata; prints and exits.
         </div></div>
       </div>
       <p style="margin-top:18px">Prompt the agent as usual. When the turn settles, the commit is already there.
-      <span class="p">git log</span> tells the rest.</p>
+      <span class="p">git log</span> tells the rest. Prefer an editor? Grab the
+      <a href="#vscode">VS Code extension</a>.</p>
     </section>
 
     <section class="commit agent">
