@@ -60,14 +60,14 @@ flowchart TD
   sig --> done(["aGiTrack exits"])
   ex --> done
 
-  click launch "#2-startup-and-launch-gating"
-  click pre "#4-before-forwarding-a-prompt-base-to-worktree"
-  click turn "#5-the-agent-turn-auto-commit-and-integration"
-  click copyback "#6-after-the-turn-copy-worktree-only-files-to-base"
-  click menu "#7-ctrl-g-command-menu"
-  click cancel "#5-the-agent-turn-auto-commit-and-integration"
-  click upd "#9-self-update-flow"
-  click ex "#10-exit-and-terminal-close"
+  click launch "#2-startup-and-launch-gating" _self
+  click pre "#4-before-forwarding-a-prompt-base-to-worktree" _self
+  click turn "#5-the-agent-turn-auto-commit-and-integration" _self
+  click copyback "#6-after-the-turn-copy-worktree-only-files-to-base" _self
+  click menu "#7-ctrl-g-command-menu" _self
+  click cancel "#5-the-agent-turn-auto-commit-and-integration" _self
+  click upd "#9-self-update-flow" _self
+  click ex "#10-exit-and-terminal-close" _self
 ```
 
 ---
@@ -108,8 +108,8 @@ flowchart TD
 
   sess["Pick the session to show: resume the repo's pinned session, or start fresh"] --> spawn["Spawn backend TUI in its worktree under the sandbox"] --> ready(["Ready for input"])
 
-  click updoffer "#9-self-update-flow"
-  click spawn "#3-worktrees-vs-no-worktree"
+  click updoffer "#9-self-update-flow" _self
+  click spawn "#3-worktrees-vs-no-worktree" _self
 ```
 
 ---
@@ -161,7 +161,7 @@ flowchart TD
   sync --> fwd["Forward the prompt to the backend"]
   fwd --> go(["Agent turn begins"])
 
-  click go "#5-the-agent-turn-auto-commit-and-integration"
+  click go "#5-the-agent-turn-auto-commit-and-integration" _self
 ```
 
 > The explicit base commit paths (this pre-prompt offer and the `git-user-commit`
@@ -201,7 +201,7 @@ flowchart TD
   discard --> copy
 
   copy["Offer to copy worktree-only files to base"] --> back(["Back to the input loop"])
-  click copy "#6-after-the-turn-copy-worktree-only-files-to-base"
+  click copy "#6-after-the-turn-copy-worktree-only-files-to-base" _self
 ```
 
 ---
@@ -255,7 +255,7 @@ flowchart TD
   copyall --> tally[["Report copied count; anything not copied gets the 'files remain' notice"]]
   tally --> done
 
-  click ucommit "#8-git-user-commit"
+  click ucommit "#8-git-user-commit" _self
 ```
 
 > A file already accepted or left in place isn't re-offered until its content changes
@@ -335,16 +335,16 @@ flowchart TD
 
   exit --> exflow["Exit confirmation"]
 
-  click snew "#3-worktrees-vs-no-worktree"
-  click gcflow "#8-git-user-commit"
-  click uflow "#9-self-update-flow"
-  click exflow "#10-exit-and-terminal-close"
-  click mode3 "#3-worktrees-vs-no-worktree"
-  click setmenu "#12-settings-menu"
-  click sshare "#11-session-sharing"
-  click srshare "#11-session-sharing"
-  click smanage "#11-session-sharing"
-  click scopy "#6-after-the-turn-copy-worktree-only-files-to-base"
+  click snew "#3-worktrees-vs-no-worktree" _self
+  click gcflow "#8-git-user-commit" _self
+  click uflow "#9-self-update-flow" _self
+  click exflow "#10-exit-and-terminal-close" _self
+  click mode3 "#3-worktrees-vs-no-worktree" _self
+  click setmenu "#12-settings-menu" _self
+  click sshare "#11-session-sharing" _self
+  click srshare "#11-session-sharing" _self
+  click smanage "#11-session-sharing" _self
+  click scopy "#6-after-the-turn-copy-worktree-only-files-to-base" _self
 ```
 
 ---
@@ -446,7 +446,7 @@ flowchart TD
   sig --> fin
   rm --> bye(["aGiTrack exits"])
 
-  click copy2 "#6-after-the-turn-copy-worktree-only-files-to-base"
+  click copy2 "#6-after-the-turn-copy-worktree-only-files-to-base" _self
 ```
 
 ---
