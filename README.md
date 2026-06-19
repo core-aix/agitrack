@@ -2,9 +2,8 @@
 
 aGiTrack stands for agent + git tracking. It is an interactive Python CLI that wraps coding-agent command line tools and Git so agentic code changes are committed with traceable metadata.
 
-aGiTrack supports OpenCode and Claude (Claude Code) as interchangeable backends. Every aGiTrack feature works the same regardless of the selected backend.
+aGiTrack supports OpenCode and Claude (Claude Code) as interchangeable backends, with more backend support being planned for the future. Every aGiTrack feature works the same regardless of the selected backend.
 
-> 📊 **[User Flow Diagram](docs/user-flow.md)** — a complete, graph-rendered map of aGiTrack's interactive logic: which file/commit status triggers which prompt, and where every option (and nested option) leads. Read it to understand exactly how aGiTrack behaves.
 
 ## Requirements
 
@@ -82,19 +81,7 @@ Switching to `--no-worktree` doesn't strand sessions you started **with** worktr
 
 On the first run, aGiTrack asks which backend should be the default (listed alphabetically, with each backend's install status). If the chosen backend's CLI is not installed, aGiTrack shows install instructions and lets you install it or pick a different one. The choice is saved in `~/.agitrack/config.json` (`default_backend`) and reused for future runs. You can also switch backends mid-session with the `agent-backend` command below.
 
-In proxy mode (default), press `Ctrl-G`, then type one of these aGiTrack commands:
-
-```text
-sessions                  switch / start (own worktree) / stop a live session
-agent-backend             switch backend (opencode|claude); shows a picker
-summarizer                toggle summarization on/off, set model, show status
-settings                  view/change all config options (repo-local or global)
-git-unstaged              show intentionally unstaged files
-git-user-commit           create a user commit
-dashboard                 serve the metrics dashboard and open it in the browser
-update                    check for / install an aGiTrack self-update
-exit                      exit (with confirmation)
-```
+In proxy mode (default), press `Ctrl-G`, then choose an aGiTrack commands from the menu.
 
 When any worktree still has un-integrated work — committed-but-unmerged commits, **or**
 uncommitted (committable) changes — a **`merge`** command appears at the **top** of the
@@ -141,6 +128,8 @@ Shared sessions also appear in the [dashboard](#dashboard) under **shared sessio
 
 
 ## How It Works
+
+> 📊 **[User Flow Diagram](docs/user-flow.md)** — a complete, graph-rendered map of aGiTrack's interactive logic: which file/commit status triggers which prompt, and where every option (and nested option) leads. Read it to understand exactly how aGiTrack behaves.
 
 ### Backends
 
