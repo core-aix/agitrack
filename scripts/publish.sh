@@ -24,14 +24,8 @@
 # not-yet-merged bump never causes a collision on the next run. Merge the PR
 # (then tag — see the printed instructions) to finish the release.
 #
-# Distribution name: `agitrack`. After the aGiT -> aGiTrack rename the
-# distribution, the import package, and the command are all `agitrack`, so users
-# `pip install agitrack` and then run `agitrack` (with `agit` kept as an alias).
-#
-# NOTE: PyPI projects cannot be renamed, so `agitrack` is a NEW project. The
-# first upload creates it and needs an ACCOUNT-scoped token (a token scoped to
-# the old `agit-ai` project cannot publish here); switch to a project-scoped
-# token once `agitrack` exists.
+# Distribution name: `agitrack`. The distribution, the import package, and the
+# command are all `agitrack`, so users `pip install agitrack` and run `agitrack`.
 #
 # Authentication:
 #   * PyPI:   uv publish reads a token from $UV_PUBLISH_TOKEN (or pass --token).
