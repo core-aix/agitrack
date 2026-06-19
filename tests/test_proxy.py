@@ -246,7 +246,7 @@ def test_menu_key_split_across_reads_under_both_protocols(protocol):
     split = len(seq) - 2  # cut mid-sequence, before the final u / ~
     forwarded, command, should_exit = _drive_host_input(runner, parser, [seq[:split], seq[split:] + b"exit\r"])
     assert forwarded == []
-    assert command == "exit"
+    assert command == "exit aGiTrack"  # typing "exit" selects the "exit aGiTrack" entry
     assert should_exit is False
 
 
@@ -6337,7 +6337,9 @@ def test_readme_proxy_command_list_matches_implementation():
 
     readme = Path(__file__).resolve().parents[1] / "README.md"
     block = re.search(r"```text\n(.*?)```", readme.read_text(encoding="utf-8"), re.S).group(1)
-    documented = {line.split()[0] for line in block.strip().splitlines()}
+    # The command is the field before the 2+-space column gap, so multi-word commands
+    # (e.g. "exit aGiTrack") are captured whole rather than truncated to their first word.
+    documented = {re.split(r"\s{2,}", line.strip(), maxsplit=1)[0] for line in block.strip().splitlines()}
 
     assert documented == set(ProxyInput.COMMANDS)
 
