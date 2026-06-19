@@ -101,8 +101,8 @@ def test_settings_menu_saves_bool_to_repo(tmp_path):
     _drive(
         runner,
         [
-            ("Settings", lambda opts: next(o for o in opts if o.startswith("Tell the agent"))),
-            ("Tell the agent", "Turn OFF"),
+            ("Settings", lambda opts: next(o for o in opts if o.startswith("Ask the agent"))),
+            ("Ask the agent", "Turn OFF"),
             ("Save", lambda opts: next(o for o in opts if o.startswith("This repository"))),
             ("Settings", "← Done"),  # loop back, then close
         ],
@@ -117,8 +117,8 @@ def test_settings_menu_saves_choice_to_global(tmp_path):
     _drive(
         runner,
         [
-            ("Settings", lambda opts: next(o for o in opts if o.startswith("Default backend"))),
-            ("Default backend", "claude"),
+            ("Settings", lambda opts: next(o for o in opts if o.startswith("Default coding agent"))),
+            ("Default coding agent", "claude"),
             ("Save", lambda opts: next(o for o in opts if o.startswith("Global"))),
             ("Settings", "← Done"),
         ],
@@ -133,8 +133,8 @@ def test_settings_menu_back_navigation_does_not_save(tmp_path):
     _drive(
         runner,
         [
-            ("Settings", lambda opts: next(o for o in opts if o.startswith("Sandbox"))),
-            ("Sandbox", "← Back"),  # back from the editor → no save, returns to list
+            ("Settings", lambda opts: next(o for o in opts if o.startswith("Confine the agent"))),
+            ("Confine the agent", "← Back"),  # back from the editor → no save, returns to list
             ("Settings", "← Done"),
         ],
     )
@@ -142,21 +142,20 @@ def test_settings_menu_back_navigation_does_not_save(tmp_path):
     assert runner.global_config.source("sandbox") == "default"  # never written
 
 
-def test_settings_menu_edits_allowed_paths_and_updates_runtime(tmp_path):
+def test_settings_menu_edits_allowed_paths(tmp_path):
     runner = _settings_runner(tmp_path)
-    runner._allowed_edit_paths = []
     _drive(
         runner,
         [
-            ("Settings", lambda opts: next(o for o in opts if o.startswith("Extra sandbox-writable"))),
-            ("Extra sandbox-writable", lambda default: "/data/shared:/srv/x"),
+            ("Settings", lambda opts: next(o for o in opts if o.startswith("Extra folders/files"))),
+            ("Extra folders/files", lambda default: "/data/shared:/srv/x"),
             ("Save", lambda opts: next(o for o in opts if o.startswith("This repository"))),
             ("Settings", "← Done"),
         ],
     )
     runner._settings_menu()
+    # Saved to config; it takes effect on the next launch (no live runtime mutation).
     assert runner.global_config.allowed_edit_paths == ["/data/shared", "/srv/x"]
-    assert runner._allowed_edit_paths == ["/data/shared", "/srv/x"]  # live runtime value too
 
 
 def test_settings_timings_submenu_saves(tmp_path):
@@ -172,3 +171,56 @@ def test_settings_timings_submenu_saves(tmp_path):
     )
     runner._settings_timings_menu()
     assert runner.global_config.timings["file_stable_seconds"] == 12.0
+
+
+def test_settings_restart_setting_warns_to_restart(tmp_path):
+    runner = _settings_runner(tmp_path)
+    msgs: list[str] = []
+    runner._set_message = lambda m, **k: msgs.append(m)
+    _drive(
+        runner,
+        [
+            ("Settings", lambda opts: next(o for o in opts if o.startswith("Confine the agent"))),  # sandbox (restart)
+            ("Confine the agent", "Turn OFF"),
+            ("Save", lambda opts: next(o for o in opts if o.startswith("Global"))),
+            ("Settings", "← Done"),
+        ],
+    )
+    runner._settings_menu()
+    assert any("restart aGiTrack yourself" in m for m in msgs)
+
+
+def test_settings_live_setting_has_no_restart_warning(tmp_path):
+    runner = _settings_runner(tmp_path)
+    msgs: list[str] = []
+    runner._set_message = lambda m, **k: msgs.append(m)
+    _drive(
+        runner,
+        [
+            # check_for_updates is read live, so changing it takes effect immediately.
+            ("Settings", lambda opts: next(o for o in opts if o.startswith("Automatically check"))),
+            ("Automatically check", "Turn OFF"),
+            ("Save", lambda opts: next(o for o in opts if o.startswith("Global"))),
+            ("Settings", "← Done"),
+        ],
+    )
+    runner._settings_menu()
+    assert any("Saved" in m for m in msgs)
+    assert not any("restart" in m.lower() for m in msgs)
+
+
+def test_settings_menu_esc_quits_whole_menu(tmp_path):
+    # Esc inside a sub-step quits the ENTIRE settings menu (not just back one level), so
+    # the list isn't shown again — "← Back" is the way to navigate back.
+    runner = _settings_runner(tmp_path)
+    lists_shown = []
+
+    def select(title, options, **k):
+        if "Settings" in title:
+            lists_shown.append(True)
+            return next(o for o in options if o.startswith("Confine the agent"))  # open the sandbox editor
+        return None  # Esc inside the editor
+
+    runner._select_popup = select
+    runner._settings_menu()
+    assert lists_shown == [True]  # shown once; Esc in the editor quit instead of looping back

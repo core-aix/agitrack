@@ -221,15 +221,16 @@ flowchart TD
   wtq -->|Yes| gather[["List worktree files that won't merge: intentionally unstaged or git-ignored (new agent files are auto-staged + committed). Skip .agitrack/ and names starting with _ or ."]]
   gather --> any{"Any candidate files?"}
   any -->|No| done
-  any -->|Yes| ctx{"Context?"}
-
-  ctx -->|Exiting| offerx[/"N file(s) will be DELETED when this worktree is removed on exit. Copy them into the base repo first? (files listed vertically, PgUp/PgDn scrolls) • No, discard them with the worktree • Yes, copy to the base repo"/]
-  ctx -->|Turn or switch| muted{"This whole SET already declined this visit, AND no genuinely new file?"}
+  any -->|Yes| muted{"This whole SET already declined, AND no genuinely new file? (applies in EVERY context, incl. exit)"}
   muted -->|Yes| done
-  muted -->|No: first ask, or a NEW path re-opens the whole set| offer[/"N file(s) won't be merged. Copy them into the base repo? (listed vertically, scrollable) Note: declining won't re-ask until the fileset changes or you switch sessions. • No, leave them in the worktree • Yes, copy to the base repo"/]
+  muted -->|No: first ask, or a NEW path re-opens the whole set| ctx{"Context?"}
+
+  ctx -->|Exiting| offerx[/"N file(s) will be DELETED when this worktree is removed on exit. Copy them into the base repo first? Esc cancels the exit so you can handle them yourself. (Files listed vertically under 'File(s):', PgUp/PgDn scrolls) • No, discard them with the worktree • Yes, copy to the base repo"/]
+  ctx -->|Turn or switch| offer[/"N file(s) won't be merged. Copy them into the base repo? (listed vertically under 'File(s):', scrollable) Note: declining won't re-ask until the fileset changes or you switch sessions. • No, leave them in the worktree • Yes, copy to the base repo"/]
 
   offer -->|No| mute[["Mute this whole set of paths (re-opened only by a new file / switch / restart); notice names the worktree path"]]
   offerx -->|No, discard| disc[["Files are discarded with the worktree"]]
+  offerx -->|Esc| abortx(["Abort the exit: keep the worktree + files; aGiTrack stays running so you can handle them"])
   mute --> done
   disc --> done
 
@@ -392,24 +393,34 @@ flowchart TD
 
 ## 10. Exit and terminal close
 
+Pressing **Esc** at any exit prompt **cancels the exit** — aGiTrack keeps running and tells
+you what was *not* done, so you can handle it yourself (commits already made this exit are
+kept; nothing is deleted). Only an explicit "Yes"/"No" choice proceeds.
+
 ```mermaid
 flowchart TD
   how{"How is aGiTrack ending?"}
-  how -->|Ctrl-G then exit, managing instance| conf[/"Exit aGiTrack? • No, keep working • Yes, exit"/]
-  conf -->|No| stay(["Keep working"])
+  how -->|Ctrl-G then exit, managing instance| conf[/"Exit aGiTrack? • No, keep working • Yes, exit (Esc cancels)"/]
+  conf -->|No / Esc| stay(["Exit cancelled — keep working (a message says nothing was shut down)"])
   conf -->|Yes| busy{"Sessions still running, turns in flight?"}
-  busy -->|Yes| term[/"Terminate them and exit? • No, keep working • Yes, terminate them and exit"/]
+  busy -->|Yes| term[/"Terminate them and exit? • No, keep working • Yes, terminate them and exit (Esc cancels)"/]
   busy -->|No| fin
-  term -->|No| stay
+  term -->|No / Esc| stay
   term -->|Yes| fin
 
-  how -->|Terminal or window closed, SIGHUP/SIGTERM| sig[["_handle_exit_signal: best-effort finalize pending work, render suppressed"]]
+  how -->|Terminal or window closed, SIGHUP/SIGTERM| sig[["_handle_exit_signal: best-effort finalize pending work, render suppressed (non-interactive)"]]
   how -->|Read-only instance| roexit[["Torn down with the window; no finalize needed"]]
 
-  fin[["Finalize: commit a just-completed turn, integrate committed work, stop the dashboard"]]
+  fin[["Finalize each session: commit a just-completed turn, integrate committed work"]]
+  fin --> copy2["Per session, before deleting its worktree: offer to copy its leftover files (see Copy)"]
+  copy2 --> esc{"Esc on that copy offer?"}
+  esc -->|Yes| abort(["Exit cancelled — worktree + files kept; message tells you to copy them then exit again"])
+  esc -->|No| rm[["Remove the (fully-integrated) worktree(s), stop the dashboard"]]
   sig --> fin
-  fin --> bye(["aGiTrack exits"])
+  rm --> bye(["aGiTrack exits"])
   roexit --> bye
+
+  click copy2 "#6-after-the-turn-copy-worktree-only-files-to-base"
 ```
 
 ---
@@ -482,30 +493,31 @@ flowchart TD
 
 ## 12. Settings menu
 
-`Ctrl-G → settings` opens an editor for **all** config options. Each shows its current
-effective value and source (`· repo` / `· global`, or nothing for a built-in default).
-Editing one asks whether to write the **repository-local** settings (`<repo>/.agitrack/
-config.json`) or the **global** settings (`~/.agitrack/config.json`); repo-local wins over
-global wins over the default (`GlobalConfig` overlay). The menu loops, so several settings
-can be changed in one visit, and every step has a "← Back" that returns without changing
-anything.
+`Ctrl-G → settings` opens an editor for **all** config options, each labelled in plain
+language and showing its current effective value and source (`· repo` / `· global`, or
+nothing for a built-in default). Editing one asks whether to write the **repository-local**
+settings (`<repo>/.agitrack/config.json`) or the **global** settings
+(`~/.agitrack/config.json`); repo-local wins over global wins over the default
+(`GlobalConfig` overlay). The menu loops so several settings can be changed in one visit.
+Navigation: **`← Back`** steps back one level; **Esc** quits the whole menu and always shows
+the same "Settings closed." message (one unified message, never sometimes-nothing).
 
 ```mermaid
 flowchart TD
-  s(["Ctrl-G → settings"]) --> list[/"Settings list — each: label, value, source. Plus 'Timings (advanced)…' and '← Done'"/]
-  list -->|← Done / cancel| close(["Close settings"])
+  s(["Ctrl-G → settings"]) --> list[/"Settings list — each: plain-language label, value, source. Plus 'Timings (advanced)…' and '← Done'"/]
+  list -->|← Done, or Esc anywhere| close(["Settings closed. (one unified message)"])
   list -->|Timings…| tlist[/"Timings list (each in seconds) + '← Back'"/]
   list -->|Pick a setting| edit{"Editor by kind"}
 
   edit -->|bool| eb[/"Turn ON / Turn OFF / ← Back"/]
   edit -->|choice e.g. backend| ec[/"Pick a value / ← Back"/]
-  edit -->|paths| ep[/"Type paths separated by the PATH separator (blank = none) / cancel"/]
-  edit -->|text e.g. model, menu key| et[/"Type a value (blank = unset) / cancel"/]
+  edit -->|paths| ep[/"Type paths separated by the PATH separator (blank = none) / ← Back"/]
+  edit -->|text e.g. model, menu key| et[/"Type a value (blank = unset) / ← Back"/]
 
-  eb -->|← Back / cancel| list
-  ec -->|← Back / cancel| list
-  ep -->|cancel| list
-  et -->|cancel| list
+  eb -->|← Back| list
+  ec -->|← Back| list
+  ep -->|← Back| list
+  et -->|← Back| list
   eb --> scope
   ec --> scope
   ep --> scope
@@ -515,14 +527,14 @@ flowchart TD
   scope -->|← Back| list
   scope -->|This repository| wrepo[["Write the repo-local overlay; repo value now wins"]]
   scope -->|Global| wglobal[["Write the global config file"]]
-  wrepo --> applied[["Live-apply where cheap (sandbox / allowed-edit-paths take effect for new sessions); launch-resolved ones (worktrees, menu key, backend) note 'next launch'"]]
+  wrepo --> applied[["Live settings (summarization, update checks) apply immediately. Launch-resolved ones (sandbox, allowed paths, worktrees, commit-guidance, backend, menu key, timings) say: won't take effect until YOU restart aGiTrack — it never restarts on its own"]]
   wglobal --> applied
   applied --> list
 
-  tlist -->|← Back| list
-  tlist -->|Pick a timing| tval[/"Type new seconds (> 0) / cancel"/]
+  tlist -->|← Back, or Esc quits the menu| list
+  tlist -->|Pick a timing| tval[/"Type new seconds (> 0) / ← Back"/]
   tval -->|valid| tscope[/"Save where? repo / global / ← Back"/]
-  tscope -->|repo or global| twrite[["Merge into the timings object at that scope (next launch)"]]
+  tscope -->|repo or global| twrite[["Merge into the timings object at that scope (restart aGiTrack to apply)"]]
   twrite --> tlist
   tscope -->|← Back| tlist
 ```
