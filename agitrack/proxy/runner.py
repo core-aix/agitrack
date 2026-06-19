@@ -7530,8 +7530,8 @@ class ProxyRunner:
         listing = ", ".join(files[:5]) + (" …" if len(files) > 5 else "")
         self._set_message(
             f"{len(files)} file(s) left in this session's worktree: {listing}. They're available at "
-            f"{wt_dir} for now, but the worktree is removed when aGiTrack exits (or the session "
-            f"integrates), so copy out anything you want to keep.",
+            f"{wt_dir} for now, but **the worktree is removed when aGiTrack exits or the session "
+            f"integrates,** so copy out anything you want to keep.",
             seconds=15.0,
         )
         self._render()
