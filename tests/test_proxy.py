@@ -839,6 +839,68 @@ def test_offer_copy_unstaged_copies_on_consent(tmp_path):
     assert (base / "new.txt").read_text() == "hello\n"
 
 
+def test_offer_copy_decline_mutes_same_set_reasks_on_new_file(tmp_path):
+    # Declining mutes the SET of files: it isn't re-asked even as the same files keep
+    # changing — but a genuinely NEW file re-opens the whole set (ask about all again).
+    runner, base, wt, _ = _copy_runner(tmp_path, "?? a.txt\n?? b.txt\n")
+    (wt / "a.txt").write_text("1\n")
+    (wt / "b.txt").write_text("1\n")
+    titles: list[str] = []
+    details: list = []
+
+    def decline(title, options, **k):
+        titles.append(title)
+        details.append(k.get("detail"))
+        return "No, leave them in the worktree"
+
+    runner._select_popup = decline
+    runner._offer_copy_unstaged_to_base()
+    assert len(titles) == 1  # asked once
+    assert sorted(details[0]) == ["a.txt", "b.txt"]  # file list passed as scrollable detail
+
+    # The same set keeps changing content → NOT re-asked.
+    (wt / "a.txt").write_text("2\n")
+    (wt / "b.txt").write_text("2\n")
+    runner._offer_copy_unstaged_to_base()
+    assert len(titles) == 1  # still muted
+
+    # A new file appears → re-ask about ALL of them.
+    runner.repo.status_short_ignored = lambda: "?? a.txt\n?? b.txt\n?? c.txt\n"
+    (wt / "c.txt").write_text("1\n")
+    runner._offer_copy_unstaged_to_base()
+    assert len(titles) == 2
+    assert sorted(details[1]) == ["a.txt", "b.txt", "c.txt"]
+
+
+def test_offer_copy_turn_popup_explains_the_decline_mute(tmp_path):
+    # The offer popup tells the user that declining is sticky until the fileset changes
+    # or they switch sessions, so they know why they won't be re-asked.
+    runner, base, wt, _ = _copy_runner(tmp_path, "?? a.txt\n")
+    (wt / "a.txt").write_text("x\n")
+    seen: list[str] = []
+    runner._select_popup = lambda title, options, **k: seen.append(title) or "No, leave them in the worktree"
+
+    runner._offer_copy_unstaged_to_base()
+
+    assert "switch sessions" in seen[0] and "change as a set" in seen[0]
+
+
+def test_offer_copy_on_exit_warns_deletion_and_ignores_mute(tmp_path):
+    # On exit the files are about to be deleted, so the offer appears even for a set the
+    # user previously declined, and the prompt warns that declining discards them.
+    runner, base, wt, _ = _copy_runner(tmp_path, "?? a.txt\n")
+    (wt / "a.txt").write_text("x\n")
+    runner._copy_declined = {"a.txt"}  # already muted by a prior in-session decline
+    seen: list[str] = []
+    runner._select_popup = lambda title, options, **k: seen.append(title) or "Yes, copy to the base repo"
+
+    runner._offer_copy_unstaged_to_base(context="exit")
+
+    assert len(seen) == 1  # the mute is ignored on exit
+    assert "DELETED" in seen[0]
+    assert (base / "a.txt").read_text() == "x\n"  # copied out before deletion
+
+
 def test_offer_copy_unstaged_declined_leaves_files_and_notifies(tmp_path):
     runner, base, wt, msgs = _copy_runner(tmp_path, "?? keep.txt\n")
     (wt / "keep.txt").write_text("x\n")
@@ -891,7 +953,7 @@ def test_offer_copy_unstaged_overwrite_all_prompts_once(tmp_path):
     (base / "b.txt").write_text("old\n")
     titles: list[str] = []
 
-    def popup(title, options):
+    def popup(title, options, **k):
         titles.append(title)
         return "Yes, copy to the base repo" if "Copy them" in title else "Yes, overwrite all"
 
@@ -915,7 +977,7 @@ def test_offer_copy_unstaged_overwrite_confirm_each_one(tmp_path):
     (base / "a.txt").write_text("old\n")
     (base / "b.txt").write_text("old\n")
 
-    def popup(title, options):
+    def popup(title, options, **k):
         if "Copy them" in title:
             return "Yes, copy to the base repo"
         if title.startswith(f"{2} of these"):  # the up-front overwrite question
@@ -4230,7 +4292,7 @@ def test_shared_resume_already_live_stay_switches_without_fetch():
 
     calls = {"n": 0}
 
-    def popup(title, options):
+    def popup(title, options, **k):
         calls["n"] += 1
         if calls["n"] == 1:
             return options[0]  # pick the entry
@@ -4262,7 +4324,7 @@ def test_shared_resume_update_live_overwrites_worktree_and_restarts_agent():
 
     calls = {"n": 0}
 
-    def popup(title, options):
+    def popup(title, options, **k):
         calls["n"] += 1
         return options[0] if calls["n"] == 1 else next(o for o in options if o.startswith("Update"))
 
@@ -5343,7 +5405,7 @@ def test_summarizer_model_picker_lists_models_and_defaults_to_smallest_for_claud
     )
     captured: dict = {}
 
-    def popup(title, options):
+    def popup(title, options, **k):
         captured["options"] = options
         return options[0]  # accept the default (smallest)
 
