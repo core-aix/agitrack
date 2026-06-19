@@ -280,10 +280,11 @@ Enter to run). Commands, in palette order:
 > a choice that moves you into a **different session** (switch / new / resume): that drops
 > straight to the agent, since there is no level to come back to.
 >
-> Internally each menu returns `UP` (Esc/back → caller re-shows itself), `DONE` (a session
-> transition → unwind to the agent), or stays in its own loop; a child's `UP` becomes the
-> parent's "re-show me". So Esc unwinds the call stack one frame at a time and the on-screen
-> hierarchy mirrors the code's call hierarchy.
+> Navigation is **silent and instant**: backing out shows no "closed/cancelled" message and
+> never flashes the bare backend screen between levels. Internally each menu is one loop
+> returning just `UP` (Esc/back → caller re-shows itself) or `DONE` (a session transition →
+> unwind to the agent); a child menu the user backs out of simply re-shows its parent. So Esc
+> unwinds the call stack one frame at a time and the on-screen hierarchy mirrors the code's.
 
 ```mermaid
 flowchart TD
