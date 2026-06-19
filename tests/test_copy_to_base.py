@@ -96,14 +96,15 @@ def test_decline_notice_gives_worktree_path_and_deletion_warning(tmp_path):
     notice = messages[-1]
     assert str(wt_dir) in notice  # the worktree path is spelled out for the user
     assert "removed when aGiTrack exits" in notice  # and the deletion warning is present
+    assert "**" in notice  # the removal warning is marked bold for emphasis
 
 
-def test_overwrite_is_reconfirmed_per_file(tmp_path):
+def test_overwrite_is_confirmed_before_replacing_base_files(tmp_path):
     runner, base_dir, wt_dir, _ = _session_with_worktree(tmp_path)
     (wt_dir / "dup.txt").write_text("NEW\n", encoding="utf-8")
     (base_dir / "dup.txt").write_text("OLD\n", encoding="utf-8")
-    # Consent to copy, then decline the per-file overwrite → base version survives.
-    answers = iter(["Yes, copy to the base repo", "No, keep the base version"])
+    # Consent to copy, then decline the (single) overwrite confirmation → base version survives.
+    answers = iter(["Yes, copy to the base repo", "No, keep the base versions"])
     runner._select_popup = lambda title, opts: next(answers)
 
     runner._offer_copy_unstaged_to_base()

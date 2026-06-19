@@ -18,10 +18,12 @@
 
 import * as vscode from "vscode";
 import { execFile, spawn } from "child_process";
-import { readFileSync } from "fs";
+import { readdirSync, readFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 
+import { dedupe, staticExeCandidates } from "./installPaths";
+import { sessionLooksLive } from "./liveness";
 import { isNativeWindows } from "./platform";
 
 const TERMINAL_NAME = "aGiTrack";
@@ -37,6 +39,11 @@ const terminals = new Map<string, vscode.Terminal>();
 // Dashboard terminals are tracked separately: the dashboard is read-only (no repo
 // lock), so it can run alongside a session.
 const dashboards = new Map<string, vscode.Terminal>();
+
+// When we launched aGiTrack in each session terminal, so the reuse check gives a new
+// session time to come up before judging it dead (see sessionStillRunning).
+const launchedAt = new WeakMap<vscode.Terminal, number>();
+const SESSION_STARTUP_GRACE_MS = 15_000;
 
 // Terminals we created, so the split-terminal handler never disposes our own
 // terminals (it fires for every opened terminal, including ours).
@@ -265,8 +272,15 @@ async function startSession(targetUri?: vscode.Uri): Promise<void> {
   const key = folder.uri.fsPath;
   const existing = terminals.get(key);
   if (existing) {
-    existing.show();
-    return; // aGiTrack already has a terminal here — bring it forward, never restart it.
+    if (await sessionStillRunning(existing, key)) {
+      existing.show();
+      return; // a RUNNING aGiTrack is here — bring it forward, never restart it.
+    }
+    // Tracked terminal, but aGiTrack is no longer running in it (e.g. a non-zero exit
+    // left the shell open). Discard the dead terminal and start a fresh session, so the
+    // aG button doesn't just keep re-focusing a lingering shell.
+    terminals.delete(key);
+    existing.dispose();
   }
 
   const exe = await ensureCliAvailable();
@@ -298,8 +312,42 @@ async function startSession(targetUri?: vscode.Uri): Promise<void> {
     icon: "git-commit",
     command: `${launchCommand(exe)} && exit`,
   });
+  launchedAt.set(terminal, Date.now());
   terminals.set(key, terminal);
   terminal.show();
+}
+
+/** Whether `terminal` still has a RUNNING aGiTrack session (so the aG button focuses it
+ * instead of starting a second one). Map presence alone isn't enough: a non-zero aGiTrack
+ * exit leaves the shell open. We confirm via the combined signals in `sessionLooksLive`.
+ * The lock is taken only after the startup privacy prompt, so a session waiting at that
+ * prompt holds no lock yet but its shell still has the aGiTrack child — hence the child
+ * check covers it. */
+async function sessionStillRunning(terminal: vscode.Terminal, folderPath: string): Promise<boolean> {
+  const pid = readAgitrackPid(folderPath);
+  return sessionLooksLive({
+    shellExited: terminal.exitStatus !== undefined,
+    msSinceLaunch: Date.now() - (launchedAt.get(terminal) ?? 0),
+    lockAlive: pid !== undefined && isAlive(pid),
+    shellHasChild: await shellHasChild(terminal),
+    graceMs: SESSION_STARTUP_GRACE_MS,
+  });
+}
+
+/** True if the terminal's shell process currently has any child — i.e. aGiTrack (run as
+ * `agitrack && exit`) is still executing in it. An idle interactive shell at a prompt
+ * (the state after a non-zero exit) has no children. POSIX-only, like aGiTrack itself. */
+async function shellHasChild(terminal: vscode.Terminal): Promise<boolean> {
+  const shellPid = await terminal.processId;
+  if (!shellPid) {
+    return false;
+  }
+  try {
+    const out = await execCapture("pgrep", ["-P", String(shellPid)], 2_000);
+    return out.trim().length > 0;
+  } catch {
+    return false; // pgrep exits non-zero when the shell has no children
+  }
 }
 
 /** Once per installed version, tell the user the reliable way to exit aGiTrack —
@@ -320,8 +368,8 @@ async function maybeShowGracefulExitTip(): Promise<void> {
   }
   await state.update(KEY, version); // remember first, so an immediate close won't re-show it
   void vscode.window.showInformationMessage(
-    "To exit aGiTrack and make sure your latest turn is committed and merged, use the " +
-      "Ctrl-G menu → exit inside aGiTrack. Closing the terminal or window still tries to " +
+    "When exiting aGiTrack later, to make sure your latest turn is committed and merged, use " +
+      "the Ctrl-G menu → exit inside aGiTrack. Closing the terminal or window still tries to " +
       "exit cleanly, but Ctrl-G → exit is the reliable way.",
     { modal: true },
     "Got it",
@@ -671,9 +719,14 @@ async function installAgitrack(): Promise<string | undefined> {
       },
     );
     if (!exe) {
-      void vscode.window.showErrorMessage(
-        "aGiTrack installed but its executable couldn't be located. Set `agitrack.path` to it manually.",
+      const pick = await vscode.window.showErrorMessage(
+        "aGiTrack installed, but its executable wasn't on any known path. Run `which agitrack` " +
+          "(or `pipx list`) in a terminal, then paste that path into the `agitrack.path` setting.",
+        "Open Setting",
       );
+      if (pick) {
+        void vscode.commands.executeCommand("workbench.action.openSettings", "agitrack.path");
+      }
       return undefined;
     }
     // Persist a resolved absolute path so later launches work even if the install
@@ -717,25 +770,56 @@ async function planInstaller(): Promise<InstallPlan | undefined> {
   return undefined;
 }
 
-/** Locate the agitrack executable produced by an install. */
+/** Locate the agitrack executable produced by an install (issue #93). A GUI-launched
+ * VSCode (Finder/Dock) doesn't inherit the shell PATH, so a bare `agitrack` won't resolve
+ * even after a successful install. We first ask the package manager exactly where it put
+ * the executable (authoritative, PATH-independent), then fall back to the well-known
+ * install locations for the host. */
 async function resolveInstalledExe(plan: InstallPlan): Promise<string | undefined> {
-  const candidates: string[] = ["agitrack", join(homedir(), ".local", "bin", "agitrack")];
+  const candidates: string[] = ["agitrack"];
+  if (plan.cmd === "pipx") {
+    // pipx knows its own app-bin directory — the most reliable answer.
+    try {
+      const binDir = (await execCapture("pipx", ["environment", "--value", "PIPX_BIN_DIR"], 5_000)).trim();
+      if (binDir) {
+        candidates.push(join(binDir, "agitrack"));
+      }
+    } catch {
+      // fall through to the static candidates
+    }
+  }
   if (plan.userBaseFrom) {
+    // pip --user puts console scripts in <user-base>/bin (covers macOS framework
+    // Python's ~/Library/Python/X.Y/bin too).
     try {
       const base = (await execCapture(plan.userBaseFrom, ["-m", "site", "--user-base"], 5_000)).trim();
       if (base) {
         candidates.push(join(base, "bin", "agitrack"));
       }
     } catch {
-      // ignore — fall back to the other candidates
+      // ignore — fall back to the static candidates
     }
   }
-  for (const candidate of candidates) {
+  candidates.push(...staticExeCandidates(homedir(), process.platform, macLibraryPythonVersions()));
+  for (const candidate of dedupe(candidates)) {
     if (await runnable(candidate)) {
       return candidate;
     }
   }
   return undefined;
+}
+
+/** Version subdirectories under ~/Library/Python (e.g. "3.12"), where macOS framework
+ * Python keeps user console scripts. Empty off macOS or when the directory is absent. */
+function macLibraryPythonVersions(): string[] {
+  if (process.platform !== "darwin") {
+    return [];
+  }
+  try {
+    return readdirSync(join(homedir(), "Library", "Python"));
+  } catch {
+    return [];
+  }
 }
 
 async function firstPython(): Promise<string | undefined> {

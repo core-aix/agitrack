@@ -152,7 +152,7 @@
   "scripts": {
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "test": "tsc -p ./ && node --test out/platform.test.js",
+    "test": "tsc -p ./ && node --test out/platform.test.js out/installPaths.test.js out/liveness.test.js",
     "vscode:prepublish": "npm run compile",
     "package": "vsce package --no-dependencies",
     "publish": "vsce publish --no-dependencies"

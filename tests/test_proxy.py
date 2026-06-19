@@ -860,7 +860,7 @@ def test_offer_copy_unstaged_overwrite_declined_keeps_base(tmp_path):
     runner, base, wt, msgs = _copy_runner(tmp_path, "?? dup.txt\n")
     (wt / "dup.txt").write_text("new\n")
     (base / "dup.txt").write_text("old\n")
-    answers = iter(["Yes, copy to the base repo", "No, keep the base version"])
+    answers = iter(["Yes, copy to the base repo", "No, keep the base versions"])
     runner._select_popup = lambda *a, **k: next(answers)
 
     runner._offer_copy_unstaged_to_base()
@@ -873,12 +873,63 @@ def test_offer_copy_unstaged_overwrite_confirmed(tmp_path):
     runner, base, wt, _ = _copy_runner(tmp_path, "?? dup.txt\n")
     (wt / "dup.txt").write_text("new\n")
     (base / "dup.txt").write_text("old\n")
-    answers = iter(["Yes, copy to the base repo", "Yes, overwrite"])
+    answers = iter(["Yes, copy to the base repo", "Yes, overwrite all"])
     runner._select_popup = lambda *a, **k: next(answers)
 
     runner._offer_copy_unstaged_to_base()
 
     assert (base / "dup.txt").read_text() == "new\n"  # overwritten
+
+
+def test_offer_copy_unstaged_overwrite_all_prompts_once(tmp_path):
+    # "Yes, overwrite all" is a SINGLE confirmation covering every conflict, not one
+    # prompt per file.
+    runner, base, wt, _ = _copy_runner(tmp_path, "?? a.txt\n?? b.txt\n?? c.txt\n")
+    for name in ("a.txt", "b.txt", "c.txt"):
+        (wt / name).write_text("new\n")
+    (base / "a.txt").write_text("old\n")  # only a.txt and b.txt pre-exist in the base
+    (base / "b.txt").write_text("old\n")
+    titles: list[str] = []
+
+    def popup(title, options):
+        titles.append(title)
+        return "Yes, copy to the base repo" if "Copy them" in title else "Yes, overwrite all"
+
+    runner._select_popup = popup
+    runner._offer_copy_unstaged_to_base()
+
+    # Exactly two popups: the copy offer + ONE overwrite confirmation for both conflicts.
+    assert len(titles) == 2
+    assert sum("verwrite" in t for t in titles) == 1
+    assert (base / "a.txt").read_text() == "new\n"
+    assert (base / "b.txt").read_text() == "new\n"
+    assert (base / "c.txt").read_text() == "new\n"  # the new (non-conflicting) file too
+
+
+def test_offer_copy_unstaged_overwrite_confirm_each_one(tmp_path):
+    # "Let me confirm each one" then prompts per conflicting file: overwrite a.txt, keep
+    # b.txt. The non-conflicting c.txt copies without a per-file prompt.
+    runner, base, wt, _ = _copy_runner(tmp_path, "?? a.txt\n?? b.txt\n?? c.txt\n")
+    for name in ("a.txt", "b.txt", "c.txt"):
+        (wt / name).write_text("new\n")
+    (base / "a.txt").write_text("old\n")
+    (base / "b.txt").write_text("old\n")
+
+    def popup(title, options):
+        if "Copy them" in title:
+            return "Yes, copy to the base repo"
+        if title.startswith(f"{2} of these"):  # the up-front overwrite question
+            return "Let me confirm each one"
+        if title.startswith("'a.txt'"):
+            return "Yes, overwrite"
+        return "No, keep the base version"  # for 'b.txt'
+
+    runner._select_popup = popup
+    runner._offer_copy_unstaged_to_base()
+
+    assert (base / "a.txt").read_text() == "new\n"  # confirmed overwrite
+    assert (base / "b.txt").read_text() == "old\n"  # declined per-file
+    assert (base / "c.txt").read_text() == "new\n"  # non-conflicting, copied
 
 
 def test_offer_copy_unstaged_noop_without_worktree(tmp_path):
@@ -943,6 +994,9 @@ def test_offer_copy_decline_notice_warns_worktree_is_removed(tmp_path):
     notice = msgs[-1]
     assert str(wt) in notice  # the worktree path is spelled out
     assert "removed when aGiTrack exits" in notice
+    # The removal warning is marked bold (**…**), which the popup renderer renders as
+    # SGR bold; the marked run covers the removal words.
+    assert "**the worktree is removed when aGiTrack exits or the session integrates,**" in notice
 
 
 def test_maybe_offer_copy_when_idle_is_gated_on_idleness(tmp_path):
@@ -5464,6 +5518,47 @@ def test_pre_agent_commit_detects_and_syncs_base_user_edits(tmp_path):
     assert runner._base_edits_declined_status is None
 
 
+def test_pre_agent_commit_stages_commits_and_syncs_a_new_base_file(tmp_path):
+    # The field scenario: the user drops a NEW (untracked, unstaged) file into the base
+    # repo — e.g. a screenshot. Before the prompt goes out, aGiTrack offers to stage it
+    # ([y/N]); on "y" it commits the file to the base branch and merges that commit into
+    # the session worktree, so both the repo and the agent get it.
+    runner, base, worktree, wt_path = _base_edit_runner(tmp_path, answers=["y", "add screenshot"])
+    runner.pre_agent_reconciled_status = ""
+    runner._finish_agent_parse_if_ready = lambda quiet: False
+    runner.actions = types.SimpleNamespace(has_pre_agent_user_changes=lambda: False)
+
+    (tmp_path / "shot.png").write_bytes(b"PNGDATA")  # added but unstaged (untracked)
+
+    assert runner._pre_agent_commit_if_needed("use the screenshot") is True
+
+    # Staged + committed to the base branch...
+    assert base._run(["git", "log", "-1", "--format=%s"]).stdout.strip() == "add screenshot"
+    assert "shot.png" in base._run(["git", "show", "--stat", "--format="]).stdout
+    # ...and merged into the worktree so the agent sees it.
+    assert (wt_path / "shot.png").read_bytes() == b"PNGDATA"
+
+
+def test_base_user_edit_declined_then_restaged_is_not_stranded(tmp_path):
+    # Saying "N" to the stage prompt must not permanently strand the file: a later
+    # pre-agent check still offers it (so the user can stage it then), and the "no" only
+    # suppresses re-prompting until the base tree changes (the fingerprint gate).
+    runner, base, worktree, wt_path = _base_edit_runner(tmp_path, answers=["N", "y", "add later"])
+    runner.pre_agent_reconciled_status = ""
+    runner._finish_agent_parse_if_ready = lambda quiet: False
+    runner.actions = types.SimpleNamespace(has_pre_agent_user_changes=lambda: False)
+    (tmp_path / "shot.png").write_bytes(b"PNGDATA")
+
+    runner._pre_agent_commit_if_needed("first")  # user says N to staging
+    assert "shot.png" not in base._run(["git", "ls-files"]).stdout  # not committed
+    assert runner._base_user_edits_pending() is True  # still offered, not stranded
+
+    runner._base_edits_declined_status = None  # simulate the base tree changing → re-offer
+    runner._pre_agent_commit_if_needed("second")  # now user says y
+    assert "shot.png" in base._run(["git", "ls-files"]).stdout  # committed this time
+    assert (wt_path / "shot.png").read_bytes() == b"PNGDATA"  # and synced
+
+
 def test_base_user_edit_decline_remembered_until_new_edits(tmp_path):
     runner, base, worktree, wt_path = _base_edit_runner(tmp_path, answers=[None])
 
@@ -5482,16 +5577,18 @@ def test_base_user_edit_decline_remembered_until_new_edits(tmp_path):
     assert len(runner.prompts) == 2
 
 
-def test_base_user_new_file_counts_as_pending_unless_declined(tmp_path):
+def test_base_user_untracked_file_counts_as_pending(tmp_path):
     runner, base, worktree, wt_path = _base_edit_runner(tmp_path, answers=[])
 
     assert runner._base_user_edits_pending() is False
+    # A new, untracked (added-but-unstaged) file in the base repo is a pending edit, so
+    # the pre-agent flow offers to stage/commit it.
     (tmp_path / "added.txt").write_text("new\n", encoding="utf-8")
     assert runner._base_user_edits_pending() is True
-    # Files the user already declined to stage don't count as pending edits.
-    state = runner._user_state()
-    state.add_declined(["added.txt"])
-    assert runner._base_user_edits_pending() is False
+    # It keeps counting even after a prior "don't stage" answer, so it can never become
+    # permanently un-committable; re-prompt nagging is handled by the fingerprint gate.
+    runner._user_state().add_declined(["added.txt"])
+    assert runner._base_user_edits_pending() is True
 
 
 def test_resume_pending_prompt_checks_base_user_edits(tmp_path):
