@@ -266,11 +266,14 @@ flowchart TD
   pal --> sessions["sessions"]
   pal --> backend["agent-backend"]
   pal --> summ["summarizer"]
+  pal --> settings2["settings"]
   pal --> gunstaged["git-unstaged"]
   pal --> gcommit["git-user-commit"]
   pal --> dash["dashboard"]
   pal --> update["update"]
   pal --> exit["exit"]
+
+  settings2 --> setmenu["Settings menu"]
 
   sessions --> smenu[/"Sessions menu (live sessions show running/idle; dormant worktrees and shared markers listed too)"/]
   smenu -->|Switch to a live session| sswitch[["Show it, relaunch TUI, re-baseline so history isn't re-committed; then offer to copy its worktree-only files"]]
@@ -308,6 +311,7 @@ flowchart TD
   click uflow "#9-self-update-flow"
   click exflow "#10-exit-and-terminal-close"
   click mode3 "#3-worktrees-vs-no-worktree"
+  click setmenu "#12-settings-menu"
   click sshare "#11-session-sharing"
   click srshare "#11-session-sharing"
   click smanage "#11-session-sharing"
@@ -473,6 +477,63 @@ flowchart TD
 > cleared, so sharing the renamed session creates a NEW `<you>/<new-name>` shared entry rather
 > than updating the one it came from. The whole feature is opt-in; nothing is uploaded without
 > an explicit "Yes" each time.
+
+---
+
+## 12. Settings menu
+
+`Ctrl-G → settings` opens an editor for **all** config options. Each shows its current
+effective value and source (`· repo` / `· global`, or nothing for a built-in default).
+Editing one asks whether to write the **repository-local** settings (`<repo>/.agitrack/
+config.json`) or the **global** settings (`~/.agitrack/config.json`); repo-local wins over
+global wins over the default (`GlobalConfig` overlay). The menu loops, so several settings
+can be changed in one visit, and every step has a "← Back" that returns without changing
+anything.
+
+```mermaid
+flowchart TD
+  s(["Ctrl-G → settings"]) --> list[/"Settings list — each: label, value, source. Plus 'Timings (advanced)…' and '← Done'"/]
+  list -->|← Done / cancel| close(["Close settings"])
+  list -->|Timings…| tlist[/"Timings list (each in seconds) + '← Back'"/]
+  list -->|Pick a setting| edit{"Editor by kind"}
+
+  edit -->|bool| eb[/"Turn ON / Turn OFF / ← Back"/]
+  edit -->|choice e.g. backend| ec[/"Pick a value / ← Back"/]
+  edit -->|paths| ep[/"Type paths separated by the PATH separator (blank = none) / cancel"/]
+  edit -->|text e.g. model, menu key| et[/"Type a value (blank = unset) / cancel"/]
+
+  eb -->|← Back / cancel| list
+  ec -->|← Back / cancel| list
+  ep -->|cancel| list
+  et -->|cancel| list
+  eb --> scope
+  ec --> scope
+  ep --> scope
+  et --> scope
+
+  scope[/"Save where? • This repository (.agitrack/config.json) • Global (all repositories) • ← Back (don't save)"/]
+  scope -->|← Back| list
+  scope -->|This repository| wrepo[["Write the repo-local overlay; repo value now wins"]]
+  scope -->|Global| wglobal[["Write the global config file"]]
+  wrepo --> applied[["Live-apply where cheap (sandbox / allowed-edit-paths take effect for new sessions); launch-resolved ones (worktrees, menu key, backend) note 'next launch'"]]
+  wglobal --> applied
+  applied --> list
+
+  tlist -->|← Back| list
+  tlist -->|Pick a timing| tval[/"Type new seconds (> 0) / cancel"/]
+  tval -->|valid| tscope[/"Save where? repo / global / ← Back"/]
+  tscope -->|repo or global| twrite[["Merge into the timings object at that scope (next launch)"]]
+  twrite --> tlist
+  tscope -->|← Back| tlist
+```
+
+> **Sandbox & allowed edit paths.** By default the backend agent is confined (`sandbox`)
+> so it can only write inside its session worktree (plus `.git`). `allowed_edit_paths`
+> lists extra directories/files it may write to (e.g. a shared data dir). Both are settable
+> here, in either config file, or per run on the command line: `--no-sandbox` and
+> `--allowed-edit-paths <path>[:<path>…]` (`:`-separated like `PATH`; a CLI flag wins over
+> config). On macOS the carve-out covers not-yet-created paths; under Linux bubblewrap a
+> path under the read-only base must already exist to become writable.
 
 ---
 

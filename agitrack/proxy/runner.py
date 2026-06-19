@@ -197,6 +197,7 @@ class ProxyInput:
         "sessions",
         "agent-backend",
         "summarizer",
+        "settings",
         "git-unstaged",
         "git-user-commit",
         "dashboard",
@@ -381,6 +382,8 @@ class ProxyRunner:
         commit_guidance: bool = True,
         full_agent_messages: bool = False,
         delay_merge: bool = False,
+        sandbox: bool = True,
+        allowed_edit_paths: list[str] | None = None,
         # Optional injected collaborators (default to production construction).
         # These keyword arguments are for testing and advanced use; the CLI call
         # site passes only the first five parameters and is unaffected.
@@ -398,6 +401,9 @@ class ProxyRunner:
         # (--no-commit-guidance / config turns it off). Appended to the agent's system prompt
         # where the backend supports it (Claude).
         self._commit_guidance = commit_guidance
+        # Effective sandbox settings (CLI flag wins over config; resolved in cli.py).
+        self._sandbox = sandbox
+        self._allowed_edit_paths = list(allowed_edit_paths or [])
         # Per-run override for the "include all agent messages" trace option
         # (--full-agent-messages). True forces it on for this run regardless of the
         # per-repo config; False (the default) defers to ``state.full_agent_messages``.
@@ -824,6 +830,8 @@ class ProxyRunner:
                 "_background_share_ops": [],
                 "_use_worktrees": True,
                 "_warned_parallel_no_worktree": False,
+                "_sandbox": True,
+                "_allowed_edit_paths": [],
                 "_commit_guidance": True,
                 "_relaunch_times": [],
                 "_exiting": False,
@@ -1084,7 +1092,7 @@ class ProxyRunner:
         self._monitor_base_edits = False
         if self.worktree is None:
             return
-        if not (self.global_config.sandbox and sandbox.is_enabled()):
+        if not (self._sandbox and sandbox.is_enabled()):
             return  # user disabled confinement
         if sandbox.is_available():
             return  # the sandbox enforces it; nothing to monitor
@@ -1678,12 +1686,17 @@ class ProxyRunner:
         # then warns if the base working tree is touched).
         if self.worktree is None:
             return command
-        if not self.global_config.sandbox:
+        if not self._sandbox:
             return command
         base = self.base_repo
         if base is None:
             return command
-        return sandbox.wrap_command(command, base=str(base.repo), worktree=str(self.repo.repo))
+        return sandbox.wrap_command(
+            command,
+            base=str(base.repo),
+            worktree=str(self.repo.repo),
+            allowed_paths=self._allowed_edit_paths,
+        )
 
     def _should_continue_session(self) -> bool:
         session_id = self.state.backend_session_id
@@ -5939,6 +5952,9 @@ class ProxyRunner:
         elif name == "summarizer":
             self._handle_summarizer_command(arg)
             return
+        elif name == "settings":
+            self._settings_menu()
+            return
         elif name == "update":
             self._handle_update_command()
             return
@@ -5952,6 +5968,159 @@ class ProxyRunner:
             self._set_message("Select an aGiTrack command.")
         else:
             self._set_message(f"Unknown aGiTrack command: {name}")
+        self._render()
+
+    # --- settings menu ------------------------------------------------------
+
+    def _settings_specs(self) -> list[dict]:
+        """Declarative registry of the user-editable config options shown in the
+        settings menu. ``kind`` drives the editor; ``restart`` marks settings resolved
+        at launch (so a change applies to new sessions / the next launch). Effective
+        values are read from ``global_config`` (repo overlay > global > built-in)."""
+        return [
+            {
+                "key": "default_backend",
+                "label": "Default backend",
+                "kind": "choice",
+                "options": ["claude", "opencode"],
+                "restart": True,
+            },
+            {"key": "sandbox", "label": "Sandbox agent writes to its worktree", "kind": "bool", "restart": True},
+            {"key": "allowed_edit_paths", "label": "Extra sandbox-writable paths", "kind": "paths", "restart": True},
+            {"key": "use_worktrees", "label": "Run each session in its own worktree", "kind": "bool", "restart": True},
+            {"key": "commit_guidance", "label": "Tell the agent aGiTrack auto-commits", "kind": "bool"},
+            {"key": "summarization_enabled", "label": "Summarize commits", "kind": "bool"},
+            {"key": "summarization_model", "label": "Summarizer model", "kind": "text"},
+            {"key": "check_for_updates", "label": "Check for aGiTrack updates", "kind": "bool"},
+            {"key": "menu_key", "label": "Command-menu key", "kind": "text", "restart": True},
+            {"key": "timings", "label": "Timings (advanced) …", "kind": "timings"},
+        ]
+
+    def _setting_value_display(self, spec: dict) -> str:
+        key, kind = spec["key"], spec["kind"]
+        if kind == "timings":
+            return ""
+        if kind == "bool":
+            text = "on" if bool(getattr(self.global_config, key)) else "off"
+        elif kind == "paths":
+            paths = self.global_config.allowed_edit_paths
+            text = ", ".join(paths) if paths else "(none)"
+        else:
+            value = getattr(self.global_config, key, None)
+            text = str(value) if value not in (None, "") else "(default)"
+        suffix = {"repo": " · repo", "global": " · global", "default": ""}[self.global_config.source(key)]
+        return f"{text}{suffix}"
+
+    def _settings_menu(self) -> None:
+        """Ctrl-G → "settings": browse and edit ALL config options. Editing returns
+        to this list (backward navigation) so several settings can be changed in one
+        visit; each save asks whether to write repo-local or global settings."""
+        while True:
+            specs = self._settings_specs()
+            options = []
+            for spec in specs:
+                disp = self._setting_value_display(spec)
+                options.append(f"{spec['label']}: {disp}" if disp else spec["label"])
+            options.append("")  # separator
+            options.append("← Done")
+            choice = self._select_popup("Settings — pick one to change", options)
+            if choice is None or choice == "← Done" or not choice.strip():
+                self._set_message("Closed settings.")
+                self._render()
+                return
+            spec = specs[options.index(choice)]
+            if spec["kind"] == "timings":
+                self._settings_timings_menu()
+            else:
+                self._edit_one_setting(spec)
+
+    def _edit_one_setting(self, spec: dict) -> None:
+        key, kind, label = spec["key"], spec["kind"], spec["label"]
+        if kind == "bool":
+            pick = self._select_popup(label, ["Turn ON", "Turn OFF", "← Back"])
+            if pick is None or pick.startswith("←"):
+                return
+            value: object = pick == "Turn ON"
+        elif kind == "choice":
+            pick = self._select_popup(label, [*spec["options"], "← Back"])
+            if pick is None or pick.startswith("←"):
+                return
+            value = pick
+        elif kind == "paths":
+            current = self.global_config.allowed_edit_paths
+            raw = self._prompt_popup(
+                label, f"Paths separated by '{os.pathsep}' (blank = none):", default=os.pathsep.join(current)
+            )
+            if raw is None:
+                return
+            value = [p.strip() for p in raw.split(os.pathsep) if p.strip()]
+        else:  # text
+            current_text = getattr(self.global_config, key, None) or ""
+            raw = self._prompt_popup(label, "New value (blank = unset):", default=str(current_text))
+            if raw is None:
+                return
+            value = raw.strip() or None
+        self._save_setting_scoped(key, value, label, restart=bool(spec.get("restart")))
+
+    def _save_setting_scoped(self, key: str, value: object, label: str, *, restart: bool) -> None:
+        pick = self._select_popup(
+            f"Save '{label}' where?",
+            ["This repository (.agitrack/config.json)", "Global (all repositories)", "← Back (don't save)"],
+        )
+        if pick is None or pick.startswith("←"):
+            return
+        scope = "repo" if pick.startswith("This repository") else "global"
+        self.global_config.set(key, value, scope=scope)
+        # Keep runtime values we resolved at launch in sync where it's cheap, so a change
+        # applies to NEW sessions without a restart (the running backend keeps its sandbox).
+        if key == "sandbox":
+            self._sandbox = bool(value)
+        elif key == "allowed_edit_paths" and isinstance(value, list):
+            self._allowed_edit_paths = [str(p) for p in value]
+        note = " Takes effect for new sessions / the next launch." if restart else ""
+        self._set_message(f"Saved '{label}' to {scope} settings.{note}", seconds=8.0)
+        self._render()
+
+    def _settings_timings_menu(self) -> None:
+        from agitrack.config.settings import DEFAULT_TIMINGS
+
+        while True:
+            timings = self.global_config.timings
+            keys = list(DEFAULT_TIMINGS)
+            options = [f"{k}: {timings[k]:g}s" for k in keys]
+            options += ["", "← Back"]
+            choice = self._select_popup("Timings (seconds) — pick one to change", options)
+            if choice is None or choice == "← Back" or not choice.strip():
+                return
+            tkey = keys[options.index(choice)]
+            raw = self._prompt_popup(
+                tkey, f"New value in seconds (current {timings[tkey]:g}):", default=str(timings[tkey])
+            )
+            if raw is None:
+                continue
+            try:
+                seconds = float(raw)
+                if seconds <= 0:
+                    raise ValueError
+            except ValueError:
+                self._set_message("Enter a positive number of seconds.")
+                self._render()
+                continue
+            self._save_timing_scoped(tkey, seconds)
+
+    def _save_timing_scoped(self, tkey: str, seconds: float) -> None:
+        pick = self._select_popup(
+            f"Save timing '{tkey}' = {seconds:g}s where?",
+            ["This repository (.agitrack/config.json)", "Global (all repositories)", "← Back (don't save)"],
+        )
+        if pick is None or pick.startswith("←"):
+            return
+        scope = "repo" if pick.startswith("This repository") else "global"
+        store = self.global_config.repo_data if scope == "repo" else self.global_config.data
+        merged = dict(store.get("timings") or {})
+        merged[tkey] = seconds
+        self.global_config.set("timings", merged, scope=scope)
+        self._set_message(f"Saved timing '{tkey}' to {scope} settings. Takes effect on the next launch.", seconds=8.0)
         self._render()
 
     def _handle_dashboard_command(self) -> None:

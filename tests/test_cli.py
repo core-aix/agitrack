@@ -198,6 +198,35 @@ def test_default_uses_config_use_worktrees(monkeypatch):
     assert captured["use_worktrees"] is False
 
 
+# --- --no-sandbox / --allowed-edit-paths ------------------------------------
+
+
+def test_sandbox_on_by_default(monkeypatch):
+    captured = _stub_launch(monkeypatch)
+    cli.main(["--backend", "opencode"])
+    assert captured["sandbox"] is True
+
+
+def test_no_sandbox_flag_disables_sandbox(monkeypatch):
+    captured = _stub_launch(monkeypatch)
+    cli.main(["--backend", "opencode", "--no-sandbox"])
+    assert captured["sandbox"] is False
+
+
+def test_allowed_edit_paths_flag_splits_on_pathsep(monkeypatch):
+    import os
+
+    captured = _stub_launch(monkeypatch)
+    cli.main(["--backend", "opencode", "--allowed-edit-paths", os.pathsep.join(["/data", "/srv/x"])])
+    assert captured["allowed_edit_paths"] == ["/data", "/srv/x"]
+
+
+def test_allowed_edit_paths_default_empty(monkeypatch):
+    captured = _stub_launch(monkeypatch)
+    cli.main(["--backend", "opencode"])
+    assert captured["allowed_edit_paths"] == []
+
+
 # --- --no-commit-guidance ---------------------------------------------------
 
 
