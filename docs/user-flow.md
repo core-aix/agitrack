@@ -271,6 +271,15 @@ flowchart TD
 `Ctrl-G` opens the command palette (type a prefix, Up/Down to select, Tab to complete,
 Enter to run). Commands, in palette order:
 
+> **One rule across every menu: Esc goes up one level.** Esc in a sub-menu returns to the
+> menu that opened it; Esc on a top-level menu (the palette, the sessions list, the settings
+> list) closes it back to the agent. A menu re-shows itself after a child menu returns, so a
+> child's Esc lands you back on its parent rather than dumping you all the way out. Picking a
+> choice that moves you into a different context (switch / new / resume a session) closes the
+> menu instead, since there is nothing to step back to. (Implementation: each menu is a
+> `while True` loop whose Esc `return`s, so Esc unwinds the call stack one frame at a time —
+> the on-screen hierarchy mirrors the code's call hierarchy.)
+
 ```mermaid
 flowchart TD
   g(["Ctrl-G"]) --> pal[/"Command palette"/]
@@ -305,7 +314,10 @@ flowchart TD
   backend -->|No arg, picker| bpick[/"Pick claude or opencode"/]
   bpick --> bswitch[["Save current backend's session, relaunch target backend, restore its last session, update global default"]]
 
-  summ --> spick[/"Pick the summarizer model, current shown"/]
+  summ --> smm[/"Summarizer menu: Toggle (ON/OFF) / Set model"/]
+  smm -->|Toggle| stog[["Flip on/off; menu re-shows"]]
+  smm -->|Set model| spick[/"Pick the summarizer model (current shown); Esc → back to the Summarizer menu"/]
+  spick --> smm
 
   gunstaged --> gu[["Show intentionally-unstaged files in the status bar"]]
 
@@ -505,18 +517,31 @@ flowchart TD
 
 `Ctrl-G → settings` opens an editor for **all** config options, each labelled in plain
 language and showing its current effective value and source (`· repo` / `· global`, or
-nothing for a built-in default). Editing one asks whether to write the **repository-local**
-settings (`<repo>/.agitrack/config.json`) or the **global** settings
-(`~/.agitrack/config.json`); repo-local wins over global wins over the default
-(`GlobalConfig` overlay). The menu loops so several settings can be changed in one visit.
-Navigation: **`← Back`** steps back one level; **Esc** quits the whole menu and always shows
-the same "Settings closed." message (one unified message, never sometimes-nothing).
+nothing for a built-in default). The menu is a small **form**: edits are collected as
+**pending** changes — each one picks its own scope, **This repository**
+(`<repo>/.agitrack/config.json`) or **Global** (`~/.agitrack/config.json`) — and is
+written only when you **save on the way out**. A pending row shows its new value as
+`· UNSAVED → repo/global`. Precedence: repo-local wins over global wins over the built-in
+default (`GlobalConfig` overlay).
+
+**Esc goes up one level**, everywhere ([§7](#7-ctrl-g-command-menu) describes the same rule
+for every menu): Esc at a value editor → back to the list; Esc at the scope prompt → back to
+the value editor; Esc on the list → close. **Closing with unsaved changes asks whether to
+save them** — *Yes, save them / No, discard them / ← Keep editing* — so nothing is written
+silently and nothing is lost without a prompt.
 
 ```mermaid
 flowchart TD
-  s(["Ctrl-G → settings"]) --> list[/"Settings list — each: plain-language label, value, source. Plus 'Timings (advanced)…' and '← Done'"/]
-  list -->|← Done, or Esc anywhere| close(["Settings closed. (one unified message)"])
-  list -->|Timings…| tlist[/"Timings list (each in seconds) + '← Back'"/]
+  s(["Ctrl-G → settings"]) --> list[/"Settings list — each: label, value, source (or '· UNSAVED → scope' for a pending edit). Plus 'Timings (advanced)…' and '← Close (save N change(s))'"/]
+  list -->|"← Close / Esc, no pending edits"| close(["Settings closed."])
+  list -->|"← Close / Esc, with pending edits"| savep[/"You have N unsaved change(s). Save them? • Yes, save them • No, discard them • ← Keep editing"/]
+  savep -->|Yes| writeall[["Write every pending edit to its chosen scope (repo overlay / global file). Restart-only settings note: won't take effect until YOU restart aGiTrack — it never restarts on its own"]]
+  savep -->|No| discard[["Drop all pending edits — nothing written"]]
+  savep -->|← Keep editing| list
+  writeall --> close
+  discard --> close
+
+  list -->|Timings…| tlist[/"Timings list (seconds), pending shown as '· UNSAVED → scope' + '← Back'"/]
   list -->|Pick a setting| edit{"Editor by kind"}
 
   edit -->|bool| eb[/"Turn ON / Turn OFF / ← Back"/]
@@ -524,29 +549,28 @@ flowchart TD
   edit -->|paths| ep[/"Type paths separated by the PATH separator (blank = none) / ← Back"/]
   edit -->|text e.g. model, menu key| et[/"Type a value (blank = unset) / ← Back"/]
 
-  eb -->|← Back| list
-  ec -->|← Back| list
-  ep -->|← Back| list
-  et -->|← Back| list
+  eb -->|← Back / Esc → up one level| list
+  ec -->|← Back / Esc| list
+  ep -->|← Back / Esc| list
+  et -->|← Back / Esc| list
   eb --> scope
   ec --> scope
   ep --> scope
   et --> scope
 
-  scope[/"Save where? • This repository (.agitrack/config.json) • Global (all repositories) • ← Back (don't save)"/]
-  scope -->|← Back| list
-  scope -->|This repository| wrepo[["Write the repo-local overlay; repo value now wins"]]
-  scope -->|Global| wglobal[["Write the global config file"]]
-  wrepo --> applied[["Live settings (summarization, update checks) apply immediately. Launch-resolved ones (sandbox, allowed paths, worktrees, commit-guidance, backend, menu key, timings) say: won't take effect until YOU restart aGiTrack — it never restarts on its own"]]
-  wglobal --> applied
-  applied --> list
+  scope[/"Apply 'setting' to: • This repository only • Global — all repositories • ← Back"/]
+  scope -->|"← Back / Esc → up one level (re-edit the value)"| edit
+  scope -->|This repository| pend[["Record a PENDING edit (value + scope) — not written yet"]]
+  scope -->|Global| pend
+  pend --> list
 
-  tlist -->|← Back, or Esc quits the menu| list
+  tlist -->|← Back / Esc → up one level| list
   tlist -->|Pick a timing| tval[/"Type new seconds (> 0) / ← Back"/]
-  tval -->|valid| tscope[/"Save where? repo / global / ← Back"/]
-  tscope -->|repo or global| twrite[["Merge into the timings object at that scope (restart aGiTrack to apply)"]]
-  twrite --> tlist
-  tscope -->|← Back| tlist
+  tval -->|"← Back / Esc"| tlist
+  tval -->|valid| tscope[/"Apply timing to: repo / global / ← Back"/]
+  tscope -->|repo or global| tpend[["Record a PENDING timing edit (saved with the rest on close)"]]
+  tpend --> tlist
+  tscope -->|"← Back / Esc → re-edit the value"| tval
 ```
 
 > **Sandbox & allowed edit paths.** By default the backend agent is confined (`sandbox`)

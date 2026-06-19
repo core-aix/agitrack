@@ -5479,6 +5479,48 @@ def test_summarizer_model_picker_lists_models_and_defaults_to_smallest_for_claud
     assert runner.state.summarization_model is None
 
 
+def test_summarizer_menu_set_model_returns_to_menu_then_esc_closes(tmp_path):
+    # Esc goes up ONE level: opening "Set model" then Esc'ing the picker lands back on the
+    # Summarizer menu (not all the way out); Esc on the Summarizer menu then closes it.
+    from agitrack.config.settings import GlobalConfig
+    from proxy_helpers import make_runner
+
+    runner = make_runner(state=AgitrackState(tmp_path))
+    runner.global_config = GlobalConfig(tmp_path / "global" / "config.json")
+    runner._render = lambda *a, **k: None
+    runner._set_message = lambda *a, **k: None
+    runner._select_summarizer_model_popup = lambda: None  # simulate the picker being Esc'd
+    titles: list[str] = []
+
+    def select(title, options, **k):
+        titles.append(title)
+        if title == "Summarizer" and titles.count("Summarizer") == 1:
+            return next(o for o in options if o.startswith("Set model"))
+        return None  # second visit to the Summarizer menu → Esc closes it
+
+    runner._select_popup = select
+    runner._handle_summarizer_command("")
+    assert titles.count("Summarizer") == 2  # menu re-shown after the picker returned
+
+
+def test_session_menu_config_action_loops_back_then_esc_closes(tmp_path):
+    # A configuration action (Share) returns to the sessions list so its Esc lands one
+    # level up here; Esc on the list then closes the whole menu.
+    runner = _delay_menu_runner(tmp_path)
+    runner._share_session = lambda: None
+    shown: list[bool] = []
+
+    def select(title, options):
+        shown.append(True)
+        if len(shown) == 1:
+            return next(o for o in options if o.startswith("⇪ Share"))
+        return None  # close on the second visit
+
+    runner._select_popup = select
+    runner._session_menu()
+    assert len(shown) == 2  # the list re-showed after Share, then Esc closed it
+
+
 def test_summarizer_toggle_persists_to_global_config_across_restart(tmp_path):
     # Turning the summarizer off must survive an aGiTrack restart: the toggle is written
     # to the durable GLOBAL config, not the transient per-session worktree state (which is

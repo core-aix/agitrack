@@ -1900,13 +1900,17 @@ def test_runner_manage_unshare_removes_session(tmp_path, monkeypatch):
     )
 
     # First popup picks the (only) session; the "Manage" popup picks Unshare (3rd
-    # action); the "Unshare …?" popup confirms.
+    # action); the "Unshare …?" popup confirms. The list loops, so close it (Esc/None)
+    # on the second visit.
+    picks = {"n": 0}
+
     def _popup(title, options):
         if title.startswith("Manage"):
             return options[2]  # Unshare
         if title.startswith("Unshare"):
             return "Yes, unshare"  # confirm the destructive removal
-        return options[0]  # the session picker
+        picks["n"] += 1
+        return options[0] if picks["n"] == 1 else None  # pick once, then close
 
     runner._select_popup = _popup
 
@@ -1970,8 +1974,16 @@ def test_manage_enabling_auto_update_syncs_immediately(tmp_path, monkeypatch):
         transcript="stale",
         manifest={"github_id": "tester", "name": "session-1", "session_id": "sid-123", "updated": 1},
     )
-    # Pick the session, then "Turn ON auto-update" (2nd action).
-    runner._select_popup = lambda title, options: options[1] if title.startswith("Manage") else options[0]
+    # Pick the session, then "Turn ON auto-update" (2nd action); close the looping list next.
+    picks = {"n": 0}
+
+    def _popup(title, options):
+        if title.startswith("Manage"):
+            return options[1]
+        picks["n"] += 1
+        return options[0] if picks["n"] == 1 else None
+
+    runner._select_popup = _popup
 
     runner._manage_shared_sessions_menu()
     # Enabling auto-update kicks the sync push onto a background thread (it must not
@@ -2000,8 +2012,17 @@ def test_manage_update_now_pushes_in_background_with_progress_notice(tmp_path, m
             "transcript_bytes": 5,
         },
     )
-    # Pick the (only) session, then "Update now" (1st action) — both are options[0].
-    runner._select_popup = lambda title, options: options[0]
+    # Pick the (only) session, then "Update now" (1st action) — both are options[0];
+    # then close the looping list (Esc/None) on the next visit.
+    picks = {"n": 0}
+
+    def _popup(title, options):
+        if title.startswith("Manage"):
+            return options[0]
+        picks["n"] += 1
+        return options[0] if picks["n"] == 1 else None
+
+    runner._select_popup = _popup
 
     runner._manage_shared_sessions_menu()
 
