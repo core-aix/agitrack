@@ -73,6 +73,15 @@ class GitRepo:
     def status_short(self) -> str:
         return self._run(["git", "status", "--short"]).stdout
 
+    def status_short_ignored(self) -> str:
+        """Porcelain short status that also lists git-ignored entries (``!! path``).
+
+        Used to find worktree files that no commit will ever carry into the base
+        directory — not just untracked/unstaged tracked edits, but also ignored
+        build output or local data the agent may have created. A wholly-ignored
+        directory is reported once as ``dir/`` rather than file-by-file."""
+        return self._run(["git", "status", "--short", "--ignored"]).stdout
+
     def status(self) -> str:
         # Full (long-format) `git status`, for the user-facing status command.
         return self._run(["git", "status"]).stdout

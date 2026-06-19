@@ -61,7 +61,9 @@ By default, each session runs in its own [git worktree](https://git-scm.com/docs
 agitrack --no-worktree
 ```
 
-Without a worktree the agent edits the current branch directly, so changes are visible live as it works — but there's no isolation or auto-integration, and concurrent sessions are unsafe in this mode (starting a new session is blocked). Because the agent edits the checked-out branch directly, the session always works on (merges into) the repo directory's **current** branch and can never be pointed at a different one — so the "change a session's merge branch" option isn't offered in this mode. If you switch the directory's branch out-of-band (e.g. `git checkout` in another terminal), aGiTrack warns you and the session follows the new branch (future changes land there). To make this the default, set `"use_worktrees": false` in `~/.agitrack/config.json`.
+Without a worktree the agent edits the current branch directly, so changes are visible live as it works — but there's no isolation or auto-integration. You can still **start and switch between multiple sessions** in this mode; they just all share the one directory, editing the same files at the same time (aGiTrack shows a one-time heads-up the first time you open a second one, and a turn's commit captures whatever is in the working tree then — coordinate as you would with another person editing the same checkout). Because the agent edits the checked-out branch directly, every session works on (merges into) the repo directory's **current** branch and can never be pointed at a different one — so the "change a session's merge branch" option isn't offered in this mode. If you switch the directory's branch out-of-band (e.g. `git checkout` in another terminal), aGiTrack warns you and the session follows the new branch (future changes land there).
+
+Switching to `--no-worktree` doesn't strand sessions you started **with** worktrees: resuming one (`Ctrl-G → sessions`, or `↻ Resume a past conversation…`) continues it in the base directory. A conversation first run inside a worktree records that worktree as its working directory; on resume here aGiTrack rewrites the recorded working directory to the base repo, so the agent runs in your directory rather than the old (now-removed) worktree path. To make no-worktree the default, set `"use_worktrees": false` in `~/.agitrack/config.json`.
 
 
 
@@ -156,6 +158,15 @@ When you start a new session you can make it either a **blank session** (a fresh
 To let sessions run without stepping on each other or on your working tree, each aGiTrack session runs in its own git worktree under `.agitrack/worktrees/<name>`, created *detached* at its merge branch — a session has no branch of its own. Work within a session is committed on per-turn branches named `agitrack/<backend>/<name>/t<turn>`, created lazily on the first commit of each turn; once a turn is integrated its branch is deleted and the worktree is detached at the merge branch again. All aGiTrack-managed branches live under the `agitrack/` prefix so they are easy to recognize for cleanup and never collide with your own branches.
 
 A session's branch is only ever advanced by **integration**: aGiTrack merges a session's pending commits back into its merge branch rather than committing onto it directly. A single-writer lock ensures only one aGiTrack process auto-commits or integrates at a time, so concurrent sessions stay consistent.
+
+#### Copying a worktree's leftover files into your directory
+
+A session's committed work reaches your directory through integration, but files that are never committed don't: untracked files you declined to stage, unstaged edits, and **git-ignored** files (build output, local data, a `.env`-style local config the agent generated). Those live only in the session's worktree — which is deleted once the session integrates or aGiTrack exits — so aGiTrack offers to copy them into the base repo directory where you actually work.
+
+- The offer appears when a turn finishes, **whether or not it produced a commit** — a turn that only touches ignored files stages nothing, yet those files may still need to come across.
+- Files whose name starts with `_` or `.` are treated as generated/hidden scaffolding (`__pycache__`, `.venv`, `.env`, editor dotfiles) and are **never** offered; if a turn changed only such files, you aren't asked at all.
+- Each file is tracked by a content fingerprint, so a file you choose to leave isn't offered again until it changes. If copying a file would overwrite one that already exists in the base directory, aGiTrack asks again per file before replacing it.
+- If you decline, the files stay in the worktree and aGiTrack tells you **where** (the worktree path is spelled out) and reminds you that the worktree is removed when aGiTrack exits or the session integrates — so copy out anything you want to keep.
 
 #### Per-session merge branches
 
