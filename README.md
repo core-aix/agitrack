@@ -2,9 +2,8 @@
 
 aGiTrack stands for *agent + git tracking*. It's a command-line tool that runs an AI coding agent for you and turns each change the agent makes into a git commit automatically — with a record of what you asked, what the agent did, and how many tokens it used. You get a clean, reviewable git history of the AI's work without committing anything by hand.
 
-You can use either **OpenCode** or **Claude (Claude Code)** as the AI agent — they're interchangeable, and every aGiTrack feature works the same way with either one.
+You can use either **OpenCode** or **Claude (Claude Code)** as the AI agent — they're interchangeable, and every aGiTrack feature works the same way with either one. Support for more agents is planned.
 
-> 📊 **[User Flow Diagram](docs/user-flow.md)** — a complete, graph-rendered map of aGiTrack's interactive logic: which file/commit status triggers which prompt, and where every option (and nested option) leads. Read it to understand exactly how aGiTrack behaves.
 
 ## Requirements
 
@@ -82,7 +81,7 @@ If you ran sessions the normal way before (each in its own worktree) and then st
 
 On the first run, aGiTrack asks which backend should be the default (listed alphabetically, with each backend's install status). If the chosen backend's CLI is not installed, aGiTrack shows install instructions and lets you install it or pick a different one. The choice is saved in `~/.agitrack/config.json` (`default_backend`) and reused for future runs. You can also switch backends mid-session with the `agent-backend` command below.
 
-In proxy mode (default), press `Ctrl-G`, then type one of these aGiTrack commands:
+In proxy mode (default), press `Ctrl-G` to open aGiTrack's menu, then pick a command from the list (or type its name):
 
 ```text
 sessions                  switch / start (own worktree) / stop a live session
@@ -141,6 +140,8 @@ Shared sessions also appear in the [dashboard](#dashboard) under **shared sessio
 
 
 ## How It Works
+
+> 📊 **[User Flow Diagram](docs/user-flow.md)** — a complete, graph-rendered map of aGiTrack's interactive logic: which file/commit status triggers which prompt, and where every option (and nested option) leads. Read it to understand exactly how aGiTrack behaves.
 
 ### Backends
 
