@@ -60,15 +60,15 @@ flowchart TD
   sig --> done(["aGiTrack exits"])
   ex --> done
 
-  click launch "#2-startup-and-launch-gating" _self
-  click pre "#4-before-forwarding-a-prompt-base-to-worktree" _self
-  click turn "#5-the-agent-turn-auto-commit-and-integration" _self
-  click copyback "#6-after-the-turn-copy-worktree-only-files-to-base" _self
-  click menu "#7-ctrl-g-command-menu" _self
-  click cancel "#5-the-agent-turn-auto-commit-and-integration" _self
-  click upd "#9-self-update-flow" _self
-  click ex "#10-exit-and-terminal-close" _self
 ```
+
+**Jump to:** [Startup and launch gating](#2-startup-and-launch-gating) ·
+[Before forwarding a prompt](#4-before-forwarding-a-prompt-base-to-worktree) ·
+[The agent turn](#5-the-agent-turn-auto-commit-and-integration) ·
+[Copy worktree-only files](#6-after-the-turn-copy-worktree-only-files-to-base) ·
+[Ctrl-G command menu](#7-ctrl-g-command-menu) ·
+[Self-update flow](#9-self-update-flow) ·
+[Exit and terminal close](#10-exit-and-terminal-close)
 
 ---
 
@@ -108,9 +108,10 @@ flowchart TD
 
   sess["Pick the session to show: resume the repo's pinned session, or start fresh"] --> spawn["Spawn backend TUI in its worktree under the sandbox"] --> ready(["Ready for input"])
 
-  click updoffer "#9-self-update-flow" _self
-  click spawn "#3-worktrees-vs-no-worktree" _self
 ```
+
+**Jump to:** [Self-update flow](#9-self-update-flow) ·
+[Worktrees vs no-worktree](#3-worktrees-vs-no-worktree)
 
 ---
 
@@ -160,9 +161,9 @@ flowchart TD
   basecommit --> sync[["_sync_idle_worktrees_to_base: merge / re-point the new base commit into the worktree(s)"]]
   sync --> fwd["Forward the prompt to the backend"]
   fwd --> go(["Agent turn begins"])
-
-  click go "#5-the-agent-turn-auto-commit-and-integration" _self
 ```
+
+**Jump to:** [The agent turn](#5-the-agent-turn-auto-commit-and-integration)
 
 > The explicit base commit paths (this pre-prompt offer and the `git-user-commit`
 > command) re-offer **every** untracked file (`include_declined=True`), so a previously
@@ -201,8 +202,9 @@ flowchart TD
   discard --> copy
 
   copy["Offer to copy worktree-only files to base"] --> back(["Back to the input loop"])
-  click copy "#6-after-the-turn-copy-worktree-only-files-to-base" _self
 ```
+
+**Jump to:** [Copy worktree-only files to base](#6-after-the-turn-copy-worktree-only-files-to-base)
 
 ---
 
@@ -254,9 +256,9 @@ flowchart TD
   skipc --> tally
   copyall --> tally[["Report copied count; anything not copied gets the 'files remain' notice"]]
   tally --> done
-
-  click ucommit "#8-git-user-commit" _self
 ```
+
+**Jump to:** [`git-user-commit`](#8-git-user-commit)
 
 > A file already accepted or left in place isn't re-offered until its content changes
 > (fingerprint). Declining mutes the whole current **set of paths** — aGiTrack won't ask
@@ -334,18 +336,15 @@ flowchart TD
   update --> uflow["aGiTrack self-update flow"]
 
   exit --> exflow["Exit confirmation"]
-
-  click snew "#3-worktrees-vs-no-worktree" _self
-  click gcflow "#8-git-user-commit" _self
-  click uflow "#9-self-update-flow" _self
-  click exflow "#10-exit-and-terminal-close" _self
-  click mode3 "#3-worktrees-vs-no-worktree" _self
-  click setmenu "#12-settings-menu" _self
-  click sshare "#11-session-sharing" _self
-  click srshare "#11-session-sharing" _self
-  click smanage "#11-session-sharing" _self
-  click scopy "#6-after-the-turn-copy-worktree-only-files-to-base" _self
 ```
+
+**Jump to:** [Worktrees vs no-worktree](#3-worktrees-vs-no-worktree) ·
+[Copy worktree-only files](#6-after-the-turn-copy-worktree-only-files-to-base) ·
+[`git-user-commit`](#8-git-user-commit) ·
+[Self-update flow](#9-self-update-flow) ·
+[Exit and terminal close](#10-exit-and-terminal-close) ·
+[Session sharing](#11-session-sharing) ·
+[Settings menu](#12-settings-menu)
 
 ---
 
@@ -445,9 +444,9 @@ flowchart TD
   esc -->|No| rm[["Remove the (fully-integrated) worktree(s), stop the dashboard"]]
   sig --> fin
   rm --> bye(["aGiTrack exits"])
-
-  click copy2 "#6-after-the-turn-copy-worktree-only-files-to-base" _self
 ```
+
+**Jump to:** [Copy worktree-only files to base](#6-after-the-turn-copy-worktree-only-files-to-base)
 
 ---
 
