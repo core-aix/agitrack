@@ -368,8 +368,8 @@ async function maybeShowGracefulExitTip(): Promise<void> {
   }
   await state.update(KEY, version); // remember first, so an immediate close won't re-show it
   void vscode.window.showInformationMessage(
-    "To exit aGiTrack and make sure your latest turn is committed and merged, use the " +
-      "Ctrl-G menu → exit inside aGiTrack. Closing the terminal or window still tries to " +
+    "When exiting aGiTrack later, to make sure your latest turn is committed and merged, use " +
+      "the Ctrl-G menu → exit inside aGiTrack. Closing the terminal or window still tries to " +
       "exit cleanly, but Ctrl-G → exit is the reliable way.",
     { modal: true },
     "Got it",
