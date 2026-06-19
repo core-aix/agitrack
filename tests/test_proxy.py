@@ -860,7 +860,7 @@ def test_offer_copy_unstaged_overwrite_declined_keeps_base(tmp_path):
     runner, base, wt, msgs = _copy_runner(tmp_path, "?? dup.txt\n")
     (wt / "dup.txt").write_text("new\n")
     (base / "dup.txt").write_text("old\n")
-    answers = iter(["Yes, copy to the base repo", "No, keep the base version"])
+    answers = iter(["Yes, copy to the base repo", "No, keep the base versions"])
     runner._select_popup = lambda *a, **k: next(answers)
 
     runner._offer_copy_unstaged_to_base()
@@ -873,12 +873,37 @@ def test_offer_copy_unstaged_overwrite_confirmed(tmp_path):
     runner, base, wt, _ = _copy_runner(tmp_path, "?? dup.txt\n")
     (wt / "dup.txt").write_text("new\n")
     (base / "dup.txt").write_text("old\n")
-    answers = iter(["Yes, copy to the base repo", "Yes, overwrite"])
+    answers = iter(["Yes, copy to the base repo", "Yes, overwrite them"])
     runner._select_popup = lambda *a, **k: next(answers)
 
     runner._offer_copy_unstaged_to_base()
 
     assert (base / "dup.txt").read_text() == "new\n"  # overwritten
+
+
+def test_offer_copy_unstaged_overwrite_prompts_once_for_all(tmp_path):
+    # Multiple files that would overwrite existing base files get a SINGLE all-or-nothing
+    # confirmation, not one prompt per file.
+    runner, base, wt, _ = _copy_runner(tmp_path, "?? a.txt\n?? b.txt\n?? c.txt\n")
+    for name in ("a.txt", "b.txt", "c.txt"):
+        (wt / name).write_text("new\n")
+    (base / "a.txt").write_text("old\n")  # only a.txt and b.txt pre-exist in the base
+    (base / "b.txt").write_text("old\n")
+    titles: list[str] = []
+
+    def popup(title, options):
+        titles.append(title)
+        return "Yes, copy to the base repo" if "Copy them" in title else "Yes, overwrite them"
+
+    runner._select_popup = popup
+    runner._offer_copy_unstaged_to_base()
+
+    # Exactly two popups: the copy offer + ONE overwrite confirmation for both conflicts.
+    assert len(titles) == 2
+    assert sum("verwrite" in t for t in titles) == 1
+    assert (base / "a.txt").read_text() == "new\n"
+    assert (base / "b.txt").read_text() == "new\n"
+    assert (base / "c.txt").read_text() == "new\n"  # the new (non-conflicting) file too
 
 
 def test_offer_copy_unstaged_noop_without_worktree(tmp_path):

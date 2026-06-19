@@ -177,7 +177,7 @@ A session's committed work reaches your directory through integration, but files
 
 - The offer appears when a turn finishes, **whether or not it produced a commit** — a turn that only touches ignored files stages nothing, yet those files may still need to come across.
 - Files whose name starts with `_` or `.` are treated as generated/hidden scaffolding (`__pycache__`, `.venv`, `.env`, editor dotfiles) and are **never** offered; if a turn changed only such files, you aren't asked at all.
-- Each file is tracked by a content fingerprint, so a file you choose to leave isn't offered again until it changes. If copying a file would overwrite one that already exists in the base directory, aGiTrack asks again per file before replacing it.
+- Each file is tracked by a content fingerprint, so a file you choose to leave isn't offered again until it changes. If any of the files would overwrite ones that already exist in the base directory, aGiTrack asks once to confirm replacing them all (declining skips just those — the new files are still copied).
 - If you decline, the files stay in the worktree and aGiTrack tells you **where** (the worktree path is spelled out) and reminds you that the worktree is removed when aGiTrack exits or the session integrates — so copy out anything you want to keep.
 
 #### Per-session merge branches

@@ -8,6 +8,14 @@ matches the `agitrack` release it launches.
 
 Launch the full aGiTrack terminal application from VSCode — no terminal typing.
 
+- **Fixed: the aG button stopped opening a new session after a previous one stopped.**
+  aGiTrack only auto-closes its terminal on a clean exit (`… && exit`); a non-zero exit
+  leaves the shell open, so the terminal lingered in the tracking map and the aG button
+  kept re-focusing that dead shell instead of starting fresh. The button now checks
+  whether a session is actually still running (the repo-lock PID, or — for a session
+  still at the startup privacy prompt, before the lock is taken — whether the shell still
+  has the aGiTrack child process) and discards a lingering shell before launching a new
+  session.
 - **Fixed: "aGiTrack installed but its executable couldn't be located"** after a
   Marketplace install ([#93](https://github.com/core-aix/agitrack/issues/93)). A VSCode
   launched from Finder/Dock doesn't inherit the shell `PATH`, so a bare `agitrack` lookup
