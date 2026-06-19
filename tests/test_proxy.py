@@ -811,6 +811,32 @@ def test_session_menu_explicit_integrate_choice_integrates(tmp_path):
     assert called == [True]
 
 
+def test_session_menu_esc_signals_up_and_reopens_palette(tmp_path):
+    # Esc on the sessions list goes UP one level — to the Ctrl-G command palette — not all
+    # the way to the agent. _session_menu returns _MENU_UP; _run_command re-opens the palette.
+    runner = _delay_menu_runner(tmp_path)
+    runner._select_popup = lambda title, options: None  # Esc on the list
+
+    assert runner._session_menu() == runner._MENU_UP
+
+    # Going through the command dispatch, an UP signal re-opens the input-layer palette.
+    runner.input.capturing = False
+    runner._render = lambda *a, **k: None
+    runner._has_unmerged_work = lambda: False
+    runner._after_menu_command(runner._MENU_UP)
+    assert runner.input.capturing is True  # back at the palette, one level up
+
+
+def test_session_menu_transition_signals_done(tmp_path):
+    # Starting a new session is a context transition: it returns _MENU_DONE so the menu
+    # unwinds straight to the agent (the palette is NOT re-opened).
+    runner = _delay_menu_runner(tmp_path)
+    runner._prompt_new_session = lambda: None
+    runner._select_popup = lambda title, options: next(o for o in options if o.startswith("+ New session"))
+
+    assert runner._session_menu() == runner._MENU_DONE
+
+
 def _copy_runner(tmp_path, status):
     import types
 
