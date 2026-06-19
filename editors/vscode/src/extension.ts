@@ -18,10 +18,11 @@
 
 import * as vscode from "vscode";
 import { execFile, spawn } from "child_process";
-import { readFileSync } from "fs";
+import { readdirSync, readFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 
+import { dedupe, staticExeCandidates } from "./installPaths";
 import { isNativeWindows } from "./platform";
 
 const TERMINAL_NAME = "aGiTrack";
@@ -671,9 +672,14 @@ async function installAgitrack(): Promise<string | undefined> {
       },
     );
     if (!exe) {
-      void vscode.window.showErrorMessage(
-        "aGiTrack installed but its executable couldn't be located. Set `agitrack.path` to it manually.",
+      const pick = await vscode.window.showErrorMessage(
+        "aGiTrack installed, but its executable wasn't on any known path. Run `which agitrack` " +
+          "(or `pipx list`) in a terminal, then paste that path into the `agitrack.path` setting.",
+        "Open Setting",
       );
+      if (pick) {
+        void vscode.commands.executeCommand("workbench.action.openSettings", "agitrack.path");
+      }
       return undefined;
     }
     // Persist a resolved absolute path so later launches work even if the install
@@ -717,25 +723,56 @@ async function planInstaller(): Promise<InstallPlan | undefined> {
   return undefined;
 }
 
-/** Locate the agitrack executable produced by an install. */
+/** Locate the agitrack executable produced by an install (issue #93). A GUI-launched
+ * VSCode (Finder/Dock) doesn't inherit the shell PATH, so a bare `agitrack` won't resolve
+ * even after a successful install. We first ask the package manager exactly where it put
+ * the executable (authoritative, PATH-independent), then fall back to the well-known
+ * install locations for the host. */
 async function resolveInstalledExe(plan: InstallPlan): Promise<string | undefined> {
-  const candidates: string[] = ["agitrack", join(homedir(), ".local", "bin", "agitrack")];
+  const candidates: string[] = ["agitrack"];
+  if (plan.cmd === "pipx") {
+    // pipx knows its own app-bin directory — the most reliable answer.
+    try {
+      const binDir = (await execCapture("pipx", ["environment", "--value", "PIPX_BIN_DIR"], 5_000)).trim();
+      if (binDir) {
+        candidates.push(join(binDir, "agitrack"));
+      }
+    } catch {
+      // fall through to the static candidates
+    }
+  }
   if (plan.userBaseFrom) {
+    // pip --user puts console scripts in <user-base>/bin (covers macOS framework
+    // Python's ~/Library/Python/X.Y/bin too).
     try {
       const base = (await execCapture(plan.userBaseFrom, ["-m", "site", "--user-base"], 5_000)).trim();
       if (base) {
         candidates.push(join(base, "bin", "agitrack"));
       }
     } catch {
-      // ignore — fall back to the other candidates
+      // ignore — fall back to the static candidates
     }
   }
-  for (const candidate of candidates) {
+  candidates.push(...staticExeCandidates(homedir(), process.platform, macLibraryPythonVersions()));
+  for (const candidate of dedupe(candidates)) {
     if (await runnable(candidate)) {
       return candidate;
     }
   }
   return undefined;
+}
+
+/** Version subdirectories under ~/Library/Python (e.g. "3.12"), where macOS framework
+ * Python keeps user console scripts. Empty off macOS or when the directory is absent. */
+function macLibraryPythonVersions(): string[] {
+  if (process.platform !== "darwin") {
+    return [];
+  }
+  try {
+    return readdirSync(join(homedir(), "Library", "Python"));
+  } catch {
+    return [];
+  }
 }
 
 async function firstPython(): Promise<string | undefined> {
