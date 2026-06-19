@@ -19,11 +19,23 @@ pip install agitrack
 
 This installs the `agitrack` command and the terminal UI dependency used for status bars and contextual command hints. The PyPI distribution, the importable package, and the command are all named `agitrack`. Once installed, aGiTrack keeps itself up to date — see [Self-update](#self-update).
 
+On systems where Python comes from a system package manager (many Linux distributions, or Homebrew on macOS), `pip` may refuse to install into the system environment with an "externally-managed-environment" error ([PEP 668](https://peps.python.org/pep-0668/)). In that case install with [`pipx`](https://pipx.pypa.io) instead, which puts `agitrack` in its own isolated environment and on your PATH:
+
+```bash
+pipx install agitrack
+```
+
 For local development, install from a checkout instead:
 
 ```bash
 python3 -m pip install -e .
 ```
+
+### VS Code extension
+
+aGiTrack is also available as a **[VS Code extension](https://marketplace.visualstudio.com/items?itemName=core-aix.agitrack-vscode)**. Install it from the Marketplace and launch aGiTrack inside VS Code with one click — the **aG** button in the editor toolbar (top-right), or the `aGiTrack:` commands in the Command Palette. It runs the real aGiTrack CLI in an integrated terminal (installing the CLI on first use if it's missing), so you get the complete experience — the agent's native interface, the `Ctrl-G` menu, sessions, sharing, worktrees, and per-turn auto-commits. See [Editor integration](#editor-integration) for details.
+
+![aGiTrack running inside VS Code via the extension](https://raw.githubusercontent.com/core-aix/agitrack/main/docs/images/vs-code-with-extension.png)
 
 
 ## Usage
@@ -336,7 +348,7 @@ scripts/demo.sh --model haiku --dir /tmp/agitrack-demo
 
 ### Editor integration
 
-A VSCode extension in [`editors/vscode/`](editors/vscode/) lets you **install aGiTrack as a VSCode plugin and launch it inside VSCode with one click** — without opening a terminal and typing `agitrack` yourself. It's a thin launcher: a brand-icon button in the editor toolbar (or the `aGiTrack:` Command Palette commands) runs the real aGiTrack CLI in a VSCode terminal, so you get the **complete experience** (the agent's native interface, the `Ctrl-G` command menu, sessions, sharing, worktrees, per-turn auto-commits — everything proxy mode does). It also installs the aGiTrack CLI on first use if it's missing, works over Remote-SSH / WSL / containers (running where the code lives), and routes the dashboard to your local browser. The TypeScript side isn't built by the Python CI — see its README to build (`npm install && npm run compile`), run it (F5 → "Run Extension"), package a `.vsix` (`npm run package`), or publish to the Marketplace (`npm run publish`, needs the maintainer's publisher token).
+The VSCode extension — on the [Marketplace](https://marketplace.visualstudio.com/items?itemName=core-aix.agitrack-vscode), source in [`editors/vscode/`](editors/vscode/) — lets you **install aGiTrack as a VSCode plugin and launch it inside VSCode with one click** — without opening a terminal and typing `agitrack` yourself. It's a thin launcher: a brand-icon button in the editor toolbar (or the `aGiTrack:` Command Palette commands) runs the real aGiTrack CLI in a VSCode terminal, so you get the **complete experience** (the agent's native interface, the `Ctrl-G` command menu, sessions, sharing, worktrees, per-turn auto-commits — everything proxy mode does). It also installs the aGiTrack CLI on first use if it's missing, works over Remote-SSH / WSL / containers (running where the code lives), and routes the dashboard to your local browser. The TypeScript side isn't built by the Python CI — see its README to build (`npm install && npm run compile`), run it (F5 → "Run Extension"), package a `.vsix` (`npm run package`), or publish to the Marketplace (`npm run publish`, needs the maintainer's publisher token).
 
 ### Forwarding arguments to the backend
 
