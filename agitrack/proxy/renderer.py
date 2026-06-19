@@ -739,7 +739,7 @@ class ScreenRenderer:
         header = [
             "aGiTrack commands",
             f"> {input_text}",
-            "Up/Down selects. Tab completes. Enter runs. Esc/Ctrl-C cancels.",
+            "Up/Down selects. Tab completes. Enter runs. Esc cancels.",
             "",
         ]
         # Size the match window to whatever fits below the header: append_box caps

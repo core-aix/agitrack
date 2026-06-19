@@ -3964,8 +3964,8 @@ class ProxyRunner:
 
     def _drain_pty_until_done_or_esc(self, thread, *, deadline: float | None = None) -> str:
         """Wait for *thread* while keeping the UI alive (PTYs draining) so the wait
-        is responsive, not a freeze, and the user can press Esc/Ctrl-C to stop.
-        Returns ``"done"`` when the thread finishes, ``"cancel"`` on Esc/Ctrl-C, or
+        is responsive, not a freeze, and the user can press Esc to stop.
+        Returns ``"done"`` when the thread finishes, ``"cancel"`` on Esc, or
         ``"timeout"`` if the optional *deadline* passes first. Shared by the two
         cancellable shared-session fetches (listing and full-transcript)."""
         thread.join(timeout=0.05)  # fast fetches (and tests) finish without the wait UI
@@ -4315,7 +4315,7 @@ class ProxyRunner:
             self._shared_resume_thread, deadline=time.monotonic() + self.RESUME_FETCH_TIMEOUT + 2.0
         )
         if status == "cancel":
-            # The user pressed Esc/Ctrl-C: stop and reset all fetch state so a retry
+            # The user pressed Esc: stop and reset all fetch state so a retry
             # can start immediately. This is the ONLY path that reports "cancelled".
             self._abort_shared_resume(cancel)
             self._set_message(f"Stopped fetching '{entry.display}' (cancelled).", seconds=6.0)
