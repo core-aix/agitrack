@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -83,6 +84,21 @@ def main(argv: list[str] | None = None) -> int:
         help="do not tell the coding agent that aGiTrack handles commits; by default aGiTrack "
         "appends a note to the agent's system prompt (where the backend supports it) so the "
         "agent does not create its own git commits unless you explicitly ask",
+    )
+    parser.add_argument(
+        "--no-sandbox",
+        action="store_true",
+        help="do not confine the agent's writes to its session worktree; by default aGiTrack "
+        "sandboxes the backend so it can only write inside its worktree (plus .git). Also "
+        "settable via 'sandbox' in config.",
+    )
+    parser.add_argument(
+        "--allowed-edit-paths",
+        default=None,
+        metavar="PATH[:PATH...]",
+        help="extra paths the sandbox lets the agent write to, beyond its worktree — "
+        "multiple paths separated by '%s' (like PATH). Also settable via "
+        "allowed_edit_paths in config." % os.pathsep,
     )
     parser.add_argument(
         "--delay-merge",
@@ -243,13 +259,6 @@ def main(argv: list[str] | None = None) -> int:
         # First run also picks the default summarizer model, saved to the global config.
         select_default_summarizer_model(config, chosen_backend)
 
-    # Worktrees on unless the config opts out or --no-worktree is passed (flag wins).
-    use_worktrees = False if args.no_worktree else config.use_worktrees
-    # The agent commit-guidance note is on unless the config opts out or
-    # --no-commit-guidance is passed (flag wins). getattr keeps a config written before
-    # this key existed (or a partial stub) defaulting to on.
-    commit_guidance = False if args.no_commit_guidance else getattr(config, "commit_guidance", True)
-
     if backend_args:
         _warn_reserved_passthrough(args.backend or config.default_backend, backend_args)
 
@@ -267,6 +276,19 @@ def main(argv: list[str] | None = None) -> int:
     from agitrack.config.migrate import migrate_repo_state
 
     migrate_repo_state(repo)
+
+    # Now that we know the repo, layer its local settings (.agitrack/config.json) over
+    # the global config, then resolve the effective settings. A CLI flag always wins;
+    # otherwise the (repo-overlaid) config value applies. getattr keeps a config written
+    # before these keys existed (or a partial stub) working with the defaults.
+    getattr(config, "load_repo_overlay", lambda _root: None)(repo.repo)
+    use_worktrees = False if args.no_worktree else config.use_worktrees
+    commit_guidance = False if args.no_commit_guidance else getattr(config, "commit_guidance", True)
+    sandbox_enabled = False if args.no_sandbox else getattr(config, "sandbox", True)
+    if args.allowed_edit_paths is not None:
+        allowed_edit_paths = [p for p in args.allowed_edit_paths.split(os.pathsep) if p.strip()]
+    else:
+        allowed_edit_paths = getattr(config, "allowed_edit_paths", [])
 
     # Refuse a second instance on this repo up front — BEFORE the privacy prompt —
     # so the user isn't asked to acknowledge anything only to be turned away. The
@@ -305,6 +327,8 @@ def main(argv: list[str] | None = None) -> int:
                 commit_guidance=commit_guidance,
                 full_agent_messages=args.full_agent_messages,
                 delay_merge=args.delay_merge,
+                sandbox=sandbox_enabled,
+                allowed_edit_paths=allowed_edit_paths,
             ).run()
     except (GitError, RuntimeError) as error:
         print(error)

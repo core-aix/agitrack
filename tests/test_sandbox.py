@@ -219,6 +219,36 @@ def test_build_profile_allows_agent_update_dir_under_repo(monkeypatch, tmp_path)
     assert allow_agent > deny_base  # later rule wins -> updates allowed
 
 
+def test_build_profile_allows_user_allowed_paths(tmp_path):
+    # A user-specified allowed path is re-allowed for writes after the base deny, even
+    # if it doesn't exist yet (subpath rules cover not-yet-created files).
+    base = tmp_path / "repo"
+    wt = base / ".agitrack" / "worktrees" / "s1"
+    wt.mkdir(parents=True)
+    allowed = base / "data" / "shared"  # under the base (the interesting case), not created
+    lines = sandbox.build_profile(str(base), str(wt), [str(allowed)]).splitlines()
+    deny_base = next(i for i, ln in enumerate(lines) if "deny" in ln and str(base.resolve()) in ln)
+    allow_user = next(i for i, ln in enumerate(lines) if "allow" in ln and str(os.path.realpath(allowed)) in ln)
+    assert allow_user > deny_base  # later rule wins → writes allowed
+
+
+def test_build_bwrap_command_binds_existing_allowed_path_under_base(tmp_path):
+    base = tmp_path / "repo"
+    (base / ".git").mkdir(parents=True)
+    wt = base / ".agitrack" / "worktrees" / "s1"
+    wt.mkdir(parents=True)
+    allowed = base / "data"
+    allowed.mkdir(parents=True)
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    args = sandbox.build_bwrap_command(str(base), str(wt), [str(allowed), str(outside)])
+    # Under-base allowed dir is re-bound read-write; an outside one is already RW (not bound).
+    ro_base = args.index(str(base.resolve()))
+    bind_allowed = args.index(str(allowed.resolve()))
+    assert args[bind_allowed - 1] == "--bind" and bind_allowed > ro_base
+    assert str(outside.resolve()) not in args
+
+
 def test_build_bwrap_command_rebinds_agent_dir_under_base(monkeypatch, tmp_path):
     base = tmp_path / "repo"
     (base / ".git").mkdir(parents=True)

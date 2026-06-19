@@ -178,14 +178,15 @@ def _quote(path: str) -> str:
     return path.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def build_profile(base: str, worktree: str) -> str:
+def build_profile(base: str, worktree: str, allowed_paths: list[str] | None = None) -> str:
     """A ``sandbox-exec`` profile: allow everything, then deny writes inside the
     base repo *and* the worktrees root (so sibling sessions are off-limits too),
-    then re-allow the repo's ``.git``, *this* session's worktree, and the backend
-    agent's own install/update dirs. Later rules win, so the worktree allow
-    overrides the worktrees-root deny, and the agent-toolchain allows override the
-    base deny for any agent dir that happens to live under the repo (keeping a
-    backend self-update working)."""
+    then re-allow the repo's ``.git``, *this* session's worktree, the backend
+    agent's own install/update dirs, and any user-specified ``allowed_paths``.
+    Later rules win, so the worktree allow overrides the worktrees-root deny, and
+    the agent-toolchain / allowed-path allows override the base deny for any path
+    that happens to live under the repo (keeping a backend self-update working and
+    honoring explicit write carve-outs)."""
     base = os.path.realpath(base)
     worktree = os.path.realpath(worktree)
     worktrees_root = os.path.dirname(worktree)  # sibling sessions live alongside
@@ -201,6 +202,10 @@ def build_profile(base: str, worktree: str) -> str:
     # install/state/config/download dirs even when they sit under the base repo.
     for path in agent_writable_dirs():
         lines.append(f'(allow file-write* (subpath "{_quote(path)}"))')
+    # User-specified write carve-outs (config / --allowed-edit-paths). subpath rules
+    # work even for paths that don't exist yet, so the agent can create files there.
+    for path in allowed_paths or []:
+        lines.append(f'(allow file-write* (subpath "{_quote(os.path.realpath(path))}"))')
     return "\n".join(lines)
 
 
@@ -209,12 +214,15 @@ def build_profile(base: str, worktree: str) -> str:
 # ----------------------------------------------------------------------------
 
 
-def build_bwrap_command(base: str, worktree: str) -> list[str]:
+def build_bwrap_command(base: str, worktree: str, allowed_paths: list[str] | None = None) -> list[str]:
     """A ``bwrap`` prefix that mirrors the host filesystem read-write, re-binds
     the base repo read-only (covering sibling worktrees), then re-binds the
-    repo's ``.git`` and *this* session's worktree read-write on top. Bind order
-    matters: later binds layer over earlier ones, so the worktree/``.git`` binds
-    must follow the base read-only bind to win."""
+    repo's ``.git``, *this* session's worktree, and any user-specified
+    ``allowed_paths`` read-write on top. Bind order matters: later binds layer over
+    earlier ones, so the worktree/``.git``/allowed binds must follow the base
+    read-only bind to win. (bwrap can only bind paths that already exist, so an
+    allowed path under the read-only base must exist to become writable — unlike
+    the macOS profile, which carves out non-existent paths too.)"""
     base = os.path.realpath(base)
     worktree = os.path.realpath(worktree)
     git_dir = os.path.join(base, ".git")
@@ -241,6 +249,13 @@ def build_bwrap_command(base: str, worktree: str) -> list[str]:
     for path in agent_writable_dirs():
         if _within(path, base) and os.path.exists(path):
             args += ["--bind", path, path]
+    # User-specified write carve-outs. A path outside the base is already read-write
+    # via the top ``--dev-bind / /``; only existing paths under the read-only base
+    # need re-binding (bwrap errors on a missing bind source).
+    for path in allowed_paths or []:
+        real = os.path.realpath(path)
+        if _within(real, base) and os.path.exists(real):
+            args += ["--bind", real, real]
     args += [
         "--chdir",
         worktree,
@@ -255,16 +270,17 @@ def build_bwrap_command(base: str, worktree: str) -> list[str]:
 # ----------------------------------------------------------------------------
 
 
-def wrap_command(command: list[str], *, base: str, worktree: str) -> list[str]:
+def wrap_command(command: list[str], *, base: str, worktree: str, allowed_paths: list[str] | None = None) -> list[str]:
     """Wrap ``command`` so its writes are confined to ``worktree`` (plus the
-    repo's ``.git``) within ``base``. Returns the command unchanged when
-    confinement is disabled, unavailable, or unnecessary (worktree == base)."""
+    repo's ``.git`` and any ``allowed_paths``) within ``base``. Returns the command
+    unchanged when confinement is disabled, unavailable, or unnecessary (worktree ==
+    base)."""
     if not command or not is_enabled():
         return command
     if os.path.realpath(worktree) == os.path.realpath(base):
         return command  # legacy in-place session: nothing to isolate
     if _have_sandbox_exec():
-        return ["sandbox-exec", "-p", build_profile(base, worktree), *command]
+        return ["sandbox-exec", "-p", build_profile(base, worktree, allowed_paths), *command]
     if _have_bwrap():
-        return [*build_bwrap_command(base, worktree), *command]
+        return [*build_bwrap_command(base, worktree, allowed_paths), *command]
     return command

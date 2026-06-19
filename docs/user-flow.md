@@ -56,19 +56,19 @@ flowchart TD
   upd --> loop
 
   loop -->|Terminal or window closed| sig["Signal exit: finalize pending work"]
-  loop -->|Ctrl-G then exit| ex["Exit confirmation"]
+  loop -->|"Ctrl-G then 'exit aGiTrack'"| ex["Exit confirmation"]
   sig --> done(["aGiTrack exits"])
   ex --> done
 
-  click launch "#2-startup-and-launch-gating"
-  click pre "#4-before-forwarding-a-prompt-base-to-worktree"
-  click turn "#5-the-agent-turn-auto-commit-and-integration"
-  click copyback "#6-after-the-turn-copy-worktree-only-files-to-base"
-  click menu "#7-ctrl-g-command-menu"
-  click cancel "#5-the-agent-turn-auto-commit-and-integration"
-  click upd "#9-self-update-flow"
-  click ex "#10-exit-and-terminal-close"
 ```
+
+**Jump to:** [Startup and launch gating](#2-startup-and-launch-gating) ·
+[Before forwarding a prompt](#4-before-forwarding-a-prompt-base-to-worktree) ·
+[The agent turn](#5-the-agent-turn-auto-commit-and-integration) ·
+[Copy worktree-only files](#6-after-the-turn-copy-worktree-only-files-to-base) ·
+[Ctrl-G command menu](#7-ctrl-g-command-menu) ·
+[Self-update flow](#9-self-update-flow) ·
+[Exit and terminal close](#10-exit-and-terminal-close)
 
 ---
 
@@ -85,8 +85,8 @@ flowchart TD
   priv -->|Yes, or --skip-privacy-ack| lock
 
   lock{"Acquire single-writer repo lock .agitrack/lock?"}
-  lock -->|Held by another aGiTrack process| ro[["Run READ-ONLY: render TUI, make no commits, show 'another process manages this repo' banner"]]
-  ro --> spawn
+  lock -->|Held by another aGiTrack process| busy[["Refuse to start: name the holding process (PID) and tell the user to stop it first"]]
+  busy --> quit
   lock -->|Acquired, or stale owner reclaimed| backend
 
   backend{"Selected backend CLI installed on PATH?"}
@@ -108,9 +108,10 @@ flowchart TD
 
   sess["Pick the session to show: resume the repo's pinned session, or start fresh"] --> spawn["Spawn backend TUI in its worktree under the sandbox"] --> ready(["Ready for input"])
 
-  click updoffer "#9-self-update-flow"
-  click spawn "#3-worktrees-vs-no-worktree"
 ```
+
+**Jump to:** [Self-update flow](#9-self-update-flow) ·
+[Worktrees vs no-worktree](#3-worktrees-vs-no-worktree)
 
 ---
 
@@ -160,9 +161,9 @@ flowchart TD
   basecommit --> sync[["_sync_idle_worktrees_to_base: merge / re-point the new base commit into the worktree(s)"]]
   sync --> fwd["Forward the prompt to the backend"]
   fwd --> go(["Agent turn begins"])
-
-  click go "#5-the-agent-turn-auto-commit-and-integration"
 ```
+
+**Jump to:** [The agent turn](#5-the-agent-turn-auto-commit-and-integration)
 
 > The explicit base commit paths (this pre-prompt offer and the `git-user-commit`
 > command) re-offer **every** untracked file (`include_declined=True`), so a previously
@@ -201,8 +202,9 @@ flowchart TD
   discard --> copy
 
   copy["Offer to copy worktree-only files to base"] --> back(["Back to the input loop"])
-  click copy "#6-after-the-turn-copy-worktree-only-files-to-base"
 ```
+
+**Jump to:** [Copy worktree-only files to base](#6-after-the-turn-copy-worktree-only-files-to-base)
 
 ---
 
@@ -210,33 +212,59 @@ flowchart TD
 
 Only for a worktree session. Catches files the agent left UNCOMMITTED or that are
 git-ignored — they integrate into nothing, so the user working in the base dir would
-never see them (`_offer_copy_unstaged_to_base`). Runs whether or not the turn committed.
+never see them (`_offer_copy_unstaged_to_base`). It runs for the **active** session only
+(a background session is never interrupted mid-run); its files are caught instead when you
+**switch to it** or on **aGiTrack exit**, just before the worktree is deleted.
+
+First, though, aGiTrack offers to **commit** any of the user's own uncommitted edits in
+the worktree (`_offer_user_commit_for_worktree_edits`) — those belong in git, not just
+copied. So when both a user edit and copy-able leftovers exist, **both prompts appear**: a
+commit prompt for the edits, then the copy prompt for the leftovers.
 
 ```mermaid
 flowchart TD
-  start(["Turn finished, worktree session"]) --> gather[["List worktree files that won't merge: uncommitted or git-ignored. Skip .agitrack/ and names starting with _ or ."]]
-  gather --> fresh{"Any with NEW content since last offered? Fingerprint gate"}
-  fresh -->|No| done(["Nothing to do"])
-  fresh -->|Yes| offer[/"N file(s) won't be merged. Copy them into the base repo dir? • No, leave them in the worktree • Yes, copy to the base repo"/]
+  start(["Trigger: active session idle after a turn (committed or not), OR switched to this session, OR aGiTrack exiting"]) --> wtq{"Worktree session? (no-op under --no-worktree)"}
+  wtq -->|No| done(["Nothing to do"])
+  wtq -->|Yes| useredit{"User's OWN uncommitted edits in the worktree? (tracked changes / new non-declined files)"}
+  useredit -->|Yes| ucommit[/"Uncommitted changes in this worktree — commit them? (the normal user-commit prompt; see git-user-commit). Then continue to the copy offer"/]
+  useredit -->|No| gather
+  ucommit --> gather[["List worktree files that won't merge: intentionally unstaged or git-ignored (new agent files are auto-staged + committed). Skip .agitrack/ and names starting with _ or ."]]
+  gather --> any{"Any candidate files left to copy?"}
+  any -->|No| done
+  any -->|Yes| muted{"This whole SET already declined, AND no genuinely new file? (applies in EVERY context, incl. exit)"}
+  muted -->|Yes| done
+  muted -->|No: first ask, or a NEW path re-opens the whole set| ctx{"Context?"}
 
-  offer -->|No, or cancel| remain[/"Notice: the files remain in the worktree, with the worktree path; they're deleted when aGiTrack exits or the session integrates"/]
-  remain --> done
+  ctx -->|Exiting| offerx[/"N file(s) will be DELETED when this worktree is removed on exit. Copy them into the base repo first? Esc cancels the exit so you can handle them yourself. (Files listed vertically under 'File(s):', PgUp/PgDn scrolls) • No, discard them with the worktree • Yes, copy to the base repo"/]
+  ctx -->|Turn or switch| offer[/"N file(s) won't be merged. Copy them into the base repo? (listed vertically under 'File(s):', scrollable) Note: declining won't re-ask until the fileset changes or you switch sessions. • No, leave them in the worktree • Yes, copy to the base repo"/]
 
-  offer -->|Yes, copy| conflictq{"Any would overwrite an existing base file?"}
+  offer -->|No| mute[["Mute this whole set of paths (re-opened only by a new file / switch / restart); notice names the worktree path"]]
+  offerx -->|No, discard| disc[["Files are discarded with the worktree"]]
+  offerx -->|Esc| abortx(["Abort the exit: keep the worktree + files; aGiTrack stays running so you can handle them"])
+  mute --> done
+  disc --> done
+
+  offer -->|Yes| conflictq{"Any would overwrite an existing base file?"}
+  offerx -->|Yes| conflictq
   conflictq -->|No conflicts| copyall[["Copy every file into the base dir"]]
   conflictq -->|Yes| ow[/"N already exist in the base repo. Overwrite them? • No, keep the base versions • Yes, overwrite all • Let me confirm each one"/]
 
   ow -->|No, keep the base versions| skipc[["Skip the conflicting files; still copy the non-conflicting new ones"]]
   ow -->|Yes, overwrite all| copyall
-  ow -->|Let me confirm each one| each[/"Per conflicting file: 'file' already exists. Overwrite it? • No, keep the base version • Yes, overwrite"/]
-  each -->|No, keep| skip1[["Keep the base copy"]]
-  each -->|Yes, overwrite| ov1[["Overwrite that file"]]
-  skip1 --> tally
-  ov1 --> tally
+  ow -->|Let me confirm each one| each[/"Per conflicting file: overwrite it? • No, keep the base version • Yes, overwrite"/]
+  each --> tally
   skipc --> tally
   copyall --> tally[["Report copied count; anything not copied gets the 'files remain' notice"]]
   tally --> done
 ```
+
+**Jump to:** [`git-user-commit`](#8-git-user-commit)
+
+> A file already accepted or left in place isn't re-offered until its content changes
+> (fingerprint). Declining mutes the whole current **set of paths** — aGiTrack won't ask
+> again while only those files keep changing; a genuinely new path re-opens the whole set
+> (ask about all again). The mute clears on session switch and aGiTrack restart. The
+> **exit** offer ignores the mute (the files are about to be deleted) and warns as much.
 
 ---
 
@@ -245,29 +273,59 @@ flowchart TD
 `Ctrl-G` opens the command palette (type a prefix, Up/Down to select, Tab to complete,
 Enter to run). Commands, in palette order:
 
+> **One rule across every menu: Esc goes up exactly one level.** The **command palette is
+> the parent of every command menu**, so Esc on a command menu (the sessions list, the
+> settings list, the summarizer menu…) returns you **to the palette** — not to the agent.
+> Esc on the palette returns to the agent. Esc in a sub-menu returns to the menu that opened
+> it (e.g. Esc in *Manage <one shared session>* → the shared-sessions list → the sessions
+> menu → the palette → the agent — one step per Esc). The only thing that unwinds further is
+> a choice that moves you into a **different session** (switch / new / resume): that drops
+> straight to the agent, since there is no level to come back to.
+>
+> Navigation is **silent and instant**: backing out shows no "closed/cancelled" message and
+> never flashes the bare backend screen between levels. Internally each menu is one loop
+> returning just `UP` (Esc/back → caller re-shows itself) or `DONE` (a session transition →
+> unwind to the agent); a child menu the user backs out of simply re-shows its parent. So Esc
+> unwinds the call stack one frame at a time and the on-screen hierarchy mirrors the code's.
+
 ```mermaid
 flowchart TD
   g(["Ctrl-G"]) --> pal[/"Command palette"/]
   pal --> sessions["sessions"]
   pal --> backend["agent-backend"]
   pal --> summ["summarizer"]
+  pal --> settings2["settings"]
   pal --> gunstaged["git-unstaged"]
   pal --> gcommit["git-user-commit"]
   pal --> dash["dashboard"]
   pal --> update["update"]
-  pal --> exit["exit"]
+  pal --> exit["exit aGiTrack"]
 
-  sessions --> smenu[/"Live sessions menu: each shows running or idle"/]
-  smenu -->|Switch to one| sswitch[["Show that session, relaunch TUI, re-baseline so history isn't re-committed"]]
-  smenu -->|sessions new| snew["Start a new session: own worktree, or shared base dir under --no-worktree"]
-  smenu -->|Stop one| sstop[["Stop the session"]]
-  smenu -->|Merge reviewed changes| smerge[/"Pick base branch, then integrate that session's changes"/]
+  settings2 --> setmenu["Settings menu"]
+
+  sessions --> smenu[/"Sessions menu (live sessions show running/idle; dormant worktrees and shared markers listed too)"/]
+  smenu -->|Switch to a live session| sswitch[["Show it, relaunch TUI, re-baseline so history isn't re-committed; then offer to copy its worktree-only files"]]
+  smenu -->|Resume an idle/dormant worktree| sresume[["Reopen that session in its worktree; continue the backend conversation if still recorded"]]
+  smenu -->|Resolve an unmerged dormant worktree| sresolve[/"Integrate its pending commits, or discard the worktree (confirmed)"/]
+  smenu -->|+ New session| snew["Start a new session: own worktree, or shared base dir under --no-worktree"]
+  smenu -->|✎ Rename a session| srename[["Rename = fork: clears the shared lineage, so a later share creates a NEW shared entry"]]
+  smenu -->|⤳ Change a session's merge branch| smb[/"Pick the branch this idle session integrates into (flushes its pending work into the old branch first)"/]
+  smenu -->|↻ Resume a past conversation| spast[/"Pick from past conversations of this repo, newest first"/]
+  smenu -->|⇪ Share this session with collaborators| sshare["Session sharing"]
+  smenu -->|⇩ Resume a shared session| srshare["Session sharing"]
+  smenu -->|⚙ Manage shared sessions| smanage["Session sharing"]
+  smenu -->|✓ Integrate this session's commits / Merge reviewed changes| smerge[/"Integrate this session's committed work into its base branch (pick the branch under --delay-merge)"/]
+  smenu -->|- Stop a session| sstop[["Stop the session"]]
   snew --> mode3["See Worktrees vs no-worktree"]
+  sswitch --> scopy["See After the turn: copy worktree-only files"]
 
   backend -->|No arg, picker| bpick[/"Pick claude or opencode"/]
   bpick --> bswitch[["Save current backend's session, relaunch target backend, restore its last session, update global default"]]
 
-  summ --> spick[/"Pick the summarizer model, current shown"/]
+  summ --> smm[/"Summarizer menu: Toggle (ON/OFF) / Set model"/]
+  smm -->|Toggle| stog[["Flip on/off; menu re-shows"]]
+  smm -->|Set model| spick[/"Pick the summarizer model (current shown); Esc → back to the Summarizer menu"/]
+  spick --> smm
 
   gunstaged --> gu[["Show intentionally-unstaged files in the status bar"]]
 
@@ -278,13 +336,15 @@ flowchart TD
   update --> uflow["aGiTrack self-update flow"]
 
   exit --> exflow["Exit confirmation"]
-
-  click snew "#3-worktrees-vs-no-worktree"
-  click gcflow "#8-git-user-commit"
-  click uflow "#9-self-update-flow"
-  click exflow "#10-exit-and-terminal-close"
-  click mode3 "#3-worktrees-vs-no-worktree"
 ```
+
+**Jump to:** [Worktrees vs no-worktree](#3-worktrees-vs-no-worktree) ·
+[Copy worktree-only files](#6-after-the-turn-copy-worktree-only-files-to-base) ·
+[`git-user-commit`](#8-git-user-commit) ·
+[Self-update flow](#9-self-update-flow) ·
+[Exit and terminal close](#10-exit-and-terminal-close) ·
+[Session sharing](#11-session-sharing) ·
+[Settings menu](#12-settings-menu)
 
 ---
 
@@ -360,30 +420,175 @@ flowchart TD
 
 ## 10. Exit and terminal close
 
+Pressing **Esc** at any exit prompt **cancels the exit** — aGiTrack keeps running and tells
+you what was *not* done, so you can handle it yourself (commits already made this exit are
+kept; nothing is deleted). Only an explicit "Yes"/"No" choice proceeds.
+
 ```mermaid
 flowchart TD
   how{"How is aGiTrack ending?"}
-  how -->|Ctrl-G then exit, managing instance| conf[/"Exit aGiTrack? • No, keep working • Yes, exit"/]
-  conf -->|No| stay(["Keep working"])
+  how -->|"Ctrl-G then 'exit aGiTrack', managing instance"| conf[/"Exit aGiTrack? • No, keep working • Yes, exit (Esc cancels)"/]
+  conf -->|No / Esc| stay(["Exit cancelled — keep working (a message says nothing was shut down)"])
   conf -->|Yes| busy{"Sessions still running, turns in flight?"}
-  busy -->|Yes| term[/"Terminate them and exit? • No, keep working • Yes, terminate them and exit"/]
+  busy -->|Yes| term[/"Terminate them and exit? • No, keep working • Yes, terminate them and exit (Esc cancels)"/]
   busy -->|No| fin
-  term -->|No| stay
+  term -->|No / Esc| stay
   term -->|Yes| fin
 
-  how -->|Terminal or window closed, SIGHUP/SIGTERM| sig[["_handle_exit_signal: best-effort finalize pending work, render suppressed"]]
-  how -->|Read-only instance| roexit[["Torn down with the window; no finalize needed"]]
+  how -->|Terminal or window closed, SIGHUP/SIGTERM| sig[["_handle_exit_signal: best-effort finalize pending work, render suppressed (non-interactive)"]]
 
-  fin[["Finalize: commit a just-completed turn, integrate committed work, stop the dashboard"]]
+  fin[["Finalize each session: commit a just-completed turn, integrate committed work"]]
+  fin --> copy2["Per session, before deleting its worktree: offer to copy its leftover files (see Copy)"]
+  copy2 --> esc{"Esc on that copy offer?"}
+  esc -->|Yes| abort(["Exit cancelled — worktree + files kept; message tells you to copy them then exit again"])
+  esc -->|No| rm[["Remove the (fully-integrated) worktree(s), stop the dashboard"]]
   sig --> fin
-  fin --> bye(["aGiTrack exits"])
-  roexit --> bye
+  rm --> bye(["aGiTrack exits"])
 ```
+
+**Jump to:** [Copy worktree-only files to base](#6-after-the-turn-copy-worktree-only-files-to-base)
+
+---
+
+## 11. Session sharing
+
+Sharing pushes a session's **redacted** backend transcript to `origin` on a custom ref
+(`refs/agitrack/shared-sessions`), keyed by repo + your GitHub id + a name, so collaborators
+on the same repo can resume your conversation. Opt-in, with consent on every share — the
+first prompt spells out exactly what is uploaded (`_share_session`,
+`_resume_shared_session_menu`, `_manage_shared_sessions_menu`). Only backends with a portable
+transcript (Claude) support it.
+
+### Share this session
+
+```mermaid
+flowchart TD
+  s(["⇪ Share this session"]) --> sup{"Backend supports sharing AND a resumable session exists?"}
+  sup -->|No| nope[/"Not supported / nothing to share yet — explain why"/]
+  sup -->|Yes| consent{"Consent — shown every share: the transcript may include file contents, command output, and secrets"}
+  consent -->|No, cancel| cancel(["Cancelled"])
+  consent -->|Yes, share it| redact[["Export + REDACT the transcript, build the manifest, record the lineage origin: owner + name + contributors"]]
+  redact --> push[["Push to origin in the BACKGROUND so the terminal never freezes; the result lands as a notice"]]
+  push --> behind{"Shared copy already has NEWER turns than this machine?"}
+  behind -->|Yes| skip[["Refuse to rewind it: tell the user to resume the shared version first, then share again"]]
+  behind -->|No| okp[["Shared (or saved locally if there is no remote). A diverged collaborator's turns are union-merged in, never lost"]]
+  redact --> autoq{"Already auto-shared?"}
+  autoq -->|No| autop[/"Keep this shared session up to date automatically? • Yes, keep it updated • No, I'll re-share manually"/]
+  autop -->|Yes| auton[["Auto-update ON: every new turn (and exit) re-pushes the latest"]]
+```
+
+### Resume a shared session
+
+```mermaid
+flowchart TD
+  r(["⇩ Resume a shared session"]) --> fetch[["Fetch shared sessions from origin (cancellable)"]]
+  fetch --> anyr{"Any found for this repo?"}
+  anyr -->|No| noner(["None found"])
+  anyr -->|Yes| pickr[/"Pick one (newest first; shows model + age)"/]
+  pickr --> origin[["Record its lineage origin, so a later re-share updates the SAME entry and adds you to the contributors"]]
+  origin --> wherer{"Is this conversation already open locally?"}
+  wherer -->|Running here, same id| livr[/"Update this session to the shared version / Keep both (copy to a new session) / Stay as it is — guards against replacing newer local work with an older shared copy"/]
+  wherer -->|Open under the same shared lineage, different backend id| linr[/"Continue my existing session / Fetch the shared version as a separate copy"/]
+  wherer -->|Not open here| namer[/"Name the local session (defaults to the share name)"/]
+  livr --> bgr[["Fetch transcript + import on a worker thread; the resume completes on the main loop so the UI never freezes"]]
+  linr --> bgr
+  namer --> bgr
+```
+
+### Manage / unshare
+
+```mermaid
+flowchart TD
+  mg(["⚙ Manage shared sessions"]) --> mine{"You've shared any in this repo?"}
+  mine -->|No| nonem(["Nothing to manage"])
+  mine -->|Yes| pickm[/"Pick one (shows age, auto-update state, and a 'local has newer turns' hint)"/]
+  pickm --> act{"Manage this shared session"}
+  act -->|↻ Update now| upd[["Re-push the latest transcript in the background; folds you into the contributor set"]]
+  act -->|Toggle auto-update| tog[["Turn auto-update on (pushes once immediately) or off"]]
+  act -->|✗ Unshare| uconf{"Remove from origin for everyone? Can't be undone."}
+  uconf -->|Yes, unshare| undo[["Delete the shared ref entry (background)"]]
+  uconf -->|No, keep it| keepm(["Kept"])
+```
+
+> Renaming a session **forks** it (`_fork_lineage_on_rename`): the shared lineage origin is
+> cleared, so sharing the renamed session creates a NEW `<you>/<new-name>` shared entry rather
+> than updating the one it came from. The whole feature is opt-in; nothing is uploaded without
+> an explicit "Yes" each time.
+
+---
+
+## 12. Settings menu
+
+`Ctrl-G → settings` opens an editor for **all** config options, each labelled in plain
+language and showing its current effective value and source (`· repo` / `· global`, or
+nothing for a built-in default). The menu is a small **form**: edits are collected as
+**pending** changes — each one picks its own scope, **This repository**
+(`<repo>/.agitrack/config.json`) or **Global** (`~/.agitrack/config.json`) — and is
+written only when you **save on the way out**. A pending row shows its new value as
+`· UNSAVED → repo/global`. Precedence: repo-local wins over global wins over the built-in
+default (`GlobalConfig` overlay).
+
+**Esc goes up one level**, everywhere ([§7](#7-ctrl-g-command-menu) describes the same rule
+for every menu): Esc at a value editor → back to the list; Esc at the scope prompt → back to
+the value editor; Esc on the list → close. **Closing with unsaved changes asks whether to
+save them** — *Yes, save them / No, discard them / ← Keep editing* — so nothing is written
+silently and nothing is lost without a prompt.
+
+```mermaid
+flowchart TD
+  s(["Ctrl-G → settings"]) --> list[/"Settings list — each: label, value, source (or '· UNSAVED → scope' for a pending edit). Plus 'Timings (advanced)…' and '← Close (save N change(s))'"/]
+  list -->|"← Close / Esc, no pending edits"| close(["Settings closed."])
+  list -->|"← Close / Esc, with pending edits"| savep[/"You have N unsaved change(s). Save them? • Yes, save them • No, discard them • ← Keep editing"/]
+  savep -->|Yes| writeall[["Write every pending edit to its chosen scope (repo overlay / global file). Restart-only settings note: won't take effect until YOU restart aGiTrack — it never restarts on its own"]]
+  savep -->|No| discard[["Drop all pending edits — nothing written"]]
+  savep -->|← Keep editing| list
+  writeall --> close
+  discard --> close
+
+  list -->|Pick 'Timings…'| tlist[/"Timings list (seconds), pending shown as '· UNSAVED → scope' + '← Back'"/]
+  list -->|Pick a setting| edit{"Editor depends on the setting's kind"}
+
+  edit -->|on/off setting e.g. sandbox| eb[/"Turn ON / Turn OFF / ← Back"/]
+  edit -->|choice setting e.g. backend| ec[/"Pick a value / ← Back"/]
+  edit -->|path-list setting e.g. allowed edit paths| ep[/"Type paths separated by the PATH separator (blank = none) / ← Back"/]
+  edit -->|text setting e.g. model, menu key| et[/"Type a value (blank = unset) / ← Back"/]
+
+  eb -->|← Back / Esc → up one level| list
+  ec -->|← Back / Esc| list
+  ep -->|← Back / Esc| list
+  et -->|← Back / Esc| list
+  eb --> scope
+  ec --> scope
+  ep --> scope
+  et --> scope
+
+  scope[/"Apply 'setting' to: • This repository only • Global — all repositories • ← Back"/]
+  scope -->|"← Back / Esc → up one level (re-edit the value)"| edit
+  scope -->|This repository| pend[["Record a PENDING edit (value + scope) — not written yet"]]
+  scope -->|Global| pend
+  pend --> list
+
+  tlist -->|← Back / Esc → up one level| list
+  tlist -->|Pick a timing| tval[/"Type new seconds (> 0) / ← Back"/]
+  tval -->|"← Back / Esc"| tlist
+  tval -->|valid| tscope[/"Apply timing to: repo / global / ← Back"/]
+  tscope -->|repo or global| tpend[["Record a PENDING timing edit (saved with the rest on close)"]]
+  tpend --> tlist
+  tscope -->|"← Back / Esc → re-edit the value"| tval
+```
+
+> **Sandbox & allowed edit paths.** By default the backend agent is confined (`sandbox`)
+> so it can only write inside its session worktree (plus `.git`). `allowed_edit_paths`
+> lists extra directories/files it may write to (e.g. a shared data dir). Both are settable
+> here, in either config file, or per run on the command line: `--no-sandbox` and
+> `--allowed-edit-paths <path>[:<path>…]` (`:`-separated like `PATH`; a CLI flag wins over
+> config). On macOS the carve-out covers not-yet-created paths; under Linux bubblewrap a
+> path under the read-only base must already exist to become writable.
 
 ---
 
 ### Cross-references
 
-- Prose spec: [`AGENTS.md`](../AGENTS.md) — Staging Behavior, Concurrent Sessions, Self-Update, Concurrency and Locking.
-- User-facing docs: [`README.md`](../README.md).
-- Sandbox / confinement: `agitrack/proxy/sandbox.py`; per-turn commit and copy logic: `agitrack/proxy/runner.py`.
+- Prose spec: [`AGENTS.md`](../AGENTS.md) — Staging Behavior, Concurrent Sessions, Session Sharing, Self-Update, Concurrency and Locking.
+- User-facing docs: [`README.md`](../README.md) — including [Sharing sessions](../README.md#sharing-sessions).
+- Sandbox / confinement: `agitrack/proxy/sandbox.py`; per-turn commit and copy logic: `agitrack/proxy/runner.py`; sharing store: `agitrack/sessions/store.py`.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -63,6 +64,11 @@ class GlobalConfig:
     def __init__(self, path: Path | None = None) -> None:
         self.path = path or _default_path()
         self.data = self._load()
+        # Repo-local overlay: settings written for THIS repository (in its
+        # ``.agitrack/config.json``) take precedence over the global file. Loaded via
+        # ``load_repo_overlay`` once aGiTrack knows which repo it's running in.
+        self.repo_path: Path | None = None
+        self.repo_data: dict[str, Any] = {}
 
     def _load(self) -> dict[str, Any]:
         if not self.path.exists():
@@ -80,12 +86,70 @@ class GlobalConfig:
             json.dump(self.data, handle, indent=2, sort_keys=True)
             handle.write("\n")
 
+    # --- repo-local overlay -------------------------------------------------
+
+    def load_repo_overlay(self, repo_root: Path) -> None:
+        """Load a repository's ``.agitrack/config.json`` so its settings override the
+        global file for this run. Best-effort; a missing/corrupt file is ignored."""
+        self.repo_path = Path(repo_root) / ".agitrack" / "config.json"
+        if not self.repo_path.exists():
+            self.repo_data = {}
+            return
+        try:
+            with self.repo_path.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            self.repo_data = data if isinstance(data, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            self.repo_data = {}
+
+    def save_repo(self) -> None:
+        """Write the repo-local overlay back to ``<repo>/.agitrack/config.json``,
+        preserving any other keys the file already holds (e.g. AgitrackState's)."""
+        if self.repo_path is None:
+            return
+        self.repo_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.repo_path.open("w", encoding="utf-8") as handle:
+            json.dump(self.repo_data, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+
+    def _raw(self, key: str) -> Any:
+        """The stored value for *key*: the repo-local overlay wins over the global file."""
+        if key in self.repo_data:
+            return self.repo_data[key]
+        return self.data.get(key)
+
+    def source(self, key: str) -> str:
+        """Where *key*'s current value comes from: 'repo', 'global', or 'default'."""
+        if key in self.repo_data:
+            return "repo"
+        if key in self.data:
+            return "global"
+        return "default"
+
+    def set(self, key: str, value: Any, *, scope: str) -> None:
+        """Set a setting at the given scope ('global' or 'repo') and persist it."""
+        if scope == "repo":
+            self.repo_data[key] = value
+            self.save_repo()
+        else:
+            self.data[key] = value
+            self.save()
+
+    def unset(self, key: str, *, scope: str) -> None:
+        """Remove a setting at the given scope (revert to the lower layer / default)."""
+        if scope == "repo":
+            self.repo_data.pop(key, None)
+            self.save_repo()
+        else:
+            self.data.pop(key, None)
+            self.save()
+
     def has_default_backend(self) -> bool:
-        return bool(self.data.get("default_backend"))
+        return bool(self._raw("default_backend"))
 
     @property
     def default_backend(self) -> str:
-        value = self.data.get("default_backend")
+        value = self._raw("default_backend")
         return str(value) if value else DEFAULT_BACKEND
 
     @default_backend.setter
@@ -96,7 +160,7 @@ class GlobalConfig:
     @property
     def sandbox(self) -> bool:
         # Confine the agent's writes to its session worktree (on by default).
-        value = self.data.get("sandbox")
+        value = self._raw("sandbox")
         return True if value is None else bool(value)
 
     @sandbox.setter
@@ -109,7 +173,7 @@ class GlobalConfig:
         # Whether to append a note to a coding agent's system prompt telling it that
         # aGiTrack auto-commits, so it should not create its own commits (on by default;
         # disable per-run with --no-commit-guidance).
-        value = self.data.get("commit_guidance")
+        value = self._raw("commit_guidance")
         return True if value is None else bool(value)
 
     @commit_guidance.setter
@@ -122,7 +186,7 @@ class GlobalConfig:
         # Run each session in its own git worktree (on by default). When off,
         # the agent edits the current branch directly (#9) — visible live, but
         # no isolation/integration and unsafe with concurrent sessions.
-        value = self.data.get("use_worktrees")
+        value = self._raw("use_worktrees")
         return True if value is None else bool(value)
 
     @use_worktrees.setter
@@ -131,11 +195,28 @@ class GlobalConfig:
         self.save()
 
     @property
+    def allowed_edit_paths(self) -> list[str]:
+        # Extra paths the sandbox lets the agent write to, beyond its worktree (e.g. a
+        # shared data dir, a sibling package). Stored as a JSON list of strings; the CLI
+        # accepts them ":"-separated like PATH. Empty by default.
+        value = self._raw("allowed_edit_paths")
+        if isinstance(value, str):  # tolerate a ":"-joined string written by hand
+            value = [p for p in value.split(os.pathsep) if p.strip()]
+        if not isinstance(value, list):
+            return []
+        return [str(p) for p in value if isinstance(p, str) and p.strip()]
+
+    @allowed_edit_paths.setter
+    def allowed_edit_paths(self, value: list[str]) -> None:
+        self.data["allowed_edit_paths"] = list(value)
+        self.save()
+
+    @property
     def menu_key(self) -> str:
         # Normalized menu key spec. Supports "ctrl-<letter>" or "ctrl+shift+<letter>".
         # Invalid or conflicting values fall back to the default so a config typo
         # can never lock the user out of the menu.
-        value = self.data.get("menu_key")
+        value = self._raw("menu_key")
         if isinstance(value, str):
             normalized = value.strip().lower()
             match = _MENU_KEY_SHIFT_RE.match(normalized)
@@ -183,7 +264,7 @@ class GlobalConfig:
         # Defaults overlaid with any valid user overrides from the "timings" object.
         # An override must be a positive number; bad values (wrong type, <= 0, bool)
         # are ignored so a typo can never stall or busy-spin a poll loop.
-        stored = self.data.get("timings")
+        stored = self._raw("timings")
         stored = stored if isinstance(stored, dict) else {}
         result = dict(DEFAULT_TIMINGS)
         for key in DEFAULT_TIMINGS:
@@ -194,7 +275,7 @@ class GlobalConfig:
 
     @property
     def summarization_model(self) -> str | None:
-        value = self.data.get("summarization_model")
+        value = self._raw("summarization_model")
         return str(value) if value else None
 
     @summarization_model.setter
@@ -204,7 +285,7 @@ class GlobalConfig:
 
     @property
     def summarization_enabled(self) -> bool:
-        value = self.data.get("summarization_enabled")
+        value = self._raw("summarization_enabled")
         return True if value is None else bool(value)
 
     @summarization_enabled.setter
@@ -217,7 +298,7 @@ class GlobalConfig:
         # Whether aGiTrack checks for its own updates (at startup and periodically).
         # On by default; the user can turn it off here or by choosing "don't ask
         # again" when offered an update.
-        value = self.data.get("check_for_updates")
+        value = self._raw("check_for_updates")
         return True if value is None else bool(value)
 
     @check_for_updates.setter
