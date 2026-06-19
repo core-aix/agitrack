@@ -202,7 +202,10 @@ class ProxyInput:
         "dashboard",
         "settings",
         "update",
-        "exit",
+        # Reads "exit aGiTrack" so it is never mistaken for "exit the menu" (Esc does that).
+        # `_run_command` parses the command name from the first word, so the trailing word is
+        # ignored and "exit"/"quit" still work when typed directly.
+        "exit aGiTrack",
     ]
 
     def __init__(self, menu_key: bytes = b"\x07") -> None:

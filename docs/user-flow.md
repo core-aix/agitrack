@@ -56,7 +56,7 @@ flowchart TD
   upd --> loop
 
   loop -->|Terminal or window closed| sig["Signal exit: finalize pending work"]
-  loop -->|Ctrl-G then exit| ex["Exit confirmation"]
+  loop -->|"Ctrl-G then 'exit aGiTrack'"| ex["Exit confirmation"]
   sig --> done(["aGiTrack exits"])
   ex --> done
 
@@ -297,7 +297,7 @@ flowchart TD
   pal --> gcommit["git-user-commit"]
   pal --> dash["dashboard"]
   pal --> update["update"]
-  pal --> exit["exit"]
+  pal --> exit["exit aGiTrack"]
 
   settings2 --> setmenu["Settings menu"]
 
@@ -428,7 +428,7 @@ kept; nothing is deleted). Only an explicit "Yes"/"No" choice proceeds.
 ```mermaid
 flowchart TD
   how{"How is aGiTrack ending?"}
-  how -->|Ctrl-G then exit, managing instance| conf[/"Exit aGiTrack? • No, keep working • Yes, exit (Esc cancels)"/]
+  how -->|"Ctrl-G then 'exit aGiTrack', managing instance"| conf[/"Exit aGiTrack? • No, keep working • Yes, exit (Esc cancels)"/]
   conf -->|No / Esc| stay(["Exit cancelled — keep working (a message says nothing was shut down)"])
   conf -->|Yes| busy{"Sessions still running, turns in flight?"}
   busy -->|Yes| term[/"Terminate them and exit? • No, keep working • Yes, terminate them and exit (Esc cancels)"/]
@@ -457,9 +457,10 @@ flowchart TD
 
 Sharing pushes a session's **redacted** backend transcript to `origin` on a custom ref
 (`refs/agitrack/shared-sessions`), keyed by repo + your GitHub id + a name, so collaborators
-on the same repo can resume your conversation. Opt-in, with informed consent on every share
-(`_share_session`, `_resume_shared_session_menu`, `_manage_shared_sessions_menu`). Only
-backends with a portable transcript (Claude) support it.
+on the same repo can resume your conversation. Opt-in, with consent on every share — the
+first prompt spells out exactly what is uploaded (`_share_session`,
+`_resume_shared_session_menu`, `_manage_shared_sessions_menu`). Only backends with a portable
+transcript (Claude) support it.
 
 ### Share this session
 
@@ -467,9 +468,9 @@ backends with a portable transcript (Claude) support it.
 flowchart TD
   s(["⇪ Share this session"]) --> sup{"Backend supports sharing AND a resumable session exists?"}
   sup -->|No| nope[/"Not supported / nothing to share yet — explain why"/]
-  sup -->|Yes| consent[/"Consent, shown EVERY time: the transcript can contain file contents, command output, and secrets — review first (the first time spells out exactly what is uploaded). • Yes, share it • No, cancel"/]
-  consent -->|No| cancel(["Cancelled"])
-  consent -->|Yes| redact[["Export + REDACT the transcript, build the manifest, record the lineage origin: owner + name + contributors"]]
+  sup -->|Yes| consent{"Consent — shown every share: the transcript may include file contents, command output, and secrets"}
+  consent -->|No, cancel| cancel(["Cancelled"])
+  consent -->|Yes, share it| redact[["Export + REDACT the transcript, build the manifest, record the lineage origin: owner + name + contributors"]]
   redact --> push[["Push to origin in the BACKGROUND so the terminal never freezes; the result lands as a notice"]]
   push --> behind{"Shared copy already has NEWER turns than this machine?"}
   behind -->|Yes| skip[["Refuse to rewind it: tell the user to resume the shared version first, then share again"]]
@@ -504,12 +505,12 @@ flowchart TD
   mg(["⚙ Manage shared sessions"]) --> mine{"You've shared any in this repo?"}
   mine -->|No| nonem(["Nothing to manage"])
   mine -->|Yes| pickm[/"Pick one (shows age, auto-update state, and a 'local has newer turns' hint)"/]
-  pickm --> act[/"• ↻ Update now (push latest turns) • Toggle auto-update • ✗ Unshare (remove for everyone)"/]
-  act -->|Update now| upd[["Re-push the latest transcript in the background; folds you into the contributor set"]]
+  pickm --> act{"Manage this shared session"}
+  act -->|↻ Update now| upd[["Re-push the latest transcript in the background; folds you into the contributor set"]]
   act -->|Toggle auto-update| tog[["Turn auto-update on (pushes once immediately) or off"]]
-  act -->|Unshare| uconf[/"Unshare '…'? Removes it from origin for everyone and can't be undone. • No, keep it • Yes, unshare"/]
-  uconf -->|Yes| undo[["Delete the shared ref entry (background)"]]
-  uconf -->|No| keepm(["Kept"])
+  act -->|✗ Unshare| uconf{"Remove from origin for everyone? Can't be undone."}
+  uconf -->|Yes, unshare| undo[["Delete the shared ref entry (background)"]]
+  uconf -->|No, keep it| keepm(["Kept"])
 ```
 
 > Renaming a session **forks** it (`_fork_lineage_on_rename`): the shared lineage origin is
@@ -547,13 +548,13 @@ flowchart TD
   writeall --> close
   discard --> close
 
-  list -->|Timings…| tlist[/"Timings list (seconds), pending shown as '· UNSAVED → scope' + '← Back'"/]
-  list -->|Pick a setting| edit{"Editor by kind"}
+  list -->|Pick 'Timings…'| tlist[/"Timings list (seconds), pending shown as '· UNSAVED → scope' + '← Back'"/]
+  list -->|Pick a setting| edit{"Editor depends on the setting's kind"}
 
-  edit -->|bool| eb[/"Turn ON / Turn OFF / ← Back"/]
-  edit -->|choice e.g. backend| ec[/"Pick a value / ← Back"/]
-  edit -->|paths| ep[/"Type paths separated by the PATH separator (blank = none) / ← Back"/]
-  edit -->|text e.g. model, menu key| et[/"Type a value (blank = unset) / ← Back"/]
+  edit -->|on/off setting e.g. sandbox| eb[/"Turn ON / Turn OFF / ← Back"/]
+  edit -->|choice setting e.g. backend| ec[/"Pick a value / ← Back"/]
+  edit -->|path-list setting e.g. allowed edit paths| ep[/"Type paths separated by the PATH separator (blank = none) / ← Back"/]
+  edit -->|text setting e.g. model, menu key| et[/"Type a value (blank = unset) / ← Back"/]
 
   eb -->|← Back / Esc → up one level| list
   ec -->|← Back / Esc| list

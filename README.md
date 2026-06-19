@@ -92,7 +92,7 @@ git-user-commit           create a user commit
 dashboard                 serve the metrics dashboard and open it in the browser
 settings                  view/change all config options (repo-local or global)
 update                    check for / install an aGiTrack self-update
-exit                      exit (with confirmation)
+exit aGiTrack             quit aGiTrack (with confirmation); Esc just closes the menu
 ```
 
 When any worktree still has un-integrated work — committed-but-unmerged commits, **or**
