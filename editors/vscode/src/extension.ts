@@ -23,6 +23,7 @@ import { homedir } from "os";
 import { join } from "path";
 
 import { dedupe, staticExeCandidates } from "./installPaths";
+import { sessionLooksLive } from "./liveness";
 import { isNativeWindows } from "./platform";
 
 const TERMINAL_NAME = "aGiTrack";
@@ -38,6 +39,11 @@ const terminals = new Map<string, vscode.Terminal>();
 // Dashboard terminals are tracked separately: the dashboard is read-only (no repo
 // lock), so it can run alongside a session.
 const dashboards = new Map<string, vscode.Terminal>();
+
+// When we launched aGiTrack in each session terminal, so the reuse check gives a new
+// session time to come up before judging it dead (see sessionStillRunning).
+const launchedAt = new WeakMap<vscode.Terminal, number>();
+const SESSION_STARTUP_GRACE_MS = 15_000;
 
 // Terminals we created, so the split-terminal handler never disposes our own
 // terminals (it fires for every opened terminal, including ours).
@@ -266,8 +272,15 @@ async function startSession(targetUri?: vscode.Uri): Promise<void> {
   const key = folder.uri.fsPath;
   const existing = terminals.get(key);
   if (existing) {
-    existing.show();
-    return; // aGiTrack already has a terminal here — bring it forward, never restart it.
+    if (await sessionStillRunning(existing, key)) {
+      existing.show();
+      return; // a RUNNING aGiTrack is here — bring it forward, never restart it.
+    }
+    // Tracked terminal, but aGiTrack is no longer running in it (e.g. a non-zero exit
+    // left the shell open). Discard the dead terminal and start a fresh session, so the
+    // aG button doesn't just keep re-focusing a lingering shell.
+    terminals.delete(key);
+    existing.dispose();
   }
 
   const exe = await ensureCliAvailable();
@@ -299,8 +312,42 @@ async function startSession(targetUri?: vscode.Uri): Promise<void> {
     icon: "git-commit",
     command: `${launchCommand(exe)} && exit`,
   });
+  launchedAt.set(terminal, Date.now());
   terminals.set(key, terminal);
   terminal.show();
+}
+
+/** Whether `terminal` still has a RUNNING aGiTrack session (so the aG button focuses it
+ * instead of starting a second one). Map presence alone isn't enough: a non-zero aGiTrack
+ * exit leaves the shell open. We confirm via the combined signals in `sessionLooksLive`.
+ * The lock is taken only after the startup privacy prompt, so a session waiting at that
+ * prompt holds no lock yet but its shell still has the aGiTrack child — hence the child
+ * check covers it. */
+async function sessionStillRunning(terminal: vscode.Terminal, folderPath: string): Promise<boolean> {
+  const pid = readAgitrackPid(folderPath);
+  return sessionLooksLive({
+    shellExited: terminal.exitStatus !== undefined,
+    msSinceLaunch: Date.now() - (launchedAt.get(terminal) ?? 0),
+    lockAlive: pid !== undefined && isAlive(pid),
+    shellHasChild: await shellHasChild(terminal),
+    graceMs: SESSION_STARTUP_GRACE_MS,
+  });
+}
+
+/** True if the terminal's shell process currently has any child — i.e. aGiTrack (run as
+ * `agitrack && exit`) is still executing in it. An idle interactive shell at a prompt
+ * (the state after a non-zero exit) has no children. POSIX-only, like aGiTrack itself. */
+async function shellHasChild(terminal: vscode.Terminal): Promise<boolean> {
+  const shellPid = await terminal.processId;
+  if (!shellPid) {
+    return false;
+  }
+  try {
+    const out = await execCapture("pgrep", ["-P", String(shellPid)], 2_000);
+    return out.trim().length > 0;
+  } catch {
+    return false; // pgrep exits non-zero when the shell has no children
+  }
 }
 
 /** Once per installed version, tell the user the reliable way to exit aGiTrack —

@@ -7482,18 +7482,25 @@ class ProxyRunner:
         if choice is None or choice.startswith("No"):
             self._notice_files_remain(wt_dir, [rel for rel, _ in fresh])
             return
+        # Files that would overwrite something already in the base get a SINGLE
+        # all-or-nothing confirmation (not one prompt per file). Decline → those files
+        # are skipped, but the new (non-overwriting) files are still copied.
+        conflicts = [rel for rel, _ in fresh if (base_dir / rel).exists()]
+        overwrite_conflicts = True
+        if conflicts:
+            preview = ", ".join(conflicts[:5]) + (" …" if len(conflicts) > 5 else "")
+            answer = self._select_popup(
+                f"{len(conflicts)} of these already exist in the base repo ({preview}). Overwrite them?",
+                ["No, keep the base versions", "Yes, overwrite them"],
+            )
+            overwrite_conflicts = answer == "Yes, overwrite them"
         remained: list[str] = []
         copied = 0
         for rel, _ in fresh:
             src, dst = wt_dir / rel, base_dir / rel
-            if dst.exists():
-                overwrite = self._select_popup(
-                    f"'{rel}' already exists in the base repo. Overwrite it?",
-                    ["No, keep the base version", "Yes, overwrite"],
-                )
-                if overwrite != "Yes, overwrite":
-                    remained.append(rel)
-                    continue
+            if dst.exists() and not overwrite_conflicts:
+                remained.append(rel)  # the single overwrite prompt was declined
+                continue
             try:
                 if src.is_dir():  # a wholly-ignored directory, reported as `dir/`
                     shutil.copytree(src, dst, dirs_exist_ok=True)
