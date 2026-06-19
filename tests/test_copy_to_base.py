@@ -96,6 +96,7 @@ def test_decline_notice_gives_worktree_path_and_deletion_warning(tmp_path):
     notice = messages[-1]
     assert str(wt_dir) in notice  # the worktree path is spelled out for the user
     assert "removed when aGiTrack exits" in notice  # and the deletion warning is present
+    assert "**" in notice  # the removal warning is marked bold for emphasis
 
 
 def test_overwrite_is_reconfirmed_per_file(tmp_path):

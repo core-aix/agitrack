@@ -943,6 +943,9 @@ def test_offer_copy_decline_notice_warns_worktree_is_removed(tmp_path):
     notice = msgs[-1]
     assert str(wt) in notice  # the worktree path is spelled out
     assert "removed when aGiTrack exits" in notice
+    # The removal warning is marked bold (**…**), which the popup renderer renders as
+    # SGR bold; the marked run covers the removal words.
+    assert "**the worktree is removed when aGiTrack exits or the session integrates,**" in notice
 
 
 def test_maybe_offer_copy_when_idle_is_gated_on_idleness(tmp_path):
