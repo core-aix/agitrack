@@ -88,6 +88,7 @@ In proxy mode (default), press `Ctrl-G`, then type one of these aGiTrack command
 sessions                  switch / start (own worktree) / stop a live session
 agent-backend             switch backend (opencode|claude); shows a picker
 summarizer                toggle summarization on/off, set model, show status
+settings                  view/change all config options (repo-local or global)
 git-unstaged              show intentionally unstaged files
 git-user-commit           create a user commit
 dashboard                 serve the metrics dashboard and open it in the browser
@@ -373,6 +374,8 @@ Help follows the same model: `agitrack --help` (or `-h`) prints aGiTrack's own o
 
 ## Configuration
 
+You can edit every option below interactively with the **`settings`** command (`Ctrl-G → settings`): it lists each option with its current value and source, and when you change one it asks whether to save to the **repository-local** settings (`.agitrack/config.json`) or the **global** settings (`~/.agitrack/config.json`). The menu loops so you can change several at once, and every step has a "← Back". You can also edit the JSON files by hand, as described here.
+
 Repository-local configuration can be stored in `.agitrack/config.json`:
 
 ```json
@@ -404,7 +407,9 @@ User-wide settings live in `~/.agitrack/config.json` (override the directory wit
 
 `default_backend` (`opencode` or `claude`) is used for repositories that have no backend recorded yet. It is updated whenever you pass `--backend` or switch backends with `agent-backend`.
 
-`sandbox` (default `true`) confines the agent's writes to its own session worktree (via `sandbox-exec` on macOS and `bubblewrap` on Linux), keeping the base repository and sibling worktrees read-only to the agent. The backend agent's own install/update directories stay writable, so the agent (Claude Code or OpenCode) can still update itself in place while running under aGiTrack. Set it to `false` to disable confinement; when sandboxing is unavailable, aGiTrack instead warns when the base repository is edited while a session runs.
+`sandbox` (default `true`) confines the agent's writes to its own session worktree (via `sandbox-exec` on macOS and `bubblewrap` on Linux), keeping the base repository and sibling worktrees read-only to the agent. The backend agent's own install/update directories stay writable, so the agent (Claude Code or OpenCode) can still update itself in place while running under aGiTrack. Set it to `false` to disable confinement (or pass `--no-sandbox` for a single run); when sandboxing is unavailable, aGiTrack instead warns when the base repository is edited while a session runs.
+
+`allowed_edit_paths` (default empty) is a list of extra paths the sandbox lets the agent write to, beyond its worktree — for example a shared data directory or a sibling package the agent needs to edit. Specify them in config as a JSON list (`"allowed_edit_paths": ["/srv/data", "../shared"]`), or for a single run on the command line with `--allowed-edit-paths`, separating multiple paths with your platform's `PATH` separator (`:` on macOS/Linux). A command-line value replaces the config list for that run. On macOS the carve-out covers paths that don't exist yet (the agent can create them); under Linux bubblewrap, a path under the read-only base must already exist to become writable.
 
 `use_worktrees` (default `true`) controls whether sessions run in isolated worktrees. Set it to `false` to run the agent directly on the current branch by default — the same behavior as `--no-worktree`, which applies it for a single run. See the `--no-worktree` notes under Usage for the trade-offs.
 

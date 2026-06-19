@@ -5112,14 +5112,14 @@ def test_confine_to_worktree_noop_without_worktree_or_when_disabled(monkeypatch)
 
     monkeypatch.setattr(sandbox, "is_available", lambda: True)
     runner = make_runner(worktree=None)
-    runner.global_config = types.SimpleNamespace(sandbox=True)
+    runner._sandbox = True
     assert runner._confine_to_worktree(["claude"]) == ["claude"]
 
     runner = make_runner(
         worktree=types.SimpleNamespace(name="session-1"),
         repo=types.SimpleNamespace(repo="/repo/.agitrack/worktrees/session-1"),
     )
-    runner.global_config = types.SimpleNamespace(sandbox=False)  # user opted out
+    runner._sandbox = False  # user opted out (config or --no-sandbox)
     runner.base_repo = types.SimpleNamespace(repo="/repo")
     assert runner._confine_to_worktree(["claude"]) == ["claude"]
 
