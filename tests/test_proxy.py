@@ -885,9 +885,9 @@ def test_offer_copy_turn_popup_explains_the_decline_mute(tmp_path):
     assert "switch sessions" in seen[0] and "change as a set" in seen[0]
 
 
-def test_offer_copy_on_exit_warns_deletion_and_ignores_mute(tmp_path):
-    # On exit the files are about to be deleted, so the offer appears even for a set the
-    # user previously declined, and the prompt warns that declining discards them.
+def test_offer_copy_on_exit_respects_mute_unless_new_file(tmp_path):
+    # On exit, a set the user already declined (and no new file) is NOT re-prompted —
+    # the mute is respected. A genuinely new file re-opens the whole set.
     runner, base, wt, _ = _copy_runner(tmp_path, "?? a.txt\n")
     (wt / "a.txt").write_text("x\n")
     runner._copy_declined = {"a.txt"}  # already muted by a prior in-session decline
@@ -895,10 +895,29 @@ def test_offer_copy_on_exit_warns_deletion_and_ignores_mute(tmp_path):
     runner._select_popup = lambda title, options, **k: seen.append(title) or "Yes, copy to the base repo"
 
     runner._offer_copy_unstaged_to_base(context="exit")
+    assert seen == []  # same set, already declined → not asked again, even on exit
 
-    assert len(seen) == 1  # the mute is ignored on exit
-    assert "DELETED" in seen[0]
-    assert (base / "a.txt").read_text() == "x\n"  # copied out before deletion
+    # A new file appears → re-offer all of them on exit, with the deletion warning.
+    runner.repo.status_short_ignored = lambda: "?? a.txt\n?? b.txt\n"
+    (wt / "b.txt").write_text("y\n")
+    runner._offer_copy_unstaged_to_base(context="exit")
+    assert len(seen) == 1 and "DELETED" in seen[0]
+    assert (base / "a.txt").read_text() == "x\n" and (base / "b.txt").read_text() == "y\n"
+
+
+def test_offer_copy_on_exit_esc_aborts_exit(tmp_path):
+    # Esc on the exit copy offer aborts the exit (the caller checks _exit_aborted) and
+    # discards nothing; the just-recorded fingerprints are forgotten so the next exit re-asks.
+    runner, base, wt, _ = _copy_runner(tmp_path, "?? a.txt\n")
+    (wt / "a.txt").write_text("x\n")
+    runner._exit_aborted = False
+    runner._select_popup = lambda title, options, **k: None  # Esc
+
+    runner._offer_copy_unstaged_to_base(context="exit")
+
+    assert runner._exit_aborted is True
+    assert not (base / "a.txt").exists()  # nothing copied/discarded
+    assert "a.txt" not in runner._copy_prompted  # re-offered on the next exit
 
 
 def test_offer_copy_unstaged_declined_leaves_files_and_notifies(tmp_path):
@@ -5932,6 +5951,30 @@ def test_popup_exit_flow_background_decline_keeps_working():
 
     assert runner._run_exit_flow() is False
     assert runner.events == []
+
+
+def test_popup_exit_flow_aborted_by_esc_on_copy_offer_stays_running():
+    # Esc on the on-exit copy offer sets _exit_aborted; the exit flow then stays running
+    # (no _exit_child), restores the exiting state, and shows a clear "Exit cancelled" message.
+    runner = _popup_exit_runner()
+    runner._confirm_exit = lambda: True
+    runner._confirm_terminate_background_sessions = lambda: True
+    runner._exiting = True
+    runner._finalized_on_exit = True
+    msgs: list[str] = []
+    runner._set_message = lambda m, **k: msgs.append(m)
+    runner._render = lambda *a, **k: None
+
+    def finalize():
+        runner.events.append("finalize")
+        runner._exit_aborted = True  # simulate Esc on the copy offer deep in finalize
+
+    runner._finalize_pending_work = finalize
+
+    assert runner._run_exit_flow() is False  # exit cancelled
+    assert runner.events == ["finalize"]  # finalized (commits stand) but did NOT exit
+    assert runner._exiting is False and runner._finalized_on_exit is False  # state restored
+    assert any("Exit cancelled" in m for m in msgs)
 
 
 def test_popup_exit_flow_double_ctrl_c_still_finalizes():

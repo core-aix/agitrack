@@ -197,10 +197,10 @@ class ProxyInput:
         "sessions",
         "agent-backend",
         "summarizer",
-        "settings",
         "git-unstaged",
         "git-user-commit",
         "dashboard",
+        "settings",
         "update",
         "exit",
     ]
@@ -610,6 +610,9 @@ class ProxyRunner:
         self._relaunch_times: list[float] = []
         self._exiting = False
         self._finalized_on_exit = False
+        # Set when the user presses Esc on the on-exit copy offer: aborts the in-progress
+        # exit so they can deal with the worktree files themselves (see _run_exit_flow).
+        self._exit_aborted = False
         # The metrics dashboard, when started from the Ctrl-G menu, runs on a daemon
         # thread inside this process (read-only HTTP server) so the TUI keeps running;
         # shut down on exit. None until first started.
@@ -836,6 +839,7 @@ class ProxyRunner:
                 "_relaunch_times": [],
                 "_exiting": False,
                 "_finalized_on_exit": False,
+                "_exit_aborted": False,
                 "_dashboard_server": None,
                 "_dashboard_thread": None,
                 "_dashboard_url": None,
@@ -5972,28 +5976,59 @@ class ProxyRunner:
 
     # --- settings menu ------------------------------------------------------
 
+    # Esc anywhere in the settings menu quits the whole menu (a sub-step returns this
+    # sentinel so the loop breaks and shows ONE unified close message). "← Back" returns
+    # None instead, navigating back a level so several settings can be edited in one visit.
+    _SETTINGS_QUIT = "quit"
+
     def _settings_specs(self) -> list[dict]:
         """Declarative registry of the user-editable config options shown in the
-        settings menu. ``kind`` drives the editor; ``restart`` marks settings resolved
-        at launch (so a change applies to new sessions / the next launch). Effective
-        values are read from ``global_config`` (repo overlay > global > built-in)."""
+        settings menu. Labels are written to be self-explanatory. ``kind`` drives the
+        editor; ``restart`` marks settings resolved at launch (so a change applies to new
+        sessions / the next launch). Effective values are read from ``global_config``
+        (repo overlay > global > built-in default)."""
         return [
             {
                 "key": "default_backend",
-                "label": "Default backend",
+                "label": "Default coding agent (Claude Code or OpenCode)",
                 "kind": "choice",
                 "options": ["claude", "opencode"],
                 "restart": True,
             },
-            {"key": "sandbox", "label": "Sandbox agent writes to its worktree", "kind": "bool", "restart": True},
-            {"key": "allowed_edit_paths", "label": "Extra sandbox-writable paths", "kind": "paths", "restart": True},
-            {"key": "use_worktrees", "label": "Run each session in its own worktree", "kind": "bool", "restart": True},
-            {"key": "commit_guidance", "label": "Tell the agent aGiTrack auto-commits", "kind": "bool"},
-            {"key": "summarization_enabled", "label": "Summarize commits", "kind": "bool"},
-            {"key": "summarization_model", "label": "Summarizer model", "kind": "text"},
-            {"key": "check_for_updates", "label": "Check for aGiTrack updates", "kind": "bool"},
-            {"key": "menu_key", "label": "Command-menu key", "kind": "text", "restart": True},
-            {"key": "timings", "label": "Timings (advanced) …", "kind": "timings"},
+            {
+                "key": "sandbox",
+                "label": "Confine the agent's file writes to its session worktree",
+                "kind": "bool",
+                "restart": True,
+            },
+            {
+                "key": "allowed_edit_paths",
+                "label": "Extra folders/files the agent may write to (besides its worktree)",
+                "kind": "paths",
+                "restart": True,
+            },
+            {
+                "key": "use_worktrees",
+                "label": "Run each session in its own isolated git worktree",
+                "kind": "bool",
+                "restart": True,
+            },
+            {
+                "key": "commit_guidance",
+                "label": "Ask the agent not to make its own git commits (aGiTrack commits each turn)",
+                "kind": "bool",
+                "restart": True,
+            },
+            {"key": "summarization_enabled", "label": "Write an AI summary for each commit", "kind": "bool"},
+            {"key": "summarization_model", "label": "Model used to write commit summaries", "kind": "text"},
+            {"key": "check_for_updates", "label": "Automatically check for aGiTrack updates", "kind": "bool"},
+            {
+                "key": "menu_key",
+                "label": "Key that opens this aGiTrack menu (e.g. ctrl-g)",
+                "kind": "text",
+                "restart": True,
+            },
+            {"key": "timings", "label": "Polling & debounce timings (advanced) …", "kind": "timings"},
         ]
 
     def _setting_value_display(self, spec: dict) -> str:
@@ -6012,39 +6047,42 @@ class ProxyRunner:
         return f"{text}{suffix}"
 
     def _settings_menu(self) -> None:
-        """Ctrl-G → "settings": browse and edit ALL config options. Editing returns
-        to this list (backward navigation) so several settings can be changed in one
-        visit; each save asks whether to write repo-local or global settings."""
+        """Ctrl-G → "settings": browse and edit ALL config options. Editing returns to
+        this list (so several settings can be changed in one visit); each save asks whether
+        to write repo-local or global settings. "← Back" navigates back a level; Esc quits
+        the whole menu with one unified message."""
         while True:
             specs = self._settings_specs()
             options = []
             for spec in specs:
                 disp = self._setting_value_display(spec)
                 options.append(f"{spec['label']}: {disp}" if disp else spec["label"])
-            options.append("")  # separator
-            options.append("← Done")
-            choice = self._select_popup("Settings — pick one to change", options)
+            options += ["", "← Done"]
+            choice = self._select_popup("Settings — pick one to change (Esc closes)", options)
             if choice is None or choice == "← Done" or not choice.strip():
-                self._set_message("Closed settings.")
-                self._render()
-                return
+                break
             spec = specs[options.index(choice)]
-            if spec["kind"] == "timings":
-                self._settings_timings_menu()
-            else:
-                self._edit_one_setting(spec)
+            step = self._settings_timings_menu() if spec["kind"] == "timings" else self._edit_one_setting(spec)
+            if step == self._SETTINGS_QUIT:
+                break  # Esc inside a sub-step quits the whole menu
+        self._set_message("Settings closed.")
+        self._render()
 
-    def _edit_one_setting(self, spec: dict) -> None:
+    def _edit_one_setting(self, spec: dict) -> str | None:
         key, kind, label = spec["key"], spec["kind"], spec["label"]
         if kind == "bool":
             pick = self._select_popup(label, ["Turn ON", "Turn OFF", "← Back"])
-            if pick is None or pick.startswith("←"):
-                return
+            if pick is None:
+                return self._SETTINGS_QUIT
+            if pick.startswith("←"):
+                return None
             value: object = pick == "Turn ON"
         elif kind == "choice":
             pick = self._select_popup(label, [*spec["options"], "← Back"])
-            if pick is None or pick.startswith("←"):
-                return
+            if pick is None:
+                return self._SETTINGS_QUIT
+            if pick.startswith("←"):
+                return None
             value = pick
         elif kind == "paths":
             current = self.global_config.allowed_edit_paths
@@ -6052,36 +6090,39 @@ class ProxyRunner:
                 label, f"Paths separated by '{os.pathsep}' (blank = none):", default=os.pathsep.join(current)
             )
             if raw is None:
-                return
+                return self._SETTINGS_QUIT
             value = [p.strip() for p in raw.split(os.pathsep) if p.strip()]
         else:  # text
             current_text = getattr(self.global_config, key, None) or ""
             raw = self._prompt_popup(label, "New value (blank = unset):", default=str(current_text))
             if raw is None:
-                return
+                return self._SETTINGS_QUIT
             value = raw.strip() or None
-        self._save_setting_scoped(key, value, label, restart=bool(spec.get("restart")))
+        return self._save_setting_scoped(key, value, label, restart=bool(spec.get("restart")))
 
-    def _save_setting_scoped(self, key: str, value: object, label: str, *, restart: bool) -> None:
+    def _save_setting_scoped(self, key: str, value: object, label: str, *, restart: bool) -> str | None:
         pick = self._select_popup(
             f"Save '{label}' where?",
             ["This repository (.agitrack/config.json)", "Global (all repositories)", "← Back (don't save)"],
         )
-        if pick is None or pick.startswith("←"):
-            return
+        if pick is None:
+            return self._SETTINGS_QUIT
+        if pick.startswith("←"):
+            return None
         scope = "repo" if pick.startswith("This repository") else "global"
         self.global_config.set(key, value, scope=scope)
-        # Keep runtime values we resolved at launch in sync where it's cheap, so a change
-        # applies to NEW sessions without a restart (the running backend keeps its sandbox).
-        if key == "sandbox":
-            self._sandbox = bool(value)
-        elif key == "allowed_edit_paths" and isinstance(value, list):
-            self._allowed_edit_paths = [str(p) for p in value]
-        note = " Takes effect for new sessions / the next launch." if restart else ""
-        self._set_message(f"Saved '{label}' to {scope} settings.{note}", seconds=8.0)
+        # Some settings are resolved at launch and aren't re-read by the running process,
+        # so they only take effect after a restart — which aGiTrack never does on its own.
+        note = (
+            " It won't take effect until you restart aGiTrack yourself (aGiTrack won't restart automatically)."
+            if restart
+            else ""
+        )
+        self._set_message(f"Saved '{label}' to {scope} settings.{note}", seconds=10.0)
         self._render()
+        return None
 
-    def _settings_timings_menu(self) -> None:
+    def _settings_timings_menu(self) -> str | None:
         from agitrack.config.settings import DEFAULT_TIMINGS
 
         while True:
@@ -6090,14 +6131,16 @@ class ProxyRunner:
             options = [f"{k}: {timings[k]:g}s" for k in keys]
             options += ["", "← Back"]
             choice = self._select_popup("Timings (seconds) — pick one to change", options)
-            if choice is None or choice == "← Back" or not choice.strip():
-                return
+            if choice is None:
+                return self._SETTINGS_QUIT
+            if choice == "← Back" or not choice.strip():
+                return None
             tkey = keys[options.index(choice)]
             raw = self._prompt_popup(
                 tkey, f"New value in seconds (current {timings[tkey]:g}):", default=str(timings[tkey])
             )
             if raw is None:
-                continue
+                return self._SETTINGS_QUIT
             try:
                 seconds = float(raw)
                 if seconds <= 0:
@@ -6106,22 +6149,29 @@ class ProxyRunner:
                 self._set_message("Enter a positive number of seconds.")
                 self._render()
                 continue
-            self._save_timing_scoped(tkey, seconds)
+            if self._save_timing_scoped(tkey, seconds) == self._SETTINGS_QUIT:
+                return self._SETTINGS_QUIT
 
-    def _save_timing_scoped(self, tkey: str, seconds: float) -> None:
+    def _save_timing_scoped(self, tkey: str, seconds: float) -> str | None:
         pick = self._select_popup(
             f"Save timing '{tkey}' = {seconds:g}s where?",
             ["This repository (.agitrack/config.json)", "Global (all repositories)", "← Back (don't save)"],
         )
-        if pick is None or pick.startswith("←"):
-            return
+        if pick is None:
+            return self._SETTINGS_QUIT
+        if pick.startswith("←"):
+            return None
         scope = "repo" if pick.startswith("This repository") else "global"
         store = self.global_config.repo_data if scope == "repo" else self.global_config.data
         merged = dict(store.get("timings") or {})
         merged[tkey] = seconds
         self.global_config.set("timings", merged, scope=scope)
-        self._set_message(f"Saved timing '{tkey}' to {scope} settings. Takes effect on the next launch.", seconds=8.0)
+        self._set_message(
+            f"Saved timing '{tkey}' to {scope} settings. It won't take effect until you restart aGiTrack yourself.",
+            seconds=10.0,
+        )
         self._render()
+        return None
 
     def _handle_dashboard_command(self) -> None:
         """Ctrl-G → "dashboard": serve aGiTrack's metrics dashboard for this repo and
@@ -6806,13 +6856,31 @@ class ProxyRunner:
             return True
         self._popup_exit_pending = True
         self._popup_exit_force = False
+        self._exit_aborted = False
         try:
             if not self._confirm_exit() and not self._popup_exit_force:
+                self._set_message("Exit cancelled — still running; nothing was shut down.")
+                self._render()
                 return False
             if not self._popup_exit_force:
                 if not self._confirm_terminate_background_sessions() and not self._popup_exit_force:
+                    self._set_message("Exit cancelled — kept working; the background sessions are still running.")
+                    self._render()
                     return False
             self._finalize_pending_work()
+            if self._exit_aborted and not self._popup_exit_force:
+                # Esc on the on-exit copy offer: undo the "we're exiting" state and stay
+                # running so the user can deal with the files. Already-made commits/merges
+                # stand (they never lose work); nothing was deleted.
+                self._exiting = False
+                self._finalized_on_exit = False
+                self._set_message(
+                    "Exit cancelled. Your worktree and its files were NOT deleted — copy/move what you "
+                    "need, then exit again. (Commits already made this exit were kept.)",
+                    seconds=12.0,
+                )
+                self._render()
+                return False
             self._exit_child()
             self._exit_requested = True
             return True
@@ -6879,6 +6947,8 @@ class ProxyRunner:
         self._commit_latest_turn_sync()  # active session, in place
         self._auto_share_on_exit()  # push the latest conversation if auto-shared
         self._finalize_summary_then_integrate_on_exit()
+        if self._exit_aborted:
+            return  # Esc on the active session's copy offer — leave the rest untouched
         for session in list(self.sessions):
             if session is self.active:
                 continue
@@ -6890,6 +6960,8 @@ class ProxyRunner:
                 self._finalize_summary_then_integrate_on_exit()
             finally:
                 self.active = saved
+            if self._exit_aborted:
+                return  # Esc on a session's copy offer — stop finalizing the rest
         self._delete_orphan_merged_branches()
         # NB: deliberately NOT sweeping orphan shared-session snapshots here. That
         # sweep runs `git fsck` over the whole object graph — seconds on a large
@@ -7029,6 +7101,8 @@ class ProxyRunner:
         # no UI to prompt with. The "exit" context warns that declining discards them.
         if self.screen is not None:
             self._offer_copy_unstaged_to_base(context="exit")
+            if self._exit_aborted:
+                return  # Esc on the copy offer: keep this worktree + files, abort the exit
         # Remember this session's conversation under its backend so switching back
         # to that backend (this run or a later one) resumes it.
         self._remember_session_for_backend()
@@ -7639,12 +7713,14 @@ class ProxyRunner:
             sessions are never interrupted; their files are offered on switch/exit instead.
           - ``"switch"`` — when the user switches TO this session.
           - ``"exit"``   — last offer before the worktree (and these files) are deleted: the
-            decline mute is ignored and the prompt warns that declining discards them.
+            prompt warns that discarding them is permanent, and pressing Esc aborts the exit
+            so the user can deal with the files themselves.
 
         A file already accepted/left in place isn't re-offered until its content changes
         (fingerprint). Declining mutes the whole current SET of paths: aGiTrack won't ask
         again while only those files keep changing — only a genuinely NEW path re-opens the
-        set (ask about all again). The mute clears on session switch and aGiTrack restart."""
+        set (ask about all again), in EVERY context including exit. The mute clears on
+        session switch and aGiTrack restart."""
         if self.worktree is None or self.base_repo is None:
             return
         base_dir = self.base_repo.repo
@@ -7658,7 +7734,7 @@ class ProxyRunner:
         on_exit = context == "exit"
         # A genuinely new path (one we haven't muted) re-opens the whole set: drop the
         # decline mute and the per-file fingerprint memory so "all files" means all again.
-        if not on_exit and self._copy_declined and (current - self._copy_declined):
+        if self._copy_declined and (current - self._copy_declined):
             self._copy_declined.clear()
             self._copy_prompted.clear()
         fresh: list[tuple[str, tuple[int, int]]] = []
@@ -7666,23 +7742,24 @@ class ProxyRunner:
             fingerprint = self._file_fingerprint(wt_dir / rel)
             if fingerprint is None:
                 continue
-            if not on_exit:
-                if rel in self._copy_declined:
-                    continue  # muted by a prior decline; its contents can change freely
-                if self._copy_prompted.get(rel) == fingerprint:
-                    continue  # already offered/copied at this exact content
+            if rel in self._copy_declined:
+                continue  # muted by a prior decline; not re-asked even on exit (no new file)
+            if self._copy_prompted.get(rel) == fingerprint:
+                continue  # already offered/copied at this exact content
             fresh.append((rel, fingerprint))
         if not fresh:
             return
         for rel, fingerprint in fresh:
             self._copy_prompted[rel] = fingerprint
         rels = [rel for rel, _ in fresh]
-        # The file list is shown vertically (one per line) and scrolls (PgUp/PgDn) when long.
+        # The file list is shown vertically (one per line, scrolls with PgUp/PgDn), led by
+        # a "File(s):" line so it's clear the message refers to these names.
         if on_exit:
             title = (
                 f"This session's worktree ({wt_dir}) has {len(rels)} file(s) not in the base repo "
                 f"that will be DELETED when the worktree is removed on exit. Copy them into the base "
-                f"repo ({base_dir}) first?"
+                f"repo ({base_dir}) first? (Press Esc to cancel the exit and handle them yourself.)\n"
+                f"File(s):"
             )
             options = ["No, discard them with the worktree", "Yes, copy to the base repo"]
         else:
@@ -7690,10 +7767,19 @@ class ProxyRunner:
                 f"This session's worktree ({wt_dir}) has {len(rels)} file(s) that won't be merged "
                 f"into the base — intentionally unstaged or git-ignored. Copy them into the base repo ({base_dir})?\n"
                 f"(Decline and aGiTrack won't ask about this set again until the files change as a set "
-                f"or you switch sessions.)"
+                f"or you switch sessions.)\n"
+                f"File(s):"
             )
             options = ["No, leave them in the worktree", "Yes, copy to the base repo"]
         choice = self._select_popup(title, options, detail=rels)
+        if on_exit and choice is None:
+            # Esc on the exit offer cancels the exit entirely (handled by the caller) so the
+            # user can copy/move the files themselves — nothing is discarded or removed. Forget
+            # we offered them so the NEXT exit re-offers (the user didn't actually resolve them).
+            for rel in rels:
+                self._copy_prompted.pop(rel, None)
+            self._exit_aborted = True
+            return
         if choice is None or choice.startswith("No"):
             if on_exit:
                 self._set_message(f"Discarding {len(rels)} file(s) with the worktree.", seconds=6.0)

@@ -1,16 +1,16 @@
 # aGiTrack
 
-aGiTrack stands for agent + git tracking. It is an interactive Python CLI that wraps coding-agent command line tools and Git so agentic code changes are committed with traceable metadata.
+aGiTrack stands for *agent + git tracking*. It's a command-line tool that runs an AI coding agent for you and turns each change the agent makes into a git commit automatically — with a record of what you asked, what the agent did, and how many tokens it used. You get a clean, reviewable git history of the AI's work without committing anything by hand.
 
-aGiTrack supports OpenCode and Claude (Claude Code) as interchangeable backends. Every aGiTrack feature works the same regardless of the selected backend.
+You can use either **OpenCode** or **Claude (Claude Code)** as the AI agent — they're interchangeable, and every aGiTrack feature works the same way with either one.
 
 > 📊 **[User Flow Diagram](docs/user-flow.md)** — a complete, graph-rendered map of aGiTrack's interactive logic: which file/commit status triggers which prompt, and where every option (and nested option) leads. Read it to understand exactly how aGiTrack behaves.
 
 ## Requirements
 
-aGiTrack runs on **macOS and Linux**. It is a POSIX terminal application (it drives the terminal through `pty`/`termios`), so it does not run on native Windows; on Windows, use it inside **WSL** (Windows Subsystem for Linux), which is a Linux environment. aGiTrack works across common terminal emulators (e.g. iTerm2, Apple Terminal, Alacritty, kitty, GNOME Terminal, Konsole, tmux, the VS Code integrated terminal, and Windows Terminal driving WSL), degrading gracefully on terminals that lack features such as the alternate screen or the kitty keyboard protocol.
+aGiTrack runs on **macOS and Linux**. It doesn't run directly on Windows; on Windows, run it inside **WSL** (Windows Subsystem for Linux), which gives you a Linux environment. It works in the common terminal apps (iTerm2, Apple Terminal, Alacritty, kitty, GNOME Terminal, Konsole, tmux, the VS Code terminal, and Windows Terminal running WSL); on a terminal that lacks some advanced features, it still works, just with fewer visual frills.
 
-aGiTrack needs **git** and at least one backend CLI — [Claude Code](https://docs.claude.com/en/docs/claude-code) or [OpenCode](https://opencode.ai) — on your `PATH`. The dashboard's committer view additionally uses the **GitHub CLI (`gh`)** to resolve commit authors to their GitHub logins: install it from [cli.github.com](https://cli.github.com) and run `gh auth login`. `gh` is optional — without it the dashboard still works and falls back to merging committer identities by email and no-reply login.
+You need **git** and at least one AI agent — [Claude Code](https://docs.claude.com/en/docs/claude-code) or [OpenCode](https://opencode.ai) — installed and on your `PATH`. The dashboard can also use the **GitHub CLI (`gh`)** to show each commit's author by their GitHub username: install it from [cli.github.com](https://cli.github.com) and run `gh auth login`. `gh` is optional — without it, the dashboard still works and just groups authors by email instead.
 
 ## Install
 
@@ -47,7 +47,7 @@ Run in the current repository:
 agitrack
 ```
 
-By default, `agitrack` runs in proxy mode: it launches the real backend TUI (OpenCode or Claude) in a pseudo-terminal, renders it through an internal terminal screen, and reserves a bottom status line for aGiTrack showing the session (and the branch it merges into — shown **bold** when that branch differs from the one checked out in the repo directory), the backend, the summarizer state, and the repository the agent is working on (the base repository path, home-abbreviated and elided from the left when space is tight). Press `Ctrl-G` to enter aGiTrack command mode (configurable via `menu_key` in `~/.agitrack/config.json` — see Configuration).
+By default, aGiTrack launches the AI agent's normal interface (OpenCode or Claude) and sits quietly between you and it — you use the agent exactly as you would on its own. At the bottom of the screen, aGiTrack adds a status line showing: the current session and the branch its work goes into (in **bold** when that branch isn't the one you have checked out), which agent is running, whether commit summaries are on, and which repository you're working in. Press `Ctrl-G` at any time to open aGiTrack's own menu (you can change this key with `menu_key` in `~/.agitrack/config.json` — see Configuration).
 
 Run against another repository:
 
@@ -76,7 +76,7 @@ agitrack --no-worktree
 
 Without a worktree the agent edits the current branch directly, so changes are visible live as it works — but there's no isolation or auto-integration. You can still **start and switch between multiple sessions** in this mode; they just all share the one directory, editing the same files at the same time (aGiTrack shows a one-time heads-up the first time you open a second one, and a turn's commit captures whatever is in the working tree then — coordinate as you would with another person editing the same checkout). Because the agent edits the checked-out branch directly, every session works on (merges into) the repo directory's **current** branch and can never be pointed at a different one — so the "change a session's merge branch" option isn't offered in this mode. If you switch the directory's branch out-of-band (e.g. `git checkout` in another terminal), aGiTrack warns you and the session follows the new branch (future changes land there).
 
-Switching to `--no-worktree` doesn't strand sessions you started **with** worktrees: resuming one (`Ctrl-G → sessions`, or `↻ Resume a past conversation…`) continues it in the base directory. A conversation first run inside a worktree records that worktree as its working directory; on resume here aGiTrack rewrites the recorded working directory to the base repo, so the agent runs in your directory rather than the old (now-removed) worktree path. To make no-worktree the default, set `"use_worktrees": false` in `~/.agitrack/config.json`.
+If you ran sessions the normal way before (each in its own worktree) and then start aGiTrack with `--no-worktree`, those earlier sessions are still there to resume — pick one from `Ctrl-G → sessions` (or `↻ Resume a past conversation…`) and it picks up in your main repository directory. (Why this needs handling: a session that first ran inside a worktree remembers that worktree folder as where it was working. When you resume it without worktrees, aGiTrack updates that remembered folder to your main directory, so the agent works there instead of trying to use the old worktree folder — which no longer exists.) To make no-worktree the default for every run, set `"use_worktrees": false` in `~/.agitrack/config.json`.
 
 
 
@@ -88,10 +88,10 @@ In proxy mode (default), press `Ctrl-G`, then type one of these aGiTrack command
 sessions                  switch / start (own worktree) / stop a live session
 agent-backend             switch backend (opencode|claude); shows a picker
 summarizer                toggle summarization on/off, set model, show status
-settings                  view/change all config options (repo-local or global)
 git-unstaged              show intentionally unstaged files
 git-user-commit           create a user commit
 dashboard                 serve the metrics dashboard and open it in the browser
+settings                  view/change all config options (repo-local or global)
 update                    check for / install an aGiTrack self-update
 exit                      exit (with confirmation)
 ```
@@ -144,13 +144,13 @@ Shared sessions also appear in the [dashboard](#dashboard) under **shared sessio
 
 ### Backends
 
-aGiTrack drives an external coding agent rather than calling a model directly. OpenCode and Claude (Claude Code) are interchangeable backends, and every aGiTrack feature behaves the same regardless of which is selected. The per-repository backend is recorded in state; the user-wide default lives in `~/.agitrack/config.json`.
+aGiTrack runs a separate coding agent rather than talking to an AI model itself. OpenCode and Claude (Claude Code) are interchangeable, and every feature works the same with either. Each repository remembers which agent it uses; your overall default is stored in `~/.agitrack/config.json`.
 
-aGiTrack recovers what to commit from the backend's own session record: `opencode export` for OpenCode, and the session transcript under `~/.claude/projects/` for Claude. In JSON mode it instead invokes the backend non-interactively per prompt and captures the final response.
+To know what to commit, aGiTrack reads the agent's own record of the conversation: `opencode export` for OpenCode, and the transcript Claude keeps under `~/.claude/projects/`. (In JSON mode it instead runs the agent once per prompt and captures its final reply.)
 
 ### Session tracking
 
-aGiTrack tracks exactly one backend session per repository and stays pinned to the session it launched, so it does not drift to other conversations you open in the backend. On startup it baselines the tracked session, so token metadata and the interaction trace only cover turns that happen after aGiTrack starts watching — resuming an old conversation does not re-commit its history.
+aGiTrack follows exactly one agent conversation per repository — the one it started — and stays with it, so it won't get confused by other conversations you open in the agent. When it starts, it notes where the conversation currently stands, so the commits, token counts, and conversation records it makes only cover what happens from that point on. Resuming an older conversation won't re-commit its earlier history.
 
 Use the `session` command to start a new session, switch the tracked session to another existing one, or sync tracking to the most recently active session (for example after starting a fresh conversation inside the backend's own TUI). The session menu marks each session `running` or `idle`. A new session is given a friendly random word as its default name (e.g. `maple`, `harbor`) — easier to remember than `session-1` and, since sessions are shared as `<github-id(s)>/<name>`, far less likely to clash with a collaborator's; you can accept it or type your own at the prompt, and rename later.
 
@@ -169,9 +169,9 @@ When you start a new session you can make it either a **blank session** (a fresh
 
 ### Worktrees and branches
 
-To let sessions run without stepping on each other or on your working tree, each aGiTrack session runs in its own git worktree under `.agitrack/worktrees/<name>`, created *detached* at its merge branch — a session has no branch of its own. Work within a session is committed on per-turn branches named `agitrack/<backend>/<name>/t<turn>`, created lazily on the first commit of each turn; once a turn is integrated its branch is deleted and the worktree is detached at the merge branch again. All aGiTrack-managed branches live under the `agitrack/` prefix so they are easy to recognize for cleanup and never collide with your own branches.
+So that sessions don't interfere with each other or with the files you're editing, aGiTrack runs each session in its own [git worktree](https://git-scm.com/docs/git-worktree) — a separate copy of the repository under `.agitrack/worktrees/<name>`, where the agent does its work. Each turn's commits go onto a temporary, aGiTrack-managed branch (named `agitrack/<backend>/<name>/t<turn>`); once aGiTrack merges that turn into the session's target branch, it deletes the temporary branch. All of aGiTrack's own branches start with `agitrack/`, so they're easy to recognize and never clash with your own.
 
-A session's branch is only ever advanced by **integration**: aGiTrack merges a session's pending commits back into its merge branch rather than committing onto it directly. A single-writer lock ensures only one aGiTrack process auto-commits or integrates at a time, so concurrent sessions stay consistent.
+A session's target branch only ever moves forward by **merging** — aGiTrack merges a session's finished commits into it, rather than committing onto it directly. A single-writer lock means only one aGiTrack process commits or merges at a time, so sessions running side by side stay consistent.
 
 #### Copying a worktree's leftover files into your directory
 
@@ -200,9 +200,9 @@ Each session has its **own** merge destination, independent of the other session
 
 ### Integration and startup recovery
 
-When a session's commits are merged into its merge branch and the merge has conflicts, the agent backend resolves them, and the resolution is recorded as an `<aGiTrack-merge>` commit listing the base commits it was resolved against.
+When merging a session's commits hits a conflict, aGiTrack asks the AI agent to resolve it and records the result as an `<aGiTrack-merge>` commit (which lists the commits it was resolved against).
 
-On startup, aGiTrack reconciles worktrees left behind by previous runs: it integrates any pending commits into the merge branch and then deletes the worktree. Worktrees that cannot be integrated cleanly (a conflict, or uncommitted changes) are kept so no work is lost. The backend conversation itself persists (keyed by the worktree path) and stays resumable.
+When it starts, aGiTrack tidies up worktrees left behind by earlier runs: it merges any unfinished commits into their target branch, then removes the worktree. If a worktree can't be merged cleanly (a conflict, or uncommitted changes), aGiTrack keeps it so nothing is lost. The agent's conversation is saved separately and can still be resumed.
 
 ### Commit message format
 
@@ -374,7 +374,7 @@ Help follows the same model: `agitrack --help` (or `-h`) prints aGiTrack's own o
 
 ## Configuration
 
-You can edit every option below interactively with the **`settings`** command (`Ctrl-G → settings`): it lists each option with its current value and source, and when you change one it asks whether to save to the **repository-local** settings (`.agitrack/config.json`) or the **global** settings (`~/.agitrack/config.json`). The menu loops so you can change several at once, and every step has a "← Back". You can also edit the JSON files by hand, as described here.
+You can edit every option below interactively with the **`settings`** command (`Ctrl-G → settings`): it lists each option with its current value and source, and when you change one it asks whether to save to the **repository-local** settings (`.agitrack/config.json`) or the **global** settings (`~/.agitrack/config.json`). The menu loops so you can change several at once; **← Back** steps back a level and **Esc** closes the menu. Some options are read only at startup — when you change one of those, aGiTrack saves it and tells you it won't take effect until you **restart aGiTrack yourself** (it never restarts on its own). You can also edit the JSON files by hand, as described here.
 
 Repository-local configuration can be stored in `.agitrack/config.json`:
 
