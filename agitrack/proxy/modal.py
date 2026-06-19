@@ -175,6 +175,20 @@ class SelectModal:
         overhead = title_lines + len(self.options) + 5  # instructions, gaps, 2 scroll hints
         return max(3, self.viewport_rows - 4 - overhead)
 
+    def _option_window(self, used_rows: int) -> tuple[int, int]:
+        """The half-open ``[start, end)`` slice of options to show so the SELECTED row stays
+        visible when the list is taller than the terminal. ``used_rows`` is everything else
+        the popup already spends (title, detail, instruction, blank). Without a known
+        terminal height, show every option (the box still clamps)."""
+        count = len(self.options)
+        if not self.viewport_rows:
+            return 0, count
+        budget = max(3, self.viewport_rows - 4 - used_rows - 2)  # 2 rows reserved for hints
+        if count <= budget:
+            return 0, count
+        start = min(max(self.selected - budget // 2, 0), count - budget)
+        return start, start + budget
+
     def render_message(self) -> str:
         """Return the message string that should be shown in the popup area."""
         lines = [self.title]
@@ -194,12 +208,22 @@ class SelectModal:
             "Up/Down selects. PgUp/PgDn scroll. Enter confirms." if scrollable else "Up/Down selects. Enter confirms."
         )
         lines.append("")
-        for index, option in enumerate(self.options):
+        # Window the options so a list taller than the terminal scrolls with the selection
+        # (otherwise the box would truncate it and hide the highlighted row). Rows used so
+        # far = the title's own height plus every line after it (detail, instruction, blank).
+        title_rows = self.title.count("\n") + 1
+        start, end = self._option_window(title_rows + (len(lines) - 1))
+        if start > 0:
+            lines.append(f"  ↑ {start} more above")
+        for index in range(start, end):
+            option = self.options[index]
             if self._is_separator(option):
                 lines.append("")  # a blank gap between groups
                 continue
             prefix = "> " if index == self.selected else "  "
             lines.append(prefix + option)
+        if end < len(self.options):
+            lines.append(f"  ↓ {len(self.options) - end} more below")
         return "\n".join(lines)
 
     def feed(self, data: bytes) -> tuple[str, str | None]:
