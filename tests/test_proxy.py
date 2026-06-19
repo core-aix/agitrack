@@ -5467,26 +5467,45 @@ def test_pre_agent_commit_detects_and_syncs_base_user_edits(tmp_path):
     assert runner._base_edits_declined_status is None
 
 
-def test_pre_agent_commit_recovers_a_previously_declined_base_file(tmp_path):
-    # The exact bug from the field: the user drops a NEW file into the base repo (e.g. a
-    # screenshot) that was once declined at the stage prompt. It must NOT be stranded —
-    # the pre-agent commit offer re-includes it, commits it to the base branch, and syncs
-    # it into the session worktree so the agent (and the repo) actually get it.
+def test_pre_agent_commit_stages_commits_and_syncs_a_new_base_file(tmp_path):
+    # The field scenario: the user drops a NEW (untracked, unstaged) file into the base
+    # repo — e.g. a screenshot. Before the prompt goes out, aGiTrack offers to stage it
+    # ([y/N]); on "y" it commits the file to the base branch and merges that commit into
+    # the session worktree, so both the repo and the agent get it.
     runner, base, worktree, wt_path = _base_edit_runner(tmp_path, answers=["y", "add screenshot"])
     runner.pre_agent_reconciled_status = ""
     runner._finish_agent_parse_if_ready = lambda quiet: False
     runner.actions = types.SimpleNamespace(has_pre_agent_user_changes=lambda: False)
 
-    (tmp_path / "shot.png").write_bytes(b"PNGDATA")
-    runner._user_state().add_declined(["shot.png"])  # previously declined → used to be stuck
+    (tmp_path / "shot.png").write_bytes(b"PNGDATA")  # added but unstaged (untracked)
 
     assert runner._pre_agent_commit_if_needed("use the screenshot") is True
 
-    # Committed to the base branch (the untracked file was re-offered and staged)...
+    # Staged + committed to the base branch...
     assert base._run(["git", "log", "-1", "--format=%s"]).stdout.strip() == "add screenshot"
     assert "shot.png" in base._run(["git", "show", "--stat", "--format="]).stdout
-    # ...and synced into the worktree so the agent sees it.
+    # ...and merged into the worktree so the agent sees it.
     assert (wt_path / "shot.png").read_bytes() == b"PNGDATA"
+
+
+def test_base_user_edit_declined_then_restaged_is_not_stranded(tmp_path):
+    # Saying "N" to the stage prompt must not permanently strand the file: a later
+    # pre-agent check still offers it (so the user can stage it then), and the "no" only
+    # suppresses re-prompting until the base tree changes (the fingerprint gate).
+    runner, base, worktree, wt_path = _base_edit_runner(tmp_path, answers=["N", "y", "add later"])
+    runner.pre_agent_reconciled_status = ""
+    runner._finish_agent_parse_if_ready = lambda quiet: False
+    runner.actions = types.SimpleNamespace(has_pre_agent_user_changes=lambda: False)
+    (tmp_path / "shot.png").write_bytes(b"PNGDATA")
+
+    runner._pre_agent_commit_if_needed("first")  # user says N to staging
+    assert "shot.png" not in base._run(["git", "ls-files"]).stdout  # not committed
+    assert runner._base_user_edits_pending() is True  # still offered, not stranded
+
+    runner._base_edits_declined_status = None  # simulate the base tree changing → re-offer
+    runner._pre_agent_commit_if_needed("second")  # now user says y
+    assert "shot.png" in base._run(["git", "ls-files"]).stdout  # committed this time
+    assert (wt_path / "shot.png").read_bytes() == b"PNGDATA"  # and synced
 
 
 def test_base_user_edit_decline_remembered_until_new_edits(tmp_path):
@@ -5507,18 +5526,17 @@ def test_base_user_edit_decline_remembered_until_new_edits(tmp_path):
     assert len(runner.prompts) == 2
 
 
-def test_base_user_new_file_counts_as_pending_even_if_declined(tmp_path):
+def test_base_user_untracked_file_counts_as_pending(tmp_path):
     runner, base, worktree, wt_path = _base_edit_runner(tmp_path, answers=[])
 
     assert runner._base_user_edits_pending() is False
+    # A new, untracked (added-but-unstaged) file in the base repo is a pending edit, so
+    # the pre-agent flow offers to stage/commit it.
     (tmp_path / "added.txt").write_text("new\n", encoding="utf-8")
     assert runner._base_user_edits_pending() is True
-    # A previously-declined file STILL counts as a pending base edit, so it can never
-    # be permanently stranded — the commit offer re-includes it (include_declined), and
-    # re-prompt nagging is instead avoided by the fingerprint gate in
-    # _commit_base_user_edits_if_needed.
-    state = runner._user_state()
-    state.add_declined(["added.txt"])
+    # It keeps counting even after a prior "don't stage" answer, so it can never become
+    # permanently un-committable; re-prompt nagging is handled by the fingerprint gate.
+    runner._user_state().add_declined(["added.txt"])
     assert runner._base_user_edits_pending() is True
 
 

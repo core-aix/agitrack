@@ -6115,10 +6115,11 @@ class ProxyRunner:
         # Defaults to the active worktree (capturing uncommitted worktree changes
         # before the next prompt). The user-facing `git-user-commit` command passes
         # the base repo/state instead, since the user's own edits live there.
-        # ``include_declined`` re-offers untracked files the user previously left
-        # unstaged — used when the user is explicitly committing (the base-repo paths),
-        # so a once-declined file is never permanently un-committable. The automatic
-        # worktree capture keeps it False so the agent's untracked decline still sticks.
+        # ``include_declined`` re-offers every untracked (added-but-unstaged) file at the
+        # stage prompt — used for the base-repo paths, where the user is explicitly
+        # committing, so a file is always offer-able and never permanently un-stageable.
+        # The automatic worktree capture keeps it False so the agent's own untracked
+        # decline still sticks.
         on_worktree = repo is None
         repo = repo or self.repo
         state = state or self.state
@@ -6997,9 +6998,12 @@ class ProxyRunner:
         if base is None or self.worktree is None:
             return False
         try:
-            # `untracked_files()` already excludes aGiTrack's own `.agitrack/`; declined
-            # files are deliberately NOT excluded here (the fingerprint gate handles
-            # re-prompt nagging) so they can't get permanently stranded.
+            # Any uncommitted work counts: a tracked-file edit, OR a new untracked
+            # (added-but-unstaged) file — `untracked_files()` lists those (and already
+            # excludes aGiTrack's own `.agitrack/`). The user is offered to stage and
+            # commit it; a "don't stage" answer only suppresses re-prompting for the
+            # same tree state via the fingerprint gate, never permanently, so a file is
+            # always offer-able.
             return base.has_tracked_changes() or bool(base.untracked_files())
         except Exception as error:
             self._debug(f"base user-edit check failed: {error!r}")
