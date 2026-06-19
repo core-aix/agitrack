@@ -218,7 +218,7 @@ never see them (`_offer_copy_unstaged_to_base`). It runs for the **active** sess
 flowchart TD
   start(["Trigger: active session idle after a turn (committed or not), OR switched to this session, OR aGiTrack exiting"]) --> wtq{"Worktree session? (no-op under --no-worktree)"}
   wtq -->|No| done(["Nothing to do"])
-  wtq -->|Yes| gather[["List worktree files that won't merge: uncommitted or git-ignored. Skip .agitrack/ and names starting with _ or ."]]
+  wtq -->|Yes| gather[["List worktree files that won't merge: intentionally unstaged or git-ignored (new agent files are auto-staged + committed). Skip .agitrack/ and names starting with _ or ."]]
   gather --> any{"Any candidate files?"}
   any -->|No| done
   any -->|Yes| ctx{"Context?"}

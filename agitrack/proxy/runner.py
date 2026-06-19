@@ -7519,7 +7519,7 @@ class ProxyRunner:
         else:
             title = (
                 f"This session's worktree ({wt_dir}) has {len(rels)} file(s) that won't be merged "
-                f"into the base — uncommitted or git-ignored. Copy them into the base repo ({base_dir})?\n"
+                f"into the base — intentionally unstaged or git-ignored. Copy them into the base repo ({base_dir})?\n"
                 f"(Decline and aGiTrack won't ask about this set again until the files change as a set "
                 f"or you switch sessions.)"
             )
