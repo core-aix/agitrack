@@ -7482,25 +7482,39 @@ class ProxyRunner:
         if choice is None or choice.startswith("No"):
             self._notice_files_remain(wt_dir, [rel for rel, _ in fresh])
             return
-        # Files that would overwrite something already in the base get a SINGLE
-        # all-or-nothing confirmation (not one prompt per file). Decline → those files
-        # are skipped, but the new (non-overwriting) files are still copied.
+        # Files that would overwrite something already in the base are handled in one
+        # up-front choice: overwrite them all, keep them all (the new files still copy),
+        # or confirm each one individually.
         conflicts = [rel for rel, _ in fresh if (base_dir / rel).exists()]
-        overwrite_conflicts = True
+        overwrite_mode = "all"  # no conflicts → moot
         if conflicts:
             preview = ", ".join(conflicts[:5]) + (" …" if len(conflicts) > 5 else "")
             answer = self._select_popup(
                 f"{len(conflicts)} of these already exist in the base repo ({preview}). Overwrite them?",
-                ["No, keep the base versions", "Yes, overwrite them"],
+                ["No, keep the base versions", "Yes, overwrite all", "Let me confirm each one"],
             )
-            overwrite_conflicts = answer == "Yes, overwrite them"
+            if answer == "Yes, overwrite all":
+                overwrite_mode = "all"
+            elif answer == "Let me confirm each one":
+                overwrite_mode = "each"
+            else:  # "No, keep the base versions" or cancelled
+                overwrite_mode = "none"
         remained: list[str] = []
         copied = 0
         for rel, _ in fresh:
             src, dst = wt_dir / rel, base_dir / rel
-            if dst.exists() and not overwrite_conflicts:
-                remained.append(rel)  # the single overwrite prompt was declined
-                continue
+            if dst.exists():
+                if overwrite_mode == "none":
+                    remained.append(rel)  # keep all base versions
+                    continue
+                if overwrite_mode == "each":
+                    per = self._select_popup(
+                        f"'{rel}' already exists in the base repo. Overwrite it?",
+                        ["No, keep the base version", "Yes, overwrite"],
+                    )
+                    if per != "Yes, overwrite":
+                        remained.append(rel)
+                        continue
             try:
                 if src.is_dir():  # a wholly-ignored directory, reported as `dir/`
                     shutil.copytree(src, dst, dirs_exist_ok=True)
