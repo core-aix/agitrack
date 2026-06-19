@@ -820,7 +820,8 @@ def _copy_runner(tmp_path, status):
     wt.mkdir()
     runner = make_runner()
     runner.base_repo = types.SimpleNamespace(repo=base)
-    runner.repo = types.SimpleNamespace(repo=wt, status_short=lambda: status)
+    # The copy offer reads ignored entries too (git status --short --ignored).
+    runner.repo = types.SimpleNamespace(repo=wt, status_short=lambda: status, status_short_ignored=lambda: status)
     runner.worktree = types.SimpleNamespace(name="s", path=wt)
     msgs: list[str] = []
     runner._set_message = lambda m, **k: msgs.append(m)
@@ -846,7 +847,7 @@ def test_offer_copy_unstaged_declined_leaves_files_and_notifies(tmp_path):
     runner._offer_copy_unstaged_to_base()
 
     assert not (base / "keep.txt").exists()
-    assert any("remain in this session's worktree" in m and str(wt) in m for m in msgs)
+    assert any("left in this session's worktree" in m and str(wt) in m for m in msgs)
 
     # An unchanged file is not prompted again.
     prompted: list = []
@@ -865,7 +866,7 @@ def test_offer_copy_unstaged_overwrite_declined_keeps_base(tmp_path):
     runner._offer_copy_unstaged_to_base()
 
     assert (base / "dup.txt").read_text() == "old\n"  # not overwritten
-    assert any("remain in this session's worktree" in m for m in msgs)
+    assert any("left in this session's worktree" in m for m in msgs)
 
 
 def test_offer_copy_unstaged_overwrite_confirmed(tmp_path):
@@ -887,6 +888,80 @@ def test_offer_copy_unstaged_noop_without_worktree(tmp_path):
     runner._select_popup = lambda *a, **k: prompted.append(a) or None
     runner._offer_copy_unstaged_to_base()
     assert prompted == []
+
+
+def test_offer_copy_includes_git_ignored_files(tmp_path):
+    # A turn that only created git-ignored files makes no commit, but those files
+    # (here `data.bin`, reported with the `!!` ignored status) should still be
+    # offered for copying into the base directory.
+    runner, base, wt, _ = _copy_runner(tmp_path, "!! data.bin\n")
+    (wt / "data.bin").write_text("payload\n")
+    runner._select_popup = lambda *a, **k: "Yes, copy to the base repo"
+
+    runner._offer_copy_unstaged_to_base()
+
+    assert (base / "data.bin").read_text() == "payload\n"
+
+
+def test_offer_copy_skips_underscore_and_dot_files(tmp_path):
+    # Files whose name starts with `_` or `.` are generated/hidden scaffolding and
+    # are never offered — so a turn touching only such files prompts nothing.
+    status = "?? __pycache__/\n!! .env\n?? _scratch.tmp\n"
+    runner, base, wt, _ = _copy_runner(tmp_path, status)
+    prompted: list = []
+    runner._select_popup = lambda *a, **k: prompted.append(a) or None
+
+    runner._offer_copy_unstaged_to_base()
+
+    assert prompted == []
+    assert runner._uncommitted_worktree_files() == []
+
+
+def test_offer_copy_mixes_real_files_and_skips_hidden(tmp_path):
+    # When real files and hidden/scaffolding files are both present, only the real
+    # ones are offered; `.cache` and `_tmp` are filtered out.
+    status = "?? keep.txt\n?? .cache\n!! _tmp\n"
+    runner, base, wt, _ = _copy_runner(tmp_path, status)
+    (wt / "keep.txt").write_text("real\n")
+    runner._select_popup = lambda *a, **k: "Yes, copy to the base repo"
+
+    assert runner._uncommitted_worktree_files() == ["keep.txt"]
+    runner._offer_copy_unstaged_to_base()
+    assert (base / "keep.txt").read_text() == "real\n"
+
+
+def test_offer_copy_decline_notice_warns_worktree_is_removed(tmp_path):
+    # Declining keeps the files in the worktree, but the notice must say where they
+    # are (the worktree path) and that the worktree is removed on aGiTrack exit.
+    runner, base, wt, msgs = _copy_runner(tmp_path, "?? keep.txt\n")
+    (wt / "keep.txt").write_text("x\n")
+    runner._select_popup = lambda *a, **k: "No, leave them in the worktree"
+
+    runner._offer_copy_unstaged_to_base()
+
+    assert msgs
+    notice = msgs[-1]
+    assert str(wt) in notice  # the worktree path is spelled out
+    assert "removed when aGiTrack exits" in notice
+
+
+def test_maybe_offer_copy_when_idle_is_gated_on_idleness(tmp_path):
+    # The idle wrapper used by the turn loop must not prompt while the agent is
+    # still active, but should once it's idle.
+    runner, base, wt, _ = _copy_runner(tmp_path, "!! data.bin\n")
+    (wt / "data.bin").write_text("payload\n")
+    runner.merge_ctx = None
+    runner.last_child_output = 0.0  # long ago → past the idle threshold
+    calls: list = []
+    runner._offer_copy_unstaged_to_base = lambda: calls.append(True)
+
+    runner._agent_is_active = lambda: True
+    runner._maybe_offer_copy_when_idle(1e9)
+    assert calls == []  # agent active → no offer
+
+    runner._agent_is_active = lambda: False
+    runner._maybe_offer_copy_when_idle(1e9)
+    assert calls == [True]  # idle → offer fires
 
 
 def test_stage_backend_resume_retargets_cwd_to_launch_dir(tmp_path):
@@ -3542,6 +3617,96 @@ def test_resume_switches_to_already_live_conversation():
     assert "_created" not in runner.__dict__
 
 
+# --- parallel sessions under --no-worktree (shared base directory) ---
+
+
+def _no_worktree_new_session_runner(tmp_path):
+    """A runner with worktrees OFF and one live session, stubbed so `_new_session`
+    can be driven without spawning a real backend."""
+    import types
+
+    from agitrack.git import GitRepo
+
+    base = GitRepo.init(tmp_path / "base")
+    (tmp_path / "base" / "README.md").write_text("hi\n", encoding="utf-8")
+    base.stage_paths(["README.md"])
+    base.commit("seed")
+
+    runner = make_runner(name="first")
+    runner._use_worktrees = False
+    runner.worktree = None
+    runner.base_repo = base
+    runner.repo = base
+    runner.global_config = types.SimpleNamespace(default_backend="claude")
+    runner.sessions = [types.SimpleNamespace(name="first")]
+    events: list = []
+    # Stub the heavy lifecycle steps so the test exercises only the session wiring.
+    runner._warn_parallel_no_worktree_sessions = lambda: events.append("warn")
+    runner._stage_backend_resume = lambda sid: events.append(("stage", sid))
+    runner._initialize_session_baseline = lambda: None
+    runner._sanitize_state_trace = lambda: None
+    runner._init_screen = lambda: None
+    runner._spawn = lambda: None
+    runner._start_file_watcher = lambda: None
+    runner._resize_child = lambda: None
+    runner._enable_host_mouse = lambda: None
+    runner._render = lambda *a, **k: None
+    runner._set_message = lambda m, **k: events.append(("msg", m))
+    return runner, base, events
+
+
+def test_new_session_no_worktree_runs_in_base_dir_not_a_worktree(tmp_path):
+    # Worktrees off: a new session runs on the base tree (worktree stays None, repo is
+    # the base repo) instead of being refused — so parallel sessions are allowed.
+    runner, base, events = _no_worktree_new_session_runner(tmp_path)
+
+    runner._new_session("second")
+
+    assert runner.worktree is None
+    assert runner.repo is base
+    assert len(runner.sessions) == 2  # the new session was actually started
+    assert "warn" in events  # the shared-tree caveat was surfaced
+
+
+def test_new_session_no_worktree_blank_starts_fresh_conversation(tmp_path):
+    # A blank no-worktree session must not inherit the shared base-dir state's recorded
+    # conversation id — it mints a fresh one.
+    runner, base, _ = _no_worktree_new_session_runner(tmp_path)
+    from agitrack.config import AgitrackState
+
+    stale = AgitrackState(base.repo, default_backend="claude")
+    stale.backend_session_id = "stale-id"  # persisted in the shared base-dir state
+
+    runner._new_session("blank")
+
+    assert runner.state.backend_session_id is None  # not the stale base-dir id
+
+
+def test_new_session_no_worktree_resume_stages_transcript(tmp_path):
+    # Resuming a (previously-worktree) conversation under --no-worktree stages its
+    # transcript into the base dir, which also retargets its recorded cwd there.
+    runner, _base, events = _no_worktree_new_session_runner(tmp_path)
+
+    runner._new_session("resumed", resume_session_id="old-sid")
+
+    assert runner.state.backend_session_id == "old-sid"
+    assert ("stage", "old-sid") in events
+
+
+def test_warn_parallel_no_worktree_sessions_fires_once(tmp_path):
+    # The shared-tree caveat is shown only once per run.
+    runner, _base, _ = _no_worktree_new_session_runner(tmp_path)
+    del runner._warn_parallel_no_worktree_sessions  # use the real method
+    shown: list = []
+    runner._select_popup = lambda title, opts: shown.append(title) or "Got it"
+
+    runner._warn_parallel_no_worktree_sessions()
+    runner._warn_parallel_no_worktree_sessions()
+
+    assert len(shown) == 1
+    assert "share this directory" in shown[0]
+
+
 # --- shared-session resume gives a local name (#71) ---
 
 
@@ -3854,6 +4019,88 @@ def test_timers_phase_stops_after_pending_update_teardown():
     runner._reactor_timers_phase()
 
     assert synced == []  # the worktree-sync tail was skipped after teardown
+
+
+def test_ensure_worktree_alive_recreates_externally_deleted_worktree(tmp_path):
+    # If a live session's worktree directory disappears out from under it (an external
+    # delete — a backup/indexer/cloud-sync, or a stray `git worktree` elsewhere), the
+    # recovery must recreate it at the SAME path, keep it a worktree session (not the
+    # base-tree fallback), and respawn the backend there — never silently keep running
+    # git in a gone directory. (Pins the path the agent's "worktree re-synced (cwd
+    # reset)" narration came from.)
+    import shutil
+
+    from agitrack.git import GitRepo
+    from agitrack.git.worktree import WorktreeManager
+
+    base = GitRepo.init(tmp_path / "base")
+    (tmp_path / "base" / "seed.txt").write_text("seed\n", encoding="utf-8")
+    base.stage_paths(["seed.txt"])
+    base.commit("seed")
+    manager = WorktreeManager(base)
+    info = manager.create("session-1", base=base.current_branch())
+
+    runner = make_runner(
+        name="session-1",
+        base_repo=base,
+        repo=GitRepo(info.path),
+        worktree=info,
+        _base_branch=base.current_branch(),
+        state=AgitrackState(info.path, default_backend="claude"),
+    )
+    runner.global_config = type("GC", (), {"default_backend": "claude"})()
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda *a, **k: None
+    runner._debug = lambda *a, **k: None
+    # Stub the process/screen lifecycle so no real backend is spawned.
+    events: list = []
+    runner._teardown_child = lambda: events.append("teardown")
+    runner._stop_file_watcher = lambda: None
+    runner._reset_agent_tracking = lambda: None
+    runner._sanitize_state_trace = lambda: None
+    runner._initialize_session_baseline = lambda: None
+    runner._init_screen = lambda: None
+    runner._spawn = lambda: events.append("spawn")
+    runner._start_file_watcher = lambda: None
+    runner._resize_child = lambda: None
+    runner._enable_host_mouse = lambda: None
+
+    # The worktree directory vanishes externally.
+    shutil.rmtree(info.path)
+    assert not info.path.exists()
+
+    runner._ensure_worktree_alive()
+
+    # Recreated at the same path as a real linked worktree, still a worktree session,
+    # with the backend torn down and respawned (in that order).
+    assert runner.worktree is not None  # not the base-tree fallback
+    assert runner.worktree.path == info.path
+    assert info.path.exists()
+    assert (info.path / ".git").exists()  # a real linked worktree again
+    assert runner.repo.repo == info.path
+    assert events == ["teardown", "spawn"]
+
+
+def test_ensure_worktree_alive_noop_when_directory_present(tmp_path):
+    # The common case: the worktree is fine, so recovery must do nothing (no teardown,
+    # no respawn) — it only acts when the directory is genuinely gone.
+    from agitrack.git import GitRepo
+    from agitrack.git.worktree import WorktreeManager
+
+    base = GitRepo.init(tmp_path / "base")
+    (tmp_path / "base" / "seed.txt").write_text("seed\n", encoding="utf-8")
+    base.stage_paths(["seed.txt"])
+    base.commit("seed")
+    info = WorktreeManager(base).create("session-1", base=base.current_branch())
+
+    runner = make_runner(name="session-1", base_repo=base, repo=GitRepo(info.path), worktree=info)
+    touched: list = []
+    runner._teardown_child = lambda: touched.append("teardown")
+    runner._spawn = lambda: touched.append("spawn")
+
+    runner._ensure_worktree_alive()
+
+    assert touched == []  # directory present → recovery is a no-op
 
 
 def test_abort_shared_resume_clears_token_for_retry():
@@ -6672,14 +6919,3 @@ def test_no_worktree_mode_skips_worktree_setup(tmp_path):
     runner._setup_base_merge_only_session()
     assert runner.worktree is None
     assert not (tmp_path / ".agitrack" / "worktrees").exists()
-
-
-def test_no_worktree_mode_refuses_new_session():
-    runner = make_runner()
-    runner._use_worktrees = False
-    msgs = []
-    runner._set_message = lambda m, **k: msgs.append(m)
-    runner._render = lambda: None
-    runner._new_session("session-2")
-    assert runner.worktree is None
-    assert any("worktree" in m.lower() for m in msgs)

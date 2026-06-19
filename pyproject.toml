@@ -13,7 +13,7 @@ include = ["agitrack*"]
 # NOTE: `name` is the PyPI *distribution* name (what `pip install` takes). After
 # the aGiT → aGiTrack rename, the distribution, the import package, and the
 # installed command are all `agitrack` — `pip install agitrack` provides
-# `import agitrack` and the `agitrack` command (with `agit` kept as an alias).
+# `import agitrack` and the `agitrack` command.
 # `version` is managed by scripts/publish.sh (auto-incremented per release);
 # 0.0.0 marks an unreleased working tree.
 [project]
@@ -42,8 +42,6 @@ dev = [
 
 [project.scripts]
 agitrack = "agitrack.cli:main"
-# `agit` kept as an alias so existing muscle memory / scripts keep working.
-agit = "agitrack.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/core-aix/agitrack"

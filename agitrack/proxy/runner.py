@@ -393,6 +393,7 @@ class ProxyRunner:
         self.active = Session.bare()
         self.repo = repo
         self._use_worktrees = use_worktrees  # #9: when False, run on the current branch directly
+        self._warned_parallel_no_worktree = False  # one-time shared-tree caveat for extra --no-worktree sessions
         # When True, tell a coding agent that aGiTrack auto-commits so it doesn't self-commit
         # (--no-commit-guidance / config turns it off). Appended to the agent's system prompt
         # where the backend supports it (Claude).
@@ -817,6 +818,7 @@ class ProxyRunner:
                 "_shared_resume_cancel": None,
                 "_background_share_ops": [],
                 "_use_worktrees": True,
+                "_warned_parallel_no_worktree": False,
                 "_commit_guidance": True,
                 "_relaunch_times": [],
                 "_exiting": False,
@@ -1923,8 +1925,8 @@ class ProxyRunner:
             # None; all the `worktree is None` paths commit straight to it).
             self._set_message(
                 "Running without a worktree: the agent edits this branch directly (visible live), "
-                "but there's no isolation or auto-integration. Don't run multiple sessions this way "
-                "— they'd all write the same tree.",
+                "but there's no isolation or auto-integration. Extra sessions started this way share "
+                "this directory and edit the same files at once.",
                 seconds=12.0,
             )
             return
@@ -2784,7 +2786,9 @@ class ProxyRunner:
             else:
                 options.append(f"  {info.name} [idle — resume]")
                 actions.append(("resume", info.name))
-        options.append("+ New session (own worktree)")
+        options.append(
+            "+ New session (own worktree)" if self._use_worktrees else "+ New session (shares this directory)"
+        )
         actions.append(("new", None))
         if self._use_worktrees and self.sessions:
             options.append("")  # gap: separate session-creation from session-management
@@ -4863,6 +4867,22 @@ class ProxyRunner:
         except Exception:
             return False
 
+    def _warn_parallel_no_worktree_sessions(self) -> None:
+        """Explain the shared-tree caveat the first time a user opens an additional
+        --no-worktree session in a run. Parallel sessions are allowed; this only makes
+        sure the user knows they have no isolation (they edit the same files at once and
+        a turn's commit captures whatever is in the tree)."""
+        if self._warned_parallel_no_worktree:
+            return
+        self._warned_parallel_no_worktree = True
+        self._select_popup(
+            "These sessions share this directory (--no-worktree): they have no isolation, so "
+            "they edit the same files at the same time and a turn's commit captures whatever is "
+            "in the working tree then — coordinate as you would with another person editing the "
+            "same checkout. Restart without --no-worktree to give each session its own worktree.",
+            ["Got it"],
+        )
+
     def _new_session(
         self,
         name: str,
@@ -4871,40 +4891,53 @@ class ProxyRunner:
         backend: str | None = None,
         base_branch: str | None = None,
     ) -> None:
-        if not self._use_worktrees:
-            # #9: concurrent sessions need worktrees; in no-worktree mode they'd
-            # all write the same tree. Refuse rather than corrupt the checkout.
-            self._set_message(
-                "New sessions need worktrees, which are off (--no-worktree). "
-                "Restart without --no-worktree to run multiple sessions.",
-                seconds=8.0,
-            )
-            self._render()
-            return
-        # The branch this new session merges into — its own, independent of the
-        # other sessions and of the branch checked out in the repo directory.
-        base = base_branch or self._merge_target_default()
-        try:
-            info, repo = self._open_session_worktree(name, base_branch=base)
-        except Exception as error:
-            self._set_message(f"Could not create worktree: {error}", seconds=8.0)
-            self._render()
-            return
         # Fresh per-session runtime state; the outgoing active session keeps
         # its state on its own Session object in self.sessions.
         self.active = Session.bare()
-        self.name = info.name
-        self.worktree = info
-        self.repo = repo
-        self._base_branch = base  # this session integrates into `base` (per-session)
-        self.turn = self._turn_from_branch(repo.current_branch())
-        self.state = AgitrackState(info.path, default_backend=self.global_config.default_backend)
-        if base_branch is None:
-            # No branch was explicitly chosen (e.g. resuming a dormant worktree): honor
-            # any merge branch a prior run assigned it, confirming the change with the user.
-            self._reconcile_merge_branch(base)
+        if self._use_worktrees:
+            # The branch this new session merges into — its own, independent of the
+            # other sessions and of the branch checked out in the repo directory.
+            base = base_branch or self._merge_target_default()
+            try:
+                info, repo = self._open_session_worktree(name, base_branch=base)
+            except Exception as error:
+                self._set_message(f"Could not create worktree: {error}", seconds=8.0)
+                self._render()
+                return
+            self.name = info.name
+            self.worktree = info
+            self.repo = repo
+            self._base_branch = base  # this session integrates into `base` (per-session)
+            self.turn = self._turn_from_branch(repo.current_branch())
+            self.state = AgitrackState(info.path, default_backend=self.global_config.default_backend)
+            if base_branch is None:
+                # No branch was explicitly chosen (e.g. resuming a dormant worktree): honor
+                # any merge branch a prior run assigned it, confirming the change with the user.
+                self._reconcile_merge_branch(base)
+            else:
+                self.state.merge_branch = base  # an explicit choice wins; record it
+            started_msg = f"Started session '{info.name}' in .agitrack/worktrees/{info.path.name}"
         else:
-            self.state.merge_branch = base  # an explicit choice wins; record it
+            # --no-worktree: sessions run directly on the base tree with no isolation,
+            # editing the same files in parallel (the user accepts this; we warn once).
+            # There is no worktree and no per-session merge branch — commits land on the
+            # branch checked out in the directory, like the startup no-worktree session.
+            self._warn_parallel_no_worktree_sessions()
+            self.name = name
+            self.worktree = None
+            self.repo = self.base_repo
+            self._base_branch = self.base_repo.current_branch()
+            self.turn = 0
+            self.state = AgitrackState(self.base_repo.repo, default_backend=self.global_config.default_backend)
+            if not resume_session_id:
+                # A blank session is a FRESH conversation, not a continuation of whatever
+                # the shared base-dir state last recorded (worktree sessions each got a
+                # clean state dir; here the state file is shared, so reset it explicitly).
+                self.state.backend_session_id = None
+                self.state.last_backend_message_id = None
+                self.state.new_agitrack_session_id()
+                self.state.clear_trace()
+            started_msg = f"Started session '{name}' (no worktree — shares this directory)"
         if backend:
             # Pin this session to a specific backend (e.g. created by switching
             # backends), independent of the global default.
@@ -4915,10 +4948,13 @@ class ProxyRunner:
             self._persist_session_name(resume_session_id)
         self.backend = make_proxy_agent(self.state.backend)
         if resume_session_id:
-            # Stage the transcript into THIS worktree before spawning, so a
-            # `--resume` finds it. Crucial for a shared session: its transcript was
-            # imported under the base repo's project dir, not this fresh worktree's,
-            # so without this the resume found nothing and the session never loaded.
+            # Stage the transcript into THIS session's directory before spawning, so a
+            # `--resume` finds it. Crucial when the conversation last ran somewhere else:
+            # a shared session imported under the base repo, or — when worktrees are off —
+            # a session that previously ran in a worktree. `_stage_backend_resume` also
+            # retargets the transcript's recorded cwd to this directory, so resuming a
+            # worktree session under --no-worktree runs in the base dir, not the old
+            # (now-gone) worktree path.
             self._stage_backend_resume(resume_session_id)
         self.actions = AgitrackActions(self.repo, self.state, verbose=self.verbose)
         self._sanitize_state_trace()
@@ -4929,7 +4965,7 @@ class ProxyRunner:
         self.sessions.append(self.active)
         self._resize_child()
         self._enable_host_mouse()
-        self._set_message(f"Started session '{info.name}' in .agitrack/worktrees/{info.path.name}")
+        self._set_message(started_msg)
         self._render()
 
     def _stop_session(self, index: int, *, commit: bool = True) -> None:
@@ -7299,6 +7335,9 @@ class ProxyRunner:
             if self.verbose:
                 self._render_status("no git changes")
             self._integrate_agent_made_commits_if_idle(now)
+            # A turn can leave only git-ignored files (nothing staged, clean tree),
+            # so there's no commit to hang the copy offer on — offer here too.
+            self._maybe_offer_copy_when_idle(now)
             return
         if self.agent_parse_thread and self.agent_parse_thread.is_alive():
             if self.verbose:
@@ -7320,6 +7359,11 @@ class ProxyRunner:
             if finished is False:
                 self.parse_pending = False
                 self.last_parse_attempt_status = status
+                # The turn concluded with nothing to commit (e.g. the only changed
+                # files were untracked ones the user declined to stage). They still
+                # live only in the worktree, so offer to copy them across — the same
+                # offer the committed path makes below.
+                self._maybe_offer_copy_when_idle(now)
             if not self.parse_pending or status == self.last_parse_attempt_status:
                 if self.verbose:
                     self._render_status("git changes found; waiting for new file changes")
@@ -7351,13 +7395,29 @@ class ProxyRunner:
         # those over so they aren't stranded in the session's worktree.
         self._offer_copy_unstaged_to_base()
 
+    def _maybe_offer_copy_when_idle(self, now: float) -> None:
+        """Idle-gated entry to the copy offer, used by the turn-polling loop so the
+        offer fires after a turn that produced **no** commit too (e.g. the agent only
+        touched git-ignored files, so nothing was staged) — not just committed turns.
+        Skipped while a turn is running or a merge is in progress, so it never
+        interrupts the agent; the offer itself is fingerprint-deduped, so a file is
+        offered only once per change."""
+        if self.worktree is None or self.merge_ctx:
+            return
+        if self._agent_is_active() or now - self.last_child_output < self.CHILD_IDLE_SECONDS:
+            return
+        self._offer_copy_unstaged_to_base()
+
     def _offer_copy_unstaged_to_base(self) -> None:
-        """Offer to copy the turn's uncommitted worktree files into the base repo dir.
+        """Offer to copy the worktree's would-be-stranded files into the base repo dir.
 
         Only relevant for an isolated worktree session: changes committed this turn
         integrate into the base branch, but files the agent modified and left
-        uncommitted (declined untracked files, unstaged edits) live only in the
-        worktree and the user — working in the base directory — never sees them.
+        uncommitted (declined untracked files, unstaged edits) or that are git-ignored
+        live only in the worktree and the user — working in the base directory — never
+        sees them. This runs **whether or not the turn produced a commit**: a turn that
+        only touched ignored files stages nothing, yet those files may still need to
+        come across (see the callers in ``_maybe_agent_commit``).
 
         Files are tracked by a content fingerprint, so a file the user chose to leave
         is not prompted again until it changes. With consent each file is copied; an
@@ -7385,8 +7445,9 @@ class ProxyRunner:
             self._copy_prompted[rel] = fingerprint
         names = ", ".join(rel for rel, _ in fresh[:5]) + (" …" if len(fresh) > 5 else "")
         choice = self._select_popup(
-            f"The agent left {len(fresh)} uncommitted file(s) in this session's worktree "
-            f"({names}). Copy them into the base repo directory?",
+            f"This session's worktree ({wt_dir}) has {len(fresh)} file(s) that won't be "
+            f"merged into the base — uncommitted or git-ignored ({names}). Copy them into "
+            f"the base repo directory ({base_dir})?",
             ["No, leave them in the worktree", "Yes, copy to the base repo"],
         )
         if choice is None or choice.startswith("No"):
@@ -7405,8 +7466,11 @@ class ProxyRunner:
                     remained.append(rel)
                     continue
             try:
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src, dst)
+                if src.is_dir():  # a wholly-ignored directory, reported as `dir/`
+                    shutil.copytree(src, dst, dirs_exist_ok=True)
+                else:
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dst)
                 copied += 1
             except OSError as error:
                 self._debug(f"copy {rel} to base failed: {error!r}")
@@ -7418,11 +7482,17 @@ class ProxyRunner:
             self._render()
 
     def _uncommitted_worktree_files(self) -> list[str]:
-        """Repo-relative paths of files left uncommitted in the worktree (unstaged
-        tracked edits and untracked files), excluding aGiTrack's own ``.agitrack/``."""
+        """Repo-relative paths of files left in the worktree that no commit will carry
+        into the base directory: unstaged tracked edits, untracked files, and
+        git-*ignored* files (build output, local data, etc. the agent may have created).
+
+        Always skipped: aGiTrack's own ``.agitrack/`` and any path whose final name
+        starts with ``_`` or ``.`` — generated/hidden scaffolding (``__pycache__``,
+        ``.venv``, ``.env`` …) the user doesn't want copied back. So a turn that touched
+        only such files yields an empty list and is never offered for copying."""
         files: list[str] = []
         try:
-            status = self.repo.status_short()
+            status = self.repo.status_short_ignored()
         except Exception as error:
             self._debug(f"status for uncommitted-files check failed: {error!r}")
             return files
@@ -7433,9 +7503,20 @@ class ProxyRunner:
             if " -> " in path:  # a rename: take the destination
                 path = path.split(" -> ", 1)[1]
             path = path.strip().strip('"')
-            if path and not path.startswith(".agitrack/"):
-                files.append(path)
+            if not path or path.startswith(".agitrack/"):
+                continue
+            if self._copy_name_is_skipped(path):
+                continue
+            files.append(path)
         return files
+
+    @staticmethod
+    def _copy_name_is_skipped(path: str) -> bool:
+        """True for paths whose final component starts with ``_`` or ``.`` (a wholly
+        ignored directory is reported as ``dir/``, so the trailing slash is stripped
+        first). These are never offered for copying into the base directory."""
+        name = path.rstrip("/").rsplit("/", 1)[-1]
+        return name.startswith("_") or name.startswith(".")
 
     @staticmethod
     def _file_fingerprint(path) -> tuple[int, int] | None:
@@ -7448,7 +7529,9 @@ class ProxyRunner:
     def _notice_files_remain(self, wt_dir, files: list[str]) -> None:
         listing = ", ".join(files[:5]) + (" …" if len(files) > 5 else "")
         self._set_message(
-            f"{len(files)} file(s) remain in this session's worktree directory: {listing}. Worktree: {wt_dir}",
+            f"{len(files)} file(s) left in this session's worktree: {listing}. They're available at "
+            f"{wt_dir} for now, but the worktree is removed when aGiTrack exits (or the session "
+            f"integrates), so copy out anything you want to keep.",
             seconds=15.0,
         )
         self._render()
