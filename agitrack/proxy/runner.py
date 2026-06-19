@@ -3476,7 +3476,7 @@ class ProxyRunner:
             message += f" Pruned {result.pruned} older shared session(s)."
         return message
 
-    def _manage_shared_sessions_menu(self) -> None:
+    def _manage_shared_sessions_menu(self) -> str:
         # Must open instantly: read only the LOCAL ref (no network fetch — your own
         # shares are already here) and label each entry from cheap data only
         # (manifest + a stat-sized "newer?" check), never a transcript read/redact.
