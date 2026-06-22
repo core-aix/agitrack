@@ -360,7 +360,7 @@ class ProxyRunner:
     BASE_POLL_SECONDS = 3.0
     IDLE_AFTER_SECONDS = 30.0  # idle threshold: no input/output/work for this long ⇒ low-power loop
     IDLE_POLL_SECONDS = 30.0  # select timeout while idle (vs ACTIVE_POLL_SECONDS when working)
-    ACTIVE_POLL_SECONDS = 0.2  # select timeout while active: drives the per-turn background sweep
+    ACTIVE_POLL_SECONDS = 1.0  # select timeout while active; every background sweep self-throttles to ≥2s anyway
     BASE_EDIT_CHECK_SECONDS = 3.0
     CWD_CHECK_SECONDS = 3.0
     BASE_DRIFT_CHECK_SECONDS = 2.0
@@ -5237,17 +5237,29 @@ class ProxyRunner:
     def _select_timeout(self) -> float:
         """How long the reactor blocks in ``select`` this iteration.
 
-        A queued repaint flushes on the next tick (``0.016``); otherwise the
-        timeout is ``ACTIVE_POLL_SECONDS`` while there is work to service and
-        ``IDLE_POLL_SECONDS`` once :meth:`_is_idle` says nothing needs prompt
-        polling. ``select`` returns the instant stdin or any PTY fd becomes
-        readable regardless of the timeout, so a longer idle timeout never
-        delays the user's keystrokes or the backend's output — it only lets the
-        CPU sleep between autonomous background sweeps, which is what saves
-        battery while the user is away.
+        ``select`` returns the instant stdin or any PTY fd becomes readable, so
+        this timeout only bounds how long we may sit idle before re-running the
+        timer-driven work — it never delays the user's keystrokes or the
+        backend's output. The value is the time until the *next* thing that must
+        happen:
+
+        * a queued repaint → ``0.016`` (coalesced output frame, ~next tick);
+        * a deferred prompt-submit (the injected Enter, scheduled 0.4s out) →
+          the exact time remaining to it, so it still fires promptly even though
+          the normal active poll is a full second;
+        * otherwise ``ACTIVE_POLL_SECONDS`` while there is work to service, or
+          ``IDLE_POLL_SECONDS`` once :meth:`_is_idle` says nothing does — the
+          long idle block is what lets the CPU sleep and saves battery while the
+          user is away.
+
+        Every background sweep self-throttles to its own interval (≥2s), so the
+        active poll being a coarse 1s never makes any check run more often.
         """
         if self._render_pending:
             return 0.016
+        if self._pending_enter_at is not None:
+            remaining = self._pending_enter_at - time.monotonic()
+            return max(0.0, min(remaining, self.ACTIVE_POLL_SECONDS))
         return self.IDLE_POLL_SECONDS if self._is_idle() else self.ACTIVE_POLL_SECONDS
 
     def _is_idle(self) -> bool:
