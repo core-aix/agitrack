@@ -35,6 +35,8 @@ DEFAULT_TIMINGS: dict[str, float] = {
     "base_drift_check_seconds": 2.0,  # how often to check the base repo's checked-out branch
     "summary_wait_seconds": 45.0,  # how long integration waits for a background commit summary (#8)
     "update_check_seconds": 300.0,  # how often to re-check for an aGiTrack self-update (every 5 min)
+    "idle_after_seconds": 30.0,  # no input/output AND no running session for this long ⇒ enter low-power idle
+    "idle_poll_seconds": 30.0,  # background-sweep interval while idle (the loop still wakes instantly on input)
 }
 
 

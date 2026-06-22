@@ -2313,6 +2313,99 @@ def test_apply_timings_overrides_constants():
     assert runner.POLL_SECONDS == DEFAULT_TIMINGS["background_poll_seconds"]
 
 
+def test_apply_timings_sets_idle_backoff_constants():
+    from agitrack.config import DEFAULT_TIMINGS
+
+    runner = make_runner()
+    custom = dict(DEFAULT_TIMINGS, idle_after_seconds=12.0, idle_poll_seconds=45.0)
+    runner._apply_timings(custom)
+    assert runner.IDLE_AFTER_SECONDS == 12.0
+    assert runner.IDLE_POLL_SECONDS == 45.0
+
+
+def test_select_timeout_backs_off_when_idle():
+    # A quiescent runner (no input/output/work) blocks in select for the long
+    # IDLE_POLL_SECONDS so the CPU can sleep; any work drops it to the fast loop,
+    # and a queued repaint flushes on the very next tick.
+    runner = make_runner()
+    runner.IDLE_POLL_SECONDS = 30.0
+    runner.ACTIVE_POLL_SECONDS = 0.2
+
+    assert runner._is_idle() is True
+    assert runner._select_timeout() == 30.0
+
+    runner.agent_in_flight = True  # a turn is in flight → fast loop
+    assert runner._is_idle() is False
+    assert runner._select_timeout() == 0.2
+
+    runner.agent_in_flight = False
+    runner._render_pending = True  # a paint is queued → flush next tick
+    assert runner._select_timeout() == 0.016
+
+
+def test_is_idle_false_until_user_and_backend_go_quiet():
+    import time
+
+    runner = make_runner()
+    runner.IDLE_AFTER_SECONDS = 30.0
+    now = time.monotonic()
+
+    runner.last_user_input = now  # just typed
+    assert runner._is_idle() is False
+
+    runner.last_user_input = now - 100  # typed long ago
+    runner.last_child_output = now  # but the backend just printed
+    assert runner._is_idle() is False
+
+    runner.last_child_output = now - 100  # both quiet now
+    assert runner._is_idle() is True
+
+
+def test_is_idle_false_for_pending_pipeline_work():
+    import time
+
+    runner = make_runner()
+    old = time.monotonic() - 100
+    runner.last_user_input = old
+    runner.last_child_output = old
+    assert runner._is_idle() is True  # baseline: idle
+
+    # A queued prompt, a deferred Enter, or a set file-change event each keep the
+    # fast loop so the per-turn pipeline is serviced without delay.
+    runner.pending_prompt_text = "do the thing"
+    assert runner._is_idle() is False
+    runner.pending_prompt_text = ""
+
+    runner._pending_enter_at = time.monotonic() + 0.4
+    assert runner._is_idle() is False
+    runner._pending_enter_at = None
+
+    runner.file_change_event.set()
+    assert runner._is_idle() is False
+    runner.file_change_event.clear()
+    assert runner._is_idle() is True
+
+
+def test_is_idle_respects_timed_but_not_sticky_messages():
+    import time
+
+    runner = make_runner()
+    old = time.monotonic() - 100
+    runner.last_user_input = old
+    runner.last_child_output = old
+
+    # A timed notice must expire on schedule, so it keeps us awake.
+    runner.message = "Saved."
+    runner._message_sticky = False
+    runner.message_until = time.monotonic() + 5
+    assert runner._is_idle() is False
+
+    # A sticky notice waits for a keypress (which wakes select on its own), so it
+    # must NOT pin the CPU at the fast poll rate.
+    runner._message_sticky = True
+    assert runner._is_idle() is True
+
+
 def test_proxy_refuses_second_instance(monkeypatch, capsys):
     import sys
 

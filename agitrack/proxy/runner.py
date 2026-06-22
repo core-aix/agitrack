@@ -358,6 +358,9 @@ class ProxyRunner:
     POLL_SECONDS = 2.0
     PARSE_COOLDOWN_SECONDS = 10.0
     BASE_POLL_SECONDS = 3.0
+    IDLE_AFTER_SECONDS = 30.0  # idle threshold: no input/output/work for this long ⇒ low-power loop
+    IDLE_POLL_SECONDS = 30.0  # select timeout while idle (vs ACTIVE_POLL_SECONDS when working)
+    ACTIVE_POLL_SECONDS = 0.2  # select timeout while active: drives the per-turn background sweep
     BASE_EDIT_CHECK_SECONDS = 3.0
     CWD_CHECK_SECONDS = 3.0
     BASE_DRIFT_CHECK_SECONDS = 2.0
@@ -478,6 +481,7 @@ class ProxyRunner:
         self.sel_point: tuple[int, int] | None = None
         self._input_tail = b""
         self.last_child_output = 0.0
+        self.last_user_input = 0.0  # monotonic time of the user's last keystroke (drives idle backoff)
         self.last_child_output_sample = b""
         self.last_status = ""
         self.last_status_change = 0.0
@@ -677,6 +681,8 @@ class ProxyRunner:
         self.BASE_DRIFT_CHECK_SECONDS = timings["base_drift_check_seconds"]
         self.SUMMARY_WAIT_SECONDS = timings["summary_wait_seconds"]
         self.UPDATE_CHECK_SECONDS = timings["update_check_seconds"]
+        self.IDLE_AFTER_SECONDS = timings["idle_after_seconds"]
+        self.IDLE_POLL_SECONDS = timings["idle_poll_seconds"]
 
     # --- session pointer -------------------------------------------------
 
@@ -785,6 +791,7 @@ class ProxyRunner:
                 "_sync_since": 0.0,
                 "message": None,
                 "message_until": 0.0,
+                "last_user_input": 0.0,
                 "_message_scroll": 0,
                 "_message_max_scroll": 0,
                 "_message_sticky": False,
@@ -5227,6 +5234,80 @@ class ProxyRunner:
     # Reactor phases (called exclusively from _loop)
     # ------------------------------------------------------------------
 
+    def _select_timeout(self) -> float:
+        """How long the reactor blocks in ``select`` this iteration.
+
+        A queued repaint flushes on the next tick (``0.016``); otherwise the
+        timeout is ``ACTIVE_POLL_SECONDS`` while there is work to service and
+        ``IDLE_POLL_SECONDS`` once :meth:`_is_idle` says nothing needs prompt
+        polling. ``select`` returns the instant stdin or any PTY fd becomes
+        readable regardless of the timeout, so a longer idle timeout never
+        delays the user's keystrokes or the backend's output — it only lets the
+        CPU sleep between autonomous background sweeps, which is what saves
+        battery while the user is away.
+        """
+        if self._render_pending:
+            return 0.016
+        return self.IDLE_POLL_SECONDS if self._is_idle() else self.ACTIVE_POLL_SECONDS
+
+    def _is_idle(self) -> bool:
+        """True when no foreground or background work needs the fast poll loop.
+
+        Idle means: no turn in flight (active or background), no merge being
+        resolved, no per-turn pipeline work pending (file change to process,
+        parse/commit due, deferred Enter or queued prompt), no background worker
+        thread alive, no timed notice still on screen, and no keystroke or
+        backend output within ``IDLE_AFTER_SECONDS``. A sticky message (one that
+        waits for a keypress) does NOT keep us awake — the keypress that
+        dismisses it wakes ``select`` on its own.
+        """
+        now = time.monotonic()
+        # An active turn, or output recent enough to still be inside the
+        # post-turn commit-debounce window, keeps the fast loop.
+        if self.agent_in_flight or self.merge_ctx is not None:
+            return False
+        if now - self.last_child_output < self.CHILD_IDLE_SECONDS:
+            return False
+        if now - self.last_user_input < self.IDLE_AFTER_SECONDS:
+            return False
+        # Pending per-turn pipeline work. file_change_event is set by the file
+        # watcher thread (it does not wake select), so it must be checked here.
+        if self.file_change_event.is_set() or self.parse_pending or self.status_check_pending:
+            return False
+        if self.pending_forwarded or self.pending_prompt_text:
+            return False
+        if self._pending_enter_at is not None or self._base_advanced:
+            return False
+        # A timed notice must expire/refresh on schedule; a sticky one need not.
+        if self.message is not None and not self._message_sticky and now < self.message_until:
+            return False
+        for attr in (
+            "agent_parse_thread",
+            "_summary_thread",
+            "_precompact_thread",
+            "_auto_share_thread",
+            "_shared_resume_thread",
+            "_update_check_thread",
+        ):
+            thread = getattr(self, attr, None)
+            if thread is not None and thread.is_alive():
+                return False
+        # Any *background* session still working (the active one is covered above).
+        # Background turns are committed/integrated by _service_background_sessions
+        # once they have been quiet for CHILD_IDLE_SECONDS, with POLL_SECONDS between
+        # service passes; stay non-idle a little past that window so a just-finished
+        # background turn is integrated promptly rather than waiting a full idle tick.
+        background_quiet = self.CHILD_IDLE_SECONDS + self.POLL_SECONDS + 1.0
+        for index in range(len(self.sessions)):
+            if index == self.active_index:
+                continue
+            session = self.sessions[index]
+            if getattr(session, "agent_in_flight", False) or getattr(session, "merge_ctx", None) is not None:
+                return False
+            if now - getattr(session, "last_child_output", 0.0) < background_quiet:
+                return False
+        return True
+
     def _reactor_select_phase(self) -> tuple[dict, list]:
         """Phase 1 — compute the fd set, block in select, drain background PTYs.
 
@@ -5234,7 +5315,7 @@ class ProxyRunner:
         drained here so their PTY buffers never fill up regardless of which
         phase the main loop is in.
         """
-        timeout = 0.016 if self._render_pending else 0.2
+        timeout = self._select_timeout()
         background = self._background_fds()
         readable, _, _ = select.select([sys.stdin.fileno(), self.master_fd, *background], [], [], timeout)
         for fd in readable:
@@ -5278,6 +5359,7 @@ class ProxyRunner:
         if sys.stdin.fileno() not in readable:
             return None
         data = os.read(sys.stdin.fileno(), 4096)
+        self.last_user_input = time.monotonic()  # reset the idle backoff: the user is here
         self._raw_capture(">", data)
         self._debug(f"stdin: {data!r} menu_key={self.input.menu_key!r}")
         # A popup message taller than the screen scrolls with PgUp/PgDn, handled before
