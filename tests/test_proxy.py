@@ -4297,6 +4297,35 @@ def test_is_real_keypress_ignores_mouse_and_focus():
     assert runner._is_real_keypress(b"\x1b[A") is True  # an arrow key is still a key
     # A mouse move bundled with a real key still counts as a key.
     assert runner._is_real_keypress(b"\x1b[<35;1;1Mx") is True
+    # Mouse SCROLL wheel reports (SGR buttons 64=up / 65=down) are not keystrokes
+    # either: scrolling history must not reset the idle backoff (see _reactor_stdin_phase).
+    assert runner._is_real_keypress(b"\x1b[<64;10;20M") is False
+    assert runner._is_real_keypress(b"\x1b[<65;10;20M") is False
+
+
+def test_mouse_scroll_does_not_reset_idle_backoff():
+    import time
+
+    # A runner quiet long enough to be idle stays idle through a mouse-scroll burst
+    # (passive reading) but flips active the instant a real key arrives. This mirrors
+    # the gate in _reactor_stdin_phase: only _is_real_keypress(data) touches
+    # last_user_input, so scrolling never pins aGiTrack in the 1s active loop.
+    runner = make_runner()
+    runner.IDLE_AFTER_SECONDS = 30.0
+    old = time.monotonic() - 100
+    runner.last_user_input = old
+    runner.last_child_output = old
+    assert runner._is_idle() is True
+
+    scroll = b"\x1b[<65;10;20M"  # wheel-down report
+    if not runner._is_real_keypress(scroll):
+        pass  # would NOT update last_user_input
+    assert runner._is_idle() is True  # still idle after scrolling
+
+    key = b"a"
+    if runner._is_real_keypress(key):
+        runner.last_user_input = time.monotonic()  # a real key wakes the active loop
+    assert runner._is_idle() is False
 
 
 def test_timers_phase_noops_when_not_running():
