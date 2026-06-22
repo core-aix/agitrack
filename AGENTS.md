@@ -116,9 +116,10 @@ aGiTrack stands for agent + git tracking. It is a Python library and interactive
 
 ## Concurrency and Locking
 
-- Only one aGiTrack process may auto-commit/merge in a given working tree at a time. A process acquires a single-writer lock at `<tree>/.agitrack/lock` (PID-based, with stale-owner reclaim). A second aGiTrack process on the same repo runs **read-only**: it renders the backend TUI but makes no commits, and shows a banner that another aGiTrack process is managing the repo. (Implemented in `agitrack/git/lock.py`, wired into both proxy and JSON modes.)
-- Quitting a managing (non-read-only) proxy instance asks for confirmation before exiting.
+- Only one aGiTrack process may auto-commit/merge in a given working tree at a time. A process acquires a single-writer lock at `<tree>/.agitrack/lock` (PID-based, with stale-owner reclaim). A second aGiTrack process on the same repo **refuses to start**: it prints `already_running_message` (which names the holding PID and tells the user to stop it first) and exits non-zero. (Implemented in `agitrack/git/lock.py`, wired into both proxy and JSON modes.)
+- Quitting a proxy instance asks for confirmation before exiting.
 - Concurrent sessions are isolated with git worktrees so changes are never attributed to the wrong session; see Concurrent Sessions below.
+- **Idle low-power loop (battery).** The reactor blocks in `select` for `ACTIVE_POLL_SECONDS` (0.2s) while there is work to service, but backs off to `IDLE_POLL_SECONDS` (`timings.idle_poll_seconds`, default 30s) once `_is_idle()` is true — no turn in flight (active or background), no pending per-turn pipeline work (file-change event, parse/commit, deferred Enter/queued prompt), no live worker thread, no timed notice on screen, and no keystroke or backend output for `timings.idle_after_seconds` (default 30s). `select` still returns the instant stdin or any PTY fd is readable, so typing and backend output stay instantly responsive; only the autonomous background sweep (out-of-band base-HEAD poll, update check, drift warnings) slows down while the user is away. This stops the process waking ~5×/second when nothing is happening — which is what made the host editor (e.g. VS Code) report aGiTrack as a significant energy user. A sticky message (one that waits for a keypress) does **not** keep the fast loop, since the dismissing keypress wakes `select` on its own.
 
 ## Concurrent Sessions (worktrees + auto-integration)
 
