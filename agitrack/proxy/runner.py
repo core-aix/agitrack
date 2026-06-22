@@ -5371,7 +5371,13 @@ class ProxyRunner:
         if sys.stdin.fileno() not in readable:
             return None
         data = os.read(sys.stdin.fileno(), 4096)
-        self.last_user_input = time.monotonic()  # reset the idle backoff: the user is here
+        # Only a real keystroke resets the idle backoff — NOT a mouse wheel / move /
+        # click or a focus in/out report. Scrolling history is passive reading: it
+        # needs no commits or background polling, so it must not pin aGiTrack in the
+        # active loop. (select still woke instantly to redraw the scrolled view; this
+        # only governs whether we then drop back to the low-power idle cadence.)
+        if self._is_real_keypress(data):
+            self.last_user_input = time.monotonic()
         self._raw_capture(">", data)
         self._debug(f"stdin: {data!r} menu_key={self.input.menu_key!r}")
         # A popup message taller than the screen scrolls with PgUp/PgDn, handled before
