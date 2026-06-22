@@ -2325,22 +2325,41 @@ def test_apply_timings_sets_idle_backoff_constants():
 
 def test_select_timeout_backs_off_when_idle():
     # A quiescent runner (no input/output/work) blocks in select for the long
-    # IDLE_POLL_SECONDS so the CPU can sleep; any work drops it to the fast loop,
-    # and a queued repaint flushes on the very next tick.
+    # IDLE_POLL_SECONDS so the CPU can sleep; any work drops it to the active
+    # poll, and a queued repaint flushes on the very next tick. The active poll
+    # is a coarse ≥1s — every background sweep self-throttles, and select still
+    # wakes instantly on real input/output.
     runner = make_runner()
     runner.IDLE_POLL_SECONDS = 30.0
-    runner.ACTIVE_POLL_SECONDS = 0.2
+    runner.ACTIVE_POLL_SECONDS = 1.0
+    assert runner.ACTIVE_POLL_SECONDS >= 1.0  # no sub-second busy-poll
 
     assert runner._is_idle() is True
     assert runner._select_timeout() == 30.0
 
-    runner.agent_in_flight = True  # a turn is in flight → fast loop
+    runner.agent_in_flight = True  # a turn is in flight → active poll
     assert runner._is_idle() is False
-    assert runner._select_timeout() == 0.2
+    assert runner._select_timeout() == 1.0
 
     runner.agent_in_flight = False
     runner._render_pending = True  # a paint is queued → flush next tick
     assert runner._select_timeout() == 0.016
+
+
+def test_select_timeout_honors_deferred_prompt_submit():
+    import time
+
+    # The injected-Enter is scheduled 0.4s out; the active poll must not stretch
+    # it to a full second, so the timeout collapses to the time remaining.
+    runner = make_runner()
+    runner._render_pending = False
+    runner.ACTIVE_POLL_SECONDS = 1.0
+    runner._pending_enter_at = time.monotonic() + 0.4
+    timeout = runner._select_timeout()
+    assert 0.0 < timeout <= 0.4  # blocks only until the Enter is due, not 1s
+
+    runner._pending_enter_at = time.monotonic() - 5  # already overdue → fire now
+    assert runner._select_timeout() == 0.0
 
 
 def test_is_idle_false_until_user_and_backend_go_quiet():
