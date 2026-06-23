@@ -169,6 +169,32 @@ def _real_metadata_label(value: str | None) -> str | None:
     return None if value.strip().lower() in _METADATA_PLACEHOLDERS else value
 
 
+# Hierarchy for the dashboard's token panel. Each base category's headline number is the
+# main-agent count PLUS its sub-agent share; the sub-agent amount (and, for input, the
+# cache-write amount) is a SUBSET of that headline, shown indented as "of which". This
+# mirrors the metadata convention (commits/message.py): ``input`` already folds in
+# cache-write (fresh input processed once into the cache), and sub-agent usage is recorded
+# in its own ``subagent_*`` counters rather than added to the main ones. Each entry is
+# ``(base_key, subagent_key, label, [(subset_label, (keys_to_sum, …)), …])``; a subset's
+# value is the sum of its keys (so "cache write" totals main + sub-agent cache-write).
+_TOKEN_CATEGORIES: list[tuple[str, str, str, list[tuple[str, tuple[str, ...]]]]] = [
+    (
+        "input",
+        "subagent_input",
+        "input",
+        [
+            ("cache write", ("cache_write", "subagent_cache_write")),
+            ("sub-agents", ("subagent_input",)),
+        ],
+    ),
+    ("output", "subagent_output", "output", [("sub-agents", ("subagent_output",))]),
+    # reasoning sits with output (both are generated tokens): OpenCode reports it as its
+    # own bucket; Claude folds it into output, so this row is simply absent for Claude.
+    ("reasoning", "subagent_reasoning", "reasoning", [("sub-agents", ("subagent_reasoning",))]),
+    ("cache_read", "subagent_cache_read", "cache read", [("sub-agents", ("subagent_cache_read",))]),
+]
+
+
 @dataclass
 class Dashboard:
     repo: str
@@ -228,6 +254,35 @@ class Dashboard:
             for key, value in stat.tokens.items():
                 totals[key] += value
         return dict(totals)
+
+    @property
+    def token_breakdown(self) -> dict:
+        """The token totals arranged as a hierarchy for the dashboard: each base category's
+        headline is main-agent + sub-agent, with the sub-agent (and, for input, cache-write)
+        amount as an indented "of which" subset. Summarizer usage — aGiTrack's own commit
+        summary calls, not the agent's — is reported separately. JSON-serializable so the
+        web dashboard can render the same structure the text one does (see _TOKEN_CATEGORIES)."""
+        totals = self.token_totals
+
+        def s(*keys: str) -> int:
+            return sum(totals.get(key, 0) for key in keys)
+
+        categories = []
+        for base, subagent, label, subsets in _TOKEN_CATEGORIES:
+            total = s(base, subagent)
+            if total <= 0:
+                continue
+            children = [{"label": clabel, "value": value} for clabel, keys in subsets if (value := s(*keys)) > 0]
+            categories.append({"label": label, "total": total, "subsets": children})
+        summarizer = {
+            key: totals.get(name, 0)
+            for key, name in (
+                ("input", "summary_input"),
+                ("output", "summary_output"),
+                ("cache_read", "summary_cache_read"),
+            )
+        }
+        return {"categories": categories, "summarizer": {k: v for k, v in summarizer.items() if v > 0}}
 
     @property
     def lines_per_1k_output_tokens(self) -> float | None:

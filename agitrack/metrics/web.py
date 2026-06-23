@@ -232,6 +232,7 @@ def _aggregates(fd: Dashboard) -> dict:
         "ai_lines": list(fd.ai_lines),
         "nontracked_lines": list(fd.nontracked_lines),
         "tokens": fd.token_totals,
+        "token_breakdown": fd.token_breakdown,
         "line_yield": fd.lines_per_1k_output_tokens,
         "by_backend": fd.by_backend,
         "by_model": fd.by_model,
@@ -628,6 +629,11 @@ h2.section::before{content:"# ";color:var(--amber)}
 .row:last-child{border-bottom:none}
 .row .name{color:var(--fg);font-weight:500;overflow-wrap:anywhere}
 .row .name small{color:var(--fg-dim);font-weight:400}
+/* "of which …" subset rows: indented and dimmed so they read as children of the line above */
+.row.sub{padding-top:5px;padding-bottom:5px;border-bottom:none}
+.row.sub .name{padding-left:18px;font-weight:400;color:var(--fg-dim);font-size:12.5px}
+.row.sub .bar{height:12px}
+.row.sub .bar i{background:var(--fg-dim);box-shadow:none;opacity:.55}
 .bar{position:relative;height:18px;background:var(--ink);border:1px solid var(--line);overflow:hidden}
 .bar i{position:absolute;inset:0 auto 0 0;background:var(--phosphor-dim);box-shadow:0 0 10px rgba(61,255,160,.4)}
 .bar i.amber{background:var(--amber-dim);box-shadow:0 0 10px rgba(255,180,84,.35)}
@@ -844,11 +850,6 @@ let tsDrag = null;    // in-progress pan: {x, lo, hi}; null when not dragging
 
 const AI_KINDS = new Set(["agent","covered","agent-merge"]);
 const KIND_LABEL = {"agitrack-ops":"aGiTrack-ops","agent-merge":"agent-merge"};
-const TOKEN_ORDER = [["input","input"],["output","output"],["reasoning","reasoning"],
-  ["cache_read","cache read"],["cache_write","cache write"],
-  ["subagent_input","subagent input"],["subagent_output","subagent output"],
-  ["subagent_cache_read","subagent cache read"],["subagent_cache_write","subagent cache write"],
-  ["summary_input","summarizer input"],["summary_output","summarizer output"]];
 const REFRESH_MS = 30000, DAY = 86400;
 
 // DEFAULT_BRANCH is the branch the page first loaded for; "reset" returns to it.
@@ -941,6 +942,13 @@ function barRow(name, sub, value, max, numHtml, amber){
     `<div class="bar"><i class="${amber?"amber":""}" style="width:${w}%"></i></div>`+
     `<div class="num">${numHtml}</div></div>`;
 }
+// An indented "of which …" row: a subset of the category above it. Same bar scale, dimmed.
+function subBarRow(name, value, max, numHtml){
+  const w = max ? Math.max(2, value/max*100) : 0;
+  return `<div class="row sub"><div class="name" title="${esc(name)}">${esc(name)}</div>`+
+    `<div class="bar"><i style="width:${w}%"></i></div>`+
+    `<div class="num">${numHtml}</div></div>`;
+}
 function card(label, value, note, amber){
   return `<div class="card"><div class="label">${esc(label)}</div>`+
     `<div class="value ${amber?"amber":""}">${value}</div><div class="note">${esc(note||"")}</div></div>`;
@@ -968,7 +976,7 @@ function renderAgg(){
     card("aGiTrack coverage", pct(tracked,total), `${fmt(total-tracked)} non-tracked`, true),
     card("Tracked AI lines", "+"+fmt(ai.ins), `−${fmt(ai.del)} · ${pct(ai.total, allLines)} of changes`),
     card("non-tracked lines", "+"+fmt(nt.ins), `−${fmt(nt.del)} · not tracked as AI`, true),
-    card("output tokens", fmt(tok.output||0), `${fmt(tok.input||0)} input`),
+    card("output tokens", fmt((tok.output||0)+(tok.subagent_output||0)), `${fmt((tok.input||0)+(tok.subagent_input||0))} input`),
     card("line yield", eff===null?"—":eff.toFixed(1), "AI lines / 1k output tok", true),
   ].join("");
 
@@ -989,22 +997,39 @@ function renderAgg(){
       kc("untracked", "untracked", "Commits with no aGiTrack metadata (made outside aGiTrack)") +
     `</div>`;
 
-  const shown = TOKEN_ORDER.filter(([k])=>tok[k]);
-  // Token kinds span orders of magnitude (cache reads dwarf everything), so a
-  // linear bar would shrink the small kinds to invisible slivers. Scale the bar
-  // widths by log10 instead; the numbers shown on each row remain the real counts.
+  // Token panel as a hierarchy (mirrors the text dashboard / collect.token_breakdown):
+  // each base category's headline is main-agent + sub-agent, with the sub-agent (and, for
+  // input, the cache-write) share shown as an indented "of which" subset of it.
+  const tb = AGG.token_breakdown || {categories:[], summarizer:{}};
+  const cats = tb.categories || [], summ = tb.summarizer || {};
+  // Token kinds span orders of magnitude (cache reads dwarf everything), so a linear bar
+  // would shrink the small kinds to invisible slivers. Scale the bar widths by log10
+  // instead; the numbers shown on each row remain the real counts.
   const logTok = v => Math.log10((v||0)+1);
-  const maxLog = Math.max(1, ...shown.map(([k])=>logTok(tok[k])));
-  // Whenever cache-creation happened, spell out aGiTrack's input convention: input folds
-  // in cache-write tokens (fresh input processed once into the cache), which is NOT how
-  // the provider bills it (writes/reads are separate line items at different rates).
-  const cacheNote = (tok.cache_write||0)+(tok.subagent_cache_write||0) > 0
-    ? `<div class="hint" title="aGiTrack counts a turn's input as fresh input = uncached input + cache-creation tokens, so the number reflects how much context was processed rather than the provider's price sheet. cache write and cache read are still listed as their own bars.">input includes cache-creation (cache&nbsp;write) tokens — differs from provider billing, see README</div>`
+  const allVals = [];
+  cats.forEach(c => { allVals.push(c.total); (c.subsets||[]).forEach(s => allVals.push(s.value)); });
+  Object.values(summ).forEach(v => allVals.push(v));
+  const maxLog = Math.max(1, ...allVals.map(logTok));
+  const rows = [];
+  cats.forEach(c => {
+    rows.push(barRow(c.label, "", logTok(c.total), maxLog, `<b>${fmt(c.total)}</b>`, c.label==="output"));
+    (c.subsets||[]).forEach(s => rows.push(subBarRow("of which "+s.label, logTok(s.value), maxLog, fmt(s.value))));
+  });
+  const summParts = ["input","output","cache_read"].filter(k=>summ[k])
+    .map(k => `${k==="cache_read"?"cache read":k} <b>${fmt(summ[k])}</b>`);
+  if(summParts.length){
+    rows.push(`<div class="row"><div class="name" title="aGiTrack's own commit-summary calls, separate from the agent's usage">summarizer <small>aGiTrack's own calls</small></div>`+
+      `<div class="bar"></div><div class="num">${summParts.join(" · ")}</div></div>`);
+  }
+  // The hierarchy shows cache-write under input; the note clarifies the one billing nuance
+  // it can't — input is what was processed (uncached input + cache write), while cache read
+  // is the cached context reused, billed separately.
+  const cacheNote = (tok.cache_write||0)+(tok.subagent_cache_write||0)+(tok.cache_read||0) > 0
+    ? `<div class="hint" title="aGiTrack counts input as what was processed = uncached input + cache-creation (cache write) tokens, rather than the provider's price sheet. Cache read is the cached context reused and is billed separately.">input counts processed tokens (uncached&nbsp;input + cache&nbsp;write); cache&nbsp;read is the cached context reused, billed separately</div>`
     : "";
   // Notes sit BELOW the bars so the bars lead the panel and the annotations follow.
-  $("tokens").innerHTML = shown.length
-    ? shown.map(([k,label]) => barRow(label, "", logTok(tok[k]), maxLog, `<b>${fmt(tok[k])}</b>`, k==="output")).join("") +
-      `<div class="hint">bar widths are log-scaled</div>` + cacheNote
+  $("tokens").innerHTML = rows.length
+    ? rows.join("") + `<div class="hint">bar widths are log-scaled; indented rows are a subset of the line above</div>` + cacheNote
     : `<div class="empty">no token metadata recorded</div>`;
 
   $("by-backend").innerHTML = groupPanel(AGG.by_backend);
