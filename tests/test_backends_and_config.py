@@ -65,6 +65,67 @@ def test_opencode_proxy_agent_spawn_command_has_no_system_prompt_append():
     assert cmd == ["opencode", "--session", "s1", "/repo"]
 
 
+def test_spawn_command_executable_replaces_backend_binary():
+    # A custom launch command (e.g. a wrapper) replaces the backend executable head,
+    # while the backend's own flags are still appended after it.
+    claude = make_proxy_agent("claude")
+    cmd = claude.spawn_command(
+        Path("/repo"), session_id="u1", resume=True, commit_guidance=False, executable=["somewrapper", "claude"]
+    )
+    assert cmd == ["somewrapper", "claude", "--resume", "u1"]
+    # No session id, no resume: just the wrapper head.
+    assert claude.spawn_command(
+        Path("/repo"), session_id=None, resume=False, commit_guidance=False, executable=["somewrapper", "claude"]
+    ) == ["somewrapper", "claude"]
+
+    opencode = make_proxy_agent("opencode")
+    assert opencode.spawn_command(Path("/repo"), session_id="s1", resume=True, executable=["w", "opencode"]) == [
+        "w",
+        "opencode",
+        "--session",
+        "s1",
+        "/repo",
+    ]
+    # executable=None keeps the default binary head.
+    assert opencode.spawn_command(Path("/repo"), session_id=None, resume=False, executable=None) == [
+        "opencode",
+        "/repo",
+    ]
+
+
+def test_headless_backends_launch_command_replaces_binary():
+    # The headless backends (shell mode / summarizer) build their command head from
+    # launch_command when given, falling back to the bare binary otherwise.
+    from agitrack.backends.opencode import OpenCodeBackend
+
+    claude = ClaudeBackend("/repo", launch_command=["somewrapper", "claude"])
+    assert claude.launch_command == ["somewrapper", "claude"]
+    oc = OpenCodeBackend("/repo")
+    assert oc.launch_command == []
+
+
+def test_backend_command_config_string_and_dict(tmp_path):
+    path = tmp_path / "config.json"
+    # A bare string applies to whichever backend is launched (single-backend setup).
+    path.write_text(json.dumps({"backend_command": "somewrapper claude"}))
+    config = GlobalConfig(path)
+    assert config.backend_command("claude") == ["somewrapper", "claude"]
+    assert config.backend_command("opencode") == ["somewrapper", "claude"]
+
+    # An object keyed by backend name wraps each backend differently; an unlisted
+    # backend gets no wrapper.
+    path.write_text(json.dumps({"backend_command": {"claude": "wrap claude", "opencode": "wrap oc -x"}}))
+    config = GlobalConfig(path)
+    assert config.backend_command("claude") == ["wrap", "claude"]
+    assert config.backend_command("opencode") == ["wrap", "oc", "-x"]
+    assert config.backend_command("other") == []
+
+    # Unset / invalid (unbalanced quote) ⇒ launch the binary directly, never raise.
+    assert GlobalConfig(tmp_path / "absent.json").backend_command("claude") == []
+    path.write_text(json.dumps({"backend_command": 'wrap "unbalanced'}))
+    assert GlobalConfig(path).backend_command("claude") == []
+
+
 def test_make_proxy_agent_raises_on_unknown_backend():
     # An unknown/stale backend name must surface loudly, not silently launch
     # OpenCode (which contradicts the configured default).

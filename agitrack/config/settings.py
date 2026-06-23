@@ -213,6 +213,30 @@ class GlobalConfig:
         self.data["allowed_edit_paths"] = list(value)
         self.save()
 
+    def backend_command(self, backend: str) -> list[str]:
+        """Custom command used to launch *backend*, replacing the backend executable so
+        a wrapper can sit beneath aGiTrack — e.g. ``["somewrapper", "claude"]`` runs the
+        agent under ``somewrapper`` (aGiTrack's own sandbox wrapper then goes on top).
+
+        Configured under ``"backend_command"`` as either a single command string
+        (applies to whichever backend is launched) or an object mapping backend name →
+        command string, so a user who switches backends can wrap each differently. A
+        string is split like a shell command. Returns ``[]`` when unset/invalid, in
+        which case aGiTrack launches the backend executable directly."""
+        raw = self._raw("backend_command")
+        if isinstance(raw, dict):
+            raw = raw.get(backend)
+        if isinstance(raw, list):  # tolerate a pre-split list written by hand
+            return [str(token) for token in raw if isinstance(token, str) and token]
+        if isinstance(raw, str) and raw.strip():
+            import shlex
+
+            try:
+                return shlex.split(raw)
+            except ValueError:
+                return []  # an unbalanced quote can't lock the user out of launching
+        return []
+
     @property
     def menu_key(self) -> str:
         # Normalized menu key spec. Supports "ctrl-<letter>" or "ctrl+shift+<letter>".

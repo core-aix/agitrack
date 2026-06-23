@@ -94,12 +94,18 @@ class ProxyAgent(Protocol):
         resume: bool,
         commit_guidance: bool = True,
         use_worktrees: bool = True,
+        executable: list[str] | None = None,
     ) -> list[str]: ...
 
     # ``commit_guidance``: when True (default) and the backend CLI supports appending to its
     # system prompt, append the agent note (see :func:`agent_system_note`) so the coding agent
     # doesn't self-commit. Disabled per-run by --no-commit-guidance. ``use_worktrees`` selects
     # the note variant: the worktree-merge clause is added only in the default worktree model.
+    #
+    # ``executable``: the command that launches the backend CLI, replacing the default
+    # ``[<backend binary>]`` head. Lets the user run the agent under a wrapper, e.g.
+    # ``["somewrapper", "claude"]`` (see GlobalConfig.backend_command / --backend-command).
+    # The backend's own flags are still appended after it. None ⇒ launch the binary directly.
 
     def session_belongs_to_repo(self, repo: Path, session_id: str) -> bool: ...
 
@@ -175,10 +181,11 @@ class OpenCodeProxyAgent:
         resume: bool,
         commit_guidance: bool = True,
         use_worktrees: bool = True,
+        executable: list[str] | None = None,
     ) -> list[str]:
         # ``commit_guidance``/``use_worktrees`` are accepted for a uniform interface but
         # unused: OpenCode's interactive TUI has no flag to append to its system prompt.
-        command = ["opencode"]
+        command = list(executable) if executable else ["opencode"]
         if resume and session_id:
             command.extend(["--session", session_id])
         command.append(str(repo))
@@ -250,13 +257,15 @@ class ClaudeProxyAgent:
         resume: bool,
         commit_guidance: bool = True,
         use_worktrees: bool = True,
+        executable: list[str] | None = None,
     ) -> list[str]:
+        head = list(executable) if executable else ["claude"]
         if resume and session_id:
-            command = ["claude", "--resume", session_id]
+            command = [*head, "--resume", session_id]
         elif session_id:
-            command = ["claude", "--session-id", session_id]
+            command = [*head, "--session-id", session_id]
         else:
-            command = ["claude"]
+            command = list(head)
         # Tell the coding agent that aGiTrack auto-commits, so it doesn't self-commit (Claude
         # supports appending to its system prompt). Skipped when commit_guidance is off. The
         # note's worktree clause is included only in the worktree model.

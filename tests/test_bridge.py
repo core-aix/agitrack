@@ -91,8 +91,9 @@ def test_wait_answer_skips_stale_answers():
 class FakeBackend:
     name = "claude"
 
-    def __init__(self, repo, *, verbose=False, backend_args=None):
+    def __init__(self, repo, *, verbose=False, backend_args=None, launch_command=None):
         self.repo = Path(repo)
+        self.launch_command = list(launch_command or [])
 
     def run(self, prompt, *, model, session_id, bare=False, system_prompt=None, commit_guidance=True):
         (self.repo / "hello.py").write_text("print('hi')\n", encoding="utf-8")

@@ -371,6 +371,25 @@ aGiTrack's own flags (`--repo`, `--verbose`, `--mode`, `--backend`, `--new-sessi
 
 Help follows the same model: `agitrack --help` (or `-h`) prints aGiTrack's own options followed by the active backend's help, so one command documents both layers. To run only the backend's help, forward it explicitly: `agitrack -- --help`.
 
+#### Launching the backend under a wrapper
+
+If you run the agent through another tool — a sandbox, a version manager, a profiler, your own launcher — give aGiTrack the **custom launch command** and it replaces the backend executable, so your wrapper sits directly beneath aGiTrack (aGiTrack's own worktree sandbox still goes on top):
+
+```bash
+agitrack --backend-command "somewrapper claude"   # runs `somewrapper claude …` instead of `claude …`
+```
+
+The value is split like a shell command and must ultimately exec the chosen backend; aGiTrack still appends the backend's own flags (session id, resume, system-prompt note) and any `--`-forwarded arguments after it. To make it permanent, set `backend_command` in config — either a single string (applies to whichever backend you launch) or an object keyed by backend name when you switch backends and want each wrapped differently:
+
+```jsonc
+// ~/.agitrack/config.json (or a repo's .agitrack/config.json)
+"backend_command": "somewrapper claude"
+// or, per backend:
+"backend_command": { "claude": "somewrapper claude", "opencode": "somewrapper opencode" }
+```
+
+A `--backend-command` on the command line overrides the config value for that run. The wrapper applies wherever aGiTrack launches the agent — interactive proxy mode, scripted `--prompt` runs, and the per-turn summarizer.
+
 
 
 ## Configuration
