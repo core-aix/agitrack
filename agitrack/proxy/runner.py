@@ -113,6 +113,26 @@ _MODIFY_OTHER_KEYS_RE = re.compile(rb"\x1b\[27;(\d+);(\d+)~")
 # the `|$`): newlines inside it are pasted CONTENT, not prompt submissions.
 _BRACKETED_PASTE_RE = re.compile(rb"\x1b\[200~.*?(?:\x1b\[201~|$)", re.S)
 
+# String-level escape stripper for captured subprocess output (e.g. a backend updater's
+# spinner) so it reduces to readable lines for a status message: drop CSI/OSC sequences and
+# lone ESC pairs, and turn carriage-returns (used to redraw a spinner in place) into newlines
+# so each frame is its own line and the last meaningful one survives.
+_ANSI_CSI_OSC_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_CSI_OSC_RE.sub("", text).replace("\r", "\n")
+
+
+def _homebrew_formula(real_path: str) -> str | None:
+    """The Homebrew formula name for a keg path (…/Cellar/<formula>/<version>/…), or None if
+    the path isn't a Homebrew keg. Used to ask `brew outdated <formula>`."""
+    parts = real_path.split(os.sep)
+    try:
+        return parts[parts.index("Cellar") + 1]
+    except (ValueError, IndexError):
+        return None
+
 
 def _shared_transcript_rows(transcript: str) -> int:
     # Recorded in the share manifest so the resume menu can tell at a glance whether
@@ -219,6 +239,7 @@ class ProxyInput:
     COMMANDS = [
         "sessions",
         "agent-backend",
+        "agent-update",
         "summarizer",
         "git-unstaged",
         "git-user-commit",
@@ -612,6 +633,14 @@ class ProxyRunner:
         self._summary_pending: dict | None = None  # {"sha", "since"} while a summary is being computed
         self._precompact_thread: threading.Thread | None = None  # background pre-compaction summary worker
         self._precompact_result: dict | None = None
+        # Ctrl-G → "agent-update": the backend's own self-update, run from aGiTrack's UNCONFINED
+        # proxy (not the sandboxed agent) on a background thread, plus the finished result the
+        # main loop surfaces. One at a time. See _handle_backend_update_command.
+        self._backend_update_thread: threading.Thread | None = None
+        self._backend_update_result: dict | None = None
+        # Name of the backend we've already evaluated for the "self-update is sandbox-blocked,
+        # use agent-update" hint. Switching to a different backend re-evaluates (once).
+        self._backend_update_hint_checked_for: str | None = None
         self._base_poll_at = 0.0  # throttle for the base-HEAD poll
         self._warned_backend_session = False  # one-shot "use agit to start sessions" notice
         # Auto-share (issue #55): for sessions the user opted to keep shared, the
@@ -885,6 +914,9 @@ class ProxyRunner:
                 "_warned_backend_session": False,
                 "_auto_share_hash": {},
                 "_auto_share_thread": None,
+                "_backend_update_thread": None,
+                "_backend_update_result": None,
+                "_backend_update_hint_checked_for": None,
                 "_sessions_with_activity": set(),
                 "_cancel_prompted": set(),
                 "_copy_prompted": {},
@@ -1063,7 +1095,7 @@ class ProxyRunner:
             signal.signal(signal.SIGTERM, self._handle_exit_signal)
             signal.signal(signal.SIGHUP, self._handle_exit_signal)
             self._setup_worktree_confinement_notice()
-            exit_code = self._loop()
+            exit_code = self._loop()  # the timers phase surfaces the 'agent-update' hint when relevant
         finally:
             if self.original_sigwinch is not None:
                 signal.signal(signal.SIGWINCH, self.original_sigwinch)
@@ -1878,6 +1910,150 @@ class ProxyRunner:
             )
             self._render()
 
+    def _backend_update_command(self) -> list[str] | None:
+        getter = getattr(self.backend, "update_command", None)
+        if not callable(getter):
+            return None
+        try:
+            cmd = getter()
+        except Exception as error:
+            self._debug(f"backend update_command failed: {error!r}")
+            return None
+        return list(cmd) if cmd else None
+
+    def _backend_self_update_blocked(self) -> bool:
+        """Whether the backend's OWN in-app self-update can't work inside aGiTrack: on macOS,
+        a Homebrew-managed CLI updates via `brew upgrade`, which runs Homebrew's own
+        `sandbox-exec` — and macOS forbids nesting that inside the agent's worktree sandbox.
+        (npm/native installs self-update fine; only the brew-under-sandbox combination breaks.)
+        When true, the fix is Ctrl-G → 'agent-update', which runs the updater UNCONFINED."""
+        if not self._sandbox or sys.platform != "darwin" or not sandbox.is_available():
+            return False
+        exe = shutil.which(self.backend.name)
+        if not exe:
+            return False
+        real = os.path.realpath(exe)
+        # Homebrew kegs resolve under …/Cellar/…; the prefix is /opt/homebrew (Apple Silicon)
+        # or /usr/local (Intel). Matching either covers both layouts.
+        return "/Cellar/" in real or real.startswith("/opt/homebrew/") or real.startswith("/usr/local/")
+
+    def _backend_update_available(self) -> bool | None:
+        """Best-effort: is a newer backend CLI version available? True / False, or None when we
+        can't tell cheaply (callers then proceed or offer rather than wrongly skip). For a
+        Homebrew keg we ask `brew outdated` (fast, metadata-only — no build, so no sandbox-exec
+        and no nesting); other install methods have no uniform cheap check, hence None."""
+        exe = shutil.which(self.backend.name)
+        if not exe:
+            return None
+        formula = _homebrew_formula(os.path.realpath(exe))
+        if not formula or not shutil.which("brew"):
+            return None
+        try:
+            proc = subprocess.run(["brew", "outdated", "--quiet", formula], capture_output=True, text=True, timeout=30)
+        except Exception as error:
+            self._debug(f"brew outdated check failed: {error!r}")
+            return None
+        if proc.returncode != 0:
+            return None
+        return formula in proc.stdout.split()
+
+    def _maybe_hint_backend_update(self) -> None:
+        """Notice (once per backend, re-armed on a backend switch): if the backend's own
+        self-update is blocked by confinement (brew + macOS sandbox) AND an update is actually
+        available, point the user at the working in-app path instead of the failing in-backend
+        updater. Evaluated lazily off the timers phase so it also fires after a switch."""
+        name = getattr(self.backend, "name", None)
+        if name is None or self._backend_update_hint_checked_for == name:
+            return
+        if not self._backend_self_update_blocked():
+            self._backend_update_hint_checked_for = name  # not blocked → don't re-check this backend
+            return
+        # The availability check shells out to `brew outdated`; do it off the main thread so the
+        # reactor never blocks, then surface the hint on a later tick once the answer is in.
+        threading.Thread(target=self._resolve_backend_update_hint, args=(name,), daemon=True).start()
+        self._backend_update_hint_checked_for = name
+
+    def _resolve_backend_update_hint(self, name: str) -> None:
+        if self._backend_update_available() is False:
+            return  # confidently up to date — nothing to nag about
+        self._set_message(
+            f"{name}'s own self-update can't run inside aGiTrack's sandbox "
+            f"(Homebrew's installer can't sandbox within a sandbox). To update it, use "
+            f"{self._menu_label()} → 'agent-update'.",
+            seconds=14.0,
+        )
+        self._render()
+
+    def _handle_backend_update_command(self) -> None:
+        # Ctrl-G → "agent-update": run the backend CLI's own updater (e.g. `opencode upgrade`)
+        # from aGiTrack's UNCONFINED proxy — NOT the worktree-sandboxed agent. That keeps a
+        # package-manager updater (notably Homebrew's own sandbox-exec) from being nested
+        # inside the agent's macOS sandbox, which macOS forbids and which is exactly what
+        # breaks the backend's in-app self-update. Runs on a background thread so the long
+        # download never blocks the TUI; the result is surfaced by _service_backend_update.
+        cmd = self._backend_update_command()
+        if cmd is None:
+            self._set_message(f"{self.backend.name} has no self-update command.")
+            self._render()
+            return
+        if self._backend_update_thread is not None and self._backend_update_thread.is_alive():
+            self._set_message(f"An update of {self.backend.name} is already running…")
+            self._render()
+            return
+        name = self.backend.name
+        if self._backend_update_available() is False:
+            self._set_message(f"{name} is already up to date.")
+            self._render()
+            return
+        cwd = str(getattr(self.base_repo, "repo", None) or getattr(self.repo, "repo", "."))
+        self._set_message(
+            f"Updating {name} (running '{' '.join(cmd)}' outside aGiTrack's sandbox)… this can take a minute.",
+            seconds=600.0,
+            sticky=True,
+        )
+        self._render()
+
+        def worker() -> None:
+            result: dict = {"name": name}
+            try:
+                proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=600)
+                result["code"] = proc.returncode
+                result["output"] = (proc.stdout or "") + (proc.stderr or "")
+            except Exception as error:
+                result["error"] = repr(error)
+            self._backend_update_result = result
+
+        self._backend_update_thread = threading.Thread(target=worker, daemon=True, name="agit-backend-update")
+        self._backend_update_thread.start()
+
+    def _service_backend_update(self) -> None:
+        """Main loop: surface a finished `agent-update` result (set by its worker thread)."""
+        result = self._backend_update_result
+        if result is None:
+            return
+        self._backend_update_result = None
+        name = result.get("name", "the agent")
+        if "error" in result:
+            self._set_message(f"Updating {name} failed: {result['error']}", seconds=12.0)
+            self._render()
+            return
+        output = _strip_ansi(result.get("output", ""))
+        lines = [line.strip() for line in output.splitlines() if line.strip()]
+        tail = lines[-1] if lines else ""
+        # The updater's exit code isn't always reliable (e.g. `opencode upgrade` exits 0 even
+        # when its brew step failed), so flag a likely failure from the output text too.
+        looks_failed = result.get("code") not in (0, None) or "fail" in output.lower() or "error" in output.lower()
+        if looks_failed:
+            flagged = [line for line in lines if "fail" in line.lower() or "error" in line.lower()]
+            detail = (flagged[-1] if flagged else tail)[:200]
+            self._set_message(f"Updating {name} may have failed: {detail}", seconds=14.0)
+        else:
+            self._set_message(
+                f"{name} updated{(' — ' + tail[:160]) if tail else ''}. Start a new session to use it.",
+                seconds=12.0,
+            )
+        self._render()
+
     def _confine_to_worktree(self, command: list[str]) -> list[str]:
         # Wrap the backend so it can only write inside its session worktree (plus
         # the repo's .git), not the base repo it lives in. A no-op when there is
@@ -1970,6 +2146,9 @@ class ProxyRunner:
             self._set_message(f"Already using {name}.")
             self._render()
             return
+        # Re-arm the "self-update is sandbox-blocked → use agent-update" hint so it re-evaluates
+        # for the backend being switched to (the update can be applied on switch too).
+        self._backend_update_hint_checked_for = None
         self.global_config.default_backend = name
         if self.worktree is None:
             # A non-worktree session has nothing to multiplex; restart the single
@@ -5793,6 +5972,8 @@ class ProxyRunner:
             # restart; stop before any further servicing.
             return
         self._service_background_share_ops()  # surface finished background unshare/etc. results
+        self._service_backend_update()  # surface a finished 'agent-update' (backend self-update)
+        self._maybe_hint_backend_update()  # once per (re-armed on switch) backend; cheap when checked
         self._service_session_notices()  # expire/refresh per-session status lines
         self._git_wake.set()  # nudge the worker so its pass tracks the reactor's cadence
 
@@ -6434,6 +6615,9 @@ class ProxyRunner:
             return
         elif name == "settings":
             self._after_menu_command(self._settings_menu())
+            return
+        elif name == "agent-update":
+            self._handle_backend_update_command()
             return
         elif name == "update":
             self._handle_update_command()

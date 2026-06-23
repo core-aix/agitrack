@@ -86,6 +86,7 @@ In proxy mode (default), press `Ctrl-G` to open aGiTrack's menu, then pick a com
 ```text
 sessions                  switch / start (own worktree) / stop a live session
 agent-backend             switch backend (opencode|claude); shows a picker
+agent-update              update the coding agent CLI (runs its own updater, unconfined)
 summarizer                toggle summarization on/off, set model, show status
 git-unstaged              show intentionally unstaged files
 git-user-commit           create a user commit

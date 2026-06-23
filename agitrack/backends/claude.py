@@ -70,6 +70,9 @@ class ClaudeBackend:
         # wrapper (e.g. ["somewrapper", "claude"]); empty ⇒ run "claude" directly.
         self.launch_command = list(launch_command or [])
 
+    def update_command(self) -> list[str] | None:
+        return [*(self.launch_command or ["claude"]), "update"]
+
     def run(
         self,
         prompt: str,
