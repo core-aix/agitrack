@@ -51,13 +51,12 @@ def shared_sessions_for(repo: GitRepo) -> list[dict]:
     except Exception:
         return []
     # The remote fetch is a best-effort extra (others' shares); a transient failure
-    # (e.g. racing a concurrent auto-share push) must NOT blank the list — fall back
-    # to the local ref, which always holds your own shared sessions. It fetches into a
-    # mirror ref (not the canonical local ref), so a remote that's momentarily behind can
-    # never rewind your own just-shared session — listing_entries then takes the newest
-    # copy of each session, so its "shared" time reflects the latest share, not a stale one.
+    # (e.g. racing a concurrent auto-share push) must NOT blank the list. It fetches into
+    # mirror refs, NOT the canonical local ref, so a remote that's momentarily behind can
+    # never rewind your own just-shared session — entries() then takes the newest copy of
+    # each session, so its "shared" time reflects the latest share, not a stale one.
     try:
-        store.fetch_listing_throttled()
+        store.fetch_throttled()
     except Exception:
         pass
     try:
@@ -72,7 +71,7 @@ def shared_sessions_for(repo: GitRepo) -> list[dict]:
                 "backend": entry.manifest.get("backend"),
                 "updated": entry.manifest.get("updated", 0),
             }
-            for entry in store.listing_entries()
+            for entry in store.entries()
         ]
     except Exception:
         return []
