@@ -220,9 +220,9 @@ def test_share_lists_and_reads_back(tmp_path):
     assert entries[0].manifest["session_id"] == "id1"
 
 
-def test_listing_entries_prefers_fresh_local_over_stale_remote_mirror(tmp_path):
-    # The dashboard listing must never show a stale "shared" time: when the canonical local
-    # ref holds a fresher copy of your own session than the remote mirror (a share whose push
+def test_entries_prefers_fresh_local_over_stale_remote_mirror(tmp_path):
+    # The listing must never show a stale "shared" time: when the canonical local ref holds
+    # a fresher copy of your own session than the remote mirror (a share whose push
     # lagged/failed), the local copy wins — and a teammate's mirror-only session still lists.
     from agitrack.sessions.store import REMOTE_MIRROR
 
@@ -233,8 +233,8 @@ def test_listing_entries_prefers_fresh_local_over_stale_remote_mirror(tmp_path):
         transcript="local-fresh",
         manifest=_manifest("fix-parser", session_id="id1", updated=2000),
     )
-    # The remote mirror (what fetch_listing_throttled would populate) holds a STALE copy of
-    # the same session plus a teammate's session that only exists on the remote.
+    # The remote mirror (what fetch() populates) holds a STALE copy of the same session plus
+    # a teammate's session that only exists on the remote.
     prefix = store._prefix()
     mirror = {
         f"{prefix}alice/fix-parser/transcript.jsonl": store.repo.write_blob("remote-stale"),
@@ -248,13 +248,11 @@ def test_listing_entries_prefers_fresh_local_over_stale_remote_mirror(tmp_path):
     }
     store._commit(mirror, "mirror", ref=REMOTE_MIRROR)
 
-    listed = store.listing_entries()
+    listed = store.entries()
     by_key = {(e.github_id, e.name): e.manifest.get("updated") for e in listed}
     assert by_key[("alice", "fix-parser")] == 2000  # fresh local beats the stale remote mirror
     assert by_key[("bob", "feature")] == 1500  # teammate's mirror-only session still appears
     assert [e.name for e in listed] == ["fix-parser", "feature"]  # newest (highest updated) first
-    # The listing read did not rewind the canonical local ref (entries() still fresh).
-    assert next(e for e in store.entries() if e.name == "fix-parser").manifest["updated"] == 2000
 
 
 def test_fetch_lists_with_filter_and_reads_transcript_on_demand():

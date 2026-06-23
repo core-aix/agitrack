@@ -8569,6 +8569,15 @@ class ProxyRunner:
                 overwrite_mode = "none"
         remained: list[str] = []
         copied = 0
+        # Announce the copy BEFORE it runs (a wholly-ignored directory like node_modules can
+        # take a moment to copy), so the user sees that work is happening rather than the
+        # "Copied …" confirmation appearing as if from nowhere. Only when something will
+        # actually be copied — a "keep the base versions" choice on every conflict copies
+        # nothing, so it must not claim to be copying.
+        attempting = [rel for rel, _ in fresh if not ((base_dir / rel).exists() and overwrite_mode == "none")]
+        if attempting:
+            self._set_message(f"Copying {len(attempting)} file(s) into the base repo directory…")
+            self._render()
         for rel, _ in fresh:
             src, dst = wt_dir / rel, base_dir / rel
             if dst.exists():
