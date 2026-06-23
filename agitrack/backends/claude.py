@@ -47,10 +47,20 @@ def _bare_args(system_prompt: str | None) -> list[str]:
 class ClaudeBackend:
     name = "claude"
 
-    def __init__(self, repo: Path, *, verbose: bool = False, backend_args: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        repo: Path,
+        *,
+        verbose: bool = False,
+        backend_args: list[str] | None = None,
+        launch_command: list[str] | None = None,
+    ) -> None:
         self.repo = repo
         self.verbose = verbose
         self.backend_args = list(backend_args or [])  # forwarded verbatim to the backend CLI (#32)
+        # Command that launches the backend, replacing the "claude" executable with a user
+        # wrapper (e.g. ["somewrapper", "claude"]); empty ⇒ run "claude" directly.
+        self.launch_command = list(launch_command or [])
 
     def run(
         self,
@@ -62,7 +72,7 @@ class ClaudeBackend:
         system_prompt: str | None = None,
         commit_guidance: bool = True,
     ) -> AgentResult:
-        command = ["claude", "-p", prompt, "--output-format", "json"]
+        command = [*(self.launch_command or ["claude"]), "-p", prompt, "--output-format", "json"]
         if model:
             command.extend(["--model", model])
         if session_id:

@@ -61,8 +61,9 @@ class FakeBackend:
     name = "claude"
     runs: list[str] = []
 
-    def __init__(self, repo, *, verbose=False, backend_args=None):
+    def __init__(self, repo, *, verbose=False, backend_args=None, launch_command=None):
         self.repo = Path(repo)
+        self.launch_command = list(launch_command or [])
 
     def run(self, prompt, *, model, session_id, bare=False, system_prompt=None, commit_guidance=True):
         FakeBackend.runs.append(prompt)

@@ -31,6 +31,7 @@ class AgitrackShell:
         backend: str | None = None,
         new_session: bool = False,
         backend_args: list[str] | None = None,
+        backend_command: list[str] | None = None,
         prompts: list[str] | None = None,
         commit_guidance: bool = True,
         json_events: bool = False,
@@ -38,6 +39,10 @@ class AgitrackShell:
     ) -> None:
         self.repo = repo
         self.backend_args = list(backend_args or [])  # forwarded to the backend CLI (#32)
+        # Per-run override (from --backend-command) for the command that launches the
+        # backend, replacing its executable so the agent runs under a user wrapper. Empty
+        # ⇒ the per-backend config value (GlobalConfig.backend_command) applies.
+        self._backend_command = list(backend_command or [])
         # The VSCode extension runs aGiTrack as a long-lived child with no terminal and
         # drives it over a bidirectional JSON-RPC bridge (see agitrack/shell/bridge.py):
         # prompts/commands arrive on stdin, events go out on stdout, and interactive
@@ -459,11 +464,25 @@ class AgitrackShell:
             if self.verbose:
                 print("No code changes detected; interaction trace remains pending.")
 
+    def _launch_command(self) -> list[str]:
+        # Command that launches the current backend, replacing its executable with a user
+        # wrapper. A per-run --backend-command override wins; otherwise the per-backend
+        # config value applies. Empty ⇒ launch the backend binary directly.
+        if self._backend_command:
+            return list(self._backend_command)
+        getter = getattr(self.global_config, "backend_command", None)
+        return list(getter(self.state.backend)) if callable(getter) else []
+
     def _backend(self):
         backend_class = BACKENDS.get(self.state.backend)
         if backend_class is None:
             raise RuntimeError(f"Unsupported backend: {self.state.backend}")
-        return backend_class(self.repo.repo, verbose=self.verbose, backend_args=self.backend_args)
+        return backend_class(
+            self.repo.repo,
+            verbose=self.verbose,
+            backend_args=self.backend_args,
+            launch_command=self._launch_command() or None,
+        )
 
     def _summarizer_backend(self):
         # Summarizer calls run from a scratch cwd, never the repo: a headless
@@ -475,7 +494,7 @@ class AgitrackShell:
         backend_class = BACKENDS.get(self.state.backend)
         if backend_class is None:
             raise RuntimeError(f"Unsupported backend: {self.state.backend}")
-        return backend_class(summary_scratch_dir(), verbose=self.verbose)
+        return backend_class(summary_scratch_dir(), verbose=self.verbose, launch_command=self._launch_command() or None)
 
     def _handle_pre_compaction(self) -> None:
         if self.verbose:

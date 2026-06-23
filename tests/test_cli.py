@@ -408,6 +408,38 @@ def test_reserved_passthrough_flag_warns_but_forwards(monkeypatch, capsys):
     assert captured["backend_args"] == ["--resume", "abc123"]  # still forwarded
 
 
+def test_backend_command_flag_passed_to_runner(monkeypatch):
+    captured = _stub_launch(monkeypatch)
+    rc = cli.main(["--backend-command", "somewrapper claude"])
+    assert rc == 0
+    assert captured["backend_command"] == ["somewrapper", "claude"]
+
+
+def test_backend_command_absent_resolves_from_config(monkeypatch):
+    captured = _stub_launch(monkeypatch)
+    cli.main(["--backend", "opencode"])
+    # No flag and the stub config has no backend_command ⇒ launch the binary directly.
+    assert captured["backend_command"] == []
+
+
+def test_backend_command_invalid_value_fails_fast(monkeypatch, capsys):
+    _stub_launch(monkeypatch)
+    rc = cli.main(["--backend-command", 'wrap "unbalanced'])
+    assert rc == 1
+    assert "backend-command" in capsys.readouterr().out.lower()
+
+
+def test_proxy_runner_stores_backend_command(tmp_path):
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-q", "--allow-empty", "-m", "init"], check=True)
+    from agitrack.proxy.runner import ProxyRunner
+
+    runner = ProxyRunner(GitRepo(tmp_path), backend_command=["somewrapper", "opencode"])
+    assert runner._backend_command == ["somewrapper", "opencode"]
+    # The launch command flows into the spawned command's executable head.
+    assert runner._launch_command() == ["somewrapper", "opencode"]
+
+
 def test_proxy_runner_stores_backend_args(tmp_path):
     # Build a runner through the real __init__ (with a tmp git repo) and confirm
     # passthrough args are stored for _spawn to append.

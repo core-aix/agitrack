@@ -17,10 +17,20 @@ _SUMMARIZER_REASONING_VARIANT = "minimal"
 class OpenCodeBackend:
     name = "opencode"
 
-    def __init__(self, repo: Path, *, verbose: bool = False, backend_args: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        repo: Path,
+        *,
+        verbose: bool = False,
+        backend_args: list[str] | None = None,
+        launch_command: list[str] | None = None,
+    ) -> None:
         self.repo = repo
         self.verbose = verbose
         self.backend_args = list(backend_args or [])  # forwarded verbatim to the backend CLI (#32)
+        # Command that launches the backend, replacing the "opencode" executable with a user
+        # wrapper (e.g. ["somewrapper", "opencode"]); empty ⇒ run "opencode" directly.
+        self.launch_command = list(launch_command or [])
 
     def run(
         self,
@@ -40,7 +50,7 @@ class OpenCodeBackend:
         # directory, so at least no repo AGENTS.md is loaded. (Claude, where the bloat is
         # large and the echo risk real, applies the full reduction.) Accepted for a uniform
         # backend interface.
-        command = ["opencode", "run", "--format", "json", "--dir", str(self.repo)]
+        command = [*(self.launch_command or ["opencode"]), "run", "--format", "json", "--dir", str(self.repo)]
         if model:
             command.extend(["--model", model])
         if session_id:
