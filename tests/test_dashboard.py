@@ -882,9 +882,13 @@ def test_web_dashboard_embeds_token_hierarchy_and_cache_note(tmp_path):
     assert "function barWidth(value, max, min)" in html
     assert "const minLog = logs.length ? Math.min(...logs) : 0" in html
     # Log-scaled token bars are visually distinguished from the linear bars: a striped fill
-    # plus a "log" tag.
+    # plus a "log" tag — on the indented "of which" bars as well as the parents.
     assert ".bar i.log{background-image:repeating-linear-gradient" in html
-    assert '<span class="logtag">log</span>' in html
+    assert '<div class="bar"><span class="logtag">log</span><i class="log"' in html  # subset bars tagged too
+    # A separator delimits each whole token group (a main category + its sub-rows), drawn as
+    # a top border before each main row rather than between a parent and its own children.
+    assert "#tokens .row{border-bottom:none}" in html
+    assert "#tokens .row:not(.sub){border-top:1px solid var(--line)}" in html
 
 
 def test_filter_bar_is_single_row_with_a_custom_range_popup(tmp_path):
