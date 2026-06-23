@@ -240,6 +240,41 @@ def test_dashboard_groups_by_backend_model_and_author(tmp_path):
     assert author_stats["nontracked_insertions"] == 14
 
 
+def test_dashboard_omits_unknown_and_synthetic_backend_model(tmp_path):
+    # A backend/model that's a "no real value" placeholder — the writer's "unknown"
+    # or Claude's "<synthetic>" marker — must not form its own row in the by-backend /
+    # by-model breakdowns; the turn is omitted from them instead.
+    repo = GitRepo.init(tmp_path)
+    _write_lines(repo, "good.txt", 10)
+    repo.commit(
+        "Good turn\n\n* work\n\n"
+        "# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\nmodel: claude-opus-4-8\n"
+        "tokens_since_last_commit_output: 100\ntokens_since_last_commit_input: 50\n"
+    )
+    _write_lines(repo, "unk.txt", 10)
+    repo.commit(
+        "Unknown turn\n\n* work\n\n"
+        "# aGiTrack Metadata\ncommit_type: agent\nbackend: unknown\nmodel: unknown\n"
+        "tokens_since_last_commit_output: 10\ntokens_since_last_commit_input: 5\n"
+    )
+    _write_lines(repo, "syn.txt", 10)
+    repo.commit(
+        "Synthetic turn\n\n* work\n\n"
+        "# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\nmodel: <synthetic>\n"
+        "tokens_since_last_commit_output: 7\ntokens_since_last_commit_input: 3\n"
+    )
+
+    dash = build_dashboard(repo)
+
+    assert set(dash.by_backend) == {"claude"}  # the unknown-backend turn is dropped
+    # The synthetic-model turn still has a real backend, so it counts under claude.
+    assert dash.by_backend["claude"]["commits"] == 2
+    assert set(dash.by_model) == {"claude-opus-4-8"}  # unknown + <synthetic> models dropped
+    # The text dashboard never prints the placeholders either.
+    text = render_dashboard(repo)
+    assert "unknown:" not in text and "<synthetic>" not in text
+
+
 def test_render_dashboard_contains_all_sections(tmp_path):
     text = render_dashboard(_demo_repo(tmp_path))
 
