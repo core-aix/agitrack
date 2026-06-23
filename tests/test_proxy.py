@@ -2954,30 +2954,42 @@ def test_can_show_dialog_requires_macos(monkeypatch):
     assert host_prompt.can_show_dialog() is False
 
 
-def test_had_unfinalized_work_detects_inflight_and_dirty():
+def test_had_unfinalized_work_detects_inflight_and_unmerged():
     runner = make_runner()
+    runner.sessions = []
+    runner._unmerged_worktrees = lambda: []
 
-    runner._agent_is_active = lambda: True
+    runner._agent_is_active = lambda: True  # a turn is in flight
     assert runner._had_unfinalized_work() is True
 
     runner._agent_is_active = lambda: False
-    runner.sessions = [object()]
-    runner._session_status = lambda _i: "running"
-    assert runner._had_unfinalized_work() is True
-
-    runner.sessions = []
-    runner.repo = types.SimpleNamespace(status_short=lambda: " M file.py")
-    runner.base_repo = types.SimpleNamespace(status_short=lambda: "", repo="/tmp/x")
+    runner._unmerged_worktrees = lambda: [("session-1 (current session)", "")]  # committed but unmerged
     assert runner._had_unfinalized_work() is True
 
 
-def test_had_unfinalized_work_false_on_clean_idle_close():
+def test_had_unfinalized_work_ignores_base_repo_and_declined_dirt():
+    # A clean session (every turn committed AND merged) must exit silently even when
+    # the developer's own base repo is dirty or the worktree has declined/ignored
+    # files — aGiTrack does not finalize those, so they aren't "unfinalized work".
     runner = make_runner()
-    runner._agent_is_active = lambda: False
     runner.sessions = []
-    runner.repo = types.SimpleNamespace(status_short=lambda: "")
-    runner.base_repo = types.SimpleNamespace(status_short=lambda: "", repo="/tmp/x")
+    runner._agent_is_active = lambda: False
+    runner._unmerged_worktrees = lambda: []  # _unmerged_worktrees already excludes that noise
     assert runner._had_unfinalized_work() is False
+    assert runner._describe_exit_finalize() is None
+
+
+def test_describe_exit_finalize_names_the_pending_work():
+    # When there IS something to finalize, the exit message says exactly what.
+    runner = make_runner()
+    runner.sessions = []
+    runner._agent_is_active = lambda: True
+    runner._unmerged_worktrees = lambda: [("foo (dormant)", "foo")]
+    detail = runner._describe_exit_finalize()
+    assert detail is not None
+    assert "committing the latest turn" in detail
+    assert "foo (dormant)" in detail
+    assert "Finalizing commits" not in detail  # not the old vague message
 
 
 def test_handle_exit_signal_ignored_while_update_applying():
@@ -3283,25 +3295,10 @@ def test_confirm_exit_prompts_when_managing(monkeypatch):
     assert runner._confirm_exit() is False
 
 
-def test_exit_skips_confirmation_when_nothing_pending():
-    # Clean tree, nothing running, nothing unmerged → exit directly, no popups.
+def test_exit_always_confirms_even_when_nothing_pending():
+    # Exit is a deliberate safety net: it asks first regardless of pending work.
     runner = make_runner()
-    runner._had_unfinalized_work = lambda: False
-    runner._has_unmerged_work = lambda: False
-    events = []
-    runner._confirm_exit = lambda: events.append("confirm") or True
-    runner._confirm_terminate_background_sessions = lambda: events.append("bg") or True
-    runner._finalize_pending_work = lambda: events.append("finalize")
-    runner._exit_child = lambda: events.append("exit")
-
-    assert runner._run_exit_flow() is True
-    assert events == ["finalize", "exit"], "a clean exit must skip both confirmations"
-
-
-def test_exit_confirms_when_work_pending():
-    runner = make_runner()
-    runner._had_unfinalized_work = lambda: True  # something still uncommitted/running
-    runner._has_unmerged_work = lambda: False
+    runner._had_unfinalized_work = lambda: False  # clean tree, everything merged
     events = []
     runner._confirm_exit = lambda: events.append("confirm") or True
     runner._confirm_terminate_background_sessions = lambda: True
@@ -3309,7 +3306,19 @@ def test_exit_confirms_when_work_pending():
     runner._exit_child = lambda: events.append("exit")
 
     assert runner._run_exit_flow() is True
-    assert events == ["confirm", "finalize", "exit"]
+    assert events == ["confirm", "finalize", "exit"], "exit must confirm even when clean"
+
+
+def test_exit_confirm_declined_keeps_running():
+    runner = make_runner()
+    events = []
+    runner._confirm_exit = lambda: False  # user declines the exit prompt
+    runner._finalize_pending_work = lambda: events.append("finalize")
+    runner._exit_child = lambda: events.append("exit")
+    runner._render = lambda: None
+
+    assert runner._run_exit_flow() is False
+    assert events == [], "declining the exit prompt leaves aGiTrack running"
 
 
 def test_proxy_passthrough_prompt_drops_escape_sequences():
@@ -6631,9 +6640,6 @@ def test_switch_active_joins_worker_before_swapping():
 def _popup_exit_runner():
     runner = make_runner()
     runner.events = []
-    # These tests exercise the confirmation path, so force "work pending" — otherwise
-    # a clean tree would (correctly) skip the confirmations and exit directly.
-    runner._exit_needs_confirmation = lambda: True
     runner._finalize_pending_work = lambda: runner.events.append("finalize")
     runner._exit_child = lambda: runner.events.append("exit")
     return runner
@@ -6946,7 +6952,6 @@ def test_sync_tracked_session_skips_empty_newest_session(tmp_path):
 
 def test_exit_command_routes_through_unified_exit_flow(tmp_path):
     runner = make_runner()
-    runner._exit_needs_confirmation = lambda: True  # exercise the confirmation path
     events = []
     runner._confirm_exit = lambda: (events.append("confirm"), True)[1]
     runner._confirm_terminate_background_sessions = lambda: True
@@ -6966,7 +6971,6 @@ def test_exit_command_cancelled_does_not_request_exit(tmp_path):
     # Declining the exit confirmation keeps aGiTrack running: the loop-break flag
     # stays clear.
     runner = make_runner()
-    runner._exit_needs_confirmation = lambda: True  # work pending, so the prompt is shown
     runner._confirm_exit = lambda: False
     runner._render = lambda: None
 
