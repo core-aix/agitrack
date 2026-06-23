@@ -130,9 +130,9 @@ jobs:
         run: uv publish
 
       # Summarize the key changes since the previous release with the OpenAI API
-      # (shared composite action). Produces an empty notes-file when the
-      # OPENAI_API_KEY secret is absent or the call fails, so the release still
-      # ships on GitHub's generated notes.
+      # (shared composite action). AI-only: this step FAILS the release with a
+      # descriptive error if OpenAI is unavailable, rather than shipping inferior
+      # notes. Requires the OPENAI_API_KEY secret.
       - name: Generate AI release notes
         id: notes
         uses: ./.github/actions/ai-release-notes
@@ -148,20 +148,11 @@ jobs:
           NOTES_FILE: ${{ steps.notes.outputs.notes-file }}
         run: |
           VERSION="${{ steps.bump.outputs.version }}"
-          if [ -n "${NOTES_FILE:-}" ]; then
-            gh release create "v${VERSION}" \
-              --title "v${VERSION}" \
-              --target main \
-              --notes-file "${NOTES_FILE}" \
-              dist/*
-          else
-            # No AI summary available: keep GitHub's generated notes.
-            gh release create "v${VERSION}" \
-              --title "v${VERSION}" \
-              --target main \
-              --generate-notes \
-              dist/*
-          fi
+          gh release create "v${VERSION}" \
+            --title "v${VERSION}" \
+            --target main \
+            --notes-file "${NOTES_FILE}" \
+            dist/*
 
       # Publish the VSCode extension to the Marketplace at the matching version, so a
       # CLI release and its extension move together. Skipped when VSCE_TOKEN is unset.

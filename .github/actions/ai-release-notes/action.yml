@@ -1,9 +1,10 @@
 name: AI release notes
 description: >
   Summarize the key changes since the previous release into Markdown release
-  notes using the OpenAI API. Outputs an empty notes-file (so the caller can
-  fall back to GitHub's generated notes) when no API key is set, the API call
-  fails, or there are no changes to describe — a release never depends on it.
+  notes using the OpenAI API. The notes are AI-only: if the OpenAI API is
+  unavailable (missing key, network error, HTTP error, or empty completion) the
+  action FAILS with a descriptive error so the release does not proceed with
+  inferior notes.
 
 inputs:
   version:
@@ -29,8 +30,8 @@ inputs:
 
 outputs:
   notes-file:
-    description: Path to the generated notes file, or empty if none were produced.
-    value: ${{ steps.assemble.outputs.notes-file }}
+    description: Path to the generated release notes file.
+    value: ${{ steps.summarize.outputs.notes-file }}
   previous-tag:
     description: The previous release tag the changes were computed against.
     value: ${{ steps.range.outputs.previous-tag }}
@@ -70,21 +71,39 @@ runs:
         cat changes.txt
 
     - name: Summarize changes with OpenAI
-      id: ai
+      id: summarize
       shell: bash
       env:
         OPENAI_API_KEY: ${{ inputs.openai-api-key }}
         OPENAI_MODEL: ${{ inputs.model }}
+        VERSION: ${{ inputs.version }}
+        REPO: ${{ inputs.repository }}
+        PREV: ${{ steps.range.outputs.previous-tag }}
       run: |
         set -euo pipefail
-        if [ ! -s changes.txt ]; then
-          echo "No changes to summarize; skipping."
-          exit 0
-        fi
+        # On any OpenAI unavailability, fail the release with a clear reason —
+        # both as an inline ::error:: annotation and in the run summary panel.
+        fail() {
+          echo "::error title=AI release notes unavailable::$1"
+          {
+            echo "## ❌ Release notes generation failed"
+            echo
+            echo "$1"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+        }
+
         if [ -z "${OPENAI_API_KEY:-}" ]; then
-          echo "OPENAI_API_KEY is not set; skipping the AI summary."
+          fail "The OPENAI_API_KEY secret is not set. Add it under Settings → Secrets and variables → Actions (repo or org), then re-run."
+        fi
+        if [ ! -s changes.txt ]; then
+          # No commits in range — a legitimately empty release, not an API
+          # failure. Emit a minimal note instead of calling the API.
+          printf '_No notable changes since %s._\n' "${PREV:-the previous release}" > release_notes.md
+          echo "notes-file=release_notes.md" >> "$GITHUB_OUTPUT"
           exit 0
         fi
+
         SYSTEM='You write concise GitHub release notes. You are given a list of commit subjects representing every change since the previous release. Output GitHub-flavored Markdown only, with no preamble or headings: one short summary sentence, then a bullet list of the KEY user-facing changes since the last release. Merge duplicates and closely related commits, and drop pure noise (merge commits, version bumps, formatting-only, CI-only, and internal refactors with no user impact). Order bullets by importance and keep it tight — aim for the 5-12 most important changes.'
         # Build the request with jq so commit text is safely JSON-encoded; a
         # crafted commit message cannot break out of the JSON or inject fields.
@@ -97,38 +116,31 @@ runs:
               {role: "system", content: $system},
               {role: "user", content: ("Summarize the key changes since the previous release from these commits:\n\n" + $commits)}
             ]}' > payload.json
+
         HTTP=$(curl -sS -o resp.json -w '%{http_code}' \
           https://api.openai.com/v1/chat/completions \
           -H "Authorization: Bearer ${OPENAI_API_KEY}" \
           -H "Content-Type: application/json" \
-          -d @payload.json) || true
-        if [ "${HTTP:-}" != "200" ]; then
-          echo "OpenAI request failed (HTTP ${HTTP:-none}); will fall back to generated notes."
-          cat resp.json 2>/dev/null || true
-          exit 0
-        fi
-        jq -r '.choices[0].message.content // empty' resp.json > ai_notes.md
-        echo "----- AI release notes -----"
-        cat ai_notes.md
+          -d @payload.json) \
+          || fail "Could not reach the OpenAI API (network error). Check connectivity and that api.openai.com is reachable from the runner."
 
-    - name: Assemble release notes
-      id: assemble
-      shell: bash
-      env:
-        VERSION: ${{ inputs.version }}
-        REPO: ${{ inputs.repository }}
-        PREV: ${{ steps.range.outputs.previous-tag }}
-      run: |
-        set -euo pipefail
-        if [ -s ai_notes.md ]; then
-          cp ai_notes.md release_notes.md
-          if [ -n "${PREV:-}" ]; then
-            {
-              echo
-              echo "**Full Changelog**: https://github.com/${REPO}/compare/${PREV}...v${VERSION}"
-            } >> release_notes.md
-          fi
-          echo "notes-file=release_notes.md" >> "$GITHUB_OUTPUT"
-        else
-          echo "notes-file=" >> "$GITHUB_OUTPUT"
+        if [ "${HTTP:-}" != "200" ]; then
+          MSG=$(jq -r '.error.message // empty' resp.json 2>/dev/null || true)
+          fail "OpenAI API returned HTTP ${HTTP:-unknown}.${MSG:+ Message: ${MSG}} (Common causes: invalid/expired key, no billing/credits, rate limit, or unknown model '"${OPENAI_MODEL}"'.)"
         fi
+
+        CONTENT=$(jq -r '.choices[0].message.content // empty' resp.json)
+        if [ -z "$CONTENT" ]; then
+          fail "OpenAI API returned a 200 response with an empty completion; no release notes were produced."
+        fi
+
+        printf '%s\n' "$CONTENT" > release_notes.md
+        if [ -n "${PREV:-}" ]; then
+          {
+            echo
+            echo "**Full Changelog**: https://github.com/${REPO}/compare/${PREV}...v${VERSION}"
+          } >> release_notes.md
+        fi
+        echo "notes-file=release_notes.md" >> "$GITHUB_OUTPUT"
+        echo "----- AI release notes -----"
+        cat release_notes.md
