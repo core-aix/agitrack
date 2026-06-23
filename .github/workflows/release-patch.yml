@@ -129,108 +129,33 @@ jobs:
           UV_PUBLISH_TOKEN: ${{ secrets.PYPI_TOKEN }}
         run: uv publish
 
-      # Collect the commit subjects of the PR whose merge triggered this run.
-      # Using the commits/<sha>/pulls API means this works regardless of how the
-      # PR was created or merged (squash, merge commit, or rebase) and does not
-      # depend on aGiTrack's commit format.
-      - name: Collect the merged PR's commits
-        id: prcommits
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          MERGE_SHA: ${{ github.event.head_commit.id }}
-          REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          NUM=$(gh api "repos/${REPO}/commits/${MERGE_SHA}/pulls" \
-                  --jq '.[0].number' 2>/dev/null || true)
-          if [ -z "${NUM:-}" ] || [ "${NUM}" = "null" ]; then
-            echo "No PR is associated with ${MERGE_SHA}; will fall back to generated notes."
-            echo "number=" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "number=${NUM}" >> "$GITHUB_OUTPUT"
-          # One bullet per commit (first line of each message), oldest to newest.
-          gh api --paginate "repos/${REPO}/pulls/${NUM}/commits" \
-            --jq '.[].commit.message | split("\n")[0] | "- " + .' > pr_commits.txt
-          echo "Commits in PR #${NUM}:"
-          cat pr_commits.txt
-
-      # Summarize those commits into a changelog with the OpenAI API. The request
-      # is built with jq so commit text is safely JSON-encoded (no injection from
-      # a crafted commit message). continue-on-error + the absent-key guard keep a
-      # release shipping even if the call fails — the next step falls back to
-      # GitHub's generated notes. Requires the OPENAI_API_KEY repository secret.
-      - name: Summarize changes with OpenAI
-        id: ai
-        if: steps.prcommits.outputs.number != ''
-        continue-on-error: true
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_MODEL: gpt-4o-mini
-        run: |
-          set -euo pipefail
-          if [ -z "${OPENAI_API_KEY:-}" ]; then
-            echo "OPENAI_API_KEY is not set; skipping the AI summary."
-            exit 0
-          fi
-          SYSTEM='You write concise GitHub release notes from a list of commit subjects in a single merged pull request. Output GitHub-flavored Markdown only, with no preamble or headings: an optional one-sentence summary line, then a bullet list of the meaningful, user-facing changes. Merge duplicates and drop pure noise (merge commits, version bumps, formatting-only or CI-only changes). Keep it tight.'
-          jq -n \
-            --arg model "$OPENAI_MODEL" \
-            --arg system "$SYSTEM" \
-            --rawfile commits pr_commits.txt \
-            '{model: $model, temperature: 0.3, max_tokens: 800,
-              messages: [
-                {role: "system", content: $system},
-                {role: "user", content: ("Summarize these commits into release notes:\n\n" + $commits)}
-              ]}' > payload.json
-          HTTP=$(curl -sS -o resp.json -w '%{http_code}' \
-            https://api.openai.com/v1/chat/completions \
-            -H "Authorization: Bearer ${OPENAI_API_KEY}" \
-            -H "Content-Type: application/json" \
-            -d @payload.json) || true
-          if [ "${HTTP:-}" != "200" ]; then
-            echo "OpenAI request failed (HTTP ${HTTP:-none}); will fall back to generated notes."
-            cat resp.json 2>/dev/null || true
-            exit 0
-          fi
-          jq -r '.choices[0].message.content // empty' resp.json > ai_notes.md
-          echo "----- AI release notes -----"
-          cat ai_notes.md
-
-      - name: Assemble release notes
+      # Summarize the key changes since the previous release with the OpenAI API
+      # (shared composite action). Produces an empty notes-file when the
+      # OPENAI_API_KEY secret is absent or the call fails, so the release still
+      # ships on GitHub's generated notes.
+      - name: Generate AI release notes
         id: notes
-        env:
-          VERSION: ${{ steps.bump.outputs.version }}
-          REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          if [ -s ai_notes.md ]; then
-            cp ai_notes.md release_notes.md
-            PREV=$(git describe --tags --abbrev=0 2>/dev/null || true)
-            if [ -n "$PREV" ]; then
-              {
-                echo
-                echo "**Full Changelog**: https://github.com/${REPO}/compare/${PREV}...v${VERSION}"
-              } >> release_notes.md
-            fi
-            echo "have_notes=1" >> "$GITHUB_OUTPUT"
-          else
-            echo "have_notes=0" >> "$GITHUB_OUTPUT"
-          fi
+        uses: ./.github/actions/ai-release-notes
+        with:
+          version: ${{ steps.bump.outputs.version }}
+          ref: HEAD
+          repository: ${{ github.repository }}
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
 
       - name: Create GitHub Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NOTES_FILE: ${{ steps.notes.outputs.notes-file }}
         run: |
           VERSION="${{ steps.bump.outputs.version }}"
-          if [ "${{ steps.notes.outputs.have_notes }}" = "1" ]; then
+          if [ -n "${NOTES_FILE:-}" ]; then
             gh release create "v${VERSION}" \
               --title "v${VERSION}" \
               --target main \
-              --notes-file release_notes.md \
+              --notes-file "${NOTES_FILE}" \
               dist/*
           else
-            # No PR found or the AI step failed: keep the previous behavior.
+            # No AI summary available: keep GitHub's generated notes.
             gh release create "v${VERSION}" \
               --title "v${VERSION}" \
               --target main \
