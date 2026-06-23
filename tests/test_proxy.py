@@ -7978,22 +7978,23 @@ def _update_runner(tmp_path):
     return runner
 
 
-def test_backend_auto_update_runs_unconfined_when_blocked_and_available(tmp_path, monkeypatch):
+def test_backend_auto_update_runs_unconfined_and_reports_version_change(tmp_path, monkeypatch):
     import agitrack.proxy.runner as runner_mod
 
     runner = _update_runner(tmp_path)
     runner.backend = types.SimpleNamespace(name="opencode", update_command=lambda: ["opencode", "upgrade"])
     runner._backend_self_update_blocked = lambda: True  # brew + macOS sandbox
-    runner._backend_update_available = lambda: True
+    runner._backend_version = lambda: next(versions)
+    versions = iter(["1.15.13", "1.17.9"])  # before, after — the upgrade landed
     captured = {}
 
     def fake_run(cmd, **kwargs):
         captured["cmd"] = cmd
-        return types.SimpleNamespace(returncode=0, stdout="From 1.15.13 -> 1.17.9\nUpgraded\n", stderr="")
+        return types.SimpleNamespace(returncode=0, stdout="Upgraded\n", stderr="")
 
     monkeypatch.setattr(runner_mod.subprocess, "run", fake_run)
 
-    runner._maybe_auto_update_backend()  # automatic — no menu, no prompt
+    runner._maybe_auto_update_backend()  # automatic — no menu, no prompt, no brew pre-check
     runner._backend_update_thread.join(2)
     # The updater is the RAW backend command — NOT wrapped in sandbox-exec/bwrap. It runs in
     # the unconfined proxy, so a brew updater's own sandbox isn't nested (the whole bug).
@@ -8001,40 +8002,65 @@ def test_backend_auto_update_runs_unconfined_when_blocked_and_available(tmp_path
     assert runner._backend_update_checked_for == "opencode"  # evaluated once; won't re-trigger
 
     runner._service_backend_update()
-    assert any("updated" in m.lower() for m in runner._msgs)
+    assert any("updated" in m.lower() and "1.17.9" in m for m in runner._msgs)
 
 
-def test_backend_auto_update_skips_when_self_update_not_blocked(tmp_path):
-    # An npm/native backend updates itself fine; aGiTrack must not touch it (no availability
-    # check, no upgrade).
-    runner = _update_runner(tmp_path)
-    runner.backend = types.SimpleNamespace(name="opencode", update_command=lambda: ["opencode", "upgrade"])
-    runner._backend_self_update_blocked = lambda: False
-    checked = []
-    runner._backend_update_available = lambda: checked.append(True) or True
-
-    runner._maybe_auto_update_backend()
-
-    assert runner._backend_update_thread is None
-    assert checked == []  # never even checked availability
-
-
-def test_backend_auto_update_skips_when_already_current(tmp_path, monkeypatch):
+def test_backend_auto_update_reports_up_to_date_when_version_unchanged(tmp_path, monkeypatch):
+    # The updater no-ops when current (version unchanged before/after) — don't claim an update.
     import agitrack.proxy.runner as runner_mod
 
     runner = _update_runner(tmp_path)
     runner.backend = types.SimpleNamespace(name="opencode", update_command=lambda: ["opencode", "upgrade"])
     runner._backend_self_update_blocked = lambda: True
-    runner._backend_update_available = lambda: False  # brew says it's current
+    runner._backend_version = lambda: "1.17.9"  # unchanged before and after
+    monkeypatch.setattr(
+        runner_mod.subprocess,
+        "run",
+        lambda *a, **k: types.SimpleNamespace(returncode=0, stdout="already on latest\n", stderr=""),
+    )
+
+    runner._maybe_auto_update_backend()
+    runner._backend_update_thread.join(2)
+    runner._service_backend_update()
+
+    assert any("up to date" in m for m in runner._msgs)
+    assert not any("updated (" in m for m in runner._msgs)
+
+
+def test_backend_auto_update_skips_when_self_update_not_blocked(tmp_path, monkeypatch):
+    # An npm/native backend updates itself fine; aGiTrack must not touch it (no upgrade run).
+    import agitrack.proxy.runner as runner_mod
+
+    runner = _update_runner(tmp_path)
+    runner.backend = types.SimpleNamespace(name="opencode", update_command=lambda: ["opencode", "upgrade"])
+    runner._backend_self_update_blocked = lambda: False
     ran = []
     monkeypatch.setattr(runner_mod.subprocess, "run", lambda *a, **k: ran.append(True))
 
     runner._maybe_auto_update_backend()
-    if runner._backend_update_thread is not None:
-        runner._backend_update_thread.join(2)
 
-    assert ran == []  # no pointless upgrade
-    assert runner._backend_update_result is None
+    assert runner._backend_update_thread is None
+    assert ran == []  # never ran the updater (or a version check)
+
+
+def test_backend_child_env_disables_opencode_autoupdate_when_agitrack_takes_over(tmp_path):
+    # When aGiTrack will apply the update itself (OpenCode's own updater is sandbox-blocked and
+    # update checks are on), the interactive child gets OPENCODE_DISABLE_AUTOUPDATE so OpenCode
+    # doesn't show its own prompt — which would only fail inside the sandbox.
+    runner = _update_runner(tmp_path)
+    runner.backend = types.SimpleNamespace(name="opencode")
+    runner.global_config = types.SimpleNamespace(check_for_updates=True)
+    runner._backend_self_update_blocked = lambda: True
+    assert runner._backend_child_env() == {"OPENCODE_DISABLE_AUTOUPDATE": "1"}
+
+    # npm/native (not sandbox-blocked) → leave OpenCode's own auto-update alone.
+    runner._backend_self_update_blocked = lambda: False
+    assert runner._backend_child_env() is None
+
+    # Update checks off → aGiTrack won't auto-update, so don't suppress OpenCode's either.
+    runner._backend_self_update_blocked = lambda: True
+    runner.global_config = types.SimpleNamespace(check_for_updates=False)
+    assert runner._backend_child_env() is None
 
 
 def test_backend_auto_update_respects_update_check_toggle(tmp_path):

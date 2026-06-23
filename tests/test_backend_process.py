@@ -145,6 +145,23 @@ def test_cleanup_terminates_child_via_signal_escalation():
             os.close(proc.master_fd)
 
 
+def test_spawn_applies_extra_env_to_child_only(tmp_path):
+    """extra_env reaches the forked child's environment but never the aGiTrack process."""
+    out = tmp_path / "env.txt"
+    proc = BackendProcess.spawn(
+        ["/bin/sh", "-c", f"printf '%s' \"$OPENCODE_DISABLE_AUTOUPDATE\" > {out}"],
+        cwd="/tmp",
+        extra_env={"OPENCODE_DISABLE_AUTOUPDATE": "1"},
+    )
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline and not (out.exists() and out.stat().st_size > 0):
+        time.sleep(0.05)
+    if proc.master_fd is not None:
+        os.close(proc.master_fd)
+    assert out.read_text() == "1"  # the child saw the injected var
+    assert "OPENCODE_DISABLE_AUTOUPDATE" not in os.environ  # parent env untouched
+
+
 def test_spawn_exec_failure_guard_exits_127():
     """A non-existent command must exit with code 127, not leave a duplicate runner."""
     proc = BackendProcess.spawn(["/nonexistent-command-agit-test"], cwd="/tmp")
