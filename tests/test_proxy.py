@@ -7965,3 +7965,73 @@ def test_no_worktree_mode_skips_worktree_setup(tmp_path):
     runner._setup_base_merge_only_session()
     assert runner.worktree is None
     assert not (tmp_path / ".agitrack" / "worktrees").exists()
+
+
+# --- backend self-update (Ctrl-G → agent-update) -----------------------------
+
+
+def _update_runner(tmp_path):
+    runner = make_runner(state=AgitrackState(tmp_path))
+    runner._set_message = lambda m, **k: runner._msgs.append(m)  # type: ignore[attr-defined]
+    runner._render = lambda *a, **k: None
+    runner._msgs = []  # type: ignore[attr-defined]
+    return runner
+
+
+def test_agent_update_skips_when_already_up_to_date(tmp_path):
+    runner = _update_runner(tmp_path)
+    runner.backend = types.SimpleNamespace(name="opencode", update_command=lambda: ["opencode", "upgrade"])
+    runner._backend_update_available = lambda: False  # confidently current
+
+    runner._handle_backend_update_command()
+
+    assert runner._backend_update_thread is None  # the slow upgrade was not started
+    assert any("up to date" in m for m in runner._msgs)
+
+
+def test_agent_update_runs_updater_unconfined_and_surfaces_result(tmp_path, monkeypatch):
+    import agitrack.proxy.runner as runner_mod
+
+    runner = _update_runner(tmp_path)
+    runner.backend = types.SimpleNamespace(name="opencode", update_command=lambda: ["opencode", "upgrade"])
+    runner._backend_update_available = lambda: True
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return types.SimpleNamespace(returncode=0, stdout="From 1.15.13 -> 1.17.9\nUpgraded\n", stderr="")
+
+    monkeypatch.setattr(runner_mod.subprocess, "run", fake_run)
+
+    runner._handle_backend_update_command()
+    runner._backend_update_thread.join(2)
+    # The updater is the RAW backend command — NOT wrapped in sandbox-exec/bwrap. It runs in
+    # the unconfined proxy, so a brew updater's own sandbox isn't nested (the whole bug).
+    assert captured["cmd"] == ["opencode", "upgrade"]
+
+    runner._service_backend_update()
+    assert any("updated" in m.lower() for m in runner._msgs)
+
+
+def test_service_backend_update_flags_failure_even_on_exit_zero(tmp_path):
+    # `opencode upgrade` exits 0 even when its brew step fails, so failure is read from output.
+    runner = _update_runner(tmp_path)
+    runner._backend_update_result = {
+        "name": "opencode",
+        "code": 0,
+        "output": "Upgrading...\n\x1b[2K■  Upgrade failed for brew (exit code 1).\n",
+    }
+
+    runner._service_backend_update()
+
+    assert any("may have failed" in m for m in runner._msgs)
+    assert any("Upgrade failed" in m for m in runner._msgs)
+
+
+def test_agent_update_reports_when_backend_has_no_updater(tmp_path):
+    runner = _update_runner(tmp_path)
+    runner.backend = types.SimpleNamespace(name="foo")  # no update_command attribute
+
+    runner._handle_backend_update_command()
+
+    assert any("no self-update" in m for m in runner._msgs)

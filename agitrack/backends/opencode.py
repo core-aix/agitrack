@@ -41,6 +41,9 @@ class OpenCodeBackend:
         # wrapper (e.g. ["somewrapper", "opencode"]); empty ⇒ run "opencode" directly.
         self.launch_command = list(launch_command or [])
 
+    def update_command(self) -> list[str] | None:
+        return [*(self.launch_command or ["opencode"]), "upgrade"]
+
     def run(
         self,
         prompt: str,
