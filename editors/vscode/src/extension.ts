@@ -401,18 +401,28 @@ async function reconcileRestoredTerminal(terminal: vscode.Terminal): Promise<voi
   }
   const key = folderKeyForTerminal(terminal);
   const pid = key ? readAgitrackPid(key) : undefined;
-  // The repo lock is the authoritative "aGiTrack is running for this folder" signal; the
-  // shell-child check is a belt-and-suspenders backstop so a live session is never closed.
-  const live = (pid !== undefined && isAlive(pid)) || (await shellHasChild(terminal));
-  if (live) {
+  // The repo lock is the authoritative "aGiTrack is running for this folder" signal — and
+  // aGiTrack holds it for the whole session (from startup, see cli.py). A revived terminal's
+  // shell is a FRESH process, so its children are never the (long-dead) aGiTrack; checking
+  // for shell children here only produced false positives that kept a bare leftover shell
+  // open, so we deliberately don't.
+  if (pid !== undefined && isAlive(pid)) {
     if (key && !terminals.has(key)) {
       terminals.set(key, terminal);
       launchedAt.set(terminal, Date.now());
       ourTerminals.add(terminal);
     }
-    return;
+    return; // a live aGiTrack still holds the lock — adopt it so the aG button focuses it
   }
-  terminal.dispose(); // a leftover shell with no aGiTrack — close the tab
+  // A leftover aGiTrack terminal with no live session: VSCode was closed/reloaded without
+  // exiting aGiTrack (a clean Ctrl-G → exit closes its terminal, so it is never restored).
+  // The revived tab is just a dead shell showing the old scrollback. Close it and relaunch
+  // aGiTrack so the session resumes automatically, rather than leaving a stale terminal.
+  terminal.dispose();
+  const folder = key ? vscode.workspace.workspaceFolders?.find((f) => f.uri.fsPath === key) : undefined;
+  if (folder) {
+    void startSession(folder.uri);
+  }
 }
 
 /** Whether `terminal`'s name marks it as an aGiTrack SESSION terminal (not a dashboard) —
