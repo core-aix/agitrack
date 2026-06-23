@@ -7712,6 +7712,13 @@ class ProxyRunner:
         self.active.process.signal_exit()
 
     def _handle_exit_signal(self, signum, _frame) -> None:
+        # A self-update is mid-flight (pip is uninstalling/reinstalling aGiTrack). Do
+        # NOT tear down: unwinding would abort the apply and could leave aGiTrack
+        # half-uninstalled. The upgrade runs in its own session (see updater) so this
+        # SIGHUP/SIGTERM never reached it; ignore the signal and let the apply +
+        # restart finish. (The user can still hard-kill with SIGKILL if truly stuck.)
+        if self._update_applying:
+            return
         self.running = False
         # Closing the terminal (the VSCode terminal, an SSH/Mosh session, a `kill`)
         # delivers SIGHUP/SIGTERM. Finalize pending work first so a just-completed turn
