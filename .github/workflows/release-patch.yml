@@ -8,6 +8,9 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  # Lets the release-notes step call GitHub Models (GitHub's built-in AI
+  # inference) with the default GITHUB_TOKEN — no extra API key needed.
+  models: read
 
 jobs:
   release:
@@ -129,16 +132,93 @@ jobs:
           UV_PUBLISH_TOKEN: ${{ secrets.PYPI_TOKEN }}
         run: uv publish
 
+      # Collect the commit subjects of the PR whose merge triggered this run.
+      # Using the commits/<sha>/pulls API means this works regardless of how the
+      # PR was created or merged (squash, merge commit, or rebase) and does not
+      # depend on aGiTrack's commit format.
+      - name: Collect the merged PR's commits
+        id: prcommits
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MERGE_SHA: ${{ github.event.head_commit.id }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          NUM=$(gh api "repos/${REPO}/commits/${MERGE_SHA}/pulls" \
+                  --jq '.[0].number' 2>/dev/null || true)
+          if [ -z "${NUM:-}" ] || [ "${NUM}" = "null" ]; then
+            echo "No PR is associated with ${MERGE_SHA}; will fall back to generated notes."
+            echo "number=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "number=${NUM}" >> "$GITHUB_OUTPUT"
+          # One bullet per commit (first line of each message), oldest to newest.
+          gh api --paginate "repos/${REPO}/pulls/${NUM}/commits" \
+            --jq '.[].commit.message | split("\n")[0] | "- " + .' > pr_commits.txt
+          echo "Commits in PR #${NUM}:"
+          cat pr_commits.txt
+
+      # Summarize those commits into a changelog with GitHub Models (GitHub's
+      # built-in AI). continue-on-error keeps a release shipping even if the
+      # inference call fails — the next step falls back to generated notes.
+      - name: Summarize changes with GitHub Models
+        id: ai
+        if: steps.prcommits.outputs.number != ''
+        continue-on-error: true
+        uses: actions/ai-inference@v1
+        with:
+          model: openai/gpt-4o
+          max-completion-tokens: 800
+          system-prompt: >
+            You write concise GitHub release notes from a list of commit
+            subjects in a single merged pull request. Output GitHub-flavored
+            Markdown only, with no preamble or headings: an optional one-sentence
+            summary line, then a bullet list of the meaningful, user-facing
+            changes. Merge duplicates and drop pure noise (merge commits, version
+            bumps, formatting-only or CI-only changes). Keep it tight.
+          prompt-file: pr_commits.txt
+
+      - name: Assemble release notes
+        id: notes
+        env:
+          AI_NOTES: ${{ steps.ai.outputs.response }}
+          VERSION: ${{ steps.bump.outputs.version }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ -n "${AI_NOTES//[[:space:]]/}" ]; then
+            printf '%s\n' "$AI_NOTES" > release_notes.md
+            PREV=$(git describe --tags --abbrev=0 2>/dev/null || true)
+            if [ -n "$PREV" ]; then
+              {
+                echo
+                echo "**Full Changelog**: https://github.com/${REPO}/compare/${PREV}...v${VERSION}"
+              } >> release_notes.md
+            fi
+            echo "have_notes=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_notes=0" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Create GitHub Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VERSION="${{ steps.bump.outputs.version }}"
-          gh release create "v${VERSION}" \
-            --title "v${VERSION}" \
-            --target main \
-            --generate-notes \
-            dist/*
+          if [ "${{ steps.notes.outputs.have_notes }}" = "1" ]; then
+            gh release create "v${VERSION}" \
+              --title "v${VERSION}" \
+              --target main \
+              --notes-file release_notes.md \
+              dist/*
+          else
+            # No PR found or the AI step failed: keep the previous behavior.
+            gh release create "v${VERSION}" \
+              --title "v${VERSION}" \
+              --target main \
+              --generate-notes \
+              dist/*
+          fi
 
       # Publish the VSCode extension to the Marketplace at the matching version, so a
       # CLI release and its extension move together. Skipped when VSCE_TOKEN is unset.
