@@ -314,7 +314,9 @@ def main(argv: list[str] | None = None) -> int:
     if backend_command_error:
         print(backend_command_error)
         return 1
-    _warn_backend_command_mismatch(effective_backend, backend_command)
+    if not _confirm_backend_command_mismatch(effective_backend, backend_command, scripted=scripted):
+        print("aGiTrack not started.")
+        return 1
 
     # Refuse a second instance on this repo up front — BEFORE the privacy prompt —
     # so the user isn't asked to acknowledge anything only to be turned away. The
@@ -395,27 +397,42 @@ def _resolve_backend_command(
     return (tokens, None)
 
 
-def _warn_backend_command_mismatch(backend: str, backend_command: list[str]) -> None:
-    """Warn when the launch command clearly names a *different* known backend than the
-    selected one (e.g. ``--backend claude --backend-command "wrap opencode"``). aGiTrack
-    tracks transcripts/sessions per the selected backend, so a wrapper that execs another
-    backend silently breaks that tracking. Only fires on an unambiguous mismatch — a known
-    backend name appears in the command but the selected one does not. An opaque wrapper
-    (no known backend named, e.g. ``mylauncher``) is left alone: aGiTrack does not guess
-    which backend it ultimately runs."""
+def _confirm_backend_command_mismatch(backend: str, backend_command: list[str], *, scripted: bool) -> bool:
+    """When the launch command clearly names a *different* known backend than the selected
+    one (e.g. ``--backend claude --backend-command "wrap opencode"``), warn and require
+    explicit confirmation before proceeding. aGiTrack tracks transcripts/sessions per the
+    selected backend, so a wrapper that execs another backend silently breaks that tracking
+    — the user must opt in. Returns True to proceed, False to abort.
+
+    Only an unambiguous mismatch prompts — a known backend name appears in the command but
+    the selected one does not. An opaque wrapper (no known backend named, e.g.
+    ``mylauncher``) or a consistent command proceeds silently. Without a way to ask
+    (scripted/non-interactive), the warning is printed and the run proceeds, since
+    automation can't answer a prompt and must not hang on one."""
     if not backend_command:
-        return
+        return True
     named = {os.path.basename(token) for token in backend_command}
     if backend in named:
-        return  # the command names the selected backend — consistent
+        return True  # the command names the selected backend — consistent
     others = sorted(named & (set(available_backends()) - {backend}))
-    if others:
-        print(
-            f"Warning: --backend is '{backend}' but the launch command names "
-            f"{', '.join(others)}. aGiTrack tracks sessions for '{backend}', so a wrapper "
-            f"that runs a different backend will break session/transcript tracking. Pass "
-            f"--backend {others[0]} (or set default_backend) if that's what you meant."
-        )
+    if not others:
+        return True  # opaque wrapper — don't guess which backend it runs
+    print(
+        f"Warning: --backend is '{backend}' but the launch command names "
+        f"{', '.join(others)}. aGiTrack tracks sessions for '{backend}', so a wrapper "
+        f"that runs a different backend will break session/transcript tracking. Pass "
+        f"--backend {others[0]} (or set default_backend) if that's what you meant."
+    )
+    if scripted or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return True  # can't prompt here; proceed with the warning rather than hang automation
+    # Drain any injected input first so a stray newline can't auto-confirm (same reason as
+    # the privacy acknowledgment): this must be a deliberate keypress.
+    _drain_terminal_input()
+    try:
+        answer = input(f"Proceed with backend '{backend}' anyway? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return answer in {"y", "yes"}
 
 
 def _warn_reserved_passthrough(backend: str, backend_args: list[str]) -> None:

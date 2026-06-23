@@ -439,6 +439,35 @@ def test_backend_command_mismatch_warns(monkeypatch, capsys):
     assert captured["backend_command"] == ["wrap", "opencode"]
 
 
+def test_backend_command_mismatch_aborts_when_declined(monkeypatch, capsys):
+    # Interactive run: a mismatch must be explicitly confirmed; declining (anything but
+    # y) aborts before the backend is ever launched.
+    captured = _stub_launch(monkeypatch)
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True)
+    monkeypatch.setattr(cli, "_drain_terminal_input", lambda: None)
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "n")
+    rc = cli.main(["--backend", "claude", "--backend-command", "wrap opencode"])
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "Warning" in out and "not started" in out
+    assert captured == {}  # the runner was never constructed
+
+
+def test_backend_command_mismatch_proceeds_when_confirmed(monkeypatch):
+    # Entering y proceeds with exactly the command the user asked for.
+    captured = _stub_launch(monkeypatch)
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True)
+    monkeypatch.setattr(cli, "_drain_terminal_input", lambda: None)
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "y")
+    rc = cli.main(["--backend", "claude", "--backend-command", "wrap opencode"])
+    assert rc == 0
+    assert captured["backend_command"] == ["wrap", "opencode"]
+
+
 def test_backend_command_naming_selected_backend_does_not_warn(monkeypatch, capsys):
     _stub_launch(monkeypatch)
     cli.main(["--backend", "claude", "--backend-command", "somewrapper claude"])

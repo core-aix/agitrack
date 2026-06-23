@@ -390,6 +390,8 @@ The value is split like a shell command and must ultimately exec the chosen back
 
 A `--backend-command` on the command line overrides the config value for that run. The wrapper applies wherever aGiTrack launches the agent — interactive proxy mode, scripted `--prompt` runs, and the per-turn summarizer.
 
+aGiTrack tracks sessions and transcripts for the **selected** backend (`--backend` / the saved default), so the wrapper must ultimately run that same backend. If the launch command clearly names a *different* known backend than the one selected (e.g. `--backend claude` with `--backend-command "wrap opencode"`), aGiTrack warns and asks you to confirm (`y`) before starting — running a different backend would break session tracking. An opaque wrapper that doesn't name a backend is accepted without prompting.
+
 
 
 ## Configuration
