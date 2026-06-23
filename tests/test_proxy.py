@@ -5200,6 +5200,30 @@ def test_fork_falls_back_to_blank_when_backend_cannot_share():
     assert runner._fork_current_session("x") is False  # forking not possible
 
 
+def test_prompt_new_session_inherits_current_backend():
+    # A blank new session must start in the SAME backend as the session it is
+    # created from — not the global default, which may differ (e.g. left at
+    # opencode while the user is coding in claude).
+    import types
+
+    runner = make_runner(name="main")
+    runner._render = lambda: None
+    runner._set_message = lambda *a, **k: None
+    # Active session is claude with no live conversation (so the fork option is
+    # not offered and the blank-session path is taken).
+    runner.state = types.SimpleNamespace(backend_session_id=None, backend="claude")
+    runner.backend = types.SimpleNamespace(name="claude", supports_session_sharing=False)
+    runner._prompt_session_name = lambda *a, **k: "new-one"
+    runner._prompt_new_session_base = lambda *, default=None: "main"
+    created: dict = {}
+    runner._new_session = lambda name, **kw: created.update(name=name, **kw)
+
+    assert runner._prompt_new_session() == runner._MENU_DONE
+    assert created["name"] == "new-one"
+    # The new session inherits the active session's backend, not the global default.
+    assert created["backend"] == "claude"
+
+
 def test_shared_resume_cancel_on_name_prompt_does_not_resume():
     runner = _shared_resume_runner()
     runner._prompt_session_name = lambda *a, **k: None  # user cancels naming
