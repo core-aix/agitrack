@@ -315,7 +315,7 @@ def test_claude_backend_bare_run_timeout_returns_unusable_result(monkeypatch, tm
 
 
 def test_backends_expose_self_update_command(tmp_path):
-    # aGiTrack runs these from its UNCONFINED proxy (Ctrl-G → agent-update) so a brew-based
+    # aGiTrack runs these from its UNCONFINED proxy (automatic backend update) so a brew-based
     # updater isn't nested inside the agent's macOS sandbox. A user launch wrapper is honored.
     from agitrack.backends.opencode import OpenCodeBackend
 

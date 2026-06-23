@@ -7967,7 +7967,7 @@ def test_no_worktree_mode_skips_worktree_setup(tmp_path):
     assert not (tmp_path / ".agitrack" / "worktrees").exists()
 
 
-# --- backend self-update (Ctrl-G → agent-update) -----------------------------
+# --- backend self-update (automatic, sandbox-blocked → run from the unconfined proxy) ---
 
 
 def _update_runner(tmp_path):
@@ -7978,22 +7978,12 @@ def _update_runner(tmp_path):
     return runner
 
 
-def test_agent_update_skips_when_already_up_to_date(tmp_path):
-    runner = _update_runner(tmp_path)
-    runner.backend = types.SimpleNamespace(name="opencode", update_command=lambda: ["opencode", "upgrade"])
-    runner._backend_update_available = lambda: False  # confidently current
-
-    runner._handle_backend_update_command()
-
-    assert runner._backend_update_thread is None  # the slow upgrade was not started
-    assert any("up to date" in m for m in runner._msgs)
-
-
-def test_agent_update_runs_updater_unconfined_and_surfaces_result(tmp_path, monkeypatch):
+def test_backend_auto_update_runs_unconfined_when_blocked_and_available(tmp_path, monkeypatch):
     import agitrack.proxy.runner as runner_mod
 
     runner = _update_runner(tmp_path)
     runner.backend = types.SimpleNamespace(name="opencode", update_command=lambda: ["opencode", "upgrade"])
+    runner._backend_self_update_blocked = lambda: True  # brew + macOS sandbox
     runner._backend_update_available = lambda: True
     captured = {}
 
@@ -8003,14 +7993,61 @@ def test_agent_update_runs_updater_unconfined_and_surfaces_result(tmp_path, monk
 
     monkeypatch.setattr(runner_mod.subprocess, "run", fake_run)
 
-    runner._handle_backend_update_command()
+    runner._maybe_auto_update_backend()  # automatic — no menu, no prompt
     runner._backend_update_thread.join(2)
     # The updater is the RAW backend command — NOT wrapped in sandbox-exec/bwrap. It runs in
     # the unconfined proxy, so a brew updater's own sandbox isn't nested (the whole bug).
     assert captured["cmd"] == ["opencode", "upgrade"]
+    assert runner._backend_update_checked_for == "opencode"  # evaluated once; won't re-trigger
 
     runner._service_backend_update()
     assert any("updated" in m.lower() for m in runner._msgs)
+
+
+def test_backend_auto_update_skips_when_self_update_not_blocked(tmp_path):
+    # An npm/native backend updates itself fine; aGiTrack must not touch it (no availability
+    # check, no upgrade).
+    runner = _update_runner(tmp_path)
+    runner.backend = types.SimpleNamespace(name="opencode", update_command=lambda: ["opencode", "upgrade"])
+    runner._backend_self_update_blocked = lambda: False
+    checked = []
+    runner._backend_update_available = lambda: checked.append(True) or True
+
+    runner._maybe_auto_update_backend()
+
+    assert runner._backend_update_thread is None
+    assert checked == []  # never even checked availability
+
+
+def test_backend_auto_update_skips_when_already_current(tmp_path, monkeypatch):
+    import agitrack.proxy.runner as runner_mod
+
+    runner = _update_runner(tmp_path)
+    runner.backend = types.SimpleNamespace(name="opencode", update_command=lambda: ["opencode", "upgrade"])
+    runner._backend_self_update_blocked = lambda: True
+    runner._backend_update_available = lambda: False  # brew says it's current
+    ran = []
+    monkeypatch.setattr(runner_mod.subprocess, "run", lambda *a, **k: ran.append(True))
+
+    runner._maybe_auto_update_backend()
+    if runner._backend_update_thread is not None:
+        runner._backend_update_thread.join(2)
+
+    assert ran == []  # no pointless upgrade
+    assert runner._backend_update_result is None
+
+
+def test_backend_auto_update_respects_update_check_toggle(tmp_path):
+    # Honors the same opt-out as aGiTrack's own self-update: if update checks are off, don't
+    # even probe whether the self-update is blocked.
+    runner = _update_runner(tmp_path)
+    runner.backend = types.SimpleNamespace(name="opencode", update_command=lambda: ["opencode", "upgrade"])
+    runner.global_config = types.SimpleNamespace(check_for_updates=False)
+    runner._backend_self_update_blocked = lambda: pytest.fail("should not probe when checks are off")
+
+    runner._maybe_auto_update_backend()
+
+    assert runner._backend_update_thread is None
 
 
 def test_service_backend_update_flags_failure_even_on_exit_zero(tmp_path):
@@ -8028,10 +8065,13 @@ def test_service_backend_update_flags_failure_even_on_exit_zero(tmp_path):
     assert any("Upgrade failed" in m for m in runner._msgs)
 
 
-def test_agent_update_reports_when_backend_has_no_updater(tmp_path):
+def test_backend_auto_update_noop_when_backend_has_no_updater(tmp_path):
+    # A backend without an update_command (or where it's blocked but returns nothing) simply
+    # isn't auto-updated — no thread, no error.
     runner = _update_runner(tmp_path)
     runner.backend = types.SimpleNamespace(name="foo")  # no update_command attribute
+    runner._backend_self_update_blocked = lambda: True
 
-    runner._handle_backend_update_command()
+    runner._maybe_auto_update_backend()
 
-    assert any("no self-update" in m for m in runner._msgs)
+    assert runner._backend_update_thread is None

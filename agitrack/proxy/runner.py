@@ -124,6 +124,11 @@ def _strip_ansi(text: str) -> str:
     return _ANSI_CSI_OSC_RE.sub("", text).replace("\r", "\n")
 
 
+# Sentinel: the summarizer-model picker was dismissed (Esc), distinct from a real None choice
+# ("same as the session model"). Lets _choose_summarizer_model report "no change" unambiguously.
+_NO_MODEL_PICK = object()
+
+
 def _homebrew_formula(real_path: str) -> str | None:
     """The Homebrew formula name for a keg path (…/Cellar/<formula>/<version>/…), or None if
     the path isn't a Homebrew keg. Used to ask `brew outdated <formula>`."""
@@ -239,8 +244,6 @@ class ProxyInput:
     COMMANDS = [
         "sessions",
         "agent-backend",
-        "agent-update",
-        "summarizer",
         "git-unstaged",
         "git-user-commit",
         "dashboard",
@@ -633,14 +636,14 @@ class ProxyRunner:
         self._summary_pending: dict | None = None  # {"sha", "since"} while a summary is being computed
         self._precompact_thread: threading.Thread | None = None  # background pre-compaction summary worker
         self._precompact_result: dict | None = None
-        # Ctrl-G → "agent-update": the backend's own self-update, run from aGiTrack's UNCONFINED
-        # proxy (not the sandboxed agent) on a background thread, plus the finished result the
-        # main loop surfaces. One at a time. See _handle_backend_update_command.
+        # Automatic backend self-update: when the agent's own updater is sandbox-blocked,
+        # aGiTrack runs it from its UNCONFINED proxy (not the sandboxed agent) on a background
+        # thread, plus the finished result the main loop surfaces. See _maybe_auto_update_backend.
         self._backend_update_thread: threading.Thread | None = None
         self._backend_update_result: dict | None = None
-        # Name of the backend we've already evaluated for the "self-update is sandbox-blocked,
-        # use agent-update" hint. Switching to a different backend re-evaluates (once).
-        self._backend_update_hint_checked_for: str | None = None
+        # Name of the backend we've already evaluated for an automatic self-update (when its own
+        # updater is sandbox-blocked). Switching to a different backend re-evaluates (once).
+        self._backend_update_checked_for: str | None = None
         self._base_poll_at = 0.0  # throttle for the base-HEAD poll
         self._warned_backend_session = False  # one-shot "use agit to start sessions" notice
         # Auto-share (issue #55): for sessions the user opted to keep shared, the
@@ -916,7 +919,7 @@ class ProxyRunner:
                 "_auto_share_thread": None,
                 "_backend_update_thread": None,
                 "_backend_update_result": None,
-                "_backend_update_hint_checked_for": None,
+                "_backend_update_checked_for": None,
                 "_sessions_with_activity": set(),
                 "_cancel_prompted": set(),
                 "_copy_prompted": {},
@@ -1095,7 +1098,7 @@ class ProxyRunner:
             signal.signal(signal.SIGTERM, self._handle_exit_signal)
             signal.signal(signal.SIGHUP, self._handle_exit_signal)
             self._setup_worktree_confinement_notice()
-            exit_code = self._loop()  # the timers phase surfaces the 'agent-update' hint when relevant
+            exit_code = self._loop()  # the timers phase auto-applies a sandbox-blocked backend update
         finally:
             if self.original_sigwinch is not None:
                 signal.signal(signal.SIGWINCH, self.original_sigwinch)
@@ -1926,7 +1929,7 @@ class ProxyRunner:
         a Homebrew-managed CLI updates via `brew upgrade`, which runs Homebrew's own
         `sandbox-exec` — and macOS forbids nesting that inside the agent's worktree sandbox.
         (npm/native installs self-update fine; only the brew-under-sandbox combination breaks.)
-        When true, the fix is Ctrl-G → 'agent-update', which runs the updater UNCONFINED."""
+        When true, aGiTrack applies the update itself from its UNCONFINED proxy."""
         if not self._sandbox or sys.platform != "darwin" or not sandbox.is_available():
             return False
         exe = shutil.which(self.backend.name)
@@ -1957,77 +1960,58 @@ class ProxyRunner:
             return None
         return formula in proc.stdout.split()
 
-    def _maybe_hint_backend_update(self) -> None:
-        """Notice (once per backend, re-armed on a backend switch): if the backend's own
-        self-update is blocked by confinement (brew + macOS sandbox) AND an update is actually
-        available, point the user at the working in-app path instead of the failing in-backend
-        updater. Evaluated lazily off the timers phase so it also fires after a switch."""
+    def _maybe_auto_update_backend(self) -> None:
+        """Timers phase: when the backend's OWN self-update can't run under aGiTrack's sandbox
+        (brew + macOS) AND a newer version is available, apply it AUTOMATICALLY from the
+        UNCONFINED proxy — no menu, no prompt. Evaluated once per backend (re-armed on a
+        switch) and gated by the global update-check toggle. The brew/version checks and the
+        upgrade itself shell out, so they run on a background thread; the result is surfaced by
+        _service_backend_update."""
         name = getattr(self.backend, "name", None)
-        if name is None or self._backend_update_hint_checked_for == name:
+        if name is None or self._backend_update_checked_for == name:
             return
+        self._backend_update_checked_for = name  # evaluate each backend once (re-armed on switch)
+        if self.global_config is not None and not getattr(self.global_config, "check_for_updates", True):
+            return  # the user turned update checks off
         if not self._backend_self_update_blocked():
-            self._backend_update_hint_checked_for = name  # not blocked → don't re-check this backend
+            return  # the backend self-updates fine on its own; leave it to do so
+        if self._backend_update_thread is not None and self._backend_update_thread.is_alive():
             return
-        # The availability check shells out to `brew outdated`; do it off the main thread so the
-        # reactor never blocks, then surface the hint on a later tick once the answer is in.
-        threading.Thread(target=self._resolve_backend_update_hint, args=(name,), daemon=True).start()
-        self._backend_update_hint_checked_for = name
-
-    def _resolve_backend_update_hint(self, name: str) -> None:
-        if self._backend_update_available() is False:
-            return  # confidently up to date — nothing to nag about
-        self._set_message(
-            f"{name}'s own self-update can't run inside aGiTrack's sandbox "
-            f"(Homebrew's installer can't sandbox within a sandbox). To update it, use "
-            f"{self._menu_label()} → 'agent-update'.",
-            seconds=14.0,
-        )
-        self._render()
-
-    def _handle_backend_update_command(self) -> None:
-        # Ctrl-G → "agent-update": run the backend CLI's own updater (e.g. `opencode upgrade`)
-        # from aGiTrack's UNCONFINED proxy — NOT the worktree-sandboxed agent. That keeps a
-        # package-manager updater (notably Homebrew's own sandbox-exec) from being nested
-        # inside the agent's macOS sandbox, which macOS forbids and which is exactly what
-        # breaks the backend's in-app self-update. Runs on a background thread so the long
-        # download never blocks the TUI; the result is surfaced by _service_backend_update.
         cmd = self._backend_update_command()
         if cmd is None:
-            self._set_message(f"{self.backend.name} has no self-update command.")
-            self._render()
             return
-        if self._backend_update_thread is not None and self._backend_update_thread.is_alive():
-            self._set_message(f"An update of {self.backend.name} is already running…")
-            self._render()
+        thread = threading.Thread(
+            target=self._auto_update_backend_worker, args=(name, cmd), daemon=True, name="agit-backend-update"
+        )
+        self._backend_update_thread = thread
+        thread.start()
+
+    def _auto_update_backend_worker(self, name: str, cmd: list[str]) -> None:
+        # Background: only apply when a newer version is actually available (don't run a pointless
+        # upgrade), then run the backend's own updater UNCONFINED so a package-manager updater
+        # (notably Homebrew's own sandbox-exec) isn't nested inside the agent's macOS sandbox —
+        # the very nesting macOS forbids, which is what breaks the in-backend self-update.
+        if self._backend_update_available() is not True:
             return
-        name = self.backend.name
-        if self._backend_update_available() is False:
-            self._set_message(f"{name} is already up to date.")
-            self._render()
-            return
-        cwd = str(getattr(self.base_repo, "repo", None) or getattr(self.repo, "repo", "."))
         self._set_message(
-            f"Updating {name} (running '{' '.join(cmd)}' outside aGiTrack's sandbox)… this can take a minute.",
+            f"Updating {name} to the latest version in the background "
+            f"(its own updater can't run inside aGiTrack's sandbox)…",
             seconds=600.0,
             sticky=True,
         )
         self._render()
-
-        def worker() -> None:
-            result: dict = {"name": name}
-            try:
-                proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=600)
-                result["code"] = proc.returncode
-                result["output"] = (proc.stdout or "") + (proc.stderr or "")
-            except Exception as error:
-                result["error"] = repr(error)
-            self._backend_update_result = result
-
-        self._backend_update_thread = threading.Thread(target=worker, daemon=True, name="agit-backend-update")
-        self._backend_update_thread.start()
+        cwd = str(getattr(self.base_repo, "repo", None) or getattr(self.repo, "repo", "."))
+        result: dict = {"name": name}
+        try:
+            proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=600)
+            result["code"] = proc.returncode
+            result["output"] = (proc.stdout or "") + (proc.stderr or "")
+        except Exception as error:
+            result["error"] = repr(error)
+        self._backend_update_result = result
 
     def _service_backend_update(self) -> None:
-        """Main loop: surface a finished `agent-update` result (set by its worker thread)."""
+        """Main loop: surface a finished backend auto-update result (set by its worker thread)."""
         result = self._backend_update_result
         if result is None:
             return
@@ -2146,9 +2130,9 @@ class ProxyRunner:
             self._set_message(f"Already using {name}.")
             self._render()
             return
-        # Re-arm the "self-update is sandbox-blocked → use agent-update" hint so it re-evaluates
-        # for the backend being switched to (the update can be applied on switch too).
-        self._backend_update_hint_checked_for = None
+        # Re-arm the automatic self-update check so it re-evaluates for the backend being
+        # switched to (a sandbox-blocked update is then applied on switch too).
+        self._backend_update_checked_for = None
         self.global_config.default_backend = name
         if self.worktree is None:
             # A non-worktree session has nothing to multiplex; restart the single
@@ -2994,10 +2978,12 @@ class ProxyRunner:
                 self._select_summarizer_model_popup()
             self._render()
 
-    def _select_summarizer_model_popup(self) -> None:
-        # List the current backend's models as a picker. For Claude the smallest
-        # (Haiku) tier is offered first as the default, since summarization is a cheap
-        # task. Backends whose models can't be listed fall back to free-text entry.
+    def _choose_summarizer_model(self) -> "str | None | object":
+        """Show the summarizer-model picker and RETURN the chosen model name, None for "same as
+        the session model", or ``_NO_MODEL_PICK`` if the user backed out. Does not persist — so
+        both the immediate popup and the settings menu's pending-save flow can reuse it. Lists
+        the current backend's models (smallest tier first as the cheap default); a backend whose
+        models can't be listed falls back to free-text entry."""
         from agitrack.summaries.model_select import list_available_models, smallest_model
 
         backend_name = self.state.backend
@@ -3016,20 +3002,21 @@ class ProxyRunner:
             label_for[clear_label] = None
             options.append(clear_label)
             choice = self._select_popup(f"Summarizer model (current: {current or 'same as session'})", options)
-            if choice is not None:
-                self._persist_summarizer_model(label_for.get(choice, choice))
-                self._set_message(f"Summarizer model: {self.global_config.summarization_model or '(same as session)'}")
-            self._render()
-            return
-        # No model list available (the backend's CLI couldn't be queried) — let the
-        # user type a model name, as before.
-        new_model = self._prompt_popup(
+            return _NO_MODEL_PICK if choice is None else label_for.get(choice, choice)
+        # No model list available (the backend's CLI couldn't be queried) — type a name.
+        raw = self._prompt_popup(
             "Summarizer Model",
             f"Current: {current or '(same as session)'}\nEnter model (empty to clear):",
             default=current or "",
         )
-        if new_model is not None:
-            self._persist_summarizer_model(new_model.strip() or None)
+        return _NO_MODEL_PICK if raw is None else (raw.strip() or None)
+
+    def _select_summarizer_model_popup(self) -> None:
+        # Pick a model and persist it immediately (the `:summarizer model` path). The settings
+        # menu instead stores the same choice as a pending edit (see _edit_one_setting).
+        chosen = self._choose_summarizer_model()
+        if chosen is not _NO_MODEL_PICK:
+            self._persist_summarizer_model(chosen if chosen is None else str(chosen))
             self._set_message(f"Summarizer model: {self.global_config.summarization_model or '(same as session)'}")
         self._render()
 
@@ -5972,8 +5959,8 @@ class ProxyRunner:
             # restart; stop before any further servicing.
             return
         self._service_background_share_ops()  # surface finished background unshare/etc. results
-        self._service_backend_update()  # surface a finished 'agent-update' (backend self-update)
-        self._maybe_hint_backend_update()  # once per (re-armed on switch) backend; cheap when checked
+        self._service_backend_update()  # surface a finished backend auto-update result
+        self._maybe_auto_update_backend()  # auto-apply a sandbox-blocked backend update; once per backend
         self._service_session_notices()  # expire/refresh per-session status lines
         self._git_wake.set()  # nudge the worker so its pass tracks the reactor's cadence
 
@@ -6610,14 +6597,8 @@ class ProxyRunner:
         elif name == "sessions":
             self._after_menu_command(self._handle_session_command(arg))
             return
-        elif name == "summarizer":
-            self._after_menu_command(self._handle_summarizer_command(arg))
-            return
         elif name == "settings":
             self._after_menu_command(self._settings_menu())
-            return
-        elif name == "agent-update":
-            self._handle_backend_update_command()
             return
         elif name == "update":
             self._handle_update_command()
@@ -6706,7 +6687,7 @@ class ProxyRunner:
                 "restart": True,
             },
             {"key": "summarization_enabled", "label": "Write an AI summary for each commit", "kind": "bool"},
-            {"key": "summarization_model", "label": "Model used to write commit summaries", "kind": "text"},
+            {"key": "summarization_model", "label": "Model used to write commit summaries", "kind": "model"},
             {"key": "check_for_updates", "label": "Automatically check for aGiTrack updates", "kind": "bool"},
             {
                 "key": "menu_key",
@@ -6782,6 +6763,11 @@ class ProxyRunner:
                 if pick is None or pick.startswith("←"):
                     return
                 value = pick
+            elif kind == "model":
+                chosen = self._choose_summarizer_model()  # picker (smallest tier first) or free-text
+                if chosen is _NO_MODEL_PICK:
+                    return
+                value = chosen
             elif kind == "paths":
                 current = self._pending_paths(key)
                 raw = self._prompt_popup(
