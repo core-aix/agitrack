@@ -75,6 +75,17 @@ def test_status_line_reserves_the_bottom_row(tmp_path):
     assert b"\x1b[7m" in rendered
 
 
+def test_render_addresses_rows_absolutely_so_a_stale_size_cannot_scroll(tmp_path):
+    # Each body row and the status bar are placed with an absolute cursor move, not by
+    # walking down with \r\n. That way, if `rows` is briefly larger than the real terminal
+    # (a shrink not yet observed), the bottom write clamps to the last row instead of
+    # scrolling the alt screen — which is what smeared a ghost status bar toward the top.
+    runner = _render_runner(tmp_path, rows=10, cols=40, name="sx")
+    rendered = _feed_and_render(runner, b"hello\r\n").decode()
+    assert "\x1b[10;1H" in rendered  # status bar placed on the reserved bottom row absolutely
+    assert "\r\n" not in rendered  # no newline walking, so an over-large `rows` can't scroll
+
+
 @pytest.mark.parametrize("cols", [20, 80, 120])
 def test_screen_width_tracks_terminal_columns(tmp_path, cols):
     # The pyte screen must be sized to the host width, so a line longer than the width

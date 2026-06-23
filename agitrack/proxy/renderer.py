@@ -174,6 +174,42 @@ def _home_relative(path: str) -> str:
     return text
 
 
+_OSC_RGB_RE = re.compile(r"rgb:([0-9a-fA-F]+)/([0-9a-fA-F]+)/([0-9a-fA-F]+)")
+_HEX6_RE = re.compile(r"#?([0-9a-fA-F]{6})\b")
+
+
+def _host_bg_is_dark(host) -> bool:
+    """Whether the terminal background is dark, read from its OSC-11 colour (``host_bg_value``).
+    Defaults to dark when unknown/unparseable — the common terminal default — so a popup's
+    accent colour can be chosen to contrast the background."""
+    raw = getattr(host, "host_bg_value", None)
+    if not raw:
+        return True
+    try:
+        text = raw.decode("ascii", "ignore") if isinstance(raw, (bytes, bytearray)) else str(raw)
+    except Exception:
+        return True
+    match = _OSC_RGB_RE.search(text)
+    if match:
+        red, green, blue = (int(group[:2], 16) for group in match.groups())  # high byte of each component
+    else:
+        hex_match = _HEX6_RE.search(text)
+        if not hex_match:
+            return True
+        value = hex_match.group(1)
+        red, green, blue = int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
+    return (0.299 * red + 0.587 * green + 0.114 * blue) < 128
+
+
+def _box_accent_sgr(host) -> str:
+    """A bold SGR that colours a popup's border so the box stands out — a hue chosen to
+    contrast the terminal background and encoded for its colour depth (via ``hex_color_code``).
+    Only the border is coloured; the box's text keeps the default colour so it stays legible
+    against whatever the terminal background is."""
+    accent = "5ee7df" if _host_bg_is_dark(host) else "005f87"  # bright cyan on dark, deep blue on light
+    return "\x1b[1;" + host.hex_color_code(accent, foreground=True) + "m"
+
+
 class _BackgroundColorEraseScreen(pyte.HistoryScreen):
     # pyte erases cells using the cursor's *full* SGR attributes, so a backend
     # that clears the screen (or a line) while underline — or any glyph
@@ -686,8 +722,16 @@ class ScreenRenderer:
         scroll: int = 0,
     ) -> None:
         inner = max(width - 2, 1)
-        border_top = "┌" + "─" * inner + "┐"
-        border_bottom = "└" + "─" * inner + "┘"
+        # A heavy, accent-coloured frame so the popup (and the Ctrl-G menu, which uses this
+        # same box) reads as a distinct panel over the backend's screen rather than blending
+        # in. The accent contrasts the terminal background; the interior text is left at the
+        # default colour so it stays readable. The escapes carry no visible width, so the
+        # box geometry is unchanged.
+        accent = _box_accent_sgr(self)
+        reset = "\x1b[0m"
+        edge = f"{accent}┃{reset}"
+        border_top = f"{accent}┏{'━' * inner}┓{reset}"
+        border_bottom = f"{accent}┗{'━' * inner}┛{reset}"
         box_lines = [border_top]
         # Each wrapped row is (text, pre_rendered): a row carrying **bold** markup is
         # wrapped + padded + SGR-rendered up front (its escapes have no visible width,
@@ -710,13 +754,13 @@ class ScreenRenderer:
             wrapped_lines = head + wrapped_lines[start : start + body] + tail
         for line, pre_rendered in wrapped_lines[:max_body]:
             if pre_rendered:
-                box_lines.append("│" + line + "│")
+                box_lines.append(f"{edge}{line}{edge}")
                 continue
             content = line[:inner].ljust(inner)
             if highlight and line == highlight:
-                box_lines.append("│" + "\x1b[7m" + content + "\x1b[0m" + "│")
+                box_lines.append(f"{edge}\x1b[7m{content}\x1b[0m{edge}")
             else:
-                box_lines.append("│" + content + "│")
+                box_lines.append(f"{edge}{content}{edge}")
         box_lines.append(border_bottom)
         for offset, line in enumerate(box_lines):
             if row + offset >= rows:
@@ -823,10 +867,18 @@ class ScreenRenderer:
         # fall back to the previous (unwrapped) full-repaint behaviour.
         parts = ["\x1b[?2026h\x1b[0m\x1b[?25l\x1b[H"]
         selection = self.selection_ranges(cols)
-        for index, cells in enumerate(self.visible_lines(rows)):
-            parts.append("\x1b[0m" + self.render_line(cells, selection.get(index), cols=cols))
-            parts.append("\r\n")
-        parts.append(status_line_str)
+        # Address every row absolutely instead of walking down with \r\n. If `rows` is
+        # momentarily LARGER than the real terminal (a shrink not yet observed via
+        # SIGWINCH), a trailing \r\n on the bottom row SCROLLS the alt screen, so the status
+        # bar — written at the bottom — drifts up a row each frame and leaves a ghost copy
+        # near the top (the "status bar at top AND bottom" glitch). Absolute moves clamp to
+        # the terminal's last row instead: an over-large `rows` just overwrites the bottom
+        # row and never scrolls, so a stale geometry can't smear the status bar up the screen.
+        body = self.visible_lines(rows)
+        for index, cells in enumerate(body):
+            parts.append(f"\x1b[{index + 1};1H\x1b[0m" + self.render_line(cells, selection.get(index), cols=cols))
+        # The status bar owns the reserved row just below the body, addressed absolutely too.
+        parts.append(f"\x1b[{len(body) + 1};1H" + status_line_str)
         if input_capturing:
             self.append_command_palette(
                 parts,
