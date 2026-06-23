@@ -429,6 +429,29 @@ def test_backend_command_invalid_value_fails_fast(monkeypatch, capsys):
     assert "backend-command" in capsys.readouterr().out.lower()
 
 
+def test_backend_command_mismatch_warns(monkeypatch, capsys):
+    captured = _stub_launch(monkeypatch)
+    rc = cli.main(["--backend", "claude", "--backend-command", "wrap opencode"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Warning" in out and "opencode" in out and "claude" in out
+    # The launch still goes through with exactly what the user asked for.
+    assert captured["backend_command"] == ["wrap", "opencode"]
+
+
+def test_backend_command_naming_selected_backend_does_not_warn(monkeypatch, capsys):
+    _stub_launch(monkeypatch)
+    cli.main(["--backend", "claude", "--backend-command", "somewrapper claude"])
+    assert "Warning" not in capsys.readouterr().out
+
+
+def test_backend_command_opaque_wrapper_does_not_warn(monkeypatch, capsys):
+    # A wrapper that doesn't name any known backend is left alone (no guessing).
+    _stub_launch(monkeypatch)
+    cli.main(["--backend", "claude", "--backend-command", "mylauncher --flag"])
+    assert "Warning" not in capsys.readouterr().out
+
+
 def test_proxy_runner_stores_backend_command(tmp_path):
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
     subprocess.run(["git", "-C", str(tmp_path), "commit", "-q", "--allow-empty", "-m", "init"], check=True)
