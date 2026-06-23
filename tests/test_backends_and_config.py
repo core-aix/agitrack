@@ -137,7 +137,10 @@ def test_make_proxy_agent_raises_on_unknown_backend():
 def test_global_config_default_backend_persists(tmp_path):
     path = tmp_path / "config.json"
     config = GlobalConfig(path)
-    assert config.default_backend == "opencode"
+    # No silent fallback: an unconfigured default reads as None (the caller must
+    # prompt/error), rather than quietly resolving to a hardcoded backend.
+    assert config.default_backend is None
+    assert config.has_default_backend() is False
     config.default_backend = "claude"
     assert GlobalConfig(path).default_backend == "claude"
     assert json.loads(path.read_text())["default_backend"] == "claude"
