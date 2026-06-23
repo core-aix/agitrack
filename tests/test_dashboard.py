@@ -877,6 +877,14 @@ def test_web_dashboard_embeds_token_hierarchy_and_cache_note(tmp_path):
     # categories (so it lines up), and the log-scale hint is prefixed with "Note:".
     assert 'barRow("summarizer", "aGiTrack\'s own calls"' in html
     assert "Note: bar widths are log-scaled" in html
+    # Bars scale between the SMALLEST and largest value (not a fixed 0 baseline), so widths
+    # spread across the full track — width maps [min, max] → [0, 100].
+    assert "function barWidth(value, max, min)" in html
+    assert "const minLog = logs.length ? Math.min(...logs) : 0" in html
+    # Log-scaled token bars are visually distinguished from the linear bars: a striped fill
+    # plus a "log" tag.
+    assert ".bar i.log{background-image:repeating-linear-gradient" in html
+    assert '<span class="logtag">log</span>' in html
 
 
 def test_filter_bar_is_single_row_with_a_custom_range_popup(tmp_path):
