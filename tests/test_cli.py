@@ -112,6 +112,15 @@ def _stub_repo_and_free_lock(monkeypatch):
         def __init__(self, _path):
             pass
 
+        def acquire(self):
+            return True  # nobody else holds it — we take it
+
+        def release(self):
+            pass
+
+        def owner_pid(self):
+            return None
+
         def probe_owner(self):
             return None
 
@@ -157,6 +166,15 @@ def test_already_running_refused_before_privacy_prompt(monkeypatch, capsys):
 
     class _HeldLock:
         def __init__(self, _path):
+            pass
+
+        def acquire(self):
+            return False  # another instance holds it — refuse
+
+        def owner_pid(self):
+            return 4321
+
+        def release(self):
             pass
 
         def probe_owner(self):
@@ -560,7 +578,7 @@ def test_proxy_runner_stores_backend_command(tmp_path):
     subprocess.run(["git", "-C", str(tmp_path), "commit", "-q", "--allow-empty", "-m", "init"], check=True)
     from agitrack.proxy.runner import ProxyRunner
 
-    runner = ProxyRunner(GitRepo(tmp_path), backend_command=["somewrapper", "opencode"])
+    runner = ProxyRunner(GitRepo(tmp_path), backend="opencode", backend_command=["somewrapper", "opencode"])
     assert runner._backend_command == ["somewrapper", "opencode"]
     # The launch command flows into the spawned command's executable head.
     assert runner._launch_command() == ["somewrapper", "opencode"]
@@ -573,7 +591,7 @@ def test_proxy_runner_stores_backend_args(tmp_path):
     subprocess.run(["git", "-C", str(tmp_path), "commit", "-q", "--allow-empty", "-m", "init"], check=True)
     from agitrack.proxy.runner import ProxyRunner
 
-    runner = ProxyRunner(GitRepo(tmp_path), backend_args=["--port", "9999"])
+    runner = ProxyRunner(GitRepo(tmp_path), backend="opencode", backend_args=["--port", "9999"])
     assert runner._backend_args == ["--port", "9999"]
     # _spawn appends them after spawn_command; verify that composition directly.
     base = ["opencode", str(tmp_path)]

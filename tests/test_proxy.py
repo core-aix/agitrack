@@ -7897,7 +7897,7 @@ def test_real_init_defines_all_lifecycle_flags(tmp_path):
     sp.run(["git", "-C", str(tmp_path), "commit", "-q", "--allow-empty", "-m", "init"], check=True)
     from agitrack.git import GitRepo
 
-    runner = ProxyRunner(GitRepo(tmp_path))
+    runner = ProxyRunner(GitRepo(tmp_path), backend="claude")
     for flag in (
         "_monitor_base_edits",
         "_base_check_at",
@@ -7920,7 +7920,7 @@ def test_no_worktree_mode_skips_worktree_setup(tmp_path):
     from agitrack.git import GitRepo
     from agitrack.proxy.runner import ProxyRunner
 
-    runner = ProxyRunner(GitRepo(tmp_path), use_worktrees=False)
+    runner = ProxyRunner(GitRepo(tmp_path), use_worktrees=False, backend="claude")
     runner._base_branch = "main"
     runner._setup_base_merge_only_session()
     assert runner.worktree is None
