@@ -4,8 +4,10 @@ import base64
 import hashlib
 import os
 from agitrack.env import getenv_compat
+import queue
 import re
 import select
+import shlex
 import shutil
 import signal
 import subprocess
@@ -38,7 +40,7 @@ from agitrack.commits import (
 from agitrack.git import GitRepo
 from agitrack.config import GlobalConfig
 from agitrack.git import RepoLock, already_running_message
-from agitrack.proxy import sandbox
+from agitrack.proxy import host_prompt, sandbox
 from agitrack.config import AgitrackState
 from agitrack.git import WorktreeInfo, WorktreeManager, _sanitize_name, is_managed_branch
 from agitrack.proxy.commit_engine import CommitEngine
@@ -172,9 +174,12 @@ def _short_session(session_id: str | None) -> str:
 class RepoChangeHandler(FileSystemEventHandler):
     IGNORED_PARTS = {".agitrack", ".git", ".pytest_cache", ".venv", "__pycache__"}
 
-    def __init__(self, repo_path, changed: threading.Event) -> None:
+    def __init__(self, repo_path, changed: threading.Event, wake: "threading.Event | None" = None) -> None:
         self.repo_path = repo_path
         self.changed = changed
+        # The git worker sleeps on `wake`; setting it lets a real worktree write
+        # wake the worker at once instead of waiting for its poll timeout.
+        self.wake = wake
 
     def on_any_event(self, event: FileSystemEvent) -> None:
         # watchdog reports src_path as str or bytes depending on how the watch was
@@ -187,6 +192,24 @@ class RepoChangeHandler(FileSystemEventHandler):
         if any(part in self.IGNORED_PARTS for part in relative.split(os.sep)):
             return
         self.changed.set()
+        if self.wake is not None:
+            self.wake.set()
+
+
+class _ModalRequest:
+    """A dialog the git worker needs the main (reactor) thread to present.
+
+    The worker can't touch stdin/screen, so it enqueues one of these on
+    ``_modal_mailbox`` and blocks on ``done`` until the main thread has run the
+    modal and stored the user's answer in ``result``.
+    """
+
+    __slots__ = ("modal", "done", "result")
+
+    def __init__(self, modal) -> None:
+        self.modal = modal
+        self.done = threading.Event()
+        self.result: "str | None" = None
 
 
 class ProxyInput:
@@ -358,6 +381,9 @@ class ProxyRunner:
     POLL_SECONDS = 2.0
     PARSE_COOLDOWN_SECONDS = 10.0
     BASE_POLL_SECONDS = 3.0
+    IDLE_AFTER_SECONDS = 30.0  # idle threshold: no input/output/work for this long ⇒ low-power loop
+    IDLE_POLL_SECONDS = 30.0  # select timeout while idle (vs ACTIVE_POLL_SECONDS when working)
+    ACTIVE_POLL_SECONDS = 1.0  # select timeout while active; every background sweep self-throttles to ≥2s anyway
     BASE_EDIT_CHECK_SECONDS = 3.0
     CWD_CHECK_SECONDS = 3.0
     BASE_DRIFT_CHECK_SECONDS = 2.0
@@ -478,6 +504,7 @@ class ProxyRunner:
         self.sel_point: tuple[int, int] | None = None
         self._input_tail = b""
         self.last_child_output = 0.0
+        self.last_user_input = 0.0  # monotonic time of the user's last keystroke (drives idle backoff)
         self.last_child_output_sample = b""
         self.last_status = ""
         self.last_status_change = 0.0
@@ -557,6 +584,8 @@ class ProxyRunner:
         self._pending_enter_fd: int | None = None  # the PTY that injected prompt's Enter must go to
         self._base_advanced = False  # base moved; sync idle sessions onto it on the next loop pass
         self._last_base_head: str | None = None  # last-polled base HEAD, to catch out-of-band commits
+        self._base_head_mtime = -1.0  # mtime signature of the repo dir's .git/HEAD (gates the branch poll)
+        self._base_ref_mtime = -1.0  # mtime signature of the base branch ref (gates the base-HEAD poll)
         self._base_edits_declined_status: str | None = None  # base status the user declined to commit
         self._popup_exit_pending = False  # a popup Ctrl-C exit flow is running
         self._popup_exit_force = False  # second Ctrl-C inside the exit confirmation
@@ -663,6 +692,18 @@ class ProxyRunner:
         self._update_pending = False  # user accepted; apply once sessions finish
         self._update_applying = False  # apply+restart in progress
         self._pending_restart = False  # re-exec aGiTrack after the loop tears down
+        self._reopen_after_exit = False  # host terminal closed; user asked to reopen in a new window
+        # Git worker (the automatic commit/merge pipeline runs here, never on the main
+        # reactor thread, so typing is never blocked by a git subprocess). The worker
+        # marshals any user dialog back to the main thread via `_modal_mailbox`.
+        self._main_thread_ident: int | None = None  # set in run(); identifies the reactor thread
+        self._git_worker: threading.Thread | None = None  # the dedicated git pipeline thread
+        self._stop_worker = False  # set to break the worker loop (exit/restart/teardown)
+        self._git_wake = threading.Event()  # wakes the worker on file changes / session changes
+        self._pipeline_lock = threading.RLock()  # guards a pipeline pass vs. session swap / exit
+        self._modal_mailbox: queue.Queue = queue.Queue()  # worker → main: dialogs to present
+        self._wake_r = -1  # self-pipe read end (added to select) — wakes the reactor on demand
+        self._wake_w = -1  # self-pipe write end — the worker writes to wake the main loop
 
     def _apply_timings(self, timings: dict[str, float]) -> None:
         # Override the class-constant timing defaults with the user's configured
@@ -677,6 +718,8 @@ class ProxyRunner:
         self.BASE_DRIFT_CHECK_SECONDS = timings["base_drift_check_seconds"]
         self.SUMMARY_WAIT_SECONDS = timings["summary_wait_seconds"]
         self.UPDATE_CHECK_SECONDS = timings["update_check_seconds"]
+        self.IDLE_AFTER_SECONDS = timings["idle_after_seconds"]
+        self.IDLE_POLL_SECONDS = timings["idle_poll_seconds"]
 
     # --- session pointer -------------------------------------------------
 
@@ -785,6 +828,7 @@ class ProxyRunner:
                 "_sync_since": 0.0,
                 "message": None,
                 "message_until": 0.0,
+                "last_user_input": 0.0,
                 "_message_scroll": 0,
                 "_message_max_scroll": 0,
                 "_message_sticky": False,
@@ -806,6 +850,8 @@ class ProxyRunner:
                 "_pending_enter_fd": None,
                 "_base_advanced": False,
                 "_last_base_head": None,
+                "_base_head_mtime": -1.0,
+                "_base_ref_mtime": -1.0,
                 "_base_edits_declined_status": None,
                 "_popup_exit_pending": False,
                 "_popup_exit_force": False,
@@ -869,6 +915,15 @@ class ProxyRunner:
                 "_update_pending": False,
                 "_update_applying": False,
                 "_pending_restart": False,
+                "_reopen_after_exit": False,
+                "_main_thread_ident": threading.get_ident(),
+                "_git_worker": None,
+                "_stop_worker": False,
+                "_git_wake": threading.Event(),
+                "_pipeline_lock": threading.RLock(),
+                "_modal_mailbox": queue.Queue(),
+                "_wake_r": -1,
+                "_wake_w": -1,
                 "UPDATE_CHECK_SECONDS": 300.0,
             }
         )
@@ -939,6 +994,13 @@ class ProxyRunner:
         self._init_screen()
         self._spawn()
         self._start_file_watcher()
+        # Identify the reactor thread and open the self-pipe the git worker writes to
+        # so it can wake `select` on demand (e.g. to present a dialog) instead of
+        # waiting for the next poll tick. Then start the git worker itself.
+        self._main_thread_ident = threading.get_ident()
+        self._wake_r, self._wake_w = os.pipe()
+        os.set_blocking(self._wake_r, False)
+        self._start_git_worker()
         # Register the initial session as the sole (active) entry in the
         # multiplexer. Additional sessions are appended by `_new_session`.
         self.sessions = [self.active]
@@ -975,16 +1037,29 @@ class ProxyRunner:
                 signal.signal(signal.SIGWINCH, self.original_sigwinch)
             for signum, handler in self.original_signal_handlers.items():
                 signal.signal(signum, handler)
+            self._stop_git_worker()  # join before tearing the worktree/PTY down
             self._stop_file_watcher()
             self._stop_dashboard()
             self._cleanup_child()
             self._restore_terminal()
+            for fd in (self._wake_r, self._wake_w):
+                if fd >= 0:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+            self._wake_r = self._wake_w = -1
             if self.master_fd is not None:
                 try:
                     os.close(self.master_fd)
                 except OSError:
                     pass
             self.management_lock.release()
+            # The host terminal closed mid-work and the user chose "Reopen" in the
+            # forced-exit dialog: launch a fresh window now that the lock is free so
+            # the new instance can acquire it and auto-resume the session.
+            if self._reopen_after_exit:
+                self._reopen_in_new_window()
         # A self-update was applied; re-exec aGiTrack in place now that the terminal
         # is restored and the management lock is released. Does not return.
         if self._pending_restart:
@@ -1143,9 +1218,23 @@ class ProxyRunner:
         if now - self._base_drift_check_at < self.BASE_DRIFT_CHECK_SECONDS:
             return
         self._base_drift_check_at = now
-        try:
-            current = self.base_repo.current_branch()  # the branch checked out in the repo dir
-        except Exception:
+        # Cheap pre-check: the checked-out branch only changes when `.git/HEAD` is
+        # rewritten (a checkout — a commit does not touch it), so skip the git
+        # subprocess and reuse the cached branch when HEAD's mtime is unchanged. The
+        # pending-merge-prompt handling below depends on session merge state, not
+        # HEAD, so it still runs every tick.
+        git_dir = self._base_git_dir()
+        head_sig = self._newest_mtime([git_dir / "HEAD"]) if git_dir is not None else None
+        if head_sig is not None and head_sig == self._base_head_mtime:
+            current = self._repo_dir_branch  # HEAD untouched — branch is unchanged
+        else:
+            if head_sig is not None:
+                self._base_head_mtime = head_sig
+            try:
+                current = self.base_repo.current_branch()  # the branch checked out in the repo dir
+            except Exception:
+                return
+        if current is None:
             return
         moved = current != self._repo_dir_branch
         self._repo_dir_branch = current  # keep the status bar's "current dir branch" fresh
@@ -1193,6 +1282,14 @@ class ProxyRunner:
         if now - self._base_drift_check_at < self.BASE_DRIFT_CHECK_SECONDS:
             return
         self._base_drift_check_at = now
+        # Cheap pre-check: a checkout rewrites `.git/HEAD`; if its mtime is unchanged
+        # the branch can't have switched, so skip the git subprocess entirely.
+        git_dir = self._base_git_dir()
+        if git_dir is not None:
+            head_sig = self._newest_mtime([git_dir / "HEAD"])
+            if head_sig == self._base_head_mtime:
+                return
+            self._base_head_mtime = head_sig
         try:
             current = self.base_repo.current_branch()  # the branch checked out in the repo dir
         except Exception:
@@ -1400,6 +1497,32 @@ class ProxyRunner:
             self._base_status_baseline = current  # don't repeat for the same files
             self._render()
 
+    @staticmethod
+    def _newest_mtime(paths) -> float:
+        """Newest modification time across *paths* (missing entries ignored).
+
+        A cheap change signal: a single ``stat`` per path, no work-tree walk, so a
+        git subprocess only runs when the underlying ref/HEAD file actually moved.
+        Returns 0.0 when nothing is present.
+        """
+        newest = 0.0
+        for path in paths:
+            try:
+                newest = max(newest, os.stat(path).st_mtime)
+            except OSError:
+                continue
+        return newest
+
+    def _base_git_dir(self):
+        """The repo dir's ``.git`` directory as a Path, or None when it can't be
+        resolved (e.g. a stubbed base repo in tests). Callers that can't resolve it
+        skip mtime-gating and fall back to reading git directly."""
+        repo = getattr(self.base_repo, "repo", None)
+        try:
+            return repo / ".git" if repo is not None else None
+        except TypeError:
+            return None
+
     def _poll_base_advanced(self) -> None:
         # aGiTrack advances the base itself (integration sets `_base_advanced`), but the
         # base branch can also gain commits out of band — the user commits directly
@@ -1413,6 +1536,15 @@ class ProxyRunner:
         if now - self._base_poll_at < self.BASE_POLL_SECONDS:
             return
         self._base_poll_at = now
+        # Cheap pre-check: only shell out to `git rev-parse` when the base branch's
+        # ref (loose file or packed-refs) was actually rewritten since the last poll.
+        git_dir = self._base_git_dir()
+        if git_dir is not None:
+            sig = self._newest_mtime([git_dir / "refs" / "heads" / self._base_branch, git_dir / "packed-refs"])
+            if sig == self._base_ref_mtime:
+                self._prune_user_declined()  # keep the status-line count current
+                return
+            self._base_ref_mtime = sig
         try:
             head = self.base_repo.rev_parse(self._base_branch)
         except Exception as error:
@@ -4708,25 +4840,34 @@ class ProxyRunner:
     def _switch_active(self, index: int) -> None:
         if not (0 <= index < len(self.sessions)) or index == self.active_index:
             return
-        self._join_parse_worker_before_swap()
-        # Swap under the outgoing session's parse lock: if the join above timed
-        # out, the still-running worker writes its result to its owning Session
-        # under this same lock, so it sees either fully-before or fully-after.
-        lock = self.agent_parse_lock or threading.Lock()
-        with lock:
-            self.active = self.sessions[index]
-        self.scroll_back = 0
-        self._resize_child()
-        self._enable_host_mouse()
-        self._set_message(f"Switched to session '{self._session_name(index)}'")
-        self._render()
-        # The copy-back mute is per active-session-visit: a switch resets it so the
-        # session we just landed on gets offered its own worktree-only files (background
-        # sessions are never interrupted mid-run; this is where we catch up). Only when
-        # it's idle — a session still mid-turn gets offered by the turn path once it settles.
-        self._copy_declined = set()
-        if not self._agent_is_active():
-            self._offer_copy_unstaged_to_base(context="switch")
+        # Hold the pipeline lock across the foreground swap so the git worker (which
+        # reads `self.active`) can't be mid-pass while the pointer moves. Draining the
+        # modal mailbox while we wait keeps a worker that's blocked on a dialog from
+        # deadlocking us. (RLock: reentrant when already held by this thread, e.g. the
+        # background-session conflict path that calls us from the locked cluster.)
+        self._acquire_pipeline_lock_from_main()
+        try:
+            self._join_parse_worker_before_swap()
+            # Swap under the outgoing session's parse lock: if the join above timed
+            # out, the still-running worker writes its result to its owning Session
+            # under this same lock, so it sees either fully-before or fully-after.
+            lock = self.agent_parse_lock or threading.Lock()
+            with lock:
+                self.active = self.sessions[index]
+            self.scroll_back = 0
+            self._resize_child()
+            self._enable_host_mouse()
+            self._set_message(f"Switched to session '{self._session_name(index)}'")
+            self._render()
+            # The copy-back mute is per active-session-visit: a switch resets it so the
+            # session we just landed on gets offered its own worktree-only files (background
+            # sessions are never interrupted mid-run; this is where we catch up). Only when
+            # it's idle — a session still mid-turn gets offered by the turn path once it settles.
+            self._copy_declined = set()
+            if not self._agent_is_active():
+                self._offer_copy_unstaged_to_base(context="switch")
+        finally:
+            self._pipeline_lock.release()
         # The newly-active session may merge into a different branch than the one
         # checked out in the repo directory — ask where its changes should merge.
         self._prompt_merge_target_if_diverged()
@@ -5153,7 +5294,9 @@ class ProxyRunner:
             return
         observer = Observer()
         observer.schedule(
-            RepoChangeHandler(self.repo.repo, self.file_change_event), str(self.repo.repo), recursive=True
+            RepoChangeHandler(self.repo.repo, self.file_change_event, self._git_wake),
+            str(self.repo.repo),
+            recursive=True,
         )
         observer.start()
         self.file_observer = observer
@@ -5165,6 +5308,85 @@ class ProxyRunner:
         observer.stop()
         observer.join(timeout=2.0)
         self.file_observer = None
+
+    def _start_git_worker(self) -> None:
+        """Start the dedicated git thread. From here on the automatic commit/merge
+        pipeline for the foreground session runs there, never on the main reactor
+        thread, so a `git status`/commit/merge can never block the user's typing."""
+        self._stop_worker = False
+        worker = threading.Thread(target=self._git_worker_loop, name="agitrack-git", daemon=True)
+        self._git_worker = worker
+        worker.start()
+
+    def _stop_git_worker(self) -> None:
+        """Stop and join the git worker. Idempotent. Called before exit-time finalize
+        and before a restart re-exec so the foreground git that runs there can never
+        race the worker.
+
+        While joining, keep cancelling any dialog the worker is blocked on (returning
+        None) so it can observe the stop and unwind — otherwise a worker waiting on an
+        unanswered modal would never finish. Capped so teardown can't hang."""
+        worker = self._git_worker
+        if worker is None:
+            return
+        self._stop_worker = True
+        self._git_wake.set()
+        deadline = time.monotonic() + 10.0
+        while worker.is_alive() and time.monotonic() < deadline:
+            self._cancel_pending_modals()
+            worker.join(timeout=0.05)
+        self._git_worker = None
+
+    def _cancel_pending_modals(self) -> None:
+        """Unblock any worker waiting on a queued dialog by returning None for it.
+        Used during teardown, where presenting the dialog is neither possible nor
+        wanted."""
+        while True:
+            try:
+                request = self._modal_mailbox.get_nowait()
+            except queue.Empty:
+                return
+            request.result = None
+            request.done.set()
+
+    def _git_worker_loop(self) -> None:
+        """The git thread's main loop: sleep on `_git_wake` (set by the file watcher
+        on worktree writes, and once per reactor tick), then run one foreground
+        pipeline pass under `_pipeline_lock`. Backs off to the idle cadence when the
+        user has stepped away, so it doesn't spin (preserving the battery win)."""
+        while self.running and not self._stop_worker:
+            timeout = self.IDLE_POLL_SECONDS if self._is_idle() else self.POLL_SECONDS
+            self._git_wake.wait(timeout=timeout)
+            self._git_wake.clear()
+            if not self.running or self._stop_worker:
+                break
+            try:
+                with self._pipeline_lock:
+                    if self.running and not self._stop_worker and self.master_fd is not None:
+                        self._run_git_pipeline()
+            except Exception as error:  # a git failure must never kill the worker
+                self._debug(f"git worker pass failed: {error!r}")
+
+    def _run_git_pipeline(self) -> None:
+        """One foreground-session git pass — the work that used to run inline in the
+        reactor's timers phase. Operates only on the active (foreground) session and
+        never swaps `self.active`, so it can run concurrently with the main thread's
+        stdin/render without misrouting. Any user dialog it raises is marshaled to the
+        main thread via `_run_modal`; any repaint just flags `_render_pending`.
+
+        Background / multi-session servicing (which DOES swap `self.active`) stays on
+        the main thread, mutually excluded from this pass by `_pipeline_lock`.
+        """
+        if self._stop_worker or not self.running or self.master_fd is None:
+            return
+        if self.merge_ctx:
+            # A foreground merge is being resolved; don't make normal commits meanwhile.
+            self._maybe_complete_agent_merge()
+            return
+        self._maybe_agent_commit()
+        self._poll_base_advanced()
+        self._warn_if_base_edited()
+        self._warn_if_cwd_drifted()
 
     def _background_fds(self) -> dict:
         # master_fd -> session object, for every session that is not the active
@@ -5227,6 +5449,92 @@ class ProxyRunner:
     # Reactor phases (called exclusively from _loop)
     # ------------------------------------------------------------------
 
+    def _select_timeout(self) -> float:
+        """How long the reactor blocks in ``select`` this iteration.
+
+        ``select`` returns the instant stdin or any PTY fd becomes readable, so
+        this timeout only bounds how long we may sit idle before re-running the
+        timer-driven work — it never delays the user's keystrokes or the
+        backend's output. The value is the time until the *next* thing that must
+        happen:
+
+        * a queued repaint → ``0.016`` (coalesced output frame, ~next tick);
+        * a deferred prompt-submit (the injected Enter, scheduled 0.4s out) →
+          the exact time remaining to it, so it still fires promptly even though
+          the normal active poll is a full second;
+        * otherwise ``ACTIVE_POLL_SECONDS`` while there is work to service, or
+          ``IDLE_POLL_SECONDS`` once :meth:`_is_idle` says nothing does — the
+          long idle block is what lets the CPU sleep and saves battery while the
+          user is away.
+
+        Every background sweep self-throttles to its own interval (≥2s), so the
+        active poll being a coarse 1s never makes any check run more often.
+        """
+        if self._render_pending:
+            return 0.016
+        if self._pending_enter_at is not None:
+            remaining = self._pending_enter_at - time.monotonic()
+            return max(0.0, min(remaining, self.ACTIVE_POLL_SECONDS))
+        return self.IDLE_POLL_SECONDS if self._is_idle() else self.ACTIVE_POLL_SECONDS
+
+    def _is_idle(self) -> bool:
+        """True when no foreground or background work needs the fast poll loop.
+
+        Idle means: no turn in flight (active or background), no merge being
+        resolved, no per-turn pipeline work pending (file change to process,
+        parse/commit due, deferred Enter or queued prompt), no background worker
+        thread alive, no timed notice still on screen, and no keystroke or
+        backend output within ``IDLE_AFTER_SECONDS``. A sticky message (one that
+        waits for a keypress) does NOT keep us awake — the keypress that
+        dismisses it wakes ``select`` on its own.
+        """
+        now = time.monotonic()
+        # An active turn, or output recent enough to still be inside the
+        # post-turn commit-debounce window, keeps the fast loop.
+        if self.agent_in_flight or self.merge_ctx is not None:
+            return False
+        if now - self.last_child_output < self.CHILD_IDLE_SECONDS:
+            return False
+        if now - self.last_user_input < self.IDLE_AFTER_SECONDS:
+            return False
+        # Pending per-turn pipeline work. file_change_event is set by the file
+        # watcher thread (it does not wake select), so it must be checked here.
+        if self.file_change_event.is_set() or self.parse_pending or self.status_check_pending:
+            return False
+        if self.pending_forwarded or self.pending_prompt_text:
+            return False
+        if self._pending_enter_at is not None or self._base_advanced:
+            return False
+        # A timed notice must expire/refresh on schedule; a sticky one need not.
+        if self.message is not None and not self._message_sticky and now < self.message_until:
+            return False
+        for attr in (
+            "agent_parse_thread",
+            "_summary_thread",
+            "_precompact_thread",
+            "_auto_share_thread",
+            "_shared_resume_thread",
+            "_update_check_thread",
+        ):
+            thread = getattr(self, attr, None)
+            if thread is not None and thread.is_alive():
+                return False
+        # Any *background* session still working (the active one is covered above).
+        # Background turns are committed/integrated by _service_background_sessions
+        # once they have been quiet for CHILD_IDLE_SECONDS, with POLL_SECONDS between
+        # service passes; stay non-idle a little past that window so a just-finished
+        # background turn is integrated promptly rather than waiting a full idle tick.
+        background_quiet = self.CHILD_IDLE_SECONDS + self.POLL_SECONDS + 1.0
+        for index in range(len(self.sessions)):
+            if index == self.active_index:
+                continue
+            session = self.sessions[index]
+            if getattr(session, "agent_in_flight", False) or getattr(session, "merge_ctx", None) is not None:
+                return False
+            if now - getattr(session, "last_child_output", 0.0) < background_quiet:
+                return False
+        return True
+
     def _reactor_select_phase(self) -> tuple[dict, list]:
         """Phase 1 — compute the fd set, block in select, drain background PTYs.
 
@@ -5234,9 +5542,17 @@ class ProxyRunner:
         drained here so their PTY buffers never fill up regardless of which
         phase the main loop is in.
         """
-        timeout = 0.016 if self._render_pending else 0.2
+        timeout = self._select_timeout()
         background = self._background_fds()
-        readable, _, _ = select.select([sys.stdin.fileno(), self.master_fd, *background], [], [], timeout)
+        watch = [sys.stdin.fileno(), self.master_fd, *background]
+        if self._wake_r >= 0:
+            watch.append(self._wake_r)  # the git worker's wake pipe (e.g. it queued a dialog)
+        readable, _, _ = select.select(watch, [], [], timeout)
+        if self._wake_r in readable:
+            try:
+                os.read(self._wake_r, 4096)  # drain the wake byte(s); presence is the signal
+            except OSError:
+                pass
         for fd in readable:
             if fd in background:
                 self._pump_background(background[fd])
@@ -5278,6 +5594,13 @@ class ProxyRunner:
         if sys.stdin.fileno() not in readable:
             return None
         data = os.read(sys.stdin.fileno(), 4096)
+        # Only a real keystroke resets the idle backoff — NOT a mouse wheel / move /
+        # click or a focus in/out report. Scrolling history is passive reading: it
+        # needs no commits or background polling, so it must not pin aGiTrack in the
+        # active loop. (select still woke instantly to redraw the scrolled view; this
+        # only governs whether we then drop back to the low-power idle cadence.)
+        if self._is_real_keypress(data):
+            self.last_user_input = time.monotonic()
         self._raw_capture(">", data)
         self._debug(f"stdin: {data!r} menu_key={self.input.menu_key!r}")
         # A popup message taller than the screen scrolls with PgUp/PgDn, handled before
@@ -5338,11 +5661,18 @@ class ProxyRunner:
                 submitted_prompt = self.passthrough_prompt.decode(errors="ignore").strip()
                 if submitted_prompt.startswith("/compact"):
                     self._handle_pre_compaction()
-                if not self._pre_agent_commit_if_needed(submitted_prompt):
-                    self.pending_forwarded = [chunk for chunk in forwarded if chunk in {b"\r", b"\n"}]
-                    self.pending_prompt_text = submitted_prompt
-                    forwarded = [chunk for chunk in forwarded if chunk not in {b"\r", b"\n"}]
-                    submit = False
+                # Submit-time commits touch the foreground worktree's index, the same
+                # one the git worker commits the agent's turn into — take the pipeline
+                # lock so the two never run at once (draining dialogs while we wait).
+                self._acquire_pipeline_lock_from_main()
+                try:
+                    if not self._pre_agent_commit_if_needed(submitted_prompt):
+                        self.pending_forwarded = [chunk for chunk in forwarded if chunk in {b"\r", b"\n"}]
+                        self.pending_prompt_text = submitted_prompt
+                        forwarded = [chunk for chunk in forwarded if chunk not in {b"\r", b"\n"}]
+                        submit = False
+                finally:
+                    self._pipeline_lock.release()
             if submit:
                 self.passthrough_prompt.clear()
                 self.passthrough_escape = None
@@ -5351,9 +5681,14 @@ class ProxyRunner:
                     self.agent_in_flight = True
                     if submitted_prompt:
                         # Flush the previous turn's deferred integration first, then
-                        # put this new prompt on its own branch.
-                        self._integrate_committed_turn_before_new_turn()
-                        self._ensure_turn_branch()
+                        # put this new prompt on its own branch (same shared index as
+                        # the worker → under the pipeline lock).
+                        self._acquire_pipeline_lock_from_main()
+                        try:
+                            self._integrate_committed_turn_before_new_turn()
+                            self._ensure_turn_branch()
+                        finally:
+                            self._pipeline_lock.release()
                         # Drop the previous turn's "created & merged" status line so
                         # it doesn't linger into — and read as belonging to — the
                         # new turn (which would show "created" before "summarizing").
@@ -5371,37 +5706,42 @@ class ProxyRunner:
         return None
 
     def _reactor_timers_phase(self) -> None:
-        """Phase 4 — flush pending renders, deferred enters, and all background tasks."""
+        """Phase 4 — main-thread servicing. The foreground commit/merge pipeline runs
+        on the git worker (`_run_git_pipeline`); this phase keeps only terminal I/O,
+        prompt forwarding, dialog hand-off, and the background / multi-session git
+        that swaps `self.active` (guarded by `_pipeline_lock`, non-blocking so a busy
+        worker never stalls the reactor — and thus never delays typing)."""
         if not self.running:
             return  # a restart/exit is underway; touch no (possibly-removed) worktree
         self._flush_pending_render()
         self._flush_pending_enter()
-        if self.merge_ctx:
-            # A merge is being resolved; don't make normal commits meanwhile.
-            self._maybe_complete_agent_merge()
-        else:
-            self._check_base_branch_drift()  # pause merging before any integration runs
-            self._resume_pending_prompt_if_ready()
-            self._ensure_worktree_alive()
-            self._service_commit_summaries()  # apply finished background summaries (#8)
-            self._service_precompact_summary()
-            self._service_shared_resume()  # complete a shared-session resume once fetched
-            self._maybe_agent_commit()
-            self._service_background_sessions()
-            self._poll_base_advanced()
-            self._warn_if_base_edited()
-            self._warn_if_cwd_drifted()
-            self._maybe_check_for_update()
-            self._maybe_apply_pending_update()
+        self._drain_modal_mailbox()  # present any dialog the git worker queued
+        self._resume_pending_prompt_if_ready()
+        self._service_shared_resume()  # complete a shared-session resume once fetched
+        # Background / multi-session git (these swap self.active via _with_session, so
+        # they must be mutually exclusive with the worker's foreground pass). Skip the
+        # whole cluster this tick when the worker holds the lock — it runs on the next.
+        if self._pipeline_lock.acquire(blocking=False):
+            try:
+                self._ensure_worktree_alive()  # recovers a vanished worktree (PTY/watcher work)
+                self._check_base_branch_drift()  # may surface a dir-change session swap
+                self._service_commit_summaries()  # apply finished background summaries (#8)
+                self._service_precompact_summary()
+                self._service_background_sessions()
+                if self._base_advanced:
+                    self._base_advanced = False
+                    self._sync_idle_worktrees_to_base()
+            finally:
+                self._pipeline_lock.release()
+        self._maybe_check_for_update()
+        self._maybe_apply_pending_update()
         if not self.running:
             # _maybe_apply_pending_update finalized and removed the worktree for a
-            # restart; stop before the worktree-touching sync below.
+            # restart; stop before any further servicing.
             return
         self._service_background_share_ops()  # surface finished background unshare/etc. results
         self._service_session_notices()  # expire/refresh per-session status lines
-        if self._base_advanced:
-            self._base_advanced = False
-            self._sync_idle_worktrees_to_base()
+        self._git_wake.set()  # nudge the worker so its pass tracks the reactor's cadence
 
     def _reactor_child_exit_phase(self) -> "str | int | None":
         """Phase 5 — reap stopped children and check whether the active child exited.
@@ -5657,6 +5997,13 @@ class ProxyRunner:
 
     def _render(self) -> None:
         if self.screen is None:
+            return
+        # The git worker must never write to the terminal (only the main reactor
+        # thread owns the screen). When it asks to render, just request a repaint;
+        # the main loop flushes it within ~16 ms via _flush_pending_render.
+        if not self._on_main_thread():
+            self._render_pending = True
+            self._wake_main_loop()
             return
         capturing = self.input.capturing
         ScreenRenderer.render(
@@ -5922,6 +6269,11 @@ class ProxyRunner:
         return True if state_enabled is None else bool(state_enabled)
 
     def _render_status(self, text: str) -> None:
+        # Writes straight to stdout, so only the main reactor thread may run it: the
+        # git worker calls it (verbose mode) but must never touch the screen. This is
+        # a debug-only status line, so dropping it off-thread is harmless.
+        if not self._on_main_thread():
+            return
         prompt = text.replace("\r", "").replace("\n", "")
         line = f" aGiTrack> {prompt}"[: self.cols].ljust(self.cols)
         os.write(sys.stdout.fileno(), f"\x1b[{self.rows};1H\x1b[7m{line}\x1b[0m".encode())
@@ -6450,7 +6802,19 @@ class ProxyRunner:
         The call-shape is synchronous, which preserves the ~25 existing call
         sites unmodified.  ``_prompt_popup`` and ``_select_popup`` are thin
         facades that construct the appropriate modal and delegate here.
+
+        When called from the git worker thread (which must never touch stdin/the
+        screen), the modal is marshaled to the main reactor thread via
+        ``_run_modal_via_main`` and this call blocks until the user answers there.
         """
+        if not self._on_main_thread():
+            return self._run_modal_via_main(modal)
+        return self._run_modal_inline(modal)
+
+    def _run_modal_inline(self, modal: "PromptModal | SelectModal") -> "str | None":
+        """The actual modal loop — always runs on the main reactor thread (directly,
+        or via ``_drain_modal_mailbox`` for a worker-queued dialog). Reads stdin and
+        paints the screen, so it must never run off the main thread."""
         while True:
             self._set_message(modal.render_message(), seconds=60)
             self._render()
@@ -6468,6 +6832,55 @@ class ProxyRunner:
                 if self._run_exit_flow():
                     return None
                 # Exit declined: redraw the modal and keep listening.
+
+    def _on_main_thread(self) -> bool:
+        """Whether the caller is the main reactor thread (or no worker is running,
+        as in tests/early construction, where everything is effectively 'main')."""
+        return self._main_thread_ident is None or threading.get_ident() == self._main_thread_ident
+
+    def _run_modal_via_main(self, modal: "PromptModal | SelectModal") -> "str | None":
+        """Worker → main hand-off: queue *modal* for the reactor thread to present
+        and block until it returns the user's answer. The git worker has no access
+        to stdin or the screen, so every dialog it raises is shown by the main
+        thread (which drains ``_modal_mailbox`` in its timers phase)."""
+        request = _ModalRequest(modal)
+        self._modal_mailbox.put(request)
+        self._wake_main_loop()  # don't wait for the next poll tick to present it
+        request.done.wait()
+        return request.result
+
+    def _drain_modal_mailbox(self) -> None:
+        """Main thread: present every modal the worker queued, returning each answer
+        to the blocked worker. Safe to call when no worker is running (no-op)."""
+        while True:
+            try:
+                request = self._modal_mailbox.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                request.result = self._run_modal_inline(request.modal)  # on main thread
+            finally:
+                request.done.set()
+
+    def _wake_main_loop(self) -> None:
+        """Wake the reactor out of ``select`` at once (e.g. a worker queued a dialog
+        or finished work that should repaint). Writes a byte to the self-pipe whose
+        read end is in the select set. No-op before the pipe exists (tests)."""
+        if self._wake_w < 0:
+            return
+        try:
+            os.write(self._wake_w, b"\x00")
+        except OSError:
+            pass
+
+    def _acquire_pipeline_lock_from_main(self) -> None:
+        """Acquire ``_pipeline_lock`` from the main thread WITHOUT deadlocking on a
+        worker that holds it while blocked on a modal: keep draining the modal
+        mailbox while we wait, so the worker's dialog is serviced and it can release.
+        Pair every call with ``self._pipeline_lock.release()``."""
+        while not self._pipeline_lock.acquire(timeout=0.02):
+            self._drain_modal_mailbox()
+        self._drain_modal_mailbox()
 
     def _prompt_popup(self, title: str, prompt: str, *, default: str = "") -> str | None:
         """Free-text input popup.  Thin facade over ``_run_modal(PromptModal(...))``.
@@ -6981,8 +7394,11 @@ class ProxyRunner:
         return False
 
     def _confirm_exit(self) -> bool:
-        choice = self._select_popup("Exit aGiTrack?", ["No, keep working", "Yes, exit"])
-        return choice == "Yes, exit"
+        # "(Ctrl-C again)" hints that a second Ctrl-C confirms the exit (the
+        # double-Ctrl-C fast path in _run_exit_flow), matching the keystroke that
+        # opened this prompt.
+        choice = self._select_popup("Exit aGiTrack?", ["No, keep working", "Yes, exit (Ctrl-C again)"])
+        return choice == "Yes, exit (Ctrl-C again)"
 
     def _run_exit_flow(self) -> bool:
         # THE single exit path (P6 Stage 3 — exit-path unification).
@@ -7009,6 +7425,9 @@ class ProxyRunner:
         self._popup_exit_force = False
         self._exit_aborted = False
         try:
+            # Exiting always asks first (a deliberate safety net), regardless of
+            # whether there is pending work. Whether there is anything to *finalize*
+            # only affects the message shown during teardown (see _finalize_pending_work).
             if not self._confirm_exit() and not self._popup_exit_force:
                 self._set_message("Exit cancelled — still running; nothing was shut down.")
                 self._render()
@@ -7088,13 +7507,25 @@ class ProxyRunner:
             return  # already finalized (e.g. the backend exited and we ran this)
         self._finalized_on_exit = True
         self._exiting = True
+        # ALWAYS show a notice the moment exit begins, before any of the (sometimes
+        # multi-second) teardown below — joining the git worker, pushing an
+        # auto-shared session, integrating, removing worktrees, joining threads. A
+        # silent terminal during that wait looks frozen. Name the specific work when
+        # we can; otherwise a generic notice. (On a forced/terminal-closed exit the
+        # screen is already None, so _render no-ops — harmless.) Computed before
+        # stopping the worker so it still reflects any in-flight turn.
+        detail = self._describe_exit_finalize()
+        self._set_message(detail or "Finalizing things before exiting…", seconds=30)
+        self._render()
+        # Stop the git worker first so the exit-time foreground commits below run on
+        # this (main) thread without racing a worker pass. After this join the
+        # finalize git is the only git touching the worktree.
+        self._stop_git_worker()
         self._cancel_inflight_shared_fetches()  # stop any unfinished session fetch at once
         # The session the user was working in when they quit is the one to
         # auto-resume next start — not necessarily the primary (they may have
         # switched to a new or shared session). It is finalized first, below.
         self._exit_resume_worktree = getattr(self.worktree, "name", None)
-        self._set_message("Finalizing commits before exit...", seconds=30)
-        self._render()
         self._commit_latest_turn_sync()  # active session, in place
         self._auto_share_on_exit()  # push the latest conversation if auto-shared
         self._finalize_summary_then_integrate_on_exit()
@@ -7116,8 +7547,8 @@ class ProxyRunner:
         self._delete_orphan_merged_branches()
         # NB: deliberately NOT sweeping orphan shared-session snapshots here. That
         # sweep runs `git fsck` over the whole object graph — seconds on a large
-        # repo — and would block exit (showing "Finalizing commits…") even when the
-        # session made no commits. It is redundant anyway: each publish reclaims its
+        # repo — and would stall exit even when the session made no commits. It is
+        # redundant anyway: each publish reclaims its
         # previous snapshot immediately, and the startup sweep (a background thread)
         # mops up any stragglers. So leave exit fast.
 
@@ -7273,6 +7704,13 @@ class ProxyRunner:
         self.active.process.signal_exit()
 
     def _handle_exit_signal(self, signum, _frame) -> None:
+        # A self-update is mid-flight (pip is uninstalling/reinstalling aGiTrack). Do
+        # NOT tear down: unwinding would abort the apply and could leave aGiTrack
+        # half-uninstalled. The upgrade runs in its own session (see updater) so this
+        # SIGHUP/SIGTERM never reached it; ignore the signal and let the apply +
+        # restart finish. (The user can still hard-kill with SIGKILL if truly stuck.)
+        if self._update_applying:
+            return
         self.running = False
         # Closing the terminal (the VSCode terminal, an SSH/Mosh session, a `kill`)
         # delivers SIGHUP/SIGTERM. Finalize pending work first so a just-completed turn
@@ -7280,6 +7718,11 @@ class ProxyRunner:
         # not abruptly. Rendering is suppressed (the terminal may already be gone:
         # `_render()` no-ops when `screen` is None) and the whole finalize is guarded so
         # a slow or failing finalize can never stop the process from exiting.
+        #
+        # Whether work was actually in progress is captured *before* finalizing (which
+        # commits it away) so the out-of-terminal prompt only fires when the close
+        # interrupted something — a clean close stays silent.
+        had_work = self._had_unfinalized_work()
         self.screen = None
         try:
             self._finalize_pending_work()
@@ -7288,7 +7731,94 @@ class ProxyRunner:
         self._disable_host_terminal_modes()
         self._cleanup_child()
         self._restore_terminal()
+        if had_work:
+            self._prompt_forced_exit()
         raise SystemExit(128 + int(signum))
+
+    def _describe_exit_finalize(self) -> str | None:
+        """A specific, user-facing description of what exit finalize will actually
+        do — or ``None`` when everything is already committed and merged (a clean,
+        silent exit).
+
+        It deliberately ignores the base repo's own dirty/untracked files and a
+        worktree's git-ignored or intentionally-declined files: aGiTrack never
+        commits those on exit, so they must not make exit claim there is something
+        to "finalize". The signals are aGiTrack's own pending work: a turn still in
+        flight, a session with committable or committed-but-unmerged work
+        (``_unmerged_worktrees`` already excludes ignored/declined noise), or a
+        commit summary still being written. Best-effort; any error reads as
+        "nothing to report".
+        """
+        actions: list[str] = []
+        try:
+            if self._agent_is_active() or any(getattr(s, "agent_in_flight", False) for s in self.sessions):
+                actions.append("committing the latest turn")
+            unmerged = self._unmerged_worktrees()
+            if unmerged:
+                actions.append("committing and merging unsaved work in " + ", ".join(label for label, _ in unmerged))
+            if any(self._session_summary_in_progress(s) for s in self.sessions):
+                actions.append("saving the commit summary")
+        except Exception:
+            return None
+        if not actions:
+            return None
+        return "Finishing up before exit — " + ", and ".join(actions) + "…"
+
+    @staticmethod
+    def _session_summary_in_progress(session) -> bool:
+        """Whether *session* still has a commit summary being computed (a pending
+        slot or a live summarizer thread) that exit finalize would wait to apply."""
+        if getattr(session, "_summary_pending", None) is not None:
+            return True
+        thread = getattr(session, "_summary_thread", None)
+        return thread is not None and thread.is_alive()
+
+    def _had_unfinalized_work(self) -> bool:
+        """Whether aGiTrack still has work to finalize on exit — an agent turn in
+        flight, a session with committable/unmerged work, or a commit summary being
+        written (see :meth:`_describe_exit_finalize`). Drives the forced-exit prompt
+        and the exit confirmation, so a clean close (everything committed and merged)
+        exits silently. Ignores the base repo's own dirt and declined/ignored files.
+        """
+        return self._describe_exit_finalize() is not None
+
+    def _prompt_forced_exit(self) -> None:
+        """Prompt the user about an exit forced by the host terminal closing.
+
+        The TUI is gone by the time SIGHUP/SIGTERM arrives, so the user can no
+        longer be asked anything inside the terminal. Surface a blocking dialog
+        through the OS window server instead (macOS only — a silent no-op on
+        SSH/headless/Linux, and time-boxed so it can never hang a system
+        restart). "Reopen aGiTrack" arms a best-effort relaunch in a fresh
+        window, performed after the management lock is released (see `run`).
+        """
+        if not host_prompt.can_show_dialog():
+            return
+        try:
+            choice = host_prompt.confirm_forced_exit(
+                "Choose Reopen aGiTrack to keep working in a new window, or Quit aGiTrack to close."
+            )
+        except Exception as error:
+            self._debug(f"forced-exit prompt failed: {error!r}")
+            return
+        if choice == host_prompt.REOPEN:
+            self._reopen_after_exit = True
+
+    def _reopen_in_new_window(self) -> None:
+        """Relaunch aGiTrack in a fresh window after a forced exit.
+
+        Called from `run`'s teardown once the management lock is released so the
+        new instance can take it. Mirrors `restart_agitrack`'s
+        `python -m agitrack <argv>` invocation (the original terminal is gone, so
+        this opens a new window) and starts it in the base repo root so the last
+        session auto-resumes. Best-effort; never raises.
+        """
+        try:
+            args = " ".join(shlex.quote(arg) for arg in sys.argv[1:])
+            command = f"{shlex.quote(sys.executable)} -m agitrack {args}".rstrip()
+            host_prompt.reopen_in_new_terminal(command, str(self.base_repo.repo))
+        except Exception as error:
+            self._debug(f"reopen in new window failed: {error!r}")
 
     def _cleanup_child(self) -> None:
         # Delegate SIGINT -> wait -> SIGTERM escalation to the session's BackendProcess.
@@ -7752,6 +8282,7 @@ class ProxyRunner:
         now = time.monotonic()
         if self.file_change_event.is_set():
             self.file_change_event.clear()
+            self._last_change_at = now  # a real worktree write just landed
             self.status_check_pending = True
         elif Observer is None:
             if now - self.last_poll < self.POLL_SECONDS:
@@ -7759,7 +8290,17 @@ class ProxyRunner:
             self.last_poll = now
             self.status_check_pending = True
         self._clear_agent_in_flight_if_idle()
-        if self.status_check_pending:
+        # Defer the `git status` subprocess out of the active edit/type window. A
+        # commit can only happen once the worktree AND the backend have been quiet
+        # for the stable/idle windows, so reading status on every keystroke-adjacent
+        # file event buys nothing — and doing it on the main thread is exactly what
+        # made typing lag right after an edit. Hold off until things settle; then a
+        # single read serves the commit. (With no file watcher, `_last_change_at` is
+        # never advanced, so this naturally reduces to the old poll-then-read once
+        # the backend goes idle.)
+        worktree_settled = now - self._last_change_at >= self.FILE_STABLE_SECONDS
+        backend_idle = now - self.last_child_output >= self.CHILD_IDLE_SECONDS
+        if self.status_check_pending and worktree_settled and backend_idle:
             status = self.repo.status_short()
             self._prune_declined_untracked()
             self.status_check_pending = False
@@ -7772,6 +8313,11 @@ class ProxyRunner:
             else:
                 self.parse_pending = False
                 self.last_parse_attempt_status = ""
+        elif self.status_check_pending:
+            # Worktree or backend still active — revisit next tick without touching git.
+            if self.verbose:
+                self._render_status(f"git changes found; waiting for {self.backend.name} to become idle")
+            return
         else:
             status = self.last_status
         if not status.strip():
@@ -7787,7 +8333,7 @@ class ProxyRunner:
                 self._render_status(f"git changes found; parsing {self.backend.name} session")
             return
         if (
-            now - self.last_status_change < self.FILE_STABLE_SECONDS
+            now - self._last_change_at < self.FILE_STABLE_SECONDS
             or now - self.last_child_output < self.CHILD_IDLE_SECONDS
         ):
             if self.verbose:
@@ -7928,13 +8474,14 @@ class ProxyRunner:
             self._copy_prompted[rel] = fingerprint
         rels = [rel for rel, _ in fresh]
         # The file list is shown vertically (one per line, scrolls with PgUp/PgDn), led by
-        # a "File(s):" line so it's clear the message refers to these names.
+        # a "File(s):" line (set off with a blank line above it) so it's clear the message
+        # refers to these names.
         if on_exit:
             title = (
                 f"This session's worktree ({wt_dir}) has {len(rels)} file(s) not in the base repo "
                 f"that will be DELETED when the worktree is removed on exit. Copy them into the base "
                 f"repo ({base_dir}) first? (Press Esc to cancel the exit and handle them yourself.)\n"
-                f"File(s):"
+                f"\nFile(s):"
             )
             options = ["No, discard them with the worktree", "Yes, copy to the base repo"]
         else:
@@ -7943,7 +8490,7 @@ class ProxyRunner:
                 f"into the base — intentionally unstaged or git-ignored. Copy them into the base repo ({base_dir})?\n"
                 f"(Decline and aGiTrack won't ask about this set again until the files change as a set "
                 f"or you switch sessions.)\n"
-                f"File(s):"
+                f"\nFile(s):"
             )
             options = ["No, leave them in the worktree", "Yes, copy to the base repo"]
         choice = self._select_popup(title, options, detail=rels)

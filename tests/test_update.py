@@ -341,6 +341,26 @@ def test_apply_package_primary_path_is_running_interpreter_pip(monkeypatch):
     assert calls == [[sys.executable, "-m", "pip", "install", "--upgrade", "agitrack"]]
 
 
+def test_apply_package_detaches_pip_from_terminal(monkeypatch):
+    # The upgrade must run in its OWN session so a terminal-close SIGHUP (the user
+    # quitting VS Code mid-upgrade) can't kill pip between uninstall and reinstall
+    # and leave aGiTrack uninstalled.
+    updater = Updater(source_repo=None)
+    monkeypatch.setattr(updater, "_has_module_pip", lambda python: True)
+    monkeypatch.setattr(updater, "_installed_version", lambda: "2.0.0")
+    seen: dict = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"] = list(cmd)
+        seen["kwargs"] = kwargs
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("agitrack.update.updater.subprocess.run", fake_run)
+    assert updater.apply().ok
+    assert seen["cmd"][-3:] == ["install", "--upgrade", "agitrack"]
+    assert seen["kwargs"].get("start_new_session") is True
+
+
 def test_apply_package_pip_falls_back_to_pip3_on_path(monkeypatch):
     updater = Updater(source_repo=None)
     monkeypatch.setattr(updater, "_has_module_pip", lambda python: False)  # no `python -m pip`
