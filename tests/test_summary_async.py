@@ -211,6 +211,21 @@ def test_commit_path_does_not_block_on_summarization(tmp_path, monkeypatch):
     assert (repo.notes_show(final, namespace="agitrack/session-summary") or "").startswith("rolling narrative")
 
 
+def test_start_commit_summary_skips_while_exiting(tmp_path, monkeypatch):
+    # During exit-finalize a fresh summarizer call must NOT be started: it would only be
+    # blocked on a few lines later and drag teardown out by a whole LLM round-trip per
+    # session. The commit keeps its prompt-based message instead.
+    runner, repo = _summary_runner(tmp_path, monkeypatch)
+    sha = _commit_change(repo, "a.txt", "<aGiTrack> prompt subject")
+    runner._exiting = True
+
+    runner._start_commit_summary(sha, _TRACE_TEXT)
+
+    assert runner._summary_thread is None  # no summarizer thread spun up
+    assert runner._summary_pending is None
+    assert repo.commit_message("HEAD").startswith("<aGiTrack> prompt subject")  # message untouched
+
+
 def test_summarizing_notice_precedes_created_popup_worktree(tmp_path, monkeypatch):
     # The reported bug: the "Created <aGiTrack> commit … merged" popup appeared
     # before the "summarizing…" one. A worktree session announces the commit
