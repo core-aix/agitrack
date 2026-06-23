@@ -20,6 +20,7 @@ import os
 import pty
 import select
 import signal
+import threading
 import time
 
 
@@ -38,6 +39,10 @@ class BackendProcess:
     def __init__(self, master_fd: int | None = None, child_pid: int | None = None) -> None:
         self.master_fd = master_fd
         self.child_pid = child_pid
+        # Serializes writes to the PTY: the main reactor thread forwards keystrokes
+        # while the git worker may inject a conflict-resolution prompt, and a
+        # multi-byte payload must not interleave with another write's bytes.
+        self._write_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Spawn
@@ -115,7 +120,8 @@ class BackendProcess:
         """
         if self.master_fd is None:
             return
-        os.write(self.master_fd, data)
+        with self._write_lock:
+            os.write(self.master_fd, data)
 
     # ------------------------------------------------------------------
     # Resize (PTY ioctl only)

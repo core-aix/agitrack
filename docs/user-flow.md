@@ -204,6 +204,13 @@ flowchart TD
   copy["Offer to copy worktree-only files to base"] --> back(["Back to the input loop"])
 ```
 
+> **The whole status → commit → integrate pipeline above runs on a dedicated git worker
+> thread, never the main one** — so a `git status`/commit/merge can never block your typing,
+> even right after an edit. Any dialog it needs (the conflict prompt, the copy/keep/discard
+> offers) is handed to the main thread to present and the answer passed back; the worker only
+> ever touches the **foreground** session. Background sessions are committed/integrated on the
+> main thread (rare, throttled, and never the session you're typing in).
+
 **Jump to:** [Copy worktree-only files to base](#6-after-the-turn-copy-worktree-only-files-to-base)
 
 ---
@@ -403,7 +410,7 @@ flowchart TD
 
   apply{"Apply the update"}
   apply -->|Source-linked| src[["Fast-forward only; abort with a message if the checkout is dirty or diverged"]]
-  apply -->|Package| pkg[["Upgrade via the running interpreter's pip; PEP 668 defers to brew or prints every manual route"]]
+  apply -->|Package| pkg[["Upgrade via the running interpreter's pip (PEP 668 defers to brew or prints every manual route). Runs DETACHED in its own session so a terminal-close SIGHUP mid-upgrade can't kill pip between uninstall and reinstall"]]
   src --> ok{"Succeeded?"}
   pkg --> ok
   ok -->|Yes| reexec[["Re-exec python -m agitrack so the new code loads"]]
@@ -411,6 +418,12 @@ flowchart TD
   reexec --> done2(["Updated"])
   failnotice --> done2
 ```
+
+> **An interrupted upgrade never leaves aGiTrack uninstalled.** `pip install --upgrade`
+> removes the old version before writing the new, so the upgrade runs in its own session
+> (`start_new_session`) and a SIGHUP/SIGTERM that arrives while it applies is **ignored**
+> (the apply + restart finish) — closing the terminal or quitting VS Code mid-upgrade can no
+> longer strand the package half-removed.
 
 > Distinct from the **backend agent** (Claude / OpenCode) updating itself: that runs
 > inside the agent TUI, and the sandbox is built to keep the agent's own install dirs
@@ -420,30 +433,36 @@ flowchart TD
 
 ## 10. Exit and terminal close
 
-Pressing **Esc** at any exit prompt **cancels the exit** — aGiTrack keeps running and tells
-you what was *not* done, so you can handle it yourself (commits already made this exit are
-kept; nothing is deleted). Only an explicit "Yes"/"No" choice proceeds.
+Exiting **always asks first** — a deliberate safety net — regardless of whether anything is
+pending. Pressing **Esc** at any exit prompt **cancels the exit**: aGiTrack keeps running and
+tells you what was *not* done, so you can handle it yourself (commits already made this exit
+are kept; nothing is deleted). Only an explicit "Yes"/"No" choice proceeds.
 
 ```mermaid
 flowchart TD
   how{"How is aGiTrack ending?"}
-  how -->|"Ctrl-G then 'exit aGiTrack', managing instance"| conf[/"Exit aGiTrack? • No, keep working • Yes, exit (Esc cancels)"/]
+  how -->|"Ctrl-C, or Ctrl-G then 'exit aGiTrack'"| conf[/"Exit aGiTrack? • No, keep working • Yes, exit (or press Ctrl-C again) — Esc cancels"/]
   conf -->|No / Esc| stay(["Exit cancelled — keep working (a message says nothing was shut down)"])
-  conf -->|Yes| busy{"Sessions still running, turns in flight?"}
+  conf -->|Yes| busy{"Background sessions still running?"}
   busy -->|Yes| term[/"Terminate them and exit? • No, keep working • Yes, terminate them and exit (Esc cancels)"/]
   busy -->|No| fin
   term -->|No / Esc| stay
   term -->|Yes| fin
 
-  how -->|Terminal or window closed, SIGHUP/SIGTERM| sig[["_handle_exit_signal: best-effort finalize pending work, render suppressed (non-interactive)"]]
+  how -->|"Terminal or window closed, SIGHUP/SIGTERM (incl. system restart)"| sig[["_handle_exit_signal: note whether work was in progress, then best-effort finalize, render suppressed (non-interactive)"]]
 
-  fin[["Finalize each session: commit a just-completed turn, integrate committed work"]]
+  fin[["Finalize each session: commit a just-completed turn, integrate committed work. ALWAYS shows a notice the moment exit begins (teardown can take seconds) — a specific 'Finishing up before exit — …' naming the work when known, else a generic 'Finalizing things before exiting…'"]]
   fin --> copy2["Per session, before deleting its worktree: offer to copy its leftover files (see Copy)"]
   copy2 --> esc{"Esc on that copy offer?"}
   esc -->|Yes| abort(["Exit cancelled — worktree + files kept; message tells you to copy them then exit again"])
   esc -->|No| rm[["Remove the (fully-integrated) worktree(s), stop the dashboard"]]
   sig --> fin
-  rm --> bye(["aGiTrack exits"])
+  rm --> pend{"Forced close (SIGHUP/SIGTERM) that interrupted work, on a macOS desktop?"}
+  pend -->|"No (chose to exit, clean close, or no GUI)"| bye(["aGiTrack exits"])
+  pend -->|Yes| ask[/"Out-of-terminal dialog: Reopen aGiTrack • Quit aGiTrack (auto-quits after 25s, so a restart never hangs)"/]
+  ask -->|Quit / timeout| bye
+  ask -->|Reopen| again[["Release the lock, then open a new window running aGiTrack in the repo (last session auto-resumes)"]]
+  again --> bye
 ```
 
 **Jump to:** [Copy worktree-only files to base](#6-after-the-turn-copy-worktree-only-files-to-base)

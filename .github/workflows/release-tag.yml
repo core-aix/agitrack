@@ -109,13 +109,28 @@ jobs:
           UV_PUBLISH_TOKEN: ${{ secrets.PYPI_TOKEN }}
         run: uv publish
 
+      # Summarize the key changes since the previous release with the OpenAI API
+      # (shared composite action). The change range ends at this tag. AI-only:
+      # this step FAILS the release with a descriptive error if OpenAI is
+      # unavailable. Requires the OPENAI_API_KEY secret.
+      - name: Generate AI release notes
+        id: notes
+        uses: ./.github/actions/ai-release-notes
+        with:
+          version: ${{ steps.version.outputs.version }}
+          ref: ${{ github.ref_name }}
+          repository: ${{ github.repository }}
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+
       - name: Create GitHub Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NOTES_FILE: ${{ steps.notes.outputs.notes-file }}
         run: |
-          gh release create "${GITHUB_REF#refs/tags/}" \
-            --title "${GITHUB_REF#refs/tags/}" \
-            --generate-notes \
+          TAG="${GITHUB_REF#refs/tags/}"
+          gh release create "${TAG}" \
+            --title "${TAG}" \
+            --notes-file "${NOTES_FILE}" \
             dist/*
 
       # Publish the VSCode extension to the Marketplace at the matching version, so a

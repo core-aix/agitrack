@@ -521,6 +521,12 @@ class Updater:
         pip = self._pip_invocation()
         pep668 = False
         if pip is not None:
+            # Detach the upgrade into its own session (`start_new_session`). `pip
+            # install --upgrade` uninstalls the old version before writing the new,
+            # so an interruption between the two leaves aGiTrack UNINSTALLED. Running
+            # it in a new session means a terminal-close SIGHUP (the user quitting
+            # VS Code / closing the window mid-upgrade) is NOT delivered to pip, so it
+            # runs to completion and the package is never left half-removed.
             result = subprocess.run(
                 [*pip, "install", "--upgrade", DIST_NAME],
                 text=True,
@@ -528,6 +534,7 @@ class Updater:
                 stderr=subprocess.PIPE,
                 check=False,
                 timeout=600,
+                start_new_session=True,
             )
             if result.returncode == 0:
                 return self._package_upgraded(status)
@@ -551,6 +558,7 @@ class Updater:
                     stderr=subprocess.PIPE,
                     check=False,
                     timeout=600,
+                    start_new_session=True,  # survive a terminal-close SIGHUP mid-upgrade
                 )
                 if result.returncode == 0:
                     return self._package_upgraded(status)

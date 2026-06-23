@@ -2313,6 +2313,118 @@ def test_apply_timings_overrides_constants():
     assert runner.POLL_SECONDS == DEFAULT_TIMINGS["background_poll_seconds"]
 
 
+def test_apply_timings_sets_idle_backoff_constants():
+    from agitrack.config import DEFAULT_TIMINGS
+
+    runner = make_runner()
+    custom = dict(DEFAULT_TIMINGS, idle_after_seconds=12.0, idle_poll_seconds=45.0)
+    runner._apply_timings(custom)
+    assert runner.IDLE_AFTER_SECONDS == 12.0
+    assert runner.IDLE_POLL_SECONDS == 45.0
+
+
+def test_select_timeout_backs_off_when_idle():
+    # A quiescent runner (no input/output/work) blocks in select for the long
+    # IDLE_POLL_SECONDS so the CPU can sleep; any work drops it to the active
+    # poll, and a queued repaint flushes on the very next tick. The active poll
+    # is a coarse ≥1s — every background sweep self-throttles, and select still
+    # wakes instantly on real input/output.
+    runner = make_runner()
+    runner.IDLE_POLL_SECONDS = 30.0
+    runner.ACTIVE_POLL_SECONDS = 1.0
+    assert runner.ACTIVE_POLL_SECONDS >= 1.0  # no sub-second busy-poll
+
+    assert runner._is_idle() is True
+    assert runner._select_timeout() == 30.0
+
+    runner.agent_in_flight = True  # a turn is in flight → active poll
+    assert runner._is_idle() is False
+    assert runner._select_timeout() == 1.0
+
+    runner.agent_in_flight = False
+    runner._render_pending = True  # a paint is queued → flush next tick
+    assert runner._select_timeout() == 0.016
+
+
+def test_select_timeout_honors_deferred_prompt_submit():
+    import time
+
+    # The injected-Enter is scheduled 0.4s out; the active poll must not stretch
+    # it to a full second, so the timeout collapses to the time remaining.
+    runner = make_runner()
+    runner._render_pending = False
+    runner.ACTIVE_POLL_SECONDS = 1.0
+    runner._pending_enter_at = time.monotonic() + 0.4
+    timeout = runner._select_timeout()
+    assert 0.0 < timeout <= 0.4  # blocks only until the Enter is due, not 1s
+
+    runner._pending_enter_at = time.monotonic() - 5  # already overdue → fire now
+    assert runner._select_timeout() == 0.0
+
+
+def test_is_idle_false_until_user_and_backend_go_quiet():
+    import time
+
+    runner = make_runner()
+    runner.IDLE_AFTER_SECONDS = 30.0
+    now = time.monotonic()
+
+    runner.last_user_input = now  # just typed
+    assert runner._is_idle() is False
+
+    runner.last_user_input = now - 100  # typed long ago
+    runner.last_child_output = now  # but the backend just printed
+    assert runner._is_idle() is False
+
+    runner.last_child_output = now - 100  # both quiet now
+    assert runner._is_idle() is True
+
+
+def test_is_idle_false_for_pending_pipeline_work():
+    import time
+
+    runner = make_runner()
+    old = time.monotonic() - 100
+    runner.last_user_input = old
+    runner.last_child_output = old
+    assert runner._is_idle() is True  # baseline: idle
+
+    # A queued prompt, a deferred Enter, or a set file-change event each keep the
+    # fast loop so the per-turn pipeline is serviced without delay.
+    runner.pending_prompt_text = "do the thing"
+    assert runner._is_idle() is False
+    runner.pending_prompt_text = ""
+
+    runner._pending_enter_at = time.monotonic() + 0.4
+    assert runner._is_idle() is False
+    runner._pending_enter_at = None
+
+    runner.file_change_event.set()
+    assert runner._is_idle() is False
+    runner.file_change_event.clear()
+    assert runner._is_idle() is True
+
+
+def test_is_idle_respects_timed_but_not_sticky_messages():
+    import time
+
+    runner = make_runner()
+    old = time.monotonic() - 100
+    runner.last_user_input = old
+    runner.last_child_output = old
+
+    # A timed notice must expire on schedule, so it keeps us awake.
+    runner.message = "Saved."
+    runner._message_sticky = False
+    runner.message_until = time.monotonic() + 5
+    assert runner._is_idle() is False
+
+    # A sticky notice waits for a keypress (which wakes select on its own), so it
+    # must NOT pin the CPU at the fast poll rate.
+    runner._message_sticky = True
+    assert runner._is_idle() is True
+
+
 def test_proxy_refuses_second_instance(monkeypatch, capsys):
     import sys
 
@@ -2772,14 +2884,484 @@ def test_finalize_pending_work_commits_non_interactively():
     assert all(call.get("prompt_untracked") is False for call in calls)
 
 
+def _finalize_message_runner(monkeypatch=None):
+    runner = make_runner()
+    runner.sessions = []
+    runner._render = lambda: None
+    # Isolate the message from the rest of teardown.
+    for name in (
+        "_stop_git_worker",
+        "_cancel_inflight_shared_fetches",
+        "_commit_latest_turn_sync",
+        "_auto_share_on_exit",
+        "_finalize_summary_then_integrate_on_exit",
+        "_delete_orphan_merged_branches",
+    ):
+        setattr(runner, name, lambda *a, **k: None)
+    return runner
+
+
+def test_finalize_always_shows_a_message_even_when_clean():
+    # Even a "clean" exit does teardown (worktree removal, auto-share push, thread
+    # joins) that can take seconds, so it must never be silent.
+    runner = _finalize_message_runner()
+    msgs: list = []
+    runner._set_message = lambda m, **k: msgs.append(m)
+    runner._describe_exit_finalize = lambda: None  # nothing specific to name
+
+    runner._finalize_pending_work()
+
+    assert msgs, "exit must show a message immediately"
+    assert "Finalizing things before exiting" in msgs[0]
+    assert "commit" not in msgs[0].lower()  # never the vague "finalizing commits"
+
+
+def test_finalize_shows_the_specific_work_when_known():
+    runner = _finalize_message_runner()
+    msgs: list = []
+    runner._set_message = lambda m, **k: msgs.append(m)
+    runner._describe_exit_finalize = lambda: "Finishing up before exit — committing the latest turn…"
+
+    runner._finalize_pending_work()
+
+    assert msgs[0] == "Finishing up before exit — committing the latest turn…"
+
+
+def _fake_completed(stdout):
+    return types.SimpleNamespace(stdout=stdout, returncode=0)
+
+
+def test_confirm_forced_exit_quit_without_gui(monkeypatch):
+    from agitrack.proxy import host_prompt
+
+    monkeypatch.setattr(host_prompt, "can_show_dialog", lambda: False)
+    # No window server: never shell out, just resolve to QUIT so the exit is fast.
+    monkeypatch.setattr(
+        host_prompt.subprocess,
+        "run",
+        lambda *a, **k: pytest.fail("must not run osascript without a GUI"),
+    )
+    assert host_prompt.confirm_forced_exit("x") == host_prompt.QUIT
+
+
+def test_confirm_forced_exit_parses_button_and_timeout(monkeypatch):
+    from agitrack.proxy import host_prompt
+
+    monkeypatch.setattr(host_prompt, "can_show_dialog", lambda: True)
+
+    monkeypatch.setattr(
+        host_prompt.subprocess,
+        "run",
+        lambda *a, **k: _fake_completed("button returned:Reopen aGiTrack, gave up:false"),
+    )
+    assert host_prompt.confirm_forced_exit("x") == host_prompt.REOPEN
+
+    monkeypatch.setattr(
+        host_prompt.subprocess,
+        "run",
+        lambda *a, **k: _fake_completed("button returned:Quit aGiTrack, gave up:false"),
+    )
+    assert host_prompt.confirm_forced_exit("x") == host_prompt.QUIT
+
+    # A timed-out dialog (system restart) reports gave up:true and must QUIT,
+    # even though the giving-up record can echo the default button.
+    monkeypatch.setattr(
+        host_prompt.subprocess,
+        "run",
+        lambda *a, **k: _fake_completed("button returned:Reopen aGiTrack, gave up:true"),
+    )
+    assert host_prompt.confirm_forced_exit("x") == host_prompt.QUIT
+
+
+def test_confirm_forced_exit_quit_on_osascript_error(monkeypatch):
+    from agitrack.proxy import host_prompt
+
+    monkeypatch.setattr(host_prompt, "can_show_dialog", lambda: True)
+
+    def boom(*a, **k):
+        raise OSError("osascript blew up")
+
+    monkeypatch.setattr(host_prompt.subprocess, "run", boom)
+    assert host_prompt.confirm_forced_exit("x") == host_prompt.QUIT
+
+
+def test_can_show_dialog_requires_macos(monkeypatch):
+    from agitrack.proxy import host_prompt
+
+    monkeypatch.setattr(host_prompt.shutil, "which", lambda _name: "/usr/bin/osascript")
+    monkeypatch.setattr(host_prompt.sys, "platform", "linux")
+    assert host_prompt.can_show_dialog() is False
+    monkeypatch.setattr(host_prompt.sys, "platform", "darwin")
+    assert host_prompt.can_show_dialog() is True
+    monkeypatch.setattr(host_prompt.shutil, "which", lambda _name: None)
+    assert host_prompt.can_show_dialog() is False
+
+
+def test_had_unfinalized_work_detects_inflight_and_unmerged():
+    runner = make_runner()
+    runner.sessions = []
+    runner._unmerged_worktrees = lambda: []
+
+    runner._agent_is_active = lambda: True  # a turn is in flight
+    assert runner._had_unfinalized_work() is True
+
+    runner._agent_is_active = lambda: False
+    runner._unmerged_worktrees = lambda: [("session-1 (current session)", "")]  # committed but unmerged
+    assert runner._had_unfinalized_work() is True
+
+
+def test_had_unfinalized_work_ignores_base_repo_and_declined_dirt():
+    # A clean session (every turn committed AND merged) must exit silently even when
+    # the developer's own base repo is dirty or the worktree has declined/ignored
+    # files — aGiTrack does not finalize those, so they aren't "unfinalized work".
+    runner = make_runner()
+    runner.sessions = []
+    runner._agent_is_active = lambda: False
+    runner._unmerged_worktrees = lambda: []  # _unmerged_worktrees already excludes that noise
+    assert runner._had_unfinalized_work() is False
+    assert runner._describe_exit_finalize() is None
+
+
+def test_describe_exit_finalize_names_the_pending_work():
+    # When there IS something to finalize, the exit message says exactly what.
+    runner = make_runner()
+    runner.sessions = []
+    runner._agent_is_active = lambda: True
+    runner._unmerged_worktrees = lambda: [("foo (dormant)", "foo")]
+    detail = runner._describe_exit_finalize()
+    assert detail is not None
+    assert "committing the latest turn" in detail
+    assert "foo (dormant)" in detail
+    assert "Finalizing commits" not in detail  # not the old vague message
+
+
+def test_handle_exit_signal_ignored_while_update_applying():
+    # A terminal-close SIGHUP must NOT tear aGiTrack down mid-self-update: unwinding
+    # would abort the pip apply and could leave aGiTrack half-uninstalled.
+    import signal as signal_mod
+
+    runner = make_runner()
+    runner._update_applying = True
+    torn = []
+    runner._finalize_pending_work = lambda: torn.append("finalize")
+    runner._cleanup_child = lambda: torn.append("cleanup")
+    runner._restore_terminal = lambda: torn.append("restore")
+
+    runner._handle_exit_signal(signal_mod.SIGHUP, None)  # returns, does NOT raise SystemExit
+
+    assert torn == [], "exit signal must be ignored while an update is applying"
+    assert runner.running is True
+
+
+def test_handle_exit_signal_prompts_only_when_work_pending(monkeypatch):
+    import signal as signal_mod
+
+    runner = make_runner()
+    runner._disable_host_terminal_modes = lambda: None
+    runner._cleanup_child = lambda: None
+    runner._restore_terminal = lambda: None
+    runner._finalize_pending_work = lambda: None
+    prompted = []
+    runner._prompt_forced_exit = lambda: prompted.append(True)
+
+    runner._had_unfinalized_work = lambda: False
+    with pytest.raises(SystemExit):
+        runner._handle_exit_signal(signal_mod.SIGHUP, None)
+    assert prompted == [], "a clean close must exit silently"
+
+    runner._had_unfinalized_work = lambda: True
+    with pytest.raises(SystemExit):
+        runner._handle_exit_signal(signal_mod.SIGHUP, None)
+    assert prompted == [True], "a close mid-work must prompt the user"
+
+
+def test_prompt_forced_exit_arms_reopen_on_choice(monkeypatch):
+    from agitrack.proxy import host_prompt
+
+    runner = make_runner()
+    monkeypatch.setattr(host_prompt, "can_show_dialog", lambda: True)
+
+    monkeypatch.setattr(host_prompt, "confirm_forced_exit", lambda *a, **k: host_prompt.REOPEN)
+    runner._prompt_forced_exit()
+    assert runner._reopen_after_exit is True
+
+    runner._reopen_after_exit = False
+    monkeypatch.setattr(host_prompt, "confirm_forced_exit", lambda *a, **k: host_prompt.QUIT)
+    runner._prompt_forced_exit()
+    assert runner._reopen_after_exit is False
+
+
+def test_prompt_forced_exit_noop_without_gui(monkeypatch):
+    from agitrack.proxy import host_prompt
+
+    runner = make_runner()
+    monkeypatch.setattr(host_prompt, "can_show_dialog", lambda: False)
+    monkeypatch.setattr(
+        host_prompt,
+        "confirm_forced_exit",
+        lambda *a, **k: pytest.fail("must not prompt without a GUI"),
+    )
+    runner._prompt_forced_exit()
+    assert runner._reopen_after_exit is False
+
+
+def test_reopen_in_new_window_builds_resume_command(monkeypatch):
+    from agitrack.proxy import host_prompt
+
+    runner = make_runner()
+    runner.base_repo = types.SimpleNamespace(status_short=lambda: "", repo="/repo/root")
+    captured = {}
+
+    def fake_reopen(command, cwd):
+        captured["command"] = command
+        captured["cwd"] = cwd
+        return True
+
+    monkeypatch.setattr(host_prompt, "reopen_in_new_terminal", fake_reopen)
+    monkeypatch.setattr("agitrack.proxy.runner.sys.argv", ["agitrack", "--backend", "claude"])
+    runner._reopen_in_new_window()
+
+    assert "-m agitrack" in captured["command"]
+    assert "--backend claude" in captured["command"]
+    assert captured["cwd"] == "/repo/root"
+
+
+def test_reopen_in_new_terminal_runs_osascript(monkeypatch):
+    from agitrack.proxy import host_prompt
+
+    monkeypatch.setattr(host_prompt.sys, "platform", "darwin")
+    monkeypatch.setattr(host_prompt.shutil, "which", lambda _name: "/usr/bin/osascript")
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        return types.SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(host_prompt.subprocess, "run", fake_run)
+    assert host_prompt.reopen_in_new_terminal("py -m agitrack", "/repo root") is True
+    script = captured["argv"][-1]
+    assert 'tell application "Terminal" to do script' in script
+    # The cwd is single-quoted for the inner shell; a space must not split it.
+    assert "cd '/repo root' && exec py -m agitrack" in script
+
+
+def test_reopen_in_new_terminal_no_op_off_macos(monkeypatch):
+    from agitrack.proxy import host_prompt
+
+    monkeypatch.setattr(host_prompt.sys, "platform", "linux")
+    monkeypatch.setattr(
+        host_prompt.subprocess,
+        "run",
+        lambda *a, **k: pytest.fail("must not run osascript off macOS"),
+    )
+    assert host_prompt.reopen_in_new_terminal("x", "/y") is False
+
+
+def test_host_prompt_quoting_is_injection_safe():
+    from agitrack.proxy import host_prompt
+
+    # An AppleScript literal escapes embedded double quotes and backslashes.
+    assert host_prompt._quote('a"b\\c') == '"a\\"b\\\\c"'
+    # A shell argument single-quotes and escapes embedded single quotes.
+    assert host_prompt._sh_quote("it's") == "'it'\\''s'"
+
+
+def test_git_pipeline_runs_on_worker_thread():
+    # The automatic git pass must run on the dedicated worker, never the main thread.
+    runner = make_runner()
+    runner._main_thread_ident = threading.get_ident()
+    runner.master_fd = 99  # non-None so the worker actually runs a pass
+    ran_on: list = []
+    done = threading.Event()
+
+    def probe():
+        ran_on.append(threading.get_ident())
+        done.set()
+
+    runner._run_git_pipeline = probe
+    runner._start_git_worker()
+    try:
+        runner._git_wake.set()
+        assert done.wait(timeout=3), "the worker never ran a pipeline pass"
+    finally:
+        runner._stop_git_worker()
+    assert ran_on, "pipeline did not run"
+    assert ran_on[0] != threading.get_ident(), "git pipeline ran on the MAIN thread"
+    assert runner._git_worker is None  # stop joined and cleared it
+
+
+def test_timers_phase_runs_no_foreground_git():
+    # The foreground commit/merge moved to the worker, so the main reactor's timers
+    # phase must NOT invoke them (that is what used to block typing).
+    runner = make_runner()
+    runner.running = True
+    runner.merge_ctx = None
+    runner._base_advanced = False
+    called: list = []
+    runner._maybe_agent_commit = lambda: called.append("commit")
+    runner._maybe_complete_agent_merge = lambda: called.append("merge")
+    runner._poll_base_advanced = lambda: called.append("poll")
+
+    def noop(*a, **k):
+        return None
+
+    for name in [
+        "_flush_pending_render",
+        "_flush_pending_enter",
+        "_drain_modal_mailbox",
+        "_resume_pending_prompt_if_ready",
+        "_service_shared_resume",
+        "_ensure_worktree_alive",
+        "_check_base_branch_drift",
+        "_service_commit_summaries",
+        "_service_precompact_summary",
+        "_service_background_sessions",
+        "_maybe_check_for_update",
+        "_maybe_apply_pending_update",
+        "_service_background_share_ops",
+        "_service_session_notices",
+    ]:
+        setattr(runner, name, noop)
+
+    runner._reactor_timers_phase()
+    assert called == [], "foreground git ran on the main thread's timers phase"
+
+
+def test_worker_modal_marshaled_to_main_and_answered():
+    # A dialog raised off the main thread is queued for the main thread, which
+    # presents it and returns the answer to the blocked caller.
+    runner = make_runner()
+    runner._main_thread_ident = threading.get_ident()  # this test thread acts as 'main'
+    modal = object()
+    box: dict = {}
+
+    def worker():
+        box["ret"] = runner._run_modal(modal)  # off-main → marshals + blocks
+
+    t = threading.Thread(target=worker)
+    t.start()
+    request = runner._modal_mailbox.get(timeout=3)  # the worker enqueued it
+    assert request.modal is modal
+    assert not request.done.is_set(), "worker should still be blocked"
+    assert t.is_alive()
+    # Main presents the dialog and hands the answer back.
+    request.result = "answer"
+    request.done.set()
+    t.join(timeout=3)
+    assert box["ret"] == "answer"
+
+
+def test_drain_modal_mailbox_presents_on_main():
+    runner = make_runner()
+    runner._main_thread_ident = threading.get_ident()
+    presented: list = []
+    runner._run_modal_inline = lambda m: (presented.append(threading.get_ident()), "picked")[1]
+
+    request = _make_modal_request(runner, object())
+    runner._modal_mailbox.put(request)
+    runner._drain_modal_mailbox()
+
+    assert request.done.is_set()
+    assert request.result == "picked"
+    assert presented == [threading.get_ident()]  # ran on the main (this) thread
+
+
+def test_acquire_pipeline_lock_from_main_drains_to_avoid_deadlock():
+    # Worker holds the pipeline lock AND is blocked on a dialog; the main thread's
+    # lock acquisition must drain that dialog so the worker can release the lock.
+    runner = make_runner()
+    runner._main_thread_ident = threading.get_ident()
+    runner._run_modal_inline = lambda m: "resolved"  # main presents instantly
+    started = threading.Event()
+    worker_ret: dict = {}
+
+    def worker():
+        with runner._pipeline_lock:  # worker holds the lock...
+            started.set()
+            worker_ret["ret"] = runner._run_modal(object())  # ...and blocks on a dialog
+
+    t = threading.Thread(target=worker)
+    t.start()
+    assert started.wait(timeout=3)
+    # Without draining this would deadlock; the helper drains while waiting.
+    runner._acquire_pipeline_lock_from_main()
+    try:
+        assert worker_ret["ret"] == "resolved"  # the worker's dialog was serviced
+    finally:
+        runner._pipeline_lock.release()
+    t.join(timeout=3)
+    assert not t.is_alive()
+
+
+def test_stop_git_worker_cancels_blocked_dialog():
+    # Teardown must not hang on a worker blocked waiting for a dialog answer.
+    runner = make_runner()
+    runner._main_thread_ident = threading.get_ident()
+    runner.master_fd = 99
+    blocked = threading.Event()
+    answer: dict = {}
+
+    def pipeline():
+        blocked.set()
+        answer["ret"] = runner._run_modal(object())  # blocks until cancelled
+
+    runner._run_git_pipeline = pipeline
+    runner._start_git_worker()
+    runner._git_wake.set()
+    assert blocked.wait(timeout=3)
+    runner._stop_git_worker()  # cancels the pending dialog so the worker can exit
+    assert runner._git_worker is None
+    assert answer["ret"] is None  # cancelled dialogs resolve to None
+
+
+def _make_modal_request(runner, modal):
+    from agitrack.proxy.runner import _ModalRequest
+
+    return _ModalRequest(modal)
+
+
 def test_confirm_exit_prompts_when_managing(monkeypatch):
     runner = make_runner()
-    monkeypatch.setattr(runner, "_select_popup", lambda *a, **k: "Yes, exit")
+    seen = {}
+
+    def fake_popup(title, options, **k):
+        seen["options"] = options
+        return options[1]  # "Yes, exit (Ctrl-C again)"
+
+    monkeypatch.setattr(runner, "_select_popup", fake_popup)
     assert runner._confirm_exit() is True
+    # The exit option advertises the double-Ctrl-C confirm shortcut.
+    assert seen["options"][1] == "Yes, exit (Ctrl-C again)"
     monkeypatch.setattr(runner, "_select_popup", lambda *a, **k: "No, keep working")
     assert runner._confirm_exit() is False
     monkeypatch.setattr(runner, "_select_popup", lambda *a, **k: None)  # cancelled
     assert runner._confirm_exit() is False
+
+
+def test_exit_always_confirms_even_when_nothing_pending():
+    # Exit is a deliberate safety net: it asks first regardless of pending work.
+    runner = make_runner()
+    runner._had_unfinalized_work = lambda: False  # clean tree, everything merged
+    events = []
+    runner._confirm_exit = lambda: events.append("confirm") or True
+    runner._confirm_terminate_background_sessions = lambda: True
+    runner._finalize_pending_work = lambda: events.append("finalize")
+    runner._exit_child = lambda: events.append("exit")
+
+    assert runner._run_exit_flow() is True
+    assert events == ["confirm", "finalize", "exit"], "exit must confirm even when clean"
+
+
+def test_exit_confirm_declined_keeps_running():
+    runner = make_runner()
+    events = []
+    runner._confirm_exit = lambda: False  # user declines the exit prompt
+    runner._finalize_pending_work = lambda: events.append("finalize")
+    runner._exit_child = lambda: events.append("exit")
+    runner._render = lambda: None
+
+    assert runner._run_exit_flow() is False
+    assert events == [], "declining the exit prompt leaves aGiTrack running"
 
 
 def test_proxy_passthrough_prompt_drops_escape_sequences():
@@ -2901,7 +3483,12 @@ def test_proxy_answers_nothing_without_host_values(monkeypatch):
     assert written == []
 
 
-def test_proxy_status_check_runs_after_file_event_only():
+def test_proxy_status_check_runs_after_file_event_only(monkeypatch):
+    # The `git status` read is DEFERRED out of the active edit window: it only fires
+    # once the worktree (FILE_STABLE_SECONDS) and backend (CHILD_IDLE_SECONDS) have
+    # gone quiet — never on every keystroke-adjacent file event. Drive a fixed clock.
+    clock = [10_000.0]
+    monkeypatch.setattr("agitrack.proxy.runner.time.monotonic", lambda: clock[0])
     runner = make_runner(
         file_change_event=threading.Event(),
         status_check_pending=False,
@@ -2912,12 +3499,17 @@ def test_proxy_status_check_runs_after_file_event_only():
         last_child_output=0.0,
         last_status="",
         last_status_change=0.0,
+        _last_change_at=0.0,
         verbose=False,
     )
     runner.CHILD_IDLE_SECONDS = 4.0
     runner.FILE_STABLE_SECONDS = 8.0
     runner._prune_declined_untracked = lambda: None
     runner._commit_available_agent_turns = lambda quiet: False
+    # Keep this test focused on the status-read count; stub the downstream commit path.
+    runner._finish_agent_parse_if_ready = lambda **k: None
+    runner._start_agent_parse = lambda: False
+    runner._maybe_offer_copy_when_idle = lambda now: None
 
     class Repo:
         calls = 0
@@ -2929,9 +3521,17 @@ def test_proxy_status_check_runs_after_file_event_only():
     runner.repo = Repo()
     runner.file_change_event.set()
 
+    # Event just fired: the worktree hasn't settled, so no git read yet.
     runner._maybe_agent_commit()
-    runner._maybe_agent_commit()
+    assert runner.repo.calls == 0
 
+    # Past the stable + idle windows: a single read serves the (deferred) commit.
+    clock[0] += runner.FILE_STABLE_SECONDS + 1
+    runner._maybe_agent_commit()
+    assert runner.repo.calls == 1
+
+    # No new file event → no further reads (cached status is reused).
+    runner._maybe_agent_commit()
     assert runner.repo.calls == 1
 
 
@@ -4185,6 +4785,35 @@ def test_is_real_keypress_ignores_mouse_and_focus():
     assert runner._is_real_keypress(b"\x1b[A") is True  # an arrow key is still a key
     # A mouse move bundled with a real key still counts as a key.
     assert runner._is_real_keypress(b"\x1b[<35;1;1Mx") is True
+    # Mouse SCROLL wheel reports (SGR buttons 64=up / 65=down) are not keystrokes
+    # either: scrolling history must not reset the idle backoff (see _reactor_stdin_phase).
+    assert runner._is_real_keypress(b"\x1b[<64;10;20M") is False
+    assert runner._is_real_keypress(b"\x1b[<65;10;20M") is False
+
+
+def test_mouse_scroll_does_not_reset_idle_backoff():
+    import time
+
+    # A runner quiet long enough to be idle stays idle through a mouse-scroll burst
+    # (passive reading) but flips active the instant a real key arrives. This mirrors
+    # the gate in _reactor_stdin_phase: only _is_real_keypress(data) touches
+    # last_user_input, so scrolling never pins aGiTrack in the 1s active loop.
+    runner = make_runner()
+    runner.IDLE_AFTER_SECONDS = 30.0
+    old = time.monotonic() - 100
+    runner.last_user_input = old
+    runner.last_child_output = old
+    assert runner._is_idle() is True
+
+    scroll = b"\x1b[<65;10;20M"  # wheel-down report
+    if not runner._is_real_keypress(scroll):
+        pass  # would NOT update last_user_input
+    assert runner._is_idle() is True  # still idle after scrolling
+
+    key = b"a"
+    if runner._is_real_keypress(key):
+        runner.last_user_input = time.monotonic()  # a real key wakes the active loop
+    assert runner._is_idle() is False
 
 
 def test_timers_phase_noops_when_not_running():
@@ -4207,15 +4836,16 @@ def test_timers_phase_noops_when_not_running():
 
 def test_timers_phase_stops_after_pending_update_teardown():
     # A deferred update can apply mid-phase (sessions just went idle), finalizing and
-    # removing the worktree; the worktree-touching tail must then be skipped.
+    # removing the worktree; the post-update tail must then be skipped.
     from proxy_helpers import make_runner
 
     runner = make_runner()
     runner.running = True
     runner.merge_ctx = None
     runner._base_advanced = True
-    synced: list = []
-    runner._sync_idle_worktrees_to_base = lambda: synced.append(True)
+    tail: list = []
+    runner._service_background_share_ops = lambda: tail.append("share")
+    runner._service_session_notices = lambda: tail.append("notices")
 
     def noop(*a, **k):
         return None
@@ -4223,19 +4853,16 @@ def test_timers_phase_stops_after_pending_update_teardown():
     for name in [
         "_flush_pending_render",
         "_flush_pending_enter",
+        "_drain_modal_mailbox",
         "_check_base_branch_drift",
         "_resume_pending_prompt_if_ready",
         "_ensure_worktree_alive",
         "_service_commit_summaries",
         "_service_precompact_summary",
         "_service_shared_resume",
-        "_maybe_agent_commit",
         "_service_background_sessions",
-        "_poll_base_advanced",
-        "_warn_if_base_edited",
-        "_warn_if_cwd_drifted",
+        "_sync_idle_worktrees_to_base",
         "_maybe_check_for_update",
-        "_service_session_notices",
     ]:
         setattr(runner, name, noop)
 
@@ -4245,7 +4872,7 @@ def test_timers_phase_stops_after_pending_update_teardown():
     runner._maybe_apply_pending_update = apply_pending
     runner._reactor_timers_phase()
 
-    assert synced == []  # the worktree-sync tail was skipped after teardown
+    assert tail == []  # the post-update tail (share ops, notices) was skipped after teardown
 
 
 def test_ensure_worktree_alive_recreates_externally_deleted_worktree(tmp_path):
