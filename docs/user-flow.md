@@ -435,7 +435,7 @@ flowchart TD
   term -->|No / Esc| stay
   term -->|Yes| fin
 
-  how -->|Terminal or window closed, SIGHUP/SIGTERM| sig[["_handle_exit_signal: best-effort finalize pending work, render suppressed (non-interactive)"]]
+  how -->|"Terminal or window closed, SIGHUP/SIGTERM (incl. system restart)"| sig[["_handle_exit_signal: note whether work was in progress, then best-effort finalize, render suppressed (non-interactive)"]]
 
   fin[["Finalize each session: commit a just-completed turn, integrate committed work"]]
   fin --> copy2["Per session, before deleting its worktree: offer to copy its leftover files (see Copy)"]
@@ -443,7 +443,12 @@ flowchart TD
   esc -->|Yes| abort(["Exit cancelled — worktree + files kept; message tells you to copy them then exit again"])
   esc -->|No| rm[["Remove the (fully-integrated) worktree(s), stop the dashboard"]]
   sig --> fin
-  rm --> bye(["aGiTrack exits"])
+  rm --> pend{"Forced close (SIGHUP/SIGTERM) that interrupted work, on a macOS desktop?"}
+  pend -->|"No (chose to exit, clean close, or no GUI)"| bye(["aGiTrack exits"])
+  pend -->|Yes| ask[/"Out-of-terminal dialog: Reopen aGiTrack • Quit aGiTrack (auto-quits after 25s, so a restart never hangs)"/]
+  ask -->|Quit / timeout| bye
+  ask -->|Reopen| again[["Release the lock, then open a new window running aGiTrack in the repo (last session auto-resumes)"]]
+  again --> bye
 ```
 
 **Jump to:** [Copy worktree-only files to base](#6-after-the-turn-copy-worktree-only-files-to-base)
