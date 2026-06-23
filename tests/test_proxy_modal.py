@@ -464,6 +464,7 @@ def test_exit_byte_in_modal_reaches_finalize_pending_work():
 def test_exit_byte_in_modal_decline_continues_modal():
     """Ctrl-C inside a modal with exit declined keeps the modal running."""
     runner = make_runner()
+    runner._exit_needs_confirmation = lambda: True  # work pending → the confirm popup shows
     runner._set_message = lambda *a, **k: None
     runner._render = lambda: None
     runner._clear_message = lambda: None

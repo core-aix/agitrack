@@ -3093,14 +3093,205 @@ def test_host_prompt_quoting_is_injection_safe():
     assert host_prompt._sh_quote("it's") == "'it'\\''s'"
 
 
+def test_git_pipeline_runs_on_worker_thread():
+    # The automatic git pass must run on the dedicated worker, never the main thread.
+    runner = make_runner()
+    runner._main_thread_ident = threading.get_ident()
+    runner.master_fd = 99  # non-None so the worker actually runs a pass
+    ran_on: list = []
+    done = threading.Event()
+
+    def probe():
+        ran_on.append(threading.get_ident())
+        done.set()
+
+    runner._run_git_pipeline = probe
+    runner._start_git_worker()
+    try:
+        runner._git_wake.set()
+        assert done.wait(timeout=3), "the worker never ran a pipeline pass"
+    finally:
+        runner._stop_git_worker()
+    assert ran_on, "pipeline did not run"
+    assert ran_on[0] != threading.get_ident(), "git pipeline ran on the MAIN thread"
+    assert runner._git_worker is None  # stop joined and cleared it
+
+
+def test_timers_phase_runs_no_foreground_git():
+    # The foreground commit/merge moved to the worker, so the main reactor's timers
+    # phase must NOT invoke them (that is what used to block typing).
+    runner = make_runner()
+    runner.running = True
+    runner.merge_ctx = None
+    runner._base_advanced = False
+    called: list = []
+    runner._maybe_agent_commit = lambda: called.append("commit")
+    runner._maybe_complete_agent_merge = lambda: called.append("merge")
+    runner._poll_base_advanced = lambda: called.append("poll")
+
+    def noop(*a, **k):
+        return None
+
+    for name in [
+        "_flush_pending_render",
+        "_flush_pending_enter",
+        "_drain_modal_mailbox",
+        "_resume_pending_prompt_if_ready",
+        "_service_shared_resume",
+        "_ensure_worktree_alive",
+        "_check_base_branch_drift",
+        "_service_commit_summaries",
+        "_service_precompact_summary",
+        "_service_background_sessions",
+        "_maybe_check_for_update",
+        "_maybe_apply_pending_update",
+        "_service_background_share_ops",
+        "_service_session_notices",
+    ]:
+        setattr(runner, name, noop)
+
+    runner._reactor_timers_phase()
+    assert called == [], "foreground git ran on the main thread's timers phase"
+
+
+def test_worker_modal_marshaled_to_main_and_answered():
+    # A dialog raised off the main thread is queued for the main thread, which
+    # presents it and returns the answer to the blocked caller.
+    runner = make_runner()
+    runner._main_thread_ident = threading.get_ident()  # this test thread acts as 'main'
+    modal = object()
+    box: dict = {}
+
+    def worker():
+        box["ret"] = runner._run_modal(modal)  # off-main → marshals + blocks
+
+    t = threading.Thread(target=worker)
+    t.start()
+    request = runner._modal_mailbox.get(timeout=3)  # the worker enqueued it
+    assert request.modal is modal
+    assert not request.done.is_set(), "worker should still be blocked"
+    assert t.is_alive()
+    # Main presents the dialog and hands the answer back.
+    request.result = "answer"
+    request.done.set()
+    t.join(timeout=3)
+    assert box["ret"] == "answer"
+
+
+def test_drain_modal_mailbox_presents_on_main():
+    runner = make_runner()
+    runner._main_thread_ident = threading.get_ident()
+    presented: list = []
+    runner._run_modal_inline = lambda m: (presented.append(threading.get_ident()), "picked")[1]
+
+    request = _make_modal_request(runner, object())
+    runner._modal_mailbox.put(request)
+    runner._drain_modal_mailbox()
+
+    assert request.done.is_set()
+    assert request.result == "picked"
+    assert presented == [threading.get_ident()]  # ran on the main (this) thread
+
+
+def test_acquire_pipeline_lock_from_main_drains_to_avoid_deadlock():
+    # Worker holds the pipeline lock AND is blocked on a dialog; the main thread's
+    # lock acquisition must drain that dialog so the worker can release the lock.
+    runner = make_runner()
+    runner._main_thread_ident = threading.get_ident()
+    runner._run_modal_inline = lambda m: "resolved"  # main presents instantly
+    started = threading.Event()
+    worker_ret: dict = {}
+
+    def worker():
+        with runner._pipeline_lock:  # worker holds the lock...
+            started.set()
+            worker_ret["ret"] = runner._run_modal(object())  # ...and blocks on a dialog
+
+    t = threading.Thread(target=worker)
+    t.start()
+    assert started.wait(timeout=3)
+    # Without draining this would deadlock; the helper drains while waiting.
+    runner._acquire_pipeline_lock_from_main()
+    try:
+        assert worker_ret["ret"] == "resolved"  # the worker's dialog was serviced
+    finally:
+        runner._pipeline_lock.release()
+    t.join(timeout=3)
+    assert not t.is_alive()
+
+
+def test_stop_git_worker_cancels_blocked_dialog():
+    # Teardown must not hang on a worker blocked waiting for a dialog answer.
+    runner = make_runner()
+    runner._main_thread_ident = threading.get_ident()
+    runner.master_fd = 99
+    blocked = threading.Event()
+    answer: dict = {}
+
+    def pipeline():
+        blocked.set()
+        answer["ret"] = runner._run_modal(object())  # blocks until cancelled
+
+    runner._run_git_pipeline = pipeline
+    runner._start_git_worker()
+    runner._git_wake.set()
+    assert blocked.wait(timeout=3)
+    runner._stop_git_worker()  # cancels the pending dialog so the worker can exit
+    assert runner._git_worker is None
+    assert answer["ret"] is None  # cancelled dialogs resolve to None
+
+
+def _make_modal_request(runner, modal):
+    from agitrack.proxy.runner import _ModalRequest
+
+    return _ModalRequest(modal)
+
+
 def test_confirm_exit_prompts_when_managing(monkeypatch):
     runner = make_runner()
-    monkeypatch.setattr(runner, "_select_popup", lambda *a, **k: "Yes, exit")
+    seen = {}
+
+    def fake_popup(title, options, **k):
+        seen["options"] = options
+        return options[1]  # "Yes, exit (Ctrl-C again)"
+
+    monkeypatch.setattr(runner, "_select_popup", fake_popup)
     assert runner._confirm_exit() is True
+    # The exit option advertises the double-Ctrl-C confirm shortcut.
+    assert seen["options"][1] == "Yes, exit (Ctrl-C again)"
     monkeypatch.setattr(runner, "_select_popup", lambda *a, **k: "No, keep working")
     assert runner._confirm_exit() is False
     monkeypatch.setattr(runner, "_select_popup", lambda *a, **k: None)  # cancelled
     assert runner._confirm_exit() is False
+
+
+def test_exit_skips_confirmation_when_nothing_pending():
+    # Clean tree, nothing running, nothing unmerged → exit directly, no popups.
+    runner = make_runner()
+    runner._had_unfinalized_work = lambda: False
+    runner._has_unmerged_work = lambda: False
+    events = []
+    runner._confirm_exit = lambda: events.append("confirm") or True
+    runner._confirm_terminate_background_sessions = lambda: events.append("bg") or True
+    runner._finalize_pending_work = lambda: events.append("finalize")
+    runner._exit_child = lambda: events.append("exit")
+
+    assert runner._run_exit_flow() is True
+    assert events == ["finalize", "exit"], "a clean exit must skip both confirmations"
+
+
+def test_exit_confirms_when_work_pending():
+    runner = make_runner()
+    runner._had_unfinalized_work = lambda: True  # something still uncommitted/running
+    runner._has_unmerged_work = lambda: False
+    events = []
+    runner._confirm_exit = lambda: events.append("confirm") or True
+    runner._confirm_terminate_background_sessions = lambda: True
+    runner._finalize_pending_work = lambda: events.append("finalize")
+    runner._exit_child = lambda: events.append("exit")
+
+    assert runner._run_exit_flow() is True
+    assert events == ["confirm", "finalize", "exit"]
 
 
 def test_proxy_passthrough_prompt_drops_escape_sequences():
@@ -3222,7 +3413,12 @@ def test_proxy_answers_nothing_without_host_values(monkeypatch):
     assert written == []
 
 
-def test_proxy_status_check_runs_after_file_event_only():
+def test_proxy_status_check_runs_after_file_event_only(monkeypatch):
+    # The `git status` read is DEFERRED out of the active edit window: it only fires
+    # once the worktree (FILE_STABLE_SECONDS) and backend (CHILD_IDLE_SECONDS) have
+    # gone quiet — never on every keystroke-adjacent file event. Drive a fixed clock.
+    clock = [10_000.0]
+    monkeypatch.setattr("agitrack.proxy.runner.time.monotonic", lambda: clock[0])
     runner = make_runner(
         file_change_event=threading.Event(),
         status_check_pending=False,
@@ -3233,12 +3429,17 @@ def test_proxy_status_check_runs_after_file_event_only():
         last_child_output=0.0,
         last_status="",
         last_status_change=0.0,
+        _last_change_at=0.0,
         verbose=False,
     )
     runner.CHILD_IDLE_SECONDS = 4.0
     runner.FILE_STABLE_SECONDS = 8.0
     runner._prune_declined_untracked = lambda: None
     runner._commit_available_agent_turns = lambda quiet: False
+    # Keep this test focused on the status-read count; stub the downstream commit path.
+    runner._finish_agent_parse_if_ready = lambda **k: None
+    runner._start_agent_parse = lambda: False
+    runner._maybe_offer_copy_when_idle = lambda now: None
 
     class Repo:
         calls = 0
@@ -3250,9 +3451,17 @@ def test_proxy_status_check_runs_after_file_event_only():
     runner.repo = Repo()
     runner.file_change_event.set()
 
+    # Event just fired: the worktree hasn't settled, so no git read yet.
     runner._maybe_agent_commit()
-    runner._maybe_agent_commit()
+    assert runner.repo.calls == 0
 
+    # Past the stable + idle windows: a single read serves the (deferred) commit.
+    clock[0] += runner.FILE_STABLE_SECONDS + 1
+    runner._maybe_agent_commit()
+    assert runner.repo.calls == 1
+
+    # No new file event → no further reads (cached status is reused).
+    runner._maybe_agent_commit()
     assert runner.repo.calls == 1
 
 
@@ -4557,15 +4766,16 @@ def test_timers_phase_noops_when_not_running():
 
 def test_timers_phase_stops_after_pending_update_teardown():
     # A deferred update can apply mid-phase (sessions just went idle), finalizing and
-    # removing the worktree; the worktree-touching tail must then be skipped.
+    # removing the worktree; the post-update tail must then be skipped.
     from proxy_helpers import make_runner
 
     runner = make_runner()
     runner.running = True
     runner.merge_ctx = None
     runner._base_advanced = True
-    synced: list = []
-    runner._sync_idle_worktrees_to_base = lambda: synced.append(True)
+    tail: list = []
+    runner._service_background_share_ops = lambda: tail.append("share")
+    runner._service_session_notices = lambda: tail.append("notices")
 
     def noop(*a, **k):
         return None
@@ -4573,19 +4783,16 @@ def test_timers_phase_stops_after_pending_update_teardown():
     for name in [
         "_flush_pending_render",
         "_flush_pending_enter",
+        "_drain_modal_mailbox",
         "_check_base_branch_drift",
         "_resume_pending_prompt_if_ready",
         "_ensure_worktree_alive",
         "_service_commit_summaries",
         "_service_precompact_summary",
         "_service_shared_resume",
-        "_maybe_agent_commit",
         "_service_background_sessions",
-        "_poll_base_advanced",
-        "_warn_if_base_edited",
-        "_warn_if_cwd_drifted",
+        "_sync_idle_worktrees_to_base",
         "_maybe_check_for_update",
-        "_service_session_notices",
     ]:
         setattr(runner, name, noop)
 
@@ -4595,7 +4802,7 @@ def test_timers_phase_stops_after_pending_update_teardown():
     runner._maybe_apply_pending_update = apply_pending
     runner._reactor_timers_phase()
 
-    assert synced == []  # the worktree-sync tail was skipped after teardown
+    assert tail == []  # the post-update tail (share ops, notices) was skipped after teardown
 
 
 def test_ensure_worktree_alive_recreates_externally_deleted_worktree(tmp_path):
@@ -6406,6 +6613,9 @@ def test_switch_active_joins_worker_before_swapping():
 def _popup_exit_runner():
     runner = make_runner()
     runner.events = []
+    # These tests exercise the confirmation path, so force "work pending" — otherwise
+    # a clean tree would (correctly) skip the confirmations and exit directly.
+    runner._exit_needs_confirmation = lambda: True
     runner._finalize_pending_work = lambda: runner.events.append("finalize")
     runner._exit_child = lambda: runner.events.append("exit")
     return runner
@@ -6718,6 +6928,7 @@ def test_sync_tracked_session_skips_empty_newest_session(tmp_path):
 
 def test_exit_command_routes_through_unified_exit_flow(tmp_path):
     runner = make_runner()
+    runner._exit_needs_confirmation = lambda: True  # exercise the confirmation path
     events = []
     runner._confirm_exit = lambda: (events.append("confirm"), True)[1]
     runner._confirm_terminate_background_sessions = lambda: True
@@ -6737,6 +6948,7 @@ def test_exit_command_cancelled_does_not_request_exit(tmp_path):
     # Declining the exit confirmation keeps aGiTrack running: the loop-break flag
     # stays clear.
     runner = make_runner()
+    runner._exit_needs_confirmation = lambda: True  # work pending, so the prompt is shown
     runner._confirm_exit = lambda: False
     runner._render = lambda: None
 
