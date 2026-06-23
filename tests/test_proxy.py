@@ -2980,6 +2980,24 @@ def test_had_unfinalized_work_false_on_clean_idle_close():
     assert runner._had_unfinalized_work() is False
 
 
+def test_handle_exit_signal_ignored_while_update_applying():
+    # A terminal-close SIGHUP must NOT tear aGiTrack down mid-self-update: unwinding
+    # would abort the pip apply and could leave aGiTrack half-uninstalled.
+    import signal as signal_mod
+
+    runner = make_runner()
+    runner._update_applying = True
+    torn = []
+    runner._finalize_pending_work = lambda: torn.append("finalize")
+    runner._cleanup_child = lambda: torn.append("cleanup")
+    runner._restore_terminal = lambda: torn.append("restore")
+
+    runner._handle_exit_signal(signal_mod.SIGHUP, None)  # returns, does NOT raise SystemExit
+
+    assert torn == [], "exit signal must be ignored while an update is applying"
+    assert runner.running is True
+
+
 def test_handle_exit_signal_prompts_only_when_work_pending(monkeypatch):
     import signal as signal_mod
 
