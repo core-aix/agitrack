@@ -8472,13 +8472,14 @@ class ProxyRunner:
             self._copy_prompted[rel] = fingerprint
         rels = [rel for rel, _ in fresh]
         # The file list is shown vertically (one per line, scrolls with PgUp/PgDn), led by
-        # a "File(s):" line so it's clear the message refers to these names.
+        # a "File(s):" line (set off with a blank line above it) so it's clear the message
+        # refers to these names.
         if on_exit:
             title = (
                 f"This session's worktree ({wt_dir}) has {len(rels)} file(s) not in the base repo "
                 f"that will be DELETED when the worktree is removed on exit. Copy them into the base "
                 f"repo ({base_dir}) first? (Press Esc to cancel the exit and handle them yourself.)\n"
-                f"File(s):"
+                f"\nFile(s):"
             )
             options = ["No, discard them with the worktree", "Yes, copy to the base repo"]
         else:
@@ -8487,7 +8488,7 @@ class ProxyRunner:
                 f"into the base — intentionally unstaged or git-ignored. Copy them into the base repo ({base_dir})?\n"
                 f"(Decline and aGiTrack won't ask about this set again until the files change as a set "
                 f"or you switch sessions.)\n"
-                f"File(s):"
+                f"\nFile(s):"
             )
             options = ["No, leave them in the worktree", "Yes, copy to the base repo"]
         choice = self._select_popup(title, options, detail=rels)
