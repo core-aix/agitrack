@@ -642,6 +642,13 @@ h2.section::before{content:"# ";color:var(--amber)}
 .bar i.log{background-image:repeating-linear-gradient(45deg,rgba(2,8,5,.32) 0 3px,transparent 3px 7px)}
 .bar .logtag{position:absolute;right:6px;top:50%;transform:translateY(-50%);z-index:1;pointer-events:none;
   font-size:9px;letter-spacing:.5px;text-transform:uppercase;color:var(--fg-dim);opacity:.85;text-shadow:0 0 3px var(--ink)}
+.row.sub .bar .logtag{font-size:8px;right:5px}
+/* Token panel: a separator delimits each whole token GROUP (a main category plus its
+   "of which" sub-rows), never between a parent and its own children. Drawn as a top border
+   before each main row — i.e. after the previous group — instead of below every row. */
+#tokens .row{border-bottom:none}
+#tokens .row:not(.sub){border-top:1px solid var(--line)}
+#tokens .row:not(.sub):first-child{border-top:none}
 .bar span{position:absolute;right:6px;top:0;font-size:11px;color:var(--fg-dim);line-height:18px}
 .row .num{text-align:right;color:var(--fg-dim);font-size:12.5px}
 .row .num b{color:var(--phosphor);font-weight:600}
@@ -961,12 +968,12 @@ function barWidth(value, max, min){
   return span > 0 ? Math.max(2, (value-lo)/span*100) : (value > 0 ? 100 : 0);
 }
 // An indented "of which …" row: a subset of the category above it. Always log-scaled (it
-// only renders token subsets), so its fill is striped like its parent; the parent carries
-// the "log" tag for the group, so the thin sub-bars stay uncluttered.
+// only renders token subsets), so its fill is striped and it carries the "log" tag like the
+// parent.
 function subBarRow(name, value, max, numHtml, min){
   const w = barWidth(value, max, min);
   return `<div class="row sub"><div class="name" title="${esc(name)}">${esc(name)}</div>`+
-    `<div class="bar"><i class="log" style="width:${w}%"></i></div>`+
+    `<div class="bar"><span class="logtag">log</span><i class="log" style="width:${w}%"></i></div>`+
     `<div class="num">${numHtml}</div></div>`;
 }
 function card(label, value, note, amber){
