@@ -13,6 +13,14 @@ from agitrack.backends.base import AgentResult, TokenUsage
 # thinking on the Anthropic API (it omits the thinking parameter on third-party providers).
 _SUMMARIZER_THINKING_TOKENS = "0"
 
+# Cap a ``bare`` (summarizer / pre-compaction) ``claude -p`` call. Without a bound a hung or
+# pathologically slow call never returns: the commit goes unsummarized AND, since only one
+# summary runs per session at a time, the still-alive worker blocks every following commit's
+# summary too — exactly the intermittent "this commit wasn't summarized" symptom. On timeout
+# we return a non-zero result so the caller falls back to the prompt-based message and the
+# worker frees up. (Interactive agent turns are NOT bare and stay untimed — they can be long.)
+_SUMMARIZER_TIMEOUT_SECONDS = 90
+
 # Flags that strip Claude Code down to a plain text completion for a ``bare`` run (the
 # summarizer). Each removes a chunk of input the summary never needs:
 #   --tools ""            no built-in tool schemas (the largest single source of bloat)
@@ -104,15 +112,26 @@ class ClaudeBackend:
             env = {**os.environ}
             env.setdefault("MAX_THINKING_TOKENS", _SUMMARIZER_THINKING_TOKENS)
 
-        process = subprocess.run(
-            command,
-            cwd=self.repo,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            env=env,
-        )
+        try:
+            process = subprocess.run(
+                command,
+                cwd=self.repo,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                env=env,
+                timeout=_SUMMARIZER_TIMEOUT_SECONDS if bare else None,
+            )
+        except subprocess.TimeoutExpired:
+            return AgentResult(
+                backend=self.name,
+                session_id=session_id,
+                model=model,
+                final_response="",
+                exit_code=124,  # conventional timeout code; the summarizer treats it as unusable
+                tokens=TokenUsage(),
+            )
         if self.verbose and process.stderr.strip():
             print(process.stderr.rstrip())
 

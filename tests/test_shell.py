@@ -36,7 +36,7 @@ def test_new_promptable_untracked_files_count_as_pre_agent_changes(tmp_path):
 def test_second_instance_is_refused(tmp_path, monkeypatch, capsys):
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, stdout=subprocess.PIPE)
     repo = GitRepo.discover(tmp_path)
-    shell = AgitrackShell(repo)
+    shell = AgitrackShell(repo, backend="claude")
     monkeypatch.setattr(shell_mod, "ensure_installed_backend", lambda *a, **k: shell.state.backend)
     # Another live aGiTrack already holds this repo's management lock.
     holder = RepoLock(repo.repo / ".agitrack" / "lock")

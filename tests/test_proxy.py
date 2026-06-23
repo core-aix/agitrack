@@ -911,9 +911,10 @@ def test_copy_announces_before_confirming(tmp_path):
     assert copying < copied  # "Copying …" precedes the "Copied …" confirmation
 
 
-def test_copy_offer_also_offers_user_commit_for_edits(tmp_path):
-    # When the worktree has the user's own uncommitted edits AND copy-able leftovers, BOTH
-    # prompts show: a commit prompt for the edits, then the copy prompt for the leftovers.
+def test_copy_offer_offers_user_commit_for_edits_on_switch(tmp_path):
+    # On a switch/exit offer (main thread), when the worktree has the user's own uncommitted
+    # edits AND copy-able leftovers, BOTH prompts show: a commit prompt for the edits, then
+    # the copy prompt. (The per-turn offer defers the commit prompt — see the test below.)
     import types
 
     runner, base, wt, _ = _copy_runner(tmp_path, "?? leftover.txt\n")
@@ -924,9 +925,46 @@ def test_copy_offer_also_offers_user_commit_for_edits(tmp_path):
     runner._select_popup = lambda *a, **k: events.append("copy") or "No, leave them in the worktree"
     del runner._offer_user_commit_for_worktree_edits  # use the real method
 
-    runner._offer_copy_unstaged_to_base()
+    runner._offer_copy_unstaged_to_base(context="switch")
 
     assert events == ["user-commit", "copy"]  # both shown, commit prompt first
+
+
+def test_turn_copy_offer_defers_user_commit_prompt(tmp_path):
+    # The per-turn offer's worktree read runs on the git worker, which must never raise the
+    # (blocking) user-commit popup or commit from there; that prompt is left for switch/exit.
+    import types
+
+    runner, base, wt, _ = _copy_runner(tmp_path, "?? leftover.txt\n")
+    (wt / "leftover.txt").write_text("x\n")
+    runner.actions = types.SimpleNamespace(has_pre_agent_user_changes=lambda: True)
+    events: list[str] = []
+    runner._create_user_commit_popup = lambda *a, **k: events.append("user-commit")
+    runner._select_popup = lambda *a, **k: events.append("copy") or "No, leave them in the worktree"
+    del runner._offer_user_commit_for_worktree_edits
+
+    runner._offer_copy_unstaged_to_base()  # context="turn"
+
+    assert events == ["copy"]  # no user-commit prompt mid-turn (deferred to switch/exit)
+
+
+def test_request_copy_offer_stashes_for_main_without_presenting(tmp_path):
+    # The git-worker side collects candidates and stashes them for the main thread, but must
+    # NOT present any popup itself (that would block the worker, stalling commit/merge). The
+    # main thread then presents the stash via _present_pending_copy_offer.
+    runner, base, wt, _ = _copy_runner(tmp_path, "?? leftover.txt\n")
+    (wt / "leftover.txt").write_text("x\n")
+    presented: list = []
+    runner._present_copy_offer = lambda collected, *, context: presented.append((collected, context))
+
+    runner._request_copy_offer()  # worker side: collect + stash, no popup
+    assert presented == []  # nothing presented on the worker
+    assert runner._pending_copy_offer is not None  # stashed for the main thread
+    assert runner._pending_copy_offer[0] == "turn"
+
+    runner._present_pending_copy_offer()  # main side: present the stash
+    assert len(presented) == 1 and presented[0][1] == "turn"
+    assert runner._pending_copy_offer is None  # consumed
 
 
 def test_copy_offer_skips_user_commit_when_no_edits(tmp_path):
@@ -1195,7 +1233,9 @@ def test_maybe_offer_copy_when_idle_is_gated_on_idleness(tmp_path):
     runner.merge_ctx = None
     runner.last_child_output = 0.0  # long ago → past the idle threshold
     calls: list = []
-    runner._offer_copy_unstaged_to_base = lambda: calls.append(True)
+    # The idle wrapper hands the offer to the main thread via _request_copy_offer (so the git
+    # worker never blocks on the popup); it must not even collect while the agent is active.
+    runner._request_copy_offer = lambda: calls.append(True)
 
     runner._agent_is_active = lambda: True
     runner._maybe_offer_copy_when_idle(1e9)
@@ -4650,7 +4690,7 @@ def test_fork_current_session_records_fork_origin_event(tmp_path):
 
     runner = _shared_resume_runner()
     runner.name = "original"
-    src_state = AgitrackState(tmp_path / "src")
+    src_state = AgitrackState(tmp_path / "src", default_backend="claude")
     src_state.backend_session_id = "ses_src"
     runner.state = src_state
     runner.repo = types.SimpleNamespace(repo="/wt")
@@ -5198,6 +5238,30 @@ def test_fork_falls_back_to_blank_when_backend_cannot_share():
     assert runner._can_fork_active() is False
     assert runner._prompt_fork_or_blank() is False  # no fork option offered
     assert runner._fork_current_session("x") is False  # forking not possible
+
+
+def test_prompt_new_session_inherits_current_backend():
+    # A blank new session must start in the SAME backend as the session it is
+    # created from — not the global default, which may differ (e.g. left at
+    # opencode while the user is coding in claude).
+    import types
+
+    runner = make_runner(name="main")
+    runner._render = lambda: None
+    runner._set_message = lambda *a, **k: None
+    # Active session is claude with no live conversation (so the fork option is
+    # not offered and the blank-session path is taken).
+    runner.state = types.SimpleNamespace(backend_session_id=None, backend="claude")
+    runner.backend = types.SimpleNamespace(name="claude", supports_session_sharing=False)
+    runner._prompt_session_name = lambda *a, **k: "new-one"
+    runner._prompt_new_session_base = lambda *, default=None: "main"
+    created: dict = {}
+    runner._new_session = lambda name, **kw: created.update(name=name, **kw)
+
+    assert runner._prompt_new_session() == runner._MENU_DONE
+    assert created["name"] == "new-one"
+    # The new session inherits the active session's backend, not the global default.
+    assert created["backend"] == "claude"
 
 
 def test_shared_resume_cancel_on_name_prompt_does_not_resume():
@@ -7873,7 +7937,7 @@ def test_real_init_defines_all_lifecycle_flags(tmp_path):
     sp.run(["git", "-C", str(tmp_path), "commit", "-q", "--allow-empty", "-m", "init"], check=True)
     from agitrack.git import GitRepo
 
-    runner = ProxyRunner(GitRepo(tmp_path))
+    runner = ProxyRunner(GitRepo(tmp_path), backend="claude")
     for flag in (
         "_monitor_base_edits",
         "_base_check_at",
@@ -7896,7 +7960,7 @@ def test_no_worktree_mode_skips_worktree_setup(tmp_path):
     from agitrack.git import GitRepo
     from agitrack.proxy.runner import ProxyRunner
 
-    runner = ProxyRunner(GitRepo(tmp_path), use_worktrees=False)
+    runner = ProxyRunner(GitRepo(tmp_path), use_worktrees=False, backend="claude")
     runner._base_branch = "main"
     runner._setup_base_merge_only_session()
     assert runner.worktree is None

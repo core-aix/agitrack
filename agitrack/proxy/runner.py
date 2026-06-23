@@ -466,7 +466,10 @@ class ProxyRunner:
         self.state = (
             _state
             if _state is not None
-            else AgitrackState(repo.repo, default_backend=self.global_config.default_backend)
+            # An explicit --backend seeds the state's default so a brand-new repo (no
+            # stored backend) resolves to it rather than to the configured default,
+            # which may be unset (there is no hardcoded fallback).
+            else AgitrackState(repo.repo, default_backend=backend or self.global_config.default_backend)
         )
         if backend and backend != self.state.backend:
             self.state.remember_backend_session()
@@ -635,6 +638,12 @@ class ProxyRunner:
         # re-asked even as its contents change. A genuinely new path un-mutes the whole
         # set (ask about all again); cleared on session switch and aGiTrack restart.
         self._copy_declined: set[str] = set()
+        # A turn's copy offer, collected on the git worker (the worktree read) and handed to
+        # the main thread to PRESENT — so the worker never blocks on the popup and keeps the
+        # commit/summary/merge pipeline flowing while the user decides. `(context, collected)`.
+        self._pending_copy_offer: tuple[str, tuple[list[str], list[tuple[str, tuple[int, int]]], set[str]]] | None = (
+            None
+        )
         # Settings-menu scratch: edits collected as pending changes (each with its chosen
         # scope) and written only when the user confirms "save" on the way out.
         self._settings_pending: dict[str, tuple[object, str, bool]] = {}
@@ -880,6 +889,7 @@ class ProxyRunner:
                 "_cancel_prompted": set(),
                 "_copy_prompted": {},
                 "_copy_declined": set(),
+                "_pending_copy_offer": None,
                 "_settings_pending": {},
                 "_settings_pending_timings": {},
                 "_full_agent_messages": False,
@@ -955,6 +965,15 @@ class ProxyRunner:
         session_kwargs.update(session_overrides)
         session = Session(**session_kwargs)
         instance.__dict__["_active_session"] = session
+
+        # Tests build minimal AgitrackStates without a backend; production always resolves
+        # one before launch (there is no hardcoded fallback anymore), so reading
+        # ``state.backend`` on an unconfigured state now raises. Seed a concrete backend so
+        # the test factory keeps producing a launch-ready session unless a test set one.
+        # Guarded so tests that pass a non-AgitrackState stub (no ``data`` dict) are untouched.
+        state_data = getattr(session.state, "data", None)
+        if isinstance(state_data, dict) and not state_data.get("backend"):
+            state_data["backend"] = "claude"
 
         # Apply runner-level overrides. Names shadowed by a class property are
         # routed through it; a read-only property makes the misuse loud instead
@@ -4689,7 +4708,11 @@ class ProxyRunner:
             return self._MENU_DONE
         if fork:
             self._set_message("Couldn't fork the current session; starting a blank one instead.", seconds=8.0)
-        self._new_session(name, base_branch=base)
+        # A new session inherits the CURRENT session's backend, not the global default —
+        # the user is coding in this backend, so a sibling session should start there too
+        # (the global default may be stale, e.g. left at opencode). Captured here because
+        # _new_session replaces self.active (and thus self.state) before reading it.
+        self._new_session(name, base_branch=base, backend=self.state.backend)
         return self._MENU_DONE
 
     def _can_fork_active(self) -> bool:
@@ -5745,6 +5768,7 @@ class ProxyRunner:
         self._flush_pending_render()
         self._flush_pending_enter()
         self._drain_modal_mailbox()  # present any dialog the git worker queued
+        self._present_pending_copy_offer()  # the turn's "copy stranded files?" popup, if any
         self._resume_pending_prompt_if_ready()
         self._service_shared_resume()  # complete a shared-session resume once fetched
         # Background / multi-session git (these swap self.active via _with_session, so
@@ -8421,8 +8445,10 @@ class ProxyRunner:
         # The turn's committed changes integrate into the base branch, but any files
         # the agent left UNCOMMITTED in the worktree (e.g. untracked files the user
         # declined to stage) never reach the base working directory. Offer to copy
-        # those over so they aren't stranded in the session's worktree.
-        self._offer_copy_unstaged_to_base()
+        # those over so they aren't stranded in the session's worktree. Hand the offer to the
+        # main thread (it presents the popup) so this worker pass returns and the next
+        # commit/summary/merge keeps flowing while the user decides.
+        self._request_copy_offer()
 
     def _maybe_offer_copy_when_idle(self, now: float) -> None:
         """Idle-gated entry to the copy offer, used by the turn-polling loop so the
@@ -8435,7 +8461,7 @@ class ProxyRunner:
             return
         if self._agent_is_active() or now - self.last_child_output < self.CHILD_IDLE_SECONDS:
             return
-        self._offer_copy_unstaged_to_base()
+        self._request_copy_offer()
 
     def _offer_user_commit_for_worktree_edits(self) -> None:
         """Offer to COMMIT the user's own uncommitted edits in this worktree (tracked
@@ -8479,20 +8505,62 @@ class ProxyRunner:
         (fingerprint). Declining mutes the whole current SET of paths: aGiTrack won't ask
         again while only those files keep changing — only a genuinely NEW path re-opens the
         set (ask about all again), in EVERY context including exit. The mute clears on
-        session switch and aGiTrack restart."""
-        if self.worktree is None or self.base_repo is None:
+        session switch and aGiTrack restart.
+
+        Runs collect (the worktree read) then present (the popup + copy) inline — used for the
+        ``switch``/``exit`` contexts, which are already on the main thread. The per-turn offer
+        instead goes through ``_request_copy_offer`` so the git worker never blocks on it."""
+        collected = self._collect_copy_candidates(context=context)
+        if collected is not None:
+            self._present_copy_offer(collected, context=context)
+
+    def _request_copy_offer(self, *, context: str = "turn") -> None:
+        """Git-worker side of the turn copy offer: do the worktree read HERE (off the main
+        thread) and, if there are fresh files, stash them for the main thread to present. The
+        worker never blocks on the popup, so commit/summary/merge keep flowing while the user
+        decides — only a merge CONFLICT (its own popup) holds integration up."""
+        if self._pending_copy_offer is not None:
+            return  # a previously collected batch is still waiting to be presented
+        collected = self._collect_copy_candidates(context=context)
+        if collected is not None:
+            self._pending_copy_offer = (context, collected)
+            self._wake_main_loop()  # present it on the next reactor tick
+
+    def _present_pending_copy_offer(self) -> None:
+        """Main thread: present a copy offer the git worker collected for this turn, if any.
+        Deliberately NOT under `_pipeline_lock` — the worker must keep committing/merging
+        while this popup is open. A merge that needs the user (a conflict) queues its own
+        popup via the modal mailbox, so the two are answered one at a time."""
+        pending = self._pending_copy_offer
+        if pending is None:
             return
+        self._pending_copy_offer = None
+        context, collected = pending
+        if self.worktree is None or self.base_repo is None:
+            return  # the worktree went away before we could ask (a switch/exit) — drop it
+        self._present_copy_offer(collected, context=context)
+
+    def _collect_copy_candidates(
+        self, *, context: str
+    ) -> tuple[list[str], list[tuple[str, tuple[int, int]]], set[str]] | None:
+        """The worktree read + dedup behind the copy offer (git/file I/O, no popup). Returns
+        the fresh files to offer as ``(rels, fresh, current_set)``, or None when there is
+        nothing to ask about. Safe to run on the git worker."""
+        if self.worktree is None or self.base_repo is None:
+            return None
         base_dir = self.base_repo.repo
         wt_dir = self.repo.repo
         if base_dir == wt_dir:
-            return
-        # First commit the user's own edits (if any), then offer to copy the leftovers.
-        self._offer_user_commit_for_worktree_edits()
+            return None
+        if context != "turn":
+            # switch/exit run on the main thread: offer to COMMIT the user's own edits first.
+            # The turn path runs on the git worker and must NOT raise a (blocking) popup or
+            # commit from there; those edits are still offered at the next switch/exit.
+            self._offer_user_commit_for_worktree_edits()
         candidates = self._uncommitted_worktree_files()
         if not candidates:
-            return
+            return None
         current = set(candidates)
-        on_exit = context == "exit"
         # A genuinely new path (one we haven't muted) re-opens the whole set: drop the
         # decline mute and the per-file fingerprint memory so "all files" means all again.
         if self._copy_declined and (current - self._copy_declined):
@@ -8509,10 +8577,27 @@ class ProxyRunner:
                 continue  # already offered/copied at this exact content
             fresh.append((rel, fingerprint))
         if not fresh:
-            return
+            return None
         for rel, fingerprint in fresh:
             self._copy_prompted[rel] = fingerprint
         rels = [rel for rel, _ in fresh]
+        return (rels, fresh, current)
+
+    def _present_copy_offer(
+        self,
+        collected: tuple[list[str], list[tuple[str, tuple[int, int]]], set[str]],
+        *,
+        context: str,
+    ) -> None:
+        """Main-thread side: show the copy popup(s) and copy the files. Runs WITHOUT the
+        pipeline lock so the git worker keeps committing/merging behind the popup; a merge
+        that needs the user (a conflict) just queues its own popup, answered one at a time."""
+        if self.base_repo is None:
+            return
+        rels, fresh, current = collected
+        base_dir = self.base_repo.repo
+        wt_dir = self.repo.repo
+        on_exit = context == "exit"
         # The file list is shown vertically (one per line, scrolls with PgUp/PgDn), led by
         # a "File(s):" line (set off with a blank line above it) so it's clear the message
         # refers to these names.

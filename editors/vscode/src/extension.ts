@@ -401,18 +401,59 @@ async function reconcileRestoredTerminal(terminal: vscode.Terminal): Promise<voi
   }
   const key = folderKeyForTerminal(terminal);
   const pid = key ? readAgitrackPid(key) : undefined;
-  // The repo lock is the authoritative "aGiTrack is running for this folder" signal; the
-  // shell-child check is a belt-and-suspenders backstop so a live session is never closed.
-  const live = (pid !== undefined && isAlive(pid)) || (await shellHasChild(terminal));
-  if (live) {
+  const shellPid = await terminal.processId;
+  // aGiTrack is LIVE IN THIS TERMINAL only if the lock-holder is alive AND a descendant of
+  // this terminal's own shell. The repo lock alone is NOT enough: it is folder-global, so it
+  // can be held by the detached `agitrack --recover` we spawn on window close, or matched by a
+  // stale/reused PID — neither of which means aGiTrack is running in this revived shell. That
+  // false positive is exactly what left an idle leftover terminal around.
+  const lockHeld = pid !== undefined && isAlive(pid);
+  const liveHere = lockHeld && shellPid !== undefined && (await isUnderShell(pid as number, shellPid));
+  if (liveHere) {
     if (key && !terminals.has(key)) {
       terminals.set(key, terminal);
       launchedAt.set(terminal, Date.now());
       ourTerminals.add(terminal);
     }
-    return;
+    return; // a live aGiTrack is running in this terminal — adopt it so the aG button focuses it
   }
-  terminal.dispose(); // a leftover shell with no aGiTrack — close the tab
+  // A leftover aGiTrack terminal with no session in it: VSCode was closed/reloaded without
+  // exiting aGiTrack (a clean Ctrl-G → exit closes its terminal, so it is never restored). The
+  // revived tab is just a dead shell showing old scrollback — close it.
+  terminal.dispose();
+  // Relaunch only when the repo lock is actually free, so the session resumes in a fresh
+  // terminal. If the lock is still held elsewhere (a recovery finalizing the last turn), don't
+  // relaunch — it would be refused as "already running"; the user can press aG once it frees.
+  if (!lockHeld) {
+    const folder = key ? vscode.workspace.workspaceFolders?.find((f) => f.uri.fsPath === key) : undefined;
+    if (folder) {
+      void startSession(folder.uri);
+    }
+  }
+}
+
+/** Parent PID of `pid`, or undefined if it can't be read (process gone / `ps` unavailable). */
+async function parentPid(pid: number): Promise<number | undefined> {
+  try {
+    const ppid = parseInt((await execCapture("ps", ["-o", "ppid=", "-p", String(pid)], 2_000)).trim(), 10);
+    return Number.isFinite(ppid) ? ppid : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Whether `pid` is `shellPid` or a descendant of it (walking the parent chain, bounded). Tells
+ * an aGiTrack actually running in THIS terminal apart from one whose folder-global lock is held
+ * by an unrelated process (e.g. the detached `agitrack --recover` spawned on window close). */
+async function isUnderShell(pid: number, shellPid: number): Promise<boolean> {
+  let cur: number | undefined = pid;
+  for (let depth = 0; depth < 12 && cur !== undefined && cur > 1; depth++) {
+    if (cur === shellPid) {
+      return true;
+    }
+    cur = await parentPid(cur);
+  }
+  return cur === shellPid;
 }
 
 /** Whether `terminal`'s name marks it as an aGiTrack SESSION terminal (not a dashboard) —

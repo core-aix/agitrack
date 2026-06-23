@@ -6,10 +6,12 @@
  * just re-focuses a dead shell — the aG button appears to "do nothing." So map presence
  * isn't enough; we confirm a process is actually there.
  *
- * No single signal suffices: the repo lock is only acquired *after* the startup privacy
- * prompt, so a freshly-launched session at that prompt holds no lock yet (but is very
- * much alive). This combines the available signals; pure and parameterised so the policy
- * is unit-testable without VSCode or a real process.
+ * aGiTrack takes the repo lock at the very start now — before the privacy prompt — so a
+ * session holds it from launch (lockAlive) and that is the primary, reliable signal. There
+ * is still a brief window between opening the terminal and aGiTrack acquiring the lock (the
+ * shell's own startup), so we also accept a freshly-launched session (graceMs) or one whose
+ * shell already has the aGiTrack child. This combines the available signals; pure and
+ * parameterised so the policy is unit-testable without VSCode or a real process.
  */
 
 export interface LivenessSignals {
