@@ -889,6 +889,8 @@ def test_web_dashboard_embeds_token_hierarchy_and_cache_note(tmp_path):
     # a top border before each main row rather than between a parent and its own children.
     assert "#tokens .row{border-bottom:none}" in html
     assert "#tokens .row:not(.sub){border-top:1px solid var(--line)}" in html
+    # The notes apply to every bar, so a separator sets them off above the first note.
+    assert "#tokens .row + .hint{border-top:1px solid var(--line)" in html
 
 
 def test_filter_bar_is_single_row_with_a_custom_range_popup(tmp_path):

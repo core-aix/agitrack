@@ -52,9 +52,12 @@ def shared_sessions_for(repo: GitRepo) -> list[dict]:
         return []
     # The remote fetch is a best-effort extra (others' shares); a transient failure
     # (e.g. racing a concurrent auto-share push) must NOT blank the list — fall back
-    # to the local ref, which always holds your own shared sessions.
+    # to the local ref, which always holds your own shared sessions. It fetches into a
+    # mirror ref (not the canonical local ref), so a remote that's momentarily behind can
+    # never rewind your own just-shared session — listing_entries then takes the newest
+    # copy of each session, so its "shared" time reflects the latest share, not a stale one.
     try:
-        store.fetch_throttled()
+        store.fetch_listing_throttled()
     except Exception:
         pass
     try:
@@ -69,7 +72,7 @@ def shared_sessions_for(repo: GitRepo) -> list[dict]:
                 "backend": entry.manifest.get("backend"),
                 "updated": entry.manifest.get("updated", 0),
             }
-            for entry in store.entries()
+            for entry in store.listing_entries()
         ]
     except Exception:
         return []
@@ -649,6 +652,8 @@ h2.section::before{content:"# ";color:var(--amber)}
 #tokens .row{border-bottom:none}
 #tokens .row:not(.sub){border-top:1px solid var(--line)}
 #tokens .row:not(.sub):first-child{border-top:none}
+/* The notes apply to every bar, so set them off with a separator above the first one. */
+#tokens .row + .hint{border-top:1px solid var(--line);padding-top:10px;margin-top:2px}
 .bar span{position:absolute;right:6px;top:0;font-size:11px;color:var(--fg-dim);line-height:18px}
 .row .num{text-align:right;color:var(--fg-dim);font-size:12.5px}
 .row .num b{color:var(--phosphor);font-weight:600}

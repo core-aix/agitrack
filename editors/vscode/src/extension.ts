@@ -44,10 +44,19 @@ const dashboards = new Map<string, vscode.Terminal>();
 // session time to come up before judging it dead (see sessionStillRunning).
 const launchedAt = new WeakMap<vscode.Terminal, number>();
 const SESSION_STARTUP_GRACE_MS = 15_000;
+// How long to let a VSCode-revived terminal settle (its shell reconnect, its child reattach)
+// before probing whether aGiTrack is still running in it, so the reconcile verdict is accurate.
+const RESTORE_SETTLE_MS = 1_500;
 
 // Terminals we created, so the split-terminal handler never disposes our own
 // terminals (it fires for every opened terminal, including ours).
 const ourTerminals = new WeakSet<vscode.Terminal>();
+
+// Folders whose session launch is in flight. startSession is async and has several
+// awaits between deciding to launch and recording the terminal, so two rapid clicks of
+// the aG button could both pass the "already running?" check and each create a terminal.
+// A synchronous guard keyed by folder path closes that window: the second click bails.
+const launching = new Set<string>();
 
 export function activate(context: vscode.ExtensionContext): void {
   extensionContext = context;
@@ -88,21 +97,33 @@ export function activate(context: vscode.ExtensionContext): void {
         return; // a terminal we launched — never dispose our own
       }
       const parent = splitParentOf(opened);
-      if (!parent || !isAgitrackTerminal(parent)) {
+      if (parent && isAgitrackTerminal(parent)) {
+        opened.dispose();
+        void vscode.window.showInformationMessage(
+          "aGiTrack runs one session per repository, so splitting its terminal just opens an " +
+            "empty shell — that split was closed. Use the existing aGiTrack terminal (or the " +
+            "aGiTrack button to start a session in another folder).",
+        );
         return;
       }
-      opened.dispose();
-      void vscode.window.showInformationMessage(
-        "aGiTrack runs one session per repository, so splitting its terminal just opens an " +
-          "empty shell — that split was closed. Use the existing aGiTrack terminal (or the " +
-          "aGiTrack button to start a session in another folder).",
-      );
+      // A non-split terminal we don't own that's named like an aGiTrack session — almost
+      // always one VSCode revived from a previous window. Reconcile it once it settles (see
+      // reconcileRestoredTerminal): adopt it if aGiTrack is still running, close it if not.
+      if (!parent && isRestoredSessionTerminal(opened)) {
+        setTimeout(() => void reconcileRestoredTerminal(opened), RESTORE_SETTLE_MS);
+      }
     }),
   );
 
-  if (vscode.workspace.getConfiguration("agitrack").get<boolean>("openOnStartup")) {
-    void startSession();
-  }
+  // VSCode revives persisted terminals from the previous window asynchronously after
+  // activation. Reconcile any already present (adopt a still-running aGiTrack so the button
+  // focuses it; close a leftover bare shell), then honour openOnStartup — by which point an
+  // adopted session is known and gets focused rather than duplicated.
+  void reconcileRestoredTerminals(RESTORE_SETTLE_MS).then(() => {
+    if (vscode.workspace.getConfiguration("agitrack").get<boolean>("openOnStartup")) {
+      void startSession();
+    }
+  });
 
   void bootstrap(context);
 }
@@ -270,51 +291,63 @@ async function startSession(targetUri?: vscode.Uri): Promise<void> {
   }
 
   const key = folder.uri.fsPath;
-  const existing = terminals.get(key);
-  if (existing) {
-    if (await sessionStillRunning(existing, key)) {
-      existing.show();
-      return; // a RUNNING aGiTrack is here — bring it forward, never restart it.
+  // Reserve the folder synchronously before any await, so a second rapid click can't slip
+  // past the checks below and open a duplicate terminal (a focus/no-op is the right
+  // response to "it's already starting").
+  if (launching.has(key)) {
+    terminals.get(key)?.show();
+    return;
+  }
+  launching.add(key);
+  try {
+    const existing = terminals.get(key);
+    if (existing) {
+      if (await sessionStillRunning(existing, key)) {
+        existing.show();
+        return; // a RUNNING aGiTrack is here — bring it forward, never restart it.
+      }
+      // Tracked terminal, but aGiTrack is no longer running in it (e.g. a non-zero exit
+      // left the shell open). Discard the dead terminal and start a fresh session, so the
+      // aG button doesn't just keep re-focusing a lingering shell.
+      terminals.delete(key);
+      existing.dispose();
     }
-    // Tracked terminal, but aGiTrack is no longer running in it (e.g. a non-zero exit
-    // left the shell open). Discard the dead terminal and start a fresh session, so the
-    // aG button doesn't just keep re-focusing a lingering shell.
-    terminals.delete(key);
-    existing.dispose();
+
+    const exe = await ensureCliAvailable();
+    if (!exe) {
+      return; // not installed and not installed-on-demand
+    }
+
+    await ensureCloseConfirmation();
+    void maybeShowGracefulExitTip();
+    // Disable VSCode's Python venv activation BEFORE creating the terminal, so the Python
+    // extension doesn't send a process-killing Ctrl-C + `source activate` into aGiTrack.
+    await suppressPythonEnvActivationForLaunch();
+
+    // Run aGiTrack inside the shell, but only AFTER the shell has finished its own startup
+    // — including any commands VSCode injects automatically (the Python extension's venv
+    // activation, conda init, shell integration). Those must run in the shell first;
+    // otherwise they get typed into aGiTrack's stdin (e.g. `source .venv/bin/activate`
+    // landing in the agent, or a stray newline auto-answering the privacy prompt).
+    // spawnAgitrackTerminal sequences the launch via shell integration to guarantee this.
+    //
+    // `&& exit` closes the terminal ONLY when aGiTrack exits successfully (status 0, e.g.
+    // Ctrl-G → exit). On a non-zero/error exit the `&& exit` is skipped, so the shell
+    // stays open with aGiTrack's error message still on screen for the user to read.
+    // aGiTrack runs as a child of the shell (not `exec`-ed), so it's a real child process
+    // VSCode can see — which also makes the close-confirmation prompt fire consistently.
+    const terminal = spawnAgitrackTerminal({
+      name: terminals.size === 0 ? TERMINAL_NAME : `${TERMINAL_NAME} (${folder.name})`,
+      cwd: folder.uri.fsPath,
+      icon: "git-commit",
+      command: `${launchCommand(exe)} && exit`,
+    });
+    launchedAt.set(terminal, Date.now());
+    terminals.set(key, terminal);
+    terminal.show();
+  } finally {
+    launching.delete(key);
   }
-
-  const exe = await ensureCliAvailable();
-  if (!exe) {
-    return; // not installed and not installed-on-demand
-  }
-
-  await ensureCloseConfirmation();
-  void maybeShowGracefulExitTip();
-  // Disable VSCode's Python venv activation BEFORE creating the terminal, so the Python
-  // extension doesn't send a process-killing Ctrl-C + `source activate` into aGiTrack.
-  await suppressPythonEnvActivationForLaunch();
-
-  // Run aGiTrack inside the shell, but only AFTER the shell has finished its own startup
-  // — including any commands VSCode injects automatically (the Python extension's venv
-  // activation, conda init, shell integration). Those must run in the shell first;
-  // otherwise they get typed into aGiTrack's stdin (e.g. `source .venv/bin/activate`
-  // landing in the agent, or a stray newline auto-answering the privacy prompt).
-  // spawnAgitrackTerminal sequences the launch via shell integration to guarantee this.
-  //
-  // `&& exit` closes the terminal ONLY when aGiTrack exits successfully (status 0, e.g.
-  // Ctrl-G → exit). On a non-zero/error exit the `&& exit` is skipped, so the shell
-  // stays open with aGiTrack's error message still on screen for the user to read.
-  // aGiTrack runs as a child of the shell (not `exec`-ed), so it's a real child process
-  // VSCode can see — which also makes the close-confirmation prompt fire consistently.
-  const terminal = spawnAgitrackTerminal({
-    name: terminals.size === 0 ? TERMINAL_NAME : `${TERMINAL_NAME} (${folder.name})`,
-    cwd: folder.uri.fsPath,
-    icon: "git-commit",
-    command: `${launchCommand(exe)} && exit`,
-  });
-  launchedAt.set(terminal, Date.now());
-  terminals.set(key, terminal);
-  terminal.show();
 }
 
 /** Whether `terminal` still has a RUNNING aGiTrack session (so the aG button focuses it
@@ -348,6 +381,63 @@ async function shellHasChild(terminal: vscode.Terminal): Promise<boolean> {
   } catch {
     return false; // pgrep exits non-zero when the shell has no children
   }
+}
+
+/** Reconcile aGiTrack SESSION terminals VSCode revived from a previous window (those we
+ * didn't create this run): adopt one that still has aGiTrack running — a reload that kept
+ * its pty — so the aG button focuses it, and close one whose aGiTrack is gone — a restart
+ * left a bare shell — so it isn't mistaken for a live session and the user can start fresh.
+ * Dashboards (read-only) are left alone. `delayMs` lets revival settle before probing. */
+async function reconcileRestoredTerminals(delayMs = 0): Promise<void> {
+  if (delayMs > 0) {
+    await delay(delayMs);
+  }
+  await Promise.all(vscode.window.terminals.map((terminal) => reconcileRestoredTerminal(terminal)));
+}
+
+async function reconcileRestoredTerminal(terminal: vscode.Terminal): Promise<void> {
+  if (ourTerminals.has(terminal) || !isRestoredSessionTerminal(terminal)) {
+    return; // created this run, or not one of our session terminals (by name)
+  }
+  const key = folderKeyForTerminal(terminal);
+  const pid = key ? readAgitrackPid(key) : undefined;
+  // The repo lock is the authoritative "aGiTrack is running for this folder" signal; the
+  // shell-child check is a belt-and-suspenders backstop so a live session is never closed.
+  const live = (pid !== undefined && isAlive(pid)) || (await shellHasChild(terminal));
+  if (live) {
+    if (key && !terminals.has(key)) {
+      terminals.set(key, terminal);
+      launchedAt.set(terminal, Date.now());
+      ourTerminals.add(terminal);
+    }
+    return;
+  }
+  terminal.dispose(); // a leftover shell with no aGiTrack — close the tab
+}
+
+/** Whether `terminal`'s name marks it as an aGiTrack SESSION terminal (not a dashboard) —
+ * e.g. one revived across a window reopen. */
+function isRestoredSessionTerminal(terminal: vscode.Terminal): boolean {
+  const name = terminal.name;
+  if (name.startsWith(`${TERMINAL_NAME} Dashboard`)) {
+    return false; // dashboards are read-only; never auto-close them
+  }
+  return name === TERMINAL_NAME || name.startsWith(`${TERMINAL_NAME} (`);
+}
+
+/** Best-effort map from a session terminal's name back to its workspace folder path: the
+ * un-suffixed "aGiTrack" is the first folder; "aGiTrack (name)" matches by folder name. */
+function folderKeyForTerminal(terminal: vscode.Terminal): string | undefined {
+  const folders = vscode.workspace.workspaceFolders ?? [];
+  if (terminal.name === TERMINAL_NAME) {
+    return folders[0]?.uri.fsPath;
+  }
+  const prefix = `${TERMINAL_NAME} (`;
+  if (terminal.name.startsWith(prefix) && terminal.name.endsWith(")")) {
+    const folderName = terminal.name.slice(prefix.length, -1);
+    return folders.find((folder) => folder.name === folderName)?.uri.fsPath;
+  }
+  return undefined;
 }
 
 /** Once per installed version, tell the user the only reliable way to exit aGiTrack —
