@@ -307,9 +307,20 @@ def main(argv: list[str] | None = None) -> int:
         allowed_edit_paths = [p for p in args.allowed_edit_paths.split(os.pathsep) if p.strip()]
     else:
         allowed_edit_paths = getattr(config, "allowed_edit_paths", [])
+    # Resolve the backend this run will use: an explicit --backend wins, else the
+    # (repo-overlaid) configured default. There is no hardcoded fallback — if neither
+    # exists we must not silently pick an agent. The interactive first-run prompt above
+    # fills in a default when possible; reaching here without one means a non-interactive
+    # run (scripted / no TTY) with nothing configured, so fail clearly instead.
+    effective_backend = args.backend or config.default_backend
+    if not effective_backend:
+        print(
+            "No coding agent backend is configured. Run aGiTrack in an interactive "
+            "terminal to choose a default, or pass --backend <claude|opencode>."
+        )
+        return 1
     # Resolve the backend launch wrapper (--backend-command, else config) for the backend
     # this run will use. Validate the flag here so a malformed value fails fast and clearly.
-    effective_backend = args.backend or config.default_backend
     backend_command, backend_command_error = _resolve_backend_command(args.backend_command, config, effective_backend)
     if backend_command_error:
         print(backend_command_error)
@@ -318,21 +329,26 @@ def main(argv: list[str] | None = None) -> int:
         print("aGiTrack not started.")
         return 1
 
-    # Refuse a second instance on this repo up front — BEFORE the privacy prompt —
-    # so the user isn't asked to acknowledge anything only to be turned away. The
-    # authoritative lock is still taken inside run(); this is just an early, friendly
-    # check (a brief probe-then-acquire race only delays the same refusal, never
-    # lets two instances start).
-    owner = RepoLock(repo.repo / ".agitrack" / "lock").probe_owner()
-    if owner is not None:
-        print(already_running_message(owner))
+    # Take the single-writer lock up front — BEFORE the privacy prompt — and hold it
+    # for the whole session. Besides refusing a second instance immediately, this
+    # makes the lock (carrying our PID) present from the very start, so a session
+    # still sitting at this privacy prompt is already "locked". The VSCode extension
+    # reads this lock to tell a starting/running session apart from a dead shell;
+    # holding it from the start is what lets the aG button reliably focus the existing
+    # terminal instead of opening a second one. (It was a read-only probe before, so
+    # no lock was held during startup and the extension couldn't yet see the session.)
+    management_lock = RepoLock(repo.repo / ".agitrack" / "lock")
+    if not management_lock.acquire():
+        print(already_running_message(management_lock.owner_pid()))
         return 1
 
     if not _acknowledge_privacy_warning(scripted=scripted, skip=args.skip_privacy_ack):
+        management_lock.release()
         return 1
 
     try:
         if args.mode == "json":
+            management_lock.release()  # json/scripted mode runs via AgitrackShell, which takes its own lock
             AgitrackShell(
                 repo,
                 verbose=args.verbose,
@@ -359,10 +375,13 @@ def main(argv: list[str] | None = None) -> int:
                 delay_merge=args.delay_merge,
                 sandbox=sandbox_enabled,
                 allowed_edit_paths=allowed_edit_paths,
+                _lock=management_lock,
             ).run()
     except (GitError, RuntimeError) as error:
         print(error)
         return 1
+    finally:
+        management_lock.release()  # idempotent: run()/json mode already released on their own paths
     return 0
 
 
@@ -435,8 +454,8 @@ def _confirm_backend_command_mismatch(backend: str, backend_command: list[str], 
     return answer in {"y", "yes"}
 
 
-def _warn_reserved_passthrough(backend: str, backend_args: list[str]) -> None:
-    reserved = _RESERVED_PASSTHROUGH.get(backend, set())
+def _warn_reserved_passthrough(backend: str | None, backend_args: list[str]) -> None:
+    reserved = _RESERVED_PASSTHROUGH.get(backend or "", set())
     hit = sorted({arg for arg in backend_args if arg in reserved})
     if hit:
         print(

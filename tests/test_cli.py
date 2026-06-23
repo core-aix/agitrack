@@ -112,6 +112,15 @@ def _stub_repo_and_free_lock(monkeypatch):
         def __init__(self, _path):
             pass
 
+        def acquire(self):
+            return True  # nobody else holds it — we take it
+
+        def release(self):
+            pass
+
+        def owner_pid(self):
+            return None
+
         def probe_owner(self):
             return None
 
@@ -159,6 +168,15 @@ def test_already_running_refused_before_privacy_prompt(monkeypatch, capsys):
         def __init__(self, _path):
             pass
 
+        def acquire(self):
+            return False  # another instance holds it — refuse
+
+        def owner_pid(self):
+            return 4321
+
+        def release(self):
+            pass
+
         def probe_owner(self):
             return 4321  # another instance holds it
 
@@ -181,6 +199,80 @@ def test_already_running_refused_before_privacy_prompt(monkeypatch, capsys):
 
     assert rc == 1
     assert events == ["refused:4321"]  # refused, and the privacy prompt never ran
+
+
+def test_no_backend_configured_non_interactive_errors(monkeypatch, capsys):
+    # No --backend and no configured default, run non-interactively: aGiTrack must
+    # fail clearly rather than silently fall back to a hardcoded backend (the old
+    # behaviour that produced surprise OpenCode sessions).
+    _force_tty(monkeypatch, stdin=False)
+    _stub_repo_and_free_lock(monkeypatch)
+    launched: list = []
+
+    class Fake:
+        def __init__(self, repo, **kw):
+            launched.append(kw)
+
+        def run(self):
+            return 0
+
+    monkeypatch.setattr(cli, "ProxyRunner", Fake)
+    monkeypatch.setattr(cli, "AgitrackShell", Fake)
+
+    class Config:
+        use_worktrees = True
+
+        def has_default_backend(self):
+            return False
+
+        default_backend = None
+
+        def load_repo_overlay(self, _root):
+            pass
+
+    monkeypatch.setattr(cli, "GlobalConfig", lambda: Config())
+
+    rc = cli.main([])
+
+    assert rc == 1
+    assert launched == []  # never launched a backend
+    assert "No coding agent backend is configured" in capsys.readouterr().out
+
+
+def test_explicit_backend_flag_launches_without_configured_default(monkeypatch):
+    # An explicit --backend works even with no configured default (no fallback needed).
+    _force_tty(monkeypatch, stdin=False)
+    _stub_repo_and_free_lock(monkeypatch)
+    captured: dict = {}
+
+    class Fake:
+        def __init__(self, repo, **kw):
+            captured.update(kw)
+
+        def run(self):
+            return 0
+
+    monkeypatch.setattr(cli, "ProxyRunner", Fake)
+    monkeypatch.setattr(cli, "AgitrackShell", Fake)
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
+
+    class Config:
+        use_worktrees = True
+
+        def has_default_backend(self):
+            return False
+
+        default_backend = None
+
+        def load_repo_overlay(self, _root):
+            pass
+
+    monkeypatch.setattr(cli, "GlobalConfig", lambda: Config())
+
+    rc = cli.main(["--backend", "claude"])
+
+    assert rc == 0
+    assert captured.get("backend") == "claude"
 
 
 # --- --no-worktree (#9) -----------------------------------------------------
@@ -486,7 +578,7 @@ def test_proxy_runner_stores_backend_command(tmp_path):
     subprocess.run(["git", "-C", str(tmp_path), "commit", "-q", "--allow-empty", "-m", "init"], check=True)
     from agitrack.proxy.runner import ProxyRunner
 
-    runner = ProxyRunner(GitRepo(tmp_path), backend_command=["somewrapper", "opencode"])
+    runner = ProxyRunner(GitRepo(tmp_path), backend="opencode", backend_command=["somewrapper", "opencode"])
     assert runner._backend_command == ["somewrapper", "opencode"]
     # The launch command flows into the spawned command's executable head.
     assert runner._launch_command() == ["somewrapper", "opencode"]
@@ -499,7 +591,7 @@ def test_proxy_runner_stores_backend_args(tmp_path):
     subprocess.run(["git", "-C", str(tmp_path), "commit", "-q", "--allow-empty", "-m", "init"], check=True)
     from agitrack.proxy.runner import ProxyRunner
 
-    runner = ProxyRunner(GitRepo(tmp_path), backend_args=["--port", "9999"])
+    runner = ProxyRunner(GitRepo(tmp_path), backend="opencode", backend_args=["--port", "9999"])
     assert runner._backend_args == ["--port", "9999"]
     # _spawn appends them after spawn_command; verify that composition directly.
     base = ["opencode", str(tmp_path)]

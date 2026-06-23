@@ -8,8 +8,6 @@ from typing import Any
 
 from agitrack.env import getenv_compat
 
-DEFAULT_BACKEND = "opencode"
-
 # The key that opens aGiTrack's command menu in proxy mode. Configurable as
 # "menu_key" in config.json. Supports:
 #   - "ctrl-<letter>" (e.g., "ctrl-g") — single control byte
@@ -150,9 +148,15 @@ class GlobalConfig:
         return bool(self._raw("default_backend"))
 
     @property
-    def default_backend(self) -> str:
+    def default_backend(self) -> str | None:
+        """The configured default backend, or ``None`` when the user has never chosen one.
+
+        There is deliberately NO silent fallback to a hardcoded backend: a missing default
+        must surface as an explicit first-run prompt (interactive) or a clear error
+        (non-interactive) at the call site — never quietly launch some default agent, which
+        previously caused surprise OpenCode sessions when the value couldn't be read."""
         value = self._raw("default_backend")
-        return str(value) if value else DEFAULT_BACKEND
+        return str(value) if value else None
 
     @default_backend.setter
     def default_backend(self, value: str) -> None:

@@ -68,7 +68,10 @@ class AgitrackShell:
         # answered by the editor over the bridge rather than by a terminal user.
         self.interactive = self._ui_bridge or (self.prompts is None and sys.stdin.isatty())
         self.global_config = GlobalConfig()
-        self.state = AgitrackState(repo.repo, default_backend=self.global_config.default_backend)
+        # An explicit --backend seeds the state's default so a brand-new repo (no stored
+        # backend) resolves to it rather than to the configured default, which may be unset
+        # (there is no hardcoded fallback).
+        self.state = AgitrackState(repo.repo, default_backend=backend or self.global_config.default_backend)
         if backend and backend in BACKENDS and backend != self.state.backend:
             self.state.remember_backend_session()
             self.state.backend = backend

@@ -137,7 +137,10 @@ def test_make_proxy_agent_raises_on_unknown_backend():
 def test_global_config_default_backend_persists(tmp_path):
     path = tmp_path / "config.json"
     config = GlobalConfig(path)
-    assert config.default_backend == "opencode"
+    # No silent fallback: an unconfigured default reads as None (the caller must
+    # prompt/error), rather than quietly resolving to a hardcoded backend.
+    assert config.default_backend is None
+    assert config.has_default_backend() is False
     config.default_backend = "claude"
     assert GlobalConfig(path).default_backend == "claude"
     assert json.loads(path.read_text())["default_backend"] == "claude"
@@ -270,6 +273,45 @@ def test_claude_backend_bare_run_strips_tools_memory_and_system_prompt(monkeypat
     # ...but commit_guidance=False (--no-commit-guidance) omits it on a coding run too.
     backend.run("do real work", model=None, session_id=None, commit_guidance=False)
     assert "--append-system-prompt" not in captured["command"]
+
+
+def test_claude_backend_bare_run_is_timeout_capped(monkeypatch, tmp_path):
+    # A bare (summarizer) call passes a timeout so a hung backend can't block this session's
+    # next summary forever; a normal coding run stays uncapped (timeout=None).
+    import subprocess
+
+    captured: dict = {}
+
+    def fake_run(command, **kwargs):
+        captured["timeout"] = kwargs.get("timeout")
+        return types.SimpleNamespace(
+            stdout=json.dumps({"type": "result", "result": "ok", "session_id": "s"}), stderr="", returncode=0
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    backend = ClaudeBackend(tmp_path)
+
+    backend.run("summarize this", model=None, session_id=None, bare=True)
+    assert captured["timeout"] is not None and captured["timeout"] > 0
+
+    backend.run("do real work", model=None, session_id=None)
+    assert captured["timeout"] is None  # interactive turns are not capped
+
+
+def test_claude_backend_bare_run_timeout_returns_unusable_result(monkeypatch, tmp_path):
+    # When the bare call times out, run() returns a non-zero result (not a raised exception)
+    # so the summarizer falls back to the prompt-based message and the worker thread frees up.
+    import subprocess
+
+    def fake_run(command, **kwargs):
+        raise subprocess.TimeoutExpired(command, kwargs.get("timeout") or 0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    backend = ClaudeBackend(tmp_path)
+
+    result = backend.run("summarize this", model="m", session_id="s", bare=True)
+    assert result.exit_code != 0
+    assert result.final_response == ""
 
 
 def test_claude_backend_tolerates_leading_logs():
