@@ -47,10 +47,20 @@ def _bare_args(system_prompt: str | None) -> list[str]:
 class ClaudeBackend:
     name = "claude"
 
-    def __init__(self, repo: Path, *, verbose: bool = False, backend_args: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        repo: Path,
+        *,
+        verbose: bool = False,
+        backend_args: list[str] | None = None,
+        launch_command: list[str] | None = None,
+    ) -> None:
         self.repo = repo
         self.verbose = verbose
         self.backend_args = list(backend_args or [])  # forwarded verbatim to the backend CLI (#32)
+        # Command that launches the backend, replacing the "claude" executable with a user
+        # wrapper (e.g. ["somewrapper", "claude"]); empty ⇒ run "claude" directly.
+        self.launch_command = list(launch_command or [])
 
     def run(
         self,
@@ -62,7 +72,7 @@ class ClaudeBackend:
         system_prompt: str | None = None,
         commit_guidance: bool = True,
     ) -> AgentResult:
-        command = ["claude", "-p", prompt, "--output-format", "json"]
+        command = [*(self.launch_command or ["claude"]), "-p", prompt, "--output-format", "json"]
         if model:
             command.extend(["--model", model])
         if session_id:
@@ -156,16 +166,24 @@ class ClaudeBackend:
         return None
 
     def _model(self, data: dict) -> str | None:
-        # An explicit top-level model field, when present, is authoritative.
-        if isinstance(data.get("model"), str) and data["model"]:
-            return data["model"]
+        from agitrack.transcripts.claude import SYNTHETIC_MODEL
+
+        # An explicit top-level model field, when present, is authoritative — unless it
+        # is Claude Code's synthetic marker, which names no real model.
+        top = data.get("model")
+        if isinstance(top, str) and top and top != SYNTHETIC_MODEL:
+            return top
         # `modelUsage` can list several models for one invocation (a Haiku
         # sub-agent or background model alongside the main one) in arbitrary
         # order; the metadata (and the --model passed on later runs) must name
         # the MAIN conversation model — the one that produced the most output,
-        # with overall token volume as the tie-breaker.
+        # with overall token volume as the tie-breaker. The synthetic marker is
+        # dropped so it can never win.
         model_usage = data.get("modelUsage")
         if not isinstance(model_usage, dict) or not model_usage:
+            return None
+        candidates = [item for item in model_usage.items() if item[0] != SYNTHETIC_MODEL]
+        if not candidates:
             return None
 
         def weight(item: tuple[str, object]) -> tuple[int, int]:
@@ -176,7 +194,7 @@ class ClaudeBackend:
             total = sum(self._int(value) for value in usage.values())
             return (output, total)
 
-        return max(model_usage.items(), key=weight)[0]
+        return max(candidates, key=weight)[0]
 
     def _tokens(self, usage: object) -> TokenUsage:
         if not isinstance(usage, dict):

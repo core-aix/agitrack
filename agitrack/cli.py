@@ -101,6 +101,17 @@ def main(argv: list[str] | None = None) -> int:
         "allowed_edit_paths in config." % os.pathsep,
     )
     parser.add_argument(
+        "--backend-command",
+        default=None,
+        metavar="COMMAND",
+        help="custom command used to launch the backend agent, replacing the backend "
+        "executable so a wrapper can sit beneath aGiTrack — e.g. "
+        "--backend-command 'somewrapper claude'. Split like a shell command; it must "
+        "ultimately exec the chosen backend (aGiTrack's own sandbox wrapper still goes "
+        "on top). Also settable via backend_command in config (a string, or an object "
+        "keyed by backend name).",
+    )
+    parser.add_argument(
         "--delay-merge",
         action="store_true",
         help="don't merge a turn's committed changes into the base branch automatically; "
@@ -221,10 +232,17 @@ def main(argv: list[str] | None = None) -> int:
         if not backend_cmd:
             print(f"Error: Unknown backend '{backend}'.")
             return 1
-        if not shutil.which(backend_cmd):
+        launch, launch_error = _resolve_backend_command(args.backend_command, config, backend)
+        if launch_error:
+            print(launch_error)
+            return 1
+        # Launch under the configured wrapper if any (so `agitrack -- --help` shows the
+        # backend's help exactly as it runs); otherwise verify the bare binary is on PATH.
+        head = launch or [backend_cmd]
+        if not launch and not shutil.which(backend_cmd):
             print(f"Error: Backend '{backend}' not found on PATH.")
             return 1
-        result = subprocess.run([backend_cmd] + backend_args, check=False)
+        result = subprocess.run(head + backend_args, check=False)
         return result.returncode
 
     scripted = bool(args.prompts)
@@ -289,6 +307,16 @@ def main(argv: list[str] | None = None) -> int:
         allowed_edit_paths = [p for p in args.allowed_edit_paths.split(os.pathsep) if p.strip()]
     else:
         allowed_edit_paths = getattr(config, "allowed_edit_paths", [])
+    # Resolve the backend launch wrapper (--backend-command, else config) for the backend
+    # this run will use. Validate the flag here so a malformed value fails fast and clearly.
+    effective_backend = args.backend or config.default_backend
+    backend_command, backend_command_error = _resolve_backend_command(args.backend_command, config, effective_backend)
+    if backend_command_error:
+        print(backend_command_error)
+        return 1
+    if not _confirm_backend_command_mismatch(effective_backend, backend_command, scripted=scripted):
+        print("aGiTrack not started.")
+        return 1
 
     # Refuse a second instance on this repo up front — BEFORE the privacy prompt —
     # so the user isn't asked to acknowledge anything only to be turned away. The
@@ -311,6 +339,7 @@ def main(argv: list[str] | None = None) -> int:
                 backend=args.backend,
                 new_session=args.new_session,
                 backend_args=backend_args,
+                backend_command=backend_command,
                 prompts=args.prompts,
                 commit_guidance=commit_guidance,
                 json_events=args.json_events,
@@ -324,6 +353,7 @@ def main(argv: list[str] | None = None) -> int:
                 new_session=args.new_session,
                 use_worktrees=use_worktrees,
                 backend_args=backend_args,
+                backend_command=backend_command,
                 commit_guidance=commit_guidance,
                 full_agent_messages=args.full_agent_messages,
                 delay_merge=args.delay_merge,
@@ -343,6 +373,66 @@ _RESERVED_PASSTHROUGH = {
     "claude": {"--session-id", "--resume", "-r", "--continue", "-c"},
     "opencode": {"--session", "-s", "--continue", "-c"},
 }
+
+
+def _resolve_backend_command(
+    flag_value: str | None, config: GlobalConfig, backend: str
+) -> tuple[list[str], str | None]:
+    """Resolve the command that launches the backend, replacing its executable with a
+    user wrapper. The ``--backend-command`` flag (a shell-split string) wins; otherwise
+    the per-backend ``backend_command`` config value applies. Returns ``(tokens, error)``
+    — ``tokens`` empty means "launch the backend directly"; a non-None ``error`` is a
+    user-facing message for a malformed flag (so the caller can stop)."""
+    if flag_value is None:
+        getter = getattr(config, "backend_command", None)
+        return (list(getter(backend)) if callable(getter) else [], None)
+    import shlex
+
+    try:
+        tokens = shlex.split(flag_value)
+    except ValueError as error:
+        return ([], f"Invalid --backend-command {flag_value!r}: {error}")
+    if not tokens:
+        return ([], "Invalid --backend-command: the command is empty.")
+    return (tokens, None)
+
+
+def _confirm_backend_command_mismatch(backend: str, backend_command: list[str], *, scripted: bool) -> bool:
+    """When the launch command clearly names a *different* known backend than the selected
+    one (e.g. ``--backend claude --backend-command "wrap opencode"``), warn and require
+    explicit confirmation before proceeding. aGiTrack tracks transcripts/sessions per the
+    selected backend, so a wrapper that execs another backend silently breaks that tracking
+    — the user must opt in. Returns True to proceed, False to abort.
+
+    Only an unambiguous mismatch prompts — a known backend name appears in the command but
+    the selected one does not. An opaque wrapper (no known backend named, e.g.
+    ``mylauncher``) or a consistent command proceeds silently. Without a way to ask
+    (scripted/non-interactive), the warning is printed and the run proceeds, since
+    automation can't answer a prompt and must not hang on one."""
+    if not backend_command:
+        return True
+    named = {os.path.basename(token) for token in backend_command}
+    if backend in named:
+        return True  # the command names the selected backend — consistent
+    others = sorted(named & (set(available_backends()) - {backend}))
+    if not others:
+        return True  # opaque wrapper — don't guess which backend it runs
+    print(
+        f"Warning: --backend is '{backend}' but the launch command names "
+        f"{', '.join(others)}. aGiTrack tracks sessions for '{backend}', so a wrapper "
+        f"that runs a different backend will break session/transcript tracking. Pass "
+        f"--backend {others[0]} (or set default_backend) if that's what you meant."
+    )
+    if scripted or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return True  # can't prompt here; proceed with the warning rather than hang automation
+    # Drain any injected input first so a stray newline can't auto-confirm (same reason as
+    # the privacy acknowledgment): this must be a deliberate keypress.
+    _drain_terminal_input()
+    try:
+        answer = input(f"Proceed with backend '{backend}' anyway? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return answer in {"y", "yes"}
 
 
 def _warn_reserved_passthrough(backend: str, backend_args: list[str]) -> None:

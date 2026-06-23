@@ -390,6 +390,12 @@ class ProxyRunner:
     RENDER_MIN_INTERVAL = 0.033  # coalesce output-driven repaints to ~30fps
     SYNC_MAX_HOLD = 0.05  # cap how long a backend synchronized-update may defer a paint
     SUMMARY_WAIT_SECONDS = 45.0  # how long integration waits for a background commit summary (#8)
+    # On exit we don't start new summaries (see _start_commit_summary); we only give a
+    # summary that was ALREADY running (from the live path) a brief moment to land before
+    # integrating, then drop it rather than holding teardown hostage. Short on purpose —
+    # the commit already has a usable prompt-based message, so a slow summary isn't worth
+    # the wait. Per session.
+    EXIT_SUMMARY_GRACE_SECONDS = 3.0
     EXIT_SHARE_TIMEOUT = (
         45.0  # cap the exit-path auto-share push; long enough for a real push, short enough to never truly hang
     )
@@ -413,6 +419,7 @@ class ProxyRunner:
         delay_merge: bool = False,
         sandbox: bool = True,
         allowed_edit_paths: list[str] | None = None,
+        backend_command: list[str] | None = None,
         # Optional injected collaborators (default to production construction).
         # These keyword arguments are for testing and advanced use; the CLI call
         # site passes only the first five parameters and is unaffected.
@@ -444,6 +451,11 @@ class ProxyRunner:
         self._delay_merge = delay_merge
         # Extra CLI args forwarded verbatim to every backend spawn (#32).
         self._backend_args = list(backend_args or [])
+        # Per-run override (from --backend-command) for the command that launches the
+        # backend, replacing its executable so the agent runs under a user wrapper. When
+        # empty, the per-backend config value (GlobalConfig.backend_command) applies. The
+        # override wins for whatever backend is active; the config form is keyed by backend.
+        self._backend_command = list(backend_command or [])
         self._force_new_session = new_session  # start a fresh conversation, do not resume
         self.name = "main"  # session label (multiplexer assigns names to others)
         self._primary_worktree_name: str | None = None  # session kept across exits for auto-resume
@@ -896,6 +908,7 @@ class ProxyRunner:
                 "_warned_parallel_no_worktree": False,
                 "_sandbox": True,
                 "_allowed_edit_paths": [],
+                "_backend_command": [],
                 "_commit_guidance": True,
                 "_relaunch_times": [],
                 "_exiting": False,
@@ -1113,6 +1126,7 @@ class ProxyRunner:
             resume=resume,
             commit_guidance=self._commit_guidance,
             use_worktrees=self._use_worktrees,
+            executable=self._launch_command() or None,
         )
         # Forward any backend-specific args the user passed through aGiTrack (#32),
         # before the sandbox wrapper so they reach the backend, not sandbox-exec.
@@ -1129,6 +1143,21 @@ class ProxyRunner:
         self._cwd_drift_checked = False
         self._cwd_check_at = 0.0
         self._cwd_launch_at = time.time()
+
+    def _launch_command(self) -> list[str]:
+        # The command that launches the current backend, replacing its executable with a
+        # user wrapper (e.g. ["somewrapper", "claude"]). A per-run --backend-command
+        # override wins; otherwise the per-backend config value applies. Resolved per
+        # spawn because the active backend can change mid-session (menu switch / new
+        # session with another backend), so the right wrapper follows the backend. Empty
+        # ⇒ launch the backend binary directly.
+        if self._backend_command:
+            return list(self._backend_command)
+        config = self.global_config
+        if config is None:
+            return []
+        getter = getattr(config, "backend_command", None)
+        return list(getter(self.backend.name)) if callable(getter) else []
 
     def _notify_if_gh_unavailable(self) -> None:
         # Recommend installing / authenticating gh when it isn't usable, so the
@@ -7132,9 +7161,20 @@ class ProxyRunner:
         # its headless calls record real backend sessions keyed by cwd, which
         # the parse worker / exit adoption would then resume instead of the
         # user's conversation (issues #8/#56).
-        return Summarizer(backend_class(summary_scratch_dir()), model=model)
+        # Honour a configured backend wrapper for the summarizer's headless calls too,
+        # so the agent binary is always launched the same way the user asked.
+        launch = self._launch_command()
+        return Summarizer(backend_class(summary_scratch_dir(), launch_command=launch or None), model=model)
 
     def _start_commit_summary(self, sha: str, trace_text: str) -> None:
+        # Never kick off a fresh summarizer call while exiting. The exit-finalize commits
+        # each session's final turn (_commit_latest_turn_sync), and a summary started here
+        # would only be blocked on a few lines later (_finalize_summary_then_integrate_on_exit
+        # joins it), adding a whole LLM round-trip PER SESSION to teardown — the main reason
+        # exit dragged on for tens of seconds. The commit keeps its prompt-based message; the
+        # AI summary is an optional enhancement, not worth holding the exit for.
+        if self._exiting:
+            return
         summarizer = self._make_summarizer()
         if summarizer is None:
             return
@@ -7558,7 +7598,7 @@ class ProxyRunner:
         # dropped rather than holding the exit hostage (#8). Runs for the active
         # session in place and for each background session under a context swap.
         if self._summary_thread is not None and self._summary_thread.is_alive():
-            self._summary_thread.join(timeout=10)
+            self._summary_thread.join(timeout=self.EXIT_SUMMARY_GRACE_SECONDS)
         self._service_commit_summary()
         self._integrate_session_on_exit()
         self._remove_worktree_on_exit()

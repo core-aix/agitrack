@@ -408,6 +408,90 @@ def test_reserved_passthrough_flag_warns_but_forwards(monkeypatch, capsys):
     assert captured["backend_args"] == ["--resume", "abc123"]  # still forwarded
 
 
+def test_backend_command_flag_passed_to_runner(monkeypatch):
+    captured = _stub_launch(monkeypatch)
+    rc = cli.main(["--backend-command", "somewrapper claude"])
+    assert rc == 0
+    assert captured["backend_command"] == ["somewrapper", "claude"]
+
+
+def test_backend_command_absent_resolves_from_config(monkeypatch):
+    captured = _stub_launch(monkeypatch)
+    cli.main(["--backend", "opencode"])
+    # No flag and the stub config has no backend_command ⇒ launch the binary directly.
+    assert captured["backend_command"] == []
+
+
+def test_backend_command_invalid_value_fails_fast(monkeypatch, capsys):
+    _stub_launch(monkeypatch)
+    rc = cli.main(["--backend-command", 'wrap "unbalanced'])
+    assert rc == 1
+    assert "backend-command" in capsys.readouterr().out.lower()
+
+
+def test_backend_command_mismatch_warns(monkeypatch, capsys):
+    captured = _stub_launch(monkeypatch)
+    rc = cli.main(["--backend", "claude", "--backend-command", "wrap opencode"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Warning" in out and "opencode" in out and "claude" in out
+    # The launch still goes through with exactly what the user asked for.
+    assert captured["backend_command"] == ["wrap", "opencode"]
+
+
+def test_backend_command_mismatch_aborts_when_declined(monkeypatch, capsys):
+    # Interactive run: a mismatch must be explicitly confirmed; declining (anything but
+    # y) aborts before the backend is ever launched.
+    captured = _stub_launch(monkeypatch)
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True)
+    monkeypatch.setattr(cli, "_drain_terminal_input", lambda: None)
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "n")
+    rc = cli.main(["--backend", "claude", "--backend-command", "wrap opencode"])
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "Warning" in out and "not started" in out
+    assert captured == {}  # the runner was never constructed
+
+
+def test_backend_command_mismatch_proceeds_when_confirmed(monkeypatch):
+    # Entering y proceeds with exactly the command the user asked for.
+    captured = _stub_launch(monkeypatch)
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: True)
+    monkeypatch.setattr(cli, "_drain_terminal_input", lambda: None)
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "y")
+    rc = cli.main(["--backend", "claude", "--backend-command", "wrap opencode"])
+    assert rc == 0
+    assert captured["backend_command"] == ["wrap", "opencode"]
+
+
+def test_backend_command_naming_selected_backend_does_not_warn(monkeypatch, capsys):
+    _stub_launch(monkeypatch)
+    cli.main(["--backend", "claude", "--backend-command", "somewrapper claude"])
+    assert "Warning" not in capsys.readouterr().out
+
+
+def test_backend_command_opaque_wrapper_does_not_warn(monkeypatch, capsys):
+    # A wrapper that doesn't name any known backend is left alone (no guessing).
+    _stub_launch(monkeypatch)
+    cli.main(["--backend", "claude", "--backend-command", "mylauncher --flag"])
+    assert "Warning" not in capsys.readouterr().out
+
+
+def test_proxy_runner_stores_backend_command(tmp_path):
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-q", "--allow-empty", "-m", "init"], check=True)
+    from agitrack.proxy.runner import ProxyRunner
+
+    runner = ProxyRunner(GitRepo(tmp_path), backend_command=["somewrapper", "opencode"])
+    assert runner._backend_command == ["somewrapper", "opencode"]
+    # The launch command flows into the spawned command's executable head.
+    assert runner._launch_command() == ["somewrapper", "opencode"]
+
+
 def test_proxy_runner_stores_backend_args(tmp_path):
     # Build a runner through the real __init__ (with a tmp git repo) and confirm
     # passthrough args are stored for _spawn to append.

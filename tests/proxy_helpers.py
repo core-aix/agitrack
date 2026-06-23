@@ -73,20 +73,34 @@ def run_in_pty(argv: list[str]) -> bytes:
 
     This exercises the same OS pty read path the proxy uses for the backend — the part
     of aGiTrack that differs between macOS (BSD) and Linux. The child sees a real TTY on
-    stdin/stdout/stderr, so it emits the framed/cursor output a TUI would."""
+    stdin/stdout/stderr, so it emits the framed/cursor output a TUI would.
+
+    The parent keeps its own copy of the slave fd open until after draining. On macOS
+    (BSD) a pty discards any unread output the moment its *last* slave fd is closed, so a
+    short-lived child that writes and exits before the parent reads (e.g. ``printf``)
+    would otherwise race: the child's exit closes the only slave reference and the buffered
+    output is dropped, intermittently yielding a blank read in CI. Holding the slave open
+    across ``wait()`` keeps the output buffered; we then drain the master non-blocking. The
+    child's output here is tiny (well under the pty buffer), so waiting first can't
+    deadlock on a full buffer."""
+    import select
+
     master, slave = pty.openpty()
     process = subprocess.Popen(argv, stdin=slave, stdout=slave, stderr=slave, close_fds=True)
-    os.close(slave)
+    process.wait()  # parent still holds `slave`, so BSD keeps the output buffered
     chunks: list[bytes] = []
     while True:
+        readable, _, _ = select.select([master], [], [], 0.5)
+        if master not in readable:
+            break  # nothing left buffered
         try:
             chunk = os.read(master, 65536)
-        except OSError:  # slave closed → EOF on the master side
+        except OSError:  # last slave fd gone → EIO/EOF on the master side
             break
         if not chunk:
             break
         chunks.append(chunk)
-    process.wait()
+    os.close(slave)
     os.close(master)
     return b"".join(chunks)
 

@@ -350,12 +350,12 @@ async function shellHasChild(terminal: vscode.Terminal): Promise<boolean> {
   }
 }
 
-/** Once per installed version, tell the user the reliable way to exit aGiTrack —
- * Ctrl-G → exit — so the in-flight turn is finalized. We key the "seen" flag on the
- * extension version, so the tip re-appears after every update or reinstall (a fresh
- * version bump is a good moment to re-surface the safe-exit habit). Closing the window
- * also attempts a graceful exit (see deactivate()), but VSCode bounds how long it waits,
- * so this is the sure path. */
+/** Once per installed version, tell the user the only reliable way to exit aGiTrack —
+ * Ctrl-G → exit — so the in-flight turn is committed and merged. We key the "seen" flag on
+ * the extension version, so the tip re-appears after every update or reinstall (a fresh
+ * version bump is a good moment to re-surface the safe-exit habit). Closing the terminal or
+ * window can leave the latest turn unfinalized, so we deliberately do NOT present that as a
+ * graceful alternative — the user is directed to exit through the menu only. */
 async function maybeShowGracefulExitTip(): Promise<void> {
   const KEY = "agitrack.gracefulExitTipShownVersion";
   const state = extensionContext?.globalState;
@@ -368,9 +368,9 @@ async function maybeShowGracefulExitTip(): Promise<void> {
   }
   await state.update(KEY, version); // remember first, so an immediate close won't re-show it
   void vscode.window.showInformationMessage(
-    "When exiting aGiTrack later, to make sure your latest turn is committed and merged, use " +
-      "the Ctrl-G menu → exit inside aGiTrack. Closing the terminal or window still tries to " +
-      "exit cleanly, but Ctrl-G → exit is the reliable way.",
+    "To exit aGiTrack, always use the Ctrl-G menu → exit inside aGiTrack — that is what " +
+      "commits and merges your latest turn. Closing the terminal or window may leave your " +
+      "most recent work unfinalized, so exit through the menu rather than closing the terminal.",
     { modal: true },
     "Got it",
   );
