@@ -637,6 +637,11 @@ h2.section::before{content:"# ";color:var(--amber)}
 .bar{position:relative;height:18px;background:var(--ink);border:1px solid var(--line);overflow:hidden}
 .bar i{position:absolute;inset:0 auto 0 0;background:var(--phosphor-dim);box-shadow:0 0 10px rgba(61,255,160,.4)}
 .bar i.amber{background:var(--amber-dim);box-shadow:0 0 10px rgba(255,180,84,.35)}
+/* Log-scaled bars (the token panel) get a diagonal hatch over the fill plus a "log" tag,
+   so they read as non-linear at a glance — distinct from the proportional bars elsewhere. */
+.bar i.log{background-image:repeating-linear-gradient(45deg,rgba(2,8,5,.32) 0 3px,transparent 3px 7px)}
+.bar .logtag{position:absolute;right:6px;top:50%;transform:translateY(-50%);z-index:1;pointer-events:none;
+  font-size:9px;letter-spacing:.5px;text-transform:uppercase;color:var(--fg-dim);opacity:.85;text-shadow:0 0 3px var(--ink)}
 .bar span{position:absolute;right:6px;top:0;font-size:11px;color:var(--fg-dim);line-height:18px}
 .row .num{text-align:right;color:var(--fg-dim);font-size:12.5px}
 .row .num b{color:var(--phosphor);font-weight:600}
@@ -933,20 +938,35 @@ function md(src){
   return html;
 }
 
-function barRow(name, sub, value, max, numHtml, amber){
-  const w = max ? Math.max(2, value/max*100) : 0;
+// `min` (default 0) is the low end of the scale: the width maps [min, max] → [0, 100],
+// so passing the smallest value in the set as `min` spreads the bars across the full
+// width instead of compressing them against a fixed 0 baseline. The smallest value then
+// shows the 2% floor (still visible) and the largest fills the bar.
+// `logScale` marks a bar whose width is log-scaled (the token bars): it gets a striped
+// fill and a small "log" tag so it reads differently from the linear (scalar) bars
+// elsewhere, whose widths are directly proportional to their value.
+function barRow(name, sub, value, max, numHtml, amber, min, logScale){
+  const w = barWidth(value, max, min);
   // A long name is ellipsized to keep the row tidy, but its full text (and the
   // sub-label) is always available on hover via the title attribute.
   const title = esc(name) + (sub ? " — " + esc(sub) : "");
+  const cls = ((amber?"amber":"") + (logScale?" log":"")).trim();
+  const tag = logScale ? `<span class="logtag">log</span>` : "";
   return `<div class="row"><div class="name" title="${title}">${esc(name)}${sub?` <small>${esc(sub)}</small>`:""}</div>`+
-    `<div class="bar"><i class="${amber?"amber":""}" style="width:${w}%"></i></div>`+
+    `<div class="bar">${tag}<i class="${cls}" style="width:${w}%"></i></div>`+
     `<div class="num">${numHtml}</div></div>`;
 }
-// An indented "of which …" row: a subset of the category above it. Same bar scale, dimmed.
-function subBarRow(name, value, max, numHtml){
-  const w = max ? Math.max(2, value/max*100) : 0;
+function barWidth(value, max, min){
+  const lo = min || 0, span = max - lo;
+  return span > 0 ? Math.max(2, (value-lo)/span*100) : (value > 0 ? 100 : 0);
+}
+// An indented "of which …" row: a subset of the category above it. Always log-scaled (it
+// only renders token subsets), so its fill is striped like its parent; the parent carries
+// the "log" tag for the group, so the thin sub-bars stay uncluttered.
+function subBarRow(name, value, max, numHtml, min){
+  const w = barWidth(value, max, min);
   return `<div class="row sub"><div class="name" title="${esc(name)}">${esc(name)}</div>`+
-    `<div class="bar"><i style="width:${w}%"></i></div>`+
+    `<div class="bar"><i class="log" style="width:${w}%"></i></div>`+
     `<div class="num">${numHtml}</div></div>`;
 }
 function card(label, value, note, amber){
@@ -1011,18 +1031,23 @@ function renderAgg(){
   // one-off. Its headline is the sum of its parts.
   const summKeys = ["input","output","cache_read"].filter(k=>summ[k]);
   const summTotal = summKeys.reduce((a,k)=>a+summ[k], 0);
-  const allVals = [summTotal];
-  cats.forEach(c => { allVals.push(c.total); (c.subsets||[]).forEach(s => allVals.push(s.value)); });
-  summKeys.forEach(k => allVals.push(summ[k]));
-  const maxLog = Math.max(1, ...allVals.map(logTok));
+  // Scale the bars between the SMALLEST and largest value shown (not a fixed 0 baseline), so
+  // the widths spread across the full bar — the smallest value gets the floor, the largest
+  // fills it. Built from exactly the values that get a bar.
+  const barVals = [];
+  cats.forEach(c => { barVals.push(c.total); (c.subsets||[]).forEach(s => barVals.push(s.value)); });
+  if(summKeys.length){ barVals.push(summTotal); summKeys.forEach(k => barVals.push(summ[k])); }
+  const logs = barVals.map(logTok);
+  const maxLog = logs.length ? Math.max(...logs) : 1;
+  const minLog = logs.length ? Math.min(...logs) : 0;
   const rows = [];
   cats.forEach(c => {
-    rows.push(barRow(c.label, "", logTok(c.total), maxLog, `<b>${fmt(c.total)}</b>`, c.label==="output"));
-    (c.subsets||[]).forEach(s => rows.push(subBarRow("of which "+s.label, logTok(s.value), maxLog, fmt(s.value))));
+    rows.push(barRow(c.label, "", logTok(c.total), maxLog, `<b>${fmt(c.total)}</b>`, c.label==="output", minLog, true));
+    (c.subsets||[]).forEach(s => rows.push(subBarRow("of which "+s.label, logTok(s.value), maxLog, fmt(s.value), minLog)));
   });
   if(summKeys.length){
-    rows.push(barRow("summarizer", "aGiTrack's own calls", logTok(summTotal), maxLog, `<b>${fmt(summTotal)}</b>`));
-    summKeys.forEach(k => rows.push(subBarRow("of which "+(k==="cache_read"?"cache read":k), logTok(summ[k]), maxLog, fmt(summ[k]))));
+    rows.push(barRow("summarizer", "aGiTrack's own calls", logTok(summTotal), maxLog, `<b>${fmt(summTotal)}</b>`, false, minLog, true));
+    summKeys.forEach(k => rows.push(subBarRow("of which "+(k==="cache_read"?"cache read":k), logTok(summ[k]), maxLog, fmt(summ[k]), minLog)));
   }
   // The hierarchy shows cache-write under input; the note clarifies the one billing nuance
   // it can't — input is what was processed (uncached input + cache write), while cache read
