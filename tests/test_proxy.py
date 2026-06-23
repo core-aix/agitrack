@@ -2884,6 +2884,215 @@ def test_finalize_pending_work_commits_non_interactively():
     assert all(call.get("prompt_untracked") is False for call in calls)
 
 
+def _fake_completed(stdout):
+    return types.SimpleNamespace(stdout=stdout, returncode=0)
+
+
+def test_confirm_forced_exit_quit_without_gui(monkeypatch):
+    from agitrack.proxy import host_prompt
+
+    monkeypatch.setattr(host_prompt, "can_show_dialog", lambda: False)
+    # No window server: never shell out, just resolve to QUIT so the exit is fast.
+    monkeypatch.setattr(
+        host_prompt.subprocess,
+        "run",
+        lambda *a, **k: pytest.fail("must not run osascript without a GUI"),
+    )
+    assert host_prompt.confirm_forced_exit("x") == host_prompt.QUIT
+
+
+def test_confirm_forced_exit_parses_button_and_timeout(monkeypatch):
+    from agitrack.proxy import host_prompt
+
+    monkeypatch.setattr(host_prompt, "can_show_dialog", lambda: True)
+
+    monkeypatch.setattr(
+        host_prompt.subprocess,
+        "run",
+        lambda *a, **k: _fake_completed("button returned:Reopen aGiTrack, gave up:false"),
+    )
+    assert host_prompt.confirm_forced_exit("x") == host_prompt.REOPEN
+
+    monkeypatch.setattr(
+        host_prompt.subprocess,
+        "run",
+        lambda *a, **k: _fake_completed("button returned:Quit aGiTrack, gave up:false"),
+    )
+    assert host_prompt.confirm_forced_exit("x") == host_prompt.QUIT
+
+    # A timed-out dialog (system restart) reports gave up:true and must QUIT,
+    # even though the giving-up record can echo the default button.
+    monkeypatch.setattr(
+        host_prompt.subprocess,
+        "run",
+        lambda *a, **k: _fake_completed("button returned:Reopen aGiTrack, gave up:true"),
+    )
+    assert host_prompt.confirm_forced_exit("x") == host_prompt.QUIT
+
+
+def test_confirm_forced_exit_quit_on_osascript_error(monkeypatch):
+    from agitrack.proxy import host_prompt
+
+    monkeypatch.setattr(host_prompt, "can_show_dialog", lambda: True)
+
+    def boom(*a, **k):
+        raise OSError("osascript blew up")
+
+    monkeypatch.setattr(host_prompt.subprocess, "run", boom)
+    assert host_prompt.confirm_forced_exit("x") == host_prompt.QUIT
+
+
+def test_can_show_dialog_requires_macos(monkeypatch):
+    from agitrack.proxy import host_prompt
+
+    monkeypatch.setattr(host_prompt.shutil, "which", lambda _name: "/usr/bin/osascript")
+    monkeypatch.setattr(host_prompt.sys, "platform", "linux")
+    assert host_prompt.can_show_dialog() is False
+    monkeypatch.setattr(host_prompt.sys, "platform", "darwin")
+    assert host_prompt.can_show_dialog() is True
+    monkeypatch.setattr(host_prompt.shutil, "which", lambda _name: None)
+    assert host_prompt.can_show_dialog() is False
+
+
+def test_had_unfinalized_work_detects_inflight_and_dirty():
+    runner = make_runner()
+
+    runner._agent_is_active = lambda: True
+    assert runner._had_unfinalized_work() is True
+
+    runner._agent_is_active = lambda: False
+    runner.sessions = [object()]
+    runner._session_status = lambda _i: "running"
+    assert runner._had_unfinalized_work() is True
+
+    runner.sessions = []
+    runner.repo = types.SimpleNamespace(status_short=lambda: " M file.py")
+    runner.base_repo = types.SimpleNamespace(status_short=lambda: "", repo="/tmp/x")
+    assert runner._had_unfinalized_work() is True
+
+
+def test_had_unfinalized_work_false_on_clean_idle_close():
+    runner = make_runner()
+    runner._agent_is_active = lambda: False
+    runner.sessions = []
+    runner.repo = types.SimpleNamespace(status_short=lambda: "")
+    runner.base_repo = types.SimpleNamespace(status_short=lambda: "", repo="/tmp/x")
+    assert runner._had_unfinalized_work() is False
+
+
+def test_handle_exit_signal_prompts_only_when_work_pending(monkeypatch):
+    import signal as signal_mod
+
+    runner = make_runner()
+    runner._disable_host_terminal_modes = lambda: None
+    runner._cleanup_child = lambda: None
+    runner._restore_terminal = lambda: None
+    runner._finalize_pending_work = lambda: None
+    prompted = []
+    runner._prompt_forced_exit = lambda: prompted.append(True)
+
+    runner._had_unfinalized_work = lambda: False
+    with pytest.raises(SystemExit):
+        runner._handle_exit_signal(signal_mod.SIGHUP, None)
+    assert prompted == [], "a clean close must exit silently"
+
+    runner._had_unfinalized_work = lambda: True
+    with pytest.raises(SystemExit):
+        runner._handle_exit_signal(signal_mod.SIGHUP, None)
+    assert prompted == [True], "a close mid-work must prompt the user"
+
+
+def test_prompt_forced_exit_arms_reopen_on_choice(monkeypatch):
+    from agitrack.proxy import host_prompt
+
+    runner = make_runner()
+    monkeypatch.setattr(host_prompt, "can_show_dialog", lambda: True)
+
+    monkeypatch.setattr(host_prompt, "confirm_forced_exit", lambda *a, **k: host_prompt.REOPEN)
+    runner._prompt_forced_exit()
+    assert runner._reopen_after_exit is True
+
+    runner._reopen_after_exit = False
+    monkeypatch.setattr(host_prompt, "confirm_forced_exit", lambda *a, **k: host_prompt.QUIT)
+    runner._prompt_forced_exit()
+    assert runner._reopen_after_exit is False
+
+
+def test_prompt_forced_exit_noop_without_gui(monkeypatch):
+    from agitrack.proxy import host_prompt
+
+    runner = make_runner()
+    monkeypatch.setattr(host_prompt, "can_show_dialog", lambda: False)
+    monkeypatch.setattr(
+        host_prompt,
+        "confirm_forced_exit",
+        lambda *a, **k: pytest.fail("must not prompt without a GUI"),
+    )
+    runner._prompt_forced_exit()
+    assert runner._reopen_after_exit is False
+
+
+def test_reopen_in_new_window_builds_resume_command(monkeypatch):
+    from agitrack.proxy import host_prompt
+
+    runner = make_runner()
+    runner.base_repo = types.SimpleNamespace(status_short=lambda: "", repo="/repo/root")
+    captured = {}
+
+    def fake_reopen(command, cwd):
+        captured["command"] = command
+        captured["cwd"] = cwd
+        return True
+
+    monkeypatch.setattr(host_prompt, "reopen_in_new_terminal", fake_reopen)
+    monkeypatch.setattr("agitrack.proxy.runner.sys.argv", ["agitrack", "--backend", "claude"])
+    runner._reopen_in_new_window()
+
+    assert "-m agitrack" in captured["command"]
+    assert "--backend claude" in captured["command"]
+    assert captured["cwd"] == "/repo/root"
+
+
+def test_reopen_in_new_terminal_runs_osascript(monkeypatch):
+    from agitrack.proxy import host_prompt
+
+    monkeypatch.setattr(host_prompt.sys, "platform", "darwin")
+    monkeypatch.setattr(host_prompt.shutil, "which", lambda _name: "/usr/bin/osascript")
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        return types.SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(host_prompt.subprocess, "run", fake_run)
+    assert host_prompt.reopen_in_new_terminal("py -m agitrack", "/repo root") is True
+    script = captured["argv"][-1]
+    assert 'tell application "Terminal" to do script' in script
+    # The cwd is single-quoted for the inner shell; a space must not split it.
+    assert "cd '/repo root' && exec py -m agitrack" in script
+
+
+def test_reopen_in_new_terminal_no_op_off_macos(monkeypatch):
+    from agitrack.proxy import host_prompt
+
+    monkeypatch.setattr(host_prompt.sys, "platform", "linux")
+    monkeypatch.setattr(
+        host_prompt.subprocess,
+        "run",
+        lambda *a, **k: pytest.fail("must not run osascript off macOS"),
+    )
+    assert host_prompt.reopen_in_new_terminal("x", "/y") is False
+
+
+def test_host_prompt_quoting_is_injection_safe():
+    from agitrack.proxy import host_prompt
+
+    # An AppleScript literal escapes embedded double quotes and backslashes.
+    assert host_prompt._quote('a"b\\c') == '"a\\"b\\\\c"'
+    # A shell argument single-quotes and escapes embedded single quotes.
+    assert host_prompt._sh_quote("it's") == "'it'\\''s'"
+
+
 def test_confirm_exit_prompts_when_managing(monkeypatch):
     runner = make_runner()
     monkeypatch.setattr(runner, "_select_popup", lambda *a, **k: "Yes, exit")

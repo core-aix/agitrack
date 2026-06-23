@@ -6,6 +6,7 @@ import os
 from agitrack.env import getenv_compat
 import re
 import select
+import shlex
 import shutil
 import signal
 import subprocess
@@ -38,7 +39,7 @@ from agitrack.commits import (
 from agitrack.git import GitRepo
 from agitrack.config import GlobalConfig
 from agitrack.git import RepoLock, already_running_message
-from agitrack.proxy import sandbox
+from agitrack.proxy import host_prompt, sandbox
 from agitrack.config import AgitrackState
 from agitrack.git import WorktreeInfo, WorktreeManager, _sanitize_name, is_managed_branch
 from agitrack.proxy.commit_engine import CommitEngine
@@ -667,6 +668,7 @@ class ProxyRunner:
         self._update_pending = False  # user accepted; apply once sessions finish
         self._update_applying = False  # apply+restart in progress
         self._pending_restart = False  # re-exec aGiTrack after the loop tears down
+        self._reopen_after_exit = False  # host terminal closed; user asked to reopen in a new window
 
     def _apply_timings(self, timings: dict[str, float]) -> None:
         # Override the class-constant timing defaults with the user's configured
@@ -876,6 +878,7 @@ class ProxyRunner:
                 "_update_pending": False,
                 "_update_applying": False,
                 "_pending_restart": False,
+                "_reopen_after_exit": False,
                 "UPDATE_CHECK_SECONDS": 300.0,
             }
         )
@@ -992,6 +995,11 @@ class ProxyRunner:
                 except OSError:
                     pass
             self.management_lock.release()
+            # The host terminal closed mid-work and the user chose "Reopen" in the
+            # forced-exit dialog: launch a fresh window now that the lock is free so
+            # the new instance can acquire it and auto-resume the session.
+            if self._reopen_after_exit:
+                self._reopen_in_new_window()
         # A self-update was applied; re-exec aGiTrack in place now that the terminal
         # is restored and the management lock is released. Does not return.
         if self._pending_restart:
@@ -7380,6 +7388,11 @@ class ProxyRunner:
         # not abruptly. Rendering is suppressed (the terminal may already be gone:
         # `_render()` no-ops when `screen` is None) and the whole finalize is guarded so
         # a slow or failing finalize can never stop the process from exiting.
+        #
+        # Whether work was actually in progress is captured *before* finalizing (which
+        # commits it away) so the out-of-terminal prompt only fires when the close
+        # interrupted something — a clean close stays silent.
+        had_work = self._had_unfinalized_work()
         self.screen = None
         try:
             self._finalize_pending_work()
@@ -7388,7 +7401,69 @@ class ProxyRunner:
         self._disable_host_terminal_modes()
         self._cleanup_child()
         self._restore_terminal()
+        if had_work:
+            self._prompt_forced_exit()
         raise SystemExit(128 + int(signum))
+
+    def _had_unfinalized_work(self) -> bool:
+        """Whether the host terminal closed while a session still had work going.
+
+        True when an agent turn is in flight, a background session is still
+        running, or any tracked tree has uncommitted changes. Drives the
+        forced-exit prompt so a clean close (nothing pending) exits silently.
+        Best-effort and cheap; any error resolves to False so a forced exit
+        stays fast and quiet.
+        """
+        try:
+            if self._agent_is_active():
+                return True
+            if any(self._session_status(i) == "running" for i in range(len(self.sessions))):
+                return True
+            if self.repo.status_short().strip():
+                return True
+            if self.base_repo.status_short().strip():
+                return True
+        except Exception:
+            return False
+        return False
+
+    def _prompt_forced_exit(self) -> None:
+        """Prompt the user about an exit forced by the host terminal closing.
+
+        The TUI is gone by the time SIGHUP/SIGTERM arrives, so the user can no
+        longer be asked anything inside the terminal. Surface a blocking dialog
+        through the OS window server instead (macOS only — a silent no-op on
+        SSH/headless/Linux, and time-boxed so it can never hang a system
+        restart). "Reopen aGiTrack" arms a best-effort relaunch in a fresh
+        window, performed after the management lock is released (see `run`).
+        """
+        if not host_prompt.can_show_dialog():
+            return
+        try:
+            choice = host_prompt.confirm_forced_exit(
+                "Choose Reopen aGiTrack to keep working in a new window, or Quit aGiTrack to close."
+            )
+        except Exception as error:
+            self._debug(f"forced-exit prompt failed: {error!r}")
+            return
+        if choice == host_prompt.REOPEN:
+            self._reopen_after_exit = True
+
+    def _reopen_in_new_window(self) -> None:
+        """Relaunch aGiTrack in a fresh window after a forced exit.
+
+        Called from `run`'s teardown once the management lock is released so the
+        new instance can take it. Mirrors `restart_agitrack`'s
+        `python -m agitrack <argv>` invocation (the original terminal is gone, so
+        this opens a new window) and starts it in the base repo root so the last
+        session auto-resumes. Best-effort; never raises.
+        """
+        try:
+            args = " ".join(shlex.quote(arg) for arg in sys.argv[1:])
+            command = f"{shlex.quote(sys.executable)} -m agitrack {args}".rstrip()
+            host_prompt.reopen_in_new_terminal(command, str(self.base_repo.repo))
+        except Exception as error:
+            self._debug(f"reopen in new window failed: {error!r}")
 
     def _cleanup_child(self) -> None:
         # Delegate SIGINT -> wait -> SIGTERM escalation to the session's BackendProcess.
