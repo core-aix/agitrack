@@ -7545,8 +7545,8 @@ class ProxyRunner:
         self._delete_orphan_merged_branches()
         # NB: deliberately NOT sweeping orphan shared-session snapshots here. That
         # sweep runs `git fsck` over the whole object graph — seconds on a large
-        # repo — and would block exit (showing "Finalizing commits…") even when the
-        # session made no commits. It is redundant anyway: each publish reclaims its
+        # repo — and would stall exit even when the session made no commits. It is
+        # redundant anyway: each publish reclaims its
         # previous snapshot immediately, and the startup sweep (a background thread)
         # mops up any stragglers. So leave exit fast.
 
