@@ -911,9 +911,10 @@ def test_copy_announces_before_confirming(tmp_path):
     assert copying < copied  # "Copying …" precedes the "Copied …" confirmation
 
 
-def test_copy_offer_also_offers_user_commit_for_edits(tmp_path):
-    # When the worktree has the user's own uncommitted edits AND copy-able leftovers, BOTH
-    # prompts show: a commit prompt for the edits, then the copy prompt for the leftovers.
+def test_copy_offer_offers_user_commit_for_edits_on_switch(tmp_path):
+    # On a switch/exit offer (main thread), when the worktree has the user's own uncommitted
+    # edits AND copy-able leftovers, BOTH prompts show: a commit prompt for the edits, then
+    # the copy prompt. (The per-turn offer defers the commit prompt — see the test below.)
     import types
 
     runner, base, wt, _ = _copy_runner(tmp_path, "?? leftover.txt\n")
@@ -924,9 +925,46 @@ def test_copy_offer_also_offers_user_commit_for_edits(tmp_path):
     runner._select_popup = lambda *a, **k: events.append("copy") or "No, leave them in the worktree"
     del runner._offer_user_commit_for_worktree_edits  # use the real method
 
-    runner._offer_copy_unstaged_to_base()
+    runner._offer_copy_unstaged_to_base(context="switch")
 
     assert events == ["user-commit", "copy"]  # both shown, commit prompt first
+
+
+def test_turn_copy_offer_defers_user_commit_prompt(tmp_path):
+    # The per-turn offer's worktree read runs on the git worker, which must never raise the
+    # (blocking) user-commit popup or commit from there; that prompt is left for switch/exit.
+    import types
+
+    runner, base, wt, _ = _copy_runner(tmp_path, "?? leftover.txt\n")
+    (wt / "leftover.txt").write_text("x\n")
+    runner.actions = types.SimpleNamespace(has_pre_agent_user_changes=lambda: True)
+    events: list[str] = []
+    runner._create_user_commit_popup = lambda *a, **k: events.append("user-commit")
+    runner._select_popup = lambda *a, **k: events.append("copy") or "No, leave them in the worktree"
+    del runner._offer_user_commit_for_worktree_edits
+
+    runner._offer_copy_unstaged_to_base()  # context="turn"
+
+    assert events == ["copy"]  # no user-commit prompt mid-turn (deferred to switch/exit)
+
+
+def test_request_copy_offer_stashes_for_main_without_presenting(tmp_path):
+    # The git-worker side collects candidates and stashes them for the main thread, but must
+    # NOT present any popup itself (that would block the worker, stalling commit/merge). The
+    # main thread then presents the stash via _present_pending_copy_offer.
+    runner, base, wt, _ = _copy_runner(tmp_path, "?? leftover.txt\n")
+    (wt / "leftover.txt").write_text("x\n")
+    presented: list = []
+    runner._present_copy_offer = lambda collected, *, context: presented.append((collected, context))
+
+    runner._request_copy_offer()  # worker side: collect + stash, no popup
+    assert presented == []  # nothing presented on the worker
+    assert runner._pending_copy_offer is not None  # stashed for the main thread
+    assert runner._pending_copy_offer[0] == "turn"
+
+    runner._present_pending_copy_offer()  # main side: present the stash
+    assert len(presented) == 1 and presented[0][1] == "turn"
+    assert runner._pending_copy_offer is None  # consumed
 
 
 def test_copy_offer_skips_user_commit_when_no_edits(tmp_path):
@@ -1195,7 +1233,9 @@ def test_maybe_offer_copy_when_idle_is_gated_on_idleness(tmp_path):
     runner.merge_ctx = None
     runner.last_child_output = 0.0  # long ago → past the idle threshold
     calls: list = []
-    runner._offer_copy_unstaged_to_base = lambda: calls.append(True)
+    # The idle wrapper hands the offer to the main thread via _request_copy_offer (so the git
+    # worker never blocks on the popup); it must not even collect while the agent is active.
+    runner._request_copy_offer = lambda: calls.append(True)
 
     runner._agent_is_active = lambda: True
     runner._maybe_offer_copy_when_idle(1e9)
