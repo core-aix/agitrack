@@ -29,6 +29,14 @@ REF = "refs/agitrack/shared-sessions"
 # Sessions shared by a peer still running pre-rename aGiT land under the old ref.
 # Reads merge both (new wins); writes only ever touch the new ref.
 LEGACY_REF = "refs/agit/shared-sessions"
+# Read-only MIRROR of the remote refs, used by the dashboard's listing fetch. The
+# listing path fetches the remote into these instead of force-overwriting the canonical
+# local refs above — so a remote that's momentarily behind (a share whose push lagged or
+# failed) can never rewind your own freshly-shared session out of the local ref. The
+# listing then unions the local refs with these mirrors, newest copy winning (see
+# ``listing_entries``).
+REMOTE_MIRROR = "refs/agitrack/shared-sessions-remote"
+LEGACY_MIRROR = "refs/agit/shared-sessions-remote"
 DEFAULT_KEEP = 5  # most-recent shared sessions retained per contributor
 # Throttle remote fetches when the dashboard polls. Your OWN shared sessions land
 # in the local ref directly (no fetch needed); this only pulls collaborators'
@@ -223,6 +231,57 @@ class SharedSessionStore:
                     github_id=key[0], name=key[1], manifest=self._manifest(*key, ref=ref), source_ref=ref
                 )
         return sorted(seen.values(), key=lambda e: e.manifest.get("updated", 0), reverse=True)
+
+    def listing_entries(self) -> list[SharedEntry]:
+        """Shared sessions for read-only LISTING (the dashboard), newest first.
+
+        Unions the canonical local refs — which always hold YOUR own freshly-shared
+        sessions — with the remote mirrors (collaborators' sessions, and possibly a stale
+        copy of your own), keeping the newest copy of each session by manifest ``updated``.
+        Unlike :meth:`entries`, the freshest copy wins regardless of source, so a remote
+        that's briefly behind never makes your just-shared session look old. The mirrors are
+        populated non-destructively by :meth:`fetch_listing_throttled`, so listing never
+        rewinds the local ref the session writer owns."""
+        prefix = self._prefix()
+        best: dict[tuple[str, str], SharedEntry] = {}
+        for ref in (self.ref, REMOTE_MIRROR, LEGACY_REF, LEGACY_MIRROR):
+            if not self.repo.ref_exists(ref):
+                continue
+            for path in self.repo.read_tree_paths(ref):
+                if not path.startswith(prefix):
+                    continue
+                rest = path[len(prefix) :].split("/")
+                if len(rest) != 3 or rest[2] != "manifest.json":
+                    continue  # one decision per session, from its manifest
+                key = (rest[0], rest[1])
+                manifest = self._manifest(*key, ref=ref)
+                current = best.get(key)
+                if current is None or manifest.get("updated", 0) > current.manifest.get("updated", 0):
+                    best[key] = SharedEntry(github_id=key[0], name=key[1], manifest=manifest, source_ref=ref)
+        return sorted(best.values(), key=lambda e: e.manifest.get("updated", 0), reverse=True)
+
+    def fetch_listing_throttled(self) -> None:
+        """Throttled, background remote refresh for the read-only listing. Fetches the
+        remote shared refs into the local MIRROR refs (never the canonical local refs your
+        own shares live in), so a poll can surface collaborators' newly-shared sessions
+        without ever rewinding your own. Best-effort; a missing remote or fetch error is
+        ignored. Pair with :meth:`listing_entries`."""
+        if not self.repo.remote_exists():
+            return
+        key = f"{self.repo.repo}#listing"
+        now = time.monotonic()
+        if now - _fetch_at.get(key, 0.0) < _FETCH_TTL:
+            return
+        _fetch_at[key] = now  # claim the window up front so concurrent polls don't pile on
+
+        def worker() -> None:
+            for src, dst in ((self.ref, REMOTE_MIRROR), (LEGACY_REF, LEGACY_MIRROR)):
+                try:
+                    self.repo.fetch_ref(f"+{src}:{dst}", filter_blobs="blob:limit=16k")
+                except Exception:
+                    pass  # listing is best-effort; the local ref still renders your own shares
+
+        threading.Thread(target=worker, daemon=True, name="agit-shared-listing-fetch").start()
 
     def _manifest(self, github_id: str, name: str, *, ref: str | None = None) -> dict:
         raw = self.repo.read_ref_blob(ref or self.ref, f"{self._prefix()}{github_id}/{name}/manifest.json")
