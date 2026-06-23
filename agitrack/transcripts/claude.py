@@ -30,6 +30,11 @@ __all__ = [
     "parse_rows",
 ]
 
+# The "model" Claude Code stamps on synthetic (non-LLM) assistant messages —
+# compaction notices, interrupt/"no response" markers. It names no real model, so
+# the turn parser must not treat it as the conversation's model.
+SYNTHETIC_MODEL = "<synthetic>"
+
 # User messages whose text is purely a slash-command/tool artifact are not real
 # prompts and should be excluded from the interaction trace.
 _COMMAND_TAGS = (
@@ -617,8 +622,13 @@ def parse_rows(
             if stamp is not None:
                 current["ended_at"] = stamp
             current["tokens"].add(_usage_once(message, counted_ids))
+            # Claude Code stamps synthetic (non-LLM) assistant messages — compaction
+            # notices, interrupt/"no response" markers — with the literal model
+            # "<synthetic>". That names no real model, so it must not overwrite the
+            # turn's actual model (otherwise the commit, and the dashboard's by-model
+            # breakdown, records "<synthetic>" instead of e.g. claude-opus-4-8).
             message_model = message.get("model")
-            if isinstance(message_model, str) and message_model:
+            if isinstance(message_model, str) and message_model and message_model != SYNTHETIC_MODEL:
                 current["model"] = message_model
                 model = message_model
             # Track the most recent assistant message's stop reason; `tool_use`

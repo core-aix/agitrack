@@ -151,6 +151,24 @@ class CommitStat:
         return self.insertions + self.deletions
 
 
+# Placeholders the backend/model commit metadata uses for "no real value". The
+# writer records ``model: unknown`` when a turn's model couldn't be determined
+# (commits/message.py), and the Claude transcript can carry ``<synthetic>`` as the
+# "model" of synthetic (non-LLM) assistant messages — compaction notices, interrupt
+# markers — which name no real model. Read back as None so a turn with no genuine
+# backend/model is simply omitted from the by-backend / by-model breakdowns instead
+# of forming an "unknown"/"<synthetic>" bucket. (The transcript parser now also avoids
+# recording ``<synthetic>`` going forward; this keeps already-committed history clean.)
+_METADATA_PLACEHOLDERS = {"unknown", "<synthetic>"}
+
+
+def _real_metadata_label(value: str | None) -> str | None:
+    """A backend/model metadata value, or None when it is a "no real value" placeholder."""
+    if value is None:
+        return None
+    return None if value.strip().lower() in _METADATA_PLACEHOLDERS else value
+
+
 @dataclass
 class Dashboard:
     repo: str
@@ -243,19 +261,25 @@ class Dashboard:
             if stat.constituents:
                 ai_parts = [p for p in stat.constituents if p.kind in ("agent", "covered", "agent-merge")]
                 for part in ai_parts:
-                    bucket = groups.setdefault(label_fn(part) or "unknown", defaultdict(int))
+                    label = label_fn(part)
+                    if not label:
+                        continue  # unknown backend/model (placeholder → None) — omit, don't bucket
+                    bucket = groups.setdefault(label, defaultdict(int))
                     bucket["commits"] += 1
                     bucket["output_tokens"] += part.tokens.get("output", 0)
                     bucket["input_tokens"] += part.tokens.get("input", 0)
                 dominant = max(ai_parts, key=lambda p: p.tokens.get("output", 0), default=None)
-                if dominant is not None:
-                    bucket = groups.setdefault(label_fn(dominant) or "unknown", defaultdict(int))
+                dominant_label = label_fn(dominant) if dominant is not None else None
+                if dominant_label:
+                    bucket = groups.setdefault(dominant_label, defaultdict(int))
                     bucket["insertions"] += stat.insertions
                     bucket["deletions"] += stat.deletions
                 continue
             if stat.kind != "agent":
                 continue
-            label = label_fn(by_sha[stat.sha]) or "unknown"
+            label = label_fn(by_sha[stat.sha])
+            if not label:
+                continue  # unknown backend/model (placeholder → None) — omit, don't bucket
             bucket = groups.setdefault(label, defaultdict(int))
             bucket["commits"] += 1
             ins, dels = covered_lines[stat.sha]
@@ -637,8 +661,8 @@ def _parse_commit(sha: str, author: str, email: str, committed_at: str, body: st
         timestamp=timestamp,
         started_at=metadata.get("agent_started_at", ""),
         ended_at=metadata.get("agent_ended_at", ""),
-        backend=metadata.get("backend"),
-        model=metadata.get("model"),
+        backend=_real_metadata_label(metadata.get("backend")),
+        model=_real_metadata_label(metadata.get("model")),
         tokens=_parse_tokens(metadata),
         covered_commits=(metadata.get("covered_commits") or "").split(),
         co_authors=co_authors,
@@ -714,8 +738,8 @@ def _constituent(segment_lines: list[str]) -> CommitStat:
         kind=_kind_from_metadata(metadata),
         started_at=metadata.get("agent_started_at", ""),
         ended_at=metadata.get("agent_ended_at", ""),
-        backend=metadata.get("backend"),
-        model=metadata.get("model"),
+        backend=_real_metadata_label(metadata.get("backend")),
+        model=_real_metadata_label(metadata.get("model")),
         tokens=_parse_tokens(metadata),
         # The metadata block identifies the original commit this constituent was
         # parsed from: if the same commit is captured in more than one squash, the

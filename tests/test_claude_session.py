@@ -222,6 +222,23 @@ def test_parse_rows_records_reasoning_effort_from_thinking_blocks():
     assert session.turns[1].reasoning_effort is None
 
 
+def test_parse_rows_ignores_synthetic_model_marker():
+    # Claude Code stamps synthetic (non-LLM) assistant messages — compaction notices,
+    # interrupt markers — with the literal model "<synthetic>". It names no real model,
+    # so it must not overwrite the turn's actual model.
+    rows = [
+        _user("u1", "prompt"),
+        _assistant("m1", "real answer", usage={"input_tokens": 5, "output_tokens": 7}),
+        _assistant("m2", "[interrupted]", model="<synthetic>", usage={"input_tokens": 0, "output_tokens": 0}),
+    ]
+
+    session = parse_rows("sess-syn", rows)
+
+    # The real model sticks for both the turn and the session, never "<synthetic>".
+    assert session.turns[0].model == "claude-opus-4-8"
+    assert session.model == "claude-opus-4-8"
+
+
 def test_parse_rows_collects_all_agent_messages_in_order():
     # A turn can interleave several user-facing replies with tool calls; the parser
     # keeps each text message (in order) on agent_messages, while final_response
