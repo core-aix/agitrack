@@ -1006,20 +1006,23 @@ function renderAgg(){
   // would shrink the small kinds to invisible slivers. Scale the bar widths by log10
   // instead; the numbers shown on each row remain the real counts.
   const logTok = v => Math.log10((v||0)+1);
-  const allVals = [];
+  // Summarizer (aGiTrack's own calls) gets the same parent + indented "of which" layout as
+  // the agent categories, so its breakdown lines up with the others rather than reading as a
+  // one-off. Its headline is the sum of its parts.
+  const summKeys = ["input","output","cache_read"].filter(k=>summ[k]);
+  const summTotal = summKeys.reduce((a,k)=>a+summ[k], 0);
+  const allVals = [summTotal];
   cats.forEach(c => { allVals.push(c.total); (c.subsets||[]).forEach(s => allVals.push(s.value)); });
-  Object.values(summ).forEach(v => allVals.push(v));
+  summKeys.forEach(k => allVals.push(summ[k]));
   const maxLog = Math.max(1, ...allVals.map(logTok));
   const rows = [];
   cats.forEach(c => {
     rows.push(barRow(c.label, "", logTok(c.total), maxLog, `<b>${fmt(c.total)}</b>`, c.label==="output"));
     (c.subsets||[]).forEach(s => rows.push(subBarRow("of which "+s.label, logTok(s.value), maxLog, fmt(s.value))));
   });
-  const summParts = ["input","output","cache_read"].filter(k=>summ[k])
-    .map(k => `${k==="cache_read"?"cache read":k} <b>${fmt(summ[k])}</b>`);
-  if(summParts.length){
-    rows.push(`<div class="row"><div class="name" title="aGiTrack's own commit-summary calls, separate from the agent's usage">summarizer <small>aGiTrack's own calls</small></div>`+
-      `<div class="bar"></div><div class="num">${summParts.join(" · ")}</div></div>`);
+  if(summKeys.length){
+    rows.push(barRow("summarizer", "aGiTrack's own calls", logTok(summTotal), maxLog, `<b>${fmt(summTotal)}</b>`));
+    summKeys.forEach(k => rows.push(subBarRow("of which "+(k==="cache_read"?"cache read":k), logTok(summ[k]), maxLog, fmt(summ[k]))));
   }
   // The hierarchy shows cache-write under input; the note clarifies the one billing nuance
   // it can't — input is what was processed (uncached input + cache write), while cache read
@@ -1029,7 +1032,7 @@ function renderAgg(){
     : "";
   // Notes sit BELOW the bars so the bars lead the panel and the annotations follow.
   $("tokens").innerHTML = rows.length
-    ? rows.join("") + `<div class="hint">bar widths are log-scaled; indented rows are a subset of the line above</div>` + cacheNote
+    ? rows.join("") + `<div class="hint">Note: bar widths are log-scaled; indented rows are a subset of the line above</div>` + cacheNote
     : `<div class="empty">no token metadata recorded</div>`;
 
   $("by-backend").innerHTML = groupPanel(AGG.by_backend);

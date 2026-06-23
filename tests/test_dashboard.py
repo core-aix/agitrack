@@ -873,6 +873,10 @@ def test_web_dashboard_embeds_token_hierarchy_and_cache_note(tmp_path):
     assert "of which " in html
     assert "input counts processed tokens (uncached&nbsp;input + cache&nbsp;write)" in html
     assert "(tok.cache_write||0)+(tok.subagent_cache_write||0)+(tok.cache_read||0) > 0" in html  # the gate
+    # The summarizer uses the same parent + indented "of which" layout as the agent
+    # categories (so it lines up), and the log-scale hint is prefixed with "Note:".
+    assert 'barRow("summarizer", "aGiTrack\'s own calls"' in html
+    assert "Note: bar widths are log-scaled" in html
 
 
 def test_filter_bar_is_single_row_with_a_custom_range_popup(tmp_path):
