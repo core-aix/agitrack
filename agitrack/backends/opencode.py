@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
 from pathlib import Path
 from typing import IO
 
@@ -12,6 +13,14 @@ from agitrack.backends.base import AgentResult, TokenUsage
 # to turn reasoning fully off (Claude's MAX_THINKING_TOKENS=0 has no OpenCode equivalent);
 # `--variant minimal` is the floor its CLI exposes for the provider-specific reasoning effort.
 _SUMMARIZER_REASONING_VARIANT = "minimal"
+
+# Cap a ``bare`` (summarizer) call. A hung call would never finish, leaving the commit
+# unsummarized and — since one summary runs per session at a time — blocking every later
+# commit's summary too. Unlike Claude's blocking ``subprocess.run`` we stream events here, so
+# a plain ``timeout=`` won't interrupt a stalled read; a watchdog kills the process instead,
+# which ends the stream and yields a non-zero exit the summarizer treats as unusable. Only
+# bare runs are capped — interactive agent turns are unbounded and can be long.
+_SUMMARIZER_TIMEOUT_SECONDS = 90
 
 
 class OpenCodeBackend:
@@ -79,9 +88,20 @@ class OpenCodeBackend:
             stderr=subprocess.STDOUT,
             stdout=subprocess.PIPE,
         )
+        watchdog: threading.Timer | None = None
+        if bare:
+            watchdog = threading.Timer(_SUMMARIZER_TIMEOUT_SECONDS, process.kill)
+            watchdog.daemon = True
+            watchdog.start()
         child_ids: set[str] = set()
-        final_response, parsed_session_id, parsed_model, tokens = self._read_events(process.stdout, child_ids=child_ids)
-        exit_code = process.wait()
+        try:
+            final_response, parsed_session_id, parsed_model, tokens = self._read_events(
+                process.stdout, child_ids=child_ids
+            )
+            exit_code = process.wait()
+        finally:
+            if watchdog is not None:
+                watchdog.cancel()
         # Sub-agents (the `task` tool) run in their OWN child sessions, absent from this
         # run's token totals. The child session ids streamed through the events above;
         # export each and fold its consumption in (issue: subagent tokens).
