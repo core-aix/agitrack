@@ -8,9 +8,6 @@ on:
 permissions:
   contents: write
   pull-requests: write
-  # Lets the release-notes step call GitHub Models (GitHub's built-in AI
-  # inference) with the default GITHUB_TOKEN — no extra API key needed.
-  models: read
 
 jobs:
   release:
@@ -158,36 +155,57 @@ jobs:
           echo "Commits in PR #${NUM}:"
           cat pr_commits.txt
 
-      # Summarize those commits into a changelog with GitHub Models (GitHub's
-      # built-in AI). continue-on-error keeps a release shipping even if the
-      # inference call fails — the next step falls back to generated notes.
-      - name: Summarize changes with GitHub Models
+      # Summarize those commits into a changelog with the OpenAI API. The request
+      # is built with jq so commit text is safely JSON-encoded (no injection from
+      # a crafted commit message). continue-on-error + the absent-key guard keep a
+      # release shipping even if the call fails — the next step falls back to
+      # GitHub's generated notes. Requires the OPENAI_API_KEY repository secret.
+      - name: Summarize changes with OpenAI
         id: ai
         if: steps.prcommits.outputs.number != ''
         continue-on-error: true
-        uses: actions/ai-inference@v1
-        with:
-          model: openai/gpt-4o
-          max-completion-tokens: 800
-          system-prompt: >
-            You write concise GitHub release notes from a list of commit
-            subjects in a single merged pull request. Output GitHub-flavored
-            Markdown only, with no preamble or headings: an optional one-sentence
-            summary line, then a bullet list of the meaningful, user-facing
-            changes. Merge duplicates and drop pure noise (merge commits, version
-            bumps, formatting-only or CI-only changes). Keep it tight.
-          prompt-file: pr_commits.txt
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: gpt-4o-mini
+        run: |
+          set -euo pipefail
+          if [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo "OPENAI_API_KEY is not set; skipping the AI summary."
+            exit 0
+          fi
+          SYSTEM='You write concise GitHub release notes from a list of commit subjects in a single merged pull request. Output GitHub-flavored Markdown only, with no preamble or headings: an optional one-sentence summary line, then a bullet list of the meaningful, user-facing changes. Merge duplicates and drop pure noise (merge commits, version bumps, formatting-only or CI-only changes). Keep it tight.'
+          jq -n \
+            --arg model "$OPENAI_MODEL" \
+            --arg system "$SYSTEM" \
+            --rawfile commits pr_commits.txt \
+            '{model: $model, temperature: 0.3, max_tokens: 800,
+              messages: [
+                {role: "system", content: $system},
+                {role: "user", content: ("Summarize these commits into release notes:\n\n" + $commits)}
+              ]}' > payload.json
+          HTTP=$(curl -sS -o resp.json -w '%{http_code}' \
+            https://api.openai.com/v1/chat/completions \
+            -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d @payload.json) || true
+          if [ "${HTTP:-}" != "200" ]; then
+            echo "OpenAI request failed (HTTP ${HTTP:-none}); will fall back to generated notes."
+            cat resp.json 2>/dev/null || true
+            exit 0
+          fi
+          jq -r '.choices[0].message.content // empty' resp.json > ai_notes.md
+          echo "----- AI release notes -----"
+          cat ai_notes.md
 
       - name: Assemble release notes
         id: notes
         env:
-          AI_NOTES: ${{ steps.ai.outputs.response }}
           VERSION: ${{ steps.bump.outputs.version }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          if [ -n "${AI_NOTES//[[:space:]]/}" ]; then
-            printf '%s\n' "$AI_NOTES" > release_notes.md
+          if [ -s ai_notes.md ]; then
+            cp ai_notes.md release_notes.md
             PREV=$(git describe --tags --abbrev=0 2>/dev/null || true)
             if [ -n "$PREV" ]; then
               {
