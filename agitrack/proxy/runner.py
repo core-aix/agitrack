@@ -466,7 +466,10 @@ class ProxyRunner:
         self.state = (
             _state
             if _state is not None
-            else AgitrackState(repo.repo, default_backend=self.global_config.default_backend)
+            # An explicit --backend seeds the state's default so a brand-new repo (no
+            # stored backend) resolves to it rather than to the configured default,
+            # which may be unset (there is no hardcoded fallback).
+            else AgitrackState(repo.repo, default_backend=backend or self.global_config.default_backend)
         )
         if backend and backend != self.state.backend:
             self.state.remember_backend_session()
@@ -955,6 +958,15 @@ class ProxyRunner:
         session_kwargs.update(session_overrides)
         session = Session(**session_kwargs)
         instance.__dict__["_active_session"] = session
+
+        # Tests build minimal AgitrackStates without a backend; production always resolves
+        # one before launch (there is no hardcoded fallback anymore), so reading
+        # ``state.backend`` on an unconfigured state now raises. Seed a concrete backend so
+        # the test factory keeps producing a launch-ready session unless a test set one.
+        # Guarded so tests that pass a non-AgitrackState stub (no ``data`` dict) are untouched.
+        state_data = getattr(session.state, "data", None)
+        if isinstance(state_data, dict) and not state_data.get("backend"):
+            state_data["backend"] = "claude"
 
         # Apply runner-level overrides. Names shadowed by a class property are
         # routed through it; a read-only property makes the misuse loud instead

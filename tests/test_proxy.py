@@ -4650,7 +4650,7 @@ def test_fork_current_session_records_fork_origin_event(tmp_path):
 
     runner = _shared_resume_runner()
     runner.name = "original"
-    src_state = AgitrackState(tmp_path / "src")
+    src_state = AgitrackState(tmp_path / "src", default_backend="claude")
     src_state.backend_session_id = "ses_src"
     runner.state = src_state
     runner.repo = types.SimpleNamespace(repo="/wt")

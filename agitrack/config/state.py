@@ -10,7 +10,7 @@ from typing import Any
 
 
 class AgitrackState:
-    def __init__(self, repo: Path, *, default_backend: str = "opencode") -> None:
+    def __init__(self, repo: Path, *, default_backend: str | None = None) -> None:
         self.repo = repo
         self.path = repo / ".agitrack" / "state.json"
         self.config_path = repo / ".agitrack" / "config.json"
@@ -170,13 +170,21 @@ class AgitrackState:
         # Honour the configured default (not a hardcoded backend) when the record
         # has no backend yet, or when the stored value is no longer a known
         # backend, so a missing/stale entry never silently launches the wrong
-        # agent (and make_proxy_agent never receives an invalid name).
+        # agent (and make_proxy_agent never receives an invalid name). With no
+        # stored value AND no configured default this RAISES rather than silently
+        # falling back to some hardcoded agent — the caller is expected to have
+        # resolved a backend (prompt/error) before reaching a spawn path.
         from agitrack.backends.proxy_agents import available_backends
 
         stored = self.data.get("backend")
         if stored and stored in available_backends():
             return str(stored)
-        return self._default_backend
+        if self._default_backend:
+            return self._default_backend
+        raise RuntimeError(
+            "No coding agent backend is configured for this session. Run aGiTrack in an "
+            "interactive terminal to choose a default, or pass --backend <claude|opencode>."
+        )
 
     @backend.setter
     def backend(self, value: str) -> None:
