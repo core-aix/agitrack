@@ -4689,7 +4689,11 @@ class ProxyRunner:
             return self._MENU_DONE
         if fork:
             self._set_message("Couldn't fork the current session; starting a blank one instead.", seconds=8.0)
-        self._new_session(name, base_branch=base)
+        # A new session inherits the CURRENT session's backend, not the global default —
+        # the user is coding in this backend, so a sibling session should start there too
+        # (the global default may be stale, e.g. left at opencode). Captured here because
+        # _new_session replaces self.active (and thus self.state) before reading it.
+        self._new_session(name, base_branch=base, backend=self.state.backend)
         return self._MENU_DONE
 
     def _can_fork_active(self) -> bool:
