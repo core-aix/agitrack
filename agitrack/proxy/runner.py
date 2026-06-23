@@ -7393,17 +7393,6 @@ class ProxyRunner:
             return True
         return False
 
-    def _exit_needs_confirmation(self) -> bool:
-        """Whether exiting should ask the user first.
-
-        True when a session is still working or there is work that isn't safely
-        committed AND merged — an agent turn in flight, uncommitted changes in any
-        tracked tree, or a worktree whose commits haven't been integrated. When
-        everything is committed and merged and nothing is running, exiting loses
-        nothing, so aGiTrack leaves without prompting.
-        """
-        return self._had_unfinalized_work() or self._has_unmerged_work()
-
     def _confirm_exit(self) -> bool:
         # "(Ctrl-C again)" hints that a second Ctrl-C confirms the exit (the
         # double-Ctrl-C fast path in _run_exit_flow), matching the keystroke that
@@ -7436,14 +7425,14 @@ class ProxyRunner:
         self._popup_exit_force = False
         self._exit_aborted = False
         try:
-            # Skip the confirmation(s) when nothing is running and everything is
-            # committed and merged — exiting is lossless, so leave directly.
-            needs_confirm = self._exit_needs_confirmation()
-            if needs_confirm and not self._confirm_exit() and not self._popup_exit_force:
+            # Exiting always asks first (a deliberate safety net), regardless of
+            # whether there is pending work. Whether there is anything to *finalize*
+            # only affects the message shown during teardown (see _finalize_pending_work).
+            if not self._confirm_exit() and not self._popup_exit_force:
                 self._set_message("Exit cancelled — still running; nothing was shut down.")
                 self._render()
                 return False
-            if needs_confirm and not self._popup_exit_force:
+            if not self._popup_exit_force:
                 if not self._confirm_terminate_background_sessions() and not self._popup_exit_force:
                     self._set_message("Exit cancelled — kept working; the background sessions are still running.")
                     self._render()
@@ -7527,12 +7516,13 @@ class ProxyRunner:
         # auto-resume next start — not necessarily the primary (they may have
         # switched to a new or shared session). It is finalized first, below.
         self._exit_resume_worktree = getattr(self.worktree, "name", None)
-        # Only show the "Finalizing commits..." notice when there is actually work
-        # to finalize. On a clean exit (nothing running, everything committed and
-        # merged) the steps below are quick no-ops, so skip the message and leave
-        # directly instead of flashing a pause the user has to wonder about.
-        if self._had_unfinalized_work() or self._has_unmerged_work():
-            self._set_message("Finalizing commits before exit...", seconds=30)
+        # Tell the user exactly what exit is doing — and only when there is something
+        # to do. On a clean exit (everything committed and merged) this is None, so we
+        # skip the message and leave directly instead of flashing a vague "Finalizing
+        # commits..." the user can't make sense of.
+        detail = self._describe_exit_finalize()
+        if detail is not None:
+            self._set_message(detail, seconds=30)
             self._render()
         self._commit_latest_turn_sync()  # active session, in place
         self._auto_share_on_exit()  # push the latest conversation if auto-shared
@@ -7743,27 +7733,52 @@ class ProxyRunner:
             self._prompt_forced_exit()
         raise SystemExit(128 + int(signum))
 
-    def _had_unfinalized_work(self) -> bool:
-        """Whether the host terminal closed while a session still had work going.
+    def _describe_exit_finalize(self) -> str | None:
+        """A specific, user-facing description of what exit finalize will actually
+        do — or ``None`` when everything is already committed and merged (a clean,
+        silent exit).
 
-        True when an agent turn is in flight, a background session is still
-        running, or any tracked tree has uncommitted changes. Drives the
-        forced-exit prompt so a clean close (nothing pending) exits silently.
-        Best-effort and cheap; any error resolves to False so a forced exit
-        stays fast and quiet.
+        It deliberately ignores the base repo's own dirty/untracked files and a
+        worktree's git-ignored or intentionally-declined files: aGiTrack never
+        commits those on exit, so they must not make exit claim there is something
+        to "finalize". The signals are aGiTrack's own pending work: a turn still in
+        flight, a session with committable or committed-but-unmerged work
+        (``_unmerged_worktrees`` already excludes ignored/declined noise), or a
+        commit summary still being written. Best-effort; any error reads as
+        "nothing to report".
         """
+        actions: list[str] = []
         try:
-            if self._agent_is_active():
-                return True
-            if any(self._session_status(i) == "running" for i in range(len(self.sessions))):
-                return True
-            if self.repo.status_short().strip():
-                return True
-            if self.base_repo.status_short().strip():
-                return True
+            if self._agent_is_active() or any(getattr(s, "agent_in_flight", False) for s in self.sessions):
+                actions.append("committing the latest turn")
+            unmerged = self._unmerged_worktrees()
+            if unmerged:
+                actions.append("committing and merging unsaved work in " + ", ".join(label for label, _ in unmerged))
+            if any(self._session_summary_in_progress(s) for s in self.sessions):
+                actions.append("saving the commit summary")
         except Exception:
-            return False
-        return False
+            return None
+        if not actions:
+            return None
+        return "Finishing up before exit — " + ", and ".join(actions) + "…"
+
+    @staticmethod
+    def _session_summary_in_progress(session) -> bool:
+        """Whether *session* still has a commit summary being computed (a pending
+        slot or a live summarizer thread) that exit finalize would wait to apply."""
+        if getattr(session, "_summary_pending", None) is not None:
+            return True
+        thread = getattr(session, "_summary_thread", None)
+        return thread is not None and thread.is_alive()
+
+    def _had_unfinalized_work(self) -> bool:
+        """Whether aGiTrack still has work to finalize on exit — an agent turn in
+        flight, a session with committable/unmerged work, or a commit summary being
+        written (see :meth:`_describe_exit_finalize`). Drives the forced-exit prompt
+        and the exit confirmation, so a clean close (everything committed and merged)
+        exits silently. Ignores the base repo's own dirt and declined/ignored files.
+        """
+        return self._describe_exit_finalize() is not None
 
     def _prompt_forced_exit(self) -> None:
         """Prompt the user about an exit forced by the host terminal closing.
