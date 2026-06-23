@@ -222,6 +222,78 @@ def test_dashboard_sums_tokens_and_efficiency(tmp_path):
     assert dash.lines_per_1k_output_tokens == (28 + 0) / 100 * 1000
 
 
+def test_token_hierarchy_folds_subagents_into_base_categories(tmp_path):
+    # Each base category's headline is main-agent + sub-agent; the sub-agent share (and,
+    # for input, the cache-write share) is an indented subset, never a separate top-level row.
+    repo = GitRepo.init(tmp_path)
+    _write_lines(repo, "a.txt", 5)
+    repo.commit(
+        "agent turn\n\n* w\n\n"
+        "# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\nmodel: claude-opus-4-8\n"
+        "tokens_since_last_commit_input: 1000\ntokens_since_last_commit_output: 50\n"
+        "tokens_since_last_commit_cache_write: 800\n"
+        "tokens_since_last_commit_subagent_input: 200\ntokens_since_last_commit_subagent_output: 20\n"
+    )
+
+    dash = build_dashboard(repo)
+    by_label = {c["label"]: c for c in dash.token_breakdown["categories"]}
+    assert by_label["input"]["total"] == 1200  # 1000 main + 200 sub-agent
+    assert by_label["output"]["total"] == 70  # 50 + 20
+    input_subsets = {s["label"]: s["value"] for s in by_label["input"]["subsets"]}
+    assert input_subsets == {"cache write": 800, "sub-agents": 200}  # both subsets of input
+
+    text = render_dashboard(repo)
+    assert "input: 1,200" in text and "of which sub-agents: 200" in text
+    assert "subagent input" not in text  # sub-agents are an annotation, not their own category
+
+
+def test_token_hierarchy_works_for_opencode_shaped_tokens(tmp_path):
+    # Both backends feed the SAME TokenUsage fields through the same (backend-agnostic)
+    # metadata writer, so the hierarchy is identical for each. OpenCode additionally
+    # reports reasoning tokens separately (Claude folds thinking into output), so its
+    # panel gains a reasoning row — proving the same presentation covers both.
+    repo = GitRepo.init(tmp_path)
+    _write_lines(repo, "a.txt", 5)
+    usage = {
+        "context": 100,
+        "total": 80,
+        "input": 100,
+        "output": 50,
+        "reasoning": 30,
+        "cache_read": 5000,
+        "cache_write": 40,
+        "subagent_input": 20,
+        "subagent_output": 10,
+        "subagent_reasoning": 5,
+        "subagent_cache_read": 200,
+        "subagent_cache_write": 8,
+    }
+    repo.commit(
+        build_agent_commit_message(
+            latest_prompt="do it",
+            trace=[{"role": "user", "content": "do it"}, {"role": "agent", "content": "done"}],
+            backend="opencode",
+            backend_session_id="ses_x",
+            agitrack_session_id="agit-1",
+            model="anthropic/claude-opus-4-8",
+            token_usage=usage,
+        )
+    )
+
+    dash = build_dashboard(repo)
+    cats = {c["label"]: c for c in dash.token_breakdown["categories"]}
+    # input headline folds in the writer's cache-write convention (140 main + 28 sub-agent).
+    assert cats["input"]["total"] == 168
+    assert {s["label"]: s["value"] for s in cats["input"]["subsets"]} == {"cache write": 48, "sub-agents": 28}
+    assert cats["output"]["total"] == 60
+    assert cats["reasoning"]["total"] == 35  # OpenCode reports reasoning separately
+    assert {s["label"]: s["value"] for s in cats["reasoning"]["subsets"]} == {"sub-agents": 5}
+    assert cats["cache read"]["total"] == 5200
+
+    text = render_dashboard(repo)
+    assert "reasoning: 35" in text and "of which sub-agents: 5" in text
+
+
 def test_dashboard_groups_by_backend_model_and_author(tmp_path):
     dash = build_dashboard(_demo_repo(tmp_path))
 
@@ -297,21 +369,23 @@ def test_render_dashboard_contains_all_sections(tmp_path):
     assert "Human (" not in text and "human (own code)" not in text
 
 
-def test_text_dashboard_notes_input_includes_cache_write_only_when_nonzero(tmp_path):
-    # When cache-creation happened, the text dashboard spells out that input folds in
-    # cache-write tokens (which diverges from provider billing); otherwise it stays quiet.
+def test_text_dashboard_shows_cache_write_as_a_subset_of_input(tmp_path):
+    # Cache-write is shown as an indented "of which" subset of input, and the note
+    # clarifying the input/cache-read billing convention appears only when there are
+    # cache tokens; otherwise the panel stays quiet.
     cached = GitRepo.init(tmp_path / "cached")
     _write_lines(cached, "a.txt", 5)
     cached.commit(_agent_message("do it", tokens={**_TOKENS, "cache_write": 800}))
     text = render_dashboard(cached)
-    assert "cache write: 800" in text
-    assert "note: input includes cache-creation (cache write) tokens" in text
+    assert "of which cache write: 800" in text  # nested under input, not a top-level line
+    assert "note: input counts processed tokens" in text
 
     plain = GitRepo.init(tmp_path / "plain")
     _write_lines(plain, "b.txt", 5)
-    plain.commit(_agent_message("do it", tokens=_TOKENS))  # cache_write == 0
+    plain.commit(_agent_message("do it", tokens=_TOKENS))  # cache_write == 0, cache_read == 0
     plain_text = render_dashboard(plain)
-    assert "note: input includes cache-creation" not in plain_text
+    assert "note: input counts processed tokens" not in plain_text
+    assert "of which cache write" not in plain_text
 
 
 def test_pr_merge_commit_does_not_double_count_the_cover_turn(tmp_path):
@@ -790,12 +864,15 @@ def test_web_dashboard_shows_loading_indicator_on_filter_change(tmp_path):
     assert "showLoading(true)" in html and "} finally { showLoading(false); }" in html
 
 
-def test_web_dashboard_embeds_cache_write_input_note(tmp_path):
-    # The web token panel explains aGiTrack's input convention; the note is client-side
-    # gated to show only when cache-write tokens are non-zero.
+def test_web_dashboard_embeds_token_hierarchy_and_cache_note(tmp_path):
+    # The web token panel renders the hierarchy (indented "of which" subset rows) and
+    # explains aGiTrack's input convention; the note is client-side gated on cache tokens.
     html = render_html(_demo_repo(tmp_path))
-    assert "input includes cache-creation (cache&nbsp;write) tokens" in html
-    assert "(tok.cache_write||0)+(tok.subagent_cache_write||0) > 0" in html  # the gate
+    assert "token_breakdown" in html  # the structured payload the panel renders from
+    assert "function subBarRow" in html  # indented subset rows
+    assert "of which " in html
+    assert "input counts processed tokens (uncached&nbsp;input + cache&nbsp;write)" in html
+    assert "(tok.cache_write||0)+(tok.subagent_cache_write||0)+(tok.cache_read||0) > 0" in html  # the gate
 
 
 def test_filter_bar_is_single_row_with_a_custom_range_popup(tmp_path):
