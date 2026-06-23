@@ -896,6 +896,21 @@ def test_offer_copy_unstaged_copies_on_consent(tmp_path):
     assert (base / "new.txt").read_text() == "hello\n"
 
 
+def test_copy_announces_before_confirming(tmp_path):
+    # The user is told the files are being copied BEFORE the "Copied …" confirmation, so a
+    # slow copy (a large ignored dir) doesn't look like nothing is happening.
+    runner, base, wt, msgs = _copy_runner(tmp_path, "?? new.txt\n")
+    (wt / "new.txt").write_text("hello\n")
+    runner._select_popup = lambda *a, **k: "Yes, copy to the base repo"
+
+    runner._offer_copy_unstaged_to_base()
+
+    copying = next((i for i, m in enumerate(msgs) if m.startswith("Copying 1 file(s)")), None)
+    copied = next((i for i, m in enumerate(msgs) if m.startswith("Copied 1 file(s)")), None)
+    assert copying is not None and copied is not None
+    assert copying < copied  # "Copying …" precedes the "Copied …" confirmation
+
+
 def test_copy_offer_also_offers_user_commit_for_edits(tmp_path):
     # When the worktree has the user's own uncommitted edits AND copy-able leftovers, BOTH
     # prompts show: a commit prompt for the edits, then the copy prompt for the leftovers.
@@ -7608,7 +7623,9 @@ def test_screen_renderer_append_box():
     r.append_box(parts, 2, 2, 20, ["Line one", "Line two"], rows=20)
     combined = "".join(parts)
     assert "Line one" in combined
-    assert "│" in combined  # │ border char
+    assert "┃" in combined  # heavy border char (a prominent, thicker frame)
+    assert "┏" in combined and "┛" in combined  # heavy corners
+    assert "\x1b[1;38;2;" in combined  # bold, truecolor-encoded accent on the border
 
 
 def test_screen_renderer_feed_strips_hostile_csi():

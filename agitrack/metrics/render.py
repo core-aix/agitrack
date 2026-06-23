@@ -11,20 +11,6 @@ from agitrack.git import GitRepo
 from agitrack.metrics.collect import Dashboard, build_dashboard
 from agitrack.metrics.github import resolve_logins
 
-_TOKEN_ORDER = [
-    ("input", "input"),
-    ("output", "output"),
-    ("reasoning", "reasoning"),
-    ("cache_read", "cache read"),
-    ("cache_write", "cache write"),
-    ("subagent_input", "subagent input"),
-    ("subagent_output", "subagent output"),
-    ("subagent_cache_read", "subagent cache read"),
-    ("subagent_cache_write", "subagent cache write"),
-    ("summary_input", "summarizer input"),
-    ("summary_output", "summarizer output"),
-]
-
 
 def render_dashboard(repo: GitRepo, ref: str = "HEAD") -> str:
     return format_dashboard(build_dashboard(repo, ref, sha_logins=resolve_logins(repo)))
@@ -56,16 +42,29 @@ def format_dashboard(dash: Dashboard) -> str:
     lines.append("")
 
     lines.append("Tokens (from aGiTrack commit metadata)")
-    totals = dash.token_totals
-    shown = [(label, totals[key]) for key, label in _TOKEN_ORDER if totals.get(key)]
-    if shown:
-        lines.extend(f"  {label}: {value:,}" for label, value in shown)
-        # Spell out the input convention only when cache-creation actually happened:
-        # input folds in cache-write tokens (fresh input processed once into the cache),
-        # which differs from how the provider bills it (writes/reads are separate rates).
-        if totals.get("cache_write") or totals.get("subagent_cache_write"):
-            lines.append("  note: input includes cache-creation (cache write) tokens — differs from")
-            lines.append("        provider billing; cache write/read are listed separately above")
+    breakdown = dash.token_breakdown
+    categories, summarizer = breakdown["categories"], breakdown["summarizer"]
+    if categories or summarizer:
+        # Each base category's headline is main-agent + sub-agent; the indented "of which"
+        # lines are subsets of it (the sub-agent share, and for input the cache-write share).
+        for category in categories:
+            lines.append(f"  {category['label']}: {category['total']:,}")
+            for subset in category["subsets"]:
+                lines.append(f"    of which {subset['label']}: {subset['value']:,}")
+        if summarizer:
+            parts = [
+                f"{'cache read' if key == 'cache_read' else key} {summarizer[key]:,}"
+                for key in ("input", "output", "cache_read")
+                if summarizer.get(key)
+            ]
+            lines.append("  summarizer (aGiTrack's own calls): " + " · ".join(parts))
+        # The hierarchy already shows cache-write as a subset of input; clarify the one
+        # billing nuance it can't — input counts what was processed (uncached input +
+        # cache-creation), while cache read is the cached context reused, billed separately.
+        totals = dash.token_totals
+        if totals.get("cache_write") or totals.get("subagent_cache_write") or totals.get("cache_read"):
+            lines.append("  note: input counts processed tokens (uncached input + cache write);")
+            lines.append("        cache read is the cached context reused, billed separately")
         line_yield = dash.lines_per_1k_output_tokens
         if line_yield is not None:
             lines.append(f"  line yield: {line_yield:,.1f} AI-changed lines per 1k output tokens")

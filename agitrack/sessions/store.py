@@ -29,6 +29,14 @@ REF = "refs/agitrack/shared-sessions"
 # Sessions shared by a peer still running pre-rename aGiT land under the old ref.
 # Reads merge both (new wins); writes only ever touch the new ref.
 LEGACY_REF = "refs/agit/shared-sessions"
+# Read-only MIRROR of the remote refs, used by the dashboard's listing fetch. The
+# listing path fetches the remote into these instead of force-overwriting the canonical
+# local refs above — so a remote that's momentarily behind (a share whose push lagged or
+# failed) can never rewind your own freshly-shared session out of the local ref. The
+# listing then unions the local refs with these mirrors, newest copy winning (see
+# ``listing_entries``).
+REMOTE_MIRROR = "refs/agitrack/shared-sessions-remote"
+LEGACY_MIRROR = "refs/agit/shared-sessions-remote"
 DEFAULT_KEEP = 5  # most-recent shared sessions retained per contributor
 # Throttle remote fetches when the dashboard polls. Your OWN shared sessions land
 # in the local ref directly (no fetch needed); this only pulls collaborators'
@@ -202,12 +210,18 @@ class SharedSessionStore:
     def entries(self) -> list[SharedEntry]:
         """Shared sessions for *this* repo, newest first (by manifest ``updated``).
 
-        Merges the current ref with the legacy ``refs/agitrack/shared-sessions`` so
-        sessions shared by a peer still on pre-rename aGiT remain visible. The
-        current ref is read first and wins on a name collision."""
+        Unions four sources, keeping the NEWEST copy of each session: the canonical local
+        ref — which always holds YOUR own freshly-shared sessions — its legacy counterpart
+        (a pre-rename peer's shares), and the two remote MIRRORS the listing fetch keeps
+        (collaborators' sessions, plus possibly a stale copy of your own). Newest-wins —
+        rather than "local wins" — is what keeps a remote that's momentarily behind from
+        making your just-shared session look old: the listing fetch (:meth:`fetch`) writes
+        only the mirrors, never the local ref, so your fresh local copy is never rewound and
+        wins the tie against a stale mirror. The local ref is read unconditionally (it always
+        exists once you've shared); the others are skipped until they exist."""
         prefix = self._prefix()
-        seen: dict[tuple[str, str], SharedEntry] = {}
-        for ref in (self.ref, LEGACY_REF):
+        best: dict[tuple[str, str], SharedEntry] = {}
+        for ref in (self.ref, REMOTE_MIRROR, LEGACY_REF, LEGACY_MIRROR):
             if ref != self.ref and not self.repo.ref_exists(ref):
                 continue
             for path in self.repo.read_tree_paths(ref):
@@ -217,12 +231,13 @@ class SharedSessionStore:
                 if len(rest) < 3:
                     continue
                 key = (rest[0], rest[1])
-                if key in seen:
-                    continue
-                seen[key] = SharedEntry(
-                    github_id=key[0], name=key[1], manifest=self._manifest(*key, ref=ref), source_ref=ref
-                )
-        return sorted(seen.values(), key=lambda e: e.manifest.get("updated", 0), reverse=True)
+                if key in best and rest[2] != "manifest.json":
+                    continue  # the manifest path decides the winner; skip the transcript path
+                manifest = self._manifest(*key, ref=ref)
+                current = best.get(key)
+                if current is None or manifest.get("updated", 0) > current.manifest.get("updated", 0):
+                    best[key] = SharedEntry(github_id=key[0], name=key[1], manifest=manifest, source_ref=ref)
+        return sorted(best.values(), key=lambda e: e.manifest.get("updated", 0), reverse=True)
 
     def _manifest(self, github_id: str, name: str, *, ref: str | None = None) -> dict:
         raw = self.repo.read_ref_blob(ref or self.ref, f"{self._prefix()}{github_id}/{name}/manifest.json")
@@ -252,6 +267,10 @@ class SharedSessionStore:
     ) -> str | None:
         ref = entry.source_ref
         path = f"{self._prefix()}{entry.github_id}/{entry.name}/transcript.jsonl"
+        # When the chosen entry came from a remote MIRROR, its transcript lives on the
+        # remote's CANONICAL ref (the mirror name doesn't exist on the remote), so fetch
+        # that into the mirror; for a local/legacy entry the source ref IS the remote ref.
+        remote_ref = {REMOTE_MIRROR: REF, LEGACY_MIRROR: LEGACY_REF}.get(ref, ref)
         # Resuming a SHARED session must reflect the LATEST shared state — so sync the
         # full ref from the remote FIRST, then read. Reading the local ref blind would
         # return a stale copy whenever one is already present locally: the listing
@@ -262,7 +281,7 @@ class SharedSessionStore:
         # git process is terminated, not left running). Offline (fetch fails) we fall
         # back to whatever is local — the best available.
         if self.repo.remote_exists() and not (cancel is not None and cancel.is_set()):
-            self.repo.fetch_ref(f"+{ref}:{ref}", timeout=timeout, cancel=cancel)
+            self.repo.fetch_ref(f"+{remote_ref}:{ref}", timeout=timeout, cancel=cancel)
         return self.repo.read_ref_blob(ref, path)
 
     # --- writing -----------------------------------------------------------
@@ -318,25 +337,36 @@ class SharedSessionStore:
     # --- sync --------------------------------------------------------------
 
     def fetch(self, *, timeout: float | None = None, cancel: "threading.Event | None" = None) -> bool:
-        """Pull the latest shared ref from the remote (best-effort).
+        """Pull the latest shared refs from the remote into the read-only MIRROR refs, for
+        LISTING (best-effort).
 
-        Fetches only the small manifests (a blob-size filter skips the large
-        transcripts) so listing which sessions exist is fast; the transcript of a
-        chosen session is fetched on demand by :meth:`read_transcript`. Falls back
-        to a full fetch when the remote doesn't support partial fetch. An optional
-        ``timeout`` bounds each underlying git fetch so a stalled network call on
-        bad internet can't run unbounded; ``cancel`` (an Event) stops it at once."""
+        Fetching into the mirrors — NOT the canonical local refs — is what keeps a listing
+        refresh from rewinding your own freshly-shared session: the local ref (which holds
+        your shares) is left untouched, and :meth:`entries` unions it with the mirrors,
+        newest copy winning. So a remote that's momentarily behind can never make your
+        just-shared session show an old "shared" time. Fetches only the small manifests (a
+        blob-size filter skips the large transcripts) so listing is fast; a chosen session's
+        transcript is fetched on demand by :meth:`read_transcript`, falling back to a full
+        fetch when the remote doesn't support partial fetch. ``timeout`` bounds each git
+        fetch; ``cancel`` stops it at once. (Internal write syncs use ``_fetch_current``,
+        which still force-updates the local ref for the push lease.)"""
         if not self.repo.remote_exists():
             return False
         if cancel is not None and cancel.is_set():
             return False  # already cancelled: don't even start
-        # Pull the legacy ref too (best-effort, ignore failure) so sessions shared
-        # by a pre-rename peer still list. The remote may not have it at all. Only
-        # the *listing* path needs this; internal syncs use ``_fetch_current``.
-        self.repo.fetch_ref(
-            f"+{LEGACY_REF}:{LEGACY_REF}", filter_blobs="blob:limit=16k", timeout=timeout, cancel=cancel
-        )
-        return self._fetch_current(timeout=timeout, cancel=cancel)
+        ok = False
+        # Mirror the current ref and the legacy ref (a pre-rename peer's shares); the legacy
+        # ref may not exist on the remote at all (best-effort, ignore failure).
+        for src, dst in ((self.ref, REMOTE_MIRROR), (LEGACY_REF, LEGACY_MIRROR)):
+            if cancel is not None and cancel.is_set():
+                break
+            fetched = self.repo.fetch_ref(
+                f"+{src}:{dst}", filter_blobs="blob:limit=16k", timeout=timeout, cancel=cancel
+            )
+            if not fetched and not (cancel is not None and cancel.is_set()):
+                fetched = self.repo.fetch_ref(f"+{src}:{dst}", timeout=timeout, cancel=cancel)
+            ok = ok or fetched
+        return ok
 
     def _fetch_current(self, *, timeout: float | None = None, cancel: "threading.Event | None" = None) -> bool:
         """Sync only the current ref from the remote (no legacy ref). Used by the
