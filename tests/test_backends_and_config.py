@@ -275,6 +275,45 @@ def test_claude_backend_bare_run_strips_tools_memory_and_system_prompt(monkeypat
     assert "--append-system-prompt" not in captured["command"]
 
 
+def test_claude_backend_bare_run_is_timeout_capped(monkeypatch, tmp_path):
+    # A bare (summarizer) call passes a timeout so a hung backend can't block this session's
+    # next summary forever; a normal coding run stays uncapped (timeout=None).
+    import subprocess
+
+    captured: dict = {}
+
+    def fake_run(command, **kwargs):
+        captured["timeout"] = kwargs.get("timeout")
+        return types.SimpleNamespace(
+            stdout=json.dumps({"type": "result", "result": "ok", "session_id": "s"}), stderr="", returncode=0
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    backend = ClaudeBackend(tmp_path)
+
+    backend.run("summarize this", model=None, session_id=None, bare=True)
+    assert captured["timeout"] is not None and captured["timeout"] > 0
+
+    backend.run("do real work", model=None, session_id=None)
+    assert captured["timeout"] is None  # interactive turns are not capped
+
+
+def test_claude_backend_bare_run_timeout_returns_unusable_result(monkeypatch, tmp_path):
+    # When the bare call times out, run() returns a non-zero result (not a raised exception)
+    # so the summarizer falls back to the prompt-based message and the worker thread frees up.
+    import subprocess
+
+    def fake_run(command, **kwargs):
+        raise subprocess.TimeoutExpired(command, kwargs.get("timeout") or 0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    backend = ClaudeBackend(tmp_path)
+
+    result = backend.run("summarize this", model="m", session_id="s", bare=True)
+    assert result.exit_code != 0
+    assert result.final_response == ""
+
+
 def test_claude_backend_tolerates_leading_logs():
     backend = ClaudeBackend(Path("."))
     output = "starting up\n" + json.dumps({"type": "result", "result": "hi", "session_id": "s"})

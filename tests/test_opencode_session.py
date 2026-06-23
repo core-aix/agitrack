@@ -524,6 +524,53 @@ def test_collect_subagent_tokens_recurses_into_nested_subagents(monkeypatch, tmp
     assert token_map["C"].subagent_input == 7  # 5 + 2
 
 
+def test_opencode_bare_run_is_watchdog_capped(monkeypatch):
+    # A bare (summarizer) run arms a watchdog that kills a hung process so it can't block this
+    # session's next summary; an interactive run is uncapped. A killed process yields a
+    # non-zero exit the summarizer treats as unusable (falling back to the prompt message).
+    import io
+    from pathlib import Path
+
+    from agitrack.backends import opencode as O
+    from agitrack.backends.opencode import OpenCodeBackend
+
+    timers: list = []
+
+    class FakeTimer:
+        def __init__(self, interval, func):
+            self.interval = interval
+            self.func = func
+            timers.append(self)
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            pass
+
+    class FakeProc:
+        def __init__(self):
+            self.stdout = io.StringIO("")
+
+        def wait(self):
+            return -9  # as if killed by the watchdog
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(O.threading, "Timer", FakeTimer)
+    monkeypatch.setattr(O.subprocess, "Popen", lambda *a, **k: FakeProc())
+    backend = OpenCodeBackend(repo=Path("."))
+
+    result = backend.run("summarize", model=None, session_id="s", bare=True)
+    assert len(timers) == 1 and timers[0].interval > 0
+    assert result.exit_code != 0  # killed → unusable, prompt-based message is kept
+
+    timers.clear()
+    backend.run("real work", model=None, session_id="s", bare=False)
+    assert timers == []  # interactive turns are not capped
+
+
 def test_read_events_captures_child_session_ids_from_task_events():
     # The headless run() path captures sub-agent child session ids from the live event
     # stream (a `task` tool event carries the child sessionId in its part metadata), so it
