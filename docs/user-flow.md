@@ -451,7 +451,7 @@ flowchart TD
 
   how -->|"Terminal or window closed, SIGHUP/SIGTERM (incl. system restart)"| sig[["_handle_exit_signal: note whether work was in progress, then best-effort finalize, render suppressed (non-interactive)"]]
 
-  fin[["Finalize each session: commit a just-completed turn, integrate committed work. Shows a specific 'Finishing up before exit — …' notice naming what it is doing; stays SILENT when everything is already committed and merged"]]
+  fin[["Finalize each session: commit a just-completed turn, integrate committed work. ALWAYS shows a notice the moment exit begins (teardown can take seconds) — a specific 'Finishing up before exit — …' naming the work when known, else a generic 'Finalizing things before exiting…'"]]
   fin --> copy2["Per session, before deleting its worktree: offer to copy its leftover files (see Copy)"]
   copy2 --> esc{"Esc on that copy offer?"}
   esc -->|Yes| abort(["Exit cancelled — worktree + files kept; message tells you to copy them then exit again"])

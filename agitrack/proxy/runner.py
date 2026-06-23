@@ -7507,6 +7507,16 @@ class ProxyRunner:
             return  # already finalized (e.g. the backend exited and we ran this)
         self._finalized_on_exit = True
         self._exiting = True
+        # ALWAYS show a notice the moment exit begins, before any of the (sometimes
+        # multi-second) teardown below — joining the git worker, pushing an
+        # auto-shared session, integrating, removing worktrees, joining threads. A
+        # silent terminal during that wait looks frozen. Name the specific work when
+        # we can; otherwise a generic notice. (On a forced/terminal-closed exit the
+        # screen is already None, so _render no-ops — harmless.) Computed before
+        # stopping the worker so it still reflects any in-flight turn.
+        detail = self._describe_exit_finalize()
+        self._set_message(detail or "Finalizing things before exiting…", seconds=30)
+        self._render()
         # Stop the git worker first so the exit-time foreground commits below run on
         # this (main) thread without racing a worker pass. After this join the
         # finalize git is the only git touching the worktree.
@@ -7516,14 +7526,6 @@ class ProxyRunner:
         # auto-resume next start — not necessarily the primary (they may have
         # switched to a new or shared session). It is finalized first, below.
         self._exit_resume_worktree = getattr(self.worktree, "name", None)
-        # Tell the user exactly what exit is doing — and only when there is something
-        # to do. On a clean exit (everything committed and merged) this is None, so we
-        # skip the message and leave directly instead of flashing a vague "Finalizing
-        # commits..." the user can't make sense of.
-        detail = self._describe_exit_finalize()
-        if detail is not None:
-            self._set_message(detail, seconds=30)
-            self._render()
         self._commit_latest_turn_sync()  # active session, in place
         self._auto_share_on_exit()  # push the latest conversation if auto-shared
         self._finalize_summary_then_integrate_on_exit()

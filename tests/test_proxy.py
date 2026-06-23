@@ -2884,6 +2884,49 @@ def test_finalize_pending_work_commits_non_interactively():
     assert all(call.get("prompt_untracked") is False for call in calls)
 
 
+def _finalize_message_runner(monkeypatch=None):
+    runner = make_runner()
+    runner.sessions = []
+    runner._render = lambda: None
+    # Isolate the message from the rest of teardown.
+    for name in (
+        "_stop_git_worker",
+        "_cancel_inflight_shared_fetches",
+        "_commit_latest_turn_sync",
+        "_auto_share_on_exit",
+        "_finalize_summary_then_integrate_on_exit",
+        "_delete_orphan_merged_branches",
+    ):
+        setattr(runner, name, lambda *a, **k: None)
+    return runner
+
+
+def test_finalize_always_shows_a_message_even_when_clean():
+    # Even a "clean" exit does teardown (worktree removal, auto-share push, thread
+    # joins) that can take seconds, so it must never be silent.
+    runner = _finalize_message_runner()
+    msgs: list = []
+    runner._set_message = lambda m, **k: msgs.append(m)
+    runner._describe_exit_finalize = lambda: None  # nothing specific to name
+
+    runner._finalize_pending_work()
+
+    assert msgs, "exit must show a message immediately"
+    assert "Finalizing things before exiting" in msgs[0]
+    assert "commit" not in msgs[0].lower()  # never the vague "finalizing commits"
+
+
+def test_finalize_shows_the_specific_work_when_known():
+    runner = _finalize_message_runner()
+    msgs: list = []
+    runner._set_message = lambda m, **k: msgs.append(m)
+    runner._describe_exit_finalize = lambda: "Finishing up before exit — committing the latest turn…"
+
+    runner._finalize_pending_work()
+
+    assert msgs[0] == "Finishing up before exit — committing the latest turn…"
+
+
 def _fake_completed(stdout):
     return types.SimpleNamespace(stdout=stdout, returncode=0)
 
