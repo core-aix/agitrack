@@ -129,16 +129,6 @@ def _strip_ansi(text: str) -> str:
 _NO_MODEL_PICK = object()
 
 
-def _homebrew_formula(real_path: str) -> str | None:
-    """The Homebrew formula name for a keg path (…/Cellar/<formula>/<version>/…), or None if
-    the path isn't a Homebrew keg. Used to ask `brew outdated <formula>`."""
-    parts = real_path.split(os.sep)
-    try:
-        return parts[parts.index("Cellar") + 1]
-    except (ValueError, IndexError):
-        return None
-
-
 def _shared_transcript_rows(transcript: str) -> int:
     # Recorded in the share manifest so the resume menu can tell at a glance whether
     # a shared copy is older/newer than the local one without reading either blob.
@@ -1190,7 +1180,7 @@ class ProxyRunner:
         # construction, sandbox wrapping) stays here in the runner. The session
         # owns its BackendProcess; child_pid / master_fd remain readable on the
         # runner via the Session-delegating compat properties.
-        self.active.process = BackendProcess.spawn(command, str(self.repo.repo))
+        self.active.process = BackendProcess.spawn(command, str(self.repo.repo), extra_env=self._backend_child_env())
         # Re-arm the cwd-drift check for this launch, and remember when it started:
         # only turns recorded at/after this time count, so a stale cwd left in the
         # transcript before this launch can't trigger a false drift warning (#72).
@@ -1940,33 +1930,34 @@ class ProxyRunner:
         # or /usr/local (Intel). Matching either covers both layouts.
         return "/Cellar/" in real or real.startswith("/opt/homebrew/") or real.startswith("/usr/local/")
 
-    def _backend_update_available(self) -> bool | None:
-        """Best-effort: is a newer backend CLI version available? True / False, or None when we
-        can't tell cheaply (callers then proceed or offer rather than wrongly skip). For a
-        Homebrew keg we ask `brew outdated` (fast, metadata-only — no build, so no sandbox-exec
-        and no nesting); other install methods have no uniform cheap check, hence None."""
-        exe = shutil.which(self.backend.name)
-        if not exe:
-            return None
-        formula = _homebrew_formula(os.path.realpath(exe))
-        if not formula or not shutil.which("brew"):
-            return None
+    def _backend_child_env(self) -> dict[str, str] | None:
+        """Extra environment for the interactive backend child only. When aGiTrack will apply
+        this backend's update itself (its own in-app updater is sandbox-blocked and update
+        checks are on), disable OpenCode's in-app auto-update so the user isn't shown its
+        prompt — which only fails inside the sandbox. Does NOT affect aGiTrack's own
+        `opencode upgrade`, which runs from the unconfined proxy with the normal environment."""
+        checks_on = self.global_config is None or getattr(self.global_config, "check_for_updates", True)
+        if getattr(self.backend, "name", None) == "opencode" and checks_on and self._backend_self_update_blocked():
+            return {"OPENCODE_DISABLE_AUTOUPDATE": "1"}
+        return None
+
+    def _backend_version(self) -> str:
+        """The backend CLI's reported version string, used to detect whether an update actually
+        landed. Empty when it can't be read."""
         try:
-            proc = subprocess.run(["brew", "outdated", "--quiet", formula], capture_output=True, text=True, timeout=30)
+            proc = subprocess.run([self.backend.name, "--version"], capture_output=True, text=True, timeout=20)
         except Exception as error:
-            self._debug(f"brew outdated check failed: {error!r}")
-            return None
-        if proc.returncode != 0:
-            return None
-        return formula in proc.stdout.split()
+            self._debug(f"backend version check failed: {error!r}")
+            return ""
+        return (proc.stdout or proc.stderr or "").strip()
 
     def _maybe_auto_update_backend(self) -> None:
         """Timers phase: when the backend's OWN self-update can't run under aGiTrack's sandbox
-        (brew + macOS) AND a newer version is available, apply it AUTOMATICALLY from the
-        UNCONFINED proxy — no menu, no prompt. Evaluated once per backend (re-armed on a
-        switch) and gated by the global update-check toggle. The brew/version checks and the
-        upgrade itself shell out, so they run on a background thread; the result is surfaced by
-        _service_backend_update."""
+        (brew + macOS), apply it AUTOMATICALLY from the UNCONFINED proxy — no menu, no prompt.
+        Evaluated once per backend (re-armed on a switch) and gated by the global update-check
+        toggle. The updater itself decides whether an upgrade is needed (it checks the backend's
+        release server, not Homebrew's possibly-stale local tap), so we don't pre-gate on `brew
+        outdated`. Runs on a background thread; the result is surfaced by _service_backend_update."""
         name = getattr(self.backend, "name", None)
         if name is None or self._backend_update_checked_for == name:
             return
@@ -1987,27 +1978,28 @@ class ProxyRunner:
         thread.start()
 
     def _auto_update_backend_worker(self, name: str, cmd: list[str]) -> None:
-        # Background: only apply when a newer version is actually available (don't run a pointless
-        # upgrade), then run the backend's own updater UNCONFINED so a package-manager updater
+        # Background: run the backend's own updater UNCONFINED so a package-manager updater
         # (notably Homebrew's own sandbox-exec) isn't nested inside the agent's macOS sandbox —
-        # the very nesting macOS forbids, which is what breaks the in-backend self-update.
-        if self._backend_update_available() is not True:
-            return
+        # the very nesting macOS forbids, which is what breaks the in-backend self-update. The
+        # updater no-ops fast when already current, so we don't pre-check; we compare the CLI
+        # version before and after to report only a real change (and to catch a silent failure).
+        before = self._backend_version()
         self._set_message(
-            f"Updating {name} to the latest version in the background "
-            f"(its own updater can't run inside aGiTrack's sandbox)…",
+            f"Checking {name} for updates in the background "
+            f"(applying any — its own updater can't, inside aGiTrack's sandbox)…",
             seconds=600.0,
             sticky=True,
         )
         self._render()
         cwd = str(getattr(self.base_repo, "repo", None) or getattr(self.repo, "repo", "."))
-        result: dict = {"name": name}
+        result: dict = {"name": name, "before": before}
         try:
             proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=600)
             result["code"] = proc.returncode
             result["output"] = (proc.stdout or "") + (proc.stderr or "")
         except Exception as error:
             result["error"] = repr(error)
+        result["after"] = self._backend_version()
         self._backend_update_result = result
 
     def _service_backend_update(self) -> None:
@@ -2021,21 +2013,19 @@ class ProxyRunner:
             self._set_message(f"Updating {name} failed: {result['error']}", seconds=12.0)
             self._render()
             return
+        before, after = result.get("before", ""), result.get("after", "")
         output = _strip_ansi(result.get("output", ""))
         lines = [line.strip() for line in output.splitlines() if line.strip()]
-        tail = lines[-1] if lines else ""
-        # The updater's exit code isn't always reliable (e.g. `opencode upgrade` exits 0 even
-        # when its brew step failed), so flag a likely failure from the output text too.
-        looks_failed = result.get("code") not in (0, None) or "fail" in output.lower() or "error" in output.lower()
-        if looks_failed:
+        if after and before and after != before:
+            # The version actually changed — the update landed. (Authoritative, unlike the
+            # updater's exit code, which `opencode upgrade` reports as 0 even when it failed.)
+            self._set_message(f"{name} updated ({before} → {after}). Start a new session to use it.", seconds=12.0)
+        elif result.get("code") not in (0, None) or "fail" in output.lower() or "error" in output.lower():
             flagged = [line for line in lines if "fail" in line.lower() or "error" in line.lower()]
-            detail = (flagged[-1] if flagged else tail)[:200]
+            detail = (flagged[-1] if flagged else (lines[-1] if lines else ""))[:200]
             self._set_message(f"Updating {name} may have failed: {detail}", seconds=14.0)
         else:
-            self._set_message(
-                f"{name} updated{(' — ' + tail[:160]) if tail else ''}. Start a new session to use it.",
-                seconds=12.0,
-            )
+            self._set_message(f"{name} is already up to date.", seconds=6.0)
         self._render()
 
     def _confine_to_worktree(self, command: list[str]) -> list[str]:
