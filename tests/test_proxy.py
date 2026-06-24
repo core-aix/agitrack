@@ -6079,6 +6079,74 @@ def test_relaunch_backend_resumes_then_gives_up_on_crash_loop(monkeypatch):
     assert calls == ["relaunch", "relaunch", "relaunch", "finalize"]
 
 
+def test_crash_loop_capture_surfaces_backend_output(monkeypatch):
+    # When the backend keeps dying on launch, the crash-loop bail must capture the
+    # backend's last output so run() can echo it instead of exiting silently (#114).
+    runner = make_runner()
+    runner._debug = lambda *a, **k: None
+    runner._restart_agent = lambda msg: None
+    runner._finalize_on_backend_exit = lambda: None
+    runner.last_child_output_sample = (
+        b"\x1b[2J\x1b[HError: Session abc123 is currently running as a "
+        b"background agent (bg). Use `claude agents` ... or add --fork-session.\r\n"
+    )
+
+    t = [1000.0]
+    monkeypatch.setattr("agitrack.proxy.runner.time.monotonic", lambda: t[0])
+    for _ in range(3):
+        assert runner._relaunch_backend_or_exit() is True
+    assert runner._relaunch_backend_or_exit() is False
+
+    notice = runner._backend_exit_notice
+    assert notice is not None
+    assert "exited repeatedly" in notice
+    assert "running as a background agent" in notice  # the real reason, escapes stripped
+    assert "\x1b" not in notice
+    assert "--new-session" in notice
+
+
+def test_busy_session_forks_instead_of_crash_looping():
+    # The claude session is held by a running background agent. aGiTrack should fork a
+    # copy on the next spawn rather than relaunch into the same refusal (#114).
+    import types
+
+    runner = make_runner(
+        state=types.SimpleNamespace(backend="claude", backend_session_id="old-id"),
+        last_child_output_sample=(
+            b"Error: Session old-id is currently running as a background agent (bg). "
+            b"Use `claude agents` ... or add --fork-session to branch off a copy.\r\n"
+        ),
+    )
+    runner._debug = lambda *a, **k: None
+    messages = []
+    runner._restart_agent = lambda msg: messages.append(msg)
+
+    # First death: fork once.
+    assert runner._relaunch_backend_or_exit() is True
+    assert runner._fork_next_spawn is True
+    assert runner._forked_for_busy is True
+    assert messages and "forked" in messages[0].lower()
+
+    # If the fork ALSO dies, don't fork again — fall through to the normal guard.
+    runner._restart_agent = lambda msg: messages.append("relaunch")
+    runner._finalize_on_backend_exit = lambda: messages.append("finalize")
+    runner._relaunch_backend_or_exit()
+    assert runner._forked_for_busy is True  # not re-forked
+
+
+def test_claude_spawn_command_fork_appends_flag():
+    from pathlib import Path
+
+    from agitrack.backends.proxy_agents import ClaudeProxyAgent
+
+    agent = ClaudeProxyAgent()
+    cmd = agent.spawn_command(Path("/repo"), session_id="abc", resume=True, fork=True, commit_guidance=False)
+    assert cmd[:4] == ["claude", "--resume", "abc", "--fork-session"]
+    # No fork flag when not forking.
+    cmd_plain = agent.spawn_command(Path("/repo"), session_id="abc", resume=True, fork=False, commit_guidance=False)
+    assert "--fork-session" not in cmd_plain
+
+
 def test_relaunch_backend_resets_loop_guard_after_quiet_period(monkeypatch):
     runner = make_runner()
     runner._debug = lambda *a, **k: None
@@ -6923,7 +6991,7 @@ def test_spawn_failed_exec_child_exits_with_127(tmp_path):
         worktree=None,
         backend=types.SimpleNamespace(
             new_session_id=lambda: "ses-1",
-            spawn_command=lambda repo, session_id, resume, commit_guidance=True, use_worktrees=True, executable=None: [
+            spawn_command=lambda repo, session_id, resume, fork=False, commit_guidance=True, use_worktrees=True, executable=None: [
                 "agit-test-binary-that-does-not-exist"
             ],
             list_sessions=lambda repo: [],
