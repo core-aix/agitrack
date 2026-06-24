@@ -49,12 +49,17 @@ class BackendProcess:
     # ------------------------------------------------------------------
 
     @classmethod
-    def spawn(cls, command: list[str], cwd: str) -> "BackendProcess":
+    def spawn(cls, command: list[str], cwd: str, extra_env: dict[str, str] | None = None) -> "BackendProcess":
         """Fork a PTY child, exec *command* inside it, and return a new instance.
 
         The child changes to *cwd* before exec.  If exec fails the child exits
         with code 127 (the exec-failure guard from issue #20) so the fork never
         silently propagates as a duplicate runner.
+
+        ``extra_env`` is applied to the CHILD's environment only (set after the fork,
+        before exec), so it never leaks into the aGiTrack process or its own
+        subprocesses — e.g. disabling a backend's in-app auto-update for the session
+        without disabling the explicit upgrade aGiTrack runs itself.
         """
         pid, fd = pty.fork()
         if pid == 0:
@@ -64,6 +69,8 @@ class BackendProcess:
             # fork point, sharing state files, locks, and the terminal.
             try:
                 os.chdir(cwd)
+                if extra_env:
+                    os.environ.update(extra_env)
                 os.execvp(command[0], command)
             except BaseException:
                 os._exit(127)

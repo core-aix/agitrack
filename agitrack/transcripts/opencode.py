@@ -4,13 +4,22 @@ import json
 import os
 from agitrack.env import getenv_compat
 import pty
+import signal
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 
 from agitrack.backends.base import TokenUsage
 from agitrack.transcripts.types import ExportedSession, SessionRef, SessionTurn, turns_after
+
+# Every `opencode` subprocess aGiTrack runs synchronously (often on the main reactor/menu
+# thread — session list/export/import) is capped: the CLI talks to a TTY and can hang
+# (interactive fallback, a server-side stall), and an unbounded wait would FREEZE the whole
+# TUI. On timeout the call returns empty/non-zero, which every caller already treats as "no
+# data", rather than deadlocking. Generous enough for a real call, short enough to recover.
+_OPENCODE_CALL_TIMEOUT = 30.0
 
 __all__ = [
     "ExportedSession",
@@ -26,6 +35,7 @@ __all__ = [
     "session_transcript_size",
     "has_imported_session",
     "import_shared_session",
+    "retarget_session_dir",
     "parse_exported_session",
     "looks_like_event_blob",
 ]
@@ -36,25 +46,38 @@ __all__ = [
 _REASONING_EFFORT_KEYS = {"reasoningEffort", "reasoning_effort", "effort", "variant"}
 
 
-def _fetch_sessions(repo: Path, max_count: int) -> list[dict]:
-    _debug(repo, "opencode session list starting")
-    process = subprocess.run(
-        ["opencode", "session", "list", "--format", "json", "--max-count", str(max_count)],
-        cwd=repo,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    _debug(
-        repo,
-        f"opencode session list finished returncode={process.returncode} stdout_bytes={len(process.stdout)} stderr_bytes={len(process.stderr)}",
-    )
+def _opencode_session_list(cwd: Path, max_count: int) -> list[dict]:
+    """`opencode session list --format json`, BOUNDED by a timeout. The CLI talks to a TTY and
+    can hang; without the cap this (run on the menu/main thread) freezes the whole TUI. Returns
+    the parsed session dicts, or [] on timeout/spawn-failure/non-zero/bad-JSON — every caller
+    already treats an empty list as 'no sessions'."""
+    _debug(cwd, f"opencode session list starting (max_count={max_count})")
+    try:
+        process = subprocess.run(
+            ["opencode", "session", "list", "--format", "json", "--max-count", str(max_count)],
+            cwd=cwd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=_OPENCODE_CALL_TIMEOUT,
+        )
+    except (subprocess.TimeoutExpired, OSError) as error:
+        _debug(cwd, f"opencode session list timed out/failed: {error!r}")
+        return []
+    _debug(cwd, f"opencode session list finished returncode={process.returncode} stdout_bytes={len(process.stdout)}")
     if process.returncode != 0:
         return []
     try:
         sessions = json.loads(process.stdout)
     except json.JSONDecodeError:
+        return []
+    return sessions if isinstance(sessions, list) else []
+
+
+def _fetch_sessions(repo: Path, max_count: int) -> list[dict]:
+    sessions = _opencode_session_list(repo, max_count)
+    if not sessions:
         return []
     resolved = repo.resolve()
     matching = [session for session in sessions if _same_repo(session.get("directory"), resolved) and session.get("id")]
@@ -105,20 +128,7 @@ def list_worktree_sessions(worktrees_root: Path) -> list[tuple[str, SessionRef]]
     since been removed are still listed (and stay resumable)."""
     root = worktrees_root.resolve()
     cwd = next((p for p in [root, *root.parents] if p.is_dir()), Path.home())
-    process = subprocess.run(
-        ["opencode", "session", "list", "--format", "json", "--max-count", "200"],
-        cwd=cwd,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    if process.returncode != 0:
-        return []
-    try:
-        sessions = json.loads(process.stdout)
-    except json.JSONDecodeError:
-        return []
+    sessions = _opencode_session_list(cwd, 200)
     out: list[tuple[str, SessionRef]] = []
     for session in sessions:
         sid = session.get("id")
@@ -140,22 +150,7 @@ def list_worktree_sessions(worktrees_root: Path) -> list[tuple[str, SessionRef]]
 
 
 def session_belongs_to_repo(repo: Path, session_id: str) -> bool:
-    _debug(repo, f"opencode session belongs check starting session_id={session_id}")
-    process = subprocess.run(
-        ["opencode", "session", "list", "--format", "json", "--max-count", "50"],
-        cwd=repo,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    _debug(repo, f"opencode session belongs check finished session_id={session_id} returncode={process.returncode}")
-    if process.returncode != 0:
-        return False
-    try:
-        sessions = json.loads(process.stdout)
-    except json.JSONDecodeError:
-        return False
+    sessions = _opencode_session_list(repo, 50)
     resolved = repo.resolve()
     return any(
         session.get("id") == session_id and _same_repo(session.get("directory"), resolved) for session in sessions
@@ -291,6 +286,30 @@ def export_session_raw(repo: Path, session_id: str) -> str | None:
     return json_text
 
 
+def retarget_session_dir(repo: Path, session_id: str, cwd: str) -> bool:
+    """Point an OpenCode session's recorded ``directory`` at ``cwd`` so resuming it opens in
+    THIS worktree, not the (possibly stale or deleted) directory it last ran in.
+
+    OpenCode resumes by id from its global store and restores that recorded directory,
+    ignoring the launch path — so without this a resumed session keeps the wrong working
+    directory. A no-op when the session already belongs to ``cwd``. Otherwise re-exports the
+    session (UNSANITIZED — this is a local move, not a share, so content must be preserved)
+    and re-imports it with ``cwd`` as the import cwd, which is how OpenCode retargets a
+    session's directory. Best-effort: returns True only when it was actually moved."""
+    if not session_id:
+        return False
+    cwd_path = Path(cwd)
+    if session_belongs_to_repo(cwd_path, session_id):
+        return False  # already recorded against this directory — nothing to do
+    output, returncode = _run_export_pty(repo, session_id, sanitize=False)
+    if returncode != 0:
+        return False
+    transcript = _extract_json_object(output)
+    if not transcript:
+        return False
+    return import_shared_session(cwd_path, session_id, transcript, overwrite=True)
+
+
 def session_transcript_size(repo: Path, session_id: str) -> int | None:
     # OpenCode keeps sessions in a SQLite store with no per-session file to stat,
     # and exporting purely to measure size would make the manage-shared menu slow
@@ -388,18 +407,39 @@ def _run_opencode_pty(repo: Path, args: list[str]) -> tuple[str, int]:
         except BaseException:
             os._exit(127)
 
-    chunks: list[bytes] = []
-    while True:
+    # Watchdog: a hung `opencode` (interactive TTY fallback, server stall) would otherwise
+    # block the os.read loop forever and FREEZE aGiTrack. SIGKILL it on timeout so the read
+    # hits EOF and we return what we have with a non-zero exit (callers treat that as no data).
+    timed_out = threading.Event()
+
+    def _kill_on_timeout() -> None:
+        timed_out.set()
         try:
-            chunk = os.read(fd, 65536)
+            os.kill(pid, signal.SIGKILL)
         except OSError:
-            break
-        if not chunk:
-            break
-        chunks.append(chunk)
+            pass
+
+    watchdog = threading.Timer(_OPENCODE_CALL_TIMEOUT, _kill_on_timeout)
+    watchdog.daemon = True
+    watchdog.start()
+    chunks: list[bytes] = []
+    try:
+        while True:
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        watchdog.cancel()
     os.close(fd)
     _done, status = os.waitpid(pid, 0)
-    return b"".join(chunks).decode(errors="replace"), os.waitstatus_to_exitcode(status)
+    exit_code = os.waitstatus_to_exitcode(status)
+    if timed_out.is_set():
+        exit_code = exit_code or 124  # killed → ensure a non-zero "unusable" code
+    return b"".join(chunks).decode(errors="replace"), exit_code
 
 
 def parse_exported_session(

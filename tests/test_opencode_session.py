@@ -594,3 +594,123 @@ def test_read_events_captures_child_session_ids_from_task_events():
     child_ids: set[str] = set()
     backend._read_events(io.StringIO(task_event + "\n" + other + "\n"), child_ids=child_ids)
     assert child_ids == {"ses_child"}
+
+
+def test_retarget_session_dir_noop_when_already_in_dir(monkeypatch, tmp_path):
+    from agitrack.transcripts import opencode as O
+
+    monkeypatch.setattr(O, "session_belongs_to_repo", lambda repo, sid: True)
+    exported = []
+    monkeypatch.setattr(O, "_run_export_pty", lambda *a, **k: exported.append(True) or ("", 0))
+
+    assert O.retarget_session_dir(tmp_path, "ses_1", str(tmp_path)) is False
+    assert exported == []  # already aligned → no export/import work
+
+
+def test_retarget_session_dir_reimports_unsanitized_when_dir_differs(monkeypatch, tmp_path):
+    from agitrack.transcripts import opencode as O
+
+    monkeypatch.setattr(O, "session_belongs_to_repo", lambda repo, sid: False)
+    captured = {}
+
+    def fake_export(repo, sid, *, sanitize):
+        captured["sanitize"] = sanitize
+        return ('{"id": "ses_1"}', 0)
+
+    def fake_import(repo, sid, transcript, *, overwrite=False, as_id=None):
+        captured.update(repo=str(repo), sid=sid, overwrite=overwrite)
+        return True
+
+    monkeypatch.setattr(O, "_run_export_pty", fake_export)
+    monkeypatch.setattr(O, "_extract_json_object", lambda out: out)
+    monkeypatch.setattr(O, "import_shared_session", fake_import)
+
+    worktree = str(tmp_path / "wt")
+    assert O.retarget_session_dir(tmp_path, "ses_1", worktree) is True
+    assert captured["sanitize"] is False  # local move: keep full content, don't redact
+    assert captured["overwrite"] is True
+    assert captured["repo"] == worktree  # re-imported with the worktree as the cwd
+    assert captured["sid"] == "ses_1"
+
+
+def test_opencode_bare_run_folds_system_prompt_into_prompt(monkeypatch):
+    # OpenCode ignores --system-prompt, so the summarizer's INSTRUCTION (passed as system_prompt)
+    # must be folded into the prompt positional — otherwise OpenCode never learns to summarize.
+    import io
+    import types
+    from pathlib import Path
+
+    from agitrack.backends import opencode as O
+    from agitrack.backends.opencode import OpenCodeBackend
+
+    captured = {}
+
+    class FakeProc:
+        def __init__(self, cmd):
+            captured["cmd"] = cmd
+            self.stdout = io.StringIO("")
+
+        def wait(self):
+            return 0
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(O.subprocess, "Popen", lambda cmd, **k: FakeProc(cmd))
+    monkeypatch.setattr(
+        O.threading,
+        "Timer",
+        lambda *a, **k: types.SimpleNamespace(start=lambda: None, cancel=lambda: None, daemon=False),
+    )
+    backend = OpenCodeBackend(repo=Path("/tmp"))
+
+    backend.run("TRACE", model=None, session_id=None, bare=True, system_prompt="SUMMARIZE THIS")
+    assert captured["cmd"][-1] == "SUMMARIZE THIS\n\nTRACE"  # instruction reached OpenCode
+
+    backend.run("HELLO", model=None, session_id=None, bare=False, system_prompt="X")
+    assert captured["cmd"][-1] == "HELLO"  # non-bare run: prompt untouched
+
+
+# --- no-deadlock guarantees: every synchronous opencode call must be bounded ------------------
+
+
+def test_run_opencode_pty_kills_a_hung_command_and_returns(monkeypatch):
+    # The export/import pty path must never block forever: a command that produces no output
+    # and never exits (opencode hanging on a TTY) is SIGKILLed by the watchdog, so the call
+    # returns with a non-zero code instead of freezing the whole TUI.
+    import time
+    from pathlib import Path
+
+    from agitrack.transcripts import opencode as O
+
+    monkeypatch.setattr(O, "_OPENCODE_CALL_TIMEOUT", 1.0)  # short cap for the test
+    start = time.monotonic()
+    out, code = O._run_opencode_pty(Path("/tmp"), ["sleep", "30"])
+    elapsed = time.monotonic() - start
+    assert elapsed < 15, f"hung command was not killed (took {elapsed:.1f}s)"
+    assert code != 0  # killed -> non-zero ("unusable") so callers treat it as no data
+
+
+def test_opencode_session_list_is_bounded_and_safe_on_timeout(monkeypatch):
+    import subprocess
+    import types
+    from pathlib import Path
+
+    from agitrack.transcripts import opencode as O
+
+    captured = {}
+
+    def fake_run(args, **kwargs):
+        captured["timeout"] = kwargs.get("timeout")
+        return types.SimpleNamespace(returncode=0, stdout="[]", stderr="")
+
+    monkeypatch.setattr(O.subprocess, "run", fake_run)
+    O._opencode_session_list(Path("/tmp"), 50)
+    assert captured["timeout"] and captured["timeout"] > 0  # a timeout is always passed
+
+    # A timed-out call returns [] (no data) rather than raising / hanging.
+    def timeout_run(args, **kwargs):
+        raise subprocess.TimeoutExpired(args, kwargs.get("timeout") or 0)
+
+    monkeypatch.setattr(O.subprocess, "run", timeout_run)
+    assert O._opencode_session_list(Path("/tmp"), 50) == []
