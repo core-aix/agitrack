@@ -388,6 +388,34 @@ def test_commit_turns_preserves_pending_users_not_in_turns(tmp_path):
     assert "second prompt" in repo.message
 
 
+def test_leftover_user_message_precedes_multi_message_agent_response(tmp_path):
+    # A message the user sent mid-turn (a pending "leftover" prompt) must appear BEFORE the
+    # agent's response in the trace — even when the turn emitted several agent messages. The
+    # agent's reply covers everything the user said, so the leftover belongs right after the
+    # turn's prompt, not wedged between (or after) the agent's messages. The old logic
+    # inserted before the LAST agent message, which (with full_agent_messages on) dropped
+    # the leftover after the agent's earlier replies — the Claude trace-ordering bug.
+    engine, repo, state = _engine(tmp_path)
+    engine._full_agent_messages = True  # each agent message becomes its own ## Agent block
+    state.append_trace("user", "wait, also handle the edge case")  # typed while agent worked
+    turn = _turn("add the feature", "all done")
+    turn.agent_messages = ["starting now", "still working", "all done"]
+    engine.commit_turns(
+        turns=[turn],
+        backend="claude",
+        backend_session_id="s1",
+        model="m",
+        stage_untracked_fn=_noop_stage,
+    )
+    msg = repo.message
+    assert msg is not None
+    # rindex skips the leftover's appearance in the subject line and finds its ## User block
+    # in the trace body — which must precede every ## Agent block of the turn.
+    leftover_pos = msg.rindex("wait, also handle the edge case")
+    assert leftover_pos < msg.index("starting now")
+    assert msg.index("starting now") < msg.index("still working") < msg.index("all done")
+
+
 def test_commit_turns_stage_untracked_fn_receives_repo_and_state(tmp_path):
     engine, repo, state = _engine(tmp_path)
     calls = []
