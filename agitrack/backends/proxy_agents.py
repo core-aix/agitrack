@@ -92,6 +92,7 @@ class ProxyAgent(Protocol):
         *,
         session_id: str | None,
         resume: bool,
+        fork: bool = False,
         commit_guidance: bool = True,
         use_worktrees: bool = True,
         executable: list[str] | None = None,
@@ -179,12 +180,14 @@ class OpenCodeProxyAgent:
         *,
         session_id: str | None,
         resume: bool,
+        fork: bool = False,
         commit_guidance: bool = True,
         use_worktrees: bool = True,
         executable: list[str] | None = None,
     ) -> list[str]:
-        # ``commit_guidance``/``use_worktrees`` are accepted for a uniform interface but
-        # unused: OpenCode's interactive TUI has no flag to append to its system prompt.
+        # ``commit_guidance``/``use_worktrees``/``fork`` are accepted for a uniform
+        # interface but unused: OpenCode's interactive TUI has no flag to append to its
+        # system prompt, and no session-fork concept.
         command = list(executable) if executable else ["opencode"]
         if resume and session_id:
             command.extend(["--session", session_id])
@@ -261,6 +264,7 @@ class ClaudeProxyAgent:
         *,
         session_id: str | None,
         resume: bool,
+        fork: bool = False,
         commit_guidance: bool = True,
         use_worktrees: bool = True,
         executable: list[str] | None = None,
@@ -268,6 +272,10 @@ class ClaudeProxyAgent:
         head = list(executable) if executable else ["claude"]
         if resume and session_id:
             command = [*head, "--resume", session_id]
+            # --fork-session resumes this conversation into a NEW session id, used when
+            # the original is still held by a running background agent (#114).
+            if fork:
+                command.append("--fork-session")
         elif session_id:
             command = [*head, "--session-id", session_id]
         else:
