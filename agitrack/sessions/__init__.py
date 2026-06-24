@@ -11,7 +11,12 @@ import/export (in :mod:`agitrack.transcripts.claude`) is Claude-specific today.
 
 from agitrack.sessions.identity import github_login
 from agitrack.sessions.redact import redact_transcript
-from agitrack.sessions.store import PublishResult, SharedEntry, SharedSessionStore, count_transcript_rows
+from agitrack.sessions.store import (
+    PublishResult,
+    SharedEntry,
+    SharedSessionStore,
+    count_transcript_rows,
+)
 
 __all__ = [
     "PublishResult",

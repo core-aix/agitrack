@@ -479,10 +479,21 @@ class SharedSessionStore:
         keep: int = DEFAULT_KEEP,
         timeout: float | None = None,
         cancel: "threading.Event | None" = None,
+        overwrite: bool = False,
     ) -> PublishResult:
         """Share one session: add it, prune the contributor's stale ones, and push.
         The local copy is always saved (so it can be pushed later); the push is
         best-effort and reports its outcome.
+
+        ``overwrite`` resolves a conflict where the SHARED copy is already newer (more
+        turns) than this one — normally refused with ``behind=True`` so a stale machine
+        can't rewind everyone's copy. It first syncs the current remote (so the
+        replacement is against its latest tip), then replaces the shared copy with this
+        session wholesale, skipping both the union merge and the recency guard. Default
+        off: an ordinary share (and every auto-share) stays conservative and refuses to
+        regress. (Divergent copies that CAN be combined are union-merged automatically
+        during a normal publish, so they never reach a ``behind`` refusal — ``overwrite``
+        is for the non-mergeable case, where replace-or-keep is the only real choice.)
 
         ``github_id``/``name`` are the entry's LINEAGE ORIGIN (the path it lives at) —
         a re-share of an imported session writes under the original owner+name so it
@@ -501,12 +512,19 @@ class SharedSessionStore:
         gid, nm = slug(github_id), slug(name)
         pgid = slug(prune_gid) if prune_gid else gid
         if not self.repo.remote_exists():
-            if self._would_regress(gid, nm, transcript):
+            if not overwrite and self._would_regress(gid, nm, transcript):
                 return PublishResult(remote=False, pushed=False, behind=True)
             self._add_session(gid, nm, transcript, manifest)
             pruned = self.prune_own_stale(pgid, keep=keep)
             return PublishResult(remote=False, pushed=False, pruned=pruned)
-        result = self._add_and_push(gid, nm, transcript, manifest, keep, timeout, cancel, prune_gid=pgid)
+        # Overwrite: sync the current remote FIRST so we replace its latest tip cleanly
+        # (the lease then matches), instead of pushing optimistically only to lose the
+        # lease and retry.
+        if overwrite:
+            self._fetch_current(timeout=timeout, cancel=cancel)
+        result = self._add_and_push(
+            gid, nm, transcript, manifest, keep, timeout, cancel, prune_gid=pgid, overwrite=overwrite
+        )
         if result.pushed or not _is_stale_lease(result.error):
             return result
         if cancel is not None and cancel.is_set():
@@ -514,7 +532,9 @@ class SharedSessionStore:
         # Lost the race (or our orphan ref diverged from a remote one we'd never
         # fetched): sync onto the current remote tip and try once more.
         self._fetch_current(timeout=timeout, cancel=cancel)
-        return self._add_and_push(gid, nm, transcript, manifest, keep, timeout, cancel, prune_gid=pgid)
+        return self._add_and_push(
+            gid, nm, transcript, manifest, keep, timeout, cancel, prune_gid=pgid, overwrite=overwrite
+        )
 
     def _add_and_push(
         self,
@@ -527,6 +547,7 @@ class SharedSessionStore:
         cancel: "threading.Event | None" = None,
         *,
         prune_gid: str | None = None,
+        overwrite: bool = False,
     ) -> PublishResult:
         # Best-effort union merge: if a copy already sits in the local ref and it has
         # DIVERGED from ours — e.g. a concurrent contributor's version we just fetched
@@ -534,10 +555,12 @@ class SharedSessionStore:
         # dropped, instead of overwriting one with the other. A no-op for the common
         # cases: our copy is a superset of what's there (append-only re-share), or the
         # transcript isn't line-mergeable (OpenCode), in which case last-write-wins and
-        # the recency guard below still applies.
+        # the recency guard below still applies. Skipped entirely on ``overwrite``: the
+        # caller chose to REPLACE the shared copy with this session, so its turns must
+        # not be folded back in.
         merged_rows = 0
         existing = self.repo.read_ref_blob(self.ref, f"{self._prefix()}{gid}/{nm}/transcript.jsonl")
-        if existing:
+        if existing and not overwrite:
             combined = merge_transcripts(transcript, existing)
             # Only accept the merge if its result is still readable by the backend —
             # the guard that combining two diverged copies didn't corrupt the session.
@@ -557,7 +580,9 @@ class SharedSessionStore:
         # remote, so a machine that's behind is caught here and refuses rather than
         # rewinding everyone's shared session to its older state. (After a merge above
         # the transcript is a superset, so this never trips for a genuine divergence.)
-        if self._would_regress(gid, nm, transcript):
+        # ``overwrite`` deliberately bypasses it: the user chose to replace the newer
+        # shared copy with this one.
+        if not overwrite and self._would_regress(gid, nm, transcript):
             return PublishResult(remote=True, pushed=False, behind=True)
         old = self.repo.ref_sha(self.ref)  # tip we believe the remote is at = the delta base
         # Keep the PREVIOUS snapshot's objects (reclaim=False) so they survive until the
