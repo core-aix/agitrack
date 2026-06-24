@@ -31,6 +31,26 @@ For local development, install from a checkout instead:
 python3 -m pip install -e .
 ```
 
+### Windows (native — no WSL)
+
+`pip install agitrack` works natively on Windows (PowerShell / Windows Terminal). It automatically pulls in **`pywinpty`** (a prebuilt wheel — no C/Rust compiler needed) to drive the agent through a pseudo-console (ConPTY). Notes:
+
+- **Check Python/pip first:** `py -m pip --version`. No Python? `winget install Python.Python.3.12` (tick *Add to PATH*).
+- **`agitrack` not found after install?** Your Python `Scripts` dir isn't on PATH. Run it as `py -m agitrack`, or install with **pipx** (`pipx install agitrack`), which puts it on PATH for you.
+- The write-confinement **sandbox is macOS/Linux-only**, so on Windows the agent runs unconfined (aGiTrack shows a one-time warning).
+
+### Prerequisites — git and a backend (macOS · Linux · Windows)
+
+aGiTrack needs **git** and at least one backend CLI ([Claude Code](https://docs.claude.com/en/docs/claude-code) or [OpenCode](https://opencode.ai)); the GitHub CLI (`gh`) is optional (it lets the dashboard show authors by GitHub username). Install them for your OS:
+
+| | git (required) | a backend (Claude Code **or** OpenCode) | `gh` (optional) |
+|---|---|---|---|
+| **macOS** | `brew install git` | `curl -fsSL https://claude.ai/install.sh \| bash` · or `npm install -g opencode-ai` | `brew install gh` |
+| **Linux** | `sudo apt install git` *(or your package manager)* | `curl -fsSL https://claude.ai/install.sh \| bash` · or `npm install -g opencode-ai` | `sudo apt install gh` |
+| **Windows** | `winget install Git.Git` | `npm install -g @anthropic-ai/claude-code` · or `npm install -g opencode-ai` *(no Node? `winget install OpenJS.NodeJS`)* | `winget install GitHub.cli` |
+
+Run `gh auth login` if you installed `gh`. After installing anything, open a **new terminal** so the updated `PATH` is picked up. aGiTrack also prints these same per-OS hints at startup if `git` or the selected backend is missing.
+
 ### VS Code extension
 
 aGiTrack is also available as a **[VS Code extension](https://marketplace.visualstudio.com/items?itemName=core-aix.agitrack-vscode)**. Install it from the Marketplace and launch aGiTrack inside VS Code with one click — the **aG** button in the editor toolbar (top-right), or the `aGiTrack:` commands in the Command Palette. It runs the real aGiTrack CLI in an integrated terminal (installing the CLI on first use if it's missing), so you get the complete experience — the agent's native interface, the `Ctrl-G` menu, sessions, sharing, worktrees, and per-turn auto-commits. See [Editor integration](#editor-integration) for details.
