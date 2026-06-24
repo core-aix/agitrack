@@ -8219,3 +8219,19 @@ def test_no_worktree_mode_removes_leftover_worktrees(tmp_path):
 
     assert removed == ["sess-a", "sess-b"]
     assert runner.worktree is None  # runs on the base tree directly
+
+
+def test_worktree_sessions_is_memoized_to_avoid_repeated_slow_listing(tmp_path):
+    # Entering the resume menu calls _worktree_sessions several times (via _resumable_sessions
+    # and _agitrack_named_sessions); each is a slow `opencode session list`. It must be
+    # memoized so the menu fires it ONCE, not back-to-back (which froze the TUI for seconds).
+    runner = make_runner(state=AgitrackState(tmp_path))
+    calls = []
+    runner.backend = types.SimpleNamespace(list_worktree_sessions=lambda root: calls.append(1) or [])
+    runner._worktrees = lambda: types.SimpleNamespace(root=tmp_path)
+
+    runner._worktree_sessions()
+    runner._worktree_sessions()
+    runner._worktree_sessions()
+
+    assert len(calls) == 1  # cached within the TTL, not three subprocesses
