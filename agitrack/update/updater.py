@@ -38,6 +38,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn, cast
 
+from agitrack.proc import detach_kwargs
+
 import agitrack
 
 # The PyPI distribution name. After the aGiT → aGiTrack rename the distribution,
@@ -534,7 +536,7 @@ class Updater:
                 stderr=subprocess.PIPE,
                 check=False,
                 timeout=600,
-                start_new_session=True,
+                **detach_kwargs(),
             )
             if result.returncode == 0:
                 return self._package_upgraded(status)
@@ -558,7 +560,8 @@ class Updater:
                     stderr=subprocess.PIPE,
                     check=False,
                     timeout=600,
-                    start_new_session=True,  # survive a terminal-close SIGHUP mid-upgrade
+                    # survive a terminal-close SIGHUP (POSIX) / detached on Windows mid-upgrade
+                    **detach_kwargs(),
                 )
                 if result.returncode == 0:
                     return self._package_upgraded(status)
