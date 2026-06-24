@@ -1946,13 +1946,16 @@ class ProxyRunner:
             return None
         return list(cmd) if cmd else None
 
-    def _backend_self_update_blocked(self) -> bool:
-        """Whether the backend's OWN in-app self-update can't work inside aGiTrack: on macOS,
-        a Homebrew-managed CLI updates via `brew upgrade`, which runs Homebrew's own
-        `sandbox-exec` — and macOS forbids nesting that inside the agent's worktree sandbox.
-        (npm/native installs self-update fine; only the brew-under-sandbox combination breaks.)
-        When true, aGiTrack applies the update itself from its UNCONFINED proxy."""
-        if not self._sandbox or sys.platform != "darwin" or not sandbox.is_available():
+    def _backend_update_via_agitrack(self) -> bool:
+        """Whether aGiTrack should drive this backend's update itself (from its UNCONFINED proxy)
+        rather than leaving it to the backend's own updater. True for a Homebrew-managed CLI on
+        macOS — independent of the sandbox toggle:
+          - sandboxed: the backend's own `brew upgrade` can't run at all (macOS forbids nesting
+            `sandbox-exec`), so aGiTrack MUST do it;
+          - unsandboxed: it *would* work, but the backend only nags with a prompt (and OpenCode's,
+            run interactively, has been failing for users), so aGiTrack does it silently instead.
+        (npm/native installs self-update cleanly; aGiTrack leaves those to the backend.)"""
+        if sys.platform != "darwin":
             return False
         exe = shutil.which(self.backend.name)
         if not exe:
@@ -1964,12 +1967,13 @@ class ProxyRunner:
 
     def _backend_child_env(self) -> dict[str, str] | None:
         """Extra environment for the interactive backend child only. When aGiTrack will apply
-        this backend's update itself (its own in-app updater is sandbox-blocked and update
-        checks are on), disable OpenCode's in-app auto-update so the user isn't shown its
-        prompt — which only fails inside the sandbox. Does NOT affect aGiTrack's own
-        `opencode upgrade`, which runs from the unconfined proxy with the normal environment."""
+        this backend's update itself (it's a brew-managed backend on macOS and update checks are
+        on), disable OpenCode's in-app auto-update so the user isn't shown its prompt — which is
+        redundant with aGiTrack's silent update and, under the sandbox, fails outright. Does NOT
+        affect aGiTrack's own `opencode upgrade`, which runs from the unconfined proxy with the
+        normal environment."""
         checks_on = self.global_config is None or getattr(self.global_config, "check_for_updates", True)
-        if getattr(self.backend, "name", None) == "opencode" and checks_on and self._backend_self_update_blocked():
+        if getattr(self.backend, "name", None) == "opencode" and checks_on and self._backend_update_via_agitrack():
             return {"OPENCODE_DISABLE_AUTOUPDATE": "1"}
         return None
 
@@ -1984,20 +1988,21 @@ class ProxyRunner:
         return (proc.stdout or proc.stderr or "").strip()
 
     def _maybe_auto_update_backend(self) -> None:
-        """Timers phase: when the backend's OWN self-update can't run under aGiTrack's sandbox
-        (brew + macOS), apply it AUTOMATICALLY from the UNCONFINED proxy — no menu, no prompt.
-        Evaluated once per backend (re-armed on a switch) and gated by the global update-check
-        toggle. The updater itself decides whether an upgrade is needed (it checks the backend's
-        release server, not Homebrew's possibly-stale local tap), so we don't pre-gate on `brew
-        outdated`. Runs on a background thread; the result is surfaced by _service_backend_update."""
+        """Timers phase: when aGiTrack should drive this backend's update (a brew-managed CLI on
+        macOS — see _backend_update_via_agitrack), apply it AUTOMATICALLY from the UNCONFINED
+        proxy — no menu, no prompt, regardless of the sandbox toggle. Evaluated once per backend
+        (re-armed on a switch) and gated by the global update-check toggle. The updater itself
+        decides whether an upgrade is needed (it checks the backend's release server, not
+        Homebrew's possibly-stale local tap), so we don't pre-gate on `brew outdated`. Runs on a
+        background thread; the result is surfaced by _service_backend_update."""
         name = getattr(self.backend, "name", None)
         if name is None or self._backend_update_checked_for == name:
             return
         self._backend_update_checked_for = name  # evaluate each backend once (re-armed on switch)
         if self.global_config is not None and not getattr(self.global_config, "check_for_updates", True):
             return  # the user turned update checks off
-        if not self._backend_self_update_blocked():
-            return  # the backend self-updates fine on its own; leave it to do so
+        if not self._backend_update_via_agitrack():
+            return  # the backend self-updates cleanly on its own; leave it to do so
         if self._backend_update_thread is not None and self._backend_update_thread.is_alive():
             return
         cmd = self._backend_update_command()
@@ -5985,7 +5990,7 @@ class ProxyRunner:
             return
         self._service_background_share_ops()  # surface finished background unshare/etc. results
         self._service_backend_update()  # surface a finished backend auto-update result
-        self._maybe_auto_update_backend()  # auto-apply a sandbox-blocked backend update; once per backend
+        self._maybe_auto_update_backend()  # auto-apply a brew-managed backend update; once per backend
         self._service_session_notices()  # expire/refresh per-session status lines
         self._git_wake.set()  # nudge the worker so its pass tracks the reactor's cadence
 
