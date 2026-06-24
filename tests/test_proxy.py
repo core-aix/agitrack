@@ -6146,6 +6146,68 @@ def test_relaunch_backend_resets_loop_guard_after_quiet_period(monkeypatch):
     assert relaunches.count("finalize") == 0  # never gave up
 
 
+def test_backend_launch_failure_reason_detects_busy_background_agent():
+    # The resumed claude session is held by a running background agent: surface an
+    # actionable reason instead of crash-looping into a silent flash (#114).
+    import time as _time
+
+    runner = make_runner()
+    runner._cwd_launch_at = _time.time()  # just spawned
+    runner.last_child_output_sample = (
+        b"\x1b[31mError: Session abc is currently running as a background agent (bg). "
+        b"Use `claude agents` to find and attach to it, or add --fork-session to branch off a copy.\x1b[0m\n"
+    )
+    reason = runner._backend_launch_failure_reason(1)
+    assert reason is not None
+    assert "background agent" in reason
+    assert "--new-session" in reason and "--fork-session" in reason
+    assert "Session abc" in reason  # the backend's own message is echoed
+
+
+def test_backend_launch_failure_reason_ignores_clean_and_late_exits():
+    import time as _time
+
+    runner = make_runner()
+    # A clean exit (e.g. Esc on Claude's picker) leaves no error output → not a failure,
+    # so aGiTrack relaunches+resumes as before.
+    runner._cwd_launch_at = _time.time()
+    runner.last_child_output_sample = b"\x1b[?1049l"  # just a terminal restore, no error
+    assert runner._backend_launch_failure_reason(0) is None
+    # The busy message long AFTER spawn is a real mid-session exit, not a launch failure.
+    runner.last_child_output_sample = b"Session x is currently running as a background agent (bg)\n"
+    runner._cwd_launch_at = _time.time() - 999
+    assert runner._backend_launch_failure_reason(1) is None
+
+
+def test_backend_launch_failure_reason_surfaces_generic_nonzero_exit():
+    import time as _time
+
+    runner = make_runner()
+    runner._cwd_launch_at = _time.time()
+    runner.last_child_output_sample = b"fatal: model provider unreachable\n"
+    reason = runner._backend_launch_failure_reason(2)
+    assert reason is not None
+    assert "provider unreachable" in reason and "code 2" in reason
+
+
+def test_relaunch_surfaces_launch_failure_instead_of_crash_looping():
+    import time as _time
+
+    runner = make_runner()
+    runner._debug = lambda *a, **k: None
+    calls = []
+    runner._restart_agent = lambda msg: calls.append("relaunch")
+    runner._finalize_on_backend_exit = lambda: calls.append("finalize")
+    runner._cwd_launch_at = _time.time()
+    runner.last_child_output_sample = b"Session x is currently running as a background agent (bg)\n"
+
+    # A launch failure must surface on the FIRST exit and not relaunch (no 3x flash).
+    assert runner._relaunch_backend_or_exit(1) is False
+    assert calls == ["finalize"]  # finalized for exit, never relaunched
+    assert runner._backend_exit_notice is not None
+    assert "background agent" in runner._backend_exit_notice
+
+
 def test_finalize_on_backend_exit_finalizes_once_and_clears_pid():
     runner = make_runner(child_pid=4321)
     calls = []
