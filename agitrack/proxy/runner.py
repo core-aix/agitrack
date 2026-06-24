@@ -434,6 +434,9 @@ class ProxyRunner:
         sandbox: bool = True,
         allowed_edit_paths: list[str] | None = None,
         backend_command: list[str] | None = None,
+        # True when cli.py already ran the blocking startup gh-availability prompt for
+        # this launch, so run() skips its own in-TUI gh notice (avoids double-nagging).
+        gh_prechecked: bool = False,
         # Optional injected collaborators (default to production construction).
         # These keyword arguments are for testing and advanced use; the CLI call
         # site passes only the first five parameters and is unaffected.
@@ -470,6 +473,8 @@ class ProxyRunner:
         # empty, the per-backend config value (GlobalConfig.backend_command) applies. The
         # override wins for whatever backend is active; the config form is keyed by backend.
         self._backend_command = list(backend_command or [])
+        # cli.py already showed the blocking startup gh prompt ⇒ suppress the in-TUI notice.
+        self._gh_prechecked = gh_prechecked
         self._force_new_session = new_session  # start a fresh conversation, do not resume
         self.name = "main"  # session label (multiplexer assigns names to others)
         self._primary_worktree_name: str | None = None  # session kept across exits for auto-resume
@@ -883,6 +888,7 @@ class ProxyRunner:
                 "_message_scroll": 0,
                 "_message_max_scroll": 0,
                 "_message_sticky": False,
+                "_gh_prechecked": False,
                 "_session_notices": {},
                 "_notice_shown": False,
                 "_awaited_followups": [],
@@ -1087,7 +1093,9 @@ class ProxyRunner:
         # Recommend installing / logging into gh when it's unavailable, since the
         # dashboard's committer identities and session sharing depend on it (#76).
         # Runs in the background so a slow `gh auth status` never blocks startup.
-        threading.Thread(target=self._notify_if_gh_unavailable, daemon=True).start()
+        # Skipped when cli.py already showed the blocking startup gh prompt (no double-nag).
+        if not self._gh_prechecked:
+            threading.Thread(target=self._notify_if_gh_unavailable, daemon=True).start()
         # Resolve the GitHub login now, off the hot path, so neither a live nor an
         # exit-time auto-share has to shell out to `gh` mid-share (that lookup can
         # stall and would otherwise eat into the bounded share budget).

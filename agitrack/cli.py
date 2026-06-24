@@ -362,6 +362,12 @@ def main(argv: list[str] | None = None) -> int:
                 ui_bridge=args.ui_bridge,
             ).run()
         else:
+            # Before the TUI takes over the terminal, check the GitHub CLI and let the
+            # user install/log in or continue without it (the TUI would otherwise leave
+            # no shell prompt to act on the gh warning).
+            proceed, gh_handled = _check_gh_availability(repo, scripted=scripted)
+            if not proceed:
+                return 1
             return ProxyRunner(
                 repo,
                 verbose=args.verbose,
@@ -375,6 +381,7 @@ def main(argv: list[str] | None = None) -> int:
                 delay_merge=args.delay_merge,
                 sandbox=sandbox_enabled,
                 allowed_edit_paths=allowed_edit_paths,
+                gh_prechecked=gh_handled,
                 _lock=management_lock,
             ).run()
     except (GitError, RuntimeError) as error:
@@ -589,6 +596,67 @@ def _acknowledge_privacy_warning(*, scripted: bool = False, skip: bool = False) 
         print("aGiTrack not started.")
         return False
     return True
+
+
+def _check_gh_availability(repo: GitRepo, *, scripted: bool = False) -> tuple[bool, bool]:
+    """Before the TUI takes over the terminal, check the GitHub CLI (``gh``) and let the
+    user act on it. aGiTrack uses ``gh`` for the dashboard's committer identities and for
+    session sharing; once the full-screen TUI starts there is no shell prompt left to run
+    ``gh auth login`` in, so we surface it here while stdin is still an ordinary terminal.
+
+    Only prompts when ``gh`` is missing or not signed in **and** the repo has a GitHub
+    remote (where ``gh`` actually matters) — a local-only / non-GitHub repo is never nagged.
+    Offers to log in inline (``gh auth login`` runs right here) or continue without it.
+
+    Returns ``(proceed, handled)``: ``proceed`` is False only when the user chose to quit;
+    ``handled`` is True when the interactive prompt was shown, so the runner can skip its
+    own in-TUI gh notice. Never blocks automation — without an interactive TTY (or in
+    scripted mode) it does nothing and returns ``(True, False)``."""
+    if scripted or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return (True, False)
+    from agitrack.metrics.github import commit_url_base, gh_status
+
+    status = gh_status()
+    if status == "ok":
+        return (True, False)  # installed and authenticated — nothing to do
+    if not commit_url_base(repo):
+        return (True, False)  # no GitHub remote — gh isn't needed here yet
+    if status == "missing":
+        print(
+            "GitHub CLI (gh) isn't installed. aGiTrack uses it for the dashboard's committer\n"
+            "identities and for session sharing; without it those features are limited.\n"
+            "Install it from https://cli.github.com, then restart aGiTrack."
+        )
+        prompt = "Press Enter to continue without it (q to quit): "
+    else:  # unauthenticated
+        print(
+            "GitHub CLI (gh) isn't signed in. aGiTrack uses it for the dashboard's committer\n"
+            "identities and for session sharing; without it those features are limited."
+        )
+        prompt = "Press Enter to continue, type 'l' to log in now (q to quit): "
+    # Drain injected input first so a stray newline can't auto-answer this (same reason as
+    # the privacy acknowledgment) — the choice must be a deliberate keypress.
+    _drain_terminal_input()
+    try:
+        answer = input(prompt).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("\naGiTrack not started.")
+        return (False, True)
+    if answer in {"q", "quit"}:
+        print("aGiTrack not started.")
+        return (False, True)
+    if status == "unauthenticated" and answer in {"l", "login", "log in"}:
+        _run_gh_login()
+    return (True, True)
+
+
+def _run_gh_login() -> None:
+    """Run ``gh auth login`` interactively in the current terminal (we are still in cooked
+    mode, before the TUI). Best-effort: any failure is reported and aGiTrack continues."""
+    try:
+        subprocess.run(["gh", "auth", "login"], check=False)
+    except (OSError, subprocess.SubprocessError) as error:
+        print(f"Could not run `gh auth login`: {error}")
 
 
 def _discover_or_init(path: Path) -> GitRepo | None:
