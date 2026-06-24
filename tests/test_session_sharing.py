@@ -699,6 +699,82 @@ def test_publish_refuses_to_regress_to_a_shorter_transcript(tmp_path):
     assert store.read_transcript(store.entries()[0]) == "t1\nt2\nt3\n"
 
 
+def test_publish_overwrite_replaces_a_newer_shared_copy(tmp_path):
+    # overwrite=True is the explicit "share onto a newer shared copy anyway" path: it
+    # bypasses the recency guard and replaces the stored copy with this (shorter) one,
+    # instead of refusing. Used when the user picks "Overwrite" on a behind conflict.
+    store = SharedSessionStore(_init_repo(tmp_path))  # no remote: writes the local ref
+    store.publish(
+        github_id="a", name="s", transcript="t1\nt2\nt3\n", manifest=_manifest("s", session_id="id", updated=1)
+    )
+    # Without overwrite this regresses and is refused...
+    assert store.publish(
+        github_id="a", name="s", transcript="t1\n", manifest=_manifest("s", session_id="id", updated=2)
+    ).behind
+    # ...with overwrite it is accepted and replaces the longer copy wholesale.
+    result = store.publish(
+        github_id="a", name="s", transcript="t1\n", manifest=_manifest("s", session_id="id", updated=3), overwrite=True
+    )
+    assert result.behind is False
+    assert store.read_transcript(store.entries()[0]) == "t1\n"
+
+
+def test_publish_overwrite_does_not_fold_in_the_existing_turns(tmp_path):
+    # Overwrite must REPLACE, not union: a divergent mergeable copy is written exactly,
+    # so the shared copy's turns are dropped (that's the point — the user chose to reset
+    # it to this session), unlike a normal publish which would merge them in.
+    store = SharedSessionStore(_init_repo(tmp_path))
+    store.publish(
+        github_id="a",
+        name="s",
+        transcript=_row("u1") + "\n" + _row("u2") + "\n",
+        manifest=_manifest("s", session_id="id", updated=1),
+    )
+    only_first = _row("u1") + "\n"
+    store.publish(
+        github_id="a",
+        name="s",
+        transcript=only_first,
+        manifest=_manifest("s", session_id="id", updated=2),
+        overwrite=True,
+    )
+    assert store.read_transcript(store.entries()[0]) == only_first
+
+
+def test_remote_publish_overwrite_replaces_newer_remote_copy(tmp_path):
+    # End-to-end through a bare remote: a behind machine that chooses overwrite syncs the
+    # remote, then force-replaces its newer copy with this one — the mirror image of the
+    # recency-guard test, where the same machine WITHOUT overwrite is refused.
+    import subprocess as sp
+
+    remote = tmp_path / "remote.git"
+    sp.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+    (tmp_path / "src").mkdir()
+    src = _init_repo(tmp_path / "src")
+    branch = src.current_branch()
+    sp.run(["git", "remote", "add", "origin", str(remote)], cwd=src.repo, check=True)
+    sp.run(["git", "push", "-q", "origin", f"HEAD:refs/heads/{branch}"], cwd=src.repo, check=True)
+    sp.run(["git", "-C", str(remote), "symbolic-ref", "HEAD", f"refs/heads/{branch}"], check=True)
+    store = SharedSessionStore(src)
+
+    assert store.publish(
+        github_id="a", name="s", transcript="t1\nt2\nt3\n", manifest=_manifest("s", session_id="id", updated=1)
+    ).pushed
+    # Behind without overwrite (refused, remote intact)...
+    assert store.publish(
+        github_id="a", name="s", transcript="t1\n", manifest=_manifest("s", session_id="id", updated=2)
+    ).behind
+    # ...accepted and pushed with overwrite.
+    overwritten = store.publish(
+        github_id="a", name="s", transcript="t1\n", manifest=_manifest("s", session_id="id", updated=3), overwrite=True
+    )
+    assert overwritten.pushed is True and overwritten.behind is False
+    sp.run(["git", "clone", "-q", str(remote), str(tmp_path / "clone")], check=True)
+    clone_store = SharedSessionStore(GitRepo(tmp_path / "clone"))
+    assert clone_store.fetch()
+    assert clone_store.read_transcript(clone_store.entries()[0]) == "t1\n"  # remote replaced
+
+
 def test_publish_allows_a_longer_transcript(tmp_path):
     # The normal append case: more rows than the shared copy is accepted (and a new
     # first share, with no existing entry, is never blocked).
@@ -1509,6 +1585,69 @@ def test_runner_share_session_publishes_and_redacts(tmp_path, monkeypatch):
     assert any(
         "Saved shared session" in n[0] or "Shared" in n[0] for n in runner._session_notices.values()
     )  # result notice
+
+
+def test_share_behind_offers_overwrite_and_reshares(tmp_path, monkeypatch):
+    # When the shared copy already has newer changes, the push is refused (behind). The
+    # user is then asked, and choosing overwrite re-shares with overwrite=True.
+    from agitrack.sessions import PublishResult
+
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend(transcript="my session"))
+    calls: list[dict] = []
+
+    class FakeStore:
+        def publish(self, **kw):
+            calls.append(kw)
+            if kw.get("overwrite"):
+                return PublishResult(remote=True, pushed=True)
+            return PublishResult(remote=True, pushed=False, behind=True)  # the shared copy is newer
+
+    runner._shared_store = lambda: FakeStore()
+
+    runner._share_session()  # consent + keep-updated popups answered with options[0]
+    _drain_background_share_ops(runner)  # first publish → behind → conflict stashed
+    assert runner._pending_share_conflicts, "a behind share queues a conflict to resolve"
+
+    # The overwrite prompt's first option is "Overwrite…", so the default popup picks it.
+    runner._service_share_conflicts()
+    _drain_background_share_ops(runner)  # the overwrite publish
+
+    assert len(calls) == 2
+    assert not calls[0].get("overwrite")  # the initial share doesn't force
+    assert calls[1]["overwrite"] is True  # the resolution does
+    assert not runner._pending_share_conflicts
+    assert any("Overwrote the shared copy" in n[0] for n in runner._session_notices.values())
+
+
+def test_share_behind_cancel_leaves_shared_copy_untouched(tmp_path, monkeypatch):
+    from agitrack.sessions import PublishResult
+
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend(transcript="my session"))
+    calls: list[dict] = []
+
+    class FakeStore:
+        def publish(self, **kw):
+            calls.append(kw)
+            return PublishResult(remote=True, pushed=False, behind=True)
+
+    runner._shared_store = lambda: FakeStore()
+
+    # Answer the conflict prompt by keeping the newer shared copy; other popups (consent,
+    # keep-updated) still take their first option.
+    def popup(title, options):
+        if "already has newer changes" in title:
+            return options[-1]  # "Keep the newer shared copy (cancel)"
+        return options[0]
+
+    runner._select_popup = popup
+
+    runner._share_session()
+    _drain_background_share_ops(runner)
+    runner._service_share_conflicts()
+    _drain_background_share_ops(runner)
+
+    assert len(calls) == 1  # only the refused initial attempt — no overwrite was issued
+    assert any("left the newer shared copy as is" in m for m in runner.messages)
 
 
 def test_share_confirms_every_time_even_after_acknowledged(tmp_path, monkeypatch):
