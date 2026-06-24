@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -53,13 +54,15 @@ def main(argv: list[str] | None = None) -> int:
         "--dashboard",
         nargs="?",
         const="html",
-        choices=["text", "html"],
+        choices=["text", "html", "stop", "status"],
         default=None,
         help="show repository metrics computed from aGiTrack commit metadata "
         "(coverage, AI / human / non-tracked line changes, tokens, per-backend/"
-        "model/committer breakdowns, loop detection). Bare or `html` serves a "
-        "filterable, auto-refreshing dashboard on localhost and opens it in the "
-        "browser (Ctrl-C to stop); `text` prints a one-shot report and exits",
+        "model/committer breakdowns, loop detection). Bare or `html` starts a "
+        "filterable, auto-refreshing dashboard as a background daemon on localhost, "
+        "opens it in the browser, and returns to the shell; the daemon stops when "
+        "this terminal closes or via `-d stop`. `status` reports it; `text` prints a "
+        "one-shot report and exits",
     )
     parser.add_argument(
         "--backend",
@@ -156,6 +159,25 @@ def main(argv: list[str] | None = None) -> int:
         # acknowledged it this session — and not meant for manual use.
         help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--dashboard-serve",
+        action="store_true",
+        # Internal: run the metrics dashboard HTTP server in the foreground (this
+        # process). `agitrack -d` and the TUI's Ctrl-G dashboard spawn aGiTrack with this
+        # flag to host the dashboard in a separate, lifecycle-bound child process (#110).
+        # Not meant for manual use.
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--dashboard-owner-pid",
+        type=int,
+        default=None,
+        # Internal: pid the --dashboard-serve child watches (the launching shell for
+        # `agitrack -d`, the TUI for the Ctrl-G dashboard). The child shuts itself down
+        # when that pid dies, so the dashboard never outlives whatever launched it —
+        # even on SIGKILL, which leaves no chance to stop us first.
+        help=argparse.SUPPRESS,
+    )
     parser.epilog = (
         "Unrecognized arguments are forwarded verbatim to the backend CLI "
         "(claude / opencode), e.g. `agitrack --backend opencode --port 12345`. Use "
@@ -187,23 +209,57 @@ def main(argv: list[str] | None = None) -> int:
         print(__version__)
         return 0
 
+    if args.dashboard_serve:
+        # Internal entry point: the detached dashboard child process. `agitrack -d`
+        # (and the TUI's Ctrl-G dashboard) spawn this to run the read-only HTTP server
+        # out-of-process (#110); it shuts down when its owner pid dies. No privacy
+        # prompt / update check (read-only).
+        try:
+            serve_repo = GitRepo.discover(Path(args.repo).expanduser())
+        except (GitError, OSError) as error:
+            print(error)
+            return 1
+        from agitrack.metrics.daemon import EMAIL_LOGINS_ENV, run_dashboard_daemon
+
+        email_logins: dict[str, str] = {}
+        raw_logins = os.environ.get(EMAIL_LOGINS_ENV)
+        if raw_logins:
+            try:
+                parsed = json.loads(raw_logins)
+                if isinstance(parsed, dict):
+                    email_logins = {str(k): str(v) for k, v in parsed.items()}
+            except json.JSONDecodeError:
+                pass
+        return run_dashboard_daemon(serve_repo, owner_pid=args.dashboard_owner_pid, email_logins=email_logins)
+
     if args.dashboard:
         # Read-only: nothing is logged or committed, so no privacy
         # acknowledgment and no repo initialization offer.
         try:
             dashboard_repo = GitRepo.discover(Path(args.repo).expanduser())
-            if args.dashboard == "text":
-                from agitrack.metrics import render_dashboard
-
-                print(render_dashboard(dashboard_repo))
-                return 0
-            from agitrack.metrics import serve_dashboard
-
-            return serve_dashboard(dashboard_repo)
         except (GitError, OSError) as error:
             # OSError: --repo points at a directory that does not exist.
             print(error)
             return 1
+        if args.dashboard == "text":
+            from agitrack.metrics import render_dashboard
+
+            print(render_dashboard(dashboard_repo))
+            return 0
+        if args.dashboard == "stop":
+            from agitrack.metrics import stop_dashboard_daemon
+
+            return stop_dashboard_daemon(dashboard_repo)
+        if args.dashboard == "status":
+            from agitrack.metrics import dashboard_daemon_status
+
+            return dashboard_daemon_status(dashboard_repo)
+        # Bare `-d` / `-d html`: start the live dashboard as a background daemon owned
+        # by the launching shell, so the terminal is freed and the daemon dies when
+        # that shell/terminal closes (#110).
+        from agitrack.metrics import start_dashboard_daemon
+
+        return start_dashboard_daemon(dashboard_repo, owner_pid=os.getppid())
 
     if args.recover:
         # Headless finalization of work left by a session that exited abruptly.
