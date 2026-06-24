@@ -1055,13 +1055,15 @@ class ProxyRunner:
         self._apply_new_session_if_requested()
         self._sanitize_state_trace()
         self._initialize_session_baseline()
-        # Stage the resume BEFORE the startup spawn so a previous session whose backend-recorded
-        # working directory has since moved (e.g. the repo was renamed, or it last ran in a
-        # now-gone worktree) resumes in THIS session's directory — not its stale old path. The
-        # multi-session paths stage via _new_session; the initial session spawns directly here,
-        # so without this its resume keeps the old cwd (OpenCode especially, which restores the
-        # session's recorded directory and ignores the launch path).
-        if self._should_continue_session():
+        # Stage the resume (retarget the backend's recorded working dir to THIS directory) BEFORE
+        # the startup spawn. Crucially this is NOT gated on _should_continue_session: that gate
+        # asks "does this session belong to this repo?" using the backend's recorded directory —
+        # which is exactly what has gone stale (the repo was renamed, or worktrees were turned off
+        # so the session that last ran in a now-removed worktree must move to the base repo). So
+        # without retargeting first, our own recorded session is mistaken for a stranger and a
+        # FRESH one starts in the wrong/old dir. Staging only ever moves OUR recorded session id
+        # (set for this repo), so it's safe; after it, _spawn's gate sees the dir match and resumes.
+        if self.state.backend_session_id and not self._force_new_session:
             self._stage_backend_resume(self.state.backend_session_id)
         self._init_screen()
         self._spawn()
@@ -2331,10 +2333,22 @@ class ProxyRunner:
         if not self._use_worktrees:
             # #9: opt-out — run on the current branch directly (worktree stays
             # None; all the `worktree is None` paths commit straight to it).
+            # Worktrees are off, so any session worktrees left by a previous worktree-mode run
+            # are dead weight — remove them (their committed work was already integrated into
+            # the base branch). Best-effort; a removal failure must not block startup.
+            removed = 0
+            try:
+                manager = self._worktrees()
+                for info in manager.list():
+                    manager.remove(info.name)
+                    removed += 1
+            except Exception as error:
+                self._debug(f"no-worktree cleanup failed: {error!r}")
+            note = f" Removed {removed} leftover worktree(s)." if removed else ""
             self._set_message(
                 "Running without a worktree: the agent edits this branch directly (visible live), "
                 "but there's no isolation or auto-integration. Extra sessions started this way share "
-                "this directory and edit the same files at once.",
+                "this directory and edit the same files at once." + note,
                 seconds=12.0,
             )
             return
