@@ -113,6 +113,21 @@ _MODIFY_OTHER_KEYS_RE = re.compile(rb"\x1b\[27;(\d+);(\d+)~")
 # the `|$`): newlines inside it are pasted CONTENT, not prompt submissions.
 _BRACKETED_PASTE_RE = re.compile(rb"\x1b\[200~.*?(?:\x1b\[201~|$)", re.S)
 
+# String-level escape stripper for captured subprocess output (e.g. a backend updater's
+# spinner) so it reduces to readable lines for a status message: drop CSI/OSC sequences and
+# lone ESC pairs, and turn carriage-returns (used to redraw a spinner in place) into newlines
+# so each frame is its own line and the last meaningful one survives.
+_ANSI_CSI_OSC_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_CSI_OSC_RE.sub("", text).replace("\r", "\n")
+
+
+# Sentinel: the summarizer-model picker was dismissed (Esc), distinct from a real None choice
+# ("same as the session model"). Lets _choose_summarizer_model report "no change" unambiguously.
+_NO_MODEL_PICK = object()
+
 
 def _shared_transcript_rows(transcript: str) -> int:
     # Recorded in the share manifest so the resume menu can tell at a glance whether
@@ -219,7 +234,6 @@ class ProxyInput:
     COMMANDS = [
         "sessions",
         "agent-backend",
-        "summarizer",
         "git-unstaged",
         "git-user-commit",
         "dashboard",
@@ -462,6 +476,13 @@ class ProxyRunner:
         self._exit_resume_worktree: str | None = None  # session active at exit → auto-resumes next start
         self.worktree: WorktreeInfo | None = None  # set when this session runs in a git worktree
         self.global_config = _global_config if _global_config is not None else GlobalConfig()
+        # Load THIS repo's .agitrack/config.json overlay so repo-scoped settings are both READ
+        # and WRITABLE in the session. Without it `repo_path` is None and save_repo() silently
+        # drops every "this repository only" settings change (e.g. turning worktrees off), so
+        # the change never persists and reverts on the next launch. Uses the base repo path
+        # (this arg, before any worktree is created) so the overlay is the durable one.
+        if getattr(self.global_config, "repo_path", "set") is None:
+            self.global_config.load_repo_overlay(repo.repo)
         self._apply_timings(self.global_config.timings)
         self.state = (
             _state
@@ -612,6 +633,14 @@ class ProxyRunner:
         self._summary_pending: dict | None = None  # {"sha", "since"} while a summary is being computed
         self._precompact_thread: threading.Thread | None = None  # background pre-compaction summary worker
         self._precompact_result: dict | None = None
+        # Automatic backend self-update: when the agent's own updater is sandbox-blocked,
+        # aGiTrack runs it from its UNCONFINED proxy (not the sandboxed agent) on a background
+        # thread, plus the finished result the main loop surfaces. See _maybe_auto_update_backend.
+        self._backend_update_thread: threading.Thread | None = None
+        self._backend_update_result: dict | None = None
+        # Name of the backend we've already evaluated for an automatic self-update (when its own
+        # updater is sandbox-blocked). Switching to a different backend re-evaluates (once).
+        self._backend_update_checked_for: str | None = None
         self._base_poll_at = 0.0  # throttle for the base-HEAD poll
         self._warned_backend_session = False  # one-shot "use agit to start sessions" notice
         # Auto-share (issue #55): for sessions the user opted to keep shared, the
@@ -633,6 +662,7 @@ class ProxyRunner:
         # Worktree files we've already offered to copy into the base repo, keyed by
         # repo-relative path → content fingerprint, so a file the user accepted/left in
         # place is re-offered only once its content changes again (per-run, in-memory).
+        self._worktree_sessions_cache: tuple[float, list] | None = None  # memoizes _worktree_sessions
         self._copy_prompted: dict[str, tuple[int, int]] = {}
         # Repo-relative paths the user declined to copy: muted so the SAME set isn't
         # re-asked even as its contents change. A genuinely new path un-mutes the whole
@@ -885,8 +915,12 @@ class ProxyRunner:
                 "_warned_backend_session": False,
                 "_auto_share_hash": {},
                 "_auto_share_thread": None,
+                "_backend_update_thread": None,
+                "_backend_update_result": None,
+                "_backend_update_checked_for": None,
                 "_sessions_with_activity": set(),
                 "_cancel_prompted": set(),
+                "_worktree_sessions_cache": None,
                 "_copy_prompted": {},
                 "_copy_declined": set(),
                 "_pending_copy_offer": None,
@@ -1023,6 +1057,16 @@ class ProxyRunner:
         self._apply_new_session_if_requested()
         self._sanitize_state_trace()
         self._initialize_session_baseline()
+        # Stage the resume (retarget the backend's recorded working dir to THIS directory) BEFORE
+        # the startup spawn. Crucially this is NOT gated on _should_continue_session: that gate
+        # asks "does this session belong to this repo?" using the backend's recorded directory —
+        # which is exactly what has gone stale (the repo was renamed, or worktrees were turned off
+        # so the session that last ran in a now-removed worktree must move to the base repo). So
+        # without retargeting first, our own recorded session is mistaken for a stranger and a
+        # FRESH one starts in the wrong/old dir. Staging only ever moves OUR recorded session id
+        # (set for this repo), so it's safe; after it, _spawn's gate sees the dir match and resumes.
+        if self.state.backend_session_id and not self._force_new_session:
+            self._stage_backend_resume(self.state.backend_session_id)
         self._init_screen()
         self._spawn()
         self._start_file_watcher()
@@ -1063,7 +1107,7 @@ class ProxyRunner:
             signal.signal(signal.SIGTERM, self._handle_exit_signal)
             signal.signal(signal.SIGHUP, self._handle_exit_signal)
             self._setup_worktree_confinement_notice()
-            exit_code = self._loop()
+            exit_code = self._loop()  # the timers phase auto-applies a sandbox-blocked backend update
         finally:
             if self.original_sigwinch is not None:
                 signal.signal(signal.SIGWINCH, self.original_sigwinch)
@@ -1155,7 +1199,7 @@ class ProxyRunner:
         # construction, sandbox wrapping) stays here in the runner. The session
         # owns its BackendProcess; child_pid / master_fd remain readable on the
         # runner via the Session-delegating compat properties.
-        self.active.process = BackendProcess.spawn(command, str(self.repo.repo))
+        self.active.process = BackendProcess.spawn(command, str(self.repo.repo), extra_env=self._backend_child_env())
         # Re-arm the cwd-drift check for this launch, and remember when it started:
         # only turns recorded at/after this time count, so a stale cwd left in the
         # transcript before this launch can't trigger a false drift warning (#72).
@@ -1818,6 +1862,23 @@ class ProxyRunner:
         self._pending_restart = True
         self.running = False
 
+    def _restart_now(self, message: str) -> None:
+        """Finish pending work and re-exec aGiTrack (the same teardown a self-update uses) so
+        launch-time settings — worktrees on/off, the default backend, timings — take effect.
+        run()'s teardown sees _pending_restart and performs the re-exec after restoring the
+        terminal and releasing the lock."""
+        self._set_message("Finishing commits, then restarting aGiTrack…", seconds=30.0)
+        self._render()
+        try:
+            self._finalize_pending_work()
+        except Exception as error:  # don't let a commit hiccup strand the restart
+            self._debug(f"finalize before settings restart failed: {error!r}")
+        self._set_message(message, seconds=10.0)
+        self._render()
+        self._exit_child()
+        self._pending_restart = True
+        self.running = False
+
     def _handle_update_command(self) -> None:
         # Ctrl-G → "update": show the current update status and let the user opt
         # in (applied once sessions finish), postpone, or stop update checks.
@@ -1877,6 +1938,136 @@ class ProxyRunner:
                 seconds=8.0,
             )
             self._render()
+
+    def _backend_update_command(self) -> list[str] | None:
+        getter = getattr(self.backend, "update_command", None)
+        if not callable(getter):
+            return None
+        try:
+            cmd = getter()
+        except Exception as error:
+            self._debug(f"backend update_command failed: {error!r}")
+            return None
+        return list(cmd) if cmd else None
+
+    def _backend_update_via_agitrack(self) -> bool:
+        """Whether aGiTrack should drive this backend's update itself (from its UNCONFINED proxy)
+        rather than leaving it to the backend's own updater. True for a Homebrew-managed CLI on
+        macOS — independent of the sandbox toggle:
+          - sandboxed: the backend's own `brew upgrade` can't run at all (macOS forbids nesting
+            `sandbox-exec`), so aGiTrack MUST do it;
+          - unsandboxed: it *would* work, but the backend only nags with a prompt (and OpenCode's,
+            run interactively, has been failing for users), so aGiTrack does it silently instead.
+        (npm/native installs self-update cleanly; aGiTrack leaves those to the backend.)"""
+        if sys.platform != "darwin":
+            return False
+        exe = shutil.which(self.backend.name)
+        if not exe:
+            return False
+        real = os.path.realpath(exe)
+        # Homebrew kegs resolve under …/Cellar/…; the prefix is /opt/homebrew (Apple Silicon)
+        # or /usr/local (Intel). Matching either covers both layouts.
+        return "/Cellar/" in real or real.startswith("/opt/homebrew/") or real.startswith("/usr/local/")
+
+    def _backend_child_env(self) -> dict[str, str] | None:
+        """Extra environment for the interactive backend child only. When aGiTrack will apply
+        this backend's update itself (it's a brew-managed backend on macOS and update checks are
+        on), disable OpenCode's in-app auto-update so the user isn't shown its prompt — which is
+        redundant with aGiTrack's silent update and, under the sandbox, fails outright. Does NOT
+        affect aGiTrack's own `opencode upgrade`, which runs from the unconfined proxy with the
+        normal environment."""
+        checks_on = self.global_config is None or getattr(self.global_config, "check_for_updates", True)
+        if getattr(self.backend, "name", None) == "opencode" and checks_on and self._backend_update_via_agitrack():
+            return {"OPENCODE_DISABLE_AUTOUPDATE": "1"}
+        return None
+
+    def _backend_version(self) -> str:
+        """The backend CLI's reported version string, used to detect whether an update actually
+        landed. Empty when it can't be read."""
+        try:
+            proc = subprocess.run([self.backend.name, "--version"], capture_output=True, text=True, timeout=20)
+        except Exception as error:
+            self._debug(f"backend version check failed: {error!r}")
+            return ""
+        return (proc.stdout or proc.stderr or "").strip()
+
+    def _maybe_auto_update_backend(self) -> None:
+        """Timers phase: when aGiTrack should drive this backend's update (a brew-managed CLI on
+        macOS — see _backend_update_via_agitrack), apply it AUTOMATICALLY from the UNCONFINED
+        proxy — no menu, no prompt, regardless of the sandbox toggle. Evaluated once per backend
+        (re-armed on a switch) and gated by the global update-check toggle. The updater itself
+        decides whether an upgrade is needed (it checks the backend's release server, not
+        Homebrew's possibly-stale local tap), so we don't pre-gate on `brew outdated`. Runs on a
+        background thread; the result is surfaced by _service_backend_update."""
+        name = getattr(self.backend, "name", None)
+        if name is None or self._backend_update_checked_for == name:
+            return
+        self._backend_update_checked_for = name  # evaluate each backend once (re-armed on switch)
+        if self.global_config is not None and not getattr(self.global_config, "check_for_updates", True):
+            return  # the user turned update checks off
+        if not self._backend_update_via_agitrack():
+            return  # the backend self-updates cleanly on its own; leave it to do so
+        if self._backend_update_thread is not None and self._backend_update_thread.is_alive():
+            return
+        cmd = self._backend_update_command()
+        if cmd is None:
+            return
+        thread = threading.Thread(
+            target=self._auto_update_backend_worker, args=(name, cmd), daemon=True, name="agit-backend-update"
+        )
+        self._backend_update_thread = thread
+        thread.start()
+
+    def _auto_update_backend_worker(self, name: str, cmd: list[str]) -> None:
+        # Background: run the backend's own updater UNCONFINED so a package-manager updater
+        # (notably Homebrew's own sandbox-exec) isn't nested inside the agent's macOS sandbox —
+        # the very nesting macOS forbids, which is what breaks the in-backend self-update. The
+        # updater no-ops fast when already current, so we don't pre-check; we compare the CLI
+        # version before and after to report only a real change (and to catch a silent failure).
+        before = self._backend_version()
+        self._set_message(
+            f"Checking {name} for updates in the background "
+            f"(applying any — its own updater can't, inside aGiTrack's sandbox)…",
+            seconds=600.0,
+            sticky=True,
+        )
+        self._render()
+        cwd = str(getattr(self.base_repo, "repo", None) or getattr(self.repo, "repo", "."))
+        result: dict = {"name": name, "before": before}
+        try:
+            proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=600)
+            result["code"] = proc.returncode
+            result["output"] = (proc.stdout or "") + (proc.stderr or "")
+        except Exception as error:
+            result["error"] = repr(error)
+        result["after"] = self._backend_version()
+        self._backend_update_result = result
+
+    def _service_backend_update(self) -> None:
+        """Main loop: surface a finished backend auto-update result (set by its worker thread)."""
+        result = self._backend_update_result
+        if result is None:
+            return
+        self._backend_update_result = None
+        name = result.get("name", "the agent")
+        if "error" in result:
+            self._set_message(f"Updating {name} failed: {result['error']}", seconds=12.0)
+            self._render()
+            return
+        before, after = result.get("before", ""), result.get("after", "")
+        output = _strip_ansi(result.get("output", ""))
+        lines = [line.strip() for line in output.splitlines() if line.strip()]
+        if after and before and after != before:
+            # The version actually changed — the update landed. (Authoritative, unlike the
+            # updater's exit code, which `opencode upgrade` reports as 0 even when it failed.)
+            self._set_message(f"{name} updated ({before} → {after}). Start a new session to use it.", seconds=12.0)
+        elif result.get("code") not in (0, None) or "fail" in output.lower() or "error" in output.lower():
+            flagged = [line for line in lines if "fail" in line.lower() or "error" in line.lower()]
+            detail = (flagged[-1] if flagged else (lines[-1] if lines else ""))[:200]
+            self._set_message(f"Updating {name} may have failed: {detail}", seconds=14.0)
+        else:
+            self._set_message(f"{name} is already up to date.", seconds=6.0)
+        self._render()
 
     def _confine_to_worktree(self, command: list[str]) -> list[str]:
         # Wrap the backend so it can only write inside its session worktree (plus
@@ -1970,7 +2161,13 @@ class ProxyRunner:
             self._set_message(f"Already using {name}.")
             self._render()
             return
-        self.global_config.default_backend = name
+        # Re-arm the automatic self-update check so it re-evaluates for the backend being
+        # switched to (a sandbox-blocked update is then applied on switch too).
+        self._backend_update_checked_for = None
+        # Remember the switch for THIS repo only (repo-scoped), not globally: switching to a
+        # backend in one repo (e.g. to try it) must not change the user's global default for
+        # every other repo. The repo overlay value drives this repo's backend on next launch.
+        self.global_config.set("default_backend", name, scope="repo")
         if self.worktree is None:
             # A non-worktree session has nothing to multiplex; restart the single
             # backend in place (legacy behaviour).
@@ -2138,10 +2335,22 @@ class ProxyRunner:
         if not self._use_worktrees:
             # #9: opt-out — run on the current branch directly (worktree stays
             # None; all the `worktree is None` paths commit straight to it).
+            # Worktrees are off, so any session worktrees left by a previous worktree-mode run
+            # are dead weight — remove them (their committed work was already integrated into
+            # the base branch). Best-effort; a removal failure must not block startup.
+            removed = 0
+            try:
+                manager = self._worktrees()
+                for info in manager.list():
+                    manager.remove(info.name)
+                    removed += 1
+            except Exception as error:
+                self._debug(f"no-worktree cleanup failed: {error!r}")
+            note = f" Removed {removed} leftover worktree(s)." if removed else ""
             self._set_message(
                 "Running without a worktree: the agent edits this branch directly (visible live), "
                 "but there's no isolation or auto-integration. Extra sessions started this way share "
-                "this directory and edit the same files at once.",
+                "this directory and edit the same files at once." + note,
                 seconds=12.0,
             )
             return
@@ -2815,10 +3024,12 @@ class ProxyRunner:
                 self._select_summarizer_model_popup()
             self._render()
 
-    def _select_summarizer_model_popup(self) -> None:
-        # List the current backend's models as a picker. For Claude the smallest
-        # (Haiku) tier is offered first as the default, since summarization is a cheap
-        # task. Backends whose models can't be listed fall back to free-text entry.
+    def _choose_summarizer_model(self) -> "str | None | object":
+        """Show the summarizer-model picker and RETURN the chosen model name, None for "same as
+        the session model", or ``_NO_MODEL_PICK`` if the user backed out. Does not persist — so
+        both the immediate popup and the settings menu's pending-save flow can reuse it. Lists
+        the current backend's models (smallest tier first as the cheap default); a backend whose
+        models can't be listed falls back to free-text entry."""
         from agitrack.summaries.model_select import list_available_models, smallest_model
 
         backend_name = self.state.backend
@@ -2837,20 +3048,21 @@ class ProxyRunner:
             label_for[clear_label] = None
             options.append(clear_label)
             choice = self._select_popup(f"Summarizer model (current: {current or 'same as session'})", options)
-            if choice is not None:
-                self._persist_summarizer_model(label_for.get(choice, choice))
-                self._set_message(f"Summarizer model: {self.global_config.summarization_model or '(same as session)'}")
-            self._render()
-            return
-        # No model list available (the backend's CLI couldn't be queried) — let the
-        # user type a model name, as before.
-        new_model = self._prompt_popup(
+            return _NO_MODEL_PICK if choice is None else label_for.get(choice, choice)
+        # No model list available (the backend's CLI couldn't be queried) — type a name.
+        raw = self._prompt_popup(
             "Summarizer Model",
             f"Current: {current or '(same as session)'}\nEnter model (empty to clear):",
             default=current or "",
         )
-        if new_model is not None:
-            self._persist_summarizer_model(new_model.strip() or None)
+        return _NO_MODEL_PICK if raw is None else (raw.strip() or None)
+
+    def _select_summarizer_model_popup(self) -> None:
+        # Pick a model and persist it immediately (the `:summarizer model` path). The settings
+        # menu instead stores the same choice as a pending edit (see _edit_one_setting).
+        chosen = self._choose_summarizer_model()
+        if chosen is not _NO_MODEL_PICK:
+            self._persist_summarizer_model(chosen if chosen is None else str(chosen))
             self._set_message(f"Summarizer model: {self.global_config.summarization_model or '(same as session)'}")
         self._render()
 
@@ -3126,12 +3338,26 @@ class ProxyRunner:
             self._render()
             return
         if self.repo.has_changes():
-            self._set_message(
-                "Finish or stop the current turn before integrating — the worktree has uncommitted changes.",
-                seconds=8.0,
-            )
-            self._render()
-            return
+            # Best effort: the user asked to merge, so don't dead-end them on uncommitted
+            # changes. Only a turn that is GENUINELY still running should block (its edits
+            # are mid-flight). Refresh the in-flight flag first (the git worker may not have
+            # run since the turn went quiet), then if a turn really is active, ask them to
+            # finish/stop it; otherwise commit the committable leftovers now and proceed.
+            self._clear_agent_in_flight_if_idle()
+            if self._agent_is_active():
+                self._set_message(
+                    "Finish or stop the current turn before integrating — a turn is still running.",
+                    seconds=8.0,
+                )
+                self._render()
+                return
+            if self._active_has_committable_changes():
+                self._set_message(f"Committing '{self.name}' changes before merging…", seconds=30)
+                self._render()
+                self._commit_latest_turn_sync()
+            # Anything still uncommitted now is non-committable (git-ignored or intentionally
+            # unstaged files) and can't enter the merge, but committed work still can —
+            # fall through and integrate that rather than refuse the whole merge.
         if not self._active_has_pending():
             self._set_message(f"'{self.name}' has nothing to integrate.")
             self._render()
@@ -3241,18 +3467,13 @@ class ProxyRunner:
 
     def _merge_active_into(self, target: str) -> None:
         """Integrate the active session's un-integrated work into ``target`` (re-pointing
-        the session's merge branch to it). Uncommitted committable changes are committed
-        first (so they aren't left behind), then integrated. Reuses
-        _integrate_active_session so a conflict surfaces the same resolve options."""
+        the session's merge branch to it). Reuses _integrate_active_session, which best-
+        effort commits any uncommitted committable changes first (so nothing is stranded)
+        and surfaces the same resolve options on a conflict."""
         if self.worktree is None or self._base_branch is None:
             self._set_message("This session has no worktree to merge.")
             self._render()
             return
-        if self._active_has_committable_changes():
-            # Commit the worktree's uncommitted work before merging so nothing is stranded.
-            self._set_message(f"Committing '{self.name}' changes before merging…", seconds=30)
-            self._render()
-            self._commit_latest_turn_sync()
         self._base_branch = target  # syncs the IntegrationService to the chosen destination
         self._integrate_active_session()
 
@@ -3324,6 +3545,7 @@ class ProxyRunner:
             self._render()
 
     RESUME_LIST_LIMIT = 20
+    _WORKTREE_SESSIONS_TTL = 10.0  # seconds to memoize the slow `opencode session list` enumeration
 
     def _worktree_sessions(self) -> list:
         # (worktree-name, SessionRef) for every conversation this backend recorded
@@ -3332,11 +3554,23 @@ class ProxyRunner:
         # or id). The worktree directory name IS the session's user-given name, so
         # this is how a named session — and its name — survives across runs even
         # after its worktree is gone.
+        #
+        # Briefly MEMOIZED: a single open of the resume menu calls this 3× (via
+        # _resumable_sessions and _agitrack_named_sessions), each a slow `opencode session
+        # list` subprocess — without the cache, entering the menu fired several of them back
+        # to back and the TUI hung for seconds. The short TTL covers one menu render while
+        # staying fresh enough that a just-created session still appears next time.
+        now = time.monotonic()
+        cached = self._worktree_sessions_cache
+        if cached is not None and now - cached[0] < self._WORKTREE_SESSIONS_TTL:
+            return cached[1]
         try:
-            return list(self.backend.list_worktree_sessions(self._worktrees().root))
+            result = list(self.backend.list_worktree_sessions(self._worktrees().root))
         except Exception as error:
             self._debug(f"list_worktree_sessions failed: {error!r}")
-            return []
+            result = []
+        self._worktree_sessions_cache = (time.monotonic(), result)
+        return result
 
     def _resumable_sessions(self) -> list:
         # Past conversations to offer for resume: those the backend recorded in
@@ -3431,10 +3665,23 @@ class ProxyRunner:
                 self._switch_active(index)
                 return
         if self._live_session_name_taken(name):
-            # The chosen name is occupied by a different live session — resume
-            # under a fresh name so the two don't share a worktree (which would
-            # run two backends in one directory).
-            name = self._next_session_name()
+            # The name is occupied by a different LIVE session. Two live sessions can't share a
+            # name — a session and its git worktree are 1:1, so they'd share a worktree and run
+            # two backends in one directory. Don't silently rename: ASK the user, explaining
+            # why, and offer a random word they can keep or change (Esc cancels the resume).
+            chosen = self._prompt_session_name(
+                f"A session named '{name}' is already open, so this resumed conversation needs a "
+                f"different name (two live sessions can't share a worktree). New name:",
+                default=self._next_session_name(),
+            )
+            if chosen is None:
+                return  # user cancelled — leave the active session as-is
+            name = chosen
+        # Resuming relocates and re-spawns the backend (OpenCode in --no-worktree mode also
+        # exports+imports the session to retarget its directory) — a few seconds. Paint a
+        # notice first so the screen shows progress instead of looking frozen.
+        self._set_message(f"Resuming '{name}'…")
+        self._render()
         self._new_session(name, resume_session_id=session_id, backend=backend)
 
     def _live_session_name_taken(self, name: str) -> bool:
@@ -5793,6 +6040,8 @@ class ProxyRunner:
             # restart; stop before any further servicing.
             return
         self._service_background_share_ops()  # surface finished background unshare/etc. results
+        self._service_backend_update()  # surface a finished backend auto-update result
+        self._maybe_auto_update_backend()  # auto-apply a brew-managed backend update; once per backend
         self._service_session_notices()  # expire/refresh per-session status lines
         self._git_wake.set()  # nudge the worker so its pass tracks the reactor's cadence
 
@@ -6429,9 +6678,6 @@ class ProxyRunner:
         elif name == "sessions":
             self._after_menu_command(self._handle_session_command(arg))
             return
-        elif name == "summarizer":
-            self._after_menu_command(self._handle_summarizer_command(arg))
-            return
         elif name == "settings":
             self._after_menu_command(self._settings_menu())
             return
@@ -6484,11 +6730,17 @@ class ProxyRunner:
         return "repo" if pick.startswith("This repository") else "global"
 
     def _settings_specs(self) -> list[dict]:
-        """Declarative registry of the user-editable config options shown in the
-        settings menu. Labels are written to be self-explanatory. ``kind`` drives the
-        editor; ``restart`` marks settings resolved at launch (so a change applies to new
-        sessions / the next launch). Effective values are read from ``global_config``
-        (repo overlay > global > built-in default)."""
+        """Declarative registry of the user-editable config options shown in the settings
+        menu. Labels are self-explanatory and the ORDER groups related settings (backend →
+        session isolation → agent behavior → commit summaries → aGiTrack itself). ``kind``
+        drives the editor; ``restart`` marks settings resolved at launch (so a change applies
+        to new sessions / the next launch). Effective values are read from ``global_config``
+        (repo overlay > global > built-in default).
+
+        Note the two distinct "worktree" settings, kept adjacent and worded so they aren't
+        confused: ``use_worktrees`` decides WHETHER each session gets its own worktree, while
+        ``sandbox`` only CONFINES the agent's writes to that worktree (and is moot when
+        worktrees are off)."""
         return [
             {
                 "key": "default_backend",
@@ -6497,32 +6749,36 @@ class ProxyRunner:
                 "options": ["claude", "opencode"],
                 "restart": True,
             },
+            # --- session isolation: the worktree toggle, then the sandbox that depends on it ---
+            {
+                "key": "use_worktrees",
+                "label": "Isolate each session in its own git worktree (off: edit the current branch directly)",
+                "kind": "bool",
+                "restart": True,
+            },
             {
                 "key": "sandbox",
-                "label": "Confine the agent's file writes to its session worktree",
+                "label": "Sandbox: block the agent from writing outside its worktree (no effect when worktrees are off)",
                 "kind": "bool",
                 "restart": True,
             },
             {
                 "key": "allowed_edit_paths",
-                "label": "Extra folders/files the agent may write to (besides its worktree)",
+                "label": "Folders/files the agent may write to outside its worktree (sandbox carve-out)",
                 "kind": "paths",
                 "restart": True,
             },
-            {
-                "key": "use_worktrees",
-                "label": "Run each session in its own isolated git worktree",
-                "kind": "bool",
-                "restart": True,
-            },
+            # --- agent behavior ---
             {
                 "key": "commit_guidance",
                 "label": "Ask the agent not to make its own git commits (aGiTrack commits each turn)",
                 "kind": "bool",
                 "restart": True,
             },
+            # --- commit summaries ---
             {"key": "summarization_enabled", "label": "Write an AI summary for each commit", "kind": "bool"},
-            {"key": "summarization_model", "label": "Model used to write commit summaries", "kind": "text"},
+            {"key": "summarization_model", "label": "Model used to write commit summaries", "kind": "model"},
+            # --- aGiTrack itself ---
             {"key": "check_for_updates", "label": "Automatically check for aGiTrack updates", "kind": "bool"},
             {
                 "key": "menu_key",
@@ -6598,6 +6854,11 @@ class ProxyRunner:
                 if pick is None or pick.startswith("←"):
                     return
                 value = pick
+            elif kind == "model":
+                chosen = self._choose_summarizer_model()  # picker (smallest tier first) or free-text
+                if chosen is _NO_MODEL_PICK:
+                    return
+                value = chosen
             elif kind == "paths":
                 current = self._pending_paths(key)
                 raw = self._prompt_popup(
@@ -6711,12 +6972,24 @@ class ProxyRunner:
             needs_restart = True  # timings are read at launch
         self._settings_pending = {}
         self._settings_pending_timings = {}
-        note = (
-            " Some changes won't take effect until you restart aGiTrack yourself (it won't restart on its own)."
-            if needs_restart
-            else ""
-        )
-        self._set_message(f"Saved {n} settings change(s).{note}", seconds=10.0)
+        if needs_restart:
+            # These settings are read only at launch (worktrees on/off, default backend,
+            # timings), so they don't apply to the running session — offer to restart now
+            # rather than silently leaving them inert until the next manual launch.
+            pick = self._select_popup(
+                f"Saved {n} change(s). Some take effect only after a restart. Restart aGiTrack now?",
+                ["Yes, restart now", "Not now"],
+            )
+            if pick == "Yes, restart now":
+                self._restart_now("Restarting aGiTrack to apply the new settings…")
+            else:
+                self._set_message(
+                    f"Saved {n} settings change(s). The restart-only ones apply next time you start aGiTrack.",
+                    seconds=10.0,
+                )
+                self._render()
+            return "saved"
+        self._set_message(f"Saved {n} settings change(s).", seconds=8.0)
         self._render()
         return "saved"
 
@@ -7722,9 +7995,16 @@ class ProxyRunner:
         if info.name == (self._exit_resume_worktree or self._primary_worktree_name):
             self._persist_last_session_record()
         try:
-            if self.merge_ctx or self.repo.merge_in_progress() or self.repo.has_changes():
-                self._debug(f"keeping worktree '{info.name}' on exit: merge or uncommitted changes pending")
+            if self.merge_ctx or self.repo.merge_in_progress():
+                self._debug(f"keeping worktree '{info.name}' on exit: a merge is in progress")
                 return
+            # Uncommitted leftover FILES (untracked / git-ignored / files the user declined
+            # to stage) do NOT by themselves keep the worktree — they are exactly what the
+            # copy offer below handles, and a copy leaves the source in place, so refusing
+            # removal here is what left dirty worktrees stranded forever ("open end"). They
+            # only force us to keep the worktree on a *signal* teardown, where there's no UI
+            # to offer the copy and silently deleting the files would lose the user's work.
+            has_leftover_files = self.repo.has_changes()
             branch = self.repo.current_branch()
             if is_managed_branch(branch):
                 # Only drop the worktree if we can CONFIRM its branch is fully
@@ -7749,6 +8029,13 @@ class ProxyRunner:
             self._offer_copy_unstaged_to_base(context="exit")
             if self._exit_aborted:
                 return  # Esc on the copy offer: keep this worktree + files, abort the exit
+        elif has_leftover_files:
+            # Signal teardown with leftover files and no UI to rescue them: keep the
+            # worktree so the next startup can surface the files rather than discarding
+            # them. (An interactive exit just gave the user the copy offer above, so by
+            # here those files were handled and the worktree is safe to remove forcibly.)
+            self._debug(f"keeping worktree '{info.name}' on signal exit: leftover files, no UI to copy them out")
+            return
         # Remember this session's conversation under its backend so switching back
         # to that backend (this run or a later one) resumes it.
         self._remember_session_for_backend()

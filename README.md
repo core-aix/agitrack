@@ -86,7 +86,6 @@ In proxy mode (default), press `Ctrl-G` to open aGiTrack's menu, then pick a com
 ```text
 sessions                  switch / start (own worktree) / stop a live session
 agent-backend             switch backend (opencode|claude); shows a picker
-summarizer                toggle summarization on/off, set model, show status
 git-unstaged              show intentionally unstaged files
 git-user-commit           create a user commit
 dashboard                 serve the metrics dashboard and open it in the browser
@@ -230,7 +229,7 @@ git notes --ref agitrack/session-summary show <commit>
 
 Summarization never blocks the session: commits are created immediately with a prompt-based subject, the summary is computed on a background worker (the status line shows "aGiTrack is summarizing commit ..."), and the commit message is then amended in place. The amend only happens while it is safe — the commit is still the latest, unintegrated, and nothing new is staged; integration waits for the summary up to `summary_wait_seconds` and then proceeds, in which case the summary is recorded in git notes only. The metadata records the summarization cost next to the session's own usage (`summary_model`, `summary_tokens_input`, `summary_tokens_output`, and `summary_tokens_cache_read` when the summary prompt was served from cache). `summary_tokens_input` follows the same convention as the session's own `input` — fresh input including cache-creation tokens (see the token-accounting note below) — so a cache-served summary reports the real input it processed rather than just the tiny uncached remainder.
 
-The status bar shows whether summarization is active (`sum:on` / `sum:off`). Use the `summarizer` command (`Ctrl-G`, then `summarizer`, or `:summarizer` in JSON mode) to toggle it (`summarizer on|off`), set the summarization model (`summarizer model`), or show the current status. Both the on/off toggle and the model are saved to the **global** config (`~/.agitrack/config.json`), so they persist across restarts (a per-session worktree is transient and removed on exit, so a setting written only there would reset on the next launch).
+The status bar shows whether summarization is active (`sum:on` / `sum:off`). Toggle it and choose the summarization model under `Ctrl-G` → `settings` (the *"Write an AI summary for each commit"* and *"Model used to write commit summaries"* options); in JSON mode the `:summarizer [on|off|model|status]` command does the same. Both the on/off toggle and the model are saved to the **global** config (`~/.agitrack/config.json`), so they persist across restarts (a per-session worktree is transient and removed on exit, so a setting written only there would reset on the next launch).
 
 
 ### Commit Behavior

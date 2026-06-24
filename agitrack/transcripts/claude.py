@@ -49,6 +49,14 @@ _COMMAND_TAGS = (
     "<task-notification>",
 )
 
+# A typed slash command is recorded as a synthetic user row carrying a
+# <command-name>/foo</command-name> artifact (see `_slash_command_name`). For
+# commands that DO real work — most importantly /init, which writes CLAUDE.md —
+# Claude Code then injects the command's expanded instructions as a separate
+# `isMeta` user row, and the assistant's file-changing work follows. Capturing
+# the command lets that expansion open a real turn so its work is committed.
+_COMMAND_NAME_RE = re.compile(r"<command-name>\s*(/[^<]*?)\s*</command-name>")
+
 
 def _projects_root() -> Path:
     config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
@@ -565,6 +573,10 @@ def parse_rows(
     # NEXT turn — the one whose context it shrank. A compaction with no following turn
     # influenced no work and is left unrecorded.
     pending_compactions = 0
+    # The slash command (e.g. "/init") whose invocation row we just saw, awaiting its
+    # expanded-instructions row to open a turn. Cleared once a turn opens (from the
+    # expansion or the next real prompt). See `_slash_command_name`.
+    pending_command: str | None = None
 
     def flush(*, dangling: bool = False) -> None:
         nonlocal current
@@ -591,9 +603,24 @@ def parse_rows(
                 # prompt, but a token-affecting event. Tally it for the next turn.
                 pending_compactions += 1
                 continue
+            command = _slash_command_name(row)
+            if command is not None:
+                # A typed slash command invocation. Remember it: a command that does
+                # real work (e.g. /init) injects its expanded instructions as the next
+                # isMeta user row, which then opens the turn. Commands with no expansion
+                # (/model, /clear) leave this set but harmlessly unused.
+                pending_command = command
+                continue
             prompt = _user_prompt(row)
             if prompt is None:
-                continue
+                # The expanded instructions of a slash command arrive as an isMeta user
+                # row. Right after a command invocation this row drives the turn (e.g.
+                # /init writing CLAUDE.md), so open a turn labelled with the command;
+                # otherwise meta rows stay excluded as before.
+                if pending_command is None or _command_expansion_text(row) is None:
+                    continue
+                prompt = pending_command
+            pending_command = None
             flush()
             current = {
                 "user_id": str(row.get("uuid") or ""),
@@ -788,6 +815,52 @@ def _user_prompt(row: dict) -> str | None:
     else:
         return None
     if not text or text.startswith(_COMMAND_TAGS) or text.startswith(_INTERRUPT_MARKER):
+        return None
+    return text
+
+
+def _slash_command_name(row: dict) -> str | None:
+    """The slash command a user row invokes (e.g. ``/init``), or None.
+
+    Claude Code records a typed slash command as a synthetic user row carrying a
+    ``<command-name>`` artifact rather than a normal prompt, so `_user_prompt`
+    rightly drops it. We surface the command name separately so that — for a
+    command whose expansion drives real work — the following expansion row can
+    open a turn attributed to the command (see `parse_rows`)."""
+    message = _as_dict(row.get("message"))
+    content = message.get("content")
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        text = "".join(
+            block.get("text", "") for block in content if isinstance(block, dict) and block.get("type") == "text"
+        )
+    else:
+        return None
+    match = _COMMAND_NAME_RE.search(text)
+    return match.group(1) if match else None
+
+
+def _command_expansion_text(row: dict) -> str | None:
+    """The expanded instructions a slash command injects, or None.
+
+    Commands like ``/init`` substitute their body as a following ``isMeta`` user
+    row (e.g. "analyze this codebase and create a CLAUDE.md"). Meta rows are not
+    normally prompts, but right after a command invocation this row IS the turn's
+    driver, so `parse_rows` opens a turn for it. Returns the row's prompt text
+    when it is a meta row carrying real text (not another command artifact)."""
+    if not row.get("isMeta"):
+        return None
+    message = _as_dict(row.get("message"))
+    content = message.get("content")
+    if isinstance(content, str):
+        text = content.strip()
+    elif isinstance(content, list):
+        parts = [block.get("text", "") for block in content if isinstance(block, dict) and block.get("type") == "text"]
+        text = "".join(parts).strip()
+    else:
+        return None
+    if not text or text.startswith(_COMMAND_TAGS):
         return None
     return text
 

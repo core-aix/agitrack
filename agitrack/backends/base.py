@@ -73,6 +73,14 @@ class AgentBackend(Protocol):
         commit_guidance: bool = True,
     ) -> AgentResult: ...
 
+    def update_command(self) -> list[str] | None:
+        """The command that updates this backend CLI in place (e.g. ``["opencode", "upgrade"]``),
+        or None if it has no self-update. aGiTrack runs this from its UNCONFINED proxy, NOT the
+        worktree-sandboxed agent: a package-manager updater (notably Homebrew's own
+        ``sandbox-exec``) cannot run nested inside the agent's macOS sandbox — that nesting is
+        what breaks the backend's in-app self-update."""
+        ...
+
     # ``commit_guidance``: on a non-bare coding run, append the note telling the agent that
     # aGiTrack auto-commits (so it doesn't self-commit), where the backend supports it.
     # Disabled per-run by --no-commit-guidance. Ignored on a bare (summarizer) run.

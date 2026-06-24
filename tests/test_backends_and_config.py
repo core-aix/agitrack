@@ -314,6 +314,20 @@ def test_claude_backend_bare_run_timeout_returns_unusable_result(monkeypatch, tm
     assert result.final_response == ""
 
 
+def test_backends_expose_self_update_command(tmp_path):
+    # aGiTrack runs these from its UNCONFINED proxy (automatic backend update) so a brew-based
+    # updater isn't nested inside the agent's macOS sandbox. A user launch wrapper is honored.
+    from agitrack.backends.opencode import OpenCodeBackend
+
+    assert ClaudeBackend(tmp_path).update_command() == ["claude", "update"]
+    assert OpenCodeBackend(repo=tmp_path).update_command() == ["opencode", "upgrade"]
+    assert OpenCodeBackend(repo=tmp_path, launch_command=["wrap", "opencode"]).update_command() == [
+        "wrap",
+        "opencode",
+        "upgrade",
+    ]
+
+
 def test_claude_backend_tolerates_leading_logs():
     backend = ClaudeBackend(Path("."))
     output = "starting up\n" + json.dumps({"type": "result", "result": "hi", "session_id": "s"})

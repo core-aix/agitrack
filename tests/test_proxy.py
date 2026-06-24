@@ -676,17 +676,55 @@ def test_committable_changes_ignores_declined_untracked(tmp_path):
     assert runner._active_has_committable_changes() is True
 
 
-def test_merge_active_commits_uncommitted_before_integrating(tmp_path):
+def test_merge_active_retargets_then_delegates_to_integrate(tmp_path):
     runner = _merge_runner(tmp_path)
     runner.repo.has_tracked_changes = lambda: True  # uncommitted work present
-    order: list = []
-    runner._commit_latest_turn_sync = lambda: order.append("commit")
-    runner._integrate_active_session = lambda: order.append("integrate")
+    integrated: list = []
+    runner._integrate_active_session = lambda: integrated.append(runner._base_branch)
 
     runner._merge_active_into("release")
 
-    assert order == ["commit", "integrate"]  # commit FIRST, then merge
+    # _merge_active_into retargets the base then hands off; the commit-before-merge now
+    # lives in _integrate_active_session (one place), exercised by the test below.
+    assert integrated == ["release"]
     assert runner._base_branch == "release"
+
+
+def test_integrate_active_commits_committable_changes_before_integrating(tmp_path):
+    # Best effort: with no turn in flight, uncommitted committable work is committed first
+    # rather than dead-ending the user with "finish or stop the current turn".
+    runner = _merge_runner(tmp_path)
+    runner.repo.has_changes = lambda: True  # worktree dirty, but...
+    runner.repo.has_tracked_changes = lambda: True  # ...with committable work, and...
+    runner.agent_in_flight = False  # ...no turn is actually running
+    runner.agent_parse_thread = None
+    order: list = []
+    runner._commit_latest_turn_sync = lambda: order.append("commit")
+    runner._integrate_turn_or_conflict = lambda: order.append("integrate") or "integrated"
+
+    runner._integrate_active_session()
+
+    assert order == ["commit", "integrate"]  # committed first, then integrated — no dead-end
+
+
+def test_integrate_active_blocks_only_while_a_turn_is_running(tmp_path):
+    # A genuinely in-flight turn still blocks the merge (its edits are mid-flight).
+    runner = _merge_runner(tmp_path)
+    runner.repo.has_changes = lambda: True
+    runner.agent_in_flight = True
+    runner.agent_parse_thread = None
+    runner.last_child_output = time.monotonic()  # output just now: the turn is genuinely live
+    runner.CHILD_IDLE_SECONDS = 999.0  # so the in-flight flag is NOT cleared as idle
+    messages: list = []
+    runner._set_message = lambda msg, **k: messages.append(msg)
+    committed: list = []
+    runner._commit_latest_turn_sync = lambda: committed.append(True)
+    runner._integrate_turn_or_conflict = lambda: committed.append("integrate") or "integrated"
+
+    runner._integrate_active_session()
+
+    assert committed == []  # neither committed nor integrated
+    assert any("still running" in m for m in messages)
 
 
 def test_active_has_mergeable_work_excludes_in_flight_turn(tmp_path):
@@ -4070,7 +4108,10 @@ def _backend_switch_runner(monkeypatch):
     runner = _mux_runner()
     runner.backend = types.SimpleNamespace(name="claude")
     runner.worktree = object()
-    runner.global_config = types.SimpleNamespace(default_backend="claude")
+    # A switch records the choice repo-scoped via global_config.set(...); capture it on .sets.
+    cfg = types.SimpleNamespace(default_backend="claude", sets=[])
+    cfg.set = lambda key, value, *, scope: cfg.sets.append((key, value, scope))
+    runner.global_config = cfg
     monkeypatch.setattr("agitrack.proxy.runner.backend_installed", lambda n: True)
     return runner
 
@@ -4483,6 +4524,9 @@ def test_resume_uses_original_worktree_when_name_is_free():
 def test_resume_uses_fresh_name_when_colliding_with_live_session():
     runner = _resume_runner()
     runner._next_session_name = lambda: "session-3"
+    # A collision with the live session now PROMPTS the user (it no longer silently renames);
+    # here the user accepts the suggested fresh name (the prompt's default).
+    runner._prompt_session_name = lambda title, *, default: default
 
     # A past conversation that ran in "session-1" — but session-1 is live now.
     runner._resume_conversation("session-1", "past-xyz")
@@ -7965,3 +8009,318 @@ def test_no_worktree_mode_skips_worktree_setup(tmp_path):
     runner._setup_base_merge_only_session()
     assert runner.worktree is None
     assert not (tmp_path / ".agitrack" / "worktrees").exists()
+
+
+# --- backend self-update (automatic, sandbox-blocked → run from the unconfined proxy) ---
+
+
+def _update_runner(tmp_path):
+    runner = make_runner(state=AgitrackState(tmp_path))
+    runner._set_message = lambda m, **k: runner._msgs.append(m)  # type: ignore[attr-defined]
+    runner._render = lambda *a, **k: None
+    runner._msgs = []  # type: ignore[attr-defined]
+    return runner
+
+
+def test_backend_auto_update_runs_unconfined_and_reports_version_change(tmp_path, monkeypatch):
+    import agitrack.proxy.runner as runner_mod
+
+    runner = _update_runner(tmp_path)
+    runner.backend = types.SimpleNamespace(name="opencode", update_command=lambda: ["opencode", "upgrade"])
+    runner._backend_update_via_agitrack = lambda: True  # aGiTrack drives the update (brew-managed on macOS)
+    runner._backend_version = lambda: next(versions)
+    versions = iter(["1.15.13", "1.17.9"])  # before, after — the upgrade landed
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return types.SimpleNamespace(returncode=0, stdout="Upgraded\n", stderr="")
+
+    monkeypatch.setattr(runner_mod.subprocess, "run", fake_run)
+
+    runner._maybe_auto_update_backend()  # automatic — no menu, no prompt, no brew pre-check
+    runner._backend_update_thread.join(2)
+    # The updater is the RAW backend command — NOT wrapped in sandbox-exec/bwrap. It runs in
+    # the unconfined proxy, so a brew updater's own sandbox isn't nested (the whole bug).
+    assert captured["cmd"] == ["opencode", "upgrade"]
+    assert runner._backend_update_checked_for == "opencode"  # evaluated once; won't re-trigger
+
+    runner._service_backend_update()
+    assert any("updated" in m.lower() and "1.17.9" in m for m in runner._msgs)
+
+
+def test_backend_auto_update_reports_up_to_date_when_version_unchanged(tmp_path, monkeypatch):
+    # The updater no-ops when current (version unchanged before/after) — don't claim an update.
+    import agitrack.proxy.runner as runner_mod
+
+    runner = _update_runner(tmp_path)
+    runner.backend = types.SimpleNamespace(name="opencode", update_command=lambda: ["opencode", "upgrade"])
+    runner._backend_update_via_agitrack = lambda: True
+    runner._backend_version = lambda: "1.17.9"  # unchanged before and after
+    monkeypatch.setattr(
+        runner_mod.subprocess,
+        "run",
+        lambda *a, **k: types.SimpleNamespace(returncode=0, stdout="already on latest\n", stderr=""),
+    )
+
+    runner._maybe_auto_update_backend()
+    runner._backend_update_thread.join(2)
+    runner._service_backend_update()
+
+    assert any("up to date" in m for m in runner._msgs)
+    assert not any("updated (" in m for m in runner._msgs)
+
+
+def test_backend_auto_update_skips_when_self_update_not_blocked(tmp_path, monkeypatch):
+    # An npm/native backend updates itself fine; aGiTrack must not touch it (no upgrade run).
+    import agitrack.proxy.runner as runner_mod
+
+    runner = _update_runner(tmp_path)
+    runner.backend = types.SimpleNamespace(name="opencode", update_command=lambda: ["opencode", "upgrade"])
+    runner._backend_update_via_agitrack = lambda: False
+    ran = []
+    monkeypatch.setattr(runner_mod.subprocess, "run", lambda *a, **k: ran.append(True))
+
+    runner._maybe_auto_update_backend()
+
+    assert runner._backend_update_thread is None
+    assert ran == []  # never ran the updater (or a version check)
+
+
+def test_backend_child_env_disables_opencode_autoupdate_when_agitrack_takes_over(tmp_path):
+    # When aGiTrack will apply the update itself (OpenCode's own updater is sandbox-blocked and
+    # update checks are on), the interactive child gets OPENCODE_DISABLE_AUTOUPDATE so OpenCode
+    # doesn't show its own prompt — which would only fail inside the sandbox.
+    runner = _update_runner(tmp_path)
+    runner.backend = types.SimpleNamespace(name="opencode")
+    runner.global_config = types.SimpleNamespace(check_for_updates=True)
+    runner._backend_update_via_agitrack = lambda: True
+    assert runner._backend_child_env() == {"OPENCODE_DISABLE_AUTOUPDATE": "1"}
+
+    # npm/native (not sandbox-blocked) → leave OpenCode's own auto-update alone.
+    runner._backend_update_via_agitrack = lambda: False
+    assert runner._backend_child_env() is None
+
+    # Update checks off → aGiTrack won't auto-update, so don't suppress OpenCode's either.
+    runner._backend_update_via_agitrack = lambda: True
+    runner.global_config = types.SimpleNamespace(check_for_updates=False)
+    assert runner._backend_child_env() is None
+
+
+def test_backend_auto_update_respects_update_check_toggle(tmp_path):
+    # Honors the same opt-out as aGiTrack's own self-update: if update checks are off, don't
+    # even probe whether the self-update is blocked.
+    runner = _update_runner(tmp_path)
+    runner.backend = types.SimpleNamespace(name="opencode", update_command=lambda: ["opencode", "upgrade"])
+    runner.global_config = types.SimpleNamespace(check_for_updates=False)
+    runner._backend_update_via_agitrack = lambda: pytest.fail("should not probe when checks are off")
+
+    runner._maybe_auto_update_backend()
+
+    assert runner._backend_update_thread is None
+
+
+def test_service_backend_update_flags_failure_even_on_exit_zero(tmp_path):
+    # `opencode upgrade` exits 0 even when its brew step fails, so failure is read from output.
+    runner = _update_runner(tmp_path)
+    runner._backend_update_result = {
+        "name": "opencode",
+        "code": 0,
+        "output": "Upgrading...\n\x1b[2K■  Upgrade failed for brew (exit code 1).\n",
+    }
+
+    runner._service_backend_update()
+
+    assert any("may have failed" in m for m in runner._msgs)
+    assert any("Upgrade failed" in m for m in runner._msgs)
+
+
+def test_backend_auto_update_noop_when_backend_has_no_updater(tmp_path):
+    # A backend without an update_command (or where it's blocked but returns nothing) simply
+    # isn't auto-updated — no thread, no error.
+    runner = _update_runner(tmp_path)
+    runner.backend = types.SimpleNamespace(name="foo")  # no update_command attribute
+    runner._backend_update_via_agitrack = lambda: True
+
+    runner._maybe_auto_update_backend()
+
+    assert runner._backend_update_thread is None
+
+
+# --- settings persistence + restart prompt -----------------------------------
+
+
+def test_runner_loads_repo_overlay_so_repo_scoped_settings_persist(tmp_path):
+    # Regression: the proxy built a fresh GlobalConfig without loading the repo overlay, so
+    # repo_path was None and save_repo() silently dropped every "this repository only" change.
+    from agitrack.config import GlobalConfig
+    from agitrack.git import GitRepo
+    from agitrack.proxy.runner import ProxyRunner
+
+    repo = GitRepo.init(tmp_path)
+    runner = ProxyRunner(repo, use_worktrees=False, backend="claude")
+    assert runner.global_config.repo_path is not None  # overlay loaded → save_repo() works
+
+    runner.global_config.set("use_worktrees", False, scope="repo")
+
+    fresh = GlobalConfig()  # re-read from disk
+    fresh.load_repo_overlay(tmp_path)
+    assert fresh.use_worktrees is False  # the repo-scoped change actually hit the file
+
+
+def _save_pending_runner(tmp_path):
+    runner = make_runner(state=AgitrackState(tmp_path))
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda *a, **k: None
+    sets: list = []
+    runner.global_config = types.SimpleNamespace(
+        set=lambda key, value, *, scope: sets.append((key, value, scope)),
+        repo_data={},
+        data={},
+    )
+    runner._sets = sets  # type: ignore[attr-defined]
+    return runner
+
+
+def test_settings_save_offers_restart_for_restart_only_change(tmp_path):
+    runner = _save_pending_runner(tmp_path)
+    runner._settings_pending = {"use_worktrees": (False, "repo", True)}  # restart-only
+    runner._settings_pending_timings = {}
+    restarted: list = []
+    runner._restart_now = lambda msg: restarted.append(msg)
+    answers = iter(["Yes, save them", "Yes, restart now"])
+    runner._select_popup = lambda *a, **k: next(answers)
+
+    assert runner._confirm_save_pending() == "saved"
+    assert ("use_worktrees", False, "repo") in runner._sets  # persisted at repo scope
+    assert restarted  # restart offered and accepted
+
+
+def test_settings_save_restart_only_not_now_keeps_running(tmp_path):
+    runner = _save_pending_runner(tmp_path)
+    runner._settings_pending = {"use_worktrees": (False, "repo", True)}
+    runner._settings_pending_timings = {}
+    restarted: list = []
+    runner._restart_now = lambda msg: restarted.append(msg)
+    answers = iter(["Yes, save them", "Not now"])
+    runner._select_popup = lambda *a, **k: next(answers)
+
+    assert runner._confirm_save_pending() == "saved"
+    assert restarted == []  # declined → keep running, changes apply next launch
+
+
+def test_settings_save_no_restart_prompt_for_live_change(tmp_path):
+    # A non-restart setting (e.g. summarization on/off) saves without offering a restart:
+    # _select_popup is consulted only once (the save confirmation), never a second time.
+    runner = _save_pending_runner(tmp_path)
+    runner._settings_pending = {"summarization_enabled": (True, "global", False)}
+    runner._settings_pending_timings = {}
+    runner._restart_now = lambda msg: pytest.fail("must not offer a restart for a live setting")
+    answers = iter(["Yes, save them"])  # a second _select_popup call would StopIteration → fail
+    runner._select_popup = lambda *a, **k: next(answers)
+
+    assert runner._confirm_save_pending() == "saved"
+
+
+def test_switch_backend_records_choice_repo_scoped_not_global(tmp_path, monkeypatch):
+    # Switching backends in one repo (e.g. to try OpenCode) must persist at REPO scope, not
+    # overwrite the user's GLOBAL default for every other repo.
+    import agitrack.proxy.runner as rm
+
+    runner = make_runner(state=AgitrackState(tmp_path), worktree=None)
+    runner.backend = types.SimpleNamespace(name="claude")
+    sets: list = []
+    runner.global_config = types.SimpleNamespace(set=lambda key, value, *, scope: sets.append((key, value, scope)))
+    monkeypatch.setattr(rm, "backend_installed", lambda name: True)
+    monkeypatch.setattr(rm, "make_proxy_agent", lambda name: types.SimpleNamespace(name=name))
+    runner._restart_agent = lambda msg: None
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda *a, **k: None
+
+    runner._switch_backend("opencode")
+
+    assert ("default_backend", "opencode", "repo") in sets
+    assert not any(scope == "global" for _, _, scope in sets)  # global default left alone
+
+
+def test_no_worktree_mode_removes_leftover_worktrees(tmp_path):
+    # Turning worktrees off must clean up worktrees left by a previous worktree-mode run
+    # (their committed work is already integrated into the base branch).
+    runner = make_runner(state=AgitrackState(tmp_path))
+    runner._use_worktrees = False
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda *a, **k: None
+    removed: list = []
+    runner._worktrees = lambda: types.SimpleNamespace(
+        list=lambda: [types.SimpleNamespace(name="sess-a"), types.SimpleNamespace(name="sess-b")],
+        remove=lambda name, **k: removed.append(name),
+    )
+
+    runner._setup_base_merge_only_session()
+
+    assert removed == ["sess-a", "sess-b"]
+    assert runner.worktree is None  # runs on the base tree directly
+
+
+def test_worktree_sessions_is_memoized_to_avoid_repeated_slow_listing(tmp_path):
+    # Entering the resume menu calls _worktree_sessions several times (via _resumable_sessions
+    # and _agitrack_named_sessions); each is a slow `opencode session list`. It must be
+    # memoized so the menu fires it ONCE, not back-to-back (which froze the TUI for seconds).
+    runner = make_runner(state=AgitrackState(tmp_path))
+    calls = []
+    runner.backend = types.SimpleNamespace(list_worktree_sessions=lambda root: calls.append(1) or [])
+    runner._worktrees = lambda: types.SimpleNamespace(root=tmp_path)
+
+    runner._worktree_sessions()
+    runner._worktree_sessions()
+    runner._worktree_sessions()
+
+    assert len(calls) == 1  # cached within the TTL, not three subprocesses
+
+
+def _collision_resume_runner(tmp_path):
+    runner = make_runner(state=AgitrackState(tmp_path))
+    runner.sessions = []  # no live session matches the id -> skip the "already live, just switch" shortcut
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda *a, **k: None
+    runner._next_session_name = lambda: "suggested-word"
+    runner._created = []  # type: ignore[attr-defined]
+    runner._new_session = lambda name, **k: runner._created.append(name)  # type: ignore[attr-defined]
+    return runner
+
+
+def test_resume_name_collision_prompts_with_random_suggestion(tmp_path):
+    # Resuming a conversation whose name collides with a LIVE session must PROMPT the user
+    # (explaining why, suggesting a random word) — never silently rename.
+    runner = _collision_resume_runner(tmp_path)
+    runner._live_session_name_taken = lambda name: True
+    asked = []
+    runner._prompt_session_name = lambda title, *, default: asked.append((title, default)) or "bar"
+
+    runner._resume_conversation("foo", "ses_1")
+
+    assert asked, "the user was not prompted"
+    title, default = asked[0]
+    assert default == "suggested-word"  # a random word is offered as the editable default
+    assert "already open" in title and "name" in title.lower()  # explains why a new name is needed
+    assert runner._created == ["bar"]  # resumed under the user's chosen name, not an auto one
+
+
+def test_resume_name_collision_cancel_aborts_resume(tmp_path):
+    runner = _collision_resume_runner(tmp_path)
+    runner._live_session_name_taken = lambda name: True
+    runner._prompt_session_name = lambda *a, **k: None  # Esc / cancel
+
+    runner._resume_conversation("foo", "ses_1")
+
+    assert runner._created == []  # nothing resumed when the user cancels the name prompt
+
+
+def test_resume_without_collision_keeps_name_and_does_not_prompt(tmp_path):
+    runner = _collision_resume_runner(tmp_path)
+    runner._live_session_name_taken = lambda name: False
+    runner._prompt_session_name = lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not prompt"))
+
+    runner._resume_conversation("foo", "ses_1")
+
+    assert runner._created == ["foo"]  # original name kept, no prompt
