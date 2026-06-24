@@ -719,6 +719,11 @@ class ProxyRunner:
         # session never freezes; _service_background_share_ops surfaces each result as a
         # notice when it finishes. Each entry: {key, thread, box, outcome_fn}.
         self._background_share_ops: list[dict] = []
+        # A share refused because the SHARED copy is already newer (PublishResult.behind):
+        # the background op stashes the context here, and _service_share_conflicts later
+        # (on the main thread, NOT mid-iteration over _background_share_ops) prompts the
+        # user to overwrite or merge. Each entry: {payload, store, display, session_id}.
+        self._pending_share_conflicts: list[dict] = []
         self._relaunch_times: list[float] = []
         self._exiting = False
         self._finalized_on_exit = False
@@ -971,6 +976,7 @@ class ProxyRunner:
                 "_shared_resume_result": None,
                 "_shared_resume_cancel": None,
                 "_background_share_ops": [],
+                "_pending_share_conflicts": [],
                 "_use_worktrees": True,
                 "_warned_parallel_no_worktree": False,
                 "_sandbox": True,
@@ -3836,10 +3842,20 @@ class ProxyRunner:
                 timeout=self.SHARE_PUSH_TIMEOUT,
             )
 
-        def outcome(box) -> str:
+        def outcome(box) -> str | None:
             if "error" in box:
                 return f"Could not share session: {box['error']}"
             result = box["result"]
+            if result.behind:
+                # The shared copy already has newer turns than this session, so the push
+                # was refused. Don't just give up — stash it so the main loop can ask the
+                # user whether to overwrite or merge (can't prompt here: we're mid-iteration
+                # over the background-op list). Leave the auto-share hash/origin untouched
+                # since nothing was published yet.
+                self._pending_share_conflicts.append(
+                    {"payload": payload, "store": store, "display": display, "session_id": session_id}
+                )
+                return None
             self._auto_share_hash[session_id] = payload["digest"]  # don't immediately re-push the same content
             # Record the lineage origin so a later re-share (here or on another machine)
             # updates this same entry and keeps accumulating contributors.
@@ -4128,6 +4144,68 @@ class ProxyRunner:
             if text:
                 self._set_session_notice(entry["key"], text, seconds=10.0)
         self._background_share_ops = still
+
+    def _service_share_conflicts(self) -> None:
+        """Main-loop tick: for each share refused because the shared copy was already
+        newer, ask the user whether to overwrite or merge, then re-share their way. Run
+        AFTER _service_background_share_ops (not inside it) so opening a modal and queuing
+        a new background op doesn't mutate the list that method is iterating."""
+        if not self._pending_share_conflicts:
+            return
+        pending, self._pending_share_conflicts = self._pending_share_conflicts, []
+        for conflict in pending:
+            self._resolve_share_behind(conflict)
+
+    def _resolve_share_behind(self, conflict: dict) -> None:
+        """Prompt the user about one behind-refused share — the shared copy already has
+        newer changes — and, if they choose, overwrite it with this session.
+
+        Only *overwrite* (or keep-as-is) is offered: when two copies of a session CAN be
+        combined they're union-merged automatically during a normal publish and never
+        reach this refusal, so the only sessions that land here are ones that can't be
+        merged (e.g. OpenCode's single-object export). For those, replace-or-keep is the
+        real choice."""
+        payload, store, display, session_id = (
+            conflict["payload"],
+            conflict["store"],
+            conflict["display"],
+            conflict["session_id"],
+        )
+        overwrite_opt = "Overwrite the shared copy with this session"
+        choice = self._select_popup(
+            f"The shared copy of '{display}' already has newer changes than this session.\n"
+            "Sharing would replace those newer changes with this older one. Proceed?",
+            [overwrite_opt, "Keep the newer shared copy (cancel)"],
+        )
+        if choice != overwrite_opt:
+            self._set_message(f"Didn't share '{display}' — left the newer shared copy as is.")
+            self._render()
+            return
+
+        def op():
+            return store.publish(
+                github_id=payload["owner"],
+                name=payload["name"],
+                transcript=payload["redacted"],
+                manifest=payload["manifest"],
+                prune_gid=payload["sharer"],
+                timeout=self.SHARE_PUSH_TIMEOUT,
+                overwrite=True,
+            )
+
+        def outcome(box) -> str | None:
+            if "error" in box:
+                return f"Could not share session: {box['error']}"
+            result = box["result"]
+            self._auto_share_hash[session_id] = payload["digest"]
+            self._user_state().set_shared_origin(
+                session_id, owner=payload["owner"], name=payload["name"], contributors=payload["contributors"]
+            )
+            if not result.pushed:
+                return self._share_outcome_message(result, display)
+            return f"Overwrote the shared copy of '{display}' on origin with this session."
+
+        self._run_share_op_async(f"share:{display}", f"Overwriting '{display}' — pushing to origin…", op, outcome)
 
     def _session_auto_shared(self, session_id: str | None) -> bool:
         # Read the opt-in from the BASE repo state (persists across runs); the
@@ -6133,6 +6211,7 @@ class ProxyRunner:
             # restart; stop before any further servicing.
             return
         self._service_background_share_ops()  # surface finished background unshare/etc. results
+        self._service_share_conflicts()  # prompt overwrite/merge for a share refused as behind
         self._service_backend_update()  # surface a finished backend auto-update result
         self._maybe_auto_update_backend()  # auto-apply a brew-managed backend update; once per backend
         self._service_session_notices()  # expire/refresh per-session status lines
