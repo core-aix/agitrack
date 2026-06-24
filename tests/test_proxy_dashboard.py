@@ -1,68 +1,101 @@
-import threading
-import time
+import os
 
 from agitrack.metrics.server import browser_is_local, open_dashboard_in_browser
 from agitrack.proxy.runner import ProxyInput
 from tests.proxy_helpers import make_runner
 
 
-class _FakeServer:
-    def __init__(self):
-        self.server_address = ("127.0.0.1", 12345)
-        self.shutdown_called = False
-        self.closed = False
-        self.started = threading.Event()
+class _FakeProc:
+    """Stand-in for the detached dashboard child's Popen handle."""
 
-    def serve_forever(self):
-        self.started.set()
-        while not self.shutdown_called:
-            time.sleep(0.005)
+    def __init__(self, pid=4242):
+        self.pid = pid
+        self._alive = True
+        self.terminated = False
+        self.killed = False
 
-    def shutdown(self):
-        self.shutdown_called = True
+    def poll(self):
+        return None if self._alive else 0
 
-    def server_close(self):
-        self.closed = True
+    def terminate(self):
+        self.terminated = True
+        self._alive = False
+
+    def wait(self, timeout=None):
+        return 0
+
+    def kill(self):
+        self.killed = True
+        self._alive = False
 
 
 def test_dashboard_is_in_the_ctrl_g_command_palette():
     assert "dashboard" in ProxyInput.COMMANDS
 
 
-def test_dashboard_command_serves_and_opens_browser(monkeypatch):
-    fake = _FakeServer()
+def test_dashboard_command_spawns_process_and_opens_browser(monkeypatch):
+    proc = _FakeProc()
+    spawned: list[dict] = []
     opened: list[str] = []
-    monkeypatch.setattr("agitrack.metrics.build_server", lambda repo, **kw: fake)
+    monkeypatch.setattr("agitrack.metrics.clear_handshake", lambda repo: None)
+    monkeypatch.setattr("agitrack.metrics.spawn_dashboard_daemon", lambda repo, **kw: spawned.append(kw) or proc)
+    monkeypatch.setattr(
+        "agitrack.metrics.wait_for_handshake",
+        lambda repo, **kw: {"pid": proc.pid, "url": "http://127.0.0.1:12345/", "port": 12345},
+    )
     # The handler routes the browser through open_dashboard_in_browser (which skips
     # opening on a remote/headless host); force "opened locally" for the test.
     monkeypatch.setattr("agitrack.metrics.open_dashboard_in_browser", lambda url: opened.append(url) or True)
 
     runner = make_runner(base_repo=object())
     monkeypatch.setattr(runner, "_render", lambda: None)
+    monkeypatch.setattr(runner, "_dashboard_email_logins", lambda: {})
 
     runner._handle_dashboard_command()
 
-    assert runner._dashboard_server is fake
+    assert runner._dashboard_proc is proc
     assert runner._dashboard_url == "http://127.0.0.1:12345/"
     assert opened == ["http://127.0.0.1:12345/"]
-    assert fake.started.wait(timeout=2.0)  # the server thread actually started
+    # The child is owned by THIS aGiTrack process, so it dies when the TUI exits.
+    assert spawned and spawned[0]["owner_pid"] == os.getpid()
 
-    # A second invocation reuses the running server (no new one), just reopens it.
-    monkeypatch.setattr("agitrack.metrics.build_server", lambda repo, **kw: _FakeServer())
+    # A second invocation reuses the running process (never respawns), just reopens it.
+    monkeypatch.setattr(
+        "agitrack.metrics.spawn_dashboard_daemon",
+        lambda repo, **kw: (_ for _ in ()).throw(AssertionError("must not respawn a live daemon")),
+    )
     runner._handle_dashboard_command()
-    assert runner._dashboard_server is fake  # unchanged
+    assert runner._dashboard_proc is proc  # unchanged
     assert opened == ["http://127.0.0.1:12345/", "http://127.0.0.1:12345/"]
 
-    # Exit shuts the dashboard down.
+    # Exit kills the dashboard process.
+    monkeypatch.setattr("agitrack.metrics.clear_handshake", lambda repo: None)
     runner._stop_dashboard()
-    assert fake.shutdown_called and fake.closed
-    assert runner._dashboard_server is None
+    assert proc.terminated
+    assert runner._dashboard_proc is None
+
+
+def test_dashboard_command_reports_when_daemon_fails_to_start(monkeypatch):
+    proc = _FakeProc()
+    monkeypatch.setattr("agitrack.metrics.clear_handshake", lambda repo: None)
+    monkeypatch.setattr("agitrack.metrics.spawn_dashboard_daemon", lambda repo, **kw: proc)
+    monkeypatch.setattr("agitrack.metrics.wait_for_handshake", lambda repo, **kw: None)  # never binds
+    monkeypatch.setattr("agitrack.metrics.log_path", lambda repo: "/tmp/dashboard.log")
+
+    runner = make_runner(base_repo=object())
+    monkeypatch.setattr(runner, "_render", lambda: None)
+    monkeypatch.setattr(runner, "_dashboard_email_logins", lambda: {})
+
+    runner._handle_dashboard_command()
+
+    assert runner._dashboard_proc is None  # not adopted
+    assert proc.terminated  # the stillborn child was reaped, not orphaned
 
 
 def test_stop_dashboard_is_a_noop_when_none_running():
     runner = make_runner(base_repo=object())
     runner._stop_dashboard()  # must not raise
-    assert runner._dashboard_server is None
+    assert runner._dashboard_proc is None
 
 
 # --- browser routing: open locally, never on a remote/headless host -------------

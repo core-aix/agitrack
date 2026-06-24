@@ -725,11 +725,12 @@ class ProxyRunner:
         # Set when the user presses Esc on the on-exit copy offer: aborts the in-progress
         # exit so they can deal with the worktree files themselves (see _run_exit_flow).
         self._exit_aborted = False
-        # The metrics dashboard, when started from the Ctrl-G menu, runs on a daemon
-        # thread inside this process (read-only HTTP server) so the TUI keeps running;
-        # shut down on exit. None until first started.
-        self._dashboard_server: Any = None
-        self._dashboard_thread: "threading.Thread | None" = None
+        # The metrics dashboard, when started from the Ctrl-G menu, runs as a separate
+        # background process (read-only HTTP server) rather than in-process, so its git
+        # log work and energy use are charged to that child, not the TUI (#110). It is
+        # killed when aGiTrack exits (_stop_dashboard, plus the child's own parent-death
+        # watchdog). None until first started.
+        self._dashboard_proc: "subprocess.Popen[bytes] | None" = None
         self._dashboard_url: str | None = None
         # Set once the interactive exit flow has committed to quitting (worktree
         # removed). The reactor loop checks this after running a menu command so an
@@ -983,8 +984,7 @@ class ProxyRunner:
                 "_exiting": False,
                 "_finalized_on_exit": False,
                 "_exit_aborted": False,
-                "_dashboard_server": None,
-                "_dashboard_thread": None,
+                "_dashboard_proc": None,
                 "_dashboard_url": None,
                 "_exit_requested": False,
                 # Self-update fields (production sets these in __init__).
@@ -7080,35 +7080,46 @@ class ProxyRunner:
 
     def _handle_dashboard_command(self) -> None:
         """Ctrl-G → "dashboard": serve aGiTrack's metrics dashboard for this repo and
-        open it in the browser. The dashboard is read-only and runs on a daemon thread
-        inside this process (so the TUI keeps running); it's reused if already up and
-        shut down on exit."""
-        import threading
+        open it in the browser. The dashboard is read-only and runs as a separate
+        background process (#110) — keeping its git-log work and energy use off the TUI
+        process — owned by this aGiTrack so it is reused if already up and killed on exit
+        (here and via the child's own owner-death watchdog)."""
+        from agitrack.metrics import (
+            clear_handshake,
+            log_path,
+            open_dashboard_in_browser,
+            remote_browser_hint,
+            spawn_dashboard_daemon,
+            wait_for_handshake,
+        )
 
-        from agitrack.metrics import open_dashboard_in_browser, remote_browser_hint
-
-        if self._dashboard_server is not None:
+        if self._dashboard_proc is not None and self._dashboard_proc.poll() is None:
             url = self._dashboard_url or ""
-            port = self._dashboard_server.server_address[1]
             opened = open_dashboard_in_browser(url)
             self._set_message(
                 f"Dashboard already running at {url}."
                 if opened
-                else f"Dashboard running. {remote_browser_hint(url, port)}"
+                else f"Dashboard running. {remote_browser_hint(url, 0)}"
             )
             self._render()
             return
         try:
-            from agitrack.metrics import build_server
-            from agitrack.metrics.server import DEFAULT_HOST
-
-            server = build_server(self.base_repo, email_logins=self._dashboard_email_logins())
-            port = server.server_address[1]
-            url = f"http://{DEFAULT_HOST}:{port}/"
-            thread = threading.Thread(target=server.serve_forever, name="agitrack-dashboard", daemon=True)
-            thread.start()
-            self._dashboard_server = server
-            self._dashboard_thread = thread
+            clear_handshake(self.base_repo)  # drop any record from a dead earlier daemon
+            proc = spawn_dashboard_daemon(
+                self.base_repo, owner_pid=os.getpid(), email_logins=self._dashboard_email_logins()
+            )
+            record = wait_for_handshake(self.base_repo, pid=proc.pid, timeout=5.0)
+            if record is None:
+                # The child died before binding, or never published. Reap it and point
+                # the user at its log so a startup failure isn't swallowed silently.
+                if proc.poll() is None:
+                    proc.terminate()
+                self._set_message(f"Could not start the dashboard. See {log_path(self.base_repo)}.")
+                self._render()
+                return
+            url = str(record.get("url", ""))
+            port = int(record.get("port", 0))
+            self._dashboard_proc = proc
             self._dashboard_url = url
             # Only open a browser when it would land on THIS machine; on a remote/SSH/
             # Mosh host, tell the user how to reach the forwarded URL from their own
@@ -7136,15 +7147,29 @@ class ProxyRunner:
         return {}
 
     def _stop_dashboard(self) -> None:
-        """Shut the dashboard server down if it was started this session."""
-        server = self._dashboard_server
-        if server is None:
+        """Kill the dashboard process if it was started this session.
+
+        Called on the TUI's teardown path so the dashboard never outlives aGiTrack.
+        (The child also self-terminates via its owner-death watchdog, which covers a
+        SIGKILL of the TUI where this never runs.)"""
+        proc = self._dashboard_proc
+        if proc is None:
             return
-        self._dashboard_server = None
-        self._dashboard_thread = None
+        self._dashboard_proc = None
+        self._dashboard_url = None
         try:
-            server.shutdown()
-            server.server_close()
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+        except Exception:
+            pass
+        try:
+            from agitrack.metrics import clear_handshake
+
+            clear_handshake(self.base_repo)
         except Exception:
             pass
 

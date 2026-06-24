@@ -10,6 +10,7 @@ commit (#58), and an agent-merge.
 from pathlib import Path
 
 import json
+import os
 import re
 import threading
 import urllib.error
@@ -1319,42 +1320,69 @@ def test_dashboard_server_is_threaded_and_swallows_client_disconnects(tmp_path, 
 # --- CLI -----------------------------------------------------------------------
 
 
-def test_cli_dashboard_html_is_default_and_serves_on_localhost(tmp_path, monkeypatch):
+def test_cli_dashboard_html_is_default_and_starts_daemon(tmp_path, monkeypatch):
     _demo_repo(tmp_path)
-    served: dict[str, GitRepo] = {}
+    started: dict[str, object] = {}
 
-    def fake_serve(repo, **kwargs):
-        served["repo"] = repo
+    def fake_start(repo, **kwargs):
+        started["repo"] = repo
+        started["owner_pid"] = kwargs.get("owner_pid")
         return 0
 
-    monkeypatch.setattr(metrics, "serve_dashboard", fake_serve)
+    monkeypatch.setattr(metrics, "start_dashboard_daemon", fake_start)
 
-    # Bare --dashboard now means html, which serves on localhost.
+    # Bare --dashboard now means html, which starts the background daemon.
     rc = cli.main(["--dashboard", "--repo", str(tmp_path)])
 
     assert rc == 0
-    assert served["repo"].repo == GitRepo.discover(tmp_path).repo
+    assert started["repo"].repo == GitRepo.discover(tmp_path).repo
+    # The daemon is owned by the launching shell (this process's parent) so it dies
+    # when that terminal closes.
+    assert started["owner_pid"] == os.getppid()
 
 
-def test_cli_dashboard_shorthand_d_serves_like_dashboard(tmp_path, monkeypatch):
+def test_cli_dashboard_shorthand_d_starts_daemon_like_dashboard(tmp_path, monkeypatch):
     _demo_repo(tmp_path)
-    served: dict[str, GitRepo] = {}
+    started: dict[str, GitRepo] = {}
 
-    def fake_serve(repo, **kwargs):
-        served["repo"] = repo
+    def fake_start(repo, **kwargs):
+        started["repo"] = repo
         return 0
 
-    monkeypatch.setattr(metrics, "serve_dashboard", fake_serve)
+    monkeypatch.setattr(metrics, "start_dashboard_daemon", fake_start)
 
-    # `-d` is shorthand for `--dashboard`; bare form defaults to html (serve).
+    # `-d` is shorthand for `--dashboard`; bare form defaults to html (start daemon).
     assert cli.main(["-d", "--repo", str(tmp_path)]) == 0
-    assert served["repo"].repo == GitRepo.discover(tmp_path).repo
+    assert started["repo"].repo == GitRepo.discover(tmp_path).repo
+
+
+def test_cli_dashboard_stop_stops_daemon(tmp_path, monkeypatch):
+    _demo_repo(tmp_path)
+    stopped: dict[str, GitRepo] = {}
+    monkeypatch.setattr(
+        metrics, "start_dashboard_daemon", lambda *a, **k: (_ for _ in ()).throw(AssertionError("stop must not start"))
+    )
+    monkeypatch.setattr(metrics, "stop_dashboard_daemon", lambda repo: stopped.__setitem__("repo", repo) or 0)
+
+    assert cli.main(["-d", "stop", "--repo", str(tmp_path)]) == 0
+    assert stopped["repo"].repo == GitRepo.discover(tmp_path).repo
+
+
+def test_cli_dashboard_status_reports_daemon(tmp_path, monkeypatch):
+    _demo_repo(tmp_path)
+    queried: dict[str, GitRepo] = {}
+    monkeypatch.setattr(metrics, "dashboard_daemon_status", lambda repo: queried.__setitem__("repo", repo) or 0)
+
+    assert cli.main(["-d", "status", "--repo", str(tmp_path)]) == 0
+    assert queried["repo"].repo == GitRepo.discover(tmp_path).repo
 
 
 def test_cli_dashboard_shorthand_d_accepts_text(tmp_path, capsys, monkeypatch):
     _demo_repo(tmp_path)
     monkeypatch.setattr(
-        metrics, "serve_dashboard", lambda *a, **k: (_ for _ in ()).throw(AssertionError("text must not serve"))
+        metrics,
+        "start_dashboard_daemon",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("text must not start a daemon")),
     )
 
     assert cli.main(["-d", "text", "--repo", str(tmp_path)]) == 0
@@ -1364,9 +1392,11 @@ def test_cli_dashboard_shorthand_d_accepts_text(tmp_path, capsys, monkeypatch):
 def test_cli_dashboard_text_prints_report_and_exits(tmp_path, capsys, monkeypatch):
     _demo_repo(tmp_path)
     monkeypatch.setattr("builtins.input", lambda *a: (_ for _ in ()).throw(AssertionError("dashboard must not prompt")))
-    # The text path must never start a server.
+    # The text path must never start a daemon.
     monkeypatch.setattr(
-        metrics, "serve_dashboard", lambda *a, **k: (_ for _ in ()).throw(AssertionError("text must not serve"))
+        metrics,
+        "start_dashboard_daemon",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("text must not start a daemon")),
     )
 
     rc = cli.main(["--dashboard", "text", "--repo", str(tmp_path)])
@@ -1380,7 +1410,7 @@ def test_cli_dashboard_text_prints_report_and_exits(tmp_path, capsys, monkeypatc
 def test_cli_dashboard_outside_repo_fails_cleanly(tmp_path, capsys, monkeypatch):
     (tmp_path / "plain").mkdir()
     monkeypatch.setattr(
-        metrics, "serve_dashboard", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not serve"))
+        metrics, "start_dashboard_daemon", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not start"))
     )
 
     rc = cli.main(["--dashboard", "--repo", str(tmp_path / "plain")])
@@ -1391,6 +1421,6 @@ def test_cli_dashboard_outside_repo_fails_cleanly(tmp_path, capsys, monkeypatch)
 
 def test_cli_dashboard_missing_directory_fails_cleanly(tmp_path, monkeypatch):
     monkeypatch.setattr(
-        metrics, "serve_dashboard", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not serve"))
+        metrics, "start_dashboard_daemon", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not start"))
     )
     assert cli.main(["--dashboard", "--repo", str(tmp_path / "nowhere")]) == 1
