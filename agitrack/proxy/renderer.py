@@ -13,9 +13,10 @@ import re
 import sys
 import textwrap
 import time
-from typing import Protocol
+from typing import NamedTuple, Protocol
 
 import pyte
+import pyte.modes as _pyte_modes
 
 # Lightweight inline emphasis for box text: ``**bold**`` marks a run that should be
 # rendered bold. Only balanced pairs count, so stray ``*``/``**`` stay literal.
@@ -210,6 +211,24 @@ def _box_accent_sgr(host) -> str:
     return "\x1b[1;" + host.hex_color_code(accent, foreground=True) + "m"
 
 
+class _DimChar(NamedTuple):
+    """pyte's :class:`~pyte.screens.Char` plus a ``dim`` (faint, SGR 2) flag. pyte 0.8.2
+    has no slot for faint and silently drops ``\\x1b[2m``, so dim text — e.g. Claude's
+    autosuggestion ghost text — would otherwise re-render at full intensity (#113). Field
+    order mirrors pyte's Char so name-based ``_replace``/``_asdict`` interop is exact."""
+
+    data: str = " "
+    fg: str = "default"
+    bg: str = "default"
+    bold: bool = False
+    italics: bool = False
+    underscore: bool = False
+    strikethrough: bool = False
+    reverse: bool = False
+    blink: bool = False
+    dim: bool = False
+
+
 class _BackgroundColorEraseScreen(pyte.HistoryScreen):
     # pyte erases cells using the cursor's *full* SGR attributes, so a backend
     # that clears the screen (or a line) while underline — or any glyph
@@ -219,6 +238,56 @@ class _BackgroundColorEraseScreen(pyte.HistoryScreen):
     # session-choice picker). Real terminals do background-colour-erase: erased
     # cells keep only the background colour, not glyph attributes. Mirror that by
     # blanking everything except the background on the cursor attrs we erase with.
+    # --- faint (SGR 2) tracking ---------------------------------------------
+    # pyte 0.8.2 ignores faint entirely (no ``dim`` field on Char, no ``2`` in its
+    # SGR map), so dim text loses its dimness when aGiTrack re-renders it and shows
+    # up at full intensity — most visibly Claude's grey autosuggestion ghost text,
+    # which then looks identical to what the user typed (#113). We carry ``dim`` on
+    # an extended Char (:class:`_DimChar`) ourselves and re-emit it in ``cell_sgr``.
+
+    @property
+    def default_char(self) -> _DimChar:  # type: ignore[override]
+        reverse = _pyte_modes.DECSCNM in self.mode
+        return _DimChar(data=" ", fg="default", bg="default", reverse=reverse)
+
+    def reset(self) -> None:
+        super().reset()
+        # pyte's reset() leaves the cursor carrying a plain Char (no ``dim`` slot);
+        # promote it to our default so every subsequent ``_replace`` keeps ``dim``.
+        self.cursor.attrs = self.default_char  # type: ignore[assignment]  # _DimChar extends Char
+
+    def select_graphic_rendition(self, *attrs: int) -> None:
+        # Let pyte handle everything it knows (it harmlessly ignores the faint code),
+        # then apply the faint state we tracked. A reset (0) or normal-intensity (22)
+        # clears faint; a standalone 2 sets it; last occurrence wins.
+        #
+        # The 2 must be parsed exactly as pyte does, NOT matched anywhere in the list:
+        # in a 24-bit colour like ``38;2;r;g;b`` (or ``48;2;…``) the ``2`` is the colour
+        # selector, not faint. Consuming 38/48's parameters here keeps normal truecolor
+        # text (e.g. the user's own white input) from being wrongly dimmed (#113 follow-up).
+        dim: bool | None = None
+        remaining = list(reversed(attrs or (0,)))
+        while remaining:
+            attr = remaining.pop()
+            if attr == 2:
+                dim = True
+            elif attr in (0, 22):
+                dim = False
+            elif attr in (38, 48):  # extended fg/bg — skip its parameters
+                mode = remaining.pop() if remaining else None
+                if mode == 5 and remaining:  # 256-colour: one index byte
+                    remaining.pop()
+                elif mode == 2:  # 24-bit: three colour bytes
+                    del remaining[-3:]
+        super().select_graphic_rendition(*attrs)
+        if dim is None:
+            return
+        current = self.cursor.attrs
+        if hasattr(current, "dim"):
+            self.cursor.attrs = current._replace(dim=dim)  # type: ignore[call-arg]  # _DimChar has dim
+        elif dim:  # cursor still on a plain pyte Char — promote it
+            self.cursor.attrs = _DimChar(**current._asdict(), dim=True)  # type: ignore[assignment]
+
     def _erase_attrs(self):
         return self.cursor.attrs._replace(
             data=" ",
@@ -229,6 +298,7 @@ class _BackgroundColorEraseScreen(pyte.HistoryScreen):
             strikethrough=False,
             reverse=False,
             blink=False,
+            dim=False,
         )
 
     def erase_in_line(self, how: int = 0, private: bool = False) -> None:
@@ -557,6 +627,8 @@ class ScreenRenderer:
         codes = []
         if getattr(cell, "bold", False):
             codes.append("1")
+        if getattr(cell, "dim", False):
+            codes.append("2")  # faint — pyte drops it, so we track it on _DimChar (#113)
         if getattr(cell, "italics", False):
             codes.append("3")
         if getattr(cell, "underscore", False):
