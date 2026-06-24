@@ -1055,6 +1055,60 @@ def test_remove_worktree_on_exit_keeps_unintegrated_session(tmp_path):
     assert info.path.exists()
 
 
+def test_remove_worktree_on_exit_removes_dirty_worktree_after_copy_offer(tmp_path):
+    # Regression: a fully-integrated session whose worktree still holds uncommitted
+    # leftover files (e.g. an untracked file the user declined / a copied-out file
+    # whose source remains) must NOT linger forever. On an interactive exit the copy
+    # offer runs, then the worktree is removed — no "open end".
+    main = _init_repo(tmp_path)
+    base = main.current_branch()
+    info, work = _make_session(main, "session-1", base)
+    _commit(work, "a.txt", "x\n", "<aGiTrack> work")
+
+    runner = _integration_runner(main, work, base, "session-1")
+    runner.worktree = info
+    runner.child_pid = None
+    runner.master_fd = None
+    runner.screen = object()  # interactive exit: a UI exists to offer the copy
+    runner._exit_aborted = False
+    offered: list = []
+    runner._offer_copy_unstaged_to_base = lambda **k: offered.append(k.get("context"))
+
+    runner._integrate_session_on_exit()  # clean integrate -> nothing ahead of base
+    (work.repo / "leftover.txt").write_text("stranded\n")  # uncommitted leftover file
+    assert work.has_changes()  # the worktree is dirty...
+    runner._remove_worktree_on_exit()
+
+    # ...but it is still removed (after the copy offer), not stranded.
+    assert offered == ["exit"]
+    assert not info.path.exists()
+    assert runner.worktree is None
+
+
+def test_remove_worktree_on_signal_exit_keeps_dirty_worktree(tmp_path):
+    # On a signal teardown (terminal/window closed: screen is None) there is no UI to
+    # offer the copy, so a worktree with leftover files is KEPT rather than silently
+    # discarding the user's uncommitted work — the next startup surfaces it.
+    main = _init_repo(tmp_path)
+    base = main.current_branch()
+    info, work = _make_session(main, "session-1", base)
+    _commit(work, "a.txt", "x\n", "<aGiTrack> work")
+
+    runner = _integration_runner(main, work, base, "session-1")
+    runner.worktree = info
+    runner.child_pid = None
+    runner.master_fd = None
+    runner.screen = None  # signal teardown: no UI
+    runner._offer_copy_unstaged_to_base = lambda **k: pytest.fail("no copy offer without a UI")
+
+    runner._integrate_session_on_exit()
+    (work.repo / "leftover.txt").write_text("stranded\n")
+    runner._remove_worktree_on_exit()
+
+    # Kept so the leftover file isn't lost.
+    assert info.path.exists()
+
+
 def test_integrate_active_session_fast_forward_does_not_prompt(tmp_path):
     main = _init_repo(tmp_path)
     base = main.current_branch()
