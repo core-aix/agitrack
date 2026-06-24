@@ -1978,6 +1978,31 @@ def test_screen_tracks_faint_dim_attribute():
     assert screen.buffer[0][3].dim is False  # 'd' after reset is not
 
 
+def test_faint_tracking_ignores_the_2_inside_truecolor_sgr():
+    # The faint code (2) must be parsed exactly where pyte expects it, never matched
+    # anywhere in the parameter list: in a 24-bit colour like `38;2;r;g;b` the `2` is the
+    # colour selector, not faint. Otherwise normal truecolor text — e.g. the user's own
+    # white input in Claude — gets wrongly dimmed (regression of the #113 fix).
+    import pyte
+
+    from agitrack.proxy import _BackgroundColorEraseScreen
+
+    screen = _BackgroundColorEraseScreen(30, 2, history=10, ratio=0.5)
+    stream = pyte.ByteStream(screen)
+    stream.feed(b"\x1b[38;2;255;255;255mhi")  # 24-bit white
+    assert screen.buffer[0][0].dim is False  # not dimmed by the colour's "2"
+    assert screen.buffer[0][0].fg == "ffffff"  # colour still applied
+
+    # 256-colour (38;5;n) likewise must not be read as faint.
+    stream.feed(b"\x1b[38;5;240mx")
+    assert screen.buffer[0][2].dim is False
+
+    # Genuine faint COMBINED with a truecolor fg keeps both.
+    stream.feed(b"\x1b[2;38;2;128;128;128mg")
+    cell = screen.buffer[0][3]
+    assert cell.dim is True and cell.fg == "808080"
+
+
 def test_screen_faint_cleared_by_normal_intensity_and_erase():
     # SGR 22 (normal intensity) clears faint, and an erase leaves clean (non-dim) blanks.
     import pyte
