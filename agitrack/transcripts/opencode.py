@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 from agitrack.env import getenv_compat
-import pty
 import signal
 import subprocess
 import tempfile
@@ -394,9 +393,40 @@ def _run_export_pty(repo: Path, session_id: str, *, sanitize: bool = False) -> t
 
 
 def _run_opencode_pty(repo: Path, args: list[str]) -> tuple[str, int]:
-    """Run ``opencode`` under a pty in ``repo`` (it talks to a TTY) and return
-    its combined output and exit code. A pty is needed because the CLI writes
-    framed/colour output to a terminal, not a plain pipe."""
+    """Run ``opencode`` in ``repo`` and return its combined output and exit code.
+
+    The CLI writes framed/colour output to a terminal, so POSIX runs it under a real
+    pty. Native Windows has no ``pty``/``fork``, so it runs the (non-interactive)
+    one-shot subcommand through a normal pipe with the same timeout guard."""
+    if os.name == "nt":
+        return _run_opencode_subprocess(repo, args)
+    return _run_opencode_posix_pty(repo, args)
+
+
+def _run_opencode_subprocess(repo: Path, args: list[str]) -> tuple[str, int]:
+    """Windows fallback for :func:`_run_opencode_pty`: a plain pipe with the same
+    timeout semantics (returns ``124`` on timeout, ``127`` when ``opencode`` is missing —
+    the same "unusable" codes callers already treat as no data)."""
+    try:
+        result = subprocess.run(
+            args,
+            cwd=repo,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=_OPENCODE_CALL_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        out = exc.output or b""
+        text = out.decode(errors="replace") if isinstance(out, (bytes, bytearray)) else str(out)
+        return text, 124
+    except OSError:
+        return "", 127
+    return result.stdout.decode(errors="replace"), result.returncode
+
+
+def _run_opencode_posix_pty(repo: Path, args: list[str]) -> tuple[str, int]:
+    import pty
+
     pid, fd = pty.fork()
     if pid == 0:
         # Never let the child survive a failed exec — it would keep running

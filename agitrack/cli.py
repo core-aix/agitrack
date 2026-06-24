@@ -12,8 +12,16 @@ from agitrack.backends.setup import select_default_backend, select_default_summa
 from agitrack.backends.proxy_agents import available_backends
 from agitrack.git import GitError, GitRepo, RepoLock, already_running_message
 from agitrack.config import GlobalConfig, settings
-from agitrack.proxy import ProxyRunner
 from agitrack.shell import AgitrackShell
+
+try:
+    # The proxy drives the agent through a (Con)PTY. Imported at module level so tests and
+    # the launch path reference ``cli.ProxyRunner`` directly, but tolerant of a platform
+    # where the proxy's platform layer can't load yet — the headless paths (json mode,
+    # dashboard, --version) don't need it, and proxy mode reports it cleanly below.
+    from agitrack.proxy import ProxyRunner
+except ImportError:  # pragma: no cover - only when the proxy platform layer is unavailable
+    ProxyRunner = None  # type: ignore[assignment,misc]
 
 _BACKEND_COMMANDS = {
     "claude": "claude",
@@ -427,6 +435,9 @@ def main(argv: list[str] | None = None) -> int:
             # Warn about a menu key the host likely intercepts (e.g. VS Code's Ctrl-G) and
             # let the user test/replace it now — the only chance before the TUI takes over.
             if not _verify_menu_key(config, scripted=scripted):
+                return 1
+            if ProxyRunner is None:  # pragma: no cover - platform without proxy support
+                print("The interactive aGiTrack TUI is not available on this platform yet.")
                 return 1
             return ProxyRunner(
                 repo,
