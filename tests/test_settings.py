@@ -111,6 +111,7 @@ def test_settings_menu_saves_bool_to_repo(tmp_path):
             ("Apply", lambda opts: next(o for o in opts if o.startswith("This repository"))),
             ("Settings", lambda opts: next(o for o in opts if o.startswith("← Close"))),  # close → save prompt
             ("unsaved settings change", "Yes, save them"),
+            ("Restart aGiTrack now", "Not now"),  # restart-only setting → offered a restart
         ],
     )
     runner._settings_menu()
@@ -128,6 +129,7 @@ def test_settings_menu_saves_choice_to_global(tmp_path):
             ("Apply", lambda opts: next(o for o in opts if o.startswith("Global"))),
             ("Settings", lambda opts: next(o for o in opts if o.startswith("← Close"))),
             ("unsaved settings change", "Yes, save them"),
+            ("Restart aGiTrack now", "Not now"),  # default backend is read at launch → restart offered
         ],
     )
     runner._settings_menu()
@@ -204,6 +206,7 @@ def test_settings_menu_edits_allowed_paths(tmp_path):
             ("Apply", lambda opts: next(o for o in opts if o.startswith("This repository"))),
             ("Settings", lambda opts: next(o for o in opts if o.startswith("← Close"))),
             ("unsaved settings change", "Yes, save them"),
+            ("Restart aGiTrack now", "Not now"),  # allowed-paths is read at launch → restart offered
         ],
     )
     runner._settings_menu()
@@ -224,16 +227,21 @@ def test_settings_timings_submenu_saves(tmp_path):
             ("Timings", "← Back"),  # back to the settings list
             ("Settings", lambda opts: next(o for o in opts if o.startswith("← Close"))),
             ("unsaved settings change", "Yes, save them"),
+            ("Restart aGiTrack now", "Not now"),  # timings are read at launch → restart offered
         ],
     )
     runner._settings_menu()
     assert runner.global_config.timings["file_stable_seconds"] == 12.0
 
 
-def test_settings_restart_setting_warns_to_restart(tmp_path):
+def test_settings_restart_setting_offers_restart(tmp_path):
+    # A restart-only setting (sandbox) offers a restart after saving; declining keeps running
+    # and notes the change applies next launch.
     runner = _settings_runner(tmp_path)
     msgs: list[str] = []
     runner._set_message = lambda m, **k: msgs.append(m)
+    restarted: list = []
+    runner._restart_now = lambda msg: restarted.append(msg)
     _drive(
         runner,
         [
@@ -242,10 +250,33 @@ def test_settings_restart_setting_warns_to_restart(tmp_path):
             ("Apply", lambda opts: next(o for o in opts if o.startswith("Global"))),
             ("Settings", lambda opts: next(o for o in opts if o.startswith("← Close"))),
             ("unsaved settings change", "Yes, save them"),
+            ("Restart aGiTrack now", "Not now"),
         ],
     )
     runner._settings_menu()
-    assert any("restart aGiTrack yourself" in m for m in msgs)
+    assert runner.global_config.sandbox is False  # the change was saved
+    assert restarted == []  # declined → kept running
+    assert any("next time you start aGiTrack" in m for m in msgs)
+
+
+def test_settings_restart_setting_can_restart_now(tmp_path):
+    # Accepting the restart offer triggers the re-exec path.
+    runner = _settings_runner(tmp_path)
+    restarted: list = []
+    runner._restart_now = lambda msg: restarted.append(msg)
+    _drive(
+        runner,
+        [
+            ("Settings", lambda opts: next(o for o in opts if o.startswith("Confine the agent"))),
+            ("Confine the agent", "Turn OFF"),
+            ("Apply", lambda opts: next(o for o in opts if o.startswith("Global"))),
+            ("Settings", lambda opts: next(o for o in opts if o.startswith("← Close"))),
+            ("unsaved settings change", "Yes, save them"),
+            ("Restart aGiTrack now", "Yes, restart now"),
+        ],
+    )
+    runner._settings_menu()
+    assert restarted  # _restart_now was invoked
 
 
 def test_settings_live_setting_has_no_restart_warning(tmp_path):
