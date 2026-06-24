@@ -124,6 +124,23 @@ def _strip_ansi(text: str) -> str:
     return _ANSI_CSI_OSC_RE.sub("", text).replace("\r", "\n")
 
 
+# The claude CLI refuses to resume a session that is still held by a running background
+# agent (a stale `bg` agent from an earlier run), printing this and exiting non-zero:
+#   "Session <id> is currently running as a background agent (bg). Use `claude agents`
+#    to find and attach to it, or add --fork-session to branch off a copy."
+# In proxy mode that error lands on the alt-screen, which teardown discards — so the user
+# saw only a silent flash. We detect it to surface an actionable message instead (#114).
+_BUSY_BACKGROUND_AGENT_RE = re.compile(r"running as a background agent|--fork-session", re.IGNORECASE)
+
+
+def _format_backend_output(raw: bytes) -> str:
+    """The backend's last PTY output as readable, indented lines (ANSI stripped, blank
+    lines collapsed) for echoing a launch-failure reason on the restored host screen."""
+    text = _strip_ansi(raw.decode("utf-8", errors="replace"))
+    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+    return "\n".join(f"    {line}" for line in lines)
+
+
 # Sentinel: the summarizer-model picker was dismissed (Esc), distinct from a real None choice
 # ("same as the session model"). Lets _choose_summarizer_model report "no change" unambiguously.
 _NO_MODEL_PICK = object()
@@ -547,6 +564,10 @@ class ProxyRunner:
         self.last_child_output = 0.0
         self.last_user_input = 0.0  # monotonic time of the user's last keystroke (drives idle backoff)
         self.last_child_output_sample = b""
+        # Set when the backend fails to launch (e.g. the resumed session is held by a
+        # running background agent) so run() can echo the reason on the restored host
+        # screen instead of leaving the user with a silent alt-screen flash (#114).
+        self._backend_exit_notice: str | None = None
         self.last_status = ""
         self.last_status_change = 0.0
         self.message: str | None = None
@@ -960,6 +981,7 @@ class ProxyRunner:
                 "_allowed_edit_paths": [],
                 "_backend_command": [],
                 "_commit_guidance": True,
+                "_backend_exit_notice": None,
                 "_relaunch_times": [],
                 "_exiting": False,
                 "_finalized_on_exit": False,
@@ -1144,6 +1166,11 @@ class ProxyRunner:
             # the new instance can acquire it and auto-resume the session.
             if self._reopen_after_exit:
                 self._reopen_in_new_window()
+        # The backend failed to launch (e.g. the resumed session is busy as a background
+        # agent). The error lived on the now-discarded alt-screen, so echo it on the
+        # restored terminal — otherwise the user sees only a silent flash (#114).
+        if self._backend_exit_notice:
+            print(f"\n{self._backend_exit_notice}", file=sys.stderr)
         # A self-update was applied; re-exec aGiTrack in place now that the terminal
         # is restored and the management lock is released. Does not return.
         if self._pending_restart:
@@ -5516,13 +5543,60 @@ class ProxyRunner:
         self._render()
         return True
 
-    def _relaunch_backend_or_exit(self) -> bool:
+    # How soon after a spawn an exit still counts as a "launch failure" (vs a normal
+    # mid-session exit like Esc on Claude's picker). A failed launch dies within a
+    # second or two; this window is generous for a slow machine.
+    LAUNCH_FAILURE_WINDOW_SECONDS = 20.0
+
+    def _backend_launch_failure_reason(self, exit_code: int | None) -> str | None:
+        """When the backend exited as a *launch failure* (right after spawn, before any
+        real interaction), a user-facing reason to surface instead of relaunching into the
+        same failure and exiting with a silent flash (#114). ``None`` ⇒ treat as an ordinary
+        exit (relaunch+resume as before).
+
+        Recognized: the resumed session is held by a running background agent (claude's own
+        message, with an actionable hint), or any other backend that exited **non-zero**
+        within the launch window (its last output is surfaced verbatim)."""
+        launched_at = getattr(self, "_cwd_launch_at", 0.0)
+        if not launched_at or (time.time() - launched_at) > self.LAUNCH_FAILURE_WINDOW_SECONDS:
+            return None  # not a launch-time exit — a real mid-session exit; relaunch as usual
+        raw = self.last_child_output_sample
+        text = _strip_ansi(raw.decode("utf-8", errors="replace"))
+        if _BUSY_BACKGROUND_AGENT_RE.search(text):
+            body = _format_backend_output(raw)
+            return (
+                "aGiTrack could not resume your last session — it is still running as a "
+                "background agent, so the backend refused to attach.\n\n"
+                "  • Start a fresh conversation:      agitrack --new-session\n"
+                "  • Or branch off a copy of it:      agitrack -- --fork-session\n"
+                "  • Or stop the background agent (e.g. `claude agents`) and retry.\n"
+                + (f"\nThe backend reported:\n{body}" if body else "")
+            )
+        if exit_code not in (None, 0):
+            body = _format_backend_output(raw)
+            if not body:
+                return None  # nothing useful to show; fall back to normal relaunch handling
+            return f"The backend exited (code {exit_code}) right after starting. It reported:\n{body}"
+        return None
+
+    def _relaunch_backend_or_exit(self, exit_code: int | None = None) -> bool:
         # The only session's backend process exited on its own — most often Claude
         # quitting when you Esc its native session picker, where Claude restores
         # the terminal and terminates (its shutdown sequence is in the debug log).
         # aGiTrack should stay up and relaunch+resume the conversation rather than
         # quitting with it. Guard against a crash loop: if the backend keeps dying
         # quickly, stop relaunching and exit normally.
+        #
+        # But a *launch failure* (e.g. the resumed session is held by a running
+        # background agent) would just recur on every relaunch, so the user would see
+        # nothing but a flashing alt-screen. Detect that, surface the reason on the
+        # restored host screen (printed in run()), and exit instead of crash-looping (#114).
+        reason = self._backend_launch_failure_reason(exit_code)
+        if reason is not None:
+            self._backend_exit_notice = reason
+            self._debug(f"backend launch failure; surfacing instead of relaunching: {reason!r}")
+            self._finalize_on_backend_exit()
+            return False
         now = time.monotonic()
         recent = [t for t in self._relaunch_times if now - t < 12.0]
         if len(recent) >= 3:
@@ -5542,6 +5616,27 @@ class ProxyRunner:
             self._finalize_on_backend_exit()
             return False
         return True
+
+    def _reap_active_child_exit_code(self) -> int | None:
+        """Non-blocking reap of the active backend child to learn its exit code — used by
+        the master_fd-EOF path, which (unlike the waitpid path) has no status of its own.
+        At EOF the child has already exited, so this normally succeeds; ``None`` if it is
+        not reapable (already collected, or — rarely — not quite gone yet)."""
+        pid = self.child_pid
+        if pid is None:
+            return None
+        try:
+            done, status = os.waitpid(pid, os.WNOHANG)
+        except (ChildProcessError, OSError):
+            return None
+        if not done:
+            return None
+        if hasattr(os, "waitstatus_to_exitcode"):
+            try:
+                return os.waitstatus_to_exitcode(status)
+            except ValueError:
+                return None
+        return None
 
     def _finalize_on_backend_exit(self) -> None:
         # The only session's backend process is gone and we are NOT relaunching
@@ -5877,9 +5972,10 @@ class ProxyRunner:
             sample = self.last_child_output_sample[-2048:].decode(errors="replace").replace("\x1b", "\\x1b")
             self._debug(f"master_fd closed (backend gone); last_output={sample!r}")
             self._raw_capture("EOF", b"")
+            exit_code = self._reap_active_child_exit_code()  # so a launch failure can be detected
             if self._handle_active_session_exit():
                 return "continue"
-            if self._relaunch_backend_or_exit():
+            if self._relaunch_backend_or_exit(exit_code):
                 return "continue"
             return "break"
         if output:
@@ -6074,7 +6170,7 @@ class ProxyRunner:
                 # whichever sees the exit first must relaunch.
                 if self._handle_active_session_exit():
                     return "continue"
-                if self._relaunch_backend_or_exit():
+                if self._relaunch_backend_or_exit(exit_code):
                     return "continue"
                 return exit_code
         return None
