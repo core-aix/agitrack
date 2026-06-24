@@ -631,3 +631,41 @@ def test_retarget_session_dir_reimports_unsanitized_when_dir_differs(monkeypatch
     assert captured["overwrite"] is True
     assert captured["repo"] == worktree  # re-imported with the worktree as the cwd
     assert captured["sid"] == "ses_1"
+
+
+def test_opencode_bare_run_folds_system_prompt_into_prompt(monkeypatch):
+    # OpenCode ignores --system-prompt, so the summarizer's INSTRUCTION (passed as system_prompt)
+    # must be folded into the prompt positional — otherwise OpenCode never learns to summarize.
+    import io
+    import types
+    from pathlib import Path
+
+    from agitrack.backends import opencode as O
+    from agitrack.backends.opencode import OpenCodeBackend
+
+    captured = {}
+
+    class FakeProc:
+        def __init__(self, cmd):
+            captured["cmd"] = cmd
+            self.stdout = io.StringIO("")
+
+        def wait(self):
+            return 0
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(O.subprocess, "Popen", lambda cmd, **k: FakeProc(cmd))
+    monkeypatch.setattr(
+        O.threading,
+        "Timer",
+        lambda *a, **k: types.SimpleNamespace(start=lambda: None, cancel=lambda: None, daemon=False),
+    )
+    backend = OpenCodeBackend(repo=Path("/tmp"))
+
+    backend.run("TRACE", model=None, session_id=None, bare=True, system_prompt="SUMMARIZE THIS")
+    assert captured["cmd"][-1] == "SUMMARIZE THIS\n\nTRACE"  # instruction reached OpenCode
+
+    backend.run("HELLO", model=None, session_id=None, bare=False, system_prompt="X")
+    assert captured["cmd"][-1] == "HELLO"  # non-bare run: prompt untouched
