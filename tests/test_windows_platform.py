@@ -138,3 +138,33 @@ def test_custom_launch_command_bypasses_install_gate(monkeypatch):
         lambda *a, **k: pytest.fail("the install gate must be skipped when a launch command is set"),
     )
     assert runner._ensure_backend_available() is True
+
+
+# --- install guidance covers macOS, Linux, AND Windows in one message -----------------
+
+
+def test_backend_install_hint_covers_all_platforms():
+    from agitrack.backends import setup
+
+    hint = setup.install_hint("opencode")
+    assert "npm install -g opencode-ai" in hint  # works on any OS (with Node)
+    assert "winget install OpenJS.NodeJS" in hint  # Windows Node
+    assert "brew install node" in hint  # macOS Node
+    assert "package manager" in hint  # Linux
+    assert "opencode.ai" in hint
+
+
+def test_git_install_hint_covers_all_platforms():
+    hint = cli._git_install_hint()
+    assert "brew install git" in hint  # macOS
+    assert "apt install git" in hint  # Linux
+    assert "winget install Git.Git" in hint  # Windows
+
+
+def test_cli_gives_clear_message_when_git_missing(monkeypatch, capsys):
+    # The VS Code extension can install the aGiTrack CLI without git being present; that must
+    # produce an actionable message, not a raw FileNotFoundError from repo discovery.
+    monkeypatch.setattr(cli.shutil, "which", lambda name: None if name == "git" else f"/usr/bin/{name}")
+    rc = cli.main(["--repo", "."])
+    assert rc == 1
+    assert "git is not installed" in capsys.readouterr().out

@@ -29,6 +29,21 @@ _BACKEND_COMMANDS = {
 }
 
 
+def _git_install_hint() -> str:
+    """Shown when ``git`` isn't on PATH. aGiTrack manages your commits with git, so it can't
+    run without it — a common state right after the VS Code extension installs the CLI but
+    git itself isn't installed. Covers macOS, Linux, and Windows so any user sees a command
+    that works."""
+    return (
+        "git is not installed (or not on your PATH).\n"
+        "aGiTrack manages your commits with git, so it can't run without it. Install it:\n"
+        "  macOS:    brew install git    (or: xcode-select --install)\n"
+        "  Linux:    use your package manager, e.g. sudo apt install git / sudo dnf install git\n"
+        "  Windows:  winget install Git.Git    (or https://git-scm.com/download/win)\n"
+        "Then open a NEW terminal so the updated PATH is picked up."
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Interactive agent + git commit orchestration.",
@@ -216,6 +231,14 @@ def main(argv: list[str] | None = None) -> int:
 
         print(__version__)
         return 0
+
+    # aGiTrack can't do anything without git (every path below discovers/commits to a repo).
+    # Check once, up front, so a missing git gives a clear, actionable message instead of a
+    # raw FileNotFoundError deep in repo discovery — common right after the VS Code extension
+    # installs the CLI but git isn't on PATH. --version/--help above don't need git.
+    if shutil.which("git") is None:
+        print(_git_install_hint())
+        return 1
 
     if args.dashboard_serve:
         # Internal entry point: the detached dashboard child process. `agitrack -d`

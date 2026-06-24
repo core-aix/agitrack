@@ -6,15 +6,22 @@ from typing import Callable
 
 from agitrack.backends.proxy_agents import available_backends, make_proxy_agent
 
-# Where to point users when a backend CLI is missing.
-INSTALL_HINTS = {
-    "claude": (
-        "Install Claude Code: https://docs.claude.com/en/docs/claude-code\n"
-        "  e.g. curl -fsSL https://claude.ai/install.sh | bash  (or: npm install -g @anthropic-ai/claude-code)"
-    ),
-    "opencode": (
-        "Install OpenCode: https://opencode.ai\n  e.g. brew install sst/tap/opencode  (or: npm install -g opencode-ai)"
-    ),
+# Per-backend facts used to build a single install hint that covers macOS, Linux, AND
+# Windows — so whatever OS a user is on, they see a command that works. ``unix`` is the
+# native installer for macOS/Linux; ``npm`` is the cross-platform fallback (needs Node.js).
+_BACKEND_INSTALL = {
+    "claude": {
+        "label": "Claude Code",
+        "url": "https://docs.claude.com/en/docs/claude-code",
+        "unix": "curl -fsSL https://claude.ai/install.sh | bash",
+        "npm": "@anthropic-ai/claude-code",
+    },
+    "opencode": {
+        "label": "OpenCode",
+        "url": "https://opencode.ai",
+        "unix": "curl -fsSL https://opencode.ai/install | bash",
+        "npm": "opencode-ai",
+    },
 }
 
 
@@ -32,7 +39,18 @@ def backend_installed(name: str) -> bool:
 
 
 def install_hint(name: str) -> str:
-    return INSTALL_HINTS.get(name, f"Install the '{name}' CLI and make sure it is on your PATH.")
+    """A cross-platform (macOS / Linux / Windows) install hint for a missing backend CLI."""
+    info = _BACKEND_INSTALL.get(name)
+    if info is None:
+        return f"Install the '{name}' CLI and make sure it is on your PATH."
+    return (
+        f"Install {info['label']}: {info['url']}\n"
+        f"  macOS / Linux:  {info['unix']}\n"
+        f"  any OS (Node):  npm install -g {info['npm']}\n"
+        "  (no Node? install it — macOS: brew install node · Linux: your package manager · "
+        "Windows: winget install OpenJS.NodeJS)\n"
+        "  Then open a NEW terminal so the updated PATH is picked up."
+    )
 
 
 def select_default_backend(
