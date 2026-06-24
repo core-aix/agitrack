@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import contextlib
 import os
-import pty
 import subprocess
 import sys
 from collections.abc import Iterator
@@ -83,6 +82,7 @@ def run_in_pty(argv: list[str]) -> bytes:
     across ``wait()`` keeps the output buffered; we then drain the master non-blocking. The
     child's output here is tiny (well under the pty buffer), so waiting first can't
     deadlock on a full buffer."""
+    import pty  # POSIX-only; imported lazily so this test helper imports on native Windows
     import select
 
     master, slave = pty.openpty()
