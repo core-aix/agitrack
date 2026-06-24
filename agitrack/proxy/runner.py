@@ -45,6 +45,7 @@ from agitrack.config import AgitrackState
 from agitrack.git import WorktreeInfo, WorktreeManager, _sanitize_name, is_managed_branch
 from agitrack.proxy.commit_engine import CommitEngine
 from agitrack.proxy.integration import IntegrationService, MergeContext, MergePhase
+from agitrack.proxy.platform import make_child_process
 from agitrack.proxy.process import BackendProcess
 from agitrack.proxy.session import Session
 from agitrack.transcripts import SessionRef
@@ -1243,11 +1244,12 @@ class ProxyRunner:
         # before the sandbox wrapper so they reach the backend, not sandbox-exec.
         command = command + getattr(self, "_backend_args", [])
         command = self._confine_to_worktree(command)
-        # Fork/exec mechanics delegated to BackendProcess; policy (command
-        # construction, sandbox wrapping) stays here in the runner. The session
-        # owns its BackendProcess; child_pid / master_fd remain readable on the
-        # runner via the Session-delegating compat properties.
-        self.active.process = BackendProcess.spawn(command, str(self.repo.repo), extra_env=self._backend_child_env())
+        # Pseudo-terminal mechanics delegated to the platform child process (POSIX PTY
+        # via BackendProcess, or Windows ConPTY via NtChildProcess); policy (command
+        # construction, sandbox wrapping) stays here in the runner. The session owns its
+        # child process; child_pid / master_fd remain readable on the runner via the
+        # Session-delegating compat properties.
+        self.active.process = make_child_process(command, str(self.repo.repo), extra_env=self._backend_child_env())
         # Re-arm the cwd-drift check for this launch, and remember when it started:
         # only turns recorded at/after this time count, so a stale cwd left in the
         # transcript before this launch can't trigger a false drift warning (#72).

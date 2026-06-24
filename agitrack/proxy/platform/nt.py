@@ -9,7 +9,11 @@ the same socketpair trick and is the first piece wired through the platform fact
 
 from __future__ import annotations
 
+import os
+import select
 import socket
+import subprocess
+import threading
 
 
 class NtWaker:
@@ -45,3 +49,199 @@ class NtWaker:
                 sock.close()
             except OSError:
                 pass
+
+
+def _env_block(extra_env: dict[str, str] | None) -> str | None:
+    """The null-separated environment block ``winpty`` expects, or ``None`` to inherit
+    aGiTrack's environment unchanged (the common case — no per-child overrides)."""
+    if not extra_env:
+        return None
+    merged = {**os.environ, **extra_env}
+    return "".join(f"{key}={value}\0" for key, value in merged.items()) + "\0"
+
+
+class NtChildProcess:
+    """A backend session's child on native Windows: a ConPTY (``pywinpty``) whose output
+    is bridged to a ``socketpair`` so the reactor can ``select`` on it exactly as it does
+    the POSIX PTY master. Satisfies the :class:`~agitrack.proxy.platform.base.ChildProcess`
+    contract; the reactor and session code can't tell it apart from ``BackendProcess``.
+
+    A single daemon reader thread copies ConPTY output into the bridge socket. That gives
+    the same backpressure the POSIX PTY does: if the reactor falls behind, the socket
+    buffer fills, the reader blocks on ``sendall``, the ConPTY output pipe fills, and the
+    backend throttles — never an unbounded in-memory queue.
+    """
+
+    def __init__(self, pty: object, child_pid: int | None) -> None:
+        self._pty = pty
+        self.child_pid = child_pid
+        self._rsock, self._wsock = socket.socketpair()
+        self._rsock.setblocking(False)
+        self._write_lock = threading.Lock()
+        self._exit_code: int | None = None
+        self._closed = False
+        self._reader = threading.Thread(target=self._pump, name="agitrack-conpty-reader", daemon=True)
+        self._reader.start()
+
+    @classmethod
+    def spawn(cls, command: list[str], cwd: str, extra_env: dict[str, str] | None = None) -> "NtChildProcess":
+        import winpty  # type: ignore[import-not-found]  # Windows-only dependency
+
+        rows, cols = 24, 80
+        pty = winpty.PTY(cols, rows)
+        appname = command[0]
+        cmdline = subprocess.list2cmdline(command[1:]) if len(command) > 1 else ""
+        pty.spawn(appname, cmdline=cmdline, cwd=cwd, env=_env_block(extra_env))
+        child_pid = getattr(pty, "pid", None)
+        return cls(pty, child_pid)
+
+    @property
+    def master_fd(self) -> int | None:
+        """The bridge socket's fd — the ``select``-able stand-in for the PTY master."""
+        if self._closed:
+            return None
+        return self._rsock.fileno()
+
+    @master_fd.setter
+    def master_fd(self, value: int | None) -> None:
+        # Teardown nulls master_fd to mark the child gone; mirror that by closing the bridge.
+        if value is None:
+            self._close_bridge()
+
+    def read_fileno(self) -> int | None:
+        return self.master_fd
+
+    def _pump(self) -> None:
+        """Copy ConPTY output → bridge socket until the child exits/EOF."""
+        try:
+            while True:
+                try:
+                    data = self._pty.read(65536, blocking=True)  # type: ignore[attr-defined]
+                except Exception:  # noqa: BLE001 - any winpty read error means the child is gone
+                    break
+                if not data:
+                    break
+                payload = data.encode("utf-8", "surrogatepass") if isinstance(data, str) else data
+                try:
+                    self._wsock.sendall(payload)
+                except OSError:
+                    break
+        finally:
+            self._exit_code = self._read_exitstatus()
+            try:
+                self._wsock.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+    def _read_exitstatus(self) -> int | None:
+        getter = getattr(self._pty, "get_exitstatus", None)
+        if getter is None:
+            return None
+        try:
+            return getter()
+        except Exception:  # noqa: BLE001 - best effort; treat as unknown
+            return None
+
+    def drain(self) -> bytes | None:
+        """All currently-available bridged output (bounded), or ``None`` at EOF — the same
+        contract as ``BackendProcess.drain``."""
+        if self._closed:
+            return None
+        chunks: list[bytes] = []
+        total = 0
+        while total < 262_144:
+            try:
+                data = self._rsock.recv(65536)
+            except BlockingIOError:
+                break
+            except OSError:
+                break
+            if not data:
+                break  # bridge EOF: the reader thread saw the child go
+            chunks.append(data)
+            total += len(data)
+            readable, _, _ = select.select([self._rsock], [], [], 0)
+            if self._rsock not in readable:
+                break
+        if not chunks:
+            return None
+        return b"".join(chunks)
+
+    def write(self, data: bytes) -> None:
+        if self._closed:
+            return
+        with self._write_lock:
+            try:
+                self._pty.write(data.decode("utf-8", "surrogatepass"))  # type: ignore[attr-defined]
+            except Exception:  # noqa: BLE001 - match os.write's "let the caller decide" is N/A here
+                pass
+
+    def resize(self, rows: int, cols: int) -> None:
+        if self._closed:
+            return
+        try:
+            self._pty.set_size(cols, rows)  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001 - a failed resize is non-fatal
+            pass
+
+    def interrupt(self) -> None:
+        # Ctrl-C reaches the ConPTY child as an ETX byte, which it turns into a console
+        # Ctrl-C — process-group-safe, unlike GenerateConsoleCtrlEvent.
+        self.write(b"\x03")
+
+    def poll(self) -> int | None:
+        if self._exit_code is not None:
+            return self._exit_code
+        isalive = getattr(self._pty, "isalive", None)
+        if isalive is not None:
+            try:
+                if isalive():
+                    return None
+            except Exception:  # noqa: BLE001
+                pass
+        self._exit_code = self._read_exitstatus()
+        return self._exit_code
+
+    def cleanup(self) -> None:
+        if self._closed:
+            return
+        self.interrupt()
+        # Give the child a moment to exit on the Ctrl-C, then force it.
+        import time
+
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            if self.poll() is not None:
+                return
+            time.sleep(0.05)
+        self._terminate_pty()
+
+    def terminate(self) -> None:
+        self._terminate_pty()
+        self._close_bridge()
+
+    def teardown(self) -> None:
+        self.cleanup()
+        self._close_bridge()
+
+    def signal_exit(self) -> None:
+        self.interrupt()
+
+    def _terminate_pty(self) -> None:
+        terminate = getattr(self._pty, "terminate", None)
+        if terminate is not None:
+            try:
+                terminate()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _close_bridge(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for sock in (self._rsock, self._wsock):
+            try:
+                sock.close()
+            except OSError:
+                pass
+        self.child_pid = None
