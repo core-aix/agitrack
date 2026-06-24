@@ -486,7 +486,9 @@ def _resolve_backend_command(
     import shlex
 
     try:
-        tokens = shlex.split(flag_value)
+        # posix=False on Windows so backslashes in paths (e.g. C:\tools\wrapper.exe) are
+        # kept literally rather than treated as shell escapes.
+        tokens = shlex.split(flag_value, posix=(os.name != "nt"))
     except ValueError as error:
         return ([], f"Invalid --backend-command {flag_value!r}: {error}")
     if not tokens:

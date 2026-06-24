@@ -787,6 +787,7 @@ class ProxyRunner:
         # Windows uses the Win32 console + socketpairs. None until run() (and in tests).
         self._host: Any = None
         self._waker: Any = None
+        self._last_shutdown_check = 0.0  # rate-limit the .agitrack/shutdown sentinel poll
 
     def _apply_timings(self, timings: dict[str, float]) -> None:
         # Override the class-constant timing defaults with the user's configured
@@ -1019,6 +1020,7 @@ class ProxyRunner:
                 "_wake_w": -1,
                 "_host": None,
                 "_waker": None,
+                "_last_shutdown_check": 0.0,
                 "UPDATE_CHECK_SECONDS": 300.0,
             }
         )
@@ -1210,6 +1212,12 @@ class ProxyRunner:
         return exit_code
 
     def _ensure_backend_available(self) -> bool:
+        # A user-supplied launch command (--backend-command / config backend_command)
+        # replaces the backend's own binary — a wrapper that ultimately execs the agent —
+        # so the default backend CLI need not be installed on PATH. Skip the install gate
+        # in that case (it would otherwise block a perfectly valid wrapped setup).
+        if self._launch_command():
+            return True
         try:
             resolved = ensure_installed_backend(self.state.backend, self.global_config, interactive=True)
         except BackendUnavailable as error:
@@ -2921,7 +2929,15 @@ class ProxyRunner:
         if fd is None:
             return
         try:
-            BackendProcess(fd).write(b"\r")
+            if self.master_fd == fd:
+                # The common case (the prompt's session is still active): write through its
+                # platform child, which knows how to reach the backend (a raw os.write to a
+                # bridge-socket fd would be wrong on Windows).
+                self.active.process.write(b"\r")
+            else:
+                # A backgrounded session's PTY (POSIX multi-session merge); a transient
+                # POSIX child writes straight to its master fd.
+                BackendProcess(fd).write(b"\r")
         except OSError:
             return  # Enter never reached the backend; the merge gate stays closed
         if self.merge_ctx is not None and self.master_fd == fd:
@@ -5597,10 +5613,7 @@ class ProxyRunner:
                 self._commit_latest_turn_sync()
             self._stop_file_watcher()
             if self.child_pid:
-                try:
-                    os.kill(self.child_pid, signal.SIGINT)
-                except ProcessLookupError:
-                    pass
+                self.active.process.interrupt()  # SIGINT on POSIX, ConPTY ETX on Windows
                 self._note_pid_for_reaping(self.child_pid)
             if self.master_fd is not None:
                 try:
@@ -6205,6 +6218,9 @@ class ProxyRunner:
         worker never stalls the reactor — and thus never delays typing)."""
         if not self.running:
             return  # a restart/exit is underway; touch no (possibly-removed) worktree
+        self._check_shutdown_request()
+        if not self.running:
+            return  # an external graceful-shutdown request just fired
         self._flush_pending_render()
         self._flush_pending_enter()
         self._drain_modal_mailbox()  # present any dialog the git worker queued
@@ -6247,13 +6263,12 @@ class ProxyRunner:
         """
         self._reap_stopped_children()  # collect SIGINT'd backends as they exit
         if self.child_pid is not None:
-            done, status = os.waitpid(self.child_pid, os.WNOHANG)
-            if done:
-                exit_code = os.waitstatus_to_exitcode(status) if hasattr(os, "waitstatus_to_exitcode") else 0
+            # Non-blocking exit check via the platform child (POSIX waitpid / Windows
+            # ConPTY isalive) — os.waitpid/os.WNOHANG don't exist on native Windows.
+            exit_code = self.active.process.poll()
+            if exit_code is not None:
                 sample = self.last_child_output_sample[-512:].decode(errors="replace").replace("\x1b", "\\x1b")
-                self._debug(
-                    f"child exited pid={self.child_pid} status={status} exit_code={exit_code} last_output={sample!r}"
-                )
+                self._debug(f"child exited pid={self.child_pid} exit_code={exit_code} last_output={sample!r}")
                 # Same handling as the master_fd-EOF path: switch away (multi
                 # session) or relaunch+resume (single) so Claude exiting its own
                 # picker on Esc doesn't take aGiTrack down. These two detectors race;
@@ -8162,6 +8177,11 @@ class ProxyRunner:
         pids = self._reap_pids
         if not pids:
             return
+        if os.name == "nt":
+            # No zombie reaping on Windows: a ConPTY child is fully closed by terminate(),
+            # and os.waitpid/os.WNOHANG don't exist there. Nothing to wait on.
+            self._reap_pids = []
+            return
         remaining = []
         for pid in pids:
             try:
@@ -8268,6 +8288,35 @@ class ProxyRunner:
         # SIGINT to child delegated to the session's BackendProcess (does not
         # close fd -- the run() finally block handles that so it always runs).
         self.active.process.signal_exit()
+
+    def _check_shutdown_request(self) -> None:
+        """Honor an external graceful-shutdown request: a ``<repo>/.agitrack/shutdown`` file.
+
+        This is the cross-platform equivalent of the SIGTERM/SIGHUP a closing terminal
+        sends — used by the VS Code extension on Windows, where a separate process can't
+        deliver a catchable signal (Node's ``process.kill`` hard-kills there). Polled
+        cheaply on a ~1 s interval; on finding the file we remove it, finalize the pending
+        turn (so a just-finished turn is committed, not stranded), and stop the loop."""
+        now = time.monotonic()
+        if now - self._last_shutdown_check < 1.0:
+            return
+        self._last_shutdown_check = now
+        try:
+            path = self.base_repo.repo / ".agitrack" / "shutdown"
+            if not path.exists():
+                return
+        except (OSError, AttributeError, TypeError):
+            return  # no real base repo (e.g. a unit-test runner) ⇒ nothing to honor
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        self._debug("external shutdown request — finalizing and exiting")
+        try:
+            self._finalize_pending_work()
+        except Exception as error:  # never let a slow/failing finalize block the shutdown
+            self._debug(f"shutdown finalize failed: {error!r}")
+        self.running = False
 
     def _handle_exit_signal(self, signum, _frame) -> None:
         # A self-update is mid-flight (pip is uninstalling/reinstalling aGiTrack). Do

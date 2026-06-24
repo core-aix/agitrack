@@ -16,6 +16,7 @@ _kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]  # Windows-only
 
 STD_INPUT_HANDLE = -10
 STD_OUTPUT_HANDLE = -11
+_CP_UTF8 = 65001
 
 # Console input modes (SetConsoleMode on the input handle).
 ENABLE_PROCESSED_INPUT = 0x0001
@@ -112,8 +113,17 @@ class RawConsole:
         self._out = _std_handle(STD_OUTPUT_HANDLE)
         self._saved_in: int | None = None
         self._saved_out: int | None = None
+        self._saved_cp: int | None = None
+        self._saved_out_cp: int | None = None
 
     def enter(self) -> None:
+        # aGiTrack emits UTF-8 (box-drawing, status line, agent output); without UTF-8
+        # code pages the console renders multi-byte sequences as garbage. Switch both code
+        # pages to CP_UTF8 (65001) and restore them on leave.
+        self._saved_cp = _kernel32.GetConsoleCP()
+        self._saved_out_cp = _kernel32.GetConsoleOutputCP()
+        _kernel32.SetConsoleCP(_CP_UTF8)
+        _kernel32.SetConsoleOutputCP(_CP_UTF8)
         self._saved_in = _get_mode(self._in)
         self._saved_out = _get_mode(self._out)
         in_mode = self._saved_in
@@ -132,3 +142,7 @@ class RawConsole:
             _set_mode(self._in, self._saved_in)
         if self._saved_out is not None:
             _set_mode(self._out, self._saved_out)
+        if self._saved_cp is not None:
+            _kernel32.SetConsoleCP(self._saved_cp)
+        if self._saved_out_cp is not None:
+            _kernel32.SetConsoleOutputCP(self._saved_out_cp)
