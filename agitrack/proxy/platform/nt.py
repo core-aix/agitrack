@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import select
+import shutil
 import socket
 import subprocess
 import threading
@@ -51,6 +52,28 @@ class NtWaker:
                 pass
 
 
+def _resolve_windows_command(command: list[str]) -> tuple[str, list[str]]:
+    """Turn a logical ``[exe, *args]`` into the ``(appname, args)`` ConPTY needs.
+
+    ConPTY's ``CreateProcess`` does NOT search ``PATH``/``PATHEXT`` for the application
+    name and cannot run a batch script directly — but Windows backends are routinely on
+    PATH only via an extension (``claude.cmd`` from npm, ``opencode.exe``), so:
+
+    * resolve the executable against PATH/PATHEXT with ``shutil.which`` (full path), and
+    * for a ``.cmd``/``.bat`` (Claude's npm shim), run it through ``cmd.exe /c`` — the only
+      way ``CreateProcess`` will execute a batch file.
+
+    This is what makes BOTH the ``claude`` and ``opencode`` backends launchable on native
+    Windows regardless of how their CLI was installed.
+    """
+    exe = shutil.which(command[0]) or command[0]
+    rest = command[1:]
+    if exe.lower().endswith((".cmd", ".bat")):
+        comspec = os.environ.get("COMSPEC", "cmd.exe")
+        return comspec, ["/c", exe, *rest]
+    return exe, rest
+
+
 def _env_block(extra_env: dict[str, str] | None) -> str | None:
     """The null-separated environment block ``winpty`` expects, or ``None`` to inherit
     aGiTrack's environment unchanged (the common case — no per-child overrides)."""
@@ -89,8 +112,8 @@ class NtChildProcess:
 
         rows, cols = 24, 80
         pty = winpty.PTY(cols, rows)
-        appname = command[0]
-        cmdline = subprocess.list2cmdline(command[1:]) if len(command) > 1 else ""
+        appname, args = _resolve_windows_command(command)
+        cmdline = subprocess.list2cmdline(args) if args else ""
         pty.spawn(appname, cmdline=cmdline, cwd=cwd, env=_env_block(extra_env))
         child_pid = getattr(pty, "pid", None)
         return cls(pty, child_pid)
@@ -116,7 +139,9 @@ class NtChildProcess:
         try:
             while True:
                 try:
-                    data = self._pty.read(65536, blocking=True)  # type: ignore[attr-defined]
+                    # pywinpty's PTY.read takes ONLY ``blocking`` (it returns all currently
+                    # available ConPTY output as a str); a length arg collides with it.
+                    data = self._pty.read(blocking=True)  # type: ignore[attr-defined]
                 except Exception:  # noqa: BLE001 - any winpty read error means the child is gone
                     break
                 if not data:

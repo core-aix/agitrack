@@ -14,9 +14,15 @@ import subprocess
 import sys
 from types import FrameType
 from typing import Any, Callable, cast
-import termios
 import threading
 import time
+
+# ``termios`` is POSIX-only and used solely on the POSIX host-terminal setup path; native
+# Windows drives the console through the platform layer instead. Guard on ``sys.platform``
+# (mypy platform-narrows it) so this module imports on Windows — ``agitrack.proxy.__init__``
+# eagerly imports it, so the whole proxy package (incl. the ConPTY child) must load there.
+if sys.platform != "win32":
+    import termios
 
 import pyte
 
