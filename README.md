@@ -7,7 +7,7 @@ You can use either **OpenCode** or **Claude (Claude Code)** as the AI agent — 
 
 ## Requirements
 
-aGiTrack runs on **macOS and Linux**. It doesn't run directly on Windows; on Windows, run it inside **WSL** (Windows Subsystem for Linux), which gives you a Linux environment. It works in the common terminal apps (iTerm2, Apple Terminal, Alacritty, kitty, GNOME Terminal, Konsole, tmux, the VS Code terminal, and Windows Terminal running WSL); on a terminal that lacks some advanced features, it still works, just with fewer visual frills.
+aGiTrack runs on **macOS, Linux, and natively on Windows** (PowerShell / Windows Terminal — no WSL required; WSL still works too). It works in the common terminal apps (iTerm2, Apple Terminal, Alacritty, kitty, GNOME Terminal, Konsole, tmux, the VS Code terminal, and Windows Terminal); on a terminal that lacks some advanced features, it still works, just with fewer visual frills. On Windows it drives the agent through a pseudo-console (ConPTY); the sandbox that confines agent writes is macOS/Linux-only, so on Windows the agent runs unconfined (a warning is shown).
 
 You need **git** and at least one AI agent — [Claude Code](https://docs.claude.com/en/docs/claude-code) or [OpenCode](https://opencode.ai) — installed and on your `PATH`. The dashboard can also use the **GitHub CLI (`gh`)** to show each commit's author by their GitHub username: install it from [cli.github.com](https://cli.github.com) and run `gh auth login`. `gh` is optional — without it, the dashboard still works and just groups authors by email instead.
 
