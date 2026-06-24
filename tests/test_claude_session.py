@@ -343,6 +343,41 @@ def test_parse_rows_excludes_meta_sidechain_tool_results_and_commands():
     assert session.turns[0].final_response == "response"
 
 
+def test_parse_rows_opens_a_turn_for_a_slash_command_expansion():
+    # Regression: `/init` (and other work-doing commands) write CLAUDE.md, but Claude
+    # records the command as a <command-name> artifact and injects its instructions as a
+    # separate isMeta user row. Both are filtered as non-prompts, so previously NO turn
+    # opened and the file-creating assistant work was dropped — aGiTrack never committed
+    # or merged it. The command's expansion must open a turn labelled with the command.
+    rows = [
+        _user("cmd", "<command-message>init</command-message>\n<command-name>/init</command-name>"),
+        _user("exp", "Please analyze this codebase and create a CLAUDE.md file.", isMeta=True),
+        _assistant("m1", "I've created CLAUDE.md.", stop_reason="end_turn"),
+    ]
+
+    session = parse_rows("sess-init", rows)
+
+    assert len(session.turns) == 1
+    turn = session.turns[0]
+    assert turn.user_prompt == "/init"
+    assert turn.final_response == "I've created CLAUDE.md."
+    assert turn.complete is True
+
+
+def test_parse_rows_command_without_expansion_opens_no_turn():
+    # A command that injects no expanded prompt (e.g. /model, /clear) does no work, so it
+    # must NOT open a spurious turn just because it was remembered — only an expansion does.
+    rows = [
+        _user("cmd", "<command-name>/model</command-name>"),
+        _assistant("m1", "switched model", stop_reason="end_turn"),
+    ]
+
+    session = parse_rows("sess-model", rows)
+
+    # No turn: the lone assistant row has no opening prompt to attach to.
+    assert session.turns == []
+
+
 def test_parse_rows_excludes_compaction_summary():
     rows = [
         _user(
