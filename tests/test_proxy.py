@@ -8200,3 +8200,22 @@ def test_switch_backend_records_choice_repo_scoped_not_global(tmp_path, monkeypa
 
     assert ("default_backend", "opencode", "repo") in sets
     assert not any(scope == "global" for _, _, scope in sets)  # global default left alone
+
+
+def test_no_worktree_mode_removes_leftover_worktrees(tmp_path):
+    # Turning worktrees off must clean up worktrees left by a previous worktree-mode run
+    # (their committed work is already integrated into the base branch).
+    runner = make_runner(state=AgitrackState(tmp_path))
+    runner._use_worktrees = False
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda *a, **k: None
+    removed: list = []
+    runner._worktrees = lambda: types.SimpleNamespace(
+        list=lambda: [types.SimpleNamespace(name="sess-a"), types.SimpleNamespace(name="sess-b")],
+        remove=lambda name, **k: removed.append(name),
+    )
+
+    runner._setup_base_merge_only_session()
+
+    assert removed == ["sess-a", "sess-b"]
+    assert runner.worktree is None  # runs on the base tree directly
