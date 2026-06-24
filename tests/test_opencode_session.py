@@ -594,3 +594,40 @@ def test_read_events_captures_child_session_ids_from_task_events():
     child_ids: set[str] = set()
     backend._read_events(io.StringIO(task_event + "\n" + other + "\n"), child_ids=child_ids)
     assert child_ids == {"ses_child"}
+
+
+def test_retarget_session_dir_noop_when_already_in_dir(monkeypatch, tmp_path):
+    from agitrack.transcripts import opencode as O
+
+    monkeypatch.setattr(O, "session_belongs_to_repo", lambda repo, sid: True)
+    exported = []
+    monkeypatch.setattr(O, "_run_export_pty", lambda *a, **k: exported.append(True) or ("", 0))
+
+    assert O.retarget_session_dir(tmp_path, "ses_1", str(tmp_path)) is False
+    assert exported == []  # already aligned → no export/import work
+
+
+def test_retarget_session_dir_reimports_unsanitized_when_dir_differs(monkeypatch, tmp_path):
+    from agitrack.transcripts import opencode as O
+
+    monkeypatch.setattr(O, "session_belongs_to_repo", lambda repo, sid: False)
+    captured = {}
+
+    def fake_export(repo, sid, *, sanitize):
+        captured["sanitize"] = sanitize
+        return ('{"id": "ses_1"}', 0)
+
+    def fake_import(repo, sid, transcript, *, overwrite=False, as_id=None):
+        captured.update(repo=str(repo), sid=sid, overwrite=overwrite)
+        return True
+
+    monkeypatch.setattr(O, "_run_export_pty", fake_export)
+    monkeypatch.setattr(O, "_extract_json_object", lambda out: out)
+    monkeypatch.setattr(O, "import_shared_session", fake_import)
+
+    worktree = str(tmp_path / "wt")
+    assert O.retarget_session_dir(tmp_path, "ses_1", worktree) is True
+    assert captured["sanitize"] is False  # local move: keep full content, don't redact
+    assert captured["overwrite"] is True
+    assert captured["repo"] == worktree  # re-imported with the worktree as the cwd
+    assert captured["sid"] == "ses_1"

@@ -476,6 +476,13 @@ class ProxyRunner:
         self._exit_resume_worktree: str | None = None  # session active at exit → auto-resumes next start
         self.worktree: WorktreeInfo | None = None  # set when this session runs in a git worktree
         self.global_config = _global_config if _global_config is not None else GlobalConfig()
+        # Load THIS repo's .agitrack/config.json overlay so repo-scoped settings are both READ
+        # and WRITABLE in the session. Without it `repo_path` is None and save_repo() silently
+        # drops every "this repository only" settings change (e.g. turning worktrees off), so
+        # the change never persists and reverts on the next launch. Uses the base repo path
+        # (this arg, before any worktree is created) so the overlay is the durable one.
+        if getattr(self.global_config, "repo_path", "set") is None:
+            self.global_config.load_repo_overlay(repo.repo)
         self._apply_timings(self.global_config.timings)
         self.state = (
             _state
@@ -1843,6 +1850,23 @@ class ProxyRunner:
         self._pending_restart = True
         self.running = False
 
+    def _restart_now(self, message: str) -> None:
+        """Finish pending work and re-exec aGiTrack (the same teardown a self-update uses) so
+        launch-time settings — worktrees on/off, the default backend, timings — take effect.
+        run()'s teardown sees _pending_restart and performs the re-exec after restoring the
+        terminal and releasing the lock."""
+        self._set_message("Finishing commits, then restarting aGiTrack…", seconds=30.0)
+        self._render()
+        try:
+            self._finalize_pending_work()
+        except Exception as error:  # don't let a commit hiccup strand the restart
+            self._debug(f"finalize before settings restart failed: {error!r}")
+        self._set_message(message, seconds=10.0)
+        self._render()
+        self._exit_child()
+        self._pending_restart = True
+        self.running = False
+
     def _handle_update_command(self) -> None:
         # Ctrl-G → "update": show the current update status and let the user opt
         # in (applied once sessions finish), postpone, or stop update checks.
@@ -2123,7 +2147,10 @@ class ProxyRunner:
         # Re-arm the automatic self-update check so it re-evaluates for the backend being
         # switched to (a sandbox-blocked update is then applied on switch too).
         self._backend_update_checked_for = None
-        self.global_config.default_backend = name
+        # Remember the switch for THIS repo only (repo-scoped), not globally: switching to a
+        # backend in one repo (e.g. to try it) must not change the user's global default for
+        # every other repo. The repo overlay value drives this repo's backend on next launch.
+        self.global_config.set("default_backend", name, scope="repo")
         if self.worktree is None:
             # A non-worktree session has nothing to multiplex; restart the single
             # backend in place (legacy behaviour).
@@ -6871,12 +6898,24 @@ class ProxyRunner:
             needs_restart = True  # timings are read at launch
         self._settings_pending = {}
         self._settings_pending_timings = {}
-        note = (
-            " Some changes won't take effect until you restart aGiTrack yourself (it won't restart on its own)."
-            if needs_restart
-            else ""
-        )
-        self._set_message(f"Saved {n} settings change(s).{note}", seconds=10.0)
+        if needs_restart:
+            # These settings are read only at launch (worktrees on/off, default backend,
+            # timings), so they don't apply to the running session — offer to restart now
+            # rather than silently leaving them inert until the next manual launch.
+            pick = self._select_popup(
+                f"Saved {n} change(s). Some take effect only after a restart. Restart aGiTrack now?",
+                ["Yes, restart now", "Not now"],
+            )
+            if pick == "Yes, restart now":
+                self._restart_now("Restarting aGiTrack to apply the new settings…")
+            else:
+                self._set_message(
+                    f"Saved {n} settings change(s). The restart-only ones apply next time you start aGiTrack.",
+                    seconds=10.0,
+                )
+                self._render()
+            return "saved"
+        self._set_message(f"Saved {n} settings change(s).", seconds=8.0)
         self._render()
         return "saved"
 

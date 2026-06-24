@@ -4070,7 +4070,10 @@ def _backend_switch_runner(monkeypatch):
     runner = _mux_runner()
     runner.backend = types.SimpleNamespace(name="claude")
     runner.worktree = object()
-    runner.global_config = types.SimpleNamespace(default_backend="claude")
+    # A switch records the choice repo-scoped via global_config.set(...); capture it on .sets.
+    cfg = types.SimpleNamespace(default_backend="claude", sets=[])
+    cfg.set = lambda key, value, *, scope: cfg.sets.append((key, value, scope))
+    runner.global_config = cfg
     monkeypatch.setattr("agitrack.proxy.runner.backend_installed", lambda n: True)
     return runner
 
@@ -8101,3 +8104,99 @@ def test_backend_auto_update_noop_when_backend_has_no_updater(tmp_path):
     runner._maybe_auto_update_backend()
 
     assert runner._backend_update_thread is None
+
+
+# --- settings persistence + restart prompt -----------------------------------
+
+
+def test_runner_loads_repo_overlay_so_repo_scoped_settings_persist(tmp_path):
+    # Regression: the proxy built a fresh GlobalConfig without loading the repo overlay, so
+    # repo_path was None and save_repo() silently dropped every "this repository only" change.
+    from agitrack.config import GlobalConfig
+    from agitrack.git import GitRepo
+    from agitrack.proxy.runner import ProxyRunner
+
+    repo = GitRepo.init(tmp_path)
+    runner = ProxyRunner(repo, use_worktrees=False, backend="claude")
+    assert runner.global_config.repo_path is not None  # overlay loaded → save_repo() works
+
+    runner.global_config.set("use_worktrees", False, scope="repo")
+
+    fresh = GlobalConfig()  # re-read from disk
+    fresh.load_repo_overlay(tmp_path)
+    assert fresh.use_worktrees is False  # the repo-scoped change actually hit the file
+
+
+def _save_pending_runner(tmp_path):
+    runner = make_runner(state=AgitrackState(tmp_path))
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda *a, **k: None
+    sets: list = []
+    runner.global_config = types.SimpleNamespace(
+        set=lambda key, value, *, scope: sets.append((key, value, scope)),
+        repo_data={},
+        data={},
+    )
+    runner._sets = sets  # type: ignore[attr-defined]
+    return runner
+
+
+def test_settings_save_offers_restart_for_restart_only_change(tmp_path):
+    runner = _save_pending_runner(tmp_path)
+    runner._settings_pending = {"use_worktrees": (False, "repo", True)}  # restart-only
+    runner._settings_pending_timings = {}
+    restarted: list = []
+    runner._restart_now = lambda msg: restarted.append(msg)
+    answers = iter(["Yes, save them", "Yes, restart now"])
+    runner._select_popup = lambda *a, **k: next(answers)
+
+    assert runner._confirm_save_pending() == "saved"
+    assert ("use_worktrees", False, "repo") in runner._sets  # persisted at repo scope
+    assert restarted  # restart offered and accepted
+
+
+def test_settings_save_restart_only_not_now_keeps_running(tmp_path):
+    runner = _save_pending_runner(tmp_path)
+    runner._settings_pending = {"use_worktrees": (False, "repo", True)}
+    runner._settings_pending_timings = {}
+    restarted: list = []
+    runner._restart_now = lambda msg: restarted.append(msg)
+    answers = iter(["Yes, save them", "Not now"])
+    runner._select_popup = lambda *a, **k: next(answers)
+
+    assert runner._confirm_save_pending() == "saved"
+    assert restarted == []  # declined → keep running, changes apply next launch
+
+
+def test_settings_save_no_restart_prompt_for_live_change(tmp_path):
+    # A non-restart setting (e.g. summarization on/off) saves without offering a restart:
+    # _select_popup is consulted only once (the save confirmation), never a second time.
+    runner = _save_pending_runner(tmp_path)
+    runner._settings_pending = {"summarization_enabled": (True, "global", False)}
+    runner._settings_pending_timings = {}
+    runner._restart_now = lambda msg: pytest.fail("must not offer a restart for a live setting")
+    answers = iter(["Yes, save them"])  # a second _select_popup call would StopIteration → fail
+    runner._select_popup = lambda *a, **k: next(answers)
+
+    assert runner._confirm_save_pending() == "saved"
+
+
+def test_switch_backend_records_choice_repo_scoped_not_global(tmp_path, monkeypatch):
+    # Switching backends in one repo (e.g. to try OpenCode) must persist at REPO scope, not
+    # overwrite the user's GLOBAL default for every other repo.
+    import agitrack.proxy.runner as rm
+
+    runner = make_runner(state=AgitrackState(tmp_path), worktree=None)
+    runner.backend = types.SimpleNamespace(name="claude")
+    sets: list = []
+    runner.global_config = types.SimpleNamespace(set=lambda key, value, *, scope: sets.append((key, value, scope)))
+    monkeypatch.setattr(rm, "backend_installed", lambda name: True)
+    monkeypatch.setattr(rm, "make_proxy_agent", lambda name: types.SimpleNamespace(name=name))
+    runner._restart_agent = lambda msg: None
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda *a, **k: None
+
+    runner._switch_backend("opencode")
+
+    assert ("default_backend", "opencode", "repo") in sets
+    assert not any(scope == "global" for _, _, scope in sets)  # global default left alone

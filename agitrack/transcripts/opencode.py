@@ -26,6 +26,7 @@ __all__ = [
     "session_transcript_size",
     "has_imported_session",
     "import_shared_session",
+    "retarget_session_dir",
     "parse_exported_session",
     "looks_like_event_blob",
 ]
@@ -289,6 +290,30 @@ def export_session_raw(repo: Path, session_id: str) -> str | None:
     except json.JSONDecodeError:
         return None
     return json_text
+
+
+def retarget_session_dir(repo: Path, session_id: str, cwd: str) -> bool:
+    """Point an OpenCode session's recorded ``directory`` at ``cwd`` so resuming it opens in
+    THIS worktree, not the (possibly stale or deleted) directory it last ran in.
+
+    OpenCode resumes by id from its global store and restores that recorded directory,
+    ignoring the launch path — so without this a resumed session keeps the wrong working
+    directory. A no-op when the session already belongs to ``cwd``. Otherwise re-exports the
+    session (UNSANITIZED — this is a local move, not a share, so content must be preserved)
+    and re-imports it with ``cwd`` as the import cwd, which is how OpenCode retargets a
+    session's directory. Best-effort: returns True only when it was actually moved."""
+    if not session_id:
+        return False
+    cwd_path = Path(cwd)
+    if session_belongs_to_repo(cwd_path, session_id):
+        return False  # already recorded against this directory — nothing to do
+    output, returncode = _run_export_pty(repo, session_id, sanitize=False)
+    if returncode != 0:
+        return False
+    transcript = _extract_json_object(output)
+    if not transcript:
+        return False
+    return import_shared_session(cwd_path, session_id, transcript, overwrite=True)
 
 
 def session_transcript_size(repo: Path, session_id: str) -> int | None:
