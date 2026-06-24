@@ -3338,12 +3338,26 @@ class ProxyRunner:
             self._render()
             return
         if self.repo.has_changes():
-            self._set_message(
-                "Finish or stop the current turn before integrating — the worktree has uncommitted changes.",
-                seconds=8.0,
-            )
-            self._render()
-            return
+            # Best effort: the user asked to merge, so don't dead-end them on uncommitted
+            # changes. Only a turn that is GENUINELY still running should block (its edits
+            # are mid-flight). Refresh the in-flight flag first (the git worker may not have
+            # run since the turn went quiet), then if a turn really is active, ask them to
+            # finish/stop it; otherwise commit the committable leftovers now and proceed.
+            self._clear_agent_in_flight_if_idle()
+            if self._agent_is_active():
+                self._set_message(
+                    "Finish or stop the current turn before integrating — a turn is still running.",
+                    seconds=8.0,
+                )
+                self._render()
+                return
+            if self._active_has_committable_changes():
+                self._set_message(f"Committing '{self.name}' changes before merging…", seconds=30)
+                self._render()
+                self._commit_latest_turn_sync()
+            # Anything still uncommitted now is non-committable (git-ignored or intentionally
+            # unstaged files) and can't enter the merge, but committed work still can —
+            # fall through and integrate that rather than refuse the whole merge.
         if not self._active_has_pending():
             self._set_message(f"'{self.name}' has nothing to integrate.")
             self._render()
@@ -3453,18 +3467,13 @@ class ProxyRunner:
 
     def _merge_active_into(self, target: str) -> None:
         """Integrate the active session's un-integrated work into ``target`` (re-pointing
-        the session's merge branch to it). Uncommitted committable changes are committed
-        first (so they aren't left behind), then integrated. Reuses
-        _integrate_active_session so a conflict surfaces the same resolve options."""
+        the session's merge branch to it). Reuses _integrate_active_session, which best-
+        effort commits any uncommitted committable changes first (so nothing is stranded)
+        and surfaces the same resolve options on a conflict."""
         if self.worktree is None or self._base_branch is None:
             self._set_message("This session has no worktree to merge.")
             self._render()
             return
-        if self._active_has_committable_changes():
-            # Commit the worktree's uncommitted work before merging so nothing is stranded.
-            self._set_message(f"Committing '{self.name}' changes before merging…", seconds=30)
-            self._render()
-            self._commit_latest_turn_sync()
         self._base_branch = target  # syncs the IntegrationService to the chosen destination
         self._integrate_active_session()
 
@@ -7986,9 +7995,16 @@ class ProxyRunner:
         if info.name == (self._exit_resume_worktree or self._primary_worktree_name):
             self._persist_last_session_record()
         try:
-            if self.merge_ctx or self.repo.merge_in_progress() or self.repo.has_changes():
-                self._debug(f"keeping worktree '{info.name}' on exit: merge or uncommitted changes pending")
+            if self.merge_ctx or self.repo.merge_in_progress():
+                self._debug(f"keeping worktree '{info.name}' on exit: a merge is in progress")
                 return
+            # Uncommitted leftover FILES (untracked / git-ignored / files the user declined
+            # to stage) do NOT by themselves keep the worktree — they are exactly what the
+            # copy offer below handles, and a copy leaves the source in place, so refusing
+            # removal here is what left dirty worktrees stranded forever ("open end"). They
+            # only force us to keep the worktree on a *signal* teardown, where there's no UI
+            # to offer the copy and silently deleting the files would lose the user's work.
+            has_leftover_files = self.repo.has_changes()
             branch = self.repo.current_branch()
             if is_managed_branch(branch):
                 # Only drop the worktree if we can CONFIRM its branch is fully
@@ -8013,6 +8029,13 @@ class ProxyRunner:
             self._offer_copy_unstaged_to_base(context="exit")
             if self._exit_aborted:
                 return  # Esc on the copy offer: keep this worktree + files, abort the exit
+        elif has_leftover_files:
+            # Signal teardown with leftover files and no UI to rescue them: keep the
+            # worktree so the next startup can surface the files rather than discarding
+            # them. (An interactive exit just gave the user the copy offer above, so by
+            # here those files were handled and the worktree is safe to remove forcibly.)
+            self._debug(f"keeping worktree '{info.name}' on signal exit: leftover files, no UI to copy them out")
+            return
         # Remember this session's conversation under its backend so switching back
         # to that backend (this run or a later one) resumes it.
         self._remember_session_for_backend()

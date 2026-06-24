@@ -676,17 +676,55 @@ def test_committable_changes_ignores_declined_untracked(tmp_path):
     assert runner._active_has_committable_changes() is True
 
 
-def test_merge_active_commits_uncommitted_before_integrating(tmp_path):
+def test_merge_active_retargets_then_delegates_to_integrate(tmp_path):
     runner = _merge_runner(tmp_path)
     runner.repo.has_tracked_changes = lambda: True  # uncommitted work present
-    order: list = []
-    runner._commit_latest_turn_sync = lambda: order.append("commit")
-    runner._integrate_active_session = lambda: order.append("integrate")
+    integrated: list = []
+    runner._integrate_active_session = lambda: integrated.append(runner._base_branch)
 
     runner._merge_active_into("release")
 
-    assert order == ["commit", "integrate"]  # commit FIRST, then merge
+    # _merge_active_into retargets the base then hands off; the commit-before-merge now
+    # lives in _integrate_active_session (one place), exercised by the test below.
+    assert integrated == ["release"]
     assert runner._base_branch == "release"
+
+
+def test_integrate_active_commits_committable_changes_before_integrating(tmp_path):
+    # Best effort: with no turn in flight, uncommitted committable work is committed first
+    # rather than dead-ending the user with "finish or stop the current turn".
+    runner = _merge_runner(tmp_path)
+    runner.repo.has_changes = lambda: True  # worktree dirty, but...
+    runner.repo.has_tracked_changes = lambda: True  # ...with committable work, and...
+    runner.agent_in_flight = False  # ...no turn is actually running
+    runner.agent_parse_thread = None
+    order: list = []
+    runner._commit_latest_turn_sync = lambda: order.append("commit")
+    runner._integrate_turn_or_conflict = lambda: order.append("integrate") or "integrated"
+
+    runner._integrate_active_session()
+
+    assert order == ["commit", "integrate"]  # committed first, then integrated — no dead-end
+
+
+def test_integrate_active_blocks_only_while_a_turn_is_running(tmp_path):
+    # A genuinely in-flight turn still blocks the merge (its edits are mid-flight).
+    runner = _merge_runner(tmp_path)
+    runner.repo.has_changes = lambda: True
+    runner.agent_in_flight = True
+    runner.agent_parse_thread = None
+    runner.last_child_output = time.monotonic()  # output just now: the turn is genuinely live
+    runner.CHILD_IDLE_SECONDS = 999.0  # so the in-flight flag is NOT cleared as idle
+    messages: list = []
+    runner._set_message = lambda msg, **k: messages.append(msg)
+    committed: list = []
+    runner._commit_latest_turn_sync = lambda: committed.append(True)
+    runner._integrate_turn_or_conflict = lambda: committed.append("integrate") or "integrated"
+
+    runner._integrate_active_session()
+
+    assert committed == []  # neither committed nor integrated
+    assert any("still running" in m for m in messages)
 
 
 def test_active_has_mergeable_work_excludes_in_flight_turn(tmp_path):
