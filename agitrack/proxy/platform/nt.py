@@ -14,6 +14,7 @@ import select
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 
 
@@ -50,6 +51,141 @@ class NtWaker:
                 sock.close()
             except OSError:
                 pass
+
+
+class NtHostTerminal:
+    """Native-Windows host terminal: Win32 console VT raw-mode plus a console→socket stdin
+    bridge so the reactor can ``select`` on keyboard input (Windows ``select`` rejects
+    console handles). Output is plain ``os.write`` to stdout — VT processing is enabled by
+    :class:`~agitrack.proxy.platform._winconsole.RawConsole`, so the existing ANSI render
+    bytes work unchanged. Implements the same surface the runner uses on the POSIX
+    ``TerminalHost``.
+    """
+
+    def __init__(self) -> None:
+        from agitrack.proxy.platform import _winconsole
+
+        self._winconsole = _winconsole
+        self._console = _winconsole.RawConsole()
+        self._rsock, self._wsock = socket.socketpair()
+        self._rsock.setblocking(False)
+        self._stop = threading.Event()
+        self._resize_pending = threading.Event()
+        self._last_size: tuple[int, int] | None = None
+        self._reader: threading.Thread | None = None
+        self._resizer: threading.Thread | None = None
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        self._stop.set()
+        try:
+            self._console.leave()
+        except Exception:  # noqa: BLE001 - best effort on teardown
+            pass
+        for sock in (self._rsock, self._wsock):
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def set_raw(self) -> None:
+        self._console.enter()
+        if self._reader is None:
+            self._reader = threading.Thread(target=self._pump_stdin, name="agitrack-conin-reader", daemon=True)
+            self._reader.start()
+        if self._resizer is None:
+            self._resizer = threading.Thread(target=self._watch_resize, name="agitrack-conin-resize", daemon=True)
+            self._resizer.start()
+
+    def set_cooked(self) -> None:
+        self._console.leave()
+
+    def restore_terminal(self) -> None:
+        self.disable_host_terminal_modes()
+        self.set_cooked()
+        self.write_stdout(b"\x1b[2J\x1b[H\x1b[?1049l\x1b[0m\r\n")
+
+    def disable_host_terminal_modes(self) -> None:
+        # Same reset bytes as the POSIX TerminalHost (no kitty-pop: we never enable it on
+        # Windows, where the host wouldn't answer the capability query anyway).
+        self.write_stdout(
+            b"\x1b[?9l\x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l\x1b[?1004l"
+            b"\x1b[?1005l\x1b[?1006l\x1b[?1007l\x1b[?1015l\x1b[?1016l\x1b[?2004l"
+            b"\x1b[>4;0m\x1b[?25h\x1b[0m"
+        )
+
+    def enter_host_screen(self) -> None:
+        self.write_stdout(b"\x1b[?1049h\x1b[2J\x1b[H")
+        self.enable_host_mouse()
+
+    def enable_host_mouse(self) -> None:
+        self.write_stdout(b"\x1b[?1000h\x1b[?1006h")
+
+    def detect_host_terminal(self, debug_fn: object = None) -> None:
+        # The Windows console doesn't reliably answer the OSC fg/bg/palette queries the
+        # POSIX path caches, and a blocking wait would stall startup — skip it. Colors fall
+        # back to the backend's own defaults.
+        return None
+
+    def pause_child_ui(self) -> None:
+        self.set_cooked()
+        self.write_stdout(b"\x1b[0m\r\n")
+
+    def resume_child_ui(self, render_fn: object) -> None:
+        self.set_raw()
+        if callable(render_fn):
+            render_fn()
+
+    def terminal_size(self) -> tuple[int, int]:
+        return self._winconsole.terminal_size()
+
+    def stdin_fileno(self) -> int:
+        return self._rsock.fileno()
+
+    def read_stdin(self, length: int) -> bytes:
+        try:
+            return self._rsock.recv(length)
+        except (BlockingIOError, OSError):
+            return b""
+
+    def write_stdout(self, data: bytes) -> None:
+        try:
+            os.write(sys.stdout.fileno(), data)
+        except OSError:
+            pass
+
+    def flush_input(self) -> None:
+        try:
+            while self._rsock.recv(4096):
+                pass
+        except (BlockingIOError, OSError):
+            pass
+
+    def consume_resize_pending(self) -> bool:
+        if self._resize_pending.is_set():
+            self._resize_pending.clear()
+            return True
+        return False
+
+    def _pump_stdin(self) -> None:
+        while not self._stop.is_set():
+            data = self._winconsole.read_input(4096)
+            if not data:
+                break
+            try:
+                self._wsock.sendall(data)
+            except OSError:
+                break
+
+    def _watch_resize(self) -> None:
+        self._last_size = self._winconsole.terminal_size()
+        while not self._stop.wait(0.15):
+            size = self._winconsole.terminal_size()
+            if size != self._last_size:
+                self._last_size = size
+                self._resize_pending.set()
 
 
 def _resolve_windows_command(command: list[str]) -> tuple[str, list[str]]:
