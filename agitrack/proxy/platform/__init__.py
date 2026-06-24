@@ -14,7 +14,22 @@ from __future__ import annotations
 
 from agitrack.proxy.platform.base import ChildProcess, ReactorWaker
 
-__all__ = ["ChildProcess", "ReactorWaker", "make_waker"]
+__all__ = ["ChildProcess", "ReactorWaker", "make_child_process", "make_waker"]
+
+
+def make_child_process(command: list[str], cwd: str, extra_env: dict[str, str] | None = None) -> ChildProcess:
+    """Spawn the backend child under a pseudo-terminal for this platform: a POSIX PTY
+    (``BackendProcess``) or a Windows ConPTY (``NtChildProcess``). The returned object
+    exposes a ``select``-able ``master_fd`` either way, so the reactor is unchanged."""
+    import os
+
+    if os.name == "nt":
+        from agitrack.proxy.platform.nt import NtChildProcess
+
+        return NtChildProcess.spawn(command, cwd, extra_env)
+    from agitrack.proxy.process import BackendProcess
+
+    return BackendProcess.spawn(command, cwd, extra_env)
 
 
 def make_waker() -> ReactorWaker:
