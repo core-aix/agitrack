@@ -143,8 +143,8 @@ def test_settings_menu_discard_on_close_writes_nothing(tmp_path):
     _drive(
         runner,
         [
-            ("Settings", lambda opts: next(o for o in opts if o.startswith("Confine the agent"))),
-            ("Confine the agent", "Turn OFF"),
+            ("Settings", lambda opts: next(o for o in opts if o.startswith("Sandbox"))),
+            ("Sandbox", "Turn OFF"),
             ("Apply", lambda opts: next(o for o in opts if o.startswith("Global"))),
             ("Settings", lambda opts: next(o for o in opts if o.startswith("← Close"))),
             ("unsaved settings change", "No, discard them"),
@@ -163,7 +163,7 @@ def test_settings_menu_esc_in_editor_returns_to_list(tmp_path):
         if "Settings" in title:
             lists_shown.append(True)
             if len(lists_shown) == 1:
-                return next(o for o in options if o.startswith("Confine the agent"))  # open editor
+                return next(o for o in options if o.startswith("Sandbox"))  # open editor
             return next(o for o in options if o.startswith("← Close"))  # second visit → close
         return None  # Esc in the editor (and the empty close → no pending, just closes)
 
@@ -201,8 +201,8 @@ def test_settings_menu_edits_allowed_paths(tmp_path):
     _drive(
         runner,
         [
-            ("Settings", lambda opts: next(o for o in opts if o.startswith("Extra folders/files"))),
-            ("Extra folders/files", lambda default: "/data/shared:/srv/x"),
+            ("Settings", lambda opts: next(o for o in opts if o.startswith("Folders/files"))),
+            ("Folders/files", lambda default: "/data/shared:/srv/x"),
             ("Apply", lambda opts: next(o for o in opts if o.startswith("This repository"))),
             ("Settings", lambda opts: next(o for o in opts if o.startswith("← Close"))),
             ("unsaved settings change", "Yes, save them"),
@@ -245,8 +245,8 @@ def test_settings_restart_setting_offers_restart(tmp_path):
     _drive(
         runner,
         [
-            ("Settings", lambda opts: next(o for o in opts if o.startswith("Confine the agent"))),  # sandbox (restart)
-            ("Confine the agent", "Turn OFF"),
+            ("Settings", lambda opts: next(o for o in opts if o.startswith("Sandbox"))),  # sandbox (restart)
+            ("Sandbox", "Turn OFF"),
             ("Apply", lambda opts: next(o for o in opts if o.startswith("Global"))),
             ("Settings", lambda opts: next(o for o in opts if o.startswith("← Close"))),
             ("unsaved settings change", "Yes, save them"),
@@ -267,8 +267,8 @@ def test_settings_restart_setting_can_restart_now(tmp_path):
     _drive(
         runner,
         [
-            ("Settings", lambda opts: next(o for o in opts if o.startswith("Confine the agent"))),
-            ("Confine the agent", "Turn OFF"),
+            ("Settings", lambda opts: next(o for o in opts if o.startswith("Sandbox"))),
+            ("Sandbox", "Turn OFF"),
             ("Apply", lambda opts: next(o for o in opts if o.startswith("Global"))),
             ("Settings", lambda opts: next(o for o in opts if o.startswith("← Close"))),
             ("unsaved settings change", "Yes, save them"),
@@ -305,8 +305,8 @@ def test_settings_menu_esc_on_list_with_pending_prompts_save(tmp_path):
 
     def select(title, options, **k):
         if "Settings" in title and runner._pending_count() == 0:
-            return next(o for o in options if o.startswith("Confine the agent"))
-        if "Confine the agent" in title:
+            return next(o for o in options if o.startswith("Sandbox"))
+        if "Sandbox" in title:
             return "Turn OFF"
         if "Apply" in title:
             return next(o for o in options if o.startswith("Global"))

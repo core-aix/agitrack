@@ -6693,11 +6693,17 @@ class ProxyRunner:
         return "repo" if pick.startswith("This repository") else "global"
 
     def _settings_specs(self) -> list[dict]:
-        """Declarative registry of the user-editable config options shown in the
-        settings menu. Labels are written to be self-explanatory. ``kind`` drives the
-        editor; ``restart`` marks settings resolved at launch (so a change applies to new
-        sessions / the next launch). Effective values are read from ``global_config``
-        (repo overlay > global > built-in default)."""
+        """Declarative registry of the user-editable config options shown in the settings
+        menu. Labels are self-explanatory and the ORDER groups related settings (backend →
+        session isolation → agent behavior → commit summaries → aGiTrack itself). ``kind``
+        drives the editor; ``restart`` marks settings resolved at launch (so a change applies
+        to new sessions / the next launch). Effective values are read from ``global_config``
+        (repo overlay > global > built-in default).
+
+        Note the two distinct "worktree" settings, kept adjacent and worded so they aren't
+        confused: ``use_worktrees`` decides WHETHER each session gets its own worktree, while
+        ``sandbox`` only CONFINES the agent's writes to that worktree (and is moot when
+        worktrees are off)."""
         return [
             {
                 "key": "default_backend",
@@ -6706,32 +6712,36 @@ class ProxyRunner:
                 "options": ["claude", "opencode"],
                 "restart": True,
             },
+            # --- session isolation: the worktree toggle, then the sandbox that depends on it ---
+            {
+                "key": "use_worktrees",
+                "label": "Isolate each session in its own git worktree (off: edit the current branch directly)",
+                "kind": "bool",
+                "restart": True,
+            },
             {
                 "key": "sandbox",
-                "label": "Confine the agent's file writes to its session worktree",
+                "label": "Sandbox: block the agent from writing outside its worktree (no effect when worktrees are off)",
                 "kind": "bool",
                 "restart": True,
             },
             {
                 "key": "allowed_edit_paths",
-                "label": "Extra folders/files the agent may write to (besides its worktree)",
+                "label": "Folders/files the agent may write to outside its worktree (sandbox carve-out)",
                 "kind": "paths",
                 "restart": True,
             },
-            {
-                "key": "use_worktrees",
-                "label": "Run each session in its own isolated git worktree",
-                "kind": "bool",
-                "restart": True,
-            },
+            # --- agent behavior ---
             {
                 "key": "commit_guidance",
                 "label": "Ask the agent not to make its own git commits (aGiTrack commits each turn)",
                 "kind": "bool",
                 "restart": True,
             },
+            # --- commit summaries ---
             {"key": "summarization_enabled", "label": "Write an AI summary for each commit", "kind": "bool"},
             {"key": "summarization_model", "label": "Model used to write commit summaries", "kind": "model"},
+            # --- aGiTrack itself ---
             {"key": "check_for_updates", "label": "Automatically check for aGiTrack updates", "kind": "bool"},
             {
                 "key": "menu_key",
