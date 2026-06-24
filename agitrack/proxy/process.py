@@ -17,7 +17,6 @@ that delegate to the active session — so tests built via
 from __future__ import annotations
 
 import os
-import pty
 import select
 import signal
 import threading
@@ -61,6 +60,8 @@ class BackendProcess:
         subprocesses — e.g. disabling a backend's in-app auto-update for the session
         without disabling the explicit upgrade aGiTrack runs itself.
         """
+        import pty  # POSIX-only; imported lazily so this module loads on native Windows
+
         pid, fd = pty.fork()
         if pid == 0:
             # The child must never survive a failed exec (backend uninstalled
@@ -79,6 +80,45 @@ class BackendProcess:
     # ------------------------------------------------------------------
     # Drain
     # ------------------------------------------------------------------
+
+    def read_fileno(self) -> int | None:
+        """The ``select``-able fd carrying the child's output — the PTY master here.
+
+        Part of the cross-platform ``ChildProcess`` contract (see
+        ``agitrack/proxy/platform/base.py``): the reactor selects on this fd. On Windows
+        the implementation returns a socket fd bridged from the ConPTY instead, so the
+        same ``select`` loop works unchanged.
+        """
+        return self.master_fd
+
+    def interrupt(self) -> None:
+        """Forward a Ctrl-C (SIGINT) to the child — the programmatic interrupt used by
+        teardown. POSIX sends the signal; the Windows impl writes an ETX byte into the
+        ConPTY, which it translates to a console Ctrl-C for the child."""
+        if self.child_pid:
+            try:
+                os.kill(self.child_pid, signal.SIGINT)
+            except ProcessLookupError:
+                pass
+
+    def poll(self) -> int | None:
+        """The child's exit code if it has exited, else ``None`` — without blocking.
+
+        Replaces direct ``os.waitpid(WNOHANG)`` use in the reactor so the exit check is
+        platform-agnostic (Windows has no zombie reaping; it queries the ConPTY child).
+        Reaps the zombie on POSIX when the child has exited.
+        """
+        if not self.child_pid:
+            return None
+        try:
+            done, status = os.waitpid(self.child_pid, os.WNOHANG)
+        except ChildProcessError:
+            return None  # already reaped elsewhere
+        except OSError:
+            return None
+        if done == 0:
+            return None
+        return os.waitstatus_to_exitcode(status)
 
     def drain(self) -> bytes | None:
         """Read all currently-available output from the PTY (bounded).

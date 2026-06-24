@@ -12,10 +12,16 @@ import os
 import re
 import select
 import sys
-import termios
 import time
-import tty
 from typing import Any, Protocol
+
+# ``termios``/``tty`` are POSIX-only and back the POSIX ``TerminalHost`` below. On native
+# Windows the host terminal is driven by ``agitrack/proxy/platform/nt.py`` (the Win32
+# console API) instead, so guard the import on ``sys.platform`` (mypy platform-narrows it)
+# to keep this module importable there.
+if sys.platform != "win32":
+    import termios
+    import tty
 
 
 class TerminalHostState(Protocol):
