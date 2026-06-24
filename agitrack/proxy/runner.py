@@ -2759,8 +2759,14 @@ class ProxyRunner:
         if self._integration_paused or self._delay_merge:
             return  # --delay-merge: the user merges on their own confirmation
         try:
-            if self.repo.has_changes() or self.repo.merge_in_progress():
-                return  # in-flight or mid-merge work; leave it for the normal path
+            if self.repo.has_tracked_changes() or self.repo.merge_in_progress():
+                # A real in-flight tracked edit or a mid-merge: leave it for the normal
+                # path. But UNTRACKED leftovers (files the agent created that the user
+                # declined to stage) must NOT block this merge — they're not part of the
+                # turn branch and don't affect the fast-forward, yet has_changes() counts
+                # them, which stranded a ready, summarized commit whenever the next prompt
+                # started before it had merged.
+                return
             branch = self.repo.current_branch()
             if not is_managed_branch(branch):
                 return
