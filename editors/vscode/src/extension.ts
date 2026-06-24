@@ -1092,7 +1092,11 @@ function macLibraryPythonVersions(): string[] {
 }
 
 async function firstPython(): Promise<string | undefined> {
-  for (const py of ["python3", "python"]) {
+  // `py` is the canonical Windows launcher; there `python`/`python3` are usually the
+  // Microsoft Store app-execution stub, which fails `--version` (so `runnable` rejects it).
+  // Try `py` first on Windows; on POSIX keep the existing python3 → python order.
+  const candidates = process.platform === "win32" ? ["py", "python", "python3"] : ["python3", "python"];
+  for (const py of candidates) {
     if (await runnable(py)) {
       return py;
     }
