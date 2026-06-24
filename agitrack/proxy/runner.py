@@ -1179,6 +1179,10 @@ class ProxyRunner:
                     os.close(self.master_fd)
                 except OSError:
                     pass
+                # Nulling routes through the platform child: a no-op extra on POSIX (the fd
+                # is closed above), but on Windows the setter closes the ConPTY bridge socket
+                # (os.close can't close a socket fd there), so it isn't leaked.
+                self.master_fd = None
             self.management_lock.release()
             # The host terminal closed mid-work and the user chose "Reopen" in the
             # forced-exit dialog: launch a fresh window now that the lock is free so
@@ -5620,6 +5624,7 @@ class ProxyRunner:
                     os.close(self.master_fd)
                 except OSError:
                     pass
+                self.master_fd = None  # closes the ConPTY bridge socket on Windows (see run())
             worktree = self.worktree
         finally:
             self.active = saved
