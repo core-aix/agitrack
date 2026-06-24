@@ -139,6 +139,82 @@ def test_gh_check_missing_does_not_offer_login(monkeypatch):
     assert ran == []  # no login attempted — gh isn't installed
 
 
+# --- startup menu-key conflict check ----------------------------------------------
+
+
+def _menu_config(tmp_path, **data):
+    from agitrack.config import GlobalConfig
+
+    config = GlobalConfig(tmp_path / "config.json")
+    config.data.update(data)
+    return config
+
+
+def test_menu_key_check_silent_without_conflict(tmp_path, monkeypatch):
+    # No known host conflict (not VS Code) → never prompts.
+    _force_tty(monkeypatch, stdin=True)
+    monkeypatch.setattr(cli.os, "environ", {"TERM_PROGRAM": "iTerm.app"})
+    monkeypatch.setattr("builtins.input", lambda *a: (_ for _ in ()).throw(AssertionError("should not prompt")))
+    assert cli._verify_menu_key(_menu_config(tmp_path)) is True
+
+
+def test_menu_key_check_non_interactive_does_not_prompt(tmp_path, monkeypatch):
+    _force_tty(monkeypatch, stdin=False)
+    monkeypatch.setattr(cli.os, "environ", {"TERM_PROGRAM": "vscode"})
+    monkeypatch.setattr("builtins.input", lambda *a: (_ for _ in ()).throw(AssertionError("should not prompt")))
+    assert cli._verify_menu_key(_menu_config(tmp_path)) is True
+
+
+def test_menu_key_check_keep_records_acknowledgement(tmp_path, monkeypatch):
+    # VS Code + Ctrl-G conflicts; pressing Enter keeps it and records the ack so the next
+    # launch stays quiet.
+    _force_tty(monkeypatch, stdin=True)
+    monkeypatch.setattr(cli.os, "environ", {"TERM_PROGRAM": "vscode"})
+    monkeypatch.setattr("builtins.input", lambda *a: "")  # keep
+    config = _menu_config(tmp_path)
+    assert cli._verify_menu_key(config) is True
+    assert config._raw("menu_key_acknowledged") == "ctrl-g"
+    # Second launch: already acknowledged → no prompt.
+    monkeypatch.setattr("builtins.input", lambda *a: (_ for _ in ()).throw(AssertionError("should not prompt")))
+    assert cli._verify_menu_key(config) is True
+
+
+def test_menu_key_check_quit_aborts(tmp_path, monkeypatch):
+    _force_tty(monkeypatch, stdin=True)
+    monkeypatch.setattr(cli.os, "environ", {"TERM_PROGRAM": "vscode"})
+    monkeypatch.setattr("builtins.input", lambda *a: "q")
+    assert cli._verify_menu_key(_menu_config(tmp_path)) is False
+
+
+def test_menu_key_check_test_then_keep(tmp_path, monkeypatch):
+    # 't' runs the key test (stubbed), then Enter keeps the key.
+    _force_tty(monkeypatch, stdin=True)
+    monkeypatch.setattr(cli.os, "environ", {"TERM_PROGRAM": "vscode"})
+    answers = iter(["t", ""])
+    monkeypatch.setattr("builtins.input", lambda *a: next(answers))
+    tested = []
+    monkeypatch.setattr(cli, "_run_menu_key_test", lambda key: tested.append(key) or True)
+    assert cli._verify_menu_key(_menu_config(tmp_path)) is True
+    assert tested == ["ctrl-g"]
+
+
+def test_menu_key_check_change_persists_new_key(tmp_path, monkeypatch):
+    # 'c' to change → enter a non-conflicting key → it's persisted as menu_key.
+    _force_tty(monkeypatch, stdin=True)
+    monkeypatch.setattr(cli.os, "environ", {"TERM_PROGRAM": "vscode"})
+    answers = iter(["c", "ctrl-o", "n"])  # choose; new key; skip the test
+    monkeypatch.setattr("builtins.input", lambda *a: next(answers))
+    config = _menu_config(tmp_path)
+    assert cli._verify_menu_key(config) is True
+    assert config.menu_key == "ctrl-o"
+    assert config._raw("menu_key_acknowledged") == "ctrl-o"
+
+
+def test_read_menu_key_press_returns_none_without_tty():
+    # No real tty under pytest → the raw-mode test can't run and reports "unavailable".
+    assert cli._read_menu_key_press(b"\x07", shift=False) is None
+
+
 def test_discover_or_init_initializes_when_user_agrees(tmp_path, monkeypatch):
     _force_tty(monkeypatch, stdin=True)
     monkeypatch.setattr("builtins.input", lambda *a: "y")
@@ -211,6 +287,10 @@ def _stub_launch(monkeypatch, *, use_worktrees: bool = True, commit_guidance: bo
 
     monkeypatch.setattr(cli, "ProxyRunner", Fake)
     monkeypatch.setattr(cli, "AgitrackShell", Fake)
+    # These tests exercise main()'s arg routing, not the pre-TUI menu-key check; neutralize
+    # it so the minimal stub Config below needs no menu_key surface (and so the check never
+    # fires just because the suite itself runs inside VS Code's integrated terminal).
+    monkeypatch.setattr(cli, "_verify_menu_key", lambda *a, **k: True)
     _stub_repo_and_free_lock(monkeypatch)
 
     class Config:
