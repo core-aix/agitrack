@@ -543,12 +543,32 @@ def _check_for_update_at_startup(config: GlobalConfig) -> None:
     restart_agitrack()  # does not return on success
 
 
-PRIVACY_WARNING = (
-    "\nWARNING: aGiTrack records the conversation in git commit messages — every\n"
-    "message you enter in the chat can become part of the repository history.\n"
-    "Do not enter passwords, API keys, or other sensitive information in the\n"
+# The privacy warning as one flowing paragraph; it is wrapped per terminal width at
+# print time (see `_privacy_warning`) so it never overflows or is chopped mid-word on a
+# narrow terminal.
+_PRIVACY_WARNING_TEXT = (
+    "WARNING: aGiTrack records the conversation in git commit messages — every "
+    "message you enter in the chat can become part of the repository history. "
+    "Do not enter passwords, API keys, or other sensitive information in the "
     "chat. (Keeping secrets out of prompts is good practice anyway.)"
 )
+# The width the warning is authored to wrap at on a normal/wide terminal; a narrower
+# terminal wraps tighter than this so the text always fits.
+_PRIVACY_WARNING_WIDTH = 73
+
+
+def _privacy_warning(width: int | None = None) -> str:
+    """The startup privacy warning, wrapped to fit the terminal. Wraps at the authored
+    width on a normal/wide terminal, but re-wraps at the terminal's actual width when it is
+    narrower, so the line breaks land in different places (and nothing overflows) on a small
+    terminal. ``width`` defaults to the detected terminal width. Keeps the leading blank
+    line the message has always had."""
+    import textwrap
+
+    if width is None:
+        width = shutil.get_terminal_size().columns
+    wrap_at = max(20, min(_PRIVACY_WARNING_WIDTH, width))
+    return "\n" + textwrap.fill(_PRIVACY_WARNING_TEXT, width=wrap_at)
 
 
 def _drain_terminal_input() -> None:
@@ -578,7 +598,7 @@ def _acknowledge_privacy_warning(*, scripted: bool = False, skip: bool = False) 
     warning earlier this session and should not be prompted again."""
     if skip:
         return True
-    print(PRIVACY_WARNING)
+    print(_privacy_warning())
     if scripted or not (sys.stdin.isatty() and sys.stdout.isatty()):
         return True
     # Discard anything already sitting in the terminal's input queue before reading, so a

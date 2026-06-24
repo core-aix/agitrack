@@ -951,6 +951,27 @@ def test_drain_terminal_input_never_raises():
     cli._drain_terminal_input()  # no real tty under pytest; must be a safe no-op
 
 
+def test_privacy_warning_wraps_to_terminal_width():
+    # A narrow terminal must wrap the warning tighter (different break points) so it never
+    # overflows, while a wide terminal keeps the authored wrapping.
+    wide = cli._privacy_warning(100)
+    narrow = cli._privacy_warning(34)
+    for text in (wide, narrow):
+        assert text.startswith("\n")  # leading blank line preserved
+        assert "passwords, API keys" in text  # key phrase never split mid-wrap
+    # Narrow re-wraps: more lines, and every line fits the width.
+    narrow_lines = [line for line in narrow.splitlines() if line]
+    assert len(narrow_lines) > len([line for line in wide.splitlines() if line])
+    assert all(len(line) <= 34 for line in narrow_lines)
+
+
+def test_privacy_warning_never_exceeds_authored_width_on_wide_terminal():
+    # On a very wide terminal we cap at the authored width rather than stretching the text
+    # across the whole screen.
+    lines = [line for line in cli._privacy_warning(500).splitlines() if line]
+    assert lines and all(len(line) <= cli._PRIVACY_WARNING_WIDTH for line in lines)
+
+
 def test_privacy_warning_quit_aborts(monkeypatch, capsys):
     _force_tty(monkeypatch, stdin=True)
     monkeypatch.setattr("builtins.input", lambda *a: "q")
