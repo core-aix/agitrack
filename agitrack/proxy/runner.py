@@ -662,6 +662,7 @@ class ProxyRunner:
         # Worktree files we've already offered to copy into the base repo, keyed by
         # repo-relative path → content fingerprint, so a file the user accepted/left in
         # place is re-offered only once its content changes again (per-run, in-memory).
+        self._worktree_sessions_cache: tuple[float, list] | None = None  # memoizes _worktree_sessions
         self._copy_prompted: dict[str, tuple[int, int]] = {}
         # Repo-relative paths the user declined to copy: muted so the SAME set isn't
         # re-asked even as its contents change. A genuinely new path un-mutes the whole
@@ -919,6 +920,7 @@ class ProxyRunner:
                 "_backend_update_checked_for": None,
                 "_sessions_with_activity": set(),
                 "_cancel_prompted": set(),
+                "_worktree_sessions_cache": None,
                 "_copy_prompted": {},
                 "_copy_declined": set(),
                 "_pending_copy_offer": None,
@@ -3534,6 +3536,7 @@ class ProxyRunner:
             self._render()
 
     RESUME_LIST_LIMIT = 20
+    _WORKTREE_SESSIONS_TTL = 10.0  # seconds to memoize the slow `opencode session list` enumeration
 
     def _worktree_sessions(self) -> list:
         # (worktree-name, SessionRef) for every conversation this backend recorded
@@ -3542,11 +3545,23 @@ class ProxyRunner:
         # or id). The worktree directory name IS the session's user-given name, so
         # this is how a named session — and its name — survives across runs even
         # after its worktree is gone.
+        #
+        # Briefly MEMOIZED: a single open of the resume menu calls this 3× (via
+        # _resumable_sessions and _agitrack_named_sessions), each a slow `opencode session
+        # list` subprocess — without the cache, entering the menu fired several of them back
+        # to back and the TUI hung for seconds. The short TTL covers one menu render while
+        # staying fresh enough that a just-created session still appears next time.
+        now = time.monotonic()
+        cached = self._worktree_sessions_cache
+        if cached is not None and now - cached[0] < self._WORKTREE_SESSIONS_TTL:
+            return cached[1]
         try:
-            return list(self.backend.list_worktree_sessions(self._worktrees().root))
+            result = list(self.backend.list_worktree_sessions(self._worktrees().root))
         except Exception as error:
             self._debug(f"list_worktree_sessions failed: {error!r}")
-            return []
+            result = []
+        self._worktree_sessions_cache = (time.monotonic(), result)
+        return result
 
     def _resumable_sessions(self) -> list:
         # Past conversations to offer for resume: those the backend recorded in
@@ -3645,6 +3660,11 @@ class ProxyRunner:
             # under a fresh name so the two don't share a worktree (which would
             # run two backends in one directory).
             name = self._next_session_name()
+        # Resuming relocates and re-spawns the backend (OpenCode in --no-worktree mode also
+        # exports+imports the session to retarget its directory) — a few seconds. Paint a
+        # notice first so the screen shows progress instead of looking frozen.
+        self._set_message(f"Resuming '{name}'…")
+        self._render()
         self._new_session(name, resume_session_id=session_id, backend=backend)
 
     def _live_session_name_taken(self, name: str) -> bool:
