@@ -10,7 +10,7 @@ from pathlib import Path
 from agitrack.backends.setup import select_default_backend, select_default_summarizer_model
 from agitrack.backends.proxy_agents import available_backends
 from agitrack.git import GitError, GitRepo, RepoLock, already_running_message
-from agitrack.config import GlobalConfig
+from agitrack.config import GlobalConfig, settings
 from agitrack.proxy import ProxyRunner
 from agitrack.shell import AgitrackShell
 
@@ -368,6 +368,10 @@ def main(argv: list[str] | None = None) -> int:
             proceed, gh_handled = _check_gh_availability(repo, scripted=scripted)
             if not proceed:
                 return 1
+            # Warn about a menu key the host likely intercepts (e.g. VS Code's Ctrl-G) and
+            # let the user test/replace it now — the only chance before the TUI takes over.
+            if not _verify_menu_key(config, scripted=scripted):
+                return 1
             return ProxyRunner(
                 repo,
                 verbose=args.verbose,
@@ -677,6 +681,166 @@ def _run_gh_login() -> None:
         subprocess.run(["gh", "auth", "login"], check=False)
     except (OSError, subprocess.SubprocessError) as error:
         print(f"Could not run `gh auth login`: {error}")
+
+
+def _verify_menu_key(config: GlobalConfig, *, scripted: bool = False) -> bool:
+    """Before the TUI starts, warn when the configured menu key is likely intercepted by
+    the host (e.g. VS Code binds Ctrl-G to "Go to Line"), and let the user test it, switch
+    to another key, or keep it. The menu can't be opened from inside the TUI if its key
+    doesn't reach aGiTrack, so this is the one chance to fix it while a shell prompt exists.
+
+    Returns True to proceed, False to abort. A changed key is persisted to the global
+    config (which the runner re-reads). Never blocks automation — without an interactive
+    TTY, or in scripted mode, it does nothing and returns True."""
+    if scripted or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return True
+    key = config.menu_key
+    conflict = settings.detect_menu_key_conflict(key, os.environ)
+    if conflict is None:
+        return True  # no known conflict — don't bother the user
+    if config._raw("menu_key_acknowledged") == key:
+        return True  # the user already resolved/confirmed this key in this environment
+    label = settings.menu_key_label_for(key)
+    print(f"\nHeads up: aGiTrack's menu key is {label}, but {conflict}")
+    print("Once the TUI starts you can't open the aGiTrack menu if that key never arrives.")
+    while True:
+        try:
+            answer = (
+                input(f"[t] test {label} now   [c] choose a different key   [Enter] keep it   [q] quit: ")
+                .strip()
+                .lower()
+            )
+        except (EOFError, KeyboardInterrupt):
+            print("\naGiTrack not started.")
+            return False
+        if answer in {"q", "quit"}:
+            print("aGiTrack not started.")
+            return False
+        if answer in {"", "k", "keep"}:
+            config.set("menu_key_acknowledged", key, scope="global")  # don't nag next launch
+            return True
+        if answer in {"t", "test"}:
+            _run_menu_key_test(key)
+            continue
+        if answer in {"c", "change", "choose"}:
+            chosen = _choose_menu_key(config, key)
+            if chosen is None:
+                continue  # backed out — re-show the options
+            config.set("menu_key", chosen, scope="global")
+            config.set("menu_key_acknowledged", chosen, scope="global")
+            print(f"Menu key set to {settings.menu_key_label_for(chosen)}.")
+            return True
+        print("Please choose t, c, Enter, or q.")
+
+
+def _choose_menu_key(config: GlobalConfig, current: str) -> str | None:
+    """Prompt for a replacement menu key, offering known-good suggestions and an optional
+    test. Returns the canonical key chosen, or None if the user backed out."""
+    suggestions = settings.suggest_menu_keys(current, os.environ)
+    if suggestions:
+        print("Suggested: " + ", ".join(settings.menu_key_label_for(k) for k in suggestions))
+    while True:
+        try:
+            raw = input("New menu key (e.g. ctrl-o or ctrl+shift+g; blank to go back): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if not raw:
+            return None
+        chosen = settings.normalize_menu_key(raw)
+        if chosen is None:
+            print("Not a valid menu key. Use ctrl-<letter> (not c/h/i/j/m) or ctrl+shift+<letter>.")
+            continue
+        if settings.detect_menu_key_conflict(chosen, os.environ):
+            print(f"Note: {settings.menu_key_label_for(chosen)} may also be intercepted by the host.")
+        if not _confirm_menu_key_by_test(chosen):
+            continue  # the test failed and the user declined to use it anyway — pick another
+        return chosen
+
+
+def _confirm_menu_key_by_test(key: str) -> bool:
+    """Offer to test *key*; if the test shows it doesn't reach aGiTrack, ask whether to use
+    it anyway. Returns True to accept *key*, False to pick a different one."""
+    label = settings.menu_key_label_for(key)
+    try:
+        if input(f"Test {label} now? [Y/n]: ").strip().lower() in {"n", "no"}:
+            return True  # user skipped the test — accept the key as entered
+    except (EOFError, KeyboardInterrupt):
+        return True
+    result = _run_menu_key_test(key)
+    if result is not False:
+        return True  # worked, or the test was cancelled/unavailable
+    try:
+        return input(f"{label} didn't reach aGiTrack. Use it anyway? [y/N]: ").strip().lower() in {"y", "yes"}
+    except (EOFError, KeyboardInterrupt):
+        return False
+
+
+def _run_menu_key_test(key: str) -> bool | None:
+    """Prompt the user to press *key* and report whether it reached aGiTrack. Returns True
+    (reached), False (swallowed by the host / timed out), or None (cancelled/unavailable)."""
+    label = settings.menu_key_label_for(key)
+    print(f"Press {label} now (you have a few seconds)…")
+    result = _read_menu_key_press(settings.menu_key_bytes_for(key), shift=settings.menu_key_is_shift(key))
+    if result is True:
+        print(f"  ✓ {label} reached aGiTrack — it will open the menu inside the TUI.")
+    elif result is False:
+        print(f"  ✗ {label} did NOT reach aGiTrack — the host likely intercepts it; choose another key.")
+    else:
+        print(f"  (skipped the {label} test)")
+    return result
+
+
+def _read_menu_key_press(expected: bytes, *, shift: bool, timeout: float = 8.0) -> bool | None:
+    """Put the terminal in raw mode and wait up to *timeout* for *expected* to arrive on
+    stdin. True if it does (so it will open the menu in the TUI), False on timeout (the
+    host swallowed it), None if the user pressed Ctrl-C or the terminal can't go raw.
+
+    This is the authoritative check the issue asks for: a key intercepted by VS Code (or
+    any host) never reaches stdin here, so the test fails exactly when the TUI would."""
+    import select
+    import termios
+    import time
+    import tty
+
+    try:
+        fd = sys.stdin.fileno()
+        saved = termios.tcgetattr(fd)
+    except (termios.error, ValueError, OSError):
+        return None  # not a real tty (or redirected stdin) — can't test
+    try:
+        tty.setraw(fd)
+        if shift:
+            # Ask the terminal to report shifted control keys (kitty keyboard protocol).
+            # If it doesn't support them, the sequence never arrives and the test fails —
+            # which is correct, since the key wouldn't work in the TUI either.
+            os.write(sys.stdout.fileno(), b"\x1b[>1u")
+        buffer = bytearray()
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            readable, _, _ = select.select([fd], [], [], remaining)
+            if not readable:
+                return False
+            chunk = os.read(fd, 64)
+            if not chunk:
+                return False
+            buffer += chunk
+            if b"\x03" in buffer:  # Ctrl-C cancels the test (never a valid menu key)
+                return None
+            if expected in buffer:
+                return True
+    finally:
+        if shift:
+            try:
+                os.write(sys.stdout.fileno(), b"\x1b[<u")
+            except OSError:
+                pass
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        except (termios.error, ValueError, OSError):
+            pass
 
 
 def _discover_or_init(path: Path) -> GitRepo | None:

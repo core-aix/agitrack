@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,86 @@ from agitrack.env import getenv_compat
 DEFAULT_MENU_KEY = "ctrl-g"
 _MENU_KEY_RE = re.compile(r"^ctrl[-+]([a-bd-gk-ln-z])$")
 _MENU_KEY_SHIFT_RE = re.compile(r"^ctrl\+shift\+([a-bd-gk-ln-z])$")
+
+
+def normalize_menu_key(value: str) -> str | None:
+    """Canonicalize a user-entered menu key to ``ctrl-<letter>`` / ``ctrl+shift+<letter>``,
+    or ``None`` when it isn't a valid, allowed menu key. (The :class:`GlobalConfig`
+    property falls back to the default for invalid input so a typo can't lock the user out;
+    callers that need to *reject* bad input — e.g. the startup picker — use this directly.)"""
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    match = _MENU_KEY_SHIFT_RE.match(normalized)
+    if match:
+        return f"ctrl+shift+{match.group(1)}"
+    match = _MENU_KEY_RE.match(normalized)
+    if match:
+        return f"ctrl-{match.group(1)}"
+    return None
+
+
+def menu_key_is_shift(key: str) -> bool:
+    """True if *key* (canonical form) is the ``ctrl+shift+<letter>`` variant."""
+    return key.startswith("ctrl+shift+")
+
+
+def menu_key_label_for(key: str) -> str:
+    """Human label for a canonical menu key, e.g. ``Ctrl-G`` or ``Ctrl+Shift-G``."""
+    if menu_key_is_shift(key):
+        return f"Ctrl+Shift-{key.split('+')[-1].upper()}"
+    return f"Ctrl-{key[-1].upper()}"
+
+
+def menu_key_bytes_for(key: str) -> bytes:
+    """The byte(s) the terminal sends for a canonical menu key: the single control byte
+    (0x01–0x1a) for ``ctrl-<letter>``, or the kitty-keyboard-protocol CSI-u escape
+    sequence for ``ctrl+shift+<letter>``. This is exactly what aGiTrack matches against
+    stdin to open the menu, so it is also what a pre-TUI key test must look for."""
+    if menu_key_is_shift(key):
+        letter = key.split("+")[-1]
+        # CSI <codepoint> ; <modifiers> u — modifiers = 1 (base) + 1 (shift) + 4 (ctrl) = 6
+        return f"\x1b[{ord(letter)};6u".encode()
+    return bytes([ord(key[-1]) - 96])  # ctrl-a..ctrl-z → 0x01..0x1a
+
+
+def host_is_vscode(env: Mapping[str, str]) -> bool:
+    """Whether aGiTrack is running inside VS Code's integrated terminal, which it tags
+    with ``TERM_PROGRAM=vscode`` (and injects ``VSCODE_*`` vars via shell integration)."""
+    return env.get("TERM_PROGRAM") == "vscode" or "VSCODE_INJECTION" in env or "VSCODE_GIT_IPC_HANDLE" in env
+
+
+# Menu keys the host editor/terminal is known to bind itself, so the keypress may be
+# swallowed before it ever reaches aGiTrack. Keyed by host predicate. Only a heads-up —
+# the pre-TUI key test is the authoritative check.
+def detect_menu_key_conflict(key: str, env: Mapping[str, str]) -> str | None:
+    """A human-readable reason if *key* is likely intercepted by the detected host (so it
+    won't reach aGiTrack's menu), else ``None``. Conservative: only well-known conflicts."""
+    if key == "ctrl-g" and host_is_vscode(env):
+        return (
+            'VS Code binds Ctrl-G to "Go to Line", so in its integrated terminal the '
+            "keypress can be intercepted before it reaches aGiTrack."
+        )
+    return None
+
+
+# Preferred fallbacks, in order — control letters editors/terminals rarely grab. (All are
+# in the allowed set; Ctrl-C/H/I/J/M are excluded as terminal-reserved.)
+_MENU_KEY_SUGGESTIONS = ("ctrl-o", "ctrl-b", "ctrl-n", "ctrl-k", "ctrl-y", "ctrl+shift+g")
+
+
+def suggest_menu_keys(current: str, env: Mapping[str, str], limit: int = 3) -> list[str]:
+    """Up to *limit* alternative menu keys to offer when *current* may conflict — skipping
+    the current key and any that also conflict with the detected host."""
+    out: list[str] = []
+    for candidate in _MENU_KEY_SUGGESTIONS:
+        if candidate == current or detect_menu_key_conflict(candidate, env):
+            continue
+        out.append(candidate)
+        if len(out) >= limit:
+            break
+    return out
+
 
 # Tunable timings (all in seconds) governing aGiTrack's polling / debounce behaviour.
 # Stored under the "timings" key in config.json; any subset may be overridden, and
@@ -247,47 +328,28 @@ class GlobalConfig:
         # Invalid or conflicting values fall back to the default so a config typo
         # can never lock the user out of the menu.
         value = self._raw("menu_key")
-        if isinstance(value, str):
-            normalized = value.strip().lower()
-            match = _MENU_KEY_SHIFT_RE.match(normalized)
-            if match:
-                return f"ctrl+shift+{match.group(1)}"
-            match = _MENU_KEY_RE.match(normalized)
-            if match:
-                return f"ctrl-{match.group(1)}"
-        return DEFAULT_MENU_KEY
+        return normalize_menu_key(value) or DEFAULT_MENU_KEY if isinstance(value, str) else DEFAULT_MENU_KEY
 
     @property
     def menu_key_byte(self) -> bytes:
         # For plain ctrl-<letter>, return the control byte (0x01-0x1a).
         # For ctrl+shift+<letter>, return empty bytes (sequence-based matching).
-        if self.is_shift_modified:
-            return b""
-        return bytes([ord(self.menu_key[-1]) - 96])  # ctrl-a..ctrl-z → 0x01..0x1a
+        return b"" if self.is_shift_modified else menu_key_bytes_for(self.menu_key)
 
     @property
     def menu_key_sequence(self) -> bytes:
-        # Kitty keyboard protocol escape sequence for the menu key.
-        # For ctrl+shift+<letter>: CSI <unicode> ; <modifiers> u
-        # Modifiers: 1 (base) + 1 (shift) + 4 (ctrl) = 6
-        if self.is_shift_modified:
-            letter = self.menu_key.split("+")[-1]
-            unicode_codepoint = ord(letter)
-            return f"\x1b[{unicode_codepoint};6u".encode()
-        # For plain ctrl-<letter>, return the control byte
-        return self.menu_key_byte
+        # The bytes aGiTrack matches against stdin: the control byte for ctrl-<letter>,
+        # or the kitty-keyboard CSI-u escape sequence for ctrl+shift+<letter>.
+        return menu_key_bytes_for(self.menu_key)
 
     @property
     def is_shift_modified(self) -> bool:
         # True if the menu key uses ctrl+shift+<letter> format
-        return self.menu_key.startswith("ctrl+shift+")
+        return menu_key_is_shift(self.menu_key)
 
     @property
     def menu_key_label(self) -> str:
-        if self.is_shift_modified:
-            letter = self.menu_key.split("+")[-1]
-            return f"Ctrl+Shift-{letter.upper()}"
-        return f"Ctrl-{self.menu_key[-1].upper()}"
+        return menu_key_label_for(self.menu_key)
 
     @property
     def timings(self) -> dict[str, float]:

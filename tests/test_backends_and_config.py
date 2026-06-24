@@ -429,6 +429,39 @@ def test_menu_key_defaults_and_validation(tmp_path):
         assert config.menu_key == "ctrl-g"
 
 
+def test_menu_key_helpers_normalize_and_describe():
+    from agitrack.config import settings as s
+
+    # Canonicalization rejects invalid/reserved keys (so the startup picker can say no).
+    assert s.normalize_menu_key("CTRL-G") == "ctrl-g"
+    assert s.normalize_menu_key("Ctrl+Shift+G") == "ctrl+shift+g"
+    for bad in ("ctrl-c", "ctrl-h", "ctrl-i", "ctrl-j", "ctrl-m", "g", "nonsense", 7, None):
+        assert s.normalize_menu_key(bad) is None
+    # Labels and the bytes aGiTrack matches against stdin.
+    assert s.menu_key_label_for("ctrl-g") == "Ctrl-G"
+    assert s.menu_key_label_for("ctrl+shift+g") == "Ctrl+Shift-G"
+    assert s.menu_key_bytes_for("ctrl-g") == b"\x07"
+    assert s.menu_key_bytes_for("ctrl-o") == b"\x0f"
+    assert s.menu_key_bytes_for("ctrl+shift+g") == b"\x1b[103;6u"
+    assert s.menu_key_is_shift("ctrl+shift+g") is True
+    assert s.menu_key_is_shift("ctrl-g") is False
+
+
+def test_menu_key_conflict_detection_and_suggestions():
+    from agitrack.config import settings as s
+
+    # Ctrl-G is flagged only inside VS Code (which binds it to "Go to Line").
+    assert s.detect_menu_key_conflict("ctrl-g", {"TERM_PROGRAM": "vscode"})
+    assert s.detect_menu_key_conflict("ctrl-g", {"VSCODE_INJECTION": "1"})
+    assert s.detect_menu_key_conflict("ctrl-g", {"TERM_PROGRAM": "iTerm.app"}) is None
+    assert s.detect_menu_key_conflict("ctrl-o", {"TERM_PROGRAM": "vscode"}) is None
+    # Suggestions skip the current key and any that also conflict with the host.
+    suggestions = s.suggest_menu_keys("ctrl-o", {"TERM_PROGRAM": "vscode"})
+    assert "ctrl-o" not in suggestions
+    assert all(s.normalize_menu_key(k) == k for k in suggestions)
+    assert 1 <= len(suggestions) <= 3
+
+
 def test_menu_key_shift_modified(tmp_path):
     from agitrack.config import GlobalConfig
 
