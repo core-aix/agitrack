@@ -3656,10 +3656,18 @@ class ProxyRunner:
                 self._switch_active(index)
                 return
         if self._live_session_name_taken(name):
-            # The chosen name is occupied by a different live session — resume
-            # under a fresh name so the two don't share a worktree (which would
-            # run two backends in one directory).
-            name = self._next_session_name()
+            # The name is occupied by a different LIVE session. Two live sessions can't share a
+            # name — a session and its git worktree are 1:1, so they'd share a worktree and run
+            # two backends in one directory. Don't silently rename: ASK the user, explaining
+            # why, and offer a random word they can keep or change (Esc cancels the resume).
+            chosen = self._prompt_session_name(
+                f"A session named '{name}' is already open, so this resumed conversation needs a "
+                f"different name (two live sessions can't share a worktree). New name:",
+                default=self._next_session_name(),
+            )
+            if chosen is None:
+                return  # user cancelled — leave the active session as-is
+            name = chosen
         # Resuming relocates and re-spawns the backend (OpenCode in --no-worktree mode also
         # exports+imports the session to retarget its directory) — a few seconds. Paint a
         # notice first so the screen shows progress instead of looking frozen.
