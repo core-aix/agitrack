@@ -7986,7 +7986,7 @@ def test_backend_auto_update_runs_unconfined_and_reports_version_change(tmp_path
 
     runner = _update_runner(tmp_path)
     runner.backend = types.SimpleNamespace(name="opencode", update_command=lambda: ["opencode", "upgrade"])
-    runner._backend_self_update_blocked = lambda: True  # brew + macOS sandbox
+    runner._backend_update_via_agitrack = lambda: True  # aGiTrack drives the update (brew-managed on macOS)
     runner._backend_version = lambda: next(versions)
     versions = iter(["1.15.13", "1.17.9"])  # before, after — the upgrade landed
     captured = {}
@@ -8014,7 +8014,7 @@ def test_backend_auto_update_reports_up_to_date_when_version_unchanged(tmp_path,
 
     runner = _update_runner(tmp_path)
     runner.backend = types.SimpleNamespace(name="opencode", update_command=lambda: ["opencode", "upgrade"])
-    runner._backend_self_update_blocked = lambda: True
+    runner._backend_update_via_agitrack = lambda: True
     runner._backend_version = lambda: "1.17.9"  # unchanged before and after
     monkeypatch.setattr(
         runner_mod.subprocess,
@@ -8036,7 +8036,7 @@ def test_backend_auto_update_skips_when_self_update_not_blocked(tmp_path, monkey
 
     runner = _update_runner(tmp_path)
     runner.backend = types.SimpleNamespace(name="opencode", update_command=lambda: ["opencode", "upgrade"])
-    runner._backend_self_update_blocked = lambda: False
+    runner._backend_update_via_agitrack = lambda: False
     ran = []
     monkeypatch.setattr(runner_mod.subprocess, "run", lambda *a, **k: ran.append(True))
 
@@ -8053,15 +8053,15 @@ def test_backend_child_env_disables_opencode_autoupdate_when_agitrack_takes_over
     runner = _update_runner(tmp_path)
     runner.backend = types.SimpleNamespace(name="opencode")
     runner.global_config = types.SimpleNamespace(check_for_updates=True)
-    runner._backend_self_update_blocked = lambda: True
+    runner._backend_update_via_agitrack = lambda: True
     assert runner._backend_child_env() == {"OPENCODE_DISABLE_AUTOUPDATE": "1"}
 
     # npm/native (not sandbox-blocked) → leave OpenCode's own auto-update alone.
-    runner._backend_self_update_blocked = lambda: False
+    runner._backend_update_via_agitrack = lambda: False
     assert runner._backend_child_env() is None
 
     # Update checks off → aGiTrack won't auto-update, so don't suppress OpenCode's either.
-    runner._backend_self_update_blocked = lambda: True
+    runner._backend_update_via_agitrack = lambda: True
     runner.global_config = types.SimpleNamespace(check_for_updates=False)
     assert runner._backend_child_env() is None
 
@@ -8072,7 +8072,7 @@ def test_backend_auto_update_respects_update_check_toggle(tmp_path):
     runner = _update_runner(tmp_path)
     runner.backend = types.SimpleNamespace(name="opencode", update_command=lambda: ["opencode", "upgrade"])
     runner.global_config = types.SimpleNamespace(check_for_updates=False)
-    runner._backend_self_update_blocked = lambda: pytest.fail("should not probe when checks are off")
+    runner._backend_update_via_agitrack = lambda: pytest.fail("should not probe when checks are off")
 
     runner._maybe_auto_update_backend()
 
@@ -8099,7 +8099,7 @@ def test_backend_auto_update_noop_when_backend_has_no_updater(tmp_path):
     # isn't auto-updated — no thread, no error.
     runner = _update_runner(tmp_path)
     runner.backend = types.SimpleNamespace(name="foo")  # no update_command attribute
-    runner._backend_self_update_blocked = lambda: True
+    runner._backend_update_via_agitrack = lambda: True
 
     runner._maybe_auto_update_backend()
 
