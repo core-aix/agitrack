@@ -69,6 +69,76 @@ def _force_tty(monkeypatch, stdin: bool, stdout: bool = True):
     monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: stdout, raising=False)
 
 
+# --- startup gh-availability check ------------------------------------------------
+
+
+def _stub_gh(monkeypatch, *, status: str, has_remote: bool = True):
+    """Stub the gh status + GitHub-remote probes the startup check reads."""
+    import agitrack.metrics.github as ghmod
+
+    monkeypatch.setattr(ghmod, "gh_status", lambda: status)
+    monkeypatch.setattr(ghmod, "commit_url_base", lambda repo: "https://x/commit/" if has_remote else "")
+    monkeypatch.setattr(cli, "_drain_terminal_input", lambda: None)
+
+
+_FAKE_REPO = object()
+
+
+def test_gh_check_silent_when_authenticated(monkeypatch):
+    _force_tty(monkeypatch, stdin=True)
+    _stub_gh(monkeypatch, status="ok")
+    monkeypatch.setattr("builtins.input", lambda *a: (_ for _ in ()).throw(AssertionError("should not prompt")))
+    assert cli._check_gh_availability(_FAKE_REPO) == (True, False)
+
+
+def test_gh_check_silent_without_a_github_remote(monkeypatch):
+    _force_tty(monkeypatch, stdin=True)
+    _stub_gh(monkeypatch, status="unauthenticated", has_remote=False)
+    monkeypatch.setattr("builtins.input", lambda *a: (_ for _ in ()).throw(AssertionError("should not prompt")))
+    assert cli._check_gh_availability(_FAKE_REPO) == (True, False)
+
+
+def test_gh_check_non_interactive_does_not_prompt(monkeypatch):
+    _force_tty(monkeypatch, stdin=False)
+    _stub_gh(monkeypatch, status="unauthenticated")
+    monkeypatch.setattr("builtins.input", lambda *a: (_ for _ in ()).throw(AssertionError("should not prompt")))
+    assert cli._check_gh_availability(_FAKE_REPO) == (True, False)
+
+
+def test_gh_check_unauthenticated_continue(monkeypatch):
+    _force_tty(monkeypatch, stdin=True)
+    _stub_gh(monkeypatch, status="unauthenticated")
+    monkeypatch.setattr("builtins.input", lambda *a: "")
+    assert cli._check_gh_availability(_FAKE_REPO) == (True, True)
+
+
+def test_gh_check_quit_aborts_startup(monkeypatch):
+    _force_tty(monkeypatch, stdin=True)
+    _stub_gh(monkeypatch, status="unauthenticated")
+    monkeypatch.setattr("builtins.input", lambda *a: "q")
+    assert cli._check_gh_availability(_FAKE_REPO) == (False, True)
+
+
+def test_gh_check_login_runs_gh_auth_login(monkeypatch):
+    _force_tty(monkeypatch, stdin=True)
+    _stub_gh(monkeypatch, status="unauthenticated")
+    monkeypatch.setattr("builtins.input", lambda *a: "l")
+    ran = []
+    monkeypatch.setattr(cli, "_run_gh_login", lambda: ran.append(True))
+    assert cli._check_gh_availability(_FAKE_REPO) == (True, True)
+    assert ran == [True]
+
+
+def test_gh_check_missing_does_not_offer_login(monkeypatch):
+    _force_tty(monkeypatch, stdin=True)
+    _stub_gh(monkeypatch, status="missing")
+    monkeypatch.setattr("builtins.input", lambda *a: "l")  # 'l' is meaningless when gh isn't installed
+    ran = []
+    monkeypatch.setattr(cli, "_run_gh_login", lambda: ran.append(True))
+    assert cli._check_gh_availability(_FAKE_REPO) == (True, True)
+    assert ran == []  # no login attempted — gh isn't installed
+
+
 def test_discover_or_init_initializes_when_user_agrees(tmp_path, monkeypatch):
     _force_tty(monkeypatch, stdin=True)
     monkeypatch.setattr("builtins.input", lambda *a: "y")
