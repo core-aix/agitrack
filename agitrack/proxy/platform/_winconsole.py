@@ -69,6 +69,23 @@ def _set_mode(handle: int, mode: int) -> None:
     _kernel32.SetConsoleMode(handle, mode)
 
 
+def read_input(length: int) -> bytes:
+    """Blocking read of up to *length* bytes from the console input handle.
+
+    With ``ENABLE_VIRTUAL_TERMINAL_INPUT`` set (see :class:`RawConsole`), the console
+    delivers keystrokes as the same VT escape-byte stream the POSIX path reads from stdin,
+    so the reader thread can copy these straight into the bridge socket. Returns ``b""`` on
+    EOF / error so the reader loop ends cleanly.
+    """
+    handle = _std_handle(STD_INPUT_HANDLE)
+    buf = ctypes.create_string_buffer(length)
+    read = wintypes.DWORD()
+    ok = _kernel32.ReadFile(handle, buf, length, ctypes.byref(read), None)
+    if not ok or read.value == 0:
+        return b""
+    return buf.raw[: read.value]
+
+
 def terminal_size() -> tuple[int, int]:
     """``(rows, cols)`` of the console window, or a ``(24, 80)`` fallback."""
     info = _CONSOLE_SCREEN_BUFFER_INFO()

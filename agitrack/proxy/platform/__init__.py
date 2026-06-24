@@ -12,9 +12,33 @@ contracts, so it stays platform-agnostic.
 
 from __future__ import annotations
 
-from agitrack.proxy.platform.base import ChildProcess, ReactorWaker
+from typing import Any
 
-__all__ = ["ChildProcess", "ReactorWaker", "make_child_process", "make_waker"]
+from agitrack.proxy.platform.base import ChildProcess, HostTerminal, ReactorWaker
+
+__all__ = [
+    "ChildProcess",
+    "HostTerminal",
+    "ReactorWaker",
+    "make_child_process",
+    "make_host_terminal",
+    "make_waker",
+]
+
+
+def make_host_terminal(owner: Any) -> HostTerminal:
+    """The host-terminal controller for this platform. POSIX wraps the existing
+    ``TerminalHost`` bound to ``owner`` (the runner, which holds the raw-mode/capability
+    state); Windows returns a self-contained Win32-console controller."""
+    import os
+
+    if os.name == "nt":
+        from agitrack.proxy.platform.nt import NtHostTerminal
+
+        return NtHostTerminal()
+    from agitrack.proxy.platform.posix import PosixHostTerminal
+
+    return PosixHostTerminal(owner)
 
 
 def make_child_process(command: list[str], cwd: str, extra_env: dict[str, str] | None = None) -> ChildProcess:
