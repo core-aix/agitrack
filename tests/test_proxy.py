@@ -1786,6 +1786,10 @@ def test_proxy_cell_sgr_reproduces_attributes():
     # Named ANSI colors plus attributes round-trip to their SGR codes.
     assert runner._cell_sgr(_make_cell(bold=True, fg="red", bg="black")) == "1;31;40"
     assert runner._cell_sgr(_make_cell(italics=True, fg="brightcyan")) == "3;96"
+    # Faint (SGR 2) — pyte drops it, so aGiTrack tracks it on _DimChar and re-emits it,
+    # otherwise dim text (Claude's grey autosuggestion) renders like typed text (#113).
+    assert runner._cell_sgr(_make_cell(dim=True)) == "2"
+    assert runner._cell_sgr(_make_cell(bold=True, dim=True)) == "1;2"
 
 
 def test_proxy_render_line_preserves_colors():
@@ -1952,6 +1956,67 @@ def test_screen_erase_in_line_does_not_carry_underline():
     assert screen.buffer[0][0].underscore is True  # the drawn char keeps it
     for x in range(1, 6):
         assert screen.buffer[0][x].underscore is False
+
+
+def test_screen_tracks_faint_dim_attribute():
+    # pyte 0.8.2 has no slot for faint (SGR 2) and silently drops it, so Claude's grey
+    # autosuggestion ghost text would re-render at full intensity, indistinguishable from
+    # what the user typed (#113). _BackgroundColorEraseScreen tracks faint on _DimChar so
+    # it survives into the rendered cells.
+    import pyte
+
+    from agitrack.proxy import _BackgroundColorEraseScreen
+
+    screen = _BackgroundColorEraseScreen(20, 2, history=10, ratio=0.5)
+    stream = pyte.ByteStream(screen)
+    # Faint on, draw "ab", reset, draw "cd" at full intensity.
+    stream.feed(b"\x1b[2mab\x1b[0mcd")
+
+    assert screen.buffer[0][0].dim is True  # 'a' is faint
+    assert screen.buffer[0][1].dim is True  # 'b' is faint
+    assert screen.buffer[0][2].dim is False  # 'c' after reset is not
+    assert screen.buffer[0][3].dim is False  # 'd' after reset is not
+
+
+def test_faint_tracking_ignores_the_2_inside_truecolor_sgr():
+    # The faint code (2) must be parsed exactly where pyte expects it, never matched
+    # anywhere in the parameter list: in a 24-bit colour like `38;2;r;g;b` the `2` is the
+    # colour selector, not faint. Otherwise normal truecolor text — e.g. the user's own
+    # white input in Claude — gets wrongly dimmed (regression of the #113 fix).
+    import pyte
+
+    from agitrack.proxy import _BackgroundColorEraseScreen
+
+    screen = _BackgroundColorEraseScreen(30, 2, history=10, ratio=0.5)
+    stream = pyte.ByteStream(screen)
+    stream.feed(b"\x1b[38;2;255;255;255mhi")  # 24-bit white
+    assert screen.buffer[0][0].dim is False  # not dimmed by the colour's "2"
+    assert screen.buffer[0][0].fg == "ffffff"  # colour still applied
+
+    # 256-colour (38;5;n) likewise must not be read as faint.
+    stream.feed(b"\x1b[38;5;240mx")
+    assert screen.buffer[0][2].dim is False
+
+    # Genuine faint COMBINED with a truecolor fg keeps both.
+    stream.feed(b"\x1b[2;38;2;128;128;128mg")
+    cell = screen.buffer[0][3]
+    assert cell.dim is True and cell.fg == "808080"
+
+
+def test_screen_faint_cleared_by_normal_intensity_and_erase():
+    # SGR 22 (normal intensity) clears faint, and an erase leaves clean (non-dim) blanks.
+    import pyte
+
+    from agitrack.proxy import _BackgroundColorEraseScreen
+
+    screen = _BackgroundColorEraseScreen(6, 2, history=10, ratio=0.5)
+    stream = pyte.ByteStream(screen)
+    stream.feed(b"\x1b[2mx\x1b[22my")  # faint x, then normal-intensity y
+    assert screen.buffer[0][0].dim is True
+    assert screen.buffer[0][1].dim is False
+
+    stream.feed(b"\x1b[2m\x1b[2J")  # clear the display while faint is active
+    assert screen.buffer[0][0].dim is False  # erased blanks are not dim
 
 
 def test_screen_survives_private_device_status_query():
@@ -2319,7 +2384,11 @@ def test_pageup_pagedown_scroll_history():
     assert runner.scroll_back == 0
 
 
-def test_mouse_drag_selects_and_copies():
+def test_mouse_drag_does_not_copy_or_hijack_selection():
+    # Text selection is the terminal's job. A left-button drag must NOT trigger aGiTrack's
+    # own copy: that only ran in terminals that forward the drag to the app (mouse mode
+    # 1000), where it suppressed native selection and popped an unwanted "Copied N char(s)
+    # to clipboard" message (#112). aGiTrack now ignores left-button events entirely.
     runner = _history_runner()
     import pyte
 
@@ -2327,35 +2396,17 @@ def test_mouse_drag_selects_and_copies():
     pyte.ByteStream(runner.screen).feed(b"hello world\r\n")
     runner.sel_active = False
     runner.sel_anchor = runner.sel_point = None
-    copied = []
+    copied: list[str] = []
+    messages: list[str] = []
     runner._copy_to_clipboard = lambda text: copied.append(text)
-    runner._set_message = lambda *a, **k: None
+    runner._set_message = lambda msg, **k: messages.append(msg)
 
     runner._intercept_scroll(b"\x1b[<0;1;1M")  # press at col 1, row 1
     runner._intercept_scroll(b"\x1b[<32;5;1M")  # drag to col 5
-    assert runner._selection_ranges() == {0: (0, 4)}
-    runner._intercept_scroll(b"\x1b[<0;5;1m")  # release
-    assert copied == ["hello"]
-    assert runner.sel_active is False
-
-
-def test_mouse_press_release_copies_without_motion_events():
-    # With only button tracking (no 1002 motion), the release must still capture
-    # the end point so a drag copies correctly.
-    runner = _history_runner()
-    import pyte
-
-    runner.screen = pyte.HistoryScreen(20, 4, history=50, ratio=0.5)
-    pyte.ByteStream(runner.screen).feed(b"hello world\r\n")
-    runner.sel_active = False
-    runner.sel_anchor = runner.sel_point = None
-    copied = []
-    runner._copy_to_clipboard = lambda text: copied.append(text)
-    runner._set_message = lambda *a, **k: None
-
-    runner._intercept_scroll(b"\x1b[<0;1;1M")  # press
-    runner._intercept_scroll(b"\x1b[<0;5;1m")  # release (no motion in between)
-    assert copied == ["hello"]
+    runner._intercept_scroll(b"\x1b[<0;5;1m")  # release at a different cell (a real drag)
+    assert copied == []  # nothing was copied
+    assert messages == []  # no "Copied N chars" popup
+    assert runner.sel_active is False  # aGiTrack never started a selection
 
 
 def test_mouse_events_are_stripped_from_forwarded_input():
@@ -6079,6 +6130,74 @@ def test_relaunch_backend_resumes_then_gives_up_on_crash_loop(monkeypatch):
     assert calls == ["relaunch", "relaunch", "relaunch", "finalize"]
 
 
+def test_crash_loop_capture_surfaces_backend_output(monkeypatch):
+    # When the backend keeps dying on launch, the crash-loop bail must capture the
+    # backend's last output so run() can echo it instead of exiting silently (#114).
+    runner = make_runner()
+    runner._debug = lambda *a, **k: None
+    runner._restart_agent = lambda msg: None
+    runner._finalize_on_backend_exit = lambda: None
+    runner.last_child_output_sample = (
+        b"\x1b[2J\x1b[HError: Session abc123 is currently running as a "
+        b"background agent (bg). Use `claude agents` ... or add --fork-session.\r\n"
+    )
+
+    t = [1000.0]
+    monkeypatch.setattr("agitrack.proxy.runner.time.monotonic", lambda: t[0])
+    for _ in range(3):
+        assert runner._relaunch_backend_or_exit() is True
+    assert runner._relaunch_backend_or_exit() is False
+
+    notice = runner._backend_exit_notice
+    assert notice is not None
+    assert "exited repeatedly" in notice
+    assert "running as a background agent" in notice  # the real reason, escapes stripped
+    assert "\x1b" not in notice
+    assert "--new-session" in notice
+
+
+def test_busy_session_forks_instead_of_crash_looping():
+    # The claude session is held by a running background agent. aGiTrack should fork a
+    # copy on the next spawn rather than relaunch into the same refusal (#114).
+    import types
+
+    runner = make_runner(
+        state=types.SimpleNamespace(backend="claude", backend_session_id="old-id"),
+        last_child_output_sample=(
+            b"Error: Session old-id is currently running as a background agent (bg). "
+            b"Use `claude agents` ... or add --fork-session to branch off a copy.\r\n"
+        ),
+    )
+    runner._debug = lambda *a, **k: None
+    messages = []
+    runner._restart_agent = lambda msg: messages.append(msg)
+
+    # First death: fork once.
+    assert runner._relaunch_backend_or_exit() is True
+    assert runner._fork_next_spawn is True
+    assert runner._forked_for_busy is True
+    assert messages and "forked" in messages[0].lower()
+
+    # If the fork ALSO dies, don't fork again — fall through to the normal guard.
+    runner._restart_agent = lambda msg: messages.append("relaunch")
+    runner._finalize_on_backend_exit = lambda: messages.append("finalize")
+    runner._relaunch_backend_or_exit()
+    assert runner._forked_for_busy is True  # not re-forked
+
+
+def test_claude_spawn_command_fork_appends_flag():
+    from pathlib import Path
+
+    from agitrack.backends.proxy_agents import ClaudeProxyAgent
+
+    agent = ClaudeProxyAgent()
+    cmd = agent.spawn_command(Path("/repo"), session_id="abc", resume=True, fork=True, commit_guidance=False)
+    assert cmd[:4] == ["claude", "--resume", "abc", "--fork-session"]
+    # No fork flag when not forking.
+    cmd_plain = agent.spawn_command(Path("/repo"), session_id="abc", resume=True, fork=False, commit_guidance=False)
+    assert "--fork-session" not in cmd_plain
+
+
 def test_relaunch_backend_resets_loop_guard_after_quiet_period(monkeypatch):
     runner = make_runner()
     runner._debug = lambda *a, **k: None
@@ -6923,7 +7042,7 @@ def test_spawn_failed_exec_child_exits_with_127(tmp_path):
         worktree=None,
         backend=types.SimpleNamespace(
             new_session_id=lambda: "ses-1",
-            spawn_command=lambda repo, session_id, resume, commit_guidance=True, use_worktrees=True, executable=None: [
+            spawn_command=lambda repo, session_id, resume, fork=False, commit_guidance=True, use_worktrees=True, executable=None: [
                 "agit-test-binary-that-does-not-exist"
             ],
             list_sessions=lambda repo: [],

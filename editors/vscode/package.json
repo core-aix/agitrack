@@ -72,6 +72,12 @@
         "command": "agitrack.install",
         "title": "Install aGiTrack CLI",
         "category": "aGiTrack"
+      },
+      {
+        "command": "agitrack.ghLogin",
+        "title": "Sign in to GitHub (gh)",
+        "category": "aGiTrack",
+        "icon": "$(github)"
       }
     ],
     "menus": {
@@ -152,7 +158,7 @@
   "scripts": {
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "test": "tsc -p ./ && node --test out/platform.test.js out/installPaths.test.js out/liveness.test.js",
+    "test": "tsc -p ./ && node --test out/platform.test.js out/installPaths.test.js out/liveness.test.js out/github.test.js",
     "vscode:prepublish": "npm run compile",
     "package": "vsce package --no-dependencies",
     "publish": "vsce publish --no-dependencies"

@@ -22,6 +22,7 @@ import { readdirSync, readFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 
+import { GhStatus, hasGithubRemoteUrl, shouldPromptGithubSignIn } from "./github";
 import { dedupe, staticExeCandidates } from "./installPaths";
 import { sessionLooksLive } from "./liveness";
 import { isNativeWindows } from "./platform";
@@ -66,6 +67,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("agitrack.restart", () => restartSession()),
     vscode.commands.registerCommand("agitrack.dashboard", (uri?: vscode.Uri) => openDashboard(uri)),
     vscode.commands.registerCommand("agitrack.install", () => installAgitrack()),
+    vscode.commands.registerCommand("agitrack.ghLogin", () => ghLogin()),
   );
 
   // Forget terminals the user closes so the next launch starts a fresh one. We do
@@ -345,6 +347,9 @@ async function startSession(targetUri?: vscode.Uri): Promise<void> {
     launchedAt.set(terminal, Date.now());
     terminals.set(key, terminal);
     terminal.show();
+    // aGiTrack's TUI will nag if `gh` isn't authenticated, but its full-screen UI leaves
+    // no shell prompt to fix it — so offer a one-click sign-in here, off the launch path.
+    void maybePromptGithubSignIn(folder.uri.fsPath);
   } finally {
     launching.delete(key);
   }
@@ -569,6 +574,90 @@ async function ensureCloseConfirmation(): Promise<void> {
   const willPrompt = current === "always" || (inEditor && current === "editor");
   if (!willPrompt) {
     await termCfg.update("confirmOnKill", "always", vscode.ConfigurationTarget.Global);
+  }
+}
+
+// --- GitHub CLI sign-in ----------------------------------------------------------
+
+const GH_LOGIN_TERMINAL = "GitHub Login (gh)";
+// Show the sign-in prompt at most once per activation, so relaunching a session in the
+// same window doesn't re-nag. Dismissal ("Don't show again") persists across windows.
+let githubSignInPrompted = false;
+const SUPPRESS_GH_SIGN_IN_KEY = "agitrack.suppressGithubSignInPrompt";
+
+/** Open a terminal running `gh auth login` so the user can authenticate the GitHub CLI
+ * without leaving VSCode. aGiTrack's TUI occupies its own terminal (no shell prompt to
+ * type into), and the dashboard's committer identities + session sharing depend on `gh`.
+ * Run in a plain shell terminal so `gh` resolves from the user's real PATH — the same
+ * environment aGiTrack inherits — and writes credentials that environment can read. */
+async function ghLogin(): Promise<void> {
+  if (await blockOnNativeWindows()) {
+    return;
+  }
+  const terminal = vscode.window.createTerminal({
+    name: GH_LOGIN_TERMINAL,
+    iconPath: new vscode.ThemeIcon("github"),
+  });
+  ourTerminals.add(terminal); // mark before onDidOpenTerminal fires, so we never self-dispose
+  terminal.show();
+  // `gh auth login` is interactive (it prompts for protocol, then opens a browser / shows a
+  // device code). Run it via the shell so a missing `gh` surfaces a normal "command not
+  // found" the user can act on, rather than us guessing the binary's path.
+  terminal.sendText("gh auth login");
+}
+
+/** Best-effort `gh` auth state, checked the same way aGiTrack's CLI does (`gh auth status`
+ * exit code). Runs in the extension host, which — like a GUI-launched aGiTrack — may not be
+ * able to read Keychain-stored credentials, so this mirrors what aGiTrack actually sees. */
+async function ghAuthStatus(): Promise<GhStatus> {
+  if (!(await runnable("gh"))) {
+    return "missing";
+  }
+  try {
+    await execCapture("gh", ["auth", "status"], 8_000);
+    return "ok";
+  } catch {
+    return "unauthenticated";
+  }
+}
+
+/** Whether the folder has a GitHub remote (so `gh` is actually relevant here). */
+async function hasGithubRemote(folderPath: string): Promise<boolean> {
+  try {
+    return hasGithubRemoteUrl(await execCaptureIn("git", ["remote", "-v"], folderPath, 4_000));
+  } catch {
+    return false; // not a git repo / no git — treat as no GitHub remote
+  }
+}
+
+/** After a session launches, offer one-click GitHub sign-in when `gh` is installed but not
+ * authenticated on a GitHub repo — the case where aGiTrack nags but the user has no way to
+ * act from inside its TUI. Best-effort and unobtrusive: silent unless actionable, gated to
+ * once per activation, and permanently dismissible. */
+async function maybePromptGithubSignIn(folderPath: string): Promise<void> {
+  const state = extensionContext?.globalState;
+  const status = await ghAuthStatus();
+  if (
+    !shouldPromptGithubSignIn({
+      status,
+      hasGithubRemote: await hasGithubRemote(folderPath),
+      suppressed: state?.get<boolean>(SUPPRESS_GH_SIGN_IN_KEY) ?? false,
+      alreadyPrompted: githubSignInPrompted,
+    })
+  ) {
+    return;
+  }
+  githubSignInPrompted = true;
+  const choice = await vscode.window.showInformationMessage(
+    "aGiTrack: the GitHub CLI (gh) isn't signed in here, so the dashboard's committer " +
+      "identities and session sharing are disabled. Sign in to enable them.",
+    "Sign in to GitHub",
+    "Don't show again",
+  );
+  if (choice === "Sign in to GitHub") {
+    await ghLogin();
+  } else if (choice === "Don't show again") {
+    await state?.update(SUPPRESS_GH_SIGN_IN_KEY, true);
   }
 }
 
@@ -982,8 +1071,13 @@ async function runnable(exe: string): Promise<boolean> {
 }
 
 function execCapture(cmd: string, args: string[], timeout: number): Promise<string> {
+  return execCaptureIn(cmd, args, undefined, timeout);
+}
+
+/** As `execCapture`, but run in `cwd` (used for repo-scoped probes like `git remote -v`). */
+function execCaptureIn(cmd: string, args: string[], cwd: string | undefined, timeout: number): Promise<string> {
   return new Promise((resolve, reject) => {
-    execFile(cmd, args, { timeout }, (err, stdout, stderr) => {
+    execFile(cmd, args, { timeout, cwd }, (err, stdout, stderr) => {
       if (err) {
         reject(new Error(((stderr || "") + (err.message || "")).trim() || "command failed"));
       } else {

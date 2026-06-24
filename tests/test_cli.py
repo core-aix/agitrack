@@ -69,6 +69,152 @@ def _force_tty(monkeypatch, stdin: bool, stdout: bool = True):
     monkeypatch.setattr(cli.sys.stdout, "isatty", lambda: stdout, raising=False)
 
 
+# --- startup gh-availability check ------------------------------------------------
+
+
+def _stub_gh(monkeypatch, *, status: str, has_remote: bool = True):
+    """Stub the gh status + GitHub-remote probes the startup check reads."""
+    import agitrack.metrics.github as ghmod
+
+    monkeypatch.setattr(ghmod, "gh_status", lambda: status)
+    monkeypatch.setattr(ghmod, "commit_url_base", lambda repo: "https://x/commit/" if has_remote else "")
+    monkeypatch.setattr(cli, "_drain_terminal_input", lambda: None)
+
+
+_FAKE_REPO = object()
+
+
+def test_gh_check_silent_when_authenticated(monkeypatch):
+    _force_tty(monkeypatch, stdin=True)
+    _stub_gh(monkeypatch, status="ok")
+    monkeypatch.setattr("builtins.input", lambda *a: (_ for _ in ()).throw(AssertionError("should not prompt")))
+    assert cli._check_gh_availability(_FAKE_REPO) == (True, False)
+
+
+def test_gh_check_silent_without_a_github_remote(monkeypatch):
+    _force_tty(monkeypatch, stdin=True)
+    _stub_gh(monkeypatch, status="unauthenticated", has_remote=False)
+    monkeypatch.setattr("builtins.input", lambda *a: (_ for _ in ()).throw(AssertionError("should not prompt")))
+    assert cli._check_gh_availability(_FAKE_REPO) == (True, False)
+
+
+def test_gh_check_non_interactive_does_not_prompt(monkeypatch):
+    _force_tty(monkeypatch, stdin=False)
+    _stub_gh(monkeypatch, status="unauthenticated")
+    monkeypatch.setattr("builtins.input", lambda *a: (_ for _ in ()).throw(AssertionError("should not prompt")))
+    assert cli._check_gh_availability(_FAKE_REPO) == (True, False)
+
+
+def test_gh_check_unauthenticated_continue(monkeypatch):
+    _force_tty(monkeypatch, stdin=True)
+    _stub_gh(monkeypatch, status="unauthenticated")
+    monkeypatch.setattr("builtins.input", lambda *a: "")
+    assert cli._check_gh_availability(_FAKE_REPO) == (True, True)
+
+
+def test_gh_check_quit_aborts_startup(monkeypatch):
+    _force_tty(monkeypatch, stdin=True)
+    _stub_gh(monkeypatch, status="unauthenticated")
+    monkeypatch.setattr("builtins.input", lambda *a: "q")
+    assert cli._check_gh_availability(_FAKE_REPO) == (False, True)
+
+
+def test_gh_check_login_runs_gh_auth_login(monkeypatch):
+    _force_tty(monkeypatch, stdin=True)
+    _stub_gh(monkeypatch, status="unauthenticated")
+    monkeypatch.setattr("builtins.input", lambda *a: "l")
+    ran = []
+    monkeypatch.setattr(cli, "_run_gh_login", lambda: ran.append(True))
+    assert cli._check_gh_availability(_FAKE_REPO) == (True, True)
+    assert ran == [True]
+
+
+def test_gh_check_missing_does_not_offer_login(monkeypatch):
+    _force_tty(monkeypatch, stdin=True)
+    _stub_gh(monkeypatch, status="missing")
+    monkeypatch.setattr("builtins.input", lambda *a: "l")  # 'l' is meaningless when gh isn't installed
+    ran = []
+    monkeypatch.setattr(cli, "_run_gh_login", lambda: ran.append(True))
+    assert cli._check_gh_availability(_FAKE_REPO) == (True, True)
+    assert ran == []  # no login attempted — gh isn't installed
+
+
+# --- startup menu-key conflict check ----------------------------------------------
+
+
+def _menu_config(tmp_path, **data):
+    from agitrack.config import GlobalConfig
+
+    config = GlobalConfig(tmp_path / "config.json")
+    config.data.update(data)
+    return config
+
+
+def test_menu_key_check_silent_without_conflict(tmp_path, monkeypatch):
+    # No known host conflict (not VS Code) → never prompts.
+    _force_tty(monkeypatch, stdin=True)
+    monkeypatch.setattr(cli.os, "environ", {"TERM_PROGRAM": "iTerm.app"})
+    monkeypatch.setattr("builtins.input", lambda *a: (_ for _ in ()).throw(AssertionError("should not prompt")))
+    assert cli._verify_menu_key(_menu_config(tmp_path)) is True
+
+
+def test_menu_key_check_non_interactive_does_not_prompt(tmp_path, monkeypatch):
+    _force_tty(monkeypatch, stdin=False)
+    monkeypatch.setattr(cli.os, "environ", {"TERM_PROGRAM": "vscode"})
+    monkeypatch.setattr("builtins.input", lambda *a: (_ for _ in ()).throw(AssertionError("should not prompt")))
+    assert cli._verify_menu_key(_menu_config(tmp_path)) is True
+
+
+def test_menu_key_check_keep_records_acknowledgement(tmp_path, monkeypatch):
+    # VS Code + Ctrl-G conflicts; pressing Enter keeps it and records the ack so the next
+    # launch stays quiet.
+    _force_tty(monkeypatch, stdin=True)
+    monkeypatch.setattr(cli.os, "environ", {"TERM_PROGRAM": "vscode"})
+    monkeypatch.setattr("builtins.input", lambda *a: "")  # keep
+    config = _menu_config(tmp_path)
+    assert cli._verify_menu_key(config) is True
+    assert config._raw("menu_key_acknowledged") == "ctrl-g"
+    # Second launch: already acknowledged → no prompt.
+    monkeypatch.setattr("builtins.input", lambda *a: (_ for _ in ()).throw(AssertionError("should not prompt")))
+    assert cli._verify_menu_key(config) is True
+
+
+def test_menu_key_check_quit_aborts(tmp_path, monkeypatch):
+    _force_tty(monkeypatch, stdin=True)
+    monkeypatch.setattr(cli.os, "environ", {"TERM_PROGRAM": "vscode"})
+    monkeypatch.setattr("builtins.input", lambda *a: "q")
+    assert cli._verify_menu_key(_menu_config(tmp_path)) is False
+
+
+def test_menu_key_check_test_then_keep(tmp_path, monkeypatch):
+    # 't' runs the key test (stubbed), then Enter keeps the key.
+    _force_tty(monkeypatch, stdin=True)
+    monkeypatch.setattr(cli.os, "environ", {"TERM_PROGRAM": "vscode"})
+    answers = iter(["t", ""])
+    monkeypatch.setattr("builtins.input", lambda *a: next(answers))
+    tested = []
+    monkeypatch.setattr(cli, "_run_menu_key_test", lambda key: tested.append(key) or True)
+    assert cli._verify_menu_key(_menu_config(tmp_path)) is True
+    assert tested == ["ctrl-g"]
+
+
+def test_menu_key_check_change_persists_new_key(tmp_path, monkeypatch):
+    # 'c' to change → enter a non-conflicting key → it's persisted as menu_key.
+    _force_tty(monkeypatch, stdin=True)
+    monkeypatch.setattr(cli.os, "environ", {"TERM_PROGRAM": "vscode"})
+    answers = iter(["c", "ctrl-o", "n"])  # choose; new key; skip the test
+    monkeypatch.setattr("builtins.input", lambda *a: next(answers))
+    config = _menu_config(tmp_path)
+    assert cli._verify_menu_key(config) is True
+    assert config.menu_key == "ctrl-o"
+    assert config._raw("menu_key_acknowledged") == "ctrl-o"
+
+
+def test_read_menu_key_press_returns_none_without_tty():
+    # No real tty under pytest → the raw-mode test can't run and reports "unavailable".
+    assert cli._read_menu_key_press(b"\x07", shift=False) is None
+
+
 def test_discover_or_init_initializes_when_user_agrees(tmp_path, monkeypatch):
     _force_tty(monkeypatch, stdin=True)
     monkeypatch.setattr("builtins.input", lambda *a: "y")
@@ -141,6 +287,13 @@ def _stub_launch(monkeypatch, *, use_worktrees: bool = True, commit_guidance: bo
 
     monkeypatch.setattr(cli, "ProxyRunner", Fake)
     monkeypatch.setattr(cli, "AgitrackShell", Fake)
+    # These tests exercise main()'s arg routing, not the pre-TUI startup checks; neutralize
+    # them so the minimal stub Config/repo below need no extra surface — and so the checks
+    # don't behave differently by environment (e.g. the menu-key check firing because the
+    # suite runs inside VS Code, or the gh check shelling out to `gh` on the stub repo,
+    # which has no `_run` and broke CI where gh is unauthenticated).
+    monkeypatch.setattr(cli, "_verify_menu_key", lambda *a, **k: True)
+    monkeypatch.setattr(cli, "_check_gh_availability", lambda *a, **k: (True, False))
     _stub_repo_and_free_lock(monkeypatch)
 
     class Config:
@@ -879,6 +1032,27 @@ def test_privacy_warning_drains_stdin_before_reading(monkeypatch):
 
 def test_drain_terminal_input_never_raises():
     cli._drain_terminal_input()  # no real tty under pytest; must be a safe no-op
+
+
+def test_privacy_warning_wraps_to_terminal_width():
+    # A narrow terminal must wrap the warning tighter (different break points) so it never
+    # overflows, while a wide terminal keeps the authored wrapping.
+    wide = cli._privacy_warning(100)
+    narrow = cli._privacy_warning(34)
+    for text in (wide, narrow):
+        assert text.startswith("\n")  # leading blank line preserved
+        assert "passwords, API keys" in text  # key phrase never split mid-wrap
+    # Narrow re-wraps: more lines, and every line fits the width.
+    narrow_lines = [line for line in narrow.splitlines() if line]
+    assert len(narrow_lines) > len([line for line in wide.splitlines() if line])
+    assert all(len(line) <= 34 for line in narrow_lines)
+
+
+def test_privacy_warning_never_exceeds_authored_width_on_wide_terminal():
+    # On a very wide terminal we cap at the authored width rather than stretching the text
+    # across the whole screen.
+    lines = [line for line in cli._privacy_warning(500).splitlines() if line]
+    assert lines and all(len(line) <= cli._PRIVACY_WARNING_WIDTH for line in lines)
 
 
 def test_privacy_warning_quit_aborts(monkeypatch, capsys):
