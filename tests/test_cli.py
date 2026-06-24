@@ -287,10 +287,13 @@ def _stub_launch(monkeypatch, *, use_worktrees: bool = True, commit_guidance: bo
 
     monkeypatch.setattr(cli, "ProxyRunner", Fake)
     monkeypatch.setattr(cli, "AgitrackShell", Fake)
-    # These tests exercise main()'s arg routing, not the pre-TUI menu-key check; neutralize
-    # it so the minimal stub Config below needs no menu_key surface (and so the check never
-    # fires just because the suite itself runs inside VS Code's integrated terminal).
+    # These tests exercise main()'s arg routing, not the pre-TUI startup checks; neutralize
+    # them so the minimal stub Config/repo below need no extra surface — and so the checks
+    # don't behave differently by environment (e.g. the menu-key check firing because the
+    # suite runs inside VS Code, or the gh check shelling out to `gh` on the stub repo,
+    # which has no `_run` and broke CI where gh is unauthenticated).
     monkeypatch.setattr(cli, "_verify_menu_key", lambda *a, **k: True)
+    monkeypatch.setattr(cli, "_check_gh_availability", lambda *a, **k: (True, False))
     _stub_repo_and_free_lock(monkeypatch)
 
     class Config:

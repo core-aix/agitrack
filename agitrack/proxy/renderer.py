@@ -259,13 +259,26 @@ class _BackgroundColorEraseScreen(pyte.HistoryScreen):
     def select_graphic_rendition(self, *attrs: int) -> None:
         # Let pyte handle everything it knows (it harmlessly ignores the faint code),
         # then apply the faint state we tracked. A reset (0) or normal-intensity (22)
-        # clears faint; 2 sets it; last occurrence wins.
+        # clears faint; a standalone 2 sets it; last occurrence wins.
+        #
+        # The 2 must be parsed exactly as pyte does, NOT matched anywhere in the list:
+        # in a 24-bit colour like ``38;2;r;g;b`` (or ``48;2;…``) the ``2`` is the colour
+        # selector, not faint. Consuming 38/48's parameters here keeps normal truecolor
+        # text (e.g. the user's own white input) from being wrongly dimmed (#113 follow-up).
         dim: bool | None = None
-        for attr in attrs or (0,):
+        remaining = list(reversed(attrs or (0,)))
+        while remaining:
+            attr = remaining.pop()
             if attr == 2:
                 dim = True
             elif attr in (0, 22):
                 dim = False
+            elif attr in (38, 48):  # extended fg/bg — skip its parameters
+                mode = remaining.pop() if remaining else None
+                if mode == 5 and remaining:  # 256-colour: one index byte
+                    remaining.pop()
+                elif mode == 2:  # 24-bit: three colour bytes
+                    del remaining[-3:]
         super().select_graphic_rendition(*attrs)
         if dim is None:
             return
