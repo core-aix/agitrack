@@ -6383,27 +6383,19 @@ class ProxyRunner:
         return data
 
     def _handle_mouse(self, button: int, col: int, row: int, kind: bytes) -> None:
+        # Only the wheel is aGiTrack's to act on (history scrollback for a backend that
+        # doesn't drive the mouse itself, e.g. Claude). Left-button press/drag/release are
+        # deliberately left alone so the TERMINAL owns text selection.
+        #
+        # aGiTrack used to drag-select-and-copy here, but that path only ever ran in
+        # terminals that forward a plain drag to the application (mouse mode 1000) — and
+        # there it both SUPPRESSED the terminal's native selection and popped an unwanted
+        # "Copied N char(s) to clipboard" message (#112). Terminals that select natively
+        # never forward the drag, so they never hit this code and are unaffected; dropping
+        # it removes only the harmful case. The mouse bytes are still stripped from the
+        # input forwarded to the backend by _intercept_scroll.
         if button & 64:  # wheel
             self._scroll(-3 if button & 1 else 3)
-            return
-        y = max(0, min(row - 1, max(self.rows - 2, 0)))
-        x = max(0, min(col - 1, self.cols - 1))
-        is_left = (button & 0b11) == 0
-        motion = bool(button & 32)
-        if kind == b"M" and is_left and not motion:  # press
-            self.sel_active = True
-            self.sel_anchor = (y, x)
-            self.sel_point = (y, x)
-        elif kind == b"M" and motion and self.sel_active:  # drag (live, when motion is reported)
-            self.sel_point = (y, x)
-            self._render()
-        elif kind == b"m" and self.sel_active:  # release
-            self.sel_point = (y, x)  # capture the release point even without motion events
-            if self.sel_anchor != self.sel_point:  # a drag, not a plain click
-                self._copy_selection()
-            self.sel_active = False
-            self.sel_anchor = self.sel_point = None
-            self._render()
 
     def _selection_ranges(self) -> dict[int, tuple[int, int]]:
         return ScreenRenderer.selection_ranges(self, self.cols)
