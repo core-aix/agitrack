@@ -56,12 +56,15 @@ class OpenCodeBackend:
     ) -> AgentResult:
         # ``commit_guidance`` is accepted for a uniform interface but unused: OpenCode's CLI
         # has no flag to append to its system prompt.
-        # ``bare``/``system_prompt`` are honoured best-effort: ``opencode run`` exposes no
-        # flag to drop its tool set or replace its system prompt, so the summarizer's input
-        # stays whatever OpenCode sends. The summarizer is already pointed at a scratch
-        # directory, so at least no repo AGENTS.md is loaded. (Claude, where the bloat is
-        # large and the echo risk real, applies the full reduction.) Accepted for a uniform
-        # backend interface.
+        # ``bare``/``system_prompt``: ``opencode run`` exposes no flag to replace its system
+        # prompt, so a system_prompt passed here (the summarizer's TASK INSTRUCTION) would be
+        # dropped — leaving OpenCode no idea it should summarize, so it acts on the trace
+        # instead and the summary is rejected. Fold the instruction into the prompt itself so
+        # OpenCode actually receives it. (Claude takes the instruction via --system-prompt and
+        # also strips tools/memory; OpenCode keeps its agent context but the scratch dir is
+        # empty, so there's nothing for its tools to act on.)
+        if bare and system_prompt:
+            prompt = f"{system_prompt}\n\n{prompt}"
         command = [*(self.launch_command or ["opencode"]), "run", "--format", "json", "--dir", str(self.repo)]
         if model:
             command.extend(["--model", model])

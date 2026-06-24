@@ -1055,6 +1055,14 @@ class ProxyRunner:
         self._apply_new_session_if_requested()
         self._sanitize_state_trace()
         self._initialize_session_baseline()
+        # Stage the resume BEFORE the startup spawn so a previous session whose backend-recorded
+        # working directory has since moved (e.g. the repo was renamed, or it last ran in a
+        # now-gone worktree) resumes in THIS session's directory — not its stale old path. The
+        # multi-session paths stage via _new_session; the initial session spawns directly here,
+        # so without this its resume keeps the old cwd (OpenCode especially, which restores the
+        # session's recorded directory and ignores the launch path).
+        if self._should_continue_session():
+            self._stage_backend_resume(self.state.backend_session_id)
         self._init_screen()
         self._spawn()
         self._start_file_watcher()
