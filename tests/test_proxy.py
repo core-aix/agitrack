@@ -4486,6 +4486,9 @@ def test_resume_uses_original_worktree_when_name_is_free():
 def test_resume_uses_fresh_name_when_colliding_with_live_session():
     runner = _resume_runner()
     runner._next_session_name = lambda: "session-3"
+    # A collision with the live session now PROMPTS the user (it no longer silently renames);
+    # here the user accepts the suggested fresh name (the prompt's default).
+    runner._prompt_session_name = lambda title, *, default: default
 
     # A past conversation that ran in "session-1" — but session-1 is live now.
     runner._resume_conversation("session-1", "past-xyz")
@@ -8235,3 +8238,51 @@ def test_worktree_sessions_is_memoized_to_avoid_repeated_slow_listing(tmp_path):
     runner._worktree_sessions()
 
     assert len(calls) == 1  # cached within the TTL, not three subprocesses
+
+
+def _collision_resume_runner(tmp_path):
+    runner = make_runner(state=AgitrackState(tmp_path))
+    runner.sessions = []  # no live session matches the id -> skip the "already live, just switch" shortcut
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda *a, **k: None
+    runner._next_session_name = lambda: "suggested-word"
+    runner._created = []  # type: ignore[attr-defined]
+    runner._new_session = lambda name, **k: runner._created.append(name)  # type: ignore[attr-defined]
+    return runner
+
+
+def test_resume_name_collision_prompts_with_random_suggestion(tmp_path):
+    # Resuming a conversation whose name collides with a LIVE session must PROMPT the user
+    # (explaining why, suggesting a random word) — never silently rename.
+    runner = _collision_resume_runner(tmp_path)
+    runner._live_session_name_taken = lambda name: True
+    asked = []
+    runner._prompt_session_name = lambda title, *, default: asked.append((title, default)) or "bar"
+
+    runner._resume_conversation("foo", "ses_1")
+
+    assert asked, "the user was not prompted"
+    title, default = asked[0]
+    assert default == "suggested-word"  # a random word is offered as the editable default
+    assert "already open" in title and "name" in title.lower()  # explains why a new name is needed
+    assert runner._created == ["bar"]  # resumed under the user's chosen name, not an auto one
+
+
+def test_resume_name_collision_cancel_aborts_resume(tmp_path):
+    runner = _collision_resume_runner(tmp_path)
+    runner._live_session_name_taken = lambda name: True
+    runner._prompt_session_name = lambda *a, **k: None  # Esc / cancel
+
+    runner._resume_conversation("foo", "ses_1")
+
+    assert runner._created == []  # nothing resumed when the user cancels the name prompt
+
+
+def test_resume_without_collision_keeps_name_and_does_not_prompt(tmp_path):
+    runner = _collision_resume_runner(tmp_path)
+    runner._live_session_name_taken = lambda name: False
+    runner._prompt_session_name = lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not prompt"))
+
+    runner._resume_conversation("foo", "ses_1")
+
+    assert runner._created == ["foo"]  # original name kept, no prompt
