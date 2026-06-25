@@ -4045,17 +4045,25 @@ class ProxyRunner:
         return message
 
     def _manage_shared_sessions_menu(self) -> str:
-        # Must open instantly: read only the LOCAL ref (no network fetch — your own
-        # shares are already here) and label each entry from cheap data only
-        # (manifest + a stat-sized "newer?" check), never a transcript read/redact.
+        # Fetch the remote FIRST so the list reflects what's actually shared on origin — a
+        # session shared from another machine becomes manageable here, and one removed
+        # elsewhere drops out, instead of trusting a possibly-stale local/mirror view (which is
+        # what let a local-only session that never reached origin masquerade as "shared"). The
+        # fetch is cancelable and bounded; with no remote it's an instant local call. The list
+        # itself is still labelled from cheap data only (manifest + a stat-sized "newer?"
+        # check), never a transcript read/redact.
         store = self._shared_store()
         login = self.global_config.github_login or self._cached_or_resolve_login()
+        if not self._fetch_shared_with_cancel(store, "Fetching shared sessions from origin…"):
+            return self._MENU_UP  # the user stopped the fetch — back to the sessions menu
         while True:
             mine = [entry for entry in store.entries() if entry.github_id == login]
             if not mine:
-                self._set_message("You haven't shared any sessions in this repo yet. Use session → Share this session.")
+                # _MENU_DONE (not _UP) so this message is VISIBLE on the agent screen: returning
+                # _UP re-shows the sessions menu straight over it, which reads as "nothing shows".
+                self._set_message("No sessions are shared in this repo. Use session → Share this session to share one.")
                 self._render()
-                return self._MENU_UP
+                return self._MENU_DONE
             auto_state = self._user_state()  # base-repo opt-in, read once for the whole list
             options: list[str] = []
             for entry in mine:
