@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import threading
 from pathlib import Path
@@ -8,6 +9,10 @@ from typing import IO
 
 from agitrack.backends.base import AgentResult, TokenUsage
 from agitrack.proc import resolve_subprocess_command
+
+# Module constant (not a runtime ``os.name`` read) so tests can flip the Windows path on a
+# POSIX host without monkeypatching ``os.name`` globally (which would break pathlib there).
+_IS_WINDOWS = os.name == "nt"
 
 # The summarizer is a mechanical text-reduction task that gains nothing from reasoning, so
 # its bare run asks OpenCode for the lowest reasoning effort. OpenCode has no env-var/flag
@@ -78,6 +83,11 @@ class OpenCodeBackend:
             command.extend(["--variant", _SUMMARIZER_REASONING_VARIANT])
         # Passthrough options go before the prompt positional (#32).
         command.extend(self.backend_args)
+        # On Windows the backend is usually a `.cmd` shim run through cmd.exe, which TRUNCATES
+        # a command-line argument at its first newline; the (multi-line) message would be cut
+        # to its first line. Feed it via STDIN instead. A leading-slash command stays on argv
+        # (a short single-line directive routed through --command). POSIX passes it positionally.
+        to_stdin = _IS_WINDOWS and not prompt.startswith("/")
         if prompt.startswith("/"):
             slash_command, args = self._split_slash_command(prompt)
             if slash_command:
@@ -85,16 +95,33 @@ class OpenCodeBackend:
                 command.extend(args)
             else:
                 command.append(prompt)
-        else:
+        elif not to_stdin:
             command.append(prompt)
 
         process = subprocess.Popen(
             resolve_subprocess_command(command),  # find/launch opencode(.cmd/.exe) on Windows (#118)
             cwd=self.repo,
             text=True,
+            stdin=subprocess.PIPE if to_stdin else None,
             stderr=subprocess.STDOUT,
             stdout=subprocess.PIPE,
         )
+        if to_stdin and process.stdin is not None:
+            # Write on a daemon thread so a large message can't deadlock against the stdout
+            # reader (both pipes filling at once); close stdin so OpenCode sees EOF and never
+            # blocks waiting for more input.
+            def _feed_stdin(pipe: IO[str], text: str) -> None:
+                try:
+                    pipe.write(text)
+                except OSError:
+                    pass
+                finally:
+                    try:
+                        pipe.close()
+                    except OSError:
+                        pass
+
+            threading.Thread(target=_feed_stdin, args=(process.stdin, prompt), daemon=True).start()
         watchdog: threading.Timer | None = None
         if bare:
             watchdog = threading.Timer(_SUMMARIZER_TIMEOUT_SECONDS, process.kill)

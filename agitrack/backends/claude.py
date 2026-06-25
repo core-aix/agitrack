@@ -8,6 +8,10 @@ from pathlib import Path
 from agitrack.backends.base import AgentResult, TokenUsage
 from agitrack.proc import resolve_subprocess_command
 
+# Module constant (not a runtime ``os.name`` read) so tests can flip the Windows path on a
+# POSIX host without monkeypatching ``os.name`` globally (which would break pathlib there).
+_IS_WINDOWS = os.name == "nt"
+
 # The summarizer is a mechanical text-reduction task that gains nothing from extended
 # reasoning, so its bare run turns thinking off entirely rather than using whatever the
 # model defaults to. Claude Code reads the budget from MAX_THINKING_TOKENS; 0 disables
@@ -37,11 +41,22 @@ _SUMMARIZER_TIMEOUT_SECONDS = 90
 _BARE_SYSTEM_PROMPT = "Follow the user's instructions exactly and output only what is requested, with no preamble."
 
 
-def _bare_args(system_prompt: str | None) -> list[str]:
+def _flatten(text: str) -> str:
+    """Collapse every run of whitespace (newlines included) to a single space.
+
+    On Windows the backend runs through cmd.exe, which truncates a command-line argument at
+    its first newline; a flattened system-prompt value survives as one argument with its
+    meaning intact (instruction prose doesn't depend on its line breaks)."""
+    return " ".join(text.split())
+
+
+def _bare_args(system_prompt: str | None, *, flatten: bool = False) -> list[str]:
     # The caller's ``system_prompt`` (e.g. the summarizer's instruction) replaces the
     # default agent system prompt; with the directive in the SYSTEM role the model treats
     # the user message as content to act on rather than an instruction to echo. None falls
-    # back to a minimal generic directive.
+    # back to a minimal generic directive. ``flatten`` single-lines it for the Windows
+    # cmd.exe path (see ClaudeBackend.run).
+    system = system_prompt or _BARE_SYSTEM_PROMPT
     return [
         "--tools",
         "",
@@ -49,7 +64,7 @@ def _bare_args(system_prompt: str | None) -> list[str]:
         "--setting-sources",
         "",
         "--system-prompt",
-        system_prompt or _BARE_SYSTEM_PROMPT,
+        _flatten(system) if flatten else system,
     ]
 
 
@@ -84,13 +99,23 @@ class ClaudeBackend:
         system_prompt: str | None = None,
         commit_guidance: bool = True,
     ) -> AgentResult:
-        command = [*(self.launch_command or ["claude"]), "-p", prompt, "--output-format", "json"]
+        # On Windows the backend is usually a `.cmd` shim (npm), which must run through
+        # cmd.exe — and cmd.exe TRUNCATES a command-line argument at its first newline. The
+        # prompt (the multi-line interaction trace) and the system prompt are both multi-line,
+        # so on Windows feed the prompt via STDIN (Claude reads it in print mode — verified)
+        # and flatten multi-line system-prompt flag values to a single line. POSIX has no such
+        # limit and passes them as arguments unchanged.
+        to_stdin = _IS_WINDOWS
+        command = [*(self.launch_command or ["claude"]), "-p"]
+        if not to_stdin:
+            command.append(prompt)
+        command.extend(["--output-format", "json"])
         if model:
             command.extend(["--model", model])
         if session_id:
             command.extend(["--resume", session_id])
         if bare:
-            command.extend(_bare_args(system_prompt))
+            command.extend(_bare_args(system_prompt, flatten=to_stdin))
         elif commit_guidance:
             # A coding run (e.g. shell mode): tell the agent aGiTrack auto-commits so it
             # doesn't self-commit. Deliberately NOT added on a bare run — that is the
@@ -99,7 +124,8 @@ class ClaudeBackend:
             # repo directly (no worktree), so use the no-worktree note variant.
             from agitrack.backends.proxy_agents import agent_system_note
 
-            command.extend(["--append-system-prompt", agent_system_note(use_worktrees=False)])
+            note = agent_system_note(use_worktrees=False)
+            command.extend(["--append-system-prompt", _flatten(note) if to_stdin else note])
         command.extend(self.backend_args)
 
         # Sub-agents Claude spawns are recorded in their OWN transcript files, separate
@@ -121,6 +147,7 @@ class ClaudeBackend:
                 resolve_subprocess_command(command),  # find/launch claude.cmd on Windows (#118)
                 cwd=self.repo,
                 text=True,
+                input=prompt if to_stdin else None,  # Windows: prompt via stdin, not a cmd.exe arg
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=False,
