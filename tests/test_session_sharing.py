@@ -419,10 +419,18 @@ def test_fetch_lists_with_filter_and_reads_transcript_on_demand():
         def read_ref_blob(self, ref, path):
             return blobs.get(path)
 
-        def fetch_ref(self, refspec, *, remote="origin", filter_blobs=None, timeout=None, cancel=None):
+        def fetch_ref(self, refspec, *, remote="origin", filter_blobs=None, refetch=False, timeout=None, cancel=None):
             fetches.append(filter_blobs)
-            if filter_blobs is None:  # the on-demand full fetch brings the transcript in
-                blobs["abc/me/sess/transcript.jsonl"] = "the transcript"
+            return True
+
+        def resolve_blob_oid(self, ref, path):
+            return "t-oid" if path.endswith("transcript.jsonl") else None
+
+        def has_object_local(self, oid):
+            return "abc/me/sess/transcript.jsonl" in blobs  # missing until backfilled
+
+        def fetch_object(self, oid, *, remote="origin", timeout=None, cancel=None):
+            blobs["abc/me/sess/transcript.jsonl"] = "the transcript"  # on-demand blob backfill
             return True
 
     store = SharedSessionStore(FakeRepo())  # type: ignore[arg-type]
@@ -431,8 +439,10 @@ def test_fetch_lists_with_filter_and_reads_transcript_on_demand():
     # session shared by a pre-rename peer still lists.
     assert fetches == ["blob:limit=16k", "blob:limit=16k"]
     entry = store.entries()[0]
+    # The transcript blob (omitted by the partial listing) is fetched by id on demand —
+    # a plain ref fetch wouldn't backfill it.
     assert store.read_transcript(entry) == "the transcript"
-    assert None in fetches  # a full fetch was triggered on demand for the transcript
+    assert None in fetches  # the ref tip was synced (full, unfiltered) before reading
 
 
 def test_fetch_passes_timeout_through_to_git(tmp_path):
@@ -538,12 +548,21 @@ def test_read_transcript_passes_timeout_to_on_demand_fetch(tmp_path):
             return "abc"
 
         def read_ref_blob(self, ref, path):
-            return None if not seen else "the transcript"  # missing until the fetch runs
+            return "the transcript" if seen else None  # missing until the on-demand fetch runs
 
         def remote_exists(self, name="origin"):
             return True
 
-        def fetch_ref(self, refspec, *, remote="origin", filter_blobs=None, timeout=None, cancel=None):
+        def fetch_ref(self, refspec, *, remote="origin", filter_blobs=None, refetch=False, timeout=None, cancel=None):
+            return True
+
+        def resolve_blob_oid(self, ref, path):
+            return "t-oid"
+
+        def has_object_local(self, oid):
+            return bool(seen)  # not local until the on-demand blob fetch runs
+
+        def fetch_object(self, oid, *, remote="origin", timeout=None, cancel=None):
             seen.append(timeout)
             return True
 
@@ -552,7 +571,7 @@ def test_read_transcript_passes_timeout_to_on_demand_fetch(tmp_path):
     store = SharedSessionStore(FakeRepo())  # type: ignore[arg-type]
     entry = SharedEntry(github_id="me", name="sess", manifest={})
     assert store.read_transcript(entry, timeout=120.0) == "the transcript"
-    assert seen == [120.0]
+    assert seen == [120.0]  # the timeout bounds the on-demand transcript-blob fetch
 
 
 def test_read_transcript_refetches_latest_even_when_stale_blob_is_local():
@@ -573,10 +592,19 @@ def test_read_transcript_refetches_latest_even_when_stale_blob_is_local():
         def read_ref_blob(self, ref, path):
             return blobs.get(path)
 
-        def fetch_ref(self, refspec, *, remote="origin", filter_blobs=None, timeout=None, cancel=None):
+        def fetch_ref(self, refspec, *, remote="origin", filter_blobs=None, refetch=False, timeout=None, cancel=None):
             fetched.append(refspec)
             blobs["abc/me/sess/transcript.jsonl"] = "NEW shared latest"  # the remote tip
             return True
+
+        def resolve_blob_oid(self, ref, path):
+            return "t-oid"
+
+        def has_object_local(self, oid):
+            return True  # after the ref sync the (small) blob is already local — no extra fetch
+
+        def fetch_object(self, oid, *, remote="origin", timeout=None, cancel=None):
+            raise AssertionError("must not fetch the blob when it is already present locally")
 
     from agitrack.sessions import SharedEntry
 
@@ -584,6 +612,48 @@ def test_read_transcript_refetches_latest_even_when_stale_blob_is_local():
     entry = SharedEntry(github_id="me", name="sess", manifest={})
     assert store.read_transcript(entry) == "NEW shared latest"
     assert fetched == ["+refs/agitrack/shared-sessions:refs/agitrack/shared-sessions"]  # synced before reading
+
+
+def test_read_transcript_falls_back_to_refetch_when_fetch_by_id_is_unsupported():
+    # A partial-clone-omitted transcript blob is fetched by id; if the remote disallows that
+    # (some servers don't allow object-id wants), fall back to a full --refetch of the ref so
+    # the resume still gets the blob instead of failing with "incomplete".
+    calls: list = []
+    blobs: dict = {}  # the transcript blob is NOT local (omitted by the partial listing)
+
+    class FakeRepo:
+        def remote_exists(self, name="origin"):
+            return True
+
+        def root_commit(self):
+            return "abc"
+
+        def read_ref_blob(self, ref, path):
+            return blobs.get(path)
+
+        def fetch_ref(self, refspec, *, remote="origin", filter_blobs=None, refetch=False, timeout=None, cancel=None):
+            calls.append(("refetch" if refetch else "fetch", refspec))
+            if refetch:  # the fallback re-downloads the omitted blob
+                blobs["abc/me/sess/transcript.jsonl"] = "backfilled by refetch"
+            return True
+
+        def resolve_blob_oid(self, ref, path):
+            return "t-oid"
+
+        def has_object_local(self, oid):
+            return "abc/me/sess/transcript.jsonl" in blobs
+
+        def fetch_object(self, oid, *, remote="origin", timeout=None, cancel=None):
+            calls.append(("fetch_object", oid))
+            return False  # the remote refuses object-id wants
+
+    from agitrack.sessions import SharedEntry
+
+    store = SharedSessionStore(FakeRepo())  # type: ignore[arg-type]
+    entry = SharedEntry(github_id="me", name="sess", manifest={})
+    assert store.read_transcript(entry) == "backfilled by refetch"
+    assert ("fetch_object", "t-oid") in calls  # tried by-id first
+    assert ("refetch", "+refs/agitrack/shared-sessions:refs/agitrack/shared-sessions") in calls  # then refetched
 
 
 def test_read_transcript_without_remote_reads_local_only():
