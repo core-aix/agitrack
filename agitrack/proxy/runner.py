@@ -4174,7 +4174,7 @@ class ProxyRunner:
                 self._set_session_auto_share(lineage_sid, False)
 
         def op():
-            return store.unshare(entry.github_id, entry.name)
+            return store.unshare(entry.github_id, entry.name, timeout=self.SHARE_PUSH_TIMEOUT)
 
         def outcome(box) -> str:
             if "error" in box:
@@ -4184,7 +4184,12 @@ class ProxyRunner:
                 return f"Removed {entry.display} from the local shared ref (no remote to push the removal to)."
             if result.pushed:
                 return f"Unshared {entry.display} (removed from origin)."
-            return f"Removed {entry.display} locally, but the push was rejected — try again. [{result.error[:80]}]"
+            # Removed locally but the origin push was rejected even after the auto-retry — show
+            # the real git error and point the user at re-running unshare from the Ctrl-G menu.
+            return (
+                f"Removed {entry.display} locally, but origin rejected the push — re-run unshare "
+                f"from the menu to retry. [{result.error[:120]}]"
+            )
 
         self._run_share_op_async(
             f"unshare:{entry.display}", f"Unsharing {entry.display} — removing from origin…", op, outcome

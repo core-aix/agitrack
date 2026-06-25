@@ -2118,7 +2118,7 @@ def test_unshare_is_non_blocking_with_progress_and_result_notices(tmp_path, monk
     gate = threading.Event()
 
     class SlowStore:
-        def unshare(self, github_id, name):
+        def unshare(self, github_id, name, *, timeout=None):
             gate.wait(timeout=5)  # the network removal is slow
             return PublishResult(remote=True, pushed=True)
 
@@ -2328,7 +2328,7 @@ class _ResultStore:
         self.publish_kwargs = kwargs
         return self.result
 
-    def unshare(self, github_id, name):
+    def unshare(self, github_id, name, *, timeout=None):
         return self.result
 
     def entries(self):
@@ -2534,3 +2534,61 @@ def test_unshare_disables_auto_share_across_the_whole_lineage(tmp_path, monkeypa
 
     assert runner._session_auto_shared("sid-new") is False  # off across the lineage now
     assert runner._user_state().auto_share_enabled("sid-old") is False  # fresh read from disk
+
+
+def _repo_with_bare_remote(tmp_path):
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+    (tmp_path / "src").mkdir()
+    src = _init_repo(tmp_path / "src")
+    branch = src.current_branch()
+    subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=src.repo, check=True)
+    subprocess.run(["git", "push", "-q", "origin", f"HEAD:refs/heads/{branch}"], cwd=src.repo, check=True)
+    subprocess.run(["git", "-C", str(remote), "symbolic-ref", "HEAD", f"refs/heads/{branch}"], check=True)
+    return src
+
+
+def test_unshare_retries_after_a_stale_lease(tmp_path, monkeypatch):
+    # A concurrent push (e.g. this session's own auto-share) moved the remote ref, so the
+    # unshare's force-with-lease push is rejected once. unshare must re-sync and retry — like
+    # publish — or the removal never lands and the user just sees "the push was rejected".
+    src = _repo_with_bare_remote(tmp_path)
+    store = SharedSessionStore(src)
+    store.publish(github_id="alice", name="drop", transcript="d", manifest=_manifest("drop", session_id="d", updated=1))
+
+    real_push = src.push_ref
+    attempts = {"n": 0}
+
+    def flaky_push(refspec, **kwargs):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            return (False, "! [rejected] (stale info)")  # lost the race the first time
+        return real_push(refspec, **kwargs)
+
+    monkeypatch.setattr(src, "push_ref", flaky_push)
+
+    result = store.unshare("alice", "drop")
+
+    assert result.pushed is True  # the retry landed the removal
+    assert attempts["n"] == 2  # rejected once, then re-synced and retried
+    assert store.entries() == []  # actually gone
+
+
+def test_unshare_does_not_retry_on_auth_failure(tmp_path, monkeypatch):
+    # A non-race failure (auth) must fail fast and surface the real reason — no retry loop.
+    src = _repo_with_bare_remote(tmp_path)
+    store = SharedSessionStore(src)
+    store.publish(github_id="alice", name="drop", transcript="d", manifest=_manifest("drop", session_id="d", updated=1))
+    attempts = {"n": 0}
+
+    def auth_fail(refspec, **kwargs):
+        attempts["n"] += 1
+        return (False, "fatal: Authentication failed for 'origin'")
+
+    monkeypatch.setattr(src, "push_ref", auth_fail)
+
+    result = store.unshare("alice", "drop")
+
+    assert result.pushed is False
+    assert attempts["n"] == 1  # failed fast — a broken credential can't spin a retry loop
+    assert "Authentication failed" in result.error  # the real reason is surfaced, not hidden
