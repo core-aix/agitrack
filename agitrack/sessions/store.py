@@ -188,6 +188,11 @@ def _is_stale_lease(error: str) -> bool:
     of looping. Git emits 'stale info' for a broken ``--force-with-lease`` and
     'fetch first'/'non-fast-forward'/'[rejected]' for an ordinary rejection."""
     text = error.lower()
+    # A permanent refusal (a pre-receive hook, a protected ref, a permission/forbidden denial)
+    # won't change on a retry — even though git prints "[remote rejected]" for it too. Don't
+    # loop on those; only an actual lost-race rejection is retryable.
+    if any(marker in text for marker in ("hook", "denied", "permission", "protected", "forbidden")):
+        return False
     return any(marker in text for marker in ("stale info", "fetch first", "non-fast-forward", "rejected"))
 
 
@@ -583,16 +588,20 @@ class SharedSessionStore:
         result = self._add_and_push(
             gid, nm, transcript, manifest, keep, timeout, cancel, prune_gid=pgid, overwrite=overwrite
         )
-        if result.pushed or not _is_stale_lease(result.error):
-            return result
-        if cancel is not None and cancel.is_set():
-            return result  # the user cancelled the push: don't fetch+retry behind their back
-        # Lost the race (or our orphan ref diverged from a remote one we'd never
-        # fetched): sync onto the current remote tip and try once more.
-        self._fetch_current(timeout=timeout, cancel=cancel)
-        return self._add_and_push(
-            gid, nm, transcript, manifest, keep, timeout, cancel, prune_gid=pgid, overwrite=overwrite
-        )
+        if not result.pushed and _is_stale_lease(result.error) and not (cancel is not None and cancel.is_set()):
+            # Lost the race (or our orphan ref diverged from a remote one we'd never fetched):
+            # sync onto the current remote tip and try once more. A cancelled push isn't retried.
+            self._fetch_current(timeout=timeout, cancel=cancel)
+            result = self._add_and_push(
+                gid, nm, transcript, manifest, keep, timeout, cancel, prune_gid=pgid, overwrite=overwrite
+            )
+        if result.remote and not result.pushed and not result.behind:
+            # Origin refused the push (a pre-receive hook / protected ref / permission denial)
+            # or a retry still lost — roll back the just-added LOCAL copy so a share that never
+            # reached origin doesn't masquerade as "shared" in the menus. The transcript is
+            # re-read on the next share/auto-share, so nothing is lost.
+            self._drop_local_entry(self.ref, gid, nm)
+        return result
 
     def _add_and_push(
         self,

@@ -6,12 +6,23 @@ through a local bare remote.
 """
 
 import json
+import random
+import string
 import subprocess
 from pathlib import Path
 
 from agitrack.git import GitRepo
 from agitrack.sessions import SharedSessionStore, github_login, redact_transcript
 from agitrack.sessions.identity import slug
+
+
+def _fake_token(prefix: str, n: int, *, charset: str = string.ascii_letters + string.digits) -> str:
+    """A secret-SHAPED string assembled at runtime. Keeping no full literal secret in this
+    file is deliberate: a hard-coded dummy token (a real-looking ``AIza…``/``SG.…``) trips
+    GitHub's own secret-scanning push protection and blocks the test file from being pushed —
+    the very failure these tests guard against. Only the (non-secret) prefix is literal; the
+    body is random, so every regex still matches but nothing here is a scannable secret."""
+    return prefix + "".join(random.choice(charset) for _ in range(n))
 
 
 def _init_repo(path):
@@ -163,9 +174,11 @@ def test_transcript_is_readable_opencode():
 
 
 def test_redact_masks_secrets_and_home_path_but_keeps_structure():
-    line = '{"cwd":"/Users/alice/Code/x","t":"api_key=sk-ABCDEFGHIJKLMNOP token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"}'
+    sk = _fake_token("sk-", 18)
+    ghp = _fake_token("ghp_", 36)
+    line = f'{{"cwd":"/Users/alice/Code/x","t":"api_key={sk} token {ghp}"}}'
     out = redact_transcript(line)
-    assert "sk-ABCDEFGHIJKLMNOP" not in out and "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345" not in out
+    assert sk not in out and ghp not in out
     assert "[REDACTED]" in out
     assert "/Users/alice" not in out and "/Users/user/Code/x" in out  # username masked, path kept
     assert out.startswith('{"cwd"')  # JSON shape preserved
@@ -173,6 +186,48 @@ def test_redact_masks_secrets_and_home_path_but_keeps_structure():
 
 def test_redact_leaves_ordinary_text_untouched():
     assert redact_transcript("just a normal sentence\nsecond line") == "just a normal sentence\nsecond line"
+
+
+def test_redact_covers_the_secret_shapes_github_push_protection_blocks():
+    # A secret that slips through redaction is what gets the push declined by GitHub's secret
+    # scanning. Redaction must cover at least the high-confidence shapes GitHub flags, so a
+    # share never trips push protection.
+    upper = string.ascii_uppercase + string.digits  # AWS key ids are upper+digits
+    hexlower = string.digits + "abcdef"  # Twilio SID is hex
+    samples = [
+        _fake_token("ghp_", 36),  # GitHub classic PAT
+        _fake_token("github_pat_", 60, charset=string.ascii_letters + string.digits + "_"),  # fine-grained PAT
+        _fake_token("glpat-", 20),  # GitLab PAT
+        _fake_token("xoxb-", 24),  # Slack bot token
+        _fake_token("AKIA", 16, charset=upper),  # AWS long-term key id
+        _fake_token("ASIA", 16, charset=upper),  # AWS temporary key id
+        _fake_token("AIza", 35),  # Google API key
+        _fake_token("ya29.", 30),  # Google OAuth token
+        _fake_token("sk_live_", 24),  # Stripe secret key
+        _fake_token("sk-ant-api03-", 24),  # Anthropic key
+        _fake_token("npm_", 36),  # npm token
+        _fake_token("pypi-", 24),  # PyPI token
+        _fake_token("SG.", 22) + "." + _fake_token("", 43),  # SendGrid
+        _fake_token("SK", 32, charset=hexlower),  # Twilio API key SID
+        _fake_token("dop_v1_", 40),  # Doppler token
+    ]
+    for secret in samples:
+        out = redact_transcript(f'{{"text":"using token {secret} now"}}')
+        assert secret not in out, f"leaked: {secret}"
+        assert "[REDACTED]" in out
+
+    # A PEM private key embedded in a JSONL line (escaped newlines) is masked end-to-end.
+    pem_body = _fake_token("", 40)
+    pem = f"-----BEGIN RSA PRIVATE KEY-----\\n{pem_body}\\n-----END RSA PRIVATE KEY-----"
+    out = redact_transcript(f'{{"key":"{pem}"}}')
+    assert pem_body not in out and "BEGIN RSA PRIVATE KEY" not in out
+
+
+def test_redact_does_not_mask_ordinary_hex_or_identifiers():
+    # The added patterns must not be so greedy they mangle normal transcript content (commit
+    # SHAs, UUIDs, plain words) — that would corrupt shared transcripts wholesale.
+    benign = '{"sha":"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0","id":"550e8400-e29b-41d4-a716-446655440000"}'
+    assert redact_transcript(benign) == benign
 
 
 # --- identity ---------------------------------------------------------------
@@ -1569,8 +1624,8 @@ def test_warm_share_login_skips_when_no_remote_or_already_cached(tmp_path):
 
 
 def test_runner_share_session_publishes_and_redacts(tmp_path, monkeypatch):
-    secret = '{"t":"token sk-ABCDEFGHIJKLMNOPQR"}'
-    runner, repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend(transcript=secret))
+    sk = _fake_token("sk-", 20)
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend(transcript=f'{{"t":"token {sk}"}}'))
 
     runner._share_session()
     # The push runs in the background so the terminal never freezes; drain it.
@@ -1580,7 +1635,7 @@ def test_runner_share_session_publishes_and_redacts(tmp_path, monkeypatch):
     entries = store.entries()
     assert len(entries) == 1
     transcript = store.read_transcript(entries[0])
-    assert "sk-ABCDEFGHIJKLMNOPQR" not in transcript and "[REDACTED]" in transcript  # redacted
+    assert sk not in transcript and "[REDACTED]" in transcript  # redacted
     assert entries[0].manifest["session_id"] == "sid-123"
     assert any(
         "Saved shared session" in n[0] or "Shared" in n[0] for n in runner._session_notices.values()
@@ -2545,6 +2600,58 @@ def _repo_with_bare_remote(tmp_path):
     return src
 
 
+def test_publish_rolls_back_local_entry_when_origin_rejects_the_push(tmp_path, monkeypatch):
+    # Origin refused the push (GitHub push protection / a ruleset / a pre-receive hook). The
+    # session NEVER reached origin, so it must NOT linger in the LOCAL ref masquerading as
+    # "shared" in the menus or the resume-shared list (the reported bug).
+    src = _repo_with_bare_remote(tmp_path)
+    store = SharedSessionStore(src)
+    monkeypatch.setattr(
+        src,
+        "push_ref",
+        lambda *a, **k: (False, "remote: error: GH013: Repository rule violations found\n ! [remote rejected]"),
+    )
+
+    result = store.publish(
+        github_id="alice", name="blocked", transcript="t", manifest=_manifest("blocked", session_id="x", updated=1)
+    )
+
+    assert result.pushed is False
+    assert result.remote is True
+    assert store.entries() == []  # rolled back — a rejected share never shows as shared
+
+
+def test_publish_keeps_local_only_entry_when_there_is_no_remote(tmp_path):
+    # The rollback is for REJECTED pushes only: with no remote at all, saving locally is the
+    # legitimate behaviour and must be preserved.
+    store = SharedSessionStore(_init_repo(tmp_path))
+
+    result = store.publish(
+        github_id="alice", name="local", transcript="t", manifest=_manifest("local", session_id="x", updated=1)
+    )
+
+    assert result.remote is False
+    assert [e.name for e in store.entries()] == ["local"]  # kept — there was nowhere to push
+
+
+def test_publish_does_not_loop_retrying_a_permanent_hook_rejection(tmp_path, monkeypatch):
+    # A pre-receive hook decline won't change on a retry — unlike a stale-lease race. Don't
+    # waste a fetch+retry round-trip on it (and don't let "[remote rejected]" fool the
+    # stale-lease check into looping).
+    src = _repo_with_bare_remote(tmp_path)
+    store = SharedSessionStore(src)
+    attempts = {"n": 0}
+
+    def reject(*a, **k):
+        attempts["n"] += 1
+        return (False, " ! [remote rejected] refs/agitrack/shared-sessions (pre-receive hook declined)")
+
+    monkeypatch.setattr(src, "push_ref", reject)
+    store.publish(github_id="alice", name="x", transcript="t", manifest=_manifest("x", session_id="x", updated=1))
+
+    assert attempts["n"] == 1  # pushed once, recognised it as permanent, did not retry
+
+
 def test_unshare_retries_after_a_stale_lease(tmp_path, monkeypatch):
     # A concurrent push (e.g. this session's own auto-share) moved the remote ref, so the
     # unshare's force-with-lease push is rejected once. unshare must re-sync and retry — like
@@ -2657,6 +2764,20 @@ def test_push_rejection_reason_extracts_the_meaningful_git_line():
     assert "pre-receive hook declined" in reason  # the WHY, not a blind prefix slice
     assert "timed out" in _push_rejection_reason("")  # empty ⇒ actionable hint, never a bare "[]"
     assert "stale info" in _push_rejection_reason("x\n ! [rejected] foo (stale info)\nerror: failed")
+
+    # GitHub's push protection / rulesets (NOT a custom hook) put the actionable detail — which
+    # secret, the unblock URL — on lines OTHER than the bare "declined" summary. Surface those.
+    gh = (
+        "remote: error: GH013: Repository rule violations found for refs/agitrack/shared-sessions.\n"
+        "remote: - GITHUB PUSH PROTECTION\n"
+        "remote:   - Push cannot contain secrets\n"
+        "remote:     To allow, visit https://github.com/org/repo/security/secret-scanning/unblock-secret/abc\n"
+        " ! [remote rejected] refs/agitrack/shared-sessions (push declined due to repository rule violations)\n"
+    )
+    detail = _push_rejection_reason(gh)
+    assert "secret" in detail.lower()  # tells the user it's a blocked secret, not a vague "declined"
+    assert "unblock-secret/abc" in detail  # and hands them the URL to resolve it
+    assert "remote:" not in detail  # git's noisy prefix stripped for legibility
 
 
 def test_unshare_of_a_local_only_entry_reports_not_rejected(tmp_path):

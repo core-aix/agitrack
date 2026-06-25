@@ -46,11 +46,42 @@ SECRET_MASK = "[REDACTED]"
 SECRET_ASSIGNMENT_RE = re.compile(
     r"(?i)\b(api[_-]?key|access[_-]?token|auth[_-]?token|token|secret|password|passwd|authorization)\b(\s*[:=]\s*)([^\s,;]+)"
 )
+# High-confidence secret token shapes — the set GitHub's secret-scanning push protection
+# blocks. Redaction must cover at least these, or a transcript carrying one is refused by
+# origin ("push declined") instead of sharing. Each has a distinctive prefix, so the
+# false-positive risk is low. (Generic ``name = value`` secrets are caught separately by
+# SECRET_ASSIGNMENT_RE above.)
 SECRET_TOKEN_RES = [
+    # OpenAI / Anthropic and other "sk-" API keys (covers sk-proj-…, sk-ant-…).
     re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
+    # GitHub personal-access / OAuth / user / server / refresh tokens.
     re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
-    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{20,}\b"),
-    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    # GitHub fine-grained personal-access token.
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
+    # GitLab personal-access / pipeline-trigger tokens.
+    re.compile(r"\bgl(?:pat|ptt|rt|soat)-[A-Za-z0-9_-]{16,}\b"),
+    # Slack bot / user / app / refresh / config tokens.
+    re.compile(r"\bxox[baprse]-[A-Za-z0-9-]{10,}\b"),
+    # AWS access key id (long-term AKIA + temporary/role/user ASIA, AROA, AIDA, …).
+    re.compile(r"\b(?:AKIA|ASIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|A3T[A-Z0-9])[0-9A-Z]{16}\b"),
+    # Google API key and OAuth access token.
+    re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"),
+    re.compile(r"\bya29\.[0-9A-Za-z_-]{20,}"),
+    # Stripe live / restricted secret keys.
+    re.compile(r"\b[sr]k_live_[0-9A-Za-z]{16,}\b"),
+    # npm automation token.
+    re.compile(r"\bnpm_[A-Za-z0-9]{36}\b"),
+    # PyPI / Test-PyPI upload token.
+    re.compile(r"\bpypi-[A-Za-z0-9_-]{16,}\b"),
+    # SendGrid API key.
+    re.compile(r"\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\b"),
+    # Twilio API key SID.
+    re.compile(r"\bSK[0-9a-fA-F]{32}\b"),
+    # Doppler service / personal token.
+    re.compile(r"\bdop_v1_[A-Za-z0-9]{32,}\b"),
+    # PEM private-key block (RSA/EC/OpenSSH/PGP/…); in a JSONL transcript the whole block
+    # sits on one physical line, so grab it end-to-end when the END marker is present too.
+    re.compile(r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----(?:[\s\S]*?-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----)?"),
 ]
 MOUSE_REPORT_RE = re.compile(r"(?:\x1b)?\[<\d+;\d+;\d+[Mm]")
 # Full ANSI/terminal escape sequences (CSI/OSC/DCS and lone two-byte escapes).

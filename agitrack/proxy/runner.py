@@ -140,9 +140,22 @@ def _push_rejection_reason(error: str) -> str:
     the remote rejected it (a stale lease, a protected ref, a declined hook, a permission
     denial). Git buries the reason among progress lines, so showing the whole blob (or a
     blind prefix slice) hides it; this surfaces the line that actually explains the failure."""
-    lines = [line.strip() for line in (error or "").splitlines() if line.strip()]
+    raw = [line.strip() for line in (error or "").splitlines()]
+    # Drop git's "remote: " prefix so the reason reads cleanly.
+    lines = [(line[len("remote:") :].strip() if line.startswith("remote:") else line) for line in raw]
+    lines = [line for line in lines if line]
     if not lines:
         return "origin returned no error — the push likely timed out; check your connection and retry"
+    # GitHub's push protection / repository rulesets (NOT a custom hook) carry the actionable
+    # detail — which secret was found, an unblock URL, the rule — on lines OTHER than the bare
+    # "declined" summary. Surface those so the user can actually resolve it.
+    detail = [
+        line
+        for line in lines
+        if any(m in line.lower() for m in ("secret", "push protection", "rule violation", "ruleset", "unblock", "http"))
+    ]
+    if detail:
+        return " | ".join(detail[:4])[:400]
     markers = ("rejected", "denied", "declined", "permission", "forbidden", "protected", "stale info")
     for line in lines:
         if any(marker in line.lower() for marker in markers):
