@@ -474,9 +474,16 @@ class SharedSessionStore:
         ref each call so the retry above rebuilds the removal onto the moved remote tip."""
         base = f"{self._prefix()}{gid}/{nm}/"
         if remote:
-            # Filtered sync is enough: rewriting only re-references existing blob SHAs
-            # (already on the remote), so the large transcripts need not be local.
-            self.repo.fetch_ref(f"+{ref}:{ref}", filter_blobs="blob:limit=16k", timeout=timeout)
+            # Sync the ref so the --force-with-lease below is built against the CURRENT remote
+            # tip. A blob-filtered fetch is enough (rewriting only re-references existing SHAs,
+            # so the big transcripts needn't be local) — BUT fall back to a full fetch when the
+            # remote doesn't support partial fetch. Without the fallback the filtered fetch
+            # silently fails, the lease is built against a stale local tip, and the push is
+            # rejected on every attempt (the "rerun shows the same message" bug). Mirrors
+            # _fetch_current, which the publish path already uses.
+            refspec = f"+{ref}:{ref}"
+            if not self.repo.fetch_ref(refspec, filter_blobs="blob:limit=16k", timeout=timeout):
+                self.repo.fetch_ref(refspec, timeout=timeout)
         paths = self.repo.read_tree_paths(ref)
         if not any(k.startswith(base) for k in paths):
             return None, ""  # this ref doesn't hold the entry
