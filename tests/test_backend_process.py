@@ -8,11 +8,15 @@ from __future__ import annotations
 
 import os
 import signal
+import sys
 import time
 
 import pytest
 
 from agitrack.proxy.process import BackendProcess
+
+posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX PTY only")
+win_only = pytest.mark.skipif(sys.platform != "win32", reason="Windows ConPTY only")
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +84,7 @@ def test_write_is_noop_when_master_fd_is_none():
 # ---------------------------------------------------------------------------
 
 
+@posix_only
 def test_spawn_trivial_child_and_terminate():
     """/bin/cat as a trivial child: spawn, write, drain, terminate."""
     proc = BackendProcess.spawn(["/bin/cat"], cwd="/tmp")
@@ -115,6 +120,7 @@ def test_spawn_trivial_child_and_terminate():
             os.close(proc.master_fd)
 
 
+@posix_only
 def test_cleanup_terminates_child_via_signal_escalation():
     # Under a non-interactive shell the child inherits SIGINT=SIG_IGN (POSIX
     # background-job semantics), so this exercises the SIGTERM escalation path.
@@ -145,6 +151,7 @@ def test_cleanup_terminates_child_via_signal_escalation():
             os.close(proc.master_fd)
 
 
+@posix_only
 def test_spawn_applies_extra_env_to_child_only(tmp_path):
     """extra_env reaches the forked child's environment but never the aGiTrack process."""
     out = tmp_path / "env.txt"
@@ -162,6 +169,7 @@ def test_spawn_applies_extra_env_to_child_only(tmp_path):
     assert "OPENCODE_DISABLE_AUTOUPDATE" not in os.environ  # parent env untouched
 
 
+@posix_only
 def test_spawn_exec_failure_guard_exits_127():
     """A non-existent command must exit with code 127, not leave a duplicate runner."""
     proc = BackendProcess.spawn(["/nonexistent-command-agit-test"], cwd="/tmp")
@@ -187,6 +195,7 @@ def test_spawn_exec_failure_guard_exits_127():
     assert exit_code == 127, f"expected exit code 127, got {exit_code}"
 
 
+@posix_only
 def test_teardown_clears_fd_and_pid():
     proc = BackendProcess.spawn(["/bin/cat"], cwd="/tmp")
     assert proc.child_pid is not None
@@ -215,3 +224,68 @@ def test_backendprocess_importable_from_agitrack_proxy():
     from agitrack.proxy import BackendProcess as BP  # noqa: F401
 
     assert BP is BackendProcess
+
+
+# ---------------------------------------------------------------------------
+# Windows ConPTY spawn (cmd.exe)
+# ---------------------------------------------------------------------------
+
+
+@win_only
+def test_spawn_cmd_child_on_windows():
+    """Spawn cmd /c echo hello via ConPTY; drain output; teardown cleans up.
+
+    pywinpty may emit PTY init escape sequences before the actual command output,
+    so we drain in a loop until "hello" appears or we time out.
+    """
+    import select
+
+    proc = BackendProcess.spawn(["cmd", "/c", "echo", "hello"], cwd="C:\\")
+    try:
+        assert proc.child_pid is not None
+        assert proc.master_fd is not None
+
+        # master_fd is a socket fd on Windows — verify select works on it.
+        combined = b""
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            readable, _, _ = select.select([proc.master_fd], [], [], 0.5)
+            if readable:
+                chunk = proc.drain()
+                if chunk:
+                    combined += chunk
+                if b"hello" in combined.lower():
+                    break
+            elif proc._handle is not None and proc._handle.poll_exited():
+                break
+        assert b"hello" in combined.lower(), f"output not found in: {combined!r}"
+    finally:
+        proc.teardown()
+    assert proc.master_fd is None
+    assert proc.child_pid is None
+
+
+@win_only
+def test_spawn_extra_env_reaches_cmd_child(tmp_path):
+    """extra_env is visible inside the ConPTY child and not leaked to the parent."""
+    import select
+
+    marker = "AGITRACK_WIN_TEST_VAR"
+    out_file = str(tmp_path / "env.txt")
+    proc = BackendProcess.spawn(
+        ["cmd", "/c", f"echo %{marker}% > {out_file}"],
+        cwd=str(tmp_path),
+        extra_env={marker: "win32_ok"},
+    )
+    try:
+        # Wait for the child to exit (it's a one-shot command).
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if proc._handle is not None and proc._handle.poll_exited():
+                break
+            time.sleep(0.1)
+    finally:
+        proc.teardown()
+    result = (tmp_path / "env.txt").read_text(encoding="utf-8", errors="replace").strip()
+    assert "win32_ok" in result
+    assert marker not in os.environ

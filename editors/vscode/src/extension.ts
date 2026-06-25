@@ -241,30 +241,14 @@ function isAlive(pid: number): boolean {
   }
 }
 
-/** Explain that aGiTrack needs WSL on Windows, with a link to set it up. Returns true if
- * we're on native Windows (caller should stop), false otherwise. */
-async function blockOnNativeWindows(): Promise<boolean> {
-  if (!isNativeWindows()) {
-    return false;
-  }
-  const choice = await vscode.window.showWarningMessage(
-    "aGiTrack needs a POSIX environment and can't run on native Windows. Open your project " +
-      "in WSL (or a Dev Container / Remote-SSH) and start aGiTrack there — this extension then " +
-      "runs on the Linux side automatically.",
-    "Set up WSL",
-  );
-  if (choice === "Set up WSL") {
-    void vscode.env.openExternal(vscode.Uri.parse("https://code.visualstudio.com/docs/remote/wsl"));
-  }
-  return true;
-}
+// isNativeWindows is imported but no longer used to block operations — aGiTrack now
+// supports native Windows.  The import is kept for any future platform-specific
+// behaviour that may differ between native Windows and WSL/Remote-SSH.
+void isNativeWindows; // suppress unused-import linters
 
 /** First-run housekeeping: if the CLI is present, check version parity; if it's
  * missing, offer to install it so the extension is usable out of the box. */
 async function bootstrap(context: vscode.ExtensionContext): Promise<void> {
-  if (isNativeWindows()) {
-    return; // can't run here — stay silent on activation; we explain when they try to start
-  }
   const exe = configuredExe();
   if (await runnable(exe)) {
     await checkVersionParity(context, exe);
@@ -283,9 +267,6 @@ async function bootstrap(context: vscode.ExtensionContext): Promise<void> {
 
 /** Launch (or focus) aGiTrack in a terminal for the chosen workspace folder. */
 async function startSession(targetUri?: vscode.Uri): Promise<void> {
-  if (await blockOnNativeWindows()) {
-    return;
-  }
   const folder = await pickFolder(targetUri);
   if (!folder) {
     void vscode.window.showWarningMessage("aGiTrack: open a folder or repository first.");
@@ -374,17 +355,31 @@ async function sessionStillRunning(terminal: vscode.Terminal, folderPath: string
 
 /** True if the terminal's shell process currently has any child — i.e. aGiTrack (run as
  * `agitrack && exit`) is still executing in it. An idle interactive shell at a prompt
- * (the state after a non-zero exit) has no children. POSIX-only, like aGiTrack itself. */
+ * (the state after a non-zero exit) has no children. */
 async function shellHasChild(terminal: vscode.Terminal): Promise<boolean> {
   const shellPid = await terminal.processId;
   if (!shellPid) {
     return false;
   }
   try {
+    if (process.platform === "win32") {
+      // wmic lists processes whose ParentProcessId matches the shell.
+      const out = await execCapture(
+        "wmic",
+        ["process", "where", `ParentProcessId=${shellPid}`, "get", "ProcessId"],
+        2_000,
+      );
+      // wmic outputs a header line and then one PID per child; if there are any
+      // children there is at least one numeric line after "ProcessId".
+      return out
+        .trim()
+        .split(/\r?\n/)
+        .some((line) => /^\s*\d+\s*$/.test(line));
+    }
     const out = await execCapture("pgrep", ["-P", String(shellPid)], 2_000);
     return out.trim().length > 0;
   } catch {
-    return false; // pgrep exits non-zero when the shell has no children
+    return false;
   }
 }
 
@@ -437,9 +432,24 @@ async function reconcileRestoredTerminal(terminal: vscode.Terminal): Promise<voi
   }
 }
 
-/** Parent PID of `pid`, or undefined if it can't be read (process gone / `ps` unavailable). */
+/** Parent PID of `pid`, or undefined if it can't be read (process gone / tool unavailable). */
 async function parentPid(pid: number): Promise<number | undefined> {
   try {
+    if (process.platform === "win32") {
+      const out = await execCapture(
+        "wmic",
+        ["process", "where", `ProcessId=${pid}`, "get", "ParentProcessId"],
+        2_000,
+      );
+      // wmic emits "ParentProcessId\r\n<value>\r\n\r\n"
+      const lines = out.trim().split(/\r?\n/);
+      const valueLine = lines.find((l) => /^\s*\d+\s*$/.test(l));
+      if (!valueLine) {
+        return undefined;
+      }
+      const ppid = parseInt(valueLine.trim(), 10);
+      return Number.isFinite(ppid) ? ppid : undefined;
+    }
     const ppid = parseInt((await execCapture("ps", ["-o", "ppid=", "-p", String(pid)], 2_000)).trim(), 10);
     return Number.isFinite(ppid) ? ppid : undefined;
   } catch {
@@ -591,9 +601,6 @@ const SUPPRESS_GH_SIGN_IN_KEY = "agitrack.suppressGithubSignInPrompt";
  * Run in a plain shell terminal so `gh` resolves from the user's real PATH — the same
  * environment aGiTrack inherits — and writes credentials that environment can read. */
 async function ghLogin(): Promise<void> {
-  if (await blockOnNativeWindows()) {
-    return;
-  }
   const terminal = vscode.window.createTerminal({
     name: GH_LOGIN_TERMINAL,
     iconPath: new vscode.ThemeIcon("github"),
@@ -677,9 +684,6 @@ async function restartSession(): Promise<void> {
 /** Open aGiTrack's metrics dashboard for the chosen folder (read-only; `agitrack -d`
  * serves it on localhost and opens the browser, Ctrl-C in the terminal to stop). */
 async function openDashboard(targetUri?: vscode.Uri): Promise<void> {
-  if (await blockOnNativeWindows()) {
-    return;
-  }
   const folder = await pickFolder(targetUri);
   if (!folder) {
     void vscode.window.showWarningMessage("aGiTrack: open a folder or repository first.");
@@ -875,9 +879,13 @@ function terminalLocation(): vscode.TerminalOptions["location"] {
   }
 }
 
-/** Quote a shell argument only when it contains characters that need it (used for the
- * install-in-terminal fallback, which runs in a shell). */
+/** Quote a shell argument only when it contains characters that need it.
+ * On Windows (PowerShell) uses double-quote escaping; on POSIX uses single-quote. */
 function quote(value: string): string {
+  if (process.platform === "win32") {
+    // PowerShell: wrap in double quotes, escape existing double quotes.
+    return /[^\w./:\\-]/.test(value) ? `"${value.replace(/"/g, '`"')}"` : value;
+  }
   return /[^\w./:-]/.test(value) ? `'${value.replace(/'/g, "'\\''")}'` : value;
 }
 
@@ -915,9 +923,6 @@ interface InstallPlan {
 /** Install the aGiTrack CLI with the best available Python tool, then resolve the
  * executable it produced. Returns the path to use, or undefined on failure. */
 async function installAgitrack(): Promise<string | undefined> {
-  if (await blockOnNativeWindows()) {
-    return undefined; // POSIX-only — installing on native Windows would never run
-  }
   const plan = await planInstaller();
   if (!plan) {
     const pick = await vscode.window.showErrorMessage(
@@ -996,31 +1001,37 @@ async function planInstaller(): Promise<InstallPlan | undefined> {
  * the executable (authoritative, PATH-independent), then fall back to the well-known
  * install locations for the host. */
 async function resolveInstalledExe(plan: InstallPlan): Promise<string | undefined> {
-  const candidates: string[] = ["agitrack"];
+  const exeName = process.platform === "win32" ? "agitrack.exe" : "agitrack";
+  const candidates: string[] = [exeName === "agitrack.exe" ? "agitrack.exe" : "agitrack"];
   if (plan.cmd === "pipx") {
     // pipx knows its own app-bin directory — the most reliable answer.
     try {
       const binDir = (await execCapture("pipx", ["environment", "--value", "PIPX_BIN_DIR"], 5_000)).trim();
       if (binDir) {
-        candidates.push(join(binDir, "agitrack"));
+        candidates.push(join(binDir, exeName));
       }
     } catch {
       // fall through to the static candidates
     }
   }
   if (plan.userBaseFrom) {
-    // pip --user puts console scripts in <user-base>/bin (covers macOS framework
-    // Python's ~/Library/Python/X.Y/bin too).
+    // pip --user puts console scripts in <user-base>/bin on POSIX, or
+    // <user-base>\Scripts on Windows.
     try {
       const base = (await execCapture(plan.userBaseFrom, ["-m", "site", "--user-base"], 5_000)).trim();
       if (base) {
-        candidates.push(join(base, "bin", "agitrack"));
+        const scriptsDir = process.platform === "win32" ? join(base, "Scripts") : join(base, "bin");
+        candidates.push(join(scriptsDir, exeName));
       }
     } catch {
       // ignore — fall back to the static candidates
     }
   }
-  candidates.push(...staticExeCandidates(homedir(), process.platform, macLibraryPythonVersions()));
+  if (process.platform === "win32") {
+    candidates.push(...staticExeCandidates(homedir(), process.platform, windowsPythonVersionDirs()));
+  } else {
+    candidates.push(...staticExeCandidates(homedir(), process.platform, macLibraryPythonVersions()));
+  }
   for (const candidate of dedupe(candidates)) {
     if (await runnable(candidate)) {
       return candidate;
@@ -1037,6 +1048,20 @@ function macLibraryPythonVersions(): string[] {
   }
   try {
     return readdirSync(join(homedir(), "Library", "Python"));
+  } catch {
+    return [];
+  }
+}
+
+/** Subdirectory names under %LOCALAPPDATA%\Programs\Python\ (e.g. "Python312"),
+ * where per-user Python installs live on Windows. Empty off Windows or when absent. */
+function windowsPythonVersionDirs(): string[] {
+  if (process.platform !== "win32") {
+    return [];
+  }
+  const localappdata = process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local");
+  try {
+    return readdirSync(join(localappdata, "Programs", "Python"));
   } catch {
     return [];
   }

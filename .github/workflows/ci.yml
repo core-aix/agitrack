@@ -12,15 +12,13 @@ concurrency:
 
 jobs:
   check:
-    # aGiTrack is a POSIX TUI (it imports pty/termios/fcntl directly), so the OS axis
-    # that actually matters is macOS (BSD pty/termios) vs Linux (glibc). Run both to
-    # catch platform-specific pty/ioctl/terminal differences. Native Windows is not a
-    # target — the package can't even import there; Windows is supported via WSL, which
-    # is Linux and so is already covered by the ubuntu job.
+    # Three platforms: Linux (glibc), macOS (BSD pty/termios semantics), and native
+    # Windows (ConPTY via pywinpty). POSIX-only tests carry skipif(win32) markers and
+    # are silently skipped on the Windows runner. Lint/format/mypy run on Linux only.
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -33,13 +31,9 @@ jobs:
           git config --global user.email "ci@agitrack.invalid"
           git config --global user.name "aGiTrack CI"
 
-      # Install uv via its official script rather than a third-party action,
-      # so the workflow runs even under an "allow GitHub-owned actions only"
-      # policy. uv manages the Python toolchain itself.
+      # Official action installs uv cross-platform (Linux, macOS, Windows).
       - name: Install uv
-        run: |
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        uses: astral-sh/setup-uv@v4
 
       - name: Install dependencies
         run: uv sync --group dev

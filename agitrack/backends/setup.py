@@ -1,21 +1,40 @@
 from __future__ import annotations
 
 import shutil
+import sys
 from pathlib import Path
 from typing import Callable
 
 from agitrack.backends.proxy_agents import available_backends, make_proxy_agent
 
 # Where to point users when a backend CLI is missing.
-INSTALL_HINTS = {
-    "claude": (
+def _claude_hint() -> str:
+    if sys.platform == "win32":
+        return (
+            "Install Claude Code: https://docs.claude.com/en/docs/claude-code\n"
+            "  Windows: npm install -g @anthropic-ai/claude-code\n"
+            "           or: winget install Anthropic.Claude"
+        )
+    return (
         "Install Claude Code: https://docs.claude.com/en/docs/claude-code\n"
         "  e.g. curl -fsSL https://claude.ai/install.sh | bash  (or: npm install -g @anthropic-ai/claude-code)"
-    ),
-    "opencode": (
-        "Install OpenCode: https://opencode.ai\n  e.g. brew install sst/tap/opencode  (or: npm install -g opencode-ai)"
-    ),
-}
+    )
+
+
+def _opencode_hint() -> str:
+    if sys.platform == "win32":
+        return (
+            "Install OpenCode: https://opencode.ai\n"
+            "  Windows: npm install -g opencode-ai\n"
+            "           or: scoop install opencode"
+        )
+    return (
+        "Install OpenCode: https://opencode.ai\n"
+        "  e.g. brew install sst/tap/opencode  (or: npm install -g opencode-ai)"
+    )
+
+
+INSTALL_HINTS: dict[str, str] = {}  # populated lazily to pick up sys.platform at call time
 
 
 class BackendUnavailable(RuntimeError):
@@ -32,7 +51,11 @@ def backend_installed(name: str) -> bool:
 
 
 def install_hint(name: str) -> str:
-    return INSTALL_HINTS.get(name, f"Install the '{name}' CLI and make sure it is on your PATH.")
+    hints = {
+        "claude": _claude_hint(),
+        "opencode": _opencode_hint(),
+    }
+    return hints.get(name, f"Install the '{name}' CLI and make sure it is on your PATH.")
 
 
 def select_default_backend(
