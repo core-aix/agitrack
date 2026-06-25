@@ -159,6 +159,23 @@ def test_git_install_hint_covers_all_platforms():
     assert "brew install git" in hint  # macOS
     assert "apt install git" in hint  # Linux
     assert "winget install Git.Git" in hint  # Windows
+    assert "\n\n" in hint  # parts separated by a blank line for legibility
+
+
+def test_gh_install_hint_covers_all_platforms():
+    hint = cli._gh_install_hint()
+    assert "brew install gh" in hint  # macOS
+    assert "apt install gh" in hint  # Linux
+    assert "winget install GitHub.cli" in hint  # Windows
+    assert "gh auth login" in hint  # how to sign in after installing
+    assert "\n\n" in hint  # parts separated by a blank line for legibility
+
+
+def test_backend_install_hint_parts_are_blank_line_separated():
+    from agitrack.backends import setup
+
+    # Each instruction part is its own block so the options are easy to tell apart on screen.
+    assert "\n\n" in setup.install_hint("claude")
 
 
 def test_cli_gives_clear_message_when_git_missing(monkeypatch, capsys):

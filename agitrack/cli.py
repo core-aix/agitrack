@@ -33,14 +33,34 @@ def _git_install_hint() -> str:
     """Shown when ``git`` isn't on PATH. aGiTrack manages your commits with git, so it can't
     run without it — a common state right after the VS Code extension installs the CLI but
     git itself isn't installed. Covers macOS, Linux, and Windows so any user sees a command
-    that works."""
-    return (
-        "git is not installed (or not on your PATH).\n"
-        "aGiTrack manages your commits with git, so it can't run without it. Install it:\n"
-        "  macOS:    brew install git    (or: xcode-select --install)\n"
-        "  Linux:    use your package manager, e.g. sudo apt install git / sudo dnf install git\n"
-        "  Windows:  winget install Git.Git    (or https://git-scm.com/download/win)\n"
-        "Then open a NEW terminal so the updated PATH is picked up."
+    that works; each part is its own block (blank line between) for legibility."""
+    return "\n\n".join(
+        [
+            "git is not installed (or not on your PATH). aGiTrack manages your commits with "
+            "git, so it can't run without it. Install it:",
+            "  macOS:    brew install git    (or: xcode-select --install)",
+            "  Linux:    use your package manager, e.g. sudo apt install git / sudo dnf install git",
+            "  Windows:  winget install Git.Git    (or https://git-scm.com/download/win)",
+            "Then open a NEW terminal so the updated PATH is picked up.",
+        ]
+    )
+
+
+def _gh_install_hint() -> str:
+    """Shown when the GitHub CLI (``gh``) isn't installed. gh is OPTIONAL — it gives the
+    dashboard committer identities by GitHub username and powers session sharing — so this is
+    informational. Covers macOS, Linux, and Windows, each part its own block for legibility."""
+    return "\n\n".join(
+        [
+            "GitHub CLI (gh) isn't installed. aGiTrack uses it for the dashboard's committer "
+            "identities and for session sharing; without it those features are limited (the "
+            "dashboard groups authors by email instead). It's optional — you can continue "
+            "without it. To install it:",
+            "  macOS:    brew install gh",
+            "  Linux:    sudo apt install gh    (or your package manager)",
+            "  Windows:  winget install GitHub.cli",
+            "Then run `gh auth login` and restart aGiTrack.",
+        ]
     )
 
 
@@ -740,18 +760,15 @@ def _check_gh_availability(repo: GitRepo, *, scripted: bool = False) -> tuple[bo
     if not commit_url_base(repo):
         return (True, False)  # no GitHub remote — gh isn't needed here yet
     if status == "missing":
-        print(
-            "GitHub CLI (gh) isn't installed. aGiTrack uses it for the dashboard's committer\n"
-            "identities and for session sharing; without it those features are limited.\n"
-            "Install it from https://cli.github.com, then restart aGiTrack."
-        )
-        prompt = "Press Enter to continue without it (q to quit): "
+        print(_gh_install_hint())
+        prompt = "\nPress Enter to continue without it (q to quit): "
     else:  # unauthenticated
         print(
-            "GitHub CLI (gh) isn't signed in. aGiTrack uses it for the dashboard's committer\n"
-            "identities and for session sharing; without it those features are limited."
+            "GitHub CLI (gh) isn't signed in. aGiTrack uses it for the dashboard's committer "
+            "identities and for session sharing; without it those features are limited.\n\n"
+            "Sign in with `gh auth login` (or press 'l' below to run it now)."
         )
-        prompt = "Press Enter to continue, type 'l' to log in now (q to quit): "
+        prompt = "\nPress Enter to continue, type 'l' to log in now (q to quit): "
     # Drain injected input first so a stray newline can't auto-answer this (same reason as
     # the privacy acknowledgment) — the choice must be a deliberate keypress.
     _drain_terminal_input()
