@@ -47,7 +47,7 @@ from agitrack.proxy.integration import IntegrationService, MergeContext, MergePh
 from agitrack.proxy.platform import make_child_process, make_host_terminal, make_waker
 from agitrack.proxy.process import BackendProcess
 from agitrack.proxy.session import Session
-from agitrack.sessions.share_cap import DEFAULT_HEAD_BYTES, DEFAULT_MAX_SHARED_BYTES
+from agitrack.sessions.share_cap import DEFAULT_MAX_SHARED_BYTES
 from agitrack.transcripts import SessionRef
 
 
@@ -184,14 +184,14 @@ def _shared_transcript_rows(transcript: str) -> int:
     return count_transcript_rows(transcript)
 
 
-def _redact_and_cap(backend, raw: str, max_bytes: int, head_bytes: int = DEFAULT_HEAD_BYTES) -> tuple[str, bool]:
-    """Redact secrets, then bound the transcript to ``max_bytes`` (keeping up to ``head_bytes``
-    of the opening) so a large session can't exceed Git's per-file size limit. Returns the
-    (possibly trimmed) shared text and whether it was trimmed."""
+def _redact_and_cap(backend, raw: str, max_bytes: int) -> tuple[str, bool]:
+    """Redact secrets, then bound the transcript to ``max_bytes`` (keeping a resumable recent
+    tail) so a large session can't exceed Git's per-file size limit. Returns the (possibly
+    trimmed) shared text and whether it was trimmed."""
     from agitrack.sessions import redact_transcript
 
     redacted = redact_transcript(raw)
-    capped = backend.cap_shared_transcript(redacted, max_bytes, head_bytes)
+    capped = backend.cap_shared_transcript(redacted, max_bytes)
     return capped, capped != redacted
 
 
@@ -4034,15 +4034,11 @@ class ProxyRunner:
                 self._render()
         return self._MENU_DONE  # the share is underway — close the menu so its progress shows
 
-    def _share_size_limits(self) -> tuple[int, int]:
-        """The (max-transcript-bytes, head-bytes) caps for sharing — user-configurable, with a
-        safe fallback when the config object predates these keys. Both are already clamped to
-        the hard limit by GlobalConfig (and an over-limit config is refused at startup)."""
-        cfg = self.global_config
-        return (
-            getattr(cfg, "share_max_transcript_bytes", DEFAULT_MAX_SHARED_BYTES),
-            getattr(cfg, "share_head_bytes", DEFAULT_HEAD_BYTES),
-        )
+    def _share_max_transcript_bytes(self) -> int:
+        """The max-transcript-bytes cap for sharing — user-configurable, with a safe fallback
+        when the config object predates the key. Already clamped to the hard limit by
+        GlobalConfig (and an over-limit config is refused at startup)."""
+        return getattr(self.global_config, "share_max_transcript_bytes", DEFAULT_MAX_SHARED_BYTES)
 
     def _share_payload(self, session_id: str):
         """Read + redact the session transcript and build its manifest (no network,
@@ -4057,7 +4053,7 @@ class ProxyRunner:
             return None
         from agitrack.sessions import github_login
 
-        shared, truncated = _redact_and_cap(backend, raw, *self._share_size_limits())
+        shared, truncated = _redact_and_cap(backend, raw, self._share_max_transcript_bytes())
         digest = hashlib.sha256(shared.encode("utf-8")).hexdigest()
         login = self.global_config.github_login or github_login(self.base_repo)
         self.global_config.github_login = login
@@ -4228,7 +4224,7 @@ class ProxyRunner:
             self._set_message(f"Can't read the transcript for {entry.display} to update it.")
             self._render()
             return
-        shared, truncated = _redact_and_cap(self.backend, raw, *self._share_size_limits())
+        shared, truncated = _redact_and_cap(self.backend, raw, self._share_max_transcript_bytes())
         # Updating from the Manage menu counts as a (re-)share by the current user, so
         # fold them into the contributor set — the entry stays under its origin owner.
         login = self._cached_or_resolve_login()
@@ -4544,7 +4540,7 @@ class ProxyRunner:
             )
             if not raw:
                 return None
-            shared, truncated = _redact_and_cap(backend, raw, *self._share_size_limits())
+            shared, truncated = _redact_and_cap(backend, raw, self._share_max_transcript_bytes())
             digest = hashlib.sha256(shared.encode("utf-8")).hexdigest()
             if digest == ctx["last_hash"]:
                 return None  # nothing new since the last push — skip the network round-trip
@@ -7237,11 +7233,6 @@ class ProxyRunner:
             {
                 "key": "share_max_transcript_bytes",
                 "label": "Max size of a shared session (larger sessions are trimmed to fit)",
-                "kind": "size_mb",
-            },
-            {
-                "key": "share_head_bytes",
-                "label": "How much of a shared session's opening to always keep when trimming",
                 "kind": "size_mb",
             },
             # --- commit summaries ---
