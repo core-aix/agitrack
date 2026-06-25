@@ -2660,3 +2660,81 @@ def test_push_rejection_reason_extracts_the_meaningful_git_line():
     assert "pre-receive hook declined" in reason  # the WHY, not a blind prefix slice
     assert _push_rejection_reason("") == "no error output from git"
     assert "stale info" in _push_rejection_reason("x\n ! [rejected] foo (stale info)\nerror: failed")
+
+
+def test_unshare_of_a_local_only_entry_reports_not_rejected(tmp_path):
+    # An entry that was only ever saved locally (its share never reached origin) has nothing to
+    # push. unshare must report that — NOT "rejected with no error output" — and remove it.
+    src = _repo_with_bare_remote(tmp_path)
+    store = SharedSessionStore(src)
+    store.publish(github_id="alice", name="keep", transcript="k", manifest=_manifest("keep", session_id="k", updated=1))
+    store._add_session("alice", "drop", "d", _manifest("drop", session_id="d", updated=2))  # local only
+    assert {e.name for e in store.entries()} == {"keep", "drop"}
+
+    result = store.unshare("alice", "drop")
+
+    assert result.remote is True
+    assert result.pushed is False  # nothing on origin to push...
+    assert result.error == ""  # ...but it was NOT a rejection
+    assert [e.name for e in store.entries()] == ["keep"]  # actually gone
+
+
+def test_unshare_clears_a_stale_mirror_entry_from_the_menu(tmp_path):
+    # The menu also lists from the cached remote MIRROR ref. An entry lingering there (a stale
+    # listing of a session no longer on origin) must be dropped on unshare, or it keeps showing
+    # as shared and re-running just repeats the same no-op.
+    from agitrack.sessions.store import REMOTE_MIRROR
+
+    repo = _init_repo(tmp_path)  # no remote
+    store = SharedSessionStore(repo)
+    SharedSessionStore(repo, ref=REMOTE_MIRROR)._add_session(
+        "alice", "ghost", "g", _manifest("ghost", session_id="g", updated=1)
+    )
+    assert [e.name for e in store.entries()] == ["ghost"]  # visible only via the mirror
+
+    store.unshare("alice", "ghost")
+
+    assert store.entries() == []  # dropped from the mirror → gone from the menu
+
+
+def test_unshare_empty_stderr_push_reports_a_timeout_hint(tmp_path):
+    # A push that exits non-zero with NO stderr (a killed/timed-out push) must not surface as a
+    # blank "no error output" — the user gets an actionable hint instead.
+    class _EmptyErrPushRepo:
+        def remote_exists(self, name="origin"):
+            return True
+
+        def ref_exists(self, ref):
+            return False
+
+        def root_commit(self):
+            return "fp"
+
+        def read_tree_paths(self, ref):
+            return {"fp/alice/drop/transcript.jsonl": "b1", "fp/alice/drop/manifest.json": "b2"}
+
+        def ref_sha(self, ref):
+            return "tip"
+
+        def write_tree_from(self, entries):
+            return "tree"
+
+        def commit_tree_orphan(self, tree, message):
+            return "commit"
+
+        def update_ref(self, ref, sha):
+            pass
+
+        def delete_orphaned_objects(self, old):
+            return 0
+
+        def fetch_ref(self, refspec, *, remote="origin", filter_blobs=None, timeout=None, cancel=None):
+            return True
+
+        def push_ref(self, refspec, *, remote="origin", force_with_lease=None, timeout=None, cancel=None):
+            return (False, "")  # non-zero exit, no stderr (killed / timed out)
+
+    result = SharedSessionStore(_EmptyErrPushRepo()).unshare("alice", "drop")  # type: ignore[arg-type]
+
+    assert result.pushed is False
+    assert "timed out" in result.error  # actionable, not a blank "no output"

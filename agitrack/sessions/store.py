@@ -440,60 +440,91 @@ class SharedSessionStore:
         The entry is removed from BOTH the current ref and the legacy
         ``refs/agit/shared-sessions`` — a session shared before the aGiT → aGiTrack
         rename lives only in the legacy ref, so rewriting the current ref alone would
-        leave it visible (it would keep surfacing through :meth:`entries`)."""
+        leave it visible (it would keep surfacing through :meth:`entries`).
+
+        ``pushed`` is True only when a copy that was actually on origin got removed there.
+        ``pushed=False`` with an empty ``error`` means there was nothing to push — the entry
+        was only ever local (its share never reached origin) or was already gone there — NOT a
+        rejection. A real rejection carries git's reason in ``error``."""
         gid, nm = slug(github_id), slug(name)
         remote = self.repo.remote_exists()
         pushed_any = False
+        on_origin = False  # did the entry exist on origin (so a removal had to be pushed)?
         errors: list[str] = []
         for ref in (self.ref, LEGACY_REF):
             if ref != self.ref and not self.repo.ref_exists(ref):
                 continue
-            ok, err = self._unshare_one_ref(ref, gid, nm, remote, timeout)
-            if ok is None:
-                continue  # this ref doesn't hold the entry
-            if remote and not ok and _is_stale_lease(err):
+            status, err = self._unshare_one_ref(ref, gid, nm, remote, timeout)
+            if status == "rejected" and _is_stale_lease(err):
                 # A concurrent push (this session's own auto-share, or another machine) moved
                 # the remote ref between our fetch and our push, so --force-with-lease rejected
                 # it. Re-sync onto the current tip and retry once — exactly what publish() does.
-                # Without this the unshare reliably fails on an active repo and the removal
-                # never lands (the user sees "the push was rejected").
-                ok, err = self._unshare_one_ref(ref, gid, nm, remote, timeout)
-            pushed_any = pushed_any or bool(ok)
-            if not ok and err.strip():
-                errors.append(err.strip())
+                status, err = self._unshare_one_ref(ref, gid, nm, remote, timeout)
+            if status == "pushed":
+                pushed_any = True
+                on_origin = True
+            elif status == "rejected":
+                on_origin = True
+                if err.strip():
+                    errors.append(err.strip())
+        # The menu lists from the cached MIRROR refs too. Once the entry is off origin (we
+        # pushed its removal, or it was never there), drop it from the mirrors so it leaves the
+        # menu immediately instead of lingering as a stale "shared" entry. Leave the mirrors
+        # alone when a push was rejected — it IS still on origin, so the user can retry.
+        if not (on_origin and not pushed_any):
+            for mirror in (REMOTE_MIRROR, LEGACY_MIRROR):
+                if self.repo.ref_exists(mirror):
+                    self._drop_local_entry(mirror, gid, nm)
         if not remote:
             return PublishResult(remote=False, pushed=False)
         return PublishResult(remote=True, pushed=pushed_any, error="; ".join(errors))
 
-    def _unshare_one_ref(
-        self, ref: str, gid: str, nm: str, remote: bool, timeout: float | None = None
-    ) -> tuple[bool | None, str]:
-        """Drop the ``gid/nm`` entry from *ref* and (with a remote) push the removal. Returns
-        ``(None, "")`` when *ref* doesn't hold the entry; otherwise ``(pushed_ok, error)`` — a
-        remote-less repo reports ``(True, "")`` once the local ref is rewritten. Re-fetches the
-        ref each call so the retry above rebuilds the removal onto the moved remote tip."""
+    def _unshare_one_ref(self, ref: str, gid: str, nm: str, remote: bool, timeout: float | None) -> tuple[str, str]:
+        """Drop the ``gid/nm`` entry from *ref*. Returns ``(status, error)`` where status is:
+        ``"skip"`` — *ref* never held the entry; ``"local"`` — removed locally and it isn't on
+        origin (nothing to push); ``"pushed"`` — removed and the removal pushed to origin;
+        ``"rejected"`` — it's on origin but the push failed (``error`` carries git's reason)."""
         base = f"{self._prefix()}{gid}/{nm}/"
-        if remote:
-            # Sync the ref so the --force-with-lease below is built against the CURRENT remote
-            # tip. A blob-filtered fetch is enough (rewriting only re-references existing SHAs,
-            # so the big transcripts needn't be local) — BUT fall back to a full fetch when the
-            # remote doesn't support partial fetch. Without the fallback the filtered fetch
-            # silently fails, the lease is built against a stale local tip, and the push is
-            # rejected on every attempt (the "rerun shows the same message" bug). Mirrors
-            # _fetch_current, which the publish path already uses.
-            refspec = f"+{ref}:{ref}"
-            if not self.repo.fetch_ref(refspec, filter_blobs="blob:limit=16k", timeout=timeout):
-                self.repo.fetch_ref(refspec, timeout=timeout)
+        held_locally = any(k.startswith(base) for k in self.repo.read_tree_paths(ref))
+        if not remote:
+            if not held_locally:
+                return "skip", ""
+            self._drop_local_entry(ref, gid, nm)  # local-only repo: the rewrite IS the removal
+            return "local", ""
+        # Sync the ref so the --force-with-lease below is built against the CURRENT remote tip.
+        # A blob-filtered fetch is enough (rewriting only re-references existing SHAs) — BUT
+        # fall back to a full fetch when the remote rejects partial fetch, or the filtered fetch
+        # silently fails, the lease is stale, and the push is rejected on every attempt. Mirrors
+        # _fetch_current, which the publish path uses.
+        refspec = f"+{ref}:{ref}"
+        if not self.repo.fetch_ref(refspec, filter_blobs="blob:limit=16k", timeout=timeout):
+            self.repo.fetch_ref(refspec, timeout=timeout)
+        synced = self.repo.read_tree_paths(ref)
+        if not any(k.startswith(base) for k in synced):
+            # Not on origin. If we'd had a local copy, the sync just dropped it from the local
+            # ref — gone from your view, and there's nothing to push.
+            return ("local" if held_locally else "skip"), ""
+        old = self.repo.ref_sha(ref)
+        kept = {k: v for k, v in synced.items() if not k.startswith(base)}
+        self._commit(kept, f"agitrack: unshare session {gid}/{nm}", ref=ref)
+        lease = f"{ref}:{old}" if old else None
+        ok, err = self.repo.push_ref(f"{ref}:{ref}", force_with_lease=lease, timeout=timeout)
+        if not ok and not err.strip():
+            # Non-zero exit with no stderr — almost always a killed/timed-out push, not a clean
+            # rejection. Give the user something actionable instead of a blank "no output".
+            err = "the push to origin timed out or returned no output — check your connection, then retry"
+        return ("pushed" if ok else "rejected"), err
+
+    def _drop_local_entry(self, ref: str, gid: str, nm: str) -> bool:
+        """Rewrite *ref* locally to drop the ``gid/nm`` entry (no push). Returns whether it
+        removed anything. Used to clear a session from the canonical/mirror refs the menu reads."""
+        base = f"{self._prefix()}{gid}/{nm}/"
         paths = self.repo.read_tree_paths(ref)
         if not any(k.startswith(base) for k in paths):
-            return None, ""  # this ref doesn't hold the entry
-        old = self.repo.ref_sha(ref)
+            return False
         kept = {k: v for k, v in paths.items() if not k.startswith(base)}
         self._commit(kept, f"agitrack: unshare session {gid}/{nm}", ref=ref)
-        if not remote:
-            return True, ""  # local-only: the rewrite IS the removal
-        lease = f"{ref}:{old}" if old else None
-        return self.repo.push_ref(f"{ref}:{ref}", force_with_lease=lease, timeout=timeout)
+        return True
 
     def publish(
         self,

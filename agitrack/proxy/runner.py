@@ -4199,6 +4199,10 @@ class ProxyRunner:
                 return f"Removed {entry.display} from the local shared ref (no remote to push the removal to)."
             if result.pushed:
                 return f"Unshared {entry.display} (removed from origin)."
+            if not result.error:
+                # Nothing was rejected: the entry wasn't on origin (its share never reached it,
+                # or it was already removed there). It's gone from your list either way.
+                return f"Removed {entry.display} — it wasn't on origin (nothing to push)."
             # Removed locally but the origin push was rejected even after the auto-retry — show
             # the REASON git gave (not a blind prefix slice) so the user can tell a transient
             # race from a permission/protected-ref/hook rejection they must fix on the remote.
