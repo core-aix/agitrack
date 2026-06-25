@@ -4577,7 +4577,7 @@ class ProxyRunner:
                 continue
             for fd in readable:
                 if fd == stdin_fd:
-                    if self._stdin_has_cancel(os.read(stdin_fd, 32)):
+                    if self._stdin_has_cancel(self._read_stdin_fd(32)):
                         return "cancel"
                 elif fd == master:
                     output = self._drain_child_output()
@@ -4954,7 +4954,7 @@ class ProxyRunner:
                 return
             for fd in readable:
                 if fd == stdin_fd:
-                    if self._is_real_keypress(os.read(stdin_fd, 32)):  # a key (not a mouse move) dismisses
+                    if self._is_real_keypress(self._read_stdin_fd(32)):  # a key (not a mouse move) dismisses
                         return
                 elif fd == master:
                     output = self._drain_child_output()
@@ -6054,7 +6054,10 @@ class ProxyRunner:
         readable, _, _ = select.select(watch, [], [], timeout)
         if self._wake_r in readable:
             try:
-                os.read(self._wake_r, 4096)  # drain the wake byte(s); presence is the signal
+                if sys.platform == "win32":
+                    self._wake_r_sock.recv(4096)
+                else:
+                    os.read(self._wake_r, 4096)  # drain the wake byte(s); presence is the signal
             except OSError:
                 pass
         for fd in readable:
@@ -6098,7 +6101,7 @@ class ProxyRunner:
         stdin_fd = self._stdin_fileno()
         if stdin_fd not in readable:
             return None
-        data = os.read(stdin_fd, 4096)
+        data = self._read_stdin_fd(4096)
         # Only a real keystroke resets the idle backoff — NOT a mouse wheel / move /
         # click or a focus in/out report. Scrolling history is passive reading: it
         # needs no commits or background polling, so it must not pin aGiTrack in the
@@ -7322,7 +7325,7 @@ class ProxyRunner:
                     # the view; the next normal render shows the updated screen.
                     self._feed_child_output(output)
             if stdin_fd in readable:
-                return os.read(stdin_fd, 32)
+                return self._read_stdin_fd(32)
 
     def _run_modal(self, modal: "PromptModal | SelectModal") -> "str | None":
         """Run *modal* to completion, keeping all session PTYs draining.
@@ -7440,6 +7443,16 @@ class ProxyRunner:
         if sys.platform == "win32" and hasattr(self, "_win_stdin_r"):
             return self._win_stdin_r.fileno()
         return sys.stdin.fileno()
+
+    def _read_stdin_fd(self, n: int) -> bytes:
+        """Read up to *n* bytes from the stdin fd.
+
+        On Windows the stdin fd is backed by a socket, so use recv(); on POSIX
+        use os.read() on the real stdin fd.
+        """
+        if sys.platform == "win32" and hasattr(self, "_win_stdin_r"):
+            return self._win_stdin_r.recv(n)
+        return os.read(sys.stdin.fileno(), n)
 
     def _win_start_stdin_pump(self) -> None:
         """Start a thread that reads raw keystrokes and forwards them through a
@@ -8227,13 +8240,11 @@ class ProxyRunner:
 
     def _waitpid_nowait(self, pid: int) -> tuple[int, int]:
         """Non-blocking child-exit check.  Returns (pid, status) if exited, (0, 0) if still running.
-        On POSIX: os.waitpid(WNOHANG).  On Windows: poll the ConPTY subprocess handle."""
+        On POSIX: os.waitpid(WNOHANG).  On Windows: poll the ConPTY handle via poll_exited()."""
         if sys.platform == "win32":
             handle = self.active.process._handle
-            if handle is not None:
-                rc = handle._proc.poll()
-                if rc is not None:
-                    return pid, max(0, rc)
+            if handle is not None and handle.poll_exited():
+                return pid, 0
             return 0, 0
         return os.waitpid(pid, os.WNOHANG)
 
