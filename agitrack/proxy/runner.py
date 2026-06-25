@@ -47,6 +47,7 @@ from agitrack.proxy.integration import IntegrationService, MergeContext, MergePh
 from agitrack.proxy.platform import make_child_process, make_host_terminal, make_waker
 from agitrack.proxy.process import BackendProcess
 from agitrack.proxy.session import Session
+from agitrack.sessions.share_cap import DEFAULT_HEAD_BYTES, DEFAULT_MAX_SHARED_BYTES
 from agitrack.transcripts import SessionRef
 
 
@@ -181,6 +182,17 @@ def _shared_transcript_rows(transcript: str) -> int:
     from agitrack.sessions import count_transcript_rows
 
     return count_transcript_rows(transcript)
+
+
+def _redact_and_cap(backend, raw: str, max_bytes: int, head_bytes: int = DEFAULT_HEAD_BYTES) -> tuple[str, bool]:
+    """Redact secrets, then bound the transcript to ``max_bytes`` (keeping up to ``head_bytes``
+    of the opening) so a large session can't exceed Git's per-file size limit. Returns the
+    (possibly trimmed) shared text and whether it was trimmed."""
+    from agitrack.sessions import redact_transcript
+
+    redacted = redact_transcript(raw)
+    capped = backend.cap_shared_transcript(redacted, max_bytes, head_bytes)
+    return capped, capped != redacted
 
 
 def _decode_kitty_ctrl_keys(data: bytes) -> bytes:
@@ -724,6 +736,9 @@ class ProxyRunner:
         # surface; a notice is shown only on FAILURE/behind (success is silent, since it fires
         # every commit). None ⇒ nothing to report. See _service_auto_share_outcome.
         self._auto_share_outcome: dict | None = None
+        # Session ids already told (this run) that auto-share is trimming their oversized
+        # transcript — so the truncation notice shows ONCE, not on every commit's auto-share.
+        self._auto_share_truncation_warned: set[str] = set()
         # aGiTrack session ids (stable, never drift) that saw at least one committed turn
         # THIS run. The exit-path auto-share consults this so a session that was only
         # resumed and never typed into is not re-shared — robust where a transcript
@@ -1009,6 +1024,7 @@ class ProxyRunner:
                 "_auto_share_hash": {},
                 "_auto_share_thread": None,
                 "_auto_share_outcome": None,
+                "_auto_share_truncation_warned": set(),
                 "_backend_update_thread": None,
                 "_backend_update_result": None,
                 "_backend_update_checked_for": None,
@@ -3995,7 +4011,7 @@ class ProxyRunner:
             self._user_state().set_shared_origin(
                 session_id, owner=payload["owner"], name=payload["name"], contributors=payload["contributors"]
             )
-            return self._share_outcome_message(result, payload["display"])
+            return self._share_outcome_message(result, payload["display"], truncated=payload.get("truncated", False))
 
         # The read+redact+push all run in the BACKGROUND so the terminal never freezes; the
         # result lands as a notice. Only the exit-path share blocks (it must finish before the
@@ -4018,6 +4034,16 @@ class ProxyRunner:
                 self._render()
         return self._MENU_DONE  # the share is underway — close the menu so its progress shows
 
+    def _share_size_limits(self) -> tuple[int, int]:
+        """The (max-transcript-bytes, head-bytes) caps for sharing — user-configurable, with a
+        safe fallback when the config object predates these keys. Both are already clamped to
+        the hard limit by GlobalConfig (and an over-limit config is refused at startup)."""
+        cfg = self.global_config
+        return (
+            getattr(cfg, "share_max_transcript_bytes", DEFAULT_MAX_SHARED_BYTES),
+            getattr(cfg, "share_head_bytes", DEFAULT_HEAD_BYTES),
+        )
+
     def _share_payload(self, session_id: str):
         """Read + redact the session transcript and build its manifest (no network,
         no UI). Returns a dict with the lineage identity (``owner``/``name``/
@@ -4029,10 +4055,10 @@ class ProxyRunner:
         )
         if not raw:
             return None
-        from agitrack.sessions import github_login, redact_transcript
+        from agitrack.sessions import github_login
 
-        redacted = redact_transcript(raw)
-        digest = hashlib.sha256(redacted.encode("utf-8")).hexdigest()
+        shared, truncated = _redact_and_cap(backend, raw, *self._share_size_limits())
+        digest = hashlib.sha256(shared.encode("utf-8")).hexdigest()
         login = self.global_config.github_login or github_login(self.base_repo)
         self.global_config.github_login = login
         owner, name, contributors = self._share_identity(session_id, login)
@@ -4047,7 +4073,8 @@ class ProxyRunner:
             "updated": int(time.time()),
             "content_hash": digest,
             "transcript_bytes": backend.transcript_size(self.base_repo.repo, session_id),
-            "transcript_rows": _shared_transcript_rows(redacted),
+            "transcript_rows": _shared_transcript_rows(shared),
+            "truncated": truncated,  # oldest middle turns dropped to fit Git's file-size limit
         }
         return {
             "owner": owner,
@@ -4055,12 +4082,13 @@ class ProxyRunner:
             "contributors": contributors,
             "sharer": login,
             "display": f"{'+'.join(contributors)}/{name}",
-            "redacted": redacted,
+            "redacted": shared,
             "digest": digest,
+            "truncated": truncated,
             "manifest": manifest,
         }
 
-    def _share_outcome_message(self, result, display: str) -> str:
+    def _share_outcome_message(self, result, display: str, *, truncated: bool = False) -> str:
         if result.behind:
             # The shared copy already has newer turns than this machine's copy —
             # sharing would rewind it. Tell the user in plain language (no git jargon).
@@ -4092,6 +4120,14 @@ class ProxyRunner:
             message += f" Merged {result.merged} turn(s) shared by a collaborator."
         if result.pruned:
             message += f" Pruned {result.pruned} older shared session(s)."
+        if truncated and (result.pushed or not result.remote):
+            # The session was too big for Git's per-file limit, so the oldest middle turns were
+            # dropped at a compaction boundary. The opening and recent turns are shared intact.
+            message += (
+                " Note: this session was large, so the oldest middle turns were trimmed to fit "
+                "the share size limit — the opening and recent turns are included. Compact the "
+                "conversation if you want a smaller, cleaner shared copy."
+            )
         return message
 
     def _manage_shared_sessions_menu(self) -> str:
@@ -4192,9 +4228,7 @@ class ProxyRunner:
             self._set_message(f"Can't read the transcript for {entry.display} to update it.")
             self._render()
             return
-        from agitrack.sessions import redact_transcript
-
-        redacted = redact_transcript(raw)
+        shared, truncated = _redact_and_cap(self.backend, raw, *self._share_size_limits())
         # Updating from the Manage menu counts as a (re-)share by the current user, so
         # fold them into the contributor set — the entry stays under its origin owner.
         login = self._cached_or_resolve_login()
@@ -4203,9 +4237,10 @@ class ProxyRunner:
             **entry.manifest,
             "contributors": contributors,
             "updated": int(time.time()),
-            "content_hash": hashlib.sha256(redacted.encode("utf-8")).hexdigest(),
+            "content_hash": hashlib.sha256(shared.encode("utf-8")).hexdigest(),
             "transcript_bytes": self.backend.transcript_size(self.base_repo.repo, sid),
-            "transcript_rows": _shared_transcript_rows(redacted),
+            "transcript_rows": _shared_transcript_rows(shared),
+            "truncated": truncated,
         }
         display = f"{'+'.join(contributors)}/{entry.name}"
         store = self._shared_store()
@@ -4214,7 +4249,7 @@ class ProxyRunner:
             return store.publish(
                 github_id=entry.github_id,
                 name=entry.name,
-                transcript=redacted,
+                transcript=shared,
                 manifest=manifest,
                 prune_gid=login,
                 timeout=self.SHARE_PUSH_TIMEOUT,
@@ -4226,7 +4261,7 @@ class ProxyRunner:
             result = box["result"]
             if sid:
                 self._auto_share_hash[sid] = manifest["content_hash"]
-            return self._share_outcome_message(result, display)
+            return self._share_outcome_message(result, display, truncated=truncated)
 
         # Push in the BACKGROUND (same as the initial share) so the terminal never
         # freezes; a progress notice shows now, the result lands when it finishes.
@@ -4369,8 +4404,11 @@ class ProxyRunner:
                 session_id, owner=payload["owner"], name=payload["name"], contributors=payload["contributors"]
             )
             if not result.pushed:
-                return self._share_outcome_message(result, display)
-            return f"Overwrote the shared copy of '{display}' on origin with this session."
+                return self._share_outcome_message(result, display, truncated=payload.get("truncated", False))
+            note = ""
+            if payload.get("truncated"):
+                note = " (older middle turns were trimmed to fit the share size limit)"
+            return f"Overwrote the shared copy of '{display}' on origin with this session.{note}"
 
         self._run_share_op_async(f"share:{display}", f"Overwriting '{display}' — pushing to origin…", op, outcome)
 
@@ -4506,10 +4544,8 @@ class ProxyRunner:
             )
             if not raw:
                 return None
-            from agitrack.sessions import redact_transcript
-
-            redacted = redact_transcript(raw)
-            digest = hashlib.sha256(redacted.encode("utf-8")).hexdigest()
+            shared, truncated = _redact_and_cap(backend, raw, *self._share_size_limits())
+            digest = hashlib.sha256(shared.encode("utf-8")).hexdigest()
             if digest == ctx["last_hash"]:
                 return None  # nothing new since the last push — skip the network round-trip
             manifest = {
@@ -4523,12 +4559,13 @@ class ProxyRunner:
                 "updated": int(time.time()),
                 "content_hash": digest,
                 "transcript_bytes": backend.transcript_size(ctx["base_repo_path"], sid),
-                "transcript_rows": _shared_transcript_rows(redacted),
+                "transcript_rows": _shared_transcript_rows(shared),
+                "truncated": truncated,
             }
             result = ctx["store"].publish(
                 github_id=ctx["owner"],
                 name=ctx["name"],
-                transcript=redacted,
+                transcript=shared,
                 manifest=manifest,
                 prune_gid=ctx["login"],
                 # Bound the push: a stalled remote must not strand this worker, because the
@@ -4542,7 +4579,9 @@ class ProxyRunner:
             # so a successful local write counts as shared.
             if result.pushed or not result.remote:
                 self._auto_share_hash[sid] = digest
-                self._auto_share_outcome = {"ok": True}
+                # Carry truncation + sid so the main loop can show a ONE-TIME notice (it owns the
+                # "already warned" set, off this worker thread). Success is otherwise silent.
+                self._auto_share_outcome = {"ok": True, "truncated": truncated, "sid": sid, "name": ctx["name"]}
             elif result.behind:
                 self._auto_share_outcome = {"behind": True, "name": ctx["name"]}
             else:
@@ -4574,6 +4613,18 @@ class ProxyRunner:
                 "auto-share",
                 f"Auto-share for {name} skipped — the shared copy already has newer turns than this machine.",
                 seconds=10.0,
+            )
+            self._render()
+        elif outcome.get("truncated") and outcome.get("sid") not in self._auto_share_truncation_warned:
+            # Tell the user ONCE that their oversized session is being trimmed to fit the share
+            # size limit — not on every commit's auto-share (that would spam). Marked here, on
+            # the main thread, so the show-once gate is race-free.
+            self._auto_share_truncation_warned.add(outcome["sid"])
+            self._set_session_notice(
+                "auto-share",
+                f"{name} is large, so auto-share is trimming its oldest turns to fit the share size limit "
+                f"(the opening and recent turns are kept). Compact the conversation for a smaller shared copy.",
+                seconds=12.0,
             )
             self._render()
 
@@ -7182,6 +7233,17 @@ class ProxyRunner:
                 "kind": "bool",
                 "restart": True,
             },
+            # --- session sharing ---
+            {
+                "key": "share_max_transcript_bytes",
+                "label": "Max size of a shared session (larger sessions are trimmed to fit)",
+                "kind": "size_mb",
+            },
+            {
+                "key": "share_head_bytes",
+                "label": "How much of a shared session's opening to always keep when trimming",
+                "kind": "size_mb",
+            },
             # --- commit summaries ---
             {"key": "summarization_enabled", "label": "Write an AI summary for each commit", "kind": "bool"},
             {"key": "summarization_model", "label": "Model used to write commit summaries", "kind": "model"},
@@ -7203,12 +7265,19 @@ class ProxyRunner:
             return f"{n} unsaved change(s)" if n else ""
         if key in self._settings_pending:  # a pending (unsaved) edit shows its new value
             value, scope, _ = self._settings_pending[key]
-            return f"{self._fmt_setting(value)}  · UNSAVED → {scope}"
+            shown = (
+                f"{value // (1024 * 1024)} MB"
+                if kind == "size_mb" and isinstance(value, int)
+                else self._fmt_setting(value)
+            )
+            return f"{shown}  · UNSAVED → {scope}"
         if kind == "bool":
             text = "on" if bool(getattr(self.global_config, key)) else "off"
         elif kind == "paths":
             paths = self.global_config.allowed_edit_paths
             text = ", ".join(paths) if paths else "(none)"
+        elif kind == "size_mb":
+            text = f"{int(getattr(self.global_config, key)) // (1024 * 1024)} MB"
         else:
             value = getattr(self.global_config, key, None)
             text = str(value) if value not in (None, "") else "(default)"
@@ -7274,6 +7343,26 @@ class ProxyRunner:
                 if raw is None:
                     return
                 value = [p.strip() for p in raw.split(os.pathsep) if p.strip()]
+            elif kind == "size_mb":
+                from agitrack.sessions.share_cap import HARD_MAX_SHARED_BYTES
+
+                hard_mb = HARD_MAX_SHARED_BYTES // (1024 * 1024)
+                raw = self._prompt_popup(label, f"Size in MB (1–{hard_mb}):", default=str(self._pending_size_mb(key)))
+                if raw is None:
+                    return
+                try:
+                    mb = int(float(raw.strip()))
+                except ValueError:
+                    self._set_message("Enter a whole number of MB.")
+                    self._render()
+                    continue
+                if not 1 <= mb <= hard_mb:
+                    # Enforce the hard limit in the editor too — a shared file over this is
+                    # rejected by Git hosts, so we never let it be configured that high.
+                    self._set_message(f"Must be between 1 and {hard_mb} MB (Git's per-file size limit).")
+                    self._render()
+                    continue
+                value = mb * 1024 * 1024
             else:  # text
                 raw = self._prompt_popup(label, "New value (blank = unset):", default=self._pending_text(key))
                 if raw is None:
@@ -7283,11 +7372,21 @@ class ProxyRunner:
             if scope is None:  # Esc at scope → one level up: re-edit the value
                 continue
             self._settings_pending[key] = (value, scope, bool(spec.get("restart")))
-            self._set_message(
-                f"'{label}' → {self._fmt_setting(value)} ({scope}) — unsaved; choose Close to save.", seconds=7.0
+            shown = (
+                f"{value // (1024 * 1024)} MB"
+                if kind == "size_mb" and isinstance(value, int)
+                else self._fmt_setting(value)
             )
+            self._set_message(f"'{label}' → {shown} ({scope}) — unsaved; choose Close to save.", seconds=7.0)
             self._render()
             return
+
+    def _pending_size_mb(self, key: str) -> int:
+        # Current value (MB) to seed the editor: a pending edit if any, else the effective config.
+        raw: object = (
+            self._settings_pending[key][0] if key in self._settings_pending else getattr(self.global_config, key)
+        )
+        return raw // (1024 * 1024) if isinstance(raw, int) else 0
 
     def _pending_paths(self, key: str) -> list[str]:
         if key in self._settings_pending:

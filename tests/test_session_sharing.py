@@ -230,6 +230,93 @@ def test_redact_does_not_mask_ordinary_hex_or_identifiers():
     assert redact_transcript(benign) == benign
 
 
+# --- size cap (don't exceed Git's per-file limit) ---------------------------
+
+
+def test_select_kept_indices_returns_none_when_already_small():
+    from agitrack.sessions.share_cap import select_kept_indices
+
+    assert select_kept_indices([100] * 5, [False] * 5, max_bytes=100_000, sep_bytes=0) is None
+
+
+def test_select_kept_indices_keeps_head_and_drops_middle_anchoring_tail_at_compaction():
+    from agitrack.sessions.share_cap import select_kept_indices
+
+    sizes = [100] * 100
+    compaction = [False] * 100
+    compaction[80] = True  # a clean boundary at/after where the greedy tail begins
+    kept = select_kept_indices(sizes, compaction, max_bytes=3000, sep_bytes=0, head_bytes=500)
+    assert kept is not None
+    assert kept[:5] == [0, 1, 2, 3, 4]  # the opening (head) is preserved
+    assert 80 in kept and 79 not in kept  # tail anchored at the compaction, not mid-conversation
+    assert kept[-1] == 99  # the most recent item is kept
+    assert sum(sizes[i] for i in kept) <= 3000  # under budget
+
+
+def test_claude_cap_bounds_size_preserving_head_and_recent_turns():
+    from agitrack.transcripts.claude import cap_shared_transcript
+
+    rows = [json.dumps({"type": "assistant", "uuid": f"u{i}", "cwd": "/x", "pad": "P" * 400}) for i in range(300)]
+    rows[200] = json.dumps({"type": "user", "isCompactSummary": True, "uuid": "c", "summary": "S" * 400})
+    raw = "\n".join(rows)
+    max_bytes = 40 * 1024
+
+    out = cap_shared_transcript(raw, max_bytes, head_bytes=8 * 1024)
+
+    assert len(out.encode("utf-8")) <= max_bytes  # under Git's file-size limit
+    kept = out.split("\n")
+    assert kept[0] == rows[0]  # opening preserved (system/setup persists)
+    assert kept[-1] == rows[-1]  # most recent turn preserved
+    assert len(kept) < 300  # the old middle was dropped
+    for line in kept:
+        json.loads(line)  # every kept row is still valid JSON (resume-able .jsonl)
+    assert cap_shared_transcript(raw, 10 * 1024 * 1024) == raw  # unchanged when it already fits
+
+
+def test_opencode_cap_bounds_size_keeping_info_and_recent_messages():
+    from agitrack.transcripts.opencode import cap_shared_transcript
+
+    messages = []
+    for i in range(300):
+        info = {"id": f"m{i}", "role": "assistant"}
+        if i == 200:
+            info = {"id": "c", "role": "assistant", "summary": True}
+        messages.append({"info": info, "parts": [{"type": "text", "text": "T" * 400}]})
+    raw = json.dumps({"info": {"id": "ses_x", "title": "hello"}, "messages": messages})
+    max_bytes = 40 * 1024
+
+    out = cap_shared_transcript(raw, max_bytes, head_bytes=8 * 1024)
+
+    assert len(out.encode("utf-8")) <= max_bytes
+    parsed = json.loads(out)  # still a valid {info, messages} object opencode can import
+    assert parsed["info"]["id"] == "ses_x"  # session info preserved
+    ids = [m["info"]["id"] for m in parsed["messages"]]
+    assert ids[0] == "m0"  # opening preserved
+    assert ids[-1] == "m299"  # most recent preserved
+    assert len(parsed["messages"]) < 300  # middle dropped
+    assert cap_shared_transcript(raw, 10 * 1024 * 1024) == raw  # unchanged when it fits
+    assert cap_shared_transcript("not json{", 1) == "not json{"  # unparseable → left as-is
+
+
+def test_redact_and_cap_trims_oversized_and_flags_truncation():
+    # The share helper every share path uses: redact, then bound the size so the push can't
+    # trip Git's per-file limit — reporting whether anything was trimmed (for the user notice).
+    from types import SimpleNamespace
+
+    from agitrack.proxy.runner import _redact_and_cap
+    from agitrack.transcripts.claude import cap_shared_transcript
+
+    backend = SimpleNamespace(cap_shared_transcript=cap_shared_transcript)
+    big = "\n".join(json.dumps({"type": "assistant", "uuid": f"u{i}", "pad": "P" * 900}) for i in range(400))
+
+    text, truncated = _redact_and_cap(backend, big, 64 * 1024)
+    assert truncated is True
+    assert len(text.encode("utf-8")) <= 64 * 1024
+
+    small, trimmed = _redact_and_cap(backend, '{"type":"user"}', 64 * 1024)
+    assert trimmed is False and small == '{"type":"user"}'
+
+
 # --- identity ---------------------------------------------------------------
 
 
@@ -1547,6 +1634,9 @@ class _StubBackend:
     def export_session_raw(self, repo, session_id):
         return self._transcript
 
+    def cap_shared_transcript(self, transcript, max_bytes, head_bytes=0):
+        return transcript  # stub transcripts are tiny; size-capping is unit-tested separately
+
     def transcript_size(self, repo, session_id):
         return len(self._transcript.encode("utf-8"))
 
@@ -2452,6 +2542,35 @@ def test_auto_share_success_caches_hash_and_stays_silent(tmp_path, monkeypatch):
 
     assert "sid-123" in runner._auto_share_hash  # cached on a real success
     assert not any("failed" in n[0].lower() for n in runner._session_notices.values())  # silent on success
+
+
+def test_auto_share_truncation_notice_shows_once_per_session(tmp_path, monkeypatch):
+    # Auto-share fires every commit; a session that stays oversized is truncated every time. The
+    # "we're trimming this" notice must appear ONCE, not on each auto-share (that would spam).
+    runner, _repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend())
+
+    runner._auto_share_outcome = {"ok": True, "truncated": True, "sid": "sid-1", "name": "feature"}
+    runner._service_auto_share_outcome()
+    first = [n[0] for n in runner._session_notices.values() if "trimming" in n[0]]
+    assert len(first) == 1 and "feature" in first[0]
+
+    # A second truncated auto-share of the SAME session stays silent.
+    runner._session_notices.clear()
+    runner._auto_share_outcome = {"ok": True, "truncated": True, "sid": "sid-1", "name": "feature"}
+    runner._service_auto_share_outcome()
+    assert not any("trimming" in n[0] for n in runner._session_notices.values())
+
+    # A DIFFERENT session still gets its own one-time notice.
+    runner._auto_share_outcome = {"ok": True, "truncated": True, "sid": "sid-2", "name": "other"}
+    runner._service_auto_share_outcome()
+    assert any("trimming" in n[0] and "other" in n[0] for n in runner._session_notices.values())
+
+
+def test_auto_share_success_without_truncation_stays_silent(tmp_path, monkeypatch):
+    runner, _repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend())
+    runner._auto_share_outcome = {"ok": True, "truncated": False, "sid": "sid-1", "name": "feature"}
+    runner._service_auto_share_outcome()
+    assert not any("trimming" in n[0] for n in runner._session_notices.values())
 
 
 def test_auto_share_bounds_the_push_with_a_timeout(tmp_path, monkeypatch):

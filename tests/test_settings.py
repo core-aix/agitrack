@@ -35,6 +35,39 @@ def test_repo_overlay_overrides_global(tmp_path):
     assert json.loads((tmp_path / "global" / "config.json").read_text())["sandbox"] is False
 
 
+def test_share_size_settings_default_configure_and_hard_clamp(tmp_path):
+    from agitrack.sessions.share_cap import DEFAULT_HEAD_BYTES, DEFAULT_MAX_SHARED_BYTES, HARD_MAX_SHARED_BYTES
+
+    gc = _config(tmp_path)
+    # Defaults when unset.
+    assert gc.share_max_transcript_bytes == DEFAULT_MAX_SHARED_BYTES
+    assert gc.share_head_bytes == DEFAULT_HEAD_BYTES
+    # A sensible configured value is honored (repo overlay wins, like any setting).
+    gc.set("share_max_transcript_bytes", 50 * 1024 * 1024, scope="repo")
+    assert gc.share_max_transcript_bytes == 50 * 1024 * 1024
+    # A nonsensical value falls back to the default (a typo can't break sharing).
+    gc.set("share_head_bytes", "lots", scope="global")
+    assert gc.share_head_bytes == DEFAULT_HEAD_BYTES
+    # Even if an over-limit value slips in, the effective value is clamped to the hard ceiling.
+    gc.set("share_max_transcript_bytes", 500 * 1024 * 1024, scope="repo")
+    assert gc.share_max_transcript_bytes == HARD_MAX_SHARED_BYTES
+
+
+def test_share_config_error_flags_only_over_the_hard_limit(tmp_path):
+    from agitrack.sessions.share_cap import HARD_MAX_SHARED_BYTES
+
+    gc = _config(tmp_path)
+    assert gc.share_config_error() is None  # unset → fine
+    gc.set("share_max_transcript_bytes", HARD_MAX_SHARED_BYTES, scope="global")
+    assert gc.share_config_error() is None  # exactly at the limit → fine
+    gc.set("share_max_transcript_bytes", HARD_MAX_SHARED_BYTES + 1, scope="global")
+    err = gc.share_config_error()
+    assert err is not None and "share_max_transcript_bytes" in err and "100 MiB" in err
+    gc.unset("share_max_transcript_bytes", scope="global")
+    gc.set("share_head_bytes", 200 * 1024 * 1024, scope="repo")  # the head cap is bounded too
+    assert "share_head_bytes" in (gc.share_config_error() or "")
+
+
 def test_unset_repo_reveals_global(tmp_path):
     gc = _config(tmp_path)
     gc.set("use_worktrees", False, scope="global")

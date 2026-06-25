@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 from agitrack.backends.base import TokenUsage
+from agitrack.sessions.share_cap import DEFAULT_HEAD_BYTES, select_kept_indices
 from agitrack.transcripts.types import ExportedSession, SessionRef, SessionTurn, turns_after
 
 __all__ = [
@@ -248,6 +249,35 @@ def export_session_raw(repo: Path, session_id: str) -> str | None:
         return path.read_text(encoding="utf-8")
     except OSError:
         return None
+
+
+def _is_compaction_row(line: str) -> bool:
+    """A row Claude injects when it compacts the conversation (``isCompactSummary``) — a
+    self-contained recap of everything before it, hence a clean place to resume from."""
+    stripped = line.strip()
+    if not stripped or '"isCompactSummary"' not in stripped:
+        return False
+    try:
+        row = json.loads(stripped)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(row, dict) and bool(row.get("isCompactSummary"))
+
+
+def cap_shared_transcript(transcript: str, max_bytes: int, head_bytes: int = DEFAULT_HEAD_BYTES) -> str:
+    """Bound a Claude ``.jsonl`` transcript to ``max_bytes`` for sharing, keeping whole rows.
+    Preserves the opening (system prompt / initial context) and the most recent turns, dropping
+    the middle and anchoring the kept tail at a compaction summary. Returns ``transcript``
+    unchanged when it already fits."""
+    if len(transcript.encode("utf-8")) <= max_bytes:
+        return transcript
+    lines = transcript.split("\n")
+    sizes = [len(line.encode("utf-8")) for line in lines]
+    compaction = [_is_compaction_row(line) for line in lines]
+    kept = select_kept_indices(sizes, compaction, max_bytes, sep_bytes=1, head_bytes=head_bytes)
+    if kept is None:
+        return transcript
+    return "\n".join(lines[i] for i in kept)
 
 
 def session_transcript_size(repo: Path, session_id: str) -> int | None:
