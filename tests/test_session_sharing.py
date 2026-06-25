@@ -2206,9 +2206,10 @@ def test_manage_update_now_pushes_in_background_with_progress_notice(tmp_path, m
     assert SharedSessionStore(repo).read_transcript(entry) == "newest turns"  # pushed
 
 
-def test_manage_menu_opens_without_fetch_or_transcript_read(tmp_path, monkeypatch):
-    # The menu must open instantly: no network fetch, and no transcript read/redact
-    # while building the list (the "takes a few seconds" bug).
+def test_manage_menu_builds_list_without_reading_transcripts(tmp_path, monkeypatch):
+    # The menu syncs the listing first (small manifests — see test_manage_menu_fetches_origin),
+    # but must NEVER read/redact full transcripts to build the list (the "takes a few seconds"
+    # bug). Here there's no remote, so the sync is an instant local no-op.
     backend = _StubBackend()
     runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
     SharedSessionStore(repo).publish(
@@ -2218,13 +2219,9 @@ def test_manage_menu_opens_without_fetch_or_transcript_read(tmp_path, monkeypatc
         manifest={"github_id": "tester", "name": "s1", "session_id": "sid-123", "updated": 1, "transcript_bytes": 5},
     )
 
-    def boom_fetch(*a, **k):
-        raise AssertionError("manage menu must not fetch from the network")
-
     def boom_read(*a, **k):
         raise AssertionError("manage menu must not read/redact transcripts to build the list")
 
-    monkeypatch.setattr(repo, "fetch_ref", boom_fetch)
     backend.export_session_raw = boom_read
     captured = {}
     runner._select_popup = lambda title, options: captured.update(title=title, options=options) or None
@@ -2738,3 +2735,45 @@ def test_unshare_empty_stderr_push_reports_a_timeout_hint(tmp_path):
 
     assert result.pushed is False
     assert "timed out" in result.error  # actionable, not a blank "no output"
+
+
+def test_manage_menu_empty_state_shows_a_visible_message(tmp_path, monkeypatch):
+    # No shared sessions: a clear message must be SHOWN. Returning _MENU_UP re-shows the
+    # sessions menu straight over it ("nothing shows"); _MENU_DONE leaves it on the screen.
+    runner, _repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend())  # nothing shared
+
+    result = runner._manage_shared_sessions_menu()
+
+    assert result == runner._MENU_DONE
+    assert any("No sessions are shared" in m for m in runner.messages)
+
+
+def test_manage_menu_fetches_origin_before_listing(tmp_path, monkeypatch):
+    # The manage menu must sync origin first so it reflects what's actually shared there — not a
+    # stale local/mirror view (where a local-only session masquerades as shared).
+    runner, _repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend())
+    fetched: list = []
+    runner._fetch_shared_with_cancel = lambda store, message: fetched.append(message) or True
+
+    runner._manage_shared_sessions_menu()
+
+    assert fetched and "Fetching shared sessions" in fetched[0]  # a fetch ran before the list
+
+
+def test_manage_menu_lists_a_session_shared_from_another_machine(tmp_path, monkeypatch):
+    # A session shared from another machine lives in the remote MIRROR, not the local ref. Once
+    # the menu fetches, it must show it so the user can manage/unshare it here (the "it's on
+    # origin only and I can't see it" case).
+    from agitrack.sessions.store import REMOTE_MIRROR
+
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend())
+    SharedSessionStore(repo, ref=REMOTE_MIRROR)._add_session(
+        "tester", "from-laptop", "t", _manifest("from-laptop", session_id="laptop-sid", updated=5)
+    )
+    runner._fetch_shared_with_cancel = lambda store, message: True  # mirror already populated
+    captured: dict = {}
+    runner._select_popup = lambda title, options: captured.update(title=title, options=options) or None
+
+    runner._manage_shared_sessions_menu()
+
+    assert captured.get("options") and any("from-laptop" in option for option in captured["options"])
