@@ -2655,7 +2655,7 @@ def test_push_rejection_reason_extracts_the_meaningful_git_line():
     )
     reason = _push_rejection_reason(stderr)
     assert "pre-receive hook declined" in reason  # the WHY, not a blind prefix slice
-    assert _push_rejection_reason("") == "no error output from git"
+    assert "timed out" in _push_rejection_reason("")  # empty ⇒ actionable hint, never a bare "[]"
     assert "stale info" in _push_rejection_reason("x\n ! [rejected] foo (stale info)\nerror: failed")
 
 
@@ -2777,3 +2777,16 @@ def test_manage_menu_lists_a_session_shared_from_another_machine(tmp_path, monke
     runner._manage_shared_sessions_menu()
 
     assert captured.get("options") and any("from-laptop" in option for option in captured["options"])
+
+
+def test_share_session_signals_done_on_share_and_up_on_cancel(tmp_path, monkeypatch):
+    # Per the menu rule: a completed action closes the menu (_MENU_DONE) so its progress shows;
+    # backing out at the consent prompt does nothing and re-shows the list (_MENU_UP).
+    runner, _repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend())
+
+    runner._select_popup = lambda title, options: "No, cancel"
+    assert runner._share_session() == runner._MENU_UP  # declined → back to the list
+
+    answers = iter(["Yes, share it", "No, I'll re-share manually"])
+    runner._select_popup = lambda title, options: next(answers)
+    assert runner._share_session() == runner._MENU_DONE  # shared → close the menu

@@ -227,6 +227,68 @@ def test_menu_key_opens_under_both_keyboard_protocols(protocol):
     assert should_exit is False
 
 
+def test_menu_key_again_closes_the_palette():
+    # Ctrl-G opens the command palette; pressing it again CLOSES it (a toggle), rather than
+    # typing a literal control byte into the command buffer.
+    parser = ProxyInput(menu_key=b"\x07")
+    parser.feed(b"\x07")
+    assert parser.capturing is True
+    forwarded, _echo, command, should_exit = parser.feed(b"\x07")
+    assert parser.capturing is False  # closed
+    assert command is None and should_exit is False
+    assert parser.text() == ""  # the menu key was NOT typed into the buffer
+
+
+def test_after_menu_command_closes_all_when_ctrl_g_requested():
+    # Ctrl-G inside a popup requests a full close: _after_menu_command must drop to the agent
+    # (not reopen the Ctrl-G palette), and consume the request.
+    runner = make_runner()
+    reopened: list = []
+    runner._reopen_command_palette = lambda: reopened.append(True)
+    runner._exit_menu_requested = True
+
+    runner._after_menu_command(runner._MENU_UP)
+    assert reopened == []  # did NOT reopen the palette
+    assert runner._exit_menu_requested is False  # consumed
+
+    runner._after_menu_command(runner._MENU_UP)  # ordinary back-out
+    assert reopened == [True]  # reopens the palette as usual
+
+
+def test_run_modal_menu_key_requests_a_full_close():
+    import types
+
+    from agitrack.proxy.modal import SelectModal
+
+    runner = make_runner()
+    runner.input = types.SimpleNamespace(menu_key=b"\x07")
+    runner._set_message = lambda *a, **k: None
+    runner._clear_message = lambda: None
+    runner._render = lambda: None
+    runner._popup_read_input = lambda: b"\x07"  # Ctrl-G pressed inside the popup
+
+    result = runner._run_modal_inline(SelectModal("pick", ["a", "b"], viewport_rows=10))
+
+    assert result is None  # treated as cancel...
+    assert runner._exit_menu_requested is True  # ...but flags the WHOLE menu to close
+
+
+def test_run_modal_short_circuits_when_close_already_requested():
+    from agitrack.proxy.modal import SelectModal
+
+    runner = make_runner()
+    runner._exit_menu_requested = True
+    runner._clear_message = lambda: None
+    runner._render = lambda: None
+    reads: list = []
+    runner._popup_read_input = lambda: reads.append(True) or b""
+
+    result = runner._run_modal_inline(SelectModal("pick", ["a"], viewport_rows=10))
+
+    assert result is None
+    assert reads == []  # never painted or read input — the close unwinds straight through
+
+
 @pytest.mark.parametrize("protocol", ["kitty", "modifyOtherKeys"])
 def test_ctrl_c_exits_under_both_keyboard_protocols(protocol):
     runner = make_runner()
