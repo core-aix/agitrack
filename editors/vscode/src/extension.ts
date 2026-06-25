@@ -18,12 +18,12 @@
 
 import * as vscode from "vscode";
 import { execFile, spawn } from "child_process";
-import { readdirSync, readFileSync } from "fs";
+import { readdirSync, readFileSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 
 import { GhStatus, hasGithubRemoteUrl, shouldPromptGithubSignIn } from "./github";
-import { dedupe, staticExeCandidates } from "./installPaths";
+import { dedupe, exeName, staticExeCandidates } from "./installPaths";
 import { sessionLooksLive } from "./liveness";
 import { isNativeWindows } from "./platform";
 
@@ -182,10 +182,22 @@ async function signalAndWait(folderPath: string, timeoutMs: number): Promise<voi
   if (!pid) {
     return;
   }
+  // Ask aGiTrack to shut down GRACEFULLY (finalize the in-flight turn, then exit). POSIX
+  // delivers SIGTERM, which its signal handler catches. Native Windows can't deliver a
+  // catchable signal from another process (Node's process.kill there force-terminates), so
+  // write the cross-platform shutdown sentinel the reactor polls; aGiTrack finalizes and
+  // exits on its own. The sentinel is harmless on POSIX too (belt and braces).
   try {
-    process.kill(pid, "SIGTERM"); // aGiTrack's SIGTERM handler finalizes the turn, then exits
+    writeFileSync(join(folderPath, ".agitrack", "shutdown"), "");
   } catch {
-    return; // already gone
+    // best effort — fall back to the signal below / the timeout
+  }
+  if (!isNativeWindows()) {
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      return; // already gone
+    }
   }
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -193,6 +205,15 @@ async function signalAndWait(folderPath: string, timeoutMs: number): Promise<voi
       return; // exited cleanly
     }
     await delay(150);
+  }
+  if (isNativeWindows() && isAlive(pid)) {
+    // Last resort on Windows: nothing acknowledged the sentinel in time, and there's no
+    // graceful signal to fall back on — force-terminate so the lock is freed.
+    try {
+      spawn("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore" }).unref();
+    } catch {
+      // already gone
+    }
   }
 }
 
@@ -323,7 +344,7 @@ async function startSession(targetUri?: vscode.Uri): Promise<void> {
       name: terminals.size === 0 ? TERMINAL_NAME : `${TERMINAL_NAME} (${folder.name})`,
       cwd: folder.uri.fsPath,
       icon: "git-commit",
-      command: `${launchCommand(exe)} && exit`,
+      command: `${launchCommand(exe)}${exitOnSuccess()}`,
     });
     launchedAt.set(terminal, Date.now());
     terminals.set(key, terminal);
@@ -353,13 +374,25 @@ async function sessionStillRunning(terminal: vscode.Terminal, folderPath: string
   });
 }
 
-/** True if the terminal's shell process currently has any child — i.e. aGiTrack (run as
- * `agitrack && exit`) is still executing in it. An idle interactive shell at a prompt
- * (the state after a non-zero exit) has no children. */
+/** True if the terminal's shell process currently has any child — i.e. aGiTrack is still
+ * executing in it. An idle interactive shell at a prompt (the state after a non-zero exit)
+ * has no children. Uses `pgrep` on POSIX and a WMI query on native Windows. */
 async function shellHasChild(terminal: vscode.Terminal): Promise<boolean> {
   const shellPid = await terminal.processId;
   if (!shellPid) {
     return false;
+  }
+  if (isNativeWindows()) {
+    try {
+      const out = await execCapture(
+        "powershell",
+        ["-NoProfile", "-Command", `(Get-CimInstance Win32_Process -Filter "ParentProcessId=${shellPid}" | Measure-Object).Count`],
+        4_000,
+      );
+      return parseInt(out.trim(), 10) > 0;
+    } catch {
+      return false;
+    }
   }
   try {
     if (process.platform === "win32") {
@@ -432,8 +465,22 @@ async function reconcileRestoredTerminal(terminal: vscode.Terminal): Promise<voi
   }
 }
 
-/** Parent PID of `pid`, or undefined if it can't be read (process gone / tool unavailable). */
+/** Parent PID of `pid`, or undefined if it can't be read (process gone / tool unavailable).
+ * `ps` on POSIX; a WMI query on native Windows. */
 async function parentPid(pid: number): Promise<number | undefined> {
+  if (isNativeWindows()) {
+    try {
+      const out = await execCapture(
+        "powershell",
+        ["-NoProfile", "-Command", `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").ParentProcessId`],
+        4_000,
+      );
+      const ppid = parseInt(out.trim(), 10);
+      return Number.isFinite(ppid) ? ppid : undefined;
+    } catch {
+      return undefined;
+    }
+  }
   try {
     if (process.platform === "win32") {
       const out = await execCapture(
@@ -879,14 +926,23 @@ function terminalLocation(): vscode.TerminalOptions["location"] {
   }
 }
 
-/** Quote a shell argument only when it contains characters that need it.
- * On Windows (PowerShell) uses double-quote escaping; on POSIX uses single-quote. */
-function quote(value: string): string {
-  if (process.platform === "win32") {
-    // PowerShell: wrap in double quotes, escape existing double quotes.
-    return /[^\w./:\\-]/.test(value) ? `"${value.replace(/"/g, '`"')}"` : value;
+/** Quote a shell argument only when it contains characters that need it. PowerShell (the
+ * default Windows terminal) and POSIX shells both use single quotes for literals, but escape
+ * an embedded quote differently — PowerShell doubles it (`''`), POSIX uses `'\''`. Paths with
+ * backslashes don't need quoting in PowerShell, so they're left bare unless they also contain
+ * a space or other special character. */
+function quote(value: string, platform: NodeJS.Platform = process.platform): string {
+  if (platform === "win32") {
+    return /[^\w.:\\/-]/.test(value) ? `'${value.replace(/'/g, "''")}'` : value;
   }
   return /[^\w./:-]/.test(value) ? `'${value.replace(/'/g, "'\\''")}'` : value;
+}
+
+/** Suffix that closes the terminal only when aGiTrack exits successfully (status 0). POSIX
+ * shells use `&& exit`; PowerShell (the Windows default) lacks `&&` before v7, so gate on
+ * `$LASTEXITCODE`. */
+function exitOnSuccess(platform: NodeJS.Platform = process.platform): string {
+  return platform === "win32" ? " ; if ($LASTEXITCODE -eq 0) { exit }" : " && exit";
 }
 
 // --- making sure the CLI is installed ------------------------------------------
@@ -972,7 +1028,7 @@ async function installAgitrack(): Promise<string | undefined> {
       const terminal = vscode.window.createTerminal({ name: "Install aGiTrack" });
       ourTerminals.add(terminal);
       terminal.show();
-      terminal.sendText([plan.cmd, ...plan.args].map(quote).join(" "));
+      terminal.sendText([plan.cmd, ...plan.args].map((arg) => quote(arg)).join(" "));
     }
     return undefined;
   }
@@ -1001,27 +1057,28 @@ async function planInstaller(): Promise<InstallPlan | undefined> {
  * the executable (authoritative, PATH-independent), then fall back to the well-known
  * install locations for the host. */
 async function resolveInstalledExe(plan: InstallPlan): Promise<string | undefined> {
-  const exeName = process.platform === "win32" ? "agitrack.exe" : "agitrack";
-  const candidates: string[] = [exeName === "agitrack.exe" ? "agitrack.exe" : "agitrack"];
+  const exe = exeName(process.platform); // agitrack.exe on Windows, agitrack elsewhere
+  // pip console scripts live in <user-base>/Scripts on Windows, <user-base>/bin on POSIX.
+  const scriptsDir = process.platform === "win32" ? "Scripts" : "bin";
+  const candidates: string[] = ["agitrack"];
   if (plan.cmd === "pipx") {
     // pipx knows its own app-bin directory — the most reliable answer.
     try {
       const binDir = (await execCapture("pipx", ["environment", "--value", "PIPX_BIN_DIR"], 5_000)).trim();
       if (binDir) {
-        candidates.push(join(binDir, exeName));
+        candidates.push(join(binDir, exe));
       }
     } catch {
       // fall through to the static candidates
     }
   }
   if (plan.userBaseFrom) {
-    // pip --user puts console scripts in <user-base>/bin on POSIX, or
-    // <user-base>\Scripts on Windows.
+    // pip --user puts console scripts in <user-base>/bin (POSIX, incl. macOS framework
+    // Python's ~/Library/Python/X.Y/bin) or <user-base>/Scripts (Windows).
     try {
       const base = (await execCapture(plan.userBaseFrom, ["-m", "site", "--user-base"], 5_000)).trim();
       if (base) {
-        const scriptsDir = process.platform === "win32" ? join(base, "Scripts") : join(base, "bin");
-        candidates.push(join(scriptsDir, exeName));
+        candidates.push(join(base, scriptsDir, exe));
       }
     } catch {
       // ignore — fall back to the static candidates
@@ -1068,7 +1125,11 @@ function windowsPythonVersionDirs(): string[] {
 }
 
 async function firstPython(): Promise<string | undefined> {
-  for (const py of ["python3", "python"]) {
+  // `py` is the canonical Windows launcher; there `python`/`python3` are usually the
+  // Microsoft Store app-execution stub, which fails `--version` (so `runnable` rejects it).
+  // Try `py` first on Windows; on POSIX keep the existing python3 → python order.
+  const candidates = process.platform === "win32" ? ["py", "python", "python3"] : ["python3", "python"];
+  for (const py of candidates) {
     if (await runnable(py)) {
       return py;
     }

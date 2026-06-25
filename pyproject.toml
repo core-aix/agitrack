@@ -28,7 +28,9 @@ dependencies = [
     "prompt_toolkit>=3.0.52",
     "pyte>=0.8.2",
     "watchdog>=6.0",
-    "pywinpty>=2.0; sys_platform=='win32'",
+    # Native-Windows only (#118): ConPTY bindings used to spawn the backend under a
+    # pseudo-console. POSIX uses the stdlib ``pty`` module, so this is never installed there.
+    "pywinpty>=2.0.13; sys_platform == 'win32'",
 ]
 
 [dependency-groups]

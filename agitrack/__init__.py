@@ -1,4 +1,10 @@
-"""aGiTrack: agent + git tracking."""
+"""aGiTrack: agent + git tracking.
+
+aGiTrack runs on POSIX (Linux/macOS) and natively on Windows (issue #118): the POSIX-only
+mechanics — the pseudo-terminal that drives the agent, the single-writer lock, process
+detach/probe — sit behind a platform layer (``agitrack/proxy/platform/*``, ``agitrack/proc``,
+``agitrack/git/lock``) that selects a Windows implementation (ConPTY/``pywinpty``,
+``msvcrt`` locking, Win32 process APIs) when ``os.name == "nt"``."""
 
 import re
 from importlib.metadata import PackageNotFoundError, version

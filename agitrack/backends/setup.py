@@ -7,34 +7,23 @@ from typing import Callable
 
 from agitrack.backends.proxy_agents import available_backends, make_proxy_agent
 
-# Where to point users when a backend CLI is missing.
-def _claude_hint() -> str:
-    if sys.platform == "win32":
-        return (
-            "Install Claude Code: https://docs.claude.com/en/docs/claude-code\n"
-            "  Windows: npm install -g @anthropic-ai/claude-code\n"
-            "           or: winget install Anthropic.Claude"
-        )
-    return (
-        "Install Claude Code: https://docs.claude.com/en/docs/claude-code\n"
-        "  e.g. curl -fsSL https://claude.ai/install.sh | bash  (or: npm install -g @anthropic-ai/claude-code)"
-    )
-
-
-def _opencode_hint() -> str:
-    if sys.platform == "win32":
-        return (
-            "Install OpenCode: https://opencode.ai\n"
-            "  Windows: npm install -g opencode-ai\n"
-            "           or: scoop install opencode"
-        )
-    return (
-        "Install OpenCode: https://opencode.ai\n"
-        "  e.g. brew install sst/tap/opencode  (or: npm install -g opencode-ai)"
-    )
-
-
-INSTALL_HINTS: dict[str, str] = {}  # populated lazily to pick up sys.platform at call time
+# Per-backend facts used to build a single install hint that covers macOS, Linux, AND
+# Windows — so whatever OS a user is on, they see a command that works. ``unix`` is the
+# native installer for macOS/Linux; ``npm`` is the cross-platform fallback (needs Node.js).
+_BACKEND_INSTALL = {
+    "claude": {
+        "label": "Claude Code",
+        "url": "https://docs.claude.com/en/docs/claude-code",
+        "unix": "curl -fsSL https://claude.ai/install.sh | bash",
+        "npm": "@anthropic-ai/claude-code",
+    },
+    "opencode": {
+        "label": "OpenCode",
+        "url": "https://opencode.ai",
+        "unix": "curl -fsSL https://opencode.ai/install | bash",
+        "npm": "opencode-ai",
+    },
+}
 
 
 class BackendUnavailable(RuntimeError):
@@ -51,11 +40,23 @@ def backend_installed(name: str) -> bool:
 
 
 def install_hint(name: str) -> str:
-    hints = {
-        "claude": _claude_hint(),
-        "opencode": _opencode_hint(),
-    }
-    return hints.get(name, f"Install the '{name}' CLI and make sure it is on your PATH.")
+    """A cross-platform (macOS / Linux / Windows) install hint for a missing backend CLI.
+
+    Each part sits on its own block (a blank line between them) so the options are easy to
+    tell apart when printed to the user."""
+    info = _BACKEND_INSTALL.get(name)
+    if info is None:
+        return f"Install the '{name}' CLI and make sure it is on your PATH."
+    return "\n\n".join(
+        [
+            f"Install {info['label']} ({info['url']}):",
+            f"  macOS / Linux:  {info['unix']}",
+            f"  any OS (with Node.js):  npm install -g {info['npm']}",
+            "  No Node.js? Install it first — macOS: brew install node · "
+            "Linux: your package manager · Windows: winget install OpenJS.NodeJS",
+            "  Then open a NEW terminal so the updated PATH is picked up.",
+        ]
+    )
 
 
 def select_default_backend(
@@ -138,10 +139,10 @@ def ensure_installed_backend(
     while True:
         if backend_installed(name):
             return name
-        output_fn(f"\nThe selected backend '{name}' is not installed.")
+        output_fn(f"\nThe selected backend '{name}' is not installed.\n")
         output_fn(install_hint(name))
         installed = [other for other in names if backend_installed(other)]
-        prompt = "Press Enter after installing to retry"
+        prompt = "\nPress Enter after installing to retry"  # blank line off the hint above
         if installed:
             prompt += f", type a backend to switch to ({', '.join(installed)})"
         prompt += ", or 'q' to quit: "
@@ -163,10 +164,10 @@ def _wait_for_install(
     """Return True once `name` is installed, or False if the user wants to
     choose a different backend."""
     while True:
-        output_fn(f"\n'{name}' is not installed.")
+        output_fn(f"\n'{name}' is not installed.\n")
         output_fn(install_hint(name))
         answer = (
-            input_fn("Press Enter after installing to continue, or type 'b' to choose a different backend: ")
+            input_fn("\nPress Enter after installing to continue, or type 'b' to choose a different backend: ")
             .strip()
             .lower()
         )

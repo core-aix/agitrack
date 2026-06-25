@@ -12,9 +12,10 @@ concurrency:
 
 jobs:
   check:
-    # Three platforms: Linux (glibc), macOS (BSD pty/termios semantics), and native
-    # Windows (ConPTY via pywinpty). POSIX-only tests carry skipif(win32) markers and
-    # are silently skipped on the Windows runner. Lint/format/mypy run on Linux only.
+    # The POSIX OS axis that matters is macOS (BSD pty/termios) vs Linux (glibc). Run both
+    # to catch platform-specific pty/ioctl/terminal differences. Native Windows (ConPTY +
+    # Win32 console, #118) is covered by the dedicated `windows` job below — much of this
+    # suite is POSIX-terminal-specific, so Windows runs a curated, platform-relevant subset.
     strategy:
       fail-fast: false
       matrix:
@@ -60,6 +61,36 @@ jobs:
         run: |
           uv run coverage run -m pytest -q
           uv run coverage report
+
+  # Native-Windows validation (#118): the package imports and runs natively on Windows
+  # (ConPTY via pywinpty, Win32 console, msvcrt locking). Most of the suite is
+  # POSIX-terminal-specific, so this runs a curated, platform-relevant subset plus an
+  # import smoke and a real ConPTY spawn/read check (test_windows_conpty, skipped off
+  # Windows). git ships on the windows-latest runner.
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure git identity
+        run: |
+          git config --global user.email "ci@agitrack.invalid"
+          git config --global user.name "aGiTrack CI"
+
+      - name: Install uv
+        shell: pwsh
+        run: |
+          irm https://astral.sh/uv/install.ps1 | iex
+          "$env:USERPROFILE\.local\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding ascii
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Import smoke (native Windows)
+        run: uv run python -c "import agitrack, agitrack.cli, agitrack.proxy, agitrack.proxy.platform.nt, agitrack.git.lock; print(agitrack.__version__)"
+
+      - name: Windows-relevant tests + ConPTY
+        run: uv run python -m pytest tests/test_proc.py tests/test_dashboard_daemon.py tests/test_shutdown_request.py tests/test_windows_conpty.py -q
 
   # The VSCode extension is TypeScript, built and tested with Node — independent of the
   # Python suite above. Its unit tests (node:test) are platform-independent (the

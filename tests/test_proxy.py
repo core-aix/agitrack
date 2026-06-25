@@ -2136,6 +2136,30 @@ def test_wheel_scrolls_history_and_strips_mouse_when_backend_has_no_mouse():
     assert runner.scroll_back == 3
 
 
+def test_x10_mouse_reports_are_stripped_and_wheel_scrolls():
+    # Terminals that ignore SGR mouse mode (?1006) — some tmux configs, the native Windows
+    # console — send legacy X10 reports (ESC [ M + three offset bytes) even though aGiTrack
+    # asked for SGR. They must be consumed like SGR reports, or their raw coordinate bytes
+    # (column/row 3 is '#') leak into the backend's input as the "mouse cursor hash".
+    runner = _history_runner()
+    wheel_up = b"\x1b[M" + bytes([32 + 64, 32 + 5, 32 + 5])  # button 64 = wheel up
+    assert runner._intercept_scroll(wheel_up) == b""  # consumed, nothing forwarded
+    assert runner.scroll_back == 3
+    wheel_down = b"\x1b[M" + bytes([32 + 65, 32 + 5, 32 + 5])  # button 65 = wheel down
+    runner._intercept_scroll(wheel_down)
+    assert runner.scroll_back == 0
+    # A non-wheel X10 report whose coordinate byte is '#' (column/row 3) is stripped too,
+    # leaving the surrounding real keystrokes intact.
+    leaky = b"\x1b[M" + bytes([32, ord("#"), ord("#")])
+    assert runner._intercept_scroll(b"x" + leaky + b"y") == b"xy"
+
+
+def test_is_real_keypress_ignores_x10_mouse_reports():
+    leaky = b"\x1b[M" + bytes([32, ord("#"), ord("#")])  # an incidental X10 mouse move
+    assert ProxyRunner._is_real_keypress(leaky) is False
+    assert ProxyRunner._is_real_keypress(b"a" + leaky) is True  # a real key alongside it
+
+
 def test_scrolled_view_shows_history_lines():
     runner = _history_runner()
     runner.scroll_back = 9
@@ -2379,6 +2403,18 @@ def test_hold_incomplete_tail_buffers_split_escape_sequence():
     assert runner._hold_incomplete_tail(b"plain text") == (b"plain text", b"")
 
 
+def test_hold_incomplete_tail_buffers_split_x10_mouse():
+    runner = make_runner()
+    # A legacy X10 report (ESC [ M + 3 bytes) split across reads must also be held, not
+    # leaked — its trailing coordinate bytes are ordinary characters.
+    head, tail = runner._hold_incomplete_tail(b"abc\x1b[M")
+    assert head == b"abc"
+    assert tail == b"\x1b[M"
+    head2, tail2 = runner._hold_incomplete_tail(tail + bytes([32, ord("#"), ord("#")]))
+    assert head2 == b"\x1b[M" + bytes([32, ord("#"), ord("#")])
+    assert tail2 == b""
+
+
 def test_pageup_pagedown_scroll_history():
     runner = _history_runner()
     runner._intercept_scroll(b"\x1b[5~")  # PageUp
@@ -2585,6 +2621,62 @@ def test_proxy_refuses_second_instance(monkeypatch, capsys):
     assert runner.run() == 1
     out = capsys.readouterr().out
     assert "already running" in out and "4321" in out  # names the holding process
+
+
+def _run_startup_runner(monkeypatch):
+    import sys
+
+    runner = make_runner()
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
+    runner.management_lock = type(
+        "L", (), {"acquire": lambda self: True, "release": lambda self: None, "owner_pid": lambda self: 0}
+    )()
+    return runner
+
+
+def test_run_asks_privacy_only_after_backend_gate(monkeypatch):
+    # The privacy warning must come AFTER the backend install/availability gate (and the
+    # gh-login / menu-key prompts cli.py runs before this), right before the TUI — so if the
+    # backend isn't available, the user is never asked to acknowledge anything.
+    import agitrack.cli as cli
+
+    runner = _run_startup_runner(monkeypatch)
+    runner._ensure_backend_available = lambda: False  # backend unavailable → stop here
+    asked: list[bool] = []
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: asked.append(True) or True)
+
+    assert runner.run() == 1
+    assert asked == []  # privacy is asked only once the backend is available
+
+
+def test_run_stops_when_privacy_declined(monkeypatch):
+    # Declining the privacy warning stops startup before the backend is spawned.
+    import agitrack.cli as cli
+
+    runner = _run_startup_runner(monkeypatch)
+    runner._ensure_backend_available = lambda: True
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: False)  # user declined
+    spawned: list[bool] = []
+    runner._spawn = lambda: spawned.append(True)
+
+    assert runner.run() == 1
+    assert spawned == []  # never reached the spawn
+
+
+def test_run_forwards_skip_privacy_ack(monkeypatch):
+    # The --skip-privacy-ack flag (set on an in-app menu re-exec) is passed through to the ack.
+    import agitrack.cli as cli
+
+    runner = _run_startup_runner(monkeypatch)
+    runner._ensure_backend_available = lambda: True
+    runner._skip_privacy_ack = True
+    seen: list = []
+    # Return False so run() stops right after the ack (before the heavier startup work).
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: seen.append(k.get("skip")) or False)
+
+    assert runner.run() == 1
+    assert seen == [True]
 
 
 def _mux_runner():

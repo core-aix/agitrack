@@ -675,6 +675,41 @@ def test_restart_agitrack_does_not_duplicate_existing_flag(monkeypatch):
     assert captured[0].count("--skip-privacy-ack") == 1
 
 
+def test_restart_agitrack_windows_relaunches_and_waits(monkeypatch):
+    # Windows has no in-place exec: os.execv there raised "[WinError 6] The handle is invalid"
+    # and orphaned the new TUI. Instead aGiTrack relaunches as a child sharing the console and
+    # waits for it, propagating the exit code. os.execv must NOT be used on Windows.
+    from agitrack.update import restart_agitrack
+    from agitrack.update import updater as updater_mod
+
+    monkeypatch.setattr(updater_mod.os, "name", "nt")
+    monkeypatch.setattr(updater_mod.sys, "argv", ["agitrack", "--backend", "claude"])
+    monkeypatch.setattr(updater_mod.sys, "executable", "py")
+    monkeypatch.setattr(updater_mod.sys.stdout, "flush", lambda: None)
+    monkeypatch.setattr(updater_mod.sys.stderr, "flush", lambda: None)
+    monkeypatch.setattr(updater_mod.signal, "signal", lambda *a, **k: None)
+    monkeypatch.setattr(updater_mod.os, "execv", lambda *a: pytest.fail("os.execv must not run on Windows"))
+    launched: dict = {}
+
+    class _Child:
+        def wait(self):
+            launched["waited"] = True
+            return 7
+
+    def _fake_popen(cmd, *a, **k):
+        launched["cmd"] = cmd
+        return _Child()
+
+    monkeypatch.setattr(updater_mod.subprocess, "Popen", _fake_popen)
+
+    with pytest.raises(SystemExit) as exc:
+        restart_agitrack(["--skip-privacy-ack"])
+
+    assert exc.value.code == 7  # propagates the child's exit code
+    assert launched["cmd"] == ["py", "-m", "agitrack", "--backend", "claude", "--skip-privacy-ack"]
+    assert launched["waited"]
+
+
 def test_restart_agitrack_without_extra_args_preserves_argv(monkeypatch):
     # The startup-update path passes no extra args, so the restart re-shows the
     # privacy warning (no --skip-privacy-ack injected).

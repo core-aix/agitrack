@@ -7,11 +7,13 @@ You can use either **OpenCode** or **Claude (Claude Code)** as the AI agent — 
 
 ## Requirements
 
-aGiTrack runs on **macOS and Linux**. It doesn't run directly on Windows; on Windows, run it inside **WSL** (Windows Subsystem for Linux), which gives you a Linux environment. It works in the common terminal apps (iTerm2, Apple Terminal, Alacritty, kitty, GNOME Terminal, Konsole, tmux, the VS Code terminal, and Windows Terminal running WSL); on a terminal that lacks some advanced features, it still works, just with fewer visual frills.
+aGiTrack runs on **macOS, Linux, and natively on Windows** (PowerShell / Windows Terminal — no WSL required; WSL still works too). It works in the common terminal apps (iTerm2, Apple Terminal, Alacritty, kitty, GNOME Terminal, Konsole, tmux, the VS Code terminal, and Windows Terminal); on a terminal that lacks some advanced features, it still works, just with fewer visual frills. On Windows it drives the agent through a pseudo-console (ConPTY); the sandbox that confines agent writes is macOS/Linux-only, so on Windows the agent runs unconfined (a warning is shown).
 
 You need **git** and at least one AI agent — [Claude Code](https://docs.claude.com/en/docs/claude-code) or [OpenCode](https://opencode.ai) — installed and on your `PATH`. The dashboard can also use the **GitHub CLI (`gh`)** to show each commit's author by their GitHub username: install it from [cli.github.com](https://cli.github.com) and run `gh auth login`. `gh` is optional — without it, the dashboard still works and just groups authors by email instead.
 
 ## Install
+
+aGiTrack is a Python package, so it needs **Python 3.10+** (with `pip`). Most macOS/Linux systems already have it (`python3 --version`); if not — macOS: `brew install python`, Linux: your package manager (e.g. `sudo apt install python3 python3-pip`), Windows: `winget install Python.Python.3.12` (tick *Add to PATH*). Then:
 
 ```bash
 pip install agitrack
@@ -30,6 +32,26 @@ For local development, install from a checkout instead:
 ```bash
 python3 -m pip install -e .
 ```
+
+### Windows (native — no WSL)
+
+`pip install agitrack` works natively on Windows (PowerShell / Windows Terminal). It automatically pulls in **`pywinpty`** (a prebuilt wheel — no C/Rust compiler needed) to drive the agent through a pseudo-console (ConPTY). Notes:
+
+- **Check Python/pip first:** `py -m pip --version`. No Python? `winget install Python.Python.3.12` (tick *Add to PATH*).
+- **`agitrack` not found after install?** Your Python `Scripts` dir isn't on PATH. Run it as `py -m agitrack`, or install with **pipx** (`pipx install agitrack`), which puts it on PATH for you.
+- The write-confinement **sandbox is macOS/Linux-only**, so on Windows the agent runs unconfined (aGiTrack shows a one-time warning).
+
+### Prerequisites — git and a backend (macOS · Linux · Windows)
+
+aGiTrack needs **git** and at least one backend CLI ([Claude Code](https://docs.claude.com/en/docs/claude-code) or [OpenCode](https://opencode.ai)); the GitHub CLI (`gh`) is optional (it lets the dashboard show authors by GitHub username). Install them for your OS:
+
+| | git (required) | a backend (Claude Code **or** OpenCode) | `gh` (optional) |
+|---|---|---|---|
+| **macOS** | `brew install git` | `curl -fsSL https://claude.ai/install.sh \| bash` · or `npm install -g opencode-ai` | `brew install gh` |
+| **Linux** | `sudo apt install git` *(or your package manager)* | `curl -fsSL https://claude.ai/install.sh \| bash` · or `npm install -g opencode-ai` | `sudo apt install gh` |
+| **Windows** | `winget install Git.Git` | `npm install -g @anthropic-ai/claude-code` · or `npm install -g opencode-ai` *(no Node? `winget install OpenJS.NodeJS`)* | `winget install GitHub.cli` |
+
+Run `gh auth login` if you installed `gh`. After installing anything, open a **new terminal** so the updated `PATH` is picked up. aGiTrack also prints these same per-OS install hints at startup when `git`, the selected backend, or `gh` is missing — so you can copy the right command without leaving the prompt.
 
 ### VS Code extension
 

@@ -31,12 +31,15 @@ from __future__ import annotations
 
 import os
 import shutil
+import signal
 import subprocess
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn, cast
+
+from agitrack.proc import detach_kwargs
 
 import agitrack
 
@@ -534,7 +537,7 @@ class Updater:
                 stderr=subprocess.PIPE,
                 check=False,
                 timeout=600,
-                start_new_session=True,
+                **detach_kwargs(),
             )
             if result.returncode == 0:
                 return self._package_upgraded(status)
@@ -558,7 +561,8 @@ class Updater:
                     stderr=subprocess.PIPE,
                     check=False,
                     timeout=600,
-                    start_new_session=True,  # survive a terminal-close SIGHUP mid-upgrade
+                    # survive a terminal-close SIGHUP (POSIX) / detached on Windows mid-upgrade
+                    **detach_kwargs(),
                 )
                 if result.returncode == 0:
                     return self._package_upgraded(status)
@@ -612,9 +616,9 @@ def _version_tuple(version: str) -> tuple:
 
 
 def restart_agitrack(extra_args: Sequence[str] = ()) -> NoReturn:
-    """Re-exec aGiTrack in place so the freshly updated code is loaded.
+    """Re-launch aGiTrack so the freshly updated code is loaded.
 
-    Uses ``python -m agit`` with the original CLI arguments so the entry point
+    Uses ``python -m agitrack`` with the original CLI arguments so the entry point
     survives a package upgrade that may have rewritten the console script. This
     does not return on success.
 
@@ -628,4 +632,20 @@ def restart_agitrack(extra_args: Sequence[str] = ()) -> NoReturn:
     for arg in extra_args:
         if arg not in args:
             args.append(arg)
-    os.execv(sys.executable, [sys.executable, "-m", "agitrack", *args])
+    cmd = [sys.executable, "-m", "agitrack", *args]
+    if os.name == "nt":
+        # Windows has no true in-place exec. os.execv there spawns a new process and exits
+        # this one, which (a) fails with "[WinError 6] The handle is invalid" when the CRT
+        # tries to inherit this process's now-torn-down console/socket handles, and (b) lets
+        # the launching shell return to a prompt while the new TUI is orphaned on the same
+        # console. Instead, launch the updated aGiTrack as a child sharing this console and
+        # wait for it, propagating its exit code — so the launching shell keeps waiting on us
+        # until the new instance finishes. close_fds (the subprocess default on Windows) keeps
+        # the bad handles out of the child. Ignore Ctrl-C here so it reaches the child's TUI.
+        try:
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+        except (ValueError, OSError):
+            pass
+        child = subprocess.Popen(cmd)
+        sys.exit(child.wait())
+    os.execv(sys.executable, cmd)
