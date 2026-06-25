@@ -287,6 +287,17 @@ class SharedSessionStore:
         # back to whatever is local — the best available.
         if self.repo.remote_exists() and not (cancel is not None and cancel.is_set()):
             self.repo.fetch_ref(f"+{remote_ref}:{ref}", timeout=timeout, cancel=cancel)
+            # The listing fetch is partial (``blob:limit=16k``), so a LARGE transcript blob is
+            # omitted — present only as a promised placeholder — and the ref fetch above won't
+            # backfill it (the ref is already at the tip, so nothing transfers). Without this the
+            # read below returns empty and the resume reports "incomplete". Fetch the transcript
+            # blob explicitly by id; if the remote disallows that, fall back to a full refetch.
+            oid = self.repo.resolve_blob_oid(ref, path)
+            if oid and not self.repo.has_object_local(oid) and not (cancel is not None and cancel.is_set()):
+                if not self.repo.fetch_object(oid, timeout=timeout, cancel=cancel) and not (
+                    cancel is not None and cancel.is_set()
+                ):
+                    self.repo.fetch_ref(f"+{remote_ref}:{ref}", refetch=True, timeout=timeout, cancel=cancel)
         return self.repo.read_ref_blob(ref, path)
 
     # --- writing -----------------------------------------------------------
