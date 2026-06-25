@@ -63,6 +63,20 @@ def test_real_pty_child_output_decodes_and_renders(tmp_path):
     assert b"session-x" in rendered  # the status line names the session
 
 
+def test_dcs_sequences_are_not_rendered_as_text(tmp_path):
+    # pyte renders the payload of a Device Control String (ESC P … ST) as visible text. A
+    # backend inside tmux wraps its terminal queries in a tmux passthrough DCS
+    # (ESC P tmux; … ST), and an XTVERSION reply is a plain DCS — both would otherwise leak
+    # onto the screen as stray characters like "tmux;]11;?" (the reported startup bug).
+    runner = _render_runner(tmp_path)
+    passthrough = b"\x1bPtmux;\x1b\x1b]11;?\x07\x1b\\"  # tmux-wrapped OSC 11 background query
+    plain_dcs = b"\x1bP>|tmux 3.4\x1b\\"  # XTVERSION-style reply
+    runner._feed_child_output(b"AA" + passthrough + plain_dcs + b"BB")
+    rendered = runner.screen.display[0]
+    assert "tmux" not in rendered and "]11;?" not in rendered  # nothing from the DCS leaked
+    assert rendered.startswith("AABB")  # the surrounding real text survives intact
+
+
 def test_status_line_reserves_the_bottom_row(tmp_path):
     # The status line is aGiTrack's, drawn on the last row; the backend screen gets
     # rows-1 lines so the two never collide.
