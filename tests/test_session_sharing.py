@@ -1334,11 +1334,7 @@ def test_claude_export_and_import_retargets_cwd(tmp_path, monkeypatch):
     assert claude.import_shared_session(dst, "sid", raw)
     imported = (claude._project_dir(dst) / "sid.jsonl").read_text()
     # Parse JSON to compare the cwd field; raw text has JSON-escaped backslashes on Windows.
-    cwd_in_imported = any(
-        json.loads(line).get("cwd") == str(dst.resolve())
-        for line in imported.splitlines()
-        if line
-    )
+    cwd_in_imported = any(json.loads(line).get("cwd") == str(dst.resolve()) for line in imported.splitlines() if line)
     assert cwd_in_imported and "/Users/alice/old" not in imported
     assert claude.session_belongs_to_repo(dst, "sid")
     # Re-importing must not clobber an existing local transcript.
@@ -1365,11 +1361,7 @@ def test_claude_import_as_id_keeps_both_under_a_new_id(tmp_path, monkeypatch):
     copy = (claude._project_dir(dst) / "newid.jsonl").read_text()
     assert '"sessionId": "newid"' in copy and '"sid"' not in copy
     # Parse JSON to compare the cwd field; raw text has JSON-escaped backslashes on Windows.
-    assert any(
-        json.loads(line).get("cwd") == str(dst.resolve())
-        for line in copy.splitlines()
-        if line
-    )
+    assert any(json.loads(line).get("cwd") == str(dst.resolve()) for line in copy.splitlines() if line)
 
 
 # --- OpenCode transcript export / import ------------------------------------

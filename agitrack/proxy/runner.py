@@ -7513,6 +7513,7 @@ class ProxyRunner:
         """Start a thread that reads raw keystrokes and forwards them through a
         socket pair so the reactor's ``select`` can watch them on Windows."""
         import socket as _socket
+
         r_sock, w_sock = _socket.socketpair()
         self._win_stdin_r = r_sock
         self._win_stdin_w = w_sock
@@ -7520,6 +7521,7 @@ class ProxyRunner:
 
         def _pump() -> None:
             import msvcrt
+
             try:
                 while not self._win_stdin_stop.is_set():
                     if msvcrt.kbhit():

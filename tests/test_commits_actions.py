@@ -16,6 +16,7 @@ from agitrack.commits.actions import AgitrackActions
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _make_actions(*, verbose=False, interactive=True, ui=None, has_staged=False, has_changes=False):
     repo = MagicMock()
     repo.has_staged_changes.return_value = has_staged

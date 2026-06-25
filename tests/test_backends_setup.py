@@ -106,9 +106,7 @@ def test_select_default_summarizer_model_invalid_input_uses_default():
             return_value="claude-haiku-4-5-20251001",
         ),
     ):
-        select_default_summarizer_model(
-            config, "claude", input_fn=lambda _: "not-a-number", output_fn=lambda _: None
-        )
+        select_default_summarizer_model(config, "claude", input_fn=lambda _: "not-a-number", output_fn=lambda _: None)
     assert config.summarization_model == "claude-haiku-4-5-20251001"
 
 
@@ -124,9 +122,7 @@ def test_select_default_summarizer_model_valid_choice_saved():
             return_value="claude-haiku-4-5-20251001",
         ),
     ):
-        select_default_summarizer_model(
-            config, "claude", input_fn=lambda _: "2", output_fn=lambda _: None
-        )
+        select_default_summarizer_model(config, "claude", input_fn=lambda _: "2", output_fn=lambda _: None)
     assert config.summarization_model == "claude-sonnet-4-6"
 
 
@@ -134,9 +130,7 @@ def test_select_default_summarizer_model_no_models_is_noop():
     # When no models come back, the function returns early without touching config.
     config = MagicMock()
     with patch("agitrack.summaries.model_select.list_available_models", return_value=[]):
-        select_default_summarizer_model(
-            config, "claude", input_fn=lambda _: "1", output_fn=lambda _: None
-        )
+        select_default_summarizer_model(config, "claude", input_fn=lambda _: "1", output_fn=lambda _: None)
     config.summarization_model.__set__.assert_not_called() if hasattr(config.summarization_model, "__set__") else None
 
 
@@ -173,7 +167,7 @@ def test_ensure_installed_backend_installed_on_retry():
             "claude",
             config,
             interactive=True,
-            input_fn=lambda _: "",   # user presses Enter (retry)
+            input_fn=lambda _: "",  # user presses Enter (retry)
             output_fn=lambda _: None,
         )
     assert result == "claude"

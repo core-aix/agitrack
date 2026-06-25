@@ -207,6 +207,7 @@ class BackendProcess:
             import fcntl
             import struct
             import termios
+
             winsize = struct.pack("HHHH", rows, cols, 0, 0)
             fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, winsize)
 

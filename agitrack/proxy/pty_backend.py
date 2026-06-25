@@ -17,6 +17,7 @@ Factory
 ``_WindowsPtyHandle``; both expose the same attributes and methods used by
 ``BackendProcess``.
 """
+
 from __future__ import annotations
 
 import os
@@ -127,8 +128,7 @@ if sys.platform == "win32":
             import winpty  # pywinpty >= 2.0
         except ImportError:
             raise RuntimeError(
-                "pywinpty is required to run aGiTrack on Windows.\n"
-                "Install it with:  pip install pywinpty"
+                "pywinpty is required to run aGiTrack on Windows.\nInstall it with:  pip install pywinpty"
             ) from None
 
         env = {**os.environ, **(extra_env or {})}
@@ -200,6 +200,7 @@ else:
             import fcntl
             import struct
             import termios as _termios
+
             winsize = struct.pack("HHHH", rows, cols, 0, 0)
             fcntl.ioctl(self._fd, _termios.TIOCSWINSZ, winsize)
 

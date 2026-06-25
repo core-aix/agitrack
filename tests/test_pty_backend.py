@@ -173,6 +173,7 @@ def test_posix_terminate_graceful_stops_child():
         time.sleep(0.05)
     else:
         import signal as _signal
+
         os.kill(pid, _signal.SIGKILL)
         os.waitpid(pid, 0)
         pytest.fail("terminate_graceful did not stop the child")
