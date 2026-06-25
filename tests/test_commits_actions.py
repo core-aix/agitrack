@@ -7,9 +7,7 @@ interactive untracked-file review (y/s/default).
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, call, patch
-
-import pytest
+from unittest.mock import MagicMock, patch
 
 from agitrack.commits.actions import AgitrackActions
 

@@ -17,9 +17,6 @@ from typing import Any, Callable, cast
 import threading
 import time
 
-if sys.platform != "win32":
-    import termios
-
 import pyte
 
 try:

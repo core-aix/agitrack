@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 from agitrack.env import getenv_compat
 import signal
 import subprocess
@@ -10,9 +9,6 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-
-if sys.platform != "win32":
-    import pty as _pty
 
 from agitrack.backends.base import TokenUsage
 from agitrack.proc import resolve_subprocess_command

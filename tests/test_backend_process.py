@@ -268,8 +268,6 @@ def test_spawn_cmd_child_on_windows():
 @win_only
 def test_spawn_extra_env_reaches_cmd_child(tmp_path):
     """extra_env is visible inside the ConPTY child and not leaked to the parent."""
-    import select
-
     marker = "AGITRACK_WIN_TEST_VAR"
     out_file = str(tmp_path / "env.txt")
     proc = BackendProcess.spawn(

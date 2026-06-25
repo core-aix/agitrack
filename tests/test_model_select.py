@@ -8,8 +8,6 @@ from __future__ import annotations
 import subprocess
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from agitrack.summaries.model_select import (
     _list_claude_models,
     _list_opencode_models,
