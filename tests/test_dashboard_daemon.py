@@ -5,6 +5,8 @@ import sys
 import threading
 import types
 
+import pytest
+
 from agitrack.metrics import daemon
 
 
@@ -13,6 +15,7 @@ def _repo(tmp_path):
     return types.SimpleNamespace(repo=tmp_path)
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows keeps process handles open after wait(); PID appears alive")
 def test_pid_alive_distinguishes_live_and_dead_processes():
     import os
 

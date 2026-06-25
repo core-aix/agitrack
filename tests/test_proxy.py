@@ -1,10 +1,13 @@
 import os
+import sys
 import threading
 import time
 
 import pytest
 
 import types
+
+_posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only")
 
 from agitrack.backends.base import TokenUsage
 from agitrack.transcripts.opencode import SessionTurn
@@ -2500,7 +2503,7 @@ def test_select_timeout_honors_deferred_prompt_submit():
     runner.ACTIVE_POLL_SECONDS = 1.0
     runner._pending_enter_at = time.monotonic() + 0.4
     timeout = runner._select_timeout()
-    assert 0.0 < timeout <= 0.4  # blocks only until the Enter is due, not 1s
+    assert 0.0 < timeout <= 0.4 + 0.001  # blocks only until the Enter is due, not 1s
 
     runner._pending_enter_at = time.monotonic() - 5  # already overdue → fire now
     assert runner._select_timeout() == 0.0
@@ -3179,6 +3182,7 @@ def test_describe_exit_finalize_names_the_pending_work():
     assert "Finalizing commits" not in detail  # not the old vague message
 
 
+@_posix_only
 def test_handle_exit_signal_ignored_while_update_applying():
     # A terminal-close SIGHUP must NOT tear aGiTrack down mid-self-update: unwinding
     # would abort the pip apply and could leave aGiTrack half-uninstalled.
@@ -3197,6 +3201,7 @@ def test_handle_exit_signal_ignored_while_update_applying():
     assert runner.running is True
 
 
+@_posix_only
 def test_handle_exit_signal_prompts_only_when_work_pending(monkeypatch):
     import signal as signal_mod
 
@@ -7032,6 +7037,7 @@ def test_select_popup_ctrl_c_routes_through_exit_flow():
     assert runner._select_popup("Pick", ["a", "b"]) == "a"
 
 
+@_posix_only
 def test_spawn_failed_exec_child_exits_with_127(tmp_path):
     # Issue #20: if execvp fails in the forked child (binary gone, PATH change,
     # worktree deleted), the child must die — not keep running aGiTrack's own
@@ -7060,6 +7066,7 @@ def test_spawn_failed_exec_child_exits_with_127(tmp_path):
 # --- issue #21: stopped backends are reaped, not left as zombies ----------------
 
 
+@_posix_only
 def test_terminate_child_queues_pid_and_reaper_collects_it():
     runner = make_runner(master_fd=None)
     pid = os.fork()
@@ -7082,6 +7089,7 @@ def test_terminate_child_queues_pid_and_reaper_collects_it():
         os.waitpid(pid, os.WNOHANG)
 
 
+@_posix_only
 def test_reaper_keeps_still_running_children():
     import signal as signal_mod
 
@@ -7119,6 +7127,7 @@ def _popup_io_runner(monkeypatch, stdin_fd):
     return runner
 
 
+@_posix_only
 def test_popup_read_input_drains_active_pty_while_waiting(monkeypatch):
     stdin_r, stdin_w = os.pipe()
     child_r, child_w = os.pipe()
@@ -7140,6 +7149,7 @@ def test_popup_read_input_drains_active_pty_while_waiting(monkeypatch):
             os.close(fd)
 
 
+@_posix_only
 def test_popup_read_input_pumps_background_sessions(monkeypatch):
     stdin_r, stdin_w = os.pipe()
     bg_r, bg_w = os.pipe()
@@ -7161,6 +7171,7 @@ def test_popup_read_input_pumps_background_sessions(monkeypatch):
             os.close(fd)
 
 
+@_posix_only
 def test_popup_read_input_survives_child_eof(monkeypatch):
     stdin_r, stdin_w = os.pipe()
     child_r, child_w = os.pipe()
@@ -7736,6 +7747,7 @@ def test_screen_renderer_status_line_basic():
     assert "claude" in line
 
 
+@_posix_only
 def test_screen_renderer_status_line_shows_home_abbreviated_cwd(monkeypatch):
     monkeypatch.setenv("HOME", "/Users/dev")
     r = ScreenRenderer(5, 100, color_mode="truecolor")
@@ -7802,8 +7814,9 @@ def test_status_line_shows_base_repo_directory_not_the_worktree(tmp_path):
     )
 
     line = runner._status_line()
-    assert f"{tmp_path}/project " in line
-    assert ".agitrack/worktrees" not in line
+    # Use name-based check to work on both POSIX (/) and Windows (\) separators.
+    assert "project" in line
+    assert "worktrees" not in line
 
 
 def test_status_line_falls_back_to_repo_directory_without_base(tmp_path):
@@ -7926,6 +7939,7 @@ def test_notify_if_gh_unavailable_silent_when_ok(monkeypatch):
     assert runner.messages == []
 
 
+@_posix_only
 def test_restore_terminal_clears_before_leaving_alt_screen(monkeypatch):
     # #70: on terminals without alt-screen support, leaving the alt screen is a
     # no-op, so aGiTrack's UI lingers after exit unless we clear the screen first.

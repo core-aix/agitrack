@@ -9,10 +9,14 @@ Covers:
 from __future__ import annotations
 
 import os
+import sys
 import types
 
+import pytest
 
 from agitrack.proxy.modal import PromptModal, SelectModal
+
+_posix_only = pytest.mark.skipif(sys.platform == "win32", reason="select.select on pipe fds is POSIX-only")
 from proxy_helpers import make_runner
 
 
@@ -255,6 +259,7 @@ def _modal_runner(monkeypatch, stdin_fd):
     return runner
 
 
+@_posix_only
 def test_popup_read_input_pumps_background_sessions(monkeypatch):
     """While a modal waits, BACKGROUND session PTYs are pumped too.
 
@@ -288,6 +293,7 @@ def test_popup_read_input_pumps_background_sessions(monkeypatch):
                 pass
 
 
+@_posix_only
 def test_run_modal_pty_drain_real_popup_read_input(monkeypatch):
     """PTY is drained via the real _popup_read_input when a modal is open.
 
