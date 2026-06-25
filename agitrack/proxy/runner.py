@@ -444,6 +444,9 @@ class ProxyRunner:
         # True when cli.py already ran the blocking startup gh-availability prompt for
         # this launch, so run() skips its own in-TUI gh notice (avoids double-nagging).
         gh_prechecked: bool = False,
+        # Suppress the privacy acknowledgment (set on an in-app menu re-exec, where the
+        # user already acknowledged it earlier this session) — see _acknowledge_privacy_warning.
+        skip_privacy_ack: bool = False,
         # Optional injected collaborators (default to production construction).
         # These keyword arguments are for testing and advanced use; the CLI call
         # site passes only the first five parameters and is unaffected.
@@ -482,6 +485,7 @@ class ProxyRunner:
         self._backend_command = list(backend_command or [])
         # cli.py already showed the blocking startup gh prompt ⇒ suppress the in-TUI notice.
         self._gh_prechecked = gh_prechecked
+        self._skip_privacy_ack = skip_privacy_ack
         self._force_new_session = new_session  # start a fresh conversation, do not resume
         self.name = "main"  # session label (multiplexer assigns names to others)
         self._primary_worktree_name: str | None = None  # session kept across exits for auto-resume
@@ -917,6 +921,7 @@ class ProxyRunner:
                 "_message_max_scroll": 0,
                 "_message_sticky": False,
                 "_gh_prechecked": False,
+                "_skip_privacy_ack": False,
                 "_session_notices": {},
                 "_notice_shown": False,
                 "_awaited_followups": [],
@@ -1078,6 +1083,16 @@ class ProxyRunner:
             return 1
         if not self.management_lock.acquire():
             print(already_running_message(self.management_lock.owner_pid()))
+            return 1
+        # Privacy warning LAST in the cooked-mode startup — after the backend
+        # install/availability gate above, after the second-instance lock check (a refused
+        # instance is never asked to acknowledge), and after cli.py's gh-login and menu-key
+        # prompts — so it's the final thing the user acknowledges right before the full-screen
+        # TUI takes over, not buried above those configuration steps.
+        from agitrack.cli import _acknowledge_privacy_warning
+
+        if not _acknowledge_privacy_warning(skip=self._skip_privacy_ack):
+            self.management_lock.release()
             return 1
         self.state.save()
         if self.actions.has_pre_agent_user_changes():

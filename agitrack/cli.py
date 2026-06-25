@@ -416,25 +416,26 @@ def main(argv: list[str] | None = None) -> int:
         print("aGiTrack not started.")
         return 1
 
-    # Take the single-writer lock up front — BEFORE the privacy prompt — and hold it
-    # for the whole session. Besides refusing a second instance immediately, this
-    # makes the lock (carrying our PID) present from the very start, so a session
-    # still sitting at this privacy prompt is already "locked". The VSCode extension
-    # reads this lock to tell a starting/running session apart from a dead shell;
-    # holding it from the start is what lets the aG button reliably focus the existing
-    # terminal instead of opening a second one. (It was a read-only probe before, so
-    # no lock was held during startup and the extension couldn't yet see the session.)
+    # Take the single-writer lock up front — BEFORE any interactive startup prompt — and
+    # hold it for the whole session. Besides refusing a second instance immediately, this
+    # makes the lock (carrying our PID) present from the very start, so a session still
+    # sitting at a startup prompt is already "locked". The VSCode extension reads this lock
+    # to tell a starting/running session apart from a dead shell; holding it from the start
+    # is what lets the aG button reliably focus the existing terminal instead of opening a
+    # second one. (It was a read-only probe before, so no lock was held during startup and
+    # the extension couldn't yet see the session.)
     management_lock = RepoLock(repo.repo / ".agitrack" / "lock")
     if not management_lock.acquire():
         print(already_running_message(management_lock.owner_pid()))
         return 1
 
-    if not _acknowledge_privacy_warning(scripted=scripted, skip=args.skip_privacy_ack):
-        management_lock.release()
-        return 1
-
     try:
         if args.mode == "json":
+            # json/scripted mode has no interactive pre-TUI configuration steps, so show the
+            # privacy warning here (it auto-proceeds without a TTY) before the shell starts.
+            if not _acknowledge_privacy_warning(scripted=scripted, skip=args.skip_privacy_ack):
+                management_lock.release()
+                return 1
             management_lock.release()  # json/scripted mode runs via AgitrackShell, which takes its own lock
             AgitrackShell(
                 repo,
@@ -476,6 +477,7 @@ def main(argv: list[str] | None = None) -> int:
                 sandbox=sandbox_enabled,
                 allowed_edit_paths=allowed_edit_paths,
                 gh_prechecked=gh_handled,
+                skip_privacy_ack=args.skip_privacy_ack,
                 _lock=management_lock,
             ).run()
     except (GitError, RuntimeError) as error:

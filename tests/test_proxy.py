@@ -2584,6 +2584,62 @@ def test_proxy_refuses_second_instance(monkeypatch, capsys):
     assert "already running" in out and "4321" in out  # names the holding process
 
 
+def _run_startup_runner(monkeypatch):
+    import sys
+
+    runner = make_runner()
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
+    runner.management_lock = type(
+        "L", (), {"acquire": lambda self: True, "release": lambda self: None, "owner_pid": lambda self: 0}
+    )()
+    return runner
+
+
+def test_run_asks_privacy_only_after_backend_gate(monkeypatch):
+    # The privacy warning must come AFTER the backend install/availability gate (and the
+    # gh-login / menu-key prompts cli.py runs before this), right before the TUI — so if the
+    # backend isn't available, the user is never asked to acknowledge anything.
+    import agitrack.cli as cli
+
+    runner = _run_startup_runner(monkeypatch)
+    runner._ensure_backend_available = lambda: False  # backend unavailable → stop here
+    asked: list[bool] = []
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: asked.append(True) or True)
+
+    assert runner.run() == 1
+    assert asked == []  # privacy is asked only once the backend is available
+
+
+def test_run_stops_when_privacy_declined(monkeypatch):
+    # Declining the privacy warning stops startup before the backend is spawned.
+    import agitrack.cli as cli
+
+    runner = _run_startup_runner(monkeypatch)
+    runner._ensure_backend_available = lambda: True
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: False)  # user declined
+    spawned: list[bool] = []
+    runner._spawn = lambda: spawned.append(True)
+
+    assert runner.run() == 1
+    assert spawned == []  # never reached the spawn
+
+
+def test_run_forwards_skip_privacy_ack(monkeypatch):
+    # The --skip-privacy-ack flag (set on an in-app menu re-exec) is passed through to the ack.
+    import agitrack.cli as cli
+
+    runner = _run_startup_runner(monkeypatch)
+    runner._ensure_backend_available = lambda: True
+    runner._skip_privacy_ack = True
+    seen: list = []
+    # Return False so run() stops right after the ack (before the heavier startup work).
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: seen.append(k.get("skip")) or False)
+
+    assert runner.run() == 1
+    assert seen == [True]
+
+
 def _mux_runner():
     runner = make_runner(
         cols=20,
