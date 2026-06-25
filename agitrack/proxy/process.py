@@ -32,7 +32,7 @@ import sys
 import threading
 import time
 
-from agitrack.proxy.pty_backend import spawn_pty
+from agitrack.proxy.pty_backend import PtyHandle, spawn_pty
 
 if sys.platform != "win32":
     # Only needed for the POSIX cleanup path (os.waitpid with WNOHANG).
@@ -57,7 +57,7 @@ class BackendProcess:
         self.child_pid = child_pid
         self._write_lock = threading.Lock()
         # Pty handle (set by spawn); None for manually-constructed instances.
-        self._handle: object = None
+        self._handle: PtyHandle | None = None
 
     # ------------------------------------------------------------------
     # Spawn
