@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import IO
 
 from agitrack.backends.base import AgentResult, TokenUsage
+from agitrack.proc import resolve_subprocess_command
 
 # The summarizer is a mechanical text-reduction task that gains nothing from reasoning, so
 # its bare run asks OpenCode for the lowest reasoning effort. OpenCode has no env-var/flag
@@ -88,7 +89,7 @@ class OpenCodeBackend:
             command.append(prompt)
 
         process = subprocess.Popen(
-            command,
+            resolve_subprocess_command(command),  # find/launch opencode(.cmd/.exe) on Windows (#118)
             cwd=self.repo,
             text=True,
             stderr=subprocess.STDOUT,

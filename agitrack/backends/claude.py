@@ -6,6 +6,7 @@ import subprocess
 from pathlib import Path
 
 from agitrack.backends.base import AgentResult, TokenUsage
+from agitrack.proc import resolve_subprocess_command
 
 # The summarizer is a mechanical text-reduction task that gains nothing from extended
 # reasoning, so its bare run turns thinking off entirely rather than using whatever the
@@ -117,7 +118,7 @@ class ClaudeBackend:
 
         try:
             process = subprocess.run(
-                command,
+                resolve_subprocess_command(command),  # find/launch claude.cmd on Windows (#118)
                 cwd=self.repo,
                 text=True,
                 stdout=subprocess.PIPE,
