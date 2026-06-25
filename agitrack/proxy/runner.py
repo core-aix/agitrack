@@ -4117,12 +4117,12 @@ class ProxyRunner:
         if result.pruned:
             message += f" Pruned {result.pruned} older shared session(s)."
         if truncated and (result.pushed or not result.remote):
-            # The session was too big for Git's per-file limit, so the oldest middle turns were
-            # dropped at a compaction boundary. The opening and recent turns are shared intact.
+            # The session was too big for Git's per-file limit, so only the most recent turns
+            # were shared. Put the note on its own line (after a blank one) so it stands out.
             message += (
-                " Note: this session was large, so the oldest middle turns were trimmed to fit "
-                "the share size limit — the opening and recent turns are included. Compact the "
-                "conversation if you want a smaller, cleaner shared copy."
+                "\n\nNote: this session was large, so only the most recent turns were shared "
+                "(older ones were trimmed to fit the share size limit). Compact the conversation "
+                "if you want a smaller, cleaner shared copy."
             )
         return message
 
@@ -4403,7 +4403,7 @@ class ProxyRunner:
                 return self._share_outcome_message(result, display, truncated=payload.get("truncated", False))
             note = ""
             if payload.get("truncated"):
-                note = " (older middle turns were trimmed to fit the share size limit)"
+                note = " (only the most recent turns were shared — older ones trimmed to fit the size limit)"
             return f"Overwrote the shared copy of '{display}' on origin with this session.{note}"
 
         self._run_share_op_async(f"share:{display}", f"Overwriting '{display}' — pushing to origin…", op, outcome)
@@ -4618,8 +4618,8 @@ class ProxyRunner:
             self._auto_share_truncation_warned.add(outcome["sid"])
             self._set_session_notice(
                 "auto-share",
-                f"{name} is large, so auto-share is trimming its oldest turns to fit the share size limit "
-                f"(the opening and recent turns are kept). Compact the conversation for a smaller shared copy.",
+                f"{name} is large, so auto-share shares only its most recent turns "
+                f"(older ones are trimmed to fit the share size limit). Compact the conversation for a smaller shared copy.",
                 seconds=12.0,
             )
             self._render()
