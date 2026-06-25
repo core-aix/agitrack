@@ -7,7 +7,9 @@ import pytest
 
 from agitrack.proxy import sandbox
 
-_posix_only = pytest.mark.skipif(sys.platform == "win32", reason="sandbox-exec is macOS-only; select.select on pipes is POSIX-only")
+_posix_only = pytest.mark.skipif(
+    sys.platform == "win32", reason="sandbox-exec is macOS-only; select.select on pipes is POSIX-only"
+)
 
 
 def test_wrap_command_disabled_via_env(monkeypatch):

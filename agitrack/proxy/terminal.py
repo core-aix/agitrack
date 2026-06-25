@@ -72,7 +72,6 @@ if sys.platform == "win32":
         _kernel32.SetConsoleCP(cp)
 
 
-
 class TerminalHostState(Protocol):
     """Structural type for whatever ``TerminalHost``'s methods run against.
 

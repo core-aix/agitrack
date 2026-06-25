@@ -22,6 +22,7 @@ from agitrack.update.updater import (
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _completed(returncode: int, stdout: str = "", stderr: str = ""):
     return subprocess.CompletedProcess([], returncode=returncode, stdout=stdout, stderr=stderr)
 
@@ -134,6 +135,7 @@ def test_has_module_pip_subprocess_error_returns_false():
 
 def test_pip_invocation_uses_current_python_when_pip_available():
     import sys
+
     updater = _make_updater_package()
     with patch.object(updater, "_has_module_pip", return_value=True):
         result = updater._pip_invocation()
