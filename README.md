@@ -13,6 +13,8 @@ You need **git** and at least one AI agent — [Claude Code](https://docs.claude
 
 ## Install
 
+aGiTrack is a Python package, so it needs **Python 3.10+** (with `pip`). Most macOS/Linux systems already have it (`python3 --version`); if not — macOS: `brew install python`, Linux: your package manager (e.g. `sudo apt install python3 python3-pip`), Windows: `winget install Python.Python.3.12` (tick *Add to PATH*). Then:
+
 ```bash
 pip install agitrack
 ```
@@ -49,7 +51,7 @@ aGiTrack needs **git** and at least one backend CLI ([Claude Code](https://docs.
 | **Linux** | `sudo apt install git` *(or your package manager)* | `curl -fsSL https://claude.ai/install.sh \| bash` · or `npm install -g opencode-ai` | `sudo apt install gh` |
 | **Windows** | `winget install Git.Git` | `npm install -g @anthropic-ai/claude-code` · or `npm install -g opencode-ai` *(no Node? `winget install OpenJS.NodeJS`)* | `winget install GitHub.cli` |
 
-Run `gh auth login` if you installed `gh`. After installing anything, open a **new terminal** so the updated `PATH` is picked up. aGiTrack also prints these same per-OS hints at startup if `git` or the selected backend is missing.
+Run `gh auth login` if you installed `gh`. After installing anything, open a **new terminal** so the updated `PATH` is picked up. aGiTrack also prints these same per-OS install hints at startup when `git`, the selected backend, or `gh` is missing — so you can copy the right command without leaving the prompt.
 
 ### VS Code extension
 
