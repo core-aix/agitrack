@@ -135,6 +135,21 @@ def _strip_ansi(text: str) -> str:
     return _ANSI_CSI_OSC_RE.sub("", text).replace("\r", "\n")
 
 
+def _push_rejection_reason(error: str) -> str:
+    """The most informative line of a failed `git push`'s stderr — the part that names WHY
+    the remote rejected it (a stale lease, a protected ref, a declined hook, a permission
+    denial). Git buries the reason among progress lines, so showing the whole blob (or a
+    blind prefix slice) hides it; this surfaces the line that actually explains the failure."""
+    lines = [line.strip() for line in (error or "").splitlines() if line.strip()]
+    if not lines:
+        return "no error output from git"
+    markers = ("rejected", "denied", "declined", "permission", "forbidden", "protected", "stale info")
+    for line in lines:
+        if any(marker in line.lower() for marker in markers):
+            return line[:200]
+    return lines[-1][:200]  # else the last line, which usually carries git's summary
+
+
 # The claude CLI refuses to resume a session that is still held by a running
 # background agent, printing this and exiting (e.g. a stale `bg` agent from an
 # earlier run). Its own remedy is --fork-session, which aGiTrack applies
@@ -4185,10 +4200,11 @@ class ProxyRunner:
             if result.pushed:
                 return f"Unshared {entry.display} (removed from origin)."
             # Removed locally but the origin push was rejected even after the auto-retry — show
-            # the real git error and point the user at re-running unshare from the Ctrl-G menu.
+            # the REASON git gave (not a blind prefix slice) so the user can tell a transient
+            # race from a permission/protected-ref/hook rejection they must fix on the remote.
             return (
                 f"Removed {entry.display} locally, but origin rejected the push — re-run unshare "
-                f"from the menu to retry. [{result.error[:120]}]"
+                f"from the menu to retry. Reason: {_push_rejection_reason(result.error)}"
             )
 
         self._run_share_op_async(

@@ -2592,3 +2592,71 @@ def test_unshare_does_not_retry_on_auth_failure(tmp_path, monkeypatch):
     assert result.pushed is False
     assert attempts["n"] == 1  # failed fast — a broken credential can't spin a retry loop
     assert "Authentication failed" in result.error  # the real reason is surfaced, not hidden
+
+
+def test_unshare_falls_back_to_full_fetch_when_partial_unsupported(tmp_path):
+    # When the remote doesn't support partial (blob-filtered) fetch, the filtered sync fails.
+    # Without a fallback to a full fetch, the unshare's --force-with-lease is built against a
+    # STALE local tip and the push is rejected on every attempt ("rerun shows the same
+    # message"). It must fall back to a full fetch and then push successfully.
+    class _NoPartialFetchRepo:
+        def __init__(self):
+            self.fetches: list = []
+            self.pushed = False
+
+        def remote_exists(self, name="origin"):
+            return True
+
+        def ref_exists(self, ref):
+            return False  # no legacy ref present
+
+        def root_commit(self):
+            return "fp"
+
+        def read_tree_paths(self, ref):
+            return {"fp/alice/drop/transcript.jsonl": "b1", "fp/alice/drop/manifest.json": "b2"}
+
+        def ref_sha(self, ref):
+            return "tip"
+
+        def write_tree_from(self, entries):
+            return "tree"
+
+        def commit_tree_orphan(self, tree, message):
+            return "commit"
+
+        def update_ref(self, ref, sha):
+            pass
+
+        def delete_orphaned_objects(self, old):
+            return 0
+
+        def fetch_ref(self, refspec, *, remote="origin", filter_blobs=None, timeout=None, cancel=None):
+            self.fetches.append(filter_blobs)
+            return filter_blobs is None  # the filtered fetch FAILS; a full fetch succeeds
+
+        def push_ref(self, refspec, *, remote="origin", force_with_lease=None, timeout=None, cancel=None):
+            self.pushed = True
+            return (True, "")
+
+    repo = _NoPartialFetchRepo()
+    result = SharedSessionStore(repo).unshare("alice", "drop")  # type: ignore[arg-type]
+
+    assert repo.fetches == ["blob:limit=16k", None]  # tried filtered, then fell back to a full fetch
+    assert repo.pushed is True  # the removal pushed once the lease matched the synced tip
+    assert result.pushed is True
+
+
+def test_push_rejection_reason_extracts_the_meaningful_git_line():
+    from agitrack.proxy.runner import _push_rejection_reason
+
+    stderr = (
+        "Enumerating objects: 5, done.\n"
+        "To github.com:org/repo.git\n"
+        " ! [remote rejected] refs/agitrack/shared-sessions -> refs/agitrack/shared-sessions (pre-receive hook declined)\n"
+        "error: failed to push some refs to 'github.com:org/repo.git'\n"
+    )
+    reason = _push_rejection_reason(stderr)
+    assert "pre-receive hook declined" in reason  # the WHY, not a blind prefix slice
+    assert _push_rejection_reason("") == "no error output from git"
+    assert "stale info" in _push_rejection_reason("x\n ! [rejected] foo (stale info)\nerror: failed")
