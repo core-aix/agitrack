@@ -2310,3 +2310,227 @@ def test_live_session_for_lineage_matches_by_origin_not_backend_id():
     assert runner._live_session_for_lineage("alice", "feature") == 0
     assert runner._live_session_for_lineage("alice", "other") is None
     assert runner._live_session_for_lineage("carol", "feature") is None  # different owner
+
+
+# --- sharing-workflow fixes: menu exit, auto-share robustness, lineage unshare ---------
+
+
+class _ResultStore:
+    """A shared-session store stub that records publish kwargs and returns a fixed result
+    for publish/unshare — for exercising the auto-share/menu paths without a real remote."""
+
+    def __init__(self, result=None, entries=None):
+        self.result = result
+        self._entries = list(entries or [])
+        self.publish_kwargs: dict | None = None
+
+    def publish(self, **kwargs):
+        self.publish_kwargs = kwargs
+        return self.result
+
+    def unshare(self, github_id, name):
+        return self.result
+
+    def entries(self):
+        return list(self._entries)
+
+
+def _fire_auto_share(runner):
+    runner._auto_share_thread = None
+    runner._maybe_auto_share_active()
+    if runner._auto_share_thread is not None:
+        runner._auto_share_thread.join(timeout=10)
+
+
+def test_auto_share_does_not_cache_hash_on_failed_push(tmp_path, monkeypatch):
+    # The bug: the content hash was cached BEFORE the push, so a silently-failing push left
+    # the content marked "already shared" and it was never retried (shared copy went stale).
+    from agitrack.sessions.store import PublishResult
+
+    runner, _repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend(transcript="turns"))
+    runner.state.set_auto_share("sid-123", True)
+    runner._shared_store = lambda: _ResultStore(PublishResult(remote=True, pushed=False, error="rejected"))
+
+    _fire_auto_share(runner)
+
+    assert "sid-123" not in runner._auto_share_hash  # NOT cached — the next commit will retry
+    assert runner._auto_share_outcome and "failed" in runner._auto_share_outcome  # recorded to surface
+
+
+def test_auto_share_retries_unchanged_content_after_a_failure(tmp_path, monkeypatch):
+    # Concretely: a failed push followed by a fire with the SAME content must push AGAIN
+    # (not skip via the hash gate), and only then cache the hash.
+    from agitrack.sessions.store import PublishResult
+
+    runner, _repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend(transcript="turns"))
+    runner.state.set_auto_share("sid-123", True)
+    results = [
+        PublishResult(remote=True, pushed=False, error="rejected"),
+        PublishResult(remote=True, pushed=True),
+    ]
+    pushes = {"n": 0}
+
+    class _FlakyStore:
+        def entries(self):
+            return []
+
+        def publish(self, **kwargs):
+            pushes["n"] += 1
+            return results.pop(0)
+
+    runner._shared_store = lambda: _FlakyStore()
+
+    _fire_auto_share(runner)  # fails
+    assert "sid-123" not in runner._auto_share_hash
+    _fire_auto_share(runner)  # SAME content retried — must not be skipped
+
+    assert pushes["n"] == 2  # retried the unchanged content rather than treating it as shared
+    assert "sid-123" in runner._auto_share_hash  # cached only after the success
+
+
+def test_auto_share_success_caches_hash_and_stays_silent(tmp_path, monkeypatch):
+    from agitrack.sessions.store import PublishResult
+
+    runner, _repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend(transcript="turns"))
+    runner.state.set_auto_share("sid-123", True)
+    runner._shared_store = lambda: _ResultStore(PublishResult(remote=True, pushed=True))
+
+    _fire_auto_share(runner)
+    runner._service_auto_share_outcome()
+
+    assert "sid-123" in runner._auto_share_hash  # cached on a real success
+    assert not any("failed" in n[0].lower() for n in runner._session_notices.values())  # silent on success
+
+
+def test_auto_share_bounds_the_push_with_a_timeout(tmp_path, monkeypatch):
+    # A stalled push must not strand the worker — that would block EVERY future auto-share for
+    # the run via the in-flight guard, silently freezing the shared copy.
+    from agitrack.sessions.store import PublishResult
+
+    runner, _repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend(transcript="turns"))
+    runner.state.set_auto_share("sid-123", True)
+    store = _ResultStore(PublishResult(remote=True, pushed=True))
+    runner._shared_store = lambda: store
+
+    _fire_auto_share(runner)
+
+    assert store.publish_kwargs is not None
+    assert store.publish_kwargs["timeout"] == runner.SHARE_PUSH_TIMEOUT
+
+
+def test_service_auto_share_outcome_surfaces_a_failure_notice(tmp_path, monkeypatch):
+    runner, _repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend())
+    runner._auto_share_outcome = {"failed": "remote rejected the push", "name": "feature"}
+
+    runner._service_auto_share_outcome()
+
+    assert runner._auto_share_outcome is None  # consumed
+    assert any(
+        "Auto-share" in n[0] and "feature" in n[0] and "failed" in n[0].lower()
+        for n in runner._session_notices.values()
+    )
+
+
+def test_auto_share_behind_does_not_cache_and_surfaces_a_notice(tmp_path, monkeypatch):
+    from agitrack.sessions.store import PublishResult
+
+    runner, _repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend(transcript="turns"))
+    runner.state.set_auto_share("sid-123", True)
+    runner._shared_store = lambda: _ResultStore(PublishResult(remote=True, pushed=False, behind=True))
+
+    _fire_auto_share(runner)
+    assert "sid-123" not in runner._auto_share_hash  # behind ⇒ not marked as shared
+    runner._service_auto_share_outcome()
+
+    assert any("newer turns" in n[0] for n in runner._session_notices.values())
+
+
+def test_manage_one_shared_session_closes_menu_on_unshare(tmp_path, monkeypatch):
+    from agitrack.sessions import SharedEntry
+    from agitrack.sessions.store import PublishResult
+
+    runner, _repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend())
+    runner._shared_store = lambda: _ResultStore(PublishResult(remote=True, pushed=True))
+
+    def _popup(title, options):
+        if title.startswith("Manage"):
+            return options[2]  # ✗ Unshare
+        return "Yes, unshare"  # the confirm
+
+    runner._select_popup = _popup
+    entry = SharedEntry("tester", "s1", {"session_id": "sid-123"})
+
+    assert runner._manage_one_shared_session(entry) == runner._MENU_DONE  # exits so progress shows
+    assert any("Unsharing" in n[0] for n in runner._session_notices.values())  # "unsharing…" notice
+
+
+def test_manage_one_shared_session_stays_when_unshare_cancelled(tmp_path, monkeypatch):
+    from agitrack.sessions import SharedEntry
+
+    runner, _repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend())
+
+    def _popup(title, options):
+        if title.startswith("Manage"):
+            return options[2]  # Unshare
+        return "No, keep it"  # cancel the confirm
+
+    runner._select_popup = _popup
+    entry = SharedEntry("tester", "s1", {"session_id": "sid-123"})
+
+    assert runner._manage_one_shared_session(entry) == runner._MENU_UP  # back to the list
+    assert any("Kept" in m for m in runner.messages)
+
+
+def test_manage_one_shared_session_esc_returns_up(tmp_path, monkeypatch):
+    from agitrack.sessions import SharedEntry
+
+    runner, _repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend())
+    runner._select_popup = lambda title, options: None  # Esc
+    entry = SharedEntry("tester", "s1", {"session_id": "sid-123"})
+
+    assert runner._manage_one_shared_session(entry) == runner._MENU_UP
+
+
+def test_manage_menu_exits_after_unshare_instead_of_relisting(tmp_path, monkeypatch):
+    # The whole shared-sessions menu must close after unsharing — not re-show the list over
+    # the progress notice (the reported "returns to the parent menu" bug).
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend())
+    SharedSessionStore(repo).publish(
+        github_id="tester",
+        name="s1",
+        transcript="t",
+        manifest={"github_id": "tester", "name": "s1", "session_id": "sid-123", "updated": 1, "transcript_bytes": 1},
+    )
+    shown = {"list": 0}
+
+    def _popup(title, options):
+        if title.startswith("Your shared sessions"):
+            shown["list"] += 1
+            return options[0]  # pick the entry
+        if title.startswith("Manage"):
+            return options[2]  # Unshare
+        return "Yes, unshare"
+
+    runner._select_popup = _popup
+
+    assert runner._manage_shared_sessions_menu() == runner._MENU_DONE
+    assert shown["list"] == 1  # the list was shown ONCE — it did not loop back after the action
+
+
+def test_unshare_disables_auto_share_across_the_whole_lineage(tmp_path, monkeypatch):
+    # Unsharing must turn auto-share OFF for the entire id lineage, not just the entry's id —
+    # else a session opted in under a drifted id keeps re-sharing and still shows as shared.
+    from agitrack.sessions import SharedEntry
+    from agitrack.sessions.store import PublishResult
+
+    runner, _repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend())
+    user = runner._user_state()
+    user.set_auto_share("sid-old", True)  # opted in under the original id
+    user.add_shared_session_alias("sid-new", "sid-old")  # backend forked a new id on resume
+    assert runner._session_auto_shared("sid-new") is True  # the lineage sees the opt-in
+
+    runner._shared_store = lambda: _ResultStore(PublishResult(remote=True, pushed=True))
+    runner._unshare_entry(SharedEntry("tester", "s1", {"session_id": "sid-new"}))
+
+    assert runner._session_auto_shared("sid-new") is False  # off across the lineage now
+    assert runner._user_state().auto_share_enabled("sid-old") is False  # fresh read from disk
