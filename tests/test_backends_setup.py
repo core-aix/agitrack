@@ -11,8 +11,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agitrack.backends.setup import (
-    _claude_hint,
-    _opencode_hint,
     _wait_for_install,
     ensure_installed_backend,
     install_hint,
@@ -23,34 +21,29 @@ from agitrack.backends.setup import (
 
 
 # ---------------------------------------------------------------------------
-# Platform-specific install hints
+# install_hint — cross-platform (consolidated in dev merge)
 # ---------------------------------------------------------------------------
 
 
-def test_claude_hint_windows_contains_winget():
-    with patch.object(sys, "platform", "win32"):
-        hint = _claude_hint()
+def test_install_hint_claude_mentions_windows_winget():
+    hint = install_hint("claude")
     assert "winget" in hint
     assert "Windows" in hint
 
 
-def test_claude_hint_posix_contains_curl():
-    with patch.object(sys, "platform", "linux"):
-        hint = _claude_hint()
-    assert "curl" in hint or "npm" in hint
+def test_install_hint_claude_mentions_curl():
+    hint = install_hint("claude")
+    assert "curl" in hint
 
 
-def test_opencode_hint_windows_contains_scoop():
-    with patch.object(sys, "platform", "win32"):
-        hint = _opencode_hint()
-    assert "scoop" in hint
+def test_install_hint_opencode_mentions_npm():
+    hint = install_hint("opencode")
+    assert "npm" in hint
+
+
+def test_install_hint_opencode_mentions_windows():
+    hint = install_hint("opencode")
     assert "Windows" in hint
-
-
-def test_opencode_hint_posix_contains_brew():
-    with patch.object(sys, "platform", "darwin"):
-        hint = _opencode_hint()
-    assert "brew" in hint or "npm" in hint
 
 
 def test_install_hint_unknown_backend():
