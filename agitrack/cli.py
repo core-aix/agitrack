@@ -407,6 +407,10 @@ def main(argv: list[str] | None = None) -> int:
     # otherwise the (repo-overlaid) config value applies. getattr keeps a config written
     # before these keys existed (or a partial stub) working with the defaults.
     getattr(config, "load_repo_overlay", lambda _root: None)(repo.repo)
+    share_config_error = getattr(config, "share_config_error", lambda: None)()
+    if share_config_error:
+        print(f"Configuration error: {share_config_error}")
+        return 1
     use_worktrees = False if args.no_worktree else config.use_worktrees
     commit_guidance = False if args.no_commit_guidance else getattr(config, "commit_guidance", True)
     sandbox_enabled = False if args.no_sandbox else getattr(config, "sandbox", True)

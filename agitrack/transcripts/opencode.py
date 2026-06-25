@@ -12,6 +12,7 @@ from pathlib import Path
 
 from agitrack.backends.base import TokenUsage
 from agitrack.proc import resolve_subprocess_command
+from agitrack.sessions.share_cap import DEFAULT_HEAD_BYTES, select_kept_indices
 from agitrack.transcripts.types import ExportedSession, SessionRef, SessionTurn, turns_after
 
 # Every `opencode` subprocess aGiTrack runs synchronously (often on the main reactor/menu
@@ -310,6 +311,47 @@ def retarget_session_dir(repo: Path, session_id: str, cwd: str) -> bool:
     if not transcript:
         return False
     return import_shared_session(cwd_path, session_id, transcript, overwrite=True)
+
+
+def _is_compaction_message(message: object) -> bool:
+    """An OpenCode compaction message — its assistant summary recaps the prior context, so it
+    is a clean place to resume the conversation from when trimming old turns."""
+    if not isinstance(message, dict):
+        return False
+    info = message.get("info")
+    if not isinstance(info, dict):
+        return False
+    return info.get("summary") is True or info.get("mode") == "compaction"
+
+
+def cap_shared_transcript(transcript: str, max_bytes: int, head_bytes: int = DEFAULT_HEAD_BYTES) -> str:
+    """Bound an OpenCode exported session (a ``{info, messages}`` JSON object) to ``max_bytes``
+    for sharing. Keeps the session ``info`` plus the opening and most-recent messages, dropping
+    the middle and anchoring the kept tail at a compaction message; re-serializes compactly so
+    ``opencode import`` still round-trips it. Returns ``transcript`` unchanged when it already
+    fits or can't be parsed."""
+    if len(transcript.encode("utf-8")) <= max_bytes:
+        return transcript
+    try:
+        data = json.loads(transcript)
+    except json.JSONDecodeError:
+        return transcript
+    messages = data.get("messages")
+    if not isinstance(data, dict) or not isinstance(messages, list) or len(messages) <= 1:
+        return transcript
+
+    def _compact(obj: object) -> str:
+        return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+
+    sizes = [len(_compact(message).encode("utf-8")) for message in messages]
+    compaction = [_is_compaction_message(message) for message in messages]
+    # Budget the messages array only: subtract the envelope ({info, "messages":[]} brackets).
+    envelope = len(_compact({**data, "messages": []}).encode("utf-8"))
+    kept = select_kept_indices(sizes, compaction, max_bytes - envelope, sep_bytes=1, head_bytes=head_bytes)
+    if kept is None:
+        return transcript
+    data["messages"] = [messages[i] for i in kept]
+    return _compact(data)
 
 
 def session_transcript_size(repo: Path, session_id: str) -> int | None:
