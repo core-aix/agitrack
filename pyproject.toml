@@ -40,6 +40,9 @@ dev = [
     "mypy-baseline>=0.7",
     "pre-commit>=4.0",
 ]
+build = [
+    "pyinstaller>=6.0",
+]
 
 [project.scripts]
 agitrack = "agitrack.cli:main"
