@@ -1089,11 +1089,14 @@ def test_privacy_warning_skipped_does_not_print_or_prompt(monkeypatch, capsys):
 
 
 def test_main_stops_when_privacy_warning_declined(monkeypatch):
+    # json/scripted startup acknowledges the privacy warning in cli.main (no pre-TUI config
+    # steps precede it there). The interactive TUI path acks it inside the runner, AFTER the
+    # gh-login / menu-key / backend-install steps — see test_proxy.test_run_*privacy*.
     captured = _stub_launch(monkeypatch)
     _force_tty(monkeypatch, stdin=True)
     monkeypatch.setattr("builtins.input", lambda *a: "q")
 
-    rc = cli.main([])
+    rc = cli.main(["--mode", "json"])
 
     assert rc == 1
-    assert captured == {}  # neither the proxy nor the shell was launched
+    assert captured == {}  # the shell was not launched
