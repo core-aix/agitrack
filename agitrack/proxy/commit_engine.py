@@ -296,13 +296,18 @@ class CommitEngine:
                 leftovers.append(pending_user)
             subject_prompts.extend(leftovers)
 
-            # Leftovers were typed while the (last) turn was running, so they
-            # belong after its prompt and BEFORE its response — appending them
-            # at the end put the trace out of chronological order (issue #8).
+            # Leftovers were typed while the LAST turn was running, so they belong with
+            # that turn's prompt — right after it and BEFORE the turn's agent response(s).
+            # A turn is laid out as [user_prompt, agent_msg, agent_msg, …], so insert the
+            # leftovers immediately after the last user prompt. The previous logic inserted
+            # before the last AGENT message, which — when a turn emitted several agent
+            # messages — dropped the leftovers in between (or after) the agent's replies,
+            # so a message the user sent mid-turn read as if it came after the agent's
+            # final response (issue #8; the agent's answer actually covers all of them).
             insert_at = len(entries)
             for index in range(len(entries) - 1, -1, -1):
-                if entries[index][0] == "agent":
-                    insert_at = index
+                if entries[index][0] == "user":
+                    insert_at = index + 1
                     break
             entries[insert_at:insert_at] = [("user", leftover) for leftover in leftovers]
             for role, content in entries:

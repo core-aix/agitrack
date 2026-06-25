@@ -12,13 +12,56 @@ from agitrack.backends.setup import select_default_backend, select_default_summa
 from agitrack.backends.proxy_agents import available_backends
 from agitrack.git import GitError, GitRepo, RepoLock, already_running_message
 from agitrack.config import GlobalConfig, settings
-from agitrack.proxy import ProxyRunner
 from agitrack.shell import AgitrackShell
+
+try:
+    # The proxy drives the agent through a (Con)PTY. Imported at module level so tests and
+    # the launch path reference ``cli.ProxyRunner`` directly, but tolerant of a platform
+    # where the proxy's platform layer can't load yet — the headless paths (json mode,
+    # dashboard, --version) don't need it, and proxy mode reports it cleanly below.
+    from agitrack.proxy import ProxyRunner
+except ImportError:  # pragma: no cover - only when the proxy platform layer is unavailable
+    ProxyRunner = None  # type: ignore[assignment,misc]
 
 _BACKEND_COMMANDS = {
     "claude": "claude",
     "opencode": "opencode",
 }
+
+
+def _git_install_hint() -> str:
+    """Shown when ``git`` isn't on PATH. aGiTrack manages your commits with git, so it can't
+    run without it — a common state right after the VS Code extension installs the CLI but
+    git itself isn't installed. Covers macOS, Linux, and Windows so any user sees a command
+    that works; each part is its own block (blank line between) for legibility."""
+    return "\n\n".join(
+        [
+            "git is not installed (or not on your PATH). aGiTrack manages your commits with "
+            "git, so it can't run without it. Install it:",
+            "  macOS:    brew install git    (or: xcode-select --install)",
+            "  Linux:    use your package manager, e.g. sudo apt install git / sudo dnf install git",
+            "  Windows:  winget install Git.Git    (or https://git-scm.com/download/win)",
+            "Then open a NEW terminal so the updated PATH is picked up.",
+        ]
+    )
+
+
+def _gh_install_hint() -> str:
+    """Shown when the GitHub CLI (``gh``) isn't installed. gh is OPTIONAL — it gives the
+    dashboard committer identities by GitHub username and powers session sharing — so this is
+    informational. Covers macOS, Linux, and Windows, each part its own block for legibility."""
+    return "\n\n".join(
+        [
+            "GitHub CLI (gh) isn't installed. aGiTrack uses it for the dashboard's committer "
+            "identities and for session sharing; without it those features are limited (the "
+            "dashboard groups authors by email instead). It's optional — you can continue "
+            "without it. To install it:",
+            "  macOS:    brew install gh",
+            "  Linux:    sudo apt install gh    (or your package manager)",
+            "  Windows:  winget install GitHub.cli",
+            "Then run `gh auth login` and restart aGiTrack.",
+        ]
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -209,6 +252,14 @@ def main(argv: list[str] | None = None) -> int:
         print(__version__)
         return 0
 
+    # aGiTrack can't do anything without git (every path below discovers/commits to a repo).
+    # Check once, up front, so a missing git gives a clear, actionable message instead of a
+    # raw FileNotFoundError deep in repo discovery — common right after the VS Code extension
+    # installs the CLI but git isn't on PATH. --version/--help above don't need git.
+    if shutil.which("git") is None:
+        print(_git_install_hint())
+        return 1
+
     if args.dashboard_serve:
         # Internal entry point: the detached dashboard child process. `agitrack -d`
         # (and the TUI's Ctrl-G dashboard) spawn this to run the read-only HTTP server
@@ -385,25 +436,26 @@ def main(argv: list[str] | None = None) -> int:
         print("aGiTrack not started.")
         return 1
 
-    # Take the single-writer lock up front — BEFORE the privacy prompt — and hold it
-    # for the whole session. Besides refusing a second instance immediately, this
-    # makes the lock (carrying our PID) present from the very start, so a session
-    # still sitting at this privacy prompt is already "locked". The VSCode extension
-    # reads this lock to tell a starting/running session apart from a dead shell;
-    # holding it from the start is what lets the aG button reliably focus the existing
-    # terminal instead of opening a second one. (It was a read-only probe before, so
-    # no lock was held during startup and the extension couldn't yet see the session.)
+    # Take the single-writer lock up front — BEFORE any interactive startup prompt — and
+    # hold it for the whole session. Besides refusing a second instance immediately, this
+    # makes the lock (carrying our PID) present from the very start, so a session still
+    # sitting at a startup prompt is already "locked". The VSCode extension reads this lock
+    # to tell a starting/running session apart from a dead shell; holding it from the start
+    # is what lets the aG button reliably focus the existing terminal instead of opening a
+    # second one. (It was a read-only probe before, so no lock was held during startup and
+    # the extension couldn't yet see the session.)
     management_lock = RepoLock(repo.repo / ".agitrack" / "lock")
     if not management_lock.acquire():
         print(already_running_message(management_lock.owner_pid()))
         return 1
 
-    if not _acknowledge_privacy_warning(scripted=scripted, skip=args.skip_privacy_ack):
-        management_lock.release()
-        return 1
-
     try:
         if args.mode == "json":
+            # json/scripted mode has no interactive pre-TUI configuration steps, so show the
+            # privacy warning here (it auto-proceeds without a TTY) before the shell starts.
+            if not _acknowledge_privacy_warning(scripted=scripted, skip=args.skip_privacy_ack):
+                management_lock.release()
+                return 1
             management_lock.release()  # json/scripted mode runs via AgitrackShell, which takes its own lock
             AgitrackShell(
                 repo,
@@ -428,6 +480,9 @@ def main(argv: list[str] | None = None) -> int:
             # let the user test/replace it now — the only chance before the TUI takes over.
             if not _verify_menu_key(config, scripted=scripted):
                 return 1
+            if ProxyRunner is None:  # pragma: no cover - platform without proxy support
+                print("The interactive aGiTrack TUI is not available on this platform yet.")
+                return 1
             return ProxyRunner(
                 repo,
                 verbose=args.verbose,
@@ -442,6 +497,7 @@ def main(argv: list[str] | None = None) -> int:
                 sandbox=sandbox_enabled,
                 allowed_edit_paths=allowed_edit_paths,
                 gh_prechecked=gh_handled,
+                skip_privacy_ack=args.skip_privacy_ack,
                 _lock=management_lock,
             ).run()
     except (GitError, RuntimeError) as error:
@@ -475,7 +531,9 @@ def _resolve_backend_command(
     import shlex
 
     try:
-        tokens = shlex.split(flag_value)
+        # posix=False on Windows so backslashes in paths (e.g. C:\tools\wrapper.exe) are
+        # kept literally rather than treated as shell escapes.
+        tokens = shlex.split(flag_value, posix=(os.name != "nt"))
     except ValueError as error:
         return ([], f"Invalid --backend-command {flag_value!r}: {error}")
     if not tokens:
@@ -702,18 +760,15 @@ def _check_gh_availability(repo: GitRepo, *, scripted: bool = False) -> tuple[bo
     if not commit_url_base(repo):
         return (True, False)  # no GitHub remote — gh isn't needed here yet
     if status == "missing":
-        print(
-            "GitHub CLI (gh) isn't installed. aGiTrack uses it for the dashboard's committer\n"
-            "identities and for session sharing; without it those features are limited.\n"
-            "Install it from https://cli.github.com, then restart aGiTrack."
-        )
-        prompt = "Press Enter to continue without it (q to quit): "
+        print(_gh_install_hint())
+        prompt = "\nPress Enter to continue without it (q to quit): "
     else:  # unauthenticated
         print(
-            "GitHub CLI (gh) isn't signed in. aGiTrack uses it for the dashboard's committer\n"
-            "identities and for session sharing; without it those features are limited."
+            "GitHub CLI (gh) isn't signed in. aGiTrack uses it for the dashboard's committer "
+            "identities and for session sharing; without it those features are limited.\n\n"
+            "Sign in with `gh auth login` (or press 'l' below to run it now)."
         )
-        prompt = "Press Enter to continue, type 'l' to log in now (q to quit): "
+        prompt = "\nPress Enter to continue, type 'l' to log in now (q to quit): "
     # Drain injected input first so a stray newline can't auto-answer this (same reason as
     # the privacy acknowledgment) — the choice must be a deliberate keypress.
     _drain_terminal_input()
@@ -853,8 +908,8 @@ def _read_menu_key_press(expected: bytes, *, shift: bool, timeout: float = 8.0) 
 
     This is the authoritative check the issue asks for: a key intercepted by VS Code (or
     any host) never reaches stdin here, so the test fails exactly when the TUI would."""
-    if sys.platform == "win32":
-        return None  # Windows console doesn't support raw-mode terminal testing
+    if os.name == "nt":  # native Windows has no termios/tty — read the console via msvcrt
+        return _read_menu_key_press_windows(expected, shift=shift, timeout=timeout)
     import select
     import termios
     import time
@@ -899,6 +954,47 @@ def _read_menu_key_press(expected: bytes, *, shift: bool, timeout: float = 8.0) 
             termios.tcsetattr(fd, termios.TCSADRAIN, saved)
         except (termios.error, ValueError, OSError):
             pass
+
+
+def _read_menu_key_press_windows(expected: bytes, *, shift: bool, timeout: float) -> bool | None:
+    """Native-Windows port of :func:`_read_menu_key_press` (#118).
+
+    The Windows console hands control keys (Ctrl-G = ``0x07``) straight through
+    ``msvcrt.getch`` with no echo or line buffering, so a key the host (VS Code) intercepts
+    never arrives here — exactly as it wouldn't reach the TUI. Returns True if *expected*
+    arrives, False on timeout, None on Ctrl-C / no console. The kitty-protocol shifted-key
+    reporting the POSIX path enables isn't available on the Windows console, so a shift-based
+    menu key simply times out here — which is correct, since it wouldn't work in the TUI."""
+    import time
+
+    try:
+        import msvcrt
+    except ImportError:  # pragma: no cover - msvcrt is always present on Windows
+        return None
+    # Bind the console readers once; the ignores cover mypy on POSIX, where it (correctly)
+    # sees no win32 attributes on the ``msvcrt`` stub. The dispatcher only reaches here on
+    # Windows; the tests substitute a fake msvcrt so this stays exercised on the POSIX gate.
+    kbhit = msvcrt.kbhit  # type: ignore[attr-defined]
+    getch = msvcrt.getch  # type: ignore[attr-defined]
+    buffer = bytearray()
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not kbhit():
+            time.sleep(0.02)
+            continue
+        char = getch()
+        if char in (b"\x00", b"\xe0"):
+            # A function/arrow key: a lead byte followed by a scancode. Consume the scancode
+            # so it isn't mis-read as a separate keypress; it's never a valid menu key here.
+            if kbhit():
+                getch()
+            continue
+        buffer += char
+        if b"\x03" in buffer:  # Ctrl-C cancels the test (never a valid menu key)
+            return None
+        if expected in buffer:
+            return True
+    return False
 
 
 def _discover_or_init(path: Path) -> GitRepo | None:

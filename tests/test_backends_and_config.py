@@ -280,6 +280,89 @@ def test_claude_backend_bare_run_strips_tools_memory_and_system_prompt(monkeypat
     assert "--append-system-prompt" not in captured["command"]
 
 
+def test_claude_backend_windows_feeds_prompt_via_stdin_and_flattens_system(monkeypatch, tmp_path):
+    # On Windows the backend runs through cmd.exe (the npm .cmd shim), which TRUNCATES a
+    # command-line argument at its first newline. The multi-line prompt must therefore go via
+    # STDIN, and the multi-line system prompt must be flattened to a single line — otherwise
+    # summarization receives a garbled prompt (the Windows "garbage commit message" bug).
+    import subprocess
+
+    from agitrack.backends import claude as claude_mod
+
+    monkeypatch.setattr(claude_mod, "_IS_WINDOWS", True)
+    captured: dict = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["input"] = kwargs.get("input")
+        return types.SimpleNamespace(
+            stdout=json.dumps({"type": "result", "result": "ok", "session_id": "s"}), stderr="", returncode=0
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    backend = ClaudeBackend(tmp_path)
+    prompt = "Interaction trace:\nline two\nline three\n\nSummary:"
+    backend.run(prompt, model=None, session_id=None, bare=True, system_prompt="BE A\nSUMMARIZER\nNOW")
+
+    cmd = captured["command"]
+    assert prompt not in cmd  # the multi-line prompt is NOT a (truncatable) argument...
+    assert captured["input"] == prompt  # ...it is fed on stdin instead
+    assert "-p" in cmd  # print mode still set (no positional)
+    system = cmd[cmd.index("--system-prompt") + 1]
+    assert "\n" not in system and system == "BE A SUMMARIZER NOW"  # flattened to one line
+
+
+def test_opencode_backend_windows_feeds_prompt_via_stdin(monkeypatch, tmp_path):
+    # Same Windows cmd.exe truncation applies to OpenCode: the multi-line message must go via
+    # STDIN (verified: `opencode run --format json` reads the prompt from stdin), not as a
+    # positional argument that cmd.exe would cut at its first newline.
+    import io
+    import subprocess
+    import time
+
+    from agitrack.backends.opencode import OpenCodeBackend
+    from agitrack.backends import opencode as opencode_mod
+
+    monkeypatch.setattr(opencode_mod, "_IS_WINDOWS", True)
+    captured: dict = {}
+    written: list[str] = []
+
+    class _FakeStdin:
+        def write(self, text):
+            written.append(text)
+
+        def close(self):
+            pass
+
+    class _FakePopen:
+        def __init__(self, command, **kwargs):
+            captured["command"] = command
+            captured["stdin"] = kwargs.get("stdin")
+            self.stdin = _FakeStdin()
+            self.stdout = io.StringIO("")  # no events; the test only checks how the prompt is passed
+
+        def wait(self):
+            return 0
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(subprocess, "Popen", _FakePopen)
+    backend = OpenCodeBackend(tmp_path)
+    prompt = "Interaction trace:\nline two\nline three\n\nSummary:"
+    backend.run(prompt, model=None, session_id=None, bare=True, system_prompt="BE A SUMMARIZER")
+
+    cmd = captured["command"]
+    folded = f"BE A SUMMARIZER\n\n{prompt}"  # bare run folds the instruction into the message
+    assert folded not in cmd  # not a positional argument
+    assert captured["stdin"] is subprocess.PIPE  # stdin pipe was opened
+    for _ in range(100):  # the prompt is written on a daemon thread
+        if written:
+            break
+        time.sleep(0.01)
+    assert "".join(written) == folded
+
+
 def test_claude_backend_bare_run_is_timeout_capped(monkeypatch, tmp_path):
     # A bare (summarizer) call passes a timeout so a hung backend can't block this session's
     # next summary forever; a normal coding run stays uncapped (timeout=None).

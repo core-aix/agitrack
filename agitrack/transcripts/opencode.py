@@ -15,6 +15,7 @@ if sys.platform != "win32":
     import pty as _pty
 
 from agitrack.backends.base import TokenUsage
+from agitrack.proc import resolve_subprocess_command
 from agitrack.transcripts.types import ExportedSession, SessionRef, SessionTurn, turns_after
 
 # Every `opencode` subprocess aGiTrack runs synchronously (often on the main reactor/menu
@@ -57,7 +58,9 @@ def _opencode_session_list(cwd: Path, max_count: int) -> list[dict]:
     _debug(cwd, f"opencode session list starting (max_count={max_count})")
     try:
         process = subprocess.run(
-            ["opencode", "session", "list", "--format", "json", "--max-count", str(max_count)],
+            resolve_subprocess_command(
+                ["opencode", "session", "list", "--format", "json", "--max-count", str(max_count)]
+            ),
             cwd=cwd,
             text=True,
             stdout=subprocess.PIPE,
@@ -399,15 +402,39 @@ def _run_export_pty(repo: Path, session_id: str, *, sanitize: bool = False) -> t
 def _run_opencode_pty(repo: Path, args: list[str]) -> tuple[str, int]:
     """Run ``opencode`` in ``repo`` and return its combined output and exit code.
 
-    On POSIX a pty is used because the CLI writes framed/colour output to a terminal
-    and may hang on a plain pipe. On Windows subprocess.run with PIPE is used instead
-    (pywinpty could emulate a pty, but these are purely programmatic JSON calls that
-    don't need TTY output formatting, and the timeout cap keeps the blocking bounded).
-    """
-    if sys.platform == "win32":
+    The CLI writes framed/colour output to a terminal, so POSIX runs it under a real
+    pty. Native Windows has no ``pty``/``fork``, so it runs the (non-interactive)
+    one-shot subcommand through a normal pipe with the same timeout guard."""
+    if os.name == "nt":
         return _run_opencode_subprocess(repo, args)
+    return _run_opencode_posix_pty(repo, args)
 
-    pid, fd = _pty.fork()
+
+def _run_opencode_subprocess(repo: Path, args: list[str]) -> tuple[str, int]:
+    """Windows fallback for :func:`_run_opencode_pty`: a plain pipe with the same
+    timeout semantics (returns ``124`` on timeout, ``127`` when ``opencode`` is missing —
+    the same "unusable" codes callers already treat as no data)."""
+    try:
+        result = subprocess.run(
+            resolve_subprocess_command(args),  # resolve opencode(.cmd) on Windows (#118)
+            cwd=repo,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=_OPENCODE_CALL_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        out = exc.output or b""
+        text = out.decode(errors="replace") if isinstance(out, (bytes, bytearray)) else str(out)
+        return text, 124
+    except OSError:
+        return "", 127
+    return result.stdout.decode(errors="replace"), result.returncode
+
+
+def _run_opencode_posix_pty(repo: Path, args: list[str]) -> tuple[str, int]:
+    import pty
+
+    pid, fd = pty.fork()
     if pid == 0:
         # Never let the child survive a failed exec — it would keep running
         # aGiTrack's own Python code from the fork point as a duplicate process.
@@ -450,24 +477,6 @@ def _run_opencode_pty(repo: Path, args: list[str]) -> tuple[str, int]:
     if timed_out.is_set():
         exit_code = exit_code or 124  # killed → ensure a non-zero "unusable" code
     return b"".join(chunks).decode(errors="replace"), exit_code
-
-
-def _run_opencode_subprocess(repo: Path, args: list[str]) -> tuple[str, int]:
-    """Windows fallback: run ``opencode`` via subprocess.run with a timeout cap."""
-    try:
-        result = subprocess.run(
-            args,
-            cwd=repo,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            check=False,
-            timeout=_OPENCODE_CALL_TIMEOUT,
-        )
-        return result.stdout.decode(errors="replace"), result.returncode
-    except subprocess.TimeoutExpired:
-        return "", 124
-    except OSError:
-        return "", 127
 
 
 def parse_exported_session(

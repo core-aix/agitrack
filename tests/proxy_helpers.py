@@ -79,10 +79,12 @@ def run_in_pty(argv: list[str]) -> bytes:
     short-lived child that writes and exits before the parent reads (e.g. ``printf``)
     would otherwise race: the child's exit closes the only slave reference and the buffered
     output is dropped, intermittently yielding a blank read in CI. Holding the slave open
-    across ``wait()`` keeps the output buffered; we then drain the master non-blocking."""
+    across ``wait()`` keeps the output buffered; we then drain the master non-blocking. The
+    child's output here is tiny (well under the pty buffer), so waiting first can't
+    deadlock on a full buffer."""
     if sys.platform == "win32":
         raise NotImplementedError("run_in_pty is POSIX-only; use spawn_pty on Windows")
-    import pty
+    import pty  # POSIX-only; imported lazily so this test helper imports on native Windows
     import select
 
     master, slave = pty.openpty()

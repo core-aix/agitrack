@@ -47,6 +47,7 @@ from agitrack.config import AgitrackState
 from agitrack.git import WorktreeInfo, WorktreeManager, _sanitize_name, is_managed_branch
 from agitrack.proxy.commit_engine import CommitEngine
 from agitrack.proxy.integration import IntegrationService, MergeContext, MergePhase
+from agitrack.proxy.platform import make_child_process, make_host_terminal, make_waker
 from agitrack.proxy.process import BackendProcess
 from agitrack.proxy.session import Session
 from agitrack.transcripts import SessionRef
@@ -71,6 +72,17 @@ from agitrack.proxy.modal import PromptModal, SelectModal, _escape_sequence_comp
 
 _SGR_MOUSE_RE = re.compile(rb"\x1b\[<\d+;\d+;\d+[Mm]")
 _SGR_MOUSE_EVENT_RE = re.compile(rb"\x1b\[<(\d+);(\d+);(\d+)([Mm])")
+# Legacy X10/normal mouse reports: ESC [ M then exactly three raw bytes (button, column, row —
+# each the value offset by 32). Terminals that don't honour SGR mouse mode (?1006) — some tmux
+# configs and the native Windows console — send THESE instead of the SGR form even though
+# aGiTrack requested SGR. Their raw coordinate bytes are ordinary characters (column/row 3 is
+# '#'), so if they go unrecognised they leak into the backend's input as stray text — the
+# "mouse cursor hash". Matched and stripped alongside the SGR form. DOTALL: a coordinate byte
+# can be any value, including ones the default '.' would skip.
+_X10_MOUSE_RE = re.compile(rb"\x1b\[M.{3}", re.DOTALL)
+# A trailing, not-yet-complete X10 report (ESC [ M with fewer than three coordinate bytes),
+# held back like the SGR/CSI tail below so its bytes aren't forwarded split across reads.
+_INCOMPLETE_X10_RE = re.compile(rb"\x1b\[M.{0,2}$", re.DOTALL)
 # Terminal focus in/out reports (CSI I / CSI O), emitted on window focus changes
 # when focus reporting is on. Like mouse reports they are not keystrokes.
 _FOCUS_EVENT_RE = re.compile(rb"\x1b\[[IO]")
@@ -446,6 +458,9 @@ class ProxyRunner:
         # True when cli.py already ran the blocking startup gh-availability prompt for
         # this launch, so run() skips its own in-TUI gh notice (avoids double-nagging).
         gh_prechecked: bool = False,
+        # Suppress the privacy acknowledgment (set on an in-app menu re-exec, where the
+        # user already acknowledged it earlier this session) — see _acknowledge_privacy_warning.
+        skip_privacy_ack: bool = False,
         # Optional injected collaborators (default to production construction).
         # These keyword arguments are for testing and advanced use; the CLI call
         # site passes only the first five parameters and is unaffected.
@@ -484,6 +499,7 @@ class ProxyRunner:
         self._backend_command = list(backend_command or [])
         # cli.py already showed the blocking startup gh prompt ⇒ suppress the in-TUI notice.
         self._gh_prechecked = gh_prechecked
+        self._skip_privacy_ack = skip_privacy_ack
         self._force_new_session = new_session  # start a fresh conversation, do not resume
         self.name = "main"  # session label (multiplexer assigns names to others)
         self._primary_worktree_name: str | None = None  # session kept across exits for auto-resume
@@ -784,6 +800,12 @@ class ProxyRunner:
         self._modal_mailbox: queue.Queue = queue.Queue()  # worker → main: dialogs to present
         self._wake_r = -1  # self-pipe read end (added to select) — wakes the reactor on demand
         self._wake_w = -1  # self-pipe write end — the worker writes to wake the main loop
+        # Platform host-I/O (issue #118), created in run(): the host terminal (raw mode +
+        # a select-able stdin source) and the reactor waker. POSIX wraps termios/os.pipe;
+        # Windows uses the Win32 console + socketpairs. None until run() (and in tests).
+        self._host: Any = None
+        self._waker: Any = None
+        self._last_shutdown_check = 0.0  # rate-limit the .agitrack/shutdown sentinel poll
 
     def _apply_timings(self, timings: dict[str, float]) -> None:
         # Override the class-constant timing defaults with the user's configured
@@ -913,6 +935,7 @@ class ProxyRunner:
                 "_message_max_scroll": 0,
                 "_message_sticky": False,
                 "_gh_prechecked": False,
+                "_skip_privacy_ack": False,
                 "_session_notices": {},
                 "_notice_shown": False,
                 "_awaited_followups": [],
@@ -1014,6 +1037,9 @@ class ProxyRunner:
                 "_modal_mailbox": queue.Queue(),
                 "_wake_r": -1,
                 "_wake_w": -1,
+                "_host": None,
+                "_waker": None,
+                "_last_shutdown_check": 0.0,
                 "UPDATE_CHECK_SECONDS": 300.0,
             }
         )
@@ -1072,6 +1098,16 @@ class ProxyRunner:
         if not self.management_lock.acquire():
             print(already_running_message(self.management_lock.owner_pid()))
             return 1
+        # Privacy warning LAST in the cooked-mode startup — after the backend
+        # install/availability gate above, after the second-instance lock check (a refused
+        # instance is never asked to acknowledge), and after cli.py's gh-login and menu-key
+        # prompts — so it's the final thing the user acknowledges right before the full-screen
+        # TUI takes over, not buried above those configuration steps.
+        from agitrack.cli import _acknowledge_privacy_warning
+
+        if not _acknowledge_privacy_warning(skip=self._skip_privacy_ack):
+            self.management_lock.release()
+            return 1
         self.state.save()
         if self.actions.has_pre_agent_user_changes():
             print("User changes detected before the agent starts.")
@@ -1107,21 +1143,12 @@ class ProxyRunner:
         # so it can wake `select` on demand (e.g. to present a dialog) instead of
         # waiting for the next poll tick. Then start the git worker itself.
         self._main_thread_ident = threading.get_ident()
-        # Wake pipe: on POSIX use os.pipe() (directly selectable). On Windows
-        # use a socket pair (sockets ARE selectable by select.select on Windows,
-        # but regular pipe fds are not).
-        if sys.platform == "win32":
-            import socket as _socket
-            _wake_r_sock, _wake_w_sock = _socket.socketpair()
-            _wake_r_sock.setblocking(False)
-            self._wake_r = _wake_r_sock.fileno()
-            self._wake_w = _wake_w_sock.fileno()
-            # Keep socket objects alive so GC doesn't close the underlying fds.
-            self._wake_r_sock = _wake_r_sock
-            self._wake_w_sock = _wake_w_sock
-        else:
-            self._wake_r, self._wake_w = os.pipe()
-            os.set_blocking(self._wake_r, False)
+        # Host I/O via the platform layer (#118): the waker (self-pipe on POSIX, socketpair
+        # on Windows) the git worker uses to break the reactor out of select, and the host
+        # terminal (termios fd 0 on POSIX, Win32 console + a stdin bridge socket on Windows).
+        self._waker = make_waker()
+        self._wake_r = self._waker.wake_fileno()
+        self._host = make_host_terminal(self)
         self._start_git_worker()
         # Register the initial session as the sole (active) entry in the
         # multiplexer. Additional sessions are appended by `_new_session`.
@@ -1140,31 +1167,22 @@ class ProxyRunner:
         # exit-time auto-share has to shell out to `gh` mid-share (that lookup can
         # stall and would otherwise eat into the bounded share budget).
         threading.Thread(target=self._warm_share_login, daemon=True).start()
-        # Save the host terminal's current mode so we can restore it on exit.
-        if sys.platform == "win32":
-            from agitrack.proxy.terminal import _win_get_console_mode, _win_stdin_handle
-            self.old_attrs = _win_get_console_mode(_win_stdin_handle())
-        else:
-            self.old_attrs = termios.tcgetattr(sys.stdin.fileno())
-        # On Windows, stdin is a Windows console handle that select() cannot
-        # watch, so we bridge it through a socket pair via a reader thread.
-        if sys.platform == "win32":
-            self._win_start_stdin_pump()
         try:
             self._enter_host_screen()
-            self._set_raw()
+            self._set_raw()  # POSIX saves old_attrs here; Windows enters console raw mode
             self._detect_host_terminal()
             self._resize_child()
-            self.original_sigwinch = None
-            self.original_signal_handlers = {}
-            if hasattr(signal, "SIGWINCH"):
+            # SIGWINCH/SIGHUP don't exist on native Windows — there the host terminal's
+            # resize watcher feeds _resize_child via consume_resize_pending() in the select
+            # phase, and console-close is handled by the platform console-control handler.
+            if sys.platform != "win32":
                 self.original_sigwinch = signal.getsignal(signal.SIGWINCH)
+                self.original_signal_handlers = {
+                    signal.SIGTERM: signal.getsignal(signal.SIGTERM),
+                    signal.SIGHUP: signal.getsignal(signal.SIGHUP),
+                }
                 signal.signal(signal.SIGWINCH, lambda _signum, _frame: self._resize_child())
-            if hasattr(signal, "SIGTERM"):
-                self.original_signal_handlers[signal.SIGTERM] = signal.getsignal(signal.SIGTERM)
                 signal.signal(signal.SIGTERM, self._handle_exit_signal)
-            if hasattr(signal, "SIGHUP"):
-                self.original_signal_handlers[signal.SIGHUP] = signal.getsignal(signal.SIGHUP)
                 signal.signal(signal.SIGHUP, self._handle_exit_signal)
             self._setup_worktree_confinement_notice()
             exit_code = self._loop()  # the timers phase auto-applies a sandbox-blocked backend update
@@ -1178,12 +1196,12 @@ class ProxyRunner:
             self._stop_dashboard()
             self._cleanup_child()
             self._restore_terminal()
-            for fd in (self._wake_r, self._wake_w):
-                if fd >= 0:
-                    try:
-                        os.close(fd)
-                    except OSError:
-                        pass
+            if self._host is not None:
+                self._host.stop()  # stop the Windows stdin/resize threads; no-op on POSIX
+                self._host = None
+            if self._waker is not None:
+                self._waker.close()
+                self._waker = None
             self._wake_r = self._wake_w = -1
             if sys.platform == "win32":
                 self._win_stop_stdin_pump()
@@ -1192,6 +1210,10 @@ class ProxyRunner:
                     os.close(self.master_fd)
                 except OSError:
                     pass
+                # Nulling routes through the platform child: a no-op extra on POSIX (the fd
+                # is closed above), but on Windows the setter closes the ConPTY bridge socket
+                # (os.close can't close a socket fd there), so it isn't leaked.
+                self.master_fd = None
             self.management_lock.release()
             # The host terminal closed mid-work and the user chose "Reopen" in the
             # forced-exit dialog: launch a fresh window now that the lock is free so
@@ -1225,6 +1247,12 @@ class ProxyRunner:
         return exit_code
 
     def _ensure_backend_available(self) -> bool:
+        # A user-supplied launch command (--backend-command / config backend_command)
+        # replaces the backend's own binary — a wrapper that ultimately execs the agent —
+        # so the default backend CLI need not be installed on PATH. Skip the install gate
+        # in that case (it would otherwise block a perfectly valid wrapped setup).
+        if self._launch_command():
+            return True
         try:
             resolved = ensure_installed_backend(self.state.backend, self.global_config, interactive=True)
         except BackendUnavailable as error:
@@ -1272,11 +1300,12 @@ class ProxyRunner:
         # before the sandbox wrapper so they reach the backend, not sandbox-exec.
         command = command + getattr(self, "_backend_args", [])
         command = self._confine_to_worktree(command)
-        # Fork/exec mechanics delegated to BackendProcess; policy (command
-        # construction, sandbox wrapping) stays here in the runner. The session
-        # owns its BackendProcess; child_pid / master_fd remain readable on the
-        # runner via the Session-delegating compat properties.
-        self.active.process = BackendProcess.spawn(command, str(self.repo.repo), extra_env=self._backend_child_env())
+        # Pseudo-terminal mechanics delegated to the platform child process (POSIX PTY
+        # via BackendProcess, or Windows ConPTY via NtChildProcess); policy (command
+        # construction, sandbox wrapping) stays here in the runner. The session owns its
+        # child process; child_pid / master_fd remain readable on the runner via the
+        # Session-delegating compat properties.
+        self.active.process = make_child_process(command, str(self.repo.repo), extra_env=self._backend_child_env())
         # Re-arm the cwd-drift check for this launch, and remember when it started:
         # only turns recorded at/after this time count, so a stale cwd left in the
         # transcript before this launch can't trigger a false drift warning (#72).
@@ -2761,8 +2790,14 @@ class ProxyRunner:
         if self._integration_paused or self._delay_merge:
             return  # --delay-merge: the user merges on their own confirmation
         try:
-            if self.repo.has_changes() or self.repo.merge_in_progress():
-                return  # in-flight or mid-merge work; leave it for the normal path
+            if self.repo.has_tracked_changes() or self.repo.merge_in_progress():
+                # A real in-flight tracked edit or a mid-merge: leave it for the normal
+                # path. But UNTRACKED leftovers (files the agent created that the user
+                # declined to stage) must NOT block this merge — they're not part of the
+                # turn branch and don't affect the fast-forward, yet has_changes() counts
+                # them, which stranded a ready, summarized commit whenever the next prompt
+                # started before it had merged.
+                return
             branch = self.repo.current_branch()
             if not is_managed_branch(branch):
                 return
@@ -2935,7 +2970,15 @@ class ProxyRunner:
         if fd is None:
             return
         try:
-            BackendProcess(fd).write(b"\r")
+            if self.master_fd == fd:
+                # The common case (the prompt's session is still active): write through its
+                # platform child, which knows how to reach the backend (a raw os.write to a
+                # bridge-socket fd would be wrong on Windows).
+                self.active.process.write(b"\r")
+            else:
+                # A backgrounded session's PTY (POSIX multi-session merge); a transient
+                # POSIX child writes straight to its master fd.
+                BackendProcess(fd).write(b"\r")
         except OSError:
             return  # Enter never reached the backend; the merge gate stays closed
         if self.merge_ctx is not None and self.master_fd == fd:
@@ -4577,7 +4620,7 @@ class ProxyRunner:
                 continue
             for fd in readable:
                 if fd == stdin_fd:
-                    if self._stdin_has_cancel(self._read_stdin_fd(32)):
+                    if self._stdin_has_cancel(self._read_stdin(32)):
                         return "cancel"
                 elif fd == master:
                     output = self._drain_child_output()
@@ -4605,6 +4648,7 @@ class ProxyRunner:
         escape sequences (mouse reports, focus in/out). Lets a 'press any key' notice
         ignore an incidental mouse move while host mouse reporting is on."""
         stripped = _SGR_MOUSE_RE.sub(b"", data)
+        stripped = _X10_MOUSE_RE.sub(b"", stripped)
         stripped = _FOCUS_EVENT_RE.sub(b"", stripped)
         return bool(stripped)
 
@@ -4954,7 +4998,7 @@ class ProxyRunner:
                 return
             for fd in readable:
                 if fd == stdin_fd:
-                    if self._is_real_keypress(self._read_stdin_fd(32)):  # a key (not a mouse move) dismisses
+                    if self._is_real_keypress(self._read_stdin(32)):  # a key (not a mouse move) dismisses
                         return
                 elif fd == master:
                     output = self._drain_child_output()
@@ -5609,16 +5653,14 @@ class ProxyRunner:
                 self._commit_latest_turn_sync()
             self._stop_file_watcher()
             if self.child_pid:
-                try:
-                    os.kill(self.child_pid, signal.SIGINT)
-                except OSError:
-                    pass  # process already gone, or SIGINT unsupported (Windows ConPTY)
+                self.active.process.interrupt()  # SIGINT on POSIX, ConPTY ETX on Windows
                 self._note_pid_for_reaping(self.child_pid)
             if self.master_fd is not None:
                 try:
                     os.close(self.master_fd)
                 except OSError:
                     pass
+                self.master_fd = None  # closes the ConPTY bridge socket on Windows (see run())
             worktree = self.worktree
         finally:
             self.active = saved
@@ -6050,16 +6092,20 @@ class ProxyRunner:
         # Filter out None (unspawned / torn-down session) so select never sees it.
         watch = [fd for fd in [stdin_fd, self.master_fd, *background] if fd is not None]
         if self._wake_r >= 0:
-            watch.append(self._wake_r)  # the git worker's wake pipe (e.g. it queued a dialog)
+            watch.append(self._wake_r)  # the git worker's wake channel (e.g. it queued a dialog)
         readable, _, _ = select.select(watch, [], [], timeout)
         if self._wake_r in readable:
-            try:
-                if sys.platform == "win32":
-                    self._wake_r_sock.recv(4096)
-                else:
-                    os.read(self._wake_r, 4096)  # drain the wake byte(s); presence is the signal
-            except OSError:
-                pass
+            if self._waker is not None:
+                self._waker.drain()  # drain the wake byte(s); presence is the signal
+            else:
+                try:
+                    os.read(self._wake_r, 4096)
+                except OSError:
+                    pass
+        # On Windows a resize is delivered by the host's watcher, not SIGWINCH; pick it up
+        # here (POSIX always returns False — it uses the SIGWINCH handler instead).
+        if self._host is not None and self._host.consume_resize_pending():
+            self._resize_child()
         for fd in readable:
             if fd in background:
                 self._pump_background(background[fd])
@@ -6101,7 +6147,7 @@ class ProxyRunner:
         stdin_fd = self._stdin_fileno()
         if stdin_fd not in readable:
             return None
-        data = self._read_stdin_fd(4096)
+        data = self._read_stdin(4096)
         # Only a real keystroke resets the idle backoff — NOT a mouse wheel / move /
         # click or a focus in/out report. Scrolling history is passive reading: it
         # needs no commits or background polling, so it must not pin aGiTrack in the
@@ -6221,6 +6267,9 @@ class ProxyRunner:
         worker never stalls the reactor — and thus never delays typing)."""
         if not self.running:
             return  # a restart/exit is underway; touch no (possibly-removed) worktree
+        self._check_shutdown_request()
+        if not self.running:
+            return  # an external graceful-shutdown request just fired
         self._flush_pending_render()
         self._flush_pending_enter()
         self._drain_modal_mailbox()  # present any dialog the git worker queued
@@ -6263,13 +6312,12 @@ class ProxyRunner:
         """
         self._reap_stopped_children()  # collect SIGINT'd backends as they exit
         if self.child_pid is not None:
-            done, status = self._waitpid_nowait(self.child_pid)
-            if done:
-                exit_code = os.waitstatus_to_exitcode(status) if hasattr(os, "waitstatus_to_exitcode") else (status if sys.platform == "win32" else 0)
+            # Non-blocking exit check via the platform child (POSIX waitpid / Windows
+            # ConPTY isalive) — os.waitpid/os.WNOHANG don't exist on native Windows.
+            exit_code = self.active.process.poll()
+            if exit_code is not None:
                 sample = self.last_child_output_sample[-512:].decode(errors="replace").replace("\x1b", "\\x1b")
-                self._debug(
-                    f"child exited pid={self.child_pid} status={status} exit_code={exit_code} last_output={sample!r}"
-                )
+                self._debug(f"child exited pid={self.child_pid} exit_code={exit_code} last_output={sample!r}")
                 # Same handling as the master_fd-EOF path: switch away (multi
                 # session) or relaunch+resume (single) so Claude exiting its own
                 # picker on Esc doesn't take aGiTrack down. These two detectors race;
@@ -6433,7 +6481,11 @@ class ProxyRunner:
         # The bounded 0.5 s select-and-read loop inside terminal.py is correct
         # here because no PTY children are running yet and no reactor iteration
         # is live.  Do NOT convert to a modal — there is nothing to drain yet.
-        TerminalHost.detect_host_terminal(self, debug_fn=self._debug if self.debug_proxy else None)
+        debug_fn = self._debug if self.debug_proxy else None
+        if self._host is not None:
+            self._host.detect_host_terminal(debug_fn=debug_fn)
+        else:
+            TerminalHost.detect_host_terminal(self, debug_fn=debug_fn)
         # If the menu key requires shift modifier, enable the kitty keyboard protocol
         # so the terminal sends distinguishable escape sequences.
         if self.global_config.is_shift_modified:
@@ -6561,8 +6613,9 @@ class ProxyRunner:
     def _hold_incomplete_tail(self, data: bytes) -> tuple[bytes, bytes]:
         # If the read ends mid escape-sequence (e.g. a mouse report split across
         # reads), hold the trailing partial so it is completed on the next read
-        # rather than leaking to the backend as stray bytes (the "[<35;..." hex).
-        match = _INCOMPLETE_TAIL_RE.search(data)
+        # rather than leaking to the backend as stray bytes (the "[<35;..." hex, or
+        # a half-delivered legacy "[M" X10 report).
+        match = _INCOMPLETE_TAIL_RE.search(data) or _INCOMPLETE_X10_RE.search(data)
         if match:
             return data[: match.start()], data[match.start() :]
         return data, b""
@@ -6582,6 +6635,15 @@ class ProxyRunner:
             for match in _SGR_MOUSE_EVENT_RE.finditer(data):
                 self._handle_mouse(int(match.group(1)), int(match.group(2)), int(match.group(3)), match.group(4))
             data = _SGR_MOUSE_RE.sub(b"", data)
+        if b"\x1b[M" in data:
+            # Legacy X10 reports (terminals that ignored ?1006). The three bytes are button,
+            # column, row each offset by 32; the offset button matches the SGR button numbers
+            # _handle_mouse expects (wheel = 64/65), so the wheel still scrolls. Strip them so
+            # the raw coordinate bytes don't leak into the backend's input.
+            for match in _X10_MOUSE_RE.finditer(data):
+                report = match.group()
+                self._handle_mouse(report[3] - 32, report[4] - 32, report[5] - 32, b"M")
+            data = _X10_MOUSE_RE.sub(b"", data)
         return data
 
     def _handle_mouse(self, button: int, col: int, row: int, kind: bytes) -> None:
@@ -6783,7 +6845,10 @@ class ProxyRunner:
         os.write(sys.stdout.fileno(), f"\x1b[{self.rows};1H\x1b[7m{line}\x1b[0m".encode())
 
     def _enter_host_screen(self) -> None:
-        TerminalHost.enter_host_screen(self)
+        if self._host is not None:
+            self._host.enter_host_screen()
+        else:
+            TerminalHost.enter_host_screen(self)
 
     def _enable_host_mouse(self) -> None:
         TerminalHost.enable_host_mouse(self)
@@ -7325,7 +7390,7 @@ class ProxyRunner:
                     # the view; the next normal render shows the updated screen.
                     self._feed_child_output(output)
             if stdin_fd in readable:
-                return self._read_stdin_fd(32)
+                return self._read_stdin(32)
 
     def _run_modal(self, modal: "PromptModal | SelectModal") -> "str | None":
         """Run *modal* to completion, keeping all session PTYs draining.
@@ -7415,18 +7480,11 @@ class ProxyRunner:
 
     def _wake_main_loop(self) -> None:
         """Wake the reactor out of ``select`` at once (e.g. a worker queued a dialog
-        or finished work that should repaint). Writes a byte to the self-pipe (POSIX)
-        or the wake socket (Windows) whose read end is in the select set.
-        No-op before the pipe/socket exists (tests)."""
-        if self._wake_w < 0:
+        or finished work that should repaint). Writes a byte to the self-pipe whose
+        read end is in the select set. No-op before the waker exists (tests)."""
+        if self._waker is None:
             return
-        try:
-            if sys.platform == "win32":
-                self._wake_w_sock.send(b"\x00")
-            else:
-                os.write(self._wake_w, b"\x00")
-        except OSError:
-            pass
+        self._waker.wake()
 
     # ------------------------------------------------------------------
     # Windows stdin bridge
@@ -8252,8 +8310,9 @@ class ProxyRunner:
         pids = self._reap_pids
         if not pids:
             return
-        if sys.platform == "win32":
-            # Windows has no zombie processes; once terminated, no reaping needed.
+        if os.name == "nt":
+            # No zombie reaping on Windows: a ConPTY child is fully closed by terminate(),
+            # and os.waitpid/os.WNOHANG don't exist there. Nothing to wait on.
             self._reap_pids = []
             return
         remaining = []
@@ -8362,6 +8421,35 @@ class ProxyRunner:
         # SIGINT to child delegated to the session's BackendProcess (does not
         # close fd -- the run() finally block handles that so it always runs).
         self.active.process.signal_exit()
+
+    def _check_shutdown_request(self) -> None:
+        """Honor an external graceful-shutdown request: a ``<repo>/.agitrack/shutdown`` file.
+
+        This is the cross-platform equivalent of the SIGTERM/SIGHUP a closing terminal
+        sends — used by the VS Code extension on Windows, where a separate process can't
+        deliver a catchable signal (Node's ``process.kill`` hard-kills there). Polled
+        cheaply on a ~1 s interval; on finding the file we remove it, finalize the pending
+        turn (so a just-finished turn is committed, not stranded), and stop the loop."""
+        now = time.monotonic()
+        if now - self._last_shutdown_check < 1.0:
+            return
+        self._last_shutdown_check = now
+        try:
+            path = self.base_repo.repo / ".agitrack" / "shutdown"
+            if not path.exists():
+                return
+        except (OSError, AttributeError, TypeError):
+            return  # no real base repo (e.g. a unit-test runner) ⇒ nothing to honor
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        self._debug("external shutdown request — finalizing and exiting")
+        try:
+            self._finalize_pending_work()
+        except Exception as error:  # never let a slow/failing finalize block the shutdown
+            self._debug(f"shutdown finalize failed: {error!r}")
+        self.running = False
 
     def _handle_exit_signal(self, signum, _frame) -> None:
         # A self-update is mid-flight (pip is uninstalling/reinstalling aGiTrack). Do
@@ -9405,23 +9493,44 @@ class ProxyRunner:
         self._start_agent_parse()
         return False
 
+    # Host-terminal operations route through the platform host object (POSIX termios /
+    # Windows Win32 console) once run() created it; before that (unit tests construct a
+    # runner without run()), they fall back to the POSIX TerminalHost mixin directly.
     def _pause_child_ui(self) -> None:
-        TerminalHost.pause_child_ui(self)
+        if self._host is not None:
+            self._host.pause_child_ui()
+        else:
+            TerminalHost.pause_child_ui(self)
 
     def _resume_child_ui(self) -> None:
-        TerminalHost.resume_child_ui(self, self._render)
+        if self._host is not None:
+            self._host.resume_child_ui(self._render)
+        else:
+            TerminalHost.resume_child_ui(self, self._render)
 
     def _set_raw(self) -> None:
-        TerminalHost.set_raw(self)
+        if self._host is not None:
+            self._host.set_raw()
+        else:
+            TerminalHost.set_raw(self)
 
     def _set_cooked(self) -> None:
-        TerminalHost.set_cooked(self)
+        if self._host is not None:
+            self._host.set_cooked()
+        else:
+            TerminalHost.set_cooked(self)
 
     def _restore_terminal(self) -> None:
-        TerminalHost.restore_terminal(self)
+        if self._host is not None:
+            self._host.restore_terminal()
+        else:
+            TerminalHost.restore_terminal(self)
 
     def _disable_host_terminal_modes(self) -> None:
-        TerminalHost.disable_host_terminal_modes(self)
+        if self._host is not None:
+            self._host.disable_host_terminal_modes()
+        else:
+            TerminalHost.disable_host_terminal_modes(self)
 
     def _resize_child(self) -> None:
         if self.master_fd is None:
@@ -9438,7 +9547,19 @@ class ProxyRunner:
             pass
 
     def _terminal_size(self) -> tuple[int, int]:
+        if self._host is not None:
+            return self._host.terminal_size()
         return TerminalHost.terminal_size(self)
+
+    def _stdin_fileno(self) -> int:
+        """The select-able stdin fd: the real terminal fd on POSIX, the host's
+        console→socket bridge fd on Windows (Windows can't select on a console handle)."""
+        return self._host.stdin_fileno() if self._host is not None else sys.stdin.fileno()
+
+    def _read_stdin(self, length: int) -> bytes:
+        if self._host is not None:
+            return self._host.read_stdin(length)
+        return os.read(sys.stdin.fileno(), length)
 
 
 # ---------------------------------------------------------------------------

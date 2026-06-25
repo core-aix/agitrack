@@ -317,7 +317,8 @@ class GlobalConfig:
             import shlex
 
             try:
-                return shlex.split(raw)
+                # posix=False on Windows keeps backslashes in paths literal (not escapes).
+                return shlex.split(raw, posix=(os.name != "nt"))
             except ValueError:
                 return []  # an unbalanced quote can't lock the user out of launching
         return []

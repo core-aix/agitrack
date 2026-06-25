@@ -174,6 +174,31 @@ def test_integrate_clean_merge_advances_base(tmp_path):
     assert runner.turn == 1
 
 
+def test_pre_prompt_integration_merges_despite_untracked_leftovers(tmp_path):
+    # A committed (and summarized) turn must still merge when the next prompt starts, even if
+    # the worktree holds UNTRACKED leftovers (files the agent created that the user declined
+    # to stage). has_changes() counts those, which used to strand the ready commit until the
+    # new turn finished (problem 1: "not merged if the user starts a new prompt").
+    main = _init_repo(tmp_path)
+    base = main.current_branch()
+    info, work = _make_session(main, "s1", base)
+    _commit(work, "agent.txt", "agent work\n", "<aGiTrack> work")
+    base_head = main.rev_parse(base)
+    (work.repo / "scratch.tmp").write_text("leftover the user declined\n")  # untracked
+    assert work.has_changes()  # status --short sees the untracked file...
+    assert not work.has_tracked_changes()  # ...but there is no tracked edit in flight
+
+    runner = _integration_runner(main, work, base, "s1")
+    runner._integration_paused = False
+    runner._delay_merge = False
+    runner._integrate_committed_turn_before_new_turn()
+
+    # The ready commit merged: base advanced despite the untracked file, which is untouched.
+    assert main.rev_parse(base) != base_head
+    assert (main.repo / "agent.txt").read_text() == "agent work\n"
+    assert (work.repo / "scratch.tmp").exists()
+
+
 def test_integrate_conflict_prompts_then_starts_agent_merge(tmp_path):
     main = _init_repo(tmp_path)  # f.txt == "base\n"
     base = main.current_branch()

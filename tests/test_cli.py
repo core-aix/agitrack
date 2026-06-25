@@ -198,6 +198,42 @@ def test_menu_key_check_test_then_keep(tmp_path, monkeypatch):
     assert tested == ["ctrl-g"]
 
 
+def _fake_msvcrt(monkeypatch, presses):
+    # A stand-in msvcrt for the native-Windows menu-key probe so it's testable on POSIX
+    # (the real path has no termios; #118). getch pops the queued keypresses in order.
+    import sys
+    import types
+
+    queue = list(presses)
+    monkeypatch.setitem(
+        sys.modules, "msvcrt", types.SimpleNamespace(kbhit=lambda: bool(queue), getch=lambda: queue.pop(0))
+    )
+
+
+def test_read_menu_key_press_windows_detects_expected(monkeypatch):
+    # Ctrl-G arriving as 0x07 means the key reached aGiTrack and would open the TUI menu.
+    _fake_msvcrt(monkeypatch, [b"\x07"])
+    assert cli._read_menu_key_press_windows(b"\x07", shift=False, timeout=1.0) is True
+
+
+def test_read_menu_key_press_windows_times_out_when_intercepted(monkeypatch):
+    # The host (VS Code) swallowed the key — nothing ever arrives, so the probe reports False.
+    _fake_msvcrt(monkeypatch, [])
+    assert cli._read_menu_key_press_windows(b"\x07", shift=False, timeout=0.05) is False
+
+
+def test_read_menu_key_press_windows_ctrl_c_cancels(monkeypatch):
+    _fake_msvcrt(monkeypatch, [b"\x03"])  # Ctrl-C
+    assert cli._read_menu_key_press_windows(b"\x07", shift=False, timeout=1.0) is None
+
+
+def test_read_menu_key_press_windows_skips_function_key_scancodes(monkeypatch):
+    # A function/arrow key (lead byte 0xe0 + scancode) is consumed, not matched; a real
+    # Ctrl-G after it still registers.
+    _fake_msvcrt(monkeypatch, [b"\xe0", b"H", b"\x07"])
+    assert cli._read_menu_key_press_windows(b"\x07", shift=False, timeout=1.0) is True
+
+
 def test_menu_key_check_change_persists_new_key(tmp_path, monkeypatch):
     # 'c' to change → enter a non-conflicting key → it's persisted as menu_key.
     _force_tty(monkeypatch, stdin=True)
@@ -1089,11 +1125,14 @@ def test_privacy_warning_skipped_does_not_print_or_prompt(monkeypatch, capsys):
 
 
 def test_main_stops_when_privacy_warning_declined(monkeypatch):
+    # json/scripted startup acknowledges the privacy warning in cli.main (no pre-TUI config
+    # steps precede it there). The interactive TUI path acks it inside the runner, AFTER the
+    # gh-login / menu-key / backend-install steps — see test_proxy.test_run_*privacy*.
     captured = _stub_launch(monkeypatch)
     _force_tty(monkeypatch, stdin=True)
     monkeypatch.setattr("builtins.input", lambda *a: "q")
 
-    rc = cli.main([])
+    rc = cli.main(["--mode", "json"])
 
     assert rc == 1
-    assert captured == {}  # neither the proxy nor the shell was launched
+    assert captured == {}  # the shell was not launched
