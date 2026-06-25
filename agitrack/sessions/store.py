@@ -432,41 +432,61 @@ class SharedSessionStore:
 
         threading.Thread(target=worker, daemon=True, name="agit-shared-fetch-bg").start()
 
-    def unshare(self, github_id: str, name: str) -> PublishResult:
+    def unshare(self, github_id: str, name: str, *, timeout: float | None = None) -> PublishResult:
         """Remove one of the contributor's own shared sessions and push the removal.
-        Sync-then-rewrite-then-push, like :meth:`publish`.
+        Sync-then-rewrite-then-push, like :meth:`publish`. ``timeout`` bounds each network
+        fetch/push so a stalled remote can't hang the (background) unshare thread.
 
         The entry is removed from BOTH the current ref and the legacy
         ``refs/agit/shared-sessions`` — a session shared before the aGiT → aGiTrack
         rename lives only in the legacy ref, so rewriting the current ref alone would
         leave it visible (it would keep surfacing through :meth:`entries`)."""
         gid, nm = slug(github_id), slug(name)
-        base = f"{self._prefix()}{gid}/{nm}/"
         remote = self.repo.remote_exists()
         pushed_any = False
         errors: list[str] = []
         for ref in (self.ref, LEGACY_REF):
             if ref != self.ref and not self.repo.ref_exists(ref):
                 continue
-            if remote:
-                # Filtered sync is enough: rewriting only re-references existing blob
-                # SHAs (already on the remote), so the large transcripts need not be local.
-                self.repo.fetch_ref(f"+{ref}:{ref}", filter_blobs="blob:limit=16k")
-            paths = self.repo.read_tree_paths(ref)
-            if not any(k.startswith(base) for k in paths):
+            ok, err = self._unshare_one_ref(ref, gid, nm, remote, timeout)
+            if ok is None:
                 continue  # this ref doesn't hold the entry
-            old = self.repo.ref_sha(ref)
-            kept = {k: v for k, v in paths.items() if not k.startswith(base)}
-            self._commit(kept, f"agitrack: unshare session {gid}/{nm}", ref=ref)
-            if remote:
-                lease = f"{ref}:{old}" if old else None
-                ok, err = self.repo.push_ref(f"{ref}:{ref}", force_with_lease=lease)
-                pushed_any = pushed_any or ok
-                if not ok and err.strip():
-                    errors.append(err.strip())
+            if remote and not ok and _is_stale_lease(err):
+                # A concurrent push (this session's own auto-share, or another machine) moved
+                # the remote ref between our fetch and our push, so --force-with-lease rejected
+                # it. Re-sync onto the current tip and retry once — exactly what publish() does.
+                # Without this the unshare reliably fails on an active repo and the removal
+                # never lands (the user sees "the push was rejected").
+                ok, err = self._unshare_one_ref(ref, gid, nm, remote, timeout)
+            pushed_any = pushed_any or bool(ok)
+            if not ok and err.strip():
+                errors.append(err.strip())
         if not remote:
             return PublishResult(remote=False, pushed=False)
         return PublishResult(remote=True, pushed=pushed_any, error="; ".join(errors))
+
+    def _unshare_one_ref(
+        self, ref: str, gid: str, nm: str, remote: bool, timeout: float | None = None
+    ) -> tuple[bool | None, str]:
+        """Drop the ``gid/nm`` entry from *ref* and (with a remote) push the removal. Returns
+        ``(None, "")`` when *ref* doesn't hold the entry; otherwise ``(pushed_ok, error)`` — a
+        remote-less repo reports ``(True, "")`` once the local ref is rewritten. Re-fetches the
+        ref each call so the retry above rebuilds the removal onto the moved remote tip."""
+        base = f"{self._prefix()}{gid}/{nm}/"
+        if remote:
+            # Filtered sync is enough: rewriting only re-references existing blob SHAs
+            # (already on the remote), so the large transcripts need not be local.
+            self.repo.fetch_ref(f"+{ref}:{ref}", filter_blobs="blob:limit=16k", timeout=timeout)
+        paths = self.repo.read_tree_paths(ref)
+        if not any(k.startswith(base) for k in paths):
+            return None, ""  # this ref doesn't hold the entry
+        old = self.repo.ref_sha(ref)
+        kept = {k: v for k, v in paths.items() if not k.startswith(base)}
+        self._commit(kept, f"agitrack: unshare session {gid}/{nm}", ref=ref)
+        if not remote:
+            return True, ""  # local-only: the rewrite IS the removal
+        lease = f"{ref}:{old}" if old else None
+        return self.repo.push_ref(f"{ref}:{ref}", force_with_lease=lease, timeout=timeout)
 
     def publish(
         self,
