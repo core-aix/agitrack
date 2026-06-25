@@ -36,6 +36,7 @@ if sys.platform == "win32":
     _ENABLE_WRAP_AT_EOL_OUTPUT = 0x0002
     _ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
     _ENABLE_DISABLE_NEWLINE_AUTO_RETURN = 0x0008
+    _CP_UTF8 = 65001
 
     _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     _STD_INPUT_HANDLE = -10
@@ -54,6 +55,17 @@ if sys.platform == "win32":
 
     def _win_stdout_handle():
         return _kernel32.GetStdHandle(_STD_OUTPUT_HANDLE)
+
+    def _win_set_utf8_codepage() -> int:
+        """Switch the console I/O code pages to UTF-8; return the previous output CP."""
+        prev = _kernel32.GetConsoleOutputCP()
+        _kernel32.SetConsoleOutputCP(_CP_UTF8)
+        _kernel32.SetConsoleCP(_CP_UTF8)
+        return prev
+
+    def _win_restore_codepage(cp: int) -> None:
+        _kernel32.SetConsoleOutputCP(cp)
+        _kernel32.SetConsoleCP(cp)
 
 
 class TerminalHostState(Protocol):
@@ -122,6 +134,8 @@ class TerminalHost:
             mo = _win_get_console_mode(ho)
             mo |= _ENABLE_VIRTUAL_TERMINAL_PROCESSING | _ENABLE_DISABLE_NEWLINE_AUTO_RETURN
             _win_set_console_mode(ho, mo)
+            # Switch to UTF-8 so os.write() byte strings render correctly.
+            self._win_prev_cp = _win_set_utf8_codepage()
         else:
             tty.setraw(sys.stdin.fileno())
 
@@ -129,6 +143,10 @@ class TerminalHost:
         if sys.platform == "win32":
             if self.old_attrs is not None:
                 _win_set_console_mode(_win_stdin_handle(), self.old_attrs)
+            prev_cp = getattr(self, "_win_prev_cp", None)
+            if prev_cp is not None:
+                _win_restore_codepage(prev_cp)
+                self._win_prev_cp = None
         elif self.old_attrs is not None:
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self.old_attrs)
 
