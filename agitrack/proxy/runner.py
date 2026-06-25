@@ -69,6 +69,17 @@ from agitrack.proxy.modal import PromptModal, SelectModal, _escape_sequence_comp
 
 _SGR_MOUSE_RE = re.compile(rb"\x1b\[<\d+;\d+;\d+[Mm]")
 _SGR_MOUSE_EVENT_RE = re.compile(rb"\x1b\[<(\d+);(\d+);(\d+)([Mm])")
+# Legacy X10/normal mouse reports: ESC [ M then exactly three raw bytes (button, column, row —
+# each the value offset by 32). Terminals that don't honour SGR mouse mode (?1006) — some tmux
+# configs and the native Windows console — send THESE instead of the SGR form even though
+# aGiTrack requested SGR. Their raw coordinate bytes are ordinary characters (column/row 3 is
+# '#'), so if they go unrecognised they leak into the backend's input as stray text — the
+# "mouse cursor hash". Matched and stripped alongside the SGR form. DOTALL: a coordinate byte
+# can be any value, including ones the default '.' would skip.
+_X10_MOUSE_RE = re.compile(rb"\x1b\[M.{3}", re.DOTALL)
+# A trailing, not-yet-complete X10 report (ESC [ M with fewer than three coordinate bytes),
+# held back like the SGR/CSI tail below so its bytes aren't forwarded split across reads.
+_INCOMPLETE_X10_RE = re.compile(rb"\x1b\[M.{0,2}$", re.DOTALL)
 # Terminal focus in/out reports (CSI I / CSI O), emitted on window focus changes
 # when focus reporting is on. Like mouse reports they are not keystrokes.
 _FOCUS_EVENT_RE = re.compile(rb"\x1b\[[IO]")
@@ -4632,6 +4643,7 @@ class ProxyRunner:
         escape sequences (mouse reports, focus in/out). Lets a 'press any key' notice
         ignore an incidental mouse move while host mouse reporting is on."""
         stripped = _SGR_MOUSE_RE.sub(b"", data)
+        stripped = _X10_MOUSE_RE.sub(b"", stripped)
         stripped = _FOCUS_EVENT_RE.sub(b"", stripped)
         return bool(stripped)
 
@@ -6590,8 +6602,9 @@ class ProxyRunner:
     def _hold_incomplete_tail(self, data: bytes) -> tuple[bytes, bytes]:
         # If the read ends mid escape-sequence (e.g. a mouse report split across
         # reads), hold the trailing partial so it is completed on the next read
-        # rather than leaking to the backend as stray bytes (the "[<35;..." hex).
-        match = _INCOMPLETE_TAIL_RE.search(data)
+        # rather than leaking to the backend as stray bytes (the "[<35;..." hex, or
+        # a half-delivered legacy "[M" X10 report).
+        match = _INCOMPLETE_TAIL_RE.search(data) or _INCOMPLETE_X10_RE.search(data)
         if match:
             return data[: match.start()], data[match.start() :]
         return data, b""
@@ -6611,6 +6624,15 @@ class ProxyRunner:
             for match in _SGR_MOUSE_EVENT_RE.finditer(data):
                 self._handle_mouse(int(match.group(1)), int(match.group(2)), int(match.group(3)), match.group(4))
             data = _SGR_MOUSE_RE.sub(b"", data)
+        if b"\x1b[M" in data:
+            # Legacy X10 reports (terminals that ignored ?1006). The three bytes are button,
+            # column, row each offset by 32; the offset button matches the SGR button numbers
+            # _handle_mouse expects (wheel = 64/65), so the wheel still scrolls. Strip them so
+            # the raw coordinate bytes don't leak into the backend's input.
+            for match in _X10_MOUSE_RE.finditer(data):
+                report = match.group()
+                self._handle_mouse(report[3] - 32, report[4] - 32, report[5] - 32, b"M")
+            data = _X10_MOUSE_RE.sub(b"", data)
         return data
 
     def _handle_mouse(self, button: int, col: int, row: int, kind: bytes) -> None:
