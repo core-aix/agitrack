@@ -239,61 +239,81 @@ def test_select_kept_indices_returns_none_when_already_small():
     assert select_kept_indices([100] * 5, [False] * 5, max_bytes=100_000, sep_bytes=0) is None
 
 
-def test_select_kept_indices_keeps_head_and_drops_middle_anchoring_tail_at_compaction():
+def test_select_kept_indices_keeps_recent_tail_anchored_at_a_boundary():
     from agitrack.sessions.share_cap import select_kept_indices
 
     sizes = [100] * 100
-    compaction = [False] * 100
-    compaction[80] = True  # a clean boundary at/after where the greedy tail begins
-    kept = select_kept_indices(sizes, compaction, max_bytes=3000, sep_bytes=0, head_bytes=500)
+    boundary = [False] * 100
+    boundary[80] = True  # a clean resume boundary at/after where the greedy tail begins
+    kept = select_kept_indices(sizes, boundary, max_bytes=3000, sep_bytes=0)
     assert kept is not None
-    assert kept[:5] == [0, 1, 2, 3, 4]  # the opening (head) is preserved
-    assert 80 in kept and 79 not in kept  # tail anchored at the compaction, not mid-conversation
-    assert kept[-1] == 99  # the most recent item is kept
+    assert kept == list(range(80, 100))  # contiguous recent tail, starting AT the boundary
+    assert 79 not in kept  # nothing before the boundary (no disconnected head)
     assert sum(sizes[i] for i in kept) <= 3000  # under budget
 
 
-def test_claude_cap_bounds_size_preserving_head_and_recent_turns():
+def test_select_kept_indices_falls_back_to_an_earlier_boundary_when_none_fits():
+    # The most recent turn alone exceeds the budget (no boundary in the fitting window), so
+    # rather than begin mid-turn it keeps from the latest boundary before it (a clean start).
+    from agitrack.sessions.share_cap import select_kept_indices
+
+    sizes = [100] * 100
+    boundary = [False] * 100
+    boundary[40] = True  # the only boundary is well before the fitting window
+    kept = select_kept_indices(sizes, boundary, max_bytes=1500, sep_bytes=0)
+    assert kept is not None and kept[0] == 40 and kept[-1] == 99  # clean start, even if over budget
+
+
+def test_claude_cap_keeps_resumable_recent_tail_and_reroots():
     from agitrack.transcripts.claude import cap_shared_transcript
 
-    rows = [json.dumps({"type": "assistant", "uuid": f"u{i}", "cwd": "/x", "pad": "P" * 400}) for i in range(300)]
-    rows[200] = json.dumps({"type": "user", "isCompactSummary": True, "uuid": "c", "summary": "S" * 400})
+    rows = []
+    for i in range(300):
+        # alternate user-prompt / assistant turns, each with a uuid chained to the previous
+        role = "user" if i % 2 == 0 else "assistant"
+        content = "hello" if role == "user" else [{"type": "text", "text": "ok"}]
+        rows.append(
+            json.dumps(
+                {"type": role, "uuid": f"u{i}", "parentUuid": (f"u{i - 1}" if i else None), "pad": "P" * 300}
+                | {"message": {"role": role, "content": content}}
+            )
+        )
     raw = "\n".join(rows)
-    max_bytes = 40 * 1024
+    max_bytes = 30 * 1024
 
-    out = cap_shared_transcript(raw, max_bytes, head_bytes=8 * 1024)
+    out = cap_shared_transcript(raw, max_bytes)
 
-    assert len(out.encode("utf-8")) <= max_bytes  # under Git's file-size limit
-    kept = out.split("\n")
-    assert kept[0] == rows[0]  # opening preserved (system/setup persists)
-    assert kept[-1] == rows[-1]  # most recent turn preserved
-    assert len(kept) < 300  # the old middle was dropped
-    for line in kept:
-        json.loads(line)  # every kept row is still valid JSON (resume-able .jsonl)
+    assert len(out.encode("utf-8")) <= max_bytes  # under the file-size limit
+    kept = [json.loads(line) for line in out.split("\n") if line.strip()]
+    assert rows[0] not in out.split("\n")  # NO disconnected head — the opening was dropped
+    assert kept[-1]["uuid"] == "u299"  # most recent turn preserved (contiguous tail)
+    # The tail begins at a user prompt (a resume boundary), re-rooted so Claude can reconstruct it.
+    assert kept[0]["type"] == "user" and kept[0]["parentUuid"] is None
+    # No kept row has a dangling parent (all parents are among the kept rows or null).
+    uuids = {r["uuid"] for r in kept}
+    assert all(r.get("parentUuid") in uuids or r.get("parentUuid") is None for r in kept)
     assert cap_shared_transcript(raw, 10 * 1024 * 1024) == raw  # unchanged when it already fits
 
 
-def test_opencode_cap_bounds_size_keeping_info_and_recent_messages():
+def test_opencode_cap_keeps_info_and_recent_messages():
     from agitrack.transcripts.opencode import cap_shared_transcript
 
     messages = []
     for i in range(300):
-        info = {"id": f"m{i}", "role": "assistant"}
-        if i == 200:
-            info = {"id": "c", "role": "assistant", "summary": True}
-        messages.append({"info": info, "parts": [{"type": "text", "text": "T" * 400}]})
+        role = "user" if i % 2 == 0 else "assistant"
+        messages.append({"info": {"id": f"m{i}", "role": role}, "parts": [{"type": "text", "text": "T" * 300}]})
     raw = json.dumps({"info": {"id": "ses_x", "title": "hello"}, "messages": messages})
-    max_bytes = 40 * 1024
+    max_bytes = 30 * 1024
 
-    out = cap_shared_transcript(raw, max_bytes, head_bytes=8 * 1024)
+    out = cap_shared_transcript(raw, max_bytes)
 
     assert len(out.encode("utf-8")) <= max_bytes
     parsed = json.loads(out)  # still a valid {info, messages} object opencode can import
     assert parsed["info"]["id"] == "ses_x"  # session info preserved
     ids = [m["info"]["id"] for m in parsed["messages"]]
-    assert ids[0] == "m0"  # opening preserved
     assert ids[-1] == "m299"  # most recent preserved
-    assert len(parsed["messages"]) < 300  # middle dropped
+    assert ids != [f"m{i}" for i in range(300)]  # older messages dropped (it IS trimmed)
+    assert parsed["messages"][0]["info"]["role"] == "user"  # tail starts at a user turn boundary
     assert cap_shared_transcript(raw, 10 * 1024 * 1024) == raw  # unchanged when it fits
     assert cap_shared_transcript("not json{", 1) == "not json{"  # unparseable → left as-is
 
@@ -1704,7 +1724,7 @@ class _StubBackend:
     def export_session_raw(self, repo, session_id):
         return self._transcript
 
-    def cap_shared_transcript(self, transcript, max_bytes, head_bytes=0):
+    def cap_shared_transcript(self, transcript, max_bytes):
         return transcript  # stub transcripts are tiny; size-capping is unit-tested separately
 
     def transcript_size(self, repo, session_id):

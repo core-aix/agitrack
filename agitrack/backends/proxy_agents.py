@@ -60,10 +60,10 @@ class ProxyAgent(Protocol):
     def export_session_raw(self, repo: Path, session_id: str) -> str | None:
         """The full transcript text to share, or None if unavailable/unsupported."""
 
-    def cap_shared_transcript(self, transcript: str, max_bytes: int, head_bytes: int) -> str:
+    def cap_shared_transcript(self, transcript: str, max_bytes: int) -> str:
         """Bound the (already-redacted) shared transcript to ``max_bytes`` so a huge session
-        doesn't exceed Git's per-file size limit. Preserves up to ``head_bytes`` of the opening
-        plus the recent turns, dropping old middle content at a compaction boundary. Returns it
+        doesn't exceed Git's per-file size limit. Keeps the most recent turns as a resumable
+        contiguous tail (anchored at a clean turn boundary), dropping older ones. Returns it
         unchanged when small enough."""
 
     def transcript_size(self, repo: Path, session_id: str) -> int | None:
@@ -160,8 +160,8 @@ class OpenCodeProxyAgent:
     def export_session_raw(self, repo: Path, session_id: str) -> str | None:
         return opencode_session.export_session_raw(repo, session_id)
 
-    def cap_shared_transcript(self, transcript: str, max_bytes: int, head_bytes: int) -> str:
-        return opencode_session.cap_shared_transcript(transcript, max_bytes, head_bytes)
+    def cap_shared_transcript(self, transcript: str, max_bytes: int) -> str:
+        return opencode_session.cap_shared_transcript(transcript, max_bytes)
 
     def transcript_size(self, repo: Path, session_id: str) -> int | None:
         return opencode_session.session_transcript_size(repo, session_id)
@@ -247,8 +247,8 @@ class ClaudeProxyAgent:
     def export_session_raw(self, repo: Path, session_id: str) -> str | None:
         return claude_session.export_session_raw(repo, session_id)
 
-    def cap_shared_transcript(self, transcript: str, max_bytes: int, head_bytes: int) -> str:
-        return claude_session.cap_shared_transcript(transcript, max_bytes, head_bytes)
+    def cap_shared_transcript(self, transcript: str, max_bytes: int) -> str:
+        return claude_session.cap_shared_transcript(transcript, max_bytes)
 
     def transcript_size(self, repo: Path, session_id: str) -> int | None:
         return claude_session.session_transcript_size(repo, session_id)

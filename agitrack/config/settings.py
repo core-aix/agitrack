@@ -474,26 +474,17 @@ class GlobalConfig:
 
         return self._share_byte_setting("share_max_transcript_bytes", DEFAULT_MAX_SHARED_BYTES)
 
-    @property
-    def share_head_bytes(self) -> int:
-        """How much of a shared session's opening (system prompt / setup) to keep verbatim when
-        trimming an oversized transcript. Default 4 MiB; configurable up to the hard limit."""
-        from agitrack.sessions.share_cap import DEFAULT_HEAD_BYTES
-
-        return self._share_byte_setting("share_head_bytes", DEFAULT_HEAD_BYTES)
-
     def share_config_error(self) -> str | None:
-        """A human-readable error if a share-size setting is configured beyond the 100 MiB hard
+        """A human-readable error if the share-size cap is configured beyond the 100 MiB hard
         limit (Git hosts reject larger files), so startup can refuse with a clear message —
         else None. A non-numeric/≤0 value is NOT an error (it falls back to the default)."""
         from agitrack.sessions.share_cap import HARD_MAX_SHARED_BYTES
 
-        for key in ("share_max_transcript_bytes", "share_head_bytes"):
-            raw = self._raw(key)
-            if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw > HARD_MAX_SHARED_BYTES:
-                return (
-                    f"config '{key}' is {int(raw):,} bytes, over the maximum "
-                    f"{HARD_MAX_SHARED_BYTES // (1024 * 1024)} MiB ({HARD_MAX_SHARED_BYTES:,} bytes) — "
-                    f"Git hosts reject files larger than this. Lower it in your aGiTrack config.json."
-                )
+        raw = self._raw("share_max_transcript_bytes")
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw > HARD_MAX_SHARED_BYTES:
+            return (
+                f"config 'share_max_transcript_bytes' is {int(raw):,} bytes, over the maximum "
+                f"{HARD_MAX_SHARED_BYTES // (1024 * 1024)} MiB ({HARD_MAX_SHARED_BYTES:,} bytes) — "
+                f"Git hosts reject files larger than this. Lower it in your aGiTrack config.json."
+            )
         return None
