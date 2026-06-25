@@ -1200,8 +1200,6 @@ class ProxyRunner:
                 self._waker.close()
                 self._waker = None
             self._wake_r = self._wake_w = -1
-            if sys.platform == "win32":
-                self._win_stop_stdin_pump()
             if self.master_fd is not None:
                 try:
                     os.close(self.master_fd)
@@ -7482,74 +7480,6 @@ class ProxyRunner:
         if self._waker is None:
             return
         self._waker.wake()
-
-    # ------------------------------------------------------------------
-    # Windows stdin bridge
-    # ------------------------------------------------------------------
-
-    def _stdin_fileno(self) -> int:
-        """Return the fd that the reactor's select() should watch for keyboard input.
-
-        On POSIX this is the real stdin fd.  On Windows the real stdin is a
-        Windows console handle that select() cannot watch, so we bridge raw
-        keystrokes from ``msvcrt`` through a socket pair; ``_win_stdin_r``
-        is that socket's read end.
-        """
-        if sys.platform == "win32" and hasattr(self, "_win_stdin_r"):
-            return self._win_stdin_r.fileno()
-        return sys.stdin.fileno()
-
-    def _read_stdin_fd(self, n: int) -> bytes:
-        """Read up to *n* bytes from the stdin fd.
-
-        On Windows the stdin fd is backed by a socket, so use recv(); on POSIX
-        use os.read() on the real stdin fd.
-        """
-        if sys.platform == "win32" and hasattr(self, "_win_stdin_r"):
-            return self._win_stdin_r.recv(n)
-        return os.read(sys.stdin.fileno(), n)
-
-    def _win_start_stdin_pump(self) -> None:
-        """Start a thread that reads raw keystrokes and forwards them through a
-        socket pair so the reactor's ``select`` can watch them on Windows."""
-        import socket as _socket
-
-        r_sock, w_sock = _socket.socketpair()
-        self._win_stdin_r = r_sock
-        self._win_stdin_w = w_sock
-        self._win_stdin_stop = threading.Event()
-
-        def _pump() -> None:
-            import msvcrt
-
-            try:
-                while not self._win_stdin_stop.is_set():
-                    if msvcrt.kbhit():
-                        ch = msvcrt.getch()
-                        if ch in (b"\x00", b"\xe0"):
-                            # Extended key: second byte is the actual key code.
-                            ext = msvcrt.getch()
-                            w_sock.send(ch + ext)
-                        else:
-                            w_sock.send(ch)
-                    else:
-                        time.sleep(0.005)
-            except OSError:
-                pass
-
-        self._win_stdin_thread = threading.Thread(target=_pump, daemon=True, name="agitrack-stdin-pump")
-        self._win_stdin_thread.start()
-
-    def _win_stop_stdin_pump(self) -> None:
-        if hasattr(self, "_win_stdin_stop"):
-            self._win_stdin_stop.set()
-        for attr in ("_win_stdin_r", "_win_stdin_w"):
-            sock = getattr(self, attr, None)
-            if sock is not None:
-                try:
-                    sock.close()
-                except OSError:
-                    pass
 
     def _acquire_pipeline_lock_from_main(self) -> None:
         """Acquire ``_pipeline_lock`` from the main thread WITHOUT deadlocking on a

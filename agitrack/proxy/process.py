@@ -57,7 +57,7 @@ class BackendProcess:
         self.child_pid = child_pid
         self._write_lock = threading.Lock()
         # Pty handle (set by spawn); None for manually-constructed instances.
-        self._handle = None
+        self._handle: object = None
 
     # ------------------------------------------------------------------
     # Spawn
