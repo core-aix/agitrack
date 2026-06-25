@@ -2636,31 +2636,31 @@ def test_auto_share_success_caches_hash_and_stays_silent(tmp_path, monkeypatch):
 
 def test_auto_share_truncation_notice_shows_once_per_session(tmp_path, monkeypatch):
     # Auto-share fires every commit; a session that stays oversized is truncated every time. The
-    # "we're trimming this" notice must appear ONCE, not on each auto-share (that would spam).
+    # "we trimmed this" notice must appear ONCE, not on each auto-share (that would spam).
     runner, _repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend())
 
     runner._auto_share_outcome = {"ok": True, "truncated": True, "sid": "sid-1", "name": "feature"}
     runner._service_auto_share_outcome()
-    first = [n[0] for n in runner._session_notices.values() if "trimming" in n[0]]
+    first = [n[0] for n in runner._session_notices.values() if "trimmed" in n[0]]
     assert len(first) == 1 and "feature" in first[0]
 
     # A second truncated auto-share of the SAME session stays silent.
     runner._session_notices.clear()
     runner._auto_share_outcome = {"ok": True, "truncated": True, "sid": "sid-1", "name": "feature"}
     runner._service_auto_share_outcome()
-    assert not any("trimming" in n[0] for n in runner._session_notices.values())
+    assert not any("trimmed" in n[0] for n in runner._session_notices.values())
 
     # A DIFFERENT session still gets its own one-time notice.
     runner._auto_share_outcome = {"ok": True, "truncated": True, "sid": "sid-2", "name": "other"}
     runner._service_auto_share_outcome()
-    assert any("trimming" in n[0] and "other" in n[0] for n in runner._session_notices.values())
+    assert any("trimmed" in n[0] and "other" in n[0] for n in runner._session_notices.values())
 
 
 def test_auto_share_success_without_truncation_stays_silent(tmp_path, monkeypatch):
     runner, _repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend())
     runner._auto_share_outcome = {"ok": True, "truncated": False, "sid": "sid-1", "name": "feature"}
     runner._service_auto_share_outcome()
-    assert not any("trimming" in n[0] for n in runner._session_notices.values())
+    assert not any("trimmed" in n[0] for n in runner._session_notices.values())
 
 
 def test_auto_share_bounds_the_push_with_a_timeout(tmp_path, monkeypatch):
