@@ -134,11 +134,13 @@ def test_lock_released_by_os_when_owner_dies(tmp_path):
             sys.executable,
             "-c",
             (
-                "import pathlib, sys, time\n"
+                "import os, pathlib, sys, time\n"
                 "from agitrack.git import RepoLock\n"
                 "lock = RepoLock(pathlib.Path(sys.argv[1]))\n"
                 "assert lock.acquire()\n"
-                "print('held', flush=True)\n"
+                # Print the real interpreter PID — on Windows the venv launcher
+                # spawns a new python.exe whose PID differs from Popen.pid.
+                "print('held', os.getpid(), flush=True)\n"
                 "time.sleep(30)\n"
             ),
             str(path),
@@ -147,10 +149,12 @@ def test_lock_released_by_os_when_owner_dies(tmp_path):
         text=True,
     )
     try:
-        assert child.stdout.readline().strip() == "held"
+        line = child.stdout.readline().strip()
+        assert line.startswith("held")
+        child_self_pid = int(line.split()[1])
         lock = RepoLock(path)
         assert lock.acquire() is False  # blocked by the live holder...
-        assert lock.owner_pid() == child.pid  # ...which the message can name
+        assert lock.owner_pid() == child_self_pid  # ...which the message can name
     finally:
         child.kill()
         child.wait()
