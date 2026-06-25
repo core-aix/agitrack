@@ -1,18 +1,13 @@
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import threading
 from pathlib import Path
 from typing import IO
 
 from agitrack.backends.base import AgentResult, TokenUsage
-from agitrack.proc import resolve_subprocess_command
-
-# Module constant (not a runtime ``os.name`` read) so tests can flip the Windows path on a
-# POSIX host without monkeypatching ``os.name`` globally (which would break pathlib there).
-_IS_WINDOWS = os.name == "nt"
+from agitrack.proc import _IS_WINDOWS, resolve_subprocess_command  # _IS_WINDOWS: see proc.py
 
 # The summarizer is a mechanical text-reduction task that gains nothing from reasoning, so
 # its bare run asks OpenCode for the lowest reasoning effort. OpenCode has no env-var/flag

@@ -891,6 +891,8 @@ def _read_menu_key_press(expected: bytes, *, shift: bool, timeout: float = 8.0) 
 
     This is the authoritative check the issue asks for: a key intercepted by VS Code (or
     any host) never reaches stdin here, so the test fails exactly when the TUI would."""
+    if os.name == "nt":  # native Windows has no termios/tty — read the console via msvcrt
+        return _read_menu_key_press_windows(expected, shift=shift, timeout=timeout)
     import select
     import termios
     import time
@@ -935,6 +937,47 @@ def _read_menu_key_press(expected: bytes, *, shift: bool, timeout: float = 8.0) 
             termios.tcsetattr(fd, termios.TCSADRAIN, saved)
         except (termios.error, ValueError, OSError):
             pass
+
+
+def _read_menu_key_press_windows(expected: bytes, *, shift: bool, timeout: float) -> bool | None:
+    """Native-Windows port of :func:`_read_menu_key_press` (#118).
+
+    The Windows console hands control keys (Ctrl-G = ``0x07``) straight through
+    ``msvcrt.getch`` with no echo or line buffering, so a key the host (VS Code) intercepts
+    never arrives here — exactly as it wouldn't reach the TUI. Returns True if *expected*
+    arrives, False on timeout, None on Ctrl-C / no console. The kitty-protocol shifted-key
+    reporting the POSIX path enables isn't available on the Windows console, so a shift-based
+    menu key simply times out here — which is correct, since it wouldn't work in the TUI."""
+    import time
+
+    try:
+        import msvcrt
+    except ImportError:  # pragma: no cover - msvcrt is always present on Windows
+        return None
+    # Bind the console readers once; the ignores cover mypy on POSIX, where it (correctly)
+    # sees no win32 attributes on the ``msvcrt`` stub. The dispatcher only reaches here on
+    # Windows; the tests substitute a fake msvcrt so this stays exercised on the POSIX gate.
+    kbhit = msvcrt.kbhit  # type: ignore[attr-defined]
+    getch = msvcrt.getch  # type: ignore[attr-defined]
+    buffer = bytearray()
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not kbhit():
+            time.sleep(0.02)
+            continue
+        char = getch()
+        if char in (b"\x00", b"\xe0"):
+            # A function/arrow key: a lead byte followed by a scancode. Consume the scancode
+            # so it isn't mis-read as a separate keypress; it's never a valid menu key here.
+            if kbhit():
+                getch()
+            continue
+        buffer += char
+        if b"\x03" in buffer:  # Ctrl-C cancels the test (never a valid menu key)
+            return None
+        if expected in buffer:
+            return True
+    return False
 
 
 def _discover_or_init(path: Path) -> GitRepo | None:
