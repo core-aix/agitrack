@@ -14,6 +14,11 @@ import shutil
 import signal
 import subprocess
 
+# The one canonical Windows flag for the package. Prefer a plain ``os.name == "nt"`` inline
+# for a runtime branch; import THIS constant instead in code whose Windows branch is unit-
+# tested on a POSIX host (backends, this module) — a test flips ``_IS_WINDOWS`` directly,
+# whereas monkeypatching the global ``os.name`` would also switch ``pathlib`` to WindowsPath
+# semantics and break unrelated path handling on the test host.
 _IS_WINDOWS = os.name == "nt"
 
 # Windows: a process that is still running reports this as its exit code.

@@ -198,6 +198,42 @@ def test_menu_key_check_test_then_keep(tmp_path, monkeypatch):
     assert tested == ["ctrl-g"]
 
 
+def _fake_msvcrt(monkeypatch, presses):
+    # A stand-in msvcrt for the native-Windows menu-key probe so it's testable on POSIX
+    # (the real path has no termios; #118). getch pops the queued keypresses in order.
+    import sys
+    import types
+
+    queue = list(presses)
+    monkeypatch.setitem(
+        sys.modules, "msvcrt", types.SimpleNamespace(kbhit=lambda: bool(queue), getch=lambda: queue.pop(0))
+    )
+
+
+def test_read_menu_key_press_windows_detects_expected(monkeypatch):
+    # Ctrl-G arriving as 0x07 means the key reached aGiTrack and would open the TUI menu.
+    _fake_msvcrt(monkeypatch, [b"\x07"])
+    assert cli._read_menu_key_press_windows(b"\x07", shift=False, timeout=1.0) is True
+
+
+def test_read_menu_key_press_windows_times_out_when_intercepted(monkeypatch):
+    # The host (VS Code) swallowed the key — nothing ever arrives, so the probe reports False.
+    _fake_msvcrt(monkeypatch, [])
+    assert cli._read_menu_key_press_windows(b"\x07", shift=False, timeout=0.05) is False
+
+
+def test_read_menu_key_press_windows_ctrl_c_cancels(monkeypatch):
+    _fake_msvcrt(monkeypatch, [b"\x03"])  # Ctrl-C
+    assert cli._read_menu_key_press_windows(b"\x07", shift=False, timeout=1.0) is None
+
+
+def test_read_menu_key_press_windows_skips_function_key_scancodes(monkeypatch):
+    # A function/arrow key (lead byte 0xe0 + scancode) is consumed, not matched; a real
+    # Ctrl-G after it still registers.
+    _fake_msvcrt(monkeypatch, [b"\xe0", b"H", b"\x07"])
+    assert cli._read_menu_key_press_windows(b"\x07", shift=False, timeout=1.0) is True
+
+
 def test_menu_key_check_change_persists_new_key(tmp_path, monkeypatch):
     # 'c' to change → enter a non-conflicting key → it's persisted as menu_key.
     _force_tty(monkeypatch, stdin=True)
