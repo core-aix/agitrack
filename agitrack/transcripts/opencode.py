@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 
 from agitrack.backends.base import TokenUsage
+from agitrack.proc import resolve_subprocess_command
 from agitrack.transcripts.types import ExportedSession, SessionRef, SessionTurn, turns_after
 
 # Every `opencode` subprocess aGiTrack runs synchronously (often on the main reactor/menu
@@ -53,7 +54,9 @@ def _opencode_session_list(cwd: Path, max_count: int) -> list[dict]:
     _debug(cwd, f"opencode session list starting (max_count={max_count})")
     try:
         process = subprocess.run(
-            ["opencode", "session", "list", "--format", "json", "--max-count", str(max_count)],
+            resolve_subprocess_command(
+                ["opencode", "session", "list", "--format", "json", "--max-count", str(max_count)]
+            ),
             cwd=cwd,
             text=True,
             stdout=subprocess.PIPE,
@@ -409,7 +412,7 @@ def _run_opencode_subprocess(repo: Path, args: list[str]) -> tuple[str, int]:
     the same "unusable" codes callers already treat as no data)."""
     try:
         result = subprocess.run(
-            args,
+            resolve_subprocess_command(args),  # resolve opencode(.cmd) on Windows (#118)
             cwd=repo,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,

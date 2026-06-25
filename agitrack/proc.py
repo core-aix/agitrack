@@ -10,6 +10,7 @@ keep every call site identical and platform-agnostic.
 from __future__ import annotations
 
 import os
+import shutil
 import signal
 import subprocess
 
@@ -17,6 +18,28 @@ _IS_WINDOWS = os.name == "nt"
 
 # Windows: a process that is still running reports this as its exit code.
 _STILL_ACTIVE = 259
+
+
+def resolve_subprocess_command(command: list[str]) -> list[str]:
+    """Resolve *command* for ``subprocess`` on the current OS.
+
+    On Windows, look the executable up via PATH/PATHEXT (so a bare ``claude`` finds the npm
+    ``claude.cmd`` shim — which ``CreateProcess`` would otherwise miss, since it only tries
+    ``.exe``) and run a ``.cmd``/``.bat`` through ``cmd.exe /c``, the only way
+    ``CreateProcess`` (what ``subprocess`` uses with ``shell=False``) executes a batch file.
+    On POSIX, returns *command* unchanged.
+
+    This is the flat-list ``subprocess`` counterpart of the ConPTY launch path's
+    ``_resolve_windows_command``: without it, every non-TUI backend invocation (summarizer,
+    model listing) raised ``FileNotFoundError`` on Windows, so summarization silently fell
+    back to the prompt-led commit message.
+    """
+    if not _IS_WINDOWS or not command:
+        return command
+    exe = shutil.which(command[0]) or command[0]
+    if exe.lower().endswith((".cmd", ".bat")):
+        return [os.environ.get("COMSPEC", "cmd.exe"), "/c", exe, *command[1:]]
+    return [exe, *command[1:]]
 
 
 def detach_kwargs() -> dict:

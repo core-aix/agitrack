@@ -54,3 +54,43 @@ def test_terminate_pid_dispatches_to_windows_helper(monkeypatch):
     monkeypatch.setattr(proc, "_windows_terminate", lambda pid: seen.append(pid))
     proc.terminate_pid(555)
     assert seen == [555]
+
+
+# --- resolve_subprocess_command (Windows .cmd/.exe resolution, #118) ----------------
+
+
+def test_resolve_subprocess_command_posix_passthrough(monkeypatch):
+    monkeypatch.setattr(proc, "_IS_WINDOWS", False)
+    assert proc.resolve_subprocess_command(["claude", "-p", "x"]) == ["claude", "-p", "x"]
+
+
+def test_resolve_subprocess_command_empty_is_unchanged(monkeypatch):
+    monkeypatch.setattr(proc, "_IS_WINDOWS", True)
+    assert proc.resolve_subprocess_command([]) == []
+
+
+def test_resolve_subprocess_command_windows_wraps_cmd_shim(monkeypatch):
+    # npm installs `claude.cmd`; CreateProcess can't run a batch file, so it must go through
+    # cmd.exe /c — otherwise summarization raised FileNotFoundError on Windows.
+    monkeypatch.setattr(proc, "_IS_WINDOWS", True)
+    monkeypatch.setattr(proc.shutil, "which", lambda name: r"C:\Users\me\AppData\npm\claude.cmd")
+    cmd = proc.resolve_subprocess_command(["claude", "-p", "summarize this"])
+    assert cmd[0].lower().endswith("cmd.exe")
+    assert cmd[1] == "/c"
+    assert r"C:\Users\me\AppData\npm\claude.cmd" in cmd
+    assert cmd[-1] == "summarize this"  # args preserved after the shim
+
+
+def test_resolve_subprocess_command_windows_exe_no_shell(monkeypatch):
+    monkeypatch.setattr(proc, "_IS_WINDOWS", True)
+    monkeypatch.setattr(proc.shutil, "which", lambda name: r"C:\bin\opencode.exe")
+    cmd = proc.resolve_subprocess_command(["opencode", "models"])
+    assert cmd == [r"C:\bin\opencode.exe", "models"]  # resolved path, run directly
+
+
+def test_resolve_subprocess_command_windows_unresolved_falls_back(monkeypatch):
+    # which() found nothing (backend not on PATH): pass the name through unchanged so the
+    # caller still gets its usual FileNotFoundError rather than a surprise.
+    monkeypatch.setattr(proc, "_IS_WINDOWS", True)
+    monkeypatch.setattr(proc.shutil, "which", lambda name: None)
+    assert proc.resolve_subprocess_command(["claude", "-p", "x"]) == ["claude", "-p", "x"]

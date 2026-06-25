@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import subprocess
 
+from agitrack.proc import resolve_subprocess_command
+
 
 def list_available_models(backend_name: str) -> list[str]:
     """The models the summarizer can use for the given backend (smallest tier first
@@ -28,7 +30,7 @@ def smallest_model(backend_name: str, models: list[str]) -> str | None:
 def _list_opencode_models() -> list[str]:
     try:
         result = subprocess.run(
-            ["opencode", "models"],
+            resolve_subprocess_command(["opencode", "models"]),
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -50,7 +52,7 @@ def _list_opencode_models() -> list[str]:
 def _list_claude_models() -> list[str]:
     try:
         result = subprocess.run(
-            ["claude", "--help"],
+            resolve_subprocess_command(["claude", "--help"]),
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
