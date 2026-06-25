@@ -853,6 +853,8 @@ def _read_menu_key_press(expected: bytes, *, shift: bool, timeout: float = 8.0) 
 
     This is the authoritative check the issue asks for: a key intercepted by VS Code (or
     any host) never reaches stdin here, so the test fails exactly when the TUI would."""
+    if sys.platform == "win32":
+        return None  # Windows console doesn't support raw-mode terminal testing
     import select
     import termios
     import time
