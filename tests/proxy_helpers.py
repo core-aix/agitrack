@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import contextlib
 import os
-import pty
 import subprocess
 import sys
 from collections.abc import Iterator
@@ -54,16 +53,17 @@ def capture_fd(fd: int | None = None) -> Iterator[list[bytes]]:
     finally:
         os.dup2(saved, fd)
         os.close(saved)
-        os.set_blocking(read_fd, False)
         chunks: list[bytes] = []
-        try:
-            while True:
-                chunk = os.read(read_fd, 65536)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-        except BlockingIOError:
-            pass
+        if sys.platform != "win32":
+            os.set_blocking(read_fd, False)
+            try:
+                while True:
+                    chunk = os.read(read_fd, 65536)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+            except BlockingIOError:
+                pass
         os.close(read_fd)
         out.append(b"".join(chunks))
 
@@ -71,18 +71,18 @@ def capture_fd(fd: int | None = None) -> Iterator[list[bytes]]:
 def run_in_pty(argv: list[str]) -> bytes:
     """Run ``argv`` under a real pseudo-terminal and return its combined output bytes.
 
-    This exercises the same OS pty read path the proxy uses for the backend — the part
-    of aGiTrack that differs between macOS (BSD) and Linux. The child sees a real TTY on
-    stdin/stdout/stderr, so it emits the framed/cursor output a TUI would.
+    POSIX only — raises ``NotImplementedError`` on Windows. Use ``spawn_pty`` from
+    ``agitrack.proxy.pty_backend`` for cross-platform PTY spawning.
 
     The parent keeps its own copy of the slave fd open until after draining. On macOS
     (BSD) a pty discards any unread output the moment its *last* slave fd is closed, so a
     short-lived child that writes and exits before the parent reads (e.g. ``printf``)
     would otherwise race: the child's exit closes the only slave reference and the buffered
     output is dropped, intermittently yielding a blank read in CI. Holding the slave open
-    across ``wait()`` keeps the output buffered; we then drain the master non-blocking. The
-    child's output here is tiny (well under the pty buffer), so waiting first can't
-    deadlock on a full buffer."""
+    across ``wait()`` keeps the output buffered; we then drain the master non-blocking."""
+    if sys.platform == "win32":
+        raise NotImplementedError("run_in_pty is POSIX-only; use spawn_pty on Windows")
+    import pty
     import select
 
     master, slave = pty.openpty()

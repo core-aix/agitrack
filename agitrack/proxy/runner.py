@@ -14,9 +14,11 @@ import subprocess
 import sys
 from types import FrameType
 from typing import Any, Callable, cast
-import termios
 import threading
 import time
+
+if sys.platform != "win32":
+    import termios
 
 import pyte
 
@@ -1105,8 +1107,21 @@ class ProxyRunner:
         # so it can wake `select` on demand (e.g. to present a dialog) instead of
         # waiting for the next poll tick. Then start the git worker itself.
         self._main_thread_ident = threading.get_ident()
-        self._wake_r, self._wake_w = os.pipe()
-        os.set_blocking(self._wake_r, False)
+        # Wake pipe: on POSIX use os.pipe() (directly selectable). On Windows
+        # use a socket pair (sockets ARE selectable by select.select on Windows,
+        # but regular pipe fds are not).
+        if sys.platform == "win32":
+            import socket as _socket
+            _wake_r_sock, _wake_w_sock = _socket.socketpair()
+            _wake_r_sock.setblocking(False)
+            self._wake_r = _wake_r_sock.fileno()
+            self._wake_w = _wake_w_sock.fileno()
+            # Keep socket objects alive so GC doesn't close the underlying fds.
+            self._wake_r_sock = _wake_r_sock
+            self._wake_w_sock = _wake_w_sock
+        else:
+            self._wake_r, self._wake_w = os.pipe()
+            os.set_blocking(self._wake_r, False)
         self._start_git_worker()
         # Register the initial session as the sole (active) entry in the
         # multiplexer. Additional sessions are appended by `_new_session`.
@@ -1125,24 +1140,36 @@ class ProxyRunner:
         # exit-time auto-share has to shell out to `gh` mid-share (that lookup can
         # stall and would otherwise eat into the bounded share budget).
         threading.Thread(target=self._warm_share_login, daemon=True).start()
-        self.old_attrs = termios.tcgetattr(sys.stdin.fileno())
+        # Save the host terminal's current mode so we can restore it on exit.
+        if sys.platform == "win32":
+            from agitrack.proxy.terminal import _win_get_console_mode, _win_stdin_handle
+            self.old_attrs = _win_get_console_mode(_win_stdin_handle())
+        else:
+            self.old_attrs = termios.tcgetattr(sys.stdin.fileno())
+        # On Windows, stdin is a Windows console handle that select() cannot
+        # watch, so we bridge it through a socket pair via a reader thread.
+        if sys.platform == "win32":
+            self._win_start_stdin_pump()
         try:
             self._enter_host_screen()
             self._set_raw()
             self._detect_host_terminal()
             self._resize_child()
-            self.original_sigwinch = signal.getsignal(signal.SIGWINCH)
-            self.original_signal_handlers = {
-                signal.SIGTERM: signal.getsignal(signal.SIGTERM),
-                signal.SIGHUP: signal.getsignal(signal.SIGHUP),
-            }
-            signal.signal(signal.SIGWINCH, lambda _signum, _frame: self._resize_child())
-            signal.signal(signal.SIGTERM, self._handle_exit_signal)
-            signal.signal(signal.SIGHUP, self._handle_exit_signal)
+            self.original_sigwinch = None
+            self.original_signal_handlers = {}
+            if hasattr(signal, "SIGWINCH"):
+                self.original_sigwinch = signal.getsignal(signal.SIGWINCH)
+                signal.signal(signal.SIGWINCH, lambda _signum, _frame: self._resize_child())
+            if hasattr(signal, "SIGTERM"):
+                self.original_signal_handlers[signal.SIGTERM] = signal.getsignal(signal.SIGTERM)
+                signal.signal(signal.SIGTERM, self._handle_exit_signal)
+            if hasattr(signal, "SIGHUP"):
+                self.original_signal_handlers[signal.SIGHUP] = signal.getsignal(signal.SIGHUP)
+                signal.signal(signal.SIGHUP, self._handle_exit_signal)
             self._setup_worktree_confinement_notice()
             exit_code = self._loop()  # the timers phase auto-applies a sandbox-blocked backend update
         finally:
-            if self.original_sigwinch is not None:
+            if self.original_sigwinch is not None and hasattr(signal, "SIGWINCH"):
                 signal.signal(signal.SIGWINCH, self.original_sigwinch)
             for signum, handler in self.original_signal_handlers.items():
                 signal.signal(signum, handler)
@@ -1158,6 +1185,8 @@ class ProxyRunner:
                     except OSError:
                         pass
             self._wake_r = self._wake_w = -1
+            if sys.platform == "win32":
+                self._win_stop_stdin_pump()
             if self.master_fd is not None:
                 try:
                     os.close(self.master_fd)
@@ -4522,7 +4551,7 @@ class ProxyRunner:
         if not thread.is_alive():
             return "done"
         try:
-            stdin_fd = sys.stdin.fileno()
+            stdin_fd = self._stdin_fileno()
         except (OSError, ValueError):
             # No real stdin (headless/non-interactive): can't offer interactive
             # cancel, so just wait for the thread, still honouring the deadline.
@@ -4911,15 +4940,13 @@ class ProxyRunner:
         self._set_message(message, seconds=3600)
         self._render()
         try:
-            stdin_fd = sys.stdin.fileno()
+            stdin_fd = self._stdin_fileno()
         except (OSError, ValueError):
             return
         while self.running:
             master = self.master_fd
             background = self._background_fds() if self.sessions else {}
-            fds = [stdin_fd]
-            if master is not None:
-                fds.append(master)
+            fds = [fd for fd in [stdin_fd, master] if fd is not None]
             fds.extend(background)
             try:
                 readable, _, _ = select.select(fds, [], [], 0.2)
@@ -6011,10 +6038,17 @@ class ProxyRunner:
         Returns (background_fds_map, readable_list).  Background sessions are
         drained here so their PTY buffers never fill up regardless of which
         phase the main loop is in.
+
+        On POSIX: watches stdin fd, PTY master fd, background session fds, and
+        the self-pipe wake fd.  On Windows: watches the stdin socket bridge, the
+        pywinpty output socket bridge, background sockets, and the wake socket.
+        All are sockets (or POSIX fds on POSIX) and thus selectable.
         """
         timeout = self._select_timeout()
         background = self._background_fds()
-        watch = [sys.stdin.fileno(), self.master_fd, *background]
+        stdin_fd = self._stdin_fileno()
+        # Filter out None (unspawned / torn-down session) so select never sees it.
+        watch = [fd for fd in [stdin_fd, self.master_fd, *background] if fd is not None]
         if self._wake_r >= 0:
             watch.append(self._wake_r)  # the git worker's wake pipe (e.g. it queued a dialog)
         readable, _, _ = select.select(watch, [], [], timeout)
@@ -6061,9 +6095,10 @@ class ProxyRunner:
 
         Returns a loop-control sentinel or None to continue normally.
         """
-        if sys.stdin.fileno() not in readable:
+        stdin_fd = self._stdin_fileno()
+        if stdin_fd not in readable:
             return None
-        data = os.read(sys.stdin.fileno(), 4096)
+        data = os.read(stdin_fd, 4096)
         # Only a real keystroke resets the idle backoff — NOT a mouse wheel / move /
         # click or a focus in/out report. Scrolling history is passive reading: it
         # needs no commits or background polling, so it must not pin aGiTrack in the
@@ -7258,14 +7293,12 @@ class ProxyRunner:
         # the popup waits, since back-pressure on a full PTY buffer blocks the
         # backend's writes and can stall or kill it (a popup can stay open for a
         # long time, and agents keep streaming behind it).
-        stdin_fd = sys.stdin.fileno()
+        stdin_fd = self._stdin_fileno()
         dead: set[int] = set()
         while True:
             background = self._background_fds() if self.sessions else {}
             master = self.master_fd
-            fds = [stdin_fd]
-            if master is not None and master not in dead:
-                fds.append(master)
+            fds = [fd for fd in [stdin_fd, master] if fd is not None and fd not in dead]
             fds.extend(fd for fd in background if fd not in dead)
             readable, _, _ = select.select(fds, [], [], 1.0)
             for fd in readable:
@@ -7379,14 +7412,74 @@ class ProxyRunner:
 
     def _wake_main_loop(self) -> None:
         """Wake the reactor out of ``select`` at once (e.g. a worker queued a dialog
-        or finished work that should repaint). Writes a byte to the self-pipe whose
-        read end is in the select set. No-op before the pipe exists (tests)."""
+        or finished work that should repaint). Writes a byte to the self-pipe (POSIX)
+        or the wake socket (Windows) whose read end is in the select set.
+        No-op before the pipe/socket exists (tests)."""
         if self._wake_w < 0:
             return
         try:
-            os.write(self._wake_w, b"\x00")
+            if sys.platform == "win32":
+                self._wake_w_sock.send(b"\x00")
+            else:
+                os.write(self._wake_w, b"\x00")
         except OSError:
             pass
+
+    # ------------------------------------------------------------------
+    # Windows stdin bridge
+    # ------------------------------------------------------------------
+
+    def _stdin_fileno(self) -> int:
+        """Return the fd that the reactor's select() should watch for keyboard input.
+
+        On POSIX this is the real stdin fd.  On Windows the real stdin is a
+        Windows console handle that select() cannot watch, so we bridge raw
+        keystrokes from ``msvcrt`` through a socket pair; ``_win_stdin_r``
+        is that socket's read end.
+        """
+        if sys.platform == "win32" and hasattr(self, "_win_stdin_r"):
+            return self._win_stdin_r.fileno()
+        return sys.stdin.fileno()
+
+    def _win_start_stdin_pump(self) -> None:
+        """Start a thread that reads raw keystrokes and forwards them through a
+        socket pair so the reactor's ``select`` can watch them on Windows."""
+        import socket as _socket
+        r_sock, w_sock = _socket.socketpair()
+        self._win_stdin_r = r_sock
+        self._win_stdin_w = w_sock
+        self._win_stdin_stop = threading.Event()
+
+        def _pump() -> None:
+            import msvcrt
+            try:
+                while not self._win_stdin_stop.is_set():
+                    if msvcrt.kbhit():
+                        ch = msvcrt.getch()
+                        if ch in (b"\x00", b"\xe0"):
+                            # Extended key: second byte is the actual key code.
+                            ext = msvcrt.getch()
+                            w_sock.send(ch + ext)
+                        else:
+                            w_sock.send(ch)
+                    else:
+                        time.sleep(0.005)
+            except OSError:
+                pass
+
+        self._win_stdin_thread = threading.Thread(target=_pump, daemon=True, name="agitrack-stdin-pump")
+        self._win_stdin_thread.start()
+
+    def _win_stop_stdin_pump(self) -> None:
+        if hasattr(self, "_win_stdin_stop"):
+            self._win_stdin_stop.set()
+        for attr in ("_win_stdin_r", "_win_stdin_w"):
+            sock = getattr(self, attr, None)
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
 
     def _acquire_pipeline_lock_from_main(self) -> None:
         """Acquire ``_pipeline_lock`` from the main thread WITHOUT deadlocking on a

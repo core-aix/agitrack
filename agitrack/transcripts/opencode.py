@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from agitrack.env import getenv_compat
-import pty
 import signal
 import subprocess
 import tempfile
 import threading
 import time
 from pathlib import Path
+
+if sys.platform != "win32":
+    import pty as _pty
 
 from agitrack.backends.base import TokenUsage
 from agitrack.transcripts.types import ExportedSession, SessionRef, SessionTurn, turns_after
@@ -394,10 +397,17 @@ def _run_export_pty(repo: Path, session_id: str, *, sanitize: bool = False) -> t
 
 
 def _run_opencode_pty(repo: Path, args: list[str]) -> tuple[str, int]:
-    """Run ``opencode`` under a pty in ``repo`` (it talks to a TTY) and return
-    its combined output and exit code. A pty is needed because the CLI writes
-    framed/colour output to a terminal, not a plain pipe."""
-    pid, fd = pty.fork()
+    """Run ``opencode`` in ``repo`` and return its combined output and exit code.
+
+    On POSIX a pty is used because the CLI writes framed/colour output to a terminal
+    and may hang on a plain pipe. On Windows subprocess.run with PIPE is used instead
+    (pywinpty could emulate a pty, but these are purely programmatic JSON calls that
+    don't need TTY output formatting, and the timeout cap keeps the blocking bounded).
+    """
+    if sys.platform == "win32":
+        return _run_opencode_subprocess(repo, args)
+
+    pid, fd = _pty.fork()
     if pid == 0:
         # Never let the child survive a failed exec — it would keep running
         # aGiTrack's own Python code from the fork point as a duplicate process.
@@ -440,6 +450,24 @@ def _run_opencode_pty(repo: Path, args: list[str]) -> tuple[str, int]:
     if timed_out.is_set():
         exit_code = exit_code or 124  # killed → ensure a non-zero "unusable" code
     return b"".join(chunks).decode(errors="replace"), exit_code
+
+
+def _run_opencode_subprocess(repo: Path, args: list[str]) -> tuple[str, int]:
+    """Windows fallback: run ``opencode`` via subprocess.run with a timeout cap."""
+    try:
+        result = subprocess.run(
+            args,
+            cwd=repo,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+            timeout=_OPENCODE_CALL_TIMEOUT,
+        )
+        return result.stdout.decode(errors="replace"), result.returncode
+    except subprocess.TimeoutExpired:
+        return "", 124
+    except OSError:
+        return "", 127
 
 
 def parse_exported_session(

@@ -8,14 +8,52 @@ detection (fg/bg/palette/DA query-and-cache), and terminal-size querying.
 
 from __future__ import annotations
 
+import ctypes
 import os
 import re
 import select
 import sys
-import termios
 import time
-import tty
 from typing import Any, Protocol
+
+if sys.platform != "win32":
+    import termios
+    import tty
+
+# ---------------------------------------------------------------------------
+# Windows console-mode helpers
+# ---------------------------------------------------------------------------
+# These constants and helpers are only used on Windows; on POSIX the code path
+# uses termios / tty as before.
+
+if sys.platform == "win32":
+    # Console mode flags (wincon.h)
+    _ENABLE_PROCESSED_INPUT = 0x0001
+    _ENABLE_LINE_INPUT = 0x0002
+    _ENABLE_ECHO_INPUT = 0x0004
+    _ENABLE_VIRTUAL_TERMINAL_INPUT = 0x0200
+    _ENABLE_PROCESSED_OUTPUT = 0x0001
+    _ENABLE_WRAP_AT_EOL_OUTPUT = 0x0002
+    _ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+    _ENABLE_DISABLE_NEWLINE_AUTO_RETURN = 0x0008
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _STD_INPUT_HANDLE = -10
+    _STD_OUTPUT_HANDLE = -11
+
+    def _win_get_console_mode(handle) -> int:
+        mode = ctypes.c_ulong()
+        _kernel32.GetConsoleMode(handle, ctypes.byref(mode))
+        return mode.value
+
+    def _win_set_console_mode(handle, mode: int) -> None:
+        _kernel32.SetConsoleMode(handle, ctypes.c_ulong(mode))
+
+    def _win_stdin_handle():
+        return _kernel32.GetStdHandle(_STD_INPUT_HANDLE)
+
+    def _win_stdout_handle():
+        return _kernel32.GetStdHandle(_STD_OUTPUT_HANDLE)
 
 
 class TerminalHostState(Protocol):
@@ -72,10 +110,26 @@ class TerminalHost:
     # ------------------------------------------------------------------
 
     def set_raw(self: TerminalHostState) -> None:
-        tty.setraw(sys.stdin.fileno())
+        if sys.platform == "win32":
+            h = _win_stdin_handle()
+            mode = _win_get_console_mode(h)
+            # Disable line-buffering and echo; enable VT input sequences.
+            mode &= ~(_ENABLE_LINE_INPUT | _ENABLE_ECHO_INPUT | _ENABLE_PROCESSED_INPUT)
+            mode |= _ENABLE_VIRTUAL_TERMINAL_INPUT
+            _win_set_console_mode(h, mode)
+            # Enable VT processing on stdout so ANSI escape sequences render.
+            ho = _win_stdout_handle()
+            mo = _win_get_console_mode(ho)
+            mo |= _ENABLE_VIRTUAL_TERMINAL_PROCESSING | _ENABLE_DISABLE_NEWLINE_AUTO_RETURN
+            _win_set_console_mode(ho, mo)
+        else:
+            tty.setraw(sys.stdin.fileno())
 
     def set_cooked(self: TerminalHostState) -> None:
-        if self.old_attrs is not None:
+        if sys.platform == "win32":
+            if self.old_attrs is not None:
+                _win_set_console_mode(_win_stdin_handle(), self.old_attrs)
+        elif self.old_attrs is not None:
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self.old_attrs)
 
     def restore_terminal(self: TerminalHostState) -> None:
@@ -83,10 +137,11 @@ class TerminalHost:
         # mouse reports the terminal already queued — otherwise those buffered SGR
         # sequences (e.g. "\x1b[<35;..M") leak to the shell as stray hex after exit.
         self.disable_host_terminal_modes()
-        try:
-            termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
-        except (termios.error, OSError, ValueError):
-            pass
+        if sys.platform != "win32":
+            try:
+                termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+            except (termios.error, OSError, ValueError):
+                pass
         self.set_cooked()
         # Clear+home *before* leaving the alt screen, then leave it. On terminals
         # that support the alternate screen (macOS, VTE/gnome-terminal) the clear
@@ -163,6 +218,10 @@ class TerminalHost:
         # cache the raw answers. OpenCode adapts its entire theme to the
         # reported foreground/background, so relaying the real values is what
         # makes its colors match a native session.
+        # On Windows, terminal capability detection via escape-sequence queries is
+        # unreliable (the console may not respond to OSC queries), so we skip it.
+        if sys.platform == "win32":
+            return
         queries = bytearray(b"\x1b]10;?\x07\x1b]11;?\x07")
         for index in range(16):
             queries += b"\x1b]4;%d;?\x07" % index
