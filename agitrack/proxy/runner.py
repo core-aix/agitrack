@@ -142,7 +142,7 @@ def _push_rejection_reason(error: str) -> str:
     blind prefix slice) hides it; this surfaces the line that actually explains the failure."""
     lines = [line.strip() for line in (error or "").splitlines() if line.strip()]
     if not lines:
-        return "no error output from git"
+        return "origin returned no error — the push likely timed out; check your connection and retry"
     markers = ("rejected", "denied", "declined", "permission", "forbidden", "protected", "stale info")
     for line in lines:
         if any(marker in line.lower() for marker in markers):
@@ -333,6 +333,14 @@ class ProxyInput:
                         self.escape_buffer = None
                         continue
                     self.escape_buffer = bytearray(char)
+                    continue
+                if len(self.menu_key) == 1 and char == self.menu_key:
+                    # The menu key again while the palette is open closes it (a toggle), like
+                    # Esc — instead of typing a literal control byte into the command buffer.
+                    self.buffer.clear()
+                    self.capturing = False
+                    self.selected_index = 0
+                    self.escape_buffer = None
                     continue
                 if char in {b"\r", b"\n"}:
                     typed = self.buffer.decode(errors="ignore").strip()
@@ -758,6 +766,9 @@ class ProxyRunner:
         # (on the main thread, NOT mid-iteration over _background_share_ops) prompts the
         # user to overwrite or merge. Each entry: {payload, store, display, session_id}.
         self._pending_share_conflicts: list[dict] = []
+        # Set when the menu key (Ctrl-G) is pressed inside an open popup: closes the WHOLE
+        # command menu (every nested level) back to the agent, rather than going up one level.
+        self._exit_menu_requested = False
         self._relaunch_times: list[float] = []
         self._exiting = False
         self._finalized_on_exit = False
@@ -1019,6 +1030,7 @@ class ProxyRunner:
                 "_shared_resume_cancel": None,
                 "_background_share_ops": [],
                 "_pending_share_conflicts": [],
+                "_exit_menu_requested": False,
                 "_use_worktrees": True,
                 "_warned_parallel_no_worktree": False,
                 "_sandbox": True,
@@ -3237,12 +3249,14 @@ class ProxyRunner:
         choice = self._select_popup(title, options)
         return None if choice is None else label_for.get(choice, choice)
 
-    def _change_session_merge_branch_menu(self) -> None:
-        # Session-config entry: change the merge destination of ANY session.
+    def _change_session_merge_branch_menu(self) -> str:
+        # Session-config entry: change the merge destination of ANY session. Returns _MENU_DONE
+        # once it acts/reports (so the menu closes and that's visible) or _MENU_UP on a plain
+        # Esc/cancel (re-show the list).
         if not self.sessions:
             self._set_message("No sessions.")
             self._render()
-            return
+            return self._MENU_DONE
         label_for: dict[str, int] = {}
         options: list[str] = []
         for index in range(len(self.sessions)):
@@ -3252,7 +3266,7 @@ class ProxyRunner:
             options.append(label)
         choice = self._select_popup("Change the merge branch of which session?", options)
         if choice is None:
-            return
+            return self._MENU_UP
         index = label_for[choice]
         session = self.sessions[index]
         if getattr(session, "agent_in_flight", False):
@@ -3263,20 +3277,21 @@ class ProxyRunner:
                 seconds=8.0,
             )
             self._render()
-            return
+            return self._MENU_DONE
         current = getattr(session, "_base_branch", None)
         target = self._prompt_merge_branch(f"Merge '{self._session_name(index)}' into which branch?", current)
         if not target:
-            return
+            return self._MENU_UP
         if target == current:
             self._set_message(f"'{self._session_name(index)}' already merges into '{target}'.")
             self._render()
-            return
+            return self._MENU_DONE
         if session is self.active:
             self._retarget_active_session(target)
         else:
             # Re-target a background session by temporarily making it active.
             self._with_session(session, lambda: self._retarget_active_session(target))
+        return self._MENU_DONE
 
     def _integrate_session_keeping_alive(self) -> None:
         # Commit the latest turn and integrate it into the current base WITHOUT
@@ -3429,15 +3444,20 @@ class ProxyRunner:
                 if self._manage_shared_sessions_menu() == self._MENU_DONE:
                     return self._MENU_DONE
                 continue
-            # Configuration actions: run, then re-show this list (so their Esc lands here).
+            # Configuration actions: a COMPLETED action closes the menu so its result/progress
+            # is visible (never bounce back to the list); only backing out (Esc before doing
+            # anything) re-shows this list. Each handler signals which it was.
             if kind == "rename":
-                self._rename_session_menu()
+                signal = self._rename_session_menu()
             elif kind == "merge-branch":
-                self._change_session_merge_branch_menu()
+                signal = self._change_session_merge_branch_menu()
             elif kind == "share":
-                self._share_session()
+                signal = self._share_session()
             else:
-                self._stop_session_menu()
+                signal = self._stop_session_menu()
+            if signal == self._MENU_DONE:
+                return self._MENU_DONE
+            # else _MENU_UP: nothing was done (Esc/cancel) → re-show this list
 
     def _active_has_pending(self) -> bool:
         # True if the active session has committed work not yet in the base.
@@ -3872,7 +3892,9 @@ class ProxyRunner:
         except Exception as error:
             self._debug(f"orphan-session sweep failed: {error!r}")
 
-    def _share_session(self) -> None:
+    def _share_session(self) -> str:
+        # Returns _MENU_DONE once a share starts/reports (so the menu closes and the progress is
+        # visible) or _MENU_UP when the user backs out at the consent prompt (re-show the list).
         backend = self.backend
         if not getattr(backend, "supports_session_sharing", False):
             self._set_message(
@@ -3881,12 +3903,12 @@ class ProxyRunner:
                 seconds=10.0,
             )
             self._render()
-            return
+            return self._MENU_DONE
         session_id = self.state.backend_session_id
         if not session_id or not backend.session_belongs_to_repo(self.repo.repo, session_id):
             self._set_message("No resumable session for this repo to share yet.")
             self._render()
-            return
+            return self._MENU_DONE
         # Informed consent before EVERY manual share — sharing is opt-in and never
         # automatic, and each push uploads a fresh, possibly sensitive transcript, so
         # the warning must appear every time, not just once. The first time it spells
@@ -3909,30 +3931,41 @@ class ProxyRunner:
         if choice != "Yes, share it":
             self._set_message("Sharing cancelled.")
             self._render()
-            return
+            return self._MENU_UP  # backed out before sharing — re-show the sessions list
         self.global_config.acknowledge_session_sharing()
-        payload = self._share_payload(session_id)
-        if payload is None:
-            self._set_message("Could not read the session transcript to share.")
-            self._render()
-            return
-        display = payload["display"]
         store = self._shared_store()
+        # The display name comes from cheap identity (no transcript read), so the progress
+        # notice and the keep-updated prompt below appear INSTANTLY. The heavy read+redact (and
+        # the push) run in the background op — previously they blocked the main thread here,
+        # which is the "it takes a while before the second confirmation" delay.
+        login = self.global_config.github_login or self._cached_or_resolve_login()
+        _owner, _name, contributors = self._share_identity(session_id, login)
+        display = f"{'+'.join(contributors)}/{_name}"
 
         def op():
-            return store.publish(
-                github_id=payload["owner"],
-                name=payload["name"],
-                transcript=payload["redacted"],
-                manifest=payload["manifest"],
-                prune_gid=payload["sharer"],
-                timeout=self.SHARE_PUSH_TIMEOUT,
-            )
+            payload = self._share_payload(session_id)  # read + redact OFF the main thread
+            if payload is None:
+                return {"payload": None}
+            return {
+                "payload": payload,
+                "result": store.publish(
+                    github_id=payload["owner"],
+                    name=payload["name"],
+                    transcript=payload["redacted"],
+                    manifest=payload["manifest"],
+                    prune_gid=payload["sharer"],
+                    timeout=self.SHARE_PUSH_TIMEOUT,
+                ),
+            }
 
         def outcome(box) -> str | None:
             if "error" in box:
                 return f"Could not share session: {box['error']}"
-            result = box["result"]
+            data = box["result"]
+            payload = data.get("payload")
+            if payload is None:
+                return "Could not read the session transcript to share."
+            result = data["result"]
             if result.behind:
                 # The shared copy already has newer turns than this session, so the push
                 # was refused. Don't just give up — stash it so the main loop can ask the
@@ -3940,7 +3973,7 @@ class ProxyRunner:
                 # over the background-op list). Leave the auto-share hash/origin untouched
                 # since nothing was published yet.
                 self._pending_share_conflicts.append(
-                    {"payload": payload, "store": store, "display": display, "session_id": session_id}
+                    {"payload": payload, "store": store, "display": payload["display"], "session_id": session_id}
                 )
                 return None
             self._auto_share_hash[session_id] = payload["digest"]  # don't immediately re-push the same content
@@ -3949,11 +3982,11 @@ class ProxyRunner:
             self._user_state().set_shared_origin(
                 session_id, owner=payload["owner"], name=payload["name"], contributors=payload["contributors"]
             )
-            return self._share_outcome_message(result, display)
+            return self._share_outcome_message(result, payload["display"])
 
-        # The push to origin runs in the BACKGROUND so the terminal never freezes; its
-        # result lands as a notice. Only the exit-path share blocks (it must finish
-        # before the process quits, since daemon threads die with it).
+        # The read+redact+push all run in the BACKGROUND so the terminal never freezes; the
+        # result lands as a notice. Only the exit-path share blocks (it must finish before the
+        # process quits, since daemon threads die with it).
         self._run_share_op_async(f"share:{display}", f"Sharing '{display}' — pushing to origin…", op, outcome)
         # Offer to keep it current automatically. This is a quick interactive prompt
         # (not a network wait), shown while the push proceeds in the background.
@@ -3970,6 +4003,7 @@ class ProxyRunner:
                     seconds=8.0,
                 )
                 self._render()
+        return self._MENU_DONE  # the share is underway — close the menu so its progress shows
 
     def _share_payload(self, session_id: str):
         """Read + redact the session transcript and build its manifest (no network,
@@ -4032,9 +4066,12 @@ class ProxyRunner:
                 f"or: git ls-remote origin 'refs/agitrack/*'."
             )
         else:
+            # The push to origin failed. Show the REAL reason (a stale-lease race, a protected
+            # ref, a declined hook, a timeout) rather than always blaming a concurrent update —
+            # and never a bare "[]" from an empty error.
             message = (
-                f"Saved '{display}' locally, but the push was rejected — someone else may have "
-                f"updated the shared ref. Try sharing again. [{result.error[:80]}]"
+                f"Saved '{display}' locally, but couldn't push it to origin. "
+                f"Reason: {_push_rejection_reason(result.error)}. Try sharing again."
             )
         if getattr(result, "merged", 0):
             # A concurrent contributor's diverged copy was folded in rather than
@@ -5319,12 +5356,13 @@ class ProxyRunner:
             return None
         return default_branch if choice == default_label else choice
 
-    def _stop_session_menu(self) -> None:
+    def _stop_session_menu(self) -> str:
         options = [self._session_name(index) for index in range(len(self.sessions))]
         choice = self._select_popup("Stop which session?", options)
         if choice is None:
-            return
+            return self._MENU_UP
         self._stop_session(options.index(choice))
+        return self._MENU_DONE
 
     def _fork_lineage_on_rename(self, session_id: str | None) -> None:
         # Rename-as-fork (#55): a deliberate rename re-identifies the session, so drop
@@ -5334,16 +5372,17 @@ class ProxyRunner:
         if session_id and self._user_state().shared_origin(session_id):
             self._user_state().set_shared_origin(session_id, owner=None, name=None)
 
-    def _rename_session_menu(self) -> None:
+    def _rename_session_menu(self) -> str:
         options = [self._session_name(index) for index in range(len(self.sessions))]
         choice = self._select_popup("Rename which session?", options)
         if choice is None:
-            return
+            return self._MENU_UP
         index = options.index(choice)
         new_name = self._prompt_popup("Rename session", "New name for this session:", default=self._session_name(index))
         if new_name is None or not new_name.strip():
-            return
+            return self._MENU_UP
         self._rename_session(index, new_name.strip())
+        return self._MENU_DONE
 
     def _rename_session(self, index: int, new_name: str) -> None:
         # Rename a session by moving its worktree directory. The worktree is in use
@@ -6966,6 +7005,11 @@ class ProxyRunner:
     def _after_menu_command(self, signal: str) -> None:
         """A top-level command menu closed. Esc/back (UP) goes up one level to the Ctrl-G
         command palette; a transition (DONE) drops through to the agent."""
+        if self._exit_menu_requested:
+            # Ctrl-G inside the menu asked to close everything: drop to the agent, don't reopen
+            # the palette — even though the unwind surfaced as _MENU_UP.
+            self._exit_menu_requested = False
+            return
         if signal == self._MENU_UP:
             self._reopen_command_palette()
 
@@ -6986,6 +7030,7 @@ class ProxyRunner:
         # backend like any other input). On a confirmed "exit"/"quit" this runs
         # the teardown flow (which sets self._exiting); the caller checks that
         # flag to break the reactor loop.
+        self._exit_menu_requested = False  # fresh menu session: clear any stale close request
         name, _, arg = command.partition(" ")
         if name in {"exit", "quit"}:
             if not self._run_exit_flow():
@@ -7516,9 +7561,25 @@ class ProxyRunner:
         or via ``_drain_modal_mailbox`` for a worker-queued dialog). Reads stdin and
         paints the screen, so it must never run off the main thread."""
         while True:
+            if self._exit_menu_requested:
+                # A Ctrl-G in a deeper popup asked to close the whole menu: don't even paint
+                # this one. Every nested level's next popup short-circuits the same way, so the
+                # menu unwinds straight to the agent (the flag is consumed in _after_menu_command).
+                self._clear_message()
+                self._render_pending = True
+                return None
             self._set_message(modal.render_message(), seconds=60)
             self._render()
             data = self._popup_read_input()
+            menu_key = getattr(self.input, "menu_key", b"\x07")
+            if menu_key and menu_key in data:
+                # The menu key while a popup is open closes the WHOLE menu (a toggle), matching
+                # the palette. Treat it as a cancel, but flag the full-close so the unwind above
+                # doesn't stop one level up.
+                self._exit_menu_requested = True
+                self._clear_message()
+                self._render_pending = True
+                return None
             action, value = modal.feed(data)
             if action == "done":
                 self._clear_message()
