@@ -5611,8 +5611,8 @@ class ProxyRunner:
             if self.child_pid:
                 try:
                     os.kill(self.child_pid, signal.SIGINT)
-                except ProcessLookupError:
-                    pass
+                except OSError:
+                    pass  # process already gone, or SIGINT unsupported (Windows ConPTY)
                 self._note_pid_for_reaping(self.child_pid)
             if self.master_fd is not None:
                 try:
@@ -6260,9 +6260,9 @@ class ProxyRunner:
         """
         self._reap_stopped_children()  # collect SIGINT'd backends as they exit
         if self.child_pid is not None:
-            done, status = os.waitpid(self.child_pid, os.WNOHANG)
+            done, status = self._waitpid_nowait(self.child_pid)
             if done:
-                exit_code = os.waitstatus_to_exitcode(status) if hasattr(os, "waitstatus_to_exitcode") else 0
+                exit_code = os.waitstatus_to_exitcode(status) if hasattr(os, "waitstatus_to_exitcode") else (status if sys.platform == "win32" else 0)
                 sample = self.last_child_output_sample[-512:].decode(errors="replace").replace("\x1b", "\\x1b")
                 self._debug(
                     f"child exited pid={self.child_pid} status={status} exit_code={exit_code} last_output={sample!r}"
@@ -8225,9 +8225,25 @@ class ProxyRunner:
         if pid:
             self._reap_pids.append(pid)
 
+    def _waitpid_nowait(self, pid: int) -> tuple[int, int]:
+        """Non-blocking child-exit check.  Returns (pid, status) if exited, (0, 0) if still running.
+        On POSIX: os.waitpid(WNOHANG).  On Windows: poll the ConPTY subprocess handle."""
+        if sys.platform == "win32":
+            handle = self.active.process._handle
+            if handle is not None:
+                rc = handle._proc.poll()
+                if rc is not None:
+                    return pid, max(0, rc)
+            return 0, 0
+        return os.waitpid(pid, os.WNOHANG)
+
     def _reap_stopped_children(self) -> None:
         pids = self._reap_pids
         if not pids:
+            return
+        if sys.platform == "win32":
+            # Windows has no zombie processes; once terminated, no reaping needed.
+            self._reap_pids = []
             return
         remaining = []
         for pid in pids:
