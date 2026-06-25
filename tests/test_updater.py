@@ -9,14 +9,10 @@ import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from agitrack.update.updater import (
     KIND_PACKAGE,
     KIND_SOURCE,
     METHOD_HOMEBREW,
-    METHOD_PIP,
-    DIST_NAME,
     Updater,
     _version_tuple,
 )
@@ -192,7 +188,6 @@ def test_installed_version_returns_string():
 def test_installed_version_fallback_on_metadata_error():
     updater = _make_updater_package()
     with patch("importlib.metadata.version", side_effect=Exception("not found")):
-        import agitrack
         result = updater._installed_version()
     # Must return something string-like without raising
     assert isinstance(result, str)
@@ -209,7 +204,7 @@ def test_latest_package_version_parses_latest_line():
         patch.object(updater, "_pip_invocation", return_value=["pip"]),
         patch("agitrack.update.updater.subprocess.run") as mock_run,
     ):
-        mock_run.return_value = _completed(0, stdout=f"LATEST: 1.5.0\nagitrack (1.4.0)\n")
+        mock_run.return_value = _completed(0, stdout="LATEST: 1.5.0\nagitrack (1.4.0)\n")
         result = updater._latest_package_version()
     assert result == "1.5.0"
 

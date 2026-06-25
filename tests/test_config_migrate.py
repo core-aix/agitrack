@@ -5,7 +5,6 @@ All tests use tmp_path — no real git repo or network needed.
 
 from __future__ import annotations
 
-import shutil
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 

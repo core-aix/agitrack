@@ -5,7 +5,6 @@ All backend availability checks and subprocess calls are mocked.
 
 from __future__ import annotations
 
-import sys
 from unittest.mock import MagicMock, patch
 
 import pytest

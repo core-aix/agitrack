@@ -166,7 +166,6 @@ if sys.platform == "win32":
 
 else:
     import pty as _pty
-    import select as _select
     import signal as _signal
 
     class _PosixPtyHandle:
