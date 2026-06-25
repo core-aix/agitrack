@@ -684,6 +684,10 @@ class ProxyRunner:
         # background push thread (only one at a time). Triggered per commit.
         self._auto_share_hash: dict[str, str] = {}
         self._auto_share_thread: threading.Thread | None = None
+        # The live auto-share worker (off-thread) leaves its result here for the main loop to
+        # surface; a notice is shown only on FAILURE/behind (success is silent, since it fires
+        # every commit). None ⇒ nothing to report. See _service_auto_share_outcome.
+        self._auto_share_outcome: dict | None = None
         # aGiTrack session ids (stable, never drift) that saw at least one committed turn
         # THIS run. The exit-path auto-share consults this so a session that was only
         # resumed and never typed into is not re-shared — robust where a transcript
@@ -965,6 +969,7 @@ class ProxyRunner:
                 "_warned_backend_session": False,
                 "_auto_share_hash": {},
                 "_auto_share_thread": None,
+                "_auto_share_outcome": None,
                 "_backend_update_thread": None,
                 "_backend_update_result": None,
                 "_backend_update_checked_for": None,
@@ -4047,8 +4052,12 @@ class ProxyRunner:
             choice = self._select_popup("Your shared sessions — pick one to manage", options)
             if choice is None:  # Esc → up one level (back to the sessions menu)
                 return self._MENU_UP
-            # The per-entry menu returns here, so its Esc re-shows this list (one level up).
-            self._manage_one_shared_session(mine[options.index(choice)])
+            # An action that kicks off a background network op (update/unshare/auto-on) returns
+            # _MENU_DONE so the whole menu closes and the user can WATCH its progress notice
+            # ("Unsharing…" → "Unshared") on the live screen — instead of the menu re-showing
+            # over it. Backing out of an entry (_MENU_UP) re-shows this list.
+            if self._manage_one_shared_session(mine[options.index(choice)]) == self._MENU_DONE:
+                return self._MENU_DONE
 
     def _shared_entry_status(self, entry, session_id: str) -> str:
         # Cheap "is the shared copy current?" — compare the transcript's byte size
@@ -4061,7 +4070,9 @@ class ProxyRunner:
             return "local has newer turns — Update to push them"
         return "shared (up to date)"
 
-    def _manage_one_shared_session(self, entry) -> None:
+    def _manage_one_shared_session(self, entry) -> str:
+        # Returns _MENU_DONE to close the whole menu (so a background op's progress notice is
+        # visible on the live screen), or _MENU_UP to re-show the shared-sessions list.
         sid = entry.manifest.get("session_id", "")
         auto_on = self._session_auto_shared(sid)
         actions = [
@@ -4071,11 +4082,12 @@ class ProxyRunner:
         ]
         choice = self._select_popup(f"Manage {entry.display}", [label for _, label in actions])
         if choice is None:
-            return
+            return self._MENU_UP  # Esc backs out to the list
         kind = actions[[label for _, label in actions].index(choice)][0]
         if kind == "update":
             self._update_shared_entry(entry)
-        elif kind == "auto":
+            return self._MENU_DONE  # close the menu so the "Updating…" → result notice shows
+        if kind == "auto":
             self._set_session_auto_share(sid, not auto_on)
             if auto_on:
                 self._set_message(f"Auto-update disabled for {entry.display}.")
@@ -4086,19 +4098,19 @@ class ProxyRunner:
                 self._set_message(f"Auto-update on for {entry.display} — pushing the latest now…", seconds=10.0)
                 self._render()
                 self._update_shared_entry(entry)
-        else:
-            # Unsharing removes the session from origin for every collaborator and
-            # can't be undone, so confirm before doing it (mirrors the discard-confirm
-            # flow).
-            confirm = self._select_popup(
-                f"Unshare '{entry.display}'? This removes it from origin for everyone and can't be undone.",
-                ["No, keep it", "Yes, unshare"],
-            )
-            if confirm == "Yes, unshare":
-                self._unshare_entry(entry)
-            else:
-                self._set_message("Kept the shared session.")
-                self._render()
+            return self._MENU_DONE  # close the menu so the message/push progress is visible
+        # Unsharing removes the session from origin for every collaborator and can't be undone,
+        # so confirm before doing it (mirrors the discard-confirm flow).
+        confirm = self._select_popup(
+            f"Unshare '{entry.display}'? This removes it from origin for everyone and can't be undone.",
+            ["No, keep it", "Yes, unshare"],
+        )
+        if confirm == "Yes, unshare":
+            self._unshare_entry(entry)
+            return self._MENU_DONE  # close the menu so "Unsharing…" → "Unshared" is visible
+        self._set_message("Kept the shared session.")
+        self._render()
+        return self._MENU_UP  # cancelled — back to the list
 
     def _update_shared_entry(self, entry) -> None:
         sid = entry.manifest.get("session_id", "")
@@ -4154,7 +4166,12 @@ class ProxyRunner:
         store = self._shared_store()
         sid = entry.manifest.get("session_id", "")
         if sid:
-            self._set_session_auto_share(sid, False)  # stop auto-pushing it immediately
+            # Stop auto-pushing it immediately — across the WHOLE id lineage, not just this
+            # entry's id. The backend mints a new id on resume, so auto-share may be opted in
+            # under a drifted id; clearing only `sid` left it enabled (the menu kept showing it
+            # as shared/auto and it kept re-pushing). _session_auto_shared reads the lineage too.
+            for lineage_sid in {sid, *self._user_state().session_lineage(sid)}:
+                self._set_session_auto_share(lineage_sid, False)
 
         def op():
             return store.unshare(entry.github_id, entry.name)
@@ -4393,12 +4410,14 @@ class ProxyRunner:
         self._auto_share_thread.start()
 
     def _auto_share_worker(self, ctx: dict):
-        # Runs off the reactor thread; best-effort, never touches the UI. Reads and
-        # redacts the (possibly large) transcript and pushes here, not on the loop.
-        # Returns the PublishResult on a push, or None when it skipped (no
-        # transcript / unchanged) or hit an error — the exit path inspects it.
+        # Runs off the reactor thread; best-effort. Reads and redacts the (possibly large)
+        # transcript and pushes here, not on the loop. Returns the PublishResult on a push,
+        # or None when it skipped (no transcript / unchanged) or hit an error — the exit path
+        # inspects it. Records the outcome for the main loop to surface ONLY on failure/behind
+        # (success is silent: this fires on every commit). See _service_auto_share_outcome.
+        sid = ctx["session_id"]
         try:
-            backend, sid = ctx["backend"], ctx["session_id"]
+            backend = ctx["backend"]
             raw = backend.export_session_raw(ctx["repo_path"], sid) or backend.export_session_raw(
                 ctx["base_repo_path"], sid
             )
@@ -4410,7 +4429,6 @@ class ProxyRunner:
             digest = hashlib.sha256(redacted.encode("utf-8")).hexdigest()
             if digest == ctx["last_hash"]:
                 return None  # nothing new since the last push — skip the network round-trip
-            self._auto_share_hash[sid] = digest
             manifest = {
                 "github_id": ctx["owner"],  # lineage origin owner (entry's ref path owner)
                 "name": ctx["name"],
@@ -4424,16 +4442,57 @@ class ProxyRunner:
                 "transcript_bytes": backend.transcript_size(ctx["base_repo_path"], sid),
                 "transcript_rows": _shared_transcript_rows(redacted),
             }
-            return ctx["store"].publish(
+            result = ctx["store"].publish(
                 github_id=ctx["owner"],
                 name=ctx["name"],
                 transcript=redacted,
                 manifest=manifest,
                 prune_gid=ctx["login"],
+                # Bound the push: a stalled remote must not strand this worker, because the
+                # in-flight guard (_auto_share_thread.is_alive()) would then block EVERY future
+                # auto-share for the run — the session would silently stop updating (the bug).
+                timeout=self.SHARE_PUSH_TIMEOUT,
             )
+            # Cache the digest ONLY after a real success, so a failed/refused push retries on
+            # the next commit instead of being silently marked "already shared" (which left the
+            # shared copy days stale with no error). A remote-less repo only has the local ref,
+            # so a successful local write counts as shared.
+            if result.pushed or not result.remote:
+                self._auto_share_hash[sid] = digest
+                self._auto_share_outcome = {"ok": True}
+            elif result.behind:
+                self._auto_share_outcome = {"behind": True, "name": ctx["name"]}
+            else:
+                self._auto_share_outcome = {"failed": result.error or "push rejected", "name": ctx["name"]}
+            return result
         except Exception as error:
             self._debug(f"auto-share failed: {error!r}")
+            self._auto_share_outcome = {"failed": str(error), "name": ctx["name"]}
             return None
+
+    def _service_auto_share_outcome(self) -> None:
+        """Main-loop tick: surface the live auto-share worker's result. Only FAILURE and
+        'behind' are shown (success is silent — auto-share fires on every commit), so a push
+        that keeps failing becomes visible instead of leaving the shared copy quietly stale."""
+        outcome = self._auto_share_outcome
+        if outcome is None:
+            return
+        self._auto_share_outcome = None
+        name = outcome.get("name", "this session")
+        if "failed" in outcome:
+            self._set_session_notice(
+                "auto-share",
+                f"Auto-share for {name} failed: {str(outcome['failed'])[:120]} — it will retry on the next commit.",
+                seconds=12.0,
+            )
+            self._render()
+        elif outcome.get("behind"):
+            self._set_session_notice(
+                "auto-share",
+                f"Auto-share for {name} skipped — the shared copy already has newer turns than this machine.",
+                seconds=10.0,
+            )
+            self._render()
 
     def _auto_share_on_exit(self) -> None:
         # Exit-path counterpart to _maybe_auto_share_active. The live auto-share
@@ -6287,6 +6346,7 @@ class ProxyRunner:
             # restart; stop before any further servicing.
             return
         self._service_background_share_ops()  # surface finished background unshare/etc. results
+        self._service_auto_share_outcome()  # surface a live auto-share failure (else it's silent)
         self._service_share_conflicts()  # prompt overwrite/merge for a share refused as behind
         self._service_backend_update()  # surface a finished backend auto-update result
         self._maybe_auto_update_backend()  # auto-apply a brew-managed backend update; once per backend
