@@ -26,6 +26,7 @@ _last_error = ctypes.get_last_error  # type: ignore[attr-defined]
 _STILL_ACTIVE = 259
 _EXTENDED_STARTUPINFO_PRESENT = 0x00080000
 _CREATE_UNICODE_ENVIRONMENT = 0x00000400
+_CREATE_NO_WINDOW = 0x08000000
 _PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = 0x00020016
 
 
@@ -163,7 +164,10 @@ class ConPTY:
         si.StartupInfo.cb = sizeof(_STARTUPINFOEXW)
         si.lpAttributeList = attr_list
         pi = _PROCESS_INFORMATION()
-        flags = _EXTENDED_STARTUPINFO_PRESENT
+        # CREATE_NO_WINDOW keeps the child headless: without it, on Windows 11 with Windows
+        # Terminal as the default terminal, the frozen build hands the ConPTY child off to a
+        # NEW Windows Terminal window instead of staying in aGiTrack's pseudoconsole.
+        flags = _EXTENDED_STARTUPINFO_PRESENT | _CREATE_NO_WINDOW
         env_buf = None
         if env:
             env_buf = ctypes.create_unicode_buffer(env)
@@ -198,9 +202,15 @@ class ConPTY:
     def read(self, blocking: bool = True) -> bytes:
         """Currently-available child output, or ``b""`` at EOF (the child exited and the pipe
         drained). Polls the output pipe so the reader thread unblocks when the child dies —
-        a blocking ``ReadFile`` would hang, since the console keeps the pipe open until close."""
+        a blocking ``ReadFile`` would hang, since the console keeps the pipe open until close.
+
+        After the child exits, the console may still flush its final rendered output to the
+        pipe, so don't declare EOF the instant the process dies — keep draining for a short
+        grace window first (a fast child like ``cmd /c echo …& exit`` can finish before any
+        byte has been rendered)."""
         buf = (ctypes.c_byte * 65536)()
         avail, read = wintypes.DWORD(0), wintypes.DWORD(0)
+        grace = 0
         while not self._closed:
             if _k32.PeekNamedPipe(self._out_read, None, 0, None, byref(avail), None) and avail.value:
                 want = min(len(buf), avail.value)
@@ -208,11 +218,11 @@ class ConPTY:
                     return bytes(buf[: read.value])
                 return b""
             if not self.isalive():
-                if _k32.PeekNamedPipe(self._out_read, None, 0, None, byref(avail), None) and avail.value:
-                    want = min(len(buf), avail.value)
-                    if _k32.ReadFile(self._out_read, buf, want, byref(read), None) and read.value:
-                        return bytes(buf[: read.value])
-                return b""
+                grace += 1
+                if grace > 30:  # ~300ms with no further output after exit → real EOF
+                    return b""
+                time.sleep(0.01)
+                continue
             if not blocking:
                 return b""
             time.sleep(0.005)
