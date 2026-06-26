@@ -155,8 +155,12 @@ class ConPTY:
         attr_list = ctypes.cast(attr_buf, c_void_p)
         if not _k32.InitializeProcThreadAttributeList(attr_list, 1, 0, byref(size)):
             raise _win_error(_last_error())
+        # The pseudoconsole value is the HPCON itself, passed BY VALUE (matching the Win32 C
+        # sample and winpty-rs): ctypes hands UpdateProcThreadAttribute the handle as lpValue.
+        # Passing byref(self._hpc) instead stores the handle's *address* as the pseudoconsole,
+        # so the child never attaches and its output goes to the parent's console, not our pipe.
         if not _k32.UpdateProcThreadAttribute(
-            attr_list, 0, _PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, byref(self._hpc), sizeof(wintypes.HANDLE), None, None
+            attr_list, 0, _PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, self._hpc, sizeof(wintypes.HANDLE), None, None
         ):
             raise _win_error(_last_error())
 
