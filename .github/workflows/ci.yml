@@ -92,6 +92,93 @@ jobs:
       - name: Windows-relevant tests + ConPTY
         run: uv run python -m pytest tests/test_proc.py tests/test_dashboard_daemon.py tests/test_shutdown_request.py tests/test_windows_conpty.py -q
 
+  # The Windows MSI is a first-class, standalone install method — a user can download it
+  # from the GitHub release and install aGiTrack without pip/pipx/Python (the VSCode
+  # extension also falls back to it when no Python tooling is present). release.yml only
+  # builds the MSI on a version tag, so it could silently rot between releases; this job
+  # builds it on every PR AND proves it installs by itself: a silent perMachine `msiexec`
+  # install (the runner has an admin token), then run the installed agitrack.exe, then a
+  # clean silent uninstall. If the WiX source, the PyInstaller spec, or a new runtime
+  # import breaks the bundle, this fails here rather than at release time.
+  build-msi:
+    name: Build + install Windows MSI
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install runtime + build deps
+        run: uv sync --group build
+
+      - name: Read version from pyproject
+        id: version
+        shell: pwsh
+        run: |
+          $ver = (Select-String -Path pyproject.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          echo "VERSION=$ver" >> $env:GITHUB_OUTPUT
+          echo "MSI_NAME=agitrack-$ver-windows-x64.msi" >> $env:GITHUB_OUTPUT
+
+      - name: Build with PyInstaller
+        run: uv run pyinstaller installer/agitrack.spec -y
+
+      - name: Smoke-test bundled EXE
+        shell: pwsh
+        run: dist\agitrack\agitrack.exe --version
+
+      - name: Install WiX v4
+        run: dotnet tool install --global wix --version 4.*
+
+      - name: Add WiX UI extension
+        run: wix extension add --global WixToolset.UI.wixext
+
+      - name: Harvest PyInstaller output
+        run: |
+          wix harvest dir dist\agitrack `
+            --output installer\agitrack-files.wxs `
+            --component-group AgitrackFiles `
+            --directory-ref INSTALLFOLDER `
+            --var var.SourceDir
+
+      - name: Build MSI
+        run: |
+          wix build `
+            installer\agitrack.wxs `
+            installer\agitrack-files.wxs `
+            -d Version=${{ steps.version.outputs.VERSION }} `
+            -d SourceDir=dist\agitrack `
+            -ext WixToolset.UI.wixext `
+            -o dist\${{ steps.version.outputs.MSI_NAME }}
+
+      # Prove the MSI installs as a standalone product (no pip/Python on the target).
+      # /qn is a silent perMachine install; the runner's admin token bypasses UAC.
+      - name: Install the MSI silently
+        shell: pwsh
+        run: |
+          $msi = "dist\${{ steps.version.outputs.MSI_NAME }}"
+          $proc = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait -PassThru
+          if ($proc.ExitCode -ne 0) { throw "msiexec install failed: exit $($proc.ExitCode)" }
+
+      - name: Run the installed agitrack.exe
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:ProgramFiles "aGiTrack\agitrack.exe"
+          if (-not (Test-Path $exe)) { throw "installed exe not found at $exe" }
+          & $exe --version
+
+      - name: Uninstall the MSI silently
+        shell: pwsh
+        run: |
+          $msi = "dist\${{ steps.version.outputs.MSI_NAME }}"
+          $proc = Start-Process msiexec.exe -ArgumentList "/x `"$msi`" /qn /norestart" -Wait -PassThru
+          if ($proc.ExitCode -ne 0) { throw "msiexec uninstall failed: exit $($proc.ExitCode)" }
+
   # The VSCode extension is TypeScript, built and tested with Node — independent of the
   # Python suite above. Its unit tests (node:test) are platform-independent (the
   # native-Windows guard is exercised by passing platform strings, not the real OS), so a

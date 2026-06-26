@@ -41,6 +41,8 @@ python3 -m pip install -e .
 - **`agitrack` not found after install?** Your Python `Scripts` dir isn't on PATH. Run it as `py -m agitrack`, or install with **pipx** (`pipx install agitrack`), which puts it on PATH for you.
 - The write-confinement **sandbox is macOS/Linux-only**, so on Windows the agent runs unconfined (aGiTrack shows a one-time warning).
 
+**No Python? Use the standalone MSI installer.** Each release ships a self-contained Windows installer — `agitrack-<version>-windows-x64.msi` — attached to the [GitHub release](https://github.com/core-aix/agitrack/releases/latest). It bundles its own Python (built with PyInstaller), so it installs and runs `agitrack` on a machine with **no Python or pip at all**: download it, double-click, and `agitrack` is added to your PATH under `C:\Program Files\aGiTrack`. The [VS Code extension](editors/vscode/README.md) uses this same MSI automatically when it can't find pipx or pip. (The MSI is unsigned for now; if SmartScreen warns, choose *More info → Run anyway*.)
+
 ### Prerequisites — git and a backend (macOS · Linux · Windows)
 
 aGiTrack needs **git** and at least one backend CLI ([Claude Code](https://docs.claude.com/en/docs/claude-code) or [OpenCode](https://opencode.ai)); the GitHub CLI (`gh`) is optional (it lets the dashboard show authors by GitHub username). Install them for your OS:

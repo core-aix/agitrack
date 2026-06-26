@@ -19,11 +19,20 @@
 import * as vscode from "vscode";
 import { execFile, spawn } from "child_process";
 import { readdirSync, readFileSync, writeFileSync } from "fs";
-import { homedir } from "os";
+import { writeFile } from "fs/promises";
+import { homedir, tmpdir } from "os";
 import { join } from "path";
 
 import { GhStatus, hasGithubRemoteUrl, shouldPromptGithubSignIn } from "./github";
 import { dedupe, exeName, staticExeCandidates } from "./installPaths";
+import {
+  githubRepo,
+  latestReleasePageUrl,
+  MsiAsset,
+  msiInstallCandidates,
+  pickMsiAsset,
+  releasesApiUrl,
+} from "./msi";
 import { sessionLooksLive } from "./liveness";
 import { isNativeWindows } from "./platform";
 
@@ -270,8 +279,8 @@ void isNativeWindows; // suppress unused-import linters
 /** First-run housekeeping: if the CLI is present, check version parity; if it's
  * missing, offer to install it so the extension is usable out of the box. */
 async function bootstrap(context: vscode.ExtensionContext): Promise<void> {
-  const exe = configuredExe();
-  if (await runnable(exe)) {
+  const exe = await findInstalledExe();
+  if (exe) {
     await checkVersionParity(context, exe);
     return;
   }
@@ -953,12 +962,12 @@ function configuredExe(): string {
 
 /** Return a runnable aGiTrack executable, installing it on demand when missing. */
 async function ensureCliAvailable(): Promise<string | undefined> {
-  const exe = configuredExe();
-  if (await runnable(exe)) {
-    return exe;
+  const existing = await findInstalledExe();
+  if (existing) {
+    return existing;
   }
   const choice = await vscode.window.showInformationMessage(
-    "aGiTrack isn't installed. Install it now? (Requires Python 3.10+.)",
+    "aGiTrack isn't installed. Install it now? (Requires Python 3.10+, or the bundled Windows installer.)",
     { modal: true },
     "Install aGiTrack",
   );
@@ -966,6 +975,27 @@ async function ensureCliAvailable(): Promise<string | undefined> {
     return undefined;
   }
   return installAgitrack();
+}
+
+/** The aGiTrack exe to use, or `undefined` when none is installed yet. Returns the
+ * configured path when runnable; otherwise, on Windows, discovers a by-hand MSI install at
+ * its absolute Program Files location — a GUI-launched VSCode doesn't inherit the PATH entry
+ * the MSI adds, so a bare `agitrack` lookup misses it (issue #93) — and persists it. */
+async function findInstalledExe(): Promise<string | undefined> {
+  const exe = configuredExe();
+  if (await runnable(exe)) {
+    return exe;
+  }
+  if (process.platform === "win32" && exe === "agitrack") {
+    const installed = await resolveMsiInstalledExe();
+    if (installed) {
+      await vscode.workspace
+        .getConfiguration("agitrack")
+        .update("path", installed, vscode.ConfigurationTarget.Global);
+      return installed;
+    }
+  }
+  return undefined;
 }
 
 interface InstallPlan {
@@ -981,6 +1011,12 @@ interface InstallPlan {
 async function installAgitrack(): Promise<string | undefined> {
   const plan = await planInstaller();
   if (!plan) {
+    // No pipx/pip on PATH. On Windows the standalone MSI is a complete, Python-free
+    // install (it bundles its own interpreter), so fall back to it rather than dead-ending
+    // at "install Python" — some machines have no Python at all.
+    if (process.platform === "win32") {
+      return installViaMsi();
+    }
     const pick = await vscode.window.showErrorMessage(
       "aGiTrack needs Python 3.10+ with pipx or pip. Install Python, then try again.",
       "Open python.org",
@@ -1047,6 +1083,111 @@ async function planInstaller(): Promise<InstallPlan | undefined> {
       label: `pip (${py})`,
       userBaseFrom: py,
     };
+  }
+  return undefined;
+}
+
+/** Install aGiTrack on Windows from the standalone MSI on the latest GitHub release.
+ *
+ * The fallback when no pipx/pip is present: the MSI bundles its own Python, so the machine
+ * needs no Python tooling at all. Downloads the release asset, runs `msiexec` (which
+ * self-elevates with a UAC prompt for the perMachine install), then resolves the installed
+ * exe by absolute path (PATH isn't refreshed in this process after the install). */
+async function installViaMsi(): Promise<string | undefined> {
+  const repo = githubRepo(process.env);
+  try {
+    const exe = await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: "Installing aGiTrack (Windows installer)…" },
+      async (progress) => {
+        progress.report({ message: "Finding the latest release…" });
+        const asset = await fetchLatestMsiAsset(repo);
+        if (!asset) {
+          throw new Error("the latest aGiTrack release has no Windows installer (.msi) asset");
+        }
+        progress.report({ message: `Downloading ${asset.name}…` });
+        const file = await downloadMsiToTemp(asset);
+        progress.report({ message: "Running the installer — accept the Windows prompt…" });
+        await runMsiInstaller(file);
+        return resolveMsiInstalledExe();
+      },
+    );
+    if (!exe) {
+      const pick = await vscode.window.showErrorMessage(
+        "aGiTrack installed, but its executable wasn't found under Program Files. Open a new " +
+          "terminal and run `agitrack --version`; if that works, paste its path into the " +
+          "`agitrack.path` setting.",
+        "Open Setting",
+      );
+      if (pick) {
+        void vscode.commands.executeCommand("workbench.action.openSettings", "agitrack.path");
+      }
+      return undefined;
+    }
+    await vscode.workspace.getConfiguration("agitrack").update("path", exe, vscode.ConfigurationTarget.Global);
+    void vscode.window.showInformationMessage("aGiTrack installed.");
+    return exe;
+  } catch (err) {
+    const pick = await vscode.window.showErrorMessage(
+      `Installing aGiTrack from the Windows installer failed: ${errorText(err)}`,
+      "Open Releases Page",
+    );
+    if (pick) {
+      void vscode.env.openExternal(vscode.Uri.parse(latestReleasePageUrl(repo)));
+    }
+    return undefined;
+  }
+}
+
+/** Query the GitHub Releases API for the latest release's Windows MSI asset, or `undefined`
+ * when that release ships none. */
+async function fetchLatestMsiAsset(repo: string): Promise<MsiAsset | undefined> {
+  const resp = await fetch(releasesApiUrl(repo), {
+    headers: { Accept: "application/vnd.github+json", "User-Agent": "agitrack-vscode" },
+  });
+  if (!resp.ok) {
+    throw new Error(`GitHub API returned ${resp.status} ${resp.statusText}`);
+  }
+  const release = (await resp.json()) as { assets?: unknown };
+  return pickMsiAsset(release.assets);
+}
+
+/** Download the MSI asset to the OS temp dir and return the local file path. */
+async function downloadMsiToTemp(asset: MsiAsset): Promise<string> {
+  const resp = await fetch(asset.url, {
+    headers: { Accept: "application/octet-stream", "User-Agent": "agitrack-vscode" },
+  });
+  if (!resp.ok) {
+    throw new Error(`downloading the installer returned ${resp.status} ${resp.statusText}`);
+  }
+  const bytes = Buffer.from(await resp.arrayBuffer());
+  const dest = join(tmpdir(), asset.name);
+  await writeFile(dest, bytes);
+  return dest;
+}
+
+/** Run the downloaded MSI. `msiexec /i` self-elevates (UAC) for the perMachine install; we
+ * wait for it and tolerate exit 3010 (success, reboot advised) as success. The long timeout
+ * covers the UAC wait plus the install. */
+function runMsiInstaller(msiPath: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    execFile("msiexec", ["/i", msiPath, "/passive", "/norestart"], { timeout: 600_000 }, (err) => {
+      const code = (err as { code?: number } | null)?.code;
+      if (!err || code === 3010) {
+        resolve();
+      } else {
+        reject(new Error(errorText(err)));
+      }
+    });
+  });
+}
+
+/** Find agitrack.exe under the MSI's Program Files install dir, or `undefined`. PATH may not
+ * be inherited by a GUI-launched VSCode, so only absolute candidates are probed. */
+async function resolveMsiInstalledExe(): Promise<string | undefined> {
+  for (const candidate of msiInstallCandidates(process.env)) {
+    if (await runnable(candidate)) {
+      return candidate;
+    }
   }
   return undefined;
 }
