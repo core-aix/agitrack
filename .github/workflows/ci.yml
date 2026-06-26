@@ -157,6 +157,17 @@ jobs:
             -ext WixToolset.UI.wixext `
             -o dist\${{ steps.version.outputs.MSI_NAME }}
 
+      # Publish the built MSI as a downloadable workflow artifact so it can be tested by hand
+      # off any PR/branch build — not just at release time. (Uploaded before the install
+      # smoke-test below so the artifact is captured even if that step later fails.)
+      - name: Upload MSI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.version.outputs.MSI_NAME }}
+          path: dist/${{ steps.version.outputs.MSI_NAME }}
+          if-no-files-found: error
+          retention-days: 14
+
       # Prove the MSI installs as a standalone product (no pip/Python on the target).
       # /qn is a silent perMachine install; the runner's admin token bypasses UAC.
       - name: Install the MSI silently
