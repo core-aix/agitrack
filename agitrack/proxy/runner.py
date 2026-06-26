@@ -4810,8 +4810,16 @@ class ProxyRunner:
                 continue
             for fd in readable:
                 if fd == stdin_fd:
-                    if self._stdin_has_cancel(self._read_stdin(32)):
+                    chunk = self._read_stdin(32)
+                    if self._stdin_has_cancel(chunk):
                         return "cancel"
+                    # Keystrokes typed while this wait runs belong to the live backend, not
+                    # to the wait — stash them on the same `_input_tail` pushback the main
+                    # reactor prepends to its next stdin read, so they are forwarded once the
+                    # wait ends instead of being silently dropped (the first keystrokes after
+                    # a backend switch land here while the new session's fetch is in flight).
+                    elif chunk:
+                        self._input_tail = self._input_tail + chunk
                 elif fd == master:
                     output = self._drain_child_output()
                     if output is not None:
