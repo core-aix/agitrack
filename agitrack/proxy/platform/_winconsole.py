@@ -70,6 +70,38 @@ def _set_mode(handle: int, mode: int) -> None:
     _kernel32.SetConsoleMode(handle, mode)
 
 
+# Console control-event handler. aGiTrack treats Ctrl-C as a forwarded input *byte* (raw
+# mode), never as a signal. But a CTRL_C_EVENT — e.g. one propagated from a ConPTY backend's
+# pseudoconsole/teardown (seen with OpenCode), or delivered while the console is briefly in
+# cooked mode for a prompt — would otherwise raise SIGINT/KeyboardInterrupt and either crash
+# the reactor (it's uncaught inside a popup's read loop) or interrupt input handling and drop
+# the user's keystrokes. Swallow Ctrl-C / Ctrl-Break so they never become a Python signal;
+# leave CTRL_CLOSE/LOGOFF/SHUTDOWN to default handling (the extension's shutdown-file +
+# taskkill path covers graceful close).
+_CTRL_C_EVENT = 0
+_CTRL_BREAK_EVENT = 1
+_PHANDLER_ROUTINE = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)  # type: ignore[attr-defined]  # Windows-only
+
+
+def _console_ctrl_handler(ctrl_type: int) -> bool:
+    return ctrl_type in (_CTRL_C_EVENT, _CTRL_BREAK_EVENT)
+
+
+# Keep the ctypes callback alive for the process lifetime: SetConsoleCtrlHandler stores the
+# raw function pointer, so if this object were GC'd Windows would call freed memory.
+_console_ctrl_handler_ref = _PHANDLER_ROUTINE(_console_ctrl_handler)
+_ctrl_handler_installed = False
+
+
+def suppress_console_ctrl_c() -> None:
+    """Install the Ctrl-C/Ctrl-Break swallowing handler (idempotent)."""
+    global _ctrl_handler_installed
+    if _ctrl_handler_installed:
+        return
+    if _kernel32.SetConsoleCtrlHandler(_console_ctrl_handler_ref, True):
+        _ctrl_handler_installed = True
+
+
 def read_input(length: int) -> bytes:
     """Blocking read of up to *length* bytes from the console input handle.
 

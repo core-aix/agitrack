@@ -65,6 +65,10 @@ class NtHostTerminal:
         from agitrack.proxy.platform import _winconsole
 
         self._winconsole = _winconsole
+        # aGiTrack handles Ctrl-C as a forwarded byte, never a signal: swallow console
+        # Ctrl-C/Ctrl-Break events so a stray one (e.g. propagated from an OpenCode ConPTY
+        # teardown) can't raise KeyboardInterrupt and crash the reactor or drop keystrokes.
+        _winconsole.suppress_console_ctrl_c()
         self._console = _winconsole.RawConsole()
         self._rsock, self._wsock = socket.socketpair()
         self._rsock.setblocking(False)
