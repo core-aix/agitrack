@@ -137,5 +137,13 @@
     -->
     <ui:WixUI Id="WixUI_Minimal" />
 
+    <!--
+      Show aGiTrack's actual licence (Apache-2.0) on the EULA page. Without this WiX shows
+      its built-in placeholder text. installer/license.rtf is generated from the repo's
+      LICENSE file; $(sys.SOURCEFILEDIR) is the directory of this .wxs, so the path resolves
+      no matter what working directory `wix build` runs from.
+    -->
+    <WixVariable Id="WixUILicenseRtf" Value="$(sys.SOURCEFILEDIR)license.rtf" />
+
   </Package>
 </Wix>
