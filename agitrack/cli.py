@@ -64,10 +64,23 @@ def _gh_install_hint() -> str:
     )
 
 
+def _installed_via_msi() -> bool:
+    """True for a frozen (PyInstaller) build — i.e. the Windows MSI bundle. There,
+    prerequisite setup (backends, git, gh, git identity, gh login) is the MSI installer's
+    job, so aGiTrack does NOT prompt for it at runtime. A pip/source install is not frozen
+    and does its setup at first run, on every platform (including Windows)."""
+    return bool(getattr(sys, "frozen", False))
+
+
 def _maybe_install_tool(name: str, *, required: bool) -> bool:
     """Offer to auto-install a missing prerequisite (``git`` or ``gh``); return True once it
     is available. Only prompts on an interactive TTY where a supported package manager
-    exists — otherwise returns False so the caller falls back to printing the manual hint."""
+    exists — otherwise returns False so the caller falls back to printing the manual hint.
+
+    The MSI bundle is intentionally excluded: there, prerequisites are set up by the MSI
+    installer, not by aGiTrack at runtime. A pip/source install still offers it (any OS)."""
+    if _installed_via_msi():
+        return False
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         return False
     from agitrack.system_tools import can_install_tool, install_system_tool
@@ -422,9 +435,9 @@ def main(argv: list[str] | None = None) -> int:
 
     # Make sure git can actually commit: without a global user.name/user.email every commit
     # fails with "Author identity unknown", and aGiTrack commits each turn. Prompt for any
-    # missing value on an interactive launch (skipped for scripted/json so machine-readable
-    # output stays clean; those users are expected to have git configured already).
-    if args.mode == "proxy" and sys.stdin.isatty() and sys.stdout.isatty():
+    # missing value on an interactive launch; the MSI bundle defers this to the installer,
+    # and scripted/json runs are left clean (those users have git configured).
+    if args.mode == "proxy" and not _installed_via_msi() and sys.stdin.isatty() and sys.stdout.isatty():
         _ensure_git_identity()
 
     # Offer a self-update before launching anything. Skipped for scripted/non-TTY
@@ -434,10 +447,19 @@ def main(argv: list[str] | None = None) -> int:
     if not scripted and sys.stdin.isatty() and sys.stdout.isatty():
         _check_for_update_at_startup(config)
 
+    # First-run backend setup. Skipped for the MSI bundle (the installer handles it); a
+    # pip/source install does it here, on any OS. Only when at least one backend is missing —
+    # if both are already installed there's nothing to prompt about. select_default_backend
+    # lists statuses and offers to install the missing one(s).
+    from agitrack.backends.setup import backend_installed
+
+    some_backend_missing = not all(backend_installed(name) for name in available_backends())
     if (
         args.backend is None
         and not config.has_default_backend()
         and not scripted
+        and not _installed_via_msi()
+        and some_backend_missing
         and sys.stdin.isatty()
         and sys.stdout.isatty()
     ):
@@ -814,8 +836,9 @@ def _check_gh_availability(repo: GitRepo, *, scripted: bool = False) -> tuple[bo
     Returns ``(proceed, handled)``: ``proceed`` is False only when the user chose to quit;
     ``handled`` is True when the interactive prompt was shown, so the runner can skip its
     own in-TUI gh notice. Never blocks automation — without an interactive TTY (or in
-    scripted mode) it does nothing and returns ``(True, False)``."""
-    if scripted or not (sys.stdin.isatty() and sys.stdout.isatty()):
+    scripted mode) it does nothing and returns ``(True, False)``. The MSI bundle also does
+    nothing — gh setup/login there is the installer's job; a pip/source install still does it."""
+    if _installed_via_msi() or scripted or not (sys.stdin.isatty() and sys.stdout.isatty()):
         return (True, False)
     from agitrack.metrics.github import commit_url_base, gh_status
 

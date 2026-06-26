@@ -324,40 +324,36 @@ def ensure_installed_backend(
     interactive: bool,
     input_fn: Callable[[str], str] = input,
     output_fn: Callable[[str], None] = print,
-    install_fn: Callable[..., bool] = install_backend,
 ) -> str:
-    """Make sure the backend that is about to run is installed. If not, offer to install it
-    automatically, switch to an installed backend (saving the new default), or see manual
-    instructions. Returns the backend to use; raises BackendUnavailable otherwise."""
+    """Make sure the backend that is about to run is installed before launching it. This is a
+    launch-time GATE, not an installer: aGiTrack does not install backends at runtime
+    (that's the MSI installer on Windows, or first-run on macOS/Linux). If the backend is
+    missing, show manual install instructions and let the user install it themselves and
+    retry, or switch to an already-installed backend. Returns the backend to use; raises
+    BackendUnavailable otherwise."""
     if backend_installed(name):
         return name
     if not interactive:
         raise BackendUnavailable(f"Backend '{name}' is not installed.\n{install_hint(name)}")
 
     names = available_backends()
-    label = _label(name)
     while True:
         if backend_installed(name):
             return name
-        installed = [other for other in names if backend_installed(other)]
         output_fn(f"\nThe selected backend '{name}' is not installed.\n")
-        prompt = f"Press Enter to install {label} now"
+        output_fn(install_hint(name))
+        installed = [other for other in names if backend_installed(other)]
+        prompt = "\nPress Enter after installing it to retry"
         if installed:
             prompt += f", type a backend to switch to ({', '.join(installed)})"
-        prompt += ", 'm' for manual instructions, or 'q' to quit: "
+        prompt += ", or 'q' to quit: "
         answer = input_fn(prompt).strip().lower()
         if answer in {"q", "quit"}:
             raise BackendUnavailable(f"Backend '{name}' is not installed.")
         if answer in installed:
             config.default_backend = answer
             return answer
-        if answer in {"m", "manual"}:
-            output_fn("\n" + install_hint(name))
-            input_fn("\nPress Enter after installing to retry: ")
-            continue
-        if install_fn(name, output_fn=output_fn):
-            return name
-        # Install didn't take — loop and offer the choices again.
+        # Otherwise loop and re-check whether `name` is now installed.
 
 
 def _label(name: str) -> str:

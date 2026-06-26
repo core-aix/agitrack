@@ -157,23 +157,27 @@ def test_ensure_installed_backend_not_interactive_raises():
             ensure_installed_backend("claude", config, interactive=False)
 
 
-def test_ensure_installed_backend_auto_installs_on_enter():
+def test_ensure_installed_backend_is_a_gate_not_an_installer():
+    # The launch gate never installs (that's the MSI / first-run). It shows the manual hint
+    # and re-checks on Enter; once the user has installed it by hand, it proceeds.
     config = MagicMock()
-    calls = []
+    state = {"installed": False}
+    lines = []
+
+    def fake_input(_prompt):
+        state["installed"] = True  # user installs it, then presses Enter
+        return ""
+
     with (
         patch("agitrack.backends.setup.available_backends", return_value=["claude"]),
-        patch("agitrack.backends.setup.backend_installed", return_value=False),
+        patch("agitrack.backends.setup.backend_installed", side_effect=lambda _name: state["installed"]),
+        patch("agitrack.backends.setup.install_hint", return_value="INSTALL-HINT"),
     ):
         result = ensure_installed_backend(
-            "claude",
-            config,
-            interactive=True,
-            input_fn=lambda _: "",  # user presses Enter → install automatically
-            output_fn=lambda _: None,
-            install_fn=lambda name, output_fn: calls.append(name) or True,
+            "claude", config, interactive=True, input_fn=fake_input, output_fn=lines.append
         )
     assert result == "claude"
-    assert calls == ["claude"]  # only the selected backend was installed
+    assert any("INSTALL-HINT" in line for line in lines)  # showed instructions, didn't install
 
 
 def test_ensure_installed_backend_quit_raises():
