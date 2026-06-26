@@ -115,8 +115,17 @@ class RawConsole:
         self._saved_out: int | None = None
         self._saved_cp: int | None = None
         self._saved_out_cp: int | None = None
+        self._entered = False
 
     def enter(self) -> None:
+        # Idempotent: set_raw() can be called again while already in raw mode (a render or a
+        # resume that didn't go through set_cooked). Re-entering would (a) re-save the current
+        # — already raw — modes over the real cooked ones, so leave() could never restore the
+        # terminal, and (b) re-flush the input buffer, discarding keystrokes the user just
+        # typed. Only the first cooked->raw entry (re-armed by leave()) does the real work.
+        if self._entered:
+            return
+        self._entered = True
         # aGiTrack emits UTF-8 (box-drawing, status line, agent output); without UTF-8
         # code pages the console renders multi-byte sequences as garbage. Switch both code
         # pages to CP_UTF8 (65001) and restore them on leave.
@@ -145,6 +154,12 @@ class RawConsole:
         _set_mode(self._out, out_mode)
 
     def leave(self) -> None:
+        # Re-arm enter() so the next set_raw() does a real cooked->raw transition (re-flush of
+        # input typed during the cooked interval is then correct). A leave() with no prior
+        # enter() is a no-op.
+        if not self._entered:
+            return
+        self._entered = False
         if self._saved_in is not None:
             _set_mode(self._in, self._saved_in)
         if self._saved_out is not None:
