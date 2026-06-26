@@ -200,19 +200,10 @@ jobs:
       - name: Add WiX UI extension
         run: wix extension add --global WixToolset.UI.wixext
 
-      - name: Harvest PyInstaller output
-        run: |
-          wix harvest dir dist\agitrack `
-            --output installer\agitrack-files.wxs `
-            --component-group AgitrackFiles `
-            --directory-ref INSTALLFOLDER `
-            --var var.SourceDir
-
       - name: Build MSI
         run: |
           wix build `
             installer\agitrack.wxs `
-            installer\agitrack-files.wxs `
             -d Version=${{ needs.release.outputs.version }} `
             -d SourceDir=dist\agitrack `
             -ext WixToolset.UI.wixext `
