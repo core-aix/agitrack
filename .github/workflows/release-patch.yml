@@ -218,10 +218,13 @@ jobs:
         run: dist\agitrack\agitrack.exe --version
 
       - name: Install WiX v4
-        run: dotnet tool install --global wix --version 4.*
+        run: dotnet tool install --global wix --version 4.0.6
 
       - name: Add WiX UI extension
-        run: wix extension add --global WixToolset.UI.wixext
+        # Pin the UI extension to the SAME version as the wix tool. Unpinned, `wix
+        # extension add` pulls the latest (a newer major), which the 4.0.x toolset
+        # can't load — `wix build` then fails with WIX0144 "extension could not be found".
+        run: wix extension add --global WixToolset.UI.wixext/4.0.6
 
       - name: Build MSI
         run: |
