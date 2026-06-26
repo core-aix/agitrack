@@ -5,6 +5,8 @@ import sys
 import threading
 import types
 
+import pytest
+
 from agitrack.metrics import daemon
 
 
@@ -13,6 +15,9 @@ def _repo(tmp_path):
     return types.SimpleNamespace(repo=tmp_path)
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="Windows keeps process handles open after wait(); PID appears alive"
+)
 def test_pid_alive_distinguishes_live_and_dead_processes():
     import os
 
@@ -115,7 +120,9 @@ def test_stop_signals_and_clears(tmp_path, monkeypatch, capsys):
     daemon._write_handshake(repo, {"pid": 4242, "url": "http://x/"})
     monkeypatch.setattr(daemon, "running_handshake", lambda r: {"pid": 4242, "url": "http://x/"})
     killed: list[int] = []
-    monkeypatch.setattr(daemon.os, "kill", lambda pid, sig: killed.append(pid))
+    # stop uses the cross-platform terminate_pid (SIGTERM / TerminateProcess), imported
+    # into the daemon module's namespace.
+    monkeypatch.setattr(daemon, "terminate_pid", lambda pid: killed.append(pid))
     # Report the process gone immediately so the wait loop returns at once.
     monkeypatch.setattr(daemon, "pid_alive", lambda pid: False)
 

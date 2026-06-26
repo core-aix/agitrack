@@ -438,6 +438,7 @@ class GitRepo:
         *,
         remote: str = "origin",
         filter_blobs: str | None = None,
+        refetch: bool = False,
         timeout: float | None = None,
         cancel: "threading.Event | None" = None,
     ) -> bool:
@@ -450,10 +451,17 @@ class GitRepo:
         one-off partial fetch's persisted filter is then dropped so the user's
         normal ``git fetch`` stays full.
 
+        With ``refetch`` git re-downloads every object reachable from the ref as a
+        fresh clone would (ignoring what's already local) — used to backfill blobs a
+        prior partial fetch omitted, since a plain ref fetch won't (the ref is already
+        at the tip, so it transfers nothing).
+
         ``cancel`` (a ``threading.Event``) stops the fetch the moment it is set —
         the git subprocess is killed, not merely abandoned — so a user who cancels
         (or exits) truly stops the network work rather than leaving it running."""
         cmd = ["git", "fetch"]
+        if refetch:
+            cmd.append("--refetch")
         if filter_blobs:
             cmd.append(f"--filter={filter_blobs}")
         cmd += [remote, refspec]
@@ -466,6 +474,37 @@ class GitRepo:
             # Don't turn the user's remote into a permanently-filtered clone.
             self._run(["git", "config", "--unset", f"remote.{remote}.partialclonefilter"], check=False)
         return ok
+
+    def resolve_blob_oid(self, ref: str, path: str) -> str | None:
+        """The blob id at ``ref:path``, read from the (present) tree — so it resolves even when
+        the blob CONTENT is a partial-clone placeholder not yet fetched. None if absent."""
+        result = self._run(["git", "rev-parse", f"{ref}:{path}"], check=False)
+        oid = result.stdout.strip()
+        return oid if result.returncode == 0 and oid else None
+
+    def has_object_local(self, oid: str) -> bool:
+        """Whether ``oid`` is present in the LOCAL object store, without triggering a
+        partial-clone lazy fetch (``GIT_NO_LAZY_FETCH`` keeps it offline). Lets a caller decide
+        whether a blob still needs downloading without paying a network round-trip when it
+        doesn't. (On git < 2.36 the env is ignored and a missing promised object may lazy-fetch
+        here instead — harmless: it just gets fetched a step earlier.)"""
+        result = self._run(["git", "cat-file", "-e", oid], check=False, env={"GIT_NO_LAZY_FETCH": "1"})
+        return result.returncode == 0
+
+    def fetch_object(
+        self,
+        oid: str,
+        *,
+        remote: str = "origin",
+        timeout: float | None = None,
+        cancel: "threading.Event | None" = None,
+    ) -> bool:
+        """Fetch a single object by id — used to backfill a transcript blob a partial-clone
+        listing fetch omitted (a plain ref fetch won't, as the ref is already at the tip).
+        Returns True on success. Bounded + non-interactive like ``fetch_ref``; fails (False)
+        on a remote that disallows fetching by object id, so the caller can fall back."""
+        cmd = ["git", "fetch", remote, oid]
+        return self._run_bounded(cmd, env={"GIT_TERMINAL_PROMPT": "0"}, timeout=timeout, cancel=cancel) == 0
 
     def _run_bounded(
         self,

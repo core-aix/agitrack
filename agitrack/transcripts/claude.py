@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 from agitrack.backends.base import TokenUsage
+from agitrack.sessions.share_cap import select_kept_indices
 from agitrack.transcripts.types import ExportedSession, SessionRef, SessionTurn, turns_after
 
 __all__ = [
@@ -248,6 +249,84 @@ def export_session_raw(repo: Path, session_id: str) -> str | None:
         return path.read_text(encoding="utf-8")
     except OSError:
         return None
+
+
+def _is_resume_boundary(line: str) -> bool:
+    """A row the trimmed tail can validly BEGIN at so ``claude --resume`` reconstructs the
+    conversation: a ``user`` message whose content is plain text — a real prompt OR the
+    compaction summary (both are ``type:"user"`` with a *string* content). A ``user`` row whose
+    content is a LIST is a tool_result, which must not start a conversation (it would orphan the
+    tool_use it answers — Claude then reports no prior context). Anchoring here keeps the tail
+    user-first and reconstructible; verified against a real ``claude --resume``."""
+    stripped = line.strip()
+    if not stripped or "user" not in stripped:
+        return False
+    try:
+        row = json.loads(stripped)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(row, dict) or row.get("type") != "user":
+        return False
+    message = row.get("message")
+    return isinstance(message, dict) and isinstance(message.get("content"), str)
+
+
+def _reroot_dangling_rows(lines: list[str]) -> list[str]:
+    """After trimming, a kept row may reference a ``parentUuid`` that was dropped. Claude
+    resumes by walking ``parentUuid`` from the newest message back to a root (``parentUuid:
+    null``); if it hits a MISSING parent instead it reconstructs NOTHING ("no prior context").
+    So rewrite every dangling ``parentUuid`` (parent not among the kept rows) to ``null``,
+    turning the trimmed tail into a self-rooted, resumable conversation. Verified against a
+    real ``claude --resume`` (kept tail resumes; a dangling parent does not)."""
+    kept_uuids: set[str] = set()
+    for line in lines:
+        s = line.strip()
+        if not s:
+            continue
+        try:
+            row = json.loads(s)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict) and row.get("uuid"):
+            kept_uuids.add(row["uuid"])
+    out: list[str] = []
+    for line in lines:
+        s = line.strip()
+        if not s:
+            out.append(line)
+            continue
+        try:
+            row = json.loads(s)
+        except json.JSONDecodeError:
+            out.append(line)
+            continue
+        if isinstance(row, dict) and row.get("parentUuid") and row["parentUuid"] not in kept_uuids:
+            row["parentUuid"] = None
+            out.append(json.dumps(row))
+        else:
+            out.append(line)
+    return out
+
+
+def cap_shared_transcript(transcript: str, max_bytes: int) -> str:
+    """Bound a Claude ``.jsonl`` transcript to ``max_bytes`` for sharing, keeping whole rows.
+    Keeps the most recent turns as a CONTIGUOUS tail (anchored at a compaction summary, whose
+    recap carries the dropped earlier context), then re-roots the chain so Claude can resume it.
+    Returns ``transcript`` unchanged when it already fits.
+
+    A disconnected "head" is deliberately NOT kept: empirically it leaves Claude unable to
+    reconstruct the conversation on resume (it reports no prior context). The system prompt is
+    re-applied by Claude at runtime and the compaction summary recaps persistent context, so a
+    contiguous tail loses nothing needed while staying resumable."""
+    if len(transcript.encode("utf-8")) <= max_bytes:
+        return transcript
+    lines = transcript.split("\n")
+    sizes = [len(line.encode("utf-8")) for line in lines]
+    boundary = [_is_resume_boundary(line) for line in lines]
+    kept = select_kept_indices(sizes, boundary, max_bytes, sep_bytes=1)
+    if kept is None:
+        return transcript
+    return "\n".join(_reroot_dangling_rows([lines[i] for i in kept]))
 
 
 def session_transcript_size(repo: Path, session_id: str) -> int | None:

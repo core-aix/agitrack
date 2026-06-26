@@ -1,10 +1,58 @@
 from __future__ import annotations
 
-import fcntl
 import json
 import os
+import sys
 import time
 from pathlib import Path
+
+# Single-writer locking primitive, chosen per platform. POSIX uses an advisory
+# ``flock`` on the open file description; native Windows has no ``fcntl``, so it uses a
+# mandatory ``msvcrt.locking`` byte-range lock. Both are released the instant the owning
+# handle/process dies, which is the property RepoLock relies on (no stale-file reclaim).
+# The Windows lock is taken on a single byte FAR past any data we store, so a reader
+# (e.g. the VS Code extension) can still read the pid JSON at offset 0 — a mandatory lock
+# over offset 0 would block those reads. Gated on ``sys.platform`` (not ``os.name``) so
+# mypy platform-narrows and skips the Windows-only ``msvcrt`` branch when checking on POSIX.
+if sys.platform == "win32":  # pragma: no cover - exercised only on native Windows
+    import msvcrt
+
+    _WIN_LOCK_OFFSET = 0x4000_0000
+
+    def _try_lock(fd: int) -> bool:
+        try:
+            os.lseek(fd, _WIN_LOCK_OFFSET, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            return False
+
+    def _unlock(fd: int) -> None:
+        try:
+            os.lseek(fd, _WIN_LOCK_OFFSET, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+else:
+    import fcntl
+
+    def _try_lock(fd: int) -> bool:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            return False
+
+    def _unlock(fd: int) -> None:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+
+
+def _open_lock_file(path: str) -> int:
+    """Open/create the lock file; cross-platform (os.open works on Windows too)."""
+    return os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
 
 
 def already_running_message(pid: int | None) -> str:
@@ -27,13 +75,18 @@ class RepoLock:
     """Advisory single-writer lock for a working tree.
 
     Only one aGiTrack process should auto-commit/merge in a given working tree at a
-    time. The authority is an OS ``flock`` held on a long-lived fd: the kernel
+    time. The authority is an OS file-lock held on a long-lived fd: the kernel
     releases it the instant the owner dies, so there is no stale-file reclaim
     (and its delete-a-live-lock race) and no PID-liveness guessing that PID
     reuse could fool. The file itself carries no authority — it just records
     the owner's PID for the "already running" message; it persists across
-    releases (never unlinked, so two processes can never end up holding flocks
+    releases (never unlinked, so two processes can never end up holding locks
     on two different inodes of the same path) and is truncated on release.
+
+    POSIX: uses fcntl.flock (LOCK_EX | LOCK_NB).
+    Windows: uses msvcrt.locking at a high byte offset (well beyond any PID data)
+             so that other processes can always read the PID info at byte 0.
+             Both are released automatically when the process exits.
     """
 
     def __init__(self, path: Path) -> None:
@@ -47,19 +100,18 @@ class RepoLock:
             return True
         self.path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o644)
+            fd = _open_lock_file(str(self.path))
         except OSError:
             return False
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
+        if not _try_lock(fd):
             os.close(fd)
             return False
         try:
             os.ftruncate(fd, 0)
+            os.lseek(fd, 0, os.SEEK_SET)  # the lock may have left the fd seeked elsewhere (Windows)
             os.write(fd, json.dumps({"pid": os.getpid(), "started_at": time.time()}).encode())
         except OSError:
-            pass  # informational only; the flock is what locks
+            pass  # informational only; the lock is what guards, not the file content
         self._fd = fd
         return True
 
@@ -70,10 +122,7 @@ class RepoLock:
             os.ftruncate(self._fd, 0)  # leave no stale-looking owner info behind
         except OSError:
             pass
-        try:
-            fcntl.flock(self._fd, fcntl.LOCK_UN)
-        except OSError:
-            pass
+        _unlock(self._fd)
         try:
             os.close(self._fd)
         except OSError:
@@ -96,18 +145,16 @@ class RepoLock:
         if self._fd is not None:
             return None  # we already hold it
         try:
-            fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o644)
+            fd = _open_lock_file(str(self.path))
         except OSError:
             # No lock file / dir yet ⇒ nobody is running; let acquire() be authority.
             return None
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
+        if not _try_lock(fd):
             os.close(fd)
             return self.owner_pid()  # held by another live process
         # Free: we momentarily grabbed it — release at once so acquire() can take it.
         try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            _unlock(fd)
         finally:
             os.close(fd)
         return None

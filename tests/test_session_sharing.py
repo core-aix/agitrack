@@ -6,12 +6,31 @@ through a local bare remote.
 """
 
 import json
+import random
+import string
 import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 from agitrack.git import GitRepo
 from agitrack.sessions import SharedSessionStore, github_login, redact_transcript
 from agitrack.sessions.identity import slug
+
+_posix_git_gc = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="git object reclamation via loose-file removal behaves differently on Windows (objects may be packed)",
+)
+
+
+def _fake_token(prefix: str, n: int, *, charset: str = string.ascii_letters + string.digits) -> str:
+    """A secret-SHAPED string assembled at runtime. Keeping no full literal secret in this
+    file is deliberate: a hard-coded dummy token (a real-looking ``AIza…``/``SG.…``) trips
+    GitHub's own secret-scanning push protection and blocks the test file from being pushed —
+    the very failure these tests guard against. Only the (non-secret) prefix is literal; the
+    body is random, so every regex still matches but nothing here is a scannable secret."""
+    return prefix + "".join(random.choice(charset) for _ in range(n))
 
 
 def _init_repo(path):
@@ -163,9 +182,11 @@ def test_transcript_is_readable_opencode():
 
 
 def test_redact_masks_secrets_and_home_path_but_keeps_structure():
-    line = '{"cwd":"/Users/alice/Code/x","t":"api_key=sk-ABCDEFGHIJKLMNOP token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"}'
+    sk = _fake_token("sk-", 18)
+    ghp = _fake_token("ghp_", 36)
+    line = f'{{"cwd":"/Users/alice/Code/x","t":"api_key={sk} token {ghp}"}}'
     out = redact_transcript(line)
-    assert "sk-ABCDEFGHIJKLMNOP" not in out and "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345" not in out
+    assert sk not in out and ghp not in out
     assert "[REDACTED]" in out
     assert "/Users/alice" not in out and "/Users/user/Code/x" in out  # username masked, path kept
     assert out.startswith('{"cwd"')  # JSON shape preserved
@@ -173,6 +194,155 @@ def test_redact_masks_secrets_and_home_path_but_keeps_structure():
 
 def test_redact_leaves_ordinary_text_untouched():
     assert redact_transcript("just a normal sentence\nsecond line") == "just a normal sentence\nsecond line"
+
+
+def test_redact_covers_the_secret_shapes_github_push_protection_blocks():
+    # A secret that slips through redaction is what gets the push declined by GitHub's secret
+    # scanning. Redaction must cover at least the high-confidence shapes GitHub flags, so a
+    # share never trips push protection.
+    upper = string.ascii_uppercase + string.digits  # AWS key ids are upper+digits
+    hexlower = string.digits + "abcdef"  # Twilio SID is hex
+    samples = [
+        _fake_token("ghp_", 36),  # GitHub classic PAT
+        _fake_token("github_pat_", 60, charset=string.ascii_letters + string.digits + "_"),  # fine-grained PAT
+        _fake_token("glpat-", 20),  # GitLab PAT
+        _fake_token("xoxb-", 24),  # Slack bot token
+        _fake_token("AKIA", 16, charset=upper),  # AWS long-term key id
+        _fake_token("ASIA", 16, charset=upper),  # AWS temporary key id
+        _fake_token("AIza", 35),  # Google API key
+        _fake_token("ya29.", 30),  # Google OAuth token
+        _fake_token("sk_live_", 24),  # Stripe secret key
+        _fake_token("sk-ant-api03-", 24),  # Anthropic key
+        _fake_token("npm_", 36),  # npm token
+        _fake_token("pypi-", 24),  # PyPI token
+        _fake_token("SG.", 22) + "." + _fake_token("", 43),  # SendGrid
+        _fake_token("SK", 32, charset=hexlower),  # Twilio API key SID
+        _fake_token("dop_v1_", 40),  # Doppler token
+    ]
+    for secret in samples:
+        out = redact_transcript(f'{{"text":"using token {secret} now"}}')
+        assert secret not in out, f"leaked: {secret}"
+        assert "[REDACTED]" in out
+
+    # A PEM private key embedded in a JSONL line (escaped newlines) is masked end-to-end.
+    pem_body = _fake_token("", 40)
+    pem = f"-----BEGIN RSA PRIVATE KEY-----\\n{pem_body}\\n-----END RSA PRIVATE KEY-----"
+    out = redact_transcript(f'{{"key":"{pem}"}}')
+    assert pem_body not in out and "BEGIN RSA PRIVATE KEY" not in out
+
+
+def test_redact_does_not_mask_ordinary_hex_or_identifiers():
+    # The added patterns must not be so greedy they mangle normal transcript content (commit
+    # SHAs, UUIDs, plain words) — that would corrupt shared transcripts wholesale.
+    benign = '{"sha":"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0","id":"550e8400-e29b-41d4-a716-446655440000"}'
+    assert redact_transcript(benign) == benign
+
+
+# --- size cap (don't exceed Git's per-file limit) ---------------------------
+
+
+def test_select_kept_indices_returns_none_when_already_small():
+    from agitrack.sessions.share_cap import select_kept_indices
+
+    assert select_kept_indices([100] * 5, [False] * 5, max_bytes=100_000, sep_bytes=0) is None
+
+
+def test_select_kept_indices_keeps_recent_tail_anchored_at_a_boundary():
+    from agitrack.sessions.share_cap import select_kept_indices
+
+    sizes = [100] * 100
+    boundary = [False] * 100
+    boundary[80] = True  # a clean resume boundary at/after where the greedy tail begins
+    kept = select_kept_indices(sizes, boundary, max_bytes=3000, sep_bytes=0)
+    assert kept is not None
+    assert kept == list(range(80, 100))  # contiguous recent tail, starting AT the boundary
+    assert 79 not in kept  # nothing before the boundary (no disconnected head)
+    assert sum(sizes[i] for i in kept) <= 3000  # under budget
+
+
+def test_select_kept_indices_falls_back_to_an_earlier_boundary_when_none_fits():
+    # The most recent turn alone exceeds the budget (no boundary in the fitting window), so
+    # rather than begin mid-turn it keeps from the latest boundary before it (a clean start).
+    from agitrack.sessions.share_cap import select_kept_indices
+
+    sizes = [100] * 100
+    boundary = [False] * 100
+    boundary[40] = True  # the only boundary is well before the fitting window
+    kept = select_kept_indices(sizes, boundary, max_bytes=1500, sep_bytes=0)
+    assert kept is not None and kept[0] == 40 and kept[-1] == 99  # clean start, even if over budget
+
+
+def test_claude_cap_keeps_resumable_recent_tail_and_reroots():
+    from agitrack.transcripts.claude import cap_shared_transcript
+
+    rows = []
+    for i in range(300):
+        # alternate user-prompt / assistant turns, each with a uuid chained to the previous
+        role = "user" if i % 2 == 0 else "assistant"
+        content = "hello" if role == "user" else [{"type": "text", "text": "ok"}]
+        rows.append(
+            json.dumps(
+                {"type": role, "uuid": f"u{i}", "parentUuid": (f"u{i - 1}" if i else None), "pad": "P" * 300}
+                | {"message": {"role": role, "content": content}}
+            )
+        )
+    raw = "\n".join(rows)
+    max_bytes = 30 * 1024
+
+    out = cap_shared_transcript(raw, max_bytes)
+
+    assert len(out.encode("utf-8")) <= max_bytes  # under the file-size limit
+    kept = [json.loads(line) for line in out.split("\n") if line.strip()]
+    assert rows[0] not in out.split("\n")  # NO disconnected head — the opening was dropped
+    assert kept[-1]["uuid"] == "u299"  # most recent turn preserved (contiguous tail)
+    # The tail begins at a user prompt (a resume boundary), re-rooted so Claude can reconstruct it.
+    assert kept[0]["type"] == "user" and kept[0]["parentUuid"] is None
+    # No kept row has a dangling parent (all parents are among the kept rows or null).
+    uuids = {r["uuid"] for r in kept}
+    assert all(r.get("parentUuid") in uuids or r.get("parentUuid") is None for r in kept)
+    assert cap_shared_transcript(raw, 10 * 1024 * 1024) == raw  # unchanged when it already fits
+
+
+def test_opencode_cap_keeps_info_and_recent_messages():
+    from agitrack.transcripts.opencode import cap_shared_transcript
+
+    messages = []
+    for i in range(300):
+        role = "user" if i % 2 == 0 else "assistant"
+        messages.append({"info": {"id": f"m{i}", "role": role}, "parts": [{"type": "text", "text": "T" * 300}]})
+    raw = json.dumps({"info": {"id": "ses_x", "title": "hello"}, "messages": messages})
+    max_bytes = 30 * 1024
+
+    out = cap_shared_transcript(raw, max_bytes)
+
+    assert len(out.encode("utf-8")) <= max_bytes
+    parsed = json.loads(out)  # still a valid {info, messages} object opencode can import
+    assert parsed["info"]["id"] == "ses_x"  # session info preserved
+    ids = [m["info"]["id"] for m in parsed["messages"]]
+    assert ids[-1] == "m299"  # most recent preserved
+    assert ids != [f"m{i}" for i in range(300)]  # older messages dropped (it IS trimmed)
+    assert parsed["messages"][0]["info"]["role"] == "user"  # tail starts at a user turn boundary
+    assert cap_shared_transcript(raw, 10 * 1024 * 1024) == raw  # unchanged when it fits
+    assert cap_shared_transcript("not json{", 1) == "not json{"  # unparseable → left as-is
+
+
+def test_redact_and_cap_trims_oversized_and_flags_truncation():
+    # The share helper every share path uses: redact, then bound the size so the push can't
+    # trip Git's per-file limit — reporting whether anything was trimmed (for the user notice).
+    from types import SimpleNamespace
+
+    from agitrack.proxy.runner import _redact_and_cap
+    from agitrack.transcripts.claude import cap_shared_transcript
+
+    backend = SimpleNamespace(cap_shared_transcript=cap_shared_transcript)
+    big = "\n".join(json.dumps({"type": "assistant", "uuid": f"u{i}", "pad": "P" * 900}) for i in range(400))
+
+    text, truncated = _redact_and_cap(backend, big, 64 * 1024)
+    assert truncated is True
+    assert len(text.encode("utf-8")) <= 64 * 1024
+
+    small, trimmed = _redact_and_cap(backend, '{"type":"user"}', 64 * 1024)
+    assert trimmed is False and small == '{"type":"user"}'
 
 
 # --- identity ---------------------------------------------------------------
@@ -277,10 +447,18 @@ def test_fetch_lists_with_filter_and_reads_transcript_on_demand():
         def read_ref_blob(self, ref, path):
             return blobs.get(path)
 
-        def fetch_ref(self, refspec, *, remote="origin", filter_blobs=None, timeout=None, cancel=None):
+        def fetch_ref(self, refspec, *, remote="origin", filter_blobs=None, refetch=False, timeout=None, cancel=None):
             fetches.append(filter_blobs)
-            if filter_blobs is None:  # the on-demand full fetch brings the transcript in
-                blobs["abc/me/sess/transcript.jsonl"] = "the transcript"
+            return True
+
+        def resolve_blob_oid(self, ref, path):
+            return "t-oid" if path.endswith("transcript.jsonl") else None
+
+        def has_object_local(self, oid):
+            return "abc/me/sess/transcript.jsonl" in blobs  # missing until backfilled
+
+        def fetch_object(self, oid, *, remote="origin", timeout=None, cancel=None):
+            blobs["abc/me/sess/transcript.jsonl"] = "the transcript"  # on-demand blob backfill
             return True
 
     store = SharedSessionStore(FakeRepo())  # type: ignore[arg-type]
@@ -289,8 +467,10 @@ def test_fetch_lists_with_filter_and_reads_transcript_on_demand():
     # session shared by a pre-rename peer still lists.
     assert fetches == ["blob:limit=16k", "blob:limit=16k"]
     entry = store.entries()[0]
+    # The transcript blob (omitted by the partial listing) is fetched by id on demand —
+    # a plain ref fetch wouldn't backfill it.
     assert store.read_transcript(entry) == "the transcript"
-    assert None in fetches  # a full fetch was triggered on demand for the transcript
+    assert None in fetches  # the ref tip was synced (full, unfiltered) before reading
 
 
 def test_fetch_passes_timeout_through_to_git(tmp_path):
@@ -396,12 +576,21 @@ def test_read_transcript_passes_timeout_to_on_demand_fetch(tmp_path):
             return "abc"
 
         def read_ref_blob(self, ref, path):
-            return None if not seen else "the transcript"  # missing until the fetch runs
+            return "the transcript" if seen else None  # missing until the on-demand fetch runs
 
         def remote_exists(self, name="origin"):
             return True
 
-        def fetch_ref(self, refspec, *, remote="origin", filter_blobs=None, timeout=None, cancel=None):
+        def fetch_ref(self, refspec, *, remote="origin", filter_blobs=None, refetch=False, timeout=None, cancel=None):
+            return True
+
+        def resolve_blob_oid(self, ref, path):
+            return "t-oid"
+
+        def has_object_local(self, oid):
+            return bool(seen)  # not local until the on-demand blob fetch runs
+
+        def fetch_object(self, oid, *, remote="origin", timeout=None, cancel=None):
             seen.append(timeout)
             return True
 
@@ -410,7 +599,7 @@ def test_read_transcript_passes_timeout_to_on_demand_fetch(tmp_path):
     store = SharedSessionStore(FakeRepo())  # type: ignore[arg-type]
     entry = SharedEntry(github_id="me", name="sess", manifest={})
     assert store.read_transcript(entry, timeout=120.0) == "the transcript"
-    assert seen == [120.0]
+    assert seen == [120.0]  # the timeout bounds the on-demand transcript-blob fetch
 
 
 def test_read_transcript_refetches_latest_even_when_stale_blob_is_local():
@@ -431,10 +620,19 @@ def test_read_transcript_refetches_latest_even_when_stale_blob_is_local():
         def read_ref_blob(self, ref, path):
             return blobs.get(path)
 
-        def fetch_ref(self, refspec, *, remote="origin", filter_blobs=None, timeout=None, cancel=None):
+        def fetch_ref(self, refspec, *, remote="origin", filter_blobs=None, refetch=False, timeout=None, cancel=None):
             fetched.append(refspec)
             blobs["abc/me/sess/transcript.jsonl"] = "NEW shared latest"  # the remote tip
             return True
+
+        def resolve_blob_oid(self, ref, path):
+            return "t-oid"
+
+        def has_object_local(self, oid):
+            return True  # after the ref sync the (small) blob is already local — no extra fetch
+
+        def fetch_object(self, oid, *, remote="origin", timeout=None, cancel=None):
+            raise AssertionError("must not fetch the blob when it is already present locally")
 
     from agitrack.sessions import SharedEntry
 
@@ -442,6 +640,48 @@ def test_read_transcript_refetches_latest_even_when_stale_blob_is_local():
     entry = SharedEntry(github_id="me", name="sess", manifest={})
     assert store.read_transcript(entry) == "NEW shared latest"
     assert fetched == ["+refs/agitrack/shared-sessions:refs/agitrack/shared-sessions"]  # synced before reading
+
+
+def test_read_transcript_falls_back_to_refetch_when_fetch_by_id_is_unsupported():
+    # A partial-clone-omitted transcript blob is fetched by id; if the remote disallows that
+    # (some servers don't allow object-id wants), fall back to a full --refetch of the ref so
+    # the resume still gets the blob instead of failing with "incomplete".
+    calls: list = []
+    blobs: dict = {}  # the transcript blob is NOT local (omitted by the partial listing)
+
+    class FakeRepo:
+        def remote_exists(self, name="origin"):
+            return True
+
+        def root_commit(self):
+            return "abc"
+
+        def read_ref_blob(self, ref, path):
+            return blobs.get(path)
+
+        def fetch_ref(self, refspec, *, remote="origin", filter_blobs=None, refetch=False, timeout=None, cancel=None):
+            calls.append(("refetch" if refetch else "fetch", refspec))
+            if refetch:  # the fallback re-downloads the omitted blob
+                blobs["abc/me/sess/transcript.jsonl"] = "backfilled by refetch"
+            return True
+
+        def resolve_blob_oid(self, ref, path):
+            return "t-oid"
+
+        def has_object_local(self, oid):
+            return "abc/me/sess/transcript.jsonl" in blobs
+
+        def fetch_object(self, oid, *, remote="origin", timeout=None, cancel=None):
+            calls.append(("fetch_object", oid))
+            return False  # the remote refuses object-id wants
+
+    from agitrack.sessions import SharedEntry
+
+    store = SharedSessionStore(FakeRepo())  # type: ignore[arg-type]
+    entry = SharedEntry(github_id="me", name="sess", manifest={})
+    assert store.read_transcript(entry) == "backfilled by refetch"
+    assert ("fetch_object", "t-oid") in calls  # tried by-id first
+    assert ("refetch", "+refs/agitrack/shared-sessions:refs/agitrack/shared-sessions") in calls  # then refetched
 
 
 def test_read_transcript_without_remote_reads_local_only():
@@ -623,6 +863,7 @@ def test_publish_without_remote_saves_locally(tmp_path):
     assert result.remote is False and result.pushed is False
 
 
+@_posix_git_gc
 def test_remote_publish_reclaims_previous_version_but_keeps_latest(tmp_path):
     # Deferred reclaim: the previous transcript blob survives the push (so git can
     # deltify the new transcript against it — append-only sessions transmit just the
@@ -989,6 +1230,7 @@ def test_unshare_removes_a_session_living_in_the_legacy_ref(tmp_path):
     assert not any(k.startswith(store._prefix()) for k in repo.read_tree_paths(LEGACY_REF))
 
 
+@_posix_git_gc
 def test_update_deletes_old_version_objects_immediately(tmp_path):
     import subprocess as sp
 
@@ -1020,6 +1262,7 @@ def test_update_one_session_keeps_other_sessions_intact(tmp_path):
     assert got == {"a/s1": "one-v2", "b/s2": "two"}
 
 
+@_posix_git_gc
 def test_cleanup_orphans_removes_only_session_snapshots(tmp_path):
     import subprocess as sp
 
@@ -1322,7 +1565,9 @@ def test_claude_export_and_import_retargets_cwd(tmp_path, monkeypatch):
     dst.mkdir()
     assert claude.import_shared_session(dst, "sid", raw)
     imported = (claude._project_dir(dst) / "sid.jsonl").read_text()
-    assert str(dst.resolve()) in imported and "/Users/alice/old" not in imported
+    # Parse JSON to compare the cwd field; raw text has JSON-escaped backslashes on Windows.
+    cwd_in_imported = any(json.loads(line).get("cwd") == str(dst.resolve()) for line in imported.splitlines() if line)
+    assert cwd_in_imported and "/Users/alice/old" not in imported
     assert claude.session_belongs_to_repo(dst, "sid")
     # Re-importing must not clobber an existing local transcript.
     (claude._project_dir(dst) / "sid.jsonl").write_text("LOCAL")
@@ -1347,7 +1592,8 @@ def test_claude_import_as_id_keeps_both_under_a_new_id(tmp_path, monkeypatch):
     assert claude.session_belongs_to_repo(dst, "newid")
     copy = (claude._project_dir(dst) / "newid.jsonl").read_text()
     assert '"sessionId": "newid"' in copy and '"sid"' not in copy
-    assert str(dst.resolve()) in copy
+    # Parse JSON to compare the cwd field; raw text has JSON-escaped backslashes on Windows.
+    assert any(json.loads(line).get("cwd") == str(dst.resolve()) for line in copy.splitlines() if line)
 
 
 # --- OpenCode transcript export / import ------------------------------------
@@ -1492,6 +1738,9 @@ class _StubBackend:
     def export_session_raw(self, repo, session_id):
         return self._transcript
 
+    def cap_shared_transcript(self, transcript, max_bytes):
+        return transcript  # stub transcripts are tiny; size-capping is unit-tested separately
+
     def transcript_size(self, repo, session_id):
         return len(self._transcript.encode("utf-8"))
 
@@ -1569,8 +1818,8 @@ def test_warm_share_login_skips_when_no_remote_or_already_cached(tmp_path):
 
 
 def test_runner_share_session_publishes_and_redacts(tmp_path, monkeypatch):
-    secret = '{"t":"token sk-ABCDEFGHIJKLMNOPQR"}'
-    runner, repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend(transcript=secret))
+    sk = _fake_token("sk-", 20)
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend(transcript=f'{{"t":"token {sk}"}}'))
 
     runner._share_session()
     # The push runs in the background so the terminal never freezes; drain it.
@@ -1580,7 +1829,7 @@ def test_runner_share_session_publishes_and_redacts(tmp_path, monkeypatch):
     entries = store.entries()
     assert len(entries) == 1
     transcript = store.read_transcript(entries[0])
-    assert "sk-ABCDEFGHIJKLMNOPQR" not in transcript and "[REDACTED]" in transcript  # redacted
+    assert sk not in transcript and "[REDACTED]" in transcript  # redacted
     assert entries[0].manifest["session_id"] == "sid-123"
     assert any(
         "Saved shared session" in n[0] or "Shared" in n[0] for n in runner._session_notices.values()
@@ -2118,7 +2367,7 @@ def test_unshare_is_non_blocking_with_progress_and_result_notices(tmp_path, monk
     gate = threading.Event()
 
     class SlowStore:
-        def unshare(self, github_id, name):
+        def unshare(self, github_id, name, *, timeout=None):
             gate.wait(timeout=5)  # the network removal is slow
             return PublishResult(remote=True, pushed=True)
 
@@ -2206,9 +2455,10 @@ def test_manage_update_now_pushes_in_background_with_progress_notice(tmp_path, m
     assert SharedSessionStore(repo).read_transcript(entry) == "newest turns"  # pushed
 
 
-def test_manage_menu_opens_without_fetch_or_transcript_read(tmp_path, monkeypatch):
-    # The menu must open instantly: no network fetch, and no transcript read/redact
-    # while building the list (the "takes a few seconds" bug).
+def test_manage_menu_builds_list_without_reading_transcripts(tmp_path, monkeypatch):
+    # The menu syncs the listing first (small manifests — see test_manage_menu_fetches_origin),
+    # but must NEVER read/redact full transcripts to build the list (the "takes a few seconds"
+    # bug). Here there's no remote, so the sync is an instant local no-op.
     backend = _StubBackend()
     runner, repo = _runner_with_store(tmp_path, monkeypatch, backend)
     SharedSessionStore(repo).publish(
@@ -2218,13 +2468,9 @@ def test_manage_menu_opens_without_fetch_or_transcript_read(tmp_path, monkeypatc
         manifest={"github_id": "tester", "name": "s1", "session_id": "sid-123", "updated": 1, "transcript_bytes": 5},
     )
 
-    def boom_fetch(*a, **k):
-        raise AssertionError("manage menu must not fetch from the network")
-
     def boom_read(*a, **k):
         raise AssertionError("manage menu must not read/redact transcripts to build the list")
 
-    monkeypatch.setattr(repo, "fetch_ref", boom_fetch)
     backend.export_session_raw = boom_read
     captured = {}
     runner._select_popup = lambda title, options: captured.update(title=title, options=options) or None
@@ -2310,3 +2556,581 @@ def test_live_session_for_lineage_matches_by_origin_not_backend_id():
     assert runner._live_session_for_lineage("alice", "feature") == 0
     assert runner._live_session_for_lineage("alice", "other") is None
     assert runner._live_session_for_lineage("carol", "feature") is None  # different owner
+
+
+# --- sharing-workflow fixes: menu exit, auto-share robustness, lineage unshare ---------
+
+
+class _ResultStore:
+    """A shared-session store stub that records publish kwargs and returns a fixed result
+    for publish/unshare — for exercising the auto-share/menu paths without a real remote."""
+
+    def __init__(self, result=None, entries=None):
+        self.result = result
+        self._entries = list(entries or [])
+        self.publish_kwargs: dict | None = None
+
+    def publish(self, **kwargs):
+        self.publish_kwargs = kwargs
+        return self.result
+
+    def unshare(self, github_id, name, *, timeout=None):
+        return self.result
+
+    def entries(self):
+        return list(self._entries)
+
+
+def _fire_auto_share(runner):
+    runner._auto_share_thread = None
+    runner._maybe_auto_share_active()
+    if runner._auto_share_thread is not None:
+        runner._auto_share_thread.join(timeout=10)
+
+
+def test_auto_share_does_not_cache_hash_on_failed_push(tmp_path, monkeypatch):
+    # The bug: the content hash was cached BEFORE the push, so a silently-failing push left
+    # the content marked "already shared" and it was never retried (shared copy went stale).
+    from agitrack.sessions.store import PublishResult
+
+    runner, _repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend(transcript="turns"))
+    runner.state.set_auto_share("sid-123", True)
+    runner._shared_store = lambda: _ResultStore(PublishResult(remote=True, pushed=False, error="rejected"))
+
+    _fire_auto_share(runner)
+
+    assert "sid-123" not in runner._auto_share_hash  # NOT cached — the next commit will retry
+    assert runner._auto_share_outcome and "failed" in runner._auto_share_outcome  # recorded to surface
+
+
+def test_auto_share_retries_unchanged_content_after_a_failure(tmp_path, monkeypatch):
+    # Concretely: a failed push followed by a fire with the SAME content must push AGAIN
+    # (not skip via the hash gate), and only then cache the hash.
+    from agitrack.sessions.store import PublishResult
+
+    runner, _repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend(transcript="turns"))
+    runner.state.set_auto_share("sid-123", True)
+    results = [
+        PublishResult(remote=True, pushed=False, error="rejected"),
+        PublishResult(remote=True, pushed=True),
+    ]
+    pushes = {"n": 0}
+
+    class _FlakyStore:
+        def entries(self):
+            return []
+
+        def publish(self, **kwargs):
+            pushes["n"] += 1
+            return results.pop(0)
+
+    runner._shared_store = lambda: _FlakyStore()
+
+    _fire_auto_share(runner)  # fails
+    assert "sid-123" not in runner._auto_share_hash
+    _fire_auto_share(runner)  # SAME content retried — must not be skipped
+
+    assert pushes["n"] == 2  # retried the unchanged content rather than treating it as shared
+    assert "sid-123" in runner._auto_share_hash  # cached only after the success
+
+
+def test_auto_share_success_caches_hash_and_stays_silent(tmp_path, monkeypatch):
+    from agitrack.sessions.store import PublishResult
+
+    runner, _repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend(transcript="turns"))
+    runner.state.set_auto_share("sid-123", True)
+    runner._shared_store = lambda: _ResultStore(PublishResult(remote=True, pushed=True))
+
+    _fire_auto_share(runner)
+    runner._service_auto_share_outcome()
+
+    assert "sid-123" in runner._auto_share_hash  # cached on a real success
+    assert not any("failed" in n[0].lower() for n in runner._session_notices.values())  # silent on success
+
+
+def test_auto_share_truncation_notice_shows_once_per_session(tmp_path, monkeypatch):
+    # Auto-share fires every commit; a session that stays oversized is truncated every time. The
+    # "we trimmed this" notice must appear ONCE, not on each auto-share (that would spam).
+    runner, _repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend())
+
+    runner._auto_share_outcome = {"ok": True, "truncated": True, "sid": "sid-1", "name": "feature"}
+    runner._service_auto_share_outcome()
+    first = [n[0] for n in runner._session_notices.values() if "trimmed" in n[0]]
+    assert len(first) == 1 and "feature" in first[0]
+
+    # A second truncated auto-share of the SAME session stays silent.
+    runner._session_notices.clear()
+    runner._auto_share_outcome = {"ok": True, "truncated": True, "sid": "sid-1", "name": "feature"}
+    runner._service_auto_share_outcome()
+    assert not any("trimmed" in n[0] for n in runner._session_notices.values())
+
+    # A DIFFERENT session still gets its own one-time notice.
+    runner._auto_share_outcome = {"ok": True, "truncated": True, "sid": "sid-2", "name": "other"}
+    runner._service_auto_share_outcome()
+    assert any("trimmed" in n[0] and "other" in n[0] for n in runner._session_notices.values())
+
+
+def test_auto_share_success_without_truncation_stays_silent(tmp_path, monkeypatch):
+    runner, _repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend())
+    runner._auto_share_outcome = {"ok": True, "truncated": False, "sid": "sid-1", "name": "feature"}
+    runner._service_auto_share_outcome()
+    assert not any("trimmed" in n[0] for n in runner._session_notices.values())
+
+
+def test_auto_share_bounds_the_push_with_a_timeout(tmp_path, monkeypatch):
+    # A stalled push must not strand the worker — that would block EVERY future auto-share for
+    # the run via the in-flight guard, silently freezing the shared copy.
+    from agitrack.sessions.store import PublishResult
+
+    runner, _repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend(transcript="turns"))
+    runner.state.set_auto_share("sid-123", True)
+    store = _ResultStore(PublishResult(remote=True, pushed=True))
+    runner._shared_store = lambda: store
+
+    _fire_auto_share(runner)
+
+    assert store.publish_kwargs is not None
+    assert store.publish_kwargs["timeout"] == runner.SHARE_PUSH_TIMEOUT
+
+
+def test_service_auto_share_outcome_surfaces_a_failure_notice(tmp_path, monkeypatch):
+    runner, _repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend())
+    runner._auto_share_outcome = {"failed": "remote rejected the push", "name": "feature"}
+
+    runner._service_auto_share_outcome()
+
+    assert runner._auto_share_outcome is None  # consumed
+    assert any(
+        "Auto-share" in n[0] and "feature" in n[0] and "failed" in n[0].lower()
+        for n in runner._session_notices.values()
+    )
+
+
+def test_auto_share_behind_does_not_cache_and_surfaces_a_notice(tmp_path, monkeypatch):
+    from agitrack.sessions.store import PublishResult
+
+    runner, _repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend(transcript="turns"))
+    runner.state.set_auto_share("sid-123", True)
+    runner._shared_store = lambda: _ResultStore(PublishResult(remote=True, pushed=False, behind=True))
+
+    _fire_auto_share(runner)
+    assert "sid-123" not in runner._auto_share_hash  # behind ⇒ not marked as shared
+    runner._service_auto_share_outcome()
+
+    assert any("newer turns" in n[0] for n in runner._session_notices.values())
+
+
+def test_manage_one_shared_session_closes_menu_on_unshare(tmp_path, monkeypatch):
+    from agitrack.sessions import SharedEntry
+    from agitrack.sessions.store import PublishResult
+
+    runner, _repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend())
+    runner._shared_store = lambda: _ResultStore(PublishResult(remote=True, pushed=True))
+
+    def _popup(title, options):
+        if title.startswith("Manage"):
+            return options[2]  # ✗ Unshare
+        return "Yes, unshare"  # the confirm
+
+    runner._select_popup = _popup
+    entry = SharedEntry("tester", "s1", {"session_id": "sid-123"})
+
+    assert runner._manage_one_shared_session(entry) == runner._MENU_DONE  # exits so progress shows
+    assert any("Unsharing" in n[0] for n in runner._session_notices.values())  # "unsharing…" notice
+
+
+def test_manage_one_shared_session_stays_when_unshare_cancelled(tmp_path, monkeypatch):
+    from agitrack.sessions import SharedEntry
+
+    runner, _repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend())
+
+    def _popup(title, options):
+        if title.startswith("Manage"):
+            return options[2]  # Unshare
+        return "No, keep it"  # cancel the confirm
+
+    runner._select_popup = _popup
+    entry = SharedEntry("tester", "s1", {"session_id": "sid-123"})
+
+    assert runner._manage_one_shared_session(entry) == runner._MENU_UP  # back to the list
+    assert any("Kept" in m for m in runner.messages)
+
+
+def test_manage_one_shared_session_esc_returns_up(tmp_path, monkeypatch):
+    from agitrack.sessions import SharedEntry
+
+    runner, _repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend())
+    runner._select_popup = lambda title, options: None  # Esc
+    entry = SharedEntry("tester", "s1", {"session_id": "sid-123"})
+
+    assert runner._manage_one_shared_session(entry) == runner._MENU_UP
+
+
+def test_manage_menu_exits_after_unshare_instead_of_relisting(tmp_path, monkeypatch):
+    # The whole shared-sessions menu must close after unsharing — not re-show the list over
+    # the progress notice (the reported "returns to the parent menu" bug).
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend())
+    SharedSessionStore(repo).publish(
+        github_id="tester",
+        name="s1",
+        transcript="t",
+        manifest={"github_id": "tester", "name": "s1", "session_id": "sid-123", "updated": 1, "transcript_bytes": 1},
+    )
+    shown = {"list": 0}
+
+    def _popup(title, options):
+        if title.startswith("Your shared sessions"):
+            shown["list"] += 1
+            return options[0]  # pick the entry
+        if title.startswith("Manage"):
+            return options[2]  # Unshare
+        return "Yes, unshare"
+
+    runner._select_popup = _popup
+
+    assert runner._manage_shared_sessions_menu() == runner._MENU_DONE
+    assert shown["list"] == 1  # the list was shown ONCE — it did not loop back after the action
+
+
+def test_unshare_disables_auto_share_across_the_whole_lineage(tmp_path, monkeypatch):
+    # Unsharing must turn auto-share OFF for the entire id lineage, not just the entry's id —
+    # else a session opted in under a drifted id keeps re-sharing and still shows as shared.
+    from agitrack.sessions import SharedEntry
+    from agitrack.sessions.store import PublishResult
+
+    runner, _repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend())
+    user = runner._user_state()
+    user.set_auto_share("sid-old", True)  # opted in under the original id
+    user.add_shared_session_alias("sid-new", "sid-old")  # backend forked a new id on resume
+    assert runner._session_auto_shared("sid-new") is True  # the lineage sees the opt-in
+
+    runner._shared_store = lambda: _ResultStore(PublishResult(remote=True, pushed=True))
+    runner._unshare_entry(SharedEntry("tester", "s1", {"session_id": "sid-new"}))
+
+    assert runner._session_auto_shared("sid-new") is False  # off across the lineage now
+    assert runner._user_state().auto_share_enabled("sid-old") is False  # fresh read from disk
+
+
+def _repo_with_bare_remote(tmp_path):
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+    (tmp_path / "src").mkdir()
+    src = _init_repo(tmp_path / "src")
+    branch = src.current_branch()
+    subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=src.repo, check=True)
+    subprocess.run(["git", "push", "-q", "origin", f"HEAD:refs/heads/{branch}"], cwd=src.repo, check=True)
+    subprocess.run(["git", "-C", str(remote), "symbolic-ref", "HEAD", f"refs/heads/{branch}"], check=True)
+    return src
+
+
+def test_publish_rolls_back_local_entry_when_origin_rejects_the_push(tmp_path, monkeypatch):
+    # Origin refused the push (GitHub push protection / a ruleset / a pre-receive hook). The
+    # session NEVER reached origin, so it must NOT linger in the LOCAL ref masquerading as
+    # "shared" in the menus or the resume-shared list (the reported bug).
+    src = _repo_with_bare_remote(tmp_path)
+    store = SharedSessionStore(src)
+    monkeypatch.setattr(
+        src,
+        "push_ref",
+        lambda *a, **k: (False, "remote: error: GH013: Repository rule violations found\n ! [remote rejected]"),
+    )
+
+    result = store.publish(
+        github_id="alice", name="blocked", transcript="t", manifest=_manifest("blocked", session_id="x", updated=1)
+    )
+
+    assert result.pushed is False
+    assert result.remote is True
+    assert store.entries() == []  # rolled back — a rejected share never shows as shared
+
+
+def test_publish_keeps_local_only_entry_when_there_is_no_remote(tmp_path):
+    # The rollback is for REJECTED pushes only: with no remote at all, saving locally is the
+    # legitimate behaviour and must be preserved.
+    store = SharedSessionStore(_init_repo(tmp_path))
+
+    result = store.publish(
+        github_id="alice", name="local", transcript="t", manifest=_manifest("local", session_id="x", updated=1)
+    )
+
+    assert result.remote is False
+    assert [e.name for e in store.entries()] == ["local"]  # kept — there was nowhere to push
+
+
+def test_publish_does_not_loop_retrying_a_permanent_hook_rejection(tmp_path, monkeypatch):
+    # A pre-receive hook decline won't change on a retry — unlike a stale-lease race. Don't
+    # waste a fetch+retry round-trip on it (and don't let "[remote rejected]" fool the
+    # stale-lease check into looping).
+    src = _repo_with_bare_remote(tmp_path)
+    store = SharedSessionStore(src)
+    attempts = {"n": 0}
+
+    def reject(*a, **k):
+        attempts["n"] += 1
+        return (False, " ! [remote rejected] refs/agitrack/shared-sessions (pre-receive hook declined)")
+
+    monkeypatch.setattr(src, "push_ref", reject)
+    store.publish(github_id="alice", name="x", transcript="t", manifest=_manifest("x", session_id="x", updated=1))
+
+    assert attempts["n"] == 1  # pushed once, recognised it as permanent, did not retry
+
+
+def test_unshare_retries_after_a_stale_lease(tmp_path, monkeypatch):
+    # A concurrent push (e.g. this session's own auto-share) moved the remote ref, so the
+    # unshare's force-with-lease push is rejected once. unshare must re-sync and retry — like
+    # publish — or the removal never lands and the user just sees "the push was rejected".
+    src = _repo_with_bare_remote(tmp_path)
+    store = SharedSessionStore(src)
+    store.publish(github_id="alice", name="drop", transcript="d", manifest=_manifest("drop", session_id="d", updated=1))
+
+    real_push = src.push_ref
+    attempts = {"n": 0}
+
+    def flaky_push(refspec, **kwargs):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            return (False, "! [rejected] (stale info)")  # lost the race the first time
+        return real_push(refspec, **kwargs)
+
+    monkeypatch.setattr(src, "push_ref", flaky_push)
+
+    result = store.unshare("alice", "drop")
+
+    assert result.pushed is True  # the retry landed the removal
+    assert attempts["n"] == 2  # rejected once, then re-synced and retried
+    assert store.entries() == []  # actually gone
+
+
+def test_unshare_does_not_retry_on_auth_failure(tmp_path, monkeypatch):
+    # A non-race failure (auth) must fail fast and surface the real reason — no retry loop.
+    src = _repo_with_bare_remote(tmp_path)
+    store = SharedSessionStore(src)
+    store.publish(github_id="alice", name="drop", transcript="d", manifest=_manifest("drop", session_id="d", updated=1))
+    attempts = {"n": 0}
+
+    def auth_fail(refspec, **kwargs):
+        attempts["n"] += 1
+        return (False, "fatal: Authentication failed for 'origin'")
+
+    monkeypatch.setattr(src, "push_ref", auth_fail)
+
+    result = store.unshare("alice", "drop")
+
+    assert result.pushed is False
+    assert attempts["n"] == 1  # failed fast — a broken credential can't spin a retry loop
+    assert "Authentication failed" in result.error  # the real reason is surfaced, not hidden
+
+
+def test_unshare_falls_back_to_full_fetch_when_partial_unsupported(tmp_path):
+    # When the remote doesn't support partial (blob-filtered) fetch, the filtered sync fails.
+    # Without a fallback to a full fetch, the unshare's --force-with-lease is built against a
+    # STALE local tip and the push is rejected on every attempt ("rerun shows the same
+    # message"). It must fall back to a full fetch and then push successfully.
+    class _NoPartialFetchRepo:
+        def __init__(self):
+            self.fetches: list = []
+            self.pushed = False
+
+        def remote_exists(self, name="origin"):
+            return True
+
+        def ref_exists(self, ref):
+            return False  # no legacy ref present
+
+        def root_commit(self):
+            return "fp"
+
+        def read_tree_paths(self, ref):
+            return {"fp/alice/drop/transcript.jsonl": "b1", "fp/alice/drop/manifest.json": "b2"}
+
+        def ref_sha(self, ref):
+            return "tip"
+
+        def write_tree_from(self, entries):
+            return "tree"
+
+        def commit_tree_orphan(self, tree, message):
+            return "commit"
+
+        def update_ref(self, ref, sha):
+            pass
+
+        def delete_orphaned_objects(self, old):
+            return 0
+
+        def fetch_ref(self, refspec, *, remote="origin", filter_blobs=None, timeout=None, cancel=None):
+            self.fetches.append(filter_blobs)
+            return filter_blobs is None  # the filtered fetch FAILS; a full fetch succeeds
+
+        def push_ref(self, refspec, *, remote="origin", force_with_lease=None, timeout=None, cancel=None):
+            self.pushed = True
+            return (True, "")
+
+    repo = _NoPartialFetchRepo()
+    result = SharedSessionStore(repo).unshare("alice", "drop")  # type: ignore[arg-type]
+
+    assert repo.fetches == ["blob:limit=16k", None]  # tried filtered, then fell back to a full fetch
+    assert repo.pushed is True  # the removal pushed once the lease matched the synced tip
+    assert result.pushed is True
+
+
+def test_push_rejection_reason_extracts_the_meaningful_git_line():
+    from agitrack.proxy.runner import _push_rejection_reason
+
+    stderr = (
+        "Enumerating objects: 5, done.\n"
+        "To github.com:org/repo.git\n"
+        " ! [remote rejected] refs/agitrack/shared-sessions -> refs/agitrack/shared-sessions (pre-receive hook declined)\n"
+        "error: failed to push some refs to 'github.com:org/repo.git'\n"
+    )
+    reason = _push_rejection_reason(stderr)
+    assert "pre-receive hook declined" in reason  # the WHY, not a blind prefix slice
+    assert "timed out" in _push_rejection_reason("")  # empty ⇒ actionable hint, never a bare "[]"
+    assert "stale info" in _push_rejection_reason("x\n ! [rejected] foo (stale info)\nerror: failed")
+
+    # GitHub's push protection / rulesets (NOT a custom hook) put the actionable detail — which
+    # secret, the unblock URL — on lines OTHER than the bare "declined" summary. Surface those.
+    gh = (
+        "remote: error: GH013: Repository rule violations found for refs/agitrack/shared-sessions.\n"
+        "remote: - GITHUB PUSH PROTECTION\n"
+        "remote:   - Push cannot contain secrets\n"
+        "remote:     To allow, visit https://github.com/org/repo/security/secret-scanning/unblock-secret/abc\n"
+        " ! [remote rejected] refs/agitrack/shared-sessions (push declined due to repository rule violations)\n"
+    )
+    detail = _push_rejection_reason(gh)
+    assert "secret" in detail.lower()  # tells the user it's a blocked secret, not a vague "declined"
+    assert "unblock-secret/abc" in detail  # and hands them the URL to resolve it
+    assert "remote:" not in detail  # git's noisy prefix stripped for legibility
+
+
+def test_unshare_of_a_local_only_entry_reports_not_rejected(tmp_path):
+    # An entry that was only ever saved locally (its share never reached origin) has nothing to
+    # push. unshare must report that — NOT "rejected with no error output" — and remove it.
+    src = _repo_with_bare_remote(tmp_path)
+    store = SharedSessionStore(src)
+    store.publish(github_id="alice", name="keep", transcript="k", manifest=_manifest("keep", session_id="k", updated=1))
+    store._add_session("alice", "drop", "d", _manifest("drop", session_id="d", updated=2))  # local only
+    assert {e.name for e in store.entries()} == {"keep", "drop"}
+
+    result = store.unshare("alice", "drop")
+
+    assert result.remote is True
+    assert result.pushed is False  # nothing on origin to push...
+    assert result.error == ""  # ...but it was NOT a rejection
+    assert [e.name for e in store.entries()] == ["keep"]  # actually gone
+
+
+def test_unshare_clears_a_stale_mirror_entry_from_the_menu(tmp_path):
+    # The menu also lists from the cached remote MIRROR ref. An entry lingering there (a stale
+    # listing of a session no longer on origin) must be dropped on unshare, or it keeps showing
+    # as shared and re-running just repeats the same no-op.
+    from agitrack.sessions.store import REMOTE_MIRROR
+
+    repo = _init_repo(tmp_path)  # no remote
+    store = SharedSessionStore(repo)
+    SharedSessionStore(repo, ref=REMOTE_MIRROR)._add_session(
+        "alice", "ghost", "g", _manifest("ghost", session_id="g", updated=1)
+    )
+    assert [e.name for e in store.entries()] == ["ghost"]  # visible only via the mirror
+
+    store.unshare("alice", "ghost")
+
+    assert store.entries() == []  # dropped from the mirror → gone from the menu
+
+
+def test_unshare_empty_stderr_push_reports_a_timeout_hint(tmp_path):
+    # A push that exits non-zero with NO stderr (a killed/timed-out push) must not surface as a
+    # blank "no error output" — the user gets an actionable hint instead.
+    class _EmptyErrPushRepo:
+        def remote_exists(self, name="origin"):
+            return True
+
+        def ref_exists(self, ref):
+            return False
+
+        def root_commit(self):
+            return "fp"
+
+        def read_tree_paths(self, ref):
+            return {"fp/alice/drop/transcript.jsonl": "b1", "fp/alice/drop/manifest.json": "b2"}
+
+        def ref_sha(self, ref):
+            return "tip"
+
+        def write_tree_from(self, entries):
+            return "tree"
+
+        def commit_tree_orphan(self, tree, message):
+            return "commit"
+
+        def update_ref(self, ref, sha):
+            pass
+
+        def delete_orphaned_objects(self, old):
+            return 0
+
+        def fetch_ref(self, refspec, *, remote="origin", filter_blobs=None, timeout=None, cancel=None):
+            return True
+
+        def push_ref(self, refspec, *, remote="origin", force_with_lease=None, timeout=None, cancel=None):
+            return (False, "")  # non-zero exit, no stderr (killed / timed out)
+
+    result = SharedSessionStore(_EmptyErrPushRepo()).unshare("alice", "drop")  # type: ignore[arg-type]
+
+    assert result.pushed is False
+    assert "timed out" in result.error  # actionable, not a blank "no output"
+
+
+def test_manage_menu_empty_state_shows_a_visible_message(tmp_path, monkeypatch):
+    # No shared sessions: a clear message must be SHOWN. Returning _MENU_UP re-shows the
+    # sessions menu straight over it ("nothing shows"); _MENU_DONE leaves it on the screen.
+    runner, _repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend())  # nothing shared
+
+    result = runner._manage_shared_sessions_menu()
+
+    assert result == runner._MENU_DONE
+    assert any("No sessions are shared" in m for m in runner.messages)
+
+
+def test_manage_menu_fetches_origin_before_listing(tmp_path, monkeypatch):
+    # The manage menu must sync origin first so it reflects what's actually shared there — not a
+    # stale local/mirror view (where a local-only session masquerades as shared).
+    runner, _repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend())
+    fetched: list = []
+    runner._fetch_shared_with_cancel = lambda store, message: fetched.append(message) or True
+
+    runner._manage_shared_sessions_menu()
+
+    assert fetched and "Fetching shared sessions" in fetched[0]  # a fetch ran before the list
+
+
+def test_manage_menu_lists_a_session_shared_from_another_machine(tmp_path, monkeypatch):
+    # A session shared from another machine lives in the remote MIRROR, not the local ref. Once
+    # the menu fetches, it must show it so the user can manage/unshare it here (the "it's on
+    # origin only and I can't see it" case).
+    from agitrack.sessions.store import REMOTE_MIRROR
+
+    runner, repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend())
+    SharedSessionStore(repo, ref=REMOTE_MIRROR)._add_session(
+        "tester", "from-laptop", "t", _manifest("from-laptop", session_id="laptop-sid", updated=5)
+    )
+    runner._fetch_shared_with_cancel = lambda store, message: True  # mirror already populated
+    captured: dict = {}
+    runner._select_popup = lambda title, options: captured.update(title=title, options=options) or None
+
+    runner._manage_shared_sessions_menu()
+
+    assert captured.get("options") and any("from-laptop" in option for option in captured["options"])
+
+
+def test_share_session_signals_done_on_share_and_up_on_cancel(tmp_path, monkeypatch):
+    # Per the menu rule: a completed action closes the menu (_MENU_DONE) so its progress shows;
+    # backing out at the consent prompt does nothing and re-shows the list (_MENU_UP).
+    runner, _repo = _runner_with_store(tmp_path, monkeypatch, _StubBackend())
+
+    runner._select_popup = lambda title, options: "No, cancel"
+    assert runner._share_session() == runner._MENU_UP  # declined → back to the list
+
+    answers = iter(["Yes, share it", "No, I'll re-share manually"])
+    runner._select_popup = lambda title, options: next(answers)
+    assert runner._share_session() == runner._MENU_DONE  # shared → close the menu

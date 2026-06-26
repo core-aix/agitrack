@@ -1,11 +1,11 @@
-/** aGiTrack is POSIX-only (it imports pty/termios/fcntl at load), so it cannot run on a
- * native Windows host. The extension runs on the workspace machine (`extensionKind:
- * ["workspace"]`), so a Windows + WSL / Remote-SSH / Dev Container / Codespaces window runs
- * this code on the Linux side (`platform !== "win32"`) and works exactly as on macOS/Linux;
- * only a LOCAL Windows window is `"win32"` here — the one case aGiTrack can't support.
+/** Whether this is a native-Windows host (as opposed to the Linux side of a WSL /
+ * Remote-SSH / Dev Container / Codespaces window, which reports a POSIX platform).
  *
- * Parameterised on the platform string (defaulting to the current process) so it can be
- * unit-tested without spoofing `process.platform`. */
+ * aGiTrack runs natively on Windows as of #118, so this is no longer a "can't run" gate —
+ * it selects the Windows code paths (PowerShell process queries, the shutdown sentinel +
+ * taskkill fallback, `.exe`/Scripts install locations, PowerShell launch syntax) from the
+ * POSIX ones. Parameterised on the platform string (defaulting to the current process) so
+ * it can be unit-tested without spoofing `process.platform`. */
 export function isNativeWindows(platform: NodeJS.Platform = process.platform): boolean {
   return platform === "win32";
 }

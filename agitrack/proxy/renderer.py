@@ -18,6 +18,14 @@ from typing import NamedTuple, Protocol
 import pyte
 import pyte.modes as _pyte_modes
 
+# Device Control String sequences (``ESC P … ST``). pyte does NOT consume these — it renders
+# the payload as visible text — so a backend's DCS (e.g. an XTVERSION reply ``ESC P >|tmux…``,
+# or, inside tmux, a passthrough-wrapped query ``ESC P tmux; ESC ESC ]11;? BEL ST``) would
+# otherwise leak onto the screen as stray characters like "tmux;]11;?". Stripped before the
+# feed. Non-greedy up to the first ST; BEL-terminated payloads (e.g. a wrapped OSC query) keep
+# the real ST as the only ``ESC \``. Gated on a cheap ``ESC P`` presence check at the call site.
+_DCS_RE = re.compile(rb"\x1bP.*?\x1b\\", re.DOTALL)
+
 # Lightweight inline emphasis for box text: ``**bold**`` marks a run that should be
 # rendered bold. Only balanced pairs count, so stray ``*``/``**`` stay literal.
 _BOLD_MARKUP_RE = re.compile(r"\*\*(.+?)\*\*")
@@ -478,10 +486,13 @@ class ScreenRenderer:
     # ------------------------------------------------------------------
 
     def feed(self: RendererHost, output: bytes, *, pyte_hostile_csi_re) -> None:
-        """Feed child output into the pyte model (strips pyte-hostile CSI)."""
+        """Feed child output into the pyte model (strips pyte-hostile CSI and DCS)."""
         if self.stream is not None:
             try:
-                self.stream.feed(pyte_hostile_csi_re.sub(b"", output))
+                cleaned = pyte_hostile_csi_re.sub(b"", output)
+                if b"\x1bP" in cleaned:  # cheap gate: only scan for DCS when one is present
+                    cleaned = _DCS_RE.sub(b"", cleaned)
+                self.stream.feed(cleaned)
             except Exception as error:  # never let a parse hiccup kill the session
                 getattr(self, "_debug", lambda message: None)(f"pyte feed error: {error!r}")
 

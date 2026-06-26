@@ -14,7 +14,6 @@ import subprocess
 import sys
 from types import FrameType
 from typing import Any, Callable, cast
-import termios
 import threading
 import time
 
@@ -45,8 +44,10 @@ from agitrack.config import AgitrackState
 from agitrack.git import WorktreeInfo, WorktreeManager, _sanitize_name, is_managed_branch
 from agitrack.proxy.commit_engine import CommitEngine
 from agitrack.proxy.integration import IntegrationService, MergeContext, MergePhase
+from agitrack.proxy.platform import make_child_process, make_host_terminal, make_waker
 from agitrack.proxy.process import BackendProcess
 from agitrack.proxy.session import Session
+from agitrack.sessions.share_cap import DEFAULT_MAX_SHARED_BYTES
 from agitrack.transcripts import SessionRef
 
 
@@ -69,6 +70,17 @@ from agitrack.proxy.modal import PromptModal, SelectModal, _escape_sequence_comp
 
 _SGR_MOUSE_RE = re.compile(rb"\x1b\[<\d+;\d+;\d+[Mm]")
 _SGR_MOUSE_EVENT_RE = re.compile(rb"\x1b\[<(\d+);(\d+);(\d+)([Mm])")
+# Legacy X10/normal mouse reports: ESC [ M then exactly three raw bytes (button, column, row —
+# each the value offset by 32). Terminals that don't honour SGR mouse mode (?1006) — some tmux
+# configs and the native Windows console — send THESE instead of the SGR form even though
+# aGiTrack requested SGR. Their raw coordinate bytes are ordinary characters (column/row 3 is
+# '#'), so if they go unrecognised they leak into the backend's input as stray text — the
+# "mouse cursor hash". Matched and stripped alongside the SGR form. DOTALL: a coordinate byte
+# can be any value, including ones the default '.' would skip.
+_X10_MOUSE_RE = re.compile(rb"\x1b\[M.{3}", re.DOTALL)
+# A trailing, not-yet-complete X10 report (ESC [ M with fewer than three coordinate bytes),
+# held back like the SGR/CSI tail below so its bytes aren't forwarded split across reads.
+_INCOMPLETE_X10_RE = re.compile(rb"\x1b\[M.{0,2}$", re.DOTALL)
 # Terminal focus in/out reports (CSI I / CSI O), emitted on window focus changes
 # when focus reporting is on. Like mouse reports they are not keystrokes.
 _FOCUS_EVENT_RE = re.compile(rb"\x1b\[[IO]")
@@ -124,6 +136,34 @@ def _strip_ansi(text: str) -> str:
     return _ANSI_CSI_OSC_RE.sub("", text).replace("\r", "\n")
 
 
+def _push_rejection_reason(error: str) -> str:
+    """The most informative line of a failed `git push`'s stderr — the part that names WHY
+    the remote rejected it (a stale lease, a protected ref, a declined hook, a permission
+    denial). Git buries the reason among progress lines, so showing the whole blob (or a
+    blind prefix slice) hides it; this surfaces the line that actually explains the failure."""
+    raw = [line.strip() for line in (error or "").splitlines()]
+    # Drop git's "remote: " prefix so the reason reads cleanly.
+    lines = [(line[len("remote:") :].strip() if line.startswith("remote:") else line) for line in raw]
+    lines = [line for line in lines if line]
+    if not lines:
+        return "origin returned no error — the push likely timed out; check your connection and retry"
+    # GitHub's push protection / repository rulesets (NOT a custom hook) carry the actionable
+    # detail — which secret was found, an unblock URL, the rule — on lines OTHER than the bare
+    # "declined" summary. Surface those so the user can actually resolve it.
+    detail = [
+        line
+        for line in lines
+        if any(m in line.lower() for m in ("secret", "push protection", "rule violation", "ruleset", "unblock", "http"))
+    ]
+    if detail:
+        return " | ".join(detail[:4])[:400]
+    markers = ("rejected", "denied", "declined", "permission", "forbidden", "protected", "stale info")
+    for line in lines:
+        if any(marker in line.lower() for marker in markers):
+            return line[:200]
+    return lines[-1][:200]  # else the last line, which usually carries git's summary
+
+
 # The claude CLI refuses to resume a session that is still held by a running
 # background agent, printing this and exiting (e.g. a stale `bg` agent from an
 # earlier run). Its own remedy is --fork-session, which aGiTrack applies
@@ -142,6 +182,17 @@ def _shared_transcript_rows(transcript: str) -> int:
     from agitrack.sessions import count_transcript_rows
 
     return count_transcript_rows(transcript)
+
+
+def _redact_and_cap(backend, raw: str, max_bytes: int) -> tuple[str, bool]:
+    """Redact secrets, then bound the transcript to ``max_bytes`` (keeping a resumable recent
+    tail) so a large session can't exceed Git's per-file size limit. Returns the (possibly
+    trimmed) shared text and whether it was trimmed."""
+    from agitrack.sessions import redact_transcript
+
+    redacted = redact_transcript(raw)
+    capped = backend.cap_shared_transcript(redacted, max_bytes)
+    return capped, capped != redacted
 
 
 def _decode_kitty_ctrl_keys(data: bytes) -> bytes:
@@ -308,6 +359,14 @@ class ProxyInput:
                         continue
                     self.escape_buffer = bytearray(char)
                     continue
+                if len(self.menu_key) == 1 and char == self.menu_key:
+                    # The menu key again while the palette is open closes it (a toggle), like
+                    # Esc — instead of typing a literal control byte into the command buffer.
+                    self.buffer.clear()
+                    self.capturing = False
+                    self.selected_index = 0
+                    self.escape_buffer = None
+                    continue
                 if char in {b"\r", b"\n"}:
                     typed = self.buffer.decode(errors="ignore").strip()
                     command = self.selected() or typed
@@ -444,6 +503,9 @@ class ProxyRunner:
         # True when cli.py already ran the blocking startup gh-availability prompt for
         # this launch, so run() skips its own in-TUI gh notice (avoids double-nagging).
         gh_prechecked: bool = False,
+        # Suppress the privacy acknowledgment (set on an in-app menu re-exec, where the
+        # user already acknowledged it earlier this session) — see _acknowledge_privacy_warning.
+        skip_privacy_ack: bool = False,
         # Optional injected collaborators (default to production construction).
         # These keyword arguments are for testing and advanced use; the CLI call
         # site passes only the first five parameters and is unaffected.
@@ -482,6 +544,7 @@ class ProxyRunner:
         self._backend_command = list(backend_command or [])
         # cli.py already showed the blocking startup gh prompt ⇒ suppress the in-TUI notice.
         self._gh_prechecked = gh_prechecked
+        self._skip_privacy_ack = skip_privacy_ack
         self._force_new_session = new_session  # start a fresh conversation, do not resume
         self.name = "main"  # session label (multiplexer assigns names to others)
         self._primary_worktree_name: str | None = None  # session kept across exits for auto-resume
@@ -669,6 +732,13 @@ class ProxyRunner:
         # background push thread (only one at a time). Triggered per commit.
         self._auto_share_hash: dict[str, str] = {}
         self._auto_share_thread: threading.Thread | None = None
+        # The live auto-share worker (off-thread) leaves its result here for the main loop to
+        # surface; a notice is shown only on FAILURE/behind (success is silent, since it fires
+        # every commit). None ⇒ nothing to report. See _service_auto_share_outcome.
+        self._auto_share_outcome: dict | None = None
+        # Session ids already told (this run) that auto-share is trimming their oversized
+        # transcript — so the truncation notice shows ONCE, not on every commit's auto-share.
+        self._auto_share_truncation_warned: set[str] = set()
         # aGiTrack session ids (stable, never drift) that saw at least one committed turn
         # THIS run. The exit-path auto-share consults this so a session that was only
         # resumed and never typed into is not re-shared — robust where a transcript
@@ -724,6 +794,9 @@ class ProxyRunner:
         # (on the main thread, NOT mid-iteration over _background_share_ops) prompts the
         # user to overwrite or merge. Each entry: {payload, store, display, session_id}.
         self._pending_share_conflicts: list[dict] = []
+        # Set when the menu key (Ctrl-G) is pressed inside an open popup: closes the WHOLE
+        # command menu (every nested level) back to the agent, rather than going up one level.
+        self._exit_menu_requested = False
         self._relaunch_times: list[float] = []
         self._exiting = False
         self._finalized_on_exit = False
@@ -782,6 +855,12 @@ class ProxyRunner:
         self._modal_mailbox: queue.Queue = queue.Queue()  # worker → main: dialogs to present
         self._wake_r = -1  # self-pipe read end (added to select) — wakes the reactor on demand
         self._wake_w = -1  # self-pipe write end — the worker writes to wake the main loop
+        # Platform host-I/O (issue #118), created in run(): the host terminal (raw mode +
+        # a select-able stdin source) and the reactor waker. POSIX wraps termios/os.pipe;
+        # Windows uses the Win32 console + socketpairs. None until run() (and in tests).
+        self._host: Any = None
+        self._waker: Any = None
+        self._last_shutdown_check = 0.0  # rate-limit the .agitrack/shutdown sentinel poll
 
     def _apply_timings(self, timings: dict[str, float]) -> None:
         # Override the class-constant timing defaults with the user's configured
@@ -911,6 +990,7 @@ class ProxyRunner:
                 "_message_max_scroll": 0,
                 "_message_sticky": False,
                 "_gh_prechecked": False,
+                "_skip_privacy_ack": False,
                 "_session_notices": {},
                 "_notice_shown": False,
                 "_awaited_followups": [],
@@ -943,6 +1023,8 @@ class ProxyRunner:
                 "_warned_backend_session": False,
                 "_auto_share_hash": {},
                 "_auto_share_thread": None,
+                "_auto_share_outcome": None,
+                "_auto_share_truncation_warned": set(),
                 "_backend_update_thread": None,
                 "_backend_update_result": None,
                 "_backend_update_checked_for": None,
@@ -977,6 +1059,7 @@ class ProxyRunner:
                 "_shared_resume_cancel": None,
                 "_background_share_ops": [],
                 "_pending_share_conflicts": [],
+                "_exit_menu_requested": False,
                 "_use_worktrees": True,
                 "_warned_parallel_no_worktree": False,
                 "_sandbox": True,
@@ -1012,6 +1095,9 @@ class ProxyRunner:
                 "_modal_mailbox": queue.Queue(),
                 "_wake_r": -1,
                 "_wake_w": -1,
+                "_host": None,
+                "_waker": None,
+                "_last_shutdown_check": 0.0,
                 "UPDATE_CHECK_SECONDS": 300.0,
             }
         )
@@ -1070,6 +1156,16 @@ class ProxyRunner:
         if not self.management_lock.acquire():
             print(already_running_message(self.management_lock.owner_pid()))
             return 1
+        # Privacy warning LAST in the cooked-mode startup — after the backend
+        # install/availability gate above, after the second-instance lock check (a refused
+        # instance is never asked to acknowledge), and after cli.py's gh-login and menu-key
+        # prompts — so it's the final thing the user acknowledges right before the full-screen
+        # TUI takes over, not buried above those configuration steps.
+        from agitrack.cli import _acknowledge_privacy_warning
+
+        if not _acknowledge_privacy_warning(skip=self._skip_privacy_ack):
+            self.management_lock.release()
+            return 1
         self.state.save()
         if self.actions.has_pre_agent_user_changes():
             print("User changes detected before the agent starts.")
@@ -1105,8 +1201,12 @@ class ProxyRunner:
         # so it can wake `select` on demand (e.g. to present a dialog) instead of
         # waiting for the next poll tick. Then start the git worker itself.
         self._main_thread_ident = threading.get_ident()
-        self._wake_r, self._wake_w = os.pipe()
-        os.set_blocking(self._wake_r, False)
+        # Host I/O via the platform layer (#118): the waker (self-pipe on POSIX, socketpair
+        # on Windows) the git worker uses to break the reactor out of select, and the host
+        # terminal (termios fd 0 on POSIX, Win32 console + a stdin bridge socket on Windows).
+        self._waker = make_waker()
+        self._wake_r = self._waker.wake_fileno()
+        self._host = make_host_terminal(self)
         self._start_git_worker()
         # Register the initial session as the sole (active) entry in the
         # multiplexer. Additional sessions are appended by `_new_session`.
@@ -1125,24 +1225,27 @@ class ProxyRunner:
         # exit-time auto-share has to shell out to `gh` mid-share (that lookup can
         # stall and would otherwise eat into the bounded share budget).
         threading.Thread(target=self._warm_share_login, daemon=True).start()
-        self.old_attrs = termios.tcgetattr(sys.stdin.fileno())
         try:
             self._enter_host_screen()
-            self._set_raw()
+            self._set_raw()  # POSIX saves old_attrs here; Windows enters console raw mode
             self._detect_host_terminal()
             self._resize_child()
-            self.original_sigwinch = signal.getsignal(signal.SIGWINCH)
-            self.original_signal_handlers = {
-                signal.SIGTERM: signal.getsignal(signal.SIGTERM),
-                signal.SIGHUP: signal.getsignal(signal.SIGHUP),
-            }
-            signal.signal(signal.SIGWINCH, lambda _signum, _frame: self._resize_child())
-            signal.signal(signal.SIGTERM, self._handle_exit_signal)
-            signal.signal(signal.SIGHUP, self._handle_exit_signal)
+            # SIGWINCH/SIGHUP don't exist on native Windows — there the host terminal's
+            # resize watcher feeds _resize_child via consume_resize_pending() in the select
+            # phase, and console-close is handled by the platform console-control handler.
+            if sys.platform != "win32":
+                self.original_sigwinch = signal.getsignal(signal.SIGWINCH)
+                self.original_signal_handlers = {
+                    signal.SIGTERM: signal.getsignal(signal.SIGTERM),
+                    signal.SIGHUP: signal.getsignal(signal.SIGHUP),
+                }
+                signal.signal(signal.SIGWINCH, lambda _signum, _frame: self._resize_child())
+                signal.signal(signal.SIGTERM, self._handle_exit_signal)
+                signal.signal(signal.SIGHUP, self._handle_exit_signal)
             self._setup_worktree_confinement_notice()
             exit_code = self._loop()  # the timers phase auto-applies a sandbox-blocked backend update
         finally:
-            if self.original_sigwinch is not None:
+            if self.original_sigwinch is not None and hasattr(signal, "SIGWINCH"):
                 signal.signal(signal.SIGWINCH, self.original_sigwinch)
             for signum, handler in self.original_signal_handlers.items():
                 signal.signal(signum, handler)
@@ -1151,18 +1254,22 @@ class ProxyRunner:
             self._stop_dashboard()
             self._cleanup_child()
             self._restore_terminal()
-            for fd in (self._wake_r, self._wake_w):
-                if fd >= 0:
-                    try:
-                        os.close(fd)
-                    except OSError:
-                        pass
+            if self._host is not None:
+                self._host.stop()  # stop the Windows stdin/resize threads; no-op on POSIX
+                self._host = None
+            if self._waker is not None:
+                self._waker.close()
+                self._waker = None
             self._wake_r = self._wake_w = -1
             if self.master_fd is not None:
                 try:
                     os.close(self.master_fd)
                 except OSError:
                     pass
+                # Nulling routes through the platform child: a no-op extra on POSIX (the fd
+                # is closed above), but on Windows the setter closes the ConPTY bridge socket
+                # (os.close can't close a socket fd there), so it isn't leaked.
+                self.master_fd = None
             self.management_lock.release()
             # The host terminal closed mid-work and the user chose "Reopen" in the
             # forced-exit dialog: launch a fresh window now that the lock is free so
@@ -1196,6 +1303,12 @@ class ProxyRunner:
         return exit_code
 
     def _ensure_backend_available(self) -> bool:
+        # A user-supplied launch command (--backend-command / config backend_command)
+        # replaces the backend's own binary — a wrapper that ultimately execs the agent —
+        # so the default backend CLI need not be installed on PATH. Skip the install gate
+        # in that case (it would otherwise block a perfectly valid wrapped setup).
+        if self._launch_command():
+            return True
         try:
             resolved = ensure_installed_backend(self.state.backend, self.global_config, interactive=True)
         except BackendUnavailable as error:
@@ -1243,11 +1356,12 @@ class ProxyRunner:
         # before the sandbox wrapper so they reach the backend, not sandbox-exec.
         command = command + getattr(self, "_backend_args", [])
         command = self._confine_to_worktree(command)
-        # Fork/exec mechanics delegated to BackendProcess; policy (command
-        # construction, sandbox wrapping) stays here in the runner. The session
-        # owns its BackendProcess; child_pid / master_fd remain readable on the
-        # runner via the Session-delegating compat properties.
-        self.active.process = BackendProcess.spawn(command, str(self.repo.repo), extra_env=self._backend_child_env())
+        # Pseudo-terminal mechanics delegated to the platform child process (POSIX PTY
+        # via BackendProcess, or Windows ConPTY via NtChildProcess); policy (command
+        # construction, sandbox wrapping) stays here in the runner. The session owns its
+        # child process; child_pid / master_fd remain readable on the runner via the
+        # Session-delegating compat properties.
+        self.active.process = make_child_process(command, str(self.repo.repo), extra_env=self._backend_child_env())
         # Re-arm the cwd-drift check for this launch, and remember when it started:
         # only turns recorded at/after this time count, so a stale cwd left in the
         # transcript before this launch can't trigger a false drift warning (#72).
@@ -2732,8 +2846,14 @@ class ProxyRunner:
         if self._integration_paused or self._delay_merge:
             return  # --delay-merge: the user merges on their own confirmation
         try:
-            if self.repo.has_changes() or self.repo.merge_in_progress():
-                return  # in-flight or mid-merge work; leave it for the normal path
+            if self.repo.has_tracked_changes() or self.repo.merge_in_progress():
+                # A real in-flight tracked edit or a mid-merge: leave it for the normal
+                # path. But UNTRACKED leftovers (files the agent created that the user
+                # declined to stage) must NOT block this merge — they're not part of the
+                # turn branch and don't affect the fast-forward, yet has_changes() counts
+                # them, which stranded a ready, summarized commit whenever the next prompt
+                # started before it had merged.
+                return
             branch = self.repo.current_branch()
             if not is_managed_branch(branch):
                 return
@@ -2906,7 +3026,15 @@ class ProxyRunner:
         if fd is None:
             return
         try:
-            BackendProcess(fd).write(b"\r")
+            if self.master_fd == fd:
+                # The common case (the prompt's session is still active): write through its
+                # platform child, which knows how to reach the backend (a raw os.write to a
+                # bridge-socket fd would be wrong on Windows).
+                self.active.process.write(b"\r")
+            else:
+                # A backgrounded session's PTY (POSIX multi-session merge); a transient
+                # POSIX child writes straight to its master fd.
+                BackendProcess(fd).write(b"\r")
         except OSError:
             return  # Enter never reached the backend; the merge gate stays closed
         if self.merge_ctx is not None and self.master_fd == fd:
@@ -3150,12 +3278,14 @@ class ProxyRunner:
         choice = self._select_popup(title, options)
         return None if choice is None else label_for.get(choice, choice)
 
-    def _change_session_merge_branch_menu(self) -> None:
-        # Session-config entry: change the merge destination of ANY session.
+    def _change_session_merge_branch_menu(self) -> str:
+        # Session-config entry: change the merge destination of ANY session. Returns _MENU_DONE
+        # once it acts/reports (so the menu closes and that's visible) or _MENU_UP on a plain
+        # Esc/cancel (re-show the list).
         if not self.sessions:
             self._set_message("No sessions.")
             self._render()
-            return
+            return self._MENU_DONE
         label_for: dict[str, int] = {}
         options: list[str] = []
         for index in range(len(self.sessions)):
@@ -3165,7 +3295,7 @@ class ProxyRunner:
             options.append(label)
         choice = self._select_popup("Change the merge branch of which session?", options)
         if choice is None:
-            return
+            return self._MENU_UP
         index = label_for[choice]
         session = self.sessions[index]
         if getattr(session, "agent_in_flight", False):
@@ -3176,20 +3306,21 @@ class ProxyRunner:
                 seconds=8.0,
             )
             self._render()
-            return
+            return self._MENU_DONE
         current = getattr(session, "_base_branch", None)
         target = self._prompt_merge_branch(f"Merge '{self._session_name(index)}' into which branch?", current)
         if not target:
-            return
+            return self._MENU_UP
         if target == current:
             self._set_message(f"'{self._session_name(index)}' already merges into '{target}'.")
             self._render()
-            return
+            return self._MENU_DONE
         if session is self.active:
             self._retarget_active_session(target)
         else:
             # Re-target a background session by temporarily making it active.
             self._with_session(session, lambda: self._retarget_active_session(target))
+        return self._MENU_DONE
 
     def _integrate_session_keeping_alive(self) -> None:
         # Commit the latest turn and integrate it into the current base WITHOUT
@@ -3342,15 +3473,20 @@ class ProxyRunner:
                 if self._manage_shared_sessions_menu() == self._MENU_DONE:
                     return self._MENU_DONE
                 continue
-            # Configuration actions: run, then re-show this list (so their Esc lands here).
+            # Configuration actions: a COMPLETED action closes the menu so its result/progress
+            # is visible (never bounce back to the list); only backing out (Esc before doing
+            # anything) re-shows this list. Each handler signals which it was.
             if kind == "rename":
-                self._rename_session_menu()
+                signal = self._rename_session_menu()
             elif kind == "merge-branch":
-                self._change_session_merge_branch_menu()
+                signal = self._change_session_merge_branch_menu()
             elif kind == "share":
-                self._share_session()
+                signal = self._share_session()
             else:
-                self._stop_session_menu()
+                signal = self._stop_session_menu()
+            if signal == self._MENU_DONE:
+                return self._MENU_DONE
+            # else _MENU_UP: nothing was done (Esc/cancel) → re-show this list
 
     def _active_has_pending(self) -> bool:
         # True if the active session has committed work not yet in the base.
@@ -3785,7 +3921,9 @@ class ProxyRunner:
         except Exception as error:
             self._debug(f"orphan-session sweep failed: {error!r}")
 
-    def _share_session(self) -> None:
+    def _share_session(self) -> str:
+        # Returns _MENU_DONE once a share starts/reports (so the menu closes and the progress is
+        # visible) or _MENU_UP when the user backs out at the consent prompt (re-show the list).
         backend = self.backend
         if not getattr(backend, "supports_session_sharing", False):
             self._set_message(
@@ -3794,12 +3932,12 @@ class ProxyRunner:
                 seconds=10.0,
             )
             self._render()
-            return
+            return self._MENU_DONE
         session_id = self.state.backend_session_id
         if not session_id or not backend.session_belongs_to_repo(self.repo.repo, session_id):
             self._set_message("No resumable session for this repo to share yet.")
             self._render()
-            return
+            return self._MENU_DONE
         # Informed consent before EVERY manual share — sharing is opt-in and never
         # automatic, and each push uploads a fresh, possibly sensitive transcript, so
         # the warning must appear every time, not just once. The first time it spells
@@ -3822,30 +3960,41 @@ class ProxyRunner:
         if choice != "Yes, share it":
             self._set_message("Sharing cancelled.")
             self._render()
-            return
+            return self._MENU_UP  # backed out before sharing — re-show the sessions list
         self.global_config.acknowledge_session_sharing()
-        payload = self._share_payload(session_id)
-        if payload is None:
-            self._set_message("Could not read the session transcript to share.")
-            self._render()
-            return
-        display = payload["display"]
         store = self._shared_store()
+        # The display name comes from cheap identity (no transcript read), so the progress
+        # notice and the keep-updated prompt below appear INSTANTLY. The heavy read+redact (and
+        # the push) run in the background op — previously they blocked the main thread here,
+        # which is the "it takes a while before the second confirmation" delay.
+        login = self.global_config.github_login or self._cached_or_resolve_login()
+        _owner, _name, contributors = self._share_identity(session_id, login)
+        display = f"{'+'.join(contributors)}/{_name}"
 
         def op():
-            return store.publish(
-                github_id=payload["owner"],
-                name=payload["name"],
-                transcript=payload["redacted"],
-                manifest=payload["manifest"],
-                prune_gid=payload["sharer"],
-                timeout=self.SHARE_PUSH_TIMEOUT,
-            )
+            payload = self._share_payload(session_id)  # read + redact OFF the main thread
+            if payload is None:
+                return {"payload": None}
+            return {
+                "payload": payload,
+                "result": store.publish(
+                    github_id=payload["owner"],
+                    name=payload["name"],
+                    transcript=payload["redacted"],
+                    manifest=payload["manifest"],
+                    prune_gid=payload["sharer"],
+                    timeout=self.SHARE_PUSH_TIMEOUT,
+                ),
+            }
 
         def outcome(box) -> str | None:
             if "error" in box:
                 return f"Could not share session: {box['error']}"
-            result = box["result"]
+            data = box["result"]
+            payload = data.get("payload")
+            if payload is None:
+                return "Could not read the session transcript to share."
+            result = data["result"]
             if result.behind:
                 # The shared copy already has newer turns than this session, so the push
                 # was refused. Don't just give up — stash it so the main loop can ask the
@@ -3853,7 +4002,7 @@ class ProxyRunner:
                 # over the background-op list). Leave the auto-share hash/origin untouched
                 # since nothing was published yet.
                 self._pending_share_conflicts.append(
-                    {"payload": payload, "store": store, "display": display, "session_id": session_id}
+                    {"payload": payload, "store": store, "display": payload["display"], "session_id": session_id}
                 )
                 return None
             self._auto_share_hash[session_id] = payload["digest"]  # don't immediately re-push the same content
@@ -3862,11 +4011,11 @@ class ProxyRunner:
             self._user_state().set_shared_origin(
                 session_id, owner=payload["owner"], name=payload["name"], contributors=payload["contributors"]
             )
-            return self._share_outcome_message(result, display)
+            return self._share_outcome_message(result, payload["display"], truncated=payload.get("truncated", False))
 
-        # The push to origin runs in the BACKGROUND so the terminal never freezes; its
-        # result lands as a notice. Only the exit-path share blocks (it must finish
-        # before the process quits, since daemon threads die with it).
+        # The read+redact+push all run in the BACKGROUND so the terminal never freezes; the
+        # result lands as a notice. Only the exit-path share blocks (it must finish before the
+        # process quits, since daemon threads die with it).
         self._run_share_op_async(f"share:{display}", f"Sharing '{display}' — pushing to origin…", op, outcome)
         # Offer to keep it current automatically. This is a quick interactive prompt
         # (not a network wait), shown while the push proceeds in the background.
@@ -3883,6 +4032,13 @@ class ProxyRunner:
                     seconds=8.0,
                 )
                 self._render()
+        return self._MENU_DONE  # the share is underway — close the menu so its progress shows
+
+    def _share_max_transcript_bytes(self) -> int:
+        """The max-transcript-bytes cap for sharing — user-configurable, with a safe fallback
+        when the config object predates the key. Already clamped to the hard limit by
+        GlobalConfig (and an over-limit config is refused at startup)."""
+        return getattr(self.global_config, "share_max_transcript_bytes", DEFAULT_MAX_SHARED_BYTES)
 
     def _share_payload(self, session_id: str):
         """Read + redact the session transcript and build its manifest (no network,
@@ -3895,10 +4051,10 @@ class ProxyRunner:
         )
         if not raw:
             return None
-        from agitrack.sessions import github_login, redact_transcript
+        from agitrack.sessions import github_login
 
-        redacted = redact_transcript(raw)
-        digest = hashlib.sha256(redacted.encode("utf-8")).hexdigest()
+        shared, truncated = _redact_and_cap(backend, raw, self._share_max_transcript_bytes())
+        digest = hashlib.sha256(shared.encode("utf-8")).hexdigest()
         login = self.global_config.github_login or github_login(self.base_repo)
         self.global_config.github_login = login
         owner, name, contributors = self._share_identity(session_id, login)
@@ -3913,7 +4069,8 @@ class ProxyRunner:
             "updated": int(time.time()),
             "content_hash": digest,
             "transcript_bytes": backend.transcript_size(self.base_repo.repo, session_id),
-            "transcript_rows": _shared_transcript_rows(redacted),
+            "transcript_rows": _shared_transcript_rows(shared),
+            "truncated": truncated,  # oldest middle turns dropped to fit Git's file-size limit
         }
         return {
             "owner": owner,
@@ -3921,12 +4078,13 @@ class ProxyRunner:
             "contributors": contributors,
             "sharer": login,
             "display": f"{'+'.join(contributors)}/{name}",
-            "redacted": redacted,
+            "redacted": shared,
             "digest": digest,
+            "truncated": truncated,
             "manifest": manifest,
         }
 
-    def _share_outcome_message(self, result, display: str) -> str:
+    def _share_outcome_message(self, result, display: str, *, truncated: bool = False) -> str:
         if result.behind:
             # The shared copy already has newer turns than this machine's copy —
             # sharing would rewind it. Tell the user in plain language (no git jargon).
@@ -3945,9 +4103,12 @@ class ProxyRunner:
                 f"or: git ls-remote origin 'refs/agitrack/*'."
             )
         else:
+            # The push to origin failed. Show the REAL reason (a stale-lease race, a protected
+            # ref, a declined hook, a timeout) rather than always blaming a concurrent update —
+            # and never a bare "[]" from an empty error.
             message = (
-                f"Saved '{display}' locally, but the push was rejected — someone else may have "
-                f"updated the shared ref. Try sharing again. [{result.error[:80]}]"
+                f"Saved '{display}' locally, but couldn't push it to origin. "
+                f"Reason: {_push_rejection_reason(result.error)}. Try sharing again."
             )
         if getattr(result, "merged", 0):
             # A concurrent contributor's diverged copy was folded in rather than
@@ -3955,20 +4116,36 @@ class ProxyRunner:
             message += f" Merged {result.merged} turn(s) shared by a collaborator."
         if result.pruned:
             message += f" Pruned {result.pruned} older shared session(s)."
+        if truncated and (result.pushed or not result.remote):
+            # The session was too big for Git's per-file limit, so only the most recent turns
+            # were shared. Put the note on its own line (after a blank one) so it stands out.
+            message += (
+                "\n\nNote: this session was large, so only the most recent turns were shared "
+                "(older ones were trimmed to fit the share size limit). Compact the conversation "
+                "if you want a smaller, cleaner shared copy."
+            )
         return message
 
     def _manage_shared_sessions_menu(self) -> str:
-        # Must open instantly: read only the LOCAL ref (no network fetch — your own
-        # shares are already here) and label each entry from cheap data only
-        # (manifest + a stat-sized "newer?" check), never a transcript read/redact.
+        # Fetch the remote FIRST so the list reflects what's actually shared on origin — a
+        # session shared from another machine becomes manageable here, and one removed
+        # elsewhere drops out, instead of trusting a possibly-stale local/mirror view (which is
+        # what let a local-only session that never reached origin masquerade as "shared"). The
+        # fetch is cancelable and bounded; with no remote it's an instant local call. The list
+        # itself is still labelled from cheap data only (manifest + a stat-sized "newer?"
+        # check), never a transcript read/redact.
         store = self._shared_store()
         login = self.global_config.github_login or self._cached_or_resolve_login()
+        if not self._fetch_shared_with_cancel(store, "Fetching shared sessions from origin…"):
+            return self._MENU_UP  # the user stopped the fetch — back to the sessions menu
         while True:
             mine = [entry for entry in store.entries() if entry.github_id == login]
             if not mine:
-                self._set_message("You haven't shared any sessions in this repo yet. Use session → Share this session.")
+                # _MENU_DONE (not _UP) so this message is VISIBLE on the agent screen: returning
+                # _UP re-shows the sessions menu straight over it, which reads as "nothing shows".
+                self._set_message("No sessions are shared in this repo. Use session → Share this session to share one.")
                 self._render()
-                return self._MENU_UP
+                return self._MENU_DONE
             auto_state = self._user_state()  # base-repo opt-in, read once for the whole list
             options: list[str] = []
             for entry in mine:
@@ -3980,8 +4157,12 @@ class ProxyRunner:
             choice = self._select_popup("Your shared sessions — pick one to manage", options)
             if choice is None:  # Esc → up one level (back to the sessions menu)
                 return self._MENU_UP
-            # The per-entry menu returns here, so its Esc re-shows this list (one level up).
-            self._manage_one_shared_session(mine[options.index(choice)])
+            # An action that kicks off a background network op (update/unshare/auto-on) returns
+            # _MENU_DONE so the whole menu closes and the user can WATCH its progress notice
+            # ("Unsharing…" → "Unshared") on the live screen — instead of the menu re-showing
+            # over it. Backing out of an entry (_MENU_UP) re-shows this list.
+            if self._manage_one_shared_session(mine[options.index(choice)]) == self._MENU_DONE:
+                return self._MENU_DONE
 
     def _shared_entry_status(self, entry, session_id: str) -> str:
         # Cheap "is the shared copy current?" — compare the transcript's byte size
@@ -3994,7 +4175,9 @@ class ProxyRunner:
             return "local has newer turns — Update to push them"
         return "shared (up to date)"
 
-    def _manage_one_shared_session(self, entry) -> None:
+    def _manage_one_shared_session(self, entry) -> str:
+        # Returns _MENU_DONE to close the whole menu (so a background op's progress notice is
+        # visible on the live screen), or _MENU_UP to re-show the shared-sessions list.
         sid = entry.manifest.get("session_id", "")
         auto_on = self._session_auto_shared(sid)
         actions = [
@@ -4004,11 +4187,12 @@ class ProxyRunner:
         ]
         choice = self._select_popup(f"Manage {entry.display}", [label for _, label in actions])
         if choice is None:
-            return
+            return self._MENU_UP  # Esc backs out to the list
         kind = actions[[label for _, label in actions].index(choice)][0]
         if kind == "update":
             self._update_shared_entry(entry)
-        elif kind == "auto":
+            return self._MENU_DONE  # close the menu so the "Updating…" → result notice shows
+        if kind == "auto":
             self._set_session_auto_share(sid, not auto_on)
             if auto_on:
                 self._set_message(f"Auto-update disabled for {entry.display}.")
@@ -4019,19 +4203,19 @@ class ProxyRunner:
                 self._set_message(f"Auto-update on for {entry.display} — pushing the latest now…", seconds=10.0)
                 self._render()
                 self._update_shared_entry(entry)
-        else:
-            # Unsharing removes the session from origin for every collaborator and
-            # can't be undone, so confirm before doing it (mirrors the discard-confirm
-            # flow).
-            confirm = self._select_popup(
-                f"Unshare '{entry.display}'? This removes it from origin for everyone and can't be undone.",
-                ["No, keep it", "Yes, unshare"],
-            )
-            if confirm == "Yes, unshare":
-                self._unshare_entry(entry)
-            else:
-                self._set_message("Kept the shared session.")
-                self._render()
+            return self._MENU_DONE  # close the menu so the message/push progress is visible
+        # Unsharing removes the session from origin for every collaborator and can't be undone,
+        # so confirm before doing it (mirrors the discard-confirm flow).
+        confirm = self._select_popup(
+            f"Unshare '{entry.display}'? This removes it from origin for everyone and can't be undone.",
+            ["No, keep it", "Yes, unshare"],
+        )
+        if confirm == "Yes, unshare":
+            self._unshare_entry(entry)
+            return self._MENU_DONE  # close the menu so "Unsharing…" → "Unshared" is visible
+        self._set_message("Kept the shared session.")
+        self._render()
+        return self._MENU_UP  # cancelled — back to the list
 
     def _update_shared_entry(self, entry) -> None:
         sid = entry.manifest.get("session_id", "")
@@ -4040,9 +4224,7 @@ class ProxyRunner:
             self._set_message(f"Can't read the transcript for {entry.display} to update it.")
             self._render()
             return
-        from agitrack.sessions import redact_transcript
-
-        redacted = redact_transcript(raw)
+        shared, truncated = _redact_and_cap(self.backend, raw, self._share_max_transcript_bytes())
         # Updating from the Manage menu counts as a (re-)share by the current user, so
         # fold them into the contributor set — the entry stays under its origin owner.
         login = self._cached_or_resolve_login()
@@ -4051,9 +4233,10 @@ class ProxyRunner:
             **entry.manifest,
             "contributors": contributors,
             "updated": int(time.time()),
-            "content_hash": hashlib.sha256(redacted.encode("utf-8")).hexdigest(),
+            "content_hash": hashlib.sha256(shared.encode("utf-8")).hexdigest(),
             "transcript_bytes": self.backend.transcript_size(self.base_repo.repo, sid),
-            "transcript_rows": _shared_transcript_rows(redacted),
+            "transcript_rows": _shared_transcript_rows(shared),
+            "truncated": truncated,
         }
         display = f"{'+'.join(contributors)}/{entry.name}"
         store = self._shared_store()
@@ -4062,7 +4245,7 @@ class ProxyRunner:
             return store.publish(
                 github_id=entry.github_id,
                 name=entry.name,
-                transcript=redacted,
+                transcript=shared,
                 manifest=manifest,
                 prune_gid=login,
                 timeout=self.SHARE_PUSH_TIMEOUT,
@@ -4074,7 +4257,7 @@ class ProxyRunner:
             result = box["result"]
             if sid:
                 self._auto_share_hash[sid] = manifest["content_hash"]
-            return self._share_outcome_message(result, display)
+            return self._share_outcome_message(result, display, truncated=truncated)
 
         # Push in the BACKGROUND (same as the initial share) so the terminal never
         # freezes; a progress notice shows now, the result lands when it finishes.
@@ -4087,10 +4270,15 @@ class ProxyRunner:
         store = self._shared_store()
         sid = entry.manifest.get("session_id", "")
         if sid:
-            self._set_session_auto_share(sid, False)  # stop auto-pushing it immediately
+            # Stop auto-pushing it immediately — across the WHOLE id lineage, not just this
+            # entry's id. The backend mints a new id on resume, so auto-share may be opted in
+            # under a drifted id; clearing only `sid` left it enabled (the menu kept showing it
+            # as shared/auto and it kept re-pushing). _session_auto_shared reads the lineage too.
+            for lineage_sid in {sid, *self._user_state().session_lineage(sid)}:
+                self._set_session_auto_share(lineage_sid, False)
 
         def op():
-            return store.unshare(entry.github_id, entry.name)
+            return store.unshare(entry.github_id, entry.name, timeout=self.SHARE_PUSH_TIMEOUT)
 
         def outcome(box) -> str:
             if "error" in box:
@@ -4100,7 +4288,17 @@ class ProxyRunner:
                 return f"Removed {entry.display} from the local shared ref (no remote to push the removal to)."
             if result.pushed:
                 return f"Unshared {entry.display} (removed from origin)."
-            return f"Removed {entry.display} locally, but the push was rejected — try again. [{result.error[:80]}]"
+            if not result.error:
+                # Nothing was rejected: the entry wasn't on origin (its share never reached it,
+                # or it was already removed there). It's gone from your list either way.
+                return f"Removed {entry.display} — it wasn't on origin (nothing to push)."
+            # Removed locally but the origin push was rejected even after the auto-retry — show
+            # the REASON git gave (not a blind prefix slice) so the user can tell a transient
+            # race from a permission/protected-ref/hook rejection they must fix on the remote.
+            return (
+                f"Removed {entry.display} locally, but origin rejected the push — re-run unshare "
+                f"from the menu to retry. Reason: {_push_rejection_reason(result.error)}"
+            )
 
         self._run_share_op_async(
             f"unshare:{entry.display}", f"Unsharing {entry.display} — removing from origin…", op, outcome
@@ -4202,8 +4400,11 @@ class ProxyRunner:
                 session_id, owner=payload["owner"], name=payload["name"], contributors=payload["contributors"]
             )
             if not result.pushed:
-                return self._share_outcome_message(result, display)
-            return f"Overwrote the shared copy of '{display}' on origin with this session."
+                return self._share_outcome_message(result, display, truncated=payload.get("truncated", False))
+            note = ""
+            if payload.get("truncated"):
+                note = " (only the most recent turns were shared — older ones trimmed to fit the size limit)"
+            return f"Overwrote the shared copy of '{display}' on origin with this session.{note}"
 
         self._run_share_op_async(f"share:{display}", f"Overwriting '{display}' — pushing to origin…", op, outcome)
 
@@ -4326,24 +4527,23 @@ class ProxyRunner:
         self._auto_share_thread.start()
 
     def _auto_share_worker(self, ctx: dict):
-        # Runs off the reactor thread; best-effort, never touches the UI. Reads and
-        # redacts the (possibly large) transcript and pushes here, not on the loop.
-        # Returns the PublishResult on a push, or None when it skipped (no
-        # transcript / unchanged) or hit an error — the exit path inspects it.
+        # Runs off the reactor thread; best-effort. Reads and redacts the (possibly large)
+        # transcript and pushes here, not on the loop. Returns the PublishResult on a push,
+        # or None when it skipped (no transcript / unchanged) or hit an error — the exit path
+        # inspects it. Records the outcome for the main loop to surface ONLY on failure/behind
+        # (success is silent: this fires on every commit). See _service_auto_share_outcome.
+        sid = ctx["session_id"]
         try:
-            backend, sid = ctx["backend"], ctx["session_id"]
+            backend = ctx["backend"]
             raw = backend.export_session_raw(ctx["repo_path"], sid) or backend.export_session_raw(
                 ctx["base_repo_path"], sid
             )
             if not raw:
                 return None
-            from agitrack.sessions import redact_transcript
-
-            redacted = redact_transcript(raw)
-            digest = hashlib.sha256(redacted.encode("utf-8")).hexdigest()
+            shared, truncated = _redact_and_cap(backend, raw, self._share_max_transcript_bytes())
+            digest = hashlib.sha256(shared.encode("utf-8")).hexdigest()
             if digest == ctx["last_hash"]:
                 return None  # nothing new since the last push — skip the network round-trip
-            self._auto_share_hash[sid] = digest
             manifest = {
                 "github_id": ctx["owner"],  # lineage origin owner (entry's ref path owner)
                 "name": ctx["name"],
@@ -4355,18 +4555,74 @@ class ProxyRunner:
                 "updated": int(time.time()),
                 "content_hash": digest,
                 "transcript_bytes": backend.transcript_size(ctx["base_repo_path"], sid),
-                "transcript_rows": _shared_transcript_rows(redacted),
+                "transcript_rows": _shared_transcript_rows(shared),
+                "truncated": truncated,
             }
-            return ctx["store"].publish(
+            result = ctx["store"].publish(
                 github_id=ctx["owner"],
                 name=ctx["name"],
-                transcript=redacted,
+                transcript=shared,
                 manifest=manifest,
                 prune_gid=ctx["login"],
+                # Bound the push: a stalled remote must not strand this worker, because the
+                # in-flight guard (_auto_share_thread.is_alive()) would then block EVERY future
+                # auto-share for the run — the session would silently stop updating (the bug).
+                timeout=self.SHARE_PUSH_TIMEOUT,
             )
+            # Cache the digest ONLY after a real success, so a failed/refused push retries on
+            # the next commit instead of being silently marked "already shared" (which left the
+            # shared copy days stale with no error). A remote-less repo only has the local ref,
+            # so a successful local write counts as shared.
+            if result.pushed or not result.remote:
+                self._auto_share_hash[sid] = digest
+                # Carry truncation + sid so the main loop can show a ONE-TIME notice (it owns the
+                # "already warned" set, off this worker thread). Success is otherwise silent.
+                self._auto_share_outcome = {"ok": True, "truncated": truncated, "sid": sid, "name": ctx["name"]}
+            elif result.behind:
+                self._auto_share_outcome = {"behind": True, "name": ctx["name"]}
+            else:
+                self._auto_share_outcome = {"failed": result.error or "push rejected", "name": ctx["name"]}
+            return result
         except Exception as error:
             self._debug(f"auto-share failed: {error!r}")
+            self._auto_share_outcome = {"failed": str(error), "name": ctx["name"]}
             return None
+
+    def _service_auto_share_outcome(self) -> None:
+        """Main-loop tick: surface the live auto-share worker's result. Only FAILURE and
+        'behind' are shown (success is silent — auto-share fires on every commit), so a push
+        that keeps failing becomes visible instead of leaving the shared copy quietly stale."""
+        outcome = self._auto_share_outcome
+        if outcome is None:
+            return
+        self._auto_share_outcome = None
+        name = outcome.get("name", "this session")
+        if "failed" in outcome:
+            self._set_session_notice(
+                "auto-share",
+                f"Auto-share for {name} failed: {str(outcome['failed'])[:120]} — it will retry on the next commit.",
+                seconds=12.0,
+            )
+            self._render()
+        elif outcome.get("behind"):
+            self._set_session_notice(
+                "auto-share",
+                f"Auto-share for {name} skipped — the shared copy already has newer turns than this machine.",
+                seconds=10.0,
+            )
+            self._render()
+        elif outcome.get("truncated") and outcome.get("sid") not in self._auto_share_truncation_warned:
+            # Tell the user ONCE that their oversized session is being trimmed to fit the share
+            # size limit — not on every commit's auto-share (that would spam). Marked here, on
+            # the main thread, so the show-once gate is race-free.
+            self._auto_share_truncation_warned.add(outcome["sid"])
+            self._set_session_notice(
+                "auto-share",
+                f"{name} is large, so auto-share shares only its most recent turns "
+                f"(older ones are trimmed to fit the share size limit). Compact the conversation for a smaller shared copy.",
+                seconds=12.0,
+            )
+            self._render()
 
     def _auto_share_on_exit(self) -> None:
         # Exit-path counterpart to _maybe_auto_share_active. The live auto-share
@@ -4522,7 +4778,7 @@ class ProxyRunner:
         if not thread.is_alive():
             return "done"
         try:
-            stdin_fd = sys.stdin.fileno()
+            stdin_fd = self._stdin_fileno()
         except (OSError, ValueError):
             # No real stdin (headless/non-interactive): can't offer interactive
             # cancel, so just wait for the thread, still honouring the deadline.
@@ -4548,7 +4804,7 @@ class ProxyRunner:
                 continue
             for fd in readable:
                 if fd == stdin_fd:
-                    if self._stdin_has_cancel(os.read(stdin_fd, 32)):
+                    if self._stdin_has_cancel(self._read_stdin(32)):
                         return "cancel"
                 elif fd == master:
                     output = self._drain_child_output()
@@ -4576,6 +4832,7 @@ class ProxyRunner:
         escape sequences (mouse reports, focus in/out). Lets a 'press any key' notice
         ignore an incidental mouse move while host mouse reporting is on."""
         stripped = _SGR_MOUSE_RE.sub(b"", data)
+        stripped = _X10_MOUSE_RE.sub(b"", stripped)
         stripped = _FOCUS_EVENT_RE.sub(b"", stripped)
         return bool(stripped)
 
@@ -4911,15 +5168,13 @@ class ProxyRunner:
         self._set_message(message, seconds=3600)
         self._render()
         try:
-            stdin_fd = sys.stdin.fileno()
+            stdin_fd = self._stdin_fileno()
         except (OSError, ValueError):
             return
         while self.running:
             master = self.master_fd
             background = self._background_fds() if self.sessions else {}
-            fds = [stdin_fd]
-            if master is not None:
-                fds.append(master)
+            fds = [fd for fd in [stdin_fd, master] if fd is not None]
             fds.extend(background)
             try:
                 readable, _, _ = select.select(fds, [], [], 0.2)
@@ -4927,7 +5182,7 @@ class ProxyRunner:
                 return
             for fd in readable:
                 if fd == stdin_fd:
-                    if self._is_real_keypress(os.read(stdin_fd, 32)):  # a key (not a mouse move) dismisses
+                    if self._is_real_keypress(self._read_stdin(32)):  # a key (not a mouse move) dismisses
                         return
                 elif fd == master:
                     output = self._drain_child_output()
@@ -5159,12 +5414,13 @@ class ProxyRunner:
             return None
         return default_branch if choice == default_label else choice
 
-    def _stop_session_menu(self) -> None:
+    def _stop_session_menu(self) -> str:
         options = [self._session_name(index) for index in range(len(self.sessions))]
         choice = self._select_popup("Stop which session?", options)
         if choice is None:
-            return
+            return self._MENU_UP
         self._stop_session(options.index(choice))
+        return self._MENU_DONE
 
     def _fork_lineage_on_rename(self, session_id: str | None) -> None:
         # Rename-as-fork (#55): a deliberate rename re-identifies the session, so drop
@@ -5174,16 +5430,17 @@ class ProxyRunner:
         if session_id and self._user_state().shared_origin(session_id):
             self._user_state().set_shared_origin(session_id, owner=None, name=None)
 
-    def _rename_session_menu(self) -> None:
+    def _rename_session_menu(self) -> str:
         options = [self._session_name(index) for index in range(len(self.sessions))]
         choice = self._select_popup("Rename which session?", options)
         if choice is None:
-            return
+            return self._MENU_UP
         index = options.index(choice)
         new_name = self._prompt_popup("Rename session", "New name for this session:", default=self._session_name(index))
         if new_name is None or not new_name.strip():
-            return
+            return self._MENU_UP
         self._rename_session(index, new_name.strip())
+        return self._MENU_DONE
 
     def _rename_session(self, index: int, new_name: str) -> None:
         # Rename a session by moving its worktree directory. The worktree is in use
@@ -5582,16 +5839,14 @@ class ProxyRunner:
                 self._commit_latest_turn_sync()
             self._stop_file_watcher()
             if self.child_pid:
-                try:
-                    os.kill(self.child_pid, signal.SIGINT)
-                except ProcessLookupError:
-                    pass
+                self.active.process.interrupt()  # SIGINT on POSIX, ConPTY ETX on Windows
                 self._note_pid_for_reaping(self.child_pid)
             if self.master_fd is not None:
                 try:
                     os.close(self.master_fd)
                 except OSError:
                     pass
+                self.master_fd = None  # closes the ConPTY bridge socket on Windows (see run())
             worktree = self.worktree
         finally:
             self.active = saved
@@ -6011,18 +6266,32 @@ class ProxyRunner:
         Returns (background_fds_map, readable_list).  Background sessions are
         drained here so their PTY buffers never fill up regardless of which
         phase the main loop is in.
+
+        On POSIX: watches stdin fd, PTY master fd, background session fds, and
+        the self-pipe wake fd.  On Windows: watches the stdin socket bridge, the
+        pywinpty output socket bridge, background sockets, and the wake socket.
+        All are sockets (or POSIX fds on POSIX) and thus selectable.
         """
         timeout = self._select_timeout()
         background = self._background_fds()
-        watch = [sys.stdin.fileno(), self.master_fd, *background]
+        stdin_fd = self._stdin_fileno()
+        # Filter out None (unspawned / torn-down session) so select never sees it.
+        watch = [fd for fd in [stdin_fd, self.master_fd, *background] if fd is not None]
         if self._wake_r >= 0:
-            watch.append(self._wake_r)  # the git worker's wake pipe (e.g. it queued a dialog)
+            watch.append(self._wake_r)  # the git worker's wake channel (e.g. it queued a dialog)
         readable, _, _ = select.select(watch, [], [], timeout)
         if self._wake_r in readable:
-            try:
-                os.read(self._wake_r, 4096)  # drain the wake byte(s); presence is the signal
-            except OSError:
-                pass
+            if self._waker is not None:
+                self._waker.drain()  # drain the wake byte(s); presence is the signal
+            else:
+                try:
+                    os.read(self._wake_r, 4096)
+                except OSError:
+                    pass
+        # On Windows a resize is delivered by the host's watcher, not SIGWINCH; pick it up
+        # here (POSIX always returns False — it uses the SIGWINCH handler instead).
+        if self._host is not None and self._host.consume_resize_pending():
+            self._resize_child()
         for fd in readable:
             if fd in background:
                 self._pump_background(background[fd])
@@ -6061,9 +6330,10 @@ class ProxyRunner:
 
         Returns a loop-control sentinel or None to continue normally.
         """
-        if sys.stdin.fileno() not in readable:
+        stdin_fd = self._stdin_fileno()
+        if stdin_fd not in readable:
             return None
-        data = os.read(sys.stdin.fileno(), 4096)
+        data = self._read_stdin(4096)
         # Only a real keystroke resets the idle backoff — NOT a mouse wheel / move /
         # click or a focus in/out report. Scrolling history is passive reading: it
         # needs no commits or background polling, so it must not pin aGiTrack in the
@@ -6183,6 +6453,9 @@ class ProxyRunner:
         worker never stalls the reactor — and thus never delays typing)."""
         if not self.running:
             return  # a restart/exit is underway; touch no (possibly-removed) worktree
+        self._check_shutdown_request()
+        if not self.running:
+            return  # an external graceful-shutdown request just fired
         self._flush_pending_render()
         self._flush_pending_enter()
         self._drain_modal_mailbox()  # present any dialog the git worker queued
@@ -6211,6 +6484,7 @@ class ProxyRunner:
             # restart; stop before any further servicing.
             return
         self._service_background_share_ops()  # surface finished background unshare/etc. results
+        self._service_auto_share_outcome()  # surface a live auto-share failure (else it's silent)
         self._service_share_conflicts()  # prompt overwrite/merge for a share refused as behind
         self._service_backend_update()  # surface a finished backend auto-update result
         self._maybe_auto_update_backend()  # auto-apply a brew-managed backend update; once per backend
@@ -6225,13 +6499,12 @@ class ProxyRunner:
         """
         self._reap_stopped_children()  # collect SIGINT'd backends as they exit
         if self.child_pid is not None:
-            done, status = os.waitpid(self.child_pid, os.WNOHANG)
-            if done:
-                exit_code = os.waitstatus_to_exitcode(status) if hasattr(os, "waitstatus_to_exitcode") else 0
+            # Non-blocking exit check via the platform child (POSIX waitpid / Windows
+            # ConPTY isalive) — os.waitpid/os.WNOHANG don't exist on native Windows.
+            exit_code = self.active.process.poll()
+            if exit_code is not None:
                 sample = self.last_child_output_sample[-512:].decode(errors="replace").replace("\x1b", "\\x1b")
-                self._debug(
-                    f"child exited pid={self.child_pid} status={status} exit_code={exit_code} last_output={sample!r}"
-                )
+                self._debug(f"child exited pid={self.child_pid} exit_code={exit_code} last_output={sample!r}")
                 # Same handling as the master_fd-EOF path: switch away (multi
                 # session) or relaunch+resume (single) so Claude exiting its own
                 # picker on Esc doesn't take aGiTrack down. These two detectors race;
@@ -6395,7 +6668,11 @@ class ProxyRunner:
         # The bounded 0.5 s select-and-read loop inside terminal.py is correct
         # here because no PTY children are running yet and no reactor iteration
         # is live.  Do NOT convert to a modal — there is nothing to drain yet.
-        TerminalHost.detect_host_terminal(self, debug_fn=self._debug if self.debug_proxy else None)
+        debug_fn = self._debug if self.debug_proxy else None
+        if self._host is not None:
+            self._host.detect_host_terminal(debug_fn=debug_fn)
+        else:
+            TerminalHost.detect_host_terminal(self, debug_fn=debug_fn)
         # If the menu key requires shift modifier, enable the kitty keyboard protocol
         # so the terminal sends distinguishable escape sequences.
         if self.global_config.is_shift_modified:
@@ -6523,8 +6800,9 @@ class ProxyRunner:
     def _hold_incomplete_tail(self, data: bytes) -> tuple[bytes, bytes]:
         # If the read ends mid escape-sequence (e.g. a mouse report split across
         # reads), hold the trailing partial so it is completed on the next read
-        # rather than leaking to the backend as stray bytes (the "[<35;..." hex).
-        match = _INCOMPLETE_TAIL_RE.search(data)
+        # rather than leaking to the backend as stray bytes (the "[<35;..." hex, or
+        # a half-delivered legacy "[M" X10 report).
+        match = _INCOMPLETE_TAIL_RE.search(data) or _INCOMPLETE_X10_RE.search(data)
         if match:
             return data[: match.start()], data[match.start() :]
         return data, b""
@@ -6544,6 +6822,15 @@ class ProxyRunner:
             for match in _SGR_MOUSE_EVENT_RE.finditer(data):
                 self._handle_mouse(int(match.group(1)), int(match.group(2)), int(match.group(3)), match.group(4))
             data = _SGR_MOUSE_RE.sub(b"", data)
+        if b"\x1b[M" in data:
+            # Legacy X10 reports (terminals that ignored ?1006). The three bytes are button,
+            # column, row each offset by 32; the offset button matches the SGR button numbers
+            # _handle_mouse expects (wheel = 64/65), so the wheel still scrolls. Strip them so
+            # the raw coordinate bytes don't leak into the backend's input.
+            for match in _X10_MOUSE_RE.finditer(data):
+                report = match.group()
+                self._handle_mouse(report[3] - 32, report[4] - 32, report[5] - 32, b"M")
+            data = _X10_MOUSE_RE.sub(b"", data)
         return data
 
     def _handle_mouse(self, button: int, col: int, row: int, kind: bytes) -> None:
@@ -6745,7 +7032,10 @@ class ProxyRunner:
         os.write(sys.stdout.fileno(), f"\x1b[{self.rows};1H\x1b[7m{line}\x1b[0m".encode())
 
     def _enter_host_screen(self) -> None:
-        TerminalHost.enter_host_screen(self)
+        if self._host is not None:
+            self._host.enter_host_screen()
+        else:
+            TerminalHost.enter_host_screen(self)
 
     def _enable_host_mouse(self) -> None:
         TerminalHost.enable_host_mouse(self)
@@ -6781,6 +7071,11 @@ class ProxyRunner:
     def _after_menu_command(self, signal: str) -> None:
         """A top-level command menu closed. Esc/back (UP) goes up one level to the Ctrl-G
         command palette; a transition (DONE) drops through to the agent."""
+        if self._exit_menu_requested:
+            # Ctrl-G inside the menu asked to close everything: drop to the agent, don't reopen
+            # the palette — even though the unwind surfaced as _MENU_UP.
+            self._exit_menu_requested = False
+            return
         if signal == self._MENU_UP:
             self._reopen_command_palette()
 
@@ -6801,6 +7096,7 @@ class ProxyRunner:
         # backend like any other input). On a confirmed "exit"/"quit" this runs
         # the teardown flow (which sets self._exiting); the caller checks that
         # flag to break the reactor loop.
+        self._exit_menu_requested = False  # fresh menu session: clear any stale close request
         name, _, arg = command.partition(" ")
         if name in {"exit", "quit"}:
             if not self._run_exit_flow():
@@ -6939,6 +7235,12 @@ class ProxyRunner:
                 "kind": "bool",
                 "restart": True,
             },
+            # --- session sharing ---
+            {
+                "key": "share_max_transcript_bytes",
+                "label": "Max size of a shared session (larger sessions are trimmed to fit)",
+                "kind": "size_mb",
+            },
             # --- commit summaries ---
             {"key": "summarization_enabled", "label": "Write an AI summary for each commit", "kind": "bool"},
             {"key": "summarization_model", "label": "Model used to write commit summaries", "kind": "model"},
@@ -6960,12 +7262,19 @@ class ProxyRunner:
             return f"{n} unsaved change(s)" if n else ""
         if key in self._settings_pending:  # a pending (unsaved) edit shows its new value
             value, scope, _ = self._settings_pending[key]
-            return f"{self._fmt_setting(value)}  · UNSAVED → {scope}"
+            shown = (
+                f"{value // (1024 * 1024)} MB"
+                if kind == "size_mb" and isinstance(value, int)
+                else self._fmt_setting(value)
+            )
+            return f"{shown}  · UNSAVED → {scope}"
         if kind == "bool":
             text = "on" if bool(getattr(self.global_config, key)) else "off"
         elif kind == "paths":
             paths = self.global_config.allowed_edit_paths
             text = ", ".join(paths) if paths else "(none)"
+        elif kind == "size_mb":
+            text = f"{int(getattr(self.global_config, key)) // (1024 * 1024)} MB"
         else:
             value = getattr(self.global_config, key, None)
             text = str(value) if value not in (None, "") else "(default)"
@@ -7031,6 +7340,26 @@ class ProxyRunner:
                 if raw is None:
                     return
                 value = [p.strip() for p in raw.split(os.pathsep) if p.strip()]
+            elif kind == "size_mb":
+                from agitrack.sessions.share_cap import HARD_MAX_SHARED_BYTES
+
+                hard_mb = HARD_MAX_SHARED_BYTES // (1024 * 1024)
+                raw = self._prompt_popup(label, f"Size in MB (1–{hard_mb}):", default=str(self._pending_size_mb(key)))
+                if raw is None:
+                    return
+                try:
+                    mb = int(float(raw.strip()))
+                except ValueError:
+                    self._set_message("Enter a whole number of MB.")
+                    self._render()
+                    continue
+                if not 1 <= mb <= hard_mb:
+                    # Enforce the hard limit in the editor too — a shared file over this is
+                    # rejected by Git hosts, so we never let it be configured that high.
+                    self._set_message(f"Must be between 1 and {hard_mb} MB (Git's per-file size limit).")
+                    self._render()
+                    continue
+                value = mb * 1024 * 1024
             else:  # text
                 raw = self._prompt_popup(label, "New value (blank = unset):", default=self._pending_text(key))
                 if raw is None:
@@ -7040,11 +7369,21 @@ class ProxyRunner:
             if scope is None:  # Esc at scope → one level up: re-edit the value
                 continue
             self._settings_pending[key] = (value, scope, bool(spec.get("restart")))
-            self._set_message(
-                f"'{label}' → {self._fmt_setting(value)} ({scope}) — unsaved; choose Close to save.", seconds=7.0
+            shown = (
+                f"{value // (1024 * 1024)} MB"
+                if kind == "size_mb" and isinstance(value, int)
+                else self._fmt_setting(value)
             )
+            self._set_message(f"'{label}' → {shown} ({scope}) — unsaved; choose Close to save.", seconds=7.0)
             self._render()
             return
+
+    def _pending_size_mb(self, key: str) -> int:
+        # Current value (MB) to seed the editor: a pending edit if any, else the effective config.
+        raw: object = (
+            self._settings_pending[key][0] if key in self._settings_pending else getattr(self.global_config, key)
+        )
+        return raw // (1024 * 1024) if isinstance(raw, int) else 0
 
     def _pending_paths(self, key: str) -> list[str]:
         if key in self._settings_pending:
@@ -7258,14 +7597,12 @@ class ProxyRunner:
         # the popup waits, since back-pressure on a full PTY buffer blocks the
         # backend's writes and can stall or kill it (a popup can stay open for a
         # long time, and agents keep streaming behind it).
-        stdin_fd = sys.stdin.fileno()
+        stdin_fd = self._stdin_fileno()
         dead: set[int] = set()
         while True:
             background = self._background_fds() if self.sessions else {}
             master = self.master_fd
-            fds = [stdin_fd]
-            if master is not None and master not in dead:
-                fds.append(master)
+            fds = [fd for fd in [stdin_fd, master] if fd is not None and fd not in dead]
             fds.extend(fd for fd in background if fd not in dead)
             readable, _, _ = select.select(fds, [], [], 1.0)
             for fd in readable:
@@ -7289,7 +7626,7 @@ class ProxyRunner:
                     # the view; the next normal render shows the updated screen.
                     self._feed_child_output(output)
             if stdin_fd in readable:
-                return os.read(stdin_fd, 32)
+                return self._read_stdin(32)
 
     def _run_modal(self, modal: "PromptModal | SelectModal") -> "str | None":
         """Run *modal* to completion, keeping all session PTYs draining.
@@ -7331,9 +7668,25 @@ class ProxyRunner:
         or via ``_drain_modal_mailbox`` for a worker-queued dialog). Reads stdin and
         paints the screen, so it must never run off the main thread."""
         while True:
+            if self._exit_menu_requested:
+                # A Ctrl-G in a deeper popup asked to close the whole menu: don't even paint
+                # this one. Every nested level's next popup short-circuits the same way, so the
+                # menu unwinds straight to the agent (the flag is consumed in _after_menu_command).
+                self._clear_message()
+                self._render_pending = True
+                return None
             self._set_message(modal.render_message(), seconds=60)
             self._render()
             data = self._popup_read_input()
+            menu_key = getattr(self.input, "menu_key", b"\x07")
+            if menu_key and menu_key in data:
+                # The menu key while a popup is open closes the WHOLE menu (a toggle), matching
+                # the palette. Treat it as a cancel, but flag the full-close so the unwind above
+                # doesn't stop one level up.
+                self._exit_menu_requested = True
+                self._clear_message()
+                self._render_pending = True
+                return None
             action, value = modal.feed(data)
             if action == "done":
                 self._clear_message()
@@ -7380,13 +7733,10 @@ class ProxyRunner:
     def _wake_main_loop(self) -> None:
         """Wake the reactor out of ``select`` at once (e.g. a worker queued a dialog
         or finished work that should repaint). Writes a byte to the self-pipe whose
-        read end is in the select set. No-op before the pipe exists (tests)."""
-        if self._wake_w < 0:
+        read end is in the select set. No-op before the waker exists (tests)."""
+        if self._waker is None:
             return
-        try:
-            os.write(self._wake_w, b"\x00")
-        except OSError:
-            pass
+        self._waker.wake()
 
     def _acquire_pipeline_lock_from_main(self) -> None:
         """Acquire ``_pipeline_lock`` from the main thread WITHOUT deadlocking on a
@@ -8132,9 +8482,24 @@ class ProxyRunner:
         if pid:
             self._reap_pids.append(pid)
 
+    def _waitpid_nowait(self, pid: int) -> tuple[int, int]:
+        """Non-blocking child-exit check.  Returns (pid, status) if exited, (0, 0) if still running.
+        On POSIX: os.waitpid(WNOHANG).  On Windows: poll the ConPTY handle via poll_exited()."""
+        if sys.platform == "win32":
+            handle = self.active.process._handle
+            if handle is not None and handle.poll_exited():
+                return pid, 0
+            return 0, 0
+        return os.waitpid(pid, os.WNOHANG)
+
     def _reap_stopped_children(self) -> None:
         pids = self._reap_pids
         if not pids:
+            return
+        if os.name == "nt":
+            # No zombie reaping on Windows: a ConPTY child is fully closed by terminate(),
+            # and os.waitpid/os.WNOHANG don't exist there. Nothing to wait on.
+            self._reap_pids = []
             return
         remaining = []
         for pid in pids:
@@ -8242,6 +8607,35 @@ class ProxyRunner:
         # SIGINT to child delegated to the session's BackendProcess (does not
         # close fd -- the run() finally block handles that so it always runs).
         self.active.process.signal_exit()
+
+    def _check_shutdown_request(self) -> None:
+        """Honor an external graceful-shutdown request: a ``<repo>/.agitrack/shutdown`` file.
+
+        This is the cross-platform equivalent of the SIGTERM/SIGHUP a closing terminal
+        sends — used by the VS Code extension on Windows, where a separate process can't
+        deliver a catchable signal (Node's ``process.kill`` hard-kills there). Polled
+        cheaply on a ~1 s interval; on finding the file we remove it, finalize the pending
+        turn (so a just-finished turn is committed, not stranded), and stop the loop."""
+        now = time.monotonic()
+        if now - self._last_shutdown_check < 1.0:
+            return
+        self._last_shutdown_check = now
+        try:
+            path = self.base_repo.repo / ".agitrack" / "shutdown"
+            if not path.exists():
+                return
+        except (OSError, AttributeError, TypeError):
+            return  # no real base repo (e.g. a unit-test runner) ⇒ nothing to honor
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        self._debug("external shutdown request — finalizing and exiting")
+        try:
+            self._finalize_pending_work()
+        except Exception as error:  # never let a slow/failing finalize block the shutdown
+            self._debug(f"shutdown finalize failed: {error!r}")
+        self.running = False
 
     def _handle_exit_signal(self, signum, _frame) -> None:
         # A self-update is mid-flight (pip is uninstalling/reinstalling aGiTrack). Do
@@ -9285,23 +9679,44 @@ class ProxyRunner:
         self._start_agent_parse()
         return False
 
+    # Host-terminal operations route through the platform host object (POSIX termios /
+    # Windows Win32 console) once run() created it; before that (unit tests construct a
+    # runner without run()), they fall back to the POSIX TerminalHost mixin directly.
     def _pause_child_ui(self) -> None:
-        TerminalHost.pause_child_ui(self)
+        if self._host is not None:
+            self._host.pause_child_ui()
+        else:
+            TerminalHost.pause_child_ui(self)
 
     def _resume_child_ui(self) -> None:
-        TerminalHost.resume_child_ui(self, self._render)
+        if self._host is not None:
+            self._host.resume_child_ui(self._render)
+        else:
+            TerminalHost.resume_child_ui(self, self._render)
 
     def _set_raw(self) -> None:
-        TerminalHost.set_raw(self)
+        if self._host is not None:
+            self._host.set_raw()
+        else:
+            TerminalHost.set_raw(self)
 
     def _set_cooked(self) -> None:
-        TerminalHost.set_cooked(self)
+        if self._host is not None:
+            self._host.set_cooked()
+        else:
+            TerminalHost.set_cooked(self)
 
     def _restore_terminal(self) -> None:
-        TerminalHost.restore_terminal(self)
+        if self._host is not None:
+            self._host.restore_terminal()
+        else:
+            TerminalHost.restore_terminal(self)
 
     def _disable_host_terminal_modes(self) -> None:
-        TerminalHost.disable_host_terminal_modes(self)
+        if self._host is not None:
+            self._host.disable_host_terminal_modes()
+        else:
+            TerminalHost.disable_host_terminal_modes(self)
 
     def _resize_child(self) -> None:
         if self.master_fd is None:
@@ -9318,7 +9733,19 @@ class ProxyRunner:
             pass
 
     def _terminal_size(self) -> tuple[int, int]:
+        if self._host is not None:
+            return self._host.terminal_size()
         return TerminalHost.terminal_size(self)
+
+    def _stdin_fileno(self) -> int:
+        """The select-able stdin fd: the real terminal fd on POSIX, the host's
+        console→socket bridge fd on Windows (Windows can't select on a console handle)."""
+        return self._host.stdin_fileno() if self._host is not None else sys.stdin.fileno()
+
+    def _read_stdin(self, length: int) -> bytes:
+        if self._host is not None:
+            return self._host.read_stdin(length)
+        return os.read(sys.stdin.fileno(), length)
 
 
 # ---------------------------------------------------------------------------

@@ -317,7 +317,8 @@ class GlobalConfig:
             import shlex
 
             try:
-                return shlex.split(raw)
+                # posix=False on Windows keeps backslashes in paths literal (not escapes).
+                return shlex.split(raw, posix=(os.name != "nt"))
             except ValueError:
                 return []  # an unbalanced quote can't lock the user out of launching
         return []
@@ -450,3 +451,40 @@ class GlobalConfig:
             block.pop("github_login", None)
         self.data["session_sharing"] = block
         self.save()
+
+    def _share_byte_setting(self, key: str, default: int) -> int:
+        """A configurable byte size for the share size cap / head budget. Falls back to
+        ``default`` on a missing or nonsensical value (wrong type, ≤ 0, bool) so a typo can't
+        break sharing, and is hard-clamped to ``HARD_MAX_SHARED_BYTES`` so the effective value
+        is ALWAYS shareable even if validation was somehow bypassed. ``share_config_error``
+        surfaces an over-the-hard-limit value as an explicit startup error first."""
+        from agitrack.sessions.share_cap import HARD_MAX_SHARED_BYTES
+
+        raw = self._raw(key)
+        if not isinstance(raw, (int, float)) or isinstance(raw, bool) or raw <= 0:
+            return default
+        return min(int(raw), HARD_MAX_SHARED_BYTES)
+
+    @property
+    def share_max_transcript_bytes(self) -> int:
+        """Max byte size of a shared session transcript. A longer session is trimmed (oldest
+        middle turns dropped at a compaction boundary) so it never bloats git. Default 20 MiB;
+        configurable, but never above the 100 MiB hard limit Git hosts allow."""
+        from agitrack.sessions.share_cap import DEFAULT_MAX_SHARED_BYTES
+
+        return self._share_byte_setting("share_max_transcript_bytes", DEFAULT_MAX_SHARED_BYTES)
+
+    def share_config_error(self) -> str | None:
+        """A human-readable error if the share-size cap is configured beyond the 100 MiB hard
+        limit (Git hosts reject larger files), so startup can refuse with a clear message —
+        else None. A non-numeric/≤0 value is NOT an error (it falls back to the default)."""
+        from agitrack.sessions.share_cap import HARD_MAX_SHARED_BYTES
+
+        raw = self._raw("share_max_transcript_bytes")
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw > HARD_MAX_SHARED_BYTES:
+            return (
+                f"config 'share_max_transcript_bytes' is {int(raw):,} bytes, over the maximum "
+                f"{HARD_MAX_SHARED_BYTES // (1024 * 1024)} MiB ({HARD_MAX_SHARED_BYTES:,} bytes) — "
+                f"Git hosts reject files larger than this. Lower it in your aGiTrack config.json."
+            )
+        return None

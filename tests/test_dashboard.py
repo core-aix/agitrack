@@ -12,6 +12,7 @@ from pathlib import Path
 import json
 import os
 import re
+import sys
 import threading
 import urllib.error
 import urllib.parse
@@ -1006,6 +1007,9 @@ def test_dashboard_repo_path_abbreviates_home(tmp_path, monkeypatch):
     repo_dir.parent.mkdir(parents=True)
     repo = _demo_repo(repo_dir)
     monkeypatch.setenv("HOME", str(home))
+    # Windows uses USERPROFILE (not HOME) for Path.home().
+    if sys.platform == "win32":
+        monkeypatch.setenv("USERPROFILE", str(home))
 
     dash = build_dashboard(repo)
     assert dash.repo == "~/projects/demo"
@@ -1015,6 +1019,8 @@ def test_dashboard_repo_path_abbreviates_home(tmp_path, monkeypatch):
 def test_dashboard_repo_path_outside_home_is_unchanged(tmp_path, monkeypatch):
     repo = _demo_repo(tmp_path / "work")
     monkeypatch.setenv("HOME", str(tmp_path / "elsewhere"))
+    if sys.platform == "win32":
+        monkeypatch.setenv("USERPROFILE", str(tmp_path / "elsewhere"))
     dash = build_dashboard(repo)
     assert dash.repo == str(repo.repo)
 
