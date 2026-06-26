@@ -1,4 +1,5 @@
 import subprocess
+import sys
 
 import pytest
 
@@ -246,6 +247,7 @@ def test_menu_key_check_change_persists_new_key(tmp_path, monkeypatch):
     assert config._raw("menu_key_acknowledged") == "ctrl-o"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows msvcrt path returns False on timeout, not None")
 def test_read_menu_key_press_returns_none_without_tty():
     # No real tty under pytest → the raw-mode test can't run and reports "unavailable".
     assert cli._read_menu_key_press(b"\x07", shift=False) is None

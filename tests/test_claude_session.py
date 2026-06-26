@@ -1,4 +1,7 @@
 import json
+import sys
+
+import pytest
 
 from agitrack.transcripts import claude as claude_session
 from agitrack.transcripts.claude import (
@@ -42,7 +45,8 @@ def test_retarget_session_cwd_rewrites_recorded_cwd(monkeypatch, tmp_path):
     assert claude_session.retarget_session_cwd(repo, "s", str(repo)) is True
     body = (proj / "s.jsonl").read_text(encoding="utf-8")
     assert "/old/worktree" not in body
-    assert str(repo) in body
+    # Parse JSON to compare paths — raw text has JSON-escaped backslashes on Windows.
+    assert any(json.loads(ln).get("cwd") == str(repo) for ln in body.splitlines() if ln)
     assert claude_session.session_cwd("s") == str(repo)
     # Idempotent: a second call (already aligned) makes no change.
     assert claude_session.retarget_session_cwd(repo, "s", str(repo)) is False
@@ -67,7 +71,9 @@ def test_retarget_session_cwd_breaks_hardlink_to_other_copy(monkeypatch, tmp_pat
     os.link(other_proj / "s.jsonl", repo_proj / "s.jsonl")  # share one inode
 
     assert claude_session.retarget_session_cwd(repo, "s", str(repo)) is True
-    assert str(repo) in (repo_proj / "s.jsonl").read_text(encoding="utf-8")
+    # Parse JSON to compare paths — raw text has JSON-escaped backslashes on Windows.
+    rewritten = (repo_proj / "s.jsonl").read_text(encoding="utf-8")
+    assert any(json.loads(ln).get("cwd") == str(repo) for ln in rewritten.splitlines() if ln)
     # The other copy is untouched (hardlink was broken before the rewrite).
     assert (other_proj / "s.jsonl").read_text(encoding="utf-8") == '{"type":"user","cwd":"/old/worktree"}\n'
 
@@ -754,6 +760,7 @@ def test_list_worktree_sessions_aggregates_by_recency(tmp_path, monkeypatch):
     assert key_by_id["sess-b"] == "beta"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Path('/...') on Windows includes drive letter, changing encoding")
 def test_encode_repo_matches_claude_naming():
     # Claude names the project directory by replacing every non-alphanumeric
     # character of the absolute working directory with a dash.

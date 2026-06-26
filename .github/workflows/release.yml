@@ -1,0 +1,95 @@
+name: Release
+
+# Produces a signed-ready Windows MSI and attaches it to the GitHub release.
+#
+# Trigger: pushing a version tag (v1.2.3).  The tag version is used as the
+# MSI Package Version attribute and appears in the installer UI.
+#
+# Artefact: agitrack-<version>-windows-x64.msi attached to the GitHub release.
+
+on:
+  push:
+    tags:
+      - "v[0-9]*"
+
+jobs:
+  build-msi:
+    name: Build Windows MSI
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # -------------------------------------------------------------------- #
+      # 1. Parse the version from the tag (strip leading "v")                 #
+      # -------------------------------------------------------------------- #
+      - name: Extract version from tag
+        id: version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $ver = $tag.TrimStart("v")
+          echo "VERSION=$ver" >> $env:GITHUB_OUTPUT
+          echo "MSI_NAME=agitrack-$ver-windows-x64.msi" >> $env:GITHUB_OUTPUT
+
+      # -------------------------------------------------------------------- #
+      # 2. Python + dependencies                                              #
+      # -------------------------------------------------------------------- #
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install runtime + build deps
+        run: uv sync --group build
+
+      # -------------------------------------------------------------------- #
+      # 3. PyInstaller → dist/agitrack/                                      #
+      # -------------------------------------------------------------------- #
+      - name: Build with PyInstaller
+        run: uv run pyinstaller installer/agitrack.spec -y
+
+      # Quick smoke-test: the bundled EXE must print a version line and exit 0.
+      - name: Smoke-test bundled EXE
+        run: dist\agitrack\agitrack.exe --version
+        shell: pwsh
+
+      # -------------------------------------------------------------------- #
+      # 4. WiX v4 — install then harvest + build MSI                        #
+      # -------------------------------------------------------------------- #
+      - name: Install WiX v4
+        run: dotnet tool install --global wix --version 4.*
+
+      # WiX v4 needs the UI extension for WixUI_Minimal
+      - name: Add WiX UI extension
+        run: wix extension add --global WixToolset.UI.wixext
+
+      - name: Harvest PyInstaller output
+        run: |
+          wix harvest dir dist\agitrack `
+            --output installer\agitrack-files.wxs `
+            --component-group AgitrackFiles `
+            --directory-ref INSTALLFOLDER `
+            --var var.SourceDir
+
+      - name: Build MSI
+        run: |
+          wix build `
+            installer\agitrack.wxs `
+            installer\agitrack-files.wxs `
+            -d Version=${{ steps.version.outputs.VERSION }} `
+            -d SourceDir=dist\agitrack `
+            -ext WixToolset.UI.wixext `
+            -o dist\${{ steps.version.outputs.MSI_NAME }}
+
+      # -------------------------------------------------------------------- #
+      # 5. Attach MSI to the GitHub release                                  #
+      # -------------------------------------------------------------------- #
+      - name: Upload MSI to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ steps.version.outputs.MSI_NAME }}
+          fail_on_unmatched_files: true

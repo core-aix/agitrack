@@ -50,6 +50,11 @@ else:
             pass
 
 
+def _open_lock_file(path: str) -> int:
+    """Open/create the lock file; cross-platform (os.open works on Windows too)."""
+    return os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+
+
 def already_running_message(pid: int | None) -> str:
     """Refusal shown when a second aGiTrack is started on a repo that already has one
     running. aGiTrack auto-commits and merges as the agent works, so two instances on
@@ -70,13 +75,18 @@ class RepoLock:
     """Advisory single-writer lock for a working tree.
 
     Only one aGiTrack process should auto-commit/merge in a given working tree at a
-    time. The authority is an OS ``flock`` held on a long-lived fd: the kernel
+    time. The authority is an OS file-lock held on a long-lived fd: the kernel
     releases it the instant the owner dies, so there is no stale-file reclaim
     (and its delete-a-live-lock race) and no PID-liveness guessing that PID
     reuse could fool. The file itself carries no authority — it just records
     the owner's PID for the "already running" message; it persists across
-    releases (never unlinked, so two processes can never end up holding flocks
+    releases (never unlinked, so two processes can never end up holding locks
     on two different inodes of the same path) and is truncated on release.
+
+    POSIX: uses fcntl.flock (LOCK_EX | LOCK_NB).
+    Windows: uses msvcrt.locking at a high byte offset (well beyond any PID data)
+             so that other processes can always read the PID info at byte 0.
+             Both are released automatically when the process exits.
     """
 
     def __init__(self, path: Path) -> None:
@@ -90,7 +100,7 @@ class RepoLock:
             return True
         self.path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o644)
+            fd = _open_lock_file(str(self.path))
         except OSError:
             return False
         if not _try_lock(fd):
@@ -135,7 +145,7 @@ class RepoLock:
         if self._fd is not None:
             return None  # we already hold it
         try:
-            fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o644)
+            fd = _open_lock_file(str(self.path))
         except OSError:
             # No lock file / dir yet ⇒ nobody is running; let acquire() be authority.
             return None

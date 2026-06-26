@@ -1245,7 +1245,7 @@ class ProxyRunner:
             self._setup_worktree_confinement_notice()
             exit_code = self._loop()  # the timers phase auto-applies a sandbox-blocked backend update
         finally:
-            if self.original_sigwinch is not None:
+            if self.original_sigwinch is not None and hasattr(signal, "SIGWINCH"):
                 signal.signal(signal.SIGWINCH, self.original_sigwinch)
             for signum, handler in self.original_signal_handlers.items():
                 signal.signal(signum, handler)
@@ -5174,9 +5174,7 @@ class ProxyRunner:
         while self.running:
             master = self.master_fd
             background = self._background_fds() if self.sessions else {}
-            fds = [stdin_fd]
-            if master is not None:
-                fds.append(master)
+            fds = [fd for fd in [stdin_fd, master] if fd is not None]
             fds.extend(background)
             try:
                 readable, _, _ = select.select(fds, [], [], 0.2)
@@ -6268,10 +6266,17 @@ class ProxyRunner:
         Returns (background_fds_map, readable_list).  Background sessions are
         drained here so their PTY buffers never fill up regardless of which
         phase the main loop is in.
+
+        On POSIX: watches stdin fd, PTY master fd, background session fds, and
+        the self-pipe wake fd.  On Windows: watches the stdin socket bridge, the
+        pywinpty output socket bridge, background sockets, and the wake socket.
+        All are sockets (or POSIX fds on POSIX) and thus selectable.
         """
         timeout = self._select_timeout()
         background = self._background_fds()
-        watch = [self._stdin_fileno(), self.master_fd, *background]
+        stdin_fd = self._stdin_fileno()
+        # Filter out None (unspawned / torn-down session) so select never sees it.
+        watch = [fd for fd in [stdin_fd, self.master_fd, *background] if fd is not None]
         if self._wake_r >= 0:
             watch.append(self._wake_r)  # the git worker's wake channel (e.g. it queued a dialog)
         readable, _, _ = select.select(watch, [], [], timeout)
@@ -6325,7 +6330,8 @@ class ProxyRunner:
 
         Returns a loop-control sentinel or None to continue normally.
         """
-        if self._stdin_fileno() not in readable:
+        stdin_fd = self._stdin_fileno()
+        if stdin_fd not in readable:
             return None
         data = self._read_stdin(4096)
         # Only a real keystroke resets the idle backoff — NOT a mouse wheel / move /
@@ -7596,9 +7602,7 @@ class ProxyRunner:
         while True:
             background = self._background_fds() if self.sessions else {}
             master = self.master_fd
-            fds = [stdin_fd]
-            if master is not None and master not in dead:
-                fds.append(master)
+            fds = [fd for fd in [stdin_fd, master] if fd is not None and fd not in dead]
             fds.extend(fd for fd in background if fd not in dead)
             readable, _, _ = select.select(fds, [], [], 1.0)
             for fd in readable:
@@ -8477,6 +8481,16 @@ class ProxyRunner:
         # rest of the run. Host-level (shared across sessions), not swapped.
         if pid:
             self._reap_pids.append(pid)
+
+    def _waitpid_nowait(self, pid: int) -> tuple[int, int]:
+        """Non-blocking child-exit check.  Returns (pid, status) if exited, (0, 0) if still running.
+        On POSIX: os.waitpid(WNOHANG).  On Windows: poll the ConPTY handle via poll_exited()."""
+        if sys.platform == "win32":
+            handle = self.active.process._handle
+            if handle is not None and handle.poll_exited():
+                return pid, 0
+            return 0, 0
+        return os.waitpid(pid, os.WNOHANG)
 
     def _reap_stopped_children(self) -> None:
         pids = self._reap_pids

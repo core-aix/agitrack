@@ -16,10 +16,12 @@ def test_available_backends_includes_opencode_and_claude():
 
 def test_opencode_proxy_agent_spawn_command():
     agent = make_proxy_agent("opencode")
+    repo = Path("/repo")
+    repo_s = str(repo)
     assert agent.name == "opencode"
     assert agent.new_session_id() is None
-    assert agent.spawn_command(Path("/repo"), session_id=None, resume=False) == ["opencode", "/repo"]
-    assert agent.spawn_command(Path("/repo"), session_id="s1", resume=True) == ["opencode", "--session", "s1", "/repo"]
+    assert agent.spawn_command(repo, session_id=None, resume=False) == ["opencode", repo_s]
+    assert agent.spawn_command(repo, session_id="s1", resume=True) == ["opencode", "--session", "s1", repo_s]
 
 
 def test_claude_proxy_agent_spawn_command_uses_session_id_and_resume():
@@ -60,9 +62,10 @@ def test_opencode_proxy_agent_spawn_command_has_no_system_prompt_append():
     # OpenCode's interactive TUI exposes no flag to append to the system prompt, so the
     # note is not added there ("if there is this option" — there isn't for OpenCode).
     agent = make_proxy_agent("opencode")
-    cmd = agent.spawn_command(Path("/repo"), session_id="s1", resume=True)
+    repo = Path("/repo")
+    cmd = agent.spawn_command(repo, session_id="s1", resume=True)
     assert "--append-system-prompt" not in cmd
-    assert cmd == ["opencode", "--session", "s1", "/repo"]
+    assert cmd == ["opencode", "--session", "s1", str(repo)]
 
 
 def test_spawn_command_executable_replaces_backend_binary():
@@ -79,17 +82,19 @@ def test_spawn_command_executable_replaces_backend_binary():
     ) == ["somewrapper", "claude"]
 
     opencode = make_proxy_agent("opencode")
-    assert opencode.spawn_command(Path("/repo"), session_id="s1", resume=True, executable=["w", "opencode"]) == [
+    repo = Path("/repo")
+    repo_s = str(repo)
+    assert opencode.spawn_command(repo, session_id="s1", resume=True, executable=["w", "opencode"]) == [
         "w",
         "opencode",
         "--session",
         "s1",
-        "/repo",
+        repo_s,
     ]
     # executable=None keeps the default binary head.
-    assert opencode.spawn_command(Path("/repo"), session_id=None, resume=False, executable=None) == [
+    assert opencode.spawn_command(repo, session_id=None, resume=False, executable=None) == [
         "opencode",
-        "/repo",
+        repo_s,
     ]
 
 

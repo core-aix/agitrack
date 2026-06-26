@@ -6,6 +6,7 @@ code paths covered on the normal Linux/macOS gate. The genuinely Windows-only pi
 spawn, Win32 console) live in ``test_windows_conpty`` (skipped off Windows)."""
 
 import select
+import sys
 import types
 
 import pytest
@@ -13,6 +14,8 @@ import pytest
 import agitrack.cli as cli
 import agitrack.proxy.platform as platform
 from agitrack.proxy.platform.nt import NtWaker, _env_block, _resolve_windows_command
+
+_posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX-path behaviour only")
 
 
 # --- reactor waker (socket-bridge) -------------------------------------------------
@@ -44,6 +47,7 @@ def test_nt_waker_socketpair_works_on_any_platform():
 # --- host terminal factory ---------------------------------------------------------
 
 
+@_posix_only
 def test_make_host_terminal_posix_adapter():
     runner = types.SimpleNamespace(old_attrs=None)
     host = platform.make_host_terminal(runner)
@@ -60,6 +64,7 @@ def test_make_host_terminal_posix_adapter():
 # --- child-process factory dispatch ------------------------------------------------
 
 
+@_posix_only
 def test_make_child_process_dispatches_to_posix_spawn(monkeypatch):
     import agitrack.proxy.process as process
 
