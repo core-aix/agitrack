@@ -551,6 +551,7 @@ def test_opencode_bare_run_is_watchdog_capped(monkeypatch):
     class FakeProc:
         def __init__(self):
             self.stdout = io.StringIO("")
+            self.stdin = io.StringIO()
 
         def wait(self):
             return -9  # as if killed by the watchdog
@@ -649,6 +650,7 @@ def test_opencode_bare_run_folds_system_prompt_into_prompt(monkeypatch):
         def __init__(self, cmd):
             captured["cmd"] = cmd
             self.stdout = io.StringIO("")
+            self.stdin = io.StringIO()
 
         def wait(self):
             return 0
@@ -662,6 +664,8 @@ def test_opencode_bare_run_folds_system_prompt_into_prompt(monkeypatch):
         "Timer",
         lambda *a, **k: types.SimpleNamespace(start=lambda: None, cancel=lambda: None, daemon=False),
     )
+    # Force POSIX stdin-vs-argv routing so the assertion is cross-platform.
+    monkeypatch.setattr(O, "_IS_WINDOWS", False)
     backend = OpenCodeBackend(repo=Path("/tmp"))
 
     backend.run("TRACE", model=None, session_id=None, bare=True, system_prompt="SUMMARIZE THIS")

@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import contextlib
 import os
-import pty
 import subprocess
 import sys
 from collections.abc import Iterator
@@ -54,16 +53,17 @@ def capture_fd(fd: int | None = None) -> Iterator[list[bytes]]:
     finally:
         os.dup2(saved, fd)
         os.close(saved)
-        os.set_blocking(read_fd, False)
         chunks: list[bytes] = []
-        try:
-            while True:
-                chunk = os.read(read_fd, 65536)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-        except BlockingIOError:
-            pass
+        if sys.platform != "win32":
+            os.set_blocking(read_fd, False)
+            try:
+                while True:
+                    chunk = os.read(read_fd, 65536)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+            except BlockingIOError:
+                pass
         os.close(read_fd)
         out.append(b"".join(chunks))
 
@@ -71,9 +71,8 @@ def capture_fd(fd: int | None = None) -> Iterator[list[bytes]]:
 def run_in_pty(argv: list[str]) -> bytes:
     """Run ``argv`` under a real pseudo-terminal and return its combined output bytes.
 
-    This exercises the same OS pty read path the proxy uses for the backend — the part
-    of aGiTrack that differs between macOS (BSD) and Linux. The child sees a real TTY on
-    stdin/stdout/stderr, so it emits the framed/cursor output a TUI would.
+    POSIX only — raises ``NotImplementedError`` on Windows. Use ``spawn_pty`` from
+    ``agitrack.proxy.pty_backend`` for cross-platform PTY spawning.
 
     The parent keeps its own copy of the slave fd open until after draining. On macOS
     (BSD) a pty discards any unread output the moment its *last* slave fd is closed, so a
@@ -83,6 +82,9 @@ def run_in_pty(argv: list[str]) -> bytes:
     across ``wait()`` keeps the output buffered; we then drain the master non-blocking. The
     child's output here is tiny (well under the pty buffer), so waiting first can't
     deadlock on a full buffer."""
+    if sys.platform == "win32":
+        raise NotImplementedError("run_in_pty is POSIX-only; use spawn_pty on Windows")
+    import pty  # POSIX-only; imported lazily so this test helper imports on native Windows
     import select
 
     master, slave = pty.openpty()

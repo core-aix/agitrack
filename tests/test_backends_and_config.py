@@ -16,10 +16,12 @@ def test_available_backends_includes_opencode_and_claude():
 
 def test_opencode_proxy_agent_spawn_command():
     agent = make_proxy_agent("opencode")
+    repo = Path("/repo")
+    repo_s = str(repo)
     assert agent.name == "opencode"
     assert agent.new_session_id() is None
-    assert agent.spawn_command(Path("/repo"), session_id=None, resume=False) == ["opencode", "/repo"]
-    assert agent.spawn_command(Path("/repo"), session_id="s1", resume=True) == ["opencode", "--session", "s1", "/repo"]
+    assert agent.spawn_command(repo, session_id=None, resume=False) == ["opencode", repo_s]
+    assert agent.spawn_command(repo, session_id="s1", resume=True) == ["opencode", "--session", "s1", repo_s]
 
 
 def test_claude_proxy_agent_spawn_command_uses_session_id_and_resume():
@@ -60,9 +62,10 @@ def test_opencode_proxy_agent_spawn_command_has_no_system_prompt_append():
     # OpenCode's interactive TUI exposes no flag to append to the system prompt, so the
     # note is not added there ("if there is this option" — there isn't for OpenCode).
     agent = make_proxy_agent("opencode")
-    cmd = agent.spawn_command(Path("/repo"), session_id="s1", resume=True)
+    repo = Path("/repo")
+    cmd = agent.spawn_command(repo, session_id="s1", resume=True)
     assert "--append-system-prompt" not in cmd
-    assert cmd == ["opencode", "--session", "s1", "/repo"]
+    assert cmd == ["opencode", "--session", "s1", str(repo)]
 
 
 def test_spawn_command_executable_replaces_backend_binary():
@@ -79,17 +82,19 @@ def test_spawn_command_executable_replaces_backend_binary():
     ) == ["somewrapper", "claude"]
 
     opencode = make_proxy_agent("opencode")
-    assert opencode.spawn_command(Path("/repo"), session_id="s1", resume=True, executable=["w", "opencode"]) == [
+    repo = Path("/repo")
+    repo_s = str(repo)
+    assert opencode.spawn_command(repo, session_id="s1", resume=True, executable=["w", "opencode"]) == [
         "w",
         "opencode",
         "--session",
         "s1",
-        "/repo",
+        repo_s,
     ]
     # executable=None keeps the default binary head.
-    assert opencode.spawn_command(Path("/repo"), session_id=None, resume=False, executable=None) == [
+    assert opencode.spawn_command(repo, session_id=None, resume=False, executable=None) == [
         "opencode",
-        "/repo",
+        repo_s,
     ]
 
 
@@ -273,6 +278,89 @@ def test_claude_backend_bare_run_strips_tools_memory_and_system_prompt(monkeypat
     # ...but commit_guidance=False (--no-commit-guidance) omits it on a coding run too.
     backend.run("do real work", model=None, session_id=None, commit_guidance=False)
     assert "--append-system-prompt" not in captured["command"]
+
+
+def test_claude_backend_windows_feeds_prompt_via_stdin_and_flattens_system(monkeypatch, tmp_path):
+    # On Windows the backend runs through cmd.exe (the npm .cmd shim), which TRUNCATES a
+    # command-line argument at its first newline. The multi-line prompt must therefore go via
+    # STDIN, and the multi-line system prompt must be flattened to a single line — otherwise
+    # summarization receives a garbled prompt (the Windows "garbage commit message" bug).
+    import subprocess
+
+    from agitrack.backends import claude as claude_mod
+
+    monkeypatch.setattr(claude_mod, "_IS_WINDOWS", True)
+    captured: dict = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["input"] = kwargs.get("input")
+        return types.SimpleNamespace(
+            stdout=json.dumps({"type": "result", "result": "ok", "session_id": "s"}), stderr="", returncode=0
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    backend = ClaudeBackend(tmp_path)
+    prompt = "Interaction trace:\nline two\nline three\n\nSummary:"
+    backend.run(prompt, model=None, session_id=None, bare=True, system_prompt="BE A\nSUMMARIZER\nNOW")
+
+    cmd = captured["command"]
+    assert prompt not in cmd  # the multi-line prompt is NOT a (truncatable) argument...
+    assert captured["input"] == prompt  # ...it is fed on stdin instead
+    assert "-p" in cmd  # print mode still set (no positional)
+    system = cmd[cmd.index("--system-prompt") + 1]
+    assert "\n" not in system and system == "BE A SUMMARIZER NOW"  # flattened to one line
+
+
+def test_opencode_backend_windows_feeds_prompt_via_stdin(monkeypatch, tmp_path):
+    # Same Windows cmd.exe truncation applies to OpenCode: the multi-line message must go via
+    # STDIN (verified: `opencode run --format json` reads the prompt from stdin), not as a
+    # positional argument that cmd.exe would cut at its first newline.
+    import io
+    import subprocess
+    import time
+
+    from agitrack.backends.opencode import OpenCodeBackend
+    from agitrack.backends import opencode as opencode_mod
+
+    monkeypatch.setattr(opencode_mod, "_IS_WINDOWS", True)
+    captured: dict = {}
+    written: list[str] = []
+
+    class _FakeStdin:
+        def write(self, text):
+            written.append(text)
+
+        def close(self):
+            pass
+
+    class _FakePopen:
+        def __init__(self, command, **kwargs):
+            captured["command"] = command
+            captured["stdin"] = kwargs.get("stdin")
+            self.stdin = _FakeStdin()
+            self.stdout = io.StringIO("")  # no events; the test only checks how the prompt is passed
+
+        def wait(self):
+            return 0
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(subprocess, "Popen", _FakePopen)
+    backend = OpenCodeBackend(tmp_path)
+    prompt = "Interaction trace:\nline two\nline three\n\nSummary:"
+    backend.run(prompt, model=None, session_id=None, bare=True, system_prompt="BE A SUMMARIZER")
+
+    cmd = captured["command"]
+    folded = f"BE A SUMMARIZER\n\n{prompt}"  # bare run folds the instruction into the message
+    assert folded not in cmd  # not a positional argument
+    assert captured["stdin"] is subprocess.PIPE  # stdin pipe was opened
+    for _ in range(100):  # the prompt is written on a daemon thread
+        if written:
+            break
+        time.sleep(0.01)
+    assert "".join(written) == folded
 
 
 def test_claude_backend_bare_run_is_timeout_capped(monkeypatch, tmp_path):

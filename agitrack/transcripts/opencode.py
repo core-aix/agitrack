@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 from agitrack.env import getenv_compat
-import pty
 import signal
 import subprocess
 import tempfile
@@ -12,6 +11,8 @@ import time
 from pathlib import Path
 
 from agitrack.backends.base import TokenUsage
+from agitrack.proc import resolve_subprocess_command
+from agitrack.sessions.share_cap import select_kept_indices
 from agitrack.transcripts.types import ExportedSession, SessionRef, SessionTurn, turns_after
 
 # Every `opencode` subprocess aGiTrack runs synchronously (often on the main reactor/menu
@@ -54,7 +55,9 @@ def _opencode_session_list(cwd: Path, max_count: int) -> list[dict]:
     _debug(cwd, f"opencode session list starting (max_count={max_count})")
     try:
         process = subprocess.run(
-            ["opencode", "session", "list", "--format", "json", "--max-count", str(max_count)],
+            resolve_subprocess_command(
+                ["opencode", "session", "list", "--format", "json", "--max-count", str(max_count)]
+            ),
             cwd=cwd,
             text=True,
             stdout=subprocess.PIPE,
@@ -310,6 +313,48 @@ def retarget_session_dir(repo: Path, session_id: str, cwd: str) -> bool:
     return import_shared_session(cwd_path, session_id, transcript, overwrite=True)
 
 
+def _is_resume_boundary(message: object) -> bool:
+    """A message the trimmed tail can validly BEGIN at: a user turn (a real prompt) or a
+    compaction message (whose assistant summary recaps prior context). Anchoring here keeps the
+    kept conversation starting at a clean turn boundary rather than mid-exchange."""
+    if not isinstance(message, dict):
+        return False
+    info = message.get("info")
+    if not isinstance(info, dict):
+        return False
+    return info.get("role") == "user" or info.get("summary") is True or info.get("mode") == "compaction"
+
+
+def cap_shared_transcript(transcript: str, max_bytes: int) -> str:
+    """Bound an OpenCode exported session (a ``{info, messages}`` JSON object) to ``max_bytes``
+    for sharing. Keeps the session ``info`` plus the most-recent messages as a contiguous tail
+    (anchored at a user/compaction boundary), dropping older messages; re-serializes compactly
+    so ``opencode import`` still round-trips it. Returns ``transcript`` unchanged when it already
+    fits or can't be parsed."""
+    if len(transcript.encode("utf-8")) <= max_bytes:
+        return transcript
+    try:
+        data = json.loads(transcript)
+    except json.JSONDecodeError:
+        return transcript
+    messages = data.get("messages")
+    if not isinstance(data, dict) or not isinstance(messages, list) or len(messages) <= 1:
+        return transcript
+
+    def _compact(obj: object) -> str:
+        return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+
+    sizes = [len(_compact(message).encode("utf-8")) for message in messages]
+    boundary = [_is_resume_boundary(message) for message in messages]
+    # Budget the messages array only: subtract the envelope ({info, "messages":[]} brackets).
+    envelope = len(_compact({**data, "messages": []}).encode("utf-8"))
+    kept = select_kept_indices(sizes, boundary, max_bytes - envelope, sep_bytes=1)
+    if kept is None:
+        return transcript
+    data["messages"] = [messages[i] for i in kept]
+    return _compact(data)
+
+
 def session_transcript_size(repo: Path, session_id: str) -> int | None:
     # OpenCode keeps sessions in a SQLite store with no per-session file to stat,
     # and exporting purely to measure size would make the manage-shared menu slow
@@ -394,9 +439,40 @@ def _run_export_pty(repo: Path, session_id: str, *, sanitize: bool = False) -> t
 
 
 def _run_opencode_pty(repo: Path, args: list[str]) -> tuple[str, int]:
-    """Run ``opencode`` under a pty in ``repo`` (it talks to a TTY) and return
-    its combined output and exit code. A pty is needed because the CLI writes
-    framed/colour output to a terminal, not a plain pipe."""
+    """Run ``opencode`` in ``repo`` and return its combined output and exit code.
+
+    The CLI writes framed/colour output to a terminal, so POSIX runs it under a real
+    pty. Native Windows has no ``pty``/``fork``, so it runs the (non-interactive)
+    one-shot subcommand through a normal pipe with the same timeout guard."""
+    if os.name == "nt":
+        return _run_opencode_subprocess(repo, args)
+    return _run_opencode_posix_pty(repo, args)
+
+
+def _run_opencode_subprocess(repo: Path, args: list[str]) -> tuple[str, int]:
+    """Windows fallback for :func:`_run_opencode_pty`: a plain pipe with the same
+    timeout semantics (returns ``124`` on timeout, ``127`` when ``opencode`` is missing —
+    the same "unusable" codes callers already treat as no data)."""
+    try:
+        result = subprocess.run(
+            resolve_subprocess_command(args),  # resolve opencode(.cmd) on Windows (#118)
+            cwd=repo,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=_OPENCODE_CALL_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        out = exc.output or b""
+        text = out.decode(errors="replace") if isinstance(out, (bytes, bytearray)) else str(out)
+        return text, 124
+    except OSError:
+        return "", 127
+    return result.stdout.decode(errors="replace"), result.returncode
+
+
+def _run_opencode_posix_pty(repo: Path, args: list[str]) -> tuple[str, int]:
+    import pty
+
     pid, fd = pty.fork()
     if pid == 0:
         # Never let the child survive a failed exec — it would keep running

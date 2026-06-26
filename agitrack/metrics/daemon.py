@@ -42,6 +42,7 @@ from agitrack.metrics.server import (
     open_dashboard_in_browser,
     remote_browser_hint,
 )
+from agitrack.proc import detach_kwargs, pid_alive, terminate_pid
 
 # How often the child re-checks that its owner is still alive. The check
 # (``os.kill(pid, 0)``) is essentially free, so a couple of seconds keeps
@@ -88,17 +89,6 @@ def _write_handshake(repo: GitRepo, record: dict[str, Any]) -> None:
     with tmp.open("w", encoding="utf-8") as handle:
         json.dump(record, handle)
     os.replace(tmp, path)  # atomic: the launcher never sees a half-written record
-
-
-def pid_alive(pid: int) -> bool:
-    """Whether ``pid`` names a live process (signal 0 probes without delivering)."""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # exists, owned by someone else
-    return True
 
 
 def running_handshake(repo: GitRepo) -> dict[str, Any] | None:
@@ -169,9 +159,9 @@ def spawn_dashboard_daemon(
             stdin=subprocess.DEVNULL,
             stdout=log,
             stderr=log,
-            start_new_session=True,
             cwd=str(repo.repo),
             env=env,
+            **detach_kwargs(),
         )
     finally:
         # The child holds its own dup of the log fd; close the launcher's copy.
@@ -230,11 +220,7 @@ def stop_dashboard_daemon(repo: GitRepo) -> int:
         print("No dashboard daemon is running for this repository.")
         return 0
     pid = int(record["pid"])
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except OSError as error:
-        print(f"Could not stop the dashboard daemon (pid {pid}): {error}")
-        return 1
+    terminate_pid(pid)  # SIGTERM on POSIX, TerminateProcess on Windows; best-effort
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline and pid_alive(pid):
         time.sleep(0.05)

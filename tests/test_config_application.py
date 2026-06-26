@@ -127,6 +127,42 @@ def test_repo_overlay_default_backend_overrides_global(tmp_path, monkeypatch):
     assert runner.backend.name == "opencode"
 
 
+def test_over_limit_share_cap_is_refused_at_startup(tmp_path, monkeypatch, capsys):
+    # A configured share cap above the 100 MiB hard limit is a config error: aGiTrack refuses
+    # to start with a clear message rather than silently producing an unpushable file.
+    from agitrack.sessions.share_cap import HARD_MAX_SHARED_BYTES
+
+    _write_global(tmp_path, monkeypatch, {})
+    repo = _dummy_repo(tmp_path)
+    _write_repo_overlay(repo, {"share_max_transcript_bytes": HARD_MAX_SHARED_BYTES + 1})
+
+    built = {"ran": False}
+
+    class _FakeRunner:
+        def __init__(self, repo, **kw):
+            built["ran"] = True
+
+        def run(self):
+            return 0
+
+    monkeypatch.setattr(cli, "ProxyRunner", _FakeRunner)
+    rc = cli.main(["--repo", str(repo), "--skip-privacy-ack"])
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "Configuration error" in out and "share_max_transcript_bytes" in out
+    assert built["ran"] is False  # refused BEFORE building/launching the session
+
+
+def test_within_limit_share_cap_does_not_block_startup(tmp_path, monkeypatch):
+    # A valid (sub-limit) configured cap must NOT be treated as an error.
+    _write_global(tmp_path, monkeypatch, {})
+    repo = _dummy_repo(tmp_path)
+    _write_repo_overlay(repo, {"share_max_transcript_bytes": 50 * 1024 * 1024})
+    captured = _run_main_capturing_runner(monkeypatch, repo)
+    assert captured.get("_repo") is not None  # reached the runner build — no config error
+
+
 RUNNER_READ_FIELDS = [
     ("summarization_enabled", False, lambda r: r._summarization_enabled()),
     ("summarization_model", "some-model-x", lambda r: r.global_config.summarization_model),

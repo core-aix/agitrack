@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 
 import threading
 
+from agitrack.proxy.platform.base import ChildProcess
 from agitrack.proxy.process import BackendProcess
 
 
@@ -120,7 +121,10 @@ class Session:
         _commit_summarized: bool
 
     def __init__(self, **fields) -> None:
-        self.process = BackendProcess(
+        # Typed as the platform-agnostic ChildProcess contract: a freshly-constructed
+        # session holds a POSIX BackendProcess, but the runner replaces it with the
+        # platform's child (a Windows ConPTY child on native Windows) when it spawns.
+        self.process: ChildProcess = BackendProcess(
             master_fd=fields.get("master_fd"),
             child_pid=fields.get("child_pid"),
         )

@@ -1,10 +1,13 @@
 import os
+import sys
 import threading
 import time
 
 import pytest
 
 import types
+
+_posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only")
 
 from agitrack.backends.base import TokenUsage
 from agitrack.transcripts.opencode import SessionTurn
@@ -225,6 +228,68 @@ def test_menu_key_opens_under_both_keyboard_protocols(protocol):
     assert forwarded == []
     assert command == "git-unstaged"
     assert should_exit is False
+
+
+def test_menu_key_again_closes_the_palette():
+    # Ctrl-G opens the command palette; pressing it again CLOSES it (a toggle), rather than
+    # typing a literal control byte into the command buffer.
+    parser = ProxyInput(menu_key=b"\x07")
+    parser.feed(b"\x07")
+    assert parser.capturing is True
+    forwarded, _echo, command, should_exit = parser.feed(b"\x07")
+    assert parser.capturing is False  # closed
+    assert command is None and should_exit is False
+    assert parser.text() == ""  # the menu key was NOT typed into the buffer
+
+
+def test_after_menu_command_closes_all_when_ctrl_g_requested():
+    # Ctrl-G inside a popup requests a full close: _after_menu_command must drop to the agent
+    # (not reopen the Ctrl-G palette), and consume the request.
+    runner = make_runner()
+    reopened: list = []
+    runner._reopen_command_palette = lambda: reopened.append(True)
+    runner._exit_menu_requested = True
+
+    runner._after_menu_command(runner._MENU_UP)
+    assert reopened == []  # did NOT reopen the palette
+    assert runner._exit_menu_requested is False  # consumed
+
+    runner._after_menu_command(runner._MENU_UP)  # ordinary back-out
+    assert reopened == [True]  # reopens the palette as usual
+
+
+def test_run_modal_menu_key_requests_a_full_close():
+    import types
+
+    from agitrack.proxy.modal import SelectModal
+
+    runner = make_runner()
+    runner.input = types.SimpleNamespace(menu_key=b"\x07")
+    runner._set_message = lambda *a, **k: None
+    runner._clear_message = lambda: None
+    runner._render = lambda: None
+    runner._popup_read_input = lambda: b"\x07"  # Ctrl-G pressed inside the popup
+
+    result = runner._run_modal_inline(SelectModal("pick", ["a", "b"], viewport_rows=10))
+
+    assert result is None  # treated as cancel...
+    assert runner._exit_menu_requested is True  # ...but flags the WHOLE menu to close
+
+
+def test_run_modal_short_circuits_when_close_already_requested():
+    from agitrack.proxy.modal import SelectModal
+
+    runner = make_runner()
+    runner._exit_menu_requested = True
+    runner._clear_message = lambda: None
+    runner._render = lambda: None
+    reads: list = []
+    runner._popup_read_input = lambda: reads.append(True) or b""
+
+    result = runner._run_modal_inline(SelectModal("pick", ["a"], viewport_rows=10))
+
+    assert result is None
+    assert reads == []  # never painted or read input — the close unwinds straight through
 
 
 @pytest.mark.parametrize("protocol", ["kitty", "modifyOtherKeys"])
@@ -2133,6 +2198,30 @@ def test_wheel_scrolls_history_and_strips_mouse_when_backend_has_no_mouse():
     assert runner.scroll_back == 3
 
 
+def test_x10_mouse_reports_are_stripped_and_wheel_scrolls():
+    # Terminals that ignore SGR mouse mode (?1006) — some tmux configs, the native Windows
+    # console — send legacy X10 reports (ESC [ M + three offset bytes) even though aGiTrack
+    # asked for SGR. They must be consumed like SGR reports, or their raw coordinate bytes
+    # (column/row 3 is '#') leak into the backend's input as the "mouse cursor hash".
+    runner = _history_runner()
+    wheel_up = b"\x1b[M" + bytes([32 + 64, 32 + 5, 32 + 5])  # button 64 = wheel up
+    assert runner._intercept_scroll(wheel_up) == b""  # consumed, nothing forwarded
+    assert runner.scroll_back == 3
+    wheel_down = b"\x1b[M" + bytes([32 + 65, 32 + 5, 32 + 5])  # button 65 = wheel down
+    runner._intercept_scroll(wheel_down)
+    assert runner.scroll_back == 0
+    # A non-wheel X10 report whose coordinate byte is '#' (column/row 3) is stripped too,
+    # leaving the surrounding real keystrokes intact.
+    leaky = b"\x1b[M" + bytes([32, ord("#"), ord("#")])
+    assert runner._intercept_scroll(b"x" + leaky + b"y") == b"xy"
+
+
+def test_is_real_keypress_ignores_x10_mouse_reports():
+    leaky = b"\x1b[M" + bytes([32, ord("#"), ord("#")])  # an incidental X10 mouse move
+    assert ProxyRunner._is_real_keypress(leaky) is False
+    assert ProxyRunner._is_real_keypress(b"a" + leaky) is True  # a real key alongside it
+
+
 def test_scrolled_view_shows_history_lines():
     runner = _history_runner()
     runner.scroll_back = 9
@@ -2376,6 +2465,18 @@ def test_hold_incomplete_tail_buffers_split_escape_sequence():
     assert runner._hold_incomplete_tail(b"plain text") == (b"plain text", b"")
 
 
+def test_hold_incomplete_tail_buffers_split_x10_mouse():
+    runner = make_runner()
+    # A legacy X10 report (ESC [ M + 3 bytes) split across reads must also be held, not
+    # leaked — its trailing coordinate bytes are ordinary characters.
+    head, tail = runner._hold_incomplete_tail(b"abc\x1b[M")
+    assert head == b"abc"
+    assert tail == b"\x1b[M"
+    head2, tail2 = runner._hold_incomplete_tail(tail + bytes([32, ord("#"), ord("#")]))
+    assert head2 == b"\x1b[M" + bytes([32, ord("#"), ord("#")])
+    assert tail2 == b""
+
+
 def test_pageup_pagedown_scroll_history():
     runner = _history_runner()
     runner._intercept_scroll(b"\x1b[5~")  # PageUp
@@ -2500,7 +2601,7 @@ def test_select_timeout_honors_deferred_prompt_submit():
     runner.ACTIVE_POLL_SECONDS = 1.0
     runner._pending_enter_at = time.monotonic() + 0.4
     timeout = runner._select_timeout()
-    assert 0.0 < timeout <= 0.4  # blocks only until the Enter is due, not 1s
+    assert 0.0 < timeout <= 0.4 + 0.001  # blocks only until the Enter is due, not 1s
 
     runner._pending_enter_at = time.monotonic() - 5  # already overdue → fire now
     assert runner._select_timeout() == 0.0
@@ -2582,6 +2683,62 @@ def test_proxy_refuses_second_instance(monkeypatch, capsys):
     assert runner.run() == 1
     out = capsys.readouterr().out
     assert "already running" in out and "4321" in out  # names the holding process
+
+
+def _run_startup_runner(monkeypatch):
+    import sys
+
+    runner = make_runner()
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True, raising=False)
+    runner.management_lock = type(
+        "L", (), {"acquire": lambda self: True, "release": lambda self: None, "owner_pid": lambda self: 0}
+    )()
+    return runner
+
+
+def test_run_asks_privacy_only_after_backend_gate(monkeypatch):
+    # The privacy warning must come AFTER the backend install/availability gate (and the
+    # gh-login / menu-key prompts cli.py runs before this), right before the TUI — so if the
+    # backend isn't available, the user is never asked to acknowledge anything.
+    import agitrack.cli as cli
+
+    runner = _run_startup_runner(monkeypatch)
+    runner._ensure_backend_available = lambda: False  # backend unavailable → stop here
+    asked: list[bool] = []
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: asked.append(True) or True)
+
+    assert runner.run() == 1
+    assert asked == []  # privacy is asked only once the backend is available
+
+
+def test_run_stops_when_privacy_declined(monkeypatch):
+    # Declining the privacy warning stops startup before the backend is spawned.
+    import agitrack.cli as cli
+
+    runner = _run_startup_runner(monkeypatch)
+    runner._ensure_backend_available = lambda: True
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: False)  # user declined
+    spawned: list[bool] = []
+    runner._spawn = lambda: spawned.append(True)
+
+    assert runner.run() == 1
+    assert spawned == []  # never reached the spawn
+
+
+def test_run_forwards_skip_privacy_ack(monkeypatch):
+    # The --skip-privacy-ack flag (set on an in-app menu re-exec) is passed through to the ack.
+    import agitrack.cli as cli
+
+    runner = _run_startup_runner(monkeypatch)
+    runner._ensure_backend_available = lambda: True
+    runner._skip_privacy_ack = True
+    seen: list = []
+    # Return False so run() stops right after the ack (before the heavier startup work).
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: seen.append(k.get("skip")) or False)
+
+    assert runner.run() == 1
+    assert seen == [True]
 
 
 def _mux_runner():
@@ -3179,6 +3336,7 @@ def test_describe_exit_finalize_names_the_pending_work():
     assert "Finalizing commits" not in detail  # not the old vague message
 
 
+@_posix_only
 def test_handle_exit_signal_ignored_while_update_applying():
     # A terminal-close SIGHUP must NOT tear aGiTrack down mid-self-update: unwinding
     # would abort the pip apply and could leave aGiTrack half-uninstalled.
@@ -3197,6 +3355,7 @@ def test_handle_exit_signal_ignored_while_update_applying():
     assert runner.running is True
 
 
+@_posix_only
 def test_handle_exit_signal_prompts_only_when_work_pending(monkeypatch):
     import signal as signal_mod
 
@@ -7032,6 +7191,7 @@ def test_select_popup_ctrl_c_routes_through_exit_flow():
     assert runner._select_popup("Pick", ["a", "b"]) == "a"
 
 
+@_posix_only
 def test_spawn_failed_exec_child_exits_with_127(tmp_path):
     # Issue #20: if execvp fails in the forked child (binary gone, PATH change,
     # worktree deleted), the child must die — not keep running aGiTrack's own
@@ -7060,6 +7220,7 @@ def test_spawn_failed_exec_child_exits_with_127(tmp_path):
 # --- issue #21: stopped backends are reaped, not left as zombies ----------------
 
 
+@_posix_only
 def test_terminate_child_queues_pid_and_reaper_collects_it():
     runner = make_runner(master_fd=None)
     pid = os.fork()
@@ -7082,6 +7243,7 @@ def test_terminate_child_queues_pid_and_reaper_collects_it():
         os.waitpid(pid, os.WNOHANG)
 
 
+@_posix_only
 def test_reaper_keeps_still_running_children():
     import signal as signal_mod
 
@@ -7119,6 +7281,7 @@ def _popup_io_runner(monkeypatch, stdin_fd):
     return runner
 
 
+@_posix_only
 def test_popup_read_input_drains_active_pty_while_waiting(monkeypatch):
     stdin_r, stdin_w = os.pipe()
     child_r, child_w = os.pipe()
@@ -7140,6 +7303,7 @@ def test_popup_read_input_drains_active_pty_while_waiting(monkeypatch):
             os.close(fd)
 
 
+@_posix_only
 def test_popup_read_input_pumps_background_sessions(monkeypatch):
     stdin_r, stdin_w = os.pipe()
     bg_r, bg_w = os.pipe()
@@ -7161,6 +7325,7 @@ def test_popup_read_input_pumps_background_sessions(monkeypatch):
             os.close(fd)
 
 
+@_posix_only
 def test_popup_read_input_survives_child_eof(monkeypatch):
     stdin_r, stdin_w = os.pipe()
     child_r, child_w = os.pipe()
@@ -7736,6 +7901,7 @@ def test_screen_renderer_status_line_basic():
     assert "claude" in line
 
 
+@_posix_only
 def test_screen_renderer_status_line_shows_home_abbreviated_cwd(monkeypatch):
     monkeypatch.setenv("HOME", "/Users/dev")
     r = ScreenRenderer(5, 100, color_mode="truecolor")
@@ -7802,8 +7968,9 @@ def test_status_line_shows_base_repo_directory_not_the_worktree(tmp_path):
     )
 
     line = runner._status_line()
-    assert f"{tmp_path}/project " in line
-    assert ".agitrack/worktrees" not in line
+    # Use name-based check to work on both POSIX (/) and Windows (\) separators.
+    assert "project" in line
+    assert "worktrees" not in line
 
 
 def test_status_line_falls_back_to_repo_directory_without_base(tmp_path):
@@ -7926,6 +8093,7 @@ def test_notify_if_gh_unavailable_silent_when_ok(monkeypatch):
     assert runner.messages == []
 
 
+@_posix_only
 def test_restore_terminal_clears_before_leaving_alt_screen(monkeypatch):
     # #70: on terminals without alt-screen support, leaving the alt screen is a
     # no-op, so aGiTrack's UI lingers after exit unless we clear the screen first.

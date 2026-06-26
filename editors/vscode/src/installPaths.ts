@@ -10,14 +10,18 @@
 
 import { join } from "path";
 
-const EXE = "agitrack";
+/** The console-script filename: `agitrack.exe` on Windows, `agitrack` elsewhere. */
+export function exeName(platform: NodeJS.Platform): string {
+  return platform === "win32" ? "agitrack.exe" : "agitrack";
+}
 
 /** Ordered absolute candidate paths for the `agitrack` executable, for the common
  * install locations on a host:
- *  - `~/.local/bin` (pipx default; pip --user on many Linux setups)
- *  - macOS framework Python user scripts: `~/Library/Python/<X.Y>/bin` (one per version
- *    directory found, passed in as `libraryPythonVersions`)
- *  - Homebrew bin dirs (`/opt/homebrew/bin` on Apple Silicon, `/usr/local/bin`)
+ *  - POSIX: `~/.local/bin` (pipx default; pip --user on many Linux setups), macOS
+ *    framework Python user scripts `~/Library/Python/<X.Y>/bin` (one per version found),
+ *    Homebrew bin dirs (`/opt/homebrew/bin`, `/usr/local/bin`)
+ *  - Windows: `~/.local/bin` (pipx default) and the pip `--user` Scripts dirs under
+ *    `%APPDATA%\Python` and a per-user Python install — all holding `agitrack.exe`
  *
  * Pure and parameterised (no `process`/`fs` access) so it is unit-testable. */
 export function staticExeCandidates(
@@ -25,6 +29,15 @@ export function staticExeCandidates(
   platform: NodeJS.Platform,
   libraryPythonVersions: string[] = [],
 ): string[] {
+  const exe = exeName(platform);
+  if (platform === "win32") {
+    const dirs = [
+      join(home, ".local", "bin"), // pipx default bin dir on Windows
+      join(home, "AppData", "Roaming", "Python", "Scripts"), // pip --user (%APPDATA%\Python)
+      join(home, "AppData", "Local", "Programs", "Python", "Scripts"), // per-user Python
+    ];
+    return dirs.map((dir) => join(dir, exe));
+  }
   const dirs: string[] = [join(home, ".local", "bin")];
   if (platform === "darwin") {
     for (const version of libraryPythonVersions) {
@@ -34,7 +47,7 @@ export function staticExeCandidates(
   } else {
     dirs.push("/usr/local/bin");
   }
-  return dirs.map((dir) => join(dir, EXE));
+  return dirs.map((dir) => join(dir, exe));
 }
 
 /** De-duplicate while preserving first-seen order (so the most authoritative candidate,

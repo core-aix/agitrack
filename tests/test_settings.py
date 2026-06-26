@@ -9,10 +9,17 @@ only when the user confirms "save" on close. Esc goes up one level at every step
 from __future__ import annotations
 
 import json
+import sys
+
+import pytest
 
 from agitrack.config.settings import GlobalConfig
 
 from proxy_helpers import make_runner
+
+# Tests that use POSIX-style paths ("/x:/y" with ":" separator) are skipped
+# on Windows where os.pathsep is ";" and drive letters also contain ":".
+posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX path separator only")
 
 
 def _config(tmp_path):
@@ -33,6 +40,36 @@ def test_repo_overlay_overrides_global(tmp_path):
     # The repo value lives in the repo file; the global file keeps its own.
     assert json.loads((tmp_path / "repo" / ".agitrack" / "config.json").read_text())["sandbox"] is True
     assert json.loads((tmp_path / "global" / "config.json").read_text())["sandbox"] is False
+
+
+def test_share_size_cap_default_configure_and_hard_clamp(tmp_path):
+    from agitrack.sessions.share_cap import DEFAULT_MAX_SHARED_BYTES, HARD_MAX_SHARED_BYTES
+
+    gc = _config(tmp_path)
+    # Default when unset.
+    assert gc.share_max_transcript_bytes == DEFAULT_MAX_SHARED_BYTES
+    # A sensible configured value is honored (repo overlay wins, like any setting).
+    gc.set("share_max_transcript_bytes", 50 * 1024 * 1024, scope="repo")
+    assert gc.share_max_transcript_bytes == 50 * 1024 * 1024
+    # A nonsensical value falls back to the default (a typo can't break sharing).
+    gc.set("share_max_transcript_bytes", "lots", scope="global")
+    gc.unset("share_max_transcript_bytes", scope="repo")
+    assert gc.share_max_transcript_bytes == DEFAULT_MAX_SHARED_BYTES
+    # Even if an over-limit value slips in, the effective value is clamped to the hard ceiling.
+    gc.set("share_max_transcript_bytes", 500 * 1024 * 1024, scope="repo")
+    assert gc.share_max_transcript_bytes == HARD_MAX_SHARED_BYTES
+
+
+def test_share_config_error_flags_only_over_the_hard_limit(tmp_path):
+    from agitrack.sessions.share_cap import HARD_MAX_SHARED_BYTES
+
+    gc = _config(tmp_path)
+    assert gc.share_config_error() is None  # unset → fine
+    gc.set("share_max_transcript_bytes", HARD_MAX_SHARED_BYTES, scope="global")
+    assert gc.share_config_error() is None  # exactly at the limit → fine
+    gc.set("share_max_transcript_bytes", HARD_MAX_SHARED_BYTES + 1, scope="global")
+    err = gc.share_config_error()
+    assert err is not None and "share_max_transcript_bytes" in err and "100 MiB" in err
 
 
 def test_unset_repo_reveals_global(tmp_path):
@@ -56,6 +93,7 @@ def test_save_repo_preserves_other_keys(tmp_path):
     assert data == {"summarization_enabled": False, "trace_turn_limit": 9, "sandbox": False}
 
 
+@posix_only
 def test_allowed_edit_paths_parsing(tmp_path):
     gc = _config(tmp_path)
     gc.set("allowed_edit_paths", ["/a", "/b"], scope="repo")
@@ -196,6 +234,7 @@ def test_settings_menu_esc_in_scope_returns_to_value(tmp_path):
     assert runner.global_config.source("default_backend") == "default"  # never saved
 
 
+@posix_only
 def test_settings_menu_edits_allowed_paths(tmp_path):
     runner = _settings_runner(tmp_path)
     _drive(
