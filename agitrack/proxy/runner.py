@@ -6716,6 +6716,12 @@ class ProxyRunner:
         # OpenCode enables mouse reporting on its PTY. Because aGiTrack renders the
         # screen itself, the host terminal never sees those mode switches unless
         # we mirror them explicitly.
+        # On Windows the host console (incl. over RDP) floods *motion* tracking (1002/1003)
+        # with events it doesn't round-trip cleanly like xterm — they come back and, forwarded
+        # to a mouse-driving backend, render as literal `[<35;..M` text in its prompt. So don't
+        # enable host motion tracking on Windows; button + wheel (1000/1006) still work, the
+        # backend just loses hover/drag motion. (Disables are always mirrored.)
+        _no_host_enable = {b"1002", b"1003"} if os.name == "nt" else set()
         for mode in (
             b"9",
             b"1000",
@@ -6730,7 +6736,7 @@ class ProxyRunner:
             b"1016",
             b"2004",
         ):
-            if b"\x1b[?" + mode + b"h" in output:
+            if b"\x1b[?" + mode + b"h" in output and mode not in _no_host_enable:
                 os.write(sys.stdout.fileno(), b"\x1b[?" + mode + b"h")
             if b"\x1b[?" + mode + b"l" in output:
                 os.write(sys.stdout.fileno(), b"\x1b[?" + mode + b"l")
