@@ -6315,6 +6315,28 @@ def test_crash_loop_capture_surfaces_backend_output(monkeypatch):
     assert "--new-session" in notice
 
 
+def test_backend_exit_notice_shows_the_launched_command(monkeypatch):
+    # The notice must name the EXACT command aGiTrack tried to launch (and what it produced),
+    # so a backend that dies on startup is diagnosable rather than a generic "exited".
+    runner = make_runner()
+    runner._debug = lambda *a, **k: None
+    runner._restart_agent = lambda msg: None
+    runner._finalize_on_backend_exit = lambda: None
+    runner._last_spawn_command = ["claude", "--resume", "abc"]
+    runner.last_child_output_sample = b""  # claude died producing nothing
+
+    t = [1000.0]
+    monkeypatch.setattr("agitrack.proxy.runner.time.monotonic", lambda: t[0])
+    for _ in range(3):
+        runner._relaunch_backend_or_exit()
+    runner._relaunch_backend_or_exit()
+
+    notice = runner._backend_exit_notice
+    assert notice is not None
+    assert "Command: claude --resume abc" in notice
+    assert "no output before exiting" in notice  # explicit, not an empty section
+
+
 def test_busy_session_forks_instead_of_crash_looping():
     # The claude session is held by a running background agent. aGiTrack should fork a
     # copy on the next spawn rather than relaunch into the same refusal (#114).

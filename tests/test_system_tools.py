@@ -177,3 +177,14 @@ def test_maybe_install_tool_accepts_and_installs(monkeypatch):
     ):
         assert cli._maybe_install_tool("gh", required=False) is True
     install.assert_called_once_with("gh")
+
+
+# ---------------------------------------------------------------------------
+# ensure_powershell_execution_policy — no-op off Windows, never raises
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_powershell_execution_policy_noop_off_windows(monkeypatch):
+    monkeypatch.setattr(st.os, "name", "posix")
+    # Must not touch the registry or raise on POSIX.
+    st.ensure_powershell_execution_policy(output_fn=lambda _: None)

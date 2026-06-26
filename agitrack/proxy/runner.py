@@ -617,6 +617,7 @@ class ProxyRunner:
         self.last_child_output = 0.0
         self.last_user_input = 0.0  # monotonic time of the user's last keystroke (drives idle backoff)
         self.last_child_output_sample = b""
+        self._last_spawn_command: list[str] = []  # the exact command of the most recent spawn
         # Set when the backend exits repeatedly and aGiTrack stops relaunching, so
         # run() can echo the reason on the restored host screen instead of leaving
         # the user with a silent flash (#114).
@@ -1070,6 +1071,7 @@ class ProxyRunner:
                 "_fork_next_spawn": False,
                 "_forked_for_busy": False,
                 "_backend_exit_notice": None,
+                "_last_spawn_command": [],
                 "_exiting": False,
                 "_finalized_on_exit": False,
                 "_exit_aborted": False,
@@ -1356,6 +1358,10 @@ class ProxyRunner:
         # before the sandbox wrapper so they reach the backend, not sandbox-exec.
         command = command + getattr(self, "_backend_args", [])
         command = self._confine_to_worktree(command)
+        # Remember the exact command we tried to launch so a backend that dies on startup
+        # can report it (the #1 question when "backend exited repeatedly" — did aGiTrack even
+        # find/launch the right binary?).
+        self._last_spawn_command = list(command)
         # Pseudo-terminal mechanics delegated to the platform child process (POSIX PTY
         # via BackendProcess, or Windows ConPTY via NtChildProcess); policy (command
         # construction, sandbox wrapping) stays here in the runner. The session owns its
@@ -5942,24 +5948,82 @@ class ProxyRunner:
         return bool(_FORK_HINT_RE.search(text))
 
     def _format_backend_exit_notice(self) -> str | None:
-        # The backend died on launch several times in a row (e.g. the claude CLI
-        # refusing to resume a session that is still running as a background agent),
-        # so aGiTrack is giving up. In proxy mode that output lived on the alt-screen,
-        # which the terminal restore discards, so the user otherwise just sees a flash
-        # and a bare prompt with no reason (#114). Echo the backend's last readable
-        # lines, plus how to get unstuck.
+        # The backend died on launch several times in a row (e.g. the claude CLI refusing to
+        # resume a session held by a running background agent, or — on Windows — a backend
+        # that isn't actually launchable). In proxy mode that output lived on the alt-screen,
+        # which the terminal restore discards, so the user otherwise just sees a flash and a
+        # bare prompt (#114). Surface the EXACT failure: the command aGiTrack ran, what the
+        # binary resolved to, the exit code, and the backend's own output (raw if it isn't
+        # cleanly decodable) — plus a written log so nothing is lost to scrollback.
         backend = getattr(self.state, "backend", None) or "the backend"
-        text = _strip_ansi(self.last_child_output_sample.decode(errors="replace"))
-        lines = [line.rstrip() for line in text.splitlines() if line.strip()]
         notice = f"aGiTrack: {backend} exited repeatedly on launch and was not relaunched."
+
+        command = list(getattr(self, "_last_spawn_command", []) or [])
+        if command:
+            notice += f"\nCommand: {' '.join(command)}"
+            try:
+                from agitrack.proc import which_executable
+
+                resolved = which_executable(command[0])
+                notice += f"\nResolved '{command[0]}' to: {resolved or '(not found on PATH)'}"
+            except Exception:  # diagnostics must never themselves crash the notice
+                pass
+
+        exit_code = self._last_backend_exit_code()
+        if exit_code is not None:
+            notice += f"\nExit code: {exit_code}"
+
+        raw = self.last_child_output_sample
+        text = _strip_ansi(raw.decode(errors="replace"))
+        lines = [line.rstrip() for line in text.splitlines() if line.strip()]
         if lines:
-            tail = "\n".join("  " + line for line in lines[-12:])
+            tail = "\n".join("  " + line for line in lines[-20:])
             notice += f"\nLast output from {backend}:\n{tail}"
+        elif raw:
+            # No cleanly readable text (often just terminal control bytes) — show the escaped
+            # raw tail so an early CreateProcess/cmd.exe error is still visible.
+            escaped = raw[-400:].decode(errors="replace").replace("\x1b", "\\x1b")
+            notice += f"\nRaw {backend} output (no readable text): {escaped!r}"
+        else:
+            notice += f"\n{backend} produced no output before exiting."
+
+        log_path = self._write_backend_exit_log(backend, command, exit_code, raw)
+        if log_path is not None:
+            notice += f"\nFull details written to: {log_path}"
         notice += (
             "\nTry `agitrack --new-session` to start a fresh conversation, "
             "or `agitrack --mode json` to see the full backend error."
         )
         return notice
+
+    def _last_backend_exit_code(self) -> int | None:
+        # Best-effort exit code of the just-dead child (the platform child keeps it after the
+        # process is gone); None when unavailable. Coerced to int so a test mock's poll()
+        # can't leak a non-numeric value into the notice.
+        process = getattr(self.active, "process", None) if getattr(self, "active", None) else None
+        if process is None:
+            return None
+        try:
+            code = process.poll()
+        except Exception:
+            return None
+        return code if isinstance(code, int) else None
+
+    def _write_backend_exit_log(self, backend: str, command: list[str], exit_code: int | None, raw: bytes):
+        # Persist the full, unstripped backend output to the base repo's .agitrack/ so the
+        # reason survives the alt-screen teardown and the user (or a bug report) can read it.
+        try:
+            path = self._diag_path("backend-exit")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("w", encoding="utf-8") as handle:
+                handle.write(f"backend: {backend}\n")
+                handle.write(f"command: {command}\n")
+                handle.write(f"exit_code: {exit_code}\n")
+                handle.write("--- raw output (utf-8, replace) ---\n")
+                handle.write(raw.decode(errors="replace"))
+            return path
+        except Exception:  # diagnostics must never crash the exit path
+            return None
 
     def _finalize_on_backend_exit(self) -> None:
         # The only session's backend process is gone and we are NOT relaunching

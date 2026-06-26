@@ -204,7 +204,8 @@ def install_backend(
     npm = _npm_command(which)
     plan = _install_plan(name, info, npm, which)
     if not plan:
-        # Nothing to run with (e.g. Windows without Node) — try to bootstrap npm via winget.
+        # Nothing to run with (e.g. Windows without Node) — install Node/npm via winget so
+        # there's a way to install the backend at all.
         npm = _install_node_with_winget(output_fn, run, which)
         plan = _install_plan(name, info, npm, which)
     if not plan:
@@ -223,6 +224,12 @@ def install_backend(
             continue
         _add_dirs_to_path(_candidate_bin_dirs(npm, run))
         if backend_installed(name):
+            # npm leaves a .ps1 shim too; make sure PowerShell's execution policy won't block
+            # the user from running it (aGiTrack itself uses the .cmd via cmd.exe). No-op off
+            # Windows.
+            from agitrack.system_tools import ensure_powershell_execution_policy
+
+            ensure_powershell_execution_policy(output_fn)
             output_fn(f"\n{info['label']} installed.\n")
             return True
     output_fn(f"\n{info['label']} could not be made runnable automatically.\n")

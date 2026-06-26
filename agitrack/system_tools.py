@@ -19,7 +19,7 @@ import os
 import shutil
 import subprocess
 import sys
-from typing import Callable
+from typing import Any, Callable
 
 # Per-tool install identifiers per package manager. winget needs no sudo (it elevates via
 # UAC only if required); brew is user-scoped; the Linux distro managers need sudo.
@@ -115,6 +115,38 @@ def _add_dirs_to_path(dirs: list[str]) -> None:
     additions = [d for d in dirs if d and os.path.isdir(d) and d not in parts]
     if additions:
         os.environ["PATH"] = os.pathsep.join([*additions, *parts])
+
+
+def ensure_powershell_execution_policy(output_fn: Callable[[str], None] = print) -> None:
+    """On Windows, make sure the per-user PowerShell execution policy allows the signed/local
+    scripts that npm installs as ``.ps1`` shims (``npm.ps1``, ``claude.ps1``). Sets the
+    CurrentUser policy to ``RemoteSigned`` when it's currently more restrictive (the default
+    ``Restricted`` blocks them with "running scripts is disabled on this system").
+
+    aGiTrack itself launches backends via the ``.cmd`` shim through ``cmd.exe`` and does NOT
+    need this; it's a courtesy so the user's own ``npm``/``claude`` work in PowerShell too.
+    No-op off Windows; never raises."""
+    if os.name != "nt":
+        return
+    try:
+        import winreg  # type: ignore[import-not-found,unused-ignore]  # Windows-only stdlib
+    except ImportError:
+        return
+    reg: Any = winreg  # Any so mypy on Linux doesn't flag the win32-only registry members
+    key_path = r"Software\Microsoft\PowerShell\1\ShellIds\Microsoft.PowerShell"
+    acceptable = {"remotesigned", "unrestricted", "bypass"}
+    try:
+        with reg.CreateKeyEx(reg.HKEY_CURRENT_USER, key_path, 0, reg.KEY_READ | reg.KEY_SET_VALUE) as key:
+            try:
+                current, _ = reg.QueryValueEx(key, "ExecutionPolicy")
+            except OSError:
+                current = ""
+            if str(current).strip().lower() in acceptable:
+                return
+            reg.SetValueEx(key, "ExecutionPolicy", 0, reg.REG_SZ, "RemoteSigned")
+        output_fn("Set the PowerShell execution policy (current user) to RemoteSigned so npm/claude scripts run.\n")
+    except OSError:
+        return
 
 
 def install_system_tool(
