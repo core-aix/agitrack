@@ -29,7 +29,7 @@ test("staticExeCandidates does not add macOS-only dirs off darwin", () => {
   assert.ok(!candidates.some((c) => c.startsWith("/opt/homebrew")));
 });
 
-test("staticExeCandidates ends every candidate with the agitrack executable", () => {
+test("staticExeCandidates ends every POSIX candidate with the agitrack executable", () => {
   for (const candidate of staticExeCandidates("/Users/u", "darwin", ["3.12"])) {
     assert.ok(candidate.endsWith("/agitrack"), candidate);
   }

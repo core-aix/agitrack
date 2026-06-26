@@ -9,11 +9,19 @@ import json
 import random
 import string
 import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 from agitrack.git import GitRepo
 from agitrack.sessions import SharedSessionStore, github_login, redact_transcript
 from agitrack.sessions.identity import slug
+
+_posix_git_gc = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="git object reclamation via loose-file removal behaves differently on Windows (objects may be packed)",
+)
 
 
 def _fake_token(prefix: str, n: int, *, charset: str = string.ascii_letters + string.digits) -> str:
@@ -855,6 +863,7 @@ def test_publish_without_remote_saves_locally(tmp_path):
     assert result.remote is False and result.pushed is False
 
 
+@_posix_git_gc
 def test_remote_publish_reclaims_previous_version_but_keeps_latest(tmp_path):
     # Deferred reclaim: the previous transcript blob survives the push (so git can
     # deltify the new transcript against it — append-only sessions transmit just the
@@ -1221,6 +1230,7 @@ def test_unshare_removes_a_session_living_in_the_legacy_ref(tmp_path):
     assert not any(k.startswith(store._prefix()) for k in repo.read_tree_paths(LEGACY_REF))
 
 
+@_posix_git_gc
 def test_update_deletes_old_version_objects_immediately(tmp_path):
     import subprocess as sp
 
@@ -1252,6 +1262,7 @@ def test_update_one_session_keeps_other_sessions_intact(tmp_path):
     assert got == {"a/s1": "one-v2", "b/s2": "two"}
 
 
+@_posix_git_gc
 def test_cleanup_orphans_removes_only_session_snapshots(tmp_path):
     import subprocess as sp
 
@@ -1554,7 +1565,9 @@ def test_claude_export_and_import_retargets_cwd(tmp_path, monkeypatch):
     dst.mkdir()
     assert claude.import_shared_session(dst, "sid", raw)
     imported = (claude._project_dir(dst) / "sid.jsonl").read_text()
-    assert str(dst.resolve()) in imported and "/Users/alice/old" not in imported
+    # Parse JSON to compare the cwd field; raw text has JSON-escaped backslashes on Windows.
+    cwd_in_imported = any(json.loads(line).get("cwd") == str(dst.resolve()) for line in imported.splitlines() if line)
+    assert cwd_in_imported and "/Users/alice/old" not in imported
     assert claude.session_belongs_to_repo(dst, "sid")
     # Re-importing must not clobber an existing local transcript.
     (claude._project_dir(dst) / "sid.jsonl").write_text("LOCAL")
@@ -1579,7 +1592,8 @@ def test_claude_import_as_id_keeps_both_under_a_new_id(tmp_path, monkeypatch):
     assert claude.session_belongs_to_repo(dst, "newid")
     copy = (claude._project_dir(dst) / "newid.jsonl").read_text()
     assert '"sessionId": "newid"' in copy and '"sid"' not in copy
-    assert str(dst.resolve()) in copy
+    # Parse JSON to compare the cwd field; raw text has JSON-escaped backslashes on Windows.
+    assert any(json.loads(line).get("cwd") == str(dst.resolve()) for line in copy.splitlines() if line)
 
 
 # --- OpenCode transcript export / import ------------------------------------

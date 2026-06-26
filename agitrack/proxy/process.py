@@ -4,6 +4,15 @@ Owns the fork/exec mechanics, PTY drain, window-size ioctl, signal-based
 teardown, and all writes to the child's PTY.  Policy decisions (command
 construction, sandbox wrapping, session selection) stay in ProxyRunner.
 
+Cross-platform
+--------------
+On POSIX the child PTY is a real Unix master fd; on Windows it is the read
+end of a ``socket.socketpair`` bridged from ``pywinpty`` by a pump thread
+(see :mod:`agitrack.proxy.pty_backend`).  Both are selectable by
+``select.select`` and readable via ``os.read``, so the rest of runner.py
+is unchanged.  Write and resize go through the pty handle directly (not the
+socket) so data flows correctly on both platforms.
+
 Ownership note (P3)
 -------------------
 Each proxy :class:`~agitrack.proxy.session.Session` owns one BackendProcess
@@ -19,8 +28,15 @@ from __future__ import annotations
 import os
 import select
 import signal
+import sys
 import threading
 import time
+
+from agitrack.proxy.pty_backend import PtyHandle, spawn_pty
+
+if sys.platform != "win32":
+    # Only needed for the POSIX cleanup path (os.waitpid with WNOHANG).
+    pass  # all POSIX-specific imports are inside the methods that need them
 
 
 class BackendProcess:
@@ -29,8 +45,9 @@ class BackendProcess:
     Parameters
     ----------
     master_fd:
-        The master end of the PTY (returned by ``pty.fork``).  ``None`` means
-        the process has not been spawned yet (or has been torn down).
+        The master end of the PTY (or the socket bridge read-end on Windows).
+        ``None`` means the process has not been spawned yet (or has been torn
+        down).
     child_pid:
         PID of the child process.  ``None`` when not running.
     """
@@ -38,10 +55,9 @@ class BackendProcess:
     def __init__(self, master_fd: int | None = None, child_pid: int | None = None) -> None:
         self.master_fd = master_fd
         self.child_pid = child_pid
-        # Serializes writes to the PTY: the main reactor thread forwards keystrokes
-        # while the git worker may inject a conflict-resolution prompt, and a
-        # multi-byte payload must not interleave with another write's bytes.
         self._write_lock = threading.Lock()
+        # Pty handle (set by spawn); None for manually-constructed instances.
+        self._handle: PtyHandle | None = None
 
     # ------------------------------------------------------------------
     # Spawn
@@ -49,33 +65,27 @@ class BackendProcess:
 
     @classmethod
     def spawn(cls, command: list[str], cwd: str, extra_env: dict[str, str] | None = None) -> "BackendProcess":
-        """Fork a PTY child, exec *command* inside it, and return a new instance.
+        """Spawn *command* in a PTY and return a new BackendProcess.
+
+        On POSIX uses ``pty.fork()``; on Windows uses pywinpty + a socket
+        bridge so the resulting ``master_fd`` is selectable by
+        ``select.select``.
 
         The child changes to *cwd* before exec.  If exec fails the child exits
-        with code 127 (the exec-failure guard from issue #20) so the fork never
-        silently propagates as a duplicate runner.
+        with code 127 so the fork never silently propagates as a duplicate
+        runner.
 
-        ``extra_env`` is applied to the CHILD's environment only (set after the fork,
-        before exec), so it never leaks into the aGiTrack process or its own
-        subprocesses — e.g. disabling a backend's in-app auto-update for the session
-        without disabling the explicit upgrade aGiTrack runs itself.
+        ``extra_env`` is applied to the CHILD's environment only (set after
+        the fork, before exec), so it never leaks into the aGiTrack process
+        or its own subprocesses.
         """
-        import pty  # POSIX-only; imported lazily so this module loads on native Windows
-
-        pid, fd = pty.fork()
-        if pid == 0:
-            # The child must never survive a failed exec (backend uninstalled
-            # mid-session, PATH change, worktree deleted): the exception would
-            # otherwise propagate and leave a duplicate aGiTrack running from the
-            # fork point, sharing state files, locks, and the terminal.
-            try:
-                os.chdir(cwd)
-                if extra_env:
-                    os.environ.update(extra_env)
-                os.execvp(command[0], command)
-            except BaseException:
-                os._exit(127)
-        return cls(master_fd=fd, child_pid=pid)
+        handle = spawn_pty(command, cwd, extra_env)
+        inst = cls.__new__(cls)
+        inst._handle = handle
+        inst.master_fd = handle.master_fd
+        inst.child_pid = handle.child_pid
+        inst._write_lock = threading.Lock()
+        return inst
 
     # ------------------------------------------------------------------
     # Drain
@@ -126,27 +136,30 @@ class BackendProcess:
         Returns the concatenated bytes, or ``None`` on EOF / read error with
         nothing buffered (signals the caller that the child is gone).
 
-        Read all currently-available output in one go (capped) and render once,
-        instead of re-rendering after every 4 KB. During heavy output (e.g.
-        fast scrolling in OpenCode) this keeps the PTY drained so the backend's
-        writes never block, which otherwise stalls/kills the backend.
+        On POSIX reads from the PTY master fd via ``os.read``.  On Windows reads
+        via ``handle.read_master`` which calls ``socket.recv`` on the socket
+        bridge (``os.read`` does not work on Windows socket handles).
         """
-        assert self.master_fd is not None
+        if self.master_fd is None:
+            return None
         chunks: list[bytes] = []
         total = 0
-        # Bound per-iteration output so the (pure-Python) pyte parse stays small
-        # and the loop keeps draining the PTY promptly; leftover output is read
-        # on the next iteration.
         while total < 262_144:
             try:
-                data = os.read(self.master_fd, 65536)
+                if self._handle is not None:
+                    data = self._handle.read_master(65536)
+                else:
+                    data = os.read(self.master_fd, 65536)
             except OSError:
                 break
             if not data:
                 break
             chunks.append(data)
             total += len(data)
-            readable, _, _ = select.select([self.master_fd], [], [], 0)
+            try:
+                readable, _, _ = select.select([self.master_fd], [], [], 0)
+            except OSError:
+                break  # Windows: pipe fds aren't selectable; stop after first read
             if self.master_fd not in readable:
                 break
         if not chunks:
@@ -158,74 +171,91 @@ class BackendProcess:
     # ------------------------------------------------------------------
 
     def write(self, data: bytes) -> None:
-        """Write *data* to the child's PTY master fd.
+        """Write *data* to the child's PTY.
 
-        ``OSError`` propagates: call sites have different error semantics (some
-        abort the surrounding operation, some let it unwind the loop), so the
-        policy of swallowing or handling belongs to the caller, exactly as it
-        did when they called ``os.write`` directly.
+        On POSIX writes to the master fd directly (``os.write``).  On Windows
+        writes through the pywinpty handle so data flows into the child's ConPTY
+        stdin — writing to the socket bridge would have no effect.
+
+        ``OSError`` propagates; call sites handle it as appropriate.
         """
         if self.master_fd is None:
             return
         with self._write_lock:
-            os.write(self.master_fd, data)
+            if self._handle is not None and sys.platform == "win32":
+                self._handle.write(data)
+            else:
+                os.write(self.master_fd, data)
 
     # ------------------------------------------------------------------
     # Resize (PTY ioctl only)
     # ------------------------------------------------------------------
 
     def resize(self, rows: int, cols: int) -> None:
-        """Send ``TIOCSWINSZ`` to the child's PTY master fd.
+        """Resize the child PTY.
 
-        The caller is responsible for updating its own screen model; this method
-        only performs the kernel ioctl. ``OSError`` propagates so the caller can
-        skip follow-up work (e.g. a repaint) when the ioctl failed, matching the
-        original inline behavior.
+        On POSIX sends ``TIOCSWINSZ`` via ``fcntl.ioctl``.  On Windows calls
+        the pywinpty ``setwinsize`` method.  ``OSError`` propagates so the
+        caller can skip follow-up work (e.g. a repaint) when the operation
+        failed.
         """
         if self.master_fd is None:
             return
-        import fcntl
-        import struct
-        import termios
+        if self._handle is not None:
+            self._handle.resize(rows, cols)
+        elif sys.platform != "win32":
+            import fcntl
+            import struct
+            import termios
 
-        winsize = struct.pack("HHHH", rows, cols, 0, 0)
-        fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, winsize)
+            winsize = struct.pack("HHHH", rows, cols, 0, 0)
+            fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, winsize)
 
     # ------------------------------------------------------------------
     # Teardown
     # ------------------------------------------------------------------
 
     def terminate(self) -> None:
-        """Send SIGINT to the child and close the master fd.
+        """Send interrupt to the child and close the master fd.
 
         Callers that need to wait for the child to exit should pass the pid to
-        ``_note_pid_for_reaping`` / ``_reap_stopped_children`` on the runner
-        (those are host-level, not session-level, so they live on the runner).
-        This method fires the signal, closes the fd, and nulls the local
+        ``_note_pid_for_reaping`` / ``_reap_stopped_children`` on the runner.
+        This method fires the interrupt, closes the fd, and nulls the local
         references; the runner clears its own ``child_pid`` / ``master_fd``
         after calling this.
         """
-        if self.child_pid:
+        if self._handle is not None:
+            self._handle.send_interrupt()
+            self._handle.close_master()
+        elif self.child_pid:
             try:
                 os.kill(self.child_pid, signal.SIGINT)
             except ProcessLookupError:
                 pass
-        if self.master_fd is not None:
-            try:
-                os.close(self.master_fd)
-            except OSError:
-                pass
-            self.master_fd = None
+            if self.master_fd is not None:
+                try:
+                    os.close(self.master_fd)
+                except OSError:
+                    pass
+        self.master_fd = None
         self.child_pid = None
 
     def cleanup(self) -> None:
-        """SIGINT -> wait up to 1 s -> SIGTERM the child process.
+        """Interrupt → wait up to 1 s → terminate the child process.
 
         This is the graceful shutdown used by ``_cleanup_child`` on exit/signal.
-        Does nothing if no child is running.  The waitpid reaping logic (issue
-        #21) is preserved verbatim.
+        Does nothing if no child is running.
         """
+        if self._handle is not None:
+            self._handle.terminate_graceful()
+            return
         if not self.child_pid:
+            return
+        if sys.platform == "win32":
+            try:
+                os.kill(self.child_pid, signal.SIGTERM)
+            except (ProcessLookupError, OSError):
+                pass
             return
         try:
             done, _status = os.waitpid(self.child_pid, os.WNOHANG)
@@ -239,17 +269,16 @@ class BackendProcess:
                     return
                 time.sleep(0.05)
             os.kill(self.child_pid, signal.SIGTERM)
-        except ChildProcessError:
-            return
-        except ProcessLookupError:
+        except (ChildProcessError, ProcessLookupError):
             return
 
     def teardown(self) -> None:
-        """``cleanup()`` then close the master fd and null out both fields.
-
-        Equivalent to the old ``_teardown_child``: suitable for callers that
-        want to reuse the runner for a fresh spawn afterwards.
-        """
+        """``cleanup()`` then close the master fd and null out both fields."""
+        if self._handle is not None:
+            self._handle.teardown()
+            self.master_fd = None
+            self.child_pid = None
+            return
         self.cleanup()
         if self.master_fd is not None:
             try:
@@ -260,11 +289,14 @@ class BackendProcess:
         self.child_pid = None
 
     def signal_exit(self) -> None:
-        """Send SIGINT to the child without waiting (used by ``_exit_child``).
+        """Send interrupt to the child without waiting (used by ``_exit_child``).
 
         Does not close the master fd -- the caller handles that in the ``run``
         ``finally`` block so it always runs even if the child is already gone.
         """
+        if self._handle is not None:
+            self._handle.send_interrupt()
+            return
         if self.child_pid:
             try:
                 os.kill(self.child_pid, signal.SIGINT)

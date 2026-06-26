@@ -9,10 +9,17 @@ only when the user confirms "save" on close. Esc goes up one level at every step
 from __future__ import annotations
 
 import json
+import sys
+
+import pytest
 
 from agitrack.config.settings import GlobalConfig
 
 from proxy_helpers import make_runner
+
+# Tests that use POSIX-style paths ("/x:/y" with ":" separator) are skipped
+# on Windows where os.pathsep is ";" and drive letters also contain ":".
+posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX path separator only")
 
 
 def _config(tmp_path):
@@ -86,6 +93,7 @@ def test_save_repo_preserves_other_keys(tmp_path):
     assert data == {"summarization_enabled": False, "trace_turn_limit": 9, "sandbox": False}
 
 
+@posix_only
 def test_allowed_edit_paths_parsing(tmp_path):
     gc = _config(tmp_path)
     gc.set("allowed_edit_paths", ["/a", "/b"], scope="repo")
@@ -226,6 +234,7 @@ def test_settings_menu_esc_in_scope_returns_to_value(tmp_path):
     assert runner.global_config.source("default_backend") == "default"  # never saved
 
 
+@posix_only
 def test_settings_menu_edits_allowed_paths(tmp_path):
     runner = _settings_runner(tmp_path)
     _drive(

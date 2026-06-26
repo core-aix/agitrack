@@ -7,6 +7,10 @@ import pytest
 
 from agitrack.proxy import sandbox
 
+_posix_only = pytest.mark.skipif(
+    sys.platform == "win32", reason="sandbox-exec is macOS-only; select.select on pipes is POSIX-only"
+)
+
 
 def test_wrap_command_disabled_via_env(monkeypatch):
     monkeypatch.setenv("AGITRACK_SANDBOX", "0")
@@ -33,6 +37,7 @@ def test_wrap_command_noop_when_no_mechanism(monkeypatch, tmp_path):
     assert sandbox.wrap_command(command, base=str(base), worktree=str(wt)) is command
 
 
+@_posix_only
 def test_wrap_command_wraps_with_sandbox_exec(monkeypatch, tmp_path):
     monkeypatch.delenv("AGITRACK_SANDBOX", raising=False)
     monkeypatch.setattr(sandbox, "_have_sandbox_exec", lambda: True)
@@ -62,6 +67,7 @@ def test_wrap_command_wraps_with_bwrap(monkeypatch, tmp_path):
     assert wrapped[wrapped.index("--") + 1 :] == ["claude", "-r", "x"]
 
 
+@_posix_only
 def test_build_profile_denies_siblings_allows_this_worktree(tmp_path):
     base = tmp_path / "repo"
     root = base / ".agitrack" / "worktrees"
@@ -169,6 +175,9 @@ def test_agent_writable_dirs_covers_known_roots(monkeypatch, tmp_path):
     home = tmp_path / "home"
     (home / ".claude").mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))
+    # Windows uses USERPROFILE (not HOME) for Path.home() / os.path.expanduser("~").
+    if sys.platform == "win32":
+        monkeypatch.setenv("USERPROFILE", str(home))
     for var in ("XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(sandbox.shutil, "which", lambda _name: None)
@@ -203,6 +212,7 @@ def test_agent_writable_dirs_follows_resolved_executable(monkeypatch, tmp_path):
     assert str(install.parent.resolve()) in dirs  # the dir the launcher resolves into
 
 
+@_posix_only
 def test_build_profile_allows_agent_update_dir_under_repo(monkeypatch, tmp_path):
     # An agent installed *under* the base repo must still be writable for updates:
     # its allow rule has to come after the base deny so it wins.
@@ -219,6 +229,7 @@ def test_build_profile_allows_agent_update_dir_under_repo(monkeypatch, tmp_path)
     assert allow_agent > deny_base  # later rule wins -> updates allowed
 
 
+@_posix_only
 def test_build_profile_allows_user_allowed_paths(tmp_path):
     # A user-specified allowed path is re-allowed for writes after the base deny, even
     # if it doesn't exist yet (subpath rules cover not-yet-created files).
