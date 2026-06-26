@@ -26,7 +26,6 @@ _last_error = ctypes.get_last_error  # type: ignore[attr-defined]
 _STILL_ACTIVE = 259
 _EXTENDED_STARTUPINFO_PRESENT = 0x00080000
 _CREATE_UNICODE_ENVIRONMENT = 0x00000400
-_CREATE_NO_WINDOW = 0x08000000
 _PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = 0x00020016
 
 
@@ -168,10 +167,7 @@ class ConPTY:
         si.StartupInfo.cb = sizeof(_STARTUPINFOEXW)
         si.lpAttributeList = attr_list
         pi = _PROCESS_INFORMATION()
-        # CREATE_NO_WINDOW keeps the child headless: without it, on Windows 11 with Windows
-        # Terminal as the default terminal, the frozen build hands the ConPTY child off to a
-        # NEW Windows Terminal window instead of staying in aGiTrack's pseudoconsole.
-        flags = _EXTENDED_STARTUPINFO_PRESENT | _CREATE_NO_WINDOW
+        flags = _EXTENDED_STARTUPINFO_PRESENT
         env_buf = None
         if env:
             env_buf = ctypes.create_unicode_buffer(env)
