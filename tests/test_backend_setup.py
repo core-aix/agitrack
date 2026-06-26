@@ -31,8 +31,9 @@ def test_available_backends_is_alphabetical():
     assert available_backends() == ["claude", "opencode"]
 
 
-def test_backend_installed_uses_path_lookup(monkeypatch):
-    monkeypatch.setattr(bs.shutil, "which", lambda exe: "/usr/bin/" + exe if exe == "claude" else None)
+def test_backend_installed_uses_executable_lookup(monkeypatch):
+    # backend_installed resolves through which_executable (Windows-aware), not raw shutil.which.
+    monkeypatch.setattr(bs, "which_executable", lambda exe: "/usr/bin/" + exe if exe == "claude" else None)
     assert bs.backend_installed("claude") is True
     assert bs.backend_installed("opencode") is False
 

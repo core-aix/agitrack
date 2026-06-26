@@ -25,6 +25,31 @@ _IS_WINDOWS = os.name == "nt"
 _STILL_ACTIVE = 259
 
 
+def which_executable(name: str) -> str | None:
+    """Like :func:`shutil.which`, but on Windows only returns a path the OS can actually
+    execute — a ``.exe``/``.cmd``/``.bat``/``.com`` — never a bare extensionless file or a
+    ``.ps1``.
+
+    ``shutil.which`` on Windows treats EVERY existing file as executable (there is no
+    ``X_OK`` bit), so for a half-installed npm package that left only the extensionless Unix
+    shell script and a PowerShell ``.ps1`` shim — e.g. a ``claude`` with ``claude.ps1`` but
+    no ``claude.cmd`` — it returns the non-runnable shell script. aGiTrack would then think
+    the backend is installed, skip offering to install it, and fail to launch it through
+    ConPTY/``CreateProcess`` (which can't run a shell script or a ``.ps1``), surfacing as
+    "backend exited repeatedly on launch". Restricting to real Windows-executable shims makes
+    detection match what can actually be launched.
+    """
+    if not _IS_WINDOWS:
+        return shutil.which(name)
+    if os.path.splitext(name)[1]:
+        return shutil.which(name)  # an explicit extension was given — trust it
+    for ext in (".exe", ".cmd", ".bat", ".com"):
+        found = shutil.which(name + ext)
+        if found:
+            return found
+    return None
+
+
 def resolve_subprocess_command(command: list[str]) -> list[str]:
     """Resolve *command* for ``subprocess`` on the current OS.
 
@@ -41,7 +66,7 @@ def resolve_subprocess_command(command: list[str]) -> list[str]:
     """
     if not _IS_WINDOWS or not command:
         return command
-    exe = shutil.which(command[0]) or command[0]
+    exe = which_executable(command[0]) or command[0]
     if exe.lower().endswith((".cmd", ".bat")):
         return [os.environ.get("COMSPEC", "cmd.exe"), "/c", exe, *command[1:]]
     return [exe, *command[1:]]

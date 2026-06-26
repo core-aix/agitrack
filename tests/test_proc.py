@@ -94,3 +94,34 @@ def test_resolve_subprocess_command_windows_unresolved_falls_back(monkeypatch):
     monkeypatch.setattr(proc, "_IS_WINDOWS", True)
     monkeypatch.setattr(proc.shutil, "which", lambda name: None)
     assert proc.resolve_subprocess_command(["claude", "-p", "x"]) == ["claude", "-p", "x"]
+
+
+# --- which_executable: Windows-correct executable lookup (#half-installed npm shims) -------
+
+
+def test_which_executable_posix_is_plain_which(monkeypatch):
+    monkeypatch.setattr(proc, "_IS_WINDOWS", False)
+    monkeypatch.setattr(proc.shutil, "which", lambda name: "/usr/bin/" + name)
+    assert proc.which_executable("claude") == "/usr/bin/claude"
+
+
+def test_which_executable_windows_finds_cmd_shim(monkeypatch):
+    monkeypatch.setattr(proc, "_IS_WINDOWS", True)
+    # Only claude.cmd exists (the proper npm shim); .exe does not.
+    monkeypatch.setattr(proc.shutil, "which", lambda name: r"C:\npm\claude.cmd" if name == "claude.cmd" else None)
+    assert proc.which_executable("claude") == r"C:\npm\claude.cmd"
+
+
+def test_which_executable_windows_rejects_extensionless_and_ps1(monkeypatch):
+    monkeypatch.setattr(proc, "_IS_WINDOWS", True)
+    # A half-installed npm package: bare 'claude' (shell script) and claude.ps1 exist, but
+    # no .exe/.cmd/.bat — raw shutil.which would return the bare file, which_executable must not.
+    present = {"claude": r"C:\npm\claude", "claude.ps1": r"C:\npm\claude.ps1"}
+    monkeypatch.setattr(proc.shutil, "which", lambda name: present.get(name))
+    assert proc.which_executable("claude") is None
+
+
+def test_which_executable_windows_honours_explicit_extension(monkeypatch):
+    monkeypatch.setattr(proc, "_IS_WINDOWS", True)
+    monkeypatch.setattr(proc.shutil, "which", lambda name: r"C:\bin\opencode.exe" if name == "opencode.exe" else None)
+    assert proc.which_executable("opencode.exe") == r"C:\bin\opencode.exe"

@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import os
 import select
-import shutil
 import socket
 import subprocess
 import sys
@@ -195,14 +194,19 @@ def _resolve_windows_command(command: list[str]) -> tuple[str, list[str]]:
     name and cannot run a batch script directly — but Windows backends are routinely on
     PATH only via an extension (``claude.cmd`` from npm, ``opencode.exe``), so:
 
-    * resolve the executable against PATH/PATHEXT with ``shutil.which`` (full path), and
+    * resolve the executable against PATH/PATHEXT with ``which_executable`` — which (unlike
+      ``shutil.which``) returns only a real runnable ``.exe``/``.cmd``/``.bat``, not the bare
+      extensionless shell script or ``.ps1`` a half-installed npm package may leave (those
+      can't be launched and would exit instantly), and
     * for a ``.cmd``/``.bat`` (Claude's npm shim), run it through ``cmd.exe /c`` — the only
       way ``CreateProcess`` will execute a batch file.
 
     This is what makes BOTH the ``claude`` and ``opencode`` backends launchable on native
     Windows regardless of how their CLI was installed.
     """
-    exe = shutil.which(command[0]) or command[0]
+    from agitrack.proc import which_executable
+
+    exe = which_executable(command[0]) or command[0]
     rest = command[1:]
     if exe.lower().endswith((".cmd", ".bat")):
         comspec = os.environ.get("COMSPEC", "cmd.exe")

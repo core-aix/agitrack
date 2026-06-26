@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Callable
 
 from agitrack.backends.proxy_agents import available_backends, make_proxy_agent
-from agitrack.proc import resolve_subprocess_command
+from agitrack.proc import resolve_subprocess_command, which_executable
 
 # Per-backend facts used to build a single install hint that covers macOS, Linux, AND
 # Windows — so whatever OS a user is on, they see a command that works. ``unix`` is the
@@ -38,7 +38,10 @@ def _executable(name: str) -> str:
 
 
 def backend_installed(name: str) -> bool:
-    return shutil.which(_executable(name)) is not None
+    # which_executable (not shutil.which) so a Windows backend is "installed" only when a
+    # real runnable shim (.exe/.cmd/.bat) exists — not a half-installed npm package that left
+    # only an extensionless shell script or a .ps1, which aGiTrack can't actually launch.
+    return which_executable(_executable(name)) is not None
 
 
 def install_hint(name: str) -> str:
