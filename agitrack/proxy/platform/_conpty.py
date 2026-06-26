@@ -208,7 +208,11 @@ class ConPTY:
         pipe, so don't declare EOF the instant the process dies — keep draining for a short
         grace window first (a fast child like ``cmd /c echo …& exit`` can finish before any
         byte has been rendered)."""
-        buf = (ctypes.c_byte * 65536)()
+        # c_ubyte (unsigned), NOT c_byte: indexing a signed c_byte array yields ints in
+        # -128..127, so bytes(buf[:n]) raises "bytes must be in range(0, 256)" the moment the
+        # child emits any byte >= 128 (its UTF-8 TUI: box-drawing, banners). That exception
+        # would surface as a spurious reader EOF and tear the backend down on launch.
+        buf = (ctypes.c_ubyte * 65536)()
         avail, read = wintypes.DWORD(0), wintypes.DWORD(0)
         grace = 0
         while not self._closed:
