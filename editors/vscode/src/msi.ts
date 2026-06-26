@@ -1,6 +1,6 @@
 /** Locating and installing aGiTrack from the standalone Windows MSI.
  *
- * The MSI (built by `.github/workflows/release.yml`, attached to every GitHub release) is a
+ * The MSI (built and attached to every GitHub release by the release workflows) is a
  * complete, self-contained install: a PyInstaller bundle, so the target needs no
  * Python/pip at all. The extension falls back to it on Windows when neither pipx nor pip is
  * available (some machines have no Python), and uses it to discover an MSI a user installed

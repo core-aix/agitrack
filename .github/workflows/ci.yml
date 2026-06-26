@@ -94,12 +94,13 @@ jobs:
 
   # The Windows MSI is a first-class, standalone install method — a user can download it
   # from the GitHub release and install aGiTrack without pip/pipx/Python (the VSCode
-  # extension also falls back to it when no Python tooling is present). release.yml only
-  # builds the MSI on a version tag, so it could silently rot between releases; this job
-  # builds it on every PR AND proves it installs by itself: a silent perMachine `msiexec`
-  # install (the runner has an admin token), then run the installed agitrack.exe, then a
-  # clean silent uninstall. If the WiX source, the PyInstaller spec, or a new runtime
-  # import breaks the bundle, this fails here rather than at release time.
+  # extension also falls back to it when no Python tooling is present). The release
+  # workflows only build the MSI at release time, so it could silently rot between
+  # releases; this job builds it on every PR AND proves it installs by itself: a silent
+  # perMachine `msiexec` install (the runner has an admin token), assert the installed
+  # agitrack.exe reports the real version, then a clean silent uninstall. If the WiX
+  # source, the PyInstaller spec, or a new runtime import breaks the bundle, this fails
+  # here rather than at release time.
   build-msi:
     name: Build + install Windows MSI
     runs-on: windows-latest
@@ -170,7 +171,11 @@ jobs:
         run: |
           $exe = Join-Path $env:ProgramFiles "aGiTrack\agitrack.exe"
           if (-not (Test-Path $exe)) { throw "installed exe not found at $exe" }
-          & $exe --version
+          # The frozen build must report the real version, not the 0.0.0 fallback — i.e.
+          # copy_metadata("agitrack") in the spec actually bundled the dist-info.
+          $reported = (& $exe --version).Trim()
+          $expected = "${{ steps.version.outputs.VERSION }}"
+          if ($reported -ne $expected) { throw "installed exe reported '$reported', expected '$expected'" }
 
       - name: Uninstall the MSI silently
         shell: pwsh

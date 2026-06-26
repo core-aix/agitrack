@@ -235,5 +235,6 @@ msiexec is purely an optimisation to avoid a UAC dialog for a no-op.
   plugs into.
 - `agitrack/update/updater.py` — the updater the `METHOD_MSI`
   branch is added to.
-- `.github/workflows/release.yml` — the CI that already attaches
-  the MSI to the GitHub release; no change needed there.
+- `.github/workflows/release-patch.yml` / `release-tag.yml` — the
+  `build-msi` jobs that build and attach `agitrack-<version>-windows-x64.msi`
+  to each GitHub release; no change needed there.
