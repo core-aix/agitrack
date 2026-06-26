@@ -6454,6 +6454,12 @@ class ProxyRunner:
         data = self._input_tail + data
         data, self._input_tail = self._hold_incomplete_tail(data)
         data = self._intercept_scroll(data)
+        if os.name == "nt":
+            # ConPTY can't deliver focus in/out (?1004) events to the backend either — they'd
+            # render as a literal `[I`/`[O` in its prompt: a phantom char that makes a blank
+            # line submit on Enter and prepends junk to typed input. aGiTrack still uses focus
+            # for its own idle wake, but never forwards it to the backend on Windows.
+            data = _FOCUS_EVENT_RE.sub(b"", data)
         self._debug(f"after intercept: {data!r}")
         # Decode kitty keyboard protocol control keys back to plain bytes.
         # When the terminal is in kitty mode (enabled by the backend), Ctrl-A
@@ -6742,9 +6748,13 @@ class ProxyRunner:
                 os.write(sys.stdout.fileno(), b"\x1b[?" + mode + b"l")
         # Track whether the backend drives the mouse itself. If it does, wheel
         # events are forwarded to it; if not, aGiTrack uses the wheel for scrollback.
+        # On Windows the ConPTY input path can't deliver mouse events to the backend — they
+        # arrive as literal `[<…M` text in its prompt — so aGiTrack keeps mouse ownership
+        # itself there regardless of what the backend requests (wheel scrolls history; mouse
+        # events are stripped from the input in _intercept_scroll, never forwarded).
         for mode in (b"1000", b"1002", b"1003"):
             if b"\x1b[?" + mode + b"h" in output:
-                self.child_mouse = True
+                self.child_mouse = os.name != "nt"
             if b"\x1b[?" + mode + b"l" in output:
                 self.child_mouse = False
         # Mirror keyboard-protocol negotiation (kitty protocol, modifyOtherKeys)
