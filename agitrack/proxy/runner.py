@@ -699,6 +699,7 @@ class ProxyRunner:
         # _pending_merge_prompt is per-session (a Session field) — see Session.FIELDS.
         self._integration_paused = False  # reserved; integration is no longer globally paused
         self._base_drift_check_at = 0.0
+        self._agent_branch_check_at = 0.0  # throttles the poll of the worktree's own checked-out branch
         self.turn = 0  # per-session transient-branch counter
         self.merge_ctx: MergeContext | None = None  # in-progress agent merge resolution
         self._pending_enter_at: float | None = None  # deferred submit of an injected prompt
@@ -1568,6 +1569,37 @@ class ProxyRunner:
             f"follows the directory's current branch and can't merge into a different one.",
             seconds=12.0,
         )
+        self._render()
+
+    def _follow_agent_worktree_branch(self) -> None:
+        # The backend agent can switch the branch checked out IN ITS OWN WORKTREE with a plain
+        # `git checkout`/`git switch` — the worktree directory does not move, only HEAD. aGiTrack
+        # otherwise only ever leaves a worktree detached at base (between turns) or on a managed
+        # `agit/<backend>/<name>/tN` turn branch, so the worktree sitting on a NON-managed, named
+        # branch can only mean the agent moved it. Follow it: point the session's tracked branch
+        # (status bar + integration accounting) at it so cover commits keep landing there as
+        # normal — the existing `is_managed_branch` gates already skip auto-integrating a branch
+        # the agent owns — and tell the user once. (No-worktree mode is handled separately by
+        # `_check_no_worktree_branch_change`; there's no second branch to follow without a worktree.)
+        if self.worktree is None or self._base_branch is None:
+            return
+        now = time.monotonic()
+        if now - self._agent_branch_check_at < self.BASE_DRIFT_CHECK_SECONDS:
+            return
+        self._agent_branch_check_at = now
+        try:
+            current = self.repo.current_branch()  # the branch checked out in THIS session's worktree
+        except Exception:
+            return
+        # "HEAD" = detached (aGiTrack's between-turns state), a managed turn branch = aGiTrack's
+        # own doing, and a branch already equal to the tracked one = nothing new. None of those is
+        # an agent-driven switch.
+        if not current or current == "HEAD" or is_managed_branch(current) or current == self._base_branch:
+            return
+        self._base_branch = current
+        self._repo_dir_branch = current  # keep the status bar's branch fresh
+        self._integration.base_branch = current
+        self._set_message(f"Working branch switched to '{current}' by the backend agent.", seconds=10.0)
         self._render()
 
     def _session_work_merged_into_base(self) -> bool:
@@ -6565,6 +6597,7 @@ class ProxyRunner:
         if self._pipeline_lock.acquire(blocking=False):
             try:
                 self._ensure_worktree_alive()  # recovers a vanished worktree (PTY/watcher work)
+                self._follow_agent_worktree_branch()  # follow an agent `git checkout` in the worktree
                 self._check_base_branch_drift()  # may surface a dir-change session swap
                 self._service_commit_summaries()  # apply finished background summaries (#8)
                 self._service_precompact_summary()

@@ -97,22 +97,29 @@ tracks/shows and (b) let the commit pipeline run on the new branch.
   branch (`agitrack/<name>/tN`, created by `_ensure_turn_branch` at ~2974, detached at base between
   turns). The moment the agent moves the worktree to `main`/`feature`, aGiTrack stops processing.
 
-**Plan:**
-1. Detect the agent's switch: poll `self.repo.current_branch()` (cheap `.git/HEAD` mtime gate, like
-   the existing checks) and notice when the worktree is on a branch aGiTrack didn't put it on — i.e.
-   NOT detached-at-base and NOT a managed `agitrack/<name>/tN` branch, and it changed. Distinguish
-   aGiTrack's own changes (set a flag around `_ensure_turn_branch`/detach/integrate) from the agent's.
-2. Follow: update `_base_branch` / `_repo_dir_branch` / `_integration.base_branch` and the status-bar
-   branch; `self._set_message("Working branch switched to '<X>' by the backend agent.")` + `_render()`.
-3. Make commits work on the followed branch: relax the `is_managed_branch` gate so the agent-chosen
-   branch is treated as the working branch — cover commits land on it, and the integration target
-   becomes that branch (or its merge base). Verify `_maybe_agent_commit` (~9322) →
-   `_finish_agent_parse_if_ready` → the `<aGiTrack>` cover-commit path runs on it.
-4. Test the real flow in the VM (worktree AND `--no-worktree`): give the backend a prompt that does
-   `git checkout -b feature` (or checks out an existing branch), confirm the popup fires once, the
-   status bar updates, and an `<aGiTrack>` cover commit lands on `feature`. (no-worktree already
-   "follows" via `_check_no_worktree_branch_change`, but verify cover commits aren't blocked by
-   `is_managed_branch` there either.)
+**Status: core implemented + unit-tested (host).** `_follow_agent_worktree_branch()` (runner.py,
+called in the timers phase next to `_check_base_branch_drift`) polls `self.repo.current_branch()`
+(throttled by `_agent_branch_check_at`); the agent's in-place switch is uniquely identified by the
+worktree being on a NON-managed, named branch (`current != "HEAD"`, `not is_managed_branch(current)`,
+`current != self._base_branch`) — because aGiTrack only ever leaves a worktree detached-at-base or on
+a managed `agit*/...` turn branch. On detection it sets `_base_branch`/`_repo_dir_branch`/
+`_integration.base_branch` to the new branch (status bar + integration follow), pops "Working branch
+switched to '<X>' by the backend agent.", and the existing `is_managed_branch` gates then correctly
+*skip* auto-integrating a branch the agent owns. The turn cover-commit path
+(`_finish_agent_parse_if_ready` → `CommitEngine.finish_parse_if_ready`) does NOT gate on the branch,
+so cover commits land on the followed branch. Tests: `test_follows_agent_worktree_branch_switch`,
+`test_does_not_follow_managed_turn_branch_or_detached_head`,
+`test_no_worktree_session_does_not_poll_worktree_branch` in `tests/test_proxy.py`.
+
+**Remaining (verify/refine in the VM with a real backend):**
+1. End-to-end: prompt the backend to run `git checkout -b feature` (in-place), confirm the popup fires
+   once, the status bar shows `feature`, and a `<aGiTrack>` cover commit for the turn lands on
+   `feature`. Test BOTH backends, worktree mode.
+2. Covering the agent's OWN git commits on the followed branch: `_uncovered_backend_commits()`
+   (runner.py:8026) returns `[]` for a non-managed branch, and after the follow `_base_branch ==
+   branch` so `log_shas(base, branch)` is empty anyway — so an aGiTrack metadata commit won't *cover*
+   commits the agent made itself on `feature`. If that matters, record the HEAD where the follow
+   happened as the cover baseline and walk from there instead of `_base_branch`.
 
 ## Verification constraints to remember
 - Keep `./scripts/check.sh` green (1668 tests) — POSIX path must be untouched; Windows-only code is

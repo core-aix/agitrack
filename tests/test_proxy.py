@@ -5562,6 +5562,59 @@ def _merge_drift_runner(dir_branch, *, session_target="dev", choice, sessions=No
     return runner
 
 
+# --- agent switches the worktree's OWN branch (in-place git checkout) ---
+
+
+def _agent_branch_runner(worktree_branch, *, base="master"):
+    import types
+
+    runner = make_runner(
+        worktree=types.SimpleNamespace(),
+        _base_branch=base,
+        repo=types.SimpleNamespace(current_branch=lambda: worktree_branch),
+        name="s1",
+    )
+    runner._integration = types.SimpleNamespace(base_branch=base)
+    runner._agent_branch_check_at = 0.0
+    runner.messages = []
+    runner._set_message = lambda m, **k: runner.messages.append(m)
+    runner._render = lambda: None
+    return runner
+
+
+def test_follows_agent_worktree_branch_switch():
+    runner = _agent_branch_runner("feature")
+    runner._follow_agent_worktree_branch()
+    assert runner._base_branch == "feature"
+    assert runner._repo_dir_branch == "feature"  # status bar follows
+    assert runner._integration.base_branch == "feature"
+    assert any("Working branch switched to 'feature' by the backend agent" in m for m in runner.messages)
+    # Already on 'feature' → no re-notification, no churn.
+    runner.messages.clear()
+    runner._agent_branch_check_at = 0.0
+    runner._follow_agent_worktree_branch()
+    assert runner.messages == [] and runner._base_branch == "feature"
+
+
+def test_does_not_follow_managed_turn_branch_or_detached_head():
+    # aGiTrack's own worktree states — a managed turn branch, or detached at base between turns —
+    # are NOT the agent switching the branch, so the follow must never fire for them.
+    for branch in ("agitrack/claude/s1/t1", "HEAD"):
+        runner = _agent_branch_runner(branch)
+        runner._follow_agent_worktree_branch()
+        assert runner._base_branch == "master", branch
+        assert runner.messages == []
+
+
+def test_no_worktree_session_does_not_poll_worktree_branch():
+    # No-worktree mode is followed by _check_no_worktree_branch_change; there is no separate
+    # worktree branch to track here, so this poll is a no-op.
+    runner = _agent_branch_runner("feature")
+    runner.worktree = None
+    runner._follow_agent_worktree_branch()
+    assert runner._base_branch == "master" and runner.messages == []
+
+
 def test_repo_dir_change_keeps_all_sessions_on_their_branches_by_default():
     # The default (first) option does nothing — background sessions keep merging into
     # their own branches after the directory's branch changes.
