@@ -132,6 +132,13 @@ class RawConsole:
         )
         in_mode |= ENABLE_EXTENDED_FLAGS | ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_WINDOW_INPUT
         _set_mode(self._in, in_mode)
+        # Discard anything already sitting in the console input buffer before the stdin
+        # bridge starts forwarding it to the backend — the POSIX path does the same with
+        # termios.tcflush. Without this, a keystroke left over from the cooked-mode startup
+        # prompts (notably a stray Ctrl-C, which raw mode delivers as a 0x03 byte) would be
+        # forwarded straight into the freshly-spawned backend and kill it on launch
+        # (Windows STATUS_CONTROL_C_EXIT, 0xC000013A).
+        _kernel32.FlushConsoleInputBuffer(self._in)
         out_mode = (
             self._saved_out | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN
         )

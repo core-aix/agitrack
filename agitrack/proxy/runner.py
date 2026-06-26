@@ -6018,12 +6018,31 @@ class ProxyRunner:
             with path.open("w", encoding="utf-8") as handle:
                 handle.write(f"backend: {backend}\n")
                 handle.write(f"command: {command}\n")
+                handle.write(f"resolved: {self._resolved_launch(command)}\n")
                 handle.write(f"exit_code: {exit_code}\n")
                 handle.write("--- raw output (utf-8, replace) ---\n")
                 handle.write(raw.decode(errors="replace"))
             return path
         except Exception:  # diagnostics must never crash the exit path
             return None
+
+    def _resolved_launch(self, command: list[str]):
+        # What the platform layer actually launches for `command` — on Windows this exposes
+        # the cmd.exe /c <shim> wrapping (or, tellingly, that the bare name was used because no
+        # runnable shim was found). The single most useful line when a backend dies on startup.
+        if not command:
+            return command
+        try:
+            if sys.platform == "win32":
+                from agitrack.proxy.platform.nt import _resolve_windows_command
+
+                appname, args = _resolve_windows_command(command)
+                return [appname, *args]
+            from agitrack.proc import which_executable
+
+            return [which_executable(command[0]) or command[0], *command[1:]]
+        except Exception:
+            return command
 
     def _finalize_on_backend_exit(self) -> None:
         # The only session's backend process is gone and we are NOT relaunching
