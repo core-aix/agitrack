@@ -64,6 +64,60 @@ def _gh_install_hint() -> str:
     )
 
 
+def _maybe_install_tool(name: str, *, required: bool) -> bool:
+    """Offer to auto-install a missing prerequisite (``git`` or ``gh``); return True once it
+    is available. Only prompts on an interactive TTY where a supported package manager
+    exists — otherwise returns False so the caller falls back to printing the manual hint."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return False
+    from agitrack.system_tools import can_install_tool, install_system_tool
+
+    if not can_install_tool(name):
+        return False
+    label = "git" if name == "git" else "the GitHub CLI (gh)"
+    note = "" if required else " (optional)"
+    try:
+        answer = input(f"\n{label} isn't installed. Install it now{note}? [Y/n]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    if answer in {"n", "no"}:
+        return False
+    return install_system_tool(name)
+
+
+def _git_config_global(config_args: list[str]) -> str:
+    """Run ``git config --global`` and return its stdout (empty on any failure)."""
+    try:
+        result = subprocess.run(
+            ["git", "config", "--global", *config_args], text=True, capture_output=True, check=False
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return result.stdout.strip()
+
+
+def _ensure_git_identity() -> None:
+    """git refuses to commit without ``user.name`` and ``user.email`` ("Author identity
+    unknown"), and aGiTrack commits every turn — so on a fresh machine, prompt for whichever
+    is missing and set it globally. Interactive callers only; non-TTY callers should not
+    reach here (they get no prompt and a polluted machine-readable stream is avoided)."""
+    name = _git_config_global(["--get", "user.name"])
+    email = _git_config_global(["--get", "user.email"])
+    if name and email:
+        return
+    print("\ngit needs a name and email to record commits (aGiTrack commits your work each turn).")
+    if not name:
+        entered = input("  Name for git commits: ").strip()
+        if entered:
+            _git_config_global(["user.name", entered])
+    if not email:
+        entered = input("  Email for git commits: ").strip()
+        if entered:
+            _git_config_global(["user.email", entered])
+    if not (_git_config_global(["--get", "user.name"]) and _git_config_global(["--get", "user.email"])):
+        print("git identity is still incomplete; aGiTrack's commits may fail until name and email are set.")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Interactive agent + git commit orchestration.",
@@ -256,7 +310,7 @@ def main(argv: list[str] | None = None) -> int:
     # Check once, up front, so a missing git gives a clear, actionable message instead of a
     # raw FileNotFoundError deep in repo discovery — common right after the VS Code extension
     # installs the CLI but git isn't on PATH. --version/--help above don't need git.
-    if shutil.which("git") is None:
+    if shutil.which("git") is None and not _maybe_install_tool("git", required=True):
         print(_git_install_hint())
         return 1
 
@@ -365,6 +419,13 @@ def main(argv: list[str] | None = None) -> int:
     # however aGiTrack was started (terminal or VSCode), then replaced by the TUI frame.
     if args.mode == "proxy":
         print("aGiTrack is starting...", flush=True)
+
+    # Make sure git can actually commit: without a global user.name/user.email every commit
+    # fails with "Author identity unknown", and aGiTrack commits each turn. Prompt for any
+    # missing value on an interactive launch (skipped for scripted/json so machine-readable
+    # output stays clean; those users are expected to have git configured already).
+    if args.mode == "proxy" and sys.stdin.isatty() and sys.stdout.isatty():
+        _ensure_git_identity()
 
     # Offer a self-update before launching anything. Skipped for scripted/non-TTY
     # runs (no way to answer) and when the user turned update checks off. If the
@@ -763,6 +824,13 @@ def _check_gh_availability(repo: GitRepo, *, scripted: bool = False) -> tuple[bo
         return (True, False)  # installed and authenticated — nothing to do
     if not commit_url_base(repo):
         return (True, False)  # no GitHub remote — gh isn't needed here yet
+    if status == "missing":
+        # Offer to install gh automatically; if it lands, it still needs a login, so fall
+        # through to the unauthenticated branch below (re-checking its real status).
+        if _maybe_install_tool("gh", required=False):
+            status = gh_status()
+            if status == "ok":
+                return (True, True)
     if status == "missing":
         print(_gh_install_hint())
         prompt = "\nPress Enter to continue without it (q to quit): "

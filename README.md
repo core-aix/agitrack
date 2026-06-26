@@ -53,7 +53,14 @@ aGiTrack needs **git** and at least one backend CLI ([Claude Code](https://docs.
 | **Linux** | `sudo apt install git` *(or your package manager)* | `curl -fsSL https://claude.ai/install.sh \| bash` · or `npm install -g opencode-ai` | `sudo apt install gh` |
 | **Windows** | `winget install Git.Git` | `npm install -g @anthropic-ai/claude-code` · or `npm install -g opencode-ai` *(no Node? `winget install OpenJS.NodeJS`)* | `winget install GitHub.cli` |
 
-**aGiTrack can install a backend for you.** On first run it lists the backends with their install status and offers to install any that are missing — pick one or install all of them — and at launch, if the selected backend isn't present, it offers to install it then. It uses the official installer on macOS/Linux and npm everywhere (bootstrapping Node via winget on Windows when needed), and adds the new CLI to the current session's `PATH` so it works right away without reopening the terminal. (You still need `git`, and the agent backend needs you to be signed in.)
+**aGiTrack can set up its prerequisites for you.** On an interactive launch it offers to install whatever's missing, then makes sure git can commit:
+
+- **A backend.** First run lists the backends with their install status and offers to install any that are missing — pick one or install all of them; at launch, if the selected backend isn't present, it offers to install it then. Uses the official installer on macOS/Linux and npm everywhere (bootstrapping Node via winget on Windows when needed).
+- **git and gh.** If `git` (required) or `gh` (optional) isn't installed, aGiTrack offers to install it with your platform's package manager — winget on Windows, Homebrew on macOS, your distro manager on Linux.
+- **git identity.** If `user.name`/`user.email` aren't set globally (commits fail without them), it prompts you for them and saves them.
+- **gh sign-in.** If `gh` is installed but not signed in, it offers to run `gh auth login` right there.
+
+Anything it installs is added to the current session's `PATH`, so it works right away without reopening the terminal.
 
 Run `gh auth login` if you installed `gh`. After installing anything by hand, open a **new terminal** so the updated `PATH` is picked up. aGiTrack also prints these same per-OS install hints at startup when `git`, the selected backend, or `gh` is missing — so you can copy the right command without leaving the prompt.
 
