@@ -205,9 +205,12 @@ jobs:
         run: wix extension add --global WixToolset.UI.wixext/5.0.2
 
       - name: Build MSI
+        # -arch x64: the PyInstaller bundle is 64-bit, so the MSI must be too (else
+        # ProgramFiles64Folder doesn't resolve and files install to the wrong place).
         run: |
           wix build `
             installer\agitrack.wxs `
+            -arch x64 `
             -d Version=${{ needs.release.outputs.version }} `
             -d SourceDir=${{ github.workspace }}\dist\agitrack `
             -ext WixToolset.UI.wixext `
