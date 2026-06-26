@@ -242,6 +242,7 @@ class NtChildProcess:
         self._rsock.setblocking(False)
         self._write_lock = threading.Lock()
         self._exit_code: int | None = None
+        self._pump_done = False  # set once the reader thread has drained all output + EOF'd
         self._closed = False
         self._reader = threading.Thread(target=self._pump, name="agitrack-conpty-reader", daemon=True)
         self._reader.start()
@@ -295,6 +296,7 @@ class NtChildProcess:
                     break
         finally:
             self._exit_code = self._read_exitstatus()
+            self._pump_done = True
             try:
                 self._wsock.shutdown(socket.SHUT_WR)
             except OSError:
@@ -359,15 +361,13 @@ class NtChildProcess:
     def poll(self) -> int | None:
         if self._exit_code is not None:
             return self._exit_code
-        isalive = getattr(self._pty, "isalive", None)
-        if isalive is not None:
-            try:
-                if isalive():
-                    return None
-            except Exception:  # noqa: BLE001
-                pass
-        self._exit_code = self._read_exitstatus()
-        return self._exit_code
+        # Don't report the child gone off the raw process state: a fast child's trailing
+        # output is flushed by the console only after the process dies, so the reader thread
+        # keeps draining for a short grace after exit. Wait for it to finish — otherwise a
+        # caller that stops reading the moment poll() goes non-None loses that output.
+        if self._pump_done:
+            return self._exit_code if self._exit_code is not None else -1
+        return None
 
     def cleanup(self) -> None:
         if self._closed:
