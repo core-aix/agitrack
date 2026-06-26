@@ -248,15 +248,17 @@ class NtChildProcess:
 
     @classmethod
     def spawn(cls, command: list[str], cwd: str, extra_env: dict[str, str] | None = None) -> "NtChildProcess":
-        import winpty  # type: ignore[import-not-found]  # Windows-only dependency
+        # Our own raw-ConPTY driver, NOT pywinpty: pywinpty's ConPTY backend kills every child
+        # on launch with STATUS_CONTROL_C_EXIT when the app is PyInstaller-frozen (the MSI
+        # build), while the OS's own CreatePseudoConsole works fine frozen. See _conpty.py.
+        from agitrack.proxy.platform._conpty import ConPTY
 
         rows, cols = 24, 80
-        pty = winpty.PTY(cols, rows)
+        pty = ConPTY(cols, rows)
         appname, args = _resolve_windows_command(command)
         cmdline = subprocess.list2cmdline(args) if args else ""
         pty.spawn(appname, cmdline=cmdline, cwd=cwd, env=_env_block(extra_env))
-        child_pid = getattr(pty, "pid", None)
-        return cls(pty, child_pid)
+        return cls(pty, pty.pid)
 
     @property
     def master_fd(self) -> int | None:
@@ -337,7 +339,7 @@ class NtChildProcess:
             return
         with self._write_lock:
             try:
-                self._pty.write(data.decode("utf-8", "surrogatepass"))  # type: ignore[attr-defined]
+                self._pty.write(data)  # type: ignore[attr-defined]  # ConPTY.write takes bytes
             except Exception:  # noqa: BLE001 - match os.write's "let the caller decide" is N/A here
                 pass
 
