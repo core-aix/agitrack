@@ -53,7 +53,9 @@ aGiTrack needs **git** and at least one backend CLI ([Claude Code](https://docs.
 | **Linux** | `sudo apt install git` *(or your package manager)* | `curl -fsSL https://claude.ai/install.sh \| bash` · or `npm install -g opencode-ai` | `sudo apt install gh` |
 | **Windows** | `winget install Git.Git` | `npm install -g @anthropic-ai/claude-code` · or `npm install -g opencode-ai` *(no Node? `winget install OpenJS.NodeJS`)* | `winget install GitHub.cli` |
 
-Run `gh auth login` if you installed `gh`. After installing anything, open a **new terminal** so the updated `PATH` is picked up. aGiTrack also prints these same per-OS install hints at startup when `git`, the selected backend, or `gh` is missing — so you can copy the right command without leaving the prompt.
+**aGiTrack can install a backend for you.** On first run it lists the backends with their install status and offers to install any that are missing — pick one or install all of them — and at launch, if the selected backend isn't present, it offers to install it then. It uses the official installer on macOS/Linux and npm everywhere (bootstrapping Node via winget on Windows when needed), and adds the new CLI to the current session's `PATH` so it works right away without reopening the terminal. (You still need `git`, and the agent backend needs you to be signed in.)
+
+Run `gh auth login` if you installed `gh`. After installing anything by hand, open a **new terminal** so the updated `PATH` is picked up. aGiTrack also prints these same per-OS install hints at startup when `git`, the selected backend, or `gh` is missing — so you can copy the right command without leaving the prompt.
 
 ### VS Code extension
 

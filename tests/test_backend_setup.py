@@ -37,27 +37,40 @@ def test_backend_installed_uses_path_lookup(monkeypatch):
     assert bs.backend_installed("opencode") is False
 
 
-def test_select_default_backend_picks_installed_choice(monkeypatch):
-    monkeypatch.setattr(bs, "backend_installed", lambda name: True)
-    config = FakeConfig()
-    # Menu is alphabetical, so option 2 is opencode.
-    chosen = select_default_backend(config, input_fn=_inputs("2"), output_fn=lambda _s: None)
-    assert chosen == "opencode"
-    assert config.saved == ["opencode"]
-
-
-def test_select_default_backend_defaults_to_first_on_empty_input(monkeypatch):
+def test_select_default_backend_all_installed_defaults_to_first(monkeypatch):
+    # Both installed: nothing to offer, default is the first (claude). No input needed.
     monkeypatch.setattr(bs, "backend_installed", lambda name: True)
     config = FakeConfig()
     chosen = select_default_backend(config, input_fn=_inputs(""), output_fn=lambda _s: None)
     assert chosen == "claude"
+    assert config.saved == ["claude"]
 
 
-def test_select_default_backend_offers_install_or_choose_another(monkeypatch):
-    # opencode is missing; user picks it, backs out, then picks the installed claude.
+def test_select_default_backend_skip_keeps_installed_default(monkeypatch):
+    # claude installed, opencode not; user is asked but presses Enter to skip → default claude.
     monkeypatch.setattr(bs, "backend_installed", lambda name: name == "claude")
     config = FakeConfig()
-    chosen = select_default_backend(config, input_fn=_inputs("2", "b", "1"), output_fn=lambda _s: None)
+    chosen = select_default_backend(
+        config,
+        input_fn=_inputs(""),  # skip installing opencode
+        output_fn=lambda _s: None,
+        install_fn=lambda name, output_fn: pytest.fail("skip must not install anything"),
+    )
+    assert chosen == "claude"
+
+
+def test_select_default_backend_installs_chosen_uninstalled(monkeypatch):
+    # claude installed, opencode not; user enters '2' to install opencode, then Enter.
+    installs = []
+    monkeypatch.setattr(bs, "backend_installed", lambda name: name == "claude" or name in installs)
+    config = FakeConfig()
+    chosen = select_default_backend(
+        config,
+        input_fn=_inputs("2", ""),
+        output_fn=lambda _s: None,
+        install_fn=lambda name, output_fn: installs.append(name) or True,
+    )
+    assert installs == ["opencode"]
     assert chosen == "claude"
 
 
