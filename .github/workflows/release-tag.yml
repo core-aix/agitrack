@@ -194,21 +194,22 @@ jobs:
       - name: Smoke-test bundled EXE
         run: dist\agitrack\agitrack.exe --version
 
-      - name: Install WiX v4
-        run: dotnet tool install --global wix --version 4.0.6
+      - name: Install WiX v5
+        # WiX v5 is required for the <Files> harvest element in agitrack.wxs (v4 lacks it).
+        run: dotnet tool install --global wix --version 5.0.2
 
       - name: Add WiX UI extension
         # Pin the UI extension to the SAME version as the wix tool. Unpinned, `wix
-        # extension add` pulls the latest (a newer major), which the 4.0.x toolset
-        # can't load — `wix build` then fails with WIX0144 "extension could not be found".
-        run: wix extension add --global WixToolset.UI.wixext/4.0.6
+        # extension add` pulls the latest (a newer major), which the toolset can't load —
+        # `wix build` then fails with WIX0144 "extension could not be found".
+        run: wix extension add --global WixToolset.UI.wixext/5.0.2
 
       - name: Build MSI
         run: |
           wix build `
             installer\agitrack.wxs `
             -d Version=${{ needs.release.outputs.version }} `
-            -d SourceDir=dist\agitrack `
+            -d SourceDir=${{ github.workspace }}\dist\agitrack `
             -ext WixToolset.UI.wixext `
             -o dist\${{ steps.msi.outputs.MSI_NAME }}
 

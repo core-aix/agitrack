@@ -1,24 +1,27 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  WiX v4 source for the aGiTrack Windows installer.
+  WiX v5 source for the aGiTrack Windows installer (schema namespace is still
+  .../v4/wxs — WiX v5 kept the v4 schema).
 
   Build (after running PyInstaller into dist/agitrack):
     wix build installer/agitrack.wxs               \
          -d Version=<x.y.z>                        \
-         -d SourceDir=dist/agitrack                \
+         -d SourceDir=<abs path>/dist/agitrack     \
          -ext WixToolset.UI.wixext                 \
          -o dist/agitrack-<x.y.z>-windows-x64.msi
 
-  No separate harvest/heat step: WiX v4 removed the `wix harvest` command, so the
-  <Files Include="$(var.SourceDir)\**"> element (in the AgitrackFiles ComponentGroup
-  below) globs and harvests the PyInstaller output directory at build time. SourceDir
-  is supplied with -d on the command line.
+  Requires WiX v5: the <Files Include="$(var.SourceDir)\**"> element (in the
+  AgitrackFiles ComponentGroup below) globs and harvests the PyInstaller output
+  directory at build time — it replaces the removed `heat`/`wix harvest` step and was
+  only added in WiX v5. Pass SourceDir as an ABSOLUTE path so the glob is unambiguous,
+  and pin the WixToolset.UI.wixext extension to the SAME version as the wix tool.
 
   UpgradeCode must NEVER change between releases — it is the stable identity
   Windows uses to recognise that two MSI packages are versions of the same
   product and to offer upgrade/replace rather than side-by-side install.
 -->
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
 
   <Package
     Name="aGiTrack"
@@ -102,12 +105,12 @@
     </ComponentGroup>
 
     <!--
-      The PyInstaller bundle (agitrack.exe + the _internal/ tree). WiX v4 has no
-      separate harvest/heat step — the <Files> element globs and harvests the whole
-      directory at build time, recreating the subdirectory structure under
-      INSTALLFOLDER and generating a component per file. var.SourceDir is passed on the
-      `wix build` command line (-d SourceDir=dist\agitrack), so this stays in lockstep
-      with the PyInstaller output directory.
+      The PyInstaller bundle (agitrack.exe + the _internal/ tree). The WiX v5 <Files>
+      element globs and harvests the whole directory at build time, recreating the
+      subdirectory structure under INSTALLFOLDER and generating a component per file —
+      it replaces the removed heat/`wix harvest` step. var.SourceDir is passed (as an
+      absolute path) on the `wix build` command line, so this stays in lockstep with
+      the PyInstaller output directory.
     -->
     <ComponentGroup Id="AgitrackFiles" Directory="INSTALLFOLDER">
       <Files Include="$(var.SourceDir)\**" />
@@ -132,7 +135,7 @@
       WixUI_Minimal: just a license agreement page + install/cancel.
       Swap for WixUI_InstallDir if you want a folder-picker page.
     -->
-    <WixUI Id="WixUI_Minimal" />
+    <ui:WixUI Id="WixUI_Minimal" />
 
   </Package>
 </Wix>
