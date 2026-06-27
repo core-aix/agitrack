@@ -2856,6 +2856,56 @@ def test_background_session_relaunches_on_unexpected_exit_then_stops_after_crash
     assert b not in runner.sessions
 
 
+def test_deferred_switch_offer_reconciles_transcript_before_offering():
+    # A switch's user-commit / copy offer must wait until the switched-to session's latest agent
+    # turn is reconciled (parsed + committed in the background) so the agent's own changes aren't
+    # offered as the user's. The offer fires only once reconciled; a running/needed parse defers it.
+    import types
+
+    runner = make_runner()
+    runner._agent_is_active = lambda: False
+    runner._finish_agent_parse_if_ready = lambda **k: None
+    runner.agent_parse_thread = None
+    offers: list = []
+    runner._offer_copy_unstaged_to_base = lambda **k: offers.append(k.get("context"))
+    runner._start_agent_parse = lambda: False
+
+    # Nothing pending → no-op.
+    runner._pending_switch_copy_offer = None
+    runner._service_deferred_switch_offer()
+    assert offers == []
+
+    # Pending for the active session, clean tree, no parse running → offer now.
+    runner._pending_switch_copy_offer = runner.active
+    runner._switch_offer_parse_started = False
+    runner.repo = types.SimpleNamespace(status_short=lambda: "")
+    runner._service_deferred_switch_offer()
+    assert offers == ["switch"] and runner._pending_switch_copy_offer is None
+
+    # A running parse defers the offer (don't offer mid-reconcile).
+    offers.clear()
+    runner._pending_switch_copy_offer = runner.active
+    runner.agent_parse_thread = types.SimpleNamespace(is_alive=lambda: True)
+    runner._service_deferred_switch_offer()
+    assert offers == [] and runner._pending_switch_copy_offer is runner.active
+
+    # Uncommitted changes not yet checked → start ONE background parse and keep deferring.
+    offers.clear()
+    started: list = []
+    runner.agent_parse_thread = None
+    runner._switch_offer_parse_started = False
+    runner.repo = types.SimpleNamespace(status_short=lambda: " M f.py")
+    runner._start_agent_parse = lambda: (started.append(1), True)[1]
+    runner._service_deferred_switch_offer()
+    assert started == [1] and runner._switch_offer_parse_started is True and offers == []
+
+    # Target no longer the active session → drop the deferred offer silently.
+    offers.clear()
+    runner._pending_switch_copy_offer = _bg_session("Z")
+    runner._service_deferred_switch_offer()
+    assert offers == [] and runner._pending_switch_copy_offer is None
+
+
 def test_baseline_drops_session_with_no_conversation(tmp_path):
     from types import SimpleNamespace
 
@@ -7257,6 +7307,41 @@ def test_switch_active_resumes_in_place_without_interrupting_target(monkeypatch)
     assert runner.active_index == 0 and runner.repo == "repoA"  # swapped back
     assert resizes and not restarts  # in-place resume on POSIX too
     assert not host_resets  # POSIX path leaves host modes alone
+
+
+def test_esc_on_a_popup_during_exit_finalize_aborts_the_whole_exit():
+    # Pressing Esc on ANY popup shown during the exit/finalize sequence (user-commit box, copy
+    # box, merge prompt) cancels the whole exit — not just that one step. Implemented by the
+    # _run_modal_inline cancel chokepoint, gated on _finalized_on_exit so ordinary popups are
+    # unaffected.
+    import types
+
+    runner = make_runner()
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda: None
+    runner._clear_message = lambda: None
+    runner._popup_read_input = lambda: b"\x1b"  # Esc
+    runner._exit_menu_requested = False
+    runner.input = types.SimpleNamespace(menu_key=b"\x07")
+
+    class _CancelModal:
+        def render_message(self):
+            return "msg"
+
+        def feed(self, data):
+            return ("cancel", None)
+
+    # Outside the exit finalize: an Esc-cancel must NOT set the exit-abort flag.
+    runner._finalized_on_exit = False
+    runner._exit_aborted = False
+    assert runner._run_modal_inline(_CancelModal()) is None
+    assert runner._exit_aborted is False
+
+    # During the exit finalize: an Esc-cancel aborts the whole exit.
+    runner._finalized_on_exit = True
+    runner._exit_aborted = False
+    assert runner._run_modal_inline(_CancelModal()) is None
+    assert runner._exit_aborted is True
 
 
 # --- issue #18: Ctrl-C inside a popup goes through the full exit flow -----------

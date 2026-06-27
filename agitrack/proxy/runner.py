@@ -817,6 +817,13 @@ class ProxyRunner:
         # is finally dropped instead of looping. (Session uses __slots__, so this can't live on
         # the session object.) See _relaunch_background_session.
         self._bg_relaunch_times: dict[int, list[float]] = {}
+        # A switch's user-commit / copy offer is deferred until the switched-to session's latest
+        # agent turn has been reconciled (parsed + committed) in the background, so the agent's
+        # own changes aren't offered as the user's. Holds the Session awaiting its offer (or None);
+        # the bool tracks that we've already kicked the one reconciling parse. See
+        # _service_deferred_switch_offer.
+        self._pending_switch_copy_offer: "Session | None" = None
+        self._switch_offer_parse_started = False
         self._exiting = False
         self._finalized_on_exit = False
         # Set when the user presses Esc on the on-exit copy offer: aborts the in-progress
@@ -1104,6 +1111,8 @@ class ProxyRunner:
                 "_exiting": False,
                 "_finalized_on_exit": False,
                 "_exit_aborted": False,
+                "_pending_switch_copy_offer": None,
+                "_switch_offer_parse_started": False,
                 "_dashboard_proc": None,
                 "_dashboard_url": None,
                 "_exit_requested": False,
@@ -5678,8 +5687,15 @@ class ProxyRunner:
             # it's idle — a session still mid-turn gets offered by the turn path once it settles.
             self._copy_declined = set()
             if not self._agent_is_active():
-                self._debug("switch_active: offering copy-to-base")
-                self._offer_copy_unstaged_to_base(context="switch")
+                # Defer this session's user-commit / copy offer until its latest agent turn has
+                # been reconciled (parsed + committed) in the BACKGROUND — otherwise the agent's
+                # own just-made changes can be offered as the user's (a Claude change shown in the
+                # "user commit" box right after switching to a session whose turn hadn't been
+                # parsed yet). _service_deferred_switch_offer parses, then offers once only
+                # genuine user changes remain.
+                self._debug("switch_active: deferring copy-to-base until transcript reconciled")
+                self._pending_switch_copy_offer = self.active
+                self._switch_offer_parse_started = False
         finally:
             self._pipeline_lock.release()
         self._debug("switch_active: lock released; prompting merge-target if diverged")
@@ -6789,6 +6805,7 @@ class ProxyRunner:
                 self._service_commit_summaries()  # apply finished background summaries (#8)
                 self._service_precompact_summary()
                 self._service_background_sessions()
+                self._service_deferred_switch_offer()  # a switch's copy/commit offer, once reconciled
                 if self._base_advanced:
                     self._base_advanced = False
                     self._sync_idle_worktrees_to_base()
@@ -8055,6 +8072,13 @@ class ProxyRunner:
             if action == "cancel":
                 self._clear_message()
                 self._render_pending = True
+                if self._finalized_on_exit:
+                    # Esc on ANY popup shown during the exit/finalize sequence cancels the WHOLE
+                    # exit — the user changed their mind. _run_exit_flow / _finalize_pending_work
+                    # see this flag and stay running; commits/merges already made this exit are
+                    # kept and nothing is deleted. _finalized_on_exit is set only for the duration
+                    # of the exit finalize, so this never fires for ordinary (non-exit) popups.
+                    self._exit_aborted = True
                 return None
             if action == "exit":
                 if self._run_exit_flow():
@@ -8807,6 +8831,8 @@ class ProxyRunner:
             self._summary_thread.join(timeout=self.EXIT_SUMMARY_GRACE_SECONDS)
         self._service_commit_summary()
         self._integrate_session_on_exit()
+        if self._exit_aborted:
+            return  # Esc on a finalize popup (e.g. a merge prompt) aborted the exit — keep the worktree
         self._remove_worktree_on_exit()
 
     def _adopt_latest_backend_session(self) -> None:
@@ -9766,6 +9792,39 @@ class ProxyRunner:
             self._pending_copy_offer = (context, collected)
             self._wake_main_loop()  # present it on the next reactor tick
 
+    def _service_deferred_switch_offer(self) -> None:
+        """Present a switch's user-commit / copy offer that _switch_active deferred — but only
+        AFTER the switched-to session's latest agent turn is reconciled, so the agent's own
+        changes aren't offered as the user's. The CALLER holds ``_pipeline_lock`` (the timers-
+        phase background cluster), so the parse/commit here can't race the git worker; the
+        background parse keeps the main thread responsive (we re-check each tick, never block).
+
+        Sequence: commit any finished parse; if uncommitted changes remain and we haven't yet
+        checked the transcript for them, kick ONE background parse and wait; once reconciled
+        (committed, or nothing more to attribute), make the offer."""
+        target = self._pending_switch_copy_offer
+        if target is None:
+            return
+        if target is not self.active:
+            self._pending_switch_copy_offer = None  # switched away before it fired — drop it
+            self._switch_offer_parse_started = False
+            return
+        if self._agent_is_active():
+            return  # a turn is running; the post-turn pipeline reconciles it — wait
+        self._finish_agent_parse_if_ready(quiet=True)  # commit a just-finished agent turn
+        if self.agent_parse_thread is not None and self.agent_parse_thread.is_alive():
+            return  # a parse is running; offer next tick once it lands
+        if not self._switch_offer_parse_started and self.repo.status_short().strip():
+            # Uncommitted changes remain and we haven't checked the transcript for them yet: run
+            # ONE parse to attribute/commit any agent turn, then offer on a later tick. Bounded to
+            # a single parse so non-committable leftovers (declined/ignored files) still get offered.
+            if self._start_agent_parse():
+                self._switch_offer_parse_started = True
+                return
+        self._pending_switch_copy_offer = None
+        self._switch_offer_parse_started = False
+        self._offer_copy_unstaged_to_base(context="switch")
+
     def _present_pending_copy_offer(self) -> None:
         """Main thread: present a copy offer the git worker collected for this turn, if any.
         Deliberately NOT under `_pipeline_lock` — the worker must keep committing/merging
@@ -9797,6 +9856,9 @@ class ProxyRunner:
             # The turn path runs on the git worker and must NOT raise a (blocking) popup or
             # commit from there; those edits are still offered at the next switch/exit.
             self._offer_user_commit_for_worktree_edits()
+            if context == "exit" and self._exit_aborted:
+                # Esc on the user-commit box aborted the exit — don't also open the copy box.
+                return None
         candidates = self._uncommitted_worktree_files()
         if not candidates:
             return None
