@@ -77,6 +77,8 @@ class NtHostTerminal:
         self._last_size: tuple[int, int] | None = None
         self._reader: threading.Thread | None = None
         self._resizer: threading.Thread | None = None
+        self._reader_reads = 0  # diagnostic counters (see stdin_reader_stats)
+        self._reader_empties = 0
 
     def start(self) -> None:
         pass
@@ -114,6 +116,11 @@ class NtHostTerminal:
         # Diagnostic: whether the console→bridge reader thread is still running. A dead reader
         # means no keystroke can reach the reactor (a hang where the loop still spins).
         return self._reader is not None and self._reader.is_alive()
+
+    def stdin_reader_stats(self) -> str:
+        # Diagnostic: distinguishes a reader blocked in ReadFile (counts flat — input not arriving)
+        # from one spinning on empty reads (empties climbing — the console handle is broken).
+        return f"alive={self.stdin_reader_alive()} reads={self._reader_reads} empties={self._reader_empties}"
 
     def restore_terminal(self) -> None:
         self.disable_host_terminal_modes()
@@ -195,11 +202,13 @@ class NtHostTerminal:
             data = self._winconsole.read_input(4096)
             if not data:
                 empties += 1
+                self._reader_empties += 1
                 if empties > 5000:  # ~50s of nothing but empty reads → the handle is really gone
                     break
                 self._stop.wait(0.01)  # brief backoff; also wakes promptly on teardown
                 continue
             empties = 0
+            self._reader_reads += 1
             try:
                 self._wsock.sendall(data)
             except OSError:
