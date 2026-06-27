@@ -8098,6 +8098,7 @@ class ProxyRunner:
             log_path,
             open_dashboard_in_browser,
             remote_browser_hint,
+            running_handshake,
             spawn_dashboard_daemon,
             wait_for_handshake,
         )
@@ -8109,6 +8110,24 @@ class ProxyRunner:
                 f"Dashboard already running at {url}."
                 if opened
                 else f"Dashboard running. {remote_browser_hint(url, 0)}"
+            )
+            self._render()
+            return
+        # A dashboard daemon may already be running for this repo from elsewhere — an
+        # `agitrack -d`, or a prior TUI session whose process handle we no longer hold.
+        # Reuse it (just open the browser at its URL) instead of clobbering its handshake
+        # and spawning a duplicate. We don't own it, so we don't track it as our proc and
+        # won't stop it on exit; its own owner-death watchdog handles its lifecycle.
+        running = running_handshake(self.base_repo)
+        if running is not None:
+            url = str(running.get("url", ""))
+            self._dashboard_url = url
+            port = running.get("port", 0)
+            opened = open_dashboard_in_browser(url)
+            self._set_message(
+                f"Dashboard already running at {url} — opening in your browser."
+                if opened
+                else f"Dashboard already running. {remote_browser_hint(url, int(port) if isinstance(port, int) else 0)}"
             )
             self._render()
             return

@@ -19,8 +19,8 @@ from typing import Any
 
 from agitrack.git import GitRepo
 from agitrack.metrics.collect import Dashboard, build_dashboard
-from agitrack.metrics.github import cached_logins, resolve_logins
-from agitrack.metrics.web import aggregates_payload, format_html, log_page, shared_sessions_for
+from agitrack.metrics.github import cached_logins
+from agitrack.metrics.web import aggregates_payload, log_page, shared_sessions_for, shell_html
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
@@ -48,10 +48,14 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
             frm, to = _int(query, "from", 0), _int(query, "to", 0)
             ref = self._ref(_str(query, "branch"))
             if parsed.path in ("/", "/index.html"):
-                # The initial paint resolves GitHub logins synchronously so committers
-                # show as their GitHub IDs from the first render — not git names that
-                # flip to IDs on the next poll. This warms the cache for those polls.
-                html = format_html(self._dashboard(ref, blocking=True), shared_sessions=shared_sessions_for(self.repo))
+                # Paint the page chrome instantly with no aggregates/log embedded, then
+                # let the browser fetch /data and /log behind a loading animation — so a
+                # repo with a huge history doesn't block the first paint on the git-log
+                # crunch. Warming the login cache here (a background refresh) means the
+                # resolved GitHub IDs are likely ready by the time the first /data poll
+                # lands, so committers show as their IDs almost immediately.
+                cached_logins(self.repo)
+                html = shell_html(self.repo)
                 self._respond("text/html; charset=utf-8", html.encode("utf-8"))
             elif parsed.path == "/data":
                 payload = aggregates_payload(
@@ -96,12 +100,12 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
         # branch list (an option string, a bogus name, "") falls back to HEAD.
         return branch if branch and branch in self.repo.list_branches() else "HEAD"
 
-    def _dashboard(self, ref: str = "HEAD", *, blocking: bool = False) -> Dashboard:
+    def _dashboard(self, ref: str = "HEAD") -> Dashboard:
         # cached_logins never blocks: it returns the cached GitHub identities (or {}
         # when cold) and refreshes them in the background, so polls stay fast. Resolved
-        # logins appear on a later poll. {} when gh is absent. The initial page render
-        # asks for blocking resolution instead, so committer IDs are right immediately.
-        logins = resolve_logins(self.repo) if blocking else cached_logins(self.repo)
+        # logins appear on a later poll. {} when gh is absent. The initial / paint warms
+        # this cache so the IDs are usually ready by the first /data poll.
+        logins = cached_logins(self.repo)
         return build_dashboard(self.repo, ref, sha_logins=logins, email_logins=self.email_logins)
 
     def _respond(self, content_type: str, body: bytes) -> None:
