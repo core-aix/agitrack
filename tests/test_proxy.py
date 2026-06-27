@@ -7158,6 +7158,40 @@ def test_switch_active_joins_worker_before_swapping():
     assert runner.active_index == 1
 
 
+def test_debug_and_raw_logs_write_to_base_repo_when_enabled(tmp_path):
+    # The diagnostic logs (DEBUG_PROXY -> proxy-debug, DEBUG_RAW -> proxy-raw) must behave the
+    # same on every platform: written to the BASE repo's .agitrack/, one shared run-stamp per
+    # run, and gated so nothing is written when the switch is off. Runs on both CI OSes.
+    import types
+
+    base = tmp_path / "base"
+    base.mkdir()
+    runner = make_runner()
+    runner.base_repo = types.SimpleNamespace(repo=base)
+    runner._diag_run = "20260627-101112"
+
+    # Enabled: both logs are written under the base repo, named by the shared run-stamp.
+    runner.debug_proxy = True
+    runner.raw_capture = True
+    runner._debug("session switch start")
+    runner._raw_capture(">", b"\x1b[A")
+
+    debug_log = base / ".agitrack" / "proxy-debug-20260627-101112.log"
+    raw_log = base / ".agitrack" / "proxy-raw-20260627-101112.log"
+    assert "session switch start" in debug_log.read_text(encoding="utf-8")
+    raw_text = raw_log.read_text(encoding="utf-8")
+    assert "> b'\\x1b[A'" in raw_text  # tag + byte-exact repr
+
+    # Disabled: a second run writes nothing new (the gate is honoured on both methods).
+    runner.debug_proxy = False
+    runner.raw_capture = False
+    runner._diag_run = "20260627-202122"
+    runner._debug("must not appear")
+    runner._raw_capture("<", b"x")
+    assert not (base / ".agitrack" / "proxy-debug-20260627-202122.log").exists()
+    assert not (base / ".agitrack" / "proxy-raw-20260627-202122.log").exists()
+
+
 def test_switch_active_full_reset_on_windows_inplace_on_posix(monkeypatch):
     # Per the user: switching sessions must reset state "as if you restart aGiTrack in the
     # new session". On Windows, resuming the target's backgrounded ConPTY in place steals the

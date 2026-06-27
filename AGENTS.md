@@ -233,6 +233,21 @@ This is the design aGiTrack targets for running several sessions at once. Founda
 - Capture the verified scenarios as permanent tests under `tests/` so the behavior stays locked in, and clean up any temporary repositories afterwards.
 - `./scripts/check.sh` (ruff check, ruff format, mypy-vs-baseline, pytest + coverage) must pass before a change is considered done.
 
+## Diagnostics & Debugging (DEBUG_PROXY / DEBUG_RAW)
+
+aGiTrack ships two always-present, opt-in diagnostic switches for debugging the proxy reactor — input/output, terminal-mode mirroring, session switches, hangs, and leaks. They are **off by default**, gated so they cost nothing in normal use, and behave **identically on Windows and macOS/Linux** (same env vars, same log files, same format) — so a bug report from either platform produces the same artifacts. Keep them; they are the first thing to reach for when an interactive glitch is reported.
+
+- **`DEBUG_PROXY`** — human-readable event log. Records the stdin parse pipeline (each chunk: raw bytes → after menu-key intercept → after kitty decode → feed result with `forwarded`/`command`/`capturing`), backend spawn/switch/restart decisions, session lifecycle, agent-parse worker start/finish, shutdown, and a throttled (~5 s) **idle heartbeat** showing the loop is alive when no keystroke arrives. `agitrack --verbose` implies it.
+- **`DEBUG_RAW`** — byte-exact I/O capture for replaying an interactive glitch (mouse/keyboard escape sequences, a backend's native picker). **Implies `DEBUG_PROXY`.** Every record is `HH:MM:SS.mmm <TAG> b'<repr>'`, flushed line-by-line (open+write+close per line) so the log survives a hard kill when a leak has broken Ctrl-C / graceful exit. Tags: `>` host→backend input (includes bytes read inside popups/modals), `<` backend→host output, `M` a terminal-mode sequence mirrored to the host console (mouse/kitty/paste — `_sync_terminal_modes`), `EOF` the backend's pty/ConPTY closed.
+
+**Setting them.** Each switch is read under THREE names (first found wins): the bare name (`DEBUG_RAW`), the project-prefixed `AGITRACK_DEBUG_RAW`, and the legacy `AGIT_DEBUG_RAW` (see `agitrack/env.py` + `ProxyRunner._debug_flag`). Truthy values are `1` / `true` / `yes` (case-insensitive). The bare form exists because these are throwaway switches a user sets ad hoc in a shell — reaching for `DEBUG_RAW` is the obvious move, and a prefixed-only flag silently produced no log.
+  - macOS/Linux (bash/zsh): `DEBUG_RAW=1 agitrack` (one run) or `export DEBUG_RAW=1` (the shell session).
+  - Windows (PowerShell): `$env:DEBUG_RAW = "1"; agitrack` — set it in the **same** terminal that launches aGiTrack (the VS Code extension launches a child shell, so set it in that integrated terminal or in the OS environment).
+
+**Where the logs go.** One file per run, in the **base** repo's `.agitrack/` (never the session worktree's — the worktree is removed on exit, which would destroy the log): `<base-repo>/.agitrack/proxy-debug-<YYYYMMDD-HHMMSS>.log` and `proxy-raw-<YYYYMMDD-HHMMSS>.log` (`_diag_path`; the `<YYYYMMDD-HHMMSS>` run-stamp is shared by both files of a run). To inspect the latest run, sort that directory by name/mtime and read the newest `proxy-*` pair; share both when filing a report.
+
+**Cross-platform parity / the one platform-specific detail.** The flags, both log files, and every record format are the same on all platforms. The only platform difference is *inside* the idle-heartbeat line: on Windows it appends the console→bridge **reader-thread** stats (`reader[alive=… reads=… empties=…]`, from `NtHostTerminal.stdin_reader_stats`) — diagnostic for the Windows-only blocking-`ReadFile` reader; on macOS/Linux there is no bridge thread (the reactor `select`s the tty fd directly), so the same line shows `reader[n/a]`. Everything else is identical.
+
 ## Applying Code Changes to a Running aGiTrack
 
 - **A code fix on disk does not take effect until the running aGiTrack process is restarted.** Python loads modules into memory at process start, so a long-lived proxy keeps executing the code it started with even after the source file changes. This is the usual reason a just-merged fix "still doesn't work": the file is fixed; the live process is stale. The remedy is to **fully quit and relaunch aGiTrack** — not reinstall.

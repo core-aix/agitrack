@@ -323,6 +323,25 @@ Show aGiTrack diagnostic messages:
 agitrack --verbose
 ```
 
+### Debugging / diagnostic logs
+
+When something in the terminal misbehaves — stray escape codes, input not registering, a hang on a menu or session switch — aGiTrack can write detailed diagnostic logs. Two opt-in environment switches turn them on (off by default; they work the same on macOS, Linux, and Windows):
+
+- **`DEBUG_PROXY`** — a human-readable event log: keystrokes/commands as they're parsed, backend spawn/switch/restart, session lifecycle, and an idle heartbeat. (`--verbose` turns this on too.)
+- **`DEBUG_RAW`** — a byte-exact capture of everything read from the keyboard and written to the terminal, for replaying an interactive glitch precisely. It also enables `DEBUG_PROXY`.
+
+```bash
+# macOS / Linux (bash/zsh) — one run:
+DEBUG_RAW=1 agitrack
+```
+
+```powershell
+# Windows (PowerShell) — set it in the same terminal that launches aGiTrack:
+$env:DEBUG_RAW = "1"; agitrack
+```
+
+The logs are written to your **target repo**'s `.agitrack/` folder, one pair per run: `proxy-debug-<timestamp>.log` and `proxy-raw-<timestamp>.log`. When reporting a problem, attach the newest pair. (The switches are also accepted as `AGITRACK_DEBUG_RAW` / `AGITRACK_DEBUG_PROXY`. Full details for contributors are in `AGENTS.md` → "Diagnostics & Debugging".)
+
 Review each turn before it merges, instead of integrating automatically:
 
 ```bash

@@ -836,13 +836,14 @@ class ProxyRunner:
         self.sessions: list[Session] = []
         self.worktree_manager: WorktreeManager | None = None
 
-        # AGITRACK_DEBUG_RAW records every raw child-output / user-input chunk so an
-        # interactive glitch (e.g. Claude's native session picker) can be replayed
-        # byte-for-byte; it implies debug logging too.
+        # Diagnostic switches (off by default, identical on every platform; user docs in
+        # README "Debugging / diagnostic logs" and AGENTS.md "Diagnostics & Debugging"):
+        #   DEBUG_PROXY -> proxy-debug-<run>.log   (human-readable event log; --verbose implies it)
+        #   DEBUG_RAW   -> proxy-raw-<run>.log      (byte-exact I/O capture; implies DEBUG_PROXY)
         # Honour the AGITRACK_/AGIT_ prefixed names (the project convention) AND the bare
-        # DEBUG_RAW / DEBUG_PROXY: these are throwaway diagnostic switches a user sets ad hoc in
-        # their shell, and the bare form is the obvious thing to reach for (a prefixed-only flag
-        # silently produced no log).
+        # DEBUG_RAW / DEBUG_PROXY: these are throwaway switches a user sets ad hoc in their shell,
+        # and the bare form is the obvious thing to reach for (a prefixed-only flag silently
+        # produced no log). Truthy = 1/true/yes (case-insensitive).
         def _debug_flag(name: str) -> bool:
             value = getenv_compat(name)
             if value is None:
