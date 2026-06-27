@@ -812,6 +812,11 @@ class ProxyRunner:
         # command menu (every nested level) back to the agent, rather than going up one level.
         self._exit_menu_requested = False
         self._relaunch_times: list[float] = []
+        # Per-background-session crash-loop guard (keyed by id(session)): a background backend
+        # that exits is relaunched+resumed like the active one, but a backend that won't stay up
+        # is finally dropped instead of looping. (Session uses __slots__, so this can't live on
+        # the session object.) See _relaunch_background_session.
+        self._bg_relaunch_times: dict[int, list[float]] = {}
         self._exiting = False
         self._finalized_on_exit = False
         # Set when the user presses Esc on the on-exit copy offer: aborts the in-progress
@@ -1091,6 +1096,7 @@ class ProxyRunner:
                 "_backend_command": [],
                 "_commit_guidance": True,
                 "_relaunch_times": [],
+                "_bg_relaunch_times": {},
                 "_fork_next_spawn": False,
                 "_forked_for_busy": False,
                 "_backend_exit_notice": None,
@@ -5745,7 +5751,51 @@ class ProxyRunner:
         finally:
             self.active = saved
         if died:
-            self._stop_session(self.sessions.index(session), commit=False)
+            # The backend exited on its own while backgrounded (some backends — notably Claude
+            # on Windows — quit when they lose the foreground). The ACTIVE session already
+            # auto-relaunches+resumes in this case (_relaunch_backend_or_exit); a background
+            # session must be just as resilient, or switching away from such a backend silently
+            # loses the session. Try to bring it back in the background first; only drop it if it
+            # won't stay up (crash-loop guard) so it isn't lost forever.
+            if not self._relaunch_background_session(session):
+                self._stop_session(self.sessions.index(session), commit=False)
+
+    def _relaunch_background_session(self, session: Session) -> bool:
+        # Respawn a background session's backend IN THE BACKGROUND, resuming the same
+        # conversation, after it exited unexpectedly. Mirrors the active session's
+        # _relaunch_backend_or_exit (teardown → re-baseline → spawn) but omits every
+        # foreground/host step (no host-mode/mouse/raw changes, no _render) so it never paints
+        # over or disturbs the foreground session. Returns False (→ caller stops the session)
+        # when the per-session crash-loop guard trips, so a backend that refuses to stay up is
+        # dropped rather than relaunched forever.
+        if session not in self.sessions:
+            return False
+        key = id(session)
+        now = time.monotonic()
+        recent = [t for t in self._bg_relaunch_times.get(key, []) if now - t < 30.0]
+        if len(recent) >= 3:
+            self._debug(f"background session '{getattr(session, 'name', '?')}' exited 3x/30s; dropping")
+            self._bg_relaunch_times.pop(key, None)
+            return False
+        recent.append(now)
+        self._bg_relaunch_times[key] = recent
+
+        def _respawn() -> None:
+            self._teardown_child()  # close the dead child's bridge fd before respawning
+            self._reset_agent_tracking()
+            self._sanitize_state_trace()
+            self._initialize_session_baseline()
+            self._init_screen()  # the session's own (per-session) screen; no host paint
+            self._spawn()  # resumes self.state.backend_session_id in the background
+
+        try:
+            self._with_session(session, _respawn)
+        except Exception as error:
+            self._debug(f"background relaunch of '{getattr(session, 'name', '?')}' failed: {error!r}")
+            return False
+        session.last_child_output = time.monotonic()  # don't immediately re-poll as idle/dead
+        self._debug(f"relaunched background session '{getattr(session, 'name', '?')}' after backend exit")
+        return True
 
     def _ensure_worktree_alive(self) -> None:
         if self.worktree is None:
@@ -6004,6 +6054,7 @@ class ProxyRunner:
             self._render()
             return
         session = self.sessions[index]
+        self._bg_relaunch_times.pop(id(session), None)  # drop its background crash-loop guard
         active = session is self.active
         if active:
             # Don't let an in-flight parse worker outlive its session's runtime

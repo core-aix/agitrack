@@ -2824,6 +2824,38 @@ def test_pump_background_feeds_screen_without_disturbing_active():
         os.close(write_fd)
 
 
+def test_background_session_relaunches_on_unexpected_exit_then_stops_after_crashloop():
+    # A background backend that exits on its own (e.g. Claude on Windows when it loses the
+    # foreground) must be relaunched+resumed in the background like the active session is —
+    # not silently dropped. A backend that refuses to stay up is finally stopped (crash-loop
+    # guard) so it isn't relaunched forever.
+    runner = _mux_runner()
+    b = _bg_session("B")
+    runner.sessions.append(b)
+    runner._drain_child_output = lambda: None  # force the background drain to report "backend gone"
+    # The background-safe respawn steps are no-ops here (their real work is covered elsewhere).
+    for name in (
+        "_teardown_child",
+        "_reset_agent_tracking",
+        "_sanitize_state_trace",
+        "_initialize_session_baseline",
+        "_init_screen",
+        "_spawn",
+        "_commit_latest_turn_sync",
+        "_stop_file_watcher",
+    ):
+        setattr(runner, name, lambda *a, **k: None)
+
+    # The first few unexpected exits relaunch the session in the background; it is never dropped.
+    for _ in range(3):
+        runner._pump_background(b)
+        assert b in runner.sessions
+
+    # A further quick exit trips the per-session crash-loop guard → the session is stopped.
+    runner._pump_background(b)
+    assert b not in runner.sessions
+
+
 def test_baseline_drops_session_with_no_conversation(tmp_path):
     from types import SimpleNamespace
 
