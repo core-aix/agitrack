@@ -2403,6 +2403,7 @@ class ProxyRunner:
         if self.worktree is None:
             # A non-worktree session has nothing to multiplex; restart the single
             # backend in place (legacy behaviour).
+            self._debug(f"_switch_backend: name={name} worktree=None -> _restart_agent (respawn in place)")
             self.state.remember_backend_session()
             self.state.backend = name
             self.backend = make_proxy_agent(name)
@@ -2414,18 +2415,22 @@ class ProxyRunner:
         # Keep the current backend's session running in the background and switch
         # to this backend's own session.
         index = self._live_session_for_backend(name)
+        self._debug(f"_switch_backend: name={name} worktree={self.name} live_index={index}")
         if index is not None:
+            self._debug("_switch_backend: -> _switch_active (resume live bg session)")
             self._switch_active(index)
             return
         # Resume this backend's last conversation if we remember one (recreating
         # its worktree at the same path so the backend finds its transcript).
         record = self._recall_backend_session(name)
         if record and record.get("id"):
+            self._debug(f"_switch_backend: -> _new_session resume (fresh spawn) id={record.get('id')}")
             self._new_session(
                 record.get("worktree") or self._next_session_name(), backend=name, resume_session_id=record["id"]
             )
             return
         # Otherwise start fresh, confirming the session name first.
+        self._debug("_switch_backend: -> _new_session fresh (prompt name)")
         session_name = self._prompt_session_name(f"New {name} session", default=self._next_session_name())
         if session_name is None:
             return
@@ -5658,13 +5663,12 @@ class ProxyRunner:
         if not (0 <= index < len(self.sessions)):
             return
         target = self.sessions[index]
-        target_name = getattr(getattr(target, "backend", None), "name", None)
+        target_name = getattr(getattr(target, "backend", None), "name", None) or getattr(
+            getattr(target, "state", None), "backend", None
+        )
         current_name = getattr(self.backend, "name", None)
-        cross_backend = bool(target_name and current_name and target_name != current_name)
-        name = self._session_name(index)
+        self._debug(f"_switch_to_session_index: idx={index} target_backend={target_name} cur={current_name}")
         self._switch_active(index)
-        if cross_backend and os.name == "nt":
-            self._restart_agent(f"Switched to session '{name}'")
 
     def _run_pending_session_switch(self) -> None:
         # Execute a sessions-menu cross-backend switch deferred out of the (nested) sessions modal,
