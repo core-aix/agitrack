@@ -9935,7 +9935,9 @@ class ProxyRunner:
         host = self._host
         reassert = getattr(host, "reassert_raw", None)
         if callable(reassert):
-            reassert()
+            changed = reassert()
+            if changed:
+                self._debug(f"reassert_host_raw: re-applied console mode (changed={changed})")
 
     def _restore_terminal(self) -> None:
         if self._host is not None:

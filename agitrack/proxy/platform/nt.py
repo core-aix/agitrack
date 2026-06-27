@@ -107,10 +107,11 @@ class NtHostTerminal:
     def set_cooked(self) -> None:
         self._console.leave()
 
-    def reassert_raw(self) -> None:
+    def reassert_raw(self) -> int:
         # Re-apply console raw mode after a backend switch (which can knock the host console back
-        # into cooked/echo mode, making all input echo as codes). See RawConsole.reassert.
-        self._console.reassert()
+        # into cooked/echo mode, making all input echo as codes). See RawConsole.reassert. Returns
+        # a bitmask of what was actually re-applied (0 = mode was already correct, a no-op).
+        return self._console.reassert()
 
     def stdin_reader_alive(self) -> bool:
         # Diagnostic: whether the console→bridge reader thread is still running. A dead reader

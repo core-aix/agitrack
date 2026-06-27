@@ -185,27 +185,40 @@ class RawConsole:
         )
         _set_mode(self._out, out_mode)
 
-    def reassert(self) -> None:
-        """Forcibly re-apply the raw input/output console modes.
+    def reassert(self) -> int:
+        """Re-apply the raw input/output console modes only if they have actually drifted.
 
         A backend switch (spawning the new backend's ConPTY, tearing the old one down) can
         intermittently knock the *host* console out of raw mode — the symptom is that ALL input
         suddenly echoes as visible escape codes (arrows, mouse, Esc), Ctrl-C stops working, and
         the menu can't be navigated, because the console is back in cooked/echo/line mode and the
-        VT-input translation is off. Re-assert raw here (no save, no code-page change, and — vital
-        — no input flush, so keystrokes typed during the switch aren't dropped). Idempotent and
-        safe to call on every switch; a no-op if we never entered raw mode."""
+        VT-input translation is off.
+
+        CRITICAL: only call ``SetConsoleMode`` when the mode is genuinely wrong. An unconditional
+        ``SetConsoleMode`` (even setting the mode it already has) races the console reader thread's
+        pending ``ReadFile`` and can WEDGE it — the read then never returns even as keystrokes
+        arrive, hanging the session switch (confirmed via DEBUG_RAW: reader alive, reads flat,
+        input gone). In the common case the console is still raw, so this becomes a no-op and the
+        reader is never disturbed.
+
+        Returns a bitmask: 1 = input mode was re-applied, 2 = output mode was. 0 = nothing changed."""
         if not self._entered:
-            return
-        in_mode = _get_mode(self._in)
-        in_mode &= ~(
+            return 0
+        changed = 0
+        cur_in = _get_mode(self._in)
+        want_in = cur_in & ~(
             ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT | ENABLE_MOUSE_INPUT | ENABLE_QUICK_EDIT_MODE
         )
-        in_mode |= ENABLE_EXTENDED_FLAGS | ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_WINDOW_INPUT
-        _set_mode(self._in, in_mode)
-        out_mode = _get_mode(self._out) | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING
-        out_mode |= DISABLE_NEWLINE_AUTO_RETURN
-        _set_mode(self._out, out_mode)
+        want_in |= ENABLE_EXTENDED_FLAGS | ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_WINDOW_INPUT
+        if want_in != cur_in:
+            _set_mode(self._in, want_in)
+            changed |= 1
+        cur_out = _get_mode(self._out)
+        want_out = cur_out | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN
+        if want_out != cur_out:
+            _set_mode(self._out, want_out)
+            changed |= 2
+        return changed
 
     def leave(self) -> None:
         # Re-arm enter() so the next set_raw() does a real cooked->raw transition (re-flush of
