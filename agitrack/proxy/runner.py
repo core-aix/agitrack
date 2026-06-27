@@ -6464,7 +6464,7 @@ class ProxyRunner:
         # only governs whether we then drop back to the low-power idle cadence.)
         if self._is_real_keypress(data):
             self.last_user_input = time.monotonic()
-        self._raw_capture(">", data)
+        # (stdin bytes are raw-captured centrally in _read_stdin so modal/wait reads are logged too)
         self._debug(f"stdin: {data!r} menu_key={self.input.menu_key!r}")
         # A popup message taller than the screen scrolls with PgUp/PgDn, handled before
         # anything else so a long notice can be read in full (and isn't dismissed mid-read).
@@ -6770,9 +6770,9 @@ class ProxyRunner:
             b"2004",
         ):
             if b"\x1b[?" + mode + b"h" in output:
-                os.write(sys.stdout.fileno(), b"\x1b[?" + mode + b"h")
+                self._mirror_to_host(b"\x1b[?" + mode + b"h")
             if b"\x1b[?" + mode + b"l" in output:
-                os.write(sys.stdout.fileno(), b"\x1b[?" + mode + b"l")
+                self._mirror_to_host(b"\x1b[?" + mode + b"l")
         # Track whether the backend drives the mouse itself. If it does, wheel
         # events (and all other mouse events) are forwarded to it; if not, aGiTrack uses the
         # wheel for scrollback. This applies on Windows too: the ConPTY input path DOES
@@ -6795,7 +6795,14 @@ class ProxyRunner:
             # ``...m`` form is an ordinary CSI any terminal consumes, so always mirror it).
             if seq.endswith(b"u") and not self.host_kitty_keyboard:
                 continue
-            os.write(sys.stdout.fileno(), seq)
+            self._mirror_to_host(seq)
+
+    def _mirror_to_host(self, seq: bytes) -> None:
+        # Write a backend-requested terminal mode to the host AND raw-capture it (tag "M") so a
+        # DEBUG_RAW trace shows exactly which mouse/keyboard-protocol modes were pushed to the host
+        # — the evidence for a mode that one backend enables and a switch leaves stuck for the next.
+        self._raw_capture("M", seq)
+        os.write(sys.stdout.fileno(), seq)
 
     def _detect_host_terminal(self) -> None:
         # Pre-reactor: called once during run() startup, before _loop() starts.
@@ -9888,8 +9895,17 @@ class ProxyRunner:
 
     def _read_stdin(self, length: int) -> bytes:
         if self._host is not None:
-            return self._host.read_stdin(length)
-        return os.read(sys.stdin.fileno(), length)
+            data = self._host.read_stdin(length)
+        else:
+            data = os.read(sys.stdin.fileno(), length)
+        # Capture EVERY stdin read here (not just the main reactor phase) so input read by
+        # popups/modals and the wait-with-cancel loops is logged too — essential for diagnosing
+        # a post-switch state where the menu's own keys (arrows/Esc) arrive misencoded. Each
+        # _raw_capture call opens+writes+closes, so the log is flushed line-by-line and survives a
+        # hard-kill (needed when a leak has broken Ctrl-C and graceful exit isn't possible).
+        if data:
+            self._raw_capture(">", data)
+        return data
 
 
 # ---------------------------------------------------------------------------
