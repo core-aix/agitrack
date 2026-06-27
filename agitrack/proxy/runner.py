@@ -5645,28 +5645,26 @@ class ProxyRunner:
         self._debug("switch_active: complete")
 
     def _switch_to_session_index(self, index: int) -> None:
-        # Entry point for switching to another LIVE session by index. When the target runs a
-        # DIFFERENT backend, do it exactly as the Ctrl-G backend switch does — go through
-        # _switch_backend — rather than a single direct _switch_active. On Windows a one-shot
-        # cross-backend _switch_active (resuming a backgrounded session of another backend) hangs:
-        # the host console stops delivering keystrokes (confirmed via DEBUG_RAW — the reader blocks
-        # in ReadFile, input never arrives). Routing cross-backend switches through _switch_backend
-        # is the path the user verified works; same-backend switches keep the direct path.
+        # Entry point for switching to another LIVE session by index.
+        #
+        # On WINDOWS, switching to a session that runs a DIFFERENT backend by resuming its
+        # backgrounded ConPTY steals the host console: keystrokes stop reaching aGiTrack
+        # afterwards (confirmed via DEBUG_RAW — the console input mode drops and even a fresh
+        # ReadFile receives nothing). A FRESH backend spawn never does this (the first
+        # Claude→OpenCode switch, which spawns, works). So for a cross-backend switch on Windows,
+        # become the target session and then RESPAWN its backend fresh (resuming the same
+        # conversation) — a clean ConPTY that doesn't steal the console. This is the
+        # "(re)initialize the new backend" the manual backend-then-session two-step achieves.
         if not (0 <= index < len(self.sessions)):
             return
         target = self.sessions[index]
         target_name = getattr(getattr(target, "backend", None), "name", None)
         current_name = getattr(self.backend, "name", None)
-        if target_name and current_name and target_name != current_name:
-            self._switch_backend(target_name)
-            # _switch_backend lands on a session of that backend; if the user picked a specific
-            # one that isn't now active, land on it (a same-backend switch, which is safe).
-            if target in self.sessions:
-                idx = self.sessions.index(target)
-                if idx != self.active_index:
-                    self._switch_active(idx)
-        else:
-            self._switch_active(index)
+        cross_backend = bool(target_name and current_name and target_name != current_name)
+        name = self._session_name(index)
+        self._switch_active(index)
+        if cross_backend and os.name == "nt":
+            self._restart_agent(f"Switched to session '{name}'")
 
     def _run_pending_session_switch(self) -> None:
         # Execute a sessions-menu cross-backend switch deferred out of the (nested) sessions modal,
