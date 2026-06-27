@@ -826,10 +826,18 @@ class ProxyRunner:
         # AGITRACK_DEBUG_RAW records every raw child-output / user-input chunk so an
         # interactive glitch (e.g. Claude's native session picker) can be replayed
         # byte-for-byte; it implies debug logging too.
-        self.raw_capture = (getenv_compat("DEBUG_RAW") or "").strip().lower() in {"1", "true", "yes"}
-        self.debug_proxy = (
-            verbose or self.raw_capture or (getenv_compat("DEBUG_PROXY") or "").strip().lower() in {"1", "true", "yes"}
-        )
+        # Honour the AGITRACK_/AGIT_ prefixed names (the project convention) AND the bare
+        # DEBUG_RAW / DEBUG_PROXY: these are throwaway diagnostic switches a user sets ad hoc in
+        # their shell, and the bare form is the obvious thing to reach for (a prefixed-only flag
+        # silently produced no log).
+        def _debug_flag(name: str) -> bool:
+            value = getenv_compat(name)
+            if value is None:
+                value = os.environ.get(name)
+            return (value or "").strip().lower() in {"1", "true", "yes"}
+
+        self.raw_capture = _debug_flag("DEBUG_RAW")
+        self.debug_proxy = verbose or self.raw_capture or _debug_flag("DEBUG_PROXY")
         # One diagnostic-log file per run, in the base repo's .agitrack/ (survives the
         # per-run worktree teardown).
         self._diag_run = time.strftime("%Y%m%d-%H%M%S")
