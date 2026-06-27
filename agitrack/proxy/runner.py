@@ -2185,10 +2185,20 @@ class ProxyRunner:
         redundant with aGiTrack's silent update and, under the sandbox, fails outright. Does NOT
         affect aGiTrack's own `opencode upgrade`, which runs from the unconfined proxy with the
         normal environment."""
+        env: dict[str, str] = {}
         checks_on = self.global_config is None or getattr(self.global_config, "check_for_updates", True)
         if getattr(self.backend, "name", None) == "opencode" and checks_on and self._backend_update_via_agitrack():
-            return {"OPENCODE_DISABLE_AUTOUPDATE": "1"}
-        return None
+            env["OPENCODE_DISABLE_AUTOUPDATE"] = "1"
+        if os.name == "nt":
+            # On Windows aGiTrack skips host-terminal capability detection (the console doesn't
+            # answer the OSC/DA color queries the POSIX path uses), so a backend that probes the
+            # terminal for color support sees none and renders greyscale (observed with Claude;
+            # OpenCode forces color itself). aGiTrack DOES render 24-bit color to the host (VT
+            # processing is on — OpenCode's colors prove the pipeline), so tell the child the
+            # terminal is truecolor-capable. Scoped to Windows; POSIX keeps real detection.
+            env.setdefault("COLORTERM", "truecolor")
+            env.setdefault("FORCE_COLOR", "3")
+        return env or None
 
     def _backend_version(self) -> str:
         """The backend CLI's reported version string, used to detect whether an update actually

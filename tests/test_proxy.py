@@ -8457,15 +8457,37 @@ def test_backend_child_env_disables_opencode_autoupdate_when_agitrack_takes_over
     runner.backend = types.SimpleNamespace(name="opencode")
     runner.global_config = types.SimpleNamespace(check_for_updates=True)
     runner._backend_update_via_agitrack = lambda: True
-    assert runner._backend_child_env() == {"OPENCODE_DISABLE_AUTOUPDATE": "1"}
+    # Assert the autoupdate-suppression behavior independent of the color env vars the Windows
+    # path also injects (COLORTERM/FORCE_COLOR), which are orthogonal to this.
+    assert (runner._backend_child_env() or {}).get("OPENCODE_DISABLE_AUTOUPDATE") == "1"
 
     # npm/native (not sandbox-blocked) → leave OpenCode's own auto-update alone.
     runner._backend_update_via_agitrack = lambda: False
-    assert runner._backend_child_env() is None
+    assert "OPENCODE_DISABLE_AUTOUPDATE" not in (runner._backend_child_env() or {})
 
     # Update checks off → aGiTrack won't auto-update, so don't suppress OpenCode's either.
     runner._backend_update_via_agitrack = lambda: True
     runner.global_config = types.SimpleNamespace(check_for_updates=False)
+    assert "OPENCODE_DISABLE_AUTOUPDATE" not in (runner._backend_child_env() or {})
+
+
+def test_backend_child_env_forces_color_on_windows_only(tmp_path, monkeypatch):
+    # On Windows aGiTrack skips host-terminal color detection, so a probing backend (Claude)
+    # renders greyscale unless told the terminal is color-capable. Force truecolor there; POSIX
+    # keeps real detection (no forced color env).
+    import agitrack.proxy.runner as proxy_mod
+
+    runner = _update_runner(tmp_path)
+    runner.backend = types.SimpleNamespace(name="claude")
+    runner.global_config = types.SimpleNamespace(check_for_updates=True)
+    runner._backend_update_via_agitrack = lambda: False
+
+    monkeypatch.setattr(proxy_mod.os, "name", "nt")
+    env = runner._backend_child_env() or {}
+    assert env.get("COLORTERM") == "truecolor"
+    assert env.get("FORCE_COLOR") == "3"
+
+    monkeypatch.setattr(proxy_mod.os, "name", "posix")
     assert runner._backend_child_env() is None
 
 
