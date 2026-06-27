@@ -5653,24 +5653,24 @@ class ProxyRunner:
             with lock:
                 self.active = self.sessions[index]
             self.scroll_back = 0
+            # Switch IN PLACE: keep the target session's backend RUNNING and resume its existing
+            # (backgrounded) ConPTY. NEVER tear it down or respawn it — an earlier Windows
+            # workaround did exactly that (_restart_agent), but teardown calls cleanup() →
+            # interrupt(), which sends Ctrl-C/ETX to the very session you're switching to and
+            # cancels its in-progress turn ("Interrupted"). The leak/hang that workaround was
+            # meant to fix is now fixed at its root (subprocess console isolation — see
+            # proc.console_isolation_kwargs), so the in-place resume is correct on every platform.
             if os.name == "nt":
-                # WINDOWS: do NOT resume the target session's backgrounded ConPTY in place.
-                # Doing so steals the host console — keystrokes/mouse stop reaching aGiTrack
-                # and the reader thread's blocking ReadFile wedges (the session-switch hang).
-                # Instead RESTART the backend fresh into the now-active session: a clean
-                # teardown + respawn that re-initializes the screen and console exactly as a
-                # fresh aGiTrack launch would. The conversation is preserved because
-                # self.state.backend_session_id is unchanged, so the respawn resumes it.
-                # This is the user-requested "reset state as if you restart aGiTrack in the
-                # new session", and it uses the same fresh-spawn path the backend menu uses.
-                self._debug("switch_active: nt -> _restart_agent (fresh respawn into target)")
-                self._restart_agent(f"Switched to session '{self._session_name(index)}'")
-            else:
-                self._resize_child()
-                self._enable_host_mouse()
-                self._reassert_host_raw()  # a switch can knock the host console out of raw mode
-                self._set_message(f"Switched to session '{self._session_name(index)}'")
-                self._render()
+                # Clear the OUTGOING backend's host terminal-mode mirror so the host returns to a
+                # clean baseline (mouse/kitty/paste); the incoming backend re-establishes only its
+                # own modes via _sync_terminal_modes as its output streams in. Host-side only — it
+                # never touches a backend's ConPTY, so it can't interrupt the target.
+                self._disable_host_terminal_modes()
+            self._resize_child()
+            self._enable_host_mouse()
+            self._reassert_host_raw()  # a switch can knock the host console out of raw mode
+            self._set_message(f"Switched to session '{self._session_name(index)}'")
+            self._render()
             self._debug("switch_active: swapped + rendered")
             # The copy-back mute is per active-session-visit: a switch resets it so the
             # session we just landed on gets offered its own worktree-only files (background

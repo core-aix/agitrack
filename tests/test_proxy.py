@@ -7224,12 +7224,12 @@ def test_debug_and_raw_logs_write_to_base_repo_when_enabled(tmp_path):
     assert not (base / ".agitrack" / "proxy-raw-20260627-202122.log").exists()
 
 
-def test_switch_active_full_reset_on_windows_inplace_on_posix(monkeypatch):
-    # Per the user: switching sessions must reset state "as if you restart aGiTrack in the
-    # new session". On Windows, resuming the target's backgrounded ConPTY in place steals the
-    # host console and wedges stdin (the session-switch hang), so the switch must instead do a
-    # full teardown + fresh respawn (_restart_agent). On POSIX there is no console-steal, so
-    # the lighter in-place resume (resize + re-enable mouse) is kept.
+def test_switch_active_resumes_in_place_without_interrupting_target(monkeypatch):
+    # Switching to a session must KEEP its backend running — resume the existing ConPTY in
+    # place, never teardown/respawn it. A teardown would call interrupt() (Ctrl-C/ETX) on the
+    # session being switched to and cancel its in-progress turn. So _switch_active must NOT call
+    # _restart_agent on any platform; it resizes + resumes. On Windows it additionally clears the
+    # host terminal-mode mirror (host-side only — never touches a backend's ConPTY).
     import agitrack.proxy.runner as proxy_mod
 
     runner = _mux_runner()
@@ -7238,20 +7238,25 @@ def test_switch_active_full_reset_on_windows_inplace_on_posix(monkeypatch):
 
     restarts: list[str] = []
     resizes: list[int] = []
+    host_resets: list[int] = []
     runner._restart_agent = lambda msg: restarts.append(msg)
     runner._resize_child = lambda: resizes.append(1)
+    runner._disable_host_terminal_modes = lambda: host_resets.append(1)
 
     monkeypatch.setattr(proxy_mod.os, "name", "nt")
     runner._switch_active(1)
-    assert runner.active_index == 1 and runner.repo == "repoB"  # still swapped
-    assert restarts and not resizes  # full reset, no in-place resume
+    assert runner.active_index == 1 and runner.repo == "repoB"  # swapped
+    assert resizes and not restarts  # in-place resume, the target backend is never respawned
+    assert host_resets  # host mode mirror cleared on Windows
 
     restarts.clear()
     resizes.clear()
+    host_resets.clear()
     monkeypatch.setattr(proxy_mod.os, "name", "posix")
     runner._switch_active(0)
     assert runner.active_index == 0 and runner.repo == "repoA"  # swapped back
-    assert resizes and not restarts  # in-place resume, no respawn
+    assert resizes and not restarts  # in-place resume on POSIX too
+    assert not host_resets  # POSIX path leaves host modes alone
 
 
 # --- issue #18: Ctrl-C inside a popup goes through the full exit flow -----------
