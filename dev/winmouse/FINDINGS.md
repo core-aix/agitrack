@@ -57,19 +57,28 @@ Spawned each backend, let it paint its TUI (it enables mouse itself), then forwa
   consumed as a mouse event (silent here only because nothing was actionable at those coords).
 
 ## So what was the original leak?
-Not a ConPTY input-encoding problem. The remaining suspect (per AGENTS.md + commits 69dcbd3 /
-55430ca) is **host-side motion tracking over RDP**: the host console floods `?1002/1003h` motion
-reports that the RDP console does not round-trip cleanly (split/garbled sequences), which then
-forward to the backend and render as literal `[<35;..M`. That is a host-terminal artifact, not
-the ConPTY input path — clean motion sequences pass through identically to button/wheel.
+Not a ConPTY input-encoding problem. It is **host-side motion tracking over RDP**: the host
+console floods `?1002/1003h` motion reports that the RDP console does not round-trip cleanly
+(split/garbled sequences), which then forward to the backend and render as literal `[<35;..M`
+in its input box. That is a host-terminal artifact, not the ConPTY input path — clean *injected*
+motion sequences pass through identically to button/wheel, but the *host's own* motion stream over
+RDP does not.
 
-## Recommended fix (revised from the handoff)
+## CONFIRMED by live real-mouse testing (the user, over RDP)
+After shipping full pass-through (button/wheel/motion forwarded, motion mirrored to host):
+- Button/wheel/click forwarding to a freshly-started backend: **works, no leak.**
+- **Motion leaks**: scrolling/hovering after a Claude→OpenCode switch produced `[<35;30;10M`
+  (button 35 = no-button motion = `?1003h` hover) in OpenCode's input box. Starting a backend
+  alone mostly hid it; the switch made it reliable.
+- A mouse scroll while the exit "Finalizing…" message showed also leaked (host mouse still on
+  during the cooked, stdin-unserviced teardown).
+
+## Final fix (what landed)
 1. **Drop the win32-input-mode plan** — unnecessary; neither backend uses it.
-2. **Revert the broad band-aid** so button + wheel mouse reach the backend: let `child_mouse`
-   track the backend's real `?1000h` (don't force `False` on Windows), and stop stripping SGR
-   mouse from forwarded input when the backend drives the mouse.
-3. **Keep the host-side motion mitigation** (don't mirror `?1002/1003h` to the host on Windows)
-   until real-mouse + RDP testing shows motion can be forwarded without the leak — this is the
-   part that needs the user's physical-mouse confirmation.
-4. Keep the focus-event strip (`?1004`) — conhost/RDP focus handling is its own can of worms and
-   the backends don't need it.
+2. **Forward button/wheel/click + focus to the backend**: `child_mouse` tracks the backend's real
+   `?1000h` (no longer forced `False` on Windows); no mouse/focus stripping. (Verified working.)
+3. **Do NOT mirror motion (`?1002/1003h`) to the host on Windows** (`_no_host_enable = {1002,1003}`)
+   — the RDP motion leak is real and host-side; the backend loses hover/drag but keeps clicks +
+   wheel. This is the proven, conservative tradeoff.
+4. **Disable host terminal modes at the start of exit finalize** so a scroll during the cooked
+   "Finalizing…" teardown can't echo its raw report; re-enabled if exit is aborted.

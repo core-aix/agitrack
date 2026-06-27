@@ -6748,12 +6748,16 @@ class ProxyRunner:
     def _sync_terminal_modes(self, output: bytes) -> None:
         # OpenCode enables mouse reporting on its PTY. Because aGiTrack renders the
         # screen itself, the host terminal never sees those mode switches unless
-        # we mirror them explicitly. Full pass-through: every mouse/paste mode the backend
-        # requests is mirrored to the host on all platforms (including motion 1002/1003 on
-        # Windows), so the host reports the matching events and aGiTrack can forward them to
-        # the backend unchanged. (A deterministic ConPTY harness confirmed clean SGR mouse —
-        # button, wheel, and motion — passes through conhost to a VT-input backend verbatim;
-        # see dev/winmouse/FINDINGS.md.)
+        # we mirror them explicitly. The ConPTY *input* path delivers clean SGR mouse to the
+        # backend (button/wheel/click verified end-to-end — see dev/winmouse/FINDINGS.md), so
+        # those modes mirror on all platforms and aGiTrack forwards the events unchanged.
+        # EXCEPT motion tracking (1002 button-event/drag, 1003 any-event/hover) on Windows: the
+        # host console — notably over RDP — emits motion reports it does NOT round-trip cleanly,
+        # so once forwarded to a mouse-driving backend they surface as literal `[<35;..M` text in
+        # its input box (confirmed in a live Claude→OpenCode test). Don't enable host motion
+        # tracking there; button + wheel + click still work, the backend just loses hover/drag.
+        # (Disables are always mirrored.)
+        _no_host_enable = {b"1002", b"1003"} if os.name == "nt" else set()
         for mode in (
             b"9",
             b"1000",
@@ -6768,7 +6772,7 @@ class ProxyRunner:
             b"1016",
             b"2004",
         ):
-            if b"\x1b[?" + mode + b"h" in output:
+            if b"\x1b[?" + mode + b"h" in output and mode not in _no_host_enable:
                 os.write(sys.stdout.fileno(), b"\x1b[?" + mode + b"h")
             if b"\x1b[?" + mode + b"l" in output:
                 os.write(sys.stdout.fileno(), b"\x1b[?" + mode + b"l")
@@ -8453,6 +8457,9 @@ class ProxyRunner:
                 # stand (they never lose work); nothing was deleted.
                 self._exiting = False
                 self._finalized_on_exit = False
+                # Finalize disabled host mouse/focus/paste reporting up front; we're staying
+                # running, so restore it for the live session.
+                self._enable_host_mouse()
                 self._set_message(
                     "Exit cancelled. Your worktree and its files were NOT deleted — copy/move what you "
                     "need, then exit again. (Commits already made this exit were kept.)",
@@ -8526,6 +8533,13 @@ class ProxyRunner:
         detail = self._describe_exit_finalize()
         self._set_message(detail or "Finalizing things before exiting…", seconds=30)
         self._render()
+        # Stop the host terminal reporting mouse/focus/paste NOW, before the (sometimes
+        # multi-second) finalize below. Finalize doesn't service stdin, and parts of it run
+        # cooked (prompts, backend teardown), so a mouse scroll while "Finalizing…" shows would
+        # otherwise echo its raw SGR report (`\x1b[<…M`) onto the screen as literal text. The
+        # backend is on its way out, so it doesn't need these events either. (Re-enabled on the
+        # _exit_aborted path, where we stay running.)
+        self._disable_host_terminal_modes()
         # Stop the git worker first so the exit-time foreground commits below run on
         # this (main) thread without racing a worker pass. After this join the
         # finalize git is the only git touching the worktree.

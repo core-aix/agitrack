@@ -49,16 +49,19 @@ you have every commit below, and confirm `git push` is authenticated.
 - The original leak was a **host-side artifact** (motion/focus reports mangled by the RDP console),
   not the ConPTY input path.
 
-**What was done:** the broad band-aid was reverted for full pass-through —
-`_sync_terminal_modes` now mirrors motion (1002/1003) to the host and sets `child_mouse=True` from
-the backend's real `?1000h` on Windows too; the Windows focus-event strip in `_reactor_stdin_phase`
-was removed. All Windows-only mouse/focus special-casing is gone; the path now equals POSIX. Tests
-green (466 passed in `tests/test_proxy.py`+`tests/test_windows_platform.py`).
+**What was done (final, after real-mouse RDP testing):**
+- Forward button/wheel/click + focus to the backend: `child_mouse` tracks the backend's real
+  `?1000h` on Windows (no longer forced `False`); focus-event strip removed. **Verified working.**
+- **Motion (1002/1003) is NOT mirrored to the host on Windows** (`_no_host_enable = {1002,1003}`):
+  real-mouse testing over RDP confirmed the host's own motion stream leaks as literal `[<35;..M`
+  in the backend's input box (button 35 = `?1003h` hover). Backend loses hover/drag, keeps
+  clicks/wheel. The original band-aid was right about *this specific* risk.
+- **Exit finalize disables host terminal modes up front** so a scroll during the cooked,
+  stdin-unserviced "Finalizing…" teardown can't echo its raw mouse report (re-enabled on abort).
 
-**Remaining (needs the user's real mouse over RDP):** confirm scroll/click/select/drag inside live
-claude + opencode, both worktree and `--no-worktree`. If motion/focus reports leak as literal text
-over RDP (the host-mangling risk), that's where a targeted host-side mitigation (or a different
-terminal stack) would go — capture the raw host bytes first.
+**Resolved.** The only behaviour given up is backend hover/drag motion over RDP — an inherent
+host-console limitation, not the ConPTY path. If that's ever wanted, capture the raw host motion
+bytes over RDP first to see exactly how they're mangled.
 
 ### (obsolete) original plan — kept for context only
 **Design goal (from the user):** aGiTrack should forward **all** keys and mouse events to the
