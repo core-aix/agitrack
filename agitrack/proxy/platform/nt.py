@@ -110,6 +110,11 @@ class NtHostTerminal:
         # into cooked/echo mode, making all input echo as codes). See RawConsole.reassert.
         self._console.reassert()
 
+    def stdin_reader_alive(self) -> bool:
+        # Diagnostic: whether the console→bridge reader thread is still running. A dead reader
+        # means no keystroke can reach the reactor (a hang where the loop still spins).
+        return self._reader is not None and self._reader.is_alive()
+
     def restore_terminal(self) -> None:
         self.disable_host_terminal_modes()
         self.set_cooked()
@@ -178,10 +183,23 @@ class NtHostTerminal:
         return False
 
     def _pump_stdin(self) -> None:
+        # An empty read is NOT a reliable EOF on a Windows console: a SetConsoleMode from another
+        # thread (e.g. reassert_raw on a backend switch) can make a pending ReadFile return zero
+        # bytes. Breaking on that permanently kills stdin — the symptom was a hang after switching
+        # sessions where the reactor kept looping but no keystroke was ever delivered again. The
+        # console has no real EOF, so treat empty as transient: retry, and exit only when asked to
+        # stop (set on teardown). A large consecutive-empty backstop guards a truly dead handle so
+        # the thread can't spin forever.
+        empties = 0
         while not self._stop.is_set():
             data = self._winconsole.read_input(4096)
             if not data:
-                break
+                empties += 1
+                if empties > 5000:  # ~50s of nothing but empty reads → the handle is really gone
+                    break
+                self._stop.wait(0.01)  # brief backoff; also wakes promptly on teardown
+                continue
+            empties = 0
             try:
                 self._wsock.sendall(data)
             except OSError:

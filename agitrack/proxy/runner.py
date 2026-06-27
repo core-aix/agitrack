@@ -6491,6 +6491,16 @@ class ProxyRunner:
         """
         stdin_fd = self._stdin_fileno()
         if stdin_fd not in readable:
+            # Diagnostic (throttled): if a hang ever recurs where the loop spins but no keystroke
+            # is delivered, this records whether the host's console→bridge reader thread is alive.
+            if self.debug_proxy:
+                now = time.monotonic()
+                if now - getattr(self, "_dbg_stdin_idle_at", 0.0) > 5.0:
+                    self._dbg_stdin_idle_at = now
+                    alive = "n/a"
+                    if self._host is not None and hasattr(self._host, "stdin_reader_alive"):
+                        alive = self._host.stdin_reader_alive()
+                    self._debug(f"stdin idle: fd={stdin_fd} reader_alive={alive}")
             return None
         data = self._read_stdin(4096)
         # Only a real keystroke resets the idle backoff — NOT a mouse wheel / move /
