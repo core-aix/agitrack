@@ -3229,7 +3229,7 @@ class ProxyRunner:
         if arg in {"new", "fresh"}:
             return self._prompt_new_session()
         if arg.isdigit():
-            self._switch_active(int(arg) - 1)
+            self._switch_to_session_index(int(arg) - 1)
             return self._MENU_DONE
         return self._session_menu()
 
@@ -3505,7 +3505,7 @@ class ProxyRunner:
                 if value == self.active_index:
                     self._select_current_session()
                 else:
-                    self._switch_active(value)
+                    self._switch_to_session_index(value)
                 return self._MENU_DONE
             if kind == "integrate-active":
                 self._integrate_active_session()  # explicit "integrate now" for the active session
@@ -3912,7 +3912,7 @@ class ProxyRunner:
         # OpenCode session while the active backend is Claude).
         for index, session in enumerate(self.sessions):
             if getattr(getattr(session, "state", None), "backend_session_id", None) == session_id:
-                self._switch_active(index)
+                self._switch_to_session_index(index)
                 return
         if self._live_session_name_taken(name):
             # The name is occupied by a different LIVE session. Two live sessions can't share a
@@ -5628,6 +5628,30 @@ class ProxyRunner:
         # checked out in the repo directory — ask where its changes should merge.
         self._prompt_merge_target_if_diverged()
         self._debug("switch_active: complete")
+
+    def _switch_to_session_index(self, index: int) -> None:
+        # Entry point for switching to another LIVE session by index. When the target runs a
+        # DIFFERENT backend, do it exactly as the Ctrl-G backend switch does — go through
+        # _switch_backend — rather than a single direct _switch_active. On Windows a one-shot
+        # cross-backend _switch_active (resuming a backgrounded session of another backend) hangs:
+        # the host console stops delivering keystrokes (confirmed via DEBUG_RAW — the reader blocks
+        # in ReadFile, input never arrives). Routing cross-backend switches through _switch_backend
+        # is the path the user verified works; same-backend switches keep the direct path.
+        if not (0 <= index < len(self.sessions)):
+            return
+        target = self.sessions[index]
+        target_name = getattr(getattr(target, "backend", None), "name", None)
+        current_name = getattr(self.backend, "name", None)
+        if target_name and current_name and target_name != current_name:
+            self._switch_backend(target_name)
+            # _switch_backend lands on a session of that backend; if the user picked a specific
+            # one that isn't now active, land on it (a same-backend switch, which is safe).
+            if target in self.sessions:
+                idx = self.sessions.index(target)
+                if idx != self.active_index:
+                    self._switch_active(idx)
+        else:
+            self._switch_active(index)
 
     def _join_parse_worker_before_swap(self) -> None:
         # A parse worker started for the active session reads that session's
