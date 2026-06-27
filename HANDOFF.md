@@ -38,30 +38,27 @@ you have every commit below, and confirm `git push` is authenticated.
   must be **reverted** once Task A makes pass-through actually work. (The focus-strip and not-mirror-
   motion bits may stay or be folded into the real fix.)
 
-## Task A — STATUS: largely RESOLVED; premise was wrong (see dev/winmouse/FINDINGS.md)
-**What was actually found (deterministic harness + live-backend injection, in-VM, build 26200):**
-- ConPTY **does** deliver clean mouse: it passes SGR button/wheel/**motion** and focus events
-  through to a VT-input backend **verbatim**; injecting them into live claude+opencode produced
-  **no leak**.
-- **Neither backend enables win32-input-mode.** The `\x1b[?9001h` seen in their output is
-  conhost's *unconditional startup emission*, NOT the backend — so implementing win32-input-mode
-  input encoding (the plan below) would have fixed nothing. **That plan is dropped.**
-- The original leak was a **host-side artifact** (motion/focus reports mangled by the RDP console),
-  not the ConPTY input path.
+## Task A — STATUS: single-backend DONE; switch-carryover OPEN (see dev/winmouse/FINDINGS.md)
+**What was found (deterministic harness + live-backend injection, in-VM, build 26200):**
+- ConPTY **does** deliver clean mouse: SGR button/wheel/**motion** + focus pass through to a
+  VT-input backend **verbatim**; injection into live claude+opencode leaked nothing.
+- **Neither backend enables win32-input-mode.** The `\x1b[?9001h` is conhost's *unconditional
+  startup emission*, NOT the backend — implementing win32-input-mode would fix nothing. Dropped.
 
-**What was done (final, after real-mouse RDP testing):**
-- Forward button/wheel/click + focus to the backend: `child_mouse` tracks the backend's real
-  `?1000h` on Windows (no longer forced `False`); focus-event strip removed. **Verified working.**
-- **Motion (1002/1003) is NOT mirrored to the host on Windows** (`_no_host_enable = {1002,1003}`):
-  real-mouse testing over RDP confirmed the host's own motion stream leaks as literal `[<35;..M`
-  in the backend's input box (button 35 = `?1003h` hover). Backend loses hover/drag, keeps
-  clicks/wheel. The original band-aid was right about *this specific* risk.
+**What was done:**
+- Full mouse pass-through on Windows, same as POSIX: forward button/wheel/click/**motion** + focus;
+  `child_mouse` tracks the backend's real `?1000h` (no longer forced `False`); motion mirrored to
+  the host (the backend needs it for **drag-select / copy**). **A single backend works fully.**
 - **Exit finalize disables host terminal modes up front** so a scroll during the cooked,
-  stdin-unserviced "Finalizing…" teardown can't echo its raw mouse report (re-enabled on abort).
+  stdin-unserviced "Finalizing…" teardown can't echo its raw report (re-enabled on abort).
 
-**Resolved.** The only behaviour given up is backend hover/drag motion over RDP — an inherent
-host-console limitation, not the ConPTY path. If that's ever wanted, capture the raw host motion
-bytes over RDP first to see exactly how they're mangled.
+**OPEN: switching backends carries over state.** Claude→OpenCode leaks mouse codes into the input
+box AND corrupts keyboard input (phantom char on Enter, Ctrl-C stops exiting). Switch-only; single
+backend is clean. Per-session input state is reset and the new backend's modes are re-mirrored, so
+the obvious candidates are ruled out — needs a `DEBUG_RAW=1` capture (`.agitrack/proxy-raw-*.log`)
+of post-switch input to pin the exact carried-over host/terminal state. A prior motion-only
+mitigation (`_no_host_enable={1002,1003}`) was reverted: it broke copy and only masked a symptom.
+Worst-case fallback the user accepted: disable backend switching on Windows.
 
 ### (obsolete) original plan — kept for context only
 **Design goal (from the user):** aGiTrack should forward **all** keys and mouse events to the

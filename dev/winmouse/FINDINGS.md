@@ -64,21 +64,28 @@ in its input box. That is a host-terminal artifact, not the ConPTY input path �
 motion sequences pass through identically to button/wheel, but the *host's own* motion stream over
 RDP does not.
 
-## CONFIRMED by live real-mouse testing (the user, over RDP)
-After shipping full pass-through (button/wheel/motion forwarded, motion mirrored to host):
-- Button/wheel/click forwarding to a freshly-started backend: **works, no leak.**
-- **Motion leaks**: scrolling/hovering after a Claude→OpenCode switch produced `[<35;30;10M`
-  (button 35 = no-button motion = `?1003h` hover) in OpenCode's input box. Starting a backend
-  alone mostly hid it; the switch made it reliable.
+## CONFIRMED by live real-mouse testing (the user)
+- **A single backend works fully** — mouse click, wheel/scroll, drag-select **copy** — no leak.
+- **Switching backends leaks** (e.g. Claude→OpenCode): mouse codes (`[<0;..`, `[<35;..`) appear in
+  the backend's input box, AND keyboard input is corrupted — a phantom char on Enter, and Ctrl-C
+  stops exiting. Switch-only; a single backend is clean.
+- An earlier motion-only mitigation (`_no_host_enable = {1002,1003}`) **broke backend copy**
+  (drag-select needs motion) and only masked one symptom of the switch carryover — reverted.
 - A mouse scroll while the exit "Finalizing…" message showed also leaked (host mouse still on
-  during the cooked, stdin-unserviced teardown).
+  during the cooked, stdin-unserviced teardown) — fixed separately.
 
 ## Final fix (what landed)
 1. **Drop the win32-input-mode plan** — unnecessary; neither backend uses it.
-2. **Forward button/wheel/click + focus to the backend**: `child_mouse` tracks the backend's real
-   `?1000h` (no longer forced `False` on Windows); no mouse/focus stripping. (Verified working.)
-3. **Do NOT mirror motion (`?1002/1003h`) to the host on Windows** (`_no_host_enable = {1002,1003}`)
-   — the RDP motion leak is real and host-side; the backend loses hover/drag but keeps clicks +
-   wheel. This is the proven, conservative tradeoff.
-4. **Disable host terminal modes at the start of exit finalize** so a scroll during the cooked
+2. **Forward ALL mouse (button/wheel/click/motion) + focus to the backend** on Windows, same as
+   POSIX: `child_mouse` tracks the backend's real `?1000h` (no longer forced `False`); no
+   mouse/focus stripping; motion mirrored to the host (the backend needs it for drag-select/copy).
+3. **Disable host terminal modes at the start of exit finalize** so a scroll during the cooked
    "Finalizing…" teardown can't echo its raw report; re-enabled if exit is aborted.
+
+## OPEN ISSUE — switching backends carries over state (single backend is fine)
+That switching breaks Enter/Ctrl-C *and* mouse together points to a **process-global host/terminal
+state set by the first backend that the second doesn't reset** (a keyboard-protocol mode, host
+console mode, or input-pipeline state). Per-session input state (`_input_tail`, `passthrough_escape`,
+`child_mouse`) is reset on switch, and the foreground output path *does* mirror the new backend's
+modes (`_sync_terminal_modes` at the `<` drain), so the obvious candidates are ruled out — needs a
+byte-exact `DEBUG_RAW=1` capture of the post-switch input (`.agitrack/proxy-raw-*.log`) to pin it.

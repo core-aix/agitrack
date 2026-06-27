@@ -6748,16 +6748,13 @@ class ProxyRunner:
     def _sync_terminal_modes(self, output: bytes) -> None:
         # OpenCode enables mouse reporting on its PTY. Because aGiTrack renders the
         # screen itself, the host terminal never sees those mode switches unless
-        # we mirror them explicitly. The ConPTY *input* path delivers clean SGR mouse to the
-        # backend (button/wheel/click verified end-to-end — see dev/winmouse/FINDINGS.md), so
-        # those modes mirror on all platforms and aGiTrack forwards the events unchanged.
-        # EXCEPT motion tracking (1002 button-event/drag, 1003 any-event/hover) on Windows: the
-        # host console — notably over RDP — emits motion reports it does NOT round-trip cleanly,
-        # so once forwarded to a mouse-driving backend they surface as literal `[<35;..M` text in
-        # its input box (confirmed in a live Claude→OpenCode test). Don't enable host motion
-        # tracking there; button + wheel + click still work, the backend just loses hover/drag.
-        # (Disables are always mirrored.)
-        _no_host_enable = {b"1002", b"1003"} if os.name == "nt" else set()
+        # we mirror them explicitly. Full pass-through (all platforms): every mouse/paste mode
+        # the backend requests — including motion 1002 (button-event/drag) and 1003 (any-event),
+        # which the backend needs for drag-select / copy — is mirrored to the host so the host
+        # reports the matching events and aGiTrack forwards them to the backend unchanged. The
+        # ConPTY input path delivers clean SGR mouse to a VT-input backend (verified end-to-end;
+        # see dev/winmouse/FINDINGS.md). Leaks seen on a backend switch are carryover state under
+        # investigation, NOT a reason to drop motion (the backend needs it for drag-select/copy).
         for mode in (
             b"9",
             b"1000",
@@ -6772,7 +6769,7 @@ class ProxyRunner:
             b"1016",
             b"2004",
         ):
-            if b"\x1b[?" + mode + b"h" in output and mode not in _no_host_enable:
+            if b"\x1b[?" + mode + b"h" in output:
                 os.write(sys.stdout.fileno(), b"\x1b[?" + mode + b"h")
             if b"\x1b[?" + mode + b"l" in output:
                 os.write(sys.stdout.fileno(), b"\x1b[?" + mode + b"l")
