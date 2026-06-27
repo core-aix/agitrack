@@ -6,7 +6,11 @@ import subprocess
 from pathlib import Path
 
 from agitrack.backends.base import AgentResult, TokenUsage
-from agitrack.proc import _IS_WINDOWS, resolve_subprocess_command  # _IS_WINDOWS: see proc.py
+from agitrack.proc import (  # _IS_WINDOWS: see proc.py
+    _IS_WINDOWS,
+    console_isolation_kwargs,
+    resolve_subprocess_command,
+)
 
 # The summarizer is a mechanical text-reduction task that gains nothing from extended
 # reasoning, so its bare run turns thinking off entirely rather than using whatever the
@@ -149,6 +153,9 @@ class ClaudeBackend:
                 check=False,
                 env=env,
                 timeout=_SUMMARIZER_TIMEOUT_SECONDS if bare else None,
+                # Keep the claude CLI off the host console (raw-mode preservation; see proc.py).
+                # When we feed it via input= (to_stdin) subprocess already pipes stdin.
+                **console_isolation_kwargs(detach_stdin=not to_stdin),
             )
         except subprocess.TimeoutExpired:
             return AgentResult(

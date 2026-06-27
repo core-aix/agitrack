@@ -90,6 +90,31 @@ def detach_kwargs() -> dict:
     return {"start_new_session": True}
 
 
+def console_isolation_kwargs(*, detach_stdin: bool = True) -> dict:
+    """``subprocess`` kwargs for a SYNCHRONOUS, output-captured child that must NOT disturb the
+    parent's console.
+
+    aGiTrack keeps the host console in raw mode on Windows. A child process that INHERITS that
+    console can call ``SetConsoleMode`` on it (the backend CLIs do, to talk to a TTY — e.g.
+    ``opencode session list`` run while building the sessions menu) and never restore it, which
+    drops the host out of raw mode: the user then sees keystrokes echo as visible escape codes
+    and input stops reaching aGiTrack until raw mode is reasserted. Give the child its OWN hidden
+    console (``CREATE_NO_WINDOW``) so its console calls can't touch ours, and detach its stdin
+    from our console (``DEVNULL``) so it neither reads our input nor probes it as a TTY (which
+    also stops a TTY-expecting CLI from hanging the menu thread).
+
+    Pass ``detach_stdin=False`` for a call that already feeds the child via ``input=`` (the two
+    are mutually exclusive in ``subprocess``); the ``input=`` pipe already keeps it off the
+    console. On POSIX there is no console coupling, so only the stdin detach (harmless) applies.
+    """
+    kwargs: dict = {}
+    if detach_stdin:
+        kwargs["stdin"] = subprocess.DEVNULL
+    if _IS_WINDOWS:
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    return kwargs
+
+
 def pid_alive(pid: int) -> bool:
     """Whether ``pid`` names a live process.
 

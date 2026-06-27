@@ -56,6 +56,35 @@ def test_terminate_pid_dispatches_to_windows_helper(monkeypatch):
     assert seen == [555]
 
 
+# --- console_isolation_kwargs (keep child subprocesses off the host console) --------
+
+
+def test_console_isolation_kwargs_windows_detaches_stdin_and_hides_console(monkeypatch):
+    # On Windows a captured child must not inherit our console (it would reset raw mode and
+    # make input echo as escape codes) — give it its own hidden console and a detached stdin.
+    monkeypatch.setattr(proc, "_IS_WINDOWS", True)
+    kwargs = proc.console_isolation_kwargs()
+    assert kwargs["stdin"] == subprocess.DEVNULL
+    assert "creationflags" in kwargs  # CREATE_NO_WINDOW → child gets its own console, not ours
+
+
+def test_console_isolation_kwargs_windows_keeps_stdin_when_feeding_input(monkeypatch):
+    # When the caller feeds the child via input=, subprocess already pipes stdin; passing our
+    # own stdin= too would be a conflict, so detach_stdin=False omits it (creationflags stay).
+    monkeypatch.setattr(proc, "_IS_WINDOWS", True)
+    kwargs = proc.console_isolation_kwargs(detach_stdin=False)
+    assert "stdin" not in kwargs
+    assert "creationflags" in kwargs
+
+
+def test_console_isolation_kwargs_posix_only_detaches_stdin(monkeypatch):
+    # POSIX has no console coupling, so there are no creationflags — just the harmless stdin
+    # detach (which also stops a TTY-probing CLI from hanging the menu thread).
+    monkeypatch.setattr(proc, "_IS_WINDOWS", False)
+    assert proc.console_isolation_kwargs() == {"stdin": subprocess.DEVNULL}
+    assert proc.console_isolation_kwargs(detach_stdin=False) == {}
+
+
 # --- resolve_subprocess_command (Windows .cmd/.exe resolution, #118) ----------------
 
 

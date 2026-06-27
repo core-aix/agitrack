@@ -7,6 +7,8 @@ import threading
 import time
 from pathlib import Path
 
+from agitrack.proc import console_isolation_kwargs
+
 
 class GitError(RuntimeError):
     pass
@@ -690,6 +692,10 @@ class GitRepo:
         # A timeout bounds a network git call (fetch/push over bad internet): on
         # expiry subprocess.run kills the process and raises, which we surface as a
         # non-zero result so the caller treats it as a plain failure (e.g. offline).
+        # Keep git off the host console on Windows: a child that inherits our console can leave
+        # it out of raw mode (input then echoes as escape codes). When we feed git via input=,
+        # subprocess already pipes its stdin, so only detach stdin when we don't. (See proc.py.)
+        isolation = console_isolation_kwargs(detach_stdin=input_text is None)
         if timeout is not None:
             try:
                 return subprocess.run(
@@ -702,6 +708,7 @@ class GitRepo:
                     check=False,
                     env={**os.environ, **env} if env else None,
                     timeout=timeout,
+                    **isolation,
                 )
             except subprocess.TimeoutExpired:
                 return subprocess.CompletedProcess(command, returncode=124, stdout="", stderr="timed out")
@@ -714,6 +721,7 @@ class GitRepo:
             stderr=subprocess.PIPE,
             check=False,
             env={**os.environ, **env} if env else None,
+            **isolation,
         )
         if check and process.returncode != 0:
             detail = process.stderr.strip() or process.stdout.strip()

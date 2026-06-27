@@ -2216,7 +2216,15 @@ class ProxyRunner:
         """The backend CLI's reported version string, used to detect whether an update actually
         landed. Empty when it can't be read."""
         try:
-            proc = subprocess.run([self.backend.name, "--version"], capture_output=True, text=True, timeout=20)
+            from agitrack.proc import console_isolation_kwargs
+
+            proc = subprocess.run(
+                [self.backend.name, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                **console_isolation_kwargs(),  # keep the backend CLI off the host console (proc.py)
+            )
         except Exception as error:
             self._debug(f"backend version check failed: {error!r}")
             return ""
@@ -2266,7 +2274,11 @@ class ProxyRunner:
         cwd = str(getattr(self.base_repo, "repo", None) or getattr(self.repo, "repo", "."))
         result: dict = {"name": name, "before": before}
         try:
-            proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=600)
+            from agitrack.proc import console_isolation_kwargs
+
+            proc = subprocess.run(
+                cmd, cwd=cwd, capture_output=True, text=True, timeout=600, **console_isolation_kwargs()
+            )
             result["code"] = proc.returncode
             result["output"] = (proc.stdout or "") + (proc.stderr or "")
         except Exception as error:
