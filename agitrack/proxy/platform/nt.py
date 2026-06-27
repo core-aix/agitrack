@@ -105,6 +105,11 @@ class NtHostTerminal:
     def set_cooked(self) -> None:
         self._console.leave()
 
+    def reassert_raw(self) -> None:
+        # Re-apply console raw mode after a backend switch (which can knock the host console back
+        # into cooked/echo mode, making all input echo as codes). See RawConsole.reassert.
+        self._console.reassert()
+
     def restore_terminal(self) -> None:
         self.disable_host_terminal_modes()
         self.set_cooked()

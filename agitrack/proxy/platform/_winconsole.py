@@ -185,6 +185,28 @@ class RawConsole:
         )
         _set_mode(self._out, out_mode)
 
+    def reassert(self) -> None:
+        """Forcibly re-apply the raw input/output console modes.
+
+        A backend switch (spawning the new backend's ConPTY, tearing the old one down) can
+        intermittently knock the *host* console out of raw mode — the symptom is that ALL input
+        suddenly echoes as visible escape codes (arrows, mouse, Esc), Ctrl-C stops working, and
+        the menu can't be navigated, because the console is back in cooked/echo/line mode and the
+        VT-input translation is off. Re-assert raw here (no save, no code-page change, and — vital
+        — no input flush, so keystrokes typed during the switch aren't dropped). Idempotent and
+        safe to call on every switch; a no-op if we never entered raw mode."""
+        if not self._entered:
+            return
+        in_mode = _get_mode(self._in)
+        in_mode &= ~(
+            ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT | ENABLE_MOUSE_INPUT | ENABLE_QUICK_EDIT_MODE
+        )
+        in_mode |= ENABLE_EXTENDED_FLAGS | ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_WINDOW_INPUT
+        _set_mode(self._in, in_mode)
+        out_mode = _get_mode(self._out) | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        out_mode |= DISABLE_NEWLINE_AUTO_RETURN
+        _set_mode(self._out, out_mode)
+
     def leave(self) -> None:
         # Re-arm enter() so the next set_raw() does a real cooked->raw transition (re-flush of
         # input typed during the cooked interval is then correct). A leave() with no prior

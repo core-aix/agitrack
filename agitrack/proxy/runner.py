@@ -2349,6 +2349,7 @@ class ProxyRunner:
         # Re-assert host mouse reporting for the new backend so wheel scrollback
         # keeps working regardless of what the previous backend left behind.
         self._enable_host_mouse()
+        self._reassert_host_raw()  # a restart can knock the host console out of raw mode
         self._set_message(message)
         self._render()
 
@@ -5588,6 +5589,7 @@ class ProxyRunner:
             self.scroll_back = 0
             self._resize_child()
             self._enable_host_mouse()
+            self._reassert_host_raw()  # a switch can knock the host console out of raw mode
             self._set_message(f"Switched to session '{self._session_name(index)}'")
             self._render()
             # The copy-back mute is per active-session-visit: a switch resets it so the
@@ -5871,6 +5873,7 @@ class ProxyRunner:
         self.sessions.append(self.active)
         self._resize_child()
         self._enable_host_mouse()
+        self._reassert_host_raw()  # a switch can knock the host console out of raw mode
         self._set_message(started_msg)
         self._render()
 
@@ -9865,6 +9868,16 @@ class ProxyRunner:
             self._host.set_cooked()
         else:
             TerminalHost.set_cooked(self)
+
+    def _reassert_host_raw(self) -> None:
+        # Windows only: after a backend switch, forcibly re-apply console raw mode in case the
+        # switch knocked the host console back to cooked/echo (all input then echoes as codes,
+        # Ctrl-C dies, the menu can't be navigated). A no-op on POSIX (the PTY raw mode is stable
+        # across a switch) and whenever the host doesn't expose it.
+        host = self._host
+        reassert = getattr(host, "reassert_raw", None)
+        if callable(reassert):
+            reassert()
 
     def _restore_terminal(self) -> None:
         if self._host is not None:
