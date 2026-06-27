@@ -485,12 +485,14 @@ class ProxyRunner:
     RENDER_MIN_INTERVAL = 0.033  # coalesce output-driven repaints to ~30fps
     SYNC_MAX_HOLD = 0.05  # cap how long a backend synchronized-update may defer a paint
     SUMMARY_WAIT_SECONDS = 45.0  # how long integration waits for a background commit summary (#8)
-    # On exit we don't start new summaries (see _start_commit_summary); we only give a
-    # summary that was ALREADY running (from the live path) a brief moment to land before
-    # integrating, then drop it rather than holding teardown hostage. Short on purpose —
-    # the commit already has a usable prompt-based message, so a slow summary isn't worth
-    # the wait. Per session.
-    EXIT_SUMMARY_GRACE_SECONDS = 3.0
+    # On an INTERACTIVE exit we summarize the final turn's commit (see _start_commit_summary)
+    # and wait up to this grace for the summary — whether freshly started at exit-finalize or
+    # already running from the live path — to be amended in before integrating; past it the
+    # commit integrates with its prompt-based message and the summary lands as git notes only,
+    # so teardown is never held hostage. Long enough for a typical summarizer round-trip to
+    # land, bounded so a slow/hung one can't stall exit. Per session. (Non-interactive/signal
+    # teardown skips fresh summaries entirely and only ever joins an already-running one here.)
+    EXIT_SUMMARY_GRACE_SECONDS = 30.0
     EXIT_SHARE_TIMEOUT = (
         45.0  # cap the exit-path auto-share push; long enough for a real push, short enough to never truly hang
     )
@@ -8647,13 +8649,14 @@ class ProxyRunner:
         return Summarizer(backend_class(summary_scratch_dir(), launch_command=launch or None), model=model)
 
     def _start_commit_summary(self, sha: str, trace_text: str) -> None:
-        # Never kick off a fresh summarizer call while exiting. The exit-finalize commits
-        # each session's final turn (_commit_latest_turn_sync), and a summary started here
-        # would only be blocked on a few lines later (_finalize_summary_then_integrate_on_exit
-        # joins it), adding a whole LLM round-trip PER SESSION to teardown — the main reason
-        # exit dragged on for tens of seconds. The commit keeps its prompt-based message; the
-        # AI summary is an optional enhancement, not worth holding the exit for.
-        if self._exiting:
+        # On a NON-interactive teardown — a closed terminal / signal exit, where ``screen`` is
+        # already None — skip a fresh summarizer call: there is no one watching and teardown
+        # must stay fast (a full LLM round-trip per session is the main reason exit used to drag
+        # on for tens of seconds). On an INTERACTIVE exit the user is present and has opted into a
+        # slightly slower exit, so we DO summarize the turn committed at exit-finalize and give it
+        # a bounded grace to land (_finalize_summary_then_integrate_on_exit joins it), falling back
+        # to the commit's prompt-based message if it doesn't finish in time.
+        if self._exiting and self.screen is None:
             return
         summarizer = self._make_summarizer()
         if summarizer is None:
@@ -9083,10 +9086,12 @@ class ProxyRunner:
         # mops up any stragglers. So leave exit fast.
 
     def _finalize_summary_then_integrate_on_exit(self) -> None:
-        # Give the current session's in-flight commit summary a short grace period
-        # so it can be amended in before the final integration; past that it is
-        # dropped rather than holding the exit hostage (#8). Runs for the active
-        # session in place and for each background session under a context swap.
+        # Give the current session's in-flight commit summary — the one the exit-finalize
+        # commit just started on an interactive exit, or one already running from the live
+        # path — a bounded grace to land so it can be amended into the commit before the
+        # final integration; past that it is dropped to git notes rather than holding the
+        # exit hostage (#8). Runs for the active session in place and for each background
+        # session under a context swap.
         if self._summary_thread is not None and self._summary_thread.is_alive():
             self._summary_thread.join(timeout=self.EXIT_SUMMARY_GRACE_SECONDS)
         self._service_commit_summary()

@@ -211,13 +211,30 @@ def test_commit_path_does_not_block_on_summarization(tmp_path, monkeypatch):
     assert (repo.notes_show(final, namespace="agitrack/session-summary") or "").startswith("rolling narrative")
 
 
-def test_start_commit_summary_skips_while_exiting(tmp_path, monkeypatch):
-    # During exit-finalize a fresh summarizer call must NOT be started: it would only be
-    # blocked on a few lines later and drag teardown out by a whole LLM round-trip per
-    # session. The commit keeps its prompt-based message instead.
+def test_start_commit_summary_runs_on_interactive_exit(tmp_path, monkeypatch):
+    # On an INTERACTIVE exit (screen present) the final turn's commit IS summarized: the
+    # user opted into a slightly slower exit, and _finalize_summary_then_integrate_on_exit
+    # gives the summary a bounded grace to land before integrating.
     runner, repo = _summary_runner(tmp_path, monkeypatch)
     sha = _commit_change(repo, "a.txt", "<aGiTrack> prompt subject")
     runner._exiting = True
+    runner.screen = object()  # a live screen ⇒ interactive exit (not a signal teardown)
+
+    runner._start_commit_summary(sha, _TRACE_TEXT)
+
+    assert runner._summary_thread is not None  # the summary worker was spun up
+    _finish_summary(runner)
+    assert repo.commit_message("HEAD").startswith("<aGiTrack> Implement the widget renderer with caching")
+
+
+def test_start_commit_summary_skips_on_signal_exit(tmp_path, monkeypatch):
+    # On a NON-interactive teardown (terminal closed / signal exit: screen is None) a fresh
+    # summarizer call must NOT be started — there's no one watching and teardown must stay
+    # fast. The commit keeps its prompt-based message instead.
+    runner, repo = _summary_runner(tmp_path, monkeypatch)
+    sha = _commit_change(repo, "a.txt", "<aGiTrack> prompt subject")
+    runner._exiting = True
+    runner.screen = None  # signal/terminal-close teardown
 
     runner._start_commit_summary(sha, _TRACE_TEXT)
 
