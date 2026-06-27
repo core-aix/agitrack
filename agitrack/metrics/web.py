@@ -89,6 +89,29 @@ def format_html(dash: Dashboard, *, shared_sessions: list[dict] | None = None) -
     )
 
 
+def shell_html(repo: GitRepo) -> str:
+    """The page chrome with NO aggregates or commit log embedded, for an instant first
+    paint on a large repo: the browser shows a loading animation, then fetches ``/data``
+    and ``/log``. The expensive ``git log`` crunch happens during those fetches, behind
+    the animation, instead of blocking the first paint.
+
+    Shared sessions are cheap (a local ref read plus a throttled fetch), so they're still
+    embedded for the first paint (#55). The repo path/name fill the header."""
+    from agitrack.metrics.collect import _abbreviate_home
+
+    repo_path = _abbreviate_home(str(repo.repo))
+    payload = json.dumps(
+        {"page_size": PAGE_SIZE, "shared_sessions": shared_sessions_for(repo)},
+        separators=(",", ":"),
+    )
+    repo_name = repo_path.rstrip("/").rsplit("/", 1)[-1] or repo_path
+    return (
+        _TEMPLATE.replace("__DATA__", payload)
+        .replace("__REPO_NAME__", _escape(repo_name))
+        .replace("__REPO__", _escape(repo_path))
+    )
+
+
 def dashboard_data(dash: Dashboard) -> dict:
     """Serialize the dashboard to a JSON-ready dict.
 
@@ -507,6 +530,20 @@ body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:31;
 a{color:var(--phosphor);text-decoration:none;border-bottom:1px solid var(--phosphor-dim)}
 a:hover{color:var(--ink);background:var(--phosphor)}
 .wrap{max-width:1080px;margin:0 auto;padding:0 24px 80px}
+/* Initial-load animation. On a large repo the server sends the page chrome with no
+   aggregates/log embedded; this loader shows while the browser fetches /data and /log,
+   and `body.booting` hides the (still-empty) data sections so they don't flash. */
+.booting{display:none;flex-direction:column;align-items:center;justify-content:center;
+  gap:18px;padding:110px 0 130px;text-align:center}
+body.booting .booting{display:flex}
+body.booting .wrap>*:not(header):not(.booting){display:none}
+.booting .spin{width:48px;height:48px;border:3px solid var(--phosphor-dim);border-top-color:var(--phosphor);
+  border-radius:50%;animation:spin .8s linear infinite;box-shadow:0 0 18px rgba(61,255,160,.25)}
+.booting .bmsg{font-family:var(--display);font-size:32px;color:var(--phosphor);letter-spacing:1px;
+  text-shadow:0 0 18px rgba(61,255,160,.35)}
+.booting .bdots::after{content:"";animation:bdots 1.4s steps(4,end) infinite}
+@keyframes bdots{0%{content:""}25%{content:"."}50%{content:".."}75%{content:"..."}}
+.booting .bsub{font-size:13px;color:var(--fg-dim)}
 .neterror{position:fixed;top:0;left:0;right:0;z-index:40;background:#3a0f0f;color:#ffd5d5;
   border-bottom:2px solid var(--red);padding:10px 18px;font-size:13px;text-align:center;
   box-shadow:0 6px 20px rgba(0,0,0,.55);animation:rise .25s ease}
@@ -755,6 +792,12 @@ footer{margin-top:46px;padding-top:22px;border-top:1px dashed var(--line);color:
     <div class="meta"><span class="tag">repo</span> <b>__REPO__</b> &nbsp;·&nbsp; <span class="tag">branch</span> <select id="f-branch" class="branchsel" title="View statistics and the commit log for a single branch"></select> &nbsp;·&nbsp; <span id="genat"></span></div>
   </header>
 
+  <div class="booting" id="booting">
+    <span class="spin"></span>
+    <div class="bmsg">reading commit history<span class="bdots"></span></div>
+    <div class="bsub">crunching the git log — a large repo can take a few seconds</div>
+  </div>
+
   <div class="controls">
     <span class="prompt">&gt; filter</span>
     <div class="field"><label for="f-author">committer</label><select id="f-author"></select></div>
@@ -842,8 +885,14 @@ footer{margin-top:46px;padding-top:22px;border-top:1px dashed var(--line);color:
 // browser never holds every commit's message/trace/constituents — only the
 // current page — so memory stays bounded no matter how deep the history is.
 const INIT = JSON.parse(document.getElementById("agitrack-data").textContent);
+// In "shell" mode the server embeds no aggregates/log (just page_size + shared
+// sessions) so the page paints instantly on a large repo; the browser then fetches
+// /data and /log behind a loading animation. With data embedded (a file:// snapshot
+// or a small repo's first paint), the page renders fully right away.
+const HAVE_DATA = !!INIT.agg;
+if(!HAVE_DATA) document.body.classList.add("booting");  // show the loader at once
 const PAGE_SIZE = INIT.page_size || 50;
-let HEAD = INIT.head, AGG = INIT.agg, LOGPAGE = INIT.log, OPTIONS = INIT.options, GENERATED = INIT.generated_at;
+let HEAD = INIT.head||"", AGG = INIT.agg||null, LOGPAGE = INIT.log||null, OPTIONS = INIT.options||null, GENERATED = INIT.generated_at||"";
 let TS = INIT.timeseries || {t:[]};  // per-period series for the activity-over-time plot
 let SPAN = INIT.span || {from:0, to:0};  // full-history commit-date range (epoch seconds)
 let SHARED = INIT.shared_sessions || [];  // sessions shared into this repo (issue #55)
@@ -1410,11 +1459,22 @@ function applyPeriod(){
   syncPeriodDates();
 }
 
-function init(){
-  syncFilters();
+async function init(){
+  // Shell mode: the chrome is already on screen with the loading animation; fetch the
+  // real aggregates + first log page, then drop the loader and render. A big repo's
+  // git-log crunch happens here, behind the animation, instead of blocking first paint.
+  if(!HAVE_DATA){
+    await loadAgg(); await loadLog(0);
+    document.body.classList.remove("booting");
+  }
+  // Whether the data is in hand (embedded, or just fetched). If the boot fetch failed
+  // (server already gone), skip the renders — the offline banner is up and the poll
+  // below recovers once the server is back — rather than crashing on null data.
+  const ready = AGG && OPTIONS && LOGPAGE;
+  if(ready){ syncFilters(); }
   // Show the real range from the first paint: bound the pickers to the history
   // span and fill from/to with it (default period is "all time" = full history).
-  setDateBounds(); applyPeriod();
+  if(ready){ setDateBounds(); applyPeriod(); }
   // Switching branch re-scopes everything; the old branch's committer/backend/
   // model picks may not exist on the new one, so clear them for a clean view.
   $("f-branch").onchange = e => { state.branch = e.target.value; state.author=state.backend=state.model=""; applyFilters(); };
@@ -1474,9 +1534,10 @@ function init(){
   cv.addEventListener("dblclick", () => { resetZoom(); renderChart(); });
   // The canvas backing store is sized in px, so it must be repainted on resize.
   let rz; window.addEventListener("resize", () => { clearTimeout(rz); rz = setTimeout(renderChart, 120); });
-  renderAgg(); renderLog();
+  if(ready){ renderAgg(); renderLog(); }
   // Poll only when there's a live backend; the poll also clears the
-  // "unreachable" banner automatically once the server is back.
+  // "unreachable" banner automatically once the server is back — and, after a failed
+  // boot fetch, the next successful poll populates the view (HEAD goes "" → real).
   if(LIVE) setInterval(refresh, REFRESH_MS);
 }
 init();
