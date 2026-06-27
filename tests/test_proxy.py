@@ -8967,3 +8967,127 @@ def test_resume_without_collision_keeps_name_and_does_not_prompt(tmp_path):
     runner._resume_conversation("foo", "ses_1")
 
     assert runner._created == ["foo"]  # original name kept, no prompt
+
+
+# --- Flow-matrix gap fills (audit 2026-06-27): branches with no prior test -------------------
+
+
+def test_warn_if_base_edited_fires_then_rebaselines_and_noop_when_off():
+    import types
+
+    runner = make_runner()
+    runner.BASE_EDIT_CHECK_SECONDS = 0.0
+    runner._base_check_at = 0.0
+    runner._monitor_base_edits = True
+    runner._base_status_baseline = set()
+    runner.base_repo = types.SimpleNamespace(status_short=lambda: " M src/app.py\n?? new.txt")
+    msgs: list = []
+    runner._set_message = lambda m, **k: msgs.append(m)
+    runner._render = lambda: None
+
+    runner._warn_if_base_edited()
+    assert any("edited the base repo" in m for m in msgs)  # the agent wrote into the base tree
+
+    # The same files must NOT warn again (baseline absorbed them).
+    msgs.clear()
+    runner._base_check_at = 0.0
+    runner._warn_if_base_edited()
+    assert msgs == []
+
+    # Monitoring off → never warns, even with new base changes.
+    msgs.clear()
+    runner._monitor_base_edits = False
+    runner._base_check_at = 0.0
+    runner._base_status_baseline = set()
+    runner._warn_if_base_edited()
+    assert msgs == []
+
+
+def test_stop_session_drops_it_keeps_others_and_refuses_the_last():
+    runner = _mux_runner()
+    runner.sessions.append(_bg_session("B"))
+    runner._commit_latest_turn_sync = lambda *a, **k: None
+
+    runner._stop_session(1, commit=False)  # stop the background session
+    assert len(runner.sessions) == 1 and runner.sessions[0].repo == "repoA"
+
+    msgs: list = []
+    runner._set_message = lambda m, **k: msgs.append(m)
+    runner._stop_session(0)  # the only remaining session can't be stopped
+    assert len(runner.sessions) == 1 and any("only session" in m for m in msgs)
+
+
+def test_stop_session_menu_routes_choice_and_esc_backs_out():
+    runner = _mux_runner()
+    runner.sessions.append(_bg_session("B"))
+    runner._session_name = lambda i: f"s{i}"
+    stopped: list = []
+    runner._stop_session = lambda index: stopped.append(index)
+
+    runner._select_popup = lambda title, options, **k: options[1]  # pick the 2nd session
+    assert runner._stop_session_menu() == runner._MENU_DONE
+    assert stopped == [1]
+
+    runner._select_popup = lambda title, options, **k: None  # Esc
+    assert runner._stop_session_menu() == runner._MENU_UP
+
+
+def test_handle_session_command_numeric_switches_new_prompts_blank_opens_menu():
+    runner = make_runner()
+    calls: list = []
+    runner._switch_to_session_index = lambda i: calls.append(("switch", i))
+    runner._prompt_new_session = lambda: calls.append(("new",)) or runner._MENU_DONE
+    runner._session_menu = lambda: calls.append(("menu",)) or runner._MENU_UP
+
+    assert runner._handle_session_command("2") == runner._MENU_DONE
+    assert calls == [("switch", 1)]  # 1-based -> 0-based index
+
+    calls.clear()
+    runner._handle_session_command("new")
+    assert calls == [("new",)]
+
+    calls.clear()
+    runner._handle_session_command("")
+    assert calls == [("menu",)]
+
+
+def test_run_command_agent_backend_already_set_and_unknown_command():
+    import types
+
+    runner = make_runner()
+    runner.state = types.SimpleNamespace(backend="claude")
+    msgs: list = []
+    runner._set_message = lambda m, **k: msgs.append(m)
+    runner._render = lambda: None
+    runner._after_menu_command = lambda signal: None
+
+    runner._run_command("agent-backend claude")  # same backend
+    assert any("already set to claude" in m for m in msgs)
+
+    msgs.clear()
+    runner._run_command("totally-not-a-command")
+    assert any("Unknown aGiTrack command" in m for m in msgs)
+
+
+def test_integrate_active_session_refuses_mid_turn_and_without_worktree():
+    import types
+
+    runner = make_runner()
+    msgs: list = []
+    runner._set_message = lambda m, **k: msgs.append(m)
+    runner._render = lambda: None
+
+    # No worktree → clear refusal.
+    runner.worktree = None
+    runner._integrate_active_session()
+    assert any("no worktree to integrate" in m for m in msgs)
+
+    # Worktree with changes but a turn is genuinely running → refuse, don't dead-end.
+    msgs.clear()
+    runner.worktree = types.SimpleNamespace(name="s", path="/wt")
+    runner._base_branch = "main"
+    runner.repo = types.SimpleNamespace(has_changes=lambda: True, repo="/wt")
+    runner._clear_agent_in_flight_if_idle = lambda: None
+    runner._agent_is_active = lambda: True
+    runner._integrate_active_session()
+    assert any("Finish or stop the current turn" in m for m in msgs)

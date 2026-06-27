@@ -246,3 +246,26 @@ def test_incomplete_latest_turn_defers_until_it_finishes(tmp_path: Path):
         commit_fn=lambda **_k: committed.append(1) or True,
     )
     assert result is None and committed == []  # deferred, nothing committed
+
+
+def test_commit_raises_catchable_giterror_on_failing_pre_commit_hook(tmp_path: Path):
+    # The real-git counterpart of test_user_commit_popup_surfaces_failure_without_crashing: a repo
+    # pre-commit hook that rejects the commit must surface as a catchable GitError (which the
+    # user-commit popup then reports instead of crashing), and the staged changes must be PRESERVED
+    # so the user can fix the cause and retry — never silently lost.
+    import pytest
+
+    from agitrack.git.repo import GitError
+
+    repo = GitRepo.init(tmp_path)
+    hook = tmp_path / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\necho 'hook rejected' >&2\nexit 1\n", encoding="utf-8")
+    hook.chmod(0o755)
+    (tmp_path / "f.txt").write_text("change\n", encoding="utf-8")
+    repo.stage_paths(["f.txt"])
+
+    with pytest.raises(GitError):
+        repo.commit("a message")
+
+    staged = repo._run(["git", "diff", "--cached", "--name-only"]).stdout
+    assert "f.txt" in staged  # changes left staged, not lost

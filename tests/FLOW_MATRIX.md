@@ -76,6 +76,7 @@ Conventions:
 | Offer user-commit for edits before copy (switch/exit only) | `test_copy_offer_offers_user_commit_for_edits_on_switch`, `test_copy_offer_skips_user_commit_when_no_edits` | mock |
 | Per-turn offer defers the user-commit prompt to the worker | `test_turn_copy_offer_defers_user_commit_prompt` | mock |
 | aGiTrack's own copy does NOT trigger "Agent edited base repo" | `test_rebaseline_base_edits_absorbs_agitracks_own_copy` | mock |
+| Agent edits the base repo directly (un-sandboxed) → warns once, then rebaselines | `test_warn_if_base_edited_fires_then_rebaselines_and_noop_when_off` | mock |
 
 ## 6. User commit (worktree / base edits)
 | Sequence | Test(s) | Kind |
@@ -83,7 +84,7 @@ Conventions:
 | Empty message re-prompts until non-empty | `test_create_user_commit_terminal_retries_until_non_empty`, `test_create_user_commit_ui_empty_then_valid` | mock |
 | Esc / cancel → no commit | `test_create_user_commit_ui_cancel_returns_false` | mock |
 | Nothing staged → silent no-op | `test_create_user_commit_no_staged_silent` | mock |
-| **Commit failure (hook/config) → surfaced, no crash, changes kept** | `test_user_commit_popup_surfaces_failure_without_crashing` | mock |
+| **Commit failure (hook/config) → surfaced, no crash, changes kept** | `test_user_commit_popup_surfaces_failure_without_crashing` (mock) + `test_commit_raises_catchable_giterror_on_failing_pre_commit_hook` (**real-git**, real pre-commit hook) | mock + real-git |
 
 ## 7. Switching sessions
 | Sequence | Test(s) | Kind |
@@ -93,6 +94,8 @@ Conventions:
 | **Resume in place — never interrupt the target backend** | `test_switch_active_resumes_in_place_without_interrupting_target` | mock |
 | Reconcile transcript (bg parse) before the switch copy/commit offer | `test_deferred_switch_offer_reconciles_transcript_before_offering` | mock |
 | Select current session → integrate / "already here" | `test_session_switch_prompt_keeps_or_switches_active_session`, `test_session_menu_explicit_integrate_choice_integrates` | mock |
+| Typed `sessions <n>` jumps to a session; `sessions new` prompts; bare opens the menu | `test_handle_session_command_numeric_switches_new_prompts_blank_opens_menu` | mock |
+| Stop a session (menu pick / Esc-back / can't-stop-the-only-one) | `test_stop_session_drops_it_keeps_others_and_refuses_the_last`, `test_stop_session_menu_routes_choice_and_esc_backs_out` | mock |
 
 ## 8. Backend switch
 | Sequence | Test(s) | Kind |
@@ -103,6 +106,7 @@ Conventions:
 | Same backend → no-op | `test_switch_backend_noop_when_same_backend` | mock |
 | Choice is repo-scoped, not global | `test_switch_backend_records_choice_repo_scoped_not_global` | mock |
 | aGiTrack system note passed to Claude, not OpenCode (by design) | `test_claude_proxy_agent_spawn_command_*`, `test_opencode_proxy_agent_spawn_command_has_no_system_prompt_append` | mock |
+| `agent-backend` already-set / unknown-backend; unknown Ctrl-G command | `test_run_command_agent_backend_already_set_and_unknown_command` | mock |
 
 ## 9. Background sessions
 | Sequence | Test(s) | Kind |
@@ -123,6 +127,7 @@ Conventions:
 | `--delay-merge`: defer until explicit menu choice | `test_delay_merge_defers_integration_and_names_working_dir`, `test_delay_merge_menu_choice_integrates`, `test_delay_merge_off_integrates_immediately` | real-git / mock |
 | Resolve-conflict dispatch (auto / manual / leave) | `test_prompt_resolve_conflict_dispatches_auto/manual`, `_leave_does_not_merge` | mock |
 | Idle worktrees re-sync onto advanced base | `test_switch_all_idle_sessions_skips_running_ones`, `test_align_session_to_base_skips_conflicting_base` | real-git |
+| "Integrate this session" refused mid-turn / no-worktree guard | `test_integrate_active_session_refuses_mid_turn_and_without_worktree` | mock |
 
 ## 11. Exit flow
 | Sequence | Test(s) | Kind |
@@ -187,7 +192,12 @@ Flows that run on an interactive launch when a required tool, config, or login i
 Track anything not yet covered here so it's explicit rather than silently missing. Add a row, then
 remove it once a test lands.
 
-- _(none currently tracked — add as discovered)_
+Remaining from the 2026-06-27 self-audit — lower-risk message/guard branches, to be filled:
+- `runner.py:_change_session_merge_branch_menu` — the "'X' is running a turn — change its merge branch when idle" refusal for an in-flight session (happy-path retarget IS tested).
+- `runner.py:_rename_session` — the move-failure recovery ("Could not rename session…") and the "Name unchanged" no-op (collision path IS tested).
+- `runner.py:_prompt_new_session` — the runtime fork-failure fallback ("Couldn't fork…; starting a blank one instead") (the capability-gate path IS tested).
+- `runner.py:_run_command("git-user-commit")` — the "Committed your changes…" / "No changes to commit in the base repo." messaging wrapper (the underlying `_create_user_commit_popup` IS tested).
+- mock-only → upgrade to real-git when convenient: `_present_copy_offer` per-file "confirm each" combined with a real `shutil.copy2` OSError branch; `_finalize_pending_work` multi-session loop where one background session's real commit/merge fails.
 
 ## How to extend (the rule, restated)
 When you touch a user flow:
