@@ -823,6 +823,7 @@ class ProxyRunner:
         self._user_declined: list[str] = []
         self.sessions: list[Session] = []
         self.worktree_manager: WorktreeManager | None = None
+
         # AGITRACK_DEBUG_RAW records every raw child-output / user-input chunk so an
         # interactive glitch (e.g. Claude's native session picker) can be replayed
         # byte-for-byte; it implies debug logging too.
