@@ -602,6 +602,10 @@ class ProxyRunner:
         self.child_mouse = False
         self.scroll_back = 0
         self._last_render = 0.0
+        # A cross-backend session switch requested from the (nested) sessions modal is deferred to
+        # the top-level reactor; doing it inline from the modal breaks host console input on
+        # Windows. Holds the target Session until the timers phase runs it. (See _switch_to_session_index.)
+        self._pending_switch_session = None
         self._render_pending = False
         # Synchronized output (DECSET 2026): while the backend is mid-update we
         # hold the repaint so a half-drawn frame is never shown (tearing), and
@@ -3504,6 +3508,17 @@ class ProxyRunner:
                 assert isinstance(value, int)  # "switch" pairs with a session index
                 if value == self.active_index:
                     self._select_current_session()
+                    return self._MENU_DONE
+                target = self.sessions[value]
+                target_name = getattr(getattr(target, "backend", None), "name", None)
+                current_name = getattr(self.backend, "name", None)
+                if target_name and current_name and target_name != current_name:
+                    # Cross-backend switch: defer to the top-level reactor (timers phase) so it runs
+                    # OUTSIDE this nested sessions modal — the same context as a Ctrl-G backend
+                    # switch, which works. Running it inline from the modal breaks host console
+                    # input on Windows (the switch's SetConsoleMode wedges the reader and even a
+                    # fresh read then gets nothing). Close the menu now; the switch fires next tick.
+                    self._pending_switch_session = target
                 else:
                     self._switch_to_session_index(value)
                 return self._MENU_DONE
@@ -5653,6 +5668,17 @@ class ProxyRunner:
         else:
             self._switch_active(index)
 
+    def _run_pending_session_switch(self) -> None:
+        # Execute a sessions-menu cross-backend switch deferred out of the (nested) sessions modal,
+        # now that we're at the top of the reactor loop — the same context a Ctrl-G backend switch
+        # runs in. Doing it here instead of inline in the modal keeps host console input alive.
+        target = getattr(self, "_pending_switch_session", None)
+        if target is None:
+            return
+        self._pending_switch_session = None
+        if target in self.sessions:
+            self._switch_to_session_index(self.sessions.index(target))
+
     def _join_parse_worker_before_swap(self) -> None:
         # A parse worker started for the active session reads that session's
         # backend/repo and must not straddle a session swap. The export normally
@@ -6649,6 +6675,7 @@ class ProxyRunner:
         self._check_shutdown_request()
         if not self.running:
             return  # an external graceful-shutdown request just fired
+        self._run_pending_session_switch()  # a cross-backend switch deferred out of the sessions modal
         self._flush_pending_render()
         self._flush_pending_enter()
         self._drain_modal_mailbox()  # present any dialog the git worker queued
