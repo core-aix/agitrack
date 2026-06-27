@@ -119,6 +119,20 @@ def read_input(length: int) -> bytes:
     return buf.raw[: read.value]
 
 
+def cancel_input_io() -> None:
+    """Cancel any in-flight ``ReadFile`` on the console input handle.
+
+    Changing the console mode (``SetConsoleMode``) from another thread can WEDGE the reader
+    thread's pending blocking ``ReadFile`` so it never returns even as keystrokes arrive — the
+    cause of the session-switch hang. After re-applying the mode we call this to abort that stuck
+    read; ``ReadFile`` then returns ``ERROR_OPERATION_ABORTED`` (an empty read), the reader loops
+    and issues a fresh ``ReadFile`` against the now-correct mode, and input flows again.
+    ``CancelIoEx`` cancels I/O on the handle regardless of which thread issued it; a no-op (returns
+    FALSE / ERROR_NOT_FOUND) when nothing is pending."""
+    handle = _std_handle(STD_INPUT_HANDLE)
+    _kernel32.CancelIoEx(handle, None)
+
+
 def terminal_size() -> tuple[int, int]:
     """``(rows, cols)`` of the console window, or a ``(24, 80)`` fallback."""
     info = _CONSOLE_SCREEN_BUFFER_INFO()

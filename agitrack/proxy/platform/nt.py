@@ -111,7 +111,13 @@ class NtHostTerminal:
         # Re-apply console raw mode after a backend switch (which can knock the host console back
         # into cooked/echo mode, making all input echo as codes). See RawConsole.reassert. Returns
         # a bitmask of what was actually re-applied (0 = mode was already correct, a no-op).
-        return self._console.reassert()
+        changed = self._console.reassert()
+        if changed & 1:
+            # Re-applying the INPUT mode (SetConsoleMode) can wedge the reader thread's pending
+            # blocking ReadFile so it never returns — the session-switch hang. Abort that read so
+            # the reader re-issues a fresh one against the corrected mode and input flows again.
+            self._winconsole.cancel_input_io()
+        return changed
 
     def stdin_reader_alive(self) -> bool:
         # Diagnostic: whether the console→bridge reader thread is still running. A dead reader
