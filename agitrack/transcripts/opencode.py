@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 from agitrack.backends.base import TokenUsage
-from agitrack.proc import resolve_subprocess_command
+from agitrack.proc import console_isolation_kwargs, resolve_subprocess_command
 from agitrack.sessions.share_cap import select_kept_indices
 from agitrack.transcripts.types import ExportedSession, SessionRef, SessionTurn, turns_after
 
@@ -64,6 +64,9 @@ def _opencode_session_list(cwd: Path, max_count: int) -> list[dict]:
             stderr=subprocess.PIPE,
             check=False,
             timeout=_OPENCODE_CALL_TIMEOUT,
+            # Don't let the opencode CLI touch the host console (it sets TTY modes and would
+            # leave the host out of raw mode → input echoes as escape codes; see proc.py).
+            **console_isolation_kwargs(),
         )
     except (subprocess.TimeoutExpired, OSError) as error:
         _debug(cwd, f"opencode session list timed out/failed: {error!r}")
@@ -460,6 +463,8 @@ def _run_opencode_subprocess(repo: Path, args: list[str]) -> tuple[str, int]:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             timeout=_OPENCODE_CALL_TIMEOUT,
+            # Keep the opencode CLI off the host console (raw-mode preservation; see proc.py).
+            **console_isolation_kwargs(),
         )
     except subprocess.TimeoutExpired as exc:
         out = exc.output or b""

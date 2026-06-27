@@ -16,6 +16,11 @@ jobs:
     # not trigger workflows, so this is also belt-and-suspenders against a loop.)
     if: github.event.head_commit.author.name != 'github-actions[bot]'
 
+    # Exposed so the Windows MSI job below can name and attach its artefact to the
+    # release this job creates.
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+
     env:
       # Set this repository secret to a Marketplace Personal Access Token to have the
       # VSCode extension published automatically on each release. When it's absent the
@@ -169,3 +174,72 @@ jobs:
           npm install --no-audit --no-fund
           npm run compile
           npx --yes @vscode/vsce publish --no-dependencies -p "$VSCE_TOKEN"
+
+  # Build the standalone Windows MSI and attach it to the release the job above just
+  # created. This MUST live in the same workflow run as the release: the release is created
+  # with GITHUB_TOKEN, and a tag/release made with GITHUB_TOKEN does NOT trigger other
+  # workflows — so a separate tag-triggered MSI workflow would never fire (it never did).
+  # `needs: release` makes this run after the release exists and after the version bump has
+  # merged to main, so checking out main yields the bumped source and `gh release upload`
+  # has a release to attach to.
+  build-msi:
+    name: Build + attach Windows MSI
+    needs: release
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install runtime + build deps
+        run: uv sync --group build
+
+      - name: Resolve MSI name
+        id: msi
+        shell: pwsh
+        run: |
+          $ver = "${{ needs.release.outputs.version }}"
+          echo "MSI_NAME=agitrack-$ver-windows-x64.msi" >> $env:GITHUB_OUTPUT
+
+      - name: Build with PyInstaller
+        run: uv run pyinstaller installer/agitrack.spec -y
+
+      - name: Smoke-test bundled EXE
+        run: dist\agitrack\agitrack.exe --version
+
+      - name: Install WiX v5
+        # WiX v5 is required for the <Files> harvest element in agitrack.wxs (v4 lacks it).
+        run: dotnet tool install --global wix --version 5.0.2
+
+      - name: Add WiX UI extension
+        # Pin the UI extension to the SAME version as the wix tool. Unpinned, `wix
+        # extension add` pulls the latest (a newer major), which the toolset can't load —
+        # `wix build` then fails with WIX0144 "extension could not be found".
+        run: wix extension add --global WixToolset.UI.wixext/5.0.2
+
+      - name: Build MSI
+        # -arch x64: the PyInstaller bundle is 64-bit, so the MSI must be too (else
+        # ProgramFiles64Folder doesn't resolve and files install to the wrong place).
+        run: |
+          wix build `
+            installer\agitrack.wxs `
+            -arch x64 `
+            -d Version=${{ needs.release.outputs.version }} `
+            -d SourceDir=${{ github.workspace }}\dist\agitrack `
+            -ext WixToolset.UI.wixext `
+            -o dist\${{ steps.msi.outputs.MSI_NAME }}
+
+      - name: Attach MSI to the release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "v${{ needs.release.outputs.version }}" "dist/${{ steps.msi.outputs.MSI_NAME }}" --clobber

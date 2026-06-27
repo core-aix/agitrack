@@ -64,6 +64,73 @@ def _gh_install_hint() -> str:
     )
 
 
+def _installed_via_msi() -> bool:
+    """True for a frozen (PyInstaller) build — i.e. the Windows MSI bundle. There,
+    prerequisite setup (backends, git, gh, git identity, gh login) is the MSI installer's
+    job, so aGiTrack does NOT prompt for it at runtime. A pip/source install is not frozen
+    and does its setup at first run, on every platform (including Windows)."""
+    return bool(getattr(sys, "frozen", False))
+
+
+def _maybe_install_tool(name: str, *, required: bool) -> bool:
+    """Offer to auto-install a missing prerequisite (``git`` or ``gh``); return True once it
+    is available. Only prompts on an interactive TTY where a supported package manager
+    exists — otherwise returns False so the caller falls back to printing the manual hint.
+
+    The MSI bundle is intentionally excluded: there, prerequisites are set up by the MSI
+    installer, not by aGiTrack at runtime. A pip/source install still offers it (any OS)."""
+    if _installed_via_msi():
+        return False
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return False
+    from agitrack.system_tools import can_install_tool, install_system_tool
+
+    if not can_install_tool(name):
+        return False
+    label = "git" if name == "git" else "the GitHub CLI (gh)"
+    note = "" if required else " (optional)"
+    try:
+        answer = input(f"\n{label} isn't installed. Install it now{note}? [Y/n]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    if answer in {"n", "no"}:
+        return False
+    return install_system_tool(name)
+
+
+def _git_config_global(config_args: list[str]) -> str:
+    """Run ``git config --global`` and return its stdout (empty on any failure)."""
+    try:
+        result = subprocess.run(
+            ["git", "config", "--global", *config_args], text=True, capture_output=True, check=False
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return result.stdout.strip()
+
+
+def _ensure_git_identity() -> None:
+    """git refuses to commit without ``user.name`` and ``user.email`` ("Author identity
+    unknown"), and aGiTrack commits every turn — so on a fresh machine, prompt for whichever
+    is missing and set it globally. Interactive callers only; non-TTY callers should not
+    reach here (they get no prompt and a polluted machine-readable stream is avoided)."""
+    name = _git_config_global(["--get", "user.name"])
+    email = _git_config_global(["--get", "user.email"])
+    if name and email:
+        return
+    print("\ngit needs a name and email to record commits (aGiTrack commits your work each turn).")
+    if not name:
+        entered = input("  Name for git commits: ").strip()
+        if entered:
+            _git_config_global(["user.name", entered])
+    if not email:
+        entered = input("  Email for git commits: ").strip()
+        if entered:
+            _git_config_global(["user.email", entered])
+    if not (_git_config_global(["--get", "user.name"]) and _git_config_global(["--get", "user.email"])):
+        print("git identity is still incomplete; aGiTrack's commits may fail until name and email are set.")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Interactive agent + git commit orchestration.",
@@ -132,11 +199,15 @@ def main(argv: list[str] | None = None) -> int:
         "agent does not create its own git commits unless you explicitly ask",
     )
     parser.add_argument(
+        "--no-confine",
         "--no-sandbox",
+        dest="no_sandbox",
         action="store_true",
-        help="do not confine the agent's writes to its session worktree; by default aGiTrack "
-        "sandboxes the backend so it can only write inside its worktree (plus .git). Also "
-        "settable via 'sandbox' in config.",
+        help="do not confine the agent's writes to its session worktree. By default aGiTrack "
+        "confines the agent to its worktree (plus .git): on macOS/Linux via the OS sandbox "
+        "(sandbox-exec/bubblewrap), and where no sandbox is available (e.g. Windows) via a git "
+        "pre-commit guard that stops the agent from committing into the base repo. Also settable "
+        "via 'sandbox' in config. (--no-sandbox is kept as an alias.)",
     )
     parser.add_argument(
         "--allowed-edit-paths",
@@ -256,7 +327,7 @@ def main(argv: list[str] | None = None) -> int:
     # Check once, up front, so a missing git gives a clear, actionable message instead of a
     # raw FileNotFoundError deep in repo discovery — common right after the VS Code extension
     # installs the CLI but git isn't on PATH. --version/--help above don't need git.
-    if shutil.which("git") is None:
+    if shutil.which("git") is None and not _maybe_install_tool("git", required=True):
         print(_git_install_hint())
         return 1
 
@@ -366,6 +437,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.mode == "proxy":
         print("aGiTrack is starting...", flush=True)
 
+    # Make sure git can actually commit: without a global user.name/user.email every commit
+    # fails with "Author identity unknown", and aGiTrack commits each turn. Prompt for any
+    # missing value on an interactive launch; the MSI bundle defers this to the installer,
+    # and scripted/json runs are left clean (those users have git configured).
+    if args.mode == "proxy" and not _installed_via_msi() and sys.stdin.isatty() and sys.stdout.isatty():
+        _ensure_git_identity()
+
     # Offer a self-update before launching anything. Skipped for scripted/non-TTY
     # runs (no way to answer) and when the user turned update checks off. If the
     # user accepts, aGiTrack updates and re-execs immediately — no sessions are
@@ -373,10 +451,19 @@ def main(argv: list[str] | None = None) -> int:
     if not scripted and sys.stdin.isatty() and sys.stdout.isatty():
         _check_for_update_at_startup(config)
 
+    # First-run backend setup. Skipped for the MSI bundle (the installer handles it); a
+    # pip/source install does it here, on any OS. Only when at least one backend is missing —
+    # if both are already installed there's nothing to prompt about. select_default_backend
+    # lists statuses and offers to install the missing one(s).
+    from agitrack.backends.setup import backend_installed
+
+    some_backend_missing = not all(backend_installed(name) for name in available_backends())
     if (
         args.backend is None
         and not config.has_default_backend()
         and not scripted
+        and not _installed_via_msi()
+        and some_backend_missing
         and sys.stdin.isatty()
         and sys.stdout.isatty()
     ):
@@ -753,8 +840,9 @@ def _check_gh_availability(repo: GitRepo, *, scripted: bool = False) -> tuple[bo
     Returns ``(proceed, handled)``: ``proceed`` is False only when the user chose to quit;
     ``handled`` is True when the interactive prompt was shown, so the runner can skip its
     own in-TUI gh notice. Never blocks automation — without an interactive TTY (or in
-    scripted mode) it does nothing and returns ``(True, False)``."""
-    if scripted or not (sys.stdin.isatty() and sys.stdout.isatty()):
+    scripted mode) it does nothing and returns ``(True, False)``. The MSI bundle also does
+    nothing — gh setup/login there is the installer's job; a pip/source install still does it."""
+    if _installed_via_msi() or scripted or not (sys.stdin.isatty() and sys.stdout.isatty()):
         return (True, False)
     from agitrack.metrics.github import commit_url_base, gh_status
 
@@ -763,6 +851,13 @@ def _check_gh_availability(repo: GitRepo, *, scripted: bool = False) -> tuple[bo
         return (True, False)  # installed and authenticated — nothing to do
     if not commit_url_base(repo):
         return (True, False)  # no GitHub remote — gh isn't needed here yet
+    if status == "missing":
+        # Offer to install gh automatically; if it lands, it still needs a login, so fall
+        # through to the unauthenticated branch below (re-checking its real status).
+        if _maybe_install_tool("gh", required=False):
+            status = gh_status()
+            if status == "ok":
+                return (True, True)
     if status == "missing":
         print(_gh_install_hint())
         prompt = "\nPress Enter to continue without it (q to quit): "

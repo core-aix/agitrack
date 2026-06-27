@@ -101,6 +101,21 @@ def test_resolve_windows_command_passes_through_plain_exe(tmp_path):
     assert args == ["go"]
 
 
+def test_resolve_windows_command_ignores_half_installed_npm_shim(monkeypatch):
+    # A backend whose npm install left only an extensionless shell script / .ps1 (no .cmd)
+    # must NOT resolve to that non-runnable file — which_executable returns None, so the
+    # command falls back to the bare name (which then fails loudly rather than launching a
+    # file ConPTY can't execute and looping on "exited repeatedly").
+    import agitrack.proc as proc
+
+    present = {"claude": r"C:\npm\claude", "claude.ps1": r"C:\npm\claude.ps1"}
+    monkeypatch.setattr(proc, "_IS_WINDOWS", True)
+    monkeypatch.setattr(proc.shutil, "which", lambda name: present.get(name))
+    appname, args = _resolve_windows_command(["claude", "--resume"])
+    assert appname == "claude"  # not C:\npm\claude (the bare shell script)
+    assert args == ["--resume"]
+
+
 def test_env_block_is_null_separated_or_none():
     assert _env_block(None) is None  # inherit the environment unchanged
     block = _env_block({"AGIT_X": "1"})
