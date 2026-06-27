@@ -53,7 +53,16 @@ aGiTrack needs **git** and at least one backend CLI ([Claude Code](https://docs.
 | **Linux** | `sudo apt install git` *(or your package manager)* | `curl -fsSL https://claude.ai/install.sh \| bash` · or `npm install -g opencode-ai` | `sudo apt install gh` |
 | **Windows** | `winget install Git.Git` | `npm install -g @anthropic-ai/claude-code` · or `npm install -g opencode-ai` *(no Node? `winget install OpenJS.NodeJS`)* | `winget install GitHub.cli` |
 
-Run `gh auth login` if you installed `gh`. After installing anything, open a **new terminal** so the updated `PATH` is picked up. aGiTrack also prints these same per-OS install hints at startup when `git`, the selected backend, or `gh` is missing — so you can copy the right command without leaving the prompt.
+**aGiTrack can set up its prerequisites for you.** On an interactive launch it offers to install whatever's missing, then makes sure git can commit:
+
+- **A backend.** First run lists the backends with their install status and offers to install any that are missing — pick one or install all of them; at launch, if the selected backend isn't present, it offers to install it then. Uses the official installer on macOS/Linux and npm everywhere (bootstrapping Node via winget on Windows when needed).
+- **git and gh.** If `git` (required) or `gh` (optional) isn't installed, aGiTrack offers to install it with your platform's package manager — winget on Windows, Homebrew on macOS, your distro manager on Linux.
+- **git identity.** If `user.name`/`user.email` aren't set globally (commits fail without them), it prompts you for them and saves them.
+- **gh sign-in.** If `gh` is installed but not signed in, it offers to run `gh auth login` right there.
+
+Anything it installs is added to the current session's `PATH`, so it works right away without reopening the terminal.
+
+Run `gh auth login` if you installed `gh`. After installing anything by hand, open a **new terminal** so the updated `PATH` is picked up. aGiTrack also prints these same per-OS install hints at startup when `git`, the selected backend, or `gh` is missing — so you can copy the right command without leaving the prompt.
 
 ### VS Code extension
 
@@ -313,6 +322,25 @@ Show aGiTrack diagnostic messages:
 ```bash
 agitrack --verbose
 ```
+
+### Debugging / diagnostic logs
+
+When something in the terminal misbehaves — stray escape codes, input not registering, a hang on a menu or session switch — aGiTrack can write detailed diagnostic logs. Two opt-in environment switches turn them on (off by default; they work the same on macOS, Linux, and Windows):
+
+- **`DEBUG_PROXY`** — a human-readable event log: keystrokes/commands as they're parsed, backend spawn/switch/restart, session lifecycle, and an idle heartbeat. (`--verbose` turns this on too.)
+- **`DEBUG_RAW`** — a byte-exact capture of everything read from the keyboard and written to the terminal, for replaying an interactive glitch precisely. It also enables `DEBUG_PROXY`.
+
+```bash
+# macOS / Linux (bash/zsh) — one run:
+DEBUG_RAW=1 agitrack
+```
+
+```powershell
+# Windows (PowerShell) — set it in the same terminal that launches aGiTrack:
+$env:DEBUG_RAW = "1"; agitrack
+```
+
+The logs are written to your **target repo**'s `.agitrack/` folder, one pair per run: `proxy-debug-<timestamp>.log` and `proxy-raw-<timestamp>.log`. When reporting a problem, attach the newest pair. (The switches are also accepted as `AGITRACK_DEBUG_RAW` / `AGITRACK_DEBUG_PROXY`. Full details for contributors are in `AGENTS.md` → "Diagnostics & Debugging".)
 
 Review each turn before it merges, instead of integrating automatically:
 

@@ -7,6 +7,8 @@ import threading
 import time
 from pathlib import Path
 
+from agitrack.proc import console_isolation_kwargs
+
 
 class GitError(RuntimeError):
     pass
@@ -690,6 +692,17 @@ class GitRepo:
         # A timeout bounds a network git call (fetch/push over bad internet): on
         # expiry subprocess.run kills the process and raises, which we surface as a
         # non-zero result so the caller treats it as a plain failure (e.g. offline).
+        # Keep git off the host console on Windows: a child that inherits our console can leave
+        # it out of raw mode (input then echoes as escape codes). When we feed git via input=,
+        # subprocess already pipes its stdin, so only detach stdin when we don't. (See proc.py.)
+        isolation = console_isolation_kwargs(detach_stdin=input_text is None)
+        # ALWAYS encode/decode git I/O as UTF-8 (git's default commit/text encoding), NEVER the
+        # platform locale. On Windows ``text=True`` defaults to the ANSI code page (cp1252), which
+        # cannot encode the box-drawing, em-dash, curly-quote, and emoji characters that routinely
+        # appear in aGiTrack commit messages (the agent interaction trace). Feeding such a message
+        # via ``input=`` then raised UnicodeEncodeError before git even ran — so EVERY agent-turn
+        # commit failed and aGiTrack silently "stopped committing" on Windows. errors="replace"
+        # keeps a stray undecodable byte in git's OUTPUT from ever crashing a read.
         if timeout is not None:
             try:
                 return subprocess.run(
@@ -697,11 +710,14 @@ class GitRepo:
                     cwd=self.repo,
                     input=input_text,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     check=False,
                     env={**os.environ, **env} if env else None,
                     timeout=timeout,
+                    **isolation,
                 )
             except subprocess.TimeoutExpired:
                 return subprocess.CompletedProcess(command, returncode=124, stdout="", stderr="timed out")
@@ -710,10 +726,13 @@ class GitRepo:
             cwd=self.repo,
             input=input_text,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
             env={**os.environ, **env} if env else None,
+            **isolation,
         )
         if check and process.returncode != 0:
             detail = process.stderr.strip() or process.stdout.strip()

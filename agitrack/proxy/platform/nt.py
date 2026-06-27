@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import os
 import select
-import shutil
 import socket
 import subprocess
 import sys
@@ -66,6 +65,10 @@ class NtHostTerminal:
         from agitrack.proxy.platform import _winconsole
 
         self._winconsole = _winconsole
+        # aGiTrack handles Ctrl-C as a forwarded byte, never a signal: swallow console
+        # Ctrl-C/Ctrl-Break events so a stray one (e.g. propagated from an OpenCode ConPTY
+        # teardown) can't raise KeyboardInterrupt and crash the reactor or drop keystrokes.
+        _winconsole.suppress_console_ctrl_c()
         self._console = _winconsole.RawConsole()
         self._rsock, self._wsock = socket.socketpair()
         self._rsock.setblocking(False)
@@ -74,6 +77,8 @@ class NtHostTerminal:
         self._last_size: tuple[int, int] | None = None
         self._reader: threading.Thread | None = None
         self._resizer: threading.Thread | None = None
+        self._reader_reads = 0  # diagnostic counters (see stdin_reader_stats)
+        self._reader_empties = 0
 
     def start(self) -> None:
         pass
@@ -101,6 +106,28 @@ class NtHostTerminal:
 
     def set_cooked(self) -> None:
         self._console.leave()
+
+    def reassert_raw(self) -> int:
+        # Re-apply console raw mode after a backend switch (which can knock the host console back
+        # into cooked/echo mode, making all input echo as codes). See RawConsole.reassert. Returns
+        # a bitmask of what was actually re-applied (0 = mode was already correct, a no-op).
+        changed = self._console.reassert()
+        if changed & 1:
+            # Re-applying the INPUT mode (SetConsoleMode) can wedge the reader thread's pending
+            # blocking ReadFile so it never returns — the session-switch hang. Abort that read so
+            # the reader re-issues a fresh one against the corrected mode and input flows again.
+            self._winconsole.cancel_input_io()
+        return changed
+
+    def stdin_reader_alive(self) -> bool:
+        # Diagnostic: whether the console→bridge reader thread is still running. A dead reader
+        # means no keystroke can reach the reactor (a hang where the loop still spins).
+        return self._reader is not None and self._reader.is_alive()
+
+    def stdin_reader_stats(self) -> str:
+        # Diagnostic: distinguishes a reader blocked in ReadFile (counts flat — input not arriving)
+        # from one spinning on empty reads (empties climbing — the console handle is broken).
+        return f"alive={self.stdin_reader_alive()} reads={self._reader_reads} empties={self._reader_empties}"
 
     def restore_terminal(self) -> None:
         self.disable_host_terminal_modes()
@@ -170,10 +197,25 @@ class NtHostTerminal:
         return False
 
     def _pump_stdin(self) -> None:
+        # An empty read is NOT a reliable EOF on a Windows console: a SetConsoleMode from another
+        # thread (e.g. reassert_raw on a backend switch) can make a pending ReadFile return zero
+        # bytes. Breaking on that permanently kills stdin — the symptom was a hang after switching
+        # sessions where the reactor kept looping but no keystroke was ever delivered again. The
+        # console has no real EOF, so treat empty as transient: retry, and exit only when asked to
+        # stop (set on teardown). A large consecutive-empty backstop guards a truly dead handle so
+        # the thread can't spin forever.
+        empties = 0
         while not self._stop.is_set():
             data = self._winconsole.read_input(4096)
             if not data:
-                break
+                empties += 1
+                self._reader_empties += 1
+                if empties > 5000:  # ~50s of nothing but empty reads → the handle is really gone
+                    break
+                self._stop.wait(0.01)  # brief backoff; also wakes promptly on teardown
+                continue
+            empties = 0
+            self._reader_reads += 1
             try:
                 self._wsock.sendall(data)
             except OSError:
@@ -195,14 +237,19 @@ def _resolve_windows_command(command: list[str]) -> tuple[str, list[str]]:
     name and cannot run a batch script directly — but Windows backends are routinely on
     PATH only via an extension (``claude.cmd`` from npm, ``opencode.exe``), so:
 
-    * resolve the executable against PATH/PATHEXT with ``shutil.which`` (full path), and
+    * resolve the executable against PATH/PATHEXT with ``which_executable`` — which (unlike
+      ``shutil.which``) returns only a real runnable ``.exe``/``.cmd``/``.bat``, not the bare
+      extensionless shell script or ``.ps1`` a half-installed npm package may leave (those
+      can't be launched and would exit instantly), and
     * for a ``.cmd``/``.bat`` (Claude's npm shim), run it through ``cmd.exe /c`` — the only
       way ``CreateProcess`` will execute a batch file.
 
     This is what makes BOTH the ``claude`` and ``opencode`` backends launchable on native
     Windows regardless of how their CLI was installed.
     """
-    exe = shutil.which(command[0]) or command[0]
+    from agitrack.proc import which_executable
+
+    exe = which_executable(command[0]) or command[0]
     rest = command[1:]
     if exe.lower().endswith((".cmd", ".bat")):
         comspec = os.environ.get("COMSPEC", "cmd.exe")
@@ -238,21 +285,24 @@ class NtChildProcess:
         self._rsock.setblocking(False)
         self._write_lock = threading.Lock()
         self._exit_code: int | None = None
+        self._pump_done = False  # set once the reader thread has drained all output + EOF'd
         self._closed = False
         self._reader = threading.Thread(target=self._pump, name="agitrack-conpty-reader", daemon=True)
         self._reader.start()
 
     @classmethod
     def spawn(cls, command: list[str], cwd: str, extra_env: dict[str, str] | None = None) -> "NtChildProcess":
-        import winpty  # type: ignore[import-not-found]  # Windows-only dependency
+        # Our own raw-ConPTY driver, NOT pywinpty: pywinpty's ConPTY backend kills every child
+        # on launch with STATUS_CONTROL_C_EXIT when the app is PyInstaller-frozen (the MSI
+        # build), while the OS's own CreatePseudoConsole works fine frozen. See _conpty.py.
+        from agitrack.proxy.platform._conpty import ConPTY
 
         rows, cols = 24, 80
-        pty = winpty.PTY(cols, rows)
+        pty = ConPTY(cols, rows)
         appname, args = _resolve_windows_command(command)
         cmdline = subprocess.list2cmdline(args) if args else ""
         pty.spawn(appname, cmdline=cmdline, cwd=cwd, env=_env_block(extra_env))
-        child_pid = getattr(pty, "pid", None)
-        return cls(pty, child_pid)
+        return cls(pty, pty.pid)
 
     @property
     def master_fd(self) -> int | None:
@@ -289,6 +339,7 @@ class NtChildProcess:
                     break
         finally:
             self._exit_code = self._read_exitstatus()
+            self._pump_done = True
             try:
                 self._wsock.shutdown(socket.SHUT_WR)
             except OSError:
@@ -333,7 +384,7 @@ class NtChildProcess:
             return
         with self._write_lock:
             try:
-                self._pty.write(data.decode("utf-8", "surrogatepass"))  # type: ignore[attr-defined]
+                self._pty.write(data)  # type: ignore[attr-defined]  # ConPTY.write takes bytes
             except Exception:  # noqa: BLE001 - match os.write's "let the caller decide" is N/A here
                 pass
 
@@ -353,15 +404,13 @@ class NtChildProcess:
     def poll(self) -> int | None:
         if self._exit_code is not None:
             return self._exit_code
-        isalive = getattr(self._pty, "isalive", None)
-        if isalive is not None:
-            try:
-                if isalive():
-                    return None
-            except Exception:  # noqa: BLE001
-                pass
-        self._exit_code = self._read_exitstatus()
-        return self._exit_code
+        # Don't report the child gone off the raw process state: a fast child's trailing
+        # output is flushed by the console only after the process dies, so the reader thread
+        # keeps draining for a short grace after exit. Wait for it to finish — otherwise a
+        # caller that stops reading the moment poll() goes non-None loses that output.
+        if self._pump_done:
+            return self._exit_code if self._exit_code is not None else -1
+        return None
 
     def cleanup(self) -> None:
         if self._closed:

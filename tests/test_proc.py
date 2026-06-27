@@ -56,6 +56,35 @@ def test_terminate_pid_dispatches_to_windows_helper(monkeypatch):
     assert seen == [555]
 
 
+# --- console_isolation_kwargs (keep child subprocesses off the host console) --------
+
+
+def test_console_isolation_kwargs_windows_detaches_stdin_and_hides_console(monkeypatch):
+    # On Windows a captured child must not inherit our console (it would reset raw mode and
+    # make input echo as escape codes) — give it its own hidden console and a detached stdin.
+    monkeypatch.setattr(proc, "_IS_WINDOWS", True)
+    kwargs = proc.console_isolation_kwargs()
+    assert kwargs["stdin"] == subprocess.DEVNULL
+    assert "creationflags" in kwargs  # CREATE_NO_WINDOW → child gets its own console, not ours
+
+
+def test_console_isolation_kwargs_windows_keeps_stdin_when_feeding_input(monkeypatch):
+    # When the caller feeds the child via input=, subprocess already pipes stdin; passing our
+    # own stdin= too would be a conflict, so detach_stdin=False omits it (creationflags stay).
+    monkeypatch.setattr(proc, "_IS_WINDOWS", True)
+    kwargs = proc.console_isolation_kwargs(detach_stdin=False)
+    assert "stdin" not in kwargs
+    assert "creationflags" in kwargs
+
+
+def test_console_isolation_kwargs_posix_only_detaches_stdin(monkeypatch):
+    # POSIX has no console coupling, so there are no creationflags — just the harmless stdin
+    # detach (which also stops a TTY-probing CLI from hanging the menu thread).
+    monkeypatch.setattr(proc, "_IS_WINDOWS", False)
+    assert proc.console_isolation_kwargs() == {"stdin": subprocess.DEVNULL}
+    assert proc.console_isolation_kwargs(detach_stdin=False) == {}
+
+
 # --- resolve_subprocess_command (Windows .cmd/.exe resolution, #118) ----------------
 
 
@@ -94,3 +123,34 @@ def test_resolve_subprocess_command_windows_unresolved_falls_back(monkeypatch):
     monkeypatch.setattr(proc, "_IS_WINDOWS", True)
     monkeypatch.setattr(proc.shutil, "which", lambda name: None)
     assert proc.resolve_subprocess_command(["claude", "-p", "x"]) == ["claude", "-p", "x"]
+
+
+# --- which_executable: Windows-correct executable lookup (#half-installed npm shims) -------
+
+
+def test_which_executable_posix_is_plain_which(monkeypatch):
+    monkeypatch.setattr(proc, "_IS_WINDOWS", False)
+    monkeypatch.setattr(proc.shutil, "which", lambda name: "/usr/bin/" + name)
+    assert proc.which_executable("claude") == "/usr/bin/claude"
+
+
+def test_which_executable_windows_finds_cmd_shim(monkeypatch):
+    monkeypatch.setattr(proc, "_IS_WINDOWS", True)
+    # Only claude.cmd exists (the proper npm shim); .exe does not.
+    monkeypatch.setattr(proc.shutil, "which", lambda name: r"C:\npm\claude.cmd" if name == "claude.cmd" else None)
+    assert proc.which_executable("claude") == r"C:\npm\claude.cmd"
+
+
+def test_which_executable_windows_rejects_extensionless_and_ps1(monkeypatch):
+    monkeypatch.setattr(proc, "_IS_WINDOWS", True)
+    # A half-installed npm package: bare 'claude' (shell script) and claude.ps1 exist, but
+    # no .exe/.cmd/.bat — raw shutil.which would return the bare file, which_executable must not.
+    present = {"claude": r"C:\npm\claude", "claude.ps1": r"C:\npm\claude.ps1"}
+    monkeypatch.setattr(proc.shutil, "which", lambda name: present.get(name))
+    assert proc.which_executable("claude") is None
+
+
+def test_which_executable_windows_honours_explicit_extension(monkeypatch):
+    monkeypatch.setattr(proc, "_IS_WINDOWS", True)
+    monkeypatch.setattr(proc.shutil, "which", lambda name: r"C:\bin\opencode.exe" if name == "opencode.exe" else None)
+    assert proc.which_executable("opencode.exe") == r"C:\bin\opencode.exe"

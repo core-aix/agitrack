@@ -70,6 +70,38 @@ def _set_mode(handle: int, mode: int) -> None:
     _kernel32.SetConsoleMode(handle, mode)
 
 
+# Console control-event handler. aGiTrack treats Ctrl-C as a forwarded input *byte* (raw
+# mode), never as a signal. But a CTRL_C_EVENT — e.g. one propagated from a ConPTY backend's
+# pseudoconsole/teardown (seen with OpenCode), or delivered while the console is briefly in
+# cooked mode for a prompt — would otherwise raise SIGINT/KeyboardInterrupt and either crash
+# the reactor (it's uncaught inside a popup's read loop) or interrupt input handling and drop
+# the user's keystrokes. Swallow Ctrl-C / Ctrl-Break so they never become a Python signal;
+# leave CTRL_CLOSE/LOGOFF/SHUTDOWN to default handling (the extension's shutdown-file +
+# taskkill path covers graceful close).
+_CTRL_C_EVENT = 0
+_CTRL_BREAK_EVENT = 1
+_PHANDLER_ROUTINE = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)  # type: ignore[attr-defined]  # Windows-only
+
+
+def _console_ctrl_handler(ctrl_type: int) -> bool:
+    return ctrl_type in (_CTRL_C_EVENT, _CTRL_BREAK_EVENT)
+
+
+# Keep the ctypes callback alive for the process lifetime: SetConsoleCtrlHandler stores the
+# raw function pointer, so if this object were GC'd Windows would call freed memory.
+_console_ctrl_handler_ref = _PHANDLER_ROUTINE(_console_ctrl_handler)
+_ctrl_handler_installed = False
+
+
+def suppress_console_ctrl_c() -> None:
+    """Install the Ctrl-C/Ctrl-Break swallowing handler (idempotent)."""
+    global _ctrl_handler_installed
+    if _ctrl_handler_installed:
+        return
+    if _kernel32.SetConsoleCtrlHandler(_console_ctrl_handler_ref, True):
+        _ctrl_handler_installed = True
+
+
 def read_input(length: int) -> bytes:
     """Blocking read of up to *length* bytes from the console input handle.
 
@@ -85,6 +117,20 @@ def read_input(length: int) -> bytes:
     if not ok or read.value == 0:
         return b""
     return buf.raw[: read.value]
+
+
+def cancel_input_io() -> None:
+    """Cancel any in-flight ``ReadFile`` on the console input handle.
+
+    Changing the console mode (``SetConsoleMode``) from another thread can WEDGE the reader
+    thread's pending blocking ``ReadFile`` so it never returns even as keystrokes arrive — the
+    cause of the session-switch hang. After re-applying the mode we call this to abort that stuck
+    read; ``ReadFile`` then returns ``ERROR_OPERATION_ABORTED`` (an empty read), the reader loops
+    and issues a fresh ``ReadFile`` against the now-correct mode, and input flows again.
+    ``CancelIoEx`` cancels I/O on the handle regardless of which thread issued it; a no-op (returns
+    FALSE / ERROR_NOT_FOUND) when nothing is pending."""
+    handle = _std_handle(STD_INPUT_HANDLE)
+    _kernel32.CancelIoEx(handle, None)
 
 
 def terminal_size() -> tuple[int, int]:
@@ -115,8 +161,17 @@ class RawConsole:
         self._saved_out: int | None = None
         self._saved_cp: int | None = None
         self._saved_out_cp: int | None = None
+        self._entered = False
 
     def enter(self) -> None:
+        # Idempotent: set_raw() can be called again while already in raw mode (a render or a
+        # resume that didn't go through set_cooked). Re-entering would (a) re-save the current
+        # — already raw — modes over the real cooked ones, so leave() could never restore the
+        # terminal, and (b) re-flush the input buffer, discarding keystrokes the user just
+        # typed. Only the first cooked->raw entry (re-armed by leave()) does the real work.
+        if self._entered:
+            return
+        self._entered = True
         # aGiTrack emits UTF-8 (box-drawing, status line, agent output); without UTF-8
         # code pages the console renders multi-byte sequences as garbage. Switch both code
         # pages to CP_UTF8 (65001) and restore them on leave.
@@ -132,12 +187,60 @@ class RawConsole:
         )
         in_mode |= ENABLE_EXTENDED_FLAGS | ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_WINDOW_INPUT
         _set_mode(self._in, in_mode)
+        # Discard anything already sitting in the console input buffer before the stdin
+        # bridge starts forwarding it to the backend — the POSIX path does the same with
+        # termios.tcflush. Without this, a keystroke left over from the cooked-mode startup
+        # prompts (notably a stray Ctrl-C, which raw mode delivers as a 0x03 byte) would be
+        # forwarded straight into the freshly-spawned backend and kill it on launch
+        # (Windows STATUS_CONTROL_C_EXIT, 0xC000013A).
+        _kernel32.FlushConsoleInputBuffer(self._in)
         out_mode = (
             self._saved_out | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN
         )
         _set_mode(self._out, out_mode)
 
+    def reassert(self) -> int:
+        """Re-apply the raw input/output console modes only if they have actually drifted.
+
+        A backend switch (spawning the new backend's ConPTY, tearing the old one down) can
+        intermittently knock the *host* console out of raw mode — the symptom is that ALL input
+        suddenly echoes as visible escape codes (arrows, mouse, Esc), Ctrl-C stops working, and
+        the menu can't be navigated, because the console is back in cooked/echo/line mode and the
+        VT-input translation is off.
+
+        CRITICAL: only call ``SetConsoleMode`` when the mode is genuinely wrong. An unconditional
+        ``SetConsoleMode`` (even setting the mode it already has) races the console reader thread's
+        pending ``ReadFile`` and can WEDGE it — the read then never returns even as keystrokes
+        arrive, hanging the session switch (confirmed via DEBUG_RAW: reader alive, reads flat,
+        input gone). In the common case the console is still raw, so this becomes a no-op and the
+        reader is never disturbed.
+
+        Returns a bitmask: 1 = input mode was re-applied, 2 = output mode was. 0 = nothing changed."""
+        if not self._entered:
+            return 0
+        changed = 0
+        cur_in = _get_mode(self._in)
+        want_in = cur_in & ~(
+            ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT | ENABLE_MOUSE_INPUT | ENABLE_QUICK_EDIT_MODE
+        )
+        want_in |= ENABLE_EXTENDED_FLAGS | ENABLE_VIRTUAL_TERMINAL_INPUT | ENABLE_WINDOW_INPUT
+        if want_in != cur_in:
+            _set_mode(self._in, want_in)
+            changed |= 1
+        cur_out = _get_mode(self._out)
+        want_out = cur_out | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN
+        if want_out != cur_out:
+            _set_mode(self._out, want_out)
+            changed |= 2
+        return changed
+
     def leave(self) -> None:
+        # Re-arm enter() so the next set_raw() does a real cooked->raw transition (re-flush of
+        # input typed during the cooked interval is then correct). A leave() with no prior
+        # enter() is a no-op.
+        if not self._entered:
+            return
+        self._entered = False
         if self._saved_in is not None:
             _set_mode(self._in, self._saved_in)
         if self._saved_out is not None:
