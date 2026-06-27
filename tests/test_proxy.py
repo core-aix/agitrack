@@ -2758,6 +2758,10 @@ def _mux_runner():
     runner._enable_host_mouse = lambda: None
     runner._set_message = lambda *a, **k: None
     runner._stop_file_watcher = lambda: None
+    # On Windows a session switch performs a full state reset (teardown + fresh respawn)
+    # instead of resuming the backgrounded ConPTY in place; stub it so the pointer-swap
+    # assertions run identically on every CI OS.
+    runner._restart_agent = lambda msg: None
     runner.sessions = [runner.active]
     return runner
 
@@ -2818,6 +2822,131 @@ def test_pump_background_feeds_screen_without_disturbing_active():
     finally:
         os.close(read_fd)
         os.close(write_fd)
+
+
+def test_background_session_relaunches_on_unexpected_exit_then_stops_after_crashloop():
+    # A background backend that exits on its own (e.g. Claude on Windows when it loses the
+    # foreground) must be relaunched+resumed in the background like the active session is —
+    # not silently dropped. A backend that refuses to stay up is finally stopped (crash-loop
+    # guard) so it isn't relaunched forever.
+    runner = _mux_runner()
+    b = _bg_session("B")
+    runner.sessions.append(b)
+    runner._drain_child_output = lambda: None  # force the background drain to report "backend gone"
+    # The background-safe respawn steps are no-ops here (their real work is covered elsewhere).
+    for name in (
+        "_teardown_child",
+        "_reset_agent_tracking",
+        "_sanitize_state_trace",
+        "_initialize_session_baseline",
+        "_init_screen",
+        "_spawn",
+        "_commit_latest_turn_sync",
+        "_stop_file_watcher",
+    ):
+        setattr(runner, name, lambda *a, **k: None)
+
+    # The first few unexpected exits relaunch the session in the background; it is never dropped.
+    for _ in range(3):
+        runner._pump_background(b)
+        assert b in runner.sessions
+
+    # A further quick exit trips the per-session crash-loop guard → the session is stopped.
+    runner._pump_background(b)
+    assert b not in runner.sessions
+
+
+def test_deferred_switch_offer_reconciles_transcript_before_offering():
+    # A switch's user-commit / copy offer must wait until the switched-to session's latest agent
+    # turn is reconciled (parsed + committed in the background) so the agent's own changes aren't
+    # offered as the user's. The offer fires only once reconciled; a running/needed parse defers it.
+    import types
+
+    runner = make_runner()
+    runner._agent_is_active = lambda: False
+    runner._finish_agent_parse_if_ready = lambda **k: None
+    runner.agent_parse_thread = None
+    offers: list = []
+    runner._offer_copy_unstaged_to_base = lambda **k: offers.append(k.get("context"))
+    runner._start_agent_parse = lambda: False
+
+    # Nothing pending → no-op.
+    runner._pending_switch_copy_offer = None
+    runner._service_deferred_switch_offer()
+    assert offers == []
+
+    # Pending for the active session, clean tree, no parse running → offer now.
+    runner._pending_switch_copy_offer = runner.active
+    runner._switch_offer_parse_started = False
+    runner.repo = types.SimpleNamespace(status_short=lambda: "")
+    runner._service_deferred_switch_offer()
+    assert offers == ["switch"] and runner._pending_switch_copy_offer is None
+
+    # A running parse defers the offer (don't offer mid-reconcile).
+    offers.clear()
+    runner._pending_switch_copy_offer = runner.active
+    runner.agent_parse_thread = types.SimpleNamespace(is_alive=lambda: True)
+    runner._service_deferred_switch_offer()
+    assert offers == [] and runner._pending_switch_copy_offer is runner.active
+
+    # Uncommitted changes not yet checked → start ONE background parse and keep deferring.
+    offers.clear()
+    started: list = []
+    runner.agent_parse_thread = None
+    runner._switch_offer_parse_started = False
+    runner.repo = types.SimpleNamespace(status_short=lambda: " M f.py")
+    runner._start_agent_parse = lambda: (started.append(1), True)[1]
+    runner._service_deferred_switch_offer()
+    assert started == [1] and runner._switch_offer_parse_started is True and offers == []
+
+    # Target no longer the active session → drop the deferred offer silently.
+    offers.clear()
+    runner._pending_switch_copy_offer = _bg_session("Z")
+    runner._service_deferred_switch_offer()
+    assert offers == [] and runner._pending_switch_copy_offer is None
+
+
+def test_user_commit_popup_surfaces_failure_without_crashing():
+    # A failed `git commit` (e.g. a repo pre-commit hook rejecting it) must NOT crash aGiTrack
+    # with an uncaught GitError ("Command failed: git commit -F -"); it surfaces the error and
+    # leaves the changes staged.
+    import types
+
+    from agitrack.git.repo import GitError
+
+    runner = make_runner()
+    runner._ensure_turn_branch = lambda: None
+    runner._review_untracked_popup = lambda **k: ""
+    runner._prompt_popup = lambda *a, **k: "msg"
+    msgs: list = []
+    runner._set_message = lambda m, **k: msgs.append(m)
+    runner._render = lambda: None
+    runner.state = types.SimpleNamespace(session_id="sid", clear_trace=lambda: None)
+
+    def boom(_message):
+        raise GitError("Command failed: git commit -F -\npre-commit hook rejected")
+
+    runner.repo = types.SimpleNamespace(add_tracked=lambda: None, has_staged_changes=lambda: True, commit=boom)
+
+    assert runner._create_user_commit_popup() is False  # no exception escapes
+    assert any("Commit failed" in m for m in msgs)
+
+
+def test_rebaseline_base_edits_absorbs_agitracks_own_copy():
+    # After aGiTrack copies stranded files into the base repo, those files are folded into the
+    # base-edit monitor's baseline so _warn_if_base_edited doesn't flag them as an agent edit.
+    import types
+
+    runner = make_runner()
+    runner._monitor_base_edits = False
+    runner._base_status_baseline = {"old"}
+    runner._rebaseline_base_edits()
+    assert runner._base_status_baseline == {"old"}  # no-op when not monitoring
+
+    runner._monitor_base_edits = True
+    runner.base_repo = types.SimpleNamespace(status_short=lambda: "?? copied.txt\n M f.py")
+    runner._rebaseline_base_edits()
+    assert runner._base_status_baseline == {"?? copied.txt", " M f.py"}
 
 
 def test_baseline_drops_session_with_no_conversation(tmp_path):
@@ -5562,6 +5691,59 @@ def _merge_drift_runner(dir_branch, *, session_target="dev", choice, sessions=No
     return runner
 
 
+# --- agent switches the worktree's OWN branch (in-place git checkout) ---
+
+
+def _agent_branch_runner(worktree_branch, *, base="master"):
+    import types
+
+    runner = make_runner(
+        worktree=types.SimpleNamespace(),
+        _base_branch=base,
+        repo=types.SimpleNamespace(current_branch=lambda: worktree_branch),
+        name="s1",
+    )
+    runner._integration = types.SimpleNamespace(base_branch=base)
+    runner._agent_branch_check_at = 0.0
+    runner.messages = []
+    runner._set_message = lambda m, **k: runner.messages.append(m)
+    runner._render = lambda: None
+    return runner
+
+
+def test_follows_agent_worktree_branch_switch():
+    runner = _agent_branch_runner("feature")
+    runner._follow_agent_worktree_branch()
+    assert runner._base_branch == "feature"
+    assert runner._repo_dir_branch == "feature"  # status bar follows
+    assert runner._integration.base_branch == "feature"
+    assert any("Working branch switched to 'feature' by the backend agent" in m for m in runner.messages)
+    # Already on 'feature' → no re-notification, no churn.
+    runner.messages.clear()
+    runner._agent_branch_check_at = 0.0
+    runner._follow_agent_worktree_branch()
+    assert runner.messages == [] and runner._base_branch == "feature"
+
+
+def test_does_not_follow_managed_turn_branch_or_detached_head():
+    # aGiTrack's own worktree states — a managed turn branch, or detached at base between turns —
+    # are NOT the agent switching the branch, so the follow must never fire for them.
+    for branch in ("agitrack/claude/s1/t1", "HEAD"):
+        runner = _agent_branch_runner(branch)
+        runner._follow_agent_worktree_branch()
+        assert runner._base_branch == "master", branch
+        assert runner.messages == []
+
+
+def test_no_worktree_session_does_not_poll_worktree_branch():
+    # No-worktree mode is followed by _check_no_worktree_branch_change; there is no separate
+    # worktree branch to track here, so this poll is a no-op.
+    runner = _agent_branch_runner("feature")
+    runner.worktree = None
+    runner._follow_agent_worktree_branch()
+    assert runner._base_branch == "master" and runner.messages == []
+
+
 def test_repo_dir_change_keeps_all_sessions_on_their_branches_by_default():
     # The default (first) option does nothing — background sessions keep merging into
     # their own branches after the directory's branch changes.
@@ -6313,6 +6495,28 @@ def test_crash_loop_capture_surfaces_backend_output(monkeypatch):
     assert "running as a background agent" in notice  # the real reason, escapes stripped
     assert "\x1b" not in notice
     assert "--new-session" in notice
+
+
+def test_backend_exit_notice_shows_the_launched_command(monkeypatch):
+    # The notice must name the EXACT command aGiTrack tried to launch (and what it produced),
+    # so a backend that dies on startup is diagnosable rather than a generic "exited".
+    runner = make_runner()
+    runner._debug = lambda *a, **k: None
+    runner._restart_agent = lambda msg: None
+    runner._finalize_on_backend_exit = lambda: None
+    runner._last_spawn_command = ["claude", "--resume", "abc"]
+    runner.last_child_output_sample = b""  # claude died producing nothing
+
+    t = [1000.0]
+    monkeypatch.setattr("agitrack.proxy.runner.time.monotonic", lambda: t[0])
+    for _ in range(3):
+        runner._relaunch_backend_or_exit()
+    runner._relaunch_backend_or_exit()
+
+    notice = runner._backend_exit_notice
+    assert notice is not None
+    assert "Command: claude --resume abc" in notice
+    assert "no output before exiting" in notice  # explicit, not an empty section
 
 
 def test_busy_session_forks_instead_of_crash_looping():
@@ -7070,12 +7274,117 @@ def test_switch_active_joins_worker_before_swapping():
     runner._render = lambda: None
     runner._resize_child = lambda: None
     runner._enable_host_mouse = lambda: None
+    runner._restart_agent = lambda msg: None  # Windows switch path; no-op on the fake
     runner._session_name = lambda index: f"s{index}"
 
     runner._switch_active(1)
 
     assert events and events[0][0] == "join"  # waited before swapping
     assert runner.active_index == 1
+
+
+def test_debug_and_raw_logs_write_to_base_repo_when_enabled(tmp_path):
+    # The diagnostic logs (DEBUG_PROXY -> proxy-debug, DEBUG_RAW -> proxy-raw) must behave the
+    # same on every platform: written to the BASE repo's .agitrack/, one shared run-stamp per
+    # run, and gated so nothing is written when the switch is off. Runs on both CI OSes.
+    import types
+
+    base = tmp_path / "base"
+    base.mkdir()
+    runner = make_runner()
+    runner.base_repo = types.SimpleNamespace(repo=base)
+    runner._diag_run = "20260627-101112"
+
+    # Enabled: both logs are written under the base repo, named by the shared run-stamp.
+    runner.debug_proxy = True
+    runner.raw_capture = True
+    runner._debug("session switch start")
+    runner._raw_capture(">", b"\x1b[A")
+
+    debug_log = base / ".agitrack" / "proxy-debug-20260627-101112.log"
+    raw_log = base / ".agitrack" / "proxy-raw-20260627-101112.log"
+    assert "session switch start" in debug_log.read_text(encoding="utf-8")
+    raw_text = raw_log.read_text(encoding="utf-8")
+    assert "> b'\\x1b[A'" in raw_text  # tag + byte-exact repr
+
+    # Disabled: a second run writes nothing new (the gate is honoured on both methods).
+    runner.debug_proxy = False
+    runner.raw_capture = False
+    runner._diag_run = "20260627-202122"
+    runner._debug("must not appear")
+    runner._raw_capture("<", b"x")
+    assert not (base / ".agitrack" / "proxy-debug-20260627-202122.log").exists()
+    assert not (base / ".agitrack" / "proxy-raw-20260627-202122.log").exists()
+
+
+def test_switch_active_resumes_in_place_without_interrupting_target(monkeypatch):
+    # Switching to a session must KEEP its backend running — resume the existing ConPTY in
+    # place, never teardown/respawn it. A teardown would call interrupt() (Ctrl-C/ETX) on the
+    # session being switched to and cancel its in-progress turn. So _switch_active must NOT call
+    # _restart_agent on any platform; it resizes + resumes. On Windows it additionally clears the
+    # host terminal-mode mirror (host-side only — never touches a backend's ConPTY).
+    import agitrack.proxy.runner as proxy_mod
+
+    runner = _mux_runner()
+    runner.sessions.append(_bg_session("B"))
+    runner._session_name = lambda index: f"s{index}"
+
+    restarts: list[str] = []
+    resizes: list[int] = []
+    host_resets: list[int] = []
+    runner._restart_agent = lambda msg: restarts.append(msg)
+    runner._resize_child = lambda: resizes.append(1)
+    runner._disable_host_terminal_modes = lambda: host_resets.append(1)
+
+    monkeypatch.setattr(proxy_mod.os, "name", "nt")
+    runner._switch_active(1)
+    assert runner.active_index == 1 and runner.repo == "repoB"  # swapped
+    assert resizes and not restarts  # in-place resume, the target backend is never respawned
+    assert host_resets  # host mode mirror cleared on Windows
+
+    restarts.clear()
+    resizes.clear()
+    host_resets.clear()
+    monkeypatch.setattr(proxy_mod.os, "name", "posix")
+    runner._switch_active(0)
+    assert runner.active_index == 0 and runner.repo == "repoA"  # swapped back
+    assert resizes and not restarts  # in-place resume on POSIX too
+    assert not host_resets  # POSIX path leaves host modes alone
+
+
+def test_esc_on_a_popup_during_exit_finalize_aborts_the_whole_exit():
+    # Pressing Esc on ANY popup shown during the exit/finalize sequence (user-commit box, copy
+    # box, merge prompt) cancels the whole exit — not just that one step. Implemented by the
+    # _run_modal_inline cancel chokepoint, gated on _finalized_on_exit so ordinary popups are
+    # unaffected.
+    import types
+
+    runner = make_runner()
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda: None
+    runner._clear_message = lambda: None
+    runner._popup_read_input = lambda: b"\x1b"  # Esc
+    runner._exit_menu_requested = False
+    runner.input = types.SimpleNamespace(menu_key=b"\x07")
+
+    class _CancelModal:
+        def render_message(self):
+            return "msg"
+
+        def feed(self, data):
+            return ("cancel", None)
+
+    # Outside the exit finalize: an Esc-cancel must NOT set the exit-abort flag.
+    runner._finalized_on_exit = False
+    runner._exit_aborted = False
+    assert runner._run_modal_inline(_CancelModal()) is None
+    assert runner._exit_aborted is False
+
+    # During the exit finalize: an Esc-cancel aborts the whole exit.
+    runner._finalized_on_exit = True
+    runner._exit_aborted = False
+    assert runner._run_modal_inline(_CancelModal()) is None
+    assert runner._exit_aborted is True
 
 
 # --- issue #18: Ctrl-C inside a popup goes through the full exit flow -----------
@@ -7492,6 +7801,31 @@ def test_sync_terminal_modes_skips_kitty_on_unsupported_host(monkeypatch):
     assert b"\x1b[<u" not in writes  # kitty pop suppressed
     assert b"\x1b[>4;2m" in writes  # modifyOtherKeys still mirrored
     assert b"\x1b[>4;0m" in writes
+
+
+def test_sync_terminal_modes_windows_drops_hover_motion_keeps_drag(monkeypatch):
+    # On Windows the host floods 1003 (any-event/hover) motion that doesn't round-trip cleanly
+    # and leaks into the backend as literal `[<35;..M` text. Mirror 1002 (button-event/drag, for
+    # drag-select copy), button (1000), and SGR (1006), but NOT 1003. POSIX mirrors all.
+    import agitrack.proxy.runner as proxy_mod
+
+    backend_modes = b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h"
+
+    runner = make_runner(child_mouse=False)
+    writes: list[bytes] = []
+    monkeypatch.setattr(proxy_mod.os, "write", lambda fd, data: writes.append(data))
+
+    monkeypatch.setattr(proxy_mod.os, "name", "nt")
+    runner._sync_terminal_modes(backend_modes)
+    assert b"\x1b[?1000h" in writes  # button mirrored
+    assert b"\x1b[?1002h" in writes  # drag mirrored (copy works)
+    assert b"\x1b[?1006h" in writes  # SGR mirrored
+    assert b"\x1b[?1003h" not in writes  # hover NOT mirrored (the flood/leak)
+
+    writes.clear()
+    monkeypatch.setattr(proxy_mod.os, "name", "posix")
+    runner._sync_terminal_modes(backend_modes)
+    assert b"\x1b[?1003h" in writes  # POSIX mirrors hover too (no leak there)
 
 
 def test_disable_host_terminal_modes_pops_kitty_only_when_supported(monkeypatch):
@@ -8382,15 +8716,37 @@ def test_backend_child_env_disables_opencode_autoupdate_when_agitrack_takes_over
     runner.backend = types.SimpleNamespace(name="opencode")
     runner.global_config = types.SimpleNamespace(check_for_updates=True)
     runner._backend_update_via_agitrack = lambda: True
-    assert runner._backend_child_env() == {"OPENCODE_DISABLE_AUTOUPDATE": "1"}
+    # Assert the autoupdate-suppression behavior independent of the color env vars the Windows
+    # path also injects (COLORTERM/FORCE_COLOR), which are orthogonal to this.
+    assert (runner._backend_child_env() or {}).get("OPENCODE_DISABLE_AUTOUPDATE") == "1"
 
     # npm/native (not sandbox-blocked) → leave OpenCode's own auto-update alone.
     runner._backend_update_via_agitrack = lambda: False
-    assert runner._backend_child_env() is None
+    assert "OPENCODE_DISABLE_AUTOUPDATE" not in (runner._backend_child_env() or {})
 
     # Update checks off → aGiTrack won't auto-update, so don't suppress OpenCode's either.
     runner._backend_update_via_agitrack = lambda: True
     runner.global_config = types.SimpleNamespace(check_for_updates=False)
+    assert "OPENCODE_DISABLE_AUTOUPDATE" not in (runner._backend_child_env() or {})
+
+
+def test_backend_child_env_forces_color_on_windows_only(tmp_path, monkeypatch):
+    # On Windows aGiTrack skips host-terminal color detection, so a probing backend (Claude)
+    # renders greyscale unless told the terminal is color-capable. Force truecolor there; POSIX
+    # keeps real detection (no forced color env).
+    import agitrack.proxy.runner as proxy_mod
+
+    runner = _update_runner(tmp_path)
+    runner.backend = types.SimpleNamespace(name="claude")
+    runner.global_config = types.SimpleNamespace(check_for_updates=True)
+    runner._backend_update_via_agitrack = lambda: False
+
+    monkeypatch.setattr(proxy_mod.os, "name", "nt")
+    env = runner._backend_child_env() or {}
+    assert env.get("COLORTERM") == "truecolor"
+    assert env.get("FORCE_COLOR") == "3"
+
+    monkeypatch.setattr(proxy_mod.os, "name", "posix")
     assert runner._backend_child_env() is None
 
 
@@ -8611,3 +8967,127 @@ def test_resume_without_collision_keeps_name_and_does_not_prompt(tmp_path):
     runner._resume_conversation("foo", "ses_1")
 
     assert runner._created == ["foo"]  # original name kept, no prompt
+
+
+# --- Flow-matrix gap fills (audit 2026-06-27): branches with no prior test -------------------
+
+
+def test_warn_if_base_edited_fires_then_rebaselines_and_noop_when_off():
+    import types
+
+    runner = make_runner()
+    runner.BASE_EDIT_CHECK_SECONDS = 0.0
+    runner._base_check_at = 0.0
+    runner._monitor_base_edits = True
+    runner._base_status_baseline = set()
+    runner.base_repo = types.SimpleNamespace(status_short=lambda: " M src/app.py\n?? new.txt")
+    msgs: list = []
+    runner._set_message = lambda m, **k: msgs.append(m)
+    runner._render = lambda: None
+
+    runner._warn_if_base_edited()
+    assert any("edited the base repo" in m for m in msgs)  # the agent wrote into the base tree
+
+    # The same files must NOT warn again (baseline absorbed them).
+    msgs.clear()
+    runner._base_check_at = 0.0
+    runner._warn_if_base_edited()
+    assert msgs == []
+
+    # Monitoring off → never warns, even with new base changes.
+    msgs.clear()
+    runner._monitor_base_edits = False
+    runner._base_check_at = 0.0
+    runner._base_status_baseline = set()
+    runner._warn_if_base_edited()
+    assert msgs == []
+
+
+def test_stop_session_drops_it_keeps_others_and_refuses_the_last():
+    runner = _mux_runner()
+    runner.sessions.append(_bg_session("B"))
+    runner._commit_latest_turn_sync = lambda *a, **k: None
+
+    runner._stop_session(1, commit=False)  # stop the background session
+    assert len(runner.sessions) == 1 and runner.sessions[0].repo == "repoA"
+
+    msgs: list = []
+    runner._set_message = lambda m, **k: msgs.append(m)
+    runner._stop_session(0)  # the only remaining session can't be stopped
+    assert len(runner.sessions) == 1 and any("only session" in m for m in msgs)
+
+
+def test_stop_session_menu_routes_choice_and_esc_backs_out():
+    runner = _mux_runner()
+    runner.sessions.append(_bg_session("B"))
+    runner._session_name = lambda i: f"s{i}"
+    stopped: list = []
+    runner._stop_session = lambda index: stopped.append(index)
+
+    runner._select_popup = lambda title, options, **k: options[1]  # pick the 2nd session
+    assert runner._stop_session_menu() == runner._MENU_DONE
+    assert stopped == [1]
+
+    runner._select_popup = lambda title, options, **k: None  # Esc
+    assert runner._stop_session_menu() == runner._MENU_UP
+
+
+def test_handle_session_command_numeric_switches_new_prompts_blank_opens_menu():
+    runner = make_runner()
+    calls: list = []
+    runner._switch_to_session_index = lambda i: calls.append(("switch", i))
+    runner._prompt_new_session = lambda: calls.append(("new",)) or runner._MENU_DONE
+    runner._session_menu = lambda: calls.append(("menu",)) or runner._MENU_UP
+
+    assert runner._handle_session_command("2") == runner._MENU_DONE
+    assert calls == [("switch", 1)]  # 1-based -> 0-based index
+
+    calls.clear()
+    runner._handle_session_command("new")
+    assert calls == [("new",)]
+
+    calls.clear()
+    runner._handle_session_command("")
+    assert calls == [("menu",)]
+
+
+def test_run_command_agent_backend_already_set_and_unknown_command():
+    import types
+
+    runner = make_runner()
+    runner.state = types.SimpleNamespace(backend="claude")
+    msgs: list = []
+    runner._set_message = lambda m, **k: msgs.append(m)
+    runner._render = lambda: None
+    runner._after_menu_command = lambda signal: None
+
+    runner._run_command("agent-backend claude")  # same backend
+    assert any("already set to claude" in m for m in msgs)
+
+    msgs.clear()
+    runner._run_command("totally-not-a-command")
+    assert any("Unknown aGiTrack command" in m for m in msgs)
+
+
+def test_integrate_active_session_refuses_mid_turn_and_without_worktree():
+    import types
+
+    runner = make_runner()
+    msgs: list = []
+    runner._set_message = lambda m, **k: msgs.append(m)
+    runner._render = lambda: None
+
+    # No worktree → clear refusal.
+    runner.worktree = None
+    runner._integrate_active_session()
+    assert any("no worktree to integrate" in m for m in msgs)
+
+    # Worktree with changes but a turn is genuinely running → refuse, don't dead-end.
+    msgs.clear()
+    runner.worktree = types.SimpleNamespace(name="s", path="/wt")
+    runner._base_branch = "main"
+    runner.repo = types.SimpleNamespace(has_changes=lambda: True, repo="/wt")
+    runner._clear_agent_in_flight_if_idle = lambda: None
+    runner._agent_is_active = lambda: True
+    runner._integrate_active_session()
+    assert any("Finish or stop the current turn" in m for m in msgs)
