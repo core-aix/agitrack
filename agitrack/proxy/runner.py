@@ -679,6 +679,14 @@ class ProxyRunner:
         self.host_da: bytes | None = None
         self.host_kitty_keyboard: bool = False
         self.color_mode = detect_color_mode()
+        if os.name == "nt" and self.color_mode == "16":
+            # The modern Windows console (conhost / Windows Terminal) renders 24-bit color and
+            # aGiTrack enables VT processing on it, but it sets neither COLORTERM nor TERM, so
+            # detect_color_mode lands on its 16-color fallback. That downsamples the backend's
+            # truecolor UI when aGiTrack re-emits it — flattening Claude's subtle palette to
+            # near-greyscale (OpenCode's bolder colors survived 16-color, which is why only Claude
+            # looked wrong). Render truecolor on Windows so the backend's colors are preserved.
+            self.color_mode = "truecolor"
         # Single-writer management: only one aGiTrack may auto-commit/merge in a
         # working tree. A second instance is refused at startup (see `run`).
         self.management_lock = _lock if _lock is not None else RepoLock(repo.repo / ".agitrack" / "lock")
@@ -5587,8 +5595,10 @@ class ProxyRunner:
         # modal mailbox while we wait keeps a worker that's blocked on a dialog from
         # deadlocking us. (RLock: reentrant when already held by this thread, e.g. the
         # background-session conflict path that calls us from the locked cluster.)
+        self._debug(f"switch_active: idx={index} acquiring pipeline lock")
         self._acquire_pipeline_lock_from_main()
         try:
+            self._debug("switch_active: lock held; joining parse worker")
             self._join_parse_worker_before_swap()
             # Swap under the outgoing session's parse lock: if the join above timed
             # out, the still-running worker writes its result to its owning Session
@@ -5602,18 +5612,22 @@ class ProxyRunner:
             self._reassert_host_raw()  # a switch can knock the host console out of raw mode
             self._set_message(f"Switched to session '{self._session_name(index)}'")
             self._render()
+            self._debug("switch_active: swapped + rendered")
             # The copy-back mute is per active-session-visit: a switch resets it so the
             # session we just landed on gets offered its own worktree-only files (background
             # sessions are never interrupted mid-run; this is where we catch up). Only when
             # it's idle — a session still mid-turn gets offered by the turn path once it settles.
             self._copy_declined = set()
             if not self._agent_is_active():
+                self._debug("switch_active: offering copy-to-base")
                 self._offer_copy_unstaged_to_base(context="switch")
         finally:
             self._pipeline_lock.release()
+        self._debug("switch_active: lock released; prompting merge-target if diverged")
         # The newly-active session may merge into a different branch than the one
         # checked out in the repo directory — ask where its changes should merge.
         self._prompt_merge_target_if_diverged()
+        self._debug("switch_active: complete")
 
     def _join_parse_worker_before_swap(self) -> None:
         # A parse worker started for the active session reads that session's
