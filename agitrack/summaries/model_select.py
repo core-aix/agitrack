@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import subprocess
 
-from agitrack.proc import resolve_subprocess_command
+from agitrack.proc import console_isolation_kwargs, resolve_subprocess_command
 
 
 def list_available_models(backend_name: str) -> list[str]:
@@ -36,6 +36,7 @@ def _list_opencode_models() -> list[str]:
             stderr=subprocess.PIPE,
             check=False,
             timeout=5,
+            **console_isolation_kwargs(),  # keep the backend CLI off the host console (proc.py)
         )
         if result.returncode != 0:
             return []
@@ -58,6 +59,7 @@ def _list_claude_models() -> list[str]:
             stderr=subprocess.PIPE,
             check=False,
             timeout=5,
+            **console_isolation_kwargs(),  # keep the backend CLI off the host console (proc.py)
         )
         if result.returncode != 0:
             return []

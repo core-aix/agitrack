@@ -53,9 +53,10 @@ class AgitrackActions:
         if self.ui is not None:
             message = ""
             while not message.strip():
-                entered = self.ui.text("User commit message:")
+                # Cancelling (Esc) returns None — continue without committing.
+                entered = self.ui.text("User commit message (Esc to continue without committing):")
                 if entered is None:
-                    self.ui.info("User commit cancelled.", level="warn")
+                    self.ui.info("Continuing without committing.", level="warn")
                     return False
                 message = entered
                 if not message.strip():

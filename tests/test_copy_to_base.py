@@ -14,17 +14,17 @@ wholly-ignored ``dir/``) is pinned to git's actual output.
 
 from __future__ import annotations
 
-import os
 import types
-
-import pytest
 
 from agitrack.git import GitRepo
 from agitrack.git.worktree import WorktreeManager
 
 from proxy_helpers import make_runner
 
-pytestmark = pytest.mark.skipif(os.name != "posix", reason="aGiTrack is POSIX-only (Windows runs under WSL = Linux)")
+# Runs on EVERY OS, including the Windows CI job: this is platform-agnostic flow logic over real
+# git worktrees, and Windows is exactly where the copy/commit flow bugs surfaced. (It used to be
+# gated POSIX-only on the stale assumption that aGiTrack only ran under WSL; native Windows is
+# supported since #118.)
 
 
 def _session_with_worktree(tmp_path):

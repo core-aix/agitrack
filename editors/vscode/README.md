@@ -19,13 +19,18 @@ aGiTrack does in a terminal, started from VSCode.
 
 ## Requirements
 
-- **Python 3.10+** (so the aGiTrack CLI can be installed — see below).
+- **Python 3.10+** to install the aGiTrack CLI via pipx/pip — **or**, on Windows, nothing
+  at all: the extension can install the self-contained MSI (which bundles its own Python).
 - A backend installed (Claude Code or OpenCode), the same as using aGiTrack in a terminal.
 - The workspace is a git repository.
 
 The aGiTrack CLI itself does **not** need to be installed first — if it's missing, the
-extension offers to install it for you (via `pipx`, falling back to `pip --user`). If
-you already have it elsewhere, point `agitrack.path` at it.
+extension offers to install it for you (via `pipx`, falling back to `pip --user`). On
+Windows, when neither pipx nor pip is available, it falls back to downloading the
+standalone **MSI** from the latest GitHub release and running it (you'll see a Windows
+elevation prompt) — so the extension works even on a machine with no Python. The extension
+also discovers an MSI you installed by hand under `C:\Program Files\aGiTrack`. If you
+already have the CLI elsewhere, point `agitrack.path` at it.
 
 ## Usage
 

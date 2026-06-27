@@ -6,7 +6,11 @@ import subprocess
 from pathlib import Path
 
 from agitrack.backends.base import AgentResult, TokenUsage
-from agitrack.proc import _IS_WINDOWS, resolve_subprocess_command  # _IS_WINDOWS: see proc.py
+from agitrack.proc import (  # _IS_WINDOWS: see proc.py
+    _IS_WINDOWS,
+    console_isolation_kwargs,
+    resolve_subprocess_command,
+)
 
 # The summarizer is a mechanical text-reduction task that gains nothing from extended
 # reasoning, so its bare run turns thinking off entirely rather than using whatever the
@@ -143,12 +147,17 @@ class ClaudeBackend:
                 resolve_subprocess_command(command),  # find/launch claude.cmd on Windows (#118)
                 cwd=self.repo,
                 text=True,
+                encoding="utf-8",  # NEVER the Windows cp1252 locale: a prompt with non-cp1252
+                errors="replace",  # chars (em-dash, emoji, …) would otherwise fail to encode here
                 input=prompt if to_stdin else None,  # Windows: prompt via stdin, not a cmd.exe arg
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=False,
                 env=env,
                 timeout=_SUMMARIZER_TIMEOUT_SECONDS if bare else None,
+                # Keep the claude CLI off the host console (raw-mode preservation; see proc.py).
+                # When we feed it via input= (to_stdin) subprocess already pipes stdin.
+                **console_isolation_kwargs(detach_stdin=not to_stdin),
             )
         except subprocess.TimeoutExpired:
             return AgentResult(

@@ -93,7 +93,8 @@ def test_create_user_commit_ui_cancel_returns_false():
     result = actions.create_user_commit()
     assert result is False
     ui.info.assert_called_once()
-    assert "cancel" in ui.info.call_args.args[0].lower()
+    # Cancelling continues without committing; the notice says so.
+    assert "without committing" in ui.info.call_args.args[0].lower()
 
 
 # ---------------------------------------------------------------------------
