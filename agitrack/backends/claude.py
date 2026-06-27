@@ -147,6 +147,8 @@ class ClaudeBackend:
                 resolve_subprocess_command(command),  # find/launch claude.cmd on Windows (#118)
                 cwd=self.repo,
                 text=True,
+                encoding="utf-8",  # NEVER the Windows cp1252 locale: a prompt with non-cp1252
+                errors="replace",  # chars (em-dash, emoji, …) would otherwise fail to encode here
                 input=prompt if to_stdin else None,  # Windows: prompt via stdin, not a cmd.exe arg
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,

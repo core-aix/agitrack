@@ -2906,6 +2906,49 @@ def test_deferred_switch_offer_reconciles_transcript_before_offering():
     assert offers == [] and runner._pending_switch_copy_offer is None
 
 
+def test_user_commit_popup_surfaces_failure_without_crashing():
+    # A failed `git commit` (e.g. a repo pre-commit hook rejecting it) must NOT crash aGiTrack
+    # with an uncaught GitError ("Command failed: git commit -F -"); it surfaces the error and
+    # leaves the changes staged.
+    import types
+
+    from agitrack.git.repo import GitError
+
+    runner = make_runner()
+    runner._ensure_turn_branch = lambda: None
+    runner._review_untracked_popup = lambda **k: ""
+    runner._prompt_popup = lambda *a, **k: "msg"
+    msgs: list = []
+    runner._set_message = lambda m, **k: msgs.append(m)
+    runner._render = lambda: None
+    runner.state = types.SimpleNamespace(session_id="sid", clear_trace=lambda: None)
+
+    def boom(_message):
+        raise GitError("Command failed: git commit -F -\npre-commit hook rejected")
+
+    runner.repo = types.SimpleNamespace(add_tracked=lambda: None, has_staged_changes=lambda: True, commit=boom)
+
+    assert runner._create_user_commit_popup() is False  # no exception escapes
+    assert any("Commit failed" in m for m in msgs)
+
+
+def test_rebaseline_base_edits_absorbs_agitracks_own_copy():
+    # After aGiTrack copies stranded files into the base repo, those files are folded into the
+    # base-edit monitor's baseline so _warn_if_base_edited doesn't flag them as an agent edit.
+    import types
+
+    runner = make_runner()
+    runner._monitor_base_edits = False
+    runner._base_status_baseline = {"old"}
+    runner._rebaseline_base_edits()
+    assert runner._base_status_baseline == {"old"}  # no-op when not monitoring
+
+    runner._monitor_base_edits = True
+    runner.base_repo = types.SimpleNamespace(status_short=lambda: "?? copied.txt\n M f.py")
+    runner._rebaseline_base_edits()
+    assert runner._base_status_baseline == {"?? copied.txt", " M f.py"}
+
+
 def test_baseline_drops_session_with_no_conversation(tmp_path):
     from types import SimpleNamespace
 

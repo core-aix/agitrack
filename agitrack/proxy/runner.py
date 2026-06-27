@@ -1826,6 +1826,19 @@ class ProxyRunner:
             self._base_status_baseline = current  # don't repeat for the same files
             self._render()
 
+    def _rebaseline_base_edits(self) -> None:
+        # Re-baseline the un-sandboxed base-edit monitor after aGiTrack ITSELF wrote into the base
+        # repo (the copy-back of stranded worktree files). Those files are aGiTrack's own action,
+        # not the agent editing outside its worktree, so fold them into the baseline rather than
+        # letting _warn_if_base_edited flag them as "Agent edited the base repo". No-op when the
+        # monitor isn't active (sandbox enforces confinement, or no worktree).
+        if not self._monitor_base_edits:
+            return
+        try:
+            self._base_status_baseline = set(self.base_repo.status_short().splitlines())
+        except Exception as error:
+            self._debug(f"rebaseline base edits failed: {error!r}")
+
     @staticmethod
     def _newest_mtime(paths) -> float:
         """Newest modification time across *paths* (missing entries ignored).
@@ -8182,7 +8195,20 @@ class ProxyRunner:
                 return False
             message = result
             prompt = "Commit message is required. Enter a commit message:"
-        repo.commit(build_user_commit_message(message=message, agitrack_session_id=state.session_id))
+        try:
+            repo.commit(build_user_commit_message(message=message, agitrack_session_id=state.session_id))
+        except Exception as error:
+            # A failed commit (a repo pre-commit hook rejecting it, a git config/identity problem,
+            # a racing change) must NOT crash aGiTrack — it used to propagate as an uncaught
+            # GitError and exit with "Command failed: git commit -F -" on the console. Surface the
+            # git error and leave the changes staged so the user can fix the cause and retry.
+            self._debug(f"user commit failed: {error!r}")
+            self._set_message(
+                f"Commit failed — your changes are left staged, unchanged:\n{error}",
+                seconds=15.0,
+            )
+            self._render()
+            return False
         state.clear_trace()
         return True
 
@@ -9989,6 +10015,12 @@ class ProxyRunner:
             except OSError as error:
                 self._debug(f"copy {rel} to base failed: {error!r}")
                 remained.append(rel)
+        if copied:
+            # aGiTrack itself just wrote these into the base repo (the copy-back of stranded
+            # worktree files) — that is NOT the agent editing outside its worktree, so fold them
+            # into the un-sandboxed base-edit monitor's baseline. Otherwise _warn_if_base_edited
+            # would flag aGiTrack's own copy as "Agent edited the base repo".
+            self._rebaseline_base_edits()
         if remained:
             self._notice_files_remain(wt_dir, remained)
         elif copied:
