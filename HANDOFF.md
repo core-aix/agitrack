@@ -38,7 +38,29 @@ you have every commit below, and confirm `git push` is authenticated.
   must be **reverted** once Task A makes pass-through actually work. (The focus-strip and not-mirror-
   motion bits may stay or be folded into the real fix.)
 
-## Task A — make mouse (and rich keys) pass through to the backend (the real fix)
+## Task A — STATUS: largely RESOLVED; premise was wrong (see dev/winmouse/FINDINGS.md)
+**What was actually found (deterministic harness + live-backend injection, in-VM, build 26200):**
+- ConPTY **does** deliver clean mouse: it passes SGR button/wheel/**motion** and focus events
+  through to a VT-input backend **verbatim**; injecting them into live claude+opencode produced
+  **no leak**.
+- **Neither backend enables win32-input-mode.** The `\x1b[?9001h` seen in their output is
+  conhost's *unconditional startup emission*, NOT the backend — so implementing win32-input-mode
+  input encoding (the plan below) would have fixed nothing. **That plan is dropped.**
+- The original leak was a **host-side artifact** (motion/focus reports mangled by the RDP console),
+  not the ConPTY input path.
+
+**What was done:** the broad band-aid was reverted for full pass-through —
+`_sync_terminal_modes` now mirrors motion (1002/1003) to the host and sets `child_mouse=True` from
+the backend's real `?1000h` on Windows too; the Windows focus-event strip in `_reactor_stdin_phase`
+was removed. All Windows-only mouse/focus special-casing is gone; the path now equals POSIX. Tests
+green (466 passed in `tests/test_proxy.py`+`tests/test_windows_platform.py`).
+
+**Remaining (needs the user's real mouse over RDP):** confirm scroll/click/select/drag inside live
+claude + opencode, both worktree and `--no-worktree`. If motion/focus reports leak as literal text
+over RDP (the host-mangling risk), that's where a targeted host-side mitigation (or a different
+terminal stack) would go — capture the raw host bytes first.
+
+### (obsolete) original plan — kept for context only
 **Design goal (from the user):** aGiTrack should forward **all** keys and mouse events to the
 backend agent unchanged, intercepting **only the menu key** (Ctrl-O / the configured `menu_key`).
 Backends evolve their own key/mouse handling; aGiTrack must not block them.

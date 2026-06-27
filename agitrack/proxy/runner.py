@@ -6486,12 +6486,6 @@ class ProxyRunner:
         data = self._input_tail + data
         data, self._input_tail = self._hold_incomplete_tail(data)
         data = self._intercept_scroll(data)
-        if os.name == "nt":
-            # ConPTY can't deliver focus in/out (?1004) events to the backend either — they'd
-            # render as a literal `[I`/`[O` in its prompt: a phantom char that makes a blank
-            # line submit on Enter and prepends junk to typed input. aGiTrack still uses focus
-            # for its own idle wake, but never forwards it to the backend on Windows.
-            data = _FOCUS_EVENT_RE.sub(b"", data)
         self._debug(f"after intercept: {data!r}")
         # Decode kitty keyboard protocol control keys back to plain bytes.
         # When the terminal is in kitty mode (enabled by the backend), Ctrl-A
@@ -6754,13 +6748,12 @@ class ProxyRunner:
     def _sync_terminal_modes(self, output: bytes) -> None:
         # OpenCode enables mouse reporting on its PTY. Because aGiTrack renders the
         # screen itself, the host terminal never sees those mode switches unless
-        # we mirror them explicitly.
-        # On Windows the host console (incl. over RDP) floods *motion* tracking (1002/1003)
-        # with events it doesn't round-trip cleanly like xterm — they come back and, forwarded
-        # to a mouse-driving backend, render as literal `[<35;..M` text in its prompt. So don't
-        # enable host motion tracking on Windows; button + wheel (1000/1006) still work, the
-        # backend just loses hover/drag motion. (Disables are always mirrored.)
-        _no_host_enable = {b"1002", b"1003"} if os.name == "nt" else set()
+        # we mirror them explicitly. Full pass-through: every mouse/paste mode the backend
+        # requests is mirrored to the host on all platforms (including motion 1002/1003 on
+        # Windows), so the host reports the matching events and aGiTrack can forward them to
+        # the backend unchanged. (A deterministic ConPTY harness confirmed clean SGR mouse —
+        # button, wheel, and motion — passes through conhost to a VT-input backend verbatim;
+        # see dev/winmouse/FINDINGS.md.)
         for mode in (
             b"9",
             b"1000",
@@ -6775,19 +6768,19 @@ class ProxyRunner:
             b"1016",
             b"2004",
         ):
-            if b"\x1b[?" + mode + b"h" in output and mode not in _no_host_enable:
+            if b"\x1b[?" + mode + b"h" in output:
                 os.write(sys.stdout.fileno(), b"\x1b[?" + mode + b"h")
             if b"\x1b[?" + mode + b"l" in output:
                 os.write(sys.stdout.fileno(), b"\x1b[?" + mode + b"l")
         # Track whether the backend drives the mouse itself. If it does, wheel
-        # events are forwarded to it; if not, aGiTrack uses the wheel for scrollback.
-        # On Windows the ConPTY input path can't deliver mouse events to the backend — they
-        # arrive as literal `[<…M` text in its prompt — so aGiTrack keeps mouse ownership
-        # itself there regardless of what the backend requests (wheel scrolls history; mouse
-        # events are stripped from the input in _intercept_scroll, never forwarded).
+        # events (and all other mouse events) are forwarded to it; if not, aGiTrack uses the
+        # wheel for scrollback. This applies on Windows too: the ConPTY input path DOES
+        # deliver clean SGR mouse to a VT-input backend (verified end-to-end against claude and
+        # opencode — see dev/winmouse/FINDINGS.md), so a mouse-driving backend owns the mouse
+        # the same way it does on POSIX.
         for mode in (b"1000", b"1002", b"1003"):
             if b"\x1b[?" + mode + b"h" in output:
-                self.child_mouse = os.name != "nt"
+                self.child_mouse = True
             if b"\x1b[?" + mode + b"l" in output:
                 self.child_mouse = False
         # Mirror keyboard-protocol negotiation (kitty protocol, modifyOtherKeys)
