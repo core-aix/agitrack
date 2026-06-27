@@ -25,6 +25,31 @@ _IS_WINDOWS = os.name == "nt"
 _STILL_ACTIVE = 259
 
 
+def which_executable(name: str) -> str | None:
+    """Like :func:`shutil.which`, but on Windows only returns a path the OS can actually
+    execute — a ``.exe``/``.cmd``/``.bat``/``.com`` — never a bare extensionless file or a
+    ``.ps1``.
+
+    ``shutil.which`` on Windows treats EVERY existing file as executable (there is no
+    ``X_OK`` bit), so for a half-installed npm package that left only the extensionless Unix
+    shell script and a PowerShell ``.ps1`` shim — e.g. a ``claude`` with ``claude.ps1`` but
+    no ``claude.cmd`` — it returns the non-runnable shell script. aGiTrack would then think
+    the backend is installed, skip offering to install it, and fail to launch it through
+    ConPTY/``CreateProcess`` (which can't run a shell script or a ``.ps1``), surfacing as
+    "backend exited repeatedly on launch". Restricting to real Windows-executable shims makes
+    detection match what can actually be launched.
+    """
+    if not _IS_WINDOWS:
+        return shutil.which(name)
+    if os.path.splitext(name)[1]:
+        return shutil.which(name)  # an explicit extension was given — trust it
+    for ext in (".exe", ".cmd", ".bat", ".com"):
+        found = shutil.which(name + ext)
+        if found:
+            return found
+    return None
+
+
 def resolve_subprocess_command(command: list[str]) -> list[str]:
     """Resolve *command* for ``subprocess`` on the current OS.
 
@@ -41,7 +66,7 @@ def resolve_subprocess_command(command: list[str]) -> list[str]:
     """
     if not _IS_WINDOWS or not command:
         return command
-    exe = shutil.which(command[0]) or command[0]
+    exe = which_executable(command[0]) or command[0]
     if exe.lower().endswith((".cmd", ".bat")):
         return [os.environ.get("COMSPEC", "cmd.exe"), "/c", exe, *command[1:]]
     return [exe, *command[1:]]
@@ -63,6 +88,31 @@ def detach_kwargs() -> dict:
         )
         return {"creationflags": flags}
     return {"start_new_session": True}
+
+
+def console_isolation_kwargs(*, detach_stdin: bool = True) -> dict:
+    """``subprocess`` kwargs for a SYNCHRONOUS, output-captured child that must NOT disturb the
+    parent's console.
+
+    aGiTrack keeps the host console in raw mode on Windows. A child process that INHERITS that
+    console can call ``SetConsoleMode`` on it (the backend CLIs do, to talk to a TTY — e.g.
+    ``opencode session list`` run while building the sessions menu) and never restore it, which
+    drops the host out of raw mode: the user then sees keystrokes echo as visible escape codes
+    and input stops reaching aGiTrack until raw mode is reasserted. Give the child its OWN hidden
+    console (``CREATE_NO_WINDOW``) so its console calls can't touch ours, and detach its stdin
+    from our console (``DEVNULL``) so it neither reads our input nor probes it as a TTY (which
+    also stops a TTY-expecting CLI from hanging the menu thread).
+
+    Pass ``detach_stdin=False`` for a call that already feeds the child via ``input=`` (the two
+    are mutually exclusive in ``subprocess``); the ``input=`` pipe already keeps it off the
+    console. On POSIX there is no console coupling, so only the stdin detach (harmless) applies.
+    """
+    kwargs: dict = {}
+    if detach_stdin:
+        kwargs["stdin"] = subprocess.DEVNULL
+    if _IS_WINDOWS:
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    return kwargs
 
 
 def pid_alive(pid: int) -> bool:
@@ -95,6 +145,64 @@ def terminate_pid(pid: int) -> None:
         os.kill(pid, signal.SIGTERM)
     except OSError:
         pass
+
+
+def shell_execute_runas(file: str, params: str = "") -> None:
+    """Launch *file* elevated via UAC (the shell's ``runas`` verb). Windows-only.
+
+    This is the only Windows-native way for an UN-elevated process to obtain an
+    elevated child without a separate always-admin helper — the same pattern VS Code,
+    Slack, and GitHub Desktop use to hand a perMachine installer off to ``msiexec``.
+    ``ShellExecuteExW`` shows the UAC consent dialog; the elevated process is launched
+    only if the user accepts.
+
+    Raises :class:`NotImplementedError` off Windows, and :class:`OSError` when the
+    launch fails — including when the user declines the UAC prompt
+    (``ERROR_CANCELLED`` = 1223) — so the caller can fall back (e.g. keep running the
+    current version and remind the user to update manually).
+    """
+    if not _IS_WINDOWS:
+        raise NotImplementedError("shell_execute_runas is Windows-only")
+    import ctypes
+    from ctypes import wintypes
+
+    class _SHELLEXECUTEINFOW(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD),
+            ("fMask", ctypes.c_ulong),
+            ("hwnd", wintypes.HWND),
+            ("lpVerb", wintypes.LPCWSTR),
+            ("lpFile", wintypes.LPCWSTR),
+            ("lpParameters", wintypes.LPCWSTR),
+            ("lpDirectory", wintypes.LPCWSTR),
+            ("nShow", ctypes.c_int),
+            ("hInstApp", wintypes.HINSTANCE),
+            ("lpIDList", ctypes.c_void_p),
+            ("lpClass", wintypes.LPCWSTR),
+            ("hkeyClass", wintypes.HKEY),
+            ("dwHotKey", wintypes.DWORD),
+            ("hIconOrMonitor", wintypes.HANDLE),
+            ("hProcess", wintypes.HANDLE),
+        ]
+
+    SEE_MASK_NOCLOSEPROCESS = 0x00000040
+    SEE_MASK_NOASYNC = 0x00000100  # complete the operation before returning
+    SW_SHOWNORMAL = 1
+
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)  # type: ignore[attr-defined]  # Windows-only
+    shell32.ShellExecuteExW.argtypes = [ctypes.POINTER(_SHELLEXECUTEINFOW)]
+    shell32.ShellExecuteExW.restype = wintypes.BOOL
+
+    info = _SHELLEXECUTEINFOW()
+    info.cbSize = ctypes.sizeof(_SHELLEXECUTEINFOW)
+    info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC
+    info.lpVerb = "runas"
+    info.lpFile = file
+    info.lpParameters = params
+    info.nShow = SW_SHOWNORMAL
+    if not shell32.ShellExecuteExW(ctypes.byref(info)):
+        err = ctypes.get_last_error()  # type: ignore[attr-defined]  # Windows-only
+        raise OSError(f"ShellExecuteExW(runas) failed for {file!r} (Windows error {err})")
 
 
 def _windows_pid_alive(pid: int) -> bool:

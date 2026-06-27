@@ -37,6 +37,7 @@ from agitrack.commits import (
     summary_metadata_lines,
 )
 from agitrack.git import GitRepo
+from agitrack.git import hooks as git_hooks
 from agitrack.config import GlobalConfig
 from agitrack.git import RepoLock, already_running_message
 from agitrack.proxy import host_prompt, sandbox
@@ -81,6 +82,14 @@ _X10_MOUSE_RE = re.compile(rb"\x1b\[M.{3}", re.DOTALL)
 # A trailing, not-yet-complete X10 report (ESC [ M with fewer than three coordinate bytes),
 # held back like the SGR/CSI tail below so its bytes aren't forwarded split across reads.
 _INCOMPLETE_X10_RE = re.compile(rb"\x1b\[M.{0,2}$", re.DOTALL)
+
+
+def _ps_single_quote(value: str) -> str:
+    """Quote *value* as a PowerShell single-quoted string literal (doubling embedded
+    single quotes). Used to embed file paths in the MSI-update relauncher command."""
+    return "'" + value.replace("'", "''") + "'"
+
+
 # Terminal focus in/out reports (CSI I / CSI O), emitted on window focus changes
 # when focus reporting is on. Like mouse reports they are not keystrokes.
 _FOCUS_EVENT_RE = re.compile(rb"\x1b\[[IO]")
@@ -130,6 +139,12 @@ _BRACKETED_PASTE_RE = re.compile(rb"\x1b\[200~.*?(?:\x1b\[201~|$)", re.S)
 # lone ESC pairs, and turn carriage-returns (used to redraw a spinner in place) into newlines
 # so each frame is its own line and the last meaningful one survives.
 _ANSI_CSI_OSC_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
+
+# OSC 52 (set/clear the terminal clipboard), BEL- or ST-terminated. The backend emits this to
+# copy to the clipboard; because aGiTrack renders the screen via pyte (which consumes OSC and
+# only the visible grid is re-emitted), it must be forwarded to the host terminal explicitly or
+# a backend's copy is silently dropped — see ProxyRunner._forward_clipboard_osc.
+_OSC52_RE = re.compile(rb"\x1b\]52;[^\x07\x1b]*(?:\x07|\x1b\\)")
 
 
 def _strip_ansi(text: str) -> str:
@@ -470,12 +485,14 @@ class ProxyRunner:
     RENDER_MIN_INTERVAL = 0.033  # coalesce output-driven repaints to ~30fps
     SYNC_MAX_HOLD = 0.05  # cap how long a backend synchronized-update may defer a paint
     SUMMARY_WAIT_SECONDS = 45.0  # how long integration waits for a background commit summary (#8)
-    # On exit we don't start new summaries (see _start_commit_summary); we only give a
-    # summary that was ALREADY running (from the live path) a brief moment to land before
-    # integrating, then drop it rather than holding teardown hostage. Short on purpose —
-    # the commit already has a usable prompt-based message, so a slow summary isn't worth
-    # the wait. Per session.
-    EXIT_SUMMARY_GRACE_SECONDS = 3.0
+    # On an INTERACTIVE exit we summarize the final turn's commit (see _start_commit_summary)
+    # and wait up to this grace for the summary — whether freshly started at exit-finalize or
+    # already running from the live path — to be amended in before integrating; past it the
+    # commit integrates with its prompt-based message and the summary lands as git notes only,
+    # so teardown is never held hostage. Long enough for a typical summarizer round-trip to
+    # land, bounded so a slow/hung one can't stall exit. Per session. (Non-interactive/signal
+    # teardown skips fresh summaries entirely and only ever joins an already-running one here.)
+    EXIT_SUMMARY_GRACE_SECONDS = 30.0
     EXIT_SHARE_TIMEOUT = (
         45.0  # cap the exit-path auto-share push; long enough for a real push, short enough to never truly hang
     )
@@ -519,6 +536,10 @@ class ProxyRunner:
         self.repo = repo
         self._use_worktrees = use_worktrees  # #9: when False, run on the current branch directly
         self._warned_parallel_no_worktree = False  # one-time shared-tree caveat for extra --no-worktree sessions
+        # No-worktree only: the branch HEAD when this session started. Commits made past it that
+        # aGiTrack didn't author are the agent's own (#35 cover applies); the anchor floors the
+        # scan so pre-existing user history is never covered. Set at startup in no-worktree mode.
+        self._noworktree_base_head: str | None = None
         # When True, tell a coding agent that aGiTrack auto-commits so it doesn't self-commit
         # (--no-commit-guidance / config turns it off). Appended to the agent's system prompt
         # where the backend supports it (Claude).
@@ -602,6 +623,10 @@ class ProxyRunner:
         self.child_mouse = False
         self.scroll_back = 0
         self._last_render = 0.0
+        # A cross-backend session switch requested from the (nested) sessions modal is deferred to
+        # the top-level reactor; doing it inline from the modal breaks host console input on
+        # Windows. Holds the target Session until the timers phase runs it. (See _switch_to_session_index.)
+        self._pending_switch_session: "Session | None" = None
         self._render_pending = False
         # Synchronized output (DECSET 2026): while the backend is mid-update we
         # hold the repaint so a half-drawn frame is never shown (tearing), and
@@ -617,6 +642,7 @@ class ProxyRunner:
         self.last_child_output = 0.0
         self.last_user_input = 0.0  # monotonic time of the user's last keystroke (drives idle backoff)
         self.last_child_output_sample = b""
+        self._last_spawn_command: list[str] = []  # the exact command of the most recent spawn
         # Set when the backend exits repeatedly and aGiTrack stops relaunching, so
         # run() can echo the reason on the restored host screen instead of leaving
         # the user with a silent flash (#114).
@@ -678,6 +704,14 @@ class ProxyRunner:
         self.host_da: bytes | None = None
         self.host_kitty_keyboard: bool = False
         self.color_mode = detect_color_mode()
+        if os.name == "nt" and self.color_mode == "16":
+            # The modern Windows console (conhost / Windows Terminal) renders 24-bit color and
+            # aGiTrack enables VT processing on it, but it sets neither COLORTERM nor TERM, so
+            # detect_color_mode lands on its 16-color fallback. That downsamples the backend's
+            # truecolor UI when aGiTrack re-emits it — flattening Claude's subtle palette to
+            # near-greyscale (OpenCode's bolder colors survived 16-color, which is why only Claude
+            # looked wrong). Render truecolor on Windows so the backend's colors are preserved.
+            self.color_mode = "truecolor"
         # Single-writer management: only one aGiTrack may auto-commit/merge in a
         # working tree. A second instance is refused at startup (see `run`).
         self.management_lock = _lock if _lock is not None else RepoLock(repo.repo / ".agitrack" / "lock")
@@ -698,6 +732,7 @@ class ProxyRunner:
         # _pending_merge_prompt is per-session (a Session field) — see Session.FIELDS.
         self._integration_paused = False  # reserved; integration is no longer globally paused
         self._base_drift_check_at = 0.0
+        self._agent_branch_check_at = 0.0  # throttles the poll of the worktree's own checked-out branch
         self.turn = 0  # per-session transient-branch counter
         self.merge_ctx: MergeContext | None = None  # in-progress agent merge resolution
         self._pending_enter_at: float | None = None  # deferred submit of an injected prompt
@@ -798,6 +833,18 @@ class ProxyRunner:
         # command menu (every nested level) back to the agent, rather than going up one level.
         self._exit_menu_requested = False
         self._relaunch_times: list[float] = []
+        # Per-background-session crash-loop guard (keyed by id(session)): a background backend
+        # that exits is relaunched+resumed like the active one, but a backend that won't stay up
+        # is finally dropped instead of looping. (Session uses __slots__, so this can't live on
+        # the session object.) See _relaunch_background_session.
+        self._bg_relaunch_times: dict[int, list[float]] = {}
+        # A switch's user-commit / copy offer is deferred until the switched-to session's latest
+        # agent turn has been reconciled (parsed + committed) in the background, so the agent's
+        # own changes aren't offered as the user's. Holds the Session awaiting its offer (or None);
+        # the bool tracks that we've already kicked the one reconciling parse. See
+        # _service_deferred_switch_offer.
+        self._pending_switch_copy_offer: "Session | None" = None
+        self._switch_offer_parse_started = False
         self._exiting = False
         self._finalized_on_exit = False
         # Set when the user presses Esc on the on-exit copy offer: aborts the in-progress
@@ -821,13 +868,23 @@ class ProxyRunner:
         self._user_declined: list[str] = []
         self.sessions: list[Session] = []
         self.worktree_manager: WorktreeManager | None = None
-        # AGITRACK_DEBUG_RAW records every raw child-output / user-input chunk so an
-        # interactive glitch (e.g. Claude's native session picker) can be replayed
-        # byte-for-byte; it implies debug logging too.
-        self.raw_capture = (getenv_compat("DEBUG_RAW") or "").strip().lower() in {"1", "true", "yes"}
-        self.debug_proxy = (
-            verbose or self.raw_capture or (getenv_compat("DEBUG_PROXY") or "").strip().lower() in {"1", "true", "yes"}
-        )
+
+        # Diagnostic switches (off by default, identical on every platform; user docs in
+        # README "Debugging / diagnostic logs" and AGENTS.md "Diagnostics & Debugging"):
+        #   DEBUG_PROXY -> proxy-debug-<run>.log   (human-readable event log; --verbose implies it)
+        #   DEBUG_RAW   -> proxy-raw-<run>.log      (byte-exact I/O capture; implies DEBUG_PROXY)
+        # Honour the AGITRACK_/AGIT_ prefixed names (the project convention) AND the bare
+        # DEBUG_RAW / DEBUG_PROXY: these are throwaway switches a user sets ad hoc in their shell,
+        # and the bare form is the obvious thing to reach for (a prefixed-only flag silently
+        # produced no log). Truthy = 1/true/yes (case-insensitive).
+        def _debug_flag(name: str) -> bool:
+            value = getenv_compat(name)
+            if value is None:
+                value = os.environ.get(name)
+            return (value or "").strip().lower() in {"1", "true", "yes"}
+
+        self.raw_capture = _debug_flag("DEBUG_RAW")
+        self.debug_proxy = verbose or self.raw_capture or _debug_flag("DEBUG_PROXY")
         # One diagnostic-log file per run, in the base repo's .agitrack/ (survives the
         # per-run worktree teardown).
         self._diag_run = time.strftime("%Y%m%d-%H%M%S")
@@ -843,6 +900,7 @@ class ProxyRunner:
         self._update_pending = False  # user accepted; apply once sessions finish
         self._update_applying = False  # apply+restart in progress
         self._pending_restart = False  # re-exec aGiTrack after the loop tears down
+        self._pending_msi_handoff = False  # restart goes through the elevated MSI installer, not re-exec
         self._reopen_after_exit = False  # host terminal closed; user asked to reopen in a new window
         # Git worker (the automatic commit/merge pipeline runs here, never on the main
         # reactor thread, so typing is never blocked by a git subprocess). The worker
@@ -1061,18 +1119,23 @@ class ProxyRunner:
                 "_pending_share_conflicts": [],
                 "_exit_menu_requested": False,
                 "_use_worktrees": True,
+                "_noworktree_base_head": None,
                 "_warned_parallel_no_worktree": False,
                 "_sandbox": True,
                 "_allowed_edit_paths": [],
                 "_backend_command": [],
                 "_commit_guidance": True,
                 "_relaunch_times": [],
+                "_bg_relaunch_times": {},
                 "_fork_next_spawn": False,
                 "_forked_for_busy": False,
                 "_backend_exit_notice": None,
+                "_last_spawn_command": [],
                 "_exiting": False,
                 "_finalized_on_exit": False,
                 "_exit_aborted": False,
+                "_pending_switch_copy_offer": None,
+                "_switch_offer_parse_started": False,
                 "_dashboard_proc": None,
                 "_dashboard_url": None,
                 "_exit_requested": False,
@@ -1167,6 +1230,10 @@ class ProxyRunner:
             self.management_lock.release()
             return 1
         self.state.save()
+        # Record this launch's CLI arguments so a later MSI self-update can re-launch with
+        # the same flags (--repo / --backend / --no-worktree …) after replacing agitrack.exe.
+        # Frozen-Windows only; a no-op everywhere else.
+        self._write_msi_last_args()
         if self.actions.has_pre_agent_user_changes():
             print("User changes detected before the agent starts.")
             self.actions.create_user_commit()
@@ -1243,6 +1310,7 @@ class ProxyRunner:
                 signal.signal(signal.SIGTERM, self._handle_exit_signal)
                 signal.signal(signal.SIGHUP, self._handle_exit_signal)
             self._setup_worktree_confinement_notice()
+            self._install_base_commit_guard()  # hard-stop agent commits to base when no OS sandbox
             exit_code = self._loop()  # the timers phase auto-applies a sandbox-blocked backend update
         finally:
             if self.original_sigwinch is not None and hasattr(signal, "SIGWINCH"):
@@ -1252,6 +1320,7 @@ class ProxyRunner:
             self._stop_git_worker()  # join before tearing the worktree/PTY down
             self._stop_file_watcher()
             self._stop_dashboard()
+            self._remove_base_commit_guard()  # uninstall the pre-commit guard + restore any chained hook
             self._cleanup_child()
             self._restore_terminal()
             if self._host is not None:
@@ -1295,6 +1364,13 @@ class ProxyRunner:
                     os.chdir(self.base_repo.repo)
                 except OSError:
                     pass
+            # An MSI self-update can't re-exec in place — the new MSI replaces the very
+            # agitrack.exe we'd re-run. Hand off to the elevated installer instead; it
+            # re-launches the updated build itself. If the hand-off can't start (e.g. the
+            # user declined the UAC prompt), fall through to a normal re-exec so the user
+            # keeps running the current version.
+            if self._pending_msi_handoff and self._launch_msi_bootstrapper():
+                return exit_code
             # This restart follows an in-app (menu) update; the user already saw
             # and acknowledged the privacy warning when this session started, so
             # don't make them acknowledge it again. (A startup-time update re-execs
@@ -1356,6 +1432,10 @@ class ProxyRunner:
         # before the sandbox wrapper so they reach the backend, not sandbox-exec.
         command = command + getattr(self, "_backend_args", [])
         command = self._confine_to_worktree(command)
+        # Remember the exact command we tried to launch so a backend that dies on startup
+        # can report it (the #1 question when "backend exited repeatedly" — did aGiTrack even
+        # find/launch the right binary?).
+        self._last_spawn_command = list(command)
         # Pseudo-terminal mechanics delegated to the platform child process (POSIX PTY
         # via BackendProcess, or Windows ConPTY via NtChildProcess); policy (command
         # construction, sandbox wrapping) stays here in the runner. The session owns its
@@ -1450,6 +1530,43 @@ class ProxyRunner:
             self._base_status_baseline: set[str] = set(self.base_repo.status_short().splitlines())
         except Exception:
             self._base_status_baseline = set()
+
+    def _base_commit_guard_active(self) -> bool:
+        """Whether to enforce "no agent commits to the base repo" via the pre-commit guard hook.
+
+        Active exactly when confinement is wanted in worktree mode but the OS sandbox can't
+        enforce it — i.e. on any platform where ``sandbox.is_available()`` is False (Windows, or
+        POSIX without bwrap/seatbelt). On POSIX with a working sandbox the base repo is already
+        read-only to the agent, so the hook would be redundant. Turned off by disabling
+        confinement (``--no-sandbox`` / ``sandbox: false`` / ``AGITRACK_SANDBOX=0``)."""
+        return bool(
+            self._use_worktrees
+            and self.worktree is not None
+            and self._sandbox
+            and sandbox.is_enabled()
+            and not sandbox.is_available()
+        )
+
+    def _install_base_commit_guard(self) -> None:
+        # Install the pre-commit guard in the base repo when active. Skipped (with a note) when a
+        # custom core.hooksPath is configured, since our hook in the default dir wouldn't run and
+        # overriding the user's hooksPath would disable their own hooks.
+        if not self._base_commit_guard_active():
+            return
+        try:
+            if self.base_repo.core_hooks_path():
+                self._debug("base-commit guard skipped: core.hooksPath is set")
+                return
+            git_hooks.install_base_commit_guard(self.base_repo.hooks_dir(), debug=self._debug)
+        except Exception as error:  # never let hook setup block startup
+            self._debug(f"base-commit guard install failed: {error!r}")
+
+    def _remove_base_commit_guard(self) -> None:
+        try:
+            if self.base_repo is not None and not self.base_repo.core_hooks_path():
+                git_hooks.remove_base_commit_guard(self.base_repo.hooks_dir(), debug=self._debug)
+        except Exception as error:
+            self._debug(f"base-commit guard removal failed: {error!r}")
 
     def _check_base_branch_drift(self) -> None:
         # Poll the branch checked out in the repo directory. The status bar bolds a
@@ -1562,6 +1679,37 @@ class ProxyRunner:
             f"follows the directory's current branch and can't merge into a different one.",
             seconds=12.0,
         )
+        self._render()
+
+    def _follow_agent_worktree_branch(self) -> None:
+        # The backend agent can switch the branch checked out IN ITS OWN WORKTREE with a plain
+        # `git checkout`/`git switch` — the worktree directory does not move, only HEAD. aGiTrack
+        # otherwise only ever leaves a worktree detached at base (between turns) or on a managed
+        # `agit/<backend>/<name>/tN` turn branch, so the worktree sitting on a NON-managed, named
+        # branch can only mean the agent moved it. Follow it: point the session's tracked branch
+        # (status bar + integration accounting) at it so cover commits keep landing there as
+        # normal — the existing `is_managed_branch` gates already skip auto-integrating a branch
+        # the agent owns — and tell the user once. (No-worktree mode is handled separately by
+        # `_check_no_worktree_branch_change`; there's no second branch to follow without a worktree.)
+        if self.worktree is None or self._base_branch is None:
+            return
+        now = time.monotonic()
+        if now - self._agent_branch_check_at < self.BASE_DRIFT_CHECK_SECONDS:
+            return
+        self._agent_branch_check_at = now
+        try:
+            current = self.repo.current_branch()  # the branch checked out in THIS session's worktree
+        except Exception:
+            return
+        # "HEAD" = detached (aGiTrack's between-turns state), a managed turn branch = aGiTrack's
+        # own doing, and a branch already equal to the tracked one = nothing new. None of those is
+        # an agent-driven switch.
+        if not current or current == "HEAD" or is_managed_branch(current) or current == self._base_branch:
+            return
+        self._base_branch = current
+        self._repo_dir_branch = current  # keep the status bar's branch fresh
+        self._integration.base_branch = current
+        self._set_message(f"Working branch switched to '{current}' by the backend agent.", seconds=10.0)
         self._render()
 
     def _session_work_merged_into_base(self) -> bool:
@@ -1730,6 +1878,9 @@ class ProxyRunner:
         # Fallback for un-sandboxed platforms: detect the agent editing the base
         # repo (its working tree gaining uncommitted changes beyond the startup
         # baseline) and warn, since those edits bypass aGiTrack's worktree tracking.
+        # (A direct *commit* to base is prevented outright by the pre-commit guard
+        # hook — see agitrack/git/hooks.py — which can attribute reliably via an env
+        # marker, something this status-based check cannot do.)
         if not self._monitor_base_edits:
             return
         now = time.monotonic()
@@ -1750,6 +1901,19 @@ class ProxyRunner:
             )
             self._base_status_baseline = current  # don't repeat for the same files
             self._render()
+
+    def _rebaseline_base_edits(self) -> None:
+        # Re-baseline the un-sandboxed base-edit monitor after aGiTrack ITSELF wrote into the base
+        # repo (the copy-back of stranded worktree files). Those files are aGiTrack's own action,
+        # not the agent editing outside its worktree, so fold them into the baseline rather than
+        # letting _warn_if_base_edited flag them as "Agent edited the base repo". No-op when the
+        # monitor isn't active (sandbox enforces confinement, or no worktree).
+        if not self._monitor_base_edits:
+            return
+        try:
+            self._base_status_baseline = set(self.base_repo.status_short().splitlines())
+        except Exception as error:
+            self._debug(f"rebaseline base edits failed: {error!r}")
 
     @staticmethod
     def _newest_mtime(paths) -> float:
@@ -2007,6 +2171,11 @@ class ProxyRunner:
                 self._set_message(f"aGiTrack update failed: {result.error}.{manual}", seconds=15.0)
                 self._render()
                 return  # session untouched — keep running
+            # The MSI updater only DOWNLOADS during apply(); the actual install is an
+            # elevated hand-off after we exit (the MSI replaces the running agitrack.exe).
+            # Flag it so the teardown launches the bootstrapper instead of re-exec'ing.
+            if getattr(self._updater, "pending_msi_path", None):
+                self._pending_msi_handoff = True
             message = f"{result.message} Restarting aGiTrack…"
         # Update is in place (or unnecessary): now finish commits and tear down for
         # the re-exec.
@@ -2040,6 +2209,99 @@ class ProxyRunner:
         self._exit_child()
         self._pending_restart = True
         self.running = False
+
+    def _msi_last_args_path(self) -> str | None:
+        # Per-user, no UAC needed to write, survives reboots. The MSI bootstrapper reads it
+        # to re-launch with the same flags after the install. None when LOCALAPPDATA is unset.
+        local = os.environ.get("LOCALAPPDATA")
+        if not local:
+            return None
+        return os.path.join(local, "aGiTrack", "last-args.txt")
+
+    def _write_msi_last_args(self) -> None:
+        # Frozen-Windows (MSI) only: record this launch's argv so a self-update can restore it.
+        if sys.platform != "win32" or not getattr(sys, "frozen", False):
+            return
+        path = self._msi_last_args_path()
+        if path is None:
+            return
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(subprocess.list2cmdline(list(sys.argv[1:])))
+        except OSError as error:
+            self._debug(f"could not write MSI last-args ({error!r})")
+
+    def _launch_msi_bootstrapper(self) -> bool:
+        """Hand the downloaded MSI off to the elevated installer and arrange the re-launch.
+
+        Two cooperating processes, so the updated aGiTrack comes back at the user's NORMAL
+        integrity level rather than inheriting the installer's admin token:
+
+        * an **elevated** bootstrapper (``agitrack-update.cmd``, run via UAC ``runas``) waits
+          for this process to exit, runs ``msiexec``, and writes its exit code to a marker file;
+        * a **non-elevated** relauncher (spawned here, before we exit) waits for that marker and,
+          on success, starts the freshly installed ``agitrack.exe`` with the saved arguments.
+
+        Returns True when the elevated install was started (the caller should just exit), or
+        False when it couldn't be (e.g. the user declined UAC) so the caller falls back to a
+        normal re-exec of the current version.
+        """
+        from agitrack.proc import detach_kwargs, shell_execute_runas
+
+        msi = getattr(self._updater, "pending_msi_path", None)
+        if not msi or self._updater is None:
+            return False
+        install_dir = self._updater.msi_install_dir()
+        bootstrapper = os.path.join(install_dir, "agitrack-update.cmd")
+        exe = os.path.join(install_dir, "agitrack.exe")
+        last_args = self._msi_last_args_path() or ""
+        local = os.environ.get("LOCALAPPDATA", install_dir)
+        marker = os.path.join(local, "aGiTrack", "update-result.txt")
+        try:
+            os.makedirs(os.path.dirname(marker), exist_ok=True)
+        except OSError:
+            pass
+        # Clear any stale marker so the relauncher only acts on THIS install's result.
+        try:
+            os.remove(marker)
+        except OSError:
+            pass
+
+        # Elevated install: wait for our PID, run msiexec, write the result code to the marker.
+        # cmd /c quoting rule: wrap the whole command line in one extra pair of quotes when any
+        # token is quoted, so the leading "" is stripped and the inner quotes survive.
+        pid = os.getpid()
+        inner = f'"{bootstrapper}" "{msi}" {pid} "{marker}"'
+        try:
+            shell_execute_runas("cmd.exe", f'/c "{inner}"')
+        except Exception as error:  # UAC declined or launch failed: keep the current version
+            self._debug(f"MSI elevated hand-off failed ({error!r})")
+            if self.global_config is not None:
+                self.global_config.pending_manual_update = getattr(self._updater, "_msi_latest", "") or "available"
+            return False
+
+        # Non-elevated relauncher: wait for the marker, then start the new build de-elevated.
+        relauncher = (
+            "$ErrorActionPreference='SilentlyContinue';"
+            f"$m={_ps_single_quote(marker)};$exe={_ps_single_quote(exe)};$af={_ps_single_quote(last_args)};"
+            "$deadline=(Get-Date).AddMinutes(10);"
+            "while(-not (Test-Path $m) -and (Get-Date) -lt $deadline){Start-Sleep -Seconds 1};"
+            "if(-not (Test-Path $m)){exit};"
+            "$rc=((Get-Content $m -TotalCount 1) -join '').Trim();"
+            "if($rc -ne '0'){exit};"
+            "$a='';if(Test-Path $af){$a=((Get-Content $af -TotalCount 1) -join '').Trim()};"
+            "if($a){Start-Process -FilePath $exe -ArgumentList $a}else{Start-Process -FilePath $exe}"
+        )
+        try:
+            subprocess.Popen(
+                ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", relauncher],
+                **detach_kwargs(),
+            )
+        except OSError as error:
+            # The install will still proceed; the user just has to start aGiTrack again.
+            self._debug(f"MSI relauncher spawn failed ({error!r})")
+        return True
 
     def _handle_update_command(self) -> None:
         # Ctrl-G → "update": show the current update status and let the user opt
@@ -2138,16 +2400,40 @@ class ProxyRunner:
         redundant with aGiTrack's silent update and, under the sandbox, fails outright. Does NOT
         affect aGiTrack's own `opencode upgrade`, which runs from the unconfined proxy with the
         normal environment."""
+        env: dict[str, str] = {}
         checks_on = self.global_config is None or getattr(self.global_config, "check_for_updates", True)
         if getattr(self.backend, "name", None) == "opencode" and checks_on and self._backend_update_via_agitrack():
-            return {"OPENCODE_DISABLE_AUTOUPDATE": "1"}
-        return None
+            env["OPENCODE_DISABLE_AUTOUPDATE"] = "1"
+        # Mark the agent's process tree so the base-repo pre-commit guard (agitrack/git/hooks.py)
+        # can tell THIS agent's commits from the user's. Set only when the guard is active (see
+        # _base_commit_guard_active). Any git the agent runs inherits this; the user's own shell
+        # and agents run outside aGiTrack don't have it, so they commit freely.
+        if self._base_commit_guard_active():
+            env[git_hooks.ENV_GUARD] = "1"
+        if os.name == "nt":
+            # On Windows aGiTrack skips host-terminal capability detection (the console doesn't
+            # answer the OSC/DA color queries the POSIX path uses), so a backend that probes the
+            # terminal for color support sees none and renders greyscale (observed with Claude;
+            # OpenCode forces color itself). aGiTrack DOES render 24-bit color to the host (VT
+            # processing is on — OpenCode's colors prove the pipeline), so tell the child the
+            # terminal is truecolor-capable. Scoped to Windows; POSIX keeps real detection.
+            env.setdefault("COLORTERM", "truecolor")
+            env.setdefault("FORCE_COLOR", "3")
+        return env or None
 
     def _backend_version(self) -> str:
         """The backend CLI's reported version string, used to detect whether an update actually
         landed. Empty when it can't be read."""
         try:
-            proc = subprocess.run([self.backend.name, "--version"], capture_output=True, text=True, timeout=20)
+            from agitrack.proc import console_isolation_kwargs
+
+            proc = subprocess.run(
+                [self.backend.name, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                **console_isolation_kwargs(),  # keep the backend CLI off the host console (proc.py)
+            )
         except Exception as error:
             self._debug(f"backend version check failed: {error!r}")
             return ""
@@ -2197,7 +2483,11 @@ class ProxyRunner:
         cwd = str(getattr(self.base_repo, "repo", None) or getattr(self.repo, "repo", "."))
         result: dict = {"name": name, "before": before}
         try:
-            proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=600)
+            from agitrack.proc import console_isolation_kwargs
+
+            proc = subprocess.run(
+                cmd, cwd=cwd, capture_output=True, text=True, timeout=600, **console_isolation_kwargs()
+            )
             result["code"] = proc.returncode
             result["output"] = (proc.stdout or "") + (proc.stderr or "")
         except Exception as error:
@@ -2293,6 +2583,16 @@ class ProxyRunner:
         # Tear down the running TUI and relaunch it for the current backend and
         # session state, re-baselining so existing history is not re-committed.
         self._teardown_child()
+        if os.name == "nt":
+            # Return the HOST terminal to its clean fresh-launch baseline before the new backend
+            # comes up. A fresh aGiTrack launch starts with no host modes set; a restart must
+            # too, otherwise mouse reporting (and kitty/paste/etc.) that the OUTGOING backend
+            # mirrored onto the host stays on — and if the incoming backend doesn't use it (e.g.
+            # Claude after OpenCode) nothing ever turns it off, so host-emitted mouse codes leak
+            # into the backend as literal text. The incoming backend re-establishes only its own
+            # modes via _sync_terminal_modes as its output streams in. (Windows-only: the POSIX
+            # restart paths are long-proven and the leak is native-Windows specific.)
+            self._disable_host_terminal_modes()
         self._reset_agent_tracking()
         self._sanitize_state_trace()
         self._initialize_session_baseline()
@@ -2302,6 +2602,7 @@ class ProxyRunner:
         # Re-assert host mouse reporting for the new backend so wheel scrollback
         # keeps working regardless of what the previous backend left behind.
         self._enable_host_mouse()
+        self._reassert_host_raw()  # a restart can knock the host console out of raw mode
         self._set_message(message)
         self._render()
 
@@ -2333,6 +2634,7 @@ class ProxyRunner:
         if self.worktree is None:
             # A non-worktree session has nothing to multiplex; restart the single
             # backend in place (legacy behaviour).
+            self._debug(f"_switch_backend: name={name} worktree=None -> _restart_agent (respawn in place)")
             self.state.remember_backend_session()
             self.state.backend = name
             self.backend = make_proxy_agent(name)
@@ -2344,18 +2646,22 @@ class ProxyRunner:
         # Keep the current backend's session running in the background and switch
         # to this backend's own session.
         index = self._live_session_for_backend(name)
+        self._debug(f"_switch_backend: name={name} worktree={self.name} live_index={index}")
         if index is not None:
+            self._debug("_switch_backend: -> _switch_active (resume live bg session)")
             self._switch_active(index)
             return
         # Resume this backend's last conversation if we remember one (recreating
         # its worktree at the same path so the backend finds its transcript).
         record = self._recall_backend_session(name)
         if record and record.get("id"):
+            self._debug(f"_switch_backend: -> _new_session resume (fresh spawn) id={record.get('id')}")
             self._new_session(
                 record.get("worktree") or self._next_session_name(), backend=name, resume_session_id=record["id"]
             )
             return
         # Otherwise start fresh, confirming the session name first.
+        self._debug("_switch_backend: -> _new_session fresh (prompt name)")
         session_name = self._prompt_session_name(f"New {name} session", default=self._next_session_name())
         if session_name is None:
             return
@@ -2515,6 +2821,14 @@ class ProxyRunner:
                 "this directory and edit the same files at once." + note,
                 seconds=12.0,
             )
+            # Anchor the no-worktree cover scan at the branch's current HEAD so commits the agent
+            # makes itself from here get aGiTrack metadata (#35), while pre-existing history is
+            # never touched. Set once (the earliest start); the metadata-reset handles the rest.
+            if self._noworktree_base_head is None:
+                try:
+                    self._noworktree_base_head = self.repo.rev_parse("HEAD")
+                except Exception as error:
+                    self._debug(f"no-worktree cover anchor failed: {error!r}")
             return
         root_state = self.state  # the durable repo-root "last session" record
         backend_name = root_state.backend
@@ -3163,7 +3477,7 @@ class ProxyRunner:
         if arg in {"new", "fresh"}:
             return self._prompt_new_session()
         if arg.isdigit():
-            self._switch_active(int(arg) - 1)
+            self._switch_to_session_index(int(arg) - 1)
             return self._MENU_DONE
         return self._session_menu()
 
@@ -3438,8 +3752,16 @@ class ProxyRunner:
                 assert isinstance(value, int)  # "switch" pairs with a session index
                 if value == self.active_index:
                     self._select_current_session()
-                else:
-                    self._switch_active(value)
+                    return self._MENU_DONE
+                # Defer EVERY live-session switch to the top-level reactor (timers phase) so it
+                # runs OUTSIDE this nested sessions modal — the same context as a Ctrl-G backend
+                # switch, which works. Running a switch inline from the modal breaks host console
+                # input on Windows: the switch's teardown/SetConsoleMode races the reader thread's
+                # blocking ReadFile and wedges it (input then never arrives — the session-switch
+                # hang). This applies to a same-backend switch too, not just cross-backend. Close
+                # the menu now; the deferred switch fires next tick and does a full state reset
+                # (fresh respawn) into the target session.
+                self._pending_switch_session = self.sessions[value]
                 return self._MENU_DONE
             if kind == "integrate-active":
                 self._integrate_active_session()  # explicit "integrate now" for the active session
@@ -3846,7 +4168,7 @@ class ProxyRunner:
         # OpenCode session while the active backend is Claude).
         for index, session in enumerate(self.sessions):
             if getattr(getattr(session, "state", None), "backend_session_id", None) == session_id:
-                self._switch_active(index)
+                self._switch_to_session_index(index)
                 return
         if self._live_session_name_taken(name):
             # The name is occupied by a different LIVE session. Two live sessions can't share a
@@ -4804,8 +5126,16 @@ class ProxyRunner:
                 continue
             for fd in readable:
                 if fd == stdin_fd:
-                    if self._stdin_has_cancel(self._read_stdin(32)):
+                    chunk = self._read_stdin(32)
+                    if self._stdin_has_cancel(chunk):
                         return "cancel"
+                    # Keystrokes typed while this wait runs belong to the live backend, not
+                    # to the wait — stash them on the same `_input_tail` pushback the main
+                    # reactor prepends to its next stdin read, so they are forwarded once the
+                    # wait ends instead of being silently dropped (the first keystrokes after
+                    # a backend switch land here while the new session's fetch is in flight).
+                    elif chunk:
+                        self._input_tail = self._input_tail + chunk
                 elif fd == master:
                     output = self._drain_child_output()
                     if output is not None:
@@ -5521,8 +5851,10 @@ class ProxyRunner:
         # modal mailbox while we wait keeps a worker that's blocked on a dialog from
         # deadlocking us. (RLock: reentrant when already held by this thread, e.g. the
         # background-session conflict path that calls us from the locked cluster.)
+        self._debug(f"switch_active: idx={index} acquiring pipeline lock")
         self._acquire_pipeline_lock_from_main()
         try:
+            self._debug("switch_active: lock held; joining parse worker")
             self._join_parse_worker_before_swap()
             # Swap under the outgoing session's parse lock: if the join above timed
             # out, the still-running worker writes its result to its owning Session
@@ -5531,22 +5863,79 @@ class ProxyRunner:
             with lock:
                 self.active = self.sessions[index]
             self.scroll_back = 0
+            # Switch IN PLACE: keep the target session's backend RUNNING and resume its existing
+            # (backgrounded) ConPTY. NEVER tear it down or respawn it — an earlier Windows
+            # workaround did exactly that (_restart_agent), but teardown calls cleanup() →
+            # interrupt(), which sends Ctrl-C/ETX to the very session you're switching to and
+            # cancels its in-progress turn ("Interrupted"). The leak/hang that workaround was
+            # meant to fix is now fixed at its root (subprocess console isolation — see
+            # proc.console_isolation_kwargs), so the in-place resume is correct on every platform.
+            if os.name == "nt":
+                # Clear the OUTGOING backend's host terminal-mode mirror so the host returns to a
+                # clean baseline (mouse/kitty/paste); the incoming backend re-establishes only its
+                # own modes via _sync_terminal_modes as its output streams in. Host-side only — it
+                # never touches a backend's ConPTY, so it can't interrupt the target.
+                self._disable_host_terminal_modes()
             self._resize_child()
             self._enable_host_mouse()
+            self._reassert_host_raw()  # a switch can knock the host console out of raw mode
             self._set_message(f"Switched to session '{self._session_name(index)}'")
             self._render()
+            self._debug("switch_active: swapped + rendered")
             # The copy-back mute is per active-session-visit: a switch resets it so the
             # session we just landed on gets offered its own worktree-only files (background
             # sessions are never interrupted mid-run; this is where we catch up). Only when
             # it's idle — a session still mid-turn gets offered by the turn path once it settles.
             self._copy_declined = set()
             if not self._agent_is_active():
-                self._offer_copy_unstaged_to_base(context="switch")
+                # Defer this session's user-commit / copy offer until its latest agent turn has
+                # been reconciled (parsed + committed) in the BACKGROUND — otherwise the agent's
+                # own just-made changes can be offered as the user's (a Claude change shown in the
+                # "user commit" box right after switching to a session whose turn hadn't been
+                # parsed yet). _service_deferred_switch_offer parses, then offers once only
+                # genuine user changes remain.
+                self._debug("switch_active: deferring copy-to-base until transcript reconciled")
+                self._pending_switch_copy_offer = self.active
+                self._switch_offer_parse_started = False
         finally:
             self._pipeline_lock.release()
+        self._debug("switch_active: lock released; prompting merge-target if diverged")
         # The newly-active session may merge into a different branch than the one
         # checked out in the repo directory — ask where its changes should merge.
         self._prompt_merge_target_if_diverged()
+        self._debug("switch_active: complete")
+
+    def _switch_to_session_index(self, index: int) -> None:
+        # Entry point for switching to another LIVE session by index.
+        #
+        # On WINDOWS, switching to a session that runs a DIFFERENT backend by resuming its
+        # backgrounded ConPTY steals the host console: keystrokes stop reaching aGiTrack
+        # afterwards (confirmed via DEBUG_RAW — the console input mode drops and even a fresh
+        # ReadFile receives nothing). A FRESH backend spawn never does this (the first
+        # Claude→OpenCode switch, which spawns, works). So for a cross-backend switch on Windows,
+        # become the target session and then RESPAWN its backend fresh (resuming the same
+        # conversation) — a clean ConPTY that doesn't steal the console. This is the
+        # "(re)initialize the new backend" the manual backend-then-session two-step achieves.
+        if not (0 <= index < len(self.sessions)):
+            return
+        target = self.sessions[index]
+        target_name = getattr(getattr(target, "backend", None), "name", None) or getattr(
+            getattr(target, "state", None), "backend", None
+        )
+        current_name = getattr(self.backend, "name", None)
+        self._debug(f"_switch_to_session_index: idx={index} target_backend={target_name} cur={current_name}")
+        self._switch_active(index)
+
+    def _run_pending_session_switch(self) -> None:
+        # Execute a sessions-menu cross-backend switch deferred out of the (nested) sessions modal,
+        # now that we're at the top of the reactor loop — the same context a Ctrl-G backend switch
+        # runs in. Doing it here instead of inline in the modal keeps host console input alive.
+        target = getattr(self, "_pending_switch_session", None)
+        if target is None:
+            return
+        self._pending_switch_session = None
+        if target in self.sessions:
+            self._switch_to_session_index(self.sessions.index(target))
 
     def _join_parse_worker_before_swap(self) -> None:
         # A parse worker started for the active session reads that session's
@@ -5579,7 +5968,51 @@ class ProxyRunner:
         finally:
             self.active = saved
         if died:
-            self._stop_session(self.sessions.index(session), commit=False)
+            # The backend exited on its own while backgrounded (some backends — notably Claude
+            # on Windows — quit when they lose the foreground). The ACTIVE session already
+            # auto-relaunches+resumes in this case (_relaunch_backend_or_exit); a background
+            # session must be just as resilient, or switching away from such a backend silently
+            # loses the session. Try to bring it back in the background first; only drop it if it
+            # won't stay up (crash-loop guard) so it isn't lost forever.
+            if not self._relaunch_background_session(session):
+                self._stop_session(self.sessions.index(session), commit=False)
+
+    def _relaunch_background_session(self, session: Session) -> bool:
+        # Respawn a background session's backend IN THE BACKGROUND, resuming the same
+        # conversation, after it exited unexpectedly. Mirrors the active session's
+        # _relaunch_backend_or_exit (teardown → re-baseline → spawn) but omits every
+        # foreground/host step (no host-mode/mouse/raw changes, no _render) so it never paints
+        # over or disturbs the foreground session. Returns False (→ caller stops the session)
+        # when the per-session crash-loop guard trips, so a backend that refuses to stay up is
+        # dropped rather than relaunched forever.
+        if session not in self.sessions:
+            return False
+        key = id(session)
+        now = time.monotonic()
+        recent = [t for t in self._bg_relaunch_times.get(key, []) if now - t < 30.0]
+        if len(recent) >= 3:
+            self._debug(f"background session '{getattr(session, 'name', '?')}' exited 3x/30s; dropping")
+            self._bg_relaunch_times.pop(key, None)
+            return False
+        recent.append(now)
+        self._bg_relaunch_times[key] = recent
+
+        def _respawn() -> None:
+            self._teardown_child()  # close the dead child's bridge fd before respawning
+            self._reset_agent_tracking()
+            self._sanitize_state_trace()
+            self._initialize_session_baseline()
+            self._init_screen()  # the session's own (per-session) screen; no host paint
+            self._spawn()  # resumes self.state.backend_session_id in the background
+
+        try:
+            self._with_session(session, _respawn)
+        except Exception as error:
+            self._debug(f"background relaunch of '{getattr(session, 'name', '?')}' failed: {error!r}")
+            return False
+        session.last_child_output = time.monotonic()  # don't immediately re-poll as idle/dead
+        self._debug(f"relaunched background session '{getattr(session, 'name', '?')}' after backend exit")
+        return True
 
     def _ensure_worktree_alive(self) -> None:
         if self.worktree is None:
@@ -5669,9 +6102,10 @@ class ProxyRunner:
         # lands in the base without waiting to be switched to. A background
         # session whose finished turn cannot fast-forward is brought to the
         # foreground and its resolve options box is surfaced (session + backend).
+        now = time.monotonic()
+        self._debug_session_liveness(now)
         if self.merge_ctx is not None:
             return
-        now = time.monotonic()
         for index in range(len(self.sessions)):
             if index == self.active_index:
                 continue
@@ -5810,12 +6244,22 @@ class ProxyRunner:
         self.actions = AgitrackActions(self.repo, self.state, verbose=self.verbose)
         self._sanitize_state_trace()
         self._initialize_session_baseline()
+        if os.name == "nt":
+            # Clear the OUTGOING backend's host-terminal-mode mirror before the new backend comes
+            # up, so this session starts from the same clean host baseline a fresh aGiTrack launch
+            # would (mouse reporting, kitty, paste, …). Without this, modes the previous backend
+            # mirrored onto the host persist; if they don't match what the new backend expects,
+            # host-emitted mouse codes leak into it as literal text. The new backend re-establishes
+            # only its own modes via _sync_terminal_modes as its output streams in. (Windows-only:
+            # the POSIX session paths are long-proven and the leak is native-Windows specific.)
+            self._disable_host_terminal_modes()
         self._init_screen()
         self._spawn()
         self._start_file_watcher()
         self.sessions.append(self.active)
         self._resize_child()
         self._enable_host_mouse()
+        self._reassert_host_raw()  # a switch can knock the host console out of raw mode
         self._set_message(started_msg)
         self._render()
 
@@ -5827,6 +6271,7 @@ class ProxyRunner:
             self._render()
             return
         session = self.sessions[index]
+        self._bg_relaunch_times.pop(id(session), None)  # drop its background crash-loop guard
         active = session is self.active
         if active:
             # Don't let an in-flight parse worker outlive its session's runtime
@@ -5942,24 +6387,101 @@ class ProxyRunner:
         return bool(_FORK_HINT_RE.search(text))
 
     def _format_backend_exit_notice(self) -> str | None:
-        # The backend died on launch several times in a row (e.g. the claude CLI
-        # refusing to resume a session that is still running as a background agent),
-        # so aGiTrack is giving up. In proxy mode that output lived on the alt-screen,
-        # which the terminal restore discards, so the user otherwise just sees a flash
-        # and a bare prompt with no reason (#114). Echo the backend's last readable
-        # lines, plus how to get unstuck.
+        # The backend died on launch several times in a row (e.g. the claude CLI refusing to
+        # resume a session held by a running background agent, or — on Windows — a backend
+        # that isn't actually launchable). In proxy mode that output lived on the alt-screen,
+        # which the terminal restore discards, so the user otherwise just sees a flash and a
+        # bare prompt (#114). Surface the EXACT failure: the command aGiTrack ran, what the
+        # binary resolved to, the exit code, and the backend's own output (raw if it isn't
+        # cleanly decodable) — plus a written log so nothing is lost to scrollback.
         backend = getattr(self.state, "backend", None) or "the backend"
-        text = _strip_ansi(self.last_child_output_sample.decode(errors="replace"))
-        lines = [line.rstrip() for line in text.splitlines() if line.strip()]
         notice = f"aGiTrack: {backend} exited repeatedly on launch and was not relaunched."
+
+        command = list(getattr(self, "_last_spawn_command", []) or [])
+        if command:
+            notice += f"\nCommand: {' '.join(command)}"
+            try:
+                from agitrack.proc import which_executable
+
+                resolved = which_executable(command[0])
+                notice += f"\nResolved '{command[0]}' to: {resolved or '(not found on PATH)'}"
+            except Exception:  # diagnostics must never themselves crash the notice
+                pass
+
+        exit_code = self._last_backend_exit_code()
+        if exit_code is not None:
+            notice += f"\nExit code: {exit_code}"
+
+        raw = self.last_child_output_sample
+        text = _strip_ansi(raw.decode(errors="replace"))
+        lines = [line.rstrip() for line in text.splitlines() if line.strip()]
         if lines:
-            tail = "\n".join("  " + line for line in lines[-12:])
+            tail = "\n".join("  " + line for line in lines[-20:])
             notice += f"\nLast output from {backend}:\n{tail}"
+        elif raw:
+            # No cleanly readable text (often just terminal control bytes) — show the escaped
+            # raw tail so an early CreateProcess/cmd.exe error is still visible.
+            escaped = raw[-400:].decode(errors="replace").replace("\x1b", "\\x1b")
+            notice += f"\nRaw {backend} output (no readable text): {escaped!r}"
+        else:
+            notice += f"\n{backend} produced no output before exiting."
+
+        log_path = self._write_backend_exit_log(backend, command, exit_code, raw)
+        if log_path is not None:
+            notice += f"\nFull details written to: {log_path}"
         notice += (
             "\nTry `agitrack --new-session` to start a fresh conversation, "
             "or `agitrack --mode json` to see the full backend error."
         )
         return notice
+
+    def _last_backend_exit_code(self) -> int | None:
+        # Best-effort exit code of the just-dead child (the platform child keeps it after the
+        # process is gone); None when unavailable. Coerced to int so a test mock's poll()
+        # can't leak a non-numeric value into the notice.
+        process = getattr(self.active, "process", None) if getattr(self, "active", None) else None
+        if process is None:
+            return None
+        try:
+            code = process.poll()
+        except Exception:
+            return None
+        return code if isinstance(code, int) else None
+
+    def _write_backend_exit_log(self, backend: str, command: list[str], exit_code: int | None, raw: bytes):
+        # Persist the full, unstripped backend output to the base repo's .agitrack/ so the
+        # reason survives the alt-screen teardown and the user (or a bug report) can read it.
+        try:
+            path = self._diag_path("backend-exit")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("w", encoding="utf-8") as handle:
+                handle.write(f"backend: {backend}\n")
+                handle.write(f"command: {command}\n")
+                handle.write(f"resolved: {self._resolved_launch(command)}\n")
+                handle.write(f"exit_code: {exit_code}\n")
+                handle.write("--- raw output (utf-8, replace) ---\n")
+                handle.write(raw.decode(errors="replace"))
+            return path
+        except Exception:  # diagnostics must never crash the exit path
+            return None
+
+    def _resolved_launch(self, command: list[str]):
+        # What the platform layer actually launches for `command` — on Windows this exposes
+        # the cmd.exe /c <shim> wrapping (or, tellingly, that the bare name was used because no
+        # runnable shim was found). The single most useful line when a backend dies on startup.
+        if not command:
+            return command
+        try:
+            if sys.platform == "win32":
+                from agitrack.proxy.platform.nt import _resolve_windows_command
+
+                appname, args = _resolve_windows_command(command)
+                return [appname, *args]
+            from agitrack.proc import which_executable
+
+            return [which_executable(command[0]) or command[0], *command[1:]]
+        except Exception:
+            return command
 
     def _finalize_on_backend_exit(self) -> None:
         # The only session's backend process is gone and we are NOT relaunching
@@ -6320,6 +6842,7 @@ class ProxyRunner:
             self.last_child_output_sample = (self.last_child_output_sample + output)[-4096:]
             self._answer_terminal_queries(output)
             self._sync_terminal_modes(output)
+            self._forward_clipboard_osc(output)
             self._track_sync_update(output)
             self._feed_child_output(output)
             self._render_output()
@@ -6332,6 +6855,16 @@ class ProxyRunner:
         """
         stdin_fd = self._stdin_fileno()
         if stdin_fd not in readable:
+            # Diagnostic (throttled): if a hang ever recurs where the loop spins but no keystroke
+            # is delivered, this records whether the host's console→bridge reader thread is alive.
+            if self.debug_proxy:
+                now = time.monotonic()
+                if now - getattr(self, "_dbg_stdin_idle_at", 0.0) > 5.0:
+                    self._dbg_stdin_idle_at = now
+                    stats = "n/a"
+                    if self._host is not None and hasattr(self._host, "stdin_reader_stats"):
+                        stats = self._host.stdin_reader_stats()
+                    self._debug(f"stdin idle: fd={stdin_fd} reader[{stats}]")
             return None
         data = self._read_stdin(4096)
         # Only a real keystroke resets the idle backoff — NOT a mouse wheel / move /
@@ -6341,7 +6874,7 @@ class ProxyRunner:
         # only governs whether we then drop back to the low-power idle cadence.)
         if self._is_real_keypress(data):
             self.last_user_input = time.monotonic()
-        self._raw_capture(">", data)
+        # (stdin bytes are raw-captured centrally in _read_stdin so modal/wait reads are logged too)
         self._debug(f"stdin: {data!r} menu_key={self.input.menu_key!r}")
         # A popup message taller than the screen scrolls with PgUp/PgDn, handled before
         # anything else so a long notice can be read in full (and isn't dismissed mid-read).
@@ -6456,6 +6989,7 @@ class ProxyRunner:
         self._check_shutdown_request()
         if not self.running:
             return  # an external graceful-shutdown request just fired
+        self._run_pending_session_switch()  # a cross-backend switch deferred out of the sessions modal
         self._flush_pending_render()
         self._flush_pending_enter()
         self._drain_modal_mailbox()  # present any dialog the git worker queued
@@ -6468,10 +7002,12 @@ class ProxyRunner:
         if self._pipeline_lock.acquire(blocking=False):
             try:
                 self._ensure_worktree_alive()  # recovers a vanished worktree (PTY/watcher work)
+                self._follow_agent_worktree_branch()  # follow an agent `git checkout` in the worktree
                 self._check_base_branch_drift()  # may surface a dir-change session swap
                 self._service_commit_summaries()  # apply finished background summaries (#8)
                 self._service_precompact_summary()
                 self._service_background_sessions()
+                self._service_deferred_switch_offer()  # a switch's copy/commit offer, once reconciled
                 if self._base_advanced:
                     self._base_advanced = False
                     self._sync_idle_worktrees_to_base()
@@ -6519,6 +7055,31 @@ class ProxyRunner:
     def _drain_child_output(self) -> bytes | None:
         # Delegate to the session-owned BackendProcess for the bounded PTY read loop.
         return self.active.process.drain()
+
+    def _debug_session_liveness(self, now: float) -> None:
+        # (debug-gated, throttled) Snapshot every session's backend + whether its child
+        # process is still alive, to proxy-debug. Diagnoses reports of a session silently
+        # stopping while backgrounded ("Claude stops after I switch away"): the log then shows
+        # exactly which session's process exited and when. Only the active session is skipped
+        # (left as "active") so poll() never disturbs the foreground backend.
+        if not self.debug_proxy:
+            return
+        if now - getattr(self, "_dbg_liveness_at", 0.0) < 5.0:
+            return
+        self._dbg_liveness_at = now
+        parts = []
+        for index, session in enumerate(self.sessions):
+            backend = getattr(getattr(session, "backend", None), "name", "?")
+            if index == self.active_index:
+                state = "active"
+            else:
+                proc = getattr(session, "process", None)
+                try:
+                    state = "exited" if (proc is not None and proc.poll() is not None) else "alive"
+                except Exception:
+                    state = "err"
+            parts.append(f"{index}:{backend}:{state}")
+        self._debug("session liveness " + " ".join(parts))
 
     def _diag_path(self, kind: str):
         # Diagnostic logs live in the *base* repo's .agitrack/ (one file per run), not
@@ -6618,13 +7179,34 @@ class ProxyRunner:
         self.scroll_back = 0
         self._in_sync_update = False
 
+    def _forward_clipboard_osc(self, output: bytes) -> None:
+        # Forward the backend's OSC 52 clipboard writes to the host terminal. aGiTrack renders
+        # the active session's screen via pyte, which consumes OSC sequences and re-emits only
+        # the visible grid — so a backend's "copy to clipboard" (e.g. Claude's, which emits
+        # OSC 52) is otherwise swallowed and the clipboard never changes, even though the backend
+        # reports it copied. Only the FOREGROUND session reaches this path, so a background
+        # session can't hijack the clipboard. Forwarded verbatim; the host terminal honors it
+        # exactly as it does for a backend whose output isn't pyte-rendered.
+        for seq in _OSC52_RE.findall(output):
+            try:
+                os.write(sys.stdout.fileno(), seq)
+            except OSError:
+                pass
+
     def _feed_child_output(self, output: bytes) -> None:
         ScreenRenderer.feed(self, output, pyte_hostile_csi_re=_PYTE_HOSTILE_CSI_RE)
 
     def _sync_terminal_modes(self, output: bytes) -> None:
         # OpenCode enables mouse reporting on its PTY. Because aGiTrack renders the
-        # screen itself, the host terminal never sees those mode switches unless
-        # we mirror them explicitly.
+        # screen itself, the host terminal never sees those mode switches unless we mirror them.
+        # Mirror button/wheel/SGR/paste and 1002 (button-event tracking = motion WHILE a button is
+        # held = drag, which the backend needs for drag-select / copy). But on Windows do NOT
+        # mirror 1003 (any-event tracking = motion with NO button = hover): the host floods hover
+        # reports (`\x1b[<35;..M`) that don't round-trip cleanly and leak into the backend as
+        # literal text. Excluding only 1003 stops the hover flood while keeping drag-copy working
+        # (the confirmed leak is button 35 = no-button motion; see the proxy-raw trace and
+        # dev/winmouse/FINDINGS.md). Disables are always mirrored.
+        _no_host_enable = {b"1003"} if os.name == "nt" else set()
         for mode in (
             b"9",
             b"1000",
@@ -6639,12 +7221,16 @@ class ProxyRunner:
             b"1016",
             b"2004",
         ):
-            if b"\x1b[?" + mode + b"h" in output:
-                os.write(sys.stdout.fileno(), b"\x1b[?" + mode + b"h")
+            if b"\x1b[?" + mode + b"h" in output and mode not in _no_host_enable:
+                self._mirror_to_host(b"\x1b[?" + mode + b"h")
             if b"\x1b[?" + mode + b"l" in output:
-                os.write(sys.stdout.fileno(), b"\x1b[?" + mode + b"l")
+                self._mirror_to_host(b"\x1b[?" + mode + b"l")
         # Track whether the backend drives the mouse itself. If it does, wheel
-        # events are forwarded to it; if not, aGiTrack uses the wheel for scrollback.
+        # events (and all other mouse events) are forwarded to it; if not, aGiTrack uses the
+        # wheel for scrollback. This applies on Windows too: the ConPTY input path DOES
+        # deliver clean SGR mouse to a VT-input backend (verified end-to-end against claude and
+        # opencode — see dev/winmouse/FINDINGS.md), so a mouse-driving backend owns the mouse
+        # the same way it does on POSIX.
         for mode in (b"1000", b"1002", b"1003"):
             if b"\x1b[?" + mode + b"h" in output:
                 self.child_mouse = True
@@ -6661,7 +7247,14 @@ class ProxyRunner:
             # ``...m`` form is an ordinary CSI any terminal consumes, so always mirror it).
             if seq.endswith(b"u") and not self.host_kitty_keyboard:
                 continue
-            os.write(sys.stdout.fileno(), seq)
+            self._mirror_to_host(seq)
+
+    def _mirror_to_host(self, seq: bytes) -> None:
+        # Write a backend-requested terminal mode to the host AND raw-capture it (tag "M") so a
+        # DEBUG_RAW trace shows exactly which mouse/keyboard-protocol modes were pushed to the host
+        # — the evidence for a mode that one backend enables and a switch leaves stuck for the next.
+        self._raw_capture("M", seq)
+        os.write(sys.stdout.fileno(), seq)
 
     def _detect_host_terminal(self) -> None:
         # Pre-reactor: called once during run() startup, before _loop() starts.
@@ -7507,6 +8100,7 @@ class ProxyRunner:
             log_path,
             open_dashboard_in_browser,
             remote_browser_hint,
+            running_handshake,
             spawn_dashboard_daemon,
             wait_for_handshake,
         )
@@ -7518,6 +8112,24 @@ class ProxyRunner:
                 f"Dashboard already running at {url}."
                 if opened
                 else f"Dashboard running. {remote_browser_hint(url, 0)}"
+            )
+            self._render()
+            return
+        # A dashboard daemon may already be running for this repo from elsewhere — an
+        # `agitrack -d`, or a prior TUI session whose process handle we no longer hold.
+        # Reuse it (just open the browser at its URL) instead of clobbering its handshake
+        # and spawning a duplicate. We don't own it, so we don't track it as our proc and
+        # won't stop it on exit; its own owner-death watchdog handles its lifecycle.
+        running = running_handshake(self.base_repo)
+        if running is not None:
+            url = str(running.get("url", ""))
+            self._dashboard_url = url
+            port = running.get("port", 0)
+            opened = open_dashboard_in_browser(url)
+            self._set_message(
+                f"Dashboard already running at {url} — opening in your browser."
+                if opened
+                else f"Dashboard already running. {remote_browser_hint(url, int(port) if isinstance(port, int) else 0)}"
             )
             self._render()
             return
@@ -7695,6 +8307,13 @@ class ProxyRunner:
             if action == "cancel":
                 self._clear_message()
                 self._render_pending = True
+                if self._finalized_on_exit:
+                    # Esc on ANY popup shown during the exit/finalize sequence cancels the WHOLE
+                    # exit — the user changed their mind. _run_exit_flow / _finalize_pending_work
+                    # see this flag and stay running; commits/merges already made this exit are
+                    # kept and nothing is deleted. _finalized_on_exit is set only for the duration
+                    # of the exit finalize, so this never fires for ordinary (non-exit) popups.
+                    self._exit_aborted = True
                 return None
             if action == "exit":
                 if self._run_exit_flow():
@@ -7791,14 +8410,29 @@ class ProxyRunner:
         if not repo.has_staged_changes():
             return False
         message = ""
-        prompt = "Commit message:"
+        # Esc cancels the prompt (_prompt_popup returns None) and we continue without
+        # committing — note that in the prompt so the user knows it's a safe way out.
+        prompt = "Commit message (press Esc to continue without committing):"
         while not message.strip():
             result = self._prompt_popup("User Commit", prompt)
             if result is None:
                 return False
             message = result
-            prompt = "Commit message is required. Enter a commit message:"
-        repo.commit(build_user_commit_message(message=message, agitrack_session_id=state.session_id))
+            prompt = "Commit message is required — enter one, or press Esc to continue without committing:"
+        try:
+            repo.commit(build_user_commit_message(message=message, agitrack_session_id=state.session_id))
+        except Exception as error:
+            # A failed commit (a repo pre-commit hook rejecting it, a git config/identity problem,
+            # a racing change) must NOT crash aGiTrack — it used to propagate as an uncaught
+            # GitError and exit with "Command failed: git commit -F -" on the console. Surface the
+            # git error and leave the changes staged so the user can fix the cause and retry.
+            self._debug(f"user commit failed: {error!r}")
+            self._set_message(
+                f"Commit failed — your changes are left staged, unchanged:\n{error}",
+                seconds=15.0,
+            )
+            self._render()
+            return False
         state.clear_trace()
         return True
 
@@ -7904,22 +8538,34 @@ class ProxyRunner:
         )
 
     def _uncovered_backend_commits(self) -> list[str]:
-        """Unintegrated commits on the session's turn branch that the backend
-        created itself and no aGiTrack commit accounts for yet (#35). Full SHAs,
-        oldest first. Backend commits keep their own messages forever (their
-        hashes must stay stable, #58), so "covered" cannot be read off the
-        commit itself: an aGiTrack metadata commit covers everything before it on
-        the branch (its ``covered_commits`` named them), leaving only commits
-        NEWER than the newest metadata commit unaccounted for. Only commits
-        ahead of base qualify at all."""
-        if self.worktree is None or self._base_branch is None:
-            return []
+        """Commits the backend created itself that no aGiTrack commit accounts for
+        yet (#35). Full SHAs, oldest first. Backend commits keep their own messages
+        forever (their hashes must stay stable, #58), so "covered" cannot be read off
+        the commit itself: an aGiTrack metadata commit covers everything before it on
+        the branch (its ``covered_commits`` named them), leaving only commits NEWER
+        than the newest metadata commit unaccounted for.
+
+        Worktree mode: commits ahead of base on the session's managed turn branch.
+        No-worktree mode (only when actually running with --no-worktree): commits on
+        the current branch made since this session started (anchored at the startup
+        HEAD so pre-existing user history is never covered) — that's where the agent's
+        changes legitimately live without a worktree."""
         try:
-            branch = self.repo.current_branch()
-            if not is_managed_branch(branch):
-                return []
+            if not self._use_worktrees:
+                anchor = self._noworktree_base_head
+                if not anchor:
+                    return []
+                head_ref = "HEAD"
+            else:
+                if self.worktree is None or self._base_branch is None:
+                    return []
+                branch = self.repo.current_branch()
+                if not is_managed_branch(branch):
+                    return []
+                anchor = self._base_branch
+                head_ref = branch
             uncovered: list[str] = []
-            for sha in self.repo.log_shas(self._base_branch, branch):  # oldest first
+            for sha in self.repo.log_shas(anchor, head_ref):  # oldest first
                 if METADATA_HEADER in self.repo.commit_message(sha):
                     uncovered = []
                 else:
@@ -8003,13 +8649,14 @@ class ProxyRunner:
         return Summarizer(backend_class(summary_scratch_dir(), launch_command=launch or None), model=model)
 
     def _start_commit_summary(self, sha: str, trace_text: str) -> None:
-        # Never kick off a fresh summarizer call while exiting. The exit-finalize commits
-        # each session's final turn (_commit_latest_turn_sync), and a summary started here
-        # would only be blocked on a few lines later (_finalize_summary_then_integrate_on_exit
-        # joins it), adding a whole LLM round-trip PER SESSION to teardown — the main reason
-        # exit dragged on for tens of seconds. The commit keeps its prompt-based message; the
-        # AI summary is an optional enhancement, not worth holding the exit for.
-        if self._exiting:
+        # On a NON-interactive teardown — a closed terminal / signal exit, where ``screen`` is
+        # already None — skip a fresh summarizer call: there is no one watching and teardown
+        # must stay fast (a full LLM round-trip per session is the main reason exit used to drag
+        # on for tens of seconds). On an INTERACTIVE exit the user is present and has opted into a
+        # slightly slower exit, so we DO summarize the turn committed at exit-finalize and give it
+        # a bounded grace to land (_finalize_summary_then_integrate_on_exit joins it), falling back
+        # to the commit's prompt-based message if it doesn't finish in time.
+        if self._exiting and self.screen is None:
             return
         summarizer = self._make_summarizer()
         if summarizer is None:
@@ -8320,6 +8967,9 @@ class ProxyRunner:
                 # stand (they never lose work); nothing was deleted.
                 self._exiting = False
                 self._finalized_on_exit = False
+                # Finalize disabled host mouse/focus/paste reporting up front; we're staying
+                # running, so restore it for the live session.
+                self._enable_host_mouse()
                 self._set_message(
                     "Exit cancelled. Your worktree and its files were NOT deleted — copy/move what you "
                     "need, then exit again. (Commits already made this exit were kept.)",
@@ -8393,6 +9043,13 @@ class ProxyRunner:
         detail = self._describe_exit_finalize()
         self._set_message(detail or "Finalizing things before exiting…", seconds=30)
         self._render()
+        # Stop the host terminal reporting mouse/focus/paste NOW, before the (sometimes
+        # multi-second) finalize below. Finalize doesn't service stdin, and parts of it run
+        # cooked (prompts, backend teardown), so a mouse scroll while "Finalizing…" shows would
+        # otherwise echo its raw SGR report (`\x1b[<…M`) onto the screen as literal text. The
+        # backend is on its way out, so it doesn't need these events either. (Re-enabled on the
+        # _exit_aborted path, where we stay running.)
+        self._disable_host_terminal_modes()
         # Stop the git worker first so the exit-time foreground commits below run on
         # this (main) thread without racing a worker pass. After this join the
         # finalize git is the only git touching the worktree.
@@ -8429,14 +9086,18 @@ class ProxyRunner:
         # mops up any stragglers. So leave exit fast.
 
     def _finalize_summary_then_integrate_on_exit(self) -> None:
-        # Give the current session's in-flight commit summary a short grace period
-        # so it can be amended in before the final integration; past that it is
-        # dropped rather than holding the exit hostage (#8). Runs for the active
-        # session in place and for each background session under a context swap.
+        # Give the current session's in-flight commit summary — the one the exit-finalize
+        # commit just started on an interactive exit, or one already running from the live
+        # path — a bounded grace to land so it can be amended into the commit before the
+        # final integration; past that it is dropped to git notes rather than holding the
+        # exit hostage (#8). Runs for the active session in place and for each background
+        # session under a context swap.
         if self._summary_thread is not None and self._summary_thread.is_alive():
             self._summary_thread.join(timeout=self.EXIT_SUMMARY_GRACE_SECONDS)
         self._service_commit_summary()
         self._integrate_session_on_exit()
+        if self._exit_aborted:
+            return  # Esc on a finalize popup (e.g. a merge prompt) aborted the exit — keep the worktree
         self._remove_worktree_on_exit()
 
     def _adopt_latest_backend_session(self) -> None:
@@ -9396,6 +10057,39 @@ class ProxyRunner:
             self._pending_copy_offer = (context, collected)
             self._wake_main_loop()  # present it on the next reactor tick
 
+    def _service_deferred_switch_offer(self) -> None:
+        """Present a switch's user-commit / copy offer that _switch_active deferred — but only
+        AFTER the switched-to session's latest agent turn is reconciled, so the agent's own
+        changes aren't offered as the user's. The CALLER holds ``_pipeline_lock`` (the timers-
+        phase background cluster), so the parse/commit here can't race the git worker; the
+        background parse keeps the main thread responsive (we re-check each tick, never block).
+
+        Sequence: commit any finished parse; if uncommitted changes remain and we haven't yet
+        checked the transcript for them, kick ONE background parse and wait; once reconciled
+        (committed, or nothing more to attribute), make the offer."""
+        target = self._pending_switch_copy_offer
+        if target is None:
+            return
+        if target is not self.active:
+            self._pending_switch_copy_offer = None  # switched away before it fired — drop it
+            self._switch_offer_parse_started = False
+            return
+        if self._agent_is_active():
+            return  # a turn is running; the post-turn pipeline reconciles it — wait
+        self._finish_agent_parse_if_ready(quiet=True)  # commit a just-finished agent turn
+        if self.agent_parse_thread is not None and self.agent_parse_thread.is_alive():
+            return  # a parse is running; offer next tick once it lands
+        if not self._switch_offer_parse_started and self.repo.status_short().strip():
+            # Uncommitted changes remain and we haven't checked the transcript for them yet: run
+            # ONE parse to attribute/commit any agent turn, then offer on a later tick. Bounded to
+            # a single parse so non-committable leftovers (declined/ignored files) still get offered.
+            if self._start_agent_parse():
+                self._switch_offer_parse_started = True
+                return
+        self._pending_switch_copy_offer = None
+        self._switch_offer_parse_started = False
+        self._offer_copy_unstaged_to_base(context="switch")
+
     def _present_pending_copy_offer(self) -> None:
         """Main thread: present a copy offer the git worker collected for this turn, if any.
         Deliberately NOT under `_pipeline_lock` — the worker must keep committing/merging
@@ -9427,6 +10121,9 @@ class ProxyRunner:
             # The turn path runs on the git worker and must NOT raise a (blocking) popup or
             # commit from there; those edits are still offered at the next switch/exit.
             self._offer_user_commit_for_worktree_edits()
+            if context == "exit" and self._exit_aborted:
+                # Esc on the user-commit box aborted the exit — don't also open the copy box.
+                return None
         candidates = self._uncommitted_worktree_files()
         if not candidates:
             return None
@@ -9557,6 +10254,12 @@ class ProxyRunner:
             except OSError as error:
                 self._debug(f"copy {rel} to base failed: {error!r}")
                 remained.append(rel)
+        if copied:
+            # aGiTrack itself just wrote these into the base repo (the copy-back of stranded
+            # worktree files) — that is NOT the agent editing outside its worktree, so fold them
+            # into the un-sandboxed base-edit monitor's baseline. Otherwise _warn_if_base_edited
+            # would flag aGiTrack's own copy as "Agent edited the base repo".
+            self._rebaseline_base_edits()
         if remained:
             self._notice_files_remain(wt_dir, remained)
         elif copied:
@@ -9620,20 +10323,29 @@ class ProxyRunner:
 
     def _integrate_agent_made_commits_if_idle(self, now: float) -> None:
         # The agent can run `git commit` itself (some workflows ask it to).
-        # Those turns leave the worktree CLEAN, so the auto-commit path — which
+        # Those turns leave the tree CLEAN, so the auto-commit path — which
         # integration used to piggyback on exclusively — never runs, and the
-        # turn branch sat ahead of base until exit/restart. When the session is
-        # idle, its tree is clean, and its branch holds unintegrated commits,
-        # integrate them now.
-        if self.worktree is None or self.merge_ctx:
+        # commits sat unaccounted-for until exit/restart. When the session is
+        # idle and its tree is clean, account for those commits now.
+        if self.merge_ctx:
             return
-        if self._base_branch is None or self._integration_paused or self._delay_merge:
-            return  # --delay-merge: don't integrate idle commits behind the user's back
+        if self._integration_paused or self._delay_merge:
+            return  # --delay-merge: don't touch the branch behind the user's back
         if self._agent_is_active() or now - self.last_child_output < self.CHILD_IDLE_SECONDS:
             return
         if now - self._idle_integrate_at < self.BASE_POLL_SECONDS:
             return
         self._idle_integrate_at = now
+        if not self._use_worktrees:
+            # No-worktree: the agent's own commits live on the current branch (there is no
+            # separate base to integrate into). Cover them with aGiTrack metadata — the same
+            # #35 machinery, minus the integration step.
+            if not self._uncovered_backend_commits() or self._summary_blocks_integration(now):
+                return
+            self._attach_trace_to_backend_commits(now)  # parse → commit_turns → cover commit
+            return
+        if self.worktree is None or self._base_branch is None:
+            return
         try:
             branch = self.repo.current_branch()
             if not is_managed_branch(branch) or not self.base_repo.log_range(self._base_branch, branch):
@@ -9706,6 +10418,18 @@ class ProxyRunner:
         else:
             TerminalHost.set_cooked(self)
 
+    def _reassert_host_raw(self) -> None:
+        # Windows only: after a backend switch, forcibly re-apply console raw mode in case the
+        # switch knocked the host console back to cooked/echo (all input then echoes as codes,
+        # Ctrl-C dies, the menu can't be navigated). A no-op on POSIX (the PTY raw mode is stable
+        # across a switch) and whenever the host doesn't expose it.
+        host = self._host
+        reassert = getattr(host, "reassert_raw", None)
+        if callable(reassert):
+            changed = reassert()
+            if changed:
+                self._debug(f"reassert_host_raw: re-applied console mode (changed={changed})")
+
     def _restore_terminal(self) -> None:
         if self._host is not None:
             self._host.restore_terminal()
@@ -9744,8 +10468,17 @@ class ProxyRunner:
 
     def _read_stdin(self, length: int) -> bytes:
         if self._host is not None:
-            return self._host.read_stdin(length)
-        return os.read(sys.stdin.fileno(), length)
+            data = self._host.read_stdin(length)
+        else:
+            data = os.read(sys.stdin.fileno(), length)
+        # Capture EVERY stdin read here (not just the main reactor phase) so input read by
+        # popups/modals and the wait-with-cancel loops is logged too — essential for diagnosing
+        # a post-switch state where the menu's own keys (arrows/Esc) arrive misencoded. Each
+        # _raw_capture call opens+writes+closes, so the log is flushed line-by-line and survives a
+        # hard-kill (needed when a leak has broken Ctrl-C and graceful exit isn't possible).
+        if data:
+            self._raw_capture(">", data)
+        return data
 
 
 # ---------------------------------------------------------------------------

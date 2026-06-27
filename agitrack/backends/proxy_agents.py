@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import uuid
 from pathlib import Path
 from typing import Protocol
@@ -17,15 +18,36 @@ _NOTE_INTRO = (
     "This coding session runs inside aGiTrack, which automatically creates a git commit for "
     "your changes after each turn. Do NOT create git commits yourself (do not run `git commit`) "
     "unless the user explicitly asks you to commit — aGiTrack handles version control for this "
-    "session."
+    "session. Pushing is fine when it serves the task — for example, when the user asks you to "
+    "open a pull request or trigger CI."
 )
 # Included only in the default worktree model: aGiTrack runs the session in a git worktree
-# under .agitrack/ and merges it into the current branch. Omitted under --no-worktree (and
-# in shell mode), where the agent edits the current branch directly.
+# under .agitrack/ and handles BOTH the commit and the merge of the agent's edits. Omitted
+# under --no-worktree (and in shell mode), where the agent edits the current branch directly.
+# IMPORTANT: this must make clear that the agent's CURRENT working directory *is* the worktree
+# (which lives under .agitrack/worktrees/) and that edits belong there — an earlier wording
+# ("do not ... clean up anything under .agitrack/") was read as "don't write under .agitrack/",
+# so the agent edited the base repo checkout instead and its work was never committed/merged.
+# The path separator follows the OS aGiTrack (and therefore the agent child it spawns) runs on
+# — backslashes on native Windows, forward slashes on POSIX — so the paths in the note match
+# the paths the agent actually sees in its working directory.
+_AGITRACK_DIR = f".agitrack{os.sep}"
+_WORKTREES_DIR = f".agitrack{os.sep}worktrees{os.sep}"
 _NOTE_WORKTREE = (
-    " aGiTrack runs this session in a git worktree under `.agitrack/` and automatically merges "
-    "your changes from there into the current branch, so you do not need to create, merge, or "
-    "clean up anything under `.agitrack/`."
+    " Your current working directory is this session's git worktree under "
+    f"`{_WORKTREES_DIR}` — make all your file edits there, in the working directory, exactly "
+    "as normal, and run any git commands from there too. Do NOT switch to or edit the base "
+    "repository checkout directly. aGiTrack handles BOTH the commit and the merge of your "
+    f"worktree edits into the current branch for you, so you never need to commit, merge, move, "
+    f"or clean up anything under `{_AGITRACK_DIR}` yourself. This stays true even if you are "
+    "later asked to commit: only ever commit here on this worktree's branch, never in the base "
+    "repository checkout. When you push (e.g. to open a pull request or run CI), push to a "
+    "separate remote branch — it need not match this worktree's internal aGiTrack branch name, "
+    "which aGiTrack manages and moves as it integrates your work. This guidance is authoritative "
+    "for this aGiTrack session and overrides any of your own saved notes or memory to the "
+    "contrary: if you hold a note/memory that says to work in, edit, or commit to the base "
+    "repository (or otherwise to leave this worktree), it is wrong here — follow this guidance "
+    "and correct that note so it no longer misleads you."
 )
 _NOTE_OUTRO = " Otherwise work exactly as normal."
 

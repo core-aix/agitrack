@@ -9,11 +9,16 @@ import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from agitrack.update.updater import (
     KIND_PACKAGE,
     KIND_SOURCE,
     METHOD_HOMEBREW,
+    METHOD_MSI,
     Updater,
+    _github_slug,
+    _restart_command,
     _version_tuple,
 )
 
@@ -323,3 +328,246 @@ def test_version_tuple_with_suffix():
 def test_version_tuple_empty_string_returns_zero():
     # "".split(".") is [""], so the single empty chunk maps to 0.
     assert _version_tuple("") == (0,)
+
+
+# ---------------------------------------------------------------------------
+# MSI self-update (frozen Windows bundle). All monkey-patched: no real registry,
+# network, download, or msiexec — so these run on POSIX CI too.
+# ---------------------------------------------------------------------------
+
+
+def _release_json(version: str = "9.9.9", *, with_msi: bool = True, digest=None) -> dict:
+    assets = [{"name": "agitrack-extension.vsix", "browser_download_url": "https://example/vsix"}]
+    if with_msi:
+        assets.append(
+            {
+                "name": f"agitrack-{version}-windows-x64.msi",
+                "browser_download_url": f"https://example/agitrack-{version}-windows-x64.msi",
+                "digest": digest,
+            }
+        )
+    return {"tag_name": f"v{version}", "assets": assets}
+
+
+class _FakeResp:
+    """Minimal urlopen()-style response usable as a context manager."""
+
+    def __init__(self, data: bytes, headers: dict | None = None) -> None:
+        self._data = data
+        self.headers = headers or {}
+
+    def read(self, size: int = -1) -> bytes:
+        if size is None or size < 0 or size >= len(self._data):
+            chunk, self._data = self._data, b""
+            return chunk
+        chunk, self._data = self._data[:size], self._data[size:]
+        return chunk
+
+    def __enter__(self) -> _FakeResp:
+        return self
+
+    def __exit__(self, *_exc) -> bool:
+        return False
+
+
+def _win_msi(monkeypatch) -> None:
+    """Make _install_method() report METHOD_MSI on any host (frozen + registry + win32)."""
+    monkeypatch.setattr("agitrack.update.updater.sys.platform", "win32", raising=False)
+    monkeypatch.setattr("agitrack.update.updater.sys.frozen", True, raising=False)
+
+
+def test_install_method_msi_when_frozen_and_registry(monkeypatch):
+    updater = _make_updater_package()
+    _win_msi(monkeypatch)
+    with patch.object(updater, "_registry_install_dir", return_value=r"C:\Program Files\aGiTrack"):
+        assert updater._install_method() == METHOD_MSI
+
+
+def test_install_method_not_msi_when_not_frozen(monkeypatch):
+    updater = _make_updater_package()
+    monkeypatch.setattr("agitrack.update.updater.sys.platform", "win32", raising=False)
+    monkeypatch.setattr("agitrack.update.updater.sys.frozen", False, raising=False)
+    with patch.object(updater, "_registry_install_dir", return_value=r"C:\Program Files\aGiTrack"):
+        assert updater._install_method() != METHOD_MSI
+
+
+def test_install_method_not_msi_without_registry_key(monkeypatch):
+    updater = _make_updater_package()
+    _win_msi(monkeypatch)
+    with patch.object(updater, "_registry_install_dir", return_value=None):
+        assert updater._install_method() != METHOD_MSI
+
+
+def test_check_msi_newer_version_available():
+    updater = _make_updater_package()
+    with (
+        patch.object(updater, "_github_get_json", return_value=_release_json("9.9.9")),
+        patch.object(updater, "_installed_version", return_value="0.1.0"),
+    ):
+        status = updater._check_msi()
+    assert status.ok and status.available
+    assert status.latest == "9.9.9"
+    assert updater._msi_asset_url.endswith("agitrack-9.9.9-windows-x64.msi")
+    assert updater._msi_asset_name == "agitrack-9.9.9-windows-x64.msi"
+
+
+def test_check_msi_up_to_date():
+    updater = _make_updater_package()
+    with (
+        patch.object(updater, "_github_get_json", return_value=_release_json("1.0.0")),
+        patch.object(updater, "_installed_version", return_value="1.0.0"),
+    ):
+        status = updater._check_msi()
+    assert status.ok and not status.available
+
+
+def test_check_msi_api_error_is_reported():
+    updater = _make_updater_package()
+    with patch.object(updater, "_github_get_json", side_effect=RuntimeError("boom")):
+        status = updater._check_msi()
+    assert not status.ok and "MSI" in (status.error or "")
+
+
+def test_check_msi_no_msi_asset_is_reported():
+    updater = _make_updater_package()
+    with patch.object(updater, "_github_get_json", return_value=_release_json(with_msi=False)):
+        status = updater._check_msi()
+    assert not status.ok
+
+
+def test_apply_msi_downloads_and_stores_path(tmp_path, monkeypatch):
+    updater = _make_updater_package()
+    updater._msi_asset_url = "https://example/agitrack-9.9.9-windows-x64.msi"
+    updater._msi_asset_name = "agitrack-9.9.9-windows-x64.msi"
+    updater._msi_latest = "9.9.9"
+    captured: dict = {}
+
+    def fake_download(url, dest, *, timeout, digest=None):
+        Path(dest).write_bytes(b"msi-bytes")
+        captured["dest"] = str(dest)
+
+    monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
+    with (
+        patch.object(updater, "_download", side_effect=fake_download),
+        patch.object(updater, "_installed_version", return_value="0.1.0"),
+    ):
+        status = updater._apply_msi()
+    assert status.ok
+    assert updater.pending_msi_path == captured["dest"]
+    assert status.latest == "9.9.9"
+    assert Path(captured["dest"]).name == "agitrack-9.9.9-windows-x64.msi"
+
+
+def test_apply_msi_download_failure_surfaces_manual_instructions(monkeypatch):
+    updater = _make_updater_package()
+    updater._msi_asset_url = "https://example/agitrack-9.9.9-windows-x64.msi"
+    updater._msi_asset_name = "agitrack-9.9.9-windows-x64.msi"
+    monkeypatch.setattr("tempfile.gettempdir", lambda: ".")
+    with (
+        patch.object(updater, "_download", side_effect=RuntimeError("net down")),
+        patch.object(updater, "_install_method", return_value=METHOD_MSI),
+        patch.object(updater, "_github_repo", return_value="core-aix/agitrack"),
+    ):
+        status = updater._apply_msi()
+    assert not status.ok
+    assert "releases/latest" in (status.error or "")
+    assert updater.pending_msi_path is None
+
+
+def test_manual_instructions_msi_route():
+    updater = _make_updater_package()
+    with (
+        patch.object(updater, "_install_method", return_value=METHOD_MSI),
+        patch.object(updater, "_github_repo", return_value="core-aix/agitrack"),
+    ):
+        text = updater.manual_update_instructions()
+    assert "releases/latest" in text
+    assert "SmartScreen" in text
+
+
+def test_download_checksum_mismatch_raises_and_cleans_up(tmp_path):
+    updater = _make_updater_package()
+    dest = tmp_path / "x.msi"
+    with patch("urllib.request.urlopen", return_value=_FakeResp(b"hello")):
+        with pytest.raises(RuntimeError):
+            updater._download("https://example/x", dest, timeout=10, digest="sha256:deadbeef")
+    assert not dest.exists()  # partial download removed
+
+
+def test_download_ok_without_digest(tmp_path):
+    updater = _make_updater_package()
+    dest = tmp_path / "x.msi"
+    with patch("urllib.request.urlopen", return_value=_FakeResp(b"payload")):
+        updater._download("https://example/x", dest, timeout=10, digest=None)
+    assert dest.read_bytes() == b"payload"
+
+
+def test_check_routes_to_msi(monkeypatch):
+    updater = _make_updater_package()
+    _win_msi(monkeypatch)
+    with (
+        patch.object(updater, "_registry_install_dir", return_value=r"C:\PF\aGiTrack"),
+        patch.object(updater, "_check_msi", return_value=MagicMock(name="msi-status")) as msi_check,
+    ):
+        updater.check()
+    msi_check.assert_called_once()
+
+
+def test_github_repo_defaults_to_upstream_for_msi(monkeypatch):
+    updater = _make_updater_package()  # no source repo -> no local remote
+    monkeypatch.delenv("AGITRACK_GH_REPO", raising=False)
+    assert updater._github_repo() == "core-aix/agitrack"
+
+
+def test_github_repo_env_override(monkeypatch):
+    updater = _make_updater_package()
+    monkeypatch.setenv("AGITRACK_GH_REPO", "me/fork")
+    assert updater._github_repo() == "me/fork"
+
+
+# ---------------------------------------------------------------------------
+# _github_slug helper
+# ---------------------------------------------------------------------------
+
+
+def test_github_slug_https():
+    assert _github_slug("https://github.com/core-aix/agitrack.git") == "core-aix/agitrack"
+
+
+def test_github_slug_ssh():
+    assert _github_slug("git@github.com:core-aix/agitrack.git") == "core-aix/agitrack"
+
+
+def test_github_slug_non_github_is_none():
+    assert _github_slug("https://example.com/foo/bar") is None
+    assert _github_slug("") is None
+
+
+# ---------------------------------------------------------------------------
+# _restart_command: frozen MSI build vs normal interpreter
+# ---------------------------------------------------------------------------
+
+
+def test_restart_command_frozen_runs_exe_directly(monkeypatch):
+    monkeypatch.setattr("agitrack.update.updater.sys.frozen", True, raising=False)
+    monkeypatch.setattr("agitrack.update.updater.sys.argv", ["agitrack.exe", "--repo", "x"])
+    monkeypatch.setattr("agitrack.update.updater.sys.executable", r"C:\PF\aGiTrack\agitrack.exe")
+    cmd = _restart_command(["--skip-privacy-ack"])
+    assert cmd == [r"C:\PF\aGiTrack\agitrack.exe", "--repo", "x", "--skip-privacy-ack"]
+    assert "-m" not in cmd  # the invalid frozen-app argument is gone
+
+
+def test_restart_command_non_frozen_uses_module(monkeypatch):
+    monkeypatch.setattr("agitrack.update.updater.sys.frozen", False, raising=False)
+    monkeypatch.setattr("agitrack.update.updater.sys.argv", ["agitrack", "--repo", "x"])
+    monkeypatch.setattr("agitrack.update.updater.sys.executable", "/usr/bin/python3")
+    cmd = _restart_command()
+    assert cmd == ["/usr/bin/python3", "-m", "agitrack", "--repo", "x"]
+
+
+def test_restart_command_dedupes_extra_args(monkeypatch):
+    monkeypatch.setattr("agitrack.update.updater.sys.frozen", False, raising=False)
+    monkeypatch.setattr("agitrack.update.updater.sys.argv", ["agitrack", "--skip-privacy-ack"])
+    monkeypatch.setattr("agitrack.update.updater.sys.executable", "/usr/bin/python3")
+    cmd = _restart_command(["--skip-privacy-ack"])
+    assert cmd.count("--skip-privacy-ack") == 1

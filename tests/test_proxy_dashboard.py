@@ -37,6 +37,7 @@ def test_dashboard_command_spawns_process_and_opens_browser(monkeypatch):
     proc = _FakeProc()
     spawned: list[dict] = []
     opened: list[str] = []
+    monkeypatch.setattr("agitrack.metrics.running_handshake", lambda repo: None)  # none running yet
     monkeypatch.setattr("agitrack.metrics.clear_handshake", lambda repo: None)
     monkeypatch.setattr("agitrack.metrics.spawn_dashboard_daemon", lambda repo, **kw: spawned.append(kw) or proc)
     monkeypatch.setattr(
@@ -77,6 +78,7 @@ def test_dashboard_command_spawns_process_and_opens_browser(monkeypatch):
 
 def test_dashboard_command_reports_when_daemon_fails_to_start(monkeypatch):
     proc = _FakeProc()
+    monkeypatch.setattr("agitrack.metrics.running_handshake", lambda repo: None)  # none running yet
     monkeypatch.setattr("agitrack.metrics.clear_handshake", lambda repo: None)
     monkeypatch.setattr("agitrack.metrics.spawn_dashboard_daemon", lambda repo, **kw: proc)
     monkeypatch.setattr("agitrack.metrics.wait_for_handshake", lambda repo, **kw: None)  # never binds
@@ -90,6 +92,37 @@ def test_dashboard_command_reports_when_daemon_fails_to_start(monkeypatch):
 
     assert runner._dashboard_proc is None  # not adopted
     assert proc.terminated  # the stillborn child was reaped, not orphaned
+
+
+def test_dashboard_command_reuses_an_externally_running_daemon(monkeypatch):
+    # A dashboard daemon already running for this repo (e.g. from `agitrack -d`, or a
+    # prior session) is reused: the browser opens at its URL and no duplicate is spawned,
+    # nor is its handshake cleared.
+    opened: list[str] = []
+    monkeypatch.setattr(
+        "agitrack.metrics.running_handshake",
+        lambda repo: {"pid": 777, "url": "http://127.0.0.1:9999/", "port": 9999},
+    )
+    monkeypatch.setattr(
+        "agitrack.metrics.spawn_dashboard_daemon",
+        lambda repo, **kw: (_ for _ in ()).throw(AssertionError("must not spawn when one is already running")),
+    )
+    monkeypatch.setattr(
+        "agitrack.metrics.clear_handshake",
+        lambda repo: (_ for _ in ()).throw(AssertionError("must not clear another daemon's handshake")),
+    )
+    monkeypatch.setattr("agitrack.metrics.open_dashboard_in_browser", lambda url: opened.append(url) or True)
+
+    runner = make_runner(base_repo=object())
+    monkeypatch.setattr(runner, "_render", lambda: None)
+
+    runner._handle_dashboard_command()
+
+    assert opened == ["http://127.0.0.1:9999/"]
+    assert runner._dashboard_url == "http://127.0.0.1:9999/"
+    # We don't own it, so we don't track it as our proc and won't stop it on exit.
+    assert runner._dashboard_proc is None
+    runner._stop_dashboard()  # must not raise, must not kill the reused daemon
 
 
 def test_stop_dashboard_is_a_noop_when_none_running():

@@ -17,7 +17,7 @@
 #   - watchdog on Windows uses the ReadDirectoryChangesW backend which is pure
 #     Python on Windows, so no native libs need special handling there.
 
-from PyInstaller.utils.hooks import collect_submodules, collect_dynamic_libs
+from PyInstaller.utils.hooks import collect_submodules, collect_dynamic_libs, copy_metadata
 
 hidden = [
     # Force all agitrack subpackages in — some are imported conditionally
@@ -36,11 +36,18 @@ hidden = [
 # pywinpty's .pyd / .dll lives next to the Python binding; pull it in.
 binaries = collect_dynamic_libs("winpty")
 
+# Bundle agitrack's own distribution metadata (.dist-info). Without it,
+# importlib.metadata.version("agitrack") raises PackageNotFoundError in the frozen
+# app and __version__ falls back to "0.0.0" (there is no pyproject.toml beside the
+# bundled package either), so `agitrack --version` — and the VSCode extension's
+# version-parity check that reads it — would report 0.0.0 for every MSI build.
+datas = copy_metadata("agitrack")
+
 a = Analysis(
     [r"..\agitrack\__main__.py"],
     pathex=[r".."],
     binaries=binaries,
-    datas=[],
+    datas=datas,
     hiddenimports=hidden,
     hookspath=[],
     hooksconfig={},
