@@ -2362,6 +2362,16 @@ class ProxyRunner:
         # Tear down the running TUI and relaunch it for the current backend and
         # session state, re-baselining so existing history is not re-committed.
         self._teardown_child()
+        if os.name == "nt":
+            # Return the HOST terminal to its clean fresh-launch baseline before the new backend
+            # comes up. A fresh aGiTrack launch starts with no host modes set; a restart must
+            # too, otherwise mouse reporting (and kitty/paste/etc.) that the OUTGOING backend
+            # mirrored onto the host stays on — and if the incoming backend doesn't use it (e.g.
+            # Claude after OpenCode) nothing ever turns it off, so host-emitted mouse codes leak
+            # into the backend as literal text. The incoming backend re-establishes only its own
+            # modes via _sync_terminal_modes as its output streams in. (Windows-only: the POSIX
+            # restart paths are long-proven and the leak is native-Windows specific.)
+            self._disable_host_terminal_modes()
         self._reset_agent_tracking()
         self._sanitize_state_trace()
         self._initialize_session_baseline()
@@ -3514,18 +3524,15 @@ class ProxyRunner:
                 if value == self.active_index:
                     self._select_current_session()
                     return self._MENU_DONE
-                target = self.sessions[value]
-                target_name = getattr(getattr(target, "backend", None), "name", None)
-                current_name = getattr(self.backend, "name", None)
-                if target_name and current_name and target_name != current_name:
-                    # Cross-backend switch: defer to the top-level reactor (timers phase) so it runs
-                    # OUTSIDE this nested sessions modal — the same context as a Ctrl-G backend
-                    # switch, which works. Running it inline from the modal breaks host console
-                    # input on Windows (the switch's SetConsoleMode wedges the reader and even a
-                    # fresh read then gets nothing). Close the menu now; the switch fires next tick.
-                    self._pending_switch_session = target
-                else:
-                    self._switch_to_session_index(value)
+                # Defer EVERY live-session switch to the top-level reactor (timers phase) so it
+                # runs OUTSIDE this nested sessions modal — the same context as a Ctrl-G backend
+                # switch, which works. Running a switch inline from the modal breaks host console
+                # input on Windows: the switch's teardown/SetConsoleMode races the reader thread's
+                # blocking ReadFile and wedges it (input then never arrives — the session-switch
+                # hang). This applies to a same-backend switch too, not just cross-backend. Close
+                # the menu now; the deferred switch fires next tick and does a full state reset
+                # (fresh respawn) into the target session.
+                self._pending_switch_session = self.sessions[value]
                 return self._MENU_DONE
             if kind == "integrate-active":
                 self._integrate_active_session()  # explicit "integrate now" for the active session
@@ -5627,11 +5634,24 @@ class ProxyRunner:
             with lock:
                 self.active = self.sessions[index]
             self.scroll_back = 0
-            self._resize_child()
-            self._enable_host_mouse()
-            self._reassert_host_raw()  # a switch can knock the host console out of raw mode
-            self._set_message(f"Switched to session '{self._session_name(index)}'")
-            self._render()
+            if os.name == "nt":
+                # WINDOWS: do NOT resume the target session's backgrounded ConPTY in place.
+                # Doing so steals the host console — keystrokes/mouse stop reaching aGiTrack
+                # and the reader thread's blocking ReadFile wedges (the session-switch hang).
+                # Instead RESTART the backend fresh into the now-active session: a clean
+                # teardown + respawn that re-initializes the screen and console exactly as a
+                # fresh aGiTrack launch would. The conversation is preserved because
+                # self.state.backend_session_id is unchanged, so the respawn resumes it.
+                # This is the user-requested "reset state as if you restart aGiTrack in the
+                # new session", and it uses the same fresh-spawn path the backend menu uses.
+                self._debug("switch_active: nt -> _restart_agent (fresh respawn into target)")
+                self._restart_agent(f"Switched to session '{self._session_name(index)}'")
+            else:
+                self._resize_child()
+                self._enable_host_mouse()
+                self._reassert_host_raw()  # a switch can knock the host console out of raw mode
+                self._set_message(f"Switched to session '{self._session_name(index)}'")
+                self._render()
             self._debug("switch_active: swapped + rendered")
             # The copy-back mute is per active-session-visit: a switch resets it so the
             # session we just landed on gets offered its own worktree-only files (background
@@ -5943,6 +5963,15 @@ class ProxyRunner:
         self.actions = AgitrackActions(self.repo, self.state, verbose=self.verbose)
         self._sanitize_state_trace()
         self._initialize_session_baseline()
+        if os.name == "nt":
+            # Clear the OUTGOING backend's host-terminal-mode mirror before the new backend comes
+            # up, so this session starts from the same clean host baseline a fresh aGiTrack launch
+            # would (mouse reporting, kitty, paste, …). Without this, modes the previous backend
+            # mirrored onto the host persist; if they don't match what the new backend expects,
+            # host-emitted mouse codes leak into it as literal text. The new backend re-establishes
+            # only its own modes via _sync_terminal_modes as its output streams in. (Windows-only:
+            # the POSIX session paths are long-proven and the leak is native-Windows specific.)
+            self._disable_host_terminal_modes()
         self._init_screen()
         self._spawn()
         self._start_file_watcher()

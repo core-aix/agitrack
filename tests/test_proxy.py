@@ -2758,6 +2758,10 @@ def _mux_runner():
     runner._enable_host_mouse = lambda: None
     runner._set_message = lambda *a, **k: None
     runner._stop_file_watcher = lambda: None
+    # On Windows a session switch performs a full state reset (teardown + fresh respawn)
+    # instead of resuming the backgrounded ConPTY in place; stub it so the pointer-swap
+    # assertions run identically on every CI OS.
+    runner._restart_agent = lambda msg: None
     runner.sessions = [runner.active]
     return runner
 
@@ -7145,12 +7149,43 @@ def test_switch_active_joins_worker_before_swapping():
     runner._render = lambda: None
     runner._resize_child = lambda: None
     runner._enable_host_mouse = lambda: None
+    runner._restart_agent = lambda msg: None  # Windows switch path; no-op on the fake
     runner._session_name = lambda index: f"s{index}"
 
     runner._switch_active(1)
 
     assert events and events[0][0] == "join"  # waited before swapping
     assert runner.active_index == 1
+
+
+def test_switch_active_full_reset_on_windows_inplace_on_posix(monkeypatch):
+    # Per the user: switching sessions must reset state "as if you restart aGiTrack in the
+    # new session". On Windows, resuming the target's backgrounded ConPTY in place steals the
+    # host console and wedges stdin (the session-switch hang), so the switch must instead do a
+    # full teardown + fresh respawn (_restart_agent). On POSIX there is no console-steal, so
+    # the lighter in-place resume (resize + re-enable mouse) is kept.
+    import agitrack.proxy.runner as proxy_mod
+
+    runner = _mux_runner()
+    runner.sessions.append(_bg_session("B"))
+    runner._session_name = lambda index: f"s{index}"
+
+    restarts: list[str] = []
+    resizes: list[int] = []
+    runner._restart_agent = lambda msg: restarts.append(msg)
+    runner._resize_child = lambda: resizes.append(1)
+
+    monkeypatch.setattr(proxy_mod.os, "name", "nt")
+    runner._switch_active(1)
+    assert runner.active_index == 1 and runner.repo == "repoB"  # still swapped
+    assert restarts and not resizes  # full reset, no in-place resume
+
+    restarts.clear()
+    resizes.clear()
+    monkeypatch.setattr(proxy_mod.os, "name", "posix")
+    runner._switch_active(0)
+    assert runner.active_index == 0 and runner.repo == "repoA"  # swapped back
+    assert resizes and not restarts  # in-place resume, no respawn
 
 
 # --- issue #18: Ctrl-C inside a popup goes through the full exit flow -----------
