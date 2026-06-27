@@ -605,7 +605,7 @@ class ProxyRunner:
         # A cross-backend session switch requested from the (nested) sessions modal is deferred to
         # the top-level reactor; doing it inline from the modal breaks host console input on
         # Windows. Holds the target Session until the timers phase runs it. (See _switch_to_session_index.)
-        self._pending_switch_session = None
+        self._pending_switch_session: "Session | None" = None
         self._render_pending = False
         # Synchronized output (DECSET 2026): while the backend is mid-update we
         # hold the repaint so a half-drawn frame is never shown (tearing), and
@@ -6846,14 +6846,15 @@ class ProxyRunner:
 
     def _sync_terminal_modes(self, output: bytes) -> None:
         # OpenCode enables mouse reporting on its PTY. Because aGiTrack renders the
-        # screen itself, the host terminal never sees those mode switches unless
-        # we mirror them explicitly. Full pass-through (all platforms): every mouse/paste mode
-        # the backend requests — including motion 1002 (button-event/drag) and 1003 (any-event),
-        # which the backend needs for drag-select / copy — is mirrored to the host so the host
-        # reports the matching events and aGiTrack forwards them to the backend unchanged. The
-        # ConPTY input path delivers clean SGR mouse to a VT-input backend (verified end-to-end;
-        # see dev/winmouse/FINDINGS.md). Leaks seen on a backend switch are carryover state under
-        # investigation, NOT a reason to drop motion (the backend needs it for drag-select/copy).
+        # screen itself, the host terminal never sees those mode switches unless we mirror them.
+        # Mirror button/wheel/SGR/paste and 1002 (button-event tracking = motion WHILE a button is
+        # held = drag, which the backend needs for drag-select / copy). But on Windows do NOT
+        # mirror 1003 (any-event tracking = motion with NO button = hover): the host floods hover
+        # reports (`\x1b[<35;..M`) that don't round-trip cleanly and leak into the backend as
+        # literal text. Excluding only 1003 stops the hover flood while keeping drag-copy working
+        # (the confirmed leak is button 35 = no-button motion; see the proxy-raw trace and
+        # dev/winmouse/FINDINGS.md). Disables are always mirrored.
+        _no_host_enable = {b"1003"} if os.name == "nt" else set()
         for mode in (
             b"9",
             b"1000",
@@ -6868,7 +6869,7 @@ class ProxyRunner:
             b"1016",
             b"2004",
         ):
-            if b"\x1b[?" + mode + b"h" in output:
+            if b"\x1b[?" + mode + b"h" in output and mode not in _no_host_enable:
                 self._mirror_to_host(b"\x1b[?" + mode + b"h")
             if b"\x1b[?" + mode + b"l" in output:
                 self._mirror_to_host(b"\x1b[?" + mode + b"l")
