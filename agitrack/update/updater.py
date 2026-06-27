@@ -57,6 +57,23 @@ KIND_UNKNOWN = "unknown"
 METHOD_PIP = "pip"
 METHOD_PIPX = "pipx"
 METHOD_HOMEBREW = "homebrew"
+# A frozen (PyInstaller) Windows bundle installed by the perMachine MSI. Detected via
+# ``sys.frozen`` + the ``HKLM\Software\aGiTrack\InstallDir`` registry key the WiX fragment
+# writes. Updated by downloading and re-running the MSI, not pip — see ``_apply_msi``.
+METHOD_MSI = "msi"
+
+# The upstream GitHub repo that builds and publishes the Windows MSI release assets. The
+# MSI install carries no aGiTrack source checkout, so (unlike a source install) there is no
+# local git remote to read — releases always come from here. Overridable via
+# ``AGITRACK_GH_REPO`` for forks/testing.
+_DEFAULT_GH_REPO = "core-aix/agitrack"
+# In-process cache of GitHub Releases API responses: url -> (etag, parsed_json, monotonic_ts).
+# The anonymous API allows 60 req/h; our periodic check fires every ~5 min, but the cache
+# (plus a conditional ``If-None-Match`` request) keeps even bursty on-demand checks well under.
+_GH_CACHE: dict[str, tuple[str, object, float]] = {}
+_GH_CACHE_TTL = 300.0
+# Cap the MSI download so a wrong/huge asset can't fill the disk; the real MSI is ~25 MB.
+_MSI_MAX_BYTES = 200 * 1024 * 1024
 
 # Path fragments that mark where a package install physically lives. ``pipx`` gives each
 # app its own venv under ``<PIPX_HOME>/venvs/<app>``; Homebrew formulae (and their bundled
@@ -183,6 +200,13 @@ class Updater:
             head = _git(["rev-parse", "HEAD"], self._source_repo)
             if head.returncode == 0:
                 self._running_rev = head.stdout.strip() or None
+        # MSI-path scratch state, populated by _check_msi/_apply_msi (see METHOD_MSI):
+        self._msi_asset_url: str | None = None
+        self._msi_asset_name: str | None = None
+        self._msi_asset_digest: str | None = None  # "sha256:<hex>" when GitHub provides it
+        self._msi_latest: str = ""
+        # The downloaded MSI awaiting the elevated install hand-off (the runner reads this).
+        self.pending_msi_path: str | None = None
 
     @property
     def kind(self) -> str:
@@ -203,6 +227,8 @@ class Updater:
         check so an offline user isn't made to wait."""
         if self.kind == KIND_SOURCE:
             return self._check_source(fetch=fetch, timeout=timeout)
+        if self._install_method() == METHOD_MSI:
+            return self._check_msi(timeout=timeout)
         return self._check_package(timeout=timeout)
 
     def _upstream_ref(self, repo: Path) -> str | None:
@@ -394,6 +420,8 @@ class Updater:
         try:
             if self.kind == KIND_SOURCE:
                 return self._apply_source()
+            if self._install_method() == METHOD_MSI:
+                return self._apply_msi()
             return self._apply_package()
         except Exception as error:  # an update attempt must not crash aGiTrack
             status = UpdateStatus(kind=self.kind)
@@ -406,6 +434,13 @@ class Updater:
         continuing to run the current version."""
         if self.kind == KIND_SOURCE and self._source_repo is not None:
             return f"update manually by running `git pull` in the aGiTrack source checkout at {self._source_repo}"
+        if self._install_method() == METHOD_MSI:
+            repo = self._github_repo()
+            return (
+                f"download the latest aGiTrack MSI from https://github.com/{repo}/releases/latest and run it "
+                "(the installer is not code-signed yet, so if Windows SmartScreen warns, choose "
+                '"More info" then "Run anyway")'
+            )
         return self._manual_routes()
 
     def _apply_source(self) -> UpdateStatus:
@@ -467,7 +502,15 @@ class Updater:
         ``…/pipx/venvs/…``, not under the brew Cellar, so the pipx marker is the
         more specific signal — and a pipx venv isn't externally managed, so it must
         not be mistaken for a Homebrew install and pushed at ``brew``.
+
+        The MSI bundle is detected first: a frozen (PyInstaller) build whose perMachine
+        install root the WiX fragment recorded in the registry. Both conditions are
+        required so a portable PyInstaller zip (frozen, but no registry key) still falls
+        through to the pip path rather than trying to drive ``msiexec`` against a release
+        it didn't come from.
         """
+        if sys.platform == "win32" and getattr(sys, "frozen", False) and self._registry_install_dir() is not None:
+            return METHOD_MSI
         candidates: list[str] = []
         try:
             candidates.append(str(Path(agitrack.__file__).resolve()))
@@ -480,6 +523,187 @@ class Updater:
         if any(marker in blob for marker in _HOMEBREW_MARKERS):
             return METHOD_HOMEBREW
         return METHOD_PIP
+
+    # --- MSI (frozen Windows bundle) -------------------------------------
+
+    def _registry_install_dir(self) -> str | None:
+        """The perMachine MSI install root from ``HKLM\\Software\\aGiTrack\\InstallDir``
+        (written by ``installer/agitrack.wxs``), or ``None`` when absent / off Windows."""
+        if sys.platform != "win32":
+            return None
+        try:
+            import winreg  # type: ignore[import-not-found,unused-ignore]  # Windows-only stdlib
+        except ImportError:
+            return None
+        for view in (getattr(winreg, "KEY_WOW64_64KEY", 0), getattr(winreg, "KEY_WOW64_32KEY", 0)):
+            try:
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"Software\aGiTrack", 0, winreg.KEY_READ | view) as key:
+                    value, _ = winreg.QueryValueEx(key, "InstallDir")
+            except OSError:
+                continue
+            if value:
+                return str(value)
+        return None
+
+    def msi_install_dir(self) -> str:
+        """The directory the MSI installed aGiTrack into — where the bootstrapper and the
+        replacement ``agitrack.exe`` live. Prefers the registry value, falling back to the
+        running executable's directory so a hand-off still works if the key is missing."""
+        registry = self._registry_install_dir()
+        if registry and os.path.isdir(registry):
+            return registry
+        return os.path.dirname(os.path.abspath(sys.executable))
+
+    def _github_repo(self) -> str:
+        """The ``owner/name`` slug to query for releases. An MSI install carries no source
+        checkout, so unlike the source path there is no meaningful local git remote (the cwd
+        is the *user's* project, not aGiTrack's) — default to the known upstream repo, with an
+        ``AGITRACK_GH_REPO`` override for forks/testing, and a source remote when available."""
+        override = os.environ.get("AGITRACK_GH_REPO")
+        if override:
+            return override.strip()
+        if self._source_repo is not None:
+            result = _git(["config", "--get", "remote.origin.url"], self._source_repo)
+            slug = _github_slug(result.stdout.strip()) if result.returncode == 0 else None
+            if slug:
+                return slug
+        return _DEFAULT_GH_REPO
+
+    def _github_get_json(self, url: str, *, timeout: int) -> object:
+        """GET *url* from the GitHub API as parsed JSON, with a short-TTL + ETag cache so the
+        periodic check stays well under the anonymous rate limit. Raises on a hard failure."""
+        import json
+        import time
+        import urllib.error
+        import urllib.request
+
+        now = time.monotonic()
+        cached = _GH_CACHE.get(url)
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "agitrack-updater",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        if cached is not None:
+            etag, payload, ts = cached
+            if now - ts < _GH_CACHE_TTL:
+                return payload
+            if etag:
+                headers["If-None-Match"] = etag
+        request = urllib.request.Request(url, headers=headers)  # noqa: S310 - fixed https GitHub API host
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
+                body = response.read()
+                etag = response.headers.get("ETag", "")
+                payload = json.loads(body.decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            if error.code == 304 and cached is not None:  # Not Modified: reuse the cached body
+                _GH_CACHE[url] = (cached[0], cached[1], now)
+                return cached[1]
+            raise
+        _GH_CACHE[url] = (etag, payload, now)
+        return payload
+
+    def _latest_msi_release(self, *, timeout: int) -> tuple[str | None, str | None, str | None, str | None]:
+        """``(version, download_url, asset_name, digest)`` for the newest release's
+        ``agitrack-*-windows-x64.msi`` asset, or all-``None`` when none is published."""
+        repo = self._github_repo()
+        data = self._github_get_json(f"https://api.github.com/repos/{repo}/releases/latest", timeout=timeout)
+        assets = data.get("assets", []) if isinstance(data, dict) else []
+        prefix, suffix = "agitrack-", "-windows-x64.msi"
+        for asset in assets:
+            if not isinstance(asset, dict):
+                continue
+            name = str(asset.get("name", ""))
+            if name.startswith(prefix) and name.endswith(suffix):
+                version = name[len(prefix) : -len(suffix)]
+                digest = asset.get("digest")  # e.g. "sha256:abc…" (newer GitHub API)
+                return version, asset.get("browser_download_url"), name, digest
+        return None, None, None, None
+
+    def _check_msi(self, *, timeout: int = _NET_TIMEOUT) -> UpdateStatus:
+        status = UpdateStatus(kind=KIND_PACKAGE)
+        installed = self._installed_version()
+        status.current = installed
+        try:
+            version, url, name, digest = self._latest_msi_release(timeout=timeout)
+        except Exception as error:  # network / API / parse failure: report, don't crash
+            status.error = f"could not check for aGiTrack MSI updates ({error})"
+            return status
+        if version is None or not url:
+            status.error = "could not find a Windows MSI asset in the latest aGiTrack release"
+            return status
+        status.latest = version
+        self._msi_asset_url = url
+        self._msi_asset_name = name
+        self._msi_asset_digest = digest
+        self._msi_latest = version
+        if _version_tuple(version) > _version_tuple(installed):
+            status.available = True
+            status.message = f"aGiTrack update available: {installed} → {version}."
+        else:
+            status.message = "aGiTrack is up to date."
+        return status
+
+    def _download(self, url: str, dest: Path, *, timeout: int, digest: str | None = None) -> None:
+        """Stream *url* to *dest* with a size cap, verifying *digest* (``sha256:<hex>``)
+        when GitHub supplies one. Raises on any failure (the partial file is removed)."""
+        import hashlib
+        import urllib.request
+
+        hasher = hashlib.sha256()
+        total = 0
+        request = urllib.request.Request(url, headers={"User-Agent": "agitrack-updater"})  # noqa: S310 - GitHub asset URL
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response, open(dest, "wb") as out:  # noqa: S310
+                while True:
+                    chunk = response.read(65536)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > _MSI_MAX_BYTES:
+                        raise RuntimeError("MSI download exceeds the size cap")
+                    hasher.update(chunk)
+                    out.write(chunk)
+        except BaseException:
+            dest.unlink(missing_ok=True)
+            raise
+        if digest and digest.lower().startswith("sha256:"):
+            expected = digest.split(":", 1)[1].strip().lower()
+            if hasher.hexdigest() != expected:
+                dest.unlink(missing_ok=True)
+                raise RuntimeError("downloaded MSI failed its sha256 checksum")
+
+    def _apply_msi(self) -> UpdateStatus:
+        """Download the newest MSI to ``%TEMP%`` and stash its path for the runner's elevated
+        hand-off. Does NOT run the installer (the running ``agitrack.exe`` is the very file the
+        MSI replaces, so the install must happen after this process exits — see the runner's
+        ``_launch_msi_bootstrapper``)."""
+        import tempfile
+
+        status = UpdateStatus(kind=KIND_PACKAGE)
+        if not self._msi_asset_url:
+            # apply() may be called without a preceding check() (e.g. on-demand); resolve now.
+            check = self._check_msi()
+            if not check.ok:
+                status.error = check.error
+                return status
+        url = self._msi_asset_url
+        if not url:
+            status.error = f"no aGiTrack MSI asset found to download; {self.manual_update_instructions()}"
+            return status
+        name = self._msi_asset_name or "agitrack-update.msi"
+        dest = Path(tempfile.gettempdir()) / name
+        try:
+            self._download(url, dest, timeout=600, digest=self._msi_asset_digest)
+        except Exception as error:
+            status.error = f"failed to download the aGiTrack MSI ({error}); {self.manual_update_instructions()}"
+            return status
+        self.pending_msi_path = str(dest)
+        status.current = self._installed_version()
+        status.latest = self._msi_latest or status.current
+        status.message = f"Downloaded aGiTrack {status.latest}.".strip()
+        return status
 
     def _pip_invocation(self) -> list[str] | None:
         """The command prefix for a pip call, or ``None`` when no pip is reachable.
@@ -599,6 +823,21 @@ class Updater:
         return f"{lead}; {self._manual_routes()}"
 
 
+def _github_slug(remote_url: str) -> str | None:
+    """Parse ``owner/name`` from a GitHub remote URL (https or ssh), or ``None``."""
+    url = remote_url.strip()
+    if not url:
+        return None
+    for marker in ("github.com/", "github.com:"):
+        if marker in url:
+            slug = url.split(marker, 1)[1]
+            if slug.endswith(".git"):
+                slug = slug[:-4]
+            slug = slug.strip("/")
+            return slug if slug.count("/") == 1 else None
+    return None
+
+
 def _version_tuple(version: str) -> tuple:
     # Lenient numeric-prefix comparison: "1.2.3" -> (1, 2, 3). Non-numeric
     # trailers (e.g. "1.2.3rc1") compare by their leading integer only, which is
@@ -615,12 +854,29 @@ def _version_tuple(version: str) -> tuple:
     return tuple(parts)
 
 
+def _restart_command(extra_args: Sequence[str] = ()) -> list[str]:
+    """The argv to re-launch the running aGiTrack with the original CLI arguments.
+
+    A normal (pip/source) install is a Python interpreter, so it is re-run as
+    ``python -m agitrack …`` — robust to a package upgrade that rewrote the console
+    script. A **frozen** build (the PyInstaller/MSI ``agitrack.exe``) is NOT a Python
+    interpreter: ``-m agitrack`` is not a valid argument there and argparse would reject
+    it, so the frozen executable is re-run directly with the saved arguments instead.
+    """
+    args = list(sys.argv[1:])
+    for arg in extra_args:
+        if arg not in args:
+            args.append(arg)
+    if getattr(sys, "frozen", False):
+        return [sys.executable, *args]
+    return [sys.executable, "-m", "agitrack", *args]
+
+
 def restart_agitrack(extra_args: Sequence[str] = ()) -> NoReturn:
     """Re-launch aGiTrack so the freshly updated code is loaded.
 
-    Uses ``python -m agitrack`` with the original CLI arguments so the entry point
-    survives a package upgrade that may have rewritten the console script. This
-    does not return on success.
+    Uses ``python -m agitrack`` (or, for a frozen MSI build, the ``agitrack.exe`` directly —
+    see :func:`_restart_command`) with the original CLI arguments. Does not return on success.
 
     ``extra_args`` are appended to the original argv (de-duplicated) — used to
     carry ``--skip-privacy-ack`` through a menu-triggered restart so the
@@ -628,11 +884,7 @@ def restart_agitrack(extra_args: Sequence[str] = ()) -> NoReturn:
     """
     sys.stdout.flush()
     sys.stderr.flush()
-    args = list(sys.argv[1:])
-    for arg in extra_args:
-        if arg not in args:
-            args.append(arg)
-    cmd = [sys.executable, "-m", "agitrack", *args]
+    cmd = _restart_command(extra_args)
     if os.name == "nt":
         # Windows has no true in-place exec. os.execv there spawns a new process and exits
         # this one, which (a) fails with "[WinError 6] The handle is invalid" when the CRT

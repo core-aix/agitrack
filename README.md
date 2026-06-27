@@ -7,51 +7,108 @@ You can use either **OpenCode** or **Claude (Claude Code)** as the AI agent — 
 
 ## Requirements
 
-aGiTrack runs on **macOS, Linux, and natively on Windows** (PowerShell / Windows Terminal — no WSL required; WSL still works too). It works in the common terminal apps (iTerm2, Apple Terminal, Alacritty, kitty, GNOME Terminal, Konsole, tmux, the VS Code terminal, and Windows Terminal); on a terminal that lacks some advanced features, it still works, just with fewer visual frills. On Windows it drives the agent through a pseudo-console (ConPTY); the sandbox that confines agent writes is macOS/Linux-only, so on Windows the agent runs unconfined (a warning is shown).
+aGiTrack runs on **macOS, Linux, and natively on Windows** (PowerShell / Windows Terminal — no WSL required; WSL still works too). It works in the common terminal apps (iTerm2, Apple Terminal, Alacritty, kitty, GNOME Terminal, Konsole, tmux, the VS Code terminal, and Windows Terminal); on a terminal that lacks some advanced features, it still works, just with fewer visual frills. On Windows it drives the agent through a pseudo-console (ConPTY); the sandbox that confines agent writes is macOS/Linux-only, so on Windows the agent runs unconfined (aGiTrack instead warns if the agent edits the base repo outside its worktree).
 
 You need **git** and at least one AI agent — [Claude Code](https://docs.claude.com/en/docs/claude-code) or [OpenCode](https://opencode.ai) — installed and on your `PATH`. The dashboard can also use the **GitHub CLI (`gh`)** to show each commit's author by their GitHub username: install it from [cli.github.com](https://cli.github.com) and run `gh auth login`. `gh` is optional — without it, the dashboard still works and just groups authors by email instead.
 
 ## Install
 
-aGiTrack is a Python package, so it needs **Python 3.10+** (with `pip`). Most macOS/Linux systems already have it (`python3 --version`); if not — macOS: `brew install python`, Linux: your package manager (e.g. `sudo apt install python3 python3-pip`), Windows: `winget install Python.Python.3.12` (tick *Add to PATH*). Then:
+aGiTrack is a Python package (**Python 3.10+**), installed with `pip` or `pipx`. On **Windows** you can instead use a standalone **MSI** that needs no Python at all. Pick your OS below — each section is self-contained. Once installed, aGiTrack keeps itself up to date (see [Self-update](#self-update)); the PyPI distribution, the importable package, and the command are all named `agitrack`.
 
-```bash
-pip install agitrack
-```
+### macOS
 
-This installs the `agitrack` command and the terminal UI dependency used for status bars and contextual command hints. The PyPI distribution, the importable package, and the command are all named `agitrack`. Once installed, aGiTrack keeps itself up to date — see [Self-update](#self-update).
-
-On systems where Python comes from a system package manager (many Linux distributions, or Homebrew on macOS), `pip` may refuse to install into the system environment with an "externally-managed-environment" error ([PEP 668](https://peps.python.org/pep-0668/)). In that case install with [`pipx`](https://pipx.pypa.io) instead, which puts `agitrack` in its own isolated environment and on your PATH:
-
-```bash
-pipx install agitrack
-```
-
-For local development, install from a checkout instead:
-
-```bash
-python3 -m pip install -e .
-```
+1. **Python 3.10+** — check with `python3 --version`; if it's missing, `brew install python`.
+2. **Install aGiTrack** (the terminal-UI dependency for status bars and command hints comes with it):
+   ```bash
+   pip3 install agitrack
+   ```
+   If pip refuses with an "externally-managed-environment" error ([PEP 668](https://peps.python.org/pep-0668/) — common with Homebrew's Python), use [`pipx`](https://pipx.pypa.io) instead; it isolates aGiTrack and puts it on your PATH:
+   ```bash
+   pipx install agitrack
+   ```
+3. **Prerequisites** — git (required), a backend (Claude Code **or** OpenCode), and optionally `gh` (lets the dashboard show authors by GitHub username):
+   ```bash
+   brew install git
+   curl -fsSL https://claude.ai/install.sh | bash   # Claude Code …
+   npm install -g opencode-ai                        # … or OpenCode
+   brew install gh                                   # optional
+   ```
 
 ### Windows (native — no WSL)
 
-`pip install agitrack` works natively on Windows (PowerShell / Windows Terminal). It automatically pulls in **`pywinpty`** (a prebuilt wheel — no C/Rust compiler needed) to drive the agent through a pseudo-console (ConPTY). Notes:
+aGiTrack runs natively on Windows (PowerShell / Windows Terminal — WSL not required). Two ways to install — pick one:
 
-- **Check Python/pip first:** `py -m pip --version`. No Python? `winget install Python.Python.3.12` (tick *Add to PATH*).
-- **`agitrack` not found after install?** Your Python `Scripts` dir isn't on PATH. Run it as `py -m agitrack`, or install with **pipx** (`pipx install agitrack`), which puts it on PATH for you.
-- The write-confinement **sandbox is macOS/Linux-only**, so on Windows the agent runs unconfined (aGiTrack shows a one-time warning).
+**Option A — standalone MSI (no Python needed).** Each release ships a self-contained installer that bundles its own Python (built with PyInstaller), so it runs on a machine with **no Python or pip at all**.
 
-### Prerequisites — git and a backend (macOS · Linux · Windows)
+- **Download** `agitrack-<version>-windows-x64.msi` from the latest release: **<https://github.com/core-aix/agitrack/releases/latest>** (under *Assets*).
+- **Install** by double-clicking it. `agitrack` is installed to `C:\Program Files\aGiTrack` and added to your PATH, so you can run `agitrack` from any terminal.
+- ⚠️ **You must bypass the security warning.** The MSI is **not code-signed yet** (we don't have a Windows code-signing certificate), so SmartScreen warns that the publisher is unknown. This is expected — click **More info → Run anyway**, then accept the UAC prompt. Code-signing is planned so this step goes away in a future release.
+- The [VS Code extension](editors/vscode/README.md) uses this same MSI automatically when it can't find pipx or pip.
 
-aGiTrack needs **git** and at least one backend CLI ([Claude Code](https://docs.claude.com/en/docs/claude-code) or [OpenCode](https://opencode.ai)); the GitHub CLI (`gh`) is optional (it lets the dashboard show authors by GitHub username). Install them for your OS:
+**Option B — with Python (`pip` / `pipx`).**
 
-| | git (required) | a backend (Claude Code **or** OpenCode) | `gh` (optional) |
-|---|---|---|---|
-| **macOS** | `brew install git` | `curl -fsSL https://claude.ai/install.sh \| bash` · or `npm install -g opencode-ai` | `brew install gh` |
-| **Linux** | `sudo apt install git` *(or your package manager)* | `curl -fsSL https://claude.ai/install.sh \| bash` · or `npm install -g opencode-ai` | `sudo apt install gh` |
-| **Windows** | `winget install Git.Git` | `npm install -g @anthropic-ai/claude-code` · or `npm install -g opencode-ai` *(no Node? `winget install OpenJS.NodeJS`)* | `winget install GitHub.cli` |
+1. **Python 3.10+** — `winget install Python.Python.3.12` (tick *Add to PATH*). Check with `py --version`.
+2. **pip** — the Python installer usually includes pip, but it can be missing (e.g. a minimal install, or pip was deselected). Check with `py -m pip --version`; if that errors, bootstrap pip:
+   ```powershell
+   py -m ensurepip --upgrade
+   py -m pip install --upgrade pip
+   ```
+3. **Install aGiTrack:**
+   ```powershell
+   pip install agitrack
+   ```
+   This pulls in **`pywinpty`** automatically (a prebuilt wheel — no C/Rust compiler needed) to drive the agent through a pseudo-console (ConPTY). If `agitrack` isn't found afterward, your Python `Scripts` dir isn't on PATH — install with `pipx install agitrack` (which puts it on PATH for you) or run it as `py -m agitrack`.
 
-Run `gh auth login` if you installed `gh`. After installing anything, open a **new terminal** so the updated `PATH` is picked up. aGiTrack also prints these same per-OS install hints at startup when `git`, the selected backend, or `gh` is missing — so you can copy the right command without leaving the prompt.
+**Prerequisites (either option)** — git (required), a backend (Claude Code **or** OpenCode), and optionally `gh`:
+
+```powershell
+winget install Git.Git
+npm install -g @anthropic-ai/claude-code   # Claude Code … (no Node? winget install OpenJS.NodeJS)
+npm install -g opencode-ai                 # … or OpenCode
+winget install GitHub.cli                  # optional
+```
+
+> The write-confinement **sandbox is macOS/Linux-only**. On Windows the agent runs unconfined; instead of blocking writes, aGiTrack watches the base repository and warns you only **if** the agent actually edits files outside its worktree.
+
+### Linux
+
+1. **Python 3.10+ with pip** — `sudo apt install python3 python3-pip` (or your distro's package manager).
+2. **Install aGiTrack:**
+   ```bash
+   pip3 install agitrack
+   ```
+   If pip refuses with an "externally-managed-environment" error ([PEP 668](https://peps.python.org/pep-0668/)), use [`pipx`](https://pipx.pypa.io) instead:
+   ```bash
+   pipx install agitrack
+   ```
+3. **Prerequisites** — git (required), a backend (Claude Code **or** OpenCode), and optionally `gh`:
+   ```bash
+   sudo apt install git    # (or your package manager)
+   curl -fsSL https://claude.ai/install.sh | bash   # Claude Code …
+   npm install -g opencode-ai                        # … or OpenCode
+   sudo apt install gh     # optional
+   ```
+
+### Local development
+
+From a checkout (with `pip` already installed), do an **editable install** — this puts the `agitrack` command on your PATH, so you launch it directly as `agitrack`:
+
+```bash
+pip install -e .
+```
+
+(If your Python is externally managed, use `pipx install -e .` instead.)
+
+---
+
+**aGiTrack can set up its prerequisites for you.** On an interactive launch it offers to install whatever's missing, then makes sure git can commit:
+
+- **A backend** — first run lists the backends and offers to install any that are missing (official installer on macOS/Linux, npm everywhere, bootstrapping Node via winget on Windows when needed).
+- **git and `gh`** — offered via your platform's package manager (winget on Windows, Homebrew on macOS, your distro manager on Linux).
+- **git identity** — if `user.name`/`user.email` aren't set (commits fail without them), it prompts you and saves them.
+- **`gh` sign-in** — if `gh` is installed but not signed in, it offers to run `gh auth login`.
+
+Anything it installs is added to the current session's `PATH`, so it works right away. After installing tools by hand, open a **new terminal** so the updated `PATH` is picked up; aGiTrack also prints these per-OS hints at startup when something's missing.
 
 ### VS Code extension
 
@@ -298,6 +355,7 @@ aGiTrack keeps itself current. On startup, and then about every five minutes whi
 
 - **Source-linked install** (the editable `pip install -e .` from a git checkout): it compares three commit hashes — the one the **running** process loaded, the checkout's **local** `HEAD`, and the **remote** target's tip — and offers an update whenever either the local disk or the remote carries newer code. The remote target is the current branch's upstream, or, when the branch tracks nothing (aGiTrack runs on session worktree branches), `origin`'s default branch. When you pick `update` from the menu it runs a **fresh** check on the spot, so a teammate's push or a just-pulled local update is reflected immediately rather than waiting for the next periodic check.
 - **Package install** (a wheel from a package index): it compares the installed version with the latest published one.
+- **Windows MSI install** (the standalone installer above): it checks the [GitHub releases](https://github.com/core-aix/agitrack/releases/latest) for a newer `agitrack-<version>-windows-x64.msi`, downloads it, and re-runs the installer. Because the MSI replaces the running `agitrack.exe`, the install happens through an elevated helper after aGiTrack exits — you'll see a **UAC prompt** (and, since the MSI is unsigned, possibly a SmartScreen warning to *Run anyway*); accept it and aGiTrack reinstalls and relaunches itself with your original options. Decline the prompt and you simply stay on the current version, with a reminder to update manually.
 
 If an update exists, aGiTrack prompts you at startup and shows a notice during a session (run the `update` command from the `Ctrl-G` menu to act on it). When you accept, aGiTrack waits until **every session has finished and all commits are integrated**, installs the update, then restarts itself automatically. It never interrupts a merge: while any session is resolving a merge/conflict, the notice is held back and an accepted update is deferred until the merge is done. A source update **merges** the upstream branch into the checkout — a clean checkout fast-forwards and a diverged one (your own commits, or aGiTrack's session integrations) gets a normal merge — so it pulls in new code without discarding local work; if the checkout has uncommitted changes it's skipped with a message, and if the merge hits a genuine conflict aGiTrack aborts it (leaving the source clean) and tells you automatic update isn't possible until you resolve it. When only the running process is behind the on-disk code, no download happens — aGiTrack just restarts to load it. Choose "Stop checking for updates" — or set `"check_for_updates": false` in `~/.agitrack/config.json` — to turn the checks off; tune the cadence with `timings.update_check_seconds`.
 
@@ -311,6 +369,25 @@ Show aGiTrack diagnostic messages:
 ```bash
 agitrack --verbose
 ```
+
+### Debugging / diagnostic logs
+
+When something in the terminal misbehaves — stray escape codes, input not registering, a hang on a menu or session switch — aGiTrack can write detailed diagnostic logs. Two opt-in environment switches turn them on (off by default; they work the same on macOS, Linux, and Windows):
+
+- **`DEBUG_PROXY`** — a human-readable event log: keystrokes/commands as they're parsed, backend spawn/switch/restart, session lifecycle, and an idle heartbeat. (`--verbose` turns this on too.)
+- **`DEBUG_RAW`** — a byte-exact capture of everything read from the keyboard and written to the terminal, for replaying an interactive glitch precisely. It also enables `DEBUG_PROXY`.
+
+```bash
+# macOS / Linux (bash/zsh) — one run:
+DEBUG_RAW=1 agitrack
+```
+
+```powershell
+# Windows (PowerShell) — set it in the same terminal that launches aGiTrack:
+$env:DEBUG_RAW = "1"; agitrack
+```
+
+The logs are written to your **target repo**'s `.agitrack/` folder, one pair per run: `proxy-debug-<timestamp>.log` and `proxy-raw-<timestamp>.log`. When reporting a problem, attach the newest pair. (The switches are also accepted as `AGITRACK_DEBUG_RAW` / `AGITRACK_DEBUG_PROXY`. Full details for contributors are in `AGENTS.md` → "Diagnostics & Debugging".)
 
 Review each turn before it merges, instead of integrating automatically:
 
