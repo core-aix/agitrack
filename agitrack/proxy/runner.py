@@ -5835,9 +5835,10 @@ class ProxyRunner:
         # lands in the base without waiting to be switched to. A background
         # session whose finished turn cannot fast-forward is brought to the
         # foreground and its resolve options box is surfaced (session + backend).
+        now = time.monotonic()
+        self._debug_session_liveness(now)
         if self.merge_ctx is not None:
             return
-        now = time.monotonic()
         for index in range(len(self.sessions)):
             if index == self.active_index:
                 continue
@@ -6784,6 +6785,31 @@ class ProxyRunner:
     def _drain_child_output(self) -> bytes | None:
         # Delegate to the session-owned BackendProcess for the bounded PTY read loop.
         return self.active.process.drain()
+
+    def _debug_session_liveness(self, now: float) -> None:
+        # (debug-gated, throttled) Snapshot every session's backend + whether its child
+        # process is still alive, to proxy-debug. Diagnoses reports of a session silently
+        # stopping while backgrounded ("Claude stops after I switch away"): the log then shows
+        # exactly which session's process exited and when. Only the active session is skipped
+        # (left as "active") so poll() never disturbs the foreground backend.
+        if not self.debug_proxy:
+            return
+        if now - getattr(self, "_dbg_liveness_at", 0.0) < 5.0:
+            return
+        self._dbg_liveness_at = now
+        parts = []
+        for index, session in enumerate(self.sessions):
+            backend = getattr(getattr(session, "backend", None), "name", "?")
+            if index == self.active_index:
+                state = "active"
+            else:
+                proc = getattr(session, "process", None)
+                try:
+                    state = "exited" if (proc is not None and proc.poll() is not None) else "alive"
+                except Exception:
+                    state = "err"
+            parts.append(f"{index}:{backend}:{state}")
+        self._debug("session liveness " + " ".join(parts))
 
     def _diag_path(self, kind: str):
         # Diagnostic logs live in the *base* repo's .agitrack/ (one file per run), not
