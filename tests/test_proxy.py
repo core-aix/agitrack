@@ -7569,6 +7569,31 @@ def test_sync_terminal_modes_skips_kitty_on_unsupported_host(monkeypatch):
     assert b"\x1b[>4;0m" in writes
 
 
+def test_sync_terminal_modes_windows_drops_hover_motion_keeps_drag(monkeypatch):
+    # On Windows the host floods 1003 (any-event/hover) motion that doesn't round-trip cleanly
+    # and leaks into the backend as literal `[<35;..M` text. Mirror 1002 (button-event/drag, for
+    # drag-select copy), button (1000), and SGR (1006), but NOT 1003. POSIX mirrors all.
+    import agitrack.proxy.runner as proxy_mod
+
+    backend_modes = b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h"
+
+    runner = make_runner(child_mouse=False)
+    writes: list[bytes] = []
+    monkeypatch.setattr(proxy_mod.os, "write", lambda fd, data: writes.append(data))
+
+    monkeypatch.setattr(proxy_mod.os, "name", "nt")
+    runner._sync_terminal_modes(backend_modes)
+    assert b"\x1b[?1000h" in writes  # button mirrored
+    assert b"\x1b[?1002h" in writes  # drag mirrored (copy works)
+    assert b"\x1b[?1006h" in writes  # SGR mirrored
+    assert b"\x1b[?1003h" not in writes  # hover NOT mirrored (the flood/leak)
+
+    writes.clear()
+    monkeypatch.setattr(proxy_mod.os, "name", "posix")
+    runner._sync_terminal_modes(backend_modes)
+    assert b"\x1b[?1003h" in writes  # POSIX mirrors hover too (no leak there)
+
+
 def test_disable_host_terminal_modes_pops_kitty_only_when_supported(monkeypatch):
     import agitrack.proxy.runner as proxy_mod
 
