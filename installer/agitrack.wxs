@@ -116,12 +116,27 @@
       <Files Include="$(var.SourceDir)\**" />
     </ComponentGroup>
 
+    <!--
+      The MSI self-update bootstrapper. It is committed in the repo (not part of the
+      PyInstaller output), so install it explicitly from this .wxs's own directory
+      ($(sys.SOURCEFILEDIR)). It lands next to agitrack.exe in INSTALLFOLDER and is
+      updated by the same MSI that updates the rest of the install. See
+      agitrack/proxy/runner.py:_launch_msi_bootstrapper and docs/design/msi-self-update.md.
+    -->
+    <ComponentGroup Id="UpdaterComponents" Directory="INSTALLFOLDER">
+      <Component Id="UpdaterBootstrapper" Guid="C7F0A2E1-9D3B-4A6C-8E25-3F1B0D9A4C77">
+        <File Id="AgitrackUpdateCmd" Source="$(sys.SOURCEFILEDIR)agitrack-update.cmd" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
     <!-- ================================================================ -->
     <!-- Feature tree                                                        -->
     <!-- ================================================================ -->
     <Feature Id="Main" Title="aGiTrack" Level="1">
       <!-- All harvested PyInstaller output files -->
       <ComponentGroupRef Id="AgitrackFiles" />
+      <!-- MSI self-update bootstrapper -->
+      <ComponentGroupRef Id="UpdaterComponents" />
       <!-- PATH entry -->
       <ComponentGroupRef Id="PathComponents" />
       <!-- Start Menu shortcut -->

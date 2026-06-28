@@ -147,6 +147,64 @@ def terminate_pid(pid: int) -> None:
         pass
 
 
+def shell_execute_runas(file: str, params: str = "") -> None:
+    """Launch *file* elevated via UAC (the shell's ``runas`` verb). Windows-only.
+
+    This is the only Windows-native way for an UN-elevated process to obtain an
+    elevated child without a separate always-admin helper — the same pattern VS Code,
+    Slack, and GitHub Desktop use to hand a perMachine installer off to ``msiexec``.
+    ``ShellExecuteExW`` shows the UAC consent dialog; the elevated process is launched
+    only if the user accepts.
+
+    Raises :class:`NotImplementedError` off Windows, and :class:`OSError` when the
+    launch fails — including when the user declines the UAC prompt
+    (``ERROR_CANCELLED`` = 1223) — so the caller can fall back (e.g. keep running the
+    current version and remind the user to update manually).
+    """
+    if not _IS_WINDOWS:
+        raise NotImplementedError("shell_execute_runas is Windows-only")
+    import ctypes
+    from ctypes import wintypes
+
+    class _SHELLEXECUTEINFOW(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD),
+            ("fMask", ctypes.c_ulong),
+            ("hwnd", wintypes.HWND),
+            ("lpVerb", wintypes.LPCWSTR),
+            ("lpFile", wintypes.LPCWSTR),
+            ("lpParameters", wintypes.LPCWSTR),
+            ("lpDirectory", wintypes.LPCWSTR),
+            ("nShow", ctypes.c_int),
+            ("hInstApp", wintypes.HINSTANCE),
+            ("lpIDList", ctypes.c_void_p),
+            ("lpClass", wintypes.LPCWSTR),
+            ("hkeyClass", wintypes.HKEY),
+            ("dwHotKey", wintypes.DWORD),
+            ("hIconOrMonitor", wintypes.HANDLE),
+            ("hProcess", wintypes.HANDLE),
+        ]
+
+    SEE_MASK_NOCLOSEPROCESS = 0x00000040
+    SEE_MASK_NOASYNC = 0x00000100  # complete the operation before returning
+    SW_SHOWNORMAL = 1
+
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    shell32.ShellExecuteExW.argtypes = [ctypes.POINTER(_SHELLEXECUTEINFOW)]
+    shell32.ShellExecuteExW.restype = wintypes.BOOL
+
+    info = _SHELLEXECUTEINFOW()
+    info.cbSize = ctypes.sizeof(_SHELLEXECUTEINFOW)
+    info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC
+    info.lpVerb = "runas"
+    info.lpFile = file
+    info.lpParameters = params
+    info.nShow = SW_SHOWNORMAL
+    if not shell32.ShellExecuteExW(ctypes.byref(info)):
+        err = ctypes.get_last_error()
+        raise OSError(f"ShellExecuteExW(runas) failed for {file!r} (Windows error {err})")
+
+
 def _windows_pid_alive(pid: int) -> bool:
     import ctypes
     from ctypes import wintypes

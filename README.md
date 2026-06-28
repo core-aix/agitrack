@@ -7,7 +7,7 @@ You can use either **OpenCode** or **Claude (Claude Code)** as the AI agent — 
 
 ## Requirements
 
-aGiTrack runs on **macOS, Linux, and natively on Windows** (PowerShell / Windows Terminal — no WSL required; WSL still works too). It works in the common terminal apps (iTerm2, Apple Terminal, Alacritty, kitty, GNOME Terminal, Konsole, tmux, the VS Code terminal, and Windows Terminal); on a terminal that lacks some advanced features, it still works, just with fewer visual frills. On Windows it drives the agent through a pseudo-console (ConPTY); the sandbox that confines agent writes is macOS/Linux-only, so on Windows the agent runs unconfined (a warning is shown).
+aGiTrack runs on **macOS, Linux, and natively on Windows** (PowerShell / Windows Terminal — no WSL required; WSL still works too). It works in the common terminal apps (iTerm2, Apple Terminal, Alacritty, kitty, GNOME Terminal, Konsole, tmux, the VS Code terminal, and Windows Terminal); on a terminal that lacks some advanced features, it still works, just with fewer visual frills. On Windows it drives the agent through a pseudo-console (ConPTY); the sandbox that confines agent writes is macOS/Linux-only, so on Windows the agent runs unconfined (aGiTrack instead warns if the agent edits the base repo outside its worktree).
 
 You need **git** and at least one AI agent — [Claude Code](https://docs.claude.com/en/docs/claude-code) or [OpenCode](https://opencode.ai) — installed and on your `PATH`. The dashboard can also use the **GitHub CLI (`gh`)** to show each commit's author by their GitHub username: install it from [cli.github.com](https://cli.github.com) and run `gh auth login`. `gh` is optional — without it, the dashboard still works and just groups authors by email instead.
 
@@ -35,13 +35,29 @@ python3 -m pip install -e .
 
 ### Windows (native — no WSL)
 
-`pip install agitrack` works natively on Windows (PowerShell / Windows Terminal). It automatically pulls in **`pywinpty`** (a prebuilt wheel — no C/Rust compiler needed) to drive the agent through a pseudo-console (ConPTY). Notes:
+aGiTrack runs natively on Windows (PowerShell / Windows Terminal — WSL not required). There are **two ways to install it**; pick whichever fits:
 
-- **Check Python/pip first:** `py -m pip --version`. No Python? `winget install Python.Python.3.12` (tick *Add to PATH*).
+**1. With Python — `pip` (or `pipx`).** If you have Python 3.10+:
+
+```powershell
+pip install agitrack
+```
+
+This pulls in **`pywinpty`** automatically (a prebuilt wheel — no C/Rust compiler needed) to drive the agent through a pseudo-console (ConPTY). Notes:
+
+- **Check Python/pip first:** `py -m pip --version`. No Python? `winget install Python.Python.3.12` (tick *Add to PATH*) — or use the MSI below instead.
 - **`agitrack` not found after install?** Your Python `Scripts` dir isn't on PATH. Run it as `py -m agitrack`, or install with **pipx** (`pipx install agitrack`), which puts it on PATH for you.
-- The write-confinement **sandbox is macOS/Linux-only**, so on Windows the agent runs unconfined (aGiTrack shows a one-time warning).
 
-**No Python? Use the standalone MSI installer.** Each release ships a self-contained Windows installer — `agitrack-<version>-windows-x64.msi` — attached to the [GitHub release](https://github.com/core-aix/agitrack/releases/latest). It bundles its own Python (built with PyInstaller), so it installs and runs `agitrack` on a machine with **no Python or pip at all**: download it, double-click, and `agitrack` is added to your PATH under `C:\Program Files\aGiTrack`. The [VS Code extension](editors/vscode/README.md) uses this same MSI automatically when it can't find pipx or pip. (The MSI is unsigned for now; if SmartScreen warns, choose *More info → Run anyway*.)
+**2. Without Python — the standalone MSI installer.** Each release ships a self-contained Windows installer that bundles its own Python (built with PyInstaller), so it installs and runs `agitrack` on a machine with **no Python or pip at all**.
+
+- **Where to get it:** download `agitrack-<version>-windows-x64.msi` from the latest GitHub release: **<https://github.com/core-aix/agitrack/releases/latest>** (under *Assets*).
+- **Install it:** double-click the `.msi`. `agitrack` is installed to `C:\Program Files\aGiTrack` and added to your PATH, so you can run `agitrack` from any terminal.
+- ⚠️ **Security warning — you must bypass it.** The MSI is **not code-signed yet** (we don't have a Windows code-signing certificate). Windows SmartScreen will therefore warn that the publisher is unknown. This is expected — to proceed, click **More info → Run anyway** (and accept the UAC prompt). Code-signing is planned so this step goes away in a future release.
+- The [VS Code extension](editors/vscode/README.md) uses this same MSI automatically when it can't find pipx or pip.
+
+Both install methods **keep themselves up to date** (the MSI re-downloads and reinstalls the latest release; pip/pipx upgrade the package) — see [Self-update](#self-update).
+
+> The write-confinement **sandbox is macOS/Linux-only**. On Windows the agent runs unconfined; instead of blocking writes, aGiTrack watches the base repository and warns you only **if** the agent actually edits files outside its worktree.
 
 ### Prerequisites — git and a backend (macOS · Linux · Windows)
 
@@ -309,6 +325,7 @@ aGiTrack keeps itself current. On startup, and then about every five minutes whi
 
 - **Source-linked install** (the editable `pip install -e .` from a git checkout): it compares three commit hashes — the one the **running** process loaded, the checkout's **local** `HEAD`, and the **remote** target's tip — and offers an update whenever either the local disk or the remote carries newer code. The remote target is the current branch's upstream, or, when the branch tracks nothing (aGiTrack runs on session worktree branches), `origin`'s default branch. When you pick `update` from the menu it runs a **fresh** check on the spot, so a teammate's push or a just-pulled local update is reflected immediately rather than waiting for the next periodic check.
 - **Package install** (a wheel from a package index): it compares the installed version with the latest published one.
+- **Windows MSI install** (the standalone installer above): it checks the [GitHub releases](https://github.com/core-aix/agitrack/releases/latest) for a newer `agitrack-<version>-windows-x64.msi`, downloads it, and re-runs the installer. Because the MSI replaces the running `agitrack.exe`, the install happens through an elevated helper after aGiTrack exits — you'll see a **UAC prompt** (and, since the MSI is unsigned, possibly a SmartScreen warning to *Run anyway*); accept it and aGiTrack reinstalls and relaunches itself with your original options. Decline the prompt and you simply stay on the current version, with a reminder to update manually.
 
 If an update exists, aGiTrack prompts you at startup and shows a notice during a session (run the `update` command from the `Ctrl-G` menu to act on it). When you accept, aGiTrack waits until **every session has finished and all commits are integrated**, installs the update, then restarts itself automatically. It never interrupts a merge: while any session is resolving a merge/conflict, the notice is held back and an accepted update is deferred until the merge is done. A source update **merges** the upstream branch into the checkout — a clean checkout fast-forwards and a diverged one (your own commits, or aGiTrack's session integrations) gets a normal merge — so it pulls in new code without discarding local work; if the checkout has uncommitted changes it's skipped with a message, and if the merge hits a genuine conflict aGiTrack aborts it (leaving the source clean) and tells you automatic update isn't possible until you resolve it. When only the running process is behind the on-disk code, no download happens — aGiTrack just restarts to load it. Choose "Stop checking for updates" — or set `"check_for_updates": false` in `~/.agitrack/config.json` — to turn the checks off; tune the cadence with `timings.update_check_seconds`.
 
