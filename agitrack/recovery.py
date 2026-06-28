@@ -141,10 +141,16 @@ class RecoveryService:
                 # Aborted / in-flight / nothing committable — leave it untouched.
                 report.flagged.append(info.name)
                 return
-        # The worktree is now clean (or was already): integrate committed work
-        # into the base and remove the worktree. cleanup_stale_worktree skips
-        # (returns False) on a dirty tree or a merge conflict.
+        # The worktree is now clean (or was already): integrate committed work into the
+        # base. cleanup_stale_worktree skips (returns False) on a dirty tree or a merge
+        # conflict. `--recover` is an explicit, offline cleanup of a crashed run, so it
+        # then REMOVES the integrated worktree (unlike the live reconcile, which keeps
+        # worktrees so they can be resumed).
         if integration.cleanup_stale_worktree(info, manager):
+            try:
+                manager.remove(info.name)
+            except Exception as error:
+                self._debug(f"recover: removing integrated worktree '{info.name}' failed: {error!r}")
             report.integrated.append(info.name)
         elif info.name not in report.flagged:
             report.flagged.append(info.name)

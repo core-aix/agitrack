@@ -86,7 +86,7 @@ def test_only_hidden_or_scaffolding_changed_prompts_nothing(tmp_path):
     assert prompted == []  # nothing offered, so no popup at all
 
 
-def test_decline_notice_gives_worktree_path_and_deletion_warning(tmp_path):
+def test_decline_notice_gives_worktree_path(tmp_path):
     runner, base_dir, wt_dir, messages = _session_with_worktree(tmp_path)
     (wt_dir / "keep.txt").write_text("x\n", encoding="utf-8")
     runner._select_popup = lambda title, opts, **k: "No, leave them in the worktree"
@@ -96,8 +96,7 @@ def test_decline_notice_gives_worktree_path_and_deletion_warning(tmp_path):
     assert not (base_dir / "keep.txt").exists()  # left where it was
     notice = messages[-1]
     assert str(wt_dir) in notice  # the worktree path is spelled out for the user
-    assert "removed when aGiTrack exits" in notice  # and the deletion warning is present
-    assert "**" in notice  # the removal warning is marked bold for emphasis
+    assert "kept across runs" in notice  # worktrees persist, so the files stay available
 
 
 def test_overwrite_is_confirmed_before_replacing_base_files(tmp_path):

@@ -490,10 +490,14 @@ class IntegrationService:
         info,
         worktree_manager: WorktreeManager,
     ) -> bool:
-        """Integrate a dormant worktree's pending commits and delete it.
+        """Integrate a dormant worktree's pending commits into the base, KEEPING the
+        worktree directory (worktrees are persistent — the environment copied into them and
+        any leftover files are preserved for a later resume).
 
-        Returns False (keep + flag) when it has uncommitted changes or its work
-        conflicts with the base and needs manual resolution.
+        Returns True when the worktree is fully reconciled (its commits, if any, are now in
+        the base), False (keep + flag) when it has uncommitted changes or its work conflicts
+        with the base and needs manual resolution. ``worktree_manager`` is retained for the
+        call signature though the directory is no longer removed here.
         """
         repo = GitRepo(info.path)
         if repo.merge_in_progress() or repo.has_changes():
@@ -504,7 +508,6 @@ class IntegrationService:
                 repo.merge_abort()
                 return False
             self.base_repo.merge_ff_only(branch)
-        worktree_manager.remove(info.name)
         return True
 
     def delete_orphan_merged_branches(self) -> list[str]:

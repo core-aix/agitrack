@@ -12,6 +12,7 @@ import shutil
 import signal
 import subprocess
 import sys
+from pathlib import Path
 from types import FrameType
 from typing import Any, Callable, cast
 import threading
@@ -800,6 +801,10 @@ class ProxyRunner:
         self._pending_copy_offer: tuple[str, tuple[list[str], list[tuple[str, tuple[int, int]]], set[str]]] | None = (
             None
         )
+        # Deferred "the base repo has newer files — overwrite the worktree's older copies?"
+        # prompts: (worktree path, repo-relative paths) queued when a worktree is reopened
+        # (possibly before the UI is up) and presented by the loop. See _refresh_worktree_from_base.
+        self._pending_env_refresh: list[tuple[Path, list[str]]] = []
         # Settings-menu scratch: edits collected as pending changes (each with its chosen
         # scope) and written only when the user confirms "save" on the way out.
         self._settings_pending: dict[str, tuple[object, str, bool]] = {}
@@ -847,6 +852,9 @@ class ProxyRunner:
         self._switch_offer_parse_started = False
         self._exiting = False
         self._finalized_on_exit = False
+        # The exit-time "delete this run's worktrees or keep them?" decision, asked once and
+        # applied to every session (None = not yet asked). See _should_delete_worktrees_on_exit.
+        self._exit_delete_worktrees: bool | None = None
         # Set when the user presses Esc on the on-exit copy offer: aborts the in-progress
         # exit so they can deal with the worktree files themselves (see _run_exit_flow).
         self._exit_aborted = False
@@ -1092,6 +1100,8 @@ class ProxyRunner:
                 "_copy_prompted": {},
                 "_copy_declined": set(),
                 "_pending_copy_offer": None,
+                "_pending_env_refresh": [],
+                "_exit_delete_worktrees": None,
                 "_settings_pending": {},
                 "_settings_pending_timings": {},
                 "_full_agent_messages": False,
@@ -2803,22 +2813,22 @@ class ProxyRunner:
         if not self._use_worktrees:
             # #9: opt-out — run on the current branch directly (worktree stays
             # None; all the `worktree is None` paths commit straight to it).
-            # Worktrees are off, so any session worktrees left by a previous worktree-mode run
-            # are dead weight — remove them (their committed work was already integrated into
-            # the base branch). Best-effort; a removal failure must not block startup.
-            removed = 0
-            try:
-                manager = self._worktrees()
-                for info in manager.list():
-                    manager.remove(info.name)
-                    removed += 1
-            except Exception as error:
-                self._debug(f"no-worktree cleanup failed: {error!r}")
-            note = f" Removed {removed} leftover worktree(s)." if removed else ""
+            # A session that last ran in a worktree shouldn't be abandoned just because the
+            # user switched off worktrees: adopt the most recent prior worktree session's
+            # conversation as the resume target so it continues HERE in the base repo. run()'s
+            # startup staging (_stage_backend_resume) retargets that transcript's recorded cwd
+            # to the base directory, so it resumes in the right place. The leftover worktree
+            # DIRECTORIES are kept — switching back to worktree mode later resumes them in place
+            # (the user can delete them by hand if they want the space back).
+            if not self._force_new_session and not self.state.backend_session_id:
+                resumed = self._newest_worktree_session_id()
+                if resumed:
+                    self.state.backend_session_id = resumed
+                    self._debug(f"--no-worktree: resuming prior worktree session {resumed} in the base repo")
             self._set_message(
                 "Running without a worktree: the agent edits this branch directly (visible live), "
                 "but there's no isolation or auto-integration. Extra sessions started this way share "
-                "this directory and edit the same files at once." + note,
+                "this directory and edit the same files at once.",
                 seconds=12.0,
             )
             # Anchor the no-worktree cover scan at the branch's current HEAD so commits the agent
@@ -2870,6 +2880,31 @@ class ProxyRunner:
             self.state.backend_session_id = resume_id  # setter records this worktree as its repo
         self.backend = make_proxy_agent(backend_name)
         self.actions = AgitrackActions(self.repo, self.state, verbose=self.verbose)
+
+    def _newest_worktree_session_id(self) -> str | None:
+        """The backend conversation id of the most recently active leftover worktree
+        session — the one a ``--no-worktree`` start should continue in the base repo. Picks
+        the worktree whose state file was written last (the session the user worked in most
+        recently). Returns None when there are no worktrees or none has a recorded session."""
+        best_id: str | None = None
+        best_mtime = -1.0
+        try:
+            infos = self._worktrees().list()
+        except Exception as error:
+            self._debug(f"newest-worktree scan failed: {error!r}")
+            return None
+        for info in infos:
+            try:
+                state = AgitrackState(info.path, default_backend=self.global_config.default_backend)
+                sid = state.backend_session_id
+                if not sid:
+                    continue
+                mtime = state.path.stat().st_mtime if state.path.exists() else 0.0
+                if mtime > best_mtime:
+                    best_mtime, best_id = mtime, sid
+            except Exception as error:
+                self._debug(f"newest-worktree scan skipped '{getattr(info, 'name', '?')}': {error!r}")
+        return best_id
 
     _AUTO_NAME_RE = re.compile(r"^session-\d+$")
 
@@ -3048,12 +3083,11 @@ class ProxyRunner:
             self._debug(f"startup cleanup failed: {error!r}")
 
     def _reconcile_sessions_on_startup(self) -> None:
-        # Clean up worktrees left by previous runs: integrate any pending commits
-        # into the base, then delete the worktree. The Claude conversation itself
-        # persists (keyed by the worktree path) and stays resumable from the
-        # session list, so nothing of value is lost. Worktrees whose work cannot
-        # be merged cleanly (a conflict, or uncommitted changes) are kept and
-        # flagged for the user to resolve.
+        # Reconcile worktrees left by previous runs: integrate any pending commits
+        # into the base. The worktree DIRECTORIES are kept (worktrees are persistent
+        # now — their environment and any leftover files survive across runs and stay
+        # resumable from the session list). Worktrees whose work cannot be merged
+        # cleanly (a conflict, or uncommitted changes) are flagged for the user to resolve.
         if self.worktree is None:
             return
         active_pending = False
@@ -6128,6 +6162,12 @@ class ProxyRunner:
         path = worktrees.worktree_path(name)
         if self._is_valid_worktree(path):
             repo = GitRepo(path)
+            # Reusing a persistent worktree from a previous run: bring its environment back in
+            # sync with the base. Newly-added base files (untracked/ignored the base gained
+            # since) are copied in silently; files the base now has a NEWER copy of are queued
+            # for a "overwrite the worktree's older copies?" prompt the loop surfaces (we may be
+            # mid-startup with no UI yet, so it's deferred rather than shown inline).
+            self._refresh_worktree_from_base(worktrees, path)
             return WorktreeInfo(name=path.name, path=path, branch=repo.current_branch()), repo
         # A leftover, *invalid* dir (e.g. only `.agitrack/` recreated by a write after
         # the previous run tore the worktree down) would otherwise make GitRepo
@@ -6140,6 +6180,41 @@ class ProxyRunner:
         base = base_branch or self._base_branch or self.base_repo.current_branch()
         info = worktrees.create(name, base=base)
         return info, GitRepo(info.path)
+
+    def _refresh_worktree_from_base(self, worktrees: WorktreeManager, path) -> None:
+        """Re-sync a reused worktree with the base environment: copy in any base files it is
+        missing (silently — additions are safe), and queue an overwrite prompt for base files
+        that are newer than the worktree's copy. Best-effort: a sync failure must never block
+        opening the worktree."""
+        try:
+            worktrees.copy_base_environment(path)  # additions only (skips files already present)
+            newer = worktrees.base_newer_entries(path)
+        except Exception as error:
+            self._debug(f"worktree env refresh failed for {path}: {error!r}")
+            return
+        if newer:
+            self._pending_env_refresh.append((path, newer))
+
+    def _present_pending_env_refresh(self) -> None:
+        """Main thread: surface any deferred "base has newer files — overwrite the worktree's
+        older copies?" prompts queued while a worktree was reopened (possibly before the UI was
+        up). One prompt per worktree; declining keeps the worktree's versions."""
+        while self._pending_env_refresh:
+            dest, rels = self._pending_env_refresh.pop(0)
+            try:
+                choice = self._select_popup(
+                    f"The base repo has {len(rels)} file(s) newer than this session's worktree "
+                    f"({dest}). Overwrite the worktree's older copies with the base versions?\n\nFile(s):",
+                    ["No, keep the worktree versions", "Yes, update from the base repo"],
+                    detail=rels,
+                )
+            except Exception as error:
+                self._debug(f"env-refresh prompt failed: {error!r}")
+                continue
+            if choice and choice.startswith("Yes"):
+                count = self._worktrees().copy_entries(dest, rels)
+                self._set_message(f"Updated {count} file(s) in the worktree from the base repo.", seconds=6.0)
+                self._render()
 
     def _is_valid_worktree(self, path) -> bool:
         # A real linked worktree has a `.git` file pointing at its gitdir and a
@@ -6994,6 +7069,7 @@ class ProxyRunner:
         self._flush_pending_enter()
         self._drain_modal_mailbox()  # present any dialog the git worker queued
         self._present_pending_copy_offer()  # the turn's "copy stranded files?" popup, if any
+        self._present_pending_env_refresh()  # "base has newer files — update the worktree?" popup
         self._resume_pending_prompt_if_ready()
         self._service_shared_resume()  # complete a shared-session resume once fetched
         # Background / multi-session git (these swap self.active via _with_session, so
@@ -9059,6 +9135,10 @@ class ProxyRunner:
         # auto-resume next start — not necessarily the primary (they may have
         # switched to a new or shared session). It is finalized first, below.
         self._exit_resume_worktree = getattr(self.worktree, "name", None)
+        # Decide keep-vs-delete for this run's worktrees ONCE, now, in the genuine active
+        # context (before any per-session swap) so the prompt reflects the real foreground
+        # screen and is asked a single time for the whole exit.
+        self._should_delete_worktrees_on_exit()
         self._commit_latest_turn_sync()  # active session, in place
         self._auto_share_on_exit()  # push the latest conversation if auto-shared
         self._finalize_summary_then_integrate_on_exit()
@@ -9098,7 +9178,7 @@ class ProxyRunner:
         self._integrate_session_on_exit()
         if self._exit_aborted:
             return  # Esc on a finalize popup (e.g. a merge prompt) aborted the exit — keep the worktree
-        self._remove_worktree_on_exit()
+        self._finalize_worktree_on_exit()
 
     def _adopt_latest_backend_session(self) -> None:
         # The user may have switched conversations inside the backend itself (e.g.
@@ -9181,83 +9261,104 @@ class ProxyRunner:
         # terminate() nulls the fd/pid on the session-owned process in place.
         self.active.process.terminate()
 
-    def _remove_worktree_on_exit(self) -> None:
-        # On exit, drop a fully-merged session's worktree so directories do not
-        # pile up across runs. A session whose work could not be integrated
-        # (conflict, uncommitted changes, or commits still ahead of the base)
-        # keeps its worktree so the next startup can surface it. The backend
-        # conversation persists (keyed by the worktree path) and is recreated if
-        # the session is resumed, so nothing of value is lost.
+    def _should_delete_worktrees_on_exit(self) -> bool:
+        """Ask once per exit whether to delete this run's session worktrees or keep them,
+        spelling out their exact on-disk locations so the user can find them either way. The
+        answer is cached and applied to every session's worktree. Defaults to KEEP — on a
+        signal teardown (terminal/window close: no UI), and on Esc — so a close never silently
+        deletes a session's environment or work-in-progress."""
+        if self._exit_delete_worktrees is not None:
+            return self._exit_delete_worktrees
+        # The exact directories the decision applies to (every live session that has one).
+        listing: list[str] = []
+        for session in self.sessions:
+            wt = getattr(session, "worktree", None)
+            if wt is not None and getattr(wt, "path", None) is not None:
+                listing.append(str(wt.path))
+        if not listing and self.worktree is not None:
+            listing = [str(self.worktree.path)]
+        if not listing:
+            # No worktrees this run (e.g. --no-worktree): nothing to decide, don't prompt.
+            self._exit_delete_worktrees = False
+            return False
+        if self.screen is None:
+            self._exit_delete_worktrees = False
+            return False
+        choice = self._select_popup(
+            "Delete this run's session worktree(s) on exit, or keep them for next time?\n"
+            "Keeping preserves each session's full environment and any work-in-progress so it "
+            "resumes instantly next time; deleting reclaims the disk (committed work has already "
+            "been integrated into your branch). The worktree(s) are at:\n\nLocation(s):",
+            ["Keep them", "Delete them"],
+            detail=listing,
+        )
+        self._exit_delete_worktrees = choice == "Delete them"  # Esc / "Keep them" → keep
+        return self._exit_delete_worktrees
+
+    def _finalize_worktree_on_exit(self) -> None:
+        # On exit aGiTrack asks (once) whether to KEEP this run's session worktrees — preserving
+        # each one's full environment and work-in-progress for an instant resume — or DELETE them
+        # to reclaim disk. Either way we first persist the resume pointer. When keeping, we only
+        # offer to copy newer/leftover worktree files into the base. When deleting, a worktree is
+        # removed only once it is safe (fully merged, its files rescued via the copy offer);
+        # unintegrated or unresolvable work keeps its worktree regardless of the choice.
         info = self.worktree
         if info is None or self._base_branch is None:
             return
-        # Persist the resume pointer FIRST — before deciding whether the worktree
-        # can be removed. _persist_last_session_record runs _adopt_latest_backend_session,
-        # which captures a conversation the user switched to inside the backend's
-        # own picker (Claude's session view). Gating it behind a clean worktree
-        # removal meant a session that still had uncommitted or unintegrated work —
-        # the usual state right after a mid-work switch — never updated its resume
-        # pointer, so the next start resumed a stale conversation and only the start
-        # after that landed on the right one (the "first restart starts fresh,
-        # second restart resumes it" off-by-one). Adopting writes both the worktree
-        # state (used when the worktree is kept) and the repo-root state (used when
-        # it is removed), so the right conversation resumes either way.
-        #
-        # Persist for the session the user was actually in when they quit (set in
-        # _finalize_pending_work), so quitting from a freshly-started or resumed
-        # *shared* session auto-resumes THAT next start — not the original primary,
-        # which left the next start prompting for a brand-new session instead.
+        # Persist the resume pointer. _persist_last_session_record runs
+        # _adopt_latest_backend_session, which captures a conversation the user switched to
+        # inside the backend's own picker (Claude's session view), and writes both the
+        # worktree state and the repo-root "last session" record, so the right conversation
+        # auto-resumes next start. Persist for the session the user was actually in when they
+        # quit (set in _finalize_pending_work), so quitting from a freshly-started or resumed
+        # *shared* session auto-resumes THAT next start, not the original primary.
         if info.name == (self._exit_resume_worktree or self._primary_worktree_name):
             self._persist_last_session_record()
+        # Remember this session's conversation under its backend so switching back to that
+        # backend (this run or a later one) resumes it.
+        self._remember_session_for_backend()
+        if not self._should_delete_worktrees_on_exit():
+            # KEEP: just offer to copy the worktree's not-merged / newer files into the base repo
+            # so the user — who works in the base directory — has them too. Interactive only (a
+            # signal teardown has no UI, and nothing is being deleted, so there's nothing to
+            # rescue). Esc on the offer aborts the exit so the user can deal with the files first.
+            if self.screen is not None:
+                self._offer_copy_unstaged_to_base(context="exit")
+                if self._exit_aborted:
+                    return
+            return
+        # DELETE: only remove a worktree we can CONFIRM is fully contained in the base, so no
+        # unintegrated work is ever discarded. A merge in progress, commits still ahead of the
+        # base, or an unresolvable base ref → keep it (and let the next startup surface it).
         try:
             if self.merge_ctx or self.repo.merge_in_progress():
                 self._debug(f"keeping worktree '{info.name}' on exit: a merge is in progress")
                 return
-            # Uncommitted leftover FILES (untracked / git-ignored / files the user declined
-            # to stage) do NOT by themselves keep the worktree — they are exactly what the
-            # copy offer below handles, and a copy leaves the source in place, so refusing
-            # removal here is what left dirty worktrees stranded forever ("open end"). They
-            # only force us to keep the worktree on a *signal* teardown, where there's no UI
-            # to offer the copy and silently deleting the files would lose the user's work.
             has_leftover_files = self.repo.has_changes()
             branch = self.repo.current_branch()
             if is_managed_branch(branch):
-                # Only drop the worktree if we can CONFIRM its branch is fully
-                # contained in the base. If the base ref can't be resolved — e.g.
-                # the user deleted/renamed the branch aGiTrack integrates into while it
-                # was running — rev_parse raises and we keep the worktree (and its
-                # branch) rather than risk discarding unmerged work.
                 self.base_repo.rev_parse(self._base_branch)
                 if self.base_repo.log_range(self._base_branch, branch):
-                    self._debug(
-                        f"keeping worktree '{info.name}' on exit: '{branch}' still ahead of {self._base_branch}"
-                    )
-                    return  # commits still ahead of base → unintegrated; keep it
+                    self._debug(f"keeping worktree '{info.name}' on exit: '{branch}' still ahead of base")
+                    return
         except Exception as error:
             self._debug(f"keeping worktree '{info.name}' on exit: {error!r}")
             return
-        # The worktree (and any uncommitted/ignored files in it) is about to be deleted.
-        # Offer to copy those out first — but only on an interactive exit (Ctrl-G → exit),
-        # never a signal teardown (terminal/window close sets screen=None), where there is
-        # no UI to prompt with. The "exit" context warns that declining discards them.
+        # About to delete: rescue the worktree's uncommitted/ignored files first on an
+        # interactive exit (the "exit" copy offer warns deletion is permanent and Esc aborts).
+        # On a signal teardown there's no UI — keep a worktree that still has leftover files
+        # rather than silently losing the user's work.
         if self.screen is not None:
             self._offer_copy_unstaged_to_base(context="exit")
             if self._exit_aborted:
-                return  # Esc on the copy offer: keep this worktree + files, abort the exit
+                return
         elif has_leftover_files:
-            # Signal teardown with leftover files and no UI to rescue them: keep the
-            # worktree so the next startup can surface the files rather than discarding
-            # them. (An interactive exit just gave the user the copy offer above, so by
-            # here those files were handled and the worktree is safe to remove forcibly.)
             self._debug(f"keeping worktree '{info.name}' on signal exit: leftover files, no UI to copy them out")
             return
-        # Remember this session's conversation under its backend so switching back
-        # to that backend (this run or a later one) resumes it.
-        self._remember_session_for_backend()
         self._terminate_child()
         try:
             self._worktrees().remove(info.name)
-            self._debug(f"removed merged worktree '{info.name}' on exit")
+            self._debug(f"removed worktree '{info.name}' on exit (user chose delete)")
         except Exception as error:
             self._debug(f"exit worktree removal failed for '{getattr(info, 'name', '?')}': {error!r}")
         self.worktree = None
@@ -10168,7 +10269,8 @@ class ProxyRunner:
         # The file list is shown vertically (one per line, scrolls with PgUp/PgDn), led by
         # a "File(s):" line (set off with a blank line above it) so it's clear the message
         # refers to these names.
-        if on_exit:
+        deleting_worktree = on_exit and bool(self._exit_delete_worktrees)
+        if on_exit and deleting_worktree:
             title = (
                 f"This session's worktree ({wt_dir}) has {len(rels)} file(s) not in the base repo "
                 f"that will be DELETED when the worktree is removed on exit. Copy them into the base "
@@ -10176,6 +10278,15 @@ class ProxyRunner:
                 f"\nFile(s):"
             )
             options = ["No, discard them with the worktree", "Yes, copy to the base repo"]
+        elif on_exit:
+            title = (
+                f"This session's worktree ({wt_dir}) has {len(rels)} file(s) the base repo "
+                f"({base_dir}) doesn't have, or that are newer here. The worktree is KEPT on exit, "
+                f"but you work in the base directory — copy them across before quitting? "
+                f"(Press Esc to cancel the exit and handle them yourself.)\n"
+                f"\nFile(s):"
+            )
+            options = ["No, leave them in the worktree", "Yes, copy to the base repo"]
         else:
             title = (
                 f"This session's worktree ({wt_dir}) has {len(rels)} file(s) that won't be merged "
@@ -10195,8 +10306,13 @@ class ProxyRunner:
             self._exit_aborted = True
             return
         if choice is None or choice.startswith("No"):
-            if on_exit:
+            if on_exit and deleting_worktree:
                 self._set_message(f"Discarding {len(rels)} file(s) with the worktree.", seconds=6.0)
+                self._render()
+            elif on_exit:
+                # The worktree is kept, so the files are NOT discarded — they simply stay in
+                # the worktree, available at its path for next time.
+                self._set_message(f"Left {len(rels)} file(s) in this session's worktree ({wt_dir}).", seconds=6.0)
                 self._render()
             else:
                 self._copy_declined |= current  # mute the whole set until it changes / switch
@@ -10315,8 +10431,7 @@ class ProxyRunner:
         listing = ", ".join(files[:5]) + (" …" if len(files) > 5 else "")
         self._set_message(
             f"{len(files)} file(s) left in this session's worktree: {listing}. They're available at "
-            f"{wt_dir} for now, but **the worktree is removed when aGiTrack exits or the session "
-            f"integrates,** so copy out anything you want to keep.",
+            f"{wt_dir}; the worktree is kept across runs, so they'll still be there next time.",
             seconds=15.0,
         )
         self._render()
