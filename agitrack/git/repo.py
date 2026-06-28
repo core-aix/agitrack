@@ -120,6 +120,15 @@ class GitRepo:
         output = self._run(["git", "ls-files", "--others", "--exclude-standard"]).stdout
         return [line for line in output.splitlines() if line and not line.startswith(".agitrack/")]
 
+    def ignored_files(self) -> list[str]:
+        """Paths git ignores (per .gitignore) in the working tree — build output,
+        local data, downloaded deps. A wholly-ignored directory collapses to a single
+        ``dir/`` entry (``--directory``) so a caller copying the environment can copy it
+        in one shot rather than walking thousands of files. aGiTrack's own ``.agitrack/``
+        is never reported (copying it would recurse into the worktrees it holds)."""
+        output = self._run(["git", "ls-files", "--others", "--ignored", "--exclude-standard", "--directory"]).stdout
+        return [line for line in output.splitlines() if line and not line.startswith(".agitrack/")]
+
     def has_staged_changes(self) -> bool:
         return self._diff_has_changes(["git", "diff", "--cached", "--quiet"])
 

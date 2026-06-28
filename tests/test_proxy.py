@@ -1208,11 +1208,12 @@ def test_offer_copy_on_exit_respects_mute_unless_new_file(tmp_path):
     runner._offer_copy_unstaged_to_base(context="exit")
     assert seen == []  # same set, already declined → not asked again, even on exit
 
-    # A new file appears → re-offer all of them on exit, with the deletion warning.
+    # A new file appears → re-offer all of them on exit (the worktree is kept, so the prompt
+    # is framed around copying newer files across rather than a deletion warning).
     runner.repo.status_short_ignored = lambda: "?? a.txt\n?? b.txt\n"
     (wt / "b.txt").write_text("y\n")
     runner._offer_copy_unstaged_to_base(context="exit")
-    assert len(seen) == 1 and "DELETED" in seen[0]
+    assert len(seen) == 1 and "KEPT on exit" in seen[0]
     assert (base / "a.txt").read_text() == "x\n" and (base / "b.txt").read_text() == "y\n"
 
 
@@ -1373,9 +1374,9 @@ def test_offer_copy_mixes_real_files_and_skips_hidden(tmp_path):
     assert (base / "keep.txt").read_text() == "real\n"
 
 
-def test_offer_copy_decline_notice_warns_worktree_is_removed(tmp_path):
-    # Declining keeps the files in the worktree, but the notice must say where they
-    # are (the worktree path) and that the worktree is removed on aGiTrack exit.
+def test_offer_copy_decline_notice_gives_worktree_path(tmp_path):
+    # Declining keeps the files in the worktree; the notice must say where they are (the
+    # worktree path) and that the worktree persists across runs, so they'll still be there.
     runner, base, wt, msgs = _copy_runner(tmp_path, "?? keep.txt\n")
     (wt / "keep.txt").write_text("x\n")
     runner._select_popup = lambda *a, **k: "No, leave them in the worktree"
@@ -1385,10 +1386,7 @@ def test_offer_copy_decline_notice_warns_worktree_is_removed(tmp_path):
     assert msgs
     notice = msgs[-1]
     assert str(wt) in notice  # the worktree path is spelled out
-    assert "removed when aGiTrack exits" in notice
-    # The removal warning is marked bold (**…**), which the popup renderer renders as
-    # SGR bold; the marked run covers the removal words.
-    assert "**the worktree is removed when aGiTrack exits or the session integrates,**" in notice
+    assert "kept across runs" in notice
 
 
 def test_maybe_offer_copy_when_idle_is_gated_on_idleness(tmp_path):
@@ -6113,7 +6111,7 @@ def _exit_removal_runner(*, log_range_result="", rev_parse_raises=False):
         _base_branch="dev",
         merge_ctx=None,
         _primary_worktree_name=None,
-        worktree=types.SimpleNamespace(name="session-1"),
+        worktree=types.SimpleNamespace(name="session-1", path="/tmp/agitrack-wt/session-1"),
         repo=types.SimpleNamespace(
             current_branch=lambda: "agit/claude/session-1/t1",
             merge_in_progress=lambda: False,
@@ -6135,20 +6133,23 @@ def _exit_removal_runner(*, log_range_result="", rev_parse_raises=False):
 
 def test_exit_keeps_worktree_with_unintegrated_commits():
     runner = _exit_removal_runner(log_range_result="deadbeef a commit")
-    runner._remove_worktree_on_exit()
+    runner._finalize_worktree_on_exit()
     assert runner.removed == []  # branch ahead of base (e.g. merging was paused) → preserved
 
 
 def test_exit_keeps_worktree_when_base_ref_unresolvable():
     runner = _exit_removal_runner(rev_parse_raises=True)
-    runner._remove_worktree_on_exit()
+    runner._finalize_worktree_on_exit()
     assert runner.removed == []  # base branch deleted/renamed → can't confirm merged → preserved
 
 
-def test_exit_removes_fully_merged_worktree():
+def test_exit_keeps_fully_merged_worktree():
+    # Worktrees are persistent: even a fully-merged session keeps its worktree on exit
+    # (its environment and any leftover files survive for the next run / a later resume).
     runner = _exit_removal_runner(log_range_result="")  # nothing ahead of base
-    runner._remove_worktree_on_exit()
-    assert runner.removed == ["session-1"]  # normal cleanup of a merged session still happens
+    runner._finalize_worktree_on_exit()
+    assert runner.removed == []
+    assert runner.worktree is not None  # still tracked, not detached
 
 
 def test_exit_persists_resume_pointer_even_when_worktree_kept():
@@ -6162,7 +6163,7 @@ def test_exit_persists_resume_pointer_even_when_worktree_kept():
     persisted = []
     runner._persist_last_session_record = lambda: persisted.append(True)
 
-    runner._remove_worktree_on_exit()
+    runner._finalize_worktree_on_exit()
 
     assert runner.removed == []  # unintegrated → worktree still kept
     assert persisted == [True]  # ...but the resume pointer was persisted anyway
@@ -6178,7 +6179,7 @@ def test_exit_does_not_persist_resume_pointer_for_background_session():
     persisted = []
     runner._persist_last_session_record = lambda: persisted.append(True)
 
-    runner._remove_worktree_on_exit()
+    runner._finalize_worktree_on_exit()
 
     assert persisted == []
 
@@ -6194,9 +6195,54 @@ def test_exit_persists_resume_pointer_for_last_active_session_even_if_not_primar
     persisted = []
     runner._persist_last_session_record = lambda: persisted.append(True)
 
-    runner._remove_worktree_on_exit()
+    runner._finalize_worktree_on_exit()
 
     assert persisted == [True]
+
+
+def test_exit_worktree_prompt_lists_paths_and_caches_decision(tmp_path):
+    # The exit keep-or-delete prompt spells out each worktree's exact location and the
+    # answer is cached (asked once per exit, applied to every session).
+    runner = make_runner()
+    runner.screen = object()
+    runner.sessions = []
+    runner.worktree = types.SimpleNamespace(name="session-1", path=tmp_path / "wt")
+    seen: list = []
+    runner._select_popup = lambda title, opts, **k: seen.append((title, k.get("detail"))) or "Delete them"
+
+    assert runner._should_delete_worktrees_on_exit() is True
+    assert str(tmp_path / "wt") in str(seen[0][1])  # the precise location is shown
+
+    seen.clear()
+    assert runner._should_delete_worktrees_on_exit() is True  # cached
+    assert seen == []  # not re-prompted
+
+
+def test_exit_worktree_prompt_defaults_to_keep_on_signal_teardown(tmp_path):
+    # A signal teardown (terminal/window close: screen is None) has no UI, so it must NOT
+    # prompt and must default to KEEP — a close never silently deletes a worktree.
+    runner = make_runner()
+    runner.screen = None
+    runner.sessions = []
+    runner.worktree = types.SimpleNamespace(name="session-1", path=tmp_path / "wt")
+    called: list = []
+    runner._select_popup = lambda *a, **k: called.append(True)
+
+    assert runner._should_delete_worktrees_on_exit() is False
+    assert called == []
+
+
+def test_exit_worktree_prompt_skipped_when_no_worktrees():
+    # In --no-worktree mode there are no worktrees to decide about, so exit never prompts.
+    runner = make_runner()
+    runner.screen = object()
+    runner.sessions = []
+    runner.worktree = None
+    called: list = []
+    runner._select_popup = lambda *a, **k: called.append(True)
+
+    assert runner._should_delete_worktrees_on_exit() is False
+    assert called == []
 
 
 def _bg_confirm_runner(statuses):
@@ -8949,9 +8995,10 @@ def test_switch_backend_records_choice_repo_scoped_not_global(tmp_path, monkeypa
     assert not any(scope == "global" for _, _, scope in sets)  # global default left alone
 
 
-def test_no_worktree_mode_removes_leftover_worktrees(tmp_path):
-    # Turning worktrees off must clean up worktrees left by a previous worktree-mode run
-    # (their committed work is already integrated into the base branch).
+def test_no_worktree_mode_keeps_leftover_worktrees_and_resumes_newest(tmp_path):
+    # Turning worktrees off must NOT delete worktrees left by a previous worktree-mode run
+    # (worktrees are persistent). Instead it adopts the most recent prior worktree session's
+    # conversation as the resume target so it continues in the base repo.
     runner = make_runner(state=AgitrackState(tmp_path))
     runner._use_worktrees = False
     runner._set_message = lambda *a, **k: None
@@ -8961,11 +9008,13 @@ def test_no_worktree_mode_removes_leftover_worktrees(tmp_path):
         list=lambda: [types.SimpleNamespace(name="sess-a"), types.SimpleNamespace(name="sess-b")],
         remove=lambda name, **k: removed.append(name),
     )
+    runner._newest_worktree_session_id = lambda: "sess-newest"
 
     runner._setup_base_merge_only_session()
 
-    assert removed == ["sess-a", "sess-b"]
+    assert removed == []  # nothing deleted — the directories are kept
     assert runner.worktree is None  # runs on the base tree directly
+    assert runner.state.backend_session_id == "sess-newest"  # resumes the prior worktree session
 
 
 def test_worktree_sessions_is_memoized_to_avoid_repeated_slow_listing(tmp_path):
