@@ -130,6 +130,56 @@ def test_prepare_resume_stages_transcript_into_worktree(monkeypatch, tmp_path):
     assert claude_session.prepare_resume(worktree, "missing") is False
 
 
+def test_prepare_resume_refreshes_stale_staged_copy(monkeypatch, tmp_path):
+    # Regression: a prior resume staged the transcript into the target dir, then cwd-retargeting
+    # broke the hardlink — freezing that staged copy while the live copy elsewhere kept growing.
+    # prepare_resume must REPLACE the stale snapshot with the newest copy, or --no-worktree
+    # resumes an OLDER state of the conversation ("an older session opened").
+    import os
+    import time
+
+    config = tmp_path / "config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    base = tmp_path / "repo"
+    worktree = base / ".agitrack" / "worktrees" / "candle"
+    base.mkdir()
+    worktree.mkdir(parents=True)
+
+    base_proj = config / "projects" / claude_session._encode_repo(base)
+    wt_proj = config / "projects" / claude_session._encode_repo(worktree)
+    base_proj.mkdir(parents=True)
+    wt_proj.mkdir(parents=True)
+
+    # The live (worktree) copy: the full, current conversation, newest mtime.
+    live = wt_proj / "s.jsonl"
+    live.write_text('{"type":"user"}\n{"type":"assistant"}\n{"type":"user"}\n', encoding="utf-8")
+    # A STALE staged copy at the base target: fewer lines, OLDER mtime, separate inode.
+    stale = base_proj / "s.jsonl"
+    stale.write_text('{"type":"user"}\n', encoding="utf-8")
+    old = time.time() - 10000
+    os.utime(stale, (old, old))
+
+    assert claude_session.prepare_resume(base, "s") is True
+    # The base copy is refreshed to the full conversation, not left at the 1-line snapshot.
+    assert (base_proj / "s.jsonl").read_text(encoding="utf-8").count("\n") == 3
+
+
+def test_prepare_resume_keeps_fresh_staged_copy(monkeypatch, tmp_path):
+    # The inverse: a staged copy that is already as fresh as (or fresher than) the source is
+    # left untouched — no needless re-staging.
+    config = tmp_path / "config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    base = tmp_path / "repo"
+    base.mkdir()
+    base_proj = config / "projects" / claude_session._encode_repo(base)
+    base_proj.mkdir(parents=True)
+    (base_proj / "s.jsonl").write_text('{"type":"user"}\n{"type":"assistant"}\n', encoding="utf-8")
+    before = (base_proj / "s.jsonl").stat().st_ino
+
+    assert claude_session.prepare_resume(base, "s") is True
+    assert (base_proj / "s.jsonl").stat().st_ino == before  # untouched (no source is newer)
+
+
 def test_link_session_surfaces_worktree_conversation_in_base(monkeypatch, tmp_path):
     config = tmp_path / "config"
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
