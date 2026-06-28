@@ -13,72 +13,102 @@ You need **git** and at least one AI agent — [Claude Code](https://docs.claude
 
 ## Install
 
-aGiTrack is a Python package, so it needs **Python 3.10+** (with `pip`). Most macOS/Linux systems already have it (`python3 --version`); if not — macOS: `brew install python`, Linux: your package manager (e.g. `sudo apt install python3 python3-pip`), Windows: `winget install Python.Python.3.12` (tick *Add to PATH*). Then:
+aGiTrack is a Python package (**Python 3.10+**), installed with `pip` or `pipx`. On **Windows** you can instead use a standalone **MSI** that needs no Python at all. Pick your OS below — each section is self-contained. Once installed, aGiTrack keeps itself up to date (see [Self-update](#self-update)); the PyPI distribution, the importable package, and the command are all named `agitrack`.
 
-```bash
-pip install agitrack
-```
+### macOS
 
-This installs the `agitrack` command and the terminal UI dependency used for status bars and contextual command hints. The PyPI distribution, the importable package, and the command are all named `agitrack`. Once installed, aGiTrack keeps itself up to date — see [Self-update](#self-update).
-
-On systems where Python comes from a system package manager (many Linux distributions, or Homebrew on macOS), `pip` may refuse to install into the system environment with an "externally-managed-environment" error ([PEP 668](https://peps.python.org/pep-0668/)). In that case install with [`pipx`](https://pipx.pypa.io) instead, which puts `agitrack` in its own isolated environment and on your PATH:
-
-```bash
-pipx install agitrack
-```
-
-For local development, install from a checkout instead:
-
-```bash
-python3 -m pip install -e .
-```
+1. **Python 3.10+** — check with `python3 --version`; if it's missing, `brew install python`.
+2. **Install aGiTrack** (the terminal-UI dependency for status bars and command hints comes with it):
+   ```bash
+   pip3 install agitrack
+   ```
+   If pip refuses with an "externally-managed-environment" error ([PEP 668](https://peps.python.org/pep-0668/) — common with Homebrew's Python), use [`pipx`](https://pipx.pypa.io) instead; it isolates aGiTrack and puts it on your PATH:
+   ```bash
+   pipx install agitrack
+   ```
+3. **Prerequisites** — git (required), a backend (Claude Code **or** OpenCode), and optionally `gh` (lets the dashboard show authors by GitHub username):
+   ```bash
+   brew install git
+   curl -fsSL https://claude.ai/install.sh | bash   # Claude Code …
+   npm install -g opencode-ai                        # … or OpenCode
+   brew install gh                                   # optional
+   ```
 
 ### Windows (native — no WSL)
 
-aGiTrack runs natively on Windows (PowerShell / Windows Terminal — WSL not required). There are **two ways to install it**; pick whichever fits:
+aGiTrack runs natively on Windows (PowerShell / Windows Terminal — WSL not required). Two ways to install — pick one:
 
-**1. With Python — `pip` (or `pipx`).** If you have Python 3.10+:
+**Option A — standalone MSI (no Python needed).** Each release ships a self-contained installer that bundles its own Python (built with PyInstaller), so it runs on a machine with **no Python or pip at all**.
 
-```powershell
-pip install agitrack
-```
-
-This pulls in **`pywinpty`** automatically (a prebuilt wheel — no C/Rust compiler needed) to drive the agent through a pseudo-console (ConPTY). Notes:
-
-- **Check Python/pip first:** `py -m pip --version`. No Python? `winget install Python.Python.3.12` (tick *Add to PATH*) — or use the MSI below instead.
-- **`agitrack` not found after install?** Your Python `Scripts` dir isn't on PATH. Run it as `py -m agitrack`, or install with **pipx** (`pipx install agitrack`), which puts it on PATH for you.
-
-**2. Without Python — the standalone MSI installer.** Each release ships a self-contained Windows installer that bundles its own Python (built with PyInstaller), so it installs and runs `agitrack` on a machine with **no Python or pip at all**.
-
-- **Where to get it:** download `agitrack-<version>-windows-x64.msi` from the latest GitHub release: **<https://github.com/core-aix/agitrack/releases/latest>** (under *Assets*).
-- **Install it:** double-click the `.msi`. `agitrack` is installed to `C:\Program Files\aGiTrack` and added to your PATH, so you can run `agitrack` from any terminal.
-- ⚠️ **Security warning — you must bypass it.** The MSI is **not code-signed yet** (we don't have a Windows code-signing certificate). Windows SmartScreen will therefore warn that the publisher is unknown. This is expected — to proceed, click **More info → Run anyway** (and accept the UAC prompt). Code-signing is planned so this step goes away in a future release.
+- **Download** `agitrack-<version>-windows-x64.msi` from the latest release: **<https://github.com/core-aix/agitrack/releases/latest>** (under *Assets*).
+- **Install** by double-clicking it. `agitrack` is installed to `C:\Program Files\aGiTrack` and added to your PATH, so you can run `agitrack` from any terminal.
+- ⚠️ **You must bypass the security warning.** The MSI is **not code-signed yet** (we don't have a Windows code-signing certificate), so SmartScreen warns that the publisher is unknown. This is expected — click **More info → Run anyway**, then accept the UAC prompt. Code-signing is planned so this step goes away in a future release.
 - The [VS Code extension](editors/vscode/README.md) uses this same MSI automatically when it can't find pipx or pip.
 
-Both install methods **keep themselves up to date** (the MSI re-downloads and reinstalls the latest release; pip/pipx upgrade the package) — see [Self-update](#self-update).
+**Option B — with Python (`pip` / `pipx`).**
+
+1. **Python 3.10+** — `winget install Python.Python.3.12` (tick *Add to PATH*). Check with `py --version`.
+2. **pip** — the Python installer usually includes pip, but it can be missing (e.g. a minimal install, or pip was deselected). Check with `py -m pip --version`; if that errors, bootstrap pip:
+   ```powershell
+   py -m ensurepip --upgrade
+   py -m pip install --upgrade pip
+   ```
+3. **Install aGiTrack:**
+   ```powershell
+   pip install agitrack
+   ```
+   This pulls in **`pywinpty`** automatically (a prebuilt wheel — no C/Rust compiler needed) to drive the agent through a pseudo-console (ConPTY). If `agitrack` isn't found afterward, your Python `Scripts` dir isn't on PATH — install with `pipx install agitrack` (which puts it on PATH for you) or run it as `py -m agitrack`.
+
+**Prerequisites (either option)** — git (required), a backend (Claude Code **or** OpenCode), and optionally `gh`:
+
+```powershell
+winget install Git.Git
+npm install -g @anthropic-ai/claude-code   # Claude Code … (no Node? winget install OpenJS.NodeJS)
+npm install -g opencode-ai                 # … or OpenCode
+winget install GitHub.cli                  # optional
+```
 
 > The write-confinement **sandbox is macOS/Linux-only**. On Windows the agent runs unconfined; instead of blocking writes, aGiTrack watches the base repository and warns you only **if** the agent actually edits files outside its worktree.
 
-### Prerequisites — git and a backend (macOS · Linux · Windows)
+### Linux
 
-aGiTrack needs **git** and at least one backend CLI ([Claude Code](https://docs.claude.com/en/docs/claude-code) or [OpenCode](https://opencode.ai)); the GitHub CLI (`gh`) is optional (it lets the dashboard show authors by GitHub username). Install them for your OS:
+1. **Python 3.10+ with pip** — `sudo apt install python3 python3-pip` (or your distro's package manager).
+2. **Install aGiTrack:**
+   ```bash
+   pip3 install agitrack
+   ```
+   If pip refuses with an "externally-managed-environment" error ([PEP 668](https://peps.python.org/pep-0668/)), use [`pipx`](https://pipx.pypa.io) instead:
+   ```bash
+   pipx install agitrack
+   ```
+3. **Prerequisites** — git (required), a backend (Claude Code **or** OpenCode), and optionally `gh`:
+   ```bash
+   sudo apt install git    # (or your package manager)
+   curl -fsSL https://claude.ai/install.sh | bash   # Claude Code …
+   npm install -g opencode-ai                        # … or OpenCode
+   sudo apt install gh     # optional
+   ```
 
-| | git (required) | a backend (Claude Code **or** OpenCode) | `gh` (optional) |
-|---|---|---|---|
-| **macOS** | `brew install git` | `curl -fsSL https://claude.ai/install.sh \| bash` · or `npm install -g opencode-ai` | `brew install gh` |
-| **Linux** | `sudo apt install git` *(or your package manager)* | `curl -fsSL https://claude.ai/install.sh \| bash` · or `npm install -g opencode-ai` | `sudo apt install gh` |
-| **Windows** | `winget install Git.Git` | `npm install -g @anthropic-ai/claude-code` · or `npm install -g opencode-ai` *(no Node? `winget install OpenJS.NodeJS`)* | `winget install GitHub.cli` |
+### Local development
+
+From a checkout (with `pip` already installed), do an **editable install** — this puts the `agitrack` command on your PATH, so you launch it directly as `agitrack`:
+
+```bash
+pip install -e .
+```
+
+(If your Python is externally managed, use `pipx install -e .` instead.)
+
+---
 
 **aGiTrack can set up its prerequisites for you.** On an interactive launch it offers to install whatever's missing, then makes sure git can commit:
 
-- **A backend.** First run lists the backends with their install status and offers to install any that are missing — pick one or install all of them; at launch, if the selected backend isn't present, it offers to install it then. Uses the official installer on macOS/Linux and npm everywhere (bootstrapping Node via winget on Windows when needed).
-- **git and gh.** If `git` (required) or `gh` (optional) isn't installed, aGiTrack offers to install it with your platform's package manager — winget on Windows, Homebrew on macOS, your distro manager on Linux.
-- **git identity.** If `user.name`/`user.email` aren't set globally (commits fail without them), it prompts you for them and saves them.
-- **gh sign-in.** If `gh` is installed but not signed in, it offers to run `gh auth login` right there.
+- **A backend** — first run lists the backends and offers to install any that are missing (official installer on macOS/Linux, npm everywhere, bootstrapping Node via winget on Windows when needed).
+- **git and `gh`** — offered via your platform's package manager (winget on Windows, Homebrew on macOS, your distro manager on Linux).
+- **git identity** — if `user.name`/`user.email` aren't set (commits fail without them), it prompts you and saves them.
+- **`gh` sign-in** — if `gh` is installed but not signed in, it offers to run `gh auth login`.
 
-Anything it installs is added to the current session's `PATH`, so it works right away without reopening the terminal.
-
-Run `gh auth login` if you installed `gh`. After installing anything by hand, open a **new terminal** so the updated `PATH` is picked up. aGiTrack also prints these same per-OS install hints at startup when `git`, the selected backend, or `gh` is missing — so you can copy the right command without leaving the prompt.
+Anything it installs is added to the current session's `PATH`, so it works right away. After installing tools by hand, open a **new terminal** so the updated `PATH` is picked up; aGiTrack also prints these per-OS hints at startup when something's missing.
 
 ### VS Code extension
 
