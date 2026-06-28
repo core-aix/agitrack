@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import uuid
 from pathlib import Path
 from typing import Protocol
@@ -26,12 +27,17 @@ _NOTE_INTRO = (
 # (which lives under .agitrack/worktrees/) and that edits belong there — an earlier wording
 # ("do not ... clean up anything under .agitrack/") was read as "don't write under .agitrack/",
 # so the agent edited the base repo checkout instead and its work was never committed/merged.
+# The path separator follows the OS aGiTrack (and therefore the agent child it spawns) runs on
+# — backslashes on native Windows, forward slashes on POSIX — so the paths in the note match
+# the paths the agent actually sees in its working directory.
+_AGITRACK_DIR = f".agitrack{os.sep}"
+_WORKTREES_DIR = f".agitrack{os.sep}worktrees{os.sep}"
 _NOTE_WORKTREE = (
     " Your current working directory is this session's git worktree under "
-    "`.agitrack/worktrees/` — make all your file edits there, in the working directory, exactly "
+    f"`{_WORKTREES_DIR}` — make all your file edits there, in the working directory, exactly "
     "as normal. Do NOT switch to or edit the base repository checkout directly. aGiTrack handles "
     "BOTH the commit and the merge of your worktree edits into the current branch for you, so you "
-    "never need to commit, merge, move, or clean up anything under `.agitrack/` yourself."
+    f"never need to commit, merge, move, or clean up anything under `{_AGITRACK_DIR}` yourself."
 )
 _NOTE_OUTRO = " Otherwise work exactly as normal."
 
