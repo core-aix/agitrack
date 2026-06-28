@@ -1,4 +1,5 @@
 import json
+import os
 import types
 from pathlib import Path
 
@@ -41,8 +42,10 @@ def test_claude_proxy_agent_spawn_command_uses_session_id_and_resume():
     # In the default worktree model the note also explains that the agent's working directory
     # IS the worktree under .agitrack/worktrees/ (so edits belong there, not in the base repo)
     # and that aGiTrack handles BOTH the commit and the merge into the current branch;
-    # spawn_command defaults to that variant.
-    assert ".agitrack/worktrees/" in AGENT_SYSTEM_NOTE and "working directory" in AGENT_SYSTEM_NOTE
+    # spawn_command defaults to that variant. The path separator matches the host OS (so the
+    # note's paths line up with what the agent actually sees in its cwd).
+    assert f".agitrack{os.sep}worktrees{os.sep}" in AGENT_SYSTEM_NOTE
+    assert "working directory" in AGENT_SYSTEM_NOTE
     assert "commit and the merge" in AGENT_SYSTEM_NOTE  # both, not just one
     assert "base repository" in AGENT_SYSTEM_NOTE  # tells the agent not to edit base directly
     # Under --no-worktree the worktree clause is dropped (the agent edits the branch directly),
@@ -50,7 +53,7 @@ def test_claude_proxy_agent_spawn_command_uses_session_id_and_resume():
     from agitrack.backends.proxy_agents import agent_system_note
 
     no_wt = agent_system_note(use_worktrees=False)
-    assert ".agitrack/" not in no_wt and "worktree" not in no_wt
+    assert ".agitrack" not in no_wt and "worktree" not in no_wt  # sep-agnostic: clause fully dropped
     assert "git commit" in no_wt
     cmd = agent.spawn_command(Path("/repo"), session_id="u1", resume=False, use_worktrees=False)
     assert cmd == ["claude", "--session-id", "u1", "--append-system-prompt", no_wt]
