@@ -140,6 +140,12 @@ _BRACKETED_PASTE_RE = re.compile(rb"\x1b\[200~.*?(?:\x1b\[201~|$)", re.S)
 # so each frame is its own line and the last meaningful one survives.
 _ANSI_CSI_OSC_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
 
+# OSC 52 (set/clear the terminal clipboard), BEL- or ST-terminated. The backend emits this to
+# copy to the clipboard; because aGiTrack renders the screen via pyte (which consumes OSC and
+# only the visible grid is re-emitted), it must be forwarded to the host terminal explicitly or
+# a backend's copy is silently dropped — see ProxyRunner._forward_clipboard_osc.
+_OSC52_RE = re.compile(rb"\x1b\]52;[^\x07\x1b]*(?:\x07|\x1b\\)")
+
 
 def _strip_ansi(text: str) -> str:
     return _ANSI_CSI_OSC_RE.sub("", text).replace("\r", "\n")
@@ -6834,6 +6840,7 @@ class ProxyRunner:
             self.last_child_output_sample = (self.last_child_output_sample + output)[-4096:]
             self._answer_terminal_queries(output)
             self._sync_terminal_modes(output)
+            self._forward_clipboard_osc(output)
             self._track_sync_update(output)
             self._feed_child_output(output)
             self._render_output()
@@ -7169,6 +7176,20 @@ class ProxyRunner:
         self.stream = pyte.ByteStream(self.screen)
         self.scroll_back = 0
         self._in_sync_update = False
+
+    def _forward_clipboard_osc(self, output: bytes) -> None:
+        # Forward the backend's OSC 52 clipboard writes to the host terminal. aGiTrack renders
+        # the active session's screen via pyte, which consumes OSC sequences and re-emits only
+        # the visible grid — so a backend's "copy to clipboard" (e.g. Claude's, which emits
+        # OSC 52) is otherwise swallowed and the clipboard never changes, even though the backend
+        # reports it copied. Only the FOREGROUND session reaches this path, so a background
+        # session can't hijack the clipboard. Forwarded verbatim; the host terminal honors it
+        # exactly as it does for a backend whose output isn't pyte-rendered.
+        for seq in _OSC52_RE.findall(output):
+            try:
+                os.write(sys.stdout.fileno(), seq)
+            except OSError:
+                pass
 
     def _feed_child_output(self, output: bytes) -> None:
         ScreenRenderer.feed(self, output, pyte_hostile_csi_re=_PYTE_HOSTILE_CSI_RE)

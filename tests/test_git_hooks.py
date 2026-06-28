@@ -17,7 +17,8 @@ def test_install_creates_guard_hook(tmp_path):
     text = hook.read_text(encoding="utf-8")
     assert git_hooks.ENV_GUARD in text  # only acts when the agent marker is set
     assert "worktrees/" in text  # commits inside a linked worktree are allowed
-    assert "--no-verify" in text  # documents the escape hatch
+    assert "not the base repo" in text  # the block message
+    assert "--no-verify" not in text  # must NOT hand the agent the bypass
 
 
 def test_install_preserves_and_chains_existing_user_hook(tmp_path):

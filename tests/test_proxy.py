@@ -9066,6 +9066,31 @@ def test_warn_if_base_edited_fires_then_rebaselines_and_noop_when_off():
     assert msgs == []
 
 
+def test_forward_clipboard_osc_forwards_only_osc52(monkeypatch):
+    # aGiTrack renders the foreground session via pyte, which swallows OSC sequences; the
+    # backend's OSC 52 clipboard write must be forwarded to the host terminal verbatim, or a
+    # backend's "copy to clipboard" (e.g. Claude's) silently does nothing.
+    import agitrack.proxy.runner as proxy_mod
+
+    runner = make_runner()
+    writes: list = []
+    monkeypatch.setattr(proxy_mod.sys, "stdout", types.SimpleNamespace(fileno=lambda: 7))
+    monkeypatch.setattr(proxy_mod.os, "write", lambda fd, data: writes.append((fd, data)) or len(data))
+
+    osc = b"\x1b]52;c;aGVsbG8=\x07"  # BEL-terminated set-clipboard
+    runner._forward_clipboard_osc(b"before" + osc + b"after")
+    assert writes == [(7, osc)]
+
+    writes.clear()
+    runner._forward_clipboard_osc(b"\x1b[31mcolor only, no clipboard\x1b[0m")
+    assert writes == []  # ordinary output is not forwarded here (pyte renders it)
+
+    writes.clear()
+    osc_st = b"\x1b]52;c;d29ybGQ=\x1b\\"  # ST-terminated form
+    runner._forward_clipboard_osc(osc_st)
+    assert writes == [(7, osc_st)]
+
+
 def test_stop_session_drops_it_keeps_others_and_refuses_the_last():
     runner = _mux_runner()
     runner.sessions.append(_bg_session("B"))

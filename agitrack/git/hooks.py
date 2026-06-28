@@ -41,9 +41,11 @@ if [ -n "${{{ENV_GUARD}}}" ]; then
     */worktrees/*)
       : ;;  # inside a linked worktree (the agent's sandbox) -> allowed
     *)
+      # Deliberately do NOT name git's hook-bypass flag in this message: it is only ever shown to
+      # the AGENT (the user is never blocked — they carry no marker), so naming the bypass would
+      # just hand the agent a way around the guard.
       echo "aGiTrack: this is a worktree session — commit inside your worktree, not the base repo." >&2
       echo "aGiTrack auto-commits and merges your worktree changes for you." >&2
-      echo "(If you really mean to commit here, bypass with: git commit --no-verify.)" >&2
       exit 1 ;;
   esac
 fi
