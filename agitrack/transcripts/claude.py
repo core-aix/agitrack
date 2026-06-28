@@ -186,13 +186,24 @@ def prepare_resume(worktree: Path, session_id: str) -> bool:
     worktree = Path(worktree)
     target_dir = _project_dir(worktree)
     target = target_dir / f"{session_id}.jsonl"
-    if target.is_file():
-        return True
-    source = _find_session_file(session_id)
+    source = _find_session_file(session_id)  # newest copy of this id across all project dirs
     if source is None:
-        return False
+        return target.is_file()  # nothing better to stage; keep whatever is already there
     if source.resolve() == target.resolve():
-        return True
+        return True  # the target already IS the freshest copy (or hardlinked to it)
+    # A copy may already sit at the target but be STALE: a prior resume hardlinked it, then
+    # cwd-retargeting broke the hardlink, freezing it while the live copy elsewhere kept growing.
+    # Returning early on mere existence would resume that OLDER frozen snapshot. Keep the existing
+    # target only when it is at least as fresh (mtime AND size) as the newest source; otherwise
+    # replace it so the resume gets the FULL, current conversation, not an older state.
+    if target.is_file():
+        try:
+            src_stat, dst_stat = source.stat(), target.stat()
+            if dst_stat.st_mtime >= src_stat.st_mtime and dst_stat.st_size >= src_stat.st_size:
+                return True
+            target.unlink()  # stale -> re-stage the newest copy below
+        except OSError:
+            return True
     try:
         target_dir.mkdir(parents=True, exist_ok=True)
     except OSError:
