@@ -2904,12 +2904,17 @@ class ProxyRunner:
         self.actions = AgitrackActions(self.repo, self.state, verbose=self.verbose)
 
     def _newest_worktree_session(self) -> tuple[str, float] | None:
-        """``(id, last-updated)`` of the most recently active worktree conversation — the one a
-        ``--no-worktree`` start should continue in the base repo. Ranked by TRANSCRIPT recency
-        (not the per-worktree tracked-session pointer), so it follows the conversation the user
-        actually last worked in — even one switched to inside the backend's own picker, and even
-        in a worktree since removed (the transcript is kept keyed by the worktree path). Returns
-        None when there are no recorded worktree conversations."""
+        """``(id, last-updated)`` of the most recently active worktree conversation that HAS
+        CONTENT — the one a ``--no-worktree`` start should continue in the base repo. Ranked by
+        transcript recency, so it follows the conversation the user actually last worked in (even
+        one in a worktree since removed — the transcript is kept keyed by the worktree path).
+
+        Empty conversations are skipped: a backend mints a fresh, EMPTY session id whenever a
+        conversation is resumed or opened from its picker, and that empty transcript is newest by
+        mtime but has nothing to resume. Adopting it makes baseline-init fall back via
+        ``recover_nonempty_session`` to an unrelated OLDER session — the "an older session opened"
+        bug. ``ref.label`` (the first real user prompt) is None exactly when there is no real
+        turn, so it is the content test. Returns None when no worktree conversation has content."""
         try:
             pairs = self.backend.list_worktree_sessions(self._worktrees().root)
         except Exception as error:
@@ -2917,6 +2922,8 @@ class ProxyRunner:
             return None
         best: tuple[str, float] | None = None
         for _key, ref in pairs:
+            if not getattr(ref, "label", None):
+                continue  # empty transcript (no real turn) — nothing to resume
             if best is None or ref.updated > best[1]:
                 best = (ref.id, ref.updated)
         return best

@@ -1602,14 +1602,37 @@ def test_newest_worktree_session_picks_most_recently_updated(tmp_path):
     runner.worktree_manager = WorktreeManager(main)
     runner.backend = types.SimpleNamespace(
         list_worktree_sessions=lambda root: [
-            ("sess-a", SessionRef(id="id-a", updated=100.0)),
-            ("sess-b", SessionRef(id="id-b", updated=200.0)),  # most recent transcript
-            ("sess-c", SessionRef(id="id-c", updated=150.0)),
+            ("sess-a", SessionRef(id="id-a", updated=100.0, label="first")),
+            ("sess-b", SessionRef(id="id-b", updated=200.0, label="latest work")),  # most recent w/ content
+            ("sess-c", SessionRef(id="id-c", updated=150.0, label="middle")),
         ]
     )
     runner._debug = lambda *a, **k: None
 
     assert runner._newest_worktree_session() == ("id-b", 200.0)
+
+
+def test_newest_worktree_session_skips_empty_picks_latest_with_content(tmp_path):
+    # Regression: a backend mints a fresh EMPTY session id on resume/picker-open; that empty
+    # transcript is newest by mtime but has nothing to resume (label is None). It must be
+    # skipped so the latest CONTENT-ful worktree session wins — otherwise baseline-init falls
+    # back to an unrelated OLDER session ("an older session opened" under --no-worktree).
+    import types
+
+    from agitrack.transcripts.types import SessionRef
+
+    main = _init_repo(tmp_path)
+    runner = make_runner(base_repo=main)
+    runner.worktree_manager = WorktreeManager(main)
+    runner.backend = types.SimpleNamespace(
+        list_worktree_sessions=lambda root: [
+            ("feature", SessionRef(id="id-content", updated=100.0, label="real work")),
+            ("feature", SessionRef(id="id-empty", updated=999.0, label=None)),  # newest, but empty
+        ]
+    )
+    runner._debug = lambda *a, **k: None
+
+    assert runner._newest_worktree_session() == ("id-content", 100.0)
 
 
 def test_newest_worktree_session_none_when_no_worktree_conversations(tmp_path):
