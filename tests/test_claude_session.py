@@ -4,6 +4,7 @@ import sys
 import pytest
 
 from agitrack.transcripts import claude as claude_session
+from agitrack.transcripts import turns_after
 from agitrack.transcripts.claude import (
     export_session,
     latest_session_id,
@@ -347,6 +348,71 @@ def test_parse_rows_excludes_meta_sidechain_tool_results_and_commands():
     assert len(session.turns) == 1
     assert session.turns[0].user_prompt == "the real prompt"
     assert session.turns[0].final_response == "response"
+
+
+def test_parse_rows_background_task_work_opens_its_own_turn():
+    # The agent backgrounds a task; the turn finishes (end_turn) and is committed. Later the
+    # task completes — the harness injects a <task-notification> user row — and the agent acts
+    # on the result. That work must form its OWN turn rather than extend the prior (already
+    # committed) turn: otherwise it overwrites that turn's assistant id, breaking the commit
+    # watermark (turns_after would then re-export everything), and mis-attributes the work.
+    rows = [
+        _user("u1", "run the tests in the background"),
+        _assistant("m1", "Started the tests in the background.", stop_reason="end_turn"),
+        _user("tn", "<task-notification>\n<task-id>abc</task-id>\n</task-notification>"),
+        _assistant("m2", "Tests passed; I fixed the failing case.", stop_reason="end_turn"),
+    ]
+
+    session = parse_rows("sess-bg", rows)
+
+    assert len(session.turns) == 2
+    assert session.turns[0].user_prompt == "run the tests in the background"
+    assert session.turns[0].assistant_message_id == "m1"
+    assert session.turns[1].user_prompt == "(background task completed)"
+    assert session.turns[1].assistant_message_id == "m2"
+    assert session.turns[1].final_response == "Tests passed; I fixed the failing case."
+    # The first turn's id is preserved, so the watermark still matches it and only the new
+    # background-driven turn is exported next.
+    assert turns_after(session, "m1") == session.turns[1:]
+
+
+def test_parse_rows_background_notification_mid_turn_does_not_split():
+    # A background task completing WHILE a turn is still in flight (the agent is mid-tool) must
+    # not split the turn — the continued work is part of the ongoing turn, not a new one.
+    rows = [
+        _user("u1", "do a thing"),
+        _assistant(
+            "m1",
+            "",
+            content=[{"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}],
+            stop_reason="tool_use",
+        ),
+        _user("tn", "<task-notification>\n<task-id>abc</task-id>\n</task-notification>"),
+        _assistant("m2", "Done.", stop_reason="end_turn"),
+    ]
+
+    session = parse_rows("sess-bg2", rows)
+
+    assert len(session.turns) == 1
+    assert session.turns[0].user_prompt == "do a thing"
+    assert session.turns[0].final_response == "Done."
+
+
+def test_parse_rows_background_notification_then_real_prompt_is_not_a_turn():
+    # A background notification followed by a genuine user prompt (the user typed before the
+    # agent acted) must NOT create a phantom "(background task completed)" turn — the real
+    # prompt supersedes it.
+    rows = [
+        _user("u1", "first"),
+        _assistant("m1", "ok", stop_reason="end_turn"),
+        _user("tn", "<task-notification>\n<task-id>abc</task-id>\n</task-notification>"),
+        _user("u2", "second real prompt"),
+        _assistant("m2", "done second", stop_reason="end_turn"),
+    ]
+
+    session = parse_rows("sess-bg3", rows)
+
+    assert [t.user_prompt for t in session.turns] == ["first", "second real prompt"]
 
 
 def test_parse_rows_opens_a_turn_for_a_slash_command_expansion():
