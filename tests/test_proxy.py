@@ -9051,6 +9051,28 @@ def test_no_worktree_mode_prefers_latest_worktree_over_stale_base_pointer(tmp_pa
     assert runner.state.backend_session_id == "sess-new-wt"
 
 
+def test_no_worktree_mode_repoints_resumed_session_to_base_repo(tmp_path):
+    # The base repo's last-session pointer usually already names the latest worktree session,
+    # but records the WORKTREE as its repo. --no-worktree must re-point it at the base repo even
+    # when the id is unchanged — otherwise the startup resume gate rejects it and baseline-init
+    # resets to a fresh session (the actual "doesn't resume the latest worktree session" bug).
+    runner = make_runner(state=AgitrackState(tmp_path))
+    runner._use_worktrees = False
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda *a, **k: None
+    runner._worktrees = lambda: types.SimpleNamespace(list=lambda: [], remove=lambda *a, **k: None)
+    runner.state.backend_session_id = "sess-W"
+    runner.state.data["backend_session_repo"] = str(tmp_path / ".agitrack" / "worktrees" / "feat")  # the worktree
+    assert not runner.state.backend_session_matches_repo()  # precondition: points at the worktree
+    runner._newest_worktree_session = lambda: ("sess-W", 1000.0)  # same id; it IS the latest worktree
+    runner._session_updated_at = lambda sid: 1000.0
+
+    runner._setup_base_merge_only_session()
+
+    assert runner.state.backend_session_id == "sess-W"
+    assert runner.state.backend_session_matches_repo()  # re-pointed at the base repo → resume honored
+
+
 def test_no_worktree_mode_keeps_newer_base_session_over_older_worktree(tmp_path):
     # The reverse guard: if the base repo's recorded session is MORE recent than any worktree
     # session (e.g. a newer --no-worktree session), it must not be demoted to an older worktree.

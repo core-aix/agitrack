@@ -2832,19 +2832,21 @@ class ProxyRunner:
             # DIRECTORIES are kept — switching back to worktree mode later resumes them in place
             # (the user can delete them by hand if they want the space back).
             if not self._force_new_session:
+                # Pick the conversation to continue HERE: the latest worktree session, unless the
+                # base repo's own recorded session is genuinely more recent (transcript recency,
+                # not just "is a session already recorded"). Then RE-POINT it at this base
+                # directory by re-assigning through the setter — even when the id is unchanged.
+                # The id persisted from the worktree run still records the OLD worktree as its
+                # repo (`backend_session_repo`), which makes the startup resume gate reject it and
+                # _initialize_session_baseline reset to a fresh session BEFORE staging ever runs.
+                # The setter updates backend_session_repo to the base repo so the resume is honored.
+                chosen = self.state.backend_session_id
                 newest = self._newest_worktree_session()
-                # Adopt the latest worktree conversation unless the base repo's own recorded
-                # session is itself more recent (e.g. a newer --no-worktree session). Comparing
-                # transcript recency — not just "is a session already recorded" — is what makes
-                # this resume the LATEST worktree session rather than a stale last-session pointer
-                # the base repo kept from an earlier run.
-                if (
-                    newest is not None
-                    and newest[0] != self.state.backend_session_id
-                    and newest[1] >= self._session_updated_at(self.state.backend_session_id)
-                ):
-                    self.state.backend_session_id = newest[0]
-                    self._debug(f"--no-worktree: resuming latest worktree session {newest[0]} in the base repo")
+                if newest is not None and newest[0] != chosen and newest[1] >= self._session_updated_at(chosen):
+                    chosen = newest[0]
+                if chosen:
+                    self.state.backend_session_id = chosen  # setter re-points backend_session_repo at base
+                    self._debug(f"--no-worktree: resuming session {chosen} in the base repo")
             self._set_message(
                 "Running without a worktree: the agent edits this branch directly (visible live), "
                 "but there's no isolation or auto-integration. Extra sessions started this way share "
