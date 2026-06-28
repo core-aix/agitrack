@@ -38,10 +38,13 @@ def test_claude_proxy_agent_spawn_command_uses_session_id_and_resume():
     assert agent.spawn_command(Path("/repo"), session_id="u1", resume=True) == ["claude", "--resume", "u1", *note]
     assert agent.spawn_command(Path("/repo"), session_id=None, resume=False) == ["claude", *note]
     assert "aGiTrack" in AGENT_SYSTEM_NOTE and "git commit" in AGENT_SYSTEM_NOTE
-    # In the default worktree model the note also explains that aGiTrack runs in a worktree
-    # under .agitrack/ and auto-merges it into the current branch (so the agent leaves those
-    # alone); spawn_command defaults to that variant.
-    assert ".agitrack/" in AGENT_SYSTEM_NOTE and "worktree" in AGENT_SYSTEM_NOTE
+    # In the default worktree model the note also explains that the agent's working directory
+    # IS the worktree under .agitrack/worktrees/ (so edits belong there, not in the base repo)
+    # and that aGiTrack handles BOTH the commit and the merge into the current branch;
+    # spawn_command defaults to that variant.
+    assert ".agitrack/worktrees/" in AGENT_SYSTEM_NOTE and "working directory" in AGENT_SYSTEM_NOTE
+    assert "commit and the merge" in AGENT_SYSTEM_NOTE  # both, not just one
+    assert "base repository" in AGENT_SYSTEM_NOTE  # tells the agent not to edit base directly
     # Under --no-worktree the worktree clause is dropped (the agent edits the branch directly),
     # but the no-self-commit guidance stays.
     from agitrack.backends.proxy_agents import agent_system_note

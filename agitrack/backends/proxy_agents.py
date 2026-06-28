@@ -20,12 +20,18 @@ _NOTE_INTRO = (
     "session."
 )
 # Included only in the default worktree model: aGiTrack runs the session in a git worktree
-# under .agitrack/ and merges it into the current branch. Omitted under --no-worktree (and
-# in shell mode), where the agent edits the current branch directly.
+# under .agitrack/ and handles BOTH the commit and the merge of the agent's edits. Omitted
+# under --no-worktree (and in shell mode), where the agent edits the current branch directly.
+# IMPORTANT: this must make clear that the agent's CURRENT working directory *is* the worktree
+# (which lives under .agitrack/worktrees/) and that edits belong there — an earlier wording
+# ("do not ... clean up anything under .agitrack/") was read as "don't write under .agitrack/",
+# so the agent edited the base repo checkout instead and its work was never committed/merged.
 _NOTE_WORKTREE = (
-    " aGiTrack runs this session in a git worktree under `.agitrack/` and automatically merges "
-    "your changes from there into the current branch, so you do not need to create, merge, or "
-    "clean up anything under `.agitrack/`."
+    " Your current working directory is this session's git worktree under "
+    "`.agitrack/worktrees/` — make all your file edits there, in the working directory, exactly "
+    "as normal. Do NOT switch to or edit the base repository checkout directly. aGiTrack handles "
+    "BOTH the commit and the merge of your worktree edits into the current branch for you, so you "
+    "never need to commit, merge, move, or clean up anything under `.agitrack/` yourself."
 )
 _NOTE_OUTRO = " Otherwise work exactly as normal."
 
