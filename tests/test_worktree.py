@@ -317,7 +317,7 @@ def test_worktree_has_pending_work(tmp_path):
     assert runner._worktree_has_pending_work(repo, repo.current_branch()) is True
 
 
-def test_reconcile_integrates_and_deletes_stale_worktrees(tmp_path):
+def test_reconcile_integrates_and_keeps_stale_worktrees(tmp_path):
 
     main = _init_repo(tmp_path)
     base = main.current_branch()
@@ -342,12 +342,12 @@ def test_reconcile_integrates_and_deletes_stale_worktrees(tmp_path):
     runner._reconcile_sessions_on_startup()
 
     names = {info.name for info in wm.list()}
-    # Stale worktrees are cleaned up; only the active session's worktree remains.
-    assert names == {"session-1"}
-    # The pending work was integrated into the base before its worktree went away
-    # (its Claude conversation persists and stays resumable).
+    # Worktrees are persistent: stale ones are reconciled but their directories are KEPT,
+    # so all three survive (the active plus both prior-run worktrees).
+    assert names == {"session-1", "merged-one", "pending-one"}
+    # The pending work was still integrated into the base.
     assert (main.repo / "p.txt").exists()
-    # A clean cleanup needs no user attention.
+    # A clean reconcile needs no user attention.
     assert messages == []
 
 
@@ -1012,27 +1012,27 @@ def test_create_recovers_from_prunable_stale_entry(tmp_path):
     assert GitRepo.discover(info2.path).rev_parse("HEAD") == main.rev_parse(base)
 
 
-def test_remove_worktree_on_exit_drops_merged_extra_session(tmp_path):
+def test_finalize_worktree_on_exit_keeps_merged_extra_session(tmp_path):
     main = _init_repo(tmp_path)
     base = main.current_branch()
     info, work = _make_session(main, "session-2", base)
     _commit(work, "a.txt", "x\n", "<aGiTrack> work")
 
     runner = _integration_runner(main, work, base, "session-2")
-    runner.worktree = info  # real WorktreeInfo so removal can find the path
+    runner.worktree = info
     runner._primary_worktree_name = "session-1"  # this is an extra session
     runner.child_pid = None
     runner.master_fd = None
     runner._integrate_session_on_exit()  # integrate -> detached at base, merged
-    runner._remove_worktree_on_exit()
+    runner._finalize_worktree_on_exit()
 
-    # A fully-merged *extra* session's worktree directory is gone on exit.
-    assert not info.path.exists()
-    assert info.name not in [w.name for w in WorktreeManager(main).list()]
-    assert runner.worktree is None
+    # Worktrees are persistent: even a fully-merged extra session keeps its worktree on exit.
+    assert info.path.exists()
+    assert info.name in [w.name for w in WorktreeManager(main).list()]
+    assert runner.worktree is info  # still tracked, not detached
 
 
-def test_remove_worktree_on_exit_persists_primary_record_then_removes(tmp_path):
+def test_finalize_worktree_on_exit_persists_primary_record_and_keeps_worktree(tmp_path):
     main = _init_repo(tmp_path)
     base = main.current_branch()
     info, work = _make_session(main, "session-1", base)
@@ -1049,19 +1049,19 @@ def test_remove_worktree_on_exit_persists_primary_record_then_removes(tmp_path):
     runner.state.backend_session_id = "sess-xyz"
 
     runner._integrate_session_on_exit()
-    runner._remove_worktree_on_exit()
+    runner._finalize_worktree_on_exit()
 
-    # The worktree (and its working state) are removed...
-    assert not info.path.exists()
-    assert runner.worktree is None
-    # ...but the resume pointer was saved to the durable repo-root state, so the
+    # The worktree is KEPT (persistent across runs)...
+    assert info.path.exists()
+    assert runner.worktree is info
+    # ...and the resume pointer was saved to the durable repo-root state, so the
     # conversation auto-resumes on the next start.
     root = AgitrackState(main.repo)
     assert root.backend_session_id == "sess-xyz"
     assert root.backend == "opencode"
 
 
-def test_remove_worktree_on_exit_keeps_unintegrated_session(tmp_path):
+def test_finalize_worktree_on_exit_keeps_unintegrated_session(tmp_path):
     main = _init_repo(tmp_path)
     base = main.current_branch()
     info, work = _make_session(main, "session-1", base)
@@ -1074,17 +1074,15 @@ def test_remove_worktree_on_exit_keeps_unintegrated_session(tmp_path):
     runner.master_fd = None
     runner._exiting = True
     runner._integrate_session_on_exit()  # conflict -> aborts, leaves the work
-    runner._remove_worktree_on_exit()
+    runner._finalize_worktree_on_exit()
 
     # A session that could not be integrated keeps its worktree for next startup.
     assert info.path.exists()
 
 
-def test_remove_worktree_on_exit_removes_dirty_worktree_after_copy_offer(tmp_path):
-    # Regression: a fully-integrated session whose worktree still holds uncommitted
-    # leftover files (e.g. an untracked file the user declined / a copied-out file
-    # whose source remains) must NOT linger forever. On an interactive exit the copy
-    # offer runs, then the worktree is removed — no "open end".
+def test_finalize_worktree_on_exit_offers_copy_then_keeps_worktree(tmp_path):
+    # On an interactive exit the copy offer still runs so leftover/newer worktree files can
+    # be copied into the base — but the worktree is now KEPT (persistent), not removed.
     main = _init_repo(tmp_path)
     base = main.current_branch()
     info, work = _make_session(main, "session-1", base)
@@ -1095,6 +1093,7 @@ def test_remove_worktree_on_exit_removes_dirty_worktree_after_copy_offer(tmp_pat
     runner.child_pid = None
     runner.master_fd = None
     runner.screen = object()  # interactive exit: a UI exists to offer the copy
+    runner._exit_delete_worktrees = False  # user chose to keep worktrees this exit
     runner._exit_aborted = False
     offered: list = []
     runner._offer_copy_unstaged_to_base = lambda **k: offered.append(k.get("context"))
@@ -1102,12 +1101,61 @@ def test_remove_worktree_on_exit_removes_dirty_worktree_after_copy_offer(tmp_pat
     runner._integrate_session_on_exit()  # clean integrate -> nothing ahead of base
     (work.repo / "leftover.txt").write_text("stranded\n")  # uncommitted leftover file
     assert work.has_changes()  # the worktree is dirty...
-    runner._remove_worktree_on_exit()
+    runner._finalize_worktree_on_exit()
 
-    # ...but it is still removed (after the copy offer), not stranded.
+    # The copy offer ran, and the worktree is kept (its files stay available next run).
     assert offered == ["exit"]
+    assert info.path.exists()
+    assert runner.worktree is info
+
+
+def test_finalize_worktree_on_exit_deletes_merged_when_user_chooses(tmp_path):
+    # When the user chooses "Delete them" at the exit prompt, a fully-merged session's
+    # worktree is removed (after the copy offer rescues any leftover files).
+    main = _init_repo(tmp_path)
+    base = main.current_branch()
+    info, work = _make_session(main, "session-1", base)
+    _commit(work, "a.txt", "x\n", "<aGiTrack> work")
+
+    runner = _integration_runner(main, work, base, "session-1")
+    runner.worktree = info
+    runner.child_pid = None
+    runner.master_fd = None
+    runner.screen = object()
+    runner._exit_delete_worktrees = True  # user chose to delete worktrees this exit
+    runner._exit_aborted = False
+    runner._offer_copy_unstaged_to_base = lambda **k: None  # nothing to rescue here
+
+    runner._integrate_session_on_exit()  # clean integrate -> nothing ahead of base
+    runner._finalize_worktree_on_exit()
+
     assert not info.path.exists()
     assert runner.worktree is None
+
+
+def test_finalize_worktree_on_exit_delete_choice_keeps_unintegrated(tmp_path):
+    # Even when the user chooses delete, an unintegrated session keeps its worktree so no
+    # un-merged work is discarded.
+    main = _init_repo(tmp_path)
+    base = main.current_branch()
+    info, work = _make_session(main, "session-1", base)
+    _commit(work, "f.txt", "wt change\n", "wt")
+    _commit(main, "f.txt", "base change\n", "base")  # diverges -> can't fast-forward
+
+    runner = _integration_runner(main, work, base, "session-1")
+    runner.worktree = info
+    runner.child_pid = None
+    runner.master_fd = None
+    runner.screen = object()
+    runner._exit_delete_worktrees = True
+    runner._exit_aborted = False
+    runner._exiting = True
+    runner._offer_copy_unstaged_to_base = lambda **k: None
+
+    runner._integrate_session_on_exit()  # conflict -> aborts, leaves the work
+    runner._finalize_worktree_on_exit()
+
+    assert info.path.exists()  # unintegrated work is never discarded
 
 
 def test_remove_worktree_on_signal_exit_keeps_dirty_worktree(tmp_path):
@@ -1128,7 +1176,7 @@ def test_remove_worktree_on_signal_exit_keeps_dirty_worktree(tmp_path):
 
     runner._integrate_session_on_exit()
     (work.repo / "leftover.txt").write_text("stranded\n")
-    runner._remove_worktree_on_exit()
+    runner._finalize_worktree_on_exit()
 
     # Kept so the leftover file isn't lost.
     assert info.path.exists()
@@ -1490,3 +1538,327 @@ def test_agent_made_commits_integrate_when_idle(tmp_path):
     assert (main.repo / "agent.txt").read_text() == "committed by the agent itself\n"
     assert work.is_detached()
     assert main.list_branches("agitrack/") == []
+
+
+# --- full environment copy (untracked + ignored) on worktree creation ---
+
+
+def test_copy_base_environment_copies_untracked_and_ignored(tmp_path):
+    # git worktree add only checks out TRACKED files; copy_base_environment brings the rest of
+    # the base environment (untracked files, ignored files, and wholly-ignored dirs) across so
+    # the worktree is a faithful clone of the working environment, not just the committed files.
+    repo = _init_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text("ignored.txt\nbuild/\n")
+    repo.stage_paths([".gitignore"])
+    repo.commit("ignore rules")
+    (tmp_path / "scratch.txt").write_text("untracked\n")  # untracked, not ignored
+    (tmp_path / "ignored.txt").write_text("secret\n")  # ignored file
+    (tmp_path / "build").mkdir()
+    (tmp_path / "build" / "out.bin").write_text("artifact\n")  # wholly-ignored directory
+
+    wm = WorktreeManager(repo)
+    info = wm.create("envtest", base=repo.current_branch())
+    assert (info.path / "f.txt").read_text() == "base\n"  # tracked file checked out by git
+    assert not (info.path / "scratch.txt").exists()  # create() does NOT copy the environment
+
+    copied = wm.copy_base_environment(info.path)
+
+    assert (info.path / "scratch.txt").read_text() == "untracked\n"
+    assert (info.path / "ignored.txt").read_text() == "secret\n"
+    assert (info.path / "build" / "out.bin").read_text() == "artifact\n"
+    assert set(copied) >= {"scratch.txt", "ignored.txt"}
+    # aGiTrack's own state dir (which holds the worktrees) is never copied across.
+    assert not (info.path / ".agitrack" / "worktrees").exists()
+
+
+def test_base_newer_entries_and_copy_entries_refresh(tmp_path):
+    import os
+    import time
+
+    repo = _init_repo(tmp_path)
+    (tmp_path / "scratch.txt").write_text("v1\n")
+    wm = WorktreeManager(repo)
+    info = wm.create("envtest", base=repo.current_branch())
+    wm.copy_base_environment(info.path)
+    assert (info.path / "scratch.txt").read_text() == "v1\n"
+    assert wm.base_newer_entries(info.path) == []  # just copied — same mtime, nothing newer
+
+    (tmp_path / "scratch.txt").write_text("v2\n")  # the base moves on...
+    future = time.time() + 100  # ...with a clearly newer mtime (deterministic, no sleep)
+    os.utime(tmp_path / "scratch.txt", (future, future))
+    assert wm.base_newer_entries(info.path) == ["scratch.txt"]
+    assert wm.copy_entries(info.path, ["scratch.txt"]) == ["scratch.txt"]
+    assert (info.path / "scratch.txt").read_text() == "v2\n"
+    assert wm.base_newer_entries(info.path) == []  # back in sync
+
+
+def test_newest_worktree_session_picks_most_recently_updated(tmp_path):
+    import types
+
+    from agitrack.transcripts.types import SessionRef
+
+    main = _init_repo(tmp_path)
+    runner = make_runner(base_repo=main)
+    runner.worktree_manager = WorktreeManager(main)
+    runner.backend = types.SimpleNamespace(
+        list_worktree_sessions=lambda root: [
+            ("sess-a", SessionRef(id="id-a", updated=100.0, label="first")),
+            ("sess-b", SessionRef(id="id-b", updated=200.0, label="latest work")),  # most recent w/ content
+            ("sess-c", SessionRef(id="id-c", updated=150.0, label="middle")),
+        ]
+    )
+    runner._debug = lambda *a, **k: None
+
+    assert runner._newest_worktree_session() == ("id-b", 200.0)
+
+
+def test_newest_worktree_session_skips_empty_picks_latest_with_content(tmp_path):
+    # Regression: a backend mints a fresh EMPTY session id on resume/picker-open; that empty
+    # transcript is newest by mtime but has nothing to resume (label is None). It must be
+    # skipped so the latest CONTENT-ful worktree session wins — otherwise baseline-init falls
+    # back to an unrelated OLDER session ("an older session opened" under --no-worktree).
+    import types
+
+    from agitrack.transcripts.types import SessionRef
+
+    main = _init_repo(tmp_path)
+    runner = make_runner(base_repo=main)
+    runner.worktree_manager = WorktreeManager(main)
+    runner.backend = types.SimpleNamespace(
+        list_worktree_sessions=lambda root: [
+            ("feature", SessionRef(id="id-content", updated=100.0, label="real work")),
+            ("feature", SessionRef(id="id-empty", updated=999.0, label=None)),  # newest, but empty
+        ]
+    )
+    runner._debug = lambda *a, **k: None
+
+    assert runner._newest_worktree_session() == ("id-content", 100.0)
+
+
+def test_newest_worktree_session_none_when_no_worktree_conversations(tmp_path):
+    import types
+
+    main = _init_repo(tmp_path)
+    runner = make_runner(base_repo=main)
+    runner.worktree_manager = WorktreeManager(main)
+    runner.backend = types.SimpleNamespace(list_worktree_sessions=lambda root: [])
+    runner._debug = lambda *a, **k: None
+
+    assert runner._newest_worktree_session() is None
+
+
+def test_present_pending_env_refresh_overwrites_on_yes(tmp_path):
+    main = _init_repo(tmp_path)
+    base = main.current_branch()
+    wm = WorktreeManager(main)
+    info = wm.create("sess", base=base)
+    (main.repo / "cfg.txt").write_text("base-v2\n")  # base has a newer version...
+    (info.path / "cfg.txt").write_text("wt-v1\n")  # ...worktree holds an older copy
+
+    runner = make_runner(base_repo=main)
+    runner.worktree_manager = wm
+    runner._select_popup = lambda *a, **k: "Yes, update from the base repo"
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda: None
+    runner._pending_env_refresh = [(info.path, ["cfg.txt"])]
+
+    runner._present_pending_env_refresh()
+
+    assert (info.path / "cfg.txt").read_text() == "base-v2\n"
+    assert runner._pending_env_refresh == []
+
+
+def test_present_pending_env_refresh_keeps_worktree_on_no(tmp_path):
+    main = _init_repo(tmp_path)
+    base = main.current_branch()
+    wm = WorktreeManager(main)
+    info = wm.create("sess", base=base)
+    (main.repo / "cfg.txt").write_text("base-v2\n")
+    (info.path / "cfg.txt").write_text("wt-v1\n")
+
+    runner = make_runner(base_repo=main)
+    runner.worktree_manager = wm
+    runner._select_popup = lambda *a, **k: "No, keep the worktree versions"
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda: None
+    runner._pending_env_refresh = [(info.path, ["cfg.txt"])]
+
+    runner._present_pending_env_refresh()
+
+    assert (info.path / "cfg.txt").read_text() == "wt-v1\n"  # untouched
+    assert runner._pending_env_refresh == []
+
+
+# --- create-time "copy full env vs tracked-only" prompt + copy-loop prevention ---
+
+
+def test_present_pending_env_copy_default_is_tracked_only(tmp_path):
+    main = _init_repo(tmp_path)
+    base = main.current_branch()
+    (main.repo / "scratch.txt").write_text("env\n")  # an untracked base env file
+    wm = WorktreeManager(main)
+    info = wm.create("sess", base=base)
+
+    runner = make_runner(base_repo=main)
+    runner.worktree_manager = wm
+    runner.global_config = type("G", (), {"default_backend": "claude"})()
+    runner._select_popup = lambda *a, **k: "Only the tracked files"  # the default choice
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda: None
+    runner._pending_env_copy = [(info.path, "sess")]
+
+    runner._present_pending_env_copy()
+
+    assert not (info.path / "scratch.txt").exists()  # tracked-only → environment NOT copied
+    assert AgitrackState(info.path).copy_full_env is False
+    assert runner._pending_env_copy == []
+
+
+def test_present_pending_env_copy_full_env_copies_and_persists(tmp_path):
+    main = _init_repo(tmp_path)
+    base = main.current_branch()
+    (main.repo / "scratch.txt").write_text("env\n")
+    wm = WorktreeManager(main)
+    info = wm.create("sess", base=base)
+
+    runner = make_runner(base_repo=main)
+    runner.worktree_manager = wm
+    runner.global_config = type("G", (), {"default_backend": "claude"})()
+    runner._select_popup = lambda *a, **k: "Copy the full environment"
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda: None
+    runner._pending_env_copy = [(info.path, "sess")]
+
+    runner._present_pending_env_copy()
+
+    assert (info.path / "scratch.txt").read_text() == "env\n"  # full env copied in
+    assert AgitrackState(info.path).copy_full_env is True  # choice persisted on the worktree
+    # The copied file is tracked as base-origin so it won't be offered for copy-back.
+    assert "scratch.txt" in runner._env_from_base.get(str(info.path), {})
+
+
+def test_copy_back_skips_unchanged_files_copied_from_base(tmp_path):
+    # A file copied INTO the worktree FROM the base must not then be offered to be copied BACK
+    # (a base → worktree → base loop) while it is unchanged.
+    main = _init_repo(tmp_path)
+    base = main.current_branch()
+    (main.repo / "data.bin").write_text("payload\n")
+    wm = WorktreeManager(main)
+    info = wm.create("sess", base=base)
+    copied = wm.copy_base_environment(info.path)
+    assert "data.bin" in copied
+
+    runner = make_runner(base_repo=main, worktree=info, repo=GitRepo(info.path))
+    runner.worktree_manager = wm
+    runner._debug = lambda *a, **k: None
+    runner._mark_env_from_base(info.path, copied)
+
+    # data.bin is untracked in the worktree, but came from base unchanged → not offered.
+    assert runner._collect_copy_candidates(context="turn") is None
+
+    # Once the agent edits it, it IS offered (genuine new content, no longer matches).
+    (info.path / "data.bin").write_text("edited by the agent\n")
+    result = runner._collect_copy_candidates(context="turn")
+    assert result is not None and "data.bin" in result[0]
+
+
+# --- untracked_entries: directory-level decline tracking ---
+
+
+def test_untracked_entries_collapses_wholly_untracked_dirs(tmp_path):
+    repo = _init_repo(tmp_path)
+    (tmp_path / "top.txt").write_text("x\n")  # individual untracked file
+    (tmp_path / "newdir").mkdir()
+    (tmp_path / "newdir" / "a.txt").write_text("a\n")
+    (tmp_path / "newdir" / "b.txt").write_text("b\n")  # wholly-untracked directory
+
+    entries = set(repo.untracked_entries())
+    files = set(repo.untracked_files())
+
+    assert "top.txt" in entries
+    assert "newdir/" in entries  # the directory collapses to ONE entry...
+    assert "newdir/a.txt" not in entries
+    # ...whereas untracked_files lists each file under it.
+    assert {"newdir/a.txt", "newdir/b.txt"} <= files
+
+
+def test_declined_directory_survives_new_files_inside(tmp_path):
+    # Regression: declining a directory must keep it declined even as new files appear inside.
+    # With per-file tracking (untracked_files) a new file in the dir wasn't covered and the
+    # prompt returned; untracked_entries collapses the dir so the single decline keeps holding.
+    from agitrack.config import AgitrackState
+
+    repo = _init_repo(tmp_path)
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "one.txt").write_text("1\n")
+    state = AgitrackState(tmp_path)
+
+    state.add_declined(repo.untracked_entries())  # user declines (e.g. "data/")
+    assert "data/" in state.declined_untracked()
+
+    # A new file appears inside the already-declined directory.
+    (tmp_path / "data" / "two.txt").write_text("2\n")
+    # Pruning keeps only still-untracked entries — the collapsed "data/" is still untracked.
+    state.keep_declined(repo.untracked_entries())
+    assert "data/" in state.declined_untracked()  # still declined, not re-surfaced
+
+    promptable = [e for e in repo.untracked_entries() if e not in set(state.declined_untracked())]
+    assert promptable == []  # nothing new to ask about — the directory stays muted
+
+
+def test_untracked_listings_exclude_agent_scaffolding_dirs(tmp_path):
+    # Agent/tooling folders (.agitrack, .claude, .opencode) must never be surfaced as untracked
+    # changes — the user should never be asked to stage an agent's own directory.
+    repo = _init_repo(tmp_path)
+    (tmp_path / "real.txt").write_text("x\n")
+    for d in (".claude", ".opencode", ".agitrack"):
+        (tmp_path / d).mkdir()
+        (tmp_path / d / "f.json").write_text("{}\n")
+
+    entries = repo.untracked_entries()
+    files = repo.untracked_files()
+
+    assert "real.txt" in entries and "real.txt" in files
+    assert not any(e.startswith((".claude/", ".opencode/", ".agitrack/")) for e in entries)
+    assert not any(f.startswith((".claude/", ".opencode/", ".agitrack/")) for f in files)
+
+
+def test_copy_back_skips_collapsed_dir_copied_from_base_via_watermark(tmp_path):
+    # Regression: a wholly-untracked directory copied from base is reported by the copy-back
+    # offer collapsed as "dir/", which the per-file registry can't match. The env-copy watermark
+    # covers it: nothing left unmodified since the copy is offered back; a later edit inside is.
+    import time
+
+    main = _init_repo(tmp_path)
+    base = main.current_branch()
+    (main.repo / "assets").mkdir()
+    (main.repo / "assets" / "logo.png").write_text("PNG\n")  # untracked dir in base
+    wm = WorktreeManager(main)
+    info = wm.create("feature", base=base)
+
+    runner = make_runner(base_repo=main, worktree=info, repo=GitRepo(info.path))
+    runner.worktree_manager = wm
+    runner._debug = lambda *a, **k: None
+    runner._offer_user_commit_for_worktree_edits = lambda: None
+
+    copied = wm.copy_base_environment(info.path)
+    assert "assets/" in copied  # collapsed directory entry
+    runner._env_copy_watermark[str(info.path)] = time.time()  # stamp copy completion
+
+    # The collapsed "assets/" came from the copy and isn't modified since → not offered back.
+    assert runner._collect_copy_candidates(context="turn") is None
+
+    # A new file created in the worktree dir AFTER the copy bumps the dir mtime → offered.
+    time.sleep(0.01)
+    (info.path / "assets" / "fresh.png").write_text("new\n")
+    os_utime_now(info.path / "assets")
+    result = runner._collect_copy_candidates(context="turn")
+    assert result is not None and "assets/" in result[0]
+
+
+def os_utime_now(path):
+    import os
+    import time
+
+    now = time.time() + 5  # safely after the watermark
+    os.utime(path, (now, now))

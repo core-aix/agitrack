@@ -139,7 +139,7 @@ Conventions:
 | Double-Ctrl-C → force exit but still finalize | `test_double_ctrl_c_finalizes_before_exiting` | mock |
 | Ctrl-C inside a popup routes through the exit flow | `test_select_popup_ctrl_c_routes_through_exit_flow` | mock |
 | Finalize commits the latest turn non-interactively | `test_finalize_pending_work_commits_non_interactively` | mock |
-| Remove fully-merged worktree; keep unintegrated/unresolvable | `test_exit_removes_fully_merged_worktree`, `test_exit_keeps_worktree_with_unintegrated_commits`, `_when_base_ref_unresolvable` | real-git |
+| Exit asks keep-or-delete worktrees (default keep); delete only fully-merged | `test_exit_keeps_fully_merged_worktree`, `test_exit_worktree_prompt_lists_paths_and_caches_decision`, `test_finalize_worktree_on_exit_deletes_merged_when_user_chooses`, `test_finalize_worktree_on_exit_delete_choice_keeps_unintegrated` | real-git |
 | Persist resume pointer (last active, even if not primary / worktree kept) | `test_exit_persists_resume_pointer_*` | mock |
 | `exit`/`quit` command routes through the unified flow | `test_exit_command_routes_through_unified_exit_flow`, `_cancelled_does_not_request_exit` | mock |
 | Signal teardown (terminal closed) keeps a worktree with leftover files | `test_handle_exit_signal_*` *(posix-only: SIGHUP/SIGTERM delivery)* | mock |
