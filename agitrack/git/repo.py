@@ -189,6 +189,21 @@ class GitRepo:
     def rev_parse(self, ref: str) -> str:
         return self._run(["git", "rev-parse", ref]).stdout.strip()
 
+    def hooks_dir(self) -> Path:
+        """The shared hooks directory (under the common git dir, so it covers the base
+        repo and all its linked worktrees). Used to install the base-commit guard hook."""
+        common = self._run(["git", "rev-parse", "--git-common-dir"], check=False).stdout.strip() or ".git"
+        base = Path(common)
+        if not base.is_absolute():
+            base = self.repo / base
+        return (base / "hooks").resolve()
+
+    def core_hooks_path(self) -> str | None:
+        """The configured ``core.hooksPath`` (which, when set, makes git ignore the
+        default hooks dir), or ``None`` if unset."""
+        value = self._run(["git", "config", "--get", "core.hooksPath"], check=False).stdout.strip()
+        return value or None
+
     def branch_exists(self, name: str) -> bool:
         return self._run(["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{name}"], check=False).returncode == 0
 

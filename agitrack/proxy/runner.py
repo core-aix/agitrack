@@ -37,6 +37,7 @@ from agitrack.commits import (
     summary_metadata_lines,
 )
 from agitrack.git import GitRepo
+from agitrack.git import hooks as git_hooks
 from agitrack.config import GlobalConfig
 from agitrack.git import RepoLock, already_running_message
 from agitrack.proxy import host_prompt, sandbox
@@ -1301,6 +1302,7 @@ class ProxyRunner:
                 signal.signal(signal.SIGTERM, self._handle_exit_signal)
                 signal.signal(signal.SIGHUP, self._handle_exit_signal)
             self._setup_worktree_confinement_notice()
+            self._install_base_commit_guard()  # hard-stop agent commits to base when no OS sandbox
             exit_code = self._loop()  # the timers phase auto-applies a sandbox-blocked backend update
         finally:
             if self.original_sigwinch is not None and hasattr(signal, "SIGWINCH"):
@@ -1310,6 +1312,7 @@ class ProxyRunner:
             self._stop_git_worker()  # join before tearing the worktree/PTY down
             self._stop_file_watcher()
             self._stop_dashboard()
+            self._remove_base_commit_guard()  # uninstall the pre-commit guard + restore any chained hook
             self._cleanup_child()
             self._restore_terminal()
             if self._host is not None:
@@ -1519,12 +1522,43 @@ class ProxyRunner:
             self._base_status_baseline: set[str] = set(self.base_repo.status_short().splitlines())
         except Exception:
             self._base_status_baseline = set()
-        # Also remember the base branch tip, so we can catch the agent *committing* straight
-        # onto base (which leaves a clean tree, so the status check above misses it).
+
+    def _base_commit_guard_active(self) -> bool:
+        """Whether to enforce "no agent commits to the base repo" via the pre-commit guard hook.
+
+        Active exactly when confinement is wanted in worktree mode but the OS sandbox can't
+        enforce it — i.e. on any platform where ``sandbox.is_available()`` is False (Windows, or
+        POSIX without bwrap/seatbelt). On POSIX with a working sandbox the base repo is already
+        read-only to the agent, so the hook would be redundant. Turned off by disabling
+        confinement (``--no-sandbox`` / ``sandbox: false`` / ``AGITRACK_SANDBOX=0``)."""
+        return bool(
+            self._use_worktrees
+            and self.worktree is not None
+            and self._sandbox
+            and sandbox.is_enabled()
+            and not sandbox.is_available()
+        )
+
+    def _install_base_commit_guard(self) -> None:
+        # Install the pre-commit guard in the base repo when active. Skipped (with a note) when a
+        # custom core.hooksPath is configured, since our hook in the default dir wouldn't run and
+        # overriding the user's hooksPath would disable their own hooks.
+        if not self._base_commit_guard_active():
+            return
         try:
-            self._base_head_baseline: str | None = self.base_repo.rev_parse("HEAD")
-        except Exception:
-            self._base_head_baseline = None
+            if self.base_repo.core_hooks_path():
+                self._debug("base-commit guard skipped: core.hooksPath is set")
+                return
+            git_hooks.install_base_commit_guard(self.base_repo.hooks_dir(), debug=self._debug)
+        except Exception as error:  # never let hook setup block startup
+            self._debug(f"base-commit guard install failed: {error!r}")
+
+    def _remove_base_commit_guard(self) -> None:
+        try:
+            if self.base_repo is not None and not self.base_repo.core_hooks_path():
+                git_hooks.remove_base_commit_guard(self.base_repo.hooks_dir(), debug=self._debug)
+        except Exception as error:
+            self._debug(f"base-commit guard removal failed: {error!r}")
 
     def _check_base_branch_drift(self) -> None:
         # Poll the branch checked out in the repo directory. The status bar bolds a
@@ -1833,10 +1867,12 @@ class ProxyRunner:
         return True
 
     def _warn_if_base_edited(self) -> None:
-        # Fallback for un-sandboxed platforms: detect the agent writing into the base
-        # repo — either uncommitted edits (working tree gains changes beyond the startup
-        # baseline) OR commits made straight onto the base branch — and warn, since both
-        # bypass aGiTrack's worktree tracking.
+        # Fallback for un-sandboxed platforms: detect the agent editing the base
+        # repo (its working tree gaining uncommitted changes beyond the startup
+        # baseline) and warn, since those edits bypass aGiTrack's worktree tracking.
+        # (A direct *commit* to base is prevented outright by the pre-commit guard
+        # hook — see agitrack/git/hooks.py — which can attribute reliably via an env
+        # marker, something this status-based check cannot do.)
         if not self._monitor_base_edits:
             return
         now = time.monotonic()
@@ -1857,42 +1893,6 @@ class ProxyRunner:
             )
             self._base_status_baseline = current  # don't repeat for the same files
             self._render()
-        # Commit-to-base detection: the agent ran `git commit` straight onto the base branch.
-        # That leaves a clean tree, so the edit check above can't see it. aGiTrack's own base
-        # commits (user edits, agent covers, integration merges) all carry the metadata header;
-        # a new commit on base WITHOUT it is a raw commit made outside the worktree. Warn once
-        # (and re-baseline either way — aGiTrack's own commits advance the baseline silently).
-        try:
-            head = self.base_repo.rev_parse("HEAD")
-        except Exception:
-            head = None
-        if head is not None and head != self._base_head_baseline:
-            raw: list[str] = []
-            if self._base_head_baseline is not None:
-                try:
-                    raw = [
-                        sha
-                        for sha in self.base_repo.log_shas(self._base_head_baseline, head)
-                        if METADATA_HEADER not in self.base_repo.commit_message(sha)
-                    ]
-                except Exception:
-                    raw = []
-            self._base_head_baseline = head  # advance regardless, so we warn at most once per batch
-            # The agent and the user share one git identity, so a raw base commit can't be
-            # attributed by content alone. Only treat it as the agent's when an agent turn was
-            # active around when it landed; a commit made while the session is idle is almost
-            # certainly the user's own, so stay quiet then (don't mislabel your commits).
-            agent_active = self._agent_is_active() or (now - self.last_child_output) < self.CHILD_IDLE_SECONDS * 2
-            if raw and agent_active:
-                count = len(raw)
-                plural = "commit" if count == 1 else "commits"
-                self._set_message(
-                    f"Agent committed to the base repo, outside its worktree ({count} {plural}). "
-                    "Those commits bypass aGiTrack's tracking — make changes in the worktree and "
-                    "let aGiTrack commit them.",
-                    seconds=12.0,
-                )
-                self._render()
 
     def _rebaseline_base_edits(self) -> None:
         # Re-baseline the un-sandboxed base-edit monitor after aGiTrack ITSELF wrote into the base
@@ -2396,6 +2396,12 @@ class ProxyRunner:
         checks_on = self.global_config is None or getattr(self.global_config, "check_for_updates", True)
         if getattr(self.backend, "name", None) == "opencode" and checks_on and self._backend_update_via_agitrack():
             env["OPENCODE_DISABLE_AUTOUPDATE"] = "1"
+        # Mark the agent's process tree so the base-repo pre-commit guard (agitrack/git/hooks.py)
+        # can tell THIS agent's commits from the user's. Set only when the guard is active (see
+        # _base_commit_guard_active). Any git the agent runs inherits this; the user's own shell
+        # and agents run outside aGiTrack don't have it, so they commit freely.
+        if self._base_commit_guard_active():
+            env[git_hooks.ENV_GUARD] = "1"
         if os.name == "nt":
             # On Windows aGiTrack skips host-terminal capability detection (the console doesn't
             # answer the OSC/DA color queries the POSIX path uses), so a backend that probes the
