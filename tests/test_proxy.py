@@ -797,7 +797,7 @@ def test_unmerged_excludes_active_while_agent_running(tmp_path):
 def test_committable_changes_ignores_declined_untracked(tmp_path):
     runner = _merge_runner(tmp_path)
     runner.repo.has_tracked_changes = lambda: False
-    runner.repo.untracked_files = lambda: ["a.py"]
+    runner.repo.untracked_entries = lambda: ["a.py"]
     runner.state.declined_untracked = lambda: ["a.py"]  # intentionally unstaged -> not committable
     assert runner._active_has_committable_changes() is False
     runner.state.declined_untracked = lambda: []
@@ -7254,6 +7254,9 @@ def test_actions_agent_commit_failed_attempt_does_not_double_count(tmp_path):
             pass
 
         def untracked_files(self):
+            return []
+
+        def untracked_entries(self):
             return []
 
         def has_staged_changes(self):

@@ -58,15 +58,56 @@ class PromptModal:
     # draws its own caret — otherwise the input line looks like a read-only label.
     CARET = "█"
 
-    def __init__(self, title: str, prompt: str, *, default: str = "") -> None:
+    def __init__(
+        self,
+        title: str,
+        prompt: str,
+        *,
+        default: str = "",
+        detail: list[str] | None = None,
+        viewport_rows: int | None = None,
+    ) -> None:
         self.title = title
         self.prompt = prompt
         self.value = default
+        # Optional context lines shown between the title and the input (e.g. the files being
+        # committed). Windowed and PgUp/PgDn-scrollable when they overflow the terminal.
+        self.detail = list(detail or [])
+        self.viewport_rows = viewport_rows
+        self.detail_scroll = 0
         self._escape_buffer: bytearray | None = None
+
+    def _detail_window(self) -> int:
+        """How many detail lines fit at once, leaving room for the title, prompt, input line,
+        and scroll hints. Without a known terminal height, show them all (the box clamps)."""
+        if not self.detail:
+            return 0
+        if not self.viewport_rows:
+            return len(self.detail)
+        title_lines = self.title.count("\n") + 1
+        prompt_lines = self.prompt.count("\n") + 1
+        overhead = title_lines + prompt_lines + 4  # input line, hint line, 2 scroll hints
+        return max(3, self.viewport_rows - 4 - overhead)
 
     def render_message(self) -> str:
         """Return the message string that should be shown in the popup area."""
-        return f"{self.title}\n{self.prompt}\n> {self.value}{self.CARET}"
+        lines = [self.title]
+        window = self._detail_window()
+        if self.detail:
+            total = len(self.detail)
+            start = max(0, min(self.detail_scroll, max(0, total - window)))
+            self.detail_scroll = start  # clamp persisted so PgDn past the end is a no-op
+            if start > 0:
+                lines.append(f"  ↑ {start} more above")
+            lines.extend("  " + line for line in self.detail[start : start + window])
+            below = total - (start + window)
+            if below > 0:
+                lines.append(f"  ↓ {below} more below")
+            if total > window:
+                lines.append("(PgUp/PgDn scroll the file list)")
+        lines.append(self.prompt)
+        lines.append(f"> {self.value}{self.CARET}")
+        return "\n".join(lines)
 
     def feed(self, data: bytes) -> tuple[str, str | None]:
         """Process *data* bytes and return an action tuple.
@@ -82,10 +123,18 @@ class PromptModal:
         for byte in data:
             char = bytes([byte])
 
-            # Inside an escape sequence: accumulate until complete, then drop.
+            # Inside an escape sequence: accumulate until complete. PgUp/PgDn scroll the
+            # detail list; any other complete sequence (arrows, etc.) is dropped.
             if self._escape_buffer is not None:
                 self._escape_buffer.extend(char)
-                if _escape_sequence_complete(bytes(self._escape_buffer)):
+                sequence = bytes(self._escape_buffer)
+                if sequence == b"\x1b[5~":  # PageUp — scroll the detail list up
+                    self.detail_scroll = max(0, self.detail_scroll - max(1, self._detail_window() - 1))
+                    self._escape_buffer = None
+                elif sequence == b"\x1b[6~":  # PageDown — scroll the detail list down
+                    self.detail_scroll += max(1, self._detail_window() - 1)
+                    self._escape_buffer = None
+                elif _escape_sequence_complete(sequence):
                     self._escape_buffer = None
                 continue
 

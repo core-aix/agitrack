@@ -1760,3 +1760,47 @@ def test_copy_back_skips_unchanged_files_copied_from_base(tmp_path):
     (info.path / "data.bin").write_text("edited by the agent\n")
     result = runner._collect_copy_candidates(context="turn")
     assert result is not None and "data.bin" in result[0]
+
+
+# --- untracked_entries: directory-level decline tracking ---
+
+
+def test_untracked_entries_collapses_wholly_untracked_dirs(tmp_path):
+    repo = _init_repo(tmp_path)
+    (tmp_path / "top.txt").write_text("x\n")  # individual untracked file
+    (tmp_path / "newdir").mkdir()
+    (tmp_path / "newdir" / "a.txt").write_text("a\n")
+    (tmp_path / "newdir" / "b.txt").write_text("b\n")  # wholly-untracked directory
+
+    entries = set(repo.untracked_entries())
+    files = set(repo.untracked_files())
+
+    assert "top.txt" in entries
+    assert "newdir/" in entries  # the directory collapses to ONE entry...
+    assert "newdir/a.txt" not in entries
+    # ...whereas untracked_files lists each file under it.
+    assert {"newdir/a.txt", "newdir/b.txt"} <= files
+
+
+def test_declined_directory_survives_new_files_inside(tmp_path):
+    # Regression: declining a directory must keep it declined even as new files appear inside.
+    # With per-file tracking (untracked_files) a new file in the dir wasn't covered and the
+    # prompt returned; untracked_entries collapses the dir so the single decline keeps holding.
+    from agitrack.config import AgitrackState
+
+    repo = _init_repo(tmp_path)
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "one.txt").write_text("1\n")
+    state = AgitrackState(tmp_path)
+
+    state.add_declined(repo.untracked_entries())  # user declines (e.g. "data/")
+    assert "data/" in state.declined_untracked()
+
+    # A new file appears inside the already-declined directory.
+    (tmp_path / "data" / "two.txt").write_text("2\n")
+    # Pruning keeps only still-untracked entries — the collapsed "data/" is still untracked.
+    state.keep_declined(repo.untracked_entries())
+    assert "data/" in state.declined_untracked()  # still declined, not re-surfaced
+
+    promptable = [e for e in repo.untracked_entries() if e not in set(state.declined_untracked())]
+    assert promptable == []  # nothing new to ask about — the directory stays muted
