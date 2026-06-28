@@ -499,6 +499,19 @@ class AgitrackState:
         self._save_config()
 
     @property
+    def copy_full_env(self) -> bool:
+        # Whether this worktree was created with the FULL base environment copied in
+        # (untracked + git-ignored files), as opposed to only the tracked files git checks
+        # out. Persisted per worktree so a later reuse knows whether to keep the environment
+        # in sync with the base, rather than re-asking or syncing a tracked-only worktree.
+        return bool(self.config.get("copy_full_env", False))
+
+    @copy_full_env.setter
+    def copy_full_env(self, value: bool) -> None:
+        self.config["copy_full_env"] = bool(value)
+        self._save_config()
+
+    @property
     def summarization_model(self) -> str | None:
         value = self.config.get("summarization_model")
         return str(value) if value else None

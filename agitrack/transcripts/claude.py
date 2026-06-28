@@ -50,6 +50,10 @@ _COMMAND_TAGS = (
     "<task-notification>",
 )
 
+# Label for a turn that the agent ran in response to a completed background task (rather than
+# a user prompt). See `_is_task_notification` and `parse_rows`.
+_BACKGROUND_TURN_LABEL = "(background task completed)"
+
 # A typed slash command is recorded as a synthetic user row carrying a
 # <command-name>/foo</command-name> artifact (see `_slash_command_name`). For
 # commands that DO real work — most importantly /init, which writes CLAUDE.md —
@@ -182,13 +186,24 @@ def prepare_resume(worktree: Path, session_id: str) -> bool:
     worktree = Path(worktree)
     target_dir = _project_dir(worktree)
     target = target_dir / f"{session_id}.jsonl"
-    if target.is_file():
-        return True
-    source = _find_session_file(session_id)
+    source = _find_session_file(session_id)  # newest copy of this id across all project dirs
     if source is None:
-        return False
+        return target.is_file()  # nothing better to stage; keep whatever is already there
     if source.resolve() == target.resolve():
-        return True
+        return True  # the target already IS the freshest copy (or hardlinked to it)
+    # A copy may already sit at the target but be STALE: a prior resume hardlinked it, then
+    # cwd-retargeting broke the hardlink, freezing it while the live copy elsewhere kept growing.
+    # Returning early on mere existence would resume that OLDER frozen snapshot. Keep the existing
+    # target only when it is at least as fresh (mtime AND size) as the newest source; otherwise
+    # replace it so the resume gets the FULL, current conversation, not an older state.
+    if target.is_file():
+        try:
+            src_stat, dst_stat = source.stat(), target.stat()
+            if dst_stat.st_mtime >= src_stat.st_mtime and dst_stat.st_size >= src_stat.st_size:
+                return True
+            target.unlink()  # stale -> re-stage the newest copy below
+        except OSError:
+            return True
     try:
         target_dir.mkdir(parents=True, exist_ok=True)
     except OSError:
@@ -508,6 +523,36 @@ def _find_session_file(session_id: str) -> Path | None:
     return newest[1] if newest else None
 
 
+_TIMESTAMP_RE = re.compile(r'"timestamp"\s*:\s*"([^"]+)"')
+
+
+def session_last_activity(session_id: str) -> float | None:
+    """Last-activity time (epoch seconds) of a session, read from its transcript's CONTENT —
+    the newest message ``timestamp`` — rather than the file's mtime. aGiTrack's own staging /
+    cwd-retargeting rewrites a transcript (bumping the FILE mtime) without adding any message,
+    so mtime is an unreliable "most recent conversation" signal — it can make an older session
+    look newest after aGiTrack touches it. The message timestamps don't move, so they rank the
+    conversations by genuine user activity. None if the transcript isn't found or has no stamp."""
+    if not session_id:
+        return None
+    path = _find_session_file(session_id)
+    if path is None:
+        return None
+    try:
+        data = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    latest: float | None = None
+    for match in _TIMESTAMP_RE.finditer(data):
+        try:
+            ts = datetime.fromisoformat(match.group(1).replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            continue
+        if latest is None or ts > latest:
+            latest = ts
+    return latest
+
+
 def export_session(repo: Path, session_id: str) -> ExportedSession | None:
     path = _session_path(repo, session_id)
     if not path.is_file():
@@ -656,6 +701,11 @@ def parse_rows(
     # expanded-instructions row to open a turn. Cleared once a turn opens (from the
     # expansion or the next real prompt). See `_slash_command_name`.
     pending_command: str | None = None
+    # Set when a backgrounded task just completed (a `<task-notification>` row). It is not a
+    # prompt, but if the agent then does work off the back of it — with the prior turn already
+    # finished and no new user prompt in between — that work opens its own turn rather than
+    # being merged into the previous (already-committed) turn. See `_is_task_notification`.
+    pending_background = False
 
     def flush(*, dangling: bool = False) -> None:
         nonlocal current
@@ -682,6 +732,12 @@ def parse_rows(
                 # prompt, but a token-affecting event. Tally it for the next turn.
                 pending_compactions += 1
                 continue
+            if _is_task_notification(row):
+                # A backgrounded task completed. Not a prompt; defer to the assistant branch,
+                # which opens a NEW turn for any work the agent does in response (so it is
+                # committed and attributed on its own, not folded into the prior turn).
+                pending_background = True
+                continue
             command = _slash_command_name(row)
             if command is not None:
                 # A typed slash command invocation. Remember it: a command that does
@@ -700,6 +756,7 @@ def parse_rows(
                     continue
                 prompt = pending_command
             pending_command = None
+            pending_background = False  # a real prompt supersedes a pending background-task turn
             flush()
             current = {
                 "user_id": str(row.get("uuid") or ""),
@@ -724,6 +781,30 @@ def parse_rows(
             message = _as_dict(row.get("message"))
             current["tokens"].add(_usage_once(message, counted_ids, sidechain=True))
         elif row_type == "assistant" and current is not None:
+            if pending_background and current.get("stop_reason") not in (None, "tool_use"):
+                # The agent is acting on a completed background task, and the current turn has
+                # already finished (a real stop reason, not mid-tool) with no new user prompt
+                # since. Open a fresh turn so this background-driven work is committed and
+                # attributed on its own — not merged into the prior, already-committed turn
+                # (which would also overwrite its assistant id and break the commit watermark).
+                flush()
+                current = {
+                    "user_id": str(row.get("uuid") or ""),
+                    "prompt": _BACKGROUND_TURN_LABEL,
+                    "final": "",
+                    "assistant_id": "",
+                    "model": model,
+                    "tokens": TokenUsage(),
+                    "stop_reason": None,
+                    "started_at": stamp,
+                    "ended_at": stamp,
+                    "tool_ids": set(),
+                    "compactions": pending_compactions,
+                    "reasoning_effort": None,
+                    "messages": [],
+                }
+                pending_compactions = 0
+            pending_background = False
             message = _as_dict(row.get("message"))
             if stamp is not None:
                 current["ended_at"] = stamp
@@ -896,6 +977,24 @@ def _user_prompt(row: dict) -> str | None:
     if not text or text.startswith(_COMMAND_TAGS) or text.startswith(_INTERRUPT_MARKER):
         return None
     return text
+
+
+def _is_task_notification(row: dict) -> bool:
+    # The harness injects a `<task-notification>` user row when a shell/task the agent
+    # backgrounded (its output reported back later, while the user kept chatting) completes.
+    # It is not a prompt, but the agent usually ACTS on it — so parse_rows can open a fresh
+    # turn for that work instead of merging it into the prior, already-committed turn.
+    message = _as_dict(row.get("message"))
+    content = message.get("content")
+    if isinstance(content, str):
+        text = content.strip()
+    elif isinstance(content, list):
+        text = "".join(
+            block.get("text", "") for block in content if isinstance(block, dict) and block.get("type") == "text"
+        ).strip()
+    else:
+        return False
+    return text.startswith("<task-notification>")
 
 
 def _slash_command_name(row: dict) -> str | None:

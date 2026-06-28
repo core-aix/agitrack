@@ -65,6 +65,31 @@ class TestPromptModal:
         assert m.value == ""
         assert m.feed(b"\r") == ("done", "")
 
+    def test_detail_lines_render_and_scroll(self):
+        # The commit prompt shows the changed files; when more than fit, they window with
+        # PgUp/PgDn and the input line is always preserved.
+        files = [f"M  file{i}.py" for i in range(20)]
+        m = PromptModal("User Commit", "Commit message:", detail=files, viewport_rows=15)
+        msg = m.render_message()
+        assert "file0.py" in msg  # the change set is shown
+        assert "Commit message:" in msg and msg.rstrip().endswith(m.CARET)  # input still there
+        window = m._detail_window()
+        assert window < len(files)  # it overflows → windowed
+        assert "more below" in msg
+
+        m.feed(b"\x1b[6~")  # PageDown scrolls the file list
+        assert m.detail_scroll > 0
+        scrolled = m.render_message()
+        assert "more above" in scrolled
+        m.feed(b"\x1b[5~")  # PageUp scrolls back
+        assert m.detail_scroll == 0
+        # Typing and Enter still work with detail present.
+        assert m.feed(b"hi")[0] == "redraw" and m.feed(b"\r") == ("done", "hi")
+
+    def test_no_detail_renders_as_before(self):
+        m = PromptModal("T", "P:")
+        assert m.render_message() == "T\nP:\n> █"
+
     def test_tab_is_ignored(self):
         # Tab (0x09 < 32) is not added to the value.
         m = PromptModal("T", "P:")

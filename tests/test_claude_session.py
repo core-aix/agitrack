@@ -4,6 +4,7 @@ import sys
 import pytest
 
 from agitrack.transcripts import claude as claude_session
+from agitrack.transcripts import turns_after
 from agitrack.transcripts.claude import (
     export_session,
     latest_session_id,
@@ -127,6 +128,56 @@ def test_prepare_resume_stages_transcript_into_worktree(monkeypatch, tmp_path):
     # Idempotent and id-specific.
     assert claude_session.prepare_resume(worktree, "abc") is True
     assert claude_session.prepare_resume(worktree, "missing") is False
+
+
+def test_prepare_resume_refreshes_stale_staged_copy(monkeypatch, tmp_path):
+    # Regression: a prior resume staged the transcript into the target dir, then cwd-retargeting
+    # broke the hardlink — freezing that staged copy while the live copy elsewhere kept growing.
+    # prepare_resume must REPLACE the stale snapshot with the newest copy, or --no-worktree
+    # resumes an OLDER state of the conversation ("an older session opened").
+    import os
+    import time
+
+    config = tmp_path / "config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    base = tmp_path / "repo"
+    worktree = base / ".agitrack" / "worktrees" / "candle"
+    base.mkdir()
+    worktree.mkdir(parents=True)
+
+    base_proj = config / "projects" / claude_session._encode_repo(base)
+    wt_proj = config / "projects" / claude_session._encode_repo(worktree)
+    base_proj.mkdir(parents=True)
+    wt_proj.mkdir(parents=True)
+
+    # The live (worktree) copy: the full, current conversation, newest mtime.
+    live = wt_proj / "s.jsonl"
+    live.write_text('{"type":"user"}\n{"type":"assistant"}\n{"type":"user"}\n', encoding="utf-8")
+    # A STALE staged copy at the base target: fewer lines, OLDER mtime, separate inode.
+    stale = base_proj / "s.jsonl"
+    stale.write_text('{"type":"user"}\n', encoding="utf-8")
+    old = time.time() - 10000
+    os.utime(stale, (old, old))
+
+    assert claude_session.prepare_resume(base, "s") is True
+    # The base copy is refreshed to the full conversation, not left at the 1-line snapshot.
+    assert (base_proj / "s.jsonl").read_text(encoding="utf-8").count("\n") == 3
+
+
+def test_prepare_resume_keeps_fresh_staged_copy(monkeypatch, tmp_path):
+    # The inverse: a staged copy that is already as fresh as (or fresher than) the source is
+    # left untouched — no needless re-staging.
+    config = tmp_path / "config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    base = tmp_path / "repo"
+    base.mkdir()
+    base_proj = config / "projects" / claude_session._encode_repo(base)
+    base_proj.mkdir(parents=True)
+    (base_proj / "s.jsonl").write_text('{"type":"user"}\n{"type":"assistant"}\n', encoding="utf-8")
+    before = (base_proj / "s.jsonl").stat().st_ino
+
+    assert claude_session.prepare_resume(base, "s") is True
+    assert (base_proj / "s.jsonl").stat().st_ino == before  # untouched (no source is newer)
 
 
 def test_link_session_surfaces_worktree_conversation_in_base(monkeypatch, tmp_path):
@@ -347,6 +398,113 @@ def test_parse_rows_excludes_meta_sidechain_tool_results_and_commands():
     assert len(session.turns) == 1
     assert session.turns[0].user_prompt == "the real prompt"
     assert session.turns[0].final_response == "response"
+
+
+def test_session_last_activity_uses_content_timestamp_not_file_mtime(tmp_path, monkeypatch):
+    # Recency must come from message timestamps, not the file's mtime: aGiTrack rewrites a
+    # transcript (staging / cwd-retarget) and bumps the file mtime without adding a message, so
+    # mtime ranking can make an older conversation look newest. session_last_activity reads the
+    # newest message timestamp, which doesn't move when aGiTrack touches the file.
+    import os
+    import time
+
+    proj = tmp_path / "projects" / "encoded-repo"
+    proj.mkdir(parents=True)
+    monkeypatch.setattr(claude_session, "_projects_root", lambda: tmp_path / "projects")
+    tx = proj / "sess-1.jsonl"
+    tx.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "u1",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "message": {"role": "user", "content": "hi"},
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "a1",
+                "timestamp": "2026-01-02T03:04:05Z",
+                "message": {"id": "m1", "content": [{"type": "text", "text": "ok"}], "usage": {}},
+            }
+        )
+        + "\n"
+    )
+    os.utime(tx, (time.time() + 99999, time.time() + 99999))  # bump file mtime far into the future
+
+    ts = claude_session.session_last_activity("sess-1")
+    from datetime import datetime, timezone
+
+    expected = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc).timestamp()
+    assert ts == expected  # content timestamp, NOT the bumped file mtime
+    assert claude_session.session_last_activity("nonexistent") is None
+
+
+def test_parse_rows_background_task_work_opens_its_own_turn():
+    # The agent backgrounds a task; the turn finishes (end_turn) and is committed. Later the
+    # task completes — the harness injects a <task-notification> user row — and the agent acts
+    # on the result. That work must form its OWN turn rather than extend the prior (already
+    # committed) turn: otherwise it overwrites that turn's assistant id, breaking the commit
+    # watermark (turns_after would then re-export everything), and mis-attributes the work.
+    rows = [
+        _user("u1", "run the tests in the background"),
+        _assistant("m1", "Started the tests in the background.", stop_reason="end_turn"),
+        _user("tn", "<task-notification>\n<task-id>abc</task-id>\n</task-notification>"),
+        _assistant("m2", "Tests passed; I fixed the failing case.", stop_reason="end_turn"),
+    ]
+
+    session = parse_rows("sess-bg", rows)
+
+    assert len(session.turns) == 2
+    assert session.turns[0].user_prompt == "run the tests in the background"
+    assert session.turns[0].assistant_message_id == "m1"
+    assert session.turns[1].user_prompt == "(background task completed)"
+    assert session.turns[1].assistant_message_id == "m2"
+    assert session.turns[1].final_response == "Tests passed; I fixed the failing case."
+    # The first turn's id is preserved, so the watermark still matches it and only the new
+    # background-driven turn is exported next.
+    assert turns_after(session, "m1") == session.turns[1:]
+
+
+def test_parse_rows_background_notification_mid_turn_does_not_split():
+    # A background task completing WHILE a turn is still in flight (the agent is mid-tool) must
+    # not split the turn — the continued work is part of the ongoing turn, not a new one.
+    rows = [
+        _user("u1", "do a thing"),
+        _assistant(
+            "m1",
+            "",
+            content=[{"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}],
+            stop_reason="tool_use",
+        ),
+        _user("tn", "<task-notification>\n<task-id>abc</task-id>\n</task-notification>"),
+        _assistant("m2", "Done.", stop_reason="end_turn"),
+    ]
+
+    session = parse_rows("sess-bg2", rows)
+
+    assert len(session.turns) == 1
+    assert session.turns[0].user_prompt == "do a thing"
+    assert session.turns[0].final_response == "Done."
+
+
+def test_parse_rows_background_notification_then_real_prompt_is_not_a_turn():
+    # A background notification followed by a genuine user prompt (the user typed before the
+    # agent acted) must NOT create a phantom "(background task completed)" turn — the real
+    # prompt supersedes it.
+    rows = [
+        _user("u1", "first"),
+        _assistant("m1", "ok", stop_reason="end_turn"),
+        _user("tn", "<task-notification>\n<task-id>abc</task-id>\n</task-notification>"),
+        _user("u2", "second real prompt"),
+        _assistant("m2", "done second", stop_reason="end_turn"),
+    ]
+
+    session = parse_rows("sess-bg3", rows)
+
+    assert [t.user_prompt for t in session.turns] == ["first", "second real prompt"]
 
 
 def test_parse_rows_opens_a_turn_for_a_slash_command_expansion():
