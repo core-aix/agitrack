@@ -1592,28 +1592,36 @@ def test_base_newer_entries_and_copy_entries_refresh(tmp_path):
     assert wm.base_newer_entries(info.path) == []  # back in sync
 
 
-def test_newest_worktree_session_id_picks_most_recent(tmp_path):
-    import time
+def test_newest_worktree_session_picks_most_recently_updated(tmp_path):
+    import types
+
+    from agitrack.transcripts.types import SessionRef
 
     main = _init_repo(tmp_path)
-    base = main.current_branch()
-    wm = WorktreeManager(main)
-    a = wm.create("sess-a", base=base)
-    b = wm.create("sess-b", base=base)
-    sa = AgitrackState(a.path)
-    sa.backend_session_id = "id-a"
-    sa.save()
-    time.sleep(0.01)
-    sb = AgitrackState(b.path)
-    sb.backend_session_id = "id-b"  # written later → most recent
-    sb.save()
-
     runner = make_runner(base_repo=main)
-    runner.worktree_manager = wm
-    runner.global_config = type("G", (), {"default_backend": "claude"})()
+    runner.worktree_manager = WorktreeManager(main)
+    runner.backend = types.SimpleNamespace(
+        list_worktree_sessions=lambda root: [
+            ("sess-a", SessionRef(id="id-a", updated=100.0)),
+            ("sess-b", SessionRef(id="id-b", updated=200.0)),  # most recent transcript
+            ("sess-c", SessionRef(id="id-c", updated=150.0)),
+        ]
+    )
     runner._debug = lambda *a, **k: None
 
-    assert runner._newest_worktree_session_id() == "id-b"
+    assert runner._newest_worktree_session() == ("id-b", 200.0)
+
+
+def test_newest_worktree_session_none_when_no_worktree_conversations(tmp_path):
+    import types
+
+    main = _init_repo(tmp_path)
+    runner = make_runner(base_repo=main)
+    runner.worktree_manager = WorktreeManager(main)
+    runner.backend = types.SimpleNamespace(list_worktree_sessions=lambda root: [])
+    runner._debug = lambda *a, **k: None
+
+    assert runner._newest_worktree_session() is None
 
 
 def test_present_pending_env_refresh_overwrites_on_yes(tmp_path):

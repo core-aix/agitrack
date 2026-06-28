@@ -2831,11 +2831,20 @@ class ProxyRunner:
             # to the base directory, so it resumes in the right place. The leftover worktree
             # DIRECTORIES are kept — switching back to worktree mode later resumes them in place
             # (the user can delete them by hand if they want the space back).
-            if not self._force_new_session and not self.state.backend_session_id:
-                resumed = self._newest_worktree_session_id()
-                if resumed:
-                    self.state.backend_session_id = resumed
-                    self._debug(f"--no-worktree: resuming prior worktree session {resumed} in the base repo")
+            if not self._force_new_session:
+                newest = self._newest_worktree_session()
+                # Adopt the latest worktree conversation unless the base repo's own recorded
+                # session is itself more recent (e.g. a newer --no-worktree session). Comparing
+                # transcript recency — not just "is a session already recorded" — is what makes
+                # this resume the LATEST worktree session rather than a stale last-session pointer
+                # the base repo kept from an earlier run.
+                if (
+                    newest is not None
+                    and newest[0] != self.state.backend_session_id
+                    and newest[1] >= self._session_updated_at(self.state.backend_session_id)
+                ):
+                    self.state.backend_session_id = newest[0]
+                    self._debug(f"--no-worktree: resuming latest worktree session {newest[0]} in the base repo")
             self._set_message(
                 "Running without a worktree: the agent edits this branch directly (visible live), "
                 "but there's no isolation or auto-integration. Extra sessions started this way share "
@@ -2892,30 +2901,37 @@ class ProxyRunner:
         self.backend = make_proxy_agent(backend_name)
         self.actions = AgitrackActions(self.repo, self.state, verbose=self.verbose)
 
-    def _newest_worktree_session_id(self) -> str | None:
-        """The backend conversation id of the most recently active leftover worktree
-        session — the one a ``--no-worktree`` start should continue in the base repo. Picks
-        the worktree whose state file was written last (the session the user worked in most
-        recently). Returns None when there are no worktrees or none has a recorded session."""
-        best_id: str | None = None
-        best_mtime = -1.0
+    def _newest_worktree_session(self) -> tuple[str, float] | None:
+        """``(id, last-updated)`` of the most recently active worktree conversation — the one a
+        ``--no-worktree`` start should continue in the base repo. Ranked by TRANSCRIPT recency
+        (not the per-worktree tracked-session pointer), so it follows the conversation the user
+        actually last worked in — even one switched to inside the backend's own picker, and even
+        in a worktree since removed (the transcript is kept keyed by the worktree path). Returns
+        None when there are no recorded worktree conversations."""
         try:
-            infos = self._worktrees().list()
+            pairs = self.backend.list_worktree_sessions(self._worktrees().root)
         except Exception as error:
             self._debug(f"newest-worktree scan failed: {error!r}")
             return None
-        for info in infos:
-            try:
-                state = AgitrackState(info.path, default_backend=self.global_config.default_backend)
-                sid = state.backend_session_id
-                if not sid:
-                    continue
-                mtime = state.path.stat().st_mtime if state.path.exists() else 0.0
-                if mtime > best_mtime:
-                    best_mtime, best_id = mtime, sid
-            except Exception as error:
-                self._debug(f"newest-worktree scan skipped '{getattr(info, 'name', '?')}': {error!r}")
-        return best_id
+        best: tuple[str, float] | None = None
+        for _key, ref in pairs:
+            if best is None or ref.updated > best[1]:
+                best = (ref.id, ref.updated)
+        return best
+
+    def _session_updated_at(self, session_id: str | None) -> float:
+        """Transcript recency of a recorded session id (0.0 when unknown), so a ``--no-worktree``
+        start overrides the base repo's last-session pointer only when a worktree session is
+        genuinely more recent — never demoting a newer base-repo conversation to an older one."""
+        if not session_id:
+            return 0.0
+        try:
+            refs = list(self.backend.list_sessions(self.base_repo.repo))
+            refs += [ref for _key, ref in self.backend.list_worktree_sessions(self._worktrees().root)]
+        except Exception as error:
+            self._debug(f"session-recency lookup failed: {error!r}")
+            return 0.0
+        return max((ref.updated for ref in refs if ref.id == session_id), default=0.0)
 
     _AUTO_NAME_RE = re.compile(r"^session-\d+$")
 

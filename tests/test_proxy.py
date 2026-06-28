@@ -9023,13 +9023,49 @@ def test_no_worktree_mode_keeps_leftover_worktrees_and_resumes_newest(tmp_path):
         list=lambda: [types.SimpleNamespace(name="sess-a"), types.SimpleNamespace(name="sess-b")],
         remove=lambda name, **k: removed.append(name),
     )
-    runner._newest_worktree_session_id = lambda: "sess-newest"
+    runner._newest_worktree_session = lambda: ("sess-newest", 1000.0)
+    runner._session_updated_at = lambda sid: 0.0  # base repo has nothing more recent
 
     runner._setup_base_merge_only_session()
 
     assert removed == []  # nothing deleted — the directories are kept
     assert runner.worktree is None  # runs on the base tree directly
-    assert runner.state.backend_session_id == "sess-newest"  # resumes the prior worktree session
+    assert runner.state.backend_session_id == "sess-newest"  # resumes the latest worktree session
+
+
+def test_no_worktree_mode_prefers_latest_worktree_over_stale_base_pointer(tmp_path):
+    # Regression: after a worktree run, the base repo keeps a "last session" pointer. On a
+    # --no-worktree restart that pointer (an OLDER session) must NOT win over the genuinely
+    # latest worktree conversation — otherwise --no-worktree resumes a stale session.
+    runner = make_runner(state=AgitrackState(tmp_path))
+    runner._use_worktrees = False
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda *a, **k: None
+    runner._worktrees = lambda: types.SimpleNamespace(list=lambda: [], remove=lambda *a, **k: None)
+    runner.state.backend_session_id = "sess-old"  # stale base-repo last-session pointer
+    runner._newest_worktree_session = lambda: ("sess-new-wt", 2000.0)
+    runner._session_updated_at = lambda sid: 1000.0 if sid == "sess-old" else 0.0  # base is older
+
+    runner._setup_base_merge_only_session()
+
+    assert runner.state.backend_session_id == "sess-new-wt"
+
+
+def test_no_worktree_mode_keeps_newer_base_session_over_older_worktree(tmp_path):
+    # The reverse guard: if the base repo's recorded session is MORE recent than any worktree
+    # session (e.g. a newer --no-worktree session), it must not be demoted to an older worktree.
+    runner = make_runner(state=AgitrackState(tmp_path))
+    runner._use_worktrees = False
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda *a, **k: None
+    runner._worktrees = lambda: types.SimpleNamespace(list=lambda: [], remove=lambda *a, **k: None)
+    runner.state.backend_session_id = "sess-recent-base"
+    runner._newest_worktree_session = lambda: ("sess-old-wt", 500.0)
+    runner._session_updated_at = lambda sid: 3000.0 if sid == "sess-recent-base" else 0.0
+
+    runner._setup_base_merge_only_session()
+
+    assert runner.state.backend_session_id == "sess-recent-base"  # not demoted to an older session
 
 
 def test_worktree_sessions_is_memoized_to_avoid_repeated_slow_listing(tmp_path):
