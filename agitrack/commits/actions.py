@@ -112,7 +112,7 @@ class AgitrackActions:
         )
 
     def review_untracked(self, *, include_declined: bool) -> None:
-        untracked = self.repo.untracked_files()
+        untracked = self.repo.untracked_entries()
         declined = set(self.state.declined_untracked())
         candidates = untracked if include_declined else [path for path in untracked if path not in declined]
         if not candidates:
@@ -151,7 +151,7 @@ class AgitrackActions:
 
     def has_pre_agent_user_changes(self) -> bool:
         declined = set(self.state.declined_untracked())
-        untracked = self.repo.untracked_files()
+        untracked = self.repo.untracked_entries()
         self.state.keep_declined(untracked)
         promptable_untracked = [path for path in untracked if path not in declined]
         return self.repo.has_tracked_changes() or bool(promptable_untracked)

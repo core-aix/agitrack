@@ -350,6 +350,48 @@ def test_parse_rows_excludes_meta_sidechain_tool_results_and_commands():
     assert session.turns[0].final_response == "response"
 
 
+def test_session_last_activity_uses_content_timestamp_not_file_mtime(tmp_path, monkeypatch):
+    # Recency must come from message timestamps, not the file's mtime: aGiTrack rewrites a
+    # transcript (staging / cwd-retarget) and bumps the file mtime without adding a message, so
+    # mtime ranking can make an older conversation look newest. session_last_activity reads the
+    # newest message timestamp, which doesn't move when aGiTrack touches the file.
+    import os
+    import time
+
+    proj = tmp_path / "projects" / "encoded-repo"
+    proj.mkdir(parents=True)
+    monkeypatch.setattr(claude_session, "_projects_root", lambda: tmp_path / "projects")
+    tx = proj / "sess-1.jsonl"
+    tx.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "u1",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "message": {"role": "user", "content": "hi"},
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "a1",
+                "timestamp": "2026-01-02T03:04:05Z",
+                "message": {"id": "m1", "content": [{"type": "text", "text": "ok"}], "usage": {}},
+            }
+        )
+        + "\n"
+    )
+    os.utime(tx, (time.time() + 99999, time.time() + 99999))  # bump file mtime far into the future
+
+    ts = claude_session.session_last_activity("sess-1")
+    from datetime import datetime, timezone
+
+    expected = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc).timestamp()
+    assert ts == expected  # content timestamp, NOT the bumped file mtime
+    assert claude_session.session_last_activity("nonexistent") is None
+
+
 def test_parse_rows_background_task_work_opens_its_own_turn():
     # The agent backgrounds a task; the turn finishes (end_turn) and is committed. Later the
     # task completes — the harness injects a <task-notification> user row — and the agent acts

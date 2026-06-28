@@ -2924,16 +2924,39 @@ class ProxyRunner:
         for _key, ref in pairs:
             if not getattr(ref, "label", None):
                 continue  # empty transcript (no real turn) — nothing to resume
-            if best is None or ref.updated > best[1]:
-                best = (ref.id, ref.updated)
+            recency = self._session_recency(ref.id, ref.updated)
+            if best is None or recency > best[1]:
+                best = (ref.id, recency)
         return best
 
+    def _session_recency(self, session_id: str | None, fallback: float) -> float:
+        """A session's last-activity time, preferring CONTENT recency (message timestamps) over
+        the transcript's file mtime. aGiTrack rewrites a transcript when it stages / retargets a
+        resume, bumping the FILE mtime without adding a message — so ranking by mtime can make an
+        older session look newest after aGiTrack touches it (the self-perpetuating "older session
+        keeps resuming" bug). Content timestamps don't move, so they rank by genuine user
+        activity; ``fallback`` (the mtime) is used only when the backend can't read them."""
+        fn = getattr(self.backend, "session_last_activity", None)
+        if fn is not None and session_id:
+            try:
+                ts = fn(session_id)
+                if ts is not None:
+                    return float(ts)
+            except Exception as error:
+                self._debug(f"content-recency lookup failed for {session_id}: {error!r}")
+        return fallback
+
     def _session_updated_at(self, session_id: str | None) -> float:
-        """Transcript recency of a recorded session id (0.0 when unknown), so a ``--no-worktree``
-        start overrides the base repo's last-session pointer only when a worktree session is
-        genuinely more recent — never demoting a newer base-repo conversation to an older one."""
+        """Recency of a recorded session id (0.0 when unknown), so a ``--no-worktree`` start
+        overrides the base repo's last-session pointer only when a worktree session is genuinely
+        more recent — never demoting a newer base-repo conversation to an older one. Uses CONTENT
+        recency (see :meth:`_session_recency`) so an aGiTrack file-touch can't skew the call."""
         if not session_id:
             return 0.0
+        content = self._session_recency(session_id, 0.0)
+        if content:
+            return content
+        # Fall back to the file-mtime recency the session listings expose.
         try:
             refs = list(self.backend.list_sessions(self.base_repo.repo))
             refs += [ref for _key, ref in self.backend.list_worktree_sessions(self._worktrees().root)]
@@ -3988,7 +4011,7 @@ class ProxyRunner:
             if self.repo.has_tracked_changes():
                 return True
             declined = set(self.state.declined_untracked()) if self.state is not None else set()
-            return any(path not in declined for path in self.repo.untracked_files())
+            return any(path not in declined for path in self.repo.untracked_entries())
         except Exception:
             return False
 
@@ -8536,12 +8559,16 @@ class ProxyRunner:
             self._drain_modal_mailbox()
         self._drain_modal_mailbox()
 
-    def _prompt_popup(self, title: str, prompt: str, *, default: str = "") -> str | None:
+    def _prompt_popup(
+        self, title: str, prompt: str, *, default: str = "", detail: list[str] | None = None
+    ) -> str | None:
         """Free-text input popup.  Thin facade over ``_run_modal(PromptModal(...))``.
 
-        Tests stub this method heavily; the name and signature are stable.
+        Tests stub this method heavily; the name and signature are stable. ``detail`` is an
+        optional list of lines (e.g. the files being committed) shown between the title and the
+        input, windowed and PgUp/PgDn-scrollable when it overflows.
         """
-        return self._run_modal(PromptModal(title, prompt, default=default))
+        return self._run_modal(PromptModal(title, prompt, default=default, detail=detail, viewport_rows=self.rows))
 
     def _select_popup(self, title: str, options: list[str], *, detail: list[str] | None = None) -> str | None:
         """Selection popup.  Thin facade over ``_run_modal(SelectModal(...))``.
@@ -8579,12 +8606,19 @@ class ProxyRunner:
         self._review_untracked_popup(include_declined=include_declined, repo=repo, state=state)
         if not repo.has_staged_changes():
             return False
+        # Show exactly which files this commit will capture, so the user isn't typing a message
+        # blind. Scrollable in the popup when there are many (see PromptModal.detail).
+        try:
+            changed = repo.staged_changes()
+        except Exception:
+            changed = []
+        detail = [f"Committing {len(changed)} file(s):", *changed] if changed else None
         message = ""
         # Esc cancels the prompt (_prompt_popup returns None) and we continue without
         # committing — note that in the prompt so the user knows it's a safe way out.
         prompt = "Commit message (press Esc to continue without committing):"
         while not message.strip():
-            result = self._prompt_popup("User Commit", prompt)
+            result = self._prompt_popup("User Commit", prompt, detail=detail)
             if result is None:
                 return False
             message = result
@@ -8612,7 +8646,7 @@ class ProxyRunner:
         repo = repo or self.repo
         state = state or self.state
         self._prune_declined_untracked(repo, state)
-        untracked = repo.untracked_files()
+        untracked = repo.untracked_entries()
         declined = set(state.declined_untracked())
         candidates = untracked if include_declined else [path for path in untracked if path not in declined]
         if not candidates:
@@ -8659,7 +8693,7 @@ class ProxyRunner:
             # the agent's new files too, except any the user intentionally declined.
             def stage_untracked_fn(repo, state):
                 declined = set(state.declined_untracked())
-                repo.stage_paths([path for path in repo.untracked_files() if path not in declined])
+                repo.stage_paths([path for path in repo.untracked_entries() if path not in declined])
 
         def on_commit_fn(sha, trace_text, is_cover):
             self._last_agent_commit_id = sha
@@ -9844,7 +9878,7 @@ class ProxyRunner:
     def _prune_declined_untracked(self, repo: GitRepo | None = None, state: AgitrackState | None = None) -> None:
         repo = repo or self.repo
         state = state or self.state
-        state.keep_declined(repo.untracked_files())
+        state.keep_declined(repo.untracked_entries())
 
     def _user_state(self) -> AgitrackState:
         # The user's working tree is the base repo (the session worktree is the
@@ -9861,7 +9895,7 @@ class ProxyRunner:
     def _prune_user_declined(self) -> None:
         # Drop cached entries no longer untracked in the base tree (committed,
         # staged, or deleted out-of-band). Cheap enough for the base-poll cadence.
-        untracked = set(self.base_repo.untracked_files())
+        untracked = set(self.base_repo.untracked_entries())
         self._user_declined = [path for path in self._user_declined if path in untracked]
 
     def _forwarded_submits(self, forwarded: list[bytes]) -> bool:

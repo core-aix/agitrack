@@ -342,6 +342,9 @@ class ClaudeProxyAgent:
     def latest_session_id(self, repo: Path) -> str | None:
         return claude_session.latest_session_id(repo)
 
+    def session_last_activity(self, session_id: str) -> float | None:
+        return claude_session.session_last_activity(session_id)
+
     def list_sessions(self, repo: Path) -> list[SessionRef]:
         return claude_session.list_sessions(repo)
 

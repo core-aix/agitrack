@@ -512,6 +512,36 @@ def _find_session_file(session_id: str) -> Path | None:
     return newest[1] if newest else None
 
 
+_TIMESTAMP_RE = re.compile(r'"timestamp"\s*:\s*"([^"]+)"')
+
+
+def session_last_activity(session_id: str) -> float | None:
+    """Last-activity time (epoch seconds) of a session, read from its transcript's CONTENT —
+    the newest message ``timestamp`` — rather than the file's mtime. aGiTrack's own staging /
+    cwd-retargeting rewrites a transcript (bumping the FILE mtime) without adding any message,
+    so mtime is an unreliable "most recent conversation" signal — it can make an older session
+    look newest after aGiTrack touches it. The message timestamps don't move, so they rank the
+    conversations by genuine user activity. None if the transcript isn't found or has no stamp."""
+    if not session_id:
+        return None
+    path = _find_session_file(session_id)
+    if path is None:
+        return None
+    try:
+        data = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    latest: float | None = None
+    for match in _TIMESTAMP_RE.finditer(data):
+        try:
+            ts = datetime.fromisoformat(match.group(1).replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            continue
+        if latest is None or ts > latest:
+            latest = ts
+    return latest
+
+
 def export_session(repo: Path, session_id: str) -> ExportedSession | None:
     path = _session_path(repo, session_id)
     if not path.is_file():

@@ -120,6 +120,16 @@ class GitRepo:
         output = self._run(["git", "ls-files", "--others", "--exclude-standard"]).stdout
         return [line for line in output.splitlines() if line and not line.startswith(".agitrack/")]
 
+    def untracked_entries(self) -> list[str]:
+        """Untracked paths with WHOLLY-untracked directories collapsed to a single ``dir/``
+        entry (``--directory``), instead of listing every file under them. Used by the
+        intentionally-unstaged ("declined") flow so the user declines a new directory ONCE and
+        files later added inside it stay covered — declining the per-file list (``untracked_files``)
+        would re-prompt for each new file in an already-declined directory. A partially-tracked
+        directory still lists its individual untracked files (git can't collapse it)."""
+        output = self._run(["git", "ls-files", "--others", "--exclude-standard", "--directory"]).stdout
+        return [line for line in output.splitlines() if line and not line.startswith(".agitrack/")]
+
     def ignored_files(self) -> list[str]:
         """Paths git ignores (per .gitignore) in the working tree — build output,
         local data, downloaded deps. A wholly-ignored directory collapses to a single
@@ -131,6 +141,18 @@ class GitRepo:
 
     def has_staged_changes(self) -> bool:
         return self._diff_has_changes(["git", "diff", "--cached", "--quiet"])
+
+    def staged_changes(self) -> list[str]:
+        """Human-readable list of the currently-staged changes, e.g. ``["A  new.py",
+        "M  app.py", "D  old.py"]`` — the files a user commit would capture. Used to show the
+        change set in the commit prompt."""
+        output = self._run(["git", "diff", "--cached", "--name-status"]).stdout
+        entries: list[str] = []
+        for line in output.splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 2:
+                entries.append(f"{parts[0]:<3}{parts[-1]}")
+        return entries
 
     def _diff_has_changes(self, command: list[str]) -> bool:
         process = self._run(command, check=False)
