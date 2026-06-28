@@ -527,6 +527,10 @@ class ProxyRunner:
         self.repo = repo
         self._use_worktrees = use_worktrees  # #9: when False, run on the current branch directly
         self._warned_parallel_no_worktree = False  # one-time shared-tree caveat for extra --no-worktree sessions
+        # No-worktree only: the branch HEAD when this session started. Commits made past it that
+        # aGiTrack didn't author are the agent's own (#35 cover applies); the anchor floors the
+        # scan so pre-existing user history is never covered. Set at startup in no-worktree mode.
+        self._noworktree_base_head: str | None = None
         # When True, tell a coding agent that aGiTrack auto-commits so it doesn't self-commit
         # (--no-commit-guidance / config turns it off). Appended to the agent's system prompt
         # where the backend supports it (Claude).
@@ -1106,6 +1110,7 @@ class ProxyRunner:
                 "_pending_share_conflicts": [],
                 "_exit_menu_requested": False,
                 "_use_worktrees": True,
+                "_noworktree_base_head": None,
                 "_warned_parallel_no_worktree": False,
                 "_sandbox": True,
                 "_allowed_edit_paths": [],
@@ -2759,6 +2764,14 @@ class ProxyRunner:
                 "this directory and edit the same files at once." + note,
                 seconds=12.0,
             )
+            # Anchor the no-worktree cover scan at the branch's current HEAD so commits the agent
+            # makes itself from here get aGiTrack metadata (#35), while pre-existing history is
+            # never touched. Set once (the earliest start); the metadata-reset handles the rest.
+            if self._noworktree_base_head is None:
+                try:
+                    self._noworktree_base_head = self.repo.rev_parse("HEAD")
+                except Exception as error:
+                    self._debug(f"no-worktree cover anchor failed: {error!r}")
             return
         root_state = self.state  # the durable repo-root "last session" record
         backend_name = root_state.backend
@@ -8306,13 +8319,15 @@ class ProxyRunner:
         if not repo.has_staged_changes():
             return False
         message = ""
-        prompt = "Commit message:"
+        # Esc cancels the prompt (_prompt_popup returns None) and we continue without
+        # committing — note that in the prompt so the user knows it's a safe way out.
+        prompt = "Commit message (press Esc to continue without committing):"
         while not message.strip():
             result = self._prompt_popup("User Commit", prompt)
             if result is None:
                 return False
             message = result
-            prompt = "Commit message is required. Enter a commit message:"
+            prompt = "Commit message is required — enter one, or press Esc to continue without committing:"
         try:
             repo.commit(build_user_commit_message(message=message, agitrack_session_id=state.session_id))
         except Exception as error:
@@ -8432,22 +8447,34 @@ class ProxyRunner:
         )
 
     def _uncovered_backend_commits(self) -> list[str]:
-        """Unintegrated commits on the session's turn branch that the backend
-        created itself and no aGiTrack commit accounts for yet (#35). Full SHAs,
-        oldest first. Backend commits keep their own messages forever (their
-        hashes must stay stable, #58), so "covered" cannot be read off the
-        commit itself: an aGiTrack metadata commit covers everything before it on
-        the branch (its ``covered_commits`` named them), leaving only commits
-        NEWER than the newest metadata commit unaccounted for. Only commits
-        ahead of base qualify at all."""
-        if self.worktree is None or self._base_branch is None:
-            return []
+        """Commits the backend created itself that no aGiTrack commit accounts for
+        yet (#35). Full SHAs, oldest first. Backend commits keep their own messages
+        forever (their hashes must stay stable, #58), so "covered" cannot be read off
+        the commit itself: an aGiTrack metadata commit covers everything before it on
+        the branch (its ``covered_commits`` named them), leaving only commits NEWER
+        than the newest metadata commit unaccounted for.
+
+        Worktree mode: commits ahead of base on the session's managed turn branch.
+        No-worktree mode (only when actually running with --no-worktree): commits on
+        the current branch made since this session started (anchored at the startup
+        HEAD so pre-existing user history is never covered) — that's where the agent's
+        changes legitimately live without a worktree."""
         try:
-            branch = self.repo.current_branch()
-            if not is_managed_branch(branch):
-                return []
+            if not self._use_worktrees:
+                anchor = self._noworktree_base_head
+                if not anchor:
+                    return []
+                head_ref = "HEAD"
+            else:
+                if self.worktree is None or self._base_branch is None:
+                    return []
+                branch = self.repo.current_branch()
+                if not is_managed_branch(branch):
+                    return []
+                anchor = self._base_branch
+                head_ref = branch
             uncovered: list[str] = []
-            for sha in self.repo.log_shas(self._base_branch, branch):  # oldest first
+            for sha in self.repo.log_shas(anchor, head_ref):  # oldest first
                 if METADATA_HEADER in self.repo.commit_message(sha):
                     uncovered = []
                 else:
@@ -10202,20 +10229,29 @@ class ProxyRunner:
 
     def _integrate_agent_made_commits_if_idle(self, now: float) -> None:
         # The agent can run `git commit` itself (some workflows ask it to).
-        # Those turns leave the worktree CLEAN, so the auto-commit path — which
+        # Those turns leave the tree CLEAN, so the auto-commit path — which
         # integration used to piggyback on exclusively — never runs, and the
-        # turn branch sat ahead of base until exit/restart. When the session is
-        # idle, its tree is clean, and its branch holds unintegrated commits,
-        # integrate them now.
-        if self.worktree is None or self.merge_ctx:
+        # commits sat unaccounted-for until exit/restart. When the session is
+        # idle and its tree is clean, account for those commits now.
+        if self.merge_ctx:
             return
-        if self._base_branch is None or self._integration_paused or self._delay_merge:
-            return  # --delay-merge: don't integrate idle commits behind the user's back
+        if self._integration_paused or self._delay_merge:
+            return  # --delay-merge: don't touch the branch behind the user's back
         if self._agent_is_active() or now - self.last_child_output < self.CHILD_IDLE_SECONDS:
             return
         if now - self._idle_integrate_at < self.BASE_POLL_SECONDS:
             return
         self._idle_integrate_at = now
+        if not self._use_worktrees:
+            # No-worktree: the agent's own commits live on the current branch (there is no
+            # separate base to integrate into). Cover them with aGiTrack metadata — the same
+            # #35 machinery, minus the integration step.
+            if not self._uncovered_backend_commits() or self._summary_blocks_integration(now):
+                return
+            self._attach_trace_to_backend_commits(now)  # parse → commit_turns → cover commit
+            return
+        if self.worktree is None or self._base_branch is None:
+            return
         try:
             branch = self.repo.current_branch()
             if not is_managed_branch(branch) or not self.base_repo.log_range(self._base_branch, branch):

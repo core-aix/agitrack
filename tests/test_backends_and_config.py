@@ -48,6 +48,9 @@ def test_claude_proxy_agent_spawn_command_uses_session_id_and_resume():
     assert "working directory" in AGENT_SYSTEM_NOTE
     assert "commit and the merge" in AGENT_SYSTEM_NOTE  # both, not just one
     assert "base repository" in AGENT_SYSTEM_NOTE  # tells the agent not to edit base directly
+    assert "pull request" in AGENT_SYSTEM_NOTE  # pushing is allowed for PRs/CI
+    assert "separate remote branch" in AGENT_SYSTEM_NOTE  # push target may differ from the worktree branch
+    assert "correct that note" in AGENT_SYSTEM_NOTE  # override + fix any conflicting saved memory
     # Under --no-worktree the worktree clause is dropped (the agent edits the branch directly),
     # but the no-self-commit guidance stays.
     from agitrack.backends.proxy_agents import agent_system_note
@@ -55,6 +58,7 @@ def test_claude_proxy_agent_spawn_command_uses_session_id_and_resume():
     no_wt = agent_system_note(use_worktrees=False)
     assert ".agitrack" not in no_wt and "worktree" not in no_wt  # sep-agnostic: clause fully dropped
     assert "git commit" in no_wt
+    assert "pull request" in no_wt  # the push allowance lives in the shared intro, so it stays
     cmd = agent.spawn_command(Path("/repo"), session_id="u1", resume=False, use_worktrees=False)
     assert cmd == ["claude", "--session-id", "u1", "--append-system-prompt", no_wt]
     # commit_guidance=False (--no-commit-guidance) omits the note entirely.
