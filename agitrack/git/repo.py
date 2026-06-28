@@ -14,6 +14,17 @@ class GitError(RuntimeError):
     pass
 
 
+# Machine-managed scaffolding directories aGiTrack must never surface as untracked changes to
+# stage: its own state (.agitrack) and the backends' local config/state (.claude, .opencode).
+# These belong to the tooling, not the user's source, so they must never appear in the
+# "stage these new files?" prompt (the user shouldn't be asked to commit an agent's folder).
+_NEVER_STAGE_PREFIXES = (".agitrack/", ".claude/", ".opencode/")
+
+
+def _is_scaffolding(path: str) -> bool:
+    return path.startswith(_NEVER_STAGE_PREFIXES)
+
+
 class GitRepo:
     def __init__(self, repo: Path) -> None:
         self.repo = repo.resolve()
@@ -118,7 +129,7 @@ class GitRepo:
 
     def untracked_files(self) -> list[str]:
         output = self._run(["git", "ls-files", "--others", "--exclude-standard"]).stdout
-        return [line for line in output.splitlines() if line and not line.startswith(".agitrack/")]
+        return [line for line in output.splitlines() if line and not _is_scaffolding(line)]
 
     def untracked_entries(self) -> list[str]:
         """Untracked paths with WHOLLY-untracked directories collapsed to a single ``dir/``
@@ -126,9 +137,12 @@ class GitRepo:
         intentionally-unstaged ("declined") flow so the user declines a new directory ONCE and
         files later added inside it stay covered — declining the per-file list (``untracked_files``)
         would re-prompt for each new file in an already-declined directory. A partially-tracked
-        directory still lists its individual untracked files (git can't collapse it)."""
+        directory still lists its individual untracked files (git can't collapse it).
+
+        Agent/tooling scaffolding (``.agitrack/``, ``.claude/``, ``.opencode/``) is filtered out
+        so the user is never asked to stage an agent's own folder."""
         output = self._run(["git", "ls-files", "--others", "--exclude-standard", "--directory"]).stdout
-        return [line for line in output.splitlines() if line and not line.startswith(".agitrack/")]
+        return [line for line in output.splitlines() if line and not _is_scaffolding(line)]
 
     def ignored_files(self) -> list[str]:
         """Paths git ignores (per .gitignore) in the working tree — build output,

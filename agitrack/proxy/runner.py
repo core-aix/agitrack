@@ -814,6 +814,12 @@ class ProxyRunner:
         # base and weren't changed — otherwise they'd loop base → worktree → base. See
         # _mark_env_from_base and _collect_copy_candidates.
         self._env_from_base: dict[str, dict[str, tuple[int, int]]] = {}
+        # Per-worktree time (epoch seconds) the initial base→worktree environment copy finished.
+        # The copy-back offer skips anything NOT modified since (mtime <= watermark): those files
+        # came from the base copy, so offering them back would be a no-op loop. Files the agent
+        # creates/edits in the worktree afterward have a newer mtime and are still offered. This
+        # catches what the per-file registry can't — a copied DIRECTORY reported collapsed.
+        self._env_copy_watermark: dict[str, float] = {}
         # Settings-menu scratch: edits collected as pending changes (each with its chosen
         # scope) and written only when the user confirms "save" on the way out.
         self._settings_pending: dict[str, tuple[object, str, bool]] = {}
@@ -1112,6 +1118,7 @@ class ProxyRunner:
                 "_pending_env_refresh": [],
                 "_pending_env_copy": [],
                 "_env_from_base": {},
+                "_env_copy_watermark": {},
                 "_exit_delete_worktrees": None,
                 "_settings_pending": {},
                 "_settings_pending_timings": {},
@@ -2909,24 +2916,36 @@ class ProxyRunner:
         transcript recency, so it follows the conversation the user actually last worked in (even
         one in a worktree since removed — the transcript is kept keyed by the worktree path).
 
-        Empty conversations are skipped: a backend mints a fresh, EMPTY session id whenever a
-        conversation is resumed or opened from its picker, and that empty transcript is newest by
-        mtime but has nothing to resume. Adopting it makes baseline-init fall back via
-        ``recover_nonempty_session`` to an unrelated OLDER session — the "an older session opened"
-        bug. ``ref.label`` (the first real user prompt) is None exactly when there is no real
-        turn, so it is the content test. Returns None when no worktree conversation has content."""
+        Candidate ids come from TWO sources, so a session is found even if one misses: the
+        backend's worktree conversation listing (project dirs keyed by worktree path) AND the
+        session id each existing worktree's own aGiTrack state recorded. They are ranked by
+        CONTENT recency; a candidate with no readable content (recency 0) — e.g. the fresh EMPTY
+        id a backend mints on resume/picker-open — is skipped, since adopting it makes
+        baseline-init fall back via ``recover_nonempty_session`` to an unrelated OLDER session
+        (the "an older session opened" bug). Returns None when no candidate has content."""
+        candidates: dict[str, float] = {}  # session id -> file-mtime fallback for ranking
         try:
-            pairs = self.backend.list_worktree_sessions(self._worktrees().root)
+            for _key, ref in self.backend.list_worktree_sessions(self._worktrees().root):
+                if getattr(ref, "label", None):  # has a real user prompt → real content
+                    candidates[ref.id] = max(candidates.get(ref.id, 0.0), ref.updated)
         except Exception as error:
-            self._debug(f"newest-worktree scan failed: {error!r}")
-            return None
+            self._debug(f"newest-worktree conversation scan failed: {error!r}")
+        try:
+            for info in self._worktrees().list():
+                sid = AgitrackState(info.path, default_backend=self.global_config.default_backend).backend_session_id
+                if sid:
+                    candidates.setdefault(sid, 0.0)
+        except Exception as error:
+            self._debug(f"newest-worktree state scan failed: {error!r}")
         best: tuple[str, float] | None = None
-        for _key, ref in pairs:
-            if not getattr(ref, "label", None):
-                continue  # empty transcript (no real turn) — nothing to resume
-            recency = self._session_recency(ref.id, ref.updated)
+        for sid, fallback in candidates.items():
+            recency = self._session_recency(sid, fallback)
+            if recency <= 0:
+                continue  # empty / unreadable transcript — nothing real to resume
             if best is None or recency > best[1]:
-                best = (ref.id, recency)
+                best = (sid, recency)
+        if best is not None:
+            self._debug(f"newest worktree session with content: {best[0]}")
         return best
 
     def _session_recency(self, session_id: str | None, fallback: float) -> float:
@@ -6287,6 +6306,9 @@ class ProxyRunner:
             try:
                 copied = self._worktrees().copy_base_environment(path)
                 self._mark_env_from_base(path, copied)
+                # Stamp the moment the copy finished: the copy-back offer won't ask about anything
+                # not modified since (the copied files), only what the agent edits/creates after.
+                self._env_copy_watermark[str(path)] = time.time()
                 AgitrackState(path, default_backend=self.global_config.default_backend).copy_full_env = True
             except Exception as error:
                 self._debug(f"env copy for '{name}' failed: {error!r}")
@@ -10372,10 +10394,14 @@ class ProxyRunner:
         if self._copy_declined and (current - self._copy_declined):
             self._copy_declined.clear()
             self._copy_prompted.clear()
-        # Files copied INTO this worktree FROM the base (and not since changed) must not be
-        # offered to be copied BACK — that would loop base → worktree → base. They match the
-        # fingerprint recorded when copied in; an agent edit changes it, so real work still flows.
+        # Files copied INTO this worktree FROM the base must not be offered to be copied BACK —
+        # that would loop base → worktree → base. Two complementary signals: the per-file
+        # fingerprint registry, and the env-copy WATERMARK — anything not modified since the
+        # initial copy finished came from that copy (this also covers a copied DIRECTORY, which
+        # the offer reports collapsed as ``dir/`` and so the per-file registry can't match). The
+        # agent's own later edits have a newer mtime / different fingerprint and still flow.
         from_base = self._env_from_base.get(str(wt_dir), {})
+        watermark = self._env_copy_watermark.get(str(wt_dir), 0.0)
         fresh: list[tuple[str, tuple[int, int]]] = []
         for rel in candidates:
             fingerprint = self._file_fingerprint(wt_dir / rel)
@@ -10383,6 +10409,8 @@ class ProxyRunner:
                 continue
             if from_base.get(rel) == fingerprint:
                 continue  # came from the base unchanged — copying it back would be a no-op loop
+            if watermark and self._entry_mtime(wt_dir / rel) <= watermark:
+                continue  # not modified since the initial base→worktree copy — don't re-offer it
             if rel in self._copy_declined:
                 continue  # muted by a prior decline; not re-asked even on exit (no new file)
             if self._copy_prompted.get(rel) == fingerprint:
@@ -10570,6 +10598,17 @@ class ProxyRunner:
         except OSError:
             return None
         return (stat.st_size, stat.st_mtime_ns)
+
+    @staticmethod
+    def _entry_mtime(path) -> float:
+        """Modification time (epoch seconds) of a worktree entry — a file, or a collapsed
+        ``dir/``. For a directory this is the directory's own mtime, which moves when entries are
+        added/removed in it: enough to tell "touched after the env copy" from "came from it".
+        Missing/unreadable → 0.0 (treated as ancient, i.e. not modified-since)."""
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return 0.0
 
     def _notice_files_remain(self, wt_dir, files: list[str]) -> None:
         listing = ", ".join(files[:5]) + (" …" if len(files) > 5 else "")

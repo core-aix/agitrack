@@ -1804,3 +1804,61 @@ def test_declined_directory_survives_new_files_inside(tmp_path):
 
     promptable = [e for e in repo.untracked_entries() if e not in set(state.declined_untracked())]
     assert promptable == []  # nothing new to ask about — the directory stays muted
+
+
+def test_untracked_listings_exclude_agent_scaffolding_dirs(tmp_path):
+    # Agent/tooling folders (.agitrack, .claude, .opencode) must never be surfaced as untracked
+    # changes — the user should never be asked to stage an agent's own directory.
+    repo = _init_repo(tmp_path)
+    (tmp_path / "real.txt").write_text("x\n")
+    for d in (".claude", ".opencode", ".agitrack"):
+        (tmp_path / d).mkdir()
+        (tmp_path / d / "f.json").write_text("{}\n")
+
+    entries = repo.untracked_entries()
+    files = repo.untracked_files()
+
+    assert "real.txt" in entries and "real.txt" in files
+    assert not any(e.startswith((".claude/", ".opencode/", ".agitrack/")) for e in entries)
+    assert not any(f.startswith((".claude/", ".opencode/", ".agitrack/")) for f in files)
+
+
+def test_copy_back_skips_collapsed_dir_copied_from_base_via_watermark(tmp_path):
+    # Regression: a wholly-untracked directory copied from base is reported by the copy-back
+    # offer collapsed as "dir/", which the per-file registry can't match. The env-copy watermark
+    # covers it: nothing left unmodified since the copy is offered back; a later edit inside is.
+    import time
+
+    main = _init_repo(tmp_path)
+    base = main.current_branch()
+    (main.repo / "assets").mkdir()
+    (main.repo / "assets" / "logo.png").write_text("PNG\n")  # untracked dir in base
+    wm = WorktreeManager(main)
+    info = wm.create("feature", base=base)
+
+    runner = make_runner(base_repo=main, worktree=info, repo=GitRepo(info.path))
+    runner.worktree_manager = wm
+    runner._debug = lambda *a, **k: None
+    runner._offer_user_commit_for_worktree_edits = lambda: None
+
+    copied = wm.copy_base_environment(info.path)
+    assert "assets/" in copied  # collapsed directory entry
+    runner._env_copy_watermark[str(info.path)] = time.time()  # stamp copy completion
+
+    # The collapsed "assets/" came from the copy and isn't modified since → not offered back.
+    assert runner._collect_copy_candidates(context="turn") is None
+
+    # A new file created in the worktree dir AFTER the copy bumps the dir mtime → offered.
+    time.sleep(0.01)
+    (info.path / "assets" / "fresh.png").write_text("new\n")
+    os_utime_now(info.path / "assets")
+    result = runner._collect_copy_candidates(context="turn")
+    assert result is not None and "assets/" in result[0]
+
+
+def os_utime_now(path):
+    import os
+    import time
+
+    now = time.time() + 5  # safely after the watermark
+    os.utime(path, (now, now))

@@ -94,7 +94,10 @@ class WorktreeManager:
         which is exactly what a fresh worktree is missing. Wholly-ignored directories come
         back as a single ``dir/`` entry so they copy in one shot."""
         try:
-            entries = self.main_repo.untracked_files() + self.main_repo.ignored_files()
+            # untracked_entries (not untracked_files) so a wholly-untracked directory is ONE
+            # ``dir/`` entry — matching how the copy-back offer reports it (collapsed), and
+            # letting it copy in one shot.
+            entries = self.main_repo.untracked_entries() + self.main_repo.ignored_files()
         except Exception:
             return []
         return [rel for rel in entries if rel.split("/", 1)[0] not in self._ENV_SKIP_TOP]
