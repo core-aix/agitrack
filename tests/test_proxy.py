@@ -38,6 +38,69 @@ def _runner_with_sessions(refs):
     return runner
 
 
+class _CwdBackend:
+    """Minimal backend that records the repo it was asked to spawn in."""
+
+    name = "fake"
+
+    def __init__(self):
+        self.spawn_repo = None
+
+    def new_session_id(self):
+        return None  # let the runner take the list_sessions branch (no state write)
+
+    def list_sessions(self, repo):
+        return []
+
+    def spawn_command(self, repo, **kwargs):
+        self.spawn_repo = repo
+        return ["fakebin"]
+
+
+def test_spawn_sets_backend_cwd_to_the_session_worktree(tmp_path, monkeypatch):
+    # The backend must be launched WITH ITS CWD INSIDE THE SESSION WORKTREE (under
+    # .agitrack/worktrees/), not the base repo — otherwise its edits land in the base
+    # checkout and aGiTrack (which watches the worktree) never commits/merges them.
+    # The runner passes the cwd backend-agnostically, so this covers Claude and OpenCode.
+    import agitrack.proxy.runner as runner_mod
+
+    worktree = tmp_path / ".agitrack" / "worktrees" / "s"
+    worktree.mkdir(parents=True)
+    backend = _CwdBackend()
+    runner = make_runner(repo=types.SimpleNamespace(repo=worktree), backend=backend)
+    runner.worktree = None  # make _confine_to_worktree a no-op (don't sandbox-wrap in the test)
+    runner._should_continue_session = lambda: False
+    runner._launch_command = lambda: []
+    runner._backend_child_env = lambda: {}
+    runner._fork_next_spawn = False
+    runner._commit_guidance = True
+    runner._use_worktrees = True
+
+    captured = {}
+
+    def fake_make_child_process(command, cwd, extra_env=None):
+        captured["command"] = command
+        captured["cwd"] = cwd
+        return types.SimpleNamespace(child_pid=1, master_fd=3)
+
+    monkeypatch.setattr(runner_mod, "make_child_process", fake_make_child_process)
+    runner._spawn()
+
+    assert captured["cwd"] == str(worktree)  # cwd is the worktree, not the base repo
+    assert backend.spawn_repo == worktree  # backend also told to operate in the worktree
+
+
+def test_opencode_spawn_command_embeds_the_worktree_path():
+    # OpenCode takes its working directory as a positional CLI arg (in addition to the
+    # process cwd the runner sets), so the path it receives must be the worktree too.
+    import pathlib
+
+    agent = make_proxy_agent("opencode")
+    wt = pathlib.Path("/repo/.agitrack/worktrees/s")
+    cmd = agent.spawn_command(wt, session_id=None, resume=False)
+    assert cmd[-1] == str(wt)  # the worktree path, platform-normalized
+
+
 def test_discover_spawned_session_picks_the_new_session():
     refs = [SessionRef("old", 100.0), SessionRef("new", 200.0)]
     runner = _runner_with_sessions(refs)
