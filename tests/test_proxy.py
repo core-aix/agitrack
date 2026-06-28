@@ -9066,66 +9066,6 @@ def test_warn_if_base_edited_fires_then_rebaselines_and_noop_when_off():
     assert msgs == []
 
 
-def test_warn_if_base_committed_detects_raw_commit_but_not_agitrack_commit(tmp_path):
-    # The agent committing straight onto the base branch leaves a CLEAN tree, so the
-    # status-based edit check can't see it. The commit check catches a raw commit (no
-    # aGiTrack metadata header) and warns; aGiTrack's own base commits carry the header
-    # and must NOT warn.
-    from agitrack.commits import build_user_commit_message
-    from agitrack.git import GitRepo
-
-    base = GitRepo.init(tmp_path)
-    (tmp_path / "seed.txt").write_text("seed\n", encoding="utf-8")
-    base.stage_paths(["seed.txt"])
-    base.commit("seed")
-
-    runner = make_runner()
-    runner.BASE_EDIT_CHECK_SECONDS = 0.0
-    runner._base_check_at = 0.0
-    runner._monitor_base_edits = True
-    runner._base_status_baseline = set()
-    runner._base_head_baseline = base.rev_parse("HEAD")
-    runner.base_repo = base
-    runner.agent_in_flight = True  # a turn is active → a raw base commit is attributed to the agent
-    msgs: list = []
-    runner._set_message = lambda m, **k: msgs.append(m)
-    runner._render = lambda: None
-
-    # Agent makes a RAW commit on base (plain message, no metadata header) → warns.
-    (tmp_path / "a.txt").write_text("x\n", encoding="utf-8")
-    base.stage_paths(["a.txt"])
-    base.commit("agent's own raw commit on base")
-    runner._warn_if_base_edited()
-    assert any("committed to the base repo" in m for m in msgs)
-
-    # Same commit must not warn again (baseline advanced).
-    msgs.clear()
-    runner._base_check_at = 0.0
-    runner._warn_if_base_edited()
-    assert msgs == []
-
-    # An aGiTrack-authored base commit (carries the metadata header) → no warning.
-    msgs.clear()
-    runner._base_check_at = 0.0
-    (tmp_path / "b.txt").write_text("y\n", encoding="utf-8")
-    base.stage_paths(["b.txt"])
-    base.commit(build_user_commit_message(message="legit user commit", agitrack_session_id="s1"))
-    runner._warn_if_base_edited()
-    assert msgs == []
-
-    # A raw commit made while the session is IDLE (no agent turn) is attributed to the user,
-    # not the agent — stay quiet (we can't tell whose commit it is, so don't mislabel it).
-    msgs.clear()
-    runner._base_check_at = 0.0
-    runner.agent_in_flight = False
-    runner.last_child_output = 0.0  # long ago → agent not recently active
-    (tmp_path / "c.txt").write_text("z\n", encoding="utf-8")
-    base.stage_paths(["c.txt"])
-    base.commit("a raw commit while idle (could be the user's own)")
-    runner._warn_if_base_edited()
-    assert msgs == []
-
-
 def test_stop_session_drops_it_keeps_others_and_refuses_the_last():
     runner = _mux_runner()
     runner.sessions.append(_bg_session("B"))

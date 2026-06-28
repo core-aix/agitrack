@@ -199,11 +199,15 @@ def main(argv: list[str] | None = None) -> int:
         "agent does not create its own git commits unless you explicitly ask",
     )
     parser.add_argument(
+        "--no-confine",
         "--no-sandbox",
+        dest="no_sandbox",
         action="store_true",
-        help="do not confine the agent's writes to its session worktree; by default aGiTrack "
-        "sandboxes the backend so it can only write inside its worktree (plus .git). Also "
-        "settable via 'sandbox' in config.",
+        help="do not confine the agent's writes to its session worktree. By default aGiTrack "
+        "confines the agent to its worktree (plus .git): on macOS/Linux via the OS sandbox "
+        "(sandbox-exec/bubblewrap), and where no sandbox is available (e.g. Windows) via a git "
+        "pre-commit guard that stops the agent from committing into the base repo. Also settable "
+        "via 'sandbox' in config. (--no-sandbox is kept as an alias.)",
     )
     parser.add_argument(
         "--allowed-edit-paths",
