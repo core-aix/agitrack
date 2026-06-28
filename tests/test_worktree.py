@@ -1543,10 +1543,10 @@ def test_agent_made_commits_integrate_when_idle(tmp_path):
 # --- full environment copy (untracked + ignored) on worktree creation ---
 
 
-def test_create_copies_full_base_environment_into_worktree(tmp_path):
-    # git worktree add only checks out TRACKED files; aGiTrack copies the rest of the base
-    # environment (untracked files, ignored files, and wholly-ignored dirs) so the worktree
-    # is a faithful clone of the working environment, not just the committed files.
+def test_copy_base_environment_copies_untracked_and_ignored(tmp_path):
+    # git worktree add only checks out TRACKED files; copy_base_environment brings the rest of
+    # the base environment (untracked files, ignored files, and wholly-ignored dirs) across so
+    # the worktree is a faithful clone of the working environment, not just the committed files.
     repo = _init_repo(tmp_path)
     (tmp_path / ".gitignore").write_text("ignored.txt\nbuild/\n")
     repo.stage_paths([".gitignore"])
@@ -1558,29 +1558,36 @@ def test_create_copies_full_base_environment_into_worktree(tmp_path):
 
     wm = WorktreeManager(repo)
     info = wm.create("envtest", base=repo.current_branch())
+    assert (info.path / "f.txt").read_text() == "base\n"  # tracked file checked out by git
+    assert not (info.path / "scratch.txt").exists()  # create() does NOT copy the environment
+
+    copied = wm.copy_base_environment(info.path)
 
     assert (info.path / "scratch.txt").read_text() == "untracked\n"
     assert (info.path / "ignored.txt").read_text() == "secret\n"
     assert (info.path / "build" / "out.bin").read_text() == "artifact\n"
-    assert (info.path / "f.txt").read_text() == "base\n"  # tracked file still there too
+    assert set(copied) >= {"scratch.txt", "ignored.txt"}
     # aGiTrack's own state dir (which holds the worktrees) is never copied across.
     assert not (info.path / ".agitrack" / "worktrees").exists()
 
 
 def test_base_newer_entries_and_copy_entries_refresh(tmp_path):
+    import os
     import time
 
     repo = _init_repo(tmp_path)
     (tmp_path / "scratch.txt").write_text("v1\n")
     wm = WorktreeManager(repo)
     info = wm.create("envtest", base=repo.current_branch())
+    wm.copy_base_environment(info.path)
     assert (info.path / "scratch.txt").read_text() == "v1\n"
     assert wm.base_newer_entries(info.path) == []  # just copied — same mtime, nothing newer
 
-    time.sleep(0.01)
-    (tmp_path / "scratch.txt").write_text("v2\n")  # the base moves on
+    (tmp_path / "scratch.txt").write_text("v2\n")  # the base moves on...
+    future = time.time() + 100  # ...with a clearly newer mtime (deterministic, no sleep)
+    os.utime(tmp_path / "scratch.txt", (future, future))
     assert wm.base_newer_entries(info.path) == ["scratch.txt"]
-    assert wm.copy_entries(info.path, ["scratch.txt"]) == 1
+    assert wm.copy_entries(info.path, ["scratch.txt"]) == ["scratch.txt"]
     assert (info.path / "scratch.txt").read_text() == "v2\n"
     assert wm.base_newer_entries(info.path) == []  # back in sync
 
@@ -1649,3 +1656,76 @@ def test_present_pending_env_refresh_keeps_worktree_on_no(tmp_path):
 
     assert (info.path / "cfg.txt").read_text() == "wt-v1\n"  # untouched
     assert runner._pending_env_refresh == []
+
+
+# --- create-time "copy full env vs tracked-only" prompt + copy-loop prevention ---
+
+
+def test_present_pending_env_copy_default_is_tracked_only(tmp_path):
+    main = _init_repo(tmp_path)
+    base = main.current_branch()
+    (main.repo / "scratch.txt").write_text("env\n")  # an untracked base env file
+    wm = WorktreeManager(main)
+    info = wm.create("sess", base=base)
+
+    runner = make_runner(base_repo=main)
+    runner.worktree_manager = wm
+    runner.global_config = type("G", (), {"default_backend": "claude"})()
+    runner._select_popup = lambda *a, **k: "Only the tracked files"  # the default choice
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda: None
+    runner._pending_env_copy = [(info.path, "sess")]
+
+    runner._present_pending_env_copy()
+
+    assert not (info.path / "scratch.txt").exists()  # tracked-only → environment NOT copied
+    assert AgitrackState(info.path).copy_full_env is False
+    assert runner._pending_env_copy == []
+
+
+def test_present_pending_env_copy_full_env_copies_and_persists(tmp_path):
+    main = _init_repo(tmp_path)
+    base = main.current_branch()
+    (main.repo / "scratch.txt").write_text("env\n")
+    wm = WorktreeManager(main)
+    info = wm.create("sess", base=base)
+
+    runner = make_runner(base_repo=main)
+    runner.worktree_manager = wm
+    runner.global_config = type("G", (), {"default_backend": "claude"})()
+    runner._select_popup = lambda *a, **k: "Copy the full environment"
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda: None
+    runner._pending_env_copy = [(info.path, "sess")]
+
+    runner._present_pending_env_copy()
+
+    assert (info.path / "scratch.txt").read_text() == "env\n"  # full env copied in
+    assert AgitrackState(info.path).copy_full_env is True  # choice persisted on the worktree
+    # The copied file is tracked as base-origin so it won't be offered for copy-back.
+    assert "scratch.txt" in runner._env_from_base.get(str(info.path), {})
+
+
+def test_copy_back_skips_unchanged_files_copied_from_base(tmp_path):
+    # A file copied INTO the worktree FROM the base must not then be offered to be copied BACK
+    # (a base → worktree → base loop) while it is unchanged.
+    main = _init_repo(tmp_path)
+    base = main.current_branch()
+    (main.repo / "data.bin").write_text("payload\n")
+    wm = WorktreeManager(main)
+    info = wm.create("sess", base=base)
+    copied = wm.copy_base_environment(info.path)
+    assert "data.bin" in copied
+
+    runner = make_runner(base_repo=main, worktree=info, repo=GitRepo(info.path))
+    runner.worktree_manager = wm
+    runner._debug = lambda *a, **k: None
+    runner._mark_env_from_base(info.path, copied)
+
+    # data.bin is untracked in the worktree, but came from base unchanged → not offered.
+    assert runner._collect_copy_candidates(context="turn") is None
+
+    # Once the agent edits it, it IS offered (genuine new content, no longer matches).
+    (info.path / "data.bin").write_text("edited by the agent\n")
+    result = runner._collect_copy_candidates(context="turn")
+    assert result is not None and "data.bin" in result[0]

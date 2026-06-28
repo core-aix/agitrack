@@ -805,6 +805,15 @@ class ProxyRunner:
         # prompts: (worktree path, repo-relative paths) queued when a worktree is reopened
         # (possibly before the UI is up) and presented by the loop. See _refresh_worktree_from_base.
         self._pending_env_refresh: list[tuple[Path, list[str]]] = []
+        # Deferred "copy the full environment into this NEW worktree, or only tracked files?"
+        # prompts: (worktree path, name), queued at creation and presented by the loop so startup
+        # stays fast and the prompt has a UI. See _present_pending_env_copy.
+        self._pending_env_copy: list[tuple[Path, str]] = []
+        # Per-worktree record of files copied INTO the worktree FROM the base (path → {rel:
+        # fingerprint}), so the copy-back-to-base offer can skip files that merely came from the
+        # base and weren't changed — otherwise they'd loop base → worktree → base. See
+        # _mark_env_from_base and _collect_copy_candidates.
+        self._env_from_base: dict[str, dict[str, tuple[int, int]]] = {}
         # Settings-menu scratch: edits collected as pending changes (each with its chosen
         # scope) and written only when the user confirms "save" on the way out.
         self._settings_pending: dict[str, tuple[object, str, bool]] = {}
@@ -1101,6 +1110,8 @@ class ProxyRunner:
                 "_copy_declined": set(),
                 "_pending_copy_offer": None,
                 "_pending_env_refresh": [],
+                "_pending_env_copy": [],
+                "_env_from_base": {},
                 "_exit_delete_worktrees": None,
                 "_settings_pending": {},
                 "_settings_pending_timings": {},
@@ -6162,11 +6173,11 @@ class ProxyRunner:
         path = worktrees.worktree_path(name)
         if self._is_valid_worktree(path):
             repo = GitRepo(path)
-            # Reusing a persistent worktree from a previous run: bring its environment back in
-            # sync with the base. Newly-added base files (untracked/ignored the base gained
-            # since) are copied in silently; files the base now has a NEWER copy of are queued
-            # for a "overwrite the worktree's older copies?" prompt the loop surfaces (we may be
-            # mid-startup with no UI yet, so it's deferred rather than shown inline).
+            # Reusing a persistent worktree from a previous run. If it was created with the full
+            # environment, keep it in sync with the base: copy in newly-added base files silently
+            # and queue an "overwrite the worktree's older copies?" prompt for any base files now
+            # newer (deferred, since we may be mid-startup with no UI yet). A tracked-only worktree
+            # is left as-is — the user opted out of carrying the environment.
             self._refresh_worktree_from_base(worktrees, path)
             return WorktreeInfo(name=path.name, path=path, branch=repo.current_branch()), repo
         # A leftover, *invalid* dir (e.g. only `.agitrack/` recreated by a write after
@@ -6179,21 +6190,77 @@ class ProxyRunner:
             shutil.rmtree(path, ignore_errors=True)
         base = base_branch or self._base_branch or self.base_repo.current_branch()
         info = worktrees.create(name, base=base)
+        # `create` only places the tracked files git checks out. Whether to also copy the full
+        # base environment (untracked + git-ignored) is the user's choice — queued as a deferred
+        # prompt so startup stays fast (the copy can be slow) and the prompt has a UI to appear in.
+        self._pending_env_copy.append((info.path, info.name))
         return info, GitRepo(info.path)
 
     def _refresh_worktree_from_base(self, worktrees: WorktreeManager, path) -> None:
-        """Re-sync a reused worktree with the base environment: copy in any base files it is
-        missing (silently — additions are safe), and queue an overwrite prompt for base files
-        that are newer than the worktree's copy. Best-effort: a sync failure must never block
-        opening the worktree."""
+        """Re-sync a reused full-environment worktree with the base: copy in any base files it is
+        missing (silently — additions are safe) and queue an overwrite prompt for base files now
+        newer than the worktree's copy. A tracked-only worktree (the user opted out of the
+        environment) is left untouched. Best-effort: a sync failure must never block opening it."""
         try:
-            worktrees.copy_base_environment(path)  # additions only (skips files already present)
+            if not AgitrackState(path, default_backend=self.global_config.default_backend).copy_full_env:
+                return  # tracked-only worktree — nothing to keep in sync
+            copied = worktrees.copy_base_environment(path)  # additions only (skips existing)
+            self._mark_env_from_base(path, copied)
             newer = worktrees.base_newer_entries(path)
         except Exception as error:
             self._debug(f"worktree env refresh failed for {path}: {error!r}")
             return
         if newer:
             self._pending_env_refresh.append((path, newer))
+
+    def _present_pending_env_copy(self) -> None:
+        """Main thread: surface the deferred "copy the full environment into the new worktree, or
+        only the tracked files?" prompt for each freshly created worktree. Default (and Esc) is
+        tracked-only, so startup stays fast unless the user opts in. On opt-in the copy runs here
+        (rsync delta) behind a "creating…" message, and the choice is persisted on the worktree."""
+        while self._pending_env_copy:
+            path, name = self._pending_env_copy.pop(0)
+            try:
+                choice = self._select_popup(
+                    f"New worktree '{name}' at {path}.\n"
+                    f"git has checked out the tracked files. Also copy the FULL environment "
+                    f"(untracked + git-ignored files: .env, node_modules, virtualenvs, build output) "
+                    f"so the agent has the same setup as the base repo? This can take a moment for a "
+                    f"large tree; by default only the tracked files are used.",
+                    ["Only the tracked files", "Copy the full environment"],
+                )
+            except Exception as error:
+                self._debug(f"env-copy prompt failed: {error!r}")
+                continue
+            if choice != "Copy the full environment":
+                continue  # tracked-only (default / Esc): nothing more to do
+            self._set_message(f"Creating worktree '{name}' — copying the environment, please wait…")
+            self._render()
+            try:
+                copied = self._worktrees().copy_base_environment(path)
+                self._mark_env_from_base(path, copied)
+                AgitrackState(path, default_backend=self.global_config.default_backend).copy_full_env = True
+            except Exception as error:
+                self._debug(f"env copy for '{name}' failed: {error!r}")
+                self._set_message(f"Could not copy the environment into '{name}': {error}", seconds=8.0)
+                self._render()
+                continue
+            self._set_message(f"Copied {len(copied)} environment entr(y/ies) into worktree '{name}'.", seconds=6.0)
+            self._render()
+
+    def _mark_env_from_base(self, path, rels: list[str]) -> None:
+        """Record that ``rels`` were copied INTO the worktree FROM the base, with their current
+        fingerprints. The copy-back-to-base offer skips a file still matching its recorded
+        fingerprint, so files that merely came from the base aren't offered to be copied back —
+        which would otherwise create a copy loop (base → worktree → base → …). A file the agent
+        later edits no longer matches, so genuine changes are still offered."""
+        if not rels:
+            return
+        registry = self._env_from_base.setdefault(str(path), {})
+        for rel in rels:
+            fingerprint = self._file_fingerprint(Path(path) / rel)
+            if fingerprint is not None:
+                registry[rel] = fingerprint
 
     def _present_pending_env_refresh(self) -> None:
         """Main thread: surface any deferred "base has newer files — overwrite the worktree's
@@ -6212,8 +6279,9 @@ class ProxyRunner:
                 self._debug(f"env-refresh prompt failed: {error!r}")
                 continue
             if choice and choice.startswith("Yes"):
-                count = self._worktrees().copy_entries(dest, rels)
-                self._set_message(f"Updated {count} file(s) in the worktree from the base repo.", seconds=6.0)
+                copied = self._worktrees().copy_entries(dest, rels)
+                self._mark_env_from_base(dest, copied)
+                self._set_message(f"Updated {len(copied)} file(s) in the worktree from the base repo.", seconds=6.0)
                 self._render()
 
     def _is_valid_worktree(self, path) -> bool:
@@ -7069,6 +7137,7 @@ class ProxyRunner:
         self._flush_pending_enter()
         self._drain_modal_mailbox()  # present any dialog the git worker queued
         self._present_pending_copy_offer()  # the turn's "copy stranded files?" popup, if any
+        self._present_pending_env_copy()  # "copy the full environment into the new worktree?" popup
         self._present_pending_env_refresh()  # "base has newer files — update the worktree?" popup
         self._resume_pending_prompt_if_ready()
         self._service_shared_resume()  # complete a shared-session resume once fetched
@@ -9137,8 +9206,10 @@ class ProxyRunner:
         self._exit_resume_worktree = getattr(self.worktree, "name", None)
         # Decide keep-vs-delete for this run's worktrees ONCE, now, in the genuine active
         # context (before any per-session swap) so the prompt reflects the real foreground
-        # screen and is asked a single time for the whole exit.
+        # screen and is asked a single time for the whole exit. Esc on it cancels the exit.
         self._should_delete_worktrees_on_exit()
+        if self._exit_aborted:
+            return
         self._commit_latest_turn_sync()  # active session, in place
         self._auto_share_on_exit()  # push the latest conversation if auto-shared
         self._finalize_summary_then_integrate_on_exit()
@@ -9264,9 +9335,9 @@ class ProxyRunner:
     def _should_delete_worktrees_on_exit(self) -> bool:
         """Ask once per exit whether to delete this run's session worktrees or keep them,
         spelling out their exact on-disk locations so the user can find them either way. The
-        answer is cached and applied to every session's worktree. Defaults to KEEP — on a
-        signal teardown (terminal/window close: no UI), and on Esc — so a close never silently
-        deletes a session's environment or work-in-progress."""
+        answer is cached and applied to every session's worktree. A signal teardown (no UI)
+        defaults to KEEP. Pressing Esc CANCELS the exit (sets ``_exit_aborted``) rather than
+        choosing for the user — so a stray keystroke never deletes or commits them to leaving."""
         if self._exit_delete_worktrees is not None:
             return self._exit_delete_worktrees
         # The exact directories the decision applies to (every live session that has one).
@@ -9292,7 +9363,12 @@ class ProxyRunner:
             ["Keep them", "Delete them"],
             detail=listing,
         )
-        self._exit_delete_worktrees = choice == "Delete them"  # Esc / "Keep them" → keep
+        if choice is None:
+            # Esc → cancel the exit entirely; the caller (_finalize_pending_work) checks this
+            # and stays running. Deliberately NOT cached, so the next exit asks again.
+            self._exit_aborted = True
+            return False
+        self._exit_delete_worktrees = choice == "Delete them"
         return self._exit_delete_worktrees
 
     def _finalize_worktree_on_exit(self) -> None:
@@ -9317,7 +9393,10 @@ class ProxyRunner:
         # Remember this session's conversation under its backend so switching back to that
         # backend (this run or a later one) resumes it.
         self._remember_session_for_backend()
-        if not self._should_delete_worktrees_on_exit():
+        delete = self._should_delete_worktrees_on_exit()
+        if self._exit_aborted:
+            return  # Esc on the keep/delete prompt cancelled the exit
+        if not delete:
             # KEEP: just offer to copy the worktree's not-merged / newer files into the base repo
             # so the user — who works in the base directory — has them too. Interactive only (a
             # signal teardown has no UI, and nothing is being deleted, so there's nothing to
@@ -10234,11 +10313,17 @@ class ProxyRunner:
         if self._copy_declined and (current - self._copy_declined):
             self._copy_declined.clear()
             self._copy_prompted.clear()
+        # Files copied INTO this worktree FROM the base (and not since changed) must not be
+        # offered to be copied BACK — that would loop base → worktree → base. They match the
+        # fingerprint recorded when copied in; an agent edit changes it, so real work still flows.
+        from_base = self._env_from_base.get(str(wt_dir), {})
         fresh: list[tuple[str, tuple[int, int]]] = []
         for rel in candidates:
             fingerprint = self._file_fingerprint(wt_dir / rel)
             if fingerprint is None:
                 continue
+            if from_base.get(rel) == fingerprint:
+                continue  # came from the base unchanged — copying it back would be a no-op loop
             if rel in self._copy_declined:
                 continue  # muted by a prior decline; not re-asked even on exit (no new file)
             if self._copy_prompted.get(rel) == fingerprint:

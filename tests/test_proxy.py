@@ -6232,6 +6232,21 @@ def test_exit_worktree_prompt_defaults_to_keep_on_signal_teardown(tmp_path):
     assert called == []
 
 
+def test_exit_worktree_prompt_esc_aborts_exit(tmp_path):
+    # Esc on the keep/delete prompt cancels the exit (sets _exit_aborted) rather than choosing
+    # for the user, and is not cached so the next exit asks again.
+    runner = make_runner()
+    runner.screen = object()
+    runner.sessions = []
+    runner.worktree = types.SimpleNamespace(name="session-1", path=tmp_path / "wt")
+    runner._select_popup = lambda *a, **k: None  # Esc
+    runner._exit_aborted = False
+
+    assert runner._should_delete_worktrees_on_exit() is False
+    assert runner._exit_aborted is True
+    assert runner._exit_delete_worktrees is None  # not cached → re-asked next exit
+
+
 def test_exit_worktree_prompt_skipped_when_no_worktrees():
     # In --no-worktree mode there are no worktrees to decide about, so exit never prompts.
     runner = make_runner()
