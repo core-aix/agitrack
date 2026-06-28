@@ -81,6 +81,14 @@ _X10_MOUSE_RE = re.compile(rb"\x1b\[M.{3}", re.DOTALL)
 # A trailing, not-yet-complete X10 report (ESC [ M with fewer than three coordinate bytes),
 # held back like the SGR/CSI tail below so its bytes aren't forwarded split across reads.
 _INCOMPLETE_X10_RE = re.compile(rb"\x1b\[M.{0,2}$", re.DOTALL)
+
+
+def _ps_single_quote(value: str) -> str:
+    """Quote *value* as a PowerShell single-quoted string literal (doubling embedded
+    single quotes). Used to embed file paths in the MSI-update relauncher command."""
+    return "'" + value.replace("'", "''") + "'"
+
+
 # Terminal focus in/out reports (CSI I / CSI O), emitted on window focus changes
 # when focus reporting is on. Like mouse reports they are not keystrokes.
 _FOCUS_EVENT_RE = re.compile(rb"\x1b\[[IO]")
@@ -879,6 +887,7 @@ class ProxyRunner:
         self._update_pending = False  # user accepted; apply once sessions finish
         self._update_applying = False  # apply+restart in progress
         self._pending_restart = False  # re-exec aGiTrack after the loop tears down
+        self._pending_msi_handoff = False  # restart goes through the elevated MSI installer, not re-exec
         self._reopen_after_exit = False  # host terminal closed; user asked to reopen in a new window
         # Git worker (the automatic commit/merge pipeline runs here, never on the main
         # reactor thread, so typing is never blocked by a git subprocess). The worker
@@ -1207,6 +1216,10 @@ class ProxyRunner:
             self.management_lock.release()
             return 1
         self.state.save()
+        # Record this launch's CLI arguments so a later MSI self-update can re-launch with
+        # the same flags (--repo / --backend / --no-worktree …) after replacing agitrack.exe.
+        # Frozen-Windows only; a no-op everywhere else.
+        self._write_msi_last_args()
         if self.actions.has_pre_agent_user_changes():
             print("User changes detected before the agent starts.")
             self.actions.create_user_commit()
@@ -1335,6 +1348,13 @@ class ProxyRunner:
                     os.chdir(self.base_repo.repo)
                 except OSError:
                     pass
+            # An MSI self-update can't re-exec in place — the new MSI replaces the very
+            # agitrack.exe we'd re-run. Hand off to the elevated installer instead; it
+            # re-launches the updated build itself. If the hand-off can't start (e.g. the
+            # user declined the UAC prompt), fall through to a normal re-exec so the user
+            # keeps running the current version.
+            if self._pending_msi_handoff and self._launch_msi_bootstrapper():
+                return exit_code
             # This restart follows an in-app (menu) update; the user already saw
             # and acknowledged the privacy warning when this session started, so
             # don't make them acknowledge it again. (A startup-time update re-execs
@@ -2095,6 +2115,11 @@ class ProxyRunner:
                 self._set_message(f"aGiTrack update failed: {result.error}.{manual}", seconds=15.0)
                 self._render()
                 return  # session untouched — keep running
+            # The MSI updater only DOWNLOADS during apply(); the actual install is an
+            # elevated hand-off after we exit (the MSI replaces the running agitrack.exe).
+            # Flag it so the teardown launches the bootstrapper instead of re-exec'ing.
+            if getattr(self._updater, "pending_msi_path", None):
+                self._pending_msi_handoff = True
             message = f"{result.message} Restarting aGiTrack…"
         # Update is in place (or unnecessary): now finish commits and tear down for
         # the re-exec.
@@ -2128,6 +2153,99 @@ class ProxyRunner:
         self._exit_child()
         self._pending_restart = True
         self.running = False
+
+    def _msi_last_args_path(self) -> str | None:
+        # Per-user, no UAC needed to write, survives reboots. The MSI bootstrapper reads it
+        # to re-launch with the same flags after the install. None when LOCALAPPDATA is unset.
+        local = os.environ.get("LOCALAPPDATA")
+        if not local:
+            return None
+        return os.path.join(local, "aGiTrack", "last-args.txt")
+
+    def _write_msi_last_args(self) -> None:
+        # Frozen-Windows (MSI) only: record this launch's argv so a self-update can restore it.
+        if sys.platform != "win32" or not getattr(sys, "frozen", False):
+            return
+        path = self._msi_last_args_path()
+        if path is None:
+            return
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(subprocess.list2cmdline(list(sys.argv[1:])))
+        except OSError as error:
+            self._debug(f"could not write MSI last-args ({error!r})")
+
+    def _launch_msi_bootstrapper(self) -> bool:
+        """Hand the downloaded MSI off to the elevated installer and arrange the re-launch.
+
+        Two cooperating processes, so the updated aGiTrack comes back at the user's NORMAL
+        integrity level rather than inheriting the installer's admin token:
+
+        * an **elevated** bootstrapper (``agitrack-update.cmd``, run via UAC ``runas``) waits
+          for this process to exit, runs ``msiexec``, and writes its exit code to a marker file;
+        * a **non-elevated** relauncher (spawned here, before we exit) waits for that marker and,
+          on success, starts the freshly installed ``agitrack.exe`` with the saved arguments.
+
+        Returns True when the elevated install was started (the caller should just exit), or
+        False when it couldn't be (e.g. the user declined UAC) so the caller falls back to a
+        normal re-exec of the current version.
+        """
+        from agitrack.proc import detach_kwargs, shell_execute_runas
+
+        msi = getattr(self._updater, "pending_msi_path", None)
+        if not msi or self._updater is None:
+            return False
+        install_dir = self._updater.msi_install_dir()
+        bootstrapper = os.path.join(install_dir, "agitrack-update.cmd")
+        exe = os.path.join(install_dir, "agitrack.exe")
+        last_args = self._msi_last_args_path() or ""
+        local = os.environ.get("LOCALAPPDATA", install_dir)
+        marker = os.path.join(local, "aGiTrack", "update-result.txt")
+        try:
+            os.makedirs(os.path.dirname(marker), exist_ok=True)
+        except OSError:
+            pass
+        # Clear any stale marker so the relauncher only acts on THIS install's result.
+        try:
+            os.remove(marker)
+        except OSError:
+            pass
+
+        # Elevated install: wait for our PID, run msiexec, write the result code to the marker.
+        # cmd /c quoting rule: wrap the whole command line in one extra pair of quotes when any
+        # token is quoted, so the leading "" is stripped and the inner quotes survive.
+        pid = os.getpid()
+        inner = f'"{bootstrapper}" "{msi}" {pid} "{marker}"'
+        try:
+            shell_execute_runas("cmd.exe", f'/c "{inner}"')
+        except Exception as error:  # UAC declined or launch failed: keep the current version
+            self._debug(f"MSI elevated hand-off failed ({error!r})")
+            if self.global_config is not None:
+                self.global_config.pending_manual_update = getattr(self._updater, "_msi_latest", "") or "available"
+            return False
+
+        # Non-elevated relauncher: wait for the marker, then start the new build de-elevated.
+        relauncher = (
+            "$ErrorActionPreference='SilentlyContinue';"
+            f"$m={_ps_single_quote(marker)};$exe={_ps_single_quote(exe)};$af={_ps_single_quote(last_args)};"
+            "$deadline=(Get-Date).AddMinutes(10);"
+            "while(-not (Test-Path $m) -and (Get-Date) -lt $deadline){Start-Sleep -Seconds 1};"
+            "if(-not (Test-Path $m)){exit};"
+            "$rc=((Get-Content $m -TotalCount 1) -join '').Trim();"
+            "if($rc -ne '0'){exit};"
+            "$a='';if(Test-Path $af){$a=((Get-Content $af -TotalCount 1) -join '').Trim()};"
+            "if($a){Start-Process -FilePath $exe -ArgumentList $a}else{Start-Process -FilePath $exe}"
+        )
+        try:
+            subprocess.Popen(
+                ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", relauncher],
+                **detach_kwargs(),
+            )
+        except OSError as error:
+            # The install will still proceed; the user just has to start aGiTrack again.
+            self._debug(f"MSI relauncher spawn failed ({error!r})")
+        return True
 
     def _handle_update_command(self) -> None:
         # Ctrl-G → "update": show the current update status and let the user opt

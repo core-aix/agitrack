@@ -158,6 +158,9 @@ Conventions:
 | Source: detect/apply (clean / diverged / conflict / offline) | `test_source_check_*`, `test_source_apply_*` | real-git |
 | Startup prompt (apply / default-enter / explicit-no / pending reminder) | `test_startup_prompt_*`, `test_startup_reminds_without_reprompting_when_pending` | mock |
 | Apply failure records pending and keeps running | `test_startup_apply_failure_records_pending_and_keeps_running` | mock |
+| Windows MSI: detect (frozen+registry) / check GitHub release / download / no-asset / api-error | `test_updater.py::test_install_method_msi_*`, `test_check_msi_*`, `test_apply_msi_*` | unit |
+| Windows MSI: manual-instructions route (releases URL + SmartScreen) | `test_updater.py::test_manual_instructions_msi_route` | unit |
+| Restart command shape (frozen exe vs `python -m agitrack`) — self-update **and** settings "restart now" | `test_updater.py::test_restart_command_*` | unit |
 
 ## 14. Windows-specific (#118)
 | Sequence | Test(s) | Kind |

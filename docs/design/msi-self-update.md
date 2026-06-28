@@ -2,8 +2,19 @@
 
 > Design doc for issue #124. Tracks the work to make the
 > PyInstaller-bundled aGiTrack MSI install update itself in place.
-> Implementation has not started yet — this file captures the agreed plan
-> so the eventual PRs have a single, reviewable specification to point at.
+>
+> **Status: implemented** (PR #127 branch `msi-self-update`). The plan below was
+> followed; the two notable deltas from the original sketch are recorded here:
+>
+> 1. **Repo discovery for an MSI install defaults to the upstream `core-aix/agitrack`**,
+>    not `git config remote.origin.url`. A frozen MSI install carries no aGiTrack source
+>    checkout — the cwd is the *user's* project repo, whose remote is irrelevant — so
+>    reading a local git remote would query the wrong repo. `AGITRACK_GH_REPO` still
+>    overrides, and a real source checkout still uses its own remote.
+> 2. **The re-launch is split into an elevated installer + a non-elevated relauncher**
+>    so the updated agent does NOT inherit the installer's admin token. The elevated
+>    bootstrapper only runs `msiexec` and writes a result marker; a detached
+>    medium-integrity PowerShell relauncher polls the marker and starts the new build.
 
 ## Problem
 

@@ -17,6 +17,17 @@ def test_detach_kwargs_posix_uses_new_session():
     assert proc.detach_kwargs() == {"start_new_session": True}
 
 
+def test_shell_execute_runas_off_windows_raises(monkeypatch):
+    # Off Windows the elevation helper is unavailable — must fail loudly, not silently no-op,
+    # so callers don't think an elevated install was launched when it wasn't.
+    monkeypatch.setattr(proc, "_IS_WINDOWS", False)
+    try:
+        proc.shell_execute_runas("cmd.exe", "/c echo hi")
+    except NotImplementedError:
+        return
+    raise AssertionError("expected NotImplementedError off Windows")
+
+
 def test_detach_kwargs_windows_uses_creationflags(monkeypatch):
     monkeypatch.setattr(proc, "_IS_WINDOWS", True)
     kwargs = proc.detach_kwargs()
