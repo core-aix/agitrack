@@ -7898,6 +7898,65 @@ class ProxyRunner:
         self.input.extra_commands = ["merge"] if self._has_unmerged_work() else []
         self._render()
 
+    def _manage_unstaged_menu(self) -> None:
+        """Interactive editor for the base repo's intentionally-unstaged ("declined") set — the
+        untracked files/folders aGiTrack will NOT offer to commit. Reuses the ``git-unstaged``
+        command (was a read-only list). The user can REMOVE entries (re-stage them, so they're
+        offered/committed again) or ADD untracked paths to keep unstaged. The set is persisted in
+        the base repo's state file, so it can equally be edited there on disk; this menu reads it
+        fresh each round so on-disk edits are reflected too."""
+        repo = self.base_repo
+        while True:
+            state = self._user_state()  # fresh read each round → reflects on-disk edits + our saves
+            self._prune_declined_untracked(repo, state)  # drop entries no longer untracked on disk
+            declined = sorted(state.declined_untracked())
+            addable = [path for path in repo.untracked_entries() if path not in set(declined)]
+            options: list[str] = []
+            if addable:
+                options.append("Add untracked path(s) to keep unstaged…")
+            if declined:
+                options.append("Re-stage a path (remove from the list)…")
+                options.append("Re-stage ALL (clear the list)")
+            options.append("← Done")
+            if declined:
+                title = (
+                    f"Intentionally unstaged — aGiTrack will NOT commit these ({len(declined)}).\n"
+                    f"Edit the list here, or directly on disk in {state.path}.\n\nUnstaged:"
+                )
+            else:
+                title = f"Nothing is intentionally unstaged.\n(The list is stored in {state.path}.)"
+            choice = self._select_popup(title, options, detail=declined or None)
+            if choice is None or choice.startswith("←"):
+                break
+            if choice.startswith("Add"):
+                pick = self._select_popup(
+                    "Keep which untracked path unstaged? (aGiTrack won't commit it)",
+                    [*addable, "← Back"],
+                    detail=addable,
+                )
+                if pick and not pick.startswith("←"):
+                    state.add_declined([pick])
+                    self._set_message(f"Keeping '{pick}' unstaged.")
+            elif choice.startswith("Re-stage ALL"):
+                confirm = self._select_popup(
+                    f"Re-stage all {len(declined)} path(s)? They'll be offered for commit again.",
+                    ["Yes, re-stage all", "← Back"],
+                )
+                if confirm == "Yes, re-stage all":
+                    state.keep_declined([])  # keep none → clears the list
+                    self._set_message("Cleared the intentionally-unstaged list.")
+            elif choice.startswith("Re-stage"):
+                pick = self._select_popup(
+                    "Re-stage which path? (stop keeping it unstaged)",
+                    [*declined, "← Back"],
+                    detail=declined,
+                )
+                if pick and not pick.startswith("←"):
+                    state.remove_declined([pick])
+                    self._set_message(f"Re-staged '{pick}' — it'll be offered for commit again.")
+        self._reload_user_declined()
+        self._render()
+
     def _run_command(self, command: str) -> None:
         # aGiTrack commands in proxy mode are triggered via Ctrl-G and are plain
         # names; ":" is not a command trigger here (it is forwarded to the
@@ -7923,13 +7982,8 @@ class ProxyRunner:
             return
 
         if name == "git-unstaged":
-            self._prune_declined_untracked(self.base_repo, self._user_state())
-            self._reload_user_declined()
-            declined = self._user_declined
-            if declined:
-                self._set_message("Intentionally unstaged files:\n" + "\n".join(f"  {path}" for path in declined))
-            else:
-                self._set_message("No intentionally unstaged files.")
+            self._manage_unstaged_menu()
+            return
         elif name == "agent-backend":
             backends = available_backends()
             selected = arg.strip() or self._select_popup("Backend Agent", backends)
