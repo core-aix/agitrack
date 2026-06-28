@@ -189,7 +189,7 @@ def shell_execute_runas(file: str, params: str = "") -> None:
     SEE_MASK_NOASYNC = 0x00000100  # complete the operation before returning
     SW_SHOWNORMAL = 1
 
-    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)  # type: ignore[attr-defined]  # Windows-only
     shell32.ShellExecuteExW.argtypes = [ctypes.POINTER(_SHELLEXECUTEINFOW)]
     shell32.ShellExecuteExW.restype = wintypes.BOOL
 
@@ -201,7 +201,7 @@ def shell_execute_runas(file: str, params: str = "") -> None:
     info.lpParameters = params
     info.nShow = SW_SHOWNORMAL
     if not shell32.ShellExecuteExW(ctypes.byref(info)):
-        err = ctypes.get_last_error()
+        err = ctypes.get_last_error()  # type: ignore[attr-defined]  # Windows-only
         raise OSError(f"ShellExecuteExW(runas) failed for {file!r} (Windows error {err})")
 
 
