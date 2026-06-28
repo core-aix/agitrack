@@ -22,6 +22,7 @@ def _make_actions(*, verbose=False, interactive=True, ui=None, has_staged=False,
     repo.has_staged_changes.return_value = has_staged
     repo.has_changes.return_value = has_changes
     repo.untracked_files.return_value = []
+    repo.untracked_entries.return_value = []
     state = MagicMock()
     state.declined_untracked.return_value = []
     state.session_id = "sess-123"
@@ -105,6 +106,7 @@ def test_create_user_commit_ui_cancel_returns_false():
 def _make_actions_with_untracked(*files, interactive=True):
     repo = MagicMock()
     repo.untracked_files.return_value = list(files)
+    repo.untracked_entries.return_value = list(files)  # review/decline flow uses entries
     state = MagicMock()
     state.declined_untracked.return_value = []
     return AgitrackActions(repo, state, interactive=interactive), repo, state
