@@ -4,10 +4,20 @@ from typing import List
 
 import re
 import shutil
+import subprocess
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 from agitrack.git.repo import GitRepo
+from agitrack.proc import console_isolation_kwargs
+
+
+@lru_cache(maxsize=1)
+def _rsync_path() -> str | None:
+    """Path to ``rsync`` if installed, else None. Memoized — looked up once per process."""
+    return shutil.which("rsync")
+
 
 # All aGiTrack-managed branches live under this prefix so they can be recognised
 # (for cleanup / stale recovery) and never collide with the user's branches. The
@@ -65,14 +75,11 @@ class WorktreeManager:
         # `worktree add` fail with "already registered". Pruning clears only
         # entries whose directories are gone, so live worktrees are untouched.
         self.main_repo.worktree_prune()
-        # Detached at base: no branch exists until the session actually commits.
+        # Detached at base: no branch exists until the session actually commits. The base
+        # environment (untracked + git-ignored files) is NOT copied here — git only checks out
+        # tracked files, and whether to also copy the full environment is the caller's choice
+        # (it can be slow), made via copy_base_environment after the user opts in.
         self.main_repo.worktree_add_detached(str(path), base=base)
-        # Give the new worktree the SAME full environment the base repo has: git only
-        # checks out tracked files, so untracked + git-ignored content (.env, node_modules,
-        # virtualenvs, build output, local data) would be missing and the agent would run
-        # in a stripped-down tree. Copy it across so the worktree is a faithful clone of the
-        # working environment, not just of the committed files.
-        self.copy_base_environment(path)
         return WorktreeInfo(name=_sanitize_name(name), path=path, branch="")
 
     # Never copied between base and worktree: ``.git`` is each worktree's own link file,
@@ -92,12 +99,13 @@ class WorktreeManager:
             return []
         return [rel for rel in entries if rel.split("/", 1)[0] not in self._ENV_SKIP_TOP]
 
-    def copy_base_environment(self, dest: Path) -> int:
+    def copy_base_environment(self, dest: Path) -> list[str]:
         """Copy the base repo's environment (untracked + git-ignored content) into ``dest``,
         skipping anything already present there (so a freshly created worktree gets the full
-        environment, and reused worktrees keep their own edits). Best-effort and per-entry
-        guarded: one unreadable path never aborts the rest, nor blocks creating the worktree.
-        Returns the number of top-level entries copied."""
+        environment, and reused worktrees keep their own edits). Uses rsync's mtime+size delta
+        when available so unchanged files are never re-transferred. Best-effort and per-entry
+        guarded: one unreadable path never aborts the rest. Returns the repo-relative paths of
+        the entries actually copied (so the caller can mark them as base-origin)."""
         return self._copy_entries(dest, self._base_env_entries(), overwrite=False)
 
     def base_newer_entries(self, dest: Path) -> list[str]:
@@ -114,35 +122,71 @@ class WorktreeManager:
             if rel.endswith("/") or not dst.exists() or not src.exists():
                 continue  # a dir unit, a missing dest (handled by copy), or a vanished src
             try:
-                if src.stat().st_mtime_ns > dst.stat().st_mtime_ns:
+                # Compare at whole-second resolution: rsync (and some filesystems) only preserve
+                # mtime to the second, so a freshly copied file would otherwise look "newer" by a
+                # fraction and trigger spurious overwrite prompts. A change within the same second
+                # as the copy is treated as in-sync — close enough for an env file.
+                if int(src.stat().st_mtime) > int(dst.stat().st_mtime):
                     newer.append(rel)
             except OSError:
                 continue
         return newer
 
-    def _copy_entries(self, dest: Path, rels: list[str], *, overwrite: bool) -> int:
+    def _copy_entries(self, dest: Path, rels: list[str], *, overwrite: bool) -> list[str]:
         base = self.main_repo.repo
-        copied = 0
+        rsync = _rsync_path()
+        copied: list[str] = []
         for rel in rels:
             src, target = base / rel, dest / rel
             try:
-                if not overwrite and target.exists():
+                if not src.exists():
                     continue
-                if src.is_dir():
-                    shutil.copytree(src, target, dirs_exist_ok=True, symlinks=True)
-                elif src.exists():
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(src, target, follow_symlinks=False)
-                else:
-                    continue
-                copied += 1
+                if not overwrite and not src.is_dir() and target.exists():
+                    continue  # a plain file already present; leave the worktree's copy alone
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if rsync is not None and self._rsync_copy(rsync, src, target, overwrite=overwrite):
+                    copied.append(rel)
+                elif self._shutil_copy(src, target, overwrite=overwrite):
+                    copied.append(rel)
             except Exception:
                 continue  # skip an odd/unreadable path; copy the rest
         return copied
 
-    def copy_entries(self, dest: Path, rels: list[str]) -> int:
-        """Copy specific environment ``rels`` from the base repo into ``dest``, overwriting
-        what is there (used to refresh a reused worktree with newer base files)."""
+    @staticmethod
+    def _rsync_copy(rsync: str, src: Path, target: Path, *, overwrite: bool) -> bool:
+        """Delta-copy ``src`` → ``target`` with rsync (archive mode: only changed files move,
+        compared by mtime+size). ``--ignore-existing`` makes a non-overwriting copy skip files
+        already in the worktree. Returns True on success, False on failure (caller falls back)."""
+        args = [rsync, "-a"]
+        if not overwrite:
+            args.append("--ignore-existing")
+        # A trailing slash on a directory source copies its CONTENTS into target (not target/dir).
+        if src.is_dir():
+            args += [f"{src}/", f"{target}/"]
+        else:
+            args += [str(src), str(target)]
+        try:
+            result = subprocess.run(
+                args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **console_isolation_kwargs()
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    @staticmethod
+    def _shutil_copy(src: Path, target: Path, *, overwrite: bool) -> bool:
+        if src.is_dir():
+            shutil.copytree(src, target, dirs_exist_ok=True, symlinks=True)
+        elif not overwrite and target.exists():
+            return False
+        else:
+            shutil.copy2(src, target, follow_symlinks=False)
+        return True
+
+    def copy_entries(self, dest: Path, rels: list[str]) -> list[str]:
+        """Copy specific environment ``rels`` from the base repo into ``dest``, overwriting what
+        is there (used to refresh a reused worktree with newer base files). Returns the copied
+        repo-relative paths."""
         return self._copy_entries(dest, rels, overwrite=True)
 
     def move(self, old_name: str, new_name: str) -> WorktreeInfo:
