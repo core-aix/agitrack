@@ -552,6 +552,18 @@ User-wide settings live in `~/.agitrack/config.json` (override the directory wit
 | `base_drift_check_seconds` | `2.0` | How often aGiTrack checks whether the base repo was switched to another branch outside aGiTrack. |
 | `summary_wait_seconds` | `45.0` | How long integration waits for a background commit summary before proceeding without it. |
 
+### `config.json` vs `state.json`
+
+aGiTrack keeps two kinds of JSON under `.agitrack/`, and they serve different purposes:
+
+- **`config.json` — your settings.** The options documented above, in the repository-local `.agitrack/config.json` and the global `~/.agitrack/config.json` (repository-local wins). These are yours to set; edit them by hand or through `Ctrl-G → settings`. aGiTrack only writes here when you change a setting.
+
+- **`state.json` — aGiTrack's working state for a directory.** This is *not* settings — it's the bookkeeping aGiTrack maintains so it can pick up where it left off: which backend conversation to resume (and its model), the aGiTrack session id, recent commit-trace context, and the list of **intentionally-unstaged** files/folders (`declined_untracked_files`) — the untracked paths you chose not to commit, which aGiTrack then won't keep re-offering. aGiTrack writes this file automatically as you work, so in general you don't edit it. The base repository's copy is `.agitrack/state.json`; each session worktree has its own under `.agitrack/worktrees/<name>/.agitrack/state.json`.
+
+  The one part you may want to manage is that intentionally-unstaged list. Edit it from the menu with `Ctrl-G → git-unstaged` — it shows the current paths and lets you **re-stage** an entry (so it's offered for commit again), re-stage all, or **add** an untracked file/folder to keep unstaged. The same list lives under `declined_untracked_files` in `.agitrack/state.json`, so you can also edit it there directly (do so while aGiTrack isn't running for that repo, since aGiTrack rewrites the file as it works).
+
+Everything under `.agitrack/` (both files, plus the worktrees) is git-ignored, so none of it is ever committed to your repository.
+
 
 ## Contributing
 

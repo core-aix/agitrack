@@ -1862,3 +1862,61 @@ def os_utime_now(path):
 
     now = time.time() + 5  # safely after the watermark
     os.utime(path, (now, now))
+
+
+# --- git-unstaged: interactive editing of the intentionally-unstaged list ---
+
+
+def _unstaged_runner(tmp_path, main):
+    runner = make_runner(base_repo=main, state=AgitrackState(tmp_path))
+    runner.global_config = type("G", (), {"default_backend": "claude"})()
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda *a, **k: None
+    runner._reload_user_declined = lambda: None
+    return runner
+
+
+def test_manage_unstaged_menu_add_then_restage(tmp_path):
+    main = _init_repo(tmp_path)
+    (tmp_path / "keep.txt").write_text("x\n")
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "a.txt").write_text("a\n")
+    runner = _unstaged_runner(tmp_path, main)
+
+    # Round 1: add keep.txt to the intentionally-unstaged list, then Done.
+    answers = iter(["Add untracked path(s) to keep unstaged…", "keep.txt", "← Done"])
+    runner._select_popup = lambda title, options, **k: next(answers)
+    runner._manage_unstaged_menu()
+    assert AgitrackState(tmp_path).declined_untracked() == ["keep.txt"]
+
+    # Round 2: re-stage (remove) it from the list, then Done.
+    answers = iter(["Re-stage a path (remove from the list)…", "keep.txt", "← Done"])
+    runner._select_popup = lambda title, options, **k: next(answers)
+    runner._manage_unstaged_menu()
+    assert AgitrackState(tmp_path).declined_untracked() == []
+
+
+def test_manage_unstaged_menu_can_unstage_a_directory(tmp_path):
+    main = _init_repo(tmp_path)
+    (tmp_path / "build").mkdir()
+    (tmp_path / "build" / "out.bin").write_text("x\n")  # wholly-untracked dir -> collapsed "build/"
+    runner = _unstaged_runner(tmp_path, main)
+
+    answers = iter(["Add untracked path(s) to keep unstaged…", "build/", "← Done"])
+    runner._select_popup = lambda title, options, **k: next(answers)
+    runner._manage_unstaged_menu()
+    assert "build/" in AgitrackState(tmp_path).declined_untracked()
+
+
+def test_manage_unstaged_menu_restage_all_clears_list(tmp_path):
+    main = _init_repo(tmp_path)
+    (tmp_path / "a.txt").write_text("a\n")
+    (tmp_path / "b.txt").write_text("b\n")
+    seed = AgitrackState(tmp_path)
+    seed.add_declined(["a.txt", "b.txt"])
+    runner = _unstaged_runner(tmp_path, main)
+
+    answers = iter(["Re-stage ALL (clear the list)", "Yes, re-stage all", "← Done"])
+    runner._select_popup = lambda title, options, **k: next(answers)
+    runner._manage_unstaged_menu()
+    assert AgitrackState(tmp_path).declined_untracked() == []
