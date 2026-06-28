@@ -281,10 +281,64 @@ def test_uncovered_backend_commits_empty_off_turn_branch(tmp_path):
     assert runner._uncovered_backend_commits() == []
 
 
-def test_uncovered_backend_commits_empty_without_worktree(tmp_path):
+def test_uncovered_backend_commits_empty_in_worktree_mode_without_a_worktree(tmp_path):
+    # Defensive: worktree MODE (use_worktrees True) but the worktree object is missing —
+    # nothing to scan. (The real --no-worktree path is keyed off _use_worktrees, below.)
     runner, repo = _detection_runner(tmp_path)
     _backend_commit(repo, "a.txt", "backend's own commit")
-    runner.worktree = None  # --no-worktree mode: never touch the user's branch
+    runner.worktree = None
+
+    assert runner._uncovered_backend_commits() == []
+
+
+def _no_worktree_runner(tmp_path):
+    """A runner in real --no-worktree mode, anchored at the current HEAD."""
+    repo = GitRepo.init(tmp_path)
+    _backend_commit(repo, "seed.txt", "pre-existing user history before aGiTrack")
+    runner = make_runner(repo=repo, state=AgitrackState(tmp_path), _base_branch=repo.current_branch())
+    runner.worktree = None
+    runner._use_worktrees = False
+    runner._noworktree_base_head = repo.rev_parse("HEAD")  # anchor at session start
+    return runner, repo
+
+
+def test_uncovered_backend_commits_covers_agent_commits_in_no_worktree_mode(tmp_path):
+    # --no-worktree: the agent commits on the current branch directly; those commits
+    # (past the session-start anchor, no aGiTrack metadata) must be detected so the
+    # cover machinery can wrap them (#35).
+    runner, repo = _no_worktree_runner(tmp_path)
+    one = _backend_commit(repo, "a.txt", "agent commit one")
+    two = _backend_commit(repo, "b.txt", "agent commit two")
+
+    assert runner._uncovered_backend_commits() == [one, two]
+
+
+def test_uncovered_backend_commits_no_worktree_excludes_pre_existing_history(tmp_path):
+    # The anchor floors the scan: commits made before the session started are the user's
+    # history and must NEVER be covered.
+    runner, repo = _no_worktree_runner(tmp_path)
+    new = _backend_commit(repo, "new.txt", "agent commit after session start")
+
+    uncovered = runner._uncovered_backend_commits()
+    assert uncovered == [new]  # only the post-anchor commit; the seed is untouched
+
+
+def test_uncovered_backend_commits_no_worktree_metadata_commit_resets(tmp_path):
+    # An aGiTrack metadata (cover) commit accounts for everything before it, so only
+    # commits newer than it stay uncovered.
+    runner, repo = _no_worktree_runner(tmp_path)
+    _backend_commit(repo, "a.txt", "agent commit")
+    _backend_commit(repo, "meta.txt", AGITRACK_BODY)  # aGiTrack metadata commit resets
+    after = _backend_commit(repo, "c.txt", "agent commit after the cover")
+
+    assert runner._uncovered_backend_commits() == [after]
+
+
+def test_uncovered_backend_commits_no_worktree_without_anchor_is_empty(tmp_path):
+    # No anchor recorded → never walk back into unbounded history; report nothing.
+    runner, repo = _no_worktree_runner(tmp_path)
+    runner._noworktree_base_head = None
+    _backend_commit(repo, "a.txt", "agent commit")
 
     assert runner._uncovered_backend_commits() == []
 

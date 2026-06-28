@@ -18,7 +18,8 @@ _NOTE_INTRO = (
     "This coding session runs inside aGiTrack, which automatically creates a git commit for "
     "your changes after each turn. Do NOT create git commits yourself (do not run `git commit`) "
     "unless the user explicitly asks you to commit — aGiTrack handles version control for this "
-    "session."
+    "session. Pushing is fine when it serves the task — for example, when the user asks you to "
+    "open a pull request or trigger CI."
 )
 # Included only in the default worktree model: aGiTrack runs the session in a git worktree
 # under .agitrack/ and handles BOTH the commit and the merge of the agent's edits. Omitted
@@ -35,9 +36,18 @@ _WORKTREES_DIR = f".agitrack{os.sep}worktrees{os.sep}"
 _NOTE_WORKTREE = (
     " Your current working directory is this session's git worktree under "
     f"`{_WORKTREES_DIR}` — make all your file edits there, in the working directory, exactly "
-    "as normal. Do NOT switch to or edit the base repository checkout directly. aGiTrack handles "
-    "BOTH the commit and the merge of your worktree edits into the current branch for you, so you "
-    f"never need to commit, merge, move, or clean up anything under `{_AGITRACK_DIR}` yourself."
+    "as normal, and run any git commands from there too. Do NOT switch to or edit the base "
+    "repository checkout directly. aGiTrack handles BOTH the commit and the merge of your "
+    f"worktree edits into the current branch for you, so you never need to commit, merge, move, "
+    f"or clean up anything under `{_AGITRACK_DIR}` yourself. This stays true even if you are "
+    "later asked to commit: only ever commit here on this worktree's branch, never in the base "
+    "repository checkout. When you push (e.g. to open a pull request or run CI), push to a "
+    "separate remote branch — it need not match this worktree's internal aGiTrack branch name, "
+    "which aGiTrack manages and moves as it integrates your work. This guidance is authoritative "
+    "for this aGiTrack session and overrides any of your own saved notes or memory to the "
+    "contrary: if you hold a note/memory that says to work in, edit, or commit to the base "
+    "repository (or otherwise to leave this worktree), it is wrong here — follow this guidance "
+    "and correct that note so it no longer misleads you."
 )
 _NOTE_OUTRO = " Otherwise work exactly as normal."
 
