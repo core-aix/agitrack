@@ -1920,3 +1920,60 @@ def test_manage_unstaged_menu_restage_all_clears_list(tmp_path):
     runner._select_popup = lambda title, options, **k: next(answers)
     runner._manage_unstaged_menu()
     assert AgitrackState(tmp_path).declined_untracked() == []
+
+
+# --- summarizer amends in --no-worktree mode; session name consistency ---
+
+
+def test_amend_summary_into_head_amends_directly_in_no_worktree_mode(tmp_path):
+    # In --no-worktree mode the commit is made on the working branch (HEAD == base), so the
+    # "ahead of base" containment check must be skipped — otherwise the summary never amends into
+    # the commit message and only lands as git notes ("commit made without summary").
+    repo = GitRepo.init(tmp_path)
+    (tmp_path / "f.txt").write_text("x\n")
+    repo.stage_paths(["f.txt"])
+    repo.commit("Prompt: do a thing")
+    head = repo.rev_parse("HEAD")
+
+    runner = make_runner(repo=repo, base_repo=repo, _base_branch=repo.current_branch(), worktree=None)
+    runner._last_agent_commit_id = None
+
+    target = runner._amend_summary_into_head(repo, head, "Added f.txt holding x", None)
+
+    assert target is not None  # amended (not skipped, not notes-only)
+    assert "Added f.txt holding x" in repo.commit_message("HEAD")
+
+
+def test_amend_summary_into_head_skips_when_not_head(tmp_path):
+    repo = GitRepo.init(tmp_path)
+    (tmp_path / "a.txt").write_text("1\n")
+    repo.stage_paths(["a.txt"])
+    repo.commit("first")
+    first = repo.rev_parse("HEAD")
+    (tmp_path / "b.txt").write_text("2\n")
+    repo.stage_paths(["b.txt"])
+    repo.commit("second")
+
+    runner = make_runner(repo=repo, base_repo=repo, _base_branch=repo.current_branch(), worktree=None)
+    runner._last_agent_commit_id = None
+    # `first` is no longer HEAD → can't amend safely → None (summary becomes notes-only).
+    assert runner._amend_summary_into_head(repo, first, "summary", None) is None
+
+
+def test_resolve_session_name_uses_worktree_key(tmp_path):
+    import types
+
+    from agitrack.transcripts.types import SessionRef
+
+    main = _init_repo(tmp_path)
+    runner = make_runner(base_repo=main)
+    runner.worktree_manager = WorktreeManager(main)
+    runner.global_config = type("G", (), {"default_backend": "claude"})()
+    runner.backend = types.SimpleNamespace(
+        list_worktree_sessions=lambda root: [("candle", SessionRef(id="sid-1", updated=1.0, label="hi"))]
+    )
+    runner._debug = lambda *a, **k: None
+
+    # A --no-worktree resume of a worktree session keeps that session's name (the worktree dir).
+    assert runner._resolve_session_name("sid-1") == "candle"
+    assert runner._resolve_session_name("unknown") is None
