@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import filecmp
 import hashlib
 import os
 from agitrack.env import getenv_compat
@@ -809,6 +810,10 @@ class ProxyRunner:
         # prompts: (worktree path, name), queued at creation and presented by the loop so startup
         # stays fast and the prompt has a UI. See _present_pending_env_copy.
         self._pending_env_copy: list[tuple[Path, str]] = []
+        # Leftover worktree directory names found at a --no-worktree startup, queued for a
+        # "delete them?" prompt (their presence can confuse a resumed agent into editing them
+        # instead of the base repo). Presented by the loop. See _present_pending_noworktree_cleanup.
+        self._pending_noworktree_cleanup: list[str] = []
         # Per-worktree record of files copied INTO the worktree FROM the base (path → {rel:
         # fingerprint}), so the copy-back-to-base offer can skip files that merely came from the
         # base and weren't changed — otherwise they'd loop base → worktree → base. See
@@ -1117,6 +1122,7 @@ class ProxyRunner:
                 "_pending_copy_offer": None,
                 "_pending_env_refresh": [],
                 "_pending_env_copy": [],
+                "_pending_noworktree_cleanup": [],
                 "_env_from_base": {},
                 "_env_copy_watermark": {},
                 "_exit_delete_worktrees": None,
@@ -2853,13 +2859,30 @@ class ProxyRunner:
                     chosen = newest[0]
                 if chosen:
                     self.state.backend_session_id = chosen  # setter re-points backend_session_repo at base
-                    self._debug(f"--no-worktree: resuming session {chosen} in the base repo")
+                    # Keep the session's NAME (the worktree it came from, e.g. "candle") rather than
+                    # leaving the default "main" — so the status bar and the resume list stay
+                    # consistent across worktree ⇄ no-worktree switches. Persist it under this id so
+                    # switching back to worktree mode resolves the same name.
+                    name = self._resolve_session_name(chosen)
+                    if name and not self._AUTO_NAME_RE.match(name):
+                        self.name = name
+                        self._persist_session_name(chosen)
+                    self._debug(f"--no-worktree: resuming session {chosen} as '{self.name}' in the base repo")
             self._set_message(
                 "Running without a worktree: the agent edits this branch directly (visible live), "
                 "but there's no isolation or auto-integration. Extra sessions started this way share "
                 "this directory and edit the same files at once.",
                 seconds=12.0,
             )
+            # Leftover worktree directories aren't used in --no-worktree mode, and their presence
+            # can confuse a resumed agent into editing them instead of the base repo. Queue a
+            # "delete them?" prompt for the loop to surface (we're pre-TUI here). Default is keep.
+            try:
+                root = self._worktrees().root
+                self._pending_noworktree_cleanup = sorted(p.name for p in root.iterdir() if p.is_dir())
+            except Exception as error:
+                self._debug(f"no-worktree leftover scan failed: {error!r}")
+                self._pending_noworktree_cleanup = []
             # Anchor the no-worktree cover scan at the branch's current HEAD so commits the agent
             # makes itself from here get aGiTrack metadata (#35), while pre-existing history is
             # never touched. Set once (the earliest start); the metadata-reset handles the rest.
@@ -2909,6 +2932,36 @@ class ProxyRunner:
             self.state.backend_session_id = resume_id  # setter records this worktree as its repo
         self.backend = make_proxy_agent(backend_name)
         self.actions = AgitrackActions(self.repo, self.state, verbose=self.verbose)
+
+    def _resolve_session_name(self, session_id: str | None) -> str | None:
+        """A friendly name for a backend conversation id, tried in order: (1) the persisted
+        session-name record, (2) the worktree DIRECTORY whose state recorded this id (its dir
+        name), (3) the worktree the backend's conversation listing keys it under. Lets a
+        ``--no-worktree`` resume of a worktree session keep that session's name (e.g. "candle")
+        instead of falling back to the default "main", and keeps the name consistent across
+        worktree ⇄ no-worktree switches even after the leftover worktree dir is deleted."""
+        if not session_id:
+            return None
+        try:
+            persisted = self._user_state().session_name_for(session_id)
+            if persisted and not self._AUTO_NAME_RE.match(persisted):
+                return persisted
+        except Exception as error:
+            self._debug(f"resolve-session-name persisted lookup failed: {error!r}")
+        try:
+            for info in self._worktrees().list():
+                state = AgitrackState(info.path, default_backend=self.global_config.default_backend)
+                if state.backend_session_id == session_id:
+                    return info.name
+        except Exception as error:
+            self._debug(f"resolve-session-name worktree-state scan failed: {error!r}")
+        try:
+            for key, ref in self.backend.list_worktree_sessions(self._worktrees().root):
+                if ref.id == session_id and key:
+                    return key
+        except Exception as error:
+            self._debug(f"resolve-session-name conversation scan failed: {error!r}")
+        return None
 
     def _newest_worktree_session(self) -> tuple[str, float] | None:
         """``(id, last-updated)`` of the most recently active worktree conversation that HAS
@@ -6264,21 +6317,21 @@ class ProxyRunner:
         return info, GitRepo(info.path)
 
     def _refresh_worktree_from_base(self, worktrees: WorktreeManager, path) -> None:
-        """Re-sync a reused full-environment worktree with the base: copy in any base files it is
-        missing (silently — additions are safe) and queue an overwrite prompt for base files now
-        newer than the worktree's copy. A tracked-only worktree (the user opted out of the
-        environment) is left untouched. Best-effort: a sync failure must never block opening it."""
+        """Re-sync a reused full-environment worktree with the base, ASKING before changing it:
+        if the base has environment files this worktree lacks (new since) or newer versions of
+        ones it has, queue a single "update this worktree from the base?" prompt for the loop.
+        Nothing is copied silently — the user decides — so a worktree preserved across runs can
+        be brought up to date (e.g. after the base's .gitignore/deps changed) on demand. A
+        tracked-only worktree (the user opted out of the environment) is left untouched."""
         try:
             if not AgitrackState(path, default_backend=self.global_config.default_backend).copy_full_env:
                 return  # tracked-only worktree — nothing to keep in sync
-            copied = worktrees.copy_base_environment(path)  # additions only (skips existing)
-            self._mark_env_from_base(path, copied)
-            newer = worktrees.base_newer_entries(path)
+            pending = sorted(set(worktrees.base_missing_entries(path)) | set(worktrees.base_newer_entries(path)))
         except Exception as error:
             self._debug(f"worktree env refresh failed for {path}: {error!r}")
             return
-        if newer:
-            self._pending_env_refresh.append((path, newer))
+        if pending:
+            self._pending_env_refresh.append((path, pending))
 
     def _present_pending_env_copy(self) -> None:
         """Main thread: surface the deferred "copy the full environment into the new worktree, or
@@ -6333,16 +6386,22 @@ class ProxyRunner:
                 registry[rel] = fingerprint
 
     def _present_pending_env_refresh(self) -> None:
-        """Main thread: surface any deferred "base has newer files — overwrite the worktree's
-        older copies?" prompts queued while a worktree was reopened (possibly before the UI was
-        up). One prompt per worktree; declining keeps the worktree's versions."""
+        """Main thread: surface any deferred "the base repo has new/changed files — update this
+        worktree?" prompts queued while a worktree was reopened (possibly before the UI was up).
+        Covers both files the worktree lacks and ones the base now has a newer version of. One
+        prompt per worktree. Pulling the base's latest into the worktree is the safe, expected
+        default (it's only the agent's sandbox), so "Yes" is the default option; declining keeps
+        the worktree as-is."""
         while self._pending_env_refresh:
             dest, rels = self._pending_env_refresh.pop(0)
             try:
                 choice = self._select_popup(
-                    f"The base repo has {len(rels)} file(s) newer than this session's worktree "
-                    f"({dest}). Overwrite the worktree's older copies with the base versions?\n\nFile(s):",
-                    ["No, keep the worktree versions", "Yes, update from the base repo"],
+                    f"The base repo has {len(rels)} untracked / git-ignored file(s) (e.g. .env, "
+                    f"dependencies, build output) that git won't sync into this session's worktree "
+                    f"({dest}). Copy them from the base now?\n"
+                    f"(Committed changes are merged into the worktree automatically — this is only "
+                    f"for files git doesn't track.)\n\nFile(s):",
+                    ["Yes, update from the base repo", "No, keep the worktree as-is"],
                     detail=rels,
                 )
             except Exception as error:
@@ -6353,6 +6412,41 @@ class ProxyRunner:
                 self._mark_env_from_base(dest, copied)
                 self._set_message(f"Updated {len(copied)} file(s) in the worktree from the base repo.", seconds=6.0)
                 self._render()
+
+    def _present_pending_noworktree_cleanup(self) -> None:
+        """Main thread: at a --no-worktree start, offer to DELETE leftover session worktree
+        directories. They aren't used without worktrees, and their presence can confuse a resumed
+        agent into editing them instead of the base repo, so deleting them is the safe option.
+        Default is keep; deleting also removes any uncommitted work in those directories."""
+        names = self._pending_noworktree_cleanup
+        if not names:
+            return
+        self._pending_noworktree_cleanup = []
+        try:
+            choice = self._select_popup(
+                f"{len(names)} session worktree director(ies) still exist under .agitrack/worktrees/. "
+                f"In --no-worktree mode they're unused, and a resumed agent can get confused into editing "
+                f"them instead of the base repo. Delete them now?\n"
+                f"(Permanently removes those directories AND any uncommitted work in them. The "
+                f"conversations themselves are kept and stay resumable.)\n\nWorktree(s):",
+                ["Keep them", "Delete them"],
+                detail=names,
+            )
+        except Exception as error:
+            self._debug(f"no-worktree cleanup prompt failed: {error!r}")
+            return
+        if choice != "Delete them":
+            return
+        worktrees = self._worktrees()
+        removed = 0
+        for name in names:
+            try:
+                worktrees.remove(name)  # git worktree remove + prune, or force-rmtree a stray dir
+                removed += 1
+            except Exception as error:
+                self._debug(f"no-worktree cleanup: removing '{name}' failed: {error!r}")
+        self._set_message(f"Deleted {removed} leftover worktree director(ies).", seconds=6.0)
+        self._render()
 
     def _is_valid_worktree(self, path) -> bool:
         # A real linked worktree has a `.git` file pointing at its gitdir and a
@@ -7209,6 +7303,7 @@ class ProxyRunner:
         self._present_pending_copy_offer()  # the turn's "copy stranded files?" popup, if any
         self._present_pending_env_copy()  # "copy the full environment into the new worktree?" popup
         self._present_pending_env_refresh()  # "base has newer files — update the worktree?" popup
+        self._present_pending_noworktree_cleanup()  # "--no-worktree: delete leftover worktree dirs?" popup
         self._resume_pending_prompt_if_ready()
         self._service_shared_resume()  # complete a shared-session resume once fetched
         # Background / multi-session git (these swap self.active via _with_session, so
@@ -7898,6 +7993,65 @@ class ProxyRunner:
         self.input.extra_commands = ["merge"] if self._has_unmerged_work() else []
         self._render()
 
+    def _manage_unstaged_menu(self) -> None:
+        """Interactive editor for the base repo's intentionally-unstaged ("declined") set — the
+        untracked files/folders aGiTrack will NOT offer to commit. Reuses the ``git-unstaged``
+        command (was a read-only list). The user can REMOVE entries (re-stage them, so they're
+        offered/committed again) or ADD untracked paths to keep unstaged. The set is persisted in
+        the base repo's state file, so it can equally be edited there on disk; this menu reads it
+        fresh each round so on-disk edits are reflected too."""
+        repo = self.base_repo
+        while True:
+            state = self._user_state()  # fresh read each round → reflects on-disk edits + our saves
+            self._prune_declined_untracked(repo, state)  # drop entries no longer untracked on disk
+            declined = sorted(state.declined_untracked())
+            addable = [path for path in repo.untracked_entries() if path not in set(declined)]
+            options: list[str] = []
+            if addable:
+                options.append("Add untracked path(s) to keep unstaged…")
+            if declined:
+                options.append("Re-stage a path (remove from the list)…")
+                options.append("Re-stage ALL (clear the list)")
+            options.append("← Done")
+            if declined:
+                title = (
+                    f"Intentionally unstaged — aGiTrack will NOT commit these ({len(declined)}).\n"
+                    f"Edit the list here, or directly on disk in {state.path}.\n\nUnstaged:"
+                )
+            else:
+                title = f"Nothing is intentionally unstaged.\n(The list is stored in {state.path}.)"
+            choice = self._select_popup(title, options, detail=declined or None)
+            if choice is None or choice.startswith("←"):
+                break
+            if choice.startswith("Add"):
+                pick = self._select_popup(
+                    "Keep which untracked path unstaged? (aGiTrack won't commit it)",
+                    [*addable, "← Back"],
+                    detail=addable,
+                )
+                if pick and not pick.startswith("←"):
+                    state.add_declined([pick])
+                    self._set_message(f"Keeping '{pick}' unstaged.")
+            elif choice.startswith("Re-stage ALL"):
+                confirm = self._select_popup(
+                    f"Re-stage all {len(declined)} path(s)? They'll be offered for commit again.",
+                    ["Yes, re-stage all", "← Back"],
+                )
+                if confirm == "Yes, re-stage all":
+                    state.keep_declined([])  # keep none → clears the list
+                    self._set_message("Cleared the intentionally-unstaged list.")
+            elif choice.startswith("Re-stage"):
+                pick = self._select_popup(
+                    "Re-stage which path? (stop keeping it unstaged)",
+                    [*declined, "← Back"],
+                    detail=declined,
+                )
+                if pick and not pick.startswith("←"):
+                    state.remove_declined([pick])
+                    self._set_message(f"Re-staged '{pick}' — it'll be offered for commit again.")
+        self._reload_user_declined()
+        self._render()
+
     def _run_command(self, command: str) -> None:
         # aGiTrack commands in proxy mode are triggered via Ctrl-G and are plain
         # names; ":" is not a command trigger here (it is forwarded to the
@@ -7923,13 +8077,8 @@ class ProxyRunner:
             return
 
         if name == "git-unstaged":
-            self._prune_declined_untracked(self.base_repo, self._user_state())
-            self._reload_user_declined()
-            declined = self._user_declined
-            if declined:
-                self._set_message("Intentionally unstaged files:\n" + "\n".join(f"  {path}" for path in declined))
-            else:
-                self._set_message("No intentionally unstaged files.")
+            self._manage_unstaged_menu()
+            return
         elif name == "agent-backend":
             backends = available_backends()
             selected = arg.strip() or self._select_popup("Backend Agent", backends)
@@ -8628,13 +8777,18 @@ class ProxyRunner:
         self._review_untracked_popup(include_declined=include_declined, repo=repo, state=state)
         if not repo.has_staged_changes():
             return False
-        # Show exactly which files this commit will capture, so the user isn't typing a message
-        # blind. Scrollable in the popup when there are many (see PromptModal.detail).
+        # Show exactly which files this commit will capture AND where it lands (the base repo vs
+        # an isolated session worktree), so the user isn't typing a message blind or unsure which
+        # tree they're committing to. Scrollable in the popup when there are many files.
         try:
             changed = repo.staged_changes()
         except Exception:
             changed = []
-        detail = [f"Committing {len(changed)} file(s):", *changed] if changed else None
+        repo_path = getattr(repo, "repo", None)
+        base_path = getattr(self.base_repo, "repo", None)
+        is_base = base_path is not None and str(repo_path) == str(base_path)
+        where = "the BASE repo" if is_base else "this session's WORKTREE"
+        detail = [f"Committing {len(changed)} file(s) to {where} ({repo_path}):", *changed]
         message = ""
         # Esc cancels the prompt (_prompt_popup returns None) and we continue without
         # committing — note that in the prompt so the user knows it's a safe way out.
@@ -9019,8 +9173,16 @@ class ProxyRunner:
         try:
             if repo.rev_parse("HEAD") != sha:
                 return None
-            if self._base_branch is None or sha not in repo.log_shas(self._base_branch, "HEAD"):
-                return None
+            # Worktree mode: the commit sits on a turn branch ahead of base; once merged into
+            # base, amending would rewrite integrated history, so only amend while it's still
+            # unintegrated (sha in base..HEAD). No-worktree mode: the commit is made DIRECTLY on
+            # the working branch (HEAD == base), so base..HEAD is always empty — that check would
+            # wrongly skip every amend, leaving the summary as notes-only and the commit message
+            # without a summary. There it's enough that the commit is still HEAD with nothing
+            # staged, so skip the containment check.
+            if self.worktree is not None:
+                if self._base_branch is None or sha not in repo.log_shas(self._base_branch, "HEAD"):
+                    return None
             if repo.has_staged_changes():
                 return None
             message = repo.commit_message("HEAD")
@@ -10415,6 +10577,8 @@ class ProxyRunner:
                 continue  # muted by a prior decline; not re-asked even on exit (no new file)
             if self._copy_prompted.get(rel) == fingerprint:
                 continue  # already offered/copied at this exact content
+            if not self._differs_from_base(wt_dir / rel, base_dir / rel):
+                continue  # identical to the base copy (incl. after a prior copy) — nothing to do
             fresh.append((rel, fingerprint))
         if not fresh:
             return None
@@ -10508,6 +10672,7 @@ class ProxyRunner:
             else:  # "No, keep the base versions" or cancelled
                 overwrite_mode = "none"
         remained: list[str] = []
+        failed: list[tuple[str, str]] = []
         copied = 0
         # Announce the copy BEFORE it runs (a wholly-ignored directory like node_modules can
         # take a moment to copy), so the user sees that work is happening rather than the
@@ -10540,17 +10705,29 @@ class ProxyRunner:
                     shutil.copy2(src, dst)
                 copied += 1
             except OSError as error:
+                # Surface the actual error (and tell the user they can copy it by hand) rather
+                # than silently lumping it in with "left in the worktree" — a failed copy of a
+                # directory looked just like a declined one, which was confusing.
                 self._debug(f"copy {rel} to base failed: {error!r}")
-                remained.append(rel)
+                failed.append((rel, str(error)))
         if copied:
             # aGiTrack itself just wrote these into the base repo (the copy-back of stranded
             # worktree files) — that is NOT the agent editing outside its worktree, so fold them
             # into the un-sandboxed base-edit monitor's baseline. Otherwise _warn_if_base_edited
             # would flag aGiTrack's own copy as "Agent edited the base repo".
             self._rebaseline_base_edits()
+        if failed:
+            shown = "; ".join(f"{rel} ({err})" for rel, err in failed[:3])
+            more = f" (+{len(failed) - 3} more)" if len(failed) > 3 else ""
+            self._set_message(
+                f"Could not copy {len(failed)} item(s) into the base repo — copy them manually "
+                f"from {wt_dir}. Error: {shown}{more}",
+                seconds=15.0,
+            )
+            self._render()
         if remained:
             self._notice_files_remain(wt_dir, remained)
-        elif copied:
+        elif copied and not failed:
             self._set_message(f"Copied {copied} file(s) into the base repo directory.")
             self._render()
 
@@ -10609,6 +10786,44 @@ class ProxyRunner:
             return path.stat().st_mtime
         except OSError:
             return 0.0
+
+    def _differs_from_base(self, wt_path: Path, base_path: Path) -> bool:
+        """Whether a worktree entry (file OR directory) actually differs from the base repo's
+        copy — so the copy-back offer only prompts when there's a real difference, and never again
+        once a copy has made them identical. A missing base counterpart, or a file⇄dir type change,
+        counts as a difference. Directories are compared recursively. Best-effort: on any
+        comparison error, treat as differing so a genuine change is never silently dropped."""
+        try:
+            if not base_path.exists():
+                return True
+            if wt_path.is_dir() != base_path.is_dir():
+                return True
+            if wt_path.is_dir():
+                return self._dirs_differ(wt_path, base_path)
+            # Cheap shallow check first (size + mtime); only read content when that disagrees, so
+            # mtime jitter doesn't produce a false "differs" and identical files aren't re-read.
+            if filecmp.cmp(str(wt_path), str(base_path), shallow=True):
+                return False
+            return not filecmp.cmp(str(wt_path), str(base_path), shallow=False)
+        except OSError:
+            return True
+
+    def _dirs_differ(self, a: Path, b: Path) -> bool:
+        """Recursively whether directory ``a`` differs from ``b`` (extra/missing entries, or any
+        file whose CONTENT differs). dircmp compares shallowly (size+mtime), so any flagged file
+        is content-confirmed to avoid mtime-jitter false positives. Short-circuits on the first
+        real difference, so an identical tree (e.g. node_modules copied from base) is cheap."""
+        try:
+            cmp = filecmp.dircmp(str(a), str(b))
+        except OSError:
+            return True
+        if cmp.left_only or cmp.right_only or cmp.funny_files:
+            return True
+        if cmp.diff_files:
+            _match, mismatch, errors = filecmp.cmpfiles(str(a), str(b), cmp.diff_files, shallow=False)
+            if mismatch or errors:
+                return True
+        return any(self._dirs_differ(a / sub, b / sub) for sub in cmp.common_dirs)
 
     def _notice_files_remain(self, wt_dir, files: list[str]) -> None:
         listing = ", ".join(files[:5]) + (" …" if len(files) > 5 else "")

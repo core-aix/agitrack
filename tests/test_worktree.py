@@ -1862,3 +1862,287 @@ def os_utime_now(path):
 
     now = time.time() + 5  # safely after the watermark
     os.utime(path, (now, now))
+
+
+# --- git-unstaged: interactive editing of the intentionally-unstaged list ---
+
+
+def _unstaged_runner(tmp_path, main):
+    runner = make_runner(base_repo=main, state=AgitrackState(tmp_path))
+    runner.global_config = type("G", (), {"default_backend": "claude"})()
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda *a, **k: None
+    runner._reload_user_declined = lambda: None
+    return runner
+
+
+def test_manage_unstaged_menu_add_then_restage(tmp_path):
+    main = _init_repo(tmp_path)
+    (tmp_path / "keep.txt").write_text("x\n")
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "a.txt").write_text("a\n")
+    runner = _unstaged_runner(tmp_path, main)
+
+    # Round 1: add keep.txt to the intentionally-unstaged list, then Done.
+    answers = iter(["Add untracked path(s) to keep unstaged…", "keep.txt", "← Done"])
+    runner._select_popup = lambda title, options, **k: next(answers)
+    runner._manage_unstaged_menu()
+    assert AgitrackState(tmp_path).declined_untracked() == ["keep.txt"]
+
+    # Round 2: re-stage (remove) it from the list, then Done.
+    answers = iter(["Re-stage a path (remove from the list)…", "keep.txt", "← Done"])
+    runner._select_popup = lambda title, options, **k: next(answers)
+    runner._manage_unstaged_menu()
+    assert AgitrackState(tmp_path).declined_untracked() == []
+
+
+def test_manage_unstaged_menu_can_unstage_a_directory(tmp_path):
+    main = _init_repo(tmp_path)
+    (tmp_path / "build").mkdir()
+    (tmp_path / "build" / "out.bin").write_text("x\n")  # wholly-untracked dir -> collapsed "build/"
+    runner = _unstaged_runner(tmp_path, main)
+
+    answers = iter(["Add untracked path(s) to keep unstaged…", "build/", "← Done"])
+    runner._select_popup = lambda title, options, **k: next(answers)
+    runner._manage_unstaged_menu()
+    assert "build/" in AgitrackState(tmp_path).declined_untracked()
+
+
+def test_manage_unstaged_menu_restage_all_clears_list(tmp_path):
+    main = _init_repo(tmp_path)
+    (tmp_path / "a.txt").write_text("a\n")
+    (tmp_path / "b.txt").write_text("b\n")
+    seed = AgitrackState(tmp_path)
+    seed.add_declined(["a.txt", "b.txt"])
+    runner = _unstaged_runner(tmp_path, main)
+
+    answers = iter(["Re-stage ALL (clear the list)", "Yes, re-stage all", "← Done"])
+    runner._select_popup = lambda title, options, **k: next(answers)
+    runner._manage_unstaged_menu()
+    assert AgitrackState(tmp_path).declined_untracked() == []
+
+
+# --- summarizer amends in --no-worktree mode; session name consistency ---
+
+
+def test_amend_summary_into_head_amends_directly_in_no_worktree_mode(tmp_path):
+    # In --no-worktree mode the commit is made on the working branch (HEAD == base), so the
+    # "ahead of base" containment check must be skipped — otherwise the summary never amends into
+    # the commit message and only lands as git notes ("commit made without summary").
+    repo = GitRepo.init(tmp_path)
+    (tmp_path / "f.txt").write_text("x\n")
+    repo.stage_paths(["f.txt"])
+    repo.commit("Prompt: do a thing")
+    head = repo.rev_parse("HEAD")
+
+    runner = make_runner(repo=repo, base_repo=repo, _base_branch=repo.current_branch(), worktree=None)
+    runner._last_agent_commit_id = None
+
+    target = runner._amend_summary_into_head(repo, head, "Added f.txt holding x", None)
+
+    assert target is not None  # amended (not skipped, not notes-only)
+    assert "Added f.txt holding x" in repo.commit_message("HEAD")
+
+
+def test_amend_summary_into_head_skips_when_not_head(tmp_path):
+    repo = GitRepo.init(tmp_path)
+    (tmp_path / "a.txt").write_text("1\n")
+    repo.stage_paths(["a.txt"])
+    repo.commit("first")
+    first = repo.rev_parse("HEAD")
+    (tmp_path / "b.txt").write_text("2\n")
+    repo.stage_paths(["b.txt"])
+    repo.commit("second")
+
+    runner = make_runner(repo=repo, base_repo=repo, _base_branch=repo.current_branch(), worktree=None)
+    runner._last_agent_commit_id = None
+    # `first` is no longer HEAD → can't amend safely → None (summary becomes notes-only).
+    assert runner._amend_summary_into_head(repo, first, "summary", None) is None
+
+
+def test_resolve_session_name_uses_worktree_key(tmp_path):
+    import types
+
+    from agitrack.transcripts.types import SessionRef
+
+    main = _init_repo(tmp_path)
+    runner = make_runner(base_repo=main)
+    runner.worktree_manager = WorktreeManager(main)
+    runner.global_config = type("G", (), {"default_backend": "claude"})()
+    runner.backend = types.SimpleNamespace(
+        list_worktree_sessions=lambda root: [("candle", SessionRef(id="sid-1", updated=1.0, label="hi"))]
+    )
+    runner._debug = lambda *a, **k: None
+
+    # A --no-worktree resume of a worktree session keeps that session's name (the worktree dir).
+    assert runner._resolve_session_name("sid-1") == "candle"
+    assert runner._resolve_session_name("unknown") is None
+
+
+# --- --no-worktree: delete-leftover-worktrees prompt; commit-box target label ---
+
+
+def test_present_pending_noworktree_cleanup_deletes_on_confirm(tmp_path):
+    main = _init_repo(tmp_path)
+    wm = WorktreeManager(main)
+    a = wm.create("sess-a", base=main.current_branch())
+    b = wm.create("sess-b", base=main.current_branch())
+    runner = make_runner(base_repo=main)
+    runner.worktree_manager = wm
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda *a, **k: None
+    runner._debug = lambda *a, **k: None
+    runner._pending_noworktree_cleanup = ["sess-a", "sess-b"]
+    runner._select_popup = lambda *a, **k: "Delete them"
+
+    runner._present_pending_noworktree_cleanup()
+
+    assert not a.path.exists() and not b.path.exists()  # removed
+    assert runner._pending_noworktree_cleanup == []
+
+
+def test_present_pending_noworktree_cleanup_keeps_on_decline(tmp_path):
+    main = _init_repo(tmp_path)
+    wm = WorktreeManager(main)
+    a = wm.create("sess-a", base=main.current_branch())
+    runner = make_runner(base_repo=main)
+    runner.worktree_manager = wm
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda *a, **k: None
+    runner._debug = lambda *a, **k: None
+    runner._pending_noworktree_cleanup = ["sess-a"]
+    runner._select_popup = lambda *a, **k: "Keep them"
+
+    runner._present_pending_noworktree_cleanup()
+
+    assert a.path.exists()  # kept (default-safe)
+
+
+def test_user_commit_box_labels_base_vs_worktree_target(tmp_path):
+    main = _init_repo(tmp_path)  # seeds f.txt committed
+    (tmp_path / "f.txt").write_text("modified\n")  # a tracked modification to stage
+    runner = make_runner(repo=main, base_repo=main, _base_branch=main.current_branch(), worktree=None)
+    runner.global_config = type("G", (), {"default_backend": "claude"})()
+    captured: dict = {}
+    runner._prompt_popup = lambda title, prompt, **k: captured.update(detail=k.get("detail")) or "my message"
+    runner._review_untracked_popup = lambda **k: None
+    runner._render = lambda *a, **k: None
+
+    assert runner._create_user_commit_popup(repo=main, state=runner._user_state(), include_declined=True)
+    # The box names where the commit lands — here the base repo.
+    assert any("BASE repo" in line for line in captured["detail"])
+
+
+# --- base→worktree copy: includes dotfiles/underscore; prompt defaults to Yes ---
+
+
+def test_copy_base_environment_includes_dot_and_underscore_files(tmp_path):
+    # base→worktree must carry ALL untracked/ignored content, including names starting with
+    # "." or "_" (.env, _private, .config/) — unlike the worktree→base copy-back, which skips
+    # those as scaffolding. Only the agent/tooling dirs (.git/.agitrack/.claude/.opencode) are
+    # excluded.
+    repo = _init_repo(tmp_path)
+    (tmp_path / ".env").write_text("SECRET=1\n")  # dotfile, untracked
+    (tmp_path / "_private.txt").write_text("p\n")  # underscore file
+    (tmp_path / ".config").mkdir()
+    (tmp_path / ".config" / "x").write_text("c\n")  # dot directory
+    wm = WorktreeManager(repo)
+    info = wm.create("env", base=repo.current_branch())
+
+    wm.copy_base_environment(info.path)
+
+    assert (info.path / ".env").read_text() == "SECRET=1\n"
+    assert (info.path / "_private.txt").read_text() == "p\n"
+    assert (info.path / ".config" / "x").read_text() == "c\n"
+
+
+def test_env_refresh_prompt_defaults_to_yes(tmp_path):
+    # Pulling the base's latest into the worktree is the safe default, so "Yes" must be the
+    # FIRST (default-selected) option of the update prompt.
+    main = _init_repo(tmp_path)
+    wm = WorktreeManager(main)
+    info = wm.create("sess", base=main.current_branch())
+    (main.repo / "cfg.txt").write_text("base-v2\n")  # the change to pull in
+    runner = make_runner(base_repo=main)
+    runner.worktree_manager = wm
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda *a, **k: None
+    runner._debug = lambda *a, **k: None
+    captured: dict = {}
+    # Simulate the user pressing Enter on the default (the first option).
+    runner._select_popup = lambda title, options, **k: captured.update(options=options) or options[0]
+    runner._pending_env_refresh = [(info.path, ["cfg.txt"])]
+
+    runner._present_pending_env_refresh()
+
+    assert captured["options"][0].startswith("Yes")  # Yes is the default
+    assert (info.path / "cfg.txt").read_text() == "base-v2\n"  # taking the default updated the worktree
+
+
+# --- copy-back: only offer real differences; report copy failures clearly ---
+
+
+def _copyback_runner(tmp_path):
+    main = _init_repo(tmp_path)
+    wm = WorktreeManager(main)
+    info = wm.create("w", base=main.current_branch())
+    runner = make_runner(base_repo=main, worktree=info, repo=GitRepo(info.path), state=AgitrackState(info.path))
+    runner.global_config = type("G", (), {"default_backend": "claude"})()
+    runner._debug = lambda *a, **k: None
+    runner._offer_user_commit_for_worktree_edits = lambda: None
+    return runner, main, info
+
+
+def test_copy_back_skips_entries_identical_to_base(tmp_path):
+    runner, main, info = _copyback_runner(tmp_path)
+    (main.repo / "same.txt").write_text("identical\n")
+    (info.path / "same.txt").write_text("identical\n")  # identical → not offered
+    (main.repo / "diff.txt").write_text("base\n")
+    (info.path / "diff.txt").write_text("worktree\n")  # differs → offered
+    (info.path / "new.txt").write_text("new\n")  # base lacks it → offered
+    (main.repo / "samedir").mkdir()
+    (main.repo / "samedir" / "a").write_text("A\n")
+    (info.path / "samedir").mkdir()
+    (info.path / "samedir" / "a").write_text("A\n")  # identical dir → not offered
+
+    collected = runner._collect_copy_candidates(context="turn")
+    offered = set(collected[0]) if collected else set()
+
+    assert "same.txt" not in offered and "samedir/" not in offered
+    assert {"diff.txt", "new.txt"} <= offered
+
+
+def test_copy_back_failure_reports_error_and_manual_copy(tmp_path, monkeypatch):
+    import agitrack.proxy.runner as rmod
+
+    runner, main, info = _copyback_runner(tmp_path)
+    (info.path / "x.txt").write_text("payload\n")  # differs from base (base lacks it) → offered
+    msgs: list = []
+    runner._set_message = lambda m, **k: msgs.append(m)
+    runner._render = lambda *a, **k: None
+    runner._select_popup = lambda *a, **k: "Yes, copy to the base repo"
+    monkeypatch.setattr(rmod.shutil, "copy2", lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+
+    collected = runner._collect_copy_candidates(context="turn")
+    runner._present_copy_offer(collected, context="turn")
+
+    # The actual error is surfaced, with a hint to copy manually — not silently lumped into "left".
+    assert any("Could not copy" in m and "manually" in m and "disk full" in m for m in msgs)
+
+
+def test_resolve_session_name_falls_back_to_worktree_state(tmp_path):
+    # When the conversation isn't in the persisted name map or the backend listing, the worktree
+    # whose state recorded the id still yields its name — so the name survives across modes.
+    import types
+
+    main = _init_repo(tmp_path)
+    wm = WorktreeManager(main)
+    info = wm.create("candle", base=main.current_branch())
+    AgitrackState(info.path).backend_session_id = "sid-candle"
+    runner = make_runner(base_repo=main, state=AgitrackState(tmp_path))
+    runner.worktree_manager = wm
+    runner.global_config = type("G", (), {"default_backend": "claude"})()
+    runner.backend = types.SimpleNamespace(list_worktree_sessions=lambda root: [])  # listing misses it
+    runner._debug = lambda *a, **k: None
+
+    assert runner._resolve_session_name("sid-candle") == "candle"

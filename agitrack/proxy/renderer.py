@@ -766,6 +766,10 @@ class ScreenRenderer:
             # out the path is elided from the LEFT — the trailing components
             # are the part that identifies the directory.
             cwd_text = _home_relative(cwd)
+            if worktree is None:
+                # No isolated worktree: the agent edits this base directory directly. Note the
+                # mode right after the path so it's clear there's no worktree isolation.
+                cwd_text += " (no worktree)"
             room = cols - len(left) - len(right) - 3  # the "| " separator + trailing space
             if len(cwd_text) > room:
                 cwd_text = "…" + cwd_text[-(room - 1) :] if room > 1 else ""

@@ -7782,23 +7782,25 @@ def test_popup_read_input_survives_child_eof(monkeypatch):
 # --- issue #25: proxy commands and README stay in sync --------------------------
 
 
-def test_git_unstaged_command_lists_declined_files(tmp_path):
+def test_git_unstaged_command_edits_the_declined_list(tmp_path):
+    # git-unstaged is now an interactive editor: it surfaces the intentionally-unstaged paths
+    # and lets the user re-stage (remove) them or add new ones.
     runner, repo = _user_git_runner(tmp_path, answers=[])
     (tmp_path / "kept.txt").write_text("x\n", encoding="utf-8")
-    state = runner._user_state()
-    state.add_declined(["kept.txt"])
-    messages = []
-    runner._set_message = lambda text, **k: messages.append(text)
+    runner._user_state().add_declined(["kept.txt"])
+    runner._set_message = lambda *a, **k: None
     runner._render = lambda: None
 
+    seen = []
+    # Drive the menu: re-stage kept.txt (remove from the list), then Done.
+    answers = iter(["Re-stage a path (remove from the list)…", "kept.txt", "← Done"])
+    runner._select_popup = lambda title, options, **k: seen.append((title, k.get("detail"))) or next(answers)
+
     runner._run_command("git-unstaged")
 
-    assert any("kept.txt" in message for message in messages)
-
-    # Once nothing is declined any more, it says so instead.
-    state.remove_declined(["kept.txt"])
-    runner._run_command("git-unstaged")
-    assert messages[-1] == "No intentionally unstaged files."
+    # The menu surfaced the declined file and re-staging removed it from the list.
+    assert any("kept.txt" in str(detail) for _title, detail in seen)
+    assert AgitrackState(tmp_path).declined_untracked() == []
 
 
 def test_readme_proxy_command_list_matches_implementation():
@@ -8372,7 +8374,7 @@ def test_screen_renderer_status_line_shows_home_abbreviated_cwd(monkeypatch):
         backend_name="claude",
         session_id=None,
         base_branch=None,
-        worktree=None,
+        worktree=types.SimpleNamespace(name="session-1"),
         scroll_back=0,
         user_declined=[],
         short_session_fn=lambda s: "(none)",
@@ -8380,6 +8382,7 @@ def test_screen_renderer_status_line_shows_home_abbreviated_cwd(monkeypatch):
     )
     # The agent's working directory is visible, home-abbreviated.
     assert "~/code/repo/.agitrack/worktrees/session-1" in line
+    assert "(no worktree)" not in line  # a real worktree → no no-worktree note
 
 
 def test_screen_renderer_status_line_elides_long_cwd_from_left():
@@ -8391,7 +8394,7 @@ def test_screen_renderer_status_line_elides_long_cwd_from_left():
         backend_name="claude",
         session_id=None,
         base_branch=None,
-        worktree=None,
+        worktree=types.SimpleNamespace(name="session-1"),
         scroll_back=0,
         user_declined=[],
         short_session_fn=lambda s: "(none)",
@@ -8402,6 +8405,25 @@ def test_screen_renderer_status_line_elides_long_cwd_from_left():
     # Elided from the left: the identifying tail of the path survives.
     assert "…" in visible
     assert visible.rstrip().endswith("session-1")
+
+
+def test_screen_renderer_status_line_notes_no_worktree(monkeypatch):
+    monkeypatch.setenv("HOME", "/Users/dev")
+    r = ScreenRenderer(5, 100, color_mode="truecolor")
+    line = r.status_line(
+        cols=100,
+        name="main",
+        backend_name="claude",
+        session_id=None,
+        base_branch=None,
+        worktree=None,  # --no-worktree: the agent edits the base repo directly
+        scroll_back=0,
+        user_declined=[],
+        short_session_fn=lambda s: "(none)",
+        cwd="/Users/dev/code/repo",
+    )
+    # The base path is shown, with the no-worktree mode noted right after it.
+    assert "~/code/repo (no worktree)" in line
 
 
 def test_status_line_shows_base_repo_directory_not_the_worktree(tmp_path):
