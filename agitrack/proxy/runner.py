@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import filecmp
 import hashlib
 import os
 from agitrack.env import getenv_compat
@@ -2933,22 +2934,34 @@ class ProxyRunner:
         self.actions = AgitrackActions(self.repo, self.state, verbose=self.verbose)
 
     def _resolve_session_name(self, session_id: str | None) -> str | None:
-        """A friendly name for a backend conversation id: the worktree directory it ran in (its
-        name), else the persisted session-name record. Lets a ``--no-worktree`` resume of a
-        worktree session keep that session's name (e.g. "candle") instead of falling back to the
-        default "main", and keeps the name consistent when switching worktree ⇄ no-worktree."""
+        """A friendly name for a backend conversation id, tried in order: (1) the persisted
+        session-name record, (2) the worktree DIRECTORY whose state recorded this id (its dir
+        name), (3) the worktree the backend's conversation listing keys it under. Lets a
+        ``--no-worktree`` resume of a worktree session keep that session's name (e.g. "candle")
+        instead of falling back to the default "main", and keeps the name consistent across
+        worktree ⇄ no-worktree switches even after the leftover worktree dir is deleted."""
         if not session_id:
             return None
+        try:
+            persisted = self._user_state().session_name_for(session_id)
+            if persisted and not self._AUTO_NAME_RE.match(persisted):
+                return persisted
+        except Exception as error:
+            self._debug(f"resolve-session-name persisted lookup failed: {error!r}")
+        try:
+            for info in self._worktrees().list():
+                state = AgitrackState(info.path, default_backend=self.global_config.default_backend)
+                if state.backend_session_id == session_id:
+                    return info.name
+        except Exception as error:
+            self._debug(f"resolve-session-name worktree-state scan failed: {error!r}")
         try:
             for key, ref in self.backend.list_worktree_sessions(self._worktrees().root):
                 if ref.id == session_id and key:
                     return key
         except Exception as error:
-            self._debug(f"resolve-session-name scan failed: {error!r}")
-        try:
-            return self._user_state().session_name_for(session_id)
-        except Exception:
-            return None
+            self._debug(f"resolve-session-name conversation scan failed: {error!r}")
+        return None
 
     def _newest_worktree_session(self) -> tuple[str, float] | None:
         """``(id, last-updated)`` of the most recently active worktree conversation that HAS
@@ -10564,6 +10577,8 @@ class ProxyRunner:
                 continue  # muted by a prior decline; not re-asked even on exit (no new file)
             if self._copy_prompted.get(rel) == fingerprint:
                 continue  # already offered/copied at this exact content
+            if not self._differs_from_base(wt_dir / rel, base_dir / rel):
+                continue  # identical to the base copy (incl. after a prior copy) — nothing to do
             fresh.append((rel, fingerprint))
         if not fresh:
             return None
@@ -10657,6 +10672,7 @@ class ProxyRunner:
             else:  # "No, keep the base versions" or cancelled
                 overwrite_mode = "none"
         remained: list[str] = []
+        failed: list[tuple[str, str]] = []
         copied = 0
         # Announce the copy BEFORE it runs (a wholly-ignored directory like node_modules can
         # take a moment to copy), so the user sees that work is happening rather than the
@@ -10689,17 +10705,29 @@ class ProxyRunner:
                     shutil.copy2(src, dst)
                 copied += 1
             except OSError as error:
+                # Surface the actual error (and tell the user they can copy it by hand) rather
+                # than silently lumping it in with "left in the worktree" — a failed copy of a
+                # directory looked just like a declined one, which was confusing.
                 self._debug(f"copy {rel} to base failed: {error!r}")
-                remained.append(rel)
+                failed.append((rel, str(error)))
         if copied:
             # aGiTrack itself just wrote these into the base repo (the copy-back of stranded
             # worktree files) — that is NOT the agent editing outside its worktree, so fold them
             # into the un-sandboxed base-edit monitor's baseline. Otherwise _warn_if_base_edited
             # would flag aGiTrack's own copy as "Agent edited the base repo".
             self._rebaseline_base_edits()
+        if failed:
+            shown = "; ".join(f"{rel} ({err})" for rel, err in failed[:3])
+            more = f" (+{len(failed) - 3} more)" if len(failed) > 3 else ""
+            self._set_message(
+                f"Could not copy {len(failed)} item(s) into the base repo — copy them manually "
+                f"from {wt_dir}. Error: {shown}{more}",
+                seconds=15.0,
+            )
+            self._render()
         if remained:
             self._notice_files_remain(wt_dir, remained)
-        elif copied:
+        elif copied and not failed:
             self._set_message(f"Copied {copied} file(s) into the base repo directory.")
             self._render()
 
@@ -10758,6 +10786,44 @@ class ProxyRunner:
             return path.stat().st_mtime
         except OSError:
             return 0.0
+
+    def _differs_from_base(self, wt_path: Path, base_path: Path) -> bool:
+        """Whether a worktree entry (file OR directory) actually differs from the base repo's
+        copy — so the copy-back offer only prompts when there's a real difference, and never again
+        once a copy has made them identical. A missing base counterpart, or a file⇄dir type change,
+        counts as a difference. Directories are compared recursively. Best-effort: on any
+        comparison error, treat as differing so a genuine change is never silently dropped."""
+        try:
+            if not base_path.exists():
+                return True
+            if wt_path.is_dir() != base_path.is_dir():
+                return True
+            if wt_path.is_dir():
+                return self._dirs_differ(wt_path, base_path)
+            # Cheap shallow check first (size + mtime); only read content when that disagrees, so
+            # mtime jitter doesn't produce a false "differs" and identical files aren't re-read.
+            if filecmp.cmp(str(wt_path), str(base_path), shallow=True):
+                return False
+            return not filecmp.cmp(str(wt_path), str(base_path), shallow=False)
+        except OSError:
+            return True
+
+    def _dirs_differ(self, a: Path, b: Path) -> bool:
+        """Recursively whether directory ``a`` differs from ``b`` (extra/missing entries, or any
+        file whose CONTENT differs). dircmp compares shallowly (size+mtime), so any flagged file
+        is content-confirmed to avoid mtime-jitter false positives. Short-circuits on the first
+        real difference, so an identical tree (e.g. node_modules copied from base) is cheap."""
+        try:
+            cmp = filecmp.dircmp(str(a), str(b))
+        except OSError:
+            return True
+        if cmp.left_only or cmp.right_only or cmp.funny_files:
+            return True
+        if cmp.diff_files:
+            _match, mismatch, errors = filecmp.cmpfiles(str(a), str(b), cmp.diff_files, shallow=False)
+            if mismatch or errors:
+                return True
+        return any(self._dirs_differ(a / sub, b / sub) for sub in cmp.common_dirs)
 
     def _notice_files_remain(self, wt_dir, files: list[str]) -> None:
         listing = ", ".join(files[:5]) + (" …" if len(files) > 5 else "")

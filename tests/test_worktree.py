@@ -2077,3 +2077,72 @@ def test_env_refresh_prompt_defaults_to_yes(tmp_path):
 
     assert captured["options"][0].startswith("Yes")  # Yes is the default
     assert (info.path / "cfg.txt").read_text() == "base-v2\n"  # taking the default updated the worktree
+
+
+# --- copy-back: only offer real differences; report copy failures clearly ---
+
+
+def _copyback_runner(tmp_path):
+    main = _init_repo(tmp_path)
+    wm = WorktreeManager(main)
+    info = wm.create("w", base=main.current_branch())
+    runner = make_runner(base_repo=main, worktree=info, repo=GitRepo(info.path), state=AgitrackState(info.path))
+    runner.global_config = type("G", (), {"default_backend": "claude"})()
+    runner._debug = lambda *a, **k: None
+    runner._offer_user_commit_for_worktree_edits = lambda: None
+    return runner, main, info
+
+
+def test_copy_back_skips_entries_identical_to_base(tmp_path):
+    runner, main, info = _copyback_runner(tmp_path)
+    (main.repo / "same.txt").write_text("identical\n")
+    (info.path / "same.txt").write_text("identical\n")  # identical → not offered
+    (main.repo / "diff.txt").write_text("base\n")
+    (info.path / "diff.txt").write_text("worktree\n")  # differs → offered
+    (info.path / "new.txt").write_text("new\n")  # base lacks it → offered
+    (main.repo / "samedir").mkdir()
+    (main.repo / "samedir" / "a").write_text("A\n")
+    (info.path / "samedir").mkdir()
+    (info.path / "samedir" / "a").write_text("A\n")  # identical dir → not offered
+
+    collected = runner._collect_copy_candidates(context="turn")
+    offered = set(collected[0]) if collected else set()
+
+    assert "same.txt" not in offered and "samedir/" not in offered
+    assert {"diff.txt", "new.txt"} <= offered
+
+
+def test_copy_back_failure_reports_error_and_manual_copy(tmp_path, monkeypatch):
+    import agitrack.proxy.runner as rmod
+
+    runner, main, info = _copyback_runner(tmp_path)
+    (info.path / "x.txt").write_text("payload\n")  # differs from base (base lacks it) → offered
+    msgs: list = []
+    runner._set_message = lambda m, **k: msgs.append(m)
+    runner._render = lambda *a, **k: None
+    runner._select_popup = lambda *a, **k: "Yes, copy to the base repo"
+    monkeypatch.setattr(rmod.shutil, "copy2", lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+
+    collected = runner._collect_copy_candidates(context="turn")
+    runner._present_copy_offer(collected, context="turn")
+
+    # The actual error is surfaced, with a hint to copy manually — not silently lumped into "left".
+    assert any("Could not copy" in m and "manually" in m and "disk full" in m for m in msgs)
+
+
+def test_resolve_session_name_falls_back_to_worktree_state(tmp_path):
+    # When the conversation isn't in the persisted name map or the backend listing, the worktree
+    # whose state recorded the id still yields its name — so the name survives across modes.
+    import types
+
+    main = _init_repo(tmp_path)
+    wm = WorktreeManager(main)
+    info = wm.create("candle", base=main.current_branch())
+    AgitrackState(info.path).backend_session_id = "sid-candle"
+    runner = make_runner(base_repo=main, state=AgitrackState(tmp_path))
+    runner.worktree_manager = wm
+    runner.global_config = type("G", (), {"default_backend": "claude"})()
+    runner.backend = types.SimpleNamespace(list_worktree_sessions=lambda root: [])  # listing misses it
+    runner._debug = lambda *a, **k: None
+
+    assert runner._resolve_session_name("sid-candle") == "candle"
