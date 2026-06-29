@@ -8374,7 +8374,7 @@ def test_screen_renderer_status_line_shows_home_abbreviated_cwd(monkeypatch):
         backend_name="claude",
         session_id=None,
         base_branch=None,
-        worktree=None,
+        worktree=types.SimpleNamespace(name="session-1"),
         scroll_back=0,
         user_declined=[],
         short_session_fn=lambda s: "(none)",
@@ -8382,6 +8382,7 @@ def test_screen_renderer_status_line_shows_home_abbreviated_cwd(monkeypatch):
     )
     # The agent's working directory is visible, home-abbreviated.
     assert "~/code/repo/.agitrack/worktrees/session-1" in line
+    assert "(no worktree)" not in line  # a real worktree → no no-worktree note
 
 
 def test_screen_renderer_status_line_elides_long_cwd_from_left():
@@ -8393,7 +8394,7 @@ def test_screen_renderer_status_line_elides_long_cwd_from_left():
         backend_name="claude",
         session_id=None,
         base_branch=None,
-        worktree=None,
+        worktree=types.SimpleNamespace(name="session-1"),
         scroll_back=0,
         user_declined=[],
         short_session_fn=lambda s: "(none)",
@@ -8404,6 +8405,25 @@ def test_screen_renderer_status_line_elides_long_cwd_from_left():
     # Elided from the left: the identifying tail of the path survives.
     assert "…" in visible
     assert visible.rstrip().endswith("session-1")
+
+
+def test_screen_renderer_status_line_notes_no_worktree(monkeypatch):
+    monkeypatch.setenv("HOME", "/Users/dev")
+    r = ScreenRenderer(5, 100, color_mode="truecolor")
+    line = r.status_line(
+        cols=100,
+        name="main",
+        backend_name="claude",
+        session_id=None,
+        base_branch=None,
+        worktree=None,  # --no-worktree: the agent edits the base repo directly
+        scroll_back=0,
+        user_declined=[],
+        short_session_fn=lambda s: "(none)",
+        cwd="/Users/dev/code/repo",
+    )
+    # The base path is shown, with the no-worktree mode noted right after it.
+    assert "~/code/repo (no worktree)" in line
 
 
 def test_status_line_shows_base_repo_directory_not_the_worktree(tmp_path):
