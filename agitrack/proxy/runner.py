@@ -6376,14 +6376,19 @@ class ProxyRunner:
         """Main thread: surface any deferred "the base repo has new/changed files — update this
         worktree?" prompts queued while a worktree was reopened (possibly before the UI was up).
         Covers both files the worktree lacks and ones the base now has a newer version of. One
-        prompt per worktree; declining keeps the worktree as-is."""
+        prompt per worktree. Pulling the base's latest into the worktree is the safe, expected
+        default (it's only the agent's sandbox), so "Yes" is the default option; declining keeps
+        the worktree as-is."""
         while self._pending_env_refresh:
             dest, rels = self._pending_env_refresh.pop(0)
             try:
                 choice = self._select_popup(
-                    f"The base repo has {len(rels)} new/changed file(s) not reflected in this session's "
-                    f"worktree ({dest}). Update the worktree to the base versions?\n\nFile(s):",
-                    ["No, keep the worktree as-is", "Yes, update from the base repo"],
+                    f"The base repo has {len(rels)} untracked / git-ignored file(s) (e.g. .env, "
+                    f"dependencies, build output) that git won't sync into this session's worktree "
+                    f"({dest}). Copy them from the base now?\n"
+                    f"(Committed changes are merged into the worktree automatically — this is only "
+                    f"for files git doesn't track.)\n\nFile(s):",
+                    ["Yes, update from the base repo", "No, keep the worktree as-is"],
                     detail=rels,
                 )
             except Exception as error:
