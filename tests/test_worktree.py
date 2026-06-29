@@ -2031,3 +2031,49 @@ def test_user_commit_box_labels_base_vs_worktree_target(tmp_path):
     assert runner._create_user_commit_popup(repo=main, state=runner._user_state(), include_declined=True)
     # The box names where the commit lands — here the base repo.
     assert any("BASE repo" in line for line in captured["detail"])
+
+
+# --- base→worktree copy: includes dotfiles/underscore; prompt defaults to Yes ---
+
+
+def test_copy_base_environment_includes_dot_and_underscore_files(tmp_path):
+    # base→worktree must carry ALL untracked/ignored content, including names starting with
+    # "." or "_" (.env, _private, .config/) — unlike the worktree→base copy-back, which skips
+    # those as scaffolding. Only the agent/tooling dirs (.git/.agitrack/.claude/.opencode) are
+    # excluded.
+    repo = _init_repo(tmp_path)
+    (tmp_path / ".env").write_text("SECRET=1\n")  # dotfile, untracked
+    (tmp_path / "_private.txt").write_text("p\n")  # underscore file
+    (tmp_path / ".config").mkdir()
+    (tmp_path / ".config" / "x").write_text("c\n")  # dot directory
+    wm = WorktreeManager(repo)
+    info = wm.create("env", base=repo.current_branch())
+
+    wm.copy_base_environment(info.path)
+
+    assert (info.path / ".env").read_text() == "SECRET=1\n"
+    assert (info.path / "_private.txt").read_text() == "p\n"
+    assert (info.path / ".config" / "x").read_text() == "c\n"
+
+
+def test_env_refresh_prompt_defaults_to_yes(tmp_path):
+    # Pulling the base's latest into the worktree is the safe default, so "Yes" must be the
+    # FIRST (default-selected) option of the update prompt.
+    main = _init_repo(tmp_path)
+    wm = WorktreeManager(main)
+    info = wm.create("sess", base=main.current_branch())
+    (main.repo / "cfg.txt").write_text("base-v2\n")  # the change to pull in
+    runner = make_runner(base_repo=main)
+    runner.worktree_manager = wm
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda *a, **k: None
+    runner._debug = lambda *a, **k: None
+    captured: dict = {}
+    # Simulate the user pressing Enter on the default (the first option).
+    runner._select_popup = lambda title, options, **k: captured.update(options=options) or options[0]
+    runner._pending_env_refresh = [(info.path, ["cfg.txt"])]
+
+    runner._present_pending_env_refresh()
+
+    assert captured["options"][0].startswith("Yes")  # Yes is the default
+    assert (info.path / "cfg.txt").read_text() == "base-v2\n"  # taking the default updated the worktree
