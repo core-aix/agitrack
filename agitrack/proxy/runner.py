@@ -2853,7 +2853,15 @@ class ProxyRunner:
                     chosen = newest[0]
                 if chosen:
                     self.state.backend_session_id = chosen  # setter re-points backend_session_repo at base
-                    self._debug(f"--no-worktree: resuming session {chosen} in the base repo")
+                    # Keep the session's NAME (the worktree it came from, e.g. "candle") rather than
+                    # leaving the default "main" — so the status bar and the resume list stay
+                    # consistent across worktree ⇄ no-worktree switches. Persist it under this id so
+                    # switching back to worktree mode resolves the same name.
+                    name = self._resolve_session_name(chosen)
+                    if name and not self._AUTO_NAME_RE.match(name):
+                        self.name = name
+                        self._persist_session_name(chosen)
+                    self._debug(f"--no-worktree: resuming session {chosen} as '{self.name}' in the base repo")
             self._set_message(
                 "Running without a worktree: the agent edits this branch directly (visible live), "
                 "but there's no isolation or auto-integration. Extra sessions started this way share "
@@ -2909,6 +2917,24 @@ class ProxyRunner:
             self.state.backend_session_id = resume_id  # setter records this worktree as its repo
         self.backend = make_proxy_agent(backend_name)
         self.actions = AgitrackActions(self.repo, self.state, verbose=self.verbose)
+
+    def _resolve_session_name(self, session_id: str | None) -> str | None:
+        """A friendly name for a backend conversation id: the worktree directory it ran in (its
+        name), else the persisted session-name record. Lets a ``--no-worktree`` resume of a
+        worktree session keep that session's name (e.g. "candle") instead of falling back to the
+        default "main", and keeps the name consistent when switching worktree ⇄ no-worktree."""
+        if not session_id:
+            return None
+        try:
+            for key, ref in self.backend.list_worktree_sessions(self._worktrees().root):
+                if ref.id == session_id and key:
+                    return key
+        except Exception as error:
+            self._debug(f"resolve-session-name scan failed: {error!r}")
+        try:
+            return self._user_state().session_name_for(session_id)
+        except Exception:
+            return None
 
     def _newest_worktree_session(self) -> tuple[str, float] | None:
         """``(id, last-updated)`` of the most recently active worktree conversation that HAS
@@ -9073,8 +9099,16 @@ class ProxyRunner:
         try:
             if repo.rev_parse("HEAD") != sha:
                 return None
-            if self._base_branch is None or sha not in repo.log_shas(self._base_branch, "HEAD"):
-                return None
+            # Worktree mode: the commit sits on a turn branch ahead of base; once merged into
+            # base, amending would rewrite integrated history, so only amend while it's still
+            # unintegrated (sha in base..HEAD). No-worktree mode: the commit is made DIRECTLY on
+            # the working branch (HEAD == base), so base..HEAD is always empty — that check would
+            # wrongly skip every amend, leaving the summary as notes-only and the commit message
+            # without a summary. There it's enough that the commit is still HEAD with nothing
+            # staged, so skip the containment check.
+            if self.worktree is not None:
+                if self._base_branch is None or sha not in repo.log_shas(self._base_branch, "HEAD"):
+                    return None
             if repo.has_staged_changes():
                 return None
             message = repo.commit_message("HEAD")
