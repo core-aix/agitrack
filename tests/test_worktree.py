@@ -1977,3 +1977,57 @@ def test_resolve_session_name_uses_worktree_key(tmp_path):
     # A --no-worktree resume of a worktree session keeps that session's name (the worktree dir).
     assert runner._resolve_session_name("sid-1") == "candle"
     assert runner._resolve_session_name("unknown") is None
+
+
+# --- --no-worktree: delete-leftover-worktrees prompt; commit-box target label ---
+
+
+def test_present_pending_noworktree_cleanup_deletes_on_confirm(tmp_path):
+    main = _init_repo(tmp_path)
+    wm = WorktreeManager(main)
+    a = wm.create("sess-a", base=main.current_branch())
+    b = wm.create("sess-b", base=main.current_branch())
+    runner = make_runner(base_repo=main)
+    runner.worktree_manager = wm
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda *a, **k: None
+    runner._debug = lambda *a, **k: None
+    runner._pending_noworktree_cleanup = ["sess-a", "sess-b"]
+    runner._select_popup = lambda *a, **k: "Delete them"
+
+    runner._present_pending_noworktree_cleanup()
+
+    assert not a.path.exists() and not b.path.exists()  # removed
+    assert runner._pending_noworktree_cleanup == []
+
+
+def test_present_pending_noworktree_cleanup_keeps_on_decline(tmp_path):
+    main = _init_repo(tmp_path)
+    wm = WorktreeManager(main)
+    a = wm.create("sess-a", base=main.current_branch())
+    runner = make_runner(base_repo=main)
+    runner.worktree_manager = wm
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda *a, **k: None
+    runner._debug = lambda *a, **k: None
+    runner._pending_noworktree_cleanup = ["sess-a"]
+    runner._select_popup = lambda *a, **k: "Keep them"
+
+    runner._present_pending_noworktree_cleanup()
+
+    assert a.path.exists()  # kept (default-safe)
+
+
+def test_user_commit_box_labels_base_vs_worktree_target(tmp_path):
+    main = _init_repo(tmp_path)  # seeds f.txt committed
+    (tmp_path / "f.txt").write_text("modified\n")  # a tracked modification to stage
+    runner = make_runner(repo=main, base_repo=main, _base_branch=main.current_branch(), worktree=None)
+    runner.global_config = type("G", (), {"default_backend": "claude"})()
+    captured: dict = {}
+    runner._prompt_popup = lambda title, prompt, **k: captured.update(detail=k.get("detail")) or "my message"
+    runner._review_untracked_popup = lambda **k: None
+    runner._render = lambda *a, **k: None
+
+    assert runner._create_user_commit_popup(repo=main, state=runner._user_state(), include_declined=True)
+    # The box names where the commit lands — here the base repo.
+    assert any("BASE repo" in line for line in captured["detail"])

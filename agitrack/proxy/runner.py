@@ -809,6 +809,10 @@ class ProxyRunner:
         # prompts: (worktree path, name), queued at creation and presented by the loop so startup
         # stays fast and the prompt has a UI. See _present_pending_env_copy.
         self._pending_env_copy: list[tuple[Path, str]] = []
+        # Leftover worktree directory names found at a --no-worktree startup, queued for a
+        # "delete them?" prompt (their presence can confuse a resumed agent into editing them
+        # instead of the base repo). Presented by the loop. See _present_pending_noworktree_cleanup.
+        self._pending_noworktree_cleanup: list[str] = []
         # Per-worktree record of files copied INTO the worktree FROM the base (path → {rel:
         # fingerprint}), so the copy-back-to-base offer can skip files that merely came from the
         # base and weren't changed — otherwise they'd loop base → worktree → base. See
@@ -1117,6 +1121,7 @@ class ProxyRunner:
                 "_pending_copy_offer": None,
                 "_pending_env_refresh": [],
                 "_pending_env_copy": [],
+                "_pending_noworktree_cleanup": [],
                 "_env_from_base": {},
                 "_env_copy_watermark": {},
                 "_exit_delete_worktrees": None,
@@ -2868,6 +2873,15 @@ class ProxyRunner:
                 "this directory and edit the same files at once.",
                 seconds=12.0,
             )
+            # Leftover worktree directories aren't used in --no-worktree mode, and their presence
+            # can confuse a resumed agent into editing them instead of the base repo. Queue a
+            # "delete them?" prompt for the loop to surface (we're pre-TUI here). Default is keep.
+            try:
+                root = self._worktrees().root
+                self._pending_noworktree_cleanup = sorted(p.name for p in root.iterdir() if p.is_dir())
+            except Exception as error:
+                self._debug(f"no-worktree leftover scan failed: {error!r}")
+                self._pending_noworktree_cleanup = []
             # Anchor the no-worktree cover scan at the branch's current HEAD so commits the agent
             # makes itself from here get aGiTrack metadata (#35), while pre-existing history is
             # never touched. Set once (the earliest start); the metadata-reset handles the rest.
@@ -6290,21 +6304,21 @@ class ProxyRunner:
         return info, GitRepo(info.path)
 
     def _refresh_worktree_from_base(self, worktrees: WorktreeManager, path) -> None:
-        """Re-sync a reused full-environment worktree with the base: copy in any base files it is
-        missing (silently — additions are safe) and queue an overwrite prompt for base files now
-        newer than the worktree's copy. A tracked-only worktree (the user opted out of the
-        environment) is left untouched. Best-effort: a sync failure must never block opening it."""
+        """Re-sync a reused full-environment worktree with the base, ASKING before changing it:
+        if the base has environment files this worktree lacks (new since) or newer versions of
+        ones it has, queue a single "update this worktree from the base?" prompt for the loop.
+        Nothing is copied silently — the user decides — so a worktree preserved across runs can
+        be brought up to date (e.g. after the base's .gitignore/deps changed) on demand. A
+        tracked-only worktree (the user opted out of the environment) is left untouched."""
         try:
             if not AgitrackState(path, default_backend=self.global_config.default_backend).copy_full_env:
                 return  # tracked-only worktree — nothing to keep in sync
-            copied = worktrees.copy_base_environment(path)  # additions only (skips existing)
-            self._mark_env_from_base(path, copied)
-            newer = worktrees.base_newer_entries(path)
+            pending = sorted(set(worktrees.base_missing_entries(path)) | set(worktrees.base_newer_entries(path)))
         except Exception as error:
             self._debug(f"worktree env refresh failed for {path}: {error!r}")
             return
-        if newer:
-            self._pending_env_refresh.append((path, newer))
+        if pending:
+            self._pending_env_refresh.append((path, pending))
 
     def _present_pending_env_copy(self) -> None:
         """Main thread: surface the deferred "copy the full environment into the new worktree, or
@@ -6359,16 +6373,17 @@ class ProxyRunner:
                 registry[rel] = fingerprint
 
     def _present_pending_env_refresh(self) -> None:
-        """Main thread: surface any deferred "base has newer files — overwrite the worktree's
-        older copies?" prompts queued while a worktree was reopened (possibly before the UI was
-        up). One prompt per worktree; declining keeps the worktree's versions."""
+        """Main thread: surface any deferred "the base repo has new/changed files — update this
+        worktree?" prompts queued while a worktree was reopened (possibly before the UI was up).
+        Covers both files the worktree lacks and ones the base now has a newer version of. One
+        prompt per worktree; declining keeps the worktree as-is."""
         while self._pending_env_refresh:
             dest, rels = self._pending_env_refresh.pop(0)
             try:
                 choice = self._select_popup(
-                    f"The base repo has {len(rels)} file(s) newer than this session's worktree "
-                    f"({dest}). Overwrite the worktree's older copies with the base versions?\n\nFile(s):",
-                    ["No, keep the worktree versions", "Yes, update from the base repo"],
+                    f"The base repo has {len(rels)} new/changed file(s) not reflected in this session's "
+                    f"worktree ({dest}). Update the worktree to the base versions?\n\nFile(s):",
+                    ["No, keep the worktree as-is", "Yes, update from the base repo"],
                     detail=rels,
                 )
             except Exception as error:
@@ -6379,6 +6394,41 @@ class ProxyRunner:
                 self._mark_env_from_base(dest, copied)
                 self._set_message(f"Updated {len(copied)} file(s) in the worktree from the base repo.", seconds=6.0)
                 self._render()
+
+    def _present_pending_noworktree_cleanup(self) -> None:
+        """Main thread: at a --no-worktree start, offer to DELETE leftover session worktree
+        directories. They aren't used without worktrees, and their presence can confuse a resumed
+        agent into editing them instead of the base repo, so deleting them is the safe option.
+        Default is keep; deleting also removes any uncommitted work in those directories."""
+        names = self._pending_noworktree_cleanup
+        if not names:
+            return
+        self._pending_noworktree_cleanup = []
+        try:
+            choice = self._select_popup(
+                f"{len(names)} session worktree director(ies) still exist under .agitrack/worktrees/. "
+                f"In --no-worktree mode they're unused, and a resumed agent can get confused into editing "
+                f"them instead of the base repo. Delete them now?\n"
+                f"(Permanently removes those directories AND any uncommitted work in them. The "
+                f"conversations themselves are kept and stay resumable.)\n\nWorktree(s):",
+                ["Keep them", "Delete them"],
+                detail=names,
+            )
+        except Exception as error:
+            self._debug(f"no-worktree cleanup prompt failed: {error!r}")
+            return
+        if choice != "Delete them":
+            return
+        worktrees = self._worktrees()
+        removed = 0
+        for name in names:
+            try:
+                worktrees.remove(name)  # git worktree remove + prune, or force-rmtree a stray dir
+                removed += 1
+            except Exception as error:
+                self._debug(f"no-worktree cleanup: removing '{name}' failed: {error!r}")
+        self._set_message(f"Deleted {removed} leftover worktree director(ies).", seconds=6.0)
+        self._render()
 
     def _is_valid_worktree(self, path) -> bool:
         # A real linked worktree has a `.git` file pointing at its gitdir and a
@@ -7235,6 +7285,7 @@ class ProxyRunner:
         self._present_pending_copy_offer()  # the turn's "copy stranded files?" popup, if any
         self._present_pending_env_copy()  # "copy the full environment into the new worktree?" popup
         self._present_pending_env_refresh()  # "base has newer files — update the worktree?" popup
+        self._present_pending_noworktree_cleanup()  # "--no-worktree: delete leftover worktree dirs?" popup
         self._resume_pending_prompt_if_ready()
         self._service_shared_resume()  # complete a shared-session resume once fetched
         # Background / multi-session git (these swap self.active via _with_session, so
@@ -8708,13 +8759,18 @@ class ProxyRunner:
         self._review_untracked_popup(include_declined=include_declined, repo=repo, state=state)
         if not repo.has_staged_changes():
             return False
-        # Show exactly which files this commit will capture, so the user isn't typing a message
-        # blind. Scrollable in the popup when there are many (see PromptModal.detail).
+        # Show exactly which files this commit will capture AND where it lands (the base repo vs
+        # an isolated session worktree), so the user isn't typing a message blind or unsure which
+        # tree they're committing to. Scrollable in the popup when there are many files.
         try:
             changed = repo.staged_changes()
         except Exception:
             changed = []
-        detail = [f"Committing {len(changed)} file(s):", *changed] if changed else None
+        repo_path = getattr(repo, "repo", None)
+        base_path = getattr(self.base_repo, "repo", None)
+        is_base = base_path is not None and str(repo_path) == str(base_path)
+        where = "the BASE repo" if is_base else "this session's WORKTREE"
+        detail = [f"Committing {len(changed)} file(s) to {where} ({repo_path}):", *changed]
         message = ""
         # Esc cancels the prompt (_prompt_popup returns None) and we continue without
         # committing — note that in the prompt so the user knows it's a safe way out.
