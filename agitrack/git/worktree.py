@@ -111,6 +111,20 @@ class WorktreeManager:
         the entries actually copied (so the caller can mark them as base-origin)."""
         return self._copy_entries(dest, self._base_env_entries(), overwrite=False)
 
+    def base_missing_entries(self, dest: Path) -> list[str]:
+        """Base environment entries (untracked + git-ignored files/dirs) that ``dest`` doesn't
+        have at all — files the base gained since this worktree was last synced. Offered so a
+        reused worktree can be brought up to date with new base content, not just changed files."""
+        base = self.main_repo.repo
+        missing: list[str] = []
+        for rel in self._base_env_entries():
+            try:
+                if (base / rel).exists() and not (dest / rel).exists():
+                    missing.append(rel)
+            except OSError:
+                continue
+        return missing
+
     def base_newer_entries(self, dest: Path) -> list[str]:
         """Environment FILES whose base-repo copy is newer than the one already in ``dest``
         — the base moved on (e.g. a regenerated .env or lockfile) while this worktree kept an

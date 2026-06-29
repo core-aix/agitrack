@@ -403,9 +403,51 @@ def import_shared_session(
     return True
 
 
-def _retarget_rows(transcript: str, *, cwd: str, new_session_id: str | None = None) -> str:
-    """Rewrite every row's ``cwd`` (and, when ``new_session_id`` is given, its
-    ``sessionId``), leaving non-JSON lines untouched."""
+def _rewrite_path_prefixes(value, prefixes: tuple[str, ...], new: str):
+    """Recursively rewrite any string under ``value`` that IS one of ``prefixes`` or sits under
+    it (``prefix + "/..."``) so its prefix becomes ``new``. Used to repoint a resumed session's
+    absolute file paths — tool ``file_path`` args, command output, mentions in text — from the
+    old worktree it ran in to the launch dir, so the agent edits there and not the old worktree."""
+    if isinstance(value, str):
+        for prefix in prefixes:
+            if value == prefix:
+                return new
+            if value.startswith(prefix + "/"):
+                return new + value[len(prefix) :]
+        return value
+    if isinstance(value, list):
+        return [_rewrite_path_prefixes(item, prefixes, new) for item in value]
+    if isinstance(value, dict):
+        return {key: _rewrite_path_prefixes(val, prefixes, new) for key, val in value.items()}
+    return value
+
+
+def _recorded_cwds(transcript: str) -> set[str]:
+    """The distinct ``cwd`` directories a transcript records (the dirs the session has run in)."""
+    found: set[str] = set()
+    for line in transcript.split("\n"):
+        stripped = line.strip()
+        if not stripped or '"cwd"' not in stripped:
+            continue
+        try:
+            row = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        cwd = row.get("cwd") if isinstance(row, dict) else None
+        if isinstance(cwd, str) and cwd:
+            found.add(cwd)
+    return found
+
+
+def _retarget_rows(
+    transcript: str, *, cwd: str, new_session_id: str | None = None, rewrite_prefixes: tuple[str, ...] = ()
+) -> str:
+    """Rewrite every row's ``cwd`` (and, when ``new_session_id`` is given, its ``sessionId``).
+    When ``rewrite_prefixes`` is given, also repoint any absolute path under those prefixes (a
+    worktree the session previously ran in) to ``cwd`` — so a resumed agent edits the launch dir,
+    not the old worktree it sees throughout its history. Non-JSON lines, and rows nothing applies
+    to, are left byte-for-byte unchanged."""
+    prefixes = tuple(p for p in rewrite_prefixes if p)
     out: list[str] = []
     for line in transcript.split("\n"):
         stripped = line.strip()
@@ -417,14 +459,19 @@ def _retarget_rows(transcript: str, *, cwd: str, new_session_id: str | None = No
         except json.JSONDecodeError:
             out.append(line)
             continue
-        if isinstance(row, dict) and ("cwd" in row or (new_session_id and "sessionId" in row)):
-            if "cwd" in row:
-                row["cwd"] = cwd
-            if new_session_id and "sessionId" in row:
-                row["sessionId"] = new_session_id
-            out.append(json.dumps(row))
-        else:
+        if not isinstance(row, dict):
             out.append(line)
+            continue
+        rewritten = _rewrite_path_prefixes(row, prefixes, cwd) if prefixes else row
+        changed = rewritten != row
+        row = rewritten
+        if "cwd" in row and row.get("cwd") != cwd:
+            row["cwd"] = cwd
+            changed = True
+        if new_session_id and "sessionId" in row and row.get("sessionId") != new_session_id:
+            row["sessionId"] = new_session_id
+            changed = True
+        out.append(json.dumps(row) if changed else line)
     return "\n".join(out)
 
 
@@ -450,7 +497,13 @@ def retarget_session_cwd(repo: Path, session_id: str, cwd: str) -> bool:
         original = path.read_text(encoding="utf-8")
     except OSError:
         return False
-    retargeted = _retarget_rows(original, cwd=cwd)
+    # Old aGiTrack worktrees this conversation ran in: repoint not just the `cwd` field but every
+    # absolute path under them to the launch dir, so a resumed agent edits there rather than the
+    # old worktree it sees throughout its history (tool file_path args, command output, mentions).
+    # Scoped to our own ``.agitrack/worktrees/`` dirs so an imported session's unrelated absolute
+    # paths (which don't exist in this repo anyway) are left alone — only its cwd field is aligned.
+    worktree_prefixes = tuple(d for d in (_recorded_cwds(original) - {cwd}) if "/.agitrack/worktrees/" in d)
+    retargeted = _retarget_rows(original, cwd=cwd, rewrite_prefixes=worktree_prefixes)
     if retargeted == original:
         return False  # already at this cwd — leave the (possibly hardlinked) file alone
     try:

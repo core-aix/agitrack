@@ -79,6 +79,60 @@ def test_retarget_session_cwd_breaks_hardlink_to_other_copy(monkeypatch, tmp_pat
     assert (other_proj / "s.jsonl").read_text(encoding="utf-8") == '{"type":"user","cwd":"/old/worktree"}\n'
 
 
+def test_retarget_session_cwd_repoints_worktree_file_paths(monkeypatch, tmp_path):
+    # Regression (--no-worktree): retargeting must repoint not just the cwd field but every
+    # absolute path under the old WORKTREE — tool file_path args, command output, mentions — so a
+    # resumed agent edits the launch dir, not the worktree it sees throughout its history.
+    config = tmp_path / "config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    repo = tmp_path / "repo"
+    wt = repo / ".agitrack" / "worktrees" / "feature"
+    proj = config / "projects" / claude_session._encode_repo(repo)
+    proj.mkdir(parents=True)
+    rows = [
+        {"type": "user", "cwd": str(wt), "message": {"role": "user", "content": "edit it"}},
+        {
+            "type": "assistant",
+            "cwd": str(wt),
+            "message": {
+                "content": [
+                    {"type": "tool_use", "name": "Edit", "input": {"file_path": f"{wt}/app.py"}},
+                    {"type": "tool_use", "name": "Read", "input": {"file_path": f"{wt}/sub/b.py"}},
+                ]
+            },
+        },
+    ]
+    (proj / "s.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+
+    assert claude_session.retarget_session_cwd(repo, "s", str(repo)) is True
+    parsed = [json.loads(ln) for ln in (proj / "s.jsonl").read_text(encoding="utf-8").splitlines() if ln]
+    assert all(r.get("cwd") == str(repo) for r in parsed)  # cwd repointed to base
+    args = [b["input"]["file_path"] for b in parsed[1]["message"]["content"]]
+    # The tool file_path args (what actually drives edits/reads) point at the base repo now.
+    assert args == [f"{repo}/app.py", f"{repo}/sub/b.py"]
+
+
+def test_retarget_session_cwd_leaves_unrelated_absolute_paths(monkeypatch, tmp_path):
+    # An imported session whose old cwd is NOT an aGiTrack worktree: align its cwd field, but do
+    # NOT rewrite unrelated absolute paths in content (those files don't exist in this repo).
+    config = tmp_path / "config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    repo = tmp_path / "repo"
+    proj = config / "projects" / claude_session._encode_repo(repo)
+    proj.mkdir(parents=True)
+    row = {
+        "type": "assistant",
+        "cwd": "/some/other/checkout",
+        "message": {"content": [{"type": "text", "text": "saw /some/other/checkout/x.py"}]},
+    }
+    (proj / "s.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    assert claude_session.retarget_session_cwd(repo, "s", str(repo)) is True
+    parsed = json.loads((proj / "s.jsonl").read_text(encoding="utf-8").strip())
+    assert parsed["cwd"] == str(repo)  # cwd field aligned...
+    assert parsed["message"]["content"][0]["text"] == "saw /some/other/checkout/x.py"  # ...content left alone
+
+
 def test_session_cwd_since_ignores_stale_pre_launch_rows(monkeypatch, tmp_path):
     # #72: with `since`, only rows recorded at/after the current launch count, so
     # a stale cwd left by a resume/import doesn't read as drift.
