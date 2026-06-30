@@ -759,6 +759,7 @@ class GitRepo:
         check: bool = True,
         env: dict[str, str] | None = None,
         timeout: float | None = None,
+        allow_lazy_fetch: bool = True,
     ) -> subprocess.CompletedProcess[str]:
         # History reads silently truncate on a busy repo, two ways -- both because aGiTrack
         # commits every turn, which constantly fires background ``git gc --auto``:
@@ -780,13 +781,25 @@ class GitRepo:
         # the commit-graph makes git walk the store directly; disabling lazy fetch makes a walk
         # use the LOCAL objects (all present) instead of attempting a doomed network fetch. Both
         # are correct and negligibly slower at the sizes aGiTrack tracks. Lazy fetch is left ON
-        # for reads that need file CONTENT (``--numstat`` line counts, ``-p``/``--stat`` diffs):
-        # on a blobless clone those legitimately fetch absent blobs, so suppressing it would
-        # zero the numbers.
+        # for reads that need file CONTENT (``--numstat`` line counts, ``-p``/``--stat`` diffs)
+        # UNLESS the caller passes ``allow_lazy_fetch=False``: on a blobless clone such a read
+        # legitimately fetches absent blobs, so suppressing it would zero the numbers -- but the
+        # caller may *want* that. The dashboard's full-history numstat scan opts out, because
+        # fetching every historical blob on every poll makes a big blobless clone's dashboard
+        # hang for tens of seconds (and the interrupted fetches litter ``.git`` with tmp packs);
+        # it instead counts from the LOCAL blobs and fetches only the page actually displayed.
+        #
+        # Lazy fetch is suppressed via the GIT_NO_LAZY_FETCH=1 ENVIRONMENT VARIABLE, not the
+        # ``-c fetch.disableLazyFetch=true`` config: measured on git 2.50.1 (Apple), the config
+        # is NOT honoured for a ``git log --numstat`` walk (it still fetches every blob), whereas
+        # the env var reliably keeps the walk to local objects. The config is set too, as a
+        # harmless second line of defence on git builds where it does take effect.
+        extra_env: dict[str, str] = dict(env) if env else {}
         if len(command) >= 2 and command[0] == "git" and command[1] in ("log", "rev-list", "shortlog"):
             flags = ["-c", "core.commitGraph=false"]
-            if not _git_read_needs_blobs(command):
+            if not allow_lazy_fetch or not _git_read_needs_blobs(command):
                 flags += ["-c", "fetch.disableLazyFetch=true"]
+                extra_env["GIT_NO_LAZY_FETCH"] = "1"
             command = [command[0], *flags, *command[1:]]
         # A timeout bounds a network git call (fetch/push over bad internet): on
         # expiry subprocess.run kills the process and raises, which we surface as a
@@ -814,7 +827,7 @@ class GitRepo:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     check=False,
-                    env={**os.environ, **env} if env else None,
+                    env={**os.environ, **extra_env} if extra_env else None,
                     timeout=timeout,
                     **isolation,
                 )
@@ -830,7 +843,7 @@ class GitRepo:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
-            env={**os.environ, **env} if env else None,
+            env={**os.environ, **extra_env} if extra_env else None,
             **isolation,
         )
         if check and process.returncode != 0:

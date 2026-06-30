@@ -917,18 +917,61 @@ def _extract_user_prompts(body: str) -> list[str]:
 
 
 def _apply_numstat(repo: GitRepo, ref: str, by_sha: dict[str, CommitStat]) -> None:
-    # Merge commits (cover commits #58, integration merges) report no numstat
-    # by default, so a turn's lines are counted exactly once — on the commits
-    # that introduced them.
-    output = repo._run(["git", "log", "--numstat", "--format=%x01%H", ref], check=False).stdout
+    # Line counts for the WHOLE history, computed from the LOCAL blobs only
+    # (allow_lazy_fetch=False). On a blobless partial clone (`git clone --filter=blob:none`)
+    # diffing every commit would otherwise lazily fetch every historical blob from the
+    # promisor remote — tens of seconds per dashboard poll, and the interrupted fetches
+    # litter `.git/objects/pack` with `tmp_pack_*` files — so the dashboard appears to hang
+    # with no commits. Counting from local blobs keeps the poll instant; the commits the user
+    # is actually viewing get their exact counts via apply_numstat_for (which fetches just
+    # that page). Merge commits (cover commits #58, integration merges) report no numstat by
+    # default, so a turn's lines are counted exactly once — on the commits that introduced them.
+    output = repo._run(["git", "log", "--numstat", "--format=%x01%H", ref], check=False, allow_lazy_fetch=False).stdout
+    _accumulate_numstat(output, by_sha)
+
+
+def apply_numstat_for(repo: GitRepo, shas: list[str], by_sha: dict[str, CommitStat]) -> None:
+    """Recompute insertions/deletions for SPECIFIC commits, fetching only those commits'
+    blobs (allow_lazy_fetch stays on). This is how the dashboard gets exact line counts for
+    the log page it is about to show without pulling the rest of a blobless clone's history:
+    only what is displayed is fetched. A commit whose blobs still can't be reached (offline,
+    or an aGiTrack-only ref the remote doesn't have) keeps the local-blob count it already
+    had, rather than being zeroed."""
+    targets = {sha for sha in shas if sha and sha in by_sha}
+    if not targets:
+        return
+    # `--no-walk` shows exactly the named commits (each diffed against its parent for numstat)
+    # without traversing ancestry, so the fetch is bounded to this page.
+    output = repo._run(
+        ["git", "log", "--no-walk=unsorted", "--numstat", "--format=%x01%H", *sorted(targets)],
+        check=False,
+    ).stdout
+    fresh: dict[str, CommitStat] = {
+        sha: CommitStat(sha=sha, author="", email="", subject="", kind="") for sha in targets
+    }
+    seen = _accumulate_numstat(output, fresh)
+    for sha in seen:
+        by_sha[sha].insertions = fresh[sha].insertions
+        by_sha[sha].deletions = fresh[sha].deletions
+
+
+def _accumulate_numstat(output: str, by_sha: dict[str, CommitStat]) -> set[str]:
+    """Parse ``git log --numstat`` output, adding each commit's line counts onto its
+    :class:`CommitStat`. Returns the set of SHAs that had at least one numstat row (so a
+    caller can tell a genuinely-counted commit from one git emitted no diff for)."""
     current: CommitStat | None = None
+    current_sha = ""
+    seen: set[str] = set()
     for line in output.splitlines():
         if line.startswith(_FIELD_SEP):
-            current = by_sha.get(line[1:].strip())
+            current_sha = line[1:].strip()
+            current = by_sha.get(current_sha)
             continue
         match = _NUMSTAT_RE.match(line)
         if match and current is not None:
+            seen.add(current_sha)
             if match.group(1) != "-":
                 current.insertions += int(match.group(1))
             if match.group(2) != "-":
                 current.deletions += int(match.group(2))
+    return seen
