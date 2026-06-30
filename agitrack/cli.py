@@ -451,19 +451,18 @@ def main(argv: list[str] | None = None) -> int:
     if not scripted and sys.stdin.isatty() and sys.stdout.isatty():
         _check_for_update_at_startup(config)
 
-    # First-run backend setup. Skipped for the MSI bundle (the installer handles it); a
-    # pip/source install does it here, on any OS. Only when at least one backend is missing —
-    # if both are already installed there's nothing to prompt about. select_default_backend
-    # lists statuses and offers to install the missing one(s).
-    from agitrack.backends.setup import backend_installed
-
-    some_backend_missing = not all(backend_installed(name) for name in available_backends())
+    # First-run backend setup. Runs whenever no default backend is configured (and one wasn't
+    # passed via --backend) so the user always chooses one before launch — NOT gated on a
+    # backend being missing: with both already installed but no default saved, skipping this
+    # used to drop straight to the "No coding agent backend is configured" error every launch.
+    # Skipped for the MSI bundle (the installer handles it) and for scripted/non-TTY runs (no
+    # way to answer). select_default_backend lists statuses, offers to install any missing
+    # ones, asks which to use as the default, and explains how to change it later.
     if (
         args.backend is None
         and not config.has_default_backend()
         and not scripted
         and not _installed_via_msi()
-        and some_backend_missing
         and sys.stdin.isatty()
         and sys.stdout.isatty()
     ):
@@ -748,6 +747,18 @@ def _check_for_update_at_startup(config: GlobalConfig) -> None:
         print(f"aGiTrack will keep running the current version. To update it, {updater.manual_update_instructions()}")
         return
     config.pending_manual_update = None  # a successful update clears any prior reminder
+    # Windows MSI build: apply() only DOWNLOADED the installer (it replaces the running
+    # agitrack.exe, so it can't install in place). Hand off to the elevated installer, which
+    # installs after we exit and relaunches the updated build; quit so that can proceed. Without
+    # this the startup path would just re-exec the current version and re-offer the update every
+    # launch (an endless "update available" loop that never installs).
+    if getattr(updater, "pending_msi_path", None):
+        if updater.launch_msi_bootstrapper():
+            print(f"{result.message} aGiTrack will reinstall and reopen automatically.")
+            sys.exit(0)
+        config.pending_manual_update = status.latest or status.current or "available"
+        print(f"Could not start the aGiTrack installer. To update it, {updater.manual_update_instructions()}")
+        return
     # Windows package installs can't replace the running agitrack.exe in place (the OS locks
     # it), so apply() defers the pip upgrade to a helper that runs after we exit. Spawn it and
     # quit so the upgrade can proceed; the helper relaunches aGiTrack itself when it's done.

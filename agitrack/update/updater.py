@@ -709,6 +709,93 @@ class Updater:
         status.message = f"Downloaded aGiTrack {status.latest}.".strip()
         return status
 
+    def msi_last_args_path(self) -> str | None:
+        """Per-user file (no UAC, survives reboots) recording this launch's argv so the MSI
+        relauncher can restart with the same flags. ``None`` when LOCALAPPDATA is unset."""
+        local = os.environ.get("LOCALAPPDATA")
+        if not local:
+            return None
+        return os.path.join(local, "aGiTrack", "last-args.txt")
+
+    def launch_msi_bootstrapper(self, extra_args: Sequence[str] = ()) -> bool:
+        """Windows MSI build only. Hand the MSI downloaded by :meth:`_apply_msi`
+        (:attr:`pending_msi_path`) off to the elevated installer and arrange a de-elevated
+        relaunch — the running ``agitrack.exe`` is the very file the MSI replaces, so the
+        install must happen AFTER this process exits. Shared by the startup path and the
+        runner's in-session teardown so both install MSI updates the same way.
+
+        Two cooperating processes keep the updated aGiTrack at the user's NORMAL integrity
+        level (not the installer's admin token): an elevated bootstrapper
+        (``agitrack-update.cmd`` via UAC ``runas``) waits for this PID, runs ``msiexec``, and
+        writes its exit code to a marker file; a non-elevated relauncher (spawned here) waits
+        for that marker and, on success, starts the freshly installed ``agitrack.exe`` with the
+        recorded args (this launch's argv plus ``extra_args``, e.g. ``--skip-privacy-ack``).
+
+        Returns True when the elevated install was started (the caller MUST exit), False when
+        it couldn't be (e.g. UAC declined) so the caller keeps running the current version."""
+        from agitrack.proc import detach_kwargs, shell_execute_runas
+
+        msi = self.pending_msi_path
+        if not msi or sys.platform != "win32":
+            return False
+        install_dir = self.msi_install_dir()
+        bootstrapper = os.path.join(install_dir, "agitrack-update.cmd")
+        exe = os.path.join(install_dir, "agitrack.exe")
+        # Record argv (+ extra_args, de-duplicated) so the relauncher restarts with the same
+        # flags. last_args stays the PATH: on a write failure the relauncher falls back to
+        # whatever is already there (e.g. a launch-time write), or to no args.
+        last_args = self.msi_last_args_path() or ""
+        if last_args:
+            args = list(sys.argv[1:])
+            for arg in extra_args:
+                if arg not in args:
+                    args.append(arg)
+            try:
+                os.makedirs(os.path.dirname(last_args), exist_ok=True)
+                with open(last_args, "w", encoding="utf-8") as handle:
+                    handle.write(subprocess.list2cmdline(args))
+            except OSError:
+                pass
+        local = os.environ.get("LOCALAPPDATA", install_dir)
+        marker = os.path.join(local, "aGiTrack", "update-result.txt")
+        try:
+            os.makedirs(os.path.dirname(marker), exist_ok=True)
+        except OSError:
+            pass
+        # Clear any stale marker so the relauncher only acts on THIS install's result.
+        try:
+            os.remove(marker)
+        except OSError:
+            pass
+        # Elevated install: wait for our PID, run msiexec, write the result code to the marker.
+        # cmd /c quoting rule: wrap the whole command line in one extra pair of quotes when any
+        # token is quoted, so the leading "" is stripped and the inner quotes survive.
+        inner = f'"{bootstrapper}" "{msi}" {os.getpid()} "{marker}"'
+        try:
+            shell_execute_runas("cmd.exe", f'/c "{inner}"')
+        except Exception:  # UAC declined or launch failed: keep the current version
+            return False
+        # Non-elevated relauncher: wait for the marker, then start the new build de-elevated.
+        relauncher = (
+            "$ErrorActionPreference='SilentlyContinue';"
+            f"$m={_ps_single_quote(marker)};$exe={_ps_single_quote(exe)};$af={_ps_single_quote(last_args)};"
+            "$deadline=(Get-Date).AddMinutes(10);"
+            "while(-not (Test-Path $m) -and (Get-Date) -lt $deadline){Start-Sleep -Seconds 1};"
+            "if(-not (Test-Path $m)){exit};"
+            "$rc=((Get-Content $m -TotalCount 1) -join '').Trim();"
+            "if($rc -ne '0'){exit};"
+            "$a='';if(Test-Path $af){$a=((Get-Content $af -TotalCount 1) -join '').Trim()};"
+            "if($a){Start-Process -FilePath $exe -ArgumentList $a}else{Start-Process -FilePath $exe}"
+        )
+        try:
+            subprocess.Popen(
+                ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", relauncher],
+                **detach_kwargs(),
+            )
+        except OSError:
+            pass  # the install still proceeds; the user just restarts aGiTrack manually
+        return True
+
     def _pip_invocation(self) -> list[str] | None:
         """The command prefix for a pip call, or ``None`` when no pip is reachable.
 
