@@ -230,8 +230,9 @@ class NtHostTerminal:
                 self._resize_pending.set()
 
 
-def _resolve_windows_command(command: list[str]) -> tuple[str, list[str]]:
-    """Turn a logical ``[exe, *args]`` into the ``(appname, args)`` ConPTY needs.
+def _resolve_windows_command(command: list[str]) -> tuple[str, str]:
+    """Turn a logical ``[exe, *args]`` into the ``(appname, cmdline)`` ConPTY needs, where
+    ``cmdline`` is the already-quoted command-LINE string (not an arg list).
 
     ConPTY's ``CreateProcess`` does NOT search ``PATH``/``PATHEXT`` for the application
     name and cannot run a batch script directly — but Windows backends are routinely on
@@ -253,8 +254,13 @@ def _resolve_windows_command(command: list[str]) -> tuple[str, list[str]]:
     rest = command[1:]
     if exe.lower().endswith((".cmd", ".bat")):
         comspec = os.environ.get("COMSPEC", "cmd.exe")
-        return comspec, ["/c", exe, *rest]
-    return exe, rest
+        # cmd.exe strips ONE layer of quotes from the text after /c, so wrap the whole inner
+        # command in an EXTRA pair — otherwise a .cmd shim under a spaced path (e.g. a npm shim
+        # under C:\Users\First Last\…) or a spaced arg is split at the space. Mirrors
+        # proc.resolve_subprocess_command. Returns the command-LINE string ConPTY needs.
+        inner = subprocess.list2cmdline([exe, *rest])
+        return comspec, f'/c "{inner}"'
+    return exe, subprocess.list2cmdline(rest)
 
 
 def _env_block(extra_env: dict[str, str] | None) -> str | None:
@@ -299,8 +305,7 @@ class NtChildProcess:
 
         rows, cols = 24, 80
         pty = ConPTY(cols, rows)
-        appname, args = _resolve_windows_command(command)
-        cmdline = subprocess.list2cmdline(args) if args else ""
+        appname, cmdline = _resolve_windows_command(command)
         pty.spawn(appname, cmdline=cmdline, cwd=cwd, env=_env_block(extra_env))
         return cls(pty, pty.pid)
 

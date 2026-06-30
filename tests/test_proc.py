@@ -111,14 +111,30 @@ def test_resolve_subprocess_command_empty_is_unchanged(monkeypatch):
 
 def test_resolve_subprocess_command_windows_wraps_cmd_shim(monkeypatch):
     # npm installs `claude.cmd`; CreateProcess can't run a batch file, so it must go through
-    # cmd.exe /c — otherwise summarization raised FileNotFoundError on Windows.
+    # cmd.exe /c — otherwise summarization raised FileNotFoundError on Windows. The .cmd case
+    # returns a fully-quoted command-LINE string (subprocess.run accepts it on Windows).
     monkeypatch.setattr(proc, "_IS_WINDOWS", True)
     monkeypatch.setattr(proc.shutil, "which", lambda name: r"C:\Users\me\AppData\npm\claude.cmd")
     cmd = proc.resolve_subprocess_command(["claude", "-p", "summarize this"])
-    assert cmd[0].lower().endswith("cmd.exe")
-    assert cmd[1] == "/c"
+    assert isinstance(cmd, str)
+    assert "cmd.exe" in cmd.lower() and "/c" in cmd
     assert r"C:\Users\me\AppData\npm\claude.cmd" in cmd
-    assert cmd[-1] == "summarize this"  # args preserved after the shim
+    assert "summarize this" in cmd  # args preserved after the shim
+
+
+def test_resolve_subprocess_command_windows_cmd_shim_under_spaced_path(monkeypatch):
+    # The reported failure: a .cmd shim under a path with a space (e.g. a Windows username
+    # "First Last") plus a spaced argument. The shim path and the arg are each quoted, and the
+    # whole inner command is wrapped in an extra quote pair so cmd.exe's /c strip leaves them
+    # intact (verified empirically — without this cmd splits the path at the space).
+    monkeypatch.setattr(proc, "_IS_WINDOWS", True)
+    spaced = r"C:\Users\First Last\AppData\Roaming\npm\claude.cmd"
+    monkeypatch.setattr(proc.shutil, "which", lambda name: spaced)
+    cmd = proc.resolve_subprocess_command(["claude", "--append-system-prompt", "a note with spaces"])
+    assert isinstance(cmd, str)
+    assert cmd.startswith('"') and cmd.endswith('"')  # protective outer quotes
+    assert f'"{spaced}"' in cmd  # the spaced shim path is quoted
+    assert '"a note with spaces"' in cmd  # the spaced arg is quoted
 
 
 def test_resolve_subprocess_command_windows_exe_no_shell(monkeypatch):

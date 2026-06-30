@@ -176,7 +176,9 @@ def _install_plan(name: str, info: dict, npm: str | None, which: Callable[[str],
     """Ordered (description, command) install attempts for the current OS. POSIX prefers the
     backend's self-contained official installer (no Node needed); npm is the cross-platform
     fallback, and the only route on Windows."""
-    plan: list[tuple[str, list[str]]] = []
+    # The command is either an arg list or, for a Windows .cmd shim (npm.cmd), a fully-quoted
+    # command-LINE string from resolve_subprocess_command — subprocess.run accepts both.
+    plan: list[tuple[str, list[str] | str]] = []
     if os.name != "nt" and which("bash") and which("curl"):
         plan.append((info["unix"], ["bash", "-lc", info["unix"]]))
     if npm:
