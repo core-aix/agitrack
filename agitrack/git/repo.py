@@ -25,6 +25,17 @@ def _is_scaffolding(path: str) -> bool:
     return path.startswith(_NEVER_STAGE_PREFIXES)
 
 
+# git ``log`` flags that emit file CONTENT (line counts / diffs), so the walk needs blob
+# objects -- which a blobless partial clone fetches lazily. A pickaxe (``-S``/``-G``) may be
+# spelled glued to its term (``-Sneedle``), so those are matched by prefix.
+_BLOB_CONTENT_FLAGS = frozenset({"--numstat", "--stat", "--shortstat", "-p", "--patch", "--patch-with-stat"})
+
+
+def _git_read_needs_blobs(command: list[str]) -> bool:
+    """Whether a ``git log``/``rev-list`` reads file content (needs blob objects)."""
+    return any(a in _BLOB_CONTENT_FLAGS or a.startswith(("--stat=", "-S", "-G")) for a in command)
+
+
 class GitRepo:
     def __init__(self, repo: Path) -> None:
         self.repo = repo.resolve()
@@ -749,21 +760,34 @@ class GitRepo:
         env: dict[str, str] | None = None,
         timeout: float | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        # A stale or corrupt commit-graph silently breaks history reads. git writes a
-        # commit-graph during background ``git gc --auto`` (which a busy repo triggers
-        # often -- aGiTrack commits every turn); if a later repack moves the objects it
-        # indexes, the graph's position-based lookups no longer match the store and
-        # traversal aborts mid-walk with a NON-ZERO exit -- "commit <sha> exists in
-        # commit-graph but not in the object database" -- even though the object is
-        # present. Every read path passes check=False, so that aborted output (often
-        # truncated or empty) is used as-is: the dashboard then shows NO commits, but
-        # only on exactly the active repos that gc enough to stale their graph (small or
-        # idle repos never hit it). Disabling the commit-graph for read-only traversals
-        # makes git walk the object store directly -- always correct, and negligibly
-        # slower at the history sizes aGiTrack tracks. The graph still accelerates git's
-        # own internal operations; we only opt these specific reads out of trusting it.
+        # History reads silently truncate on a busy repo, two ways -- both because aGiTrack
+        # commits every turn, which constantly fires background ``git gc --auto``:
+        #
+        #  1. STALE COMMIT-GRAPH. gc writes a commit-graph; a later repack moves the objects
+        #     it indexes, so the graph's position lookups no longer match the store and a walk
+        #     aborts NON-ZERO -- "commit <sha> exists in commit-graph but not in the object
+        #     database" -- though the object is present.
+        #  2. LAZY (PROMISOR) FETCH on a partial/blobless clone (``git clone --filter=blob:none``).
+        #     When a walk momentarily can't find an object locally -- e.g. mid-repack, when the
+        #     pack set is being rewritten -- git tries to LAZY-FETCH it from the promisor remote.
+        #     For aGiTrack's own local-only commits (turn branches, cover/shared-session objects)
+        #     the remote answers "not our ref" and the read aborts ("Could not read <oid>;
+        #     Failed to traverse parents"), even though the object is in the local store. The
+        #     count then flaps (e.g. 485 one read, 289 the next) and the dashboard shows a
+        #     truncated -- or empty -- log. Small/idle repos never gc enough to hit either.
+        #
+        # Every read passes check=False, so the aborted/partial output is used as-is. Disabling
+        # the commit-graph makes git walk the store directly; disabling lazy fetch makes a walk
+        # use the LOCAL objects (all present) instead of attempting a doomed network fetch. Both
+        # are correct and negligibly slower at the sizes aGiTrack tracks. Lazy fetch is left ON
+        # for reads that need file CONTENT (``--numstat`` line counts, ``-p``/``--stat`` diffs):
+        # on a blobless clone those legitimately fetch absent blobs, so suppressing it would
+        # zero the numbers.
         if len(command) >= 2 and command[0] == "git" and command[1] in ("log", "rev-list", "shortlog"):
-            command = [command[0], "-c", "core.commitGraph=false", *command[1:]]
+            flags = ["-c", "core.commitGraph=false"]
+            if not _git_read_needs_blobs(command):
+                flags += ["-c", "fetch.disableLazyFetch=true"]
+            command = [command[0], *flags, *command[1:]]
         # A timeout bounds a network git call (fetch/push over bad internet): on
         # expiry subprocess.run kills the process and raises, which we surface as a
         # non-zero result so the caller treats it as a plain failure (e.g. offline).
