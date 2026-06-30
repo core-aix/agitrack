@@ -242,7 +242,7 @@ class Updater:
     def _remote_target(self, repo: Path) -> str | None:
         # The remote-tracking ref to compare/merge against. Prefer the current
         # branch's configured upstream; when the branch has none — aGiTrack commonly
-        # runs on a session worktree branch (``agit/...``) that tracks nothing —
+        # runs on a session worktree branch (``agitrack/...``) that tracks nothing —
         # fall back to the default branch of ``origin`` so the source still
         # follows upstream aGiTrack releases. Returns None only when neither exists.
         upstream = self._upstream_ref(repo)

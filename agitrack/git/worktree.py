@@ -20,18 +20,14 @@ def _rsync_path() -> str | None:
 
 
 # All aGiTrack-managed branches live under this prefix so they can be recognised
-# (for cleanup / stale recovery) and never collide with the user's branches. The
-# legacy `agit/` prefix (pre-rename) is still recognised so in-flight sessions
-# created by an older aGiT continue to integrate and clean up.
+# (for cleanup / stale recovery) and never collide with the user's branches.
 BRANCH_PREFIX = "agitrack/"
-LEGACY_BRANCH_PREFIX = "agit/"
-BRANCH_PREFIXES = (BRANCH_PREFIX, LEGACY_BRANCH_PREFIX)
 WORKTREES_DIRNAME = "worktrees"
 
 
 def is_managed_branch(branch: str) -> bool:
-    """True for an aGiTrack-managed turn branch (current or legacy prefix)."""
-    return branch.startswith(BRANCH_PREFIXES)
+    """True for an aGiTrack-managed turn branch."""
+    return branch.startswith(BRANCH_PREFIX)
 
 
 @dataclass
@@ -49,7 +45,7 @@ def _sanitize_name(name: str) -> str:
 class WorktreeManager:
     """Creates and tracks aGiTrack session worktrees under ``.agitrack/worktrees`` of the
     main working tree. A worktree is created detached at the base; per-turn
-    branches ``agit/<backend>/<name>/tN`` are created lazily on the first commit,
+    branches ``agitrack/<backend>/<name>/tN`` are created lazily on the first commit,
     so an unused session never leaves a branch behind."""
 
     def __init__(self, main_repo: GitRepo) -> None:
@@ -232,8 +228,8 @@ class WorktreeManager:
             # its branch never drift out of sync (the user can retry the removal).
             return
         # Directory is gone: delete this session's turn branches under any backend
-        # (agit/<backend>/<name>/tN, and legacy agit/<name>/tN). The session name
-        # is the second-to-last path segment in both layouts.
+        # (agitrack/<backend>/<name>/tN). The session name is the second-to-last path
+        # segment.
         sanitized = _sanitize_name(name)
         for branch in self.main_repo.list_branches(BRANCH_PREFIX):
             parts = branch.split("/")

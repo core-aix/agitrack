@@ -157,11 +157,11 @@ def test_source_check_errors_without_upstream(tmp_path: Path):
 
 
 def test_source_check_detects_update_on_branch_without_upstream(source_clone):
-    # aGiTrack usually runs on a session worktree branch (`agit/...`) that tracks no
+    # aGiTrack usually runs on a session worktree branch (`agitrack/...`) that tracks no
     # upstream of its own. The check must still find updates by comparing against
     # origin's default branch, not silently report "up to date".
     remote, clone = source_clone
-    _git(["checkout", "-q", "-b", "agit/session-1"], clone)  # branch with no upstream
+    _git(["checkout", "-q", "-b", "agitrack/session-1"], clone)  # branch with no upstream
     _commit(remote, "agit.py", "v2\n", "second")  # origin's default branch advances
     status = Updater(source_repo=clone).check()
     assert status.ok
@@ -173,7 +173,7 @@ def test_source_apply_merges_default_branch_without_upstream(source_clone):
     # The same no-upstream branch must actually update by merging origin's default
     # branch when the user applies the update.
     remote, clone = source_clone
-    _git(["checkout", "-q", "-b", "agit/session-1"], clone)
+    _git(["checkout", "-q", "-b", "agitrack/session-1"], clone)
     _commit(remote, "agit.py", "v2\n", "second")
     result = Updater(source_repo=clone).apply()
     assert result.ok, result.error

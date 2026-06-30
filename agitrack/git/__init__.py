@@ -6,8 +6,6 @@ from agitrack.git.lock import RepoLock, already_running_message
 from agitrack.git.repo import GitError, GitRepo
 from agitrack.git.worktree import (
     BRANCH_PREFIX,
-    BRANCH_PREFIXES,
-    LEGACY_BRANCH_PREFIX,
     WORKTREES_DIRNAME,
     WorktreeInfo,
     WorktreeManager,
@@ -21,8 +19,6 @@ __all__ = [
     "WorktreeInfo",
     "WorktreeManager",
     "BRANCH_PREFIX",
-    "BRANCH_PREFIXES",
-    "LEGACY_BRANCH_PREFIX",
     "WORKTREES_DIRNAME",
     "is_managed_branch",
     "_sanitize_name",

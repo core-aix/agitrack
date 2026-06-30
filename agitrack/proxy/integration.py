@@ -511,7 +511,7 @@ class IntegrationService:
         return True
 
     def delete_orphan_merged_branches(self) -> list[str]:
-        """Remove agit/* branches that no worktree checks out and are in the
+        """Remove agitrack/* branches that no worktree checks out and are in the
         base. Returns the deleted branch names so the caller can log each one
         (matching the old per-branch debug line)."""
         deleted: list[str] = []
@@ -552,7 +552,7 @@ class IntegrationService:
     # ------------------------------------------------------------------
 
     def base_switch_candidates(self) -> list[str]:
-        """Return user branches the base could switch to (never agit/ branches)."""
+        """Return user branches the base could switch to (never agitrack/ branches)."""
         try:
             branches = self.base_repo.list_branches()
         except Exception:
