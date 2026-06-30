@@ -1201,7 +1201,11 @@ def test_offer_copy_on_exit_respects_mute_unless_new_file(tmp_path):
     # the mute is respected. A genuinely new file re-opens the whole set.
     runner, base, wt, _ = _copy_runner(tmp_path, "?? a.txt\n")
     (wt / "a.txt").write_text("x\n")
-    runner._copy_declined = {"a.txt"}  # already muted by a prior in-session decline
+    # Already muted by a prior in-session decline. A real decline records BOTH the mute and the
+    # decision set it applies to (collect pins _copy_decision_set before present mutes), so the
+    # same set stays muted; a different set resets everything.
+    runner._copy_declined = {"a.txt"}
+    runner._copy_decision_set = {"a.txt"}
     seen: list[str] = []
     runner._select_popup = lambda title, options, **k: seen.append(title) or "Yes, copy to the base repo"
 

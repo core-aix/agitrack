@@ -746,6 +746,11 @@ class ProxyRunner:
         self._base_edits_declined_status: str | None = None  # base status the user declined to commit
         self._popup_exit_pending = False  # a popup Ctrl-C exit flow is running
         self._popup_exit_force = False  # second Ctrl-C inside the exit confirmation
+        # True only while an EXIT-CONFIRMATION popup is open (the "Exit aGiTrack?" / terminate-
+        # background-sessions dialogs). It is the ONLY popup where Ctrl-C may confirm/force the
+        # exit. In every other popup — including the keep/delete-worktree and copy-back prompts
+        # shown DURING the exit finalize — Ctrl-C must not exit aGiTrack directly (see _run_modal).
+        self._exit_confirmation_active = False
         self._reap_pids: list[int] = []  # signalled backends awaiting their waitpid
         self._idle_integrate_at = 0.0  # throttle for integrating agent-made commits
         self._attach_uncovered_until = 0.0  # deadline for attaching traces to backend-made commits (#35)
@@ -796,6 +801,17 @@ class ProxyRunner:
         # re-asked even as its contents change. A genuinely new path un-mutes the whole
         # set (ask about all again); cleared on session switch and aGiTrack restart.
         self._copy_declined: set[str] = set()
+        # Remembered copy-back decisions, kept while the candidate file SET is stable and reset
+        # when it changes (a path added/removed) or aGiTrack restarts (these are in-memory only):
+        #   _copy_always      — the user chose to copy this set, so later offers copy without
+        #                       re-asking (the "always copy" half; "always NOT copy" is _copy_declined).
+        #   _overwrite_always — the user chose "always overwrite", so a conflict (a file that already
+        #                       exists in the base) is overwritten without the per-set overwrite prompt.
+        #   _copy_decision_set — the candidate set the two flags above were decided for; a different
+        #                       set clears them so the user confirms again.
+        self._copy_always: bool = False
+        self._overwrite_always: bool = False
+        self._copy_decision_set: set[str] = set()
         # A turn's copy offer, collected on the git worker (the worktree read) and handed to
         # the main thread to PRESENT — so the worker never blocks on the popup and keeps the
         # commit/summary/merge pipeline flowing while the user decides. `(context, collected)`.
@@ -1100,6 +1116,7 @@ class ProxyRunner:
                 "_base_edits_declined_status": None,
                 "_popup_exit_pending": False,
                 "_popup_exit_force": False,
+                "_exit_confirmation_active": False,
                 "_reap_pids": [],
                 "_idle_integrate_at": 0.0,
                 "_attach_uncovered_until": 0.0,
@@ -1119,6 +1136,9 @@ class ProxyRunner:
                 "_worktree_sessions_cache": None,
                 "_copy_prompted": {},
                 "_copy_declined": set(),
+                "_copy_always": False,
+                "_overwrite_always": False,
+                "_copy_decision_set": set(),
                 "_pending_copy_offer": None,
                 "_pending_env_refresh": [],
                 "_pending_env_copy": [],
@@ -6051,7 +6071,12 @@ class ProxyRunner:
             # session we just landed on gets offered its own worktree-only files (background
             # sessions are never interrupted mid-run; this is where we catch up). Only when
             # it's idle — a session still mid-turn gets offered by the turn path once it settles.
+            # The remembered copy/overwrite decisions are reset too: a different session has a
+            # different worktree and file set, so its copy-back must be confirmed afresh.
             self._copy_declined = set()
+            self._copy_always = False
+            self._overwrite_always = False
+            self._copy_decision_set = set()
             if not self._agent_is_active():
                 # Defer this session's user-commit / copy offer until its latest agent turn has
                 # been reconciled (parsed + committed) in the BACKGROUND — otherwise the agent's
@@ -8680,6 +8705,19 @@ class ProxyRunner:
                     self._exit_aborted = True
                 return None
             if action == "exit":
+                if self._popup_exit_pending and not self._exit_confirmation_active:
+                    # Ctrl-C inside a popup shown DURING the exit/finalize sequence that is NOT the
+                    # exit-confirmation dialog — the keep/delete-worktree prompt or the copy-back
+                    # offer. Only the exit-confirmation dialog may exit on Ctrl-C; here it must
+                    # never exit aGiTrack directly. Treat it like Esc: cancel this popup, which
+                    # (during finalize) aborts the whole exit so nothing is deleted and aGiTrack
+                    # stays running. The user can press Ctrl-C again at the agent to re-open the
+                    # exit confirmation.
+                    self._clear_message()
+                    self._render_pending = True
+                    if self._finalized_on_exit:
+                        self._exit_aborted = True
+                    return None
                 if self._run_exit_flow():
                     return None
                 # Exit declined: redraw the modal and keep listening.
@@ -9304,11 +9342,22 @@ class ProxyRunner:
             return True
         return False
 
+    def _exit_confirmation_popup(self, title: str, options: list[str]) -> str | None:
+        """A `_select_popup` marked as THE exit-confirmation dialog — the one and only popup
+        where Ctrl-C is allowed to confirm/force the exit (the double-Ctrl-C fast path). Every
+        other popup, including the keep/delete-worktree and copy-back prompts shown during the
+        exit finalize, treats Ctrl-C as a cancel and never exits aGiTrack directly."""
+        self._exit_confirmation_active = True
+        try:
+            return self._select_popup(title, options)
+        finally:
+            self._exit_confirmation_active = False
+
     def _confirm_exit(self) -> bool:
         # "(Ctrl-C again)" hints that a second Ctrl-C confirms the exit (the
         # double-Ctrl-C fast path in _run_exit_flow), matching the keystroke that
         # opened this prompt.
-        choice = self._select_popup("Exit aGiTrack?", ["No, keep working", "Yes, exit (Ctrl-C again)"])
+        choice = self._exit_confirmation_popup("Exit aGiTrack?", ["No, keep working", "Yes, exit (Ctrl-C again)"])
         return choice == "Yes, exit (Ctrl-C again)"
 
     def _run_exit_flow(self) -> bool:
@@ -9389,7 +9438,7 @@ class ProxyRunner:
             return True
         listing = ", ".join(f"'{name}'" for name in names)
         lead = "background sessions are" if len(names) > 1 else "A background session is"
-        choice = self._select_popup(
+        choice = self._exit_confirmation_popup(
             f"{lead} still running ({listing}). Exiting now terminates them and may lose in-progress work.",
             ["No, keep working", "Yes, terminate them and exit"],
         )
@@ -10551,9 +10600,15 @@ class ProxyRunner:
         if not candidates:
             return None
         current = set(candidates)
-        # A genuinely new path (one we haven't muted) re-opens the whole set: drop the
-        # decline mute and the per-file fingerprint memory so "all files" means all again.
-        if self._copy_declined and (current - self._copy_declined):
+        # Remembered copy-back decisions are kept only while the candidate SET is stable. Any
+        # change to the set (a path added OR removed) resets them so the user confirms again:
+        # the "always copy" / "always overwrite" flags, the decline mute, and the per-file
+        # fingerprint memory all clear, so "all files" means all again. (They also reset on
+        # restart, being in-memory only.)
+        if current != self._copy_decision_set:
+            self._copy_decision_set = set(current)
+            self._copy_always = False
+            self._overwrite_always = False
             self._copy_declined.clear()
             self._copy_prompted.clear()
         # Files copied INTO this worktree FROM the base must not be offered to be copied BACK —
@@ -10632,7 +10687,13 @@ class ProxyRunner:
                 f"\nFile(s):"
             )
             options = ["No, leave them in the worktree", "Yes, copy to the base repo"]
-        choice = self._select_popup(title, options, detail=rels)
+        if self._copy_always:
+            # The user already chose to copy this set, so don't re-ask — copy without a prompt.
+            # (Kept until the candidate set changes or aGiTrack restarts. The overwrite of any
+            # base file is still its own decision below, unless "always overwrite" was chosen.)
+            choice: str | None = options[-1]  # the "Yes, copy…" option
+        else:
+            choice = self._select_popup(title, options, detail=rels)
         if on_exit and choice is None:
             # Esc on the exit offer cancels the exit entirely (handled by the caller) so the
             # user can copy/move the files themselves — nothing is discarded or removed. Forget
@@ -10654,18 +10715,33 @@ class ProxyRunner:
                 self._copy_declined |= current  # mute the whole set until it changes / switch
                 self._notice_files_remain(wt_dir, rels)
             return
-        # Files that would overwrite something already in the base are handled in one
-        # up-front choice: overwrite them all, keep them all (the new files still copy),
-        # or confirm each one individually.
+        # The user chose to copy: remember it for this set so later offers (same set, even as
+        # the contents change) copy without re-asking — kept until the set changes / restart.
+        self._copy_always = True
+        # Files that would overwrite something already in the base are handled in one up-front
+        # choice: overwrite them all, keep them all (the new files still copy), confirm each one,
+        # or "always overwrite" — which also remembers the choice so later offers for this set
+        # overwrite without re-asking (until the set changes / restart). A prior "always
+        # overwrite" skips this prompt entirely.
         conflicts = [rel for rel in rels if (base_dir / rel).exists()]
         overwrite_mode = "all"  # no conflicts → moot
-        if conflicts:
+        if conflicts and self._overwrite_always:
+            overwrite_mode = "all"  # remembered "always overwrite" — don't ask again
+        elif conflicts:
             answer = self._select_popup(
                 f"{len(conflicts)} of these already exist in the base repo. Overwrite them?",
-                ["No, keep the base versions", "Yes, overwrite all", "Let me confirm each one"],
+                [
+                    "No, keep the base versions",
+                    "Yes, overwrite all",
+                    "Yes, always overwrite (don't ask again)",
+                    "Let me confirm each one",
+                ],
                 detail=conflicts,
             )
-            if answer == "Yes, overwrite all":
+            if answer == "Yes, always overwrite (don't ask again)":
+                overwrite_mode = "all"
+                self._overwrite_always = True
+            elif answer == "Yes, overwrite all":
                 overwrite_mode = "all"
             elif answer == "Let me confirm each one":
                 overwrite_mode = "each"
