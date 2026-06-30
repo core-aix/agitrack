@@ -25,6 +25,17 @@ def _is_scaffolding(path: str) -> bool:
     return path.startswith(_NEVER_STAGE_PREFIXES)
 
 
+# git ``log`` flags that emit file CONTENT (line counts / diffs), so the walk needs blob
+# objects -- which a blobless partial clone fetches lazily. A pickaxe (``-S``/``-G``) may be
+# spelled glued to its term (``-Sneedle``), so those are matched by prefix.
+_BLOB_CONTENT_FLAGS = frozenset({"--numstat", "--stat", "--shortstat", "-p", "--patch", "--patch-with-stat"})
+
+
+def _git_read_needs_blobs(command: list[str]) -> bool:
+    """Whether a ``git log``/``rev-list`` reads file content (needs blob objects)."""
+    return any(a in _BLOB_CONTENT_FLAGS or a.startswith(("--stat=", "-S", "-G")) for a in command)
+
+
 class GitRepo:
     def __init__(self, repo: Path) -> None:
         self.repo = repo.resolve()
@@ -430,7 +441,7 @@ class GitRepo:
         return entries
 
     # --- low-level object/ref plumbing (shared-session storage, issue #55) ------
-    # These build and move a custom ref (refs/agit/shared-sessions) entirely in
+    # These build and move a custom ref (refs/agitrack/shared-sessions) entirely in
     # the object database, never touching the working tree or the real index.
 
     def ref_exists(self, ref: str) -> bool:
@@ -504,7 +515,7 @@ class GitRepo:
         timeout: float | None = None,
         cancel: "threading.Event | None" = None,
     ) -> bool:
-        """Fetch a single refspec (e.g. ``+refs/agit/x:refs/agit/x``). Returns
+        """Fetch a single refspec (e.g. ``+refs/agitrack/x:refs/agitrack/x``). Returns
         True on success; False on any failure (offline, no such ref yet, …).
 
         With ``filter_blobs`` (e.g. ``blob:limit=16k``) the fetch skips large blobs
@@ -748,7 +759,48 @@ class GitRepo:
         check: bool = True,
         env: dict[str, str] | None = None,
         timeout: float | None = None,
+        allow_lazy_fetch: bool = True,
     ) -> subprocess.CompletedProcess[str]:
+        # History reads silently truncate on a busy repo, two ways -- both because aGiTrack
+        # commits every turn, which constantly fires background ``git gc --auto``:
+        #
+        #  1. STALE COMMIT-GRAPH. gc writes a commit-graph; a later repack moves the objects
+        #     it indexes, so the graph's position lookups no longer match the store and a walk
+        #     aborts NON-ZERO -- "commit <sha> exists in commit-graph but not in the object
+        #     database" -- though the object is present.
+        #  2. LAZY (PROMISOR) FETCH on a partial/blobless clone (``git clone --filter=blob:none``).
+        #     When a walk momentarily can't find an object locally -- e.g. mid-repack, when the
+        #     pack set is being rewritten -- git tries to LAZY-FETCH it from the promisor remote.
+        #     For aGiTrack's own local-only commits (turn branches, cover/shared-session objects)
+        #     the remote answers "not our ref" and the read aborts ("Could not read <oid>;
+        #     Failed to traverse parents"), even though the object is in the local store. The
+        #     count then flaps (e.g. 485 one read, 289 the next) and the dashboard shows a
+        #     truncated -- or empty -- log. Small/idle repos never gc enough to hit either.
+        #
+        # Every read passes check=False, so the aborted/partial output is used as-is. Disabling
+        # the commit-graph makes git walk the store directly; disabling lazy fetch makes a walk
+        # use the LOCAL objects (all present) instead of attempting a doomed network fetch. Both
+        # are correct and negligibly slower at the sizes aGiTrack tracks. Lazy fetch is left ON
+        # for reads that need file CONTENT (``--numstat`` line counts, ``-p``/``--stat`` diffs)
+        # UNLESS the caller passes ``allow_lazy_fetch=False``: on a blobless clone such a read
+        # legitimately fetches absent blobs, so suppressing it would zero the numbers -- but the
+        # caller may *want* that. The dashboard's full-history numstat scan opts out, because
+        # fetching every historical blob on every poll makes a big blobless clone's dashboard
+        # hang for tens of seconds (and the interrupted fetches litter ``.git`` with tmp packs);
+        # it instead counts from the LOCAL blobs and fetches only the page actually displayed.
+        #
+        # Lazy fetch is suppressed via the GIT_NO_LAZY_FETCH=1 ENVIRONMENT VARIABLE, not the
+        # ``-c fetch.disableLazyFetch=true`` config: measured on git 2.50.1 (Apple), the config
+        # is NOT honoured for a ``git log --numstat`` walk (it still fetches every blob), whereas
+        # the env var reliably keeps the walk to local objects. The config is set too, as a
+        # harmless second line of defence on git builds where it does take effect.
+        extra_env: dict[str, str] = dict(env) if env else {}
+        if len(command) >= 2 and command[0] == "git" and command[1] in ("log", "rev-list", "shortlog"):
+            flags = ["-c", "core.commitGraph=false"]
+            if not allow_lazy_fetch or not _git_read_needs_blobs(command):
+                flags += ["-c", "fetch.disableLazyFetch=true"]
+                extra_env["GIT_NO_LAZY_FETCH"] = "1"
+            command = [command[0], *flags, *command[1:]]
         # A timeout bounds a network git call (fetch/push over bad internet): on
         # expiry subprocess.run kills the process and raises, which we surface as a
         # non-zero result so the caller treats it as a plain failure (e.g. offline).
@@ -775,7 +827,7 @@ class GitRepo:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     check=False,
-                    env={**os.environ, **env} if env else None,
+                    env={**os.environ, **extra_env} if extra_env else None,
                     timeout=timeout,
                     **isolation,
                 )
@@ -791,7 +843,7 @@ class GitRepo:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
-            env={**os.environ, **env} if env else None,
+            env={**os.environ, **extra_env} if extra_env else None,
             **isolation,
         )
         if check and process.returncode != 0:

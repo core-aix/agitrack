@@ -72,6 +72,7 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
             elif parsed.path == "/log":
                 page = log_page(
                     self._dashboard(ref),
+                    repo=self.repo,
                     author=author,
                     backend=backend,
                     model=model,

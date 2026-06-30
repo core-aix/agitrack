@@ -258,7 +258,7 @@ def test_integrate_turn_skips_when_merge_ctx_active(tmp_path):
 def test_integrate_turn_skips_non_agitrack_branch(tmp_path):
     main = _init_repo(tmp_path)
     base = main.current_branch()
-    # main is on 'main' / 'master', not agit/...
+    # main is on 'main' / 'master', not agitrack/...
     svc = _svc(main, base)
     result, _ = svc.integrate_turn_or_conflict(main, "s", object(), None, False)
     assert result == SKIP

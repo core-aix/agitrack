@@ -1,6 +1,6 @@
 # Task A findings — ConPTY mouse pass-through (deterministic, in-VM)
 
-Built a deterministic harness (`dev/winmouse/`) and ran it against the raw ConPTY driver and
+Built a deterministic harness (`devtools/winmouse/`) and ran it against the raw ConPTY driver and
 the **real** claude/opencode backends on this Windows build (26200). Results overturn the
 handoff's root-cause hypothesis. Summary of what is actually true here.
 
@@ -11,7 +11,7 @@ child's output leaks to the parent console and its stdin handle is invalid (`ERR
 The *existing* `test_windows_conpty.py` also fails this way under the agent shell. Run everything
 via `Start-Process` (fresh console) and have the script write results to a file:
 ```
-Start-Process <uv> -ArgumentList 'run','--python','3.12','python','dev/winmouse/harness.py' -Wait
+Start-Process <uv> -ArgumentList 'run','--python','3.12','python','devtools/winmouse/harness.py' -Wait
 ```
 
 ## What conhost actually does with input-pipe mouse bytes

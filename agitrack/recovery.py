@@ -200,7 +200,7 @@ class RecoveryService:
 
         def pre_commit_fn() -> None:
             # A worktree created detached has no branch; put the commit on a fresh
-            # turn branch (agit/<backend>/<name>/tN) so it is a managed branch the
+            # turn branch (agitrack/<backend>/<name>/tN) so it is a managed branch the
             # integration step can merge — exactly what the proxy does per turn.
             branch = "" if repo.is_detached() else repo.current_branch()
             integration.ensure_turn_branch(
