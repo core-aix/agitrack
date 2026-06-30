@@ -177,3 +177,21 @@ def test_select_default_summarizer_model_noop_when_models_unlistable(monkeypatch
     config.summarization_model = "preset"
     select_default_summarizer_model(config, "opencode", input_fn=_inputs(), output_fn=lambda _s: None)
     assert config.summarization_model == "preset"  # left unchanged, no prompt shown
+
+
+def test_select_default_summarizer_model_opencode_defaults_to_session_model(monkeypatch):
+    # OpenCode has no known size ordering (smallest_model → None), so the summarizer defaults to
+    # the SAME model as the coding session (summarization_model = None) WITHOUT prompting —
+    # rather than the old behaviour of picking an arbitrary first-listed model.
+    import agitrack.summaries.model_select as ms
+    from agitrack.backends.setup import select_default_summarizer_model
+
+    monkeypatch.setattr(ms, "list_available_models", lambda name: ["openai/gpt-x", "anthropic/claude-y"])
+    config = FakeConfig()
+    config.summarization_model = "preset"
+
+    def _no_input(_prompt):
+        pytest.fail("the OpenCode summarizer default must not prompt")
+
+    select_default_summarizer_model(config, "opencode", input_fn=_no_input, output_fn=lambda _s: None)
+    assert config.summarization_model is None  # None = use the session/coding model at run time
