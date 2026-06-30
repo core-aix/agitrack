@@ -748,6 +748,17 @@ def _check_for_update_at_startup(config: GlobalConfig) -> None:
         print(f"aGiTrack will keep running the current version. To update it, {updater.manual_update_instructions()}")
         return
     config.pending_manual_update = None  # a successful update clears any prior reminder
+    # Windows package installs can't replace the running agitrack.exe in place (the OS locks
+    # it), so apply() defers the pip upgrade to a helper that runs after we exit. Spawn it and
+    # quit so the upgrade can proceed; the helper relaunches aGiTrack itself when it's done.
+    if getattr(updater, "pending_pip_upgrade", None):
+        if updater.launch_pip_bootstrapper():
+            print(f"{result.message} aGiTrack will reopen automatically once it completes.")
+            sys.exit(0)
+        # Couldn't start the helper — keep the current version and remind the user to update.
+        config.pending_manual_update = status.latest or status.current or "available"
+        print(f"Could not start the aGiTrack updater. To update it, {updater.manual_update_instructions()}")
+        return
     print(f"{result.message} Restarting aGiTrack...")
     restart_agitrack()  # does not return on success
 

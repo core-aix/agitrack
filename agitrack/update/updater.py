@@ -207,6 +207,10 @@ class Updater:
         self._msi_latest: str = ""
         # The downloaded MSI awaiting the elevated install hand-off (the runner reads this).
         self.pending_msi_path: str | None = None
+        # Windows package installs only: the ``pip install --upgrade`` command that must run
+        # AFTER this process exits (the OS locks the running ``agitrack.exe``, so pip can't
+        # replace it in place). Set by _apply_package; callers spawn launch_pip_bootstrapper.
+        self.pending_pip_upgrade: list[str] | None = None
 
     @property
     def kind(self) -> str:
@@ -748,6 +752,19 @@ class Updater:
         pip = self._pip_invocation()
         pep668 = False
         if pip is not None:
+            upgrade_cmd = [*pip, "install", "--upgrade", DIST_NAME]
+            # Windows: the OS locks the image of the running ``agitrack.exe`` console script,
+            # so pip CANNOT replace it in place. Its upgrade uninstalls the old distribution
+            # first — it deletes the unlocked package files (the whole ``agitrack/metrics``
+            # subpackage among them), then fails on the locked exe with "check the
+            # permissions", leaving the install half-removed and the next lazy import
+            # crashing. So don't run pip here: record the command and defer it to a detached
+            # helper (launch_pip_bootstrapper) that the caller spawns; it waits for this
+            # process to exit (releasing the lock), runs the upgrade, then relaunches aGiTrack.
+            if sys.platform == "win32":
+                self.pending_pip_upgrade = upgrade_cmd
+                status.message = "aGiTrack will finish updating after it exits."
+                return status
             # Detach the upgrade into its own session (`start_new_session`). `pip
             # install --upgrade` uninstalls the old version before writing the new,
             # so an interruption between the two leaves aGiTrack UNINSTALLED. Running
@@ -755,7 +772,7 @@ class Updater:
             # VS Code / closing the window mid-upgrade) is NOT delivered to pip, so it
             # runs to completion and the package is never left half-removed.
             result = subprocess.run(
-                [*pip, "install", "--upgrade", DIST_NAME],
+                upgrade_cmd,
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -802,6 +819,50 @@ class Updater:
         status.message = f"Updated aGiTrack package to {status.current}."
         return status
 
+    def launch_pip_bootstrapper(self, extra_args: Sequence[str] = ()) -> bool:
+        """Windows package install only. Spawn a detached helper that finishes the deferred
+        pip upgrade recorded in :attr:`pending_pip_upgrade` AFTER this process exits.
+
+        The running ``agitrack.exe`` console script is locked by the OS while we run, so the
+        upgrade can't happen in place (see _apply_package). The helper — a hidden, detached
+        PowerShell process that outlives us — waits for this PID to exit (releasing the lock),
+        runs ``pip install --upgrade``, and on success relaunches aGiTrack with the original
+        arguments (plus ``extra_args``, e.g. ``--skip-privacy-ack`` for a menu-triggered
+        update). If the process is still alive after the wait, it bails WITHOUT upgrading so a
+        stuck parent can't be corrupted the same way an in-place upgrade would.
+
+        Returns True when the helper was spawned (the caller MUST then exit so the upgrade can
+        proceed), False when there is nothing to do or the spawn failed (keep the current
+        version)."""
+        upgrade = self.pending_pip_upgrade
+        if not upgrade or sys.platform != "win32":
+            return False
+        relaunch = _restart_command(extra_args)
+        pip_call = " ".join(_ps_single_quote(part) for part in upgrade)
+        relaunch_exe = _ps_single_quote(relaunch[0])
+        relaunch_args = ",".join(_ps_single_quote(part) for part in relaunch[1:])
+        arglist = f" -ArgumentList @({relaunch_args})" if relaunch[1:] else ""
+        # Poll up to ~5 min for the parent to exit (600 × 500ms); bail if it never does so a
+        # hung aGiTrack is never upgraded out from under itself. Then run pip and, on success,
+        # relaunch. $ErrorActionPreference keeps a missing-process probe from being noisy.
+        script = (
+            "$ErrorActionPreference='SilentlyContinue';"
+            f"$p={os.getpid()};"
+            "for($i=0;$i -lt 600 -and (Get-Process -Id $p -ErrorAction SilentlyContinue);$i++)"
+            "{Start-Sleep -Milliseconds 500};"
+            "if(Get-Process -Id $p -ErrorAction SilentlyContinue){exit};"
+            f"& {pip_call};"
+            f"if($LASTEXITCODE -eq 0){{Start-Process -FilePath {relaunch_exe}{arglist}}}"
+        )
+        try:
+            subprocess.Popen(
+                ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", script],
+                **detach_kwargs(),
+            )
+        except OSError:
+            return False
+        return True
+
     def _manual_routes(self) -> str:
         # A full enumeration of every supported upgrade route, since aGiTrack can't tell
         # for certain which one applies once the automatic paths are exhausted.
@@ -821,6 +882,12 @@ class Updater:
             else "could not upgrade aGiTrack automatically"
         )
         return f"{lead}; {self._manual_routes()}"
+
+
+def _ps_single_quote(value: str) -> str:
+    """Quote *value* as a PowerShell single-quoted string literal (doubling embedded single
+    quotes). Used to embed the pip command and relaunch argv in the deferred-upgrade helper."""
+    return "'" + value.replace("'", "''") + "'"
 
 
 def _github_slug(remote_url: str) -> str | None:

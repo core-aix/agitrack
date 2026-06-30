@@ -945,6 +945,7 @@ class ProxyRunner:
         self._update_applying = False  # apply+restart in progress
         self._pending_restart = False  # re-exec aGiTrack after the loop tears down
         self._pending_msi_handoff = False  # restart goes through the elevated MSI installer, not re-exec
+        self._pending_pip_handoff = False  # Windows pip upgrade runs in a helper after exit, not re-exec
         self._reopen_after_exit = False  # host terminal closed; user asked to reopen in a new window
         # Git worker (the automatic commit/merge pipeline runs here, never on the main
         # reactor thread, so typing is never blocked by a git subprocess). The worker
@@ -1424,6 +1425,16 @@ class ProxyRunner:
             # user declined the UAC prompt), fall through to a normal re-exec so the user
             # keeps running the current version.
             if self._pending_msi_handoff and self._launch_msi_bootstrapper():
+                return exit_code
+            # A Windows pip self-update likewise can't re-exec in place: the deferred upgrade
+            # only runs once we exit and release the lock on agitrack.exe. Hand off to the
+            # detached helper, which upgrades and relaunches the updated build itself. If it
+            # can't be spawned, fall through to a normal re-exec of the current version.
+            if (
+                self._pending_pip_handoff
+                and self._updater is not None
+                and self._updater.launch_pip_bootstrapper(["--skip-privacy-ack"])
+            ):
                 return exit_code
             # This restart follows an in-app (menu) update; the user already saw
             # and acknowledged the privacy warning when this session started, so
@@ -2230,6 +2241,11 @@ class ProxyRunner:
             # Flag it so the teardown launches the bootstrapper instead of re-exec'ing.
             if getattr(self._updater, "pending_msi_path", None):
                 self._pending_msi_handoff = True
+            # Likewise, a Windows pip upgrade only RECORDS the command during apply() — the
+            # running agitrack.exe is locked, so the upgrade runs in a helper after we exit
+            # (which then relaunches us). Flag it for the teardown's bootstrapper hand-off.
+            if getattr(self._updater, "pending_pip_upgrade", None):
+                self._pending_pip_handoff = True
             message = f"{result.message} Restarting aGiTrack…"
         # Update is in place (or unnecessary): now finish commits and tear down for
         # the re-exec.
