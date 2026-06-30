@@ -385,7 +385,10 @@ def test_run_modal_exit_declined_continues():
 def test_run_modal_ctrl_c_during_finalize_does_not_exit():
     """Ctrl-C on a NON-confirmation popup shown during the exit finalize (the keep/delete-
     worktree prompt, the copy-back offer) must NOT exit aGiTrack directly — it cancels the
-    popup and aborts the whole exit, like Esc. Only the exit-confirmation dialog may exit."""
+    popup and aborts the whole exit, like Esc. Only the exit-confirmation dialog may exit.
+
+    Crucially this holds even after a double-Ctrl-C set the force flag on the confirmation:
+    the abort must clear that flag, or the exit would barrel on regardless."""
     runner = make_runner()
     runner._set_message = lambda *a, **k: None
     runner._render = lambda: None
@@ -393,15 +396,16 @@ def test_run_modal_ctrl_c_during_finalize_does_not_exit():
     calls: list[str] = []
     runner._run_exit_flow = lambda: (calls.append("exit"), True)[1]
     runner._popup_read_input = lambda: b"\x03"
-    runner._popup_exit_pending = True  # we're mid-exit (finalize)
+    runner._finalized_on_exit = True  # we're inside _finalize_pending_work
     runner._exit_confirmation_active = False  # but this popup is NOT the exit confirmation
-    runner._finalized_on_exit = True
+    runner._popup_exit_force = True  # a prior double-Ctrl-C "force exit" had been set
 
     result = runner._run_modal(SelectModal("Keep or delete the worktree?", ["Keep them", "Delete them"]))
 
     assert result is None
     assert calls == []  # the exit flow was never reached — Ctrl-C did not exit
     assert runner._exit_aborted is True  # the exit was aborted instead
+    assert runner._popup_exit_force is False  # force cleared so the abort can't be overridden
 
 
 def test_run_modal_ctrl_c_on_exit_confirmation_runs_exit_flow():
