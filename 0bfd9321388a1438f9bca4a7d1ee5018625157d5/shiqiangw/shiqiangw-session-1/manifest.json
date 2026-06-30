@@ -1,0 +1,16 @@
+{
+  "agitrack_session_id": "agitrack-b510a4ca-1b6e-489b-849e-621092f33402",
+  "backend": "claude",
+  "content_hash": "8d0f141a0e5cab738481baf301e4f961dd8eb195ca32a72fd038e5e1134f884e",
+  "contributors": [
+    "shiqiangw"
+  ],
+  "github_id": "shiqiangw",
+  "model": "claude-opus-4-8",
+  "name": "shiqiangw-session-1",
+  "session_id": "0b705918-b550-4ac7-86e4-c73b2612458e",
+  "transcript_bytes": 57453815,
+  "transcript_rows": 5386,
+  "truncated": true,
+  "updated": 1782481891
+}
