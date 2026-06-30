@@ -214,11 +214,11 @@ def test_select_default_backend_shows_status_and_skips_with_enter():
     assert any("opencode (installed)" in line for line in lines)
 
 
-def test_select_default_backend_prompts_to_install_uninstalled_even_when_one_present():
-    # claude installed, opencode not: the user IS still asked whether to install opencode.
+def test_select_default_backend_picking_uninstalled_installs_and_selects_it():
+    # claude installed, opencode not: picking '2' (opencode) installs it AND makes it the default
+    # — the single prompt's number is the default choice, not a separate install offer.
     installs = []
     config = MagicMock()
-    answers = iter(["2", ""])  # install opencode (#2), then Enter to finish
 
     def fake_installed(name):
         return name == "claude" or name in installs
@@ -226,15 +226,16 @@ def test_select_default_backend_prompts_to_install_uninstalled_even_when_one_pre
     with patch("agitrack.backends.setup.backend_installed", side_effect=fake_installed):
         result = select_default_backend(
             config,
-            input_fn=lambda _: next(answers),
+            input_fn=lambda _: "2",
             output_fn=lambda _: None,
             install_fn=lambda name, output_fn: installs.append(name) or True,
         )
-    assert installs == ["opencode"]  # only the uninstalled one was offered/installed
-    assert result == "claude"  # default stays the already-installed one
+    assert installs == ["opencode"]  # the chosen uninstalled backend is installed first
+    assert result == "opencode"  # …and it becomes the default
 
 
-def test_select_default_backend_install_all():
+def test_select_default_backend_none_installed_pick_installs_chosen():
+    # Nothing installed: picking '1' installs that backend and makes it the default.
     installs = []
     config = MagicMock()
 
@@ -244,11 +245,11 @@ def test_select_default_backend_install_all():
     with patch("agitrack.backends.setup.backend_installed", side_effect=fake_installed):
         result = select_default_backend(
             config,
-            input_fn=lambda _: "all",  # install every uninstalled backend
+            input_fn=lambda _: "1",
             output_fn=lambda _: None,
             install_fn=lambda name, output_fn: installs.append(name) or True,
         )
-    assert sorted(installs) == ["claude", "opencode"]
+    assert installs == ["claude"]
     assert result == "claude"
     assert config.default_backend == "claude"
 
