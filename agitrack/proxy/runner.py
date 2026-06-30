@@ -1719,7 +1719,7 @@ class ProxyRunner:
         # The backend agent can switch the branch checked out IN ITS OWN WORKTREE with a plain
         # `git checkout`/`git switch` — the worktree directory does not move, only HEAD. aGiTrack
         # otherwise only ever leaves a worktree detached at base (between turns) or on a managed
-        # `agit/<backend>/<name>/tN` turn branch, so the worktree sitting on a NON-managed, named
+        # `agitrack/<backend>/<name>/tN` turn branch, so the worktree sitting on a NON-managed, named
         # branch can only mean the agent moved it. Follow it: point the session's tracked branch
         # (status bar + integration accounting) at it so cover commits keep landing there as
         # normal — the existing `is_managed_branch` gates already skip auto-integrating a branch
@@ -3265,7 +3265,7 @@ class ProxyRunner:
         return result
 
     def _delete_orphan_merged_branches(self) -> None:
-        # Remove agit/* branches that no worktree checks out and that are already
+        # Remove agitrack/* branches that no worktree checks out and that are already
         # contained in the base branch (stale leftovers).
         try:
             for branch in self._integration.delete_orphan_merged_branches():

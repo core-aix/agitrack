@@ -430,7 +430,7 @@ class GitRepo:
         return entries
 
     # --- low-level object/ref plumbing (shared-session storage, issue #55) ------
-    # These build and move a custom ref (refs/agit/shared-sessions) entirely in
+    # These build and move a custom ref (refs/agitrack/shared-sessions) entirely in
     # the object database, never touching the working tree or the real index.
 
     def ref_exists(self, ref: str) -> bool:
@@ -504,7 +504,7 @@ class GitRepo:
         timeout: float | None = None,
         cancel: "threading.Event | None" = None,
     ) -> bool:
-        """Fetch a single refspec (e.g. ``+refs/agit/x:refs/agit/x``). Returns
+        """Fetch a single refspec (e.g. ``+refs/agitrack/x:refs/agitrack/x``). Returns
         True on success; False on any failure (offline, no such ref yet, …).
 
         With ``filter_blobs`` (e.g. ``blob:limit=16k``) the fetch skips large blobs

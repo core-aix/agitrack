@@ -751,7 +751,7 @@ def _merge_runner(tmp_path):
         repo=tmp_path,
         has_tracked_changes=lambda: False,
         untracked_files=lambda: [],
-        current_branch=lambda: "agit/x",
+        current_branch=lambda: "agitrack/x",
     )
     runner.state = types.SimpleNamespace(declined_untracked=lambda: [])
     runner.name = "feature"
@@ -3105,7 +3105,7 @@ def test_inject_prompt_defers_enter_until_text_settles():
     try:
         runner = make_runner(
             master_fd=write_fd,
-            merge_ctx=MergeContext(source_branch="agit/s/t1", context="", phase=MergePhase.PENDING),
+            merge_ctx=MergeContext(source_branch="agitrack/s/t1", context="", phase=MergePhase.PENDING),
             _pending_enter_at=None,
         )
 
@@ -4355,7 +4355,7 @@ def _integration_runner(merge_ok):
             self.aborted = False
 
         def current_branch(self):
-            return "agit/session-1/t1"
+            return "agitrack/session-1/t1"
 
         def merge(self, ref):
             return merge_ok
@@ -4384,7 +4384,7 @@ def test_integrate_conflict_aborts_and_prompts_resolve_options():
     runner._integrate_session_turn()
 
     assert runner.repo.aborted is True  # conflicted merge is backed out
-    assert calls == ["agit/session-1/t1"]  # options box is surfaced
+    assert calls == ["agitrack/session-1/t1"]  # options box is surfaced
 
 
 def test_integrate_clean_merge_advances_base_without_prompt():
@@ -4396,7 +4396,7 @@ def test_integrate_clean_merge_advances_base_without_prompt():
     runner._integrate_session_turn()
 
     assert runner.repo.aborted is False
-    assert calls == [("advance", "agit/session-1/t1")]
+    assert calls == [("advance", "agitrack/session-1/t1")]
 
 
 def test_created_notice_fires_only_after_merge_into_base():
@@ -4468,19 +4468,19 @@ def _resolve_runner(choice_index):
 
 def test_prompt_resolve_conflict_dispatches_auto():
     runner = _resolve_runner(choice_index=0)
-    runner._prompt_resolve_conflict("agit/session-1/t1")
+    runner._prompt_resolve_conflict("agitrack/session-1/t1")
     assert runner._dispatched == [True]
 
 
 def test_prompt_resolve_conflict_dispatches_manual():
     runner = _resolve_runner(choice_index=1)
-    runner._prompt_resolve_conflict("agit/session-1/t1")
+    runner._prompt_resolve_conflict("agitrack/session-1/t1")
     assert runner._dispatched == [False]
 
 
 def test_prompt_resolve_conflict_leave_does_not_merge():
     runner = _resolve_runner(choice_index=2)
-    runner._prompt_resolve_conflict("agit/session-1/t1")
+    runner._prompt_resolve_conflict("agitrack/session-1/t1")
     assert runner._dispatched == []  # nothing merged
     assert runner._messages and "unintegrated" in runner._messages[0]
 
@@ -4669,7 +4669,7 @@ def test_service_background_conflict_switches_and_prompts():
 
     class _Repo:
         def current_branch(self):
-            return "agit/B/t1"
+            return "agitrack/B/t1"
 
     def _switch(i):
         switched.append(i)
@@ -4680,14 +4680,14 @@ def test_service_background_conflict_switches_and_prompts():
 
     runner._service_background_sessions()
 
-    assert switched == [1] and prompted == ["agit/B/t1"]
+    assert switched == [1] and prompted == ["agitrack/B/t1"]
 
 
 def test_service_background_finalizes_pending_merge():
     runner = _mux_runner()
     runner.merge_ctx = None
     b = _bg_session("B")
-    b.merge_ctx = MergeContext(source_branch="agit/B/t1", context="")
+    b.merge_ctx = MergeContext(source_branch="agitrack/B/t1", context="")
     runner.sessions.append(b)
     called = []
     runner._with_session = lambda session, fn: called.append((session.name, fn.__name__))
@@ -4699,7 +4699,7 @@ def test_service_background_finalizes_pending_merge():
 
 def test_service_background_skips_while_active_merge_in_progress():
     runner = _mux_runner()
-    runner.merge_ctx = MergeContext(source_branch="agit/A/t1", context="")  # any truthy merge_ctx
+    runner.merge_ctx = MergeContext(source_branch="agitrack/A/t1", context="")  # any truthy merge_ctx
     b = _bg_session("B")
     b.agent_in_flight = True
     runner.sessions.append(b)
@@ -4819,7 +4819,7 @@ def test_flush_pending_enter_marks_sent_only_when_still_active(monkeypatch):
         _pending_enter_at=0.0,
         _pending_enter_fd=7,
         master_fd=7,
-        merge_ctx=MergeContext(source_branch="agit/s/t1", context="", phase=MergePhase.PENDING),
+        merge_ctx=MergeContext(source_branch="agitrack/s/t1", context="", phase=MergePhase.PENDING),
     )
     active._flush_pending_enter()
     assert active.merge_ctx.prompt_sent_at is not None
@@ -4830,7 +4830,7 @@ def test_flush_pending_enter_marks_sent_only_when_still_active(monkeypatch):
         _pending_enter_at=0.0,
         _pending_enter_fd=7,
         master_fd=99,
-        merge_ctx=MergeContext(source_branch="agit/s/t1", context="", phase=MergePhase.PENDING),
+        merge_ctx=MergeContext(source_branch="agitrack/s/t1", context="", phase=MergePhase.PENDING),
     )
     switched._flush_pending_enter()
     assert switched.merge_ctx.prompt_sent_at is None
@@ -5602,7 +5602,7 @@ def test_new_session_stages_transcript_before_spawn_when_resuming(tmp_path, monk
     runner._use_worktrees = True
     runner.global_config = types.SimpleNamespace(default_backend="claude")
     info = types.SimpleNamespace(name="bob-feature", path=tmp_path)
-    repo = types.SimpleNamespace(repo=tmp_path, current_branch=lambda: "agit/claude/bob-feature/t1")
+    repo = types.SimpleNamespace(repo=tmp_path, current_branch=lambda: "agitrack/claude/bob-feature/t1")
     runner._open_session_worktree = lambda name, **kwargs: (info, repo)
     monkeypatch.setattr(runner_module, "make_proxy_agent", lambda name: types.SimpleNamespace(name=name))
     monkeypatch.setattr(runner_module, "AgitrackActions", lambda *a, **k: types.SimpleNamespace())
@@ -6093,10 +6093,10 @@ def test_advance_base_when_base_not_checked_out_uses_safe_fast_forward():
     )
     runner._integration.base_repo = runner.base_repo
 
-    runner._advance_base_to("agit/claude/session-1/t1")
+    runner._advance_base_to("agitrack/claude/session-1/t1")
 
     assert merged == []  # never moved the checked-out 'feature-x'
-    assert ff == [("dev", "agit/claude/session-1/t1")]  # advanced base's ref only
+    assert ff == [("dev", "agitrack/claude/session-1/t1")]  # advanced base's ref only
 
 
 def _exit_removal_runner(*, log_range_result="", rev_parse_raises=False):
@@ -6113,7 +6113,7 @@ def _exit_removal_runner(*, log_range_result="", rev_parse_raises=False):
         _primary_worktree_name=None,
         worktree=types.SimpleNamespace(name="session-1", path="/tmp/agitrack-wt/session-1"),
         repo=types.SimpleNamespace(
-            current_branch=lambda: "agit/claude/session-1/t1",
+            current_branch=lambda: "agitrack/claude/session-1/t1",
             merge_in_progress=lambda: False,
             has_changes=lambda: False,
         ),
@@ -8088,7 +8088,7 @@ def test_idle_clean_worktree_integrates_agent_made_commits():
         agent_in_flight=False,
         agent_parse_thread=None,
         last_child_output=0.0,
-        repo=types.SimpleNamespace(current_branch=lambda: "agit/claude/s1/t1"),
+        repo=types.SimpleNamespace(current_branch=lambda: "agitrack/claude/s1/t1"),
     )
     runner.CHILD_IDLE_SECONDS = 4.0
     runner.BASE_POLL_SECONDS = 3.0
@@ -8114,7 +8114,7 @@ def test_idle_integration_skips_active_agent_and_clean_branches():
         _base_branch="main",
         agent_parse_thread=None,
         last_child_output=0.0,
-        repo=types.SimpleNamespace(current_branch=lambda: "agit/claude/s1/t1"),
+        repo=types.SimpleNamespace(current_branch=lambda: "agitrack/claude/s1/t1"),
     )
     runner.CHILD_IDLE_SECONDS = 4.0
     runner.BASE_POLL_SECONDS = 3.0

@@ -84,7 +84,7 @@ def _demo_repo(tmp_path: Path) -> GitRepo:
         input_text=build_agent_merge_message(
             session_name="s1",
             base_branch="main",
-            source_branch="agit/claude/s1/t1",
+            source_branch="agitrack/claude/s1/t1",
             agitrack_session_id="agit-1",
             backend="claude",
         ),

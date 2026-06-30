@@ -42,7 +42,7 @@ def _turn(prompt: str = "add the feature", response: str = "done") -> SessionTur
 def _repo_on_turn_branch(tmp_path: Path) -> tuple[GitRepo, str]:
     repo = GitRepo.init(tmp_path)
     base = repo.current_branch()
-    repo.switch("agit/test/s1/t1", create=True)
+    repo.switch("agitrack/test/s1/t1", create=True)
     return repo, base
 
 
@@ -241,7 +241,7 @@ def test_cover_in_actions_mode_accumulates_trace_first(tmp_path):
 def _detection_runner(tmp_path):
     repo = GitRepo.init(tmp_path)
     base = repo.current_branch()
-    repo.switch("agit/test/s1/t1", create=True)
+    repo.switch("agitrack/test/s1/t1", create=True)
     runner = make_runner(
         repo=repo,
         state=AgitrackState(tmp_path),

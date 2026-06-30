@@ -60,7 +60,7 @@ def test_naming_helpers(tmp_path):
     repo = _init_repo(tmp_path)
     wm = WorktreeManager(repo)
     assert wm.worktree_path("feat x").name == "feat-x"
-    # Branches are namespaced by backend then session: agit/<backend>/<name>/tN.
+    # Branches are namespaced by backend then session: agitrack/<backend>/<name>/tN.
     assert wm.turn_branch("feat x", 2, backend="open code") == "agitrack/open-code/feat-x/t2"
     assert wm.is_agitrack_branch("agitrack/claude/feat-x/t0") is True
     assert wm.is_agitrack_branch("main") is False
@@ -94,7 +94,7 @@ def test_turn_branches_coexist_without_df_conflict(tmp_path):
     wm = WorktreeManager(repo)
     info = wm.create("feat", base="HEAD")
     work = GitRepo.discover(info.path)
-    # Successive turn branches must coexist under agit/<backend>/<name>/.
+    # Successive turn branches must coexist under agitrack/<backend>/<name>/.
     work.switch(wm.turn_branch("feat", 1, backend="claude"), create=True, base="HEAD")
     work.switch(wm.turn_branch("feat", 2, backend="claude"), create=True, base="HEAD")
     assert "agitrack/claude/feat/t1" in repo.list_branches("agitrack/")
@@ -422,7 +422,7 @@ def test_integrate_session_on_exit_drops_empty_branch(tmp_path):
     main = _init_repo(tmp_path)
     base = main.current_branch()
     info = WorktreeManager(main).create("s1", base=base)
-    work = GitRepo.discover(info.path)  # on agit/s1/t0 with nothing ahead of base
+    work = GitRepo.discover(info.path)  # on agitrack/s1/t0 with nothing ahead of base
 
     runner = _integration_runner(main, work, base, "s1")
     runner._exiting = True
@@ -719,7 +719,7 @@ def test_base_switch_candidates_excludes_agitrack_and_current(tmp_path):
     main = _init_repo(tmp_path)
     base = main.current_branch()
     main.create_branch("feature", base)
-    WorktreeManager(main).create("s1", base=base)  # creates an agit/s1/t0 branch
+    WorktreeManager(main).create("s1", base=base)  # creates an agitrack/s1/t0 branch
 
     runner = make_runner(
         base_repo=main,
@@ -1477,7 +1477,7 @@ def test_ensure_turn_branch_never_resets_existing_branch_with_work(tmp_path):
     base = main.current_branch()
     info, work = _make_session(main, "s1", base, backend="claude")
     _commit(work, "kept.txt", "unintegrated work\n", "<aGiTrack> kept work")
-    kept_head = work.rev_parse("HEAD")  # tip of agit/claude/s1/t1
+    kept_head = work.rev_parse("HEAD")  # tip of agitrack/claude/s1/t1
 
     # Simulate recovery: detached at base again, turn counter back at 0.
     work.switch_detach(base)
