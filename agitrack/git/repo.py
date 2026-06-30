@@ -749,6 +749,21 @@ class GitRepo:
         env: dict[str, str] | None = None,
         timeout: float | None = None,
     ) -> subprocess.CompletedProcess[str]:
+        # A stale or corrupt commit-graph silently breaks history reads. git writes a
+        # commit-graph during background ``git gc --auto`` (which a busy repo triggers
+        # often -- aGiTrack commits every turn); if a later repack moves the objects it
+        # indexes, the graph's position-based lookups no longer match the store and
+        # traversal aborts mid-walk with a NON-ZERO exit -- "commit <sha> exists in
+        # commit-graph but not in the object database" -- even though the object is
+        # present. Every read path passes check=False, so that aborted output (often
+        # truncated or empty) is used as-is: the dashboard then shows NO commits, but
+        # only on exactly the active repos that gc enough to stale their graph (small or
+        # idle repos never hit it). Disabling the commit-graph for read-only traversals
+        # makes git walk the object store directly -- always correct, and negligibly
+        # slower at the history sizes aGiTrack tracks. The graph still accelerates git's
+        # own internal operations; we only opt these specific reads out of trusting it.
+        if len(command) >= 2 and command[0] == "git" and command[1] in ("log", "rev-list", "shortlog"):
+            command = [command[0], "-c", "core.commitGraph=false", *command[1:]]
         # A timeout bounds a network git call (fetch/push over bad internet): on
         # expiry subprocess.run kills the process and raises, which we surface as a
         # non-zero result so the caller treats it as a plain failure (e.g. offline).
