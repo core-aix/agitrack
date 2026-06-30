@@ -57,16 +57,29 @@ def test_select_default_backend_two_installed_user_picks_second(monkeypatch):
     assert config.saved == ["opencode"]
 
 
-def test_select_default_backend_single_installed_not_asked(monkeypatch):
-    # Exactly one backend installed (opencode): after Enter skips the install offer for the
-    # other, it's used as the default WITHOUT a separate choose-default prompt (nothing to
-    # choose between).
-    monkeypatch.setattr(bs, "backend_installed", lambda name: name == "opencode")
+def test_select_default_backend_single_list_only(monkeypatch):
+    # The backends are listed exactly ONCE (with install status); the default is chosen from
+    # that same list — no duplicate "Agent backends" / "Which … default" listings.
+    monkeypatch.setattr(bs, "backend_installed", lambda name: True)
     config = FakeConfig()
     lines: list[str] = []
     chosen = select_default_backend(config, input_fn=_inputs(""), output_fn=lines.append)
+    assert chosen == "claude"
+    assert sum(1 for line in lines if "claude (installed)" in line) == 1  # listed only once
+
+
+def test_select_default_backend_enter_keeps_installed_default(monkeypatch):
+    # Exactly one backend installed (opencode): Enter accepts it as the default (it's the listed
+    # default) without installing anything.
+    monkeypatch.setattr(bs, "backend_installed", lambda name: name == "opencode")
+    config = FakeConfig()
+    chosen = select_default_backend(
+        config,
+        input_fn=_inputs(""),
+        output_fn=lambda _s: None,
+        install_fn=lambda name, output_fn: pytest.fail("Enter on the installed default must not install"),
+    )
     assert chosen == "opencode"
-    assert not any("use by default" in line for line in lines)  # the choose prompt never appeared
 
 
 def test_select_default_backend_explains_how_to_switch(monkeypatch):
@@ -94,18 +107,19 @@ def test_select_default_backend_skip_keeps_installed_default(monkeypatch):
 
 
 def test_select_default_backend_installs_chosen_uninstalled(monkeypatch):
-    # claude installed, opencode not; user enters '2' to install opencode, then Enter.
+    # claude installed, opencode not; the user picks '2' (opencode) as the default → opencode is
+    # installed first AND becomes the default (one unified prompt: the number is the default).
     installs = []
     monkeypatch.setattr(bs, "backend_installed", lambda name: name == "claude" or name in installs)
     config = FakeConfig()
     chosen = select_default_backend(
         config,
-        input_fn=_inputs("2", ""),
+        input_fn=_inputs("2"),
         output_fn=lambda _s: None,
         install_fn=lambda name, output_fn: installs.append(name) or True,
     )
     assert installs == ["opencode"]
-    assert chosen == "claude"
+    assert chosen == "opencode"
 
 
 def test_ensure_installed_backend_returns_installed_backend(monkeypatch):

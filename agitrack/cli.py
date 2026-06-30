@@ -881,11 +881,12 @@ def _check_gh_availability(repo: GitRepo, *, scripted: bool = False) -> tuple[bo
             if status == "ok":
                 return (True, True)
     if status == "missing":
-        print(_gh_install_hint())
+        # Leading blank line so the gh question is separated from the preceding startup output.
+        print("\n" + _gh_install_hint())
         prompt = "\nPress Enter to continue without it (q to quit): "
     else:  # unauthenticated
         print(
-            "GitHub CLI (gh) isn't signed in. aGiTrack uses it for the dashboard's committer "
+            "\nGitHub CLI (gh) isn't signed in. aGiTrack uses it for the dashboard's committer "
             "identities and for session sharing; without it those features are limited.\n\n"
             "Sign in with `gh auth login` (or press 'l' below to run it now)."
         )
