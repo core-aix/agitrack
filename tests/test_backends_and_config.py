@@ -261,6 +261,10 @@ def test_claude_backend_bare_run_strips_tools_memory_and_system_prompt(monkeypat
         )
 
     monkeypatch.setattr(subprocess, "run", fake_run)
+    # Inspect the LOGICAL command flags: force a passthrough so resolve_subprocess_command
+    # doesn't wrap a real .cmd shim (when claude is installed locally) into a cmd.exe /c STRING.
+    # The .cmd→string quoting is covered separately in test_proc.py.
+    monkeypatch.setattr("agitrack.proc._IS_WINDOWS", False)
     backend = ClaudeBackend(tmp_path)
 
     backend.run(
@@ -300,6 +304,10 @@ def test_claude_backend_windows_feeds_prompt_via_stdin_and_flattens_system(monke
     from agitrack.backends import claude as claude_mod
 
     monkeypatch.setattr(claude_mod, "_IS_WINDOWS", True)
+    # Drive the Windows stdin/flatten logic (claude_mod._IS_WINDOWS) but keep the captured
+    # command a plain list: force resolve_subprocess_command (proc._IS_WINDOWS) to pass through,
+    # so a locally-installed claude.cmd isn't wrapped into a cmd.exe /c string here.
+    monkeypatch.setattr("agitrack.proc._IS_WINDOWS", False)
     captured: dict = {}
 
     def fake_run(command, **kwargs):

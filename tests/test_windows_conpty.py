@@ -48,6 +48,6 @@ def test_resolve_windows_command_wraps_cmd_scripts(tmp_path):
 
     script = tmp_path / "mybackend.cmd"
     script.write_text("@echo off\r\n")
-    appname, args = _resolve_windows_command([str(script), "run"])
+    appname, cmdline = _resolve_windows_command([str(script), "run"])
     assert appname.lower().endswith("cmd.exe")
-    assert args[0] == "/c" and str(script) in args
+    assert cmdline.startswith('/c "') and str(script) in cmdline

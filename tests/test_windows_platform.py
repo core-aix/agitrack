@@ -83,22 +83,38 @@ def test_make_child_process_dispatches_to_posix_spawn(monkeypatch):
 
 def test_resolve_windows_command_wraps_cmd_shims(tmp_path):
     # A .cmd backend shim (npm's claude.cmd) must run through cmd.exe /c — the only way
-    # ConPTY's CreateProcess executes a batch file. Args are preserved after the script.
+    # ConPTY's CreateProcess executes a batch file. Returns the command-LINE string, with the
+    # inner command wrapped in protective quotes; args are preserved after the script.
     script = tmp_path / "be.cmd"
     script.write_text("@echo off\n")
-    appname, args = _resolve_windows_command([str(script), "run", "--flag"])
+    appname, cmdline = _resolve_windows_command([str(script), "run", "--flag"])
     assert appname.lower().endswith("cmd.exe")
-    assert args[0] == "/c"
-    assert str(script) in args
-    assert args[-1] == "--flag"
+    assert cmdline.startswith('/c "') and cmdline.endswith('"')
+    assert str(script) in cmdline
+    assert "run" in cmdline and "--flag" in cmdline
+
+
+def test_resolve_windows_command_cmd_shim_under_spaced_path(tmp_path):
+    # A .cmd shim under a path with spaces (e.g. a username "First Last") must be wrapped so
+    # cmd.exe's quote-strip after /c doesn't split it at the space — the whole inner command,
+    # including the quoted shim path and a quoted spaced arg, gets an extra outer quote pair.
+    d = tmp_path / "First Last" / "npm"
+    d.mkdir(parents=True)
+    script = d / "claude.cmd"
+    script.write_text("@echo off\n")
+    appname, cmdline = _resolve_windows_command([str(script), "--flag", "arg with space"])
+    assert appname.lower().endswith("cmd.exe")
+    assert cmdline.startswith('/c "') and cmdline.endswith('"')
+    assert f'"{script}"' in cmdline  # the spaced shim path is quoted
+    assert '"arg with space"' in cmdline  # the spaced arg is quoted
 
 
 def test_resolve_windows_command_passes_through_plain_exe(tmp_path):
     exe = tmp_path / "be.exe"
     exe.write_text("")  # not executable on POSIX, so shutil.which returns None → use as-is
-    appname, args = _resolve_windows_command([str(exe), "go"])
+    appname, cmdline = _resolve_windows_command([str(exe), "go"])
     assert appname == str(exe)
-    assert args == ["go"]
+    assert cmdline == "go"
 
 
 def test_resolve_windows_command_ignores_half_installed_npm_shim(monkeypatch):
@@ -111,9 +127,9 @@ def test_resolve_windows_command_ignores_half_installed_npm_shim(monkeypatch):
     present = {"claude": r"C:\npm\claude", "claude.ps1": r"C:\npm\claude.ps1"}
     monkeypatch.setattr(proc, "_IS_WINDOWS", True)
     monkeypatch.setattr(proc.shutil, "which", lambda name: present.get(name))
-    appname, args = _resolve_windows_command(["claude", "--resume"])
+    appname, cmdline = _resolve_windows_command(["claude", "--resume"])
     assert appname == "claude"  # not C:\npm\claude (the bare shell script)
-    assert args == ["--resume"]
+    assert cmdline == "--resume"
 
 
 def test_env_block_is_null_separated_or_none():

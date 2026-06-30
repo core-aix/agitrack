@@ -39,12 +39,58 @@ def test_backend_installed_uses_executable_lookup(monkeypatch):
 
 
 def test_select_default_backend_all_installed_defaults_to_first(monkeypatch):
-    # Both installed: nothing to offer, default is the first (claude). No input needed.
+    # Both installed: nothing to install, but the user IS asked which to make the default;
+    # a bare Enter (empty) takes the first (claude).
     monkeypatch.setattr(bs, "backend_installed", lambda name: True)
     config = FakeConfig()
     chosen = select_default_backend(config, input_fn=_inputs(""), output_fn=lambda _s: None)
     assert chosen == "claude"
     assert config.saved == ["claude"]
+
+
+def test_select_default_backend_two_installed_user_picks_second(monkeypatch):
+    # Both installed: the choose-default prompt lets the user pick #2 (opencode) as the default.
+    monkeypatch.setattr(bs, "backend_installed", lambda name: True)
+    config = FakeConfig()
+    chosen = select_default_backend(config, input_fn=_inputs("2"), output_fn=lambda _s: None)
+    assert chosen == "opencode"
+    assert config.saved == ["opencode"]
+
+
+def test_select_default_backend_single_list_only(monkeypatch):
+    # The backends are listed exactly ONCE (with install status); the default is chosen from
+    # that same list — no duplicate "Agent backends" / "Which … default" listings.
+    monkeypatch.setattr(bs, "backend_installed", lambda name: True)
+    config = FakeConfig()
+    lines: list[str] = []
+    chosen = select_default_backend(config, input_fn=_inputs(""), output_fn=lines.append)
+    assert chosen == "claude"
+    assert sum(1 for line in lines if "claude (installed)" in line) == 1  # listed only once
+
+
+def test_select_default_backend_enter_keeps_installed_default(monkeypatch):
+    # Exactly one backend installed (opencode): Enter accepts it as the default (it's the listed
+    # default) without installing anything.
+    monkeypatch.setattr(bs, "backend_installed", lambda name: name == "opencode")
+    config = FakeConfig()
+    chosen = select_default_backend(
+        config,
+        input_fn=_inputs(""),
+        output_fn=lambda _s: None,
+        install_fn=lambda name, output_fn: pytest.fail("Enter on the installed default must not install"),
+    )
+    assert chosen == "opencode"
+
+
+def test_select_default_backend_explains_how_to_switch(monkeypatch):
+    # After the default is chosen, the user is told how to change it later: per-run --backend
+    # and the in-app settings menu (repo or global scope).
+    monkeypatch.setattr(bs, "backend_installed", lambda name: True)
+    lines: list[str] = []
+    select_default_backend(FakeConfig(), input_fn=_inputs("1"), output_fn=lines.append)
+    text = "\n".join(lines)
+    assert "--backend" in text
+    assert "Settings" in text and "scope" in text.lower()
 
 
 def test_select_default_backend_skip_keeps_installed_default(monkeypatch):
@@ -61,18 +107,19 @@ def test_select_default_backend_skip_keeps_installed_default(monkeypatch):
 
 
 def test_select_default_backend_installs_chosen_uninstalled(monkeypatch):
-    # claude installed, opencode not; user enters '2' to install opencode, then Enter.
+    # claude installed, opencode not; the user picks '2' (opencode) as the default → opencode is
+    # installed first AND becomes the default (one unified prompt: the number is the default).
     installs = []
     monkeypatch.setattr(bs, "backend_installed", lambda name: name == "claude" or name in installs)
     config = FakeConfig()
     chosen = select_default_backend(
         config,
-        input_fn=_inputs("2", ""),
+        input_fn=_inputs("2"),
         output_fn=lambda _s: None,
         install_fn=lambda name, output_fn: installs.append(name) or True,
     )
     assert installs == ["opencode"]
-    assert chosen == "claude"
+    assert chosen == "opencode"
 
 
 def test_ensure_installed_backend_returns_installed_backend(monkeypatch):
@@ -144,3 +191,21 @@ def test_select_default_summarizer_model_noop_when_models_unlistable(monkeypatch
     config.summarization_model = "preset"
     select_default_summarizer_model(config, "opencode", input_fn=_inputs(), output_fn=lambda _s: None)
     assert config.summarization_model == "preset"  # left unchanged, no prompt shown
+
+
+def test_select_default_summarizer_model_opencode_defaults_to_session_model(monkeypatch):
+    # OpenCode has no known size ordering (smallest_model → None), so the summarizer defaults to
+    # the SAME model as the coding session (summarization_model = None) WITHOUT prompting —
+    # rather than the old behaviour of picking an arbitrary first-listed model.
+    import agitrack.summaries.model_select as ms
+    from agitrack.backends.setup import select_default_summarizer_model
+
+    monkeypatch.setattr(ms, "list_available_models", lambda name: ["openai/gpt-x", "anthropic/claude-y"])
+    config = FakeConfig()
+    config.summarization_model = "preset"
+
+    def _no_input(_prompt):
+        pytest.fail("the OpenCode summarizer default must not prompt")
+
+    select_default_summarizer_model(config, "opencode", input_fn=_no_input, output_fn=lambda _s: None)
+    assert config.summarization_model is None  # None = use the session/coding model at run time
