@@ -50,7 +50,7 @@ def which_executable(name: str) -> str | None:
     return None
 
 
-def resolve_subprocess_command(command: list[str]) -> list[str]:
+def resolve_subprocess_command(command: list[str]) -> list[str] | str:
     """Resolve *command* for ``subprocess`` on the current OS.
 
     On Windows, look the executable up via PATH/PATHEXT (so a bare ``claude`` finds the npm
@@ -59,7 +59,15 @@ def resolve_subprocess_command(command: list[str]) -> list[str]:
     ``CreateProcess`` (what ``subprocess`` uses with ``shell=False``) executes a batch file.
     On POSIX, returns *command* unchanged.
 
-    This is the flat-list ``subprocess`` counterpart of the ConPTY launch path's
+    For the ``.cmd``/``.bat`` case the result is a fully-quoted command-LINE STRING, not an
+    arg list (``subprocess.run`` accepts either on Windows). ``cmd.exe`` strips ONE layer of
+    quotes from the text after ``/c``; if we returned the list ``[cmd, "/c", exe, *args]``,
+    ``subprocess`` would render ``cmd /c "exe" "arg with space"`` and that strip would split a
+    spaced exe path (e.g. a npm shim under ``C:\\Users\\First Last\\…``) or a spaced argument.
+    Wrapping the whole inner command in an EXTRA pair of quotes — ``cmd /c "<inner>"`` — makes
+    ``cmd`` strip exactly that pair and run the inner command (with its own quoting) intact.
+
+    This is the ``subprocess`` counterpart of the ConPTY launch path's
     ``_resolve_windows_command``: without it, every non-TUI backend invocation (summarizer,
     model listing) raised ``FileNotFoundError`` on Windows, so summarization silently fell
     back to the prompt-led commit message.
@@ -68,7 +76,9 @@ def resolve_subprocess_command(command: list[str]) -> list[str]:
         return command
     exe = which_executable(command[0]) or command[0]
     if exe.lower().endswith((".cmd", ".bat")):
-        return [os.environ.get("COMSPEC", "cmd.exe"), "/c", exe, *command[1:]]
+        comspec = os.environ.get("COMSPEC", "cmd.exe")
+        inner = subprocess.list2cmdline([exe, *command[1:]])
+        return f'"{comspec}" /c "{inner}"'
     return [exe, *command[1:]]
 
 

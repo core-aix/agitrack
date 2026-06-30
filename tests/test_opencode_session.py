@@ -666,6 +666,9 @@ def test_opencode_bare_run_folds_system_prompt_into_prompt(monkeypatch):
     )
     # Force POSIX stdin-vs-argv routing so the assertion is cross-platform.
     monkeypatch.setattr(O, "_IS_WINDOWS", False)
+    # Also force resolve_subprocess_command to pass through, so a locally-installed opencode.cmd
+    # isn't wrapped into a cmd.exe /c STRING (which would make captured["cmd"] a str, not a list).
+    monkeypatch.setattr("agitrack.proc._IS_WINDOWS", False)
     backend = OpenCodeBackend(repo=Path("/tmp"))
 
     backend.run("TRACE", model=None, session_id=None, bare=True, system_prompt="SUMMARIZE THIS")

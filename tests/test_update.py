@@ -1,3 +1,4 @@
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -334,7 +335,10 @@ def _record_run(monkeypatch, *, returncode=0, stdout="", stderr=""):
 
 def test_apply_package_primary_path_is_running_interpreter_pip(monkeypatch):
     # The manager-independent path: the running interpreter's own pip, used for a
-    # plain pip / venv / --user / pipx install alike — no pipx/brew shell-out.
+    # plain pip / venv / --user / pipx install alike — no pipx/brew shell-out. Windows
+    # defers the upgrade to a post-exit helper (its own tests below), so pin a POSIX
+    # platform here to exercise the in-process pip path on any host.
+    monkeypatch.setattr("agitrack.update.updater.sys.platform", "linux", raising=False)
     updater = Updater(source_repo=None)
     monkeypatch.setattr(updater, "_has_module_pip", lambda python: True)
     monkeypatch.setattr(updater, "_installed_version", lambda: "2.0.0")
@@ -345,9 +349,11 @@ def test_apply_package_primary_path_is_running_interpreter_pip(monkeypatch):
 
 
 def test_apply_package_detaches_pip_from_terminal(monkeypatch):
-    # The upgrade must run in its OWN session so a terminal-close SIGHUP (the user
-    # quitting VS Code mid-upgrade) can't kill pip between uninstall and reinstall
-    # and leave aGiTrack uninstalled.
+    # The in-process (POSIX) upgrade must run in its OWN session so a terminal-close SIGHUP
+    # (the user quitting VS Code mid-upgrade) can't kill pip between uninstall and reinstall
+    # and leave aGiTrack uninstalled. (On Windows the upgrade is deferred to a detached helper
+    # instead — see the launch_pip_bootstrapper tests.)
+    monkeypatch.setattr("agitrack.update.updater.sys.platform", "linux", raising=False)
     updater = Updater(source_repo=None)
     monkeypatch.setattr(updater, "_has_module_pip", lambda python: True)
     monkeypatch.setattr(updater, "_installed_version", lambda: "2.0.0")
@@ -361,14 +367,17 @@ def test_apply_package_detaches_pip_from_terminal(monkeypatch):
     monkeypatch.setattr("agitrack.update.updater.subprocess.run", fake_run)
     assert updater.apply().ok
     assert seen["cmd"][-3:] == ["install", "--upgrade", "agitrack"]
-    # POSIX uses start_new_session; Windows uses creationflags (CREATE_NEW_PROCESS_GROUP etc.)
-    if sys.platform == "win32":
+    # The upgrade detaches from the terminal; the mechanism comes from detach_kwargs(), which
+    # keys off the real host OS (POSIX start_new_session vs. Windows creationflags), not the
+    # simulated platform above — so assert per the actual host.
+    if os.name == "nt":
         assert "creationflags" in seen["kwargs"]
     else:
         assert seen["kwargs"].get("start_new_session") is True
 
 
 def test_apply_package_pip_falls_back_to_pip3_on_path(monkeypatch):
+    monkeypatch.setattr("agitrack.update.updater.sys.platform", "linux", raising=False)
     updater = Updater(source_repo=None)
     monkeypatch.setattr(updater, "_has_module_pip", lambda python: False)  # no `python -m pip`
     monkeypatch.setattr(
@@ -382,6 +391,7 @@ def test_apply_package_pip_falls_back_to_pip3_on_path(monkeypatch):
 
 def test_apply_package_pip_failure_reports_last_line(monkeypatch):
     # A non-PEP668 pip failure surfaces the error tail and does NOT try a manager.
+    monkeypatch.setattr("agitrack.update.updater.sys.platform", "linux", raising=False)
     updater = Updater(source_repo=None)
     monkeypatch.setattr(updater, "_has_module_pip", lambda python: True)
     calls = _record_run(monkeypatch, returncode=1, stderr="boom\nERROR: could not install")
@@ -393,6 +403,9 @@ def test_apply_package_pip_failure_reports_last_line(monkeypatch):
 
 def test_apply_package_pep668_under_homebrew_defers_to_brew(monkeypatch):
     # Externally-managed (PEP 668) pip refusal + a Homebrew-owned install → brew upgrade.
+    # PEP 668 is a POSIX (Homebrew/distro) condition; pin the platform so this never hits
+    # the Windows deferral.
+    monkeypatch.setattr("agitrack.update.updater.sys.platform", "linux", raising=False)
     updater = Updater(source_repo=None)
     monkeypatch.setattr(updater, "_has_module_pip", lambda python: True)
     monkeypatch.setattr(updater, "_install_method", lambda: METHOD_HOMEBREW)
@@ -416,6 +429,7 @@ def test_apply_package_pep668_under_homebrew_defers_to_brew(monkeypatch):
 
 def test_apply_package_pep668_without_manager_enumerates_routes(monkeypatch):
     # PEP 668 refusal but not a recognisable Homebrew install → full enumeration.
+    monkeypatch.setattr("agitrack.update.updater.sys.platform", "linux", raising=False)
     updater = Updater(source_repo=None)
     monkeypatch.setattr(updater, "_has_module_pip", lambda python: True)
     monkeypatch.setattr(updater, "_install_method", lambda: METHOD_PIP)
@@ -736,9 +750,22 @@ def test_restart_agitrack_without_extra_args_preserves_argv(monkeypatch):
 
 
 class _StartupUpdater:
-    def __init__(self, status: UpdateStatus, *, apply_result: UpdateStatus | None = None):
+    def __init__(
+        self,
+        status: UpdateStatus,
+        *,
+        apply_result: UpdateStatus | None = None,
+        defer_pip: bool = False,
+        defer_msi: bool = False,
+    ):
         self._status = status
         self._apply_result = apply_result
+        self._defer_pip = defer_pip  # mimic the Windows post-exit pip deferral
+        self._defer_msi = defer_msi  # mimic the Windows MSI download-then-install-after-exit
+        self.pending_pip_upgrade = None
+        self.pending_msi_path = None
+        self.bootstrapped = False
+        self.msi_handed_off = False
         self.checked = False
         self.applied = False
 
@@ -749,9 +776,23 @@ class _StartupUpdater:
 
     def apply(self) -> UpdateStatus:
         self.applied = True
+        if self._defer_pip:
+            self.pending_pip_upgrade = ["python", "-m", "pip", "install", "--upgrade", "agitrack"]
+            return UpdateStatus(kind=KIND_PACKAGE, message="aGiTrack will finish updating after it exits.")
+        if self._defer_msi:
+            self.pending_msi_path = "C:/Temp/agitrack-9.9.9-windows-x64.msi"
+            return UpdateStatus(kind=KIND_PACKAGE, message="Downloaded aGiTrack 9.9.9.")
         if self._apply_result is not None:
             return self._apply_result
         return UpdateStatus(kind=self._status.kind, message="updated", current="new")
+
+    def launch_pip_bootstrapper(self, extra_args=()) -> bool:
+        self.bootstrapped = True
+        return True
+
+    def launch_msi_bootstrapper(self, extra_args=()) -> bool:
+        self.msi_handed_off = True
+        return True
 
     def manual_update_instructions(self) -> str:
         return "update it with whichever tool installed it — pip — `pip install --upgrade agitrack`"
@@ -767,6 +808,52 @@ def test_startup_prompt_applies_and_restarts(monkeypatch, tmp_path: Path):
     cli._check_for_update_at_startup(config)
     assert updater.applied is True
     assert restarted == [True]
+
+
+def test_startup_deferred_pip_spawns_bootstrapper_and_exits(monkeypatch, tmp_path: Path):
+    # Windows package install: apply() defers the pip upgrade (the running agitrack.exe is
+    # locked), so startup must spawn the post-exit helper and EXIT — never re-exec the old
+    # version in place (which would relaunch unchanged) and never run pip itself.
+    config = GlobalConfig(path=tmp_path / "c.json")
+    updater = _StartupUpdater(_available_status(), defer_pip=True)
+    restarted = []
+    monkeypatch.setattr("agitrack.update.Updater", lambda *a, **k: updater)
+    monkeypatch.setattr("agitrack.update.restart_agitrack", lambda: restarted.append(True))
+    monkeypatch.setattr("builtins.input", lambda *a: "y")
+    with pytest.raises(SystemExit) as exc:
+        cli._check_for_update_at_startup(config)
+    assert exc.value.code == 0
+    assert updater.bootstrapped is True  # helper spawned to finish the upgrade after we exit
+    assert restarted == []  # did NOT re-exec the current (un-upgraded) version
+
+
+def test_startup_deferred_pip_bootstrapper_failure_keeps_running(monkeypatch, tmp_path: Path):
+    # If the helper can't be spawned, aGiTrack keeps running the current version, records the
+    # pending update for the next-startup reminder, and does not exit.
+    config = GlobalConfig(path=tmp_path / "c.json")
+    updater = _StartupUpdater(_available_status(), defer_pip=True)
+    monkeypatch.setattr(updater, "launch_pip_bootstrapper", lambda *a, **k: False)
+    monkeypatch.setattr("agitrack.update.Updater", lambda *a, **k: updater)
+    monkeypatch.setattr("builtins.input", lambda *a: "y")
+    cli._check_for_update_at_startup(config)  # returns normally, no SystemExit
+    assert config.pending_manual_update  # reminder recorded for next launch
+
+
+def test_startup_deferred_msi_hands_off_to_installer_and_exits(monkeypatch, tmp_path: Path):
+    # Windows MSI build: apply() only downloads the installer (it replaces the running
+    # agitrack.exe), so startup must hand off to the elevated installer and EXIT — not re-exec
+    # the current version, which would re-offer the update on every launch without installing.
+    config = GlobalConfig(path=tmp_path / "c.json")
+    updater = _StartupUpdater(_available_status(), defer_msi=True)
+    restarted = []
+    monkeypatch.setattr("agitrack.update.Updater", lambda *a, **k: updater)
+    monkeypatch.setattr("agitrack.update.restart_agitrack", lambda: restarted.append(True))
+    monkeypatch.setattr("builtins.input", lambda *a: "y")
+    with pytest.raises(SystemExit) as exc:
+        cli._check_for_update_at_startup(config)
+    assert exc.value.code == 0
+    assert updater.msi_handed_off is True  # elevated installer started
+    assert restarted == []  # did NOT re-exec the current (un-installed) version
 
 
 def test_startup_check_uses_short_timeout(monkeypatch, tmp_path: Path):

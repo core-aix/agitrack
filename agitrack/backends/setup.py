@@ -176,7 +176,9 @@ def _install_plan(name: str, info: dict, npm: str | None, which: Callable[[str],
     """Ordered (description, command) install attempts for the current OS. POSIX prefers the
     backend's self-contained official installer (no Node needed); npm is the cross-platform
     fallback, and the only route on Windows."""
-    plan: list[tuple[str, list[str]]] = []
+    # The command is either an arg list or, for a Windows .cmd shim (npm.cmd), a fully-quoted
+    # command-LINE string from resolve_subprocess_command — subprocess.run accepts both.
+    plan: list[tuple[str, list[str] | str]] = []
     if os.name != "nt" and which("bash") and which("curl"):
         plan.append((info["unix"], ["bash", "-lc", info["unix"]]))
     if npm:
@@ -244,44 +246,51 @@ def select_default_backend(
     output_fn: Callable[[str], None] = print,
     install_fn: Callable[..., bool] = install_backend,
 ) -> str:
-    """First-run backend setup. Shows every agent backend with its install status, then
-    asks whether to install any of the UNINSTALLED ones — a single one (by number) or all
-    of them ('all'). Already-installed backends are just shown as installed, never offered
-    for (re)install, and skipping is always allowed. Saves and returns the default backend
-    (the first installed one, or the first listed when none is installed yet — the launch
-    gate then offers to install that one before the agent starts)."""
+    """First-run backend setup. Lists each agent backend ONCE with its install status, then asks
+    which to use as the DEFAULT in a single prompt. The number selects the default coding agent;
+    a not-yet-installed choice is installed first (if that install is declined or fails it stays
+    the default and the launch-time gate offers to install it before the agent starts). Pressing
+    Enter accepts the default — the first installed backend, or the first listed when none is
+    installed yet (then installed at launch). Saves and returns the chosen default, then explains
+    how to change it later."""
     names = available_backends()
     while True:
         installed = [name for name in names if backend_installed(name)]
-        uninstalled = [name for name in names if name not in installed]
-        output_fn("Agent backends:")
+        # Leading blank line so this question is visually separated from the preceding startup
+        # output (the update prompt / git-identity setup).
+        output_fn("\nAgent backends:")
         for index, name in enumerate(names, start=1):
             output_fn(f"  {index}. {name} ({'installed' if name in installed else 'not installed'})")
-        if not uninstalled:
-            break  # everything installed — nothing to offer
-        choices = "its number to install it" + (
-            ", 'all' to install every uninstalled one" if len(uninstalled) > 1 else ""
-        )
-        lead = "Install any of the uninstalled backends?" if installed else "No backend is installed yet."
-        answer = input_fn(f"\n{lead} Enter {choices}, or press Enter to skip: ").strip().lower()
+        default_index = (names.index(installed[0]) + 1) if installed else 1
+        hint = "; a not-installed choice is installed first" if len(installed) < len(names) else ""
+        answer = input_fn(
+            f"\nWhich coding agent should aGiTrack use by default? "
+            f"Enter a number [1-{len(names)}] (default {default_index}){hint}: "
+        ).strip()
         if not answer:
+            # Accept the default WITHOUT installing — a not-yet-installed default is left to the
+            # launch-time gate, preserving the "skip now, install at launch" path.
+            chosen = names[default_index - 1]
             break
-        if answer in {"all", "a"}:
-            for name in uninstalled:
-                install_fn(name, output_fn=output_fn)
-            continue  # re-show with refreshed statuses
         if answer.isdigit() and 1 <= int(answer) <= len(names):
-            name = names[int(answer) - 1]
-            if name in installed:
-                output_fn(f"{name} is already installed.\n")
-            else:
-                install_fn(name, output_fn=output_fn)
-            continue
-        output_fn("Please enter a valid number, 'all', or press Enter to skip.\n")
-    installed = [name for name in names if backend_installed(name)]
-    default = installed[0] if installed else names[0]
-    config.default_backend = default
-    return default
+            chosen = names[int(answer) - 1]
+            if chosen not in installed:
+                install_fn(chosen, output_fn=output_fn)  # explicit pick of an uninstalled one → install now
+            break
+        output_fn("Please enter a valid number, or press Enter for the default.")
+    config.default_backend = chosen
+    _explain_default_backend_switching(chosen, output_fn=output_fn)
+    return chosen
+
+
+def _explain_default_backend_switching(default: str, *, output_fn: Callable[[str], None]) -> None:
+    """After the default is chosen, tell the user it is saved and how to switch it later — for
+    a single run, or persistently for this repo or globally via the in-app settings menu."""
+    output_fn(f"\nDefault coding agent set to {default}.")
+    output_fn("You can change it later:")
+    output_fn("  - for a single run:           agitrack --backend <claude|opencode>")
+    output_fn("  - for this repo or globally:  open the aGiTrack menu (Ctrl-G by default) -> Settings ->")
+    output_fn('                                "Default coding agent", choosing repo or global scope when saving.')
 
 
 def select_default_summarizer_model(
@@ -291,9 +300,18 @@ def select_default_summarizer_model(
     input_fn: Callable[[str], str] = input,
     output_fn: Callable[[str], None] = print,
 ) -> None:
-    """First-run prompt (after the backend is chosen): pick the model aGiTrack uses
-    to summarize each commit, saved as the global default. For Claude the smallest
-    (Haiku) tier is the recommended default since summarization is a cheap task.
+    """First-run setup (after the backend is chosen) for the model aGiTrack uses to summarize
+    each commit, saved as the global default.
+
+    The default depends on whether the backend has a known size ordering:
+
+    * **Claude** — summarization is a cheap task, so default to the smallest (Haiku) tier. The
+      user is still offered the larger tiers (and "same as the session model"), defaulting to
+      the smallest.
+    * **Backends with no known size ordering (e.g. OpenCode)** — there is no meaningful
+      "smallest" to recommend, so default to the SAME model as the coding session
+      (``summarization_model = None``) without prompting.
+
     Silently leaves the default unchanged when the backend's models can't be listed."""
     from agitrack.summaries.model_select import list_available_models, smallest_model
 
@@ -301,7 +319,19 @@ def select_default_summarizer_model(
     if not models:
         return
     smallest = smallest_model(backend_name, models)
-    ordered = [smallest, *(m for m in models if m != smallest)] if smallest else list(models)
+    if smallest is None:
+        # No known size ordering (e.g. OpenCode): summarize with the SAME model as the coding
+        # session rather than guessing a tier. ``None`` means "use the session model" at run
+        # time (see ProxyRunner._make_summarizer). Don't prompt — there's nothing meaningful to
+        # choose between, and the previous behaviour of defaulting to an arbitrary first listed
+        # model was wrong.
+        config.summarization_model = None
+        output_fn(
+            f"\naGiTrack will summarize each commit with the same {backend_name} model as your "
+            "coding session (change it later via the menu → Settings)."
+        )
+        return
+    ordered = [smallest, *(m for m in models if m != smallest)]
     output_fn("\nChoose the model aGiTrack uses to summarize each commit (a cheap task):")
     for index, model in enumerate(ordered, start=1):
         tag = "  (smallest — recommended)" if model == smallest else ""

@@ -5,6 +5,7 @@ All subprocess and filesystem calls are mocked — no real git, pip, or network.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -270,7 +271,10 @@ def test_latest_package_version_unrecognised_output_returns_none():
 # ---------------------------------------------------------------------------
 
 
-def test_apply_package_pip_non_pep668_failure_sets_error():
+def test_apply_package_pip_non_pep668_failure_sets_error(monkeypatch):
+    # The in-process pip path is POSIX-only (Windows defers); pin the platform so this runs
+    # the same on any host.
+    monkeypatch.setattr("agitrack.update.updater.sys.platform", "linux", raising=False)
     updater = _make_updater_package()
     pip_result = _completed(1, stdout="", stderr="some unrelated error\nfailed to upgrade")
     with (
@@ -283,11 +287,139 @@ def test_apply_package_pip_non_pep668_failure_sets_error():
 
 
 # ---------------------------------------------------------------------------
+# _apply_package: Windows defers the upgrade to a post-exit helper
+# ---------------------------------------------------------------------------
+
+
+def test_apply_package_windows_defers_without_running_pip(monkeypatch):
+    # On Windows the running agitrack.exe is locked, so pip CANNOT replace it in place — an
+    # in-process upgrade deletes package files then fails on the exe, corrupting the install.
+    # apply() must instead record the command and return success WITHOUT running pip.
+    monkeypatch.setattr("agitrack.update.updater.sys.platform", "win32", raising=False)
+    updater = _make_updater_package()
+    with (
+        patch.object(updater, "_pip_invocation", return_value=["python", "-m", "pip"]),
+        patch("agitrack.update.updater.subprocess.run") as mock_run,
+    ):
+        status = updater._apply_package()
+    mock_run.assert_not_called()  # the corrupting in-place upgrade never runs
+    assert status.error is None
+    assert updater.pending_pip_upgrade == ["python", "-m", "pip", "install", "--upgrade", "agitrack"]
+
+
+def test_launch_pip_bootstrapper_spawns_detached_helper(monkeypatch):
+    monkeypatch.setattr("agitrack.update.updater.sys.platform", "win32", raising=False)
+    updater = _make_updater_package()
+    updater.pending_pip_upgrade = ["python", "-m", "pip", "install", "--upgrade", "agitrack"]
+    with (
+        patch("agitrack.update.updater._restart_command", return_value=["python", "-m", "agitrack", "--verbose"]),
+        patch("agitrack.update.updater.subprocess.Popen") as mock_popen,
+    ):
+        assert updater.launch_pip_bootstrapper(["--skip-privacy-ack"]) is True
+    mock_popen.assert_called_once()
+    argv, kwargs = mock_popen.call_args
+    cmd = argv[0]
+    assert cmd[0] == "powershell"
+    script = cmd[-1]
+    # The helper waits for THIS pid, runs the recorded pip upgrade, then relaunches aGiTrack.
+    assert str(os.getpid()) in script
+    assert "install" in script and "--upgrade" in script and "agitrack" in script
+    assert "Start-Process" in script and "--verbose" in script
+    # Detached so it outlives this process; detach_kwargs() keys off the real host OS (Windows
+    # creationflags vs. POSIX start_new_session), not the patched platform, so assert per host.
+    if os.name == "nt":
+        assert "creationflags" in kwargs
+    else:
+        assert kwargs.get("start_new_session") is True
+
+
+def test_launch_pip_bootstrapper_noop_without_pending():
+    updater = _make_updater_package()
+    updater.pending_pip_upgrade = None
+    assert updater.launch_pip_bootstrapper() is False
+
+
+def test_launch_pip_bootstrapper_noop_off_windows(monkeypatch):
+    monkeypatch.setattr("agitrack.update.updater.sys.platform", "linux", raising=False)
+    updater = _make_updater_package()
+    updater.pending_pip_upgrade = ["python", "-m", "pip", "install", "--upgrade", "agitrack"]
+    assert updater.launch_pip_bootstrapper() is False
+
+
+def test_launch_pip_bootstrapper_returns_false_on_spawn_error(monkeypatch):
+    monkeypatch.setattr("agitrack.update.updater.sys.platform", "win32", raising=False)
+    updater = _make_updater_package()
+    updater.pending_pip_upgrade = ["python", "-m", "pip", "install", "--upgrade", "agitrack"]
+    with (
+        patch("agitrack.update.updater._restart_command", return_value=["python", "-m", "agitrack"]),
+        patch("agitrack.update.updater.subprocess.Popen", side_effect=OSError("no powershell")),
+    ):
+        assert updater.launch_pip_bootstrapper() is False
+
+
+# ---------------------------------------------------------------------------
+# launch_msi_bootstrapper: shared elevated MSI hand-off (startup + in-session)
+# ---------------------------------------------------------------------------
+
+
+def test_launch_msi_bootstrapper_starts_elevated_install_and_relaunch(monkeypatch, tmp_path):
+    monkeypatch.setattr("agitrack.update.updater.sys.platform", "win32", raising=False)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    updater = _make_updater_package()
+    updater.pending_msi_path = str(tmp_path / "agitrack-9.9.9-windows-x64.msi")
+    runas: list = []
+    popen: list = []
+    monkeypatch.setattr("agitrack.proc.shell_execute_runas", lambda file, params="": runas.append((file, params)))
+    monkeypatch.setattr("agitrack.update.updater.subprocess.Popen", lambda cmd, **kw: popen.append((cmd, kw)))
+    with patch.object(updater, "msi_install_dir", return_value=str(tmp_path / "install")):
+        assert updater.launch_msi_bootstrapper(["--skip-privacy-ack"]) is True
+    # Elevated install started via runas on cmd.exe → the bootstrapper .cmd.
+    assert runas and runas[0][0] == "cmd.exe" and "agitrack-update.cmd" in runas[0][1]
+    # A detached PowerShell relauncher was spawned to restart after the install.
+    assert popen and popen[0][0][0] == "powershell"
+    # The relaunch args were recorded with the extra flag for the relauncher to read back.
+    last = (tmp_path / "aGiTrack" / "last-args.txt").read_text(encoding="utf-8")
+    assert "--skip-privacy-ack" in last
+
+
+def test_launch_msi_bootstrapper_returns_false_when_uac_declined(monkeypatch, tmp_path):
+    monkeypatch.setattr("agitrack.update.updater.sys.platform", "win32", raising=False)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    updater = _make_updater_package()
+    updater.pending_msi_path = str(tmp_path / "x.msi")
+    popen: list = []
+
+    def _deny(file, params=""):
+        raise OSError("user declined UAC")
+
+    monkeypatch.setattr("agitrack.proc.shell_execute_runas", _deny)
+    monkeypatch.setattr("agitrack.update.updater.subprocess.Popen", lambda *a, **k: popen.append(a))
+    with patch.object(updater, "msi_install_dir", return_value=str(tmp_path)):
+        assert updater.launch_msi_bootstrapper() is False
+    assert popen == []  # the relauncher must NOT spawn when the elevated install didn't start
+
+
+def test_launch_msi_bootstrapper_noop_without_pending():
+    updater = _make_updater_package()
+    updater.pending_msi_path = None
+    assert updater.launch_msi_bootstrapper() is False
+
+
+def test_launch_msi_bootstrapper_noop_off_windows(monkeypatch, tmp_path):
+    monkeypatch.setattr("agitrack.update.updater.sys.platform", "linux", raising=False)
+    updater = _make_updater_package()
+    updater.pending_msi_path = str(tmp_path / "x.msi")
+    assert updater.launch_msi_bootstrapper() is False
+
+
+# ---------------------------------------------------------------------------
 # _apply_package: brew upgrade path
 # ---------------------------------------------------------------------------
 
 
-def test_apply_package_brew_upgrade_called_on_homebrew_install():
+def test_apply_package_brew_upgrade_called_on_homebrew_install(monkeypatch):
+    # PEP 668 / Homebrew is a POSIX condition; pin the platform off the Windows deferral.
+    monkeypatch.setattr("agitrack.update.updater.sys.platform", "linux", raising=False)
     updater = _make_updater_package()
     # Simulate pip refusing with PEP 668, then brew succeeding.
     pip_result = _completed(1, stderr="externally-managed-environment error")

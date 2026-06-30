@@ -146,7 +146,12 @@ class ConPTY:
         self._closed = False
 
     def spawn(self, appname: str, cmdline: str = "", cwd: str | None = None, env: str | None = None) -> None:
-        full = appname if not cmdline else f"{appname} {cmdline}"
+        # lpApplicationName is NULL below, so CreateProcess derives the program from the command
+        # line — quote the program path so a spaced install path (e.g. under "Program Files") is
+        # taken as a single token rather than split at the first space. cmdline carries its own
+        # quoting (see nt._resolve_windows_command).
+        quoted_app = f'"{appname}"'
+        full = quoted_app if not cmdline else f"{quoted_app} {cmdline}"
         # Attribute list carrying the pseudoconsole handle.
         size = ctypes.c_size_t(0)
         _k32.InitializeProcThreadAttributeList(None, 1, 0, byref(size))
