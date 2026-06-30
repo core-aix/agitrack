@@ -28,7 +28,7 @@ import json
 from datetime import datetime, timedelta, timezone
 
 from agitrack.git import GitRepo
-from agitrack.metrics.collect import CommitStat, Dashboard, build_dashboard
+from agitrack.metrics.collect import CommitStat, Dashboard, apply_numstat_for, build_dashboard
 
 
 def render_html(repo: GitRepo, ref: str = "HEAD") -> str:
@@ -453,6 +453,7 @@ def _log_entry(dash: Dashboard, stat: CommitStat, covers: dict[str, CommitStat])
 def log_page(
     dash: Dashboard,
     *,
+    repo: GitRepo | None = None,
     author: str = "",
     backend: str = "",
     model: str = "",
@@ -464,13 +465,20 @@ def log_page(
 ) -> dict:
     """One page of the commit log for the given filters and sort order. Only this
     page's commits carry the heavy message / squash constituents, so memory and
-    payload stay bounded however deep the history is."""
+    payload stay bounded however deep the history is.
+
+    When ``repo`` is given, the page's commits get their exact insertions/deletions
+    fetched on demand — and *only* those commits' blobs are fetched, so a blobless
+    partial clone never pulls its whole history just to render one page (the
+    full-history scan in :func:`collect_commit_stats` counts from local blobs alone)."""
     stats = _filter_stats(dash, author=author, backend=backend, model=model, frm=frm, to=to)
     stats = _sorted_for_log(stats, sort)
     covers = _covers(dash)
     offset = max(0, offset)
     limit = max(1, min(limit, 200))
     page = stats[offset : offset + limit]
+    if repo is not None and page:
+        apply_numstat_for(repo, [stat.sha for stat in page], {stat.sha: stat for stat in page})
     return {
         "total": len(stats),
         "offset": offset,

@@ -436,7 +436,7 @@ def test_fetch_lists_with_filter_and_reads_transcript_on_demand():
             return True
 
         def ref_exists(self, ref):
-            return False  # no legacy ref
+            return False  # no mirror ref
 
         def root_commit(self):
             return "abc"
@@ -463,9 +463,9 @@ def test_fetch_lists_with_filter_and_reads_transcript_on_demand():
 
     store = SharedSessionStore(FakeRepo())  # type: ignore[arg-type]
     assert store.fetch() is True
-    # The listing fetches both refs (legacy + current) with the size filter so a
-    # session shared by a pre-rename peer still lists.
-    assert fetches == ["blob:limit=16k", "blob:limit=16k"]
+    # The listing fetches the shared ref into the mirror with the size filter so listing
+    # stays fast (only the small manifests transfer).
+    assert fetches == ["blob:limit=16k"]
     entry = store.entries()[0]
     # The transcript blob (omitted by the partial listing) is fetched by id on demand —
     # a plain ref fetch wouldn't backfill it.
@@ -490,7 +490,7 @@ def test_fetch_passes_timeout_through_to_git(tmp_path):
 
     store = SharedSessionStore(FakeRepo())  # type: ignore[arg-type]
     assert store.fetch(timeout=12.0) is True
-    assert seen == [12.0, 12.0]  # the same timeout bounds both the legacy and current fetch
+    assert seen == [12.0]  # the timeout bounds the listing fetch
 
 
 def test_run_bounded_cancel_kills_process_promptly(tmp_path):
@@ -1129,7 +1129,7 @@ class _PublishFakeRepo:
         return True
 
     def ref_exists(self, ref):
-        return False  # no legacy ref present
+        return False  # no mirror ref present
 
     def root_commit(self):
         return "fp"
@@ -1210,24 +1210,6 @@ def test_unshare_removes_only_that_entry(tmp_path):
     store.publish(github_id="alice", name="drop", transcript="d", manifest=_manifest("drop", session_id="d", updated=2))
     store.unshare("alice", "drop")
     assert [e.name for e in store.entries()] == ["keep"]
-
-
-def test_unshare_removes_a_session_living_in_the_legacy_ref(tmp_path):
-    # A session shared before the aGiT -> aGiTrack rename lives only under the legacy
-    # ref. Unsharing must remove it there too, or it keeps surfacing in entries().
-    from agitrack.sessions.store import LEGACY_REF
-
-    repo = _init_repo(tmp_path)
-    # Seed an entry directly into the legacy ref (as an old aGiT client would have).
-    legacy = SharedSessionStore(repo, ref=LEGACY_REF)
-    legacy._add_session("alice", "old-sess", "t", _manifest("old-sess", session_id="o", updated=1))
-
-    store = SharedSessionStore(repo)  # current-ref store, as the running app uses
-    assert [e.name for e in store.entries()] == ["old-sess"]  # visible via the legacy merge
-
-    store.unshare("alice", "old-sess")
-    assert store.entries() == []  # gone from the legacy ref, not just the current one
-    assert not any(k.startswith(store._prefix()) for k in repo.read_tree_paths(LEGACY_REF))
 
 
 @_posix_git_gc
@@ -2935,7 +2917,7 @@ def test_unshare_falls_back_to_full_fetch_when_partial_unsupported(tmp_path):
             return True
 
         def ref_exists(self, ref):
-            return False  # no legacy ref present
+            return False  # no mirror ref present
 
         def root_commit(self):
             return "fp"

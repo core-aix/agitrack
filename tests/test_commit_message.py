@@ -565,7 +565,7 @@ def test_agent_merge_message_format():
     message = build_agent_merge_message(
         session_name="feature-x",
         base_branch="main",
-        source_branch="agit/feature-x/t2",
+        source_branch="agitrack/feature-x/t2",
         agitrack_session_id="agit-1",
         backend="claude",
         backend_session_id="ses-9",
@@ -574,7 +574,7 @@ def test_agent_merge_message_format():
     assert message.splitlines()[0].startswith("<aGiTrack-merge> ")
     assert "commit_type: agent-merge" in message
     assert "session_name: feature-x" in message
-    assert "source_branch: agit/feature-x/t2" in message
+    assert "source_branch: agitrack/feature-x/t2" in message
     assert "base_branch: main" in message
     assert "backend_session_id: ses-9" in message
     assert "abc123 base edit" in message

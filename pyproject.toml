@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 # Ship ONLY the import package (and its subpackages). Without this, setuptools'
 # flat-layout auto-discovery scans every top-level directory and fails the build
-# the moment a non-excluded one appears (e.g. `dev/` for maintenance docs):
-# "Multiple top-level packages discovered in a flat-layout: ['dev', 'agitrack']".
+# the moment a non-excluded one appears (e.g. `devtools/` for maintenance tooling):
+# "Multiple top-level packages discovered in a flat-layout: ['devtools', 'agitrack']".
 # Pinning the package set keeps the build stable as repo-root dirs come and go.
 [tool.setuptools.packages.find]
 include = ["agitrack*"]

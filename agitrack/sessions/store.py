@@ -26,17 +26,13 @@ from agitrack.git import GitRepo
 from agitrack.sessions.identity import slug
 
 REF = "refs/agitrack/shared-sessions"
-# Sessions shared by a peer still running pre-rename aGiT land under the old ref.
-# Reads merge both (new wins); writes only ever touch the new ref.
-LEGACY_REF = "refs/agit/shared-sessions"
-# Read-only MIRROR of the remote refs, used by the dashboard's listing fetch. The
-# listing path fetches the remote into these instead of force-overwriting the canonical
-# local refs above — so a remote that's momentarily behind (a share whose push lagged or
+# Read-only MIRROR of the remote ref, used by the dashboard's listing fetch. The
+# listing path fetches the remote into this instead of force-overwriting the canonical
+# local ref above — so a remote that's momentarily behind (a share whose push lagged or
 # failed) can never rewind your own freshly-shared session out of the local ref. The
-# listing then unions the local refs with these mirrors, newest copy winning (see
-# ``listing_entries``).
+# listing then unions the local ref with this mirror, newest copy winning (see
+# ``entries``).
 REMOTE_MIRROR = "refs/agitrack/shared-sessions-remote"
-LEGACY_MIRROR = "refs/agit/shared-sessions-remote"
 DEFAULT_KEEP = 5  # most-recent shared sessions retained per contributor
 # Throttle remote fetches when the dashboard polls. Your OWN shared sessions land
 # in the local ref directly (no fetch needed); this only pulls collaborators'
@@ -50,7 +46,7 @@ class SharedEntry:
     github_id: str  # the lineage origin owner = the ref path's owner component
     name: str
     manifest: dict
-    source_ref: str = REF  # the ref this entry was read from (legacy entries differ)
+    source_ref: str = REF  # the ref this entry was read from (local ref or remote mirror)
 
     @property
     def contributors(self) -> list[str]:
@@ -215,18 +211,18 @@ class SharedSessionStore:
     def entries(self) -> list[SharedEntry]:
         """Shared sessions for *this* repo, newest first (by manifest ``updated``).
 
-        Unions four sources, keeping the NEWEST copy of each session: the canonical local
-        ref — which always holds YOUR own freshly-shared sessions — its legacy counterpart
-        (a pre-rename peer's shares), and the two remote MIRRORS the listing fetch keeps
-        (collaborators' sessions, plus possibly a stale copy of your own). Newest-wins —
-        rather than "local wins" — is what keeps a remote that's momentarily behind from
-        making your just-shared session look old: the listing fetch (:meth:`fetch`) writes
-        only the mirrors, never the local ref, so your fresh local copy is never rewound and
-        wins the tie against a stale mirror. The local ref is read unconditionally (it always
-        exists once you've shared); the others are skipped until they exist."""
+        Unions two sources, keeping the NEWEST copy of each session: the canonical local
+        ref — which always holds YOUR own freshly-shared sessions — and the remote MIRROR
+        the listing fetch keeps (collaborators' sessions, plus possibly a stale copy of your
+        own). Newest-wins — rather than "local wins" — is what keeps a remote that's
+        momentarily behind from making your just-shared session look old: the listing fetch
+        (:meth:`fetch`) writes only the mirror, never the local ref, so your fresh local copy
+        is never rewound and wins the tie against a stale mirror. The local ref is read
+        unconditionally (it always exists once you've shared); the mirror is skipped until
+        it exists."""
         prefix = self._prefix()
         best: dict[tuple[str, str], SharedEntry] = {}
-        for ref in (self.ref, REMOTE_MIRROR, LEGACY_REF, LEGACY_MIRROR):
+        for ref in (self.ref, REMOTE_MIRROR):
             if ref != self.ref and not self.repo.ref_exists(ref):
                 continue
             for path in self.repo.read_tree_paths(ref):
@@ -274,8 +270,8 @@ class SharedSessionStore:
         path = f"{self._prefix()}{entry.github_id}/{entry.name}/transcript.jsonl"
         # When the chosen entry came from a remote MIRROR, its transcript lives on the
         # remote's CANONICAL ref (the mirror name doesn't exist on the remote), so fetch
-        # that into the mirror; for a local/legacy entry the source ref IS the remote ref.
-        remote_ref = {REMOTE_MIRROR: REF, LEGACY_MIRROR: LEGACY_REF}.get(ref, ref)
+        # that into the mirror; for a local entry the source ref IS the remote ref.
+        remote_ref = {REMOTE_MIRROR: REF}.get(ref, ref)
         # Resuming a SHARED session must reflect the LATEST shared state — so sync the
         # full ref from the remote FIRST, then read. Reading the local ref blind would
         # return a stale copy whenever one is already present locally: the listing
@@ -330,7 +326,7 @@ class SharedSessionStore:
         entries = {k: v for k, v in self.repo.read_tree_paths(self.ref).items() if not k.startswith(base)}
         entries[base + "transcript.jsonl"] = self.repo.write_blob(transcript)
         entries[base + "manifest.json"] = self.repo.write_blob(json.dumps(manifest, indent=2, sort_keys=True))
-        return self._commit(entries, f"agit: share session {github_id}/{name}", reclaim=reclaim)
+        return self._commit(entries, f"agitrack: share session {github_id}/{name}", reclaim=reclaim)
 
     def prune_own_stale(self, github_id: str, *, keep: int = DEFAULT_KEEP) -> int:
         """Drop all but the most-recent ``keep`` sessions belonging to ``github_id``
@@ -347,18 +343,18 @@ class SharedSessionStore:
             for path, blob in self.repo.read_tree_paths(self.ref).items()
             if not any(path.startswith(base) for base in drop_bases)
         }
-        self._commit(kept, f"agit: prune {len(stale)} stale session(s) for {gid}")
+        self._commit(kept, f"agitrack: prune {len(stale)} stale session(s) for {gid}")
         return len(stale)
 
     # --- sync --------------------------------------------------------------
 
     def fetch(self, *, timeout: float | None = None, cancel: "threading.Event | None" = None) -> bool:
-        """Pull the latest shared refs from the remote into the read-only MIRROR refs, for
+        """Pull the latest shared ref from the remote into the read-only MIRROR ref, for
         LISTING (best-effort).
 
-        Fetching into the mirrors — NOT the canonical local refs — is what keeps a listing
+        Fetching into the mirror — NOT the canonical local ref — is what keeps a listing
         refresh from rewinding your own freshly-shared session: the local ref (which holds
-        your shares) is left untouched, and :meth:`entries` unions it with the mirrors,
+        your shares) is left untouched, and :meth:`entries` unions it with the mirror,
         newest copy winning. So a remote that's momentarily behind can never make your
         just-shared session show an old "shared" time. Fetches only the small manifests (a
         blob-size filter skips the large transcripts) so listing is fast; a chosen session's
@@ -370,19 +366,12 @@ class SharedSessionStore:
             return False
         if cancel is not None and cancel.is_set():
             return False  # already cancelled: don't even start
-        ok = False
-        # Mirror the current ref and the legacy ref (a pre-rename peer's shares); the legacy
-        # ref may not exist on the remote at all (best-effort, ignore failure).
-        for src, dst in ((self.ref, REMOTE_MIRROR), (LEGACY_REF, LEGACY_MIRROR)):
-            if cancel is not None and cancel.is_set():
-                break
-            fetched = self.repo.fetch_ref(
-                f"+{src}:{dst}", filter_blobs="blob:limit=16k", timeout=timeout, cancel=cancel
-            )
-            if not fetched and not (cancel is not None and cancel.is_set()):
-                fetched = self.repo.fetch_ref(f"+{src}:{dst}", timeout=timeout, cancel=cancel)
-            ok = ok or fetched
-        return ok
+        fetched = self.repo.fetch_ref(
+            f"+{self.ref}:{REMOTE_MIRROR}", filter_blobs="blob:limit=16k", timeout=timeout, cancel=cancel
+        )
+        if not fetched and not (cancel is not None and cancel.is_set()):
+            fetched = self.repo.fetch_ref(f"+{self.ref}:{REMOTE_MIRROR}", timeout=timeout, cancel=cancel)
+        return fetched
 
     def _fetch_current(self, *, timeout: float | None = None, cancel: "threading.Event | None" = None) -> bool:
         """Sync only the current ref from the remote (no legacy ref). Used by the
@@ -453,11 +442,6 @@ class SharedSessionStore:
         Sync-then-rewrite-then-push, like :meth:`publish`. ``timeout`` bounds each network
         fetch/push so a stalled remote can't hang the (background) unshare thread.
 
-        The entry is removed from BOTH the current ref and the legacy
-        ``refs/agit/shared-sessions`` — a session shared before the aGiT → aGiTrack
-        rename lives only in the legacy ref, so rewriting the current ref alone would
-        leave it visible (it would keep surfacing through :meth:`entries`).
-
         ``pushed`` is True only when a copy that was actually on origin got removed there.
         ``pushed=False`` with an empty ``error`` means there was nothing to push — the entry
         was only ever local (its share never reached origin) or was already gone there — NOT a
@@ -467,30 +451,26 @@ class SharedSessionStore:
         pushed_any = False
         on_origin = False  # did the entry exist on origin (so a removal had to be pushed)?
         errors: list[str] = []
-        for ref in (self.ref, LEGACY_REF):
-            if ref != self.ref and not self.repo.ref_exists(ref):
-                continue
-            status, err = self._unshare_one_ref(ref, gid, nm, remote, timeout)
-            if status == "rejected" and _is_stale_lease(err):
-                # A concurrent push (this session's own auto-share, or another machine) moved
-                # the remote ref between our fetch and our push, so --force-with-lease rejected
-                # it. Re-sync onto the current tip and retry once — exactly what publish() does.
-                status, err = self._unshare_one_ref(ref, gid, nm, remote, timeout)
-            if status == "pushed":
-                pushed_any = True
-                on_origin = True
-            elif status == "rejected":
-                on_origin = True
-                if err.strip():
-                    errors.append(err.strip())
-        # The menu lists from the cached MIRROR refs too. Once the entry is off origin (we
-        # pushed its removal, or it was never there), drop it from the mirrors so it leaves the
-        # menu immediately instead of lingering as a stale "shared" entry. Leave the mirrors
+        status, err = self._unshare_one_ref(self.ref, gid, nm, remote, timeout)
+        if status == "rejected" and _is_stale_lease(err):
+            # A concurrent push (this session's own auto-share, or another machine) moved
+            # the remote ref between our fetch and our push, so --force-with-lease rejected
+            # it. Re-sync onto the current tip and retry once — exactly what publish() does.
+            status, err = self._unshare_one_ref(self.ref, gid, nm, remote, timeout)
+        if status == "pushed":
+            pushed_any = True
+            on_origin = True
+        elif status == "rejected":
+            on_origin = True
+            if err.strip():
+                errors.append(err.strip())
+        # The menu lists from the cached MIRROR ref too. Once the entry is off origin (we
+        # pushed its removal, or it was never there), drop it from the mirror so it leaves the
+        # menu immediately instead of lingering as a stale "shared" entry. Leave the mirror
         # alone when a push was rejected — it IS still on origin, so the user can retry.
         if not (on_origin and not pushed_any):
-            for mirror in (REMOTE_MIRROR, LEGACY_MIRROR):
-                if self.repo.ref_exists(mirror):
-                    self._drop_local_entry(mirror, gid, nm)
+            if self.repo.ref_exists(REMOTE_MIRROR):
+                self._drop_local_entry(REMOTE_MIRROR, gid, nm)
         if not remote:
             return PublishResult(remote=False, pushed=False)
         return PublishResult(remote=True, pushed=pushed_any, error="; ".join(errors))

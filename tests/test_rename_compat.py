@@ -1,8 +1,10 @@
 """Back-compatibility for the aGiT → aGiTrack rename.
 
-These guard the migration shims: existing on-disk state, historical commit
-metadata, legacy branch names, the legacy shared-session ref, and the old
-``AGIT_*`` env vars must all keep working after the rename.
+These guard the read/migration shims that must keep working after the rename:
+existing on-disk state, historical commit metadata (old ``# aGiT Metadata`` /
+``<aGiT>`` subjects still classify), and the old ``AGIT_*`` env vars. The ACTIVE
+legacy machinery — the ``agit/`` branch prefix and the ``refs/agit/shared-sessions``
+ref — has been removed; aGiTrack only writes/recognises ``agitrack/`` going forward.
 """
 
 import subprocess
@@ -13,7 +15,6 @@ from agitrack.config.migrate import migrate_global_config, migrate_repo_state
 from agitrack.env import getenv_compat
 from agitrack.git import GitRepo, is_managed_branch
 from agitrack.metrics.collect import _parse_commit
-from agitrack.sessions.store import LEGACY_REF, REF, SharedSessionStore
 
 
 def _init_repo(path):
@@ -48,9 +49,13 @@ def test_legacy_merge_branch_subject_classifies_as_ops():
 # --- branch-prefix back-compat ---------------------------------------------
 
 
-def test_is_managed_branch_accepts_both_prefixes():
+def test_is_managed_branch_recognises_only_agitrack_prefix():
+    # The legacy ``agit/`` active recognition was removed: aGiTrack manages only its own
+    # ``agitrack/`` turn branches now. A historical ``agit/`` merge SUBJECT still classifies
+    # as ops in the dashboard (a read shim, see above), but a live ``agit/`` branch is no
+    # longer treated as managed for integration/cleanup.
     assert is_managed_branch("agitrack/claude/session-1/t1")
-    assert is_managed_branch("agit/claude/session-1/t1")  # legacy
+    assert not is_managed_branch("agit/claude/session-1/t1")
     assert not is_managed_branch("feature/x")
     assert not is_managed_branch("main")
 
@@ -120,56 +125,6 @@ def test_getenv_compat_prefers_new_then_legacy(monkeypatch):
 
     monkeypatch.setenv("AGITRACK_SANDBOX", "on")  # new wins
     assert getenv_compat("SANDBOX") == "on"
-
-
-# --- shared-ref back-compat -------------------------------------------------
-
-
-def test_entries_merge_legacy_ref():
-    # A session shared by a pre-rename peer lives under refs/agit/shared-sessions
-    # and must still list, tagged with its source ref for later reads.
-    legacy_paths = {"fp/peer/old-sess/manifest.json": "m", "fp/peer/old-sess/transcript.jsonl": "t"}
-
-    class FakeRepo:
-        def root_commit(self):
-            return "fp"
-
-        def ref_exists(self, ref):
-            return ref == LEGACY_REF
-
-        def read_tree_paths(self, ref):
-            return legacy_paths if ref == LEGACY_REF else {}
-
-        def read_ref_blob(self, ref, path):
-            return '{"updated": 1}' if path.endswith("manifest.json") else "t"
-
-    entries = SharedSessionStore(FakeRepo()).entries()  # type: ignore[arg-type]
-    assert [(e.github_id, e.name) for e in entries] == [("peer", "old-sess")]
-    assert entries[0].source_ref == LEGACY_REF  # reads come from the legacy ref
-
-
-def test_new_ref_wins_over_legacy_on_name_collision():
-    paths = {
-        REF: {"fp/me/sess/manifest.json": "m", "fp/me/sess/transcript.jsonl": "t"},
-        LEGACY_REF: {"fp/me/sess/manifest.json": "m", "fp/me/sess/transcript.jsonl": "t"},
-    }
-
-    class FakeRepo:
-        def root_commit(self):
-            return "fp"
-
-        def ref_exists(self, ref):
-            return True
-
-        def read_tree_paths(self, ref):
-            return paths.get(ref, {})
-
-        def read_ref_blob(self, ref, path):
-            return '{"updated": 1}' if path.endswith("manifest.json") else "t"
-
-    entries = SharedSessionStore(FakeRepo()).entries()  # type: ignore[arg-type]
-    assert len(entries) == 1
-    assert entries[0].source_ref == REF  # current ref read first, wins
 
 
 # --- packaging back-compat --------------------------------------------------
