@@ -7540,7 +7540,7 @@ class ProxyRunner:
         # reports (`\x1b[<35;..M`) that don't round-trip cleanly and leak into the backend as
         # literal text. Excluding only 1003 stops the hover flood while keeping drag-copy working
         # (the confirmed leak is button 35 = no-button motion; see the proxy-raw trace and
-        # dev/winmouse/FINDINGS.md). Disables are always mirrored.
+        # devtools/winmouse/FINDINGS.md). Disables are always mirrored.
         _no_host_enable = {b"1003"} if os.name == "nt" else set()
         for mode in (
             b"9",
@@ -7564,7 +7564,7 @@ class ProxyRunner:
         # events (and all other mouse events) are forwarded to it; if not, aGiTrack uses the
         # wheel for scrollback. This applies on Windows too: the ConPTY input path DOES
         # deliver clean SGR mouse to a VT-input backend (verified end-to-end against claude and
-        # opencode — see dev/winmouse/FINDINGS.md), so a mouse-driving backend owns the mouse
+        # opencode — see devtools/winmouse/FINDINGS.md), so a mouse-driving backend owns the mouse
         # the same way it does on POSIX.
         for mode in (b"1000", b"1002", b"1003"):
             if b"\x1b[?" + mode + b"h" in output:
