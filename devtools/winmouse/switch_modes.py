@@ -8,7 +8,7 @@ Feeds each backend's real terminal init sequences through ProxyRunner._sync_term
 The difference (claude-then-opencode vs opencode-alone) is the carried-over host state — the
 suspect for the switch-only input corruption. Tries host_kitty_keyboard False and True.
 
-  uv run --python 3.12 python dev/winmouse/switch_modes.py
+  uv run --python 3.12 python devtools/winmouse/switch_modes.py
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 
 from agitrack.proxy.runner import ProxyRunner  # noqa: E402
 
-# Real init sequences each backend emits (from dev/winmouse/probe_backend.py captures).
+# Real init sequences each backend emits (from devtools/winmouse/probe_backend.py captures).
 CLAUDE = (
     b"\x1b[?9001h\x1b[?1004h\x1b[?2004h\x1b[?1049h"
     b"\x1b[<u\x1b[>1u\x1b[>4;2m"

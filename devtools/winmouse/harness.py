@@ -10,7 +10,7 @@ SGR mouse bytes (or other encodings) into a ConPTY's input, does the child get a
 or do the bytes leak as literal text?
 
 Run from the repo root:
-  uv run --python 3.12 python dev/winmouse/harness.py
+  uv run --python 3.12 python devtools/winmouse/harness.py
 """
 
 from __future__ import annotations

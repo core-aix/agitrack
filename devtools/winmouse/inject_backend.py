@@ -9,7 +9,7 @@ typed; if mouse leaks, the rendered input box will also contain mouse-report dig
 
 Must run in a REAL console (Start-Process).
 
-  uv run --python 3.12 python dev/winmouse/inject_backend.py claude
+  uv run --python 3.12 python devtools/winmouse/inject_backend.py claude
 """
 
 from __future__ import annotations

@@ -12,8 +12,8 @@ few seconds, and reports every DEC private mode set/reset it sees, in order.
 
 Must run in a REAL console (Start-Process), not the agent's non-interactive shell tools.
 
-  uv run --python 3.12 python dev/winmouse/probe_backend.py claude
-  uv run --python 3.12 python dev/winmouse/probe_backend.py opencode
+  uv run --python 3.12 python devtools/winmouse/probe_backend.py claude
+  uv run --python 3.12 python devtools/winmouse/probe_backend.py opencode
 """
 
 from __future__ import annotations
