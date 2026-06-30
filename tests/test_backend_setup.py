@@ -39,12 +39,45 @@ def test_backend_installed_uses_executable_lookup(monkeypatch):
 
 
 def test_select_default_backend_all_installed_defaults_to_first(monkeypatch):
-    # Both installed: nothing to offer, default is the first (claude). No input needed.
+    # Both installed: nothing to install, but the user IS asked which to make the default;
+    # a bare Enter (empty) takes the first (claude).
     monkeypatch.setattr(bs, "backend_installed", lambda name: True)
     config = FakeConfig()
     chosen = select_default_backend(config, input_fn=_inputs(""), output_fn=lambda _s: None)
     assert chosen == "claude"
     assert config.saved == ["claude"]
+
+
+def test_select_default_backend_two_installed_user_picks_second(monkeypatch):
+    # Both installed: the choose-default prompt lets the user pick #2 (opencode) as the default.
+    monkeypatch.setattr(bs, "backend_installed", lambda name: True)
+    config = FakeConfig()
+    chosen = select_default_backend(config, input_fn=_inputs("2"), output_fn=lambda _s: None)
+    assert chosen == "opencode"
+    assert config.saved == ["opencode"]
+
+
+def test_select_default_backend_single_installed_not_asked(monkeypatch):
+    # Exactly one backend installed (opencode): after Enter skips the install offer for the
+    # other, it's used as the default WITHOUT a separate choose-default prompt (nothing to
+    # choose between).
+    monkeypatch.setattr(bs, "backend_installed", lambda name: name == "opencode")
+    config = FakeConfig()
+    lines: list[str] = []
+    chosen = select_default_backend(config, input_fn=_inputs(""), output_fn=lines.append)
+    assert chosen == "opencode"
+    assert not any("use by default" in line for line in lines)  # the choose prompt never appeared
+
+
+def test_select_default_backend_explains_how_to_switch(monkeypatch):
+    # After the default is chosen, the user is told how to change it later: per-run --backend
+    # and the in-app settings menu (repo or global scope).
+    monkeypatch.setattr(bs, "backend_installed", lambda name: True)
+    lines: list[str] = []
+    select_default_backend(FakeConfig(), input_fn=_inputs("1"), output_fn=lines.append)
+    text = "\n".join(lines)
+    assert "--backend" in text
+    assert "Settings" in text and "scope" in text.lower()
 
 
 def test_select_default_backend_skip_keeps_installed_default(monkeypatch):

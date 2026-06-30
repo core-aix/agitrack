@@ -750,12 +750,22 @@ def test_restart_agitrack_without_extra_args_preserves_argv(monkeypatch):
 
 
 class _StartupUpdater:
-    def __init__(self, status: UpdateStatus, *, apply_result: UpdateStatus | None = None, defer_pip: bool = False):
+    def __init__(
+        self,
+        status: UpdateStatus,
+        *,
+        apply_result: UpdateStatus | None = None,
+        defer_pip: bool = False,
+        defer_msi: bool = False,
+    ):
         self._status = status
         self._apply_result = apply_result
         self._defer_pip = defer_pip  # mimic the Windows post-exit pip deferral
+        self._defer_msi = defer_msi  # mimic the Windows MSI download-then-install-after-exit
         self.pending_pip_upgrade = None
+        self.pending_msi_path = None
         self.bootstrapped = False
+        self.msi_handed_off = False
         self.checked = False
         self.applied = False
 
@@ -769,12 +779,19 @@ class _StartupUpdater:
         if self._defer_pip:
             self.pending_pip_upgrade = ["python", "-m", "pip", "install", "--upgrade", "agitrack"]
             return UpdateStatus(kind=KIND_PACKAGE, message="aGiTrack will finish updating after it exits.")
+        if self._defer_msi:
+            self.pending_msi_path = "C:/Temp/agitrack-9.9.9-windows-x64.msi"
+            return UpdateStatus(kind=KIND_PACKAGE, message="Downloaded aGiTrack 9.9.9.")
         if self._apply_result is not None:
             return self._apply_result
         return UpdateStatus(kind=self._status.kind, message="updated", current="new")
 
     def launch_pip_bootstrapper(self, extra_args=()) -> bool:
         self.bootstrapped = True
+        return True
+
+    def launch_msi_bootstrapper(self, extra_args=()) -> bool:
+        self.msi_handed_off = True
         return True
 
     def manual_update_instructions(self) -> str:
@@ -820,6 +837,23 @@ def test_startup_deferred_pip_bootstrapper_failure_keeps_running(monkeypatch, tm
     monkeypatch.setattr("builtins.input", lambda *a: "y")
     cli._check_for_update_at_startup(config)  # returns normally, no SystemExit
     assert config.pending_manual_update  # reminder recorded for next launch
+
+
+def test_startup_deferred_msi_hands_off_to_installer_and_exits(monkeypatch, tmp_path: Path):
+    # Windows MSI build: apply() only downloads the installer (it replaces the running
+    # agitrack.exe), so startup must hand off to the elevated installer and EXIT — not re-exec
+    # the current version, which would re-offer the update on every launch without installing.
+    config = GlobalConfig(path=tmp_path / "c.json")
+    updater = _StartupUpdater(_available_status(), defer_msi=True)
+    restarted = []
+    monkeypatch.setattr("agitrack.update.Updater", lambda *a, **k: updater)
+    monkeypatch.setattr("agitrack.update.restart_agitrack", lambda: restarted.append(True))
+    monkeypatch.setattr("builtins.input", lambda *a: "y")
+    with pytest.raises(SystemExit) as exc:
+        cli._check_for_update_at_startup(config)
+    assert exc.value.code == 0
+    assert updater.msi_handed_off is True  # elevated installer started
+    assert restarted == []  # did NOT re-exec the current (un-installed) version
 
 
 def test_startup_check_uses_short_timeout(monkeypatch, tmp_path: Path):

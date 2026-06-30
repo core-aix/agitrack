@@ -86,12 +86,6 @@ _X10_MOUSE_RE = re.compile(rb"\x1b\[M.{3}", re.DOTALL)
 _INCOMPLETE_X10_RE = re.compile(rb"\x1b\[M.{0,2}$", re.DOTALL)
 
 
-def _ps_single_quote(value: str) -> str:
-    """Quote *value* as a PowerShell single-quoted string literal (doubling embedded
-    single quotes). Used to embed file paths in the MSI-update relauncher command."""
-    return "'" + value.replace("'", "''") + "'"
-
-
 # Terminal focus in/out reports (CSI I / CSI O), emitted on window focus changes
 # when focus reporting is on. Like mouse reports they are not keystrokes.
 _FOCUS_EVENT_RE = re.compile(rb"\x1b\[[IO]")
@@ -2304,74 +2298,17 @@ class ProxyRunner:
 
     def _launch_msi_bootstrapper(self) -> bool:
         """Hand the downloaded MSI off to the elevated installer and arrange the re-launch.
-
-        Two cooperating processes, so the updated aGiTrack comes back at the user's NORMAL
-        integrity level rather than inheriting the installer's admin token:
-
-        * an **elevated** bootstrapper (``agitrack-update.cmd``, run via UAC ``runas``) waits
-          for this process to exit, runs ``msiexec``, and writes its exit code to a marker file;
-        * a **non-elevated** relauncher (spawned here, before we exit) waits for that marker and,
-          on success, starts the freshly installed ``agitrack.exe`` with the saved arguments.
-
-        Returns True when the elevated install was started (the caller should just exit), or
-        False when it couldn't be (e.g. the user declined UAC) so the caller falls back to a
-        normal re-exec of the current version.
-        """
-        from agitrack.proc import detach_kwargs, shell_execute_runas
-
-        msi = getattr(self._updater, "pending_msi_path", None)
-        if not msi or self._updater is None:
+        Delegates to :meth:`Updater.launch_msi_bootstrapper` (shared with the startup path so
+        both install MSI updates identically); on failure (e.g. UAC declined) records the
+        pending update so the next launch reminds, then the caller falls back to a normal
+        re-exec of the current version. Passes ``--skip-privacy-ack`` so the relaunched build
+        doesn't re-ask for the acknowledgment the user already gave this session."""
+        if self._updater is None:
             return False
-        install_dir = self._updater.msi_install_dir()
-        bootstrapper = os.path.join(install_dir, "agitrack-update.cmd")
-        exe = os.path.join(install_dir, "agitrack.exe")
-        last_args = self._msi_last_args_path() or ""
-        local = os.environ.get("LOCALAPPDATA", install_dir)
-        marker = os.path.join(local, "aGiTrack", "update-result.txt")
-        try:
-            os.makedirs(os.path.dirname(marker), exist_ok=True)
-        except OSError:
-            pass
-        # Clear any stale marker so the relauncher only acts on THIS install's result.
-        try:
-            os.remove(marker)
-        except OSError:
-            pass
-
-        # Elevated install: wait for our PID, run msiexec, write the result code to the marker.
-        # cmd /c quoting rule: wrap the whole command line in one extra pair of quotes when any
-        # token is quoted, so the leading "" is stripped and the inner quotes survive.
-        pid = os.getpid()
-        inner = f'"{bootstrapper}" "{msi}" {pid} "{marker}"'
-        try:
-            shell_execute_runas("cmd.exe", f'/c "{inner}"')
-        except Exception as error:  # UAC declined or launch failed: keep the current version
-            self._debug(f"MSI elevated hand-off failed ({error!r})")
-            if self.global_config is not None:
-                self.global_config.pending_manual_update = getattr(self._updater, "_msi_latest", "") or "available"
-            return False
-
-        # Non-elevated relauncher: wait for the marker, then start the new build de-elevated.
-        relauncher = (
-            "$ErrorActionPreference='SilentlyContinue';"
-            f"$m={_ps_single_quote(marker)};$exe={_ps_single_quote(exe)};$af={_ps_single_quote(last_args)};"
-            "$deadline=(Get-Date).AddMinutes(10);"
-            "while(-not (Test-Path $m) -and (Get-Date) -lt $deadline){Start-Sleep -Seconds 1};"
-            "if(-not (Test-Path $m)){exit};"
-            "$rc=((Get-Content $m -TotalCount 1) -join '').Trim();"
-            "if($rc -ne '0'){exit};"
-            "$a='';if(Test-Path $af){$a=((Get-Content $af -TotalCount 1) -join '').Trim()};"
-            "if($a){Start-Process -FilePath $exe -ArgumentList $a}else{Start-Process -FilePath $exe}"
-        )
-        try:
-            subprocess.Popen(
-                ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", relauncher],
-                **detach_kwargs(),
-            )
-        except OSError as error:
-            # The install will still proceed; the user just has to start aGiTrack again.
-            self._debug(f"MSI relauncher spawn failed ({error!r})")
-        return True
+        ok = self._updater.launch_msi_bootstrapper(["--skip-privacy-ack"])
+        if not ok and self.global_config is not None:
+            self.global_config.pending_manual_update = getattr(self._updater, "_msi_latest", "") or "available"
+        return ok
 
     def _handle_update_command(self) -> None:
         # Ctrl-G → "update": show the current update status and let the user opt

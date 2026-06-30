@@ -247,9 +247,12 @@ def select_default_backend(
     """First-run backend setup. Shows every agent backend with its install status, then
     asks whether to install any of the UNINSTALLED ones — a single one (by number) or all
     of them ('all'). Already-installed backends are just shown as installed, never offered
-    for (re)install, and skipping is always allowed. Saves and returns the default backend
-    (the first installed one, or the first listed when none is installed yet — the launch
-    gate then offers to install that one before the agent starts)."""
+    for (re)install, and skipping is always allowed.
+
+    Then asks which backend to use as the DEFAULT (when more than one is installed; a single
+    installed backend is used without asking), saves it, and explains how to change it later.
+    Returns the chosen default (the first listed backend when none is installed yet — the
+    launch gate then offers to install that one before the agent starts)."""
     names = available_backends()
     while True:
         installed = [name for name in names if backend_installed(name)]
@@ -279,9 +282,43 @@ def select_default_backend(
             continue
         output_fn("Please enter a valid number, 'all', or press Enter to skip.\n")
     installed = [name for name in names if backend_installed(name)]
-    default = installed[0] if installed else names[0]
+    default = _choose_default_backend(installed, names, input_fn=input_fn, output_fn=output_fn)
     config.default_backend = default
+    _explain_default_backend_switching(default, output_fn=output_fn)
     return default
+
+
+def _choose_default_backend(
+    installed: list[str],
+    names: list[str],
+    *,
+    input_fn: Callable[[str], str],
+    output_fn: Callable[[str], None],
+) -> str:
+    """Pick the default backend. With two or more installed, ask the user which one (empty or
+    invalid input → the first installed). With exactly one installed, use it without asking.
+    With none installed, fall back to the first listed (the launch gate installs it later)."""
+    if len(installed) >= 2:
+        output_fn("\nWhich coding agent should aGiTrack use by default?")
+        for index, name in enumerate(installed, start=1):
+            output_fn(f"  {index}. {name}")
+        raw = input_fn(f"Enter a number [1-{len(installed)}] (default 1): ").strip()
+        if raw.isdigit() and 1 <= int(raw) <= len(installed):
+            return installed[int(raw) - 1]
+        return installed[0]
+    if installed:
+        return installed[0]
+    return names[0]
+
+
+def _explain_default_backend_switching(default: str, *, output_fn: Callable[[str], None]) -> None:
+    """After the default is chosen, tell the user it is saved and how to switch it later — for
+    a single run, or persistently for this repo or globally via the in-app settings menu."""
+    output_fn(f"\nDefault coding agent set to {default}.")
+    output_fn("You can change it later:")
+    output_fn("  - for a single run:           agitrack --backend <claude|opencode>")
+    output_fn("  - for this repo or globally:  open the aGiTrack menu (Ctrl-G by default) -> Settings ->")
+    output_fn('                                "Default coding agent", choosing repo or global scope when saving.')
 
 
 def select_default_summarizer_model(
