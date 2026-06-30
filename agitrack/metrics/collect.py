@@ -535,7 +535,11 @@ def collect_commit_stats(repo: GitRepo, ref: str = "HEAD") -> list[CommitStat]:
     # %x00/%x01 are git's own escapes: a literal NUL is not representable in
     # an argv string, but git happily PRINTS one as a record separator.
     log = repo._run(
-        ["git", "log", "--format=%H%x01%an%x01%ae%x01%at%x01%B%x00", ref],
+        # The trailing ``--`` separates the revision from pathspecs: a ref whose name also
+        # exists as a path (e.g. a ``dev`` branch alongside a tracked ``dev/`` directory) is
+        # otherwise "ambiguous argument 'dev': both revision and filename" and git aborts with
+        # NO output — the dashboard then showed an empty commit log for that branch.
+        ["git", "log", "--format=%H%x01%an%x01%ae%x01%at%x01%B%x00", ref, "--"],
         check=False,
     ).stdout
     stats: list[CommitStat] = []
@@ -621,7 +625,8 @@ def _drop_inherited_metadata(repo: GitRepo, ref: str, stats: list[CommitStat]) -
 
 
 def _parents(repo: GitRepo, ref: str) -> dict[str, list[str]]:
-    output = repo._run(["git", "log", "--format=%H %P", ref], check=False).stdout
+    # ``--`` disambiguates a ref that collides with a path name (see collect_commit_stats).
+    output = repo._run(["git", "log", "--format=%H %P", ref, "--"], check=False).stdout
     parents: dict[str, list[str]] = {}
     for line in output.splitlines():
         sha, _, rest = line.strip().partition(" ")
@@ -926,7 +931,10 @@ def _apply_numstat(repo: GitRepo, ref: str, by_sha: dict[str, CommitStat]) -> No
     # is actually viewing get their exact counts via apply_numstat_for (which fetches just
     # that page). Merge commits (cover commits #58, integration merges) report no numstat by
     # default, so a turn's lines are counted exactly once — on the commits that introduced them.
-    output = repo._run(["git", "log", "--numstat", "--format=%x01%H", ref], check=False, allow_lazy_fetch=False).stdout
+    # ``--`` disambiguates a ref that collides with a path name (see collect_commit_stats).
+    output = repo._run(
+        ["git", "log", "--numstat", "--format=%x01%H", ref, "--"], check=False, allow_lazy_fetch=False
+    ).stdout
     _accumulate_numstat(output, by_sha)
 
 
@@ -943,7 +951,7 @@ def apply_numstat_for(repo: GitRepo, shas: list[str], by_sha: dict[str, CommitSt
     # `--no-walk` shows exactly the named commits (each diffed against its parent for numstat)
     # without traversing ancestry, so the fetch is bounded to this page.
     output = repo._run(
-        ["git", "log", "--no-walk=unsorted", "--numstat", "--format=%x01%H", *sorted(targets)],
+        ["git", "log", "--no-walk=unsorted", "--numstat", "--format=%x01%H", *sorted(targets), "--"],
         check=False,
     ).stdout
     fresh: dict[str, CommitStat] = {

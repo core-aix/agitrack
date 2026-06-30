@@ -181,3 +181,29 @@ def test_apply_numstat_for_fetches_only_the_named_commits(tmp_path: Path, monkey
     assert not _no_lazy_fetch(env), (cmd, env)
     # c3 wrote 4 lines into f3.txt; the scoped pass restored its real count.
     assert target.insertions == 4 and target.deletions == 0
+
+
+def test_collect_handles_ref_that_collides_with_a_path(tmp_path: Path) -> None:
+    """A branch whose name also names a tracked path made the dashboard's commit log show
+    NOTHING: ``git log dev`` is "ambiguous argument 'dev': both revision and filename", so git
+    aborts with no output and the empty result is used as-is. The reads terminate the revision
+    with ``--`` so the branch is read, not mistaken for a pathspec. (This is the bug behind
+    "the dashboard doesn't show the commit log" on a repo that has both a ``dev`` branch and a
+    ``dev/`` directory — the live page requests ``/log?branch=dev``.)"""
+    repo = GitRepo.init(tmp_path)
+    (tmp_path / "f.txt").write_text("hi\n", encoding="utf-8")
+    repo.stage_paths(["f.txt"])
+    repo.commit("c1")
+    # A tracked directory whose name equals the branch we will read below.
+    (tmp_path / "dev").mkdir()
+    (tmp_path / "dev" / "note.md").write_text("note\n", encoding="utf-8")
+    repo.stage_paths(["dev/note.md"])
+    repo.commit("c2")
+    repo._run(["git", "branch", "dev", "HEAD"])
+
+    # Sanity: the bare ``git log dev`` really is ambiguous here (no output, non-zero).
+    ambiguous = repo._run(["git", "log", "--format=%H", "dev"], check=False)
+    assert ambiguous.returncode != 0 and not ambiguous.stdout.strip()
+
+    stats = collect_commit_stats(repo, "dev")
+    assert [s.subject for s in stats] == ["Initial commit", "c1", "c2"]
