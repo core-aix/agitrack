@@ -328,9 +328,18 @@ def select_default_summarizer_model(
     input_fn: Callable[[str], str] = input,
     output_fn: Callable[[str], None] = print,
 ) -> None:
-    """First-run prompt (after the backend is chosen): pick the model aGiTrack uses
-    to summarize each commit, saved as the global default. For Claude the smallest
-    (Haiku) tier is the recommended default since summarization is a cheap task.
+    """First-run setup (after the backend is chosen) for the model aGiTrack uses to summarize
+    each commit, saved as the global default.
+
+    The default depends on whether the backend has a known size ordering:
+
+    * **Claude** — summarization is a cheap task, so default to the smallest (Haiku) tier. The
+      user is still offered the larger tiers (and "same as the session model"), defaulting to
+      the smallest.
+    * **Backends with no known size ordering (e.g. OpenCode)** — there is no meaningful
+      "smallest" to recommend, so default to the SAME model as the coding session
+      (``summarization_model = None``) without prompting.
+
     Silently leaves the default unchanged when the backend's models can't be listed."""
     from agitrack.summaries.model_select import list_available_models, smallest_model
 
@@ -338,7 +347,19 @@ def select_default_summarizer_model(
     if not models:
         return
     smallest = smallest_model(backend_name, models)
-    ordered = [smallest, *(m for m in models if m != smallest)] if smallest else list(models)
+    if smallest is None:
+        # No known size ordering (e.g. OpenCode): summarize with the SAME model as the coding
+        # session rather than guessing a tier. ``None`` means "use the session model" at run
+        # time (see ProxyRunner._make_summarizer). Don't prompt — there's nothing meaningful to
+        # choose between, and the previous behaviour of defaulting to an arbitrary first listed
+        # model was wrong.
+        config.summarization_model = None
+        output_fn(
+            f"\naGiTrack will summarize each commit with the same {backend_name} model as your "
+            "coding session (change it later via the menu → Settings)."
+        )
+        return
+    ordered = [smallest, *(m for m in models if m != smallest)]
     output_fn("\nChoose the model aGiTrack uses to summarize each commit (a cheap task):")
     for index, model in enumerate(ordered, start=1):
         tag = "  (smallest — recommended)" if model == smallest else ""
