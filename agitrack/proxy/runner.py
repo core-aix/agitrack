@@ -8705,18 +8705,21 @@ class ProxyRunner:
                     self._exit_aborted = True
                 return None
             if action == "exit":
-                if self._popup_exit_pending and not self._exit_confirmation_active:
-                    # Ctrl-C inside a popup shown DURING the exit/finalize sequence that is NOT the
-                    # exit-confirmation dialog — the keep/delete-worktree prompt or the copy-back
-                    # offer. Only the exit-confirmation dialog may exit on Ctrl-C; here it must
-                    # never exit aGiTrack directly. Treat it like Esc: cancel this popup, which
-                    # (during finalize) aborts the whole exit so nothing is deleted and aGiTrack
-                    # stays running. The user can press Ctrl-C again at the agent to re-open the
-                    # exit confirmation.
+                if self._finalized_on_exit and not self._exit_confirmation_active:
+                    # Ctrl-C inside a popup shown DURING the exit/finalize sequence that is NOT
+                    # the exit-confirmation dialog — the keep/delete-worktree prompt, the copy-back
+                    # offer, the on-exit user-commit box. Only the exit-confirmation dialog may
+                    # exit aGiTrack on Ctrl-C; here it must NEVER exit directly. Treat it like Esc:
+                    # cancel this popup and abort the whole exit so nothing is deleted and aGiTrack
+                    # stays running. Clearing the force flag is essential — a double-Ctrl-C used to
+                    # confirm the exit set it, and without clearing it the abort would be overridden
+                    # (the exit would proceed). The user can press Ctrl-C again at the agent to
+                    # re-open the exit confirmation. ``_finalized_on_exit`` (not _popup_exit_pending)
+                    # gates this so it also covers finalize reached on a restart / backend-exit.
                     self._clear_message()
                     self._render_pending = True
-                    if self._finalized_on_exit:
-                        self._exit_aborted = True
+                    self._exit_aborted = True
+                    self._popup_exit_force = False
                     return None
                 if self._run_exit_flow():
                     return None
