@@ -505,19 +505,20 @@ def build_manual_squash_trailer(*, agitrack_session_id: str, latent_bodies: list
 
     It is a *squashed* message: a leading ``commit_type: user`` metadata block (so even a
     commit made with no pending agent turns is still attributed to the aGiTrack session),
-    followed by the full message body of each pending latent turn. Each latent body already
-    carries its own ``# Interaction Trace`` + ``# aGiTrack Metadata``, so the concatenation has
-    one metadata block per turn — exactly the aggregate shape the dashboard already parses into
-    one constituent per turn (see ``agitrack.metrics.collect._parse_constituents``), which sums
-    the tokens and classifies the commit as agent-tracked when any turn is present. No new
-    ``commit_type`` is needed.
+    followed by the full message body of each pending latent turn in **chronological
+    (oldest-first) order** — the same order a normal squash merge lists its commits, so a
+    manual-mode commit reads like any other squash. Each latent body already carries its own
+    ``# Interaction Trace`` + ``# aGiTrack Metadata``, so the concatenation has one metadata
+    block per turn — exactly the aggregate shape the dashboard already parses into one
+    constituent per turn (see ``agitrack.metrics.collect._parse_constituents``), which sums the
+    tokens and classifies the commit as agent-tracked when any turn is present. No new
+    ``commit_type`` is needed. (The dashboard *displays* the constituents newest-first, but the
+    message itself stays chronological — the reorder is display-only, in
+    ``agitrack.metrics.web``.)
 
-    ``latent_bodies`` arrive oldest-first (as walked from the latent ref); the turns are
-    emitted **newest-first** here so the dashboard expands the squash latest-turn-first,
-    matching the newest-first order of the commit log itself. ``latent_bodies`` are the
-    commit-message bodies read from the latent ref (``refs/agitrack/manual/<id>``), the durable
-    source of truth, so the trailer is always reproducible after a restart. Returns a string
-    ending in a single newline."""
+    ``latent_bodies`` are the commit-message bodies read from the latent ref
+    (``refs/agitrack/manual/<id>``), the durable source of truth, so the trailer is always
+    reproducible after a restart. Returns a string ending in a single newline."""
     blocks: list[str] = [
         "\n".join(
             [
@@ -530,7 +531,7 @@ def build_manual_squash_trailer(*, agitrack_session_id: str, latent_bodies: list
             ]
         )
     ]
-    for body in reversed(latent_bodies):  # newest turn first — matches the dashboard log order
+    for body in latent_bodies:  # chronological (oldest-first), like any squash merge
         text = (body or "").strip()
         if text and METADATA_HEADER in text:
             blocks.append(text)

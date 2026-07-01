@@ -115,14 +115,31 @@ def test_manual_trailer_squash_parses_as_agent_with_summed_tokens():
     assert stat.tokens.get("output") == 150  # summed across turns
 
 
-def test_manual_trailer_orders_turns_newest_first():
-    # Input is oldest-first (as walked from the ref); the folded squash must list the agent
-    # turns NEWEST-first so the dashboard expands it latest-turn-first, matching the log.
+def test_manual_trailer_message_is_chronological_like_any_squash():
+    # The raw commit message must list turns CHRONOLOGICALLY (oldest-first), the same order a
+    # normal squash merge uses — the newest-first reorder is display-only (see the dashboard
+    # test below). This keeps a manual-mode commit reading like any other squash.
     bodies = [_agent_body("first", 10), _agent_body("second", 20), _agent_body("third", 30)]
     trailer = build_manual_squash_trailer(agitrack_session_id="sid", latent_bodies=bodies)
     stat = _parse_commit("h", "me", "me@x", "1", "User commit\n\n" + trailer)
     agent_subjects = [c.subject for c in stat.constituents if "aGiTrack" in (c.subject or "")]
-    assert agent_subjects == ["<aGiTrack> third", "<aGiTrack> second", "<aGiTrack> first"]
+    assert agent_subjects == ["<aGiTrack> first", "<aGiTrack> second", "<aGiTrack> third"]
+
+
+def test_dashboard_displays_manual_squash_newest_first(tmp_path):
+    # The dashboard payload must reorder the (chronological) constituents NEWEST-first so the
+    # expansion matches the newest-first commit log — without touching the commit message.
+    from agitrack.metrics.web import dashboard_data
+
+    repo = _init_repo(tmp_path)
+    bodies = [_agent_body("first", 10), _agent_body("second", 20), _agent_body("third", 30)]
+    msg = "User commit\n\n" + build_manual_squash_trailer(agitrack_session_id="sid", latent_bodies=bodies)
+    _git(repo, "commit", "--allow-empty", "-m", msg)
+
+    data = dashboard_data(build_dashboard(repo))
+    folded = next(c for c in data["commits"] if c["subject"] == "User commit")
+    agent_parts = [p["subject"] for p in folded["parts"] if "aGiTrack" in (p["subject"] or "")]
+    assert agent_parts == ["<aGiTrack> third", "<aGiTrack> second", "<aGiTrack> first"]
 
 
 def test_manual_trailer_with_no_pending_turns_is_a_plain_user_commit():
@@ -555,6 +572,39 @@ def test_git_commit_menu_flushes_pending_turn_before_folding(tmp_path):
     runner._create_user_commit_popup(repo=repo, state=state, include_declined=True)
 
     assert flushed == [True]  # the parse/record flush ran before committing
+
+
+def test_menu_commit_folds_summaries_and_dashboard_shows_newest_first(tmp_path):
+    # End-to-end through the actual menu handler: each turn's LLM summary (attached as a note)
+    # is folded into the commit, the raw message stays chronological, and the dashboard shows
+    # the turns newest-first.
+    from agitrack.metrics.web import dashboard_data
+
+    runner, repo, state = _manual_runner(tmp_path)
+    (tmp_path / "a.txt").write_text("one\nt1\n", encoding="utf-8")
+    runner._manual_gate()
+    runner._manual_record(_agent_body("first turn", 10))
+    (tmp_path / "a.txt").write_text("one\nt1\nt2\n", encoding="utf-8")
+    runner._manual_gate()
+    runner._manual_record(_agent_body("second turn", 20))
+    old, new = repo.log_shas("HEAD", repo.ref_sha(runner._manual_ref()))  # oldest, newest
+    repo.notes_add(old, "Did the first thing", namespace="agitrack/commit-summary")
+    repo.notes_add(new, "Did the second thing", namespace="agitrack/commit-summary")
+
+    (tmp_path / "a.txt").write_text("one\nt1\nt2\nuser\n", encoding="utf-8")
+    runner._create_user_commit_popup(repo=repo, state=state, include_declined=True)
+
+    # Message: chronological (oldest-first), summaries folded in.
+    msg_subjects = [
+        c.subject
+        for c in _parse_commit("h", "m", "m@x", "1", _git(repo, "log", "-1", "--format=%B", "HEAD")).constituents
+        if c.kind == "agent"
+    ]
+    assert "first thing" in msg_subjects[0] and "second thing" in msg_subjects[1]
+    # Dashboard: same commit shown newest-first.
+    folded = next(c for c in dashboard_data(build_dashboard(repo))["commits"] if c["kind"] == "agent")
+    disp = [p["subject"] for p in folded["parts"] if p["kind"] == "agent"]
+    assert "second thing" in disp[0] and "first thing" in disp[1]
 
 
 def test_runner_manual_pending_count(tmp_path):

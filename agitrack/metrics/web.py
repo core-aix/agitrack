@@ -154,8 +154,8 @@ def dashboard_data(dash: Dashboard) -> dict:
                 "message": stat.message,  # full message, shown when a log entry opens
                 "url": (dash.commit_base + stat.sha) if dash.commit_base else "",
                 # Original commits of a squash, so the log entry can expand into
-                # them (recursive, for multiple rounds of squashing).
-                "parts": [_part_payload(part) for part in stat.constituents],
+                # them (recursive, for multiple rounds of squashing). Newest-first display.
+                "parts": _display_parts(stat),
             }
         )
 
@@ -172,6 +172,14 @@ def dashboard_data(dash: Dashboard) -> dict:
     }
 
 
+def _display_parts(stat: CommitStat) -> list[dict]:
+    """A squash's constituents serialized for the expandable log view, ordered
+    **newest-first** to match the newest-first commit log. This reorder is DISPLAY-ONLY: the
+    raw commit message keeps its constituents in chronological (oldest-first) order, like any
+    squash merge — only the dashboard shows the latest one at the top."""
+    return [_part_payload(part) for part in reversed(stat.constituents)]
+
+
 def _part_payload(part: CommitStat) -> dict:
     """A squash constituent (an original commit), serialized for the expandable
     log view — recursive in case a constituent is itself a squash."""
@@ -184,7 +192,7 @@ def _part_payload(part: CommitStat) -> dict:
         "started": part.started_at,
         "ended": part.ended_at,
         "message": part.message,
-        "parts": [_part_payload(child) for child in part.constituents],
+        "parts": _display_parts(part),  # nested squashes also expand newest-first
     }
 
 
@@ -447,7 +455,7 @@ def _log_entry(dash: Dashboard, stat: CommitStat, covers: dict[str, CommitStat])
         "ended": stat.ended_at,
         "message": stat.message,
         "url": (dash.commit_base + stat.sha) if dash.commit_base else "",
-        "parts": [_part_payload(part) for part in stat.constituents],
+        "parts": _display_parts(stat),  # newest-first display (message stays chronological)
     }
 
 
