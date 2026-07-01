@@ -63,12 +63,18 @@ flowchart TD
 ```
 
 **Jump to:** [Startup and launch gating](#2-startup-and-launch-gating) ·
+[Worktrees vs no-worktree](#3-worktrees-vs-no-worktree) ·
+[Manual-commit mode](#3a-manual-commit-mode---manual-commits---m) ·
 [Before forwarding a prompt](#4-before-forwarding-a-prompt-base-to-worktree) ·
 [The agent turn](#5-the-agent-turn-auto-commit-and-integration) ·
 [Copy worktree-only files](#6-after-the-turn-copy-worktree-only-files-to-base) ·
 [Ctrl-G command menu](#7-ctrl-g-command-menu) ·
 [Self-update flow](#9-self-update-flow) ·
 [Exit and terminal close](#10-exit-and-terminal-close)
+
+> Under **`--manual-commits` / `-m`** the auto-commit → integrate steps above are replaced: each turn
+> is recorded as a hidden latent commit and the branch is only ever written by **your** commit, which
+> folds the pending turns in. See [Manual-commit mode](#3a-manual-commit-mode---manual-commits---m).
 
 ---
 
@@ -118,20 +124,68 @@ flowchart TD
 ## 3. Worktrees vs no-worktree
 
 Where a session physically runs (`--no-worktree` turns worktrees off) — this decides whether the base-to-worktree and
-worktree-to-base flows below apply at all.
+worktree-to-base flows below apply at all. `--manual-commits` / `-m` is a **commit-timing variant of no-worktree**: it
+**always runs without a worktree** (it implies `--no-worktree`) and additionally defers every commit to the user (see [Manual-commit mode](#3a-manual-commit-mode---manual-commits---m)).
 
 ```mermaid
 flowchart TD
-  s(["Start or switch a session"]) --> mode{"use_worktrees? Default true; off via --no-worktree or config"}
+  s(["Start or switch a session"]) --> mode{"use_worktrees? Default true; off via --no-worktree/-m or config"}
   mode -->|Worktrees on| wt["Open/create a worktree at .agitrack/worktrees/&lt;name&gt;; agent edits there, isolated"]
   wt --> wtnote[["Base repo is the user's tree; worktree is the agent's sandbox. Both base-to-worktree and worktree-to-base flows apply"]]
   mode -->|No-worktree| base["Session runs on the BASE tree, worktree=None, commits to the checked-out branch"]
-  base --> warn[/"One-time caveat: parallel no-worktree sessions share the dir and may conflict"/]
+  base --> mc{"Manual commits? -m / manual_commits"}
+  mc -->|No: auto-commit each turn| warn[/"One-time caveat: parallel no-worktree sessions share the dir and may conflict"/]
   warn --> basenote[["No isolation: the per-turn commit captures whatever is in the tree. Copy-back and base-sync flows are no-ops"]]
+  mc -->|Yes: user-triggered commits| mannote[["Turns are recorded as HIDDEN latent commits; the branch is untouched until YOU commit. See Manual-commit mode"]]
 
   base --> resume{"Resuming a session first run in a worktree?"}
   resume -->|Yes| retarget[["Retarget the transcript's recorded cwd to the base dir so it doesn't reopen the gone worktree path"]]
 ```
+
+**Jump to:** [Manual-commit mode](#3a-manual-commit-mode---manual-commits---m)
+
+---
+
+## 3a. Manual-commit mode (`--manual-commits` / `-m`)
+
+Makes agent-assisted coding feel like normal git: **you** decide when to commit. It **always runs
+without a worktree** (it implies `--no-worktree`, so the agent edits the current branch directly),
+but aGiTrack does **not** create a commit each turn. Instead every turn is recorded as a hidden **latent** commit on a side ref
+(`refs/agitrack/manual/<session>`) that your branch never shows, while `HEAD` stays put — so your
+history stays clean while you work, and no interaction is lost.
+
+When **you** commit — through `Ctrl-G → git-commit` **or** an ordinary `git commit` on the command
+line / in your editor — aGiTrack folds every pending latent turn's interaction trace and metadata
+into that **one** commit, alongside your own edits. A managed `prepare-commit-msg` hook does the
+folding and a `post-commit` hook resets the latent ref; both are installed only for the manual-mode
+session and removed on exit. So you always get a single, self-contained commit carrying your changes
+**and** the full agent tracking — whether or not the commit went through aGiTrack's menu, with no
+separate cover commit and no `<aGiTrack>` commits polluting the branch. Enable it for every run with
+`"manual_commits": true` in config.
+
+```mermaid
+flowchart TD
+  s(["Manual-commit mode: -m / manual_commits (implies --no-worktree)"]) --> turn["Agent runs a turn, editing the current branch directly"]
+  turn --> changed{"Working tree changed since the last latent turn?"}
+  changed -->|No| loopb(["Back to the input loop — nothing recorded"])
+  changed -->|Yes| latent[["Record a HIDDEN latent commit on refs/agitrack/manual/&lt;session&gt;: snapshot the working tree, same &lt;aGiTrack&gt; trace + metadata as a normal turn commit. HEAD does NOT move; your git index is untouched"]]
+  latent --> dash[["Dashboard shows it live as a 'pending' turn until you commit"]]
+  dash --> loopb
+
+  loopb --> uc{"You commit? Ctrl-G → git-commit, OR an external git commit"}
+  uc -->|Hook installed| fold[["prepare-commit-msg folds the pending turns' trace + metadata into YOUR message → ONE commit with your changes AND all agent tracking; post-commit resets the latent ref to the new commit"]]
+  uc -->|"core.hooksPath set (aGiTrack can't install the hook)"| cover[["Fallback: a HEAD poll detects the commit → aGiTrack adds a cover commit carrying the pending tracking (its tree = the new commit's, so it adds no diff) → reset the ref"]]
+  fold --> clean(["Branch now has ONE clean commit; 0 pending turns"])
+  cover --> clean
+```
+
+> The single folded commit carries a `commit_type: user` block plus one block per agent turn, so the
+> dashboard parses it as a squash — summing the turns' tokens and classifying it as agent-tracked
+> work. A commit made with **no** pending turns is still a plain, session-attributed user commit.
+> Recovery: if a prior run left the latent ref already contained in `HEAD` (an interrupted commit),
+> the next start resets it so those turns are never re-folded.
+
+**Jump to:** [`git-commit`](#8-git-commit) · [The agent turn](#5-the-agent-turn-auto-commit-and-integration)
 
 ---
 
@@ -165,7 +219,7 @@ flowchart TD
 
 **Jump to:** [The agent turn](#5-the-agent-turn-auto-commit-and-integration)
 
-> The explicit base commit paths (this pre-prompt offer and the `git-user-commit`
+> The explicit base commit paths (this pre-prompt offer and the `git-commit`
 > command) re-offer **every** untracked file (`include_declined=True`), so a previously
 > declined file can always be staged here. The automatic worktree capture keeps the
 > agent's own untracked decline sticky.
@@ -180,7 +234,10 @@ flowchart TD
   run --> endq{"How did the turn end?"}
 
   endq -->|Final agent message| parse[["Parse the turn: prompts, final reply, exact token usage"]]
-  parse --> changed{"Code changed AND staged changes exist?"}
+  parse --> mmode{"Manual-commit mode? (-m)"}
+  mmode -->|Yes| mlatent[["Record the turn as a HIDDEN latent commit on refs/agitrack/manual/&lt;session&gt; (HEAD frozen; no integration). See Manual-commit mode"]]
+  mlatent --> back
+  mmode -->|No| changed{"Code changed AND staged changes exist?"}
   changed -->|Yes| acommit[["Create the &lt;aGiTrack&gt; turn commit: subject = tag + latest query; body = interaction trace + metadata"]]
   changed -->|No| copy
   acommit --> delay{"--delay-merge set?"}
@@ -233,7 +290,7 @@ flowchart TD
   start(["Trigger: active session idle after a turn (committed or not), OR switched to this session, OR aGiTrack exiting"]) --> wtq{"Worktree session? (no-op under --no-worktree)"}
   wtq -->|No| done(["Nothing to do"])
   wtq -->|Yes| useredit{"User's OWN uncommitted edits in the worktree? (tracked changes / new non-declined files)"}
-  useredit -->|Yes| ucommit[/"Uncommitted changes in this worktree — commit them? (the normal user-commit prompt; see git-user-commit). Then continue to the copy offer"/]
+  useredit -->|Yes| ucommit[/"Uncommitted changes in this worktree — commit them? (the normal user-commit prompt; see git-commit). Then continue to the copy offer"/]
   useredit -->|No| gather
   ucommit --> gather[["List worktree files that won't merge: intentionally unstaged or git-ignored (new agent files are auto-staged + committed). Skip .agitrack/ and names starting with _ or ."]]
   gather --> any{"Any candidate files left to copy?"}
@@ -265,7 +322,7 @@ flowchart TD
   tally --> done
 ```
 
-**Jump to:** [`git-user-commit`](#8-git-user-commit)
+**Jump to:** [`git-commit`](#8-git-commit)
 
 > A file already accepted or left in place isn't re-offered until its content changes
 > (fingerprint). Declining mutes the whole current **set of paths** — aGiTrack won't ask
@@ -303,7 +360,7 @@ flowchart TD
   pal --> summ["summarizer"]
   pal --> settings2["settings"]
   pal --> gunstaged["git-unstaged"]
-  pal --> gcommit["git-user-commit"]
+  pal --> gcommit["git-commit"]
   pal --> dash["dashboard"]
   pal --> update["update"]
   pal --> exit["exit aGiTrack"]
@@ -336,7 +393,7 @@ flowchart TD
 
   gunstaged --> gu[["Show intentionally-unstaged files in the status bar"]]
 
-  gcommit --> gcflow["git-user-commit flow"]
+  gcommit --> gcflow["git-commit flow"]
 
   dash --> dserve[["Serve the read-only metrics dashboard; open the local browser only if it lands on this machine, else print the URL"]]
 
@@ -347,7 +404,7 @@ flowchart TD
 
 **Jump to:** [Worktrees vs no-worktree](#3-worktrees-vs-no-worktree) ·
 [Copy worktree-only files](#6-after-the-turn-copy-worktree-only-files-to-base) ·
-[`git-user-commit`](#8-git-user-commit) ·
+[`git-commit`](#8-git-commit) ·
 [Self-update flow](#9-self-update-flow) ·
 [Exit and terminal close](#10-exit-and-terminal-close) ·
 [Session sharing](#11-session-sharing) ·
@@ -355,14 +412,23 @@ flowchart TD
 
 ---
 
-## 8. `git-user-commit`
+## 8. `git-commit`
 
 Creates a user commit (no `<aGiTrack>` tag) from the user's own edits, from whichever
 tree holds them — the base repo and/or this session's worktree.
 
+> **Under `--manual-commits` / `-m` this command does more.** Manual mode always runs
+> **no-worktree** (it implies `--no-worktree`), so there is only the base tree — and this same
+> `git-commit` is the one command used for **both** a plain user commit and a commit that includes
+> the agent's tracked work. It stages your changes, then folds every pending latent turn's trace +
+> metadata into the message so the result is a **single** commit carrying your edits *and* the full
+> agent tracking; the latent ref is then reset. (An external `git commit` you run yourself gets the
+> same folding via the `prepare-commit-msg` hook.) See
+> [Manual-commit mode](#3a-manual-commit-mode---manual-commits---m).
+
 ```mermaid
 flowchart TD
-  start(["git-user-commit"]) --> where{"Which tree is dirty?"}
+  start(["git-commit"]) --> where{"Which tree is dirty?"}
   where -->|Worktree| wmsg[/"Ask for a commit message, blank rejected"/]
   where -->|Base repo| bmsg[/"Ask for a commit message, blank rejected"/]
   where -->|Both| wmsg

@@ -203,11 +203,11 @@ def main(argv: list[str] | None = None) -> int:
         "-m",
         dest="manual_commits",
         action="store_true",
-        help="user-triggered commits (implies --no-worktree): the agent edits the current "
-        "branch directly and each turn is recorded as a hidden 'latent' commit on a side ref "
-        "instead of landing on the branch. When you commit (via the aGiTrack menu or an "
-        "external `git commit`), the pending agent turns are folded into that one commit. Also "
-        "settable via 'manual_commits' in config.",
+        help="user-triggered commits. ALWAYS runs without a worktree (implies --no-worktree): the "
+        "agent edits the current branch directly and each turn is recorded as a hidden 'latent' "
+        "commit on a side ref instead of landing on the branch. When you commit (via the aGiTrack "
+        "menu or an external `git commit`), the pending agent turns are folded into that one "
+        "commit. Also settable via 'manual_commits' in config.",
     )
     parser.add_argument(
         "--no-confine",
