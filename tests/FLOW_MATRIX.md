@@ -199,7 +199,7 @@ Remaining from the 2026-06-27 self-audit — lower-risk message/guard branches, 
 - `runner.py:_change_session_merge_branch_menu` — the "'X' is running a turn — change its merge branch when idle" refusal for an in-flight session (happy-path retarget IS tested).
 - `runner.py:_rename_session` — the move-failure recovery ("Could not rename session…") and the "Name unchanged" no-op (collision path IS tested).
 - `runner.py:_prompt_new_session` — the runtime fork-failure fallback ("Couldn't fork…; starting a blank one instead") (the capability-gate path IS tested).
-- `runner.py:_run_command("git-user-commit")` — the "Committed your changes…" / "No changes to commit in the base repo." messaging wrapper (the underlying `_create_user_commit_popup` IS tested).
+- `runner.py:_run_command("git-commit")` — the "Committed your changes…" / "No changes to commit in the base repo." messaging wrapper (the underlying `_create_user_commit_popup` IS tested).
 - mock-only → upgrade to real-git when convenient: `_present_copy_offer` per-file "confirm each" combined with a real `shutil.copy2` OSError branch; `_finalize_pending_work` multi-session loop where one background session's real commit/merge fails.
 
 ## How to extend (the rule, restated)

@@ -196,7 +196,15 @@ class GitRepo:
         self._run(["git", "commit", "--amend", "-F", "-"], input_text=message)
         return self.short_sha("HEAD")
 
-    def cover_commit(self, message: str, *, first_parent: str, second_parent: str, include_staged: bool = False) -> str:
+    def cover_commit(
+        self,
+        message: str,
+        *,
+        first_parent: str,
+        second_parent: str,
+        include_staged: bool = False,
+        tree: str | None = None,
+    ) -> str:
         """Create a merge-shaped *cover* commit with parents ``(first_parent,
         second_parent)`` — the same shape as a GitHub PR merge commit. Used to
         attach aGiTrack's message on top of backend-made commits without amending
@@ -210,18 +218,64 @@ class GitRepo:
         files aGiTrack staged on top of the backend's commits) into the cover — so the
         cover's first-parent diff shows ALL the covered commits' changes plus the
         staged ones as one unit, instead of a plain commit that shows only the
-        extra delta and hides the covered changes behind its single parent."""
-        tree = (
-            self._run(["git", "write-tree"]).stdout.strip()
-            if include_staged
-            else self.rev_parse(f"{second_parent}^{{tree}}")
-        )
+        extra delta and hides the covered changes behind its single parent.
+
+        An explicit ``tree`` overrides both (e.g. manual-commit mode's cover
+        fallback, where the tree must equal ``first_parent``'s — the user's own
+        commit already carries the agent's changes and the cover only rides the
+        tracking metadata on top with the latent tip as second parent for
+        provenance, adding no diff of its own)."""
+        if tree is None:
+            tree = (
+                self._run(["git", "write-tree"]).stdout.strip()
+                if include_staged
+                else self.rev_parse(f"{second_parent}^{{tree}}")
+            )
         sha = self._run(
             ["git", "commit-tree", tree, "-p", first_parent, "-p", second_parent],
             input_text=message,
         ).stdout.strip()
         self._run(["git", "reset", "--soft", sha])
         return self.short_sha(sha)
+
+    def snapshot_worktree_tree(self) -> str:
+        """Write the CURRENT working tree to a tree object without touching the real
+        index or working tree, and return its SHA. Uses a throwaway index seeded from
+        HEAD, so ``git add -A`` records the full working-tree delta the agent produced
+        this turn — tracked edits, new untracked files, and deletions — minus the agent
+        scaffolding dirs (``.agitrack/`` / ``.claude/`` / ``.opencode/``). This is how
+        manual-commit mode captures a turn as a hidden latent commit while HEAD never
+        moves and the user's own index/staging is left completely untouched."""
+        scaffolding = [prefix.rstrip("/") for prefix in _NEVER_STAGE_PREFIXES]
+        with tempfile.TemporaryDirectory() as tmp:
+            index = os.path.join(tmp, "index")
+            env = {"GIT_INDEX_FILE": index}
+            # Seed from HEAD so `add -A` records the complete delta vs the branch, not
+            # just what happens to be staged in the user's real index. check=False so an
+            # unborn branch (no HEAD yet) simply starts from an empty index.
+            self._run(["git", "read-tree", "HEAD"], env=env, check=False)
+            self._run(["git", "add", "-A"], env=env)
+            # Drop the agent scaffolding dirs from the snapshot whether they were tracked
+            # or freshly added (``--ignore-unmatch`` so absent ones are a no-op). Done as a
+            # separate step rather than an ``:(exclude)`` pathspec, which errors when the
+            # dir is also git-ignored (a common setup — ``.agitrack/`` in a global excludes).
+            self._run(
+                ["git", "rm", "-r", "--cached", "--quiet", "--ignore-unmatch", *scaffolding],
+                env=env,
+                check=False,
+            )
+            return self._run(["git", "write-tree"], env=env).stdout.strip()
+
+    def commit_tree(self, tree: str, *, parents: list[str], message: str) -> str:
+        """Create a commit object for ``tree`` with the given ``parents`` and return its
+        FULL SHA. Unlike ``commit``/``cover_commit`` this moves no ref and touches neither
+        HEAD nor the working tree — the caller points a ref at the result (manual-commit
+        mode chains latent commits onto ``refs/agitrack/manual/<id>`` this way)."""
+        args = ["git", "commit-tree", tree]
+        for parent in parents:
+            if parent:
+                args += ["-p", parent]
+        return self._run(args, input_text=message).stdout.strip()
 
     def parents(self, ref: str = "HEAD") -> list[str]:
         output = self._run(["git", "rev-list", "--parents", "-1", ref]).stdout.split()

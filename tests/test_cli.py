@@ -481,6 +481,29 @@ def test_default_uses_config_use_worktrees(monkeypatch):
     assert captured["use_worktrees"] is False
 
 
+def test_manual_commits_flag_forces_no_worktree(monkeypatch):
+    # --manual-commits always runs without a worktree, even though config has worktrees on.
+    captured = _stub_launch(monkeypatch, use_worktrees=True)
+    cli.main(["--manual-commits"])
+    assert captured["manual_commits"] is True
+    assert captured["use_worktrees"] is False
+
+
+def test_manual_commits_short_flag(monkeypatch):
+    # -m is the short alias and behaves identically.
+    captured = _stub_launch(monkeypatch, use_worktrees=True)
+    cli.main(["-m"])
+    assert captured["manual_commits"] is True
+    assert captured["use_worktrees"] is False
+
+
+def test_manual_commits_off_by_default(monkeypatch):
+    captured = _stub_launch(monkeypatch)
+    cli.main([])
+    assert captured["manual_commits"] is False
+    assert captured["use_worktrees"] is True  # worktrees stay on when manual mode is off
+
+
 # --- --no-sandbox / --allowed-edit-paths ------------------------------------
 
 

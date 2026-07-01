@@ -180,6 +180,8 @@ class CommitEngine:
         session_name: str | None = None,
         accumulate_trace_only_on_commit: bool = False,
         backend_commits: list[str] | None = None,
+        manual_gate_fn: Callable[[], bool] | None = None,
+        manual_record_fn: Callable[[str], str | None] | None = None,
     ) -> bool:
         """Core of every agent-commit path.
 
@@ -313,24 +315,33 @@ class CommitEngine:
             for role, content in entries:
                 self.state.append_trace(role, content)
 
-            # Hook: proxy mode puts the session on a fresh turn branch here.
-            if pre_commit_fn is not None:
-                pre_commit_fn()
-
-            self.repo.add_tracked()
-            stage_untracked_fn(self.repo, self.state)
-
             cover_backend_head = False
             cover_with_staged = False
-            if not self.repo.has_staged_changes():
-                if not self._head_is_coverable(backend_commits):
+            if manual_record_fn is not None:
+                # Manual-commit mode: never stage into the user's index, run pre_commit_fn
+                # (no turn branch), or move HEAD. The turn is recorded as a hidden latent
+                # commit by manual_record_fn instead. Gate on whether the working tree
+                # actually changed since the latent tip, so a no-op turn records nothing —
+                # and, per bug #14, tokens are still accumulated only once past this gate.
+                if manual_gate_fn is not None and not manual_gate_fn():
                     return False
-                cover_backend_head = True
-            elif self._head_is_coverable(backend_commits):
-                # Staged changes on top of coverable backend commits: cover them
-                # together so the covered changes aren't hidden behind a plain
-                # commit's single parent (#35).
-                cover_with_staged = True
+            else:
+                # Hook: proxy mode puts the session on a fresh turn branch here.
+                if pre_commit_fn is not None:
+                    pre_commit_fn()
+
+                self.repo.add_tracked()
+                stage_untracked_fn(self.repo, self.state)
+
+                if not self.repo.has_staged_changes():
+                    if not self._head_is_coverable(backend_commits):
+                        return False
+                    cover_backend_head = True
+                elif self._head_is_coverable(backend_commits):
+                    # Staged changes on top of coverable backend commits: cover them
+                    # together so the covered changes aren't hidden behind a plain
+                    # commit's single parent (#35).
+                    cover_with_staged = True
 
             # Accumulate tokens only once we know the commit (or cover) will happen.
             for turn in turns:
@@ -386,7 +397,16 @@ class CommitEngine:
             compactions=compactions,
             origin_event=origin_event,
         )
-        if cover_backend_head or cover_with_staged:
+        if manual_record_fn is not None:
+            # Manual-commit mode: record the turn as a hidden latent commit on the side
+            # ref (snapshot the working tree, commit-tree onto the latent tip, move only
+            # that ref). HEAD and the user's index are untouched — the user's own commit
+            # later folds these in. Returns the latent sha (or None if, defensively, the
+            # tree turned out unchanged after the gate).
+            commit_sha = manual_record_fn(message)
+            if commit_sha is None:
+                return False
+        elif cover_backend_head or cover_with_staged:
             # The backend committed its own work (#35). Its commits keep their
             # hashes — amending them broke references the agent had already
             # published in PRs/issues (#58). Instead the trace/metadata ride a

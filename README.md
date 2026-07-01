@@ -156,6 +156,16 @@ Without a worktree the agent edits the current branch directly, so changes are v
 
 If you ran sessions the normal way before (each in its own worktree) and then start aGiTrack with `--no-worktree`, those earlier sessions are still there to resume — pick one from `Ctrl-G → sessions` (or `↻ Resume a past conversation…`) and it picks up in your main repository directory. (Why this needs handling: a session that first ran inside a worktree remembers that worktree folder as where it was working. When you resume it without worktrees, aGiTrack updates that remembered folder to your main directory, so the agent works there instead of trying to use the old worktree folder — which no longer exists.) To make no-worktree the default for every run, set `"use_worktrees": false` in `~/.agitrack/config.json`.
 
+### Manual commits (`--manual-commits` / `-m`)
+
+```bash
+agitrack --manual-commits   # or: agitrack -m
+```
+
+For a workflow that feels like plain git — you decide when to commit — use **manual-commit mode**. It **always runs without a worktree** (it implies `--no-worktree`): the agent edits the current branch directly, but aGiTrack does **not** create a commit each turn. Instead every turn is recorded as a hidden "latent" commit on a side ref (`refs/agitrack/manual/<session>`) that your branch never shows, so your history stays clean while you work.
+
+When **you** commit — either through `Ctrl-G → git-commit` or an ordinary `git commit` on the command line / in your editor — aGiTrack folds all the pending latent turns' interaction traces and metadata into that **one** commit, alongside your own changes. So you get a single, self-contained commit that carries both your edits and the full agent tracking, whether or not the commit went through aGiTrack's menu (a managed `prepare-commit-msg` hook does the folding; it's removed when the session ends). The dashboard shows the pending turns live, marked `pending`, until you commit. Enable it for every run with `"manual_commits": true` in `~/.agitrack/config.json`.
+
 
 
 On the first run, aGiTrack asks which backend should be the default (listed alphabetically, with each backend's install status). If the chosen backend's CLI is not installed, aGiTrack shows install instructions and lets you install it or pick a different one. The choice is saved in `~/.agitrack/config.json` (`default_backend`) and reused for future runs. You can also switch backends mid-session with the `agent-backend` command below.
@@ -166,7 +176,7 @@ In proxy mode (default), press `Ctrl-G` to open aGiTrack's menu, then pick a com
 sessions                  switch / start (own worktree) / stop a live session
 agent-backend             switch backend (opencode|claude); shows a picker
 git-unstaged              show intentionally unstaged files
-git-user-commit           create a user commit
+git-commit                commit your changes (folds in pending agent turns in --manual-commits mode)
 dashboard                 serve the metrics dashboard and open it in the browser
 settings                  view/change all config options (repo-local or global)
 update                    check for / install an aGiTrack self-update
@@ -533,6 +543,8 @@ User-wide settings live in `~/.agitrack/config.json` (override the directory wit
 `allowed_edit_paths` (default empty) is a list of extra paths the sandbox lets the agent write to, beyond its worktree — for example a shared data directory or a sibling package the agent needs to edit. Specify them in config as a JSON list (`"allowed_edit_paths": ["/srv/data", "../shared"]`), or for a single run on the command line with `--allowed-edit-paths`, separating multiple paths with your platform's `PATH` separator (`:` on macOS/Linux). A command-line value replaces the config list for that run. On macOS the carve-out covers paths that don't exist yet (the agent can create them); under Linux bubblewrap, a path under the read-only base must already exist to become writable.
 
 `use_worktrees` (default `true`) controls whether sessions run in isolated worktrees. Set it to `false` to run the agent directly on the current branch by default — the same behavior as `--no-worktree`, which applies it for a single run. See the `--no-worktree` notes under Usage for the trade-offs.
+
+`manual_commits` (default `false`) enables manual-commit mode by default — the same as starting aGiTrack with `--manual-commits` / `-m`, which applies it for a single run. Commits stay user-triggered and each agent turn is tracked on a hidden side ref until you commit. Manual-commit mode **always runs without a worktree** (it implies `--no-worktree`). See the `--manual-commits` notes under Usage.
 
 `commit_guidance` (default `true`) controls whether aGiTrack appends a note to the coding agent's system prompt telling it that aGiTrack auto-commits, so it doesn't create its own git commits. Set it to `false` to disable that note by default — the same as starting aGiTrack with `--no-commit-guidance`, which applies it for a single run. Only affects backends that support appending to the system prompt (Claude), and never the summarizer.
 

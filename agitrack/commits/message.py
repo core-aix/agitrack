@@ -52,8 +52,17 @@ SECRET_ASSIGNMENT_RE = re.compile(
 # false-positive risk is low. (Generic ``name = value`` secrets are caught separately by
 # SECRET_ASSIGNMENT_RE above.)
 SECRET_TOKEN_RES = [
-    # OpenAI / Anthropic and other "sk-" API keys (covers sk-proj-…, sk-ant-…).
+    # OpenAI / Anthropic and other "sk-" API keys (covers sk-proj-…, sk-ant-…, incl. the
+    # sk-ant-oat…/sk-ant-ort… OAuth access/refresh tokens Claude login stores).
     re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
+    # Claude Code / Anthropic OAuth login "reply key": after approving in the browser, the login
+    # page shows an authorization code and state joined by '#' (``code#state``) to paste back
+    # into the terminal — so it lands in the transcript as a pasted user message and, from there,
+    # in the commit trace. One-time use, but a secret that never belongs in a commit or a shared
+    # transcript. Two long URL-safe tokens joined by '#' is a distinctive shape; the lookarounds
+    # keep it from firing inside a longer run, so ordinary trace text — a bare SHA, a UUID, a URL
+    # with a short ``#fragment`` — is left untouched.
+    re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{20,}#[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])"),
     # GitHub personal-access / OAuth / user / server / refresh tokens.
     re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
     # GitHub fine-grained personal-access token.
@@ -488,6 +497,45 @@ def build_user_commit_message(
         ]
     )
     return "\n".join(lines).rstrip() + "\n"
+
+
+def build_manual_squash_trailer(*, agitrack_session_id: str, latent_bodies: list[str]) -> str:
+    """The tracking text a manual-commit-mode git hook appends to the user's own commit
+    message, so the single commit carries the whole session's interaction record.
+
+    It is a *squashed* message: a leading ``commit_type: user`` metadata block (so even a
+    commit made with no pending agent turns is still attributed to the aGiTrack session),
+    followed by the full message body of each pending latent turn in **chronological
+    (oldest-first) order** — the same order a normal squash merge lists its commits, so a
+    manual-mode commit reads like any other squash. Each latent body already carries its own
+    ``# Interaction Trace`` + ``# aGiTrack Metadata``, so the concatenation has one metadata
+    block per turn — exactly the aggregate shape the dashboard already parses into one
+    constituent per turn (see ``agitrack.metrics.collect._parse_constituents``), which sums the
+    tokens and classifies the commit as agent-tracked when any turn is present. No new
+    ``commit_type`` is needed. (The dashboard *displays* the constituents newest-first, but the
+    message itself stays chronological — the reorder is display-only, in
+    ``agitrack.metrics.web``.)
+
+    ``latent_bodies`` are the commit-message bodies read from the latent ref
+    (``refs/agitrack/manual/<id>``), the durable source of truth, so the trailer is always
+    reproducible after a restart. Returns a string ending in a single newline."""
+    blocks: list[str] = [
+        "\n".join(
+            [
+                METADATA_HEADER,
+                "commit_type: user",
+                "backend: agit",
+                f"agitrack_session_id: {agitrack_session_id}",
+                f"system: {_system_info()}",
+                f"agitrack_version: {__version__}",
+            ]
+        )
+    ]
+    for body in latent_bodies:  # chronological (oldest-first), like any squash merge
+        text = (body or "").strip()
+        if text and METADATA_HEADER in text:
+            blocks.append(text)
+    return "\n\n".join(blocks).rstrip() + "\n"
 
 
 def _subject_text(text: str, *, width: int) -> str:
