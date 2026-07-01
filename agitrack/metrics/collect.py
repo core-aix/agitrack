@@ -141,6 +141,10 @@ class CommitStat:
     # the original commits, each parsed from its block, so their tokens and
     # model/backend usage are counted and the squash is expandable in the UI.
     constituents: list[CommitStat] = field(default_factory=list)
+    # A manual-commit-mode latent turn: recorded on refs/agitrack/manual/* and not yet
+    # folded into a real branch commit. Shown in the dashboard as an in-progress turn so
+    # the user sees the session's work before they commit (#manual-commits).
+    pending: bool = False
 
     @property
     def short(self) -> str:
@@ -569,6 +573,46 @@ def collect_commit_stats(repo: GitRepo, ref: str = "HEAD") -> list[CommitStat]:
     return stats
 
 
+def collect_manual_pending(repo: GitRepo) -> list[CommitStat]:
+    """Manual-commit-mode latent turns not yet folded into a branch commit: the commits
+    on ``refs/agitrack/manual/*`` that HEAD does not contain, parsed as :class:`CommitStat`
+    and marked ``pending``. Oldest first, de-duplicated across refs. Line counts are fetched
+    per commit (blobless-clone safe). Empty unless a manual-commit session is active."""
+    try:
+        refs = repo._run(
+            ["git", "for-each-ref", "--format=%(refname)", "refs/agitrack/manual/"],
+            check=False,
+        ).stdout.split()
+    except Exception:
+        return []
+    pending: list[CommitStat] = []
+    seen: set[str] = set()
+    for ref in refs:
+        log = repo._run(
+            ["git", "log", "--format=%H%x01%an%x01%ae%x01%at%x01%B%x00", f"HEAD..{ref}", "--"],
+            check=False,
+        ).stdout
+        for record in log.split(_RECORD_SEP):
+            record = record.strip("\n")
+            if not record.strip():
+                continue
+            sha, _, rest = record.partition(_FIELD_SEP)
+            author, _, rest = rest.partition(_FIELD_SEP)
+            email, _, rest = rest.partition(_FIELD_SEP)
+            committed_at, _, body = rest.partition(_FIELD_SEP)
+            sha = sha.strip()
+            if not sha or sha in seen:
+                continue
+            seen.add(sha)
+            stat = _parse_commit(sha, author, email, committed_at.strip(), body)
+            stat.pending = True
+            pending.append(stat)
+    if pending:
+        apply_numstat_for(repo, [stat.sha for stat in pending], {stat.sha: stat for stat in pending})
+    pending.sort(key=lambda stat: stat.timestamp)  # oldest first, matching branch stats
+    return pending
+
+
 def _dedupe_squash_constituents(stats: list[CommitStat]) -> None:
     """Count each original commit's tokens once, even when it lands in several squashes.
 
@@ -656,6 +700,10 @@ def build_dashboard(
     from agitrack.metrics.github import commit_url_base
 
     stats = collect_commit_stats(repo, ref)
+    # Manual-commit mode: surface this session's not-yet-committed latent turns as pending
+    # entries (only when showing HEAD — the live working branch — not a historical ref).
+    if ref == "HEAD":
+        stats = stats + collect_manual_pending(repo)
     # The branch the dashboard *shows*: the explicit ref when one is requested,
     # otherwise whatever HEAD currently points at.
     branch = repo.current_branch() if ref == "HEAD" else ref

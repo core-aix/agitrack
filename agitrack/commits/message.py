@@ -499,6 +499,41 @@ def build_user_commit_message(
     return "\n".join(lines).rstrip() + "\n"
 
 
+def build_manual_squash_trailer(*, agitrack_session_id: str, latent_bodies: list[str]) -> str:
+    """The tracking text a manual-commit-mode git hook appends to the user's own commit
+    message, so the single commit carries the whole session's interaction record.
+
+    It is a *squashed* message: a leading ``commit_type: user`` metadata block (so even a
+    commit made with no pending agent turns is still attributed to the aGiTrack session),
+    followed by the full message body of each pending latent turn (oldest first). Each
+    latent body already carries its own ``# Interaction Trace`` + ``# aGiTrack Metadata``,
+    so the concatenation has one metadata block per turn — exactly the aggregate shape the
+    dashboard already parses into one constituent per turn (see
+    ``agitrack.metrics.collect._parse_constituents``), which sums the tokens and classifies
+    the commit as agent-tracked when any turn is present. No new ``commit_type`` is needed.
+
+    ``latent_bodies`` are the commit-message bodies read from the latent ref
+    (``refs/agitrack/manual/<id>``), the durable source of truth, so the trailer is always
+    reproducible after a restart. Returns a string ending in a single newline."""
+    blocks: list[str] = [
+        "\n".join(
+            [
+                METADATA_HEADER,
+                "commit_type: user",
+                "backend: agit",
+                f"agitrack_session_id: {agitrack_session_id}",
+                f"system: {_system_info()}",
+                f"agitrack_version: {__version__}",
+            ]
+        )
+    ]
+    for body in latent_bodies:
+        text = (body or "").strip()
+        if text and METADATA_HEADER in text:
+            blocks.append(text)
+    return "\n\n".join(blocks).rstrip() + "\n"
+
+
 def _subject_text(text: str, *, width: int) -> str:
     return _subject_parts(text, width=width)[0]
 

@@ -282,6 +282,21 @@ class GlobalConfig:
         self.save()
 
     @property
+    def manual_commits(self) -> bool:
+        # Manual-commit mode (off by default): the agent edits the current branch directly
+        # (implies no worktrees) and each turn is recorded as a hidden "latent" commit on a
+        # side ref instead of landing on the branch. Commits stay user-triggered — when you
+        # commit (via the aGiTrack menu or an external `git commit`), the pending latent turns
+        # are folded into that single commit. Enable per-run with --manual-commits / -m.
+        value = self._raw("manual_commits")
+        return False if value is None else bool(value)
+
+    @manual_commits.setter
+    def manual_commits(self, value: bool) -> None:
+        self.data["manual_commits"] = bool(value)
+        self.save()
+
+    @property
     def allowed_edit_paths(self) -> list[str]:
         # Extra paths the sandbox lets the agent write to, beyond its worktree (e.g. a
         # shared data dir, a sibling package). Stored as a JSON list of strings; the CLI
