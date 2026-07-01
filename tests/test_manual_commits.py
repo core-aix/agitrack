@@ -142,6 +142,40 @@ def test_dashboard_displays_manual_squash_newest_first(tmp_path):
     assert agent_parts == ["<aGiTrack> third", "<aGiTrack> second", "<aGiTrack> first"]
 
 
+def test_dashboard_squash_main_message_omits_constituents(tmp_path):
+    # The main message must NOT duplicate the squashed turns — they are listed (in full) under
+    # "parts", so the message keeps only the commit's own leading text.
+    from agitrack.metrics.web import dashboard_data
+
+    repo = _init_repo(tmp_path)
+    bodies = [_agent_body("first", 10), _agent_body("second", 20)]
+    msg = "My user commit\n\nsome body text\n\n" + build_manual_squash_trailer(
+        agitrack_session_id="sid", latent_bodies=bodies
+    )
+    _git(repo, "commit", "--allow-empty", "-m", msg)
+
+    folded = next(c for c in dashboard_data(build_dashboard(repo))["commits"] if c["subject"] == "My user commit")
+    # Main message: only the user's own text; no constituent blocks.
+    assert "My user commit" in folded["message"] and "some body text" in folded["message"]
+    assert "# aGiTrack Metadata" not in folded["message"]
+    assert "<aGiTrack> first" not in folded["message"]
+    # The turns are still available in full under parts.
+    part_text = "\n".join(p["message"] for p in folded["parts"])
+    assert "<aGiTrack> first" in part_text and "<aGiTrack> second" in part_text
+
+
+def test_dashboard_non_squash_message_is_unchanged(tmp_path):
+    # A normal (non-squash) agent commit has no parts, so its full message — trace + metadata —
+    # is preserved (nothing to de-duplicate).
+    from agitrack.metrics.web import dashboard_data
+
+    repo = _init_repo(tmp_path)
+    _git(repo, "commit", "--allow-empty", "-m", _agent_body("single turn", 5))
+    c = next(x for x in dashboard_data(build_dashboard(repo))["commits"] if "single turn" in (x["subject"] or ""))
+    assert not c["parts"]  # not a squash
+    assert "# aGiTrack Metadata" in c["message"]  # full message preserved
+
+
 def test_manual_trailer_with_no_pending_turns_is_a_plain_user_commit():
     trailer = build_manual_squash_trailer(agitrack_session_id="sid", latent_bodies=[])
     folded = "Just my edit\n\n" + trailer
