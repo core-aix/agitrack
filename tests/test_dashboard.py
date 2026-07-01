@@ -1139,10 +1139,12 @@ def test_dashboard_data_serializes_squash_constituents_for_expansion(tmp_path):
 
     data = dashboard_data(build_dashboard(repo))
     squash = next(c for c in data["commits"] if c["subject"].startswith("Squashed"))
-    # The original commits ride along so the log entry can expand into them.
+    # The original commits ride along so the log entry can expand into them — displayed
+    # NEWEST-first (the "second turn" leads), matching the newest-first commit log, even
+    # though the raw message lists them chronologically.
     assert len(squash["parts"]) == 2
-    assert [p["model"] for p in squash["parts"]] == ["claude-opus-4-8", "qwen"]
-    assert squash["parts"][0]["tokens"]["output"] == 200
+    assert [p["model"] for p in squash["parts"]] == ["qwen", "claude-opus-4-8"]
+    assert squash["parts"][0]["tokens"]["output"] == 50  # newest turn first
     assert squash["parts"][0]["message"]  # full text for the nested view
 
 

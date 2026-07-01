@@ -231,11 +231,26 @@ def test_redact_covers_the_secret_shapes_github_push_protection_blocks():
     assert pem_body not in out and "BEGIN RSA PRIVATE KEY" not in out
 
 
+def test_redact_masks_claude_login_reply_key():
+    # The Claude Code login "reply key" is the OAuth authorization code + state joined by '#'
+    # (code#state) pasted back from the login page; it reaches the trace as a user message and
+    # must be redacted even though it is one-time-use.
+    code = _fake_token("", 43, charset=string.ascii_letters + string.digits + "-_")
+    state = _fake_token("", 43, charset=string.ascii_letters + string.digits + "-_")
+    reply_key = f"{code}#{state}"
+    out = redact_transcript(f'{{"text":"{reply_key}"}}')
+    assert code not in out and state not in out and reply_key not in out
+    assert "[REDACTED]" in out
+
+
 def test_redact_does_not_mask_ordinary_hex_or_identifiers():
     # The added patterns must not be so greedy they mangle normal transcript content (commit
     # SHAs, UUIDs, plain words) — that would corrupt shared transcripts wholesale.
     benign = '{"sha":"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0","id":"550e8400-e29b-41d4-a716-446655440000"}'
     assert redact_transcript(benign) == benign
+    # A URL with a short #fragment and a docs anchor must survive (not a code#state pair).
+    urls = '{"a":"https://ex.com/very_long_path_segment_here#section","b":"file_name_quite_long.md#L120-L134"}'
+    assert redact_transcript(urls) == urls
 
 
 # --- size cap (don't exceed Git's per-file limit) ---------------------------
@@ -1494,6 +1509,33 @@ def test_runner_recognises_shared_session_after_id_drift(tmp_path):
 
     assert runner._session_is_shared("new", runner._my_shared_session_ids()) is True
     assert runner._session_auto_shared("new") is True
+
+
+def test_disabling_auto_share_persists_across_id_drift(tmp_path):
+    # #55: opting OUT of auto-share must clear the WHOLE id lineage, so a session opted in
+    # under an earlier id and resumed under a new one stays OFF across aGiTrack runs — the
+    # disable must persist (clearing only the current id left an ancestor enabled, and the
+    # session re-appeared as auto-shared on the next launch).
+    from proxy_helpers import make_runner
+    from agitrack.config import AgitrackState
+
+    (tmp_path / "repo").mkdir()
+    repo = _init_repo(tmp_path / "repo")
+    runner = make_runner()
+    runner.base_repo = repo
+    runner._debug = lambda *a, **k: None
+    runner._user_state = lambda: AgitrackState(repo.repo)
+
+    base_state = AgitrackState(repo.repo)
+    base_state.set_auto_share("old", True)  # opted in under the original id
+    runner._record_shared_alias_on_drift("old", "new")  # backend forked old -> new on resume
+    assert runner._session_auto_shared("new") is True
+
+    runner._set_session_auto_share("new", False)  # user turns it off via the (drifted) current id
+
+    assert runner._session_auto_shared("new") is False
+    # Persisted: a FRESH state (the next aGiTrack run reads the same file) still sees it OFF.
+    assert AgitrackState(repo.repo).auto_share_enabled("old") is False
 
 
 def test_unshare_requires_confirmation():

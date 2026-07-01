@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 
+from agitrack.commits import METADATA_HEADER
 from agitrack.git import GitRepo
 from agitrack.metrics.collect import CommitStat, Dashboard, apply_numstat_for, build_dashboard
 
@@ -151,11 +152,13 @@ def dashboard_data(dash: Dashboard) -> dict:
                 "ts": stat.timestamp,  # commit time (epoch) for the time filter
                 "started": stat.started_at,  # AI conversation span (ISO, may be "")
                 "ended": stat.ended_at,
-                "message": stat.message,  # full message, shown when a log entry opens
+                # Shown when a log entry opens. For a squash, the constituents are stripped
+                # (they're listed separately in "parts") so the message isn't duplicated.
+                "message": _main_message(stat),
                 "url": (dash.commit_base + stat.sha) if dash.commit_base else "",
                 # Original commits of a squash, so the log entry can expand into
-                # them (recursive, for multiple rounds of squashing).
-                "parts": [_part_payload(part) for part in stat.constituents],
+                # them (recursive, for multiple rounds of squashing). Newest-first display.
+                "parts": _display_parts(stat),
             }
         )
 
@@ -172,6 +175,26 @@ def dashboard_data(dash: Dashboard) -> dict:
     }
 
 
+def _display_parts(stat: CommitStat) -> list[dict]:
+    """A squash's constituents serialized for the expandable log view, ordered
+    **newest-first** to match the newest-first commit log. This reorder is DISPLAY-ONLY: the
+    raw commit message keeps its constituents in chronological (oldest-first) order, like any
+    squash merge — only the dashboard shows the latest one at the top."""
+    return [_part_payload(part) for part in reversed(stat.constituents)]
+
+
+def _main_message(stat: CommitStat) -> str:
+    """The commit's own message text for the detail view. For a squash this drops the appended
+    constituent blocks (each already shown, in full, in the expandable parts list) so the main
+    message doesn't duplicate them — it keeps only the commit's leading text before the first
+    ``# aGiTrack Metadata`` block (e.g. the user's own commit subject/body for a manual-mode
+    commit, or a PR title for a squash merge). A non-squash commit keeps its full message."""
+    if not stat.constituents:
+        return stat.message
+    head, _, _ = stat.message.partition("\n" + METADATA_HEADER)
+    return head.strip()
+
+
 def _part_payload(part: CommitStat) -> dict:
     """A squash constituent (an original commit), serialized for the expandable
     log view — recursive in case a constituent is itself a squash."""
@@ -183,8 +206,9 @@ def _part_payload(part: CommitStat) -> dict:
         "tokens": part.tokens,
         "started": part.started_at,
         "ended": part.ended_at,
-        "message": part.message,
-        "parts": [_part_payload(child) for child in part.constituents],
+        # A nested squash's own message likewise drops its (separately-listed) constituents.
+        "message": _main_message(part),
+        "parts": _display_parts(part),  # nested squashes also expand newest-first
     }
 
 
@@ -436,6 +460,7 @@ def _log_entry(dash: Dashboard, stat: CommitStat, covers: dict[str, CommitStat])
         "committers": dash.committers_of(stat),
         "subject": stat.subject,
         "kind": stat.kind,
+        "pending": stat.pending,
         "eff_backend": eff_backend,
         "eff_model": eff_model,
         "tokens": stat.tokens,
@@ -444,9 +469,9 @@ def _log_entry(dash: Dashboard, stat: CommitStat, covers: dict[str, CommitStat])
         "ts": stat.timestamp,
         "started": stat.started_at,
         "ended": stat.ended_at,
-        "message": stat.message,
+        "message": _main_message(stat),  # squash constituents stripped (shown in "parts")
         "url": (dash.commit_base + stat.sha) if dash.commit_base else "",
-        "parts": [_part_payload(part) for part in stat.constituents],
+        "parts": _display_parts(stat),  # newest-first display (message stays chronological)
     }
 
 
@@ -738,6 +763,8 @@ h2.section::before{content:"# ";color:var(--amber)}
 .entry .badge.ai{color:var(--phosphor);border-color:var(--phosphor-dim)}
 .entry .badge.ops{color:var(--ops);border-color:var(--ops)}
 .entry .badge.nontracked{color:var(--amber);border-color:var(--amber-dim)}
+.entry .badge.pending{color:var(--amber);border-color:var(--amber-dim);border-style:dashed}
+.entry.pending{opacity:.82}
 .entry .lc{font-size:12px;color:var(--fg-dim)}
 .entry .lc .add{color:var(--phosphor)} .entry .lc .rem{color:var(--red)}
 .entry .tok{font-size:11px;border:1px solid var(--line);padding:0 5px;color:var(--fg-dim)}
@@ -1330,12 +1357,15 @@ function renderLog(){
   const rows = entries.map((c, i) => {
     const cls = AI_KINDS.has(c.kind) ? "ai" : (c.kind==="agitrack-ops" ? "ops" : "nontracked");
     const badge = `<span class="badge ${cls}">${esc(KIND_LABEL[c.kind]||c.kind)}</span>`;
+    // A manual-commit-mode latent turn not yet folded into a commit — flag it so the user
+    // can tell in-progress work from committed history.
+    const pend = c.pending?`<span class="badge pending" title="not yet committed — folds into your next commit">pending</span>`:"";
     const squash = (c.parts&&c.parts.length)?`<span class="squash">⧉ ${c.parts.length} squashed</span>`:"";
     const lc = (c.ins||c.del)?`<span class="lc"><span class="add">+${fmt(c.ins)}</span> <span class="rem">−${fmt(c.del)}</span></span>`:"";
     const m = c.eff_model?`<span class="lc">${esc(c.eff_model)}</span>`:"";
     const subj = c.subject||"", shown = truncSubject(subj);
     const subjTitle = shown!==subj ? ` title="${esc(subj)}"` : "";  // full subject on hover when cut
-    return `<div class="entry ${cls}" data-i="${i}"><span class="sha">${esc(c.short)}</span>${badge}${squash}`+
+    return `<div class="entry ${cls}${c.pending?' pending':''}" data-i="${i}"><span class="sha">${esc(c.short)}</span>${badge}${pend}${squash}`+
       `<span class="ksub"${subjTitle}>${esc(shown)}</span>${lc}${tokenBrief(c.tokens)}${m}`+
       `<div class="detail" id="detail-${i}" hidden></div></div>`;
   }).join("");
