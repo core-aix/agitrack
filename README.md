@@ -162,7 +162,7 @@ If you ran sessions the normal way before (each in its own worktree) and then st
 agitrack --manual-commits   # or: agitrack -m
 ```
 
-For a workflow that feels like plain git — you decide when to commit — use **manual-commit mode** (implies `--no-worktree`). The agent edits the current branch directly, but aGiTrack does **not** create a commit each turn. Instead every turn is recorded as a hidden "latent" commit on a side ref (`refs/agitrack/manual/<session>`) that your branch never shows, so your history stays clean while you work.
+For a workflow that feels like plain git — you decide when to commit — use **manual-commit mode**. It **always runs without a worktree** (it implies `--no-worktree`): the agent edits the current branch directly, but aGiTrack does **not** create a commit each turn. Instead every turn is recorded as a hidden "latent" commit on a side ref (`refs/agitrack/manual/<session>`) that your branch never shows, so your history stays clean while you work.
 
 When **you** commit — either through `Ctrl-G → git-commit` or an ordinary `git commit` on the command line / in your editor — aGiTrack folds all the pending latent turns' interaction traces and metadata into that **one** commit, alongside your own changes. So you get a single, self-contained commit that carries both your edits and the full agent tracking, whether or not the commit went through aGiTrack's menu (a managed `prepare-commit-msg` hook does the folding; it's removed when the session ends). The dashboard shows the pending turns live, marked `pending`, until you commit. Enable it for every run with `"manual_commits": true` in `~/.agitrack/config.json`.
 
@@ -544,7 +544,7 @@ User-wide settings live in `~/.agitrack/config.json` (override the directory wit
 
 `use_worktrees` (default `true`) controls whether sessions run in isolated worktrees. Set it to `false` to run the agent directly on the current branch by default — the same behavior as `--no-worktree`, which applies it for a single run. See the `--no-worktree` notes under Usage for the trade-offs.
 
-`manual_commits` (default `false`) enables manual-commit mode by default — the same as starting aGiTrack with `--manual-commits` / `-m`, which applies it for a single run. Commits stay user-triggered and each agent turn is tracked on a hidden side ref until you commit; implies no worktrees. See the `--manual-commits` notes under Usage.
+`manual_commits` (default `false`) enables manual-commit mode by default — the same as starting aGiTrack with `--manual-commits` / `-m`, which applies it for a single run. Commits stay user-triggered and each agent turn is tracked on a hidden side ref until you commit. Manual-commit mode **always runs without a worktree** (it implies `--no-worktree`). See the `--manual-commits` notes under Usage.
 
 `commit_guidance` (default `true`) controls whether aGiTrack appends a note to the coding agent's system prompt telling it that aGiTrack auto-commits, so it doesn't create its own git commits. Set it to `false` to disable that note by default — the same as starting aGiTrack with `--no-commit-guidance`, which applies it for a single run. Only affects backends that support appending to the system prompt (Claude), and never the summarizer.
 
