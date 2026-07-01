@@ -1511,6 +1511,33 @@ def test_runner_recognises_shared_session_after_id_drift(tmp_path):
     assert runner._session_auto_shared("new") is True
 
 
+def test_disabling_auto_share_persists_across_id_drift(tmp_path):
+    # #55: opting OUT of auto-share must clear the WHOLE id lineage, so a session opted in
+    # under an earlier id and resumed under a new one stays OFF across aGiTrack runs — the
+    # disable must persist (clearing only the current id left an ancestor enabled, and the
+    # session re-appeared as auto-shared on the next launch).
+    from proxy_helpers import make_runner
+    from agitrack.config import AgitrackState
+
+    (tmp_path / "repo").mkdir()
+    repo = _init_repo(tmp_path / "repo")
+    runner = make_runner()
+    runner.base_repo = repo
+    runner._debug = lambda *a, **k: None
+    runner._user_state = lambda: AgitrackState(repo.repo)
+
+    base_state = AgitrackState(repo.repo)
+    base_state.set_auto_share("old", True)  # opted in under the original id
+    runner._record_shared_alias_on_drift("old", "new")  # backend forked old -> new on resume
+    assert runner._session_auto_shared("new") is True
+
+    runner._set_session_auto_share("new", False)  # user turns it off via the (drifted) current id
+
+    assert runner._session_auto_shared("new") is False
+    # Persisted: a FRESH state (the next aGiTrack run reads the same file) still sees it OFF.
+    assert AgitrackState(repo.repo).auto_share_enabled("old") is False
+
+
 def test_unshare_requires_confirmation():
     # Unsharing removes the session from origin for everyone, so the manage menu must
     # confirm before it runs.
