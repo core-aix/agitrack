@@ -231,11 +231,26 @@ def test_redact_covers_the_secret_shapes_github_push_protection_blocks():
     assert pem_body not in out and "BEGIN RSA PRIVATE KEY" not in out
 
 
+def test_redact_masks_claude_login_reply_key():
+    # The Claude Code login "reply key" is the OAuth authorization code + state joined by '#'
+    # (code#state) pasted back from the login page; it reaches the trace as a user message and
+    # must be redacted even though it is one-time-use.
+    code = _fake_token("", 43, charset=string.ascii_letters + string.digits + "-_")
+    state = _fake_token("", 43, charset=string.ascii_letters + string.digits + "-_")
+    reply_key = f"{code}#{state}"
+    out = redact_transcript(f'{{"text":"{reply_key}"}}')
+    assert code not in out and state not in out and reply_key not in out
+    assert "[REDACTED]" in out
+
+
 def test_redact_does_not_mask_ordinary_hex_or_identifiers():
     # The added patterns must not be so greedy they mangle normal transcript content (commit
     # SHAs, UUIDs, plain words) — that would corrupt shared transcripts wholesale.
     benign = '{"sha":"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0","id":"550e8400-e29b-41d4-a716-446655440000"}'
     assert redact_transcript(benign) == benign
+    # A URL with a short #fragment and a docs anchor must survive (not a code#state pair).
+    urls = '{"a":"https://ex.com/very_long_path_segment_here#section","b":"file_name_quite_long.md#L120-L134"}'
+    assert redact_transcript(urls) == urls
 
 
 # --- size cap (don't exceed Git's per-file limit) ---------------------------

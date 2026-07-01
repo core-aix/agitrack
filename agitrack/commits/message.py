@@ -52,8 +52,17 @@ SECRET_ASSIGNMENT_RE = re.compile(
 # false-positive risk is low. (Generic ``name = value`` secrets are caught separately by
 # SECRET_ASSIGNMENT_RE above.)
 SECRET_TOKEN_RES = [
-    # OpenAI / Anthropic and other "sk-" API keys (covers sk-proj-…, sk-ant-…).
+    # OpenAI / Anthropic and other "sk-" API keys (covers sk-proj-…, sk-ant-…, incl. the
+    # sk-ant-oat…/sk-ant-ort… OAuth access/refresh tokens Claude login stores).
     re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
+    # Claude Code / Anthropic OAuth login "reply key": after approving in the browser, the login
+    # page shows an authorization code and state joined by '#' (``code#state``) to paste back
+    # into the terminal — so it lands in the transcript as a pasted user message and, from there,
+    # in the commit trace. One-time use, but a secret that never belongs in a commit or a shared
+    # transcript. Two long URL-safe tokens joined by '#' is a distinctive shape; the lookarounds
+    # keep it from firing inside a longer run, so ordinary trace text — a bare SHA, a UUID, a URL
+    # with a short ``#fragment`` — is left untouched.
+    re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{20,}#[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])"),
     # GitHub personal-access / OAuth / user / server / refresh tokens.
     re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
     # GitHub fine-grained personal-access token.
