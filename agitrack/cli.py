@@ -199,6 +199,17 @@ def main(argv: list[str] | None = None) -> int:
         "agent does not create its own git commits unless you explicitly ask",
     )
     parser.add_argument(
+        "--manual-commits",
+        "-m",
+        dest="manual_commits",
+        action="store_true",
+        help="user-triggered commits (implies --no-worktree): the agent edits the current "
+        "branch directly and each turn is recorded as a hidden 'latent' commit on a side ref "
+        "instead of landing on the branch. When you commit (via the aGiTrack menu or an "
+        "external `git commit`), the pending agent turns are folded into that one commit. Also "
+        "settable via 'manual_commits' in config.",
+    )
+    parser.add_argument(
         "--no-confine",
         "--no-sandbox",
         dest="no_sandbox",
@@ -497,7 +508,10 @@ def main(argv: list[str] | None = None) -> int:
     if share_config_error:
         print(f"Configuration error: {share_config_error}")
         return 1
-    use_worktrees = False if args.no_worktree else config.use_worktrees
+    manual_commits = True if getattr(args, "manual_commits", False) else getattr(config, "manual_commits", False)
+    # Manual-commit mode edits the current branch directly and defers commits to the user, so
+    # it necessarily runs without a worktree (there is no per-turn branch to integrate).
+    use_worktrees = False if (args.no_worktree or manual_commits) else config.use_worktrees
     commit_guidance = False if args.no_commit_guidance else getattr(config, "commit_guidance", True)
     sandbox_enabled = False if args.no_sandbox else getattr(config, "sandbox", True)
     if args.allowed_edit_paths is not None:
@@ -579,6 +593,7 @@ def main(argv: list[str] | None = None) -> int:
                 backend=args.backend,
                 new_session=args.new_session,
                 use_worktrees=use_worktrees,
+                manual_commits=manual_commits,
                 backend_args=backend_args,
                 backend_command=backend_command,
                 commit_guidance=commit_guidance,

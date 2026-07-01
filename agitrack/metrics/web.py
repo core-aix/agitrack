@@ -436,6 +436,7 @@ def _log_entry(dash: Dashboard, stat: CommitStat, covers: dict[str, CommitStat])
         "committers": dash.committers_of(stat),
         "subject": stat.subject,
         "kind": stat.kind,
+        "pending": stat.pending,
         "eff_backend": eff_backend,
         "eff_model": eff_model,
         "tokens": stat.tokens,
@@ -738,6 +739,8 @@ h2.section::before{content:"# ";color:var(--amber)}
 .entry .badge.ai{color:var(--phosphor);border-color:var(--phosphor-dim)}
 .entry .badge.ops{color:var(--ops);border-color:var(--ops)}
 .entry .badge.nontracked{color:var(--amber);border-color:var(--amber-dim)}
+.entry .badge.pending{color:var(--amber);border-color:var(--amber-dim);border-style:dashed}
+.entry.pending{opacity:.82}
 .entry .lc{font-size:12px;color:var(--fg-dim)}
 .entry .lc .add{color:var(--phosphor)} .entry .lc .rem{color:var(--red)}
 .entry .tok{font-size:11px;border:1px solid var(--line);padding:0 5px;color:var(--fg-dim)}
@@ -1330,12 +1333,15 @@ function renderLog(){
   const rows = entries.map((c, i) => {
     const cls = AI_KINDS.has(c.kind) ? "ai" : (c.kind==="agitrack-ops" ? "ops" : "nontracked");
     const badge = `<span class="badge ${cls}">${esc(KIND_LABEL[c.kind]||c.kind)}</span>`;
+    // A manual-commit-mode latent turn not yet folded into a commit — flag it so the user
+    // can tell in-progress work from committed history.
+    const pend = c.pending?`<span class="badge pending" title="not yet committed — folds into your next commit">pending</span>`:"";
     const squash = (c.parts&&c.parts.length)?`<span class="squash">⧉ ${c.parts.length} squashed</span>`:"";
     const lc = (c.ins||c.del)?`<span class="lc"><span class="add">+${fmt(c.ins)}</span> <span class="rem">−${fmt(c.del)}</span></span>`:"";
     const m = c.eff_model?`<span class="lc">${esc(c.eff_model)}</span>`:"";
     const subj = c.subject||"", shown = truncSubject(subj);
     const subjTitle = shown!==subj ? ` title="${esc(subj)}"` : "";  // full subject on hover when cut
-    return `<div class="entry ${cls}" data-i="${i}"><span class="sha">${esc(c.short)}</span>${badge}${squash}`+
+    return `<div class="entry ${cls}${c.pending?' pending':''}" data-i="${i}"><span class="sha">${esc(c.short)}</span>${badge}${pend}${squash}`+
       `<span class="ksub"${subjTitle}>${esc(shown)}</span>${lc}${tokenBrief(c.tokens)}${m}`+
       `<div class="detail" id="detail-${i}" hidden></div></div>`;
   }).join("");

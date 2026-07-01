@@ -35,6 +35,7 @@ from agitrack.backends.proxy_agents import available_backends, make_proxy_agent
 from agitrack.commits import (
     METADATA_HEADER,
     apply_summary_to_message,
+    build_manual_squash_trailer,
     build_user_commit_message,
     summary_metadata_lines,
 )
@@ -304,7 +305,7 @@ class ProxyInput:
         "sessions",
         "agent-backend",
         "git-unstaged",
-        "git-user-commit",
+        "git-commit",
         "dashboard",
         "settings",
         "update",
@@ -506,6 +507,7 @@ class ProxyRunner:
         backend: str | None = None,
         new_session: bool = False,
         use_worktrees: bool = True,
+        manual_commits: bool = False,
         backend_args: list[str] | None = None,
         commit_guidance: bool = True,
         full_agent_messages: bool = False,
@@ -531,6 +533,17 @@ class ProxyRunner:
         self.active = Session.bare()
         self.repo = repo
         self._use_worktrees = use_worktrees  # #9: when False, run on the current branch directly
+        # Manual-commit mode: user-triggered commits with per-turn agent work recorded as hidden
+        # "latent" commits on refs/agitrack/manual/<session_id> instead of landing on the branch.
+        # Implies no worktrees (resolved in cli.py). Off by default — a strict addition that leaves
+        # the worktree and existing no-worktree paths untouched.
+        self._manual_commits = manual_commits
+        # Manual-mode runtime state (set in _setup_manual_commit_mode): whether the fold/reset
+        # hooks were installed, the last observed HEAD (poll fallback baseline), and the cached
+        # working-tree snapshot the latent gate hands to the latent record.
+        self._manual_hooks_installed = False
+        self._manual_last_head: str | None = None
+        self._manual_pending_tree: str | None = None
         self._warned_parallel_no_worktree = False  # one-time shared-tree caveat for extra --no-worktree sessions
         # No-worktree only: the branch HEAD when this session started. Commits made past it that
         # aGiTrack didn't author are the agent's own (#35 cover applies); the anchor floors the
@@ -1168,6 +1181,10 @@ class ProxyRunner:
                 "_pending_share_conflicts": [],
                 "_exit_menu_requested": False,
                 "_use_worktrees": True,
+                "_manual_commits": False,
+                "_manual_hooks_installed": False,
+                "_manual_last_head": None,
+                "_manual_pending_tree": None,
                 "_noworktree_base_head": None,
                 "_warned_parallel_no_worktree": False,
                 "_sandbox": True,
@@ -1360,6 +1377,7 @@ class ProxyRunner:
                 signal.signal(signal.SIGHUP, self._handle_exit_signal)
             self._setup_worktree_confinement_notice()
             self._install_base_commit_guard()  # hard-stop agent commits to base when no OS sandbox
+            self._setup_manual_commit_mode()  # --manual-commits: latent-commit hooks + trailer files
             exit_code = self._loop()  # the timers phase auto-applies a sandbox-blocked backend update
         finally:
             if self.original_sigwinch is not None and hasattr(signal, "SIGWINCH"):
@@ -1370,6 +1388,7 @@ class ProxyRunner:
             self._stop_file_watcher()
             self._stop_dashboard()
             self._remove_base_commit_guard()  # uninstall the pre-commit guard + restore any chained hook
+            self._teardown_manual_commit_mode()  # uninstall the manual-commit hooks + restore any chained
             self._cleanup_child()
             self._restore_terminal()
             if self._host is not None:
@@ -1626,6 +1645,201 @@ class ProxyRunner:
                 git_hooks.remove_base_commit_guard(self.base_repo.hooks_dir(), debug=self._debug)
         except Exception as error:
             self._debug(f"base-commit guard removal failed: {error!r}")
+
+    # --- manual-commit mode (--manual-commits): hidden latent commits + a hook that ----
+    # --- folds their tracking into the user's own commit (a strict addition, off by ----
+    # --- default; none of this runs unless self._manual_commits is True). --------------
+
+    def _manual_ref(self) -> str:
+        """The hidden ref that chains this session's per-turn latent commits."""
+        return f"refs/agitrack/manual/{self.state.session_id}"
+
+    def _manual_agit_dir(self):
+        return self.base_repo.repo / ".agitrack"
+
+    def _setup_manual_commit_mode(self) -> None:
+        """Startup wiring for manual-commit mode: install the fold/reset hooks (unless a
+        custom ``core.hooksPath`` makes that impossible — then the poll+cover fallback runs
+        instead), point the latent chain at the current HEAD, and render the initial trailer
+        so even a first commit with no agent turns is attributed to the session."""
+        if not self._manual_commits:
+            return
+        self._manual_hooks_installed = False
+        try:
+            if self.base_repo.core_hooks_path():
+                self._debug("manual-commit hooks skipped: core.hooksPath is set (using poll+cover fallback)")
+            else:
+                self._manual_hooks_installed = git_hooks.install_manual_commit_hooks(
+                    self.base_repo.hooks_dir(), debug=self._debug
+                )
+        except Exception as error:
+            self._debug(f"manual-commit hook install failed: {error!r}")
+        # Recovery: if a prior run left the latent ref at or behind HEAD (its turns were
+        # already committed/folded, but the ref wasn't reset — e.g. an interrupted commit),
+        # restart the chain at HEAD so stale turns aren't re-folded into the next commit.
+        try:
+            head = self.repo.rev_parse("HEAD")
+            tip = self.repo.ref_sha(self._manual_ref())
+            if tip and self.repo.is_ancestor(tip, head):
+                self.repo.update_ref(self._manual_ref(), head)
+        except Exception as error:
+            self._debug(f"manual ref recovery failed: {error!r}")
+        # Baseline HEAD for the poll fallback (detect a user/external commit that the hook
+        # didn't fold), and the durable trailer/ref files the hook reads.
+        try:
+            self._manual_last_head = self.repo.rev_parse("HEAD")
+        except Exception:
+            self._manual_last_head = None
+        self._render_manual_trailer()
+
+    def _teardown_manual_commit_mode(self) -> None:
+        if not self._manual_commits:
+            return
+        try:
+            if self.base_repo is not None and not self.base_repo.core_hooks_path():
+                git_hooks.remove_manual_commit_hooks(self.base_repo.hooks_dir(), debug=self._debug)
+        except Exception as error:
+            self._debug(f"manual-commit hook removal failed: {error!r}")
+
+    def _manual_pending_bodies(self) -> list[str]:
+        """Commit-message bodies of the pending latent turns (oldest first): the commits on
+        the latent ref that HEAD does not yet contain."""
+        tip = self.repo.ref_sha(self._manual_ref())
+        if not tip:
+            return []
+        try:
+            shas = self.repo.log_shas("HEAD", tip)  # HEAD..tip, oldest first
+        except Exception as error:
+            self._debug(f"manual pending walk failed: {error!r}")
+            return []
+        bodies: list[str] = []
+        for sha in shas:
+            body = self.repo.commit_message(sha)
+            if body:
+                bodies.append(body)
+        return bodies
+
+    def _render_manual_trailer(self) -> None:
+        """(Re)render ``.agitrack/manual-pending-trailer`` from the durable latent ref, and
+        the ``.agitrack/manual-ref`` name file the post-commit hook reads. The trailer always
+        carries at least the ``commit_type: user`` block, so a commit with no pending turns is
+        still attributed to the session; pending turns add their full trace/metadata."""
+        if not self._manual_commits:
+            return
+        try:
+            agit_dir = self._manual_agit_dir()
+            agit_dir.mkdir(parents=True, exist_ok=True)
+            (agit_dir / "manual-ref").write_text(self._manual_ref() + "\n", encoding="utf-8")
+            trailer = build_manual_squash_trailer(
+                agitrack_session_id=self.state.session_id,
+                latent_bodies=self._manual_pending_bodies(),
+            )
+            (agit_dir / "manual-pending-trailer").write_text(trailer, encoding="utf-8")
+        except Exception as error:
+            self._debug(f"manual trailer render failed: {error!r}")
+
+    def _manual_gate(self) -> bool:
+        """Commit gate for a manual-mode turn: True when the working tree changed since the
+        latent tip (or HEAD when the chain is empty). Caches the snapshot tree so
+        :meth:`_manual_record` doesn't re-snapshot."""
+        try:
+            self._manual_pending_tree = self.repo.snapshot_worktree_tree()
+        except Exception as error:
+            self._debug(f"manual snapshot failed: {error!r}")
+            self._manual_pending_tree = None
+            return False
+        tip = self.repo.ref_sha(self._manual_ref())
+        base_ref = tip or "HEAD"
+        try:
+            base_tree = self.repo.rev_parse(f"{base_ref}^{{tree}}")
+        except Exception:
+            base_tree = None
+        return self._manual_pending_tree != base_tree
+
+    def _manual_record(self, message: str) -> str | None:
+        """Record a manual-mode turn as a hidden latent commit: snapshot the working tree,
+        commit-tree it onto the latent tip, and advance ONLY the latent ref — HEAD and the
+        user's index are untouched. Returns the short sha, or None if the tree is unchanged."""
+        tree = getattr(self, "_manual_pending_tree", None)
+        self._manual_pending_tree = None
+        if tree is None:
+            try:
+                tree = self.repo.snapshot_worktree_tree()
+            except Exception as error:
+                self._debug(f"manual snapshot failed: {error!r}")
+                return None
+        tip = self.repo.ref_sha(self._manual_ref())
+        parent = tip or self.repo.rev_parse("HEAD")
+        if tip is not None and tree == self.repo.rev_parse(f"{tip}^{{tree}}"):
+            return None  # defensive: nothing new since the latent tip
+        sha = self.repo.commit_tree(tree, parents=[parent], message=message)
+        self.repo.update_ref(self._manual_ref(), sha)
+        self._render_manual_trailer()
+        return self.repo.short_sha(sha)
+
+    def _service_manual_commit_mode(self) -> None:
+        """Per-loop upkeep for manual-commit mode (throttled). With the hooks installed, react
+        to the post-commit signal (the hook already folded the trailer and reset the latent
+        ref) by refreshing our HEAD baseline and re-rendering the now-minimal trailer. Without
+        hooks (custom core.hooksPath), fall back to detecting the commit by polling HEAD and
+        adding a cover commit."""
+        if not self._manual_commits:
+            return
+        now = time.monotonic()
+        if now - getattr(self, "_manual_poll_at", 0.0) < self.BASE_POLL_SECONDS:
+            return
+        self._manual_poll_at = now
+        if getattr(self, "_manual_hooks_installed", False):
+            signal_file = self._manual_agit_dir() / "manual-commit-signal"
+            try:
+                mtime = signal_file.stat().st_mtime
+            except OSError:
+                return  # no commit has happened yet
+            if mtime != getattr(self, "_manual_signal_mtime", None):
+                self._manual_signal_mtime = mtime
+                try:
+                    self._manual_last_head = self.repo.rev_parse("HEAD")
+                except Exception:
+                    pass
+                self._render_manual_trailer()
+        else:
+            self._reconcile_manual_external_commit()
+
+    def _reconcile_manual_external_commit(self) -> None:
+        """Poll+cover FALLBACK for when the fold hook can't run (custom core.hooksPath): if
+        HEAD moved since we last looked and pending latent turns exist, the user committed
+        outside the hook — add a cover commit carrying the pending tracking (its tree equals
+        the new HEAD's, so it introduces no diff), then reset the latent ref. A no-op when
+        the hook is installed (it already folded the tracking and reset the ref)."""
+        if not self._manual_commits or getattr(self, "_manual_hooks_installed", False):
+            return
+        try:
+            head = self.repo.rev_parse("HEAD")
+        except Exception:
+            return
+        last = getattr(self, "_manual_last_head", None)
+        if last is None:
+            self._manual_last_head = head
+            return
+        if head == last:
+            return
+        self._manual_last_head = head
+        tip = self.repo.ref_sha(self._manual_ref())
+        bodies = self._manual_pending_bodies()
+        if not tip or not bodies:
+            self._render_manual_trailer()
+            return
+        message = "<aGiTrack> track agent turns\n\n" + build_manual_squash_trailer(
+            agitrack_session_id=self.state.session_id, latent_bodies=bodies
+        )
+        try:
+            head_tree = self.repo.rev_parse("HEAD^{tree}")
+            self.repo.cover_commit(message, first_parent=head, second_parent=tip, tree=head_tree)
+            self._manual_last_head = self.repo.rev_parse("HEAD")
+            self.repo.update_ref(self._manual_ref(), self.repo.rev_parse("HEAD"))
+        except Exception as error:
+            self._debug(f"manual cover reconcile failed: {error!r}")
+        self._render_manual_trailer()
 
     def _check_base_branch_drift(self) -> None:
         # Poll the branch checked out in the repo directory. The status bar bolds a
@@ -6917,6 +7131,7 @@ class ProxyRunner:
             return
         self._maybe_agent_commit()
         self._poll_base_advanced()
+        self._service_manual_commit_mode()  # --manual-commits: react to a user/external commit
         self._warn_if_base_edited()
         self._warn_if_cwd_drifted()
 
@@ -8043,13 +8258,21 @@ class ProxyRunner:
                 self._render()
             return
 
-        if name == "git-user-commit":
+        if name == "git-commit":
             created = self._create_user_commit_popup(
                 repo=self.base_repo, state=self._user_state(), include_declined=True
             )
-            self._set_message(
-                "Committed your changes to the base repo." if created else "No changes to commit in the base repo."
-            )
+            if self._manual_commits:
+                msg = (
+                    "Committed your changes (with the pending agent turns folded in)."
+                    if created
+                    else "No changes to commit."
+                )
+            else:
+                msg = (
+                    "Committed your changes to the base repo." if created else "No changes to commit in the base repo."
+                )
+            self._set_message(msg)
             self._reload_user_declined()
             self._render()
             return
@@ -8161,6 +8384,12 @@ class ProxyRunner:
                 "key": "allowed_edit_paths",
                 "label": "Folders/files the agent may write to outside its worktree (sandbox carve-out)",
                 "kind": "paths",
+                "restart": True,
+            },
+            {
+                "key": "manual_commits",
+                "label": "Manual commits: user-triggered, per-turn agent work hidden until you commit (implies no worktree)",
+                "kind": "bool",
                 "restart": True,
             },
             # --- agent behavior ---
@@ -8755,7 +8984,7 @@ class ProxyRunner:
         include_declined: bool = False,
     ) -> bool:
         # Defaults to the active worktree (capturing uncommitted worktree changes
-        # before the next prompt). The user-facing `git-user-commit` command passes
+        # before the next prompt). The user-facing `git-commit` command passes
         # the base repo/state instead, since the user's own edits live there.
         # ``include_declined`` re-offers every untracked (added-but-unstaged) file at the
         # stage prompt — used for the base-repo paths, where the user is explicitly
@@ -8793,8 +9022,24 @@ class ProxyRunner:
                 return False
             message = result
             prompt = "Commit message is required — enter one, or press Esc to continue without committing:"
+        if self._manual_commits:
+            # Manual-commit mode: fold the pending latent turns' tracking into this one
+            # commit inline, so it's fully tracked whether or not the prepare-commit-msg
+            # hook is installed (the hook is idempotent and skips a message that already
+            # carries the metadata header). Uses the session's own latent ref, not the
+            # passed state, since that's where the turns were recorded.
+            commit_message = (
+                message.strip()
+                + "\n\n"
+                + build_manual_squash_trailer(
+                    agitrack_session_id=self.state.session_id,
+                    latent_bodies=self._manual_pending_bodies(),
+                )
+            )
+        else:
+            commit_message = build_user_commit_message(message=message, agitrack_session_id=state.session_id)
         try:
-            repo.commit(build_user_commit_message(message=message, agitrack_session_id=state.session_id))
+            repo.commit(commit_message)
         except Exception as error:
             # A failed commit (a repo pre-commit hook rejecting it, a git config/identity problem,
             # a racing change) must NOT crash aGiTrack — it used to propagate as an uncaught
@@ -8807,6 +9052,17 @@ class ProxyRunner:
             )
             self._render()
             return False
+        if self._manual_commits:
+            # The pending turns are now folded into HEAD: advance the latent ref onto it
+            # (0 pending again) and refresh the baseline so the poll fallback doesn't also
+            # cover this commit. Idempotent with the post-commit hook, which does the same.
+            try:
+                new_head = repo.rev_parse("HEAD")
+                repo.update_ref(self._manual_ref(), new_head)
+                self._manual_last_head = new_head
+            except Exception as error:
+                self._debug(f"manual ref reset after user commit failed: {error!r}")
+            self._render_manual_trailer()
         state.clear_trace()
         return True
 
@@ -8908,7 +9164,11 @@ class ProxyRunner:
             pre_commit_fn=self._ensure_turn_branch,
             on_commit_fn=on_commit_fn,
             session_name=self.name,
-            backend_commits=self._uncovered_backend_commits(),
+            # Manual-commit mode diverts the per-turn write to a hidden latent commit and
+            # never touches HEAD/the index; every other mode is unaffected (both None).
+            manual_gate_fn=self._manual_gate if self._manual_commits else None,
+            manual_record_fn=self._manual_record if self._manual_commits else None,
+            backend_commits=[] if self._manual_commits else self._uncovered_backend_commits(),
         )
 
     def _uncovered_backend_commits(self) -> list[str]:
@@ -8967,6 +9227,13 @@ class ProxyRunner:
         session = self._session_label()
         base = self._base_branch or "the base branch"
         summarized = " (summarized)" if self._commit_summarized else ""
+        if self._manual_commits:
+            # Manual mode: the turn is recorded on the hidden latent ref, NOT committed to
+            # the branch — say so, and point at how to commit for real.
+            return (
+                f"Recorded agent turn {commit_id or ''} in session '{session}'{summarized} — "
+                f"commit when ready ({self._menu_label()} → git-commit) to fold it into {base}."
+            )
         head = f"Created <aGiTrack> commit {commit_id}" if commit_id else "Created <aGiTrack> commit"
         return f"{head} in session '{session}' — merged into {base}{summarized}."
 

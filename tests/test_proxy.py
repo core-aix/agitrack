@@ -6819,7 +6819,7 @@ def test_sync_idle_worktrees_aligns_idle_skips_in_flight():
 #
 # A session runs in a worktree that only contains tracked files, but the user's
 # own untracked / intentionally-unstaged files live in the base working tree.
-# These commands (git-unstaged / git-user-commit) must therefore read
+# These commands (git-unstaged / git-commit) must therefore read
 # and write the base repo + base state, or the user's files are invisible.
 
 
