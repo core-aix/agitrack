@@ -5007,12 +5007,10 @@ class ProxyRunner:
         store = self._shared_store()
         sid = entry.manifest.get("session_id", "")
         if sid:
-            # Stop auto-pushing it immediately — across the WHOLE id lineage, not just this
-            # entry's id. The backend mints a new id on resume, so auto-share may be opted in
-            # under a drifted id; clearing only `sid` left it enabled (the menu kept showing it
-            # as shared/auto and it kept re-pushing). _session_auto_shared reads the lineage too.
-            for lineage_sid in {sid, *self._user_state().session_lineage(sid)}:
-                self._set_session_auto_share(lineage_sid, False)
+            # Stop auto-pushing it immediately. _set_session_auto_share clears the WHOLE id
+            # lineage (the backend mints a new id on resume, so the opt-in may sit under a
+            # drifted id), so a single call disables it everywhere and the change persists.
+            self._set_session_auto_share(sid, False)
 
         def op():
             return store.unshare(entry.github_id, entry.name, timeout=self.SHARE_PUSH_TIMEOUT)
@@ -5211,7 +5209,18 @@ class ProxyRunner:
             self._debug(f"record shared alias failed: {error!r}")
 
     def _set_session_auto_share(self, session_id: str, enabled: bool) -> None:
-        self._user_state().set_auto_share(session_id, bool(enabled))
+        user = self._user_state()
+        if enabled:
+            user.set_auto_share(session_id, True)
+            return
+        # Disable across the WHOLE id lineage, not just this id. The backend mints a new
+        # session id on resume, so the opt-in may have been recorded under an earlier
+        # (ancestor) id; since `_session_auto_shared` checks the lineage, clearing only this
+        # id would leave an ancestor enabled — the session would then re-appear as auto-shared
+        # on the next aGiTrack run and the disable wouldn't persist (#55).
+        for sid in {session_id, *user.session_lineage(session_id)}:
+            if sid:
+                user.set_auto_share(sid, False)
 
     def _cached_or_resolve_login(self) -> str:
         # Resolve and cache the GitHub login. Only writes config when it actually
@@ -10218,6 +10227,19 @@ class ProxyRunner:
 
     def _pre_agent_commit_if_needed(self, prompt_text: str = "") -> bool:
         self._clear_agent_in_flight_if_idle()
+        if self._manual_commits:
+            # Manual mode: never block a prompt on a pre-flight parse or a user-commit
+            # reconcile. The working tree is intentionally dirty (latently-tracked agent work)
+            # and the user commits on their own schedule, so there is nothing to check before
+            # forwarding — the "checking existing git changes…" step (and its message) doesn't
+            # apply. Still capture a just-completed prior turn as a latent commit (non-blocking)
+            # and treat a prompt sent while the agent is still working as a follow-up merged
+            # into that turn's trace; then forward immediately.
+            self._finish_agent_parse_if_ready(quiet=True)
+            self._record_user_prompt(prompt_text)
+            if self._agent_is_active():
+                self._await_followup(prompt_text)
+            return True
         status = self.repo.status_short().strip()
         finished = self._finish_agent_parse_if_ready(quiet=True)
         if finished is True:
@@ -10240,17 +10262,13 @@ class ProxyRunner:
         # Commit the user's own uncommitted work before the agent runs, from whichever
         # tree holds it: this session's worktree (the agent's tree) and/or the base repo
         # (your working directory) — both, when both are dirty. The base commit is then
-        # merged into the worktree so the agent starts from your edits. Skipped entirely in
-        # manual-commit mode: the user commits on their own schedule, so aGiTrack must not
-        # prompt (the working tree is legitimately dirty with latently-tracked agent work).
-        if not self._manual_commits:
-            if self.actions.has_pre_agent_user_changes():
-                self._set_message(
-                    "Uncommitted changes in this session's worktree — committing them before the agent runs."
-                )
-                self._render()
-                self._create_user_commit_popup()
-            self._commit_base_user_edits_if_needed()
+        # merged into the worktree so the agent starts from your edits. (Manual-commit mode
+        # returned early above — it never reaches here.)
+        if self.actions.has_pre_agent_user_changes():
+            self._set_message("Uncommitted changes in this session's worktree — committing them before the agent runs.")
+            self._render()
+            self._create_user_commit_popup()
+        self._commit_base_user_edits_if_needed()
         # Trace every submitted prompt as a user message. The agent-active path
         # above already recorded; the held path records in _forward_pending_prompt.
         # This covers the remaining (clean / user-changes-committed) submits so no

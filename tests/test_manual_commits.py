@@ -115,6 +115,16 @@ def test_manual_trailer_squash_parses_as_agent_with_summed_tokens():
     assert stat.tokens.get("output") == 150  # summed across turns
 
 
+def test_manual_trailer_orders_turns_newest_first():
+    # Input is oldest-first (as walked from the ref); the folded squash must list the agent
+    # turns NEWEST-first so the dashboard expands it latest-turn-first, matching the log.
+    bodies = [_agent_body("first", 10), _agent_body("second", 20), _agent_body("third", 30)]
+    trailer = build_manual_squash_trailer(agitrack_session_id="sid", latent_bodies=bodies)
+    stat = _parse_commit("h", "me", "me@x", "1", "User commit\n\n" + trailer)
+    agent_subjects = [c.subject for c in stat.constituents if "aGiTrack" in (c.subject or "")]
+    assert agent_subjects == ["<aGiTrack> third", "<aGiTrack> second", "<aGiTrack> first"]
+
+
 def test_manual_trailer_with_no_pending_turns_is_a_plain_user_commit():
     trailer = build_manual_squash_trailer(agitrack_session_id="sid", latent_bodies=[])
     folded = "Just my edit\n\n" + trailer
@@ -357,6 +367,29 @@ def test_runner_git_commit_menu_folds_pending_and_resets_ref(tmp_path):
     assert repo.rev_parse(runner._manual_ref()) == repo.rev_parse("HEAD")  # ref reset
     assert runner._manual_last_head == repo.rev_parse("HEAD")
     assert len(_git(repo, "log", "--format=%H").split()) == 2  # init + one folded commit
+
+
+def test_pre_agent_flow_forwards_immediately_without_checking_in_manual_mode(tmp_path):
+    # A dirty tree (the agent's latently-tracked work) must NOT trigger the "checking existing
+    # git changes…" pre-flight parse/defer — the prompt goes straight to the backend.
+    runner, repo, _ = _manual_runner(tmp_path)
+    (tmp_path / "a.txt").write_text("one\nagent working\n", encoding="utf-8")
+    messages: list[str] = []
+    runner._set_message = lambda msg, **k: messages.append(msg)
+    runner._clear_agent_in_flight_if_idle = lambda: None
+    runner._finish_agent_parse_if_ready = lambda quiet=False: None
+    runner._agent_is_active = lambda: False
+    recorded: list[str] = []
+    runner._record_user_prompt = lambda text: recorded.append(text)
+    started: list[int] = []
+    runner._start_agent_parse = lambda: started.append(1) or True  # must NOT run
+
+    result = runner._pre_agent_commit_if_needed("do something")
+
+    assert result is True  # forwarded immediately, not deferred
+    assert started == []  # no pre-flight parse
+    assert recorded == ["do something"]
+    assert not any("checking existing git changes" in m for m in messages)
 
 
 def test_runner_base_user_edit_commit_is_suppressed_in_manual_mode(tmp_path):
