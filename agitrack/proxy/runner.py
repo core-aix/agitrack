@@ -858,6 +858,10 @@ class ProxyRunner:
         # the suite (the real __init__ is the production path).
         self._monitor_base_edits = False
         self._base_check_at = 0.0
+        # Base-repo files the agent has stranded that we've already flagged. Kept separate from
+        # the baseline so a warned file is not folded into "not stranded" — it stays counted for
+        # the exit reminder, while the warned-set stops us re-nagging about the same file.
+        self._base_warned_files: set[str] = set()
         self._cwd_drift_checked = False
         self._cwd_check_at = 0.0
         self._cwd_launch_at = 0.0  # epoch of the latest backend launch (set in _spawn)
@@ -1171,6 +1175,7 @@ class ProxyRunner:
                 # Lazily-set fields that getattr() guards in production methods:
                 "_monitor_base_edits": False,
                 "_base_check_at": 0.0,
+                "_base_warned_files": set(),
                 "_cwd_drift_checked": False,
                 "_cwd_check_at": 0.0,
                 "_cwd_launch_at": 0.0,
@@ -1378,6 +1383,15 @@ class ProxyRunner:
                 signal.signal(signal.SIGTERM, self._handle_exit_signal)
                 signal.signal(signal.SIGHUP, self._handle_exit_signal)
             self._setup_worktree_confinement_notice()
+            # Start from a clean hook slate. A PRIOR run that crashed (no teardown) can leave the
+            # OTHER mode's managed hooks in the base repo's .git/hooks — and modes can switch
+            # between runs (worktree ↔ no-worktree/manual). A stale manual fold-hook would rewrite
+            # a worktree run's commits; a stale base-commit guard would block a no-worktree run's
+            # commits. Both removals only touch aGiTrack's OWN marked hooks (restoring any chained
+            # user hook) and are no-ops when absent, so clearing then re-installing exactly what
+            # THIS mode wants makes every mode-switch safe regardless of how the last run ended.
+            self._remove_base_commit_guard()
+            self._teardown_manual_commit_mode()
             self._install_base_commit_guard()  # hard-stop agent commits to base when no OS sandbox
             self._setup_manual_commit_mode()  # --manual-commits: latent-commit hooks + trailer files
             exit_code = self._loop()  # the timers phase auto-applies a sandbox-blocked backend update
@@ -1506,6 +1520,10 @@ class ProxyRunner:
             fork=fork,
             commit_guidance=self._commit_guidance,
             use_worktrees=self._use_worktrees,
+            # In worktree mode self.repo.repo is the worktree; naming the base repo lets the
+            # agent note spell out both absolute paths so the agent never mistakes the base
+            # checkout for its worktree (and strands edits that are never committed).
+            base_repo=self.base_repo.repo,
             executable=self._launch_command() or None,
         )
         # Forward any backend-specific args the user passed through aGiTrack (#32),
@@ -1606,6 +1624,7 @@ class ProxyRunner:
             return  # the sandbox enforces it; nothing to monitor
         self._monitor_base_edits = True
         self._base_check_at = 0.0
+        self._base_warned_files = set()
         try:
             self._base_status_baseline: set[str] = set(self.base_repo.status_short().splitlines())
         except Exception:
@@ -1705,8 +1724,10 @@ class ProxyRunner:
         self._render_manual_trailer()
 
     def _teardown_manual_commit_mode(self) -> None:
-        if not self._latent_tracking:
-            return
+        # Unconditional (NOT gated on _latent_tracking): removal must run even in worktree mode so
+        # a stale manual fold-hook left by a prior crashed no-worktree run is cleared. It only
+        # removes aGiTrack's OWN marked hooks (restoring any chained user hook) and is a no-op when
+        # none are installed, so calling it in any mode is safe.
         try:
             if self.base_repo is not None and not self.base_repo.core_hooks_path():
                 git_hooks.remove_manual_commit_hooks(self.base_repo.hooks_dir(), debug=self._debug)
@@ -2290,15 +2311,19 @@ class ProxyRunner:
             current = set(self.base_repo.status_short().splitlines())
         except Exception:
             return
-        new = current - self._base_status_baseline
-        if new:
-            files = ", ".join(sorted(line[3:] for line in list(new) if len(line) > 3)[:5])
+        # Everything the agent has stranded in the base tree since startup (baseline stays
+        # pristine — only aGiTrack's own writes fold into it via _rebaseline_base_edits — so a
+        # stranded file stays counted for the exit reminder even after it's been warned once).
+        stranded = current - self._base_status_baseline
+        unwarned = stranded - self._base_warned_files
+        if unwarned:
+            files = ", ".join(sorted(line[3:] for line in list(unwarned) if len(line) > 3)[:5])
             self._set_message(
                 f"Agent edited the base repo, outside its worktree ({files}). These "
                 "changes are not tracked by aGiTrack — move them into the worktree.",
                 seconds=12.0,
             )
-            self._base_status_baseline = current  # don't repeat for the same files
+            self._base_warned_files |= stranded  # warned now; don't re-nag the same files
             self._render()
 
     def _rebaseline_base_edits(self) -> None:
@@ -2313,6 +2338,32 @@ class ProxyRunner:
             self._base_status_baseline = set(self.base_repo.status_short().splitlines())
         except Exception as error:
             self._debug(f"rebaseline base edits failed: {error!r}")
+
+    def _remind_stranded_base_edits_on_exit(self) -> None:
+        # Last line of defense on an unsandboxed host (e.g. Ubuntu with unprivileged user
+        # namespaces restricted, where bwrap can't confine): if the agent left edits in the base
+        # tree outside its worktree, aGiTrack never committed them, and on exit the worktree is
+        # about to be removed — so surface them ONE more time, non-transiently, listing the files
+        # and where they are, rather than letting the work vanish quietly. Best-effort and never
+        # blocks exit. No-op when the monitor is off (sandbox enforces confinement, or no worktree).
+        if not self._monitor_base_edits:
+            return
+        try:
+            current = set(self.base_repo.status_short().splitlines())
+        except Exception:
+            return
+        stranded = sorted(line[3:] for line in (current - self._base_status_baseline) if len(line) > 3)
+        if not stranded:
+            return
+        shown = ", ".join(stranded[:8]) + (" …" if len(stranded) > 8 else "")
+        self._debug(f"stranded base-repo edits at exit: {stranded}")
+        self._set_message(
+            f"Heads up: the agent left {len(stranded)} change(s) in the base repo, outside its "
+            f"worktree ({shown}), which aGiTrack did NOT commit. They are in {self.base_repo.repo}; "
+            "review and move or commit them so the work isn't lost.",
+            seconds=20.0,
+        )
+        self._render()
 
     @staticmethod
     def _newest_mtime(paths) -> float:
@@ -10076,6 +10127,10 @@ class ProxyRunner:
         info = self.worktree
         if info is None or self._base_branch is None:
             return
+        # Before anything else, remind about any edits the agent stranded in the base repo
+        # (only possible on an unsandboxed host) — the worktree may be removed below, so this is
+        # the last chance to point the user at work aGiTrack couldn't track.
+        self._remind_stranded_base_edits_on_exit()
         # Persist the resume pointer. _persist_last_session_record runs
         # _adopt_latest_backend_session, which captures a conversation the user switched to
         # inside the backend's own picker (Claude's session view), and writes both the
