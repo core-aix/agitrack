@@ -273,6 +273,46 @@ Added --version using the package metadata; prints and exits.
       </div>
     </section>
 
+    <section class="commit" id="modes">
+      <div class="commit-head">
+        <span class="sha">a11m0de</span>
+        <span class="subject">pick your workflow</span>
+      </div>
+      <h2>Four ways to run it — your call.</h2>
+      <p>Two independent choices — <strong>how you run it</strong> (watch it in a TUI, or let it track in the
+      background) and <strong>when commits happen</strong> (each turn automatically, or on your own
+      <span class="p">git commit</span>) — combine into four modes. Every one records the same per-turn trace and
+      token metadata; they differ only in who drives the agent and who triggers the commit. Switch between them
+      freely, run to run.</p>
+      <div class="branches">
+        <div class="branch" data-ref="agitrack">
+          <h3>Interactive · Auto <span class="tag">default</span></h3>
+          <p>Watch the agent's real TUI; aGiTrack commits every finished turn for you and merges it in from an
+          isolated <strong>worktree</strong>. The hands-off default — just work, and get a clean traced history.</p>
+        </div>
+        <div class="branch" data-ref="agitrack -m">
+          <h3>Interactive · Manual</h3>
+          <p>Feels like plain git: <strong>you</strong> decide when to commit. Each turn is kept on a hidden ref
+          and folds into your own commit when you make it — one tidy commit with your code and the full AI trace.</p>
+        </div>
+        <div class="branch" data-ref="agitrack -b">
+          <h3>Background · Auto</h3>
+          <p>Drive the agent from <em>any</em> UI — its own CLI, an IDE extension, a chat window — while aGiTrack
+          tracks it <strong>headlessly</strong> and commits each turn. Runs as a daemon, so your terminal stays
+          free; <span class="p">agitrack -b stop</span> when you're done.</p>
+        </div>
+        <div class="branch" data-ref="agitrack -b -m">
+          <h3>Background · Manual</h3>
+          <p>Track a session you drive yourself and commit on your own terms. The AI trace folds into your commit,
+          and — if you like — aGiTrack even starts itself on <span class="p">git commit</span> so nothing goes
+          untracked after a reboot.</p>
+        </div>
+      </div>
+      <p style="margin-top:16px;color:var(--fg-dim);font-size:14px">The isolated worktree is unique to the
+      interactive-auto default; the other three edit your current branch directly. A commit with no AI work in it
+      is never touched — no trace, no footprint.</p>
+    </section>
+
     <section class="commit agent" id="dashboard">
       <div class="commit-head">
         <span class="sha">b7e1d09</span>

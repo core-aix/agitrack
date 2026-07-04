@@ -340,6 +340,14 @@ def main(argv: list[str] | None = None) -> int:
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
+        "--remove-hooks",
+        action="store_true",
+        help="remove all aGiTrack-installed git hooks from the repo — the persistent auto-track "
+        "pre-commit hook and the manual-commit prepare-commit-msg/post-commit fold hooks (and the "
+        "worktree base-commit guard), restoring any hooks they chained. Use this to fully opt out "
+        "of aGiTrack's commit-time tracking.",
+    )
+    parser.add_argument(
         "--precommit-sync",
         action="store_true",
         # Internal: entry point of the persistent auto-track pre-commit hook. Records any pending
@@ -460,6 +468,24 @@ def main(argv: list[str] | None = None) -> int:
         from agitrack.proxy.background import background_status, stop_background
 
         return stop_background(bg_repo) if args.background == "stop" else background_status(bg_repo)
+
+    if args.remove_hooks:
+        # Let the user fully opt out of aGiTrack's commit-time tracking by removing every hook it
+        # installed (restoring any chained originals). Read-only w.r.t. the agent — no privacy
+        # prompt, no repo init, no update check.
+        try:
+            rh_repo = GitRepo.discover(Path(args.repo).expanduser())
+        except (GitError, OSError) as error:
+            print(error)
+            return 1
+        from agitrack.git import hooks as git_hooks
+
+        removed = git_hooks.remove_all_installed_hooks(rh_repo.hooks_dir())
+        if removed:
+            print(f"Removed aGiTrack git hook(s): {', '.join(removed)}. Any chained project hooks were restored.")
+        else:
+            print("No aGiTrack git hooks were installed in this repository.")
+        return 0
 
     if args.precommit_sync:
         # Internal: the persistent auto-track pre-commit hook. Fast, best-effort, never fails a

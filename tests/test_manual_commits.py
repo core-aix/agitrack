@@ -289,6 +289,35 @@ def test_autotrack_precommit_hook_install_remove_and_chain(tmp_path):
     assert (hooks_dir / "pre-commit").read_text() == "#!/bin/sh\necho project\n"  # restored
 
 
+def test_remove_all_installed_hooks_removes_everything_and_restores_chains(tmp_path):
+    import sys as _sys
+
+    repo = _init_repo(tmp_path)
+    hooks_dir = repo.repo / ".git" / "hooks"
+    hooks_dir.mkdir(exist_ok=True)
+    # A pre-existing project pre-commit hook to prove chaining is restored.
+    (hooks_dir / "pre-commit").write_text("#!/bin/sh\necho project\n", encoding="utf-8")
+    (hooks_dir / "pre-commit").chmod(0o755)
+    # Install all of aGiTrack's hooks.
+    git_hooks.install_autotrack_precommit_hook(hooks_dir, python_exe=_sys.executable, repo_root=str(repo.repo))
+    git_hooks.install_manual_commit_hooks(hooks_dir)
+    assert git_hooks.is_autotrack_hook(hooks_dir / "pre-commit")
+
+    removed = git_hooks.remove_all_installed_hooks(hooks_dir)
+
+    assert set(removed) == {"pre-commit", "prepare-commit-msg", "post-commit"}
+    assert (hooks_dir / "pre-commit").read_text() == "#!/bin/sh\necho project\n"  # project hook restored
+    assert not (hooks_dir / "prepare-commit-msg").exists()
+    assert not (hooks_dir / "post-commit").exists()
+
+
+def test_remove_all_installed_hooks_noop_when_none(tmp_path):
+    repo = _init_repo(tmp_path)
+    hooks_dir = repo.repo / ".git" / "hooks"
+    hooks_dir.mkdir(exist_ok=True)
+    assert git_hooks.remove_all_installed_hooks(hooks_dir) == []
+
+
 def test_autotrack_hook_is_a_noop_inside_a_worktree():
     # The hook script must skip (do nothing) when the commit is inside a linked worktree, so it
     # never fights aGiTrack's own worktree-mode handling.
@@ -471,7 +500,11 @@ def test_noworktree_auto_folds_latent_turn_into_commit(tmp_path):
 
     assert repo.rev_parse("HEAD") != head_before
     msg = _git(repo, "log", "-1", "--format=%B", "HEAD")
-    assert "# aGiTrack Metadata" in msg and "do x" in msg  # trace + code in ONE commit
+    # A CLEAN agent commit (subject = the prompt, one agent metadata block) — NOT the manual
+    # squash-into-a-user-commit format with a generic subject and a spurious commit_type: user.
+    assert msg.startswith("<aGiTrack> do x")
+    assert "commit agent turns" not in msg and "commit_type: user" not in msg
+    assert msg.count("# aGiTrack Metadata") == 1 and "commit_type: agent" in msg
     assert repo.ref_sha(runner._manual_ref()) == repo.rev_parse("HEAD")  # ref reset
     assert runner._manual_pending_count() == 0
 

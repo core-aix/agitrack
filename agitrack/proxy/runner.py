@@ -35,6 +35,7 @@ from agitrack.backends.proxy_agents import available_backends, make_proxy_agent
 from agitrack.commits import (
     METADATA_HEADER,
     apply_summary_to_message,
+    build_auto_fold_message,
     build_manual_squash_trailer,
     build_user_commit_message,
     summary_metadata_lines,
@@ -1989,11 +1990,9 @@ class ProxyRunner:
         except Exception:
             return
         bodies = self._manual_pending_bodies()
-        if not bodies:
+        message = build_auto_fold_message(bodies)
+        if not message:
             return
-        message = "<aGiTrack> commit agent turns\n\n" + build_manual_squash_trailer(
-            agitrack_session_id=self.state.session_id, latent_bodies=bodies
-        )
         try:
             self.repo.add_tracked()
             declined = set(self.state.declined_untracked())

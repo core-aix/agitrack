@@ -138,6 +138,11 @@ Conventions:
 | Defers to a live tracker (never double-tracks) | `test_precommit_sync_defers_to_a_running_tracker` | real-git |
 | `background_autostart` on → sync also starts the daemon for future commits | `test_precommit_sync_autostart_spawns_daemon` | real-git |
 | First interactive no-worktree run offers the repo-scoped auto-start opt-in | `test_autostart_optin_prompts_once_and_persists_repo_scope`, `test_autostart_optin_skipped_in_worktree_and_scripted` | mock |
+| AUTO fold writes a CLEAN agent commit (prompt/summary subject, one metadata block — not the squash-into-user format) | `test_background_auto_folds_pending_into_a_commit_itself`, `test_noworktree_auto_folds_latent_turn_into_commit` | real-git |
+| Daemon AUTO fold waits for the LLM summary, then uses it as the subject | `test_background_auto_fold_waits_for_summary_then_uses_it_as_subject` | real-git |
+| `agitrack --remove-hooks` removes all aGiTrack hooks, restores chained originals | `test_remove_all_installed_hooks_removes_everything_and_restores_chains`, `_noop_when_none` | real-git |
+| `.agitrack/` git-ignored before the daemon/hook write state (no `git add -A` leak) | `test_precommit_sync_git_ignores_agitrack_dir` | real-git |
+| **Session discovery is strictly repo-scoped — no cross-repo trace/token contamination** | `test_claude_session.py::test_session_discovery_is_strictly_repo_scoped`, `test_opencode_session.py::test_session_belongs_to_repo` / `_no_matching_directory_returns_no_sessions` | real-git + mock |
 
 ## 10. Integration / merge / conflict
 | Sequence | Test(s) | Kind |

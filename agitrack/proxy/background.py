@@ -33,7 +33,7 @@ from typing import Any
 
 from agitrack.backends.proxy_agents import make_proxy_agent
 from agitrack.commits import ManualCommitTracker
-from agitrack.commits.message import build_manual_squash_trailer
+from agitrack.commits.message import build_auto_fold_message
 from agitrack.config import AgitrackState, GlobalConfig
 from agitrack.events import EventLog, resolve_log_path
 from agitrack.git import GitRepo
@@ -296,6 +296,10 @@ class BackgroundRunner:
         # commit hook, and the dashboard can remind the user.
         self._last_update_check = 0.0
         self._update_thread: threading.Thread | None = None
+        # Auto-fold waits (bounded) for the LLM summary to land so the commit's subject/lead is the
+        # summary, not the raw prompt. Tracks the latent tip we're waiting on and since when.
+        self._fold_wait_tip: str | None = None
+        self._fold_wait_since: float | None = None
 
         self.global_config = _global_config if _global_config is not None else GlobalConfig()
         if getattr(self.global_config, "repo_path", "set") is None:
@@ -576,12 +580,18 @@ class BackgroundRunner:
                 return
         except Exception:
             return
-        bodies = self._manual.pending_bodies()
-        if not bodies:
+        if self._manual.pending_count() == 0:
             return
-        message = "<aGiTrack> commit agent turns\n\n" + build_manual_squash_trailer(
-            agitrack_session_id=self.state.session_id, latent_bodies=bodies
-        )
+        # Let the LLM summary land first so the commit is summarized (subject + lead paragraph),
+        # not left with the raw prompt. Bounded — after summary_wait_seconds we fold anyway. Unlike
+        # the interactive proxy the daemon never amends HEAD (the user may be committing), so the
+        # summary must be in BEFORE the commit, not amended in after.
+        if not self._fold_summary_ready(tip):
+            return  # retry next cycle
+        bodies = self._manual.pending_bodies()  # re-read: any arrived summaries are now applied
+        message = build_auto_fold_message(bodies)
+        if not message:
+            return
         try:
             self.repo.add_tracked()
             declined = set(self.state.declined_untracked())
@@ -594,10 +604,38 @@ class BackgroundRunner:
             self._manual.reset_stale_ref()
             self._manual.last_head = self.repo.rev_parse("HEAD")
             self._manual.render_trailer()
+            self._fold_wait_tip = None
+            self._fold_wait_since = None
             self.events.emit("commit", sha=self.repo.rev_parse("HEAD")[:12], type="agent", backend=self.state.backend)
             self._print("committed agent turn(s).")
         except Exception as error:
             self._debug(f"auto fold failed: {error!r}")
+
+    def _fold_summary_ready(self, tip: str) -> bool:
+        """True when the auto-fold may proceed: summarization off, the tip's summary note has
+        landed, or the bounded wait (``summary_wait_seconds``) has elapsed. Returns False while the
+        summary is still pending and within the wait window (so the caller retries next cycle)."""
+        if not self._summarization_enabled():
+            return True
+        try:
+            note = self.repo.notes_show(tip, namespace="agitrack/commit-summary")
+            if note and note.strip():
+                return True
+        except Exception:
+            return True  # can't read notes ⇒ don't block folding
+        now = time.monotonic()
+        if self._fold_wait_tip != tip:  # a new tip to wait on — restart the clock
+            self._fold_wait_tip = tip
+            self._fold_wait_since = now
+            return False
+        if self._fold_wait_since is None:
+            self._fold_wait_since = now
+            return False
+        try:
+            deadline = float(self.global_config.timings.get("summary_wait_seconds", 45.0))
+        except Exception:
+            deadline = 45.0
+        return (now - self._fold_wait_since) >= deadline
 
     # ------------------------------------------------------------------
     # Summaries (best-effort, written as git notes so the fold picks them up)

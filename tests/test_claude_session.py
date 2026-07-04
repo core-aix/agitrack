@@ -79,6 +79,35 @@ def test_retarget_session_cwd_breaks_hardlink_to_other_copy(monkeypatch, tmp_pat
     assert (other_proj / "s.jsonl").read_text(encoding="utf-8") == '{"type":"user","cwd":"/old/worktree"}\n'
 
 
+def test_session_discovery_is_strictly_repo_scoped(monkeypatch, tmp_path):
+    # SAFETY: a session driven in one repo must NEVER be visible to another repo's tracker, or a
+    # commit in repo A could pick up repo B's conversation and tokens. Claude keys transcripts by
+    # the cwd-encoded project dir, so repoA's discovery only ever sees repoA's sessions.
+    config = tmp_path / "config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    repo_a = tmp_path / "repoA"
+    repo_b = tmp_path / "repoB"
+    proj_a = config / "projects" / claude_session._encode_repo(repo_a)
+    proj_b = config / "projects" / claude_session._encode_repo(repo_b)
+    proj_a.mkdir(parents=True)
+    proj_b.mkdir(parents=True)
+
+    def _session(prompt: str) -> str:
+        return json.dumps({"type": "user", "message": {"role": "user", "content": prompt}, "cwd": "/x"}) + "\n"
+
+    (proj_a / "sa.jsonl").write_text(_session("ALPHA work"), encoding="utf-8")
+    (proj_b / "sb.jsonl").write_text(_session("BRAVO work"), encoding="utf-8")
+
+    # Each repo discovers ONLY its own session.
+    assert claude_session.latest_session_id(repo_a) == "sa"
+    assert claude_session.latest_session_id(repo_b) == "sb"
+    assert [r.id for r in claude_session.list_sessions(repo_a)] == ["sa"]
+    assert [r.id for r in claude_session.list_sessions(repo_b)] == ["sb"]
+    # repoB's session id resolves to NOTHING under repoA's project dir (no cross-repo read path).
+    assert not claude_session._session_path(repo_a, "sb").exists()
+    assert claude_session._session_path(repo_b, "sb").exists()  # it lives only under repoB
+
+
 def test_retarget_session_cwd_repoints_worktree_file_paths(monkeypatch, tmp_path):
     # Regression (--no-worktree): retargeting must repoint not just the cwd field but every
     # absolute path under the old WORKTREE — tool file_path args, command output, mentions — so a
