@@ -210,7 +210,9 @@ Because a background tracker is easy to forget after a reboot, aGiTrack installs
 
 By default the hook just **reminds** you (once, in the commit output) to start `agitrack -b` for continuous tracking. You can instead have it **auto-start** the background daemon on that commit — a **per-repository** opt-in offered the first time you run aGiTrack interactively on the repo (also under `Ctrl-G → settings`, or `"background_autostart": true` in the repo's `.agitrack/config.json`). Either way, the triggering commit gets its trace; auto-start additionally launches the daemon for future commits.
 
-To fully opt out, run `agitrack --remove-hooks` — it removes every aGiTrack-installed git hook (the auto-track `pre-commit` and the manual-commit `prepare-commit-msg`/`post-commit` fold hooks) and restores any hooks they chained.
+Because this hook **outlives the background tracker**, the first time you run `agitrack -b` in a repo aGiTrack explains it and asks how you want it to behave — **keep it** (track AI commits even when aGiTrack isn't running), **keep it and auto-start** the tracker on such a commit, or **off** (track only while the tracker runs). The choice is remembered per repo (`autotrack_hook` in the repo's `.agitrack/config.json`, also under `Ctrl-G → settings`).
+
+To fully opt out at any time, run `agitrack --remove-hooks` — it removes every aGiTrack-installed git hook (the auto-track `pre-commit` and the manual-commit `prepare-commit-msg`/`post-commit` fold hooks) and restores any hooks they chained.
 
 #### Update reminders while running in the background
 

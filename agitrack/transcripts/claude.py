@@ -754,6 +754,34 @@ def _subagents_dir(repo: Path, session_id: str) -> Path | None:
     return _session_path(Path(repo), session_id).with_suffix("") / "subagents"
 
 
+def _queued_human_prompt(row: dict) -> str | None:
+    """A message the user QUEUED while the agent was still working. Claude Code records such a
+    message as a ``type:"attachment"`` row (``attachment.type == "queued_command"``) — NOT a
+    ``type:"user"`` row — so the normal user-prompt path never sees it, and without this it is
+    dropped from the interaction trace (the user's follow-up instructions vanish from the commit).
+
+    Returns the prompt text for a genuine human prompt (``commandMode == "prompt"``, human origin,
+    not a slash directive), else None. The queued text belongs to the turn in flight when it was
+    sent — Claude threads it into the same response rather than opening a new ``user`` row."""
+    if row.get("type") != "attachment":
+        return None
+    att = row.get("attachment")
+    if not isinstance(att, dict) or att.get("type") != "queued_command":
+        return None
+    if att.get("commandMode") != "prompt":
+        return None  # a queued slash/bash directive, not a typed prompt
+    origin = att.get("origin")
+    if isinstance(origin, dict) and origin.get("kind") not in (None, "human"):
+        return None  # only genuine human input, never a tool/system-injected queue entry
+    prompt = att.get("prompt")
+    if not isinstance(prompt, str):
+        return None
+    text = prompt.strip()
+    if not text or text.startswith("/"):
+        return None  # empty, or a slash command kept out of the trace like any other
+    return text
+
+
 def parse_rows(
     session_id: str,
     rows: list[dict],
@@ -862,6 +890,36 @@ def parse_rows(
                 "messages": [],
             }
             pending_compactions = 0
+        elif row_type == "attachment":
+            queued = _queued_human_prompt(row)
+            if queued is not None:
+                if current is not None:
+                    # A message the user queued while the agent was working: Claude threads it
+                    # into the SAME response (no separate `user` row), so it belongs to the turn
+                    # in flight. Append it so the trace records EVERY user message, not just the
+                    # first. (The proxy dedups submit-time captures by word overlap, so a prompt
+                    # that was also recorded live doesn't double up.)
+                    existing = current.get("prompt") or ""
+                    current["prompt"] = f"{existing}\n\n{queued}" if existing else queued
+                else:
+                    # Queued before any turn opened in this parse window — open one for it.
+                    flush()
+                    current = {
+                        "user_id": str(row.get("uuid") or ""),
+                        "prompt": queued,
+                        "final": "",
+                        "assistant_id": "",
+                        "model": model,
+                        "tokens": TokenUsage(),
+                        "stop_reason": None,
+                        "started_at": stamp,
+                        "ended_at": stamp,
+                        "tool_ids": set(),
+                        "compactions": pending_compactions,
+                        "reasoning_effort": None,
+                        "messages": [],
+                    }
+                    pending_compactions = 0
         elif row_type == "assistant" and current is not None and row.get("isSidechain"):
             # Sub-agent (sidechain) turns are not part of the main interaction
             # trace, but their tokens are still consumed — record them under the

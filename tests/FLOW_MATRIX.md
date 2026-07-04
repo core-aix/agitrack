@@ -48,6 +48,7 @@ Conventions:
 | Empty turn list → no commit | `test_commit_turns_returns_false_for_empty_turns` | mock |
 | Subject joins multiple prompts with `/` | `test_commit_turns_subject_joins_multiple_prompts`, `test_agent_commit_subject_joins_all_prompts_with_slash` | mock |
 | Trace records final reply only (default) / all messages (opt-in) | `test_commit_turns_records_only_final_agent_message_by_default`, `test_commit_turns_records_all_agent_messages_when_option_on` | mock |
+| **Queued follow-up messages (sent mid-turn, recorded as `attachment` rows) captured in the trace** | `test_claude_session.py::test_parse_rows_captures_queued_followup_messages_in_the_turn`, `_ignores_non_human_or_slash_queued_attachments` | mock |
 | Failed attempt does not double-count tokens | `test_agent_commit_failed_attempt_does_not_double_count_tokens` | mock |
 | Backend-made commits → cover commit (hashes preserved) | `test_clean_tree_covers_backend_commits_without_rewriting_them`, `test_cover_commit_*` | real-git |
 | Token usage / reasoning effort / compactions recorded | `test_commit_turns_records_latest_reasoning_effort`, `test_commit_turns_surfaces_compactions_and_clears_origin_event` | mock |
@@ -138,6 +139,8 @@ Conventions:
 | Defers to a live tracker (never double-tracks) | `test_precommit_sync_defers_to_a_running_tracker` | real-git |
 | `background_autostart` on → sync also starts the daemon for future commits | `test_precommit_sync_autostart_spawns_daemon` | real-git |
 | First interactive no-worktree run offers the repo-scoped auto-start opt-in | `test_autostart_optin_prompts_once_and_persists_repo_scope`, `test_autostart_optin_skipped_in_worktree_and_scripted` | mock |
+| `agitrack -b` explains the persistent hook + asks keep/auto-start/off once per repo (shows how to remove) | `test_background_hook_prompt_keep_auto_off_and_asks_once`, `test_background_hook_prompt_skipped_when_scripted` | mock |
+| Daemon honors `autotrack_hook`: installs by default, REMOVES the hook when off | `test_daemon_installs_autotrack_hook_by_default_and_skips_when_off` | real-git |
 | AUTO fold writes a CLEAN agent commit (prompt/summary subject, one metadata block — not the squash-into-user format) | `test_background_auto_folds_pending_into_a_commit_itself`, `test_noworktree_auto_folds_latent_turn_into_commit` | real-git |
 | Daemon AUTO fold waits for the LLM summary, then uses it as the subject | `test_background_auto_fold_waits_for_summary_then_uses_it_as_subject` | real-git |
 | `agitrack --remove-hooks` removes all aGiTrack hooks, restores chained originals | `test_remove_all_installed_hooks_removes_everything_and_restores_chains`, `_noop_when_none` | real-git |

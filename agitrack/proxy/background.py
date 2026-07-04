@@ -447,10 +447,16 @@ class BackgroundRunner:
         """Install the PERSISTENT auto-track pre-commit hook so a commit made after this daemon
         stops (e.g. a reboot) still records its AI work. Deliberately NOT removed on teardown — it
         lives on so tracking survives aGiTrack not running (that hook re-installs the fold hooks and
-        re-starts the daemon on demand). No-op when a custom core.hooksPath makes install impossible."""
+        re-starts the daemon on demand). Gated by the repo-scoped ``autotrack_hook`` setting: when
+        the user chose "off" (via the `agitrack -b` prompt) it is NOT installed, and any existing
+        one is removed. No-op when a custom core.hooksPath makes install impossible."""
         try:
             if self.repo.core_hooks_path():
                 self._debug("autotrack hook skipped: core.hooksPath is set")
+                return
+            if getattr(self.global_config, "autotrack_hook", "keep") == "off":
+                git_hooks.remove_autotrack_precommit_hook(self.repo.hooks_dir(), debug=self._debug)
+                self._debug("autotrack hook removed (autotrack_hook=off)")
                 return
             git_hooks.install_autotrack_precommit_hook(
                 self.repo.hooks_dir(), python_exe=sys.executable, repo_root=str(self.repo.repo), debug=self._debug

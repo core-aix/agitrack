@@ -178,6 +178,7 @@ class GlobalConfig:
             "manual_commits": False,
             "background": False,
             "background_autostart": False,
+            "autotrack_hook": "keep",
             "log_file": None,
             "allowed_edit_paths": [],
             "backend_command": "",
@@ -354,6 +355,20 @@ class GlobalConfig:
     @background.setter
     def background(self, value: bool) -> None:
         self.data["background"] = bool(value)
+        self.save()
+
+    @property
+    def autotrack_hook(self) -> str:
+        # Whether the PERSISTENT auto-track pre-commit hook is installed (repo-scoped). "keep"
+        # (default): the hook stays after the background tracker exits, so a commit made when
+        # aGiTrack isn't running still gets its AI work tracked (remove it with
+        # `agitrack --remove-hooks`). "off": don't install it; track only while the tracker runs.
+        value = self._raw("autotrack_hook")
+        return "off" if str(value).lower() == "off" else "keep"
+
+    @autotrack_hook.setter
+    def autotrack_hook(self, value: str) -> None:
+        self.data["autotrack_hook"] = "off" if str(value).lower() == "off" else "keep"
         self.save()
 
     @property

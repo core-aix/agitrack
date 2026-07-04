@@ -701,6 +701,9 @@ def main(argv: list[str] | None = None) -> int:
                     log_file=log_file_spec,
                     _lock=management_lock,
                 ).run()
+            # Explain the persistent pre-commit hook and let the user decide (once per repo)
+            # whether to keep it after this tracker exits — before we spawn anything.
+            _maybe_prompt_background_hook(config, scripted=scripted)
             # Launcher: spawn the tracker as a DETACHED daemon (like `agitrack -d`) so the
             # terminal is freed, then return to the shell. The child re-execs aGiTrack with
             # --background-serve and takes its own lock, so release ours first (the child owns
@@ -1102,6 +1105,46 @@ def _run_gh_login() -> None:
         subprocess.run(["gh", "auth", "login"], check=False)
     except (OSError, subprocess.SubprocessError) as error:
         print(f"Could not run `gh auth login`: {error}")
+
+
+def _maybe_prompt_background_hook(config: GlobalConfig, *, scripted: bool) -> None:
+    """When starting `agitrack -b`, explain the PERSISTENT auto-track pre-commit hook and let the
+    user decide — once per repo — whether to keep it after the tracker exits. Never blocks
+    automation (no-TTY / scripted → keep silently, the default). Sets the repo-scoped
+    ``autotrack_hook`` (and ``background_autostart`` if they choose auto-start)."""
+    if scripted or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return
+    try:
+        if config.source("autotrack_hook") == "repo":
+            return  # already decided for this repo
+    except Exception:
+        return
+    print(
+        "\naGiTrack installs a persistent git pre-commit hook in this repo. It stays AFTER this\n"
+        "background tracker exits (e.g. after a reboot), so a `git commit` you make when aGiTrack\n"
+        "isn't running still records its AI work — it folds the interaction trace into that commit\n"
+        "(only when the AI actually changed code; a purely human commit is untouched). It can also\n"
+        "auto-start the tracker for you on such a commit. How should it behave in this repository?\n"
+        "  [K] Keep the hook (recommended) — track AI commits even when aGiTrack isn't running\n"
+        "  [A] Keep it AND auto-start the tracker on such a commit\n"
+        "  [O] Off — don't install it; track only while this tracker is running\n"
+    )
+    try:
+        answer = input("Choose [K/a/o] (default K): ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return
+    if answer.startswith("o"):
+        config.set("autotrack_hook", "off", scope="repo")
+        print("aGiTrack: the pre-commit hook won't be installed; tracking runs only while `agitrack -b` is up.")
+    elif answer.startswith("a"):
+        config.set("autotrack_hook", "keep", scope="repo")
+        config.set("background_autostart", True, scope="repo")
+        print("aGiTrack: hook kept and auto-start enabled. Remove it anytime with `agitrack --remove-hooks`.")
+    else:
+        config.set("autotrack_hook", "keep", scope="repo")
+        print(
+            "aGiTrack: hook kept — it reminds you and folds AI work into commits. Remove it anytime with `agitrack --remove-hooks`."
+        )
 
 
 def _maybe_prompt_autostart_optin(config: GlobalConfig, *, scripted: bool, use_worktrees: bool) -> None:

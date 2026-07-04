@@ -381,6 +381,22 @@ def test_start_background_daemon_reports_failure_when_child_dies(tmp_path, capsy
     assert "did not start" in capsys.readouterr().out
 
 
+def test_daemon_installs_autotrack_hook_by_default_and_skips_when_off(tmp_path):
+    from agitrack.git import hooks as git_hooks
+
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    hook = repo.repo / ".git" / "hooks" / "pre-commit"
+
+    # Default (keep): the persistent hook is installed.
+    runner._install_autotrack_hook()
+    assert hook.exists() and git_hooks.is_autotrack_hook(hook)
+
+    # autotrack_hook=off: installing removes it (the user opted out via the -b prompt).
+    runner.global_config.autotrack_hook = "off"
+    runner._install_autotrack_hook()
+    assert not hook.exists()
+
+
 def test_background_writes_event_log(tmp_path):
     # The event log records notable events in background mode too: an AI change detected and
     # the commit aGiTrack makes for it. Works with --log-file / config in every mode.

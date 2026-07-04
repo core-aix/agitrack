@@ -403,6 +403,55 @@ def test_parse_rows_collects_all_agent_messages_in_order():
     assert turn.final_response == "Done — all set."
 
 
+def _queued(prompt, *, mode="prompt", origin="human"):
+    # How Claude Code records a message the user QUEUES while the agent is working: a
+    # `type:"attachment"` row (attachment.type == "queued_command"), NOT a `type:"user"` row.
+    return {
+        "type": "attachment",
+        "attachment": {"type": "queued_command", "prompt": prompt, "commandMode": mode, "origin": {"kind": origin}},
+    }
+
+
+def test_parse_rows_captures_queued_followup_messages_in_the_turn():
+    # A follow-up the user sends WHILE the agent works must appear in the interaction trace —
+    # it's threaded into the same turn, and was being dropped entirely (issue: follow-ups vanish).
+    rows = [
+        _user("u1", "Fix the messy commit format."),
+        _assistant(
+            "m1", "", content=[{"type": "tool_use", "id": "t1", "name": "Edit", "input": {}}], stop_reason="tool_use"
+        ),
+        _queued("The subject should still be summarized."),  # queued mid-work
+        _assistant(
+            "m2", "", content=[{"type": "tool_use", "id": "t2", "name": "Edit", "input": {}}], stop_reason="tool_use"
+        ),
+        _queued("Also add a mode matrix to the webpage."),  # a second queued follow-up
+        _assistant("m3", "Done — all three addressed."),
+    ]
+
+    turn = parse_rows("sess-q", rows).turns[0]
+
+    # All three user messages are present, in order, under the one turn.
+    assert turn.user_prompt.startswith("Fix the messy commit format.")
+    assert "The subject should still be summarized." in turn.user_prompt
+    assert "Also add a mode matrix to the webpage." in turn.user_prompt
+    assert turn.final_response == "Done — all three addressed."
+    # Exactly one turn (the queued messages extend it, they don't each open a new turn).
+    assert len(parse_rows("sess-q", rows).turns) == 1
+
+
+def test_parse_rows_ignores_non_human_or_slash_queued_attachments():
+    # Only genuine human prompts are captured; a queued slash directive or non-human origin isn't.
+    rows = [
+        _user("u1", "do the thing"),
+        _queued("/compact"),  # a slash directive kept out of the trace
+        _queued("noise", origin="system"),  # non-human origin
+        _queued("bg", mode="bash"),  # not a typed prompt
+        _assistant("m1", "done"),
+    ]
+    turn = parse_rows("sess-q2", rows).turns[0]
+    assert turn.user_prompt == "do the thing"  # none of the excluded attachments were added
+
+
 def test_parse_rows_marks_turn_incomplete_while_last_message_is_tool_use():
     # A prompt whose latest assistant message is a tool call is still mid-flight:
     # the agent paused between writing code and writing tests. aGiTrack must see this
