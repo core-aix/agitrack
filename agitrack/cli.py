@@ -236,6 +236,16 @@ def main(argv: list[str] | None = None) -> int:
         "agent turn itself and folds tracking into the agent's own commits via a prepare-commit-msg hook.",
     )
     parser.add_argument(
+        "--log-file",
+        dest="log_file",
+        default=None,
+        metavar="PATH",
+        help="append notable aGiTrack events (an AI change detected, a commit made, a merge "
+        "integrated, an update available) to PATH — a plain-text log you can `tail -f`. Works in "
+        "every mode, with or without -b. A relative path is resolved against the repo root. Also "
+        "settable via 'log_file' in config.",
+    )
+    parser.add_argument(
         "--no-confine",
         "--no-sandbox",
         dest="no_sandbox",
@@ -327,6 +337,25 @@ def main(argv: list[str] | None = None) -> int:
         # `agitrack -d`, the TUI for the Ctrl-G dashboard). The child shuts itself down
         # when that pid dies, so the dashboard never outlives whatever launched it —
         # even on SIGKILL, which leaves no chance to stop us first.
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--precommit-sync",
+        action="store_true",
+        # Internal: entry point of the persistent auto-track pre-commit hook. Records any pending
+        # AI turns and renders the fold trailer so the commit being made carries the trace, and
+        # (when background_autostart is set) starts the background daemon. Best-effort, never fails
+        # a commit. Not meant for manual use.
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--background-serve",
+        action="store_true",
+        # Internal: run the headless background tracker loop in the foreground (this
+        # process). `agitrack -b` spawns aGiTrack with this flag as a detached daemon so the
+        # launching terminal is freed. Unlike the dashboard daemon it has NO owner-pid
+        # watchdog — a tracker must outlive the terminal that started it (stop it with
+        # `agitrack -b stop`). Not meant for manual use.
         help=argparse.SUPPRESS,
     )
     parser.epilog = (
@@ -431,6 +460,18 @@ def main(argv: list[str] | None = None) -> int:
         from agitrack.proxy.background import background_status, stop_background
 
         return stop_background(bg_repo) if args.background == "stop" else background_status(bg_repo)
+
+    if args.precommit_sync:
+        # Internal: the persistent auto-track pre-commit hook. Fast, best-effort, never fails a
+        # commit — records any pending AI turns and renders the fold trailer for the commit being
+        # made, then (when background_autostart is set) starts the background daemon.
+        try:
+            sync_repo = GitRepo.discover(Path(args.repo).expanduser())
+        except (GitError, OSError):
+            return 0  # not a repo / bad path ⇒ silently do nothing, never block the commit
+        from agitrack.proxy.background import precommit_sync
+
+        return precommit_sync(sync_repo)
 
     if args.recover:
         # Headless finalization of work left by a session that exited abruptly.
@@ -569,6 +610,8 @@ def main(argv: list[str] | None = None) -> int:
     use_worktrees = False if (args.no_worktree or manual_commits or background) else config.use_worktrees
     commit_guidance = False if args.no_commit_guidance else getattr(config, "commit_guidance", True)
     sandbox_enabled = False if args.no_sandbox else getattr(config, "sandbox", True)
+    # Event-log path: a per-run --log-file wins over the configured log_file; None ⇒ no log.
+    log_file_spec = args.log_file if args.log_file is not None else getattr(config, "log_file", None)
     if args.allowed_edit_paths is not None:
         allowed_edit_paths = [p for p in args.allowed_edit_paths.split(os.pathsep) if p.strip()]
     else:
@@ -612,21 +655,48 @@ def main(argv: list[str] | None = None) -> int:
         if background:
             # Headless background tracker (issue #143): no TUI, no PTY takeover. aGiTrack watches
             # the user-driven backend session and tracks it. Show the privacy warning first (it
-            # auto-proceeds without a TTY), then run the tracker until interrupted.
+            # auto-proceeds without a TTY — so the interactive launcher below acknowledges it,
+            # then hands the detached child `--skip-privacy-ack`).
             if not _acknowledge_privacy_warning(scripted=scripted, skip=args.skip_privacy_ack):
                 return 1
             if BackgroundRunner is None:  # pragma: no cover - platform without proxy support
                 print("Background mode is not available on this platform yet.")
                 return 1
-            return BackgroundRunner(
-                repo,
-                verbose=args.verbose,
-                backend=args.backend,
-                new_session=args.new_session,
-                manual_commits=manual_commits,
-                backend_command=backend_command,
-                _lock=management_lock,
-            ).run()
+            if args.background_serve:
+                # We ARE the detached daemon child: run the tracker loop in the foreground of
+                # this (already-detached) process, holding the repo lock for our whole run.
+                return BackgroundRunner(
+                    repo,
+                    verbose=args.verbose,
+                    backend=args.backend,
+                    new_session=args.new_session,
+                    manual_commits=manual_commits,
+                    backend_command=backend_command,
+                    log_file=log_file_spec,
+                    _lock=management_lock,
+                ).run()
+            # Launcher: spawn the tracker as a DETACHED daemon (like `agitrack -d`) so the
+            # terminal is freed, then return to the shell. The child re-execs aGiTrack with
+            # --background-serve and takes its own lock, so release ours first (the child owns
+            # the single-writer lock for the daemon's lifetime; stop it with `agitrack -b stop`).
+            management_lock.release()
+            from agitrack.proxy.background import start_background_daemon
+
+            child_args: list[str] = []
+            if args.backend:
+                child_args += ["--backend", args.backend]
+            # Force the resolved commit mode explicitly so the child's own config can't flip it.
+            child_args.append("--manual-commits" if manual_commits else "--auto-commit")
+            if args.new_session:
+                child_args.append("--new-session")
+            if args.verbose:
+                child_args.append("--verbose")
+            if args.backend_command:
+                child_args += ["--backend-command", args.backend_command]
+            # Forward a per-run --log-file (a configured log_file the child reads itself).
+            if args.log_file:
+                child_args += ["--log-file", args.log_file]
+            return start_background_daemon(repo, extra_args=child_args)
         if args.mode == "json":
             # json/scripted mode has no interactive pre-TUI configuration steps, so show the
             # privacy warning here (it auto-proceeds without a TTY) before the shell starts.
@@ -657,6 +727,9 @@ def main(argv: list[str] | None = None) -> int:
             # let the user test/replace it now — the only chance before the TUI takes over.
             if not _verify_menu_key(config, scripted=scripted):
                 return 1
+            # First interactive no-worktree run on this repo: offer the repo-scoped auto-start
+            # opt-in (auto-start background tracking on a commit made when aGiTrack isn't running).
+            _maybe_prompt_autostart_optin(config, scripted=scripted, use_worktrees=use_worktrees)
             if ProxyRunner is None:  # pragma: no cover - platform without proxy support
                 print("The interactive aGiTrack TUI is not available on this platform yet.")
                 return 1
@@ -674,6 +747,7 @@ def main(argv: list[str] | None = None) -> int:
                 delay_merge=args.delay_merge,
                 sandbox=sandbox_enabled,
                 allowed_edit_paths=allowed_edit_paths,
+                log_file=log_file_spec,
                 gh_prechecked=gh_handled,
                 skip_privacy_ack=args.skip_privacy_ack,
                 _lock=management_lock,
@@ -1002,6 +1076,48 @@ def _run_gh_login() -> None:
         subprocess.run(["gh", "auth", "login"], check=False)
     except (OSError, subprocess.SubprocessError) as error:
         print(f"Could not run `gh auth login`: {error}")
+
+
+def _maybe_prompt_autostart_optin(config: GlobalConfig, *, scripted: bool, use_worktrees: bool) -> None:
+    """First interactive no-worktree run on a repo: offer the **repo-scoped** auto-start opt-in.
+
+    When enabled, a persistent pre-commit hook auto-starts the background tracker on a `git commit`
+    made while aGiTrack isn't running (e.g. after a reboot), so AI work keeps being tracked — the
+    triggering commit still folds in its trace either way. Asked once per repo (skipped once a
+    choice is recorded at any layer) and only where the hook is actually installed (no-worktree
+    modes); never blocks automation (no-TTY / scripted → no-op). Worktree-mode users can still
+    enable it from Ctrl-G → settings."""
+    if scripted or use_worktrees or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return
+    try:
+        # Repo-based opt-in: skip once THIS repo has a recorded choice. (The global config seeds a
+        # default for every key, so we key off the repo layer specifically, not "global".)
+        if config.source("background_autostart") == "repo":
+            return
+    except Exception:
+        return
+    try:
+        answer = (
+            input(
+                "aGiTrack can auto-start background tracking when you `git commit` and it isn't\n"
+                "running, so AI work is tracked even after a reboot (the commit still gets its trace\n"
+                "either way). Enable auto-start for THIS repository? [y/N] "
+            )
+            .strip()
+            .lower()
+        )
+    except (EOFError, KeyboardInterrupt):
+        return
+    enabled = answer.startswith("y")
+    try:
+        config.set("background_autostart", enabled, scope="repo")
+    except Exception:
+        return
+    print(
+        "aGiTrack: auto-start enabled for this repo (change it in Ctrl-G → settings)."
+        if enabled
+        else "aGiTrack: auto-start off; aGiTrack will just remind you on commit. Change it in Ctrl-G → settings."
+    )
 
 
 def _verify_menu_key(config: GlobalConfig, *, scripted: bool = False) -> bool:

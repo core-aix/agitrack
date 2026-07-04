@@ -193,12 +193,26 @@ agitrack -b stop          # stop it
 
 **Background mode** runs aGiTrack **without its interactive TUI**, so you can drive the coding agent from *any* UI you like — its native CLI, an IDE extension (e.g. Claude's VS Code extension), a chat window — while aGiTrack watches that session's local transcript and does all the same tracking the TUI would: it records each completed turn, summarizes it, and installs the commit hooks that fold the interaction trace and token metadata into your commits. aGiTrack does **not** launch or proxy the agent here; it tracks whatever session you drive.
 
+**It runs as a detached daemon, exactly like the dashboard (`agitrack -d`).** `agitrack -b` starts the tracker in the background and **returns to your shell immediately** — the terminal isn't tied up. Unlike the dashboard daemon it deliberately has **no owner-terminal watchdog**: a tracker keeps running after you close the terminal (that's the point — it should keep tracking), so you stop it explicitly with `agitrack -b stop`. `agitrack -b status` reports whether one is running (and any available update). The daemon logs its startup and per-turn activity to `<repo>/.agitrack/background.log`.
+
 Background mode **always runs without a worktree** (it implies `--no-worktree`), and supports either commit style:
 
 - **Auto** (the default, like the interactive TUI): aGiTrack commits each completed agent turn itself. If the agent makes its **own** commit, a `prepare-commit-msg` hook folds the tracking directly into that commit (a metadata-only "cover" commit is only the fallback when the hook can't be installed).
 - **Manual** (`--manual-commits` / `-m`): exactly like manual mode above — each turn is recorded on a hidden latent ref and folded into *your* commit by the `prepare-commit-msg` hook.
 
-Only **one** aGiTrack may run per repository (a foreground TUI or a background tracker — never both, and never two), so they can't fight over commits; a second start is refused. `agitrack -b status` reports whether a background tracker is running, and `agitrack -b stop` stops it (it records any final turn and removes its hooks first). Enable background mode for every run with `"background": true` in `~/.agitrack/config.json`; press `Ctrl-C` to stop a foreground `-b` tracker.
+Only **one** aGiTrack may run per repository (a foreground TUI or a background daemon — never both, and never two), so they can't fight over commits; a second start is refused. Enable background mode for every run with `"background": true` in `~/.agitrack/config.json`.
+
+Only **repo-local AI work is ever tracked.** aGiTrack keys the backend session strictly to this repository's directory (Claude by its per-directory transcript store, OpenCode by each session's recorded working directory), so a session you drive in a *different* repo is never picked up by this repo's tracker.
+
+#### Never forget to start it: track (or auto-start) on commit
+
+Because a background tracker is easy to forget after a reboot, aGiTrack installs a **persistent `pre-commit` hook** (it survives aGiTrack not running). When you `git commit` while no tracker is running, the hook — **only if the AI actually made changes since your last commit** (non-zero tokens) — records the pending turns and folds their interaction trace and metadata **into that very commit**, so AI work is never silently lost. A purely human commit (no AI work) is left completely untouched: no trailer, no reminder, no footprint.
+
+By default the hook just **reminds** you (once, in the commit output) to start `agitrack -b` for continuous tracking. You can instead have it **auto-start** the background daemon on that commit — a **per-repository** opt-in offered the first time you run aGiTrack interactively on the repo (also under `Ctrl-G → settings`, or `"background_autostart": true` in the repo's `.agitrack/config.json`). Either way, the triggering commit gets its trace; auto-start additionally launches the daemon for future commits.
+
+#### Update reminders while running in the background
+
+A background daemon periodically checks whether a newer aGiTrack is available (it **never** auto-installs — installing may need pip/pipx/brew/an MSI). When one is found it records it and reminds you where you'll actually see it: in `agitrack -b status`, in the `git commit` output (via the pre-commit hook), and as a banner on the [dashboard](#dashboard). Turn the checks off with `"check_for_updates": false`.
 
 
 
@@ -362,6 +376,7 @@ When it launches a coding agent, aGiTrack appends a note to the agent's system p
 - Tracked modifications and deletions are staged with `git add -u`.
 - New untracked files require confirmation before staging.
 - Declined untracked files are remembered in repository-local `.agitrack/state.json`.
+- **No tracking footprint on a non-AI commit.** aGiTrack only ever attributes or covers a commit that actually contains AI-written work. A commit made with **no** agent turns since the last one (purely your own hand-written code) is left completely untouched — no trailer, no cover, no metadata.
 - Agent commits use the `<aGiTrack>` tag and include the full interaction trace since the last code-changing commit.
 - Agent commit metadata includes context token count and generated token usage accumulated since the last code-changing commit.
   - Token figures are read directly from the backend's session transcript (each assistant message's reported usage) and broken out by category: `input`, `output`, `cache_read`, `cache_write`, and (when the backend reports it) `reasoning`. Both backends report `input` as the *uncached* input (cache reads/writes are tracked separately, never rolled into it), so the categories mean the same thing across backends. The one backend difference is generated tokens: Claude folds extended-thinking and tool-call tokens into `output` (no separate `reasoning`), whereas OpenCode reports `reasoning` as its own bucket alongside `output`. Sub-agent/sidechain turns are counted separately under the matching `subagent_*` categories rather than dropped (both backends do this). Each category is recorded only when the backend reports a non-zero value, so a field a backend never populates (e.g. Claude's separate `reasoning`) simply has no line.
@@ -581,6 +596,10 @@ User-wide settings live in `~/.agitrack/config.json` (override the directory wit
 `manual_commits` (default `false`) enables manual-commit mode by default — the same as starting aGiTrack with `--manual-commits` / `-m`, which applies it for a single run. Commits stay user-triggered and each agent turn is tracked on a hidden side ref until you commit. Manual-commit mode **always runs without a worktree** (it implies `--no-worktree`). See the `--manual-commits` notes under Usage.
 
 `background` (default `false`) runs aGiTrack in background (headless) mode by default — the same as starting aGiTrack with `--background` / `-b`, which applies it for a single run. In background mode aGiTrack tracks a session you drive from your own UI (no TUI), and **always runs without a worktree** (it implies `--no-worktree`). It uses **auto** commits by default (like the interactive TUI); set `manual_commits: true` (or pass `-m`) for user-triggered commits. Settable in both the global (`~/.agitrack/config.json`) and per-repo (`<repo>/.agitrack/config.json`) config files. See the `--background` notes under Usage.
+
+`background_autostart` (default `false`, **per-repository**) makes the persistent `pre-commit` hook **auto-start** the background daemon on a `git commit` made while aGiTrack isn't running (instead of only reminding you). Either way the triggering commit still folds in its AI trace. aGiTrack offers this opt-in the first time you run it interactively on a repo; you can also toggle it under `Ctrl-G → settings` or set `"background_autostart": true` in the repo's `.agitrack/config.json`. See [Background mode](#background-mode---background---b).
+
+`log_file` (default unset) is a path to a plain-text **event log** aGiTrack appends notable events to — an AI change detected, a commit made, an update available — in **every** mode (interactive proxy and background, with or without `-b`), so you can `tail -f` one file and watch what aGiTrack is doing. A relative path is resolved against the repo root. Set it for a single run with `--log-file PATH`, or persist it here (`"log_file": "agitrack-events.log"`).
 
 The global config file (`~/.agitrack/config.json`) is written out with **every setting at its default** the first time aGiTrack runs, so you can open it and see the full list of available options at a glance. Any value you set is preserved; new options are added with their defaults after an upgrade.
 

@@ -39,6 +39,7 @@ from agitrack.commits import (
     build_user_commit_message,
     summary_metadata_lines,
 )
+from agitrack.events import EventLog, resolve_log_path
 from agitrack.git import GitRepo
 from agitrack.git import hooks as git_hooks
 from agitrack.config import GlobalConfig
@@ -515,6 +516,9 @@ class ProxyRunner:
         sandbox: bool = True,
         allowed_edit_paths: list[str] | None = None,
         backend_command: list[str] | None = None,
+        # Optional path to a user-facing event log (an AI change detected, a commit made, a
+        # merge integrated, an update available). None ⇒ no event log. See agitrack.events.
+        log_file: str | None = None,
         # True when cli.py already ran the blocking startup gh-availability prompt for
         # this launch, so run() skips its own in-TUI gh notice (avoids double-nagging).
         gh_prechecked: bool = False,
@@ -572,6 +576,9 @@ class ProxyRunner:
         # empty, the per-backend config value (GlobalConfig.backend_command) applies. The
         # override wins for whatever backend is active; the config form is keyed by backend.
         self._backend_command = list(backend_command or [])
+        # User-facing event log (an AI change detected, a commit made, an update available).
+        # Keyed on the base repo root so a relative --log-file resolves the same everywhere.
+        self.events = EventLog(resolve_log_path(log_file, repo.repo))
         # cli.py already showed the blocking startup gh prompt ⇒ suppress the in-TUI notice.
         self._gh_prechecked = gh_prechecked
         self._skip_privacy_ack = skip_privacy_ack
@@ -1103,6 +1110,7 @@ class ProxyRunner:
                 "_message_scroll": 0,
                 "_message_max_scroll": 0,
                 "_message_sticky": False,
+                "events": EventLog(None),  # disabled event log by default in tests
                 "_gh_prechecked": False,
                 "_skip_privacy_ack": False,
                 "_session_notices": {},
@@ -1712,6 +1720,21 @@ class ProxyRunner:
                 )
         except Exception as error:
             self._debug(f"manual-commit hook install failed: {error!r}")
+        # Also install the PERSISTENT auto-track pre-commit hook so a commit made LATER — after
+        # this aGiTrack exits (e.g. a reboot) — still records its AI work and folds it into that
+        # commit. It defers to a live tracker (this session), so it's a no-op while we run; it earns
+        # its keep once aGiTrack is gone. No conflict with the worktree base-commit guard (that is
+        # worktree-mode only; this path is no-worktree/_latent_tracking).
+        try:
+            if not self.base_repo.core_hooks_path():
+                git_hooks.install_autotrack_precommit_hook(
+                    self.base_repo.hooks_dir(),
+                    python_exe=sys.executable,
+                    repo_root=str(self.base_repo.repo),
+                    debug=self._debug,
+                )
+        except Exception as error:
+            self._debug(f"autotrack hook install failed: {error!r}")
         # Recovery: drop a stale latent chain left by a prior run (e.g. the user committed
         # outside aGiTrack after exiting) so its turns aren't re-folded into a later commit.
         self._reset_stale_manual_ref()
@@ -1782,9 +1805,9 @@ class ProxyRunner:
 
     def _render_manual_trailer(self) -> None:
         """(Re)render ``.agitrack/manual-pending-trailer`` from the durable latent ref, and
-        the ``.agitrack/manual-ref`` name file the post-commit hook reads. The trailer always
-        carries at least the ``commit_type: user`` block, so a commit with no pending turns is
-        still attributed to the session; pending turns add their full trace/metadata."""
+        the ``.agitrack/manual-ref`` name file the post-commit hook reads. When pending turns
+        exist the trailer carries the ``commit_type: user`` block plus each turn's full
+        trace/metadata; with NO pending turns it is empty, so a purely human commit is untouched."""
         if not self._latent_tracking:
             return
         try:
@@ -2538,6 +2561,19 @@ class ProxyRunner:
         if result is None or not result.ok:
             return
         self._update_status = result
+        # Feed the shared update marker so the dashboard banner and the pre-commit reminder
+        # reflect the same finding (best-effort; cleared when we're up to date again).
+        try:
+            from agitrack.update.marker import clear_update_marker, write_update_marker
+
+            if result.available:
+                write_update_marker(
+                    self.base_repo.repo, current=result.current, latest=result.latest, message=result.message
+                )
+            else:
+                clear_update_marker(self.base_repo.repo)
+        except Exception as error:
+            self._debug(f"update marker write failed: {error!r}")
         if result.available and not self._update_offered and not self._manual_update_pending():
             # First time we have seen this update: prompt the user (a status-bar
             # notice pointing at the `update` command, so we don't seize the
@@ -6816,6 +6852,10 @@ class ProxyRunner:
         if choice != "Delete them":
             return
         worktrees = self._worktrees()
+        # Deleting can take a while for large worktree directories, so show progress up front
+        # rather than letting the screen look frozen mid-removal.
+        self._set_message(f"Deleting {len(names)} leftover worktree director(ies)…", seconds=30)
+        self._render()
         removed = 0
         for name in names:
             try:
@@ -8584,6 +8624,11 @@ class ProxyRunner:
                 "kind": "bool",
                 "restart": True,
             },
+            {
+                "key": "background_autostart",
+                "label": "Auto-start background tracking on commit when aGiTrack isn't running (best as a repo setting)",
+                "kind": "bool",
+            },
             # --- agent behavior ---
             {
                 "key": "commit_guidance",
@@ -9324,6 +9369,13 @@ class ProxyRunner:
 
         def on_commit_fn(sha, trace_text, is_cover):
             self._last_agent_commit_id = sha
+            self.events.emit(
+                "commit",
+                sha=(sha or "")[:12],
+                type="cover" if is_cover else "agent",
+                backend=self.state.backend,
+                session=self._session_label(),
+            )
             # Mark that this session saw a real turn this run (stable aGiTrack session id,
             # not the drift-prone backend id) so the exit-path auto-share knows there
             # is genuinely something new to push.
@@ -10184,6 +10236,12 @@ class ProxyRunner:
         elif has_leftover_files:
             self._debug(f"keeping worktree '{info.name}' on signal exit: leftover files, no UI to copy them out")
             return
+        # Deletion can take a while for a large worktree (full copied environment,
+        # node_modules, build output, …), so announce it the moment we start rather than
+        # leaving the screen looking frozen. No-ops on a signal teardown (screen is None ⇒
+        # _render does nothing).
+        self._set_message(f"Deleting worktree '{info.name}'…", seconds=30)
+        self._render()
         self._terminate_child()
         try:
             self._worktrees().remove(info.name)

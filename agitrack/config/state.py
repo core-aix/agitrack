@@ -110,6 +110,13 @@ class AgitrackState:
             handle.write("\n")
         os.replace(tmp, self.path)
 
+    def ensure_local_ignore(self) -> None:
+        """Make sure ``.agitrack/`` is git-ignored for this repo (idempotent). Call this before
+        writing any ``.agitrack/`` file (the manual trailer/ref, handshake, …) so aGiTrack's
+        internal state can never leak into a ``git add -A`` / user commit — ``save()`` also does
+        it, but state isn't always saved before those files are written (e.g. an idle daemon)."""
+        self._ensure_repo_local_ignore()
+
     def _ensure_repo_local_ignore(self) -> None:
         exclude = self._exclude_path()
         if exclude is None:

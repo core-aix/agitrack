@@ -176,11 +176,15 @@ def test_dashboard_non_squash_message_is_unchanged(tmp_path):
     assert "# aGiTrack Metadata" in c["message"]  # full message preserved
 
 
-def test_manual_trailer_with_no_pending_turns_is_a_plain_user_commit():
+def test_manual_trailer_with_no_pending_turns_is_empty_no_footprint():
+    # No pending AI turns ⇒ the commit holds only the user's own code, so aGiTrack adds
+    # NOTHING: the trailer is empty and the commit is left completely untouched (no cover /
+    # no attribution when no code was written by AI).
     trailer = build_manual_squash_trailer(agitrack_session_id="sid", latent_bodies=[])
+    assert trailer == ""
     folded = "Just my edit\n\n" + trailer
     stat = _parse_commit("def4567", "me", "me@x", "1700000000", folded)
-    assert stat.kind == "user"  # still attributed to the session, not "untracked"
+    assert stat.kind == "untracked"  # no aGiTrack metadata at all
 
 
 # --- hooks ------------------------------------------------------------------
@@ -210,6 +214,26 @@ def test_hooks_fold_trailer_into_commit_and_reset_ref(tmp_path):
     assert (repo.repo / ".agitrack" / "manual-pending-trailer").read_text() == ""  # cleared
     # Exactly one commit was added (no separate cover commit).
     assert len(_git(repo, "log", "--format=%H").split()) == 2
+
+
+def test_hook_leaves_commit_untouched_when_no_pending_turns(tmp_path):
+    # With no pending AI turns the pre-rendered trailer is empty, so the prepare-commit-msg
+    # hook's `[ -s "$_trailer" ]` guard appends nothing: a purely human commit stays a plain
+    # commit with zero aGiTrack footprint (no cover, no attribution).
+    repo = _init_repo(tmp_path)
+    assert git_hooks.install_manual_commit_hooks(repo.repo / ".git" / "hooks")
+    trailer = build_manual_squash_trailer(agitrack_session_id="s", latent_bodies=[])  # no turns
+    assert trailer == ""
+    _setup_manual_ref_and_trailer(repo, trailer)
+
+    (tmp_path / "a.txt").write_text("one\nhuman only\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "My hand-written change")
+
+    msg = _git(repo, "log", "-1", "--format=%B", "HEAD")
+    assert "My hand-written change" in msg
+    assert "# aGiTrack Metadata" not in msg  # untouched — no footprint
+    assert "commit_type" not in msg
 
 
 def test_prepare_commit_msg_hook_is_idempotent_and_skips_amend(tmp_path):
@@ -242,6 +266,34 @@ def test_manual_hooks_install_remove_preserves_existing_hook(tmp_path):
     git_hooks.remove_manual_commit_hooks(hooks_dir)
     assert existing.read_text() == "#!/bin/sh\necho mine\n"  # restored
     assert not (hooks_dir / "prepare-commit-msg").exists()
+
+
+def test_autotrack_precommit_hook_install_remove_and_chain(tmp_path):
+    import sys as _sys
+
+    repo = _init_repo(tmp_path)
+    hooks_dir = repo.repo / ".git" / "hooks"
+    hooks_dir.mkdir(exist_ok=True)
+    # A pre-existing project pre-commit hook must be preserved (chained), then restored on removal.
+    existing = hooks_dir / "pre-commit"
+    existing.write_text("#!/bin/sh\necho project\n", encoding="utf-8")
+    existing.chmod(0o755)
+
+    assert git_hooks.install_autotrack_precommit_hook(hooks_dir, python_exe=_sys.executable, repo_root=str(repo.repo))
+    hook = (hooks_dir / "pre-commit").read_text()
+    assert git_hooks.is_autotrack_hook(hooks_dir / "pre-commit")
+    assert "--precommit-sync" in hook and _sys.executable in hook and str(repo.repo) in hook
+    assert (hooks_dir / "pre-commit.agitrack-orig").read_text() == "#!/bin/sh\necho project\n"
+
+    git_hooks.remove_autotrack_precommit_hook(hooks_dir)
+    assert (hooks_dir / "pre-commit").read_text() == "#!/bin/sh\necho project\n"  # restored
+
+
+def test_autotrack_hook_is_a_noop_inside_a_worktree():
+    # The hook script must skip (do nothing) when the commit is inside a linked worktree, so it
+    # never fights aGiTrack's own worktree-mode handling.
+    script = git_hooks._autotrack_precommit_script("/usr/bin/python3", "/repo")
+    assert "*/worktrees/*)" in script and "--precommit-sync" in script
 
 
 # --- CommitEngine manual sink ----------------------------------------------
@@ -622,7 +674,9 @@ def test_runner_git_commit_with_no_pending_turns_is_plain_user_commit(tmp_path):
     assert created is True
     msg = _git(repo, "log", "-1", "--format=%B", "HEAD")
     stat = _parse_commit("h", "me", "me@x", "1", msg)
-    assert stat.kind == "user"  # attributed to the session, not agent-tracked
+    # No AI turns ⇒ no aGiTrack footprint at all (the commit is a plain, untracked user commit).
+    assert stat.kind == "untracked"
+    assert "# aGiTrack Metadata" not in msg
     assert repo.rev_parse(runner._manual_ref()) == repo.rev_parse("HEAD")  # ref still reset
 
 

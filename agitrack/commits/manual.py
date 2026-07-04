@@ -128,9 +128,9 @@ class ManualCommitTracker:
 
     def render_trailer(self) -> None:
         """(Re)render ``.agitrack/manual-pending-trailer`` from the durable latent ref, and the
-        ``.agitrack/manual-ref`` name file the post-commit hook reads. The trailer always carries
-        at least the ``commit_type: user`` block, so a commit with no pending turns is still
-        attributed to the session; pending turns add their full trace/metadata."""
+        ``.agitrack/manual-ref`` name file the post-commit hook reads. When pending turns exist the
+        trailer carries the ``commit_type: user`` block plus each turn's full trace/metadata; with
+        NO pending turns it is empty, so a purely human commit (no AI work) is left untouched."""
         try:
             agit_dir = self.agit_dir()
             agit_dir.mkdir(parents=True, exist_ok=True)

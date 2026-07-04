@@ -558,29 +558,79 @@ def test_manual_commits_off_by_default(monkeypatch):
 # --- --background / -b -------------------------------------------------------
 
 
+def _autostart_config(tmp_path):
+    from agitrack.config.settings import GlobalConfig
+
+    cfg = GlobalConfig(path=tmp_path / "global.json")
+    cfg.load_repo_overlay(tmp_path)  # repo overlay at tmp_path/.agitrack/config.json
+    return cfg
+
+
+def test_autostart_optin_prompts_once_and_persists_repo_scope(tmp_path, monkeypatch, capsys):
+    # First interactive no-worktree run: the opt-in is offered and the answer is saved at REPO scope.
+    config = _autostart_config(tmp_path)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda *a: "y")
+
+    cli._maybe_prompt_autostart_optin(config, scripted=False, use_worktrees=False)
+
+    assert config.background_autostart is True
+    assert config.source("background_autostart") == "repo"  # a repo-scoped decision
+    # A second run does not prompt again (would raise if input() were called).
+    monkeypatch.setattr("builtins.input", lambda *a: (_ for _ in ()).throw(AssertionError("prompted twice")))
+    cli._maybe_prompt_autostart_optin(config, scripted=False, use_worktrees=False)
+
+
+def test_autostart_optin_skipped_in_worktree_and_scripted(tmp_path, monkeypatch):
+    config = _autostart_config(tmp_path)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda *a: (_ for _ in ()).throw(AssertionError("should not prompt")))
+
+    cli._maybe_prompt_autostart_optin(config, scripted=True, use_worktrees=False)  # scripted
+    cli._maybe_prompt_autostart_optin(config, scripted=False, use_worktrees=True)  # worktree mode
+    assert config.source("background_autostart") != "repo"  # nothing recorded
+
+
+def _stub_bg_daemon(monkeypatch):
+    """`agitrack -b` now spawns a DETACHED daemon: the launcher calls start_background_daemon
+    with the flags forwarded to the child. Capture those to assert the resolved commit mode."""
+    captured: dict = {}
+
+    def fake_start(repo, *, extra_args, **kw):
+        captured["extra_args"] = extra_args
+        return 0
+
+    monkeypatch.setattr("agitrack.proxy.background.start_background_daemon", fake_start)
+    return captured
+
+
 def test_background_flag_forces_no_worktree_and_auto_default(monkeypatch):
     # --background always runs without a worktree and defaults to AUTO commits (like the TUI).
-    captured = _stub_launch(monkeypatch, use_worktrees=True)
+    _stub_launch(monkeypatch, use_worktrees=True)
     monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
+    captured = _stub_bg_daemon(monkeypatch)
     cli.main(["--background"])
-    assert captured["manual_commits"] is False  # auto by default
-    # BackgroundRunner takes no use_worktrees kwarg (it is always no-worktree); the fact that it
-    # was constructed (captured is non-empty) confirms the background branch ran.
-    assert "use_worktrees" not in captured
+    # The launcher forwards the resolved commit mode to the detached daemon child.
+    assert "--auto-commit" in captured["extra_args"]  # auto by default
+    assert "--manual-commits" not in captured["extra_args"]
 
 
 def test_background_short_flag(monkeypatch):
-    captured = _stub_launch(monkeypatch)
+    _stub_launch(monkeypatch)
     monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
+    captured = _stub_bg_daemon(monkeypatch)
     cli.main(["-b"])
-    assert captured["manual_commits"] is False  # auto by default
+    assert "--auto-commit" in captured["extra_args"]  # auto by default
 
 
 def test_background_manual_commits_opts_into_manual(monkeypatch):
-    captured = _stub_launch(monkeypatch)
+    _stub_launch(monkeypatch)
     monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
+    captured = _stub_bg_daemon(monkeypatch)
     cli.main(["-b", "-m"])
-    assert captured["manual_commits"] is True  # -m opts into user-triggered commits
+    assert "--manual-commits" in captured["extra_args"]  # -m opts into user-triggered commits
 
 
 def test_background_stop_and_status_do_not_launch(monkeypatch):

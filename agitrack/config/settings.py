@@ -177,6 +177,8 @@ class GlobalConfig:
             "use_worktrees": True,
             "manual_commits": False,
             "background": False,
+            "background_autostart": False,
+            "log_file": None,
             "allowed_edit_paths": [],
             "backend_command": "",
             "menu_key": DEFAULT_MENU_KEY,
@@ -352,6 +354,35 @@ class GlobalConfig:
     @background.setter
     def background(self, value: bool) -> None:
         self.data["background"] = bool(value)
+        self.save()
+
+    @property
+    def background_autostart(self) -> bool:
+        # Repo-scoped opt-in (off by default): when set, a persistent pre-commit hook auto-starts
+        # the background tracker on `git commit` if it isn't already running — so AI work is tracked
+        # even after a reboot without remembering to run `agitrack -b`. The triggering commit still
+        # folds in the pending trace/metadata (the hook records + renders synchronously first). When
+        # off, the hook only REMINDS (and still folds the pending work into the current commit).
+        value = self._raw("background_autostart")
+        return False if value is None else bool(value)
+
+    @background_autostart.setter
+    def background_autostart(self, value: bool) -> None:
+        self.data["background_autostart"] = bool(value)
+        self.save()
+
+    @property
+    def log_file(self) -> str | None:
+        # Optional path to a plain-text EVENT LOG aGiTrack appends notable events to (an AI
+        # change detected, a commit made, a merge integrated, an update available). Works in
+        # every mode — interactive proxy AND headless background. Unset (None) ⇒ no event log.
+        # A relative path is resolved against the repo root (see agitrack.events.resolve_log_path).
+        value = self._raw("log_file")
+        return str(value) if isinstance(value, str) and value.strip() else None
+
+    @log_file.setter
+    def log_file(self, value: str | None) -> None:
+        self.data["log_file"] = value or None
         self.save()
 
     @property

@@ -1133,6 +1133,32 @@ def test_finalize_worktree_on_exit_deletes_merged_when_user_chooses(tmp_path):
     assert runner.worktree is None
 
 
+def test_finalize_worktree_on_exit_announces_deletion(tmp_path):
+    # A large worktree can take a while to remove, so aGiTrack must show a "Deleting
+    # worktree …" notice before the (blocking) removal rather than looking frozen.
+    main = _init_repo(tmp_path)
+    base = main.current_branch()
+    info, work = _make_session(main, "session-1", base)
+    _commit(work, "a.txt", "x\n", "<aGiTrack> work")
+
+    runner = _integration_runner(main, work, base, "session-1")
+    runner.worktree = info
+    runner.child_pid = None
+    runner.master_fd = None
+    runner.screen = object()
+    runner._exit_delete_worktrees = True
+    runner._exit_aborted = False
+    runner._offer_copy_unstaged_to_base = lambda **k: None
+    messages: list[str] = []
+    runner._set_message = lambda message, **kw: messages.append(message)
+
+    runner._integrate_session_on_exit()
+    runner._finalize_worktree_on_exit()
+
+    assert not info.path.exists()  # actually removed
+    assert any("Deleting worktree 'session-1'" in m for m in messages)
+
+
 def test_finalize_worktree_on_exit_delete_choice_keeps_unintegrated(tmp_path):
     # Even when the user chooses delete, an unintegrated session keeps its worktree so no
     # un-merged work is discarded.
@@ -1994,11 +2020,14 @@ def test_present_pending_noworktree_cleanup_deletes_on_confirm(tmp_path):
     runner._debug = lambda *a, **k: None
     runner._pending_noworktree_cleanup = ["sess-a", "sess-b"]
     runner._select_popup = lambda *a, **k: "Delete them"
+    messages: list[str] = []
+    runner._set_message = lambda message, **k: messages.append(message)
 
     runner._present_pending_noworktree_cleanup()
 
     assert not a.path.exists() and not b.path.exists()  # removed
     assert runner._pending_noworktree_cleanup == []
+    assert any("Deleting 2 leftover worktree" in m for m in messages)  # progress shown up front
 
 
 def test_present_pending_noworktree_cleanup_keeps_on_decline(tmp_path):
