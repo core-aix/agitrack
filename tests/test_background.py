@@ -13,7 +13,12 @@ from agitrack.commits import ManualCommitTracker
 from agitrack.config import AgitrackState
 from agitrack.config.settings import GlobalConfig
 from agitrack.git import GitRepo
-from agitrack.proxy.background import BackgroundRunner
+from agitrack.proxy.background import (
+    BackgroundRunner,
+    background_handshake_path,
+    background_status,
+    stop_background,
+)
 from agitrack.transcripts.types import ExportedSession, SessionTurn
 
 
@@ -160,6 +165,63 @@ def test_background_follows_latest_session_and_counts_once(tmp_path):
     assert runner._manual.pending_count() == 2
 
 
+# --- regression: a completed turn with changes is always committed ----------
+
+
+def test_auto_pipeline_commits_completed_turn_on_dirty_tree(tmp_path):
+    # Regression guard for "files left uncommitted": a completed agent turn whose edits sit in
+    # the working tree MUST be committed by the auto (no-worktree, direct-commit) pipeline — HEAD
+    # advances and the tree goes clean, never silently left for the user to commit by hand.
+    import types
+
+    from agitrack.proxy.commit_engine import CommitEngine
+    from agitrack.proxy.session import Session
+
+    repo = _init_repo(tmp_path)
+    state = AgitrackState(tmp_path, default_backend="claude")
+    (tmp_path / "a.txt").write_text("one\nagent edit\n", encoding="utf-8")  # agent's uncommitted work
+
+    session = Session.bare()
+    session.state = state
+    session.backend = types.SimpleNamespace(name="claude")
+    exported = ExportedSession("s1", "m", None, [_turn("u1", "m1", "do it", "done", 7)])
+    session.agent_parse_result = ("s1", exported, None, state)
+    session.agent_parse_thread = None
+
+    engine = CommitEngine(repo, state)
+    head_before = repo.rev_parse("HEAD")
+
+    def commit_fn(*, turns, backend, backend_session_id, model, quiet, prompt_untracked=True):
+        def stage_untracked_fn(r, s):
+            r.stage_paths(r.untracked_entries())
+
+        return engine.commit_turns(
+            turns=turns,
+            backend=backend,
+            backend_session_id=backend_session_id,
+            model=model,
+            stage_untracked_fn=stage_untracked_fn,
+        )
+
+    committed, _ = engine.finish_parse_if_ready(
+        session=session,
+        quiet=True,
+        prompt_untracked=True,
+        require_complete=True,
+        awaited_followups=[],
+        agent_is_active_fn=lambda: False,
+        debug_fn=lambda *a, **k: None,
+        note_session_change_fn=lambda _s: None,
+        mirror_fn=lambda _s: None,
+        commit_fn=commit_fn,
+    )
+
+    assert committed is True
+    assert repo.rev_parse("HEAD") != head_before  # a real commit was made, not left uncommitted
+    assert "# aGiTrack Metadata" in repo.commit_message("HEAD")
+    assert _git(repo, "status", "--short").strip() == ""  # working tree is now clean
+
+
 # --- ManualCommitTracker direct --------------------------------------------
 
 
@@ -178,6 +240,55 @@ def test_manual_tracker_gate_and_record(tmp_path):
     assert repo.rev_parse("HEAD") == head  # HEAD frozen
     assert repo.ref_sha(tracker.ref()) is not None
     assert tracker.pending_count() == 1
+
+
+# --- stop / status handshake ------------------------------------------------
+
+
+def test_background_status_reports_none_when_not_running(tmp_path, capsys):
+    repo = _init_repo(tmp_path)
+    assert background_status(repo) == 0
+    assert "No aGiTrack background tracker" in capsys.readouterr().out
+
+
+def test_background_status_reports_running_for_live_pid(tmp_path, capsys):
+    import json
+    import os
+
+    repo = _init_repo(tmp_path)
+    path = background_handshake_path(repo)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"pid": os.getpid(), "mode": "auto commits"}), encoding="utf-8")
+
+    assert background_status(repo) == 0
+    out = capsys.readouterr().out
+    assert "is running" in out and "auto commits" in out
+
+
+def test_background_stop_cleans_stale_handshake(tmp_path, capsys):
+    import json
+
+    repo = _init_repo(tmp_path)
+    path = background_handshake_path(repo)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # A dead pid (very high, not alive) ⇒ treated as not running and the stale file is removed.
+    path.write_text(json.dumps({"pid": 2_000_000_000, "mode": "auto commits"}), encoding="utf-8")
+
+    assert stop_background(repo) == 0
+    assert "No aGiTrack background tracker" in capsys.readouterr().out
+    assert not path.exists()  # stale handshake cleaned up
+
+
+def test_background_run_writes_and_removes_handshake(tmp_path, monkeypatch):
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    monkeypatch.setattr("agitrack.backends.setup.backend_installed", lambda name: True)
+    # Stop immediately after the first loop iteration so run() returns.
+    runner._stop.set()
+    monkeypatch.setattr(runner, "_install_signal_handlers", lambda: None)
+
+    assert runner.run() == 0
+    # After a clean run the handshake is removed again.
+    assert not background_handshake_path(repo).exists()
 
 
 def test_manual_tracker_reconcile_covers_external_commit(tmp_path):

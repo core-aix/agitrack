@@ -393,6 +393,56 @@ def test_already_running_refused_before_privacy_prompt(monkeypatch, capsys):
     assert events == ["refused:4321"]  # refused, and the privacy prompt never ran
 
 
+def test_background_refused_when_another_instance_holds_the_repo(monkeypatch):
+    # Only ONE aGiTrack per repo: a background tracker must be refused (never launched) when the
+    # single-writer repo lock is already held — by ANY mode — so two never race over commits.
+    import pathlib
+    from types import SimpleNamespace
+
+    launched: list = []
+    monkeypatch.setattr(cli, "_discover_or_init", lambda p: SimpleNamespace(repo=pathlib.Path("/tmp/x")))
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
+    monkeypatch.setattr(cli, "BackgroundRunner", lambda *a, **k: launched.append(k))
+
+    class _HeldLock:
+        def __init__(self, _path):
+            pass
+
+        def acquire(self):
+            return False  # another instance already holds the repo
+
+        def owner_pid(self):
+            return 999
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(cli, "RepoLock", _HeldLock)
+    monkeypatch.setattr(cli, "already_running_message", lambda pid: "running")
+
+    class Config:
+        check_for_updates = False
+        background = False
+
+        def has_default_backend(self):
+            return True
+
+        default_backend = "claude"
+
+        def load_repo_overlay(self, _root):
+            pass
+
+        def seed_defaults(self):
+            return False
+
+    monkeypatch.setattr(cli, "GlobalConfig", lambda: Config())
+
+    rc = cli.main(["--background", "--backend", "claude"])
+
+    assert rc == 1
+    assert launched == []  # the tracker was never constructed
+
+
 def test_no_backend_configured_non_interactive_errors(monkeypatch, capsys):
     # No --backend and no configured default, run non-interactively: aGiTrack must
     # fail clearly rather than silently fall back to a hardcoded backend (the old
@@ -508,12 +558,12 @@ def test_manual_commits_off_by_default(monkeypatch):
 # --- --background / -b -------------------------------------------------------
 
 
-def test_background_flag_forces_no_worktree_and_manual_default(monkeypatch):
-    # --background always runs without a worktree and defaults to manual (user-triggered) commits.
+def test_background_flag_forces_no_worktree_and_auto_default(monkeypatch):
+    # --background always runs without a worktree and defaults to AUTO commits (like the TUI).
     captured = _stub_launch(monkeypatch, use_worktrees=True)
     monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
     cli.main(["--background"])
-    assert captured["manual_commits"] is True
+    assert captured["manual_commits"] is False  # auto by default
     # BackgroundRunner takes no use_worktrees kwarg (it is always no-worktree); the fact that it
     # was constructed (captured is non-empty) confirms the background branch ran.
     assert "use_worktrees" not in captured
@@ -523,14 +573,35 @@ def test_background_short_flag(monkeypatch):
     captured = _stub_launch(monkeypatch)
     monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
     cli.main(["-b"])
-    assert captured["manual_commits"] is True
+    assert captured["manual_commits"] is False  # auto by default
 
 
-def test_background_auto_commit_switches_to_auto(monkeypatch):
+def test_background_manual_commits_opts_into_manual(monkeypatch):
     captured = _stub_launch(monkeypatch)
     monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
-    cli.main(["-b", "--auto-commit"])
-    assert captured["manual_commits"] is False  # --auto-commit opts into automatic commits
+    cli.main(["-b", "-m"])
+    assert captured["manual_commits"] is True  # -m opts into user-triggered commits
+
+
+def test_background_stop_and_status_do_not_launch(monkeypatch):
+    # `-b stop` / `-b status` are handled early and never construct a runner.
+    calls: dict = {}
+    monkeypatch.setattr(cli, "GitRepo", type("R", (), {"discover": staticmethod(lambda p: object())}))
+
+    def _stop(repo):
+        calls["stop"] = True
+        return 0
+
+    def _status(repo):
+        calls["status"] = True
+        return 0
+
+    monkeypatch.setattr("agitrack.proxy.background.stop_background", _stop)
+    monkeypatch.setattr("agitrack.proxy.background.background_status", _status)
+
+    assert cli.main(["-b", "stop"]) == 0
+    assert cli.main(["-b", "status"]) == 0
+    assert calls == {"stop": True, "status": True}
 
 
 def test_background_off_by_default(monkeypatch):
