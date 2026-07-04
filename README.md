@@ -127,6 +127,22 @@ agitrack
 
 By default, aGiTrack launches the AI agent's normal interface (OpenCode or Claude) and sits quietly between you and it — you use the agent exactly as you would on its own. At the bottom of the screen, aGiTrack adds a status line showing: the current session and the branch its work goes into (in **bold** when that branch isn't the one you have checked out), which agent is running, whether commit summaries are on, and which repository you're working in. Press `Ctrl-G` at any time to open aGiTrack's own menu (you can change this key with `menu_key` in `~/.agitrack/config.json` — see Configuration).
 
+### Modes at a glance
+
+aGiTrack has two independent choices — **how you run it** (interactive vs background) and **when commits happen** (auto vs manual) — that combine into four modes. Every mode records the same per-turn tracking (interaction trace + token metadata); they differ only in *who drives the agent*, *who triggers the commit*, and *whether an isolated worktree is used*.
+
+| | **Auto commit** (default) | **Manual commit** (`-m` / `--manual-commits`) |
+| --- | --- | --- |
+| **Interactive** (default — aGiTrack runs the agent's TUI) | **`agitrack`** — aGiTrack proxies the agent and **commits each completed turn** for you.<br>**Worktree** by default (isolated checkout, auto-merged into the target branch); opt out with `--no-worktree`. | **`agitrack -m`** — aGiTrack proxies the agent; **you** trigger every commit and pending turns fold into it.<br>**No worktree** (always) — edits the checked-out branch directly. |
+| **Background** (`-b` / `--background` — headless, no TUI; you drive the agent from any UI) | **`agitrack -b`** — aGiTrack tracks the session you drive elsewhere and **commits each completed turn** itself.<br>**No worktree** (always). | **`agitrack -b -m`** — aGiTrack tracks the session you drive; **you** trigger every commit and pending turns fold into it.<br>**No worktree** (always). |
+
+- **Interactive vs Background.** Interactive (the default) launches the agent's native interface with aGiTrack in between. Background (`-b`) runs *without a TUI* so you can drive the same agent from any front-end — its own CLI, an IDE extension, a chat window — while aGiTrack watches the transcript and tracks it. See [Background mode](#background-mode---background---b).
+- **Auto vs Manual.** Auto (the default, both interactive and background) turns each finished agent turn into a commit automatically. Manual (`-m`) leaves commits entirely up to you: turns are recorded on a hidden side ref and folded into *your* commit when you make it. See [Manual commits](#manual-commits---manual-commits---m).
+- **Worktree only applies to the interactive + auto default.** That one mode runs in an isolated [git worktree](#worktrees-and-branches) and aGiTrack integrates (merges) its commits into the target branch for you. The **other three modes always run without a worktree** (`--no-worktree`): manual and background modes are defined to operate on the branch you have checked out, editing your working directory directly. When the **agent commits on its own** in any no-worktree mode, a `prepare-commit-msg` hook folds the tracking straight into that commit (a "cover" commit is only the fallback). You can also force no-worktree on the interactive+auto default with `--no-worktree`.
+- **One instance per repo.** Whichever mode you pick, only **one** aGiTrack may run per repository (interactive *or* background — never two), so they never fight over commits. A second start is refused; use `agitrack -b status` / `agitrack -b stop` to inspect or stop a background tracker.
+
+Each mode is described in full below (`--no-worktree`, `--manual-commits`, `--background`), and every choice is also settable in config (`use_worktrees`, `manual_commits`, `background`) so it becomes your default. Switching a repo between any of these modes between runs is supported — aGiTrack cleans up or ignores the previous mode's state (hooks, side refs, background handshake) on the next launch.
+
 Run against another repository:
 
 ```bash
