@@ -152,6 +152,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--verbose", action="store_true", help="show aGiTrack diagnostic messages")
     parser.add_argument("--mode", choices=["proxy", "json"], default="proxy", help="interactive mode")
     parser.add_argument(
+        "--status",
+        "-s",
+        action="store_true",
+        help="report whether aGiTrack is running for this repo and in which mode (interactive vs "
+        "background, auto vs manual commit, worktree vs no-worktree), then exit.",
+    )
+    parser.add_argument(
         "--prompt",
         action="append",
         dest="prompts",
@@ -352,7 +359,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         # Internal: entry point of the persistent auto-track pre-commit hook. Records any pending
         # AI turns and renders the fold trailer so the commit being made carries the trace, and
-        # (when background_autostart is set) starts the background daemon. Best-effort, never fails
+        # (unless autotrack_hook=off) auto-starts the background daemon. Best-effort, never fails
         # a commit. Not meant for manual use.
         help=argparse.SUPPRESS,
     )
@@ -469,6 +476,18 @@ def main(argv: list[str] | None = None) -> int:
 
         return stop_background(bg_repo) if args.background == "stop" else background_status(bg_repo)
 
+    if args.status:
+        # `agitrack --status` / `-s`: report the running mode for this repo. Read-only — no privacy
+        # prompt, no repo init, no update check.
+        try:
+            status_repo = GitRepo.discover(Path(args.repo).expanduser())
+        except (GitError, OSError) as error:
+            print(error)
+            return 1
+        from agitrack.proxy.background import repo_status
+
+        return repo_status(status_repo)
+
     if args.remove_hooks:
         # Let the user fully opt out of aGiTrack's commit-time tracking by removing every hook it
         # installed (restoring any chained originals). Read-only w.r.t. the agent — no privacy
@@ -481,16 +500,24 @@ def main(argv: list[str] | None = None) -> int:
         from agitrack.git import hooks as git_hooks
 
         removed = git_hooks.remove_all_installed_hooks(rh_repo.hooks_dir())
+        # Persist the opt-out so a later aGiTrack run doesn't silently reinstall the auto-track hook.
+        try:
+            rh_config = GlobalConfig()
+            rh_config.load_repo_overlay(rh_repo.repo)
+            rh_config.set("autotrack_hook", "off", scope="repo")
+        except Exception:
+            pass
         if removed:
             print(f"Removed aGiTrack git hook(s): {', '.join(removed)}. Any chained project hooks were restored.")
+            print("Auto-start on commit is now off for this repo. Re-enable it in Ctrl-G → settings or `agitrack -b`.")
         else:
-            print("No aGiTrack git hooks were installed in this repository.")
+            print("No aGiTrack git hooks were installed in this repository. Auto-start on commit is now off.")
         return 0
 
     if args.precommit_sync:
         # Internal: the persistent auto-track pre-commit hook. Fast, best-effort, never fails a
         # commit — records any pending AI turns and renders the fold trailer for the commit being
-        # made, then (when background_autostart is set) starts the background daemon.
+        # made, then (unless autotrack_hook=off) auto-starts the background daemon.
         try:
             sync_repo = GitRepo.discover(Path(args.repo).expanduser())
         except (GitError, OSError):
@@ -756,9 +783,6 @@ def main(argv: list[str] | None = None) -> int:
             # let the user test/replace it now — the only chance before the TUI takes over.
             if not _verify_menu_key(config, scripted=scripted):
                 return 1
-            # First interactive no-worktree run on this repo: offer the repo-scoped auto-start
-            # opt-in (auto-start background tracking on a commit made when aGiTrack isn't running).
-            _maybe_prompt_autostart_optin(config, scripted=scripted, use_worktrees=use_worktrees)
             if ProxyRunner is None:  # pragma: no cover - platform without proxy support
                 print("The interactive aGiTrack TUI is not available on this platform yet.")
                 return 1
@@ -1108,10 +1132,11 @@ def _run_gh_login() -> None:
 
 
 def _maybe_prompt_background_hook(config: GlobalConfig, *, scripted: bool) -> None:
-    """When starting `agitrack -b`, explain the PERSISTENT auto-track pre-commit hook and let the
-    user decide — once per repo — whether to keep it after the tracker exits. Never blocks
-    automation (no-TTY / scripted → keep silently, the default). Sets the repo-scoped
-    ``autotrack_hook`` (and ``background_autostart`` if they choose auto-start)."""
+    """When starting `agitrack -b`, explain the persistent auto-track pre-commit hook and let the
+    user decide — once per repo — whether to enable it. When enabled (the default), a `git commit`
+    made while aGiTrack isn't running folds the AI trace into that commit AND auto-starts the tracker
+    (in the same commit mode as the last run) for the turns that follow. Sets the repo-scoped
+    ``autotrack_hook`` ("auto"/"off"). Never blocks automation (no-TTY / scripted → default on)."""
     if scripted or not (sys.stdin.isatty() and sys.stdout.isatty()):
         return
     try:
@@ -1120,73 +1145,23 @@ def _maybe_prompt_background_hook(config: GlobalConfig, *, scripted: bool) -> No
     except Exception:
         return
     print(
-        "\naGiTrack installs a persistent git pre-commit hook in this repo. It stays AFTER this\n"
-        "background tracker exits (e.g. after a reboot), so a `git commit` you make when aGiTrack\n"
-        "isn't running still records its AI work — it folds the interaction trace into that commit\n"
-        "(only when the AI actually changed code; a purely human commit is untouched). It can also\n"
-        "auto-start the tracker for you on such a commit. How should it behave in this repository?\n"
-        "  [K] Keep the hook (recommended) — track AI commits even when aGiTrack isn't running\n"
-        "  [A] Keep it AND auto-start the tracker on such a commit\n"
-        "  [O] Off — don't install it; track only while this tracker is running\n"
+        "\naGiTrack installs a persistent git pre-commit hook in this repo. When you `git commit`\n"
+        "later and aGiTrack isn't running, it records that commit's AI work into the commit AND\n"
+        "auto-starts background tracking (in the same auto/manual commit mode as your last run) for\n"
+        "the turns that follow — so tracking survives you closing the terminal or a reboot. Your\n"
+        "commit stays your own; a purely human commit (no AI work) is left untouched. Disable it\n"
+        "anytime with `agitrack --remove-hooks`."
     )
     try:
-        answer = input("Choose [K/a/o] (default K): ").strip().lower()
+        answer = input("Enable this auto-start hook? [Y/n]: ").strip().lower()
     except (EOFError, KeyboardInterrupt):
         return
-    if answer.startswith("o"):
+    if answer.startswith("n"):
         config.set("autotrack_hook", "off", scope="repo")
-        print("aGiTrack: the pre-commit hook won't be installed; tracking runs only while `agitrack -b` is up.")
-    elif answer.startswith("a"):
-        config.set("autotrack_hook", "keep", scope="repo")
-        config.set("background_autostart", True, scope="repo")
-        print("aGiTrack: hook kept and auto-start enabled. Remove it anytime with `agitrack --remove-hooks`.")
+        print("aGiTrack: auto-start hook off — tracking runs only while `agitrack -b` is up.")
     else:
-        config.set("autotrack_hook", "keep", scope="repo")
-        print(
-            "aGiTrack: hook kept — it reminds you and folds AI work into commits. Remove it anytime with `agitrack --remove-hooks`."
-        )
-
-
-def _maybe_prompt_autostart_optin(config: GlobalConfig, *, scripted: bool, use_worktrees: bool) -> None:
-    """First interactive no-worktree run on a repo: offer the **repo-scoped** auto-start opt-in.
-
-    When enabled, a persistent pre-commit hook auto-starts the background tracker on a `git commit`
-    made while aGiTrack isn't running (e.g. after a reboot), so AI work keeps being tracked — the
-    triggering commit still folds in its trace either way. Asked once per repo (skipped once a
-    choice is recorded at any layer) and only where the hook is actually installed (no-worktree
-    modes); never blocks automation (no-TTY / scripted → no-op). Worktree-mode users can still
-    enable it from Ctrl-G → settings."""
-    if scripted or use_worktrees or not (sys.stdin.isatty() and sys.stdout.isatty()):
-        return
-    try:
-        # Repo-based opt-in: skip once THIS repo has a recorded choice. (The global config seeds a
-        # default for every key, so we key off the repo layer specifically, not "global".)
-        if config.source("background_autostart") == "repo":
-            return
-    except Exception:
-        return
-    try:
-        answer = (
-            input(
-                "aGiTrack can auto-start background tracking when you `git commit` and it isn't\n"
-                "running, so AI work is tracked even after a reboot (the commit still gets its trace\n"
-                "either way). Enable auto-start for THIS repository? [y/N] "
-            )
-            .strip()
-            .lower()
-        )
-    except (EOFError, KeyboardInterrupt):
-        return
-    enabled = answer.startswith("y")
-    try:
-        config.set("background_autostart", enabled, scope="repo")
-    except Exception:
-        return
-    print(
-        "aGiTrack: auto-start enabled for this repo (change it in Ctrl-G → settings)."
-        if enabled
-        else "aGiTrack: auto-start off; aGiTrack will just remind you on commit. Change it in Ctrl-G → settings."
-    )
+        config.set("autotrack_hook", "auto", scope="repo")
+        print("aGiTrack: auto-start hook enabled. Disable it anytime with `agitrack --remove-hooks`.")
 
 
 def _verify_menu_key(config: GlobalConfig, *, scripted: bool = False) -> bool:

@@ -1310,6 +1310,13 @@ class ProxyRunner:
             self.management_lock.release()
             return 1
         self.state.save()
+        # Record this interactive session's mode so `agitrack --status` can report it (cleared on
+        # teardown). The shared repo lock only carries a pid, not the mode.
+        from agitrack.proxy.background import write_proxy_status
+
+        write_proxy_status(
+            self.base_repo, commits="manual" if self._manual_commits else "auto", worktree=self._use_worktrees
+        )
         # Record this launch's CLI arguments so a later MSI self-update can re-launch with
         # the same flags (--repo / --backend / --no-worktree …) after replacing agitrack.exe.
         # Frozen-Windows only; a no-op everywhere else.
@@ -1432,6 +1439,12 @@ class ProxyRunner:
                 # is closed above), but on Windows the setter closes the ConPTY bridge socket
                 # (os.close can't close a socket fd there), so it isn't leaked.
                 self.master_fd = None
+            try:
+                from agitrack.proxy.background import clear_proxy_status
+
+                clear_proxy_status(self.base_repo)
+            except Exception:
+                pass
             self.management_lock.release()
             # The host terminal closed mid-work and the user chose "Reopen" in the
             # forced-exit dialog: launch a fresh window now that the lock is free so
@@ -1728,7 +1741,7 @@ class ProxyRunner:
         # worktree-mode only; this path is no-worktree/_latent_tracking).
         try:
             if not self.base_repo.core_hooks_path():
-                if getattr(self.global_config, "autotrack_hook", "keep") == "off":
+                if getattr(self.global_config, "autotrack_hook", "auto") == "off":
                     git_hooks.remove_autotrack_precommit_hook(self.base_repo.hooks_dir(), debug=self._debug)
                 else:
                     git_hooks.install_autotrack_precommit_hook(
@@ -8627,13 +8640,8 @@ class ProxyRunner:
                 "restart": True,
             },
             {
-                "key": "background_autostart",
-                "label": "Auto-start background tracking on commit when aGiTrack isn't running (best as a repo setting)",
-                "kind": "bool",
-            },
-            {
                 "key": "autotrack_hook",
-                "label": "Persistent pre-commit hook that tracks AI commits when aGiTrack isn't running (keep/off; agitrack --remove-hooks also removes it)",
+                "label": "Auto-start tracking on commit when aGiTrack isn't running (auto/off; `agitrack --remove-hooks` also turns it off)",
                 "kind": "text",
             },
             # --- agent behavior ---

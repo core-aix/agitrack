@@ -177,8 +177,7 @@ class GlobalConfig:
             "use_worktrees": True,
             "manual_commits": False,
             "background": False,
-            "background_autostart": False,
-            "autotrack_hook": "keep",
+            "autotrack_hook": "auto",
             "log_file": None,
             "allowed_edit_paths": [],
             "backend_command": "",
@@ -359,31 +358,17 @@ class GlobalConfig:
 
     @property
     def autotrack_hook(self) -> str:
-        # Whether the PERSISTENT auto-track pre-commit hook is installed (repo-scoped). "keep"
-        # (default): the hook stays after the background tracker exits, so a commit made when
-        # aGiTrack isn't running still gets its AI work tracked (remove it with
-        # `agitrack --remove-hooks`). "off": don't install it; track only while the tracker runs.
+        # The persistent auto-track pre-commit hook (repo-scoped). "auto" (default): install it — on
+        # a `git commit` made when aGiTrack isn't running it folds the AI trace into that commit AND
+        # auto-starts the background tracker (in the same commit mode as the last run) for the turns
+        # that follow. "off": don't install it; track only while aGiTrack is actually running.
+        # Disable at any time with `agitrack --remove-hooks` (which sets this to "off").
         value = self._raw("autotrack_hook")
-        return "off" if str(value).lower() == "off" else "keep"
+        return "off" if str(value).lower() == "off" else "auto"
 
     @autotrack_hook.setter
     def autotrack_hook(self, value: str) -> None:
-        self.data["autotrack_hook"] = "off" if str(value).lower() == "off" else "keep"
-        self.save()
-
-    @property
-    def background_autostart(self) -> bool:
-        # Repo-scoped opt-in (off by default): when set, a persistent pre-commit hook auto-starts
-        # the background tracker on `git commit` if it isn't already running — so AI work is tracked
-        # even after a reboot without remembering to run `agitrack -b`. The triggering commit still
-        # folds in the pending trace/metadata (the hook records + renders synchronously first). When
-        # off, the hook only REMINDS (and still folds the pending work into the current commit).
-        value = self._raw("background_autostart")
-        return False if value is None else bool(value)
-
-    @background_autostart.setter
-    def background_autostart(self, value: bool) -> None:
-        self.data["background_autostart"] = bool(value)
+        self.data["autotrack_hook"] = "off" if str(value).lower() == "off" else "auto"
         self.save()
 
     @property
