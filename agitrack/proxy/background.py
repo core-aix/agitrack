@@ -24,6 +24,8 @@ from __future__ import annotations
 import json
 import os
 import signal
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -33,8 +35,10 @@ from agitrack.backends.proxy_agents import make_proxy_agent
 from agitrack.commits import ManualCommitTracker
 from agitrack.commits.message import build_manual_squash_trailer
 from agitrack.config import AgitrackState, GlobalConfig
+from agitrack.events import EventLog, resolve_log_path
 from agitrack.git import GitRepo
-from agitrack.proc import pid_alive, terminate_pid
+from agitrack.git import hooks as git_hooks
+from agitrack.proc import detach_kwargs, pid_alive, terminate_pid
 from agitrack.proxy.commit_engine import CommitEngine
 from agitrack.proxy.session import Session
 
@@ -77,6 +81,11 @@ def background_status(repo: GitRepo) -> int:
         info = _read_handshake(repo) or {}
         mode = info.get("mode", "?")
         print(f"aGiTrack background tracker is running (PID {pid}, {mode}).")
+    from agitrack.update.marker import update_reminder_line
+
+    reminder = update_reminder_line(repo.repo)
+    if reminder:
+        print(reminder)
     return 0
 
 
@@ -99,6 +108,162 @@ def stop_background(repo: GitRepo) -> int:
     return 0
 
 
+def background_log_path(repo: GitRepo) -> Path:
+    """Where the detached daemon's stdout/stderr go (startup errors and per-turn notices land
+    here — the daemon has no terminal). Mirrors the dashboard's ``dashboard.log``."""
+    return repo.repo / ".agitrack" / "background.log"
+
+
+def _open_log(repo: GitRepo) -> Any:
+    try:
+        path = background_log_path(repo)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path.open("ab")
+    except OSError:
+        return subprocess.DEVNULL
+
+
+def wait_for_handshake(repo: GitRepo, *, pid: int, timeout: float) -> dict | None:
+    """Poll for the handshake the daemon child with ``pid`` writes once it starts tracking.
+
+    Correlating on the child's pid means a stale record from an earlier daemon is never
+    mistaken for this launch. Returns the record, or None if the deadline passes."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        info = _read_handshake(repo)
+        if info is not None and info.get("pid") == pid:
+            return info
+        if not pid_alive(pid):  # child died during startup (e.g. lock lost, backend missing)
+            return None
+        time.sleep(0.05)
+    return None
+
+
+def spawn_background_daemon(repo: GitRepo, *, extra_args: list[str]) -> subprocess.Popen[bytes]:
+    """Launch the detached background-tracker child and return its Popen handle.
+
+    The child re-execs ``agitrack --background --background-serve`` in its own session
+    (``detach_kwargs``) so it survives the launcher returning and the terminal closing, and
+    is not hit by Ctrl-C in the launcher's terminal. Unlike the dashboard daemon there is NO
+    owner-pid watchdog — a tracker must outlive whatever launched it (stop it with
+    ``agitrack -b stop``). stdout/stderr go to a log file so a startup failure is recoverable."""
+    cmd = [
+        sys.executable,
+        "-m",
+        "agitrack",
+        "--repo",
+        str(repo.repo),
+        "--background",
+        "--background-serve",
+        "--skip-privacy-ack",  # the interactive launcher already acknowledged it
+        *extra_args,
+    ]
+    log = _open_log(repo)
+    try:
+        return subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=log,
+            cwd=str(repo.repo),
+            env=dict(os.environ),
+            **detach_kwargs(),
+        )
+    finally:
+        if log is not subprocess.DEVNULL:
+            log.close()  # the child holds its own dup of the fd
+
+
+def start_background_daemon(repo: GitRepo, *, extra_args: list[str], timeout: float = 8.0) -> int:
+    """`agitrack -b`: start the background tracker as a detached daemon and return to the shell.
+
+    Reuses a daemon already running for this repo rather than spawning a duplicate. The daemon
+    keeps running after the terminal closes; stop it with ``agitrack -b stop``."""
+    running = _live_background_pid(repo)
+    if running is not None:
+        info = _read_handshake(repo) or {}
+        print(f"aGiTrack background tracker is already running on this repo (PID {running}, {info.get('mode', '?')}).")
+        return 0
+    proc = spawn_background_daemon(repo, extra_args=extra_args)
+    record = wait_for_handshake(repo, pid=proc.pid, timeout=timeout)
+    if record is None:
+        print(f"The aGiTrack background tracker did not start. See {background_log_path(repo)} for details.")
+        return 1
+    print(
+        f"aGiTrack background tracker daemon live (PID {record.get('pid')}, {record.get('mode', '?')}, no worktree).\n"
+        "Drive the agent from any UI; it keeps tracking in the background. Stop it with `agitrack -b stop`."
+    )
+    return 0
+
+
+def precommit_sync(repo: GitRepo, *, backend_command: list[str] | None = None) -> int:
+    """Entry point of the persistent auto-track ``pre-commit`` hook. Best-effort; ALWAYS returns 0
+    so it can never fail a commit.
+
+    When aGiTrack is not already tracking this repo (its single-writer lock is free) and the AI has
+    made changes since the last commit, this records the pending turns and renders the fold trailer
+    so the interaction trace + token metadata land in the commit now being made — then, when
+    ``background_autostart`` is set, starts the background daemon for future commits (else it prints
+    a one-line reminder). A purely human commit (no pending AI turns) is left completely untouched:
+    no trailer, no reminder, no daemon."""
+    from agitrack.backends.setup import backend_installed
+    from agitrack.git import RepoLock
+
+    # Remind about an available update on EVERY commit (the marker is written by the background
+    # tracker / interactive proxy; installing can't be automated). Visible in the git commit output.
+    try:
+        from agitrack.update.marker import update_reminder_line
+
+        reminder = update_reminder_line(repo.repo)
+        if reminder:
+            print(f"aGiTrack: {reminder}", file=sys.stderr)
+    except Exception:
+        pass
+    try:
+        lock = RepoLock(repo.repo / ".agitrack" / "lock")
+        if not lock.acquire():
+            return 0  # a live tracker (TUI or daemon) already folds this commit — nothing to do
+    except Exception:
+        return 0
+    config = GlobalConfig()
+    config.load_repo_overlay(repo.repo)
+    manual_mode = config.manual_commits
+    synced = False
+    try:
+        # manual_commits=True gives fold-into-the-user's-commit semantics: record the pending AI
+        # turns latently and let THIS commit's prepare-commit-msg hook fold them in (no auto-commit).
+        runner = BackgroundRunner(
+            repo, manual_commits=True, backend_command=backend_command, _global_config=config, _lock=lock
+        )
+        if not backend_installed(runner.state.backend):
+            return 0
+        runner.state.ensure_local_ignore()  # git-ignore .agitrack/ before writing the trailer/ref
+        runner._manual.setup()  # install the fold hooks (idempotent), reset a stale ref, render
+        runner._process_once()  # parse the repo's own backend session, record NEW pending turns
+        runner._manual.render_trailer()  # (re)render so the trailer carries the just-recorded turns
+        synced = bool(runner._manual.pending_bodies())  # is there AI work to fold into this commit?
+    except Exception:
+        return 0
+    finally:
+        lock.release()  # release BEFORE spawning the daemon, which takes its own lock
+    if not synced:
+        return 0  # no AI work since the last commit ⇒ no footprint, no nag
+    if config.background_autostart and _live_background_pid(repo) is None:
+        # Start the persistent tracker for FUTURE commits (fire-and-forget — the current commit is
+        # already handled by the trailer we just rendered). It runs in the user's configured mode.
+        spawn_background_daemon(repo, extra_args=["--manual-commits" if manual_mode else "--auto-commit"])
+        print(
+            "aGiTrack: auto-started background tracking for this repo (stop with `agitrack -b stop`).",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "aGiTrack: tracked this commit's AI work. Start `agitrack -b` for continuous background tracking.",
+            file=sys.stderr,
+        )
+    return 0
+
+
 class BackgroundRunner:
     POLL_SECONDS = 3.0
 
@@ -111,6 +276,7 @@ class BackgroundRunner:
         new_session: bool = False,
         manual_commits: bool = False,  # background defaults to AUTO commits (like the interactive TUI)
         backend_command: list[str] | None = None,
+        log_file: str | None = None,
         poll_seconds: float | None = None,
         _global_config: GlobalConfig | None = None,
         _state: AgitrackState | None = None,
@@ -121,9 +287,15 @@ class BackgroundRunner:
         self.verbose = verbose
         self._manual_commits = manual_commits
         self._backend_command = list(backend_command or [])
+        self.events = EventLog(resolve_log_path(log_file, repo.repo))
         self._poll_seconds = poll_seconds if poll_seconds is not None else self.POLL_SECONDS
         self._lock = _lock
         self._stop = threading.Event()
+        # Periodic self-update check (never auto-applies — installing a newer aGiTrack can't be
+        # fully automated). A found update is recorded to the shared marker so `-b status`, the
+        # commit hook, and the dashboard can remind the user.
+        self._last_update_check = 0.0
+        self._update_thread: threading.Thread | None = None
 
         self.global_config = _global_config if _global_config is not None else GlobalConfig()
         if getattr(self.global_config, "repo_path", "set") is None:
@@ -168,13 +340,21 @@ class BackgroundRunner:
         if not backend_installed(self.state.backend):
             self._print(f"backend '{self.state.backend}' is not installed.")
             return 1
+        self.state.ensure_local_ignore()  # git-ignore .agitrack/ before we write any state there
         self._write_handshake()
         self._manual.setup()
+        self._install_autotrack_hook()
         self._install_signal_handlers()
         mode = "manual (user-triggered) commits" if self._manual_commits else "auto commits"
+        self.events.emit(
+            "daemon-start",
+            backend=self.state.backend,
+            mode="manual" if self._manual_commits else "auto",
+            repo=self.repo.repo,
+        )
         self._print(
             f"background tracker running for {self.state.backend} in {self.repo.repo} "
-            f"({mode}, no worktree). Drive the agent from any UI; press Ctrl-C to stop."
+            f"({mode}, no worktree). Drive the agent from any UI; stop it with `agitrack -b stop`."
         )
         try:
             self._loop()
@@ -192,6 +372,7 @@ class BackgroundRunner:
             self._debug(f"final process failed: {error!r}")
         self._manual.teardown()
         self._remove_handshake()
+        self.events.emit("daemon-stop", backend=self.state.backend)
         self._print("background tracker stopped.")
 
     def _write_handshake(self) -> None:
@@ -220,6 +401,59 @@ class BackgroundRunner:
         except OSError:
             pass
 
+    def _maybe_check_update(self) -> None:
+        """Periodically check for a newer aGiTrack (throttled to update_check_seconds, on a worker
+        thread so the poll never blocks on the network). NEVER auto-applies — it records the result
+        to the shared marker so `-b status`, the commit hook, and the dashboard remind the user."""
+        if not getattr(self.global_config, "check_for_updates", True):
+            return
+        if self._update_thread is not None and self._update_thread.is_alive():
+            return
+        try:
+            interval = float(self.global_config.timings.get("update_check_seconds", 300.0))
+        except Exception:
+            interval = 300.0
+        now = time.monotonic()
+        if self._last_update_check and (now - self._last_update_check) < interval:
+            return
+        self._last_update_check = now
+        self._update_thread = threading.Thread(target=self._run_update_check, name="agit-bg-update", daemon=True)
+        self._update_thread.start()
+
+    def _run_update_check(self) -> None:
+        try:
+            from agitrack.update.marker import clear_update_marker, write_update_marker
+            from agitrack.update.updater import Updater
+
+            status = Updater().check()
+            if not status.ok:
+                return
+            if status.available:
+                write_update_marker(
+                    self.repo.repo, current=status.current, latest=status.latest, message=status.message
+                )
+                self.events.emit("update-available", current=status.current, latest=status.latest)
+                self._print(f"update available: {status.current} → {status.latest}. Run `agitrack` to update.")
+            else:
+                clear_update_marker(self.repo.repo)  # up to date now — drop a stale marker
+        except Exception as error:
+            self._debug(f"update check failed: {error!r}")
+
+    def _install_autotrack_hook(self) -> None:
+        """Install the PERSISTENT auto-track pre-commit hook so a commit made after this daemon
+        stops (e.g. a reboot) still records its AI work. Deliberately NOT removed on teardown — it
+        lives on so tracking survives aGiTrack not running (that hook re-installs the fold hooks and
+        re-starts the daemon on demand). No-op when a custom core.hooksPath makes install impossible."""
+        try:
+            if self.repo.core_hooks_path():
+                self._debug("autotrack hook skipped: core.hooksPath is set")
+                return
+            git_hooks.install_autotrack_precommit_hook(
+                self.repo.hooks_dir(), python_exe=sys.executable, repo_root=str(self.repo.repo), debug=self._debug
+            )
+        except Exception as error:
+            self._debug(f"autotrack hook install failed: {error!r}")
+
     def _install_signal_handlers(self) -> None:
         def handler(_signum, _frame):
             self._stop.set()
@@ -237,6 +471,7 @@ class BackgroundRunner:
                 self._manual.service()
                 if not self._manual_commits:
                     self._auto_fold_pending()
+                self._maybe_check_update()
             except Exception as error:  # never let one bad cycle kill the tracker
                 self._debug(f"cycle error: {error!r}")
             self._stop.wait(self._poll_seconds)
@@ -304,6 +539,7 @@ class BackgroundRunner:
         a real commit itself (see :meth:`_auto_fold_pending`)."""
 
         def on_commit_fn(sha, trace_text, _is_cover):
+            self.events.emit("ai-change-detected", backend=backend, session=backend_session_id, model=model)
             self._start_commit_summary(sha, trace_text)
 
         engine = CommitEngine(self.repo, self.state, debug_fn=self._debug)
@@ -358,6 +594,7 @@ class BackgroundRunner:
             self._manual.reset_stale_ref()
             self._manual.last_head = self.repo.rev_parse("HEAD")
             self._manual.render_trailer()
+            self.events.emit("commit", sha=self.repo.rev_parse("HEAD")[:12], type="agent", backend=self.state.backend)
             self._print("committed agent turn(s).")
         except Exception as error:
             self._debug(f"auto fold failed: {error!r}")

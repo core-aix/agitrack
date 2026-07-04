@@ -119,6 +119,67 @@ exit 0
 """
 
 
+# ---------------------------------------------------------------------------
+# Persistent auto-track pre-commit hook (feature: remind / auto-start on commit).
+#
+# Unlike the worktree guard and the manual-commit hooks (installed/removed per run), this hook
+# is PERSISTENT: it stays after aGiTrack exits so a `git commit` made when aGiTrack isn't running
+# still gets its AI work tracked. On commit it invokes ``agitrack --precommit-sync`` (with the
+# python + repo baked in at install time, so it needs nothing on PATH), which — only when the AI
+# actually made changes — records the pending turns and renders the fold trailer so the trace and
+# metadata land in THIS commit, and (when ``background_autostart`` is set) starts the background
+# tracker for future commits. Best-effort and non-blocking: it never fails a commit, adds no
+# footprint to a purely human commit, and is a no-op inside a linked worktree (aGiTrack drives
+# those itself). It chains any pre-existing pre-commit hook, and coexists with the worktree guard
+# via the same ``.agitrack-orig`` backup/restore the guard already uses.
+
+_AUTOTRACK_MARKER = "# AGITRACK-AUTOTRACK-PRECOMMIT"
+
+
+def _autotrack_precommit_script(python_exe: str, repo_root: str) -> str:
+    return f"""#!/bin/sh
+{_AUTOTRACK_MARKER}
+# Installed by aGiTrack. On `git commit`, if aGiTrack is not already tracking this repo, record
+# any pending AI turns and fold their interaction trace + token metadata into THIS commit (only
+# when the AI made changes since the last commit), and — if background_autostart is on — start the
+# background tracker for future commits. Best-effort and non-blocking: it never fails the commit.
+case "$(git rev-parse --absolute-git-dir 2>/dev/null)" in
+  */worktrees/*)
+    : ;;  # inside a session worktree -> aGiTrack already handles it
+  *)
+    "{python_exe}" -m agitrack --precommit-sync --repo "{repo_root}" >/dev/null 2>&1 || true ;;
+esac
+# Chain to any pre-commit hook aGiTrack moved aside (a project hook, or the worktree guard).
+_agitrack_orig="$0{_ORIG_SUFFIX}"
+if [ -x "$_agitrack_orig" ]; then
+  exec "$_agitrack_orig" "$@"
+fi
+exit 0
+"""
+
+
+def is_autotrack_hook(path: Path) -> bool:
+    """Whether *path* is the aGiTrack persistent auto-track pre-commit hook."""
+    return _hook_has_marker(path, _AUTOTRACK_MARKER)
+
+
+def install_autotrack_precommit_hook(
+    hooks_dir: Path, *, python_exe: str, repo_root: str, debug: Callable[[str], None] | None = None
+) -> bool:
+    """Install the persistent auto-track ``pre-commit`` hook (idempotent). ``python_exe`` and
+    ``repo_root`` are baked into the script so it runs aGiTrack without anything on PATH. A
+    pre-existing non-aGiTrack hook is chained via ``pre-commit.agitrack-orig``."""
+    return _install_hook(
+        hooks_dir, "pre-commit", _autotrack_precommit_script(python_exe, repo_root), _AUTOTRACK_MARKER, debug=debug
+    )
+
+
+def remove_autotrack_precommit_hook(hooks_dir: Path, *, debug: Callable[[str], None] | None = None) -> None:
+    """Remove the persistent auto-track pre-commit hook and restore any chained original. No-op
+    unless the current ``pre-commit`` is ours."""
+    _remove_hook(hooks_dir, "pre-commit", _AUTOTRACK_MARKER, debug=debug)
+
+
 def _make_executable(path: Path) -> None:
     try:
         path.chmod(path.stat().st_mode | 0o111)

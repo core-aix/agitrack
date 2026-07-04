@@ -291,6 +291,255 @@ def test_background_run_writes_and_removes_handshake(tmp_path, monkeypatch):
     assert not background_handshake_path(repo).exists()
 
 
+def test_start_background_daemon_reuses_running(tmp_path, capsys, monkeypatch):
+    import json
+    import os
+
+    from agitrack.proxy import background as bg
+
+    repo = _init_repo(tmp_path)
+    path = background_handshake_path(repo)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"pid": os.getpid(), "mode": "auto commits"}), encoding="utf-8")
+    spawned = []
+    monkeypatch.setattr(bg, "spawn_background_daemon", lambda *a, **k: spawned.append(k) or None)
+
+    assert bg.start_background_daemon(repo, extra_args=[]) == 0
+    assert "already running" in capsys.readouterr().out
+    assert spawned == []  # never spawns a duplicate
+
+
+def test_start_background_daemon_spawns_and_reports(tmp_path, capsys, monkeypatch):
+    import json
+
+    from agitrack.proxy import background as bg
+
+    repo = _init_repo(tmp_path)
+
+    class _FakeProc:
+        pid = 4242
+
+    def fake_spawn(r, *, extra_args):
+        # Simulate the detached child publishing its handshake right after launch.
+        p = background_handshake_path(r)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"pid": 4242, "mode": "auto commits"}), encoding="utf-8")
+        return _FakeProc()
+
+    monkeypatch.setattr(bg, "spawn_background_daemon", fake_spawn)
+    monkeypatch.setattr(bg, "pid_alive", lambda pid: True)
+
+    assert bg.start_background_daemon(repo, extra_args=["--auto-commit"]) == 0
+    out = capsys.readouterr().out
+    assert "daemon live" in out and "4242" in out and "agitrack -b stop" in out
+
+
+def test_start_background_daemon_reports_failure_when_child_dies(tmp_path, capsys, monkeypatch):
+    from agitrack.proxy import background as bg
+
+    repo = _init_repo(tmp_path)
+
+    class _FakeProc:
+        pid = 4243
+
+    # Child never writes a handshake and is not alive ⇒ wait_for_handshake gives up fast.
+    monkeypatch.setattr(bg, "spawn_background_daemon", lambda r, *, extra_args: _FakeProc())
+    monkeypatch.setattr(bg, "pid_alive", lambda pid: False)
+
+    assert bg.start_background_daemon(repo, extra_args=[]) == 1
+    assert "did not start" in capsys.readouterr().out
+
+
+def test_background_writes_event_log(tmp_path):
+    # The event log records notable events in background mode too: an AI change detected and
+    # the commit aGiTrack makes for it. Works with --log-file / config in every mode.
+    from agitrack.events import EventLog
+
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    log = tmp_path / "events.log"
+    runner.events = EventLog(log)
+    runner._manual.setup()
+    (tmp_path / "a.txt").write_text("one\nagent edit\n", encoding="utf-8")
+    backend.set_session("s1", [_turn("u1", "m1", "do x", "done", 20)])
+
+    assert runner._process_once() is True  # records the latent turn → ai-change-detected
+    runner._auto_fold_pending()  # folds into a real commit → commit event
+
+    text = log.read_text(encoding="utf-8")
+    assert "ai-change-detected" in text and "backend=claude" in text
+    assert "commit " in text and "type=agent" in text
+
+
+def _precommit_env(tmp_path, monkeypatch, backend: "FakeBackend", *, autostart: bool = False):
+    """Set up a repo + injected fake backend so precommit_sync (which builds its own
+    BackgroundRunner via make_proxy_agent) runs in-process against the fake."""
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(cfg))
+    (cfg / "config.json").write_text(
+        f'{{"default_backend": "claude", "background_autostart": {str(autostart).lower()}}}', encoding="utf-8"
+    )
+    monkeypatch.setattr("agitrack.proxy.background.make_proxy_agent", lambda name: backend)
+    monkeypatch.setattr("agitrack.backends.setup.backend_installed", lambda name: True)
+
+
+def test_precommit_sync_folds_ai_work_into_the_commit(tmp_path, monkeypatch):
+    # The persistent auto-track pre-commit hook path: with AI work pending and no tracker running,
+    # precommit_sync records the turn + renders the trailer + installs the fold hooks, so the
+    # user's in-progress commit carries the full trace/metadata (the user's requirement).
+    from agitrack.proxy.background import precommit_sync
+
+    repo = _init_repo(tmp_path)
+    backend = FakeBackend()
+    backend.set_session("s1", [_turn("u1", "m1", "do x", "done", 20)])
+    _precommit_env(tmp_path, monkeypatch, backend)
+    (tmp_path / "a.txt").write_text("one\nagent edit\n", encoding="utf-8")  # AI-made change in the tree
+
+    assert precommit_sync(repo) == 0
+    # The trailer was rendered for the prepare-commit-msg hook, and the fold hooks are installed.
+    assert "# aGiTrack Metadata" in (repo.repo / ".agitrack" / "manual-pending-trailer").read_text()
+
+    # The user now commits; the installed fold hook folds the trace into that ONE commit.
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "My change")
+    msg = _git(repo, "log", "-1", "--format=%B", "HEAD")
+    assert "My change" in msg and "# aGiTrack Metadata" in msg  # single, fully-tracked commit
+
+
+def test_precommit_sync_git_ignores_agitrack_dir(tmp_path, monkeypatch):
+    # aGiTrack's own state files (the trailer, ref, …) must never leak into a user commit: the
+    # sync must git-ignore .agitrack/ before writing any of them.
+    from agitrack.proxy.background import precommit_sync
+
+    repo = _init_repo(tmp_path)
+    backend = FakeBackend()
+    backend.set_session("s1", [_turn("u1", "m1", "do x", "done", 20)])
+    _precommit_env(tmp_path, monkeypatch, backend)
+    (tmp_path / "a.txt").write_text("one\nagent edit\n", encoding="utf-8")
+
+    assert precommit_sync(repo) == 0
+    exclude = (repo.repo / ".git" / "info" / "exclude").read_text()
+    assert ".agitrack/" in exclude.splitlines()
+    # A blanket `git add -A` must not stage any .agitrack file.
+    _git(repo, "add", "-A")
+    staged = _git(repo, "diff", "--cached", "--name-only")
+    assert not any(line.startswith(".agitrack/") for line in staged.splitlines())
+
+
+def test_precommit_sync_no_ai_work_is_a_noop(tmp_path, monkeypatch):
+    # No pending AI turns ⇒ precommit_sync leaves no footprint: no trailer content, no reminder.
+    from agitrack.proxy.background import precommit_sync
+
+    repo = _init_repo(tmp_path)
+    backend = FakeBackend()  # no session set ⇒ nothing to track
+    _precommit_env(tmp_path, monkeypatch, backend)
+    (tmp_path / "a.txt").write_text("one\njust me\n", encoding="utf-8")  # human-only edit
+
+    assert precommit_sync(repo) == 0
+    trailer_file = repo.repo / ".agitrack" / "manual-pending-trailer"
+    # Either no trailer file, or an empty one — a human commit is left untouched.
+    assert not trailer_file.exists() or trailer_file.read_text().strip() == ""
+
+
+def test_precommit_sync_defers_to_a_running_tracker(tmp_path, monkeypatch):
+    # When a live tracker holds the repo lock, precommit_sync does nothing (that tracker's own
+    # fold hooks handle this commit) — it must never double-track.
+    from agitrack.git import RepoLock
+    from agitrack.proxy.background import precommit_sync
+
+    repo = _init_repo(tmp_path)
+    backend = FakeBackend()
+    backend.set_session("s1", [_turn("u1", "m1", "do x", "done", 20)])
+    _precommit_env(tmp_path, monkeypatch, backend)
+    held = RepoLock(repo.repo / ".agitrack" / "lock")
+    assert held.acquire()  # simulate a running tracker
+    try:
+        (tmp_path / "a.txt").write_text("one\nagent edit\n", encoding="utf-8")
+        assert precommit_sync(repo) == 0
+        # Deferred: no latent ref recorded by the sync (the running tracker owns that).
+        assert (
+            repo.ref_sha("refs/agitrack/manual/" + AgitrackState(tmp_path, default_backend="claude").session_id) is None
+        )
+    finally:
+        held.release()
+
+
+def test_precommit_sync_autostart_spawns_daemon(tmp_path, monkeypatch):
+    # With background_autostart on, the sync also starts the background daemon for future commits.
+    from agitrack.proxy import background as bg
+
+    repo = _init_repo(tmp_path)
+    backend = FakeBackend()
+    backend.set_session("s1", [_turn("u1", "m1", "do x", "done", 20)])
+    _precommit_env(tmp_path, monkeypatch, backend, autostart=True)
+    spawned = []
+    monkeypatch.setattr(bg, "spawn_background_daemon", lambda repo, *, extra_args: spawned.append(extra_args))
+    (tmp_path / "a.txt").write_text("one\nagent edit\n", encoding="utf-8")
+
+    assert bg.precommit_sync(repo) == 0
+    assert spawned and "--auto-commit" in spawned[0]  # daemon started in the configured (auto) mode
+
+
+def test_daemon_update_check_writes_marker_and_clears(tmp_path, monkeypatch):
+    # The daemon's periodic check RECORDS an available update (it never auto-installs), and clears
+    # a stale marker once up to date. It also emits an event-log line.
+    from agitrack.events import EventLog
+    from agitrack.update.marker import read_update_marker
+
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    log = tmp_path / "events.log"
+    runner.events = EventLog(log)
+
+    class _Status:
+        ok = True
+        available = True
+        current = "0.1.16"
+        latest = "0.2.0"
+        message = "aGiTrack update available: 0.1.16 → 0.2.0."
+
+    monkeypatch.setattr(
+        "agitrack.update.updater.Updater", lambda *a, **k: type("U", (), {"check": lambda self: _Status()})()
+    )
+    runner._run_update_check()
+    info = read_update_marker(repo.repo)
+    assert info and info["latest"] == "0.2.0"
+    assert "update-available" in log.read_text() and "0.2.0" in log.read_text()
+
+    # Now up to date ⇒ the stale marker is cleared.
+    class _None(_Status):
+        available = False
+
+    monkeypatch.setattr(
+        "agitrack.update.updater.Updater", lambda *a, **k: type("U", (), {"check": lambda self: _None()})()
+    )
+    runner._run_update_check()
+    assert read_update_marker(repo.repo) is None
+
+
+def test_background_status_shows_available_update(tmp_path, capsys):
+    from agitrack.update.marker import write_update_marker
+
+    repo = _init_repo(tmp_path)
+    write_update_marker(repo.repo, current="0.1.16", latest="0.2.0", message="u")
+    assert background_status(repo) == 0
+    out = capsys.readouterr().out
+    assert "update available" in out.lower() and "0.2.0" in out
+
+
+def test_precommit_sync_reminds_about_update_on_every_commit(tmp_path, monkeypatch, capsys):
+    from agitrack.proxy.background import precommit_sync
+    from agitrack.update.marker import write_update_marker
+
+    repo = _init_repo(tmp_path)
+    backend = FakeBackend()  # no AI work — the reminder must still show
+    _precommit_env(tmp_path, monkeypatch, backend)
+    write_update_marker(repo.repo, current="0.1.16", latest="0.2.0", message="u")
+
+    assert precommit_sync(repo) == 0
+    err = capsys.readouterr().err
+    assert "update available" in err.lower() and "0.2.0" in err
+
+
 def test_manual_tracker_reconcile_covers_external_commit(tmp_path):
     repo = _init_repo(tmp_path)
     state = AgitrackState(tmp_path, default_backend="claude")

@@ -110,7 +110,24 @@ def shell_html(repo: GitRepo) -> str:
         _TEMPLATE.replace("__DATA__", payload)
         .replace("__REPO_NAME__", _escape(repo_name))
         .replace("__REPO__", _escape(repo_path))
+        .replace("__UPDATE_BANNER__", _update_banner_html(repo))
     )
+
+
+def _update_banner_html(repo: GitRepo) -> str:
+    """A small banner shown when an aGiTrack update is available (fed by the background tracker or
+    the interactive proxy via the shared marker). Empty when there is no update. Installing can't
+    be automated, so it only informs."""
+    try:
+        from agitrack.update.marker import read_update_marker
+
+        info = read_update_marker(repo.repo)
+    except Exception:
+        info = None
+    if not info:
+        return ""
+    text = f"aGiTrack update available: {info.get('current', '?')} → {info.get('latest', '?')} — run `agitrack` and choose ‘update’, or update via pip/pipx/brew."
+    return f'<div class="updatebanner">⬆ {_escape(text)}</div>'
 
 
 def dashboard_data(dash: Dashboard) -> dict:
@@ -580,6 +597,8 @@ body.booting .wrap>*:not(header):not(.booting){display:none}
 .neterror{position:fixed;top:0;left:0;right:0;z-index:40;background:#3a0f0f;color:#ffd5d5;
   border-bottom:2px solid var(--red);padding:10px 18px;font-size:13px;text-align:center;
   box-shadow:0 6px 20px rgba(0,0,0,.55);animation:rise .25s ease}
+.updatebanner{margin:0 0 14px;padding:9px 16px;border:1px solid var(--accent,#6be);border-radius:8px;
+  background:rgba(90,150,230,.12);color:var(--accent,#9cf);font-size:13px;text-align:center}
 @keyframes rise{from{transform:translateY(-100%)}to{transform:none}}
 
 header{padding:54px 0 22px}
@@ -821,6 +840,7 @@ footer{margin-top:46px;padding-top:22px;border-top:1px dashed var(--line);color:
 </head>
 <body>
 <div id="neterror" class="neterror" hidden>⚠ Can't reach the aGiTrack dashboard server — it may have been stopped (Ctrl-C in the terminal). Showing the last loaded data; retrying…</div>
+__UPDATE_BANNER__
 <div class="wrap">
   <header>
     <div class="brand"><span class="a">a</span>GiTrack<span class="sub">&nbsp;dashboard</span></div>
