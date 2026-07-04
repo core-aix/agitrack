@@ -324,6 +324,7 @@ def _stub_launch(monkeypatch, *, use_worktrees: bool = True, commit_guidance: bo
             return 0
 
     monkeypatch.setattr(cli, "ProxyRunner", Fake)
+    monkeypatch.setattr(cli, "BackgroundRunner", Fake)
     monkeypatch.setattr(cli, "AgitrackShell", Fake)
     # These tests exercise main()'s arg routing, not the pre-TUI startup checks; neutralize
     # them so the minimal stub Config/repo below need no extra surface — and so the checks
@@ -502,6 +503,41 @@ def test_manual_commits_off_by_default(monkeypatch):
     cli.main([])
     assert captured["manual_commits"] is False
     assert captured["use_worktrees"] is True  # worktrees stay on when manual mode is off
+
+
+# --- --background / -b -------------------------------------------------------
+
+
+def test_background_flag_forces_no_worktree_and_manual_default(monkeypatch):
+    # --background always runs without a worktree and defaults to manual (user-triggered) commits.
+    captured = _stub_launch(monkeypatch, use_worktrees=True)
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
+    cli.main(["--background"])
+    assert captured["manual_commits"] is True
+    # BackgroundRunner takes no use_worktrees kwarg (it is always no-worktree); the fact that it
+    # was constructed (captured is non-empty) confirms the background branch ran.
+    assert "use_worktrees" not in captured
+
+
+def test_background_short_flag(monkeypatch):
+    captured = _stub_launch(monkeypatch)
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
+    cli.main(["-b"])
+    assert captured["manual_commits"] is True
+
+
+def test_background_auto_commit_switches_to_auto(monkeypatch):
+    captured = _stub_launch(monkeypatch)
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
+    cli.main(["-b", "--auto-commit"])
+    assert captured["manual_commits"] is False  # --auto-commit opts into automatic commits
+
+
+def test_background_off_by_default(monkeypatch):
+    # No --background ⇒ the normal proxy path runs (captures use_worktrees), background inert.
+    captured = _stub_launch(monkeypatch, use_worktrees=True)
+    cli.main([])
+    assert captured["use_worktrees"] is True
 
 
 # --- --no-sandbox / --allowed-edit-paths ------------------------------------

@@ -584,8 +584,11 @@ class CommitEngine:
                 and getattr(last_turn, "interrupted", False)
                 and on_cancelled_fn(all_turns)
             ):
-                self.state.last_backend_message_id = (
-                    last_turn.assistant_message_id or last_turn.user_message_id or self.state.last_backend_message_id
+                self.state.set_backend_message_id(
+                    self.state.backend_session_id,
+                    last_turn.assistant_message_id
+                    or last_turn.user_message_id
+                    or self.state.backend_message_id_for(self.state.backend_session_id),
                 )
             debug_fn(
                 f"agent parse consumed without final response "
@@ -602,8 +605,10 @@ class CommitEngine:
             prompt_untracked=prompt_untracked,
         )
         if committed:
-            # Advance the watermark so the next parse cycle only exports new turns.
-            self.state.last_backend_message_id = complete_turns[-1].assistant_message_id
+            # Advance the watermark for THIS conversation so the next parse cycle only
+            # exports its new turns — keyed per conversation so a later switch back to a
+            # different conversation reads its own mark, never this one's.
+            self.state.set_backend_message_id(self.state.backend_session_id, complete_turns[-1].assistant_message_id)
             debug_fn(
                 f"agent commit created session_id={self.state.backend_session_id} "
                 f"assistant_id={self.state.last_backend_message_id}"
@@ -656,7 +661,6 @@ class CommitEngine:
                 return False
             session.agent_parse_active = True
 
-        last_message_id = session.state.last_backend_message_id
         owner = session
         backend = owner.backend
         repo = owner.repo
@@ -674,12 +678,26 @@ class CommitEngine:
                     # new conversation from inside the backend.
                     session_id = backend.latest_session_id(repo.repo) or state.backend_session_id
                 else:
-                    # No worktree isolation: stay pinned to the owned session.
-                    session_id = state.backend_session_id or discover_session_id_fn()
+                    # No worktree isolation: track the session aGiTrack spawned, and follow an
+                    # in-backend switch (Claude /resume or a new conversation started inside the
+                    # backend) too, so ALL modes support session switching. discover_session_id_fn
+                    # is snapshot-based: it only ever returns a session that appeared AFTER launch,
+                    # never a pre-existing unrelated one, so preferring it can't grab the wrong
+                    # session — and it returns None (⇒ fall back to the pinned id) when no switch
+                    # has happened or no reliable snapshot exists. The per-conversation watermark
+                    # (backend_message_id_for) keeps each conversation counted exactly once.
+                    session_id = discover_session_id_fn() or state.backend_session_id
+                # Read the watermark for the conversation actually being exported (not a
+                # single global one), so switching between conversations never replays or
+                # double-counts a conversation's already-committed turns.
+                last_message_id = state.backend_message_id_for(session_id)
                 exported = backend.export_session(repo.repo, session_id) if session_id else None
                 turn_count = len(exported.turns) if exported else 0
                 final_count = len([t for t in exported.turns if t.final_response]) if exported else 0
-                debug_fn(f"agent parse worker finished session_id={session_id} turns={turn_count} finals={final_count}")
+                debug_fn(
+                    f"agent parse worker finished session_id={session_id} turns={turn_count} "
+                    f"finals={final_count} watermark={last_message_id}"
+                )
                 result = (session_id, exported, last_message_id, state)
             finally:
                 with parse_lock:
@@ -689,7 +707,7 @@ class CommitEngine:
                     owner.agent_parse_active = False
 
         session.last_parse_start = time.monotonic()
-        debug_fn(f"agent parse started last_message_id={last_message_id}")
+        debug_fn("agent parse started")
         session.agent_parse_thread = threading.Thread(target=worker, name="agit-session-parse", daemon=True)
         session.agent_parse_thread.start()
         return True

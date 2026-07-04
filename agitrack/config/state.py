@@ -296,6 +296,45 @@ class AgitrackState:
         self.data["last_backend_message_id"] = value
         self.save()
 
+    # --- per-conversation commit watermark ---------------------------------
+    # The single ``last_backend_message_id`` above is the high-water assistant message
+    # id already committed. That is correct while a session stays on ONE backend
+    # conversation, but it double-counts when the user switches conversations inside the
+    # backend and later switches back: the watermark still holds the OTHER conversation's
+    # id, which isn't found in this one, so ``turns_after`` replays (and re-counts) every
+    # already-committed turn. Keying the watermark per conversation fixes that — each
+    # conversation remembers its own high-water mark, so switching is exact. The legacy
+    # single value is kept in sync for backward compatibility and continuity across upgrade.
+
+    def backend_message_id_for(self, session_id: str | None) -> str | None:
+        """The committed high-water assistant message id to use when parsing *session_id*.
+
+        The conversation aGiTrack is currently tracking (``backend_session_id``) keeps using
+        the primary single watermark, so behavior is IDENTICAL when no switch happens and
+        every existing reset of ``last_backend_message_id`` still governs it. Only a
+        DIFFERENT conversation — one the user switched to inside the backend — reads its own
+        remembered mark from the per-conversation map (``None`` if it was never committed, so
+        all of its turns are new). This is what makes switching between conversations exact:
+        switching back to a prior one no longer replays and re-counts its committed turns."""
+        if not session_id or session_id == self.backend_session_id:
+            return self.last_backend_message_id
+        value = (self.data.get("backend_message_ids") or {}).get(str(session_id))
+        return str(value) if value else None
+
+    def set_backend_message_id(self, session_id: str | None, message_id: str | None) -> None:
+        """Advance the committed watermark for *session_id*: the primary single value (so all
+        existing readers/resetters keep working) and the per-conversation map entry, together
+        in one save."""
+        self.data["last_backend_message_id"] = message_id
+        ids = dict(self.data.get("backend_message_ids") or {})
+        if session_id:
+            if message_id:
+                ids[str(session_id)] = message_id
+            else:
+                ids.pop(str(session_id), None)
+        self.data["backend_message_ids"] = ids
+        self.save()
+
     def declined_untracked(self) -> list[str]:
         return list(self.data.get("declined_untracked_files") or [])
 

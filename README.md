@@ -166,6 +166,22 @@ For a workflow that feels like plain git — you decide when to commit — use *
 
 When **you** commit — either through `Ctrl-G → git-commit` or an ordinary `git commit` on the command line / in your editor — aGiTrack folds all the pending latent turns' interaction traces and metadata into that **one** commit, alongside your own changes. So you get a single, self-contained commit that carries both your edits and the full agent tracking, whether or not the commit went through aGiTrack's menu (a managed `prepare-commit-msg` hook does the folding; it's removed when the session ends). The dashboard shows the pending turns live, marked `pending`, until you commit. Enable it for every run with `"manual_commits": true` in `~/.agitrack/config.json`.
 
+### Background mode (`--background` / `-b`)
+
+```bash
+agitrack --background              # manual (user-triggered) commits, the default
+agitrack --background --auto-commit  # aGiTrack commits each agent turn itself
+```
+
+**Background mode** runs aGiTrack **without its interactive TUI**, so you can drive the coding agent from *any* UI you like — its native CLI, an IDE extension (e.g. Claude's VS Code extension), a chat window — while aGiTrack watches that session's local transcript and does all the same tracking the TUI would: it records each completed turn, summarizes it, and installs the commit hooks that fold the interaction trace and token metadata into your commits. aGiTrack does **not** launch or proxy the agent here; it tracks whatever session you drive.
+
+Background mode **always runs without a worktree** (it implies `--no-worktree`), and supports either commit style:
+
+- **Manual** (the default): exactly like `--manual-commits` above — each turn is recorded on a hidden latent ref and folded into *your* commit by a `prepare-commit-msg` hook.
+- **Auto** (`--auto-commit`): aGiTrack commits each completed agent turn itself. If the agent makes its **own** commit, the same `prepare-commit-msg` hook folds the tracking directly into that commit (a metadata-only "cover" commit is only the fallback when the hook can't be installed).
+
+Enable it for every run with `"background": true` in `~/.agitrack/config.json`. Press `Ctrl-C` to stop the tracker; it records any final turn and removes its hooks on the way out.
+
 
 
 On the first run, aGiTrack asks which backend should be the default (listed alphabetically, with each backend's install status). If the chosen backend's CLI is not installed, aGiTrack shows install instructions and lets you install it or pick a different one. The choice is saved in `~/.agitrack/config.json` (`default_backend`) and reused for future runs. You can also switch backends mid-session with the `agent-backend` command below.
@@ -545,6 +561,10 @@ User-wide settings live in `~/.agitrack/config.json` (override the directory wit
 `use_worktrees` (default `true`) controls whether sessions run in isolated worktrees. Set it to `false` to run the agent directly on the current branch by default — the same behavior as `--no-worktree`, which applies it for a single run. See the `--no-worktree` notes under Usage for the trade-offs.
 
 `manual_commits` (default `false`) enables manual-commit mode by default — the same as starting aGiTrack with `--manual-commits` / `-m`, which applies it for a single run. Commits stay user-triggered and each agent turn is tracked on a hidden side ref until you commit. Manual-commit mode **always runs without a worktree** (it implies `--no-worktree`). See the `--manual-commits` notes under Usage.
+
+`background` (default `false`) runs aGiTrack in background (headless) mode by default — the same as starting aGiTrack with `--background` / `-b`, which applies it for a single run. In background mode aGiTrack tracks a session you drive from your own UI (no TUI), and **always runs without a worktree** (it implies `--no-worktree`), with either manual (default) or auto (`--auto-commit`) commits. Settable in both the global (`~/.agitrack/config.json`) and per-repo (`<repo>/.agitrack/config.json`) config files. See the `--background` notes under Usage.
+
+The global config file (`~/.agitrack/config.json`) is written out with **every setting at its default** the first time aGiTrack runs, so you can open it and see the full list of available options at a glance. Any value you set is preserved; new options are added with their defaults after an upgrade.
 
 `commit_guidance` (default `true`) controls whether aGiTrack appends a note to the coding agent's system prompt telling it that aGiTrack auto-commits, so it doesn't create its own git commits. Set it to `false` to disable that note by default — the same as starting aGiTrack with `--no-commit-guidance`, which applies it for a single run. Only affects backends that support appending to the system prompt (Claude), and never the summarizer.
 

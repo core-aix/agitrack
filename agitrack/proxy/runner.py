@@ -8464,6 +8464,12 @@ class ProxyRunner:
                 "kind": "bool",
                 "restart": True,
             },
+            {
+                "key": "background",
+                "label": "Background mode: track a user-driven backend session with no TUI (implies no worktree; launch with -b)",
+                "kind": "bool",
+                "restart": True,
+            },
             # --- agent behavior ---
             {
                 "key": "commit_guidance",
@@ -9228,6 +9234,17 @@ class ProxyRunner:
             # trace passed here is exactly the one that landed in the commit (built
             # inside commit_turns), which is the summarizer's sole input.
             self._start_commit_summary(sha, trace_text)
+
+        # In manual-commit mode a turn may produce no net working-tree change (a
+        # planning/Q&A turn, or one whose edits the user already folded into HEAD),
+        # so it records no latent commit and on_commit_fn never fires. That is still
+        # genuine session activity worth sharing — the user conversed with the agent
+        # and tokens were spent — so mark it here at turn-detection time. Otherwise a
+        # manual session whose last turn left the tree unchanged is silently skipped
+        # by _auto_share_on_exit (which gates on _sessions_with_activity), which is
+        # why "the last manual session couldn't be shared."
+        if self._manual_commits and turns:
+            self._sessions_with_activity.add(self.state.session_id)
 
         return CommitEngine(
             self.repo,
@@ -10549,14 +10566,19 @@ class ProxyRunner:
         )
 
     def _discover_spawned_session(self) -> str | None:
-        # Identify the session aGiTrack just spawned: the newest one that did not
-        # exist before launch. Falls back to the newest overall when no snapshot
-        # was taken.
-        refs = self.backend.list_sessions(self.repo.repo)
-        if not refs:
-            return None
+        # Identify the session aGiTrack spawned (or the user switched to inside the
+        # backend): the newest one that did NOT exist before launch. Returns None when no
+        # pre-spawn snapshot was taken — without one we cannot tell aGiTrack's own session
+        # apart from a pre-existing unrelated session in the same directory, so the caller
+        # must keep its pinned id rather than risk grabbing the wrong session. (Because the
+        # snapshot only ever excludes post-launch sessions, the result is always safe to
+        # prefer over the pinned id, which is what lets no-worktree mode follow an
+        # in-backend session switch.)
         snapshot = self._pre_spawn_session_ids
-        candidates = [ref for ref in refs if ref.id not in snapshot] if snapshot is not None else refs
+        if snapshot is None:
+            return None
+        refs = self.backend.list_sessions(self.repo.repo)
+        candidates = [ref for ref in refs if ref.id not in snapshot]
         if not candidates:
             return None
         return max(candidates, key=lambda ref: ref.updated).id

@@ -623,7 +623,12 @@ def export_session(repo: Path, session_id: str) -> ExportedSession | None:
                     continue
     except OSError:
         return None
-    return parse_rows(session_id, rows, subagent_tokens=_subagent_token_map(path))
+    return parse_rows(
+        session_id,
+        rows,
+        subagent_tokens=_subagent_token_map(path),
+        unmatched_subagent_time=_subagent_unmatched_mtime(path),
+    )
 
 
 def _subagent_token_map(session_path: Path) -> dict[str | None, TokenUsage]:
@@ -648,6 +653,32 @@ def _subagent_token_map(session_path: Path) -> dict[str | None, TokenUsage]:
     for agent_path in agent_files:
         out.setdefault(_subagent_tool_use_id(agent_path), TokenUsage()).add(_subagent_file_tokens(agent_path))
     return out
+
+
+def _subagent_unmatched_mtime(session_path: Path) -> int | None:
+    """The newest mtime (epoch seconds) among sub-agent files with NO readable parent tool
+    id — the ones keyed under ``None`` in :func:`_subagent_token_map`. Lets ``parse_rows``
+    attribute those id-less sub-agents to the turn active when they ran, instead of always
+    the latest turn (which re-attaches, and double-counts, them onto each new turn on every
+    re-parse). ``None`` when there are no id-less sub-agents or none has a readable mtime."""
+    subdir = session_path.with_suffix("") / "subagents"
+    if not subdir.is_dir():
+        return None
+    try:
+        agent_files = sorted(subdir.glob("agent-*.jsonl"))
+    except OSError:
+        return None
+    newest: int | None = None
+    for agent_path in agent_files:
+        if _subagent_tool_use_id(agent_path) is not None:
+            continue
+        try:
+            mtime = int(agent_path.stat().st_mtime)
+        except OSError:
+            continue
+        if newest is None or mtime > newest:
+            newest = mtime
+    return newest
 
 
 def _subagent_tool_use_id(agent_path: Path) -> str | None:
@@ -728,12 +759,16 @@ def parse_rows(
     rows: list[dict],
     *,
     subagent_tokens: "dict[str | None, TokenUsage] | None" = None,
+    unmatched_subagent_time: int | None = None,
 ) -> ExportedSession:
     # `subagent_tokens` maps a Task tool_use id -> the sub-agent's token usage (in the
     # sub-agent buckets), for newer Claude Code where each sub-agent is recorded in its
     # OWN transcript file rather than inline in `rows` (see `_subagent_token_map`). Each
     # is added to the turn that launched that tool; the None key (a sub-agent with no
-    # recoverable tool id) is attributed to the latest turn so its tokens are never lost.
+    # recoverable tool id) is attributed to the turn that was active at
+    # `unmatched_subagent_time` (its file mtime), or the latest turn if that is unknown —
+    # so its tokens are never lost, and are attributed to a STABLE turn that the commit
+    # watermark can trim, instead of being re-attributed onto each new turn every re-parse.
     turns: list[SessionTurn] = []
     tool_ids_per_turn: list[set[str]] = []
     current: dict | None = None
@@ -891,7 +926,7 @@ def parse_rows(
                 # opt-in full trace can show every message, not just the last.
                 current["messages"].append(text)
     flush(dangling=True)
-    _attribute_subagent_tokens(turns, tool_ids_per_turn, subagent_tokens)
+    _attribute_subagent_tokens(turns, tool_ids_per_turn, subagent_tokens, unmatched_subagent_time)
     return ExportedSession(session_id=session_id, model=model, updated=updated, turns=turns)
 
 
@@ -931,19 +966,43 @@ def _attribute_subagent_tokens(
     turns: list[SessionTurn],
     tool_ids_per_turn: list[set[str]],
     subagent_tokens: "dict[str | None, TokenUsage] | None",
+    unmatched_subagent_time: int | None = None,
 ) -> None:
     # Add each sub-agent's token usage to the turn that launched it (matched by Task
-    # tool_use id). A sub-agent whose id matches no turn — or that had none recorded
-    # (the None key) — is attributed to the latest turn, so its tokens are never dropped.
+    # tool_use id). A sub-agent whose id matches no turn — or that had none recorded (the
+    # None key) — is attributed to the turn that was active at ``unmatched_subagent_time``
+    # (its file mtime) when that is known, else the latest turn, so its tokens are never
+    # dropped. Attributing an id-less sub-agent to the turn it actually ran during (a
+    # STABLE choice) — rather than always "the latest turn" — is what keeps the commit
+    # watermark able to trim it after it is counted once: otherwise, on each re-parse it
+    # would re-attach to the newest turn and be committed (and counted) again (double-count).
     if not subagent_tokens or not turns:
         return
     for tool_id, usage in subagent_tokens.items():
         index: int | None = None
         if tool_id is not None:
             index = next((i for i, ids in enumerate(tool_ids_per_turn) if tool_id in ids), None)
+        if index is None and unmatched_subagent_time is not None:
+            index = _turn_index_at_time(turns, unmatched_subagent_time)
         if index is None:
             index = len(turns) - 1
         turns[index].tokens.add(usage)
+
+
+def _turn_index_at_time(turns: list[SessionTurn], when: int) -> int | None:
+    # The index of the turn whose recorded span [started_at, ended_at] contains epoch
+    # second ``when``; else the latest turn that had already ended by then; else None
+    # (no turn carries usable timestamps → caller falls back to the latest turn). This
+    # gives an id-less sub-agent a STABLE home turn across re-parses so it is counted once.
+    best: int | None = None
+    for i, turn in enumerate(turns):
+        started = turn.started_at
+        ended = turn.ended_at
+        if started is not None and started <= when and (ended is None or when <= ended):
+            return i
+        if ended is not None and ended <= when:
+            best = i
+    return best
 
 
 def _row_timestamp(row: dict) -> int | None:

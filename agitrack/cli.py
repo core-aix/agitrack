@@ -19,9 +19,10 @@ try:
     # the launch path reference ``cli.ProxyRunner`` directly, but tolerant of a platform
     # where the proxy's platform layer can't load yet — the headless paths (json mode,
     # dashboard, --version) don't need it, and proxy mode reports it cleanly below.
-    from agitrack.proxy import ProxyRunner
+    from agitrack.proxy import BackgroundRunner, ProxyRunner
 except ImportError:  # pragma: no cover - only when the proxy platform layer is unavailable
     ProxyRunner = None  # type: ignore[assignment,misc]
+    BackgroundRunner = None  # type: ignore[assignment,misc]
 
 _BACKEND_COMMANDS = {
     "claude": "claude",
@@ -208,6 +209,27 @@ def main(argv: list[str] | None = None) -> int:
         "commit on a side ref instead of landing on the branch. When you commit (via the aGiTrack "
         "menu or an external `git commit`), the pending agent turns are folded into that one "
         "commit. Also settable via 'manual_commits' in config.",
+    )
+    parser.add_argument(
+        "--background",
+        "-b",
+        dest="background",
+        action="store_true",
+        help="background (headless) mode: run WITHOUT the interactive TUI, so you drive the "
+        "coding agent from any UI you like (its native CLI, an IDE extension, …) while aGiTrack "
+        "watches the local session transcript and performs all the tracking the TUI would — "
+        "recording each turn, summarizing, sharing, and installing the commit hooks that fold "
+        "the interaction trace and token metadata into your commits. ALWAYS runs without a "
+        "worktree (implies --no-worktree), with either manual (default) or auto commit — add "
+        "--auto-commit for auto. Also settable via 'background' in config.",
+    )
+    parser.add_argument(
+        "--auto-commit",
+        dest="auto_commit",
+        action="store_true",
+        help="use automatic commits instead of manual (user-triggered) ones. Only meaningful "
+        "with --background: aGiTrack commits each agent turn itself (and folds tracking into the "
+        "agent's own commits via a prepare-commit-msg hook), rather than deferring commits to you.",
     )
     parser.add_argument(
         "--no-confine",
@@ -455,6 +477,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.mode == "proxy" and not _installed_via_msi() and sys.stdin.isatty() and sys.stdout.isatty():
         _ensure_git_identity()
 
+    # Make the global config self-documenting: write any settings still missing from
+    # ~/.agitrack/config.json with their built-in defaults, so a user opening the file
+    # sees every available knob. Only fills gaps (never overwrites a user value) and only
+    # writes when something was missing, so it is a no-op on every run after the first.
+    # Placed after the cheap --version/--dashboard paths return, so those stay side-effect-free.
+    getattr(config, "seed_defaults", lambda: False)()
+
     # Offer a self-update before launching anything. Skipped for scripted/non-TTY
     # runs (no way to answer) and when the user turned update checks off. If the
     # user accepts, aGiTrack updates and re-execs immediately — no sessions are
@@ -509,9 +538,18 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Configuration error: {share_config_error}")
         return 1
     manual_commits = True if getattr(args, "manual_commits", False) else getattr(config, "manual_commits", False)
+    # Background (headless) mode: aGiTrack tracks a user-driven native backend session instead
+    # of running the interactive TUI. Enabled by --background/-b or the 'background' config key.
+    background = True if getattr(args, "background", False) else getattr(config, "background", False)
+    if background:
+        # Background mode ALWAYS runs without a worktree, and is manual (user-triggered) by
+        # default — the natural fit for driving the agent from your own UI and committing
+        # yourself. --auto-commit switches to automatic commits (aGiTrack commits each turn and
+        # folds tracking into the agent's own commits via a prepare-commit-msg hook).
+        manual_commits = not getattr(args, "auto_commit", False)
     # Manual-commit mode edits the current branch directly and defers commits to the user, so
     # it necessarily runs without a worktree (there is no per-turn branch to integrate).
-    use_worktrees = False if (args.no_worktree or manual_commits) else config.use_worktrees
+    use_worktrees = False if (args.no_worktree or manual_commits or background) else config.use_worktrees
     commit_guidance = False if args.no_commit_guidance else getattr(config, "commit_guidance", True)
     sandbox_enabled = False if args.no_sandbox else getattr(config, "sandbox", True)
     if args.allowed_edit_paths is not None:
@@ -554,6 +592,24 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
+        if background:
+            # Headless background tracker (issue #143): no TUI, no PTY takeover. aGiTrack watches
+            # the user-driven backend session and tracks it. Show the privacy warning first (it
+            # auto-proceeds without a TTY), then run the tracker until interrupted.
+            if not _acknowledge_privacy_warning(scripted=scripted, skip=args.skip_privacy_ack):
+                return 1
+            if BackgroundRunner is None:  # pragma: no cover - platform without proxy support
+                print("Background mode is not available on this platform yet.")
+                return 1
+            return BackgroundRunner(
+                repo,
+                verbose=args.verbose,
+                backend=args.backend,
+                new_session=args.new_session,
+                manual_commits=manual_commits,
+                backend_command=backend_command,
+                _lock=management_lock,
+            ).run()
         if args.mode == "json":
             # json/scripted mode has no interactive pre-TUI configuration steps, so show the
             # privacy warning here (it auto-proceeds without a TTY) before the shell starts.

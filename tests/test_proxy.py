@@ -115,11 +115,15 @@ def test_discover_spawned_session_returns_none_when_nothing_new():
     assert runner._discover_spawned_session() is None
 
 
-def test_discover_spawned_session_without_snapshot_uses_newest():
+def test_discover_spawned_session_without_snapshot_returns_none():
+    # Without a pre-spawn snapshot we cannot tell aGiTrack's own session apart from a
+    # pre-existing unrelated one in the same directory, so discovery returns None and the
+    # caller keeps its pinned id. (This is what makes the result always safe to prefer over
+    # the pinned id, which is how no-worktree mode follows an in-backend session switch.)
     refs = [SessionRef("a", 100.0), SessionRef("b", 300.0), SessionRef("c", 200.0)]
     runner = _runner_with_sessions(refs)
     runner._pre_spawn_session_ids = None
-    assert runner._discover_spawned_session() == "b"
+    assert runner._discover_spawned_session() is None
 
 
 def test_short_session():

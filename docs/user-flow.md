@@ -189,6 +189,47 @@ flowchart TD
 
 ---
 
+## 3b. Background mode (`--background` / `-b`)
+
+Runs aGiTrack **without the interactive TUI** so you can drive the coding agent from **any** UI (its
+native CLI, an IDE extension, a chat window) while aGiTrack tracks that session in the background —
+the interactive-UI-agnostic tracker of [issue #143](https://github.com/core-aix/agitrack/issues/143).
+aGiTrack does **not** launch or proxy the agent; it watches the agent's on-disk session transcript
+for the repo, records each completed turn, summarizes it, and installs the fold hooks. It **always
+runs without a worktree** (it implies `--no-worktree`), with either commit style:
+
+- **Manual** (default): identical to [Manual-commit mode](#3a-manual-commit-mode---manual-commits---m) — each
+  turn is a hidden latent commit, folded into *your* commit by the `prepare-commit-msg` hook.
+- **Auto** (`--auto-commit`): aGiTrack folds the pending turns into a commit **itself** once the agent
+  finishes a turn and hasn't committed. If the agent makes its **own** commit, the same
+  `prepare-commit-msg` hook folds the tracking directly into that commit — the metadata-only cover
+  commit is only the fallback for when the hook can't be installed (custom `core.hooksPath`).
+
+```mermaid
+flowchart TD
+  s(["Background mode: -b / background (implies --no-worktree); manual (default) or --auto-commit"]) --> watch["Poll the newest backend session transcript in the repo dir (follows in-backend session switches)"]
+  watch --> turn{"A newly completed turn?"}
+  turn -->|No| watch
+  turn -->|Yes| latent[["Record a HIDDEN latent commit on refs/agitrack/manual/&lt;session&gt; + summarize it (git note). HEAD does NOT move"]]
+  latent --> mode{"Commit style?"}
+  mode -->|Manual| user(["Wait for YOUR commit → prepare-commit-msg folds the pending turns in (cover fallback)"])
+  mode -->|Auto| auto{"Working tree still has the agent's uncommitted work?"}
+  auto -->|"Yes (agent didn't commit)"| aGit[["aGiTrack commits it itself, folding the pending turns' trace + metadata → ONE tracked commit; reset the ref"]]
+  auto -->|"No (agent committed its own work)"| hook[["The prepare-commit-msg hook already folded the tracking into the agent's commit; cover is only the fallback"]]
+  user --> watch
+  aGit --> watch
+  hook --> watch
+```
+
+The per-conversation commit watermark makes this exact even when you switch conversations inside the
+backend (a `/resume` or a new conversation): aGiTrack follows the newest session and counts each
+conversation's turns exactly once. Press `Ctrl-C` to stop; it records any final turn (folding it in
+auto mode) and removes its hooks.
+
+**Jump to:** [Manual-commit mode](#3a-manual-commit-mode---manual-commits---m) · [The agent turn](#5-the-agent-turn-auto-commit-and-integration)
+
+---
+
 ## 4. Before forwarding a prompt (base to worktree)
 
 Runs every time the user submits text, **before** the backend sees it

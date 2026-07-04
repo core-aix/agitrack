@@ -684,6 +684,77 @@ def test_start_parse_writes_result_to_owning_session(tmp_path):
     assert owner_state is state
 
 
+def _noworktree_session(tmp_path, state, *, export_sink):
+    session = Session.bare()
+    session.state = state
+    session.worktree = None
+
+    class Backend:
+        name = "claude"
+
+        def latest_session_id(self, repo):
+            return None  # unused in no-worktree mode
+
+        def export_session(self, repo, sid):
+            export_sink["sid"] = sid
+            return ExportedSession(sid, "m", None, [])
+
+    session.backend = Backend()
+    session.repo = types.SimpleNamespace(repo=tmp_path)
+    return session
+
+
+def test_start_parse_no_worktree_follows_switched_session(tmp_path):
+    # No-worktree mode prefers snapshot-based discovery (a session that appeared AFTER
+    # launch — a Claude /resume or a new conversation started inside the backend) over the
+    # pinned id, so all modes follow an in-backend session switch.
+    state = AgitrackState(tmp_path)
+    state.backend_session_id = "pinned"
+    seen: dict = {}
+    session = _noworktree_session(tmp_path, state, export_sink=seen)
+
+    engine = CommitEngine(None, state)
+    engine.start_parse(session=session, discover_session_id_fn=lambda: "switched", debug_fn=lambda *a, **k: None)
+    session.agent_parse_thread.join(timeout=5)
+
+    assert seen["sid"] == "switched"  # followed the switch, not the pinned id
+    assert session.agent_parse_result[0] == "switched"
+
+
+def test_start_parse_no_worktree_falls_back_to_pinned_when_no_switch(tmp_path):
+    # When discovery finds no post-launch switch (returns None) the worker keeps the pinned
+    # id — so a normal continuation is unaffected.
+    state = AgitrackState(tmp_path)
+    state.backend_session_id = "pinned"
+    seen: dict = {}
+    session = _noworktree_session(tmp_path, state, export_sink=seen)
+
+    engine = CommitEngine(None, state)
+    engine.start_parse(session=session, discover_session_id_fn=lambda: None, debug_fn=lambda *a, **k: None)
+    session.agent_parse_thread.join(timeout=5)
+
+    assert seen["sid"] == "pinned"
+
+
+def test_start_parse_reads_per_conversation_watermark(tmp_path):
+    # The parse worker reads the watermark for the conversation actually being exported —
+    # so after a switch it uses that conversation's own committed mark, not the last one.
+    state = AgitrackState(tmp_path)
+    state.backend_session_id = "A"
+    state.set_backend_message_id("A", "a-hi")  # A's committed high-water mark
+    state.data["backend_message_ids"] = {"A": "a-hi", "B": "b-hi"}  # B was tracked before
+    seen: dict = {}
+    session = _noworktree_session(tmp_path, state, export_sink=seen)
+
+    engine = CommitEngine(None, state)
+    engine.start_parse(session=session, discover_session_id_fn=lambda: "B", debug_fn=lambda *a, **k: None)
+    session.agent_parse_thread.join(timeout=5)
+
+    sid, _exp, last_id, _owner = session.agent_parse_result
+    assert sid == "B"
+    assert last_id == "b-hi"  # B's own watermark, not A's (a-hi)
+
+
 # ---------------------------------------------------------------------------
 # CommitEngine.finish_parse_if_ready
 # ---------------------------------------------------------------------------

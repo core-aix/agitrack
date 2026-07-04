@@ -28,6 +28,58 @@ def _config(tmp_path):
     return gc
 
 
+# --- seed defaults ----------------------------------------------------------
+
+
+def test_seed_defaults_writes_all_knobs_and_is_idempotent(tmp_path):
+    from agitrack.sessions.share_cap import DEFAULT_MAX_SHARED_BYTES
+
+    gc = GlobalConfig(path=tmp_path / "global" / "config.json")
+    assert not gc.path.exists()  # nothing written yet
+
+    assert gc.seed_defaults() is True  # first seed writes the file
+    written = json.loads(gc.path.read_text())
+    # Every user-facing knob is present with its default, so the file is self-documenting.
+    assert written["sandbox"] is True
+    assert written["use_worktrees"] is True
+    assert written["manual_commits"] is False
+    assert written["background"] is False
+    assert written["commit_guidance"] is True
+    assert written["summarization_enabled"] is True
+    assert written["check_for_updates"] is True
+    assert written["default_backend"] is None
+    assert written["allowed_edit_paths"] == []
+    assert written["menu_key"] == "ctrl-g"
+    assert written["share_max_transcript_bytes"] == DEFAULT_MAX_SHARED_BYTES
+    assert written["timings"]["base_poll_seconds"] == 3.0
+    # Transient/state-like keys are NOT written as settings.
+    assert "pending_manual_update" not in written
+    assert "session_sharing" not in written
+
+    # Idempotent: a second seed changes nothing and does not rewrite.
+    assert gc.seed_defaults() is False
+
+
+def test_seed_defaults_never_overwrites_user_values(tmp_path):
+    gc = GlobalConfig(path=tmp_path / "global" / "config.json")
+    gc.set("sandbox", False, scope="global")  # user turned sandbox off
+
+    assert gc.seed_defaults() is True  # fills the OTHER missing keys
+    written = json.loads(gc.path.read_text())
+    assert written["sandbox"] is False  # user value preserved
+    assert written["use_worktrees"] is True  # gap filled with default
+
+
+def test_seed_defaults_adds_only_new_keys_after_upgrade(tmp_path):
+    # Simulate a config written before "background" existed: seeding adds just that key.
+    gc = GlobalConfig(path=tmp_path / "global" / "config.json")
+    gc.data = {k: v for k, v in gc._default_config().items() if k != "background"}
+    gc.save()
+
+    assert gc.seed_defaults() is True
+    assert json.loads(gc.path.read_text())["background"] is False
+
+
 # --- repo-local overlay -----------------------------------------------------
 
 
