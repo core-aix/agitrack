@@ -21,8 +21,12 @@ cover is only a backup — exactly the requested behavior.
 
 from __future__ import annotations
 
+import json
+import os
 import signal
 import threading
+import time
+from pathlib import Path
 from typing import Any
 
 from agitrack.backends.proxy_agents import make_proxy_agent
@@ -30,8 +34,69 @@ from agitrack.commits import ManualCommitTracker
 from agitrack.commits.message import build_manual_squash_trailer
 from agitrack.config import AgitrackState, GlobalConfig
 from agitrack.git import GitRepo
+from agitrack.proc import pid_alive, terminate_pid
 from agitrack.proxy.commit_engine import CommitEngine
 from agitrack.proxy.session import Session
+
+
+def background_handshake_path(repo: GitRepo) -> Path:
+    """Where a running background tracker records its pid, so `agitrack -b stop`/`status` can
+    find it. Separate from the repo lock (which every mode shares) so stop/status target ONLY a
+    background tracker, never a foreground TUI holding the same repo."""
+    return repo.repo / ".agitrack" / "background.json"
+
+
+def _read_handshake(repo: GitRepo) -> dict | None:
+    try:
+        data = json.loads(background_handshake_path(repo).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _live_background_pid(repo: GitRepo) -> int | None:
+    """The pid of a live background tracker on this repo, or None (also clears a stale file)."""
+    info = _read_handshake(repo)
+    pid = info.get("pid") if info else None
+    if isinstance(pid, int) and pid_alive(pid):
+        return pid
+    if info is not None:  # stale handshake from a crashed tracker — clean it up
+        try:
+            background_handshake_path(repo).unlink()
+        except OSError:
+            pass
+    return None
+
+
+def background_status(repo: GitRepo) -> int:
+    """Report whether a background tracker is running on this repo (`agitrack -b status`)."""
+    pid = _live_background_pid(repo)
+    if pid is None:
+        print("No aGiTrack background tracker is running on this repo.")
+    else:
+        info = _read_handshake(repo) or {}
+        mode = info.get("mode", "?")
+        print(f"aGiTrack background tracker is running (PID {pid}, {mode}).")
+    return 0
+
+
+def stop_background(repo: GitRepo) -> int:
+    """Stop the background tracker running on this repo (`agitrack -b stop`). Sends SIGTERM and
+    waits briefly for a clean shutdown (it records any final turn and removes its hooks)."""
+    pid = _live_background_pid(repo)
+    if pid is None:
+        print("No aGiTrack background tracker is running on this repo.")
+        return 0
+    terminate_pid(pid)
+    for _ in range(100):  # up to ~10s for a clean shutdown
+        if not pid_alive(pid):
+            break
+        time.sleep(0.1)
+    if pid_alive(pid):
+        print(f"aGiTrack background tracker (PID {pid}) did not stop in time; it may still be shutting down.")
+        return 1
+    print("Stopped the aGiTrack background tracker.")
+    return 0
 
 
 class BackgroundRunner:
@@ -44,7 +109,7 @@ class BackgroundRunner:
         verbose: bool = False,
         backend: str | None = None,
         new_session: bool = False,
-        manual_commits: bool = True,
+        manual_commits: bool = False,  # background defaults to AUTO commits (like the interactive TUI)
         backend_command: list[str] | None = None,
         poll_seconds: float | None = None,
         _global_config: GlobalConfig | None = None,
@@ -103,6 +168,7 @@ class BackgroundRunner:
         if not backend_installed(self.state.backend):
             self._print(f"backend '{self.state.backend}' is not installed.")
             return 1
+        self._write_handshake()
         self._manual.setup()
         self._install_signal_handlers()
         mode = "manual (user-triggered) commits" if self._manual_commits else "auto commits"
@@ -125,7 +191,34 @@ class BackgroundRunner:
         except Exception as error:
             self._debug(f"final process failed: {error!r}")
         self._manual.teardown()
+        self._remove_handshake()
         self._print("background tracker stopped.")
+
+    def _write_handshake(self) -> None:
+        # Record our pid so `agitrack -b stop`/`status` can target THIS background tracker
+        # (as opposed to a foreground TUI, which shares the repo lock but not this file).
+        try:
+            path = background_handshake_path(self.repo)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            mode = "manual commits" if self._manual_commits else "auto commits"
+            path.write_text(
+                json.dumps(
+                    {"pid": os.getpid(), "started_at": time.time(), "backend": self.state.backend, "mode": mode}
+                ),
+                encoding="utf-8",
+            )
+        except OSError as error:
+            self._debug(f"handshake write failed: {error!r}")
+
+    def _remove_handshake(self) -> None:
+        try:
+            path = background_handshake_path(self.repo)
+            info = _read_handshake(self.repo)
+            # Only remove OUR handshake (guard against a race where another tracker rewrote it).
+            if info and info.get("pid") == os.getpid():
+                path.unlink()
+        except OSError:
+            pass
 
     def _install_signal_handlers(self) -> None:
         def handler(_signum, _frame):

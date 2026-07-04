@@ -198,12 +198,18 @@ aGiTrack does **not** launch or proxy the agent; it watches the agent's on-disk 
 for the repo, records each completed turn, summarizes it, and installs the fold hooks. It **always
 runs without a worktree** (it implies `--no-worktree`), with either commit style:
 
-- **Manual** (default): identical to [Manual-commit mode](#3a-manual-commit-mode---manual-commits---m) — each
-  turn is a hidden latent commit, folded into *your* commit by the `prepare-commit-msg` hook.
-- **Auto** (`--auto-commit`): aGiTrack folds the pending turns into a commit **itself** once the agent
-  finishes a turn and hasn't committed. If the agent makes its **own** commit, the same
-  `prepare-commit-msg` hook folds the tracking directly into that commit — the metadata-only cover
-  commit is only the fallback for when the hook can't be installed (custom `core.hooksPath`).
+- **Auto** (default, like the interactive TUI): aGiTrack folds the pending turns into a commit
+  **itself** once the agent finishes a turn and hasn't committed. If the agent makes its **own**
+  commit, the same `prepare-commit-msg` hook folds the tracking directly into that commit — the
+  metadata-only cover commit is only the fallback for when the hook can't be installed (custom
+  `core.hooksPath`).
+- **Manual** (`--manual-commits` / `-m`): identical to [Manual-commit mode](#3a-manual-commit-mode---manual-commits---m) —
+  each turn is a hidden latent commit, folded into *your* commit by the `prepare-commit-msg` hook.
+
+Only one aGiTrack runs per repo (a foreground TUI or a background tracker — the shared repo lock
+refuses a second start), so they never race over commits. `agitrack -b status` reports whether a
+background tracker is running on the repo; `agitrack -b stop` stops it (recording any final turn and
+removing its hooks first).
 
 ```mermaid
 flowchart TD

@@ -379,6 +379,91 @@ def _manual_runner(tmp_path):
     return runner, repo, state
 
 
+def _noworktree_auto_runner(tmp_path):
+    """A ProxyRunner wired for no-worktree AUTO mode (not manual): it records turns latently and
+    folds them into commits itself, and the prepare-commit-msg hook folds the agent's OWN commits."""
+    from tests.proxy_helpers import make_runner
+
+    repo = _init_repo(tmp_path)
+    state = AgitrackState(tmp_path)
+    runner = make_runner(
+        repo=repo,
+        state=state,
+        base_repo=repo,
+        _manual_commits=False,
+        _use_worktrees=False,
+        _base_branch=repo.current_branch(),
+    )
+    runner._review_untracked_popup = lambda *a, **k: ""
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda *a, **k: None
+    return runner, repo, state
+
+
+def test_noworktree_auto_is_latent_but_not_manual(tmp_path):
+    runner, repo, _ = _noworktree_auto_runner(tmp_path)
+    assert runner._latent_tracking is True  # no-worktree ⇒ latent record + fold
+    assert runner._noworktree_auto is True  # auto (not manual) ⇒ aGiTrack folds itself
+    assert runner._manual_commits is False
+
+
+def test_noworktree_auto_folds_latent_turn_into_commit(tmp_path):
+    runner, repo, state = _noworktree_auto_runner(tmp_path)
+    runner._setup_manual_commit_mode()  # installs the fold hooks + renders the trailer
+    (tmp_path / "a.txt").write_text("one\nagent\n", encoding="utf-8")
+    runner._manual_gate()
+    runner._manual_record(_agent_body("do x", 20))  # a turn recorded latently (HEAD frozen)
+    head_before = repo.rev_parse("HEAD")
+
+    runner._auto_fold_latent_pending()  # aGiTrack commits it itself — no user action, no cover
+
+    assert repo.rev_parse("HEAD") != head_before
+    msg = _git(repo, "log", "-1", "--format=%B", "HEAD")
+    assert "# aGiTrack Metadata" in msg and "do x" in msg  # trace + code in ONE commit
+    assert repo.ref_sha(runner._manual_ref()) == repo.rev_parse("HEAD")  # ref reset
+    assert runner._manual_pending_count() == 0
+
+
+def test_noworktree_auto_agent_selfcommit_folds_via_hook_no_cover(tmp_path):
+    runner, repo, state = _noworktree_auto_runner(tmp_path)
+    runner._setup_manual_commit_mode()
+    (tmp_path / "a.txt").write_text("one\nagent\n", encoding="utf-8")
+    runner._manual_gate()
+    runner._manual_record(_agent_body("do x", 20))
+    n_before = len(_git(repo, "log", "--format=%H").split())
+
+    # The AGENT commits its own work: the installed prepare-commit-msg hook folds the pending
+    # tracking straight into THAT commit (single commit), and post-commit resets the ref.
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "agent's own commit")
+
+    runner._auto_fold_latent_pending()  # clean tree ⇒ nothing more to do (no separate cover)
+
+    assert len(_git(repo, "log", "--format=%H").split()) == n_before + 1  # ONLY the agent's commit
+    msg = _git(repo, "log", "-1", "--format=%B", "HEAD")
+    assert "agent's own commit" in msg and msg.count("# aGiTrack Metadata") == 2  # user block + turn
+
+
+def test_noworktree_auto_reconcile_covers_when_hook_unavailable(tmp_path):
+    # Backup path: with the fold hook not installed (custom core.hooksPath), an agent/user commit
+    # is covered by a metadata-only cover commit instead — cover is the backup, per the design.
+    runner, repo, state = _noworktree_auto_runner(tmp_path)
+    runner._manual_hooks_installed = False
+    runner._manual_last_head = repo.rev_parse("HEAD")
+    (tmp_path / "a.txt").write_text("one\nagent\n", encoding="utf-8")
+    runner._manual_gate()
+    runner._manual_record(_agent_body("do y", 15))
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "external commit")
+    user_head = repo.rev_parse("HEAD")
+
+    runner._reconcile_manual_external_commit()
+
+    cover = repo.rev_parse("HEAD")
+    assert cover != user_head and repo.parents(cover)[0] == user_head  # cover on top of the commit
+    assert "# aGiTrack Metadata" in repo.commit_message(cover)
+
+
 def test_runner_manual_gate_and_record_freeze_head(tmp_path):
     runner, repo, _ = _manual_runner(tmp_path)
     head = repo.rev_parse("HEAD")

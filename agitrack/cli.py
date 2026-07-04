@@ -214,22 +214,26 @@ def main(argv: list[str] | None = None) -> int:
         "--background",
         "-b",
         dest="background",
-        action="store_true",
+        nargs="?",
+        const="run",
+        choices=["run", "stop", "status"],
+        default=None,
         help="background (headless) mode: run WITHOUT the interactive TUI, so you drive the "
         "coding agent from any UI you like (its native CLI, an IDE extension, …) while aGiTrack "
         "watches the local session transcript and performs all the tracking the TUI would — "
-        "recording each turn, summarizing, sharing, and installing the commit hooks that fold "
-        "the interaction trace and token metadata into your commits. ALWAYS runs without a "
-        "worktree (implies --no-worktree), with either manual (default) or auto commit — add "
-        "--auto-commit for auto. Also settable via 'background' in config.",
+        "recording each turn, summarizing, and installing the commit hooks that fold the "
+        "interaction trace and token metadata into your commits. ALWAYS runs without a worktree "
+        "(implies --no-worktree). Uses AUTO commits by default (like interactive mode); add "
+        "--manual-commits / -m for user-triggered commits. `-b stop` / `-b status` stop or report "
+        "the background tracker running on this repo. Also settable via 'background' in config.",
     )
     parser.add_argument(
         "--auto-commit",
         dest="auto_commit",
         action="store_true",
-        help="use automatic commits instead of manual (user-triggered) ones. Only meaningful "
-        "with --background: aGiTrack commits each agent turn itself (and folds tracking into the "
-        "agent's own commits via a prepare-commit-msg hook), rather than deferring commits to you.",
+        help="force automatic (aGiTrack-triggered) commits — the default in --background mode, so "
+        "this only matters to override a configured 'manual_commits': true. aGiTrack commits each "
+        "agent turn itself and folds tracking into the agent's own commits via a prepare-commit-msg hook.",
     )
     parser.add_argument(
         "--no-confine",
@@ -416,6 +420,18 @@ def main(argv: list[str] | None = None) -> int:
 
         return start_dashboard_daemon(dashboard_repo, owner_pid=os.getppid())
 
+    if args.background in ("stop", "status"):
+        # `agitrack -b stop` / `-b status`: signal or report the background tracker running on
+        # this repo. Read-only w.r.t. the agent — no privacy prompt, no repo init, no update check.
+        try:
+            bg_repo = GitRepo.discover(Path(args.repo).expanduser())
+        except (GitError, OSError) as error:
+            print(error)
+            return 1
+        from agitrack.proxy.background import background_status, stop_background
+
+        return stop_background(bg_repo) if args.background == "stop" else background_status(bg_repo)
+
     if args.recover:
         # Headless finalization of work left by a session that exited abruptly.
         # It only commits/merges already-produced changes (never starts new agent
@@ -539,14 +555,15 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     manual_commits = True if getattr(args, "manual_commits", False) else getattr(config, "manual_commits", False)
     # Background (headless) mode: aGiTrack tracks a user-driven native backend session instead
-    # of running the interactive TUI. Enabled by --background/-b or the 'background' config key.
-    background = True if getattr(args, "background", False) else getattr(config, "background", False)
+    # of running the interactive TUI. `-b`/`--background` (const "run") or the 'background' config
+    # key enable it; `-b stop`/`status` were handled earlier and never reach here.
+    background = (getattr(args, "background", None) == "run") or getattr(config, "background", False)
     if background:
-        # Background mode ALWAYS runs without a worktree, and is manual (user-triggered) by
-        # default — the natural fit for driving the agent from your own UI and committing
-        # yourself. --auto-commit switches to automatic commits (aGiTrack commits each turn and
-        # folds tracking into the agent's own commits via a prepare-commit-msg hook).
-        manual_commits = not getattr(args, "auto_commit", False)
+        # Background mode ALWAYS runs without a worktree, and uses AUTO commits by default (like
+        # interactive mode). --manual-commits / -m (or config manual_commits) opts into manual;
+        # --auto-commit forces auto even over a configured manual_commits: true.
+        if getattr(args, "auto_commit", False):
+            manual_commits = False
     # Manual-commit mode edits the current branch directly and defers commits to the user, so
     # it necessarily runs without a worktree (there is no per-turn branch to integrate).
     use_worktrees = False if (args.no_worktree or manual_commits or background) else config.use_worktrees

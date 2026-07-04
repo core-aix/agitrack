@@ -1659,12 +1659,29 @@ class ProxyRunner:
     def _manual_agit_dir(self):
         return self.base_repo.repo / ".agitrack"
 
+    @property
+    def _latent_tracking(self) -> bool:
+        """Whether this session records turns as hidden latent commits and folds them via the
+        prepare-commit-msg hook — true for ALL no-worktree sessions (manual OR auto). Worktree
+        mode commits per-branch and integrates as before (false). Derived (not stored) so it is
+        always consistent with ``_use_worktrees`` even in tests that build the runner directly."""
+        return not self._use_worktrees
+
+    @property
+    def _noworktree_auto(self) -> bool:
+        """No-worktree mode WITHOUT manual commits: aGiTrack folds the pending latent turns into a
+        commit itself, and the fold hook folds the agent's OWN commits (cover is only the backup)."""
+        return (not self._use_worktrees) and (not self._manual_commits)
+
     def _setup_manual_commit_mode(self) -> None:
         """Startup wiring for manual-commit mode: install the fold/reset hooks (unless a
         custom ``core.hooksPath`` makes that impossible — then the poll+cover fallback runs
         instead), point the latent chain at the current HEAD, and render the initial trailer
-        so even a first commit with no agent turns is attributed to the session."""
-        if not self._manual_commits:
+        so even a first commit with no agent turns is attributed to the session.
+
+        Also used by no-worktree AUTO mode (``_latent_tracking``): the same hooks fold the agent's
+        own commits, and aGiTrack folds any remaining pending turns itself (see _auto_fold_latent)."""
+        if not self._latent_tracking:
             return
         self._manual_hooks_installed = False
         try:
@@ -1688,7 +1705,7 @@ class ProxyRunner:
         self._render_manual_trailer()
 
     def _teardown_manual_commit_mode(self) -> None:
-        if not self._manual_commits:
+        if not self._latent_tracking:
             return
         try:
             if self.base_repo is not None and not self.base_repo.core_hooks_path():
@@ -1699,7 +1716,7 @@ class ProxyRunner:
     def _manual_pending_count(self) -> int:
         """How many latent turns are recorded but not yet folded into a commit (cheap: no
         message reads). Used by the exit reminder."""
-        if not self._manual_commits:
+        if not self._latent_tracking:
             return 0
         tip = self.repo.ref_sha(self._manual_ref())
         if not tip:
@@ -1747,7 +1764,7 @@ class ProxyRunner:
         the ``.agitrack/manual-ref`` name file the post-commit hook reads. The trailer always
         carries at least the ``commit_type: user`` block, so a commit with no pending turns is
         still attributed to the session; pending turns add their full trace/metadata."""
-        if not self._manual_commits:
+        if not self._latent_tracking:
             return
         try:
             agit_dir = self._manual_agit_dir()
@@ -1838,13 +1855,20 @@ class ProxyRunner:
         stale latent chain and re-rendering the trailer — so a commit made outside aGiTrack,
         which the fold hook already combined the pending turns into, also resets the ref.
         Without hooks (custom core.hooksPath), fall back to detecting the commit by polling
-        HEAD and adding a cover commit."""
-        if not self._manual_commits:
+        HEAD and adding a cover commit. Runs for all no-worktree modes (``_latent_tracking``):
+        in no-worktree AUTO mode this is also how the agent's own commit resets the chain after
+        the fold hook folds tracking into it."""
+        if not self._latent_tracking:
             return
         now = time.monotonic()
         if now - getattr(self, "_manual_poll_at", 0.0) < self.BASE_POLL_SECONDS:
             return
         self._manual_poll_at = now
+        # No-worktree AUTO mode: aGiTrack folds any pending turns into a commit itself (so the
+        # user doesn't have to). A clean tree means the agent already committed — the fold hook
+        # folded the tracking into that commit — so this is a no-op then.
+        if self._noworktree_auto:
+            self._auto_fold_latent_pending()
         if getattr(self, "_manual_hooks_installed", False):
             signal_file = self._manual_agit_dir() / "manual-commit-signal"
             try:
@@ -1874,7 +1898,7 @@ class ProxyRunner:
         outside the hook — add a cover commit carrying the pending tracking (its tree equals
         the new HEAD's, so it introduces no diff), then reset the latent ref. A no-op when
         the hook is installed (it already folded the tracking and reset the ref)."""
-        if not self._manual_commits or getattr(self, "_manual_hooks_installed", False):
+        if not self._latent_tracking or getattr(self, "_manual_hooks_installed", False):
             return
         try:
             head = self.repo.rev_parse("HEAD")
@@ -1903,6 +1927,45 @@ class ProxyRunner:
         except Exception as error:
             self._debug(f"manual cover reconcile failed: {error!r}")
         self._render_manual_trailer()
+
+    def _auto_fold_latent_pending(self) -> None:
+        """No-worktree AUTO mode: fold the pending latent turns into a real commit ourselves, so
+        the branch advances per turn (like normal auto mode) but the interaction trace/metadata
+        rides the SAME commit as the code — no separate cover. A clean working tree means the agent
+        (or user) already committed its work, in which case the prepare-commit-msg fold hook folded
+        the tracking into THAT commit (cover being only the backup), so there is nothing to do."""
+        if not self._noworktree_auto:
+            return
+        tip = self.repo.ref_sha(self._manual_ref())
+        if not tip:
+            return
+        try:
+            if self.repo.snapshot_worktree_tree() == self.repo.rev_parse("HEAD^{tree}"):
+                return  # clean vs HEAD ⇒ agent/user committed; the fold hook handled it
+        except Exception:
+            return
+        bodies = self._manual_pending_bodies()
+        if not bodies:
+            return
+        message = "<aGiTrack> commit agent turns\n\n" + build_manual_squash_trailer(
+            agitrack_session_id=self.state.session_id, latent_bodies=bodies
+        )
+        try:
+            self.repo.add_tracked()
+            declined = set(self.state.declined_untracked())
+            self.repo.stage_paths([p for p in self.repo.untracked_entries() if p not in declined])
+            if not self.repo.has_staged_changes():
+                return
+            # The message already carries the folded metadata, so the prepare-commit-msg hook's
+            # idempotency check skips re-appending it; the post-commit hook resets the latent ref.
+            sha = self.repo.commit(message)
+            self._reset_stale_manual_ref()
+            self._manual_last_head = self.repo.rev_parse("HEAD")
+            self._render_manual_trailer()
+            self._last_agent_commit_id = sha
+            self._sessions_with_activity.add(self.state.session_id)
+        except Exception as error:
+            self._debug(f"auto fold failed: {error!r}")
 
     def _check_base_branch_drift(self) -> None:
         # Poll the branch checked out in the repo directory. The status bar bolds a
@@ -9243,7 +9306,7 @@ class ProxyRunner:
         # manual session whose last turn left the tree unchanged is silently skipped
         # by _auto_share_on_exit (which gates on _sessions_with_activity), which is
         # why "the last manual session couldn't be shared."
-        if self._manual_commits and turns:
+        if self._latent_tracking and turns:
             self._sessions_with_activity.add(self.state.session_id)
 
         return CommitEngine(
@@ -9262,11 +9325,13 @@ class ProxyRunner:
             pre_commit_fn=self._ensure_turn_branch,
             on_commit_fn=on_commit_fn,
             session_name=self.name,
-            # Manual-commit mode diverts the per-turn write to a hidden latent commit and
-            # never touches HEAD/the index; every other mode is unaffected (both None).
-            manual_gate_fn=self._manual_gate if self._manual_commits else None,
-            manual_record_fn=self._manual_record if self._manual_commits else None,
-            backend_commits=[] if self._manual_commits else self._uncovered_backend_commits(),
+            # Every no-worktree mode (manual OR auto) diverts the per-turn write to a hidden
+            # latent commit and never touches HEAD/the index; the trailer/hook fold it into the
+            # user's or agent's own commit (no-worktree auto also folds it itself, see
+            # _auto_fold_latent_pending). Worktree mode is unaffected (both None, cover applies).
+            manual_gate_fn=self._manual_gate if self._latent_tracking else None,
+            manual_record_fn=self._manual_record if self._latent_tracking else None,
+            backend_commits=[] if self._latent_tracking else self._uncovered_backend_commits(),
         )
 
     def _uncovered_backend_commits(self) -> list[str]:
@@ -11299,6 +11364,11 @@ class ProxyRunner:
         if now - self._idle_integrate_at < self.BASE_POLL_SECONDS:
             return
         self._idle_integrate_at = now
+        if self._latent_tracking:
+            # No-worktree modes fold the agent's own commits via the prepare-commit-msg hook
+            # (and _reconcile_manual_external_commit is the cover backup when the hook can't run),
+            # so the #35 cover pass below is superseded — see _service_manual_commit_mode.
+            return
         if not self._use_worktrees:
             # No-worktree: the agent's own commits live on the current branch (there is no
             # separate base to integrate into). Cover them with aGiTrack metadata — the same
