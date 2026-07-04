@@ -401,6 +401,27 @@ def test_runner_manual_gate_false_when_tree_unchanged(tmp_path):
     assert runner._manual_gate() is False  # clean tree ⇒ nothing to record
 
 
+def test_manual_turn_marks_activity_even_without_tree_change(tmp_path):
+    # A planning/Q&A manual turn produces no net working-tree change, so the manual
+    # gate skips recording a latent commit and on_commit_fn never fires. It is still
+    # genuine session activity (the user conversed, tokens were spent), so it must be
+    # marked shareable — otherwise _auto_share_on_exit silently skips the session and
+    # "the last manual session couldn't be shared."
+    runner, repo, state = _manual_runner(tmp_path)
+    assert runner._manual_gate() is False  # clean tree, so nothing will be recorded
+
+    committed = runner._create_agent_commit_from_turns_popup(
+        turns=[SessionTurn("u1", "a1", "explain the code", "here's how", TokenUsage(total=1, output=1), None)],
+        backend="claude",
+        backend_session_id="bs",
+        model="opus",
+        quiet=True,
+    )
+
+    assert committed is False  # no latent commit (tree unchanged)
+    assert runner.state.session_id in runner._sessions_with_activity  # but still active
+
+
 def test_runner_git_commit_menu_folds_pending_and_resets_ref(tmp_path):
     runner, repo, state = _manual_runner(tmp_path)
     # One pending latent turn.

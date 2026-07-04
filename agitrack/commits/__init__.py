@@ -2,6 +2,7 @@
 user/agent commit helpers."""
 
 from agitrack.commits.actions import AgitrackActions
+from agitrack.commits.manual import ManualCommitTracker
 from agitrack.commits.message import (
     METADATA_HEADER,
     apply_summary_to_message,
@@ -15,6 +16,7 @@ from agitrack.commits.message import (
 
 __all__ = [
     "AgitrackActions",
+    "ManualCommitTracker",
     "METADATA_HEADER",
     "apply_summary_to_message",
     "build_agent_commit_message",

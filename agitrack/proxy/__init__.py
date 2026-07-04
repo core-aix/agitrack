@@ -9,6 +9,7 @@ Internal helpers prefixed with ``_`` are re-exported for test compatibility
 but are not part of the stable API.
 """
 
+from agitrack.proxy.background import BackgroundRunner
 from agitrack.proxy.commit_engine import CommitEngine
 from agitrack.proxy.integration import IntegrationService, MergeContext, MergePhase
 from agitrack.proxy.process import BackendProcess
@@ -24,6 +25,7 @@ from agitrack.proxy.runner import (
 
 __all__ = [
     # Public production API
+    "BackgroundRunner",
     "CommitEngine",
     "BackendProcess",
     "IntegrationService",

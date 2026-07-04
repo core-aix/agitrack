@@ -758,6 +758,49 @@ def test_parse_rows_subagent_with_no_tool_id_falls_back_to_latest_turn():
     assert session.turns[-1].tokens.subagent_output == 12  # never dropped
 
 
+def test_parse_rows_unmatched_subagent_attributed_by_mtime_not_latest():
+    # An id-less sub-agent (missing/unreadable meta.json) is attributed to the turn that was
+    # ACTIVE at its file mtime — not always the latest turn. Attributing it to a stable,
+    # earlier turn is what lets the commit watermark trim it after it is counted once,
+    # instead of re-attaching (and re-counting) it onto each new turn on every re-parse.
+    from datetime import datetime
+
+    from agitrack.backends.base import TokenUsage
+
+    def _u(uuid, text, ts):
+        return {"type": "user", "uuid": uuid, "timestamp": ts, "message": {"role": "user", "content": text}}
+
+    def _a(msg_id, text, ts, out):
+        return {
+            "type": "assistant",
+            "timestamp": ts,
+            "message": {
+                "id": msg_id,
+                "role": "assistant",
+                "model": "claude-opus-4-8",
+                "content": [{"type": "text", "text": text}],
+                "usage": {"output_tokens": out},
+            },
+        }
+
+    rows = [
+        _u("u1", "first", "2026-01-01T00:00:00Z"),
+        _a("m1", "one", "2026-01-01T00:10:00Z", 5),
+        _u("u2", "second", "2026-01-01T01:00:00Z"),
+        _a("m2", "two", "2026-01-01T01:10:00Z", 5),
+    ]
+    when = int(datetime.fromisoformat("2026-01-01T00:05:00+00:00").timestamp())  # inside turn 1's span
+    session = parse_rows(
+        "sess",
+        rows,
+        subagent_tokens={None: TokenUsage(total=12, subagent_output=12)},
+        unmatched_subagent_time=when,
+    )
+    first, second = session.turns
+    assert first.tokens.subagent_output == 12  # attributed to the turn it ran during
+    assert second.tokens.subagent_output == 0  # NOT the latest turn
+
+
 def test_subagent_token_map_reads_separate_agent_files(tmp_path):
     # The on-disk layout newer Claude Code uses: <session>.jsonl plus a sibling
     # <session>/subagents/agent-*.jsonl (+ .meta.json naming the parent toolUseId).
