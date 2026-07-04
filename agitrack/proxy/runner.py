@@ -1728,12 +1728,15 @@ class ProxyRunner:
         # worktree-mode only; this path is no-worktree/_latent_tracking).
         try:
             if not self.base_repo.core_hooks_path():
-                git_hooks.install_autotrack_precommit_hook(
-                    self.base_repo.hooks_dir(),
-                    python_exe=sys.executable,
-                    repo_root=str(self.base_repo.repo),
-                    debug=self._debug,
-                )
+                if getattr(self.global_config, "autotrack_hook", "keep") == "off":
+                    git_hooks.remove_autotrack_precommit_hook(self.base_repo.hooks_dir(), debug=self._debug)
+                else:
+                    git_hooks.install_autotrack_precommit_hook(
+                        self.base_repo.hooks_dir(),
+                        python_exe=sys.executable,
+                        repo_root=str(self.base_repo.repo),
+                        debug=self._debug,
+                    )
         except Exception as error:
             self._debug(f"autotrack hook install failed: {error!r}")
         # Recovery: drop a stale latent chain left by a prior run (e.g. the user committed
@@ -8627,6 +8630,11 @@ class ProxyRunner:
                 "key": "background_autostart",
                 "label": "Auto-start background tracking on commit when aGiTrack isn't running (best as a repo setting)",
                 "kind": "bool",
+            },
+            {
+                "key": "autotrack_hook",
+                "label": "Persistent pre-commit hook that tracks AI commits when aGiTrack isn't running (keep/off; agitrack --remove-hooks also removes it)",
+                "kind": "text",
             },
             # --- agent behavior ---
             {

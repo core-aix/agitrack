@@ -566,6 +566,37 @@ def _autostart_config(tmp_path):
     return cfg
 
 
+def test_background_hook_prompt_keep_auto_off_and_asks_once(tmp_path, monkeypatch, capsys):
+    # `agitrack -b` explains the persistent hook and records the repo-scoped choice once.
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+
+    def run(answer):
+        cfg = _autostart_config(tmp_path / answer)  # a fresh repo per case
+        monkeypatch.setattr("builtins.input", lambda *a: answer)
+        cli._maybe_prompt_background_hook(cfg, scripted=False)
+        return cfg
+
+    keep = run("k")
+    assert keep.autotrack_hook == "keep" and keep.background_autostart is False
+    auto = run("a")
+    assert auto.autotrack_hook == "keep" and auto.background_autostart is True
+    off = run("o")
+    assert off.autotrack_hook == "off"
+    assert "--remove-hooks" in capsys.readouterr().out  # tells the user how to cancel it
+
+    # Asked once per repo: a second call does not re-prompt.
+    monkeypatch.setattr("builtins.input", lambda *a: (_ for _ in ()).throw(AssertionError("re-prompted")))
+    cli._maybe_prompt_background_hook(keep, scripted=False)
+
+
+def test_background_hook_prompt_skipped_when_scripted(tmp_path, monkeypatch):
+    cfg = _autostart_config(tmp_path)
+    monkeypatch.setattr("builtins.input", lambda *a: (_ for _ in ()).throw(AssertionError("should not prompt")))
+    cli._maybe_prompt_background_hook(cfg, scripted=True)
+    assert cfg.source("autotrack_hook") != "repo"  # nothing recorded
+
+
 def test_autostart_optin_prompts_once_and_persists_repo_scope(tmp_path, monkeypatch, capsys):
     # First interactive no-worktree run: the opt-in is offered and the answer is saved at REPO scope.
     config = _autostart_config(tmp_path)
