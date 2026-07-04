@@ -836,6 +836,8 @@ h2.section::before{content:"# ";color:var(--amber)}
 
 footer{margin-top:46px;padding-top:22px;border-top:1px dashed var(--line);color:var(--fg-dim);font-size:12.5px;
   display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap}
+footer .flink{color:var(--accent,#6be);text-decoration:none}
+footer .flink:hover{text-decoration:underline}
 </style>
 </head>
 <body>
@@ -926,7 +928,9 @@ __UPDATE_BANNER__
   <div class="log" id="commitlog"></div>
 
   <footer>
-    <span>aGiTrack · agent + git tracking · metrics from commit metadata</span>
+    <span>aGiTrack · agent + git tracking · metrics from commit metadata &nbsp;·&nbsp;
+      <a class="flink" href="http://agitrack.core-aix.org/" target="_blank" rel="noopener noreferrer">website</a> &nbsp;·&nbsp;
+      <a class="flink" href="https://github.com/core-aix/agitrack" target="_blank" rel="noopener noreferrer">GitHub</a></span>
     <span id="count"></span>
   </footer>
 </div>

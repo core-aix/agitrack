@@ -65,6 +65,7 @@ def _runner(tmp_path, *, manual: bool):
     runner = BackgroundRunner(repo, manual_commits=manual, _global_config=gc, _state=state)
     runner.backend = FakeBackend()
     runner._make_summarizer = lambda: None  # never spawn a real summarizer LLM in tests
+    runner._summarization_enabled = lambda: False  # ...so auto-fold doesn't wait for a summary
     return runner, repo, state, runner.backend
 
 
@@ -118,10 +119,40 @@ def test_background_auto_folds_pending_into_a_commit_itself(tmp_path):
     log = _git(repo, "log", "--format=%H").split()
     assert len(log) == 2  # init + the auto commit
     msg = _git(repo, "log", "-1", "--format=%B", "HEAD")
-    assert "# aGiTrack Metadata" in msg and "do x" in msg
+    # A CLEAN agent commit: the prompt is the subject (not a generic "commit agent turns"), with a
+    # single agent metadata block — NOT the manual squash-into-a-user-commit format.
+    assert msg.startswith("<aGiTrack> do x")
+    assert "commit agent turns" not in msg
+    assert "commit_type: user" not in msg
+    assert msg.count("# aGiTrack Metadata") == 1 and "commit_type: agent" in msg
     # Ref reset to HEAD, so nothing is pending after the auto commit.
     assert repo.ref_sha(runner._manual.ref()) == repo.rev_parse("HEAD")
     assert runner._manual.pending_count() == 0
+
+
+def test_background_auto_fold_waits_for_summary_then_uses_it_as_subject(tmp_path):
+    # When summarization is on, the auto-fold must WAIT for the LLM summary and use it as the
+    # commit subject/lead (the daemon never amends HEAD, so the summary must be in before commit).
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    runner._summarization_enabled = lambda: True  # summaries on for this test
+    runner._manual.setup()
+    (tmp_path / "a.txt").write_text("one\nagent\n", encoding="utf-8")
+    backend.set_session("s1", [_turn("u1", "m1", "do x", "done", 20)])
+    runner._process_once()
+
+    # No summary note yet ⇒ fold is deferred (no commit made).
+    runner._auto_fold_pending()
+    assert len(_git(repo, "log", "--format=%H").split()) == 1  # still just init
+
+    # The summary lands as a git note on the latent tip; now the fold proceeds and uses it.
+    tip = repo.ref_sha(runner._manual.ref())
+    repo.notes_add(tip, "Add the greeting helper", namespace="agitrack/commit-summary")
+    runner._auto_fold_pending()
+
+    assert len(_git(repo, "log", "--format=%H").split()) == 2
+    msg = _git(repo, "log", "-1", "--format=%B", "HEAD")
+    assert msg.startswith("<aGiTrack> Add the greeting helper")  # summary leads the subject
+    assert "commit_type: agent" in msg
 
 
 def test_background_auto_skips_when_agent_committed_its_own_work(tmp_path):

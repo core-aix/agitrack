@@ -542,6 +542,32 @@ def build_manual_squash_trailer(*, agitrack_session_id: str, latent_bodies: list
     return "\n\n".join([header, *turn_blocks]).rstrip() + "\n"
 
 
+def build_auto_fold_message(latent_bodies: list[str]) -> str:
+    """Commit message for an **AUTO-mode fold**: aGiTrack commits the pending agent turn(s) *itself*,
+    so the message must read like a clean AGENT commit — NOT the manual "squash into a user commit"
+    format (which leads with a generic ``<aGiTrack> commit agent turns`` subject and a spurious
+    ``commit_type: user`` block for work no user committed).
+
+    One pending turn ⇒ its own single-agent-commit body **verbatim**: the subject is the turn's
+    prompt (or, when summarization has run, the LLM summary that ``pending_bodies`` folds into the
+    body — so the subject and lead paragraph are the summary), with one ``# aGiTrack Metadata``
+    block. Several turns ⇒ a squash led by the newest turn's subject with each turn's full body,
+    still with no ``commit_type: user`` header. Returns ``""`` when there are no real turns.
+
+    ``latent_bodies`` come from ``ManualCommitTracker.pending_bodies`` (summaries already applied),
+    the durable source of truth, so the message is reproducible and carries the folded metadata the
+    ``prepare-commit-msg`` hook's idempotency check looks for."""
+    bodies = [text for text in ((body or "").strip() for body in latent_bodies) if text and METADATA_HEADER in text]
+    if not bodies:
+        return ""
+    if len(bodies) == 1:
+        return bodies[0].rstrip() + "\n"  # a clean single agent commit (summary leads when present)
+    # Several turns folded at once: lead with the newest turn's subject, then every turn's full body
+    # (oldest-first, like any squash) — each already carries its own commit_type: agent metadata.
+    newest_subject = bodies[-1].splitlines()[0].strip() or f"{AGITRACK_SUBJECT_PREFIX}agent turns"
+    return newest_subject + "\n\n" + "\n\n".join(bodies).rstrip() + "\n"
+
+
 def _subject_text(text: str, *, width: int) -> str:
     return _subject_parts(text, width=width)[0]
 

@@ -92,6 +92,17 @@ def _demo_repo(tmp_path: Path) -> GitRepo:
     return repo
 
 
+def test_dashboard_links_to_website_and_github(tmp_path):
+    # The dashboard is something users keep open, so it links to the project website and repo.
+    from agitrack.metrics.web import shell_html
+
+    repo = GitRepo.init(tmp_path)
+    repo._run(["git", "commit", "--allow-empty", "-m", "seed"])
+    html = shell_html(repo)
+    assert 'href="http://agitrack.core-aix.org/"' in html
+    assert 'href="https://github.com/core-aix/agitrack"' in html
+
+
 def test_agitrack_integration_merge_is_classified_as_ops_not_untracked(tmp_path):
     repo = GitRepo.init(tmp_path)
     # aGiTrack's own auto-merge bringing base into a session turn branch.

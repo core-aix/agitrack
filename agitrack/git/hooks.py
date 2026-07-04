@@ -266,3 +266,26 @@ def remove_manual_commit_hooks(hooks_dir: Path, *, debug: Callable[[str], None] 
     """Remove the manual-commit-mode hooks and restore any chained originals."""
     _remove_hook(hooks_dir, "prepare-commit-msg", _MANUAL_MSG_MARKER, debug=debug)
     _remove_hook(hooks_dir, "post-commit", _MANUAL_DONE_MARKER, debug=debug)
+
+
+def remove_all_installed_hooks(hooks_dir: Path, *, debug: Callable[[str], None] | None = None) -> list[str]:
+    """Remove EVERY aGiTrack-installed git hook (the persistent auto-track ``pre-commit``, the
+    worktree base-commit guard, and the manual-commit ``prepare-commit-msg`` / ``post-commit`` fold
+    hooks), restoring any hooks they chained. Returns the hook names that were ours and got removed.
+    Used by ``agitrack --remove-hooks`` so a user can fully opt out of commit-time tracking."""
+    removed: list[str] = []
+    # pre-commit is listed twice (auto-track, then the guard) so a chained guard restored by the
+    # first removal is itself removed by the second — _remove_hook is a no-op unless the current
+    # hook carries that exact marker.
+    for name, marker in (
+        ("pre-commit", _AUTOTRACK_MARKER),
+        ("pre-commit", _MARKER),
+        ("prepare-commit-msg", _MANUAL_MSG_MARKER),
+        ("post-commit", _MANUAL_DONE_MARKER),
+    ):
+        hook = hooks_dir / name
+        if hook.exists() and _hook_has_marker(hook, marker):
+            _remove_hook(hooks_dir, name, marker, debug=debug)
+            if name not in removed:
+                removed.append(name)
+    return removed
