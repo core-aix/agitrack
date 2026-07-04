@@ -127,7 +127,7 @@ exit 0
 # still gets its AI work tracked. On commit it invokes ``agitrack --precommit-sync`` (with the
 # python + repo baked in at install time, so it needs nothing on PATH), which — only when the AI
 # actually made changes — records the pending turns and renders the fold trailer so the trace and
-# metadata land in THIS commit, and (when ``background_autostart`` is set) starts the background
+# metadata land in THIS commit, and (unless ``autotrack_hook`` is off) auto-starts the background
 # tracker for future commits. Best-effort and non-blocking: it never fails a commit, adds no
 # footprint to a purely human commit, and is a no-op inside a linked worktree (aGiTrack drives
 # those itself). It chains any pre-existing pre-commit hook, and coexists with the worktree guard
@@ -141,8 +141,8 @@ def _autotrack_precommit_script(python_exe: str, repo_root: str) -> str:
 {_AUTOTRACK_MARKER}
 # Installed by aGiTrack. On `git commit`, if aGiTrack is not already tracking this repo, record
 # any pending AI turns and fold their interaction trace + token metadata into THIS commit (only
-# when the AI made changes since the last commit), and — if background_autostart is on — start the
-# background tracker for future commits. Best-effort and non-blocking: it never fails the commit.
+# when the AI made changes since the last commit), and auto-start the background tracker for the
+# turns that follow. Best-effort and non-blocking: it never fails the commit.
 case "$(git rev-parse --absolute-git-dir 2>/dev/null)" in
   */worktrees/*)
     : ;;  # inside a session worktree -> aGiTrack already handles it

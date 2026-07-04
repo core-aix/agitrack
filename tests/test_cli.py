@@ -566,26 +566,24 @@ def _autostart_config(tmp_path):
     return cfg
 
 
-def test_background_hook_prompt_keep_auto_off_and_asks_once(tmp_path, monkeypatch, capsys):
-    # `agitrack -b` explains the persistent hook and records the repo-scoped choice once.
+def test_background_hook_prompt_enable_off_and_asks_once(tmp_path, monkeypatch, capsys):
+    # `agitrack -b` explains the auto-start hook and records the repo-scoped choice once.
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
     monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
 
     def run(answer):
-        cfg = _autostart_config(tmp_path / answer)  # a fresh repo per case
+        cfg = _autostart_config(tmp_path / (answer or "default"))  # a fresh repo per case
         monkeypatch.setattr("builtins.input", lambda *a: answer)
         cli._maybe_prompt_background_hook(cfg, scripted=False)
         return cfg
 
-    keep = run("k")
-    assert keep.autotrack_hook == "keep" and keep.background_autostart is False
-    auto = run("a")
-    assert auto.autotrack_hook == "keep" and auto.background_autostart is True
-    off = run("o")
-    assert off.autotrack_hook == "off"
+    assert run("").autotrack_hook == "auto"  # default (Enter) enables auto-start
+    assert run("y").autotrack_hook == "auto"
+    assert run("n").autotrack_hook == "off"
     assert "--remove-hooks" in capsys.readouterr().out  # tells the user how to cancel it
 
     # Asked once per repo: a second call does not re-prompt.
+    keep = run("y")
     monkeypatch.setattr("builtins.input", lambda *a: (_ for _ in ()).throw(AssertionError("re-prompted")))
     cli._maybe_prompt_background_hook(keep, scripted=False)
 
@@ -594,34 +592,7 @@ def test_background_hook_prompt_skipped_when_scripted(tmp_path, monkeypatch):
     cfg = _autostart_config(tmp_path)
     monkeypatch.setattr("builtins.input", lambda *a: (_ for _ in ()).throw(AssertionError("should not prompt")))
     cli._maybe_prompt_background_hook(cfg, scripted=True)
-    assert cfg.source("autotrack_hook") != "repo"  # nothing recorded
-
-
-def test_autostart_optin_prompts_once_and_persists_repo_scope(tmp_path, monkeypatch, capsys):
-    # First interactive no-worktree run: the opt-in is offered and the answer is saved at REPO scope.
-    config = _autostart_config(tmp_path)
-    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
-    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
-    monkeypatch.setattr("builtins.input", lambda *a: "y")
-
-    cli._maybe_prompt_autostart_optin(config, scripted=False, use_worktrees=False)
-
-    assert config.background_autostart is True
-    assert config.source("background_autostart") == "repo"  # a repo-scoped decision
-    # A second run does not prompt again (would raise if input() were called).
-    monkeypatch.setattr("builtins.input", lambda *a: (_ for _ in ()).throw(AssertionError("prompted twice")))
-    cli._maybe_prompt_autostart_optin(config, scripted=False, use_worktrees=False)
-
-
-def test_autostart_optin_skipped_in_worktree_and_scripted(tmp_path, monkeypatch):
-    config = _autostart_config(tmp_path)
-    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
-    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
-    monkeypatch.setattr("builtins.input", lambda *a: (_ for _ in ()).throw(AssertionError("should not prompt")))
-
-    cli._maybe_prompt_autostart_optin(config, scripted=True, use_worktrees=False)  # scripted
-    cli._maybe_prompt_autostart_optin(config, scripted=False, use_worktrees=True)  # worktree mode
-    assert config.source("background_autostart") != "repo"  # nothing recorded
+    assert cfg.source("autotrack_hook") != "repo"  # nothing recorded (default 'auto' stays implicit)
 
 
 def _stub_bg_daemon(monkeypatch):

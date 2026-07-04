@@ -128,6 +128,7 @@ Conventions:
 | `-b stop` / `-b status` target the daemon via its handshake | `test_background_status_*`, `test_background_stop_cleans_stale_handshake`, `test_background_run_writes_and_removes_handshake` | mock |
 | `-b` refused when another instance holds the repo lock | `test_background_refused_when_another_instance_holds_the_repo` | mock |
 | Daemon / proxy write a user event log (`--log-file` / `log_file`): daemon-start, ai-change-detected, commit | `test_background_writes_event_log`, `tests/test_events.py::*` | real-git + unit |
+| `agitrack --status` / `-s` reports the running mode (background / interactive / not running; auto/manual; worktree/no-worktree) | `test_repo_status_reports_each_mode`, `test_proxy_status_write_and_clear` | real-git |
 
 ## 9c. Persistent auto-track pre-commit hook (remind / auto-start on commit)
 | Sequence | Test(s) | Kind |
@@ -137,12 +138,13 @@ Conventions:
 | `--precommit-sync` records pending AI turns + folds the trace into the triggering commit | `test_precommit_sync_folds_ai_work_into_the_commit` | real-git |
 | No AI work since last commit → no footprint (no trailer, no nag) | `test_precommit_sync_no_ai_work_is_a_noop` | real-git |
 | Defers to a live tracker (never double-tracks) | `test_precommit_sync_defers_to_a_running_tracker` | real-git |
-| `background_autostart` on → sync also starts the daemon for future commits | `test_precommit_sync_autostart_spawns_daemon` | real-git |
-| First interactive no-worktree run offers the repo-scoped auto-start opt-in | `test_autostart_optin_prompts_once_and_persists_repo_scope`, `test_autostart_optin_skipped_in_worktree_and_scripted` | mock |
-| `agitrack -b` explains the persistent hook + asks keep/auto-start/off once per repo (shows how to remove) | `test_background_hook_prompt_keep_auto_off_and_asks_once`, `test_background_hook_prompt_skipped_when_scripted` | mock |
+| Sync auto-starts the daemon in the LAST run's commit mode (persisted); `off` folds but never spawns | `test_precommit_sync_autostart_spawns_daemon`, `test_precommit_sync_off_does_not_spawn_daemon`, `test_background_mode_persist_roundtrip` | real-git |
+| `agitrack -b` explains the auto-start hook + asks enable/off once per repo (default on; shows how to remove) | `test_background_hook_prompt_enable_off_and_asks_once`, `test_background_hook_prompt_skipped_when_scripted` | mock |
 | Daemon honors `autotrack_hook`: installs by default, REMOVES the hook when off | `test_daemon_installs_autotrack_hook_by_default_and_skips_when_off` | real-git |
 | AUTO fold writes a CLEAN agent commit (prompt/summary subject, one metadata block — not the squash-into-user format) | `test_background_auto_folds_pending_into_a_commit_itself`, `test_noworktree_auto_folds_latent_turn_into_commit` | real-git |
 | Daemon AUTO fold waits for the LLM summary, then uses it as the subject | `test_background_auto_fold_waits_for_summary_then_uses_it_as_subject` | real-git |
+| AUTO fold bails early (doesn't hang) when the summary worker finished without a note | `test_fold_summary_ready_bails_when_worker_finished_without_note` | real-git |
+| Global `summarization_enabled: false` wins in background mode (not shadowed by state default) | `test_global_summarization_disabled_is_not_shadowed_by_state_default` | mock |
 | `agitrack --remove-hooks` removes all aGiTrack hooks, restores chained originals | `test_remove_all_installed_hooks_removes_everything_and_restores_chains`, `_noop_when_none` | real-git |
 | `.agitrack/` git-ignored before the daemon/hook write state (no `git add -A` leak) | `test_precommit_sync_git_ignores_agitrack_dir` | real-git |
 | **Session discovery is strictly repo-scoped — no cross-repo trace/token contamination** | `test_claude_session.py::test_session_discovery_is_strictly_repo_scoped`, `test_opencode_session.py::test_session_belongs_to_repo` / `_no_matching_directory_returns_no_sessions` | real-git + mock |

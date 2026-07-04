@@ -114,6 +114,111 @@ def background_log_path(repo: GitRepo) -> Path:
     return repo.repo / ".agitrack" / "background.log"
 
 
+def proxy_status_path(repo: GitRepo) -> Path:
+    """Where the INTERACTIVE proxy records its pid + mode so `agitrack --status` can report it
+    (the daemon uses ``background.json`; the shared repo lock only carries a pid, not the mode)."""
+    return repo.repo / ".agitrack" / "session.json"
+
+
+def write_proxy_status(repo: GitRepo, *, commits: str, worktree: bool) -> None:
+    """Record the running interactive session's mode for `--status` (best-effort)."""
+    try:
+        path = proxy_status_path(repo)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"pid": os.getpid(), "mode": "interactive", "commits": commits, "worktree": bool(worktree)}),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def clear_proxy_status(repo: GitRepo) -> None:
+    try:
+        path = proxy_status_path(repo)
+        info = None
+        try:
+            info = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            info = None
+        if info is None or info.get("pid") == os.getpid():  # only clear our own record
+            path.unlink()
+    except OSError:
+        pass
+
+
+def _read_proxy_status(repo: GitRepo) -> dict | None:
+    try:
+        data = json.loads(proxy_status_path(repo).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def repo_status(repo: GitRepo) -> int:
+    """`agitrack --status` / `-s`: report whether aGiTrack is running for this repo and in which
+    mode (interactive vs background, auto vs manual commit, worktree vs no-worktree)."""
+    from agitrack.git import RepoLock
+    from agitrack.update.marker import update_reminder_line
+
+    def _commit_mode(handshake_mode: object) -> str:
+        return "manual-commit" if isinstance(handshake_mode, str) and "manual" in handshake_mode else "auto-commit"
+
+    bg_pid = _live_background_pid(repo)
+    if bg_pid is not None:
+        info = _read_handshake(repo) or {}
+        print(
+            f"aGiTrack is running in BACKGROUND mode (PID {bg_pid}): "
+            f"{_commit_mode(info.get('mode'))}, no worktree, backend {info.get('backend', '?')}."
+        )
+    else:
+        proxy = _read_proxy_status(repo)
+        proxy_pid = proxy.get("pid") if proxy else None
+        if proxy is not None and isinstance(proxy_pid, int) and pid_alive(proxy_pid):
+            commits = "manual-commit" if proxy.get("commits") == "manual" else "auto-commit"
+            worktree = "worktree" if proxy.get("worktree") else "no worktree"
+            print(f"aGiTrack is running in INTERACTIVE mode (PID {proxy_pid}): {commits}, {worktree}.")
+        else:
+            owner = RepoLock(repo.repo / ".agitrack" / "lock").owner_pid()
+            if isinstance(owner, int) and pid_alive(owner):
+                print(f"aGiTrack is running for this repo (PID {owner}); mode details are unavailable.")
+            else:
+                print("aGiTrack is not running for this repo.")
+    reminder = update_reminder_line(repo.repo)
+    if reminder:
+        print(reminder)
+    return 0
+
+
+def _background_mode_path(repo: GitRepo) -> Path:
+    return repo.repo / ".agitrack" / "background-mode"
+
+
+def write_background_mode(repo: GitRepo, *, manual: bool) -> None:
+    """Persist the commit mode of the LAST background run ("manual"/"auto"), so an auto-start on a
+    later commit can resume the same mode. Survives the daemon stopping (unlike the handshake)."""
+    try:
+        path = _background_mode_path(repo)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("manual" if manual else "auto", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def read_background_mode(repo: GitRepo) -> bool | None:
+    """The last background run's commit mode as ``manual`` (True) / ``auto`` (False), or None when
+    no run has been recorded yet."""
+    try:
+        text = _background_mode_path(repo).read_text(encoding="utf-8").strip().lower()
+    except OSError:
+        return None
+    if text == "manual":
+        return True
+    if text == "auto":
+        return False
+    return None
+
+
 def _open_log(repo: GitRepo) -> Any:
     try:
         path = background_log_path(repo)
@@ -227,7 +332,6 @@ def precommit_sync(repo: GitRepo, *, backend_command: list[str] | None = None) -
         return 0
     config = GlobalConfig()
     config.load_repo_overlay(repo.repo)
-    manual_mode = config.manual_commits
     synced = False
     try:
         # manual_commits=True gives fold-into-the-user's-commit semantics: record the pending AI
@@ -248,17 +352,19 @@ def precommit_sync(repo: GitRepo, *, backend_command: list[str] | None = None) -
         lock.release()  # release BEFORE spawning the daemon, which takes its own lock
     if not synced:
         return 0  # no AI work since the last commit ⇒ no footprint, no nag
-    if config.background_autostart and _live_background_pid(repo) is None:
-        # Start the persistent tracker for FUTURE commits (fire-and-forget — the current commit is
-        # already handled by the trailer we just rendered). It runs in the user's configured mode.
-        spawn_background_daemon(repo, extra_args=["--manual-commits" if manual_mode else "--auto-commit"])
+    if config.autotrack_hook != "off" and _live_background_pid(repo) is None:
+        # Auto-start the background tracker for the turns that FOLLOW (the current commit is already
+        # handled by the trailer we just rendered — it stays the author's own manual commit). Use the
+        # same commit mode as the last run; the *starting* commit is manual regardless.
+        manual = read_background_mode(repo)
+        if manual is None:
+            manual = config.manual_commits
+        spawn_background_daemon(repo, extra_args=["--manual-commits" if manual else "--auto-commit"])
+        mode_label = "manual" if manual else "auto"
         print(
-            "aGiTrack: auto-started background tracking for this repo (stop with `agitrack -b stop`).",
-            file=sys.stderr,
-        )
-    else:
-        print(
-            "aGiTrack: tracked this commit's AI work. Start `agitrack -b` for continuous background tracking.",
+            f"aGiTrack: started automatically in {mode_label}-commit mode (same as last run) to keep tracking — "
+            f"this commit stays your own. Stop it with `agitrack -b stop`; disable auto-start with "
+            f"`agitrack --remove-hooks`.",
             file=sys.stderr,
         )
     return 0
@@ -300,6 +406,10 @@ class BackgroundRunner:
         # summary, not the raw prompt. Tracks the latent tip we're waiting on and since when.
         self._fold_wait_tip: str | None = None
         self._fold_wait_since: float | None = None
+        # Summary worker threads keyed by the latent commit sha, so the fold can tell a summary
+        # that's still computing from one that already FINISHED (and, if it produced no note, fold
+        # now instead of waiting out the full summary_wait_seconds — e.g. the summarizer errored).
+        self._summary_threads: dict[str, threading.Thread] = {}
 
         self.global_config = _global_config if _global_config is not None else GlobalConfig()
         if getattr(self.global_config, "repo_path", "set") is None:
@@ -345,6 +455,7 @@ class BackgroundRunner:
             self._print(f"backend '{self.state.backend}' is not installed.")
             return 1
         self.state.ensure_local_ignore()  # git-ignore .agitrack/ before we write any state there
+        write_background_mode(self.repo, manual=self._manual_commits)  # so an auto-start resumes this mode
         self._write_handshake()
         self._manual.setup()
         self._install_autotrack_hook()
@@ -454,7 +565,7 @@ class BackgroundRunner:
             if self.repo.core_hooks_path():
                 self._debug("autotrack hook skipped: core.hooksPath is set")
                 return
-            if getattr(self.global_config, "autotrack_hook", "keep") == "off":
+            if getattr(self.global_config, "autotrack_hook", "auto") == "off":
                 git_hooks.remove_autotrack_precommit_hook(self.repo.hooks_dir(), debug=self._debug)
                 self._debug("autotrack hook removed (autotrack_hook=off)")
                 return
@@ -619,8 +730,9 @@ class BackgroundRunner:
 
     def _fold_summary_ready(self, tip: str) -> bool:
         """True when the auto-fold may proceed: summarization off, the tip's summary note has
-        landed, or the bounded wait (``summary_wait_seconds``) has elapsed. Returns False while the
-        summary is still pending and within the wait window (so the caller retries next cycle)."""
+        landed, the summary worker already finished WITHOUT one (it errored — don't wait it out), or
+        the bounded wait (``summary_wait_seconds``) elapsed. Returns False only while a summary is
+        genuinely still computing and within the wait window (so the caller retries next cycle)."""
         if not self._summarization_enabled():
             return True
         try:
@@ -629,6 +741,12 @@ class BackgroundRunner:
                 return True
         except Exception:
             return True  # can't read notes ⇒ don't block folding
+        worker = self._summary_threads.get(tip)
+        if worker is not None and not worker.is_alive():
+            # The summary worker for this turn finished but left no note (the summarizer errored or
+            # returned nothing). Fold now rather than waiting out the full deadline for a summary
+            # that will never arrive — the commit just keeps its raw-prompt subject.
+            return True
         now = time.monotonic()
         if self._fold_wait_tip != tip:  # a new tip to wait on — restart the clock
             self._fold_wait_tip = tip
@@ -648,10 +766,14 @@ class BackgroundRunner:
     # ------------------------------------------------------------------
 
     def _summarization_enabled(self) -> bool:
-        value = self.state.summarization_enabled
-        if value is None and self.global_config is not None:
-            value = self.global_config.summarization_enabled
-        return bool(value)
+        # The GLOBAL config (with repo overlay) is the durable source of truth and wins — matching
+        # the proxy (ProxyRunner._summarization_enabled). The per-repo AgitrackState always defaults
+        # "on", so it must NOT shadow a global/repo `summarization_enabled: false` or the toggle
+        # would never take effect in background mode. Fall back to state only with no global config.
+        gc_enabled = getattr(self.global_config, "summarization_enabled", None)
+        if gc_enabled is not None:
+            return bool(gc_enabled)
+        return bool(getattr(self.state, "summarization_enabled", True))
 
     def _make_summarizer(self):
         if not self._summarization_enabled():
@@ -693,4 +815,6 @@ class BackgroundRunner:
             except Exception as error:
                 self._debug(f"summary note failed for {sha}: {error!r}")
 
-        threading.Thread(target=worker, name="agit-bg-summary", daemon=True).start()
+        thread = threading.Thread(target=worker, name="agit-bg-summary", daemon=True)
+        self._summary_threads[full_sha] = thread
+        thread.start()

@@ -419,13 +419,13 @@ def test_background_writes_event_log(tmp_path):
 
 def _precommit_env(tmp_path, monkeypatch, backend: "FakeBackend", *, autostart: bool = False):
     """Set up a repo + injected fake backend so precommit_sync (which builds its own
-    BackgroundRunner via make_proxy_agent) runs in-process against the fake."""
+    BackgroundRunner via make_proxy_agent) runs in-process against the fake. ``autostart=False``
+    sets ``autotrack_hook: off`` so the fold happens WITHOUT spawning a real daemon subprocess."""
     cfg = tmp_path / "cfg"
     cfg.mkdir()
     monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(cfg))
-    (cfg / "config.json").write_text(
-        f'{{"default_backend": "claude", "background_autostart": {str(autostart).lower()}}}', encoding="utf-8"
-    )
+    hook = "auto" if autostart else "off"
+    (cfg / "config.json").write_text(f'{{"default_backend": "claude", "autotrack_hook": "{hook}"}}', encoding="utf-8")
     monkeypatch.setattr("agitrack.proxy.background.make_proxy_agent", lambda name: backend)
     monkeypatch.setattr("agitrack.backends.setup.backend_installed", lambda name: True)
 
@@ -512,19 +512,129 @@ def test_precommit_sync_defers_to_a_running_tracker(tmp_path, monkeypatch):
 
 
 def test_precommit_sync_autostart_spawns_daemon(tmp_path, monkeypatch):
-    # With background_autostart on, the sync also starts the background daemon for future commits.
+    # By default (autotrack_hook=auto) the sync also auto-starts the daemon for future commits,
+    # in the SAME commit mode as the last run (persisted via write_background_mode).
     from agitrack.proxy import background as bg
 
     repo = _init_repo(tmp_path)
     backend = FakeBackend()
     backend.set_session("s1", [_turn("u1", "m1", "do x", "done", 20)])
     _precommit_env(tmp_path, monkeypatch, backend, autostart=True)
+    bg.write_background_mode(repo, manual=True)  # last run was manual-commit mode
     spawned = []
     monkeypatch.setattr(bg, "spawn_background_daemon", lambda repo, *, extra_args: spawned.append(extra_args))
     (tmp_path / "a.txt").write_text("one\nagent edit\n", encoding="utf-8")
 
     assert bg.precommit_sync(repo) == 0
-    assert spawned and "--auto-commit" in spawned[0]  # daemon started in the configured (auto) mode
+    assert spawned and "--manual-commits" in spawned[0]  # resumes the last run's mode
+
+
+def test_precommit_sync_off_does_not_spawn_daemon(tmp_path, monkeypatch):
+    # autotrack_hook=off: the sync still folds the AI work into the commit but never auto-starts.
+    from agitrack.proxy import background as bg
+
+    repo = _init_repo(tmp_path)
+    backend = FakeBackend()
+    backend.set_session("s1", [_turn("u1", "m1", "do x", "done", 20)])
+    _precommit_env(tmp_path, monkeypatch, backend, autostart=False)  # -> autotrack_hook: off
+    spawned = []
+    monkeypatch.setattr(bg, "spawn_background_daemon", lambda *a, **k: spawned.append(k))
+    (tmp_path / "a.txt").write_text("one\nagent edit\n", encoding="utf-8")
+
+    assert bg.precommit_sync(repo) == 0
+    assert spawned == []  # folded, but no daemon started
+    assert "# aGiTrack Metadata" in (repo.repo / ".agitrack" / "manual-pending-trailer").read_text()
+
+
+def test_repo_status_reports_each_mode(tmp_path, capsys):
+    import json
+    import os
+
+    from agitrack.proxy import background as bg
+
+    repo = _init_repo(tmp_path)
+    agit = repo.repo / ".agitrack"
+    agit.mkdir(exist_ok=True)
+
+    # Not running.
+    assert bg.repo_status(repo) == 0
+    assert "not running" in capsys.readouterr().out.lower()
+
+    # Background daemon (live pid via our own pid) with a manual-commit handshake.
+    bg.background_handshake_path(repo).write_text(
+        json.dumps({"pid": os.getpid(), "mode": "manual commits", "backend": "opencode"}), encoding="utf-8"
+    )
+    assert bg.repo_status(repo) == 0
+    out = capsys.readouterr().out
+    assert "BACKGROUND" in out and "manual-commit" in out and "no worktree" in out and "opencode" in out
+    bg.background_handshake_path(repo).unlink()
+
+    # Interactive proxy (live pid) with worktree + auto commit.
+    bg.proxy_status_path(repo).write_text(
+        json.dumps({"pid": os.getpid(), "mode": "interactive", "commits": "auto", "worktree": True}), encoding="utf-8"
+    )
+    assert bg.repo_status(repo) == 0
+    out = capsys.readouterr().out
+    assert "INTERACTIVE" in out and "auto-commit" in out and "worktree" in out and "no worktree" not in out
+
+
+def test_proxy_status_write_and_clear(tmp_path):
+    from agitrack.proxy import background as bg
+
+    repo = _init_repo(tmp_path)
+    (repo.repo / ".agitrack").mkdir(exist_ok=True)
+    bg.write_proxy_status(repo, commits="manual", worktree=False)
+    info = bg._read_proxy_status(repo)
+    assert info["commits"] == "manual" and info["worktree"] is False
+    bg.clear_proxy_status(repo)
+    assert bg._read_proxy_status(repo) is None
+
+
+def test_global_summarization_disabled_is_not_shadowed_by_state_default(tmp_path):
+    # A global `summarization_enabled: false` must win — the per-repo AgitrackState defaults it to
+    # True, and that default must NOT shadow the global toggle (else you can't turn it off in bg).
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    del runner._summarization_enabled  # drop the test stub to exercise the real method
+    runner.global_config.summarization_enabled = False
+    assert state.summarization_enabled is True  # state still defaults on
+    assert runner._summarization_enabled() is False  # ...but the global 'off' wins
+
+
+def test_fold_summary_ready_bails_when_worker_finished_without_note(tmp_path):
+    # When the summary worker has finished but produced NO note (the summarizer errored), the fold
+    # must proceed immediately rather than waiting out the full summary_wait_seconds.
+    import threading
+
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    runner._summarization_enabled = lambda: True
+    runner._manual.setup()
+    (tmp_path / "a.txt").write_text("one\nagent\n", encoding="utf-8")
+    backend.set_session("s1", [_turn("u1", "m1", "do x", "done", 20)])
+    runner._process_once()
+    tip = repo.ref_sha(runner._manual.ref())
+
+    # No note, and a still-running worker ⇒ keep waiting.
+    alive = threading.Event()
+    t = threading.Thread(target=alive.wait)
+    t.start()
+    runner._summary_threads[tip] = t
+    assert runner._fold_summary_ready(tip) is False
+    alive.set()
+    t.join()
+
+    # Worker finished with no note ⇒ fold now (don't wait out the deadline).
+    assert runner._fold_summary_ready(tip) is True
+
+
+def test_background_mode_persist_roundtrip(tmp_path):
+    from agitrack.proxy import background as bg
+
+    repo = _init_repo(tmp_path)
+    assert bg.read_background_mode(repo) is None  # nothing recorded yet
+    bg.write_background_mode(repo, manual=True)
+    assert bg.read_background_mode(repo) is True
+    bg.write_background_mode(repo, manual=False)
+    assert bg.read_background_mode(repo) is False
 
 
 def test_daemon_update_check_writes_marker_and_clears(tmp_path, monkeypatch):
