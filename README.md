@@ -99,7 +99,7 @@ pip install -e .
 
 (If your Python is externally managed, use `pipx install -e .` instead.)
 
----
+### Prerequisites aGiTrack can install for you
 
 **aGiTrack can set up its prerequisites for you.** On an interactive launch it offers to install whatever's missing, then makes sure git can commit:
 
@@ -221,7 +221,7 @@ To turn it off at any time, run `agitrack --remove-hooks` — it removes every a
 
 A background daemon periodically checks whether a newer aGiTrack is available (it **never** auto-installs — installing may need pip/pipx/brew/an MSI). When one is found it records it and reminds you where you'll actually see it: in `agitrack -b status`, in the `git commit` output (via the pre-commit hook), and as a banner on the [dashboard](#dashboard). Turn the checks off with `"check_for_updates": false`.
 
-
+### First run and the command menu
 
 On the first run, aGiTrack asks which backend should be the default (listed alphabetically, with each backend's install status). If the chosen backend's CLI is not installed, aGiTrack shows install instructions and lets you install it or pick a different one. The choice is saved in `~/.agitrack/config.json` (`default_backend`) and reused for future runs. You can also switch backends mid-session with the `agent-backend` command below.
 
@@ -245,9 +245,7 @@ one) and which branch to merge into: the branch checked out in your directory, t
 session's own merge branch, or any other branch. A worktree with uncommitted changes is
 **committed first, then merged**; a conflict surfaces the usual resolve options.
 
-aGiTrack tracks one session per repository and stays pinned to the session it launched (so it does not drift to other sessions you open). Use the `session` command (`Ctrl-G`, then `session`) to start a new session, switch the tracked session to another existing one, or sync tracking to the most recently active session — for example after starting a new conversation inside the backend's own TUI. This works the same for all backends.
-
-Only `session` starts with `s`, so `Ctrl-G` then `s` + Enter jumps straight to the session picker. The session menu marks each session `running` or `idle`. Git-specific commands share a `git-` prefix.
+aGiTrack tracks one session per repository and stays pinned to the session it launched, so it never drifts to other conversations you open. Use the `session` command to start a new session, switch the tracked session to another existing one, or sync tracking to the most recently active session (for example after starting a fresh conversation inside the backend's own TUI) — this works the same for all backends. Only `session` starts with `s`, so `Ctrl-G` then `s` + Enter jumps straight to the picker, which marks each session `running` or `idle`; git-specific commands share a `git-` prefix. See [Session tracking](#session-tracking) below for how sessions are named, forked, and tracked.
 
 
 
@@ -399,7 +397,7 @@ When it launches a coding agent, aGiTrack appends a note to the agent's system p
 
 ### Repository dashboard
 
-`agitrack --dashboard` (or `-d`) opens a live web dashboard of repository metrics computed entirely from the aGiTrack metadata in commit messages — no extra state, so the numbers are identical on every clone. It is served on `localhost`, opens in your browser, and **auto-refreshes** (the page polls the server, which recomputes from `git log` on each request), so you can watch metrics update as an agent commits. Press Ctrl-C to stop.
+The [Dashboard](#dashboard) section above covers how to run it (`-d`, and `-d text` for a one-shot plain-text report); this is the full breakdown of **what it computes and how each commit is classified** — all from the aGiTrack metadata in commit messages, so the numbers are identical on every clone.
 
 - **Coverage**: how many commits are aGiTrack-tracked (agent commits, backend-made commits covered by an aGiTrack cover commit, agent-resolved merges, user commits, and aGiTrack's own integration merges) versus non-tracked.
 - **Code changes**: lines added/removed split two ways — **aGiTrack-tracked AI** (agent commits + the backend-made commits an aGiTrack cover commit accounts for + agent-resolved merges) and **non-tracked** (everything else: user commits, plain commits with no aGiTrack metadata, and squash/PR-merge commits whose message concatenates several metadata blocks and so can't be cleanly attributed). There is deliberately no "human" category — even a user-made commit can contain lines an agent produced off the record, so the only honest claim is whether aGiTrack tracked the lines as AI. Cover commits are merges and contribute no line counts of their own, so a turn's lines are never double-counted.
@@ -411,9 +409,7 @@ When it launches a coding agent, aGiTrack appends a note to the agent's system p
 
 The web page (styled like the [project page](https://github.com/core-aix/agitrack/tree/main/docs)) lets you **filter live** — narrow the whole dashboard to one committer or view the entire team, slice by backend or model, or restrict to a **time range** (presets or a custom from/to). The server recomputes the metrics for each filter, and the **commit log is paginated** (fetched a page at a time), so the browser never holds the whole history — memory stays bounded no matter how big the repo is. Each log line shows per-line token metrics; clicking a line opens the full commit message **rendered as Markdown** with a link to the commit on GitHub, and a squash expands into its original commits (each itself expandable). Agent commits also record when the AI-driven conversation started and ended (`agent_started_at` / `agent_ended_at` in the metadata block).
 
-`agitrack --dashboard text` (or `-d text`) prints the same metrics as a one-shot plain-text report instead of serving — handy for piping or pasting into an issue.
-
-The dashboard is read-only in either form: it never commits, never prompts, and skips the privacy acknowledgment.
+The dashboard is read-only in either form (served or `-d text`): it never commits, never prompts, and skips the privacy acknowledgment.
 
 ### Self-update
 
@@ -424,9 +420,6 @@ aGiTrack keeps itself current. On startup, and then about every five minutes whi
 - **Windows MSI install** (the standalone installer above): it checks the [GitHub releases](https://github.com/core-aix/agitrack/releases/latest) for a newer `agitrack-<version>-windows-x64.msi`, downloads it, and re-runs the installer. Because the MSI replaces the running `agitrack.exe`, the install happens through an elevated helper after aGiTrack exits — you'll see a **UAC prompt** (and, since the MSI is unsigned, possibly a SmartScreen warning to *Run anyway*); accept it and aGiTrack reinstalls and relaunches itself with your original options. Decline the prompt and you simply stay on the current version, with a reminder to update manually.
 
 If an update exists, aGiTrack prompts you at startup and shows a notice during a session (run the `update` command from the `Ctrl-G` menu to act on it). When you accept, aGiTrack waits until **every session has finished and all commits are integrated**, installs the update, then restarts itself automatically. It never interrupts a merge: while any session is resolving a merge/conflict, the notice is held back and an accepted update is deferred until the merge is done. A source update **merges** the upstream branch into the checkout — a clean checkout fast-forwards and a diverged one (your own commits, or aGiTrack's session integrations) gets a normal merge — so it pulls in new code without discarding local work; if the checkout has uncommitted changes it's skipped with a message, and if the merge hits a genuine conflict aGiTrack aborts it (leaving the source clean) and tells you automatic update isn't possible until you resolve it. When only the running process is behind the on-disk code, no download happens — aGiTrack just restarts to load it. Choose "Stop checking for updates" — or set `"check_for_updates": false` in `~/.agitrack/config.json` — to turn the checks off; tune the cadence with `timings.update_check_seconds`.
-
-
-Proxy mode launches the backend's native TUI directly and recovers session metadata for automatic agent commits — via `opencode export` for OpenCode, or by reading the session transcript under `~/.claude/projects/` for Claude.
 
 ## Advanced Usage
 
