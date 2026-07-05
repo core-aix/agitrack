@@ -127,10 +127,12 @@ a:hover{color:var(--ink);background:var(--phosphor);border-bottom-color:var(--ph
 /* Wrap long node labels: with the label width capped, mermaid measures the wrapped text and sizes
    the box to it — so long text breaks over several lines instead of one enormous single-line box.
    Uses overflow-wrap (NOT word-break: break-word, which collapses min-content to one char per line
-   inside mermaid's flex label and stacks short labels vertically). Short labels stay on one line. */
-.mermaid .nodeLabel,.mermaid .nodeLabel p{max-width:300px;white-space:normal!important;overflow-wrap:break-word}
-.mermaid .nodeLabel{display:inline-block}
-.mermaid .nodeLabel p{margin:0}
+   inside mermaid's flex label and stacks short labels vertically). Short labels stay on one line.
+   Deliberately UNSCOPED (not `.mermaid .nodeLabel`) so the same wrapping applies to the cloned SVG
+   in the zoom lightbox — otherwise the clone loses these rules and its text reflows and gets cut off. */
+.nodeLabel{display:inline-block;width:max-content;max-width:380px}
+.nodeLabel,.nodeLabel p{white-space:normal!important;overflow-wrap:break-word}
+.nodeLabel p{max-width:380px;margin:0}
 .mermaid::after{
   content:"⤢ click to zoom";position:absolute;top:8px;right:10px;font-size:11px;
   color:var(--amber);border:1px solid var(--amber-dim);padding:1px 7px;border-radius:3px;
@@ -139,7 +141,7 @@ a:hover{color:var(--ink);background:var(--phosphor);border-bottom-color:var(--ph
 .mermaid:hover::after{opacity:1}
 
 /* zoom lightbox */
-.zoom{position:fixed;inset:0;z-index:80;background:rgba(4,7,5,.97);display:flex;flex-direction:column}
+.zoom{position:fixed;inset:0;z-index:80;background:var(--ink);display:flex;flex-direction:column}
 .zoom[hidden]{display:none}
 .zoom-bar{display:flex;align-items:center;gap:10px;padding:10px 16px;border-bottom:1px solid var(--line);background:var(--panel-2);font-size:13px;color:var(--fg-dim)}
 .zoom-bar button{font-family:var(--mono);font-size:13px;font-weight:600;color:var(--phosphor);background:transparent;border:1px solid var(--phosphor-dim);border-bottom-width:2px;padding:4px 12px;cursor:pointer}
@@ -336,14 +338,26 @@ function buildToc(container){
 // producing broken/empty diagrams. So a doc warmed in the background (hidden) has its markdown
 // inserted but its diagrams left unrendered until its tab is shown (fixes "refresh once to see
 // the diagrams"). Idempotent: guarded by mermaidDone + :not([data-processed]).
+let mermaidSeq = 0;
 async function renderMermaidIfVisible(name){
   const src = SOURCES[name];
   if (!src.loaded || src.mermaidDone || name !== activeDoc) return;
   const target = document.getElementById(src.el);
   const nodes = target.querySelectorAll('.mermaid:not([data-processed])');
   if (!nodes.length){ src.mermaidDone = true; return; }
-  try { await mermaid.run({ nodes }); src.mermaidDone = true; }
-  catch (e){ console.error('mermaid', e); }
+  // Render each diagram with mermaid.render(uniqueId, source) — NOT mermaid.run(). These flowcharts
+  // reuse node ids (s, turn, done, …) across diagrams, and run() (batched OR one-at-a-time) shares
+  // a single id space, so every diagram's nodes collapse into the first and the rest render empty.
+  // render() with a unique id per diagram gives each an isolated pass — verified: all render fully.
+  for (const node of nodes){
+    const source = node.textContent; // the raw mermaid source (entities preserved, as on GitHub)
+    try {
+      const { svg } = await mermaid.render('agitrack-mmd-' + (mermaidSeq++), source);
+      node.innerHTML = svg;
+    } catch (e){ console.error('mermaid', e); }
+    node.setAttribute('data-processed', 'true');
+  }
+  src.mermaidDone = true;
 }
 
 async function loadDoc(name){
@@ -413,13 +427,20 @@ window.addEventListener('popstate', () => {
 const zoom = document.getElementById('zoom');
 const stage = document.getElementById('zoomStage');
 const pctEl = document.getElementById('zoomPct');
-let zSvg = null, zW = 0, zH = 0, zScale = 1;
+let zSvg = null, zW = 0, zH = 0, zScale = 1, zFit = 1;
 
 function applyZoom(){
   if (!zSvg) return;
   zSvg.style.width = (zW * zScale) + 'px';
   zSvg.style.height = (zH * zScale) + 'px';
   pctEl.textContent = Math.round(zScale * 100) + '%';
+}
+function centerStage(){
+  if (!zSvg) return;
+  // Horizontally centered, but anchored to the TOP — flowcharts read top-down, so start at the
+  // first node rather than centering vertically (which can land on blank space between nodes).
+  stage.scrollLeft = Math.max(0, (zSvg.offsetWidth - stage.clientWidth) / 2);
+  stage.scrollTop = 0;
 }
 function openZoom(srcSvg){
   const vb = (srcSvg.getAttribute('viewBox') || '').split(/[\s,]+/).map(Number);
@@ -429,18 +450,23 @@ function openZoom(srcSvg){
   const clone = srcSvg.cloneNode(true);
   clone.removeAttribute('width'); clone.removeAttribute('height'); clone.style.maxWidth = 'none';
   stage.innerHTML = ''; stage.appendChild(clone); zSvg = clone;
-  zScale = 1; // open at the diagram's natural (readable) size; large ones become pannable
+  zoom.hidden = false; // unhide FIRST so the stage reports real dimensions for the fit math
+  // Open at a READABLE scale: a diagram smaller than the viewport is enlarged to fill it (up to
+  // 2.5x); a diagram larger than the viewport opens at 100% (its natural, readable size) anchored
+  // top-left — where a top-down flowchart begins — so you land on content, never a blank corner.
+  // From there scroll/‑ to see the whole thing or +/scroll to zoom in further.
+  const availW = stage.clientWidth - 48, availH = stage.clientHeight - 48;
+  const fit = Math.min(availW / zW, availH / zH);
+  zScale = zFit = fit >= 1 ? Math.min(fit, 2.5) : 1;
   applyZoom();
-  zoom.hidden = false;
-  // center the diagram in the viewport
-  stage.scrollLeft = Math.max(0, (zSvg.offsetWidth - stage.clientWidth) / 2);
-  stage.scrollTop = 0;
+  if (fit >= 1) centerStage();
+  else { stage.scrollLeft = 0; stage.scrollTop = 0; }
 }
 function closeZoom(){ zoom.hidden = true; stage.innerHTML = ''; zSvg = null; }
 function zoomBy(factor, px, py){
   if (!zSvg) return;
   const old = zScale;
-  zScale = Math.min(14, Math.max(0.1, zScale * factor));
+  zScale = Math.min(14, Math.max(0.02, zScale * factor));
   if (zScale === old) return;
   const ratio = zScale / old;
   // keep the point under the cursor (or the viewport center) fixed while scaling
@@ -466,7 +492,7 @@ zoom.querySelector('.zoom-bar').addEventListener('click', e => {
   const z = b.dataset.z;
   if (z === 'in') zoomBy(1.25);
   else if (z === 'out') zoomBy(1/1.25);
-  else if (z === 'reset'){ zoomBy(1/zScale); stage.scrollLeft = Math.max(0,(zSvg.offsetWidth-stage.clientWidth)/2); stage.scrollTop = 0; }
+  else if (z === 'reset'){ zScale = zFit; applyZoom(); centerStage(); }
   else if (z === 'close') closeZoom();
 });
 // wheel to zoom (anchored at cursor)
