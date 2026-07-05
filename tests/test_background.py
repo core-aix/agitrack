@@ -628,36 +628,29 @@ def state_session_id(tmp_path) -> str:
 
 
 def test_daemon_covers_agent_commit_made_during_an_unfinished_turn(tmp_path):
-    # The hard case: the agent `git commit`s its own work BEFORE the turn's final message, so at
-    # commit time there is no completed turn to fold, and once the turn finishes the tree is clean
-    # (code already committed) — the tree-gated recorder would drop it. The daemon baselines HEAD
-    # while the turn is in flight, then covers the finished turn onto the agent's commit.
+    # The hard case: the agent `git commit`s its own work (mid-turn, so its final message comes
+    # after the commit), and by the time the turn finishes the tree is clean — the tree-gated
+    # recorder would drop it. The daemon reconciles from its persistent watermark: HEAD has advanced
+    # past it with an untracked commit, so it covers that commit with the turn's trace/metadata.
     runner, repo, state, backend = _runner(tmp_path, manual=False)
     runner._manual.setup()
+    runner._load_tracked_head()
     init_head = repo.rev_parse("HEAD")
+    assert runner._tracked_head == init_head  # watermark starts at HEAD
 
-    # 1) The daemon sees the turn IN FLIGHT (incomplete) and baselines HEAD.
-    inflight = _turn("u1", "m1", "do x", "", 0)
-    inflight.complete = False
-    backend.set_session("s1", [inflight])
-    assert runner._observe_inflight_turn() is True
-    assert runner._inflight_baseline == init_head
-
-    # 2) The agent commits its OWN work mid-turn — HEAD moves, the working tree ends clean.
+    # The agent commits its OWN work — HEAD moves, the working tree ends clean.
     (tmp_path / "a.txt").write_text("one\nagent code\n", encoding="utf-8")
     _git(repo, "add", "a.txt")
     _git(repo, "commit", "-m", "agent's own commit")
     agent_head = repo.rev_parse("HEAD")
-    runner._manual.service()  # the daemon notices the commit (resets any stale ref)
 
-    # 3) The turn now COMPLETES (its final message lands after the commit); the daemon covers it.
+    # The turn completes ⇒ the daemon covers the untracked commit since the watermark.
     backend.set_session("s1", [_turn("u1", "m1", "do x", "done", 20)])
-    assert runner._observe_inflight_turn() is False
-    runner._process_once()  # covers the agent's own commit (ONE cover commit, metadata once)
+    runner._process_once()
 
     head = repo.rev_parse("HEAD")
     assert head != agent_head  # a cover was added on top
-    # ONE cover commit, merge-shaped: first parent = the pre-commit baseline, second = agent's commit.
+    # ONE cover commit, merge-shaped: first parent = the watermark, second = the agent's commit.
     parents = _git(repo, "rev-list", "--parents", "-n", "1", "HEAD").split()
     assert parents[1:] == [init_head, agent_head]
     cover_msg = _git(repo, "log", "-1", "--format=%B", "HEAD")
@@ -666,24 +659,72 @@ def test_daemon_covers_agent_commit_made_during_an_unfinished_turn(tmp_path):
     assert "covered_commits:" in cover_msg and agent_head[:7] in cover_msg  # attributes its lines to AI
     assert repo.rev_parse("HEAD^{tree}") == repo.rev_parse(agent_head + "^{tree}")  # no diff
     assert _git(repo, "cat-file", "-t", agent_head).strip() == "commit"  # agent's commit keeps its hash
+    assert runner._tracked_head == head  # watermark advanced to the cover
 
 
-def test_daemon_does_not_cover_a_turn_it_never_saw_in_flight(tmp_path):
-    # False-positive guard: a human commit followed by a pure-Q&A AI turn (no file change, never
-    # observed in flight, so no baseline) must NOT produce a spurious cover commit. The baseline is
-    # per-observed-turn precisely so an unrelated commit is never mistaken for a turn's work.
+def test_watermark_persists_and_covers_a_commit_made_while_the_daemon_was_down(tmp_path):
+    # The watermark is what makes coverage survive a restart / the daemon being down at commit time:
+    # a commit made with no daemon running is still covered when the next turn completes, because the
+    # PERSISTED watermark predates it (the old in-flight snapshot was lost on every restart).
     runner, repo, state, backend = _runner(tmp_path, manual=False)
     runner._manual.setup()
-    (tmp_path / "a.txt").write_text("one\nhuman\n", encoding="utf-8")
+    runner._load_tracked_head()  # persists watermark = init HEAD to .agitrack/tracked-head
+    init_head = repo.rev_parse("HEAD")
+
+    # "Daemon down": a commit is made with nothing observing the turn in flight.
+    (tmp_path / "a.txt").write_text("one\nagent\n", encoding="utf-8")
     _git(repo, "add", "a.txt")
-    _git(repo, "commit", "-m", "human work")
-    human_head = repo.rev_parse("HEAD")
+    _git(repo, "commit", "-m", "agent commit while daemon down")
+    agent_head = repo.rev_parse("HEAD")
+
+    # A fresh runner (a restart) reloads the PERSISTED watermark — init_head, not the current HEAD.
+    restarted = BackgroundRunner(
+        repo, manual_commits=False, _global_config=GlobalConfig(path=tmp_path / "gc2.json"), _state=state
+    )
+    restarted.backend = backend
+    restarted._make_summarizer = lambda: None
+    restarted._summarization_enabled = lambda: False
+    restarted._manual.setup()
+    restarted._load_tracked_head()
+    assert restarted._tracked_head == init_head  # survived the restart (not agent_head)
+
+    backend.set_session("s1", [_turn("u1", "m1", "do x", "done", 20)])
+    restarted._process_once()
+
+    assert repo.rev_parse("HEAD") != agent_head  # the commit made while down is now covered
+    assert "covered_commits:" in _git(repo, "log", "-1", "--format=%B", "HEAD")
+
+
+def test_daemon_does_not_cover_a_pure_qa_turn(tmp_path):
+    # A completed turn that made NO commit (pure Q&A, no file change) must not create a cover:
+    # HEAD == watermark, so there is nothing new to attribute.
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    runner._manual.setup()
+    runner._load_tracked_head()
+    head = repo.rev_parse("HEAD")
 
     backend.set_session("s1", [_turn("u1", "m1", "explain this", "here is why", 15)])  # pure Q&A
-    assert runner._observe_inflight_turn() is False  # completed instantly; never seen in flight
     runner._process_once()
 
-    assert repo.rev_parse("HEAD") == human_head  # no spurious cover was added
+    assert repo.rev_parse("HEAD") == head  # nothing committed ⇒ no cover
+
+
+def test_daemon_never_retroactively_covers_preexisting_history(tmp_path):
+    # On a repo it has never tracked, the watermark initializes to the CURRENT HEAD, so human commits
+    # made BEFORE the daemon are never attributed to AI — only commits after the watermark are.
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    (tmp_path / "h.txt").write_text("human\n", encoding="utf-8")  # a human commit made before tracking
+    _git(repo, "add", "h.txt")
+    _git(repo, "commit", "-m", "human work")
+    human_head = repo.rev_parse("HEAD")
+    runner._manual.setup()
+    runner._load_tracked_head()
+    assert runner._tracked_head == human_head  # watermark = current HEAD, not the repo root
+
+    backend.set_session("s1", [_turn("u1", "m1", "hi", "hello", 15)])  # a turn that makes no commit
+    runner._process_once()
+
+    assert repo.rev_parse("HEAD") == human_head  # the pre-existing human commit is NOT covered
 
 
 def test_repo_status_reports_each_mode(tmp_path, capsys):
