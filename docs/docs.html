@@ -28,7 +28,7 @@
   --display:"VT323",var(--mono);
 }
 *{box-sizing:border-box;margin:0;padding:0}
-html{scroll-behavior:smooth}
+html{scroll-behavior:smooth;overflow-x:hidden}
 body{
   background:var(--ink);
   color:var(--fg);
@@ -109,7 +109,7 @@ summary.toc-title::after{content:""} /* caret only shown on mobile (see media qu
 .md ul,.md ol{max-width:74ch;color:var(--fg-dim);margin:0 0 16px;padding-left:24px}
 .md li{margin:5px 0}
 .md li::marker{color:var(--phosphor-dim)}
-.md code{font-family:var(--mono);background:var(--panel-2);color:var(--amber);padding:1px 5px;border:1px solid var(--line);border-radius:3px;font-size:.9em}
+.md code{font-family:var(--mono);background:var(--panel-2);color:var(--amber);padding:1px 5px;border:1px solid var(--line);border-radius:3px;font-size:.9em;overflow-wrap:break-word}
 .md pre{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--phosphor-dim);border-radius:6px;padding:14px 16px;overflow-x:auto;margin:0 0 18px}
 .md pre code{background:none;border:none;color:var(--phosphor);padding:0;font-size:13px;line-height:1.55}
 .md blockquote{border-left:3px solid var(--amber-dim);background:rgba(255,180,84,.04);padding:8px 16px;margin:0 0 18px;color:var(--fg-dim)}
@@ -422,6 +422,7 @@ async function activate(name, push){
     u.searchParams.set('tab', name);
     u.hash = '';
     history.pushState({ doc:name }, '', u);
+    window.scrollTo(0, 0); // a freshly-selected tab starts at the top, not the old scroll offset
   }
   await loadDoc(name);
   await renderMermaidIfVisible(name); // render now if it was warmed while hidden
