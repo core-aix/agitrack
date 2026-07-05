@@ -162,8 +162,17 @@ def main(argv: list[str] | None = None) -> int:
         "recording each turn, summarizing, and installing the commit hooks that fold the "
         "interaction trace and token metadata into your commits. ALWAYS runs without a worktree "
         "(implies --no-worktree). Uses AUTO commits by default (like interactive mode); add "
-        "--manual-commits / -m for user-triggered commits. `-b stop` / `-b status` stop or report "
-        "the background tracker running on this repo. Also settable via 'background' in config.",
+        "--manual-commits / -m for user-triggered commits. Bare `-b` (no argument) means `-b run`; "
+        "`-b stop` / `-b status` stop or report the background tracker running on this repo. "
+        "Also settable via 'background' in config.",
+    )
+    parser.add_argument(
+        "-n",
+        "--no-worktree",
+        action="store_true",
+        help="run the agent against the current branch instead of an isolated worktree "
+        "(edits are visible live; no isolation/integration; unsafe with concurrent sessions). "
+        "Background (-b) and manual-commit (-m) modes always imply this.",
     )
     parser.add_argument(
         "-m",
@@ -185,8 +194,8 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="show repository metrics computed from aGiTrack commit metadata "
         "(coverage, AI / human / non-tracked line changes, tokens, per-backend/"
-        "model/committer breakdowns, loop detection). Bare or `html` starts a "
-        "filterable, auto-refreshing dashboard as a background daemon on localhost, "
+        "model/committer breakdowns, loop detection). Bare `-d` (no argument) means `-d html`: "
+        "it starts a filterable, auto-refreshing dashboard as a background daemon on localhost, "
         "opens it in the browser, and returns to the shell; the daemon stops when "
         "this terminal closes or via `-d stop`. `status` reports it; `text` prints a "
         "one-shot report and exits",
@@ -210,12 +219,6 @@ def main(argv: list[str] | None = None) -> int:
         "--new-session",
         action="store_true",
         help="start a fresh backend conversation instead of resuming the last one",
-    )
-    parser.add_argument(
-        "--no-worktree",
-        action="store_true",
-        help="run the agent against the current branch instead of an isolated worktree "
-        "(edits are visible live; no isolation/integration; unsafe with concurrent sessions)",
     )
     parser.add_argument(
         "--auto-commit",
