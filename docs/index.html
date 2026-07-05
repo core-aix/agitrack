@@ -128,6 +128,9 @@ pre{font-family:var(--mono);white-space:pre;line-height:1.55}
 
 /* ---- feature grid as a 3-way branch ---- */
 .branches{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:16px;margin-top:8px}
+/* exactly four items read as a 2×2 matrix, not 3-in-a-row + 1 orphan */
+.branches.two{grid-template-columns:repeat(2,minmax(0,1fr))}
+@media(max-width:560px){.branches.two{grid-template-columns:1fr}}
 .branch{
   background:var(--panel);border:1px solid var(--line);padding:18px;
   position:relative;transition:border-color .15s ease,transform .15s ease;
@@ -175,9 +178,9 @@ footer .sha{font-size:12px}
   <header>
     <div class="brand reveal r1"><span class="a">a</span>GiTrack</div>
     <p class="tagline reveal r2"><span class="tag">&lt;aGiTrack&gt;</span> every agent turn, committed with its story<span class="cursor"></span></p>
-    <p class="sub reveal r3">aGiTrack runs <strong>Claude Code</strong> or <strong>OpenCode</strong> for you. You use the agent exactly as you
-    would on its own — aGiTrack just watches along and turns every finished turn into a git commit that records
-    what you asked, what the agent did, which model ran, and how many tokens it used.</p>
+    <p class="sub reveal r3">aGiTrack runs <strong>Claude Code</strong> or <strong>OpenCode</strong> for you and turns every finished
+    agent turn into a git commit — recording what you asked, what it did, the model, and the tokens it cost. Use
+    the agent exactly as you would on its own.</p>
     <div class="hero-actions reveal r4">
       <a class="btn" href="#install">pip install agitrack</a>
       <a class="btn alt" href="https://github.com/core-aix/agitrack">github.com/core-aix/agitrack</a>
@@ -217,10 +220,9 @@ footer .sha{font-size:12px}
         <span class="subject">why this exists</span>
       </div>
       <h2>Agent code without provenance is unreviewable.</h2>
-      <p>A coding agent edits twelve files while you get coffee. A week later nobody can say which
-      prompt produced which change, what the model was told, or what it cost. <strong>aGiTrack makes the unit
-      of agent work a commit</strong>, so review, blame, bisect, and revert work on agent output the same
-      way they work on yours.</p>
+      <p>A coding agent edits twelve files while you get coffee; a week later nobody can say which prompt
+      produced which change, or what it cost. <strong>aGiTrack makes the unit of agent work a commit</strong> —
+      so review, blame, bisect, and revert work on agent output just like yours.</p>
       <div class="term specimen">
         <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="title">git show: an aGiTrack commit message</span></div>
         <div class="term-body"><pre><span class="o">&lt;aGiTrack&gt;</span> <span class="w">add a --version flag to the cli</span>
@@ -250,25 +252,22 @@ Added --version using the package metadata; prints and exits.
         <span class="subject">how it works</span>
       </div>
       <h2>Your branch only ever moves by merge.</h2>
-      <p>Each session runs in its own <strong>git worktree</strong> on its own branch, so concurrent sessions never
-      stomp each other or your working tree. Finished turns integrate back into the branch you
-      launched from; conflicts are handed to the agent to resolve, and the resolution is itself a
-      traceable <span class="tag">&lt;aGiTrack-merge&gt;</span> commit.</p>
+      <p>Each session runs in its own <strong>git worktree</strong> and branch, so concurrent sessions never stomp
+      each other or your working tree. Finished turns merge back into your branch; conflicts go to the agent to
+      resolve — itself a traceable <span class="tag">&lt;aGiTrack-merge&gt;</span> commit.</p>
       <div class="branches">
         <div class="branch" data-ref="agitrack/claude/session-1/t3">
           <h3>Isolated sessions</h3>
-          <p>One worktree per session, per-turn branches, automatic recovery of anything a crash
-          leaves behind. Run several agents side by side.</p>
+          <p>One worktree per session, per-turn branches, crash recovery built in. Run several agents side by side.</p>
         </div>
         <div class="branch" data-ref="~/.claude/projects/…jsonl">
           <h3>Backend-native</h3>
-          <p>No model API keys, no proxy of your tokens. aGiTrack drives the real Claude Code / OpenCode
-          TUI and reads the session's own transcript for the facts.</p>
+          <p>No API keys, no token proxy. aGiTrack drives the real Claude Code / OpenCode TUI and reads its
+          transcript for the facts.</p>
         </div>
         <div class="branch" data-ref="tokens_since_last_commit">
           <h3>Costs on the record</h3>
-          <p>Input, output, and cache token counts per commit, straight from the backend's session
-          record: a price tag on every change.</p>
+          <p>Input, output, and cache tokens per commit, straight from the backend — a price tag on every change.</p>
         </div>
       </div>
     </section>
@@ -279,38 +278,36 @@ Added --version using the package metadata; prints and exits.
         <span class="subject">pick your workflow</span>
       </div>
       <h2>Four ways to run it — your call.</h2>
-      <p>Two independent choices — <strong>how you run it</strong> (watch it in a TUI, or let it track in the
-      background) and <strong>when commits happen</strong> (each turn automatically, or on your own
-      <span class="p">git commit</span>) — combine into four modes. Every one records the same per-turn trace and
-      token metadata; they differ only in who drives the agent and who triggers the commit. Switch between them
-      freely, run to run.</p>
-      <div class="branches">
+      <p>Two independent choices — <strong>how you run it</strong> (TUI or background) and <strong>when commits
+      happen</strong> (each turn, or on your own <span class="p">git commit</span>) — combine into four modes.
+      All record the same per-turn trace and tokens; switch between them freely.</p>
+      <div class="branches two">
         <div class="branch" data-ref="agitrack">
           <h3>Interactive · Auto <span class="tag">default</span></h3>
-          <p>Watch the agent's real TUI; aGiTrack commits every finished turn for you and merges it in from an
-          isolated <strong>worktree</strong>. The hands-off default — just work, and get a clean traced history.</p>
+          <p>Watch the agent's real TUI; aGiTrack commits every finished turn and merges it from an isolated
+          <strong>worktree</strong>. Hands-off — just work, get a clean traced history.</p>
         </div>
         <div class="branch" data-ref="agitrack -m">
           <h3>Interactive · Manual</h3>
-          <p>Feels like plain git: <strong>you</strong> decide when to commit. Each turn is kept on a hidden ref
-          and folds into your own commit when you make it — one tidy commit with your code and the full AI trace.</p>
+          <p>Feels like plain git: <strong>you</strong> decide when to commit. Pending turns fold into your own
+          commit — one tidy commit with your code and the full AI trace.</p>
         </div>
         <div class="branch" data-ref="agitrack -b">
           <h3>Background · Auto</h3>
-          <p>Prefer a GUI over the terminal? Drive the agent from <em>any</em> UI — the <strong>Claude desktop app</strong>, an IDE extension, its own CLI, a chat window — while aGiTrack
-          tracks it <strong>headlessly</strong> and commits each turn. Runs as a daemon, so your terminal stays
-          free; <span class="p">agitrack -b stop</span> when you're done.</p>
+          <p>Prefer a GUI? Drive the agent from <em>any</em> UI — the <strong>Claude desktop app</strong>, an IDE
+          extension, a chat window — while aGiTrack tracks it <strong>headlessly</strong> and commits each turn.
+          Runs as a daemon; <span class="p">agitrack -b stop</span> when done.</p>
         </div>
         <div class="branch" data-ref="agitrack -b -m">
           <h3>Background · Manual</h3>
-          <p>Track a session you drive yourself and commit on your own terms. The AI trace folds into your commit,
-          and — if you like — aGiTrack even starts itself on <span class="p">git commit</span> so nothing goes
-          untracked after a reboot.</p>
+          <p>Track a session you drive yourself, commit on your own terms. The AI trace folds into your commit —
+          and aGiTrack can even start itself on <span class="p">git commit</span> so nothing goes untracked after
+          a reboot.</p>
         </div>
       </div>
-      <p style="margin-top:16px;color:var(--fg-dim);font-size:14px">The isolated worktree is unique to the
-      interactive-auto default; the other three edit your current branch directly. A commit with no AI work in it
-      is never touched — no trace, no footprint.</p>
+      <p style="margin-top:16px;color:var(--fg-dim);font-size:14px">Only the interactive-auto default uses an
+      isolated worktree; the other three edit your current branch directly. A commit with no AI work is never
+      touched.</p>
     </section>
 
     <section class="commit agent" id="dashboard">
@@ -319,10 +316,8 @@ Added --version using the package metadata; prints and exits.
         <span class="subject"><span class="tag">&lt;aGiTrack&gt;</span> see the whole repo at a glance</span>
       </div>
       <h2>A live dashboard of what the agents did.</h2>
-      <p>Run <span class="p">agit -d</span> and aGiTrack serves a
-      live, auto-refreshing dashboard on <strong>localhost</strong> and opens it in your browser. Every
-      number is computed from commit metadata alone, so it's identical on every clone — no database,
-      no tracking server.</p>
+      <p>Run <span class="p">agitrack -d</span> for a live, auto-refreshing dashboard on <strong>localhost</strong>.
+      Every number comes from commit metadata alone — identical on every clone, no database, no tracking server.</p>
       <div class="term">
         <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="title">agitrack -d · localhost</span></div>
         <a href="images/dashboard-v4.png" target="_blank"><img class="shot" src="images/dashboard-v4.png" loading="lazy"
@@ -331,18 +326,16 @@ Added --version using the package metadata; prints and exits.
       <div class="branches" style="margin-top:18px">
         <div class="branch" data-ref="tracked AI vs non-tracked">
           <h3>Honest provenance</h3>
-          <p>Lines aGiTrack tracked as the agent's, versus everything else — it never claims a human wrote
-          what the model did, even when a person made the commit.</p>
+          <p>Lines aGiTrack tracked as the agent's versus everything else — it never claims a human wrote what
+          the model did.</p>
         </div>
         <div class="branch" data-ref="committer · backend · model · period">
           <h3>Filter live</h3>
-          <p>Narrow the whole dashboard to one committer (merged to their GitHub ID), a backend, a
-          model, or a time range — recomputed instantly in the browser.</p>
+          <p>Narrow the whole view to one committer, backend, model, or time range — recomputed instantly.</p>
         </div>
         <div class="branch" data-ref="tokens · loops · commit log">
           <h3>Cost &amp; drill-down</h3>
-          <p>Token totals and an efficiency ratio, a heads-up when a conversation loops, and a commit
-          log you can click to read the full message and jump to the commit on GitHub.</p>
+          <p>Token totals, an efficiency ratio, a loop heads-up, and a clickable commit log that jumps to GitHub.</p>
         </div>
       </div>
       <div class="steps" style="margin-top:22px">
@@ -363,11 +356,10 @@ Added --version using the package metadata; prints and exits.
         <span class="subject"><span class="tag">&lt;aGiTrack&gt;</span> right inside your editor</span>
       </div>
       <h2>Or run it in VS Code, one click away.</h2>
-      <p>aGiTrack is also a <strong>VS Code extension</strong>. Install it from the Marketplace and launch
-      aGiTrack inside the editor with the <strong>aG</strong> button in the toolbar (or the
-      <span class="p">aGiTrack:</span> Command Palette commands). It runs the real CLI in an integrated
-      terminal — the agent's native interface, the <span class="p">Ctrl-G</span> menu, sessions, worktrees,
-      and per-turn auto-commits, all without leaving your editor.</p>
+      <p>aGiTrack is also a <strong>VS Code extension</strong>. Launch it with the <strong>aG</strong> toolbar
+      button (or the <span class="p">aGiTrack:</span> Command Palette commands): the real CLI in an integrated
+      terminal — the agent's TUI, the <span class="p">Ctrl-G</span> menu, sessions, worktrees, per-turn
+      commits — without leaving your editor.</p>
       <div class="term">
         <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="title">VS Code · aGiTrack extension</span></div>
         <a href="images/vs-code-with-extension.png" target="_blank"><img class="shot" src="images/vs-code-with-extension.png" loading="lazy"
