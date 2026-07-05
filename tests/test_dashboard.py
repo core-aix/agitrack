@@ -821,7 +821,7 @@ def test_render_html_embeds_aggregates_and_first_log_page_only(tmp_path):
     html = render_html(_demo_repo(tmp_path))
 
     assert html.startswith("<!DOCTYPE html>")
-    assert "aGiTrack dashboard" in html
+    assert "aGiTrack - Dashboard" in html
     for control in ('id="f-author"', 'id="f-backend"', 'id="f-model"', 'id="f-period"', 'id="f-from"'):
         assert control in html
     # The page embeds server-computed aggregates plus only the FIRST page of the

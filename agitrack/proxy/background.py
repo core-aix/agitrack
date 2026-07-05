@@ -642,10 +642,18 @@ class BackgroundRunner:
                 git_hooks.remove_autotrack_precommit_hook(self.repo.hooks_dir(), debug=self._debug)
                 self._debug("autotrack hook removed (autotrack_hook=off)")
                 return
+            from agitrack import __version__
             from agitrack.proc import agitrack_invocation
 
+            # Stamp the running aGiTrack version so a later start can detect a stale hook SCHEMA and,
+            # if this version is newer, remove the previously installed hook and re-add the current
+            # one (handled inside install_autotrack_precommit_hook).
             git_hooks.install_autotrack_precommit_hook(
-                self.repo.hooks_dir(), invoke=agitrack_invocation(), repo_root=str(self.repo.repo), debug=self._debug
+                self.repo.hooks_dir(),
+                invoke=agitrack_invocation(),
+                repo_root=str(self.repo.repo),
+                version=__version__,
+                debug=self._debug,
             )
         except Exception as error:
             self._debug(f"autotrack hook install failed: {error!r}")

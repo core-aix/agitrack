@@ -1744,12 +1744,14 @@ class ProxyRunner:
                 if getattr(self.global_config, "autotrack_hook", "auto") == "off":
                     git_hooks.remove_autotrack_precommit_hook(self.base_repo.hooks_dir(), debug=self._debug)
                 else:
+                    from agitrack import __version__
                     from agitrack.proc import agitrack_invocation
 
                     git_hooks.install_autotrack_precommit_hook(
                         self.base_repo.hooks_dir(),
                         invoke=agitrack_invocation(),
                         repo_root=str(self.base_repo.repo),
+                        version=__version__,
                         debug=self._debug,
                     )
         except Exception as error:
