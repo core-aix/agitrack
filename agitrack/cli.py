@@ -167,7 +167,6 @@ def main(argv: list[str] | None = None) -> int:
         "Also settable via 'background' in config.",
     )
     parser.add_argument(
-        "-n",
         "--no-worktree",
         action="store_true",
         help="run the agent against the current branch instead of an isolated worktree "

@@ -526,13 +526,6 @@ def test_no_worktree_flag_disables_worktrees(monkeypatch):
     assert captured["use_worktrees"] is False
 
 
-def test_no_worktree_short_flag_n_disables_worktrees(monkeypatch):
-    # -n is the short alias for --no-worktree (not -w, which would read as "worktree on").
-    captured = _stub_launch(monkeypatch)
-    cli.main(["-n"])
-    assert captured["use_worktrees"] is False
-
-
 def test_default_uses_config_use_worktrees(monkeypatch):
     captured = _stub_launch(monkeypatch, use_worktrees=False)  # config opt-out, no flag
     cli.main([])
