@@ -81,8 +81,13 @@ a:hover{color:var(--ink);background:var(--phosphor);border-bottom-color:var(--ph
 
 /* ---- layout: sidebar TOC + content ---- */
 .shell{max-width:1180px;margin:0 auto;padding:28px 24px 80px;display:grid;grid-template-columns:250px minmax(0,1fr);gap:40px}
+.shell>*{min-width:0}
 .toc{position:sticky;top:70px;align-self:start;max-height:calc(100vh - 96px);overflow-y:auto;font-size:13px;padding-right:6px}
 .toc .toc-title{font-family:var(--display);font-size:22px;color:var(--amber);letter-spacing:.5px;margin-bottom:8px}
+.toc-box{border:none}
+summary.toc-title{list-style:none;cursor:pointer;margin-bottom:8px}
+summary.toc-title::-webkit-details-marker{display:none}
+summary.toc-title::after{content:""} /* caret only shown on mobile (see media query) */
 .toc a{display:block;padding:3px 0;color:var(--fg-dim);border-bottom:none;line-height:1.35}
 .toc a:hover{background:none;color:var(--phosphor)}
 .toc a.lv3{padding-left:14px;font-size:12.5px;color:#6b8579}
@@ -162,9 +167,24 @@ a:hover{color:var(--ink);background:var(--phosphor);border-bottom-color:var(--ph
 .srcnote{font-size:12px;color:#5f7568;margin:0 0 22px;padding-bottom:14px;border-bottom:1px dashed var(--line)}
 
 @media (max-width:820px){
-  .shell{grid-template-columns:1fr;gap:20px}
-  .toc{position:static;max-height:none;border:1px solid var(--line);padding:14px;border-radius:6px}
-  .nav{gap:12px}
+  /* minmax(0,1fr), NOT 1fr — a plain 1fr column min-widths to its widest child (code blocks,
+     wide diagrams), overflowing the viewport and clipping text. min:0 keeps them inside. */
+  .shell{grid-template-columns:minmax(0,1fr);gap:18px;padding:20px 16px 64px}
+  .toc{position:static;max-height:none;border:1px solid var(--line);padding:6px 12px;border-radius:6px}
+  /* TOC collapses to a tap-to-open panel on mobile so it doesn't fill the first screen */
+  .toc-box>summary::after{content:"▸";float:right;color:var(--fg-dim)}
+  .toc-box[open]>summary::after{content:"▾"}
+  .toc-list{padding-top:8px}
+  .md h1{font-size:38px}
+  .md h2{font-size:27px}
+  .md p,.md ul,.md ol,.md blockquote{max-width:none}
+}
+@media (max-width:560px){
+  .nav{gap:10px 14px;padding:10px 14px}
+  .nav .home{font-size:24px}
+  .nav .spacer{display:none}
+  .nav .nav-home{display:none}       /* redundant: the brand already links home */
+  .tab{padding:5px 11px}
 }
 </style>
 </head>
@@ -177,7 +197,7 @@ a:hover{color:var(--ink);background:var(--phosphor);border-bottom-color:var(--ph
     <button class="tab flow" id="tab-userflow" data-doc="userflow">User Flow</button>
   </div>
   <span class="spacer"></span>
-  <a class="lnk" href="index.html">← home</a>
+  <a class="lnk nav-home" href="index.html">← home</a>
   <a class="lnk" href="https://github.com/core-aix/agitrack">GitHub</a>
 </nav>
 
@@ -322,15 +342,14 @@ function rewriteLinks(container){
 
 function buildToc(container){
   const toc = document.getElementById('toc');
-  toc.innerHTML = '<div class="toc-title">Contents</div>';
-  container.querySelectorAll('h2, h3').forEach(h => {
-    if (!h.id) return;
-    const a = document.createElement('a');
-    a.href = '#' + h.id;
-    a.textContent = h.textContent.replace(/^#/, '').trim();
-    if (h.tagName === 'H3') a.className = 'lv3';
-    toc.appendChild(a);
-  });
+  const links = [...container.querySelectorAll('h2, h3')].filter(h => h.id).map(h => {
+    const cls = h.tagName === 'H3' ? ' class="lv3"' : '';
+    return `<a href="#${h.id}"${cls}>${escapeHtml(h.textContent.replace(/^#/, '').trim())}</a>`;
+  }).join('');
+  // A <details> so the (long) TOC collapses to a tap-to-open panel on mobile; open on wide screens
+  // where it's the sticky sidebar. Rebuilt per doc, so honor the current viewport each time.
+  const open = window.matchMedia('(min-width:821px)').matches ? ' open' : '';
+  toc.innerHTML = `<details class="toc-box"${open}><summary class="toc-title">Contents</summary><div class="toc-list">${links}</div></details>`;
 }
 
 // Render this doc's mermaid diagrams — but ONLY while its tab is visible. Mermaid measures
