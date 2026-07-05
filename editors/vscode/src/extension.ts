@@ -24,7 +24,7 @@ import { homedir, tmpdir } from "os";
 import { join } from "path";
 
 import { GhStatus, hasGithubRemoteUrl, shouldPromptGithubSignIn } from "./github";
-import { dedupe, exeName, staticExeCandidates } from "./installPaths";
+import { dedupe, exeCandidatesFromScriptDirs, exeName, staticExeCandidates } from "./installPaths";
 import {
   githubRepo,
   latestReleasePageUrl,
@@ -978,24 +978,39 @@ async function ensureCliAvailable(): Promise<string | undefined> {
 }
 
 /** The aGiTrack exe to use, or `undefined` when none is installed yet. Returns the
- * configured path when runnable; otherwise, on Windows, discovers a by-hand MSI install at
- * its absolute Program Files location — a GUI-launched VSCode doesn't inherit the PATH entry
- * the MSI adds, so a bare `agitrack` lookup misses it (issue #93) — and persists it. */
+ * configured path when runnable; otherwise discovers an install whose Scripts/bin dir isn't
+ * on this (often GUI-launched, PATH-less) process's PATH and persists the absolute path:
+ *  - on Windows, a by-hand MSI install at its Program Files location (issue #93);
+ *  - a `pip`/`pipx install agitrack` — including the Windows pip --user case where the exe
+ *    lands in a version subfolder `%APPDATA%\Python\Python<XY>\Scripts` (issue #140).
+ * Only auto-discovers when the user hasn't pointed `agitrack.path` at a specific exe. */
 async function findInstalledExe(): Promise<string | undefined> {
   const exe = configuredExe();
   if (await runnable(exe)) {
     return exe;
   }
-  if (process.platform === "win32" && exe === "agitrack") {
+  if (exe !== "agitrack") {
+    return undefined; // user set an explicit path; don't second-guess it
+  }
+  if (process.platform === "win32") {
     const installed = await resolveMsiInstalledExe();
     if (installed) {
-      await vscode.workspace
-        .getConfiguration("agitrack")
-        .update("path", installed, vscode.ConfigurationTarget.Global);
+      await persistAgitrackPath(installed);
       return installed;
     }
   }
+  const pipInstalled = await firstRunnable(await discoveredExeCandidates());
+  if (pipInstalled) {
+    await persistAgitrackPath(pipInstalled);
+    return pipInstalled;
+  }
   return undefined;
+}
+
+/** Persist a resolved absolute exe path to the `agitrack.path` global setting, so later
+ * launches use it directly even when its install dir isn't on the shell PATH. */
+async function persistAgitrackPath(exe: string): Promise<void> {
+  await vscode.workspace.getConfiguration("agitrack").update("path", exe, vscode.ConfigurationTarget.Global);
 }
 
 interface InstallPlan {
@@ -1192,15 +1207,13 @@ async function resolveMsiInstalledExe(): Promise<string | undefined> {
   return undefined;
 }
 
-/** Locate the agitrack executable produced by an install (issue #93). A GUI-launched
+/** Locate the agitrack executable produced by an install (issues #93, #140). A GUI-launched
  * VSCode (Finder/Dock) doesn't inherit the shell PATH, so a bare `agitrack` won't resolve
- * even after a successful install. We first ask the package manager exactly where it put
- * the executable (authoritative, PATH-independent), then fall back to the well-known
- * install locations for the host. */
+ * even after a successful install. We ask the interpreter that ran the install exactly where
+ * it puts console scripts (authoritative, PATH- and version-independent), then fall back to
+ * the general discovery over the well-known install locations. */
 async function resolveInstalledExe(plan: InstallPlan): Promise<string | undefined> {
   const exe = exeName(process.platform); // agitrack.exe on Windows, agitrack elsewhere
-  // pip console scripts live in <user-base>/Scripts on Windows, <user-base>/bin on POSIX.
-  const scriptsDir = process.platform === "win32" ? "Scripts" : "bin";
   const candidates: string[] = ["agitrack"];
   if (plan.cmd === "pipx") {
     // pipx knows its own app-bin directory — the most reliable answer.
@@ -1210,27 +1223,74 @@ async function resolveInstalledExe(plan: InstallPlan): Promise<string | undefine
         candidates.push(join(binDir, exe));
       }
     } catch {
-      // fall through to the static candidates
+      // fall through to the general discovery
     }
   }
   if (plan.userBaseFrom) {
-    // pip --user puts console scripts in <user-base>/bin (POSIX, incl. macOS framework
-    // Python's ~/Library/Python/X.Y/bin) or <user-base>/Scripts (Windows).
+    // Ask the installing Python for its real console-script dirs. On Windows pip --user this
+    // is %APPDATA%\Python\Python<XY>\Scripts (a version subfolder), which a plain
+    // <user-base>\Scripts join misses — the crux of issue #140.
+    candidates.push(...exeCandidatesFromScriptDirs(await pythonScriptDirs(plan.userBaseFrom), process.platform));
+  }
+  candidates.push(...(await discoveredExeCandidates()));
+  return firstRunnable(dedupe(candidates));
+}
+
+/** The console-script one-liner: print (as JSON) the directories a Python installs console
+ * scripts into — the default scheme plus the per-user schemes (`nt_user` etc.). This is the
+ * authoritative, PATH- and version-independent answer to "where did pip put agitrack.exe?".
+ * On Windows pip --user it yields %APPDATA%\Python\Python<XY>\Scripts (issue #140). */
+const SYSCONFIG_SCRIPT_DIRS =
+  "import sysconfig,json;" +
+  "n=set(sysconfig.get_scheme_names());" +
+  "d=[sysconfig.get_path('scripts')]+" +
+  "[sysconfig.get_path('scripts',s) for s in ('nt_user','posix_user','osx_framework_user') if s in n];" +
+  "print(json.dumps(d))";
+
+/** Ask a Python interpreter for its console-script directories via `sysconfig`. Returns []
+ * when the query fails (python gone, no sysconfig, unparsable output). */
+async function pythonScriptDirs(py: string): Promise<string[]> {
+  try {
+    const out = await execCapture(py, ["-c", SYSCONFIG_SCRIPT_DIRS], 5_000);
+    const dirs: unknown = JSON.parse(out.trim());
+    return Array.isArray(dirs) ? dirs.filter((d): d is string => typeof d === "string" && d.length > 0) : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Ordered, PATH-independent candidate paths for an already-installed agitrack executable:
+ * the pipx bin dir, every discoverable Python's real console-script dirs (authoritative via
+ * `sysconfig`), and the static well-known dirs. Used to adopt a by-hand `pip`/`pipx install
+ * agitrack` whose Scripts/bin dir isn't on this process's PATH — notably the Windows pip
+ * --user version-subfolder (issue #140). */
+async function discoveredExeCandidates(): Promise<string[]> {
+  const exe = exeName(process.platform);
+  const candidates: string[] = [];
+  if (await runnable("pipx")) {
     try {
-      const base = (await execCapture(plan.userBaseFrom, ["-m", "site", "--user-base"], 5_000)).trim();
-      if (base) {
-        candidates.push(join(base, scriptsDir, exe));
+      const binDir = (await execCapture("pipx", ["environment", "--value", "PIPX_BIN_DIR"], 5_000)).trim();
+      if (binDir) {
+        candidates.push(join(binDir, exe));
       }
     } catch {
-      // ignore — fall back to the static candidates
+      // ignore — pipx present but query failed
     }
   }
+  for (const py of await allPythons()) {
+    candidates.push(...exeCandidatesFromScriptDirs(await pythonScriptDirs(py), process.platform));
+  }
   if (process.platform === "win32") {
-    candidates.push(...staticExeCandidates(homedir(), process.platform, windowsPythonVersionDirs()));
+    candidates.push(...staticExeCandidates(homedir(), process.platform, [], windowsPythonVersionDirs()));
   } else {
     candidates.push(...staticExeCandidates(homedir(), process.platform, macLibraryPythonVersions()));
   }
-  for (const candidate of dedupe(candidates)) {
+  return dedupe(candidates);
+}
+
+/** First candidate that runs `--version` successfully, or undefined if none do. */
+async function firstRunnable(candidates: string[]): Promise<string | undefined> {
+  for (const candidate of candidates) {
     if (await runnable(candidate)) {
       return candidate;
     }
@@ -1251,31 +1311,48 @@ function macLibraryPythonVersions(): string[] {
   }
 }
 
-/** Subdirectory names under %LOCALAPPDATA%\Programs\Python\ (e.g. "Python312"),
- * where per-user Python installs live on Windows. Empty off Windows or when absent. */
+/** The `Python<XY>` version-folder names (e.g. "Python312") that hold console scripts on
+ * Windows, gathered from both roots that use this naming: `%APPDATA%\Python` (pip --user)
+ * and `%LOCALAPPDATA%\Programs\Python` (per-user Python installs). Feeds the version
+ * subfolder that pip --user actually uses (issue #140). Empty off Windows or when absent. */
 function windowsPythonVersionDirs(): string[] {
   if (process.platform !== "win32") {
     return [];
   }
+  const appdata = process.env.APPDATA || join(homedir(), "AppData", "Roaming");
   const localappdata = process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local");
-  try {
-    return readdirSync(join(localappdata, "Programs", "Python"));
-  } catch {
-    return [];
+  const versions = new Set<string>();
+  for (const root of [join(appdata, "Python"), join(localappdata, "Programs", "Python")]) {
+    try {
+      for (const name of readdirSync(root)) {
+        if (/^Python\d+$/i.test(name)) {
+          versions.add(name);
+        }
+      }
+    } catch {
+      // root absent — skip it
+    }
   }
+  return [...versions];
+}
+
+/** Every runnable Python interpreter, in preference order. `py` is the canonical Windows
+ * launcher; there `python`/`python3` are usually the Microsoft Store app-execution stub,
+ * which fails `--version` (so `runnable` rejects it). Try `py` first on Windows; on POSIX
+ * keep the python3 → python order. */
+async function allPythons(): Promise<string[]> {
+  const candidates = process.platform === "win32" ? ["py", "python", "python3"] : ["python3", "python"];
+  const found: string[] = [];
+  for (const py of candidates) {
+    if (await runnable(py)) {
+      found.push(py);
+    }
+  }
+  return found;
 }
 
 async function firstPython(): Promise<string | undefined> {
-  // `py` is the canonical Windows launcher; there `python`/`python3` are usually the
-  // Microsoft Store app-execution stub, which fails `--version` (so `runnable` rejects it).
-  // Try `py` first on Windows; on POSIX keep the existing python3 → python order.
-  const candidates = process.platform === "win32" ? ["py", "python", "python3"] : ["python3", "python"];
-  for (const py of candidates) {
-    if (await runnable(py)) {
-      return py;
-    }
-  }
-  return undefined;
+  return (await allPythons())[0];
 }
 
 async function hasPip(py: string): Promise<boolean> {

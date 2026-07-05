@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { dedupe, exeName, staticExeCandidates } from "./installPaths";
+import { dedupe, exeCandidatesFromScriptDirs, exeName, staticExeCandidates } from "./installPaths";
 
 // Issue #93: a GUI-launched VSCode lacks the shell PATH, so a freshly-installed `agitrack`
 // must be found by absolute path. These pin the fallback locations we probe.
@@ -51,6 +51,36 @@ test("staticExeCandidates targets agitrack.exe in Windows Scripts/pipx dirs (#11
   assert.ok(candidates.some((c) => c.includes("Scripts")), "includes a pip --user Scripts dir");
   // No POSIX-only dirs leak onto Windows.
   assert.ok(!candidates.some((c) => c.startsWith("/usr/local") || c.startsWith("/opt/homebrew")));
+});
+
+// `path.join` uses the HOST separator (these tests run on a POSIX CI host), so normalize
+// to forward slashes before asserting — mirroring how the other Windows test avoids it.
+const norm = (values: string[]): string[] => values.map((v) => v.replace(/\\/g, "/"));
+
+test("staticExeCandidates targets the pip --user version subfolder on Windows (#140)", () => {
+  // pip --user puts agitrack.exe in %APPDATA%\Python\Python<XY>\Scripts, NOT
+  // %APPDATA%\Python\Scripts — the version-less guess is the #140 bug.
+  const candidates = norm(staticExeCandidates("/home/u", "win32", [], ["Python314", "Python312"]));
+  assert.ok(
+    candidates.some((c) => c.includes("Roaming/Python/Python314/Scripts")),
+    `expected a Python314 Scripts candidate: ${JSON.stringify(candidates)}`,
+  );
+  assert.ok(candidates.some((c) => c.includes("Roaming/Python/Python312/Scripts")));
+  // Per-user Python installs share the Python<XY> naming under Programs\Python.
+  assert.ok(candidates.some((c) => c.includes("Programs/Python/Python314/Scripts")));
+  // The version-less path is kept only as a last-resort fallback, after the versioned ones.
+  const versioned = candidates.findIndex((c) => c.includes("Python314/Scripts"));
+  const versionless = candidates.findIndex((c) => c.endsWith("Roaming/Python/Scripts/agitrack.exe"));
+  assert.ok(versioned >= 0 && versionless >= 0 && versioned < versionless, "versioned dir must precede the fallback");
+});
+
+test("exeCandidatesFromScriptDirs appends the platform exe to each dir", () => {
+  assert.deepEqual(
+    norm(exeCandidatesFromScriptDirs(["/home/u/AppData/Roaming/Python/Python314/Scripts"], "win32")),
+    ["/home/u/AppData/Roaming/Python/Python314/Scripts/agitrack.exe"],
+  );
+  assert.deepEqual(norm(exeCandidatesFromScriptDirs(["/home/u/.local/bin"], "linux")), ["/home/u/.local/bin/agitrack"]);
+  assert.deepEqual(exeCandidatesFromScriptDirs([], "darwin"), []);
 });
 
 test("dedupe preserves first-seen order so the authoritative candidate stays first", () => {
