@@ -197,6 +197,7 @@ class CommitEngine:
         backend_commits: list[str] | None = None,
         manual_gate_fn: Callable[[], bool] | None = None,
         manual_record_fn: Callable[[str], str | None] | None = None,
+        summarize_fn: Callable[[str], tuple[str, list[str]] | None] | None = None,
     ) -> bool:
         """Core of every agent-commit path.
 
@@ -409,6 +410,22 @@ class CommitEngine:
             None,
         )
         origin_event = self.state.session_origin_event()
+        # Render the interaction trace once — it is the summarizer's sole input and what
+        # on_commit_fn hands off below. When a summarize_fn is supplied (the background daemon's
+        # cover path, which can't amend HEAD to attach a summary afterwards), summarize it
+        # SYNCHRONOUSLY here so the commit message LEADS with the summary, just like every other
+        # aGiTrack commit. Other callers (proxy, shell) pass None and keep the async amend flow.
+        trace_text = render_interaction_trace(self.state.pending_trace(), self.state.trace_turn_limit)
+        summary_text: str | None = None
+        summary_metadata: list[str] | None = None
+        if summarize_fn is not None:
+            try:
+                summarized = summarize_fn(trace_text)
+            except Exception as error:
+                self._debug(f"synchronous summary failed: {error!r}")
+                summarized = None
+            if summarized:
+                summary_text, summary_metadata = summarized
         message = build_agent_commit_message(
             latest_prompt=subject_text,
             trace=self.state.pending_trace(),
@@ -421,6 +438,8 @@ class CommitEngine:
             token_usage=self.state.pending_token_usage(),
             trace_turn_limit=self.state.trace_turn_limit,
             session_name=session_name,
+            summary=summary_text,
+            summary_metadata=summary_metadata,
             covered_commits=covered_display or None,
             started_at=min(starts) if starts else None,
             ended_at=max(ends) if ends else None,
@@ -460,13 +479,9 @@ class CommitEngine:
         # session shouldn't keep re-announcing the lineage.
         if origin_event is not None:
             self.state.clear_session_origin_event()
-        # Render the interaction trace exactly as it landed in the commit, BEFORE
-        # clearing it, and hand it to on_commit_fn — this is the summarizer's sole
-        # input. (Capturing it in the caller before commit_turns was wrong: the
-        # proxy branch above clears pending_trace and rebuilds it from the turns,
-        # so a pre-commit capture saw only stray leftover prompts, which made the
-        # summary empty/garbage and often unusable.)
-        trace_text = render_interaction_trace(self.state.pending_trace(), self.state.trace_turn_limit)
+        # ``trace_text`` was rendered above (before the message build) so a synchronous
+        # summarize_fn could see it; it is the summarizer's sole input and what on_commit_fn
+        # hands off. Clear the pending trace now that the commit is recorded.
         self.state.clear_trace()
 
         if on_commit_fn is not None:

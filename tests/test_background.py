@@ -662,6 +662,39 @@ def test_daemon_covers_agent_commit_made_during_an_unfinished_turn(tmp_path):
     assert runner._tracked_head == head  # watermark advanced to the cover
 
 
+def test_cover_commit_message_leads_with_the_summary(tmp_path):
+    # A cover commit must be summarized like every other aGiTrack commit: because the daemon can't
+    # amend HEAD, it summarizes SYNCHRONOUSLY before committing so the message leads with the summary
+    # (not the raw prompt), and records the summary cost + a git note.
+    class FakeSummarizer:
+        model = "sum-model"
+        tokens_input = 11
+        tokens_output = 7
+        tokens_cache_read = 0
+
+        def summarize_commit(self, *, trace):
+            return "Add a greeting helper and its test"
+
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    runner._summarization_enabled = lambda: True
+    runner._make_summarizer = lambda: FakeSummarizer()
+    runner._manual.setup()
+    runner._load_tracked_head()
+
+    (tmp_path / "a.txt").write_text("one\nagent\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "agent's own commit")
+    backend.set_session("s1", [_turn("u1", "m1", "do x", "done", 20)])
+    runner._process_once()
+
+    msg = _git(repo, "log", "-1", "--format=%B", "HEAD")
+    assert msg.startswith("<aGiTrack> Add a greeting helper and its test")  # summary leads, not "do x"
+    assert "summary_model: sum-model" in msg and "summary_tokens_input: 11" in msg  # cost recorded
+    assert "covered_commits:" in msg  # still a proper cover
+    note = _git(repo, "notes", "--ref", "agitrack/commit-summary", "show", "HEAD")
+    assert "Add a greeting helper" in note  # summary also stored as a note
+
+
 def test_watermark_persists_and_covers_a_commit_made_while_the_daemon_was_down(tmp_path):
     # The watermark is what makes coverage survive a restart / the daemon being down at commit time:
     # a commit made with no daemon running is still covered when the next turn completes, because the
