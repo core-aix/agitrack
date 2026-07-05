@@ -184,45 +184,6 @@ class ManualCommitTracker:
         self.render_trailer()
         return self.repo.short_sha(sha)
 
-    def record_tree(self, message: str, tree: str) -> str | None:
-        """Record a latent commit with an EXPLICIT tree, WITHOUT the tree-delta gate. Used to
-        capture a turn whose file changes the agent already committed itself mid-turn (so there is
-        no working-tree delta to snapshot): the tree passed is HEAD's, making the eventual cover a
-        no-diff commit that carries only the turn's trace/metadata. Returns the short sha."""
-        tip = self.repo.ref_sha(self.ref())
-        parent = tip or self.repo.rev_parse("HEAD")
-        sha = self.repo.commit_tree(tree, parents=[parent], message=message)
-        self.repo.update_ref(self.ref(), sha)
-        self.render_trailer()
-        return self.repo.short_sha(sha)
-
-    def cover_pending_onto_head(self) -> str | None:
-        """Add a no-diff cover commit on HEAD carrying every pending latent turn's trace/metadata,
-        then reset the latent ref to it. Used when those turns' file changes are ALREADY in HEAD
-        (the agent committed its own work mid-turn), so the cover's tree equals HEAD's and it
-        introduces no diff — it only makes the turns' tracking reachable in history. Mirrors the
-        cover in :meth:`reconcile_external_commit`. Returns the new HEAD, or None when nothing is
-        pending."""
-        tip = self.repo.ref_sha(self.ref())
-        bodies = self.pending_bodies()
-        if not tip or not bodies:
-            return None
-        head = self.repo.rev_parse("HEAD")
-        message = "<aGiTrack> track agent turns\n\n" + build_manual_squash_trailer(
-            agitrack_session_id=self.state.session_id, latent_bodies=bodies
-        )
-        try:
-            head_tree = self.repo.rev_parse("HEAD^{tree}")
-            self.repo.cover_commit(message, first_parent=head, second_parent=tip, tree=head_tree)
-            new_head = self.repo.rev_parse("HEAD")
-            self.repo.update_ref(self.ref(), new_head)
-            self.last_head = new_head
-            self.render_trailer()
-            return new_head
-        except Exception as error:
-            self._debug(f"cover pending onto head failed: {error!r}")
-            return None
-
     # --- reconciliation with the user's own commits -------------------------
 
     def reset_stale_ref(self) -> bool:

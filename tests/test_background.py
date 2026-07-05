@@ -650,18 +650,22 @@ def test_daemon_covers_agent_commit_made_during_an_unfinished_turn(tmp_path):
     agent_head = repo.rev_parse("HEAD")
     runner._manual.service()  # the daemon notices the commit (resets any stale ref)
 
-    # 3) The turn now COMPLETES (its final message lands after the commit).
+    # 3) The turn now COMPLETES (its final message lands after the commit); the daemon covers it.
     backend.set_session("s1", [_turn("u1", "m1", "do x", "done", 20)])
     assert runner._observe_inflight_turn() is False
-    runner._process_once()  # records the finished turn metadata-only (its code is already committed)
-    runner._cover_committed_away_if_any()  # covers it onto the agent's commit
+    runner._process_once()  # covers the agent's own commit (ONE cover commit, metadata once)
 
-    first_parent = _git(repo, "log", "--first-parent", "--format=%H").split()
-    assert len(first_parent) == 3  # init + agent's commit + the cover
+    head = repo.rev_parse("HEAD")
+    assert head != agent_head  # a cover was added on top
+    # ONE cover commit, merge-shaped: first parent = the pre-commit baseline, second = agent's commit.
+    parents = _git(repo, "rev-list", "--parents", "-n", "1", "HEAD").split()
+    assert parents[1:] == [init_head, agent_head]
     cover_msg = _git(repo, "log", "-1", "--format=%B", "HEAD")
-    assert "# aGiTrack Metadata" in cover_msg and "do x" in cover_msg  # the turn is now tracked
-    # The cover introduces NO diff — its tree equals the agent's commit's tree.
-    assert repo.rev_parse("HEAD^{tree}") == repo.rev_parse(agent_head + "^{tree}")
+    assert cover_msg.count("# aGiTrack Metadata") == 1  # metadata EXACTLY once — never duplicated
+    assert "do x" in cover_msg  # the turn's trace
+    assert "covered_commits:" in cover_msg and agent_head[:7] in cover_msg  # attributes its lines to AI
+    assert repo.rev_parse("HEAD^{tree}") == repo.rev_parse(agent_head + "^{tree}")  # no diff
+    assert _git(repo, "cat-file", "-t", agent_head).strip() == "commit"  # agent's commit keeps its hash
 
 
 def test_daemon_does_not_cover_a_turn_it_never_saw_in_flight(tmp_path):
@@ -678,7 +682,6 @@ def test_daemon_does_not_cover_a_turn_it_never_saw_in_flight(tmp_path):
     backend.set_session("s1", [_turn("u1", "m1", "explain this", "here is why", 15)])  # pure Q&A
     assert runner._observe_inflight_turn() is False  # completed instantly; never seen in flight
     runner._process_once()
-    runner._cover_committed_away_if_any()
 
     assert repo.rev_parse("HEAD") == human_head  # no spurious cover was added
 

@@ -480,8 +480,6 @@ class BackgroundRunner:
         # commit is never mistaken for a turn's work.
         self._inflight_turn_key: str | None = None
         self._inflight_baseline: str | None = None
-        # Set by the gate when the current batch of turns was committed-away (record metadata-only).
-        self._cover_tree: str | None = None
 
         self.global_config = _global_config if _global_config is not None else GlobalConfig()
         if getattr(self.global_config, "repo_path", "set") is None:
@@ -554,7 +552,6 @@ class BackgroundRunner:
         try:
             self._observe_inflight_turn()
             self._process_once()
-            self._cover_committed_away_if_any()
             if not self._manual_commits:
                 self._auto_fold_pending()
         except Exception as error:
@@ -665,8 +662,7 @@ class BackgroundRunner:
         while not self._stop.is_set():
             try:
                 inflight = self._observe_inflight_turn()  # snapshot a HEAD baseline while a turn runs
-                self._process_once()
-                self._cover_committed_away_if_any()  # cover a turn the agent committed itself
+                self._process_once()  # records latently, or covers a turn the agent committed itself
                 self._manual.service()
                 if not self._manual_commits:
                     self._auto_fold_pending()
@@ -774,15 +770,35 @@ class BackgroundRunner:
         quiet: bool,
         prompt_untracked: bool = True,
     ) -> bool:
-        """Record the completed turns as hidden latent commits (HEAD never moves); summarize
-        each. Both manual and auto mode record latently — auto mode additionally folds them into
-        a real commit itself (see :meth:`_auto_fold_pending`)."""
+        """Record the completed turns. Normally each is a hidden latent commit (HEAD never moves;
+        auto mode folds them via :meth:`_auto_fold_pending`). But if the agent committed this turn's
+        OWN work mid-turn (see :meth:`_agent_committed_own_work`), the code is already in HEAD with a
+        clean tree, so recording latently would find no delta and drop it. Instead we COVER the
+        agent's commit(s) — ONE cover commit carrying the trace/metadata, with ``covered_commits``
+        attributing their lines to AI — reusing the exact backend-commit cover path the proxy uses.
+        Crucially this puts the turn's metadata in history exactly ONCE (the old two-step approach —
+        a latent metadata commit plus a merge that embedded the same body — made it reachable twice
+        and risked double-counting tokens)."""
 
         def on_commit_fn(sha, trace_text, _is_cover):
             self.events.emit("ai-change-detected", backend=backend, session=backend_session_id, model=model)
             self._start_commit_summary(sha, trace_text)
 
         engine = CommitEngine(self.repo, self.state, debug_fn=self._debug)
+        covered = self._agent_committed_own_work()
+        if covered:
+            # Cover the agent's own commit(s) instead of a latent record. Drop the baseline so the
+            # same commits can never be covered a second time.
+            self._inflight_baseline = None
+            return engine.commit_turns(
+                turns=turns,
+                backend=backend,
+                backend_session_id=backend_session_id,
+                model=model,
+                stage_untracked_fn=lambda _repo, _state: None,
+                on_commit_fn=on_commit_fn,
+                backend_commits=covered,
+            )
         return engine.commit_turns(
             turns=turns,
             backend=backend,
@@ -790,8 +806,8 @@ class BackgroundRunner:
             model=model,
             stage_untracked_fn=lambda _repo, _state: None,  # latent path never stages
             on_commit_fn=on_commit_fn,
-            manual_gate_fn=self._committed_gate,
-            manual_record_fn=self._committed_record,
+            manual_gate_fn=self._manual.gate,
+            manual_record_fn=self._manual.record,
         )
 
     # ------------------------------------------------------------------
@@ -823,61 +839,26 @@ class BackgroundRunner:
                 self._inflight_baseline = None
         return True
 
-    def _committed_gate(self) -> bool:
-        """Latent-record gate for the daemon. Records normally when the working tree changed; else,
-        when the agent committed this turn's OWN work mid-turn (we watched it in flight and HEAD has
-        advanced from that baseline while the tree is now clean), records the turn metadata-only so
-        it can be covered onto that commit instead of being lost."""
-        if self._manual.gate():
-            self._cover_tree = None
-            return True
-        if self._inflight_committed_away():
-            try:
-                self._cover_tree = self.repo.rev_parse("HEAD^{tree}")
-                return True
-            except Exception:
-                pass
-        self._cover_tree = None
-        return False
-
-    def _committed_record(self, message: str) -> str | None:
-        if self._cover_tree is None:
-            return self._manual.record(message)
-        tree = self._cover_tree
-        self._cover_tree = None
-        return self._manual.record_tree(message, tree)
-
-    def _inflight_committed_away(self) -> bool:
-        """True when the turn we watched in flight had its file changes committed by the agent
-        itself: HEAD advanced from the in-flight baseline and the working tree is now clean."""
+    def _agent_committed_own_work(self) -> list[str]:
+        """Full SHAs (oldest first) of the commit(s) the agent made ITSELF during the current turn —
+        the commits on ``baseline..HEAD`` when the working tree is now clean — or ``[]`` otherwise.
+        We watched the turn in flight and snapshotted ``_inflight_baseline`` at HEAD before the
+        agent's commit, so an advance from it with a clean tree is precisely the agent committing its
+        own code (never an unrelated human commit, which was not part of this observed turn). The
+        caller covers these commits so the turn's trace/metadata land ONCE, with ``covered_commits``
+        attributing their lines to AI — recording latently would find no tree delta and drop it."""
         if self._inflight_baseline is None:
-            return False
+            return []
         try:
             head = self.repo.rev_parse("HEAD")
-            clean = self.repo.snapshot_worktree_tree() == self.repo.rev_parse("HEAD^{tree}")
-        except Exception:
-            return False
-        return clean and head != self._inflight_baseline
-
-    def _cover_committed_away_if_any(self) -> None:
-        """Cover a metadata-only pending latent turn (its tree equals HEAD's — the agent already
-        committed the code) with a no-diff cover commit on HEAD, so the turn's trace/metadata are
-        tracked in history. Runs in BOTH commit modes. A NORMAL pending turn (agent edits still
-        uncommitted) has a dirty tree / a differing tip tree, so it is left for the usual fold."""
-        tip = self.repo.ref_sha(self._manual.ref())
-        if not tip:
-            return
-        try:
-            head = self.repo.rev_parse("HEAD")
-            head_tree = self.repo.rev_parse("HEAD^{tree}")
-            clean = self.repo.snapshot_worktree_tree() == head_tree
-            tip_is_metadata_only = self.repo.rev_parse(f"{tip}^{{tree}}") == head_tree
-            already_folded = self.repo.is_ancestor(tip, head)
-        except Exception:
-            return
-        if clean and tip_is_metadata_only and not already_folded:
-            self._manual.cover_pending_onto_head()
-            self._inflight_baseline = None  # this turn is now tracked; re-baseline the next one
+            if head == self._inflight_baseline:
+                return []  # no commit made this turn (e.g. a pure-Q&A turn)
+            if self.repo.snapshot_worktree_tree() != self.repo.rev_parse("HEAD^{tree}"):
+                return []  # dirty tree ⇒ the agent's edits are uncommitted; record latently instead
+            return self.repo.log_shas(self._inflight_baseline, head)  # baseline..HEAD, oldest first
+        except Exception as error:
+            self._debug(f"committed-away detection failed: {error!r}")
+            return []
 
     # ------------------------------------------------------------------
     # Auto mode: fold the pending latent turns into a real commit ourselves
