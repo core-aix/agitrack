@@ -114,6 +114,40 @@ def background_log_path(repo: GitRepo) -> Path:
     return repo.repo / ".agitrack" / "background.log"
 
 
+def _flush_request_path(repo: GitRepo) -> Path:
+    return repo.repo / ".agitrack" / "flush-request"
+
+
+def _flush_done_path(repo: GitRepo) -> Path:
+    return repo.repo / ".agitrack" / "flush-done"
+
+
+def request_daemon_flush(repo: GitRepo, *, timeout: float = 5.0) -> bool:
+    """Ask the running background daemon to record any pending COMPLETED turns and (re)render the
+    fold trailer RIGHT NOW, then wait (bounded) for it to acknowledge.
+
+    Called from the pre-commit hook (``precommit_sync``) when a daemon holds the repo lock: the
+    daemon is the single writer, so the hook can't safely record turns itself, but the commit being
+    made needs an up-to-date ``manual-pending-trailer`` for its ``prepare-commit-msg`` fold — not
+    one lagging the daemon's poll. We write a unique nonce and spin until the daemon echoes it back
+    (it services the request within ~0.1s). Best-effort: on timeout the commit simply proceeds with
+    whatever the daemon last rendered. Returns True once acknowledged."""
+    nonce = f"{os.getpid()}-{time.time()}"
+    try:
+        _flush_request_path(repo).write_text(nonce, encoding="utf-8")
+    except OSError:
+        return False
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if _flush_done_path(repo).read_text(encoding="utf-8").strip() == nonce:
+                return True
+        except OSError:
+            pass
+        time.sleep(0.05)
+    return False
+
+
 def proxy_status_path(repo: GitRepo) -> Path:
     """Where the INTERACTIVE proxy records its pid + mode so `agitrack --status` can report it
     (the daemon uses ``background.json`; the shared repo lock only carries a pid, not the mode)."""
@@ -343,7 +377,16 @@ def precommit_sync(repo: GitRepo, *, backend_command: list[str] | None = None) -
     try:
         lock = RepoLock(repo.repo / ".agitrack" / "lock")
         if not lock.acquire():
-            return 0  # a live tracker (TUI or daemon) already folds this commit — nothing to do
+            # A live tracker holds the lock — it is the single writer, so we must NOT record turns
+            # here (that would race its state/refs and risk double-counting). But the commit being
+            # made needs a FRESH fold trailer: if it's the BACKGROUND daemon, nudge it to record any
+            # pending completed turns and re-render the trailer synchronously NOW, so this commit's
+            # prepare-commit-msg hook folds the trace/metadata in instead of a trailer lagging the
+            # daemon's poll (the bug where a commit racing the poll folded nothing). An interactive
+            # TUI renders its own trailer as turns complete, so it needs no nudge.
+            if _live_background_pid(repo) is not None:
+                request_daemon_flush(repo)
+            return 0
     except Exception:
         return 0
     config = GlobalConfig()
@@ -426,6 +469,19 @@ class BackgroundRunner:
         # that's still computing from one that already FINISHED (and, if it produced no note, fold
         # now instead of waiting out the full summary_wait_seconds — e.g. the summarizer errored).
         self._summary_threads: dict[str, threading.Thread] = {}
+        # Nonce of the last pre-commit flush request we serviced, so a repeated request (or a stale
+        # request file across a restart) is handled at most once.
+        self._last_flush_nonce: str | None = None
+        # Tracking the agent committing its OWN work mid-turn. We snapshot HEAD the first time we
+        # see a turn in-flight (incomplete); if the agent then `git commit`s within that turn, HEAD
+        # advances from this baseline while the working tree ends clean — so when the turn finishes
+        # we cover it onto that commit rather than dropping it (its code is already committed, so the
+        # tree-delta gate would record nothing). Keyed per in-flight turn so an unrelated human
+        # commit is never mistaken for a turn's work.
+        self._inflight_turn_key: str | None = None
+        self._inflight_baseline: str | None = None
+        # Set by the gate when the current batch of turns was committed-away (record metadata-only).
+        self._cover_tree: str | None = None
 
         self.global_config = _global_config if _global_config is not None else GlobalConfig()
         if getattr(self.global_config, "repo_path", "set") is None:
@@ -496,7 +552,9 @@ class BackgroundRunner:
     def _teardown(self) -> None:
         # Record any final completed turn (and, in auto mode, fold it) before stopping.
         try:
+            self._observe_inflight_turn()
             self._process_once()
+            self._cover_committed_away_if_any()
             if not self._manual_commits:
                 self._auto_fold_pending()
         except Exception as error:
@@ -606,14 +664,57 @@ class BackgroundRunner:
     def _loop(self) -> None:
         while not self._stop.is_set():
             try:
+                inflight = self._observe_inflight_turn()  # snapshot a HEAD baseline while a turn runs
                 self._process_once()
+                self._cover_committed_away_if_any()  # cover a turn the agent committed itself
                 self._manual.service()
                 if not self._manual_commits:
                     self._auto_fold_pending()
+                if not inflight:
+                    # No turn is in flight, so any just-completed turn has been processed this cycle;
+                    # drop its baseline so it can NEVER be mistaken for a later (e.g. pure-Q&A) turn's
+                    # work — the source of a spurious cover.
+                    self._inflight_turn_key = None
+                    self._inflight_baseline = None
                 self._maybe_check_update()
             except Exception as error:  # never let one bad cycle kill the tracker
                 self._debug(f"cycle error: {error!r}")
-            self._stop.wait(self._poll_seconds)
+            self._wait_with_flush(self._poll_seconds)
+
+    def _wait_with_flush(self, seconds: float) -> None:
+        """Sleep up to ``seconds`` between poll cycles, but stay responsive to a pre-commit flush
+        request from the auto-track hook: service it within ~0.1s so a commit isn't held waiting for
+        the next full poll. Wakes immediately when stopping."""
+        deadline = time.monotonic() + seconds
+        while not self._stop.is_set():
+            self._service_flush_requests()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            self._stop.wait(min(0.1, remaining))
+
+    def _service_flush_requests(self) -> None:
+        """Handle a pre-commit flush request (see :func:`request_daemon_flush`): record any pending
+        completed turns and (re)render the fold trailer synchronously, then echo the nonce back so
+        the waiting hook can proceed. Runs on the daemon's own loop thread — the single writer — so
+        it never races the poll. At pre-commit time the working tree still holds the about-to-be-
+        committed changes, so a just-finished turn records cleanly and folds into THAT commit."""
+        try:
+            nonce = _flush_request_path(self.repo).read_text(encoding="utf-8").strip()
+        except OSError:
+            return
+        if not nonce or nonce == self._last_flush_nonce:
+            return
+        try:
+            self._process_once()
+            self._manual.render_trailer()
+        except Exception as error:
+            self._debug(f"flush failed: {error!r}")
+        self._last_flush_nonce = nonce
+        try:
+            _flush_done_path(self.repo).write_text(nonce, encoding="utf-8")
+        except OSError:
+            pass
 
     # ------------------------------------------------------------------
     # Turn processing (reuses the proxy's CommitEngine so accounting is identical)
@@ -689,9 +790,94 @@ class BackgroundRunner:
             model=model,
             stage_untracked_fn=lambda _repo, _state: None,  # latent path never stages
             on_commit_fn=on_commit_fn,
-            manual_gate_fn=self._manual.gate,
-            manual_record_fn=self._manual.record,
+            manual_gate_fn=self._committed_gate,
+            manual_record_fn=self._committed_record,
         )
+
+    # ------------------------------------------------------------------
+    # Agent-committed-its-own-work-mid-turn tracking
+    # ------------------------------------------------------------------
+
+    def _observe_inflight_turn(self) -> bool:
+        """Snapshot HEAD as a baseline the FIRST time we see the current turn in flight (its latest
+        turn is incomplete). If the agent then commits its own work before finishing, HEAD advances
+        from this baseline — the precise signal (unlike "HEAD moved recently") that lets us cover the
+        turn onto that commit without ever mistaking an unrelated human commit for the turn's work.
+        Keyed by the turn so a new turn re-baselines. Returns True while a turn is in flight (the
+        loop keeps the baseline until the turn completes and is processed, then drops it)."""
+        try:
+            sid = self.backend.latest_session_id(self.repo.repo)
+            exported = self.backend.export_session(self.repo.repo, sid) if sid else None
+        except Exception:
+            return self._inflight_baseline is not None
+        turns = list(getattr(exported, "turns", []) or []) if exported else []
+        if not turns or turns[-1].complete:
+            return False  # nothing in flight; the loop clears the baseline after processing
+        latest = turns[-1]
+        key = f"{sid}:{latest.user_message_id or latest.assistant_message_id or len(turns)}"
+        if key != self._inflight_turn_key:
+            self._inflight_turn_key = key
+            try:
+                self._inflight_baseline = self.repo.rev_parse("HEAD")
+            except Exception:
+                self._inflight_baseline = None
+        return True
+
+    def _committed_gate(self) -> bool:
+        """Latent-record gate for the daemon. Records normally when the working tree changed; else,
+        when the agent committed this turn's OWN work mid-turn (we watched it in flight and HEAD has
+        advanced from that baseline while the tree is now clean), records the turn metadata-only so
+        it can be covered onto that commit instead of being lost."""
+        if self._manual.gate():
+            self._cover_tree = None
+            return True
+        if self._inflight_committed_away():
+            try:
+                self._cover_tree = self.repo.rev_parse("HEAD^{tree}")
+                return True
+            except Exception:
+                pass
+        self._cover_tree = None
+        return False
+
+    def _committed_record(self, message: str) -> str | None:
+        if self._cover_tree is None:
+            return self._manual.record(message)
+        tree = self._cover_tree
+        self._cover_tree = None
+        return self._manual.record_tree(message, tree)
+
+    def _inflight_committed_away(self) -> bool:
+        """True when the turn we watched in flight had its file changes committed by the agent
+        itself: HEAD advanced from the in-flight baseline and the working tree is now clean."""
+        if self._inflight_baseline is None:
+            return False
+        try:
+            head = self.repo.rev_parse("HEAD")
+            clean = self.repo.snapshot_worktree_tree() == self.repo.rev_parse("HEAD^{tree}")
+        except Exception:
+            return False
+        return clean and head != self._inflight_baseline
+
+    def _cover_committed_away_if_any(self) -> None:
+        """Cover a metadata-only pending latent turn (its tree equals HEAD's — the agent already
+        committed the code) with a no-diff cover commit on HEAD, so the turn's trace/metadata are
+        tracked in history. Runs in BOTH commit modes. A NORMAL pending turn (agent edits still
+        uncommitted) has a dirty tree / a differing tip tree, so it is left for the usual fold."""
+        tip = self.repo.ref_sha(self._manual.ref())
+        if not tip:
+            return
+        try:
+            head = self.repo.rev_parse("HEAD")
+            head_tree = self.repo.rev_parse("HEAD^{tree}")
+            clean = self.repo.snapshot_worktree_tree() == head_tree
+            tip_is_metadata_only = self.repo.rev_parse(f"{tip}^{{tree}}") == head_tree
+            already_folded = self.repo.is_ancestor(tip, head)
+        except Exception:
+            return
+        if clean and tip_is_metadata_only and not already_folded:
+            self._manual.cover_pending_onto_head()
+            self._inflight_baseline = None  # this turn is now tracked; re-baseline the next one
 
     # ------------------------------------------------------------------
     # Auto mode: fold the pending latent turns into a real commit ourselves
