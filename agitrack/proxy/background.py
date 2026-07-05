@@ -33,7 +33,7 @@ from typing import Any
 
 from agitrack.backends.proxy_agents import make_proxy_agent
 from agitrack.commits import ManualCommitTracker
-from agitrack.commits.message import build_auto_fold_message
+from agitrack.commits.message import build_auto_fold_message, summary_metadata_lines
 from agitrack.config import AgitrackState, GlobalConfig
 from agitrack.events import EventLog, resolve_log_path
 from agitrack.git import GitRepo
@@ -479,6 +479,9 @@ class BackgroundRunner:
         # survive a daemon restart or the daemon being down at commit time — the fragile in-flight
         # HEAD snapshot it replaced was lost on every restart, leaving those commits untracked.
         self._tracked_head: str | None = None
+        # Summary computed synchronously for the current cover commit's message (the daemon can't
+        # amend HEAD to add it later), reused to also write the commit-summary git note.
+        self._pending_cover_summary: str | None = None
 
         self.global_config = _global_config if _global_config is not None else GlobalConfig()
         if getattr(self.global_config, "repo_path", "set") is None:
@@ -778,14 +781,30 @@ class BackgroundRunner:
         engine = CommitEngine(self.repo, self.state, debug_fn=self._debug)
         covered = self._agent_committed_own_work()
         if covered:
+            # The cover commit is created immediately and the daemon never amends HEAD, so — unlike
+            # the async note flow for other commits — its message must LEAD with the summary already.
+            # Summarize synchronously via summarize_fn, and write the same summary as a git note.
+            self._pending_cover_summary = None
+
+            def on_commit_cover(sha, _trace_text, _is_cover):
+                self.events.emit("ai-change-detected", backend=backend, session=backend_session_id, model=model)
+                if self._pending_cover_summary:
+                    try:
+                        self.repo.notes_add(
+                            self.repo.rev_parse(sha), self._pending_cover_summary, namespace="agitrack/commit-summary"
+                        )
+                    except Exception as error:
+                        self._debug(f"cover summary note failed: {error!r}")
+
             result = engine.commit_turns(
                 turns=turns,
                 backend=backend,
                 backend_session_id=backend_session_id,
                 model=model,
                 stage_untracked_fn=lambda _repo, _state: None,
-                on_commit_fn=on_commit_fn,
+                on_commit_fn=on_commit_cover,
                 backend_commits=covered,
+                summarize_fn=self._summarize_for_message,
             )
             if result:
                 self._set_tracked_head(self.repo.rev_parse("HEAD"))  # everything up to the cover is accounted for
@@ -992,6 +1011,32 @@ class BackgroundRunner:
             model = self.global_config.summarization_model
         launch = self._backend_command or None
         return Summarizer(backend_class(summary_scratch_dir(), launch_command=launch), model=model)
+
+    def _summarize_for_message(self, trace_text: str) -> tuple[str, list[str]] | None:
+        """Summarize a cover's interaction trace SYNCHRONOUSLY, returning ``(summary, metadata)`` so
+        the cover's commit message can LEAD with the summary. The daemon never amends HEAD, so unlike
+        the proxy it can't attach the summary after committing — it must be in the message up front
+        (the auto-fold path likewise waits for the summary before committing). Best-effort: returns
+        None when summaries are off or the summarizer fails, leaving the raw prompt-led message. The
+        summary is cached so :meth:`_record_turns` can also write it as the commit-summary note."""
+        summarizer = self._make_summarizer()
+        if summarizer is None:
+            return None
+        try:
+            summary = summarizer.summarize_commit(trace=trace_text)
+        except Exception as error:
+            self._debug(f"cover summary failed: {error!r}")
+            return None
+        if not summary or not summary.strip():
+            return None
+        self._pending_cover_summary = summary
+        meta = summary_metadata_lines(
+            model=summarizer.model,
+            tokens_input=summarizer.tokens_input,
+            tokens_output=summarizer.tokens_output,
+            tokens_cache_read=summarizer.tokens_cache_read,
+        )
+        return summary, meta
 
     def _start_commit_summary(self, sha: str, trace_text: str) -> None:
         summarizer = self._make_summarizer()
