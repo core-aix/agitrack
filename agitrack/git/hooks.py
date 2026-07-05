@@ -22,6 +22,7 @@ same script works on Windows too.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from pathlib import Path
 
@@ -134,6 +135,10 @@ exit 0
 # via the same ``.agitrack-orig`` backup/restore the guard already uses.
 
 _AUTOTRACK_MARKER = "# AGITRACK-AUTOTRACK-PRECOMMIT"
+# Stamped into the hook so a later aGiTrack can tell whether the installed hook's SCHEMA is current
+# and, if not, replace it (see ``install_autotrack_precommit_hook``). The prefix is fixed; the
+# version string follows on the same line.
+_AUTOTRACK_VERSION_MARKER = "# AGITRACK-AUTOTRACK-VERSION"
 
 
 def _sh_quote(arg: str) -> str:
@@ -141,7 +146,7 @@ def _sh_quote(arg: str) -> str:
     return "'" + arg.replace("'", "'\\''") + "'"
 
 
-def _autotrack_precommit_script(invoke: list[str], repo_root: str) -> str:
+def _autotrack_precommit_script(invoke: list[str], repo_root: str, version: str) -> str:
     # The baked invocation runs THIS aGiTrack (a stable interpreter path + `-m agitrack`, or the
     # frozen exe). After a self-update it resolves the NEW code automatically (the interpreter/exe
     # path is stable). A PATH fallback (`agitrack …`) covers the rare case the baked path moved, so
@@ -150,6 +155,7 @@ def _autotrack_precommit_script(invoke: list[str], repo_root: str) -> str:
     root = _sh_quote(repo_root)
     return f"""#!/bin/sh
 {_AUTOTRACK_MARKER}
+{_AUTOTRACK_VERSION_MARKER} {version}
 # Installed by aGiTrack. On `git commit`, if aGiTrack is not already tracking this repo, record
 # any pending AI turns and fold their interaction trace + token metadata into THIS commit (only
 # when the AI made changes since the last commit), and auto-start the background tracker for the
@@ -178,16 +184,60 @@ def is_autotrack_hook(path: Path) -> bool:
     return _hook_has_marker(path, _AUTOTRACK_MARKER)
 
 
+def autotrack_hook_version(path: Path) -> str | None:
+    """The aGiTrack version stamped into the installed auto-track ``pre-commit`` hook at *path*, or
+    ``None`` when *path* isn't our hook or predates version stamping (an older schema with no line)."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    if _AUTOTRACK_MARKER not in text:
+        return None
+    match = re.search(rf"^{re.escape(_AUTOTRACK_VERSION_MARKER)}\s+(\S+)", text, re.M)
+    return match.group(1) if match else None
+
+
+def _version_tuple(version: str) -> tuple[int, ...]:
+    """Parse a dotted version into an int tuple for ordering; non-numeric parts sort as 0 so a
+    comparison never raises on an odd version string."""
+    parts: list[int] = []
+    for chunk in version.split("."):
+        match = re.match(r"\d+", chunk)
+        parts.append(int(match.group()) if match else 0)
+    return tuple(parts)
+
+
 def install_autotrack_precommit_hook(
-    hooks_dir: Path, *, invoke: list[str], repo_root: str, debug: Callable[[str], None] | None = None
+    hooks_dir: Path,
+    *,
+    invoke: list[str],
+    repo_root: str,
+    version: str | None = None,
+    debug: Callable[[str], None] | None = None,
 ) -> bool:
     """Install the persistent auto-track ``pre-commit`` hook (idempotent). ``invoke`` is the argv
     prefix that runs THIS aGiTrack (``agitrack.proc.agitrack_invocation()`` — frozen-aware) and is
     baked in with a PATH fallback so the hook always calls the CURRENT aGiTrack after a self-update.
-    A pre-existing non-aGiTrack hook is chained via ``pre-commit.agitrack-orig``. Re-run on every
-    aGiTrack launch, so the baked path is refreshed if the install location ever changes."""
+    ``version`` is stamped into the hook so a later launch can detect a schema change.
+
+    Whenever the installed hook's stamped version is OLDER than ``version`` (or unstamped — an older
+    schema), the previously installed aGiTrack hook is fully removed first (restoring any hook it
+    chained) and then re-installed fresh, so a changed hook schema is replaced cleanly rather than
+    left half-migrated. A pre-existing non-aGiTrack hook is chained via ``pre-commit.agitrack-orig``.
+    Re-run on every aGiTrack launch, so the baked path is refreshed if the install location changes."""
+    if version is None:
+        from agitrack import __version__
+
+        version = __version__
+    hook = hooks_dir / "pre-commit"
+    if is_autotrack_hook(hook):
+        installed = autotrack_hook_version(hook)
+        if installed is None or _version_tuple(installed) < _version_tuple(version):
+            if debug:
+                debug(f"autotrack hook schema outdated ({installed} < {version}); replacing")
+            _remove_hook(hooks_dir, "pre-commit", _AUTOTRACK_MARKER, debug=debug)
     return _install_hook(
-        hooks_dir, "pre-commit", _autotrack_precommit_script(invoke, repo_root), _AUTOTRACK_MARKER, debug=debug
+        hooks_dir, "pre-commit", _autotrack_precommit_script(invoke, repo_root, version), _AUTOTRACK_MARKER, debug=debug
     )
 
 

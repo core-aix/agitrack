@@ -223,9 +223,26 @@ per repo asks whether to enable this (default on; repo-scoped `autotrack_hook`);
 turns it off. The hook calls the CURRENT aGiTrack even after a self-update (frozen-aware invocation +
 PATH fallback).
 
+**Keeping the hook's schema current.** Every background start (when `autotrack_hook` isn't `off`)
+re-installs this hook and **stamps the running aGiTrack version** into it (a
+`# AGITRACK-AUTOTRACK-VERSION <version>` line). Before writing, it compares the version stamped in the
+already-installed hook against the running one: if the installed hook is **older** (or predates version
+stamping and carries no stamp), aGiTrack **removes the previously installed hook** — restoring any
+project hook it had chained — and then **installs the current version fresh**, so a changed hook schema
+is never left half-migrated. A same-or-newer stamp just refreshes the baked invocation in place. This
+runs on the background startup path (and equally when a no-worktree proxy session installs the same
+persistent hook).
+
 ```mermaid
 flowchart TD
-  s(["Background mode: -b / background (implies --no-worktree); manual (default) or --auto-commit"]) --> watch["Poll the newest backend session transcript in the repo dir (follows in-backend session switches)"]
+  s(["Background mode: -b / background (implies --no-worktree); manual (default) or --auto-commit"]) --> hookq{"Auto-start enabled? autotrack_hook != off (and no custom core.hooksPath)"}
+  hookq -->|No| watch
+  hookq -->|Yes| stamp{"Installed pre-commit hook's stamped aGiTrack version vs the running one"}
+  stamp -->|Older / unstamped schema| replace[["Remove the previously installed aGiTrack hook (restore any chained project hook), then install the current version fresh"]]
+  stamp -->|Same or newer| refresh[["Refresh the baked invocation in place; keep the stamped version"]]
+  replace --> watch
+  refresh --> watch
+  watch["Poll the newest backend session transcript in the repo dir (follows in-backend session switches)"]
   watch --> turn{"A newly completed turn?"}
   turn -->|No| watch
   turn -->|Yes| latent[["Record a HIDDEN latent commit on refs/agitrack/manual/&lt;session&gt; + summarize it (git note). HEAD does NOT move"]]

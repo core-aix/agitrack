@@ -326,16 +326,60 @@ def test_remove_all_installed_hooks_noop_when_none(tmp_path):
 def test_autotrack_hook_is_a_noop_inside_a_worktree():
     # The hook script must skip (do nothing) when the commit is inside a linked worktree, so it
     # never fights aGiTrack's own worktree-mode handling.
-    script = git_hooks._autotrack_precommit_script(["/usr/bin/python3", "-m", "agitrack"], "/repo")
+    script = git_hooks._autotrack_precommit_script(["/usr/bin/python3", "-m", "agitrack"], "/repo", "1.2.3")
     assert "*/worktrees/*)" in script and "--precommit-sync" in script
 
 
 def test_autotrack_hook_is_frozen_aware_and_has_path_fallback():
     # Frozen (MSI) build: the exe is run directly (`-m agitrack` is invalid there); a normal build
     # runs `python -m agitrack`. Both bake a PATH fallback so a self-update's new binary is used.
-    frozen = git_hooks._autotrack_precommit_script(["/opt/agitrack.exe"], "/repo")
+    frozen = git_hooks._autotrack_precommit_script(["/opt/agitrack.exe"], "/repo", "1.2.3")
     assert "'/opt/agitrack.exe' --precommit-sync" in frozen and "-m agitrack --precommit-sync" not in frozen
     assert "|| agitrack --precommit-sync" in frozen
+
+
+def test_autotrack_hook_stamps_version_and_replaces_older_schema(tmp_path):
+    import sys as _sys
+
+    repo = _init_repo(tmp_path)
+    hooks_dir = repo.repo / ".git" / "hooks"
+    hooks_dir.mkdir(exist_ok=True)
+    invoke = [_sys.executable, "-m", "agitrack"]
+
+    # First install stamps the version into the hook.
+    git_hooks.install_autotrack_precommit_hook(hooks_dir, invoke=invoke, repo_root=str(repo.repo), version="1.0.0")
+    hook = hooks_dir / "pre-commit"
+    assert git_hooks.autotrack_hook_version(hook) == "1.0.0"
+    assert "# AGITRACK-AUTOTRACK-VERSION 1.0.0" in hook.read_text()
+
+    # A newer aGiTrack removes the old hook and installs the current schema (version advances).
+    git_hooks.install_autotrack_precommit_hook(hooks_dir, invoke=invoke, repo_root=str(repo.repo), version="1.2.0")
+    assert git_hooks.autotrack_hook_version(hook) == "1.2.0"
+
+    # A same/older version is a no-op replacement but still leaves a valid, current hook.
+    git_hooks.install_autotrack_precommit_hook(hooks_dir, invoke=invoke, repo_root=str(repo.repo), version="1.2.0")
+    assert git_hooks.autotrack_hook_version(hook) == "1.2.0"
+    assert git_hooks.is_autotrack_hook(hook)
+
+
+def test_autotrack_hook_replacement_preserves_chained_project_hook(tmp_path):
+    import sys as _sys
+
+    repo = _init_repo(tmp_path)
+    hooks_dir = repo.repo / ".git" / "hooks"
+    hooks_dir.mkdir(exist_ok=True)
+    (hooks_dir / "pre-commit").write_text("#!/bin/sh\necho project\n", encoding="utf-8")
+    (hooks_dir / "pre-commit").chmod(0o755)
+    invoke = [_sys.executable, "-m", "agitrack"]
+
+    git_hooks.install_autotrack_precommit_hook(hooks_dir, invoke=invoke, repo_root=str(repo.repo), version="1.0.0")
+    # A schema-version bump replaces the hook; the chained project hook must survive the swap.
+    git_hooks.install_autotrack_precommit_hook(hooks_dir, invoke=invoke, repo_root=str(repo.repo), version="2.0.0")
+    assert git_hooks.autotrack_hook_version(hooks_dir / "pre-commit") == "2.0.0"
+    assert (hooks_dir / "pre-commit.agitrack-orig").read_text() == "#!/bin/sh\necho project\n"
+
+    git_hooks.remove_autotrack_precommit_hook(hooks_dir)
+    assert (hooks_dir / "pre-commit").read_text() == "#!/bin/sh\necho project\n"  # restored intact
 
 
 # --- CommitEngine manual sink ----------------------------------------------
