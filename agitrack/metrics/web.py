@@ -701,10 +701,6 @@ h2.section::before{content:"# ";color:var(--amber)}
 .card .label{font-size:11.5px;color:var(--amber);letter-spacing:.5px}
 .card .value{font-family:var(--display);font-size:42px;line-height:1.05;color:var(--phosphor);margin-top:6px;
   text-shadow:0 0 14px rgba(61,255,160,.3);white-space:nowrap}
-/* progressively smaller for longer numbers so they never overflow the card */
-.card .value.sz1{font-size:34px}
-.card .value.sz2{font-size:28px}
-.card .value.sz3{font-size:23px}
 .card .value.amber{color:var(--amber);text-shadow:0 0 14px rgba(255,180,84,.3)}
 .card .note{font-size:12px;color:var(--fg-dim);margin-top:4px}
 
@@ -833,7 +829,7 @@ h2.section::before{content:"# ";color:var(--amber)}
 .diffbox .dmeta2{color:var(--fg-dim)}
 .diffbox .dadd{color:var(--phosphor);background:rgba(61,255,160,.08)}
 .diffbox .ddel{color:var(--red);background:rgba(255,107,107,.08)}
-.dmsg .diffempty,.dmsg .diffloading{color:var(--fg-dim);font-size:12px;font-style:italic;padding:8px 12px}
+.dmsg .diffempty{color:var(--fg-dim);font-size:12px;font-style:italic;padding:8px 12px}
 /* rendered Markdown inside the expanded message */
 .dmsg.md p{margin:7px 0}
 .dmsg.md .md-h{font-family:var(--mono);color:var(--amber);margin:11px 0 5px;font-size:13px;font-weight:600}
@@ -1128,12 +1124,23 @@ function subBarRow(name, value, max, numHtml, min){
     `<div class="num">${numHtml}</div></div>`;
 }
 function card(label, value, note, amber){
-  // Shrink the big number as it gets longer so a large count (e.g. 100M+ output tokens)
-  // stays inside the card instead of spilling out its right edge.
-  const len = String(value).replace(/<[^>]*>/g,"").length;
-  const sz = len>12?" sz3":(len>10?" sz2":(len>8?" sz1":""));
   return `<div class="card"><div class="label">${esc(label)}</div>`+
-    `<div class="value ${amber?"amber":""}${sz}">${value}</div><div class="note">${esc(note||"")}</div></div>`;
+    `<div class="value ${amber?"amber":""}">${bigValue(value)}</div><div class="note">${esc(note||"")}</div></div>`;
+}
+// Keep the big display font, but when a plain integer is too long to fit the card (e.g. 100M+
+// output tokens) show it in scientific notation instead — nicer than shrinking the type. Percents,
+// ratios, "—", and already-short numbers are shown verbatim.
+function bigValue(value){
+  const m = String(value).match(/^([+\-]?)([\d,]+)$/);   // a signed, comma-grouped integer only
+  if(!m || m[2].length <= 9) return value;               // ≤ 9 chars incl. commas still fits at 42px
+  return m[1] + sci(Number(m[2].replace(/,/g,"")));
+}
+const SUP = {"0":"⁰","1":"¹","2":"²","3":"³","4":"⁴","5":"⁵","6":"⁶","7":"⁷","8":"⁸","9":"⁹"};
+function sci(n){
+  if(!isFinite(n) || n===0) return "0";
+  const exp = Math.floor(Math.log10(n));
+  const mant = (n/Math.pow(10,exp)).toFixed(2).replace(/\.?0+$/,"");  // 1.01, 1.2, 5, …
+  return mant + "×10" + String(exp).replace(/[0-9]/g, d => SUP[d]);   // e.g. 1.01×10⁸
 }
 function tokenBrief(t){
   if(!t) return "";
@@ -1499,10 +1506,13 @@ async function toggleDiff(i){
     if(btn) btn.textContent = "show file diff";
     return;
   }
-  body.dataset.mode = "diff"; body.className = "dmsg diff";  // commit message → file diff
+  // commit message → file diff. Flip the mode + button label now for instant feedback, but KEEP the
+  // message visible until the diff is ready, then swap the box in a single paint — so there's no
+  // "loading…" placeholder flashing on the first (uncached) switch.
+  body.dataset.mode = "diff";
   if(btn) btn.textContent = "show commit message";
-  if(_diffCache[c.sha] !== undefined){ body.innerHTML = _diffCache[c.sha]; return; }
-  body.innerHTML = '<div class="diffloading">loading diff…</div>';
+  const apply = html => { if(body.dataset.mode === "diff"){ body.className = "dmsg diff"; body.innerHTML = html; } };
+  if(_diffCache[c.sha] !== undefined){ apply(_diffCache[c.sha]); return; }
   try{
     const r = await fetch("diff?sha="+encodeURIComponent(c.sha), {cache:"no-store"});
     const d = r.ok ? await r.json() : {error:"server error"};
@@ -1511,10 +1521,8 @@ async function toggleDiff(i){
     else if(!d.diff || !d.diff.trim()) html = '<div class="diffempty">no file changes in this commit</div>';
     else html = renderDiff(d.diff) + (d.truncated?'<div class="diffempty">…diff truncated (very large commit)</div>':"");
     _diffCache[c.sha] = html;
-    if(body.dataset.mode === "diff") body.innerHTML = html;  // user may have flipped back mid-fetch
-  }catch(e){
-    if(body.dataset.mode === "diff") body.innerHTML = '<div class="diffempty">couldn\'t load the diff (server unreachable)</div>';
-  }
+    apply(html);  // apply() no-ops if the user flipped back to the message mid-fetch
+  }catch(e){ apply('<div class="diffempty">couldn\'t load the diff (server unreachable)</div>'); }
 }
 // Color a unified diff (diffstat + patch) line-by-line: file headers, hunk headers, +adds, −dels.
 function renderDiff(text){
