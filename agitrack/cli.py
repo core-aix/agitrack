@@ -11,6 +11,7 @@ from pathlib import Path
 from agitrack.backends.setup import select_default_backend, select_default_summarizer_model
 from agitrack.backends.proxy_agents import available_backends
 from agitrack.git import GitError, GitRepo, RepoLock, already_running_message
+from agitrack.proc import console_isolation_kwargs
 from agitrack.config import GlobalConfig, settings
 from agitrack.shell import AgitrackShell
 
@@ -103,7 +104,11 @@ def _git_config_global(config_args: list[str]) -> str:
     """Run ``git config --global`` and return its stdout (empty on any failure)."""
     try:
         result = subprocess.run(
-            ["git", "config", "--global", *config_args], text=True, capture_output=True, check=False
+            ["git", "config", "--global", *config_args],
+            text=True,
+            capture_output=True,
+            check=False,
+            **console_isolation_kwargs(),  # keep git off a console on Windows (proc.py)
         )
     except (OSError, subprocess.SubprocessError):
         return ""
