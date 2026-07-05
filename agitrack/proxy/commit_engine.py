@@ -138,6 +138,21 @@ def _same_prompt(a: str, b: str) -> bool:
     return overlap >= 0.6
 
 
+def _prompt_covered_by(pending: str, prompt: str) -> bool:
+    """True when *pending* is already represented WITHIN *prompt*. A single turn's ``user_prompt``
+    can aggregate several messages — a base prompt plus the follow-ups the user QUEUED while the
+    agent worked (see ``transcripts/claude._queued_human_prompt``) — so the separately-recorded
+    base prompt is a small fraction of the combined text and ``_same_prompt``'s symmetric overlap
+    misses it, re-adding it to the trace as a duplicate. Detect containment instead: (almost) all of
+    *pending*'s words appear in *prompt*. Requires ≥3 words so a short leftover can't coincidentally
+    match an unrelated turn."""
+    pt = set(_TOKEN_RE.findall(_norm(pending).lower()))
+    tt = set(_TOKEN_RE.findall(_norm(prompt).lower()))
+    if len(pt) < 3 or not tt:
+        return False
+    return len(pt & tt) / len(pt) >= 0.9
+
+
 class CommitEngine:
     """Stateless agent-commit engine bound to a ``(repo, state)`` pair.
 
@@ -251,10 +266,14 @@ class CommitEngine:
             for turn in turns:
                 if turn.user_prompt:
                     self.state.append_trace("user", turn.user_prompt)
+                # Each message the user queued mid-turn gets its OWN ## User heading (it was sent
+                # after the agent had already said something), not merged into the base prompt.
+                for followup in turn.queued_followups:
+                    self.state.append_trace("user", followup)
                 for message in self._agent_messages_for(turn):
                     self.state.append_trace("agent", message)
                 self.state.add_token_usage(turn.tokens)
-            prompts = [t.user_prompt for t in turns if t.user_prompt]
+            prompts = [p for turn in turns for p in ([turn.user_prompt, *turn.queued_followups]) if p]
             subject_text = " / ".join(prompts) if prompts else f"{backend} changes"
         else:
             # Proxy mode: rebuild trace from scratch, preserving any pending user
@@ -274,6 +293,11 @@ class CommitEngine:
                 if turn.user_prompt:
                     subject_prompts.append(turn.user_prompt)
                     entries.append(("user", turn.user_prompt))
+                # A mid-turn queued message gets its own ## User heading (sent after the agent
+                # already responded), rather than being merged into the base prompt.
+                for followup in turn.queued_followups:
+                    subject_prompts.append(followup)
+                    entries.append(("user", followup))
                 for message in self._agent_messages_for(turn):
                     entries.append(("agent", message))
 
@@ -284,14 +308,20 @@ class CommitEngine:
             # user's raw typing, which line editing garbles relative to the
             # transcript's clean version — equality re-added the same prompt as
             # if it were new (issue #8). Duplicate recordings also collapse.
-            turn_prompts = [t.user_prompt for t in turns if t.user_prompt]
+            turn_prompts = [p for t in turns for p in ([t.user_prompt, *t.queued_followups]) if p]
             leftovers: list[str] = []
             for pending_user in pending_users:
                 if not _norm(pending_user):
                     continue
                 if _is_slash_command(pending_user):
                     continue  # a backend directive (e.g. /compact) recorded earlier — not a prompt
-                if any(_same_prompt(pending_user, prompt) for prompt in turn_prompts):
+                # Skip when the turn already carries this prompt — either as a near-duplicate
+                # (_same_prompt) OR because the turn aggregated it as a queued follow-up so the
+                # base is CONTAINED in the (longer) combined turn prompt (_prompt_covered_by).
+                if any(
+                    _same_prompt(pending_user, prompt) or _prompt_covered_by(pending_user, prompt)
+                    for prompt in turn_prompts
+                ):
                     continue
                 if any(_same_prompt(pending_user, prompt) for prompt in leftovers):
                     continue

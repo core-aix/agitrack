@@ -196,6 +196,8 @@ agitrack --status         # or -s: is aGiTrack running for this repo, and in whi
 
 **Background mode** runs aGiTrack **without its interactive TUI**, so you can drive the coding agent from *any* UI you like — its native CLI, an IDE extension (e.g. Claude's VS Code extension), a chat window — while aGiTrack watches that session's local transcript and does all the same tracking the TUI would: it records each completed turn, summarizes it, and installs the commit hooks that fold the interaction trace and token metadata into your commits. aGiTrack does **not** launch or proxy the agent here; it tracks whatever session you drive.
 
+> **Great for GUI users.** This is especially useful if you'd rather keep working in a **GUI instead of a terminal** — the **Claude desktop app**, an IDE extension, or any other front-end. Start `agitrack -b` once and keep using your preferred interface; aGiTrack tracks the session and commits your AI work in the background, no terminal UI required.
+
 **It runs as a detached daemon, exactly like the dashboard (`agitrack -d`).** `agitrack -b` starts the tracker in the background and **returns to your shell immediately** — the terminal isn't tied up. Unlike the dashboard daemon it deliberately has **no owner-terminal watchdog**: a tracker keeps running after you close the terminal (that's the point — it should keep tracking), so you stop it explicitly with `agitrack -b stop`. `agitrack -b status` reports whether one is running (and any available update). The daemon logs its startup and per-turn activity to `<repo>/.agitrack/background.log`.
 
 Background mode **always runs without a worktree** (it implies `--no-worktree`), and supports either commit style:

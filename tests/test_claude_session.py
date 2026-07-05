@@ -430,10 +430,13 @@ def test_parse_rows_captures_queued_followup_messages_in_the_turn():
 
     turn = parse_rows("sess-q", rows).turns[0]
 
-    # All three user messages are present, in order, under the one turn.
-    assert turn.user_prompt.startswith("Fix the messy commit format.")
-    assert "The subject should still be summarized." in turn.user_prompt
-    assert "Also add a mode matrix to the webpage." in turn.user_prompt
+    # The base prompt stays user_prompt; each queued follow-up is a DISTINCT message (its own
+    # ## User heading later), captured in queued_followups — not merged into user_prompt.
+    assert turn.user_prompt == "Fix the messy commit format."
+    assert turn.queued_followups == [
+        "The subject should still be summarized.",
+        "Also add a mode matrix to the webpage.",
+    ]
     assert turn.final_response == "Done — all three addressed."
     # Exactly one turn (the queued messages extend it, they don't each open a new turn).
     assert len(parse_rows("sess-q", rows).turns) == 1
@@ -449,7 +452,8 @@ def test_parse_rows_ignores_non_human_or_slash_queued_attachments():
         _assistant("m1", "done"),
     ]
     turn = parse_rows("sess-q2", rows).turns[0]
-    assert turn.user_prompt == "do the thing"  # none of the excluded attachments were added
+    assert turn.user_prompt == "do the thing"
+    assert turn.queued_followups == []  # none of the excluded attachments were added
 
 
 def test_parse_rows_marks_turn_incomplete_while_last_message_is_tool_use():

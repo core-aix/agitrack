@@ -416,6 +416,35 @@ def test_leftover_user_message_precedes_multi_message_agent_response(tmp_path):
     assert msg.index("starting now") < msg.index("still working") < msg.index("all done")
 
 
+def test_queued_followups_render_as_separate_user_headings_without_duplication(tmp_path):
+    # A message the user QUEUES mid-turn belongs to the turn but is a DISTINCT message: it gets its
+    # OWN ## User heading (sent after the agent already responded), not merged into the base prompt.
+    # The submit-time capture still records the base separately — it must dedup against the turn's
+    # base (not re-added), and tokens are counted once per TURN regardless of the trace text.
+    engine, repo, state = _engine(tmp_path)
+    base = "Please fix the parser and make sure the tests pass"
+    state.append_trace("user", base)  # submit-time capture of the base prompt
+    turn = _turn(base, "done", total=100, output=40)
+    turn.queued_followups = ["Also add a status command.", "Also verify the token counts are correct."]
+    engine.commit_turns(
+        turns=[turn],
+        backend="claude",
+        backend_session_id="s1",
+        model="m",
+        stage_untracked_fn=_noop_stage,
+    )
+    msg = repo.message
+    assert msg is not None
+    body = msg.split("# Interaction Trace", 1)[1]  # ignore the subject line
+    # Three DISTINCT ## User headings: the base + the two queued follow-ups. The base is NOT
+    # duplicated by the submit-time leftover.
+    assert body.count("## User") == 3
+    assert "Also add a status command." in body and "Also verify the token counts are correct." in body
+    # Tokens reflect the ONE turn, not doubled by the extra trace entries.
+    assert "tokens_since_last_commit_output: 40" in msg
+    assert "tokens_since_last_commit_output: 80" not in msg
+
+
 def test_commit_turns_stage_untracked_fn_receives_repo_and_state(tmp_path):
     engine, repo, state = _engine(tmp_path)
     calls = []

@@ -184,6 +184,18 @@ def repo_status(repo: GitRepo) -> int:
                 print(f"aGiTrack is running for this repo (PID {owner}); mode details are unavailable.")
             else:
                 print("aGiTrack is not running for this repo.")
+    # Whether the persistent pre-commit hook will auto-start tracking on a commit (repo-scoped).
+    try:
+        config = GlobalConfig()
+        config.load_repo_overlay(repo.repo)
+        if config.autotrack_hook == "off":
+            print("Auto-start on commit: off (`agitrack -b` or Ctrl-G → settings to enable).")
+        else:
+            last = read_background_mode(repo)
+            mode = "manual-commit" if last else "auto-commit" if last is not None else "last-run"
+            print(f"Auto-start on commit: on ({mode} mode; disable with `agitrack --remove-hooks`).")
+    except Exception:
+        pass
     reminder = update_reminder_line(repo.repo)
     if reminder:
         print(reminder)
@@ -569,8 +581,10 @@ class BackgroundRunner:
                 git_hooks.remove_autotrack_precommit_hook(self.repo.hooks_dir(), debug=self._debug)
                 self._debug("autotrack hook removed (autotrack_hook=off)")
                 return
+            from agitrack.proc import agitrack_invocation
+
             git_hooks.install_autotrack_precommit_hook(
-                self.repo.hooks_dir(), python_exe=sys.executable, repo_root=str(self.repo.repo), debug=self._debug
+                self.repo.hooks_dir(), invoke=agitrack_invocation(), repo_root=str(self.repo.repo), debug=self._debug
             )
         except Exception as error:
             self._debug(f"autotrack hook install failed: {error!r}")

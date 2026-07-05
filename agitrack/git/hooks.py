@@ -136,7 +136,18 @@ exit 0
 _AUTOTRACK_MARKER = "# AGITRACK-AUTOTRACK-PRECOMMIT"
 
 
-def _autotrack_precommit_script(python_exe: str, repo_root: str) -> str:
+def _sh_quote(arg: str) -> str:
+    """POSIX single-quote a token for the hook script (also valid under Git-for-Windows' sh)."""
+    return "'" + arg.replace("'", "'\\''") + "'"
+
+
+def _autotrack_precommit_script(invoke: list[str], repo_root: str) -> str:
+    # The baked invocation runs THIS aGiTrack (a stable interpreter path + `-m agitrack`, or the
+    # frozen exe). After a self-update it resolves the NEW code automatically (the interpreter/exe
+    # path is stable). A PATH fallback (`agitrack …`) covers the rare case the baked path moved, so
+    # the hook always calls the CURRENT aGiTrack, never a stale one.
+    baked = " ".join(_sh_quote(part) for part in invoke)
+    root = _sh_quote(repo_root)
     return f"""#!/bin/sh
 {_AUTOTRACK_MARKER}
 # Installed by aGiTrack. On `git commit`, if aGiTrack is not already tracking this repo, record
@@ -147,7 +158,11 @@ case "$(git rev-parse --absolute-git-dir 2>/dev/null)" in
   */worktrees/*)
     : ;;  # inside a session worktree -> aGiTrack already handles it
   *)
-    "{python_exe}" -m agitrack --precommit-sync --repo "{repo_root}" >/dev/null 2>&1 || true ;;
+    # `>/dev/null` drops any stray stdout but KEEPS stderr, so aGiTrack's user-facing messages
+    # (auto-started …, reminders, an available update) show in the `git commit` output.
+    {baked} --precommit-sync --repo {root} >/dev/null \\
+      || agitrack --precommit-sync --repo {root} >/dev/null \\
+      || true ;;
 esac
 # Chain to any pre-commit hook aGiTrack moved aside (a project hook, or the worktree guard).
 _agitrack_orig="$0{_ORIG_SUFFIX}"
@@ -164,13 +179,15 @@ def is_autotrack_hook(path: Path) -> bool:
 
 
 def install_autotrack_precommit_hook(
-    hooks_dir: Path, *, python_exe: str, repo_root: str, debug: Callable[[str], None] | None = None
+    hooks_dir: Path, *, invoke: list[str], repo_root: str, debug: Callable[[str], None] | None = None
 ) -> bool:
-    """Install the persistent auto-track ``pre-commit`` hook (idempotent). ``python_exe`` and
-    ``repo_root`` are baked into the script so it runs aGiTrack without anything on PATH. A
-    pre-existing non-aGiTrack hook is chained via ``pre-commit.agitrack-orig``."""
+    """Install the persistent auto-track ``pre-commit`` hook (idempotent). ``invoke`` is the argv
+    prefix that runs THIS aGiTrack (``agitrack.proc.agitrack_invocation()`` — frozen-aware) and is
+    baked in with a PATH fallback so the hook always calls the CURRENT aGiTrack after a self-update.
+    A pre-existing non-aGiTrack hook is chained via ``pre-commit.agitrack-orig``. Re-run on every
+    aGiTrack launch, so the baked path is refreshed if the install location ever changes."""
     return _install_hook(
-        hooks_dir, "pre-commit", _autotrack_precommit_script(python_exe, repo_root), _AUTOTRACK_MARKER, debug=debug
+        hooks_dir, "pre-commit", _autotrack_precommit_script(invoke, repo_root), _AUTOTRACK_MARKER, debug=debug
     )
 
 

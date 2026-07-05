@@ -279,10 +279,13 @@ def test_autotrack_precommit_hook_install_remove_and_chain(tmp_path):
     existing.write_text("#!/bin/sh\necho project\n", encoding="utf-8")
     existing.chmod(0o755)
 
-    assert git_hooks.install_autotrack_precommit_hook(hooks_dir, python_exe=_sys.executable, repo_root=str(repo.repo))
+    assert git_hooks.install_autotrack_precommit_hook(
+        hooks_dir, invoke=[_sys.executable, "-m", "agitrack"], repo_root=str(repo.repo)
+    )
     hook = (hooks_dir / "pre-commit").read_text()
     assert git_hooks.is_autotrack_hook(hooks_dir / "pre-commit")
     assert "--precommit-sync" in hook and _sys.executable in hook and str(repo.repo) in hook
+    assert "|| agitrack --precommit-sync" in hook  # PATH fallback so it calls the CURRENT aGiTrack
     assert (hooks_dir / "pre-commit.agitrack-orig").read_text() == "#!/bin/sh\necho project\n"
 
     git_hooks.remove_autotrack_precommit_hook(hooks_dir)
@@ -299,7 +302,9 @@ def test_remove_all_installed_hooks_removes_everything_and_restores_chains(tmp_p
     (hooks_dir / "pre-commit").write_text("#!/bin/sh\necho project\n", encoding="utf-8")
     (hooks_dir / "pre-commit").chmod(0o755)
     # Install all of aGiTrack's hooks.
-    git_hooks.install_autotrack_precommit_hook(hooks_dir, python_exe=_sys.executable, repo_root=str(repo.repo))
+    git_hooks.install_autotrack_precommit_hook(
+        hooks_dir, invoke=[_sys.executable, "-m", "agitrack"], repo_root=str(repo.repo)
+    )
     git_hooks.install_manual_commit_hooks(hooks_dir)
     assert git_hooks.is_autotrack_hook(hooks_dir / "pre-commit")
 
@@ -321,8 +326,16 @@ def test_remove_all_installed_hooks_noop_when_none(tmp_path):
 def test_autotrack_hook_is_a_noop_inside_a_worktree():
     # The hook script must skip (do nothing) when the commit is inside a linked worktree, so it
     # never fights aGiTrack's own worktree-mode handling.
-    script = git_hooks._autotrack_precommit_script("/usr/bin/python3", "/repo")
+    script = git_hooks._autotrack_precommit_script(["/usr/bin/python3", "-m", "agitrack"], "/repo")
     assert "*/worktrees/*)" in script and "--precommit-sync" in script
+
+
+def test_autotrack_hook_is_frozen_aware_and_has_path_fallback():
+    # Frozen (MSI) build: the exe is run directly (`-m agitrack` is invalid there); a normal build
+    # runs `python -m agitrack`. Both bake a PATH fallback so a self-update's new binary is used.
+    frozen = git_hooks._autotrack_precommit_script(["/opt/agitrack.exe"], "/repo")
+    assert "'/opt/agitrack.exe' --precommit-sync" in frozen and "-m agitrack --precommit-sync" not in frozen
+    assert "|| agitrack --precommit-sync" in frozen
 
 
 # --- CommitEngine manual sink ----------------------------------------------
