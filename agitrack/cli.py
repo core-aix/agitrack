@@ -149,28 +149,32 @@ def main(argv: list[str] | None = None) -> int:
         help="show this help message and exit",
     )
     parser.add_argument(
-        "--version",
-        action="store_true",
-        help="print the aGiTrack version and exit",
+        "-b",
+        "--background",
+        dest="background",
+        nargs="?",
+        const="run",
+        choices=["run", "stop", "status"],
+        default=None,
+        help="background (headless) mode: run WITHOUT the interactive TUI, so you drive the "
+        "coding agent from any UI you like (its native CLI, an IDE extension, …) while aGiTrack "
+        "watches the local session transcript and performs all the tracking the TUI would — "
+        "recording each turn, summarizing, and installing the commit hooks that fold the "
+        "interaction trace and token metadata into your commits. ALWAYS runs without a worktree "
+        "(implies --no-worktree). Uses AUTO commits by default (like interactive mode); add "
+        "--manual-commits / -m for user-triggered commits. `-b stop` / `-b status` stop or report "
+        "the background tracker running on this repo. Also settable via 'background' in config.",
     )
-    parser.add_argument("--repo", default=".", help="target Git repository path")
-    parser.add_argument("--verbose", action="store_true", help="show aGiTrack diagnostic messages")
-    parser.add_argument("--mode", choices=["proxy", "json"], default="proxy", help="interactive mode")
     parser.add_argument(
-        "--status",
-        "-s",
+        "-m",
+        "--manual-commits",
+        dest="manual_commits",
         action="store_true",
-        help="report whether aGiTrack is running for this repo and in which mode (interactive vs "
-        "background, auto vs manual commit, worktree vs no-worktree), then exit.",
-    )
-    parser.add_argument(
-        "--prompt",
-        action="append",
-        dest="prompts",
-        metavar="TEXT",
-        help="run this prompt non-interactively (implies --mode json) and exit; "
-        "repeatable, prompts run in order. Lines starting with ':' are aGiTrack "
-        "commands, e.g. --prompt ':status'",
+        help="user-triggered commits. ALWAYS runs without a worktree (implies --no-worktree): the "
+        "agent edits the current branch directly and each turn is recorded as a hidden 'latent' "
+        "commit on a side ref instead of landing on the branch. When you commit (via the aGiTrack "
+        "menu or an external `git commit`), the pending agent turns are folded into that one "
+        "commit. Also settable via 'manual_commits' in config.",
     )
     parser.add_argument(
         "-d",
@@ -187,6 +191,15 @@ def main(argv: list[str] | None = None) -> int:
         "this terminal closes or via `-d stop`. `status` reports it; `text` prints a "
         "one-shot report and exits",
     )
+    parser.add_argument(
+        "-s",
+        "--status",
+        action="store_true",
+        help="report whether aGiTrack is running for this repo and in which mode (interactive vs "
+        "background, auto vs manual commit, worktree vs no-worktree), then exit.",
+    )
+    # --- options without a short form, in rough order of how often they matter ---
+    parser.add_argument("--repo", default=".", help="target Git repository path")
     parser.add_argument(
         "--backend",
         choices=available_backends(),
@@ -205,6 +218,21 @@ def main(argv: list[str] | None = None) -> int:
         "(edits are visible live; no isolation/integration; unsafe with concurrent sessions)",
     )
     parser.add_argument(
+        "--auto-commit",
+        dest="auto_commit",
+        action="store_true",
+        help="force automatic (aGiTrack-triggered) commits — the default in background mode, so "
+        "this only matters to override a configured 'manual_commits': true. aGiTrack commits each "
+        "agent turn itself and folds tracking into the agent's own commits via a prepare-commit-msg hook.",
+    )
+    parser.add_argument(
+        "--delay-merge",
+        action="store_true",
+        help="don't merge a turn's committed changes into the base branch automatically; "
+        "instead leave them in the session's working directory for you to review/edit, then "
+        "merge on your confirmation via the session menu. Off by default.",
+    )
+    parser.add_argument(
         "--no-commit-guidance",
         action="store_true",
         help="do not tell the coding agent that aGiTrack handles commits; by default aGiTrack "
@@ -212,40 +240,11 @@ def main(argv: list[str] | None = None) -> int:
         "agent does not create its own git commits unless you explicitly ask",
     )
     parser.add_argument(
-        "--manual-commits",
-        "-m",
-        dest="manual_commits",
+        "--full-agent-messages",
         action="store_true",
-        help="user-triggered commits. ALWAYS runs without a worktree (implies --no-worktree): the "
-        "agent edits the current branch directly and each turn is recorded as a hidden 'latent' "
-        "commit on a side ref instead of landing on the branch. When you commit (via the aGiTrack "
-        "menu or an external `git commit`), the pending agent turns are folded into that one "
-        "commit. Also settable via 'manual_commits' in config.",
-    )
-    parser.add_argument(
-        "--background",
-        "-b",
-        dest="background",
-        nargs="?",
-        const="run",
-        choices=["run", "stop", "status"],
-        default=None,
-        help="background (headless) mode: run WITHOUT the interactive TUI, so you drive the "
-        "coding agent from any UI you like (its native CLI, an IDE extension, …) while aGiTrack "
-        "watches the local session transcript and performs all the tracking the TUI would — "
-        "recording each turn, summarizing, and installing the commit hooks that fold the "
-        "interaction trace and token metadata into your commits. ALWAYS runs without a worktree "
-        "(implies --no-worktree). Uses AUTO commits by default (like interactive mode); add "
-        "--manual-commits / -m for user-triggered commits. `-b stop` / `-b status` stop or report "
-        "the background tracker running on this repo. Also settable via 'background' in config.",
-    )
-    parser.add_argument(
-        "--auto-commit",
-        dest="auto_commit",
-        action="store_true",
-        help="force automatic (aGiTrack-triggered) commits — the default in --background mode, so "
-        "this only matters to override a configured 'manual_commits': true. aGiTrack commits each "
-        "agent turn itself and folds tracking into the agent's own commits via a prepare-commit-msg hook.",
+        help="record every user-facing message the agent sends during a turn in the "
+        "commit's interaction trace, not just the final reply (tool calls and file edits "
+        "are still excluded); also settable per-repo via full_agent_messages in config",
     )
     parser.add_argument(
         "--log-file",
@@ -288,32 +287,12 @@ def main(argv: list[str] | None = None) -> int:
         "keyed by backend name).",
     )
     parser.add_argument(
-        "--delay-merge",
+        "--remove-hooks",
         action="store_true",
-        help="don't merge a turn's committed changes into the base branch automatically; "
-        "instead leave them in the session's working directory for you to review/edit, then "
-        "merge on your confirmation via the session menu. Off by default.",
-    )
-    parser.add_argument(
-        "--json-events",
-        action="store_true",
-        help="in --mode json, emit one machine-readable JSON line per turn event "
-        "(the agent's response, the commit produced, errors) — used by the VSCode "
-        "chat extension and other programmatic drivers",
-    )
-    parser.add_argument(
-        "--ui-bridge",
-        action="store_true",
-        help="in --mode json, run a long-lived JSON-RPC session over stdin/stdout where "
-        "interactive questions (menus, confirmations, text input) are asked of the driver "
-        "instead of a terminal — used by the VSCode extension (see editors/vscode)",
-    )
-    parser.add_argument(
-        "--full-agent-messages",
-        action="store_true",
-        help="record every user-facing message the agent sends during a turn in the "
-        "commit's interaction trace, not just the final reply (tool calls and file edits "
-        "are still excluded); also settable per-repo via full_agent_messages in config",
+        help="remove all aGiTrack-installed git hooks from the repo — the persistent auto-track "
+        "pre-commit hook and the manual-commit prepare-commit-msg/post-commit fold hooks (and the "
+        "worktree base-commit guard), restoring any hooks they chained. Use this to fully opt out "
+        "of aGiTrack's commit-time tracking.",
     )
     parser.add_argument(
         "--recover",
@@ -323,6 +302,54 @@ def main(argv: list[str] | None = None) -> int:
         "uncommitted changes and merge it into the base branch (skipping the merge on a "
         "conflict). Runs headlessly and no-ops if a live aGiTrack holds the repo lock. Used "
         "by the VSCode extension on close; also runnable manually.",
+    )
+    parser.add_argument("--verbose", action="store_true", help="show aGiTrack diagnostic messages")
+    parser.add_argument(
+        "--version",
+        action="store_true",
+        help="print the aGiTrack version and exit",
+    )
+    # --- testing / programmatic-driver options (real interactive use never needs these) ---
+    parser.add_argument(
+        "--json",
+        dest="json_mode",
+        action="store_true",
+        help="use the JSON prompt-loop instead of the interactive TUI: aGiTrack sends each typed "
+        "line (or --prompt) to the backend non-interactively and captures the reply as a commit. "
+        "Mainly for testing and programmatic drivers — normal interactive use does not need it.",
+    )
+    parser.add_argument(
+        "--prompt",
+        action="append",
+        dest="prompts",
+        metavar="TEXT",
+        help="run this prompt non-interactively (implies --json) and exit; "
+        "repeatable, prompts run in order. Lines starting with ':' are aGiTrack "
+        "commands, e.g. --prompt ':status'",
+    )
+    parser.add_argument(
+        "--json-events",
+        action="store_true",
+        help="with --json, emit one machine-readable JSON line per turn event "
+        "(the agent's response, the commit produced, errors) — used by the VSCode "
+        "chat extension and other programmatic drivers",
+    )
+    parser.add_argument(
+        "--ui-bridge",
+        action="store_true",
+        help="with --json, run a long-lived JSON-RPC session over stdin/stdout where "
+        "interactive questions (menus, confirmations, text input) are asked of the driver "
+        "instead of a terminal — used by the VSCode extension (see editors/vscode)",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["proxy", "json"],
+        default="proxy",
+        # Deprecated: `--mode` conflated too many things (interactive/background,
+        # auto/manual, worktree/no-worktree are separate flags now). Kept as a hidden,
+        # still-working alias for `--json` so existing scripts don't break: `--mode json`
+        # == `--json`. New usage should prefer `--json`.
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--skip-privacy-ack",
@@ -350,14 +377,6 @@ def main(argv: list[str] | None = None) -> int:
         # when that pid dies, so the dashboard never outlives whatever launched it —
         # even on SIGKILL, which leaves no chance to stop us first.
         help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--remove-hooks",
-        action="store_true",
-        help="remove all aGiTrack-installed git hooks from the repo — the persistent auto-track "
-        "pre-commit hook and the manual-commit prepare-commit-msg/post-commit fold hooks (and the "
-        "worktree base-commit guard), restoring any hooks they chained. Use this to fully opt out "
-        "of aGiTrack's commit-time tracking.",
     )
     parser.add_argument(
         "--precommit-sync",
@@ -571,6 +590,10 @@ def main(argv: list[str] | None = None) -> int:
         result = subprocess.run(head + backend_args, check=False)
         return result.returncode
 
+    # `--json` is the documented flag for the JSON prompt-loop; `--mode json` is its hidden
+    # deprecated alias. `--prompt` and `--ui-bridge` both drive that same non-interactive loop.
+    if args.json_mode:
+        args.mode = "json"
     scripted = bool(args.prompts)
     if scripted:
         args.mode = "json"  # --prompt drives the non-interactive shell (#53)

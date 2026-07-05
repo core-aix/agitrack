@@ -1293,7 +1293,7 @@ class ProxyRunner:
 
     def run(self) -> int:
         if not sys.stdin.isatty() or not sys.stdout.isatty():
-            raise RuntimeError("Proxy mode requires an interactive terminal. Use --mode json for non-TTY use.")
+            raise RuntimeError("The interactive TUI requires an interactive terminal. Use --json for non-TTY use.")
         if not self._ensure_backend_available():
             return 1
         if not self.management_lock.acquire():
@@ -7173,7 +7173,7 @@ class ProxyRunner:
             notice += f"\nFull details written to: {log_path}"
         notice += (
             "\nTry `agitrack --new-session` to start a fresh conversation, "
-            "or `agitrack --mode json` to see the full backend error."
+            "or `agitrack --json` to see the full backend error."
         )
         return notice
 
