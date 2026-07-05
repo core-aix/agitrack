@@ -292,6 +292,25 @@ class GitRepo:
     def diff_range(self, base: str, head: str) -> str:
         return self._run(["git", "diff", f"{base}..{head}"], check=False).stdout
 
+    def show_commit(self, ref: str, *, max_bytes: int = 400_000) -> tuple[str, bool]:
+        """The file diffs a commit introduced — a diffstat followed by the unified patch —
+        for the dashboard's local diff view (so the dashboard is fully usable off GitHub).
+
+        ``--first-parent`` makes a merge or cover commit show its change against the mainline
+        parent (the AI work a cover commit accounts for) instead of the near-empty combined
+        diff; it's a no-op for ordinary single-parent commits, and a root commit shows as
+        all-additions. All local: it reads blobs already in the clone, never the network.
+
+        Returns ``(patch, truncated)`` — the patch is capped at ``max_bytes`` so one enormous
+        commit can't produce an unbounded response; ``truncated`` is True when it was cut."""
+        out = self._run(
+            ["git", "show", "--no-color", "--first-parent", "--format=", "--stat", "--patch", ref],
+            check=False,
+        ).stdout
+        if len(out) > max_bytes:
+            return out[:max_bytes], True
+        return out, False
+
     # --- branches / worktrees / merges (used by concurrent-session support) ---
 
     def current_branch(self) -> str:
