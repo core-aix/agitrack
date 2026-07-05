@@ -122,8 +122,28 @@ a:hover{color:var(--ink);background:var(--phosphor);border-bottom-color:var(--ph
 .md .anchor:hover{background:none;color:var(--phosphor)}
 
 /* mermaid diagrams */
-.mermaid{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px;margin:0 0 22px;overflow-x:auto;text-align:center}
+.mermaid{position:relative;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px;margin:0 0 22px;overflow-x:auto;text-align:center;cursor:zoom-in}
 .mermaid svg{max-width:100%;height:auto}
+.mermaid::after{
+  content:"⤢ click to zoom";position:absolute;top:8px;right:10px;font-size:11px;
+  color:var(--amber);border:1px solid var(--amber-dim);padding:1px 7px;border-radius:3px;
+  background:rgba(12,18,14,.85);opacity:.65;pointer-events:none;letter-spacing:.3px;
+}
+.mermaid:hover::after{opacity:1}
+
+/* zoom lightbox */
+.zoom{position:fixed;inset:0;z-index:80;background:rgba(4,7,5,.97);display:flex;flex-direction:column}
+.zoom[hidden]{display:none}
+.zoom-bar{display:flex;align-items:center;gap:10px;padding:10px 16px;border-bottom:1px solid var(--line);background:var(--panel-2);font-size:13px;color:var(--fg-dim)}
+.zoom-bar button{font-family:var(--mono);font-size:13px;font-weight:600;color:var(--phosphor);background:transparent;border:1px solid var(--phosphor-dim);border-bottom-width:2px;padding:4px 12px;cursor:pointer}
+.zoom-bar button:hover{background:var(--phosphor);color:var(--ink)}
+.zoom-pct{min-width:54px;text-align:center;color:var(--amber);font-weight:600}
+.zoom-hint{color:#5f7568;font-size:12px}
+.zoom-close{margin-left:auto}
+.zoom-stage{flex:1;overflow:auto;cursor:grab;padding:24px;touch-action:none}
+.zoom-stage.drag{cursor:grabbing}
+.zoom-stage svg{display:block;max-width:none!important;margin:0 auto}
+@media (max-width:560px){ .zoom-hint{display:none} }
 
 /* status / loading */
 .status{color:var(--fg-dim);font-size:14px;padding:20px 0}
@@ -164,6 +184,18 @@ a:hover{color:var(--ink);background:var(--phosphor);border-bottom-color:var(--ph
       <div class="md" id="md-userflow"><p class="status">Loading the user flow…</p></div>
     </section>
   </div>
+</div>
+
+<div class="zoom" id="zoom" hidden>
+  <div class="zoom-bar">
+    <button data-z="out" title="Zoom out">−</button>
+    <span class="zoom-pct" id="zoomPct">100%</span>
+    <button data-z="in" title="Zoom in">+</button>
+    <button data-z="reset" title="Reset">reset</button>
+    <span class="zoom-hint">scroll to zoom · drag to pan · Esc to close</span>
+    <button data-z="close" class="zoom-close" title="Close">✕ close</button>
+  </div>
+  <div class="zoom-stage" id="zoomStage"></div>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/marked@4.3.0/marked.min.js"></script>
@@ -336,6 +368,86 @@ document.addEventListener('click', e => {
 window.addEventListener('popstate', () => {
   const tab = new URL(location.href).searchParams.get('tab') || 'manual';
   activate(tab, false);
+});
+
+// ---- zoomable diagrams: click a diagram to open a pan/zoom lightbox ----
+const zoom = document.getElementById('zoom');
+const stage = document.getElementById('zoomStage');
+const pctEl = document.getElementById('zoomPct');
+let zSvg = null, zW = 0, zH = 0, zScale = 1;
+
+function applyZoom(){
+  if (!zSvg) return;
+  zSvg.style.width = (zW * zScale) + 'px';
+  zSvg.style.height = (zH * zScale) + 'px';
+  pctEl.textContent = Math.round(zScale * 100) + '%';
+}
+function openZoom(srcSvg){
+  const vb = (srcSvg.getAttribute('viewBox') || '').split(/[\s,]+/).map(Number);
+  const rect = srcSvg.getBoundingClientRect();
+  zW = (vb.length === 4 && vb[2]) ? vb[2] : (rect.width || 800);
+  zH = (vb.length === 4 && vb[3]) ? vb[3] : (rect.height || 600);
+  const clone = srcSvg.cloneNode(true);
+  clone.removeAttribute('width'); clone.removeAttribute('height'); clone.style.maxWidth = 'none';
+  stage.innerHTML = ''; stage.appendChild(clone); zSvg = clone;
+  zScale = 1; // open at the diagram's natural (readable) size; large ones become pannable
+  applyZoom();
+  zoom.hidden = false;
+  // center the diagram in the viewport
+  stage.scrollLeft = Math.max(0, (zSvg.offsetWidth - stage.clientWidth) / 2);
+  stage.scrollTop = 0;
+}
+function closeZoom(){ zoom.hidden = true; stage.innerHTML = ''; zSvg = null; }
+function zoomBy(factor, px, py){
+  if (!zSvg) return;
+  const old = zScale;
+  zScale = Math.min(14, Math.max(0.1, zScale * factor));
+  if (zScale === old) return;
+  const ratio = zScale / old;
+  // keep the point under the cursor (or the viewport center) fixed while scaling
+  const cx = (px == null ? stage.clientWidth / 2 : px);
+  const cy = (py == null ? stage.clientHeight / 2 : py);
+  const beforeX = stage.scrollLeft + cx, beforeY = stage.scrollTop + cy;
+  applyZoom();
+  stage.scrollLeft = beforeX * ratio - cx;
+  stage.scrollTop = beforeY * ratio - cy;
+}
+
+// open on click of any rendered diagram
+document.addEventListener('click', e => {
+  const m = e.target.closest('.mermaid');
+  if (!m || zoom.contains(m)) return;
+  const svg = m.querySelector('svg');
+  if (svg) openZoom(svg);
+});
+// toolbar
+zoom.querySelector('.zoom-bar').addEventListener('click', e => {
+  const b = e.target.closest('[data-z]');
+  if (!b) return;
+  const z = b.dataset.z;
+  if (z === 'in') zoomBy(1.25);
+  else if (z === 'out') zoomBy(1/1.25);
+  else if (z === 'reset'){ zoomBy(1/zScale); stage.scrollLeft = Math.max(0,(zSvg.offsetWidth-stage.clientWidth)/2); stage.scrollTop = 0; }
+  else if (z === 'close') closeZoom();
+});
+// wheel to zoom (anchored at cursor)
+stage.addEventListener('wheel', e => {
+  if (zoom.hidden) return;
+  e.preventDefault();
+  const r = stage.getBoundingClientRect();
+  zoomBy(e.deltaY < 0 ? 1.15 : 1/1.15, e.clientX - r.left, e.clientY - r.top);
+}, { passive:false });
+// drag to pan
+let dragging = false, lastX = 0, lastY = 0;
+stage.addEventListener('pointerdown', e => { dragging = true; lastX = e.clientX; lastY = e.clientY; stage.classList.add('drag'); stage.setPointerCapture(e.pointerId); });
+stage.addEventListener('pointermove', e => { if (!dragging) return; stage.scrollLeft -= (e.clientX - lastX); stage.scrollTop -= (e.clientY - lastY); lastX = e.clientX; lastY = e.clientY; });
+stage.addEventListener('pointerup', e => { dragging = false; stage.classList.remove('drag'); });
+stage.addEventListener('pointercancel', () => { dragging = false; stage.classList.remove('drag'); });
+document.addEventListener('keydown', e => {
+  if (zoom.hidden) return;
+  if (e.key === 'Escape') closeZoom();
+  else if (e.key === '+' || e.key === '=') zoomBy(1.25);
+  else if (e.key === '-') zoomBy(1/1.25);
 });
 
 // initial: honor ?tab=, then eagerly warm the other doc in the background
