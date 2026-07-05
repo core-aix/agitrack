@@ -143,6 +143,8 @@ aGiTrack has two independent choices — **how you run it** (interactive vs back
 
 Each mode is described in full below (`--no-worktree`, `--manual-commits`, `--background`), and every choice is also settable in config (`use_worktrees`, `manual_commits`, `background`) so it becomes your default. Switching a repo between any of these modes between runs is supported — aGiTrack cleans up or ignores the previous mode's state (hooks, side refs, background handshake) on the next launch.
 
+### Repository, backend, and session
+
 Run against another repository:
 
 ```bash
@@ -161,6 +163,8 @@ By default aGiTrack resumes the previous conversation for the repository. Start 
 ```bash
 agitrack --new-session
 ```
+
+### Worktrees and no-worktree (`--no-worktree`)
 
 By default, each session runs in its own [git worktree](https://git-scm.com/docs/git-worktree) — a separate checkout of the repository under `.agitrack/worktrees/`. This isolates the agent's edits from your working copy, lets several sessions run concurrently without colliding, and lets aGiTrack integrate (merge) each session's commits into its target branch on its own. You can opt out of this:
 
@@ -423,13 +427,13 @@ If an update exists, aGiTrack prompts you at startup and shows a notice during a
 
 ## Advanced Usage
 
+### Debugging / diagnostic logs
+
 Show aGiTrack diagnostic messages:
 
 ```bash
 agitrack --verbose
 ```
-
-### Debugging / diagnostic logs
 
 When something in the terminal misbehaves — stray escape codes, input not registering, a hang on a menu or session switch — aGiTrack can write detailed diagnostic logs. Two opt-in environment switches turn them on (off by default; they work the same on macOS, Linux, and Windows):
 
@@ -448,6 +452,8 @@ $env:DEBUG_RAW = "1"; agitrack
 
 The logs are written to your **target repo**'s `.agitrack/` folder, one pair per run: `proxy-debug-<timestamp>.log` and `proxy-raw-<timestamp>.log`. When reporting a problem, attach the newest pair. (The switches are also accepted as `AGITRACK_DEBUG_RAW` / `AGITRACK_DEBUG_PROXY`. Full details for contributors are in `AGENTS.md` → "Diagnostics & Debugging".)
 
+### Reviewing changes before merge (`--delay-merge`)
+
 Review each turn before it merges, instead of integrating automatically:
 
 ```bash
@@ -455,6 +461,8 @@ agitrack --delay-merge
 ```
 
 By default aGiTrack merges a turn's committed changes into the base branch as soon as the turn finishes. With `--delay-merge` it holds the merge: after the agent commits, the changes stay in the session's **working directory** (a git worktree when worktrees are enabled — its path is shown in the notice, since you may not know the worktree's location otherwise) so you can review them and make any further edits. When you're ready, open the session menu and choose **"Merge reviewed changes into &lt;base&gt;"** to integrate. Nothing is merged until you confirm (on exit, any still-unmerged work stays on its branch and is offered again next time). This is off by default.
+
+### JSON prompt-loop (`--json`)
 
 Use the structured JSON prompt-loop (mainly for testing and programmatic drivers — normal interactive use doesn't need it):
 
