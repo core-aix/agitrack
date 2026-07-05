@@ -20,7 +20,7 @@ from typing import Any
 from agitrack.git import GitRepo
 from agitrack.metrics.collect import Dashboard, build_dashboard
 from agitrack.metrics.github import cached_logins
-from agitrack.metrics.web import aggregates_payload, log_page, shared_sessions_for, shell_html
+from agitrack.metrics.web import aggregates_payload, commit_diff, log_page, shared_sessions_for, shell_html
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
@@ -83,6 +83,10 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
                     sort=_str(query, "sort"),
                 )
                 self._respond("application/json", self._json(page))
+            elif parsed.path == "/diff":
+                # This commit's file diffs, straight from the local clone — so the dashboard
+                # shows changes without GitHub. The sha is validated as a hex id in commit_diff.
+                self._respond("application/json", self._json(commit_diff(self.repo, _str(query, "sha"))))
             else:
                 self.send_error(404, "not found")
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):

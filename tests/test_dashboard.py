@@ -1223,6 +1223,64 @@ def test_dashboard_server_serves_aggregates_and_paginated_log(tmp_path):
         thread.join(timeout=5)
 
 
+def test_commit_diff_returns_local_patch(tmp_path):
+    # The dashboard's diff view is computed entirely from the local clone (no GitHub).
+    from agitrack.metrics.web import commit_diff
+
+    repo = _demo_repo(tmp_path)
+    sha = repo.rev_parse("HEAD~2")  # the "add the feature" agent commit that added agent.txt
+    out = commit_diff(repo, sha)
+    assert out["sha"] == sha and out["truncated"] is False and "error" not in out
+    assert "diff --git a/agent.txt b/agent.txt" in out["diff"]
+    assert "+line 0" in out["diff"]  # the added content shows as additions
+
+
+def test_commit_diff_rejects_non_hex_sha(tmp_path):
+    # ?sha= is validated as a hex object id so it can never become a git option / injection.
+    from agitrack.metrics.web import commit_diff
+
+    repo = _demo_repo(tmp_path)
+    for bad in ("--upload-pack=x", "; rm -rf /", "HEAD", "main", ""):
+        out = commit_diff(repo, bad)
+        assert out["error"] == "invalid commit id" and out["diff"] == ""
+
+
+def test_commit_diff_of_cover_merge_uses_first_parent(tmp_path):
+    # A cover/merge commit's default combined diff is near-empty; --first-parent surfaces the
+    # real change (the AI work it accounts for), so the diff view is useful for merges too.
+    from agitrack.metrics.web import commit_diff
+
+    repo = _demo_repo(tmp_path)
+    # HEAD is the agent-merge (empty); HEAD~1 is the cover commit over backend.txt.
+    cover = repo.rev_parse("HEAD~1")
+    out = commit_diff(repo, cover)
+    assert "backend.txt" in out["diff"] and "+line 0" in out["diff"]
+
+
+def test_log_entries_carry_full_sha_for_diff(tmp_path):
+    from agitrack.metrics.web import log_page
+
+    dash = build_dashboard(_demo_repo(tmp_path))
+    entries = log_page(dash)["entries"]
+    assert entries and all(len(e["sha"]) == 40 and e["sha"].startswith(e["short"]) for e in entries)
+
+
+def test_diff_endpoint_serves_commit_diff(tmp_path):
+    repo = _demo_repo(tmp_path)
+    server, thread, base = _serve(repo)
+    try:
+        sha = json.loads(_get(base + "/log?limit=1"))["entries"][0]["sha"]
+        diff = json.loads(_get(base + "/diff?sha=" + sha))
+        assert diff["sha"] == sha and "diff" in diff
+        # a bogus id is rejected, never interpolated into git
+        bad = json.loads(_get(base + "/diff?sha=notahex"))
+        assert bad["error"] == "invalid commit id"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
 def _add_feature_branch(repo: GitRepo) -> str:
     """Branch off the current tip and add one extra agent commit on ``feature``,
     leaving the original branch checked out. Returns the original branch name."""

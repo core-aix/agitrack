@@ -25,6 +25,7 @@ and ad-hoc use; the live page does not embed it.
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timedelta, timezone
 
 from agitrack.commits import METADATA_HEADER
@@ -473,6 +474,7 @@ def _log_entry(dash: Dashboard, stat: CommitStat, covers: dict[str, CommitStat])
     eff_backend, eff_model = _effective(stat, covers)
     return {
         "short": stat.short,
+        "sha": stat.sha,  # full sha so the live page can fetch this commit's diff from /diff
         "author": dash.label_of(stat),
         "committers": dash.committers_of(stat),
         "subject": stat.subject,
@@ -529,6 +531,24 @@ def log_page(
     }
 
 
+# A commit id must be a bare hex object name before it is handed to git, so a crafted
+# ?sha= value can never become a git option (e.g. --upload-pack) or reach the shell.
+_SHA_RE = re.compile(r"^[0-9a-fA-F]{4,64}$")
+
+
+def commit_diff(repo: GitRepo, sha: str) -> dict:
+    """The file diffs a single commit introduced (a diffstat + unified patch), for the
+    dashboard's local diff view — computed entirely from the local clone, so the dashboard
+    needs no GitHub. ``sha`` is validated as a hex object id before touching git."""
+    if not _SHA_RE.match(sha or ""):
+        return {"sha": sha, "diff": "", "error": "invalid commit id"}
+    try:
+        patch, truncated = repo.show_commit(sha)
+    except Exception:
+        return {"sha": sha, "diff": "", "error": "could not read this commit's diff"}
+    return {"sha": sha, "diff": patch, "truncated": truncated}
+
+
 def initial_payload(dash: Dashboard, *, shared_sessions: list[dict] | None = None) -> dict:
     """What the page embeds for an instant first paint: unfiltered aggregates,
     the first log page, repo metadata, the page size, and any shared sessions."""
@@ -557,7 +577,7 @@ _TEMPLATE = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>aGiTrack - Dashboard · __REPO_NAME__</title>
-<!-- Inline SVG favicon (the aGiTrack wordmark mark) — the server only serves /, /data, /log, so it can't host a file. -->
+<!-- Inline SVG favicon (the aGiTrack wordmark mark) — the server only serves /, /data, /log, /diff, so it can't host a file. -->
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2064%2064'%3E%3Crect%20width='64'%20height='64'%20rx='13'%20fill='%23070b09'/%3E%3Ctext%20x='32'%20y='45'%20text-anchor='middle'%20font-family='ui-monospace,monospace'%20font-weight='700'%20font-size='42'%20letter-spacing='-1'%3E%3Ctspan%20fill='%23ffb454'%3Ea%3C/tspan%3E%3Ctspan%20fill='%233dffa0'%3EG%3C/tspan%3E%3C/text%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -795,6 +815,19 @@ h2.section::before{content:"# ";color:var(--amber)}
 .entry .detail .dmeta{color:var(--ops);font-size:12px;margin-bottom:6px}
 .entry .detail .dmsg{font-size:12.5px;color:var(--fg-dim);background:var(--ink);border:1px solid var(--line);
   padding:4px 12px;max-height:440px;overflow:auto;word-break:break-word}
+/* local (off-GitHub) per-commit file diff */
+.entry .detail .diffbtn{margin-right:10px;font-family:inherit;font-size:11.5px;color:var(--phosphor);
+  background:transparent;border:1px solid var(--phosphor-dim);padding:1px 8px;cursor:pointer;letter-spacing:.3px}
+.entry .detail .diffbtn:hover{background:var(--phosphor);color:var(--ink)}
+.diffbox{margin:6px 0 2px;border:1px solid var(--line);background:var(--ink);max-height:460px;overflow:auto;
+  font-size:12px;line-height:1.5;white-space:pre}
+.diffbox .dl{display:block;padding:0 10px}
+.diffbox .dfile{color:var(--amber);background:rgba(255,180,84,.06)}
+.diffbox .dhunk{color:var(--ops);background:rgba(103,184,214,.09)}
+.diffbox .dmeta2{color:var(--fg-dim)}
+.diffbox .dadd{color:var(--phosphor);background:rgba(61,255,160,.08)}
+.diffbox .ddel{color:var(--red);background:rgba(255,107,107,.08)}
+.diffwrap .diffempty,.diffwrap .diffloading{color:var(--fg-dim);font-size:12px;font-style:italic;padding:5px 0}
 /* rendered Markdown inside the expanded message */
 .dmsg.md p{margin:7px 0}
 .dmsg.md .md-h{font-family:var(--mono);color:var(--amber);margin:11px 0 5px;font-size:13px;font-weight:600}
@@ -1423,17 +1456,55 @@ function toggleDetail(i){
   const c = LOG_ENTRIES[i], detail = $("detail-"+i);
   if(!c || !detail) return;
   if(detail.hidden){
+    // Local file diff (served from the clone by /diff) is the primary, GitHub-free action;
+    // the GitHub link is kept as an optional extra when a remote is configured. A squash has
+    // no single diff worth showing here (its parts expand separately), so skip the button then.
+    const diffBtn = (LIVE && c.sha && !(c.parts&&c.parts.length))
+      ? `<button class="diffbtn" data-diff="${i}">show file diff</button>` : "";
     const link = c.url ? `<a href="${esc(c.url)}" target="_blank" rel="noopener">view on GitHub ↗</a>` : "";
     const span = (c.started||c.ended)
       ? `<div class="dmeta">AI conversation: ${esc(c.started||"?")} → ${esc(c.ended||"?")}</div>` : "";
     const who = (c.committers&&c.committers.length)
       ? `<div class="dmeta">committer${c.committers.length>1?"s":""}: ${c.committers.map(esc).join(", ")}</div>` : "";
-    detail.innerHTML = `<div class="dhead">${esc(c.short)} ${link}</div>${who}${span}`+
-      `<div class="dmsg md">${md(c.message||"(no message recorded)")}</div>${partsHtml(c.parts)}`;
+    detail.innerHTML = `<div class="dhead">${esc(c.short)} ${diffBtn}${link}</div>${who}${span}`+
+      `<div class="dmsg md">${md(c.message||"(no message recorded)")}</div>`+
+      `<div class="diffwrap" id="diff-${i}" hidden></div>${partsHtml(c.parts)}`;
     detail.hidden = false;
   } else {
     detail.hidden = true;
   }
+}
+
+// Fetch and show (or hide) a commit's file diffs from the local clone via /diff — no GitHub.
+async function toggleDiff(i){
+  const c = LOG_ENTRIES[i], wrap = $("diff-"+i);
+  const btn = document.querySelector('.diffbtn[data-diff="'+i+'"]');
+  if(!c || !wrap) return;
+  if(!wrap.hidden){ wrap.hidden = true; if(btn) btn.textContent = "show file diff"; return; }
+  wrap.hidden = false; if(btn) btn.textContent = "hide file diff";
+  if(wrap.dataset.loaded) return;  // fetched once; toggling after just shows/hides
+  wrap.innerHTML = '<div class="diffloading">loading diff…</div>';
+  try{
+    const r = await fetch("diff?sha="+encodeURIComponent(c.sha), {cache:"no-store"});
+    const d = r.ok ? await r.json() : {error:"server error"};
+    if(d.error) wrap.innerHTML = '<div class="diffempty">'+esc(d.error)+'</div>';
+    else if(!d.diff || !d.diff.trim()) wrap.innerHTML = '<div class="diffempty">no file changes in this commit</div>';
+    else wrap.innerHTML = renderDiff(d.diff) + (d.truncated?'<div class="diffempty">…diff truncated (very large commit)</div>':"");
+    wrap.dataset.loaded = "1";
+  }catch(e){ wrap.innerHTML = '<div class="diffempty">couldn\'t load the diff (server unreachable)</div>'; }
+}
+// Color a unified diff (diffstat + patch) line-by-line: file headers, hunk headers, +adds, −dels.
+function renderDiff(text){
+  const rows = (text||"").replace(/\r\n/g,"\n").replace(/\n+$/,"").split("\n").map(raw => {
+    let cls = "dl";
+    if(/^(diff --git |index |new file|deleted file|similarity |rename |old mode|new mode)/.test(raw)) cls="dl dfile";
+    else if(raw.startsWith("@@")) cls="dl dhunk";
+    else if(raw.startsWith("+++")||raw.startsWith("---")) cls="dl dmeta2";
+    else if(raw.startsWith("+")) cls="dl dadd";
+    else if(raw.startsWith("-")) cls="dl ddel";
+    return '<span class="'+cls+'">'+(esc(raw)||"&nbsp;")+'</span>';
+  });
+  return '<pre class="diffbox">'+rows.join("")+'</pre>';
 }
 
 function fillSelect(id, values, allLabel, keep){
@@ -1571,6 +1642,8 @@ async function init(){
   // inside the opened detail (links, the squash <details> tree, the pager) are
   // left alone.
   $("commitlog").addEventListener("click", e => {
+    const dbtn = e.target.closest(".diffbtn");
+    if(dbtn){ e.preventDefault(); toggleDiff(+dbtn.dataset.diff); return; }
     if(e.target.closest("a") || e.target.closest(".detail") || e.target.closest(".pager")) return;
     const entry = e.target.closest(".entry");
     if(entry) toggleDetail(+entry.dataset.i);
