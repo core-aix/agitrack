@@ -50,6 +50,7 @@ class GitRepo:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
+            **console_isolation_kwargs(),  # keep git off a console on Windows (proc.py)
         )
         if process.returncode != 0:
             raise GitError(f"Not a Git repository: {path}")
@@ -71,6 +72,7 @@ class GitRepo:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
+            **console_isolation_kwargs(),  # keep git off a console on Windows (proc.py)
         )
         if process.returncode != 0:
             raise GitError(f"git init failed in {path}:\n{process.stderr.strip()}")
@@ -654,6 +656,9 @@ class GitRepo:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             env={**os.environ, **env} if env else None,
+            # A cancellable network git (fetch/push) run from the console-less background
+            # daemon would flash its own console window on Windows without this (proc.py).
+            **console_isolation_kwargs(),
         )
         deadline = time.monotonic() + timeout if timeout is not None else None
         while True:
@@ -729,6 +734,9 @@ class GitRepo:
             stderr=subprocess.PIPE,
             text=True,
             env={**os.environ, **env} if env else None,
+            # A cancellable network git (push) run from the console-less background daemon
+            # would flash its own console window on Windows without this (proc.py).
+            **console_isolation_kwargs(),
         )
         deadline = time.monotonic() + timeout if timeout is not None else None
         while True:

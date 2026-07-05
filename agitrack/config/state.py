@@ -8,6 +8,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from agitrack.proc import console_isolation_kwargs
+
 
 class AgitrackState:
     def __init__(self, repo: Path, *, default_backend: str | None = None) -> None:
@@ -155,6 +157,11 @@ class AgitrackState:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=False,
+                # Keep git off a console on Windows. This runs on EVERY state save (and the
+                # background daemon saves/ensures the ignore each poll cycle); the detached,
+                # console-less daemon would otherwise allocate — and flash — a new console
+                # window per call, once every few seconds. See proc.py.
+                **console_isolation_kwargs(),
             )
         except OSError:
             return fallback

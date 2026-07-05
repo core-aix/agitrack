@@ -21,6 +21,7 @@ import threading
 import time
 
 from agitrack.git import GitRepo
+from agitrack.proc import console_isolation_kwargs
 
 # git@github.com:owner/repo.git  or  https://github.com/owner/repo(.git)
 _REMOTE_RE = re.compile(r"github\.com[:/]+(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?/?$")
@@ -46,6 +47,7 @@ def gh_status() -> str:
             capture_output=True,
             text=True,
             timeout=_TIMEOUT_SECONDS,
+            **console_isolation_kwargs(),  # keep gh off a console on Windows (proc.py)
         )
     except (OSError, subprocess.SubprocessError):
         return "unauthenticated"
@@ -124,6 +126,7 @@ def _fetch_logins(repo: GitRepo) -> dict[str, str]:
             capture_output=True,
             text=True,
             timeout=_TIMEOUT_SECONDS,
+            **console_isolation_kwargs(),  # keep gh off a console on Windows (proc.py)
         )
     except (OSError, subprocess.SubprocessError):
         return {}
