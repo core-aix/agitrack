@@ -48,7 +48,7 @@ Conventions:
 | Empty turn list → no commit | `test_commit_turns_returns_false_for_empty_turns` | mock |
 | Subject joins multiple prompts with `/` | `test_commit_turns_subject_joins_multiple_prompts`, `test_agent_commit_subject_joins_all_prompts_with_slash` | mock |
 | Trace records final reply only (default) / all messages (opt-in) | `test_commit_turns_records_only_final_agent_message_by_default`, `test_commit_turns_records_all_agent_messages_when_option_on` | mock |
-| **Queued follow-up messages (sent mid-turn, recorded as `attachment` rows) captured in the trace** | `test_claude_session.py::test_parse_rows_captures_queued_followup_messages_in_the_turn`, `_ignores_non_human_or_slash_queued_attachments` | mock |
+| **Queued follow-up messages (sent mid-turn) captured as DISTINCT `## User` headings, no duplication, tokens not doubled** | `test_claude_session.py::test_parse_rows_captures_queued_followup_messages_in_the_turn`, `_ignores_non_human_or_slash_queued_attachments`, `test_commit_engine.py::test_queued_followups_render_as_separate_user_headings_without_duplication` | mock |
 | Failed attempt does not double-count tokens | `test_agent_commit_failed_attempt_does_not_double_count_tokens` | mock |
 | Backend-made commits → cover commit (hashes preserved) | `test_clean_tree_covers_backend_commits_without_rewriting_them`, `test_cover_commit_*` | real-git |
 | Token usage / reasoning effort / compactions recorded | `test_commit_turns_records_latest_reasoning_effort`, `test_commit_turns_surfaces_compactions_and_clears_origin_event` | mock |
@@ -133,7 +133,7 @@ Conventions:
 ## 9c. Persistent auto-track pre-commit hook (remind / auto-start on commit)
 | Sequence | Test(s) | Kind |
 |---|---|---|
-| Hook installs (python+repo baked in), chains a project hook, restores on removal | `test_autotrack_precommit_hook_install_remove_and_chain` | real-git |
+| Hook installs (frozen-aware invocation + PATH fallback baked in), chains a project hook, restores on removal | `test_autotrack_precommit_hook_install_remove_and_chain`, `test_autotrack_hook_is_frozen_aware_and_has_path_fallback` | real-git |
 | Hook is a no-op inside a linked worktree | `test_autotrack_hook_is_a_noop_inside_a_worktree` | unit |
 | `--precommit-sync` records pending AI turns + folds the trace into the triggering commit | `test_precommit_sync_folds_ai_work_into_the_commit` | real-git |
 | No AI work since last commit → no footprint (no trailer, no nag) | `test_precommit_sync_no_ai_work_is_a_noop` | real-git |

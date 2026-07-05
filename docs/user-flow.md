@@ -191,25 +191,37 @@ flowchart TD
 
 ## 3b. Background mode (`--background` / `-b`)
 
-Runs aGiTrack **without the interactive TUI** so you can drive the coding agent from **any** UI (its
-native CLI, an IDE extension, a chat window) while aGiTrack tracks that session in the background —
-the interactive-UI-agnostic tracker of [issue #143](https://github.com/core-aix/agitrack/issues/143).
-aGiTrack does **not** launch or proxy the agent; it watches the agent's on-disk session transcript
-for the repo, records each completed turn, summarizes it, and installs the fold hooks. It **always
-runs without a worktree** (it implies `--no-worktree`), with either commit style:
+Runs aGiTrack **without the interactive TUI** so you can drive the coding agent from **any** UI (the
+**Claude desktop app**, an IDE extension, its native CLI, a chat window) while aGiTrack tracks that
+session in the background — the interactive-UI-agnostic tracker of
+[issue #143](https://github.com/core-aix/agitrack/issues/143). Especially handy if you'd rather stay
+in a GUI than a terminal. aGiTrack does **not** launch or proxy the agent; it watches the agent's
+on-disk session transcript for the repo (**only** this repo's — Claude by its cwd-encoded transcript
+dir, OpenCode by each session's recorded directory), records each completed turn, summarizes it, and
+installs the fold hooks. It **always runs without a worktree** (implies `--no-worktree`), with either
+commit style (auto — default — or `--manual-commits`).
 
-- **Auto** (default, like the interactive TUI): aGiTrack folds the pending turns into a commit
-  **itself** once the agent finishes a turn and hasn't committed. If the agent makes its **own**
-  commit, the same `prepare-commit-msg` hook folds the tracking directly into that commit — the
-  metadata-only cover commit is only the fallback for when the hook can't be installed (custom
-  `core.hooksPath`).
-- **Manual** (`--manual-commits` / `-m`): identical to [Manual-commit mode](#3a-manual-commit-mode---manual-commits---m) —
-  each turn is a hidden latent commit, folded into *your* commit by the `prepare-commit-msg` hook.
+**It runs as a DETACHED daemon, like `agitrack -d`.** `agitrack -b` starts the tracker in the
+background and **returns to your shell immediately**; unlike the dashboard daemon it has **no
+owner-terminal watchdog**, so it keeps tracking after the terminal closes — stop it with
+`agitrack -b stop`. `agitrack -b status` reports whether one is running; **`agitrack --status` / `-s`**
+reports the mode of whatever is tracking the repo (interactive vs background, auto/manual,
+worktree/no-worktree, or not running) and whether **auto-start on commit** is enabled. The daemon
+logs activity to `<repo>/.agitrack/background.log`, appends notable events to a user `--log-file`,
+and reminds you (never auto-installs) when an aGiTrack update is available. Auto commits are **clean
+agent commits** (subject = the LLM summary, one metadata block); the daemon waits briefly for the
+summary before folding since it never amends HEAD. Only one aGiTrack runs per repo (the shared repo
+lock refuses a second start).
 
-Only one aGiTrack runs per repo (a foreground TUI or a background tracker — the shared repo lock
-refuses a second start), so they never race over commits. `agitrack -b status` reports whether a
-background tracker is running on the repo; `agitrack -b stop` stops it (recording any final turn and
-removing its hooks first).
+**Never forget to start it — auto-start on commit.** aGiTrack installs a PERSISTENT `pre-commit`
+hook (surviving the daemon exiting). When you `git commit` while no tracker is running and the AI
+actually changed code, the hook folds that AI work's trace into your (own, manual) commit AND
+**auto-starts** the daemon for the turns that follow — in the **same commit mode as your last run** —
+printing an explicit "started automatically … stop with `agitrack -b stop`; disable with
+`agitrack --remove-hooks`" message. A purely human commit is left untouched. The first `agitrack -b`
+per repo asks whether to enable this (default on; repo-scoped `autotrack_hook`); `agitrack --remove-hooks`
+turns it off. The hook calls the CURRENT aGiTrack even after a self-update (frozen-aware invocation +
+PATH fallback).
 
 ```mermaid
 flowchart TD
@@ -228,9 +240,10 @@ flowchart TD
 ```
 
 The per-conversation commit watermark makes this exact even when you switch conversations inside the
-backend (a `/resume` or a new conversation): aGiTrack follows the newest session and counts each
-conversation's turns exactly once. Press `Ctrl-C` to stop; it records any final turn (folding it in
-auto mode) and removes its hooks.
+backend (a `/resume` or a new conversation, tested on both backends): aGiTrack follows the newest
+session and counts each conversation's turns exactly once, and sub-agent tokens are folded into the
+launching turn. `agitrack -b stop` records any final turn (folding it in auto mode) and removes its
+per-run fold hooks (the persistent auto-track `pre-commit` hook stays, so a later commit still tracks).
 
 **Jump to:** [Manual-commit mode](#3a-manual-commit-mode---manual-commits---m) · [The agent turn](#5-the-agent-turn-auto-commit-and-integration)
 

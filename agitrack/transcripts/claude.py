@@ -894,13 +894,12 @@ def parse_rows(
             queued = _queued_human_prompt(row)
             if queued is not None:
                 if current is not None:
-                    # A message the user queued while the agent was working: Claude threads it
-                    # into the SAME response (no separate `user` row), so it belongs to the turn
-                    # in flight. Append it so the trace records EVERY user message, not just the
-                    # first. (The proxy dedups submit-time captures by word overlap, so a prompt
-                    # that was also recorded live doesn't double up.)
-                    existing = current.get("prompt") or ""
-                    current["prompt"] = f"{existing}\n\n{queued}" if existing else queued
+                    # A message the user queued while the agent was working: Claude threads it into
+                    # the SAME response (no separate `user` row), so it belongs to the turn in flight.
+                    # Keep it as a DISTINCT message (its own ## User heading in the trace) rather than
+                    # merging it into the base prompt — the user sent it after the agent had already
+                    # said something.
+                    current.setdefault("queued_followups", []).append(queued)
                 else:
                     # Queued before any turn opened in this parse window — open one for it.
                     flush()
@@ -1098,6 +1097,7 @@ def _finalize_turn(turn: dict, *, dangling: bool = False) -> SessionTurn:
         compaction_count=int(turn.get("compactions") or 0),
         reasoning_effort=turn.get("reasoning_effort"),
         agent_messages=list(turn.get("messages") or []),
+        queued_followups=list(turn.get("queued_followups") or []),
     )
 
 
