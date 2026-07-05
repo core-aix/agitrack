@@ -700,7 +700,11 @@ h2.section::before{content:"# ";color:var(--amber)}
 /* No text-transform: the "aGiTrack" brand must never render all-caps. */
 .card .label{font-size:11.5px;color:var(--amber);letter-spacing:.5px}
 .card .value{font-family:var(--display);font-size:42px;line-height:1.05;color:var(--phosphor);margin-top:6px;
-  text-shadow:0 0 14px rgba(61,255,160,.3)}
+  text-shadow:0 0 14px rgba(61,255,160,.3);white-space:nowrap}
+/* progressively smaller for longer numbers so they never overflow the card */
+.card .value.sz1{font-size:34px}
+.card .value.sz2{font-size:28px}
+.card .value.sz3{font-size:23px}
 .card .value.amber{color:var(--amber);text-shadow:0 0 14px rgba(255,180,84,.3)}
 .card .note{font-size:12px;color:var(--fg-dim);margin-top:4px}
 
@@ -815,11 +819,13 @@ h2.section::before{content:"# ";color:var(--amber)}
 .entry .detail .dmeta{color:var(--ops);font-size:12px;margin-bottom:6px}
 .entry .detail .dmsg{font-size:12.5px;color:var(--fg-dim);background:var(--ink);border:1px solid var(--line);
   padding:4px 12px;max-height:440px;overflow:auto;word-break:break-word}
-/* local (off-GitHub) per-commit file diff */
+/* local (off-GitHub) per-commit file diff — the button flips this one box to the diff, so in diff
+   mode the box drops its own frame and the .diffbox (with its own border/scroll) becomes the pane */
+.entry .detail .dmsg.diff{padding:0;border:none;background:none;max-height:none;overflow:visible}
 .entry .detail .diffbtn{margin-right:10px;font-family:inherit;font-size:11.5px;color:var(--phosphor);
   background:transparent;border:1px solid var(--phosphor-dim);padding:1px 8px;cursor:pointer;letter-spacing:.3px}
 .entry .detail .diffbtn:hover{background:var(--phosphor);color:var(--ink)}
-.diffbox{margin:6px 0 2px;border:1px solid var(--line);background:var(--ink);max-height:460px;overflow:auto;
+.diffbox{border:1px solid var(--line);background:var(--ink);max-height:460px;overflow:auto;
   font-size:12px;line-height:1.5;white-space:pre}
 .diffbox .dl{display:block;padding:0 10px}
 .diffbox .dfile{color:var(--amber);background:rgba(255,180,84,.06)}
@@ -827,7 +833,7 @@ h2.section::before{content:"# ";color:var(--amber)}
 .diffbox .dmeta2{color:var(--fg-dim)}
 .diffbox .dadd{color:var(--phosphor);background:rgba(61,255,160,.08)}
 .diffbox .ddel{color:var(--red);background:rgba(255,107,107,.08)}
-.diffwrap .diffempty,.diffwrap .diffloading{color:var(--fg-dim);font-size:12px;font-style:italic;padding:5px 0}
+.dmsg .diffempty,.dmsg .diffloading{color:var(--fg-dim);font-size:12px;font-style:italic;padding:8px 12px}
 /* rendered Markdown inside the expanded message */
 .dmsg.md p{margin:7px 0}
 .dmsg.md .md-h{font-family:var(--mono);color:var(--amber);margin:11px 0 5px;font-size:13px;font-weight:600}
@@ -1122,8 +1128,12 @@ function subBarRow(name, value, max, numHtml, min){
     `<div class="num">${numHtml}</div></div>`;
 }
 function card(label, value, note, amber){
+  // Shrink the big number as it gets longer so a large count (e.g. 100M+ output tokens)
+  // stays inside the card instead of spilling out its right edge.
+  const len = String(value).replace(/<[^>]*>/g,"").length;
+  const sz = len>12?" sz3":(len>10?" sz2":(len>8?" sz1":""));
   return `<div class="card"><div class="label">${esc(label)}</div>`+
-    `<div class="value ${amber?"amber":""}">${value}</div><div class="note">${esc(note||"")}</div></div>`;
+    `<div class="value ${amber?"amber":""}${sz}">${value}</div><div class="note">${esc(note||"")}</div></div>`;
 }
 function tokenBrief(t){
   if(!t) return "";
@@ -1467,31 +1477,44 @@ function toggleDetail(i){
     const who = (c.committers&&c.committers.length)
       ? `<div class="dmeta">committer${c.committers.length>1?"s":""}: ${c.committers.map(esc).join(", ")}</div>` : "";
     detail.innerHTML = `<div class="dhead">${esc(c.short)} ${diffBtn}${link}</div>${who}${span}`+
-      `<div class="dmsg md">${md(c.message||"(no message recorded)")}</div>`+
-      `<div class="diffwrap" id="diff-${i}" hidden></div>${partsHtml(c.parts)}`;
+      `<div class="dmsg md" id="dbody-${i}" data-mode="msg">${md(c.message||"(no message recorded)")}</div>`+
+      partsHtml(c.parts);
     detail.hidden = false;
   } else {
     detail.hidden = true;
   }
 }
 
-// Fetch and show (or hide) a commit's file diffs from the local clone via /diff — no GitHub.
+// One box that flips between the commit message and this commit's file diff — the button toggles
+// which is shown, so you never juggle two panes. The diff (from the local clone via /diff, no
+// GitHub) is fetched once and cached by sha, so flipping back and forth is instant.
+const _diffCache = {};
 async function toggleDiff(i){
-  const c = LOG_ENTRIES[i], wrap = $("diff-"+i);
+  const c = LOG_ENTRIES[i], body = $("dbody-"+i);
   const btn = document.querySelector('.diffbtn[data-diff="'+i+'"]');
-  if(!c || !wrap) return;
-  if(!wrap.hidden){ wrap.hidden = true; if(btn) btn.textContent = "show file diff"; return; }
-  wrap.hidden = false; if(btn) btn.textContent = "hide file diff";
-  if(wrap.dataset.loaded) return;  // fetched once; toggling after just shows/hides
-  wrap.innerHTML = '<div class="diffloading">loading diff…</div>';
+  if(!c || !body) return;
+  if(body.dataset.mode === "diff"){                       // diff → back to the commit message
+    body.dataset.mode = "msg"; body.className = "dmsg md";
+    body.innerHTML = md(c.message||"(no message recorded)");
+    if(btn) btn.textContent = "show file diff";
+    return;
+  }
+  body.dataset.mode = "diff"; body.className = "dmsg diff";  // commit message → file diff
+  if(btn) btn.textContent = "show commit message";
+  if(_diffCache[c.sha] !== undefined){ body.innerHTML = _diffCache[c.sha]; return; }
+  body.innerHTML = '<div class="diffloading">loading diff…</div>';
   try{
     const r = await fetch("diff?sha="+encodeURIComponent(c.sha), {cache:"no-store"});
     const d = r.ok ? await r.json() : {error:"server error"};
-    if(d.error) wrap.innerHTML = '<div class="diffempty">'+esc(d.error)+'</div>';
-    else if(!d.diff || !d.diff.trim()) wrap.innerHTML = '<div class="diffempty">no file changes in this commit</div>';
-    else wrap.innerHTML = renderDiff(d.diff) + (d.truncated?'<div class="diffempty">…diff truncated (very large commit)</div>':"");
-    wrap.dataset.loaded = "1";
-  }catch(e){ wrap.innerHTML = '<div class="diffempty">couldn\'t load the diff (server unreachable)</div>'; }
+    let html;
+    if(d.error) html = '<div class="diffempty">'+esc(d.error)+'</div>';
+    else if(!d.diff || !d.diff.trim()) html = '<div class="diffempty">no file changes in this commit</div>';
+    else html = renderDiff(d.diff) + (d.truncated?'<div class="diffempty">…diff truncated (very large commit)</div>':"");
+    _diffCache[c.sha] = html;
+    if(body.dataset.mode === "diff") body.innerHTML = html;  // user may have flipped back mid-fetch
+  }catch(e){
+    if(body.dataset.mode === "diff") body.innerHTML = '<div class="diffempty">couldn\'t load the diff (server unreachable)</div>';
+  }
 }
 // Color a unified diff (diffstat + patch) line-by-line: file headers, hunk headers, +adds, −dels.
 function renderDiff(text){
