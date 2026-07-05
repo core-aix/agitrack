@@ -422,7 +422,9 @@ async function activate(name, push){
     u.searchParams.set('tab', name);
     u.hash = '';
     history.pushState({ doc:name }, '', u);
-    window.scrollTo(0, 0); // a freshly-selected tab starts at the top, not the old scroll offset
+    // Jump (don't smooth-scroll) to the top so a freshly-selected tab starts at the top instead of
+    // keeping the old tab's scroll offset. behavior:'instant' overrides html{scroll-behavior:smooth}.
+    window.scrollTo({ top: 0, left: 0, behavior: 'instant' });
   }
   await loadDoc(name);
   await renderMermaidIfVisible(name); // render now if it was warmed while hidden
