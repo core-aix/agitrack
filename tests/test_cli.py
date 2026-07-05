@@ -802,9 +802,17 @@ def test_update_check_skipped_without_a_tty(monkeypatch):
     assert ran["checked"] is False  # no way to answer a prompt without a TTY
 
 
+def test_json_flag_selects_the_json_prompt_loop(monkeypatch):
+    # --json is the documented flag for the JSON prompt-loop; it must route to AgitrackShell
+    # (json mode), exactly like the deprecated `--mode json` alias the other tests use.
+    captured = _stub_launch(monkeypatch)
+    cli.main(["--json", "--prompt", "hi"])
+    assert "json_events" in captured  # a shell-only kwarg ⇒ the json shell (not the proxy) launched
+
+
 def test_ui_bridge_flag_passed_to_shell_and_forces_json_mode(monkeypatch):
     # --ui-bridge is a json-mode transport: it must reach the shell and select json
-    # mode even without an explicit --mode json (the VSCode extension relies on this).
+    # mode even without an explicit --json (the VSCode extension relies on this).
     captured = _stub_launch(monkeypatch)
     cli.main(["--ui-bridge"])
     assert captured["ui_bridge"] is True
