@@ -124,6 +124,13 @@ a:hover{color:var(--ink);background:var(--phosphor);border-bottom-color:var(--ph
 /* mermaid diagrams */
 .mermaid{position:relative;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px;margin:0 0 22px;overflow-x:auto;text-align:center;cursor:zoom-in}
 .mermaid svg{max-width:100%;height:auto}
+/* Wrap long node labels: with the label width capped, mermaid measures the wrapped text and sizes
+   the box to it — so long text breaks over several lines instead of one enormous single-line box.
+   Uses overflow-wrap (NOT word-break: break-word, which collapses min-content to one char per line
+   inside mermaid's flex label and stacks short labels vertically). Short labels stay on one line. */
+.mermaid .nodeLabel,.mermaid .nodeLabel p{max-width:300px;white-space:normal!important;overflow-wrap:break-word}
+.mermaid .nodeLabel{display:inline-block}
+.mermaid .nodeLabel p{margin:0}
 .mermaid::after{
   content:"⤢ click to zoom";position:absolute;top:8px;right:10px;font-size:11px;
   color:var(--amber);border:1px solid var(--amber-dim);padding:1px 7px;border-radius:3px;
@@ -324,18 +331,32 @@ function buildToc(container){
   });
 }
 
+// Render this doc's mermaid diagrams — but ONLY while its tab is visible. Mermaid measures
+// text/label sizes with getBoundingClientRect, which returns 0 inside a display:none container,
+// producing broken/empty diagrams. So a doc warmed in the background (hidden) has its markdown
+// inserted but its diagrams left unrendered until its tab is shown (fixes "refresh once to see
+// the diagrams"). Idempotent: guarded by mermaidDone + :not([data-processed]).
+async function renderMermaidIfVisible(name){
+  const src = SOURCES[name];
+  if (!src.loaded || src.mermaidDone || name !== activeDoc) return;
+  const target = document.getElementById(src.el);
+  const nodes = target.querySelectorAll('.mermaid:not([data-processed])');
+  if (!nodes.length){ src.mermaidDone = true; return; }
+  try { await mermaid.run({ nodes }); src.mermaidDone = true; }
+  catch (e){ console.error('mermaid', e); }
+}
+
 async function loadDoc(name){
   const src = SOURCES[name];
-  if (src.loaded) return;
+  if (src.loaded){ await renderMermaidIfVisible(name); return; }
   const target = document.getElementById(src.el);
   try {
     let text = await fetchFirst(src.urls);
     text = text.replace(/^\s*<!--[\s\S]*?-->\s*/, ''); // drop a leading HTML comment
     target.innerHTML = marked.parse(text, { renderer: buildRenderer(), gfm: true, breaks: false });
     rewriteLinks(target);
-    const nodes = target.querySelectorAll('.mermaid');
-    if (nodes.length) { try { await mermaid.run({ nodes }); } catch(e){ console.error('mermaid', e); } }
     src.loaded = true;
+    await renderMermaidIfVisible(name); // no-op while hidden; renders when this tab is active
     if (name === activeDoc){ buildToc(target); jumpToHash(); }
   } catch (err){
     target.innerHTML = '<p class="status err">Couldn’t load this document ('
@@ -370,8 +391,9 @@ async function activate(name, push){
     history.pushState({ doc:name }, '', u);
   }
   await loadDoc(name);
+  await renderMermaidIfVisible(name); // render now if it was warmed while hidden
   const target = document.getElementById(SOURCES[name].el);
-  if (SOURCES[name].loaded) buildToc(target);
+  if (SOURCES[name].loaded){ buildToc(target); jumpToHash(); }
 }
 
 // tab buttons + cross-document links
