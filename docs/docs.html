@@ -227,14 +227,33 @@ mermaid.initialize({
 const REPO_BLOB = 'https://github.com/core-aix/agitrack/blob/main/';
 const REPO_RAW  = 'https://raw.githubusercontent.com/core-aix/agitrack/main/';
 
-// Both docs are fetched from the CORS-enabled raw GitHub source (canonical + always current).
-// Using raw for user-flow too — rather than the relative ./user-flow.md — keeps it working when
-// the page is opened via file://, and on GitHub Pages where Jekyll rewrites .md files so the raw
-// path isn't served as-is (which surfaced as a "Load failed" network error on the User Flow tab).
+// Each doc is fetched from a list of candidate URLs, in order, first success wins:
+//  1. a same-origin path — reflects the CURRENT working tree when the repo is served locally
+//     (serve the repo ROOT and open /docs/docs.html), so unmerged edits preview immediately;
+//  2. the CORS-enabled raw GitHub `main` URL — the canonical published copy, and the fallback
+//     that always works from file:// and on GitHub Pages (where Jekyll doesn't serve the raw .md).
+// This is why an edit to README.md/user-flow.md shows here only after it lands on `main` — unless
+// you preview it locally via the same-origin path above.
 const SOURCES = {
-  manual:   { url: REPO_RAW + 'README.md',          el: 'md-manual',   loaded:false },
-  userflow: { url: REPO_RAW + 'docs/user-flow.md',  el: 'md-userflow', loaded:false },
+  manual:   { urls: ['../README.md',    REPO_RAW + 'README.md'],         el: 'md-manual',   loaded:false },
+  userflow: { urls: ['./user-flow.md',  REPO_RAW + 'docs/user-flow.md'], el: 'md-userflow', loaded:false },
 };
+
+async function fetchFirst(urls){
+  let lastErr;
+  for (const u of urls){
+    try {
+      const res = await fetch(u, { cache: 'no-cache' });
+      if (!res.ok){ lastErr = new Error('HTTP ' + res.status); continue; }
+      const text = await res.text();
+      // A Jekyll-processed .md (on GitHub Pages) comes back as an HTML page, not markdown —
+      // skip it so we fall through to the raw source rather than rendering a nested document.
+      if (/^\s*<(!doctype|html)[\s>]/i.test(text)){ lastErr = new Error('not markdown'); continue; }
+      return text;
+    } catch (e){ lastErr = e; }
+  }
+  throw lastErr || new Error('no source available');
+}
 
 const escapeHtml = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 
@@ -310,9 +329,7 @@ async function loadDoc(name){
   if (src.loaded) return;
   const target = document.getElementById(src.el);
   try {
-    const res = await fetch(src.url, { cache: 'no-cache' });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    let text = await res.text();
+    let text = await fetchFirst(src.urls);
     text = text.replace(/^\s*<!--[\s\S]*?-->\s*/, ''); // drop a leading HTML comment
     target.innerHTML = marked.parse(text, { renderer: buildRenderer(), gfm: true, breaks: false });
     rewriteLinks(target);
