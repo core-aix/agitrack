@@ -1133,15 +1133,19 @@ def _run_gh_login() -> None:
 
 def _maybe_prompt_background_hook(config: GlobalConfig, *, scripted: bool) -> None:
     """When starting `agitrack -b`, explain the persistent auto-track pre-commit hook and let the
-    user decide — once per repo — whether to enable it. When enabled (the default), a `git commit`
-    made while aGiTrack isn't running folds the AI trace into that commit AND auto-starts the tracker
-    (in the same commit mode as the last run) for the turns that follow. Sets the repo-scoped
-    ``autotrack_hook`` ("auto"/"off"). Never blocks automation (no-TTY / scripted → default on)."""
+    user decide whether to enable it. When enabled (the default), a `git commit` made while aGiTrack
+    isn't running folds the AI trace into that commit AND auto-starts the tracker (in the same commit
+    mode as the last run) for the turns that follow. Sets the repo-scoped ``autotrack_hook``
+    ("auto"/"off"). Never blocks automation (no-TTY / scripted → default on)."""
     if scripted or not (sys.stdin.isatty() and sys.stdout.isatty()):
         return
     try:
-        if config.source("autotrack_hook") == "repo":
-            return  # already decided for this repo
+        # Skip only when auto-start is ALREADY enabled for this repo (an explicit repo-scoped
+        # "auto"). Re-ask whenever it's off — including after `agitrack --remove-hooks`, which sets
+        # it off — so the user can turn it back on; and ask on the first run (default is a global,
+        # not repo-scoped, "auto").
+        if config.autotrack_hook == "auto" and config.source("autotrack_hook") == "repo":
+            return
     except Exception:
         return
     print(
@@ -1158,10 +1162,10 @@ def _maybe_prompt_background_hook(config: GlobalConfig, *, scripted: bool) -> No
         return
     if answer.startswith("n"):
         config.set("autotrack_hook", "off", scope="repo")
-        print("aGiTrack: auto-start hook off — tracking runs only while `agitrack -b` is up.")
+        print("\naGiTrack: auto-start hook off — tracking runs only while `agitrack -b` is up.")
     else:
         config.set("autotrack_hook", "auto", scope="repo")
-        print("aGiTrack: auto-start hook enabled. Disable it anytime with `agitrack --remove-hooks`.")
+        print("\naGiTrack: auto-start hook enabled. Disable it anytime with `agitrack --remove-hooks`.")
 
 
 def _verify_menu_key(config: GlobalConfig, *, scripted: bool = False) -> bool:

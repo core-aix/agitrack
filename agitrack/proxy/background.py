@@ -299,15 +299,19 @@ def start_background_daemon(repo: GitRepo, *, extra_args: list[str], timeout: fl
     running = _live_background_pid(repo)
     if running is not None:
         info = _read_handshake(repo) or {}
-        print(f"aGiTrack background tracker is already running on this repo (PID {running}, {info.get('mode', '?')}).")
+        print(
+            f"\naGiTrack background tracker is already running on this repo (PID {running}, {info.get('mode', '?')})."
+        )
         return 0
     proc = spawn_background_daemon(repo, extra_args=extra_args)
     record = wait_for_handshake(repo, pid=proc.pid, timeout=timeout)
     if record is None:
-        print(f"The aGiTrack background tracker did not start. See {background_log_path(repo)} for details.")
+        print(f"\nThe aGiTrack background tracker did not start. See {background_log_path(repo)} for details.")
         return 1
+    # Leading blank line separates this from the preceding startup messages (privacy ack, the
+    # auto-start hook prompt) so each part of aGiTrack's start-up output reads as its own block.
     print(
-        f"aGiTrack background tracker daemon live (PID {record.get('pid')}, {record.get('mode', '?')}, no worktree).\n"
+        f"\naGiTrack background tracker daemon live (PID {record.get('pid')}, {record.get('mode', '?')}, no worktree).\n"
         "Drive the agent from any UI; it keeps tracking in the background. Stop it with `agitrack -b stop`."
     )
     return 0

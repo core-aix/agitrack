@@ -139,7 +139,7 @@ Conventions:
 | No AI work since last commit → no footprint (no trailer, no nag) | `test_precommit_sync_no_ai_work_is_a_noop` | real-git |
 | Defers to a live tracker (never double-tracks) | `test_precommit_sync_defers_to_a_running_tracker` | real-git |
 | Sync auto-starts the daemon in the LAST run's commit mode (persisted); `off` folds but never spawns | `test_precommit_sync_autostart_spawns_daemon`, `test_precommit_sync_off_does_not_spawn_daemon`, `test_background_mode_persist_roundtrip` | real-git |
-| `agitrack -b` explains the auto-start hook + asks enable/off once per repo (default on; shows how to remove) | `test_background_hook_prompt_enable_off_and_asks_once`, `test_background_hook_prompt_skipped_when_scripted` | mock |
+| `agitrack -b` explains the auto-start hook + asks enable/off (default on; shows how to remove); re-asks whenever off (incl. after `--remove-hooks`), skips once enabled | `test_background_hook_prompt_enable_off_and_reask_when_off`, `test_background_hook_prompt_skipped_when_scripted` | mock |
 | Daemon honors `autotrack_hook`: installs by default, REMOVES the hook when off | `test_daemon_installs_autotrack_hook_by_default_and_skips_when_off` | real-git |
 | AUTO fold writes a CLEAN agent commit (prompt/summary subject, one metadata block — not the squash-into-user format) | `test_background_auto_folds_pending_into_a_commit_itself`, `test_noworktree_auto_folds_latent_turn_into_commit` | real-git |
 | Daemon AUTO fold waits for the LLM summary, then uses it as the subject | `test_background_auto_fold_waits_for_summary_then_uses_it_as_subject` | real-git |
