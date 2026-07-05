@@ -79,6 +79,35 @@ def test_retarget_session_cwd_breaks_hardlink_to_other_copy(monkeypatch, tmp_pat
     assert (other_proj / "s.jsonl").read_text(encoding="utf-8") == '{"type":"user","cwd":"/old/worktree"}\n'
 
 
+def test_session_discovery_is_strictly_repo_scoped(monkeypatch, tmp_path):
+    # SAFETY: a session driven in one repo must NEVER be visible to another repo's tracker, or a
+    # commit in repo A could pick up repo B's conversation and tokens. Claude keys transcripts by
+    # the cwd-encoded project dir, so repoA's discovery only ever sees repoA's sessions.
+    config = tmp_path / "config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    repo_a = tmp_path / "repoA"
+    repo_b = tmp_path / "repoB"
+    proj_a = config / "projects" / claude_session._encode_repo(repo_a)
+    proj_b = config / "projects" / claude_session._encode_repo(repo_b)
+    proj_a.mkdir(parents=True)
+    proj_b.mkdir(parents=True)
+
+    def _session(prompt: str) -> str:
+        return json.dumps({"type": "user", "message": {"role": "user", "content": prompt}, "cwd": "/x"}) + "\n"
+
+    (proj_a / "sa.jsonl").write_text(_session("ALPHA work"), encoding="utf-8")
+    (proj_b / "sb.jsonl").write_text(_session("BRAVO work"), encoding="utf-8")
+
+    # Each repo discovers ONLY its own session.
+    assert claude_session.latest_session_id(repo_a) == "sa"
+    assert claude_session.latest_session_id(repo_b) == "sb"
+    assert [r.id for r in claude_session.list_sessions(repo_a)] == ["sa"]
+    assert [r.id for r in claude_session.list_sessions(repo_b)] == ["sb"]
+    # repoB's session id resolves to NOTHING under repoA's project dir (no cross-repo read path).
+    assert not claude_session._session_path(repo_a, "sb").exists()
+    assert claude_session._session_path(repo_b, "sb").exists()  # it lives only under repoB
+
+
 def test_retarget_session_cwd_repoints_worktree_file_paths(monkeypatch, tmp_path):
     # Regression (--no-worktree): retargeting must repoint not just the cwd field but every
     # absolute path under the old WORKTREE — tool file_path args, command output, mentions — so a
@@ -372,6 +401,59 @@ def test_parse_rows_collects_all_agent_messages_in_order():
 
     assert turn.agent_messages == ["On it.", "Done — all set."]
     assert turn.final_response == "Done — all set."
+
+
+def _queued(prompt, *, mode="prompt", origin="human"):
+    # How Claude Code records a message the user QUEUES while the agent is working: a
+    # `type:"attachment"` row (attachment.type == "queued_command"), NOT a `type:"user"` row.
+    return {
+        "type": "attachment",
+        "attachment": {"type": "queued_command", "prompt": prompt, "commandMode": mode, "origin": {"kind": origin}},
+    }
+
+
+def test_parse_rows_captures_queued_followup_messages_in_the_turn():
+    # A follow-up the user sends WHILE the agent works must appear in the interaction trace —
+    # it's threaded into the same turn, and was being dropped entirely (issue: follow-ups vanish).
+    rows = [
+        _user("u1", "Fix the messy commit format."),
+        _assistant(
+            "m1", "", content=[{"type": "tool_use", "id": "t1", "name": "Edit", "input": {}}], stop_reason="tool_use"
+        ),
+        _queued("The subject should still be summarized."),  # queued mid-work
+        _assistant(
+            "m2", "", content=[{"type": "tool_use", "id": "t2", "name": "Edit", "input": {}}], stop_reason="tool_use"
+        ),
+        _queued("Also add a mode matrix to the webpage."),  # a second queued follow-up
+        _assistant("m3", "Done — all three addressed."),
+    ]
+
+    turn = parse_rows("sess-q", rows).turns[0]
+
+    # The base prompt stays user_prompt; each queued follow-up is a DISTINCT message (its own
+    # ## User heading later), captured in queued_followups — not merged into user_prompt.
+    assert turn.user_prompt == "Fix the messy commit format."
+    assert turn.queued_followups == [
+        "The subject should still be summarized.",
+        "Also add a mode matrix to the webpage.",
+    ]
+    assert turn.final_response == "Done — all three addressed."
+    # Exactly one turn (the queued messages extend it, they don't each open a new turn).
+    assert len(parse_rows("sess-q", rows).turns) == 1
+
+
+def test_parse_rows_ignores_non_human_or_slash_queued_attachments():
+    # Only genuine human prompts are captured; a queued slash directive or non-human origin isn't.
+    rows = [
+        _user("u1", "do the thing"),
+        _queued("/compact"),  # a slash directive kept out of the trace
+        _queued("noise", origin="system"),  # non-human origin
+        _queued("bg", mode="bash"),  # not a typed prompt
+        _assistant("m1", "done"),
+    ]
+    turn = parse_rows("sess-q2", rows).turns[0]
+    assert turn.user_prompt == "do the thing"
+    assert turn.queued_followups == []  # none of the excluded attachments were added
 
 
 def test_parse_rows_marks_turn_incomplete_while_last_message_is_tool_use():
@@ -756,6 +838,49 @@ def test_parse_rows_subagent_with_no_tool_id_falls_back_to_latest_turn():
     rows = [_user("u1", "only prompt"), _assistant("m1", "answer", usage={"output_tokens": 5})]
     session = parse_rows("sess", rows, subagent_tokens={None: TokenUsage(total=12, subagent_output=12)})
     assert session.turns[-1].tokens.subagent_output == 12  # never dropped
+
+
+def test_parse_rows_unmatched_subagent_attributed_by_mtime_not_latest():
+    # An id-less sub-agent (missing/unreadable meta.json) is attributed to the turn that was
+    # ACTIVE at its file mtime — not always the latest turn. Attributing it to a stable,
+    # earlier turn is what lets the commit watermark trim it after it is counted once,
+    # instead of re-attaching (and re-counting) it onto each new turn on every re-parse.
+    from datetime import datetime
+
+    from agitrack.backends.base import TokenUsage
+
+    def _u(uuid, text, ts):
+        return {"type": "user", "uuid": uuid, "timestamp": ts, "message": {"role": "user", "content": text}}
+
+    def _a(msg_id, text, ts, out):
+        return {
+            "type": "assistant",
+            "timestamp": ts,
+            "message": {
+                "id": msg_id,
+                "role": "assistant",
+                "model": "claude-opus-4-8",
+                "content": [{"type": "text", "text": text}],
+                "usage": {"output_tokens": out},
+            },
+        }
+
+    rows = [
+        _u("u1", "first", "2026-01-01T00:00:00Z"),
+        _a("m1", "one", "2026-01-01T00:10:00Z", 5),
+        _u("u2", "second", "2026-01-01T01:00:00Z"),
+        _a("m2", "two", "2026-01-01T01:10:00Z", 5),
+    ]
+    when = int(datetime.fromisoformat("2026-01-01T00:05:00+00:00").timestamp())  # inside turn 1's span
+    session = parse_rows(
+        "sess",
+        rows,
+        subagent_tokens={None: TokenUsage(total=12, subagent_output=12)},
+        unmatched_subagent_time=when,
+    )
+    first, second = session.turns
+    assert first.tokens.subagent_output == 12  # attributed to the turn it ran during
+    assert second.tokens.subagent_output == 0  # NOT the latest turn
 
 
 def test_subagent_token_map_reads_separate_agent_files(tmp_path):

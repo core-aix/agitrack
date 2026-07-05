@@ -127,6 +127,22 @@ agitrack
 
 By default, aGiTrack launches the AI agent's normal interface (OpenCode or Claude) and sits quietly between you and it — you use the agent exactly as you would on its own. At the bottom of the screen, aGiTrack adds a status line showing: the current session and the branch its work goes into (in **bold** when that branch isn't the one you have checked out), which agent is running, whether commit summaries are on, and which repository you're working in. Press `Ctrl-G` at any time to open aGiTrack's own menu (you can change this key with `menu_key` in `~/.agitrack/config.json` — see Configuration).
 
+### Modes at a glance
+
+aGiTrack has two independent choices — **how you run it** (interactive vs background) and **when commits happen** (auto vs manual) — that combine into four modes. Every mode records the same per-turn tracking (interaction trace + token metadata); they differ only in *who drives the agent*, *who triggers the commit*, and *whether an isolated worktree is used*.
+
+| | **Auto commit** (default) | **Manual commit** (`-m` / `--manual-commits`) |
+| --- | --- | --- |
+| **Interactive** (default — aGiTrack runs the agent's TUI) | **`agitrack`** — aGiTrack proxies the agent and **commits each completed turn** for you.<br>**Worktree** by default (isolated checkout, auto-merged into the target branch); opt out with `--no-worktree`. | **`agitrack -m`** — aGiTrack proxies the agent; **you** trigger every commit and pending turns fold into it.<br>**No worktree** (always) — edits the checked-out branch directly. |
+| **Background** (`-b` / `--background` — headless, no TUI; you drive the agent from any UI) | **`agitrack -b`** — aGiTrack tracks the session you drive elsewhere and **commits each completed turn** itself.<br>**No worktree** (always). | **`agitrack -b -m`** — aGiTrack tracks the session you drive; **you** trigger every commit and pending turns fold into it.<br>**No worktree** (always). |
+
+- **Interactive vs Background.** Interactive (the default) launches the agent's native interface with aGiTrack in between. Background (`-b`) runs *without a TUI* so you can drive the same agent from any front-end — its own CLI, an IDE extension, a chat window — while aGiTrack watches the transcript and tracks it. See [Background mode](#background-mode---background---b).
+- **Auto vs Manual.** Auto (the default, both interactive and background) turns each finished agent turn into a commit automatically. Manual (`-m`) leaves commits entirely up to you: turns are recorded on a hidden side ref and folded into *your* commit when you make it. See [Manual commits](#manual-commits---manual-commits---m).
+- **Worktree only applies to the interactive + auto default.** That one mode runs in an isolated [git worktree](#worktrees-and-branches) and aGiTrack integrates (merges) its commits into the target branch for you. The **other three modes always run without a worktree** (`--no-worktree`): manual and background modes are defined to operate on the branch you have checked out, editing your working directory directly. When the **agent commits on its own** in any no-worktree mode, a `prepare-commit-msg` hook folds the tracking straight into that commit (a "cover" commit is only the fallback). You can also force no-worktree on the interactive+auto default with `--no-worktree`.
+- **One instance per repo.** Whichever mode you pick, only **one** aGiTrack may run per repository (interactive *or* background — never two), so they never fight over commits. A second start is refused; use `agitrack -b status` / `agitrack -b stop` to inspect or stop a background tracker.
+
+Each mode is described in full below (`--no-worktree`, `--manual-commits`, `--background`), and every choice is also settable in config (`use_worktrees`, `manual_commits`, `background`) so it becomes your default. Switching a repo between any of these modes between runs is supported — aGiTrack cleans up or ignores the previous mode's state (hooks, side refs, background handshake) on the next launch.
+
 Run against another repository:
 
 ```bash
@@ -152,7 +168,7 @@ By default, each session runs in its own [git worktree](https://git-scm.com/docs
 agitrack --no-worktree
 ```
 
-Without a worktree the agent edits the current branch directly, so changes are visible live as it works — but there's no isolation or auto-integration. You can still **start and switch between multiple sessions** in this mode; they just all share the one directory, editing the same files at the same time (aGiTrack shows a one-time heads-up the first time you open a second one, and a turn's commit captures whatever is in the working tree then — coordinate as you would with another person editing the same checkout). Because the agent edits the checked-out branch directly, every session works on (merges into) the repo directory's **current** branch and can never be pointed at a different one — so the "change a session's merge branch" option isn't offered in this mode. If you switch the directory's branch out-of-band (e.g. `git checkout` in another terminal), aGiTrack warns you and the session follows the new branch (future changes land there).
+Without a worktree the agent edits the current branch directly, so changes are visible live as it works — but there's no isolation or auto-integration. aGiTrack still commits each turn, and — because it installs a `prepare-commit-msg` hook in this mode — when **the agent makes its own `git commit`**, the interaction trace and token metadata are folded straight into that commit, so you get a single, fully-tracked commit rather than a separate "cover" commit on top (the cover is kept only as a fallback for when the hook can't be installed). You can still **start and switch between multiple sessions** in this mode; they just all share the one directory, editing the same files at the same time (aGiTrack shows a one-time heads-up the first time you open a second one, and a turn's commit captures whatever is in the working tree then — coordinate as you would with another person editing the same checkout). Because the agent edits the checked-out branch directly, every session works on (merges into) the repo directory's **current** branch and can never be pointed at a different one — so the "change a session's merge branch" option isn't offered in this mode. If you switch the directory's branch out-of-band (e.g. `git checkout` in another terminal), aGiTrack warns you and the session follows the new branch (future changes land there).
 
 If you ran sessions the normal way before (each in its own worktree) and then start aGiTrack with `--no-worktree`, those earlier sessions are still there to resume — pick one from `Ctrl-G → sessions` (or `↻ Resume a past conversation…`) and it picks up in your main repository directory. (Why this needs handling: a session that first ran inside a worktree remembers that worktree folder as where it was working. When you resume it without worktrees, aGiTrack updates that remembered folder to your main directory, so the agent works there instead of trying to use the old worktree folder — which no longer exists.) To make no-worktree the default for every run, set `"use_worktrees": false` in `~/.agitrack/config.json`.
 
@@ -165,6 +181,45 @@ agitrack --manual-commits   # or: agitrack -m
 For a workflow that feels like plain git — you decide when to commit — use **manual-commit mode**. It **always runs without a worktree** (it implies `--no-worktree`): the agent edits the current branch directly, but aGiTrack does **not** create a commit each turn. Instead every turn is recorded as a hidden "latent" commit on a side ref (`refs/agitrack/manual/<session>`) that your branch never shows, so your history stays clean while you work.
 
 When **you** commit — either through `Ctrl-G → git-commit` or an ordinary `git commit` on the command line / in your editor — aGiTrack folds all the pending latent turns' interaction traces and metadata into that **one** commit, alongside your own changes. So you get a single, self-contained commit that carries both your edits and the full agent tracking, whether or not the commit went through aGiTrack's menu (a managed `prepare-commit-msg` hook does the folding; it's removed when the session ends). The dashboard shows the pending turns live, marked `pending`, until you commit. Enable it for every run with `"manual_commits": true` in `~/.agitrack/config.json`.
+
+### Background mode (`--background` / `-b`)
+
+```bash
+agitrack --background     # auto commits (the default), no TUI
+agitrack -b -m            # or manual (user-triggered) commits
+agitrack -b status        # is a background tracker running on this repo?
+agitrack -b stop          # stop it
+agitrack --status         # or -s: is aGiTrack running for this repo, and in which mode?
+```
+
+**`agitrack --status` (or `-s`)** reports, for the current repo, whether aGiTrack is running and in which mode — **interactive vs background**, **auto vs manual commit**, and **worktree vs no-worktree** — or that it isn't running (plus any available update). It's the quick way to see what's tracking a repo.
+
+**Background mode** runs aGiTrack **without its interactive TUI**, so you can drive the coding agent from *any* UI you like — its native CLI, an IDE extension (e.g. Claude's VS Code extension), a chat window — while aGiTrack watches that session's local transcript and does all the same tracking the TUI would: it records each completed turn, summarizes it, and installs the commit hooks that fold the interaction trace and token metadata into your commits. aGiTrack does **not** launch or proxy the agent here; it tracks whatever session you drive.
+
+> **Great for GUI users.** This is especially useful if you'd rather keep working in a **GUI instead of a terminal** — the **Claude desktop app**, an IDE extension, or any other front-end. Start `agitrack -b` once and keep using your preferred interface; aGiTrack tracks the session and commits your AI work in the background, no terminal UI required.
+
+**It runs as a detached daemon, exactly like the dashboard (`agitrack -d`).** `agitrack -b` starts the tracker in the background and **returns to your shell immediately** — the terminal isn't tied up. Unlike the dashboard daemon it deliberately has **no owner-terminal watchdog**: a tracker keeps running after you close the terminal (that's the point — it should keep tracking), so you stop it explicitly with `agitrack -b stop`. `agitrack -b status` reports whether one is running (and any available update). The daemon logs its startup and per-turn activity to `<repo>/.agitrack/background.log`.
+
+Background mode **always runs without a worktree** (it implies `--no-worktree`), and supports either commit style:
+
+- **Auto** (the default, like the interactive TUI): aGiTrack commits each completed agent turn itself. If the agent makes its **own** commit, a `prepare-commit-msg` hook folds the tracking directly into that commit (a metadata-only "cover" commit is only the fallback when the hook can't be installed).
+- **Manual** (`--manual-commits` / `-m`): exactly like manual mode above — each turn is recorded on a hidden latent ref and folded into *your* commit by the `prepare-commit-msg` hook.
+
+Only **one** aGiTrack may run per repository (a foreground TUI or a background daemon — never both, and never two), so they can't fight over commits; a second start is refused. Enable background mode for every run with `"background": true` in `~/.agitrack/config.json`.
+
+Only **repo-local AI work is ever tracked.** aGiTrack keys the backend session strictly to this repository's directory (Claude by its per-directory transcript store, OpenCode by each session's recorded working directory), so a session you drive in a *different* repo is never picked up by this repo's tracker.
+
+#### Never forget to start it: track (or auto-start) on commit
+
+Because a background tracker is easy to forget after a reboot, aGiTrack installs a **persistent `pre-commit` hook** (it survives aGiTrack not running). When you `git commit` while no tracker is running, the hook — **only if the AI actually made changes since your last commit** (non-zero tokens) — records the pending turns and folds their interaction trace and metadata **into that very commit** (which stays *your* commit, with your message), so AI work is never silently lost, and then **auto-starts the background tracker** for the turns that follow — in the **same auto/manual commit mode as your last run**. The command line tells you it started automatically and how to stop it. A purely human commit (no AI work) is left completely untouched: no trailer, no auto-start, no footprint.
+
+Because this hook **outlives the background tracker**, `agitrack -b` explains it and asks whether to enable it (**default: yes**) **whenever auto-start is off** — the first time you run it in a repo, and again after you've turned it off (e.g. with `agitrack --remove-hooks`), so you can always re-enable it. Once enabled it stops asking. The choice is remembered per repo (`autotrack_hook`: `auto`/`off`, in the repo's `.agitrack/config.json`, also under `Ctrl-G → settings`).
+
+To turn it off at any time, run `agitrack --remove-hooks` — it removes every aGiTrack-installed git hook (the auto-track `pre-commit` and the manual-commit `prepare-commit-msg`/`post-commit` fold hooks), restores any hooks they chained, and sets `autotrack_hook: off` so it won't reinstall.
+
+#### Update reminders while running in the background
+
+A background daemon periodically checks whether a newer aGiTrack is available (it **never** auto-installs — installing may need pip/pipx/brew/an MSI). When one is found it records it and reminds you where you'll actually see it: in `agitrack -b status`, in the `git commit` output (via the pre-commit hook), and as a banner on the [dashboard](#dashboard). Turn the checks off with `"check_for_updates": false`.
 
 
 
@@ -328,6 +383,7 @@ When it launches a coding agent, aGiTrack appends a note to the agent's system p
 - Tracked modifications and deletions are staged with `git add -u`.
 - New untracked files require confirmation before staging.
 - Declined untracked files are remembered in repository-local `.agitrack/state.json`.
+- **No tracking footprint on a non-AI commit.** aGiTrack only ever attributes or covers a commit that actually contains AI-written work. A commit made with **no** agent turns since the last one (purely your own hand-written code) is left completely untouched — no trailer, no cover, no metadata.
 - Agent commits use the `<aGiTrack>` tag and include the full interaction trace since the last code-changing commit.
 - Agent commit metadata includes context token count and generated token usage accumulated since the last code-changing commit.
   - Token figures are read directly from the backend's session transcript (each assistant message's reported usage) and broken out by category: `input`, `output`, `cache_read`, `cache_write`, and (when the backend reports it) `reasoning`. Both backends report `input` as the *uncached* input (cache reads/writes are tracked separately, never rolled into it), so the categories mean the same thing across backends. The one backend difference is generated tokens: Claude folds extended-thinking and tool-call tokens into `output` (no separate `reasoning`), whereas OpenCode reports `reasoning` as its own bucket alongside `output`. Sub-agent/sidechain turns are counted separately under the matching `subagent_*` categories rather than dropped (both backends do this). Each category is recorded only when the backend reports a non-zero value, so a field a backend never populates (e.g. Claude's separate `reasoning`) simply has no line.
@@ -407,13 +463,13 @@ agitrack --delay-merge
 
 By default aGiTrack merges a turn's committed changes into the base branch as soon as the turn finishes. With `--delay-merge` it holds the merge: after the agent commits, the changes stay in the session's **working directory** (a git worktree when worktrees are enabled — its path is shown in the notice, since you may not know the worktree's location otherwise) so you can review them and make any further edits. When you're ready, open the session menu and choose **"Merge reviewed changes into &lt;base&gt;"** to integrate. Nothing is merged until you confirm (on exit, any still-unmerged work stays on its branch and is offered again next time). This is off by default.
 
-Use the structured JSON fallback mode:
+Use the structured JSON prompt-loop (mainly for testing and programmatic drivers — normal interactive use doesn't need it):
 
 ```bash
-agitrack --mode json
+agitrack --json
 ```
 
-JSON mode invokes the backend non-interactively for each prompt (`opencode run --format json` or `claude -p --output-format json`) so aGiTrack can capture the final response and create traceable commits.
+The JSON prompt-loop invokes the backend non-interactively for each prompt (`opencode run --format json` or `claude -p --output-format json`) so aGiTrack can capture the final response and create traceable commits. (`--mode json` is a deprecated alias for `--json`.)
 
 In JSON mode, plain text is sent to the active agent backend:
 
@@ -446,9 +502,9 @@ agitrack --repo path/to/repo --backend claude \
   --permission-mode acceptEdits
 ```
 
-Scripted runs never block on a question: the privacy warning is printed without waiting for acknowledgment, and new untracked files are staged automatically (with a notice) instead of being reviewed interactively. The same non-interactive defaults apply when prompts are piped to `agitrack --mode json` on stdin. Note that headless Claude needs permission to edit files — forward `--permission-mode acceptEdits` (or your preferred permission flags) through aGiTrack as shown above; OpenCode's `run` mode edits by default.
+Scripted runs never block on a question: the privacy warning is printed without waiting for acknowledgment, and new untracked files are staged automatically (with a notice) instead of being reviewed interactively. The same non-interactive defaults apply when prompts are piped to `agitrack --json` on stdin. Note that headless Claude needs permission to edit files — forward `--permission-mode acceptEdits` (or your preferred permission flags) through aGiTrack as shown above; OpenCode's `run` mode edits by default.
 
-For a programmatic driver, `agitrack --mode json --json-events` emits one machine-readable JSON line per turn event (`response`, `commit`, `no_changes`, `error`) alongside the plain output, so another process can render the conversation and see which commit each turn produced. For a driver that also needs to *answer* aGiTrack's interactive questions, `agitrack --mode json --ui-bridge` runs a long-lived **bidirectional** JSON-RPC session over stdin/stdout: the driver sends `{"type":"prompt"|"command"|"answer"|"exit", …}` lines and aGiTrack streams back the same turn events plus `ask` events (`kind`: select/multiselect/input/confirm) for the driver to render and reply to.
+For a programmatic driver, `agitrack --json --json-events` emits one machine-readable JSON line per turn event (`response`, `commit`, `no_changes`, `error`) alongside the plain output, so another process can render the conversation and see which commit each turn produced. For a driver that also needs to *answer* aGiTrack's interactive questions, `agitrack --json --ui-bridge` runs a long-lived **bidirectional** JSON-RPC session over stdin/stdout: the driver sends `{"type":"prompt"|"command"|"answer"|"exit", …}` lines and aGiTrack streams back the same turn events plus `ask` events (`kind`: select/multiselect/input/confirm) for the driver to render and reply to.
 
 `scripts/demo.sh` is a self-contained showcase of scripted mode: it creates a fresh repository in a temporary directory, has the agent write a small program and its tests through aGiTrack, and leaves the repository behind so you can inspect the `<aGiTrack>` commit history or continue interactively.
 
@@ -476,7 +532,7 @@ Use `--` to forward an argument that aGiTrack also defines (e.g. `--verbose`), o
 agitrack -- --verbose "fix the bug"           # everything after -- goes to the backend
 ```
 
-aGiTrack's own flags (`--repo`, `--verbose`, `--mode`, `--backend`, `--new-session`, `--no-worktree`) bind to aGiTrack when they appear before `--`. Note that aGiTrack manages session selection itself, so forwarding session flags (`--resume`, `--session-id`, `--session`, `--continue`) may interfere with its session tracking — it warns when you do.
+aGiTrack's own flags (`--repo`, `--verbose`, `--json`, `--backend`, `--new-session`, `--no-worktree`) bind to aGiTrack when they appear before `--`. Note that aGiTrack manages session selection itself, so forwarding session flags (`--resume`, `--session-id`, `--session`, `--continue`) may interfere with its session tracking — it warns when you do.
 
 Help follows the same model: `agitrack --help` (or `-h`) prints aGiTrack's own options followed by the active backend's help, so one command documents both layers. To run only the backend's help, forward it explicitly: `agitrack -- --help`.
 
@@ -545,6 +601,14 @@ User-wide settings live in `~/.agitrack/config.json` (override the directory wit
 `use_worktrees` (default `true`) controls whether sessions run in isolated worktrees. Set it to `false` to run the agent directly on the current branch by default — the same behavior as `--no-worktree`, which applies it for a single run. See the `--no-worktree` notes under Usage for the trade-offs.
 
 `manual_commits` (default `false`) enables manual-commit mode by default — the same as starting aGiTrack with `--manual-commits` / `-m`, which applies it for a single run. Commits stay user-triggered and each agent turn is tracked on a hidden side ref until you commit. Manual-commit mode **always runs without a worktree** (it implies `--no-worktree`). See the `--manual-commits` notes under Usage.
+
+`background` (default `false`) runs aGiTrack in background (headless) mode by default — the same as starting aGiTrack with `--background` / `-b`, which applies it for a single run. In background mode aGiTrack tracks a session you drive from your own UI (no TUI), and **always runs without a worktree** (it implies `--no-worktree`). It uses **auto** commits by default (like the interactive TUI); set `manual_commits: true` (or pass `-m`) for user-triggered commits. Settable in both the global (`~/.agitrack/config.json`) and per-repo (`<repo>/.agitrack/config.json`) config files. See the `--background` notes under Usage.
+
+`autotrack_hook` (default `"auto"`, **per-repository**) controls the persistent `pre-commit` hook. `"auto"`: on a `git commit` made while aGiTrack isn't running, fold the AI trace into that commit and **auto-start** the background tracker (in the same commit mode as the last run) for the turns that follow. `"off"`: don't install it — track only while aGiTrack is running. aGiTrack asks the first time you run `agitrack -b` on a repo; `agitrack --remove-hooks` sets it to `"off"`. See [Background mode](#background-mode---background---b).
+
+`log_file` (default unset) is a path to a plain-text **event log** aGiTrack appends notable events to — an AI change detected, a commit made, an update available — in **every** mode (interactive proxy and background, with or without `-b`), so you can `tail -f` one file and watch what aGiTrack is doing. A relative path is resolved against the repo root. Set it for a single run with `--log-file PATH`, or persist it here (`"log_file": "agitrack-events.log"`).
+
+The global config file (`~/.agitrack/config.json`) is written out with **every setting at its default** the first time aGiTrack runs, so you can open it and see the full list of available options at a glance. Any value you set is preserved; new options are added with their defaults after an upgrade.
 
 `commit_guidance` (default `true`) controls whether aGiTrack appends a note to the coding agent's system prompt telling it that aGiTrack auto-commits, so it doesn't create its own git commits. Set it to `false` to disable that note by default — the same as starting aGiTrack with `--no-commit-guidance`, which applies it for a single run. Only affects backends that support appending to the system prompt (Claude), and never the summarizer.
 

@@ -115,11 +115,15 @@ def test_discover_spawned_session_returns_none_when_nothing_new():
     assert runner._discover_spawned_session() is None
 
 
-def test_discover_spawned_session_without_snapshot_uses_newest():
+def test_discover_spawned_session_without_snapshot_returns_none():
+    # Without a pre-spawn snapshot we cannot tell aGiTrack's own session apart from a
+    # pre-existing unrelated one in the same directory, so discovery returns None and the
+    # caller keeps its pinned id. (This is what makes the result always safe to prefer over
+    # the pinned id, which is how no-worktree mode follows an in-backend session switch.)
     refs = [SessionRef("a", 100.0), SessionRef("b", 300.0), SessionRef("c", 200.0)]
     runner = _runner_with_sessions(refs)
     runner._pre_spawn_session_ids = None
-    assert runner._discover_spawned_session() == "b"
+    assert runner._discover_spawned_session() is None
 
 
 def test_short_session():
@@ -7642,7 +7646,7 @@ def test_spawn_failed_exec_child_exits_with_127(tmp_path):
         worktree=None,
         backend=types.SimpleNamespace(
             new_session_id=lambda: "ses-1",
-            spawn_command=lambda repo, session_id, resume, fork=False, commit_guidance=True, use_worktrees=True, executable=None: [
+            spawn_command=lambda repo, session_id, resume, fork=False, commit_guidance=True, use_worktrees=True, base_repo=None, executable=None: [
                 "agit-test-binary-that-does-not-exist"
             ],
             list_sessions=lambda repo: [],
@@ -9214,6 +9218,62 @@ def test_warn_if_base_edited_fires_then_rebaselines_and_noop_when_off():
     runner._base_check_at = 0.0
     runner._base_status_baseline = set()
     runner._warn_if_base_edited()
+    assert msgs == []
+
+
+def test_base_edit_baseline_stays_pristine_so_exit_reminder_still_catches_warned_files():
+    # Regression for stranded-work loss: once a base edit is warned, it must STILL be reported at
+    # exit. Warning must not fold the file into the baseline (which would make it "not stranded"
+    # and vanish from the exit reminder) — the warned-set stops the nag instead.
+    import types
+
+    runner = make_runner()
+    runner.BASE_EDIT_CHECK_SECONDS = 0.0
+    runner._base_check_at = 0.0
+    runner._monitor_base_edits = True
+    runner._base_status_baseline = set()
+    runner._base_warned_files = set()
+    runner.base_repo = types.SimpleNamespace(status_short=lambda: " M src/app.py\n?? new.txt", repo="/base")
+    msgs: list = []
+    runner._set_message = lambda m, **k: msgs.append(m)
+    runner._render = lambda: None
+
+    runner._warn_if_base_edited()
+    assert any("edited the base repo" in m for m in msgs)
+    # Second poll: no re-nag (warned-set), but the baseline was NOT mutated to absorb them.
+    msgs.clear()
+    runner._base_check_at = 0.0
+    runner._warn_if_base_edited()
+    assert msgs == []
+    assert runner._base_status_baseline == set()  # pristine — nothing folded in
+
+    # At exit the already-warned files are surfaced one last time, non-transiently.
+    msgs.clear()
+    runner._remind_stranded_base_edits_on_exit()
+    assert len(msgs) == 1
+    assert "src/app.py" in msgs[0] and "new.txt" in msgs[0]
+    assert "/base" in msgs[0]  # tells the user where the stranded work lives
+
+
+def test_remind_stranded_base_edits_noop_when_clean_or_monitoring_off():
+    import types
+
+    runner = make_runner()
+    runner._monitor_base_edits = True
+    runner._base_status_baseline = {" M src/app.py"}
+    runner.base_repo = types.SimpleNamespace(status_short=lambda: " M src/app.py", repo="/base")
+    msgs: list = []
+    runner._set_message = lambda m, **k: msgs.append(m)
+    runner._render = lambda: None
+
+    # Base status == baseline → nothing stranded → no reminder.
+    runner._remind_stranded_base_edits_on_exit()
+    assert msgs == []
+
+    # Monitoring off (sandbox enforced confinement, or no worktree) → never reminds.
+    runner._monitor_base_edits = False
+    runner._base_status_baseline = set()
+    runner._remind_stranded_base_edits_on_exit()
     assert msgs == []
 
 

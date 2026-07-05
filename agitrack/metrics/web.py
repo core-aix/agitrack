@@ -110,7 +110,24 @@ def shell_html(repo: GitRepo) -> str:
         _TEMPLATE.replace("__DATA__", payload)
         .replace("__REPO_NAME__", _escape(repo_name))
         .replace("__REPO__", _escape(repo_path))
+        .replace("__UPDATE_BANNER__", _update_banner_html(repo))
     )
+
+
+def _update_banner_html(repo: GitRepo) -> str:
+    """A small banner shown when an aGiTrack update is available (fed by the background tracker or
+    the interactive proxy via the shared marker). Empty when there is no update. Installing can't
+    be automated, so it only informs."""
+    try:
+        from agitrack.update.marker import read_update_marker
+
+        info = read_update_marker(repo.repo)
+    except Exception:
+        info = None
+    if not info:
+        return ""
+    text = f"aGiTrack update available: {info.get('current', '?')} → {info.get('latest', '?')} — run `agitrack` and choose ‘update’, or update via pip/pipx/brew."
+    return f'<div class="updatebanner">⬆ {_escape(text)}</div>'
 
 
 def dashboard_data(dash: Dashboard) -> dict:
@@ -539,7 +556,7 @@ _TEMPLATE = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>aGiTrack dashboard · __REPO_NAME__</title>
+<title>aGiTrack - Dashboard · __REPO_NAME__</title>
 <!-- Inline SVG favicon (the aGiTrack wordmark mark) — the server only serves /, /data, /log, so it can't host a file. -->
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2064%2064'%3E%3Crect%20width='64'%20height='64'%20rx='13'%20fill='%23070b09'/%3E%3Ctext%20x='32'%20y='45'%20text-anchor='middle'%20font-family='ui-monospace,monospace'%20font-weight='700'%20font-size='42'%20letter-spacing='-1'%3E%3Ctspan%20fill='%23ffb454'%3Ea%3C/tspan%3E%3Ctspan%20fill='%233dffa0'%3EG%3C/tspan%3E%3C/text%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -580,6 +597,8 @@ body.booting .wrap>*:not(header):not(.booting){display:none}
 .neterror{position:fixed;top:0;left:0;right:0;z-index:40;background:#3a0f0f;color:#ffd5d5;
   border-bottom:2px solid var(--red);padding:10px 18px;font-size:13px;text-align:center;
   box-shadow:0 6px 20px rgba(0,0,0,.55);animation:rise .25s ease}
+.updatebanner{margin:0 0 14px;padding:9px 16px;border:1px solid var(--accent,#6be);border-radius:8px;
+  background:rgba(90,150,230,.12);color:var(--accent,#9cf);font-size:13px;text-align:center}
 @keyframes rise{from{transform:translateY(-100%)}to{transform:none}}
 
 header{padding:54px 0 22px}
@@ -817,10 +836,13 @@ h2.section::before{content:"# ";color:var(--amber)}
 
 footer{margin-top:46px;padding-top:22px;border-top:1px dashed var(--line);color:var(--fg-dim);font-size:12.5px;
   display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap}
+footer .flink{color:var(--accent,#6be);text-decoration:none}
+footer .flink:hover{text-decoration:underline}
 </style>
 </head>
 <body>
 <div id="neterror" class="neterror" hidden>⚠ Can't reach the aGiTrack dashboard server — it may have been stopped (Ctrl-C in the terminal). Showing the last loaded data; retrying…</div>
+__UPDATE_BANNER__
 <div class="wrap">
   <header>
     <div class="brand"><span class="a">a</span>GiTrack<span class="sub">&nbsp;dashboard</span></div>
@@ -906,7 +928,9 @@ footer{margin-top:46px;padding-top:22px;border-top:1px dashed var(--line);color:
   <div class="log" id="commitlog"></div>
 
   <footer>
-    <span>aGiTrack · agent + git tracking · metrics from commit metadata</span>
+    <span>aGiTrack · agent + git tracking · metrics from commit metadata &nbsp;·&nbsp;
+      <a class="flink" href="http://agitrack.core-aix.org/" target="_blank" rel="noopener noreferrer">website</a> &nbsp;·&nbsp;
+      <a class="flink" href="https://github.com/core-aix/agitrack" target="_blank" rel="noopener noreferrer">GitHub</a></span>
     <span id="count"></span>
   </footer>
 </div>

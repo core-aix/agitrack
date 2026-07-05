@@ -161,6 +161,50 @@ class GlobalConfig:
             return {}
         return data if isinstance(data, dict) else {}
 
+    def _default_config(self) -> dict[str, Any]:
+        """Every user-facing setting mapped to its built-in default. This is the single
+        registry that :meth:`seed_defaults` writes into the global config file so the file
+        lists every available knob (each getter still carries the same default as its own
+        fallback, so a hand-deleted key keeps working). Deliberately EXCLUDES transient /
+        state-like keys — ``pending_manual_update`` and ``session_sharing`` — which are
+        runtime state, not user preferences, and must not appear as "settings"."""
+        from agitrack.sessions.share_cap import DEFAULT_MAX_SHARED_BYTES
+
+        return {
+            "default_backend": None,
+            "sandbox": True,
+            "commit_guidance": True,
+            "use_worktrees": True,
+            "manual_commits": False,
+            "background": False,
+            "autotrack_hook": "auto",
+            "log_file": None,
+            "allowed_edit_paths": [],
+            "backend_command": "",
+            "menu_key": DEFAULT_MENU_KEY,
+            "summarization_enabled": True,
+            "summarization_model": None,
+            "check_for_updates": True,
+            "share_max_transcript_bytes": DEFAULT_MAX_SHARED_BYTES,
+            "timings": dict(DEFAULT_TIMINGS),
+        }
+
+    def seed_defaults(self) -> bool:
+        """Write any missing default settings into the global config file so a user opening
+        ``~/.agitrack/config.json`` can see every available knob and its default. Only fills
+        gaps — never overwrites a value the user already set — and only writes when something
+        was actually missing, so it is a no-op on every run after the first (and after an
+        upgrade, it adds just the newly-introduced keys). Repo-local overlays are untouched.
+        Returns True if the file was updated."""
+        added = False
+        for key, default in self._default_config().items():
+            if key not in self.data:
+                self.data[key] = default
+                added = True
+        if added:
+            self.save()
+        return added
+
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("w", encoding="utf-8") as handle:
@@ -294,6 +338,51 @@ class GlobalConfig:
     @manual_commits.setter
     def manual_commits(self, value: bool) -> None:
         self.data["manual_commits"] = bool(value)
+        self.save()
+
+    @property
+    def background(self) -> bool:
+        # Background (headless) mode (off by default): aGiTrack runs without its interactive
+        # TUI, driving a native backend session and performing everything the TUI would —
+        # committing turns, summaries, session sharing, and installing the commit hooks — so
+        # tracking works when the user drives the agent from another UI (e.g. an IDE
+        # extension). Always runs without a worktree, with either manual or auto commit.
+        # Enable per-run with --background / -b.
+        value = self._raw("background")
+        return False if value is None else bool(value)
+
+    @background.setter
+    def background(self, value: bool) -> None:
+        self.data["background"] = bool(value)
+        self.save()
+
+    @property
+    def autotrack_hook(self) -> str:
+        # The persistent auto-track pre-commit hook (repo-scoped). "auto" (default): install it — on
+        # a `git commit` made when aGiTrack isn't running it folds the AI trace into that commit AND
+        # auto-starts the background tracker (in the same commit mode as the last run) for the turns
+        # that follow. "off": don't install it; track only while aGiTrack is actually running.
+        # Disable at any time with `agitrack --remove-hooks` (which sets this to "off").
+        value = self._raw("autotrack_hook")
+        return "off" if str(value).lower() == "off" else "auto"
+
+    @autotrack_hook.setter
+    def autotrack_hook(self, value: str) -> None:
+        self.data["autotrack_hook"] = "off" if str(value).lower() == "off" else "auto"
+        self.save()
+
+    @property
+    def log_file(self) -> str | None:
+        # Optional path to a plain-text EVENT LOG aGiTrack appends notable events to (an AI
+        # change detected, a commit made, a merge integrated, an update available). Works in
+        # every mode — interactive proxy AND headless background. Unset (None) ⇒ no event log.
+        # A relative path is resolved against the repo root (see agitrack.events.resolve_log_path).
+        value = self._raw("log_file")
+        return str(value) if isinstance(value, str) and value.strip() else None
+
+    @log_file.setter
+    def log_file(self, value: str | None) -> None:
+        self.data["log_file"] = value or None
         self.save()
 
     @property

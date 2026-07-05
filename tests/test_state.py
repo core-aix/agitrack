@@ -117,6 +117,40 @@ def test_backend_session_is_repo_scoped(tmp_path):
     assert state.backend_session_matches_repo() is False
 
 
+def test_per_conversation_watermark_isolates_conversations(tmp_path):
+    # Switching between backend conversations must not replay/double-count either one:
+    # each remembers its OWN committed high-water mark.
+    state = AgitrackState(tmp_path)
+
+    # Tracking conversation A: the current conversation uses the single watermark.
+    state.backend_session_id = "A"
+    assert state.backend_message_id_for("A") is None  # nothing committed yet
+    state.set_backend_message_id("A", "a-msg-2")
+    assert state.backend_message_id_for("A") == "a-msg-2"
+    assert state.last_backend_message_id == "a-msg-2"  # legacy value kept in sync
+
+    # User switches to conversation B inside the backend. While A is still the tracked
+    # (backend_session_id) conversation, B is a DIFFERENT conversation: fresh, no replay.
+    assert state.backend_message_id_for("B") is None
+    state.backend_session_id = "B"  # the switch is adopted
+    state.set_backend_message_id("B", "b-msg-5")
+
+    # Switching back to A must read A's own mark, NOT B's — so A's committed turns are
+    # not replayed. (A is now the "other" conversation, read from the per-conversation map.)
+    assert state.backend_message_id_for("A") == "a-msg-2"
+    assert state.backend_message_id_for("B") == "b-msg-5"
+
+
+def test_current_conversation_watermark_still_uses_single_value(tmp_path):
+    # A plain reset of the legacy single watermark still governs the CURRENT conversation,
+    # so all existing "recompute from scratch on resume" resets keep working.
+    state = AgitrackState(tmp_path)
+    state.backend_session_id = "A"
+    state.set_backend_message_id("A", "a-msg-9")
+    state.last_backend_message_id = None  # an existing reset path
+    assert state.backend_message_id_for("A") is None  # current conversation recomputes
+
+
 def test_trace_turn_limit_defaults_and_reads_config(tmp_path):
     state = AgitrackState(tmp_path)
     assert state.trace_turn_limit == 5

@@ -92,6 +92,17 @@ def _demo_repo(tmp_path: Path) -> GitRepo:
     return repo
 
 
+def test_dashboard_links_to_website_and_github(tmp_path):
+    # The dashboard is something users keep open, so it links to the project website and repo.
+    from agitrack.metrics.web import shell_html
+
+    repo = GitRepo.init(tmp_path)
+    repo._run(["git", "commit", "--allow-empty", "-m", "seed"])
+    html = shell_html(repo)
+    assert 'href="http://agitrack.core-aix.org/"' in html
+    assert 'href="https://github.com/core-aix/agitrack"' in html
+
+
 def test_agitrack_integration_merge_is_classified_as_ops_not_untracked(tmp_path):
     repo = GitRepo.init(tmp_path)
     # aGiTrack's own auto-merge bringing base into a session turn branch.
@@ -810,7 +821,7 @@ def test_render_html_embeds_aggregates_and_first_log_page_only(tmp_path):
     html = render_html(_demo_repo(tmp_path))
 
     assert html.startswith("<!DOCTYPE html>")
-    assert "aGiTrack dashboard" in html
+    assert "aGiTrack - Dashboard" in html
     for control in ('id="f-author"', 'id="f-backend"', 'id="f-model"', 'id="f-period"', 'id="f-from"'):
         assert control in html
     # The page embeds server-computed aggregates plus only the FIRST page of the

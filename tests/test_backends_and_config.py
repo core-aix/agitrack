@@ -51,12 +51,17 @@ def test_claude_proxy_agent_spawn_command_uses_session_id_and_resume():
     assert "pull request" in AGENT_SYSTEM_NOTE  # pushing is allowed for PRs/CI
     assert "separate remote branch" in AGENT_SYSTEM_NOTE  # push target may differ from the worktree branch
     assert "correct that note" in AGENT_SYSTEM_NOTE  # override + fix any conflicting saved memory
-    # Under --no-worktree the worktree clause is dropped (the agent edits the branch directly),
-    # but the no-self-commit guidance stays.
+    # Under --no-worktree the worktree-merge clause is replaced by a clause that POSITIVELY
+    # states the agent edits the checked-out branch in its current directory (so a session that
+    # switched here from worktree mode isn't left ambiguous), but names no worktree PATH.
     from agitrack.backends.proxy_agents import agent_system_note
 
     no_wt = agent_system_note(use_worktrees=False)
-    assert ".agitrack" not in no_wt and "worktree" not in no_wt  # sep-agnostic: clause fully dropped
+    assert f".agitrack{os.sep}worktrees{os.sep}" not in no_wt  # never points at a worktree dir
+    assert ".agitrack" not in no_wt  # no aGiTrack-internal path at all in this mode
+    assert "no separate worktree" in no_wt  # but it IS explicit that there's no worktree here
+    assert "current working directory" in no_wt  # and where the agent works instead
+    assert "commit and the merge" not in no_wt  # the worktree merge explanation is gone
     assert "git commit" in no_wt
     assert "pull request" in no_wt  # the push allowance lives in the shared intro, so it stays
     cmd = agent.spawn_command(Path("/repo"), session_id="u1", resume=False, use_worktrees=False)
@@ -66,6 +71,57 @@ def test_claude_proxy_agent_spawn_command_uses_session_id_and_resume():
     assert "--append-system-prompt" not in agent.spawn_command(
         Path("/repo"), session_id="u1", resume=True, commit_guidance=False
     )
+
+
+def test_claude_note_names_concrete_worktree_and_base_paths(tmp_path):
+    # Regression: an agent that addresses files by absolute path (not just the cwd) needs the
+    # concrete worktree AND base-repo paths to know which tree is off-limits — the relative
+    # `.agitrack/worktrees/` hint alone let the agent edit the base repo and strand its work.
+    from agitrack.backends.proxy_agents import agent_system_note
+
+    base = tmp_path / "repo"
+    worktree = base / ".agitrack" / "worktrees" / "sess"
+    worktree.mkdir(parents=True)
+
+    note = agent_system_note(use_worktrees=True, worktree=worktree, base_repo=base)
+    # Both absolute paths are named, with an explicit "edit under the worktree, base is read-only".
+    assert str(worktree.resolve()) in note
+    assert str(base.resolve()) in note
+    assert "read-only" in note
+    # And spawn_command threads them (repo == the worktree in worktree mode).
+    agent = make_proxy_agent("claude")
+    cmd = agent.spawn_command(worktree, session_id="u1", resume=False, base_repo=base)
+    appended = cmd[cmd.index("--append-system-prompt") + 1]
+    assert str(worktree.resolve()) in appended and str(base.resolve()) in appended
+
+    # Without base_repo the clause is omitted (back-compat: the plain worktree note).
+    assert str(base.resolve()) not in agent_system_note(use_worktrees=True)
+    # No-worktree note never carries concrete paths even if they are passed.
+    assert str(base.resolve()) not in agent_system_note(use_worktrees=False, worktree=worktree, base_repo=base)
+    # A legacy in-place session (worktree == base) has nothing to distinguish, so no clause.
+    same = agent_system_note(use_worktrees=True, worktree=base, base_repo=base)
+    assert "read-only" not in same
+
+
+def test_worktree_and_noworktree_notes_are_each_self_clear_across_a_switch():
+    # A session can switch between the worktree and no-worktree models between runs. Each note
+    # must self-describe its mode so the agent is never left carrying the other mode's rule:
+    # the worktree note sends edits INTO the worktree and away from the base; the no-worktree
+    # note sends edits into the current directory and explicitly retires the worktree rule.
+    from agitrack.backends.proxy_agents import agent_system_note
+
+    wt = agent_system_note(use_worktrees=True)
+    nowt = agent_system_note(use_worktrees=False)
+    assert wt != nowt
+    # Worktree variant: edit in the worktree, do NOT edit the base repo checkout.
+    assert "worktree" in wt and "base repository" in wt
+    # No-worktree variant: edit the current directory directly, and no worktree rule lingers.
+    assert "no separate worktree" in nowt and "current working directory" in nowt
+    assert "base repository" not in nowt  # no "don't touch base" rule when the cwd IS the repo
+    # Neither note leaves the agent without a clear place to work: both name where edits go.
+    assert "working directory" in wt and "working directory" in nowt
+    # Both retire a stale contrary memory, so a switch can't be overridden by an old note.
+    assert "correct that note" in wt and "correct that note" in nowt
 
 
 def test_opencode_proxy_agent_spawn_command_has_no_system_prompt_append():

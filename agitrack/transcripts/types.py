@@ -48,6 +48,12 @@ class SessionTurn:
     # it is recorded to make the turn's token counts interpretable. Almost always 0
     # or 1; only the boundary before a turn is attributed to it.
     compaction_count: int = 0
+    # Extra user messages the user QUEUED while the agent was already working on this turn (Claude
+    # records them as `attachment` rows, not `user` rows). They belong to THIS turn — the agent's
+    # response covers them — but each is a distinct message the user sent after the agent had
+    # already said something, so the trace renders each as its OWN ``## User`` heading (rather than
+    # merged into ``user_prompt``). Empty for a plain single-prompt turn.
+    queued_followups: list[str] = field(default_factory=list)
 
 
 @dataclass
