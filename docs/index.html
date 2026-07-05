@@ -246,32 +246,6 @@ Added --version using the package metadata; prints and exits.
       </div>
     </section>
 
-    <section class="commit">
-      <div class="commit-head">
-        <span class="sha">71c5b9a</span>
-        <span class="subject">how it works</span>
-      </div>
-      <h2>Your branch only ever moves by merge.</h2>
-      <p>Each session runs in its own <strong>git worktree</strong> and branch, so concurrent sessions never stomp
-      each other or your working tree. Finished turns merge back into your branch; conflicts go to the agent to
-      resolve — itself a traceable <span class="tag">&lt;aGiTrack-merge&gt;</span> commit.</p>
-      <div class="branches">
-        <div class="branch" data-ref="agitrack/claude/session-1/t3">
-          <h3>Isolated sessions</h3>
-          <p>One worktree per session, per-turn branches, crash recovery built in. Run several agents side by side.</p>
-        </div>
-        <div class="branch" data-ref="~/.claude/projects/…jsonl">
-          <h3>Backend-native</h3>
-          <p>No API keys, no token proxy. aGiTrack drives the real Claude Code / OpenCode TUI and reads its
-          transcript for the facts.</p>
-        </div>
-        <div class="branch" data-ref="tokens_since_last_commit">
-          <h3>Costs on the record</h3>
-          <p>Input, output, and cache tokens per commit, straight from the backend — a price tag on every change.</p>
-        </div>
-      </div>
-    </section>
-
     <section class="commit" id="modes">
       <div class="commit-head">
         <span class="sha">a11m0de</span>
@@ -322,21 +296,6 @@ Added --version using the package metadata; prints and exits.
         <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="title">agitrack -d · localhost</span></div>
         <a href="images/dashboard-v4.png" target="_blank"><img class="shot" src="images/dashboard-v4.png" loading="lazy"
           alt="The aGiTrack dashboard: coverage, tracked AI vs non-tracked lines, token totals, and per-backend / model / committer breakdowns, in a CRT terminal theme."></a>
-      </div>
-      <div class="branches" style="margin-top:18px">
-        <div class="branch" data-ref="tracked AI vs non-tracked">
-          <h3>Honest provenance</h3>
-          <p>Lines aGiTrack tracked as the agent's versus everything else — it never claims a human wrote what
-          the model did.</p>
-        </div>
-        <div class="branch" data-ref="committer · backend · model · period">
-          <h3>Filter live</h3>
-          <p>Narrow the whole view to one committer, backend, model, or time range — recomputed instantly.</p>
-        </div>
-        <div class="branch" data-ref="tokens · loops · commit log">
-          <h3>Cost &amp; drill-down</h3>
-          <p>Token totals, an efficiency ratio, a loop heads-up, and a clickable commit log that jumps to GitHub.</p>
-        </div>
       </div>
       <div class="steps" style="margin-top:22px">
         <div class="step"><div>
