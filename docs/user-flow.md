@@ -195,7 +195,7 @@ Runs aGiTrack **without the interactive TUI** so you can drive the coding agent 
 **Claude desktop app**, an IDE extension, its native CLI, a chat window) while aGiTrack tracks that
 session in the background — the interactive-UI-agnostic tracker of
 [issue #143](https://github.com/core-aix/agitrack/issues/143). Especially handy if you'd rather stay
-in a GUI than a terminal. aGiTrack does **not** launch or proxy the agent; it watches the agent's
+in a GUI than a terminal. aGiTrack does **not** launch or relay the agent; it watches the agent's
 on-disk session transcript for the repo (**only** this repo's — Claude by its cwd-encoded transcript
 dir, OpenCode by each session's recorded directory), records each completed turn, summarizes it, and
 installs the fold hooks. It **always runs without a worktree** (implies `--no-worktree`), with either
@@ -230,7 +230,7 @@ already-installed hook against the running one: if the installed hook is **older
 stamping and carries no stamp), aGiTrack **removes the previously installed hook** — restoring any
 project hook it had chained — and then **installs the current version fresh**, so a changed hook schema
 is never left half-migrated. A same-or-newer stamp just refreshes the baked invocation in place. This
-runs on the background startup path (and equally when a no-worktree proxy session installs the same
+runs on the background startup path (and equally when a no-worktree interactive session installs the same
 persistent hook).
 
 ```mermaid
