@@ -546,6 +546,143 @@ def test_precommit_sync_off_does_not_spawn_daemon(tmp_path, monkeypatch):
     assert "# aGiTrack Metadata" in (repo.repo / ".agitrack" / "manual-pending-trailer").read_text()
 
 
+# --- pre-commit flush: keep the trailer fresh when a daemon is running -------
+
+
+def test_daemon_flush_request_records_and_acks(tmp_path):
+    # The daemon services a pre-commit flush request by recording pending completed turns and
+    # re-rendering the fold trailer synchronously, then echoing the nonce back. This is what keeps
+    # a commit that races ahead of the daemon's poll from folding a stale/empty trailer.
+    runner, repo, state, backend = _runner(tmp_path, manual=True)
+    runner._manual.setup()
+    (tmp_path / "a.txt").write_text("one\nagent\n", encoding="utf-8")  # AI edit still in the tree
+    backend.set_session("s1", [_turn("u1", "m1", "do x", "done", 20)])
+
+    (repo.repo / ".agitrack" / "flush-request").write_text("nonce-1", encoding="utf-8")
+    runner._service_flush_requests()
+
+    assert "# aGiTrack Metadata" in (repo.repo / ".agitrack" / "manual-pending-trailer").read_text()
+    assert (repo.repo / ".agitrack" / "flush-done").read_text().strip() == "nonce-1"
+    # A repeated identical nonce is a no-op (dedup) — it must not re-service.
+    (repo.repo / ".agitrack" / "flush-done").write_text("stale", encoding="utf-8")
+    runner._service_flush_requests()
+    assert (repo.repo / ".agitrack" / "flush-done").read_text().strip() == "stale"
+
+
+def test_background_commit_folds_fresh_turn_via_flush(tmp_path):
+    # End-to-end: a turn completed but the daemon hasn't polled yet, so the trailer is empty and a
+    # naive commit would fold NOTHING (the reported bug). The pre-commit flush records the turn +
+    # renders the trailer, so the very next commit carries the full trace/metadata.
+    runner, repo, state, backend = _runner(tmp_path, manual=False)  # auto mode; the fold hook is installed too
+    runner._manual.setup()
+    (tmp_path / "a.txt").write_text("one\nagent\n", encoding="utf-8")
+    backend.set_session("s1", [_turn("u1", "m1", "do x", "done", 20)])
+    # Before the flush the trailer holds no turn (daemon hasn't recorded it yet).
+    trailer = repo.repo / ".agitrack" / "manual-pending-trailer"
+    assert "# aGiTrack Metadata" not in (trailer.read_text() if trailer.exists() else "")
+
+    (repo.repo / ".agitrack" / "flush-request").write_text("n1", encoding="utf-8")
+    runner._service_flush_requests()  # the daemon flushes on the pre-commit hook's request
+
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "my work")
+    msg = _git(repo, "log", "-1", "--format=%B", "HEAD")
+    assert "my work" in msg
+    assert "# aGiTrack Metadata" in msg  # the turn's trace/metadata folded into the commit
+
+
+def test_precommit_sync_nudges_a_running_daemon_to_flush(tmp_path, monkeypatch):
+    # When a LIVE background daemon holds the lock, precommit_sync no longer just bails: it asks the
+    # daemon to flush so this commit folds a fresh trailer (it still records nothing itself — the
+    # daemon is the single writer).
+    import json
+    import os
+
+    from agitrack.git import RepoLock
+    from agitrack.proxy import background as bg
+
+    repo = _init_repo(tmp_path)
+    backend = FakeBackend()
+    backend.set_session("s1", [_turn("u1", "m1", "do x", "done", 20)])
+    _precommit_env(tmp_path, monkeypatch, backend)
+    held = RepoLock(repo.repo / ".agitrack" / "lock")
+    assert held.acquire()  # simulate the daemon holding the repo lock
+    bg.background_handshake_path(repo).write_text(json.dumps({"pid": os.getpid()}), encoding="utf-8")
+    calls = []
+    monkeypatch.setattr(bg, "request_daemon_flush", lambda r, **k: calls.append(r) or True)
+    try:
+        (tmp_path / "a.txt").write_text("one\nagent edit\n", encoding="utf-8")
+        assert bg.precommit_sync(repo) == 0
+        assert calls  # it nudged the running daemon to flush
+        # Still never records the turn itself (single-writer): no latent ref from the sync.
+        assert repo.ref_sha("refs/agitrack/manual/" + state_session_id(tmp_path)) is None
+    finally:
+        held.release()
+
+
+def state_session_id(tmp_path) -> str:
+    return AgitrackState(tmp_path, default_backend="claude").session_id
+
+
+# --- agent commits its own work mid-turn (final message comes after the commit) ---
+
+
+def test_daemon_covers_agent_commit_made_during_an_unfinished_turn(tmp_path):
+    # The hard case: the agent `git commit`s its own work BEFORE the turn's final message, so at
+    # commit time there is no completed turn to fold, and once the turn finishes the tree is clean
+    # (code already committed) — the tree-gated recorder would drop it. The daemon baselines HEAD
+    # while the turn is in flight, then covers the finished turn onto the agent's commit.
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    runner._manual.setup()
+    init_head = repo.rev_parse("HEAD")
+
+    # 1) The daemon sees the turn IN FLIGHT (incomplete) and baselines HEAD.
+    inflight = _turn("u1", "m1", "do x", "", 0)
+    inflight.complete = False
+    backend.set_session("s1", [inflight])
+    assert runner._observe_inflight_turn() is True
+    assert runner._inflight_baseline == init_head
+
+    # 2) The agent commits its OWN work mid-turn — HEAD moves, the working tree ends clean.
+    (tmp_path / "a.txt").write_text("one\nagent code\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "agent's own commit")
+    agent_head = repo.rev_parse("HEAD")
+    runner._manual.service()  # the daemon notices the commit (resets any stale ref)
+
+    # 3) The turn now COMPLETES (its final message lands after the commit).
+    backend.set_session("s1", [_turn("u1", "m1", "do x", "done", 20)])
+    assert runner._observe_inflight_turn() is False
+    runner._process_once()  # records the finished turn metadata-only (its code is already committed)
+    runner._cover_committed_away_if_any()  # covers it onto the agent's commit
+
+    first_parent = _git(repo, "log", "--first-parent", "--format=%H").split()
+    assert len(first_parent) == 3  # init + agent's commit + the cover
+    cover_msg = _git(repo, "log", "-1", "--format=%B", "HEAD")
+    assert "# aGiTrack Metadata" in cover_msg and "do x" in cover_msg  # the turn is now tracked
+    # The cover introduces NO diff — its tree equals the agent's commit's tree.
+    assert repo.rev_parse("HEAD^{tree}") == repo.rev_parse(agent_head + "^{tree}")
+
+
+def test_daemon_does_not_cover_a_turn_it_never_saw_in_flight(tmp_path):
+    # False-positive guard: a human commit followed by a pure-Q&A AI turn (no file change, never
+    # observed in flight, so no baseline) must NOT produce a spurious cover commit. The baseline is
+    # per-observed-turn precisely so an unrelated commit is never mistaken for a turn's work.
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    runner._manual.setup()
+    (tmp_path / "a.txt").write_text("one\nhuman\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "human work")
+    human_head = repo.rev_parse("HEAD")
+
+    backend.set_session("s1", [_turn("u1", "m1", "explain this", "here is why", 15)])  # pure Q&A
+    assert runner._observe_inflight_turn() is False  # completed instantly; never seen in flight
+    runner._process_once()
+    runner._cover_committed_away_if_any()
+
+    assert repo.rev_parse("HEAD") == human_head  # no spurious cover was added
+
+
 def test_repo_status_reports_each_mode(tmp_path, capsys):
     import json
     import os
