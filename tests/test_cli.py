@@ -324,6 +324,7 @@ def _stub_launch(monkeypatch, *, use_worktrees: bool = True, commit_guidance: bo
             return 0
 
     monkeypatch.setattr(cli, "ProxyRunner", Fake)
+    monkeypatch.setattr(cli, "BackgroundRunner", Fake)
     monkeypatch.setattr(cli, "AgitrackShell", Fake)
     # These tests exercise main()'s arg routing, not the pre-TUI startup checks; neutralize
     # them so the minimal stub Config/repo below need no extra surface — and so the checks
@@ -390,6 +391,56 @@ def test_already_running_refused_before_privacy_prompt(monkeypatch, capsys):
 
     assert rc == 1
     assert events == ["refused:4321"]  # refused, and the privacy prompt never ran
+
+
+def test_background_refused_when_another_instance_holds_the_repo(monkeypatch):
+    # Only ONE aGiTrack per repo: a background tracker must be refused (never launched) when the
+    # single-writer repo lock is already held — by ANY mode — so two never race over commits.
+    import pathlib
+    from types import SimpleNamespace
+
+    launched: list = []
+    monkeypatch.setattr(cli, "_discover_or_init", lambda p: SimpleNamespace(repo=pathlib.Path("/tmp/x")))
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
+    monkeypatch.setattr(cli, "BackgroundRunner", lambda *a, **k: launched.append(k))
+
+    class _HeldLock:
+        def __init__(self, _path):
+            pass
+
+        def acquire(self):
+            return False  # another instance already holds the repo
+
+        def owner_pid(self):
+            return 999
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(cli, "RepoLock", _HeldLock)
+    monkeypatch.setattr(cli, "already_running_message", lambda pid: "running")
+
+    class Config:
+        check_for_updates = False
+        background = False
+
+        def has_default_backend(self):
+            return True
+
+        default_backend = "claude"
+
+        def load_repo_overlay(self, _root):
+            pass
+
+        def seed_defaults(self):
+            return False
+
+    monkeypatch.setattr(cli, "GlobalConfig", lambda: Config())
+
+    rc = cli.main(["--background", "--backend", "claude"])
+
+    assert rc == 1
+    assert launched == []  # the tracker was never constructed
 
 
 def test_no_backend_configured_non_interactive_errors(monkeypatch, capsys):
@@ -502,6 +553,122 @@ def test_manual_commits_off_by_default(monkeypatch):
     cli.main([])
     assert captured["manual_commits"] is False
     assert captured["use_worktrees"] is True  # worktrees stay on when manual mode is off
+
+
+# --- --background / -b -------------------------------------------------------
+
+
+def _autostart_config(tmp_path):
+    from agitrack.config.settings import GlobalConfig
+
+    cfg = GlobalConfig(path=tmp_path / "global.json")
+    cfg.load_repo_overlay(tmp_path)  # repo overlay at tmp_path/.agitrack/config.json
+    return cfg
+
+
+def test_background_hook_prompt_enable_off_and_reask_when_off(tmp_path, monkeypatch, capsys):
+    # `agitrack -b` explains the auto-start hook and records the repo-scoped choice.
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+
+    def run(answer):
+        cfg = _autostart_config(tmp_path / (answer or "default"))  # a fresh repo per case
+        monkeypatch.setattr("builtins.input", lambda *a: answer)
+        cli._maybe_prompt_background_hook(cfg, scripted=False)
+        return cfg
+
+    assert run("").autotrack_hook == "auto"  # default (Enter) enables auto-start
+    assert run("y").autotrack_hook == "auto"
+    assert run("n").autotrack_hook == "off"
+    assert "--remove-hooks" in capsys.readouterr().out  # tells the user how to cancel it
+
+    # Once ENABLED for the repo, a later `-b` does not re-prompt.
+    keep = run("y")
+    monkeypatch.setattr("builtins.input", lambda *a: (_ for _ in ()).throw(AssertionError("re-prompted")))
+    cli._maybe_prompt_background_hook(keep, scripted=False)
+
+    # But when it's OFF (e.g. after `agitrack --remove-hooks`), `-b` MUST ask again so the user
+    # can turn it back on.
+    keep.set("autotrack_hook", "off", scope="repo")
+    reasked = []
+    monkeypatch.setattr("builtins.input", lambda *a: reasked.append(1) or "y")
+    cli._maybe_prompt_background_hook(keep, scripted=False)
+    assert reasked and keep.autotrack_hook == "auto"  # re-asked and re-enabled
+
+
+def test_background_hook_prompt_skipped_when_scripted(tmp_path, monkeypatch):
+    cfg = _autostart_config(tmp_path)
+    monkeypatch.setattr("builtins.input", lambda *a: (_ for _ in ()).throw(AssertionError("should not prompt")))
+    cli._maybe_prompt_background_hook(cfg, scripted=True)
+    assert cfg.source("autotrack_hook") != "repo"  # nothing recorded (default 'auto' stays implicit)
+
+
+def _stub_bg_daemon(monkeypatch):
+    """`agitrack -b` now spawns a DETACHED daemon: the launcher calls start_background_daemon
+    with the flags forwarded to the child. Capture those to assert the resolved commit mode."""
+    captured: dict = {}
+
+    def fake_start(repo, *, extra_args, **kw):
+        captured["extra_args"] = extra_args
+        return 0
+
+    monkeypatch.setattr("agitrack.proxy.background.start_background_daemon", fake_start)
+    return captured
+
+
+def test_background_flag_forces_no_worktree_and_auto_default(monkeypatch):
+    # --background always runs without a worktree and defaults to AUTO commits (like the TUI).
+    _stub_launch(monkeypatch, use_worktrees=True)
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
+    captured = _stub_bg_daemon(monkeypatch)
+    cli.main(["--background"])
+    # The launcher forwards the resolved commit mode to the detached daemon child.
+    assert "--auto-commit" in captured["extra_args"]  # auto by default
+    assert "--manual-commits" not in captured["extra_args"]
+
+
+def test_background_short_flag(monkeypatch):
+    _stub_launch(monkeypatch)
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
+    captured = _stub_bg_daemon(monkeypatch)
+    cli.main(["-b"])
+    assert "--auto-commit" in captured["extra_args"]  # auto by default
+
+
+def test_background_manual_commits_opts_into_manual(monkeypatch):
+    _stub_launch(monkeypatch)
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
+    captured = _stub_bg_daemon(monkeypatch)
+    cli.main(["-b", "-m"])
+    assert "--manual-commits" in captured["extra_args"]  # -m opts into user-triggered commits
+
+
+def test_background_stop_and_status_do_not_launch(monkeypatch):
+    # `-b stop` / `-b status` are handled early and never construct a runner.
+    calls: dict = {}
+    monkeypatch.setattr(cli, "GitRepo", type("R", (), {"discover": staticmethod(lambda p: object())}))
+
+    def _stop(repo):
+        calls["stop"] = True
+        return 0
+
+    def _status(repo):
+        calls["status"] = True
+        return 0
+
+    monkeypatch.setattr("agitrack.proxy.background.stop_background", _stop)
+    monkeypatch.setattr("agitrack.proxy.background.background_status", _status)
+
+    assert cli.main(["-b", "stop"]) == 0
+    assert cli.main(["-b", "status"]) == 0
+    assert calls == {"stop": True, "status": True}
+
+
+def test_background_off_by_default(monkeypatch):
+    # No --background ⇒ the normal proxy path runs (captures use_worktrees), background inert.
+    captured = _stub_launch(monkeypatch, use_worktrees=True)
+    cli.main([])
+    assert captured["use_worktrees"] is True
 
 
 # --- --no-sandbox / --allowed-edit-paths ------------------------------------
@@ -635,9 +802,17 @@ def test_update_check_skipped_without_a_tty(monkeypatch):
     assert ran["checked"] is False  # no way to answer a prompt without a TTY
 
 
+def test_json_flag_selects_the_json_prompt_loop(monkeypatch):
+    # --json is the documented flag for the JSON prompt-loop; it must route to AgitrackShell
+    # (json mode), exactly like the deprecated `--mode json` alias the other tests use.
+    captured = _stub_launch(monkeypatch)
+    cli.main(["--json", "--prompt", "hi"])
+    assert "json_events" in captured  # a shell-only kwarg ⇒ the json shell (not the proxy) launched
+
+
 def test_ui_bridge_flag_passed_to_shell_and_forces_json_mode(monkeypatch):
     # --ui-bridge is a json-mode transport: it must reach the shell and select json
-    # mode even without an explicit --mode json (the VSCode extension relies on this).
+    # mode even without an explicit --json (the VSCode extension relies on this).
     captured = _stub_launch(monkeypatch)
     cli.main(["--ui-bridge"])
     assert captured["ui_bridge"] is True

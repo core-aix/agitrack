@@ -503,39 +503,69 @@ def build_manual_squash_trailer(*, agitrack_session_id: str, latent_bodies: list
     """The tracking text a manual-commit-mode git hook appends to the user's own commit
     message, so the single commit carries the whole session's interaction record.
 
-    It is a *squashed* message: a leading ``commit_type: user`` metadata block (so even a
-    commit made with no pending agent turns is still attributed to the aGiTrack session),
-    followed by the full message body of each pending latent turn in **chronological
-    (oldest-first) order** — the same order a normal squash merge lists its commits, so a
-    manual-mode commit reads like any other squash. Each latent body already carries its own
-    ``# Interaction Trace`` + ``# aGiTrack Metadata``, so the concatenation has one metadata
-    block per turn — exactly the aggregate shape the dashboard already parses into one
-    constituent per turn (see ``agitrack.metrics.collect._parse_constituents``), which sums the
-    tokens and classifies the commit as agent-tracked when any turn is present. No new
-    ``commit_type`` is needed. (The dashboard *displays* the constituents newest-first, but the
-    message itself stays chronological — the reorder is display-only, in
-    ``agitrack.metrics.web``.)
+    It is a *squashed* message: a leading ``commit_type: user`` metadata block followed by the
+    full message body of each pending latent turn in **chronological (oldest-first) order** — the
+    same order a normal squash merge lists its commits, so a manual-mode commit reads like any
+    other squash. Each latent body already carries its own ``# Interaction Trace`` +
+    ``# aGiTrack Metadata``, so the concatenation has one metadata block per turn — exactly the
+    aggregate shape the dashboard already parses into one constituent per turn (see
+    ``agitrack.metrics.collect._parse_constituents``), which sums the tokens and classifies the
+    commit as agent-tracked when any turn is present. No new ``commit_type`` is needed. (The
+    dashboard *displays* the constituents newest-first, but the message itself stays chronological
+    — the reorder is display-only, in ``agitrack.metrics.web``.)
+
+    **No footprint on a non-AI commit.** When there are no pending agent turns — i.e. the commit
+    holds only the user's own hand-written code, with no AI work to track — this returns the empty
+    string, so the ``prepare-commit-msg`` hook appends nothing and the commit is left completely
+    untouched. aGiTrack never attributes (or covers) a commit that contains no AI-written code.
 
     ``latent_bodies`` are the commit-message bodies read from the latent ref
     (``refs/agitrack/manual/<id>``), the durable source of truth, so the trailer is always
-    reproducible after a restart. Returns a string ending in a single newline."""
-    blocks: list[str] = [
-        "\n".join(
-            [
-                METADATA_HEADER,
-                "commit_type: user",
-                "backend: agit",
-                f"agitrack_session_id: {agitrack_session_id}",
-                f"system: {_system_info()}",
-                f"agitrack_version: {__version__}",
-            ]
-        )
+    reproducible after a restart. Returns a string ending in a single newline, or ``""`` when
+    there are no pending turns."""
+    # Chronological (oldest-first), like any squash merge; keep only real turn bodies.
+    turn_blocks = [
+        text for text in ((body or "").strip() for body in latent_bodies) if text and METADATA_HEADER in text
     ]
-    for body in latent_bodies:  # chronological (oldest-first), like any squash merge
-        text = (body or "").strip()
-        if text and METADATA_HEADER in text:
-            blocks.append(text)
-    return "\n\n".join(blocks).rstrip() + "\n"
+    if not turn_blocks:
+        return ""  # no AI work in this commit ⇒ no trailer, no attribution, no footprint
+    header = "\n".join(
+        [
+            METADATA_HEADER,
+            "commit_type: user",
+            "backend: agit",
+            f"agitrack_session_id: {agitrack_session_id}",
+            f"system: {_system_info()}",
+            f"agitrack_version: {__version__}",
+        ]
+    )
+    return "\n\n".join([header, *turn_blocks]).rstrip() + "\n"
+
+
+def build_auto_fold_message(latent_bodies: list[str]) -> str:
+    """Commit message for an **AUTO-mode fold**: aGiTrack commits the pending agent turn(s) *itself*,
+    so the message must read like a clean AGENT commit — NOT the manual "squash into a user commit"
+    format (which leads with a generic ``<aGiTrack> commit agent turns`` subject and a spurious
+    ``commit_type: user`` block for work no user committed).
+
+    One pending turn ⇒ its own single-agent-commit body **verbatim**: the subject is the turn's
+    prompt (or, when summarization has run, the LLM summary that ``pending_bodies`` folds into the
+    body — so the subject and lead paragraph are the summary), with one ``# aGiTrack Metadata``
+    block. Several turns ⇒ a squash led by the newest turn's subject with each turn's full body,
+    still with no ``commit_type: user`` header. Returns ``""`` when there are no real turns.
+
+    ``latent_bodies`` come from ``ManualCommitTracker.pending_bodies`` (summaries already applied),
+    the durable source of truth, so the message is reproducible and carries the folded metadata the
+    ``prepare-commit-msg`` hook's idempotency check looks for."""
+    bodies = [text for text in ((body or "").strip() for body in latent_bodies) if text and METADATA_HEADER in text]
+    if not bodies:
+        return ""
+    if len(bodies) == 1:
+        return bodies[0].rstrip() + "\n"  # a clean single agent commit (summary leads when present)
+    # Several turns folded at once: lead with the newest turn's subject, then every turn's full body
+    # (oldest-first, like any squash) — each already carries its own commit_type: agent metadata.
+    newest_subject = bodies[-1].splitlines()[0].strip() or f"{AGITRACK_SUBJECT_PREFIX}agent turns"
+    return newest_subject + "\n\n" + "\n\n".join(bodies).rstrip() + "\n"
 
 
 def _subject_text(text: str, *, width: int) -> str:

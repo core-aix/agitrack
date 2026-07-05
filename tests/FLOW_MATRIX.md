@@ -48,6 +48,7 @@ Conventions:
 | Empty turn list → no commit | `test_commit_turns_returns_false_for_empty_turns` | mock |
 | Subject joins multiple prompts with `/` | `test_commit_turns_subject_joins_multiple_prompts`, `test_agent_commit_subject_joins_all_prompts_with_slash` | mock |
 | Trace records final reply only (default) / all messages (opt-in) | `test_commit_turns_records_only_final_agent_message_by_default`, `test_commit_turns_records_all_agent_messages_when_option_on` | mock |
+| **Queued follow-up messages (sent mid-turn) captured as DISTINCT `## User` headings, no duplication, tokens not doubled** | `test_claude_session.py::test_parse_rows_captures_queued_followup_messages_in_the_turn`, `_ignores_non_human_or_slash_queued_attachments`, `test_commit_engine.py::test_queued_followups_render_as_separate_user_headings_without_duplication` | mock |
 | Failed attempt does not double-count tokens | `test_agent_commit_failed_attempt_does_not_double_count_tokens` | mock |
 | Backend-made commits → cover commit (hashes preserved) | `test_clean_tree_covers_backend_commits_without_rewriting_them`, `test_cover_commit_*` | real-git |
 | Token usage / reasoning effort / compactions recorded | `test_commit_turns_records_latest_reasoning_effort`, `test_commit_turns_surfaces_compactions_and_clears_origin_event` | mock |
@@ -85,6 +86,7 @@ Conventions:
 | Esc / cancel → no commit | `test_create_user_commit_ui_cancel_returns_false` | mock |
 | Nothing staged → silent no-op | `test_create_user_commit_no_staged_silent` | mock |
 | **Commit failure (hook/config) → surfaced, no crash, changes kept** | `test_user_commit_popup_surfaces_failure_without_crashing` (mock) + `test_commit_raises_catchable_giterror_on_failing_pre_commit_hook` (**real-git**, real pre-commit hook) | mock + real-git |
+| **No AI turns → zero aGiTrack footprint** (empty trailer; hook appends nothing; commit stays plain/untracked) | `test_manual_trailer_with_no_pending_turns_is_empty_no_footprint`, `test_hook_leaves_commit_untouched_when_no_pending_turns`, `test_runner_git_commit_with_no_pending_turns_is_plain_user_commit` | real-git |
 
 ## 7. Switching sessions
 | Sequence | Test(s) | Kind |
@@ -117,6 +119,36 @@ Conventions:
 | **Background backend exits → relaunch+resume; crash-loop → drop** | `test_background_session_relaunches_on_unexpected_exit_then_stops_after_crashloop` | mock |
 | Skip background git while an active merge is in progress | `test_service_background_skips_while_active_merge_in_progress` | mock |
 
+## 9b. Headless background tracker (`-b`, issue #143)
+| Sequence | Test(s) | Kind |
+|---|---|---|
+| `-b` launcher spawns a DETACHED daemon and returns to the shell | `test_start_background_daemon_spawns_and_reports` | mock |
+| `-b` reuses a daemon already running (no duplicate) | `test_start_background_daemon_reuses_running` | mock |
+| `-b` reports failure when the daemon child dies at startup | `test_start_background_daemon_reports_failure_when_child_dies` | mock |
+| `-b stop` / `-b status` target the daemon via its handshake | `test_background_status_*`, `test_background_stop_cleans_stale_handshake`, `test_background_run_writes_and_removes_handshake` | mock |
+| `-b` refused when another instance holds the repo lock | `test_background_refused_when_another_instance_holds_the_repo` | mock |
+| Daemon / proxy write a user event log (`--log-file` / `log_file`): daemon-start, ai-change-detected, commit | `test_background_writes_event_log`, `tests/test_events.py::*` | real-git + unit |
+| `agitrack --status` / `-s` reports the running mode (background / interactive / not running; auto/manual; worktree/no-worktree) | `test_repo_status_reports_each_mode`, `test_proxy_status_write_and_clear` | real-git |
+
+## 9c. Persistent auto-track pre-commit hook (remind / auto-start on commit)
+| Sequence | Test(s) | Kind |
+|---|---|---|
+| Hook installs (frozen-aware invocation + PATH fallback baked in), chains a project hook, restores on removal | `test_autotrack_precommit_hook_install_remove_and_chain`, `test_autotrack_hook_is_frozen_aware_and_has_path_fallback` | real-git |
+| Hook is a no-op inside a linked worktree | `test_autotrack_hook_is_a_noop_inside_a_worktree` | unit |
+| `--precommit-sync` records pending AI turns + folds the trace into the triggering commit | `test_precommit_sync_folds_ai_work_into_the_commit` | real-git |
+| No AI work since last commit → no footprint (no trailer, no nag) | `test_precommit_sync_no_ai_work_is_a_noop` | real-git |
+| Defers to a live tracker (never double-tracks) | `test_precommit_sync_defers_to_a_running_tracker` | real-git |
+| Sync auto-starts the daemon in the LAST run's commit mode (persisted); `off` folds but never spawns | `test_precommit_sync_autostart_spawns_daemon`, `test_precommit_sync_off_does_not_spawn_daemon`, `test_background_mode_persist_roundtrip` | real-git |
+| `agitrack -b` explains the auto-start hook + asks enable/off (default on; shows how to remove); re-asks whenever off (incl. after `--remove-hooks`), skips once enabled | `test_background_hook_prompt_enable_off_and_reask_when_off`, `test_background_hook_prompt_skipped_when_scripted` | mock |
+| Daemon honors `autotrack_hook`: installs by default, REMOVES the hook when off | `test_daemon_installs_autotrack_hook_by_default_and_skips_when_off` | real-git |
+| AUTO fold writes a CLEAN agent commit (prompt/summary subject, one metadata block — not the squash-into-user format) | `test_background_auto_folds_pending_into_a_commit_itself`, `test_noworktree_auto_folds_latent_turn_into_commit` | real-git |
+| Daemon AUTO fold waits for the LLM summary, then uses it as the subject | `test_background_auto_fold_waits_for_summary_then_uses_it_as_subject` | real-git |
+| AUTO fold bails early (doesn't hang) when the summary worker finished without a note | `test_fold_summary_ready_bails_when_worker_finished_without_note` | real-git |
+| Global `summarization_enabled: false` wins in background mode (not shadowed by state default) | `test_global_summarization_disabled_is_not_shadowed_by_state_default` | mock |
+| `agitrack --remove-hooks` removes all aGiTrack hooks, restores chained originals | `test_remove_all_installed_hooks_removes_everything_and_restores_chains`, `_noop_when_none` | real-git |
+| `.agitrack/` git-ignored before the daemon/hook write state (no `git add -A` leak) | `test_precommit_sync_git_ignores_agitrack_dir` | real-git |
+| **Session discovery is strictly repo-scoped — no cross-repo trace/token contamination** | `test_claude_session.py::test_session_discovery_is_strictly_repo_scoped`, `test_opencode_session.py::test_session_belongs_to_repo` / `_no_matching_directory_returns_no_sessions` | real-git + mock |
+
 ## 10. Integration / merge / conflict
 | Sequence | Test(s) | Kind |
 |---|---|---|
@@ -140,6 +172,7 @@ Conventions:
 | Ctrl-C inside a popup routes through the exit flow | `test_select_popup_ctrl_c_routes_through_exit_flow` | mock |
 | Finalize commits the latest turn non-interactively | `test_finalize_pending_work_commits_non_interactively` | mock |
 | Exit asks keep-or-delete worktrees (default keep); delete only fully-merged | `test_exit_keeps_fully_merged_worktree`, `test_exit_worktree_prompt_lists_paths_and_caches_decision`, `test_finalize_worktree_on_exit_deletes_merged_when_user_chooses`, `test_finalize_worktree_on_exit_delete_choice_keeps_unintegrated` | real-git |
+| Exit/no-worktree cleanup announces "Deleting worktree…" before the (slow) removal | `test_finalize_worktree_on_exit_announces_deletion`, `test_present_pending_noworktree_cleanup_deletes_on_confirm` | real-git |
 | Persist resume pointer (last active, even if not primary / worktree kept) | `test_exit_persists_resume_pointer_*` | mock |
 | `exit`/`quit` command routes through the unified flow | `test_exit_command_routes_through_unified_exit_flow`, `_cancelled_does_not_request_exit` | mock |
 | Signal teardown (terminal closed) keeps a worktree with leftover files | `test_handle_exit_signal_*` *(posix-only: SIGHUP/SIGTERM delivery)* | mock |
@@ -161,6 +194,8 @@ Conventions:
 | Windows MSI: detect (frozen+registry) / check GitHub release / download / no-asset / api-error | `test_updater.py::test_install_method_msi_*`, `test_check_msi_*`, `test_apply_msi_*` | unit |
 | Windows MSI: manual-instructions route (releases URL + SmartScreen) | `test_updater.py::test_manual_instructions_msi_route` | unit |
 | Restart command shape (frozen exe vs `python -m agitrack`) — self-update **and** settings "restart now" | `test_updater.py::test_restart_command_*` | unit |
+| Background daemon records an available update to the shared marker (never auto-installs); clears when current | `test_daemon_update_check_writes_marker_and_clears` | real-git |
+| Update surfaced on every surface: `-b status`, commit-time (pre-commit hook), dashboard banner | `test_background_status_shows_available_update`, `test_precommit_sync_reminds_about_update_on_every_commit`, `test_update_marker.py::*` | real-git + unit |
 
 ## 14. Windows-specific (#118)
 | Sequence | Test(s) | Kind |

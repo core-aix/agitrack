@@ -416,6 +416,35 @@ def test_leftover_user_message_precedes_multi_message_agent_response(tmp_path):
     assert msg.index("starting now") < msg.index("still working") < msg.index("all done")
 
 
+def test_queued_followups_render_as_separate_user_headings_without_duplication(tmp_path):
+    # A message the user QUEUES mid-turn belongs to the turn but is a DISTINCT message: it gets its
+    # OWN ## User heading (sent after the agent already responded), not merged into the base prompt.
+    # The submit-time capture still records the base separately — it must dedup against the turn's
+    # base (not re-added), and tokens are counted once per TURN regardless of the trace text.
+    engine, repo, state = _engine(tmp_path)
+    base = "Please fix the parser and make sure the tests pass"
+    state.append_trace("user", base)  # submit-time capture of the base prompt
+    turn = _turn(base, "done", total=100, output=40)
+    turn.queued_followups = ["Also add a status command.", "Also verify the token counts are correct."]
+    engine.commit_turns(
+        turns=[turn],
+        backend="claude",
+        backend_session_id="s1",
+        model="m",
+        stage_untracked_fn=_noop_stage,
+    )
+    msg = repo.message
+    assert msg is not None
+    body = msg.split("# Interaction Trace", 1)[1]  # ignore the subject line
+    # Three DISTINCT ## User headings: the base + the two queued follow-ups. The base is NOT
+    # duplicated by the submit-time leftover.
+    assert body.count("## User") == 3
+    assert "Also add a status command." in body and "Also verify the token counts are correct." in body
+    # Tokens reflect the ONE turn, not doubled by the extra trace entries.
+    assert "tokens_since_last_commit_output: 40" in msg
+    assert "tokens_since_last_commit_output: 80" not in msg
+
+
 def test_commit_turns_stage_untracked_fn_receives_repo_and_state(tmp_path):
     engine, repo, state = _engine(tmp_path)
     calls = []
@@ -682,6 +711,77 @@ def test_start_parse_writes_result_to_owning_session(tmp_path):
     assert sid == "ses-1"
     assert exp is exported
     assert owner_state is state
+
+
+def _noworktree_session(tmp_path, state, *, export_sink):
+    session = Session.bare()
+    session.state = state
+    session.worktree = None
+
+    class Backend:
+        name = "claude"
+
+        def latest_session_id(self, repo):
+            return None  # unused in no-worktree mode
+
+        def export_session(self, repo, sid):
+            export_sink["sid"] = sid
+            return ExportedSession(sid, "m", None, [])
+
+    session.backend = Backend()
+    session.repo = types.SimpleNamespace(repo=tmp_path)
+    return session
+
+
+def test_start_parse_no_worktree_follows_switched_session(tmp_path):
+    # No-worktree mode prefers snapshot-based discovery (a session that appeared AFTER
+    # launch — a Claude /resume or a new conversation started inside the backend) over the
+    # pinned id, so all modes follow an in-backend session switch.
+    state = AgitrackState(tmp_path)
+    state.backend_session_id = "pinned"
+    seen: dict = {}
+    session = _noworktree_session(tmp_path, state, export_sink=seen)
+
+    engine = CommitEngine(None, state)
+    engine.start_parse(session=session, discover_session_id_fn=lambda: "switched", debug_fn=lambda *a, **k: None)
+    session.agent_parse_thread.join(timeout=5)
+
+    assert seen["sid"] == "switched"  # followed the switch, not the pinned id
+    assert session.agent_parse_result[0] == "switched"
+
+
+def test_start_parse_no_worktree_falls_back_to_pinned_when_no_switch(tmp_path):
+    # When discovery finds no post-launch switch (returns None) the worker keeps the pinned
+    # id — so a normal continuation is unaffected.
+    state = AgitrackState(tmp_path)
+    state.backend_session_id = "pinned"
+    seen: dict = {}
+    session = _noworktree_session(tmp_path, state, export_sink=seen)
+
+    engine = CommitEngine(None, state)
+    engine.start_parse(session=session, discover_session_id_fn=lambda: None, debug_fn=lambda *a, **k: None)
+    session.agent_parse_thread.join(timeout=5)
+
+    assert seen["sid"] == "pinned"
+
+
+def test_start_parse_reads_per_conversation_watermark(tmp_path):
+    # The parse worker reads the watermark for the conversation actually being exported —
+    # so after a switch it uses that conversation's own committed mark, not the last one.
+    state = AgitrackState(tmp_path)
+    state.backend_session_id = "A"
+    state.set_backend_message_id("A", "a-hi")  # A's committed high-water mark
+    state.data["backend_message_ids"] = {"A": "a-hi", "B": "b-hi"}  # B was tracked before
+    seen: dict = {}
+    session = _noworktree_session(tmp_path, state, export_sink=seen)
+
+    engine = CommitEngine(None, state)
+    engine.start_parse(session=session, discover_session_id_fn=lambda: "B", debug_fn=lambda *a, **k: None)
+    session.agent_parse_thread.join(timeout=5)
+
+    sid, _exp, last_id, _owner = session.agent_parse_result
+    assert sid == "B"
+    assert last_id == "b-hi"  # B's own watermark, not A's (a-hi)
 
 
 # ---------------------------------------------------------------------------

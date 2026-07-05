@@ -35,10 +35,12 @@ from agitrack.backends.proxy_agents import available_backends, make_proxy_agent
 from agitrack.commits import (
     METADATA_HEADER,
     apply_summary_to_message,
+    build_auto_fold_message,
     build_manual_squash_trailer,
     build_user_commit_message,
     summary_metadata_lines,
 )
+from agitrack.events import EventLog, resolve_log_path
 from agitrack.git import GitRepo
 from agitrack.git import hooks as git_hooks
 from agitrack.config import GlobalConfig
@@ -515,6 +517,9 @@ class ProxyRunner:
         sandbox: bool = True,
         allowed_edit_paths: list[str] | None = None,
         backend_command: list[str] | None = None,
+        # Optional path to a user-facing event log (an AI change detected, a commit made, a
+        # merge integrated, an update available). None ⇒ no event log. See agitrack.events.
+        log_file: str | None = None,
         # True when cli.py already ran the blocking startup gh-availability prompt for
         # this launch, so run() skips its own in-TUI gh notice (avoids double-nagging).
         gh_prechecked: bool = False,
@@ -572,6 +577,9 @@ class ProxyRunner:
         # empty, the per-backend config value (GlobalConfig.backend_command) applies. The
         # override wins for whatever backend is active; the config form is keyed by backend.
         self._backend_command = list(backend_command or [])
+        # User-facing event log (an AI change detected, a commit made, an update available).
+        # Keyed on the base repo root so a relative --log-file resolves the same everywhere.
+        self.events = EventLog(resolve_log_path(log_file, repo.repo))
         # cli.py already showed the blocking startup gh prompt ⇒ suppress the in-TUI notice.
         self._gh_prechecked = gh_prechecked
         self._skip_privacy_ack = skip_privacy_ack
@@ -858,6 +866,10 @@ class ProxyRunner:
         # the suite (the real __init__ is the production path).
         self._monitor_base_edits = False
         self._base_check_at = 0.0
+        # Base-repo files the agent has stranded that we've already flagged. Kept separate from
+        # the baseline so a warned file is not folded into "not stranded" — it stays counted for
+        # the exit reminder, while the warned-set stops us re-nagging about the same file.
+        self._base_warned_files: set[str] = set()
         self._cwd_drift_checked = False
         self._cwd_check_at = 0.0
         self._cwd_launch_at = 0.0  # epoch of the latest backend launch (set in _spawn)
@@ -1099,6 +1111,7 @@ class ProxyRunner:
                 "_message_scroll": 0,
                 "_message_max_scroll": 0,
                 "_message_sticky": False,
+                "events": EventLog(None),  # disabled event log by default in tests
                 "_gh_prechecked": False,
                 "_skip_privacy_ack": False,
                 "_session_notices": {},
@@ -1171,6 +1184,7 @@ class ProxyRunner:
                 # Lazily-set fields that getattr() guards in production methods:
                 "_monitor_base_edits": False,
                 "_base_check_at": 0.0,
+                "_base_warned_files": set(),
                 "_cwd_drift_checked": False,
                 "_cwd_check_at": 0.0,
                 "_cwd_launch_at": 0.0,
@@ -1279,7 +1293,7 @@ class ProxyRunner:
 
     def run(self) -> int:
         if not sys.stdin.isatty() or not sys.stdout.isatty():
-            raise RuntimeError("Proxy mode requires an interactive terminal. Use --mode json for non-TTY use.")
+            raise RuntimeError("The interactive TUI requires an interactive terminal. Use --json for non-TTY use.")
         if not self._ensure_backend_available():
             return 1
         if not self.management_lock.acquire():
@@ -1296,6 +1310,13 @@ class ProxyRunner:
             self.management_lock.release()
             return 1
         self.state.save()
+        # Record this interactive session's mode so `agitrack --status` can report it (cleared on
+        # teardown). The shared repo lock only carries a pid, not the mode.
+        from agitrack.proxy.background import write_proxy_status
+
+        write_proxy_status(
+            self.base_repo, commits="manual" if self._manual_commits else "auto", worktree=self._use_worktrees
+        )
         # Record this launch's CLI arguments so a later MSI self-update can re-launch with
         # the same flags (--repo / --backend / --no-worktree …) after replacing agitrack.exe.
         # Frozen-Windows only; a no-op everywhere else.
@@ -1378,6 +1399,15 @@ class ProxyRunner:
                 signal.signal(signal.SIGTERM, self._handle_exit_signal)
                 signal.signal(signal.SIGHUP, self._handle_exit_signal)
             self._setup_worktree_confinement_notice()
+            # Start from a clean hook slate. A PRIOR run that crashed (no teardown) can leave the
+            # OTHER mode's managed hooks in the base repo's .git/hooks — and modes can switch
+            # between runs (worktree ↔ no-worktree/manual). A stale manual fold-hook would rewrite
+            # a worktree run's commits; a stale base-commit guard would block a no-worktree run's
+            # commits. Both removals only touch aGiTrack's OWN marked hooks (restoring any chained
+            # user hook) and are no-ops when absent, so clearing then re-installing exactly what
+            # THIS mode wants makes every mode-switch safe regardless of how the last run ended.
+            self._remove_base_commit_guard()
+            self._teardown_manual_commit_mode()
             self._install_base_commit_guard()  # hard-stop agent commits to base when no OS sandbox
             self._setup_manual_commit_mode()  # --manual-commits: latent-commit hooks + trailer files
             exit_code = self._loop()  # the timers phase auto-applies a sandbox-blocked backend update
@@ -1409,6 +1439,12 @@ class ProxyRunner:
                 # is closed above), but on Windows the setter closes the ConPTY bridge socket
                 # (os.close can't close a socket fd there), so it isn't leaked.
                 self.master_fd = None
+            try:
+                from agitrack.proxy.background import clear_proxy_status
+
+                clear_proxy_status(self.base_repo)
+            except Exception:
+                pass
             self.management_lock.release()
             # The host terminal closed mid-work and the user chose "Reopen" in the
             # forced-exit dialog: launch a fresh window now that the lock is free so
@@ -1506,6 +1542,10 @@ class ProxyRunner:
             fork=fork,
             commit_guidance=self._commit_guidance,
             use_worktrees=self._use_worktrees,
+            # In worktree mode self.repo.repo is the worktree; naming the base repo lets the
+            # agent note spell out both absolute paths so the agent never mistakes the base
+            # checkout for its worktree (and strands edits that are never committed).
+            base_repo=self.base_repo.repo,
             executable=self._launch_command() or None,
         )
         # Forward any backend-specific args the user passed through aGiTrack (#32),
@@ -1606,6 +1646,7 @@ class ProxyRunner:
             return  # the sandbox enforces it; nothing to monitor
         self._monitor_base_edits = True
         self._base_check_at = 0.0
+        self._base_warned_files = set()
         try:
             self._base_status_baseline: set[str] = set(self.base_repo.status_short().splitlines())
         except Exception:
@@ -1659,12 +1700,29 @@ class ProxyRunner:
     def _manual_agit_dir(self):
         return self.base_repo.repo / ".agitrack"
 
+    @property
+    def _latent_tracking(self) -> bool:
+        """Whether this session records turns as hidden latent commits and folds them via the
+        prepare-commit-msg hook — true for ALL no-worktree sessions (manual OR auto). Worktree
+        mode commits per-branch and integrates as before (false). Derived (not stored) so it is
+        always consistent with ``_use_worktrees`` even in tests that build the runner directly."""
+        return not self._use_worktrees
+
+    @property
+    def _noworktree_auto(self) -> bool:
+        """No-worktree mode WITHOUT manual commits: aGiTrack folds the pending latent turns into a
+        commit itself, and the fold hook folds the agent's OWN commits (cover is only the backup)."""
+        return (not self._use_worktrees) and (not self._manual_commits)
+
     def _setup_manual_commit_mode(self) -> None:
         """Startup wiring for manual-commit mode: install the fold/reset hooks (unless a
         custom ``core.hooksPath`` makes that impossible — then the poll+cover fallback runs
         instead), point the latent chain at the current HEAD, and render the initial trailer
-        so even a first commit with no agent turns is attributed to the session."""
-        if not self._manual_commits:
+        so even a first commit with no agent turns is attributed to the session.
+
+        Also used by no-worktree AUTO mode (``_latent_tracking``): the same hooks fold the agent's
+        own commits, and aGiTrack folds any remaining pending turns itself (see _auto_fold_latent)."""
+        if not self._latent_tracking:
             return
         self._manual_hooks_installed = False
         try:
@@ -1676,6 +1734,28 @@ class ProxyRunner:
                 )
         except Exception as error:
             self._debug(f"manual-commit hook install failed: {error!r}")
+        # Also install the PERSISTENT auto-track pre-commit hook so a commit made LATER — after
+        # this aGiTrack exits (e.g. a reboot) — still records its AI work and folds it into that
+        # commit. It defers to a live tracker (this session), so it's a no-op while we run; it earns
+        # its keep once aGiTrack is gone. No conflict with the worktree base-commit guard (that is
+        # worktree-mode only; this path is no-worktree/_latent_tracking).
+        try:
+            if not self.base_repo.core_hooks_path():
+                if getattr(self.global_config, "autotrack_hook", "auto") == "off":
+                    git_hooks.remove_autotrack_precommit_hook(self.base_repo.hooks_dir(), debug=self._debug)
+                else:
+                    from agitrack import __version__
+                    from agitrack.proc import agitrack_invocation
+
+                    git_hooks.install_autotrack_precommit_hook(
+                        self.base_repo.hooks_dir(),
+                        invoke=agitrack_invocation(),
+                        repo_root=str(self.base_repo.repo),
+                        version=__version__,
+                        debug=self._debug,
+                    )
+        except Exception as error:
+            self._debug(f"autotrack hook install failed: {error!r}")
         # Recovery: drop a stale latent chain left by a prior run (e.g. the user committed
         # outside aGiTrack after exiting) so its turns aren't re-folded into a later commit.
         self._reset_stale_manual_ref()
@@ -1688,8 +1768,10 @@ class ProxyRunner:
         self._render_manual_trailer()
 
     def _teardown_manual_commit_mode(self) -> None:
-        if not self._manual_commits:
-            return
+        # Unconditional (NOT gated on _latent_tracking): removal must run even in worktree mode so
+        # a stale manual fold-hook left by a prior crashed no-worktree run is cleared. It only
+        # removes aGiTrack's OWN marked hooks (restoring any chained user hook) and is a no-op when
+        # none are installed, so calling it in any mode is safe.
         try:
             if self.base_repo is not None and not self.base_repo.core_hooks_path():
                 git_hooks.remove_manual_commit_hooks(self.base_repo.hooks_dir(), debug=self._debug)
@@ -1699,7 +1781,7 @@ class ProxyRunner:
     def _manual_pending_count(self) -> int:
         """How many latent turns are recorded but not yet folded into a commit (cheap: no
         message reads). Used by the exit reminder."""
-        if not self._manual_commits:
+        if not self._latent_tracking:
             return 0
         tip = self.repo.ref_sha(self._manual_ref())
         if not tip:
@@ -1744,10 +1826,10 @@ class ProxyRunner:
 
     def _render_manual_trailer(self) -> None:
         """(Re)render ``.agitrack/manual-pending-trailer`` from the durable latent ref, and
-        the ``.agitrack/manual-ref`` name file the post-commit hook reads. The trailer always
-        carries at least the ``commit_type: user`` block, so a commit with no pending turns is
-        still attributed to the session; pending turns add their full trace/metadata."""
-        if not self._manual_commits:
+        the ``.agitrack/manual-ref`` name file the post-commit hook reads. When pending turns
+        exist the trailer carries the ``commit_type: user`` block plus each turn's full
+        trace/metadata; with NO pending turns it is empty, so a purely human commit is untouched."""
+        if not self._latent_tracking:
             return
         try:
             agit_dir = self._manual_agit_dir()
@@ -1838,13 +1920,20 @@ class ProxyRunner:
         stale latent chain and re-rendering the trailer — so a commit made outside aGiTrack,
         which the fold hook already combined the pending turns into, also resets the ref.
         Without hooks (custom core.hooksPath), fall back to detecting the commit by polling
-        HEAD and adding a cover commit."""
-        if not self._manual_commits:
+        HEAD and adding a cover commit. Runs for all no-worktree modes (``_latent_tracking``):
+        in no-worktree AUTO mode this is also how the agent's own commit resets the chain after
+        the fold hook folds tracking into it."""
+        if not self._latent_tracking:
             return
         now = time.monotonic()
         if now - getattr(self, "_manual_poll_at", 0.0) < self.BASE_POLL_SECONDS:
             return
         self._manual_poll_at = now
+        # No-worktree AUTO mode: aGiTrack folds any pending turns into a commit itself (so the
+        # user doesn't have to). A clean tree means the agent already committed — the fold hook
+        # folded the tracking into that commit — so this is a no-op then.
+        if self._noworktree_auto:
+            self._auto_fold_latent_pending()
         if getattr(self, "_manual_hooks_installed", False):
             signal_file = self._manual_agit_dir() / "manual-commit-signal"
             try:
@@ -1874,7 +1963,7 @@ class ProxyRunner:
         outside the hook — add a cover commit carrying the pending tracking (its tree equals
         the new HEAD's, so it introduces no diff), then reset the latent ref. A no-op when
         the hook is installed (it already folded the tracking and reset the ref)."""
-        if not self._manual_commits or getattr(self, "_manual_hooks_installed", False):
+        if not self._latent_tracking or getattr(self, "_manual_hooks_installed", False):
             return
         try:
             head = self.repo.rev_parse("HEAD")
@@ -1903,6 +1992,43 @@ class ProxyRunner:
         except Exception as error:
             self._debug(f"manual cover reconcile failed: {error!r}")
         self._render_manual_trailer()
+
+    def _auto_fold_latent_pending(self) -> None:
+        """No-worktree AUTO mode: fold the pending latent turns into a real commit ourselves, so
+        the branch advances per turn (like normal auto mode) but the interaction trace/metadata
+        rides the SAME commit as the code — no separate cover. A clean working tree means the agent
+        (or user) already committed its work, in which case the prepare-commit-msg fold hook folded
+        the tracking into THAT commit (cover being only the backup), so there is nothing to do."""
+        if not self._noworktree_auto:
+            return
+        tip = self.repo.ref_sha(self._manual_ref())
+        if not tip:
+            return
+        try:
+            if self.repo.snapshot_worktree_tree() == self.repo.rev_parse("HEAD^{tree}"):
+                return  # clean vs HEAD ⇒ agent/user committed; the fold hook handled it
+        except Exception:
+            return
+        bodies = self._manual_pending_bodies()
+        message = build_auto_fold_message(bodies)
+        if not message:
+            return
+        try:
+            self.repo.add_tracked()
+            declined = set(self.state.declined_untracked())
+            self.repo.stage_paths([p for p in self.repo.untracked_entries() if p not in declined])
+            if not self.repo.has_staged_changes():
+                return
+            # The message already carries the folded metadata, so the prepare-commit-msg hook's
+            # idempotency check skips re-appending it; the post-commit hook resets the latent ref.
+            sha = self.repo.commit(message)
+            self._reset_stale_manual_ref()
+            self._manual_last_head = self.repo.rev_parse("HEAD")
+            self._render_manual_trailer()
+            self._last_agent_commit_id = sha
+            self._sessions_with_activity.add(self.state.session_id)
+        except Exception as error:
+            self._debug(f"auto fold failed: {error!r}")
 
     def _check_base_branch_drift(self) -> None:
         # Poll the branch checked out in the repo directory. The status bar bolds a
@@ -2227,15 +2353,19 @@ class ProxyRunner:
             current = set(self.base_repo.status_short().splitlines())
         except Exception:
             return
-        new = current - self._base_status_baseline
-        if new:
-            files = ", ".join(sorted(line[3:] for line in list(new) if len(line) > 3)[:5])
+        # Everything the agent has stranded in the base tree since startup (baseline stays
+        # pristine — only aGiTrack's own writes fold into it via _rebaseline_base_edits — so a
+        # stranded file stays counted for the exit reminder even after it's been warned once).
+        stranded = current - self._base_status_baseline
+        unwarned = stranded - self._base_warned_files
+        if unwarned:
+            files = ", ".join(sorted(line[3:] for line in list(unwarned) if len(line) > 3)[:5])
             self._set_message(
                 f"Agent edited the base repo, outside its worktree ({files}). These "
                 "changes are not tracked by aGiTrack — move them into the worktree.",
                 seconds=12.0,
             )
-            self._base_status_baseline = current  # don't repeat for the same files
+            self._base_warned_files |= stranded  # warned now; don't re-nag the same files
             self._render()
 
     def _rebaseline_base_edits(self) -> None:
@@ -2250,6 +2380,32 @@ class ProxyRunner:
             self._base_status_baseline = set(self.base_repo.status_short().splitlines())
         except Exception as error:
             self._debug(f"rebaseline base edits failed: {error!r}")
+
+    def _remind_stranded_base_edits_on_exit(self) -> None:
+        # Last line of defense on an unsandboxed host (e.g. Ubuntu with unprivileged user
+        # namespaces restricted, where bwrap can't confine): if the agent left edits in the base
+        # tree outside its worktree, aGiTrack never committed them, and on exit the worktree is
+        # about to be removed — so surface them ONE more time, non-transiently, listing the files
+        # and where they are, rather than letting the work vanish quietly. Best-effort and never
+        # blocks exit. No-op when the monitor is off (sandbox enforces confinement, or no worktree).
+        if not self._monitor_base_edits:
+            return
+        try:
+            current = set(self.base_repo.status_short().splitlines())
+        except Exception:
+            return
+        stranded = sorted(line[3:] for line in (current - self._base_status_baseline) if len(line) > 3)
+        if not stranded:
+            return
+        shown = ", ".join(stranded[:8]) + (" …" if len(stranded) > 8 else "")
+        self._debug(f"stranded base-repo edits at exit: {stranded}")
+        self._set_message(
+            f"Heads up: the agent left {len(stranded)} change(s) in the base repo, outside its "
+            f"worktree ({shown}), which aGiTrack did NOT commit. They are in {self.base_repo.repo}; "
+            "review and move or commit them so the work isn't lost.",
+            seconds=20.0,
+        )
+        self._render()
 
     @staticmethod
     def _newest_mtime(paths) -> float:
@@ -2424,6 +2580,19 @@ class ProxyRunner:
         if result is None or not result.ok:
             return
         self._update_status = result
+        # Feed the shared update marker so the dashboard banner and the pre-commit reminder
+        # reflect the same finding (best-effort; cleared when we're up to date again).
+        try:
+            from agitrack.update.marker import clear_update_marker, write_update_marker
+
+            if result.available:
+                write_update_marker(
+                    self.base_repo.repo, current=result.current, latest=result.latest, message=result.message
+                )
+            else:
+                clear_update_marker(self.base_repo.repo)
+        except Exception as error:
+            self._debug(f"update marker write failed: {error!r}")
         if result.available and not self._update_offered and not self._manual_update_pending():
             # First time we have seen this update: prompt the user (a status-bar
             # notice pointing at the `update` command, so we don't seize the
@@ -6702,6 +6871,10 @@ class ProxyRunner:
         if choice != "Delete them":
             return
         worktrees = self._worktrees()
+        # Deleting can take a while for large worktree directories, so show progress up front
+        # rather than letting the screen look frozen mid-removal.
+        self._set_message(f"Deleting {len(names)} leftover worktree director(ies)…", seconds=30)
+        self._render()
         removed = 0
         for name in names:
             try:
@@ -7002,7 +7175,7 @@ class ProxyRunner:
             notice += f"\nFull details written to: {log_path}"
         notice += (
             "\nTry `agitrack --new-session` to start a fresh conversation, "
-            "or `agitrack --mode json` to see the full backend error."
+            "or `agitrack --json` to see the full backend error."
         )
         return notice
 
@@ -8464,6 +8637,17 @@ class ProxyRunner:
                 "kind": "bool",
                 "restart": True,
             },
+            {
+                "key": "background",
+                "label": "Background mode: track a user-driven backend session with no TUI (implies no worktree; launch with -b)",
+                "kind": "bool",
+                "restart": True,
+            },
+            {
+                "key": "autotrack_hook",
+                "label": "Auto-start tracking on commit when aGiTrack isn't running (auto/off; `agitrack --remove-hooks` also turns it off)",
+                "kind": "text",
+            },
             # --- agent behavior ---
             {
                 "key": "commit_guidance",
@@ -9204,6 +9388,13 @@ class ProxyRunner:
 
         def on_commit_fn(sha, trace_text, is_cover):
             self._last_agent_commit_id = sha
+            self.events.emit(
+                "commit",
+                sha=(sha or "")[:12],
+                type="cover" if is_cover else "agent",
+                backend=self.state.backend,
+                session=self._session_label(),
+            )
             # Mark that this session saw a real turn this run (stable aGiTrack session id,
             # not the drift-prone backend id) so the exit-path auto-share knows there
             # is genuinely something new to push.
@@ -9229,6 +9420,17 @@ class ProxyRunner:
             # inside commit_turns), which is the summarizer's sole input.
             self._start_commit_summary(sha, trace_text)
 
+        # In manual-commit mode a turn may produce no net working-tree change (a
+        # planning/Q&A turn, or one whose edits the user already folded into HEAD),
+        # so it records no latent commit and on_commit_fn never fires. That is still
+        # genuine session activity worth sharing — the user conversed with the agent
+        # and tokens were spent — so mark it here at turn-detection time. Otherwise a
+        # manual session whose last turn left the tree unchanged is silently skipped
+        # by _auto_share_on_exit (which gates on _sessions_with_activity), which is
+        # why "the last manual session couldn't be shared."
+        if self._latent_tracking and turns:
+            self._sessions_with_activity.add(self.state.session_id)
+
         return CommitEngine(
             self.repo,
             self.state,
@@ -9245,11 +9447,13 @@ class ProxyRunner:
             pre_commit_fn=self._ensure_turn_branch,
             on_commit_fn=on_commit_fn,
             session_name=self.name,
-            # Manual-commit mode diverts the per-turn write to a hidden latent commit and
-            # never touches HEAD/the index; every other mode is unaffected (both None).
-            manual_gate_fn=self._manual_gate if self._manual_commits else None,
-            manual_record_fn=self._manual_record if self._manual_commits else None,
-            backend_commits=[] if self._manual_commits else self._uncovered_backend_commits(),
+            # Every no-worktree mode (manual OR auto) diverts the per-turn write to a hidden
+            # latent commit and never touches HEAD/the index; the trailer/hook fold it into the
+            # user's or agent's own commit (no-worktree auto also folds it itself, see
+            # _auto_fold_latent_pending). Worktree mode is unaffected (both None, cover applies).
+            manual_gate_fn=self._manual_gate if self._latent_tracking else None,
+            manual_record_fn=self._manual_record if self._latent_tracking else None,
+            backend_commits=[] if self._latent_tracking else self._uncovered_backend_commits(),
         )
 
     def _uncovered_backend_commits(self) -> list[str]:
@@ -9994,6 +10198,10 @@ class ProxyRunner:
         info = self.worktree
         if info is None or self._base_branch is None:
             return
+        # Before anything else, remind about any edits the agent stranded in the base repo
+        # (only possible on an unsandboxed host) — the worktree may be removed below, so this is
+        # the last chance to point the user at work aGiTrack couldn't track.
+        self._remind_stranded_base_edits_on_exit()
         # Persist the resume pointer. _persist_last_session_record runs
         # _adopt_latest_backend_session, which captures a conversation the user switched to
         # inside the backend's own picker (Claude's session view), and writes both the
@@ -10047,6 +10255,12 @@ class ProxyRunner:
         elif has_leftover_files:
             self._debug(f"keeping worktree '{info.name}' on signal exit: leftover files, no UI to copy them out")
             return
+        # Deletion can take a while for a large worktree (full copied environment,
+        # node_modules, build output, …), so announce it the moment we start rather than
+        # leaving the screen looking frozen. No-ops on a signal teardown (screen is None ⇒
+        # _render does nothing).
+        self._set_message(f"Deleting worktree '{info.name}'…", seconds=30)
+        self._render()
         self._terminate_child()
         try:
             self._worktrees().remove(info.name)
@@ -10549,14 +10763,19 @@ class ProxyRunner:
         )
 
     def _discover_spawned_session(self) -> str | None:
-        # Identify the session aGiTrack just spawned: the newest one that did not
-        # exist before launch. Falls back to the newest overall when no snapshot
-        # was taken.
-        refs = self.backend.list_sessions(self.repo.repo)
-        if not refs:
-            return None
+        # Identify the session aGiTrack spawned (or the user switched to inside the
+        # backend): the newest one that did NOT exist before launch. Returns None when no
+        # pre-spawn snapshot was taken — without one we cannot tell aGiTrack's own session
+        # apart from a pre-existing unrelated session in the same directory, so the caller
+        # must keep its pinned id rather than risk grabbing the wrong session. (Because the
+        # snapshot only ever excludes post-launch sessions, the result is always safe to
+        # prefer over the pinned id, which is what lets no-worktree mode follow an
+        # in-backend session switch.)
         snapshot = self._pre_spawn_session_ids
-        candidates = [ref for ref in refs if ref.id not in snapshot] if snapshot is not None else refs
+        if snapshot is None:
+            return None
+        refs = self.backend.list_sessions(self.repo.repo)
+        candidates = [ref for ref in refs if ref.id not in snapshot]
         if not candidates:
             return None
         return max(candidates, key=lambda ref: ref.updated).id
@@ -11277,6 +11496,11 @@ class ProxyRunner:
         if now - self._idle_integrate_at < self.BASE_POLL_SECONDS:
             return
         self._idle_integrate_at = now
+        if self._latent_tracking:
+            # No-worktree modes fold the agent's own commits via the prepare-commit-msg hook
+            # (and _reconcile_manual_external_commit is the cover backup when the hook can't run),
+            # so the #35 cover pass below is superseded — see _service_manual_commit_mode.
+            return
         if not self._use_worktrees:
             # No-worktree: the agent's own commits live on the current branch (there is no
             # separate base to integrate into). Cover them with aGiTrack metadata — the same

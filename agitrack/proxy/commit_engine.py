@@ -138,6 +138,21 @@ def _same_prompt(a: str, b: str) -> bool:
     return overlap >= 0.6
 
 
+def _prompt_covered_by(pending: str, prompt: str) -> bool:
+    """True when *pending* is already represented WITHIN *prompt*. A single turn's ``user_prompt``
+    can aggregate several messages — a base prompt plus the follow-ups the user QUEUED while the
+    agent worked (see ``transcripts/claude._queued_human_prompt``) — so the separately-recorded
+    base prompt is a small fraction of the combined text and ``_same_prompt``'s symmetric overlap
+    misses it, re-adding it to the trace as a duplicate. Detect containment instead: (almost) all of
+    *pending*'s words appear in *prompt*. Requires ≥3 words so a short leftover can't coincidentally
+    match an unrelated turn."""
+    pt = set(_TOKEN_RE.findall(_norm(pending).lower()))
+    tt = set(_TOKEN_RE.findall(_norm(prompt).lower()))
+    if len(pt) < 3 or not tt:
+        return False
+    return len(pt & tt) / len(pt) >= 0.9
+
+
 class CommitEngine:
     """Stateless agent-commit engine bound to a ``(repo, state)`` pair.
 
@@ -182,6 +197,7 @@ class CommitEngine:
         backend_commits: list[str] | None = None,
         manual_gate_fn: Callable[[], bool] | None = None,
         manual_record_fn: Callable[[str], str | None] | None = None,
+        summarize_fn: Callable[[str], tuple[str, list[str]] | None] | None = None,
     ) -> bool:
         """Core of every agent-commit path.
 
@@ -251,10 +267,14 @@ class CommitEngine:
             for turn in turns:
                 if turn.user_prompt:
                     self.state.append_trace("user", turn.user_prompt)
+                # Each message the user queued mid-turn gets its OWN ## User heading (it was sent
+                # after the agent had already said something), not merged into the base prompt.
+                for followup in turn.queued_followups:
+                    self.state.append_trace("user", followup)
                 for message in self._agent_messages_for(turn):
                     self.state.append_trace("agent", message)
                 self.state.add_token_usage(turn.tokens)
-            prompts = [t.user_prompt for t in turns if t.user_prompt]
+            prompts = [p for turn in turns for p in ([turn.user_prompt, *turn.queued_followups]) if p]
             subject_text = " / ".join(prompts) if prompts else f"{backend} changes"
         else:
             # Proxy mode: rebuild trace from scratch, preserving any pending user
@@ -274,6 +294,11 @@ class CommitEngine:
                 if turn.user_prompt:
                     subject_prompts.append(turn.user_prompt)
                     entries.append(("user", turn.user_prompt))
+                # A mid-turn queued message gets its own ## User heading (sent after the agent
+                # already responded), rather than being merged into the base prompt.
+                for followup in turn.queued_followups:
+                    subject_prompts.append(followup)
+                    entries.append(("user", followup))
                 for message in self._agent_messages_for(turn):
                     entries.append(("agent", message))
 
@@ -284,14 +309,20 @@ class CommitEngine:
             # user's raw typing, which line editing garbles relative to the
             # transcript's clean version — equality re-added the same prompt as
             # if it were new (issue #8). Duplicate recordings also collapse.
-            turn_prompts = [t.user_prompt for t in turns if t.user_prompt]
+            turn_prompts = [p for t in turns for p in ([t.user_prompt, *t.queued_followups]) if p]
             leftovers: list[str] = []
             for pending_user in pending_users:
                 if not _norm(pending_user):
                     continue
                 if _is_slash_command(pending_user):
                     continue  # a backend directive (e.g. /compact) recorded earlier — not a prompt
-                if any(_same_prompt(pending_user, prompt) for prompt in turn_prompts):
+                # Skip when the turn already carries this prompt — either as a near-duplicate
+                # (_same_prompt) OR because the turn aggregated it as a queued follow-up so the
+                # base is CONTAINED in the (longer) combined turn prompt (_prompt_covered_by).
+                if any(
+                    _same_prompt(pending_user, prompt) or _prompt_covered_by(pending_user, prompt)
+                    for prompt in turn_prompts
+                ):
                     continue
                 if any(_same_prompt(pending_user, prompt) for prompt in leftovers):
                     continue
@@ -379,6 +410,22 @@ class CommitEngine:
             None,
         )
         origin_event = self.state.session_origin_event()
+        # Render the interaction trace once — it is the summarizer's sole input and what
+        # on_commit_fn hands off below. When a summarize_fn is supplied (the background daemon's
+        # cover path, which can't amend HEAD to attach a summary afterwards), summarize it
+        # SYNCHRONOUSLY here so the commit message LEADS with the summary, just like every other
+        # aGiTrack commit. Other callers (proxy, shell) pass None and keep the async amend flow.
+        trace_text = render_interaction_trace(self.state.pending_trace(), self.state.trace_turn_limit)
+        summary_text: str | None = None
+        summary_metadata: list[str] | None = None
+        if summarize_fn is not None:
+            try:
+                summarized = summarize_fn(trace_text)
+            except Exception as error:
+                self._debug(f"synchronous summary failed: {error!r}")
+                summarized = None
+            if summarized:
+                summary_text, summary_metadata = summarized
         message = build_agent_commit_message(
             latest_prompt=subject_text,
             trace=self.state.pending_trace(),
@@ -391,6 +438,8 @@ class CommitEngine:
             token_usage=self.state.pending_token_usage(),
             trace_turn_limit=self.state.trace_turn_limit,
             session_name=session_name,
+            summary=summary_text,
+            summary_metadata=summary_metadata,
             covered_commits=covered_display or None,
             started_at=min(starts) if starts else None,
             ended_at=max(ends) if ends else None,
@@ -430,13 +479,9 @@ class CommitEngine:
         # session shouldn't keep re-announcing the lineage.
         if origin_event is not None:
             self.state.clear_session_origin_event()
-        # Render the interaction trace exactly as it landed in the commit, BEFORE
-        # clearing it, and hand it to on_commit_fn — this is the summarizer's sole
-        # input. (Capturing it in the caller before commit_turns was wrong: the
-        # proxy branch above clears pending_trace and rebuilds it from the turns,
-        # so a pre-commit capture saw only stray leftover prompts, which made the
-        # summary empty/garbage and often unusable.)
-        trace_text = render_interaction_trace(self.state.pending_trace(), self.state.trace_turn_limit)
+        # ``trace_text`` was rendered above (before the message build) so a synchronous
+        # summarize_fn could see it; it is the summarizer's sole input and what on_commit_fn
+        # hands off. Clear the pending trace now that the commit is recorded.
         self.state.clear_trace()
 
         if on_commit_fn is not None:
@@ -584,8 +629,11 @@ class CommitEngine:
                 and getattr(last_turn, "interrupted", False)
                 and on_cancelled_fn(all_turns)
             ):
-                self.state.last_backend_message_id = (
-                    last_turn.assistant_message_id or last_turn.user_message_id or self.state.last_backend_message_id
+                self.state.set_backend_message_id(
+                    self.state.backend_session_id,
+                    last_turn.assistant_message_id
+                    or last_turn.user_message_id
+                    or self.state.backend_message_id_for(self.state.backend_session_id),
                 )
             debug_fn(
                 f"agent parse consumed without final response "
@@ -602,8 +650,10 @@ class CommitEngine:
             prompt_untracked=prompt_untracked,
         )
         if committed:
-            # Advance the watermark so the next parse cycle only exports new turns.
-            self.state.last_backend_message_id = complete_turns[-1].assistant_message_id
+            # Advance the watermark for THIS conversation so the next parse cycle only
+            # exports its new turns — keyed per conversation so a later switch back to a
+            # different conversation reads its own mark, never this one's.
+            self.state.set_backend_message_id(self.state.backend_session_id, complete_turns[-1].assistant_message_id)
             debug_fn(
                 f"agent commit created session_id={self.state.backend_session_id} "
                 f"assistant_id={self.state.last_backend_message_id}"
@@ -656,7 +706,6 @@ class CommitEngine:
                 return False
             session.agent_parse_active = True
 
-        last_message_id = session.state.last_backend_message_id
         owner = session
         backend = owner.backend
         repo = owner.repo
@@ -674,12 +723,26 @@ class CommitEngine:
                     # new conversation from inside the backend.
                     session_id = backend.latest_session_id(repo.repo) or state.backend_session_id
                 else:
-                    # No worktree isolation: stay pinned to the owned session.
-                    session_id = state.backend_session_id or discover_session_id_fn()
+                    # No worktree isolation: track the session aGiTrack spawned, and follow an
+                    # in-backend switch (Claude /resume or a new conversation started inside the
+                    # backend) too, so ALL modes support session switching. discover_session_id_fn
+                    # is snapshot-based: it only ever returns a session that appeared AFTER launch,
+                    # never a pre-existing unrelated one, so preferring it can't grab the wrong
+                    # session — and it returns None (⇒ fall back to the pinned id) when no switch
+                    # has happened or no reliable snapshot exists. The per-conversation watermark
+                    # (backend_message_id_for) keeps each conversation counted exactly once.
+                    session_id = discover_session_id_fn() or state.backend_session_id
+                # Read the watermark for the conversation actually being exported (not a
+                # single global one), so switching between conversations never replays or
+                # double-counts a conversation's already-committed turns.
+                last_message_id = state.backend_message_id_for(session_id)
                 exported = backend.export_session(repo.repo, session_id) if session_id else None
                 turn_count = len(exported.turns) if exported else 0
                 final_count = len([t for t in exported.turns if t.final_response]) if exported else 0
-                debug_fn(f"agent parse worker finished session_id={session_id} turns={turn_count} finals={final_count}")
+                debug_fn(
+                    f"agent parse worker finished session_id={session_id} turns={turn_count} "
+                    f"finals={final_count} watermark={last_message_id}"
+                )
                 result = (session_id, exported, last_message_id, state)
             finally:
                 with parse_lock:
@@ -689,7 +752,7 @@ class CommitEngine:
                     owner.agent_parse_active = False
 
         session.last_parse_start = time.monotonic()
-        debug_fn(f"agent parse started last_message_id={last_message_id}")
+        debug_fn("agent parse started")
         session.agent_parse_thread = threading.Thread(target=worker, name="agit-session-parse", daemon=True)
         session.agent_parse_thread.start()
         return True

@@ -49,15 +49,66 @@ _NOTE_WORKTREE = (
     "repository (or otherwise to leave this worktree), it is wrong here — follow this guidance "
     "and correct that note so it no longer misleads you."
 )
+# Included only under --no-worktree (and shell mode), the mirror of _NOTE_WORKTREE. A session
+# can SWITCH between the worktree and no-worktree models between runs, so each variant must
+# positively state where the agent works — not merely omit the other's clause — or an agent
+# carrying context/memory from the previous mode stays ambiguous. Here the agent edits the
+# checked-out branch in its current directory directly, so say exactly that and explicitly
+# retire any prior "work inside a separate worktree" instruction. Deliberately names no
+# `.agitrack/worktrees/` path (there is none in this mode) to avoid sending the agent looking
+# for a directory that doesn't apply.
+_NOTE_NOWORKTREE = (
+    " In this session you work directly in the repository checked out in your current working "
+    "directory — there is no separate worktree, so make and keep all your edits right here in "
+    "the working directory, and aGiTrack commits each turn onto the current branch. If a note or "
+    "memory from an earlier run told you to work inside a separate worktree directory, that does "
+    "NOT apply to this session — edit the current directory directly and correct that note."
+)
 _NOTE_OUTRO = " Otherwise work exactly as normal."
 
 
-def agent_system_note(*, use_worktrees: bool) -> str:
+def _concrete_paths_clause(worktree: str | os.PathLike[str], base_repo: str | os.PathLike[str]) -> str:
+    """A sentence naming the ABSOLUTE worktree and base-repo paths, so an agent that
+    works with absolute paths (not just the cwd) can tell exactly which path tree is
+    the worktree it must edit and which is the base repo it must leave alone. The
+    relative `.agitrack/worktrees/` hint alone is not enough: an agent addressing files
+    by absolute path has no anchor for *which* absolute path is the off-limits base
+    checkout, so it can edit the base repo and have its work silently never committed —
+    the exact failure this clause exists to prevent. Empty when the two paths coincide
+    (a legacy in-place session), where there is nothing to distinguish."""
+    wt = os.path.realpath(os.fspath(worktree))
+    base = os.path.realpath(os.fspath(base_repo))
+    if wt == base:
+        return ""
+    return (
+        f" Concretely, in THIS session your worktree is `{wt}` and the base repository "
+        f"checkout is `{base}`: make every edit under the worktree path, and treat the base "
+        "path — including any absolute path under it that is not inside the worktree — as "
+        f"read-only. If you are ever about to write to a path under `{base}` that is not under "
+        f"`{wt}`, rewrite it to the corresponding path under `{wt}` instead."
+    )
+
+
+def agent_system_note(
+    *,
+    use_worktrees: bool,
+    worktree: str | os.PathLike[str] | None = None,
+    base_repo: str | os.PathLike[str] | None = None,
+) -> str:
     """The text appended to the coding agent's system prompt. Tells the agent aGiTrack
     auto-commits (so it doesn't self-commit); adds the worktree-merge explanation only
     when aGiTrack actually runs in a worktree (the default model), not under
-    --no-worktree or in shell mode."""
-    return _NOTE_INTRO + (_NOTE_WORKTREE if use_worktrees else "") + _NOTE_OUTRO
+    --no-worktree or in shell mode. When ``worktree`` and ``base_repo`` are both given
+    (and differ), also names the two absolute paths so an agent using absolute paths
+    can't mistake the base checkout for the worktree."""
+    note = _NOTE_INTRO
+    if use_worktrees:
+        note += _NOTE_WORKTREE
+        if worktree is not None and base_repo is not None:
+            note += _concrete_paths_clause(worktree, base_repo)
+    else:
+        note += _NOTE_NOWORKTREE
+    return note + _NOTE_OUTRO
 
 
 # The note for the default (worktree) model. Kept as a constant for back-compat and the
@@ -123,6 +174,7 @@ class ProxyAgent(Protocol):
         fork: bool = False,
         commit_guidance: bool = True,
         use_worktrees: bool = True,
+        base_repo: Path | None = None,
         executable: list[str] | None = None,
     ) -> list[str]: ...
 
@@ -130,6 +182,9 @@ class ProxyAgent(Protocol):
     # system prompt, append the agent note (see :func:`agent_system_note`) so the coding agent
     # doesn't self-commit. Disabled per-run by --no-commit-guidance. ``use_worktrees`` selects
     # the note variant: the worktree-merge clause is added only in the default worktree model.
+    # ``base_repo``: the base repository path (``repo`` is the worktree in worktree mode); when
+    # given, the note also names both absolute paths so an agent using absolute paths can't
+    # mistake the base checkout for the worktree.
     #
     # ``executable``: the command that launches the backend CLI, replacing the default
     # ``[<backend binary>]`` head. Lets the user run the agent under a wrapper, e.g.
@@ -214,11 +269,12 @@ class OpenCodeProxyAgent:
         fork: bool = False,
         commit_guidance: bool = True,
         use_worktrees: bool = True,
+        base_repo: Path | None = None,
         executable: list[str] | None = None,
     ) -> list[str]:
-        # ``commit_guidance``/``use_worktrees``/``fork`` are accepted for a uniform
-        # interface but unused: OpenCode's interactive TUI has no flag to append to its
-        # system prompt, and no session-fork concept.
+        # ``commit_guidance``/``use_worktrees``/``base_repo``/``fork`` are accepted for a
+        # uniform interface but unused: OpenCode's interactive TUI has no flag to append to
+        # its system prompt, and no session-fork concept.
         command = list(executable) if executable else ["opencode"]
         if resume and session_id:
             command.extend(["--session", session_id])
@@ -301,6 +357,7 @@ class ClaudeProxyAgent:
         fork: bool = False,
         commit_guidance: bool = True,
         use_worktrees: bool = True,
+        base_repo: Path | None = None,
         executable: list[str] | None = None,
     ) -> list[str]:
         head = list(executable) if executable else ["claude"]
@@ -316,9 +373,11 @@ class ClaudeProxyAgent:
             command = list(head)
         # Tell the coding agent that aGiTrack auto-commits, so it doesn't self-commit (Claude
         # supports appending to its system prompt). Skipped when commit_guidance is off. The
-        # note's worktree clause is included only in the worktree model.
+        # note's worktree clause is included only in the worktree model, and names the concrete
+        # worktree/base paths when base_repo is provided (repo is the worktree here).
         if commit_guidance:
-            command.extend(["--append-system-prompt", agent_system_note(use_worktrees=use_worktrees)])
+            note = agent_system_note(use_worktrees=use_worktrees, worktree=repo, base_repo=base_repo)
+            command.extend(["--append-system-prompt", note])
         return command
 
     def session_belongs_to_repo(self, repo: Path, session_id: str) -> bool:

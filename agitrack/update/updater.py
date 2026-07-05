@@ -39,7 +39,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn, cast
 
-from agitrack.proc import detach_kwargs
+from agitrack.proc import console_isolation_kwargs, detach_kwargs
 
 import agitrack
 
@@ -141,6 +141,10 @@ def _git(args: list[str], cwd: Path, *, timeout: int | None = None) -> subproces
             check=False,
             timeout=timeout,
             env=env,
+            # The background daemon's periodic update check (git fetch + rev-parse) runs from a
+            # console-less detached process; without this each git call flashes a console window
+            # on Windows (proc.py).
+            **console_isolation_kwargs(),
         )
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(["git", *args], returncode=124, stdout="", stderr="timed out")
@@ -396,6 +400,9 @@ class Updater:
                 stderr=subprocess.PIPE,
                 check=False,
                 timeout=timeout,
+                # Keep pip off a console on Windows (the background daemon's update check runs
+                # console-less; without this it flashes a window each check). See proc.py.
+                **console_isolation_kwargs(),
             )
         except subprocess.TimeoutExpired:
             return None

@@ -12,6 +12,7 @@ import shutil
 import subprocess
 
 from agitrack.git import GitRepo
+from agitrack.proc import console_isolation_kwargs
 
 _TIMEOUT_SECONDS = 20.0
 _SLUG_RE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -33,6 +34,7 @@ def _gh_login() -> str | None:
             capture_output=True,
             text=True,
             timeout=_TIMEOUT_SECONDS,
+            **console_isolation_kwargs(),  # keep gh off a console on Windows (proc.py)
         )
     except (OSError, subprocess.SubprocessError):
         return None

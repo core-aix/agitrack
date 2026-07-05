@@ -7,7 +7,11 @@ from pathlib import Path
 from typing import IO
 
 from agitrack.backends.base import AgentResult, TokenUsage
-from agitrack.proc import _IS_WINDOWS, resolve_subprocess_command  # _IS_WINDOWS: see proc.py
+from agitrack.proc import (  # _IS_WINDOWS: see proc.py
+    _IS_WINDOWS,
+    console_isolation_kwargs,
+    resolve_subprocess_command,
+)
 
 # The summarizer is a mechanical text-reduction task that gains nothing from reasoning, so
 # its bare run asks OpenCode for the lowest reasoning effort. OpenCode has no env-var/flag
@@ -100,6 +104,10 @@ class OpenCodeBackend:
             stdin=subprocess.PIPE if to_stdin else None,
             stderr=subprocess.STDOUT,
             stdout=subprocess.PIPE,
+            # Keep the opencode CLI off a console on Windows: the background daemon runs the
+            # summarizer console-less, so without this each bare summary call flashes a console
+            # window. detach_stdin=False because stdin is managed above. See proc.py.
+            **console_isolation_kwargs(detach_stdin=False),
         )
         if to_stdin and process.stdin is not None:
             # Write on a daemon thread so a large message can't deadlock against the stdout

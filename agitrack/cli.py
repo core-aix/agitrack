@@ -11,6 +11,7 @@ from pathlib import Path
 from agitrack.backends.setup import select_default_backend, select_default_summarizer_model
 from agitrack.backends.proxy_agents import available_backends
 from agitrack.git import GitError, GitRepo, RepoLock, already_running_message
+from agitrack.proc import console_isolation_kwargs
 from agitrack.config import GlobalConfig, settings
 from agitrack.shell import AgitrackShell
 
@@ -19,9 +20,10 @@ try:
     # the launch path reference ``cli.ProxyRunner`` directly, but tolerant of a platform
     # where the proxy's platform layer can't load yet — the headless paths (json mode,
     # dashboard, --version) don't need it, and proxy mode reports it cleanly below.
-    from agitrack.proxy import ProxyRunner
+    from agitrack.proxy import BackgroundRunner, ProxyRunner
 except ImportError:  # pragma: no cover - only when the proxy platform layer is unavailable
     ProxyRunner = None  # type: ignore[assignment,misc]
+    BackgroundRunner = None  # type: ignore[assignment,misc]
 
 _BACKEND_COMMANDS = {
     "claude": "claude",
@@ -102,7 +104,11 @@ def _git_config_global(config_args: list[str]) -> str:
     """Run ``git config --global`` and return its stdout (empty on any failure)."""
     try:
         result = subprocess.run(
-            ["git", "config", "--global", *config_args], text=True, capture_output=True, check=False
+            ["git", "config", "--global", *config_args],
+            text=True,
+            capture_output=True,
+            check=False,
+            **console_isolation_kwargs(),  # keep git off a console on Windows (proc.py)
         )
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -143,21 +149,40 @@ def main(argv: list[str] | None = None) -> int:
         help="show this help message and exit",
     )
     parser.add_argument(
-        "--version",
-        action="store_true",
-        help="print the aGiTrack version and exit",
+        "-b",
+        "--background",
+        dest="background",
+        nargs="?",
+        const="run",
+        choices=["run", "stop", "status"],
+        default=None,
+        help="background (headless) mode: run WITHOUT the interactive TUI, so you drive the "
+        "coding agent from any UI you like (its native CLI, an IDE extension, …) while aGiTrack "
+        "watches the local session transcript and performs all the tracking the TUI would — "
+        "recording each turn, summarizing, and installing the commit hooks that fold the "
+        "interaction trace and token metadata into your commits. ALWAYS runs without a worktree "
+        "(implies --no-worktree). Uses AUTO commits by default (like interactive mode); add "
+        "--manual-commits / -m for user-triggered commits. Bare `-b` (no argument) means `-b run`; "
+        "`-b stop` / `-b status` stop or report the background tracker running on this repo. "
+        "Also settable via 'background' in config.",
     )
-    parser.add_argument("--repo", default=".", help="target Git repository path")
-    parser.add_argument("--verbose", action="store_true", help="show aGiTrack diagnostic messages")
-    parser.add_argument("--mode", choices=["proxy", "json"], default="proxy", help="interactive mode")
     parser.add_argument(
-        "--prompt",
-        action="append",
-        dest="prompts",
-        metavar="TEXT",
-        help="run this prompt non-interactively (implies --mode json) and exit; "
-        "repeatable, prompts run in order. Lines starting with ':' are aGiTrack "
-        "commands, e.g. --prompt ':status'",
+        "--no-worktree",
+        action="store_true",
+        help="run the agent against the current branch instead of an isolated worktree "
+        "(edits are visible live; no isolation/integration; unsafe with concurrent sessions). "
+        "Background (-b) and manual-commit (-m) modes always imply this.",
+    )
+    parser.add_argument(
+        "-m",
+        "--manual-commits",
+        dest="manual_commits",
+        action="store_true",
+        help="user-triggered commits. ALWAYS runs without a worktree (implies --no-worktree): the "
+        "agent edits the current branch directly and each turn is recorded as a hidden 'latent' "
+        "commit on a side ref instead of landing on the branch. When you commit (via the aGiTrack "
+        "menu or an external `git commit`), the pending agent turns are folded into that one "
+        "commit. Also settable via 'manual_commits' in config.",
     )
     parser.add_argument(
         "-d",
@@ -168,12 +193,21 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="show repository metrics computed from aGiTrack commit metadata "
         "(coverage, AI / human / non-tracked line changes, tokens, per-backend/"
-        "model/committer breakdowns, loop detection). Bare or `html` starts a "
-        "filterable, auto-refreshing dashboard as a background daemon on localhost, "
+        "model/committer breakdowns, loop detection). Bare `-d` (no argument) means `-d html`: "
+        "it starts a filterable, auto-refreshing dashboard as a background daemon on localhost, "
         "opens it in the browser, and returns to the shell; the daemon stops when "
         "this terminal closes or via `-d stop`. `status` reports it; `text` prints a "
         "one-shot report and exits",
     )
+    parser.add_argument(
+        "-s",
+        "--status",
+        action="store_true",
+        help="report whether aGiTrack is running for this repo and in which mode (interactive vs "
+        "background, auto vs manual commit, worktree vs no-worktree), then exit.",
+    )
+    # --- options without a short form, in rough order of how often they matter ---
+    parser.add_argument("--repo", default=".", help="target Git repository path")
     parser.add_argument(
         "--backend",
         choices=available_backends(),
@@ -186,10 +220,19 @@ def main(argv: list[str] | None = None) -> int:
         help="start a fresh backend conversation instead of resuming the last one",
     )
     parser.add_argument(
-        "--no-worktree",
+        "--auto-commit",
+        dest="auto_commit",
         action="store_true",
-        help="run the agent against the current branch instead of an isolated worktree "
-        "(edits are visible live; no isolation/integration; unsafe with concurrent sessions)",
+        help="force automatic (aGiTrack-triggered) commits — the default in background mode, so "
+        "this only matters to override a configured 'manual_commits': true. aGiTrack commits each "
+        "agent turn itself and folds tracking into the agent's own commits via a prepare-commit-msg hook.",
+    )
+    parser.add_argument(
+        "--delay-merge",
+        action="store_true",
+        help="don't merge a turn's committed changes into the base branch automatically; "
+        "instead leave them in the session's working directory for you to review/edit, then "
+        "merge on your confirmation via the session menu. Off by default.",
     )
     parser.add_argument(
         "--no-commit-guidance",
@@ -199,15 +242,21 @@ def main(argv: list[str] | None = None) -> int:
         "agent does not create its own git commits unless you explicitly ask",
     )
     parser.add_argument(
-        "--manual-commits",
-        "-m",
-        dest="manual_commits",
+        "--full-agent-messages",
         action="store_true",
-        help="user-triggered commits. ALWAYS runs without a worktree (implies --no-worktree): the "
-        "agent edits the current branch directly and each turn is recorded as a hidden 'latent' "
-        "commit on a side ref instead of landing on the branch. When you commit (via the aGiTrack "
-        "menu or an external `git commit`), the pending agent turns are folded into that one "
-        "commit. Also settable via 'manual_commits' in config.",
+        help="record every user-facing message the agent sends during a turn in the "
+        "commit's interaction trace, not just the final reply (tool calls and file edits "
+        "are still excluded); also settable per-repo via full_agent_messages in config",
+    )
+    parser.add_argument(
+        "--log-file",
+        dest="log_file",
+        default=None,
+        metavar="PATH",
+        help="append notable aGiTrack events (an AI change detected, a commit made, a merge "
+        "integrated, an update available) to PATH — a plain-text log you can `tail -f`. Works in "
+        "every mode, with or without -b. A relative path is resolved against the repo root. Also "
+        "settable via 'log_file' in config.",
     )
     parser.add_argument(
         "--no-confine",
@@ -240,32 +289,12 @@ def main(argv: list[str] | None = None) -> int:
         "keyed by backend name).",
     )
     parser.add_argument(
-        "--delay-merge",
+        "--remove-hooks",
         action="store_true",
-        help="don't merge a turn's committed changes into the base branch automatically; "
-        "instead leave them in the session's working directory for you to review/edit, then "
-        "merge on your confirmation via the session menu. Off by default.",
-    )
-    parser.add_argument(
-        "--json-events",
-        action="store_true",
-        help="in --mode json, emit one machine-readable JSON line per turn event "
-        "(the agent's response, the commit produced, errors) — used by the VSCode "
-        "chat extension and other programmatic drivers",
-    )
-    parser.add_argument(
-        "--ui-bridge",
-        action="store_true",
-        help="in --mode json, run a long-lived JSON-RPC session over stdin/stdout where "
-        "interactive questions (menus, confirmations, text input) are asked of the driver "
-        "instead of a terminal — used by the VSCode extension (see editors/vscode)",
-    )
-    parser.add_argument(
-        "--full-agent-messages",
-        action="store_true",
-        help="record every user-facing message the agent sends during a turn in the "
-        "commit's interaction trace, not just the final reply (tool calls and file edits "
-        "are still excluded); also settable per-repo via full_agent_messages in config",
+        help="remove all aGiTrack-installed git hooks from the repo — the persistent auto-track "
+        "pre-commit hook and the manual-commit prepare-commit-msg/post-commit fold hooks (and the "
+        "worktree base-commit guard), restoring any hooks they chained. Use this to fully opt out "
+        "of aGiTrack's commit-time tracking.",
     )
     parser.add_argument(
         "--recover",
@@ -275,6 +304,54 @@ def main(argv: list[str] | None = None) -> int:
         "uncommitted changes and merge it into the base branch (skipping the merge on a "
         "conflict). Runs headlessly and no-ops if a live aGiTrack holds the repo lock. Used "
         "by the VSCode extension on close; also runnable manually.",
+    )
+    parser.add_argument("--verbose", action="store_true", help="show aGiTrack diagnostic messages")
+    parser.add_argument(
+        "--version",
+        action="store_true",
+        help="print the aGiTrack version and exit",
+    )
+    # --- testing / programmatic-driver options (real interactive use never needs these) ---
+    parser.add_argument(
+        "--json",
+        dest="json_mode",
+        action="store_true",
+        help="use the JSON prompt-loop instead of the interactive TUI: aGiTrack sends each typed "
+        "line (or --prompt) to the backend non-interactively and captures the reply as a commit. "
+        "Mainly for testing and programmatic drivers — normal interactive use does not need it.",
+    )
+    parser.add_argument(
+        "--prompt",
+        action="append",
+        dest="prompts",
+        metavar="TEXT",
+        help="run this prompt non-interactively (implies --json) and exit; "
+        "repeatable, prompts run in order. Lines starting with ':' are aGiTrack "
+        "commands, e.g. --prompt ':status'",
+    )
+    parser.add_argument(
+        "--json-events",
+        action="store_true",
+        help="with --json, emit one machine-readable JSON line per turn event "
+        "(the agent's response, the commit produced, errors) — used by the VSCode "
+        "chat extension and other programmatic drivers",
+    )
+    parser.add_argument(
+        "--ui-bridge",
+        action="store_true",
+        help="with --json, run a long-lived JSON-RPC session over stdin/stdout where "
+        "interactive questions (menus, confirmations, text input) are asked of the driver "
+        "instead of a terminal — used by the VSCode extension (see editors/vscode)",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["proxy", "json"],
+        default="proxy",
+        # Deprecated: `--mode` conflated too many things (interactive/background,
+        # auto/manual, worktree/no-worktree are separate flags now). Kept as a hidden,
+        # still-working alias for `--json` so existing scripts don't break: `--mode json`
+        # == `--json`. New usage should prefer `--json`.
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--skip-privacy-ack",
@@ -301,6 +378,25 @@ def main(argv: list[str] | None = None) -> int:
         # `agitrack -d`, the TUI for the Ctrl-G dashboard). The child shuts itself down
         # when that pid dies, so the dashboard never outlives whatever launched it —
         # even on SIGKILL, which leaves no chance to stop us first.
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--precommit-sync",
+        action="store_true",
+        # Internal: entry point of the persistent auto-track pre-commit hook. Records any pending
+        # AI turns and renders the fold trailer so the commit being made carries the trace, and
+        # (unless autotrack_hook=off) auto-starts the background daemon. Best-effort, never fails
+        # a commit. Not meant for manual use.
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--background-serve",
+        action="store_true",
+        # Internal: run the headless background tracker loop in the foreground (this
+        # process). `agitrack -b` spawns aGiTrack with this flag as a detached daemon so the
+        # launching terminal is freed. Unlike the dashboard daemon it has NO owner-pid
+        # watchdog — a tracker must outlive the terminal that started it (stop it with
+        # `agitrack -b stop`). Not meant for manual use.
         help=argparse.SUPPRESS,
     )
     parser.epilog = (
@@ -394,6 +490,68 @@ def main(argv: list[str] | None = None) -> int:
 
         return start_dashboard_daemon(dashboard_repo, owner_pid=os.getppid())
 
+    if args.background in ("stop", "status"):
+        # `agitrack -b stop` / `-b status`: signal or report the background tracker running on
+        # this repo. Read-only w.r.t. the agent — no privacy prompt, no repo init, no update check.
+        try:
+            bg_repo = GitRepo.discover(Path(args.repo).expanduser())
+        except (GitError, OSError) as error:
+            print(error)
+            return 1
+        from agitrack.proxy.background import background_status, stop_background
+
+        return stop_background(bg_repo) if args.background == "stop" else background_status(bg_repo)
+
+    if args.status:
+        # `agitrack --status` / `-s`: report the running mode for this repo. Read-only — no privacy
+        # prompt, no repo init, no update check.
+        try:
+            status_repo = GitRepo.discover(Path(args.repo).expanduser())
+        except (GitError, OSError) as error:
+            print(error)
+            return 1
+        from agitrack.proxy.background import repo_status
+
+        return repo_status(status_repo)
+
+    if args.remove_hooks:
+        # Let the user fully opt out of aGiTrack's commit-time tracking by removing every hook it
+        # installed (restoring any chained originals). Read-only w.r.t. the agent — no privacy
+        # prompt, no repo init, no update check.
+        try:
+            rh_repo = GitRepo.discover(Path(args.repo).expanduser())
+        except (GitError, OSError) as error:
+            print(error)
+            return 1
+        from agitrack.git import hooks as git_hooks
+
+        removed = git_hooks.remove_all_installed_hooks(rh_repo.hooks_dir())
+        # Persist the opt-out so a later aGiTrack run doesn't silently reinstall the auto-track hook.
+        try:
+            rh_config = GlobalConfig()
+            rh_config.load_repo_overlay(rh_repo.repo)
+            rh_config.set("autotrack_hook", "off", scope="repo")
+        except Exception:
+            pass
+        if removed:
+            print(f"Removed aGiTrack git hook(s): {', '.join(removed)}. Any chained project hooks were restored.")
+            print("Auto-start on commit is now off for this repo. Re-enable it in Ctrl-G → settings or `agitrack -b`.")
+        else:
+            print("No aGiTrack git hooks were installed in this repository. Auto-start on commit is now off.")
+        return 0
+
+    if args.precommit_sync:
+        # Internal: the persistent auto-track pre-commit hook. Fast, best-effort, never fails a
+        # commit — records any pending AI turns and renders the fold trailer for the commit being
+        # made, then (unless autotrack_hook=off) auto-starts the background daemon.
+        try:
+            sync_repo = GitRepo.discover(Path(args.repo).expanduser())
+        except (GitError, OSError):
+            return 0  # not a repo / bad path ⇒ silently do nothing, never block the commit
+        from agitrack.proxy.background import precommit_sync
+
+        return precommit_sync(sync_repo)
+
     if args.recover:
         # Headless finalization of work left by a session that exited abruptly.
         # It only commits/merges already-produced changes (never starts new agent
@@ -434,6 +592,10 @@ def main(argv: list[str] | None = None) -> int:
         result = subprocess.run(head + backend_args, check=False)
         return result.returncode
 
+    # `--json` is the documented flag for the JSON prompt-loop; `--mode json` is its hidden
+    # deprecated alias. `--prompt` and `--ui-bridge` both drive that same non-interactive loop.
+    if args.json_mode:
+        args.mode = "json"
     scripted = bool(args.prompts)
     if scripted:
         args.mode = "json"  # --prompt drives the non-interactive shell (#53)
@@ -454,6 +616,13 @@ def main(argv: list[str] | None = None) -> int:
     # and scripted/json runs are left clean (those users have git configured).
     if args.mode == "proxy" and not _installed_via_msi() and sys.stdin.isatty() and sys.stdout.isatty():
         _ensure_git_identity()
+
+    # Make the global config self-documenting: write any settings still missing from
+    # ~/.agitrack/config.json with their built-in defaults, so a user opening the file
+    # sees every available knob. Only fills gaps (never overwrites a user value) and only
+    # writes when something was missing, so it is a no-op on every run after the first.
+    # Placed after the cheap --version/--dashboard paths return, so those stay side-effect-free.
+    getattr(config, "seed_defaults", lambda: False)()
 
     # Offer a self-update before launching anything. Skipped for scripted/non-TTY
     # runs (no way to answer) and when the user turned update checks off. If the
@@ -509,11 +678,23 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Configuration error: {share_config_error}")
         return 1
     manual_commits = True if getattr(args, "manual_commits", False) else getattr(config, "manual_commits", False)
+    # Background (headless) mode: aGiTrack tracks a user-driven native backend session instead
+    # of running the interactive TUI. `-b`/`--background` (const "run") or the 'background' config
+    # key enable it; `-b stop`/`status` were handled earlier and never reach here.
+    background = (getattr(args, "background", None) == "run") or getattr(config, "background", False)
+    if background:
+        # Background mode ALWAYS runs without a worktree, and uses AUTO commits by default (like
+        # interactive mode). --manual-commits / -m (or config manual_commits) opts into manual;
+        # --auto-commit forces auto even over a configured manual_commits: true.
+        if getattr(args, "auto_commit", False):
+            manual_commits = False
     # Manual-commit mode edits the current branch directly and defers commits to the user, so
     # it necessarily runs without a worktree (there is no per-turn branch to integrate).
-    use_worktrees = False if (args.no_worktree or manual_commits) else config.use_worktrees
+    use_worktrees = False if (args.no_worktree or manual_commits or background) else config.use_worktrees
     commit_guidance = False if args.no_commit_guidance else getattr(config, "commit_guidance", True)
     sandbox_enabled = False if args.no_sandbox else getattr(config, "sandbox", True)
+    # Event-log path: a per-run --log-file wins over the configured log_file; None ⇒ no log.
+    log_file_spec = args.log_file if args.log_file is not None else getattr(config, "log_file", None)
     if args.allowed_edit_paths is not None:
         allowed_edit_paths = [p for p in args.allowed_edit_paths.split(os.pathsep) if p.strip()]
     else:
@@ -554,6 +735,54 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
+        if background:
+            # Headless background tracker (issue #143): no TUI, no PTY takeover. aGiTrack watches
+            # the user-driven backend session and tracks it. Show the privacy warning first (it
+            # auto-proceeds without a TTY — so the interactive launcher below acknowledges it,
+            # then hands the detached child `--skip-privacy-ack`).
+            if not _acknowledge_privacy_warning(scripted=scripted, skip=args.skip_privacy_ack):
+                return 1
+            if BackgroundRunner is None:  # pragma: no cover - platform without proxy support
+                print("Background mode is not available on this platform yet.")
+                return 1
+            if args.background_serve:
+                # We ARE the detached daemon child: run the tracker loop in the foreground of
+                # this (already-detached) process, holding the repo lock for our whole run.
+                return BackgroundRunner(
+                    repo,
+                    verbose=args.verbose,
+                    backend=args.backend,
+                    new_session=args.new_session,
+                    manual_commits=manual_commits,
+                    backend_command=backend_command,
+                    log_file=log_file_spec,
+                    _lock=management_lock,
+                ).run()
+            # Explain the persistent pre-commit hook and let the user decide (once per repo)
+            # whether to keep it after this tracker exits — before we spawn anything.
+            _maybe_prompt_background_hook(config, scripted=scripted)
+            # Launcher: spawn the tracker as a DETACHED daemon (like `agitrack -d`) so the
+            # terminal is freed, then return to the shell. The child re-execs aGiTrack with
+            # --background-serve and takes its own lock, so release ours first (the child owns
+            # the single-writer lock for the daemon's lifetime; stop it with `agitrack -b stop`).
+            management_lock.release()
+            from agitrack.proxy.background import start_background_daemon
+
+            child_args: list[str] = []
+            if args.backend:
+                child_args += ["--backend", args.backend]
+            # Force the resolved commit mode explicitly so the child's own config can't flip it.
+            child_args.append("--manual-commits" if manual_commits else "--auto-commit")
+            if args.new_session:
+                child_args.append("--new-session")
+            if args.verbose:
+                child_args.append("--verbose")
+            if args.backend_command:
+                child_args += ["--backend-command", args.backend_command]
+            # Forward a per-run --log-file (a configured log_file the child reads itself).
+            if args.log_file:
+                child_args += ["--log-file", args.log_file]
+            return start_background_daemon(repo, extra_args=child_args)
         if args.mode == "json":
             # json/scripted mode has no interactive pre-TUI configuration steps, so show the
             # privacy warning here (it auto-proceeds without a TTY) before the shell starts.
@@ -601,6 +830,7 @@ def main(argv: list[str] | None = None) -> int:
                 delay_merge=args.delay_merge,
                 sandbox=sandbox_enabled,
                 allowed_edit_paths=allowed_edit_paths,
+                log_file=log_file_spec,
                 gh_prechecked=gh_handled,
                 skip_privacy_ack=args.skip_privacy_ack,
                 _lock=management_lock,
@@ -929,6 +1159,43 @@ def _run_gh_login() -> None:
         subprocess.run(["gh", "auth", "login"], check=False)
     except (OSError, subprocess.SubprocessError) as error:
         print(f"Could not run `gh auth login`: {error}")
+
+
+def _maybe_prompt_background_hook(config: GlobalConfig, *, scripted: bool) -> None:
+    """When starting `agitrack -b`, explain the persistent auto-track pre-commit hook and let the
+    user decide whether to enable it. When enabled (the default), a `git commit` made while aGiTrack
+    isn't running folds the AI trace into that commit AND auto-starts the tracker (in the same commit
+    mode as the last run) for the turns that follow. Sets the repo-scoped ``autotrack_hook``
+    ("auto"/"off"). Never blocks automation (no-TTY / scripted → default on)."""
+    if scripted or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return
+    try:
+        # Skip only when auto-start is ALREADY enabled for this repo (an explicit repo-scoped
+        # "auto"). Re-ask whenever it's off — including after `agitrack --remove-hooks`, which sets
+        # it off — so the user can turn it back on; and ask on the first run (default is a global,
+        # not repo-scoped, "auto").
+        if config.autotrack_hook == "auto" and config.source("autotrack_hook") == "repo":
+            return
+    except Exception:
+        return
+    print(
+        "\naGiTrack installs a persistent git pre-commit hook in this repo. When you `git commit`\n"
+        "later and aGiTrack isn't running, it records that commit's AI work into the commit AND\n"
+        "auto-starts background tracking (in the same auto/manual commit mode as your last run) for\n"
+        "the turns that follow — so tracking survives you closing the terminal or a reboot. Your\n"
+        "commit stays your own; a purely human commit (no AI work) is left untouched. Disable it\n"
+        "anytime with `agitrack --remove-hooks`."
+    )
+    try:
+        answer = input("Enable this auto-start hook? [Y/n]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return
+    if answer.startswith("n"):
+        config.set("autotrack_hook", "off", scope="repo")
+        print("\naGiTrack: auto-start hook off — tracking runs only while `agitrack -b` is up.")
+    else:
+        config.set("autotrack_hook", "auto", scope="repo")
+        print("\naGiTrack: auto-start hook enabled. Disable it anytime with `agitrack --remove-hooks`.")
 
 
 def _verify_menu_key(config: GlobalConfig, *, scripted: bool = False) -> bool:

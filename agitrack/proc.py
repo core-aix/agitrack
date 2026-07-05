@@ -13,6 +13,22 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
+
+
+def agitrack_invocation() -> list[str]:
+    """The argv PREFIX that invokes THIS aGiTrack (append the aGiTrack args after it).
+
+    A normal (pip/source/pipx) install is a Python interpreter, so it runs as
+    ``<python> -m agitrack …`` — which loads whatever version is installed for that interpreter,
+    so after a self-update it automatically runs the NEW code (the interpreter path is stable).
+    A **frozen** build (the PyInstaller/MSI ``agitrack.exe``) is not a Python interpreter — ``-m
+    agitrack`` is invalid there — so the executable is run directly; the MSI reinstalls it at the
+    same path, so it too resolves to the updated version. Mirrors ``updater._restart_command``."""
+    if getattr(sys, "frozen", False):
+        return [sys.executable]
+    return [sys.executable, "-m", "agitrack"]
+
 
 # The one canonical Windows flag for the package. Prefer a plain ``os.name == "nt"`` inline
 # for a runtime branch; import THIS constant instead in code whose Windows branch is unit-
