@@ -195,9 +195,13 @@ mermaid.initialize({
 const REPO_BLOB = 'https://github.com/core-aix/agitrack/blob/main/';
 const REPO_RAW  = 'https://raw.githubusercontent.com/core-aix/agitrack/main/';
 
+// Both docs are fetched from the CORS-enabled raw GitHub source (canonical + always current).
+// Using raw for user-flow too — rather than the relative ./user-flow.md — keeps it working when
+// the page is opened via file://, and on GitHub Pages where Jekyll rewrites .md files so the raw
+// path isn't served as-is (which surfaced as a "Load failed" network error on the User Flow tab).
 const SOURCES = {
-  manual:   { url: REPO_RAW + 'README.md',        el: 'md-manual',   loaded:false },
-  userflow: { url: './user-flow.md',              el: 'md-userflow', loaded:false },
+  manual:   { url: REPO_RAW + 'README.md',          el: 'md-manual',   loaded:false },
+  userflow: { url: REPO_RAW + 'docs/user-flow.md',  el: 'md-userflow', loaded:false },
 };
 
 const escapeHtml = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
