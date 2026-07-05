@@ -566,8 +566,8 @@ def _autostart_config(tmp_path):
     return cfg
 
 
-def test_background_hook_prompt_enable_off_and_asks_once(tmp_path, monkeypatch, capsys):
-    # `agitrack -b` explains the auto-start hook and records the repo-scoped choice once.
+def test_background_hook_prompt_enable_off_and_reask_when_off(tmp_path, monkeypatch, capsys):
+    # `agitrack -b` explains the auto-start hook and records the repo-scoped choice.
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
     monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
 
@@ -582,10 +582,18 @@ def test_background_hook_prompt_enable_off_and_asks_once(tmp_path, monkeypatch, 
     assert run("n").autotrack_hook == "off"
     assert "--remove-hooks" in capsys.readouterr().out  # tells the user how to cancel it
 
-    # Asked once per repo: a second call does not re-prompt.
+    # Once ENABLED for the repo, a later `-b` does not re-prompt.
     keep = run("y")
     monkeypatch.setattr("builtins.input", lambda *a: (_ for _ in ()).throw(AssertionError("re-prompted")))
     cli._maybe_prompt_background_hook(keep, scripted=False)
+
+    # But when it's OFF (e.g. after `agitrack --remove-hooks`), `-b` MUST ask again so the user
+    # can turn it back on.
+    keep.set("autotrack_hook", "off", scope="repo")
+    reasked = []
+    monkeypatch.setattr("builtins.input", lambda *a: reasked.append(1) or "y")
+    cli._maybe_prompt_background_hook(keep, scripted=False)
+    assert reasked and keep.autotrack_hook == "auto"  # re-asked and re-enabled
 
 
 def test_background_hook_prompt_skipped_when_scripted(tmp_path, monkeypatch):
