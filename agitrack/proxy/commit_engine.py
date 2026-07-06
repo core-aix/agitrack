@@ -153,6 +153,21 @@ def _prompt_covered_by(pending: str, prompt: str) -> bool:
     return len(pt & tt) / len(pt) >= 0.9
 
 
+def _garbled_short_duplicate(pending: str, prompt: str) -> bool:
+    """True when a SHORT *pending* leftover looks like a garbled capture of *prompt* already in the
+    trace. The proxy reconstructs the raw typed bytes, so a follow-up typed while the agent was busy
+    can be captured with a dropped leading/trailing character (e.g. "ontinue" for "Continue"). Such a
+    one-word near-copy is too short for the word-overlap / containment checks above (which need ≥3
+    words), so it would leak in as a spurious extra ## User heading. For short prompts (≤2 words),
+    treat them as the same when one's normalized text is a substring of the other's AND covers most
+    of it (≥0.7) — which catches a dropped edge character without matching unrelated short words."""
+    a, b = _norm(pending).lower(), _norm(prompt).lower()
+    if not a or not b or len(_TOKEN_RE.findall(a)) > 2 or len(_TOKEN_RE.findall(b)) > 2:
+        return False
+    short, long = (a, b) if len(a) <= len(b) else (b, a)
+    return len(short) >= 3 and short in long and len(short) / len(long) >= 0.7
+
+
 class CommitEngine:
     """Stateless agent-commit engine bound to a ``(repo, state)`` pair.
 
@@ -270,7 +285,8 @@ class CommitEngine:
                 # Each message the user queued mid-turn gets its OWN ## User heading (it was sent
                 # after the agent had already said something), not merged into the base prompt.
                 for followup in turn.queued_followups:
-                    self.state.append_trace("user", followup)
+                    if followup.strip():
+                        self.state.append_trace("user", followup)
                 for message in self._agent_messages_for(turn):
                     self.state.append_trace("agent", message)
                 self.state.add_token_usage(turn.tokens)
@@ -297,6 +313,8 @@ class CommitEngine:
                 # A mid-turn queued message gets its own ## User heading (sent after the agent
                 # already responded), rather than being merged into the base prompt.
                 for followup in turn.queued_followups:
+                    if not followup.strip():
+                        continue
                     subject_prompts.append(followup)
                     entries.append(("user", followup))
                 for message in self._agent_messages_for(turn):
@@ -320,7 +338,9 @@ class CommitEngine:
                 # (_same_prompt) OR because the turn aggregated it as a queued follow-up so the
                 # base is CONTAINED in the (longer) combined turn prompt (_prompt_covered_by).
                 if any(
-                    _same_prompt(pending_user, prompt) or _prompt_covered_by(pending_user, prompt)
+                    _same_prompt(pending_user, prompt)
+                    or _prompt_covered_by(pending_user, prompt)
+                    or _garbled_short_duplicate(pending_user, prompt)
                     for prompt in turn_prompts
                 ):
                     continue
@@ -766,7 +786,7 @@ class CommitEngine:
         slash command). Slash commands (``/compact``, ``/model``, …) are backend
         directives, not prompts, and are kept out of the trace — see
         :func:`_is_slash_command`."""
-        if prompt_text and not _is_slash_command(prompt_text):
+        if prompt_text and prompt_text.strip() and not _is_slash_command(prompt_text):
             self.state.append_trace("user", prompt_text)
 
     def await_followup(self, prompt_text: str, awaited: list[str]) -> list[str]:

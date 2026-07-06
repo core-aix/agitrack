@@ -319,6 +319,38 @@ def test_popup_read_input_pumps_background_sessions(monkeypatch):
 
 
 @_posix_only
+def test_modal_over_open_palette_suspends_it_so_the_dialog_shows_and_is_restored(monkeypatch):
+    """A dialog presented while the Ctrl-G palette is open must render ON TOP of it — the palette
+    is suspended for the dialog's duration (else the renderer draws the palette, not the dialog,
+    while the dialog still eats the user's keys) and restored (typed text + selection) afterwards."""
+    stdin_r, stdin_w = os.pipe()
+    try:
+        runner = _modal_runner(monkeypatch, stdin_r)
+        # Palette open, with the user mid-way through typing/selecting a command.
+        runner.input.capturing = True
+        runner.input.buffer = bytearray(b"sess")
+        runner.input.selected_index = 2
+        during = []
+        runner._render = lambda: during.append(runner.input.capturing)  # capture state while shown
+
+        os.write(stdin_w, b"\r")  # user answers the dialog
+        result = runner._run_modal(PromptModal("Confirm?", "P:", default="ok"))
+
+        assert result == "ok"
+        assert during and all(c is False for c in during)  # palette suspended while the dialog showed
+        # palette restored exactly as it was, so the user continues where they left off
+        assert runner.input.capturing is True
+        assert bytes(runner.input.buffer) == b"sess"
+        assert runner.input.selected_index == 2
+    finally:
+        for fd in (stdin_r, stdin_w):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+@_posix_only
 def test_run_modal_pty_drain_real_popup_read_input(monkeypatch):
     """PTY is drained via the real _popup_read_input when a modal is open.
 
