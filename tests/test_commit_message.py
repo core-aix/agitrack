@@ -36,6 +36,20 @@ def test_render_interaction_trace_respects_turn_limit():
     assert "turn 0" not in rendered
 
 
+def test_render_interaction_trace_drops_empty_role_entries():
+    # A blank/whitespace entry (e.g. a garbled or empty proxy capture of a follow-up typed while
+    # the agent was busy) must not render as a bare "## User" heading with nothing under it.
+    trace = [
+        {"role": "user", "content": "Continue"},
+        {"role": "user", "content": "   "},
+        {"role": "user", "content": ""},
+        {"role": "agent", "content": "done"},
+    ]
+    rendered = render_interaction_trace(trace, trace_turn_limit=10)
+    assert rendered.count("## User") == 1 and "Continue" in rendered
+    assert rendered.count("## Agent") == 1
+
+
 def test_agent_commit_message_records_reasoning_effort_when_given():
     message = build_agent_commit_message(
         latest_prompt="fix it",

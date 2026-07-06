@@ -9114,6 +9114,32 @@ class ProxyRunner:
         """The actual modal loop — always runs on the main reactor thread (directly,
         or via ``_drain_modal_mailbox`` for a worker-queued dialog). Reads stdin and
         paints the screen, so it must never run off the main thread."""
+        # If the Ctrl-G command palette is open, SUSPEND it for the duration of this dialog. The
+        # renderer draws the palette OR a message — never both — so a dialog presented while the
+        # palette is up (e.g. a background offer, or a worker-queued confirm) would otherwise stay
+        # hidden behind the palette while still consuming the user's keystrokes: dangerous, since
+        # the user answers a prompt they can't see. Suspending it makes the dialog render ON TOP;
+        # we restore the palette (its typed text + selection) afterwards so the user answers the
+        # dialog and then continues in the palette exactly where they left off.
+        palette_suspended = bool(getattr(self.input, "capturing", False))
+        saved_buffer = bytes(self.input.buffer) if palette_suspended else b""
+        saved_index = self.input.selected_index if palette_suspended else 0
+        if palette_suspended:
+            self.input.capturing = False
+        try:
+            return self._run_modal_loop(modal)
+        finally:
+            if palette_suspended:
+                # There was no menu stack here (the dialog was raised over the open palette, not from
+                # a menu command), so a menu-key press inside the dialog leaves _exit_menu_requested
+                # set with nothing to unwind — clear it so it can't close the NEXT menu prematurely.
+                self._exit_menu_requested = False
+                self.input.buffer = bytearray(saved_buffer)
+                self.input.selected_index = saved_index
+                self.input.capturing = True
+                self._render_pending = True  # repaint the restored palette over the closed dialog
+
+    def _run_modal_loop(self, modal: "PromptModal | SelectModal") -> "str | None":
         needs_render = True
         while True:
             if self._exit_menu_requested:
