@@ -388,6 +388,26 @@ def test_commit_turns_preserves_pending_users_not_in_turns(tmp_path):
     assert "second prompt" in repo.message
 
 
+def test_garbled_and_empty_leftovers_do_not_pollute_the_trace(tmp_path):
+    # The proxy reconstructs raw typed bytes, so a follow-up typed while the agent was busy can be
+    # captured garbled ("ontinue" for "Continue") or empty. Such captures used to leak into the
+    # trace as spurious extra ## User headings (the empty one rendered as a bare "## User").
+    engine, repo, state = _engine(tmp_path)
+    state.append_trace("user", "ontinue")  # a dropped-leading-char capture of "Continue"
+    state.append_trace("user", "   ")  # a blank capture
+    engine.commit_turns(
+        turns=[_turn("Continue", "done")],
+        backend="claude",
+        backend_session_id="s1",
+        model="m",
+        stage_untracked_fn=_noop_stage,
+    )
+    trace = repo.message.split("# Interaction Trace", 1)[1].split("# aGiTrack Metadata", 1)[0]
+    # Exactly one ## User (the clean "Continue") — the garbled and empty captures are dropped,
+    # not rendered as extra (or bare) headings.
+    assert trace.count("## User") == 1 and "Continue" in trace
+
+
 def test_leftover_user_message_precedes_multi_message_agent_response(tmp_path):
     # A message the user sent mid-turn (a pending "leftover" prompt) must appear BEFORE the
     # agent's response in the trace — even when the turn emitted several agent messages. The

@@ -276,6 +276,18 @@ def _insert_before_version_line(lines: list[str], extra: list[str]) -> list[str]
     return lines + list(extra)
 
 
+def _trace_role_lines(item: dict) -> list[str]:
+    """The rendered lines for one trace turn — its "## User"/"## Agent" role heading plus the
+    masked, heading-nested body — or an EMPTY list when the entry has no textual content. A
+    blank/whitespace entry (e.g. a garbled or empty proxy capture of a follow-up typed while the
+    agent was busy) must never produce a bare "## User" heading with nothing under it."""
+    content = _nest_headings_under_role(_mask_secrets(item.get("content", "")))
+    if not content.strip():
+        return []
+    label = "User" if item.get("role", "").strip().lower() == "user" else "Agent"
+    return [f"## {label}", "", *_body_lines(content), ""]
+
+
 def render_interaction_trace(trace: list[dict], trace_turn_limit: int) -> str:
     """The interaction-trace body exactly as it is appended to an aGiTrack commit:
     role headings plus masked, heading-nested content (same as the commit's
@@ -284,10 +296,7 @@ def render_interaction_trace(trace: list[dict], trace_turn_limit: int) -> str:
     nothing else — no diff, no out-of-band context."""
     lines: list[str] = []
     for item in _limit_trace_turns(trace, trace_turn_limit):
-        role = item.get("role", "").strip().lower()
-        content = _nest_headings_under_role(_mask_secrets(item.get("content", "")))
-        label = "User" if role == "user" else "Agent"
-        lines.extend([f"## {label}", "", *_body_lines(content), ""])
+        lines.extend(_trace_role_lines(item))
     return "\n".join(lines).strip()
 
 
@@ -316,12 +325,9 @@ def _trace_and_metadata_lines(
     # itself shows when the context — and the token counts riding on it — changed.
     lines.extend(_session_event_note_lines(compactions=compactions, origin_event=origin_event))
     for item in _limit_trace_turns(trace, trace_turn_limit):
-        role = item.get("role", "").strip().lower()
-        # Nest the message's own headings under the "## User"/"## Agent" heading so
-        # a message's "# Title" can't outrank the role it belongs to in the log.
-        content = _nest_headings_under_role(_mask_secrets(item.get("content", "")))
-        label = "User" if role == "user" else "Agent"
-        lines.extend([f"## {label}", "", *_body_lines(content), ""])
+        # Nest each message's own headings under its "## User"/"## Agent" role heading (so a
+        # message's "# Title" can't outrank the role) and skip empty entries (see _trace_role_lines).
+        lines.extend(_trace_role_lines(item))
 
     lines.extend(
         [
