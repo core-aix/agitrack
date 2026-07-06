@@ -7649,6 +7649,9 @@ class ProxyRunner:
         data = _decode_kitty_ctrl_keys(data)
         self._debug(f"after kitty decode: {data!r}")
         was_capturing = self.input.capturing
+        # Snapshot the palette's visible state so we can tell a real change (typing, selection move)
+        # from no-op input like mouse-motion reports — and avoid repainting the palette on the latter.
+        prev_palette = (bytes(self.input.buffer), self.input.selected_index) if was_capturing else None
         forwarded, local_echo, command, should_exit = self.input.feed(data)
         self._debug(f"feed result: forwarded={forwarded!r} command={command!r} capturing={self.input.capturing}")
         if self.input.capturing and not was_capturing:
@@ -7667,7 +7670,12 @@ class ProxyRunner:
         if local_echo:
             self._render_status(local_echo.decode(errors="ignore"))
         if self.input.capturing:
-            self._render()
+            # Repaint only when the palette actually changed (just opened, or the typed text /
+            # selection moved). A no-op feed — e.g. a mouse moving over the palette, whose motion
+            # reports are dropped — leaves the state identical, so we skip the repaint that used to
+            # flash the palette and slow it down on every mouse move.
+            if not was_capturing or (bytes(self.input.buffer), self.input.selected_index) != prev_palette:
+                self._render()
         elif was_capturing and command is None:
             self._render()
         if forwarded:
@@ -9172,7 +9180,8 @@ class ProxyRunner:
                     return None
                 if self._run_exit_flow():
                     return None
-                # Exit declined: redraw the modal and keep listening.
+                # Exit declined: the exit flow painted over us, so repaint the modal and keep listening.
+                needs_render = True
 
     def _on_main_thread(self) -> bool:
         """Whether the caller is the main reactor thread (or no worker is running,
