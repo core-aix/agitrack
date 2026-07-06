@@ -88,12 +88,14 @@ def test_console_isolation_kwargs_windows_keeps_stdin_when_feeding_input(monkeyp
     assert "creationflags" in kwargs
 
 
-def test_console_isolation_kwargs_posix_only_detaches_stdin(monkeypatch):
-    # POSIX has no console coupling, so there are no creationflags — just the harmless stdin
-    # detach (which also stops a TTY-probing CLI from hanging the menu thread).
+def test_console_isolation_kwargs_posix_detaches_stdin_and_starts_new_session(monkeypatch):
+    # POSIX has no console coupling (no creationflags), but the child runs in its OWN session
+    # (start_new_session) so a short git subprocess doesn't sit in the terminal's foreground
+    # group and flicker the tab title to "git"; the stdin detach also stops a TTY-probing CLI
+    # from hanging the menu thread.
     monkeypatch.setattr(proc, "_IS_WINDOWS", False)
-    assert proc.console_isolation_kwargs() == {"stdin": subprocess.DEVNULL}
-    assert proc.console_isolation_kwargs(detach_stdin=False) == {}
+    assert proc.console_isolation_kwargs() == {"stdin": subprocess.DEVNULL, "start_new_session": True}
+    assert proc.console_isolation_kwargs(detach_stdin=False) == {"start_new_session": True}
 
 
 # --- resolve_subprocess_command (Windows .cmd/.exe resolution, #118) ----------------
