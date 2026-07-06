@@ -570,16 +570,34 @@ def test_select_modal_escape_sequence_split_across_reads():
     """An arrow key split across read boundaries must still navigate, and the
     cross-feed escape buffer must not be confused with a lone-Esc cancel."""
     modal = SelectModal("Pick", ["a", "b", "c"])
-    # b"\x1b[" arrives alone: incomplete sequence, no action yet.
+    # b"\x1b[" arrives alone: incomplete sequence, nothing changed → a no-op (no repaint).
     action, value = modal.feed(b"\x1b[")
-    assert action in ("redraw", "continue", None) or action == "redraw"
-    assert modal.selected == 0 or modal.selected == 0  # nothing moved yet
+    assert action == "noop"
+    assert modal.selected == 0  # nothing moved yet
     # The tail b"B" completes Down: selection advances, no cancel.
     modal.feed(b"B")
     assert modal.selected == 1
     # Enter confirms the option the split sequence selected.
     action, value = modal.feed(b"\r")
     assert (action, value) == ("done", "b")
+
+
+def test_modals_return_noop_for_mouse_motion_so_menus_do_not_repaint():
+    """Mouse-motion reports arrive as SGR escape sequences. They change nothing, so feed() must
+    return "noop" (not "redraw") — otherwise a moving mouse repaints the popup on every report,
+    flashing the title and slowing the whole UI down."""
+    move, release = b"\x1b[<35;10;5M", b"\x1b[<0;12;7m"
+    sel = SelectModal("Pick", ["a", "b", "c"])
+    assert sel.feed(move) == ("noop", None)
+    assert sel.feed(release) == ("noop", None)
+    assert sel.selected == 0  # the mouse never moved the selection
+    # a real key still redraws
+    assert sel.feed(b"\x1b[B") == ("redraw", None)
+
+    pr = PromptModal("T", "P:", default="hi")
+    assert pr.feed(move) == ("noop", None)
+    assert pr.value == "hi"  # unchanged by the mouse
+    assert pr.feed(b"x") == ("redraw", None)  # typing redraws
 
 
 def test_prompt_modal_split_escape_not_treated_as_text():
