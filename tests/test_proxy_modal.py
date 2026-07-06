@@ -319,6 +319,38 @@ def test_popup_read_input_pumps_background_sessions(monkeypatch):
 
 
 @_posix_only
+def test_modal_over_open_palette_suspends_it_so_the_dialog_shows_and_is_restored(monkeypatch):
+    """A dialog presented while the Ctrl-G palette is open must render ON TOP of it — the palette
+    is suspended for the dialog's duration (else the renderer draws the palette, not the dialog,
+    while the dialog still eats the user's keys) and restored (typed text + selection) afterwards."""
+    stdin_r, stdin_w = os.pipe()
+    try:
+        runner = _modal_runner(monkeypatch, stdin_r)
+        # Palette open, with the user mid-way through typing/selecting a command.
+        runner.input.capturing = True
+        runner.input.buffer = bytearray(b"sess")
+        runner.input.selected_index = 2
+        during = []
+        runner._render = lambda: during.append(runner.input.capturing)  # capture state while shown
+
+        os.write(stdin_w, b"\r")  # user answers the dialog
+        result = runner._run_modal(PromptModal("Confirm?", "P:", default="ok"))
+
+        assert result == "ok"
+        assert during and all(c is False for c in during)  # palette suspended while the dialog showed
+        # palette restored exactly as it was, so the user continues where they left off
+        assert runner.input.capturing is True
+        assert bytes(runner.input.buffer) == b"sess"
+        assert runner.input.selected_index == 2
+    finally:
+        for fd in (stdin_r, stdin_w):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+@_posix_only
 def test_run_modal_pty_drain_real_popup_read_input(monkeypatch):
     """PTY is drained via the real _popup_read_input when a modal is open.
 
@@ -570,16 +602,34 @@ def test_select_modal_escape_sequence_split_across_reads():
     """An arrow key split across read boundaries must still navigate, and the
     cross-feed escape buffer must not be confused with a lone-Esc cancel."""
     modal = SelectModal("Pick", ["a", "b", "c"])
-    # b"\x1b[" arrives alone: incomplete sequence, no action yet.
+    # b"\x1b[" arrives alone: incomplete sequence, nothing changed → a no-op (no repaint).
     action, value = modal.feed(b"\x1b[")
-    assert action in ("redraw", "continue", None) or action == "redraw"
-    assert modal.selected == 0 or modal.selected == 0  # nothing moved yet
+    assert action == "noop"
+    assert modal.selected == 0  # nothing moved yet
     # The tail b"B" completes Down: selection advances, no cancel.
     modal.feed(b"B")
     assert modal.selected == 1
     # Enter confirms the option the split sequence selected.
     action, value = modal.feed(b"\r")
     assert (action, value) == ("done", "b")
+
+
+def test_modals_return_noop_for_mouse_motion_so_menus_do_not_repaint():
+    """Mouse-motion reports arrive as SGR escape sequences. They change nothing, so feed() must
+    return "noop" (not "redraw") — otherwise a moving mouse repaints the popup on every report,
+    flashing the title and slowing the whole UI down."""
+    move, release = b"\x1b[<35;10;5M", b"\x1b[<0;12;7m"
+    sel = SelectModal("Pick", ["a", "b", "c"])
+    assert sel.feed(move) == ("noop", None)
+    assert sel.feed(release) == ("noop", None)
+    assert sel.selected == 0  # the mouse never moved the selection
+    # a real key still redraws
+    assert sel.feed(b"\x1b[B") == ("redraw", None)
+
+    pr = PromptModal("T", "P:", default="hi")
+    assert pr.feed(move) == ("noop", None)
+    assert pr.value == "hi"  # unchanged by the mouse
+    assert pr.feed(b"x") == ("redraw", None)  # typing redraws
 
 
 def test_prompt_modal_split_escape_not_treated_as_text():

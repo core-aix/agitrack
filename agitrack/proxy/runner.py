@@ -7649,6 +7649,9 @@ class ProxyRunner:
         data = _decode_kitty_ctrl_keys(data)
         self._debug(f"after kitty decode: {data!r}")
         was_capturing = self.input.capturing
+        # Snapshot the palette's visible state so we can tell a real change (typing, selection move)
+        # from no-op input like mouse-motion reports — and avoid repainting the palette on the latter.
+        prev_palette = (bytes(self.input.buffer), self.input.selected_index) if was_capturing else None
         forwarded, local_echo, command, should_exit = self.input.feed(data)
         self._debug(f"feed result: forwarded={forwarded!r} command={command!r} capturing={self.input.capturing}")
         if self.input.capturing and not was_capturing:
@@ -7667,7 +7670,12 @@ class ProxyRunner:
         if local_echo:
             self._render_status(local_echo.decode(errors="ignore"))
         if self.input.capturing:
-            self._render()
+            # Repaint only when the palette actually changed (just opened, or the typed text /
+            # selection moved). A no-op feed — e.g. a mouse moving over the palette, whose motion
+            # reports are dropped — leaves the state identical, so we skip the repaint that used to
+            # flash the palette and slow it down on every mouse move.
+            if not was_capturing or (bytes(self.input.buffer), self.input.selected_index) != prev_palette:
+                self._render()
         elif was_capturing and command is None:
             self._render()
         if forwarded:
@@ -9106,6 +9114,33 @@ class ProxyRunner:
         """The actual modal loop — always runs on the main reactor thread (directly,
         or via ``_drain_modal_mailbox`` for a worker-queued dialog). Reads stdin and
         paints the screen, so it must never run off the main thread."""
+        # If the Ctrl-G command palette is open, SUSPEND it for the duration of this dialog. The
+        # renderer draws the palette OR a message — never both — so a dialog presented while the
+        # palette is up (e.g. a background offer, or a worker-queued confirm) would otherwise stay
+        # hidden behind the palette while still consuming the user's keystrokes: dangerous, since
+        # the user answers a prompt they can't see. Suspending it makes the dialog render ON TOP;
+        # we restore the palette (its typed text + selection) afterwards so the user answers the
+        # dialog and then continues in the palette exactly where they left off.
+        palette_suspended = bool(getattr(self.input, "capturing", False))
+        saved_buffer = bytes(self.input.buffer) if palette_suspended else b""
+        saved_index = self.input.selected_index if palette_suspended else 0
+        if palette_suspended:
+            self.input.capturing = False
+        try:
+            return self._run_modal_loop(modal)
+        finally:
+            if palette_suspended:
+                # There was no menu stack here (the dialog was raised over the open palette, not from
+                # a menu command), so a menu-key press inside the dialog leaves _exit_menu_requested
+                # set with nothing to unwind — clear it so it can't close the NEXT menu prematurely.
+                self._exit_menu_requested = False
+                self.input.buffer = bytearray(saved_buffer)
+                self.input.selected_index = saved_index
+                self.input.capturing = True
+                self._render_pending = True  # repaint the restored palette over the closed dialog
+
+    def _run_modal_loop(self, modal: "PromptModal | SelectModal") -> "str | None":
+        needs_render = True
         while True:
             if self._exit_menu_requested:
                 # A Ctrl-G in a deeper popup asked to close the whole menu: don't even paint
@@ -9114,8 +9149,13 @@ class ProxyRunner:
                 self._clear_message()
                 self._render_pending = True
                 return None
-            self._set_message(modal.render_message(), seconds=60)
-            self._render()
+            # Repaint only when something changed. A "noop" feed (e.g. mouse-motion reports from a
+            # mouse moving over the popup) leaves needs_render False, so we keep reading without
+            # repainting — no title flash, no per-move slowdown.
+            if needs_render:
+                self._set_message(modal.render_message(), seconds=60)
+                self._render()
+                needs_render = False
             data = self._popup_read_input()
             menu_key = getattr(self.input, "menu_key", b"\x07")
             if menu_key and menu_key in data:
@@ -9127,6 +9167,11 @@ class ProxyRunner:
                 self._render_pending = True
                 return None
             action, value = modal.feed(data)
+            if action == "noop":
+                continue  # nothing changed (e.g. a mouse-move report) — don't repaint
+            if action == "redraw":
+                needs_render = True
+                continue
             if action == "done":
                 self._clear_message()
                 self._render_pending = True
@@ -9161,7 +9206,8 @@ class ProxyRunner:
                     return None
                 if self._run_exit_flow():
                     return None
-                # Exit declined: redraw the modal and keep listening.
+                # Exit declined: the exit flow painted over us, so repaint the modal and keep listening.
+                needs_render = True
 
     def _on_main_thread(self) -> bool:
         """Whether the caller is the main reactor thread (or no worker is running,

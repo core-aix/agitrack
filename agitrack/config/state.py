@@ -10,6 +10,10 @@ from typing import Any
 
 from agitrack.proc import console_isolation_kwargs
 
+# The git-resolved .git/info/exclude path per repo root — invariant for a run, so resolve it once
+# (see AgitrackState._exclude_path) instead of spawning `git rev-parse` on every save/ensure.
+_EXCLUDE_PATH_CACHE: dict[Path, Path] = {}
+
 
 class AgitrackState:
     def __init__(self, repo: Path, *, default_backend: str | None = None) -> None:
@@ -144,6 +148,21 @@ class AgitrackState:
             handle.write(".agitrack/\n")
 
     def _exclude_path(self) -> Path | None:
+        # The info/exclude location is invariant for a repo, but ensure_local_ignore() /
+        # save() ask for it constantly (every state save, every daemon poll). Resolving it via
+        # git each time spawns a `git rev-parse` subprocess — dozens during the startup burst
+        # (a chunk of the slow start + the terminal "git" title flicker). Cache it per repo so
+        # the git call happens once; the (cheap) file read/append in _ensure_repo_local_ignore
+        # still runs each time, so an externally emptied exclude file is still re-populated.
+        cached = _EXCLUDE_PATH_CACHE.get(self.repo)
+        if cached is not None:
+            return cached
+        resolved = self._resolve_exclude_path()
+        if resolved is not None:
+            _EXCLUDE_PATH_CACHE[self.repo] = resolved
+        return resolved
+
+    def _resolve_exclude_path(self) -> Path | None:
         # Resolve the info/exclude path via git so it works inside a worktree,
         # where ``.git`` is a file pointing at the shared git dir rather than a
         # directory. Fall back to the conventional location when git is not

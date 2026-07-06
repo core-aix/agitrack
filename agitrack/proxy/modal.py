@@ -120,20 +120,27 @@ class PromptModal:
         if data == b"\x1b":
             return ("cancel", None)
 
+        # Only redraw when something actually changed. Mouse-motion reports (and other dropped
+        # sequences) arrive as escape sequences here; without this a moving mouse would return
+        # "redraw" for every report and repaint the popup dozens of times a second (title flash +
+        # slowdown). Such no-op input returns "noop" so the caller keeps reading without repainting.
+        changed = False
         for byte in data:
             char = bytes([byte])
 
             # Inside an escape sequence: accumulate until complete. PgUp/PgDn scroll the
-            # detail list; any other complete sequence (arrows, etc.) is dropped.
+            # detail list; any other complete sequence (arrows, mouse reports, etc.) is dropped.
             if self._escape_buffer is not None:
                 self._escape_buffer.extend(char)
                 sequence = bytes(self._escape_buffer)
                 if sequence == b"\x1b[5~":  # PageUp — scroll the detail list up
                     self.detail_scroll = max(0, self.detail_scroll - max(1, self._detail_window() - 1))
                     self._escape_buffer = None
+                    changed = True
                 elif sequence == b"\x1b[6~":  # PageDown — scroll the detail list down
                     self.detail_scroll += max(1, self._detail_window() - 1)
                     self._escape_buffer = None
+                    changed = True
                 elif _escape_sequence_complete(sequence):
                     self._escape_buffer = None
                 continue
@@ -150,10 +157,12 @@ class PromptModal:
 
             if char in {b"\x7f", b"\b"}:
                 self.value = self.value[:-1]
+                changed = True
             elif byte >= 32:
                 self.value += char.decode(errors="ignore")
+                changed = True
 
-        return ("redraw", None)
+        return ("redraw", None) if changed else ("noop", None)
 
 
 class SelectModal:
@@ -281,6 +290,10 @@ class SelectModal:
         if data == b"\x1b":
             return ("cancel", None)
 
+        # See PromptModal.feed: return "redraw" only on a real change so a moving mouse (whose
+        # motion reports arrive here as dropped escape sequences) doesn't repaint the menu on
+        # every report — which flashed the title and slowed everything down.
+        changed = False
         for byte in data:
             char = bytes([byte])
 
@@ -290,15 +303,19 @@ class SelectModal:
                 if sequence == b"\x1b[A":
                     self._advance(-1)
                     self._escape_buffer = None
+                    changed = True
                 elif sequence == b"\x1b[B":
                     self._advance(1)
                     self._escape_buffer = None
+                    changed = True
                 elif sequence == b"\x1b[5~":  # PageUp — scroll the detail list up
                     self.detail_scroll = max(0, self.detail_scroll - max(1, self._detail_window() - 1))
                     self._escape_buffer = None
+                    changed = True
                 elif sequence == b"\x1b[6~":  # PageDown — scroll the detail list down
                     self.detail_scroll += max(1, self._detail_window() - 1)
                     self._escape_buffer = None
+                    changed = True
                 elif _escape_sequence_complete(sequence):
                     self._escape_buffer = None
                 continue
@@ -313,4 +330,4 @@ class SelectModal:
             if char in {b"\r", b"\n"}:
                 return ("done", self.options[self.selected])
 
-        return ("redraw", None)
+        return ("redraw", None) if changed else ("noop", None)
