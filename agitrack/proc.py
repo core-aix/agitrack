@@ -131,13 +131,23 @@ def console_isolation_kwargs(*, detach_stdin: bool = True) -> dict:
 
     Pass ``detach_stdin=False`` for a call that already feeds the child via ``input=`` (the two
     are mutually exclusive in ``subprocess``); the ``input=`` pipe already keeps it off the
-    console. On POSIX there is no console coupling, so only the stdin detach (harmless) applies.
+    console.
+
+    On POSIX, run the child in its OWN session (``start_new_session`` → ``setsid``). aGiTrack fires
+    many short git subprocesses (per-turn commits, status/branch polls); left in aGiTrack's process
+    group they sit in the controlling terminal's FOREGROUND group, so the terminal keeps retitling
+    its tab to "git" and back — a visible flicker during the startup burst. A new session takes the
+    child out of the foreground group so the title stays put. It's safe here because these children
+    are output-captured with stdin detached (``DEVNULL`` or an ``input=`` pipe): they never need the
+    controlling terminal — no pager, no credential prompt on the tty.
     """
     kwargs: dict = {}
     if detach_stdin:
         kwargs["stdin"] = subprocess.DEVNULL
     if _IS_WINDOWS:
         kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    else:
+        kwargs["start_new_session"] = True
     return kwargs
 
 
