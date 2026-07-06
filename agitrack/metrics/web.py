@@ -702,6 +702,8 @@ h2.section::before{content:"# ";color:var(--amber)}
 .card .value{font-family:var(--display);font-size:42px;line-height:1.05;color:var(--phosphor);margin-top:6px;
   text-shadow:0 0 14px rgba(61,255,160,.3);white-space:nowrap}
 .card .value.amber{color:var(--amber);text-shadow:0 0 14px rgba(255,180,84,.3)}
+/* scientific-notation exponent: noticeably smaller than the mantissa (e.g. 1.01×10⁸) */
+.card .value sup{font-size:.5em;vertical-align:super;line-height:0;margin-left:1px}
 .card .note{font-size:12px;color:var(--fg-dim);margin-top:4px}
 
 /* ---- time-series chart ---- */
@@ -1135,12 +1137,11 @@ function bigValue(value){
   if(!m || m[2].length <= 9) return value;               // ≤ 9 chars incl. commas still fits at 42px
   return m[1] + sci(Number(m[2].replace(/,/g,"")));
 }
-const SUP = {"0":"⁰","1":"¹","2":"²","3":"³","4":"⁴","5":"⁵","6":"⁶","7":"⁷","8":"⁸","9":"⁹"};
 function sci(n){
   if(!isFinite(n) || n===0) return "0";
   const exp = Math.floor(Math.log10(n));
   const mant = (n/Math.pow(10,exp)).toFixed(2).replace(/\.?0+$/,"");  // 1.01, 1.2, 5, …
-  return mant + "×10" + String(exp).replace(/[0-9]/g, d => SUP[d]);   // e.g. 1.01×10⁸
+  return mant + "×10<sup>" + exp + "</sup>";                          // e.g. 1.01×10⁸ (exp in a <sup>)
 }
 function tokenBrief(t){
   if(!t) return "";

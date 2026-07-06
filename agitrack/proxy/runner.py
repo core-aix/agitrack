@@ -9106,6 +9106,7 @@ class ProxyRunner:
         """The actual modal loop — always runs on the main reactor thread (directly,
         or via ``_drain_modal_mailbox`` for a worker-queued dialog). Reads stdin and
         paints the screen, so it must never run off the main thread."""
+        needs_render = True
         while True:
             if self._exit_menu_requested:
                 # A Ctrl-G in a deeper popup asked to close the whole menu: don't even paint
@@ -9114,8 +9115,13 @@ class ProxyRunner:
                 self._clear_message()
                 self._render_pending = True
                 return None
-            self._set_message(modal.render_message(), seconds=60)
-            self._render()
+            # Repaint only when something changed. A "noop" feed (e.g. mouse-motion reports from a
+            # mouse moving over the popup) leaves needs_render False, so we keep reading without
+            # repainting — no title flash, no per-move slowdown.
+            if needs_render:
+                self._set_message(modal.render_message(), seconds=60)
+                self._render()
+                needs_render = False
             data = self._popup_read_input()
             menu_key = getattr(self.input, "menu_key", b"\x07")
             if menu_key and menu_key in data:
@@ -9127,6 +9133,11 @@ class ProxyRunner:
                 self._render_pending = True
                 return None
             action, value = modal.feed(data)
+            if action == "noop":
+                continue  # nothing changed (e.g. a mouse-move report) — don't repaint
+            if action == "redraw":
+                needs_render = True
+                continue
             if action == "done":
                 self._clear_message()
                 self._render_pending = True
