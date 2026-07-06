@@ -1,5 +1,30 @@
+import subprocess
+
 from agitrack.backends.base import TokenUsage
 from agitrack.config import AgitrackState
+
+
+def test_exclude_path_resolved_via_git_only_once(tmp_path, monkeypatch):
+    # ensure_local_ignore()/save() ask for the info/exclude path constantly; resolving it via a
+    # `git rev-parse` subprocess every time was a chunk of the slow startup (and the "git" title
+    # flicker). It must be cached per repo so git is spawned at most once, not on every call.
+    import agitrack.config.state as state_mod
+
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    state_mod._EXCLUDE_PATH_CACHE.clear()
+    calls = []
+    real_run = subprocess.run
+
+    def counting_run(cmd, *a, **k):
+        if isinstance(cmd, (list, tuple)) and "--git-path" in cmd and "info/exclude" in cmd:
+            calls.append(cmd)
+        return real_run(cmd, *a, **k)
+
+    monkeypatch.setattr(state_mod.subprocess, "run", counting_run)
+    state = AgitrackState(tmp_path)
+    for _ in range(5):
+        state.ensure_local_ignore()
+    assert len(calls) <= 1  # resolved once, then served from the cache
 
 
 def test_state_is_repository_local(tmp_path):
