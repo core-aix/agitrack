@@ -403,7 +403,9 @@ def test_text_dashboard_shows_cache_write_as_a_subset_of_input(tmp_path):
 
 def test_pr_merge_commit_does_not_double_count_the_cover_turn(tmp_path):
     """A GitHub-style merge that inherits the cover commit's message (and so its
-    metadata block) must not be counted as a second turn (#58 regression)."""
+    metadata block) must not be counted as a second turn (#58 regression). It is
+    still shown as a commit — so the dashboard's commit total matches GitHub's —
+    but with the inherited tokens/trace stripped, so nothing is counted twice."""
     repo = GitRepo.init(tmp_path)
 
     _write_lines(repo, "agent.txt", 20)
@@ -422,9 +424,17 @@ def test_pr_merge_commit_does_not_double_count_the_cover_turn(tmp_path):
 
     merged = build_dashboard(repo)
 
+    # Figures counted once (on the cover parent), not doubled by the merge.
     assert merged.token_totals == base.token_totals
     assert merged.count("agent") == base.count("agent")
     assert merged.by_backend["claude"]["output_tokens"] == base.by_backend["claude"]["output_tokens"]
+    # But the merge commit itself is retained (count matches GitHub), just neutralized:
+    # no leftover metadata that would re-count the turn.
+    merge_sha = repo.rev_parse("HEAD")
+    merge_stat = next(stat for stat in merged.stats if stat.sha == merge_sha)
+    assert merge_stat.kind != "agent"
+    assert merge_stat.tokens == {} and merge_stat.covered_commits == []
+    assert len(merged.stats) == len(base.stats) + 1  # exactly one new commit: the merge, retained
 
 
 # --- committer identity merging ------------------------------------------------
