@@ -279,12 +279,12 @@ Didn't run aGiTrack from the start? `--backtrace` **reconstructs** how your past
 agitrack --backtrace                 # serve the reconstructed dashboard (background daemon, opens the browser)
 agitrack --backtrace text            # one-shot plain-text report instead
 agitrack --backtrace stop            # stop the background backtrace daemon
-agitrack --backtrace commit --branch tracked-history   # write the reconstruction into real git commits
+agitrack --backtrace commit --backtrace-branch tracked-history   # write the reconstruction into real git commits
 ```
 
 - **`--backtrace` (view).** Reads every local session that ran in this directory (or a subdirectory), recovers each turn's file edits from the tool calls, and shows the **same dashboard** — tokens, models, lines changed, the full file browser, and the complete user↔agent trace behind each change — clearly labeled with a frozen banner as a **historical reconstruction, not live repo status**. It runs as a lifecycle-bound background daemon just like `-d` (stops when the terminal closes or via `--backtrace stop`).
 
-- **`--backtrace commit` (bake it in).** Replays your existing git history onto a **new branch** (`--branch <name>`), and for each commit whose files an agent turn produced, appends the reconstructed `# Interaction Trace` and `# aGiTrack Metadata` (backend, model, tokens, timings) — so a project built without aGiTrack ends up with a fully tracked history the dashboard understands. Commits with no AI correspondence are kept **verbatim**; trees, authors and dates are preserved exactly.
+- **`--backtrace commit` (bake it in).** Replays your existing git history onto a **new branch** (`--backtrace-branch <name>`), and for each commit whose files an agent turn produced, appends the reconstructed `# Interaction Trace` and `# aGiTrack Metadata` (backend, model, tokens, timings) — so a project built without aGiTrack ends up with a fully tracked history the dashboard understands. Commits with no AI correspondence are kept **verbatim**; trees, authors and dates are preserved exactly.
   - It **rewrites history** (every commit gets a new hash), so it only runs on a new branch, requires a **clean working tree** (commit or `.gitignore` your pending files first), and never touches your current branch. Because the new branch is a rewrite it is **not a fast-forward** of the old one — aGiTrack prints the exact steps to review it and, if you choose, force-replace the old branch. A progress bar shows during the replay.
 
 The reconstruction is best-effort from what the transcripts recorded; review it before relying on it. Nothing is uploaded — it all runs locally.

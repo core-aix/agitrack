@@ -764,12 +764,12 @@ flowchart TD
   mode -->|text| txt[["Print a one-shot report"]]
   mode -->|html / bare| serve[["Serve the same dashboard as a background daemon (frozen 'BACKTRACE — not live' banner); dies with the terminal or via --backtrace stop"]]
   mode -->|commit| commit
-  subgraph commit["--backtrace commit --branch NEW"]
+  subgraph commit["--backtrace commit --backtrace-branch NEW"]
     g1{git repo?} -->|no| gi[["Instruct: git init + commit, then re-run"]]
     g1 -->|yes| g2{clean tree?}
     g2 -->|no| gd[["Instruct: commit or .gitignore pending files until git status is clean"]]
     g2 -->|yes| g3{branch name given & unused?}
-    g3 -->|no| gb[["Instruct: pass --branch <new-branch>"]]
+    g3 -->|no| gb[["Instruct: pass --backtrace-branch <new-branch>"]]
     g3 -->|yes| cls[["Classify each existing commit AI-vs-user by file overlap with the turns"]]
     cls --> warn[["Warn: this REWRITES history (new hashes, not a fast-forward); confirm (unless --yes)"]]
     warn --> replay[["Replay every commit onto NEW branch with git commit-tree — same tree/author/date/parents; append trace+metadata to AI commits, keep user commits verbatim (progress bar)"]]

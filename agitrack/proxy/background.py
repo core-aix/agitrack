@@ -560,6 +560,9 @@ class BackgroundRunner:
             self._debug(f"final process failed: {error!r}")
         self._manual.teardown()
         self._remove_handshake()
+        from agitrack import daemons
+
+        daemons.deregister()
         self.events.emit("daemon-stop", backend=self.state.backend)
         self._print("background tracker stopped.")
 
@@ -578,6 +581,11 @@ class BackgroundRunner:
             )
         except OSError as error:
             self._debug(f"handshake write failed: {error!r}")
+        # Also record it in the global daemon registry, so `agitrack --daemons` lists it and a
+        # self-update can restart it. Best-effort; never blocks the tracker.
+        from agitrack import daemons
+
+        daemons.register("background", self.repo.repo)
 
     def _remove_handshake(self) -> None:
         try:
