@@ -888,6 +888,34 @@ h2.section::before{content:"# ";color:var(--amber)}
 .pager button:hover:not([disabled]){background:var(--phosphor);color:var(--ink)}
 .pager button[disabled]{opacity:.35;cursor:default;border-color:var(--line);color:var(--fg-dim)}
 
+/* ---- file browser ---- */
+.filehead{display:flex;align-items:baseline;justify-content:space-between;gap:14px;flex-wrap:wrap;margin:38px 0 14px}
+.filehead h2.section{margin:0}
+.filesearch{background:var(--ink);color:var(--fg);border:1px solid var(--line);font-family:var(--mono);
+  font-size:13px;padding:6px 11px;min-width:min(60vw,260px)}
+.filesearch:focus{outline:none;border-color:var(--phosphor)}
+.filebrowse{background:var(--panel);border:1px solid var(--line)}
+.frow{display:grid;grid-template-columns:1fr auto auto auto;gap:16px;align-items:center;
+  padding:9px 16px;border-bottom:1px solid var(--line);cursor:pointer}
+.frow:last-child{border-bottom:none}
+.frow:hover{background:rgba(61,255,160,.04)}
+.frow .fp{color:var(--fg);overflow-wrap:anywhere}
+.frow.open .fp{color:var(--phosphor)}
+.frow .fc{color:var(--fg-dim);font-size:12px;white-space:nowrap}
+.frow .fl{font-size:12px;white-space:nowrap}
+.frow .fl .add{color:var(--phosphor)} .frow .fl .rem{color:var(--red)}
+.fdetail{border-bottom:1px solid var(--line);background:var(--panel-2)}
+.fchange{padding:9px 16px 11px;border-bottom:1px dashed var(--line);border-left:2px solid var(--phosphor-dim);margin-left:14px}
+.fchange:last-child{border-bottom:none}
+.fchange .fmeta{color:var(--ops);font-size:12px;margin-bottom:3px}
+.fchange .fsub{color:var(--fg);font-size:12.5px;margin-bottom:5px;overflow-wrap:anywhere}
+.fchange .fbtns{display:flex;gap:8px}
+.fchange .fbtns button{font-family:inherit;font-size:11.5px;color:var(--phosphor);background:transparent;
+  border:1px solid var(--phosphor-dim);padding:1px 8px;cursor:pointer;letter-spacing:.3px}
+.fchange .fbtns button:hover{background:var(--phosphor);color:var(--ink)}
+.fchange .fbox{margin-top:8px}
+.fchange .fbox[hidden]{display:none}
+.fmore{padding:12px 16px;color:var(--fg-dim);font-size:12.5px}
 footer{margin-top:46px;padding-top:22px;border-top:1px dashed var(--line);color:var(--fg-dim);font-size:12.5px;
   display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap}
 footer .flink{color:var(--accent,#6be);text-decoration:none}
@@ -971,6 +999,12 @@ __UPDATE_BANNER__
   <h2 class="section">shared sessions</h2>
   <div class="panel" id="shared"></div>
 
+  <div class="filehead" id="filehead">
+    <h2 class="section">files</h2>
+    <input id="file-search" class="filesearch" type="search" placeholder="filter files…" autocomplete="off">
+  </div>
+  <div class="filebrowse" id="filebrowse"></div>
+
   <div class="loghead">
     <h2 class="section">commit log</h2>
     <div class="logsort"><label for="f-sort">sort</label><select id="f-sort" title="Sort the filtered commits">
@@ -1036,6 +1070,10 @@ const state = {branch:DEFAULT_BRANCH, author:"", backend:"", model:"", fromTs:0,
 // Only a page served over http(s) has a backend to reach; a file:// snapshot has
 // none, so it must never raise a false "server unreachable" alarm.
 const LIVE = location.protocol.indexOf("http") === 0;
+// Backtrace mode reconstructs past agent turns from local transcripts: there is no git
+// commit and no committer behind a row, so the fabricated commit-hash and committer chrome
+// are hidden (see hideFabricatedChrome). Everything shown is real transcript data.
+const BACKTRACE = !!INIT.backtrace;
 const $ = id => document.getElementById(id);
 const fmt = n => (n||0).toLocaleString("en-US");
 const pct = (a,b) => b ? (a/b*100).toFixed(1)+"%" : "0%";
@@ -1457,7 +1495,8 @@ function renderLog(){
     const m = c.eff_model?`<span class="lc">${esc(c.eff_model)}</span>`:"";
     const subj = c.subject||"", shown = truncSubject(subj);
     const subjTitle = shown!==subj ? ` title="${esc(subj)}"` : "";  // full subject on hover when cut
-    return `<div class="entry ${cls}${c.pending?' pending':''}" data-i="${i}"><span class="sha">${esc(c.short)}</span>${badge}${pend}${squash}`+
+    const shaTag = BACKTRACE ? "" : `<span class="sha">${esc(c.short)}</span>`;
+    return `<div class="entry ${cls}${c.pending?' pending':''}" data-i="${i}">${shaTag}${badge}${pend}${squash}`+
       `<span class="ksub"${subjTitle}>${esc(shown)}</span>${lc}${tokenBrief(c.tokens)}${m}`+
       `<div class="detail" id="detail-${i}" hidden></div></div>`;
   }).join("");
@@ -1499,9 +1538,10 @@ function toggleDetail(i){
     const link = c.url ? `<a href="${esc(c.url)}" target="_blank" rel="noopener">view on GitHub ↗</a>` : "";
     const span = (c.started||c.ended)
       ? `<div class="dmeta">AI conversation: ${esc(c.started||"?")} → ${esc(c.ended||"?")}</div>` : "";
-    const who = (c.committers&&c.committers.length)
+    const who = (!BACKTRACE && c.committers&&c.committers.length)
       ? `<div class="dmeta">committer${c.committers.length>1?"s":""}: ${c.committers.map(esc).join(", ")}</div>` : "";
-    detail.innerHTML = `<div class="dhead">${esc(c.short)} ${diffBtn}${link}</div>${who}${span}`+
+    const head = BACKTRACE ? `${diffBtn}${link}` : `${esc(c.short)} ${diffBtn}${link}`;
+    detail.innerHTML = `<div class="dhead">${head}</div>${who}${span}`+
       `<div class="dmsg md" id="dbody-${i}" data-mode="msg">${md(c.message||"(no message recorded)")}</div>`+
       partsHtml(c.parts);
     detail.hidden = false;
@@ -1605,6 +1645,9 @@ async function refresh(){
     setDateBounds(); syncPeriodDates();  // extend the shown range to new commits
     await loadLog(LOGPAGE.offset||0);
     syncFilters(); renderAgg(); renderLog();  // renderAgg() also repaints shared sessions
+    // Refresh the file list too — but only when no file is expanded, so a poll never
+    // yanks a change the user is reading out from under them.
+    if(!document.querySelector(".fdetail")){ await loadFiles(); renderFiles(); }
   } else {
     // No new commit, but shared sessions (and their "updated" age) still need to
     // refresh every poll — e.g. an auto-share just bumped a session's timestamp.
@@ -1641,7 +1684,98 @@ function applyPeriod(){
   syncPeriodDates();
 }
 
+// ---- file browser: every changed file, its change history, and the conversation/tokens
+// behind each change. Served by /files (list), /filelog?path= (one file's history), and
+// /filediff?path=&sha= (one change's diff for that file). Works for real commits and backtrace.
+let FILES = null, FILEQ = "", OPENFILE = { path: null, changes: [] };
+async function loadFiles(){
+  try{ const r = await fetch("files", {cache:"no-store"}); FILES = (await r.json()).files || []; }
+  catch(e){ FILES = FILES || []; }
+}
+function renderFiles(){
+  const host = $("filebrowse"), head = $("filehead");
+  if(!host || !head) return;
+  if(!FILES || !FILES.length){ head.style.display = "none"; host.style.display = "none"; return; }
+  head.style.display = ""; host.style.display = "";
+  const q = FILEQ.trim().toLowerCase();
+  const rows = q ? FILES.filter(f => f.path.toLowerCase().includes(q)) : FILES;
+  host.innerHTML = rows.length
+    ? rows.map(f => `<div class="frow" data-path="${esc(f.path)}"><span class="fp">${esc(f.path)}</span>`+
+        `<span class="fc">${fmt(f.changes)} change${f.changes===1?"":"s"}</span>`+
+        `<span class="fl"><span class="add">+${fmt(f.ins)}</span> <span class="rem">−${fmt(f.del)}</span></span>`+
+        `<span class="fc">${kfmt(f.output_tokens||0)} out</span></div>`).join("")
+    : `<div class="fmore">no files match “${esc(FILEQ)}”</div>`;
+}
+function fileChangeHtml(c, i){
+  const when = c.ts ? new Date(c.ts*1000).toISOString().slice(0,16).replace("T"," ")+" UTC" : "";
+  const who = [c.backend, c.model].filter(Boolean).map(esc).join(" · ");
+  const out = (c.tokens && c.tokens.output) ? ` · ${kfmt(c.tokens.output)} out tok` : "";
+  const lc = `<span class="add">+${fmt(c.ins)}</span> <span class="rem">−${fmt(c.del)}</span>`;
+  const meta = [esc(when), who, out].filter(Boolean).join(who?"":"");
+  return `<div class="fchange">`+
+    `<div class="fmeta">${esc(when)}${who?` · ${who}`:""}${out} · ${lc}</div>`+
+    `<div class="fsub">${esc(c.subject || c.prompt || "(change)")}</div>`+
+    `<div class="fbtns"><button class="fconvbtn" data-i="${i}">conversation</button>`+
+    `<button class="fdiffbtn" data-i="${i}">file diff</button></div>`+
+    `<div class="fbox fconv" hidden></div><div class="fbox fdiff" hidden></div></div>`;
+}
+async function openFile(row){
+  const path = row.dataset.path;
+  const existing = row.nextElementSibling;
+  document.querySelectorAll(".fdetail").forEach(d => d.remove());
+  document.querySelectorAll(".frow.open").forEach(r => r.classList.remove("open"));
+  if(existing && existing.classList.contains("fdetail")) return;  // was open → just close
+  row.classList.add("open");
+  let data = { changes: [] };
+  try{ data = await (await fetch("filelog?path="+encodeURIComponent(path), {cache:"no-store"})).json(); }catch(e){}
+  OPENFILE = { path, changes: data.changes || [] };
+  const div = document.createElement("div");
+  div.className = "fdetail";
+  div.innerHTML = OPENFILE.changes.length
+    ? OPENFILE.changes.map((c,i) => fileChangeHtml(c,i)).join("")
+    : `<div class="fmore">no recorded changes</div>`;
+  row.after(div);
+}
+function toggleFileConv(btn){
+  const box = btn.closest(".fchange").querySelector(".fconv"), c = OPENFILE.changes[+btn.dataset.i] || {};
+  if(box.hidden){ box.innerHTML = `<div class="dmsg md">${md(c.message || "(no conversation recorded)")}</div>`; box.hidden=false; btn.textContent="hide conversation"; }
+  else { box.hidden = true; btn.textContent = "conversation"; }
+}
+async function toggleFileDiff(btn){
+  const box = btn.closest(".fchange").querySelector(".fdiff"), c = OPENFILE.changes[+btn.dataset.i] || {};
+  if(!box.hidden){ box.hidden = true; btn.textContent = "file diff"; return; }
+  btn.textContent = "hide diff";
+  box.hidden = false;
+  if(box.dataset.loaded){ return; }
+  box.innerHTML = `<div class="fmore">loading…</div>`;
+  try{
+    const r = await fetch(`filediff?path=${encodeURIComponent(OPENFILE.path)}&sha=${encodeURIComponent(c.sha)}`, {cache:"no-store"});
+    const d = await r.json();
+    box.innerHTML = d.diff ? renderDiff(d.diff) : `<div class="fmore">${esc(d.error || "no diff for this change")}</div>`;
+  }catch(e){ box.innerHTML = `<div class="fmore">could not load diff</div>`; }
+  box.dataset.loaded = "1";
+}
+function wireFileBrowser(){
+  const search = $("file-search");
+  if(search) search.addEventListener("input", e => { FILEQ = e.target.value; renderFiles(); });
+  const host = $("filebrowse");
+  if(host) host.addEventListener("click", e => {
+    const cb = e.target.closest(".fconvbtn"); if(cb){ toggleFileConv(cb); return; }
+    const db = e.target.closest(".fdiffbtn"); if(db){ toggleFileDiff(db); return; }
+    if(e.target.closest(".fdetail")) return;
+    const row = e.target.closest(".frow"); if(row) openFile(row);
+  });
+}
+function hideFabricatedChrome(){
+  // Backtrace has no committer behind a turn, so drop the committer filter and the
+  // "by committer" breakdown entirely — showing a made-up committer would be dishonest.
+  if(!BACKTRACE) return;
+  const fa = $("f-author"); if(fa && fa.closest(".field")) fa.closest(".field").style.display = "none";
+  const bc = $("by-committer");
+  if(bc){ bc.style.display = "none"; if(bc.previousElementSibling) bc.previousElementSibling.style.display = "none"; }
+}
 async function init(){
+  hideFabricatedChrome();
   // Shell mode: the chrome is already on screen with the loading animation; fetch the
   // real aggregates + first log page, then drop the loader and render. A big repo's
   // git-log crunch happens here, behind the animation, instead of blocking first paint.
@@ -1719,6 +1853,9 @@ async function init(){
   // The canvas backing store is sized in px, so it must be repainted on resize.
   let rz; window.addEventListener("resize", () => { clearTimeout(rz); rz = setTimeout(renderChart, 120); });
   if(ready){ renderAgg(); renderLog(); }
+  // The file browser is independent of the commit-log filters, so it loads once here.
+  wireFileBrowser();
+  await loadFiles(); renderFiles();
   // Poll only when there's a live backend; the poll also clears the
   // "unreachable" banner automatically once the server is back — and, after a failed
   // boot fetch, the next successful poll populates the view (HEAD goes "" → real).

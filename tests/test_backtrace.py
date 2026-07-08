@@ -216,12 +216,21 @@ def test_backtrace_tokens_exclude_total_and_context():
     assert "total" not in tokens and "context" not in tokens
 
 
-def test_backtrace_message_carries_interaction_trace():
-    turn = _turn("please refactor the parser", agent="I refactored it.")
-    message = bt._message(turn)
+def test_backtrace_message_carries_interaction_trace_and_real_metadata():
+    turn = _turn("please refactor the parser", agent="I refactored it.", tokens=TokenUsage(input=40, output=90))
+    source = bt._Source("claude", "sess-1", 1.0, "/repo", lambda: None)
+    exported = ExportedSession(session_id="sess-1", model="claude-opus-4-8", updated=1, turns=[turn])
+    message = bt._message(source, exported, turn)
+    # the full user<->agent conversation
     assert "# Interaction Trace" in message
     assert "## User" in message and "please refactor the parser" in message
     assert "## Agent" in message and "I refactored it." in message
+    # the real aGiTrack metadata block — no invented fields (no session_name / committer / hash)
+    assert "# aGiTrack Metadata" in message
+    assert "backend: claude" in message and "model: claude-opus-4-8" in message
+    assert "backend_session_id: sess-1" in message
+    assert "tokens_since_last_commit_output: 90" in message
+    assert "session_name:" not in message and "agitrack_session_id:" not in message
 
 
 def test_backtrace_relativizes_edit_paths():
@@ -265,6 +274,76 @@ def test_backtrace_html_and_endpoints(monkeypatch, tmp_path):
 
 
 # --------------------------------------------------------------------------- end-to-end, non-git
+
+
+# --------------------------------------------------------------------------- file browser
+
+
+def test_backtrace_file_browser(monkeypatch, tmp_path):
+    e1 = make_edit("/repo/a.py", "", "x\ny\n", status="added")
+    e2 = make_edit("/repo/a.py", "x\ny\n", "x\nY\nz\n")  # a.py changed twice
+    e3 = make_edit("/repo/b.py", "", "1\n", status="added")
+    es = ExportedSession(
+        session_id="c1",
+        model="claude-opus-4-8",
+        updated=3000,
+        turns=[
+            _turn("create a.py and b.py", edits=[e1, e3], assistant_id="t1", ended=1000),
+            _turn("tweak a.py", edits=[e2], assistant_id="t2", ended=2000, agent="Adjusted a.py."),
+        ],
+    )
+    _patch_discovery(monkeypatch, claude_sessions={"c1": es})
+    view = bt.build_backtrace(tmp_path)
+
+    from agitrack.metrics.files import backtrace_browser
+
+    browser = backtrace_browser(view.dashboard.stats, view.file_edits)
+    files = {row["path"]: row for row in browser.files_payload()}
+    assert set(files) == {"a.py", "b.py"}
+    assert files["a.py"]["changes"] == 2  # a.py has two changes in its history
+    assert files["b.py"]["changes"] == 1
+
+    log = browser.file_log_payload("a.py")
+    assert len(log["changes"]) == 2
+    newest = log["changes"][0]  # newest first
+    assert newest["subject"] == "tweak a.py"
+    assert "# Interaction Trace" in newest["message"] and "Adjusted a.py." in newest["message"]
+    assert newest["tokens"]  # tokens carried through
+
+    diff = browser.file_diff("a.py", newest["sha"])
+    assert diff["diff"].startswith("diff --git a/a.py b/a.py")
+    # a change's per-file diff is only that file, never the other file in the same turn
+    assert "b.py" not in browser.file_diff("a.py", log["changes"][0]["sha"])["diff"]
+
+
+def test_git_file_browser(tmp_path):
+    """The file browser also works for the real dashboard: per-file history over real commits,
+    with real per-file diffs."""
+    from agitrack.git import GitRepo
+    from agitrack.metrics.collect import build_dashboard
+    from agitrack.metrics.files import git_browser
+
+    repo = GitRepo.init(tmp_path)
+    (repo.repo / "a.py").write_text("one\n", encoding="utf-8")
+    repo.stage_paths(["a.py"])
+    repo.commit("add a.py")
+    (repo.repo / "a.py").write_text("one\ntwo\n", encoding="utf-8")
+    (repo.repo / "b.py").write_text("hi\n", encoding="utf-8")
+    repo.stage_paths(["a.py", "b.py"])
+    repo.commit("extend a.py and add b.py")
+
+    dash = build_dashboard(repo)
+    browser = git_browser(repo, dash.stats, "HEAD")
+    files = {row["path"]: row for row in browser.files_payload()}
+    assert "a.py" in files and "b.py" in files
+    assert files["a.py"]["changes"] == 2  # a.py touched by both commits
+
+    log = browser.file_log_payload("a.py")
+    assert len(log["changes"]) == 2
+    sha = log["changes"][0]["sha"]
+    diff = browser.file_diff("a.py", sha)
+    assert "diff --git" in diff["diff"] and "a.py" in diff["diff"]
+    assert "b.py" not in browser.file_diff("a.py", sha)["diff"]  # per-file: only a.py
 
 
 def test_backtrace_end_to_end_non_git_claude(monkeypatch, tmp_path):

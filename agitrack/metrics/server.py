@@ -19,6 +19,7 @@ from typing import Any
 
 from agitrack.git import GitRepo
 from agitrack.metrics.collect import Dashboard, build_dashboard
+from agitrack.metrics.files import FileBrowser, git_browser
 from agitrack.metrics.github import cached_logins
 from agitrack.metrics.web import aggregates_payload, commit_diff, log_page, shared_sessions_for, shell_html
 
@@ -39,6 +40,9 @@ def _int(query: dict[str, list[str]], key: str, default: int) -> int:
 class _DashboardHandler(http.server.BaseHTTPRequestHandler):
     repo: GitRepo  # set on the per-server subclass
     email_logins: dict[str, str] = {}  # lowercased email → login hint (set on the subclass)
+    # Per-server cache of the file browser, keyed by (ref, head sha): building it scans
+    # `git log --numstat`, so it is rebuilt only when the branch's tip moves, not per poll.
+    _browser_cache: dict[tuple[str, str], FileBrowser] = {}
 
     def do_GET(self) -> None:  # noqa: N802 (http.server API)
         try:
@@ -87,6 +91,16 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
                 # This commit's file diffs, straight from the local clone — so the dashboard
                 # shows changes without GitHub. The sha is validated as a hex id in commit_diff.
                 self._respond("application/json", self._json(commit_diff(self.repo, _str(query, "sha"))))
+            elif parsed.path == "/files":
+                # The file browser: every changed file with its per-file change history and the
+                # conversation/tokens behind each change (same view as --backtrace, real commits).
+                self._respond("application/json", self._json({"files": self._browser(ref).files_payload()}))
+            elif parsed.path == "/filelog":
+                self._respond("application/json", self._json(self._browser(ref).file_log_payload(_str(query, "path"))))
+            elif parsed.path == "/filediff":
+                self._respond(
+                    "application/json", self._json(self._browser(ref).file_diff(_str(query, "path"), _str(query, "sha")))
+                )
             else:
                 self.send_error(404, "not found")
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
@@ -112,6 +126,20 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
         # this cache so the IDs are usually ready by the first /data poll.
         logins = cached_logins(self.repo)
         return build_dashboard(self.repo, ref, sha_logins=logins, email_logins=self.email_logins)
+
+    def _browser(self, ref: str = "HEAD") -> FileBrowser:
+        # Build (and cache) the file browser for this ref. Keyed by the branch tip so a poll
+        # that finds no new commits reuses it; only a new commit rebuilds the numstat index.
+        dash = self._dashboard(ref)
+        head = dash.stats[-1].sha if dash.stats else ""
+        key = (ref, head)
+        cache = type(self)._browser_cache
+        hit = cache.get(key)
+        if hit is None:
+            hit = git_browser(self.repo, dash.stats, ref)
+            cache.clear()  # keep only the latest tip's browser — bounded memory
+            cache[key] = hit
+        return hit
 
     def _respond(self, content_type: str, body: bytes) -> None:
         self.send_response(200)
@@ -154,7 +182,12 @@ def build_server(
     handler = type(
         "DashboardHandler",
         (_DashboardHandler,),
-        {"repo": repo, "email_logins": {k.lower(): v for k, v in (email_logins or {}).items()}},
+        {
+            "repo": repo,
+            "email_logins": {k.lower(): v for k, v in (email_logins or {}).items()},
+            # A fresh per-server cache so two servers (different repos) never share a browser.
+            "_browser_cache": {},
+        },
     )
     try:
         return _DashboardServer((host, port), handler)
