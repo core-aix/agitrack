@@ -258,7 +258,8 @@ aGiTrack tracks one session per repository and stays pinned to the session it la
 `agitrack --dashboard` (or `-d`) opens a **live, auto-refreshing web dashboard** of your repository — who and what wrote the code — served on `localhost` and opened in your browser. Every number is computed from commit metadata alone, so it's identical on every clone; nothing is sent anywhere.
 
 ```bash
-agitrack --dashboard        # serve on localhost and open the browser (Ctrl-C to stop)
+agitrack --dashboard        # start a background daemon on localhost, open the browser, and return to your shell
+agitrack -d stop            # stop that daemon (it also stops when the launching terminal closes)
 agitrack -d text            # one-shot plain-text report instead (pipe it, paste it into an issue)
 ```
 
