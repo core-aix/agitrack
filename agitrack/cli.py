@@ -200,6 +200,20 @@ def main(argv: list[str] | None = None) -> int:
         "one-shot report and exits",
     )
     parser.add_argument(
+        "--backtrace",
+        nargs="?",
+        const="html",
+        choices=["text", "html"],
+        default=None,
+        help="reconstruct how PAST coding-agent conversations changed THIS directory, from local "
+        "Claude/OpenCode transcripts alone — even if you have never used aGiTrack here, and even if "
+        "the directory is not a git repo. It reads the sessions that ran in this directory (or a "
+        "subdirectory), recovers each turn's file edits, and shows the same dashboard (tokens, "
+        "models, lines changed, and the full user↔agent trace behind each change) marked clearly as "
+        "a historical backtrace, not live repo status. Bare `--backtrace` (or `--backtrace html`) "
+        "serves it on localhost and opens the browser; `text` prints a one-shot report.",
+    )
+    parser.add_argument(
         "-s",
         "--status",
         action="store_true",
@@ -460,6 +474,24 @@ def main(argv: list[str] | None = None) -> int:
             except json.JSONDecodeError:
                 pass
         return run_dashboard_daemon(serve_repo, owner_pid=args.dashboard_owner_pid, email_logins=email_logins)
+
+    if args.backtrace:
+        # Read-only reconstruction from local transcripts — no git, no privacy prompt, no
+        # repo init: it works in ANY directory, including one that was never a repository. The
+        # target is the directory itself (--repo, or the cwd), NOT a discovered repo root, so a
+        # subdirectory backtraces its own sessions.
+        directory = Path(args.repo).expanduser().resolve()
+        if not directory.is_dir():
+            print(f"{directory} is not a directory.")
+            return 1
+        if args.backtrace == "text":
+            from agitrack.metrics.backtrace import render_backtrace_text
+
+            print(render_backtrace_text(directory))
+            return 0
+        from agitrack.metrics.backtrace import serve_backtrace
+
+        return serve_backtrace(directory)
 
     if args.dashboard:
         # Read-only: nothing is logged or committed, so no privacy

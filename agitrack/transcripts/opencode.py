@@ -11,9 +11,15 @@ import time
 from pathlib import Path
 
 from agitrack.backends.base import TokenUsage
+
+# Bind the transcript dataclasses (and the git-free edit reconstruction that depends only on
+# them) BEFORE importing ``agitrack.sessions`` below: that package pulls in
+# ``agitrack.commits.actions``, which imports ``SessionTurn`` back from this module, so these
+# names must already exist here or that cycle fails when opencode is the first module imported.
+from agitrack.transcripts.types import ExportedSession, FileEdit, SessionRef, SessionTurn, turns_after
+from agitrack.transcripts.edits import make_edit
 from agitrack.proc import console_isolation_kwargs, resolve_subprocess_command
 from agitrack.sessions.share_cap import select_kept_indices
-from agitrack.transcripts.types import ExportedSession, SessionRef, SessionTurn, turns_after
 
 # Every `opencode` subprocess aGiTrack runs synchronously (often on the main reactor/menu
 # thread — session list/export/import) is capped: the CLI talks to a TTY and can hang
@@ -30,6 +36,7 @@ __all__ = [
     "latest_session_id",
     "list_sessions",
     "list_worktree_sessions",
+    "sessions_under",
     "session_belongs_to_repo",
     "export_session",
     "export_session_raw",
@@ -155,6 +162,33 @@ def list_worktree_sessions(worktrees_root: Path) -> list[tuple[str, SessionRef]]
     return out
 
 
+def sessions_under(directory: Path) -> list[tuple[SessionRef, str]]:
+    """Every OpenCode session whose recorded ``directory`` is ``directory`` or a path
+    beneath it, paired with that directory — the sessions ``--backtrace`` reconstructs.
+    Uses ``opencode session list`` (the sanctioned export path) and filters by directory,
+    so it needs no git and catches sessions run in subdirectories or worktrees."""
+    directory = directory.resolve()
+    cwd = next((p for p in [directory, *directory.parents] if p.is_dir()), Path.home())
+    out: list[tuple[SessionRef, str]] = []
+    for session in _opencode_session_list(cwd, 500):
+        sid = session.get("id")
+        sdir = session.get("directory")
+        if not sid or not isinstance(sdir, str):
+            continue
+        try:
+            dpath = Path(sdir).resolve()
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if dpath != directory and directory not in dpath.parents:
+            continue
+        updated = session.get("updated") or session.get("created") or 0
+        title = session.get("title")
+        ref = SessionRef(id=str(sid), updated=_to_seconds(updated), label=title if isinstance(title, str) else None)
+        out.append((ref, str(dpath)))
+    out.sort(key=lambda item: item[0].updated, reverse=True)
+    return out
+
+
 def session_belongs_to_repo(repo: Path, session_id: str) -> bool:
     sessions = _opencode_session_list(repo, 50)
     resolved = repo.resolve()
@@ -172,7 +206,7 @@ def _same_repo(directory: object, repo: Path) -> bool:
         return directory == str(repo)
 
 
-def export_session(repo: Path, session_id: str) -> ExportedSession | None:
+def export_session(repo: Path, session_id: str, *, collect_edits: bool = False) -> ExportedSession | None:
     data = _export_data(repo, session_id)
     if data is None:
         return None
@@ -181,7 +215,7 @@ def export_session(repo: Path, session_id: str) -> ExportedSession | None:
     # the child id the parent's task part records) and fold its tokens into the turn that
     # launched it, so sub-agent consumption is fully accounted (issue: subagent tokens).
     subagent_tokens = _collect_subagent_tokens(repo, session_id, data)
-    return parse_exported_session(data, subagent_tokens=subagent_tokens)
+    return parse_exported_session(data, subagent_tokens=subagent_tokens, collect_edits=collect_edits)
 
 
 def _export_data(repo: Path, session_id: str) -> dict | None:
@@ -524,7 +558,10 @@ def _run_opencode_posix_pty(repo: Path, args: list[str]) -> tuple[str, int]:
 
 
 def parse_exported_session(
-    data: dict, *, subagent_tokens: "dict[str | None, TokenUsage] | None" = None
+    data: dict,
+    *,
+    subagent_tokens: "dict[str | None, TokenUsage] | None" = None,
+    collect_edits: bool = False,
 ) -> ExportedSession:
     # `subagent_tokens` maps a sub-agent child session id -> its token usage (in the
     # sub-agent buckets); each is added to the turn whose `task` part launched that child
@@ -546,7 +583,7 @@ def parse_exported_session(
         nonlocal compactions
         if current_user is None or not assistant_group:
             return
-        turn = _build_turn(current_user, assistant_group, model)
+        turn = _build_turn(current_user, assistant_group, model, collect_edits=collect_edits)
         if turn:
             turn.compaction_count = compactions
             turns.append(turn)
@@ -599,7 +636,13 @@ def _attribute_subagent_tokens(
         turns[index].tokens.add(usage)
 
 
-def _build_turn(user_message: dict, assistants: list[dict], session_model: str | None) -> SessionTurn | None:
+def _build_turn(
+    user_message: dict,
+    assistants: list[dict],
+    session_model: str | None,
+    *,
+    collect_edits: bool = False,
+) -> SessionTurn | None:
     user_info = _as_dict(user_message.get("info"))
     user_id = str(user_info.get("id") or "")
     if not user_id:
@@ -608,6 +651,7 @@ def _build_turn(user_message: dict, assistants: list[dict], session_model: str |
     final_response = ""
     final_assistant: dict | None = None
     agent_messages: list[str] = []
+    edits: list[FileEdit] = []
     tokens = TokenUsage()
     model = session_model
     effort: str | None = None
@@ -617,6 +661,8 @@ def _build_turn(user_message: dict, assistants: list[dict], session_model: str |
         tokens.add(_tokens(assistant_info, assistant.get("parts")))
         model = _model_name(assistant_info) or model
         effort = effort or _find_value(assistant_info, _REASONING_EFFORT_KEYS)
+        if collect_edits:
+            edits.extend(_edits_from_parts(assistant.get("parts")))
         response = _final_response(assistant.get("parts"), finish=assistant_info.get("finish"))
         if response:
             final_response = response
@@ -641,7 +687,36 @@ def _build_turn(user_message: dict, assistants: list[dict], session_model: str |
         started_at=_message_time(user_info),
         ended_at=_message_time(_as_dict(final_info)) or _message_time(user_info),
         agent_messages=agent_messages,
+        edits=edits,
     )
+
+
+def _edits_from_parts(parts: object) -> list[FileEdit]:
+    """The file edits in an assistant message's ``tool`` parts (OpenCode's edit / write /
+    patch tools), reconstructed from each call's input — used by the backtrace exporter.
+    Non-editing tools (read, bash, webfetch, …) are ignored."""
+    if not isinstance(parts, list):
+        return []
+    out: list[FileEdit] = []
+    for part in parts:
+        if not (isinstance(part, dict) and part.get("type") == "tool"):
+            continue
+        tool = str(part.get("tool") or "").lower()
+        state = part.get("state")
+        raw_input = state.get("input") if isinstance(state, dict) else None
+        inp = raw_input if isinstance(raw_input, dict) else {}
+        path = inp.get("filePath") or inp.get("file_path") or inp.get("path") or ""
+        if not isinstance(path, str):
+            continue
+        if tool == "write":
+            edit = make_edit(path, "", str(inp.get("content") or ""), status="added")
+            if edit is not None:
+                out.append(edit)
+        elif tool in ("edit", "patch"):
+            edit = make_edit(path, str(inp.get("oldString") or ""), str(inp.get("newString") or ""))
+            if edit is not None:
+                out.append(edit)
+    return out
 
 
 def _message_time(info: dict) -> int | None:

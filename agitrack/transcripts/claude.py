@@ -9,7 +9,8 @@ from pathlib import Path
 
 from agitrack.backends.base import TokenUsage
 from agitrack.sessions.share_cap import select_kept_indices
-from agitrack.transcripts.types import ExportedSession, SessionRef, SessionTurn, turns_after
+from agitrack.transcripts.edits import make_edit
+from agitrack.transcripts.types import ExportedSession, FileEdit, SessionRef, SessionTurn, turns_after
 
 __all__ = [
     "ExportedSession",
@@ -19,8 +20,10 @@ __all__ = [
     "latest_session_id",
     "list_sessions",
     "list_worktree_sessions",
+    "sessions_under",
     "session_belongs_to_repo",
     "export_session",
+    "export_session_at",
     "export_session_raw",
     "session_transcript_size",
     "import_shared_session",
@@ -139,6 +142,68 @@ def list_worktree_sessions(worktrees_root: Path) -> list[tuple[str, SessionRef]]
         for ref in _refs_in_project_dir(project_dir):
             out.append((worktree_key, ref))
     out.sort(key=lambda item: item[1].updated, reverse=True)
+    return out
+
+
+def _first_cwd(path: Path, *, line_limit: int = 200) -> str | None:
+    """The first working directory a transcript file records (Claude stamps ``cwd`` on
+    almost every row). Reads only the head of the file — enough to confirm which directory
+    a session ran in without loading the whole transcript."""
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for _, line in zip(range(line_limit), handle):
+                if '"cwd"' not in line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                cwd = row.get("cwd")
+                if isinstance(cwd, str) and cwd:
+                    return cwd
+    except OSError:
+        return None
+    return None
+
+
+def _within(directory: Path, cwd: str) -> bool:
+    """Whether ``cwd`` is ``directory`` itself or a path beneath it (so a session that ran
+    in a subdirectory or an ``.agitrack`` worktree of ``directory`` counts as having touched
+    it)."""
+    try:
+        candidate = Path(cwd).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return candidate == directory or directory in candidate.parents
+
+
+def sessions_under(directory: Path) -> list[tuple[SessionRef, Path]]:
+    """Every Claude session whose recorded working directory is ``directory`` or a path
+    beneath it, paired with its transcript file — the sessions the ``--backtrace`` feature
+    reconstructs. Git is never consulted, so this works in a directory that was never a repo.
+
+    Claude names each project directory by substituting the cwd's non-alphanumerics with
+    dashes, so a session run under ``directory`` lives in a project dir whose name starts
+    with ``directory``'s encoding; the recorded cwd is then re-read to reject a same-prefix
+    sibling (``/a/b`` vs ``/a/b-c``)."""
+    root = _projects_root()
+    if not root.is_dir():
+        return []
+    directory = directory.resolve()
+    encoded = _encode_repo(directory)
+    out: list[tuple[SessionRef, Path]] = []
+    for project_dir in root.iterdir():
+        if not project_dir.is_dir():
+            continue
+        name = project_dir.name
+        if name != encoded and not name.startswith(encoded + "-"):
+            continue
+        for ref in _refs_in_project_dir(project_dir):
+            path = project_dir / f"{ref.id}.jsonl"
+            cwd = _first_cwd(path)
+            if cwd is not None and _within(directory, cwd):
+                out.append((ref, path))
+    out.sort(key=lambda item: item[0].updated, reverse=True)
     return out
 
 
@@ -606,8 +671,18 @@ def session_last_activity(session_id: str) -> float | None:
     return latest
 
 
-def export_session(repo: Path, session_id: str) -> ExportedSession | None:
-    path = _session_path(repo, session_id)
+def export_session(repo: Path, session_id: str, *, collect_edits: bool = False) -> ExportedSession | None:
+    return export_session_at(_session_path(repo, session_id), collect_edits=collect_edits)
+
+
+def export_session_at(path: Path, *, collect_edits: bool = False) -> ExportedSession | None:
+    """Export the session recorded in the transcript file at ``path`` (the session id is
+    its filename stem). Reads a specific file rather than encoding a repo path, so the
+    backtrace scanner can export sessions it discovered under any project directory —
+    including ones whose recorded cwd is a subdirectory or a deleted worktree.
+
+    ``collect_edits`` also recovers each turn's file edits from the tool-call inputs (see
+    :func:`_edits_from_message`); it is off for ordinary exports."""
     if not path.is_file():
         return None
     rows: list[dict] = []
@@ -624,10 +699,11 @@ def export_session(repo: Path, session_id: str) -> ExportedSession | None:
     except OSError:
         return None
     return parse_rows(
-        session_id,
+        path.stem,
         rows,
         subagent_tokens=_subagent_token_map(path),
         unmatched_subagent_time=_subagent_unmatched_mtime(path),
+        collect_edits=collect_edits,
     )
 
 
@@ -788,6 +864,7 @@ def parse_rows(
     *,
     subagent_tokens: "dict[str | None, TokenUsage] | None" = None,
     unmatched_subagent_time: int | None = None,
+    collect_edits: bool = False,
 ) -> ExportedSession:
     # `subagent_tokens` maps a Task tool_use id -> the sub-agent's token usage (in the
     # sub-agent buckets), for newer Claude Code where each sub-agent is recorded in its
@@ -974,6 +1051,11 @@ def parse_rows(
             if current["reasoning_effort"] is None and _has_thinking(message):
                 current["reasoning_effort"] = "on"
             _collect_tool_use_ids(message, current["tool_ids"])
+            if collect_edits:
+                # Reconstruct this turn's file edits from the tool-call inputs (opt-in; the
+                # backtrace exporter is the only caller). Attributed to the turn in flight,
+                # so they land on the same SessionTurn the conversation trace does.
+                current.setdefault("edits", []).extend(_edits_from_message(message))
             text = _assistant_text(message)
             if text:
                 current["final"] = text
@@ -1017,6 +1099,42 @@ def _collect_tool_use_ids(message: dict, sink: set[str]) -> None:
             tool_id = block.get("id")
             if isinstance(tool_id, str) and tool_id:
                 sink.add(tool_id)
+
+
+def _edits_from_message(message: dict) -> list[FileEdit]:
+    """The file edits in an assistant message's ``tool_use`` blocks (Edit / Write /
+    MultiEdit), as :class:`FileEdit`s — used by the backtrace exporter to reconstruct
+    how the conversation changed files. Non-editing tools (Read, Bash, …) are ignored;
+    a tool call that produced no net change contributes nothing."""
+    content = message.get("content")
+    if not isinstance(content, list):
+        return []
+    edits: list[FileEdit] = []
+    for block in content:
+        if not (isinstance(block, dict) and block.get("type") == "tool_use"):
+            continue
+        name = block.get("name")
+        raw_input = block.get("input")
+        inp = raw_input if isinstance(raw_input, dict) else {}
+        path = inp.get("file_path") or inp.get("filePath") or ""
+        if not isinstance(path, str):
+            continue
+        if name == "Write":
+            edit = make_edit(path, "", str(inp.get("content") or ""), status="added")
+            if edit is not None:
+                edits.append(edit)
+        elif name == "Edit":
+            edit = make_edit(path, str(inp.get("old_string") or ""), str(inp.get("new_string") or ""))
+            if edit is not None:
+                edits.append(edit)
+        elif name == "MultiEdit":
+            for sub in inp.get("edits") or []:
+                if not isinstance(sub, dict):
+                    continue
+                edit = make_edit(path, str(sub.get("old_string") or ""), str(sub.get("new_string") or ""))
+                if edit is not None:
+                    edits.append(edit)
+    return edits
 
 
 def _attribute_subagent_tokens(
@@ -1098,6 +1216,7 @@ def _finalize_turn(turn: dict, *, dangling: bool = False) -> SessionTurn:
         reasoning_effort=turn.get("reasoning_effort"),
         agent_messages=list(turn.get("messages") or []),
         queued_followups=list(turn.get("queued_followups") or []),
+        edits=list(turn.get("edits") or []),
     )
 
 
