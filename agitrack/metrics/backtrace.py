@@ -16,7 +16,6 @@ out to its CLI) would be far too slow, and the history does not change under us.
 
 from __future__ import annotations
 
-import getpass
 import hashlib
 import http.server
 import json
@@ -27,7 +26,8 @@ from functools import partial
 from pathlib import Path
 from typing import Callable
 
-from agitrack.commits.message import render_interaction_trace
+from agitrack.commits import METADATA_HEADER
+from agitrack.commits.message import _token_metadata_lines, render_interaction_trace
 from agitrack.metrics.collect import CommitStat, Dashboard, _abbreviate_home
 from agitrack.transcripts import claude, opencode
 from agitrack.transcripts.edits import combine_patches, total_lines
@@ -52,7 +52,8 @@ class BacktraceView:
 
     directory: str  # home-abbreviated, for display
     dashboard: Dashboard
-    diffs: dict[str, str] = field(default_factory=dict)  # virtual sha -> unified patch
+    diffs: dict[str, str] = field(default_factory=dict)  # virtual sha -> combined unified patch
+    file_edits: dict[str, list[FileEdit]] = field(default_factory=dict)  # virtual sha -> per-file edits
     session_count: int = 0  # sessions included in the view
     edited_sessions: int = 0  # of those, how many actually changed files
     backends: list[str] = field(default_factory=list)  # backends that contributed
@@ -119,9 +120,9 @@ def build_backtrace(directory: Path, *, max_sessions: int = MAX_SESSIONS) -> Bac
     dropped = max(0, len(sources) - max_sessions)
     sources = sources[:max_sessions]
 
-    author = _local_author()
     stats: list[CommitStat] = []
     diffs: dict[str, str] = {}
+    file_edits: dict[str, list[FileEdit]] = {}
     backends: set[str] = set()
     edited_sessions = 0
     included_sessions = 0
@@ -134,7 +135,9 @@ def build_backtrace(directory: Path, *, max_sessions: int = MAX_SESSIONS) -> Bac
         if exported is None:
             continue
         bases = _relativize_bases(directory, source.base_dir)
-        session_stats, session_diffs, session_edited = _session_to_stats(source, exported, author=author, bases=bases)
+        session_stats, session_diffs, session_file_edits, session_edited = _session_to_stats(
+            source, exported, bases=bases
+        )
         if not session_stats:
             continue
         included_sessions += 1
@@ -143,6 +146,7 @@ def build_backtrace(directory: Path, *, max_sessions: int = MAX_SESSIONS) -> Bac
             edited_sessions += 1
         stats.extend(session_stats)
         diffs.update(session_diffs)
+        file_edits.update(session_file_edits)
 
     stats.sort(key=lambda stat: (stat.timestamp, stat.sha))  # oldest first, like git log order
     dashboard = Dashboard(
@@ -156,6 +160,7 @@ def build_backtrace(directory: Path, *, max_sessions: int = MAX_SESSIONS) -> Bac
         directory=_abbreviate_home(str(directory)),
         dashboard=dashboard,
         diffs=diffs,
+        file_edits=file_edits,
         session_count=included_sessions,
         edited_sessions=edited_sessions,
         backends=sorted(backends),
@@ -164,12 +169,14 @@ def build_backtrace(directory: Path, *, max_sessions: int = MAX_SESSIONS) -> Bac
 
 
 def _session_to_stats(
-    source: _Source, exported: ExportedSession, *, author: str, bases: list[str]
-) -> tuple[list[CommitStat], dict[str, str], bool]:
-    """Map one session's turns onto virtual :class:`CommitStat`s (plus their diffs). Returns
-    ``(stats, diffs, session_changed_files)``."""
+    source: _Source, exported: ExportedSession, *, bases: list[str]
+) -> tuple[list[CommitStat], dict[str, str], dict[str, list[FileEdit]], bool]:
+    """Map one session's turns onto virtual :class:`CommitStat`s. Returns
+    ``(stats, combined_diffs, per_turn_file_edits, session_changed_files)`` — the per-turn edits
+    back the file browser (per-file history), the combined diffs back the ``/diff`` view."""
     stats: list[CommitStat] = []
     diffs: dict[str, str] = {}
+    file_edits: dict[str, list[FileEdit]] = {}
     session_changed = False
     for index, turn in enumerate(exported.turns):
         edits = [_relativize(edit, bases) for edit in turn.edits]
@@ -180,6 +187,7 @@ def _session_to_stats(
         insertions, deletions = total_lines(edits)
         if edits:
             session_changed = True
+            file_edits[sha] = edits
             patch = combine_patches(edits)
             if len(patch) > _MAX_PATCH_CHARS:
                 patch = patch[:_MAX_PATCH_CHARS] + "\n… (diff truncated)\n"
@@ -189,7 +197,9 @@ def _session_to_stats(
         stats.append(
             CommitStat(
                 sha=sha,
-                author=author,
+                # No committer exists for a reconstructed turn — the transcript records no
+                # git author — so it is left blank (the view hides committer chrome entirely).
+                author="",
                 email="",
                 subject=_subject(turn),
                 kind="agent",
@@ -203,10 +213,10 @@ def _session_to_stats(
                 deletions=deletions,
                 prompt=turn.user_prompt,
                 user_prompts=prompts,
-                message=_message(turn),
+                message=_message(source, exported, turn),
             )
         )
-    return stats, diffs, session_changed
+    return stats, diffs, file_edits, session_changed
 
 
 # ---------------------------------------------------------------------------
@@ -256,11 +266,15 @@ def _tokens_dict(turn: SessionTurn) -> dict[str, int]:
     return {key: value for key in _TOKEN_KEYS if isinstance((value := data.get(key)), int) and value > 0}
 
 
-def _message(turn: SessionTurn) -> str:
-    """The turn's detail-view text: the subject followed by a ``# Interaction Trace`` of the
-    user↔agent conversation, rendered exactly as an aGiTrack commit renders its trace (secret
-    masking, heading nesting, ``## User`` / ``## Agent`` roles) so the dashboard's log section
-    shows the full conversation behind the change."""
+def _message(source: _Source, exported: ExportedSession, turn: SessionTurn) -> str:
+    """The turn's detail-view text: the subject, a ``# Interaction Trace`` of the user↔agent
+    conversation (rendered exactly as an aGiTrack commit renders its trace — secret masking,
+    heading nesting, ``## User`` / ``## Agent`` roles), and a ``# aGiTrack Metadata`` block.
+
+    The metadata block carries ONLY what the transcript actually records — backend, model,
+    reasoning effort, the backend session id, the conversation's start/end, and the turn's
+    token usage — so the log shows the same metadata an aGiTrack commit would, with nothing
+    invented (no synthetic session name, committer, or commit hash)."""
     trace: list[dict] = []
     if turn.user_prompt.strip():
         trace.append({"role": "user", "content": turn.user_prompt})
@@ -272,23 +286,44 @@ def _message(turn: SessionTurn) -> str:
         if text.strip():
             trace.append({"role": "agent", "content": text})
     body = render_interaction_trace(trace, trace_turn_limit=len(trace) + 1)
-    header = _subject(turn)
-    if not body:
-        return header
-    return f"{header}\n\n# Interaction Trace\n\n{body}\n"
+
+    lines = [_subject(turn), ""]
+    if body:
+        lines += ["# Interaction Trace", "", body, ""]
+    lines += _metadata_lines(source, exported, turn)
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _metadata_lines(source: _Source, exported: ExportedSession, turn: SessionTurn) -> list[str]:
+    """The ``# aGiTrack Metadata`` block for a reconstructed turn — real transcript fields only."""
+    lines = [
+        METADATA_HEADER,
+        "commit_type: agent",
+        f"backend: {source.backend}",
+        f"model: {turn.model or 'unknown'}",
+    ]
+    if turn.reasoning_effort:
+        lines.append(f"reasoning_effort: {turn.reasoning_effort}")
+    if exported.session_id:
+        lines.append(f"backend_session_id: {exported.session_id}")
+    if turn.compaction_count:
+        lines.append(f"context_compactions: {turn.compaction_count}")
+    if turn.started_at:
+        lines.append(f"agent_started_at: {_iso(turn.started_at)}")
+    if turn.ended_at:
+        lines.append(f"agent_ended_at: {_iso(turn.ended_at)}")
+    # Only the per-turn token counters (never the derived context/total lines the commit
+    # writer also emits, which aren't a real per-turn figure here).
+    lines += [
+        line for line in _token_metadata_lines(turn.tokens.to_dict()) if line.startswith("tokens_since_last_commit_")
+    ]
+    return lines
 
 
 def _iso(ts: int | None) -> str:
     if not ts:
         return ""
     return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _local_author() -> str:
-    try:
-        return getpass.getuser() or "you"
-    except Exception:
-        return "you"
 
 
 # ---------------------------------------------------------------------------
@@ -351,10 +386,12 @@ def _str(query: dict[str, list[str]], key: str) -> str:
 
 
 def _make_handler(view: BacktraceView) -> type[http.server.BaseHTTPRequestHandler]:
+    from agitrack.metrics.files import backtrace_browser
     from agitrack.metrics.web import aggregates_payload, format_html, log_page
 
     banner = _banner_html(view)
     page = format_html(view.dashboard, banner_html=banner, backtrace=True).encode("utf-8")
+    browser = backtrace_browser(view.dashboard.stats, view.file_edits)
 
     class _BacktraceHandler(http.server.BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802 (http.server API)
@@ -394,6 +431,17 @@ def _make_handler(view: BacktraceView) -> type[http.server.BaseHTTPRequestHandle
                         "application/json",
                         json.dumps({"sha": sha, "diff": view.diffs.get(sha, "")}).encode("utf-8"),
                     )
+                elif parsed.path == "/files":
+                    self._respond("application/json", json.dumps({"files": browser.files_payload()}).encode("utf-8"))
+                elif parsed.path == "/filelog":
+                    self._respond(
+                        "application/json", json.dumps(browser.file_log_payload(_str(query, "path"))).encode("utf-8")
+                    )
+                elif parsed.path == "/filediff":
+                    self._respond(
+                        "application/json",
+                        json.dumps(browser.file_diff(_str(query, "path"), _str(query, "sha"))).encode("utf-8"),
+                    )
                 else:
                     self.send_error(404, "not found")
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
@@ -419,24 +467,198 @@ def _banner_html(view: BacktraceView) -> str:
     return f'<div class="updatebanner">⏪ {_escape(view.banner_text())}</div>'
 
 
-def serve_backtrace(
-    directory: Path,
-    *,
-    host: str = "127.0.0.1",
-    port: int = 8765,
-    open_browser: bool = True,
-) -> int:
-    """Build the backtrace for ``directory`` and serve it on localhost until Ctrl-C."""
-    from agitrack.metrics.server import (
-        _DashboardServer,
-        open_dashboard_in_browser,
-        remote_browser_hint,
-    )
+# ---------------------------------------------------------------------------
+# Background daemon — same lifecycle model as `agitrack -d` (#110): a detached child
+# serves the reconstruction and dies with the shell that launched it. The handshake lives
+# in a per-directory temp file (NOT under the directory), so it works in a directory that is
+# not a git repo and never collides with the live dashboard's own handshake.
+# ---------------------------------------------------------------------------
 
-    print(f"Scanning local coding-agent transcripts for {_abbreviate_home(str(directory))} …")
+
+def _state_dir() -> Path:
+    import tempfile
+
+    return Path(tempfile.gettempdir()) / "agitrack-backtrace"
+
+
+def _dir_key(directory: Path) -> str:
+    return hashlib.sha1(str(directory.resolve()).encode()).hexdigest()[:16]
+
+
+def _handshake_path(directory: Path) -> Path:
+    return _state_dir() / f"{_dir_key(directory)}.json"
+
+
+def _log_path(directory: Path) -> Path:
+    return _state_dir() / f"{_dir_key(directory)}.log"
+
+
+def _read_handshake(directory: Path) -> dict | None:
+    try:
+        with _handshake_path(directory).open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _write_handshake(directory: Path, record: dict) -> None:
+    path = _handshake_path(directory)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(record, handle)
+    import os
+
+    os.replace(tmp, path)
+
+
+def _clear_handshake(directory: Path) -> None:
+    try:
+        _handshake_path(directory).unlink()
+    except OSError:
+        pass
+
+
+def _running_handshake(directory: Path) -> dict | None:
+    """The handshake of a backtrace daemon that is still alive for ``directory``, else None
+    (a stale record from a crashed daemon is cleared)."""
+    from agitrack.proc import pid_alive
+
+    record = _read_handshake(directory)
+    if record is None:
+        return None
+    pid = record.get("pid")
+    if isinstance(pid, int) and pid_alive(pid):
+        return record
+    _clear_handshake(directory)
+    return None
+
+
+def start_backtrace_daemon(directory: Path, *, owner_pid: int, open_browser: bool = True, timeout: float = 60.0) -> int:
+    """`agitrack --backtrace` (html): start — or reuse — the background backtrace daemon for
+    ``directory``, then return to the shell. The daemon dies when the launching terminal
+    closes (owner-pid watchdog) or via `agitrack --backtrace stop`.
+
+    The timeout is generous: the first build scans and exports every local session (OpenCode
+    shells out per session), which can take a while on a busy machine."""
+    import subprocess
+    import sys
+    import os
+    import time
+
+    from agitrack.proc import detach_kwargs
+
+    running = _running_handshake(directory)
+    if running is not None:
+        url = str(running.get("url", ""))
+        print(f"aGiTrack backtrace already running at {url} (pid {running.get('pid')}).")
+        _maybe_open(url, running, open_browser)
+        return 0
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "agitrack",
+        "--repo",
+        str(directory),
+        "--backtrace-serve",
+        "--dashboard-owner-pid",
+        str(owner_pid),
+    ]
+    # The child must load the INSTALLED aGiTrack, never a stray ``agitrack/`` package in the
+    # target directory: the backtraced directory can itself be the aGiTrack source checkout, and
+    # ``python -m agitrack`` would otherwise import that (older) copy from cwd. So run the child
+    # from a neutral state dir and set PYTHONSAFEPATH to keep cwd off ``sys.path``.
+    state_dir = _state_dir()
+    state_dir.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ)
+    env["PYTHONSAFEPATH"] = "1"
+    log = _open_log(directory)
+    print(f"Scanning local coding-agent transcripts for {_abbreviate_home(str(directory))} … (this can take a moment)")
+    try:
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log, cwd=str(state_dir), env=env, **detach_kwargs()
+        )
+    finally:
+        if log is not subprocess.DEVNULL:
+            log.close()
+
+    deadline = time.monotonic() + timeout
+    record: dict | None = None
+    while time.monotonic() < deadline:
+        candidate = _read_handshake(directory)
+        if candidate is not None and candidate.get("pid") == proc.pid:
+            record = candidate
+            break
+        if proc.poll() is not None and proc.returncode != 0:
+            break
+        time.sleep(0.1)
+    if record is None:
+        print(f"The backtrace daemon did not start. See {_log_path(directory)} for details.")
+        return 1
+    if record.get("empty"):
+        _clear_handshake(directory)
+        print(_empty_message(directory))
+        return 0
+    url = str(record.get("url", ""))
+    print(
+        f"aGiTrack backtrace daemon live at {url} (pid {record.get('pid')}).\n"
+        + record.get("banner", "")
+        + "\nRuns in the background; stops when this terminal closes or `agitrack --backtrace stop`."
+    )
+    _maybe_open(url, record, open_browser)
+    return 0
+
+
+def stop_backtrace_daemon(directory: Path) -> int:
+    """`agitrack --backtrace stop`: stop the background backtrace daemon for ``directory``."""
+    import time
+
+    from agitrack.proc import pid_alive, terminate_pid
+
+    record = _running_handshake(directory)
+    if record is None:
+        _clear_handshake(directory)
+        print("No backtrace daemon is running for this directory.")
+        return 0
+    pid = int(record["pid"])
+    terminate_pid(pid)
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and pid_alive(pid):
+        time.sleep(0.05)
+    _clear_handshake(directory)
+    print(f"Stopped the backtrace daemon (pid {pid}).")
+    return 0
+
+
+def backtrace_daemon_status(directory: Path) -> int:
+    """`agitrack --backtrace status`: report whether a backtrace daemon is running."""
+    record = _running_handshake(directory)
+    if record is None:
+        print("No backtrace daemon is running for this directory.")
+        return 0
+    print(f"aGiTrack backtrace daemon running at {record.get('url', '')} (pid {record.get('pid')}).")
+    return 0
+
+
+def run_backtrace_daemon(
+    directory: Path, *, owner_pid: int | None = None, host: str = "127.0.0.1", port: int = 8765
+) -> int:
+    """The detached child: build the reconstruction once, then serve it until told to stop
+    (SIGTERM/SIGINT) or until the owner pid disappears. Publishes a handshake so the launcher
+    can show the URL; if there is nothing to show, records that and exits."""
+    import os
+    import signal
+    import threading
+    import time
+
+    from agitrack.metrics.daemon import _watch_owner
+    from agitrack.metrics.server import _DashboardServer
+
     view = build_backtrace(directory)
     if view.is_empty:
-        print(_empty_message(directory))
+        _write_handshake(directory, {"pid": os.getpid(), "empty": True})
         return 0
 
     handler = _make_handler(view)
@@ -446,19 +668,60 @@ def serve_backtrace(
         server = _DashboardServer((host, 0), handler)
     bound_port = server.server_address[1]
     url = f"http://{host}:{bound_port}/"
-    print(view.banner_text())
-    print(
-        f"\naGiTrack backtrace live at {url}\nHistorical reconstruction from local transcripts. Press Ctrl-C to stop."
+    _write_handshake(
+        directory,
+        {
+            "pid": os.getpid(),
+            "host": host,
+            "port": bound_port,
+            "url": url,
+            "banner": view.banner_text(),
+            "started": int(time.time()),
+        },
     )
-    if open_browser and not open_dashboard_in_browser(url):
-        print(remote_browser_hint(url, bound_port))
+
+    stop = threading.Event()
+
+    def _request_shutdown(*_: object) -> None:
+        stop.set()
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, _request_shutdown)
+    signal.signal(signal.SIGINT, _request_shutdown)
+    if owner_pid:
+        threading.Thread(
+            target=_watch_owner,
+            args=(owner_pid, stop, _request_shutdown),
+            daemon=True,
+            name="agitrack-backtrace-owner-watch",
+        ).start()
     try:
         server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nStopping the backtrace dashboard.")
     finally:
         server.server_close()
+        _clear_handshake(directory)
     return 0
+
+
+def _open_log(directory: Path):
+    import subprocess
+
+    try:
+        path = _log_path(directory)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path.open("ab")
+    except OSError:
+        return subprocess.DEVNULL
+
+
+def _maybe_open(url: str, record: dict, open_browser: bool) -> None:
+    from agitrack.metrics.server import open_dashboard_in_browser, remote_browser_hint
+
+    if not (open_browser and url):
+        return
+    if not open_dashboard_in_browser(url):
+        port = record.get("port", 8765)
+        print(remote_browser_hint(url, int(port) if isinstance(port, int) else 8765))
 
 
 def render_backtrace_text(directory: Path) -> str:

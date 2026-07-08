@@ -203,7 +203,7 @@ def main(argv: list[str] | None = None) -> int:
         "--backtrace",
         nargs="?",
         const="html",
-        choices=["text", "html"],
+        choices=["text", "html", "stop", "status"],
         default=None,
         help="reconstruct how PAST coding-agent conversations changed THIS directory, from local "
         "Claude/OpenCode transcripts alone — even if you have never used aGiTrack here, and even if "
@@ -211,7 +211,9 @@ def main(argv: list[str] | None = None) -> int:
         "subdirectory), recovers each turn's file edits, and shows the same dashboard (tokens, "
         "models, lines changed, and the full user↔agent trace behind each change) marked clearly as "
         "a historical backtrace, not live repo status. Bare `--backtrace` (or `--backtrace html`) "
-        "serves it on localhost and opens the browser; `text` prints a one-shot report.",
+        "starts it as a background daemon on localhost, opens the browser, and returns to the shell "
+        "(it stops when this terminal closes or via `--backtrace stop`); `status` reports it; "
+        "`text` prints a one-shot report.",
     )
     parser.add_argument(
         "-s",
@@ -385,6 +387,14 @@ def main(argv: list[str] | None = None) -> int:
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
+        "--backtrace-serve",
+        action="store_true",
+        # Internal: the detached `--backtrace` child. Bare `agitrack --backtrace` spawns aGiTrack
+        # with this flag to host the reconstructed dashboard out-of-process, bound to the owner
+        # pid via --dashboard-owner-pid. Not meant for manual use.
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--dashboard-owner-pid",
         type=int,
         default=None,
@@ -444,6 +454,41 @@ def main(argv: list[str] | None = None) -> int:
         print(__version__)
         return 0
 
+    # Backtrace works purely from local transcripts — no git repo AND no git binary needed —
+    # so both the user command and its detached child are handled BEFORE the git check below.
+    if args.backtrace_serve:
+        # Internal entry point: the detached `--backtrace` child. Serves the reconstructed
+        # dashboard out-of-process and shuts down when its owner pid dies.
+        from agitrack.metrics.backtrace import run_backtrace_daemon
+
+        return run_backtrace_daemon(Path(args.repo).expanduser().resolve(), owner_pid=args.dashboard_owner_pid)
+
+    if args.backtrace:
+        # Read-only reconstruction from local transcripts — no git, no privacy prompt, no repo
+        # init: it works in ANY directory, including one that was never a repository. The target
+        # is the directory itself (--repo, or the cwd), NOT a discovered repo root, so a
+        # subdirectory backtraces its own sessions.
+        directory = Path(args.repo).expanduser().resolve()
+        if not directory.is_dir():
+            print(f"{directory} is not a directory.")
+            return 1
+        if args.backtrace == "text":
+            from agitrack.metrics.backtrace import render_backtrace_text
+
+            print(render_backtrace_text(directory))
+            return 0
+        if args.backtrace == "stop":
+            from agitrack.metrics.backtrace import stop_backtrace_daemon
+
+            return stop_backtrace_daemon(directory)
+        if args.backtrace == "status":
+            from agitrack.metrics.backtrace import backtrace_daemon_status
+
+            return backtrace_daemon_status(directory)
+        from agitrack.metrics.backtrace import start_backtrace_daemon
+
+        return start_backtrace_daemon(directory, owner_pid=os.getppid())
+
     # aGiTrack can't do anything without git (every path below discovers/commits to a repo).
     # Check once, up front, so a missing git gives a clear, actionable message instead of a
     # raw FileNotFoundError deep in repo discovery — common right after the VS Code extension
@@ -474,24 +519,6 @@ def main(argv: list[str] | None = None) -> int:
             except json.JSONDecodeError:
                 pass
         return run_dashboard_daemon(serve_repo, owner_pid=args.dashboard_owner_pid, email_logins=email_logins)
-
-    if args.backtrace:
-        # Read-only reconstruction from local transcripts — no git, no privacy prompt, no
-        # repo init: it works in ANY directory, including one that was never a repository. The
-        # target is the directory itself (--repo, or the cwd), NOT a discovered repo root, so a
-        # subdirectory backtraces its own sessions.
-        directory = Path(args.repo).expanduser().resolve()
-        if not directory.is_dir():
-            print(f"{directory} is not a directory.")
-            return 1
-        if args.backtrace == "text":
-            from agitrack.metrics.backtrace import render_backtrace_text
-
-            print(render_backtrace_text(directory))
-            return 0
-        from agitrack.metrics.backtrace import serve_backtrace
-
-        return serve_backtrace(directory)
 
     if args.dashboard:
         # Read-only: nothing is logged or committed, so no privacy
