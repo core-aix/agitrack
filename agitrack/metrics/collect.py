@@ -557,7 +557,7 @@ def collect_commit_stats(repo: GitRepo, ref: str = "HEAD") -> list[CommitStat]:
         committed_at, _, body = rest.partition(_FIELD_SEP)
         stats.append(_parse_commit(sha.strip(), author, email, committed_at.strip(), body))
 
-    stats = _drop_inherited_metadata(repo, ref, stats)
+    _neutralize_inherited_metadata(repo, ref, stats)
 
     _apply_numstat(repo, ref, {stat.sha: stat for stat in stats})
 
@@ -636,8 +636,8 @@ def _dedupe_squash_constituents(stats: list[CommitStat]) -> None:
             stat.tokens = _sum_tokens(kept)
 
 
-def _drop_inherited_metadata(repo: GitRepo, ref: str, stats: list[CommitStat]) -> list[CommitStat]:
-    """Drop commits that merely inherit a parent's aGiTrack metadata block.
+def _neutralize_inherited_metadata(repo: GitRepo, ref: str, stats: list[CommitStat]) -> None:
+    """Strip the aGiTrack metadata from commits that merely inherit a parent's block.
 
     When a session branch is integrated with a real merge commit (e.g. a GitHub
     PR merged with "Create a merge commit"), GitHub copies the PR title and body
@@ -648,24 +648,48 @@ def _drop_inherited_metadata(repo: GitRepo, ref: str, stats: list[CommitStat]) -
 
     The fingerprint is a *merge* commit (>1 parent) that shares an identical
     metadata block with one of its parents: that parent is the cover commit it
-    merges, and the block was copied wholesale. We keep the original (the parent)
-    and discard the inheriting merge. Restricting to merges is what separates this
-    from a genuine run of repeated turns, which is linear — each such commit has a
-    single parent, so an identical neighbouring block is a real (repeated) turn,
-    not a copy. Cover commits and integration merges are themselves merge-shaped
-    but never share a parent's block, so they are untouched."""
+    merges, and the block was copied wholesale. Rather than drop the merge (which
+    would make the dashboard show fewer commits than GitHub does), we keep it in
+    the log but wipe the inherited metadata in place — tokens, covered_commits,
+    trace, backend/model — and reclassify it as the plain merge it really is, so
+    the turn's figures are still counted only once (on the cover parent).
+    Restricting to merges is what separates this from a genuine run of repeated
+    turns, which is linear — each such commit has a single parent, so an identical
+    neighbouring block is a real (repeated) turn, not a copy. Cover commits and
+    integration merges are themselves merge-shaped but never share a parent's
+    block, so they are untouched."""
     block_by_sha = {stat.sha: stat.metadata_block for stat in stats if stat.metadata_block}
     if not block_by_sha:
-        return stats
+        return
     parents = _parents(repo, ref)
-    duplicates = {
-        stat.sha
-        for stat in stats
-        if stat.metadata_block
-        and len(parents.get(stat.sha, ())) > 1
-        and any(block_by_sha.get(parent) == stat.metadata_block for parent in parents[stat.sha])
-    }
-    return [stat for stat in stats if stat.sha not in duplicates]
+    for stat in stats:
+        inherited = (
+            stat.metadata_block
+            and len(parents.get(stat.sha, ())) > 1
+            and any(block_by_sha.get(parent) == stat.metadata_block for parent in parents[stat.sha])
+        )
+        if not inherited:
+            continue
+        # Keep the commit (so the count matches GitHub) but scrub every field that
+        # the copied block populated, so nothing about this turn is counted twice.
+        stat.kind = _neutralized_merge_kind(stat.subject)
+        stat.tokens = {}
+        stat.covered_commits = []
+        stat.constituents = []
+        stat.started_at = stat.ended_at = ""
+        stat.backend = stat.model = None
+        stat.prompt = ""
+        stat.user_prompts = []
+        stat.metadata_block = ""
+
+
+def _neutralized_merge_kind(subject: str) -> str:
+    """The kind a merge should carry once its inherited aGiTrack metadata is stripped:
+    aGiTrack's own integration plumbing if it names a session branch, else untracked —
+    mirroring the metadata-less classification in :func:`_parse_commit`."""
+    if subject.startswith("Merge ") and _AGITRACK_BRANCH_RE.search(subject):
+        return "agitrack-ops"
+    return "untracked"
 
 
 def _parents(repo: GitRepo, ref: str) -> dict[str, list[str]]:
