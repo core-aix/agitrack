@@ -365,6 +365,46 @@ def test_git_file_browser(tmp_path):
     assert "b.py" not in browser.file_diff("a.py", sha)["diff"]  # per-file: only a.py
 
 
+def test_git_file_browser_hides_deleted_files(tmp_path):
+    """A since-deleted file drops out of the file tab (its changes still counted elsewhere)."""
+    from agitrack.git import GitRepo
+    from agitrack.metrics.collect import build_dashboard
+    from agitrack.metrics.files import git_browser
+
+    repo = GitRepo.init(tmp_path)
+    (repo.repo / "keep.py").write_text("a\n", encoding="utf-8")
+    (repo.repo / "gone.py").write_text("x\n", encoding="utf-8")
+    repo.stage_paths(["keep.py", "gone.py"])
+    repo.commit("add both")
+    repo._run(["git", "rm", "gone.py"])
+    repo.commit("delete gone.py")
+
+    browser = git_browser(repo, build_dashboard(repo).stats, "HEAD")
+    paths = {row["path"] for row in browser.files_payload()}
+    assert "keep.py" in paths
+    assert "gone.py" not in paths  # deleted → hidden from the file tab
+
+
+def test_backtrace_file_browser_hides_files_absent_on_disk(monkeypatch, tmp_path):
+    edit_here = make_edit("a.py", "", "x\n", status="added")
+    edit_gone = make_edit("gone.py", "", "y\n", status="added")
+    (tmp_path / "a.py").write_text("x\n")  # a.py exists on disk; gone.py does not
+    es = ExportedSession(
+        session_id="c1",
+        model="claude-opus-4-8",
+        updated=2000,
+        turns=[_turn("make files", edits=[edit_here, edit_gone])],
+    )
+    _patch_discovery(monkeypatch, claude_sessions={"c1": es})
+    view = bt.build_backtrace(tmp_path)
+
+    from agitrack.metrics.files import backtrace_browser
+
+    browser = backtrace_browser(view.dashboard.stats, view.file_edits, directory=view.root)
+    paths = {row["path"] for row in browser.files_payload()}
+    assert "a.py" in paths and "gone.py" not in paths
+
+
 def test_backtrace_end_to_end_non_git_claude(monkeypatch, tmp_path):
     """Plant a real Claude transcript for a plain (non-git) directory and reconstruct it —
     proving the feature works with no git repo and no prior aGiTrack use."""

@@ -1584,7 +1584,9 @@ function toggleDetail(i){
       ? `<div class="dmeta">AI conversation: ${esc(c.started||"?")} → ${esc(c.ended||"?")}</div>` : "";
     const who = (!BACKTRACE && c.committers&&c.committers.length)
       ? `<div class="dmeta">committer${c.committers.length>1?"s":""}: ${c.committers.map(esc).join(", ")}</div>` : "";
-    const head = BACKTRACE ? `${diffBtn}${link}` : `${esc(c.short)} ${diffBtn}${link}`;
+    // The short hash is already shown on the log row itself, so the detail header only carries
+    // the actions (diff toggle + optional GitHub link) — no redundant second copy of the hash.
+    const head = `${diffBtn}${link}`;
     detail.innerHTML = `<div class="dhead">${head}</div>${who}${span}`+
       `<div class="dmsg md" id="dbody-${i}" data-mode="msg">${md(c.message||"(no message recorded)")}</div>`+
       partsHtml(c.parts);

@@ -52,6 +52,7 @@ class BacktraceView:
 
     directory: str  # home-abbreviated, for display
     dashboard: Dashboard
+    root: Path | None = None  # the resolved directory on disk, to list only files that still exist
     diffs: dict[str, str] = field(default_factory=dict)  # virtual sha -> combined unified patch
     file_edits: dict[str, list[FileEdit]] = field(default_factory=dict)  # virtual sha -> per-file edits
     session_count: int = 0  # sessions included in the view
@@ -159,6 +160,7 @@ def build_backtrace(directory: Path, *, max_sessions: int = MAX_SESSIONS) -> Bac
     return BacktraceView(
         directory=_abbreviate_home(str(directory)),
         dashboard=dashboard,
+        root=directory,
         diffs=diffs,
         file_edits=file_edits,
         session_count=included_sessions,
@@ -393,7 +395,7 @@ def _make_handler(view: BacktraceView) -> type[http.server.BaseHTTPRequestHandle
 
     banner = _banner_html(view)
     page = format_html(view.dashboard, banner_html=banner, backtrace=True).encode("utf-8")
-    browser = backtrace_browser(view.dashboard.stats, view.file_edits)
+    browser = backtrace_browser(view.dashboard.stats, view.file_edits, directory=view.root)
 
     class _BacktraceHandler(http.server.BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802 (http.server API)

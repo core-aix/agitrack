@@ -310,6 +310,36 @@ Added --version using the package metadata; prints and exits.
       </div>
     </section>
 
+    <section class="commit agent" id="backtrace">
+      <div class="commit-head">
+        <span class="sha">a1f8b28</span>
+        <span class="subject"><span class="tag">&lt;aGiTrack&gt;</span> reconstruct history from past sessions</span>
+      </div>
+      <h2>Didn't use it from day one? Show — and commit — the history anyway.</h2>
+      <p>Already built your project with Claude or OpenCode, without aGiTrack? Run
+      <span class="p">agitrack --backtrace</span>. It reads the coding-agent transcripts already on your machine and
+      <strong>reconstructs</strong> what those sessions did here — tokens, models, lines changed, the file-by-file history,
+      and the full user↔agent conversation behind every change — in the same dashboard, clearly marked as a historical
+      view. No prior aGiTrack use, nothing uploaded, and it works even in a folder that was never a git repo.</p>
+      <p>Want it in your <strong>real</strong> git history? <span class="p">agitrack --backtrace commit --branch tracked-history</span>
+      replays your commits onto a new branch and stamps the aGiTrack metadata onto the ones your agents produced —
+      keeping your own commits verbatim. It only ever writes to a new branch and leaves your current one untouched.</p>
+      <div class="steps" style="margin-top:22px">
+        <div class="step"><div>
+          <code>agitrack --backtrace</code>
+          <div class="note">reconstruct and serve the dashboard from local transcripts (background daemon; <code>--backtrace stop</code> ends it)</div>
+        </div></div>
+        <div class="step"><div>
+          <code>agitrack --backtrace text</code>
+          <div class="note">a one-shot plain-text report of what your past sessions changed here</div>
+        </div></div>
+        <div class="step"><div>
+          <code>agitrack --backtrace commit --branch tracked-history</code>
+          <div class="note">bake the reconstruction into real commits on a new branch (needs a clean working tree; your current branch is left alone)</div>
+        </div></div>
+      </div>
+    </section>
+
     <section class="commit" id="install">
       <div class="commit-head">
         <span class="sha">e8d2fa0</span>
