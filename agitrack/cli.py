@@ -472,18 +472,27 @@ def main(argv: list[str] | None = None) -> int:
     if args.daemons:
         # Global, read-only listing of every running aGiTrack daemon — no repo/git needed.
         from agitrack.daemons import list_running
+        from agitrack.metrics.collect import _abbreviate_home
 
         running = list_running()
         if not running:
             print("No aGiTrack daemons are currently running.")
             return 0
         print("aGiTrack daemons running:\n")
-        print(f"  {'PID':>7}  {'FUNCTION':<20}  {'REPO':<26}  URL")
+        print(f"  {'PID':>7}  {'FUNCTION':<20}  DIRECTORY")
         for info in running:
-            print(f"  {info.pid:>7}  {info.function:<20}  {info.repo_name:<26}  {info.url or '-'}")
+            location = _abbreviate_home(info.repo)
+            url = f"   {info.url}" if info.url else ""
+            print(f"  {info.pid:>7}  {info.function:<20}  {location}{url}")
+        # The per-daemon stop commands act on the CURRENT directory's repo, so they must be run
+        # from that directory (shown above) or given its path with --repo.
         print(
-            "\nStop one by hand with:  kill <PID>\n"
-            "or use its own stop command:  agitrack -d stop  /  agitrack --backtrace stop  /  agitrack -b stop"
+            "\nTo stop one:\n"
+            "  • by PID:            kill <PID>\n"
+            "  • or its own stop command, from that directory (or with --repo <path>):\n"
+            "        repo dashboard       agitrack --repo <path> -d stop\n"
+            "        backtrace dashboard  agitrack --repo <path> --backtrace stop\n"
+            "        background mode      agitrack --repo <path> -b stop"
         )
         return 0
 
