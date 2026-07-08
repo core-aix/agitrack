@@ -52,6 +52,52 @@ def make_edit(path: str, before: str, after: str, *, status: str = "modified") -
     return FileEdit(path=path, insertions=insertions, deletions=deletions, patch=patch)
 
 
+def tracked_edit(
+    state: dict[str, str],
+    path: str,
+    *,
+    write: str | None = None,
+    subedits: "list[tuple[str, str]] | None" = None,
+) -> FileEdit | None:
+    """A :class:`FileEdit` for one tool call, diffed against the file's CURRENT tracked content in
+    ``state`` (updated in place) rather than always against empty.
+
+    This is what makes each turn's diff the INCREMENTAL change: an agent that rewrites a whole file
+    with ``Write`` every turn would otherwise show the entire file as additions on every turn (the
+    diffs appear to accumulate). Tracking the content means the second write diffs against the
+    first, so only the real change shows.
+
+    - ``write``: the whole new file content (a Write). Diffed against the tracked content (or empty
+      for a file first seen), then recorded as the new content.
+    - ``subedits``: ``(old, new)`` string replacements (an Edit / MultiEdit). Applied in order to
+      the tracked content when it is known; otherwise the ``old→new`` snippets are diffed directly
+      (the file predates the session, so its full content isn't recoverable).
+    """
+    path = (path or "").strip()
+    if not path:
+        return None
+    if write is not None:
+        before = state.get(path, "")
+        status = "modified" if path in state else "added"
+        state[path] = write
+        return make_edit(path, before, write, status=status)
+    subedits = subedits or []
+    if path in state:
+        before = state[path]
+        after = before
+        for old, new in subedits:
+            if old and old in after:
+                after = after.replace(old, new, 1)  # first occurrence, as the editors do
+            elif not old:
+                after = after + new  # inserting where there is no anchor
+        state[path] = after
+        return make_edit(path, before, after, status="modified")
+    # File content isn't tracked (it existed before the session): fall back to the snippet diff.
+    before = "".join(old for old, _ in subedits)
+    after = "".join(new for _, new in subedits)
+    return make_edit(path, before, after)
+
+
 def combine_patches(edits: list[FileEdit]) -> str:
     """The concatenated git-style patch for a turn's edits (one file after another),
     for the dashboard's per-turn diff view. Empty when the turn changed nothing."""

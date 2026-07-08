@@ -17,7 +17,7 @@ from agitrack.backends.base import TokenUsage
 # ``agitrack.commits.actions``, which imports ``SessionTurn`` back from this module, so these
 # names must already exist here or that cycle fails when opencode is the first module imported.
 from agitrack.transcripts.types import ExportedSession, FileEdit, SessionRef, SessionTurn, turns_after
-from agitrack.transcripts.edits import make_edit
+from agitrack.transcripts.edits import tracked_edit
 from agitrack.proc import console_isolation_kwargs, resolve_subprocess_command
 from agitrack.sessions.share_cap import select_kept_indices
 
@@ -578,12 +578,15 @@ def parse_exported_session(
     child_ids_per_turn: list[set[str]] = []
     # Context compactions OpenCode performed within the current turn (see below).
     compactions = 0
+    # Per-session running content of each edited file, so each edit's diff is the incremental
+    # change vs the previous turn, not the whole file every time (only used when collect_edits).
+    file_state: dict[str, str] = {}
 
     def flush() -> None:
         nonlocal compactions
         if current_user is None or not assistant_group:
             return
-        turn = _build_turn(current_user, assistant_group, model, collect_edits=collect_edits)
+        turn = _build_turn(current_user, assistant_group, model, collect_edits=collect_edits, file_state=file_state)
         if turn:
             turn.compaction_count = compactions
             turns.append(turn)
@@ -642,6 +645,7 @@ def _build_turn(
     session_model: str | None,
     *,
     collect_edits: bool = False,
+    file_state: dict[str, str] | None = None,
 ) -> SessionTurn | None:
     user_info = _as_dict(user_message.get("info"))
     user_id = str(user_info.get("id") or "")
@@ -662,7 +666,7 @@ def _build_turn(
         model = _model_name(assistant_info) or model
         effort = effort or _find_value(assistant_info, _REASONING_EFFORT_KEYS)
         if collect_edits:
-            edits.extend(_edits_from_parts(assistant.get("parts")))
+            edits.extend(_edits_from_parts(assistant.get("parts"), file_state if file_state is not None else {}))
         response = _final_response(assistant.get("parts"), finish=assistant_info.get("finish"))
         if response:
             final_response = response
@@ -691,10 +695,11 @@ def _build_turn(
     )
 
 
-def _edits_from_parts(parts: object) -> list[FileEdit]:
+def _edits_from_parts(parts: object, file_state: dict[str, str]) -> list[FileEdit]:
     """The file edits in an assistant message's ``tool`` parts (OpenCode's edit / write /
     patch tools), reconstructed from each call's input — used by the backtrace exporter.
-    Non-editing tools (read, bash, webfetch, …) are ignored."""
+    Non-editing tools (read, bash, webfetch, …) are ignored. ``file_state`` (per session,
+    mutated) tracks each file's current content so each edit's diff is the incremental change."""
     if not isinstance(parts, list):
         return []
     out: list[FileEdit] = []
@@ -709,13 +714,15 @@ def _edits_from_parts(parts: object) -> list[FileEdit]:
         if not isinstance(path, str):
             continue
         if tool == "write":
-            edit = make_edit(path, "", str(inp.get("content") or ""), status="added")
-            if edit is not None:
-                out.append(edit)
+            edit = tracked_edit(file_state, path, write=str(inp.get("content") or ""))
         elif tool in ("edit", "patch"):
-            edit = make_edit(path, str(inp.get("oldString") or ""), str(inp.get("newString") or ""))
-            if edit is not None:
-                out.append(edit)
+            edit = tracked_edit(
+                file_state, path, subedits=[(str(inp.get("oldString") or ""), str(inp.get("newString") or ""))]
+            )
+        else:
+            continue
+        if edit is not None:
+            out.append(edit)
     return out
 
 

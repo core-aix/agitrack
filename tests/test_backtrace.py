@@ -94,6 +94,117 @@ def test_claude_parse_rows_collects_edits():
     assert claude.parse_rows("sess", rows).turns[0].edits == []
 
 
+def _claude_write_rows(path, contents):
+    rows = []
+    for i, content in enumerate(contents, 1):
+        rows.append(
+            {
+                "type": "user",
+                "uuid": f"u{i}",
+                "timestamp": f"2026-07-0{i}T09:00:00Z",
+                "message": {"role": "user", "content": f"turn {i}"},
+            }
+        )
+        rows.append(
+            {
+                "type": "assistant",
+                "uuid": f"a{i}",
+                "timestamp": f"2026-07-0{i}T09:00:05Z",
+                "message": {
+                    "id": f"m{i}",
+                    "role": "assistant",
+                    "stop_reason": "end_turn",
+                    "model": "claude-opus-4-8",
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": f"t{i}",
+                            "name": "Write",
+                            "input": {"file_path": path, "content": content},
+                        },
+                        {"type": "text", "text": "ok"},
+                    ],
+                },
+            }
+        )
+    return rows
+
+
+def test_claude_repeated_writes_are_incremental_not_accumulated():
+    # An agent that rewrites the WHOLE file each turn must show only the incremental change per
+    # turn, not the entire file every time (the accumulating-diff bug).
+    rows = _claude_write_rows("/r/f.py", ["line1\n", "line1\nline2\n", "line1\nline2\nline3\n"])
+    turns = claude.parse_rows("s", rows, collect_edits=True).turns
+    per_turn = [(e.insertions, e.deletions) for t in turns for e in t.edits]
+    assert per_turn == [(1, 0), (1, 0), (1, 0)]  # +line1, then +line2, then +line3 — not cumulative
+
+
+def test_claude_edit_diffs_against_previously_written_content():
+    # A Write then an Edit: the Edit's diff is the localized change within the written file, not
+    # the whole file and not a bare snippet.
+    rows = [
+        {
+            "type": "user",
+            "uuid": "u1",
+            "timestamp": "2026-07-01T09:00:00Z",
+            "message": {"role": "user", "content": "create"},
+        },
+        {
+            "type": "assistant",
+            "uuid": "a1",
+            "timestamp": "2026-07-01T09:00:05Z",
+            "message": {
+                "id": "m1",
+                "role": "assistant",
+                "stop_reason": "end_turn",
+                "model": "claude-opus-4-8",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "t1",
+                        "name": "Write",
+                        "input": {"file_path": "/r/f.py", "content": "def add():\n    pass\n"},
+                    }
+                ],
+            },
+        },
+        {
+            "type": "user",
+            "uuid": "u2",
+            "timestamp": "2026-07-02T09:00:00Z",
+            "message": {"role": "user", "content": "fix"},
+        },
+        {
+            "type": "assistant",
+            "uuid": "a2",
+            "timestamp": "2026-07-02T09:00:05Z",
+            "message": {
+                "id": "m2",
+                "role": "assistant",
+                "stop_reason": "end_turn",
+                "model": "claude-opus-4-8",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "t2",
+                        "name": "Edit",
+                        "input": {"file_path": "/r/f.py", "old_string": "    pass\n", "new_string": "    return 1\n"},
+                    }
+                ],
+            },
+        },
+    ]
+    turns = claude.parse_rows("s", rows, collect_edits=True).turns
+    edit = turns[1].edits[0]
+    assert (edit.insertions, edit.deletions) == (1, 1)  # only the one changed line
+    changed = [ln for ln in edit.patch.splitlines() if ln[:1] in "+-" and ln[:3] not in ("+++", "---")]
+    assert "+    return 1" in changed and "-    pass" in changed
+    assert not any("def add" in ln for ln in changed)  # the unchanged line is not part of the diff
+
+
 def test_opencode_parse_exported_session_collects_edits():
     data = {
         "info": {"id": "ses_1", "time": {"updated": 1_700_000_000_000}},

@@ -9,7 +9,7 @@ from pathlib import Path
 
 from agitrack.backends.base import TokenUsage
 from agitrack.sessions.share_cap import select_kept_indices
-from agitrack.transcripts.edits import make_edit
+from agitrack.transcripts.edits import tracked_edit
 from agitrack.transcripts.types import ExportedSession, FileEdit, SessionRef, SessionTurn, turns_after
 
 __all__ = [
@@ -899,6 +899,9 @@ def parse_rows(
     # finished and no new user prompt in between — that work opens its own turn rather than
     # being merged into the previous (already-committed) turn. See `_is_task_notification`.
     pending_background = False
+    # Per-session running content of each edited file, so a Write/Edit's diff is the incremental
+    # change vs the previous turn, not the whole file every time (only used when collect_edits).
+    file_state: dict[str, str] = {}
 
     def flush(*, dangling: bool = False) -> None:
         nonlocal current
@@ -1055,7 +1058,7 @@ def parse_rows(
                 # Reconstruct this turn's file edits from the tool-call inputs (opt-in; the
                 # backtrace exporter is the only caller). Attributed to the turn in flight,
                 # so they land on the same SessionTurn the conversation trace does.
-                current.setdefault("edits", []).extend(_edits_from_message(message))
+                current.setdefault("edits", []).extend(_edits_from_message(message, file_state))
             text = _assistant_text(message)
             if text:
                 current["final"] = text
@@ -1101,11 +1104,13 @@ def _collect_tool_use_ids(message: dict, sink: set[str]) -> None:
                 sink.add(tool_id)
 
 
-def _edits_from_message(message: dict) -> list[FileEdit]:
+def _edits_from_message(message: dict, file_state: dict[str, str]) -> list[FileEdit]:
     """The file edits in an assistant message's ``tool_use`` blocks (Edit / Write /
     MultiEdit), as :class:`FileEdit`s — used by the backtrace exporter to reconstruct
     how the conversation changed files. Non-editing tools (Read, Bash, …) are ignored;
-    a tool call that produced no net change contributes nothing."""
+    a tool call that produced no net change contributes nothing. ``file_state`` (per
+    session, mutated) tracks each file's current content so every edit's diff is the
+    INCREMENTAL change, not the whole file each time it is rewritten."""
     content = message.get("content")
     if not isinstance(content, list):
         return []
@@ -1120,20 +1125,25 @@ def _edits_from_message(message: dict) -> list[FileEdit]:
         if not isinstance(path, str):
             continue
         if name == "Write":
-            edit = make_edit(path, "", str(inp.get("content") or ""), status="added")
-            if edit is not None:
-                edits.append(edit)
+            edit = tracked_edit(file_state, path, write=str(inp.get("content") or ""))
         elif name == "Edit":
-            edit = make_edit(path, str(inp.get("old_string") or ""), str(inp.get("new_string") or ""))
-            if edit is not None:
-                edits.append(edit)
+            edit = tracked_edit(
+                file_state, path, subedits=[(str(inp.get("old_string") or ""), str(inp.get("new_string") or ""))]
+            )
         elif name == "MultiEdit":
-            for sub in inp.get("edits") or []:
-                if not isinstance(sub, dict):
-                    continue
-                edit = make_edit(path, str(sub.get("old_string") or ""), str(sub.get("new_string") or ""))
-                if edit is not None:
-                    edits.append(edit)
+            edit = tracked_edit(
+                file_state,
+                path,
+                subedits=[
+                    (str(sub.get("old_string") or ""), str(sub.get("new_string") or ""))
+                    for sub in inp.get("edits") or []
+                    if isinstance(sub, dict)
+                ],
+            )
+        else:
+            continue
+        if edit is not None:
+            edits.append(edit)
     return edits
 
 
