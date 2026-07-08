@@ -16,6 +16,7 @@ per-file diff for a change on demand — and then serializes to the ``/files`` (
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable
 
 from agitrack.metrics.collect import CommitStat
@@ -123,9 +124,20 @@ class FileBrowser:
             return {"path": path, "sha": sha, "diff": "", "error": "could not read this diff"}
 
 
-def build_file_browser(stats: list[CommitStat], changed_files: ChangedFiles, diff_fn: FileDiff) -> FileBrowser:
+def build_file_browser(
+    stats: list[CommitStat],
+    changed_files: ChangedFiles,
+    diff_fn: FileDiff,
+    *,
+    keep: "Callable[[str], bool] | None" = None,
+) -> FileBrowser:
     """Assemble a :class:`FileBrowser` from ``stats`` (oldest first) using ``changed_files`` to
-    attribute each change to its files. Each file's history ends up newest-first."""
+    attribute each change to its files. Each file's history ends up newest-first.
+
+    ``keep`` (when given) restricts the browser to the files that still EXIST — a file that was
+    created and later deleted should not clutter the file list, even though its changes still
+    counted toward the token/line totals (those come from the commit stats, not this browser).
+    """
     index: dict[str, FileEntry] = {}
     for stat in stats:
         for path, insertions, deletions in changed_files(stat):
@@ -148,6 +160,8 @@ def build_file_browser(stats: list[CommitStat], changed_files: ChangedFiles, dif
             )
     for entry in index.values():
         entry.changes.reverse()  # stats are oldest-first; show newest change first
+    if keep is not None:
+        index = {path: entry for path, entry in index.items() if keep(path)}
     return FileBrowser(index=index, diff_fn=diff_fn)
 
 
@@ -156,9 +170,12 @@ def build_file_browser(stats: list[CommitStat], changed_files: ChangedFiles, dif
 # ---------------------------------------------------------------------------
 
 
-def backtrace_browser(stats: list[CommitStat], file_edits: dict) -> FileBrowser:
+def backtrace_browser(stats: list[CommitStat], file_edits: dict, *, directory: "Path | None" = None) -> FileBrowser:
     """A file browser for the ``--backtrace`` view, sourced from the per-turn
-    :class:`~agitrack.transcripts.types.FileEdit`s (``sha -> [FileEdit]``)."""
+    :class:`~agitrack.transcripts.types.FileEdit`s (``sha -> [FileEdit]``).
+
+    When ``directory`` is given, only files that still exist on disk under it are listed — a file
+    an agent created and later deleted stays out of the file tab (its edits still counted)."""
     from agitrack.transcripts.edits import combine_patches
 
     def changed(stat: CommitStat) -> list[tuple[str, int, int]]:
@@ -168,15 +185,22 @@ def backtrace_browser(stats: list[CommitStat], file_edits: dict) -> FileBrowser:
         edits = [edit for edit in file_edits.get(sha, []) if edit.path == path]
         return combine_patches(edits)
 
-    return build_file_browser(stats, changed, diff)
+    keep = None
+    if directory is not None:
+        root = directory
+        keep = lambda path: (root / path).exists()  # noqa: E731 — a small local predicate reads fine inline
+    return build_file_browser(stats, changed, diff, keep=keep)
 
 
 def git_browser(repo, stats: list[CommitStat], ref: str = "HEAD") -> FileBrowser:
     """A file browser for the live dashboard, sourced from real git history: which files each
     commit changed (from ``git log --numstat``) and the per-file diff on demand (``git show``).
-    Only commits present in ``stats`` are attributed, so it matches the dashboard's scope."""
+    Only commits present in ``stats`` are attributed, so it matches the dashboard's scope, and only
+    files that still exist in ``ref``'s tree are listed (a since-deleted file's changes still count
+    toward the totals but don't clutter the file tab)."""
     known = {stat.sha for stat in stats}
     numstat = _numstat_by_commit(repo, ref, known)
+    current = _current_files(repo, ref)
 
     def changed(stat: CommitStat) -> list[tuple[str, int, int]]:
         return numstat.get(stat.sha, [])
@@ -184,7 +208,13 @@ def git_browser(repo, stats: list[CommitStat], ref: str = "HEAD") -> FileBrowser
     def diff(path: str, sha: str) -> str:
         return _git_file_diff(repo, sha, path)
 
-    return build_file_browser(stats, changed, diff)
+    return build_file_browser(stats, changed, diff, keep=lambda path: path in current)
+
+
+def _current_files(repo, ref: str) -> set[str]:
+    """The paths that still exist in ``ref``'s tree (NUL-separated so odd filenames are safe)."""
+    out = repo._run(["git", "ls-tree", "-r", "--name-only", "-z", ref, "--"], check=False).stdout
+    return {name for name in out.split("\x00") if name}
 
 
 def _numstat_by_commit(repo, ref: str, known: set[str]) -> dict[str, list[tuple[str, int, int]]]:
