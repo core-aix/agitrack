@@ -4293,7 +4293,10 @@ def test_new_turn_clears_previous_created_notice(tmp_path):
         os.close(write_fd)
 
 
-def test_proxy_pending_prompt_cancelled_user_commit_does_not_forward(tmp_path):
+def test_proxy_pending_prompt_declined_user_commit_still_forwards_with_warning(tmp_path):
+    # The user declines to commit their pre-existing edits (unstage / Esc) and edits remain:
+    # the prompt must STILL be sent (no dropped-and-retype dance), with a warning that those
+    # edits will be committed together with the agent's changes when the turn finishes.
     read_fd, write_fd = os.pipe()
     try:
         os.set_blocking(read_fd, False)
@@ -4310,23 +4313,64 @@ def test_proxy_pending_prompt_cancelled_user_commit_does_not_forward(tmp_path):
             message_until=0.0,
         )
         runner._finish_agent_parse_if_ready = lambda quiet: False
-        runner._create_user_commit_popup = lambda: False
+        runner._ensure_turn_branch = lambda: None
+        runner._create_user_commit_popup = lambda: False  # user declined / unstaged
 
         class Actions:
             def has_pre_agent_user_changes(self):
-                return True
+                return True  # edits still remain after the decline
 
         runner.actions = Actions()
 
         runner._resume_pending_prompt_if_ready()
 
-        try:
-            written = os.read(read_fd, 1)
-        except BlockingIOError:
-            written = b""
-        assert written == b""
+        assert os.read(read_fd, 1) == b"\r"  # the prompt was forwarded, not dropped
         assert runner.pending_forwarded is None
-        assert runner.agent_in_flight is False
+        assert runner.agent_in_flight is True
+        assert "committed together with" in (runner.message or "")  # the warning was shown
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+def test_proxy_pending_prompt_unstage_leaves_nothing_forwards_silently(tmp_path):
+    # The reported bug: choosing "unstage" when there are no other changes left the prompt
+    # unsent until a second Enter. Now, once unstaging leaves nothing to commit, the prompt
+    # forwards immediately — and with no leftover-changes warning.
+    read_fd, write_fd = os.pipe()
+    try:
+        runner = make_runner(
+            master_fd=write_fd,
+            pending_forwarded=[b"\r"],
+            pending_prompt_text="fix it",
+            passthrough_prompt=bytearray(b"fix it"),
+            state=AgitrackState(tmp_path),
+            agent_parse_thread=None,
+            agent_in_flight=False,
+            screen=None,
+            message=None,
+            message_until=0.0,
+        )
+        runner._finish_agent_parse_if_ready = lambda quiet: False
+        runner._ensure_turn_branch = lambda: None
+        runner._create_user_commit_popup = lambda: False  # popup returns False: nothing staged
+
+        # has_pre_agent_user_changes: True before the popup (so it's offered), False after
+        # (unstaging declined the only files, nothing left to commit).
+        answers = iter([True, False])
+
+        class Actions:
+            def has_pre_agent_user_changes(self):
+                return next(answers)
+
+        runner.actions = Actions()
+
+        runner._resume_pending_prompt_if_ready()
+
+        assert os.read(read_fd, 1) == b"\r"  # forwarded on the first pass
+        assert runner.pending_forwarded is None
+        assert runner.agent_in_flight is True
+        assert "committed together with" not in (runner.message or "")  # no warning: nothing left
     finally:
         os.close(read_fd)
         os.close(write_fd)
