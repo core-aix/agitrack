@@ -79,15 +79,26 @@ def shared_sessions_for(repo: GitRepo) -> list[dict]:
         return []
 
 
-def format_html(dash: Dashboard, *, shared_sessions: list[dict] | None = None) -> str:
-    payload = json.dumps(initial_payload(dash, shared_sessions=shared_sessions), separators=(",", ":"))
+def format_html(
+    dash: Dashboard,
+    *,
+    shared_sessions: list[dict] | None = None,
+    banner_html: str = "",
+    backtrace: bool = False,
+) -> str:
+    payload = json.dumps(
+        initial_payload(dash, shared_sessions=shared_sessions, backtrace=backtrace), separators=(",", ":")
+    )
     repo_name = dash.repo.rstrip("/").rsplit("/", 1)[-1] or dash.repo
     # The branch is rendered client-side into the meta-line picker (from the
     # embedded payload), so there's no __BRANCH__ placeholder to substitute.
+    # ``banner_html`` fills the same slot the update banner uses on the served page —
+    # the backtrace view passes its "this is a reconstruction" notice here.
     return (
         _TEMPLATE.replace("__DATA__", payload)
         .replace("__REPO_NAME__", _escape(repo_name))
         .replace("__REPO__", _escape(dash.repo))
+        .replace("__UPDATE_BANNER__", banner_html)
     )
 
 
@@ -549,13 +560,19 @@ def commit_diff(repo: GitRepo, sha: str) -> dict:
     return {"sha": sha, "diff": patch, "truncated": truncated}
 
 
-def initial_payload(dash: Dashboard, *, shared_sessions: list[dict] | None = None) -> dict:
+def initial_payload(
+    dash: Dashboard, *, shared_sessions: list[dict] | None = None, backtrace: bool = False
+) -> dict:
     """What the page embeds for an instant first paint: unfiltered aggregates,
-    the first log page, repo metadata, the page size, and any shared sessions."""
+    the first log page, repo metadata, the page size, and any shared sessions.
+
+    ``backtrace`` marks the payload as a historical reconstruction (``--backtrace``)
+    rather than live repo status, for any client-side affordance that keys off it."""
     return {
         "repo": dash.repo,
         "branch": dash.branch,
         "page_size": PAGE_SIZE,
+        "backtrace": backtrace,
         **aggregates_payload(dash),
         "log": log_page(dash),
         "shared_sessions": shared_sessions or [],
