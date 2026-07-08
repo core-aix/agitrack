@@ -196,9 +196,12 @@ def _commits_oldest_first(repo) -> list[str]:
 def _match_turns_to_commits(
     repo, commits: list[str], changed: dict, turns: list[_TurnRec]
 ) -> dict[str, list[_TurnRec]]:
-    """Attribute each turn to the EARLIEST commit at/after the turn's time whose changed files
-    overlap the turn's files — that commit is where the agent's change actually landed. Returns
-    ``sha -> [turns]`` for the commits that are thereby AI-made."""
+    """Attribute each turn to the commit where its change landed: the commit whose changed files
+    overlap the turn's files (the primary signal — content is authoritative). Among such commits,
+    prefer the EARLIEST one made at/after the turn (where the agent's work was first committed); if
+    none is later — clock/timezone skew, or a commit dated before the turn — fall back to the LATEST
+    overlapping commit. Time only disambiguates; file overlap decides. A commit no turn's files
+    match is a user commit and is left out. Returns ``sha -> [turns]``."""
     times = {
         sha: int(repo._run(["git", "log", "-1", "--format=%at", sha], check=False).stdout.strip() or 0)
         for sha in commits
@@ -206,10 +209,12 @@ def _match_turns_to_commits(
     commit_files = {sha: {path for (path, _ins, _del) in changed.get(sha, [])} for sha in commits}
     ai_map: dict[str, list[_TurnRec]] = {}
     for turn in sorted(turns, key=lambda t: t.ended_at):
-        for sha in commits:  # oldest first
-            if times[sha] + 1 >= turn.ended_at and (turn.files & commit_files[sha]):
-                ai_map.setdefault(sha, []).append(turn)
-                break
+        candidates = [sha for sha in commits if turn.files & commit_files[sha]]
+        if not candidates:
+            continue
+        after = [sha for sha in candidates if times[sha] >= turn.ended_at]
+        best = min(after, key=lambda sha: times[sha]) if after else max(candidates, key=lambda sha: times[sha])
+        ai_map.setdefault(best, []).append(turn)
     return ai_map
 
 
