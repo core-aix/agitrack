@@ -298,6 +298,31 @@ def _patch_discovery(monkeypatch, *, claude_sessions=None, opencode_sessions=Non
     monkeypatch.setattr(opencode, "export_session", lambda repo, sid, collect_edits=False: opencode_sessions.get(sid))
 
 
+def test_discover_dedupes_session_recorded_under_repo_and_worktree(monkeypatch, tmp_path):
+    # One conversation is recorded under BOTH the aGiTrack worktree it ran in and the base repo it
+    # was resumed from (Claude keys transcripts by cwd) — same session id, two files. Discovery must
+    # keep only the largest (most complete) copy, or every turn is counted twice with duplicate shas.
+    big = tmp_path / "worktree.jsonl"
+    big.write_text("x" * 5000)
+    small = tmp_path / "base.jsonl"
+    small.write_text("x" * 100)
+    monkeypatch.setattr(
+        claude,
+        "sessions_under",
+        lambda d: [
+            (SessionRef(id="dup", updated=2.0), big),
+            (SessionRef(id="dup", updated=1.0), small),
+        ],
+    )
+    monkeypatch.setattr(claude, "_first_cwd", lambda p: "/repo")
+    monkeypatch.setattr(bt.opencode, "sessions_under", lambda d: [])
+
+    sources = bt._discover(tmp_path)
+    assert len(sources) == 1
+    # It kept the larger file's source (the complete worktree copy), not the truncated base copy.
+    assert sources[0].export.args[0] == big
+
+
 def test_build_backtrace_merges_both_backends(monkeypatch, tmp_path):
     edit = make_edit("/repo/a.py", "", "x\ny\n", status="added")
     claude_es = ExportedSession(
@@ -401,6 +426,37 @@ def test_backtrace_html_and_endpoints(monkeypatch, tmp_path):
     assert re.fullmatch(r"[0-9a-f]{40}", entry["sha"])
     assert entry["message"] and "# Interaction Trace" in entry["message"]
     assert view.diffs[entry["sha"]].startswith("diff --git a/a.py b/a.py")
+
+
+def test_backtrace_html_survives_placeholder_tokens_and_script_in_transcript(monkeypatch, tmp_path):
+    # Backtracing aGiTrack's own repo replays transcripts that literally mention the page's
+    # template tokens (__DATA__, __UPDATE_BANNER__, __REPO__) and HTML like </script>. If the
+    # renderer substitutes those tokens after embedding the JSON — or fails to escape </script> —
+    # the embedded payload is corrupted, JSON.parse throws, and the whole page renders blank.
+    nasty = "fix the __UPDATE_BANNER__/__REPO__ substitution in format_html; guard </script> too __DATA__"
+    es = ExportedSession(
+        session_id="c1",
+        model="claude-opus-4-8",
+        updated=2000,
+        turns=[_turn(nasty, agent="Done: </script><script>alert(1)</script>")],
+    )
+    _patch_discovery(monkeypatch, claude_sessions={"c1": es})
+    view = bt.build_backtrace(tmp_path)
+
+    html = format_html(view.dashboard, banner_html=bt._banner_html(view), backtrace=True)
+    # The real banner filled its slot (the chrome token WAS substituted where it belongs)...
+    assert "backtracebanner" in html and "BACKTRACE" in html
+    # ...and the embedded JSON is intact: it extends to the FIRST </script> and parses, with the
+    # transcript's token/HTML text preserved (as \u-escapes) rather than substituted or truncated.
+    # (The tokens legitimately appear in transcript data, so they DO occur in the page — the point
+    # is they survive as data instead of corrupting the payload.)
+    start = html.index('id="agitrack-data">') + len('id="agitrack-data">')
+    payload = html[start : html.index("</script>", start)]
+    parsed = json.loads(payload)  # would raise if a later .replace() corrupted the JSON
+    message = parsed["log"]["entries"][0]["message"]
+    assert "__UPDATE_BANNER__" in message and "__REPO__" in message and "</script>" in message
+    # The banner div text must NOT have been injected into the JSON payload (the original bug).
+    assert "backtracebanner" not in payload
 
 
 # --------------------------------------------------------------------------- end-to-end, non-git

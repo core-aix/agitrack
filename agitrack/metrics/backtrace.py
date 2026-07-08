@@ -31,7 +31,7 @@ from agitrack.commits.message import _token_metadata_lines, render_interaction_t
 from agitrack.metrics.collect import CommitStat, Dashboard, _abbreviate_home
 from agitrack.transcripts import claude, opencode
 from agitrack.transcripts.edits import combine_patches, total_lines
-from agitrack.transcripts.types import ExportedSession, FileEdit, SessionTurn, turns_after
+from agitrack.transcripts.types import ExportedSession, FileEdit, SessionRef, SessionTurn, turns_after
 
 # Cap on how many sessions a single backtrace reconstructs, newest first. Exporting a
 # session is real work (OpenCode shells out per session), so an unbounded scan of a machine
@@ -98,14 +98,31 @@ def _discover(directory: Path) -> list[_Source]:
     in one (e.g. the OpenCode CLI missing) never blocks the other."""
     sources: list[_Source] = []
     try:
+        # One conversation can be recorded under several project dirs — the aGiTrack worktree it
+        # ran in AND the base repo it was resumed from (Claude keys transcripts by cwd). They share
+        # a session id but differ in completeness, so keep only the largest (most complete) copy per
+        # id; counting both would double every turn and emit duplicate virtual shas.
+        best: dict[str, tuple[int, SessionRef, Path]] = {}
         for ref, path in claude.sessions_under(directory):
+            try:
+                size = path.stat().st_size
+            except OSError:
+                size = 0
+            current = best.get(ref.id)
+            if current is None or size > current[0]:
+                best[ref.id] = (size, ref, path)
+        for _size, ref, path in best.values():
             base = claude._first_cwd(path) or str(directory)
             export: Callable[[], ExportedSession | None] = partial(claude.export_session_at, path, collect_edits=True)
             sources.append(_Source("claude", ref.id, ref.updated, base, export))
     except Exception:
         pass
     try:
+        seen_opencode: set[str] = set()
         for ref, sdir in opencode.sessions_under(directory):
+            if ref.id in seen_opencode:
+                continue
+            seen_opencode.add(ref.id)
             export = partial(opencode.export_session, Path(sdir), ref.id, collect_edits=True)
             sources.append(_Source("opencode", ref.id, ref.updated, sdir, export))
     except Exception:
