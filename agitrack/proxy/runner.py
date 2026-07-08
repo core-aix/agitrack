@@ -10493,6 +10493,34 @@ class ProxyRunner:
         # Delegate SIGINT -> wait -> SIGTERM escalation to the session's BackendProcess.
         self.active.process.cleanup()
 
+    def _offer_pre_agent_user_commit(self) -> bool:
+        """AUTO mode: before a prompt reaches the agent, offer to commit the user's OWN
+        uncommitted edits into their own commit, so they aren't bundled into the agent's work.
+
+        Never blocks the prompt. Returns True when the user declined (unstaged / Esc) and edits
+        still remain — the caller then forwards the prompt and warns (via
+        :meth:`_warn_uncommitted_edits_ride_along`) that those edits will be committed together
+        with the agent's changes. Returns False when there's nothing to warn about: the edits were
+        committed, unstaging left nothing (so the prompt just goes — no second Enter), or manual
+        mode (the tree is intentionally dirty there and the user commits on their own schedule)."""
+        if self._manual_commits or not self.actions.has_pre_agent_user_changes():
+            return False
+        self._set_message("Uncommitted user changes detected — committing them before the agent runs.")
+        self._render()
+        committed = self._create_user_commit_popup()
+        return not committed and self.actions.has_pre_agent_user_changes()
+
+    def _warn_uncommitted_edits_ride_along(self) -> None:
+        """Warn (AUTO mode) that the user's still-uncommitted edits will be captured together with
+        the agent's changes when this turn is committed. Shown AFTER the prompt is forwarded, so
+        the send itself (which clears transient messages) doesn't wipe the warning."""
+        self._set_message(
+            "Proceeding with your uncommitted changes — they'll be committed together with "
+            "the agent's changes when it finishes.",
+            seconds=6,
+        )
+        self._render()
+
     def _pre_agent_commit_if_needed(self, prompt_text: str = "") -> bool:
         self._clear_agent_in_flight_if_idle()
         if self._manual_commits:
@@ -10532,10 +10560,7 @@ class ProxyRunner:
         # (your working directory) — both, when both are dirty. The base commit is then
         # merged into the worktree so the agent starts from your edits. (Manual-commit mode
         # returned early above — it never reaches here.)
-        if self.actions.has_pre_agent_user_changes():
-            self._set_message("Uncommitted changes in this session's worktree — committing them before the agent runs.")
-            self._render()
-            self._create_user_commit_popup()
+        warn_uncommitted = self._offer_pre_agent_user_commit()
         self._commit_base_user_edits_if_needed()
         # Trace every submitted prompt as a user message. The agent-active path
         # above already recorded; the held path records in _forward_pending_prompt.
@@ -10543,6 +10568,8 @@ class ProxyRunner:
         # follow-up is dropped from the commit trace. Dedup in the agent-commit
         # builder collapses this with the backend's own turn.user_prompt.
         self._record_user_prompt(prompt_text)
+        if warn_uncommitted:
+            self._warn_uncommitted_edits_ride_along()
         return True
 
     def _handle_pre_compaction(self) -> None:
@@ -10690,19 +10717,15 @@ class ProxyRunner:
             # follow-up instead of holding it (and the "checking" message) forever.
             self._forward_pending_prompt()
             return
-        # Manual-commit mode never blocks a prompt on committing existing changes — the
-        # working tree is intentionally dirty and the user commits when they choose.
-        if not self._manual_commits and finished is False and self.actions.has_pre_agent_user_changes():
-            self._set_message("User changes detected before agent runs.")
-            self._render()
-            if not self._create_user_commit_popup():
-                self.pending_forwarded = None
-                self.pending_prompt_text = ""
-                self._set_message("Prompt not sent because existing user changes were not committed.")
-                self._render()
-                return
+        # Offer to commit the user's own pre-existing edits first (AUTO mode only) — but never
+        # drop the prompt over it: whether they commit, unstage, or decline, the turn still goes
+        # through (with a warning when uncommitted edits remain). Manual mode never reaches here
+        # via the guard: its tree is intentionally dirty and the user commits when they choose.
+        warn_uncommitted = self._offer_pre_agent_user_commit() if finished is False else False
         self._commit_base_user_edits_if_needed()
         self._forward_pending_prompt()
+        if warn_uncommitted:
+            self._warn_uncommitted_edits_ride_along()
 
     def _forward_pending_prompt(self) -> None:
         if self.pending_forwarded is None or self.master_fd is None:
