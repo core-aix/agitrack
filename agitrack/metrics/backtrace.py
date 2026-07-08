@@ -275,16 +275,18 @@ def _message(source: _Source, exported: ExportedSession, turn: SessionTurn) -> s
     reasoning effort, the backend session id, the conversation's start/end, and the turn's
     token usage — so the log shows the same metadata an aGiTrack commit would, with nothing
     invented (no synthetic session name, committer, or commit hash)."""
+    # Build the trace EXACTLY as a default aGiTrack commit does (commit_engine._agent_messages_for):
+    # the user prompt, each mid-turn queued follow-up as its own ## User, and ONLY the agent's
+    # FINAL response as the ## Agent block. Intermediate agent chatter, internal thinking, tool
+    # calls and results are never in a commit, so they must not appear here either.
     trace: list[dict] = []
     if turn.user_prompt.strip():
         trace.append({"role": "user", "content": turn.user_prompt})
     for followup in turn.queued_followups:
         if followup.strip():
             trace.append({"role": "user", "content": followup})
-    agent_texts = turn.agent_messages or ([turn.final_response] if turn.final_response.strip() else [])
-    for text in agent_texts:
-        if text.strip():
-            trace.append({"role": "agent", "content": text})
+    if turn.final_response.strip():
+        trace.append({"role": "agent", "content": turn.final_response})
     body = render_interaction_trace(trace, trace_turn_limit=len(trace) + 1)
 
     lines = [_subject(turn), ""]
@@ -464,7 +466,9 @@ def _make_handler(view: BacktraceView) -> type[http.server.BaseHTTPRequestHandle
 def _banner_html(view: BacktraceView) -> str:
     from agitrack.metrics.web import _escape
 
-    return f'<div class="updatebanner">⏪ {_escape(view.banner_text())}</div>'
+    # `backtracebanner` (not `updatebanner`) so it renders as a frozen top strip — the CSS pins
+    # it like the filter bar, and the JS offsets the filters below it (see the template).
+    return f'<div class="backtracebanner">⏪ {_escape(view.banner_text())}</div>'
 
 
 # ---------------------------------------------------------------------------

@@ -233,6 +233,25 @@ def test_backtrace_message_carries_interaction_trace_and_real_metadata():
     assert "session_name:" not in message and "agitrack_session_id:" not in message
 
 
+def test_backtrace_trace_shows_only_final_response_like_a_commit():
+    # A real aGiTrack commit records ONLY the agent's final response (not intermediate
+    # messages or thinking); the backtrace trace must match, so it never leaks internal chatter.
+    turn = SessionTurn(
+        user_message_id="u",
+        assistant_message_id="a",
+        user_prompt="do the thing",
+        final_response="Here is the finished result.",
+        tokens=TokenUsage(input=1, output=1),
+        model="claude-opus-4-8",
+        agent_messages=["Let me think about this intermediate step…", "Here is the finished result."],
+    )
+    source = bt._Source("claude", "s1", 1.0, "/repo", lambda: None)
+    exported = ExportedSession(session_id="s1", model="claude-opus-4-8", updated=1, turns=[turn])
+    message = bt._message(source, exported, turn)
+    assert "Here is the finished result." in message
+    assert "intermediate step" not in message  # intermediate agent message is excluded, as in a commit
+
+
 def test_backtrace_relativizes_edit_paths():
     edit = make_edit("/repo/pkg/mod.py", "a\n", "b\n")
     rel = bt._relativize(edit, ["/repo"])
@@ -260,7 +279,7 @@ def test_backtrace_html_and_endpoints(monkeypatch, tmp_path):
     view = bt.build_backtrace(tmp_path)
 
     html = format_html(view.dashboard, banner_html=bt._banner_html(view), backtrace=True)
-    assert "BACKTRACE" in html and "updatebanner" in html
+    assert "BACKTRACE" in html and "backtracebanner" in html
     assert "__UPDATE_BANNER__" not in html and "__DATA__" not in html
 
     data = aggregates_payload(view.dashboard)

@@ -636,6 +636,12 @@ body.booting .wrap>*:not(header):not(.booting){display:none}
   box-shadow:0 6px 20px rgba(0,0,0,.55);animation:rise .25s ease}
 .updatebanner{margin:0 0 14px;padding:9px 16px;border:1px solid var(--accent,#6be);border-radius:8px;
   background:rgba(90,150,230,.12);color:var(--accent,#9cf);font-size:13px;text-align:center}
+/* The backtrace notice is a frozen top strip — always visible, like the sticky filter bar.
+   Opaque so page content scrolls cleanly beneath it; the filter bar's top offset is set to this
+   strip's height in JS so the two stack instead of overlapping. */
+.backtracebanner{position:sticky;top:0;z-index:25;margin:0;padding:10px 18px;background:var(--panel);
+  border-bottom:2px solid var(--amber-dim);color:var(--amber);font-size:12.5px;line-height:1.5;
+  text-align:center;box-shadow:0 4px 16px rgba(0,0,0,.55)}
 @keyframes rise{from{transform:translateY(-100%)}to{transform:none}}
 
 header{padding:54px 0 22px}
@@ -888,15 +894,34 @@ h2.section::before{content:"# ";color:var(--amber)}
 .pager button:hover:not([disabled]){background:var(--phosphor);color:var(--ink)}
 .pager button[disabled]{opacity:.35;cursor:default;border-color:var(--line);color:var(--fg-dim)}
 
-/* ---- file browser ---- */
-.filehead{display:flex;align-items:baseline;justify-content:space-between;gap:14px;flex-wrap:wrap;margin:38px 0 14px}
-.filehead h2.section{margin:0}
+/* ---- log tabs (commits / files) ---- */
+.logtabs{display:flex;gap:8px}
+.logtab{font-family:var(--mono);font-size:13px;background:transparent;border:1px solid var(--line);
+  color:var(--fg-dim);padding:5px 15px;cursor:pointer;letter-spacing:.5px}
+.logtab.active{color:var(--phosphor);border-color:var(--phosphor-dim);background:rgba(61,255,160,.06)}
+.logtab:hover{color:var(--fg)}
+.logpane[hidden]{display:none}
+.panehead{display:flex;justify-content:flex-end;align-items:center;margin:0 0 10px}
+
+/* ---- file browser (folder tree) ---- */
 .filesearch{background:var(--ink);color:var(--fg);border:1px solid var(--line);font-family:var(--mono);
-  font-size:13px;padding:6px 11px;min-width:min(60vw,260px)}
+  font-size:13px;padding:6px 11px;min-width:min(70vw,280px)}
 .filesearch:focus{outline:none;border-color:var(--phosphor)}
 .filebrowse{background:var(--panel);border:1px solid var(--line)}
+.ftree-dir{border-bottom:1px solid var(--line)}
+.ftree-dir:last-child{border-bottom:none}
+.ftree-dir>summary{cursor:pointer;list-style:none;padding:9px 16px;display:flex;justify-content:space-between;
+  gap:14px;align-items:center}
+.ftree-dir>summary::-webkit-details-marker{display:none}
+.ftree-dir>summary::before{content:"▸ ";color:var(--ops)}
+.ftree-dir[open]>summary::before{content:"▾ "}
+.ftree-dir>summary:hover{background:rgba(103,184,214,.05)}
+.ftree-dir .fdir{color:var(--ops);overflow-wrap:anywhere}
+.ftree-dir .fdircount{color:var(--fg-dim);font-size:12px;white-space:nowrap}
+.ftree-children{padding-left:14px;border-left:1px solid var(--line);margin-left:16px}
 .frow{display:grid;grid-template-columns:1fr auto auto auto;gap:16px;align-items:center;
   padding:9px 16px;border-bottom:1px solid var(--line);cursor:pointer}
+.ftree-children .frow{border-bottom:1px dashed var(--line)}
 .frow:last-child{border-bottom:none}
 .frow:hover{background:rgba(61,255,160,.04)}
 .frow .fp{color:var(--fg);overflow-wrap:anywhere}
@@ -907,14 +932,15 @@ h2.section::before{content:"# ";color:var(--amber)}
 .fdetail{border-bottom:1px solid var(--line);background:var(--panel-2)}
 .fchange{padding:9px 16px 11px;border-bottom:1px dashed var(--line);border-left:2px solid var(--phosphor-dim);margin-left:14px}
 .fchange:last-child{border-bottom:none}
+.fchange .fchead{cursor:pointer}
+.fchange.open .fsub{color:var(--phosphor)}
 .fchange .fmeta{color:var(--ops);font-size:12px;margin-bottom:3px}
-.fchange .fsub{color:var(--fg);font-size:12.5px;margin-bottom:5px;overflow-wrap:anywhere}
-.fchange .fbtns{display:flex;gap:8px}
-.fchange .fbtns button{font-family:inherit;font-size:11.5px;color:var(--phosphor);background:transparent;
-  border:1px solid var(--phosphor-dim);padding:1px 8px;cursor:pointer;letter-spacing:.3px}
-.fchange .fbtns button:hover{background:var(--phosphor);color:var(--ink)}
-.fchange .fbox{margin-top:8px}
-.fchange .fbox[hidden]{display:none}
+.fchange .fsub{color:var(--fg);font-size:12.5px;overflow-wrap:anywhere}
+.fchange .fdetailc{margin-top:8px}
+.fchange .fdetailc[hidden]{display:none}
+.fchange .fdifftoggle{font-family:inherit;font-size:11.5px;color:var(--phosphor);background:transparent;
+  border:1px solid var(--phosphor-dim);padding:1px 8px;cursor:pointer;letter-spacing:.3px;margin-bottom:8px}
+.fchange .fdifftoggle:hover{background:var(--phosphor);color:var(--ink)}
 .fmore{padding:12px 16px;color:var(--fg-dim);font-size:12.5px}
 footer{margin-top:46px;padding-top:22px;border-top:1px dashed var(--line);color:var(--fg-dim);font-size:12.5px;
   display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap}
@@ -999,21 +1025,25 @@ __UPDATE_BANNER__
   <h2 class="section">shared sessions</h2>
   <div class="panel" id="shared"></div>
 
-  <div class="filehead" id="filehead">
-    <h2 class="section">files</h2>
-    <input id="file-search" class="filesearch" type="search" placeholder="filter files…" autocomplete="off">
-  </div>
-  <div class="filebrowse" id="filebrowse"></div>
-
   <div class="loghead">
-    <h2 class="section">commit log</h2>
-    <div class="logsort"><label for="f-sort">sort</label><select id="f-sort" title="Sort the filtered commits">
+    <h2 class="section">log</h2>
+    <div class="logtabs">
+      <button class="logtab active" data-tab="commits">commits</button>
+      <button class="logtab" data-tab="files" id="tab-files-btn">files</button>
+    </div>
+  </div>
+  <div class="logpane" id="pane-commits">
+    <div class="panehead"><div class="logsort"><label for="f-sort">sort</label><select id="f-sort" title="Sort the filtered commits">
       <option value="date">newest first</option>
       <option value="lines">most lines changed</option>
       <option value="tokens">most output tokens</option>
-    </select></div>
+    </select></div></div>
+    <div class="log" id="commitlog"></div>
   </div>
-  <div class="log" id="commitlog"></div>
+  <div class="logpane" id="pane-files" hidden>
+    <div class="panehead"><input id="file-search" class="filesearch" type="search" placeholder="filter files…" autocomplete="off"></div>
+    <div class="filebrowse" id="filebrowse"></div>
+  </div>
 
   <footer>
     <span>aGiTrack · agent + git tracking · metrics from commit metadata &nbsp;·&nbsp;
@@ -1692,32 +1722,69 @@ async function loadFiles(){
   try{ const r = await fetch("files", {cache:"no-store"}); FILES = (await r.json()).files || []; }
   catch(e){ FILES = FILES || []; }
 }
+function fileRowHtml(f){
+  const name = f.path.split("/").pop() || f.path;
+  return `<div class="frow" data-path="${esc(f.path)}"><span class="fp" title="${esc(f.path)}">${esc(name)}</span>`+
+    `<span class="fc">${fmt(f.changes)} change${f.changes===1?"":"s"}</span>`+
+    `<span class="fl"><span class="add">+${fmt(f.ins)}</span> <span class="rem">−${fmt(f.del)}</span></span>`+
+    `<span class="fc">${kfmt(f.output_tokens||0)} out</span></div>`;
+}
+// Group the flat file list into a folder tree so a big repo's file list is browsable
+// (folders collapse/expand) instead of one very long flat list.
+function buildFileTree(rows){
+  const root = { dirs:{}, files:[] };
+  for(const f of rows){
+    const parts = f.path.split("/");
+    let node = root;
+    for(let i=0;i<parts.length-1;i++){ node.dirs[parts[i]] = node.dirs[parts[i]] || { dirs:{}, files:[] }; node = node.dirs[parts[i]]; }
+    node.files.push(f);
+  }
+  return root;
+}
+function folderStats(node){
+  let files = node.files.length, changes = node.files.reduce((a,f)=>a+f.changes,0);
+  for(const k in node.dirs){ const s = folderStats(node.dirs[k]); files += s.files; changes += s.changes; }
+  return { files, changes };
+}
+function renderTree(node, forceOpen, depth){
+  let html = "";
+  for(const d of Object.keys(node.dirs).sort()){
+    const child = node.dirs[d], st = folderStats(child), open = forceOpen || depth === 0;  // top level open; rest collapsed
+    html += `<details class="ftree-dir"${open?" open":""}><summary><span class="fdir">${esc(d)}/</span>`+
+      `<span class="fdircount">${fmt(st.files)} file${st.files===1?"":"s"} · ${fmt(st.changes)} change${st.changes===1?"":"s"}</span></summary>`+
+      `<div class="ftree-children">${renderTree(child, forceOpen, depth+1)}</div></details>`;
+  }
+  for(const f of node.files.slice().sort((a,b)=> (b.last_ts-a.last_ts) || (b.changes-a.changes))) html += fileRowHtml(f);
+  return html;
+}
 function renderFiles(){
-  const host = $("filebrowse"), head = $("filehead");
-  if(!host || !head) return;
-  if(!FILES || !FILES.length){ head.style.display = "none"; host.style.display = "none"; return; }
-  head.style.display = ""; host.style.display = "";
+  const host = $("filebrowse"), btn = $("tab-files-btn");
+  if(!host) return;
+  if(!FILES || !FILES.length){ if(btn) btn.style.display = "none"; host.innerHTML = ""; return; }
+  if(btn) btn.style.display = "";
   const q = FILEQ.trim().toLowerCase();
   const rows = q ? FILES.filter(f => f.path.toLowerCase().includes(q)) : FILES;
-  host.innerHTML = rows.length
-    ? rows.map(f => `<div class="frow" data-path="${esc(f.path)}"><span class="fp">${esc(f.path)}</span>`+
-        `<span class="fc">${fmt(f.changes)} change${f.changes===1?"":"s"}</span>`+
-        `<span class="fl"><span class="add">+${fmt(f.ins)}</span> <span class="rem">−${fmt(f.del)}</span></span>`+
-        `<span class="fc">${kfmt(f.output_tokens||0)} out</span></div>`).join("")
-    : `<div class="fmore">no files match “${esc(FILEQ)}”</div>`;
+  // A search expands every matching folder so hits aren't hidden; otherwise only the top level is open.
+  host.innerHTML = rows.length ? renderTree(buildFileTree(rows), !!q, 0) : `<div class="fmore">no files match “${esc(FILEQ)}”</div>`;
+}
+function showLogTab(tab){
+  document.querySelectorAll(".logtab").forEach(b => b.classList.toggle("active", b.dataset.tab === tab));
+  const pc = $("pane-commits"), pf = $("pane-files");
+  if(pc) pc.hidden = tab !== "commits";
+  if(pf) pf.hidden = tab !== "files";
 }
 function fileChangeHtml(c, i){
   const when = c.ts ? new Date(c.ts*1000).toISOString().slice(0,16).replace("T"," ")+" UTC" : "";
   const who = [c.backend, c.model].filter(Boolean).map(esc).join(" · ");
   const out = (c.tokens && c.tokens.output) ? ` · ${kfmt(c.tokens.output)} out tok` : "";
   const lc = `<span class="add">+${fmt(c.ins)}</span> <span class="rem">−${fmt(c.del)}</span>`;
-  const meta = [esc(when), who, out].filter(Boolean).join(who?"":"");
-  return `<div class="fchange">`+
-    `<div class="fmeta">${esc(when)}${who?` · ${who}`:""}${out} · ${lc}</div>`+
-    `<div class="fsub">${esc(c.subject || c.prompt || "(change)")}</div>`+
-    `<div class="fbtns"><button class="fconvbtn" data-i="${i}">conversation</button>`+
-    `<button class="fdiffbtn" data-i="${i}">file diff</button></div>`+
-    `<div class="fbox fconv" hidden></div><div class="fbox fdiff" hidden></div></div>`;
+  // One clickable header per change; opening it reveals a SINGLE box (the conversation by
+  // default) with ONE button that toggles that box to the file diff and back — exactly like
+  // the commit log, so a change is never shown as two separate panes.
+  return `<div class="fchange" data-i="${i}">`+
+    `<div class="fchead"><div class="fmeta">${esc(when)}${who?` · ${who}`:""}${out} · ${lc}</div>`+
+    `<div class="fsub">${esc(c.subject || c.prompt || "(change)")}</div></div>`+
+    `<div class="fdetailc" id="fdetail-${i}" hidden></div></div>`;
 }
 async function openFile(row){
   const path = row.dataset.path;
@@ -1736,33 +1803,49 @@ async function openFile(row){
     : `<div class="fmore">no recorded changes</div>`;
   row.after(div);
 }
-function toggleFileConv(btn){
-  const box = btn.closest(".fchange").querySelector(".fconv"), c = OPENFILE.changes[+btn.dataset.i] || {};
-  if(box.hidden){ box.innerHTML = `<div class="dmsg md">${md(c.message || "(no conversation recorded)")}</div>`; box.hidden=false; btn.textContent="hide conversation"; }
-  else { box.hidden = true; btn.textContent = "conversation"; }
-}
-async function toggleFileDiff(btn){
-  const box = btn.closest(".fchange").querySelector(".fdiff"), c = OPENFILE.changes[+btn.dataset.i] || {};
-  if(!box.hidden){ box.hidden = true; btn.textContent = "file diff"; return; }
-  btn.textContent = "hide diff";
+function toggleFileChange(head){
+  const fchange = head.closest(".fchange"), i = +fchange.dataset.i, box = $("fdetail-"+i);
+  const c = OPENFILE.changes[i] || {};
+  if(!box.hidden){ box.hidden = true; box.innerHTML = ""; fchange.classList.remove("open"); return; }
+  fchange.classList.add("open");
   box.hidden = false;
-  if(box.dataset.loaded){ return; }
-  box.innerHTML = `<div class="fmore">loading…</div>`;
+  box.innerHTML = `<button class="fdifftoggle" data-i="${i}">show file diff</button>`+
+    `<div class="dmsg md" id="fbody-${i}" data-mode="msg">${md(c.message || "(no conversation recorded)")}</div>`;
+}
+const _fdiffCache = {};
+async function toggleFileBody(btn){
+  const i = +btn.dataset.i, body = $("fbody-"+i), c = OPENFILE.changes[i] || {};
+  if(!body) return;
+  if(body.dataset.mode === "diff"){                     // diff → back to the conversation
+    body.dataset.mode = "msg"; body.className = "dmsg md";
+    body.innerHTML = md(c.message || "(no conversation recorded)");
+    btn.textContent = "show file diff";
+    return;
+  }
+  body.dataset.mode = "diff";                            // conversation → file diff (keep the message until ready)
+  btn.textContent = "show conversation";
+  const key = OPENFILE.path + "\x00" + c.sha;
+  const apply = html => { if(body.dataset.mode === "diff"){ body.className = "dmsg diff"; body.innerHTML = html; } };
+  if(_fdiffCache[key] !== undefined){ apply(_fdiffCache[key]); return; }
   try{
     const r = await fetch(`filediff?path=${encodeURIComponent(OPENFILE.path)}&sha=${encodeURIComponent(c.sha)}`, {cache:"no-store"});
-    const d = await r.json();
-    box.innerHTML = d.diff ? renderDiff(d.diff) : `<div class="fmore">${esc(d.error || "no diff for this change")}</div>`;
-  }catch(e){ box.innerHTML = `<div class="fmore">could not load diff</div>`; }
-  box.dataset.loaded = "1";
+    const d = r.ok ? await r.json() : {error:"server error"};
+    let html;
+    if(d.error) html = '<div class="diffempty">'+esc(d.error)+'</div>';
+    else if(!d.diff || !d.diff.trim()) html = '<div class="diffempty">no changes to this file in this turn</div>';
+    else html = renderDiff(d.diff);
+    _fdiffCache[key] = html; apply(html);
+  }catch(e){ apply('<div class="diffempty">couldn\'t load the diff (server unreachable)</div>'); }
 }
 function wireFileBrowser(){
+  document.querySelectorAll(".logtab").forEach(b => b.addEventListener("click", () => showLogTab(b.dataset.tab)));
   const search = $("file-search");
   if(search) search.addEventListener("input", e => { FILEQ = e.target.value; renderFiles(); });
   const host = $("filebrowse");
   if(host) host.addEventListener("click", e => {
-    const cb = e.target.closest(".fconvbtn"); if(cb){ toggleFileConv(cb); return; }
-    const db = e.target.closest(".fdiffbtn"); if(db){ toggleFileDiff(db); return; }
-    if(e.target.closest(".fdetail")) return;
+    const tgl = e.target.closest(".fdifftoggle"); if(tgl){ toggleFileBody(tgl); return; }
+    const head = e.target.closest(".fchead"); if(head){ toggleFileChange(head); return; }
+    if(e.target.closest(".fdetail")) return;  // other clicks inside a file's change list: ignore
     const row = e.target.closest(".frow"); if(row) openFile(row);
   });
 }
@@ -1774,8 +1857,18 @@ function hideFabricatedChrome(){
   const bc = $("by-committer");
   if(bc){ bc.style.display = "none"; if(bc.previousElementSibling) bc.previousElementSibling.style.display = "none"; }
 }
+function stackStickyBanner(){
+  // Pin the filter bar just below the frozen backtrace strip (both are position:sticky top:0),
+  // so when the page scrolls the filters stop under the banner instead of behind it.
+  const bb = document.querySelector(".backtracebanner"), ctl = document.querySelector(".controls");
+  if(!bb || !ctl) return;
+  const setTop = () => { ctl.style.top = bb.offsetHeight + "px"; };
+  setTop();
+  window.addEventListener("resize", setTop);
+}
 async function init(){
   hideFabricatedChrome();
+  stackStickyBanner();
   // Shell mode: the chrome is already on screen with the loading animation; fetch the
   // real aggregates + first log page, then drop the loader and render. A big repo's
   // git-log crunch happens here, behind the animation, instead of blocking first paint.
@@ -1856,6 +1949,7 @@ async function init(){
   // The file browser is independent of the commit-log filters, so it loads once here.
   wireFileBrowser();
   await loadFiles(); renderFiles();
+  if(location.hash === "#files" && FILES && FILES.length) showLogTab("files");  // deep-link to the Files tab
   // Poll only when there's a live backend; the poll also clears the
   // "unreachable" banner automatically once the server is back — and, after a failed
   // boot fetch, the next successful poll populates the view (HEAD goes "" → real).
