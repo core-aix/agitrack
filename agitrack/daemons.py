@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -33,6 +34,15 @@ KIND_LABELS = {
     "backtrace": "backtrace dashboard",
     "background": "background mode",
 }
+
+# The internal serve flag unique to each detached daemon child — the fingerprint used to find a
+# daemon directly in the OS process table (so one that never registered, e.g. started by a version
+# before this registry existed, is still discovered).
+_SERVE_FLAGS = (
+    ("--dashboard-serve", "dashboard"),
+    ("--backtrace-serve", "backtrace"),
+    ("--background-serve", "background"),
+)
 
 
 def _registry_dir() -> Path:
@@ -103,7 +113,22 @@ def deregister(pid: int | None = None) -> None:
 
 
 def list_running() -> list[DaemonInfo]:
-    """Every aGiTrack daemon currently alive, pruning entries whose process has exited."""
+    """Every aGiTrack daemon currently alive.
+
+    Combines two sources so nothing is missed: the registry (rich — carries the URL/version and is
+    cross-platform) AND a scan of the OS process table (authoritative — finds a daemon even if it
+    never wrote a registry entry, e.g. one started before this feature existed). Deduped by pid,
+    with the registry entry preferred where both have it."""
+    by_pid: dict[int, DaemonInfo] = {info.pid: info for info in _registry_entries()}
+    for info in _scan_daemon_processes():
+        by_pid.setdefault(info.pid, info)  # a registered entry (URL/version) wins over a bare scan
+    out = list(by_pid.values())
+    out.sort(key=lambda info: (info.kind, info.repo))
+    return out
+
+
+def _registry_entries() -> list[DaemonInfo]:
+    """Daemons that recorded a registry entry, pruning entries whose process has exited."""
     out: list[DaemonInfo] = []
     try:
         entries = sorted(_registry_dir().glob("*.json"))
@@ -130,8 +155,70 @@ def list_running() -> list[DaemonInfo]:
                 started=int(record.get("started", 0)),
             )
         )
-    out.sort(key=lambda info: (info.kind, info.repo))
     return out
+
+
+def _scan_daemon_processes() -> list[DaemonInfo]:
+    """aGiTrack daemons found directly in the OS process table — matched by their unique internal
+    ``--*-serve`` flag, so a daemon that never registered is still listed and can be restarted (its
+    command line is its own re-launch command). Cross-platform (``ps`` on POSIX, PowerShell/CIM on
+    Windows); best-effort, empty if neither is available (the registry alone is then used)."""
+    out: list[DaemonInfo] = []
+    mine = os.getpid()
+    for line in _process_command_lines():
+        pid_str, _, command = line.strip().partition(" ")
+        if not pid_str.isdigit() or not command:
+            continue
+        pid = int(pid_str)
+        if pid == mine:
+            continue
+        kind = next((k for flag, k in _SERVE_FLAGS if flag in command), None)
+        if kind is None:
+            continue  # the serve flags are unique to aGiTrack daemon children
+        argv = _split_command(command)
+        out.append(DaemonInfo(pid=pid, kind=kind, repo=_repo_from_argv(argv), cmd=argv))
+    return out
+
+
+def _process_command_lines() -> list[str]:
+    """One ``"<pid> <full command line>"`` string per running process. POSIX uses ``ps``; Windows
+    uses PowerShell's ``Win32_Process`` (``ps`` doesn't exist there). ``[]`` if the query fails."""
+    if os.name == "nt":
+        command = [
+            "powershell",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId) $($_.CommandLine)" }',
+        ]
+    else:
+        command = ["ps", "-axww", "-o", "pid=,args="]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=15, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return result.stdout.splitlines()
+
+
+def _split_command(command: str) -> list[str]:
+    """Split a command line into argv. Windows paths use backslashes, so shell-splitting there must
+    NOT treat ``\\`` as an escape (``posix=False``)."""
+    try:
+        return shlex.split(command, posix=(os.name != "nt"))
+    except ValueError:
+        return command.split()
+
+
+def _repo_from_argv(argv: list[str]) -> str:
+    """The ``--repo`` path from a daemon's argv (empty if absent). Surrounding quotes — which
+    ``posix=False`` splitting keeps on a Windows path with spaces — are stripped."""
+    for index, token in enumerate(argv):
+        bare = token.strip('"')
+        if bare == "--repo" and index + 1 < len(argv):
+            return argv[index + 1].strip('"')
+        if bare.startswith("--repo="):
+            return bare[len("--repo=") :]
+    return ""
 
 
 def restart_all(*, exclude_pid: int | None = None, log=lambda message: None) -> int:

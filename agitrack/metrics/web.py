@@ -962,7 +962,7 @@ __UPDATE_BANNER__
 <div class="wrap">
   <header>
     <div class="brand"><span class="a">a</span>GiTrack<span class="sub">&nbsp;dashboard</span></div>
-    <div class="meta"><span class="tag">repo</span> <b>__REPO__</b> &nbsp;·&nbsp; <span class="tag">branch</span> <select id="f-branch" class="branchsel" title="View statistics and the commit log for a single branch"></select> &nbsp;·&nbsp; <span id="genat"></span></div>
+    <div class="meta"><span class="tag">repo</span> <b>__REPO__</b><span id="branchmeta"> &nbsp;·&nbsp; <span class="tag">branch</span> <select id="f-branch" class="branchsel" title="View statistics and the commit log for a single branch"></select></span> &nbsp;·&nbsp; <span id="genat"></span></div>
   </header>
 
   <div class="booting" id="booting">
@@ -1873,12 +1873,16 @@ function wireFileBrowser(){
   });
 }
 function hideFabricatedChrome(){
-  // Backtrace has no committer behind a turn, so drop the committer filter and the
-  // "by committer" breakdown entirely — showing a made-up committer would be dishonest.
+  // Backtrace is a reconstruction, not a live branch view: drop the parts of the dashboard that
+  // don't apply. The committer (no committer behind a turn), the branch picker (there is no
+  // branch), and shared sessions (a live-repo feature) would all be misleading here.
   if(!BACKTRACE) return;
   const fa = $("f-author"); if(fa && fa.closest(".field")) fa.closest(".field").style.display = "none";
   const bc = $("by-committer");
   if(bc){ bc.style.display = "none"; if(bc.previousElementSibling) bc.previousElementSibling.style.display = "none"; }
+  const bm = $("branchmeta"); if(bm) bm.style.display = "none";  // no "branch …" in the header
+  const sh = $("shared");
+  if(sh){ sh.style.display = "none"; if(sh.previousElementSibling) sh.previousElementSibling.style.display = "none"; }
 }
 function stackStickyBanner(){
   // Pin the filter bar just below the frozen backtrace strip (both are position:sticky top:0),
