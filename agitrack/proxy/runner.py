@@ -2009,6 +2009,14 @@ class ProxyRunner:
                 return  # clean vs HEAD ⇒ agent/user committed; the fold hook handled it
         except Exception:
             return
+        # Hold the fold briefly while this turn's summary is still in flight: the summary lands
+        # as a note on the (never-HEAD) latent commit, which _manual_pending_bodies folds into the
+        # message below — but only if it has arrived first. Without this wait the poll folds within
+        # ~3s, long before the multi-second LLM summary returns, so the folded commit keeps its
+        # prompt-based subject and the summary is orphaned as a note (the reported no-worktree bug).
+        # Bounded by SUMMARY_WAIT_SECONDS: past the deadline we fold as-is, summary becomes notes-only.
+        if self._summary_blocks_integration(time.monotonic()):
+            return
         bodies = self._manual_pending_bodies()
         message = build_auto_fold_message(bodies)
         if not message:

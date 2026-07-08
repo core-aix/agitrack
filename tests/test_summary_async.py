@@ -419,6 +419,86 @@ def test_integration_not_blocked_without_pending_summary():
     assert runner._summary_blocks_integration(100.0) is False
 
 
+# --- no-worktree AUTO mode: the auto-fold must not race the summary ------------
+
+
+def _noworktree_auto_runner(tmp_path, monkeypatch):
+    """A real repo + a no-worktree AUTO runner (_noworktree_auto): aGiTrack folds the
+    hidden latent turns into a real commit itself, per turn."""
+    monkeypatch.setattr("agitrack.summaries.Summarizer", FakeSummarizer)
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path / "agit-config"))
+    FakeSummarizer.gate = None
+    FakeSummarizer.fail = None
+    FakeSummarizer.fail_session = None
+    repo = GitRepo.init(tmp_path)
+    _commit_change(repo, "seed.txt", "initial")
+    runner = make_runner(repo=repo, state=AgitrackState(tmp_path), worktree=None)
+    runner._use_worktrees = False
+    runner._manual_commits = False  # => _noworktree_auto
+    runner.global_config = None
+    runner._render = lambda *a, **k: None
+    assert runner._noworktree_auto and runner._latent_tracking
+    return runner, repo
+
+
+# A real latent turn always carries a `# aGiTrack Metadata` block (build_auto_fold_message
+# only folds bodies that have one); mirror that here.
+_LATENT_BODY = (
+    "<aGiTrack> build the widget renderer\n\n# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\nmodel: sonnet\n"
+)
+
+
+def _record_latent_turn(runner, repo):
+    """One AI turn: the agent leaves an uncommitted edit and aGiTrack records a hidden
+    latent commit (HEAD/index untouched), then starts the async summary — the exact
+    sequence commit_engine drives via on_commit_fn in no-worktree mode."""
+    (repo.repo / "feature.txt").write_text("feature\n", encoding="utf-8")
+    latent = runner._manual_record(_LATENT_BODY)
+    assert latent
+    runner._start_commit_summary(latent, _TRACE_TEXT)
+    return latent
+
+
+def test_noworktree_auto_fold_waits_for_pending_summary(tmp_path, monkeypatch):
+    # The reported bug: in interactive no-worktree AUTO mode the 3s fold poll folded the
+    # latent turn into a real commit long before the multi-second LLM summary returned, so
+    # the user-visible commit kept its prompt subject and the summary was orphaned as a note.
+    runner, repo = _noworktree_auto_runner(tmp_path, monkeypatch)
+    FakeSummarizer.gate = threading.Event()  # keep the summary in flight
+    _record_latent_turn(runner, repo)
+    head_before = repo.rev_parse("HEAD")
+
+    # While the summary is pending the auto-fold must hold (not commit a prompt-only message).
+    runner._auto_fold_latent_pending()
+    assert repo.rev_parse("HEAD") == head_before  # nothing folded yet
+    assert repo.commit_message("HEAD").startswith("initial")
+
+    # Summary finishes; the next fold folds the SUMMARIZED message into the real commit.
+    FakeSummarizer.gate.set()
+    runner._summary_thread.join(timeout=10)
+    runner._auto_fold_latent_pending()
+
+    head_msg = repo.commit_message("HEAD")
+    assert repo.rev_parse("HEAD") != head_before  # the turn was folded into a real commit
+    # The summary leads the folded, user-visible commit message (subject + lead paragraph),
+    # instead of being orphaned as a note the user never sees.
+    assert head_msg.startswith("<aGiTrack> Implement the widget renderer with caching")
+    assert "Also reworks the cache keys." in head_msg
+
+
+def test_noworktree_auto_fold_proceeds_when_no_summary_pending(tmp_path, monkeypatch):
+    # With summarization off (or already applied) the fold must not stall: it commits the
+    # latent turn immediately, keeping its prompt-based message.
+    runner, repo = _noworktree_auto_runner(tmp_path, monkeypatch)
+    (repo.repo / "feature.txt").write_text("feature\n", encoding="utf-8")
+    latent = runner._manual_record(_LATENT_BODY)
+    assert latent and runner._summary_pending is None
+
+    runner._auto_fold_latent_pending()
+
+    assert repo.commit_message("HEAD").startswith("<aGiTrack> build the widget renderer")
+
+
 def test_pending_summary_does_not_block_integration_at_new_prompt(tmp_path, monkeypatch):
     # When a new prompt starts a turn while the previous turn's commit summary is
     # still in flight, the previous turn integrates NOW rather than riding along
