@@ -118,14 +118,31 @@ def backtrace_commit(directory: Path, new_branch: str, *, _input=input) -> int:
         return 0
     changed = filesmod._numstat_by_commit(repo, "HEAD", set(commits))
     ai_map = _match_turns_to_commits(repo, commits, changed, turns)
+    # AI commits already carrying aGiTrack metadata (a repo that used aGiTrack for part of its life)
+    # are left untouched — only agent-made commits WITHOUT metadata are annotated.
+    already_tracked = {sha for sha in ai_map if METADATA_HEADER in _commit_message(repo, sha)}
+    to_annotate = len(ai_map) - len(already_tracked)
+    if to_annotate == 0:
+        kept = "already tracked" if already_tracked else "user commits with no agent-made edits to attribute"
+        print(
+            f"Nothing to add: every agent-made commit here is {kept}. "
+            "The reconstructed transcripts turned up no untracked AI work to annotate."
+        )
+        return 0
 
     # 6) Warn (history rewrite, new SHAs, force needed) and confirm.
+    already_line = (
+        f"  • {len(already_tracked)} agent commit(s) already carry aGiTrack metadata and are kept as-is.\n"
+        if already_tracked
+        else ""
+    )
     print(
         f"Reconstructing tracked history for {_abbreviate_home(str(root))}:\n"
         f"  • {len(commits)} commit(s) will be replayed onto a new branch '{new_branch}'.\n"
-        f"  • {len(ai_map)} of them will gain aGiTrack metadata (backend, model, tokens, and the "
-        f"user↔agent trace) from {len(turns)} reconstructed agent turn(s).\n"
-        f"  • {len(commits) - len(ai_map)} will be kept verbatim as user commits.\n\n"
+        f"  • {to_annotate} agent commit(s) NOT yet tracked will gain aGiTrack metadata (backend, model, "
+        f"tokens, and the user↔agent trace) from {len(turns)} reconstructed agent turn(s).\n"
+        + already_line
+        + f"  • {len(commits) - len(ai_map)} will be kept verbatim as user commits.\n\n"
         "This REWRITES history: every commit gets a new hash, so the new branch is NOT a "
         "fast-forward of your current branch. Your current branch is left untouched."
     )
@@ -144,8 +161,12 @@ def backtrace_commit(directory: Path, new_branch: str, *, _input=input) -> int:
     switched = repo._run(["git", "switch", new_branch], check=False)
     on_branch = switched.returncode == 0
 
-    _print_completion(new_branch, original_branch, on_branch, len(commits), len(ai_map))
+    _print_completion(new_branch, original_branch, on_branch, len(commits), to_annotate)
     return 0
+
+
+def _commit_message(repo, sha: str) -> str:
+    return repo._run(["git", "log", "-1", "--format=%B", sha], check=False).stdout
 
 
 # ---------------------------------------------------------------------------
