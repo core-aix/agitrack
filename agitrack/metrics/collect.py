@@ -145,6 +145,10 @@ class CommitStat:
     # folded into a real branch commit. Shown in the dashboard as an in-progress turn so
     # the user sees the session's work before they commit (#manual-commits).
     pending: bool = False
+    # Backtrace only: this reconstructed turn is ALREADY committed to git with aGiTrack metadata
+    # (matched to a real aGiTrack commit's covered range), so the log can distinguish what is
+    # already tracked from what a `--backtrace commit` would still add. Always False elsewhere.
+    tracked: bool = False
 
     @property
     def short(self) -> str:

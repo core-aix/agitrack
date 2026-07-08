@@ -331,7 +331,7 @@ def test_backtrace_message_carries_interaction_trace_and_real_metadata():
     turn = _turn("please refactor the parser", agent="I refactored it.", tokens=TokenUsage(input=40, output=90))
     source = bt._Source("claude", "sess-1", 1.0, "/repo", lambda: None)
     exported = ExportedSession(session_id="sess-1", model="claude-opus-4-8", updated=1, turns=[turn])
-    message = bt._message(source, exported, turn)
+    message = bt._message(source, exported.session_id, turn)
     # the full user<->agent conversation
     assert "# Interaction Trace" in message
     assert "## User" in message and "please refactor the parser" in message
@@ -358,7 +358,7 @@ def test_backtrace_trace_shows_only_final_response_like_a_commit():
     )
     source = bt._Source("claude", "s1", 1.0, "/repo", lambda: None)
     exported = ExportedSession(session_id="s1", model="claude-opus-4-8", updated=1, turns=[turn])
-    message = bt._message(source, exported, turn)
+    message = bt._message(source, exported.session_id, turn)
     assert "Here is the finished result." in message
     assert "intermediate step" not in message  # intermediate agent message is excluded, as in a commit
 
@@ -514,6 +514,81 @@ def test_backtrace_file_browser_hides_files_absent_on_disk(monkeypatch, tmp_path
     browser = backtrace_browser(view.dashboard.stats, view.file_edits, directory=view.root)
     paths = {row["path"] for row in browser.files_payload()}
     assert "a.py" in paths and "gone.py" not in paths
+
+
+def test_backtrace_tags_already_committed_turns(monkeypatch, tmp_path):
+    """Turns already committed to git with aGiTrack metadata (covered by a commit's
+    conversation_anchor) are tagged ``tracked`` in the reconstructed log; later turns are not."""
+    import subprocess
+
+    home = tmp_path / "home"
+    (home / ".claude" / "projects").mkdir(parents=True)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home / ".claude"))
+    monkeypatch.setattr(bt.opencode, "sessions_under", lambda d: [])
+
+    repo = tmp_path / "proj"
+    repo.mkdir()
+    env = {"GIT_AUTHOR_NAME": "D", "GIT_AUTHOR_EMAIL": "d@x", "GIT_COMMITTER_NAME": "D", "GIT_COMMITTER_EMAIL": "d@x"}
+
+    def git(*args, **kw):
+        import os
+
+        return subprocess.run(["git", *args], cwd=repo, text=True, capture_output=True, env={**os.environ, **env}, **kw)
+
+    git("init", "-b", "main")
+    project = home / ".claude" / "projects" / re.sub(r"[^a-zA-Z0-9]", "-", str(repo.resolve()))
+    project.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for i in range(1, 4):  # 3 turns, assistant ids a1/a2/a3, each Writes calc.py
+        rows.append(
+            {
+                "type": "user",
+                "uuid": f"u{i}",
+                "cwd": str(repo),
+                "timestamp": f"2026-07-0{i}T09:00:00Z",
+                "message": {"role": "user", "content": f"turn {i}"},
+            }
+        )
+        rows.append(
+            {
+                "type": "assistant",
+                "uuid": f"a{i}",
+                "cwd": str(repo),
+                "timestamp": f"2026-07-0{i}T09:00:05Z",
+                "message": {
+                    "id": f"a{i}",
+                    "role": "assistant",
+                    "model": "claude-opus-4-8",
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": f"t{i}",
+                            "name": "Write",
+                            "input": {"file_path": str(repo / "calc.py"), "content": "x\n" * i},
+                        },
+                        {"type": "text", "text": "done"},
+                    ],
+                },
+            }
+        )
+    (project / "sess-aaa.jsonl").write_text("\n".join(json.dumps(r) for r in rows))
+    (repo / "calc.py").write_text("x\nx\nx\n")
+    git("add", "-A")
+    # A commit covering the session up to turn 2 (conversation_anchor: a2).
+    git(
+        "commit",
+        "-F",
+        "-",
+        input="<aGiTrack> add calc\n\n# aGiTrack Metadata\ncommit_type: agent\n"
+        "backend: claude\nbackend_session_id: sess-aaa\nconversation_anchor: a2\n",
+    )
+
+    view = bt.build_backtrace(repo, use_cache=False)
+    by_turn = {s.subject: s.tracked for s in view.dashboard.stats}
+    assert by_turn["turn 1"] is True and by_turn["turn 2"] is True  # covered by the anchor
+    assert by_turn["turn 3"] is False  # after the last committed anchor
 
 
 def test_backtrace_end_to_end_non_git_claude(monkeypatch, tmp_path):
