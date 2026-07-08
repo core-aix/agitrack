@@ -203,7 +203,7 @@ def main(argv: list[str] | None = None) -> int:
         "--backtrace",
         nargs="?",
         const="html",
-        choices=["text", "html", "stop", "status"],
+        choices=["text", "html", "stop", "status", "commit"],
         default=None,
         help="reconstruct how PAST coding-agent conversations changed THIS directory, from local "
         "Claude/OpenCode transcripts alone — even if you have never used aGiTrack here, and even if "
@@ -213,7 +213,20 @@ def main(argv: list[str] | None = None) -> int:
         "a historical backtrace, not live repo status. Bare `--backtrace` (or `--backtrace html`) "
         "starts it as a background daemon on localhost, opens the browser, and returns to the shell "
         "(it stops when this terminal closes or via `--backtrace stop`); `status` reports it; "
-        "`text` prints a one-shot report.",
+        "`text` prints a one-shot report. `commit` REWRITES history onto a NEW branch (`--branch`), "
+        "annotating the commits that made AI changes with aGiTrack metadata — so a project built "
+        "without aGiTrack still gets a tracked history (requires a clean working tree).",
+    )
+    parser.add_argument(
+        "--branch",
+        default=None,
+        help="the NEW branch to create for `--backtrace commit` (the reconstructed, history-"
+        "rewritten commits are placed here; your current branch is left untouched).",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="skip the confirmation prompt for `--backtrace commit` (proceed non-interactively).",
     )
     parser.add_argument(
         "-s",
@@ -485,6 +498,12 @@ def main(argv: list[str] | None = None) -> int:
             from agitrack.metrics.backtrace import backtrace_daemon_status
 
             return backtrace_daemon_status(directory)
+        if args.backtrace == "commit":
+            # Reconstruct a TRACKED git history: rewrite commits onto a new branch, annotating the
+            # AI-made ones with aGiTrack metadata. Requires a git repo + clean tree + a branch name.
+            from agitrack.metrics.backtrace_commit import backtrace_commit
+
+            return backtrace_commit(directory, args.branch or "", assume_yes=args.yes)
         from agitrack.metrics.backtrace import start_backtrace_daemon
 
         return start_backtrace_daemon(directory, owner_pid=os.getppid())

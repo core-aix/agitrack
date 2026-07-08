@@ -99,7 +99,8 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
                 self._respond("application/json", self._json(self._browser(ref).file_log_payload(_str(query, "path"))))
             elif parsed.path == "/filediff":
                 self._respond(
-                    "application/json", self._json(self._browser(ref).file_diff(_str(query, "path"), _str(query, "sha")))
+                    "application/json",
+                    self._json(self._browser(ref).file_diff(_str(query, "path"), _str(query, "sha"))),
                 )
             else:
                 self.send_error(404, "not found")
