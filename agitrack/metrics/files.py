@@ -217,9 +217,14 @@ def _numstat_by_commit(repo, ref: str, known: set[str]) -> dict[str, list[tuple[
 
 
 def _git_file_diff(repo, sha: str, path: str) -> str:
-    """The diff a single commit made to a single file (``git show <sha> -- <path>``)."""
+    """The diff a single commit made to a single file, for ANY commit — a normal commit, a
+    merge/cover commit (``--first-parent`` shows its change against the mainline, matching
+    :meth:`GitRepo.show_commit`, so merges aren't blank), or the root commit (all-additions).
+    A binary file shows git's ``Binary files … differ`` line, which the UI turns into a hint."""
     import re
 
     if not re.fullmatch(r"[0-9a-fA-F]{4,64}", sha or ""):
         return ""
-    return repo._run(["git", "show", "--format=", "--no-color", sha, "--", path], check=False).stdout
+    return repo._run(
+        ["git", "show", "--format=", "--no-color", "--first-parent", "--patch", sha, "--", path], check=False
+    ).stdout

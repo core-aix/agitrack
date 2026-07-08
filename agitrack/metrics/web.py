@@ -560,9 +560,7 @@ def commit_diff(repo: GitRepo, sha: str) -> dict:
     return {"sha": sha, "diff": patch, "truncated": truncated}
 
 
-def initial_payload(
-    dash: Dashboard, *, shared_sessions: list[dict] | None = None, backtrace: bool = False
-) -> dict:
+def initial_payload(dash: Dashboard, *, shared_sessions: list[dict] | None = None, backtrace: bool = False) -> dict:
     """What the page embeds for an instant first paint: unfiltered aggregates,
     the first log page, repo metadata, the page size, and any shared sessions.
 
@@ -855,6 +853,10 @@ h2.section::before{content:"# ";color:var(--amber)}
 .diffbox .dadd{color:var(--phosphor);background:rgba(61,255,160,.08)}
 .diffbox .ddel{color:var(--red);background:rgba(255,107,107,.08)}
 .dmsg .diffempty{color:var(--fg-dim);font-size:12px;font-style:italic;padding:8px 12px}
+/* loading spinner shown while a detail / diff / file history is being fetched */
+.loadbox{display:flex;align-items:center;gap:10px;padding:14px 12px;color:var(--phosphor);font-size:12.5px}
+.loadbox .spin{width:15px;height:15px;border:2px solid var(--phosphor-dim);border-top-color:var(--phosphor);
+  border-radius:50%;animation:spin .7s linear infinite}
 /* rendered Markdown inside the expanded message */
 .dmsg.md p{margin:7px 0}
 .dmsg.md .md-h{font-family:var(--mono);color:var(--amber);margin:11px 0 5px;font-size:13px;font-weight:600}
@@ -894,37 +896,43 @@ h2.section::before{content:"# ";color:var(--amber)}
 .pager button:hover:not([disabled]){background:var(--phosphor);color:var(--ink)}
 .pager button[disabled]{opacity:.35;cursor:default;border-color:var(--line);color:var(--fg-dim)}
 
-/* ---- log tabs (commits / files) ---- */
-.logtabs{display:flex;gap:8px}
+/* ---- log tabs (commits / files) — title on its own line, tabs left below it ---- */
+.logsection-head{margin:38px 0 14px}
+.logsection-head h2.section{margin:0 0 12px}
+.logtabs{display:flex;gap:8px;justify-content:flex-start}
 .logtab{font-family:var(--mono);font-size:13px;background:transparent;border:1px solid var(--line);
-  color:var(--fg-dim);padding:5px 15px;cursor:pointer;letter-spacing:.5px}
+  color:var(--fg-dim);padding:5px 16px;cursor:pointer;letter-spacing:.5px}
 .logtab.active{color:var(--phosphor);border-color:var(--phosphor-dim);background:rgba(61,255,160,.06)}
 .logtab:hover{color:var(--fg)}
 .logpane[hidden]{display:none}
 .panehead{display:flex;justify-content:flex-end;align-items:center;margin:0 0 10px}
 
-/* ---- file browser (folder tree) ---- */
+/* ---- file browser (folder tree) — names flush-left, folders collapsible ---- */
 .filesearch{background:var(--ink);color:var(--fg);border:1px solid var(--line);font-family:var(--mono);
   font-size:13px;padding:6px 11px;min-width:min(70vw,280px)}
 .filesearch:focus{outline:none;border-color:var(--phosphor)}
-.filebrowse{background:var(--panel);border:1px solid var(--line)}
+.filebrowse{background:var(--panel);border:1px solid var(--line);text-align:left}
 .ftree-dir{border-bottom:1px solid var(--line)}
 .ftree-dir:last-child{border-bottom:none}
-.ftree-dir>summary{cursor:pointer;list-style:none;padding:9px 16px;display:flex;justify-content:space-between;
-  gap:14px;align-items:center}
+/* Left-pack the ▸ marker and folder name; the count is pushed to the right with margin-left:auto
+   (NOT justify-content:space-between, which — with the ::before marker as a third flex item —
+   would strand the folder name in the centre). */
+.ftree-dir>summary{cursor:pointer;list-style:none;padding:9px 16px;display:flex;
+  gap:8px;align-items:center;text-align:left}
 .ftree-dir>summary::-webkit-details-marker{display:none}
-.ftree-dir>summary::before{content:"▸ ";color:var(--ops)}
-.ftree-dir[open]>summary::before{content:"▾ "}
+.ftree-dir>summary::before{content:"▸";color:var(--ops);flex:none}
+.ftree-dir[open]>summary::before{content:"▾"}
 .ftree-dir>summary:hover{background:rgba(103,184,214,.05)}
-.ftree-dir .fdir{color:var(--ops);overflow-wrap:anywhere}
-.ftree-dir .fdircount{color:var(--fg-dim);font-size:12px;white-space:nowrap}
-.ftree-children{padding-left:14px;border-left:1px solid var(--line);margin-left:16px}
-.frow{display:grid;grid-template-columns:1fr auto auto auto;gap:16px;align-items:center;
+.ftree-dir .fdir{color:var(--ops);overflow-wrap:anywhere;text-align:left}
+.ftree-dir .fdircount{color:var(--fg-dim);font-size:12px;white-space:nowrap;flex:none;margin-left:auto;padding-left:14px}
+/* Modest, single-step indentation per nesting level so names stay readable and left-anchored. */
+.ftree-children{padding-left:16px}
+.frow{display:grid;grid-template-columns:1fr auto auto auto;gap:16px;align-items:center;text-align:left;
   padding:9px 16px;border-bottom:1px solid var(--line);cursor:pointer}
 .ftree-children .frow{border-bottom:1px dashed var(--line)}
 .frow:last-child{border-bottom:none}
 .frow:hover{background:rgba(61,255,160,.04)}
-.frow .fp{color:var(--fg);overflow-wrap:anywhere}
+.frow .fp{color:var(--fg);overflow-wrap:anywhere;text-align:left}
 .frow.open .fp{color:var(--phosphor)}
 .frow .fc{color:var(--fg-dim);font-size:12px;white-space:nowrap}
 .frow .fl{font-size:12px;white-space:nowrap}
@@ -1025,7 +1033,7 @@ __UPDATE_BANNER__
   <h2 class="section">shared sessions</h2>
   <div class="panel" id="shared"></div>
 
-  <div class="loghead">
+  <div class="logsection-head">
     <h2 class="section">log</h2>
     <div class="logtabs">
       <button class="logtab active" data-tab="commits">commits</button>
@@ -1559,7 +1567,13 @@ function partsHtml(parts){
 function toggleDetail(i){
   const c = LOG_ENTRIES[i], detail = $("detail-"+i);
   if(!c || !detail) return;
-  if(detail.hidden){
+  if(!detail.hidden){ detail.hidden = true; return; }
+  // Show a loading animation immediately, then build the detail on the next frame — rendering a
+  // large message (markdown) or a squash's many parts can take a moment, so the spinner paints first.
+  detail.innerHTML = SPIN;
+  detail.hidden = false;
+  requestAnimationFrame(() => {
+    if(detail.hidden) return;
     // Local file diff (served from the clone by /diff) is the primary, GitHub-free action;
     // the GitHub link is kept as an optional extra when a remote is configured. A squash has
     // no single diff worth showing here (its parts expand separately), so skip the button then.
@@ -1574,15 +1588,22 @@ function toggleDetail(i){
     detail.innerHTML = `<div class="dhead">${head}</div>${who}${span}`+
       `<div class="dmsg md" id="dbody-${i}" data-mode="msg">${md(c.message||"(no message recorded)")}</div>`+
       partsHtml(c.parts);
-    detail.hidden = false;
-  } else {
-    detail.hidden = true;
-  }
+  });
 }
 
 // One box that flips between the commit message and this commit's file diff — the button toggles
 // which is shown, so you never juggle two panes. The diff (from the local clone via /diff, no
 // GitHub) is fetched once and cached by sha, so flipping back and forth is instant.
+// Loading animation shown while an async fetch (diff / file history) is in flight, and a
+// helper that turns a raw unified diff into HTML — a binary file (no text diff) or an empty
+// diff shows a clear hint instead of a blank pane.
+const SPIN = '<div class="loadbox"><span class="spin"></span> loading…</div>';
+function diffHtml(text, truncated){
+  const t = (text||"").trim();
+  if(!t) return '<div class="diffempty">no changes to show for this file</div>';
+  if(/Binary files .* differ/.test(t) && !/^@@/m.test(t)) return '<div class="diffempty">binary file — no text diff to show</div>';
+  return renderDiff(text) + (truncated?'<div class="diffempty">…diff truncated (very large diff)</div>':"");
+}
 const _diffCache = {};
 async function toggleDiff(i){
   const c = LOG_ENTRIES[i], body = $("dbody-"+i);
@@ -1594,20 +1615,15 @@ async function toggleDiff(i){
     if(btn) btn.textContent = "show file diff";
     return;
   }
-  // commit message → file diff. Flip the mode + button label now for instant feedback, but KEEP the
-  // message visible until the diff is ready, then swap the box in a single paint — so there's no
-  // "loading…" placeholder flashing on the first (uncached) switch.
   body.dataset.mode = "diff";
   if(btn) btn.textContent = "show commit message";
   const apply = html => { if(body.dataset.mode === "diff"){ body.className = "dmsg diff"; body.innerHTML = html; } };
   if(_diffCache[c.sha] !== undefined){ apply(_diffCache[c.sha]); return; }
+  apply(SPIN);  // computing a large commit's diff can take a moment — show a loading animation
   try{
     const r = await fetch("diff?sha="+encodeURIComponent(c.sha), {cache:"no-store"});
     const d = r.ok ? await r.json() : {error:"server error"};
-    let html;
-    if(d.error) html = '<div class="diffempty">'+esc(d.error)+'</div>';
-    else if(!d.diff || !d.diff.trim()) html = '<div class="diffempty">no file changes in this commit</div>';
-    else html = renderDiff(d.diff) + (d.truncated?'<div class="diffempty">…diff truncated (very large commit)</div>':"");
+    const html = d.error ? '<div class="diffempty">'+esc(d.error)+'</div>' : diffHtml(d.diff, d.truncated);
     _diffCache[c.sha] = html;
     apply(html);  // apply() no-ops if the user flipped back to the message mid-fetch
   }catch(e){ apply('<div class="diffempty">couldn\'t load the diff (server unreachable)</div>'); }
@@ -1749,7 +1765,7 @@ function folderStats(node){
 function renderTree(node, forceOpen, depth){
   let html = "";
   for(const d of Object.keys(node.dirs).sort()){
-    const child = node.dirs[d], st = folderStats(child), open = forceOpen || depth === 0;  // top level open; rest collapsed
+    const child = node.dirs[d], st = folderStats(child), open = forceOpen;  // collapsed by default; a search expands matches
     html += `<details class="ftree-dir"${open?" open":""}><summary><span class="fdir">${esc(d)}/</span>`+
       `<span class="fdircount">${fmt(st.files)} file${st.files===1?"":"s"} · ${fmt(st.changes)} change${st.changes===1?"":"s"}</span></summary>`+
       `<div class="ftree-children">${renderTree(child, forceOpen, depth+1)}</div></details>`;
@@ -1793,15 +1809,18 @@ async function openFile(row){
   document.querySelectorAll(".frow.open").forEach(r => r.classList.remove("open"));
   if(existing && existing.classList.contains("fdetail")) return;  // was open → just close
   row.classList.add("open");
-  let data = { changes: [] };
-  try{ data = await (await fetch("filelog?path="+encodeURIComponent(path), {cache:"no-store"})).json(); }catch(e){}
-  OPENFILE = { path, changes: data.changes || [] };
+  // Insert a loading animation immediately — a file's history can take a moment to fetch.
   const div = document.createElement("div");
   div.className = "fdetail";
+  div.innerHTML = SPIN;
+  row.after(div);
+  let data = { changes: [] };
+  try{ data = await (await fetch("filelog?path="+encodeURIComponent(path), {cache:"no-store"})).json(); }catch(e){}
+  if(!row.classList.contains("open")){ div.remove(); return; }  // user closed it mid-fetch
+  OPENFILE = { path, changes: data.changes || [] };
   div.innerHTML = OPENFILE.changes.length
     ? OPENFILE.changes.map((c,i) => fileChangeHtml(c,i)).join("")
     : `<div class="fmore">no recorded changes</div>`;
-  row.after(div);
 }
 function toggleFileChange(head){
   const fchange = head.closest(".fchange"), i = +fchange.dataset.i, box = $("fdetail-"+i);
@@ -1809,8 +1828,12 @@ function toggleFileChange(head){
   if(!box.hidden){ box.hidden = true; box.innerHTML = ""; fchange.classList.remove("open"); return; }
   fchange.classList.add("open");
   box.hidden = false;
-  box.innerHTML = `<button class="fdifftoggle" data-i="${i}">show file diff</button>`+
-    `<div class="dmsg md" id="fbody-${i}" data-mode="msg">${md(c.message || "(no conversation recorded)")}</div>`;
+  box.innerHTML = SPIN;  // loading animation while the (possibly large) conversation renders
+  requestAnimationFrame(() => {
+    if(box.hidden) return;
+    box.innerHTML = `<button class="fdifftoggle" data-i="${i}">show file diff</button>`+
+      `<div class="dmsg md" id="fbody-${i}" data-mode="msg">${md(c.message || "(no conversation recorded)")}</div>`;
+  });
 }
 const _fdiffCache = {};
 async function toggleFileBody(btn){
@@ -1822,18 +1845,16 @@ async function toggleFileBody(btn){
     btn.textContent = "show file diff";
     return;
   }
-  body.dataset.mode = "diff";                            // conversation → file diff (keep the message until ready)
+  body.dataset.mode = "diff";                            // conversation → file diff
   btn.textContent = "show conversation";
   const key = OPENFILE.path + "\x00" + c.sha;
   const apply = html => { if(body.dataset.mode === "diff"){ body.className = "dmsg diff"; body.innerHTML = html; } };
   if(_fdiffCache[key] !== undefined){ apply(_fdiffCache[key]); return; }
+  apply(SPIN);  // a large file diff can take a moment — show a loading animation
   try{
     const r = await fetch(`filediff?path=${encodeURIComponent(OPENFILE.path)}&sha=${encodeURIComponent(c.sha)}`, {cache:"no-store"});
     const d = r.ok ? await r.json() : {error:"server error"};
-    let html;
-    if(d.error) html = '<div class="diffempty">'+esc(d.error)+'</div>';
-    else if(!d.diff || !d.diff.trim()) html = '<div class="diffempty">no changes to this file in this turn</div>';
-    else html = renderDiff(d.diff);
+    const html = d.error ? '<div class="diffempty">'+esc(d.error)+'</div>' : diffHtml(d.diff, d.truncated);
     _fdiffCache[key] = html; apply(html);
   }catch(e){ apply('<div class="diffempty">couldn\'t load the diff (server unreachable)</div>'); }
 }
