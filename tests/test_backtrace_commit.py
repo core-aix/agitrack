@@ -111,7 +111,7 @@ def repo_with_history(tmp_path, monkeypatch):
 
 def test_backtrace_commit_annotates_only_ai_commit(repo_with_history):
     repo = repo_with_history
-    rc = backtrace_commit(repo, "agitrack-history", assume_yes=True)
+    rc = backtrace_commit(repo, "agitrack-history", _input=lambda p: "y")
     assert rc == 0
 
     # A new branch exists, current branch switched to it, main untouched.
@@ -151,41 +151,41 @@ def test_backtrace_commit_dashboard_sees_the_ai_commit(repo_with_history):
     from agitrack.git import GitRepo
     from agitrack.metrics.collect import build_dashboard
 
-    backtrace_commit(repo_with_history, "tracked", assume_yes=True)
+    backtrace_commit(repo_with_history, "tracked", _input=lambda p: "y")
     dash = build_dashboard(GitRepo.discover(repo_with_history), "tracked")
     assert dash.count("agent") == 1
     assert "claude-opus-4-8" in dash.by_model
 
 
 def test_backtrace_commit_requires_git_repo(tmp_path, capsys):
-    rc = backtrace_commit(tmp_path, "newb", assume_yes=True)
+    rc = backtrace_commit(tmp_path, "newb", _input=lambda p: "y")
     assert rc == 1
     assert "not a git repository" in capsys.readouterr().out
 
 
 def test_backtrace_commit_requires_clean_tree(repo_with_history, capsys):
     (repo_with_history / "calc.py").write_text("dirty\n")
-    rc = backtrace_commit(repo_with_history, "newb", assume_yes=True)
+    rc = backtrace_commit(repo_with_history, "newb", _input=lambda p: "y")
     assert rc == 1
     assert "uncommitted changes" in capsys.readouterr().out
 
 
 def test_backtrace_commit_requires_branch_name(repo_with_history, capsys):
-    rc = backtrace_commit(repo_with_history, "", assume_yes=True)
+    rc = backtrace_commit(repo_with_history, "", _input=lambda p: "y")
     assert rc == 1
     assert "NEW branch" in capsys.readouterr().out
 
 
 def test_backtrace_commit_rejects_existing_branch(repo_with_history, capsys):
     _git(repo_with_history, "branch", "taken")
-    rc = backtrace_commit(repo_with_history, "taken", assume_yes=True)
+    rc = backtrace_commit(repo_with_history, "taken", _input=lambda p: "y")
     assert rc == 1
     assert "already exists" in capsys.readouterr().out
 
 
 def test_backtrace_commit_declined_makes_no_changes(repo_with_history, capsys):
     before = _git(repo_with_history, "branch", "--format=%(refname:short)").stdout.split()
-    rc = backtrace_commit(repo_with_history, "declined", assume_yes=False, _input=lambda prompt: "n")
+    rc = backtrace_commit(repo_with_history, "declined", _input=lambda prompt: "n")
     assert rc == 0
     assert "Aborted" in capsys.readouterr().out
     after = _git(repo_with_history, "branch", "--format=%(refname:short)").stdout.split()
@@ -205,6 +205,6 @@ def test_backtrace_commit_no_ai_history(tmp_path, monkeypatch, capsys):
     (repo / "a.txt").write_text("hi\n")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-m", "init")
-    rc = backtrace_commit(repo, "newb", assume_yes=True)
+    rc = backtrace_commit(repo, "newb", _input=lambda p: "y")
     assert rc == 0
     assert "No AI-made file changes" in capsys.readouterr().out

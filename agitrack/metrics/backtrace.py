@@ -685,6 +685,9 @@ def run_backtrace_daemon(
             "started": int(time.time()),
         },
     )
+    from agitrack import daemons
+
+    daemons.register("backtrace", directory, url=url)
 
     stop = threading.Event()
 
@@ -706,6 +709,9 @@ def run_backtrace_daemon(
     finally:
         server.server_close()
         _clear_handshake(directory)
+        from agitrack import daemons
+
+        daemons.deregister()
     return 0
 
 

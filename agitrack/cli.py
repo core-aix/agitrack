@@ -213,20 +213,15 @@ def main(argv: list[str] | None = None) -> int:
         "a historical backtrace, not live repo status. Bare `--backtrace` (or `--backtrace html`) "
         "starts it as a background daemon on localhost, opens the browser, and returns to the shell "
         "(it stops when this terminal closes or via `--backtrace stop`); `status` reports it; "
-        "`text` prints a one-shot report. `commit` REWRITES history onto a NEW branch (`--branch`), "
+        "`text` prints a one-shot report. `commit` REWRITES history onto a NEW branch (`--backtrace-branch`), "
         "annotating the commits that made AI changes with aGiTrack metadata — so a project built "
         "without aGiTrack still gets a tracked history (requires a clean working tree).",
     )
     parser.add_argument(
-        "--branch",
+        "--backtrace-branch",
         default=None,
         help="the NEW branch to create for `--backtrace commit` (the reconstructed, history-"
         "rewritten commits are placed here; your current branch is left untouched).",
-    )
-    parser.add_argument(
-        "--yes",
-        action="store_true",
-        help="skip the confirmation prompt for `--backtrace commit` (proceed non-interactively).",
     )
     parser.add_argument(
         "-s",
@@ -234,6 +229,13 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="report whether aGiTrack is running for this repo and in which mode (interactive vs "
         "background, auto vs manual commit, worktree vs no-worktree), then exit.",
+    )
+    parser.add_argument(
+        "--daemons",
+        action="store_true",
+        help="list every running aGiTrack daemon across ALL repositories — its function (repo "
+        "dashboard, backtrace dashboard, or background mode), repo name, and PID — so you can stop a "
+        "stray one by hand, then exit.",
     )
     # --- options without a short form, in rough order of how often they matter ---
     parser.add_argument("--repo", default=".", help="target Git repository path")
@@ -370,7 +372,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="with --json, run a long-lived JSON-RPC session over stdin/stdout where "
         "interactive questions (menus, confirmations, text input) are asked of the driver "
-        "instead of a terminal — used by the VSCode extension (see editors/vscode)",
+        "program instead of a terminal — for embedding aGiTrack behind an editor/GUI front-end",
     )
     parser.add_argument(
         "--mode",
@@ -467,6 +469,24 @@ def main(argv: list[str] | None = None) -> int:
         print(__version__)
         return 0
 
+    if args.daemons:
+        # Global, read-only listing of every running aGiTrack daemon — no repo/git needed.
+        from agitrack.daemons import list_running
+
+        running = list_running()
+        if not running:
+            print("No aGiTrack daemons are currently running.")
+            return 0
+        print("aGiTrack daemons running:\n")
+        print(f"  {'PID':>7}  {'FUNCTION':<20}  {'REPO':<26}  URL")
+        for info in running:
+            print(f"  {info.pid:>7}  {info.function:<20}  {info.repo_name:<26}  {info.url or '-'}")
+        print(
+            "\nStop one by hand with:  kill <PID>\n"
+            "or use its own stop command:  agitrack -d stop  /  agitrack --backtrace stop  /  agitrack -b stop"
+        )
+        return 0
+
     # Backtrace works purely from local transcripts — no git repo AND no git binary needed —
     # so both the user command and its detached child are handled BEFORE the git check below.
     if args.backtrace_serve:
@@ -501,9 +521,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.backtrace == "commit":
             # Reconstruct a TRACKED git history: rewrite commits onto a new branch, annotating the
             # AI-made ones with aGiTrack metadata. Requires a git repo + clean tree + a branch name.
+            # Always interactive (it rewrites history) — there is no skip-confirmation flag.
             from agitrack.metrics.backtrace_commit import backtrace_commit
 
-            return backtrace_commit(directory, args.branch or "", assume_yes=args.yes)
+            return backtrace_commit(directory, args.backtrace_branch or "")
         from agitrack.metrics.backtrace import start_backtrace_daemon
 
         return start_backtrace_daemon(directory, owner_pid=os.getppid())

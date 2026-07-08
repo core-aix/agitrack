@@ -48,11 +48,13 @@ class _TurnRec:
     reasoning_effort: str | None = None
 
 
-def backtrace_commit(directory: Path, new_branch: str, *, assume_yes: bool = False, _input=input) -> int:
-    """Entry point for ``agitrack --backtrace commit --branch <new_branch>``.
+def backtrace_commit(directory: Path, new_branch: str, *, _input=input) -> int:
+    """Entry point for ``agitrack --backtrace commit --backtrace-branch <new_branch>``.
 
-    Returns a process exit code. Prints all user-facing guidance itself (git-init hint, dirty-tree
-    hint, the warning + confirmation, the progress bar, and the force-replace instructions)."""
+    Always interactive — it rewrites history, so it prompts for confirmation and has no
+    skip-confirmation flag. Returns a process exit code. Prints all user-facing guidance itself
+    (git-init hint, dirty-tree hint, the warning + confirmation, the progress bar, and the
+    force-replace instructions). ``_input`` is injectable only so tests can drive the prompt."""
     from agitrack.git import GitError, GitRepo
 
     directory = directory.expanduser().resolve()
@@ -127,11 +129,10 @@ def backtrace_commit(directory: Path, new_branch: str, *, assume_yes: bool = Fal
         "This REWRITES history: every commit gets a new hash, so the new branch is NOT a "
         "fast-forward of your current branch. Your current branch is left untouched."
     )
-    if not assume_yes:
-        answer = _input(f"Create branch '{new_branch}' with the reconstructed history? [y/N] ")
-        if answer.strip().lower() not in ("y", "yes"):
-            print("Aborted — no changes made.")
-            return 0
+    answer = _input(f"Create branch '{new_branch}' with the reconstructed history? [y/N] ")
+    if answer.strip().lower() not in ("y", "yes"):
+        print("Aborted — no changes made.")
+        return 0
 
     # 7) Replay onto the new branch, with a progress bar.
     original_branch = repo.current_branch()
