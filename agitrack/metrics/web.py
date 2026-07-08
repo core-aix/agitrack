@@ -86,19 +86,21 @@ def format_html(
     banner_html: str = "",
     backtrace: bool = False,
 ) -> str:
-    payload = json.dumps(
-        initial_payload(dash, shared_sessions=shared_sessions, backtrace=backtrace), separators=(",", ":")
-    )
+    payload = _embed_json(initial_payload(dash, shared_sessions=shared_sessions, backtrace=backtrace))
     repo_name = dash.repo.rstrip("/").rsplit("/", 1)[-1] or dash.repo
     # The branch is rendered client-side into the meta-line picker (from the
     # embedded payload), so there's no __BRANCH__ placeholder to substitute.
     # ``banner_html`` fills the same slot the update banner uses on the served page —
     # the backtrace view passes its "this is a reconstruction" notice here.
+    # Substitute the chrome tokens FIRST and ``__DATA__`` LAST: the embedded JSON can itself
+    # contain the literal placeholder strings (backtrace transcripts of aGiTrack's own source
+    # mention ``__UPDATE_BANNER__``/``__REPO__``), so replacing them after the JSON is in place
+    # would corrupt it.
     return (
-        _TEMPLATE.replace("__DATA__", payload)
-        .replace("__REPO_NAME__", _escape(repo_name))
+        _TEMPLATE.replace("__REPO_NAME__", _escape(repo_name))
         .replace("__REPO__", _escape(dash.repo))
         .replace("__UPDATE_BANNER__", banner_html)
+        .replace("__DATA__", payload)
     )
 
 
@@ -113,16 +115,14 @@ def shell_html(repo: GitRepo) -> str:
     from agitrack.metrics.collect import _abbreviate_home
 
     repo_path = _abbreviate_home(str(repo.repo))
-    payload = json.dumps(
-        {"page_size": PAGE_SIZE, "shared_sessions": shared_sessions_for(repo)},
-        separators=(",", ":"),
-    )
+    payload = _embed_json({"page_size": PAGE_SIZE, "shared_sessions": shared_sessions_for(repo)})
     repo_name = repo_path.rstrip("/").rsplit("/", 1)[-1] or repo_path
+    # ``__DATA__`` last (see ``format_html``): the payload may contain the chrome tokens verbatim.
     return (
-        _TEMPLATE.replace("__DATA__", payload)
-        .replace("__REPO_NAME__", _escape(repo_name))
+        _TEMPLATE.replace("__REPO_NAME__", _escape(repo_name))
         .replace("__REPO__", _escape(repo_path))
         .replace("__UPDATE_BANNER__", _update_banner_html(repo))
+        .replace("__DATA__", payload)
     )
 
 
@@ -580,6 +580,16 @@ def initial_payload(dash: Dashboard, *, shared_sessions: list[dict] | None = Non
 
 def _escape(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _embed_json(data: object) -> str:
+    """Serialize ``data`` for embedding inside a ``<script>`` tag. Escapes ``<``, ``>`` and ``&``
+    as unicode escapes so transcript content containing ``</script>``, ``<!--`` or an HTML tag
+    can't break out of the script element or corrupt the JSON (the chars only ever appear inside
+    JSON string values, so the escapes round-trip to the same data)."""
+    return (
+        json.dumps(data, separators=(",", ":")).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+    )
 
 
 # ---------------------------------------------------------------------------
