@@ -1100,6 +1100,119 @@ def test_copy_offer_offers_user_commit_for_edits_on_switch(tmp_path):
     assert events == ["user-commit", "copy"]  # both shown, commit prompt first
 
 
+def _awaiting_commit_runner(dirty=True):
+    # AUTO-commit, --no-worktree: the agent edits this very tree, so its uncommitted work looks
+    # exactly like the user's to a plain `git status`.
+    runner = make_runner()
+    runner._manual_commits = False
+    runner.worktree = None
+    runner.actions = types.SimpleNamespace(has_pre_agent_user_changes=lambda: dirty)
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda *a, **k: None
+    return runner
+
+
+def test_no_user_commit_offer_while_a_turn_awaits_its_commit():
+    # The window the agent finishing and aGiTrack committing: the dirty tree holds the AGENT's
+    # edits. aGiTrack must not offer to commit (or stage) them as the user's own work.
+    runner = _awaiting_commit_runner()
+    runner.turn_awaiting_commit = True
+    asked: list = []
+    runner._create_user_commit_popup = lambda *a, **k: asked.append("user-commit") or True
+
+    warn = runner._offer_pre_agent_user_commit()
+
+    assert asked == [], "aGiTrack offered to commit the agent's own uncommitted turn"
+    assert warn is False  # and no "your edits will ride along" warning either
+
+
+def test_user_commit_offer_returns_once_the_turn_is_reconciled():
+    # Once a parse result is consumed the turn is committed (or concluded with nothing to commit),
+    # so any remaining dirt really is the user's — the offer must come back.
+    runner = _awaiting_commit_runner()
+    runner.turn_awaiting_commit = False
+    asked: list = []
+    runner._create_user_commit_popup = lambda *a, **k: asked.append("user-commit") or True
+
+    runner._offer_pre_agent_user_commit()
+
+    assert asked == ["user-commit"]
+
+
+def test_consuming_a_parse_result_clears_turn_awaiting_commit(monkeypatch):
+    # The flag is cleared when a parse RESULT is consumed (committed True or False) — not when the
+    # agent merely goes quiet, which is what `agent_in_flight`'s idle timer does.
+    for outcome in (True, False):
+        runner = _awaiting_commit_runner()
+        runner.turn_awaiting_commit = True
+        monkeypatch.setattr(
+            "agitrack.proxy.runner.CommitEngine",
+            lambda *a, **k: types.SimpleNamespace(finish_parse_if_ready=lambda **kw: (outcome, [])),
+        )
+        runner._integrate_turn_or_conflict = lambda *a, **k: "ok"
+        runner._finish_agent_parse_if_ready(quiet=True, integrate=False)
+        assert runner.turn_awaiting_commit is False, f"not cleared for committed={outcome}"
+
+
+def test_deferred_parse_keeps_turn_awaiting_commit(monkeypatch):
+    # A deferred parse (None: worker still running, no result yet) leaves the turn unreconciled,
+    # so the suppression must stay in force.
+    runner = _awaiting_commit_runner()
+    runner.turn_awaiting_commit = True
+    monkeypatch.setattr(
+        "agitrack.proxy.runner.CommitEngine",
+        lambda *a, **k: types.SimpleNamespace(finish_parse_if_ready=lambda **kw: (None, [])),
+    )
+
+    runner._finish_agent_parse_if_ready(quiet=True, integrate=False)
+
+    assert runner.turn_awaiting_commit is True
+
+
+def test_idle_agent_alone_does_not_clear_turn_awaiting_commit():
+    # `agent_in_flight` drops on an idle timer; that must NOT be read as "the turn is committed",
+    # which is exactly the hole this guard closes.
+    runner = _awaiting_commit_runner()
+    runner.turn_awaiting_commit = True
+    runner.agent_in_flight = True
+    runner.last_child_output = time.monotonic() - runner.CHILD_IDLE_SECONDS - 1
+
+    runner._clear_agent_in_flight_if_idle()
+
+    assert runner.agent_in_flight is False  # the timer did its job...
+    assert runner.turn_awaiting_commit is True  # ...but the turn is still awaiting its commit
+
+
+def test_forwarding_a_prompt_marks_the_turn_as_awaiting_its_commit():
+    # The guard is only correct if the flag is actually raised when a turn starts.
+    runner = make_runner()
+    runner.master_fd = 1
+    runner.pending_forwarded = [b"hi\r"]
+    runner.pending_prompt_text = "hi"
+    runner._record_user_prompt = lambda text: None
+    runner._integrate_committed_turn_before_new_turn = lambda: None
+    runner._ensure_turn_branch = lambda: None
+    runner._clear_message = lambda: None
+    runner._set_session_notice = lambda *a, **k: None
+    runner._session_label = lambda: "s"
+    runner.active.process.master_fd = 1
+    runner.active.process.write = lambda data: None
+    assert runner.turn_awaiting_commit is False
+
+    runner._forward_pending_prompt()
+
+    assert runner.turn_awaiting_commit is True and runner.agent_in_flight is True
+
+
+def test_manual_mode_still_never_offers_a_pre_agent_user_commit():
+    runner = _awaiting_commit_runner()
+    runner._manual_commits = True
+    runner.turn_awaiting_commit = False
+    runner._create_user_commit_popup = lambda *a, **k: pytest.fail("manual mode must never offer")
+
+    assert runner._offer_pre_agent_user_commit() is False
+
+
 def test_turn_copy_offer_defers_user_commit_prompt(tmp_path):
     # The per-turn offer's worktree read runs on the git worker, which must never raise the
     # (blocking) user-commit popup or commit from there; that prompt is left for switch/exit.
