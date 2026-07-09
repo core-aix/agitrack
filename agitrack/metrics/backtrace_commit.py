@@ -187,7 +187,8 @@ def _gather_turns(root: Path) -> list[_TurnRec]:
             continue
         bases = bt._relativize_bases(root, source.base_dir)
         for turn in exported.turns:
-            edits = [bt._relativize(edit, bases) for edit in turn.edits]
+            # Edits outside the repo (scratch files, plans) never map to a commit's paths.
+            edits = [rel for rel in (bt._relativize(edit, bases) for edit in turn.edits) if rel is not None]
             files = {edit.path for edit in edits if edit.path}
             if not files:
                 continue

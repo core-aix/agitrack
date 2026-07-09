@@ -9,7 +9,7 @@ from pathlib import Path
 
 from agitrack.backends.base import TokenUsage
 from agitrack.sessions.share_cap import select_kept_indices
-from agitrack.transcripts.edits import tracked_edit
+from agitrack.transcripts.edits import content_from_read_output, seed_file_state, tracked_edit
 from agitrack.transcripts.types import ExportedSession, FileEdit, SessionRef, SessionTurn, turns_after
 
 __all__ = [
@@ -902,6 +902,10 @@ def parse_rows(
     # Per-session running content of each edited file, so a Write/Edit's diff is the incremental
     # change vs the previous turn, not the whole file every time (only used when collect_edits).
     file_state: dict[str, str] = {}
+    # Read tool_use id -> file path, for whole-file reads still awaiting their tool_result. The
+    # result carries the file's pre-existing content, which seeds `file_state` so a later Write
+    # diffs against it instead of counting the whole (already existing) file as newly added.
+    pending_reads: dict[str, str] = {}
 
     def flush(*, dangling: bool = False) -> None:
         nonlocal current
@@ -916,6 +920,9 @@ def parse_rows(
             updated = stamp if updated is None else max(updated, stamp)
         row_type = row.get("type")
         if row_type == "user":
+            if collect_edits and pending_reads:
+                # A Read's result: seed the file's pre-existing content before any later Write.
+                _seed_reads_from_result(_as_dict(row.get("message")), pending_reads, file_state)
             if _is_interrupt_marker(row):
                 # Esc: the turn is finished as far as commits are concerned —
                 # it will never receive more messages — and Claude discarded
@@ -1059,6 +1066,7 @@ def parse_rows(
                 # backtrace exporter is the only caller). Attributed to the turn in flight,
                 # so they land on the same SessionTurn the conversation trace does.
                 current.setdefault("edits", []).extend(_edits_from_message(message, file_state))
+                pending_reads.update(_whole_file_reads(message))
             text = _assistant_text(message)
             if text:
                 current["final"] = text
@@ -1102,6 +1110,46 @@ def _collect_tool_use_ids(message: dict, sink: set[str]) -> None:
             tool_id = block.get("id")
             if isinstance(tool_id, str) and tool_id:
                 sink.add(tool_id)
+
+
+def _whole_file_reads(message: dict) -> dict[str, str]:
+    """``tool_use id -> file path`` for each Read of a file's FULL content in this assistant
+    message. A ranged read (``offset``/``limit``) is skipped: its result is only a slice, so it
+    can't stand in for the file's prior content."""
+    content = message.get("content")
+    if not isinstance(content, list):
+        return {}
+    reads: dict[str, str] = {}
+    for block in content:
+        if not (isinstance(block, dict) and block.get("type") == "tool_use" and block.get("name") == "Read"):
+            continue
+        raw_input = block.get("input")
+        inp = raw_input if isinstance(raw_input, dict) else {}
+        if inp.get("offset") or inp.get("limit"):
+            continue
+        path, tool_id = inp.get("file_path"), block.get("id")
+        if isinstance(path, str) and path and isinstance(tool_id, str) and tool_id:
+            reads[tool_id] = path
+    return reads
+
+
+def _seed_reads_from_result(message: dict, pending_reads: dict[str, str], file_state: dict[str, str]) -> None:
+    """Consume the ``tool_result`` blocks answering earlier Reads, recording each file's content as
+    the baseline for later edits in this session."""
+    content = message.get("content")
+    if not isinstance(content, list):
+        return
+    for block in content:
+        if not (isinstance(block, dict) and block.get("type") == "tool_result"):
+            continue
+        path = pending_reads.pop(str(block.get("tool_use_id") or ""), "")
+        if not path:
+            continue
+        body = block.get("content")
+        if isinstance(body, list):  # some results arrive as a list of text blocks
+            body = "".join(b.get("text") or "" for b in body if isinstance(b, dict) and b.get("type") == "text")
+        if isinstance(body, str):
+            seed_file_state(file_state, path, content_from_read_output(body))
 
 
 def _edits_from_message(message: dict, file_state: dict[str, str]) -> list[FileEdit]:

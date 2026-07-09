@@ -140,6 +140,158 @@ def test_claude_repeated_writes_are_incremental_not_accumulated():
     assert per_turn == [(1, 0), (1, 0), (1, 0)]  # +line1, then +line2, then +line3 — not cumulative
 
 
+def test_content_from_read_output_reconstructs_both_backends_formats():
+    from agitrack.transcripts.edits import content_from_read_output
+
+    assert content_from_read_output("1\tdef f():\n2\t    return 1") == "def f():\n    return 1\n"
+    # OpenCode: zero-padded number, a pipe, one padding space. Indentation must survive intact.
+    assert content_from_read_output("<file>\n00001| def f():\n00002|     return 1\n</file>") == (
+        "def f():\n    return 1\n"
+    )
+
+
+def test_content_from_read_output_refuses_partial_or_untrusted_output():
+    from agitrack.transcripts.edits import content_from_read_output
+
+    assert content_from_read_output("") is None
+    assert content_from_read_output("no line numbers here") is None
+    # A ranged read starts at line 5, not 1 — it is not the whole file.
+    assert content_from_read_output("5\tmid\n6\tdle") is None
+    # A gap means lines were elided.
+    assert content_from_read_output("1\ta\n3\tc") is None
+    # A truncation notice is not a numbered line, so the whole output is rejected.
+    assert content_from_read_output("1\ta\n2\tb\n<system-reminder>Truncated</system-reminder>") is None
+
+
+def test_claude_write_after_full_read_diffs_against_the_read_content():
+    # The file already existed and the agent read it before rewriting it. Without using the Read's
+    # result as the baseline, the whole file counts as newly added — which inflated AI lines badly
+    # (a pre-existing file re-counted in full, once per session).
+    existing = "def add(a, b):\n    return a + b\n"
+    rows = [
+        {
+            "type": "user",
+            "uuid": "u1",
+            "timestamp": "2026-07-01T09:00:00Z",
+            "message": {"role": "user", "content": "make it subtract"},
+        },
+        {
+            "type": "assistant",
+            "uuid": "a1",
+            "timestamp": "2026-07-01T09:00:01Z",
+            "message": {
+                "id": "m1",
+                "role": "assistant",
+                "model": "claude-opus-4-8",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+                "content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "/r/f.py"}}],
+            },
+        },
+        {  # the Read's result: the file's pre-existing content, line-numbered
+            "type": "user",
+            "uuid": "u2",
+            "timestamp": "2026-07-01T09:00:02Z",
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "1\tdef add(a, b):\n2\t    return a + b"}
+                ],
+            },
+        },
+        {
+            "type": "assistant",
+            "uuid": "a2",
+            "timestamp": "2026-07-01T09:00:03Z",
+            "message": {
+                "id": "m2",
+                "role": "assistant",
+                "model": "claude-opus-4-8",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "t2",
+                        "name": "Write",
+                        "input": {"file_path": "/r/f.py", "content": "def add(a, b):\n    return a - b\n"},
+                    },
+                    {"type": "text", "text": "done"},
+                ],
+            },
+        },
+    ]
+    edits = [e for turn in claude.parse_rows("s", rows, collect_edits=True).turns for e in turn.edits]
+    assert len(edits) == 1
+    # Only the one changed line — not the whole 2-line file — and it is a modification, not an add.
+    assert (edits[0].insertions, edits[0].deletions) == (1, 1)
+    assert "new file mode" not in edits[0].patch
+    assert len(existing.splitlines()) == 2  # sanity: the file really did pre-exist with 2 lines
+
+
+def test_claude_ranged_read_does_not_seed_a_bogus_baseline():
+    # A Read with offset/limit returns only a slice; using it as the baseline would produce a
+    # nonsense diff. The Write must then fall back to counting the file as new.
+    rows = [
+        {
+            "type": "user",
+            "uuid": "u1",
+            "timestamp": "2026-07-01T09:00:00Z",
+            "message": {"role": "user", "content": "go"},
+        },
+        {
+            "type": "assistant",
+            "uuid": "a1",
+            "timestamp": "2026-07-01T09:00:01Z",
+            "message": {
+                "id": "m1",
+                "role": "assistant",
+                "model": "claude-opus-4-8",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "t1",
+                        "name": "Read",
+                        "input": {"file_path": "/r/f.py", "offset": 5, "limit": 2},
+                    }
+                ],
+            },
+        },
+        {
+            "type": "user",
+            "uuid": "u2",
+            "timestamp": "2026-07-01T09:00:02Z",
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "5\tmid\n6\tdle"}],
+            },
+        },
+        {
+            "type": "assistant",
+            "uuid": "a2",
+            "timestamp": "2026-07-01T09:00:03Z",
+            "message": {
+                "id": "m2",
+                "role": "assistant",
+                "model": "claude-opus-4-8",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "t2",
+                        "name": "Write",
+                        "input": {"file_path": "/r/f.py", "content": "x\n"},
+                    },
+                    {"type": "text", "text": "ok"},
+                ],
+            },
+        },
+    ]
+    edits = [e for turn in claude.parse_rows("s", rows, collect_edits=True).turns for e in turn.edits]
+    assert len(edits) == 1 and edits[0].insertions == 1 and edits[0].deletions == 0
+
+
 def test_claude_edit_diffs_against_previously_written_content():
     # A Write then an Edit: the Edit's diff is the localized change within the written file, not
     # the whole file and not a bare snippet.
@@ -391,8 +543,32 @@ def test_backtrace_trace_shows_only_final_response_like_a_commit():
 def test_backtrace_relativizes_edit_paths():
     edit = make_edit("/repo/pkg/mod.py", "a\n", "b\n")
     rel = bt._relativize(edit, ["/repo"])
+    assert rel is not None
     assert rel.path == "pkg/mod.py"
     assert "a/pkg/mod.py" in rel.patch and "/repo/pkg" not in rel.patch
+
+
+def test_backtrace_drops_edits_outside_the_directory():
+    # A scratch file in /tmp or a plan under ~/.claude is not a change to THIS repo, so it must not
+    # be counted in its AI lines (it used to be, inflating the totals).
+    for outside in ("/tmp/scratch/gen.py", "/Users/user/.claude/plans/plan.md"):
+        edit = make_edit(outside, "", "x\ny\n", status="added")
+        assert bt._relativize(edit, ["/repo"]) is None
+
+
+def test_backtrace_maps_worktree_edits_onto_repo_paths():
+    # Agents work inside aGiTrack worktrees and that work is merged back, so an edit under
+    # .agitrack/worktrees/<name>/ IS an edit to the repo's file — not a separate phantom path.
+    # The session's base_dir (the worktree) is deeper than the repo, so it must win.
+    bases = bt._relativize_bases(Path("/repo"), "/repo/.agitrack/worktrees/crab")
+    edit = make_edit("/repo/.agitrack/worktrees/crab/pkg/mod.py", "a\n", "b\n")
+    rel = bt._relativize(edit, bases)
+    assert rel is not None and rel.path == "pkg/mod.py"
+
+    # Even when only the repo matches (a session recorded elsewhere), the prefix is stripped.
+    edit2 = make_edit("/repo/.agitrack/worktrees/candle/pkg/other.py", "a\n", "b\n")
+    rel2 = bt._relativize(edit2, ["/repo"])
+    assert rel2 is not None and rel2.path == "pkg/other.py"
 
 
 def test_backtrace_empty_directory(monkeypatch, tmp_path):
@@ -570,6 +746,53 @@ def test_backtrace_file_browser_hides_files_absent_on_disk(monkeypatch, tmp_path
     browser = backtrace_browser(view.dashboard.stats, view.file_edits, directory=view.root)
     paths = {row["path"] for row in browser.files_payload()}
     assert "a.py" in paths and "gone.py" not in paths
+
+
+def test_backtrace_file_browser_lists_files_with_no_ai_changes(monkeypatch, tmp_path):
+    # The file tab browses the whole tree, not just AI-touched files: a file no agent ever edited
+    # is listed with zero changes (and sorts below the touched ones).
+    edit = make_edit("touched.py", "", "x\n", status="added")
+    (tmp_path / "touched.py").write_text("x\n")
+    (tmp_path / "untouched.py").write_text("hand written\n")
+    es = ExportedSession(
+        session_id="c1", model="claude-opus-4-8", updated=2000, turns=[_turn("edit one file", edits=[edit])]
+    )
+    _patch_discovery(monkeypatch, claude_sessions={"c1": es})
+    view = bt.build_backtrace(tmp_path)
+
+    from agitrack.metrics.files import backtrace_browser
+
+    rows = backtrace_browser(view.dashboard.stats, view.file_edits, directory=view.root).files_payload()
+    by_path = {row["path"]: row for row in rows}
+    assert by_path["touched.py"]["changes"] == 1
+    assert by_path["untouched.py"]["changes"] == 0 and by_path["untouched.py"]["ins"] == 0
+    assert rows[-1]["path"] == "untouched.py"  # zero-change files sort last
+
+
+def test_git_file_browser_lists_files_with_no_ai_changes(tmp_path):
+    # Same for the live dashboard (-d): every file in the tree is browsable, even one that no
+    # commit in the dashboard's scope touched.
+    import subprocess
+
+    from agitrack.git import GitRepo
+    from agitrack.metrics.files import git_browser
+
+    def git(*args):
+        subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True)
+
+    git("init", "-b", "main")
+    git("config", "user.email", "d@e.com")
+    git("config", "user.name", "D")
+    (tmp_path / "a.py").write_text("x\n")
+    (tmp_path / "b.py").write_text("y\n")
+    git("add", "-A")
+    git("commit", "-m", "initial")
+
+    repo = GitRepo.discover(tmp_path)
+    # No stats at all: nothing is attributed, yet both files must still be listed.
+    rows = git_browser(repo, [], "main").files_payload()
+    assert {row["path"] for row in rows} == {"a.py", "b.py"}
+    assert all(row["changes"] == 0 for row in rows)
 
 
 def test_backtrace_tags_already_committed_turns(monkeypatch, tmp_path):
