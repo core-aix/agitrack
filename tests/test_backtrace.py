@@ -748,6 +748,44 @@ def test_backtrace_file_browser_hides_files_absent_on_disk(monkeypatch, tmp_path
     assert "a.py" in paths and "gone.py" not in paths
 
 
+def test_merge_edits_by_path_sums_lines_and_keeps_first_touch_order():
+    from agitrack.transcripts.edits import merge_edits_by_path, total_lines
+
+    edits = [
+        make_edit("x.py", "", "a\n", status="added"),
+        make_edit("y.py", "", "q\n", status="added"),
+        make_edit("x.py", "a\n", "a\nb\n"),
+    ]
+    merged = merge_edits_by_path(edits)
+    assert [e.path for e in merged] == ["x.py", "y.py"]  # first-touch order
+    assert total_lines(merged) == total_lines(edits)  # totals unchanged
+    assert merged[0].insertions == 2 and merged[0].patch.count("diff --git") == 2
+
+
+def test_backtrace_file_browser_shows_one_row_per_file_per_turn(monkeypatch, tmp_path):
+    # A turn that calls Edit on the same file several times made ONE change to that file. Listing it
+    # once per tool call filled the file log with identical-looking rows (same sha, same prompt).
+    e1 = make_edit("a.py", "", "x\n", status="added")
+    e2 = make_edit("a.py", "x\n", "x\ny\n")
+    e3 = make_edit("a.py", "x\ny\n", "x\ny\nz\n")
+    (tmp_path / "a.py").write_text("x\ny\nz\n")
+    es = ExportedSession(
+        session_id="c1", model="claude-opus-4-8", updated=2000, turns=[_turn("edit a.py thrice", edits=[e1, e2, e3])]
+    )
+    _patch_discovery(monkeypatch, claude_sessions={"c1": es})
+    view = bt.build_backtrace(tmp_path)
+
+    from agitrack.metrics.files import backtrace_browser
+
+    browser = backtrace_browser(view.dashboard.stats, view.file_edits, directory=view.root)
+    entry = browser.index["a.py"]
+    assert len(entry.changes) == 1  # one turn -> one row, not three
+    assert (entry.insertions, entry.deletions) == (3, 0)  # every edit's lines still counted
+    assert view.dashboard.ai_lines == (3, 0)
+    # The single row's diff still contains all three tool calls' hunks.
+    assert browser.file_diff("a.py", entry.changes[0].sha)["diff"].count("diff --git") == 3
+
+
 def test_backtrace_file_browser_lists_files_with_no_ai_changes(monkeypatch, tmp_path):
     # The file tab browses the whole tree, not just AI-touched files: a file no agent ever edited
     # is listed with zero changes (and sorts below the touched ones).
