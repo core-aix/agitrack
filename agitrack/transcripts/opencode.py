@@ -17,7 +17,7 @@ from agitrack.backends.base import TokenUsage
 # ``agitrack.commits.actions``, which imports ``SessionTurn`` back from this module, so these
 # names must already exist here or that cycle fails when opencode is the first module imported.
 from agitrack.transcripts.types import ExportedSession, FileEdit, SessionRef, SessionTurn, turns_after
-from agitrack.transcripts.edits import tracked_edit
+from agitrack.transcripts.edits import content_from_read_output, seed_file_state, tracked_edit
 from agitrack.proc import console_isolation_kwargs, resolve_subprocess_command
 from agitrack.sessions.share_cap import select_kept_indices
 
@@ -712,6 +712,15 @@ def _edits_from_parts(parts: object, file_state: dict[str, str]) -> list[FileEdi
         inp = raw_input if isinstance(raw_input, dict) else {}
         path = inp.get("filePath") or inp.get("file_path") or inp.get("path") or ""
         if not isinstance(path, str):
+            continue
+        if tool == "read":
+            # The read's output is the file's pre-existing content: seed it so a later whole-file
+            # write diffs against it rather than counting the whole file as newly added. A ranged
+            # read only returns a slice, so it can't serve as the baseline.
+            if not (inp.get("offset") or inp.get("limit")):
+                output = state.get("output") if isinstance(state, dict) else None
+                if isinstance(output, str):
+                    seed_file_state(file_state, path, content_from_read_output(output))
             continue
         if tool == "write":
             edit = tracked_edit(file_state, path, write=str(inp.get("content") or ""))

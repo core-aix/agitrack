@@ -238,7 +238,7 @@ def _session_to_stats(
         # The resume watermark: the last message id we processed, even for an empty turn, so next
         # time ``turns_after`` can pick up exactly where we left off.
         last_message_id = turn.assistant_message_id or turn.user_message_id or last_message_id
-        edits = [_relativize(edit, bases) for edit in turn.edits]
+        edits = [rel for rel in (_relativize(edit, bases) for edit in turn.edits) if rel is not None]
         has_content = bool(turn.user_prompt.strip() or turn.final_response.strip() or turn.agent_messages or edits)
         if not has_content:
             continue
@@ -395,17 +395,36 @@ def _iso(ts: int | None) -> str:
 
 
 def _relativize_bases(directory: Path, session_dir: str) -> list[str]:
+    # Longest first: a session that ran in an aGiTrack worktree records a base_dir BENEATH the
+    # directory, and the deeper base must win so its edits become repo-relative
+    # ("pkg/mod.py") rather than worktree-prefixed (".agitrack/worktrees/foo/pkg/mod.py").
     bases = [str(directory)]
     if session_dir and session_dir not in bases:
         bases.append(session_dir)
-    return bases
+    return sorted(bases, key=len, reverse=True)
 
 
-def _relativize(edit: FileEdit, bases: list[str]) -> FileEdit:
+def _strip_worktree_prefix(rel: str) -> str:
+    """``.agitrack/worktrees/<name>/pkg/mod.py`` -> ``pkg/mod.py``. Work an agent did inside an
+    aGiTrack worktree is work on the repo (the worktree is merged back), so it must collapse onto
+    the same file the repo knows rather than showing up as a separate phantom path."""
+    parts = rel.split("/")
+    if len(parts) > 3 and parts[0] == ".agitrack" and parts[1] == "worktrees":
+        return "/".join(parts[3:])
+    return rel
+
+
+def _relativize(edit: FileEdit, bases: list[str]) -> FileEdit | None:
     """Rewrite an edit's absolute path to one relative to the directory (or the session's
     recorded dir), and rewrite its patch headers to match, so the diff view shows
-    repo-relative paths instead of leaking absolute/home paths."""
+    repo-relative paths instead of leaking absolute/home paths.
+
+    None when the edit is OUTSIDE the directory (a scratch file in /tmp, a plan under
+    ~/.claude): the agent touched it, but it is not a change to this repo, so it must not be
+    counted in the repo's AI lines."""
     display = _display_path(edit.path, bases)
+    if display is None:
+        return None
     if display == edit.path:
         return edit
     return FileEdit(
@@ -416,11 +435,14 @@ def _relativize(edit: FileEdit, bases: list[str]) -> FileEdit:
     )
 
 
-def _display_path(path: str, bases: list[str]) -> str:
-    for base in bases:
+def _display_path(path: str, bases: list[str]) -> str | None:
+    """``path`` as a directory-relative display path, or None when it lies outside the directory."""
+    if not path.startswith("/") and not path.startswith("~"):
+        return _strip_worktree_prefix(path)  # already relative
+    for base in bases:  # longest (most specific) base first
         base = base.rstrip("/")
         if base and (path == base or path.startswith(base + "/")):
-            return path[len(base) + 1 :] or path
+            return _strip_worktree_prefix(path[len(base) + 1 :] or path)
     # A shared/sanitized session keeps a worktree-style absolute path (e.g.
     # /Users/user/Code/x/.agitrack/worktrees/foo/pkg/mod.py) that matches no base; show the
     # path after the worktree segment so it still reads as repo-relative.
@@ -430,7 +452,7 @@ def _display_path(path: str, bases: list[str]) -> str:
         parts = tail.split("/", 1)
         if len(parts) == 2 and parts[1]:
             return parts[1]
-    return _abbreviate_home(path)
+    return None
 
 
 # ---------------------------------------------------------------------------

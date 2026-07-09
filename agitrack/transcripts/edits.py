@@ -14,8 +14,53 @@ that was never a repository.
 from __future__ import annotations
 
 import difflib
+import re
 
 from agitrack.transcripts.types import FileEdit
+
+# A line of a Read tool's output: the line number, a separator, then the line itself.
+# Claude renders ``12\ttext``; OpenCode renders ``00012| text`` (one padding space).
+_NUMBERED_LINE = re.compile(r"^\s*(\d+)(?:\t|\| ?)(.*)$")
+
+
+def content_from_read_output(text: str) -> str | None:
+    """The file content a Read tool's line-numbered output represents, or None when the output
+    can't be trusted to be the file's WHOLE content.
+
+    A backtrace has no filesystem history, so the only way to know what a file looked like before
+    an agent rewrote it is the Read the agent did first. Reconstructing that content lets a later
+    whole-file Write diff against it, instead of counting the entire file as new (see
+    :func:`tracked_edit`).
+
+    Strict on purpose: the numbering must run 1, 2, 3, … with no gaps and every line must be
+    numbered. A partial read (``offset``/``limit``), a truncation notice, or any unnumbered line
+    makes this return None, so a wrong baseline is never seeded."""
+    if not text:
+        return None
+    lines = text.split("\n")
+    if lines and lines[0].strip() == "<file>":  # OpenCode wraps its read output
+        lines = lines[1:]
+    while lines and lines[-1].strip() in ("", "</file>"):
+        lines.pop()
+    if not lines:
+        return None
+    out: list[str] = []
+    expected = 1
+    for line in lines:
+        match = _NUMBERED_LINE.match(line)
+        if not match or int(match.group(1)) != expected:
+            return None
+        expected += 1
+        out.append(match.group(2))
+    return "\n".join(out) + "\n"
+
+
+def seed_file_state(state: dict[str, str], path: str, content: str | None) -> None:
+    """Record a file's pre-existing content (from a Read) as the baseline for later edits, unless
+    the session already tracks it — a Read after a Write must not clobber what we wrote."""
+    path = (path or "").strip()
+    if path and content is not None and path not in state:
+        state[path] = content
 
 
 def make_edit(path: str, before: str, after: str, *, status: str = "modified") -> FileEdit | None:
