@@ -1267,10 +1267,11 @@ function renderAgg(){
   $("count").textContent = `${fmt(total)} commits in view`;
 
   $("cards").innerHTML = [
-    // Backtrace reconstructs conversation TURNS, not commits — a "commits" count would read as a
-    // git commit count and invite comparison with the live dashboard's, so it is left out there.
+    // Backtrace reconstructs conversation TURNS, not commits, and every turn it shows is by
+    // definition agent work. So a "commits" count (reads as a git commit count) and an "aGiTrack
+    // coverage" ratio (of turns, not commits — and always near 100%) would both mislead here.
     BACKTRACE ? "" : card("commits", fmt(total), `${fmt(tracked)} via aGiTrack`),
-    card("aGiTrack coverage", pct(tracked,total), `${fmt(total-tracked)} non-tracked`, true),
+    BACKTRACE ? "" : card("aGiTrack coverage", pct(tracked,total), `${fmt(total-tracked)} non-tracked`, true),
     card("Tracked AI lines", "+"+fmt(ai.ins), `−${fmt(ai.del)} · ${pct(ai.total, allLines)} of changes`),
     card("non-tracked lines", "+"+fmt(nt.ins), `−${fmt(nt.del)} · not tracked as AI`, true),
     card("output tokens", fmt((tok.output||0)+(tok.subagent_output||0)), `${fmt((tok.input||0)+(tok.subagent_input||0))} input`),
