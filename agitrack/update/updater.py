@@ -1045,6 +1045,16 @@ def restart_agitrack(extra_args: Sequence[str] = ()) -> NoReturn:
     """
     sys.stdout.flush()
     sys.stderr.flush()
+    # A restart means freshly updated code is on disk; the detached daemons (repo/backtrace
+    # dashboards, background trackers) are still running the OLD version, so gracefully stop and
+    # re-spawn them all now — they reload the new code just like this process is about to. The
+    # current process restarts itself via the exec below, so it's excluded. Best-effort.
+    try:
+        from agitrack import daemons
+
+        daemons.restart_all()
+    except Exception:
+        pass
     cmd = _restart_command(extra_args)
     if os.name == "nt":
         # Windows has no true in-place exec. os.execv there spawns a new process and exits

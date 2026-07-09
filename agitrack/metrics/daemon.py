@@ -268,6 +268,9 @@ def run_dashboard_daemon(
         repo,
         {"pid": os.getpid(), "host": host, "port": bound_port, "url": url, "started": int(time.time())},
     )
+    from agitrack import daemons
+
+    daemons.register("dashboard", repo.repo, url=url)
 
     stop = threading.Event()
 
@@ -293,6 +296,9 @@ def run_dashboard_daemon(
     finally:
         server.server_close()
         clear_handshake(repo)
+        from agitrack import daemons
+
+        daemons.deregister()
     return 0
 
 
