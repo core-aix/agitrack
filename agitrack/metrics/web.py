@@ -1267,7 +1267,9 @@ function renderAgg(){
   $("count").textContent = `${fmt(total)} commits in view`;
 
   $("cards").innerHTML = [
-    card("commits", fmt(total), `${fmt(tracked)} via aGiTrack`),
+    // Backtrace reconstructs conversation TURNS, not commits — a "commits" count would read as a
+    // git commit count and invite comparison with the live dashboard's, so it is left out there.
+    BACKTRACE ? "" : card("commits", fmt(total), `${fmt(tracked)} via aGiTrack`),
     card("aGiTrack coverage", pct(tracked,total), `${fmt(total-tracked)} non-tracked`, true),
     card("Tracked AI lines", "+"+fmt(ai.ins), `−${fmt(ai.del)} · ${pct(ai.total, allLines)} of changes`),
     card("non-tracked lines", "+"+fmt(nt.ins), `−${fmt(nt.del)} · not tracked as AI`, true),

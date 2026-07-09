@@ -159,6 +159,12 @@ def build_backtrace(
     backends: set[str] = set()
     edited_sessions = 0
     included_sessions = 0
+    # Resuming or rewinding a conversation forks it into a NEW session id that replays the whole
+    # earlier transcript, so one real turn shows up in several sessions. The assistant message id is
+    # the turn's true identity (it comes from the API), so keep each turn once — otherwise its lines
+    # and tokens are counted once per fork. Sessions are walked newest-first, so the newest copy wins.
+    seen_turns: set[str] = set()
+    assistant_id_by_sha: dict[str, str] = {}
 
     for index, source in enumerate(sources):
         if progress:
@@ -175,14 +181,32 @@ def build_backtrace(
         fresh_sessions[key] = entry
         if not entry.get("stats"):
             continue
+        entry_diffs = entry.get("diffs") or {}
+        entry_edits = entry.get("file_edits") or {}
+        backend = str(entry.get("backend") or source.backend)
+        assistant_ids = {str(ref["sha"]): str(ref.get("assistant_id") or "") for ref in entry.get("turn_refs") or []}
+        kept = 0
+        for stat_dict in entry["stats"]:
+            sha = str(stat_dict.get("sha") or "")
+            # A message id is only unique WITHIN a backend, so scope the turn's identity by backend.
+            assistant_id = _turn_key(backend, assistant_ids.get(sha, ""))
+            if assistant_id:
+                if assistant_id in seen_turns:
+                    continue  # this turn was already taken from a newer fork of the conversation
+                seen_turns.add(assistant_id)
+            assistant_id_by_sha[sha] = assistant_id
+            stats.append(_stat_from_dict(stat_dict))
+            if sha in entry_diffs:
+                diffs[sha] = entry_diffs[sha]
+            if sha in entry_edits:
+                file_edits[sha] = [_edit_from_dict(edit) for edit in entry_edits[sha]]
+            kept += 1
+        if not kept:
+            continue  # a pure fork: every one of its turns already came from another session
         included_sessions += 1
         backends.add(str(entry.get("backend") or source.backend))
         if entry.get("edited"):
             edited_sessions += 1
-        stats.extend(_stat_from_dict(d) for d in entry["stats"])
-        diffs.update(entry.get("diffs") or {})
-        for sha, edit_dicts in (entry.get("file_edits") or {}).items():
-            file_edits[sha] = [_edit_from_dict(e) for e in edit_dicts]
     if progress:
         progress(total, total, "done")
     if use_cache:
@@ -190,7 +214,7 @@ def build_backtrace(
 
     # Tag turns already committed to git with aGiTrack metadata, so the log shows what is tracked
     # vs. what `--backtrace commit` would still add. (No-op when the directory isn't a git repo.)
-    _mark_tracked(directory, fresh_sessions, stats)
+    _mark_tracked(directory, fresh_sessions, stats, assistant_id_by_sha)
 
     stats.sort(key=lambda stat: (stat.timestamp, stat.sha))  # oldest first, like git log order
     dashboard = Dashboard(
@@ -807,19 +831,32 @@ def _edit_from_dict(data: dict) -> FileEdit:
 # ---------------------------------------------------------------------------
 
 
-def _mark_tracked(directory: Path, sessions: dict, stats: list[CommitStat]) -> None:
+def _turn_key(backend: str, assistant_id: str) -> str:
+    """A turn's identity across forked sessions: its assistant message id, scoped by backend (the
+    id is only unique within one backend). Empty when the turn carries no message id."""
+    return f"{backend}:{assistant_id}" if assistant_id else ""
+
+
+def _mark_tracked(
+    directory: Path, sessions: dict, stats: list[CommitStat], assistant_id_by_sha: dict[str, str]
+) -> None:
     """Set ``stat.tracked`` on the reconstructed turns already committed with aGiTrack metadata.
 
     aGiTrack commits record ``backend_session_id`` and ``conversation_anchor`` (the last message id
     the commit covered), so within a session every turn up to the LATEST committed anchor is already
     tracked. Matches reconstructed turns (by session + message id + order via the cached turn_refs)
-    against those anchors. A no-op when the directory is not a git repo."""
+    against those anchors. A no-op when the directory is not a git repo.
+
+    Also matches on the assistant message id, not just the virtual sha: forked conversations share
+    turns, and the copy kept in ``stats`` may come from a different session id than the one the
+    commit recorded — the message id is what identifies the turn across forks."""
     anchors = _committed_anchors(directory)
     if not anchors:
         return
     tracked_shas: set[str] = set()
+    tracked_assistant_ids: set[str] = set()
     for key, entry in sessions.items():
-        session_id = key.partition(":")[2]
+        backend, _, session_id = key.partition(":")
         session_anchors = anchors.get(session_id)
         refs = entry.get("turn_refs") or []
         if not session_anchors or not refs:
@@ -828,11 +865,18 @@ def _mark_tracked(directory: Path, sessions: dict, stats: list[CommitStat]) -> N
         if not anchored_indices:
             continue
         cutoff = max(anchored_indices)  # every turn at/before the latest committed anchor is tracked
-        tracked_shas.update(str(ref["sha"]) for ref in refs if int(ref["index"]) <= cutoff)
-    if tracked_shas:
-        for stat in stats:
-            if stat.sha in tracked_shas:
-                stat.tracked = True
+        for ref in refs:
+            if int(ref["index"]) <= cutoff:
+                tracked_shas.add(str(ref["sha"]))
+                turn_key = _turn_key(str(entry.get("backend") or backend), str(ref.get("assistant_id") or ""))
+                if turn_key:
+                    tracked_assistant_ids.add(turn_key)
+    if not tracked_shas and not tracked_assistant_ids:
+        return
+    for stat in stats:
+        assistant_id = assistant_id_by_sha.get(stat.sha, "")
+        if stat.sha in tracked_shas or (assistant_id and assistant_id in tracked_assistant_ids):
+            stat.tracked = True
 
 
 def _committed_anchors(directory: Path) -> dict[str, set[str]]:

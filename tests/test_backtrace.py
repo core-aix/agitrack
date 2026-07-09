@@ -497,6 +497,36 @@ def test_build_backtrace_merges_both_backends(monkeypatch, tmp_path):
     assert edited.sha in view.diffs and view.diffs[edited.sha].startswith("diff --git a/a.py b/a.py")
 
 
+def test_backtrace_counts_a_forked_conversations_shared_turns_once(monkeypatch, tmp_path):
+    # Resuming/rewinding forks a conversation into a NEW session id that replays the earlier turns.
+    # The shared turns are the SAME turns (same assistant message id), so they must be counted once —
+    # otherwise their lines and tokens are multiplied by the number of forks.
+    shared = _turn("shared work", edits=[make_edit("/repo/a.py", "", "x\ny\n", status="added")], assistant_id="m1")
+    only_in_fork = _turn("later work", edits=[make_edit("/repo/b.py", "", "z\n", status="added")], assistant_id="m2")
+    original = ExportedSession(session_id="s-old", model="claude-opus-4-8", updated=1000, turns=[shared])
+    fork = ExportedSession(session_id="s-new", model="claude-opus-4-8", updated=2000, turns=[shared, only_in_fork])
+    _patch_discovery(monkeypatch, claude_sessions={"s-old": original, "s-new": fork})
+
+    view = bt.build_backtrace(tmp_path)
+    # Three turns were exported across the two sessions; only two distinct turns exist.
+    assert view.dashboard.total_commits == 2
+    assert view.dashboard.ai_lines == (3, 0)  # 2 (a.py) + 1 (b.py), not 5
+    # The fork contributed every shared turn, so the older session adds nothing and isn't counted.
+    assert view.session_count == 1
+
+
+def test_backtrace_keeps_turns_without_an_assistant_id(monkeypatch, tmp_path):
+    # Dedup keys on the assistant message id; a turn that has none must not be silently dropped
+    # (nor collapsed with other id-less turns).
+    a = _turn("one", edits=[make_edit("/repo/a.py", "", "x\n", status="added")], assistant_id="")
+    b = _turn("two", edits=[make_edit("/repo/b.py", "", "y\n", status="added")], assistant_id="")
+    es = ExportedSession(session_id="c1", model="claude-opus-4-8", updated=2000, turns=[a, b])
+    _patch_discovery(monkeypatch, claude_sessions={"c1": es})
+
+    view = bt.build_backtrace(tmp_path)
+    assert view.dashboard.total_commits == 2 and view.dashboard.ai_lines == (2, 0)
+
+
 def test_backtrace_tokens_exclude_total_and_context():
     turn = _turn("p", tokens=TokenUsage(input=10, output=20, cache_read=3))
     tokens = bt._tokens_dict(turn)
