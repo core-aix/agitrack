@@ -9167,6 +9167,95 @@ def test_no_worktree_mode_keeps_newer_base_session_over_older_worktree(tmp_path)
     assert runner.state.backend_session_id == "sess-recent-base"  # not demoted to an older session
 
 
+def _noworktree_runner(tmp_path):
+    runner = make_runner(state=AgitrackState(tmp_path))
+    runner._use_worktrees = False
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda *a, **k: None
+    runner._worktrees = lambda: types.SimpleNamespace(list=lambda: [], remove=lambda *a, **k: None)
+    runner._newest_worktree_session = lambda: None
+    runner._session_updated_at = lambda sid: 0.0
+    return runner
+
+
+def test_no_worktree_mode_prompts_for_a_session_name_in_a_new_directory(tmp_path, monkeypatch):
+    # A fresh directory has no prior conversation to inherit a name from, so --no-worktree must ASK
+    # for one — it used to silently keep the internal "main" placeholder as the session name.
+    runner = _noworktree_runner(tmp_path)
+    asked: list = []
+    monkeypatch.setattr("builtins.input", lambda prompt="": asked.append(prompt) or "my-session")
+
+    runner._setup_base_merge_only_session()
+
+    assert asked, "the user was never prompted for a session name"
+    assert runner.name == "my-session"
+
+
+def test_no_worktree_mode_prompt_default_is_never_the_main_placeholder(tmp_path, monkeypatch):
+    # Accepting the prompt's default (empty input) must yield a real generated name, not "main".
+    runner = _noworktree_runner(tmp_path)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "")
+
+    runner._setup_base_merge_only_session()
+
+    assert runner.name != "main" and runner.name
+
+
+def test_no_worktree_mode_new_session_flag_still_prompts(tmp_path, monkeypatch):
+    # --new-session is a brand-new conversation: it must be named, not inherit or default.
+    runner = _noworktree_runner(tmp_path)
+    runner._force_new_session = True
+    monkeypatch.setattr("builtins.input", lambda prompt="": "fresh")
+
+    runner._setup_base_merge_only_session()
+
+    assert runner.name == "fresh"
+
+
+def test_no_worktree_mode_keeps_an_inherited_name_without_prompting(tmp_path, monkeypatch):
+    # Resuming a session that already has a real name (e.g. the worktree "candle" it came from)
+    # keeps that name and must NOT interrupt the user with a prompt.
+    runner = _noworktree_runner(tmp_path)
+    runner.state.backend_session_id = "sess-W"
+    runner._newest_worktree_session = lambda: ("sess-W", 1000.0)
+    runner._session_updated_at = lambda sid: 1000.0
+    runner._resolve_session_name = lambda sid: "candle"
+    monkeypatch.setattr("builtins.input", lambda prompt="": pytest.fail("should not prompt for a named session"))
+
+    runner._setup_base_merge_only_session()
+
+    assert runner.name == "candle"
+
+
+def test_no_worktree_mode_prompts_when_the_inherited_name_is_auto_generated(tmp_path, monkeypatch):
+    # An auto "session-N" name is not a real name (same rule worktree mode applies), so prompt.
+    runner = _noworktree_runner(tmp_path)
+    runner.state.backend_session_id = "sess-W"
+    runner._newest_worktree_session = lambda: ("sess-W", 1000.0)
+    runner._session_updated_at = lambda sid: 1000.0
+    runner._resolve_session_name = lambda sid: "session-3"
+    monkeypatch.setattr("builtins.input", lambda prompt="": "renamed")
+
+    runner._setup_base_merge_only_session()
+
+    assert runner.name == "renamed"
+
+
+def test_no_worktree_mode_name_prompt_falls_back_when_stdin_is_unusable(tmp_path, monkeypatch):
+    # Scripted/piped runs have no usable stdin; the prompt must fall back to the generated default
+    # rather than raising or hanging startup.
+    runner = _noworktree_runner(tmp_path)
+
+    def _no_stdin(prompt=""):
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", _no_stdin)
+
+    runner._setup_base_merge_only_session()
+
+    assert runner.name and runner.name != "main"
+
+
 def test_worktree_sessions_is_memoized_to_avoid_repeated_slow_listing(tmp_path):
     # Entering the resume menu calls _worktree_sessions several times (via _resumable_sessions
     # and _agitrack_named_sessions); each is a slow `opencode session list`. It must be

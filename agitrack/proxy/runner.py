@@ -3271,6 +3271,8 @@ class ProxyRunner:
             # to the base directory, so it resumes in the right place. The leftover worktree
             # DIRECTORIES are kept — switching back to worktree mode later resumes them in place
             # (the user can delete them by hand if they want the space back).
+            resume_id: str | None = None
+            named = False
             if not self._force_new_session:
                 # Pick the conversation to continue HERE: the latest worktree session, unless the
                 # base repo's own recorded session is genuinely more recent (transcript recency,
@@ -3286,6 +3288,7 @@ class ProxyRunner:
                     chosen = newest[0]
                 if chosen:
                     self.state.backend_session_id = chosen  # setter re-points backend_session_repo at base
+                    resume_id = chosen
                     # Keep the session's NAME (the worktree it came from, e.g. "candle") rather than
                     # leaving the default "main" — so the status bar and the resume list stay
                     # consistent across worktree ⇄ no-worktree switches. Persist it under this id so
@@ -3293,8 +3296,18 @@ class ProxyRunner:
                     name = self._resolve_session_name(chosen)
                     if name and not self._AUTO_NAME_RE.match(name):
                         self.name = name
+                        named = True
                         self._persist_session_name(chosen)
                     self._debug(f"--no-worktree: resuming session {chosen} as '{self.name}' in the base repo")
+            if not named:
+                # No name carried over — a brand-new directory, a fresh --new-session, or a
+                # conversation that never got named. Ask, exactly as worktree mode does via
+                # _resolve_startup_session_name, instead of silently labelling the session with the
+                # "main" placeholder. Only reached from run(), which requires a TTY, so this never
+                # blocks headless/background runs (those use BackgroundRunner, not this path).
+                self.name = self._prompt_startup_name(resume_id is not None)
+                if resume_id:
+                    self._persist_session_name(resume_id)
             self._set_message(
                 "Running without a worktree: the agent edits this branch directly (visible live), "
                 "but there's no isolation or auto-integration. Extra sessions started this way share "
