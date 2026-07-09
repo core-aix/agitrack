@@ -200,11 +200,42 @@ def main(argv: list[str] | None = None) -> int:
         "one-shot report and exits",
     )
     parser.add_argument(
+        "--backtrace",
+        nargs="?",
+        const="html",
+        choices=["text", "html", "stop", "status", "commit"],
+        default=None,
+        help="reconstruct how PAST coding-agent conversations changed THIS directory, from local "
+        "Claude/OpenCode transcripts alone — even if you have never used aGiTrack here, and even if "
+        "the directory is not a git repo. It reads the sessions that ran in this directory (or a "
+        "subdirectory), recovers each turn's file edits, and shows the same dashboard (tokens, "
+        "models, lines changed, and the full user↔agent trace behind each change) marked clearly as "
+        "a historical backtrace, not live repo status. Bare `--backtrace` (or `--backtrace html`) "
+        "starts it as a background daemon on localhost, opens the browser, and returns to the shell "
+        "(it stops when this terminal closes or via `--backtrace stop`); `status` reports it; "
+        "`text` prints a one-shot report. `commit` REWRITES history onto a NEW branch (`--backtrace-branch`), "
+        "annotating the commits that made AI changes with aGiTrack metadata — so a project built "
+        "without aGiTrack still gets a tracked history (requires a clean working tree).",
+    )
+    parser.add_argument(
+        "--backtrace-branch",
+        default=None,
+        help="the NEW branch to create for `--backtrace commit` (the reconstructed, history-"
+        "rewritten commits are placed here; your current branch is left untouched).",
+    )
+    parser.add_argument(
         "-s",
         "--status",
         action="store_true",
         help="report whether aGiTrack is running for this repo and in which mode (interactive vs "
         "background, auto vs manual commit, worktree vs no-worktree), then exit.",
+    )
+    parser.add_argument(
+        "--daemons",
+        action="store_true",
+        help="list every running aGiTrack daemon across ALL repositories — its function (repo "
+        "dashboard, backtrace dashboard, or background mode), repo name, and PID — so you can stop a "
+        "stray one by hand, then exit.",
     )
     # --- options without a short form, in rough order of how often they matter ---
     parser.add_argument("--repo", default=".", help="target Git repository path")
@@ -341,7 +372,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="with --json, run a long-lived JSON-RPC session over stdin/stdout where "
         "interactive questions (menus, confirmations, text input) are asked of the driver "
-        "instead of a terminal — used by the VSCode extension (see editors/vscode)",
+        "program instead of a terminal — for embedding aGiTrack behind an editor/GUI front-end",
     )
     parser.add_argument(
         "--mode",
@@ -368,6 +399,14 @@ def main(argv: list[str] | None = None) -> int:
         # process). `agitrack -d` and the TUI's Ctrl-G dashboard spawn aGiTrack with this
         # flag to host the dashboard in a separate, lifecycle-bound child process (#110).
         # Not meant for manual use.
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--backtrace-serve",
+        action="store_true",
+        # Internal: the detached `--backtrace` child. Bare `agitrack --backtrace` spawns aGiTrack
+        # with this flag to host the reconstructed dashboard out-of-process, bound to the owner
+        # pid via --dashboard-owner-pid. Not meant for manual use.
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
@@ -429,6 +468,75 @@ def main(argv: list[str] | None = None) -> int:
 
         print(__version__)
         return 0
+
+    if args.daemons:
+        # Global, read-only listing of every running aGiTrack daemon — no repo/git needed.
+        from agitrack.daemons import list_running
+        from agitrack.metrics.collect import _abbreviate_home
+
+        running = list_running()
+        if not running:
+            print("No aGiTrack daemons are currently running.")
+            return 0
+        print("aGiTrack daemons running:\n")
+        print(f"  {'PID':>7}  {'FUNCTION':<20}  DIRECTORY")
+        for info in running:
+            location = _abbreviate_home(info.repo)
+            url = f"   {info.url}" if info.url else ""
+            print(f"  {info.pid:>7}  {info.function:<20}  {location}{url}")
+        # The per-daemon stop commands act on the CURRENT directory's repo, so they must be run
+        # from that directory (shown above) or given its path with --repo.
+        print(
+            "\nTo stop one:\n"
+            "  • by PID:            kill <PID>\n"
+            "  • or its own stop command, from that directory (or with --repo <path>):\n"
+            "        repo dashboard       agitrack --repo <path> -d stop\n"
+            "        backtrace dashboard  agitrack --repo <path> --backtrace stop\n"
+            "        background mode      agitrack --repo <path> -b stop"
+        )
+        return 0
+
+    # Backtrace works purely from local transcripts — no git repo AND no git binary needed —
+    # so both the user command and its detached child are handled BEFORE the git check below.
+    if args.backtrace_serve:
+        # Internal entry point: the detached `--backtrace` child. Serves the reconstructed
+        # dashboard out-of-process and shuts down when its owner pid dies.
+        from agitrack.metrics.backtrace import run_backtrace_daemon
+
+        return run_backtrace_daemon(Path(args.repo).expanduser().resolve(), owner_pid=args.dashboard_owner_pid)
+
+    if args.backtrace:
+        # Read-only reconstruction from local transcripts — no git, no privacy prompt, no repo
+        # init: it works in ANY directory, including one that was never a repository. The target
+        # is the directory itself (--repo, or the cwd), NOT a discovered repo root, so a
+        # subdirectory backtraces its own sessions.
+        directory = Path(args.repo).expanduser().resolve()
+        if not directory.is_dir():
+            print(f"{directory} is not a directory.")
+            return 1
+        if args.backtrace == "text":
+            from agitrack.metrics.backtrace import render_backtrace_text
+
+            print(render_backtrace_text(directory))
+            return 0
+        if args.backtrace == "stop":
+            from agitrack.metrics.backtrace import stop_backtrace_daemon
+
+            return stop_backtrace_daemon(directory)
+        if args.backtrace == "status":
+            from agitrack.metrics.backtrace import backtrace_daemon_status
+
+            return backtrace_daemon_status(directory)
+        if args.backtrace == "commit":
+            # Reconstruct a TRACKED git history: rewrite commits onto a new branch, annotating the
+            # AI-made ones with aGiTrack metadata. Requires a git repo + clean tree + a branch name.
+            # Always interactive (it rewrites history) — there is no skip-confirmation flag.
+            from agitrack.metrics.backtrace_commit import backtrace_commit
+
+            return backtrace_commit(directory, args.backtrace_branch or "")
+        from agitrack.metrics.backtrace import start_backtrace_daemon
+
+        return start_backtrace_daemon(directory, owner_pid=os.getppid())
 
     # aGiTrack can't do anything without git (every path below discovers/commits to a repo).
     # Check once, up front, so a missing git gives a clear, actionable message instead of a

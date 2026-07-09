@@ -258,7 +258,8 @@ aGiTrack tracks one session per repository and stays pinned to the session it la
 `agitrack --dashboard` (or `-d`) opens a **live, auto-refreshing web dashboard** of your repository — who and what wrote the code — served on `localhost` and opened in your browser. Every number is computed from commit metadata alone, so it's identical on every clone; nothing is sent anywhere.
 
 ```bash
-agitrack --dashboard        # serve on localhost and open the browser (Ctrl-C to stop)
+agitrack --dashboard        # start a background daemon on localhost, open the browser, and return to your shell
+agitrack -d stop            # stop that daemon (it also stops when the launching terminal closes)
 agitrack -d text            # one-shot plain-text report instead (pipe it, paste it into an issue)
 ```
 
@@ -266,9 +267,28 @@ agitrack -d text            # one-shot plain-text report instead (pipe it, paste
 
 - **aGiTrack-tracked AI vs non-tracked lines** — what the agents wrote (tracked by aGiTrack) versus everything else; it never claims a human wrote what the model did.
 - **Filter live** — narrow the whole dashboard to one committer (merged to their GitHub ID), a backend, a model, or a time range.
-- **Tokens, efficiency, and loop detection**, plus a commit log you can click to read the full message and show each commit's **file diff right in the page** (served from your local clone — no GitHub needed).
+- **Tokens, efficiency, and loop detection**, plus a **Log** section with two tabs: **commits** (click any commit to read its full message and show its file diff) and **files** (a collapsible folder tree — pick a file to see its whole change history and the conversation/tokens behind each change). All diffs are served from your local clone — no GitHub needed.
 
 See [Repository dashboard](#repository-dashboard) below for the full breakdown.
+
+
+## Backtrace — show and commit a history you didn't track from day one
+
+Didn't run aGiTrack from the start? `--backtrace` **reconstructs** how your past Claude and OpenCode sessions changed a directory, purely from the transcripts already on your machine — so you can see (and even bake in) the tracked history retroactively, with no prior aGiTrack use and even in a directory that was never a git repo.
+
+```bash
+agitrack --backtrace                 # serve the reconstructed dashboard (background daemon, opens the browser)
+agitrack --backtrace text            # one-shot plain-text report instead
+agitrack --backtrace stop            # stop the background backtrace daemon
+agitrack --backtrace commit --backtrace-branch tracked-history   # write the reconstruction into real git commits
+```
+
+- **`--backtrace` (view).** Reads every local session that ran in this directory (or a subdirectory), recovers each turn's file edits from the tool calls, and shows the **same dashboard** — tokens, models, lines changed, the full file browser, and the complete user↔agent trace behind each change — clearly labeled with a frozen banner as a **historical reconstruction, not live repo status**. It runs as a lifecycle-bound background daemon just like `-d` (stops when the terminal closes or via `--backtrace stop`).
+
+- **`--backtrace commit` (bake it in).** Replays your existing git history onto a **new branch** (`--backtrace-branch <name>`), and for each commit whose files an agent turn produced, appends the reconstructed `# Interaction Trace` and `# aGiTrack Metadata` (backend, model, tokens, timings) — so a project built without aGiTrack ends up with a fully tracked history the dashboard understands. Commits with no AI correspondence are kept **verbatim**; trees, authors and dates are preserved exactly.
+  - It **rewrites history** (every commit gets a new hash), so it only runs on a new branch, requires a **clean working tree** (commit or `.gitignore` your pending files first), and never touches your current branch. Because the new branch is a rewrite it is **not a fast-forward** of the old one — aGiTrack prints the exact steps to review it and, if you choose, force-replace the old branch. A progress bar shows during the replay.
+
+The reconstruction is best-effort from what the transcripts recorded; review it before relying on it. Nothing is uploaded — it all runs locally.
 
 
 ## Sharing sessions

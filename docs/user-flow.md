@@ -749,6 +749,53 @@ flowchart TD
 
 ---
 
+## 13. Backtrace (`--backtrace`) — reconstruct a history you didn't track
+
+Backtrace is **read-only reconstruction from local transcripts** — it works with no prior aGiTrack
+use and even in a directory that was never a git repo. It answers "show me (and optionally commit)
+what my past coding-agent sessions did here."
+
+```mermaid
+flowchart TD
+  bt["agitrack --backtrace [text|html|stop|status|commit]"] --> disc[["Discover every Claude/OpenCode session whose recorded cwd is this directory (or a subdirectory)"]]
+  disc --> exp[["Export each session; recover every turn's file edits from the tool calls (Edit/Write/MultiEdit)"]]
+  exp --> map[["Map each turn → a virtual commit: model, tokens, timings, per-file diff, and the user↔agent trace (final response only, exactly as a real aGiTrack commit)"]]
+  map --> mode{mode}
+  mode -->|text| txt[["Print a one-shot report"]]
+  mode -->|html / bare| serve[["Serve the same dashboard as a background daemon (frozen 'BACKTRACE — not live' banner); dies with the terminal or via --backtrace stop"]]
+  mode -->|commit| commit
+  subgraph commit["--backtrace commit --backtrace-branch NEW"]
+    g1{git repo?} -->|no| gi[["Instruct: git init + commit, then re-run"]]
+    g1 -->|yes| g2{clean tree?}
+    g2 -->|no| gd[["Instruct: commit or .gitignore pending files until git status is clean"]]
+    g2 -->|yes| g3{branch name given & unused?}
+    g3 -->|no| gb[["Instruct: pass --backtrace-branch <new-branch>"]]
+    g3 -->|yes| cls[["Classify each existing commit AI-vs-user by file overlap with the turns"]]
+    cls --> warn[["Warn: this REWRITES history (new hashes, not a fast-forward); confirm (unless --yes)"]]
+    warn --> replay[["Replay every commit onto NEW branch with git commit-tree — same tree/author/date/parents; append trace+metadata to AI commits, keep user commits verbatim (progress bar)"]]
+    replay --> sw[["Switch to NEW branch; print review + force-replace instructions"]]
+  end
+```
+
+- **View** (`text` / `html` / bare): nothing is written and nothing is uploaded. The served view
+  is built once and cached (re-exporting per poll would be far too slow). Committer chrome and the
+  commit hash are hidden — a reconstructed turn has no committer and no real commit — and only the
+  agent's **final response** is shown, matching what a real aGiTrack commit records.
+- **`stop` / `status`**: manage the background daemon (per-directory handshake in a temp dir, so it
+  works in non-git folders and never collides with the `-d` dashboard daemon).
+- **`commit`**: the only writing path. It is deliberately gated — git repo required, clean tree
+  required, a new branch required — and it never touches the current branch. AI-vs-user attribution
+  is by file overlap: a commit whose changed files an agent turn edited is AI (annotated); a commit
+  no turn explains is a user commit (kept verbatim). Because it rewrites history, aGiTrack prints
+  the exact `git branch -f` / `git push --force-with-lease` steps and tells the user to review the
+  new branch first.
+
+Implementation: `agitrack/metrics/backtrace.py` (view + daemon), `agitrack/metrics/backtrace_commit.py`
+(the `commit` replay), `agitrack/metrics/files.py` (file browser), `agitrack/transcripts/` (edit
+recovery).
+
+---
+
 ### Cross-references
 
 - Prose spec: [`AGENTS.md`](../AGENTS.md) — Staging Behavior, Concurrent Sessions, Session Sharing, Self-Update, Concurrency and Locking.

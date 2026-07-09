@@ -54,6 +54,28 @@ class SessionTurn:
     # already said something, so the trace renders each as its OWN ``## User`` heading (rather than
     # merged into ``user_prompt``). Empty for a plain single-prompt turn.
     queued_followups: list[str] = field(default_factory=list)
+    # The file edits the agent made during this turn (Edit/Write/MultiEdit tool calls),
+    # recovered from the raw transcript's tool-call inputs — the one signal the plain parse
+    # deliberately drops. Populated ONLY when a session is exported with ``collect_edits=True``
+    # (the ``--backtrace`` feature): it reconstructs how a past conversation changed files
+    # without any git history. Empty for ordinary exports and for turns that edited nothing.
+    edits: list[FileEdit] = field(default_factory=list)
+
+
+@dataclass
+class FileEdit:
+    """One file an agent turn changed, reconstructed from a transcript tool call.
+
+    ``patch`` is a git-style unified diff for the single file (``diff --git`` header,
+    ``@@`` hunks, ``+``/``-`` lines) so the dashboard's diff view can colour it exactly
+    like a real commit's diff. ``insertions``/``deletions`` are the added/removed line
+    counts within that patch. A pure whole-file write records the new content as
+    insertions (its prior content is not in the transcript, so deletions stay 0)."""
+
+    path: str
+    insertions: int
+    deletions: int
+    patch: str = ""
 
 
 @dataclass
