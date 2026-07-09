@@ -143,6 +143,29 @@ def tracked_edit(
     return make_edit(path, before, after)
 
 
+def merge_edits_by_path(edits: list[FileEdit]) -> list[FileEdit]:
+    """Coalesce a turn's edits so each file appears exactly once, keeping first-touch order.
+
+    One turn commonly calls Edit/Write on the same file many times. Those are separate tool calls
+    but a single change to that file, so they must be merged: otherwise the file's history lists the
+    same turn once per tool call — many identical-looking rows (same sha, same conversation, same
+    diff). Line counts add up and the patches concatenate, so totals and the diff view are
+    unchanged."""
+    merged: dict[str, FileEdit] = {}
+    for edit in edits:
+        previous = merged.get(edit.path)
+        if previous is None:
+            merged[edit.path] = edit
+        else:
+            merged[edit.path] = FileEdit(
+                path=edit.path,
+                insertions=previous.insertions + edit.insertions,
+                deletions=previous.deletions + edit.deletions,
+                patch=previous.patch + edit.patch,
+            )
+    return list(merged.values())
+
+
 def combine_patches(edits: list[FileEdit]) -> str:
     """The concatenated git-style patch for a turn's edits (one file after another),
     for the dashboard's per-turn diff view. Empty when the turn changed nothing."""

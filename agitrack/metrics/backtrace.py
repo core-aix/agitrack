@@ -30,7 +30,7 @@ from agitrack.commits import METADATA_HEADER
 from agitrack.commits.message import _token_metadata_lines, render_interaction_trace
 from agitrack.metrics.collect import CommitStat, Dashboard, _abbreviate_home
 from agitrack.transcripts import claude, opencode
-from agitrack.transcripts.edits import combine_patches, total_lines
+from agitrack.transcripts.edits import combine_patches, merge_edits_by_path, total_lines
 from agitrack.transcripts.types import ExportedSession, FileEdit, SessionRef, SessionTurn, turns_after
 
 # Cap on how many sessions a single backtrace reconstructs, newest first. Exporting a
@@ -238,7 +238,11 @@ def _session_to_stats(
         # The resume watermark: the last message id we processed, even for an empty turn, so next
         # time ``turns_after`` can pick up exactly where we left off.
         last_message_id = turn.assistant_message_id or turn.user_message_id or last_message_id
-        edits = [rel for rel in (_relativize(edit, bases) for edit in turn.edits) if rel is not None]
+        # Merge AFTER relativizing: two absolute paths (a worktree's and the repo's) can collapse
+        # onto the same repo-relative file, and a turn's repeated edits to one file are one change.
+        edits = merge_edits_by_path(
+            [rel for rel in (_relativize(edit, bases) for edit in turn.edits) if rel is not None]
+        )
         has_content = bool(turn.user_prompt.strip() or turn.final_response.strip() or turn.agent_messages or edits)
         if not has_content:
             continue
@@ -645,7 +649,9 @@ def _clear_progress(directory: Path) -> None:
 # ---------------------------------------------------------------------------
 
 # Bump whenever the per-session processing changes shape/logic so a stale cache is ignored.
-_CACHE_VERSION = 1
+# v2: edits are merged per file per turn, paths outside the directory are dropped, worktree paths
+# collapse onto repo paths, and a Read seeds a file's baseline — a v1 cache holds the old counts.
+_CACHE_VERSION = 2
 
 
 def _cache_path(directory: Path) -> Path:
