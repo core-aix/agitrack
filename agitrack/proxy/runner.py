@@ -700,6 +700,10 @@ class ProxyRunner:
         self.agent_parse_active = False
         self.agent_parse_lock = threading.Lock()
         self.agent_in_flight = False
+        # A turn was forwarded to the agent and aGiTrack has not yet reconciled it into a
+        # commit. Unlike ``agent_in_flight`` (cleared by an idle TIMER), this stays set
+        # across the quiet window between the agent finishing and the commit landing.
+        self.turn_awaiting_commit = False
         self.pre_agent_reconciled_status = ""
         self.last_parse_attempt_status = ""
         self.last_parse_finish = 0.0
@@ -3023,6 +3027,7 @@ class ProxyRunner:
 
     def _reset_agent_tracking(self) -> None:
         self.agent_in_flight = False
+        self.turn_awaiting_commit = False
         self.agent_parse_thread = None
         self.agent_parse_result = None
         self.agent_parse_active = False
@@ -3979,6 +3984,7 @@ class ProxyRunner:
             prompt_sent_at=None,  # set once the submit Enter goes out
         )
         self.agent_in_flight = True
+        self.turn_awaiting_commit = True
         self._set_message(
             f"Merge conflict in {', '.join(files) or 'this session'} — asking the agent to resolve it… "
             f"aGiTrack will commit the merge once the agent finishes (or use {self._menu_label()} → session → Complete merge).",
@@ -7726,6 +7732,7 @@ class ProxyRunner:
             if forwarded:
                 if submit:
                     self.agent_in_flight = True
+                    self.turn_awaiting_commit = True
                     if submitted_prompt:
                         # Flush the previous turn's deferred integration first, then
                         # put this new prompt on its own branch (same shared index as
@@ -10515,8 +10522,15 @@ class ProxyRunner:
         :meth:`_warn_uncommitted_edits_ride_along`) that those edits will be committed together
         with the agent's changes. Returns False when there's nothing to warn about: the edits were
         committed, unstaging left nothing (so the prompt just goes — no second Enter), or manual
-        mode (the tree is intentionally dirty there and the user commits on their own schedule)."""
-        if self._manual_commits or not self.actions.has_pre_agent_user_changes():
+        mode (the tree is intentionally dirty there and the user commits on their own schedule).
+
+        Also returns False in the window between the agent finishing a turn and aGiTrack committing
+        it: the uncommitted edits sitting in the tree are the AGENT's, and the turn's own commit is
+        about to claim them. Offering to commit (or stage) them as the user's own work there is
+        simply wrong — most visibly under --no-worktree, where the agent edits this very tree."""
+        if self._manual_commits or self.turn_awaiting_commit:
+            return False
+        if not self.actions.has_pre_agent_user_changes():
             return False
         self._set_message("Uncommitted user changes detected — committing them before the agent runs.")
         self._render()
@@ -10756,6 +10770,7 @@ class ProxyRunner:
             self._integrate_committed_turn_before_new_turn()
             self._ensure_turn_branch()  # a new prompt starts a turn on its own branch
         self.agent_in_flight = True
+        self.turn_awaiting_commit = True
         self._clear_message()
         if prompt_text:
             # Drop the previous turn's "created & merged" status line so it does
@@ -10912,6 +10927,10 @@ class ProxyRunner:
             on_cancelled_fn=self._handle_cancelled_turn if integrate else None,
         )
         self._awaited_followups = new_awaited
+        if committed is not None:
+            # A parse result was consumed: the turn is now reconciled (committed, or concluded with
+            # nothing to commit). Any dirt left in the tree from here on is the user's own.
+            self.turn_awaiting_commit = False
         if committed:
             self.agent_in_flight = False
             self.last_status = ""
@@ -11051,6 +11070,10 @@ class ProxyRunner:
         if not status.strip():
             if self.verbose:
                 self._render_status("no git changes")
+            # The agent went idle and the tree is settled and clean: this turn left nothing for
+            # aGiTrack to commit, so it is no longer awaiting one. (Safety valve — without it a
+            # turn that changed no files would suppress the pre-agent user-commit offer forever.)
+            self.turn_awaiting_commit = False
             self._integrate_agent_made_commits_if_idle(now)
             # A turn can leave only git-ignored files (nothing staged, clean tree),
             # so there's no commit to hang the copy offer on — offer here too.

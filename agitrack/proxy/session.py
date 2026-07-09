@@ -64,6 +64,7 @@ class Session:
         "file_observer",
         # commit / parse tracking
         "agent_in_flight",
+        "turn_awaiting_commit",
         "agent_parse_thread",
         "agent_parse_result",
         "agent_parse_active",
@@ -178,6 +179,7 @@ class Session:
             "file_change_event": threading.Event(),
             "file_observer": None,
             "agent_in_flight": False,
+            "turn_awaiting_commit": False,
             "_pending_merge_prompt": False,
             "agent_parse_thread": None,
             "agent_parse_result": None,
