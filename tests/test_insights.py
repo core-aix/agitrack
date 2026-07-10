@@ -210,6 +210,19 @@ def test_a_habit_that_stops_is_surfaced_as_an_improved_card():
     assert "correction-loops" not in insights  # not also reported as a live problem
 
 
+def test_trend_names_the_two_periods_it_compares():
+    # "vs earlier" is meaningless without saying WHEN earlier was. The trend must carry both
+    # spans and their turn counts, split by turn count so each half holds the same sample size.
+    turns = [_turn(i, prompt="still broken, fix it again") for i in range(20)]
+    turns += [_turn(100 + i, prompt=f"add feature {i} and its test") for i in range(20)]
+    trend = _by_key(build_insights(turns))["correction-loops"]["trend"]
+
+    assert trend["earlier_turns"] == trend["later_turns"] == 20
+    assert trend["earlier_from"] <= trend["earlier_to"] < trend["later_from"] <= trend["later_to"]
+    assert trend["earlier_from"] == turns[0].timestamp  # the window really starts at the first turn
+    assert trend["later_to"] == turns[-1].timestamp  # ...and ends at the last
+
+
 def test_no_trend_when_a_half_is_too_thin():
     # At the MIN_TURNS floor each half is 6 turns — below MIN_HALF_TURNS, so findings are still
     # reported but no direction is claimed from six turns a side.

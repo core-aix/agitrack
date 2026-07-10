@@ -348,10 +348,11 @@ Added --version using the package metadata; prints and exits.
       <p style="margin-top:18px">It follows the <strong>filter</strong>, so you can watch yourself improve. Narrow the
       time range and the panel re-asks the question for that slice alone — judged against your whole history forever,
       the bad old turns never leave the denominator and progress could never show. Each card also carries its own
-      trend between the earlier and later half of the range: <span class="p">&darr; 34% vs earlier</span> when a habit
-      is fading, <span class="p">&uarr; 22%</span> when it is getting worse. A habit that drops below its threshold is
-      promoted to a green <strong>improved</strong> card, so a win is something you see, not merely the absence of a
-      warning.</p>
+      trend between the earlier and later half of the range: <span class="p">&darr; 34% vs earlier half</span> when a
+      habit is fading, <span class="p">&uarr; 22%</span> when it is getting worse. Both halves are named by date and
+      turn count &mdash; the split is by turn count, not calendar time &mdash; so "earlier" is a period you can point
+      at rather than a vague baseline. A habit that drops below its threshold is promoted to a green
+      <strong>improved</strong> card, so a win is something you see, not merely the absence of a warning.</p>
       <p style="margin-top:16px;color:var(--fg-dim);font-size:14px">Every finding shows the numbers behind it, not a
       bare verdict. It is computed from the metadata already in your commits, in milliseconds, with no extra
       <span class="p">git</span> calls and no model call, so it paints with the rest of the page — and it stays
