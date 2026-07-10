@@ -704,6 +704,9 @@ class ProxyRunner:
         # commit. Unlike ``agent_in_flight`` (cleared by an idle TIMER), this stays set
         # across the quiet window between the agent finishing and the commit landing.
         self.turn_awaiting_commit = False
+        # Untracked paths that already existed when the current turn began: they are the USER's
+        # files, not this turn's output, so the turn's commit must not sweep them in.
+        self.untracked_before_turn: frozenset[str] = frozenset()
         self.pre_agent_reconciled_status = ""
         self.last_parse_attempt_status = ""
         self.last_parse_finish = 0.0
@@ -3028,6 +3031,7 @@ class ProxyRunner:
     def _reset_agent_tracking(self) -> None:
         self.agent_in_flight = False
         self.turn_awaiting_commit = False
+        self.untracked_before_turn = frozenset()
         self.agent_parse_thread = None
         self.agent_parse_result = None
         self.agent_parse_active = False
@@ -3225,6 +3229,33 @@ class ProxyRunner:
         except Exception as error:
             self._debug(f"remember backend session failed: {error!r}")
 
+    def _adopt_pending_session_name(self, root_state, session_id: str | None) -> str | None:
+        """Recover the name a previous run chose but was killed before it could link: the backend
+        conversation now exists, so key the name to it and clear the pending record."""
+        pending = root_state.pending_session_name if session_id else None
+        if not pending:
+            return None
+        root_state.name_session(session_id, pending)
+        root_state.remember_pending_session_name(None)
+        self._debug(f"recovered pending session name '{pending}' for {session_id}")
+        return pending
+
+    def _record_startup_session_name(self, root_state, session_id: str | None, name: str) -> None:
+        """Make a freshly chosen startup name durable IMMEDIATELY — at session creation, not on exit.
+
+        Keyed by the conversation id when one already exists (a resume); otherwise stored as the
+        pending name, because a brand-new conversation has no id until the backend creates it. Either
+        way the name survives a non-graceful exit."""
+        if not name or self._AUTO_NAME_RE.match(name):
+            return
+        try:
+            if session_id:
+                root_state.name_session(session_id, name)
+            else:
+                root_state.remember_pending_session_name(name)
+        except Exception as error:
+            self._debug(f"record startup session name failed: {error!r}")
+
     def _persist_session_name(self, session_id: str | None) -> None:
         # Link this session's user-given name to its backend conversation id in
         # the durable repo-root record as soon as the id is known — and again
@@ -3239,6 +3270,8 @@ class ProxyRunner:
             root = AgitrackState(self.base_repo.repo, default_backend=self.global_config.default_backend)
             if root.session_name_for(session_id) != name:
                 root.name_session(session_id, name)
+            if root.pending_session_name:
+                root.remember_pending_session_name(None)  # now durably linked to the conversation
         except Exception as error:
             self._debug(f"persist session name failed: {error!r}")
 
@@ -3298,7 +3331,7 @@ class ProxyRunner:
                     # leaving the default "main" — so the status bar and the resume list stay
                     # consistent across worktree ⇄ no-worktree switches. Persist it under this id so
                     # switching back to worktree mode resolves the same name.
-                    name = self._resolve_session_name(chosen)
+                    name = self._resolve_session_name(chosen) or self._adopt_pending_session_name(self.state, chosen)
                     if name and not self._AUTO_NAME_RE.match(name):
                         self.name = name
                         named = True
@@ -3311,6 +3344,9 @@ class ProxyRunner:
                 # "main" placeholder. Only reached from run(), which requires a TTY, so this never
                 # blocks headless/background runs (those use BackgroundRunner, not this path).
                 self.name = self._prompt_startup_name(resume_id is not None)
+                # Durable straight away: keyed by the conversation when one exists, otherwise as the
+                # pending name, so killing aGiTrack before the first turn doesn't lose it.
+                self._record_startup_session_name(self.state, resume_id, self.name)
                 if resume_id:
                     self._persist_session_name(resume_id)
             self._set_message(
@@ -3506,11 +3542,12 @@ class ProxyRunner:
             # record moves on.
             existing = prior_worktree
             root_state.name_session(resume_id, existing)
+        if not existing:
+            existing = self._adopt_pending_session_name(root_state, resume_id)
         if existing:
             return existing
         name = self._prompt_startup_name(resume_id is not None)
-        if resume_id:
-            root_state.name_session(resume_id, name)
+        self._record_startup_session_name(root_state, resume_id, name)
         return name
 
     def _startup_taken_names(self) -> set[str]:
@@ -3983,8 +4020,7 @@ class ProxyRunner:
             auto_tried=False,
             prompt_sent_at=None,  # set once the submit Enter goes out
         )
-        self.agent_in_flight = True
-        self.turn_awaiting_commit = True
+        self._begin_agent_turn()
         self._set_message(
             f"Merge conflict in {', '.join(files) or 'this session'} — asking the agent to resolve it… "
             f"aGiTrack will commit the merge once the agent finishes (or use {self._menu_label()} → session → Complete merge).",
@@ -7731,8 +7767,7 @@ class ProxyRunner:
                 self.passthrough_escape = None
             if forwarded:
                 if submit:
-                    self.agent_in_flight = True
-                    self.turn_awaiting_commit = True
+                    self._begin_agent_turn()
                     if submitted_prompt:
                         # Flush the previous turn's deferred integration first, then
                         # put this new prompt on its own branch (same shared index as
@@ -9450,9 +9485,17 @@ class ProxyRunner:
         prompt_untracked: bool = True,
     ) -> bool:
         if prompt_untracked:
-
+            # The MAIN working tree (no worktree) can hold the user's own untracked files alongside
+            # the agent's, so this commit stages only what the turn itself created — the paths that
+            # were not already untracked when the turn began. It must never ASK: this runs between
+            # the agent finishing and the commit landing, and a modal there interrupts the user
+            # mid-flow to answer for files the agent, not they, just wrote.
             def stage_untracked_fn(repo, state):
-                self._review_untracked_popup(include_declined=False)
+                declined = set(state.declined_untracked())
+                existing = self.untracked_before_turn
+                repo.stage_paths(
+                    [path for path in repo.untracked_entries() if path not in declined and path not in existing]
+                )
         else:
             # Non-interactive commit (worktree session or exit finalize): stage
             # the agent's new files too, except any the user intentionally declined.
@@ -10769,8 +10812,7 @@ class ProxyRunner:
             # one so it merges now rather than riding along with the new turn.
             self._integrate_committed_turn_before_new_turn()
             self._ensure_turn_branch()  # a new prompt starts a turn on its own branch
-        self.agent_in_flight = True
-        self.turn_awaiting_commit = True
+        self._begin_agent_turn()
         self._clear_message()
         if prompt_text:
             # Drop the previous turn's "created & merged" status line so it does
@@ -10851,6 +10893,23 @@ class ProxyRunner:
 
     def _agent_is_active(self) -> bool:
         return self.agent_in_flight or (self.agent_parse_thread is not None and self.agent_parse_thread.is_alive())
+
+    def _begin_agent_turn(self) -> None:
+        """A turn has just been handed to the agent.
+
+        Raises ``turn_awaiting_commit`` (cleared only once a parse result reconciles the turn) and
+        snapshots the untracked files that already exist. Anything untracked that appears AFTER this
+        point was produced by the turn, so its commit can stage it without asking — while the user's
+        own pre-existing untracked files are left untouched."""
+        self.agent_in_flight = True
+        self.turn_awaiting_commit = True
+        try:
+            self.untracked_before_turn = frozenset(self.repo.untracked_entries())
+        except Exception as error:
+            # Unknown baseline: fall back to the worktree rule (stage the turn's files, minus any
+            # the user explicitly declined) rather than blocking the commit on a prompt.
+            self._debug(f"untracked snapshot failed: {error!r}")
+            self.untracked_before_turn = frozenset()
 
     def _clear_agent_in_flight_if_idle(self) -> None:
         if self.agent_in_flight and time.monotonic() - self.last_child_output >= self.CHILD_IDLE_SECONDS:

@@ -293,6 +293,23 @@ class AgitrackState:
         value = (self.data.get("session_names") or {}).get(str(session_id))
         return str(value) if value else None
 
+    @property
+    def pending_session_name(self) -> str | None:
+        """A name chosen for a session whose backend conversation did not exist yet."""
+        value = self.data.get("pending_session_name")
+        return str(value) if value else None
+
+    def remember_pending_session_name(self, name: str | None) -> None:
+        """Persist a session's name the MOMENT it is chosen, before there is a backend conversation
+        id to key it against (:meth:`name_session`). A brand-new conversation only gets its id once
+        the backend creates it, so without this a non-graceful exit — kill -9, a closed terminal —
+        loses the name the user just typed. Cleared once the name is linked to a real id."""
+        if name:
+            self.data["pending_session_name"] = name
+        else:
+            self.data.pop("pending_session_name", None)
+        self.save()
+
     def name_session(self, session_id: str | None, name: str | None) -> None:
         """Record (or clear) the user-given name for a backend conversation, and
         stamp when it was last named so a session with no transcript of its own
