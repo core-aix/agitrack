@@ -655,7 +655,22 @@ def _run(ctx: Context) -> dict[str, Finding]:
     return findings
 
 
-def _trend(earlier: Finding | None, later: Finding | None) -> dict | None:
+def _halves(turns: list[CommitStat], midpoint: int) -> dict:
+    """The concrete spans the trend compares, so "vs earlier" names an actual period rather
+    than an unexplained baseline. The split is by TURN COUNT (equal samples), which is why
+    the two spans are rarely equal in calendar length — the dates say exactly where it fell."""
+    earlier, later = turns[:midpoint], turns[midpoint:]
+    return {
+        "earlier_from": earlier[0].timestamp,
+        "earlier_to": earlier[-1].timestamp,
+        "earlier_turns": len(earlier),
+        "later_from": later[0].timestamp,
+        "later_to": later[-1].timestamp,
+        "later_turns": len(later),
+    }
+
+
+def _trend(earlier: Finding | None, later: Finding | None, window: dict) -> dict | None:
     """How the category's metric moved from the window's earlier half to its later half.
     Lower is always better, so a fall is an improvement."""
     if earlier is None or later is None:
@@ -679,6 +694,7 @@ def _trend(earlier: Finding | None, later: Finding | None) -> dict | None:
         "earlier": before,
         "later": after,
         "label": earlier.metric_label,
+        **window,
     }
 
 
@@ -696,7 +712,7 @@ def _as_dict(finding: Finding, trend: dict | None) -> dict:
     return payload
 
 
-def _resolved(key: str, earlier: Finding, later: Finding) -> dict:
+def _resolved(key: str, earlier: Finding, later: Finding, window: dict) -> dict:
     """A habit that fired in the window's earlier half and no longer fires in its later
     half. Surfaced so an improvement is visible instead of simply disappearing."""
     change = (later.metric - earlier.metric) / earlier.metric if earlier.metric > 0 else -1.0
@@ -716,6 +732,7 @@ def _resolved(key: str, earlier: Finding, later: Finding) -> dict:
             "earlier": earlier.metric,
             "later": later.metric,
             "label": earlier.metric_label,
+            **window,
         },
     }
 
@@ -755,12 +772,14 @@ def build_insights(
     earlier_findings: dict[str, Finding] = {}
     later_findings: dict[str, Finding] = {}
     midpoint = len(turns) // 2
+    window: dict = {}
     if midpoint >= MIN_HALF_TURNS and len(turns) - midpoint >= MIN_HALF_TURNS:
         earlier_findings = _run(context.slice(turns[:midpoint]))
         later_findings = _run(context.slice(turns[midpoint:]))
+        window = _halves(turns, midpoint)
 
     insights = [
-        _as_dict(finding, _trend(earlier_findings.get(key), later_findings.get(key)))
+        _as_dict(finding, _trend(earlier_findings.get(key), later_findings.get(key), window))
         for key, finding in findings.items()
         if finding.triggered
     ]
@@ -770,7 +789,7 @@ def build_insights(
         late = later_findings.get(key)
         whole = findings.get(key)
         if early.triggered and late is not None and not late.triggered and not (whole and whole.triggered):
-            insights.append(_resolved(key, early, late))
+            insights.append(_resolved(key, early, late, window))
 
     order = {finding.key: index for index, finding in enumerate(findings.values())}
     insights.sort(

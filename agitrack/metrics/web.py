@@ -1307,8 +1307,11 @@ function insightCard(i){
   let chip = "";
   if(t){
     const arrow = t.direction==="better" ? "\u2193" : t.direction==="worse" ? "\u2191" : "\u2192";
-    const text = t.direction==="steady" ? "steady" : Math.abs(t.change*100).toFixed(0)+"% vs earlier";
-    chip = `<span class="itrend ${esc(t.direction)}" title="${esc(t.label)}: ${fmtMetric(t.earlier)} earlier in this range, ${fmtMetric(t.later)} later">${arrow} ${esc(text)}</span>`;
+    const text = t.direction==="steady" ? "steady" : Math.abs(t.change*100).toFixed(0)+"% vs earlier half";
+    // Spell the two periods out in the tooltip: a bare "vs earlier" leaves the reader guessing
+    // which turns it was measured against.
+    const tip = `${t.label}\n${fmtMetric(t.earlier)} over ${trendSpan(t,"earlier")}\n${fmtMetric(t.later)} over ${trendSpan(t,"later")}`;
+    chip = `<span class="itrend ${esc(t.direction)}" title="${esc(tip)}">${arrow} ${esc(text)}</span>`;
   }
   return `
     <div class="insight ${esc(i.severity)}">
@@ -1319,6 +1322,15 @@ function insightCard(i){
 }
 // A metric is a share (0..1) or a growth multiple; render it the way the card's text does.
 function fmtMetric(v){ return v<=1.5 ? (v*100).toFixed(0)+"%" : v.toFixed(1)+"\u00d7"; }
+// "earlier" / "later" as a concrete period: the range is split in two by TURN COUNT, so the
+// halves hold equal numbers of turns but rarely equal spans of calendar time. Naming the dates
+// (and the turn counts) is the only way "vs earlier" means anything to the reader.
+function trendSpan(t, half){
+  const from = t[half+"_from"], to = t[half+"_to"], n = t[half+"_turns"];
+  if(!from || !to) return half;
+  const days = ymd(from)===ymd(to) ? ymd(from) : `${ymd(from)} \u2192 ${ymd(to)}`;
+  return `${days} (${fmt(n)} turn${n===1?"":"s"})`;
+}
 const INSIGHTS_VISIBLE = 4;
 function renderInsights(){
   // One card per detected inefficiency, computed from the SAME filtered commits the rest of the
@@ -1334,7 +1346,9 @@ function renderInsights(){
   if(head) head.style.display = show ? "" : "none";
   if(!show){ host.innerHTML = ""; return; }
   const lead = items.slice(0, INSIGHTS_VISIBLE), rest = items.slice(INSIGHTS_VISIBLE);
-  let html = `<div class="insightnote">Patterns in the ${items.some(i=>i.trend)?"selected range, with the trend between its earlier and later half":"selected range"}. Narrow the filters above to check a period on its own.</div>`;
+  const t = (items.find(i => i.trend) || {}).trend;
+  let html = `<div class="insightnote">Patterns in the selected range. Narrow the filters above to check a period on its own.</div>`;
+  if(t) html += `<div class="insightnote">Each trend compares the <b>earlier half</b> of this range, ${esc(trendSpan(t,"earlier"))}, with the <b>later half</b>, ${esc(trendSpan(t,"later"))} \u2014 split so each half holds the same number of turns.</div>`;
   html += lead.map(insightCard).join("");
   if(rest.length) html += `<details class="insightmore"><summary>${rest.length} more insight${rest.length===1?"":"s"}</summary>${rest.map(insightCard).join("")}</details>`;
   host.innerHTML = html;
