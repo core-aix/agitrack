@@ -132,14 +132,22 @@ def test_short_session():
 
 
 class FakeCommitRepo:
-    def __init__(self):
+    def __init__(self, untracked=()):
         self.message = ""
+        self._untracked = list(untracked)
+        self.staged: list[str] = []
 
     def add_tracked(self):
         pass
 
     def has_staged_changes(self):
         return True
+
+    def untracked_entries(self):
+        return list(self._untracked)
+
+    def stage_paths(self, paths):
+        self.staged.extend(paths)
 
     def commit(self, message: str):
         self.message = message
@@ -1098,6 +1106,185 @@ def test_copy_offer_offers_user_commit_for_edits_on_switch(tmp_path):
     runner._offer_copy_unstaged_to_base(context="switch")
 
     assert events == ["user-commit", "copy"]  # both shown, commit prompt first
+
+
+def _awaiting_commit_runner(dirty=True):
+    # AUTO-commit, --no-worktree: the agent edits this very tree, so its uncommitted work looks
+    # exactly like the user's to a plain `git status`.
+    runner = make_runner()
+    runner._manual_commits = False
+    runner.worktree = None
+    runner.actions = types.SimpleNamespace(has_pre_agent_user_changes=lambda: dirty)
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda *a, **k: None
+    return runner
+
+
+def test_no_user_commit_offer_while_a_turn_awaits_its_commit():
+    # The window the agent finishing and aGiTrack committing: the dirty tree holds the AGENT's
+    # edits. aGiTrack must not offer to commit (or stage) them as the user's own work.
+    runner = _awaiting_commit_runner()
+    runner.turn_awaiting_commit = True
+    asked: list = []
+    runner._create_user_commit_popup = lambda *a, **k: asked.append("user-commit") or True
+
+    warn = runner._offer_pre_agent_user_commit()
+
+    assert asked == [], "aGiTrack offered to commit the agent's own uncommitted turn"
+    assert warn is False  # and no "your edits will ride along" warning either
+
+
+def test_user_commit_offer_returns_once_the_turn_is_reconciled():
+    # Once a parse result is consumed the turn is committed (or concluded with nothing to commit),
+    # so any remaining dirt really is the user's — the offer must come back.
+    runner = _awaiting_commit_runner()
+    runner.turn_awaiting_commit = False
+    asked: list = []
+    runner._create_user_commit_popup = lambda *a, **k: asked.append("user-commit") or True
+
+    runner._offer_pre_agent_user_commit()
+
+    assert asked == ["user-commit"]
+
+
+def test_consuming_a_parse_result_clears_turn_awaiting_commit(monkeypatch):
+    # The flag is cleared when a parse RESULT is consumed (committed True or False) — not when the
+    # agent merely goes quiet, which is what `agent_in_flight`'s idle timer does.
+    for outcome in (True, False):
+        runner = _awaiting_commit_runner()
+        runner.turn_awaiting_commit = True
+        monkeypatch.setattr(
+            "agitrack.proxy.runner.CommitEngine",
+            lambda *a, **k: types.SimpleNamespace(finish_parse_if_ready=lambda **kw: (outcome, [])),
+        )
+        runner._integrate_turn_or_conflict = lambda *a, **k: "ok"
+        runner._finish_agent_parse_if_ready(quiet=True, integrate=False)
+        assert runner.turn_awaiting_commit is False, f"not cleared for committed={outcome}"
+
+
+def test_deferred_parse_keeps_turn_awaiting_commit(monkeypatch):
+    # A deferred parse (None: worker still running, no result yet) leaves the turn unreconciled,
+    # so the suppression must stay in force.
+    runner = _awaiting_commit_runner()
+    runner.turn_awaiting_commit = True
+    monkeypatch.setattr(
+        "agitrack.proxy.runner.CommitEngine",
+        lambda *a, **k: types.SimpleNamespace(finish_parse_if_ready=lambda **kw: (None, [])),
+    )
+
+    runner._finish_agent_parse_if_ready(quiet=True, integrate=False)
+
+    assert runner.turn_awaiting_commit is True
+
+
+def test_idle_agent_alone_does_not_clear_turn_awaiting_commit():
+    # `agent_in_flight` drops on an idle timer; that must NOT be read as "the turn is committed",
+    # which is exactly the hole this guard closes.
+    runner = _awaiting_commit_runner()
+    runner.turn_awaiting_commit = True
+    runner.agent_in_flight = True
+    runner.last_child_output = time.monotonic() - runner.CHILD_IDLE_SECONDS - 1
+
+    runner._clear_agent_in_flight_if_idle()
+
+    assert runner.agent_in_flight is False  # the timer did its job...
+    assert runner.turn_awaiting_commit is True  # ...but the turn is still awaiting its commit
+
+
+def _stage_untracked_fn(runner, fake_repo, monkeypatch):
+    """Capture the stage_untracked_fn the agent-commit path builds, without running a real commit."""
+    captured: dict = {}
+    monkeypatch.setattr(
+        "agitrack.proxy.runner.CommitEngine",
+        lambda *a, **k: types.SimpleNamespace(
+            commit_turns=lambda **kw: captured.setdefault("fn", kw["stage_untracked_fn"]) and True
+        ),
+    )
+    runner._create_agent_commit_from_turns_popup(
+        turns=[object()], backend="claude", backend_session_id="s", model="m", quiet=True, prompt_untracked=True
+    )
+    return captured["fn"]
+
+
+def test_agent_commit_never_prompts_and_stages_only_what_the_turn_created(monkeypatch):
+    # --no-worktree: the agent edits the main tree, where the user's own untracked files also live.
+    # The commit must stage the turn's new files, leave the user's alone, and NEVER raise a modal —
+    # this runs between the agent finishing and the commit landing.
+    runner = _awaiting_commit_runner()
+    runner._debug = lambda *a, **k: None
+    runner.repo = types.SimpleNamespace(untracked_entries=lambda: ["user_scratch.txt"])
+    runner._begin_agent_turn()  # snapshot: user_scratch.txt predates the turn
+    assert set(runner.untracked_before_turn) == {"user_scratch.txt"}
+
+    runner._review_untracked_popup = lambda **k: pytest.fail("must not prompt for staging")
+    runner._prompt_popup = lambda *a, **k: pytest.fail("must not prompt for staging")
+
+    fake = FakeCommitRepo(untracked=["user_scratch.txt", "agent_new.py", "agent_other.py"])
+    stage = _stage_untracked_fn(runner, fake, monkeypatch)
+    stage(fake, types.SimpleNamespace(declined_untracked=lambda: []))
+
+    assert fake.staged == ["agent_new.py", "agent_other.py"]  # the user's scratch file is untouched
+
+
+def test_agent_commit_still_honors_intentionally_declined_files(monkeypatch):
+    # A file the user explicitly declined stays unstaged even though the turn created it.
+    runner = _awaiting_commit_runner()
+    runner._debug = lambda *a, **k: None
+    runner.repo = types.SimpleNamespace(untracked_entries=lambda: [])
+    runner._begin_agent_turn()
+
+    fake = FakeCommitRepo(untracked=["agent_new.py", "secrets.env"])
+    stage = _stage_untracked_fn(runner, fake, monkeypatch)
+    stage(fake, types.SimpleNamespace(declined_untracked=lambda: ["secrets.env"]))
+
+    assert fake.staged == ["agent_new.py"]
+
+
+def test_begin_agent_turn_survives_a_failing_untracked_snapshot(monkeypatch):
+    # If the snapshot can't be read we fall back to the worktree rule (stage the turn's files) —
+    # never to a prompt, and never to a crash on the prompt-submit path.
+    runner = _awaiting_commit_runner()
+    runner._debug = lambda *a, **k: None
+
+    def _boom():
+        raise OSError("git unavailable")
+
+    runner.repo = types.SimpleNamespace(untracked_entries=_boom)
+
+    runner._begin_agent_turn()
+
+    assert runner.untracked_before_turn == frozenset()
+    assert runner.turn_awaiting_commit is True and runner.agent_in_flight is True
+
+
+def test_forwarding_a_prompt_marks_the_turn_as_awaiting_its_commit():
+    # The guard is only correct if the flag is actually raised when a turn starts.
+    runner = make_runner()
+    runner.master_fd = 1
+    runner.pending_forwarded = [b"hi\r"]
+    runner.pending_prompt_text = "hi"
+    runner._record_user_prompt = lambda text: None
+    runner._integrate_committed_turn_before_new_turn = lambda: None
+    runner._ensure_turn_branch = lambda: None
+    runner._clear_message = lambda: None
+    runner._set_session_notice = lambda *a, **k: None
+    runner._session_label = lambda: "s"
+    runner.active.process.master_fd = 1
+    runner.active.process.write = lambda data: None
+    assert runner.turn_awaiting_commit is False
+
+    runner._forward_pending_prompt()
+
+    assert runner.turn_awaiting_commit is True and runner.agent_in_flight is True
+
+
+def test_manual_mode_still_never_offers_a_pre_agent_user_commit():
+    runner = _awaiting_commit_runner()
+    runner._manual_commits = True
+    runner.turn_awaiting_commit = False
+    runner._create_user_commit_popup = lambda *a, **k: pytest.fail("manual mode must never offer")
+
+    assert runner._offer_pre_agent_user_commit() is False
 
 
 def test_turn_copy_offer_defers_user_commit_prompt(tmp_path):
@@ -6811,7 +6998,11 @@ def _startup_runner():
         _names={},
         session_name_for=lambda sid: runner.root._names.get(sid),
         name_session=lambda sid, name: runner.root._names.__setitem__(sid, name),
+        # The real AgitrackState also carries the pending-name record (a name chosen before the
+        # backend conversation existed to key it against); model it so the fake matches the API.
+        pending_session_name=None,
     )
+    runner.root.remember_pending_session_name = lambda name: setattr(runner.root, "pending_session_name", name)
     return runner
 
 
@@ -9165,6 +9356,152 @@ def test_no_worktree_mode_keeps_newer_base_session_over_older_worktree(tmp_path)
     runner._setup_base_merge_only_session()
 
     assert runner.state.backend_session_id == "sess-recent-base"  # not demoted to an older session
+
+
+def _noworktree_runner(tmp_path):
+    runner = make_runner(state=AgitrackState(tmp_path))
+    runner._use_worktrees = False
+    runner._set_message = lambda *a, **k: None
+    runner._render = lambda *a, **k: None
+    runner._worktrees = lambda: types.SimpleNamespace(list=lambda: [], remove=lambda *a, **k: None)
+    runner._newest_worktree_session = lambda: None
+    runner._session_updated_at = lambda sid: 0.0
+    return runner
+
+
+def test_no_worktree_mode_prompts_for_a_session_name_in_a_new_directory(tmp_path, monkeypatch):
+    # A fresh directory has no prior conversation to inherit a name from, so --no-worktree must ASK
+    # for one — it used to silently keep the internal "main" placeholder as the session name.
+    runner = _noworktree_runner(tmp_path)
+    asked: list = []
+    monkeypatch.setattr("builtins.input", lambda prompt="": asked.append(prompt) or "my-session")
+
+    runner._setup_base_merge_only_session()
+
+    assert asked, "the user was never prompted for a session name"
+    assert runner.name == "my-session"
+
+
+def test_no_worktree_mode_prompt_default_is_never_the_main_placeholder(tmp_path, monkeypatch):
+    # Accepting the prompt's default (empty input) must yield a real generated name, not "main".
+    runner = _noworktree_runner(tmp_path)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "")
+
+    runner._setup_base_merge_only_session()
+
+    assert runner.name != "main" and runner.name
+
+
+def test_no_worktree_mode_new_session_flag_still_prompts(tmp_path, monkeypatch):
+    # --new-session is a brand-new conversation: it must be named, not inherit or default.
+    runner = _noworktree_runner(tmp_path)
+    runner._force_new_session = True
+    monkeypatch.setattr("builtins.input", lambda prompt="": "fresh")
+
+    runner._setup_base_merge_only_session()
+
+    assert runner.name == "fresh"
+
+
+def test_no_worktree_mode_keeps_an_inherited_name_without_prompting(tmp_path, monkeypatch):
+    # Resuming a session that already has a real name (e.g. the worktree "candle" it came from)
+    # keeps that name and must NOT interrupt the user with a prompt.
+    runner = _noworktree_runner(tmp_path)
+    runner.state.backend_session_id = "sess-W"
+    runner._newest_worktree_session = lambda: ("sess-W", 1000.0)
+    runner._session_updated_at = lambda sid: 1000.0
+    runner._resolve_session_name = lambda sid: "candle"
+    monkeypatch.setattr("builtins.input", lambda prompt="": pytest.fail("should not prompt for a named session"))
+
+    runner._setup_base_merge_only_session()
+
+    assert runner.name == "candle"
+
+
+def test_no_worktree_mode_prompts_when_the_inherited_name_is_auto_generated(tmp_path, monkeypatch):
+    # An auto "session-N" name is not a real name (same rule worktree mode applies), so prompt.
+    runner = _noworktree_runner(tmp_path)
+    runner.state.backend_session_id = "sess-W"
+    runner._newest_worktree_session = lambda: ("sess-W", 1000.0)
+    runner._session_updated_at = lambda sid: 1000.0
+    runner._resolve_session_name = lambda sid: "session-3"
+    monkeypatch.setattr("builtins.input", lambda prompt="": "renamed")
+
+    runner._setup_base_merge_only_session()
+
+    assert runner.name == "renamed"
+
+
+def test_no_worktree_mode_name_prompt_falls_back_when_stdin_is_unusable(tmp_path, monkeypatch):
+    # Scripted/piped runs have no usable stdin; the prompt must fall back to the generated default
+    # rather than raising or hanging startup.
+    runner = _noworktree_runner(tmp_path)
+
+    def _no_stdin(prompt=""):
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", _no_stdin)
+
+    runner._setup_base_merge_only_session()
+
+    assert runner.name and runner.name != "main"
+
+
+def test_session_name_is_persisted_at_creation_not_on_exit(tmp_path, monkeypatch):
+    # A brand-new conversation has no backend id yet to key the name against, so the name used to
+    # be linked only later (first turn's parse, or exit). kill -9 before that lost it. It must be
+    # durable the moment the user types it.
+    runner = _noworktree_runner(tmp_path)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "orchid")
+
+    runner._setup_base_merge_only_session()  # no exit hooks run — as if killed right after
+
+    assert runner.name == "orchid"
+    assert AgitrackState(tmp_path).pending_session_name == "orchid"  # already on disk
+
+
+def test_pending_session_name_is_recovered_and_linked_on_the_next_run(tmp_path, monkeypatch):
+    # Next start: the backend conversation now exists. The name chosen last run is adopted for it
+    # (no re-prompt), keyed to the id, and the pending record cleared.
+    AgitrackState(tmp_path).remember_pending_session_name("orchid")
+    runner = _noworktree_runner(tmp_path)
+    runner._persist_session_name = lambda sid: None  # isolate: the real one writes to base_repo
+    runner.state.backend_session_id = "sess-backend"
+    runner._newest_worktree_session = lambda: None
+    runner._session_updated_at = lambda sid: 1.0
+    runner._resolve_session_name = lambda sid: None  # nothing keyed to the id yet
+    monkeypatch.setattr("builtins.input", lambda prompt="": pytest.fail("must not re-prompt"))
+
+    runner._setup_base_merge_only_session()
+
+    assert runner.name == "orchid"
+    state = AgitrackState(tmp_path)
+    assert state.session_name_for("sess-backend") == "orchid"  # now linked to the conversation
+    assert state.pending_session_name is None  # and no longer pending
+
+
+def test_new_session_flag_does_not_adopt_a_stale_pending_name(tmp_path, monkeypatch):
+    # --new-session is a brand-new conversation; it must ask, not inherit a leftover pending name.
+    AgitrackState(tmp_path).remember_pending_session_name("orchid")
+    runner = _noworktree_runner(tmp_path)
+    runner._force_new_session = True
+    monkeypatch.setattr("builtins.input", lambda prompt="": "fresh")
+
+    runner._setup_base_merge_only_session()
+
+    assert runner.name == "fresh"
+
+
+def test_worktree_startup_also_persists_a_new_name_immediately(tmp_path, monkeypatch):
+    # Same guarantee on the worktree path, whose naming goes through _resolve_startup_session_name.
+    runner = make_runner(state=AgitrackState(tmp_path))
+    runner._worktrees = lambda: types.SimpleNamespace(list=lambda: [], remove=lambda *a, **k: None)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "willow")
+
+    name = runner._resolve_startup_session_name(runner.state, None, None)  # no conversation id yet
+
+    assert name == "willow"
+    assert AgitrackState(tmp_path).pending_session_name == "willow"
 
 
 def test_worktree_sessions_is_memoized_to_avoid_repeated_slow_listing(tmp_path):
