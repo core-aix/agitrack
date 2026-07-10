@@ -157,3 +157,183 @@ def test_non_ai_and_tokenless_commits_are_excluded():
     for stat in user:
         stat.tokens = {}
     assert build_insights(user) == []
+
+
+# --------------------------------------------------------------------------- scoping & trend
+
+
+def test_insights_are_scoped_to_the_stats_passed_in():
+    # The caller narrows the commits (the dashboard's filter); the insights must reflect only
+    # those. A bad early period and a clean late one must not be judged together.
+    bad = [_turn(i, prompt="still fails, try again") for i in range(30)]
+    good = [_turn(100 + i, prompt=f"implement feature {i} with tests") for i in range(30)]
+
+    assert "correction-loops" in _by_key(build_insights(bad))
+    assert "correction-loops" not in _by_key(build_insights(good))  # same repo, later slice: clean
+
+
+def test_trend_reports_improvement_between_the_windows_halves():
+    # Corrections dominate the first half and vanish in the second: the card must say "better".
+    turns = [_turn(i, prompt="still broken, fix it again") for i in range(20)]
+    turns += [_turn(100 + i, prompt=f"add feature {i} and its test") for i in range(20)]
+    insight = _by_key(build_insights(turns))["correction-loops"]
+    trend = insight["trend"]
+    assert trend["direction"] == "better"
+    assert trend["change"] < 0  # lower is better, so a fall is negative
+    assert trend["later"] < trend["earlier"]
+
+
+def test_trend_reports_regression_when_a_habit_worsens():
+    turns = [_turn(i, prompt=f"add feature {i}") for i in range(20)]
+    turns += [_turn(100 + i, prompt="no, that is wrong, redo it") for i in range(20)]
+    trend = _by_key(build_insights(turns))["correction-loops"]["trend"]
+    assert trend["direction"] == "worse" and trend["change"] > 0
+
+
+def test_steady_metric_is_not_reported_as_a_change():
+    # A small wobble inside the noise band must read "steady", not a false win.
+    prompts = ["still fails again" if i % 4 == 0 else f"work {i}" for i in range(40)]
+    trend = _by_key(build_insights([_turn(i, prompt=p) for i, p in enumerate(prompts)]))["correction-loops"]["trend"]
+    assert trend["direction"] == "steady"
+
+
+def test_a_habit_that_stops_is_surfaced_as_an_improved_card():
+    # Fires in the earlier half, gone in the later half, and — diluted across the whole window —
+    # below the threshold overall. It must appear as a "good" win rather than silently vanishing.
+    turns = [_turn(i, prompt="still doesn't work, again") for i in range(8)]
+    turns += [_turn(100 + i, prompt=f"implement step {i} carefully") for i in range(70)]
+    insights = _by_key(build_insights(turns))
+    win = insights.get("correction-loops-resolved")
+    assert win is not None
+    assert win["severity"] == "good"
+    assert win["trend"]["direction"] == "better"
+    assert "correction-loops" not in insights  # not also reported as a live problem
+
+
+def test_no_trend_when_a_half_is_too_thin():
+    # At the MIN_TURNS floor each half is 6 turns — below MIN_HALF_TURNS, so findings are still
+    # reported but no direction is claimed from six turns a side.
+    turns = [_turn(i, prompt="still fails, again") for i in range(MIN_TURNS)]
+    insights = build_insights(turns)
+    assert insights, "expected findings even without a trend"
+    for insight in insights:
+        assert "trend" not in insight
+
+
+# --------------------------------------------------------------------------- new categories
+
+
+def _paths(turns, mapping):
+    return {stat.sha: set(mapping(i)) for i, stat in enumerate(turns)}
+
+
+def test_verification_gap_detected_when_code_ships_without_tests():
+    turns = [_turn(i, prompt=f"change module {i}") for i in range(20)]
+    # Every turn edits source; only the last two also edit a test.
+    sha_paths = _paths(turns, lambda i: ["src/app.py"] + (["tests/test_app.py"] if i >= 18 else []))
+    insight = _by_key(build_insights(turns, sha_paths=sha_paths)).get("verification-gap")
+    assert insight is not None
+    assert "changed no test file" in insight["evidence"][0]
+
+
+def test_verification_gap_silent_when_tests_accompany_code():
+    turns = [_turn(i, prompt=f"change module {i}") for i in range(20)]
+    sha_paths = _paths(turns, lambda i: ["src/app.py", "tests/test_app.py"])
+    assert "verification-gap" not in _by_key(build_insights(turns, sha_paths=sha_paths))
+
+
+def test_verification_gap_silent_in_a_repo_with_no_tests_at_all():
+    # Nothing to say about test discipline in a repo that has no tests in this window.
+    turns = [_turn(i, prompt=f"change module {i}") for i in range(20)]
+    sha_paths = _paths(turns, lambda i: ["src/app.py"])
+    assert "verification-gap" not in _by_key(build_insights(turns, sha_paths=sha_paths))
+
+
+def test_verification_gap_ignores_docs_only_turns():
+    # A README edit with no test is not a verification gap; only code turns count.
+    turns = [_turn(i, prompt=f"doc {i}") for i in range(20)]
+    sha_paths = _paths(turns, lambda i: ["README.md"] + (["tests/test_app.py"] if i == 0 else []))
+    assert "verification-gap" not in _by_key(build_insights(turns, sha_paths=sha_paths))
+
+
+def test_wide_turns_detected():
+    turns = [_turn(i, prompt=f"work {i}") for i in range(20)]
+    sha_paths = _paths(turns, lambda i: [f"f{i}_{n}.py" for n in range(12 if i % 2 == 0 else 2)])
+    insight = _by_key(build_insights(turns, sha_paths=sha_paths)).get("wide-turns")
+    assert insight is not None
+    assert "more than 8 files" in insight["evidence"][0]
+
+
+def test_narrow_turns_stay_silent():
+    turns = [_turn(i, prompt=f"work {i}") for i in range(20)]
+    sha_paths = _paths(turns, lambda i: [f"f{i}.py", f"tests/test_f{i}.py"])
+    assert "wide-turns" not in _by_key(build_insights(turns, sha_paths=sha_paths))
+
+
+def _timed(index, minutes, **kw):
+    stat = _turn(index, **kw)
+    stat.started_at = "2026-01-01T00:00:00Z"
+    total = minutes * 60
+    stat.ended_at = f"2026-01-01T{total // 3600:02d}:{(total % 3600) // 60:02d}:00Z"
+    return stat
+
+
+def test_slow_turns_detected():
+    turns = [_timed(i, 45 if i % 3 == 0 else 5, prompt=f"work {i}") for i in range(20)]
+    insight = _by_key(build_insights(turns)).get("slow-turns")
+    assert insight is not None
+    assert "over 30 minutes" in insight["evidence"][0]
+
+
+def test_fast_turns_stay_silent():
+    turns = [_timed(i, 5, prompt=f"work {i}") for i in range(20)]
+    assert "slow-turns" not in _by_key(build_insights(turns))
+
+
+def test_turns_without_timestamps_yield_no_duration_category():
+    turns = [_turn(i, prompt=f"work {i}") for i in range(20)]  # no started_at/ended_at
+    assert "slow-turns" not in _by_key(build_insights(turns))
+
+
+def test_implausible_turn_durations_are_dropped_not_reported():
+    # A resumed conversation stamps its whole span on a commit, producing multi-day "turns".
+    # Those are metadata artifacts: they must not create a slow-turns finding on their own,
+    # nor appear in the evidence (a card claiming a 266-hour turn discredits the whole page).
+    from agitrack.metrics.insights import _duration_seconds
+
+    fast = [_timed(i, 5, prompt=f"work {i}") for i in range(20)]
+    artifact = _turn(999, prompt="resumed conversation")
+    artifact.started_at, artifact.ended_at = "2026-01-01T00:00:00Z", "2026-01-12T00:00:00Z"  # 264h
+    assert _duration_seconds(artifact) is None
+
+    insights = _by_key(build_insights([*fast, artifact]))
+    assert "slow-turns" not in insights  # 20 fast turns + 1 artifact is not a slow-turn problem
+
+
+def test_test_path_detection():
+    from agitrack.metrics.insights import _is_code_path, _is_test_path
+
+    for path in ("tests/test_app.py", "src/app_test.go", "web/app.spec.ts", "__tests__/x.js", "test_x.py"):
+        assert _is_test_path(path), path
+    for path in ("src/app.py", "README.md", "protest/main.py"):
+        assert not _is_test_path(path), path
+    assert _is_code_path("src/app.py") and not _is_code_path("tests/test_app.py")
+    assert not _is_code_path("README.md")
+
+
+def test_context_from_browser_restricts_to_the_given_stats():
+    import types
+
+    from agitrack.metrics.insights import context_from_browser
+
+    change = lambda sha, ts: types.SimpleNamespace(sha=sha, timestamp=ts, insertions=3, deletions=1)  # noqa: E731
+    browser = types.SimpleNamespace(
+        index={"a.py": types.SimpleNamespace(changes=[change("keep", 10), change("drop", 20)])}
+    )
+    kept = _turn(0)
+    kept.sha = "keep"
+
+    files, sha_paths = context_from_browser(browser, [kept])
+
+    assert files == {"a.py": [(10, 3, 1)]}
+    assert sha_paths == {"keep": {"a.py"}}

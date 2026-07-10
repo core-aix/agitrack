@@ -673,6 +673,16 @@ body.booting .wrap>*:not(header):not(.booting){display:none}
 .insight .isuggest{font-size:13px;color:var(--phosphor);border-top:1px dashed var(--line);
   padding-top:8px;margin-top:2px}
 .insightnote{font-size:12px;color:var(--fg-dim);margin:0 0 8px}
+.insight.good{border-left-color:var(--phosphor)}
+.insight.good .isev{color:var(--phosphor)}
+/* Trend chip: the same metric measured on the earlier vs the later half of the window,
+   so a habit that is getting better says so. Lower is always better. */
+.itrend{font-size:11px;border:1px solid var(--line);border-radius:4px;padding:1px 6px;color:var(--fg-dim)}
+.itrend.better{color:var(--phosphor);border-color:var(--phosphor-dim)}
+.itrend.worse{color:var(--red);border-color:var(--red)}
+.insightmore{margin-top:4px}
+.insightmore summary{cursor:pointer;color:var(--fg-dim);font-size:12px;padding:6px 0}
+.insightmore summary:hover{color:var(--phosphor)}
 .updatebanner{margin:0 0 14px;padding:9px 16px;border:1px solid var(--accent,#6be);border-radius:8px;
   background:rgba(90,150,230,.12);color:var(--accent,#9cf);font-size:13px;text-align:center}
 /* The backtrace notice is a frozen top strip — always visible, like the sticky filter bar.
@@ -1292,10 +1302,30 @@ function tokenBrief(t){
   return parts.length ? `<span class="lc">${parts.join(" ")}</span>` : "";
 }
 
+function insightCard(i){
+  const t = i.trend;
+  let chip = "";
+  if(t){
+    const arrow = t.direction==="better" ? "\u2193" : t.direction==="worse" ? "\u2191" : "\u2192";
+    const text = t.direction==="steady" ? "steady" : Math.abs(t.change*100).toFixed(0)+"% vs earlier";
+    chip = `<span class="itrend ${esc(t.direction)}" title="${esc(t.label)}: ${fmtMetric(t.earlier)} earlier in this range, ${fmtMetric(t.later)} later">${arrow} ${esc(text)}</span>`;
+  }
+  return `
+    <div class="insight ${esc(i.severity)}">
+      <div class="ihead"><span class="isev">${esc(i.severity==="good"?"improved":i.severity)}</span><b>${esc(i.title)}</b>${chip}<span class="isum">${esc(i.summary)}</span></div>
+      <ul class="ievidence">${(i.evidence||[]).map(e => `<li>${esc(e)}</li>`).join("")}</ul>
+      <div class="isuggest">&rarr; ${esc(i.suggestion)}</div>
+    </div>`;
+}
+// A metric is a share (0..1) or a growth multiple; render it the way the card's text does.
+function fmtMetric(v){ return v<=1.5 ? (v*100).toFixed(0)+"%" : v.toFixed(1)+"\u00d7"; }
+const INSIGHTS_VISIBLE = 4;
 function renderInsights(){
-  // One card per detected inefficiency: severity badge, the numbers behind the finding, and
-  // a concrete suggestion. Computed from the WHOLE history server-side (independent of the
-  // filter bar), and absent entirely on a young repo — then the section hides itself.
+  // One card per detected inefficiency, computed from the SAME filtered commits the rest of the
+  // page shows — so narrowing the range re-asks the question for that slice, and an improvement
+  // becomes visible instead of being diluted by the whole history. Each card carries the trend
+  // between the earlier and later half of the range; a habit that stopped shows as "improved".
+  // Only the worst few are expanded, the rest fold away, so the panel stays readable.
   const host = $("insights"), head = $("insights-head");
   if(!host) return;
   const items = INSIGHTS || [];
@@ -1303,13 +1333,11 @@ function renderInsights(){
   host.style.display = show ? "" : "none";
   if(head) head.style.display = show ? "" : "none";
   if(!show){ host.innerHTML = ""; return; }
-  host.innerHTML = `<div class="insightnote">Patterns from this repo's whole agent history and what they suggest. Unaffected by the filters above.</div>`
-    + items.map(i => `
-    <div class="insight ${esc(i.severity)}">
-      <div class="ihead"><span class="isev">${esc(i.severity)}</span><b>${esc(i.title)}</b><span class="isum">${esc(i.summary)}</span></div>
-      <ul class="ievidence">${(i.evidence||[]).map(e => `<li>${esc(e)}</li>`).join("")}</ul>
-      <div class="isuggest">&rarr; ${esc(i.suggestion)}</div>
-    </div>`).join("");
+  const lead = items.slice(0, INSIGHTS_VISIBLE), rest = items.slice(INSIGHTS_VISIBLE);
+  let html = `<div class="insightnote">Patterns in the ${items.some(i=>i.trend)?"selected range, with the trend between its earlier and later half":"selected range"}. Narrow the filters above to check a period on its own.</div>`;
+  html += lead.map(insightCard).join("");
+  if(rest.length) html += `<details class="insightmore"><summary>${rest.length} more insight${rest.length===1?"":"s"}</summary>${rest.map(insightCard).join("")}</details>`;
+  host.innerHTML = html;
 }
 function renderAgg(){
   renderInsights();
