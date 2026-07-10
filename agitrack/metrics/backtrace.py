@@ -499,11 +499,15 @@ def _str(query: dict[str, list[str]], key: str) -> str:
 
 def _make_handler(view: BacktraceView) -> type[http.server.BaseHTTPRequestHandler]:
     from agitrack.metrics.files import backtrace_browser
+    from agitrack.metrics.insights import build_insights, files_from_browser
     from agitrack.metrics.web import aggregates_payload, format_html, log_page
 
     banner = _banner_html(view)
-    page = format_html(view.dashboard, banner_html=banner, backtrace=True).encode("utf-8")
     browser = backtrace_browser(view.dashboard.stats, view.file_edits, directory=view.root)
+    # Whole-history efficiency insights, computed ONCE at build time (the reconstruction is
+    # static) and embedded in the page + served on /data.
+    insights = build_insights(view.dashboard.stats, files_from_browser(browser))
+    page = format_html(view.dashboard, banner_html=banner, backtrace=True, insights=insights).encode("utf-8")
 
     class _BacktraceHandler(http.server.BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802 (http.server API)
@@ -523,6 +527,7 @@ def _make_handler(view: BacktraceView) -> type[http.server.BaseHTTPRequestHandle
                         granularity=_str(query, "granularity"),
                     )
                     payload["shared_sessions"] = []
+                    payload["insights"] = insights
                     self._respond("application/json", json.dumps(payload).encode("utf-8"))
                 elif parsed.path == "/log":
                     page_data = log_page(

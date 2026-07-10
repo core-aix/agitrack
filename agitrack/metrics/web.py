@@ -85,8 +85,11 @@ def format_html(
     shared_sessions: list[dict] | None = None,
     banner_html: str = "",
     backtrace: bool = False,
+    insights: list[dict] | None = None,
 ) -> str:
-    payload = _embed_json(initial_payload(dash, shared_sessions=shared_sessions, backtrace=backtrace))
+    payload = _embed_json(
+        initial_payload(dash, shared_sessions=shared_sessions, backtrace=backtrace, insights=insights)
+    )
     repo_name = dash.repo.rstrip("/").rsplit("/", 1)[-1] or dash.repo
     # The branch is rendered client-side into the meta-line picker (from the
     # embedded payload), so there's no __BRANCH__ placeholder to substitute.
@@ -561,17 +564,26 @@ def commit_diff(repo: GitRepo, sha: str) -> dict:
     return {"sha": sha, "diff": patch, "truncated": truncated}
 
 
-def initial_payload(dash: Dashboard, *, shared_sessions: list[dict] | None = None, backtrace: bool = False) -> dict:
+def initial_payload(
+    dash: Dashboard,
+    *,
+    shared_sessions: list[dict] | None = None,
+    backtrace: bool = False,
+    insights: list[dict] | None = None,
+) -> dict:
     """What the page embeds for an instant first paint: unfiltered aggregates,
     the first log page, repo metadata, the page size, and any shared sessions.
 
     ``backtrace`` marks the payload as a historical reconstruction (``--backtrace``)
-    rather than live repo status, for any client-side affordance that keys off it."""
+    rather than live repo status, for any client-side affordance that keys off it.
+    ``insights`` (whole-history efficiency insights, never filter-scoped) render as
+    the "agent efficiency" section when non-empty."""
     return {
         "repo": dash.repo,
         "branch": dash.branch,
         "page_size": PAGE_SIZE,
         "backtrace": backtrace,
+        "insights": insights or [],
         **aggregates_payload(dash),
         "log": log_page(dash),
         "shared_sessions": shared_sessions or [],
@@ -643,6 +655,24 @@ body.booting .wrap>*:not(header):not(.booting){display:none}
 .neterror{position:fixed;top:0;left:0;right:0;z-index:40;background:#3a0f0f;color:#ffd5d5;
   border-bottom:2px solid var(--red);padding:10px 18px;font-size:13px;text-align:center;
   box-shadow:0 6px 20px rgba(0,0,0,.55);animation:rise .25s ease}
+/* Efficiency insights: one card per detected inefficiency category. The left border and
+   the small badge carry the severity; the suggestion line is the actionable part, set off
+   from the evidence by a dashed rule. Hidden entirely (with its heading) when empty. */
+.insight{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--amber);
+  border-radius:10px;padding:12px 16px;margin:0 0 10px}
+.insight.high{border-left-color:var(--red)}
+.insight.info{border-left-color:var(--fg-dim)}
+.insight .ihead{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
+.insight .isev{font-size:10px;text-transform:uppercase;letter-spacing:1px;border:1px solid var(--line);
+  border-radius:4px;padding:1px 6px;color:var(--amber)}
+.insight.high .isev{color:var(--red)}
+.insight.info .isev{color:var(--fg-dim)}
+.insight .isum{color:var(--fg-dim);font-size:13px}
+.insight .ievidence{margin:8px 0 8px 18px;font-size:13px}
+.insight .ievidence li{margin:3px 0}
+.insight .isuggest{font-size:13px;color:var(--phosphor);border-top:1px dashed var(--line);
+  padding-top:8px;margin-top:2px}
+.insightnote{font-size:12px;color:var(--fg-dim);margin:0 0 8px}
 .updatebanner{margin:0 0 14px;padding:9px 16px;border:1px solid var(--accent,#6be);border-radius:8px;
   background:rgba(90,150,230,.12);color:var(--accent,#9cf);font-size:13px;text-align:center}
 /* The backtrace notice is a frozen top strip — always visible, like the sticky filter bar.
@@ -1033,6 +1063,9 @@ __UPDATE_BANNER__
     <div class="panel" id="tokens"></div>
   </div>
 
+  <h2 class="section" id="insights-head">agent efficiency</h2>
+  <div id="insights"></div>
+
   <h2 class="section">by backend</h2>
   <div class="panel" id="by-backend"></div>
 
@@ -1093,6 +1126,7 @@ let HEAD = INIT.head||"", AGG = INIT.agg||null, LOGPAGE = INIT.log||null, OPTION
 let TS = INIT.timeseries || {t:[]};  // per-period series for the activity-over-time plot
 let SPAN = INIT.span || {from:0, to:0};  // full-history commit-date range (epoch seconds)
 let SHARED = INIT.shared_sessions || [];  // sessions shared into this repo (issue #55)
+let INSIGHTS = INIT.insights || [];  // whole-history agent-efficiency insights (not filter-scoped)
 let LOG_ENTRIES = [];  // entries of the page currently rendered (for toggleDetail)
 
 // The plottable series and which are currently shown. Each is normalised to its
@@ -1156,6 +1190,7 @@ async function loadAgg(){
   try{ const r = await fetch("data?"+qs(), {cache:"no-store"}); if(r.ok){
     const d = await r.json(); HEAD=d.head; AGG=d.agg; OPTIONS=d.options; GENERATED=d.generated_at;
     TS = d.timeseries || {t:[]}; if(d.span) SPAN = d.span; if(d.shared_sessions) SHARED = d.shared_sessions;
+    if(d.insights !== undefined) INSIGHTS = d.insights;
     // The server reports which branch it actually served (e.g. it fell back to the
     // default if the requested one vanished); reflect that in the state + header.
     if(d.branch !== undefined){ state.branch = d.branch; setBranchLabel(d.branch); }
@@ -1257,7 +1292,27 @@ function tokenBrief(t){
   return parts.length ? `<span class="lc">${parts.join(" ")}</span>` : "";
 }
 
+function renderInsights(){
+  // One card per detected inefficiency: severity badge, the numbers behind the finding, and
+  // a concrete suggestion. Computed from the WHOLE history server-side (independent of the
+  // filter bar), and absent entirely on a young repo — then the section hides itself.
+  const host = $("insights"), head = $("insights-head");
+  if(!host) return;
+  const items = INSIGHTS || [];
+  const show = items.length > 0;
+  host.style.display = show ? "" : "none";
+  if(head) head.style.display = show ? "" : "none";
+  if(!show){ host.innerHTML = ""; return; }
+  host.innerHTML = `<div class="insightnote">Patterns from this repo's whole agent history and what they suggest. Unaffected by the filters above.</div>`
+    + items.map(i => `
+    <div class="insight ${esc(i.severity)}">
+      <div class="ihead"><span class="isev">${esc(i.severity)}</span><b>${esc(i.title)}</b><span class="isum">${esc(i.summary)}</span></div>
+      <ul class="ievidence">${(i.evidence||[]).map(e => `<li>${esc(e)}</li>`).join("")}</ul>
+      <div class="isuggest">&rarr; ${esc(i.suggestion)}</div>
+    </div>`).join("");
+}
 function renderAgg(){
+  renderInsights();
   const total = AGG.total, tracked = AGG.tracked;
   const ai = {ins:AGG.ai_lines[0], del:AGG.ai_lines[1]}; ai.total = ai.ins+ai.del;
   const nt = {ins:AGG.nontracked_lines[0], del:AGG.nontracked_lines[1]}; nt.total = nt.ins+nt.del;
