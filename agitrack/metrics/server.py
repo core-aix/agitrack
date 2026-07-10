@@ -20,6 +20,7 @@ from typing import Any
 from agitrack.git import GitRepo
 from agitrack.metrics.collect import Dashboard, build_dashboard
 from agitrack.metrics.files import FileBrowser, git_browser
+from agitrack.metrics.insights import build_insights, files_from_browser
 from agitrack.metrics.github import cached_logins
 from agitrack.metrics.web import aggregates_payload, commit_diff, log_page, shared_sessions_for, shell_html
 
@@ -43,6 +44,9 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
     # Per-server cache of the file browser, keyed by (ref, head sha): building it scans
     # `git log --numstat`, so it is rebuilt only when the branch's tip moves, not per poll.
     _browser_cache: dict[tuple[str, str], FileBrowser] = {}
+    # Same idea for the efficiency insights: derived from the stats + browser index, so
+    # they only need recomputing when the tip moves (and cost ~ms even then).
+    _insights_cache: dict[tuple[str, str], list[dict]] = {}
 
     def do_GET(self) -> None:  # noqa: N802 (http.server API)
         try:
@@ -72,6 +76,7 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
                     granularity=_str(query, "granularity"),
                 )
                 payload["shared_sessions"] = shared_sessions_for(self.repo)
+                payload["insights"] = self._insights(ref)
                 self._respond("application/json", self._json(payload))
             elif parsed.path == "/log":
                 page = log_page(
@@ -139,6 +144,20 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
         if hit is None:
             hit = git_browser(self.repo, dash.stats, ref)
             cache.clear()  # keep only the latest tip's browser — bounded memory
+            cache[key] = hit
+        return hit
+
+    def _insights(self, ref: str = "HEAD") -> list[dict]:
+        # Whole-history efficiency insights, cached by the branch tip like the file
+        # browser (whose cached per-file index feeds the rework category for free).
+        dash = self._dashboard(ref)
+        head = dash.stats[-1].sha if dash.stats else ""
+        key = (ref, head)
+        cache = type(self)._insights_cache
+        hit = cache.get(key)
+        if hit is None:
+            hit = build_insights(dash.stats, files_from_browser(self._browser(ref)))
+            cache.clear()  # keep only the latest tip's insights — bounded memory
             cache[key] = hit
         return hit
 
