@@ -267,6 +267,7 @@ agitrack -d text            # one-shot plain-text report instead (pipe it, paste
 
 - **aGiTrack-tracked AI vs non-tracked lines** — what the agents wrote (tracked by aGiTrack) versus everything else; it never claims a human wrote what the model did.
 - **Filter live** — narrow the whole dashboard to one committer (merged to their GitHub ID), a backend, a model, or a time range.
+- **Agent efficiency** — an [efficiency insights](#agent-efficiency-insights) panel that mines your history for *how* the agents are being driven (correction loops, rework hotspots, context cost) and suggests what to change.
 - **Tokens, efficiency, and loop detection**, plus a **Log** section with two tabs: **commits** (click any commit to read its full message and show its file diff) and **files** (a collapsible folder tree — pick a file to see its whole change history and the conversation/tokens behind each change). All diffs are served from your local clone — no GitHub needed.
 
 See [Repository dashboard](#repository-dashboard) below for the full breakdown.
@@ -434,6 +435,25 @@ The [Dashboard](#dashboard) section above covers how to run it (`-d`, and `-d te
 The web page (styled like the [project page](https://github.com/core-aix/agitrack/tree/main/docs)) lets you **filter live** — narrow the whole dashboard to one committer or view the entire team, slice by backend or model, or restrict to a **time range** (presets or a custom from/to). The server recomputes the metrics for each filter, and the **commit log is paginated** (fetched a page at a time), so the browser never holds the whole history — memory stays bounded no matter how big the repo is. Each log line shows per-line token metrics; clicking a line opens the full commit message **rendered as Markdown** and a **"show file diff"** button that renders that commit's diff inline — computed from your **local clone**, so the whole dashboard works with no GitHub (a "view on GitHub" link is offered only when a remote is configured). Merge/cover commits show their first-parent diff (the AI work they account for). A squash expands into its original commits (each itself expandable). Agent commits also record when the AI-driven conversation started and ended (`agent_started_at` / `agent_ended_at` in the metadata block).
 
 The dashboard is read-only in either form (served or `-d text`): it never commits, never prompts, and skips the privacy acknowledgment.
+
+### Agent efficiency insights
+
+The dashboard's **agent efficiency** section answers a different question from the rest of the page. The metrics above measure *what the agents produced*; this one measures *how they were driven* — and where that wasted your time and tokens. It deliberately ignores volume: changing three lines can be far harder than changing three hundred, so "lines written" says nothing about whether a session went well.
+
+Each category is derived from the aGiTrack metadata already in your commits (per-turn prompts, token counts, session ids, timestamps) plus the per-file change timeline the file browser builds. It is a single in-memory pass over data the dashboard already holds — no extra `git` calls, no LLM, a few milliseconds on a repo with hundreds of agent turns — so the panel appears with the rest of the page. It is part of the served page in both the live dashboard and [`--backtrace`](#backtrace--show-and-commit-a-history-you-didnt-track-from-day-one); the one-shot `-d text` report prints the raw metrics only.
+
+| Category | What it looks for | What it suggests |
+| --- | --- | --- |
+| **Correction loops** | Follow-up prompts that react to the previous turn being wrong (*"still fails"*, *"no, …"*, *"you missed …"*), counted per session, with the output tokens spent re-doing the work and the longest consecutive chain. | Front-load the first prompt (files, acceptance criteria, how it will be checked) and make the agent verify before reporting done. |
+| **Rework hotspots** | Files the agent keeps **returning to within the hour**. Deliberately *not* the delete/insert ratio: replacing one line is always one insertion plus one deletion, so that ratio flags ordinary edits as churn. Rapid return visits are what "we didn't get it right the first time" actually looks like. | State the full requirement in one prompt (or ask for a plan first), and pin the behaviour with a test so the next turn builds on the last. |
+| **Long-session context cost** | Within sessions of 6+ turns, how much more context each late turn re-reads compared with the early ones, plus how top-heavy the total context reading is. | Start a fresh session per task; push exploration into sub-agents so findings, not searches, enter the main context. |
+| **Fragmented sessions** | The opposite failure: most sessions ending after one or two turns, so the repo context is rebuilt from cold for nearly every request. | Resume the previous session for related follow-ups; keep fresh sessions for genuinely new tasks. |
+| **Repeated asks** | The same request typed from scratch three or more times across sessions. | Capture it as a skill, a `CLAUDE.md` instruction, or a script — one short command instead of re-explaining it. |
+| **Heavy no-change turns** | Turns that burn 10k+ output tokens without touching a single file — fine occasionally, a pattern when it isn't. | Run exploration through sub-agents or a separate session; ask for the short answer first, detail on demand. |
+
+Every finding carries the **numbers behind it** (counts, percentages, token totals, the files or prompts involved) rather than a bare verdict, and is ranked *high → medium → info*.
+
+**When it stays quiet.** Insights are only shown once there is enough history to judge: fewer than **12** token-bearing agent turns and the whole section hides itself, so a new repo sees nothing rather than advice drawn from three commits. Beyond that gate each category has its own evidence floor (for example, a correction loop needs at least 5 corrective turns *and* at least 12% of all follow-ups), and a category that isn't triggered simply doesn't appear. A repo with healthy habits can legitimately show no insights at all. The panel reflects your **whole history** and is not affected by the dashboard's committer/backend/model/time filters.
 
 ### Self-update
 
