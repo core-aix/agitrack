@@ -311,52 +311,38 @@ Added --version using the package metadata; prints and exits.
       </div>
       <h2>Not how much it wrote. How well you drove it.</h2>
       <p>The dashboard's <strong>agent efficiency</strong> panel reads your history for the habits that quietly cost
-      you time and tokens, and tells you what to change. It ignores volume on purpose: changing three lines can be
-      far harder than changing three hundred, so lines written says nothing about whether a session went well.</p>
+      you time and tokens, and tells you what to change. Volume is beside the point: three hard lines can beat three
+      hundred easy ones.</p>
       <div class="branches two">
-        <div class="branch" data-ref="from: prompts">
+        <div class="branch" data-ref="prompts">
           <h3>Correction loops</h3>
-          <p>Follow-up turns that re-do the one before (<em>"still fails"</em>, <em>"no, …"</em>), with the tokens
-          spent on the re-work. Front-load the ask and make the agent <strong>verify before it reports done</strong>.</p>
+          <p>Turns spent re-doing the one before (<em>"still fails"</em>, <em>"no, …"</em>), and the tokens burned on the re-work.</p>
         </div>
-        <div class="branch" data-ref="from: changed paths">
+        <div class="branch" data-ref="changed paths">
           <h3>Unverified turns</h3>
-          <p>Code that shipped without a test touched alongside it — the upstream cause of the loops and the
-          hotspots. Ask for the test <strong>in the same turn</strong>, not the turn after.</p>
+          <p>Code that shipped without a test — the upstream cause of the loops and the hotspots.</p>
         </div>
-        <div class="branch" data-ref="from: file timeline">
+        <div class="branch" data-ref="file timeline">
           <h3>Rework hotspots</h3>
-          <p>Files the agent keeps coming back to <strong>within the hour</strong> — the shape of a requirement that
-          arrived one correction at a time. State it once, and pin it with a test.</p>
+          <p>Files the agent keeps coming back to within the hour, one correction at a time.</p>
         </div>
-        <div class="branch" data-ref="from: tokens + sessions">
+        <div class="branch" data-ref="tokens + sessions">
           <h3>Context cost</h3>
-          <p>Long sessions where late turns re-read far more context than early ones — or the opposite, sessions so
-          short every request rebuilds the repo from cold.</p>
+          <p>Sessions so long each turn re-reads everything — or so short every request starts from cold.</p>
         </div>
-        <div class="branch" data-ref="from: durations">
+        <div class="branch" data-ref="durations">
           <h3>Long feedback loops</h3>
-          <p>Half-hour turns you cannot steer, and turns that bundle a dozen files into one un-reviewable commit.
-          Ask for a plan, or a first slice, before the long run.</p>
+          <p>Half-hour turns you cannot steer, and turns that bundle a dozen files into one commit.</p>
         </div>
-        <div class="branch" data-ref="from: prompts + tokens">
+        <div class="branch" data-ref="prompts + tokens">
           <h3>Repeated asks</h3>
-          <p>The same request typed from scratch again and again, and heavy turns that changed no file at all.
-          Both are automation, or a sub-agent, waiting to happen.</p>
+          <p>The same request re-typed again and again — automation waiting to happen.</p>
         </div>
       </div>
-      <p style="margin-top:18px">It follows the <strong>filter</strong>, so you can watch yourself improve. Narrow the
-      time range and the panel re-asks the question for that slice alone — judged against your whole history forever,
-      the bad old turns never leave the denominator and progress could never show. Each card also carries its own
-      trend between the earlier and later half of the range: <span class="p">&darr; 34% vs earlier half</span> when a
-      habit is fading, <span class="p">&uarr; 22%</span> when it is getting worse. Both halves are named by date and
-      turn count &mdash; the split is by turn count, not calendar time &mdash; so "earlier" is a period you can point
-      at rather than a vague baseline. A habit that drops below its threshold is promoted to a green
-      <strong>improved</strong> card, so a win is something you see, not merely the absence of a warning.</p>
-      <p style="margin-top:16px;color:var(--fg-dim);font-size:14px">Every finding shows the numbers behind it, not a
-      bare verdict. It is computed from the metadata already in your commits, in milliseconds, with no extra
-      <span class="p">git</span> calls and no model call, so it paints with the rest of the page — and it stays
-      silent on a young repo, on too narrow a slice, or on one whose habits are already healthy.</p>
+      <p style="margin-top:18px">Every card shows the numbers behind it and follows the <strong>filter</strong>, so
+      narrowing to last week scores last week — and a habit that is fading shows a green <strong>improved</strong>
+      card. It reads the metadata already in your commits, in milliseconds, and stays quiet when there is nothing
+      worth flagging.</p>
     </section>
 
     <section class="commit agent" id="backtrace">
