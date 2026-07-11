@@ -85,8 +85,11 @@ def format_html(
     shared_sessions: list[dict] | None = None,
     banner_html: str = "",
     backtrace: bool = False,
+    insights: list[dict] | None = None,
 ) -> str:
-    payload = _embed_json(initial_payload(dash, shared_sessions=shared_sessions, backtrace=backtrace))
+    payload = _embed_json(
+        initial_payload(dash, shared_sessions=shared_sessions, backtrace=backtrace, insights=insights)
+    )
     repo_name = dash.repo.rstrip("/").rsplit("/", 1)[-1] or dash.repo
     # The branch is rendered client-side into the meta-line picker (from the
     # embedded payload), so there's no __BRANCH__ placeholder to substitute.
@@ -561,17 +564,26 @@ def commit_diff(repo: GitRepo, sha: str) -> dict:
     return {"sha": sha, "diff": patch, "truncated": truncated}
 
 
-def initial_payload(dash: Dashboard, *, shared_sessions: list[dict] | None = None, backtrace: bool = False) -> dict:
+def initial_payload(
+    dash: Dashboard,
+    *,
+    shared_sessions: list[dict] | None = None,
+    backtrace: bool = False,
+    insights: list[dict] | None = None,
+) -> dict:
     """What the page embeds for an instant first paint: unfiltered aggregates,
     the first log page, repo metadata, the page size, and any shared sessions.
 
     ``backtrace`` marks the payload as a historical reconstruction (``--backtrace``)
-    rather than live repo status, for any client-side affordance that keys off it."""
+    rather than live repo status, for any client-side affordance that keys off it.
+    ``insights`` (whole-history efficiency insights, never filter-scoped) render as
+    the "agent efficiency" section when non-empty."""
     return {
         "repo": dash.repo,
         "branch": dash.branch,
         "page_size": PAGE_SIZE,
         "backtrace": backtrace,
+        "insights": insights or [],
         **aggregates_payload(dash),
         "log": log_page(dash),
         "shared_sessions": shared_sessions or [],
@@ -643,6 +655,34 @@ body.booting .wrap>*:not(header):not(.booting){display:none}
 .neterror{position:fixed;top:0;left:0;right:0;z-index:40;background:#3a0f0f;color:#ffd5d5;
   border-bottom:2px solid var(--red);padding:10px 18px;font-size:13px;text-align:center;
   box-shadow:0 6px 20px rgba(0,0,0,.55);animation:rise .25s ease}
+/* Efficiency insights: one card per detected inefficiency category. The left border and
+   the small badge carry the severity; the suggestion line is the actionable part, set off
+   from the evidence by a dashed rule. Hidden entirely (with its heading) when empty. */
+.insight{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--amber);
+  border-radius:10px;padding:12px 16px;margin:0 0 10px}
+.insight.high{border-left-color:var(--red)}
+.insight.info{border-left-color:var(--fg-dim)}
+.insight .ihead{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
+.insight .isev{font-size:10px;text-transform:uppercase;letter-spacing:1px;border:1px solid var(--line);
+  border-radius:4px;padding:1px 6px;color:var(--amber)}
+.insight.high .isev{color:var(--red)}
+.insight.info .isev{color:var(--fg-dim)}
+.insight .isum{color:var(--fg-dim);font-size:13px}
+.insight .ievidence{margin:8px 0 8px 18px;font-size:13px}
+.insight .ievidence li{margin:3px 0}
+.insight .isuggest{font-size:13px;color:var(--phosphor);border-top:1px dashed var(--line);
+  padding-top:8px;margin-top:2px}
+.insightnote{font-size:12px;color:var(--fg-dim);margin:0 0 8px}
+.insight.good{border-left-color:var(--phosphor)}
+.insight.good .isev{color:var(--phosphor)}
+/* Trend chip: the same metric measured on the earlier vs the later half of the window,
+   so a habit that is getting better says so. Lower is always better. */
+.itrend{font-size:11px;border:1px solid var(--line);border-radius:4px;padding:1px 6px;color:var(--fg-dim)}
+.itrend.better{color:var(--phosphor);border-color:var(--phosphor-dim)}
+.itrend.worse{color:var(--red);border-color:var(--red)}
+.insightmore{margin-top:4px}
+.insightmore summary{cursor:pointer;color:var(--fg-dim);font-size:12px;padding:6px 0}
+.insightmore summary:hover{color:var(--phosphor)}
 .updatebanner{margin:0 0 14px;padding:9px 16px;border:1px solid var(--accent,#6be);border-radius:8px;
   background:rgba(90,150,230,.12);color:var(--accent,#9cf);font-size:13px;text-align:center}
 /* The backtrace notice is a frozen top strip — always visible, like the sticky filter bar.
@@ -1033,6 +1073,9 @@ __UPDATE_BANNER__
     <div class="panel" id="tokens"></div>
   </div>
 
+  <h2 class="section" id="insights-head">agent efficiency</h2>
+  <div id="insights"></div>
+
   <h2 class="section">by backend</h2>
   <div class="panel" id="by-backend"></div>
 
@@ -1093,6 +1136,7 @@ let HEAD = INIT.head||"", AGG = INIT.agg||null, LOGPAGE = INIT.log||null, OPTION
 let TS = INIT.timeseries || {t:[]};  // per-period series for the activity-over-time plot
 let SPAN = INIT.span || {from:0, to:0};  // full-history commit-date range (epoch seconds)
 let SHARED = INIT.shared_sessions || [];  // sessions shared into this repo (issue #55)
+let INSIGHTS = INIT.insights || [];  // whole-history agent-efficiency insights (not filter-scoped)
 let LOG_ENTRIES = [];  // entries of the page currently rendered (for toggleDetail)
 
 // The plottable series and which are currently shown. Each is normalised to its
@@ -1156,6 +1200,7 @@ async function loadAgg(){
   try{ const r = await fetch("data?"+qs(), {cache:"no-store"}); if(r.ok){
     const d = await r.json(); HEAD=d.head; AGG=d.agg; OPTIONS=d.options; GENERATED=d.generated_at;
     TS = d.timeseries || {t:[]}; if(d.span) SPAN = d.span; if(d.shared_sessions) SHARED = d.shared_sessions;
+    if(d.insights !== undefined) INSIGHTS = d.insights;
     // The server reports which branch it actually served (e.g. it fell back to the
     // default if the requested one vanished); reflect that in the state + header.
     if(d.branch !== undefined){ state.branch = d.branch; setBranchLabel(d.branch); }
@@ -1257,7 +1302,59 @@ function tokenBrief(t){
   return parts.length ? `<span class="lc">${parts.join(" ")}</span>` : "";
 }
 
+function insightCard(i){
+  const t = i.trend;
+  let chip = "";
+  if(t){
+    const arrow = t.direction==="better" ? "\u2193" : t.direction==="worse" ? "\u2191" : "\u2192";
+    const text = t.direction==="steady" ? "steady" : Math.abs(t.change*100).toFixed(0)+"% vs earlier half";
+    // Spell the two periods out in the tooltip: a bare "vs earlier" leaves the reader guessing
+    // which turns it was measured against.
+    const tip = `${t.label}\n${fmtMetric(t.earlier)} over ${trendSpan(t,"earlier")}\n${fmtMetric(t.later)} over ${trendSpan(t,"later")}`;
+    chip = `<span class="itrend ${esc(t.direction)}" title="${esc(tip)}">${arrow} ${esc(text)}</span>`;
+  }
+  return `
+    <div class="insight ${esc(i.severity)}">
+      <div class="ihead"><span class="isev">${esc(i.severity==="good"?"improved":i.severity)}</span><b>${esc(i.title)}</b>${chip}<span class="isum">${esc(i.summary)}</span></div>
+      <ul class="ievidence">${(i.evidence||[]).map(e => `<li>${esc(e)}</li>`).join("")}</ul>
+      <div class="isuggest">&rarr; ${esc(i.suggestion)}</div>
+    </div>`;
+}
+// A metric is a share (0..1) or a growth multiple; render it the way the card's text does.
+function fmtMetric(v){ return v<=1.5 ? (v*100).toFixed(0)+"%" : v.toFixed(1)+"\u00d7"; }
+// "earlier" / "later" as a concrete period: the range is split in two by TURN COUNT, so the
+// halves hold equal numbers of turns but rarely equal spans of calendar time. Naming the dates
+// (and the turn counts) is the only way "vs earlier" means anything to the reader.
+function trendSpan(t, half){
+  const from = t[half+"_from"], to = t[half+"_to"], n = t[half+"_turns"];
+  if(!from || !to) return half;
+  const days = ymd(from)===ymd(to) ? ymd(from) : `${ymd(from)} \u2192 ${ymd(to)}`;
+  return `${days} (${fmt(n)} turn${n===1?"":"s"})`;
+}
+const INSIGHTS_VISIBLE = 4;
+function renderInsights(){
+  // One card per detected inefficiency, computed from the SAME filtered commits the rest of the
+  // page shows — so narrowing the range re-asks the question for that slice, and an improvement
+  // becomes visible instead of being diluted by the whole history. Each card carries the trend
+  // between the earlier and later half of the range; a habit that stopped shows as "improved".
+  // Only the worst few are expanded, the rest fold away, so the panel stays readable.
+  const host = $("insights"), head = $("insights-head");
+  if(!host) return;
+  const items = INSIGHTS || [];
+  const show = items.length > 0;
+  host.style.display = show ? "" : "none";
+  if(head) head.style.display = show ? "" : "none";
+  if(!show){ host.innerHTML = ""; return; }
+  const lead = items.slice(0, INSIGHTS_VISIBLE), rest = items.slice(INSIGHTS_VISIBLE);
+  const t = (items.find(i => i.trend) || {}).trend;
+  let html = `<div class="insightnote">Patterns in the selected range. Narrow the filters above to check a period on its own.</div>`;
+  if(t) html += `<div class="insightnote">Each trend compares the <b>earlier half</b> of this range, ${esc(trendSpan(t,"earlier"))}, with the <b>later half</b>, ${esc(trendSpan(t,"later"))} \u2014 split so each half holds the same number of turns.</div>`;
+  html += lead.map(insightCard).join("");
+  if(rest.length) html += `<details class="insightmore"><summary>${rest.length} more insight${rest.length===1?"":"s"}</summary>${rest.map(insightCard).join("")}</details>`;
+  host.innerHTML = html;
+}
 function renderAgg(){
+  renderInsights();
   const total = AGG.total, tracked = AGG.tracked;
   const ai = {ins:AGG.ai_lines[0], del:AGG.ai_lines[1]}; ai.total = ai.ins+ai.del;
   const nt = {ins:AGG.nontracked_lines[0], del:AGG.nontracked_lines[1]}; nt.total = nt.ins+nt.del;
