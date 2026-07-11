@@ -20,8 +20,16 @@ from typing import Any
 from agitrack.git import GitRepo
 from agitrack.metrics.collect import Dashboard, build_dashboard
 from agitrack.metrics.files import FileBrowser, git_browser
+from agitrack.metrics.insights import build_insights, context_from_browser
 from agitrack.metrics.github import cached_logins
-from agitrack.metrics.web import aggregates_payload, commit_diff, log_page, shared_sessions_for, shell_html
+from agitrack.metrics.web import (
+    _filter_stats,
+    aggregates_payload,
+    commit_diff,
+    log_page,
+    shared_sessions_for,
+    shell_html,
+)
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
@@ -43,6 +51,10 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
     # Per-server cache of the file browser, keyed by (ref, head sha): building it scans
     # `git log --numstat`, so it is rebuilt only when the branch's tip moves, not per poll.
     _browser_cache: dict[tuple[str, str], FileBrowser] = {}
+    # Efficiency insights are scoped to the CURRENT FILTER (so a narrowed time range re-asks
+    # the question for that slice), hence keyed by the filter too — not just the branch tip.
+    # Bounded: cleared whenever the tip moves, and capped while a tip is current.
+    _insights_cache: dict[tuple, list[dict]] = {}
 
     def do_GET(self) -> None:  # noqa: N802 (http.server API)
         try:
@@ -72,6 +84,7 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
                     granularity=_str(query, "granularity"),
                 )
                 payload["shared_sessions"] = shared_sessions_for(self.repo)
+                payload["insights"] = self._insights(ref, author=author, backend=backend, model=model, frm=frm, to=to)
                 self._respond("application/json", self._json(payload))
             elif parsed.path == "/log":
                 page = log_page(
@@ -139,6 +152,30 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
         if hit is None:
             hit = git_browser(self.repo, dash.stats, ref)
             cache.clear()  # keep only the latest tip's browser — bounded memory
+            cache[key] = hit
+        return hit
+
+    _INSIGHTS_CACHE_MAX = 16
+
+    def _insights(
+        self, ref: str = "HEAD", *, author: str = "", backend: str = "", model: str = "", frm: int = 0, to: int = 0
+    ) -> list[dict]:
+        # Insights for the FILTERED view: the same commits the rest of the page is showing.
+        # Cached per (tip, filter) — a poll with unchanged filters reuses the result, and a new
+        # commit invalidates every entry.
+        dash = self._dashboard(ref)
+        head = dash.stats[-1].sha if dash.stats else ""
+        key = (ref, head, author, backend, model, frm, to)
+        cache = type(self)._insights_cache
+        hit = cache.get(key)
+        if hit is None:
+            if cache and next(iter(cache))[:2] != (ref, head):
+                cache.clear()  # the tip moved: every cached slice is stale
+            elif len(cache) >= self._INSIGHTS_CACHE_MAX:
+                cache.pop(next(iter(cache)))  # bound the per-tip filter variants
+            stats = _filter_stats(dash, author=author, backend=backend, model=model, frm=frm, to=to)
+            files, sha_paths = context_from_browser(self._browser(ref), stats)
+            hit = build_insights(stats, files, sha_paths)
             cache[key] = hit
         return hit
 

@@ -499,11 +499,31 @@ def _str(query: dict[str, list[str]], key: str) -> str:
 
 def _make_handler(view: BacktraceView) -> type[http.server.BaseHTTPRequestHandler]:
     from agitrack.metrics.files import backtrace_browser
-    from agitrack.metrics.web import aggregates_payload, format_html, log_page
+    from agitrack.metrics.insights import build_insights, context_from_browser
+    from agitrack.metrics.web import _filter_stats, aggregates_payload, format_html, log_page
 
     banner = _banner_html(view)
-    page = format_html(view.dashboard, banner_html=banner, backtrace=True).encode("utf-8")
     browser = backtrace_browser(view.dashboard.stats, view.file_edits, directory=view.root)
+    insight_cache: dict[tuple, list[dict]] = {}
+
+    def insights_for(author: str, backend: str, model: str, frm: int, to: int) -> list[dict]:
+        # Scoped to the current filter, exactly as the live dashboard does, so narrowing the time
+        # range re-asks the question for that slice. The reconstruction itself never changes, so
+        # each distinct filter is computed once and memoized (bounded).
+        key = (author, backend, model, frm, to)
+        hit = insight_cache.get(key)
+        if hit is None:
+            stats = _filter_stats(view.dashboard, author=author, backend=backend, model=model, frm=frm, to=to)
+            files, sha_paths = context_from_browser(browser, stats)
+            hit = build_insights(stats, files, sha_paths)
+            if len(insight_cache) >= 16:
+                insight_cache.pop(next(iter(insight_cache)))
+            insight_cache[key] = hit
+        return hit
+
+    page = format_html(
+        view.dashboard, banner_html=banner, backtrace=True, insights=insights_for("", "", "", 0, 0)
+    ).encode("utf-8")
 
     class _BacktraceHandler(http.server.BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802 (http.server API)
@@ -523,6 +543,13 @@ def _make_handler(view: BacktraceView) -> type[http.server.BaseHTTPRequestHandle
                         granularity=_str(query, "granularity"),
                     )
                     payload["shared_sessions"] = []
+                    payload["insights"] = insights_for(
+                        _str(query, "author"),
+                        _str(query, "backend"),
+                        _str(query, "model"),
+                        _int(query, "from", 0),
+                        _int(query, "to", 0),
+                    )
                     self._respond("application/json", json.dumps(payload).encode("utf-8"))
                 elif parsed.path == "/log":
                     page_data = log_page(
