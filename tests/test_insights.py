@@ -83,6 +83,32 @@ def test_repeated_prompts_become_an_automation_suggestion():
     assert "skill" in insight["suggestion"] or "CLAUDE.md" in insight["suggestion"]
 
 
+def test_background_task_markers_are_not_read_as_user_prompts():
+    # A turn the agent ran off a completed background task carries "(background task completed)"
+    # instead of a real user prompt (and the label repeats when such turns fold together). It must
+    # never be counted as a repeated ask — that is the machine talking to itself, not the user.
+    turns = [_turn(i, prompt=f"real task {i}") for i in range(20)]
+    turns += [_turn(100 + i, prompt="(background task completed) (background task completed)") for i in range(4)]
+    insight = _by_key(build_insights(turns)).get("repeated-prompts")
+    assert insight is None or all("background task" not in e.lower() for e in insight["evidence"])
+
+
+def test_background_marker_is_stripped_leaving_the_real_follow_up():
+    from agitrack.metrics.insights import _user_prompt
+
+    assert _user_prompt("(background task completed)") == ""
+    # A real prompt typed after a background turn opened must survive, and read as corrective.
+    cleaned = _user_prompt("(background task completed) still doesn't work, same error")
+    assert cleaned == "still doesn't work, same error"
+
+    # That mixed turn should count as a correction (the user reacting), not be dropped.
+    turns = [_turn(i, prompt=f"add feature {i}") for i in range(20)]
+    turns += [_turn(100 + i, prompt="(background task completed) no, still fails, redo it") for i in range(20)]
+    insight = _by_key(build_insights(turns)).get("correction-loops")
+    assert insight is not None
+    assert all("background task" not in e.lower() for e in insight["evidence"])
+
+
 def test_repeated_short_or_slash_prompts_are_ignored():
     turns = [_turn(i, prompt=f"task {i}") for i in range(20)]
     turns += [_turn(100 + i, prompt="continue") for i in range(5)]  # short: not a standing task

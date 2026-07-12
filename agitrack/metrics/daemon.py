@@ -129,6 +129,7 @@ def spawn_dashboard_daemon(
     *,
     owner_pid: int,
     email_logins: dict[str, str] | None = None,
+    port: int | None = None,
 ) -> subprocess.Popen[bytes]:
     """Launch the detached dashboard child and return its Popen handle.
 
@@ -136,6 +137,9 @@ def spawn_dashboard_daemon(
     the launcher returning and is not hit by Ctrl-C in the launcher's terminal; the
     owner-pid watchdog is what ends it. stdout/stderr go to a log file so a startup
     failure is recoverable. Shared by the CLI (``agitrack -d``) and the TUI.
+
+    ``port`` requests a specific port (used when restarting to keep the previous URL);
+    the child still falls back to an OS-assigned port if it is taken.
     """
     cmd = [
         sys.executable,
@@ -147,6 +151,8 @@ def spawn_dashboard_daemon(
         "--dashboard-owner-pid",
         str(owner_pid),
     ]
+    if port is not None:
+        cmd += ["--dashboard-port", str(port)]
     env = dict(os.environ)
     if email_logins:
         env[EMAIL_LOGINS_ENV] = json.dumps(email_logins)
@@ -187,18 +193,25 @@ def start_dashboard_daemon(
 ) -> int:
     """`agitrack -d`: start (or reuse) the background dashboard daemon for ``repo``.
 
-    Reuses a daemon that is already running for this repo rather than spawning a
-    duplicate, then opens the browser and returns. The launching shell's pid is the
-    owner, so the daemon dies when that terminal closes.
+    Restarts a daemon already running for this repo rather than leaving the old one in
+    place — so re-running ``agitrack -d`` (e.g. after an aGiTrack update) picks up the new
+    code, reusing the previous port so the URL is unchanged. The launching shell's pid is
+    the owner, so the daemon dies when that terminal closes.
     """
     running = running_handshake(repo)
+    reuse_port: int | None = None
     if running is not None:
-        url = str(running.get("url", ""))
-        print(f"aGiTrack dashboard already running at {url} (pid {running.get('pid')}).")
-        _maybe_open(url, running, open_browser)
-        return 0
+        old_pid = int(running["pid"])
+        raw_port = running.get("port")
+        reuse_port = int(raw_port) if isinstance(raw_port, int) else None
+        # Stop the old daemon and wait for it to release the socket, so the replacement can
+        # bind the SAME port. If it lingers, the child's port fallback still gives a working
+        # (just different) URL rather than failing.
+        _terminate_and_wait(old_pid, timeout=5.0)
+        clear_handshake(repo)
+        print(f"Restarting the dashboard daemon (was pid {old_pid}).")
 
-    proc = spawn_dashboard_daemon(repo, owner_pid=owner_pid)
+    proc = spawn_dashboard_daemon(repo, owner_pid=owner_pid, port=reuse_port)
     record = wait_for_handshake(repo, pid=proc.pid, timeout=timeout)
     if record is None:
         print(f"The dashboard daemon did not start. See {log_path(repo)} for details.")
@@ -212,6 +225,16 @@ def start_dashboard_daemon(
     return 0
 
 
+def _terminate_and_wait(pid: int, *, timeout: float) -> None:
+    """Signal ``pid`` to stop and block until it exits (or ``timeout`` elapses). Best-effort;
+    on POSIX this is SIGTERM, on Windows TerminateProcess. Waiting matters when the caller then
+    rebinds the daemon's port: a still-listening process would keep it in use."""
+    terminate_pid(pid)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and pid_alive(pid):
+        time.sleep(0.05)
+
+
 def stop_dashboard_daemon(repo: GitRepo) -> int:
     """`agitrack -d stop`: stop the background dashboard daemon for ``repo``."""
     record = running_handshake(repo)
@@ -220,10 +243,7 @@ def stop_dashboard_daemon(repo: GitRepo) -> int:
         print("No dashboard daemon is running for this repository.")
         return 0
     pid = int(record["pid"])
-    terminate_pid(pid)  # SIGTERM on POSIX, TerminateProcess on Windows; best-effort
-    deadline = time.monotonic() + 5.0
-    while time.monotonic() < deadline and pid_alive(pid):
-        time.sleep(0.05)
+    _terminate_and_wait(pid, timeout=5.0)
     clear_handshake(repo)
     print(f"Stopped the dashboard daemon (pid {pid}).")
     return 0

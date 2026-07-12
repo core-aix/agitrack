@@ -263,6 +263,8 @@ agitrack -d stop            # stop that daemon (it also stops when the launching
 agitrack -d text            # one-shot plain-text report instead (pipe it, paste it into an issue)
 ```
 
+Re-running `agitrack -d` while a dashboard is already up **restarts** it — the old daemon is stopped and a fresh one started on the same port, so the URL is unchanged. That is the quick way to pick up a new build after an aGiTrack update without hunting down `-d stop` first.
+
 ![The aGiTrack dashboard](https://raw.githubusercontent.com/core-aix/agitrack/main/docs/images/dashboard-v4.png)
 
 - **aGiTrack-tracked AI vs non-tracked lines** — what the agents wrote (tracked by aGiTrack) versus everything else; it never claims a human wrote what the model did.
