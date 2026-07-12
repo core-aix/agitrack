@@ -420,6 +420,15 @@ def main(argv: list[str] | None = None) -> int:
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
+        "--dashboard-port",
+        type=int,
+        default=None,
+        # Internal: port the --dashboard-serve child should bind. Used on RESTART so the
+        # replacement daemon keeps the previous URL; falls back to an OS-assigned port when
+        # taken. Not meant for manual use.
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--precommit-sync",
         action="store_true",
         # Internal: entry point of the persistent auto-track pre-commit hook. Records any pending
@@ -567,6 +576,13 @@ def main(argv: list[str] | None = None) -> int:
                     email_logins = {str(k): str(v) for k, v in parsed.items()}
             except json.JSONDecodeError:
                 pass
+        if args.dashboard_port is not None:
+            return run_dashboard_daemon(
+                serve_repo,
+                owner_pid=args.dashboard_owner_pid,
+                email_logins=email_logins,
+                port=args.dashboard_port,
+            )
         return run_dashboard_daemon(serve_repo, owner_pid=args.dashboard_owner_pid, email_logins=email_logins)
 
     if args.dashboard:

@@ -61,6 +61,25 @@ _MAX_PLAUSIBLE_TURN_SECONDS = 8 * 3600
 
 _SESSION_RE = re.compile(r"backend_session_id:\s*(\S+)")
 
+# Synthetic markers the transcript injects in place of a real user prompt. A turn the agent ran
+# off the back of a completed background task carries ``(background task completed)`` rather than
+# anything the user typed (see ``_BACKGROUND_TURN_LABEL`` in transcripts/claude.py). When several
+# such turns fold into one commit the label repeats. These are not user asks, so they must not be
+# read as prompts — otherwise the repeated-asks card "detects" the machine talking to itself. The
+# marker is stripped wherever it appears; whatever real text remains (a follow-up the user typed
+# after the background turn opened) is kept and analysed normally.
+_SYNTHETIC_PROMPT_MARKERS = ("(background task completed)",)
+
+
+def _user_prompt(prompt: str) -> str:
+    """The genuine user text in a turn's prompt: the recorded prompt with synthetic
+    background-task markers removed. Empty when the turn had no real user prompt at all."""
+    text = prompt
+    for marker in _SYNTHETIC_PROMPT_MARKERS:
+        text = text.replace(marker, " ")
+    return re.sub(r"\s+", " ", text).strip()
+
+
 # A prompt that reacts to the PREVIOUS turn going wrong. Start-anchored phrases plus a few
 # unambiguous "it is still broken" fragments; deliberately conservative — a missed
 # correction only weakens the signal, a false positive poisons it.
@@ -251,15 +270,16 @@ def _correction_loops(ctx: Context) -> Finding | None:
         for index, stat in enumerate(session_turns):
             if index == 0:
                 continue  # a session's first prompt has no prior turn to correct
-            if not stat.prompt.strip():
-                continue
+            prompt = _user_prompt(stat.prompt)
+            if not prompt:
+                continue  # a background-task turn is not a user follow-up — don't count it
             eligible += 1
-            if _is_corrective(stat.prompt):
+            if _is_corrective(prompt):
                 corrective.append(stat)
                 chain += 1
                 if chain > longest_chain:
                     longest_chain = chain
-                    chain_example = stat.prompt.strip()
+                    chain_example = prompt
             else:
                 chain = 0
     if eligible < 10:
@@ -441,7 +461,7 @@ def _repeated_prompts(ctx: Context) -> Finding | None:
     """The same request typed again and again is a standing task — automation material."""
     counts: dict[str, tuple[int, str]] = {}
     for stat in ctx.turns:
-        prompt = stat.prompt.strip()
+        prompt = _user_prompt(stat.prompt)  # drop synthetic background-task markers first
         if len(prompt) < 15 or prompt.startswith("/"):
             continue  # too short to be a task; slash commands are already automation
         key = _norm_prompt(prompt)
@@ -488,7 +508,7 @@ def _low_yield_turns(ctx: Context) -> Finding | None:
     if len(heavy_no_change) < 5 or fraction < 0.12:
         return finding
     tokens = sum(stat.tokens.get("output", 0) for stat in heavy_no_change)
-    example = next((stat.prompt.strip() for stat in heavy_no_change if stat.prompt.strip()), "")
+    example = next((_user_prompt(stat.prompt) for stat in heavy_no_change if _user_prompt(stat.prompt)), "")
     evidence = [
         f"{len(heavy_no_change)} turns ({fraction:.0%}) produced 10k+ output tokens each without "
         f"changing any file — {_fmt(tokens)} output tokens in total.",
@@ -526,8 +546,9 @@ def _verification_gap(ctx: Context) -> Finding | None:
         code_turns += 1
         if not any(_is_test_path(path) for path in paths):
             untested += 1
-            if len(examples) < 3 and stat.prompt.strip():
-                examples.append(stat.prompt.strip()[:80])
+            example = _user_prompt(stat.prompt)
+            if len(examples) < 3 and example:
+                examples.append(example[:80])
     if code_turns < 10:
         return None
     fraction = untested / code_turns
