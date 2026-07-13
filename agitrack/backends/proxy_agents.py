@@ -212,6 +212,13 @@ class ProxyAgent(Protocol):
 
     def latest_session_id(self, repo: Path) -> str | None: ...
 
+    def session_transcript_path(self, session_id: str) -> Path | None:
+        """The session's live transcript file to ``stat`` as a liveness signal, or None when the
+        backend has no single stat-able transcript. Advances (mtime) while the agent is working
+        even if it prints nothing to the terminal (e.g. waiting on a sub-agent), so the proxy can
+        tell an in-progress turn from a merely-quiet one. The caller caches and stats it."""
+        return None
+
     def list_sessions(self, repo: Path) -> list[SessionRef]:
         """Every session recorded for this repository, for listing/switching."""
 
@@ -403,6 +410,9 @@ class ClaudeProxyAgent:
 
     def session_last_activity(self, session_id: str) -> float | None:
         return claude_session.session_last_activity(session_id)
+
+    def session_transcript_path(self, session_id: str) -> Path | None:
+        return claude_session.session_transcript_path(session_id)
 
     def list_sessions(self, repo: Path) -> list[SessionRef]:
         return claude_session.list_sessions(repo)

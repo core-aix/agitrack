@@ -659,6 +659,9 @@ class ProxyRunner:
         self.last_child_output = 0.0
         self.last_user_input = 0.0  # monotonic time of the user's last keystroke (drives idle backoff)
         self.last_child_output_sample = b""
+        # (session id, resolved transcript path) cache for _active_transcript_mtime, so the
+        # liveness stat doesn't re-scan the project dirs every idle tick.
+        self._transcript_path_cache: tuple[str | None, Path | None] = (None, None)
         self._last_spawn_command: list[str] = []  # the exact command of the most recent spawn
         # Set when the backend exits repeatedly and aGiTrack stops relaunching, so
         # run() can echo the reason on the restored host screen instead of leaving
@@ -1115,6 +1118,7 @@ class ProxyRunner:
                 "message": None,
                 "message_until": 0.0,
                 "last_user_input": 0.0,
+                "_transcript_path_cache": (None, None),
                 "_message_scroll": 0,
                 "_message_max_scroll": 0,
                 "_message_sticky": False,
@@ -10911,8 +10915,48 @@ class ProxyRunner:
             self._debug(f"untracked snapshot failed: {error!r}")
             self.untracked_before_turn = frozenset()
 
+    def _active_transcript_mtime(self) -> float | None:
+        # The mtime of the active session's live transcript, as a cheap "is the backend still
+        # working" signal. Only consulted once the PTY has already gone quiet (see
+        # `_backend_idle_for`). The transcript PATH is resolved once per session id and cached, so
+        # the per-tick cost is a single `stat`, not a re-scan of every project dir.
+        session_id = getattr(self.state, "backend_session_id", None) if self.state else None
+        if not session_id:
+            return None
+        cached_id, cached_path = self._transcript_path_cache
+        if cached_id != session_id:
+            resolver = getattr(self.backend, "session_transcript_path", None)
+            cached_path = None
+            if resolver is not None:
+                try:
+                    cached_path = resolver(session_id)
+                except Exception as error:
+                    self._debug(f"transcript path lookup failed: {error!r}")
+            self._transcript_path_cache = (session_id, cached_path)
+        if cached_path is None:
+            return None
+        try:
+            return cached_path.stat().st_mtime
+        except OSError:
+            self._transcript_path_cache = (None, None)  # vanished — re-resolve next time
+            return None
+
+    def _backend_idle_for(self, seconds: float) -> bool:
+        """Whether the backend has produced NOTHING for ``seconds`` — judged by BOTH the PTY
+        output and the session transcript. A sub-agent runs inside the main agent and may print
+        nothing to the terminal while it works, but Claude keeps appending its sidechain messages
+        to the transcript, so the file mtime advances. Without the transcript check aGiTrack would
+        read the quiet terminal as "turn finished" and try to commit (and, in no-worktree mode,
+        offer to commit the user's changes) while the turn is in fact still running."""
+        if time.monotonic() - self.last_child_output < seconds:
+            return False
+        mtime = self._active_transcript_mtime()
+        if mtime is not None and time.time() - mtime < seconds:
+            return False
+        return True
+
     def _clear_agent_in_flight_if_idle(self) -> None:
-        if self.agent_in_flight and time.monotonic() - self.last_child_output >= self.CHILD_IDLE_SECONDS:
+        if self.agent_in_flight and self._backend_idle_for(self.CHILD_IDLE_SECONDS):
             self.agent_in_flight = False
 
     def _record_user_prompt(self, prompt_text: str) -> None:
@@ -11105,7 +11149,9 @@ class ProxyRunner:
         # never advanced, so this naturally reduces to the old poll-then-read once
         # the backend goes idle.)
         worktree_settled = now - self._last_change_at >= self.FILE_STABLE_SECONDS
-        backend_idle = now - self.last_child_output >= self.CHILD_IDLE_SECONDS
+        # Transcript-aware: a silent sub-agent keeps the turn running even with a quiet terminal,
+        # so aGiTrack must not treat this as the turn ending (would commit / offer mid-turn).
+        backend_idle = self._backend_idle_for(self.CHILD_IDLE_SECONDS)
         if self.status_check_pending and worktree_settled and backend_idle:
             status = self.repo.status_short()
             self._prune_declined_untracked()
@@ -11142,10 +11188,7 @@ class ProxyRunner:
             if self.verbose:
                 self._render_status(f"git changes found; parsing {self.backend.name} session")
             return
-        if (
-            now - self._last_change_at < self.FILE_STABLE_SECONDS
-            or now - self.last_child_output < self.CHILD_IDLE_SECONDS
-        ):
+        if now - self._last_change_at < self.FILE_STABLE_SECONDS or not self._backend_idle_for(self.CHILD_IDLE_SECONDS):
             if self.verbose:
                 self._render_status(f"git changes found; waiting for {self.backend.name} to become idle")
             return
