@@ -29,6 +29,22 @@ def test_session_cwd_reads_last_recorded_cwd(monkeypatch, tmp_path):
     assert claude_session.session_cwd("missing") is None
 
 
+def test_session_transcript_path_and_mtime(monkeypatch, tmp_path):
+    config = tmp_path / "config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    proj = config / "projects" / claude_session._encode_repo(tmp_path / "wt")
+    proj.mkdir(parents=True)
+    transcript = proj / "sess.jsonl"
+    transcript.write_text('{"type":"user"}\n', encoding="utf-8")
+
+    assert claude_session.session_transcript_path("sess") == transcript
+    assert claude_session.session_transcript_mtime("sess") == pytest.approx(transcript.stat().st_mtime)
+    # Unknown / empty ids resolve to nothing rather than raising.
+    assert claude_session.session_transcript_path("missing") is None
+    assert claude_session.session_transcript_mtime("missing") is None
+    assert claude_session.session_transcript_mtime("") is None
+
+
 def test_retarget_session_cwd_rewrites_recorded_cwd(monkeypatch, tmp_path):
     # Resuming under a new launch dir (e.g. --no-worktree on the repo root) must
     # rewrite the transcript's recorded cwd so Claude's --resume doesn't restore an

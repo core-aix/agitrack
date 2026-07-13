@@ -641,6 +641,30 @@ def _find_session_file(session_id: str) -> Path | None:
     return newest[1] if newest else None
 
 
+def session_transcript_path(session_id: str) -> Path | None:
+    """The path to a session's live transcript ``.jsonl`` (the newest match across project
+    dirs), or None if not found. A caller can cache this and ``stat`` it repeatedly as a cheap
+    liveness signal, instead of re-scanning the project dirs each time."""
+    return _find_session_file(session_id) if session_id else None
+
+
+def session_transcript_mtime(session_id: str) -> float | None:
+    """The mtime (epoch seconds) of a session's transcript file, or None if not found.
+
+    A CHEAP liveness signal (a single ``stat``, no read): Claude appends each message to the
+    ``.jsonl`` as it happens — including a sub-agent's sidechain messages — so a turn that is
+    working but printing nothing to the terminal (the main agent waiting on a sub-agent) still
+    advances this. It lets aGiTrack tell "the turn is still running" from "the terminal is just
+    quiet", so it doesn't decide the turn ended and try to commit mid-turn."""
+    path = session_transcript_path(session_id)
+    if path is None:
+        return None
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
 _TIMESTAMP_RE = re.compile(r'"timestamp"\s*:\s*"([^"]+)"')
 
 
