@@ -7987,8 +7987,17 @@ class ProxyRunner:
         # resume is untouched and its shared hardlink is preserved).
         retarget = getattr(self.backend, "retarget_working_dir", None)
         if retarget is not None:
+            # Pass the launch dir's current branch so retargeting a worktree session onto the base
+            # repo (the --no-worktree switch) also moves the stale ``agitrack/…`` worktree branch
+            # off the relocated rows — otherwise every row keeps the worktree branch and the resumed
+            # agent still reads its whole history as "in a worktree." Best-effort: None just skips it.
             try:
-                if retarget(self.repo.repo, session_id, str(self.repo.repo)):
+                launch_branch = self.repo.current_branch()
+            except Exception as error:
+                self._debug(f"resume branch lookup failed: {error!r}")
+                launch_branch = None
+            try:
+                if retarget(self.repo.repo, session_id, str(self.repo.repo), git_branch=launch_branch):
                     self._debug(f"retargeted resumed session {session_id} cwd to {self.repo.repo}")
             except Exception as error:
                 self._debug(f"retarget_working_dir failed: {error!r}")

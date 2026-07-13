@@ -178,6 +178,46 @@ def test_retarget_session_cwd_leaves_unrelated_absolute_paths(monkeypatch, tmp_p
     assert parsed["message"]["content"][0]["text"] == "saw /some/other/checkout/x.py"  # ...content left alone
 
 
+def test_retarget_session_cwd_moves_worktree_branch_off_relocated_rows(monkeypatch, tmp_path):
+    # Regression (worktree -> --no-worktree resume): the LAST worktree fingerprint is the row-level
+    # ``gitBranch``. After the cwd/paths move to the base repo, every row still stamped with the old
+    # ``agitrack/…`` worktree branch makes the resumed agent read its whole history as still in a
+    # worktree. Passing the launch branch retargets gitBranch on exactly the relocated rows.
+    config = tmp_path / "config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    repo = tmp_path / "repo"
+    wt = repo / ".agitrack" / "worktrees" / "crab"
+    proj = config / "projects" / claude_session._encode_repo(repo)
+    proj.mkdir(parents=True)
+    rows = [
+        {"type": "user", "cwd": str(wt), "gitBranch": "agitrack/claude/crab/t1"},
+        {"type": "assistant", "cwd": str(wt), "gitBranch": "agitrack/claude/crab/t2"},
+    ]
+    (proj / "s.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+
+    assert claude_session.retarget_session_cwd(repo, "s", str(repo), git_branch="dev") is True
+    parsed = [json.loads(ln) for ln in (proj / "s.jsonl").read_text(encoding="utf-8").splitlines() if ln]
+    assert all(r["cwd"] == str(repo) for r in parsed)  # cwd moved to base...
+    assert all(r["gitBranch"] == "dev" for r in parsed)  # ...and the worktree branch went with it
+
+
+def test_retarget_session_cwd_leaves_branch_alone_without_a_cwd_move(monkeypatch, tmp_path):
+    # A plain in-worktree resume (cwd unchanged, only the aGiTrack branch advanced a turn) must be a
+    # byte-for-byte no-op so its shared hardlink survives — the branch is NEVER rewritten when the
+    # cwd isn't moving, even if a launch branch is supplied.
+    config = tmp_path / "config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    repo = tmp_path / "repo"
+    proj = config / "projects" / claude_session._encode_repo(repo)
+    proj.mkdir(parents=True)
+    body = json.dumps({"type": "user", "cwd": str(repo), "gitBranch": "agitrack/claude/crab/t1"}) + "\n"
+    (proj / "s.jsonl").write_text(body, encoding="utf-8")
+
+    # cwd already at the launch dir -> no relocation -> no rewrite (returns False, file untouched).
+    assert claude_session.retarget_session_cwd(repo, "s", str(repo), git_branch="dev") is False
+    assert (proj / "s.jsonl").read_text(encoding="utf-8") == body
+
+
 def test_session_cwd_since_ignores_stale_pre_launch_rows(monkeypatch, tmp_path):
     # #72: with `since`, only rows recorded at/after the current launch count, so
     # a stale cwd left by a resume/import doesn't read as drift.

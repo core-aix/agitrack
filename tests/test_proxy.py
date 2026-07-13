@@ -1670,14 +1670,18 @@ def test_stage_backend_resume_retargets_cwd_to_launch_dir(tmp_path):
     import types
 
     runner = make_runner()
-    runner.repo = types.SimpleNamespace(repo=tmp_path)
+    runner.repo = types.SimpleNamespace(repo=tmp_path, current_branch=lambda: "dev")
     calls = {}
     runner.backend = types.SimpleNamespace(
         ensure_resumable=lambda repo, sid: True,
-        retarget_working_dir=lambda repo, sid, cwd: calls.update(repo=repo, sid=sid, cwd=cwd) or True,
+        retarget_working_dir=lambda repo, sid, cwd, *, git_branch=None: (
+            calls.update(repo=repo, sid=sid, cwd=cwd, git_branch=git_branch) or True
+        ),
     )
     runner._stage_backend_resume("sid-1")
-    assert calls == {"repo": tmp_path, "sid": "sid-1", "cwd": str(tmp_path)}
+    # The launch dir's branch is threaded through so a worktree->--no-worktree resume also moves
+    # the stale worktree branch off the relocated rows.
+    assert calls == {"repo": tmp_path, "sid": "sid-1", "cwd": str(tmp_path), "git_branch": "dev"}
 
 
 class _CancelRepo:
