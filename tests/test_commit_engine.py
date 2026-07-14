@@ -1035,15 +1035,18 @@ def test_finish_parse_cancel_handler_keep_does_not_advance_watermark(tmp_path):
     assert state.last_backend_message_id is None
 
 
-def test_finish_parse_skips_cancel_handler_when_not_interrupted(tmp_path):
-    # A response-less turn that was NOT interrupted (e.g. still mid-flight) must not
-    # be treated as a cancellation.
+def test_finish_parse_commits_finished_turn_with_no_final_text_response(tmp_path):
+    # A turn that FINISHED (complete, not interrupted) but emitted no final TEXT response —
+    # e.g. its last action was a file edit and the agent stopped without a closing message —
+    # must still be committed if it changed files. Dropping it would leave the work uncommitted
+    # forever (the live loop re-parses and the exit finalize hits the same gate). It is NOT a
+    # cancellation, so the cancel handler is never consulted.
     session = Session.bare()
     exported = ExportedSession(
         "ses-1",
         "m",
         None,
-        [SessionTurn("u1", "a1", "build it", "", TokenUsage(total=1, output=1), None, interrupted=False)],
+        [SessionTurn("u1", "a1", "build it", "", TokenUsage(total=1, output=1), None, complete=True)],
     )
     engine, state, commits, commit_fn = _make_finish_helpers(tmp_path, session, exported)
     called = []
@@ -1061,8 +1064,98 @@ def test_finish_parse_skips_cancel_handler_when_not_interrupted(tmp_path):
         commit_fn=commit_fn,
         on_cancelled_fn=lambda turns: called.append(turns) or True,
     )
-    assert result is False
-    assert called == []
+    assert result is True  # the edits are committed, not dropped
+    assert len(commits) == 1
+    assert called == []  # not a cancellation — the handler is never called
+    # Watermark advances past the turn (its assistant id) so it isn't re-committed.
+    assert state.last_backend_message_id == "a1"
+
+
+def test_finish_parse_no_text_turn_watermark_falls_back_to_user_id(tmp_path):
+    # A no-text finished turn never recorded an assistant id (that is only set from a text
+    # message). The watermark must still advance — off the user id — so the turn isn't
+    # reconsidered and re-committed on the next parse.
+    session = Session.bare()
+    exported = ExportedSession(
+        "ses-1",
+        "m",
+        None,
+        [SessionTurn("u1", "", "build it", "", TokenUsage(total=1, output=1), None, complete=True)],
+    )
+    engine, state, commits, commit_fn = _make_finish_helpers(tmp_path, session, exported)
+
+    result, _ = engine.finish_parse_if_ready(
+        session=session,
+        quiet=True,
+        prompt_untracked=False,
+        require_complete=True,
+        awaited_followups=[],
+        agent_is_active_fn=lambda: False,
+        debug_fn=lambda *a, **k: None,
+        note_session_change_fn=lambda sid: None,
+        mirror_fn=lambda sid: None,
+        commit_fn=commit_fn,
+    )
+    assert result is True
+    assert state.last_backend_message_id == "u1"
+
+
+def test_finish_parse_defers_a_genuinely_mid_flight_turn(tmp_path):
+    # The mid-flight guard is upstream: a turn still in progress (complete=False) with
+    # require_complete=True is DEFERRED (None), never reaching the no-response commit path.
+    session = Session.bare()
+    exported = ExportedSession(
+        "ses-1",
+        "m",
+        None,
+        [SessionTurn("u1", "a1", "build it", "", TokenUsage(total=1, output=1), None, complete=False)],
+    )
+    engine, state, commits, commit_fn = _make_finish_helpers(tmp_path, session, exported)
+
+    result, _ = engine.finish_parse_if_ready(
+        session=session,
+        quiet=True,
+        prompt_untracked=False,
+        require_complete=True,
+        awaited_followups=[],
+        agent_is_active_fn=lambda: False,
+        debug_fn=lambda *a, **k: None,
+        note_session_change_fn=lambda sid: None,
+        mirror_fn=lambda sid: None,
+        commit_fn=commit_fn,
+    )
+    assert result is None  # deferred, not committed
+    assert commits == []
+
+
+def test_finish_parse_exit_commits_dangling_no_text_turn(tmp_path):
+    # The exit / sync finalize path (require_complete=False) must commit a finished-but-dangling
+    # no-text turn's edits — this is exactly the "commit not made even on exit" case.
+    session = Session.bare()
+    exported = ExportedSession(
+        "ses-1",
+        "m",
+        None,
+        # complete=False (ended on a tool_use) but the process is gone, so on exit we commit it.
+        [SessionTurn("u1", "a1", "apply the change", "", TokenUsage(total=1, output=1), None, complete=False)],
+    )
+    engine, state, commits, commit_fn = _make_finish_helpers(tmp_path, session, exported)
+
+    result, _ = engine.finish_parse_if_ready(
+        session=session,
+        quiet=True,
+        prompt_untracked=False,
+        require_complete=False,  # exit / sync finalize
+        awaited_followups=[],
+        agent_is_active_fn=lambda: False,
+        debug_fn=lambda *a, **k: None,
+        note_session_change_fn=lambda sid: None,
+        mirror_fn=lambda sid: None,
+        commit_fn=commit_fn,
+    )
+    assert result is True
+    assert len(commits) == 1
+    assert state.last_backend_message_id == "a1"
 
 
 def test_finish_parse_discards_stale_session_result(tmp_path):

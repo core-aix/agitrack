@@ -287,11 +287,16 @@ class RecoveryService:
         from agitrack.backends.claude import ClaudeBackend
         from agitrack.backends.opencode import OpenCodeBackend
         from agitrack.summaries import Summarizer, summary_scratch_dir
+        from agitrack.summaries.model_select import compatible_summarization_model
 
-        backend_class = OpenCodeBackend if state.backend == "opencode" else ClaudeBackend
+        backend_name = "opencode" if state.backend == "opencode" else "claude"
+        backend_class = OpenCodeBackend if backend_name == "opencode" else ClaudeBackend
         model = state.summarization_model
         if model is None and self.global_config is not None:
             model = self.global_config.summarization_model
+        # A summarization_model configured for a different backend (e.g. a Claude id under an
+        # OpenCode session) is invalid there and fails every summary — drop it for the default.
+        model = compatible_summarization_model(backend_name, model)
         # The summarizer must run in a scratch cwd, never the worktree: its headless
         # backend calls record a session keyed by cwd, which would otherwise pollute
         # the repo's session list (issues #8/#56).

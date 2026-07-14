@@ -2004,12 +2004,18 @@ class ProxyRunner:
             self._debug(f"manual cover reconcile failed: {error!r}")
         self._render_manual_trailer()
 
-    def _auto_fold_latent_pending(self) -> None:
+    def _auto_fold_latent_pending(self, *, force: bool = False) -> None:
         """No-worktree AUTO mode: fold the pending latent turns into a real commit ourselves, so
         the branch advances per turn (like normal auto mode) but the interaction trace/metadata
         rides the SAME commit as the code — no separate cover. A clean working tree means the agent
         (or user) already committed its work, in which case the prepare-commit-msg fold hook folded
-        the tracking into THAT commit (cover being only the backup), so there is nothing to do."""
+        the tracking into THAT commit (cover being only the backup), so there is nothing to do.
+
+        ``force`` skips the summary-defer wait below: it is set on the EXIT finalize, where the
+        summary has already been joined and serviced separately, and where we must land the commit
+        NOW — the throttled poll that normally folds does not run during teardown, so without this
+        the turn's changes would stay recorded only as a latent commit and never reach HEAD (the
+        reported 'commit not made, not even on exit' bug in no-worktree auto mode)."""
         if not self._noworktree_auto:
             return
         tip = self.repo.ref_sha(self._manual_ref())
@@ -2026,7 +2032,7 @@ class ProxyRunner:
         # ~3s, long before the multi-second LLM summary returns, so the folded commit keeps its
         # prompt-based subject and the summary is orphaned as a note (the reported no-worktree bug).
         # Bounded by SUMMARY_WAIT_SECONDS: past the deadline we fold as-is, summary becomes notes-only.
-        if self._summary_blocks_integration(time.monotonic()):
+        if not force and self._summary_blocks_integration(time.monotonic()):
             return
         bodies = self._manual_pending_bodies()
         message = build_auto_fold_message(bodies)
@@ -9691,10 +9697,17 @@ class ProxyRunner:
         from agitrack.backends.claude import ClaudeBackend
         from agitrack.backends.opencode import OpenCodeBackend
 
-        backend_class = OpenCodeBackend if self.state.backend == "opencode" else ClaudeBackend
+        from agitrack.summaries.model_select import compatible_summarization_model
+
+        backend_name = "opencode" if self.state.backend == "opencode" else "claude"
+        backend_class = OpenCodeBackend if backend_name == "opencode" else ClaudeBackend
         model = self.state.summarization_model
         if model is None and self.global_config is not None:
             model = self.global_config.summarization_model
+        # The summarizer runs THIS session's backend; a summarization_model configured for a
+        # different backend (e.g. a Claude id while the session runs OpenCode) is invalid there and
+        # makes every summary fail — drop it and use the backend's default instead.
+        model = compatible_summarization_model(backend_name, model)
         # The summarizer must NOT run in the session worktree (or the repo):
         # its headless calls record real backend sessions keyed by cwd, which
         # the parse worker / exit adoption would then resume instead of the
@@ -10193,6 +10206,13 @@ class ProxyRunner:
         if self._summary_thread is not None and self._summary_thread.is_alive():
             self._summary_thread.join(timeout=self.EXIT_SUMMARY_GRACE_SECONDS)
         self._service_commit_summary()
+        # No-worktree AUTO mode records each turn as a hidden LATENT commit; the real commit is
+        # normally made by the throttled poll (_auto_fold_latent_pending). That poll does NOT run
+        # during exit teardown, so fold any pending latent turns HERE — otherwise a turn finished
+        # just before quitting is recorded latently but never lands on HEAD. Forced past the
+        # summary-defer gate: the summary was already joined and serviced just above. A no-op in
+        # every other mode, and idempotent (a clean tree vs HEAD means the live poll already folded).
+        self._auto_fold_latent_pending(force=True)
         self._integrate_session_on_exit()
         if self._exit_aborted:
             return  # Esc on a finalize popup (e.g. a merge prompt) aborted the exit — keep the worktree
