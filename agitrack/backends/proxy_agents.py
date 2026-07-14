@@ -212,6 +212,13 @@ class ProxyAgent(Protocol):
 
     def latest_session_id(self, repo: Path) -> str | None: ...
 
+    def session_transcript_path(self, session_id: str) -> Path | None:
+        """The session's live transcript file to ``stat`` as a liveness signal, or None when the
+        backend has no single stat-able transcript. Advances (mtime) while the agent is working
+        even if it prints nothing to the terminal (e.g. waiting on a sub-agent), so the proxy can
+        tell an in-progress turn from a merely-quiet one. The caller caches and stats it."""
+        return None
+
     def list_sessions(self, repo: Path) -> list[SessionRef]:
         """Every session recorded for this repository, for listing/switching."""
 
@@ -296,10 +303,12 @@ class OpenCodeProxyAgent:
     def recorded_working_dir(self, session_id: str, *, since: float | None = None) -> str | None:
         return None  # not tracked for OpenCode
 
-    def retarget_working_dir(self, repo: Path, session_id: str, cwd: str) -> bool:
+    def retarget_working_dir(self, repo: Path, session_id: str, cwd: str, *, git_branch: str | None = None) -> bool:
         # OpenCode resumes by id and restores the session's RECORDED directory, ignoring the
         # launch path — so a resumed session can open in an old/stale worktree. Move the
-        # recorded directory to the launch dir (no-op when already aligned).
+        # recorded directory to the launch dir (no-op when already aligned). OpenCode doesn't
+        # stamp a per-row git branch, so ``git_branch`` (Claude's worktree-fingerprint fix) is
+        # accepted for a uniform signature and ignored here.
         return opencode_session.retarget_session_dir(repo, session_id, cwd)
 
     def latest_session_id(self, repo: Path) -> str | None:
@@ -392,17 +401,22 @@ class ClaudeProxyAgent:
     def recorded_working_dir(self, session_id: str, *, since: float | None = None) -> str | None:
         return claude_session.session_cwd(session_id, since=since)
 
-    def retarget_working_dir(self, repo: Path, session_id: str, cwd: str) -> bool:
+    def retarget_working_dir(self, repo: Path, session_id: str, cwd: str, *, git_branch: str | None = None) -> bool:
         # Align a resumed session's recorded cwd with the launch dir so Claude's
         # `--resume` doesn't restore an old worktree directory (no-op when already
         # aligned). OpenCode has its own retarget (it records a per-session directory).
-        return claude_session.retarget_session_cwd(repo, session_id, cwd)
+        # ``git_branch`` also moves the recorded worktree branch off relocated rows, so a
+        # worktree session resumed under --no-worktree stops reading as still in a worktree.
+        return claude_session.retarget_session_cwd(repo, session_id, cwd, git_branch=git_branch)
 
     def latest_session_id(self, repo: Path) -> str | None:
         return claude_session.latest_session_id(repo)
 
     def session_last_activity(self, session_id: str) -> float | None:
         return claude_session.session_last_activity(session_id)
+
+    def session_transcript_path(self, session_id: str) -> Path | None:
+        return claude_session.session_transcript_path(session_id)
 
     def list_sessions(self, repo: Path) -> list[SessionRef]:
         return claude_session.list_sessions(repo)

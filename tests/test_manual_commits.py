@@ -13,6 +13,7 @@ when off (no hooks, no latent commits, existing paths unchanged).
 from __future__ import annotations
 
 import subprocess
+import time
 from pathlib import Path
 
 from agitrack.backends.base import TokenUsage
@@ -563,6 +564,56 @@ def test_noworktree_auto_folds_latent_turn_into_commit(tmp_path):
     assert "commit agent turns" not in msg and "commit_type: user" not in msg
     assert msg.count("# aGiTrack Metadata") == 1 and "commit_type: agent" in msg
     assert repo.ref_sha(runner._manual_ref()) == repo.rev_parse("HEAD")  # ref reset
+    assert runner._manual_pending_count() == 0
+
+
+def test_noworktree_auto_force_fold_lands_even_with_summary_pending(tmp_path):
+    # The throttled live fold defers while a turn summary is in flight (so the summary can ride
+    # the commit). The EXIT finalize can't wait on the poll, so it folds with force=True — which
+    # must land the commit even though a summary is still pending.
+    import types
+
+    runner, repo, state = _noworktree_auto_runner(tmp_path)
+    runner._setup_manual_commit_mode()
+    (tmp_path / "a.txt").write_text("one\nagent\n", encoding="utf-8")
+    runner._manual_gate()
+    runner._manual_record(_agent_body("do x", 20))
+    head_before = repo.rev_parse("HEAD")
+
+    # A summary is still being computed: the normal (unforced) fold must DEFER.
+    runner._summary_pending = {"sha": "deadbeef", "since": time.monotonic()}
+    runner._summary_thread = types.SimpleNamespace(is_alive=lambda: True)
+    runner._auto_fold_latent_pending()
+    assert repo.rev_parse("HEAD") == head_before  # deferred while summarizing
+
+    # Exit-style forced fold lands it anyway (summary becomes notes-only).
+    runner._auto_fold_latent_pending(force=True)
+    assert repo.rev_parse("HEAD") != head_before
+    assert runner._manual_pending_count() == 0
+
+
+def test_noworktree_auto_exit_finalize_folds_pending_latent(tmp_path):
+    # The reported bug: a turn recorded latently right before quitting was never folded on exit
+    # (the poll that folds doesn't run during teardown), so its changes never reached HEAD.
+    # The exit finalize must now fold pending latent turns itself.
+    runner, repo, state = _noworktree_auto_runner(tmp_path)
+    runner._setup_manual_commit_mode()
+    (tmp_path / "a.txt").write_text("one\nagent\n", encoding="utf-8")
+    runner._manual_gate()
+    runner._manual_record(_agent_body("apply the change", 20))
+    head_before = repo.rev_parse("HEAD")
+
+    # Isolate the fold: stub the surrounding exit steps (worktree integration / teardown), which
+    # are no-ops for a no-worktree session anyway.
+    runner._summary_thread = None
+    runner._service_commit_summary = lambda *a, **k: None
+    runner._integrate_session_on_exit = lambda *a, **k: None
+    runner._finalize_worktree_on_exit = lambda *a, **k: None
+
+    runner._finalize_summary_then_integrate_on_exit()
+
+    assert repo.rev_parse("HEAD") != head_before  # the pending turn landed on HEAD
+    assert "apply the change" in _git(repo, "log", "-1", "--format=%B", "HEAD")
     assert runner._manual_pending_count() == 0
 
 

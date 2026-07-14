@@ -83,6 +83,32 @@ def test_repeated_prompts_become_an_automation_suggestion():
     assert "skill" in insight["suggestion"] or "CLAUDE.md" in insight["suggestion"]
 
 
+def test_background_task_markers_are_not_read_as_user_prompts():
+    # A turn the agent ran off a completed background task carries "(background task completed)"
+    # instead of a real user prompt (and the label repeats when such turns fold together). It must
+    # never be counted as a repeated ask — that is the machine talking to itself, not the user.
+    turns = [_turn(i, prompt=f"real task {i}") for i in range(20)]
+    turns += [_turn(100 + i, prompt="(background task completed) (background task completed)") for i in range(4)]
+    insight = _by_key(build_insights(turns)).get("repeated-prompts")
+    assert insight is None or all("background task" not in e.lower() for e in insight["evidence"])
+
+
+def test_background_marker_is_stripped_leaving_the_real_follow_up():
+    from agitrack.metrics.insights import _user_prompt
+
+    assert _user_prompt("(background task completed)") == ""
+    # A real prompt typed after a background turn opened must survive, and read as corrective.
+    cleaned = _user_prompt("(background task completed) still doesn't work, same error")
+    assert cleaned == "still doesn't work, same error"
+
+    # That mixed turn should count as a correction (the user reacting), not be dropped.
+    turns = [_turn(i, prompt=f"add feature {i}") for i in range(20)]
+    turns += [_turn(100 + i, prompt="(background task completed) no, still fails, redo it") for i in range(20)]
+    insight = _by_key(build_insights(turns)).get("correction-loops")
+    assert insight is not None
+    assert all("background task" not in e.lower() for e in insight["evidence"])
+
+
 def test_repeated_short_or_slash_prompts_are_ignored():
     turns = [_turn(i, prompt=f"task {i}") for i in range(20)]
     turns += [_turn(100 + i, prompt="continue") for i in range(5)]  # short: not a standing task
@@ -130,6 +156,23 @@ def test_file_rework_keys_on_quick_returns_not_delete_ratio():
     assert insight is not None
     assert "hot.py" in insight["evidence"][0]
     assert all("steady.py" not in line for line in insight["evidence"])
+
+
+def test_file_rework_ignores_pure_growth_of_a_multi_feature_file():
+    # A file edited over and over but only GROWING (insertions, ~no deletions) is a file that
+    # houses several features being built up — not the same lines being redone. It must stay
+    # silent even though the quick-return frequency is identical to a real hotspot.
+    turns = [_turn(i, prompt=f"work {i}") for i in range(20)]
+    base = 1_700_000_000
+    # grows.py: 12 rapid edits, each a pure addition (new feature code), deletions ~0.
+    grows = [(base + i * 600, 30, 0) for i in range(12)]
+    # redone.py: 12 rapid edits that add and delete in equal measure — churn in place.
+    redone = [(base + i * 600, 20, 19) for i in range(12)]
+    insights = _by_key(build_insights(turns, {"grows.py": grows, "redone.py": redone}))
+    insight = insights.get("file-rework")
+    assert insight is not None
+    assert "redone.py" in insight["evidence"][0]
+    assert all("grows.py" not in line for line in insight["evidence"])
 
 
 def test_low_yield_turns_detected():
@@ -301,6 +344,29 @@ def test_slow_turns_detected():
 def test_fast_turns_stay_silent():
     turns = [_timed(i, 5, prompt=f"work {i}") for i in range(20)]
     assert "slow-turns" not in _by_key(build_insights(turns))
+
+
+def test_slow_turns_waiting_on_background_tasks_are_not_flagged():
+    # A long turn spent WAITING on a background task (build/test/sub-agent) is idle time the user
+    # couldn't have steered — it must not read as a long feedback loop. Here every slow turn is a
+    # background-task turn, so nothing steerable is slow and the category stays silent.
+    turns = []
+    for i in range(20):
+        if i % 3 == 0:
+            turns.append(_timed(i, 45, prompt="(background task completed)"))  # slow, but a wait
+        else:
+            turns.append(_timed(i, 5, prompt=f"work {i}"))  # fast, steerable
+    assert "slow-turns" not in _by_key(build_insights(turns))
+
+
+def test_slow_turns_notes_excluded_background_waits_alongside_real_ones():
+    # Genuine long autonomous turns still fire, and the card notes how many long turns were set
+    # aside as background-task waits so the number is transparent rather than silently different.
+    turns = [_timed(i, 45 if i % 3 == 0 else 5, prompt=f"work {i}") for i in range(20)]  # real slow turns
+    turns += [_timed(500 + i, 50, prompt="(background task completed)") for i in range(3)]  # excluded waits
+    insight = _by_key(build_insights(turns)).get("slow-turns")
+    assert insight is not None
+    assert any("background-task waits" in line for line in insight["evidence"])
 
 
 def test_turns_without_timestamps_yield_no_duration_category():

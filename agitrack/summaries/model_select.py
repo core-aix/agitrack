@@ -16,6 +16,31 @@ def list_available_models(backend_name: str) -> list[str]:
     return []
 
 
+def compatible_summarization_model(backend_name: str, model: str | None) -> str | None:
+    """The configured summarization model to actually hand this backend — or None to let the
+    backend pick its own default when the configured id belongs to a DIFFERENT backend.
+
+    ``summarization_model`` is a single global setting, but a model id is provider-specific:
+    OpenCode addresses models as ``provider/model`` (e.g. ``anthropic/claude-haiku-4-5``), while
+    the Claude CLI uses bare ids (``claude-haiku-4-5-20251001``, ``haiku``). A session running
+    the OpenCode backend therefore can't use a Claude model id: ``opencode run --model
+    claude-haiku-4-5-20251001`` exits non-zero and the summary fails outright. When the coding
+    backend and the configured model don't match, drop the model and fall back to the backend's
+    default rather than failing every summary. (Cross-backend summarization is impossible anyway —
+    the summarizer always runs the SAME backend as the session, so a Claude id under OpenCode is
+    simply misconfiguration, not a request to use Claude.)"""
+    if not model:
+        return None
+    has_provider = "/" in model
+    if backend_name == "opencode":
+        # OpenCode needs a provider-qualified id; a bare (Claude-style) id is not its own.
+        return model if has_provider else None
+    if backend_name == "claude":
+        # The Claude CLI needs a bare id; a provider/model id is an OpenCode-style id.
+        return model if not has_provider else None
+    return model
+
+
 def smallest_model(backend_name: str, models: list[str]) -> str | None:
     """The smallest / cheapest model to default the summarizer to. For Claude that's
     the Haiku tier; for other backends we don't presume a size ordering, so there is

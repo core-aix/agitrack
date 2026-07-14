@@ -1020,11 +1020,16 @@ class BackgroundRunner:
         from agitrack.backends.claude import ClaudeBackend
         from agitrack.backends.opencode import OpenCodeBackend
         from agitrack.summaries import Summarizer, summary_scratch_dir
+        from agitrack.summaries.model_select import compatible_summarization_model
 
-        backend_class = OpenCodeBackend if self.state.backend == "opencode" else ClaudeBackend
+        backend_name = "opencode" if self.state.backend == "opencode" else "claude"
+        backend_class = OpenCodeBackend if backend_name == "opencode" else ClaudeBackend
         model = self.state.summarization_model
         if model is None and self.global_config is not None:
             model = self.global_config.summarization_model
+        # A summarization_model configured for a different backend (e.g. a Claude id under an
+        # OpenCode session) is invalid there and fails every summary — drop it for the default.
+        model = compatible_summarization_model(backend_name, model)
         launch = self._backend_command or None
         return Summarizer(backend_class(summary_scratch_dir(), launch_command=launch), model=model)
 
