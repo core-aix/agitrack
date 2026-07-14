@@ -152,10 +152,25 @@ class GitRepo:
         would re-prompt for each new file in an already-declined directory. A partially-tracked
         directory still lists its individual untracked files (git can't collapse it).
 
+        ``--directory`` has a trap: it collapses and reports a directory that holds no TRACKED
+        file as untracked even when everything inside it is git-IGNORED (by a nested ``.gitignore``
+        like ``.venv/.gitignore`` with ``*``, or a rule that only names the dir's contents) — or
+        when the directory is simply empty. Git only ignores a directory outright when a rule
+        matches the directory itself, so a dir ignored solely from within slips through as
+        "untracked" here even though ``git status`` shows nothing. That yields a phantom
+        "stage these new files?" prompt for `.venv/`, build caches, etc. So each collapsed
+        ``dir/`` is kept only when it actually contains a genuinely-untracked file — cross-checked
+        against the accurate per-file list (which descends and honours every nested ``.gitignore``).
+
         Agent/tooling scaffolding (``.agitrack/``, ``.claude/``, ``.opencode/``) is filtered out
         so the user is never asked to stage an agent's own folder."""
         output = self._run(["git", "ls-files", "--others", "--exclude-standard", "--directory"]).stdout
-        return [line for line in output.splitlines() if line and not _is_scaffolding(line)]
+        entries = [line for line in output.splitlines() if line and not _is_scaffolding(line)]
+        if not any(entry.endswith("/") for entry in entries):
+            return entries  # no collapsed dirs -> nothing to second-guess, skip the extra git call
+        # The per-file list honours nested/self-ignoring `.gitignore`s that `--directory` misses.
+        files = self.untracked_files()
+        return [entry for entry in entries if not entry.endswith("/") or any(path.startswith(entry) for path in files)]
 
     def ignored_files(self) -> list[str]:
         """Paths git ignores (per .gitignore) in the working tree — build output,
