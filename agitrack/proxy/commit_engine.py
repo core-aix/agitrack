@@ -636,13 +636,13 @@ class CommitEngine:
             return None, awaited
 
         complete_turns = [t for t in all_turns if t.final_response]
+        last_turn = all_turns[-1] if all_turns else None
         if not complete_turns:
             # A user-cancelled turn (Esc) that produced no committable response
             # would normally leave the agent's partial edits sitting uncommitted in
             # the worktree forever. When a cancellation handler is supplied (the
             # live interactive path), let it decide commit-vs-discard; if it acted,
             # advance the watermark past the cancelled turn so it isn't reconsidered.
-            last_turn = all_turns[-1] if all_turns else None
             if (
                 on_cancelled_fn is not None
                 and last_turn is not None
@@ -655,11 +655,29 @@ class CommitEngine:
                     or last_turn.user_message_id
                     or self.state.backend_message_id_for(self.state.backend_session_id),
                 )
+                debug_fn(
+                    f"agent parse consumed without final response (cancelled) "
+                    f"session_id={self.state.backend_session_id} turns={len(all_turns)}"
+                )
+                return False, awaited
+            if last_turn is None or getattr(last_turn, "interrupted", False):
+                # Interrupted with no handler, or genuinely nothing to act on.
+                debug_fn(
+                    f"agent parse consumed without final response "
+                    f"session_id={self.state.backend_session_id} turns={len(all_turns)}"
+                )
+                return False, awaited
+            # A turn that FINISHED but emitted no final TEXT response — e.g. its last action was
+            # a tool call / file edit and the agent stopped without a closing message. It may
+            # still have changed files, and dropping it here would leave that work uncommitted
+            # forever: the live loop keeps re-parsing and the exit finalize hits this same gate,
+            # so neither ever commits it. Fall through to a normal commit attempt — commit_turns
+            # gates on has_staged_changes and no-ops (returns False) if nothing is actually
+            # staged, so a truly empty turn is still skipped, but real edits are captured.
             debug_fn(
-                f"agent parse consumed without final response "
+                f"committing finished turn with no final text response "
                 f"session_id={self.state.backend_session_id} turns={len(all_turns)}"
             )
-            return False, awaited
 
         committed = commit_fn(
             turns=all_turns,
@@ -672,8 +690,13 @@ class CommitEngine:
         if committed:
             # Advance the watermark for THIS conversation so the next parse cycle only
             # exports its new turns — keyed per conversation so a later switch back to a
-            # different conversation reads its own mark, never this one's.
-            self.state.set_backend_message_id(self.state.backend_session_id, complete_turns[-1].assistant_message_id)
+            # different conversation reads its own mark, never this one's. Prefer the last turn
+            # that actually carried a response; fall back to the last turn's ids for a no-text
+            # finished turn (its assistant id is empty, so the user id anchors the watermark).
+            watermark = complete_turns[-1] if complete_turns else last_turn
+            mark_id = watermark.assistant_message_id or watermark.user_message_id if watermark else None
+            if mark_id:
+                self.state.set_backend_message_id(self.state.backend_session_id, mark_id)
             debug_fn(
                 f"agent commit created session_id={self.state.backend_session_id} "
                 f"assistant_id={self.state.last_backend_message_id}"
