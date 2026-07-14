@@ -659,6 +659,9 @@ class ProxyRunner:
         self.last_child_output = 0.0
         self.last_user_input = 0.0  # monotonic time of the user's last keystroke (drives idle backoff)
         self.last_child_output_sample = b""
+        # (session id, resolved transcript path) cache for _active_transcript_mtime, so the
+        # liveness stat doesn't re-scan the project dirs every idle tick.
+        self._transcript_path_cache: tuple[str | None, Path | None] = (None, None)
         self._last_spawn_command: list[str] = []  # the exact command of the most recent spawn
         # Set when the backend exits repeatedly and aGiTrack stops relaunching, so
         # run() can echo the reason on the restored host screen instead of leaving
@@ -1115,6 +1118,7 @@ class ProxyRunner:
                 "message": None,
                 "message_until": 0.0,
                 "last_user_input": 0.0,
+                "_transcript_path_cache": (None, None),
                 "_message_scroll": 0,
                 "_message_max_scroll": 0,
                 "_message_sticky": False,
@@ -2000,12 +2004,18 @@ class ProxyRunner:
             self._debug(f"manual cover reconcile failed: {error!r}")
         self._render_manual_trailer()
 
-    def _auto_fold_latent_pending(self) -> None:
+    def _auto_fold_latent_pending(self, *, force: bool = False) -> None:
         """No-worktree AUTO mode: fold the pending latent turns into a real commit ourselves, so
         the branch advances per turn (like normal auto mode) but the interaction trace/metadata
         rides the SAME commit as the code — no separate cover. A clean working tree means the agent
         (or user) already committed its work, in which case the prepare-commit-msg fold hook folded
-        the tracking into THAT commit (cover being only the backup), so there is nothing to do."""
+        the tracking into THAT commit (cover being only the backup), so there is nothing to do.
+
+        ``force`` skips the summary-defer wait below: it is set on the EXIT finalize, where the
+        summary has already been joined and serviced separately, and where we must land the commit
+        NOW — the throttled poll that normally folds does not run during teardown, so without this
+        the turn's changes would stay recorded only as a latent commit and never reach HEAD (the
+        reported 'commit not made, not even on exit' bug in no-worktree auto mode)."""
         if not self._noworktree_auto:
             return
         tip = self.repo.ref_sha(self._manual_ref())
@@ -2022,7 +2032,7 @@ class ProxyRunner:
         # ~3s, long before the multi-second LLM summary returns, so the folded commit keeps its
         # prompt-based subject and the summary is orphaned as a note (the reported no-worktree bug).
         # Bounded by SUMMARY_WAIT_SECONDS: past the deadline we fold as-is, summary becomes notes-only.
-        if self._summary_blocks_integration(time.monotonic()):
+        if not force and self._summary_blocks_integration(time.monotonic()):
             return
         bodies = self._manual_pending_bodies()
         message = build_auto_fold_message(bodies)
@@ -7983,8 +7993,17 @@ class ProxyRunner:
         # resume is untouched and its shared hardlink is preserved).
         retarget = getattr(self.backend, "retarget_working_dir", None)
         if retarget is not None:
+            # Pass the launch dir's current branch so retargeting a worktree session onto the base
+            # repo (the --no-worktree switch) also moves the stale ``agitrack/…`` worktree branch
+            # off the relocated rows — otherwise every row keeps the worktree branch and the resumed
+            # agent still reads its whole history as "in a worktree." Best-effort: None just skips it.
             try:
-                if retarget(self.repo.repo, session_id, str(self.repo.repo)):
+                launch_branch = self.repo.current_branch()
+            except Exception as error:
+                self._debug(f"resume branch lookup failed: {error!r}")
+                launch_branch = None
+            try:
+                if retarget(self.repo.repo, session_id, str(self.repo.repo), git_branch=launch_branch):
                     self._debug(f"retargeted resumed session {session_id} cwd to {self.repo.repo}")
             except Exception as error:
                 self._debug(f"retarget_working_dir failed: {error!r}")
@@ -9678,10 +9697,17 @@ class ProxyRunner:
         from agitrack.backends.claude import ClaudeBackend
         from agitrack.backends.opencode import OpenCodeBackend
 
-        backend_class = OpenCodeBackend if self.state.backend == "opencode" else ClaudeBackend
+        from agitrack.summaries.model_select import compatible_summarization_model
+
+        backend_name = "opencode" if self.state.backend == "opencode" else "claude"
+        backend_class = OpenCodeBackend if backend_name == "opencode" else ClaudeBackend
         model = self.state.summarization_model
         if model is None and self.global_config is not None:
             model = self.global_config.summarization_model
+        # The summarizer runs THIS session's backend; a summarization_model configured for a
+        # different backend (e.g. a Claude id while the session runs OpenCode) is invalid there and
+        # makes every summary fail — drop it and use the backend's default instead.
+        model = compatible_summarization_model(backend_name, model)
         # The summarizer must NOT run in the session worktree (or the repo):
         # its headless calls record real backend sessions keyed by cwd, which
         # the parse worker / exit adoption would then resume instead of the
@@ -10180,6 +10206,13 @@ class ProxyRunner:
         if self._summary_thread is not None and self._summary_thread.is_alive():
             self._summary_thread.join(timeout=self.EXIT_SUMMARY_GRACE_SECONDS)
         self._service_commit_summary()
+        # No-worktree AUTO mode records each turn as a hidden LATENT commit; the real commit is
+        # normally made by the throttled poll (_auto_fold_latent_pending). That poll does NOT run
+        # during exit teardown, so fold any pending latent turns HERE — otherwise a turn finished
+        # just before quitting is recorded latently but never lands on HEAD. Forced past the
+        # summary-defer gate: the summary was already joined and serviced just above. A no-op in
+        # every other mode, and idempotent (a clean tree vs HEAD means the live poll already folded).
+        self._auto_fold_latent_pending(force=True)
         self._integrate_session_on_exit()
         if self._exit_aborted:
             return  # Esc on a finalize popup (e.g. a merge prompt) aborted the exit — keep the worktree
@@ -10911,8 +10944,48 @@ class ProxyRunner:
             self._debug(f"untracked snapshot failed: {error!r}")
             self.untracked_before_turn = frozenset()
 
+    def _active_transcript_mtime(self) -> float | None:
+        # The mtime of the active session's live transcript, as a cheap "is the backend still
+        # working" signal. Only consulted once the PTY has already gone quiet (see
+        # `_backend_idle_for`). The transcript PATH is resolved once per session id and cached, so
+        # the per-tick cost is a single `stat`, not a re-scan of every project dir.
+        session_id = getattr(self.state, "backend_session_id", None) if self.state else None
+        if not session_id:
+            return None
+        cached_id, cached_path = self._transcript_path_cache
+        if cached_id != session_id:
+            resolver = getattr(self.backend, "session_transcript_path", None)
+            cached_path = None
+            if resolver is not None:
+                try:
+                    cached_path = resolver(session_id)
+                except Exception as error:
+                    self._debug(f"transcript path lookup failed: {error!r}")
+            self._transcript_path_cache = (session_id, cached_path)
+        if cached_path is None:
+            return None
+        try:
+            return cached_path.stat().st_mtime
+        except OSError:
+            self._transcript_path_cache = (None, None)  # vanished — re-resolve next time
+            return None
+
+    def _backend_idle_for(self, seconds: float) -> bool:
+        """Whether the backend has produced NOTHING for ``seconds`` — judged by BOTH the PTY
+        output and the session transcript. A sub-agent runs inside the main agent and may print
+        nothing to the terminal while it works, but Claude keeps appending its sidechain messages
+        to the transcript, so the file mtime advances. Without the transcript check aGiTrack would
+        read the quiet terminal as "turn finished" and try to commit (and, in no-worktree mode,
+        offer to commit the user's changes) while the turn is in fact still running."""
+        if time.monotonic() - self.last_child_output < seconds:
+            return False
+        mtime = self._active_transcript_mtime()
+        if mtime is not None and time.time() - mtime < seconds:
+            return False
+        return True
+
     def _clear_agent_in_flight_if_idle(self) -> None:
-        if self.agent_in_flight and time.monotonic() - self.last_child_output >= self.CHILD_IDLE_SECONDS:
+        if self.agent_in_flight and self._backend_idle_for(self.CHILD_IDLE_SECONDS):
             self.agent_in_flight = False
 
     def _record_user_prompt(self, prompt_text: str) -> None:
@@ -11105,7 +11178,9 @@ class ProxyRunner:
         # never advanced, so this naturally reduces to the old poll-then-read once
         # the backend goes idle.)
         worktree_settled = now - self._last_change_at >= self.FILE_STABLE_SECONDS
-        backend_idle = now - self.last_child_output >= self.CHILD_IDLE_SECONDS
+        # Transcript-aware: a silent sub-agent keeps the turn running even with a quiet terminal,
+        # so aGiTrack must not treat this as the turn ending (would commit / offer mid-turn).
+        backend_idle = self._backend_idle_for(self.CHILD_IDLE_SECONDS)
         if self.status_check_pending and worktree_settled and backend_idle:
             status = self.repo.status_short()
             self._prune_declined_untracked()
@@ -11142,10 +11217,7 @@ class ProxyRunner:
             if self.verbose:
                 self._render_status(f"git changes found; parsing {self.backend.name} session")
             return
-        if (
-            now - self._last_change_at < self.FILE_STABLE_SECONDS
-            or now - self.last_child_output < self.CHILD_IDLE_SECONDS
-        ):
+        if now - self._last_change_at < self.FILE_STABLE_SECONDS or not self._backend_idle_for(self.CHILD_IDLE_SECONDS):
             if self.verbose:
                 self._render_status(f"git changes found; waiting for {self.backend.name} to become idle")
             return

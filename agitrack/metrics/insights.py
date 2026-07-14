@@ -61,6 +61,35 @@ _MAX_PLAUSIBLE_TURN_SECONDS = 8 * 3600
 
 _SESSION_RE = re.compile(r"backend_session_id:\s*(\S+)")
 
+# Synthetic markers the transcript injects in place of a real user prompt. A turn the agent ran
+# off the back of a completed background task carries ``(background task completed)`` rather than
+# anything the user typed (see ``_BACKGROUND_TURN_LABEL`` in transcripts/claude.py). When several
+# such turns fold into one commit the label repeats. These are not user asks, so they must not be
+# read as prompts — otherwise the repeated-asks card "detects" the machine talking to itself. The
+# marker is stripped wherever it appears; whatever real text remains (a follow-up the user typed
+# after the background turn opened) is kept and analysed normally.
+_SYNTHETIC_PROMPT_MARKERS = ("(background task completed)",)
+
+
+def _user_prompt(prompt: str) -> str:
+    """The genuine user text in a turn's prompt: the recorded prompt with synthetic
+    background-task markers removed. Empty when the turn had no real user prompt at all."""
+    text = prompt
+    for marker in _SYNTHETIC_PROMPT_MARKERS:
+        text = text.replace(marker, " ")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _involves_background_task(stat: CommitStat) -> bool:
+    """Whether this turn is part of a background-task workflow — its recorded prompt (or any of
+    the folded turns' prompts) carries the ``(background task completed)`` marker. Such a turn's
+    wall-clock includes time the agent spent WAITING on the background task (a build, a test run,
+    a sub-agent), not thinking — so it must not count as a long feedback loop the user could have
+    steered. Deliberately conservative: only turns the marker actually tags are treated as waits."""
+    texts = [stat.prompt or "", *(stat.user_prompts or [])]
+    return any(marker in text for text in texts for marker in _SYNTHETIC_PROMPT_MARKERS)
+
+
 # A prompt that reacts to the PREVIOUS turn going wrong. Start-anchored phrases plus a few
 # unambiguous "it is still broken" fragments; deliberately conservative — a missed
 # correction only weakens the signal, a false positive poisons it.
@@ -251,15 +280,16 @@ def _correction_loops(ctx: Context) -> Finding | None:
         for index, stat in enumerate(session_turns):
             if index == 0:
                 continue  # a session's first prompt has no prior turn to correct
-            if not stat.prompt.strip():
-                continue
+            prompt = _user_prompt(stat.prompt)
+            if not prompt:
+                continue  # a background-task turn is not a user follow-up — don't count it
             eligible += 1
-            if _is_corrective(stat.prompt):
+            if _is_corrective(prompt):
                 corrective.append(stat)
                 chain += 1
                 if chain > longest_chain:
                     longest_chain = chain
-                    chain_example = stat.prompt.strip()
+                    chain_example = prompt
             else:
                 chain = 0
     if eligible < 10:
@@ -295,11 +325,20 @@ def _correction_loops(ctx: Context) -> Finding | None:
 
 
 def _file_rework(ctx: Context) -> Finding | None:
-    """Files the agent keeps RETURNING to shortly after editing them — iteration churn.
+    """Files the agent keeps RETURNING to shortly after editing them AND churning in place —
+    lines added then removed again, the mark of redoing the same code rather than progressing.
 
-    The signal is quick returns (another edit within the hour), not the delete/insert
-    ratio: replacing a line is one insertion plus one deletion, so any file whose edits
-    modify existing lines has del≈ins no matter how efficient the work was."""
+    Two conditions must both hold, because either alone is a false positive:
+
+    * **Quick returns** — another edit within the hour. Frequency alone isn't rework: a file that
+      houses several features is legitimately edited over and over as each feature is built.
+    * **Balanced add/delete** — across those edits, deletions roughly match insertions, so the
+      file barely grows despite heavy churn. Adding *new* functionality nets positive growth
+      (few deletions); rewriting the *same* region adds and deletes in equal measure. This is
+      what separates "reworking the same lines" from "editing a big file for different reasons".
+
+    (The delete/insert ratio can't be read on a single edit — replacing a line is always 1 ins +
+    1 del — which is why it's applied only in aggregate over a file that is ALSO revisited fast.)"""
     if not ctx.files:
         return None
     total_gaps = 0
@@ -314,7 +353,12 @@ def _file_rework(ctx: Context) -> Finding | None:
         total_quick += quick
         if len(timestamps) >= 8:
             ratio = quick / (len(timestamps) - 1)
-            if quick >= 6 and ratio >= 0.35:
+            ins = sum(i for _ts, i, _dl in changes)
+            dl = sum(d for _ts, _i, d in changes)
+            # Balanced add/delete = the file churns in place instead of growing. Near 1 when the
+            # agent keeps rewriting the same lines; near 0 when it's steadily adding new code.
+            balance = min(ins, dl) / max(ins, dl) if max(ins, dl) else 0.0
+            if quick >= 6 and ratio >= 0.35 and balance >= 0.5:
                 hotspots.append((quick, ratio, len(changes), path))
     if total_gaps < 10:
         return None
@@ -331,17 +375,18 @@ def _file_rework(ctx: Context) -> Finding | None:
     finding.triggered = True
     finding.excess = worst[1] / 0.35
     finding.severity = "high" if worst[0] >= 20 and worst[1] >= 0.5 else "medium"
-    finding.summary = f"{len(hotspots)} file(s) keep being re-edited within the hour."
+    finding.summary = f"{len(hotspots)} file(s) keep being rewritten in place within the hour."
     finding.evidence = [
-        f"{path}: edited in {count} turns, and {quick} of those edits ({ratio:.0%}) came within an "
-        "hour of the previous edit to the same file."
+        f"{path}: edited in {count} turns, {quick} of them ({ratio:.0%}) within an hour of the "
+        "previous edit, with deletions roughly matching insertions — the same code being redone, "
+        "not new code being added."
         for quick, ratio, count, path in hotspots[:3]
     ]
     finding.suggestion = (
-        "Rapid re-edits to the same file mean the turn before didn't land it. For these areas, "
+        "These files churn in place — lines written one turn, removed the next. For such areas, "
         "state the full requirement in one prompt (or ask for a plan first), and insist on a test "
         "or a verification run before the agent reports done — so the next turn builds on the last "
-        "instead of redoing it."
+        "instead of redoing it. (A file simply edited often for DIFFERENT features isn't flagged.)"
     )
     return finding
 
@@ -441,7 +486,7 @@ def _repeated_prompts(ctx: Context) -> Finding | None:
     """The same request typed again and again is a standing task — automation material."""
     counts: dict[str, tuple[int, str]] = {}
     for stat in ctx.turns:
-        prompt = stat.prompt.strip()
+        prompt = _user_prompt(stat.prompt)  # drop synthetic background-task markers first
         if len(prompt) < 15 or prompt.startswith("/"):
             continue  # too short to be a task; slash commands are already automation
         key = _norm_prompt(prompt)
@@ -488,7 +533,7 @@ def _low_yield_turns(ctx: Context) -> Finding | None:
     if len(heavy_no_change) < 5 or fraction < 0.12:
         return finding
     tokens = sum(stat.tokens.get("output", 0) for stat in heavy_no_change)
-    example = next((stat.prompt.strip() for stat in heavy_no_change if stat.prompt.strip()), "")
+    example = next((_user_prompt(stat.prompt) for stat in heavy_no_change if _user_prompt(stat.prompt)), "")
     evidence = [
         f"{len(heavy_no_change)} turns ({fraction:.0%}) produced 10k+ output tokens each without "
         f"changing any file — {_fmt(tokens)} output tokens in total.",
@@ -526,8 +571,9 @@ def _verification_gap(ctx: Context) -> Finding | None:
         code_turns += 1
         if not any(_is_test_path(path) for path in paths):
             untested += 1
-            if len(examples) < 3 and stat.prompt.strip():
-                examples.append(stat.prompt.strip()[:80])
+            example = _user_prompt(stat.prompt)
+            if len(examples) < 3 and example:
+                examples.append(example[:80])
     if code_turns < 10:
         return None
     fraction = untested / code_turns
@@ -595,8 +641,18 @@ def _wide_turns(ctx: Context) -> Finding | None:
 
 def _slow_turns(ctx: Context) -> Finding | None:
     """Turns that ran for a very long wall-clock time. A long turn is a long feedback loop:
-    you cannot steer it, and when it lands wrong the whole run is wasted."""
-    durations = [seconds for seconds in (_duration_seconds(stat) for stat in ctx.turns) if seconds is not None]
+    you cannot steer it, and when it lands wrong the whole run is wasted.
+
+    Turns that were WAITING on a background task (a build, a test run, a sub-agent) are excluded:
+    their wall-clock is idle time the user couldn't have steered anyway, so counting them would
+    flag a non-problem — see :func:`_involves_background_task`."""
+    steerable = [stat for stat in ctx.turns if not _involves_background_task(stat)]
+    background_slow = sum(
+        1
+        for stat in ctx.turns
+        if _involves_background_task(stat) and (seconds := _duration_seconds(stat)) is not None and seconds > 1800
+    )
+    durations = [seconds for seconds in (_duration_seconds(stat) for stat in steerable) if seconds is not None]
     if len(durations) < 10:
         return None
     slow = [seconds for seconds in durations if seconds > 1800]
@@ -618,10 +674,16 @@ def _slow_turns(ctx: Context) -> Finding | None:
         f"(longest {max(slow) / 60:.0f} min; median turn {median(durations) / 60:.0f} min).",
         "Nothing can be corrected mid-turn, so a long turn that lands wrong wastes its whole run.",
     ]
+    if background_slow:
+        finding.evidence.append(
+            f"{background_slow} further long turn(s) were excluded as background-task waits — those "
+            "are fine, so this counts only turns you could have steered."
+        )
     finding.suggestion = (
         "Ask for a plan, or a first slice, before a long autonomous run — a checkpoint you can "
         "redirect at is cheaper than an hour spent in the wrong direction. Long sweeps are better "
-        "delegated to sub-agents that report back."
+        "delegated to sub-agents that report back. (Turns spent waiting on a background task are "
+        "already excluded here — a long wait for a build or test run is not the problem.)"
     )
     return finding
 

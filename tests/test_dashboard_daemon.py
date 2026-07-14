@@ -61,18 +61,50 @@ def test_wait_for_handshake_matches_pid_and_times_out(tmp_path):
     assert daemon.wait_for_handshake(repo, pid=2, timeout=0.2) == {"pid": 2, "url": "http://new/"}
 
 
-def test_start_reuses_a_running_daemon(tmp_path, monkeypatch, capsys):
+def test_start_restarts_a_running_daemon_on_the_same_port(tmp_path, monkeypatch, capsys):
+    # Re-running `agitrack -d` (e.g. after an update) must STOP the old daemon and start a fresh
+    # one — reusing the previous port so the URL doesn't change — not just print "already running"
+    # and leave stale code serving.
     repo = _repo(tmp_path)
     monkeypatch.setattr(
-        daemon, "running_handshake", lambda r: {"pid": 7, "url": "http://127.0.0.1:8765/", "port": 8765}
+        daemon, "running_handshake", lambda r: {"pid": 7, "url": "http://127.0.0.1:9999/", "port": 9999}
+    )
+    terminated: list[int] = []
+    monkeypatch.setattr(daemon, "_terminate_and_wait", lambda pid, *, timeout: terminated.append(pid))
+    spawned: dict[str, object] = {}
+    monkeypatch.setattr(
+        daemon,
+        "spawn_dashboard_daemon",
+        lambda r, **kw: spawned.update(kw) or types.SimpleNamespace(pid=8484),
     )
     monkeypatch.setattr(
-        daemon, "spawn_dashboard_daemon", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not respawn"))
+        daemon, "wait_for_handshake", lambda r, **kw: {"pid": 8484, "url": "http://127.0.0.1:9999/", "port": 9999}
     )
     monkeypatch.setattr(daemon, "open_dashboard_in_browser", lambda url: True)
 
     assert daemon.start_dashboard_daemon(repo, owner_pid=999) == 0
-    assert "already running" in capsys.readouterr().out
+    assert terminated == [7]  # the old daemon was stopped first
+    assert spawned["port"] == 9999  # ...and the replacement asked for the same port
+    out = capsys.readouterr().out
+    assert "Restarting the dashboard daemon" in out
+    assert "daemon live at http://127.0.0.1:9999/" in out
+
+
+def test_start_without_a_running_daemon_does_not_request_a_port(tmp_path, monkeypatch):
+    # A cold start binds the default port; only a RESTART pins a specific one.
+    repo = _repo(tmp_path)
+    monkeypatch.setattr(daemon, "running_handshake", lambda r: None)
+    spawned: dict[str, object] = {}
+    monkeypatch.setattr(
+        daemon,
+        "spawn_dashboard_daemon",
+        lambda r, **kw: spawned.update(kw) or types.SimpleNamespace(pid=1),
+    )
+    monkeypatch.setattr(daemon, "wait_for_handshake", lambda r, **kw: {"pid": 1, "url": "u", "port": 8765})
+    monkeypatch.setattr(daemon, "open_dashboard_in_browser", lambda url: True)
+
+    daemon.start_dashboard_daemon(repo, owner_pid=1)
+    assert spawned.get("port") is None
 
 
 def test_start_spawns_waits_and_reports(tmp_path, monkeypatch, capsys):
@@ -106,6 +138,22 @@ def test_start_reports_failure_when_daemon_never_binds(tmp_path, monkeypatch, ca
 
     assert daemon.start_dashboard_daemon(repo, owner_pid=555) == 1
     assert "did not start" in capsys.readouterr().out
+
+
+def test_spawn_passes_the_requested_port_to_the_child(tmp_path, monkeypatch):
+    repo = _repo(tmp_path)
+    calls: dict[str, list] = {}
+    monkeypatch.setattr(
+        subprocess, "Popen", lambda cmd, **kw: calls.setdefault("cmd", cmd) or types.SimpleNamespace(pid=1)
+    )
+
+    daemon.spawn_dashboard_daemon(repo, owner_pid=42, port=54321)
+    cmd = calls["cmd"]
+    assert "--dashboard-port" in cmd and cmd[cmd.index("--dashboard-port") + 1] == "54321"
+
+    calls.clear()
+    daemon.spawn_dashboard_daemon(repo, owner_pid=42)  # no port -> flag omitted (cold start)
+    assert "--dashboard-port" not in calls["cmd"]
 
 
 def test_stop_reports_when_nothing_running(tmp_path, monkeypatch, capsys):

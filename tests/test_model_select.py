@@ -11,9 +11,42 @@ from unittest.mock import MagicMock, patch
 from agitrack.summaries.model_select import (
     _list_claude_models,
     _list_opencode_models,
+    compatible_summarization_model,
     list_available_models,
     smallest_model,
 )
+
+
+# ---------------------------------------------------------------------------
+# compatible_summarization_model — cross-backend model guard
+# ---------------------------------------------------------------------------
+
+
+def test_opencode_rejects_a_bare_claude_model_id():
+    # The reported bug: a global summarization_model of "claude-haiku-4-5-20251001" under an
+    # OpenCode session made `opencode run --model claude-…` exit non-zero, failing every summary.
+    # OpenCode needs a provider-qualified id, so a bare Claude id is dropped for its default (None).
+    assert compatible_summarization_model("opencode", "claude-haiku-4-5-20251001") is None
+
+
+def test_opencode_keeps_a_provider_qualified_model():
+    assert compatible_summarization_model("opencode", "anthropic/claude-haiku-4-5") == "anthropic/claude-haiku-4-5"
+    assert compatible_summarization_model("opencode", "openai/gpt-5.5") == "openai/gpt-5.5"
+
+
+def test_claude_keeps_a_bare_id_and_drops_a_provider_qualified_one():
+    assert compatible_summarization_model("claude", "claude-haiku-4-5-20251001") == "claude-haiku-4-5-20251001"
+    assert compatible_summarization_model("claude", "haiku") == "haiku"
+    # A provider/model id is OpenCode-shaped, not a Claude CLI id → dropped for the default.
+    assert compatible_summarization_model("claude", "openai/gpt-5.5") is None
+
+
+def test_compatible_model_passthrough_edges():
+    assert compatible_summarization_model("opencode", None) is None
+    assert compatible_summarization_model("claude", None) is None
+    assert compatible_summarization_model("opencode", "") is None
+    # An unknown backend keeps whatever was configured (nothing better to decide).
+    assert compatible_summarization_model("other", "some/model") == "some/model"
 
 
 # ---------------------------------------------------------------------------

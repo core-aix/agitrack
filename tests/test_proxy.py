@@ -1191,6 +1191,65 @@ def test_idle_agent_alone_does_not_clear_turn_awaiting_commit():
     assert runner.turn_awaiting_commit is True  # ...but the turn is still awaiting its commit
 
 
+def _transcript_runner(mtime):
+    # A no-worktree runner whose active backend reports a transcript last touched `mtime` ago
+    # (seconds). A live sub-agent keeps appending, so a small age means the turn is still running.
+    runner = _awaiting_commit_runner()
+    runner._debug = lambda *a, **k: None
+    runner.state = types.SimpleNamespace(backend_session_id="sess-1")
+    stamp = time.time() - mtime
+    path = types.SimpleNamespace(stat=lambda: types.SimpleNamespace(st_mtime=stamp))
+    runner.backend = types.SimpleNamespace(session_transcript_path=lambda sid: path, name="claude")
+    return runner
+
+
+def test_backend_idle_considers_the_transcript_not_just_the_terminal():
+    # PTY silent well past the idle window, but the transcript is still growing (a sub-agent is
+    # running): the backend is NOT idle, so aGiTrack won't treat the turn as finished.
+    runner = _transcript_runner(mtime=1)  # transcript touched 1s ago
+    runner.last_child_output = time.monotonic() - runner.CHILD_IDLE_SECONDS - 5
+
+    assert runner._backend_idle_for(runner.CHILD_IDLE_SECONDS) is False
+
+
+def test_silent_subagent_does_not_clear_agent_in_flight_or_the_commit_guard():
+    # The exact bug: main agent waiting on a sub-agent, terminal quiet, but work ongoing. Neither
+    # `agent_in_flight` nor `turn_awaiting_commit` may drop, or a follow-up prompt would trigger a
+    # user-commit offer over the sub-agent's still-uncommitted edits.
+    runner = _transcript_runner(mtime=1)
+    runner.agent_in_flight = True
+    runner.turn_awaiting_commit = True
+    runner.last_child_output = time.monotonic() - runner.CHILD_IDLE_SECONDS - 5
+
+    runner._clear_agent_in_flight_if_idle()
+
+    assert runner.agent_in_flight is True
+    assert runner.turn_awaiting_commit is True
+
+
+def test_once_the_transcript_goes_quiet_the_turn_is_idle_again():
+    # Sub-agent finished AND the terminal is quiet AND the transcript stopped growing: now the
+    # turn really is done, so the idle timer clears agent_in_flight as before.
+    runner = _transcript_runner(mtime=100.0)  # transcript untouched for 100s
+    runner.agent_in_flight = True
+    runner.last_child_output = time.monotonic() - runner.CHILD_IDLE_SECONDS - 5
+
+    assert runner._backend_idle_for(runner.CHILD_IDLE_SECONDS) is True
+    runner._clear_agent_in_flight_if_idle()
+    assert runner.agent_in_flight is False
+
+
+def test_backend_without_a_transcript_falls_back_to_terminal_idle():
+    # OpenCode has no single stat-able transcript file, so the check degrades to PTY-only.
+    runner = _awaiting_commit_runner()
+    runner._debug = lambda *a, **k: None
+    runner.state = types.SimpleNamespace(backend_session_id="sess-1")
+    runner.backend = types.SimpleNamespace(name="opencode")  # no session_transcript_path
+    runner.last_child_output = time.monotonic() - runner.CHILD_IDLE_SECONDS - 1
+
+    assert runner._backend_idle_for(runner.CHILD_IDLE_SECONDS) is True
+
+
 def _stage_untracked_fn(runner, fake_repo, monkeypatch):
     """Capture the stage_untracked_fn the agent-commit path builds, without running a real commit."""
     captured: dict = {}
@@ -1611,14 +1670,18 @@ def test_stage_backend_resume_retargets_cwd_to_launch_dir(tmp_path):
     import types
 
     runner = make_runner()
-    runner.repo = types.SimpleNamespace(repo=tmp_path)
+    runner.repo = types.SimpleNamespace(repo=tmp_path, current_branch=lambda: "dev")
     calls = {}
     runner.backend = types.SimpleNamespace(
         ensure_resumable=lambda repo, sid: True,
-        retarget_working_dir=lambda repo, sid, cwd: calls.update(repo=repo, sid=sid, cwd=cwd) or True,
+        retarget_working_dir=lambda repo, sid, cwd, *, git_branch=None: (
+            calls.update(repo=repo, sid=sid, cwd=cwd, git_branch=git_branch) or True
+        ),
     )
     runner._stage_backend_resume("sid-1")
-    assert calls == {"repo": tmp_path, "sid": "sid-1", "cwd": str(tmp_path)}
+    # The launch dir's branch is threaded through so a worktree->--no-worktree resume also moves
+    # the stale worktree branch off the relocated rows.
+    assert calls == {"repo": tmp_path, "sid": "sid-1", "cwd": str(tmp_path), "git_branch": "dev"}
 
 
 class _CancelRepo:

@@ -505,13 +505,27 @@ def _recorded_cwds(transcript: str) -> set[str]:
 
 
 def _retarget_rows(
-    transcript: str, *, cwd: str, new_session_id: str | None = None, rewrite_prefixes: tuple[str, ...] = ()
+    transcript: str,
+    *,
+    cwd: str,
+    new_session_id: str | None = None,
+    rewrite_prefixes: tuple[str, ...] = (),
+    git_branch: str | None = None,
 ) -> str:
     """Rewrite every row's ``cwd`` (and, when ``new_session_id`` is given, its ``sessionId``).
     When ``rewrite_prefixes`` is given, also repoint any absolute path under those prefixes (a
     worktree the session previously ran in) to ``cwd`` — so a resumed agent edits the launch dir,
-    not the old worktree it sees throughout its history. Non-JSON lines, and rows nothing applies
-    to, are left byte-for-byte unchanged."""
+    not the old worktree it sees throughout its history.
+
+    When ``git_branch`` is given, a row whose ``cwd`` is being MOVED to ``cwd`` (i.e. it was
+    recorded somewhere else) also has its ``gitBranch`` retargeted to ``git_branch``. This is the
+    last worktree fingerprint: after a session made in a worktree is resumed under ``--no-worktree``
+    on the base repo, leaving every row stamped with the old ``agitrack/…`` worktree branch makes
+    the resumed agent still read its whole history as "in a worktree." The rewrite is deliberately
+    gated on the cwd actually moving, so a normal in-worktree resume (cwd unchanged, only the branch
+    advanced a turn) is left byte-for-byte identical and its shared hardlink is preserved.
+
+    Non-JSON lines, and rows nothing applies to, are left byte-for-byte unchanged."""
     prefixes = tuple(p for p in rewrite_prefixes if p)
     out: list[str] = []
     for line in transcript.split("\n"):
@@ -527,11 +541,19 @@ def _retarget_rows(
         if not isinstance(row, dict):
             out.append(line)
             continue
+        # Whether this row is being relocated is decided from its ORIGINAL cwd, before the
+        # prefix rewrite below can already drag a worktree-prefixed cwd onto the target.
+        cwd_moved = "cwd" in row and row.get("cwd") != cwd
         rewritten = _rewrite_path_prefixes(row, prefixes, cwd) if prefixes else row
         changed = rewritten != row
         row = rewritten
-        if "cwd" in row and row.get("cwd") != cwd:
+        if cwd_moved:
             row["cwd"] = cwd
+            changed = True
+        # Only move the branch on a row whose cwd we just relocated — the session is being
+        # taken out of its worktree, so its worktree branch no longer describes where it runs.
+        if git_branch and cwd_moved and row.get("gitBranch") not in (None, git_branch):
+            row["gitBranch"] = git_branch
             changed = True
         if new_session_id and "sessionId" in row and row.get("sessionId") != new_session_id:
             row["sessionId"] = new_session_id
@@ -540,7 +562,7 @@ def _retarget_rows(
     return "\n".join(out)
 
 
-def retarget_session_cwd(repo: Path, session_id: str, cwd: str) -> bool:
+def retarget_session_cwd(repo: Path, session_id: str, cwd: str, *, git_branch: str | None = None) -> bool:
     """Rewrite the ``cwd`` recorded in ``repo``'s copy of ``session_id``'s transcript
     to ``cwd``, so a resumed Claude session runs in ``cwd`` instead of a directory the
     conversation recorded earlier.
@@ -552,7 +574,13 @@ def retarget_session_cwd(repo: Path, session_id: str, cwd: str) -> bool:
     original worktree's transcript) is broken first via ``unlink`` so ONLY this repo's
     copy is retargeted — the two then diverge, which is correct: they now run in
     different directories. No-op (and cheap) when the transcript is absent or already
-    points at ``cwd``. Returns True only when a rewrite actually happened."""
+    points at ``cwd``. Returns True only when a rewrite actually happened.
+
+    ``git_branch`` (the launch dir's current branch) additionally retargets the ``gitBranch``
+    of any row whose cwd is being moved, so a worktree session resumed on the base repo no
+    longer carries the old ``agitrack/…`` worktree branch throughout its history — the final
+    worktree fingerprint that otherwise makes the resumed agent read itself as still in a
+    worktree. Gated on the cwd actually moving, so a plain in-worktree resume is untouched."""
     if not session_id or not cwd:
         return False
     path = _session_path(Path(repo), session_id)
@@ -568,7 +596,7 @@ def retarget_session_cwd(repo: Path, session_id: str, cwd: str) -> bool:
     # Scoped to our own ``.agitrack/worktrees/`` dirs so an imported session's unrelated absolute
     # paths (which don't exist in this repo anyway) are left alone — only its cwd field is aligned.
     worktree_prefixes = tuple(d for d in (_recorded_cwds(original) - {cwd}) if "/.agitrack/worktrees/" in d)
-    retargeted = _retarget_rows(original, cwd=cwd, rewrite_prefixes=worktree_prefixes)
+    retargeted = _retarget_rows(original, cwd=cwd, rewrite_prefixes=worktree_prefixes, git_branch=git_branch)
     if retargeted == original:
         return False  # already at this cwd — leave the (possibly hardlinked) file alone
     try:
@@ -639,6 +667,30 @@ def _find_session_file(session_id: str) -> Path | None:
         if newest is None or mtime > newest[0]:
             newest = (mtime, candidate)
     return newest[1] if newest else None
+
+
+def session_transcript_path(session_id: str) -> Path | None:
+    """The path to a session's live transcript ``.jsonl`` (the newest match across project
+    dirs), or None if not found. A caller can cache this and ``stat`` it repeatedly as a cheap
+    liveness signal, instead of re-scanning the project dirs each time."""
+    return _find_session_file(session_id) if session_id else None
+
+
+def session_transcript_mtime(session_id: str) -> float | None:
+    """The mtime (epoch seconds) of a session's transcript file, or None if not found.
+
+    A CHEAP liveness signal (a single ``stat``, no read): Claude appends each message to the
+    ``.jsonl`` as it happens — including a sub-agent's sidechain messages — so a turn that is
+    working but printing nothing to the terminal (the main agent waiting on a sub-agent) still
+    advances this. It lets aGiTrack tell "the turn is still running" from "the terminal is just
+    quiet", so it doesn't decide the turn ended and try to commit mid-turn."""
+    path = session_transcript_path(session_id)
+    if path is None:
+        return None
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
 
 
 _TIMESTAMP_RE = re.compile(r'"timestamp"\s*:\s*"([^"]+)"')
