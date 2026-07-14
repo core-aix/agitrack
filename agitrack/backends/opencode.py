@@ -132,8 +132,12 @@ class OpenCodeBackend:
             watchdog.start()
         child_ids: set[str] = set()
         try:
+            # A bare run is a BACKGROUND helper (the summarizer): it must never echo the streamed
+            # agent text to aGiTrack's own stdout, which is the host terminal — otherwise the
+            # summary leaks onto the screen next to the user's input box while a session is live.
+            # A non-bare run is foreground shell mode, where streaming the progress is the point.
             final_response, parsed_session_id, parsed_model, tokens = self._read_events(
-                process.stdout, child_ids=child_ids
+                process.stdout, child_ids=child_ids, stream_console=not bare
             )
             exit_code = process.wait()
         finally:
@@ -159,7 +163,7 @@ class OpenCodeBackend:
         )
 
     def _read_events(
-        self, output: IO[str] | None, *, child_ids: set[str] | None = None
+        self, output: IO[str] | None, *, child_ids: set[str] | None = None, stream_console: bool = True
     ) -> tuple[str, str | None, str | None, TokenUsage]:
         if output is None:
             return "", None, None, TokenUsage()
@@ -181,7 +185,7 @@ class OpenCodeBackend:
             session_id = session_id or parsed_session_id
             model = model or parsed_model
             self._add_tokens(tokens, parsed_tokens)
-            if display_text:
+            if display_text and stream_console:
                 print(display_text, end="" if display_text.endswith("\n") else "\n")
             if final_text:
                 final_parts.append(final_text)
