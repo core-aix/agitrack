@@ -14,6 +14,10 @@ aGiTrack stands for agent + git tracking. It is a Python library and interactive
 
 - `docs/user-flow.md` holds the complete, graph-rendered map of aGiTrack's interactive user flow (Mermaid flowcharts: startup gating, base↔worktree commit/stage/sync, the agent turn and integration, copy-back, the Ctrl-G menu, self-update, exit). It is linked prominently from the README. **It must be kept in sync with the actual flow:** whenever the user flow changes — a new or reworded prompt, a changed option label, a new decision based on file/commit/session status, a new Ctrl-G command, or a changed exit/update path — update the matching diagram in the same change.
 
+## Writing Style
+
+- **Do not use em-dashes** (Unicode U+2014, or the `&mdash;` / `&#8212;` HTML entities) in prose aGiTrack produces or ships: the website (`docs/index.html`, `docs/docs.html`), the README, docs, and other user-facing text. Use a colon, comma, parentheses, or a period instead.
+
 ## Commit Types
 
 - Agent commits use the `<aGiTrack>` tag.
