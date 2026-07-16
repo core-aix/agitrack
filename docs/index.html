@@ -3,8 +3,54 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>aGiTrack - Agent + Git Tracking</title>
-<meta name="description" content="aGiTrack wraps Claude Code and OpenCode with Git: every agent turn becomes a traceable commit with the full interaction trace, model, and token usage.">
+<title>aGiTrack — every AI coding-agent turn becomes a traceable Git commit</title>
+<meta name="description" content="aGiTrack wraps your coding agent backends with Git: every agent turn becomes a traceable commit carrying the full interaction trace, model, and token cost — with a live dashboard of what your agents did.">
+<link rel="canonical" href="https://agitrack.core-aix.org/">
+<meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1">
+<meta name="author" content="core-aix">
+<meta name="keywords" content="AI coding agent, coding agent backends, git tracking, agent commits, code provenance, code review, token usage, agent dashboard, git commit trace">
+<meta name="theme-color" content="#070b09">
+<!-- Point crawlers straight at the source repository -->
+<link rel="me" href="https://github.com/core-aix/agitrack">
+<meta name="repository" content="https://github.com/core-aix/agitrack">
+<!-- Open Graph / social preview -->
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="aGiTrack">
+<meta property="og:title" content="aGiTrack — every AI coding-agent turn, committed with its story">
+<meta property="og:description" content="Wrap your coding agent backends with Git: every agent turn becomes a traceable commit carrying the full interaction trace, model, and token cost — with a live dashboard of what your agents did.">
+<meta property="og:url" content="https://agitrack.core-aix.org/">
+<meta property="og:image" content="https://agitrack.core-aix.org/images/dashboard-v4.png">
+<meta property="og:image:alt" content="The aGiTrack dashboard: agent commits, token usage, and efficiency insights.">
+<meta property="og:locale" content="en_US">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="aGiTrack — every AI coding-agent turn, committed with its story">
+<meta name="twitter:description" content="Wrap your coding agent backends with Git: every agent turn becomes a traceable commit with the full interaction trace, model, and token cost.">
+<meta name="twitter:image" content="https://agitrack.core-aix.org/images/dashboard-v4.png">
+<!-- Structured data: helps Google understand the project and show a last-updated date -->
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "aGiTrack",
+  "alternateName": "agent + git tracking",
+  "description": "aGiTrack wraps your coding agent backends with Git: every finished agent turn becomes a traceable commit carrying the full interaction trace, model, and token cost, plus a live dashboard of what your agents did.",
+  "url": "https://agitrack.core-aix.org/",
+  "applicationCategory": "DeveloperApplication",
+  "operatingSystem": "macOS, Linux, Windows",
+  "softwareVersion": "0.4.2",
+  "dateModified": "2026-07-16",
+  "codeRepository": "https://github.com/core-aix/agitrack",
+  "downloadUrl": "https://pypi.org/project/agitrack/",
+  "installUrl": "https://pypi.org/project/agitrack/",
+  "license": "https://www.apache.org/licenses/LICENSE-2.0",
+  "author": { "@type": "Organization", "name": "core-aix", "url": "https://github.com/core-aix" },
+  "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+  "sameAs": [
+    "https://github.com/core-aix/agitrack",
+    "https://pypi.org/project/agitrack/"
+  ]
+}
+</script>
 <link rel="icon" type="image/svg+xml" href="images/favicon.svg">
 <link rel="icon" type="image/png" href="images/favicon-64.png">
 <link rel="apple-touch-icon" href="images/apple-touch-icon.png">
@@ -178,9 +224,9 @@ footer .sha{font-size:12px}
   <header>
     <div class="brand reveal r1"><span class="a">a</span>GiTrack</div>
     <p class="tagline reveal r2"><span class="tag">&lt;aGiTrack&gt;</span> every agent turn, committed with its story<span class="cursor"></span></p>
-    <p class="sub reveal r3">aGiTrack runs <strong>Claude Code</strong> or <strong>OpenCode</strong> for you and turns every finished
+    <p class="sub reveal r3">aGiTrack runs your <strong>coding agent backend</strong> for you and turns every finished
     agent turn into a git commit, recording what you asked, what it did, the model, and the tokens it cost. Use
-    the agent exactly as you would on its own.</p>
+    the agent exactly as you would on its own. <a href="#backends">See supported backends ↓</a></p>
     <div class="hero-actions reveal r4">
       <a class="btn" href="#install">pip install agitrack</a>
       <a class="btn alt" href="docs.html">read the docs</a>
@@ -268,7 +314,7 @@ Added --version using the package metadata; prints and exits.
         </div>
         <div class="branch" data-ref="agitrack -b">
           <h3>Background · Auto</h3>
-          <p>Prefer a GUI? Drive the agent from <em>any</em> UI, the <strong>Claude desktop app</strong>, an IDE
+          <p>Prefer a GUI? Drive the agent from <em>any</em> UI, its <strong>own desktop app</strong>, an IDE
           extension, a chat window, while aGiTrack tracks it <strong>headlessly</strong> and commits each turn.
           Runs as a daemon; <span class="p">agitrack -b stop</span> when done.</p>
         </div>
@@ -328,7 +374,7 @@ Added --version using the package metadata; prints and exits.
         <span class="subject"><span class="tag">&lt;aGiTrack&gt;</span> reconstruct history from past sessions</span>
       </div>
       <h2>Didn't use it from day one? Show the history anyway.</h2>
-      <p>Already built your project with Claude or OpenCode, without aGiTrack? Run
+      <p>Already built your project with a coding agent, without aGiTrack? Run
       <span class="p">agitrack --backtrace</span>. It reads the coding-agent transcripts already on your machine and
       <strong>reconstructs</strong> what those sessions did here: tokens, models, lines changed, the file-by-file history,
       and the full conversation behind every change, in the same dashboard, clearly marked as a historical
@@ -362,7 +408,7 @@ Added --version using the package metadata; prints and exits.
         </div></div>
         <div class="step"><div>
           <code>cd your-repo && agitrack</code>
-          <div class="note">launches your default backend's TUI (Claude Code or OpenCode) under aGiTrack's watch</div>
+          <div class="note">launches your default <a href="#backends">coding agent backend</a>'s TUI under aGiTrack's watch</div>
         </div></div>
         <div class="step"><div>
           <code>Ctrl-G</code>
@@ -372,6 +418,31 @@ Added --version using the package metadata; prints and exits.
       <p style="margin-top:18px">Prompt the agent as usual. When the turn settles, the commit is already there.
       <span class="p">git log</span> tells the rest. Prefer an editor? aGiTrack also runs as a
       <a href="docs.html#vs-code-extension">VS Code extension</a>, one click, same experience.</p>
+    </section>
+
+    <section class="commit" id="backends">
+      <div class="commit-head">
+        <span class="sha">b4ck3nd</span>
+        <span class="subject">supported backends</span>
+      </div>
+      <h2>Bring your own coding agent.</h2>
+      <p>aGiTrack is backend-agnostic: it wraps the coding agent you already use and records its work the same
+      way, whichever one it is. Two are supported today, and the list is designed to grow.</p>
+      <div class="branches two">
+        <div class="branch" data-ref="agitrack --backend claude">
+          <h3>Claude Code</h3>
+          <p>Anthropic's coding agent CLI. Full support: interactive TUI, background/headless tracking, per-turn
+          commits with the complete interaction trace, model, and token cost.</p>
+        </div>
+        <div class="branch" data-ref="agitrack --backend opencode">
+          <h3>OpenCode</h3>
+          <p>The open-source coding agent, run against any provider/model it supports. Same per-turn tracking,
+          dashboard, and traced commits as every other backend.</p>
+        </div>
+      </div>
+      <p style="margin-top:16px"><strong>More backends are on the roadmap.</strong> aGiTrack talks to each agent
+      through a small backend adapter, so support for additional coding agents can be added without changing how
+      your commits, dashboard, or history work. Want one covered? <a href="https://github.com/core-aix/agitrack/issues">Open an issue.</a></p>
     </section>
 
     <section class="commit agent">
@@ -392,8 +463,8 @@ Added --version using the package metadata; prints and exits.
   </main>
 
   <footer>
-    <span><span class="sha">aGiTrack</span> · agent + git tracking · Apache-2.0</span>
-    <span><a href="docs.html">docs</a> · <a href="https://github.com/core-aix/agitrack/tree/main/docs">view source</a></span>
+    <span><span class="sha">aGiTrack</span> · agent + git tracking · v0.4.2 · Apache-2.0 · updated <time datetime="2026-07-16">2026-07-16</time></span>
+    <span><a href="https://github.com/core-aix/agitrack" rel="me">github.com/core-aix/agitrack</a> · <a href="docs.html">docs</a> · <a href="https://pypi.org/project/agitrack/">PyPI</a></span>
   </footer>
 </div>
 
