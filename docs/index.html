@@ -230,7 +230,7 @@ footer .sha{font-size:12px}
     <p class="tagline reveal r2"><span class="tag">&lt;aGiTrack&gt;</span> every agent turn, committed with its story<span class="cursor"></span></p>
     <p class="sub reveal r3">aGiTrack runs your <strong>coding agent backend</strong> for you and turns every finished
     agent turn into a git commit, recording what you asked, what it did, the model, and the tokens it cost. Use
-    the agent exactly as you would on its own. <a href="#backends">See supported backends ↓</a></p>
+    the agent exactly as you would on its own.</p>
     <div class="hero-actions reveal r4">
       <a class="btn" href="#install">pip install agitrack</a>
       <a class="btn alt" href="docs.html">read the docs</a>
@@ -360,11 +360,9 @@ Added --version using the package metadata; prints and exits.
         <span class="subject"><span class="tag">&lt;aGiTrack&gt;</span> surface how the agents are being driven</span>
       </div>
       <h2>Not how much it wrote. How well you drove it.</h2>
-      <p>The dashboard mines your history for the habits that quietly cost you time and tokens: correction
-      loops, rework hotspots, unverified turns, ballooning context. Then it tells you what to change, each finding
-      backed by the numbers behind it.</p>
-      <p>It follows the <strong>filter</strong>, so narrowing to last week scores last week, and every card shows
-      whether the habit is <span class="p">&darr;</span> improving or <span class="p">&uarr;</span> getting worse.</p>
+      <p>The dashboard surfaces the habits that quietly cost time and tokens: correction loops, rework hotspots,
+      unverified turns, ballooning context. It scores the current filter and flags each one
+      <span class="p">&darr;</span> improving or <span class="p">&uarr;</span> getting worse, backed by the numbers.</p>
       <div class="term">
         <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="title">agitrack -d · agent efficiency</span></div>
         <a href="images/efficiency-insights.png" target="_blank"><img class="shot" src="images/efficiency-insights.png" loading="lazy"
@@ -378,15 +376,10 @@ Added --version using the package metadata; prints and exits.
         <span class="subject"><span class="tag">&lt;aGiTrack&gt;</span> reconstruct history from past sessions</span>
       </div>
       <h2>Didn't use it from day one? Show the history anyway.</h2>
-      <p>Already built your project with a coding agent, without aGiTrack? Run
-      <span class="p">agitrack --backtrace</span>. It reads the coding-agent transcripts already on your machine and
-      <strong>reconstructs</strong> what those sessions did here: tokens, models, lines changed, the file-by-file history,
-      and the full conversation behind every change, in the same dashboard, clearly marked as a historical
-      view. No prior aGiTrack use, nothing uploaded, and it works even in a folder that was never a git repo.</p>
-      <p>Want it in your <strong>real</strong> git history? <span class="p">agitrack --backtrace commit</span>
-      replays your commits onto a new branch and stamps the aGiTrack metadata onto the ones your agents produced,
-      keeping your own commits verbatim. It only ever writes to a new branch and leaves your current one untouched;
-      just run it and follow the prompts.</p>
+      <p>Built your project with a coding agent before aGiTrack? <span class="p">agitrack --backtrace</span>
+      <strong>reconstructs</strong> what those past sessions did from the transcripts already on your machine:
+      tokens, models, lines changed, and the conversation behind every change, in the same dashboard. Nothing
+      uploaded, and it works even outside a git repo.</p>
       <div class="steps" style="margin-top:22px">
         <div class="step"><div>
           <code>agitrack --backtrace</code>
