@@ -1,0 +1,46 @@
+name: Docs sitemap
+
+# Keep docs/sitemap.xml (and the homepage's update date) in step with the published site: on any
+# push that touches docs/, recompute each page's <lastmod> from git history and commit the result
+# if it changed. The dates come from each page's last CONTENT commit (this job's own refresh
+# commits are excluded), so the run is idempotent — an unchanged site regenerates identical files
+# and commits nothing.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+
+# Least privilege: only the ability to push the regenerated sitemap back.
+permissions:
+  contents: write
+
+concurrency:
+  group: docs-sitemap-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sitemap:
+    runs-on: ubuntu-latest
+    # Skip the job's OWN refresh commits. (Pushes made with GITHUB_TOKEN don't trigger workflows,
+    # so this is belt-and-suspenders against any manual re-run of such a commit.)
+    if: "!contains(github.event.head_commit.message, 'auto-update sitemap timestamps')"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history so `git log` can date each page
+
+      - name: Regenerate sitemap + update date
+        run: python3 docs/generate_sitemap.py
+
+      - name: Commit if the sitemap changed
+        run: |
+          if git diff --quiet -- docs/sitemap.xml docs/index.html; then
+            echo "sitemap already current — nothing to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/sitemap.xml docs/index.html
+          git commit -m "chore(docs): auto-update sitemap timestamps [skip ci]"
+          git push
