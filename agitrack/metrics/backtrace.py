@@ -76,6 +76,11 @@ class BacktraceView:
         ]
         if self.dropped_sessions:
             parts.append(f"Older sessions beyond the most recent {MAX_SESSIONS} were not included.")
+        parts.append(
+            "Tip: run 'agitrack --backtrace commit' to bake this history into your git commit "
+            "messages, then launch your coding agent through 'agitrack' and everything is fully "
+            "tracked going forward."
+        )
         return " ".join(parts)
 
 

@@ -687,6 +687,11 @@ def test_backtrace_server_serves_learn_with_banner_and_insights(tmp_path, monkey
         assert isinstance(data["insights"], list) and data["insights"]  # correction loops fire
         page = urllib.request.urlopen(f"{base}/learn", timeout=15).read().decode()
         assert "btbanner" in page and "BACKTRACE" in page and "backtraced history" in page
+        # Both banners point at the way to full tracking: bake the history in, then run
+        # the agent through aGiTrack from now on.
+        assert "--backtrace commit" in page and "fully tracked going forward" in page
+        main_page = urllib.request.urlopen(f"{base}/", timeout=15).read().decode()
+        assert "--backtrace commit" in main_page and "fully tracked going forward" in main_page
         state = json.loads(urllib.request.urlopen(f"{base}/learn/state", timeout=15).read())
         assert state["trace_turns"] == 16 and state["branches"] == []
         assert state["sync"]["available"] is False
