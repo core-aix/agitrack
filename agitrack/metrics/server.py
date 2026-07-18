@@ -73,7 +73,7 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
                 # lands, so committers show as their IDs almost immediately.
                 cached_logins(self.repo)
                 html = shell_html(self.repo)
-                self._respond("text/html; charset=utf-8", html.encode("utf-8"))
+                self._respond("text/html; charset=utf-8", html.encode("utf-8"), cache_control="no-cache")
             elif parsed.path == "/data":
                 payload = aggregates_payload(
                     self._dashboard(ref),
@@ -120,7 +120,11 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
                 # The learning page: the backend agent coaches the user from their own
                 # interaction traces (agitrack/metrics/learn.py). Chrome only; the page
                 # fetches /learn/state after paint, like the dashboard shell.
-                self._respond("text/html; charset=utf-8", learn_page.learn_html(self.repo.repo).encode("utf-8"))
+                self._respond(
+                    "text/html; charset=utf-8",
+                    learn_page.learn_html(self.repo.repo).encode("utf-8"),
+                    cache_control="no-cache",
+                )
             elif parsed.path == "/learn/state":
                 payload = learn_page.learn_state(self.repo.repo, self.repo)
                 dash = self._dashboard(ref)
@@ -226,12 +230,15 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
             cache[key] = hit
         return hit
 
-    def _respond(self, content_type: str, body: bytes) -> None:
+    def _respond(self, content_type: str, body: bytes, *, cache_control: str = "no-store") -> None:
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
-        # Always recompute; never let the browser cache /data.
-        self.send_header("Cache-Control", "no-store")
+        # Data endpoints are always recomputed; never let the browser cache them. HTML
+        # pages pass "no-cache" instead: still revalidated on a normal load, but eligible
+        # for the browser's back/forward cache — "no-store" disables bfcache, which made
+        # returning from /learn to the dashboard a full blank-page reload (#learn).
+        self.send_header("Cache-Control", cache_control)
         self.end_headers()
         self.wfile.write(body)
 

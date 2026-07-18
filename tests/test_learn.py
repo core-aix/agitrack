@@ -124,7 +124,14 @@ _LESSON_JSON = json.dumps(
     {
         "title": "Rebase without fear",
         "minutes": 10,
-        "content_md": "### Why rebase\nBecause history matters.\n\n### Try this next time\nRun `git rebase -i`.",
+        "steps": [
+            {"title": "Why rebase", "content_md": "Because history matters to you specifically."},
+            {
+                "title": "Reading a rebase todo",
+                "content_md": "```\npick abc1 first\nsquash def2 second\n```\nThis melds the second commit into the first.",
+            },
+            {"title": "Try this next time", "content_md": "Ask your agent to show the rebase plan before applying it."},
+        ],
         "links": [
             {
                 "title": "Git book: rewriting history",
@@ -316,6 +323,15 @@ def test_lesson_generation_normalizes_and_persists(tmp_path, monkeypatch, fixed_
     assert lesson["quiz"][0]["answer"] == 0
     assert lesson["exercise"]["status"] == "open"
     assert lesson["gap_id"] == "git-rebase"
+    # The guided walk: steps preserved, and the joined content_md view derived for
+    # the chat/exercise prompts.
+    assert [step["title"] for step in lesson["steps"]] == [
+        "Why rebase",
+        "Reading a rebase todo",
+        "Try this next time",
+    ]
+    assert "### Why rebase" in lesson["content_md"]
+    assert "squash def2 second" in lesson["content_md"]
     stored = json.loads((tmp_path / ".agitrack" / "learning.json").read_text())
     assert stored["profiles"]["alice"]["lessons"][0]["id"] == lesson["id"]
 
@@ -357,7 +373,7 @@ def test_exercise_check_logs_attempt_and_marks_done(tmp_path, monkeypatch, fixed
     assert exercise["status"] == "done"
     assert exercise["attempts"][0]["feedback"].startswith("Nailed it")
     assert learn.exercise_check(repo.repo, repo, lesson_id=lesson["id"], notes="") == {
-        "error": "Tell me what you tried first."
+        "error": "Type your answer first."
     }
 
 
@@ -414,6 +430,36 @@ def test_sync_progress_writes_ref_and_pushes_to_origin(tmp_path, monkeypatch, fi
     # Disabling stops future syncs but keeps the local log.
     assert learn.set_sync(repo.repo, repo, False)["sync"]["enabled"] is False
     assert learn.sync_enabled(work) is False
+
+
+def test_progress_restores_on_a_new_machine(tmp_path, monkeypatch, fixed_identity):
+    # Machine A syncs progress to origin; a fresh clone (machine B, empty learning.json)
+    # gets it back automatically on the first learn_state call, with sync re-enabled.
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    work_a = tmp_path / "machine-a"
+    work_a.mkdir()
+    repo_a = _init_repo(work_a)
+    subprocess.run(["git", "remote", "add", "origin", str(origin)], cwd=work_a, check=True)
+    subprocess.run(["git", "push", "-q", "origin", "HEAD"], cwd=work_a, check=True)
+    _write_state(work_a)
+    _fake_agent(monkeypatch, _SUGGEST_JSON)
+    learn.suggest(repo_a.repo, repo_a, [_stat()], [], [], source="", minutes=15, mood="okay")
+    assert learn.set_sync(repo_a.repo, repo_a, True)["sync"]["last"]["ok"] is True
+
+    subprocess.run(["git", "clone", "-q", str(origin), str(tmp_path / "machine-b")], check=True)
+    work_b = tmp_path / "machine-b"
+    _write_state(work_b)
+    repo_b = GitRepo.discover(work_b)
+    learn._restore_checked.discard(str(repo_b.repo))
+    state = learn.learn_state(repo_b.repo, repo_b)
+    assert state["restored"] is True
+    assert [s["id"] for s in state["profile"]["suggestions"]] == ["rebase-basics", "repo-tour"]
+    assert state["sync"]["enabled"] is True
+    # A second load doesn't re-fetch or re-report; the profile is simply there now.
+    state = learn.learn_state(repo_b.repo, repo_b)
+    assert state["restored"] is False
+    assert state["profile"]["suggestions"]
 
 
 def test_sync_without_remote_still_records_locally(tmp_path, monkeypatch, fixed_identity):
@@ -548,3 +594,29 @@ def test_dashboard_serves_learn_routes(tmp_path, monkeypatch, fixed_identity):
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_reset_suggestions_clears_picks_but_keeps_progress(tmp_path, monkeypatch, fixed_identity):
+    # "Start over": stale picks (new commits, changed filters) can be cleared without
+    # losing anything earned: lessons, gaps and the assessment stay.
+    repo = _init_repo(tmp_path)
+    _suggested(repo, tmp_path, monkeypatch)
+    _fake_agent(monkeypatch, _LESSON_JSON)
+    learn.make_lesson(repo.repo, repo, [_stat()], [], [], suggestion_id="rebase-basics")
+    profile = learn.reset_suggestions(repo.repo, repo)["profile"]
+    assert profile["suggestions"] == []
+    assert "suggest_context" not in profile
+    assert profile["lessons"] and profile["gaps"] and profile["assessment"]
+    # Wired through the shared POST dispatcher too.
+    result = learn.handle_learn_post("/learn/reset", {}, root=repo.repo, repo=repo, view=lambda *a: ([], [], []))
+    assert result is not None and result["profile"]["suggestions"] == []
+
+
+def test_norm_lesson_falls_back_to_single_step_for_a_blob():
+    # A model (or an old stored lesson) that returned one content_md blob instead of
+    # steps still works: it becomes a single step, and the page further splits legacy
+    # blobs on ### headings client-side.
+    raw = {"title": "T", "minutes": 5, "content_md": "### A\nbody text"}
+    lesson = learn._norm_lesson(raw, {"minutes": 5})
+    assert lesson["steps"] == [{"title": "", "content_md": "### A\nbody text"}]
+    assert lesson["content_md"] == "### A\nbody text"
