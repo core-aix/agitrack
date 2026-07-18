@@ -827,7 +827,9 @@ flowchart TD
   pins a specific backend and model. A model id in the other backend's format is dropped rather
   than failing the page.
 - **Backtrace too.** The backtrace dashboard serves the same page over its reconstructed
-  turns, so a project explored with `--backtrace` can be learned from as well. In a directory
+  turns, so a project explored with `--backtrace` can be learned from as well; a frozen
+  amber strip at the top (like the dashboard's) warns that the coach's suggestions are
+  based on the backtraced reconstruction, not live tracking. In a directory
   that is not a git repo the page still works: identity falls back to the gh login, progress
   stays in `<dir>/.agitrack/learning.json`, and the sync toggle reports itself unavailable.
 - **Isolation.** Every coach call is a bare one-shot run from a scratch dir outside any repo

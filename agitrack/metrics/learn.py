@@ -1409,15 +1409,36 @@ def handle_learn_post(
 # ------------------------------------------------------------------------- the page
 
 
-def learn_html(root: Path) -> str:
+def learn_html(root: Path, *, banner_html: str = "") -> str:
     """The /learn page chrome. Data (profile, committers, backend info) is fetched from
-    ``/learn/state`` after paint, so this stays instant like the dashboard shell."""
+    ``/learn/state`` after paint, so this stays instant like the dashboard shell.
+
+    ``banner_html`` fills the frozen top-strip slot; the backtrace server passes its
+    "contents are based on a reconstruction" notice here (same pattern as the dashboard's
+    backtrace banner). Empty on the live server. Substituted FIRST so page content could
+    never smuggle the placeholder in."""
     from agitrack.metrics.collect import _abbreviate_home
     from agitrack.metrics.web import _escape
 
     repo_path = _abbreviate_home(str(root))
     repo_name = repo_path.rstrip("/").rsplit("/", 1)[-1] or repo_path
-    return _LEARN_TEMPLATE.replace("__REPO_NAME__", _escape(repo_name)).replace("__REPO__", _escape(repo_path))
+    return (
+        _LEARN_TEMPLATE.replace("__BACKTRACE_BANNER__", banner_html)
+        .replace("__REPO_NAME__", _escape(repo_name))
+        .replace("__REPO__", _escape(repo_path))
+    )
+
+
+def learn_backtrace_banner(directory: str) -> str:
+    """The learn page's frozen backtrace notice: everything below is coached from a
+    RECONSTRUCTION of past local sessions, not aGiTrack's live tracking."""
+    from agitrack.metrics.web import _escape
+
+    return (
+        '<div class="btbanner">&#9194; BACKTRACE. This learning view is built from a reconstruction of past '
+        f"coding-agent sessions in {_escape(directory)}: the coach's suggestions and lessons below are based on "
+        "that backtraced history, not aGiTrack's live repo tracking.</div>"
+    )
 
 
 _LEARN_TEMPLATE = r"""<!DOCTYPE html>
@@ -1635,12 +1656,17 @@ textarea{width:100%;min-height:74px;resize:vertical}
 .confetti span{position:absolute;top:-30px;font-size:20px;animation:fall 2.6s ease-in forwards}
 @keyframes fall{to{transform:translateY(105vh) rotate(340deg);opacity:.1}}
 footer{margin-top:46px;padding-top:18px;border-top:1px dashed var(--line);color:var(--fg-dim);font-size:12px}
+/* The backtrace notice: a frozen top strip, amber like the dashboard's, always visible. */
+.btbanner{position:sticky;top:0;z-index:55;margin:0;padding:10px 18px;background:var(--panel);
+  border-bottom:2px solid #5c4d28;color:var(--warn);font-size:12.5px;line-height:1.5;
+  text-align:center;box-shadow:0 4px 16px rgba(0,0,0,.55)}
 footer code{color:var(--fg)}
 [hidden]{display:none !important}
 @media (max-width:600px){.cards{grid-template-columns:1fr}.bubble{max-width:100%}}
 </style>
 </head>
 <body>
+__BACKTRACE_BANNER__
 <div class="ambient"></div>
 <div class="wrap">
   <header class="rise">

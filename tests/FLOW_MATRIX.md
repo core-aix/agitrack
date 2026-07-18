@@ -219,6 +219,7 @@ directory that is not a git repo still gets the full page, with progress sync re
 | Identity: GitHub login with git user.name fallback | `test_learner_id_falls_back_to_git_user_name` | real-git |
 | Page + routes served over HTTP (GET /learn, /learn/state; POSTs return in-page errors, never 500) | `test_learn_html_contains_the_page`, `test_dashboard_serves_learn_routes` | real-git |
 | Backtrace mode: learn works without a git repo (repo=None; sync reported unavailable), shared POST dispatcher routes and 404s | `test_learn_works_without_a_git_repo`, `test_handle_learn_post_dispatches_and_404s` | real-git + plain-dir |
+| Backtrace server end-to-end: /data efficiency insights over reconstructed turns; /learn carries the frozen "based on backtracing" warning strip; state (no branches, sync unavailable); suggestions personalized from the reconstruction | `test_backtrace_server_serves_learn_with_banner_and_insights` | plain-dir + HTTP |
 
 ## 13. Self-update
 | Sequence | Test(s) | Kind |
