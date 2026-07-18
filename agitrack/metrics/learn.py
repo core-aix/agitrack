@@ -925,6 +925,7 @@ def suggest(
     minutes: int,
     mood: str,
     note: str = "",
+    period_days: int = 0,
 ) -> dict[str, Any]:
     """One backend call: assess the learner, identify gaps, and propose lessons sized to
     ``minutes``/``mood``. ``source`` selects WHOSE traces feed the analysis (a committer
@@ -963,7 +964,15 @@ def suggest(
             profile["gaps"] = [*gaps, *[gap for gap_id, gap in known.items() if _find_by_id(gaps, gap_id) is None]][:12]
             profile["suggestions"] = suggestions
             profile["suggested_at"] = int(time.time())
-            profile["suggest_context"] = {"minutes": minutes, "mood": mood, "note": note[:300], "source": source}
+            # The check-in that produced these picks; the page restores it into the
+            # controls so the selections shown always match the content shown.
+            profile["suggest_context"] = {
+                "minutes": minutes,
+                "mood": mood,
+                "note": note[:300],
+                "source": source,
+                "days": period_days,
+            }
 
         profile = store.update(gid, apply)
         maybe_sync(root, repo)
@@ -1007,6 +1016,7 @@ def make_lesson(
         lesson.update(
             {
                 "id": f"{suggestion_id}-{now}",
+                "suggestion_id": suggestion_id,  # lets the page pair cards with their lessons
                 "status": "started",
                 "created_at": now,
                 "seconds_spent": 0,
@@ -1210,6 +1220,7 @@ def handle_learn_post(
                 minutes=_body_int(body, "minutes"),
                 mood=str(body.get("mood") or ""),
                 note=str(body.get("note") or ""),
+                period_days=_body_int(body, "days"),
             )
         if path == "/learn/lesson":
             stats, insights, file_rows = view(source, frm, to)
@@ -1478,7 +1489,7 @@ footer code{color:var(--fg)}
 
   <div class="panel checkin rise" id="checkin">
     <p class="lead"><span class="mascot">&#127793;</span><span><span class="hi" id="hello">Hi!</span> I read your agent sessions and can teach you something genuinely useful. Just tell me how you're doing right now:</span></p>
-    <div class="row"><label>learn from</label>
+    <div class="row"><label>based on interactions from</label>
       <select id="f-source"><option value="">entire team</option></select>
       <label style="min-width:auto">period</label>
       <select id="f-period">
@@ -1740,22 +1751,52 @@ function kindBadge(kind) {
     : '<span class="badge kind-coding">&#128295; coding skill</span>';
 }
 
+// The newest lesson generated from a given suggestion (matched by the stored
+// suggestion_id, falling back to the id prefix older lessons embed).
+function lessonForSuggestion(sid) {
+  const lessons = (state.profile && state.profile.lessons) || [];
+  for (let i = lessons.length - 1; i >= 0; i--) {
+    const l = lessons[i];
+    if (l.suggestion_id === sid || String(l.id || "").replace(/-\d+$/, "") === sid) return l;
+  }
+  return null;
+}
+
 function renderSuggestions() {
   const p = state.profile;
   const list = (p && p.suggestions) || [];
+  // A pick whose lesson is finished has served its purpose: it leaves the list
+  // (it lives on under "your progress"). One with an unfinished lesson stays,
+  // but continues that lesson instead of generating a second copy.
+  const open = list.filter(s => {
+    const l = lessonForSuggestion(s.id);
+    return !(l && l.status === "completed");
+  });
   $("suggestwrap").hidden = !list.length && !(p && p.assessment);
   $("assess").hidden = !(p && p.assessment);
   if (p && p.assessment) $("assess").textContent = p.assessment;
-  $("suggestions").innerHTML = list.map(s => `
+  if (list.length && !open.length) {
+    $("suggestions").innerHTML =
+      '<div class="hint">&#127881; you finished everything I picked. Check in above and I\'ll find you something new.</div>';
+    return;
+  }
+  $("suggestions").innerHTML = open.map(s => {
+    const started = lessonForSuggestion(s.id);
+    return `
     <div class="card" data-id="${esc(s.id)}">
       <div class="badges">${kindBadge(s.kind)}<span class="badge min">&#9200; ~${esc(s.minutes)} min</span></div>
       <h3>${esc(s.title)}</h3>
       ${s.teaser ? `<div class="teaser">${esc(s.teaser)}</div>` : ""}
       ${s.why ? `<div class="why">why now: ${esc(s.why)}</div>` : ""}
-      <div class="start">start &rarr;</div>
-    </div>`).join("");
+      <div class="start">${started ? "continue &rarr;" : "start &rarr;"}</div>
+    </div>`;
+  }).join("");
   for (const card of $("suggestions").querySelectorAll(".card"))
-    card.addEventListener("click", () => openSuggestion(card.dataset.id));
+    card.addEventListener("click", () => {
+      const existing = lessonForSuggestion(card.dataset.id);
+      if (existing) openLesson(existing);
+      else openSuggestion(card.dataset.id);
+    });
 }
 
 function renderProgress() {
@@ -2101,7 +2142,8 @@ async function suggest() {
     const pr = period();
     const r = await post("learn/suggest", {source: state.source, from: pr.from, to: pr.to,
                                            minutes: state.minutes, mood: state.mood,
-                                           note: $("f-note").value.trim()});
+                                           note: $("f-note").value.trim(),
+                                           days: Number($("f-period").value) || 0});
     if (r.busy) { flash('<div class="notice">I\'m already thinking about another request, give me a moment and try again.</div>'); return; }
     if (r.error) { flash(`<div class="error">${esc(r.error)}</div>`); return; }
     state.profile = r.profile;
@@ -2136,6 +2178,23 @@ async function openSuggestion(id) {
   }
 }
 
+// Restore the check-in that produced the CURRENT picks into the controls, once per page
+// load, so the time/mood/period/note shown always describe the "picked for you" content.
+// The user's own later clicks are never overridden (the guard flips after first use).
+function setChips(id, value) {
+  for (const c of $(id).querySelectorAll(".chip")) c.classList.toggle("sel", c.dataset.v == value);
+}
+function applyCheckinContext() {
+  const ctx = state.profile && state.profile.suggest_context;
+  if (!ctx || state.ctxApplied) return;
+  state.ctxApplied = true;
+  if (ctx.minutes) { state.minutes = ctx.minutes; setChips("time-chips", ctx.minutes); }
+  if (ctx.mood) { state.mood = ctx.mood; setChips("mood-chips", ctx.mood); }
+  if (ctx.note) $("f-note").value = ctx.note;
+  if (ctx.days !== undefined) $("f-period").value = ctx.days ? String(ctx.days) : "";
+  if (ctx.source !== undefined) state.source = ctx.source;
+}
+
 async function refreshState() {
   try {
     const r = await fetch("learn/state", {cache: "no-store"});
@@ -2148,6 +2207,7 @@ async function refreshState() {
       $("hello").textContent = "Hi " + state.me + "!";
       $("me-meta").innerHTML = " &nbsp;&middot;&nbsp; learner <b>" + esc(state.me) + "</b>";
     }
+    applyCheckinContext();
     renderBackendNote(d.backend_info);
     renderSync();
     if (d.committers) {
