@@ -58,6 +58,7 @@ class OpenCodeBackend:
         bare: bool = False,
         system_prompt: str | None = None,
         commit_guidance: bool = True,
+        timeout_seconds: int | None = None,
     ) -> AgentResult:
         # ``commit_guidance`` is accepted for a uniform interface but unused: OpenCode's CLI
         # has no flag to append to its system prompt.
@@ -127,7 +128,9 @@ class OpenCodeBackend:
             threading.Thread(target=_feed_stdin, args=(process.stdin, prompt), daemon=True).start()
         watchdog: threading.Timer | None = None
         if bare:
-            watchdog = threading.Timer(_SUMMARIZER_TIMEOUT_SECONDS, process.kill)
+            # Bounded like the summarizer; a caller that legitimately needs longer
+            # (lesson generation) passes timeout_seconds.
+            watchdog = threading.Timer(timeout_seconds or _SUMMARIZER_TIMEOUT_SECONDS, process.kill)
             watchdog.daemon = True
             watchdog.start()
         child_ids: set[str] = set()

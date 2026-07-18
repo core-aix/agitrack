@@ -18,6 +18,7 @@ import webbrowser
 from typing import Any
 
 from agitrack.git import GitRepo
+from agitrack.metrics import learn as learn_page
 from agitrack.metrics.collect import Dashboard, build_dashboard
 from agitrack.metrics.files import FileBrowser, git_browser
 from agitrack.metrics.insights import build_insights, context_from_browser
@@ -72,7 +73,7 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
                 # lands, so committers show as their IDs almost immediately.
                 cached_logins(self.repo)
                 html = shell_html(self.repo)
-                self._respond("text/html; charset=utf-8", html.encode("utf-8"))
+                self._respond("text/html; charset=utf-8", html.encode("utf-8"), cache_control="no-cache")
             elif parsed.path == "/data":
                 payload = aggregates_payload(
                     self._dashboard(ref),
@@ -115,6 +116,27 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
                     "application/json",
                     self._json(self._browser(ref).file_diff(_str(query, "path"), _str(query, "sha"))),
                 )
+            elif parsed.path == "/learn":
+                # The learning page: the backend agent coaches the user from their own
+                # interaction traces (agitrack/metrics/learn.py). Chrome only; the page
+                # fetches /learn/state after paint, like the dashboard shell.
+                self._respond(
+                    "text/html; charset=utf-8",
+                    learn_page.learn_html(self.repo.repo).encode("utf-8"),
+                    cache_control="no-cache",
+                )
+            elif parsed.path == "/learn/state":
+                # ``ref`` honours a ?branch= param (validated in _ref): the trace lives in
+                # commits, so the committer list and trace count are branch-dependent.
+                payload = learn_page.learn_state(self.repo.repo, self.repo)
+                dash = self._dashboard(ref)
+                payload["committers"] = sorted({label for stat in dash.stats for label in dash.committers_of(stat)})
+                payload["branches"] = dash.branches or self.repo.list_branches()
+                payload["branch"] = ref if ref != "HEAD" else self.repo.current_branch()
+                payload["trace_turns"] = sum(1 for stat in dash.stats if stat.kind in learn_page._AI_KINDS)
+                self._respond("application/json", self._json(payload))
+            elif parsed.path == "/learn/models":
+                self._respond("application/json", self._json(learn_page.model_options(_str(query, "backend"))))
             else:
                 self.send_error(404, "not found")
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
@@ -122,6 +144,42 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
             # by the next one, a refresh, or a closed tab. Harmless; don't let
             # http.server dump a traceback to the console aGiTrack is running in.
             pass
+
+    def do_POST(self) -> None:  # noqa: N802 (http.server API)
+        # All POST endpoints belong to the learning page. Bodies are JSON; a beacon
+        # flush (navigator.sendBeacon) may arrive without an application/json header,
+        # so the body is parsed regardless of content type. Every handler returns a
+        # JSON payload; agent failures come back as {"error": …} rather than a 500 so
+        # the page can show them in place.
+        try:
+            parsed = urllib.parse.urlparse(self.path)
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if 0 < length <= 1_000_000 else b""
+            try:
+                body = json.loads(raw.decode("utf-8", errors="replace") or "{}")
+            except json.JSONDecodeError:
+                body = {}
+            if not isinstance(body, dict):
+                body = {}
+            payload = learn_page.handle_learn_post(
+                parsed.path, body, root=self.repo.repo, repo=self.repo, view=self._learn_view
+            )
+            if payload is None:
+                self.send_error(404, "not found")
+                return
+            self._respond("application/json", self._json(payload))
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+
+    def _learn_view(self, author: str, frm: int, to: int, branch: str) -> tuple[list, list[dict], list[dict]]:
+        """The filtered stats + insights + file rows the learning agent's digest is built
+        from: exactly the same slice the dashboard would show for this filter. ``branch``
+        picks the ref the trace is read from (validated like the dashboard's selector)."""
+        ref = self._ref(branch)
+        dash = self._dashboard(ref)
+        stats = _filter_stats(dash, author=author, backend="", model="", frm=frm, to=to)
+        insights = self._insights(ref, author=author, frm=frm, to=to)
+        return stats, insights, self._browser(ref).files_payload()
 
     @staticmethod
     def _json(payload: dict) -> bytes:
@@ -179,12 +237,15 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
             cache[key] = hit
         return hit
 
-    def _respond(self, content_type: str, body: bytes) -> None:
+    def _respond(self, content_type: str, body: bytes, *, cache_control: str = "no-store") -> None:
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
-        # Always recompute; never let the browser cache /data.
-        self.send_header("Cache-Control", "no-store")
+        # Data endpoints are always recomputed; never let the browser cache them. HTML
+        # pages pass "no-cache" instead: still revalidated on a normal load, but eligible
+        # for the browser's back/forward cache — "no-store" disables bfcache, which made
+        # returning from /learn to the dashboard a full blank-page reload (#learn).
+        self.send_header("Cache-Control", cache_control)
         self.end_headers()
         self.wfile.write(body)
 

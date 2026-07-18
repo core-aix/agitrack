@@ -995,3 +995,61 @@ def test_backtrace_end_to_end_non_git_claude(monkeypatch, tmp_path):
     # path relativized to the directory, trace present, diff served
     assert view.diffs[stat.sha].startswith("diff --git a/hello.py b/hello.py")
     assert "Create hello.py" in stat.message and "## Agent" in stat.message
+
+
+def test_backtrace_start_restarts_a_running_daemon_on_the_same_port(monkeypatch, tmp_path, capsys):
+    # Re-running `agitrack --backtrace` must behave like `agitrack -d`: STOP the old daemon
+    # and start a fresh one reusing the previous port, not just print "already running".
+
+    monkeypatch.setattr(bt, "_running_handshake", lambda d: {"pid": 7, "url": "http://127.0.0.1:9998/", "port": 9998})
+    terminated: list[int] = []
+    import agitrack.metrics.daemon as daemon
+
+    monkeypatch.setattr(daemon, "_terminate_and_wait", lambda pid, *, timeout: terminated.append(pid))
+    cleared: list[Path] = []
+    monkeypatch.setattr(bt, "_clear_handshake", lambda d: cleared.append(d))
+    spawned_cmd: list[str] = []
+
+    class _Proc:
+        pid = 4242
+
+    def fake_popen(cmd, **kw):
+        spawned_cmd.extend(cmd)
+        return _Proc()
+
+    import subprocess
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(bt, "_open_log", lambda d: subprocess.DEVNULL)
+    monkeypatch.setattr(
+        bt, "_wait_for_backtrace", lambda d, p, *, stall_seconds: {"pid": 4242, "url": "http://127.0.0.1:9998/"}
+    )
+    monkeypatch.setattr(bt, "_maybe_open", lambda url, record, open_browser: None)
+
+    assert bt.start_backtrace_daemon(tmp_path, owner_pid=999, open_browser=False) == 0
+    assert terminated == [7]  # the old daemon was stopped first
+    assert "--dashboard-port" in spawned_cmd and "9998" in spawned_cmd  # same port requested
+    assert cleared == [tmp_path]
+    out = capsys.readouterr().out
+    assert "Restarting the backtrace daemon" in out
+
+
+def test_backtrace_cold_start_does_not_request_a_port(monkeypatch, tmp_path):
+    # Without a running daemon there is no port to pin; the child binds its default.
+    monkeypatch.setattr(bt, "_running_handshake", lambda d: None)
+    spawned_cmd: list[str] = []
+
+    class _Proc:
+        pid = 4243
+
+    import subprocess
+
+    monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kw: (spawned_cmd.extend(cmd), _Proc())[1])
+    monkeypatch.setattr(bt, "_open_log", lambda d: subprocess.DEVNULL)
+    monkeypatch.setattr(
+        bt, "_wait_for_backtrace", lambda d, p, *, stall_seconds: {"pid": 4243, "url": "http://127.0.0.1:8765/"}
+    )
+    monkeypatch.setattr(bt, "_maybe_open", lambda url, record, open_browser: None)
+
+    assert bt.start_backtrace_daemon(tmp_path, owner_pid=999, open_browser=False) == 0
+    assert "--dashboard-port" not in spawned_cmd

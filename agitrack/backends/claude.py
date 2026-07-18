@@ -98,6 +98,7 @@ class ClaudeBackend:
         bare: bool = False,
         system_prompt: str | None = None,
         commit_guidance: bool = True,
+        timeout_seconds: int | None = None,
     ) -> AgentResult:
         # On Windows the backend is usually a `.cmd` shim (npm), which must run through
         # cmd.exe — and cmd.exe TRUNCATES a command-line argument at its first newline. The
@@ -154,7 +155,9 @@ class ClaudeBackend:
                 stderr=subprocess.PIPE,
                 check=False,
                 env=env,
-                timeout=_SUMMARIZER_TIMEOUT_SECONDS if bare else None,
+                # Bare runs are bounded (see _SUMMARIZER_TIMEOUT_SECONDS); a caller that
+                # legitimately needs longer (lesson generation) passes timeout_seconds.
+                timeout=(timeout_seconds or _SUMMARIZER_TIMEOUT_SECONDS) if bare else None,
                 # Keep the claude CLI off the host console (raw-mode preservation; see proc.py).
                 # When we feed it via input= (to_stdin) subprocess already pipes stdin.
                 **console_isolation_kwargs(detach_stdin=not to_stdin),

@@ -512,7 +512,12 @@ def main(argv: list[str] | None = None) -> int:
         # dashboard out-of-process and shuts down when its owner pid dies.
         from agitrack.metrics.backtrace import run_backtrace_daemon
 
-        return run_backtrace_daemon(Path(args.repo).expanduser().resolve(), owner_pid=args.dashboard_owner_pid)
+        return run_backtrace_daemon(
+            Path(args.repo).expanduser().resolve(),
+            owner_pid=args.dashboard_owner_pid,
+            # A restart passes the previous port so the URL survives (see start_backtrace_daemon).
+            port=args.dashboard_port if args.dashboard_port is not None else 8765,
+        )
 
     if args.backtrace:
         # Read-only reconstruction from local transcripts — no git, no privacy prompt, no repo
