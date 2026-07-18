@@ -185,6 +185,43 @@ Conventions:
 | Share-behind → overwrite + reshare / cancel | `test_share_behind_offers_overwrite_and_reshares`, `_cancel_leaves_shared_copy_untouched` | real-git |
 | Unshare (confirm, retries, fallbacks, lineage) | `test_unshare_*` | real-git |
 
+## 12b. Learning page (dashboard `/learn`, `tests/test_learn.py`)
+The dashboard's learning coach: the user opens `/learn`, taps how much time they have (5/15/30 min)
+and how they feel (fresh/okay/tired), optionally picks whose traces to learn from (their own,
+a teammate's, or the whole team) and a period, and presses one button. The backend agent reads a
+digest of those interaction traces, assesses the learner, identifies knowledge gaps, and proposes
+3-4 sized lesson suggestions; tapping one (behind a full-screen processing overlay) generates a step-by-step lesson
+(3-7 small steps walked one at a time; links, quiz and an in-page exercise unlock at the end,
+with the exercise answered in the page and reviewed by the aGiTrack coach). Progress
+(opened, completed, time on page, quiz score, exercise attempts) is tracked automatically per
+GitHub user in `.agitrack/learning.json`, and optionally synced to git
+(`refs/agitrack/learning-progress`) like shared sessions. The coach engine (backend + model) is
+selectable on the page and persisted as `learning_backend` / `learning_model` in the repo config.
+The page is served by BOTH dashboards: the live server and the backtrace reconstruction (where a
+directory that is not a git repo still gets the full page, with progress sync reported unavailable).
+
+| Sequence | Test(s) | Kind |
+|---|---|---|
+| Engine resolution: config keys > latest session backend/model; cross-backend model dropped; none → clear error | `test_resolve_prefers_config_over_latest_session`, `_falls_back_to_latest_session`, `_config_model_wins`, `_without_any_backend_raises` | real-git |
+| Engine picker persists to / clears from the repo config overlay; unknown backend refused | `test_set_learning_config_roundtrip`, `_rejects_unknown_backend` | real-git |
+| Check-in → suggestions: digest covers prompts/insights/files/README/progress; capped; persisted per GitHub user; agent failure and empty window surface as in-page errors; one agent call at a time | `test_digest_*`, `test_suggest_persists_profile_per_user`, `_reports_agent_failure_as_error`, `_with_no_turns_explains_instead_of_calling_agent`, `test_agent_lock_reports_busy` | real-git |
+| Suggestion → lesson: normalized (bad links dropped, quiz validated, exercise attached), stored under the learner | `test_lesson_generation_normalizes_and_persists`, `test_unknown_suggestion_is_an_error` | real-git |
+| Automatic progress: time accumulates, quiz results stored, completion closes the linked gap | `test_progress_tracks_time_quiz_completion_and_closes_gap` | real-git |
+| Exercise: aGiTrack coach review logs the attempt and a pass marks it done; skip via progress | `test_exercise_check_logs_attempt_and_marks_done`, `test_exercise_skip_via_progress` | real-git |
+| Follow-up chat appends bounded history | `test_lesson_chat_appends_bounded_history` | real-git |
+| Progress sync: opt-in toggle writes the orphan ref and pushes to origin; works offline; two users coexist; disable stops pushing | `test_sync_progress_writes_ref_and_pushes_to_origin`, `test_sync_without_remote_still_records_locally`, `test_two_users_coexist_on_the_sync_ref` | real-git |
+| New machine / fresh clone: empty local profile is restored from the synced ref on first page load, sync re-enabled; never overwrites local progress; reported once | `test_progress_restores_on_a_new_machine` | real-git |
+| "Start over" clears stale suggestions (new commits / changed filters) but keeps lessons, gaps, assessment | `test_reset_suggestions_clears_picks_but_keeps_progress` | real-git |
+| Delete a lesson from the progress history (two-step confirm in the UI); closed gaps stay closed; unknown id → in-page error | `test_delete_lesson_removes_it_but_keeps_gaps` | real-git |
+| Branch selector: the trace slice (and check-in context) is per git ref, validated server-side and passed through the shared dispatcher | `test_handle_learn_post_dispatches_and_404s`, `test_suggest_persists_profile_per_user` (context) | real-git |
+| (Almost) no captured trace → no agent call; notice explains --backtrace / running sessions through aGiTrack; starter topics offered and flow into the normal lesson pipeline; a later real-trace suggest clears the notice | `test_suggest_with_little_trace_offers_starter_topics_without_agent_call` | real-git |
+| No duplicate picks: digest lists completed AND in-progress lessons as no-repeat; near-duplicate suggestions are dropped server-side (kept only if the model duplicated everything) | `test_suggest_drops_picks_duplicating_recent_lessons`, `test_digest_lists_in_progress_lessons_as_no_repeat` | real-git |
+| Identity: GitHub login with git user.name fallback | `test_learner_id_falls_back_to_git_user_name` | real-git |
+| Page + routes served over HTTP (GET /learn, /learn/state; POSTs return in-page errors, never 500) | `test_learn_html_contains_the_page`, `test_dashboard_serves_learn_routes` | real-git |
+| Backtrace mode: learn works without a git repo (repo=None; sync reported unavailable), shared POST dispatcher routes and 404s | `test_learn_works_without_a_git_repo`, `test_handle_learn_post_dispatches_and_404s` | real-git + plain-dir |
+| Backtrace server end-to-end: /data efficiency insights over reconstructed turns; /learn carries the frozen "based on backtracing" warning strip; state (no branches, sync unavailable); suggestions personalized from the reconstruction | `test_backtrace_server_serves_learn_with_banner_and_insights` | plain-dir + HTTP |
+| Re-running `--backtrace` restarts a running daemon on the same port (like `-d`); a cold start pins no port | `test_backtrace_start_restarts_a_running_daemon_on_the_same_port`, `test_backtrace_cold_start_does_not_request_a_port` | mock |
+
 ## 13. Self-update
 | Sequence | Test(s) | Kind |
 |---|---|---|

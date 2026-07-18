@@ -265,7 +265,7 @@ agitrack -d text            # one-shot plain-text report instead (pipe it, paste
 
 Re-running `agitrack -d` while a dashboard is already up **restarts** it — the old daemon is stopped and a fresh one started on the same port, so the URL is unchanged. That is the quick way to pick up a new build after an aGiTrack update without hunting down `-d stop` first.
 
-![The aGiTrack dashboard](https://raw.githubusercontent.com/core-aix/agitrack/main/docs/images/dashboard-v4.png)
+![The aGiTrack dashboard](https://raw.githubusercontent.com/core-aix/agitrack/main/docs/images/dashboard-v6.png)
 
 - **aGiTrack-tracked AI vs non-tracked lines** — what the agents wrote (tracked by aGiTrack) versus everything else; it never claims a human wrote what the model did.
 - **Filter live** — narrow the whole dashboard to one committer (merged to their GitHub ID), a backend, a model, or a time range.
@@ -273,6 +273,28 @@ Re-running `agitrack -d` while a dashboard is already up **restarts** it — the
 - **Tokens, efficiency, and loop detection**, plus a **Log** section with two tabs: **commits** (click any commit to read its full message and show its file diff) and **files** (a collapsible folder tree — pick a file to see its whole change history and the conversation/tokens behind each change). All diffs are served from your local clone — no GitHub needed.
 
 See [Repository dashboard](#repository-dashboard) below for the full breakdown.
+
+
+## Learn: let the agent coach you from your own sessions
+
+The dashboard's **learn** page (the big **Learn from these traces** card in the dashboard's agent-efficiency section, the 🎓 **learn** link in the header, or `http://localhost:8765/learn`) turns your interaction traces into a personal coach. Instead of you deciding what to study, the **backend agent reads how you actually work with it** and proposes small lessons worth your time right now. No effort required beyond two taps.
+
+![The aGiTrack learn page](https://raw.githubusercontent.com/core-aix/agitrack/main/docs/images/learn-page-v2.png)
+
+**How a session goes:**
+
+1. **Check in.** Tap how much time you have (5 / 15 / 30 min) and how you feel (🔋 fresh / 🙂 okay / 🪫 tired). Optionally pick whose sessions to learn from (your own by default, a teammate's, or the whole team), a **branch** (the trace lives in commits, so it is branch-dependent; defaults to the current one), and a time period. A free-text field exists but is optional; if you leave it empty the coach picks for you. If the selection holds (almost) no captured trace, the page says so and explains how to get one (`agitrack --backtrace`, ideally `--backtrace commit`, for history written outside aGiTrack; or just run your next session through `agitrack`), and offers **starter topics** (first tracked session, picking a backend, backtrace, agent-driving habits) in the meantime.
+2. **Get suggestions.** The agent reads a digest of the selected traces (your prompts, correction loops, rework hotspots, the efficiency insights, the repo's shape) plus what you've already learned, then assesses your current level, names the **knowledge gaps** it can actually evidence, and proposes 3-4 lessons sized to your time and energy. Each suggestion says *why now*, citing the traces ("you asked the agent to untangle branches four times this month").
+3. **Learn, step by step.** Tap a suggestion (a full-screen "writing your lesson" indicator shows while your coach writes) and the page walks you through the lesson **one small step at a time**: 3-7 bite-size steps with next/back buttons and progress dots, sized to your time budget, in two flavors: **coding skills** that make you drive agents more effectively (git, testing, debugging, prompt habits) and **this-codebase knowledge** so you can spot issues and fix simple things yourself. Everything happens **inside the page**: code worth studying is shown right in the steps, and the final step is a "try this next time" tip. Reaching the end unlocks 1-3 **external links** (official docs only), a **quick-check quiz**, and a guided **in-page exercise**: the material to work with (a snippet, a diff, a scenario) is part of the task, you type your answer, and your aGiTrack coach reviews it. No terminal, no leaving the page. A follow-up **chat** box answers anything unclear.
+4. **Progress tracks itself.** Opening a lesson, finishing it, time on the page (visibility-aware), quiz scores, and exercise attempts are all recorded automatically, with no forms to fill. The next round of suggestions builds on what you've completed instead of repeating it, and gaps close as the lessons addressing them are finished.
+
+**Per-user progress, optional git sync.** Progress is kept **per user** (your GitHub ID, falling back to your git `user.name`) in `.agitrack/learning.json`, local and git-ignored by default. If you flip on **progress sync** (in the page's "coach engine & progress sync" panel), your progress log is published to the repo's remote on a history-free ref (`refs/agitrack/learning-progress`, one entry per user), the same mechanism [shared sessions](#sharing-sessions) use, so teammates can see each other's learning progress. It also travels with you: on a new machine or a fresh clone where you have no local progress yet, opening the learn page fetches your synced entry, restores it automatically ("welcome back!"), and re-enables sync, so you pick up exactly where you left off. It's off by default and progress stays tracked locally either way. You can learn from a teammate's sessions while your progress stays logged under your own ID.
+
+**Choosing the coach engine.** By default lessons are generated by the **latest session's backend and model** for the repo. Change it either on the page (the "coach engine" panel lists both backends and the models each CLI reports) or in config: `learning_backend` / `learning_model` in `.agitrack/config.json` (repo) or `~/.agitrack/config.json` (global), repo value winning. A model id that belongs to the other backend's format is ignored so a mismatch can never break the page.
+
+The learn page is also served in [backtrace](#backtrace--show-and-commit-a-history-you-didnt-track-from-day-one) mode, so you can be coached from reconstructed sessions too (in a directory that isn't a git repo, progress stays local and the sync toggle reports itself unavailable). The efficiency insights panel is likewise available in both the live and backtrace dashboards.
+
+Like the summarizer, all coach calls are one-shot bare backend runs from a scratch directory outside your repo: they never touch your coding sessions, and nothing is uploaded anywhere (the agent backend you already use is the only thing called).
 
 
 ## Backtrace — show and commit a history you didn't track from day one
@@ -286,7 +308,7 @@ agitrack --backtrace stop            # stop the background backtrace daemon
 agitrack --backtrace commit --backtrace-branch tracked-history   # write the reconstruction into real git commits
 ```
 
-- **`--backtrace` (view).** Reads every local session that ran in this directory (or a subdirectory), recovers each turn's file edits from the tool calls, and shows the **same dashboard** — tokens, models, lines changed, the full file browser, and the complete user↔agent trace behind each change — clearly labeled with a frozen banner as a **historical reconstruction, not live repo status**. It runs as a lifecycle-bound background daemon just like `-d` (stops when the terminal closes or via `--backtrace stop`).
+- **`--backtrace` (view).** Reads every local session that ran in this directory (or a subdirectory), recovers each turn's file edits from the tool calls, and shows the **same dashboard** — tokens, models, lines changed, the full file browser, and the complete user↔agent trace behind each change — clearly labeled with a frozen banner as a **historical reconstruction, not live repo status**. It runs as a lifecycle-bound background daemon just like `-d` (stops when the terminal closes or via `--backtrace stop`), and like `-d`, re-running `--backtrace` **restarts** a daemon that is already up on the same port, so the URL is unchanged and new sessions are picked up.
 
 - **`--backtrace commit` (bake it in).** Replays your existing git history onto a **new branch** (`--backtrace-branch <name>`), and for each commit whose files an agent turn produced, appends the reconstructed `# Interaction Trace` and `# aGiTrack Metadata` (backend, model, tokens, timings) — so a project built without aGiTrack ends up with a fully tracked history the dashboard understands. Commits with no AI correspondence are kept **verbatim**; trees, authors and dates are preserved exactly.
   - It **rewrites history** (every commit gets a new hash), so it only runs on a new branch, requires a **clean working tree** (commit or `.gitignore` your pending files first), and never touches your current branch. Because the new branch is a rewrite it is **not a fast-forward** of the old one — aGiTrack prints the exact steps to review it and, if you choose, force-replace the old branch. A progress bar shows during the replay.
@@ -621,13 +643,17 @@ Repository-local configuration can be stored in `.agitrack/config.json`:
 {
   "trace_turn_limit": 5,
   "summarization_enabled": true,
-  "summarization_model": null
+  "summarization_model": null,
+  "learning_backend": null,
+  "learning_model": null
 }
 ```
 
 `trace_turn_limit` controls the maximum number of recent user turns included in an agent commit body. The default is `5`.
 
 `summarization_enabled` (default `true`) toggles the LLM summarization stream (see Summarization above). `summarization_model` sets the model the summarizer asks the backend to use; leave it unset (`null`) to use the backend's default model. Both keys can also be set user-wide in `~/.agitrack/config.json`; the repository-local value wins, and the `summarizer` command writes its changes here.
+
+`learning_backend` / `learning_model` (default `null`) pin which backend and model generate content for the dashboard's [learn page](#learn-let-the-agent-coach-you-from-your-own-sessions). Unset, the page uses the latest session's backend and model. The page's "coach engine" panel writes these repo-local keys for you; set them user-wide in `~/.agitrack/config.json` to apply across repos (the repo value wins).
 
 User-wide settings live in `~/.agitrack/config.json` (override the directory with `AGITRACK_CONFIG_DIR`):
 

@@ -28,6 +28,7 @@ from typing import Callable
 
 from agitrack.commits import METADATA_HEADER
 from agitrack.commits.message import _token_metadata_lines, render_interaction_trace
+from agitrack.git import GitRepo
 from agitrack.metrics.collect import CommitStat, Dashboard, _abbreviate_home
 from agitrack.transcripts import claude, opencode
 from agitrack.transcripts.edits import combine_patches, merge_edits_by_path, total_lines
@@ -75,6 +76,11 @@ class BacktraceView:
         ]
         if self.dropped_sessions:
             parts.append(f"Older sessions beyond the most recent {MAX_SESSIONS} were not included.")
+        parts.append(
+            "Tip: run 'agitrack --backtrace commit' to bake this history into your git commit "
+            "messages, then launch your coding agent through 'agitrack' and everything is fully "
+            "tracked going forward."
+        )
         return " ".join(parts)
 
 
@@ -498,6 +504,7 @@ def _str(query: dict[str, list[str]], key: str) -> str:
 
 
 def _make_handler(view: BacktraceView) -> type[http.server.BaseHTTPRequestHandler]:
+    from agitrack.metrics import learn as learn_page
     from agitrack.metrics.files import backtrace_browser
     from agitrack.metrics.insights import build_insights, context_from_browser
     from agitrack.metrics.web import _filter_stats, aggregates_payload, format_html, log_page
@@ -505,6 +512,21 @@ def _make_handler(view: BacktraceView) -> type[http.server.BaseHTTPRequestHandle
     banner = _banner_html(view)
     browser = backtrace_browser(view.dashboard.stats, view.file_edits, directory=view.root)
     insight_cache: dict[tuple, list[dict]] = {}
+
+    # The learning page works over the reconstruction too: same traces, same coach. The
+    # served directory may not be a git repo at all — learn then runs with repo=None
+    # (identity falls back to the gh login, progress sync reports unavailable, everything
+    # else works; the progress log lives in <dir>/.agitrack/learning.json either way).
+    learn_root = view.root or Path.cwd()
+    try:
+        learn_repo: GitRepo | None = GitRepo.discover(learn_root)
+    except Exception:
+        learn_repo = None
+
+    def learn_view(source: str, frm: int, to: int, branch: str) -> tuple[list, list[dict], list[dict]]:
+        # ``branch`` is ignored: the reconstruction has no git refs to switch between.
+        stats = _filter_stats(view.dashboard, author=source, backend="", model="", frm=frm, to=to)
+        return stats, insights_for(source, "", "", frm, to), browser.files_payload()
 
     def insights_for(author: str, backend: str, model: str, frm: int, to: int) -> list[dict]:
         # Scoped to the current filter, exactly as the live dashboard does, so narrowing the time
@@ -531,7 +553,7 @@ def _make_handler(view: BacktraceView) -> type[http.server.BaseHTTPRequestHandle
                 parsed = urllib.parse.urlparse(self.path)
                 query = urllib.parse.parse_qs(parsed.query)
                 if parsed.path in ("/", "/index.html"):
-                    self._respond("text/html; charset=utf-8", page)
+                    self._respond("text/html; charset=utf-8", page, cache_control="no-cache")
                 elif parsed.path == "/data":
                     payload = aggregates_payload(
                         view.dashboard,
@@ -581,16 +603,71 @@ def _make_handler(view: BacktraceView) -> type[http.server.BaseHTTPRequestHandle
                         "application/json",
                         json.dumps(browser.file_diff(_str(query, "path"), _str(query, "sha"))).encode("utf-8"),
                     )
+                elif parsed.path == "/learn":
+                    self._respond(
+                        "text/html; charset=utf-8",
+                        learn_page.learn_html(
+                            learn_root, banner_html=learn_page.learn_backtrace_banner(view.directory)
+                        ).encode("utf-8"),
+                        cache_control="no-cache",
+                    )
+                elif parsed.path == "/learn/state":
+                    payload = learn_page.learn_state(learn_root, learn_repo)
+                    # Reconstructed turns carry no committers, so the trace-source select
+                    # usually only offers "entire team" here; harmless when some exist.
+                    try:
+                        payload["committers"] = sorted(
+                            {label for stat in view.dashboard.stats for label in view.dashboard.committers_of(stat)}
+                        )
+                    except Exception:
+                        payload["committers"] = []
+                    # No git refs in a reconstruction: the page hides its branch selector.
+                    payload["branches"] = []
+                    payload["branch"] = ""
+                    payload["trace_turns"] = sum(
+                        1 for stat in view.dashboard.stats if stat.kind in learn_page._AI_KINDS
+                    )
+                    self._respond("application/json", json.dumps(payload).encode("utf-8"))
+                elif parsed.path == "/learn/models":
+                    self._respond(
+                        "application/json", json.dumps(learn_page.model_options(_str(query, "backend"))).encode("utf-8")
+                    )
                 else:
                     self.send_error(404, "not found")
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 pass
 
-        def _respond(self, content_type: str, body: bytes) -> None:
+        def do_POST(self) -> None:  # noqa: N802 (http.server API)
+            # The learning page's POST endpoints, shared with the live server (see
+            # learn.handle_learn_post). Bodies are JSON; a beacon flush may arrive
+            # without an application/json header, so parse regardless of content type.
+            try:
+                parsed = urllib.parse.urlparse(self.path)
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if 0 < length <= 1_000_000 else b""
+                try:
+                    body = json.loads(raw.decode("utf-8", errors="replace") or "{}")
+                except json.JSONDecodeError:
+                    body = {}
+                if not isinstance(body, dict):
+                    body = {}
+                payload = learn_page.handle_learn_post(
+                    parsed.path, body, root=learn_root, repo=learn_repo, view=learn_view
+                )
+                if payload is None:
+                    self.send_error(404, "not found")
+                    return
+                self._respond("application/json", json.dumps(payload).encode("utf-8"))
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                pass
+
+        def _respond(self, content_type: str, body: bytes, *, cache_control: str = "no-store") -> None:
             self.send_response(200)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
+            # HTML pages use "no-cache" so the browser's back/forward cache can restore
+            # them instantly (see the live server's _respond); data stays "no-store".
+            self.send_header("Cache-Control", cache_control)
             self.end_headers()
             self.wfile.write(body)
 
@@ -945,9 +1022,13 @@ def _running_handshake(directory: Path) -> dict | None:
 
 
 def start_backtrace_daemon(directory: Path, *, owner_pid: int, open_browser: bool = True, timeout: float = 90.0) -> int:
-    """`agitrack --backtrace` (html): start — or reuse — the background backtrace daemon for
-    ``directory``, then return to the shell. The daemon dies when the launching terminal
-    closes (owner-pid watchdog) or via `agitrack --backtrace stop`.
+    """`agitrack --backtrace` (html): start the background backtrace daemon for ``directory``,
+    then return to the shell. The daemon dies when the launching terminal closes (owner-pid
+    watchdog) or via `agitrack --backtrace stop`.
+
+    Like ``agitrack -d``, re-running while a daemon is already up RESTARTS it — the old one is
+    stopped and a fresh one started on the same port, so the URL is unchanged and a re-run
+    (e.g. after an aGiTrack update, or to pick up new sessions) always serves current code.
 
     ``timeout`` is the STALL tolerance, not a total deadline: the first build scans and exports
     every local session (OpenCode shells out per session) and can take minutes, so a progress bar
@@ -957,14 +1038,21 @@ def start_backtrace_daemon(directory: Path, *, owner_pid: int, open_browser: boo
     import sys
     import os
 
+    from agitrack.metrics.daemon import _terminate_and_wait
     from agitrack.proc import detach_kwargs
 
     running = _running_handshake(directory)
+    reuse_port: int | None = None
     if running is not None:
-        url = str(running.get("url", ""))
-        print(f"aGiTrack backtrace already running at {url} (pid {running.get('pid')}).")
-        _maybe_open(url, running, open_browser)
-        return 0
+        old_pid = int(running["pid"])
+        raw_port = running.get("port")
+        reuse_port = int(raw_port) if isinstance(raw_port, int) else None
+        # Stop the old daemon and wait for the socket to be released so the replacement can
+        # bind the SAME port. If it lingers, the child's port fallback still yields a working
+        # (just different) URL rather than a failure.
+        _terminate_and_wait(old_pid, timeout=5.0)
+        _clear_handshake(directory)
+        print(f"Restarting the backtrace daemon (was pid {old_pid}).")
 
     cmd = [
         sys.executable,
@@ -976,6 +1064,8 @@ def start_backtrace_daemon(directory: Path, *, owner_pid: int, open_browser: boo
         "--dashboard-owner-pid",
         str(owner_pid),
     ]
+    if reuse_port is not None:
+        cmd += ["--dashboard-port", str(reuse_port)]
     # The child must load the INSTALLED aGiTrack, never a stray ``agitrack/`` package in the
     # target directory: the backtraced directory can itself be the aGiTrack source checkout, and
     # ``python -m agitrack`` would otherwise import that (older) copy from cwd. So run the child
