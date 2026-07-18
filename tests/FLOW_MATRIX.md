@@ -192,7 +192,7 @@ a teammate's, or the whole team) and a period, and presses one button. The backe
 digest of those interaction traces, assesses the learner, identifies knowledge gaps, and proposes
 3-4 sized lesson suggestions; tapping one (behind a full-screen processing overlay) generates a step-by-step lesson
 (3-7 small steps walked one at a time; links, quiz and an in-page exercise unlock at the end,
-with the exercise answered in the page and reviewed by the mentor). Progress
+with the exercise answered in the page and reviewed by the aGiTrack coach). Progress
 (opened, completed, time on page, quiz score, exercise attempts) is tracked automatically per
 GitHub user in `.agitrack/learning.json`, and optionally synced to git
 (`refs/agitrack/learning-progress`) like shared sessions. The coach engine (backend + model) is
@@ -207,7 +207,7 @@ directory that is not a git repo still gets the full page, with progress sync re
 | Check-in → suggestions: digest covers prompts/insights/files/README/progress; capped; persisted per GitHub user; agent failure and empty window surface as in-page errors; one agent call at a time | `test_digest_*`, `test_suggest_persists_profile_per_user`, `_reports_agent_failure_as_error`, `_with_no_turns_explains_instead_of_calling_agent`, `test_agent_lock_reports_busy` | real-git |
 | Suggestion → lesson: normalized (bad links dropped, quiz validated, exercise attached), stored under the learner | `test_lesson_generation_normalizes_and_persists`, `test_unknown_suggestion_is_an_error` | real-git |
 | Automatic progress: time accumulates, quiz results stored, completion closes the linked gap | `test_progress_tracks_time_quiz_completion_and_closes_gap` | real-git |
-| Exercise: mentor review logs the attempt and a pass marks it done; skip via progress | `test_exercise_check_logs_attempt_and_marks_done`, `test_exercise_skip_via_progress` | real-git |
+| Exercise: aGiTrack coach review logs the attempt and a pass marks it done; skip via progress | `test_exercise_check_logs_attempt_and_marks_done`, `test_exercise_skip_via_progress` | real-git |
 | Follow-up chat appends bounded history | `test_lesson_chat_appends_bounded_history` | real-git |
 | Progress sync: opt-in toggle writes the orphan ref and pushes to origin; works offline; two users coexist; disable stops pushing | `test_sync_progress_writes_ref_and_pushes_to_origin`, `test_sync_without_remote_still_records_locally`, `test_two_users_coexist_on_the_sync_ref` | real-git |
 | New machine / fresh clone: empty local profile is restored from the synced ref on first page load, sync re-enabled; never overwrites local progress; reported once | `test_progress_restores_on_a_new_machine` | real-git |

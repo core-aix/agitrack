@@ -808,7 +808,7 @@ flowchart TD
   checkin --> sugg[["POST /learn/suggest → one bare backend call over a trace digest (prompts, efficiency insights, rework hotspots, repo shape, README head, prior progress)"]]
   sugg --> cards[["Assessment + 3-4 suggestion cards, each with an evidence-based 'why now' and an estimated size"]]
   cards -->|tap a card| lesson[["POST /learn/lesson (full-screen 'writing your lesson' overlay) → the agent writes a STEP-BY-STEP lesson: 3-7 small steps walked one at a time, 1-3 official-doc links, quick-check quiz, and an in-page exercise (all material shown in the page; never 'run this in a terminal')"]]
-  lesson --> read[["Guided lesson view: one step at a time with progress dots; the quiz, exercise and links unlock at the final step; reading time auto-tracked (visibility-aware), quiz auto-graded, typed exercise answer reviewed by the mentor (POST /learn/exercise), follow-up chat (POST /learn/chat)"]]
+  lesson --> read[["Guided lesson view: one step at a time with progress dots; the quiz, exercise and links unlock at the final step; reading time auto-tracked (visibility-aware), quiz auto-graded, typed exercise answer reviewed by the aGiTrack coach (POST /learn/exercise), follow-up chat (POST /learn/chat)"]]
   read --> done[["'Got it, done' → lesson completed, linked gap closed, progress strip updates"]]
   done --> next[["Next check-in builds on completed lessons instead of repeating them"]]
 ```

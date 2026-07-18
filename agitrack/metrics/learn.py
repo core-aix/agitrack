@@ -12,7 +12,7 @@ the coding-agent BACKEND and asks it to coach the person behind them. The backen
   fresh they feel right now (the learner never has to know what to ask for), and
 * on request writes the full lesson: general coding knowledge that makes agent-driven
   work more effective, knowledge about THIS codebase, external links, a quick check,
-  and a hands-on exercise whose attempt the mentor reviews.
+  and a hands-on exercise whose attempt the aGiTrack coach reviews.
 
 Progress is per USER (GitHub id, via :func:`agitrack.sessions.identity.github_login`)
 and tracked automatically (opened, completed, time spent, quiz results, exercise
@@ -438,8 +438,9 @@ def _extract_json(text: str) -> dict | None:
     return None
 
 
-_MENTOR_PERSONA = (
-    "You are a friendly, encouraging coding mentor built into aGiTrack, a tool that records "
+_COACH_PERSONA = (
+    "You are the learner's aGiTrack coach: a friendly, encouraging teacher built into aGiTrack, "
+    "a tool that records "
     "how people work with coding agents. You coach the developer using evidence from their "
     "actual agent sessions. Be concrete, warm, and brief; never condescending. Use simple, "
     "everyday words and short sentences; when a technical term is unavoidable, explain it in "
@@ -480,7 +481,7 @@ def _run_agent_json(choice: LearningBackendChoice, system_prompt: str, user_prom
 
 
 _SUGGEST_SYSTEM = (
-    _MENTOR_PERSONA
+    _COACH_PERSONA
     + " You must reply with ONE JSON object and nothing else: no prose before or after it, no code fences."
 )
 
@@ -549,7 +550,7 @@ TRACE DIGEST:
 
 def _chat_prompt(lesson: dict, history: list[dict], message: str) -> str:
     convo = "\n".join(
-        f"{'Learner' if turn.get('role') == 'user' else 'Mentor'}: {str(turn.get('text', ''))[:600]}"
+        f"{'Learner' if turn.get('role') == 'user' else 'Coach'}: {str(turn.get('text', ''))[:600]}"
         for turn in history[-8:]
     )
     convo_block = f"\n\nCONVERSATION SO FAR:\n{convo}" if convo else ""
@@ -703,7 +704,7 @@ def _norm_lesson(raw: dict, suggestion: dict) -> dict:
     if not steps and content_md.strip():
         steps = [{"title": "", "content_md": content_md}]
     if not content_md.strip():
-        # Joined view of the steps: the chat/exercise prompts feed this to the mentor as context.
+        # Joined view of the steps: the chat/exercise prompts feed this to the coach as context.
         content_md = "\n\n".join(
             (f"### {step['title']}\n{step['content_md']}" if step["title"] else step["content_md"]) for step in steps
         )
@@ -1216,7 +1217,7 @@ def lesson_chat(root: Path, repo: GitRepo | None, *, lesson_id: str, message: st
             return {"error": "Unknown lesson."}
         choice = resolve_learning_backend(root)
         reply = _run_agent(
-            choice, _MENTOR_PERSONA, _chat_prompt(lesson, lesson.get("chat") or [], message), _CHAT_TIMEOUT_SECONDS
+            choice, _COACH_PERSONA, _chat_prompt(lesson, lesson.get("chat") or [], message), _CHAT_TIMEOUT_SECONDS
         )
 
         def apply(profile: dict[str, Any]) -> None:
@@ -1236,7 +1237,7 @@ def lesson_chat(root: Path, repo: GitRepo | None, *, lesson_id: str, message: st
 
 def exercise_check(root: Path, repo: GitRepo | None, *, lesson_id: str, notes: str) -> dict[str, Any]:
     """The learner tried the lesson's hands-on exercise and reports what happened; the
-    mentor reviews it. The attempt (notes, feedback, pass/fail) is logged in the
+    aGiTrack coach reviews it. The attempt (notes, feedback, pass/fail) is logged in the
     progress record, and a pass marks the exercise done."""
     notes = notes.strip()
     if not notes:
@@ -1616,7 +1617,7 @@ textarea{width:100%;min-height:74px;resize:vertical}
 .bubble.mentor{background:var(--panel2);border-bottom-left-radius:3px}
 .chatrow{display:flex;gap:8px;margin-top:10px}
 .chatrow input{flex:1}
-/* The mentor-is-thinking bubble: three softly pulsing dots where the reply will appear. */
+/* The coach-is-thinking bubble: three softly pulsing dots where the reply will appear. */
 .bubble.typing{display:inline-flex;align-items:center;gap:5px;padding:12px 16px}
 .bubble.typing .tdot{width:7px;height:7px;border-radius:50%;background:var(--fg-dim);
   animation:tblink 1.2s ease-in-out infinite}
@@ -1764,7 +1765,7 @@ __BACKTRACE_BANNER__
           <details id="ex-hint-wrap"><summary>need a hint?</summary><div id="ex-hint"></div></details>
           <textarea id="ex-notes" placeholder="type your answer here; everything you need is in the task above"></textarea>
           <div class="btnrow">
-            <button class="btn primary" id="ex-check">ask my mentor to review</button>
+            <button class="btn primary" id="ex-check">ask my aGiTrack coach to review</button>
             <button class="btn" id="ex-skip">skip for now</button>
             <span class="hint" id="ex-status"></span>
           </div>
@@ -2028,7 +2029,7 @@ function renderProgress() {
   $("pstats").innerHTML = `
     <div class="pstat" data-tip="Lessons you finished with 'got it, done'."><b>${done.length}</b><span>lessons done</span></div>
     <div class="pstat" data-tip="Lessons whose quick-check quiz you answered."><b>${quizzes}</b><span>quizzes taken</span></div>
-    <div class="pstat" data-tip="Hands-on exercises where your typed answer passed the mentor's review. Quizzes count separately, and skipped exercises don't count."><b>${exDone}</b><span>exercises done</span></div>`;
+    <div class="pstat" data-tip="Hands-on exercises where your typed answer passed the aGiTrack coach's review. Quizzes count separately, and skipped exercises don't count."><b>${exDone}</b><span>exercises done</span></div>`;
   // Newest first, split into pages so a long learning history stays scannable.
   const items = lessons.slice().reverse();
   const pages = Math.max(1, Math.ceil(items.length / PROGRESS_PAGE_SIZE));
@@ -2263,12 +2264,12 @@ function renderExercise(lesson) {
     `<div class="bubble mentor">${a.passed ? "✅ " : "\u{1F4AD} "}${md(a.feedback)}</div>`).join("");
 }
 
-// A mentor "typing" bubble appended right where the reply will appear, so the thinking
+// A coach "typing" bubble appended right where the reply will appear, so the thinking
 // state is visible at the spot the user is looking, not in an indicator scrolled away.
 function showTyping(host) {
   const bubble = document.createElement("div");
   bubble.className = "bubble mentor typing";
-  bubble.setAttribute("aria-label", "the mentor is thinking");
+  bubble.setAttribute("aria-label", "the aGiTrack coach is thinking");
   bubble.innerHTML = '<span class="tdot"></span><span class="tdot"></span><span class="tdot"></span>';
   host.appendChild(bubble);
   bubble.scrollIntoView({behavior: "smooth", block: "nearest"});
