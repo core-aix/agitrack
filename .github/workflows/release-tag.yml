@@ -67,6 +67,9 @@ jobs:
           PY
           # Keep the VSCode extension version in lockstep with the CLI.
           python3 scripts/sync_vscode_version.py
+          # Refresh the docs sitemap + homepage update date in the same sync PR (main
+          # only accepts changes through a PR; see release-patch.yml).
+          python3 docs/generate_sitemap.py
 
       - name: Sync version files to main via PR
         env:
@@ -77,7 +80,8 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git switch -c "$BRANCH"
-          git add pyproject.toml editors/vscode/package.json editors/vscode/package-lock.json
+          git add pyproject.toml editors/vscode/package.json editors/vscode/package-lock.json \
+                  docs/sitemap.xml docs/index.html
           # The version file may already match the tag (e.g. the tag was placed
           # on an already-bumped commit). Only open a PR when there's a change —
           # main cannot be pushed to directly, so the sync goes through a PR.

@@ -2,15 +2,15 @@
 """Regenerate ``docs/sitemap.xml`` (and the page's visible/structured update date) from git.
 
 Each URL's ``<lastmod>`` — and the homepage's JSON-LD ``dateModified`` and footer ``<time>`` —
-is set to the date of the most recent *content* commit that touched that page. This script's own
-refresh commits are marked with :data:`SITEMAP_MARKER` and excluded from that lookup, so running it
-is idempotent: re-running with no content change reproduces the identical files and never advances
-the date on its own.
+is set to the date of the most recent *content* commit that touched that page. Refresh commits
+(marked with :data:`SITEMAP_MARKER`) and release commits (``Release vX.Y.Z``, which carry the
+refresh into main) are excluded from that lookup, so running it is idempotent: re-running with
+no content change reproduces the identical files and never advances the date on its own.
 
-Run it locally (``python docs/generate_sitemap.py``) or let
-``.github/workflows/docs-sitemap.yml`` run it automatically on every push that touches ``docs/``.
-Exit status is 0 whether or not anything changed; the workflow decides whether to commit from the
-git diff. Uses only the standard library so it needs no install step.
+The refresh rides in the RELEASE PR: the release workflows run this script alongside the version
+bump, so the timestamps land on ``main`` through a pull request (branch protection forbids direct
+pushes). Run it locally any time (``python docs/generate_sitemap.py``); exit status is 0 whether
+or not anything changed. Uses only the standard library so it needs no install step.
 """
 
 from __future__ import annotations
@@ -26,6 +26,10 @@ REPO = DOCS.parent
 # The commit-message marker this script's own auto-commits carry, so a timestamp refresh is not
 # itself mistaken for a content change on the next run (which would otherwise advance the date).
 SITEMAP_MARKER = "auto-update sitemap timestamps"
+# Commit-message patterns whose commits never count as CONTENT changes when dating a page:
+# the refresh marker above, and the release-bump commits that now carry the refresh into main
+# (counting those would advance every page's date on every release, forever).
+EXCLUDED_MESSAGE_PATTERNS = (SITEMAP_MARKER, "^Release v")
 
 # (file under docs/, URL path, sitemap priority). Order defines sitemap order.
 PAGES: list[tuple[str, str, str]] = [
@@ -35,9 +39,10 @@ PAGES: list[tuple[str, str, str]] = [
 
 
 def _last_content_date(rel_path: str) -> str:
-    """``YYYY-MM-DD`` of the last commit that changed ``docs/<rel_path>`` and was NOT one of this
-    script's own timestamp refreshes. Falls back to today when git history can't be read (e.g. an
-    unpushed working copy or a shallow checkout with no matching commit yet)."""
+    """``YYYY-MM-DD`` of the last commit that changed ``docs/<rel_path>`` and was neither a
+    timestamp refresh nor a release-bump commit (see ``EXCLUDED_MESSAGE_PATTERNS``). Falls back
+    to today when git history can't be read (e.g. an unpushed working copy or a shallow checkout
+    with no matching commit yet)."""
     try:
         out = subprocess.run(
             [
@@ -45,8 +50,8 @@ def _last_content_date(rel_path: str) -> str:
                 "log",
                 "-1",
                 "--format=%cs",  # committer date, YYYY-MM-DD
-                "--invert-grep",
-                f"--grep={SITEMAP_MARKER}",
+                "--invert-grep",  # with --grep: keep only commits matching NO pattern
+                *[f"--grep={pattern}" for pattern in EXCLUDED_MESSAGE_PATTERNS],
                 "--",
                 f"docs/{rel_path}",
             ],
