@@ -2455,10 +2455,11 @@ function applyCheckinContext() {
   if (!ctx || state.ctxApplied) return;
   state.ctxApplied = true;
   // Time/mood/note deliberately do NOT restore: each check-in describes the moment,
-  // so the page opens with a clean slate (only the data filters carry over).
+  // so the page opens with a clean slate (only the data filters carry over). The branch
+  // doesn't restore either: opening the page always starts on the CURRENT git branch
+  // (the server reports it below), never the branch of an earlier check-in.
   if (ctx.days !== undefined) $("f-period").value = ctx.days ? String(ctx.days) : "";
   if (ctx.source !== undefined) state.source = ctx.source;
-  if (ctx.branch) state.branch = ctx.branch;
 }
 
 async function refreshState() {
@@ -2482,10 +2483,14 @@ async function refreshState() {
     $("branch-wrap").hidden = !state.branches.length;
     if (state.branches.length) {
       const bsel = $("f-branch");
-      if (!state.branch) state.branch = d.branch || "";
+      // Always adopt the server-reported branch: on a plain load that is the repo's
+      // CURRENT branch (the required default); after the user picks one, the state
+      // fetch carries it and the server echoes the same ref back, so a mid-session
+      // selection sticks while open/refresh always lands on the current branch.
+      state.branch = d.branch || state.branch || "";
       bsel.innerHTML = state.branches.map(b => `<option value="${esc(b)}">${esc(b)}</option>`).join("");
       bsel.value = state.branch;
-      if (bsel.value !== state.branch) { bsel.value = d.branch || state.branches[0]; state.branch = bsel.value; }
+      if (bsel.selectedIndex === -1) { bsel.selectedIndex = 0; state.branch = bsel.value; }
     }
     // With (almost) no captured trace in this branch, say so up front and point at the
     // ways to get one; the check-in still works and offers starter topics.
