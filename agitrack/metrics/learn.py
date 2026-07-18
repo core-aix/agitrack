@@ -1152,7 +1152,8 @@ def record_progress(
             lesson["seconds_spent"] = int(lesson.get("seconds_spent") or 0) + min(int(seconds), 7200)
         if isinstance(quiz_correct, int) and isinstance(quiz_total, int) and quiz_total > 0:
             lesson["quiz_correct"], lesson["quiz_total"] = quiz_correct, quiz_total
-        if exercise_status in ("done", "skipped") and isinstance(lesson.get("exercise"), dict):
+        # "open" reopens a previously skipped exercise (the page's "give it a try after all").
+        if exercise_status in ("done", "skipped", "open") and isinstance(lesson.get("exercise"), dict):
             lesson["exercise"]["status"] = exercise_status
         if status in ("started", "completed", "dismissed"):
             lesson["status"] = status
@@ -1550,14 +1551,18 @@ footer code{color:var(--fg)}
       </div>
       <div class="exercise" id="lesson-ex" hidden>
         <h3 class="subhead">&#128296; try it yourself</h3>
-        <div class="extask" id="ex-task"></div>
-        <details id="ex-hint-wrap"><summary>need a hint?</summary><div id="ex-hint"></div></details>
-        <textarea id="ex-notes" placeholder="type your answer here; everything you need is in the task above"></textarea>
-        <div class="btnrow">
-          <button class="btn primary" id="ex-check">ask my mentor to review</button>
-          <button class="btn" id="ex-skip">skip for now</button>
-          <span class="hint" id="ex-status"></span>
+        <div id="ex-work">
+          <div class="extask" id="ex-task"></div>
+          <details id="ex-hint-wrap"><summary>need a hint?</summary><div id="ex-hint"></div></details>
+          <textarea id="ex-notes" placeholder="type your answer here; everything you need is in the task above"></textarea>
+          <div class="btnrow">
+            <button class="btn primary" id="ex-check">ask my mentor to review</button>
+            <button class="btn" id="ex-skip">skip for now</button>
+            <span class="hint" id="ex-status"></span>
+          </div>
         </div>
+        <div class="hint" id="ex-skipped" hidden>skipped for now, no pressure.
+          <button class="btn small" id="ex-resume">give it a try after all</button></div>
         <div class="exfeed" id="ex-feedback"></div>
       </div>
       <div class="btnrow">
@@ -1943,13 +1948,19 @@ function renderExercise(lesson) {
   const ex = lesson.exercise;
   $("lesson-ex").hidden = !ex;
   if (!ex) return;
+  // Skipping visibly folds the exercise away to a one-line note (with a way back),
+  // instead of leaving the full task and buttons sitting there as if nothing happened.
+  const skipped = ex.status === "skipped";
+  $("ex-work").hidden = skipped;
+  $("ex-skipped").hidden = !skipped;
+  if (skipped) return;
   // Markdown-render the task and hint: the exercise material (code to study, a diff, a
   // scenario) lives right here in the page, so fenced blocks must display properly.
   $("ex-task").innerHTML = md(ex.task);
   $("ex-hint-wrap").hidden = !ex.hint;
   $("ex-hint").innerHTML = md(ex.hint || "");
   $("ex-notes").value = "";
-  $("ex-status").textContent = ex.status === "done" ? "done ✓" : (ex.status === "skipped" ? "skipped" : "");
+  $("ex-status").textContent = ex.status === "done" ? "done ✓" : "";
   $("ex-feedback").innerHTML = (ex.attempts || []).map(a =>
     `<div class="bubble mentor">${a.passed ? "✅ " : "\u{1F4AD} "}${md(a.feedback)}</div>`).join("");
 }
@@ -1992,8 +2003,16 @@ function skipExercise() {
   const lesson = state.lesson;
   if (!lesson || !lesson.exercise) return;
   lesson.exercise.status = "skipped";
-  $("ex-status").textContent = "skipped";
+  renderExercise(lesson);
   post("learn/progress", {lesson_id: lesson.id, exercise_status: "skipped"}).catch(() => {});
+}
+
+function resumeExercise() {
+  const lesson = state.lesson;
+  if (!lesson || !lesson.exercise) return;
+  lesson.exercise.status = "open";
+  renderExercise(lesson);
+  post("learn/progress", {lesson_id: lesson.id, exercise_status: "open"}).catch(() => {});
 }
 
 function renderChat(lesson) {
@@ -2227,6 +2246,7 @@ $("step-next").addEventListener("click", () => stepBy(1));
 $("quiz-check").addEventListener("click", checkQuiz);
 $("ex-check").addEventListener("click", checkExercise);
 $("ex-skip").addEventListener("click", skipExercise);
+$("ex-resume").addEventListener("click", resumeExercise);
 $("chat-send").addEventListener("click", sendChat);
 $("chat-input").addEventListener("keydown", e => { if (e.key === "Enter") sendChat(); });
 $("f-note").addEventListener("keydown", e => { if (e.key === "Enter") suggest(); });

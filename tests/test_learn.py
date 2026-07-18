@@ -384,6 +384,9 @@ def test_exercise_skip_via_progress(tmp_path, monkeypatch, fixed_identity):
     lesson = learn.make_lesson(repo.repo, repo, [_stat()], [], [], suggestion_id="rebase-basics")["lesson"]
     profile = learn.record_progress(repo.repo, repo, lesson_id=lesson["id"], exercise_status="skipped")["profile"]
     assert profile["lessons"][0]["exercise"]["status"] == "skipped"
+    # "give it a try after all" reopens it.
+    profile = learn.record_progress(repo.repo, repo, lesson_id=lesson["id"], exercise_status="open")["profile"]
+    assert profile["lessons"][0]["exercise"]["status"] == "open"
 
 
 def test_lesson_chat_appends_bounded_history(tmp_path, monkeypatch, fixed_identity):
