@@ -1464,9 +1464,12 @@ header{display:flex;align-items:baseline;justify-content:space-between;gap:14px;
 .rise{animation:rise .5s ease both}
 @keyframes rise{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
 @media (prefers-reduced-motion: reduce){
-  .rise,.card,.card.busy,.mascot,.ambient,.spin,.confetti span,.ov-bar span{animation:none !important}
+  .rise,.card,.card.busy,.mascot,.ambient,.spin,.confetti span{animation:none !important}
   .bubble.typing .tdot{animation:none !important;opacity:.6}
+  /* Still signal "working", just without motion: a gentle full-width pulse. */
+  .ov-bar span{width:100%;transform:none;animation:ovpulse 2s ease-in-out infinite !important}
 }
+@keyframes ovpulse{0%,100%{opacity:.25}50%{opacity:.85}}
 
 h2.section{font-size:13px;letter-spacing:1.5px;text-transform:uppercase;color:var(--phosphor);
   margin:36px 0 12px;font-weight:600}
@@ -1511,8 +1514,8 @@ textarea{width:100%;min-height:74px;resize:vertical}
 .ov-msg{font-size:13px;color:var(--fg-dim);min-height:20px}
 .ov-bar{height:4px;border-radius:2px;background:var(--panel2);overflow:hidden;margin:16px 0 12px}
 .ov-bar span{display:block;height:100%;width:38%;border-radius:2px;background:var(--phosphor);
-  animation:ovslide 1.6s ease-in-out infinite}
-@keyframes ovslide{0%{margin-left:-40%}100%{margin-left:100%}}
+  transform:translateX(-110%);animation:ovslide 1.6s ease-in-out infinite;will-change:transform}
+@keyframes ovslide{0%{transform:translateX(-110%)}100%{transform:translateX(290%)}}
 .ov-hint{font-size:11.5px;color:var(--fg-dim)}
 .spin{width:13px;height:13px;border:2px solid var(--phosphor-dim);border-top-color:var(--phosphor);
   border-radius:50%;display:inline-block;animation:spin .8s linear infinite;flex:none}
@@ -1619,8 +1622,8 @@ textarea{width:100%;min-height:74px;resize:vertical}
 .plist .plt{flex:1}
 .plist .pmeta{color:var(--fg-dim);font-size:11.5px;flex:none;display:flex;gap:6px;align-items:baseline}
 .plist .pldel{flex:none;background:none;border:none;color:var(--fg-dim);font:inherit;font-size:12px;
-  cursor:pointer;padding:2px 6px;border-radius:4px;opacity:0;transition:opacity .15s,color .15s}
-.plist .pl:hover .pldel{opacity:1}
+  cursor:pointer;padding:2px 6px;border-radius:4px;opacity:0;visibility:hidden;transition:opacity .15s,color .15s}
+.plist .pl:hover .pldel,.plist .pldel:focus-visible{opacity:1;visibility:visible}
 .plist .pldel:hover{color:var(--bad)}
 .plist .pldel.armed{opacity:1;color:var(--bad);border:1px solid var(--bad)}
 .error{border:1px solid var(--bad);color:var(--bad);padding:10px 14px;font-size:13px;margin:10px 0;border-radius:6px}
@@ -1667,14 +1670,14 @@ footer code{color:var(--fg)}
     <div class="row"><label>time I have</label>
       <div class="chips" id="time-chips">
         <button class="chip" data-v="5">&#9749; 5 min</button>
-        <button class="chip sel" data-v="15">&#9200; 15 min</button>
+        <button class="chip" data-v="15">&#9200; 15 min</button>
         <button class="chip" data-v="30">&#129504; 30 min</button>
       </div>
     </div>
     <div class="row"><label>feeling</label>
       <div class="chips" id="mood-chips">
         <button class="chip" data-v="fresh">&#128267; fresh</button>
-        <button class="chip sel" data-v="okay">&#128578; okay</button>
+        <button class="chip" data-v="okay">&#128578; okay</button>
         <button class="chip" data-v="tired">&#129715; tired</button>
       </div>
     </div>
@@ -1795,7 +1798,7 @@ footer code{color:var(--fg)}
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
-const state = { me: "", source: "", branch: "", branches: [], minutes: 15, mood: "okay", profile: null, lesson: null,
+const state = { me: "", source: "", branch: "", branches: [], minutes: 0, mood: "", profile: null, lesson: null,
                 sync: null, openedAt: 0, flushedS: 0, waitTimer: null,
                 steps: [], step: 0, endReached: false, progressPage: 0 };
 
@@ -2008,6 +2011,11 @@ function renderProgress() {
     // Two-step delete so a stray click can't erase history: the first click arms the
     // button ("sure?"), the second within a few seconds deletes.
     const del = row.querySelector(".pldel");
+    // Leaving the row hides AND disarms the button, so it never lingers.
+    row.addEventListener("mouseleave", () => {
+      del.classList.remove("armed");
+      del.innerHTML = "&#10005;";
+    });
     del.addEventListener("click", async e => {
       e.stopPropagation();
       if (!del.classList.contains("armed")) {
@@ -2352,6 +2360,12 @@ async function suggest() {
     if (r.busy) { flash('<div class="notice">I\'m already thinking about another request, give me a moment and try again.</div>'); return; }
     if (r.error) { flash(`<div class="error">${esc(r.error)}</div>`); return; }
     state.profile = r.profile;
+    // The check-in served its purpose: clear it so the next visit starts fresh.
+    $("f-note").value = "";
+    state.minutes = 0;
+    state.mood = "";
+    setChips("time-chips", null);
+    setChips("mood-chips", null);
     renderSuggestions();
     renderProgress();
     $("suggestwrap").scrollIntoView({behavior: "smooth"});
@@ -2394,9 +2408,8 @@ function applyCheckinContext() {
   const ctx = state.profile && state.profile.suggest_context;
   if (!ctx || state.ctxApplied) return;
   state.ctxApplied = true;
-  if (ctx.minutes) { state.minutes = ctx.minutes; setChips("time-chips", ctx.minutes); }
-  if (ctx.mood) { state.mood = ctx.mood; setChips("mood-chips", ctx.mood); }
-  if (ctx.note) $("f-note").value = ctx.note;
+  // Time/mood/note deliberately do NOT restore: each check-in describes the moment,
+  // so the page opens with a clean slate (only the data filters carry over).
   if (ctx.days !== undefined) $("f-period").value = ctx.days ? String(ctx.days) : "";
   if (ctx.source !== undefined) state.source = ctx.source;
   if (ctx.branch) state.branch = ctx.branch;
@@ -2446,8 +2459,11 @@ async function refreshState() {
       const current = state.source;
       sel.innerHTML = '<option value="">entire team</option>' +
         d.committers.map(c => `<option value="${esc(c)}">${esc(c)}${c === state.me ? " (me)" : ""}</option>`).join("");
-      // Default to the learner's own sessions when they appear as a committer.
+      // Default to the learner's own sessions when they appear as a committer. A stale
+      // stored source that no longer matches an option would leave the select BLANK
+      // (selectedIndex -1), so fall back to "entire team" explicitly.
       sel.value = current || (d.committers.includes(state.me) ? state.me : "");
+      if (sel.selectedIndex === -1) sel.selectedIndex = 0;
       state.source = sel.value;
     }
     renderSuggestions();

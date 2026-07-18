@@ -265,7 +265,7 @@ agitrack -d text            # one-shot plain-text report instead (pipe it, paste
 
 Re-running `agitrack -d` while a dashboard is already up **restarts** it — the old daemon is stopped and a fresh one started on the same port, so the URL is unchanged. That is the quick way to pick up a new build after an aGiTrack update without hunting down `-d stop` first.
 
-![The aGiTrack dashboard](https://raw.githubusercontent.com/core-aix/agitrack/main/docs/images/dashboard-v5.png)
+![The aGiTrack dashboard](https://raw.githubusercontent.com/core-aix/agitrack/main/docs/images/dashboard-v6.png)
 
 - **aGiTrack-tracked AI vs non-tracked lines** — what the agents wrote (tracked by aGiTrack) versus everything else; it never claims a human wrote what the model did.
 - **Filter live** — narrow the whole dashboard to one committer (merged to their GitHub ID), a backend, a model, or a time range.
@@ -279,7 +279,7 @@ See [Repository dashboard](#repository-dashboard) below for the full breakdown.
 
 The dashboard's **learn** page (the big **Learn from these traces** card in the dashboard's agent-efficiency section, the 🎓 **learn** link in the header, or `http://localhost:8765/learn`) turns your interaction traces into a personal coach. Instead of you deciding what to study, the **backend agent reads how you actually work with it** and proposes small lessons worth your time right now. No effort required beyond two taps.
 
-![The aGiTrack learn page](https://raw.githubusercontent.com/core-aix/agitrack/main/docs/images/learn-page.png)
+![The aGiTrack learn page](https://raw.githubusercontent.com/core-aix/agitrack/main/docs/images/learn-page-v2.png)
 
 **How a session goes:**
 

@@ -34,12 +34,19 @@ from agitrack.metrics.collect import CommitStat, Dashboard, apply_numstat_for, b
 
 
 def render_html(repo: GitRepo, ref: str = "HEAD") -> str:
+    from agitrack.metrics.files import git_browser
     from agitrack.metrics.github import resolve_logins
+    from agitrack.metrics.insights import build_insights, context_from_browser
 
-    return format_html(
-        build_dashboard(repo, ref, sha_logins=resolve_logins(repo)),
-        shared_sessions=shared_sessions_for(repo),
-    )
+    dash = build_dashboard(repo, ref, sha_logins=resolve_logins(repo))
+    # Compute the efficiency insights too: this render is a SELF-CONTAINED page (static
+    # export, screenshots) with no /data endpoint behind it to fill them in later.
+    try:
+        files, sha_paths = context_from_browser(git_browser(repo, dash.stats, ref), dash.stats)
+        insights = build_insights(dash.stats, files, sha_paths)
+    except Exception:
+        insights = []
+    return format_html(dash, shared_sessions=shared_sessions_for(repo), insights=insights)
 
 
 def shared_sessions_for(repo: GitRepo) -> list[dict]:
@@ -709,11 +716,11 @@ body.booting .wrap>*:not(header):not(.booting){display:none}
   text-align:center;box-shadow:0 4px 16px rgba(0,0,0,.55)}
 @keyframes rise{from{transform:translateY(-100%)}to{transform:none}}
 
-header{padding:54px 0 22px}
-.brand{font-family:var(--display);font-weight:400;font-size:clamp(56px,11vw,104px);line-height:.85;color:var(--phosphor);
-  text-shadow:0 0 14px rgba(61,255,160,.5),0 0 60px rgba(61,255,160,.22);letter-spacing:2px}
-.brand .a{color:var(--amber);text-shadow:0 0 14px rgba(255,180,84,.5),0 0 60px rgba(255,180,84,.2)}
-.brand .sub{font-family:var(--display);font-size:.42em;color:var(--fg-dim);letter-spacing:3px;text-shadow:none}
+header{padding:26px 0 18px}
+.brand{font-family:var(--display);font-weight:400;font-size:38px;line-height:.9;color:var(--phosphor);
+  text-shadow:0 0 12px rgba(61,255,160,.5),0 0 44px rgba(61,255,160,.22);letter-spacing:1.5px}
+.brand .a{color:var(--amber);text-shadow:0 0 12px rgba(255,180,84,.5),0 0 44px rgba(255,180,84,.2)}
+.brand .sub{font-family:var(--display);font-size:.5em;color:var(--fg-dim);letter-spacing:3px;text-shadow:none}
 .meta{margin-top:12px;color:var(--fg-dim);font-size:13.5px}
 .meta b{color:var(--fg);font-weight:600}
 .meta .tag{color:var(--amber)}
