@@ -1466,10 +1466,7 @@ header{display:flex;align-items:baseline;justify-content:space-between;gap:14px;
 @media (prefers-reduced-motion: reduce){
   .rise,.card,.card.busy,.mascot,.ambient,.spin,.confetti span{animation:none !important}
   .bubble.typing .tdot{animation:none !important;opacity:.6}
-  /* Still signal "working", just without motion: a gentle full-width pulse. */
-  .ov-bar span{width:100%;transform:none;animation:ovpulse 2s ease-in-out infinite !important}
 }
-@keyframes ovpulse{0%,100%{opacity:.25}50%{opacity:.85}}
 
 h2.section{font-size:13px;letter-spacing:1.5px;text-transform:uppercase;color:var(--phosphor);
   margin:36px 0 12px;font-weight:600}
@@ -1514,8 +1511,7 @@ textarea{width:100%;min-height:74px;resize:vertical}
 .ov-msg{font-size:13px;color:var(--fg-dim);min-height:20px}
 .ov-bar{height:4px;border-radius:2px;background:var(--panel2);overflow:hidden;margin:16px 0 12px}
 .ov-bar span{display:block;height:100%;width:38%;border-radius:2px;background:var(--phosphor);
-  transform:translateX(-110%);animation:ovslide 1.6s ease-in-out infinite;will-change:transform}
-@keyframes ovslide{0%{transform:translateX(-110%)}100%{transform:translateX(290%)}}
+  will-change:transform}
 .ov-hint{font-size:11.5px;color:var(--fg-dim)}
 .spin{width:13px;height:13px;border:2px solid var(--phosphor-dim);border-top-color:var(--phosphor);
   border-radius:50%;display:inline-block;animation:spin .8s linear infinite;flex:none}
@@ -1800,7 +1796,7 @@ const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt
 
 const state = { me: "", source: "", branch: "", branches: [], minutes: 0, mood: "", profile: null, lesson: null,
                 sync: null, openedAt: 0, flushedS: 0, waitTimer: null,
-                steps: [], step: 0, endReached: false, progressPage: 0 };
+                steps: [], step: 0, endReached: false, progressPage: 0, barAnim: null };
 
 function period() {
   const days = $("f-period").value;
@@ -1831,6 +1827,21 @@ const WAIT = {
             msgs: ["reading the traces behind this topic…", "tailoring the examples to your repo…",
             "building the steps, quiz and exercise…", "adding links worth opening…", "almost there…"]}
 };
+function startBarAnimation() {
+  const bar = document.querySelector("#overlay .ov-bar span");
+  if (!bar || !bar.animate) return;
+  if (state.barAnim) state.barAnim.cancel();
+  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    bar.style.width = "100%";
+    state.barAnim = bar.animate([{opacity: .25}, {opacity: .85}, {opacity: .25}],
+                                {duration: 2000, iterations: Infinity});
+  } else {
+    bar.style.width = "38%";
+    state.barAnim = bar.animate([{transform: "translateX(-110%)"}, {transform: "translateX(290%)"}],
+                                {duration: 1600, iterations: Infinity, easing: "ease-in-out"});
+  }
+}
+
 function startWait(kind) {
   let i = 0;
   const w = WAIT[kind];
@@ -1839,6 +1850,7 @@ function startWait(kind) {
     $("ov-icon").textContent = w.icon;
     $("ov-title").textContent = w.title;
     $("ov-msg").textContent = w.msgs[0];
+    startBarAnimation();
   } else {
     $("agent-wait").hidden = false;
     $("wait-icon").textContent = w.icon;
@@ -1852,6 +1864,7 @@ function startWait(kind) {
 }
 function stopWait() {
   clearInterval(state.waitTimer);
+  if (state.barAnim) { state.barAnim.cancel(); state.barAnim = null; }
   $("agent-wait").hidden = true;
   $("overlay").hidden = true;
 }
