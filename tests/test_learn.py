@@ -259,9 +259,11 @@ def test_suggest_persists_profile_per_user(tmp_path, monkeypatch, fixed_identity
     repo = _init_repo(tmp_path)
     _write_state(tmp_path)
     fake = _fake_agent(monkeypatch, _SUGGEST_JSON)
-    result = learn.suggest(repo.repo, repo, [_stat()], [], [], source="", minutes=15, mood="okay")
+    result = learn.suggest(repo.repo, repo, [_stat()], [], [], source="", minutes=15, mood="okay", period_days=30)
     assert "error" not in result
     profile = result["profile"]
+    # The check-in that produced the picks is stored so the page can restore it.
+    assert profile["suggest_context"] == {"minutes": 15, "mood": "okay", "note": "", "source": "", "days": 30}
     assert profile["assessment"].startswith("You drive")
     assert [gap["id"] for gap in profile["gaps"]] == ["git-rebase"]
     assert [s["id"] for s in profile["suggestions"]] == ["rebase-basics", "repo-tour"]
@@ -323,6 +325,7 @@ def test_lesson_generation_normalizes_and_persists(tmp_path, monkeypatch, fixed_
     assert lesson["quiz"][0]["answer"] == 0
     assert lesson["exercise"]["status"] == "open"
     assert lesson["gap_id"] == "git-rebase"
+    assert lesson["suggestion_id"] == "rebase-basics"  # pairs the lesson with its card
     # The guided walk: steps preserved, and the joined content_md view derived for
     # the chat/exercise prompts.
     assert [step["title"] for step in lesson["steps"]] == [
