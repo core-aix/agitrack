@@ -462,9 +462,10 @@ def test_lesson_chat_appends_bounded_history(tmp_path, monkeypatch, fixed_identi
     _suggested(repo, tmp_path, monkeypatch)
     _fake_agent(monkeypatch, _LESSON_JSON)
     lesson = learn.make_lesson(repo.repo, repo, [_stat()], [], [], suggestion_id="rebase-basics")["lesson"]
-    fake = _fake_agent(monkeypatch, "Great question! Squash melds commits.")
+    fake = _fake_agent(monkeypatch, "Great question \u2014 squash melds commits.")
     result = learn.lesson_chat(repo.repo, repo, lesson_id=lesson["id"], message="what does squash do?")
-    assert "Squash melds" in result["reply"]
+    # Model output is normalized to the project's no-em-dash rule before it is stored/shown.
+    assert result["reply"] == "Great question, squash melds commits."
     assert "what does squash do?" in fake.calls[0]["prompt"]
     stored = json.loads((tmp_path / ".agitrack" / "learning.json").read_text())
     chat = stored["profiles"]["alice"]["lessons"][0]["chat"]
