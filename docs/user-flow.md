@@ -804,7 +804,7 @@ assesses the learner, names evidenced knowledge gaps, and proposes lessons sized
 ```mermaid
 flowchart TD
   open[["Open /learn (the 'Learn from these traces' card in the dashboard's agent-efficiency section, or the 🎓 header link; served by BOTH the live dashboard and the backtrace reconstruction)"]] --> paint[["Instant paint; page fetches /learn/state: GitHub id (git user.name fallback), stored profile, engine info, sync status, committer list"]]
-  paint --> checkin[["Check-in: time (5/15/30 min) + mood (fresh/okay/tired) + optional trace source (own sessions default, a teammate, whole team) + period + optional free text"]]
+  paint --> checkin[["Check-in: time (5/15/30 min) + mood (fresh/okay/tired) + optional trace source (own sessions default, a teammate, whole team) + branch (default: current; hidden in backtrace) + period + optional free text. (Almost) no captured trace in the selection → a notice explains --backtrace / running sessions through aGiTrack, and starter topics are offered instead of an agent call"]]
   checkin --> sugg[["POST /learn/suggest → one bare backend call over a trace digest (prompts, efficiency insights, rework hotspots, repo shape, README head, prior progress)"]]
   sugg --> cards[["Assessment + 3-4 suggestion cards, each with an evidence-based 'why now' and an estimated size"]]
   cards -->|tap a card| lesson[["POST /learn/lesson (full-screen 'writing your lesson' overlay) → the agent writes a STEP-BY-STEP lesson: 3-7 small steps walked one at a time, 1-3 official-doc links, quick-check quiz, and an in-page exercise (all material shown in the page; never 'run this in a terminal')"]]

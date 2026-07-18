@@ -126,9 +126,14 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
                     cache_control="no-cache",
                 )
             elif parsed.path == "/learn/state":
+                # ``ref`` honours a ?branch= param (validated in _ref): the trace lives in
+                # commits, so the committer list and trace count are branch-dependent.
                 payload = learn_page.learn_state(self.repo.repo, self.repo)
                 dash = self._dashboard(ref)
                 payload["committers"] = sorted({label for stat in dash.stats for label in dash.committers_of(stat)})
+                payload["branches"] = dash.branches or self.repo.list_branches()
+                payload["branch"] = ref if ref != "HEAD" else self.repo.current_branch()
+                payload["trace_turns"] = sum(1 for stat in dash.stats if stat.kind in learn_page._AI_KINDS)
                 self._respond("application/json", self._json(payload))
             elif parsed.path == "/learn/models":
                 self._respond("application/json", self._json(learn_page.model_options(_str(query, "backend"))))
@@ -166,13 +171,15 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             pass
 
-    def _learn_view(self, author: str, frm: int, to: int) -> tuple[list, list[dict], list[dict]]:
+    def _learn_view(self, author: str, frm: int, to: int, branch: str) -> tuple[list, list[dict], list[dict]]:
         """The filtered stats + insights + file rows the learning agent's digest is built
-        from: exactly the same slice the dashboard would show for this filter."""
-        dash = self._dashboard("HEAD")
+        from: exactly the same slice the dashboard would show for this filter. ``branch``
+        picks the ref the trace is read from (validated like the dashboard's selector)."""
+        ref = self._ref(branch)
+        dash = self._dashboard(ref)
         stats = _filter_stats(dash, author=author, backend="", model="", frm=frm, to=to)
-        insights = self._insights("HEAD", author=author, frm=frm, to=to)
-        return stats, insights, self._browser("HEAD").files_payload()
+        insights = self._insights(ref, author=author, frm=frm, to=to)
+        return stats, insights, self._browser(ref).files_payload()
 
     @staticmethod
     def _json(payload: dict) -> bytes:

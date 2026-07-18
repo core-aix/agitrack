@@ -66,6 +66,67 @@ _STORE_LOCK = threading.Lock()
 # Keep the digest comfortably inside a bare prompt.
 _DIGEST_CHAR_LIMIT = 9000
 
+# Below this many tracked agent turns in the selected slice there is nothing meaningful to
+# personalize from: the check-in then explains how to get a trace (backtrace, or running
+# sessions through aGiTrack) and offers starter topics instead of calling the agent.
+_MIN_TRACE_TURNS = 3
+
+# The starter topics offered when the selection has (almost) no captured trace. They flow
+# through the normal lesson pipeline: tapping one still generates a personal, full lesson
+# (the digest simply carries little beyond the repo shape and README).
+_STARTER_SUGGESTIONS = [
+    {
+        "id": "agitrack-first-session",
+        "title": "Your first tracked session with aGiTrack",
+        "minutes": 10,
+        "kind": "coding",
+        "gap_id": "",
+        "why": "No captured trace here yet, so this is the natural place to start.",
+        "teaser": "Run one agent turn through aGiTrack and see it land as a commit with its full story.",
+    },
+    {
+        "id": "agitrack-pick-backend",
+        "title": "Picking and setting up a coding agent backend",
+        "minutes": 5,
+        "kind": "coding",
+        "gap_id": "",
+        "why": "aGiTrack drives a coding agent backend for you; choosing one is step zero.",
+        "teaser": "Know which supported agent fits you and have it running in minutes.",
+    },
+    {
+        "id": "agitrack-backtrace",
+        "title": "Reconstruct your past agent work with backtrace",
+        "minutes": 10,
+        "kind": "coding",
+        "gap_id": "",
+        "why": "If this code was written with a supported agent outside aGiTrack, its history can be recovered.",
+        "teaser": "Turn the sessions already on your machine into a dashboard, and optionally real commits.",
+    },
+    {
+        "id": "driving-agents-well",
+        "title": "Habits that make coding agents work better",
+        "minutes": 15,
+        "kind": "coding",
+        "gap_id": "",
+        "why": "Good prompting and verification habits pay off from the very first session.",
+        "teaser": "Smaller asks, clear checks, fewer correction loops.",
+    },
+]
+
+
+def _no_trace_message(turns: int) -> str:
+    found = f"only {turns} aGiTrack-tracked agent turn(s)" if turns else "no aGiTrack-tracked agent turns"
+    return (
+        f"I found {found} in this selection, not enough to personalize lessons from. "
+        "If this code was written with a supported agent (Claude Code or OpenCode) outside aGiTrack, "
+        "run 'agitrack --backtrace' to reconstruct that history from the transcripts on your machine, "
+        "preferably 'agitrack --backtrace commit' so it becomes part of a branch I can read. "
+        "Otherwise, simply launch your next coding session with 'agitrack': every turn is captured "
+        "automatically and lessons will personalize as the trace grows. Until then, here are some "
+        "starter topics:"
+    )
+
+
 # The progress-sync ref: history-free orphan commits, one progress.json per user,
 # scoped by repo fingerprint — the same shape as refs/agitrack/shared-sessions.
 PROGRESS_REF = "refs/agitrack/learning-progress"
@@ -342,10 +403,15 @@ def build_trace_digest(
                 parts.append(f"README (start):\n{head}")
             break
 
-    done = [lesson for lesson in profile.get("lessons", []) if lesson.get("status") == "completed"]
+    lessons = [lesson for lesson in profile.get("lessons", []) if lesson.get("title")]
+    done = [lesson for lesson in lessons if lesson.get("status") == "completed"]
+    in_progress = [lesson for lesson in lessons if lesson.get("status") != "completed"]
     if done:
         titles = ", ".join(str(lesson.get("title", "")) for lesson in done[-10:])
-        parts.append(f"ALREADY LEARNED (do not repeat, build on these): {titles}.")
+        parts.append(f"ALREADY LEARNED (completed lessons; never repeat these, build on them): {titles}.")
+    if in_progress:
+        titles = ", ".join(str(lesson.get("title", "")) for lesson in in_progress[-10:])
+        parts.append(f"ALREADY IN PROGRESS (lessons started; do not repeat these either): {titles}.")
     addressed = [gap for gap in profile.get("gaps", []) if gap.get("status") == "addressed"]
     if addressed:
         parts.append("GAPS ALREADY ADDRESSED: " + ", ".join(str(gap.get("title", "")) for gap in addressed[-10:]) + ".")
@@ -437,7 +503,7 @@ Your tasks:
 1. Assess the learner's current coding knowledge from how the traces drive the agent (prompt style, corrections, what gets delegated vs fixed by hand).
 2. Identify knowledge gaps the traces show. Two kinds: "coding" (general skills that would make them work with coding agents more effectively, e.g. git, testing, debugging, prompt habits) and "codebase" (understanding of THIS repository so they can spot issues and fix simple things themselves).
 3. Propose exactly 3 or 4 small lesson suggestions the learner can do RIGHT NOW in at most {minutes} minutes each. {mood_hint}{extra}
-Each suggestion must be grounded in the traces: its "why" cites the concrete evidence (a prompt pattern, a rework hotspot, an insight). Never propose something they have already learned.
+Each suggestion must be grounded in the traces: its "why" cites the concrete evidence (a prompt pattern, a rework hotspot, an insight). Never repeat or closely rephrase anything listed under ALREADY LEARNED or ALREADY IN PROGRESS in the digest: every suggestion must teach something meaningfully new, at most building on top of those.
 
 Reply with ONE JSON object, exactly this shape:
 {{"assessment": "2-3 warm sentences on their current level and strengths",
@@ -516,6 +582,29 @@ Judge whether the typed answer shows they achieved the exercise's goal. Be gener
 def _slug(value: object, fallback: str) -> str:
     text = re.sub(r"[^a-z0-9]+", "-", str(value or "").lower()).strip("-")
     return text[:60] or fallback
+
+
+_TITLE_STOPWORDS = {"the", "a", "an", "your", "with", "for", "to", "of", "and", "in", "on", "how", "what", "why"}
+
+
+def _title_tokens(text: str) -> set[str]:
+    return {token for token in re.findall(r"[a-z0-9]+", text.lower()) if token not in _TITLE_STOPWORDS}
+
+
+def _is_near_duplicate(title: str, recent_titles: list[str]) -> bool:
+    """Whether a suggested title is (nearly) the same topic as a recent lesson: high word
+    overlap after dropping stopwords. The last line of defense against the model
+    re-suggesting something already learned despite the prompt's instruction."""
+    tokens = _title_tokens(title)
+    if not tokens:
+        return False
+    for other in recent_titles:
+        other_tokens = _title_tokens(other)
+        if not other_tokens:
+            continue
+        if len(tokens & other_tokens) / min(len(tokens), len(other_tokens)) >= 0.7:
+            return True
+    return False
 
 
 def _norm_gaps(raw: object) -> list[dict]:
@@ -926,17 +1015,40 @@ def suggest(
     mood: str,
     note: str = "",
     period_days: int = 0,
+    branch: str = "",
 ) -> dict[str, Any]:
     """One backend call: assess the learner, identify gaps, and propose lessons sized to
     ``minutes``/``mood``. ``source`` selects WHOSE traces feed the analysis (a committer
     label, or '' for the whole team); the progress profile is always the current user's.
-    Persists the result and returns the refreshed profile."""
+    Persists the result and returns the refreshed profile.
+
+    With (almost) no tracked turns in the slice there is nothing to personalize from, so
+    instead of calling the agent this stores STARTER topics plus a notice explaining how
+    to get a trace (--backtrace for history written outside aGiTrack, or simply running
+    sessions through aGiTrack). The starter topics use the normal lesson pipeline."""
     if not _AGENT_LOCK.acquire(blocking=False):
         return {"busy": True}
     try:
-        if not any(stat.kind in _AI_KINDS for stat in stats):
-            return {"error": "No agent turns in this view yet. Run some aGiTrack sessions first, or widen the filter."}
         gid = learner_id(root, repo)
+        ai_turns = sum(1 for stat in stats if stat.kind in _AI_KINDS)
+        if ai_turns < _MIN_TRACE_TURNS:
+            notice = _no_trace_message(ai_turns)
+
+            def apply_starters(profile: dict[str, Any]) -> None:
+                profile["suggestions"] = [dict(item) for item in _STARTER_SUGGESTIONS]
+                profile["trace_notice"] = notice
+                profile["suggested_at"] = int(time.time())
+                profile["suggest_context"] = {
+                    "minutes": minutes,
+                    "mood": mood,
+                    "note": note[:300],
+                    "source": source,
+                    "days": period_days,
+                    "branch": branch,
+                }
+
+            profile = LearnStore(root).update(gid, apply_starters)
+            return {"profile": profile, "no_trace": True}
         store = LearnStore(root)
         with _STORE_LOCK:
             profile = LearnStore.profile(store.load(), gid)
@@ -954,6 +1066,13 @@ def suggest(
         suggestions = _norm_suggestions(raw.get("suggestions"), minutes)
         if not suggestions:
             raise LearnAgentError("The backend returned no usable suggestions; try again.")
+        # Belt and braces on top of the prompt's no-repeat instruction: drop any pick that
+        # is (nearly) the same topic as a recent lesson. If the model somehow duplicated
+        # EVERYTHING, keep its output rather than showing nothing.
+        recent_titles = [str(lesson.get("title") or "") for lesson in profile.get("lessons", [])][-15:]
+        fresh = [item for item in suggestions if not _is_near_duplicate(item["title"], recent_titles)]
+        if fresh:
+            suggestions = fresh
 
         def apply(profile: dict[str, Any]) -> None:
             if assessment:
@@ -963,6 +1082,7 @@ def suggest(
             known = {str(gap.get("id") or ""): gap for gap in profile["gaps"] if isinstance(gap, dict)}
             profile["gaps"] = [*gaps, *[gap for gap_id, gap in known.items() if _find_by_id(gaps, gap_id) is None]][:12]
             profile["suggestions"] = suggestions
+            profile.pop("trace_notice", None)  # a real trace personalized these picks
             profile["suggested_at"] = int(time.time())
             # The check-in that produced these picks; the page restores it into the
             # controls so the selections shown always match the content shown.
@@ -972,6 +1092,7 @@ def suggest(
                 "note": note[:300],
                 "source": source,
                 "days": period_days,
+                "branch": branch,
             }
 
         profile = store.update(gid, apply)
@@ -1036,6 +1157,27 @@ def make_lesson(
         return {"error": str(exc)}
     finally:
         _AGENT_LOCK.release()
+
+
+def delete_lesson(root: Path, repo: GitRepo | None, *, lesson_id: str) -> dict[str, Any]:
+    """Remove one lesson (and its chat/exercise/quiz record) from the progress history.
+    Gaps are left as they are: a gap the lesson closed stays closed, since the learning
+    happened even if the record is no longer wanted. Synced like any other milestone."""
+    store = LearnStore(root)
+    gid = learner_id(root, repo)
+    found = {"ok": False}
+
+    def apply(profile: dict[str, Any]) -> None:
+        lessons = profile.get("lessons", [])
+        kept = [lesson for lesson in lessons if lesson.get("id") != lesson_id]
+        found["ok"] = len(kept) != len(lessons)
+        profile["lessons"] = kept
+
+    profile = store.update(gid, apply)
+    if not found["ok"]:
+        return {"error": "Unknown lesson."}
+    maybe_sync(root, repo)
+    return {"profile": profile}
 
 
 def reset_suggestions(root: Path, repo: GitRepo | None) -> dict[str, Any]:
@@ -1195,21 +1337,24 @@ def handle_learn_post(
     *,
     root: Path,
     repo: GitRepo | None,
-    view: Callable[[str, int, int], tuple[list[CommitStat], list[dict], list[dict]]],
+    view: Callable[[str, int, int, str], tuple[list[CommitStat], list[dict], list[dict]]],
 ) -> dict | None:
     """The POST dispatcher both dashboard servers (live and backtrace) share.
 
-    ``view(source, frm, to)`` returns the filter-scoped ``(stats, insights, file_rows)``
-    the learning agent's digest is built from — exactly the slice that server's dashboard
-    would show. ``source`` selects WHOSE traces feed the analysis; the identity progress
-    is logged under is resolved server-side (GitHub id), never trusted from the client.
-    Returns None for an unknown path (the caller 404s); agent failures come back as
-    ``{"error": …}`` so the page shows them in place rather than a blank 500."""
+    ``view(source, frm, to, branch)`` returns the filter-scoped ``(stats, insights,
+    file_rows)`` the learning agent's digest is built from — exactly the slice that
+    server's dashboard would show. ``source`` selects WHOSE traces feed the analysis, and
+    ``branch`` which git ref they are read from (the trace lives in commits, so it is
+    branch-dependent; the live server validates it, backtrace ignores it). The identity
+    progress is logged under is resolved server-side (GitHub id), never trusted from the
+    client. Returns None for an unknown path (the caller 404s); agent failures come back
+    as ``{"error": …}`` so the page shows them in place rather than a blank 500."""
     source = str(body.get("source") or "")
     frm, to = _body_int(body, "from"), _body_int(body, "to")
+    branch = str(body.get("branch") or "")
     try:
         if path == "/learn/suggest":
-            stats, insights, file_rows = view(source, frm, to)
+            stats, insights, file_rows = view(source, frm, to, branch)
             return suggest(
                 root,
                 repo,
@@ -1221,9 +1366,10 @@ def handle_learn_post(
                 mood=str(body.get("mood") or ""),
                 note=str(body.get("note") or ""),
                 period_days=_body_int(body, "days"),
+                branch=branch,
             )
         if path == "/learn/lesson":
-            stats, insights, file_rows = view(source, frm, to)
+            stats, insights, file_rows = view(source, frm, to, branch)
             return make_lesson(
                 root, repo, stats, insights, file_rows, suggestion_id=str(body.get("suggestion_id") or "")
             )
@@ -1249,6 +1395,8 @@ def handle_learn_post(
             )
         if path == "/learn/reset":
             return reset_suggestions(root, repo)
+        if path == "/learn/delete":
+            return delete_lesson(root, repo, lesson_id=str(body.get("lesson_id") or ""))
         if path == "/learn/sync":
             return set_sync(root, repo, bool(body.get("enabled")))
         if path == "/learn/config":
@@ -1302,7 +1450,7 @@ a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
   animation:drift 36s ease-in-out infinite alternate}
 @keyframes drift{from{transform:translate3d(0,0,0) scale(1)}to{transform:translate3d(-30px,20px,0) scale(1.06)}}
 
-.wrap{max-width:880px;margin:0 auto;padding:22px 20px 60px}
+.wrap{max-width:1080px;margin:0 auto;padding:22px 20px 60px}
 header{display:flex;align-items:baseline;justify-content:space-between;gap:14px;flex-wrap:wrap;
   border-bottom:1px dashed var(--line);padding-bottom:14px;margin-bottom:18px}
 .brand{font-family:var(--display);font-weight:400;font-size:38px;line-height:.9;color:var(--phosphor);
@@ -1321,7 +1469,7 @@ header{display:flex;align-items:baseline;justify-content:space-between;gap:14px;
 }
 
 h2.section{font-size:13px;letter-spacing:1.5px;text-transform:uppercase;color:var(--phosphor);
-  margin:26px 0 10px;font-weight:600}
+  margin:36px 0 12px;font-weight:600}
 .sechead{display:flex;align-items:baseline;justify-content:space-between;gap:12px}
 .sechead h2.section{margin-bottom:10px}
 .btn.small{padding:5px 12px;font-size:12px}
@@ -1410,11 +1558,11 @@ textarea{width:100%;min-height:74px;resize:vertical}
 .lcontent pre code{background:none;border:none;padding:0}
 .lcontent ul,.lcontent ol{margin:8px 0;padding-left:24px}
 .lcontent li{margin:3px 0}
-.subhead{color:var(--phosphor);font-size:13px;letter-spacing:1px;text-transform:uppercase;margin:0 0 10px}
-.links{margin-top:18px}
+.subhead{color:var(--phosphor);font-size:13px;letter-spacing:1px;text-transform:uppercase;margin:0 0 14px}
+.links{margin-top:40px;border-top:1px dashed var(--line);padding-top:26px}
 .links .lk{margin:8px 0;font-size:13px}
 .links .lk .note{color:var(--fg-dim);font-size:12px}
-.quiz{margin-top:20px;border-top:1px dashed var(--line);padding-top:14px}
+.quiz{margin-top:40px;border-top:1px dashed var(--line);padding-top:26px}
 .qq{margin:12px 0}
 .qq .qt{font-size:13.5px;margin-bottom:6px}
 .qq label{display:block;padding:6px 10px;border:1px solid var(--line);margin:4px 0;cursor:pointer;font-size:13px;
@@ -1424,7 +1572,7 @@ textarea{width:100%;min-height:74px;resize:vertical}
 .qq label.wrong{border-color:var(--bad);color:var(--bad)}
 .qq .explain{color:var(--fg-dim);font-size:12.5px;margin:4px 0 0 10px;display:none}
 .qq .explain.show{display:block}
-.exercise{margin-top:20px;border-top:1px dashed var(--line);padding-top:14px}
+.exercise{margin-top:40px;border-top:1px dashed var(--line);padding-top:26px}
 .exercise .extask{font-size:13.5px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;
   padding:10px 12px;margin-bottom:10px}
 .exercise details{margin:8px 0;font-size:12.5px;color:var(--fg-dim)}
@@ -1436,7 +1584,7 @@ textarea{width:100%;min-height:74px;resize:vertical}
 .btn:hover{border-color:var(--phosphor-dim);transform:translateY(-1px)}
 .btn.primary{border-color:var(--phosphor-dim);color:var(--phosphor)}
 .btn.primary:hover{border-color:var(--phosphor)}
-.chat{margin-top:22px;border-top:1px dashed var(--line);padding-top:14px}
+.chat{margin-top:40px;border-top:1px dashed var(--line);padding-top:26px}
 .bubble{max-width:85%;padding:8px 12px;margin:8px 0;font-size:13px;border:1px solid var(--line);border-radius:10px;
   animation:rise .35s ease both}
 .bubble.user{margin-left:auto;background:#14222b;border-color:#2a4356;border-bottom-right-radius:3px}
@@ -1451,15 +1599,30 @@ textarea{width:100%;min-height:74px;resize:vertical}
 .bubble.typing .tdot:nth-child(3){animation-delay:.4s}
 @keyframes tblink{0%,60%,100%{opacity:.25;transform:translateY(0)}30%{opacity:1;transform:translateY(-3px)}}
 .progress .pstats{display:flex;gap:22px;flex-wrap:wrap;margin-bottom:10px}
-.pstat{cursor:help}
+/* Stat tooltips are drawn by CSS (::after on hover): reliable and instant, unlike the
+   native title bubble, which proved flaky over these elements. */
+.pstat{cursor:help;position:relative}
 .pstat b{color:var(--phosphor);font-size:17px}
 .pstat span{color:var(--fg-dim);font-size:12px;display:block;border-bottom:1px dotted var(--line)}
+.pstat::after{content:attr(data-tip);position:absolute;left:0;top:100%;margin-top:8px;z-index:20;
+  width:240px;background:var(--panel2);border:1px solid var(--phosphor-dim);border-radius:6px;
+  padding:8px 11px;font-size:11.5px;color:var(--fg);line-height:1.5;
+  opacity:0;visibility:hidden;pointer-events:none;transition:opacity .15s;
+  box-shadow:0 8px 24px rgba(0,0,0,.45)}
+.pstat:hover::after{opacity:1;visibility:visible}
+.ppager{display:flex;align-items:center;justify-content:center;gap:14px;padding:10px 0 2px;
+  border-top:1px solid var(--line)}
 .plist .pl{display:flex;align-items:baseline;gap:10px;padding:7px 4px;border-top:1px solid var(--line);
   font-size:13px;cursor:pointer}
 .plist .pl:hover .plt{color:var(--accent)}
 .plist .st{flex:none;width:16px}
 .plist .plt{flex:1}
 .plist .pmeta{color:var(--fg-dim);font-size:11.5px;flex:none;display:flex;gap:6px;align-items:baseline}
+.plist .pldel{flex:none;background:none;border:none;color:var(--fg-dim);font:inherit;font-size:12px;
+  cursor:pointer;padding:2px 6px;border-radius:4px;opacity:0;transition:opacity .15s,color .15s}
+.plist .pl:hover .pldel{opacity:1}
+.plist .pldel:hover{color:var(--bad)}
+.plist .pldel.armed{opacity:1;color:var(--bad);border:1px solid var(--bad)}
 .error{border:1px solid var(--bad);color:var(--bad);padding:10px 14px;font-size:13px;margin:10px 0;border-radius:6px}
 .notice{border:1px solid var(--warn);color:var(--warn);padding:10px 14px;font-size:13px;margin:10px 0;border-radius:6px}
 .engine{margin-top:26px;border:1px solid var(--line);background:var(--panel);border-radius:8px}
@@ -1489,8 +1652,11 @@ footer code{color:var(--fg)}
 
   <div class="panel checkin rise" id="checkin">
     <p class="lead"><span class="mascot">&#127793;</span><span><span class="hi" id="hello">Hi!</span> I read your agent sessions and can teach you something genuinely useful. Just tell me how you're doing right now:</span></p>
+    <div class="notice" id="trace-notice" hidden></div>
     <div class="row"><label>based on interactions from</label>
       <select id="f-source"><option value="">entire team</option></select>
+      <span id="branch-wrap"><label style="min-width:auto">branch</label>
+      <select id="f-branch"></select></span>
       <label style="min-width:auto">period</label>
       <select id="f-period">
         <option value="">all time</option>
@@ -1629,9 +1795,9 @@ footer code{color:var(--fg)}
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
-const state = { me: "", source: "", minutes: 15, mood: "okay", profile: null, lesson: null,
+const state = { me: "", source: "", branch: "", branches: [], minutes: 15, mood: "okay", profile: null, lesson: null,
                 sync: null, openedAt: 0, flushedS: 0, waitTimer: null,
-                steps: [], step: 0, endReached: false };
+                steps: [], step: 0, endReached: false, progressPage: 0 };
 
 function period() {
   const days = $("f-period").value;
@@ -1773,8 +1939,10 @@ function renderSuggestions() {
     return !(l && l.status === "completed");
   });
   $("suggestwrap").hidden = !list.length && !(p && p.assessment);
-  $("assess").hidden = !(p && p.assessment);
-  if (p && p.assessment) $("assess").textContent = p.assessment;
+  const notice = p && p.trace_notice;
+  $("assess").hidden = !(p && p.assessment) && !notice;
+  if (notice) $("assess").textContent = notice;
+  else if (p && p.assessment) $("assess").textContent = p.assessment;
   if (list.length && !open.length) {
     $("suggestions").innerHTML =
       '<div class="hint">&#127881; you finished everything I picked. Check in above and I\'ll find you something new.</div>';
@@ -1799,32 +1967,68 @@ function renderSuggestions() {
     });
 }
 
+const PROGRESS_PAGE_SIZE = 8;
+
 function renderProgress() {
   const p = state.profile;
   const lessons = (p && p.lessons) || [];
-  const gaps = (p && p.gaps) || [];
   $("progresswrap").hidden = !lessons.length;
   if (!lessons.length) return;
   const done = lessons.filter(l => l.status === "completed");
-  const minutes = Math.round(lessons.reduce((a, l) => a + (l.seconds_spent || 0), 0) / 60);
-  const closed = gaps.filter(g => g.status === "addressed").length;
+  const quizzes = lessons.filter(l => l.quiz_total > 0).length;
   const exDone = lessons.filter(l => l.exercise && l.exercise.status === "done").length;
   $("pstats").innerHTML = `
-    <div class="pstat" title="Lessons you finished with 'got it, done'."><b>${done.length}</b><span>lessons done</span></div>
-    <div class="pstat" title="Time spent reading lessons. Only counted while the page is actually visible."><b>${minutes}</b><span>minutes learned</span></div>
-    <div class="pstat" title="Hands-on exercises your mentor reviewed and passed."><b>${exDone}</b><span>exercises done</span></div>
-    ${gaps.length ? `<div class="pstat" title="Your coach spotted ${gaps.length} knowledge gap${gaps.length === 1 ? "" : "s"} in the analyzed sessions (things like a coding skill or a part of this codebase worth knowing better). A gap counts as closed once you finish a lesson that addresses it. A later check-in can add new gaps, so the total may grow as you learn."><b>${closed}/${gaps.length}</b><span>gaps closed</span></div>` : ""}`;
-  $("plist").innerHTML = lessons.slice().reverse().map(l => `
+    <div class="pstat" data-tip="Lessons you finished with 'got it, done'."><b>${done.length}</b><span>lessons done</span></div>
+    <div class="pstat" data-tip="Lessons whose quick-check quiz you answered."><b>${quizzes}</b><span>quizzes taken</span></div>
+    <div class="pstat" data-tip="Hands-on exercises where your typed answer passed the mentor's review. Quizzes count separately, and skipped exercises don't count."><b>${exDone}</b><span>exercises done</span></div>`;
+  // Newest first, split into pages so a long learning history stays scannable.
+  const items = lessons.slice().reverse();
+  const pages = Math.max(1, Math.ceil(items.length / PROGRESS_PAGE_SIZE));
+  state.progressPage = Math.min(state.progressPage || 0, pages - 1);
+  const start = state.progressPage * PROGRESS_PAGE_SIZE;
+  const rows = items.slice(start, start + PROGRESS_PAGE_SIZE).map(l => `
     <div class="pl" data-id="${esc(l.id)}">
       <span class="st">${l.status === "completed" ? "&#10003;" : "&#9679;"}</span>
       <span class="plt">${esc(l.title)}</span>
       <span class="pmeta">${kindBadge(l.kind)}${l.quiz_total ? `<span class="badge done">quiz ${l.quiz_correct}/${l.quiz_total}</span>` : ""}${l.exercise && l.exercise.status === "done" ? '<span class="badge done">&#128296; exercise</span>' : ""}</span>
+      <button class="pldel" title="Remove this lesson from your history">&#10005;</button>
     </div>`).join("");
-  for (const row of $("plist").querySelectorAll(".pl"))
+  const pager = pages > 1 ? `
+    <div class="ppager">
+      <button class="btn small" id="pp-prev" ${state.progressPage === 0 ? "disabled" : ""}>&larr; newer</button>
+      <span class="hint" style="margin-top:0">page ${state.progressPage + 1} of ${pages}</span>
+      <button class="btn small" id="pp-next" ${state.progressPage >= pages - 1 ? "disabled" : ""}>older &rarr;</button>
+    </div>` : "";
+  $("plist").innerHTML = rows + pager;
+  for (const row of $("plist").querySelectorAll(".pl")) {
     row.addEventListener("click", () => {
       const lesson = lessons.find(l => l.id === row.dataset.id);
       if (lesson) openLesson(lesson);
     });
+    // Two-step delete so a stray click can't erase history: the first click arms the
+    // button ("sure?"), the second within a few seconds deletes.
+    const del = row.querySelector(".pldel");
+    del.addEventListener("click", async e => {
+      e.stopPropagation();
+      if (!del.classList.contains("armed")) {
+        del.classList.add("armed");
+        del.textContent = "sure?";
+        setTimeout(() => { del.classList.remove("armed"); del.innerHTML = "&#10005;"; }, 4000);
+        return;
+      }
+      try {
+        const r = await post("learn/delete", {lesson_id: row.dataset.id});
+        if (r.error) { flash(`<div class="error">${esc(r.error)}</div>`); return; }
+        state.profile = r.profile;
+        renderProgress();
+        renderSuggestions(); // a deleted completed lesson may resurface its pick
+      } catch (err) { flash(`<div class="error">${esc(err.message)}</div>`); }
+    });
+  }
+  if (pages > 1) {
+    $("pp-prev").addEventListener("click", () => { state.progressPage--; renderProgress(); });
+    $("pp-next").addEventListener("click", () => { state.progressPage++; renderProgress(); });
+  }
 }
 
 function renderBackendNote(info) {
@@ -2140,7 +2344,8 @@ async function suggest() {
   startWait("suggest");
   try {
     const pr = period();
-    const r = await post("learn/suggest", {source: state.source, from: pr.from, to: pr.to,
+    const r = await post("learn/suggest", {source: state.source, branch: state.branch,
+                                           from: pr.from, to: pr.to,
                                            minutes: state.minutes, mood: state.mood,
                                            note: $("f-note").value.trim(),
                                            days: Number($("f-period").value) || 0});
@@ -2165,7 +2370,8 @@ async function openSuggestion(id) {
   startWait("lesson");
   try {
     const pr = period();
-    const r = await post("learn/lesson", {source: state.source, from: pr.from, to: pr.to, suggestion_id: id});
+    const r = await post("learn/lesson", {source: state.source, branch: state.branch,
+                                          from: pr.from, to: pr.to, suggestion_id: id});
     if (r.busy) { flash('<div class="notice">I\'m still writing something else, one moment please.</div>'); return; }
     if (r.error) { flash(`<div class="error">${esc(r.error)}</div>`); return; }
     if (state.profile) state.profile.lessons = [...(state.profile.lessons || []), r.lesson];
@@ -2193,11 +2399,12 @@ function applyCheckinContext() {
   if (ctx.note) $("f-note").value = ctx.note;
   if (ctx.days !== undefined) $("f-period").value = ctx.days ? String(ctx.days) : "";
   if (ctx.source !== undefined) state.source = ctx.source;
+  if (ctx.branch) state.branch = ctx.branch;
 }
 
 async function refreshState() {
   try {
-    const r = await fetch("learn/state", {cache: "no-store"});
+    const r = await fetch("learn/state" + (state.branch ? `?branch=${encodeURIComponent(state.branch)}` : ""), {cache: "no-store"});
     const d = await r.json();
     state.profile = d.profile;
     state.me = d.me || "";
@@ -2210,6 +2417,30 @@ async function refreshState() {
     applyCheckinContext();
     renderBackendNote(d.backend_info);
     renderSync();
+    // Branch selector: the trace lives in commits, so it is branch-dependent. Hidden
+    // when the server reports no refs (the backtrace reconstruction).
+    state.branches = d.branches || [];
+    $("branch-wrap").hidden = !state.branches.length;
+    if (state.branches.length) {
+      const bsel = $("f-branch");
+      if (!state.branch) state.branch = d.branch || "";
+      bsel.innerHTML = state.branches.map(b => `<option value="${esc(b)}">${esc(b)}</option>`).join("");
+      bsel.value = state.branch;
+      if (bsel.value !== state.branch) { bsel.value = d.branch || state.branches[0]; state.branch = bsel.value; }
+    }
+    // With (almost) no captured trace in this branch, say so up front and point at the
+    // ways to get one; the check-in still works and offers starter topics.
+    if (typeof d.trace_turns === "number" && d.trace_turns < 3) {
+      $("trace-notice").innerHTML =
+        `&#128269; ${d.trace_turns ? "only " + d.trace_turns : "no"} tracked agent turn${d.trace_turns === 1 ? "" : "s"} captured here yet, so I can't personalize lessons. ` +
+        "If this code was written with Claude Code or OpenCode outside aGiTrack, run " +
+        "<code>agitrack --backtrace</code> to reconstruct that history (ideally <code>agitrack --backtrace commit</code> " +
+        "so it becomes part of the branch). Or simply start your next session with <code>agitrack</code> and the " +
+        "trace builds itself. Either way, check in below and I'll offer some starter topics.";
+      $("trace-notice").hidden = false;
+    } else {
+      $("trace-notice").hidden = true;
+    }
     if (d.committers) {
       const sel = $("f-source");
       const current = state.source;
@@ -2299,6 +2530,10 @@ $("backlink").addEventListener("click", e => {
   } catch (err) {}
 });
 $("f-source").addEventListener("change", () => { state.source = $("f-source").value; });
+$("f-branch").addEventListener("change", () => {
+  state.branch = $("f-branch").value;
+  refreshState(); // committer list and the trace notice are branch-dependent
+});
 $("lesson-back").addEventListener("click", closeLesson);
 $("lesson-done").addEventListener("click", finishLesson);
 $("step-prev").addEventListener("click", () => stepBy(-1));
