@@ -220,6 +220,7 @@ directory that is not a git repo still gets the full page, with progress sync re
 | Page + routes served over HTTP (GET /learn, /learn/state; POSTs return in-page errors, never 500) | `test_learn_html_contains_the_page`, `test_dashboard_serves_learn_routes` | real-git |
 | Backtrace mode: learn works without a git repo (repo=None; sync reported unavailable), shared POST dispatcher routes and 404s | `test_learn_works_without_a_git_repo`, `test_handle_learn_post_dispatches_and_404s` | real-git + plain-dir |
 | Backtrace server end-to-end: /data efficiency insights over reconstructed turns; /learn carries the frozen "based on backtracing" warning strip; state (no branches, sync unavailable); suggestions personalized from the reconstruction | `test_backtrace_server_serves_learn_with_banner_and_insights` | plain-dir + HTTP |
+| Re-running `--backtrace` restarts a running daemon on the same port (like `-d`); a cold start pins no port | `test_backtrace_start_restarts_a_running_daemon_on_the_same_port`, `test_backtrace_cold_start_does_not_request_a_port` | mock |
 
 ## 13. Self-update
 | Sequence | Test(s) | Kind |

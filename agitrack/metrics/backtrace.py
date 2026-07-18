@@ -1022,9 +1022,13 @@ def _running_handshake(directory: Path) -> dict | None:
 
 
 def start_backtrace_daemon(directory: Path, *, owner_pid: int, open_browser: bool = True, timeout: float = 90.0) -> int:
-    """`agitrack --backtrace` (html): start — or reuse — the background backtrace daemon for
-    ``directory``, then return to the shell. The daemon dies when the launching terminal
-    closes (owner-pid watchdog) or via `agitrack --backtrace stop`.
+    """`agitrack --backtrace` (html): start the background backtrace daemon for ``directory``,
+    then return to the shell. The daemon dies when the launching terminal closes (owner-pid
+    watchdog) or via `agitrack --backtrace stop`.
+
+    Like ``agitrack -d``, re-running while a daemon is already up RESTARTS it — the old one is
+    stopped and a fresh one started on the same port, so the URL is unchanged and a re-run
+    (e.g. after an aGiTrack update, or to pick up new sessions) always serves current code.
 
     ``timeout`` is the STALL tolerance, not a total deadline: the first build scans and exports
     every local session (OpenCode shells out per session) and can take minutes, so a progress bar
@@ -1034,14 +1038,21 @@ def start_backtrace_daemon(directory: Path, *, owner_pid: int, open_browser: boo
     import sys
     import os
 
+    from agitrack.metrics.daemon import _terminate_and_wait
     from agitrack.proc import detach_kwargs
 
     running = _running_handshake(directory)
+    reuse_port: int | None = None
     if running is not None:
-        url = str(running.get("url", ""))
-        print(f"aGiTrack backtrace already running at {url} (pid {running.get('pid')}).")
-        _maybe_open(url, running, open_browser)
-        return 0
+        old_pid = int(running["pid"])
+        raw_port = running.get("port")
+        reuse_port = int(raw_port) if isinstance(raw_port, int) else None
+        # Stop the old daemon and wait for the socket to be released so the replacement can
+        # bind the SAME port. If it lingers, the child's port fallback still yields a working
+        # (just different) URL rather than a failure.
+        _terminate_and_wait(old_pid, timeout=5.0)
+        _clear_handshake(directory)
+        print(f"Restarting the backtrace daemon (was pid {old_pid}).")
 
     cmd = [
         sys.executable,
@@ -1053,6 +1064,8 @@ def start_backtrace_daemon(directory: Path, *, owner_pid: int, open_browser: boo
         "--dashboard-owner-pid",
         str(owner_pid),
     ]
+    if reuse_port is not None:
+        cmd += ["--dashboard-port", str(reuse_port)]
     # The child must load the INSTALLED aGiTrack, never a stray ``agitrack/`` package in the
     # target directory: the backtraced directory can itself be the aGiTrack source checkout, and
     # ``python -m agitrack`` would otherwise import that (older) copy from cwd. So run the child

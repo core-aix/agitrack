@@ -466,7 +466,9 @@ def _run_agent(choice: LearningBackendChoice, system_prompt: str, user_prompt: s
         )
     if not text:
         raise LearnAgentError(f"The {choice.backend_name} backend returned no output.")
-    return text
+    # The persona forbids em-dashes (the project's writing rule for everything aGiTrack
+    # ships), but models slip; normalize so shipped content honours it regardless.
+    return text.replace(" — ", ", ").replace("—", ", ")
 
 
 def _run_agent_json(choice: LearningBackendChoice, system_prompt: str, user_prompt: str, timeout: int) -> dict:
@@ -1456,9 +1458,9 @@ _LEARN_TEMPLATE = r"""<!DOCTYPE html>
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=VT323&family=IBM+Plex+Mono:ital,wght@0,400;0,500;0,600;1,400&display=swap" rel="stylesheet">
 <style>
-:root{--ink:#0b0f0e;--panel:#111716;--panel2:#0e1413;--line:#233029;--fg:#cfe3d8;--fg-dim:#7d947f;
-  --phosphor:#7fd77f;--phosphor-dim:#3f6b45;--accent:#6bbcee;--warn:#e0b653;--bad:#e07a6a;
-  --chipbg:#16201d;--amber:#ffb454;
+:root{--ink:#070b09;--panel:#0c120e;--panel2:#101813;--line:#1d2a21;--fg:#cfe7d8;--fg-dim:#7e998a;
+  --phosphor:#3dffa0;--phosphor-dim:#1f7a52;--accent:#67b8d6;--warn:#ffb454;--bad:#ff6b6b;
+  --chipbg:#101813;--amber:#ffb454;--amber-dim:#8a5e2a;
   --mono:"IBM Plex Mono",ui-monospace,Menlo,Consolas,monospace;--display:"VT323",var(--mono)}
 *{box-sizing:border-box}
 html,body{margin:0;padding:0;background:var(--ink);color:var(--fg);
@@ -1468,9 +1470,9 @@ a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
 /* A slow ambient glow drifting behind everything: calm, not busy. */
 .ambient{position:fixed;inset:0;z-index:-1;pointer-events:none;opacity:.5;
   background:
-    radial-gradient(600px 420px at 18% 8%, rgba(127,215,127,.09), transparent 60%),
-    radial-gradient(700px 480px at 85% 30%, rgba(107,188,238,.07), transparent 60%),
-    radial-gradient(520px 420px at 45% 95%, rgba(224,182,83,.05), transparent 60%);
+    radial-gradient(600px 420px at 18% 8%, rgba(61,255,160,.09), transparent 60%),
+    radial-gradient(700px 480px at 85% 30%, rgba(103,184,214,.07), transparent 60%),
+    radial-gradient(520px 420px at 45% 95%, rgba(255,180,84,.05), transparent 60%);
   animation:drift 36s ease-in-out infinite alternate}
 @keyframes drift{from{transform:translate3d(0,0,0) scale(1)}to{transform:translate3d(-30px,20px,0) scale(1.06)}}
 
@@ -1478,7 +1480,7 @@ a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
 header{display:flex;align-items:baseline;justify-content:space-between;gap:14px;flex-wrap:wrap;
   border-bottom:1px dashed var(--line);padding-bottom:14px;margin-bottom:18px}
 .brand{font-family:var(--display);font-weight:400;font-size:38px;line-height:.9;color:var(--phosphor);
-  letter-spacing:1.5px;text-shadow:0 0 12px rgba(127,215,127,.5),0 0 44px rgba(127,215,127,.2)}
+  letter-spacing:1.5px;text-shadow:0 0 12px rgba(61,255,160,.5),0 0 44px rgba(61,255,160,.2)}
 .brand .a{color:var(--amber);text-shadow:0 0 12px rgba(255,180,84,.5),0 0 44px rgba(255,180,84,.2)}
 .brand .sub{font-family:var(--display);font-size:.5em;color:var(--fg-dim);letter-spacing:3px;text-shadow:none}
 .meta{color:var(--fg-dim);font-size:12.5px} .meta b{color:var(--fg)}
@@ -1508,16 +1510,16 @@ h2.section{font-size:13px;letter-spacing:1.5px;text-transform:uppercase;color:va
 .chip{background:var(--chipbg);border:1px solid var(--line);color:var(--fg);padding:7px 14px;
   cursor:pointer;font:inherit;font-size:13px;border-radius:999px;transition:transform .12s,border-color .12s}
 .chip:hover{border-color:var(--phosphor-dim);transform:translateY(-1px)}
-.chip.sel{border-color:var(--phosphor);color:var(--phosphor);background:#14241a}
+.chip.sel{border-color:var(--phosphor);color:var(--phosphor);background:#0f2a1c}
 select,input[type=text],textarea{background:var(--panel2);border:1px solid var(--line);color:var(--fg);
   font:inherit;font-size:13px;padding:6px 8px;border-radius:4px}
 input[type=text]{flex:1;min-width:200px}
 input[type=text]::placeholder,textarea::placeholder{color:var(--fg-dim)}
 textarea{width:100%;min-height:74px;resize:vertical}
 .gobtn{display:block;width:100%;margin-top:14px;padding:13px;font:inherit;font-size:15px;cursor:pointer;
-  background:linear-gradient(180deg,#173123,#122619);border:1px solid var(--phosphor-dim);color:var(--phosphor);
+  background:linear-gradient(180deg,#123023,#0d2418);border:1px solid var(--phosphor-dim);color:var(--phosphor);
   border-radius:8px;letter-spacing:.3px;transition:transform .12s,border-color .12s,box-shadow .12s}
-.gobtn:hover{border-color:var(--phosphor);transform:translateY(-1px);box-shadow:0 4px 18px rgba(127,215,127,.12)}
+.gobtn:hover{border-color:var(--phosphor);transform:translateY(-1px);box-shadow:0 4px 18px rgba(61,255,160,.12)}
 .gobtn:disabled{opacity:.55;cursor:default;transform:none;box-shadow:none}
 .hint{color:var(--fg-dim);font-size:12px;margin-top:8px}
 .thinking{display:flex;align-items:center;gap:10px;color:var(--fg-dim);font-size:13px;padding:14px 4px}
@@ -1525,7 +1527,7 @@ textarea{width:100%;min-height:74px;resize:vertical}
 /* The full-screen processing overlay: while the agent writes suggestions or a lesson,
    the whole page dims and this card is unmissable, whatever was scrolled into view. */
 .overlay{position:fixed;inset:0;z-index:60;display:flex;align-items:center;justify-content:center;
-  background:rgba(4,7,5,.74);backdrop-filter:blur(3px);animation:fadein .25s ease both}
+  background:rgba(3,6,4,.74);backdrop-filter:blur(3px);animation:fadein .25s ease both}
 @keyframes fadein{from{opacity:0}to{opacity:1}}
 .ov-card{background:var(--panel);border:1px solid var(--phosphor-dim);border-radius:12px;
   padding:32px 40px;max-width:460px;margin:0 20px;text-align:center;
@@ -1549,15 +1551,15 @@ textarea{width:100%;min-height:74px;resize:vertical}
 .card:hover{border-color:var(--phosphor);transform:translateY(-2px);box-shadow:0 6px 22px rgba(0,0,0,.35)}
 .card.busy{border-color:var(--phosphor);animation:busypulse 1.2s ease-in-out infinite}
 .card.busy .start{color:var(--phosphor)}
-@keyframes busypulse{50%{box-shadow:0 0 0 4px rgba(127,215,127,.18)}}
+@keyframes busypulse{50%{box-shadow:0 0 0 4px rgba(61,255,160,.18)}}
 .card h3{margin:0 0 6px;font-size:14.5px;color:var(--fg);font-weight:600}
 .card .why{color:var(--fg-dim);font-size:12.5px;margin:6px 0}
 .card .teaser{color:var(--fg);font-size:12.5px;margin:6px 0 8px}
 .badges{display:flex;gap:6px;flex-wrap:wrap}
 .badge{font-size:11px;padding:2px 8px;border-radius:999px;border:1px solid var(--line);color:var(--fg-dim)}
-.badge.kind-coding{border-color:#3d5a75;color:var(--accent)}
+.badge.kind-coding{border-color:#35586b;color:var(--accent)}
 .badge.kind-codebase{border-color:var(--phosphor-dim);color:var(--phosphor)}
-.badge.min{color:var(--warn);border-color:#5c4d28}
+.badge.min{color:var(--warn);border-color:var(--amber-dim)}
 .badge.done{color:var(--phosphor);border-color:var(--phosphor-dim)}
 .card .start{margin-top:8px;font-size:12.5px;color:var(--accent)}
 .lesson h1{font-size:19px;margin:4px 0 2px;color:var(--fg)}
@@ -1610,7 +1612,7 @@ textarea{width:100%;min-height:74px;resize:vertical}
 .chat{margin-top:40px;border-top:1px dashed var(--line);padding-top:26px}
 .bubble{max-width:85%;padding:8px 12px;margin:8px 0;font-size:13px;border:1px solid var(--line);border-radius:10px;
   animation:rise .35s ease both}
-.bubble.user{margin-left:auto;background:#14222b;border-color:#2a4356;border-bottom-right-radius:3px}
+.bubble.user{margin-left:auto;background:#0f1d26;border-color:#28455a;border-bottom-right-radius:3px}
 .bubble.mentor{background:var(--panel2);border-bottom-left-radius:3px}
 .chatrow{display:flex;gap:8px;margin-top:10px}
 .chatrow input{flex:1}
@@ -1661,7 +1663,7 @@ textarea{width:100%;min-height:74px;resize:vertical}
 footer{margin-top:46px;padding-top:18px;border-top:1px dashed var(--line);color:var(--fg-dim);font-size:12px}
 /* The backtrace notice: a frozen top strip, amber like the dashboard's, always visible. */
 .btbanner{position:sticky;top:0;z-index:55;margin:0;padding:10px 18px;background:var(--panel);
-  border-bottom:2px solid #5c4d28;color:var(--warn);font-size:12.5px;line-height:1.5;
+  border-bottom:2px solid var(--amber-dim);color:var(--warn);font-size:12.5px;line-height:1.5;
   text-align:center;box-shadow:0 4px 16px rgba(0,0,0,.55)}
 .btbanner code{color:var(--fg);background:var(--panel2);padding:0 5px;border-radius:3px}
 footer code{color:var(--fg)}
