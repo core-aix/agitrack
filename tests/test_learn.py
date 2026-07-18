@@ -259,11 +259,20 @@ def test_suggest_persists_profile_per_user(tmp_path, monkeypatch, fixed_identity
     repo = _init_repo(tmp_path)
     _write_state(tmp_path)
     fake = _fake_agent(monkeypatch, _SUGGEST_JSON)
-    result = learn.suggest(repo.repo, repo, [_stat()], [], [], source="", minutes=15, mood="okay", period_days=30)
+    result = learn.suggest(
+        repo.repo, repo, _stats_over_threshold(), [], [], source="", minutes=15, mood="okay", period_days=30
+    )
     assert "error" not in result
     profile = result["profile"]
     # The check-in that produced the picks is stored so the page can restore it.
-    assert profile["suggest_context"] == {"minutes": 15, "mood": "okay", "note": "", "source": "", "days": 30}
+    assert profile["suggest_context"] == {
+        "minutes": 15,
+        "mood": "okay",
+        "note": "",
+        "source": "",
+        "days": 30,
+        "branch": "",
+    }
     assert profile["assessment"].startswith("You drive")
     assert [gap["id"] for gap in profile["gaps"]] == ["git-rebase"]
     assert [s["id"] for s in profile["suggestions"]] == ["rebase-basics", "repo-tour"]
@@ -280,17 +289,67 @@ def test_suggest_reports_agent_failure_as_error(tmp_path, monkeypatch, fixed_ide
     repo = _init_repo(tmp_path)
     _write_state(tmp_path)
     _fake_agent(monkeypatch, "boom", exit_code=1)
-    result = learn.suggest(repo.repo, repo, [_stat()], [], [], source="", minutes=15, mood="okay")
+    result = learn.suggest(repo.repo, repo, _stats_over_threshold(), [], [], source="", minutes=15, mood="okay")
     assert "exited with code 1" in result["error"]
 
 
-def test_suggest_with_no_turns_explains_instead_of_calling_agent(tmp_path, monkeypatch, fixed_identity):
+def test_suggest_with_little_trace_offers_starter_topics_without_agent_call(tmp_path, monkeypatch, fixed_identity):
+    # Under _MIN_TRACE_TURNS tracked turns there is nothing to personalize from: no agent
+    # call happens; instead a notice explains backtrace / running sessions through
+    # aGiTrack, and starter topics are stored so the normal lesson flow still works.
     repo = _init_repo(tmp_path)
     _write_state(tmp_path)
     fake = _fake_agent(monkeypatch, _SUGGEST_JSON)
-    result = learn.suggest(repo.repo, repo, [], [], [], source="", minutes=15, mood="okay")
-    assert "No agent turns" in result["error"]
+    result = learn.suggest(repo.repo, repo, [_stat()], [], [], source="", minutes=15, mood="okay", branch="main")
+    assert result["no_trace"] is True
     assert fake.calls == []
+    profile = result["profile"]
+    assert "--backtrace" in profile["trace_notice"]
+    ids = [item["id"] for item in profile["suggestions"]]
+    assert "agitrack-first-session" in ids and "agitrack-backtrace" in ids
+    assert profile["suggest_context"]["branch"] == "main"
+    # Tapping a starter topic generates a lesson through the normal pipeline.
+    _fake_agent(monkeypatch, _LESSON_JSON)
+    lesson = learn.make_lesson(repo.repo, repo, [_stat()], [], [], suggestion_id="agitrack-first-session")["lesson"]
+    assert lesson["suggestion_id"] == "agitrack-first-session"
+    # A later suggest over a REAL trace replaces the starters and clears the notice.
+    # (The starter lesson generated above is titled "Rebase without fear", so the
+    # re-suggested "rebase-basics" pick is filtered as a near-duplicate.)
+    _fake_agent(monkeypatch, _SUGGEST_JSON)
+    stats = [_stat(f"prompt {i}", ts=1_750_000_000 + i) for i in range(3)]
+    profile = learn.suggest(repo.repo, repo, stats, [], [], source="", minutes=15, mood="okay")["profile"]
+    assert "trace_notice" not in profile
+    assert [item["id"] for item in profile["suggestions"]] == ["repo-tour"]
+
+
+def test_suggest_drops_picks_duplicating_recent_lessons(tmp_path, monkeypatch, fixed_identity):
+    # The digest tells the agent what was already learned; this is the server-side
+    # backstop when it re-suggests the same topic anyway. "Rebase without fear" was
+    # just completed, so only the genuinely new pick survives.
+    repo = _init_repo(tmp_path)
+    _suggested(repo, tmp_path, monkeypatch)
+    _fake_agent(monkeypatch, _LESSON_JSON)
+    lesson = learn.make_lesson(repo.repo, repo, _stats_over_threshold(), [], [], suggestion_id="rebase-basics")[
+        "lesson"
+    ]
+    learn.record_progress(repo.repo, repo, lesson_id=lesson["id"], status="completed")
+    _fake_agent(monkeypatch, _SUGGEST_JSON)  # re-suggests "Rebase without fear" + "repo-tour"
+    profile = learn.suggest(repo.repo, repo, _stats_over_threshold(), [], [], source="", minutes=15, mood="okay")[
+        "profile"
+    ]
+    assert [s["id"] for s in profile["suggestions"]] == ["repo-tour"]
+
+
+def test_digest_lists_in_progress_lessons_as_no_repeat(tmp_path):
+    profile = {
+        "lessons": [
+            {"title": "Rebase without fear", "status": "completed"},
+            {"title": "A tour of your hot files", "status": "started"},
+        ]
+    }
+    digest = learn.build_trace_digest([_stat()], [], [], tmp_path, profile)
+    assert "ALREADY LEARNED" in digest and "Rebase without fear" in digest
+    assert "ALREADY IN PROGRESS" in digest and "A tour of your hot files" in digest
 
 
 def test_agent_lock_reports_busy(tmp_path, monkeypatch, fixed_identity):
@@ -299,7 +358,9 @@ def test_agent_lock_reports_busy(tmp_path, monkeypatch, fixed_identity):
     _fake_agent(monkeypatch, _SUGGEST_JSON)
     assert learn._AGENT_LOCK.acquire(blocking=False)
     try:
-        assert learn.suggest(repo.repo, repo, [_stat()], [], [], source="", minutes=15, mood="okay") == {"busy": True}
+        assert learn.suggest(repo.repo, repo, _stats_over_threshold(), [], [], source="", minutes=15, mood="okay") == {
+            "busy": True
+        }
     finally:
         learn._AGENT_LOCK.release()
 
@@ -307,10 +368,14 @@ def test_agent_lock_reports_busy(tmp_path, monkeypatch, fixed_identity):
 # ------------------------------------------------------- lesson, progress, exercise
 
 
+def _stats_over_threshold():
+    return [_stat(f"prompt {i}", ts=1_750_000_000 + i) for i in range(3)]
+
+
 def _suggested(repo, tmp_path, monkeypatch):
     _write_state(tmp_path)
     _fake_agent(monkeypatch, _SUGGEST_JSON)
-    learn.suggest(repo.repo, repo, [_stat()], [], [], source="", minutes=15, mood="okay")
+    learn.suggest(repo.repo, repo, _stats_over_threshold(), [], [], source="", minutes=15, mood="okay")
 
 
 def test_lesson_generation_normalizes_and_persists(tmp_path, monkeypatch, fixed_identity):
@@ -418,7 +483,7 @@ def test_sync_progress_writes_ref_and_pushes_to_origin(tmp_path, monkeypatch, fi
     subprocess.run(["git", "remote", "add", "origin", str(origin)], cwd=work, check=True)
     _write_state(work)
     _fake_agent(monkeypatch, _SUGGEST_JSON)
-    learn.suggest(repo.repo, repo, [_stat()], [], [], source="", minutes=15, mood="okay")
+    learn.suggest(repo.repo, repo, _stats_over_threshold(), [], [], source="", minutes=15, mood="okay")
 
     result = learn.set_sync(repo.repo, repo, True)
     assert result["sync"]["enabled"] is True
@@ -450,7 +515,7 @@ def test_progress_restores_on_a_new_machine(tmp_path, monkeypatch, fixed_identit
     subprocess.run(["git", "push", "-q", "origin", "HEAD"], cwd=work_a, check=True)
     _write_state(work_a)
     _fake_agent(monkeypatch, _SUGGEST_JSON)
-    learn.suggest(repo_a.repo, repo_a, [_stat()], [], [], source="", minutes=15, mood="okay")
+    learn.suggest(repo_a.repo, repo_a, _stats_over_threshold(), [], [], source="", minutes=15, mood="okay")
     assert learn.set_sync(repo_a.repo, repo_a, True)["sync"]["last"]["ok"] is True
 
     subprocess.run(["git", "clone", "-q", str(origin), str(tmp_path / "machine-b")], check=True)
@@ -472,7 +537,7 @@ def test_sync_without_remote_still_records_locally(tmp_path, monkeypatch, fixed_
     repo = _init_repo(tmp_path)
     _write_state(tmp_path)
     _fake_agent(monkeypatch, _SUGGEST_JSON)
-    learn.suggest(repo.repo, repo, [_stat()], [], [], source="", minutes=15, mood="okay")
+    learn.suggest(repo.repo, repo, _stats_over_threshold(), [], [], source="", minutes=15, mood="okay")
     result = learn.set_sync(repo.repo, repo, True)
     assert result["sync"]["last"]["ok"] is True
     assert [user["gid"] for user in learn.synced_users(repo)] == ["alice"]
@@ -483,10 +548,10 @@ def test_two_users_coexist_on_the_sync_ref(tmp_path, monkeypatch):
     _write_state(tmp_path)
     _fake_agent(monkeypatch, _SUGGEST_JSON)
     monkeypatch.setattr(learn, "learner_id", lambda root, repo: "alice")
-    learn.suggest(repo.repo, repo, [_stat()], [], [], source="", minutes=15, mood="okay")
+    learn.suggest(repo.repo, repo, _stats_over_threshold(), [], [], source="", minutes=15, mood="okay")
     learn.sync_progress_now(repo, "alice")
     monkeypatch.setattr(learn, "learner_id", lambda root, repo: "bob")
-    learn.suggest(repo.repo, repo, [_stat()], [], [], source="", minutes=15, mood="okay")
+    learn.suggest(repo.repo, repo, _stats_over_threshold(), [], [], source="", minutes=15, mood="okay")
     learn.sync_progress_now(repo, "bob")
     assert {user["gid"] for user in learn.synced_users(repo)} == {"alice", "bob"}
 
@@ -526,7 +591,7 @@ def test_learn_works_without_a_git_repo(tmp_path, monkeypatch, fixed_identity):
     # git sync reported unavailable instead of failing.
     _write_state(tmp_path)  # a backend choice, no git init
     _fake_agent(monkeypatch, _SUGGEST_JSON)
-    result = learn.suggest(tmp_path, None, [_stat()], [], [], source="", minutes=15, mood="okay")
+    result = learn.suggest(tmp_path, None, _stats_over_threshold(), [], [], source="", minutes=15, mood="okay")
     assert [s["id"] for s in result["profile"]["suggestions"]] == ["rebase-basics", "repo-tour"]
     assert (tmp_path / ".agitrack" / "learning.json").exists()
     state = learn.learn_state(tmp_path, None)
@@ -540,20 +605,20 @@ def test_handle_learn_post_dispatches_and_404s(tmp_path, monkeypatch, fixed_iden
     _suggested(repo, tmp_path, monkeypatch)
     seen = {}
 
-    def view(source, frm, to):
-        seen["args"] = (source, frm, to)
-        return [_stat()], [], []
+    def view(source, frm, to, branch):
+        seen["args"] = (source, frm, to, branch)
+        return [_stat(f"p{i}", ts=1_750_000_000 + i) for i in range(3)], [], []
 
     _fake_agent(monkeypatch, _LESSON_JSON)
     result = learn.handle_learn_post(
         "/learn/lesson",
-        {"source": "alice", "from": 5, "to": 9, "suggestion_id": "rebase-basics"},
+        {"source": "alice", "from": 5, "to": 9, "branch": "dev", "suggestion_id": "rebase-basics"},
         root=repo.repo,
         repo=repo,
         view=view,
     )
     assert result is not None and result["lesson"]["title"] == "Rebase without fear"
-    assert seen["args"] == ("alice", 5, 9)
+    assert seen["args"] == ("alice", 5, 9, "dev")
     assert learn.handle_learn_post("/learn/nope", {}, root=repo.repo, repo=repo, view=view) is None
 
 
@@ -616,6 +681,26 @@ def test_reset_suggestions_clears_picks_but_keeps_progress(tmp_path, monkeypatch
     # Wired through the shared POST dispatcher too.
     result = learn.handle_learn_post("/learn/reset", {}, root=repo.repo, repo=repo, view=lambda *a: ([], [], []))
     assert result is not None and result["profile"]["suggestions"] == []
+
+
+def test_delete_lesson_removes_it_but_keeps_gaps(tmp_path, monkeypatch, fixed_identity):
+    repo = _init_repo(tmp_path)
+    _suggested(repo, tmp_path, monkeypatch)
+    _fake_agent(monkeypatch, _LESSON_JSON)
+    lesson = learn.make_lesson(repo.repo, repo, _stats_over_threshold(), [], [], suggestion_id="rebase-basics")[
+        "lesson"
+    ]
+    learn.record_progress(repo.repo, repo, lesson_id=lesson["id"], status="completed")
+    profile = learn.delete_lesson(repo.repo, repo, lesson_id=lesson["id"])["profile"]
+    assert profile["lessons"] == []
+    # The gap the lesson closed stays closed: the learning still happened.
+    assert profile["gaps"][0]["status"] == "addressed"
+    assert learn.delete_lesson(repo.repo, repo, lesson_id="missing") == {"error": "Unknown lesson."}
+    # Wired through the shared POST dispatcher.
+    result = learn.handle_learn_post(
+        "/learn/delete", {"lesson_id": "missing"}, root=repo.repo, repo=repo, view=lambda *a: ([], [], [])
+    )
+    assert result == {"error": "Unknown lesson."}
 
 
 def test_norm_lesson_falls_back_to_single_step_for_a_blob():

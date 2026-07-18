@@ -518,7 +518,8 @@ def _make_handler(view: BacktraceView) -> type[http.server.BaseHTTPRequestHandle
     except Exception:
         learn_repo = None
 
-    def learn_view(source: str, frm: int, to: int) -> tuple[list, list[dict], list[dict]]:
+    def learn_view(source: str, frm: int, to: int, branch: str) -> tuple[list, list[dict], list[dict]]:
+        # ``branch`` is ignored: the reconstruction has no git refs to switch between.
         stats = _filter_stats(view.dashboard, author=source, backend="", model="", frm=frm, to=to)
         return stats, insights_for(source, "", "", frm, to), browser.files_payload()
 
@@ -613,6 +614,12 @@ def _make_handler(view: BacktraceView) -> type[http.server.BaseHTTPRequestHandle
                         )
                     except Exception:
                         payload["committers"] = []
+                    # No git refs in a reconstruction: the page hides its branch selector.
+                    payload["branches"] = []
+                    payload["branch"] = ""
+                    payload["trace_turns"] = sum(
+                        1 for stat in view.dashboard.stats if stat.kind in learn_page._AI_KINDS
+                    )
                     self._respond("application/json", json.dumps(payload).encode("utf-8"))
                 elif parsed.path == "/learn/models":
                     self._respond(
