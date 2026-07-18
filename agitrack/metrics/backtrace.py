@@ -601,7 +601,9 @@ def _make_handler(view: BacktraceView) -> type[http.server.BaseHTTPRequestHandle
                 elif parsed.path == "/learn":
                     self._respond(
                         "text/html; charset=utf-8",
-                        learn_page.learn_html(learn_root).encode("utf-8"),
+                        learn_page.learn_html(
+                            learn_root, banner_html=learn_page.learn_backtrace_banner(view.directory)
+                        ).encode("utf-8"),
                         cache_control="no-cache",
                     )
                 elif parsed.path == "/learn/state":

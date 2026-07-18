@@ -625,6 +625,84 @@ def test_handle_learn_post_dispatches_and_404s(tmp_path, monkeypatch, fixed_iden
 # ----------------------------------------------------------------------- the page
 
 
+def test_backtrace_server_serves_learn_with_banner_and_insights(tmp_path, monkeypatch, fixed_identity):
+    # The backtrace server must carry the whole learning experience over a RECONSTRUCTION,
+    # even in a directory that is not a git repo: efficiency insights on /data, the learn
+    # page with its frozen "based on backtracing" warning strip, state without branches or
+    # sync, and suggestions personalized from the reconstructed turns.
+    import http.server
+    import threading
+    import urllib.request
+
+    from agitrack.metrics.backtrace import BacktraceView, _make_handler
+    from agitrack.metrics.collect import Dashboard
+
+    (tmp_path / ".agitrack").mkdir()
+    _write_state(tmp_path)
+    prompts = [
+        "add a delete endpoint",
+        "no, that broke the tests, fix them",
+        "add pagination",
+        "still failing, the fixture is wrong",
+        "why is the response 500",
+        "no, you missed the edge case",
+        "add sorting",
+        "still not working, same error",
+        "refactor the db helper",
+        "add auth",
+        "no, undo that",
+        "add rate limiting",
+        "write tests for pagination",
+        "still fails on empty pages",
+        "add logging",
+        "clean up imports",
+    ]
+    stats = [
+        CommitStat(
+            sha=("%040d" % i),
+            author="",
+            email="",
+            subject=p,
+            kind="agent",
+            timestamp=1751000000 + i * 7200,
+            prompt=p,
+            user_prompts=[p],
+            tokens={"output": 400 + i, "input": 900},
+        )
+        for i, p in enumerate(prompts)
+    ]
+    view = BacktraceView(
+        directory=str(tmp_path),
+        dashboard=Dashboard(repo=str(tmp_path), branch="", stats=stats),
+        root=tmp_path,
+        session_count=3,
+        backends=["claude"],
+    )
+    _fake_agent(monkeypatch, _SUGGEST_JSON)
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(view))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        data = json.loads(urllib.request.urlopen(f"{base}/data", timeout=30).read())
+        assert isinstance(data["insights"], list) and data["insights"]  # correction loops fire
+        page = urllib.request.urlopen(f"{base}/learn", timeout=15).read().decode()
+        assert "btbanner" in page and "BACKTRACE" in page and "backtraced history" in page
+        state = json.loads(urllib.request.urlopen(f"{base}/learn/state", timeout=15).read())
+        assert state["trace_turns"] == 16 and state["branches"] == []
+        assert state["sync"]["available"] is False
+        request = urllib.request.Request(
+            f"{base}/learn/suggest",
+            data=json.dumps({"source": "", "minutes": 15, "mood": "okay"}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        result = json.loads(urllib.request.urlopen(request, timeout=30).read())
+        assert not result.get("no_trace") and result["profile"]["suggestions"]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_learn_html_contains_the_page(tmp_path):
     repo = _init_repo(tmp_path)
     html = learn.learn_html(repo.repo)
