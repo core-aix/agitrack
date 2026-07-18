@@ -28,6 +28,7 @@ from typing import Callable
 
 from agitrack.commits import METADATA_HEADER
 from agitrack.commits.message import _token_metadata_lines, render_interaction_trace
+from agitrack.git import GitRepo
 from agitrack.metrics.collect import CommitStat, Dashboard, _abbreviate_home
 from agitrack.transcripts import claude, opencode
 from agitrack.transcripts.edits import combine_patches, merge_edits_by_path, total_lines
@@ -498,6 +499,7 @@ def _str(query: dict[str, list[str]], key: str) -> str:
 
 
 def _make_handler(view: BacktraceView) -> type[http.server.BaseHTTPRequestHandler]:
+    from agitrack.metrics import learn as learn_page
     from agitrack.metrics.files import backtrace_browser
     from agitrack.metrics.insights import build_insights, context_from_browser
     from agitrack.metrics.web import _filter_stats, aggregates_payload, format_html, log_page
@@ -505,6 +507,20 @@ def _make_handler(view: BacktraceView) -> type[http.server.BaseHTTPRequestHandle
     banner = _banner_html(view)
     browser = backtrace_browser(view.dashboard.stats, view.file_edits, directory=view.root)
     insight_cache: dict[tuple, list[dict]] = {}
+
+    # The learning page works over the reconstruction too: same traces, same coach. The
+    # served directory may not be a git repo at all — learn then runs with repo=None
+    # (identity falls back to the gh login, progress sync reports unavailable, everything
+    # else works; the progress log lives in <dir>/.agitrack/learning.json either way).
+    learn_root = view.root or Path.cwd()
+    try:
+        learn_repo: GitRepo | None = GitRepo.discover(learn_root)
+    except Exception:
+        learn_repo = None
+
+    def learn_view(source: str, frm: int, to: int) -> tuple[list, list[dict], list[dict]]:
+        stats = _filter_stats(view.dashboard, author=source, backend="", model="", frm=frm, to=to)
+        return stats, insights_for(source, "", "", frm, to), browser.files_payload()
 
     def insights_for(author: str, backend: str, model: str, frm: int, to: int) -> list[dict]:
         # Scoped to the current filter, exactly as the live dashboard does, so narrowing the time
@@ -581,8 +597,49 @@ def _make_handler(view: BacktraceView) -> type[http.server.BaseHTTPRequestHandle
                         "application/json",
                         json.dumps(browser.file_diff(_str(query, "path"), _str(query, "sha"))).encode("utf-8"),
                     )
+                elif parsed.path == "/learn":
+                    self._respond("text/html; charset=utf-8", learn_page.learn_html(learn_root).encode("utf-8"))
+                elif parsed.path == "/learn/state":
+                    payload = learn_page.learn_state(learn_root, learn_repo)
+                    # Reconstructed turns carry no committers, so the trace-source select
+                    # usually only offers "entire team" here; harmless when some exist.
+                    try:
+                        payload["committers"] = sorted(
+                            {label for stat in view.dashboard.stats for label in view.dashboard.committers_of(stat)}
+                        )
+                    except Exception:
+                        payload["committers"] = []
+                    self._respond("application/json", json.dumps(payload).encode("utf-8"))
+                elif parsed.path == "/learn/models":
+                    self._respond(
+                        "application/json", json.dumps(learn_page.model_options(_str(query, "backend"))).encode("utf-8")
+                    )
                 else:
                     self.send_error(404, "not found")
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                pass
+
+        def do_POST(self) -> None:  # noqa: N802 (http.server API)
+            # The learning page's POST endpoints, shared with the live server (see
+            # learn.handle_learn_post). Bodies are JSON; a beacon flush may arrive
+            # without an application/json header, so parse regardless of content type.
+            try:
+                parsed = urllib.parse.urlparse(self.path)
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if 0 < length <= 1_000_000 else b""
+                try:
+                    body = json.loads(raw.decode("utf-8", errors="replace") or "{}")
+                except json.JSONDecodeError:
+                    body = {}
+                if not isinstance(body, dict):
+                    body = {}
+                payload = learn_page.handle_learn_post(
+                    parsed.path, body, root=learn_root, repo=learn_repo, view=learn_view
+                )
+                if payload is None:
+                    self.send_error(404, "not found")
+                    return
+                self._respond("application/json", json.dumps(payload).encode("utf-8"))
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 pass
 

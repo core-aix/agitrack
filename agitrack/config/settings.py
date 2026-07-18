@@ -184,6 +184,8 @@ class GlobalConfig:
             "menu_key": DEFAULT_MENU_KEY,
             "summarization_enabled": True,
             "summarization_model": None,
+            "learning_backend": None,
+            "learning_model": None,
             "check_for_updates": True,
             "share_max_transcript_bytes": DEFAULT_MAX_SHARED_BYTES,
             "timings": dict(DEFAULT_TIMINGS),
@@ -478,6 +480,33 @@ class GlobalConfig:
     @summarization_model.setter
     def summarization_model(self, value: str | None) -> None:
         self.data["summarization_model"] = value
+        self.save()
+
+    @property
+    def learning_backend(self) -> str | None:
+        # Which backend generates learning-page content (the dashboard's /learn page).
+        # None (the default) means "use the latest session's backend" — the learn service
+        # falls back to the repo's recorded backend, then default_backend. Set it (repo
+        # or global scope) to pin learning to a specific backend regardless of sessions.
+        value = self._raw("learning_backend")
+        return str(value) if value else None
+
+    @learning_backend.setter
+    def learning_backend(self, value: str | None) -> None:
+        self.data["learning_backend"] = value
+        self.save()
+
+    @property
+    def learning_model(self) -> str | None:
+        # Model for learning-page content generation. None means "use the latest
+        # session's model" (the learn service falls back to the repo state's model,
+        # dropped if it belongs to the other backend's id format).
+        value = self._raw("learning_model")
+        return str(value) if value else None
+
+    @learning_model.setter
+    def learning_model(self, value: str | None) -> None:
+        self.data["learning_model"] = value
         self.save()
 
     @property

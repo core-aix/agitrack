@@ -1014,7 +1014,7 @@ __UPDATE_BANNER__
 <div class="wrap">
   <header>
     <div class="brand"><span class="a">a</span>GiTrack<span class="sub">&nbsp;dashboard</span></div>
-    <div class="meta"><span class="tag">repo</span> <b>__REPO__</b><span id="branchmeta"> &nbsp;·&nbsp; <span class="tag">branch</span> <select id="f-branch" class="branchsel" title="View statistics and the commit log for a single branch"></select></span> &nbsp;·&nbsp; <span id="genat"></span></div>
+    <div class="meta"><span class="tag">repo</span> <b>__REPO__</b><span id="branchmeta"> &nbsp;·&nbsp; <span class="tag">branch</span> <select id="f-branch" class="branchsel" title="View statistics and the commit log for a single branch"></select></span> &nbsp;·&nbsp; <span id="genat"></span> &nbsp;·&nbsp; <a class="flink" id="learnlink" href="learn" title="Let the backend agent coach you from your own interaction traces">&#127891; learn</a></div>
   </header>
 
   <div class="booting" id="booting">

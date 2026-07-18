@@ -71,6 +71,7 @@ class AgentBackend(Protocol):
         bare: bool = False,
         system_prompt: str | None = None,
         commit_guidance: bool = True,
+        timeout_seconds: int | None = None,
     ) -> AgentResult: ...
 
     def update_command(self) -> list[str] | None:
@@ -95,3 +96,8 @@ class AgentBackend(Protocol):
     # its task instruction here — putting the directive in the SYSTEM role (not crammed into
     # the user message) so the model summarizes the user content instead of completing/echoing
     # an instruction-shaped prompt. None falls back to a minimal generic directive.
+
+    # ``timeout_seconds`` (bare only): overrides the built-in 90s bare-run cap. The learning
+    # page's content generation legitimately runs longer than a summary (a full lesson is a
+    # much larger completion), so it passes a bigger bound; None keeps the summarizer default.
+    # Non-bare interactive runs stay untimed regardless.
