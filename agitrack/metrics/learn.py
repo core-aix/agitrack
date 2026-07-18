@@ -375,8 +375,10 @@ def _extract_json(text: str) -> dict | None:
 _MENTOR_PERSONA = (
     "You are a friendly, encouraging coding mentor built into aGiTrack, a tool that records "
     "how people work with coding agents. You coach the developer using evidence from their "
-    "actual agent sessions. Be concrete, warm, and brief; never condescending. Do not use "
-    "em-dashes anywhere in your output."
+    "actual agent sessions. Be concrete, warm, and brief; never condescending. Use simple, "
+    "everyday words and short sentences; when a technical term is unavoidable, explain it in "
+    "plain language the first time you use it. Always prefer a concrete example over an "
+    "abstract explanation. Do not use em-dashes anywhere in your output."
 )
 
 
@@ -453,16 +455,22 @@ def _lesson_prompt(suggestion: dict, digest: str, mood: str) -> str:
 
 SUGGESTION: {json.dumps(suggestion, ensure_ascii=False)}
 
+The lesson is shown in a web page that walks the learner through it ONE STEP AT A TIME. The page is
+the entire learning environment: everything must be readable and doable inside it. NEVER tell the
+learner to run a command, open a terminal or editor, or leave the page. When code, a diff, a config,
+or a command's output is worth studying, include it directly in a step as a fenced code block.
+
 Requirements:
-- Sized for about {minutes} minutes of reading ({words} words or fewer). Mood: {mood or "okay"}.
-- "content_md" is Markdown: short sections with ### headings, concrete examples, and where relevant reference the learner's ACTUAL files/areas named in the digest. End with a "Try this next time" tip they can apply in their very next agent session.
+- "steps": 3 to 7 small steps, ONE idea each, 40-150 words per step (total sized for about {minutes} minutes, {words} words or fewer). Mood: {mood or "okay"}. The first step says why this matters to THIS learner; where relevant reference their ACTUAL files/areas named in the digest; the final step is a "Try this next time" takeaway they can apply in their very next agent session.
 - "links": 1-3 external resources for going deeper. Only real, stable, well-known URLs (official documentation, canonical references). If unsure a URL is real, leave it out.
 - "quiz": 1-3 multiple-choice questions checking the key points. 3-4 choices each, "answer" is the 0-based index of the correct choice, "explain" says why in one sentence.
-- "exercise": ONE small hands-on task the learner can try in their own repo or terminal in a few minutes, directly practicing the lesson. "task" says exactly what to do and what success looks like; "hint" helps if they get stuck.
+- "exercise": ONE exercise completable ENTIRELY in the page: include all the material to work with inside "task" (a code snippet, diff, or scenario, in fenced blocks), and ask for a short typed answer: predict what happens, spot the problem, write the fix, or write the prompt they would give their agent. Never require executing anything. "hint" helps if they get stuck.
+- Plain language above all: simple everyday words, short sentences, one concrete example beats a paragraph of theory. Define any technical term in plain words the first time it appears. Write like you are explaining to a smart colleague who is new to this exact topic, never like documentation.
 - Friendly and effortless to read. No em-dashes.
 
 Reply with ONE JSON object, exactly this shape (no prose around it, no code fences):
-{{"title": "lesson title", "minutes": {minutes}, "content_md": "the lesson in Markdown",
+{{"title": "lesson title", "minutes": {minutes},
+ "steps": [{{"title": "short step title", "content_md": "the step in Markdown"}}],
  "links": [{{"title": "…", "url": "https://…", "note": "why it is worth opening"}}],
  "quiz": [{{"question": "…", "choices": ["…", "…", "…"], "answer": 0, "explain": "…"}}],
  "exercise": {{"task": "…", "hint": "…"}}}}
@@ -498,8 +506,8 @@ LESSON (context):
 WHAT THE LEARNER REPORTS DOING / THEIR RESULT:
 {notes[:2000]}
 
-Judge whether the attempt shows they achieved the exercise's goal. Be generous with honest effort but do not pass an attempt that missed the point. Reply with ONE JSON object, nothing else:
-{{"passed": true or false, "feedback": "2-4 encouraging, concrete sentences; if not passed, say exactly what to try next"}}"""
+Judge whether the typed answer shows they achieved the exercise's goal. Be generous with honest effort but do not pass an attempt that missed the point. Anything you suggest trying next must be doable right here in the page (rethinking, retyping an answer) or in their next agent session; never tell them to run commands or open a terminal. No em-dashes. Reply with ONE JSON object, nothing else:
+{{"passed": true or false, "feedback": "2-4 encouraging, concrete sentences; if not passed, say exactly what to reconsider"}}"""
 
 
 # ------------------------------------------------------------------- normalization
@@ -583,17 +591,39 @@ def _norm_lesson(raw: dict, suggestion: dict) -> dict:
         raw_exercise = {}
     task = str(raw_exercise.get("task") or "").strip()
     exercise = (
-        {"task": task[:1200], "hint": str(raw_exercise.get("hint") or "")[:600], "status": "open", "attempts": []}
+        {"task": task[:4000], "hint": str(raw_exercise.get("hint") or "")[:1000], "status": "open", "attempts": []}
         if task
         else None
     )
+    # The lesson is a sequence of small steps the page walks through one at a time. A model
+    # that returned a single content_md blob instead (or an older stored lesson) still works:
+    # it becomes one step here, and the page splits legacy blobs on ### headings client-side.
+    steps = []
+    raw_steps = raw.get("steps")
+    for item in raw_steps if isinstance(raw_steps, list) else []:
+        if not isinstance(item, dict):
+            continue
+        content = str(item.get("content_md") or "").strip()
+        if not content:
+            continue
+        steps.append({"title": str(item.get("title") or "")[:120], "content_md": content[:6000]})
+    steps = steps[:8]
+    content_md = str(raw.get("content_md") or "")
+    if not steps and content_md.strip():
+        steps = [{"title": "", "content_md": content_md}]
+    if not content_md.strip():
+        # Joined view of the steps: the chat/exercise prompts feed this to the mentor as context.
+        content_md = "\n\n".join(
+            (f"### {step['title']}\n{step['content_md']}" if step["title"] else step["content_md"]) for step in steps
+        )
     minutes = raw.get("minutes")
     return {
         "title": str(raw.get("title") or suggestion.get("title") or "Lesson")[:140],
         "minutes": minutes if isinstance(minutes, int) and 0 < minutes <= 240 else suggestion.get("minutes", 15),
         "kind": suggestion.get("kind", "coding"),
         "gap_id": suggestion.get("gap_id", ""),
-        "content_md": str(raw.get("content_md") or ""),
+        "steps": steps,
+        "content_md": content_md,
         "links": links[:3],
         "quiz": quiz[:3],
         "exercise": exercise,
@@ -699,6 +729,52 @@ def _fetch_progress_throttled(repo: GitRepo) -> None:
             pass
 
     threading.Thread(target=worker, daemon=True, name="agit-learn-fetch").start()
+
+
+# Roots where a restore has already been attempted this process: a genuinely-new user
+# with nothing on the ref shouldn't pay a network fetch on every page load.
+_restore_checked: set[str] = set()
+
+
+def _profile_is_empty(profile: dict[str, Any]) -> bool:
+    return not (
+        profile.get("assessment") or profile.get("gaps") or profile.get("suggestions") or profile.get("lessons")
+    )
+
+
+def restore_progress_from_ref(root: Path, repo: GitRepo, gid: str) -> bool:
+    """Pull the user's synced progress back onto THIS machine.
+
+    The sync ref is how progress travels: on a machine (or fresh clone) where the local
+    ``learning.json`` has nothing for this user, fetch ``refs/agitrack/learning-progress``
+    from origin and import the user's own entry. Called by :func:`learn_state` when the
+    local profile is empty, so progress simply follows the user with no import step; a
+    successful restore also re-enables sync (they had it on wherever the entry came from).
+    Never overwrites a non-empty local profile: local, newer-by-construction state wins.
+    """
+    if repo.remote_exists():
+        repo.fetch_ref(f"+{PROGRESS_REF}:{PROGRESS_REF}", timeout=15)
+    fingerprint = repo.root_commit() or "no-root"
+    raw = repo.read_ref_blob(PROGRESS_REF, f"{fingerprint}/{gid}/progress.json")
+    if not raw:
+        return False
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return False
+    profile = parsed.get("profile") if isinstance(parsed, dict) else None
+    if not isinstance(profile, dict) or _profile_is_empty(profile):
+        return False
+    store = LearnStore(root)
+    with _STORE_LOCK:
+        data = store.load()
+        current = LearnStore.profile(data, gid)
+        if not _profile_is_empty(current):
+            return False  # something landed locally in the meantime; keep it
+        data["profiles"][gid] = profile
+        data["sync_enabled"] = True
+        store.save(data)
+    return True
 
 
 def synced_users(repo: GitRepo) -> list[dict]:
@@ -811,15 +887,28 @@ def describe_learning_backend(repo_root: Path) -> dict[str, Any]:
 
 def learn_state(root: Path, repo: GitRepo | None) -> dict[str, Any]:
     """Everything the page needs to paint instantly, with no agent call: who the learner
-    is (GitHub id), their persisted profile, the engine info, and the sync status."""
+    is (GitHub id), their persisted profile, the engine info, and the sync status. On a
+    machine where this user has no local progress yet, their synced progress (if any) is
+    restored from the git ref first, so progress follows them across machines."""
     gid = learner_id(root, repo)
     store = LearnStore(root)
     with _STORE_LOCK:
         data = store.load()
         profile = LearnStore.profile(data, gid)
+    restored = False
+    if repo is not None and _profile_is_empty(profile) and str(root) not in _restore_checked:
+        _restore_checked.add(str(root))
+        try:
+            restored = restore_progress_from_ref(root, repo, gid)
+        except Exception:
+            restored = False
+        if restored:
+            with _STORE_LOCK:
+                profile = LearnStore.profile(store.load(), gid)
     return {
         "me": gid,
         "profile": profile,
+        "restored": restored,
         "backend_info": describe_learning_backend(root),
         "sync": sync_info(root, repo),
     }
@@ -939,6 +1028,22 @@ def make_lesson(
         _AGENT_LOCK.release()
 
 
+def reset_suggestions(root: Path, repo: GitRepo | None) -> dict[str, Any]:
+    """Clear the stored suggestions (and the check-in context that produced them), so the
+    next check-in starts clean: for when the repo has moved on or the filters changed and
+    the stored picks feel stale. Progress (lessons, gaps, assessment) is kept; nothing an
+    agent produced for COMPLETED work is lost."""
+    gid = learner_id(root, repo)
+
+    def apply(profile: dict[str, Any]) -> None:
+        profile["suggestions"] = []
+        profile.pop("suggested_at", None)
+        profile.pop("suggest_context", None)
+
+    profile = LearnStore(root).update(gid, apply)
+    return {"profile": profile}
+
+
 def lesson_chat(root: Path, repo: GitRepo | None, *, lesson_id: str, message: str) -> dict[str, Any]:
     """A follow-up question about a lesson. Stateless on the backend side: the lesson and
     recent conversation ride in the prompt, so it never depends on scratch-session state."""
@@ -981,7 +1086,7 @@ def exercise_check(root: Path, repo: GitRepo | None, *, lesson_id: str, notes: s
     progress record, and a pass marks the exercise done."""
     notes = notes.strip()
     if not notes:
-        return {"error": "Tell me what you tried first."}
+        return {"error": "Type your answer first."}
     if not _AGENT_LOCK.acquire(blocking=False):
         return {"busy": True}
     try:
@@ -1130,6 +1235,8 @@ def handle_learn_post(
                 quiz_total=quiz_total if isinstance(quiz_total, int) else None,
                 exercise_status=str(body.get("exercise_status") or ""),
             )
+        if path == "/learn/reset":
+            return reset_suggestions(root, repo)
         if path == "/learn/sync":
             return set_sync(root, repo, bool(body.get("enabled")))
         if path == "/learn/config":
@@ -1161,13 +1268,17 @@ _LEARN_TEMPLATE = r"""<!DOCTYPE html>
 <meta name="robots" content="noindex">
 <title>learn · __REPO_NAME__ · aGiTrack</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🎓</text></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=VT323&family=IBM+Plex+Mono:ital,wght@0,400;0,500;0,600;1,400&display=swap" rel="stylesheet">
 <style>
 :root{--ink:#0b0f0e;--panel:#111716;--panel2:#0e1413;--line:#233029;--fg:#cfe3d8;--fg-dim:#7d947f;
   --phosphor:#7fd77f;--phosphor-dim:#3f6b45;--accent:#6bbcee;--warn:#e0b653;--bad:#e07a6a;
-  --chipbg:#16201d}
+  --chipbg:#16201d;--amber:#ffb454;
+  --mono:"IBM Plex Mono",ui-monospace,Menlo,Consolas,monospace;--display:"VT323",var(--mono)}
 *{box-sizing:border-box}
 html,body{margin:0;padding:0;background:var(--ink);color:var(--fg);
-  font:14px/1.55 "SF Mono",ui-monospace,Menlo,Consolas,monospace}
+  font:14px/1.55 var(--mono)}
 a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
 
 /* A slow ambient glow drifting behind everything: calm, not busy. */
@@ -1182,8 +1293,10 @@ a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
 .wrap{max-width:880px;margin:0 auto;padding:22px 20px 60px}
 header{display:flex;align-items:baseline;justify-content:space-between;gap:14px;flex-wrap:wrap;
   border-bottom:1px dashed var(--line);padding-bottom:14px;margin-bottom:18px}
-.brand{font-size:19px;letter-spacing:.5px}
-.brand .a{color:var(--phosphor)} .brand .sub{color:var(--fg-dim);font-size:13px}
+.brand{font-family:var(--display);font-weight:400;font-size:38px;line-height:.9;color:var(--phosphor);
+  letter-spacing:1.5px;text-shadow:0 0 12px rgba(127,215,127,.5),0 0 44px rgba(127,215,127,.2)}
+.brand .a{color:var(--amber);text-shadow:0 0 12px rgba(255,180,84,.5),0 0 44px rgba(255,180,84,.2)}
+.brand .sub{font-family:var(--display);font-size:.5em;color:var(--fg-dim);letter-spacing:3px;text-shadow:none}
 .meta{color:var(--fg-dim);font-size:12.5px} .meta b{color:var(--fg)}
 .backlink{font-size:12.5px}
 
@@ -1191,11 +1304,14 @@ header{display:flex;align-items:baseline;justify-content:space-between;gap:14px;
 .rise{animation:rise .5s ease both}
 @keyframes rise{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
 @media (prefers-reduced-motion: reduce){
-  .rise,.card,.mascot,.ambient,.spin,.confetti span{animation:none !important}
+  .rise,.card,.card.busy,.mascot,.ambient,.spin,.confetti span,.ov-bar span{animation:none !important}
 }
 
 h2.section{font-size:13px;letter-spacing:1.5px;text-transform:uppercase;color:var(--phosphor);
   margin:26px 0 10px;font-weight:600}
+.sechead{display:flex;align-items:baseline;justify-content:space-between;gap:12px}
+.sechead h2.section{margin-bottom:10px}
+.btn.small{padding:5px 12px;font-size:12px}
 .panel{background:var(--panel);border:1px solid var(--line);padding:16px 18px;border-radius:8px}
 .checkin .lead{margin:0 0 12px;color:var(--fg);font-size:15px;display:flex;align-items:center;gap:10px}
 .checkin .lead .hi{color:var(--phosphor)}
@@ -1221,6 +1337,22 @@ textarea{width:100%;min-height:74px;resize:vertical}
 .hint{color:var(--fg-dim);font-size:12px;margin-top:8px}
 .thinking{display:flex;align-items:center;gap:10px;color:var(--fg-dim);font-size:13px;padding:14px 4px}
 .thinking .grow{font-size:18px;animation:bob 2.4s ease-in-out infinite}
+/* The full-screen processing overlay: while the agent writes suggestions or a lesson,
+   the whole page dims and this card is unmissable, whatever was scrolled into view. */
+.overlay{position:fixed;inset:0;z-index:60;display:flex;align-items:center;justify-content:center;
+  background:rgba(4,7,5,.74);backdrop-filter:blur(3px);animation:fadein .25s ease both}
+@keyframes fadein{from{opacity:0}to{opacity:1}}
+.ov-card{background:var(--panel);border:1px solid var(--phosphor-dim);border-radius:12px;
+  padding:32px 40px;max-width:460px;margin:0 20px;text-align:center;
+  box-shadow:0 18px 60px rgba(0,0,0,.55);animation:rise .3s ease both}
+.ov-card .mascot{font-size:44px}
+.ov-title{font-size:16px;color:var(--phosphor);margin:12px 0 4px}
+.ov-msg{font-size:13px;color:var(--fg-dim);min-height:20px}
+.ov-bar{height:4px;border-radius:2px;background:var(--panel2);overflow:hidden;margin:16px 0 12px}
+.ov-bar span{display:block;height:100%;width:38%;border-radius:2px;background:var(--phosphor);
+  animation:ovslide 1.6s ease-in-out infinite}
+@keyframes ovslide{0%{margin-left:-40%}100%{margin-left:100%}}
+.ov-hint{font-size:11.5px;color:var(--fg-dim)}
 .spin{width:13px;height:13px;border:2px solid var(--phosphor-dim);border-top-color:var(--phosphor);
   border-radius:50%;display:inline-block;animation:spin .8s linear infinite;flex:none}
 @keyframes spin{to{transform:rotate(360deg)}}
@@ -1231,6 +1363,9 @@ textarea{width:100%;min-height:74px;resize:vertical}
   transition:border-color .15s,transform .15s,box-shadow .15s;animation:rise .5s ease both}
 .card:nth-child(2){animation-delay:.08s}.card:nth-child(3){animation-delay:.16s}.card:nth-child(4){animation-delay:.24s}
 .card:hover{border-color:var(--phosphor);transform:translateY(-2px);box-shadow:0 6px 22px rgba(0,0,0,.35)}
+.card.busy{border-color:var(--phosphor);animation:busypulse 1.2s ease-in-out infinite}
+.card.busy .start{color:var(--phosphor)}
+@keyframes busypulse{50%{box-shadow:0 0 0 4px rgba(127,215,127,.18)}}
 .card h3{margin:0 0 6px;font-size:14.5px;color:var(--fg);font-weight:600}
 .card .why{color:var(--fg-dim);font-size:12.5px;margin:6px 0}
 .card .teaser{color:var(--fg);font-size:12.5px;margin:6px 0 8px}
@@ -1243,6 +1378,16 @@ textarea{width:100%;min-height:74px;resize:vertical}
 .card .start{margin-top:8px;font-size:12.5px;color:var(--accent)}
 .lesson h1{font-size:19px;margin:4px 0 2px;color:var(--fg)}
 .lesson .lmeta{color:var(--fg-dim);font-size:12px;margin-bottom:14px}
+/* The step-by-step walk: one small idea on screen at a time, dots showing where you are. */
+.step-head{display:flex;align-items:center;justify-content:space-between;margin:6px 0 2px}
+.step-count{font-size:11.5px;color:var(--fg-dim);letter-spacing:1.2px;text-transform:uppercase}
+.step-dots .sdot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--line);
+  margin-left:7px;transition:background .25s,transform .25s}
+.step-dots .sdot.done{background:var(--phosphor-dim)}
+.step-dots .sdot.on{background:var(--phosphor);transform:scale(1.25)}
+.step-nav{display:flex;gap:10px;margin-top:16px;border-top:1px dashed var(--line);padding-top:14px}
+.step-nav #step-next{margin-left:auto}
+.lcontent.stepped{animation:rise .35s ease both}
 .lcontent{font-size:14px}
 .lcontent h3{color:var(--phosphor);font-size:14px;margin:20px 0 6px}
 .lcontent h4{color:var(--fg);font-size:13.5px;margin:16px 0 6px}
@@ -1318,7 +1463,7 @@ footer code{color:var(--fg)}
   <header class="rise">
     <div class="brand"><span class="a">a</span>GiTrack<span class="sub">&nbsp;learn</span></div>
     <div class="meta"><span>repo</span> <b>__REPO__</b> <span id="me-meta"></span></div>
-    <a class="backlink" href="./">&larr; dashboard</a>
+    <a class="backlink" id="backlink" href="./">&larr; dashboard</a>
   </header>
 
   <div class="panel checkin rise" id="checkin">
@@ -1350,14 +1495,25 @@ footer code{color:var(--fg)}
       <input type="text" id="f-note" placeholder="anything specific on your mind? (leave empty and I'll pick)" maxlength="300">
     </div>
     <button class="gobtn" id="go">&#10024; find me something worth learning</button>
-    <div class="hint">I'll look at the recent sessions, spot what would help you most, and size it to your time. Your progress is saved automatically.</div>
+    <div class="hint">I'll look at the recent sessions, spot what would help you most, and size it to your time. Your progress is saved automatically. Press the button again any time (after new commits, or with different filters) for fresh picks.</div>
   </div>
 
   <div id="agent-wait" class="thinking" hidden><span class="spin"></span><span class="grow" id="wait-icon">&#127793;</span><span id="wait-msg"></span></div>
+
+  <div class="overlay" id="overlay" hidden>
+    <div class="ov-card">
+      <span class="mascot" id="ov-icon">&#128221;</span>
+      <div class="ov-title" id="ov-title"></div>
+      <div class="ov-msg" id="ov-msg"></div>
+      <div class="ov-bar"><span></span></div>
+      <div class="ov-hint">your coach is reading the traces and writing just for you; this usually takes under a minute</div>
+    </div>
+  </div>
   <div id="flash"></div>
 
   <div id="suggestwrap" hidden>
-    <h2 class="section">picked for you</h2>
+    <div class="sechead"><h2 class="section">picked for you</h2>
+      <button class="btn small" id="reset-suggest" title="Clear these picks and check in again, e.g. after new commits or different filters">&#8635; start over</button></div>
     <div class="assess" id="assess" hidden></div>
     <div class="cards" id="suggestions"></div>
   </div>
@@ -1367,7 +1523,15 @@ footer code{color:var(--fg)}
       <button class="btn" id="lesson-back">&larr; back</button>
       <h1 id="lesson-title"></h1>
       <div class="lmeta" id="lesson-meta"></div>
+      <div class="step-head" id="step-head" hidden>
+        <span class="step-count" id="step-count"></span>
+        <span class="step-dots" id="step-dots"></span>
+      </div>
       <div class="lcontent" id="lesson-content"></div>
+      <div class="step-nav" id="step-nav" hidden>
+        <button class="btn" id="step-prev">&larr; back a step</button>
+        <button class="btn primary" id="step-next">got it, next &rarr;</button>
+      </div>
       <div class="links" id="lesson-links"></div>
       <div class="quiz" id="lesson-quiz" hidden>
         <h3 class="subhead">&#128161; quick check</h3>
@@ -1379,7 +1543,7 @@ footer code{color:var(--fg)}
         <h3 class="subhead">&#128296; try it yourself</h3>
         <div class="extask" id="ex-task"></div>
         <details id="ex-hint-wrap"><summary>need a hint?</summary><div id="ex-hint"></div></details>
-        <textarea id="ex-notes" placeholder="what did you try, and what happened? paste output or notes here"></textarea>
+        <textarea id="ex-notes" placeholder="type your answer here; everything you need is in the task above"></textarea>
         <div class="btnrow">
           <button class="btn primary" id="ex-check">ask my mentor to review</button>
           <button class="btn" id="ex-skip">skip for now</button>
@@ -1441,7 +1605,8 @@ const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
 const state = { me: "", source: "", minutes: 15, mood: "okay", profile: null, lesson: null,
-                sync: null, openedAt: 0, flushedS: 0, waitTimer: null };
+                sync: null, openedAt: 0, flushedS: 0, waitTimer: null,
+                steps: [], step: 0, endReached: false };
 
 function period() {
   const days = $("f-period").value;
@@ -1459,29 +1624,44 @@ async function post(path, body) {
 function flash(html) { $("flash").innerHTML = html; }
 function clearFlash() { flash(""); }
 
-// ------- friendly waiting messages (an agent call takes a little while) -------
+// ------- friendly waiting states (an agent call takes a little while) -------
+// The big generation calls (suggestions, a lesson) take over the whole screen with a
+// dimmed overlay + progress bar, so there is never any doubt something is happening,
+// wherever the page is scrolled. Quick in-place calls (chat, exercise review) keep the
+// small inline indicator next to where the user is looking.
 const WAIT = {
-  suggest: {icon: "\u{1F331}", msgs: ["reading your recent sessions…", "spotting patterns in how you work…",
+  suggest: {icon: "\u{1F331}", overlay: true, title: "finding something worth learning…",
+            msgs: ["reading your recent sessions…", "spotting patterns in how you work…",
             "checking what you already learned…", "picking something worth your time…"]},
-  lesson:  {icon: "\u{1F4DD}", msgs: ["writing your lesson…", "tailoring the examples to your repo…",
-            "adding links worth opening…", "almost there…"]},
+  lesson:  {icon: "\u{1F4DD}", overlay: true, title: "writing your lesson…",
+            msgs: ["reading the traces behind this topic…", "tailoring the examples to your repo…",
+            "building the steps, quiz and exercise…", "adding links worth opening…", "almost there…"]},
   chat:    {icon: "\u{1F4AC}", msgs: ["thinking about your question…", "checking the lesson again…"]},
   exercise:{icon: "\u{1F50D}", msgs: ["reviewing what you tried…", "comparing it with the goal…"]}
 };
 function startWait(kind) {
   let i = 0;
   const w = WAIT[kind];
-  $("agent-wait").hidden = false;
-  $("wait-icon").textContent = w.icon;
-  $("wait-msg").textContent = w.msgs[0];
+  if (w.overlay) {
+    $("overlay").hidden = false;
+    $("ov-icon").textContent = w.icon;
+    $("ov-title").textContent = w.title;
+    $("ov-msg").textContent = w.msgs[0];
+  } else {
+    $("agent-wait").hidden = false;
+    $("wait-icon").textContent = w.icon;
+    $("wait-msg").textContent = w.msgs[0];
+  }
+  const target = w.overlay ? "ov-msg" : "wait-msg";
   state.waitTimer = setInterval(() => {
     i = (i + 1) % w.msgs.length;
-    $("wait-msg").textContent = w.msgs[i];
+    $(target).textContent = w.msgs[i];
   }, 3500);
 }
 function stopWait() {
   clearInterval(state.waitTimer);
   $("agent-wait").hidden = true;
+  $("overlay").hidden = true;
 }
 
 // Gentle emoji confetti for finished lessons and passed exercises.
@@ -1628,19 +1808,40 @@ function renderSync() {
 }
 
 // ------------------------------------------------------------------ lesson view
+// The steps to walk through. New lessons carry a steps[] array; an older stored lesson
+// (one Markdown blob) is split on its ### headings so it gets the same guided treatment.
+function lessonSteps(lesson) {
+  if (Array.isArray(lesson.steps) && lesson.steps.length) return lesson.steps;
+  const src = String(lesson.content_md || "");
+  const steps = [];
+  let current = {title: "", content_md: ""};
+  for (const line of src.split("\n")) {
+    const m = /^###\s+(.*)/.exec(line);
+    if (m) {
+      if (current.title || current.content_md.trim()) steps.push(current);
+      current = {title: m[1].trim(), content_md: ""};
+    } else current.content_md += line + "\n";
+  }
+  if (current.title || current.content_md.trim()) steps.push(current);
+  return steps.length ? steps : [{title: "", content_md: src}];
+}
+
 function openLesson(lesson) {
   flushTime();
   state.lesson = lesson;
   state.openedAt = Date.now();
   state.flushedS = 0;
+  state.steps = lessonSteps(lesson);
+  // A finished lesson reopens fully unfolded; a fresh one starts the guided walk.
+  state.endReached = lesson.status === "completed";
+  state.step = state.endReached ? state.steps.length - 1 : 0;
   $("checkin").hidden = true;
   $("suggestwrap").hidden = true;
   $("progresswrap").hidden = true;
   $("lessonwrap").hidden = false;
   clearFlash();
   $("lesson-title").textContent = lesson.title;
-  $("lesson-meta").innerHTML = `${kindBadge(lesson.kind)} <span class="badge min">&#9200; ~${esc(lesson.minutes)} min</span>`;
-  $("lesson-content").innerHTML = md(lesson.content_md);
+  $("lesson-meta").innerHTML = `${kindBadge(lesson.kind)} <span class="badge min">&#9200; ~${esc(lesson.minutes)} min</span> <span class="badge">${state.steps.length > 1 ? state.steps.length + " small steps" : ""}</span>`;
   $("lesson-links").innerHTML = (lesson.links || []).length
     ? '<h3 class="subhead">&#128279; go deeper</h3>' +
       lesson.links.map(k => `<div class="lk"><a href="${esc(k.url)}" target="_blank" rel="noopener noreferrer">${esc(k.title)}</a>${k.note ? ` <span class="note">${esc(k.note)}</span>` : ""}</div>`).join("")
@@ -1648,10 +1849,52 @@ function openLesson(lesson) {
   renderQuiz(lesson);
   renderExercise(lesson);
   renderChat(lesson);
-  $("lesson-done").hidden = lesson.status === "completed";
+  renderStep();
   window.scrollTo(0, 0);
   if (lesson.status !== "completed")
     post("learn/progress", {lesson_id: lesson.id, status: "started"}).catch(() => {});
+}
+
+// One step on screen at a time; the quiz, exercise, links and Done button unlock when
+// the learner reaches the final step, so the page itself guides the order of things.
+function renderStep() {
+  const steps = state.steps;
+  const i = state.step;
+  const many = steps.length > 1;
+  $("step-head").hidden = !many;
+  $("step-nav").hidden = !many;
+  if (many) {
+    $("step-count").textContent = `step ${i + 1} of ${steps.length}`;
+    $("step-dots").innerHTML = steps.map((_, d) =>
+      `<span class="sdot ${d === i ? "on" : (d < i ? "done" : "")}"></span>`).join("");
+    $("step-prev").disabled = i === 0;
+    $("step-next").hidden = i >= steps.length - 1;
+  }
+  const step = steps[i];
+  const content = $("lesson-content");
+  content.classList.remove("stepped");
+  void content.offsetWidth; // restart the entry animation per step
+  content.classList.add("stepped");
+  content.innerHTML = (step.title ? `<h3>${esc(step.title)}</h3>` : "") + md(step.content_md);
+  if (i >= steps.length - 1) state.endReached = true;
+  updateEndSections();
+}
+
+function updateEndSections() {
+  const lesson = state.lesson;
+  const show = state.endReached;
+  $("lesson-links").hidden = !show || !(lesson.links || []).length;
+  $("lesson-quiz").hidden = !show || !(lesson.quiz || []).length;
+  $("lesson-ex").hidden = !show || !lesson.exercise;
+  $("lesson-done").hidden = !show || lesson.status === "completed";
+}
+
+function stepBy(delta) {
+  const next = state.step + delta;
+  if (next < 0 || next >= state.steps.length) return;
+  state.step = next;
+  renderStep();
+  $("lesson-title").scrollIntoView({behavior: "smooth", block: "start"});
 }
 
 function renderQuiz(lesson) {
@@ -1692,9 +1935,11 @@ function renderExercise(lesson) {
   const ex = lesson.exercise;
   $("lesson-ex").hidden = !ex;
   if (!ex) return;
-  $("ex-task").textContent = ex.task;
+  // Markdown-render the task and hint: the exercise material (code to study, a diff, a
+  // scenario) lives right here in the page, so fenced blocks must display properly.
+  $("ex-task").innerHTML = md(ex.task);
   $("ex-hint-wrap").hidden = !ex.hint;
-  $("ex-hint").textContent = ex.hint || "";
+  $("ex-hint").innerHTML = md(ex.hint || "");
   $("ex-notes").value = "";
   $("ex-status").textContent = ex.status === "done" ? "done ✓" : (ex.status === "skipped" ? "skipped" : "");
   $("ex-feedback").innerHTML = (ex.attempts || []).map(a =>
@@ -1704,7 +1949,7 @@ function renderExercise(lesson) {
 async function checkExercise() {
   const lesson = state.lesson;
   const notes = $("ex-notes").value.trim();
-  if (!lesson || !notes) { $("ex-status").textContent = "tell me what you tried first"; return; }
+  if (!lesson || !notes) { $("ex-status").textContent = "type your answer first"; return; }
   startWait("exercise");
   try {
     const r = await post("learn/exercise", {lesson_id: lesson.id, notes});
@@ -1817,6 +2062,12 @@ async function suggest() {
 
 async function openSuggestion(id) {
   clearFlash();
+  // Mark the tapped card as in-progress too, so when the overlay lifts (or if the user
+  // dismisses their eyes from it) the chosen topic is visibly the one being written.
+  const card = document.querySelector(`#suggestions .card[data-id="${CSS.escape(id)}"]`);
+  const start = card && card.querySelector(".start");
+  if (card) card.classList.add("busy");
+  if (start) start.innerHTML = "&#9997;&#65039; writing your lesson…";
   startWait("lesson");
   try {
     const pr = period();
@@ -1826,7 +2077,11 @@ async function openSuggestion(id) {
     if (state.profile) state.profile.lessons = [...(state.profile.lessons || []), r.lesson];
     openLesson(r.lesson);
   } catch (e) { flash(`<div class="error">${esc(e.message)}</div>`); }
-  finally { stopWait(); }
+  finally {
+    stopWait();
+    if (card) card.classList.remove("busy");
+    if (start) start.innerHTML = "start &rarr;";
+  }
 }
 
 async function refreshState() {
@@ -1836,6 +2091,7 @@ async function refreshState() {
     state.profile = d.profile;
     state.me = d.me || "";
     state.sync = d.sync || null;
+    if (d.restored) flash('<div class="notice">&#9729;&#65039; welcome back! I restored your learning progress from git, so you can pick up where you left off.</div>');
     if (state.me) {
       $("hello").textContent = "Hi " + state.me + "!";
       $("me-meta").innerHTML = " &nbsp;&middot;&nbsp; learner <b>" + esc(state.me) + "</b>";
@@ -1908,9 +2164,33 @@ function wireChips(id, key) {
 wireChips("time-chips", "minutes");
 wireChips("mood-chips", "mood");
 $("go").addEventListener("click", suggest);
+$("reset-suggest").addEventListener("click", async () => {
+  try {
+    const r = await post("learn/reset", {});
+    if (r.profile) {
+      state.profile = r.profile;
+      renderSuggestions();
+      renderProgress();
+      $("checkin").scrollIntoView({behavior: "smooth"});
+      flash('<div class="notice">fresh start! check in above and I\'ll pick again from the latest sessions.</div>');
+    }
+  } catch (e) {}
+});
+// Going back to the dashboard via history restores it instantly from the browser's
+// back/forward cache instead of a full reload (and its commit-history crunch).
+$("backlink").addEventListener("click", e => {
+  try {
+    if (document.referrer && new URL(document.referrer).origin === location.origin && history.length > 1) {
+      e.preventDefault();
+      history.back();
+    }
+  } catch (err) {}
+});
 $("f-source").addEventListener("change", () => { state.source = $("f-source").value; });
 $("lesson-back").addEventListener("click", closeLesson);
 $("lesson-done").addEventListener("click", finishLesson);
+$("step-prev").addEventListener("click", () => stepBy(-1));
+$("step-next").addEventListener("click", () => stepBy(1));
 $("quiz-check").addEventListener("click", checkQuiz);
 $("ex-check").addEventListener("click", checkExercise);
 $("ex-skip").addEventListener("click", skipExercise);

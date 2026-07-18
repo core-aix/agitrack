@@ -673,6 +673,22 @@ body.booting .wrap>*:not(header):not(.booting){display:none}
 .insight .isuggest{font-size:13px;color:var(--phosphor);border-top:1px dashed var(--line);
   padding-top:8px;margin-top:2px}
 .insightnote{font-size:12px;color:var(--fg-dim);margin:0 0 8px}
+/* The learn call-to-action: the prominent, self-explanatory entry to the /learn page,
+   sitting with the efficiency insights (same traces, next step: act on them). */
+.learncta{display:flex;align-items:center;gap:18px;margin:0 0 16px;padding:16px 20px;
+  border:1px solid var(--phosphor-dim);border-bottom:1px solid var(--phosphor-dim);border-radius:6px;
+  background:linear-gradient(135deg,rgba(61,255,160,.10),rgba(61,255,160,.02) 55%,rgba(103,184,214,.07));
+  transition:border-color .15s,transform .15s,box-shadow .15s}
+.learncta:hover{background:linear-gradient(135deg,rgba(61,255,160,.16),rgba(61,255,160,.05) 55%,rgba(103,184,214,.10));
+  color:var(--fg);border-color:var(--phosphor);transform:translateY(-2px);box-shadow:0 8px 28px rgba(61,255,160,.14)}
+.learncta .lc-icon{font-size:32px;flex:none}
+.learncta .lc-text{flex:1;font-size:13px;color:var(--fg-dim);line-height:1.55}
+.learncta .lc-text b{display:block;color:var(--phosphor);font-family:var(--display);font-size:21px;
+  font-weight:400;letter-spacing:.5px;margin-bottom:2px}
+.learncta .lc-btn{flex:none;font-family:var(--display);font-size:21px;letter-spacing:.5px;color:var(--phosphor);
+  border:1px solid var(--phosphor-dim);border-radius:4px;padding:8px 18px;white-space:nowrap}
+.learncta:hover .lc-btn{background:var(--phosphor);color:var(--ink);border-color:var(--phosphor)}
+@media (max-width:640px){.learncta{flex-wrap:wrap}.learncta .lc-btn{margin-left:50px}}
 .insight.good{border-left-color:var(--phosphor)}
 .insight.good .isev{color:var(--phosphor)}
 /* Trend chip: the same metric measured on the earlier vs the later half of the window,
@@ -1074,6 +1090,15 @@ __UPDATE_BANNER__
   </div>
 
   <h2 class="section" id="insights-head">agent efficiency</h2>
+  <a class="learncta" href="learn" title="Open the learn page">
+    <span class="lc-icon">&#127891;</span>
+    <span class="lc-text"><b>Learn from these traces.</b>
+    Your coding agent reads how you drive it, spots the knowledge gaps it can actually evidence, and writes
+    small lessons sized to the time and energy you have right now: coding skills that make you work with
+    agents more effectively, plus knowledge of this codebase. Quizzes, hands-on exercises, and your progress
+    tracked automatically.</span>
+    <span class="lc-btn">open learn &rarr;</span>
+  </a>
   <div id="insights"></div>
 
   <h2 class="section">by backend</h2>

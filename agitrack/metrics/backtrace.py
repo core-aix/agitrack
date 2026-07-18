@@ -547,7 +547,7 @@ def _make_handler(view: BacktraceView) -> type[http.server.BaseHTTPRequestHandle
                 parsed = urllib.parse.urlparse(self.path)
                 query = urllib.parse.parse_qs(parsed.query)
                 if parsed.path in ("/", "/index.html"):
-                    self._respond("text/html; charset=utf-8", page)
+                    self._respond("text/html; charset=utf-8", page, cache_control="no-cache")
                 elif parsed.path == "/data":
                     payload = aggregates_payload(
                         view.dashboard,
@@ -598,7 +598,11 @@ def _make_handler(view: BacktraceView) -> type[http.server.BaseHTTPRequestHandle
                         json.dumps(browser.file_diff(_str(query, "path"), _str(query, "sha"))).encode("utf-8"),
                     )
                 elif parsed.path == "/learn":
-                    self._respond("text/html; charset=utf-8", learn_page.learn_html(learn_root).encode("utf-8"))
+                    self._respond(
+                        "text/html; charset=utf-8",
+                        learn_page.learn_html(learn_root).encode("utf-8"),
+                        cache_control="no-cache",
+                    )
                 elif parsed.path == "/learn/state":
                     payload = learn_page.learn_state(learn_root, learn_repo)
                     # Reconstructed turns carry no committers, so the trace-source select
@@ -643,11 +647,13 @@ def _make_handler(view: BacktraceView) -> type[http.server.BaseHTTPRequestHandle
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 pass
 
-        def _respond(self, content_type: str, body: bytes) -> None:
+        def _respond(self, content_type: str, body: bytes, *, cache_control: str = "no-store") -> None:
             self.send_response(200)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
+            # HTML pages use "no-cache" so the browser's back/forward cache can restore
+            # them instantly (see the live server's _respond); data stays "no-store".
+            self.send_header("Cache-Control", cache_control)
             self.end_headers()
             self.wfile.write(body)
 
