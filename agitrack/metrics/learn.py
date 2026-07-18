@@ -1439,8 +1439,9 @@ textarea{width:100%;min-height:74px;resize:vertical}
 .bubble.typing .tdot:nth-child(3){animation-delay:.4s}
 @keyframes tblink{0%,60%,100%{opacity:.25;transform:translateY(0)}30%{opacity:1;transform:translateY(-3px)}}
 .progress .pstats{display:flex;gap:22px;flex-wrap:wrap;margin-bottom:10px}
+.pstat{cursor:help}
 .pstat b{color:var(--phosphor);font-size:17px}
-.pstat span{color:var(--fg-dim);font-size:12px;display:block}
+.pstat span{color:var(--fg-dim);font-size:12px;display:block;border-bottom:1px dotted var(--line)}
 .plist .pl{display:flex;align-items:baseline;gap:10px;padding:7px 4px;border-top:1px solid var(--line);
   font-size:13px;cursor:pointer}
 .plist .pl:hover .plt{color:var(--accent)}
@@ -1763,10 +1764,10 @@ function renderProgress() {
   const closed = gaps.filter(g => g.status === "addressed").length;
   const exDone = lessons.filter(l => l.exercise && l.exercise.status === "done").length;
   $("pstats").innerHTML = `
-    <div class="pstat"><b>${done.length}</b><span>lessons done</span></div>
-    <div class="pstat"><b>${minutes}</b><span>minutes learned</span></div>
-    <div class="pstat"><b>${exDone}</b><span>exercises done</span></div>
-    ${gaps.length ? `<div class="pstat"><b>${closed}/${gaps.length}</b><span>gaps closed</span></div>` : ""}`;
+    <div class="pstat" title="Lessons you finished with 'got it, done'."><b>${done.length}</b><span>lessons done</span></div>
+    <div class="pstat" title="Time spent reading lessons. Only counted while the page is actually visible."><b>${minutes}</b><span>minutes learned</span></div>
+    <div class="pstat" title="Hands-on exercises your mentor reviewed and passed."><b>${exDone}</b><span>exercises done</span></div>
+    ${gaps.length ? `<div class="pstat" title="Your coach spotted ${gaps.length} knowledge gap${gaps.length === 1 ? "" : "s"} in the analyzed sessions (things like a coding skill or a part of this codebase worth knowing better). A gap counts as closed once you finish a lesson that addresses it. A later check-in can add new gaps, so the total may grow as you learn."><b>${closed}/${gaps.length}</b><span>gaps closed</span></div>` : ""}`;
   $("plist").innerHTML = lessons.slice().reverse().map(l => `
     <div class="pl" data-id="${esc(l.id)}">
       <span class="st">${l.status === "completed" ? "&#10003;" : "&#9679;"}</span>
