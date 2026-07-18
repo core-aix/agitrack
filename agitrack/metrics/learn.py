@@ -1305,6 +1305,7 @@ header{display:flex;align-items:baseline;justify-content:space-between;gap:14px;
 @keyframes rise{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
 @media (prefers-reduced-motion: reduce){
   .rise,.card,.card.busy,.mascot,.ambient,.spin,.confetti span,.ov-bar span{animation:none !important}
+  .bubble.typing .tdot{animation:none !important;opacity:.6}
 }
 
 h2.section{font-size:13px;letter-spacing:1.5px;text-transform:uppercase;color:var(--phosphor);
@@ -1430,6 +1431,13 @@ textarea{width:100%;min-height:74px;resize:vertical}
 .bubble.mentor{background:var(--panel2);border-bottom-left-radius:3px}
 .chatrow{display:flex;gap:8px;margin-top:10px}
 .chatrow input{flex:1}
+/* The mentor-is-thinking bubble: three softly pulsing dots where the reply will appear. */
+.bubble.typing{display:inline-flex;align-items:center;gap:5px;padding:12px 16px}
+.bubble.typing .tdot{width:7px;height:7px;border-radius:50%;background:var(--fg-dim);
+  animation:tblink 1.2s ease-in-out infinite}
+.bubble.typing .tdot:nth-child(2){animation-delay:.2s}
+.bubble.typing .tdot:nth-child(3){animation-delay:.4s}
+@keyframes tblink{0%,60%,100%{opacity:.25;transform:translateY(0)}30%{opacity:1;transform:translateY(-3px)}}
 .progress .pstats{display:flex;gap:22px;flex-wrap:wrap;margin-bottom:10px}
 .pstat b{color:var(--phosphor);font-size:17px}
 .pstat span{color:var(--fg-dim);font-size:12px;display:block}
@@ -1627,17 +1635,15 @@ function clearFlash() { flash(""); }
 // ------- friendly waiting states (an agent call takes a little while) -------
 // The big generation calls (suggestions, a lesson) take over the whole screen with a
 // dimmed overlay + progress bar, so there is never any doubt something is happening,
-// wherever the page is scrolled. Quick in-place calls (chat, exercise review) keep the
-// small inline indicator next to where the user is looking.
+// wherever the page is scrolled. Conversational calls (chat, exercise review) instead
+// show a typing bubble right where the reply will appear (see showTyping).
 const WAIT = {
   suggest: {icon: "\u{1F331}", overlay: true, title: "finding something worth learning…",
             msgs: ["reading your recent sessions…", "spotting patterns in how you work…",
             "checking what you already learned…", "picking something worth your time…"]},
   lesson:  {icon: "\u{1F4DD}", overlay: true, title: "writing your lesson…",
             msgs: ["reading the traces behind this topic…", "tailoring the examples to your repo…",
-            "building the steps, quiz and exercise…", "adding links worth opening…", "almost there…"]},
-  chat:    {icon: "\u{1F4AC}", msgs: ["thinking about your question…", "checking the lesson again…"]},
-  exercise:{icon: "\u{1F50D}", msgs: ["reviewing what you tried…", "comparing it with the goal…"]}
+            "building the steps, quiz and exercise…", "adding links worth opening…", "almost there…"]}
 };
 function startWait(kind) {
   let i = 0;
@@ -1893,8 +1899,9 @@ function stepBy(delta) {
   const next = state.step + delta;
   if (next < 0 || next >= state.steps.length) return;
   state.step = next;
+  // Deliberately no scrolling: the next/back buttons stay under the cursor and the new
+  // step fades in place, so stepping through feels stable rather than jumpy.
   renderStep();
-  $("lesson-title").scrollIntoView({behavior: "smooth", block: "start"});
 }
 
 function renderQuiz(lesson) {
@@ -1946,11 +1953,27 @@ function renderExercise(lesson) {
     `<div class="bubble mentor">${a.passed ? "✅ " : "\u{1F4AD} "}${md(a.feedback)}</div>`).join("");
 }
 
+// A mentor "typing" bubble appended right where the reply will appear, so the thinking
+// state is visible at the spot the user is looking, not in an indicator scrolled away.
+function showTyping(host) {
+  const bubble = document.createElement("div");
+  bubble.className = "bubble mentor typing";
+  bubble.setAttribute("aria-label", "the mentor is thinking");
+  bubble.innerHTML = '<span class="tdot"></span><span class="tdot"></span><span class="tdot"></span>';
+  host.appendChild(bubble);
+  bubble.scrollIntoView({behavior: "smooth", block: "nearest"});
+  return bubble;
+}
+
 async function checkExercise() {
   const lesson = state.lesson;
   const notes = $("ex-notes").value.trim();
   if (!lesson || !notes) { $("ex-status").textContent = "type your answer first"; return; }
-  startWait("exercise");
+  const btn = $("ex-check");
+  btn.disabled = true;
+  const label = btn.textContent;
+  btn.textContent = "reviewing…";
+  const typing = showTyping($("ex-feedback"));
   try {
     const r = await post("learn/exercise", {lesson_id: lesson.id, notes});
     if (r.busy) { flash('<div class="notice">I\'m still busy with another request, give me a moment.</div>'); return; }
@@ -1961,7 +1984,7 @@ async function checkExercise() {
     if (r.passed) { lesson.exercise.status = "done"; celebrate(); }
     renderExercise(lesson);
   } catch (e) { flash(`<div class="error">${esc(e.message)}</div>`); }
-  finally { stopWait(); }
+  finally { typing.remove(); btn.disabled = false; btn.textContent = label; }
 }
 
 function skipExercise() {
@@ -1983,10 +2006,12 @@ async function sendChat() {
   const text = input.value.trim();
   if (!lesson || !text) return;
   input.value = "";
+  input.disabled = true;
+  $("chat-send").disabled = true;
   lesson.chat = lesson.chat || [];
   lesson.chat.push({role: "user", text});
   renderChat(lesson);
-  startWait("chat");
+  const typing = showTyping($("chatlog"));
   try {
     const r = await post("learn/chat", {lesson_id: lesson.id, message: text});
     if (r.busy) { flash('<div class="notice">I\'m still busy with another request, give me a moment.</div>'); return; }
@@ -1994,8 +2019,15 @@ async function sendChat() {
     clearFlash();
     lesson.chat.push({role: "mentor", text: r.reply});
     renderChat(lesson);
+    const last = $("chatlog").lastElementChild;
+    if (last) last.scrollIntoView({behavior: "smooth", block: "nearest"});
   } catch (e) { flash(`<div class="error">${esc(e.message)}</div>`); }
-  finally { stopWait(); }
+  finally {
+    typing.remove(); // renderChat may already have replaced it; removing a detached node is fine
+    input.disabled = false;
+    $("chat-send").disabled = false;
+    input.focus();
+  }
 }
 
 function closeLesson() {
