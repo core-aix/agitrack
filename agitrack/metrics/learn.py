@@ -1,0 +1,1928 @@
+"""The dashboard's interactive learning page (``/learn``).
+
+Where the efficiency insights point at habits (a single deterministic pass, no LLM),
+the learn page goes one step deeper: it hands the same filtered interaction traces to
+the coding-agent BACKEND and asks it to coach the person behind them. The backend
+
+* reads a compact digest of the traces (prompts, rework hotspots, efficiency insights,
+  repo shape) for the selected trace source (your own sessions, a teammate's, or the
+  whole team) and date slice,
+* assesses what the learner already knows and where the traces show knowledge gaps,
+* proposes a handful of small lessons sized to how much time the learner has and how
+  fresh they feel right now (the learner never has to know what to ask for), and
+* on request writes the full lesson: general coding knowledge that makes agent-driven
+  work more effective, knowledge about THIS codebase, external links, a quick check,
+  and a hands-on exercise whose attempt the mentor reviews.
+
+Progress is per USER (GitHub id, via :func:`agitrack.sessions.identity.github_login`)
+and tracked automatically (opened, completed, time spent, quiz results, exercise
+attempts) in ``.agitrack/learning.json`` (git-ignored, local). Optionally the progress
+log syncs to git the same way shared sessions do: a history-free orphan ref
+(``refs/agitrack/learning-progress``, layout ``<repo-fingerprint>/<github-id>/
+progress.json``) pushed best-effort with a lease, so teammates' dashboards can see it.
+Off by default; a toggle on the page turns it on.
+
+Backend/model selection: the ``learning_backend`` / ``learning_model`` config keys
+(repo ``.agitrack/config.json`` overrides ``~/.agitrack/config.json``) win when set;
+otherwise the latest session's backend and model from ``state.json``. The page's
+"coach engine" panel edits the repo-scope keys in place. All agent calls are ``bare``
+one-shots run from a scratch directory outside any repository (the same isolation the
+summarizer uses, so learn sessions can never be adopted or resumed as the user's
+coding conversation) and work identically on Claude and OpenCode.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable
+
+from agitrack.backends.base import AgentBackend
+from agitrack.env import getenv_compat
+from agitrack.git import GitRepo
+from agitrack.metrics.collect import CommitStat
+from agitrack.summaries.model_select import compatible_summarization_model
+
+# The turn kinds that represent agent work (mirrors the dashboard's AI_KINDS).
+_AI_KINDS = {"agent", "covered", "agent-merge"}
+
+# Bare-run bounds. A lesson is a much larger completion than a summary, so these override
+# the backends' 90s summarizer cap (see ``timeout_seconds`` in backends/base.py).
+_SUGGEST_TIMEOUT_SECONDS = 240
+_LESSON_TIMEOUT_SECONDS = 360
+_CHAT_TIMEOUT_SECONDS = 180
+
+# One learning agent call at a time: each call spawns a full backend CLI process, and the
+# dashboard server is threaded, so an eager double-click would otherwise run two.
+_AGENT_LOCK = threading.Lock()
+# Store writes are read-modify-write; serialize them across request threads.
+_STORE_LOCK = threading.Lock()
+
+# Keep the digest comfortably inside a bare prompt.
+_DIGEST_CHAR_LIMIT = 9000
+
+# The progress-sync ref: history-free orphan commits, one progress.json per user,
+# scoped by repo fingerprint — the same shape as refs/agitrack/shared-sessions.
+PROGRESS_REF = "refs/agitrack/learning-progress"
+_SYNC_THROTTLE_SECONDS = 60.0
+_PROGRESS_FETCH_TTL = 300.0
+_sync_at: dict[str, float] = {}
+_progress_fetch_at: dict[str, float] = {}
+
+# The learner's GitHub id is resolved via `gh api user` (a network call); cache it.
+_identity_cache: dict[str, tuple[float, str]] = {}
+_IDENTITY_TTL = 3600.0
+
+
+class LearnAgentError(RuntimeError):
+    """The learning backend call failed or returned unusable output."""
+
+
+def learning_scratch_dir() -> Path:
+    """A stable directory, outside any repository, for learning-page backend calls.
+
+    Same reasoning as the summarizer's scratch dir (issues #8/#56): headless backend
+    calls record a real session keyed by their working directory, and running them in
+    the repo would make the lesson conversation adoptable/resumable as the user's own.
+    """
+    config_dir = getenv_compat("CONFIG_DIR")
+    base = Path(config_dir).expanduser() if config_dir else Path.home() / ".agitrack"
+    path = base / "learning"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def learner_id(root: Path, repo: GitRepo | None) -> str:
+    """The current user's identity for progress keying: their GitHub login (slugged),
+    falling back to the git user.name (when ``repo`` is a git repo; the backtrace view
+    can serve a plain directory, where only the gh login is available). Cached;
+    ``gh api user`` is a network call."""
+    key = str(root)
+    now = time.monotonic()
+    hit = _identity_cache.get(key)
+    if hit and now - hit[0] < _IDENTITY_TTL:
+        return hit[1]
+    from agitrack.sessions.identity import github_login
+
+    gid = github_login(repo)
+    _identity_cache[key] = (now, gid)
+    return gid
+
+
+@dataclass
+class LearningBackendChoice:
+    """The backend+model the learn page will generate content with, and where each came
+    from (``config`` when pinned via learning_backend/learning_model, else ``session``)."""
+
+    backend_name: str
+    model: str | None
+    backend_source: str
+    model_source: str
+
+    def build(self) -> AgentBackend:
+        from agitrack.backends.claude import ClaudeBackend
+        from agitrack.backends.opencode import OpenCodeBackend
+        from agitrack.config.settings import GlobalConfig
+
+        config = GlobalConfig()
+        launch = config.backend_command(self.backend_name)
+        backend_class = OpenCodeBackend if self.backend_name == "opencode" else ClaudeBackend
+        return backend_class(learning_scratch_dir(), launch_command=launch)
+
+
+def resolve_learning_backend(repo_root: Path) -> LearningBackendChoice:
+    """Which backend/model generates learning content for this repo.
+
+    Precedence: the ``learning_backend`` / ``learning_model`` config keys (repo overlay
+    over global) win; otherwise the LATEST SESSION's backend and model recorded in
+    ``.agitrack/state.json``; otherwise the configured ``default_backend``. A model id
+    that belongs to the other backend's format is dropped (the backend then uses its own
+    default), exactly like the summarizer's model handling. Raises
+    :class:`LearnAgentError` when no backend can be determined at all.
+    """
+    from agitrack.config.settings import GlobalConfig
+    from agitrack.config.state import AgitrackState
+
+    config = GlobalConfig()
+    config.load_repo_overlay(repo_root)
+    state = AgitrackState(repo_root)
+
+    known = {"claude", "opencode"}
+    backend_name, backend_source = config.learning_backend, "config"
+    if backend_name not in known:
+        backend_name, backend_source = state.data.get("backend"), "session"
+    if backend_name not in known:
+        backend_name, backend_source = config.default_backend, "session"
+    if backend_name not in known:
+        raise LearnAgentError(
+            "No coding agent backend is configured for learning content. Run an aGiTrack "
+            "session in this repo first, or set learning_backend in .agitrack/config.json."
+        )
+
+    model, model_source = config.learning_model, "config"
+    if not model:
+        model, model_source = state.model, "session"
+    model = compatible_summarization_model(backend_name, model)
+    return LearningBackendChoice(
+        backend_name=str(backend_name), model=model, backend_source=backend_source, model_source=model_source
+    )
+
+
+# --------------------------------------------------------------------------- store
+
+
+class LearnStore:
+    """``.agitrack/learning.json``: per-user profiles (assessment, gaps, suggestions,
+    lessons, progress) plus the sync toggle. Local plumbing next to state.json; atomic
+    writes so an interrupted request can't truncate the file."""
+
+    def __init__(self, repo_root: Path) -> None:
+        self.path = Path(repo_root) / ".agitrack" / "learning.json"
+        self.root = Path(repo_root)
+
+    def load(self) -> dict[str, Any]:
+        try:
+            with self.path.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            return {"profiles": {}}
+        if not isinstance(data, dict) or not isinstance(data.get("profiles"), dict):
+            return {"profiles": {}}
+        return data
+
+    def save(self, data: dict[str, Any]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Best-effort: keep .agitrack/ git-ignored even in a repo that never ran aGiTrack
+        # (the learn page may be the first thing to write here, e.g. under --backtrace).
+        # A no-op outside a git repo.
+        try:
+            from agitrack.config.state import AgitrackState
+
+            AgitrackState(self.root).ensure_local_ignore()
+        except Exception:
+            pass
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        with tmp.open("w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        os.replace(tmp, self.path)
+
+    @staticmethod
+    def profile(data: dict[str, Any], gid: str) -> dict[str, Any]:
+        """Get-or-create the profile for user ``gid``."""
+        profiles = data.setdefault("profiles", {})
+        profile = profiles.get(gid)
+        if not isinstance(profile, dict):
+            profile = {"assessment": "", "gaps": [], "suggestions": [], "lessons": []}
+            profiles[gid] = profile
+        profile.setdefault("assessment", "")
+        for field in ("gaps", "suggestions", "lessons"):
+            if not isinstance(profile.get(field), list):
+                profile[field] = []
+        return profile
+
+    def update(self, gid: str, mutate: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
+        """Read-modify-write the user's profile under the store lock; returns it."""
+        with _STORE_LOCK:
+            data = self.load()
+            profile = self.profile(data, gid)
+            mutate(profile)
+            self.save(data)
+            return profile
+
+
+def _find_by_id(items: list, item_id: str) -> dict[str, Any] | None:
+    for item in items:
+        if isinstance(item, dict) and item.get("id") == item_id:
+            return item
+    return None
+
+
+# --------------------------------------------------------------------------- digest
+
+
+def _clean_prompt(text: str) -> str:
+    # Strip synthetic background-task markers (they are not something the user typed)
+    # and collapse whitespace; mirrors the insights module's handling.
+    text = text.replace("(background task completed)", " ")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def build_trace_digest(
+    stats: list[CommitStat],
+    insights: list[dict],
+    file_rows: list[dict],
+    repo_root: Path,
+    profile: dict[str, Any],
+    *,
+    limit: int = _DIGEST_CHAR_LIMIT,
+) -> str:
+    """A compact plain-text digest of the filtered interaction traces, the evidence the
+    learning agent reasons over. Everything in it is already on the dashboard: commit
+    stats, the per-file change index, and the efficiency-insight cards. Capped so it
+    always fits a bare prompt."""
+    parts: list[str] = []
+    turns = [stat for stat in stats if stat.kind in _AI_KINDS]
+    if turns:
+        first = min((s.timestamp for s in turns if s.timestamp), default=0)
+        last = max((s.timestamp for s in turns if s.timestamp), default=0)
+        span = ""
+        if first and last:
+            fmt = "%Y-%m-%d"
+            span = (
+                f" between {time.strftime(fmt, time.localtime(first))} and {time.strftime(fmt, time.localtime(last))}"
+            )
+        parts.append(f"WINDOW: {len(turns)} agent turns{span}.")
+
+    prompts: list[str] = []
+    seen: set[str] = set()
+    for stat in reversed(turns):  # newest first
+        for raw in [*(stat.user_prompts or []), stat.prompt or ""]:
+            text = _clean_prompt(raw)
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            prompts.append(text[:180])
+            if len(prompts) >= 30:
+                break
+        if len(prompts) >= 30:
+            break
+    if prompts:
+        parts.append("RECENT USER PROMPTS TO THE AGENT (newest first):\n- " + "\n- ".join(prompts))
+
+    if insights:
+        lines = []
+        for card in insights[:6]:
+            line = f"{card.get('title', '')}: {card.get('summary', '')}"
+            if card.get("suggestion"):
+                line += f" (suggested: {card['suggestion']})"
+            lines.append(line.strip())
+        parts.append("EFFICIENCY INSIGHTS (computed from the same traces):\n- " + "\n- ".join(lines))
+
+    rows = sorted(
+        (row for row in file_rows if isinstance(row, dict) and row.get("path")),
+        key=lambda row: -int(row.get("changes") or 0),
+    )[:14]
+    if rows:
+        lines = [
+            f"{row['path']} ({row.get('changes', 0)} changes, +{row.get('insertions', 0)}/-{row.get('deletions', 0)})"
+            for row in rows
+        ]
+        parts.append("MOST-CHANGED FILES:\n- " + "\n- ".join(lines))
+
+    exts: dict[str, int] = {}
+    tops: dict[str, int] = {}
+    for row in file_rows:
+        path = str(row.get("path") or "")
+        if not path:
+            continue
+        suffix = Path(path).suffix
+        if suffix:
+            exts[suffix] = exts.get(suffix, 0) + 1
+        head = path.split("/", 1)[0]
+        tops[head] = tops.get(head, 0) + 1
+    if exts:
+        shape = ", ".join(f"{ext} x{count}" for ext, count in sorted(exts.items(), key=lambda kv: -kv[1])[:8])
+        dirs = ", ".join(name for name, _ in sorted(tops.items(), key=lambda kv: -kv[1])[:8])
+        parts.append(f"REPO SHAPE: file types {shape}; top-level areas: {dirs}.")
+
+    for name in ("README.md", "README.rst", "README"):
+        readme = Path(repo_root) / name
+        if readme.is_file():
+            try:
+                head = readme.read_text(encoding="utf-8", errors="replace")[:1500].strip()
+            except OSError:
+                break
+            if head:
+                parts.append(f"README (start):\n{head}")
+            break
+
+    done = [lesson for lesson in profile.get("lessons", []) if lesson.get("status") == "completed"]
+    if done:
+        titles = ", ".join(str(lesson.get("title", "")) for lesson in done[-10:])
+        parts.append(f"ALREADY LEARNED (do not repeat, build on these): {titles}.")
+    addressed = [gap for gap in profile.get("gaps", []) if gap.get("status") == "addressed"]
+    if addressed:
+        parts.append("GAPS ALREADY ADDRESSED: " + ", ".join(str(gap.get("title", "")) for gap in addressed[-10:]) + ".")
+
+    digest = "\n\n".join(parts)
+    return digest[:limit]
+
+
+# --------------------------------------------------------------------------- agent calls
+
+
+def _extract_json(text: str) -> dict | None:
+    """The first JSON object in ``text``. Tolerates code fences and prose around it
+    (models occasionally wrap the JSON despite instructions)."""
+    cleaned = re.sub(r"^\s*```(?:json)?\s*|\s*```\s*$", "", text.strip())
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", cleaned):
+        try:
+            data, _end = decoder.raw_decode(cleaned, match.start())
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict):
+            return data
+    return None
+
+
+_MENTOR_PERSONA = (
+    "You are a friendly, encouraging coding mentor built into aGiTrack, a tool that records "
+    "how people work with coding agents. You coach the developer using evidence from their "
+    "actual agent sessions. Be concrete, warm, and brief; never condescending. Do not use "
+    "em-dashes anywhere in your output."
+)
+
+
+def _run_agent(choice: LearningBackendChoice, system_prompt: str, user_prompt: str, timeout: int) -> str:
+    backend = choice.build()
+    result = backend.run(
+        user_prompt,
+        model=choice.model,
+        session_id=None,
+        bare=True,
+        system_prompt=system_prompt,
+        timeout_seconds=timeout,
+    )
+    text = (result.final_response or "").strip()
+    if result.exit_code != 0:
+        raise LearnAgentError(
+            f"The {choice.backend_name} backend exited with code {result.exit_code}."
+            + (f" Output: {text[:200]}" if text else "")
+        )
+    if not text:
+        raise LearnAgentError(f"The {choice.backend_name} backend returned no output.")
+    return text
+
+
+def _run_agent_json(choice: LearningBackendChoice, system_prompt: str, user_prompt: str, timeout: int) -> dict:
+    text = _run_agent(choice, system_prompt, user_prompt, timeout)
+    data = _extract_json(text)
+    if data is None:
+        raise LearnAgentError(f"The {choice.backend_name} backend did not return valid JSON: {text[:200]}")
+    return data
+
+
+_SUGGEST_SYSTEM = (
+    _MENTOR_PERSONA
+    + " You must reply with ONE JSON object and nothing else: no prose before or after it, no code fences."
+)
+
+
+def _suggest_prompt(digest: str, minutes: int, mood: str, note: str, gid: str, source: str) -> str:
+    if source:
+        traces = f"the sessions of '{source}'"
+        traces += (
+            " (the learner themself)" if source == gid else f" (a teammate the learner '{gid}' wants to learn from)"
+        )
+    else:
+        traces = f"the whole team's sessions (the learner is '{gid}')"
+    mood_hint = {
+        "fresh": "They feel fresh and focused: a hands-on lesson with a small exercise is welcome.",
+        "okay": "They feel okay: keep lessons practical and medium-weight.",
+        "tired": "They feel tired: suggest light, skimmable lessons with quick wins, nothing demanding.",
+    }.get(mood, "Assume medium focus.")
+    extra = f'\nThe learner added: "{note[:300]}". Weigh this heavily when picking suggestions.' if note else ""
+    return f"""Below is a digest of real coding-agent interaction traces from {traces}.
+
+Your tasks:
+1. Assess the learner's current coding knowledge from how the traces drive the agent (prompt style, corrections, what gets delegated vs fixed by hand).
+2. Identify knowledge gaps the traces show. Two kinds: "coding" (general skills that would make them work with coding agents more effectively, e.g. git, testing, debugging, prompt habits) and "codebase" (understanding of THIS repository so they can spot issues and fix simple things themselves).
+3. Propose exactly 3 or 4 small lesson suggestions the learner can do RIGHT NOW in at most {minutes} minutes each. {mood_hint}{extra}
+Each suggestion must be grounded in the traces: its "why" cites the concrete evidence (a prompt pattern, a rework hotspot, an insight). Never propose something they have already learned.
+
+Reply with ONE JSON object, exactly this shape:
+{{"assessment": "2-3 warm sentences on their current level and strengths",
+ "gaps": [{{"id": "kebab-case-id", "title": "short title", "detail": "1-2 sentences", "kind": "coding" or "codebase", "evidence": "what in the traces shows this"}}],
+ "suggestions": [{{"id": "kebab-case-id", "title": "inviting lesson title", "minutes": <=int {minutes}, "kind": "coding" or "codebase", "gap_id": "id of the gap it addresses", "why": "evidence-based reason", "teaser": "one inviting sentence on what they will be able to do afterwards"}}]}}
+
+TRACE DIGEST:
+{digest}"""
+
+
+def _lesson_prompt(suggestion: dict, digest: str, mood: str) -> str:
+    minutes = int(suggestion.get("minutes") or 15)
+    words = {5: 350, 15: 700, 30: 1200}.get(minutes, min(1200, max(300, minutes * 45)))
+    return f"""Write the full lesson for this suggestion, for the learner described by the trace digest below.
+
+SUGGESTION: {json.dumps(suggestion, ensure_ascii=False)}
+
+Requirements:
+- Sized for about {minutes} minutes of reading ({words} words or fewer). Mood: {mood or "okay"}.
+- "content_md" is Markdown: short sections with ### headings, concrete examples, and where relevant reference the learner's ACTUAL files/areas named in the digest. End with a "Try this next time" tip they can apply in their very next agent session.
+- "links": 1-3 external resources for going deeper. Only real, stable, well-known URLs (official documentation, canonical references). If unsure a URL is real, leave it out.
+- "quiz": 1-3 multiple-choice questions checking the key points. 3-4 choices each, "answer" is the 0-based index of the correct choice, "explain" says why in one sentence.
+- "exercise": ONE small hands-on task the learner can try in their own repo or terminal in a few minutes, directly practicing the lesson. "task" says exactly what to do and what success looks like; "hint" helps if they get stuck.
+- Friendly and effortless to read. No em-dashes.
+
+Reply with ONE JSON object, exactly this shape (no prose around it, no code fences):
+{{"title": "lesson title", "minutes": {minutes}, "content_md": "the lesson in Markdown",
+ "links": [{{"title": "…", "url": "https://…", "note": "why it is worth opening"}}],
+ "quiz": [{{"question": "…", "choices": ["…", "…", "…"], "answer": 0, "explain": "…"}}],
+ "exercise": {{"task": "…", "hint": "…"}}}}
+
+TRACE DIGEST:
+{digest}"""
+
+
+def _chat_prompt(lesson: dict, history: list[dict], message: str) -> str:
+    convo = "\n".join(
+        f"{'Learner' if turn.get('role') == 'user' else 'Mentor'}: {str(turn.get('text', ''))[:600]}"
+        for turn in history[-8:]
+    )
+    convo_block = f"\n\nCONVERSATION SO FAR:\n{convo}" if convo else ""
+    content = str(lesson.get("content_md", ""))[:4000]
+    return (
+        f"The learner just read this lesson and has a follow-up question. Answer it directly, "
+        f"concretely and briefly (a few short paragraphs at most), in plain Markdown. No JSON.\n\n"
+        f"LESSON '{lesson.get('title', '')}':\n{content}{convo_block}\n\nLearner's question: {message}"
+    )
+
+
+def _exercise_prompt(lesson: dict, notes: str) -> str:
+    exercise = lesson.get("exercise") or {}
+    content = str(lesson.get("content_md", ""))[:2500]
+    return f"""The learner attempted the hands-on exercise from the lesson '{lesson.get("title", "")}'.
+
+EXERCISE: {exercise.get("task", "")}
+
+LESSON (context):
+{content}
+
+WHAT THE LEARNER REPORTS DOING / THEIR RESULT:
+{notes[:2000]}
+
+Judge whether the attempt shows they achieved the exercise's goal. Be generous with honest effort but do not pass an attempt that missed the point. Reply with ONE JSON object, nothing else:
+{{"passed": true or false, "feedback": "2-4 encouraging, concrete sentences; if not passed, say exactly what to try next"}}"""
+
+
+# ------------------------------------------------------------------- normalization
+
+
+def _slug(value: object, fallback: str) -> str:
+    text = re.sub(r"[^a-z0-9]+", "-", str(value or "").lower()).strip("-")
+    return text[:60] or fallback
+
+
+def _norm_gaps(raw: object) -> list[dict]:
+    gaps = []
+    for index, item in enumerate(raw if isinstance(raw, list) else []):
+        if not isinstance(item, dict):
+            continue
+        gaps.append(
+            {
+                "id": _slug(item.get("id") or item.get("title"), f"gap-{index}"),
+                "title": str(item.get("title") or "")[:120],
+                "detail": str(item.get("detail") or "")[:400],
+                "kind": "codebase" if item.get("kind") == "codebase" else "coding",
+                "evidence": str(item.get("evidence") or "")[:400],
+                "status": "open",
+            }
+        )
+    return gaps[:6]
+
+
+def _norm_suggestions(raw: object, minutes: int) -> list[dict]:
+    suggestions = []
+    for index, item in enumerate(raw if isinstance(raw, list) else []):
+        if not isinstance(item, dict):
+            continue
+        want = item.get("minutes")
+        estimate = want if isinstance(want, int) and 0 < want <= 240 else minutes
+        suggestions.append(
+            {
+                "id": _slug(item.get("id") or item.get("title"), f"idea-{index}"),
+                "title": str(item.get("title") or "")[:140],
+                "minutes": min(estimate, minutes) if minutes else estimate,
+                "kind": "codebase" if item.get("kind") == "codebase" else "coding",
+                "gap_id": _slug(item.get("gap_id"), "") if item.get("gap_id") else "",
+                "why": str(item.get("why") or "")[:400],
+                "teaser": str(item.get("teaser") or "")[:300],
+            }
+        )
+    return suggestions[:4]
+
+
+def _norm_lesson(raw: dict, suggestion: dict) -> dict:
+    links = []
+    raw_links = raw.get("links")
+    for item in raw_links if isinstance(raw_links, list) else []:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "")
+        if not url.startswith(("http://", "https://")):
+            continue
+        links.append(
+            {"title": str(item.get("title") or url)[:140], "url": url[:500], "note": str(item.get("note") or "")[:200]}
+        )
+    quiz = []
+    raw_quiz = raw.get("quiz")
+    for item in raw_quiz if isinstance(raw_quiz, list) else []:
+        if not isinstance(item, dict) or not isinstance(item.get("choices"), list):
+            continue
+        choices = [str(choice)[:200] for choice in item["choices"][:4] if str(choice).strip()]
+        answer = item.get("answer")
+        if len(choices) < 2 or not isinstance(answer, int) or not 0 <= answer < len(choices):
+            continue
+        quiz.append(
+            {
+                "question": str(item.get("question") or "")[:300],
+                "choices": choices,
+                "answer": answer,
+                "explain": str(item.get("explain") or "")[:300],
+            }
+        )
+    raw_exercise = raw.get("exercise")
+    if not isinstance(raw_exercise, dict):
+        raw_exercise = {}
+    task = str(raw_exercise.get("task") or "").strip()
+    exercise = (
+        {"task": task[:1200], "hint": str(raw_exercise.get("hint") or "")[:600], "status": "open", "attempts": []}
+        if task
+        else None
+    )
+    minutes = raw.get("minutes")
+    return {
+        "title": str(raw.get("title") or suggestion.get("title") or "Lesson")[:140],
+        "minutes": minutes if isinstance(minutes, int) and 0 < minutes <= 240 else suggestion.get("minutes", 15),
+        "kind": suggestion.get("kind", "coding"),
+        "gap_id": suggestion.get("gap_id", ""),
+        "content_md": str(raw.get("content_md") or ""),
+        "links": links[:3],
+        "quiz": quiz[:3],
+        "exercise": exercise,
+    }
+
+
+# ----------------------------------------------------------------- progress sync
+
+
+def sync_enabled(repo_root: Path) -> bool:
+    with _STORE_LOCK:
+        return bool(LearnStore(repo_root).load().get("sync_enabled"))
+
+
+def _record_sync_result(repo_root: Path, ok: bool, error: str) -> None:
+    store = LearnStore(repo_root)
+    with _STORE_LOCK:
+        data = store.load()
+        data["last_sync"] = {"ok": ok, "error": error[:300], "at": int(time.time())}
+        store.save(data)
+
+
+def sync_progress_now(repo: GitRepo, gid: str) -> tuple[bool, str]:
+    """Write the user's progress profile to the sync ref and push it (best-effort).
+
+    Mirrors the shared-session store's shape: the ref holds one parent-less snapshot
+    commit (no history to grow), each user owns ``<fingerprint>/<gid>/progress.json``,
+    and the push is guarded with a lease, retried once after a re-fetch on a lost race.
+    The local learning.json is always the source of truth for OUR entry, so force-syncing
+    the local ref from the remote can never lose our progress: the entry is rebuilt from
+    the store on every sync."""
+    store = LearnStore(repo.repo)
+    with _STORE_LOCK:
+        data = store.load()
+        profile = LearnStore.profile(data, gid)
+        payload = json.dumps({"gid": gid, "updated": int(time.time()), "profile": profile}, indent=2, sort_keys=True)
+    fingerprint = repo.root_commit() or "no-root"
+    path = f"{fingerprint}/{gid}/progress.json"
+    error = ""
+    if repo.remote_exists():
+        repo.fetch_ref(f"+{PROGRESS_REF}:{PROGRESS_REF}", timeout=20)
+    for _attempt in range(2):
+        old = repo.ref_sha(PROGRESS_REF)
+        entries = dict(repo.read_tree_paths(PROGRESS_REF))
+        entries[path] = repo.write_blob(payload)
+        tree = repo.write_tree_from(entries)
+        sha = repo.commit_tree_orphan(tree, f"agitrack: learning progress {gid}")
+        repo.update_ref(PROGRESS_REF, sha)
+        if not repo.remote_exists():
+            return True, ""
+        lease = f"{PROGRESS_REF}:{old}" if old else None
+        ok, error = repo.push_ref(f"{PROGRESS_REF}:{PROGRESS_REF}", force_with_lease=lease, timeout=30)
+        if ok:
+            return True, ""
+        from agitrack.sessions.store import _is_stale_lease
+
+        if not _is_stale_lease(error):
+            break
+        repo.fetch_ref(f"+{PROGRESS_REF}:{PROGRESS_REF}", timeout=20)
+    return False, error.strip()
+
+
+def maybe_sync(root: Path, repo: GitRepo | None) -> None:
+    """Kick a background progress sync after a milestone (suggestions, a new lesson,
+    completion, an exercise attempt) when the user has sync enabled. Throttled so a
+    burst of progress flushes becomes one push; never blocks the request. A no-op
+    without a git repo (backtrace over a plain directory)."""
+    if repo is None or not sync_enabled(root):
+        return
+    key = str(root)
+    now = time.monotonic()
+    if now - _sync_at.get(key, 0.0) < _SYNC_THROTTLE_SECONDS:
+        return
+    _sync_at[key] = now
+    gid = learner_id(root, repo)
+
+    def worker() -> None:
+        try:
+            ok, error = sync_progress_now(repo, gid)
+            _record_sync_result(root, ok, error)
+        except Exception as exc:
+            _record_sync_result(root, False, str(exc))
+
+    threading.Thread(target=worker, daemon=True, name="agit-learn-sync").start()
+
+
+def _fetch_progress_throttled(repo: GitRepo) -> None:
+    """Best-effort background fetch of teammates' synced progress, at most once per TTL.
+    Safe to force-update the local ref: our own entry is rebuilt from learning.json on
+    every sync, so a remote overwrite can't lose local progress."""
+    if not repo.remote_exists():
+        return
+    key = str(repo.repo)
+    now = time.monotonic()
+    if now - _progress_fetch_at.get(key, 0.0) < _PROGRESS_FETCH_TTL:
+        return
+    _progress_fetch_at[key] = now
+
+    def worker() -> None:
+        try:
+            repo.fetch_ref(f"+{PROGRESS_REF}:{PROGRESS_REF}", timeout=20)
+        except Exception:
+            pass
+
+    threading.Thread(target=worker, daemon=True, name="agit-learn-fetch").start()
+
+
+def synced_users(repo: GitRepo) -> list[dict]:
+    """Who has synced learning progress for THIS repo (from the local ref), newest first."""
+    fingerprint = repo.root_commit() or "no-root"
+    prefix = f"{fingerprint}/"
+    users = []
+    for path in repo.read_tree_paths(PROGRESS_REF):
+        if not path.startswith(prefix) or not path.endswith("/progress.json"):
+            continue
+        gid = path[len(prefix) :].split("/", 1)[0]
+        raw = repo.read_ref_blob(PROGRESS_REF, path)
+        updated = 0
+        try:
+            parsed = json.loads(raw) if raw else {}
+            updated = int(parsed.get("updated") or 0)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+        users.append({"gid": gid, "updated": updated})
+    return sorted(users, key=lambda user: -user["updated"])
+
+
+def set_sync(root: Path, repo: GitRepo | None, enabled: bool) -> dict[str, Any]:
+    """Flip the progress-sync toggle. Enabling syncs immediately (synchronously, so the
+    page can report the outcome); disabling just stops future pushes. Refused without a
+    git repo: the sync ref has nowhere to live."""
+    if repo is None:
+        return {"error": "Progress sync needs a git repository; this directory isn't one."}
+    store = LearnStore(root)
+    with _STORE_LOCK:
+        data = store.load()
+        data["sync_enabled"] = bool(enabled)
+        store.save(data)
+    if enabled:
+        try:
+            ok, error = sync_progress_now(repo, learner_id(root, repo))
+        except Exception as exc:
+            ok, error = False, str(exc)
+        _record_sync_result(root, ok, error)
+    return {"sync": sync_info(root, repo)}
+
+
+def sync_info(root: Path, repo: GitRepo | None) -> dict[str, Any]:
+    if repo is None:
+        return {"available": False, "enabled": False, "last": None, "users": []}
+    store = LearnStore(root)
+    with _STORE_LOCK:
+        data = store.load()
+    _fetch_progress_throttled(repo)
+    return {
+        "available": True,
+        "enabled": bool(data.get("sync_enabled")),
+        "last": data.get("last_sync"),
+        "users": synced_users(repo),
+    }
+
+
+# ------------------------------------------------------------------------ public API
+
+
+def model_options(backend_name: str) -> dict[str, Any]:
+    """Models the learn page's engine picker can offer for ``backend_name`` (queried from
+    the backend CLI, same as the summarizer's model menu). Empty when unqueryable; the
+    picker then falls back to "auto"."""
+    if backend_name not in {"claude", "opencode"}:
+        return {"backend": backend_name, "models": []}
+    from agitrack.summaries.model_select import list_available_models
+
+    return {"backend": backend_name, "models": list_available_models(backend_name)}
+
+
+def set_learning_config(repo_root: Path, *, backend: str, model: str) -> dict[str, Any]:
+    """Persist the learn page's engine choice into the REPO config overlay
+    (``.agitrack/config.json``): the same ``learning_backend`` / ``learning_model`` keys a
+    user can set by hand, so the page and the config file are two views of one setting.
+    Empty values unset the key (back to "auto": the latest session's backend/model)."""
+    backend, model = backend.strip(), model.strip()
+    if backend not in {"", "claude", "opencode"}:
+        return {"error": f"Unknown backend '{backend}'."}
+    from agitrack.config.settings import GlobalConfig
+
+    config = GlobalConfig()
+    config.load_repo_overlay(Path(repo_root))
+    if backend:
+        config.repo_data["learning_backend"] = backend
+    else:
+        config.repo_data.pop("learning_backend", None)
+    if model:
+        config.repo_data["learning_model"] = model
+    else:
+        config.repo_data.pop("learning_model", None)
+    config.save_repo()
+    return {"backend_info": describe_learning_backend(Path(repo_root))}
+
+
+def describe_learning_backend(repo_root: Path) -> dict[str, Any]:
+    """Backend/model info for the page footer: which backend generates content, which
+    model, and where each choice came from. An error string when unresolvable."""
+    try:
+        choice = resolve_learning_backend(Path(repo_root))
+    except LearnAgentError as exc:
+        return {"error": str(exc)}
+    return {
+        "backend": choice.backend_name,
+        "model": choice.model,
+        "backend_source": choice.backend_source,
+        "model_source": choice.model_source,
+    }
+
+
+def learn_state(root: Path, repo: GitRepo | None) -> dict[str, Any]:
+    """Everything the page needs to paint instantly, with no agent call: who the learner
+    is (GitHub id), their persisted profile, the engine info, and the sync status."""
+    gid = learner_id(root, repo)
+    store = LearnStore(root)
+    with _STORE_LOCK:
+        data = store.load()
+        profile = LearnStore.profile(data, gid)
+    return {
+        "me": gid,
+        "profile": profile,
+        "backend_info": describe_learning_backend(root),
+        "sync": sync_info(root, repo),
+    }
+
+
+def suggest(
+    root: Path,
+    repo: GitRepo | None,
+    stats: list[CommitStat],
+    insights: list[dict],
+    file_rows: list[dict],
+    *,
+    source: str,
+    minutes: int,
+    mood: str,
+    note: str = "",
+) -> dict[str, Any]:
+    """One backend call: assess the learner, identify gaps, and propose lessons sized to
+    ``minutes``/``mood``. ``source`` selects WHOSE traces feed the analysis (a committer
+    label, or '' for the whole team); the progress profile is always the current user's.
+    Persists the result and returns the refreshed profile."""
+    if not _AGENT_LOCK.acquire(blocking=False):
+        return {"busy": True}
+    try:
+        if not any(stat.kind in _AI_KINDS for stat in stats):
+            return {"error": "No agent turns in this view yet. Run some aGiTrack sessions first, or widen the filter."}
+        gid = learner_id(root, repo)
+        store = LearnStore(root)
+        with _STORE_LOCK:
+            profile = LearnStore.profile(store.load(), gid)
+        digest = build_trace_digest(stats, insights, file_rows, root, profile)
+        choice = resolve_learning_backend(root)
+        minutes = minutes if minutes in (5, 15, 30) else 15
+        raw = _run_agent_json(
+            choice,
+            _SUGGEST_SYSTEM,
+            _suggest_prompt(digest, minutes, mood, note, gid, source),
+            _SUGGEST_TIMEOUT_SECONDS,
+        )
+        assessment = str(raw.get("assessment") or "")[:800]
+        gaps = _norm_gaps(raw.get("gaps"))
+        suggestions = _norm_suggestions(raw.get("suggestions"), minutes)
+        if not suggestions:
+            raise LearnAgentError("The backend returned no usable suggestions; try again.")
+
+        def apply(profile: dict[str, Any]) -> None:
+            if assessment:
+                profile["assessment"] = assessment
+            # Merge gaps by id: a re-identified gap keeps its "addressed" status only if
+            # the agent no longer flags it; when it still shows in the evidence it reopens.
+            known = {str(gap.get("id") or ""): gap for gap in profile["gaps"] if isinstance(gap, dict)}
+            profile["gaps"] = [*gaps, *[gap for gap_id, gap in known.items() if _find_by_id(gaps, gap_id) is None]][:12]
+            profile["suggestions"] = suggestions
+            profile["suggested_at"] = int(time.time())
+            profile["suggest_context"] = {"minutes": minutes, "mood": mood, "note": note[:300], "source": source}
+
+        profile = store.update(gid, apply)
+        maybe_sync(root, repo)
+        return {"profile": profile}
+    except LearnAgentError as exc:
+        return {"error": str(exc)}
+    finally:
+        _AGENT_LOCK.release()
+
+
+def make_lesson(
+    root: Path,
+    repo: GitRepo | None,
+    stats: list[CommitStat],
+    insights: list[dict],
+    file_rows: list[dict],
+    *,
+    suggestion_id: str,
+) -> dict[str, Any]:
+    """Generate the full lesson for one stored suggestion; persist and return it."""
+    if not _AGENT_LOCK.acquire(blocking=False):
+        return {"busy": True}
+    try:
+        gid = learner_id(root, repo)
+        store = LearnStore(root)
+        with _STORE_LOCK:
+            profile = LearnStore.profile(store.load(), gid)
+        suggestion = _find_by_id(profile["suggestions"], suggestion_id)
+        if suggestion is None:
+            return {"error": "That suggestion is no longer stored; ask for fresh suggestions."}
+        digest = build_trace_digest(stats, insights, file_rows, root, profile)
+        choice = resolve_learning_backend(root)
+        mood = str((profile.get("suggest_context") or {}).get("mood") or "")
+        raw = _run_agent_json(
+            choice, _SUGGEST_SYSTEM, _lesson_prompt(suggestion, digest, mood), _LESSON_TIMEOUT_SECONDS
+        )
+        lesson = _norm_lesson(raw, suggestion)
+        if not lesson["content_md"].strip():
+            raise LearnAgentError("The backend returned an empty lesson; try again.")
+        now = int(time.time())
+        lesson.update(
+            {
+                "id": f"{suggestion_id}-{now}",
+                "status": "started",
+                "created_at": now,
+                "seconds_spent": 0,
+                "quiz_correct": None,
+                "quiz_total": None,
+                "chat": [],
+            }
+        )
+
+        def apply(profile: dict[str, Any]) -> None:
+            profile["lessons"].append(lesson)
+
+        store.update(gid, apply)
+        maybe_sync(root, repo)
+        return {"lesson": lesson}
+    except LearnAgentError as exc:
+        return {"error": str(exc)}
+    finally:
+        _AGENT_LOCK.release()
+
+
+def lesson_chat(root: Path, repo: GitRepo | None, *, lesson_id: str, message: str) -> dict[str, Any]:
+    """A follow-up question about a lesson. Stateless on the backend side: the lesson and
+    recent conversation ride in the prompt, so it never depends on scratch-session state."""
+    message = message.strip()
+    if not message:
+        return {"error": "Empty question."}
+    if not _AGENT_LOCK.acquire(blocking=False):
+        return {"busy": True}
+    try:
+        gid = learner_id(root, repo)
+        store = LearnStore(root)
+        with _STORE_LOCK:
+            profile = LearnStore.profile(store.load(), gid)
+        lesson = _find_by_id(profile["lessons"], lesson_id)
+        if lesson is None:
+            return {"error": "Unknown lesson."}
+        choice = resolve_learning_backend(root)
+        reply = _run_agent(
+            choice, _MENTOR_PERSONA, _chat_prompt(lesson, lesson.get("chat") or [], message), _CHAT_TIMEOUT_SECONDS
+        )
+
+        def apply(profile: dict[str, Any]) -> None:
+            stored = _find_by_id(profile["lessons"], lesson_id)
+            if stored is not None:
+                chat = stored.setdefault("chat", [])
+                chat.extend([{"role": "user", "text": message[:2000]}, {"role": "mentor", "text": reply[:8000]}])
+                del chat[:-20]  # keep the tail; old exchanges age out
+
+        store.update(gid, apply)
+        return {"reply": reply}
+    except LearnAgentError as exc:
+        return {"error": str(exc)}
+    finally:
+        _AGENT_LOCK.release()
+
+
+def exercise_check(root: Path, repo: GitRepo | None, *, lesson_id: str, notes: str) -> dict[str, Any]:
+    """The learner tried the lesson's hands-on exercise and reports what happened; the
+    mentor reviews it. The attempt (notes, feedback, pass/fail) is logged in the
+    progress record, and a pass marks the exercise done."""
+    notes = notes.strip()
+    if not notes:
+        return {"error": "Tell me what you tried first."}
+    if not _AGENT_LOCK.acquire(blocking=False):
+        return {"busy": True}
+    try:
+        gid = learner_id(root, repo)
+        store = LearnStore(root)
+        with _STORE_LOCK:
+            profile = LearnStore.profile(store.load(), gid)
+        lesson = _find_by_id(profile["lessons"], lesson_id)
+        if lesson is None:
+            return {"error": "Unknown lesson."}
+        if not lesson.get("exercise"):
+            return {"error": "This lesson has no exercise."}
+        choice = resolve_learning_backend(root)
+        raw = _run_agent_json(choice, _SUGGEST_SYSTEM, _exercise_prompt(lesson, notes), _CHAT_TIMEOUT_SECONDS)
+        passed = bool(raw.get("passed"))
+        feedback = str(raw.get("feedback") or "").strip()[:1500]
+        if not feedback:
+            raise LearnAgentError("The backend returned no feedback; try again.")
+
+        def apply(profile: dict[str, Any]) -> None:
+            stored = _find_by_id(profile["lessons"], lesson_id)
+            exercise = stored.get("exercise") if stored else None
+            if isinstance(exercise, dict):
+                attempts = exercise.setdefault("attempts", [])
+                attempts.append({"notes": notes[:2000], "feedback": feedback, "passed": passed, "at": int(time.time())})
+                del attempts[:-10]
+                if passed:
+                    exercise["status"] = "done"
+
+        store.update(gid, apply)
+        maybe_sync(root, repo)
+        return {"passed": passed, "feedback": feedback}
+    except LearnAgentError as exc:
+        return {"error": str(exc)}
+    finally:
+        _AGENT_LOCK.release()
+
+
+def record_progress(
+    root: Path,
+    repo: GitRepo | None,
+    *,
+    lesson_id: str,
+    status: str = "",
+    seconds: int = 0,
+    quiz_correct: int | None = None,
+    quiz_total: int | None = None,
+    exercise_status: str = "",
+) -> dict[str, Any]:
+    """Automatic progress tracking: time spent accumulates, completion closes the linked
+    gap, quiz results and exercise outcomes are stored. Cheap and agent-free; the page
+    calls it in the background (periodic flushes, quiz checks, the Done button)."""
+    gid = learner_id(root, repo)
+    store = LearnStore(root)
+    found = {"ok": False}
+
+    def apply(profile: dict[str, Any]) -> None:
+        lesson = _find_by_id(profile["lessons"], lesson_id)
+        if lesson is None:
+            return
+        found["ok"] = True
+        if seconds > 0:
+            lesson["seconds_spent"] = int(lesson.get("seconds_spent") or 0) + min(int(seconds), 7200)
+        if isinstance(quiz_correct, int) and isinstance(quiz_total, int) and quiz_total > 0:
+            lesson["quiz_correct"], lesson["quiz_total"] = quiz_correct, quiz_total
+        if exercise_status in ("done", "skipped") and isinstance(lesson.get("exercise"), dict):
+            lesson["exercise"]["status"] = exercise_status
+        if status in ("started", "completed", "dismissed"):
+            lesson["status"] = status
+            if status == "completed":
+                lesson["completed_at"] = int(time.time())
+                gap = _find_by_id(profile["gaps"], str(lesson.get("gap_id") or ""))
+                if gap is not None:
+                    gap["status"] = "addressed"
+
+    profile = store.update(gid, apply)
+    if not found["ok"]:
+        return {"error": "Unknown lesson."}
+    if status == "completed" or exercise_status:
+        maybe_sync(root, repo)
+    return {"profile": profile}
+
+
+# ---------------------------------------------------------------- shared dispatch
+
+
+def _body_int(body: dict, key: str) -> int:
+    value = body.get(key)
+    return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0
+
+
+def handle_learn_post(
+    path: str,
+    body: dict,
+    *,
+    root: Path,
+    repo: GitRepo | None,
+    view: Callable[[str, int, int], tuple[list[CommitStat], list[dict], list[dict]]],
+) -> dict | None:
+    """The POST dispatcher both dashboard servers (live and backtrace) share.
+
+    ``view(source, frm, to)`` returns the filter-scoped ``(stats, insights, file_rows)``
+    the learning agent's digest is built from — exactly the slice that server's dashboard
+    would show. ``source`` selects WHOSE traces feed the analysis; the identity progress
+    is logged under is resolved server-side (GitHub id), never trusted from the client.
+    Returns None for an unknown path (the caller 404s); agent failures come back as
+    ``{"error": …}`` so the page shows them in place rather than a blank 500."""
+    source = str(body.get("source") or "")
+    frm, to = _body_int(body, "from"), _body_int(body, "to")
+    try:
+        if path == "/learn/suggest":
+            stats, insights, file_rows = view(source, frm, to)
+            return suggest(
+                root,
+                repo,
+                stats,
+                insights,
+                file_rows,
+                source=source,
+                minutes=_body_int(body, "minutes"),
+                mood=str(body.get("mood") or ""),
+                note=str(body.get("note") or ""),
+            )
+        if path == "/learn/lesson":
+            stats, insights, file_rows = view(source, frm, to)
+            return make_lesson(
+                root, repo, stats, insights, file_rows, suggestion_id=str(body.get("suggestion_id") or "")
+            )
+        if path == "/learn/chat":
+            return lesson_chat(
+                root, repo, lesson_id=str(body.get("lesson_id") or ""), message=str(body.get("message") or "")
+            )
+        if path == "/learn/exercise":
+            return exercise_check(
+                root, repo, lesson_id=str(body.get("lesson_id") or ""), notes=str(body.get("notes") or "")
+            )
+        if path == "/learn/progress":
+            quiz_correct, quiz_total = body.get("quiz_correct"), body.get("quiz_total")
+            return record_progress(
+                root,
+                repo,
+                lesson_id=str(body.get("lesson_id") or ""),
+                status=str(body.get("status") or ""),
+                seconds=_body_int(body, "seconds"),
+                quiz_correct=quiz_correct if isinstance(quiz_correct, int) else None,
+                quiz_total=quiz_total if isinstance(quiz_total, int) else None,
+                exercise_status=str(body.get("exercise_status") or ""),
+            )
+        if path == "/learn/sync":
+            return set_sync(root, repo, bool(body.get("enabled")))
+        if path == "/learn/config":
+            return set_learning_config(root, backend=str(body.get("backend") or ""), model=str(body.get("model") or ""))
+    except Exception as exc:  # surface as an in-page error, never a blank 500
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    return None
+
+
+# ------------------------------------------------------------------------- the page
+
+
+def learn_html(root: Path) -> str:
+    """The /learn page chrome. Data (profile, committers, backend info) is fetched from
+    ``/learn/state`` after paint, so this stays instant like the dashboard shell."""
+    from agitrack.metrics.collect import _abbreviate_home
+    from agitrack.metrics.web import _escape
+
+    repo_path = _abbreviate_home(str(root))
+    repo_name = repo_path.rstrip("/").rsplit("/", 1)[-1] or repo_path
+    return _LEARN_TEMPLATE.replace("__REPO_NAME__", _escape(repo_name)).replace("__REPO__", _escape(repo_path))
+
+
+_LEARN_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>learn · __REPO_NAME__ · aGiTrack</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🎓</text></svg>">
+<style>
+:root{--ink:#0b0f0e;--panel:#111716;--panel2:#0e1413;--line:#233029;--fg:#cfe3d8;--fg-dim:#7d947f;
+  --phosphor:#7fd77f;--phosphor-dim:#3f6b45;--accent:#6bbcee;--warn:#e0b653;--bad:#e07a6a;
+  --chipbg:#16201d}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;background:var(--ink);color:var(--fg);
+  font:14px/1.55 "SF Mono",ui-monospace,Menlo,Consolas,monospace}
+a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
+
+/* A slow ambient glow drifting behind everything: calm, not busy. */
+.ambient{position:fixed;inset:0;z-index:-1;pointer-events:none;opacity:.5;
+  background:
+    radial-gradient(600px 420px at 18% 8%, rgba(127,215,127,.09), transparent 60%),
+    radial-gradient(700px 480px at 85% 30%, rgba(107,188,238,.07), transparent 60%),
+    radial-gradient(520px 420px at 45% 95%, rgba(224,182,83,.05), transparent 60%);
+  animation:drift 36s ease-in-out infinite alternate}
+@keyframes drift{from{transform:translate3d(0,0,0) scale(1)}to{transform:translate3d(-30px,20px,0) scale(1.06)}}
+
+.wrap{max-width:880px;margin:0 auto;padding:22px 20px 60px}
+header{display:flex;align-items:baseline;justify-content:space-between;gap:14px;flex-wrap:wrap;
+  border-bottom:1px dashed var(--line);padding-bottom:14px;margin-bottom:18px}
+.brand{font-size:19px;letter-spacing:.5px}
+.brand .a{color:var(--phosphor)} .brand .sub{color:var(--fg-dim);font-size:13px}
+.meta{color:var(--fg-dim);font-size:12.5px} .meta b{color:var(--fg)}
+.backlink{font-size:12.5px}
+
+/* Sections and cards float in softly. */
+.rise{animation:rise .5s ease both}
+@keyframes rise{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+@media (prefers-reduced-motion: reduce){
+  .rise,.card,.mascot,.ambient,.spin,.confetti span{animation:none !important}
+}
+
+h2.section{font-size:13px;letter-spacing:1.5px;text-transform:uppercase;color:var(--phosphor);
+  margin:26px 0 10px;font-weight:600}
+.panel{background:var(--panel);border:1px solid var(--line);padding:16px 18px;border-radius:8px}
+.checkin .lead{margin:0 0 12px;color:var(--fg);font-size:15px;display:flex;align-items:center;gap:10px}
+.checkin .lead .hi{color:var(--phosphor)}
+.mascot{display:inline-block;font-size:22px;animation:bob 3.2s ease-in-out infinite;transform-origin:50% 90%}
+@keyframes bob{0%,100%{transform:translateY(0) rotate(-3deg)}50%{transform:translateY(-4px) rotate(3deg)}}
+.row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:10px 0}
+.row label{color:var(--fg-dim);font-size:12px;min-width:86px}
+.chips{display:flex;gap:8px;flex-wrap:wrap}
+.chip{background:var(--chipbg);border:1px solid var(--line);color:var(--fg);padding:7px 14px;
+  cursor:pointer;font:inherit;font-size:13px;border-radius:999px;transition:transform .12s,border-color .12s}
+.chip:hover{border-color:var(--phosphor-dim);transform:translateY(-1px)}
+.chip.sel{border-color:var(--phosphor);color:var(--phosphor);background:#14241a}
+select,input[type=text],textarea{background:var(--panel2);border:1px solid var(--line);color:var(--fg);
+  font:inherit;font-size:13px;padding:6px 8px;border-radius:4px}
+input[type=text]{flex:1;min-width:200px}
+input[type=text]::placeholder,textarea::placeholder{color:var(--fg-dim)}
+textarea{width:100%;min-height:74px;resize:vertical}
+.gobtn{display:block;width:100%;margin-top:14px;padding:13px;font:inherit;font-size:15px;cursor:pointer;
+  background:linear-gradient(180deg,#173123,#122619);border:1px solid var(--phosphor-dim);color:var(--phosphor);
+  border-radius:8px;letter-spacing:.3px;transition:transform .12s,border-color .12s,box-shadow .12s}
+.gobtn:hover{border-color:var(--phosphor);transform:translateY(-1px);box-shadow:0 4px 18px rgba(127,215,127,.12)}
+.gobtn:disabled{opacity:.55;cursor:default;transform:none;box-shadow:none}
+.hint{color:var(--fg-dim);font-size:12px;margin-top:8px}
+.thinking{display:flex;align-items:center;gap:10px;color:var(--fg-dim);font-size:13px;padding:14px 4px}
+.thinking .grow{font-size:18px;animation:bob 2.4s ease-in-out infinite}
+.spin{width:13px;height:13px;border:2px solid var(--phosphor-dim);border-top-color:var(--phosphor);
+  border-radius:50%;display:inline-block;animation:spin .8s linear infinite;flex:none}
+@keyframes spin{to{transform:rotate(360deg)}}
+.assess{color:var(--fg);font-size:13.5px;border-left:3px solid var(--phosphor-dim);padding:8px 12px;
+  margin:0 0 14px;background:var(--panel2);border-radius:0 6px 6px 0}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:12px}
+.card{background:var(--panel);border:1px solid var(--line);padding:14px 16px;cursor:pointer;border-radius:8px;
+  transition:border-color .15s,transform .15s,box-shadow .15s;animation:rise .5s ease both}
+.card:nth-child(2){animation-delay:.08s}.card:nth-child(3){animation-delay:.16s}.card:nth-child(4){animation-delay:.24s}
+.card:hover{border-color:var(--phosphor);transform:translateY(-2px);box-shadow:0 6px 22px rgba(0,0,0,.35)}
+.card h3{margin:0 0 6px;font-size:14.5px;color:var(--fg);font-weight:600}
+.card .why{color:var(--fg-dim);font-size:12.5px;margin:6px 0}
+.card .teaser{color:var(--fg);font-size:12.5px;margin:6px 0 8px}
+.badges{display:flex;gap:6px;flex-wrap:wrap}
+.badge{font-size:11px;padding:2px 8px;border-radius:999px;border:1px solid var(--line);color:var(--fg-dim)}
+.badge.kind-coding{border-color:#3d5a75;color:var(--accent)}
+.badge.kind-codebase{border-color:var(--phosphor-dim);color:var(--phosphor)}
+.badge.min{color:var(--warn);border-color:#5c4d28}
+.badge.done{color:var(--phosphor);border-color:var(--phosphor-dim)}
+.card .start{margin-top:8px;font-size:12.5px;color:var(--accent)}
+.lesson h1{font-size:19px;margin:4px 0 2px;color:var(--fg)}
+.lesson .lmeta{color:var(--fg-dim);font-size:12px;margin-bottom:14px}
+.lcontent{font-size:14px}
+.lcontent h3{color:var(--phosphor);font-size:14px;margin:20px 0 6px}
+.lcontent h4{color:var(--fg);font-size:13.5px;margin:16px 0 6px}
+.lcontent p{margin:8px 0}
+.lcontent code{background:var(--panel2);border:1px solid var(--line);padding:1px 5px;font-size:12.5px;border-radius:3px}
+.lcontent pre{background:var(--panel2);border:1px solid var(--line);padding:12px;overflow-x:auto;font-size:12.5px;border-radius:6px}
+.lcontent pre code{background:none;border:none;padding:0}
+.lcontent ul,.lcontent ol{margin:8px 0;padding-left:24px}
+.lcontent li{margin:3px 0}
+.subhead{color:var(--phosphor);font-size:13px;letter-spacing:1px;text-transform:uppercase;margin:0 0 10px}
+.links{margin-top:18px}
+.links .lk{margin:8px 0;font-size:13px}
+.links .lk .note{color:var(--fg-dim);font-size:12px}
+.quiz{margin-top:20px;border-top:1px dashed var(--line);padding-top:14px}
+.qq{margin:12px 0}
+.qq .qt{font-size:13.5px;margin-bottom:6px}
+.qq label{display:block;padding:6px 10px;border:1px solid var(--line);margin:4px 0;cursor:pointer;font-size:13px;
+  border-radius:5px;transition:border-color .12s}
+.qq label:hover{border-color:var(--phosphor-dim)}
+.qq label.right{border-color:var(--phosphor);color:var(--phosphor)}
+.qq label.wrong{border-color:var(--bad);color:var(--bad)}
+.qq .explain{color:var(--fg-dim);font-size:12.5px;margin:4px 0 0 10px;display:none}
+.qq .explain.show{display:block}
+.exercise{margin-top:20px;border-top:1px dashed var(--line);padding-top:14px}
+.exercise .extask{font-size:13.5px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;
+  padding:10px 12px;margin-bottom:10px}
+.exercise details{margin:8px 0;font-size:12.5px;color:var(--fg-dim)}
+.exercise details summary{cursor:pointer}
+.exercise .exfeed{margin-top:10px}
+.btnrow{display:flex;gap:10px;margin-top:14px;flex-wrap:wrap;align-items:center}
+.btn{background:var(--chipbg);border:1px solid var(--line);color:var(--fg);padding:9px 16px;cursor:pointer;
+  font:inherit;font-size:13px;border-radius:5px;transition:transform .12s,border-color .12s}
+.btn:hover{border-color:var(--phosphor-dim);transform:translateY(-1px)}
+.btn.primary{border-color:var(--phosphor-dim);color:var(--phosphor)}
+.btn.primary:hover{border-color:var(--phosphor)}
+.chat{margin-top:22px;border-top:1px dashed var(--line);padding-top:14px}
+.bubble{max-width:85%;padding:8px 12px;margin:8px 0;font-size:13px;border:1px solid var(--line);border-radius:10px;
+  animation:rise .35s ease both}
+.bubble.user{margin-left:auto;background:#14222b;border-color:#2a4356;border-bottom-right-radius:3px}
+.bubble.mentor{background:var(--panel2);border-bottom-left-radius:3px}
+.chatrow{display:flex;gap:8px;margin-top:10px}
+.chatrow input{flex:1}
+.progress .pstats{display:flex;gap:22px;flex-wrap:wrap;margin-bottom:10px}
+.pstat b{color:var(--phosphor);font-size:17px}
+.pstat span{color:var(--fg-dim);font-size:12px;display:block}
+.plist .pl{display:flex;align-items:baseline;gap:10px;padding:7px 4px;border-top:1px solid var(--line);
+  font-size:13px;cursor:pointer}
+.plist .pl:hover .plt{color:var(--accent)}
+.plist .st{flex:none;width:16px}
+.plist .plt{flex:1}
+.plist .pmeta{color:var(--fg-dim);font-size:11.5px;flex:none;display:flex;gap:6px;align-items:baseline}
+.error{border:1px solid var(--bad);color:var(--bad);padding:10px 14px;font-size:13px;margin:10px 0;border-radius:6px}
+.notice{border:1px solid var(--warn);color:var(--warn);padding:10px 14px;font-size:13px;margin:10px 0;border-radius:6px}
+.engine{margin-top:26px;border:1px solid var(--line);background:var(--panel);border-radius:8px}
+.engine summary{cursor:pointer;padding:10px 16px;color:var(--fg-dim);font-size:12.5px;list-style:none}
+.engine summary::before{content:"\2699\FE0F  "}
+.engine summary:hover{color:var(--fg)}
+.engine .ebody{padding:4px 16px 14px}
+.engine .esaved{color:var(--phosphor)}
+/* Emoji confetti on a completed lesson: a brief, gentle celebration. */
+.confetti{position:fixed;inset:0;pointer-events:none;overflow:hidden;z-index:50}
+.confetti span{position:absolute;top:-30px;font-size:20px;animation:fall 2.6s ease-in forwards}
+@keyframes fall{to{transform:translateY(105vh) rotate(340deg);opacity:.1}}
+footer{margin-top:46px;padding-top:18px;border-top:1px dashed var(--line);color:var(--fg-dim);font-size:12px}
+footer code{color:var(--fg)}
+[hidden]{display:none !important}
+@media (max-width:600px){.cards{grid-template-columns:1fr}.bubble{max-width:100%}}
+</style>
+</head>
+<body>
+<div class="ambient"></div>
+<div class="wrap">
+  <header class="rise">
+    <div class="brand"><span class="a">a</span>GiTrack<span class="sub">&nbsp;learn</span></div>
+    <div class="meta"><span>repo</span> <b>__REPO__</b> <span id="me-meta"></span></div>
+    <a class="backlink" href="./">&larr; dashboard</a>
+  </header>
+
+  <div class="panel checkin rise" id="checkin">
+    <p class="lead"><span class="mascot">&#127793;</span><span><span class="hi" id="hello">Hi!</span> I read your agent sessions and can teach you something genuinely useful. Just tell me how you're doing right now:</span></p>
+    <div class="row"><label>learn from</label>
+      <select id="f-source"><option value="">entire team</option></select>
+      <label style="min-width:auto">period</label>
+      <select id="f-period">
+        <option value="">all time</option>
+        <option value="30" selected>last 30 days</option>
+        <option value="7">last 7 days</option>
+      </select>
+    </div>
+    <div class="row"><label>time I have</label>
+      <div class="chips" id="time-chips">
+        <button class="chip" data-v="5">&#9749; 5 min</button>
+        <button class="chip sel" data-v="15">&#9200; 15 min</button>
+        <button class="chip" data-v="30">&#129504; 30 min</button>
+      </div>
+    </div>
+    <div class="row"><label>feeling</label>
+      <div class="chips" id="mood-chips">
+        <button class="chip" data-v="fresh">&#128267; fresh</button>
+        <button class="chip sel" data-v="okay">&#128578; okay</button>
+        <button class="chip" data-v="tired">&#129715; tired</button>
+      </div>
+    </div>
+    <div class="row"><label>optional</label>
+      <input type="text" id="f-note" placeholder="anything specific on your mind? (leave empty and I'll pick)" maxlength="300">
+    </div>
+    <button class="gobtn" id="go">&#10024; find me something worth learning</button>
+    <div class="hint">I'll look at the recent sessions, spot what would help you most, and size it to your time. Your progress is saved automatically.</div>
+  </div>
+
+  <div id="agent-wait" class="thinking" hidden><span class="spin"></span><span class="grow" id="wait-icon">&#127793;</span><span id="wait-msg"></span></div>
+  <div id="flash"></div>
+
+  <div id="suggestwrap" hidden>
+    <h2 class="section">picked for you</h2>
+    <div class="assess" id="assess" hidden></div>
+    <div class="cards" id="suggestions"></div>
+  </div>
+
+  <div id="lessonwrap" hidden>
+    <div class="panel lesson rise">
+      <button class="btn" id="lesson-back">&larr; back</button>
+      <h1 id="lesson-title"></h1>
+      <div class="lmeta" id="lesson-meta"></div>
+      <div class="lcontent" id="lesson-content"></div>
+      <div class="links" id="lesson-links"></div>
+      <div class="quiz" id="lesson-quiz" hidden>
+        <h3 class="subhead">&#128161; quick check</h3>
+        <div id="quiz-qs"></div>
+        <div class="btnrow"><button class="btn" id="quiz-check">check my answers</button>
+          <span class="hint" id="quiz-result"></span></div>
+      </div>
+      <div class="exercise" id="lesson-ex" hidden>
+        <h3 class="subhead">&#128296; try it yourself</h3>
+        <div class="extask" id="ex-task"></div>
+        <details id="ex-hint-wrap"><summary>need a hint?</summary><div id="ex-hint"></div></details>
+        <textarea id="ex-notes" placeholder="what did you try, and what happened? paste output or notes here"></textarea>
+        <div class="btnrow">
+          <button class="btn primary" id="ex-check">ask my mentor to review</button>
+          <button class="btn" id="ex-skip">skip for now</button>
+          <span class="hint" id="ex-status"></span>
+        </div>
+        <div class="exfeed" id="ex-feedback"></div>
+      </div>
+      <div class="btnrow">
+        <button class="btn primary" id="lesson-done">&#10003; got it, done</button>
+      </div>
+      <div class="chat">
+        <h3 class="subhead">&#128172; ask a follow-up</h3>
+        <div id="chatlog"></div>
+        <div class="chatrow">
+          <input type="text" id="chat-input" placeholder="anything unclear? ask me" maxlength="2000">
+          <button class="btn" id="chat-send">send</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="progresswrap" hidden>
+    <h2 class="section">your progress</h2>
+    <div class="panel progress">
+      <div class="pstats" id="pstats"></div>
+      <div class="plist" id="plist"></div>
+    </div>
+  </div>
+
+  <details class="engine" id="engine">
+    <summary>coach engine &amp; progress sync</summary>
+    <div class="ebody">
+      <div class="row"><label>backend</label>
+        <select id="e-backend">
+          <option value="">auto (latest session)</option>
+          <option value="claude">claude</option>
+          <option value="opencode">opencode</option>
+        </select>
+        <label style="min-width:auto">model</label>
+        <select id="e-model"><option value="">auto (latest session)</option></select>
+        <button class="btn" id="e-save">save</button>
+        <span class="hint" id="e-msg"></span>
+      </div>
+      <div class="hint">Saved to <code>.agitrack/config.json</code> in this repo as <code>learning_backend</code> / <code>learning_model</code>. You can also edit it there, or set it globally in <code>~/.agitrack/config.json</code>.</div>
+      <div class="row"><label>progress sync</label>
+        <button class="chip" id="sync-toggle">off</button>
+        <span class="hint" id="sync-msg" style="margin-top:0"></span>
+      </div>
+      <div class="hint">When on, your progress log is published to git (<code>refs/agitrack/learning-progress</code>, one entry per GitHub user) the same way shared sessions are, so teammates can see it. Off by default; progress always stays tracked locally either way.</div>
+    </div>
+  </details>
+
+  <footer id="backendnote"></footer>
+</div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+const state = { me: "", source: "", minutes: 15, mood: "okay", profile: null, lesson: null,
+                sync: null, openedAt: 0, flushedS: 0, waitTimer: null };
+
+function period() {
+  const days = $("f-period").value;
+  if (!days) return {from: 0, to: 0};
+  return {from: Math.floor(Date.now()/1000) - Number(days)*86400, to: 0};
+}
+
+async function post(path, body) {
+  const r = await fetch(path, {method: "POST", headers: {"Content-Type": "application/json"},
+                               body: JSON.stringify(body), cache: "no-store"});
+  if (!r.ok) throw new Error("server error " + r.status);
+  return r.json();
+}
+
+function flash(html) { $("flash").innerHTML = html; }
+function clearFlash() { flash(""); }
+
+// ------- friendly waiting messages (an agent call takes a little while) -------
+const WAIT = {
+  suggest: {icon: "\u{1F331}", msgs: ["reading your recent sessions…", "spotting patterns in how you work…",
+            "checking what you already learned…", "picking something worth your time…"]},
+  lesson:  {icon: "\u{1F4DD}", msgs: ["writing your lesson…", "tailoring the examples to your repo…",
+            "adding links worth opening…", "almost there…"]},
+  chat:    {icon: "\u{1F4AC}", msgs: ["thinking about your question…", "checking the lesson again…"]},
+  exercise:{icon: "\u{1F50D}", msgs: ["reviewing what you tried…", "comparing it with the goal…"]}
+};
+function startWait(kind) {
+  let i = 0;
+  const w = WAIT[kind];
+  $("agent-wait").hidden = false;
+  $("wait-icon").textContent = w.icon;
+  $("wait-msg").textContent = w.msgs[0];
+  state.waitTimer = setInterval(() => {
+    i = (i + 1) % w.msgs.length;
+    $("wait-msg").textContent = w.msgs[i];
+  }, 3500);
+}
+function stopWait() {
+  clearInterval(state.waitTimer);
+  $("agent-wait").hidden = true;
+}
+
+// Gentle emoji confetti for finished lessons and passed exercises.
+function celebrate() {
+  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  const box = document.createElement("div");
+  box.className = "confetti";
+  const icons = ["\u{1F389}", "✨", "\u{1F331}", "\u{1F4A1}", "\u{1F393}"];
+  for (let i = 0; i < 18; i++) {
+    const s = document.createElement("span");
+    s.textContent = icons[i % icons.length];
+    s.style.left = (4 + Math.random()*92) + "vw";
+    s.style.animationDelay = (Math.random()*0.7) + "s";
+    s.style.fontSize = (14 + Math.random()*12) + "px";
+    box.appendChild(s);
+  }
+  document.body.appendChild(box);
+  setTimeout(() => box.remove(), 3600);
+}
+
+// ---------------------------------------------------------------- markdown (tiny)
+function md(src) {
+  src = String(src || "");
+  const blocks = [];
+  src = src.replace(/```([\s\S]*?)```/g, (_, code) => {
+    blocks.push("<pre><code>" + esc(code.replace(/^\w*\n/, "")) + "</code></pre>");
+    return "\x00" + (blocks.length - 1) + "\x00";
+  });
+  let h = esc(src);
+  h = h.replace(/^#{4,6}\s+(.+)$/gm, "<h4>$1</h4>")
+       .replace(/^###\s+(.+)$/gm, "<h3>$1</h3>")
+       .replace(/^##\s+(.+)$/gm, "<h3>$1</h3>")
+       .replace(/^#\s+(.+)$/gm, "<h3>$1</h3>")
+       .replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>")
+       .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<i>$2</i>")
+       .replace(/`([^`\n]+)`/g, "<code>$1</code>")
+       .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g,
+                '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  const lines = h.split("\n");
+  const out = [];
+  let list = null, para = [];
+  const endPara = () => { if (para.length) { out.push("<p>" + para.join(" ") + "</p>"); para = []; } };
+  const endList = () => { if (list) { out.push("</" + list + ">"); list = null; } };
+  for (const line of lines) {
+    const t = line.trim();
+    const ul = /^[-*]\s+(.*)/.exec(t), ol = /^\d+[.)]\s+(.*)/.exec(t);
+    if (ul || ol) {
+      endPara();
+      const want = ul ? "ul" : "ol";
+      if (list !== want) { endList(); out.push("<" + want + ">"); list = want; }
+      out.push("<li>" + (ul ? ul[1] : ol[1]) + "</li>");
+    } else if (!t) { endPara(); endList(); }
+    else if (/^<(h3|h4)/.test(t) || /^\x00\d+\x00$/.test(t)) { endPara(); endList(); out.push(t); }
+    else para.push(t);
+  }
+  endPara(); endList();
+  return out.join("\n").replace(/\x00(\d+)\x00/g, (_, i) => blocks[Number(i)]);
+}
+
+// ------------------------------------------------------------------ rendering
+function kindBadge(kind) {
+  return kind === "codebase"
+    ? '<span class="badge kind-codebase">&#128193; this codebase</span>'
+    : '<span class="badge kind-coding">&#128295; coding skill</span>';
+}
+
+function renderSuggestions() {
+  const p = state.profile;
+  const list = (p && p.suggestions) || [];
+  $("suggestwrap").hidden = !list.length && !(p && p.assessment);
+  $("assess").hidden = !(p && p.assessment);
+  if (p && p.assessment) $("assess").textContent = p.assessment;
+  $("suggestions").innerHTML = list.map(s => `
+    <div class="card" data-id="${esc(s.id)}">
+      <div class="badges">${kindBadge(s.kind)}<span class="badge min">&#9200; ~${esc(s.minutes)} min</span></div>
+      <h3>${esc(s.title)}</h3>
+      ${s.teaser ? `<div class="teaser">${esc(s.teaser)}</div>` : ""}
+      ${s.why ? `<div class="why">why now: ${esc(s.why)}</div>` : ""}
+      <div class="start">start &rarr;</div>
+    </div>`).join("");
+  for (const card of $("suggestions").querySelectorAll(".card"))
+    card.addEventListener("click", () => openSuggestion(card.dataset.id));
+}
+
+function renderProgress() {
+  const p = state.profile;
+  const lessons = (p && p.lessons) || [];
+  const gaps = (p && p.gaps) || [];
+  $("progresswrap").hidden = !lessons.length;
+  if (!lessons.length) return;
+  const done = lessons.filter(l => l.status === "completed");
+  const minutes = Math.round(lessons.reduce((a, l) => a + (l.seconds_spent || 0), 0) / 60);
+  const closed = gaps.filter(g => g.status === "addressed").length;
+  const exDone = lessons.filter(l => l.exercise && l.exercise.status === "done").length;
+  $("pstats").innerHTML = `
+    <div class="pstat"><b>${done.length}</b><span>lessons done</span></div>
+    <div class="pstat"><b>${minutes}</b><span>minutes learned</span></div>
+    <div class="pstat"><b>${exDone}</b><span>exercises done</span></div>
+    ${gaps.length ? `<div class="pstat"><b>${closed}/${gaps.length}</b><span>gaps closed</span></div>` : ""}`;
+  $("plist").innerHTML = lessons.slice().reverse().map(l => `
+    <div class="pl" data-id="${esc(l.id)}">
+      <span class="st">${l.status === "completed" ? "&#10003;" : "&#9679;"}</span>
+      <span class="plt">${esc(l.title)}</span>
+      <span class="pmeta">${kindBadge(l.kind)}${l.quiz_total ? `<span class="badge done">quiz ${l.quiz_correct}/${l.quiz_total}</span>` : ""}${l.exercise && l.exercise.status === "done" ? '<span class="badge done">&#128296; exercise</span>' : ""}</span>
+    </div>`).join("");
+  for (const row of $("plist").querySelectorAll(".pl"))
+    row.addEventListener("click", () => {
+      const lesson = lessons.find(l => l.id === row.dataset.id);
+      if (lesson) openLesson(lesson);
+    });
+}
+
+function renderBackendNote(info) {
+  if (!info) return;
+  if (info.error) { $("backendnote").innerHTML = "&#9888; " + esc(info.error); return; }
+  const model = info.model ? esc(info.model) : "backend default model";
+  const src = info.backend_source === "config" ? "pinned in config" : "from your latest session";
+  $("backendnote").innerHTML =
+    `lessons are generated by <b>${esc(info.backend)}</b> &middot; ${model} (${src}). ` +
+    `Adjust it in the "coach engine" panel above, or set <code>learning_backend</code> / ` +
+    `<code>learning_model</code> in <code>.agitrack/config.json</code>.`;
+  if ($("e-backend").dataset.userTouched !== "1") {
+    $("e-backend").value = info.backend_source === "config" ? info.backend : "";
+    loadModels(info);
+  }
+}
+
+function renderSync() {
+  const s = state.sync;
+  if (!s) return;
+  if (s.available === false) {
+    $("sync-toggle").textContent = "unavailable";
+    $("sync-toggle").disabled = true;
+    $("sync-msg").textContent = "needs a git repository; progress still stays tracked locally";
+    return;
+  }
+  $("sync-toggle").textContent = s.enabled ? "on" : "off";
+  $("sync-toggle").classList.toggle("sel", !!s.enabled);
+  let msg = "";
+  if (s.enabled && s.last) msg = s.last.ok ? "synced &#10003;" : ("last sync failed: " + esc(s.last.error || "unknown"));
+  const others = (s.users || []).filter(u => u.gid !== state.me);
+  if (others.length) msg += (msg ? " &middot; " : "") + "also syncing: " + others.map(u => esc(u.gid)).join(", ");
+  $("sync-msg").innerHTML = msg;
+}
+
+// ------------------------------------------------------------------ lesson view
+function openLesson(lesson) {
+  flushTime();
+  state.lesson = lesson;
+  state.openedAt = Date.now();
+  state.flushedS = 0;
+  $("checkin").hidden = true;
+  $("suggestwrap").hidden = true;
+  $("progresswrap").hidden = true;
+  $("lessonwrap").hidden = false;
+  clearFlash();
+  $("lesson-title").textContent = lesson.title;
+  $("lesson-meta").innerHTML = `${kindBadge(lesson.kind)} <span class="badge min">&#9200; ~${esc(lesson.minutes)} min</span>`;
+  $("lesson-content").innerHTML = md(lesson.content_md);
+  $("lesson-links").innerHTML = (lesson.links || []).length
+    ? '<h3 class="subhead">&#128279; go deeper</h3>' +
+      lesson.links.map(k => `<div class="lk"><a href="${esc(k.url)}" target="_blank" rel="noopener noreferrer">${esc(k.title)}</a>${k.note ? ` <span class="note">${esc(k.note)}</span>` : ""}</div>`).join("")
+    : "";
+  renderQuiz(lesson);
+  renderExercise(lesson);
+  renderChat(lesson);
+  $("lesson-done").hidden = lesson.status === "completed";
+  window.scrollTo(0, 0);
+  if (lesson.status !== "completed")
+    post("learn/progress", {lesson_id: lesson.id, status: "started"}).catch(() => {});
+}
+
+function renderQuiz(lesson) {
+  const quiz = lesson.quiz || [];
+  $("lesson-quiz").hidden = !quiz.length;
+  $("quiz-result").textContent = "";
+  $("quiz-qs").innerHTML = quiz.map((q, qi) => `
+    <div class="qq" data-qi="${qi}">
+      <div class="qt">${qi + 1}. ${esc(q.question)}</div>
+      ${q.choices.map((c, ci) => `<label><input type="radio" name="q${qi}" value="${ci}"> ${esc(c)}</label>`).join("")}
+      <div class="explain">${esc(q.explain)}</div>
+    </div>`).join("");
+}
+
+function checkQuiz() {
+  const lesson = state.lesson;
+  if (!lesson) return;
+  let correct = 0;
+  const quiz = lesson.quiz || [];
+  quiz.forEach((q, qi) => {
+    const box = document.querySelector(`.qq[data-qi="${qi}"]`);
+    const picked = box.querySelector("input:checked");
+    box.querySelectorAll("label").forEach((lab, ci) => {
+      lab.classList.remove("right", "wrong");
+      if (ci === q.answer) lab.classList.add("right");
+      else if (picked && Number(picked.value) === ci) lab.classList.add("wrong");
+    });
+    box.querySelector(".explain").classList.add("show");
+    if (picked && Number(picked.value) === q.answer) correct++;
+  });
+  $("quiz-result").textContent = correct === quiz.length
+    ? "all correct, nicely done!" : `${correct}/${quiz.length} correct. Peek at the notes above.`;
+  if (correct === quiz.length && quiz.length) celebrate();
+  post("learn/progress", {lesson_id: lesson.id, quiz_correct: correct, quiz_total: quiz.length}).catch(() => {});
+}
+
+function renderExercise(lesson) {
+  const ex = lesson.exercise;
+  $("lesson-ex").hidden = !ex;
+  if (!ex) return;
+  $("ex-task").textContent = ex.task;
+  $("ex-hint-wrap").hidden = !ex.hint;
+  $("ex-hint").textContent = ex.hint || "";
+  $("ex-notes").value = "";
+  $("ex-status").textContent = ex.status === "done" ? "done ✓" : (ex.status === "skipped" ? "skipped" : "");
+  $("ex-feedback").innerHTML = (ex.attempts || []).map(a =>
+    `<div class="bubble mentor">${a.passed ? "✅ " : "\u{1F4AD} "}${md(a.feedback)}</div>`).join("");
+}
+
+async function checkExercise() {
+  const lesson = state.lesson;
+  const notes = $("ex-notes").value.trim();
+  if (!lesson || !notes) { $("ex-status").textContent = "tell me what you tried first"; return; }
+  startWait("exercise");
+  try {
+    const r = await post("learn/exercise", {lesson_id: lesson.id, notes});
+    if (r.busy) { flash('<div class="notice">I\'m still busy with another request, give me a moment.</div>'); return; }
+    if (r.error) { flash(`<div class="error">${esc(r.error)}</div>`); return; }
+    clearFlash();
+    lesson.exercise.attempts = lesson.exercise.attempts || [];
+    lesson.exercise.attempts.push({passed: r.passed, feedback: r.feedback});
+    if (r.passed) { lesson.exercise.status = "done"; celebrate(); }
+    renderExercise(lesson);
+  } catch (e) { flash(`<div class="error">${esc(e.message)}</div>`); }
+  finally { stopWait(); }
+}
+
+function skipExercise() {
+  const lesson = state.lesson;
+  if (!lesson || !lesson.exercise) return;
+  lesson.exercise.status = "skipped";
+  $("ex-status").textContent = "skipped";
+  post("learn/progress", {lesson_id: lesson.id, exercise_status: "skipped"}).catch(() => {});
+}
+
+function renderChat(lesson) {
+  $("chatlog").innerHTML = (lesson.chat || []).map(t =>
+    `<div class="bubble ${t.role === "user" ? "user" : "mentor"}">${t.role === "user" ? esc(t.text) : md(t.text)}</div>`).join("");
+}
+
+async function sendChat() {
+  const lesson = state.lesson;
+  const input = $("chat-input");
+  const text = input.value.trim();
+  if (!lesson || !text) return;
+  input.value = "";
+  lesson.chat = lesson.chat || [];
+  lesson.chat.push({role: "user", text});
+  renderChat(lesson);
+  startWait("chat");
+  try {
+    const r = await post("learn/chat", {lesson_id: lesson.id, message: text});
+    if (r.busy) { flash('<div class="notice">I\'m still busy with another request, give me a moment.</div>'); return; }
+    if (r.error) { flash(`<div class="error">${esc(r.error)}</div>`); return; }
+    clearFlash();
+    lesson.chat.push({role: "mentor", text: r.reply});
+    renderChat(lesson);
+  } catch (e) { flash(`<div class="error">${esc(e.message)}</div>`); }
+  finally { stopWait(); }
+}
+
+function closeLesson() {
+  flushTime();
+  state.lesson = null;
+  $("lessonwrap").hidden = true;
+  $("checkin").hidden = false;
+  refreshState();
+}
+
+async function finishLesson() {
+  const lesson = state.lesson;
+  if (!lesson) return;
+  const seconds = unflushedSeconds();
+  state.flushedS += seconds;
+  try {
+    await post("learn/progress", {lesson_id: lesson.id, status: "completed", seconds});
+  } catch (e) {}
+  lesson.status = "completed";
+  $("lesson-done").hidden = true;
+  celebrate();
+  flash('<div class="notice">&#127881; nice, that one is done. It counts toward your progress.</div>');
+  closeLesson();
+}
+
+// -------------------------------------------------- automatic time tracking
+function unflushedSeconds() {
+  if (!state.openedAt || document.visibilityState === "hidden") return 0;
+  return Math.max(0, Math.round((Date.now() - state.openedAt) / 1000) - state.flushedS);
+}
+function flushTime(useBeacon) {
+  const lesson = state.lesson;
+  const seconds = unflushedSeconds();
+  if (!lesson || seconds < 5) return;
+  state.flushedS += seconds;
+  const body = JSON.stringify({lesson_id: lesson.id, seconds});
+  if (useBeacon && navigator.sendBeacon) navigator.sendBeacon("learn/progress", new Blob([body], {type: "application/json"}));
+  else post("learn/progress", JSON.parse(body)).catch(() => {});
+}
+setInterval(() => flushTime(false), 30000);
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") flushTime(true); });
+window.addEventListener("pagehide", () => flushTime(true));
+
+// ------------------------------------------------------------------ actions
+async function suggest() {
+  const btn = $("go");
+  btn.disabled = true;
+  clearFlash();
+  startWait("suggest");
+  try {
+    const pr = period();
+    const r = await post("learn/suggest", {source: state.source, from: pr.from, to: pr.to,
+                                           minutes: state.minutes, mood: state.mood,
+                                           note: $("f-note").value.trim()});
+    if (r.busy) { flash('<div class="notice">I\'m already thinking about another request, give me a moment and try again.</div>'); return; }
+    if (r.error) { flash(`<div class="error">${esc(r.error)}</div>`); return; }
+    state.profile = r.profile;
+    renderSuggestions();
+    renderProgress();
+    $("suggestwrap").scrollIntoView({behavior: "smooth"});
+  } catch (e) { flash(`<div class="error">${esc(e.message)}</div>`); }
+  finally { stopWait(); btn.disabled = false; }
+}
+
+async function openSuggestion(id) {
+  clearFlash();
+  startWait("lesson");
+  try {
+    const pr = period();
+    const r = await post("learn/lesson", {source: state.source, from: pr.from, to: pr.to, suggestion_id: id});
+    if (r.busy) { flash('<div class="notice">I\'m still writing something else, one moment please.</div>'); return; }
+    if (r.error) { flash(`<div class="error">${esc(r.error)}</div>`); return; }
+    if (state.profile) state.profile.lessons = [...(state.profile.lessons || []), r.lesson];
+    openLesson(r.lesson);
+  } catch (e) { flash(`<div class="error">${esc(e.message)}</div>`); }
+  finally { stopWait(); }
+}
+
+async function refreshState() {
+  try {
+    const r = await fetch("learn/state", {cache: "no-store"});
+    const d = await r.json();
+    state.profile = d.profile;
+    state.me = d.me || "";
+    state.sync = d.sync || null;
+    if (state.me) {
+      $("hello").textContent = "Hi " + state.me + "!";
+      $("me-meta").innerHTML = " &nbsp;&middot;&nbsp; learner <b>" + esc(state.me) + "</b>";
+    }
+    renderBackendNote(d.backend_info);
+    renderSync();
+    if (d.committers) {
+      const sel = $("f-source");
+      const current = state.source;
+      sel.innerHTML = '<option value="">entire team</option>' +
+        d.committers.map(c => `<option value="${esc(c)}">${esc(c)}${c === state.me ? " (me)" : ""}</option>`).join("");
+      // Default to the learner's own sessions when they appear as a committer.
+      sel.value = current || (d.committers.includes(state.me) ? state.me : "");
+      state.source = sel.value;
+    }
+    renderSuggestions();
+    renderProgress();
+  } catch (e) {}
+}
+
+// ------------------------------------------- engine picker & progress sync
+async function loadModels(info) {
+  const backend = $("e-backend").value || (info && info.backend) || "";
+  const sel = $("e-model");
+  sel.innerHTML = '<option value="">auto (latest session)</option>';
+  if (!backend) return;
+  try {
+    const r = await fetch(`learn/models?backend=${encodeURIComponent(backend)}`, {cache: "no-store"});
+    const d = await r.json();
+    for (const m of d.models || []) {
+      const o = document.createElement("option");
+      o.value = m; o.textContent = m;
+      sel.appendChild(o);
+    }
+    if (info && info.model_source === "config" && info.model) sel.value = info.model;
+  } catch (e) {}
+}
+
+async function saveEngine() {
+  $("e-msg").textContent = "saving…";
+  try {
+    const r = await post("learn/config", {backend: $("e-backend").value, model: $("e-model").value});
+    if (r.error) { $("e-msg").textContent = r.error; return; }
+    $("e-msg").innerHTML = '<span class="esaved">saved &#10003;</span>';
+    renderBackendNote(r.backend_info);
+  } catch (e) { $("e-msg").textContent = e.message; }
+}
+
+async function toggleSync() {
+  if (state.sync && state.sync.available === false) return;
+  const want = !(state.sync && state.sync.enabled);
+  $("sync-msg").textContent = want ? "syncing…" : "";
+  try {
+    const r = await post("learn/sync", {enabled: want});
+    if (r.error) { $("sync-msg").textContent = r.error; return; }
+    state.sync = r.sync;
+    renderSync();
+  } catch (e) { $("sync-msg").textContent = e.message; }
+}
+
+// ------------------------------------------------------------------ wiring
+function wireChips(id, key) {
+  $(id).addEventListener("click", e => {
+    const chip = e.target.closest(".chip");
+    if (!chip) return;
+    for (const c of $(id).querySelectorAll(".chip")) c.classList.toggle("sel", c === chip);
+    state[key] = key === "minutes" ? Number(chip.dataset.v) : chip.dataset.v;
+  });
+}
+wireChips("time-chips", "minutes");
+wireChips("mood-chips", "mood");
+$("go").addEventListener("click", suggest);
+$("f-source").addEventListener("change", () => { state.source = $("f-source").value; });
+$("lesson-back").addEventListener("click", closeLesson);
+$("lesson-done").addEventListener("click", finishLesson);
+$("quiz-check").addEventListener("click", checkQuiz);
+$("ex-check").addEventListener("click", checkExercise);
+$("ex-skip").addEventListener("click", skipExercise);
+$("chat-send").addEventListener("click", sendChat);
+$("chat-input").addEventListener("keydown", e => { if (e.key === "Enter") sendChat(); });
+$("f-note").addEventListener("keydown", e => { if (e.key === "Enter") suggest(); });
+$("e-backend").addEventListener("change", () => { $("e-backend").dataset.userTouched = "1"; loadModels(null); });
+$("e-save").addEventListener("click", saveEngine);
+$("sync-toggle").addEventListener("click", toggleSync);
+
+refreshState();
+</script>
+</body>
+</html>
+"""

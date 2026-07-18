@@ -18,6 +18,7 @@ import webbrowser
 from typing import Any
 
 from agitrack.git import GitRepo
+from agitrack.metrics import learn as learn_page
 from agitrack.metrics.collect import Dashboard, build_dashboard
 from agitrack.metrics.files import FileBrowser, git_browser
 from agitrack.metrics.insights import build_insights, context_from_browser
@@ -115,6 +116,18 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
                     "application/json",
                     self._json(self._browser(ref).file_diff(_str(query, "path"), _str(query, "sha"))),
                 )
+            elif parsed.path == "/learn":
+                # The learning page: the backend agent coaches the user from their own
+                # interaction traces (agitrack/metrics/learn.py). Chrome only; the page
+                # fetches /learn/state after paint, like the dashboard shell.
+                self._respond("text/html; charset=utf-8", learn_page.learn_html(self.repo.repo).encode("utf-8"))
+            elif parsed.path == "/learn/state":
+                payload = learn_page.learn_state(self.repo.repo, self.repo)
+                dash = self._dashboard(ref)
+                payload["committers"] = sorted({label for stat in dash.stats for label in dash.committers_of(stat)})
+                self._respond("application/json", self._json(payload))
+            elif parsed.path == "/learn/models":
+                self._respond("application/json", self._json(learn_page.model_options(_str(query, "backend"))))
             else:
                 self.send_error(404, "not found")
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
@@ -122,6 +135,40 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
             # by the next one, a refresh, or a closed tab. Harmless; don't let
             # http.server dump a traceback to the console aGiTrack is running in.
             pass
+
+    def do_POST(self) -> None:  # noqa: N802 (http.server API)
+        # All POST endpoints belong to the learning page. Bodies are JSON; a beacon
+        # flush (navigator.sendBeacon) may arrive without an application/json header,
+        # so the body is parsed regardless of content type. Every handler returns a
+        # JSON payload; agent failures come back as {"error": …} rather than a 500 so
+        # the page can show them in place.
+        try:
+            parsed = urllib.parse.urlparse(self.path)
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if 0 < length <= 1_000_000 else b""
+            try:
+                body = json.loads(raw.decode("utf-8", errors="replace") or "{}")
+            except json.JSONDecodeError:
+                body = {}
+            if not isinstance(body, dict):
+                body = {}
+            payload = learn_page.handle_learn_post(
+                parsed.path, body, root=self.repo.repo, repo=self.repo, view=self._learn_view
+            )
+            if payload is None:
+                self.send_error(404, "not found")
+                return
+            self._respond("application/json", self._json(payload))
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+
+    def _learn_view(self, author: str, frm: int, to: int) -> tuple[list, list[dict], list[dict]]:
+        """The filtered stats + insights + file rows the learning agent's digest is built
+        from: exactly the same slice the dashboard would show for this filter."""
+        dash = self._dashboard("HEAD")
+        stats = _filter_stats(dash, author=author, backend="", model="", frm=frm, to=to)
+        insights = self._insights("HEAD", author=author, frm=frm, to=to)
+        return stats, insights, self._browser("HEAD").files_payload()
 
     @staticmethod
     def _json(payload: dict) -> bytes:
