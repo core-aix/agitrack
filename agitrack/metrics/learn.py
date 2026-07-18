@@ -1622,7 +1622,7 @@ textarea{width:100%;min-height:74px;resize:vertical}
 .plist .plt{flex:1}
 .plist .pmeta{color:var(--fg-dim);font-size:11.5px;flex:none;display:flex;gap:6px;align-items:baseline}
 .plist .pldel{flex:none;background:none;border:none;color:var(--fg-dim);font:inherit;font-size:12px;
-  cursor:pointer;padding:2px 6px;border-radius:4px;opacity:0;visibility:hidden;transition:opacity .15s,color .15s}
+  cursor:pointer;padding:2px 6px;border-radius:4px;opacity:0;visibility:hidden;transition:color .15s}
 .plist .pl:hover .pldel,.plist .pldel:focus-visible{opacity:1;visibility:visible}
 .plist .pldel:hover{color:var(--bad)}
 .plist .pldel.armed{opacity:1;color:var(--bad);border:1px solid var(--bad)}
