@@ -1437,7 +1437,10 @@ def learn_backtrace_banner(directory: str) -> str:
     return (
         '<div class="btbanner">&#9194; BACKTRACE. This learning view is built from a reconstruction of past '
         f"coding-agent sessions in {_escape(directory)}: the coach's suggestions and lessons below are based on "
-        "that backtraced history, not aGiTrack's live repo tracking.</div>"
+        "that backtraced history, not aGiTrack's live repo tracking. "
+        "Tip: run <code>agitrack --backtrace commit</code> to bake this history into your git commit messages, "
+        "then launch your coding agent through <code>agitrack</code> and everything is fully tracked going "
+        "forward.</div>"
     )
 
 
@@ -1660,6 +1663,7 @@ footer{margin-top:46px;padding-top:18px;border-top:1px dashed var(--line);color:
 .btbanner{position:sticky;top:0;z-index:55;margin:0;padding:10px 18px;background:var(--panel);
   border-bottom:2px solid #5c4d28;color:var(--warn);font-size:12.5px;line-height:1.5;
   text-align:center;box-shadow:0 4px 16px rgba(0,0,0,.55)}
+.btbanner code{color:var(--fg);background:var(--panel2);padding:0 5px;border-radius:3px}
 footer code{color:var(--fg)}
 [hidden]{display:none !important}
 @media (max-width:600px){.cards{grid-template-columns:1fr}.bubble{max-width:100%}}
