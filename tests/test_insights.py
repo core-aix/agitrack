@@ -89,6 +89,7 @@ def test_background_task_markers_are_not_read_as_user_prompts():
     # never be counted as a repeated ask — that is the machine talking to itself, not the user.
     turns = [_turn(i, prompt=f"real task {i}") for i in range(20)]
     turns += [_turn(100 + i, prompt="(background task completed) (background task completed)") for i in range(4)]
+    turns += [_turn(200 + i, prompt="(background monitor update) (background monitor update)") for i in range(4)]
     insight = _by_key(build_insights(turns)).get("repeated-prompts")
     assert insight is None or all("background task" not in e.lower() for e in insight["evidence"])
 

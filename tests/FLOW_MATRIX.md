@@ -119,6 +119,14 @@ Conventions:
 | **Background backend exits → relaunch+resume; crash-loop → drop** | `test_background_session_relaunches_on_unexpected_exit_then_stops_after_crashloop` | mock |
 | Skip background git while an active merge is in progress | `test_service_background_skips_while_active_merge_in_progress` | mock |
 
+## 9a2. Background monitor ticks (deferred commits)
+| Sequence | Test(s) | Kind |
+|---|---|---|
+| Monitor `<event>` notification opens a turn labeled `(background monitor update)`; terminal/unknown notifications keep `(background task completed)` | `test_parse_rows_monitor_event_notification_gets_the_update_label`, `test_parse_rows_background_task_work_opens_its_own_turn` | mock |
+| Monitor-update-only completed turns are DEFERRED (no commit, watermark untouched) while the live loop runs | `test_finish_parse_defers_monitor_update_only_turns` | mock |
+| A substantive turn commits the deferred ticks in the SAME commit; exit finalize flushes tick-only sessions | `test_finish_parse_commits_monitor_updates_with_a_substantive_turn`, `test_finish_parse_exit_finalize_commits_monitor_update_only_turns` | mock |
+| Summarizer refusals ("I don't have any coding session turns...") are unusable, falling back to the prompt-led subject | `test_summarizer_raises_on_refusal_text`, `test_summary_first_person_content_is_still_usable` | mock |
+
 ## 9b. Headless background tracker (`-b`, issue #143)
 | Sequence | Test(s) | Kind |
 |---|---|---|

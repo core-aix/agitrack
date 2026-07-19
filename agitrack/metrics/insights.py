@@ -62,13 +62,14 @@ _MAX_PLAUSIBLE_TURN_SECONDS = 8 * 3600
 _SESSION_RE = re.compile(r"backend_session_id:\s*(\S+)")
 
 # Synthetic markers the transcript injects in place of a real user prompt. A turn the agent ran
-# off the back of a completed background task carries ``(background task completed)`` rather than
-# anything the user typed (see ``_BACKGROUND_TURN_LABEL`` in transcripts/claude.py). When several
-# such turns fold into one commit the label repeats. These are not user asks, so they must not be
-# read as prompts — otherwise the repeated-asks card "detects" the machine talking to itself. The
-# marker is stripped wherever it appears; whatever real text remains (a follow-up the user typed
-# after the background turn opened) is kept and analysed normally.
-_SYNTHETIC_PROMPT_MARKERS = ("(background task completed)",)
+# off the back of a background task carries ``(background task completed)`` (terminal) or
+# ``(background monitor update)`` (an intermediate monitor tick) rather than anything the user
+# typed (see ``BACKGROUND_PROMPT_LABELS`` in transcripts/claude.py). When several such turns fold
+# into one commit the labels repeat. These are not user asks, so they must not be read as
+# prompts — otherwise the repeated-asks card "detects" the machine talking to itself. The
+# markers are stripped wherever they appear; whatever real text remains (a follow-up the user
+# typed after the background turn opened) is kept and analysed normally.
+_SYNTHETIC_PROMPT_MARKERS = ("(background task completed)", "(background monitor update)")
 
 
 def _user_prompt(prompt: str) -> str:

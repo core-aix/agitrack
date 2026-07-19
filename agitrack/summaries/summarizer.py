@@ -92,6 +92,14 @@ _UNUSABLE_SUMMARY_RE = re.compile(
     r"|overloaded_error"
     r"|rate_limit_error"
     r"|authentication_error"
+    # Refusals: the model explaining it has nothing to summarize instead of summarizing
+    # (seen verbatim as commit subjects when a trace held only background-task markers:
+    # "I don't have any coding session turns or code diff to analyze.", "I cannot provide
+    # a meaningful summary...", "I don't have sufficient information..."). A real summary
+    # never opens in first person about its own inability.
+    r"|^\s*i\s+(?:cannot|can'?t|am\s+unable\s+to|won'?t\s+be\s+able\s+to)\b"
+    r"|^\s*i\s+(?:don'?t|do\s+not)\s+have\b"
+    r"|^\s*(?:unable|not\s+enough\s+information)\s+to\b"
     r")"
 )
 

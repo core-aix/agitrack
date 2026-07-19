@@ -660,6 +660,38 @@ def test_parse_rows_background_task_work_opens_its_own_turn():
     assert turns_after(session, "m1") == session.turns[1:]
 
 
+def test_parse_rows_monitor_event_notification_gets_the_update_label():
+    # A Monitor streams intermediate events from a still-running job: its notifications
+    # carry an <event> payload (and no terminal <status>). Such wake-ups get their own
+    # synthetic prompt label so the commit engine can DEFER them (one commit per monitor
+    # tick flooded a real repo with 100+ commits), while terminal notifications and
+    # unknown shapes keep the "completed" label — the conservative, commit-worthy default.
+    rows = [
+        _user("u1", "run the sweep and monitor it"),
+        _assistant("m1", "Monitoring.", stop_reason="end_turn"),
+        _user(
+            "tn1",
+            "<task-notification>\n<task-id>t1</task-id>\n"
+            '<summary>Monitor event: "sweep progress"</summary>\n<event>200/1200</event>\n</task-notification>',
+        ),
+        _assistant("m2", "Noted. Waiting for finals.", stop_reason="end_turn"),
+        _user(
+            "tn2",
+            "<task-notification>\n<task-id>t1</task-id>\n<status>completed</status>\n"
+            '<summary>Background command "sweep" completed (exit code 0)</summary>\n</task-notification>',
+        ),
+        _assistant("m3", "Sweep finished: 62.5% accuracy. Wrote results.", stop_reason="end_turn"),
+    ]
+
+    session = parse_rows("sess-monitor", rows)
+
+    assert [t.user_prompt for t in session.turns] == [
+        "run the sweep and monitor it",
+        "(background monitor update)",
+        "(background task completed)",
+    ]
+
+
 def test_parse_rows_background_notification_mid_turn_does_not_split():
     # A background task completing WHILE a turn is still in flight (the agent is mid-tool) must
     # not split the turn — the continued work is part of the ongoing turn, not a new one.

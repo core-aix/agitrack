@@ -310,7 +310,7 @@ def _find_by_id(items: list, item_id: str) -> dict[str, Any] | None:
 def _clean_prompt(text: str) -> str:
     # Strip synthetic background-task markers (they are not something the user typed)
     # and collapse whitespace; mirrors the insights module's handling.
-    text = text.replace("(background task completed)", " ")
+    text = text.replace("(background task completed)", " ").replace("(background monitor update)", " ")
     return re.sub(r"\s+", " ", text).strip()
 
 

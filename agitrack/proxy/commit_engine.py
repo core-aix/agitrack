@@ -117,6 +117,22 @@ def _is_slash_command(text: str | None) -> bool:
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 
+def _only_monitor_updates(turns) -> bool:
+    """Whether every one of these completed turns was triggered purely by an intermediate
+    background-monitor update (the ``(background monitor update)`` synthetic prompt) with
+    no real user text anywhere — the turns finish_parse_if_ready defers rather than
+    committing one history entry per monitor tick. Any real prompt (typed or queued) or a
+    terminal ``(background task completed)`` turn makes the batch commit-worthy."""
+    from agitrack.transcripts.claude import MONITOR_UPDATE_LABEL
+
+    for turn in turns:
+        prompts = [turn.user_prompt or "", *getattr(turn, "queued_followups", [])]
+        texts = [p.strip() for p in prompts if p and p.strip()]
+        if not texts or any(text != MONITOR_UPDATE_LABEL for text in texts):
+            return False
+    return True
+
+
 def _same_prompt(a: str, b: str) -> bool:
     """True when two recordings are the same user prompt.
 
@@ -636,6 +652,20 @@ class CommitEngine:
             return None, awaited
 
         complete_turns = [t for t in all_turns if t.final_response]
+        # Intermediate background-monitor ticks: a Monitor streaming events from a
+        # still-running job wakes the agent for each event, and every wake becomes its own
+        # turn (synthetic prompt, usually a one-line acknowledgment plus whatever files the
+        # monitored job just touched). Committing each tick floods the history — a real
+        # overnight session produced 100+ such commits — so while the live loop is running
+        # (``require_complete``) these turns are DEFERRED: the watermark stays put and they
+        # fold into the next substantive commit (a real prompt, a terminal task
+        # notification, or the exit finalize, which passes require_complete=False).
+        if require_complete and complete_turns and _only_monitor_updates(complete_turns):
+            debug_fn(
+                f"deferring agent commit: {len(complete_turns)} background monitor update turn(s) only "
+                f"session_id={new_session_id}"
+            )
+            return None, awaited
         last_turn = all_turns[-1] if all_turns else None
         if not complete_turns:
             # A user-cancelled turn (Esc) that produced no committable response
