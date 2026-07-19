@@ -189,6 +189,14 @@ class GlobalConfig:
             "check_for_updates": True,
             "share_max_transcript_bytes": DEFAULT_MAX_SHARED_BYTES,
             "timings": dict(DEFAULT_TIMINGS),
+            # --- routing (model router with preference learning) ---
+            "routing_mode": "off",  # off | suggest | auto
+            "routing_pool": [],  # list of {label, model, tier, local}; empty ⇒ auto-seed
+            "routing_allow_cloud": True,
+            "routing_exploration": 0.1,
+            "routing_min_margin": 0.05,
+            "routing_judge": True,
+            "routing_sync": False,
         }
 
     def seed_defaults(self) -> bool:
@@ -530,6 +538,106 @@ class GlobalConfig:
     @check_for_updates.setter
     def check_for_updates(self, value: bool) -> None:
         self.data["check_for_updates"] = bool(value)
+        self.save()
+
+    # --- routing ------------------------------------------------------------
+    #
+    # The router picks the coding model per session (or per turn, in headless
+    # modes) from a pool the user configures. ``routing_mode`` is the
+    # assertiveness: "off" = never switch, "suggest" = hint + manual switch
+    # via Ctrl-G, "auto" = switch in-TUI (PTI injection, with a relaunch
+    # fallback when the backend picker is unverifiable). The judge call is
+    # ON by default — it costs one extra small-model call per turn and is
+    # what lets the router learn anything.
+
+    @property
+    def routing_mode(self) -> str:
+        value = self._raw("routing_mode")
+        if isinstance(value, str) and value in ("off", "suggest", "auto"):
+            return value
+        return "off"
+
+    @routing_mode.setter
+    def routing_mode(self, value: str) -> None:
+        normalized = value if value in ("off", "suggest", "auto") else "off"
+        self.data["routing_mode"] = normalized
+        self.save()
+
+    @property
+    def routing_pool(self) -> list:
+        value = self._raw("routing_pool")
+        return value if isinstance(value, list) else []
+
+    @routing_pool.setter
+    def routing_pool(self, value: list) -> None:
+        self.data["routing_pool"] = list(value) if isinstance(value, list) else []
+        self.save()
+
+    @property
+    def routing_allow_cloud(self) -> bool:
+        value = self._raw("routing_allow_cloud")
+        return True if value is None else bool(value)
+
+    @routing_allow_cloud.setter
+    def routing_allow_cloud(self, value: bool) -> None:
+        self.data["routing_allow_cloud"] = bool(value)
+        self.save()
+
+    @property
+    def routing_exploration(self) -> float:
+        value = self._raw("routing_exploration")
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and 0.0 <= float(value) <= 1.0:
+            return float(value)
+        return 0.1
+
+    @routing_exploration.setter
+    def routing_exploration(self, value: float) -> None:
+        try:
+            f = float(value)
+        except (TypeError, ValueError):
+            return
+        self.data["routing_exploration"] = max(0.0, min(1.0, f))
+        self.save()
+
+    @property
+    def routing_min_margin(self) -> float:
+        value = self._raw("routing_min_margin")
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and 0.0 <= float(value) <= 1.0:
+            return float(value)
+        return 0.05
+
+    @routing_min_margin.setter
+    def routing_min_margin(self, value: float) -> None:
+        try:
+            f = float(value)
+        except (TypeError, ValueError):
+            return
+        self.data["routing_min_margin"] = max(0.0, min(1.0, f))
+        self.save()
+
+    @property
+    def routing_judge(self) -> bool:
+        # The judge call (cheap model, one extra bare invocation per turn) is on
+        # by default. Turning it off stops BOTH the judge signal and the per-turn
+        # cost — useful for users who don't want the router to learn anything.
+        value = self._raw("routing_judge")
+        return True if value is None else bool(value)
+
+    @routing_judge.setter
+    def routing_judge(self, value: bool) -> None:
+        self.data["routing_judge"] = bool(value)
+        self.save()
+
+    @property
+    def routing_sync(self) -> bool:
+        # Whether to push routing preferences to the shared orphan ref
+        # (refs/agitrack/routing-prefs), so they follow the user across machines.
+        value = self._raw("routing_sync")
+        return False if value is None else bool(value)
+
+    @routing_sync.setter
+    def routing_sync(self, value: bool) -> None:
+        self.data["routing_sync"] = bool(value)
         self.save()
 
     @property
