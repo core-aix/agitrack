@@ -189,20 +189,23 @@ def test_set_sync_without_repo_returns_error() -> None:
 
 def test_sync_prefs_round_trip(tmp_path: Path) -> None:
     """The full round-trip: write prefs on a 'machine A' clone, read them back
-    on a 'machine B' clone (same ref, no remote). Verifies the per-user
-    snapshot can travel through the orphan ref."""
+    on a 'machine B' clone. Verifies the per-user snapshot can travel through
+    the orphan ref."""
     import shutil
 
     base = tmp_path / "src-base"
     base.mkdir()
     src = _store(base)
-    # Make `src` a bare-ish remote: bare repos refuse pushes-with-lease but
-    # accept the standard fetch just fine. A `git fetch` from dst into a bare
-    # src pulls the refs.
+    # Make `src` a bare-ish remote: a bare clone of the same repo, which
+    # `sync_prefs_now` can push to.
     bare_src = tmp_path / "bare-src.git"
     bare_src.mkdir()
     subprocess.run(
         ["git", "clone", "--bare", str(src), str(bare_src)], check=True, capture_output=True
+    )
+    # Point src at bare_src so sync_prefs_now actually pushes.
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(bare_src)], cwd=src, check=True, capture_output=True
     )
     # Initial sync with an entry: write via record_event, then push.
     record_event(
@@ -220,12 +223,21 @@ def test_sync_prefs_round_trip(tmp_path: Path) -> None:
     # without a remote (the local ref carries the data).
     dst = tmp_path / "dst"
     shutil.copytree(src, dst)
-    # The state.json/src tree (incl. .agitrack/) is already copied. The ref
-    # ISN'T — that's the point: the restore should re-fetch from origin OR
-    # the local ref. Without a remote the restore relies on the local ref,
-    # which we just created on `src` — not on `dst`. So we simulate the
-    # cross-machine flow by copying the ref via `git fetch` from src into dst.
-    subprocess.run(["git", "remote", "add", "origin", str(bare_src)], cwd=dst, check=True)
+    # Wipe the inherited routing.json — a fresh clone wouldn't have it. The
+    # restore must re-fetch the prefs from the orphan ref, not from the
+    # copy-of-source's local file.
+    dst_state = dst / ".agitrack" / "routing.json"
+    if dst_state.exists():
+        dst_state.unlink()
+    # Strip the inherited remote: the dst is the "machine B" — it shouldn't
+    # already know about bare_src. Add it freshly so the test mirrors the
+    # real cross-machine flow (a clone of a remote, not a copy).
+    subprocess.run(
+        ["git", "remote", "remove", "origin"], cwd=dst, check=False, capture_output=True
+    )
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(bare_src)], cwd=dst, check=True, capture_output=True
+    )
     repo_dst = GitRepo.discover(dst)
     from agitrack.routing.store import restore_prefs_from_ref
 
@@ -244,13 +256,13 @@ def test_sync_prefs_round_trip(tmp_path: Path) -> None:
 def test_heuristic_correction_detects_explicit_negative() -> None:
     trace = (
         "## User\nAdd a button\n\n## Agent\nDone.\n\n"
-        "## User\nno, that's wrong, undo that\n"
+        "## User\nthis is wrong, please redo it\n"
     )
     found = heuristic_correction(trace)
     assert found is not None
     kind, evidence = found
     assert kind == "explicit_negative"
-    assert "wrong" in evidence or "undo" in evidence
+    assert "wrong" in evidence or "redo" in evidence
 
 
 def test_heuristic_correction_detects_redo() -> None:
@@ -661,7 +673,7 @@ def test_router_record_rating_uses_last_judgement(tmp_path: Path) -> None:
                 usable=True,
             )
 
-    router.record_judgement(trace="", judge=_FakeJudge(None), model="claude-haiku-4-5")
+    router.record_judgement(trace="", judge=_FakeJudge(), model="claude-haiku-4-5")
     router.record_rating(rating=5, model="claude-haiku-4-5")
     profile = load_profile(repo, user_id(repo, None))
     record = profile["models"]["claude-haiku-4-5"]

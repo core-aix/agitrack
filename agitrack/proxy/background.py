@@ -1051,6 +1051,29 @@ class BackgroundRunner:
         if not summary or not summary.strip():
             return None
         self._pending_cover_summary = summary
+        # Cover path: also run the judge so the router can learn from the
+        # agent's own self-committed work. The same summarizer instance is
+        # reused, so the token deltas line up with the summary call we just
+        # made. Best-effort: a judge failure must not block the cover.
+        try:
+            if self._routing_judge_enabled():
+                from agitrack.routing.judge import TurnJudge
+                from agitrack.routing.router import Router
+
+                router = Router(
+                    repo_root=self.repo.repo,
+                    backend=str(self.state.backend),
+                    global_config=self.global_config,
+                    debug_log=self._debug,
+                )
+                router.record_judgement(
+                    trace=trace_text,
+                    judge=TurnJudge(summarizer),
+                    session=str(getattr(self.state, "agitrack_session_id", "") or ""),
+                    model=self.state.model,
+                )
+        except Exception as error:
+            self._debug(f"cover judge failed: {error!r}")
         meta = summary_metadata_lines(
             model=summarizer.model,
             tokens_input=summarizer.tokens_input,
@@ -1084,7 +1107,35 @@ class BackgroundRunner:
                 self._manual.render_trailer()
             except Exception as error:
                 self._debug(f"summary note failed for {sha}: {error!r}")
+            # The summarizer-as-judge call: a structured quality signal from
+            # the same cheap model on the same worker thread. The daemon
+            # never amends HEAD, so the verdict is recorded on the routing
+            # store only — no notes, no commit-message changes. Disabled
+            # when the user has set ``routing_judge: false``.
+            try:
+                if self._routing_judge_enabled():
+                    from agitrack.routing.judge import TurnJudge
+                    from agitrack.routing.router import Router
+
+                    router = Router(
+                        repo_root=self.repo.repo,
+                        backend=str(self.state.backend),
+                        global_config=self.global_config,
+                        debug_log=self._debug,
+                    )
+                    router.record_judgement(
+                        trace=trace_text,
+                        judge=TurnJudge(summarizer),
+                        commit=full_sha,
+                        session=str(getattr(self.state, "agitrack_session_id", "") or ""),
+                        model=self.state.model,
+                    )
+            except Exception as error:
+                self._debug(f"background judge failed: {error!r}")
 
         thread = threading.Thread(target=worker, name="agit-bg-summary", daemon=True)
         self._summary_threads[full_sha] = thread
         thread.start()
+
+    def _routing_judge_enabled(self) -> bool:
+        return bool(getattr(self.global_config, "routing_judge", True))
