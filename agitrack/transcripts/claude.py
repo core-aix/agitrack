@@ -53,9 +53,15 @@ _COMMAND_TAGS = (
     "<task-notification>",
 )
 
-# Label for a turn that the agent ran in response to a completed background task (rather than
-# a user prompt). See `_is_task_notification` and `parse_rows`.
+# Labels for turns the agent ran in response to a harness `<task-notification>` rather than a
+# user prompt. Two kinds (see `_task_notification_kind`): a TERMINAL notification (the
+# backgrounded task finished or failed; carries a `<status>` tag) and an INTERMEDIATE monitor
+# update (a Monitor streaming an `<event>` while the task keeps running). The distinction
+# matters downstream: the commit engine defers monitor-update-only turns so a long-running
+# monitor doesn't flood the history with one commit per tick.
 _BACKGROUND_TURN_LABEL = "(background task completed)"
+MONITOR_UPDATE_LABEL = "(background monitor update)"
+BACKGROUND_PROMPT_LABELS = (_BACKGROUND_TURN_LABEL, MONITOR_UPDATE_LABEL)
 
 # A typed slash command is recorded as a synthetic user row carrying a
 # <command-name>/foo</command-name> artifact (see `_slash_command_name`). For
@@ -946,11 +952,12 @@ def parse_rows(
     # expanded-instructions row to open a turn. Cleared once a turn opens (from the
     # expansion or the next real prompt). See `_slash_command_name`.
     pending_command: str | None = None
-    # Set when a backgrounded task just completed (a `<task-notification>` row). It is not a
-    # prompt, but if the agent then does work off the back of it — with the prior turn already
-    # finished and no new user prompt in between — that work opens its own turn rather than
-    # being merged into the previous (already-committed) turn. See `_is_task_notification`.
-    pending_background = False
+    # Set when a `<task-notification>` row arrived ("completed" for a terminal notification,
+    # "update" for an intermediate monitor event; None otherwise). It is not a prompt, but if
+    # the agent then does work off the back of it — with the prior turn already finished and no
+    # new user prompt in between — that work opens its own turn rather than being merged into
+    # the previous (already-committed) turn. See `_task_notification_kind`.
+    pending_background: str | None = None
     # Per-session running content of each edited file, so a Write/Edit's diff is the incremental
     # change vs the previous turn, not the whole file every time (only used when collect_edits).
     file_state: dict[str, str] = {}
@@ -987,11 +994,12 @@ def parse_rows(
                 # prompt, but a token-affecting event. Tally it for the next turn.
                 pending_compactions += 1
                 continue
-            if _is_task_notification(row):
-                # A backgrounded task completed. Not a prompt; defer to the assistant branch,
-                # which opens a NEW turn for any work the agent does in response (so it is
-                # committed and attributed on its own, not folded into the prior turn).
-                pending_background = True
+            notification_kind = _task_notification_kind(row)
+            if notification_kind is not None:
+                # A backgrounded task reported back. Not a prompt; defer to the assistant
+                # branch, which opens a NEW turn for any work the agent does in response (so
+                # it is committed and attributed on its own, not folded into the prior turn).
+                pending_background = notification_kind
                 continue
             command = _slash_command_name(row)
             if command is not None:
@@ -1011,7 +1019,7 @@ def parse_rows(
                     continue
                 prompt = pending_command
             pending_command = None
-            pending_background = False  # a real prompt supersedes a pending background-task turn
+            pending_background = None  # a real prompt supersedes a pending background-task turn
             flush()
             current = {
                 "user_id": str(row.get("uuid") or ""),
@@ -1074,7 +1082,7 @@ def parse_rows(
                 flush()
                 current = {
                     "user_id": str(row.get("uuid") or ""),
-                    "prompt": _BACKGROUND_TURN_LABEL,
+                    "prompt": MONITOR_UPDATE_LABEL if pending_background == "update" else _BACKGROUND_TURN_LABEL,
                     "final": "",
                     "assistant_id": "",
                     "model": model,
@@ -1088,7 +1096,7 @@ def parse_rows(
                     "messages": [],
                 }
                 pending_compactions = 0
-            pending_background = False
+            pending_background = None
             message = _as_dict(row.get("message"))
             if stamp is not None:
                 current["ended_at"] = stamp
@@ -1378,11 +1386,17 @@ def _user_prompt(row: dict) -> str | None:
     return text
 
 
-def _is_task_notification(row: dict) -> bool:
-    # The harness injects a `<task-notification>` user row when a shell/task the agent
-    # backgrounded (its output reported back later, while the user kept chatting) completes.
-    # It is not a prompt, but the agent usually ACTS on it — so parse_rows can open a fresh
-    # turn for that work instead of merging it into the prior, already-committed turn.
+def _task_notification_kind(row: dict) -> str | None:
+    """``"completed"``/``"update"`` for a harness `<task-notification>` user row, else None.
+
+    The harness injects these rows when a task the agent backgrounded reports back. Two
+    shapes exist: a TERMINAL notification (the task completed or failed) carries a
+    ``<status>…</status>`` tag, while an INTERMEDIATE monitor update (a Monitor streaming
+    events from a still-running job) carries an ``<event>`` payload and no status. Neither
+    is a prompt, but the agent usually ACTS on them — so parse_rows opens a fresh turn for
+    that work instead of merging it into the prior, already-committed turn; the kind decides
+    the turn's synthetic prompt label (and thereby the commit engine's defer-vs-commit
+    choice for monitor ticks)."""
     message = _as_dict(row.get("message"))
     content = message.get("content")
     if isinstance(content, str):
@@ -1392,8 +1406,14 @@ def _is_task_notification(row: dict) -> bool:
             block.get("text", "") for block in content if isinstance(block, dict) and block.get("type") == "text"
         ).strip()
     else:
-        return False
-    return text.startswith("<task-notification>")
+        return None
+    if not text.startswith("<task-notification>"):
+        return None
+    # Only an explicit ``<event>`` payload marks an intermediate monitor tick; anything
+    # else (a ``<status>`` completion/failure, or an unknown shape from another harness
+    # version) is treated as terminal — the conservative default, since deferring a
+    # commit is the riskier misclassification.
+    return "update" if "<event>" in text else "completed"
 
 
 def _slash_command_name(row: dict) -> str | None:

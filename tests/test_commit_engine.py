@@ -829,6 +829,119 @@ def _make_finish_helpers(tmp_path, session, exported_session, *, last_message_id
     return engine, state, commits, commit_fn
 
 
+def test_finish_parse_defers_monitor_update_only_turns(tmp_path):
+    # A Monitor tick wakes the agent, it acknowledges, the turn completes — but committing
+    # every tick floods the history (a real overnight session produced 100+ such commits).
+    # While the live loop runs (require_complete), monitor-update-only turns are deferred:
+    # no commit, watermark untouched, so they fold into the next substantive commit.
+    session = Session.bare()
+    exported = ExportedSession(
+        "ses-mon",
+        "m",
+        None,
+        [
+            SessionTurn(
+                "tn1",
+                "a1",
+                "(background monitor update)",
+                "Noted. Waiting for finals.",
+                TokenUsage(total=1, output=1),
+                None,
+            ),
+            SessionTurn(
+                "tn2", "a2", "(background monitor update)", "Still running.", TokenUsage(total=1, output=1), None
+            ),
+        ],
+    )
+    engine, state, commits, commit_fn = _make_finish_helpers(tmp_path, session, exported)
+
+    result, _ = engine.finish_parse_if_ready(
+        session=session,
+        quiet=True,
+        prompt_untracked=False,
+        require_complete=True,
+        awaited_followups=[],
+        agent_is_active_fn=lambda: False,
+        debug_fn=lambda *a, **k: None,
+        note_session_change_fn=lambda sid: None,
+        mirror_fn=lambda sid: None,
+        commit_fn=commit_fn,
+    )
+    assert result is None and commits == []
+    # The watermark did not advance: the deferred turns will be re-exported next parse.
+    assert state.backend_message_id_for("ses-mon") is None
+
+
+def test_finish_parse_commits_monitor_updates_with_a_substantive_turn(tmp_path):
+    # Once a substantive turn lands (here: the terminal task-completed turn), the deferred
+    # monitor ticks ride along in the SAME commit instead of their own.
+    session = Session.bare()
+    exported = ExportedSession(
+        "ses-mon2",
+        "m",
+        None,
+        [
+            SessionTurn("tn1", "a1", "(background monitor update)", "Noted.", TokenUsage(total=1, output=1), None),
+            SessionTurn(
+                "tn2",
+                "a2",
+                "(background task completed)",
+                "Sweep done: wrote results.",
+                TokenUsage(total=2, output=2),
+                None,
+            ),
+        ],
+    )
+    engine, state, commits, commit_fn = _make_finish_helpers(tmp_path, session, exported)
+
+    result, _ = engine.finish_parse_if_ready(
+        session=session,
+        quiet=True,
+        prompt_untracked=False,
+        require_complete=True,
+        awaited_followups=[],
+        agent_is_active_fn=lambda: False,
+        debug_fn=lambda *a, **k: None,
+        note_session_change_fn=lambda sid: None,
+        mirror_fn=lambda sid: None,
+        commit_fn=commit_fn,
+    )
+    assert result is True and len(commits) == 1
+    assert [t.user_prompt for t in commits[0]["turns"]] == [
+        "(background monitor update)",
+        "(background task completed)",
+    ]
+
+
+def test_finish_parse_exit_finalize_commits_monitor_update_only_turns(tmp_path):
+    # The exit finalize (require_complete=False) must flush deferred monitor turns so a
+    # session that only ever ticked still leaves nothing uncommitted behind.
+    session = Session.bare()
+    exported = ExportedSession(
+        "ses-mon3",
+        "m",
+        None,
+        [
+            SessionTurn("tn1", "a1", "(background monitor update)", "Noted.", TokenUsage(total=1, output=1), None),
+        ],
+    )
+    engine, state, commits, commit_fn = _make_finish_helpers(tmp_path, session, exported)
+
+    result, _ = engine.finish_parse_if_ready(
+        session=session,
+        quiet=True,
+        prompt_untracked=False,
+        require_complete=False,
+        awaited_followups=[],
+        agent_is_active_fn=lambda: False,
+        debug_fn=lambda *a, **k: None,
+        note_session_change_fn=lambda sid: None,
+        mirror_fn=lambda sid: None,
+        commit_fn=commit_fn,
+    )
+    assert result is True and len(commits) == 1
+
+
 def test_finish_parse_returns_none_when_no_result(tmp_path):
     state = AgitrackState(tmp_path)
     session = Session.bare()
