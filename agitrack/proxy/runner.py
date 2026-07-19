@@ -4245,8 +4245,6 @@ class ProxyRunner:
         Returns ``_MENU_UP`` on Esc (back to the Ctrl-G palette) or
         ``_MENU_DONE`` after a context transition (a switch)."
         """
-        from agitrack.routing import Router
-        from agitrack.routing.policy import PoolEntry
         from agitrack.summaries.model_select import list_available_models
 
         router = self._routing_router()
@@ -4265,17 +4263,13 @@ class ProxyRunner:
             self._debug(f"pool build failed: {error!r}")
             pool = []
         if not pool:
-            self._set_message(
-                "No models in the routing pool. Add entries under 'routing_pool' in settings."
-            )
+            self._set_message("No models in the routing pool. Add entries under 'routing_pool' in settings.")
             self._render()
             return self._MENU_DONE
         # Build the menu. The current model is marked; the router's top
         # recommendation (if different) carries a "router suggests" badge.
         try:
-            decision = router.decide(
-                available_models=available, current_model=self.state.model
-            )
+            decision = router.decide(available_models=available, current_model=self.state.model)
         except Exception as error:
             self._debug(f"routing decide failed: {error!r}")
             decision = None
@@ -4316,9 +4310,7 @@ class ProxyRunner:
         self._routing_consider_switch(previous=previous, new=new_model, auto=False)
         return self._MENU_DONE
 
-    def _routing_consider_switch(
-        self, *, previous: str | None, new: str, auto: bool
-    ) -> None:
+    def _routing_consider_switch(self, *, previous: str | None, new: str, auto: bool) -> None:
         """Apply a model switch. In TUI mode, inject the backend's model-switch
         command between turns (only when the agent is idle). When the agent
         is still working — or the injection can't be verified — fall back to
@@ -4333,9 +4325,7 @@ class ProxyRunner:
             # submit path: until then, state.model is set so the NEXT turn
             # uses the new model. No need to relaunch; the user just sees a
             # hint that the switch is queued.
-            self._set_message(
-                f"Switched to {new} for the next turn (current turn is still running)."
-            )
+            self._set_message(f"Switched to {new} for the next turn (current turn is still running).")
             self._render()
             return
         # Try the in-TUI switch first. ``agitrack.routing.switch.plan_for``
@@ -4364,9 +4354,7 @@ class ProxyRunner:
             # id pinned, so a relaunch is one clean restart.
             self._restart_agent(f"Switching to {new}")
         if auto:
-            self._set_message(
-                f"Router switched {previous or '(unset)'} → {new} (auto).", seconds=8.0
-            )
+            self._set_message(f"Router switched {previous or '(unset)'} → {new} (auto).", seconds=8.0)
         else:
             self._set_message(f"Switched to {new}.", seconds=8.0)
         self._render()
@@ -8678,7 +8666,7 @@ class ProxyRunner:
         # anything should be able to silence it).
         return bool(getattr(self.global_config, "routing_judge", True))
 
-    def _routing_router(self):
+    def _routing_router(self) -> Any:
         """The :class:`agitrack.routing.router.Router` facade for this runner.
         Constructed lazily on first use, so the per-test make_runner path
         doesn't pay the cost when the feature is off. The router never
@@ -8694,11 +8682,11 @@ class ProxyRunner:
         # ``self.base_repo.repo`` is the actual git repo (a GitRepo); the
         # router only needs the path for its on-disk store. Tests that build
         # a runner without a real repo should keep routing off.
-        repo_root: Path | None
+        repo_root: Path | None = None
         try:
             repo_root = Path(self.base_repo.repo)  # type: ignore[attr-defined]
         except Exception:
-            repo_root = None
+            pass
         if repo_root is None:
             return None  # type: ignore[return-value]
         router = Router(
@@ -8729,6 +8717,7 @@ class ProxyRunner:
             return
         try:
             from agitrack.summaries.model_select import list_available_models
+
             available = list_available_models(self.state.backend)
         except Exception:
             available = []
@@ -9195,9 +9184,7 @@ class ProxyRunner:
 
             try:
                 raw = getattr(self.global_config, "routing_pool", [])
-                entries = pool_from_config(raw) if raw else default_pool_for_backend(
-                    self.state.backend, []
-                )
+                entries = pool_from_config(raw) if raw else default_pool_for_backend(self.state.backend, [])
             except Exception:
                 entries = []
             if not entries:

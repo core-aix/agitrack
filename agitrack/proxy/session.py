@@ -15,7 +15,7 @@ removes that layer and moves call sites to ``runner.active.<field>``.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from agitrack.config import AgitrackState
@@ -121,6 +121,11 @@ class Session:
         _last_agent_commit_id: "str | None"
         _commit_merged_pending: bool
         _commit_summarized: bool
+        # Routing: the most recent judge verdict for the current session.
+        # Read by the next-turn policy to set task features; set by the
+        # summary worker thread after the judge call completes. Lives on
+        # the session so a background session keeps its own verdict.
+        _routing_last_judge: "Any | None"  # agitrack.routing.judge.JudgeResult
 
     def __init__(self, **fields) -> None:
         # Typed as the platform-agnostic ChildProcess contract: a freshly-constructed
@@ -219,4 +224,5 @@ class Session:
             "turn": 0,
             "merge_ctx": None,
             "_base_branch": None,
+            "_routing_last_judge": None,
         }

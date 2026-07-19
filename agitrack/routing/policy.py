@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import math
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Iterable
 
 # The score assigned to a model with NO data — the cold-start prior. Tuned
@@ -259,10 +259,7 @@ def choose(
     # reason about "stay where you are" vs switching to a new one.
     if current is not None and not any(entry.model == current.model for entry in candidates):
         candidates.append(current)
-    scores = [
-        _score_for_model(entry, profile, task, exploration=exploration, rng=rng)
-        for entry in candidates
-    ]
+    scores = [_score_for_model(entry, profile, task, exploration=exploration, rng=rng) for entry in candidates]
     # Greedy winner by final score.
     scores_sorted = sorted(scores, key=lambda s: s.final, reverse=True)
     chosen_score = scores_sorted[0]
@@ -276,11 +273,7 @@ def choose(
         (s for s in scores if current is not None and s.model == current.model),
         None,
     )
-    margin = (
-        chosen_score.final - current_score.final
-        if current_score is not None
-        else float("inf")
-    )
+    margin = chosen_score.final - current_score.final if current_score is not None else float("inf")
     explored = bool(current is not None and chosen_score.model != current.model and margin < min_margin * 2)
     if current is not None and chosen_score.model == current.model:
         return RoutingDecision(

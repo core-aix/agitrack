@@ -10,16 +10,13 @@ machinery level, not the backend CLI.
 
 from __future__ import annotations
 
-import json
 import random
 import subprocess
 from pathlib import Path
 
-import pytest
 
-from agitrack.backends.base import AgentResult, TokenUsage
 from agitrack.routing import Router
-from agitrack.routing.policy import PoolEntry, TaskFeatures
+from agitrack.routing.policy import TaskFeatures
 
 
 # ---------------------------------------------------------------------------
