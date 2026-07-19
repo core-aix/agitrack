@@ -8,13 +8,10 @@ backends-and-config tests.
 
 from __future__ import annotations
 
-import json
 import subprocess
 from pathlib import Path
-from typing import Any
 from unittest.mock import patch
 
-import pytest
 
 from agitrack.config import GlobalConfig
 from agitrack.config.state import AgitrackState
@@ -204,6 +201,7 @@ def test_record_routing_discard_swallows_errors(tmp_path: Path) -> None:
     with patch.object(runner, "_routing_router", return_value=None):
         # The helper should silently no-op when no router is available.
         runner._record_routing_discard()
+
     # And: a router that raises must also be tolerated.
     class _RaisingRouter:
         def record_discard(self, **_):

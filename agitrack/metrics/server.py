@@ -180,7 +180,7 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
             # Routing endpoints first (they're small, /learn has more).
             if parsed.path == "/routing/rate":
                 rating = body.get("rating", 0)
-                payload = routing_page.post_rate(
+                payload: dict[str, Any] | None = routing_page.post_rate(
                     self.repo.repo,
                     self.repo,
                     rating=rating,
@@ -188,6 +188,8 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
                     task_class=body.get("task_class"),
                     complexity=body.get("complexity"),
                 )
+                if payload is None:
+                    payload = {"error": "rate handler returned no payload"}
                 self._respond("application/json", self._json(payload))
                 return
             if parsed.path == "/routing/sync":
@@ -198,6 +200,8 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
                     current = routing_page.routing_state(self.repo.repo, self.repo)
                     enabled = not bool(current.get("sync", {}).get("enabled"))
                 payload = routing_page.post_sync(self.repo.repo, self.repo, enabled=bool(enabled))
+                if payload is None:
+                    payload = {"error": "sync handler returned no payload"}
                 self._respond("application/json", self._json(payload))
                 return
             payload = learn_page.handle_learn_post(
