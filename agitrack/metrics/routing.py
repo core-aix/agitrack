@@ -18,16 +18,13 @@ store's orphan-ref sync.
 
 from __future__ import annotations
 
-import json
 import threading
-import time
 from pathlib import Path
 from typing import Any
 
 from agitrack.git import GitRepo
 from agitrack.routing.store import (
     EVENT_KIND_RATING,
-    RoutingStore,
     load_events,
     load_profile,
     maybe_sync,
@@ -35,7 +32,6 @@ from agitrack.routing.store import (
     restore_prefs_from_ref,
     set_sync as store_set_sync,
     sync_info,
-    sync_prefs_now,
     user_id,
 )
 
@@ -156,9 +152,7 @@ def routing_html(root: Path, *, banner_html: str = "") -> str:
         f"<header class='routing-header'>{banner}<h1>Model routing</h1>"
         "<p>Per-model quality signals aGiTrack has learned from your sessions. "
         "Use the rating widget to teach the router which model to prefer for each kind of task.</p>"
-        "</header>"
-        + _ROUTING_BODY
-        + "</body></html>"
+        "</header>" + _ROUTING_BODY + "</body></html>"
     )
 
 

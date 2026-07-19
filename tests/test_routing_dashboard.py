@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import json
 import subprocess
 from pathlib import Path
 
-import pytest
 
 from agitrack.routing import record_event
 from agitrack.routing.store import SignalEvent
@@ -36,6 +34,7 @@ def test_routing_state_returns_profile(tmp_path: Path) -> None:
     # The user_id resolution goes through the real gh CLI; record under the
     # resolved id so the test passes in any environment.
     from agitrack.routing.store import user_id
+
     me = user_id(repo, GitRepo.discover(repo))
     record_event(
         repo,

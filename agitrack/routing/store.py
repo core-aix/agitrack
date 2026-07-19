@@ -163,7 +163,7 @@ class RoutingStore:
 # The kind of event recorded in the store. Centralised so the dashboard and
 # the policy read the same vocabulary. New kinds MUST be added here (and
 # handled in :func:`update_quality_from_event`) — the dashboard filters
-#/groups on them, so a typo would silently drop signals.
+# /groups on them, so a typo would silently drop signals.
 EVENT_KIND_RATING = "rating"
 EVENT_KIND_JUDGE_CORRECTION = "judge_correction"
 EVENT_KIND_JUDGE_ACCEPT = "judge_accept"

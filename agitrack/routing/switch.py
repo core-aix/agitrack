@@ -106,6 +106,7 @@ def plan_for(backend: str, model: str) -> SwitchPlan:
 
 # --- Safety ------------------------------------------------------------------
 
+
 # Anything that isn't printable ASCII or common punctuation can confuse
 # the TUI textbox (or, worse, get interpreted as a control sequence). We
 # allow the model id through but strip non-printables so a misconfigured
@@ -114,10 +115,7 @@ def _safe_terminal_text(text: str) -> str:
     if not text:
         return ""
     # Allow letters, digits, slashes, dashes, underscores, dots, colons, plus.
-    allowed = set(
-        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        "0123456789/-_.:+@ "
-    )
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/-_.:+@ ")
     return "".join(ch if ch in allowed else "" for ch in text)
 
 

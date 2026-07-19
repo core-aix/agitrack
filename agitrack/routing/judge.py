@@ -165,7 +165,7 @@ def _parse_judge_json(text: str) -> JudgeResult | None:
     if text.startswith("{") and text.endswith("}"):
         try:
             parsed = json.loads(text)
-        except json.JSONError:
+        except json.JSONDecodeError:
             parsed = None
     else:
         parsed = None
@@ -176,13 +176,13 @@ def _parse_judge_json(text: str) -> JudgeResult | None:
             return None
         try:
             parsed = json.loads(match.group(0))
-        except json.JSONError:
+        except json.JSONDecodeError:
             return None
     if not isinstance(parsed, dict):
         return None
     task_class = _coerce(parsed.get("task_class"), TASK_CLASSES, "other")
     complexity = _coerce(parsed.get("complexity"), COMPLEXITY_LEVELS, "small")
-    correction = _coerce(parsed.get("correction"), _VALID_CORRECTIONS, "none")
+    correction = _coerce(parsed.get("correction"), tuple(_VALID_CORRECTIONS), "none")
     evidence_raw = parsed.get("evidence")
     evidence = evidence_raw.strip()[:280] if isinstance(evidence_raw, str) else ""
     return JudgeResult(
@@ -224,11 +224,7 @@ _JUDGE_SYSTEM = (
     '"evidence": "<short phrase from the trace that justifies your verdict, max 25 words>"}'
 )
 
-_JUDGE_USER_TEMPLATE = (
-    "Interaction trace:\n"
-    "{trace}\n\n"
-    "Classify this turn. Output JSON only."
-)
+_JUDGE_USER_TEMPLATE = "Interaction trace:\n{trace}\n\nClassify this turn. Output JSON only."
 
 
 class TurnJudge:

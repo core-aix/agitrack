@@ -185,6 +185,31 @@ Conventions:
 | Share-behind → overwrite + reshare / cancel | `test_share_behind_offers_overwrite_and_reshares`, `_cancel_leaves_shared_copy_untouched` | real-git |
 | Unshare (confirm, retries, fallbacks, lineage) | `test_unshare_*` | real-git |
 
+## 12a. Model router with preference learning (issue #143 interactive-UI-agnostic tracker; `agitrack/routing/`, `tests/test_routing*.py`)
+
+The router picks the **coding model** per session/turn from the active backend's own model list (Claude → Anthropic tiers; OpenCode → whatever providers are configured, including a local Ollama `qwen3:27b`). It learns from:
+
+* the **summarizer-as-judge** — the same small model that writes the commit summary also extracts a structured verdict (task class, complexity, explicit correction) from the interaction trace on the same worker thread (no extra round-trip when the trace contains an obvious "no, that's wrong");
+* **explicit ratings** (1-5) via `Ctrl-G → rate` or the dashboard's `/routing` panel;
+* **implicit signals** from the runner: cancelled+discarded turns, `git revert` of an agent commit, redo follow-ups, post-agent user edits.
+
+Per-(model, task-class) quality lives in `.agitrack/routing.json` (git-ignored, per-user keyed by GitHub id, with the same optional orphan-ref sync as `learning.json`: `refs/agitrack/routing-prefs`). Three modes: `off` (default — the judge still runs, but no switches), `suggest` (status-bar hint + Ctrl-G `model` picker), `auto` (also between turns, inject the backend's own model-switch command into the PTY; falls back to relaunching the session on the new model). Pool topology follows the user's active backend: Claude pool = the curated tiers; OpenCode pool = the user's configured OpenCode providers (incl. a local Ollama).
+
+| Sequence | Test(s) | Kind |
+|---|---|---|
+| Routing store: per-user profiles, EMA quality per model and per (model, task class); ring buffer caps events; sync-eligible | `tests/test_routing.py::test_store_*`, `test_record_event_*`, `test_per_task_class_ema_*`, `test_event_ring_buffer_trims` | real-git |
+| Prefs sync: orphan ref `refs/agitrack/routing-prefs` per-fingerprint + per-GitHub-id; cross-machine restore on empty local profile; never overwrites non-empty local | `test_sync_prefs_round_trip` | real-git |
+| Judge: heuristic short-circuit on loud negative traces; JSON parse tolerance (prose around, missing keys, unknown values coerced); schema validation; never raises | `test_heuristic_*`, `test_parse_judge_json_*`, `test_judge_uses_heuristic_without_backend_call` | unit |
+| Policy: cold-start prior, cost penalty, Thompson exploration, per-class EMA blending at ≥3 samples, `off` / `suggest` / `auto` modes, `allow_cloud` filter, `min_margin` | `test_choose_*`, `test_default_pool_for_backend_*`, `test_pool_from_config_*` | unit |
+| Router facade: pool building, decide, judge recording, rating using the last verdict's task class, swallowed errors | `test_router_*` | unit |
+| Signals: rating/discard/cancel/revert/redo/post-edit/switch/reroute recorders; corrupt-store tolerance (must never raise) | `tests/test_routing_signals.py::*` | real-git |
+| In-TUI switch plans: Claude `/model <name>`, OpenCode `ctrl+x m` sequence, sanitisation of unsafe characters, unknown backend raises | `test_switch_plan_*` | unit |
+| Runner integration: routing helpers short-circuit when off, settings menu exposes routing keys, model menu Esc returns cleanly, model menu's "router suggests" badge | `tests/test_routing_proxy.py::*` | mock |
+| Dashboard `/routing`: per-model quality table, event feed, rating widget, sync toggle; the page works without a git remote (sync reported unavailable) | `tests/test_routing_dashboard.py::*` | real-git |
+| Implicit signals wired: cancelled→cancel, discarded→discard (strongest negative), judge_correction, judge_accept (weak positive) | `test_record_discard_drag_quality_down`, `test_router_quality_ema_moves_with_explicit_ratings`, `test_record_routing_discard_swallows_errors` | real-git |
+| Policy outcome over many trials: a data-rich model beats a data-poor one in 19/20 trials; Thompson sampling visits every model at least once | `test_router_learns_from_judge_and_rates_higher`, `test_router_exploration_finds_unknown_models_eventually` | unit |
+| Per-class routing: with ≥3 per-class samples on "debug", the per-class EMA dominates the model-wide one | `test_router_task_features_route_per_class` | unit |
+
 ## 12b. Learning page (dashboard `/learn`, `tests/test_learn.py`)
 The dashboard's learning coach: the user opens `/learn`, taps how much time they have (5/15/30 min)
 and how they feel (fresh/okay/tired), optionally picks whose traces to learn from (their own,
