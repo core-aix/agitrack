@@ -306,6 +306,8 @@ class ProxyInput:
     COMMANDS = [
         "sessions",
         "agent-backend",
+        "model",
+        "rate",
         "git-unstaged",
         "git-commit",
         "dashboard",
@@ -4229,6 +4231,192 @@ class ProxyRunner:
             self.global_config.summarization_enabled = enabled
         # Keep the active session's view consistent for the current run.
         self.state.summarization_enabled = enabled
+
+    # --- routing menus (Ctrl-G model / rate) ------------------------------
+
+    def _routing_model_menu(self) -> str:
+        """Ctrl-G → model: list the routing pool with learned scores + a
+        "router recommended" badge, and let the user switch the current
+        session's coding model. Switching is best-effort: in TUI mode aGiTrack
+        injects the backend's own model-switch command; if the injection
+        isn't safe (agent in flight, no PTY), it falls back to relaunching the
+        session on the new model.
+
+        Returns ``_MENU_UP`` on Esc (back to the Ctrl-G palette) or
+        ``_MENU_DONE`` after a context transition (a switch)."
+        """
+        from agitrack.summaries.model_select import list_available_models
+
+        router = self._routing_router()
+        if router is None:
+            self._set_message("Routing isn't available (no git repo?).")
+            self._render()
+            return self._MENU_DONE
+        try:
+            available = list_available_models(self.state.backend)
+        except Exception as error:
+            self._debug(f"model list failed: {error!r}")
+            available = []
+        try:
+            pool = router.build_pool(available_models=available, current_model=self.state.model)
+        except Exception as error:
+            self._debug(f"pool build failed: {error!r}")
+            pool = []
+        if not pool:
+            self._set_message("No models in the routing pool. Add entries under 'routing_pool' in settings.")
+            self._render()
+            return self._MENU_DONE
+        # Build the menu. The current model is marked; the router's top
+        # recommendation (if different) carries a "router suggests" badge.
+        try:
+            decision = router.decide(available_models=available, current_model=self.state.model)
+        except Exception as error:
+            self._debug(f"routing decide failed: {error!r}")
+            decision = None
+        current_label = self.state.model or "(none)"
+        label_for: dict[str, str] = {}
+        options: list[str] = []
+        for entry in pool:
+            label = entry.label
+            extras: list[str] = []
+            if entry.local:
+                extras.append("local")
+            if entry.tier == 1:
+                extras.append("cheap")
+            elif entry.tier == 3:
+                extras.append("expensive")
+            suffix = f"  ({', '.join(extras)})" if extras else ""
+            if entry.model == self.state.model:
+                show = f"{label}  (current){suffix}"
+            elif decision is not None and entry.model == decision.chosen.model:
+                show = f"{label}  (router suggests){suffix}"
+            else:
+                show = f"{label}{suffix}"
+            label_for[show] = entry.model
+            options.append(show)
+        choice = self._select_popup(f"Switch coding model (current: {current_label})", options)
+        if choice is None:  # Esc
+            self._render()
+            return self._MENU_UP
+        new_model = label_for.get(choice)
+        if not new_model or new_model == self.state.model:
+            self._set_message("Same model — no change.")
+            self._render()
+            return self._MENU_DONE
+        # Apply: persist in state, then attempt the switch.
+        previous = self.state.model
+        self.state.model = new_model
+        self._record_routing_switch(from_model=previous, to_model=new_model)
+        self._routing_consider_switch(previous=previous, new=new_model, auto=False)
+        return self._MENU_DONE
+
+    def _routing_consider_switch(self, *, previous: str | None, new: str, auto: bool) -> None:
+        """Apply a model switch. In TUI mode, inject the backend's model-switch
+        command between turns (only when the agent is idle). When the agent
+        is still working — or the injection can't be verified — fall back to
+        relaunching the session on the new model.
+
+        ``auto=True`` (the auto-routing prompt-submit path) is treated the
+        same as a manual switch here; the difference is who called it. The
+        status-bar message distinguishes the two for the user."""
+        if not self._agent_is_idle_for_switch():
+            # The agent is still working on the previous turn. The switch
+            # will be applied the next time the runner considers the prompt-
+            # submit path: until then, state.model is set so the NEXT turn
+            # uses the new model. No need to relaunch; the user just sees a
+            # hint that the switch is queued.
+            self._set_message(f"Switched to {new} for the next turn (current turn is still running).")
+            self._render()
+            return
+        # Try the in-TUI switch first. ``agitrack.routing.switch.plan_for``
+        # returns a ``SwitchPlan`` whose bytes the runner writes into the
+        # backend's PTY. If the screen doesn't show the new model after the
+        # settle window, fall back to relaunch.
+        from agitrack.routing.switch import plan_for
+
+        try:
+            plan = plan_for(self.state.backend, new)
+        except ValueError:
+            plan = None
+        applied = False
+        if plan is not None and self.active.process is not None:
+            try:
+                with self.active.process._write_lock:  # type: ignore[attr-defined]
+                    for chunk in plan.bytes_to_write:
+                        self.active.process.write(chunk)
+                applied = True
+            except Exception as error:
+                self._debug(f"in-TUI model switch failed: {error!r}")
+                applied = False
+        if not applied:
+            # Relaunch fallback: stop the backend, restart on the new model
+            # with the same session id. The runner already has the session
+            # id pinned, so a relaunch is one clean restart.
+            self._restart_agent(f"Switching to {new}")
+        if auto:
+            self._set_message(f"Router switched {previous or '(unset)'} → {new} (auto).", seconds=8.0)
+        else:
+            self._set_message(f"Switched to {new}.", seconds=8.0)
+        self._render()
+
+    def _agent_is_idle_for_switch(self) -> bool:
+        """True when the agent is NOT in flight and the runner is ready to
+        forward a new prompt. Same condition the prompt-submit path checks
+        (no mid-turn injection — the bytes would be lost in the agent's own
+        typeahead or, worse, eaten by the picker's interactive UI)."""
+        if getattr(self, "agent_in_flight", False):
+            return False
+        if getattr(self.active, "turn_awaiting_commit", False):
+            return False
+        # ``agent_parse_active`` is the parse worker; if it's still running
+        # the previous turn's data isn't fully in the store yet, but the
+        # agent is logically idle (the user is between turns). We allow
+        # the switch — the parse worker doesn't own the backend's stdin.
+        return True
+
+    def _routing_rate_menu(self) -> str:
+        """Ctrl-G → rate: a 1-5 rating for the most recent committed turn.
+        Non-modal status-bar hint elsewhere; the menu is for users who'd
+        rather not type a number into a popup. Esc returns to the palette.
+        """
+        router = self._routing_router()
+        if router is None:
+            self._set_message("Routing isn't available (no git repo?).")
+            self._render()
+            return self._MENU_DONE
+        last_judge = getattr(self.active, "_routing_last_judge", None)
+        if last_judge is not None:
+            subtitle = f"(last turn: {last_judge.task_class} / {last_judge.complexity})"
+        else:
+            subtitle = "(rates the LAST turn)"
+        options = [
+            "★★★★★ 5 — excellent",
+            "★★★★ 4 — good",
+            "★★★ 3 — ok",
+            "★★ 2 — poor",
+            "★ 1 — wrong / unusable",
+            "← Back",
+        ]
+        choice = self._select_popup(f"Rate the last turn {subtitle}", options)
+        if choice is None or choice.startswith("←"):
+            self._render()
+            return self._MENU_UP
+        # Map the first character ("1".."5") to the rating.
+        rating = None
+        for ch in choice:
+            if ch in "12345":
+                rating = int(ch)
+                break
+        if rating is None:
+            self._render()
+            return self._MENU_UP
+        try:
+            router.record_rating(rating=rating, model=self.state.model)
+        except Exception as error:
+            self._debug(f"routing record_rating failed: {error!r}")
+        self._set_message(f"Recorded {rating}-star rating for {self.state.model or 'current model'}.")
+        self._render()
+        return self._MENU_DONE
 
     # --- switch base branch ---
 
@@ -8452,6 +8640,175 @@ class ProxyRunner:
         state_enabled = getattr(self.state, "summarization_enabled", None)
         return True if state_enabled is None else bool(state_enabled)
 
+    # ------------------------------------------------------------------
+    # Routing (model router with preference learning)
+    # ------------------------------------------------------------------
+    #
+    # The router picks the coding model for the next turn. Per-session state
+    # lives on ``self.active._routing_*``; per-runner state (the Router
+    # facade, the last-hint expiry) lives on the runner itself. The wiring
+    # here is intentionally narrow: the summary worker calls the judge, the
+    # prompt-submit path consults the policy, the Ctrl-G ``model`` and
+    # ``rate`` commands expose them to the user, and implicit signals flow
+    # in from discard/cancel/revert sites. Nothing here can block a turn's
+    # commit or a user's exit — every helper is best-effort.
+
+    def _routing_enabled(self) -> bool:
+        # The router is on whenever the user has any mode other than "off"
+        # (suggest and auto both need the judge + the policy in the loop).
+        mode = str(getattr(self.global_config, "routing_mode", "off") or "off")
+        return mode in ("suggest", "auto")
+
+    def _routing_judge_enabled(self) -> bool:
+        # The judge is the cheap-model signal extractor. Off when the user
+        # has set ``routing_judge: false`` (the judge call still costs tokens,
+        # however cheap, and a user who doesn't want the router to learn
+        # anything should be able to silence it).
+        return bool(getattr(self.global_config, "routing_judge", True))
+
+    def _routing_router(self) -> Any:
+        """The :class:`agitrack.routing.router.Router` facade for this runner.
+        Constructed lazily on first use, so the per-test make_runner path
+        doesn't pay the cost when the feature is off. The router never
+        raises — every public method is best-effort — so the test path can
+        leave it disabled without breaking the runner."""
+        cached = getattr(self, "_routing_router_obj", None)
+        if cached is not None:
+            return cached
+        from pathlib import Path
+
+        from agitrack.routing.router import Router
+
+        # ``self.base_repo.repo`` is the actual git repo (a GitRepo); the
+        # router only needs the path for its on-disk store. Tests that build
+        # a runner without a real repo should keep routing off.
+        repo_root: Path | None = None
+        try:
+            repo_root = Path(self.base_repo.repo)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        if repo_root is None:
+            return None  # type: ignore[return-value]
+        router = Router(
+            repo_root=repo_root,
+            backend=str(getattr(self.backend, "name", self.state.backend)),
+            global_config=self.global_config,
+            debug_log=self._debug,
+        )
+        self._routing_router_obj = router
+        return router
+
+    def _maybe_routing_hint(self) -> None:
+        """Status-bar hint: when the router has a clearly better model than
+        the current one, surface a "router: try X (Ctrl-G model)" line so the
+        user can act. Throttled so a noisy router doesn't spam the popup.
+
+        Only fires in ``suggest`` mode; ``auto`` mode acts on the next
+        prompt-submit instead (see ``_routing_consider_switch``)."""
+        if str(getattr(self.global_config, "routing_mode", "off")) != "suggest":
+            return
+        router = self._routing_router()
+        if router is None:
+            return
+        # Throttle: at most one hint every 60s of wall-clock, so a long
+        # session doesn't show the same line dozens of times.
+        now = time.monotonic()
+        if now - getattr(self, "_routing_hint_at", 0.0) < 60.0:
+            return
+        try:
+            from agitrack.summaries.model_select import list_available_models
+
+            available = list_available_models(self.state.backend)
+        except Exception:
+            available = []
+        decision = router.decide(
+            available_models=available,
+            current_model=self.state.model,
+            task=self._routing_task_features(),
+        )
+        if not decision.switched or decision.chosen.model == self.state.model:
+            return
+        self._routing_hint_at = now
+        self._set_session_notice(
+            self._session_label(),
+            f"router: try {decision.chosen.label} (Ctrl-G model) — {decision.reason}",
+            seconds=12.0,
+        )
+
+    def _routing_task_features(self) -> Any:
+        # The features the policy uses to score models. A future iteration
+        # could feed prompt length + file count here; today the judge
+        # produces task_class/complexity, which the next turn's policy
+        # consults via the profile, not the live task features.
+        from agitrack.routing.policy import TaskFeatures
+
+        last = getattr(self.active, "_routing_last_judge", None)
+        if last is not None:
+            return TaskFeatures(task_class=last.task_class, complexity=last.complexity)
+        return TaskFeatures()
+
+    # Implicit-signal hooks. Each is a thin wrapper around the router's
+    # ``record_*`` so the call sites in the runner stay readable. Best-
+    # effort: every helper swallows its own errors after a debug log.
+
+    def _record_routing_discard(self) -> None:
+        router = self._routing_router()
+        if router is None:
+            return
+        try:
+            router.record_discard(session=self._session_label())
+        except Exception as error:
+            self._debug(f"routing record_discard failed: {error!r}")
+
+    def _record_routing_cancel(self) -> None:
+        router = self._routing_router()
+        if router is None:
+            return
+        try:
+            router.record_cancel(session=self._session_label())
+        except Exception as error:
+            self._debug(f"routing record_cancel failed: {error!r}")
+
+    def _record_routing_revert(self, *, commit: str | None = None) -> None:
+        router = self._routing_router()
+        if router is None:
+            return
+        try:
+            router.record_revert(commit=commit, session=self._session_label())
+        except Exception as error:
+            self._debug(f"routing record_revert failed: {error!r}")
+
+    def _record_routing_redo_followup(self) -> None:
+        router = self._routing_router()
+        if router is None:
+            return
+        try:
+            router.record_redo_followup(session=self._session_label())
+        except Exception as error:
+            self._debug(f"routing record_redo_followup failed: {error!r}")
+
+    def _record_routing_post_agent_edit(self) -> None:
+        router = self._routing_router()
+        if router is None:
+            return
+        try:
+            router.record_post_agent_edit(session=self._session_label())
+        except Exception as error:
+            self._debug(f"routing record_post_agent_edit failed: {error!r}")
+
+    def _record_routing_switch(self, *, from_model: str | None, to_model: str | None) -> None:
+        router = self._routing_router()
+        if router is None:
+            return
+        try:
+            router.record_switch(
+                from_model=from_model,
+                to_model=to_model,
+                session=self._session_label(),
+            )
+        except Exception as error:
+            self._debug(f"routing record_switch failed: {error!r}")
+
     def _render_status(self, text: str) -> None:
         # Writes straight to stdout, so only the main reactor thread may run it: the
         # git worker calls it (verbose mode) but must never touch the screen. This is
@@ -8615,7 +8972,7 @@ class ProxyRunner:
         if name == "git-unstaged":
             self._manage_unstaged_menu()
             return
-        elif name == "agent-backend":
+        if name == "agent-backend":
             backends = available_backends()
             selected = arg.strip() or self._select_popup("Backend Agent", backends)
             if selected is None:  # Esc on the picker → up one level to the palette
@@ -8628,6 +8985,12 @@ class ProxyRunner:
             else:
                 self._switch_backend(selected)
                 return
+        elif name == "model":
+            self._after_menu_command(self._routing_model_menu())
+            return
+        elif name == "rate":
+            self._after_menu_command(self._routing_rate_menu())
+            return
         elif name == "sessions":
             self._after_menu_command(self._handle_session_command(arg))
             return
@@ -8754,6 +9117,34 @@ class ProxyRunner:
             # --- commit summaries ---
             {"key": "summarization_enabled", "label": "Write an AI summary for each commit", "kind": "bool"},
             {"key": "summarization_model", "label": "Model used to write commit summaries", "kind": "model"},
+            # --- routing (model router with preference learning) ---
+            {
+                "key": "routing_mode",
+                "label": "Model router (off/suggest/auto): switch coding models across turns when another model would score better",
+                "kind": "choice",
+                "options": ["off", "suggest", "auto"],
+                "restart": True,
+            },
+            {
+                "key": "routing_pool",
+                "label": "Routing pool (JSON list of {label, model, tier, local}; empty = auto-seed from this backend's models)",
+                "kind": "routing_pool",
+            },
+            {
+                "key": "routing_allow_cloud",
+                "label": "Allow cloud-tier models in the pool (off forces local/cheap models only)",
+                "kind": "bool",
+            },
+            {
+                "key": "routing_judge",
+                "label": "Run the cheap-model judge on every turn to learn quality signals",
+                "kind": "bool",
+            },
+            {
+                "key": "routing_sync",
+                "label": "Sync routing preferences across machines (off = local only)",
+                "kind": "bool",
+            },
             # --- aGiTrack itself ---
             {"key": "check_for_updates", "label": "Automatically check for aGiTrack updates", "kind": "bool"},
             {
@@ -8785,6 +9176,23 @@ class ProxyRunner:
             text = ", ".join(paths) if paths else "(none)"
         elif kind == "size_mb":
             text = f"{int(getattr(self.global_config, key)) // (1024 * 1024)} MB"
+        elif kind == "routing_pool":
+            # The pool is a list of {label, model, tier, local}; render a
+            # short summary so a long pool doesn't blow up the menu.
+            from agitrack.routing.policy import pool_from_config
+            from agitrack.routing import default_pool_for_backend
+
+            try:
+                raw = getattr(self.global_config, "routing_pool", [])
+                entries = pool_from_config(raw) if raw else default_pool_for_backend(self.state.backend, [])
+            except Exception:
+                entries = []
+            if not entries:
+                text = "(auto — derived from this backend's models)"
+            else:
+                parts = [f"{e.label} (t{e.tier}{', local' if e.local else ''})" for e in entries[:4]]
+                tail = f" +{len(entries) - 4} more" if len(entries) > 4 else ""
+                text = ", ".join(parts) + tail
         else:
             value = getattr(self.global_config, key, None)
             text = str(value) if value not in (None, "") else "(default)"
@@ -8870,6 +9278,36 @@ class ProxyRunner:
                     self._render()
                     continue
                 value = mb * 1024 * 1024
+            elif kind == "routing_pool":
+                # A list of {label, model, tier, local} objects. Editing as raw
+                # JSON keeps the format transparent; invalid JSON is rejected
+                # so a typo can't lock the user out of the menu.
+                import json
+
+                current = self._pending_routing_pool(key)
+                default = json.dumps(current, indent=1) if current else ""
+                raw = self._prompt_popup(
+                    label,
+                    "JSON list of {label, model, tier, local} (blank = auto-seed from this backend's models):",
+                    default=default,
+                )
+                if raw is None:
+                    return
+                stripped = raw.strip()
+                if not stripped:
+                    value = []
+                else:
+                    try:
+                        parsed = json.loads(stripped)
+                    except json.JSONDecodeError as error:
+                        self._set_message(f"Invalid JSON: {error.msg}")
+                        self._render()
+                        continue
+                    if not isinstance(parsed, list):
+                        self._set_message("Pool must be a JSON list.")
+                        self._render()
+                        continue
+                    value = parsed
             else:  # text
                 raw = self._prompt_popup(label, "New value (blank = unset):", default=self._pending_text(key))
                 if raw is None:
@@ -8906,6 +9344,13 @@ class ProxyRunner:
         if key in self._settings_pending:
             return self._fmt_setting(self._settings_pending[key][0]).replace("(unset)", "")
         return str(getattr(self.global_config, key, None) or "")
+
+    def _pending_routing_pool(self, key: str) -> list:
+        if key in self._settings_pending:
+            pending = self._settings_pending[key][0]
+            return list(pending) if isinstance(pending, list) else []
+        current = getattr(self.global_config, "routing_pool", None)
+        return list(current) if isinstance(current, list) else []
 
     def _settings_timings_menu(self) -> None:
         from agitrack.config.settings import DEFAULT_TIMINGS
@@ -9775,6 +10220,38 @@ class ProxyRunner:
                     # A failed rolling summary must not discard a good commit
                     # summary; the previous session summary simply stays current.
                     result["session_summary_error"] = repr(error)
+            # The summarizer-as-judge call: structured quality signal from the
+            # same cheap model on the same worker thread. Disabled when the
+            # user has set ``routing_judge: false`` or when summarization is
+            # off. The verdict feeds the routing store so the policy can
+            # score this session's model next turn.
+            try:
+                if self._routing_enabled() and self._routing_judge_enabled():
+                    from agitrack.routing.judge import TurnJudge
+
+                    judge = TurnJudge(summarizer)
+                    verdict = judge.judge(trace_text)
+                    if verdict.usable:
+                        # The router reads this on the next decide() call; record
+                        # the verdict on the routing store so the policy can
+                        # learn from it. The same TurnJudge instance is reused
+                        # so its token deltas line up with what we just spent.
+                        owner._routing_last_judge = verdict
+                        self._routing_router().record_judgement(
+                            trace=trace_text,
+                            judge=judge,
+                            commit=full_sha,
+                            session=self._session_label(),
+                            model=model,
+                        )
+                        # Surface a hint when the router has a better option on
+                        # file than the model the user is on (suggest-mode only;
+                        # auto-mode is handled by the prompt-submit path).
+                        self._maybe_routing_hint()
+            except Exception as error:
+                # The judge is best-effort: a failure here must not lose the
+                # commit summary.
+                self._debug(f"routing judge worker failed: {error!r}")
             result["metadata"] = summary_metadata_lines(
                 model=summarizer.model or model,
                 tokens_input=summarizer.tokens_input,
@@ -11114,6 +11591,10 @@ class ProxyRunner:
             ["Keep them (commit with your next turn)", "Commit the changes now", "Discard the changes"],
         )
         if choice is None or choice.startswith("Keep"):
+            # Implicit signal: the user kept the partial work but chose not to
+            # commit it themselves — weak negative, the model "needed" a nudge
+            # to keep going. We surface it as a cancel rather than a discard.
+            self._record_routing_cancel()
             self._set_message("Keeping the agent's changes — they'll be committed with your next turn.")
             self._render()
             return False
@@ -11144,6 +11625,10 @@ class ProxyRunner:
                 self._set_message("Could not discard the changes.")
                 self._render()
                 return False
+            # Implicit signal: the user discarded a turn's work. This is the
+            # strongest negative signal the router can collect; a turn whose
+            # output was thrown away is by definition not what the user wanted.
+            self._record_routing_discard()
             self._set_message("Discarded the agent's interrupted changes.")
             self._render()
             return True

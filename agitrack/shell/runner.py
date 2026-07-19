@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+from typing import Any
 
 from agitrack.commits import AgitrackActions
 from agitrack.backends.setup import BackendUnavailable, backend_installed, ensure_installed_backend, install_hint
@@ -356,6 +357,23 @@ class AgitrackShell:
                 print("User changes detected before agent runs.")
             self.actions.create_user_commit()
 
+        # Per-turn headless routing: when the router is in "auto" mode, the
+        # shell (json/bridge) mode is the only path with per-call model
+        # control. "suggest" mode surfaces a hint via the bridge/status
+        # instead of switching — interactive users get the Ctrl-G palette.
+        routing_decision = self._routing_decide_headless(prompt=prompt)
+        if routing_decision is not None and routing_decision.switched:
+            previous = self.state.model
+            self.state.model = routing_decision.chosen.model
+            self._emit(
+                {
+                    "type": "routing_switch",
+                    "from": previous,
+                    "to": routing_decision.chosen.model,
+                    "reason": routing_decision.reason,
+                }
+            )
+
         backend = self._backend()
         self.state.append_trace("user", prompt)
         result = backend.run(
@@ -459,6 +477,30 @@ class AgitrackShell:
                 except Exception as error:
                     if self.verbose:
                         print(f"Session summary update failed: {error}")
+                # The summarizer-as-judge call: structured quality signal from
+                # the same cheap model on the same summarizer instance. Best-
+                # effort: a judge failure must not block the commit.
+                try:
+                    if getattr(self.global_config, "routing_judge", True):
+                        from agitrack.routing.judge import TurnJudge
+                        from agitrack.routing.router import Router
+
+                        router = Router(
+                            repo_root=self.repo.repo,
+                            backend=str(self.state.backend),
+                            global_config=self.global_config,
+                            debug_log=(lambda msg: self._debug(msg)) if hasattr(self, "_debug") else None,
+                        )
+                        router.record_judgement(
+                            trace=trace_text,
+                            judge=TurnJudge(summarizer),
+                            commit=commit_sha,
+                            session=self.state.session_id,
+                            model=self.state.model,
+                        )
+                except Exception as error:
+                    if self.verbose:
+                        print(f"Routing judge failed: {error}")
 
             print("Created <aGiTrack> commit.")
             self._emit({"type": "commit", "sha": commit_sha, "session": self.state.session_id})
@@ -498,6 +540,37 @@ class AgitrackShell:
         if backend_class is None:
             raise RuntimeError(f"Unsupported backend: {self.state.backend}")
         return backend_class(summary_scratch_dir(), verbose=self.verbose, launch_command=self._launch_command() or None)
+
+    def _routing_decide_headless(self, *, prompt: str) -> Any:
+        """Per-turn routing for the headless shell path. Only fires in
+        ``auto`` mode — ``suggest`` mode surfaces a hint via the bridge
+        without switching. Returns the routing decision (the runner acts on
+        it) or None when routing is off."""
+        mode = str(getattr(self.global_config, "routing_mode", "off") or "off")
+        if mode not in ("suggest", "auto"):
+            return None
+        try:
+            from agitrack.routing.router import Router
+            from agitrack.summaries.model_select import list_available_models
+
+            router = Router(
+                repo_root=self.repo.repo,
+                backend=str(self.state.backend),
+                global_config=self.global_config,
+                debug_log=(lambda msg: self._debug(msg)) if hasattr(self, "_debug") else None,
+            )
+            try:
+                available = list_available_models(self.state.backend)
+            except Exception:
+                available = []
+            return router.decide(
+                available_models=available,
+                current_model=self.state.model,
+            )
+        except Exception as error:
+            if self.verbose:
+                print(f"Routing decide failed: {error}")
+            return None
 
     def _handle_pre_compaction(self) -> None:
         if self.verbose:

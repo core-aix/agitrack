@@ -19,6 +19,7 @@ from typing import Any
 
 from agitrack.git import GitRepo
 from agitrack.metrics import learn as learn_page
+from agitrack.metrics import routing as routing_page
 from agitrack.metrics.collect import Dashboard, build_dashboard
 from agitrack.metrics.files import FileBrowser, git_browser
 from agitrack.metrics.insights import build_insights, context_from_browser
@@ -137,6 +138,20 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
                 self._respond("application/json", self._json(payload))
             elif parsed.path == "/learn/models":
                 self._respond("application/json", self._json(learn_page.model_options(_str(query, "backend"))))
+            elif parsed.path == "/routing":
+                # The routing panel: per-model learned scores, event feed, and
+                # a rating widget. Same shape as /learn: a paint-then-fetch
+                # HTML page; all data lives in /routing/state.
+                self._respond(
+                    "text/html; charset=utf-8",
+                    routing_page.routing_html(self.repo.repo).encode("utf-8"),
+                    cache_control="no-cache",
+                )
+            elif parsed.path == "/routing/state":
+                self._respond(
+                    "application/json",
+                    self._json(routing_page.routing_state(self.repo.repo, self.repo)),
+                )
             else:
                 self.send_error(404, "not found")
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
@@ -146,11 +161,12 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
             pass
 
     def do_POST(self) -> None:  # noqa: N802 (http.server API)
-        # All POST endpoints belong to the learning page. Bodies are JSON; a beacon
-        # flush (navigator.sendBeacon) may arrive without an application/json header,
-        # so the body is parsed regardless of content type. Every handler returns a
-        # JSON payload; agent failures come back as {"error": …} rather than a 500 so
-        # the page can show them in place.
+        # The learning and routing pages share the JSON POST surface. Bodies
+        # are JSON; a beacon flush (navigator.sendBeacon) may arrive without
+        # an application/json header, so the body is parsed regardless of
+        # content type. Every handler returns a JSON payload; failures come
+        # back as {"error": …} rather than a 500 so the page can show them
+        # in place.
         try:
             parsed = urllib.parse.urlparse(self.path)
             length = int(self.headers.get("Content-Length") or 0)
@@ -161,6 +177,33 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
                 body = {}
             if not isinstance(body, dict):
                 body = {}
+            # Routing endpoints first (they're small, /learn has more).
+            if parsed.path == "/routing/rate":
+                rating = body.get("rating", 0)
+                payload: dict[str, Any] | None = routing_page.post_rate(
+                    self.repo.repo,
+                    self.repo,
+                    rating=rating,
+                    model=body.get("model"),
+                    task_class=body.get("task_class"),
+                    complexity=body.get("complexity"),
+                )
+                if payload is None:
+                    payload = {"error": "rate handler returned no payload"}
+                self._respond("application/json", self._json(payload))
+                return
+            if parsed.path == "/routing/sync":
+                enabled = body.get("enabled")
+                if enabled is None:
+                    # No explicit "enabled": treat the POST as a toggle based
+                    # on the current state.
+                    current = routing_page.routing_state(self.repo.repo, self.repo)
+                    enabled = not bool(current.get("sync", {}).get("enabled"))
+                payload = routing_page.post_sync(self.repo.repo, self.repo, enabled=bool(enabled))
+                if payload is None:
+                    payload = {"error": "sync handler returned no payload"}
+                self._respond("application/json", self._json(payload))
+                return
             payload = learn_page.handle_learn_post(
                 parsed.path, body, root=self.repo.repo, repo=self.repo, view=self._learn_view
             )

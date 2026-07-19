@@ -234,6 +234,8 @@ In interactive mode (default), press `Ctrl-G` to open aGiTrack's menu, then pick
 ```text
 sessions                  switch / start (own worktree) / stop a live session
 agent-backend             switch backend (opencode|claude); shows a picker
+model                     pick a different coding model (when routing is on)
+rate                      record a 1-5 rating for the last turn (feeds the router)
 git-unstaged              show intentionally unstaged files
 git-commit                commit your changes (folds in pending agent turns in --manual-commits mode)
 dashboard                 serve the metrics dashboard and open it in the browser
