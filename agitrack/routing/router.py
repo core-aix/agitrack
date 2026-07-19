@@ -21,16 +21,12 @@ from __future__ import annotations
 
 import logging
 import random
-import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable
 
-from agitrack.routing import policy
-from agitrack.routing import signals as signals_module
 from agitrack.routing.judge import JudgeResult, TurnJudge
 from agitrack.routing.policy import (
-    ModelScore,
     PoolEntry,
     RoutingDecision,
     TaskFeatures,
@@ -38,20 +34,8 @@ from agitrack.routing.policy import (
     default_pool_for_backend,
     pool_from_config,
 )
-from agitrack.routing.signals import (
-    record_cancel,
-    record_discard,
-    record_post_agent_edit,
-    record_rating,
-    record_redo_followup,
-    record_reroute,
-    record_revert,
-    record_switch,
-)
 from agitrack.routing.store import (
     EVENT_KIND_JUDGE_ACCEPT,
-    EVENT_KIND_JUDGE_CORRECTION,
-    RoutingStore,
     SignalEvent,
     load_profile,
     maybe_sync,
@@ -323,9 +307,7 @@ class Router:
     def record_redo_followup(self, *, commit: str | None = None, session: str | None = None) -> None:
         self._record_implicit("redo_followup", commit=commit, session=session)
 
-    def record_post_agent_edit(
-        self, *, commit: str | None = None, session: str | None = None
-    ) -> None:
+    def record_post_agent_edit(self, *, commit: str | None = None, session: str | None = None) -> None:
         self._record_implicit("post_agent_edit", commit=commit, session=session)
 
     def record_switch(

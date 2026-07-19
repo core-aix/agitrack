@@ -434,6 +434,8 @@ flowchart TD
   g(["Ctrl-G"]) --> pal[/"Command palette"/]
   pal --> sessions["sessions"]
   pal --> backend["agent-backend"]
+  pal --> model["model"]
+  pal --> rate["rate"]
   pal --> summ["summarizer"]
   pal --> settings2["settings"]
   pal --> gunstaged["git-unstaged"]
@@ -462,6 +464,11 @@ flowchart TD
 
   backend -->|No arg, picker| bpick[/"Pick claude or opencode"/]
   bpick --> bswitch[["Save current backend's session, relaunch target backend, restore its last session, update global default"]]
+
+  model -->|Routing enabled| mpick[/"List the routing pool with learned scores; current + 'router suggests' badges"/]
+  mpick -->|Pick a model| mswitch[["Inject the backend's model-switch command into the PTY (Claude /model, OpenCode ctrl+x m); relaunch fallback if injection can't be verified"]]
+
+  rate -->|Rating 1-5| rrecord[["Record an explicit 1-5 rating against the last turn's (model, task_class, complexity) cell; updates the routing store"]]
 
   summ --> smm[/"Summarizer menu: Toggle (ON/OFF) / Set model"/]
   smm -->|Toggle| stog[["Flip on/off; menu re-shows"]]

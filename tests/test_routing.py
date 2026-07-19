@@ -7,7 +7,6 @@ the proxy/background runners is covered in test_routing_integration.py.
 
 from __future__ import annotations
 
-import json
 import random
 import subprocess
 import tempfile
@@ -18,9 +17,7 @@ import pytest
 
 from agitrack.routing import (
     EVENT_KIND_DISCARD,
-    EVENT_KIND_JUDGE_CORRECTION,
     EVENT_KIND_RATING,
-    EVENT_KIND_REVERT,
     RoutingStore,
     SignalEvent,
     SwitchPlan,
@@ -31,17 +28,14 @@ from agitrack.routing import (
     plan_for,
     pool_from_config,
     record_event,
-    routing_scratch_dir,
     set_sync,
     sync_info,
     sync_prefs_now,
-    synced_users,
     user_id,
 )
 from agitrack.routing.judge import TurnJudge, heuristic_correction, _parse_judge_json
 from agitrack.routing.policy import PoolEntry
 from agitrack.routing.router import Router, build_pool
-from agitrack.routing.switch import plan_for as switch_plan_for
 
 
 # -----------------------------------------------------------------------------
@@ -200,13 +194,9 @@ def test_sync_prefs_round_trip(tmp_path: Path) -> None:
     # `sync_prefs_now` can push to.
     bare_src = tmp_path / "bare-src.git"
     bare_src.mkdir()
-    subprocess.run(
-        ["git", "clone", "--bare", str(src), str(bare_src)], check=True, capture_output=True
-    )
+    subprocess.run(["git", "clone", "--bare", str(src), str(bare_src)], check=True, capture_output=True)
     # Point src at bare_src so sync_prefs_now actually pushes.
-    subprocess.run(
-        ["git", "remote", "add", "origin", str(bare_src)], cwd=src, check=True, capture_output=True
-    )
+    subprocess.run(["git", "remote", "add", "origin", str(bare_src)], cwd=src, check=True, capture_output=True)
     # Initial sync with an entry: write via record_event, then push.
     record_event(
         src,
@@ -232,12 +222,8 @@ def test_sync_prefs_round_trip(tmp_path: Path) -> None:
     # Strip the inherited remote: the dst is the "machine B" — it shouldn't
     # already know about bare_src. Add it freshly so the test mirrors the
     # real cross-machine flow (a clone of a remote, not a copy).
-    subprocess.run(
-        ["git", "remote", "remove", "origin"], cwd=dst, check=False, capture_output=True
-    )
-    subprocess.run(
-        ["git", "remote", "add", "origin", str(bare_src)], cwd=dst, check=True, capture_output=True
-    )
+    subprocess.run(["git", "remote", "remove", "origin"], cwd=dst, check=False, capture_output=True)
+    subprocess.run(["git", "remote", "add", "origin", str(bare_src)], cwd=dst, check=True, capture_output=True)
     repo_dst = GitRepo.discover(dst)
     from agitrack.routing.store import restore_prefs_from_ref
 
@@ -254,10 +240,7 @@ def test_sync_prefs_round_trip(tmp_path: Path) -> None:
 
 
 def test_heuristic_correction_detects_explicit_negative() -> None:
-    trace = (
-        "## User\nAdd a button\n\n## Agent\nDone.\n\n"
-        "## User\nthis is wrong, please redo it\n"
-    )
+    trace = "## User\nAdd a button\n\n## Agent\nDone.\n\n## User\nthis is wrong, please redo it\n"
     found = heuristic_correction(trace)
     assert found is not None
     kind, evidence = found
@@ -307,7 +290,6 @@ def test_parse_judge_json_rejects_garbage() -> None:
 def test_judge_uses_heuristic_without_backend_call() -> None:
     """The TurnJudge should short-circuit on a loud negative trace and never
     instantiate a backend — saving a round-trip per obviously-bad turn."""
-    from agitrack.routing.judge import TurnJudge
 
     class _NoBackend:
         def run(self, *args, **kwargs):  # pragma: no cover - should never be called
