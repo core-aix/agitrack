@@ -872,6 +872,81 @@ def test_finish_parse_defers_monitor_update_only_turns(tmp_path):
     assert state.backend_message_id_for("ses-mon") is None
 
 
+def test_finish_parse_commits_substantive_monitor_turn_immediately(tmp_path):
+    # The final report of a monitored job often arrives ON a monitor wake-up, so its turn
+    # carries the update label. A NORMAL final message (substantive response, real output)
+    # must commit immediately, without waiting for a terminal notification, another
+    # prompt, or any background-task horizon; only trivial tick acknowledgments defer.
+    session = Session.bare()
+    report = (
+        "Sweep finished: 62.5% accuracy on the eval set, 80% on the probe. I wrote the "
+        "full comparison to results/ANALYSIS.md, updated the plots, and the cap-fifo "
+        "variant is the clear winner; unbounded memory plateaus after 4.4k tokens. "
+        "Next I suggest rerunning the 2b model with the tuned eviction threshold."
+    )
+    exported = ExportedSession(
+        "ses-mon-final",
+        "m",
+        None,
+        [
+            SessionTurn("tn1", "a1", "(background monitor update)", "Noted.", TokenUsage(total=1, output=1), None),
+            SessionTurn("tn2", "a2", "(background monitor update)", report, TokenUsage(total=900, output=900), None),
+        ],
+    )
+    engine, state, commits, commit_fn = _make_finish_helpers(tmp_path, session, exported)
+
+    result, _ = engine.finish_parse_if_ready(
+        session=session,
+        quiet=True,
+        prompt_untracked=False,
+        require_complete=True,
+        awaited_followups=[],
+        agent_is_active_fn=lambda: False,
+        debug_fn=lambda *a, **k: None,
+        note_session_change_fn=lambda sid: None,
+        mirror_fn=lambda sid: None,
+        commit_fn=commit_fn,
+    )
+    assert result is True and len(commits) == 1
+    assert len(commits[0]["turns"]) == 2  # the deferred tick rides along
+
+
+def test_finish_parse_commits_monitor_turn_with_heavy_output_despite_short_reply(tmp_path):
+    # A monitor turn that did real work (tool calls, edits) but closed with a terse reply:
+    # the output tokens betray the work, so it commits rather than deferring.
+    session = Session.bare()
+    exported = ExportedSession(
+        "ses-mon-work",
+        "m",
+        None,
+        [
+            SessionTurn(
+                "tn1",
+                "a1",
+                "(background monitor update)",
+                "Fixed the crash.",
+                TokenUsage(total=2400, output=2400),
+                None,
+            ),
+        ],
+    )
+    engine, state, commits, commit_fn = _make_finish_helpers(tmp_path, session, exported)
+
+    result, _ = engine.finish_parse_if_ready(
+        session=session,
+        quiet=True,
+        prompt_untracked=False,
+        require_complete=True,
+        awaited_followups=[],
+        agent_is_active_fn=lambda: False,
+        debug_fn=lambda *a, **k: None,
+        note_session_change_fn=lambda sid: None,
+        mirror_fn=lambda sid: None,
+        commit_fn=commit_fn,
+    )
+    assert result is True and len(commits) == 1
+
+
 def test_finish_parse_commits_monitor_updates_with_a_substantive_turn(tmp_path):
     # Once a substantive turn lands (here: the terminal task-completed turn), the deferred
     # monitor ticks ride along in the SAME commit instead of their own.
