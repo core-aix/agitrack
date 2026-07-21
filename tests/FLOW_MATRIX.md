@@ -127,13 +127,11 @@ Conventions:
 | A substantive turn commits the deferred ticks in the SAME commit; exit finalize flushes tick-only sessions | `test_finish_parse_commits_monitor_updates_with_a_substantive_turn`, `test_finish_parse_exit_finalize_commits_monitor_update_only_turns` | mock |
 | Summarizer refusals ("I don't have any coding session turns...") are unusable, falling back to the prompt-led subject | `test_summarizer_raises_on_refusal_text`, `test_summary_first_person_content_is_still_usable` | mock |
 
-## 9a3. Background-task file attribution (no-worktree user-commit dialog)
+## 9a3. Live background tasks vs the user-commit dialog
 | Sequence | Test(s) | Kind |
 |---|---|---|
-| Paths from background-labelled agent commits (and new files under their directories) attribute to the background job, not the user | `test_background_authored_sets_scans_labelled_commits` | real-git |
-| Background-only tree changes no longer raise the automatic "commit your changes?" dialog; a genuine user edit still does | `test_dialog_not_raised_for_background_only_changes` | real-git |
-| The automatic user commit unstages background files (left for the agent's next commit); the explicit git-commit command keeps everything stageable | `test_unstage_background_authored_keeps_user_files_staged` | real-git |
-| A repo with no background-labelled history keeps today's behaviour exactly | `test_split_background_paths_without_history_is_a_noop` | real-git |
+| Liveness from the notification stream: a recent monitor `<event>` with no terminal notification after it = live; terminal ends it; events beyond the horizon age out (launch-counting overcounts: mid-turn completions never notify) | `test_parse_rows_tracks_live_background_tasks_from_the_notification_stream` | mock |
+| While a background task is live, the automatic user-commit dialog is REPLACED by a warning (changes could be the user's or the task's; they'll be committed after the next agent turn); the dialog returns once no task is live | `test_live_background_task_replaces_user_commit_dialog_with_warning`, `test_user_commit_dialog_returns_once_background_tasks_end` | mock |
 
 ## 9b. Headless background tracker (`-b`, issue #143)
 | Sequence | Test(s) | Kind |

@@ -9390,19 +9390,7 @@ class ProxyRunner:
         if on_worktree:
             self._ensure_turn_branch()  # turn branches are a worktree concept only
         repo.add_tracked()
-        # The AUTOMATIC capture must not claim a background job's output as the user's
-        # own work (most visibly --no-worktree, where a monitored task writes this very
-        # tree between commits): background-authored files are unstaged and left for the
-        # agent's next commit. The explicit git-commit command (on_worktree=False) keeps
-        # everything stageable — there the user is deliberately committing.
-        skipped_background: list[str] = []
-        if on_worktree:
-            from agitrack.commits.actions import unstage_background_authored
-
-            skipped_background = unstage_background_authored(repo)
-        self._review_untracked_popup(
-            include_declined=include_declined, repo=repo, state=state, exclude_background=on_worktree
-        )
+        self._review_untracked_popup(include_declined=include_declined, repo=repo, state=state)
         if not repo.has_staged_changes():
             return False
         # Show exactly which files this commit will capture AND where it lands (the base repo vs
@@ -9417,8 +9405,6 @@ class ProxyRunner:
         is_base = base_path is not None and str(repo_path) == str(base_path)
         where = "the BASE repo" if is_base else "this session's WORKTREE"
         detail = [f"Committing {len(changed)} file(s) to {where} ({repo_path}):", *changed]
-        if skipped_background:
-            detail.append(f"(left for the agent's next commit: {len(skipped_background)} background-task file(s))")
         message = ""
         # Esc cancels the prompt (_prompt_popup returns None) and we continue without
         # committing — note that in the prompt so the user knows it's a safe way out.
@@ -9474,12 +9460,7 @@ class ProxyRunner:
         return True
 
     def _review_untracked_popup(
-        self,
-        *,
-        include_declined: bool,
-        repo: GitRepo | None = None,
-        state: AgitrackState | None = None,
-        exclude_background: bool = False,
+        self, *, include_declined: bool, repo: GitRepo | None = None, state: AgitrackState | None = None
     ) -> str:
         repo = repo or self.repo
         state = state or self.state
@@ -9487,12 +9468,6 @@ class ProxyRunner:
         untracked = repo.untracked_entries()
         declined = set(state.declined_untracked())
         candidates = untracked if include_declined else [path for path in untracked if path not in declined]
-        if exclude_background and candidates:
-            # New files a background job keeps creating (e.g. fresh run directories under a
-            # results tree it has been writing) are not the user's to stage here.
-            from agitrack.commits.actions import split_background_paths
-
-            candidates, _background = split_background_paths(repo, candidates)
         if not candidates:
             return "No untracked files to review."
         # Cap the listed files to the terminal height so the question and the input
@@ -10632,6 +10607,22 @@ class ProxyRunner:
         if self._manual_commits or self.turn_awaiting_commit:
             return False
         if not self.actions.has_pre_agent_user_changes():
+            return False
+        if getattr(self.active, "live_background_task_ids", None):
+            # A background task the agent started is still running, and it writes this
+            # tree — the same files the user might also edit — so ownership of the
+            # uncommitted changes is UNKNOWABLE here (there is no OS-level "which process
+            # changed this file"). Don't claim them as the user's: stand down, say why,
+            # and let the agent's next commit take them (it claims background work
+            # anyway). The explicit Ctrl-G git-commit remains the way to commit one's
+            # own edits separately while a task runs.
+            self._set_message(
+                "Background task still running: the uncommitted files could be your changes "
+                "or the task's edits. They will be committed after the next agent turn; use "
+                "Ctrl-G git-commit to commit your own edits separately.",
+                seconds=8,
+            )
+            self._render()
             return False
         self._set_message("Uncommitted user changes detected — committing them before the agent runs.")
         self._render()

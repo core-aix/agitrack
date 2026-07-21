@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shutil
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -62,6 +63,12 @@ _COMMAND_TAGS = (
 _BACKGROUND_TURN_LABEL = "(background task completed)"
 MONITOR_UPDATE_LABEL = "(background monitor update)"
 BACKGROUND_PROMPT_LABELS = (_BACKGROUND_TURN_LABEL, MONITOR_UPDATE_LABEL)
+
+# How recently a background task must have streamed a monitor event to still count as
+# LIVE (see parse_rows' liveness bookkeeping). Generous enough for slow-ticking
+# monitors; small enough that a task that died without a terminal notification stops
+# suppressing the user-commit dialog within the hour.
+_BACKGROUND_LIVE_HORIZON_SECONDS = 3600
 
 # A typed slash command is recorded as a synthetic user row carrying a
 # <command-name>/foo</command-name> artifact (see `_slash_command_name`). For
@@ -958,6 +965,14 @@ def parse_rows(
     # new user prompt in between — that work opens its own turn rather than being merged into
     # the previous (already-committed) turn. See `_task_notification_kind`.
     pending_background: str | None = None
+    # Liveness of background tasks, judged from the NOTIFICATION stream (launch-based
+    # counting overcounts badly: a task finishing while the agent is mid-turn delivers
+    # its result without a terminal notification). A task that has streamed an
+    # intermediate monitor event RECENTLY and has no terminal notification after it is
+    # treated as still running and still writing; the recency horizon stops a monitor
+    # that died notification-less from suppressing the user-commit dialog forever.
+    background_last_event: dict[str, int] = {}
+    background_terminated: set[str] = set()
     # Per-session running content of each edited file, so a Write/Edit's diff is the incremental
     # change vs the previous turn, not the whole file every time (only used when collect_edits).
     file_state: dict[str, str] = {}
@@ -999,6 +1014,13 @@ def parse_rows(
                 # A backgrounded task reported back. Not a prompt; defer to the assistant
                 # branch, which opens a NEW turn for any work the agent does in response (so
                 # it is committed and attributed on its own, not folded into the prior turn).
+                task_id = _notification_task_id(row)
+                if task_id:
+                    if notification_kind == "completed":
+                        background_terminated.add(task_id)
+                        background_last_event.pop(task_id, None)
+                    else:
+                        background_last_event[task_id] = _row_timestamp(row) or 0
                 pending_background = notification_kind
                 continue
             command = _slash_command_name(row)
@@ -1137,7 +1159,19 @@ def parse_rows(
                 current["messages"].append(text)
     flush(dangling=True)
     _attribute_subagent_tokens(turns, tool_ids_per_turn, subagent_tokens, unmatched_subagent_time)
-    return ExportedSession(session_id=session_id, model=model, updated=updated, turns=turns)
+    horizon = time.time() - _BACKGROUND_LIVE_HORIZON_SECONDS
+    live_ids = sorted(
+        task_id
+        for task_id, last_event in background_last_event.items()
+        if task_id not in background_terminated and last_event >= horizon
+    )
+    return ExportedSession(
+        session_id=session_id,
+        model=model,
+        updated=updated,
+        turns=turns,
+        live_background_task_ids=live_ids,
+    )
 
 
 def _usage_once(message: dict, counted_ids: set[str], *, sidechain: bool = False) -> TokenUsage:
@@ -1156,6 +1190,27 @@ def _usage_once(message: dict, counted_ids: set[str], *, sidechain: bool = False
     if msg_id is not None and isinstance(usage, dict) and usage:
         counted_ids.add(msg_id)
     return _message_tokens(usage, sidechain=sidechain)
+
+
+_NOTIFICATION_TASK_ID_RE = re.compile(r"<task-id>\s*([^<\s]+)\s*</task-id>")
+
+
+def _notification_task_id(row: dict) -> str | None:
+    """The harness task id a `<task-notification>` row refers to, if present. (The
+    ``<task-id>`` tag appears in BOTH shapes; ``<tool-use-id>`` only in terminal ones,
+    so liveness bookkeeping keys on the task id.)"""
+    message = _as_dict(row.get("message"))
+    content = message.get("content")
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        text = "".join(
+            block.get("text", "") for block in content if isinstance(block, dict) and block.get("type") == "text"
+        )
+    else:
+        return None
+    match = _NOTIFICATION_TASK_ID_RE.search(text)
+    return match.group(1) if match else None
 
 
 def _collect_tool_use_ids(message: dict, sink: set[str]) -> None:

@@ -75,6 +75,11 @@ class Session:
         "last_parse_attempt_status",
         "last_parse_finish",
         "pre_agent_reconciled_status",
+        # Tool-use ids of the session's still-running background tasks, recorded from the
+        # last consumed parse. While non-empty, the automatic pre-agent user-commit dialog
+        # stands down: the task and the user may both be editing the tree, so ownership of
+        # uncommitted changes is unknowable (see _offer_pre_agent_user_commit).
+        "live_background_task_ids",
         "status_check_pending",
         "last_poll",
         "last_status",
