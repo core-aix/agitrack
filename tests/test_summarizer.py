@@ -256,6 +256,38 @@ def test_summarizer_raises_on_session_limit_error_text() -> None:
         summarizer.summarize_commit(trace=_TRACE)
 
 
+def test_summarizer_raises_on_refusal_text() -> None:
+    # Refusals observed verbatim as commit SUBJECTS in a real repo whose trace held only
+    # background-task markers: the model explained it had nothing to summarize, and the
+    # explanation sailed through the guards into the commit message. A summary that opens
+    # in first person about its own inability is never usable.
+    import pytest
+    from agitrack.summaries import UnusableSummaryError
+
+    refusals = [
+        "I don't have any coding session turns or code diff to analyze. The trace shows only placeholders.",
+        "I cannot provide a meaningful summary of code changes because no code diff was provided.",
+        "I don't have sufficient information to write a summary.",
+        "I cannot write a meaningful summary without access to the coding session turns.",
+        "I am unable to summarize this session.",
+        "I can't generate a summary from this interaction trace.",
+    ]
+    for refusal in refusals:
+        backend = Mock()
+        backend.run.return_value = _result(refusal)
+        with pytest.raises(UnusableSummaryError):
+            Summarizer(backend).summarize_commit(trace=_TRACE)
+
+
+def test_summary_first_person_content_is_still_usable() -> None:
+    # The refusal guard keys on the OPENING of the first line; a genuine summary that
+    # mentions inability mid-sentence (or uses first person later) must still pass.
+    from agitrack.summaries.summarizer import summary_is_usable
+
+    assert summary_is_usable("Fixed the parser so it no longer says it cannot handle empty files.")
+    assert summary_is_usable("Refactored retries; I don't have to special-case timeouts anymore.".capitalize())
+
+
 def test_summarizer_raises_on_nonzero_exit_code() -> None:
     import pytest
     from agitrack.summaries import UnusableSummaryError

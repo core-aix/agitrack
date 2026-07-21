@@ -10608,6 +10608,22 @@ class ProxyRunner:
             return False
         if not self.actions.has_pre_agent_user_changes():
             return False
+        if getattr(self.active, "live_background_task_ids", None):
+            # A background task the agent started is still running, and it writes this
+            # tree — the same files the user might also edit — so ownership of the
+            # uncommitted changes is UNKNOWABLE here (there is no OS-level "which process
+            # changed this file"). Don't claim them as the user's: stand down, say why,
+            # and let the agent's next commit take them (it claims background work
+            # anyway). The explicit Ctrl-G git-commit remains the way to commit one's
+            # own edits separately while a task runs.
+            self._set_message(
+                "Background task still running: the uncommitted files could be your changes "
+                "or the task's edits. They will be committed after the next agent turn; use "
+                "Ctrl-G git-commit to commit your own edits separately.",
+                seconds=8,
+            )
+            self._render()
+            return False
         self._set_message("Uncommitted user changes detected — committing them before the agent runs.")
         self._render()
         committed = self._create_user_commit_popup()

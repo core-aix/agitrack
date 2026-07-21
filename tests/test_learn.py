@@ -229,7 +229,11 @@ def test_extract_json_tolerates_fences_and_prose():
 
 def test_digest_covers_prompts_files_insights_readme_and_progress(tmp_path):
     _init_repo(tmp_path)
-    stats = [_stat("please fix the flaky test"), _stat("(background task completed) and now refactor")]
+    stats = [
+        _stat("please fix the flaky test"),
+        _stat("(background task completed) and now refactor"),
+        _stat("(background monitor update)"),
+    ]
     insights = [{"title": "Correction loops", "summary": "1 in 4 prompts is corrective", "suggestion": "smaller asks"}]
     files = [{"path": "agitrack/metrics/web.py", "changes": 9, "insertions": 200, "deletions": 120}]
     profile = {
@@ -238,7 +242,8 @@ def test_digest_covers_prompts_files_insights_readme_and_progress(tmp_path):
     }
     digest = learn.build_trace_digest(stats, insights, files, tmp_path, profile)
     assert "please fix the flaky test" in digest
-    assert "(background task completed)" not in digest  # synthetic marker stripped
+    assert "(background task completed)" not in digest  # synthetic markers stripped
+    assert "(background monitor update)" not in digest
     assert "Correction loops" in digest
     assert "agitrack/metrics/web.py (9 changes, +200/-120)" in digest
     assert "Demo project" in digest  # README head

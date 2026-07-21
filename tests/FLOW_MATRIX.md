@@ -119,6 +119,20 @@ Conventions:
 | **Background backend exits → relaunch+resume; crash-loop → drop** | `test_background_session_relaunches_on_unexpected_exit_then_stops_after_crashloop` | mock |
 | Skip background git while an active merge is in progress | `test_service_background_skips_while_active_merge_in_progress` | mock |
 
+## 9a2. Background monitor ticks (deferred commits)
+| Sequence | Test(s) | Kind |
+|---|---|---|
+| Monitor `<event>` notification opens a turn labeled `(background monitor update)`; terminal/unknown notifications keep `(background task completed)` | `test_parse_rows_monitor_event_notification_gets_the_update_label`, `test_parse_rows_background_task_work_opens_its_own_turn` | mock |
+| Monitor-update-only completed turns are DEFERRED (no commit, watermark untouched) while the live loop runs | `test_finish_parse_defers_monitor_update_only_turns` | mock |
+| A substantive turn commits the deferred ticks in the SAME commit; exit finalize flushes tick-only sessions | `test_finish_parse_commits_monitor_updates_with_a_substantive_turn`, `test_finish_parse_exit_finalize_commits_monitor_update_only_turns` | mock |
+| Summarizer refusals ("I don't have any coding session turns...") are unusable, falling back to the prompt-led subject | `test_summarizer_raises_on_refusal_text`, `test_summary_first_person_content_is_still_usable` | mock |
+
+## 9a3. Live background tasks vs the user-commit dialog
+| Sequence | Test(s) | Kind |
+|---|---|---|
+| Liveness from the notification stream: a recent monitor `<event>` with no terminal notification after it = live; terminal ends it; events beyond the horizon age out (launch-counting overcounts: mid-turn completions never notify) | `test_parse_rows_tracks_live_background_tasks_from_the_notification_stream` | mock |
+| While a background task is live, the automatic user-commit dialog is REPLACED by a warning (changes could be the user's or the task's; they'll be committed after the next agent turn); the dialog returns once no task is live | `test_live_background_task_replaces_user_commit_dialog_with_warning`, `test_user_commit_dialog_returns_once_background_tasks_end` | mock |
+
 ## 9b. Headless background tracker (`-b`, issue #143)
 | Sequence | Test(s) | Kind |
 |---|---|---|
