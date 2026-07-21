@@ -9979,3 +9979,91 @@ def test_pty_heartbeat_still_reaches_the_commit_path(monkeypatch):
     assert first_parse_at is not None
     assert first_parse_at >= runner.CHILD_IDLE_SECONDS * runner.TRANSCRIPT_IDLE_FACTOR
     assert first_parse_at >= runner.FILE_STABLE_SECONDS
+
+
+# --- transcript path lookup: a MISS must never be cached for the whole run --------------------
+# Regression (found by reproducing the reported no-worktree/tmux hang end-to-end): the resolved
+# path was cached keyed by session id, INCLUDING a miss. The transcript does not exist yet when a
+# session starts, so the first lookup missed, `cached_id == session_id` on every later call, and
+# it was never retried — `_active_transcript_mtime` returned None for the whole run. That made
+# `_backend_idle_for` fall back to the PTY alone; with the TUI heartbeat the PTY is never quiet,
+# so the turn end was never detected and the session committed NOTHING at all.
+
+
+def _transcript_lookup_runner(resolver):
+    runner = ProxyRunner.for_testing()
+    runner.state = types.SimpleNamespace(backend_session_id="sid-1")
+    runner.backend = types.SimpleNamespace(session_transcript_path=resolver)
+    runner._transcript_path_cache = (None, None)
+    runner._transcript_lookup_at = 0.0
+    runner.TRANSCRIPT_LOOKUP_RETRY_SECONDS = 0.0  # retry every tick, so the test needn't sleep
+    return runner
+
+
+def test_transcript_path_miss_is_retried_until_the_file_appears(tmp_path):
+    found: list = [None]
+    calls: list = []
+
+    def resolver(session_id):
+        calls.append(session_id)
+        return found[0]
+
+    runner = _transcript_lookup_runner(resolver)
+    assert runner._active_transcript_mtime() is None  # not created yet
+    assert calls == ["sid-1"]
+
+    # The backend writes the transcript on its first turn; the next call must find it.
+    transcript = tmp_path / "sid-1.jsonl"
+    transcript.write_text("{}\n", encoding="utf-8")
+    found[0] = transcript
+    assert runner._active_transcript_mtime() == transcript.stat().st_mtime
+    assert len(calls) == 2  # the miss was retried rather than cached forever
+
+    # Once resolved it IS cached: no further project-dir scans per tick.
+    runner._active_transcript_mtime()
+    runner._active_transcript_mtime()
+    assert len(calls) == 2
+
+
+def test_transcript_path_miss_retry_is_throttled(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr("agitrack.proxy.runner.time.monotonic", lambda: clock[0])
+    calls: list = []
+
+    def resolver(session_id):
+        calls.append(session_id)
+        return None
+
+    runner = _transcript_lookup_runner(resolver)
+    runner.TRANSCRIPT_LOOKUP_RETRY_SECONDS = 5.0
+
+    runner._active_transcript_mtime()
+    for _ in range(50):  # a burst of ticks inside the throttle window
+        clock[0] += 0.05
+        runner._active_transcript_mtime()
+    assert len(calls) == 1  # one scan, not fifty
+
+    clock[0] += 5.0
+    runner._active_transcript_mtime()
+    assert len(calls) == 2
+
+
+def test_late_transcript_unblocks_idle_despite_a_heartbeat(tmp_path):
+    # The end-to-end shape of the hang: PTY heartbeat never stops, and the transcript only shows
+    # up after the first turn. Idle must go False->True once the transcript is resolvable and
+    # quiet, instead of being pinned False forever by the poisoned cache.
+    found: list = [None]
+    runner = _transcript_lookup_runner(lambda session_id: found[0])
+    runner.CHILD_IDLE_SECONDS = 4.0
+    runner.TRANSCRIPT_IDLE_FACTOR = 3.0
+    runner.last_child_output = time.monotonic()  # heartbeat, always fresh
+
+    assert runner._backend_idle_for(4.0) is False  # no transcript yet: stay conservative
+
+    transcript = tmp_path / "sid-1.jsonl"
+    transcript.write_text("{}\n", encoding="utf-8")
+    os.utime(transcript, (time.time() - 600, time.time() - 600))  # written 10 min ago, then quiet
+    found[0] = transcript
+
+    runner.last_child_output = time.monotonic()  # heartbeat still going
+    assert runner._backend_idle_for(4.0) is True
