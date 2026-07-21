@@ -1420,10 +1420,10 @@ def learn_html(root: Path, *, banner_html: str = "") -> str:
     "contents are based on a reconstruction" notice here (same pattern as the dashboard's
     backtrace banner). Empty on the live server. Substituted FIRST so page content could
     never smuggle the placeholder in."""
-    from agitrack.metrics.collect import _abbreviate_home
+    from agitrack.metrics.collect import _display_repo
     from agitrack.metrics.web import _escape
 
-    repo_path = _abbreviate_home(str(root))
+    repo_path = _display_repo(str(root))
     repo_name = repo_path.rstrip("/").rsplit("/", 1)[-1] or repo_path
     return (
         _LEARN_TEMPLATE.replace("__BACKTRACE_BANNER__", banner_html)

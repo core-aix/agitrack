@@ -1019,10 +1019,11 @@ def test_timeseries_fills_empty_periods_with_zero():
     assert ts["commits"] == [1, 0, 0, 1]
 
 
-def test_dashboard_repo_path_abbreviates_home(tmp_path, monkeypatch):
-    # A repo under the home directory is shown with ``~`` so the public dashboard
-    # screenshot never leaks an absolute home path. Build the repo before patching
-    # HOME so git still finds the real global identity for the seed commits.
+def test_dashboard_shows_only_the_repo_name_not_its_path(tmp_path, monkeypatch):
+    # The dashboard is kept open, screenshotted and shared, so it carries the repo NAME and
+    # never a filesystem path. Abbreviating home to ``~`` was not enough: ``~/projects/demo``
+    # still exposes the layout. Build the repo before patching HOME so git still finds the
+    # real global identity for the seed commits.
     home = tmp_path / "home"
     repo_dir = home / "projects" / "demo"
     repo_dir.parent.mkdir(parents=True)
@@ -1033,17 +1034,23 @@ def test_dashboard_repo_path_abbreviates_home(tmp_path, monkeypatch):
         monkeypatch.setenv("USERPROFILE", str(home))
 
     dash = build_dashboard(repo)
-    assert dash.repo == "~/projects/demo"
-    assert str(home) not in render_html(repo)
+    assert dash.repo == "demo"
+    html = render_html(repo)
+    assert str(home) not in html
+    assert "~/projects/demo" not in html  # not even the home-abbreviated form
+    assert "projects" not in html  # the containing directory never appears
 
 
-def test_dashboard_repo_path_outside_home_is_unchanged(tmp_path, monkeypatch):
+def test_dashboard_repo_outside_home_is_also_reduced_to_its_name(tmp_path, monkeypatch):
+    # A repo OUTSIDE the home directory used to be rendered as a full absolute path; it too
+    # is now shown by name only.
     repo = _demo_repo(tmp_path / "work")
     monkeypatch.setenv("HOME", str(tmp_path / "elsewhere"))
     if sys.platform == "win32":
         monkeypatch.setenv("USERPROFILE", str(tmp_path / "elsewhere"))
     dash = build_dashboard(repo)
-    assert dash.repo == str(repo.repo)
+    assert dash.repo == "work"
+    assert str(repo.repo) not in render_html(repo)
 
 
 def test_aggregates_payload_reports_full_history_span(tmp_path):
@@ -1511,3 +1518,26 @@ def test_cli_dashboard_missing_directory_fails_cleanly(tmp_path, monkeypatch):
         metrics, "start_dashboard_daemon", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not start"))
     )
     assert cli.main(["--dashboard", "--repo", str(tmp_path / "nowhere")]) == 1
+
+
+def test_dashboard_masks_paths_in_historical_commit_messages(tmp_path):
+    # History is never rewritten, so commits written BEFORE path masking existed still carry
+    # raw paths in git. The dashboard masks at render time, so the old ones are covered too.
+    from agitrack.metrics.collect import _parse_commit
+
+    body = (
+        "<aGiTrack> Check ~/Code/secret-client/app.py\n\n"
+        "# Interaction Trace\n\n## User\n\nlook at /home/alice/.ssh/config and paper/main.tex\n\n"
+        "# aGiTrack Metadata\ncommit_type: agent\nbackend: claude\nmodel: m1\n"
+        "tokens_since_last_commit_input: 10\n"
+    )
+    stat = _parse_commit("abc1234", "A", "a@example.com", "1700000000", body)
+
+    for leak in ("alice", "~/Code", "/home/", "secret-client"):
+        assert leak not in stat.message, f"{leak!r} survived in the rendered message"
+        assert leak not in stat.subject
+    assert "paper/main.tex" in stat.message  # relative path kept
+    # Masking must not disturb the metadata the dashboard parses out of the same body.
+    assert stat.kind == "agent"
+    assert stat.backend == "claude" and stat.model == "m1"
+    assert stat.tokens.get("input") == 10
