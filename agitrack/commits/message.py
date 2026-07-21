@@ -92,6 +92,34 @@ SECRET_TOKEN_RES = [
     # sits on one physical line, so grab it end-to-end when the END marker is present too.
     re.compile(r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----(?:[\s\S]*?-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----)?"),
 ]
+# --- filesystem-path masking -------------------------------------------------------------
+# Commit messages are shared, pushed and read by other people; an absolute path in one leaks
+# the account name and the machine's layout (``/home/alice/Code/client-work/...``) for no
+# benefit to the reader. Every ABSOLUTE path is replaced with PATH_MASK. Relative paths are
+# deliberately kept: ``paper/main.tex`` says which file changed and reveals nothing about the
+# machine.
+PATH_MASK = "[PATH]"
+# A URL is not a filesystem path — matched FIRST and passed through unchanged, so the "//" in
+# ``https://github.com/core-aix/agitrack`` is never mistaken for a path.
+_URL_RE = r"(?:[A-Za-z][A-Za-z0-9+.-]*://|mailto:|[A-Za-z0-9_.+-]+@[A-Za-z0-9.-]+:)[^\s<>\"']+"
+# POSIX absolute path. Two things keep this off ordinary prose:
+#   * the lookbehind requires the leading "/" to start a word, so "and/or" and
+#     "input/output/buffer" are untouched (their slashes follow a word character);
+#   * at least TWO segments are required ("/a/b"), so a backend SLASH COMMAND — /compact,
+#     /model, /clear, which routinely appear in prompts and in commit subjects — survives,
+#     while /etc/hosts and /usr/bin/python3 are masked.
+_POSIX_PATH_RE = r"(?<![\w.~-])/(?:[^\s/\\<>\"'`|,;]+/)+[^\s/\\<>\"'`|,;]*"
+# "~" / "~user" home paths. Unambiguous, so one segment is enough (``~/notes``). The user part
+# must be empty or start with a letter/underscore, so "~123/second" — a tilde meaning
+# "approximately", as in "(~123/second)" — is not read as a home path.
+_TILDE_PATH_RE = r"(?<![\w./-])~(?:[A-Za-z_][A-Za-z0-9_.-]*)?/[^\s<>\"'`|,;]*"
+# Windows drive-letter and UNC paths: C:\Users\me\x, C:/Users/me/x, \\server\share\x.
+_WINDOWS_PATH_RE = r"(?<![\w.-])(?:[A-Za-z]:[\\/]|\\\\[^\s\\<>\"'`]+\\)[^\s<>\"'`|,;]*"
+PATH_RE = re.compile(f"(?P<url>{_URL_RE})|(?:{_WINDOWS_PATH_RE}|{_TILDE_PATH_RE}|{_POSIX_PATH_RE})")
+# Punctuation that ends the SENTENCE rather than the path ("see ~/notes." keeps its full
+# stop). Stripped off the match and re-appended after the mask.
+_PATH_TRAILING_PUNCT = ".,;:!?)]}\"'"
+
 MOUSE_REPORT_RE = re.compile(r"(?:\x1b)?\[<\d+;\d+;\d+[Mm]")
 # Full ANSI/terminal escape sequences (CSI/OSC/DCS and lone two-byte escapes).
 ANSI_SEQUENCE_RE = re.compile(
@@ -649,7 +677,28 @@ def _limit_trace_turns(trace: list[dict], turn_limit: int) -> list[dict]:
     return trace[user_indexes[-limit] :]
 
 
+def mask_paths(text: str) -> str:
+    """Replace every ABSOLUTE filesystem path with :data:`PATH_MASK`, leaving URLs and
+    relative paths intact. See the PATH_RE block for what counts as a path and why."""
+
+    def replace(match: re.Match[str]) -> str:
+        if match.group("url"):
+            return match.group(0)  # a URL is not a filesystem path
+        path = match.group(0)
+        trailing = ""
+        while path and path[-1] in _PATH_TRAILING_PUNCT:
+            trailing = path[-1] + trailing
+            path = path[:-1]
+        if not path:
+            return match.group(0)  # punctuation only — nothing path-like to mask
+        return PATH_MASK + trailing
+
+    return PATH_RE.sub(replace, text)
+
+
 def _mask_secrets(text: object) -> str:
+    """Make arbitrary agent/user text safe to publish in a commit message: strip terminal
+    escapes and control characters, redact secrets, and mask absolute filesystem paths."""
     value = str(text or "")
     value = MOUSE_REPORT_RE.sub("", value)
     value = ANSI_SEQUENCE_RE.sub("", value)
@@ -657,7 +706,8 @@ def _mask_secrets(text: object) -> str:
     value = SECRET_ASSIGNMENT_RE.sub(lambda match: f"{match.group(1)}{match.group(2)}{SECRET_MASK}", value)
     for pattern in SECRET_TOKEN_RES:
         value = pattern.sub(SECRET_MASK, value)
-    return value
+    # Last: path masking must not re-scan the "[REDACTED]" markers the steps above inserted.
+    return mask_paths(value)
 
 
 def _token_value(token_usage: dict[str, int | None] | None, key: str) -> int | str:

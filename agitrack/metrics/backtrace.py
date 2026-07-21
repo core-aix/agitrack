@@ -29,7 +29,7 @@ from typing import Callable
 from agitrack.commits import METADATA_HEADER
 from agitrack.commits.message import _token_metadata_lines, render_interaction_trace
 from agitrack.git import GitRepo
-from agitrack.metrics.collect import CommitStat, Dashboard, _abbreviate_home
+from agitrack.metrics.collect import CommitStat, Dashboard, _abbreviate_home, _display_repo
 from agitrack.transcripts import claude, opencode
 from agitrack.transcripts.edits import combine_patches, merge_edits_by_path, total_lines
 from agitrack.transcripts.types import ExportedSession, FileEdit, SessionRef, SessionTurn, turns_after
@@ -224,14 +224,14 @@ def build_backtrace(
 
     stats.sort(key=lambda stat: (stat.timestamp, stat.sha))  # oldest first, like git log order
     dashboard = Dashboard(
-        repo=_abbreviate_home(str(directory)),
+        repo=_display_repo(str(directory)),
         branch="",
         stats=stats,
         commit_base="",  # no git remote — the virtual shas are not real commits
         branches=[],
     )
     return BacktraceView(
-        directory=_abbreviate_home(str(directory)),
+        directory=_display_repo(str(directory)),
         dashboard=dashboard,
         root=directory,
         diffs=diffs,

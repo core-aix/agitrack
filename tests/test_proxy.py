@@ -9865,3 +9865,265 @@ def test_integrate_active_session_refuses_mid_turn_and_without_worktree():
     runner._agent_is_active = lambda: True
     runner._integrate_active_session()
     assert any("Finish or stop the current turn" in m for m in msgs)
+
+
+# --- _backend_idle_for: a TUI idle heartbeat must not veto turn-end detection forever ---------
+# Regression: a Claude TUI on Linux writes a steady 8 bytes/second to the PTY while completely
+# idle — invisible on screen, but never a 4-second gap — which kept `last_child_output`
+# permanently fresh, so this returned False forever. `_maybe_agent_commit` gates the whole
+# parse→commit pipeline on it, so turns were only ever committed by the pre-agent flow at the
+# user's NEXT prompt: the worktree stayed dirty for as long as the user stayed away.
+
+
+def _idle_runner(*, pty_age: float, transcript_age: float | None):
+    """Runner whose PTY last spoke `pty_age` seconds ago and whose transcript was last written
+    `transcript_age` seconds ago (None ⇒ no transcript resolvable)."""
+    runner = ProxyRunner.for_testing()
+    runner.CHILD_IDLE_SECONDS = 4.0
+    runner.TRANSCRIPT_IDLE_FACTOR = 3.0
+    runner.last_child_output = time.monotonic() - pty_age
+    runner._active_transcript_mtime = lambda: None if transcript_age is None else time.time() - transcript_age
+    return runner
+
+
+def test_backend_idle_when_both_pty_and_transcript_are_quiet():
+    runner = _idle_runner(pty_age=10.0, transcript_age=10.0)
+    assert runner._backend_idle_for(4.0) is True
+
+
+def test_backend_not_idle_while_transcript_advances():
+    # The silent sub-agent guard: terminal quiet, transcript moving ⇒ the turn is still running.
+    runner = _idle_runner(pty_age=10.0, transcript_age=1.0)
+    assert runner._backend_idle_for(4.0) is False
+
+
+def test_pty_heartbeat_defers_idle_only_briefly():
+    # Heartbeat still ticking, transcript quiet but not yet past the factor ⇒ still hold off.
+    runner = _idle_runner(pty_age=0.0, transcript_age=6.0)
+    assert runner._backend_idle_for(4.0) is False
+
+
+def test_pty_heartbeat_cannot_veto_idle_forever():
+    # The bug. PTY never goes quiet, but the transcript has been silent past
+    # CHILD_IDLE_SECONDS * TRANSCRIPT_IDLE_FACTOR (12s) ⇒ the backend IS idle.
+    runner = _idle_runner(pty_age=0.0, transcript_age=13.0)
+    assert runner._backend_idle_for(4.0) is True
+    # ...and it stays idle as the silence stretches on (the reported 8-minute case).
+    runner = _idle_runner(pty_age=0.0, transcript_age=480.0)
+    assert runner._backend_idle_for(4.0) is True
+
+
+def test_noisy_pty_without_a_transcript_keeps_the_conservative_answer():
+    # No transcript to overrule the PTY (backend with no readable session file): unchanged
+    # behaviour — a chattering terminal still means "working".
+    runner = _idle_runner(pty_age=0.0, transcript_age=None)
+    assert runner._backend_idle_for(4.0) is False
+    runner = _idle_runner(pty_age=10.0, transcript_age=None)
+    assert runner._backend_idle_for(4.0) is True
+
+
+def test_pty_heartbeat_still_reaches_the_commit_path(monkeypatch):
+    # End-to-end at the poll level, reproducing the reported failure: the agent finished
+    # (transcript silent) and left the worktree dirty, but the TUI kept repainting so
+    # `last_child_output` never aged. Before the fix `_maybe_agent_commit` returned at the
+    # `elif self.status_check_pending` branch on every tick and the parse never started —
+    # the turn only got committed when the user typed their next prompt.
+    clock = [10_000.0]
+    wall = [50_000.0]
+    monkeypatch.setattr("agitrack.proxy.runner.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("agitrack.proxy.runner.time.time", lambda: wall[0])
+    runner = make_runner(
+        file_change_event=threading.Event(),
+        status_check_pending=False,
+        last_poll=0.0,
+        agent_in_flight=False,
+        agent_parse_thread=None,
+        agent_parse_result=None,
+        last_status="",
+        last_status_change=0.0,
+        _last_change_at=0.0,
+        verbose=False,
+    )
+    runner.CHILD_IDLE_SECONDS = 4.0
+    runner.FILE_STABLE_SECONDS = 8.0
+    runner.TRANSCRIPT_IDLE_FACTOR = 3.0
+    runner._prune_declined_untracked = lambda: None
+    runner._maybe_offer_copy_when_idle = lambda now: None
+    runner._finish_agent_parse_if_ready = lambda **k: None
+    parses: list = []
+    runner._start_agent_parse = lambda: parses.append(True)
+    runner.repo = types.SimpleNamespace(status_short=lambda: " M paper/main.tex\n")
+
+    # The agent's last edit lands; its transcript goes quiet at the same moment.
+    transcript_written_at = wall[0]
+    runner._active_transcript_mtime = lambda: transcript_written_at
+    runner.file_change_event.set()
+    runner._maybe_agent_commit()
+
+    # Now drive the real cadence: one heartbeat byte per second, forever, and a poll each
+    # second. The PTY is therefore NEVER quiet for CHILD_IDLE_SECONDS at any point.
+    first_parse_at = None
+    for second in range(1, 61):
+        clock[0] += 1.0
+        wall[0] += 1.0
+        runner.last_child_output = clock[0]  # the 8-byte heartbeat lands
+        runner._maybe_agent_commit()
+        if parses and first_parse_at is None:
+            first_parse_at = second
+
+    # Committed on its own, without the user ever typing a next prompt (before the fix this
+    # loop ran to 60s — and would have run forever — with parses still empty).
+    assert parses  # the stub never clears parse_pending, so it re-fires; only the first matters
+    # Held off until the worktree settled AND the transcript had been quiet past
+    # CHILD_IDLE_SECONDS * TRANSCRIPT_IDLE_FACTOR, so a silent sub-agent still gets its guard.
+    assert first_parse_at is not None
+    assert first_parse_at >= runner.CHILD_IDLE_SECONDS * runner.TRANSCRIPT_IDLE_FACTOR
+    assert first_parse_at >= runner.FILE_STABLE_SECONDS
+
+
+# --- transcript path lookup: a MISS must never be cached for the whole run --------------------
+# Regression (found by reproducing the reported no-worktree/tmux hang end-to-end): the resolved
+# path was cached keyed by session id, INCLUDING a miss. The transcript does not exist yet when a
+# session starts, so the first lookup missed, `cached_id == session_id` on every later call, and
+# it was never retried — `_active_transcript_mtime` returned None for the whole run. That made
+# `_backend_idle_for` fall back to the PTY alone; with the TUI heartbeat the PTY is never quiet,
+# so the turn end was never detected and the session committed NOTHING at all.
+
+
+def _transcript_lookup_runner(resolver):
+    runner = ProxyRunner.for_testing()
+    runner.state = types.SimpleNamespace(backend_session_id="sid-1")
+    runner.backend = types.SimpleNamespace(session_transcript_path=resolver)
+    runner._transcript_path_cache = (None, None)
+    runner._transcript_lookup_at = 0.0
+    runner.TRANSCRIPT_LOOKUP_RETRY_SECONDS = 0.0  # retry every tick, so the test needn't sleep
+    return runner
+
+
+def test_transcript_path_miss_is_retried_until_the_file_appears(tmp_path):
+    found: list = [None]
+    calls: list = []
+
+    def resolver(session_id):
+        calls.append(session_id)
+        return found[0]
+
+    runner = _transcript_lookup_runner(resolver)
+    assert runner._active_transcript_mtime() is None  # not created yet
+    assert calls == ["sid-1"]
+
+    # The backend writes the transcript on its first turn; the next call must find it.
+    transcript = tmp_path / "sid-1.jsonl"
+    transcript.write_text("{}\n", encoding="utf-8")
+    found[0] = transcript
+    assert runner._active_transcript_mtime() == transcript.stat().st_mtime
+    assert len(calls) == 2  # the miss was retried rather than cached forever
+
+    # Once resolved it IS cached: no further project-dir scans per tick.
+    runner._active_transcript_mtime()
+    runner._active_transcript_mtime()
+    assert len(calls) == 2
+
+
+def test_transcript_path_miss_retry_is_throttled(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr("agitrack.proxy.runner.time.monotonic", lambda: clock[0])
+    calls: list = []
+
+    def resolver(session_id):
+        calls.append(session_id)
+        return None
+
+    runner = _transcript_lookup_runner(resolver)
+    runner.TRANSCRIPT_LOOKUP_RETRY_SECONDS = 5.0
+
+    runner._active_transcript_mtime()
+    for _ in range(50):  # a burst of ticks inside the throttle window
+        clock[0] += 0.05
+        runner._active_transcript_mtime()
+    assert len(calls) == 1  # one scan, not fifty
+
+    clock[0] += 5.0
+    runner._active_transcript_mtime()
+    assert len(calls) == 2
+
+
+def test_late_transcript_unblocks_idle_despite_a_heartbeat(tmp_path):
+    # The end-to-end shape of the hang: PTY heartbeat never stops, and the transcript only shows
+    # up after the first turn. Idle must go False->True once the transcript is resolvable and
+    # quiet, instead of being pinned False forever by the poisoned cache.
+    found: list = [None]
+    runner = _transcript_lookup_runner(lambda session_id: found[0])
+    runner.CHILD_IDLE_SECONDS = 4.0
+    runner.TRANSCRIPT_IDLE_FACTOR = 3.0
+    runner.last_child_output = time.monotonic()  # heartbeat, always fresh
+
+    assert runner._backend_idle_for(4.0) is False  # no transcript yet: stay conservative
+
+    transcript = tmp_path / "sid-1.jsonl"
+    transcript.write_text("{}\n", encoding="utf-8")
+    os.utime(transcript, (time.time() - 600, time.time() - 600))  # written 10 min ago, then quiet
+    found[0] = transcript
+
+    runner.last_child_output = time.monotonic()  # heartbeat still going
+    assert runner._backend_idle_for(4.0) is True
+
+
+# --- RepoChangeHandler: a READ is not a worktree change ----------------------------------------
+# Regression (the reported "aGiTrack just stops committing" on Linux, no-worktree + tmux):
+# watchdog's inotify backend emits IN_OPEN / IN_CLOSE_NOWRITE, which `on_any_event` counted as
+# worktree changes. Every one resets `_last_change_at`, so `worktree_settled` never became true,
+# the commit gate never opened, and NOTHING was ever committed. Measured on the reporting repo
+# with nobody writing: 1536 opened + 1536 closed_no_write events in 25s (~123/second) from
+# ordinary reads. macOS FSEvents reports only real modifications, hence Linux-only.
+
+
+class _Event:
+    """Minimal stand-in for a watchdog event (event_type + src_path is all the handler reads)."""
+
+    def __init__(self, event_type, src_path):
+        self.event_type = event_type
+        self.src_path = src_path
+
+
+def _handler_fires(event_type, relative, repo="/repo"):
+    changed, wake = threading.Event(), threading.Event()
+    from agitrack.proxy.runner import RepoChangeHandler
+
+    RepoChangeHandler(repo, changed, wake).on_any_event(_Event(event_type, f"{repo}/{relative}"))
+    assert changed.is_set() == wake.is_set()  # the worker wake must track the change flag
+    return changed.is_set()
+
+
+def test_read_only_events_are_not_worktree_changes():
+    # The bug: these fire constantly from ordinary reads and must never count as changes.
+    assert _handler_fires("opened", "paper/main.tex") is False
+    assert _handler_fires("closed_no_write", "paper/main.tex") is False
+    assert _handler_fires("opened", ".gitignore") is False
+    assert _handler_fires("closed_no_write", "AGENTS.md") is False
+
+
+def test_real_modifications_still_register():
+    for event_type in ("created", "modified", "deleted", "moved", "closed"):
+        assert _handler_fires(event_type, "paper/main.tex") is True, event_type
+
+
+def test_ignored_directories_still_ignored_for_write_events():
+    for part in (".agitrack", ".git", ".venv", "__pycache__", ".pytest_cache"):
+        assert _handler_fires("modified", f"{part}/whatever.json") is False, part
+
+
+def test_a_storm_of_reads_never_marks_the_worktree_dirty():
+    # The exact failure shape: thousands of read events, zero change signals — so
+    # `_last_change_at` is never reset and `worktree_settled` can actually become true.
+    from agitrack.proxy.runner import RepoChangeHandler
+
+    changed = threading.Event()
+    handler = RepoChangeHandler("/repo", changed)
+    for _ in range(1536):
+        handler.on_any_event(_Event("opened", "/repo/.gitignore"))
+        handler.on_any_event(_Event("closed_no_write", "/repo/.gitignore"))
+    assert changed.is_set() is False
+    # ...and one genuine write still gets through immediately afterwards.
+    handler.on_any_event(_Event("modified", "/repo/paper/main.tex"))
+    assert changed.is_set() is True
