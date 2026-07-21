@@ -472,6 +472,11 @@ class ProxyRunner:
     # `self.X` still resolves for runners built via __new__ (tests).
     FILE_STABLE_SECONDS = 8.0
     CHILD_IDLE_SECONDS = 4.0
+    # A backend TUI's idle heartbeat (measured at 8 bytes/second on Linux) keeps
+    # `last_child_output` permanently fresh, which would let the PTY veto turn-end detection
+    # forever (see `_backend_idle_for`). Once the transcript — which only advances on real
+    # backend work — has been quiet for this multiple of the idle window, the transcript wins.
+    TRANSCRIPT_IDLE_FACTOR = 3.0
     POLL_SECONDS = 2.0
     PARSE_COOLDOWN_SECONDS = 10.0
     BASE_POLL_SECONDS = 3.0
@@ -782,6 +787,9 @@ class ProxyRunner:
         self._summary_thread: threading.Thread | None = None  # background commit-summary worker (#8)
         self._summary_result: dict | None = None  # finished summary awaiting main-thread application
         self._summary_pending: dict | None = None  # {"sha", "since"} while a summary is being computed
+        # {"head", "latent", "single"} for the newest no-worktree AUTO fold, so a late summary can
+        # still find the real commit that absorbed its latent turn (see _folded_head_for).
+        self._last_auto_fold: dict | None = None
         self._precompact_thread: threading.Thread | None = None  # background pre-compaction summary worker
         self._precompact_result: dict | None = None
         # Automatic backend self-update: when the agent's own updater is sandbox-blocked,
@@ -2039,6 +2047,10 @@ class ProxyRunner:
         if not message:
             return
         try:
+            folded = list(self.repo.log_shas("HEAD", tip))  # the latent turns this fold absorbs
+        except Exception:
+            folded = []
+        try:
             self.repo.add_tracked()
             declined = set(self.state.declined_untracked())
             self.repo.stage_paths([p for p in self.repo.untracked_entries() if p not in declined])
@@ -2052,6 +2064,15 @@ class ProxyRunner:
             self._render_manual_trailer()
             self._last_agent_commit_id = sha
             self._sessions_with_activity.add(self.state.session_id)
+            # Remember which latent turns this fold absorbed, so a summary that lands AFTER the
+            # deadline can still be amended into the real commit instead of being stranded on the
+            # latent one (see _folded_head_for). Only the newest fold is tracked: once HEAD moves
+            # on, amending is no longer safe anyway.
+            self._last_auto_fold = {
+                "head": self._manual_last_head,
+                "latent": folded,
+                "single": len(bodies) == 1,
+            }
         except Exception as error:
             self._debug(f"auto fold failed: {error!r}")
 
@@ -9834,9 +9855,16 @@ class ProxyRunner:
                 self._commit_summarized = True
             else:
                 # Already integrated or superseded: the summary lives in the
-                # commit's git notes instead of its message.
+                # commit's git notes instead of its message. Prefer the commit that
+                # ABSORBED this latent turn (a multi-turn auto fold, which must not be
+                # amended) over the latent sha itself — a note on a latent commit hangs
+                # off an object no branch reaches, so `git log --notes` never shows it
+                # and `git gc` eventually collects it.
+                fold = getattr(self, "_last_auto_fold", None)
                 target = sha
-                self._debug(f"summary for {sha} recorded as notes only")
+                if fold and sha in (fold.get("latent") or ()) and fold.get("head"):
+                    target = str(fold["head"])
+                self._debug(f"summary for {sha} recorded as notes only on {target}")
             repo.notes_add(target, summary, namespace="agitrack/commit-summary")
             if self._manual_commits:
                 # Manual mode: the summary just landed as a note on a pending latent commit —
@@ -9858,13 +9886,33 @@ class ProxyRunner:
         except Exception as error:
             self._debug(f"applying commit summary failed: {error!r}")
 
+    def _folded_head_for(self, sha: str, head: str) -> str | None:
+        """HEAD, when it is the auto-fold commit that absorbed latent commit *sha* as its ONLY
+        turn — else None.
+
+        No-worktree AUTO mode summarizes the **latent** commit, then folds that latent commit into
+        a real commit on the working branch. So by the time a slow summary lands, its sha is never
+        HEAD and :meth:`_amend_summary_into_head` used to give up, stranding the summary as a note
+        on a commit that is not in any branch's history — unreachable, and lost to `git gc`. Every
+        commit in the reported repo lost its summary this way. Mapping the latent sha back to the
+        fold commit gives the late summary the same second chance worktree mode has always had.
+
+        Restricted to single-turn folds: a multi-turn fold's message is a squash of several turn
+        bodies, and this summary describes only one of them, so it goes to notes instead."""
+        fold = getattr(self, "_last_auto_fold", None)
+        if not fold or fold.get("head") != head or not fold.get("single"):
+            return None
+        return head if sha in (fold.get("latent") or ()) else None
+
     def _amend_summary_into_head(self, repo, sha: str, summary: str, metadata: list[str] | None) -> str | None:
         """Amend the summary into *sha*'s message, only while that is safe:
-        the commit is still HEAD, not yet integrated into base, and nothing is
-        staged (``--amend`` would otherwise pull staged work into the commit).
+        the commit is still HEAD (or was just folded into HEAD, see :meth:`_folded_head_for`),
+        not yet integrated into base, and nothing is staged (``--amend`` would otherwise pull
+        staged work into the commit).
         Returns the amended commit's full SHA, or None if no amend happened."""
         try:
-            if repo.rev_parse("HEAD") != sha:
+            head = repo.rev_parse("HEAD")
+            if head != sha and self._folded_head_for(sha, head) is None:
                 return None
             # Worktree mode: the commit sits on a turn branch ahead of base; once merged into
             # base, amending would rewrite integrated history, so only amend while it's still
@@ -10987,18 +11035,39 @@ class ProxyRunner:
             return None
 
     def _backend_idle_for(self, seconds: float) -> bool:
-        """Whether the backend has produced NOTHING for ``seconds`` — judged by BOTH the PTY
-        output and the session transcript. A sub-agent runs inside the main agent and may print
-        nothing to the terminal while it works, but Claude keeps appending its sidechain messages
-        to the transcript, so the file mtime advances. Without the transcript check aGiTrack would
-        read the quiet terminal as "turn finished" and try to commit (and, in no-worktree mode,
-        offer to commit the user's changes) while the turn is in fact still running."""
-        if time.monotonic() - self.last_child_output < seconds:
-            return False
+        """Whether the backend has produced NOTHING for ``seconds`` — judged by the PTY output
+        and the session transcript together.
+
+        A sub-agent runs inside the main agent and may print nothing to the terminal while it
+        works, but Claude keeps appending its sidechain messages to the transcript, so the file
+        mtime advances. Without the transcript check aGiTrack would read the quiet terminal as
+        "turn finished" and try to commit (and, in no-worktree mode, offer to commit the user's
+        changes) while the turn is in fact still running.
+
+        The converse also has to be handled, or nothing ever commits. A backend TUI can emit a
+        low-rate idle HEARTBEAT with nothing running, and every byte of it refreshes
+        ``last_child_output``. Measured in a real Linux Claude session: a steady 8 bytes/second,
+        every second, never a gap — invisible on screen (a few escape bytes), but more than
+        enough to keep the PTY from ever being quiet for CHILD_IDLE_SECONDS. That pinned this
+        to False forever: the turn-end path (`_maybe_agent_commit`) never ran, and turns were
+        only ever committed by the pre-agent flow when the user typed their NEXT prompt, leaving
+        the worktree dirty for as long as the user stayed away. It reproduced on Linux and not
+        on macOS, so the heartbeat's exact rate is platform- and version-specific — which is
+        precisely why the PTY cannot be the sole authority here.
+        So the transcript — which advances only on real backend work — gets the final say: once
+        it has been quiet for ``TRANSCRIPT_IDLE_FACTOR`` x the window, the backend is idle no
+        matter how loud the terminal is. The factor keeps the PTY authoritative for the common
+        case (both quiet ⇒ idle at ``seconds``) and only overrules a chattering one, so a real
+        sub-agent still gets the full transcript-freshness guard above."""
         mtime = self._active_transcript_mtime()
-        if mtime is not None and time.time() - mtime < seconds:
-            return False
-        return True
+        transcript_quiet_for = None if mtime is None else time.time() - mtime
+        if transcript_quiet_for is not None and transcript_quiet_for < seconds:
+            return False  # real backend work — possibly a sub-agent printing nothing to the PTY
+        if time.monotonic() - self.last_child_output >= seconds:
+            return True  # PTY quiet too (or no transcript to consult): the original fast path
+        # PTY still chattering. Only a transcript can overrule it — with no transcript to read
+        # there is no second opinion, so keep the old conservative answer.
+        return transcript_quiet_for is not None and transcript_quiet_for >= seconds * self.TRANSCRIPT_IDLE_FACTOR
 
     def _clear_agent_in_flight_if_idle(self) -> None:
         if self.agent_in_flight and self._backend_idle_for(self.CHILD_IDLE_SECONDS):
