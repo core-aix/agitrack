@@ -477,6 +477,10 @@ class ProxyRunner:
     # forever (see `_backend_idle_for`). Once the transcript — which only advances on real
     # backend work — has been quiet for this multiple of the idle window, the transcript wins.
     TRANSCRIPT_IDLE_FACTOR = 3.0
+    # How often to retry resolving a session's transcript path while it is still unresolved.
+    # The path is cached once found; only misses are retried, so this costs one project-dir
+    # scan per interval and never per tick (see `_active_transcript_mtime`).
+    TRANSCRIPT_LOOKUP_RETRY_SECONDS = 5.0
     POLL_SECONDS = 2.0
     PARSE_COOLDOWN_SECONDS = 10.0
     BASE_POLL_SECONDS = 3.0
@@ -667,6 +671,7 @@ class ProxyRunner:
         # (session id, resolved transcript path) cache for _active_transcript_mtime, so the
         # liveness stat doesn't re-scan the project dirs every idle tick.
         self._transcript_path_cache: tuple[str | None, Path | None] = (None, None)
+        self._transcript_lookup_at = 0.0  # throttle for retrying an unresolved transcript path
         self._last_spawn_command: list[str] = []  # the exact command of the most recent spawn
         # Set when the backend exits repeatedly and aGiTrack stops relaunching, so
         # run() can echo the reason on the restored host screen instead of leaving
@@ -1127,6 +1132,7 @@ class ProxyRunner:
                 "message_until": 0.0,
                 "last_user_input": 0.0,
                 "_transcript_path_cache": (None, None),
+                "_transcript_lookup_at": 0.0,
                 "_message_scroll": 0,
                 "_message_max_scroll": 0,
                 "_message_sticky": False,
@@ -11010,22 +11016,31 @@ class ProxyRunner:
 
     def _active_transcript_mtime(self) -> float | None:
         # The mtime of the active session's live transcript, as a cheap "is the backend still
-        # working" signal. Only consulted once the PTY has already gone quiet (see
-        # `_backend_idle_for`). The transcript PATH is resolved once per session id and cached, so
-        # the per-tick cost is a single `stat`, not a re-scan of every project dir.
+        # working" signal (see `_backend_idle_for`). The transcript PATH is resolved and cached,
+        # so the per-tick cost is a single `stat`, not a re-scan of every project dir.
         session_id = getattr(self.state, "backend_session_id", None) if self.state else None
         if not session_id:
             return None
         cached_id, cached_path = self._transcript_path_cache
-        if cached_id != session_id:
-            resolver = getattr(self.backend, "session_transcript_path", None)
-            cached_path = None
-            if resolver is not None:
-                try:
-                    cached_path = resolver(session_id)
-                except Exception as error:
-                    self._debug(f"transcript path lookup failed: {error!r}")
-            self._transcript_path_cache = (session_id, cached_path)
+        # A MISS must not be cached forever. The transcript often does not exist yet when a
+        # session starts (the backend creates it on the first turn), and the miss used to be
+        # stored keyed by session id — so `cached_id == session_id` on every later call and the
+        # lookup was never retried. That pinned this to None for the whole run, which made
+        # `_backend_idle_for` fall back to the PTY alone; with a TUI heartbeat the PTY is never
+        # quiet, so the turn end was never detected and the session committed NOTHING, ever.
+        # Retry a miss on a throttle: one project-dir scan per interval, not per tick.
+        if cached_id != session_id or cached_path is None:
+            now = time.monotonic()
+            if cached_id != session_id or now - self._transcript_lookup_at >= self.TRANSCRIPT_LOOKUP_RETRY_SECONDS:
+                self._transcript_lookup_at = now
+                resolver = getattr(self.backend, "session_transcript_path", None)
+                cached_path = None
+                if resolver is not None:
+                    try:
+                        cached_path = resolver(session_id)
+                    except Exception as error:
+                        self._debug(f"transcript path lookup failed: {error!r}")
+                self._transcript_path_cache = (session_id, cached_path)
         if cached_path is None:
             return None
         try:
