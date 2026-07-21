@@ -117,18 +117,33 @@ def _is_slash_command(text: str | None) -> bool:
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 
-def _only_monitor_updates(turns) -> bool:
-    """Whether every one of these completed turns was triggered purely by an intermediate
-    background-monitor update (the ``(background monitor update)`` synthetic prompt) with
-    no real user text anywhere — the turns finish_parse_if_ready defers rather than
-    committing one history entry per monitor tick. Any real prompt (typed or queued) or a
-    terminal ``(background task completed)`` turn makes the batch commit-worthy."""
+# A monitor-tick acknowledgment is TRIVIAL when the agent barely responded: a short
+# reply and little output. A turn that did real work off a monitor event (tool calls,
+# file edits, a substantive final report) blows past both bounds and must commit
+# immediately, monitor-triggered or not. (The tick acks that flooded a real repo were
+# ~14 output tokens / ~26 characters; real reports run far larger on both axes.)
+_TRIVIAL_UPDATE_MAX_OUTPUT_TOKENS = 100
+_TRIVIAL_UPDATE_MAX_RESPONSE_CHARS = 240
+
+
+def _only_trivial_monitor_updates(turns) -> bool:
+    """Whether every one of these completed turns is a TRIVIAL intermediate monitor tick:
+    triggered purely by the ``(background monitor update)`` synthetic prompt (no real user
+    text anywhere) AND barely answered. Only such batches does finish_parse_if_ready defer
+    rather than committing one history entry per tick. Any real prompt (typed or queued),
+    a terminal ``(background task completed)`` turn, or a monitor turn with a substantive
+    response (a normal final message, real work) makes the batch commit-worthy."""
     from agitrack.transcripts.claude import MONITOR_UPDATE_LABEL
 
     for turn in turns:
         prompts = [turn.user_prompt or "", *getattr(turn, "queued_followups", [])]
         texts = [p.strip() for p in prompts if p and p.strip()]
         if not texts or any(text != MONITOR_UPDATE_LABEL for text in texts):
+            return False
+        output_tokens = int(getattr(getattr(turn, "tokens", None), "output", 0) or 0)
+        if output_tokens > _TRIVIAL_UPDATE_MAX_OUTPUT_TOKENS:
+            return False
+        if len(turn.final_response or "") > _TRIVIAL_UPDATE_MAX_RESPONSE_CHARS:
             return False
     return True
 
@@ -668,9 +683,9 @@ class CommitEngine:
         # (``require_complete``) these turns are DEFERRED: the watermark stays put and they
         # fold into the next substantive commit (a real prompt, a terminal task
         # notification, or the exit finalize, which passes require_complete=False).
-        if require_complete and complete_turns and _only_monitor_updates(complete_turns):
+        if require_complete and complete_turns and _only_trivial_monitor_updates(complete_turns):
             debug_fn(
-                f"deferring agent commit: {len(complete_turns)} background monitor update turn(s) only "
+                f"deferring agent commit: {len(complete_turns)} trivial background monitor update turn(s) only "
                 f"session_id={new_session_id}"
             )
             return None, awaited
