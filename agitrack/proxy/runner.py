@@ -9390,7 +9390,19 @@ class ProxyRunner:
         if on_worktree:
             self._ensure_turn_branch()  # turn branches are a worktree concept only
         repo.add_tracked()
-        self._review_untracked_popup(include_declined=include_declined, repo=repo, state=state)
+        # The AUTOMATIC capture must not claim a background job's output as the user's
+        # own work (most visibly --no-worktree, where a monitored task writes this very
+        # tree between commits): background-authored files are unstaged and left for the
+        # agent's next commit. The explicit git-commit command (on_worktree=False) keeps
+        # everything stageable — there the user is deliberately committing.
+        skipped_background: list[str] = []
+        if on_worktree:
+            from agitrack.commits.actions import unstage_background_authored
+
+            skipped_background = unstage_background_authored(repo)
+        self._review_untracked_popup(
+            include_declined=include_declined, repo=repo, state=state, exclude_background=on_worktree
+        )
         if not repo.has_staged_changes():
             return False
         # Show exactly which files this commit will capture AND where it lands (the base repo vs
@@ -9405,6 +9417,8 @@ class ProxyRunner:
         is_base = base_path is not None and str(repo_path) == str(base_path)
         where = "the BASE repo" if is_base else "this session's WORKTREE"
         detail = [f"Committing {len(changed)} file(s) to {where} ({repo_path}):", *changed]
+        if skipped_background:
+            detail.append(f"(left for the agent's next commit: {len(skipped_background)} background-task file(s))")
         message = ""
         # Esc cancels the prompt (_prompt_popup returns None) and we continue without
         # committing — note that in the prompt so the user knows it's a safe way out.
@@ -9460,7 +9474,12 @@ class ProxyRunner:
         return True
 
     def _review_untracked_popup(
-        self, *, include_declined: bool, repo: GitRepo | None = None, state: AgitrackState | None = None
+        self,
+        *,
+        include_declined: bool,
+        repo: GitRepo | None = None,
+        state: AgitrackState | None = None,
+        exclude_background: bool = False,
     ) -> str:
         repo = repo or self.repo
         state = state or self.state
@@ -9468,6 +9487,12 @@ class ProxyRunner:
         untracked = repo.untracked_entries()
         declined = set(state.declined_untracked())
         candidates = untracked if include_declined else [path for path in untracked if path not in declined]
+        if exclude_background and candidates:
+            # New files a background job keeps creating (e.g. fresh run directories under a
+            # results tree it has been writing) are not the user's to stage here.
+            from agitrack.commits.actions import split_background_paths
+
+            candidates, _background = split_background_paths(repo, candidates)
         if not candidates:
             return "No untracked files to review."
         # Cap the listed files to the terminal height so the question and the input
