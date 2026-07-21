@@ -10067,3 +10067,63 @@ def test_late_transcript_unblocks_idle_despite_a_heartbeat(tmp_path):
 
     runner.last_child_output = time.monotonic()  # heartbeat still going
     assert runner._backend_idle_for(4.0) is True
+
+
+# --- RepoChangeHandler: a READ is not a worktree change ----------------------------------------
+# Regression (the reported "aGiTrack just stops committing" on Linux, no-worktree + tmux):
+# watchdog's inotify backend emits IN_OPEN / IN_CLOSE_NOWRITE, which `on_any_event` counted as
+# worktree changes. Every one resets `_last_change_at`, so `worktree_settled` never became true,
+# the commit gate never opened, and NOTHING was ever committed. Measured on the reporting repo
+# with nobody writing: 1536 opened + 1536 closed_no_write events in 25s (~123/second) from
+# ordinary reads. macOS FSEvents reports only real modifications, hence Linux-only.
+
+
+class _Event:
+    """Minimal stand-in for a watchdog event (event_type + src_path is all the handler reads)."""
+
+    def __init__(self, event_type, src_path):
+        self.event_type = event_type
+        self.src_path = src_path
+
+
+def _handler_fires(event_type, relative, repo="/repo"):
+    changed, wake = threading.Event(), threading.Event()
+    from agitrack.proxy.runner import RepoChangeHandler
+
+    RepoChangeHandler(repo, changed, wake).on_any_event(_Event(event_type, f"{repo}/{relative}"))
+    assert changed.is_set() == wake.is_set()  # the worker wake must track the change flag
+    return changed.is_set()
+
+
+def test_read_only_events_are_not_worktree_changes():
+    # The bug: these fire constantly from ordinary reads and must never count as changes.
+    assert _handler_fires("opened", "paper/main.tex") is False
+    assert _handler_fires("closed_no_write", "paper/main.tex") is False
+    assert _handler_fires("opened", ".gitignore") is False
+    assert _handler_fires("closed_no_write", "AGENTS.md") is False
+
+
+def test_real_modifications_still_register():
+    for event_type in ("created", "modified", "deleted", "moved", "closed"):
+        assert _handler_fires(event_type, "paper/main.tex") is True, event_type
+
+
+def test_ignored_directories_still_ignored_for_write_events():
+    for part in (".agitrack", ".git", ".venv", "__pycache__", ".pytest_cache"):
+        assert _handler_fires("modified", f"{part}/whatever.json") is False, part
+
+
+def test_a_storm_of_reads_never_marks_the_worktree_dirty():
+    # The exact failure shape: thousands of read events, zero change signals — so
+    # `_last_change_at` is never reset and `worktree_settled` can actually become true.
+    from agitrack.proxy.runner import RepoChangeHandler
+
+    changed = threading.Event()
+    handler = RepoChangeHandler("/repo", changed)
+    for _ in range(1536):
+        handler.on_any_event(_Event("opened", "/repo/.gitignore"))
+        handler.on_any_event(_Event("closed_no_write", "/repo/.gitignore"))
+    assert changed.is_set() is False
+    # ...and one genuine write still gets through immediately afterwards.
+    handler.on_any_event(_Event("modified", "/repo/paper/main.tex"))
+    assert changed.is_set() is True

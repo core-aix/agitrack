@@ -261,6 +261,20 @@ def _short_session(session_id: str | None) -> str:
 class RepoChangeHandler(FileSystemEventHandler):
     IGNORED_PARTS = {".agitrack", ".git", ".pytest_cache", ".venv", "__pycache__"}
 
+    # Event types that mean "somebody READ a file", not "the worktree changed". watchdog's
+    # inotify backend reports IN_OPEN and IN_CLOSE_NOWRITE as these; macOS FSEvents reports
+    # only real modifications, which is why this was a Linux-only failure.
+    #
+    # Counting a read as a change is catastrophic here, not merely noisy: `_last_change_at` is
+    # reset on every one, so `worktree_settled` (now - _last_change_at >= FILE_STABLE_SECONDS)
+    # never becomes true, the commit gate never opens, and aGiTrack stops committing entirely
+    # while looking perfectly healthy. Measured on a real repo with NOTHING being written:
+    # 1536 opened + 1536 closed_no_write events in 25s — about 123 phantom "changes" a second,
+    # from ordinary reads of files like .gitignore and AGENTS.md.
+    #
+    # `closed` (IN_CLOSE_WRITE) is deliberately NOT in this set: it follows an actual write.
+    READ_ONLY_EVENT_TYPES = {"opened", "closed_no_write"}
+
     def __init__(self, repo_path, changed: threading.Event, wake: "threading.Event | None" = None) -> None:
         self.repo_path = repo_path
         self.changed = changed
@@ -269,6 +283,10 @@ class RepoChangeHandler(FileSystemEventHandler):
         self.wake = wake
 
     def on_any_event(self, event: FileSystemEvent) -> None:
+        # Reads are not changes. Checked by event_type STRING rather than by class so this
+        # works across watchdog versions (older ones simply never emit these types).
+        if getattr(event, "event_type", "") in self.READ_ONLY_EVENT_TYPES:
+            return
         # watchdog reports src_path as str or bytes depending on how the watch was
         # set up; normalise to str so the IGNORED_PARTS check is uniform.
         src_path = os.fsdecode(event.src_path)
@@ -672,6 +690,8 @@ class ProxyRunner:
         # liveness stat doesn't re-scan the project dirs every idle tick.
         self._transcript_path_cache: tuple[str | None, Path | None] = (None, None)
         self._transcript_lookup_at = 0.0  # throttle for retrying an unresolved transcript path
+        self._commit_gate_last: str | None = None  # last logged commit-gate snapshot (debug trace)
+        self._commit_gate_logged_at = 0.0
         self._last_spawn_command: list[str] = []  # the exact command of the most recent spawn
         # Set when the backend exits repeatedly and aGiTrack stops relaunching, so
         # run() can echo the reason on the restored host screen instead of leaving
@@ -11014,6 +11034,45 @@ class ProxyRunner:
             self._debug(f"untracked snapshot failed: {error!r}")
             self.untracked_before_turn = frozenset()
 
+    # How often the commit-gate trace may log while nothing changes. The gate is evaluated on
+    # every pipeline pass; without a throttle a stuck runner would write thousands of identical
+    # lines. Any CHANGE to the gate state logs immediately regardless of this.
+    COMMIT_GATE_TRACE_SECONDS = 30.0
+
+    def _trace_commit_gate(self, now: float, worktree_settled: bool) -> None:
+        """Debug-gated snapshot of every input that decides whether a turn gets committed.
+
+        When aGiTrack "just stops committing", the cause is always one of these flags latching,
+        and none of them is observable from outside the process — the reported no-worktree hangs
+        each cost a full reproduction to identify. Logging them (DEBUG_PROXY=1) turns that into
+        one line. Emitted on every state change, and at most once per COMMIT_GATE_TRACE_SECONDS
+        otherwise, so a healthy run costs ~2 lines a minute."""
+        if not self.debug_proxy:
+            return
+        try:
+            transcript_mtime = self._active_transcript_mtime()
+            state = (
+                f"settled={worktree_settled} idle={self._backend_idle_for(self.CHILD_IDLE_SECONDS)} "
+                f"status_check_pending={self.status_check_pending} parse_pending={self.parse_pending} "
+                f"parse_alive={bool(self.agent_parse_thread and self.agent_parse_thread.is_alive())} "
+                f"parse_active={getattr(self.active, 'agent_parse_active', None)} "
+                f"parse_result={getattr(self.active, 'agent_parse_result', None) is not None} "
+                f"in_flight={self.agent_in_flight} awaiting_commit={self.turn_awaiting_commit} "
+                f"last_status={self.last_status.strip()[:40]!r} "
+                f"last_attempt={self.last_parse_attempt_status.strip()[:40]!r} "
+                f"transcript_quiet={'n/a' if transcript_mtime is None else round(time.time() - transcript_mtime)} "
+                f"pty_quiet={round(now - self.last_child_output, 1)}"
+            )
+        except Exception as error:  # tracing must never break the pipeline
+            self._debug(f"commit gate trace failed: {error!r}")
+            return
+        changed = state != getattr(self, "_commit_gate_last", None)
+        if not changed and now - getattr(self, "_commit_gate_logged_at", 0.0) < self.COMMIT_GATE_TRACE_SECONDS:
+            return
+        self._commit_gate_last = state
+        self._commit_gate_logged_at = now
+        self._debug(f"commit gate {state}")
+
     def _active_transcript_mtime(self) -> float | None:
         # The mtime of the active session's live transcript, as a cheap "is the backend still
         # working" signal (see `_backend_idle_for`). The transcript PATH is resolved and cached,
@@ -11278,6 +11337,7 @@ class ProxyRunner:
         # never advanced, so this naturally reduces to the old poll-then-read once
         # the backend goes idle.)
         worktree_settled = now - self._last_change_at >= self.FILE_STABLE_SECONDS
+        self._trace_commit_gate(now, worktree_settled)
         # Transcript-aware: a silent sub-agent keeps the turn running even with a quiet terminal,
         # so aGiTrack must not treat this as the turn ending (would commit / offer mid-turn).
         backend_idle = self._backend_idle_for(self.CHILD_IDLE_SECONDS)
