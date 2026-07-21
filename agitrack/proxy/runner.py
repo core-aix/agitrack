@@ -261,6 +261,20 @@ def _short_session(session_id: str | None) -> str:
 class RepoChangeHandler(FileSystemEventHandler):
     IGNORED_PARTS = {".agitrack", ".git", ".pytest_cache", ".venv", "__pycache__"}
 
+    # Event types that mean "somebody READ a file", not "the worktree changed". watchdog's
+    # inotify backend reports IN_OPEN and IN_CLOSE_NOWRITE as these; macOS FSEvents reports
+    # only real modifications, which is why this was a Linux-only failure.
+    #
+    # Counting a read as a change is catastrophic here, not merely noisy: `_last_change_at` is
+    # reset on every one, so `worktree_settled` (now - _last_change_at >= FILE_STABLE_SECONDS)
+    # never becomes true, the commit gate never opens, and aGiTrack stops committing entirely
+    # while looking perfectly healthy. Measured on a real repo with NOTHING being written:
+    # 1536 opened + 1536 closed_no_write events in 25s — about 123 phantom "changes" a second,
+    # from ordinary reads of files like .gitignore and AGENTS.md.
+    #
+    # `closed` (IN_CLOSE_WRITE) is deliberately NOT in this set: it follows an actual write.
+    READ_ONLY_EVENT_TYPES = {"opened", "closed_no_write"}
+
     def __init__(self, repo_path, changed: threading.Event, wake: "threading.Event | None" = None) -> None:
         self.repo_path = repo_path
         self.changed = changed
@@ -269,6 +283,10 @@ class RepoChangeHandler(FileSystemEventHandler):
         self.wake = wake
 
     def on_any_event(self, event: FileSystemEvent) -> None:
+        # Reads are not changes. Checked by event_type STRING rather than by class so this
+        # works across watchdog versions (older ones simply never emit these types).
+        if getattr(event, "event_type", "") in self.READ_ONLY_EVENT_TYPES:
+            return
         # watchdog reports src_path as str or bytes depending on how the watch was
         # set up; normalise to str so the IGNORED_PARTS check is uniform.
         src_path = os.fsdecode(event.src_path)
@@ -472,6 +490,15 @@ class ProxyRunner:
     # `self.X` still resolves for runners built via __new__ (tests).
     FILE_STABLE_SECONDS = 8.0
     CHILD_IDLE_SECONDS = 4.0
+    # A backend TUI's idle heartbeat (measured at 8 bytes/second on Linux) keeps
+    # `last_child_output` permanently fresh, which would let the PTY veto turn-end detection
+    # forever (see `_backend_idle_for`). Once the transcript — which only advances on real
+    # backend work — has been quiet for this multiple of the idle window, the transcript wins.
+    TRANSCRIPT_IDLE_FACTOR = 3.0
+    # How often to retry resolving a session's transcript path while it is still unresolved.
+    # The path is cached once found; only misses are retried, so this costs one project-dir
+    # scan per interval and never per tick (see `_active_transcript_mtime`).
+    TRANSCRIPT_LOOKUP_RETRY_SECONDS = 5.0
     POLL_SECONDS = 2.0
     PARSE_COOLDOWN_SECONDS = 10.0
     BASE_POLL_SECONDS = 3.0
@@ -662,6 +689,9 @@ class ProxyRunner:
         # (session id, resolved transcript path) cache for _active_transcript_mtime, so the
         # liveness stat doesn't re-scan the project dirs every idle tick.
         self._transcript_path_cache: tuple[str | None, Path | None] = (None, None)
+        self._transcript_lookup_at = 0.0  # throttle for retrying an unresolved transcript path
+        self._commit_gate_last: str | None = None  # last logged commit-gate snapshot (debug trace)
+        self._commit_gate_logged_at = 0.0
         self._last_spawn_command: list[str] = []  # the exact command of the most recent spawn
         # Set when the backend exits repeatedly and aGiTrack stops relaunching, so
         # run() can echo the reason on the restored host screen instead of leaving
@@ -782,6 +812,9 @@ class ProxyRunner:
         self._summary_thread: threading.Thread | None = None  # background commit-summary worker (#8)
         self._summary_result: dict | None = None  # finished summary awaiting main-thread application
         self._summary_pending: dict | None = None  # {"sha", "since"} while a summary is being computed
+        # {"head", "latent", "single"} for the newest no-worktree AUTO fold, so a late summary can
+        # still find the real commit that absorbed its latent turn (see _folded_head_for).
+        self._last_auto_fold: dict | None = None
         self._precompact_thread: threading.Thread | None = None  # background pre-compaction summary worker
         self._precompact_result: dict | None = None
         # Automatic backend self-update: when the agent's own updater is sandbox-blocked,
@@ -1119,6 +1152,7 @@ class ProxyRunner:
                 "message_until": 0.0,
                 "last_user_input": 0.0,
                 "_transcript_path_cache": (None, None),
+                "_transcript_lookup_at": 0.0,
                 "_message_scroll": 0,
                 "_message_max_scroll": 0,
                 "_message_sticky": False,
@@ -2039,6 +2073,10 @@ class ProxyRunner:
         if not message:
             return
         try:
+            folded = list(self.repo.log_shas("HEAD", tip))  # the latent turns this fold absorbs
+        except Exception:
+            folded = []
+        try:
             self.repo.add_tracked()
             declined = set(self.state.declined_untracked())
             self.repo.stage_paths([p for p in self.repo.untracked_entries() if p not in declined])
@@ -2052,6 +2090,15 @@ class ProxyRunner:
             self._render_manual_trailer()
             self._last_agent_commit_id = sha
             self._sessions_with_activity.add(self.state.session_id)
+            # Remember which latent turns this fold absorbed, so a summary that lands AFTER the
+            # deadline can still be amended into the real commit instead of being stranded on the
+            # latent one (see _folded_head_for). Only the newest fold is tracked: once HEAD moves
+            # on, amending is no longer safe anyway.
+            self._last_auto_fold = {
+                "head": self._manual_last_head,
+                "latent": folded,
+                "single": len(bodies) == 1,
+            }
         except Exception as error:
             self._debug(f"auto fold failed: {error!r}")
 
@@ -9834,9 +9881,16 @@ class ProxyRunner:
                 self._commit_summarized = True
             else:
                 # Already integrated or superseded: the summary lives in the
-                # commit's git notes instead of its message.
+                # commit's git notes instead of its message. Prefer the commit that
+                # ABSORBED this latent turn (a multi-turn auto fold, which must not be
+                # amended) over the latent sha itself — a note on a latent commit hangs
+                # off an object no branch reaches, so `git log --notes` never shows it
+                # and `git gc` eventually collects it.
+                fold = getattr(self, "_last_auto_fold", None)
                 target = sha
-                self._debug(f"summary for {sha} recorded as notes only")
+                if fold and sha in (fold.get("latent") or ()) and fold.get("head"):
+                    target = str(fold["head"])
+                self._debug(f"summary for {sha} recorded as notes only on {target}")
             repo.notes_add(target, summary, namespace="agitrack/commit-summary")
             if self._manual_commits:
                 # Manual mode: the summary just landed as a note on a pending latent commit —
@@ -9858,13 +9912,33 @@ class ProxyRunner:
         except Exception as error:
             self._debug(f"applying commit summary failed: {error!r}")
 
+    def _folded_head_for(self, sha: str, head: str) -> str | None:
+        """HEAD, when it is the auto-fold commit that absorbed latent commit *sha* as its ONLY
+        turn — else None.
+
+        No-worktree AUTO mode summarizes the **latent** commit, then folds that latent commit into
+        a real commit on the working branch. So by the time a slow summary lands, its sha is never
+        HEAD and :meth:`_amend_summary_into_head` used to give up, stranding the summary as a note
+        on a commit that is not in any branch's history — unreachable, and lost to `git gc`. Every
+        commit in the reported repo lost its summary this way. Mapping the latent sha back to the
+        fold commit gives the late summary the same second chance worktree mode has always had.
+
+        Restricted to single-turn folds: a multi-turn fold's message is a squash of several turn
+        bodies, and this summary describes only one of them, so it goes to notes instead."""
+        fold = getattr(self, "_last_auto_fold", None)
+        if not fold or fold.get("head") != head or not fold.get("single"):
+            return None
+        return head if sha in (fold.get("latent") or ()) else None
+
     def _amend_summary_into_head(self, repo, sha: str, summary: str, metadata: list[str] | None) -> str | None:
         """Amend the summary into *sha*'s message, only while that is safe:
-        the commit is still HEAD, not yet integrated into base, and nothing is
-        staged (``--amend`` would otherwise pull staged work into the commit).
+        the commit is still HEAD (or was just folded into HEAD, see :meth:`_folded_head_for`),
+        not yet integrated into base, and nothing is staged (``--amend`` would otherwise pull
+        staged work into the commit).
         Returns the amended commit's full SHA, or None if no amend happened."""
         try:
-            if repo.rev_parse("HEAD") != sha:
+            head = repo.rev_parse("HEAD")
+            if head != sha and self._folded_head_for(sha, head) is None:
                 return None
             # Worktree mode: the commit sits on a turn branch ahead of base; once merged into
             # base, amending would rewrite integrated history, so only amend while it's still
@@ -10960,24 +11034,72 @@ class ProxyRunner:
             self._debug(f"untracked snapshot failed: {error!r}")
             self.untracked_before_turn = frozenset()
 
+    # How often the commit-gate trace may log while nothing changes. The gate is evaluated on
+    # every pipeline pass; without a throttle a stuck runner would write thousands of identical
+    # lines. Any CHANGE to the gate state logs immediately regardless of this.
+    COMMIT_GATE_TRACE_SECONDS = 30.0
+
+    def _trace_commit_gate(self, now: float, worktree_settled: bool) -> None:
+        """Debug-gated snapshot of every input that decides whether a turn gets committed.
+
+        When aGiTrack "just stops committing", the cause is always one of these flags latching,
+        and none of them is observable from outside the process — the reported no-worktree hangs
+        each cost a full reproduction to identify. Logging them (DEBUG_PROXY=1) turns that into
+        one line. Emitted on every state change, and at most once per COMMIT_GATE_TRACE_SECONDS
+        otherwise, so a healthy run costs ~2 lines a minute."""
+        if not self.debug_proxy:
+            return
+        try:
+            transcript_mtime = self._active_transcript_mtime()
+            state = (
+                f"settled={worktree_settled} idle={self._backend_idle_for(self.CHILD_IDLE_SECONDS)} "
+                f"status_check_pending={self.status_check_pending} parse_pending={self.parse_pending} "
+                f"parse_alive={bool(self.agent_parse_thread and self.agent_parse_thread.is_alive())} "
+                f"parse_active={getattr(self.active, 'agent_parse_active', None)} "
+                f"parse_result={getattr(self.active, 'agent_parse_result', None) is not None} "
+                f"in_flight={self.agent_in_flight} awaiting_commit={self.turn_awaiting_commit} "
+                f"last_status={self.last_status.strip()[:40]!r} "
+                f"last_attempt={self.last_parse_attempt_status.strip()[:40]!r} "
+                f"transcript_quiet={'n/a' if transcript_mtime is None else round(time.time() - transcript_mtime)} "
+                f"pty_quiet={round(now - self.last_child_output, 1)}"
+            )
+        except Exception as error:  # tracing must never break the pipeline
+            self._debug(f"commit gate trace failed: {error!r}")
+            return
+        changed = state != getattr(self, "_commit_gate_last", None)
+        if not changed and now - getattr(self, "_commit_gate_logged_at", 0.0) < self.COMMIT_GATE_TRACE_SECONDS:
+            return
+        self._commit_gate_last = state
+        self._commit_gate_logged_at = now
+        self._debug(f"commit gate {state}")
+
     def _active_transcript_mtime(self) -> float | None:
         # The mtime of the active session's live transcript, as a cheap "is the backend still
-        # working" signal. Only consulted once the PTY has already gone quiet (see
-        # `_backend_idle_for`). The transcript PATH is resolved once per session id and cached, so
-        # the per-tick cost is a single `stat`, not a re-scan of every project dir.
+        # working" signal (see `_backend_idle_for`). The transcript PATH is resolved and cached,
+        # so the per-tick cost is a single `stat`, not a re-scan of every project dir.
         session_id = getattr(self.state, "backend_session_id", None) if self.state else None
         if not session_id:
             return None
         cached_id, cached_path = self._transcript_path_cache
-        if cached_id != session_id:
-            resolver = getattr(self.backend, "session_transcript_path", None)
-            cached_path = None
-            if resolver is not None:
-                try:
-                    cached_path = resolver(session_id)
-                except Exception as error:
-                    self._debug(f"transcript path lookup failed: {error!r}")
-            self._transcript_path_cache = (session_id, cached_path)
+        # A MISS must not be cached forever. The transcript often does not exist yet when a
+        # session starts (the backend creates it on the first turn), and the miss used to be
+        # stored keyed by session id — so `cached_id == session_id` on every later call and the
+        # lookup was never retried. That pinned this to None for the whole run, which made
+        # `_backend_idle_for` fall back to the PTY alone; with a TUI heartbeat the PTY is never
+        # quiet, so the turn end was never detected and the session committed NOTHING, ever.
+        # Retry a miss on a throttle: one project-dir scan per interval, not per tick.
+        if cached_id != session_id or cached_path is None:
+            now = time.monotonic()
+            if cached_id != session_id or now - self._transcript_lookup_at >= self.TRANSCRIPT_LOOKUP_RETRY_SECONDS:
+                self._transcript_lookup_at = now
+                resolver = getattr(self.backend, "session_transcript_path", None)
+                cached_path = None
+                if resolver is not None:
+                    try:
+                        cached_path = resolver(session_id)
+                    except Exception as error:
+                        self._debug(f"transcript path lookup failed: {error!r}")
+                self._transcript_path_cache = (session_id, cached_path)
         if cached_path is None:
             return None
         try:
@@ -10987,18 +11109,39 @@ class ProxyRunner:
             return None
 
     def _backend_idle_for(self, seconds: float) -> bool:
-        """Whether the backend has produced NOTHING for ``seconds`` — judged by BOTH the PTY
-        output and the session transcript. A sub-agent runs inside the main agent and may print
-        nothing to the terminal while it works, but Claude keeps appending its sidechain messages
-        to the transcript, so the file mtime advances. Without the transcript check aGiTrack would
-        read the quiet terminal as "turn finished" and try to commit (and, in no-worktree mode,
-        offer to commit the user's changes) while the turn is in fact still running."""
-        if time.monotonic() - self.last_child_output < seconds:
-            return False
+        """Whether the backend has produced NOTHING for ``seconds`` — judged by the PTY output
+        and the session transcript together.
+
+        A sub-agent runs inside the main agent and may print nothing to the terminal while it
+        works, but Claude keeps appending its sidechain messages to the transcript, so the file
+        mtime advances. Without the transcript check aGiTrack would read the quiet terminal as
+        "turn finished" and try to commit (and, in no-worktree mode, offer to commit the user's
+        changes) while the turn is in fact still running.
+
+        The converse also has to be handled, or nothing ever commits. A backend TUI can emit a
+        low-rate idle HEARTBEAT with nothing running, and every byte of it refreshes
+        ``last_child_output``. Measured in a real Linux Claude session: a steady 8 bytes/second,
+        every second, never a gap — invisible on screen (a few escape bytes), but more than
+        enough to keep the PTY from ever being quiet for CHILD_IDLE_SECONDS. That pinned this
+        to False forever: the turn-end path (`_maybe_agent_commit`) never ran, and turns were
+        only ever committed by the pre-agent flow when the user typed their NEXT prompt, leaving
+        the worktree dirty for as long as the user stayed away. It reproduced on Linux and not
+        on macOS, so the heartbeat's exact rate is platform- and version-specific — which is
+        precisely why the PTY cannot be the sole authority here.
+        So the transcript — which advances only on real backend work — gets the final say: once
+        it has been quiet for ``TRANSCRIPT_IDLE_FACTOR`` x the window, the backend is idle no
+        matter how loud the terminal is. The factor keeps the PTY authoritative for the common
+        case (both quiet ⇒ idle at ``seconds``) and only overrules a chattering one, so a real
+        sub-agent still gets the full transcript-freshness guard above."""
         mtime = self._active_transcript_mtime()
-        if mtime is not None and time.time() - mtime < seconds:
-            return False
-        return True
+        transcript_quiet_for = None if mtime is None else time.time() - mtime
+        if transcript_quiet_for is not None and transcript_quiet_for < seconds:
+            return False  # real backend work — possibly a sub-agent printing nothing to the PTY
+        if time.monotonic() - self.last_child_output >= seconds:
+            return True  # PTY quiet too (or no transcript to consult): the original fast path
+        # PTY still chattering. Only a transcript can overrule it — with no transcript to read
+        # there is no second opinion, so keep the old conservative answer.
+        return transcript_quiet_for is not None and transcript_quiet_for >= seconds * self.TRANSCRIPT_IDLE_FACTOR
 
     def _clear_agent_in_flight_if_idle(self) -> None:
         if self.agent_in_flight and self._backend_idle_for(self.CHILD_IDLE_SECONDS):
@@ -11194,6 +11337,7 @@ class ProxyRunner:
         # never advanced, so this naturally reduces to the old poll-then-read once
         # the backend goes idle.)
         worktree_settled = now - self._last_change_at >= self.FILE_STABLE_SECONDS
+        self._trace_commit_gate(now, worktree_settled)
         # Transcript-aware: a silent sub-agent keeps the turn running even with a quiet terminal,
         # so aGiTrack must not treat this as the turn ending (would commit / offer mid-turn).
         backend_idle = self._backend_idle_for(self.CHILD_IDLE_SECONDS)

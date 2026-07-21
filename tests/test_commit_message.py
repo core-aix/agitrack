@@ -1,6 +1,8 @@
 import pytest
 
 from agitrack.commits import build_agent_commit_message, build_user_commit_message, render_interaction_trace
+from agitrack.commits.message import PATH_MASK, SECRET_MASK, apply_summary_to_message, mask_paths
+from agitrack.commits.message import _mask_secrets as _mask_secrets_for_test
 
 
 def test_render_interaction_trace_matches_committed_trace_and_masks_secrets():
@@ -650,3 +652,131 @@ def test_copy_origin_records_contributor_in_trace_and_metadata():
     assert "copied_from: ses_shared (feature-x)" in message
     assert "copied_from_contributor: alice+bob" in message
     assert "copied from alice+bob's shared session 'feature-x'" in message
+
+
+# --- absolute filesystem paths are masked out of commit messages -------------------------------
+# Commit messages get pushed and read by others; an absolute path leaks the account name and the
+# machine's layout (~/Code/client-work/..., /home/alice/.ssh/config) for no benefit to the reader.
+# Every absolute path is masked. RELATIVE paths are kept on purpose: "paper/main.tex" says which
+# file changed and reveals nothing about the machine.
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Check this repository ~/metacognition-compression.",
+        "Edited ~/metacognition-compression/paper/main.tex",
+        "/home/shiqiangwang/agitrack/agitrack/proxy/runner.py:11001",
+        "see ~/Code/metacognition-compression for context",
+        "Read /home/alice/.ssh/config",
+        "/Users/alice/Desktop/notes.md",
+        "ran /usr/bin/python3 -m pytest",
+        "cat /etc/hosts",
+        "log at /tmp/build.log",
+        r"C:\Users\alice\project\main.py",
+        "C:/Users/alice/project/main.py",
+        r"\\fileserver\share\docs\spec.md",
+        "~alice/notes",
+    ],
+)
+def test_absolute_paths_are_masked(text):
+    masked = mask_paths(text)
+    assert PATH_MASK in masked
+    for leak in ("shiqiangwang", "alice", "/home/", "/Users/", "~/", "/etc/", "/tmp/", "fileserver"):
+        assert leak not in masked, f"{leak!r} survived in {masked!r}"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Relative paths are the useful, non-identifying case — always kept.
+        "Edited paper/main.tex",
+        "src/agitrack/proxy/runner.py needs work",
+        # URLs are not filesystem paths.
+        "https://github.com/core-aix/agitrack",
+        "http://agitrack.core-aix.org/ is the site",
+        "git@github.com:core-aix/agitrack.git",
+        # Backend slash commands look like one-segment absolute paths but are not; they appear
+        # verbatim in prompts and commit subjects and must survive.
+        "/compact",
+        "ran /model then /clear",
+        # Ordinary prose containing slashes.
+        "use and/or here",
+        "input/output/buffer sizes",
+        "24/7 uptime",
+        "see 2026/07/21 notes",
+    ],
+)
+def test_non_paths_are_left_alone(text):
+    assert mask_paths(text) == text
+
+
+def test_sentence_punctuation_survives_masking():
+    # "see ~/notes." keeps its full stop: the trailing '.' ends the sentence, not the path.
+    assert mask_paths("see ~/notes.") == f"see {PATH_MASK}."
+    assert mask_paths("(see /etc/hosts)") == f"(see {PATH_MASK})"
+    assert mask_paths("~/a, ~/b; ~/c") == f"{PATH_MASK}, {PATH_MASK}; {PATH_MASK}"
+
+
+def test_paths_are_masked_throughout_a_built_commit_message():
+    message = build_agent_commit_message(
+        latest_prompt="Check ~/proj and fix /home/alice/proj/app.py",
+        trace=[
+            {"role": "user", "content": "Look at ~/Code/notes/todo.md and /etc/hosts"},
+            {
+                "role": "agent",
+                "content": "Edited paper/main.tex; read /home/alice/.ssh/config.\nSee https://github.com/core-aix/agitrack",
+            },
+        ],
+        backend="claude",
+        backend_session_id="ses-1",
+        agitrack_session_id="agit-1",
+        model="m1",
+        session_name="s1",
+    )
+    assert message.startswith(f"<aGiTrack> Check {PATH_MASK} and fix {PATH_MASK}")
+    assert "alice" not in message and "~/" not in message and "/etc/" not in message
+    assert "paper/main.tex" in message  # the relative path survives — it's the useful part
+    assert "https://github.com/core-aix/agitrack" in message  # URLs untouched
+
+
+def test_paths_are_masked_in_an_applied_summary():
+    base = build_agent_commit_message(
+        latest_prompt="do the thing",
+        trace=[{"role": "user", "content": "do the thing"}],
+        backend="claude",
+        backend_session_id="ses-1",
+        agitrack_session_id="agit-1",
+        model="m1",
+        session_name="s1",
+    )
+    amended = apply_summary_to_message(base, "Fixed ~/agitrack/agitrack/proxy/runner.py")
+    assert amended.splitlines()[0] == f"<aGiTrack> Fixed {PATH_MASK}"
+
+
+def test_path_masking_does_not_disturb_secret_redaction():
+    # Both run over the same text; the path pass must not chew up a [REDACTED] marker.
+    masked = _mask_secrets_for_test("token=ghp_abcdefghijklmnopqrstuvwxyz0123 in ~/.netrc")
+    assert SECRET_MASK in masked and PATH_MASK in masked
+    assert "ghp_" not in masked and "~/" not in masked
+
+
+def test_tilde_approximation_is_not_a_path():
+    # "~123/second" is a tilde meaning "approximately", not a home path — seen verbatim in
+    # this project's own history as "(~123/second)".
+    assert mask_paths("(~123/second)") == "(~123/second)"
+    assert mask_paths("about ~50/day") == "about ~50/day"
+
+
+def test_masking_stops_at_markdown_backticks():
+    # The closing backtick must survive: "`~/agitrack` editable" had been mangled to
+    # "`[PATH] editable" when backticks counted as path characters.
+    assert mask_paths("pipx resolves to `~/agitrack` editable") == f"pipx resolves to `{PATH_MASK}` editable"
+    assert mask_paths("`/home/alice/x/y` (editable)") == f"`{PATH_MASK}` (editable)"
+
+
+def test_route_like_strings_are_masked_by_design():
+    # KNOWN, DELIBERATE trade-off: an HTTP route is textually identical to an absolute path,
+    # so "/learn/state" is masked too. Masking a route only costs readability; the alternative
+    # (a carve-out for extension-less lowercase paths) would let real paths through.
+    assert mask_paths("the `/learn/state` endpoint") == f"the `{PATH_MASK}` endpoint"

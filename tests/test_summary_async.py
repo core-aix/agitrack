@@ -553,3 +553,76 @@ def test_new_prompt_flush_leaves_conflicting_turn_for_later(tmp_path, monkeypatc
     assert not repo.merge_in_progress() and not repo.has_changes()  # tree clean
     assert repo.current_branch() == "agitrack/test/s1/t1"  # work still on its branch
     assert repo.rev_parse(base) != repo.rev_parse(sha)  # base not advanced
+
+
+def test_late_summary_is_amended_into_the_commit_that_absorbed_the_latent_turn(tmp_path, monkeypatch):
+    # The reported "no summary on any commit" bug. In no-worktree AUTO mode the summary is
+    # computed for the LATENT commit, which is then folded into a real commit on the working
+    # branch. When the summarizer overruns SUMMARY_WAIT_SECONDS (measured at 48-58s against a
+    # 45s deadline on the reporting machine) the fold already happened, so the latent sha was
+    # no longer HEAD, _amend_summary_into_head gave up, and the summary was written as a note
+    # on a commit no branch reaches — invisible to `git log` and eventually gc'd. Every commit
+    # in that repo lost its summary this way.
+    runner, repo = _noworktree_auto_runner(tmp_path, monkeypatch)
+    FakeSummarizer.gate = threading.Event()  # hold the summary past the deadline
+    latent = _record_latent_turn(runner, repo)
+
+    # The agent keeps editing after the latent snapshot, so the fold re-stages the worktree and
+    # produces a genuinely different commit — as it always does in practice, where the fold also
+    # lands seconds later than the latent commit-tree.
+    (repo.repo / "feature.txt").write_text("feature\nmore\n", encoding="utf-8")
+
+    # Deadline expires while the summary is still running: the fold lands the prompt-based message.
+    runner.SUMMARY_WAIT_SECONDS = 0.0
+    runner._auto_fold_latent_pending()
+    folded = repo.rev_parse("HEAD")
+    assert repo.commit_message("HEAD").startswith("<aGiTrack> build the widget renderer")
+    # The commit the user sees is NOT the summarized latent one (compare FULL shas: a short sha
+    # is a prefix of the full one, so `!=` on mixed widths silently passes).
+    assert folded != repo.rev_parse(latent)
+    assert runner._summary_pending is not None  # still in flight
+
+    # The summary finally arrives.
+    FakeSummarizer.gate.set()
+    runner._summary_thread.join(timeout=10)
+    runner._service_commit_summary()
+
+    head_msg = repo.commit_message("HEAD")
+    assert head_msg.startswith("<aGiTrack> Implement the widget renderer with caching")
+    assert "Also reworks the cache keys." in head_msg
+    # ...and the note rides a commit the branch actually reaches, not the orphaned latent one.
+    amended = repo.rev_parse("HEAD")
+    assert repo.notes_show(amended, namespace="agitrack/commit-summary")
+    assert repo.is_ancestor(amended, "HEAD")
+    assert not repo.is_ancestor(latent, "HEAD")  # the latent commit never joins the history
+
+
+def test_late_summary_on_a_multi_turn_fold_lands_as_a_reachable_note(tmp_path, monkeypatch):
+    # A fold that squashed SEVERAL latent turns must not be amended — this summary describes
+    # only one of them. It still must not be stranded: the note goes on the fold commit (which
+    # a branch reaches) rather than the latent sha (which none does).
+    runner, repo = _noworktree_auto_runner(tmp_path, monkeypatch)
+    FakeSummarizer.gate = threading.Event()
+    (repo.repo / "one.txt").write_text("one\n", encoding="utf-8")
+    first = runner._manual_record(_LATENT_BODY)
+    (repo.repo / "two.txt").write_text("two\n", encoding="utf-8")
+    second = runner._manual_record(_LATENT_BODY.replace("build the widget", "wire the cache"))
+    assert first and second
+    runner._start_commit_summary(second, _TRACE_TEXT)
+
+    runner.SUMMARY_WAIT_SECONDS = 0.0
+    runner._auto_fold_latent_pending()
+    folded = repo.rev_parse("HEAD")
+    assert runner._last_auto_fold and runner._last_auto_fold["single"] is False
+
+    FakeSummarizer.gate.set()
+    runner._summary_thread.join(timeout=10)
+    runner._service_commit_summary()
+
+    # Message untouched (a squash keeps every turn's own body)...
+    assert repo.rev_parse("HEAD") == folded
+    assert not repo.commit_message("HEAD").startswith("<aGiTrack> Implement the widget renderer")
+    # ...but the summary is readable from the commit the user can actually see.
+    assert repo.notes_show(folded, namespace="agitrack/commit-summary")
+    assert repo.is_ancestor(folded, "HEAD")
+    assert not repo.is_ancestor(second, "HEAD")  # the latent sha the note used to land on
