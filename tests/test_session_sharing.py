@@ -181,14 +181,20 @@ def test_transcript_is_readable_opencode():
 # --- redaction --------------------------------------------------------------
 
 
-def test_redact_masks_secrets_and_home_path_but_keeps_structure():
+def test_redact_masks_secrets_and_paths_but_keeps_json_structure():
     sk = _fake_token("sk-", 18)
     ghp = _fake_token("ghp_", 36)
     line = f'{{"cwd":"/Users/alice/Code/x","t":"api_key={sk} token {ghp}"}}'
     out = redact_transcript(line)
     assert sk not in out and ghp not in out
     assert "[REDACTED]" in out
-    assert "/Users/alice" not in out and "/Users/user/Code/x" in out  # username masked, path kept
+    # The whole absolute path goes, not just the username segment: "/Users/user/Code/x" would
+    # still expose the layout. Same rule commit messages follow.
+    assert "alice" not in out and "/Users/" not in out and "Code/x" not in out
+    assert '"cwd":"[PATH]"' in out
+    import json as _json
+
+    _json.loads(out)  # still well-formed JSON
     assert out.startswith('{"cwd"')  # JSON shape preserved
 
 
@@ -3158,3 +3164,47 @@ def test_share_session_signals_done_on_share_and_up_on_cancel(tmp_path, monkeypa
     answers = iter(["Yes, share it", "No, I'll re-share manually"])
     runner._select_popup = lambda title, options: next(answers)
     assert runner._share_session() == runner._MENU_DONE  # shared → close the menu
+
+
+def test_redact_masks_every_absolute_path_shape_in_a_transcript():
+    # A shared transcript leaves the machine, so it follows the same path rule as a commit
+    # message: absolute paths go, relative paths and URLs stay.
+    import json
+
+    rows = [
+        {"type": "user", "cwd": "/home/alice/proj", "message": {"role": "user", "content": "see ~/Code/notes.md"}},
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Edited paper/main.tex; read C:\\Users\\bob\\x.txt and /etc/hosts. "
+                        "See https://github.com/core-aix/agitrack",
+                    }
+                ],
+            },
+        },
+    ]
+    raw = "\n".join(json.dumps(row) for row in rows)
+    out = redact_transcript(raw)
+
+    for leak in ("alice", "bob", "/home/", "/etc/", "~/Code", "C:\\Users"):
+        assert leak not in out, f"{leak!r} survived"
+    assert "paper/main.tex" in out  # relative path kept — says which file, leaks nothing
+    assert "https://github.com/core-aix/agitrack" in out  # URLs are not filesystem paths
+    assert len(out.split("\n")) == len(raw.split("\n"))  # line-preserving
+    for line in out.split("\n"):
+        json.loads(line)  # every row still parses
+
+
+def test_redact_never_leaves_a_dangling_backslash_escape():
+    # A Windows path inside a JSON string is written with doubled backslashes; masking must
+    # consume them whole, or the row stops being valid JSON.
+    import json
+
+    raw = json.dumps({"p": "C:\\Users\\bob\\dir\\", "q": "tail"})
+    out = redact_transcript(raw)
+    assert json.loads(out)["p"] == "[PATH]"
+    assert json.loads(out)["q"] == "tail"

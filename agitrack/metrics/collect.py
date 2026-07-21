@@ -41,6 +41,7 @@ from functools import cached_property
 from pathlib import Path
 
 from agitrack.commits import METADATA_HEADER
+from agitrack.commits.message import mask_paths
 from agitrack.git import GitRepo
 
 _NUMSTAT_RE = re.compile(r"^(\d+|-)\t(\d+|-)\t")
@@ -718,6 +719,21 @@ def _abbreviate_home(path: str) -> str:
     return "~" if str(rel) == "." else f"~/{rel.as_posix()}"
 
 
+def _display_repo(path: str) -> str:
+    """The repository's DIRECTORY NAME, for anything the dashboard renders or embeds.
+
+    The dashboard is kept open, screenshotted and shared, so it must not carry a filesystem
+    path — the same rule commit messages follow. Abbreviating the home prefix to ``~`` is not
+    enough: ``~/Code/client-work/acme`` still exposes the layout, and a repo outside the home
+    directory was shown as a full absolute path. The bare name identifies the repo (it is the
+    same name the git remote already publishes) and reveals nothing about the machine.
+
+    Terminal output keeps using :func:`_abbreviate_home`: it is read by the person whose
+    machine it is, who needs to know which directory is meant."""
+    name = Path(path).name or Path(path).parent.name
+    return name or path
+
+
 def build_dashboard(
     repo: GitRepo,
     ref: str = "HEAD",
@@ -741,7 +757,7 @@ def build_dashboard(
     if branch and branch != "HEAD":
         branches = [branch, *(b for b in branches if b != branch)]
     return Dashboard(
-        repo=_abbreviate_home(str(repo.repo)),
+        repo=_display_repo(str(repo.repo)),
         branch=branch,
         stats=stats,
         sha_logins=sha_logins or {},
@@ -758,6 +774,14 @@ def build_dashboard(
 
 def _parse_commit(sha: str, author: str, email: str, committed_at: str, body: str) -> CommitStat:
     body = _normalize_legacy_markers(body)
+    # Mask absolute paths for display. Done HERE, at the single funnel every commit body enters
+    # the dashboard through, so it also covers commits written BEFORE masking existed — history
+    # is never rewritten, so old messages still carry raw paths and only the reader can strip
+    # them. Every text field below (subject, prompt, user_prompts, metadata_block, message, and
+    # each squash constituent) derives from `body`, so one call covers them all. Metadata values
+    # are backends/models/ids/token counts and contain no paths, so parsing is unaffected; the
+    # masking is deterministic, so metadata_block duplicate detection still matches.
+    body = mask_paths(body)
     subject = body.splitlines()[0] if body.splitlines() else ""
     timestamp = int(committed_at) if committed_at.isdigit() else 0
     co_authors = _parse_co_authors(body)

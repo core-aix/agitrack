@@ -122,9 +122,9 @@ def shell_html(repo: GitRepo) -> str:
 
     Shared sessions are cheap (a local ref read plus a throttled fetch), so they're still
     embedded for the first paint (#55). The repo path/name fill the header."""
-    from agitrack.metrics.collect import _abbreviate_home
+    from agitrack.metrics.collect import _display_repo
 
-    repo_path = _abbreviate_home(str(repo.repo))
+    repo_path = _display_repo(str(repo.repo))
     payload = _embed_json({"page_size": PAGE_SIZE, "shared_sessions": shared_sessions_for(repo)})
     repo_name = repo_path.rstrip("/").rsplit("/", 1)[-1] or repo_path
     # ``__DATA__`` last (see ``format_html``): the payload may contain the chrome tokens verbatim.
