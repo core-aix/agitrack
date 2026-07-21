@@ -127,6 +127,16 @@ class GitRepo:
     def add_tracked(self) -> None:
         self._run(["git", "add", "-u"])
 
+    def changed_tracked_paths(self) -> list[str]:
+        """Tracked files with uncommitted changes (staged or unstaged), repo-relative."""
+        output = self._run(["git", "diff", "HEAD", "--name-only"], check=False).stdout
+        return [line for line in output.splitlines() if line.strip()]
+
+    def unstage_paths(self, paths: list[str]) -> None:
+        """Remove ``paths`` from the index (keeping their working-tree content)."""
+        if paths:
+            self._run(["git", "reset", "-q", "HEAD", "--", *paths], check=False)
+
     def discard_all_changes(self) -> None:
         """Reset the working tree to HEAD, discarding every uncommitted change:
         staged and unstaged tracked edits (``reset --hard``) plus untracked files
@@ -183,6 +193,12 @@ class GitRepo:
 
     def has_staged_changes(self) -> bool:
         return self._diff_has_changes(["git", "diff", "--cached", "--quiet"])
+
+    def staged_paths(self) -> list[str]:
+        """Bare repo-relative paths of the currently-staged changes (machine-readable
+        counterpart of :meth:`staged_changes`)."""
+        output = self._run(["git", "diff", "--cached", "--name-only"], check=False).stdout
+        return [line for line in output.splitlines() if line.strip()]
 
     def staged_changes(self) -> list[str]:
         """Human-readable list of the currently-staged changes, e.g. ``["A  new.py",

@@ -127,6 +127,14 @@ Conventions:
 | A substantive turn commits the deferred ticks in the SAME commit; exit finalize flushes tick-only sessions | `test_finish_parse_commits_monitor_updates_with_a_substantive_turn`, `test_finish_parse_exit_finalize_commits_monitor_update_only_turns` | mock |
 | Summarizer refusals ("I don't have any coding session turns...") are unusable, falling back to the prompt-led subject | `test_summarizer_raises_on_refusal_text`, `test_summary_first_person_content_is_still_usable` | mock |
 
+## 9a3. Background-task file attribution (no-worktree user-commit dialog)
+| Sequence | Test(s) | Kind |
+|---|---|---|
+| Paths from background-labelled agent commits (and new files under their directories) attribute to the background job, not the user | `test_background_authored_sets_scans_labelled_commits` | real-git |
+| Background-only tree changes no longer raise the automatic "commit your changes?" dialog; a genuine user edit still does | `test_dialog_not_raised_for_background_only_changes` | real-git |
+| The automatic user commit unstages background files (left for the agent's next commit); the explicit git-commit command keeps everything stageable | `test_unstage_background_authored_keeps_user_files_staged` | real-git |
+| A repo with no background-labelled history keeps today's behaviour exactly | `test_split_background_paths_without_history_is_a_noop` | real-git |
+
 ## 9b. Headless background tracker (`-b`, issue #143)
 | Sequence | Test(s) | Kind |
 |---|---|---|

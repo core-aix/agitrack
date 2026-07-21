@@ -8,6 +8,121 @@ from agitrack.transcripts.opencode import SessionTurn
 from agitrack.config import AgitrackState
 
 
+# ---------------------------------------------------------------------------
+# Background-task file attribution
+#
+# A task the agent backgrounded (an experiment, a Monitor'd job) keeps writing files
+# AFTER its turn was committed — most visibly under --no-worktree, where it writes the
+# very tree the user works in. There is no OS-level way to ask "which process changed
+# this file?", but the session's own history says it: paths that appear in agent
+# commits whose recorded prompts are ONLY the synthetic background labels were written
+# by background work, and further changes to them (or new files next to them) are
+# presumed to be the background job still running — NOT the user's own edits. The
+# user-commit flows use this to stop asking the user to commit a background job's
+# output as their own work; those files are left for the agent's next commit instead.
+
+_BACKGROUND_COMMIT_SCAN = 80  # recent commits examined
+_BACKGROUND_COMMIT_TAKE = 12  # background-authored commits actually diffed
+_background_paths_cache: dict[tuple[str, str], tuple[set[str], set[str]]] = {}
+
+
+def _background_only_message(body: str) -> bool:
+    """Whether a commit's recorded ``## User`` entries are ONLY background labels."""
+    from agitrack.transcripts.claude import BACKGROUND_PROMPT_LABELS
+
+    prompts: list[str] = []
+    in_user = False
+    for line in body.splitlines():
+        if line.startswith("## User"):
+            in_user = True
+            continue
+        if line.startswith("#"):
+            in_user = False
+            continue
+        if in_user and line.strip():
+            prompts.append(line.strip())
+    return bool(prompts) and all(prompt in BACKGROUND_PROMPT_LABELS for prompt in prompts)
+
+
+def background_authored_sets(repo: GitRepo) -> tuple[set[str], set[str]]:
+    """``(paths, ancestor_dirs)`` written by background-task turns in recent history.
+
+    Cached per (repo, HEAD): history behind HEAD never changes. Best-effort — an
+    unreadable history yields empty sets, which simply keeps today's behaviour."""
+    try:
+        head = repo.ref_sha("HEAD") or ""
+        key = (str(repo.repo), head)
+        hit = _background_paths_cache.get(key)
+        if hit is not None:
+            return hit
+        log = repo._run(["git", "log", "-n", str(_BACKGROUND_COMMIT_SCAN), "--format=%H%x01%B%x00"], check=False).stdout
+        paths: set[str] = set()
+        taken = 0
+        for record in log.split("\x00"):
+            if "\x01" not in record or taken >= _BACKGROUND_COMMIT_TAKE:
+                continue
+            sha, _, body = record.partition("\x01")
+            if not _background_only_message(body):
+                continue
+            taken += 1
+            names = repo._run(
+                ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", sha.strip()], check=False
+            ).stdout
+            paths.update(line.strip() for line in names.splitlines() if line.strip())
+        dirs: set[str] = set()
+        for path in paths:
+            parent = path.rsplit("/", 1)[0] if "/" in path else ""
+            while parent:
+                dirs.add(parent)
+                parent = parent.rsplit("/", 1)[0] if "/" in parent else ""
+        result = (paths, dirs)
+        _background_paths_cache.clear()  # one entry per repo tip is plenty
+        _background_paths_cache[key] = result
+        return result
+    except Exception:
+        return (set(), set())
+
+
+def is_background_authored(path: str, sets: tuple[set[str], set[str]]) -> bool:
+    """Whether ``path`` matches a background-authored file, or lives under a directory
+    background work has written to (covers new files the job keeps creating there)."""
+    paths, dirs = sets
+    if path in paths:
+        return True
+    parent = path.rsplit("/", 1)[0] if "/" in path else ""
+    while parent:
+        if parent in dirs:
+            return True
+        parent = parent.rsplit("/", 1)[0] if "/" in parent else ""
+    return False
+
+
+def split_background_paths(repo: GitRepo, paths: list[str]) -> tuple[list[str], list[str]]:
+    """Partition ``paths`` into ``(user, background)`` using the session history."""
+    sets = background_authored_sets(repo)
+    if not sets[0]:
+        return list(paths), []
+    user: list[str] = []
+    background: list[str] = []
+    for path in paths:
+        (background if is_background_authored(path, sets) else user).append(path)
+    return user, background
+
+
+def unstage_background_authored(repo: GitRepo) -> list[str]:
+    """Drop background-authored files from the index (a user commit must not claim a
+    background job's output as the user's own work); returns what was unstaged. The
+    files stay modified in the tree, to be captured by the agent's next commit."""
+    try:
+        staged = repo.staged_paths()
+    except Exception:
+        return []
+    _user, background = split_background_paths(repo, staged)
+    if background:
+        repo.unstage_paths(background)
+    return background
+
+
 class InteractiveUI(Protocol):
     """The editor-facing question surface (satisfied by shell.bridge.BridgeUI).
 
@@ -154,7 +269,14 @@ class AgitrackActions:
         untracked = self.repo.untracked_entries()
         self.state.keep_declined(untracked)
         promptable_untracked = [path for path in untracked if path not in declined]
-        return self.repo.has_tracked_changes() or bool(promptable_untracked)
+        # Changes attributable to the session's own BACKGROUND tasks (a monitored job
+        # still writing results between commits) are not the user's edits: they must not
+        # raise the "commit your changes?" dialog. They stay in the tree for the agent's
+        # next commit, which claims background work anyway.
+        tracked_changed = self.repo.changed_tracked_paths() if self.repo.has_tracked_changes() else []
+        user_tracked, _bg = split_background_paths(self.repo, tracked_changed)
+        user_untracked, _bg2 = split_background_paths(self.repo, promptable_untracked)
+        return bool(user_tracked) or bool(user_untracked)
 
     def _review_untracked_via_ui(self, candidates: list[str]) -> None:
         """Untracked-file review routed through the editor (VSCode bridge): a
