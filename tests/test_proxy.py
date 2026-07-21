@@ -1337,6 +1337,37 @@ def test_forwarding_a_prompt_marks_the_turn_as_awaiting_its_commit():
     assert runner.turn_awaiting_commit is True and runner.agent_in_flight is True
 
 
+def test_live_background_task_replaces_user_commit_dialog_with_warning():
+    # A background task the agent started is still running (its monitor streamed an event
+    # recently), and it writes the same tree the user edits — ownership of the uncommitted
+    # files is unknowable. The automatic user-commit DIALOG must not appear; instead a
+    # warning explains that the changes could be either's and will be committed after the
+    # next agent turn.
+    runner = _awaiting_commit_runner()
+    runner.turn_awaiting_commit = False
+    runner.active.live_background_task_ids = ["btask1"]
+    messages: list[str] = []
+    runner._set_message = lambda text, **kw: messages.append(text)
+    runner._create_user_commit_popup = lambda *a, **k: pytest.fail("dialog must not appear while a task runs")
+
+    assert runner._offer_pre_agent_user_commit() is False
+    assert messages and "Background task still running" in messages[0]
+    assert "could be your changes or the task's edits" in messages[0]
+    assert "committed after the next agent turn" in messages[0]
+
+
+def test_user_commit_dialog_returns_once_background_tasks_end():
+    runner = _awaiting_commit_runner()
+    runner.turn_awaiting_commit = False
+    runner.active.live_background_task_ids = []
+    shown: list[str] = []
+    runner._create_user_commit_popup = lambda *a, **k: shown.append("dialog") or True
+
+    runner._offer_pre_agent_user_commit()
+
+    assert shown == ["dialog"]
+
+
 def test_manual_mode_still_never_offers_a_pre_agent_user_commit():
     runner = _awaiting_commit_runner()
     runner._manual_commits = True

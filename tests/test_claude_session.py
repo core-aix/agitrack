@@ -660,6 +660,51 @@ def test_parse_rows_background_task_work_opens_its_own_turn():
     assert turns_after(session, "m1") == session.turns[1:]
 
 
+def test_parse_rows_tracks_live_background_tasks_from_the_notification_stream():
+    # Liveness is judged from the notifications, not launches (a task finishing while the
+    # agent is mid-turn never emits a terminal notification): a task whose monitor
+    # streamed an event RECENTLY, with no terminal notification after it, is live; a
+    # terminal notification ends it; an event older than the horizon no longer counts.
+    import datetime
+
+    def _iso(seconds_ago):
+        moment = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=seconds_ago)
+        return moment.isoformat().replace("+00:00", "Z")
+
+    def _event_row(uuid, task_id, ago):
+        return _user(
+            uuid,
+            f"<task-notification>\n<task-id>{task_id}</task-id>\n"
+            f'<summary>Monitor event: "sweep"</summary>\n<event>tick</event>\n</task-notification>',
+            timestamp=_iso(ago),
+        )
+
+    def _terminal_row(uuid, task_id, ago):
+        return _user(
+            uuid,
+            f"<task-notification>\n<task-id>{task_id}</task-id>\n<status>completed</status>\n"
+            f"<summary>done</summary>\n</task-notification>",
+            timestamp=_iso(ago),
+        )
+
+    rows = [
+        _user("u1", "run things"),
+        _assistant("m1", "Running.", stop_reason="end_turn"),
+        _event_row("tn1", "task-live", 60),  # fresh event, no terminal -> live
+        _assistant("m2", "Noted.", stop_reason="end_turn"),
+        _event_row("tn2", "task-done", 120),
+        _assistant("m3", "Noted.", stop_reason="end_turn"),
+        _terminal_row("tn3", "task-done", 90),  # terminated -> not live
+        _assistant("m4", "Finished.", stop_reason="end_turn"),
+        _event_row("tn4", "task-stale", 7200),  # beyond the horizon -> not live
+        _assistant("m5", "Noted.", stop_reason="end_turn"),
+    ]
+
+    session = parse_rows("sess-live", rows)
+
+    assert session.live_background_task_ids == ["task-live"]
+
+
 def test_parse_rows_monitor_event_notification_gets_the_update_label():
     # A Monitor streams intermediate events from a still-running job: its notifications
     # carry an <event> payload (and no terminal <status>). Such wake-ups get their own

@@ -629,6 +629,14 @@ class CommitEngine:
         if exported_session.model:
             self.state.model = exported_session.model
 
+        # Remember which background tasks are still running so the pre-agent user-commit
+        # dialog knows the tree may have a concurrent writer (see the runner's
+        # _offer_pre_agent_user_commit). Best-effort: sessions without the field skip it.
+        try:
+            session.live_background_task_ids = list(getattr(exported_session, "live_background_task_ids", []) or [])
+        except AttributeError:
+            pass
+
         all_turns = turns_after(exported_session, last_message_id)
 
         # Awaited-followup logic: a prompt queued while the agent was busy
