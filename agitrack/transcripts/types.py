@@ -84,6 +84,14 @@ class ExportedSession:
     model: str | None
     updated: int | None
     turns: list[SessionTurn]
+    # Harness task ids of background tasks that are demonstrably STILL RUNNING: they have
+    # streamed an intermediate monitor `<task-notification>` (an <event> payload) with no
+    # terminal notification after it. While any are live, ownership of uncommitted tree
+    # changes is unknowable (the user and the task can both edit the same files), so the
+    # automatic user-commit dialog stands down and shows a warning instead. Judged from
+    # the notification stream, not launches: a task finishing while the agent is mid-turn
+    # never emits a terminal notification. Claude-only; other backends leave it empty.
+    live_background_task_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
