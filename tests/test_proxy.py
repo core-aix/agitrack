@@ -9865,3 +9865,117 @@ def test_integrate_active_session_refuses_mid_turn_and_without_worktree():
     runner._agent_is_active = lambda: True
     runner._integrate_active_session()
     assert any("Finish or stop the current turn" in m for m in msgs)
+
+
+# --- _backend_idle_for: a TUI idle heartbeat must not veto turn-end detection forever ---------
+# Regression: a Claude TUI on Linux writes a steady 8 bytes/second to the PTY while completely
+# idle — invisible on screen, but never a 4-second gap — which kept `last_child_output`
+# permanently fresh, so this returned False forever. `_maybe_agent_commit` gates the whole
+# parse→commit pipeline on it, so turns were only ever committed by the pre-agent flow at the
+# user's NEXT prompt: the worktree stayed dirty for as long as the user stayed away.
+
+
+def _idle_runner(*, pty_age: float, transcript_age: float | None):
+    """Runner whose PTY last spoke `pty_age` seconds ago and whose transcript was last written
+    `transcript_age` seconds ago (None ⇒ no transcript resolvable)."""
+    runner = ProxyRunner.for_testing()
+    runner.CHILD_IDLE_SECONDS = 4.0
+    runner.TRANSCRIPT_IDLE_FACTOR = 3.0
+    runner.last_child_output = time.monotonic() - pty_age
+    runner._active_transcript_mtime = lambda: None if transcript_age is None else time.time() - transcript_age
+    return runner
+
+
+def test_backend_idle_when_both_pty_and_transcript_are_quiet():
+    runner = _idle_runner(pty_age=10.0, transcript_age=10.0)
+    assert runner._backend_idle_for(4.0) is True
+
+
+def test_backend_not_idle_while_transcript_advances():
+    # The silent sub-agent guard: terminal quiet, transcript moving ⇒ the turn is still running.
+    runner = _idle_runner(pty_age=10.0, transcript_age=1.0)
+    assert runner._backend_idle_for(4.0) is False
+
+
+def test_pty_heartbeat_defers_idle_only_briefly():
+    # Heartbeat still ticking, transcript quiet but not yet past the factor ⇒ still hold off.
+    runner = _idle_runner(pty_age=0.0, transcript_age=6.0)
+    assert runner._backend_idle_for(4.0) is False
+
+
+def test_pty_heartbeat_cannot_veto_idle_forever():
+    # The bug. PTY never goes quiet, but the transcript has been silent past
+    # CHILD_IDLE_SECONDS * TRANSCRIPT_IDLE_FACTOR (12s) ⇒ the backend IS idle.
+    runner = _idle_runner(pty_age=0.0, transcript_age=13.0)
+    assert runner._backend_idle_for(4.0) is True
+    # ...and it stays idle as the silence stretches on (the reported 8-minute case).
+    runner = _idle_runner(pty_age=0.0, transcript_age=480.0)
+    assert runner._backend_idle_for(4.0) is True
+
+
+def test_noisy_pty_without_a_transcript_keeps_the_conservative_answer():
+    # No transcript to overrule the PTY (backend with no readable session file): unchanged
+    # behaviour — a chattering terminal still means "working".
+    runner = _idle_runner(pty_age=0.0, transcript_age=None)
+    assert runner._backend_idle_for(4.0) is False
+    runner = _idle_runner(pty_age=10.0, transcript_age=None)
+    assert runner._backend_idle_for(4.0) is True
+
+
+def test_pty_heartbeat_still_reaches_the_commit_path(monkeypatch):
+    # End-to-end at the poll level, reproducing the reported failure: the agent finished
+    # (transcript silent) and left the worktree dirty, but the TUI kept repainting so
+    # `last_child_output` never aged. Before the fix `_maybe_agent_commit` returned at the
+    # `elif self.status_check_pending` branch on every tick and the parse never started —
+    # the turn only got committed when the user typed their next prompt.
+    clock = [10_000.0]
+    wall = [50_000.0]
+    monkeypatch.setattr("agitrack.proxy.runner.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("agitrack.proxy.runner.time.time", lambda: wall[0])
+    runner = make_runner(
+        file_change_event=threading.Event(),
+        status_check_pending=False,
+        last_poll=0.0,
+        agent_in_flight=False,
+        agent_parse_thread=None,
+        agent_parse_result=None,
+        last_status="",
+        last_status_change=0.0,
+        _last_change_at=0.0,
+        verbose=False,
+    )
+    runner.CHILD_IDLE_SECONDS = 4.0
+    runner.FILE_STABLE_SECONDS = 8.0
+    runner.TRANSCRIPT_IDLE_FACTOR = 3.0
+    runner._prune_declined_untracked = lambda: None
+    runner._maybe_offer_copy_when_idle = lambda now: None
+    runner._finish_agent_parse_if_ready = lambda **k: None
+    parses: list = []
+    runner._start_agent_parse = lambda: parses.append(True)
+    runner.repo = types.SimpleNamespace(status_short=lambda: " M paper/main.tex\n")
+
+    # The agent's last edit lands; its transcript goes quiet at the same moment.
+    transcript_written_at = wall[0]
+    runner._active_transcript_mtime = lambda: transcript_written_at
+    runner.file_change_event.set()
+    runner._maybe_agent_commit()
+
+    # Now drive the real cadence: one heartbeat byte per second, forever, and a poll each
+    # second. The PTY is therefore NEVER quiet for CHILD_IDLE_SECONDS at any point.
+    first_parse_at = None
+    for second in range(1, 61):
+        clock[0] += 1.0
+        wall[0] += 1.0
+        runner.last_child_output = clock[0]  # the 8-byte heartbeat lands
+        runner._maybe_agent_commit()
+        if parses and first_parse_at is None:
+            first_parse_at = second
+
+    # Committed on its own, without the user ever typing a next prompt (before the fix this
+    # loop ran to 60s — and would have run forever — with parses still empty).
+    assert parses  # the stub never clears parse_pending, so it re-fires; only the first matters
+    # Held off until the worktree settled AND the transcript had been quiet past
+    # CHILD_IDLE_SECONDS * TRANSCRIPT_IDLE_FACTOR, so a silent sub-agent still gets its guard.
+    assert first_parse_at is not None
+    assert first_parse_at >= runner.CHILD_IDLE_SECONDS * runner.TRANSCRIPT_IDLE_FACTOR
+    assert first_parse_at >= runner.FILE_STABLE_SECONDS
