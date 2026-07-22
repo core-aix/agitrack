@@ -322,22 +322,84 @@ def test_background_run_writes_and_removes_handshake(tmp_path, monkeypatch):
     assert not background_handshake_path(repo).exists()
 
 
-def test_start_background_daemon_reuses_running(tmp_path, capsys, monkeypatch):
+def test_start_background_daemon_restarts_running(tmp_path, capsys, monkeypatch):
+    # Like `-d` and `--backtrace`: re-running `agitrack -b` replaces a live tracker so an
+    # updated aGiTrack takes effect, after the old one's clean SIGTERM shutdown.
     import json
-    import os
 
     from agitrack.proxy import background as bg
 
     repo = _init_repo(tmp_path)
     path = background_handshake_path(repo)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"pid": os.getpid(), "mode": "auto commits"}), encoding="utf-8")
-    spawned = []
-    monkeypatch.setattr(bg, "spawn_background_daemon", lambda *a, **k: spawned.append(k) or None)
+    path.write_text(json.dumps({"pid": 4241, "mode": "auto commits"}), encoding="utf-8")
+
+    alive = {4241, 4242}
+    terminated = []
+    monkeypatch.setattr(bg, "pid_alive", lambda pid: pid in alive)
+    monkeypatch.setattr(bg, "terminate_pid", lambda pid: (terminated.append(pid), alive.discard(pid)))
+
+    class _FakeProc:
+        pid = 4242
+
+    def fake_spawn(r, *, extra_args):
+        p = background_handshake_path(r)
+        p.write_text(json.dumps({"pid": 4242, "mode": "auto commits"}), encoding="utf-8")
+        return _FakeProc()
+
+    monkeypatch.setattr(bg, "spawn_background_daemon", fake_spawn)
 
     assert bg.start_background_daemon(repo, extra_args=[]) == 0
-    assert "already running" in capsys.readouterr().out
-    assert spawned == []  # never spawns a duplicate
+    out = capsys.readouterr().out
+    assert "Restarting the aGiTrack background tracker (was PID 4241" in out
+    assert terminated == [4241]  # the old tracker got its clean shutdown signal
+    assert "daemon live" in out and "4242" in out
+
+
+def test_start_background_daemon_fails_when_old_tracker_will_not_stop(tmp_path, capsys, monkeypatch):
+    import json
+
+    from agitrack.proxy import background as bg
+
+    repo = _init_repo(tmp_path)
+    path = background_handshake_path(repo)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"pid": 4241, "mode": "auto commits"}), encoding="utf-8")
+
+    monkeypatch.setattr(bg, "pid_alive", lambda pid: True)
+    monkeypatch.setattr(bg, "terminate_pid", lambda pid: None)
+    monkeypatch.setattr(bg.time, "sleep", lambda s: None)
+    monkeypatch.setattr(bg, "_terminate_and_wait", lambda pid, **k: False)
+    spawned = []
+    monkeypatch.setattr(bg, "spawn_background_daemon", lambda *a, **k: spawned.append(1) or None)
+
+    assert bg.start_background_daemon(repo, extra_args=[]) == 1
+    assert "did not stop in time" in capsys.readouterr().out
+    assert spawned == []  # never spawns beside a still-live tracker
+
+
+def test_replace_running_tracker_only_replaces_a_background_tracker(tmp_path, capsys, monkeypatch):
+    import json
+
+    from agitrack.proxy import background as bg
+
+    repo = _init_repo(tmp_path)
+    path = background_handshake_path(repo)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"pid": 4241, "mode": "auto commits"}), encoding="utf-8")
+
+    alive = {4241}
+    monkeypatch.setattr(bg, "pid_alive", lambda pid: pid in alive)
+    monkeypatch.setattr(bg, "terminate_pid", lambda pid: alive.discard(pid))
+
+    # The lock holder is NOT the tracker (an interactive session): refuse to replace.
+    assert bg.replace_running_tracker(repo, owner_pid=7777) is False
+    assert 4241 in alive  # nothing was terminated
+
+    # The lock holder IS the live tracker: stop it and allow the rerun to take over.
+    assert bg.replace_running_tracker(repo, owner_pid=4241) is True
+    assert 4241 not in alive
+    assert "Restarting the aGiTrack background tracker (was PID 4241)" in capsys.readouterr().out
 
 
 def test_start_background_daemon_spawns_and_reports(tmp_path, capsys, monkeypatch):

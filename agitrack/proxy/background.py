@@ -96,16 +96,37 @@ def stop_background(repo: GitRepo) -> int:
     if pid is None:
         print("No aGiTrack background tracker is running on this repo.")
         return 0
-    terminate_pid(pid)
-    for _ in range(100):  # up to ~10s for a clean shutdown
-        if not pid_alive(pid):
-            break
-        time.sleep(0.1)
-    if pid_alive(pid):
+    if not _terminate_and_wait(pid):
         print(f"aGiTrack background tracker (PID {pid}) did not stop in time; it may still be shutting down.")
         return 1
     print("Stopped the aGiTrack background tracker.")
     return 0
+
+
+def replace_running_tracker(repo: GitRepo, *, owner_pid: int | None) -> bool:
+    """``agitrack -b`` invoked while the repo lock is held: if the holder is a LIVE background
+    tracker, stop it so this rerun replaces it — like ``-d`` and ``--backtrace``, rerunning
+    the command must pick up updated aGiTrack code. Only a background tracker is replaced;
+    when anything else holds the lock (an interactive TUI session) this returns False and the
+    caller keeps refusing to start. True once the old tracker has shut down cleanly."""
+    pid = _live_background_pid(repo)
+    if pid is None or (owner_pid is not None and pid != owner_pid):
+        return False
+    if not _terminate_and_wait(pid):
+        print(f"aGiTrack background tracker (PID {pid}) did not stop in time; run `agitrack -b stop` and try again.")
+        return False
+    print(f"Restarting the aGiTrack background tracker (was PID {pid}).")
+    return True
+
+
+def _terminate_and_wait(pid: int, *, timeout: float = 10.0) -> bool:
+    """SIGTERM ``pid`` and wait (bounded) for its clean shutdown — the tracker records any
+    final turn and removes its hooks on the way out. True once the process is gone."""
+    terminate_pid(pid)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and pid_alive(pid):
+        time.sleep(0.1)
+    return not pid_alive(pid)
 
 
 def background_log_path(repo: GitRepo) -> Path:
@@ -328,15 +349,21 @@ def spawn_background_daemon(repo: GitRepo, *, extra_args: list[str]) -> subproce
 def start_background_daemon(repo: GitRepo, *, extra_args: list[str], timeout: float = 8.0) -> int:
     """`agitrack -b`: start the background tracker as a detached daemon and return to the shell.
 
-    Reuses a daemon already running for this repo rather than spawning a duplicate. The daemon
-    keeps running after the terminal closes; stop it with ``agitrack -b stop``."""
+    Restarts a daemon already running for this repo rather than leaving the old one in place —
+    like ``-d`` and ``--backtrace``, re-running the command after an aGiTrack update must run
+    the NEW code. The old tracker gets its clean SIGTERM shutdown first (it records any final
+    turn and removes its hooks). The daemon keeps running after the terminal closes; stop it
+    with ``agitrack -b stop``."""
     running = _live_background_pid(repo)
     if running is not None:
         info = _read_handshake(repo) or {}
-        print(
-            f"\naGiTrack background tracker is already running on this repo (PID {running}, {info.get('mode', '?')})."
-        )
-        return 0
+        if not _terminate_and_wait(running):
+            print(
+                f"\naGiTrack background tracker (PID {running}) did not stop in time; "
+                "run `agitrack -b stop` and try again."
+            )
+            return 1
+        print(f"\nRestarting the aGiTrack background tracker (was PID {running}, {info.get('mode', '?')}).")
     proc = spawn_background_daemon(repo, extra_args=extra_args)
     record = wait_for_handshake(repo, pid=proc.pid, timeout=timeout)
     if record is None:
