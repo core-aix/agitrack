@@ -1148,9 +1148,9 @@ def parse_rows(
                 # contribute ANYTHING to the turn: not a final message (it isn't one), and
                 # not its stop_reason either — taking the filler's "end_turn" made a crashed
                 # turn look complete-but-answerless, which the no-final-text fallback then
-                # committed with a trace ending in a bare user message. The turn stays
-                # in-progress until the restarted process produces a real reply.
-                current["saw_filler"] = True
+                # committed with a trace ending in a bare user message. Leaving the
+                # stop_reason unset keeps the dangling turn in-flight (see
+                # _finalize_turn) until the restarted process produces a real reply.
                 continue
             current["stop_reason"] = message.get("stop_reason")
             # Claude Code emits a `thinking` content block whenever extended
@@ -1390,11 +1390,14 @@ def _finalize_turn(turn: dict, *, dangling: bool = False) -> SessionTurn:
     # receive more messages, so treating it as in-progress would stall the
     # commit loop forever.
     in_flight = dangling and not interrupted and turn.get("stop_reason") == "tool_use"
-    if dangling and not interrupted and turn.get("saw_filler") and not turn["final"]:
-        # The turn's only "reply" so far is the "No response requested." crash filler
-        # (skipped above, so it left no stop_reason). Without this, the missing-reason
-        # default would call the crashed turn complete despite having no answer; it
-        # stays in-flight until the restarted process produces a real reply.
+    if dangling and not interrupted and turn.get("stop_reason") is None and not turn["final"]:
+        # No real assistant row has been processed yet: a just-typed prompt the agent
+        # is still thinking about (its first assistant row can lag the user row by many
+        # seconds), or a crashed turn whose only "reply" was the skipped filler. The
+        # missing-reason default below is for OLD transcripts whose assistant rows
+        # carry no stop_reason — those still set a final text. A prompt-only turn must
+        # NOT count as complete: the background tracker polls mid-window and would
+        # commit a trace that is just the user's message with no agent response.
         in_flight = True
     return SessionTurn(
         user_message_id=turn["user_id"],

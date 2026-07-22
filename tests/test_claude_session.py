@@ -681,6 +681,22 @@ def test_no_response_requested_filler_is_not_a_final_message():
     assert turn.agent_messages == ["Everything is done and the paper builds cleanly."]
 
 
+def test_prompt_only_dangling_turn_is_in_flight():
+    # The user just typed a prompt and the agent has not produced ANY assistant row
+    # yet (first response can lag by many seconds). The turn is in-flight, NOT
+    # complete: the background tracker polls inside that window, and a "complete"
+    # answerless turn would be committed as a trace holding only the user's message.
+    rows = [
+        _user("u1", "expand the coding experiments"),
+    ]
+
+    session = parse_rows("sess-prompt-only", rows)
+
+    assert len(session.turns) == 1
+    assert session.turns[0].complete is False
+    assert session.turns[0].final_response == ""
+
+
 def test_bare_compact_command_row_does_not_open_a_turn():
     # Newer Claude Code records a typed /compact as a plain user row with the literal
     # text "/compact" (no <command-name> artifact). It never gets a reply, so opening
