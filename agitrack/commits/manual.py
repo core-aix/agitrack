@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from agitrack.commits.message import apply_summary_to_message, build_manual_squash_trailer
+from agitrack.commits.message import apply_summary_to_message, build_manual_squash_trailer, build_pending_trailer
 from agitrack.config import AgitrackState
 from agitrack.git import GitRepo
 from agitrack.git import hooks as git_hooks
@@ -33,11 +33,15 @@ class ManualCommitTracker:
         state: AgitrackState,
         *,
         debug: Callable[[str], None] | None = None,
+        in_flight_fn: Callable[[], dict | None] | None = None,
     ) -> None:
         self.repo = repo
         self.base_repo = base_repo
         self.state = state
         self._debug = debug or (lambda _m: None)
+        # Supplies the currently-running turn's facts (or None) so a commit the AGENT makes
+        # mid-turn still carries attribution — see :meth:`render_trailer`.
+        self._in_flight_fn = in_flight_fn
         # Cached working-tree snapshot from gate(), reused by record() so it doesn't re-snapshot.
         self._pending_tree: str | None = None
         # Poll/fallback state: last HEAD we saw, whether the fold hooks are installed, and the
@@ -126,24 +130,62 @@ class ManualCommitTracker:
             bodies.append(body)
         return bodies
 
+    def in_flight_attribution(self) -> dict | None:
+        """The running turn's facts for the trailer, or None when nothing should be attributed.
+
+        Two conditions, both required: the driver reports a turn actually in progress, AND the
+        working tree differs from the latent tip so the agent has real changes in this commit.
+        The tree check is what keeps the "no AI work ⇒ no footprint" promise — without it, a
+        human's own commit made while an agent happened to be thinking would be stamped as
+        agent work."""
+        if self._in_flight_fn is None:
+            return None
+        try:
+            facts = self._in_flight_fn()
+        except Exception as error:
+            self._debug(f"in-flight lookup failed: {error!r}")
+            return None
+        if not facts:
+            return None
+        try:
+            if not self._tree_differs_from_tip(self.repo.snapshot_worktree_tree()):
+                return None
+        except Exception as error:
+            self._debug(f"in-flight snapshot failed: {error!r}")
+            return None
+        return facts
+
     def render_trailer(self) -> None:
         """(Re)render ``.agitrack/manual-pending-trailer`` from the durable latent ref, and the
         ``.agitrack/manual-ref`` name file the post-commit hook reads. When pending turns exist the
-        trailer carries the ``commit_type: user`` block plus each turn's full trace/metadata; with
-        NO pending turns it is empty, so a purely human commit (no AI work) is left untouched."""
+        trailer carries the ``commit_type: user`` block plus each turn's full trace/metadata; when
+        none are pending but the agent is mid-turn with changes in the tree, it carries the
+        in-flight attribution block instead; otherwise it is empty, so a purely human commit (no
+        AI work) is left untouched."""
         try:
             agit_dir = self.agit_dir()
             agit_dir.mkdir(parents=True, exist_ok=True)
             (agit_dir / "manual-ref").write_text(self.ref() + "\n", encoding="utf-8")
-            trailer = build_manual_squash_trailer(
+            trailer = build_pending_trailer(
                 agitrack_session_id=self.state.session_id,
                 latent_bodies=self.pending_bodies(),
+                in_flight=self.in_flight_attribution(),
             )
             (agit_dir / "manual-pending-trailer").write_text(trailer, encoding="utf-8")
         except Exception as error:
             self._debug(f"manual trailer render failed: {error!r}")
 
     # --- recording turns ----------------------------------------------------
+
+    def _tree_differs_from_tip(self, tree: str) -> bool:
+        """Whether *tree* differs from the latent tip's tree (or HEAD's when the chain is
+        empty) — i.e. whether there is uncommitted agent work to account for."""
+        tip = self.repo.ref_sha(self.ref())
+        try:
+            base_tree = self.repo.rev_parse(f"{tip or 'HEAD'}^{{tree}}")
+        except Exception:
+            base_tree = None
+        return tree != base_tree
 
     def gate(self) -> bool:
         """Commit gate for a manual-mode turn: True when the working tree changed since the
@@ -155,13 +197,7 @@ class ManualCommitTracker:
             self._debug(f"manual snapshot failed: {error!r}")
             self._pending_tree = None
             return False
-        tip = self.repo.ref_sha(self.ref())
-        base_ref = tip or "HEAD"
-        try:
-            base_tree = self.repo.rev_parse(f"{base_ref}^{{tree}}")
-        except Exception:
-            base_tree = None
-        return self._pending_tree != base_tree
+        return self._tree_differs_from_tip(self._pending_tree)
 
     def record(self, message: str) -> str | None:
         """Record a manual-mode turn as a hidden latent commit: snapshot the working tree,

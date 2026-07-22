@@ -33,7 +33,7 @@ from typing import Any
 
 from agitrack.backends.proxy_agents import make_proxy_agent
 from agitrack.commits import ManualCommitTracker
-from agitrack.commits.message import build_auto_fold_message, summary_metadata_lines
+from agitrack.commits.message import build_auto_fold_message, is_fully_tracked_message, summary_metadata_lines
 from agitrack.config import AgitrackState, GlobalConfig
 from agitrack.events import EventLog, resolve_log_path
 from agitrack.git import GitRepo
@@ -532,7 +532,13 @@ class BackgroundRunner:
 
         # Both modes record turns as latent commits and fold them via the prepare-commit-msg hook;
         # the tracker owns that machinery (shared with the proxy's manual mode).
-        self._manual = ManualCommitTracker(self.repo, self.base_repo, self.state, debug=self._debug)
+        # Facts about the turn the agent is currently running, refreshed from every export (see
+        # `_note_in_flight`). Lets the fold trailer attribute a commit the agent makes ITSELF
+        # before that turn ends — the pre-commit flush re-exports first, so this is current.
+        self._in_flight: dict | None = None
+        self._manual = ManualCommitTracker(
+            self.repo, self.base_repo, self.state, debug=self._debug, in_flight_fn=lambda: self._in_flight
+        )
 
     # ------------------------------------------------------------------
 
@@ -824,8 +830,19 @@ class BackgroundRunner:
             note_session_change_fn=lambda _sid: None,
             mirror_fn=lambda _sid: None,
             commit_fn=self._record_turns,
+            note_in_flight_fn=self._note_in_flight,
         )
         return bool(committed)
+
+    def _note_in_flight(self, facts: dict | None) -> None:
+        """Remember (or clear) the running turn's facts. The pre-commit flush re-renders the
+        trailer right after ``_process_once``, so this is current at commit time; re-rendering on
+        a change as well keeps attribution working even if that nudge never lands (a removed
+        pre-commit hook, a ``core.hooksPath`` that skips it)."""
+        changed = self._in_flight != facts
+        self._in_flight = facts
+        if changed:
+            self._manual.render_trailer()
 
     def _record_turns(
         self,
@@ -928,14 +945,18 @@ class BackgroundRunner:
             self._debug(f"tracked-head write failed: {error!r}")
 
     def _is_agitrack_tracked(self, sha: str) -> bool:
-        """True when a commit already carries aGiTrack tracking (its own metadata, or an aGiTrack
-        cover/merge), so it must not be covered again. Keeps the daemon's own commits and
-        hook-folded user commits out of a cover's ``covered_commits``."""
+        """True when a commit already carries COMPLETE aGiTrack tracking (its own metadata, or an
+        aGiTrack cover/merge), so it must not be covered again. Keeps the daemon's own commits and
+        hook-folded user commits out of a cover's ``covered_commits``.
+
+        A commit carrying only an IN-FLIGHT block is deliberately NOT tracked: it was stamped
+        mid-turn with attribution alone, so the completed turn still owes it a trace and token
+        counts and must cover it."""
         try:
             body = self.repo.commit_message(sha) or ""
         except Exception:
             return False
-        return "# aGiTrack Metadata" in body or body.lstrip().startswith("<aGiTrack")
+        return is_fully_tracked_message(body) or body.lstrip().startswith("<aGiTrack")
 
     def _agent_committed_own_work(self) -> list[str]:
         """Full SHAs (oldest first) of the commit(s) to cover for a just-completed turn — the

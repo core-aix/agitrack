@@ -598,6 +598,7 @@ class CommitEngine:
         mirror_fn: Callable[[str | None], None],
         commit_fn: Callable,
         on_cancelled_fn: Callable[[list[SessionTurn]], bool] | None = None,
+        note_in_flight_fn: Callable[[dict | None], None] | None = None,
     ) -> tuple[bool | None, list[str]]:
         """Consume a ready parse result and (conditionally) commit.
 
@@ -653,6 +654,27 @@ class CommitEngine:
             pass
 
         all_turns = turns_after(exported_session, last_message_id)
+
+        # Tell the driver whether the agent is MID-TURN right now, so a commit the agent makes
+        # ITSELF before its turn ends still gets attributed (see `build_in_flight_trailer`) —
+        # otherwise the fold hook has no pending turn to fold and the commit lands with no
+        # metadata at all. Computed here, the one place that already holds both the export and
+        # the watermark, so every mode gets the same answer from the same evidence.
+        if note_in_flight_fn is not None:
+            running = all_turns[-1] if all_turns and not all_turns[-1].complete else None
+            facts = None
+            if running is not None:
+                try:
+                    backend_name = self.state.backend
+                except Exception:
+                    backend_name = "unknown"  # no backend configured (tests / partial state)
+                facts = {
+                    "backend": backend_name,
+                    "backend_session_id": new_session_id,
+                    "model": exported_session.model or self.state.model,
+                    "prompt": running.user_prompt,
+                }
+            note_in_flight_fn(facts)
 
         # Awaited-followup logic: a prompt queued while the agent was busy
         # belongs in the same commit as the turn it triggered.
