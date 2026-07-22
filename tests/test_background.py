@@ -290,6 +290,90 @@ def test_in_flight_note_clears_once_the_turn_completes(tmp_path):
     assert runner._manual.in_flight_attribution() is None
 
 
+# --- parity with the interactive TUI's auto-commit rule ---------------------
+
+
+def test_fold_waits_for_the_worktree_to_settle_like_the_tui(tmp_path):
+    # `file_stable_seconds` is a documented setting the daemon used to ignore entirely: the TUI
+    # waits for the tree to go quiet before auto-committing, the daemon folded immediately.
+    import agitrack.proxy.background as B
+
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    runner._manual.setup()
+    runner.global_config.timings["file_stable_seconds"] = 8.0
+    runner.global_config.timings["summary_wait_seconds"] = 45.0
+
+    clock = [1000.0]
+    monkey = B.time.monotonic
+    B.time.monotonic = lambda: clock[0]  # type: ignore[assignment]
+    try:
+        (tmp_path / "a.txt").write_text("one\nagent edit\n", encoding="utf-8")
+        runner._sample_worktree()  # first observation: nothing to compare against yet
+        backend.set_session("s1", [_turn("u1", "m1", "do x", "done", 20)])
+        runner._process_once()
+
+        (tmp_path / "a.txt").write_text("one\nagent edit\nstill writing\n", encoding="utf-8")
+        runner._sample_worktree()  # a real change lands
+        head = repo.rev_parse("HEAD")
+        runner._auto_fold_pending()
+        assert repo.rev_parse("HEAD") == head  # deferred: the tree is still moving
+
+        clock[0] += 9.0  # quiet for longer than file_stable_seconds
+        runner._auto_fold_pending()
+        assert repo.rev_parse("HEAD") != head  # committed once things settled
+    finally:
+        B.time.monotonic = monkey  # type: ignore[assignment]
+
+
+def test_settle_wait_is_bounded_so_a_busy_repo_still_commits(tmp_path):
+    # The TUI's settle gate is unbounded, which is survivable with a human watching. A daemon
+    # commonly runs where something writes continuously (the log of a job the agent started), and
+    # there the tree NEVER goes quiet — an unbounded wait would stop committing while looking
+    # perfectly healthy. Past summary_wait_seconds on the same turn, fold anyway.
+    import agitrack.proxy.background as B
+
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    runner._manual.setup()
+    runner.global_config.timings["file_stable_seconds"] = 8.0
+    runner.global_config.timings["summary_wait_seconds"] = 45.0
+
+    clock = [1000.0]
+    monkey = B.time.monotonic
+    B.time.monotonic = lambda: clock[0]  # type: ignore[assignment]
+    try:
+        (tmp_path / "a.txt").write_text("one\nagent edit\n", encoding="utf-8")
+        runner._sample_worktree()
+        backend.set_session("s1", [_turn("u1", "m1", "do x", "done", 20)])
+        runner._process_once()
+        head = repo.rev_parse("HEAD")
+
+        # Something writes on every single cycle: the quiet period never elapses.
+        for tick in range(12):  # 12 * 5s spans the 45s cap
+            (tmp_path / "log.txt").write_text(f"line {tick}\n", encoding="utf-8")
+            runner._sample_worktree()
+            runner._auto_fold_pending()
+            clock[0] += 5.0
+        assert repo.rev_parse("HEAD") != head  # the cap fired instead of waiting forever
+    finally:
+        B.time.monotonic = monkey  # type: ignore[assignment]
+
+
+def test_stop_finalize_captures_a_turn_that_never_finished(tmp_path):
+    # The TUI's exit finalize passes require_complete=False so work in progress is still
+    # recorded on the way out. The daemon's stop path used to keep require_complete=True, so
+    # `agitrack -b stop` mid-turn silently dropped that turn's record.
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    runner._manual.setup()
+    (tmp_path / "a.txt").write_text("one\nwork in progress\n", encoding="utf-8")
+    backend.set_session("s1", [_in_flight_turn("u1", "m1", "half-done work")])
+
+    assert runner._process_once() is False  # a normal poll leaves an unfinished turn alone
+    runner._teardown()
+
+    msg = _git(repo, "log", "-1", "--format=%B", "HEAD")
+    assert "half-done work" in msg and "# aGiTrack Metadata" in msg
+
+
 def test_background_skips_cycle_when_no_human_driven_session(tmp_path):
     # The daemon must never fall back to a pinned id when the backend reports no
     # human-driven conversation. `latest_session_id` excludes programmatic (SDK) sessions,
