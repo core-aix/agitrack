@@ -143,7 +143,8 @@ Conventions:
 | Sequence | Test(s) | Kind |
 |---|---|---|
 | `-b` launcher spawns a DETACHED daemon and returns to the shell | `test_start_background_daemon_spawns_and_reports` | mock |
-| `-b` reuses a daemon already running (no duplicate) | `test_start_background_daemon_reuses_running` | mock |
+| `-b` RESTARTS a daemon already running (rerun picks up updated code, like `-d`/`--backtrace`); failure to stop the old one refuses to spawn | `test_start_background_daemon_restarts_running`, `test_start_background_daemon_fails_when_old_tracker_will_not_stop` | mock |
+| `-b` over the repo lock: a lock-holding BACKGROUND tracker is stopped and replaced; any other holder (interactive session) still refuses | `test_background_rerun_replaces_a_running_background_tracker`, `test_replace_running_tracker_only_replaces_a_background_tracker`, `test_background_refused_when_another_instance_holds_the_repo` | mock |
 | `-b` reports failure when the daemon child dies at startup | `test_start_background_daemon_reports_failure_when_child_dies` | mock |
 | `-b stop` / `-b status` target the daemon via its handshake | `test_background_status_*`, `test_background_stop_cleans_stale_handshake`, `test_background_run_writes_and_removes_handshake` | mock |
 | `-b` refused when another instance holds the repo lock | `test_background_refused_when_another_instance_holds_the_repo` | mock |
