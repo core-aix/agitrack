@@ -1251,6 +1251,101 @@ def test_list_sessions_returns_refs_with_labels(tmp_path, monkeypatch):
     assert latest_session_id(repo) in {"s1", "s2"}
 
 
+def _sdk_user(uuid, text, **extra):
+    """A conversation-opening prompt as the Agent SDK / `claude -p` records it."""
+    return _user(uuid, text, entrypoint="sdk-cli", promptSource="sdk", isSidechain=False, **extra)
+
+
+def test_list_sessions_excludes_programmatic_sessions(tmp_path, monkeypatch):
+    # An agent that farms work out to `claude -p` workers writes one transcript per worker
+    # into the repo's own project dir. Those are work the agent did, not conversations to
+    # track — adopting them made background mode commit once per worker (issue: a
+    # SWE-bench harness produced 28 sessions and a commit for each).
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    project_dir = claude_session._project_dir(repo)
+    project_dir.mkdir(parents=True)
+    (project_dir / "human.jsonl").write_text(
+        json.dumps(_user("u1", "typed prompt", entrypoint="cli", promptSource="typed")) + "\n"
+    )
+    for index in range(3):
+        (project_dir / f"worker{index}.jsonl").write_text(json.dumps(_sdk_user(f"w{index}", "fix this bug")) + "\n")
+
+    assert [ref.id for ref in list_sessions(repo)] == ["human"]
+    # The refs themselves still carry the flag, so anything that wants the full picture can
+    # ask — `_refs_in_project_dir` (and therefore `sessions_under`/--backtrace) keeps them.
+    all_refs = {ref.id: ref for ref in claude_session._refs_in_project_dir(project_dir)}
+    assert set(all_refs) == {"human", "worker0", "worker1", "worker2"}
+    assert all_refs["human"].programmatic is False
+    assert all(all_refs[f"worker{i}"].programmatic for i in range(3))
+
+
+def test_latest_session_id_ignores_newer_programmatic_sessions(tmp_path, monkeypatch):
+    import os
+    import time
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    project_dir = claude_session._project_dir(repo)
+    project_dir.mkdir(parents=True)
+    human = project_dir / "human.jsonl"
+    human.write_text(json.dumps(_user("u1", "typed prompt", entrypoint="cli", promptSource="typed")) + "\n")
+    worker = project_dir / "worker.jsonl"
+    worker.write_text(json.dumps(_sdk_user("w1", "fix this bug")) + "\n")
+
+    now = time.time()
+    os.utime(human, (now - 100, now - 100))
+    os.utime(worker, (now, now))  # the SDK worker is newest by mtime, as it is while a run streams
+
+    assert latest_session_id(repo) == "human"
+    # With no human-driven conversation at all there is nothing to adopt — better to track
+    # nothing than to adopt a worker and commit its run as the user's turn.
+    human.unlink()
+    assert latest_session_id(repo) is None
+
+
+def test_programmatic_detection_needs_positive_evidence(tmp_path, monkeypatch):
+    # Older Claude Code builds stamp neither field. Absence must read as "human-driven", so
+    # this filter can never cost aGiTrack a session it used to track.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    project_dir = claude_session._project_dir(repo)
+    project_dir.mkdir(parents=True)
+    (project_dir / "legacy.jsonl").write_text(json.dumps(_user("u1", "no origin fields here")) + "\n")
+    # A sub-agent row inside a human conversation carries no origin fields either, and must
+    # not be mistaken for the conversation's own opening prompt.
+    (project_dir / "withsub.jsonl").write_text(
+        json.dumps(_user("u1", "typed prompt", entrypoint="cli", promptSource="typed"))
+        + "\n"
+        + json.dumps(_user("u2", "sub-agent task", isSidechain=True))
+        + "\n"
+    )
+
+    assert {ref.id for ref in list_sessions(repo)} == {"legacy", "withsub"}
+
+
+def test_scan_session_head_reads_label_and_origin_in_one_pass(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    transcript = tmp_path / "s.jsonl"
+    # A sidechain row precedes the real opening prompt: the label and the origin verdict must
+    # both come from the conversation's own first non-sidechain user row.
+    transcript.write_text(
+        json.dumps(_user("u0", "sub-agent task", isSidechain=True))
+        + "\n"
+        + json.dumps(_sdk_user("u1", "real prompt\nsecond line"))
+        + "\n"
+    )
+    label, programmatic = claude_session._scan_session_head(transcript)
+    assert label == "real prompt"  # sidechain rows are not the conversation's own prompt
+    assert programmatic is True
+    # A truncated head (opening row beyond the limit) falls back to "human-driven".
+    assert claude_session._scan_session_head(transcript, line_limit=1)[1] is False
+    assert claude_session._scan_session_head(tmp_path / "missing.jsonl") == (None, False)
+
+
 def test_latest_session_id_skips_empty_resumed_sessions(tmp_path, monkeypatch):
     import os
     import time

@@ -11166,7 +11166,9 @@ class ProxyRunner:
         # must keep its pinned id rather than risk grabbing the wrong session. (Because the
         # snapshot only ever excludes post-launch sessions, the result is always safe to
         # prefer over the pinned id, which is what lets no-worktree mode follow an
-        # in-backend session switch.)
+        # in-backend session switch.) `list_sessions` supplies both halves of the filter:
+        # it already excludes programmatic (SDK) transcripts, so an agent that farms work
+        # out to `claude -p` workers cannot have one of them adopted as the tracked session.
         snapshot = self._pre_spawn_session_ids
         if snapshot is None:
             return None
