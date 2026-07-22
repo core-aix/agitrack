@@ -126,6 +126,8 @@ Conventions:
 | TRIVIAL monitor-update-only completed turns (short ack, little output) are DEFERRED (no commit, watermark untouched) while the live loop runs | `test_finish_parse_defers_monitor_update_only_turns` | mock |
 | A substantive turn commits the deferred ticks in the SAME commit; a monitor turn with a normal final message or heavy output commits immediately; exit finalize flushes tick-only sessions | `test_finish_parse_commits_monitor_updates_with_a_substantive_turn`, `test_finish_parse_commits_substantive_monitor_turn_immediately`, `test_finish_parse_commits_monitor_turn_with_heavy_output_despite_short_reply`, `test_finish_parse_exit_finalize_commits_monitor_update_only_turns` | mock |
 | Summarizer refusals ("I don't have any coding session turns...") are unusable, falling back to the prompt-led subject | `test_summarizer_raises_on_refusal_text`, `test_summary_first_person_content_is_still_usable` | mock |
+| A turn force-committed before the agent replied (crash/restart) re-exports when it CONTINUES, so its real final message and edits are committed rather than hidden behind the user-id watermark | `test_turns_after_re_exports_a_turn_that_continued_past_its_force_commit` | mock |
+| "No response requested." (Claude's crash filler) never counts as a final message; the restarted process's real reply becomes the turn's final | `test_no_response_requested_filler_is_not_a_final_message` | mock |
 
 ## 9a3. Live background tasks vs the user-commit dialog
 | Sequence | Test(s) | Kind |
