@@ -492,6 +492,14 @@ class BackgroundRunner:
         # summary, not the raw prompt. Tracks the latent tip we're waiting on and since when.
         self._fold_wait_tip: str | None = None
         self._fold_wait_since: float | None = None
+        # Worktree-settle tracking for the fold (see `_worktree_settled`): the latent tip being
+        # waited on and since when, plus the last tree seen and when it last changed. A
+        # `_settle_changed_at` of 0.0 means "no change ever observed", which reads as settled —
+        # a daemon that starts on an already-dirty tree has nothing to wait for.
+        self._settle_tip: str | None = None
+        self._settle_since = 0.0
+        self._settle_tree: str | None = None
+        self._settle_changed_at = 0.0
         # Summary worker threads keyed by the latent commit sha, so the fold can tell a summary
         # that's still computing from one that already FINISHED (and, if it produced no note, fold
         # now instead of waiting out the full summary_wait_seconds — e.g. the summarizer errored).
@@ -584,11 +592,14 @@ class BackgroundRunner:
         return 0
 
     def _teardown(self) -> None:
-        # Record any final completed turn (and, in auto mode, fold it) before stopping.
+        # Record any final turn (and, in auto mode, fold it) before stopping. `require_complete
+        # =False` and `force=True` mirror the proxy's exit finalize: a turn still running when
+        # the daemon stops is captured rather than dropped, and the fold does not sit out the
+        # summary/settle waits during teardown.
         try:
-            self._process_once()
+            self._process_once(require_complete=False)
             if not self._manual_commits:
-                self._auto_fold_pending()
+                self._auto_fold_pending(force=True)
         except Exception as error:
             self._debug(f"final process failed: {error!r}")
         self._manual.teardown()
@@ -712,6 +723,7 @@ class BackgroundRunner:
     def _loop(self) -> None:
         while not self._stop.is_set():
             try:
+                self._sample_worktree()  # the daemon's stand-in for the TUI's file watcher
                 self._process_once()  # records latently, or covers commits the agent made itself
                 self._manual.service()
                 if not self._manual_commits:
@@ -796,9 +808,14 @@ class BackgroundRunner:
             self._debug(f"tracked session lookup failed: {error!r}")
             return None
 
-    def _process_once(self) -> bool:
+    def _process_once(self, *, require_complete: bool = True) -> bool:
         """Export the user's active backend session and record any newly completed turns as
-        latent commits. Returns True when a turn was recorded this cycle."""
+        latent commits. Returns True when a turn was recorded this cycle.
+
+        ``require_complete=False`` is the STOP finalize: it keeps a turn that never got a final
+        response, so work in progress when the daemon is stopped is still captured. This mirrors
+        the interactive proxy's exit finalize — without it, quitting mid-turn silently discarded
+        that turn's record in background mode but not in the TUI."""
         session_id = self._tracked_session_id()
         if session_id is None:
             self._debug("no human-driven session in this repo; nothing to export")
@@ -823,7 +840,7 @@ class BackgroundRunner:
             session=session,
             quiet=True,
             prompt_untracked=True,
-            require_complete=True,
+            require_complete=require_complete,
             awaited_followups=[],
             agent_is_active_fn=lambda: False,
             debug_fn=self._debug,
@@ -994,13 +1011,17 @@ class BackgroundRunner:
     # Auto mode: fold the pending latent turns into a real commit ourselves
     # ------------------------------------------------------------------
 
-    def _auto_fold_pending(self) -> None:
+    def _auto_fold_pending(self, *, force: bool = False) -> None:
         """Auto mode: aGiTrack commits the pending latent turns itself — folding their full
         trace/metadata — so the user doesn't have to. If the working tree is already clean the
         agent (or user) committed its own work, in which case the prepare-commit-msg fold hook
         folded the tracking into THAT commit (cover being only the fallback), and there is nothing
         for us to do. The tree is snapshotted with the same scaffolding filter the latent path
-        uses, so ``.agitrack`` churn never counts as work."""
+        uses, so ``.agitrack`` churn never counts as work.
+
+        ``force`` skips the settle and summary waits — set on the STOP finalize, where the commit
+        must land NOW because no further poll will run. Same role as the proxy's
+        ``_auto_fold_latent_pending(force=True)`` on exit."""
         ref = self._manual.ref()
         tip = self.repo.ref_sha(ref)
         if not tip:
@@ -1014,11 +1035,13 @@ class BackgroundRunner:
             return
         if self._manual.pending_count() == 0:
             return
+        if not force and not self._worktree_settled(tip):
+            return  # something is still writing — retry next cycle
         # Let the LLM summary land first so the commit is summarized (subject + lead paragraph),
         # not left with the raw prompt. Bounded — after summary_wait_seconds we fold anyway. Unlike
         # the interactive proxy the daemon never amends HEAD (the user may be committing), so the
         # summary must be in BEFORE the commit, not amended in after.
-        if not self._fold_summary_ready(tip):
+        if not force and not self._fold_summary_ready(tip):
             return  # retry next cycle
         bodies = self._manual.pending_bodies()  # re-read: any arrived summaries are now applied
         message = build_auto_fold_message(bodies)
@@ -1043,6 +1066,57 @@ class BackgroundRunner:
             self._print("committed agent turn(s).")
         except Exception as error:
             self._debug(f"auto fold failed: {error!r}")
+
+    def _summary_wait_seconds(self) -> float:
+        try:
+            return float(self.global_config.timings.get("summary_wait_seconds", 45.0))
+        except Exception:
+            return 45.0
+
+    def _sample_worktree(self) -> None:
+        """Note whether the working tree changed since the last poll, so ``_worktree_settled``
+        knows when it last moved.
+
+        Sampled every cycle rather than only at fold time, because that is what makes the timing
+        match the TUI: there a file watcher stamps ``_last_change_at`` on each write, so by the
+        time a turn ends the tree has usually been quiet for a while already and the extra wait
+        before committing is near zero. Measuring only from the first fold attempt would instead
+        add a full quiet period to every commit. The snapshot is the same one the fold and the
+        cover check already take each cycle, so this costs nothing extra in practice."""
+        try:
+            tree = self.repo.snapshot_worktree_tree()
+        except Exception as error:
+            self._debug(f"settle sample failed: {error!r}")
+            return
+        if self._settle_tree is not None and tree != self._settle_tree:
+            self._settle_changed_at = time.monotonic()
+        self._settle_tree = tree
+
+    def _worktree_settled(self, tip: str) -> bool:
+        """True when the working tree has stopped changing, so the fold captures a coherent
+        snapshot instead of a half-written one.
+
+        This is the ``file_stable_seconds`` quiet period the interactive TUI applies before an
+        auto-commit (``ProxyRunner._maybe_agent_commit``). The daemon used to ignore that setting
+        entirely — a user who tuned it saw it honored in the TUI and silently dropped here.
+
+        BOUNDED, unlike the TUI's: the daemon commonly runs in repos where something writes
+        continuously (a long job the agent started, a log being appended), and such a repo has no
+        quiet moment at all — deferring forever would stop committing while looking perfectly
+        healthy. Once this same latent tip has been waited on for ``summary_wait_seconds`` we fold
+        regardless. The fold already tolerates exactly that much latency waiting for a summary, so
+        this adds no new worst case."""
+        now = time.monotonic()
+        if tip != self._settle_tip:  # a new turn to fold — restart the cap clock
+            self._settle_tip = tip
+            self._settle_since = now
+        try:
+            quiet = float(self.global_config.timings.get("file_stable_seconds", 8.0))
+        except Exception:
+            quiet = 8.0
+        if now - self._settle_changed_at >= quiet:
+            return True
+        return now - self._settle_since >= self._summary_wait_seconds()
 
     def _fold_summary_ready(self, tip: str) -> bool:
         """True when the auto-fold may proceed: summarization off, the tip's summary note has
@@ -1071,11 +1145,7 @@ class BackgroundRunner:
         if self._fold_wait_since is None:
             self._fold_wait_since = now
             return False
-        try:
-            deadline = float(self.global_config.timings.get("summary_wait_seconds", 45.0))
-        except Exception:
-            deadline = 45.0
-        return (now - self._fold_wait_since) >= deadline
+        return (now - self._fold_wait_since) >= self._summary_wait_seconds()
 
     # ------------------------------------------------------------------
     # Summaries (best-effort, written as git notes so the fold picks them up)
