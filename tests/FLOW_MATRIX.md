@@ -128,6 +128,9 @@ Conventions:
 | Summarizer refusals ("I don't have any coding session turns...") are unusable, falling back to the prompt-led subject | `test_summarizer_raises_on_refusal_text`, `test_summary_first_person_content_is_still_usable` | mock |
 | A turn force-committed before the agent replied (crash/restart) re-exports when it CONTINUES, so its real final message and edits are committed rather than hidden behind the user-id watermark | `test_turns_after_re_exports_a_turn_that_continued_past_its_force_commit` | mock |
 | "No response requested." (Claude's crash filler) never counts as a final message; the restarted process's real reply becomes the turn's final | `test_no_response_requested_filler_is_not_a_final_message` | mock |
+| A dangling turn whose only reply is the crash filler stays in-flight (not complete-but-answerless) | `test_filler_only_turn_stays_incomplete` | mock |
+| A bare "/compact" user row (recorded without the command-name artifact) opens no turn | `test_bare_compact_command_row_does_not_open_a_turn` | mock |
+| A commit's trace never ends with an unanswered user message: force commits trim trailing final-less turns (watermark stays before them), but a SOLE in-flight turn still force-commits on exit | `test_force_commit_trims_trailing_unanswered_turn`, `test_sole_unanswered_turn_still_force_commits_on_exit`, `test_finish_parse_forces_in_progress_commit_on_exit` | mock |
 
 ## 9a3. Live background tasks vs the user-commit dialog
 | Sequence | Test(s) | Kind |
