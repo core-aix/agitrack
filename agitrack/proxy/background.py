@@ -33,7 +33,7 @@ from typing import Any
 
 from agitrack.backends.proxy_agents import make_proxy_agent
 from agitrack.commits import ManualCommitTracker
-from agitrack.commits.message import build_auto_fold_message, summary_metadata_lines
+from agitrack.commits.message import build_auto_fold_message, is_fully_tracked_message, summary_metadata_lines
 from agitrack.config import AgitrackState, GlobalConfig
 from agitrack.events import EventLog, resolve_log_path
 from agitrack.git import GitRepo
@@ -96,16 +96,37 @@ def stop_background(repo: GitRepo) -> int:
     if pid is None:
         print("No aGiTrack background tracker is running on this repo.")
         return 0
-    terminate_pid(pid)
-    for _ in range(100):  # up to ~10s for a clean shutdown
-        if not pid_alive(pid):
-            break
-        time.sleep(0.1)
-    if pid_alive(pid):
+    if not _terminate_and_wait(pid):
         print(f"aGiTrack background tracker (PID {pid}) did not stop in time; it may still be shutting down.")
         return 1
     print("Stopped the aGiTrack background tracker.")
     return 0
+
+
+def replace_running_tracker(repo: GitRepo, *, owner_pid: int | None) -> bool:
+    """``agitrack -b`` invoked while the repo lock is held: if the holder is a LIVE background
+    tracker, stop it so this rerun replaces it — like ``-d`` and ``--backtrace``, rerunning
+    the command must pick up updated aGiTrack code. Only a background tracker is replaced;
+    when anything else holds the lock (an interactive TUI session) this returns False and the
+    caller keeps refusing to start. True once the old tracker has shut down cleanly."""
+    pid = _live_background_pid(repo)
+    if pid is None or (owner_pid is not None and pid != owner_pid):
+        return False
+    if not _terminate_and_wait(pid):
+        print(f"aGiTrack background tracker (PID {pid}) did not stop in time; run `agitrack -b stop` and try again.")
+        return False
+    print(f"Restarting the aGiTrack background tracker (was PID {pid}).")
+    return True
+
+
+def _terminate_and_wait(pid: int, *, timeout: float = 10.0) -> bool:
+    """SIGTERM ``pid`` and wait (bounded) for its clean shutdown — the tracker records any
+    final turn and removes its hooks on the way out. True once the process is gone."""
+    terminate_pid(pid)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and pid_alive(pid):
+        time.sleep(0.1)
+    return not pid_alive(pid)
 
 
 def background_log_path(repo: GitRepo) -> Path:
@@ -328,15 +349,21 @@ def spawn_background_daemon(repo: GitRepo, *, extra_args: list[str]) -> subproce
 def start_background_daemon(repo: GitRepo, *, extra_args: list[str], timeout: float = 8.0) -> int:
     """`agitrack -b`: start the background tracker as a detached daemon and return to the shell.
 
-    Reuses a daemon already running for this repo rather than spawning a duplicate. The daemon
-    keeps running after the terminal closes; stop it with ``agitrack -b stop``."""
+    Restarts a daemon already running for this repo rather than leaving the old one in place —
+    like ``-d`` and ``--backtrace``, re-running the command after an aGiTrack update must run
+    the NEW code. The old tracker gets its clean SIGTERM shutdown first (it records any final
+    turn and removes its hooks). The daemon keeps running after the terminal closes; stop it
+    with ``agitrack -b stop``."""
     running = _live_background_pid(repo)
     if running is not None:
         info = _read_handshake(repo) or {}
-        print(
-            f"\naGiTrack background tracker is already running on this repo (PID {running}, {info.get('mode', '?')})."
-        )
-        return 0
+        if not _terminate_and_wait(running):
+            print(
+                f"\naGiTrack background tracker (PID {running}) did not stop in time; "
+                "run `agitrack -b stop` and try again."
+            )
+            return 1
+        print(f"\nRestarting the aGiTrack background tracker (was PID {running}, {info.get('mode', '?')}).")
     proc = spawn_background_daemon(repo, extra_args=extra_args)
     record = wait_for_handshake(repo, pid=proc.pid, timeout=timeout)
     if record is None:
@@ -465,6 +492,17 @@ class BackgroundRunner:
         # summary, not the raw prompt. Tracks the latent tip we're waiting on and since when.
         self._fold_wait_tip: str | None = None
         self._fold_wait_since: float | None = None
+        # Worktree-settle tracking for the fold (see `_worktree_settled`): the latent tip being
+        # waited on and since when, plus the last tree seen and when it last changed. A
+        # `_settle_changed_at` of 0.0 means "no change ever observed", which reads as settled —
+        # a daemon that starts on an already-dirty tree has nothing to wait for.
+        self._settle_tip: str | None = None
+        self._settle_since = 0.0
+        self._settle_tree: str | None = None
+        self._settle_changed_at = 0.0
+        # Tool-use ids of background tasks the agent started that are still running, refreshed
+        # from each export. While any is live the settle wait is not capped (see below).
+        self._live_background_tasks: list[str] = []
         # Summary worker threads keyed by the latent commit sha, so the fold can tell a summary
         # that's still computing from one that already FINISHED (and, if it produced no note, fold
         # now instead of waiting out the full summary_wait_seconds — e.g. the summarizer errored).
@@ -505,7 +543,13 @@ class BackgroundRunner:
 
         # Both modes record turns as latent commits and fold them via the prepare-commit-msg hook;
         # the tracker owns that machinery (shared with the proxy's manual mode).
-        self._manual = ManualCommitTracker(self.repo, self.base_repo, self.state, debug=self._debug)
+        # Facts about the turn the agent is currently running, refreshed from every export (see
+        # `_note_in_flight`). Lets the fold trailer attribute a commit the agent makes ITSELF
+        # before that turn ends — the pre-commit flush re-exports first, so this is current.
+        self._in_flight: dict | None = None
+        self._manual = ManualCommitTracker(
+            self.repo, self.base_repo, self.state, debug=self._debug, in_flight_fn=lambda: self._in_flight
+        )
 
     # ------------------------------------------------------------------
 
@@ -551,11 +595,14 @@ class BackgroundRunner:
         return 0
 
     def _teardown(self) -> None:
-        # Record any final completed turn (and, in auto mode, fold it) before stopping.
+        # Record any final turn (and, in auto mode, fold it) before stopping. `require_complete
+        # =False` and `force=True` mirror the proxy's exit finalize: a turn still running when
+        # the daemon stops is captured rather than dropped, and the fold does not sit out the
+        # summary/settle waits during teardown.
         try:
-            self._process_once()
+            self._process_once(require_complete=False)
             if not self._manual_commits:
-                self._auto_fold_pending()
+                self._auto_fold_pending(force=True)
         except Exception as error:
             self._debug(f"final process failed: {error!r}")
         self._manual.teardown()
@@ -679,6 +726,7 @@ class BackgroundRunner:
     def _loop(self) -> None:
         while not self._stop.is_set():
             try:
+                self._sample_worktree()  # the daemon's stand-in for the TUI's file watcher
                 self._process_once()  # records latently, or covers commits the agent made itself
                 self._manual.service()
                 if not self._manual_commits:
@@ -738,17 +786,51 @@ class BackgroundRunner:
         session.name = None
         return session
 
-    def _process_once(self) -> bool:
+    def _tracked_session_id(self) -> str | None:
+        """The conversation to export this cycle: the newest one a HUMAN is driving here.
+
+        The interactive proxy gets this for free — it spawns the backend itself and pins that
+        session (``ProxyRunner._discover_spawned_session``), so it tracks exactly one
+        conversation no matter what else runs in the directory. The daemon spawns nothing and
+        has to choose, and "newest transcript in the repo dir" is the wrong rule as soon as the
+        tracked agent fans work out to SDK workers: each worker writes its own transcript into
+        that same directory, so every one of them gets adopted as the user's next turn — one
+        commit per worker, each carrying that worker's interaction trace, each snapshotting
+        whatever half-finished output files happened to exist at that moment.
+        ``list_sessions`` already drops programmatic transcripts, so the newest survivor is the
+        real conversation.
+
+        Returns None when nobody is driving an agent here. The caller must then skip the cycle
+        rather than let the pinned id stand in: that id may itself be a programmatic session
+        adopted before this filter existed, and a still-running one would keep feeding the
+        daemon "turns" the user never asked for.
+        """
+        try:
+            return self.backend.latest_session_id(self.repo.repo)
+        except Exception as error:
+            self._debug(f"tracked session lookup failed: {error!r}")
+            return None
+
+    def _process_once(self, *, require_complete: bool = True) -> bool:
         """Export the user's active backend session and record any newly completed turns as
-        latent commits. Returns True when a turn was recorded this cycle."""
+        latent commits. Returns True when a turn was recorded this cycle.
+
+        ``require_complete=False`` is the STOP finalize: it keeps a turn that never got a final
+        response, so work in progress when the daemon is stopped is still captured. This mirrors
+        the interactive proxy's exit finalize — without it, quitting mid-turn silently discarded
+        that turn's record in background mode but not in the TUI."""
+        session_id = self._tracked_session_id()
+        if session_id is None:
+            self._debug("no human-driven session in this repo; nothing to export")
+            return False
         session = self._bare_session()
         engine = CommitEngine(self.repo, self.state, debug_fn=self._debug)
-        # Track whichever conversation is newest in the repo dir — the one the user is driving —
-        # and follow an in-backend session switch. The per-conversation watermark keeps each
+        # Follow an in-backend session switch (the user starting or resuming a conversation)
+        # while ignoring programmatic ones. The per-conversation watermark keeps each
         # conversation's turns counted exactly once.
         engine.start_parse(
             session=session,
-            discover_session_id_fn=lambda: self.backend.latest_session_id(self.repo.repo),
+            discover_session_id_fn=lambda: session_id,
             debug_fn=self._debug,
         )
         thread = session.agent_parse_thread
@@ -761,15 +843,30 @@ class BackgroundRunner:
             session=session,
             quiet=True,
             prompt_untracked=True,
-            require_complete=True,
+            require_complete=require_complete,
             awaited_followups=[],
             agent_is_active_fn=lambda: False,
             debug_fn=self._debug,
             note_session_change_fn=lambda _sid: None,
             mirror_fn=lambda _sid: None,
             commit_fn=self._record_turns,
+            note_in_flight_fn=self._note_in_flight,
         )
+        # The engine records the session's still-running background tasks onto the session it was
+        # given. That object is thrown away each cycle, so carry the answer onto the runner — the
+        # fold's settle rule needs it (see `_worktree_settled`).
+        self._live_background_tasks = list(getattr(session, "live_background_task_ids", None) or [])
         return bool(committed)
+
+    def _note_in_flight(self, facts: dict | None) -> None:
+        """Remember (or clear) the running turn's facts. The pre-commit flush re-renders the
+        trailer right after ``_process_once``, so this is current at commit time; re-rendering on
+        a change as well keeps attribution working even if that nudge never lands (a removed
+        pre-commit hook, a ``core.hooksPath`` that skips it)."""
+        changed = self._in_flight != facts
+        self._in_flight = facts
+        if changed:
+            self._manual.render_trailer()
 
     def _record_turns(
         self,
@@ -872,14 +969,18 @@ class BackgroundRunner:
             self._debug(f"tracked-head write failed: {error!r}")
 
     def _is_agitrack_tracked(self, sha: str) -> bool:
-        """True when a commit already carries aGiTrack tracking (its own metadata, or an aGiTrack
-        cover/merge), so it must not be covered again. Keeps the daemon's own commits and
-        hook-folded user commits out of a cover's ``covered_commits``."""
+        """True when a commit already carries COMPLETE aGiTrack tracking (its own metadata, or an
+        aGiTrack cover/merge), so it must not be covered again. Keeps the daemon's own commits and
+        hook-folded user commits out of a cover's ``covered_commits``.
+
+        A commit carrying only an IN-FLIGHT block is deliberately NOT tracked: it was stamped
+        mid-turn with attribution alone, so the completed turn still owes it a trace and token
+        counts and must cover it."""
         try:
             body = self.repo.commit_message(sha) or ""
         except Exception:
             return False
-        return "# aGiTrack Metadata" in body or body.lstrip().startswith("<aGiTrack")
+        return is_fully_tracked_message(body) or body.lstrip().startswith("<aGiTrack")
 
     def _agent_committed_own_work(self) -> list[str]:
         """Full SHAs (oldest first) of the commit(s) to cover for a just-completed turn — the
@@ -917,13 +1018,17 @@ class BackgroundRunner:
     # Auto mode: fold the pending latent turns into a real commit ourselves
     # ------------------------------------------------------------------
 
-    def _auto_fold_pending(self) -> None:
+    def _auto_fold_pending(self, *, force: bool = False) -> None:
         """Auto mode: aGiTrack commits the pending latent turns itself — folding their full
         trace/metadata — so the user doesn't have to. If the working tree is already clean the
         agent (or user) committed its own work, in which case the prepare-commit-msg fold hook
         folded the tracking into THAT commit (cover being only the fallback), and there is nothing
         for us to do. The tree is snapshotted with the same scaffolding filter the latent path
-        uses, so ``.agitrack`` churn never counts as work."""
+        uses, so ``.agitrack`` churn never counts as work.
+
+        ``force`` skips the settle and summary waits — set on the STOP finalize, where the commit
+        must land NOW because no further poll will run. Same role as the proxy's
+        ``_auto_fold_latent_pending(force=True)`` on exit."""
         ref = self._manual.ref()
         tip = self.repo.ref_sha(ref)
         if not tip:
@@ -937,11 +1042,13 @@ class BackgroundRunner:
             return
         if self._manual.pending_count() == 0:
             return
+        if not force and not self._worktree_settled(tip):
+            return  # something is still writing — retry next cycle
         # Let the LLM summary land first so the commit is summarized (subject + lead paragraph),
         # not left with the raw prompt. Bounded — after summary_wait_seconds we fold anyway. Unlike
         # the interactive proxy the daemon never amends HEAD (the user may be committing), so the
         # summary must be in BEFORE the commit, not amended in after.
-        if not self._fold_summary_ready(tip):
+        if not force and not self._fold_summary_ready(tip):
             return  # retry next cycle
         bodies = self._manual.pending_bodies()  # re-read: any arrived summaries are now applied
         message = build_auto_fold_message(bodies)
@@ -966,6 +1073,61 @@ class BackgroundRunner:
             self._print("committed agent turn(s).")
         except Exception as error:
             self._debug(f"auto fold failed: {error!r}")
+
+    def _summary_wait_seconds(self) -> float:
+        try:
+            return float(self.global_config.timings.get("summary_wait_seconds", 45.0))
+        except Exception:
+            return 45.0
+
+    def _sample_worktree(self) -> None:
+        """Note whether the working tree changed since the last poll, so ``_worktree_settled``
+        knows when it last moved.
+
+        Sampled every cycle rather than only at fold time, because that is what makes the timing
+        match the TUI: there a file watcher stamps ``_last_change_at`` on each write, so by the
+        time a turn ends the tree has usually been quiet for a while already and the extra wait
+        before committing is near zero. Measuring only from the first fold attempt would instead
+        add a full quiet period to every commit. The snapshot is the same one the fold and the
+        cover check already take each cycle, so this costs nothing extra in practice."""
+        try:
+            tree = self.repo.snapshot_worktree_tree()
+        except Exception as error:
+            self._debug(f"settle sample failed: {error!r}")
+            return
+        if self._settle_tree is not None and tree != self._settle_tree:
+            self._settle_changed_at = time.monotonic()
+        self._settle_tree = tree
+
+    def _worktree_settled(self, tip: str) -> bool:
+        """True when the working tree has stopped changing, so the fold captures a coherent
+        snapshot instead of a half-written one.
+
+        This is the ``file_stable_seconds`` quiet period the interactive TUI applies before an
+        auto-commit (``ProxyRunner._maybe_agent_commit``). The daemon used to ignore that setting
+        entirely — a user who tuned it saw it honored in the TUI and silently dropped here.
+
+        The wait is capped so a repo with an unexplained continuous writer cannot stop committing
+        forever while looking perfectly healthy — the TUI's gate has no such bound. But the cap is
+        SUSPENDED while a background task the agent started is still running, because that is the
+        one case where a never-settling tree is expected rather than pathological, and it is
+        exactly the case the TUI's unbounded wait handles well: a task that streams progress for
+        an hour otherwise produces a commit every few minutes whose entire diff is the task's own
+        log/output churn and whose turn is the agent saying "still running, nothing to report".
+        Waiting collapses that whole run into ONE commit carrying every turn's trace."""
+        now = time.monotonic()
+        if tip != self._settle_tip:  # a new turn to fold — restart the cap clock
+            self._settle_tip = tip
+            self._settle_since = now
+        try:
+            quiet = float(self.global_config.timings.get("file_stable_seconds", 8.0))
+        except Exception:
+            quiet = 8.0
+        if now - self._settle_changed_at >= quiet:
+            return True
+        if self._live_background_tasks:
+            return False  # its output is what keeps the tree moving — wait for it, like the TUI
+        return now - self._settle_since >= self._summary_wait_seconds()
 
     def _fold_summary_ready(self, tip: str) -> bool:
         """True when the auto-fold may proceed: summarization off, the tip's summary note has
@@ -994,11 +1156,7 @@ class BackgroundRunner:
         if self._fold_wait_since is None:
             self._fold_wait_since = now
             return False
-        try:
-            deadline = float(self.global_config.timings.get("summary_wait_seconds", 45.0))
-        except Exception:
-            deadline = 45.0
-        return (now - self._fold_wait_since) >= deadline
+        return (now - self._fold_wait_since) >= self._summary_wait_seconds()
 
     # ------------------------------------------------------------------
     # Summaries (best-effort, written as git notes so the fold picks them up)
