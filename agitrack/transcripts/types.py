@@ -102,6 +102,10 @@ class SessionRef:
     id: str
     updated: float  # epoch seconds; newest wins
     label: str | None = None
+    # True when the conversation was driven by a program (the Agent SDK, `claude -p`)
+    # rather than typed by a human. Such transcripts are work an agent fanned out, not a
+    # conversation to track or resume — see `agitrack.transcripts.claude.list_sessions`.
+    programmatic: bool = False
 
 
 def turns_after(session: ExportedSession, last_message_id: str | None) -> list[SessionTurn]:

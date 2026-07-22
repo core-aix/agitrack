@@ -765,17 +765,46 @@ class BackgroundRunner:
         session.name = None
         return session
 
+    def _tracked_session_id(self) -> str | None:
+        """The conversation to export this cycle: the newest one a HUMAN is driving here.
+
+        The interactive proxy gets this for free — it spawns the backend itself and pins that
+        session (``ProxyRunner._discover_spawned_session``), so it tracks exactly one
+        conversation no matter what else runs in the directory. The daemon spawns nothing and
+        has to choose, and "newest transcript in the repo dir" is the wrong rule as soon as the
+        tracked agent fans work out to SDK workers: each worker writes its own transcript into
+        that same directory, so every one of them gets adopted as the user's next turn — one
+        commit per worker, each carrying that worker's interaction trace, each snapshotting
+        whatever half-finished output files happened to exist at that moment.
+        ``list_sessions`` already drops programmatic transcripts, so the newest survivor is the
+        real conversation.
+
+        Returns None when nobody is driving an agent here. The caller must then skip the cycle
+        rather than let the pinned id stand in: that id may itself be a programmatic session
+        adopted before this filter existed, and a still-running one would keep feeding the
+        daemon "turns" the user never asked for.
+        """
+        try:
+            return self.backend.latest_session_id(self.repo.repo)
+        except Exception as error:
+            self._debug(f"tracked session lookup failed: {error!r}")
+            return None
+
     def _process_once(self) -> bool:
         """Export the user's active backend session and record any newly completed turns as
         latent commits. Returns True when a turn was recorded this cycle."""
+        session_id = self._tracked_session_id()
+        if session_id is None:
+            self._debug("no human-driven session in this repo; nothing to export")
+            return False
         session = self._bare_session()
         engine = CommitEngine(self.repo, self.state, debug_fn=self._debug)
-        # Track whichever conversation is newest in the repo dir — the one the user is driving —
-        # and follow an in-backend session switch. The per-conversation watermark keeps each
+        # Follow an in-backend session switch (the user starting or resuming a conversation)
+        # while ignoring programmatic ones. The per-conversation watermark keeps each
         # conversation's turns counted exactly once.
         engine.start_parse(
             session=session,
-            discover_session_id_fn=lambda: self.backend.latest_session_id(self.repo.repo),
+            discover_session_id_fn=lambda: session_id,
             debug_fn=self._debug,
         )
         thread = session.agent_parse_thread

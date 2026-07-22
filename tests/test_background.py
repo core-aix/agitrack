@@ -196,6 +196,28 @@ def test_background_follows_latest_session_and_counts_once(tmp_path):
     assert runner._manual.pending_count() == 2
 
 
+def test_background_skips_cycle_when_no_human_driven_session(tmp_path):
+    # The daemon must never fall back to a pinned id when the backend reports no
+    # human-driven conversation. `latest_session_id` excludes programmatic (SDK) sessions,
+    # so "None" here means the only transcripts in the repo dir are worker runs an agent
+    # fanned out — and a still-running one would otherwise keep feeding the daemon turns.
+    runner, repo, state, backend = _runner(tmp_path, manual=True)
+    runner._manual.setup()
+    (tmp_path / "a.txt").write_text("one\nfirst\n", encoding="utf-8")
+    backend.set_session("s1", [_turn("u1", "m1", "first", "done", 10)])
+    assert runner._process_once() is True
+    assert state.backend_session_id == "s1"
+
+    # A worker run appends turns to a session aGiTrack no longer considers adoptable.
+    backend.sessions["s1"] = ExportedSession(
+        "s1", "claude-opus-4-8", None, [_turn("u1", "m1", "first", "done", 10), _turn("u2", "m2", "worker", "done", 99)]
+    )
+    (tmp_path / "a.txt").write_text("one\nfirst\nworker\n", encoding="utf-8")
+    backend.latest = None
+    assert runner._process_once() is False
+    assert runner._manual.pending_count() == 1  # still just the human turn
+
+
 # --- regression: a completed turn with changes is always committed ----------
 
 

@@ -78,6 +78,11 @@ _BACKGROUND_LIVE_HORIZON_SECONDS = 3600
 # the command lets that expansion open a real turn so its work is committed.
 _COMMAND_NAME_RE = re.compile(r"<command-name>\s*(/[^<]*?)\s*</command-name>")
 
+# Values Claude stamps on a conversation's opening user row when the prompt came from a
+# program rather than a person — see `_is_programmatic_row`.
+_SDK_PROMPT_SOURCES = {"sdk"}
+_SDK_ENTRYPOINTS = {"sdk", "sdk-cli"}
+
 
 def _projects_root() -> Path:
     config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
@@ -128,12 +133,23 @@ def _refs_in_project_dir(project_dir: Path) -> list[SessionRef]:
             updated = path.stat().st_mtime
         except OSError:
             continue
-        refs.append(SessionRef(id=path.stem, updated=updated, label=_session_label(path)))
+        label, programmatic = _scan_session_head(path)
+        refs.append(SessionRef(id=path.stem, updated=updated, label=label, programmatic=programmatic))
     return refs
 
 
 def list_sessions(repo: Path) -> list[SessionRef]:
-    return _refs_in_project_dir(_project_dir(repo))
+    """Every conversation in this repository that a HUMAN is driving, newest-first ordering
+    left to the caller.
+
+    Programmatic transcripts (Agent SDK, ``claude -p``) are excluded. They are work an agent
+    fanned out, not conversations to track, resume, or offer in a picker: an agent that farms
+    a task out to one SDK worker per item writes one transcript per worker into this very
+    directory, and adopting them would make aGiTrack commit each worker's run as if it were
+    the user's next turn. `sessions_under` (used by ``--backtrace``) deliberately keeps them —
+    reconstructing what happened in a directory should still see that work.
+    """
+    return [ref for ref in _refs_in_project_dir(_project_dir(repo)) if not ref.programmatic]
 
 
 def list_worktree_sessions(worktrees_root: Path) -> list[tuple[str, SessionRef]]:
@@ -220,9 +236,31 @@ def sessions_under(directory: Path) -> list[tuple[SessionRef, Path]]:
     return out
 
 
-def _session_label(path: Path, *, line_limit: int = 100) -> str | None:
-    # The first real user prompt makes a readable label; it is near the top of
-    # the transcript, so reading only the head keeps listing cheap.
+def _is_programmatic_row(row: dict) -> bool:
+    """Whether a conversation-opening user row came from a program rather than a person.
+
+    Claude stamps where a prompt originated: an interactive TUI session records
+    ``entrypoint: "cli"`` with ``promptSource: "typed"``, while a run driven by the Agent
+    SDK or ``claude -p`` records ``sdk-cli``/``sdk``. Only POSITIVE evidence counts as
+    programmatic — a transcript from an older Claude Code that stamps neither field stays
+    adoptable, so this can never cost aGiTrack a session it used to track.
+    """
+    source = row.get("promptSource")
+    if isinstance(source, str) and source.strip().lower() in _SDK_PROMPT_SOURCES:
+        return True
+    entrypoint = row.get("entrypoint")
+    return isinstance(entrypoint, str) and entrypoint.strip().lower() in _SDK_ENTRYPOINTS
+
+
+def _scan_session_head(path: Path, *, line_limit: int = 100) -> tuple[str | None, bool]:
+    """``(label, programmatic)`` for a transcript, from one bounded read of its head.
+
+    The label is the session's first real user prompt. Both answers live near the top of
+    the file, so they are collected in a single pass to keep listing cheap.
+    """
+    label: str | None = None
+    programmatic = False
+    origin_seen = False
     try:
         with path.open("r", encoding="utf-8") as handle:
             for index, line in enumerate(handle):
@@ -235,13 +273,27 @@ def _session_label(path: Path, *, line_limit: int = 100) -> str | None:
                     row = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if row.get("type") == "user":
+                if row.get("type") != "user":
+                    continue
+                if not origin_seen and not row.get("isSidechain"):
+                    # The conversation's OWN opening prompt. Sidechain rows belong to a
+                    # sub-agent running inside it and carry no origin fields, so they say
+                    # nothing about who is driving the conversation.
+                    origin_seen = True
+                    programmatic = _is_programmatic_row(row)
+                if label is None:
                     prompt = _user_prompt(row)
                     if prompt:
-                        return prompt.splitlines()[0]
+                        label = prompt.splitlines()[0]
+                if label is not None and origin_seen:
+                    break
     except OSError:
-        return None
-    return None
+        return None, False
+    return label, programmatic
+
+
+def _session_label(path: Path, *, line_limit: int = 100) -> str | None:
+    return _scan_session_head(path, line_limit=line_limit)[0]
 
 
 def session_belongs_to_repo(repo: Path, session_id: str) -> bool:
