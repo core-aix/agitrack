@@ -662,9 +662,10 @@ def test_parse_rows_background_task_work_opens_its_own_turn():
 
 def test_no_response_requested_filler_is_not_a_final_message():
     # "No response requested." is Claude Code's synthetic filler for aborted/crashed
-    # requests. It must never count as the agent's final message: a crashed turn stays
-    # final-less (so it isn't committed as answered), and when the restarted process
-    # produces the REAL reply, that becomes the turn's final.
+    # requests. It must contribute NOTHING to the turn: not the final message and not
+    # completion (its stop_reason once made a crashed turn look complete-but-answerless,
+    # which was then committed with a trace ending in a bare user message). The real
+    # reply from the restarted process becomes the turn's final.
     rows = [
         _user("u1", "please continue"),
         _assistant("crash1", "No response requested.", stop_reason="end_turn"),
@@ -678,6 +679,41 @@ def test_no_response_requested_filler_is_not_a_final_message():
     assert turn.final_response == "Everything is done and the paper builds cleanly."
     assert turn.assistant_message_id == "m1"
     assert turn.agent_messages == ["Everything is done and the paper builds cleanly."]
+
+
+def test_bare_compact_command_row_does_not_open_a_turn():
+    # Newer Claude Code records a typed /compact as a plain user row with the literal
+    # text "/compact" (no <command-name> artifact). It never gets a reply, so opening
+    # a turn for it would leave an unanswered "## User /compact" in commit traces.
+    rows = [
+        _user("u1", "summarize the design"),
+        _assistant("a1", "Here is the summary.", stop_reason="end_turn"),
+        _user("u2", "/compact"),
+        _user("u3", "now write the tests"),
+        _assistant("a2", "Tests written.", stop_reason="end_turn"),
+    ]
+
+    session = parse_rows("sess-compact", rows)
+
+    assert [t.user_prompt for t in session.turns] == [
+        "summarize the design",
+        "now write the tests",
+    ]
+
+
+def test_filler_only_turn_stays_incomplete():
+    # A crashed turn whose only "reply" is the filler is NOT complete: it stays
+    # in-progress (deferred by the live loop) until a real reply lands.
+    rows = [
+        _user("u1", "please continue"),
+        _assistant("crash1", "No response requested.", stop_reason="end_turn"),
+    ]
+
+    session = parse_rows("sess-filler2", rows)
+
+    assert len(session.turns) == 1
+    assert session.turns[0].complete is False
+    assert session.turns[0].final_response == ""
 
 
 def test_turns_after_re_exports_a_turn_that_continued_past_its_force_commit():

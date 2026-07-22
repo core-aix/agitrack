@@ -1040,6 +1040,13 @@ def parse_rows(
                 if pending_command is None or _command_expansion_text(row) is None:
                     continue
                 prompt = pending_command
+            if prompt == "/compact" or prompt.startswith("/compact "):
+                # Newer Claude Code records a typed /compact as a PLAIN user row (no
+                # <command-name> artifact). It is a local command driving the compaction
+                # recorded right after it (compact_boundary + isCompactSummary rows),
+                # never receives an assistant reply, and must not open a turn: an
+                # unanswered "/compact" turn would ride every later commit's trace.
+                continue
             pending_command = None
             pending_background = None  # a real prompt supersedes a pending background-task turn
             flush()
@@ -1136,6 +1143,15 @@ def parse_rows(
             # means the turn is still mid-flight (more messages will follow the
             # tool result), anything else (end_turn/stop_sequence/max_tokens) is a
             # finished response.
+            if _assistant_text(message) == "No response requested.":
+                # Claude Code's synthetic filler for an aborted/crashed request. It must not
+                # contribute ANYTHING to the turn: not a final message (it isn't one), and
+                # not its stop_reason either — taking the filler's "end_turn" made a crashed
+                # turn look complete-but-answerless, which the no-final-text fallback then
+                # committed with a trace ending in a bare user message. The turn stays
+                # in-progress until the restarted process produces a real reply.
+                current["saw_filler"] = True
+                continue
             current["stop_reason"] = message.get("stop_reason")
             # Claude Code emits a `thinking` content block whenever extended
             # thinking is enabled, so its presence is the only signal the transcript
@@ -1150,13 +1166,7 @@ def parse_rows(
                 current.setdefault("edits", []).extend(_edits_from_message(message, file_state))
                 pending_reads.update(_whole_file_reads(message))
             text = _assistant_text(message)
-            if text and text.strip() != "No response requested.":
-                # "No response requested." is Claude Code's synthetic filler (written when a
-                # request is aborted or a crash cuts the turn short), NOT the agent's final
-                # message. Taking it as a final made a crashed turn look answered, so it was
-                # committed with the filler as its response; the real reply then arrived on
-                # the restarted process and continued the same turn. Skipping it keeps the
-                # turn final-less until an actual agent message lands.
+            if text:
                 current["final"] = text
                 current["assistant_id"] = str(message.get("id") or "")
                 # Each assistant message with user-facing text is a separate reply
@@ -1380,6 +1390,12 @@ def _finalize_turn(turn: dict, *, dangling: bool = False) -> SessionTurn:
     # receive more messages, so treating it as in-progress would stall the
     # commit loop forever.
     in_flight = dangling and not interrupted and turn.get("stop_reason") == "tool_use"
+    if dangling and not interrupted and turn.get("saw_filler") and not turn["final"]:
+        # The turn's only "reply" so far is the "No response requested." crash filler
+        # (skipped above, so it left no stop_reason). Without this, the missing-reason
+        # default would call the crashed turn complete despite having no answer; it
+        # stays in-flight until the restarted process produces a real reply.
+        in_flight = True
     return SessionTurn(
         user_message_id=turn["user_id"],
         assistant_message_id=turn["assistant_id"],
