@@ -196,6 +196,100 @@ def test_background_follows_latest_session_and_counts_once(tmp_path):
     assert runner._manual.pending_count() == 2
 
 
+def _in_flight_turn(uid: str, aid: str, prompt: str) -> SessionTurn:
+    """A turn the agent is still working on: prompt received, no final response yet."""
+    return SessionTurn(uid, aid, prompt, "", TokenUsage(total=0, output=0), "claude-opus-4-8", complete=False)
+
+
+def test_agent_commit_mid_turn_is_attributed_by_the_fold_hook(tmp_path):
+    # THE regression, end to end with the real hooks: the agent runs `git commit` ITSELF
+    # partway through a turn. The turn is not complete, so there is no pending latent turn to
+    # fold, and the commit used to land with no aGiTrack metadata at all — permanently
+    # untracked, because the daemon's cover fallback also bails when the tree is dirty.
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    runner._manual.setup()  # installs prepare-commit-msg / post-commit
+    assert (repo.repo / ".git" / "hooks" / "prepare-commit-msg").exists()
+
+    # The agent is mid-turn and has edited the tree.
+    (tmp_path / "a.txt").write_text("one\nagent work\n", encoding="utf-8")
+    backend.set_session("s1", [_in_flight_turn("u1", "m1", "add the thing")])
+    assert runner._process_once() is False  # nothing to record: the turn has not finished
+    runner._manual.render_trailer()  # what the pre-commit flush does
+
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "Add the thing")
+
+    msg = _git(repo, "log", "-1", "--format=%B", "HEAD")
+    assert "Add the thing" in msg  # the agent's own subject survives
+    assert "# aGiTrack Metadata" in msg
+    assert "commit_type: agent" in msg
+    assert "in_flight: true" in msg  # marked partial: the full record follows later
+    assert "add the thing" in msg  # the prompt it was working on
+    assert "tokens_since_last_commit" not in msg  # counted once, on the completed turn
+
+
+def test_completed_turn_still_covers_the_commit_it_stamped_mid_flight(tmp_path):
+    # The hand-off. An in-flight block is attribution only — no trace, no tokens — so the
+    # commit carrying it must NOT read as already-accounted-for, or the completed turn would
+    # find nothing to attach to and its whole record (and token counts) would be lost.
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    runner._manual.setup()
+    runner._load_tracked_head()
+    (tmp_path / "a.txt").write_text("one\nagent work\n", encoding="utf-8")
+    backend.set_session("s1", [_in_flight_turn("u1", "m1", "add the thing")])
+    runner._process_once()
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "Agent's own commit")
+    agent_commit = repo.rev_parse("HEAD")
+    assert "in_flight: true" in _git(repo, "log", "-1", "--format=%B", agent_commit)
+    assert runner._is_agitrack_tracked(agent_commit) is False  # partial ⇒ still owed a record
+
+    # The turn finishes with the tree clean (the agent committed everything it did).
+    backend.set_session("s1", [_turn("u1", "m1", "add the thing", "done", 120)])
+    assert runner._process_once() is True
+
+    head = _git(repo, "log", "-1", "--format=%B", "HEAD")
+    assert "covered_commits:" in head and agent_commit[:7] in head  # its lines are attributed to AI
+    assert "tokens_since_last_commit_output: 120" in head  # the usage lands exactly once
+    assert runner._is_agitrack_tracked(repo.rev_parse("HEAD")) is True
+
+
+def test_no_trailer_for_a_human_commit_while_the_agent_is_idle(tmp_path):
+    # The in-flight fallback must not turn "aGiTrack is running" into "every commit is
+    # attributed to the AI". With no running turn there is no footprint at all.
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    runner._manual.setup()
+    backend.set_session("s1", [_turn("u1", "m1", "done earlier", "ok", 10)])
+    runner._process_once()  # records + clears: no turn is running now
+    _git(repo, "commit", "-qm", "fold the pending turn", "--allow-empty")
+
+    (tmp_path / "a.txt").write_text("one\nmy own edit\n", encoding="utf-8")
+    runner._manual.render_trailer()
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "My hand-written change")
+
+    msg = _git(repo, "log", "-1", "--format=%B", "HEAD")
+    assert "My hand-written change" in msg
+    assert "# aGiTrack Metadata" not in msg
+
+
+def test_in_flight_note_clears_once_the_turn_completes(tmp_path):
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    runner._manual.setup()
+    (tmp_path / "a.txt").write_text("one\nagent work\n", encoding="utf-8")
+
+    backend.set_session("s1", [_in_flight_turn("u1", "m1", "add the thing")])
+    runner._process_once()
+    assert runner._in_flight is not None
+    assert runner._in_flight["prompt"] == "add the thing"
+
+    # The same turn finishes: the completed record takes over and the fallback stands down.
+    backend.set_session("s1", [_turn("u1", "m1", "add the thing", "done", 12)])
+    runner._process_once()
+    assert runner._in_flight is None
+    assert runner._manual.in_flight_attribution() is None
+
+
 def test_background_skips_cycle_when_no_human_driven_session(tmp_path):
     # The daemon must never fall back to a pinned id when the backend reports no
     # human-driven conversation. `latest_session_id` excludes programmatic (SDK) sessions,

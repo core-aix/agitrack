@@ -33,10 +33,11 @@ from agitrack.commits import AgitrackActions
 from agitrack.backends.setup import BackendUnavailable, backend_installed, ensure_installed_backend, install_hint
 from agitrack.backends.proxy_agents import available_backends, make_proxy_agent
 from agitrack.commits import (
-    METADATA_HEADER,
     apply_summary_to_message,
     build_auto_fold_message,
     build_manual_squash_trailer,
+    build_pending_trailer,
+    is_fully_tracked_message,
     build_user_commit_message,
     summary_metadata_lines,
 )
@@ -576,6 +577,10 @@ class ProxyRunner:
         self._manual_hooks_installed = False
         self._manual_last_head: str | None = None
         self._manual_pending_tree: str | None = None
+        # Facts about the turn the agent is currently running, refreshed from every session
+        # export (see _note_in_flight). Lets the fold trailer attribute a commit the AGENT makes
+        # ITSELF before that turn ends — a turn only becomes a pending latent turn once complete.
+        self._in_flight: dict | None = None
         self._warned_parallel_no_worktree = False  # one-time shared-tree caveat for extra --no-worktree sessions
         # No-worktree only: the branch HEAD when this session started. Commits made past it that
         # aGiTrack didn't author are the agent's own (#35 cover applies); the anchor floors the
@@ -1244,6 +1249,7 @@ class ProxyRunner:
                 "_manual_hooks_installed": False,
                 "_manual_last_head": None,
                 "_manual_pending_tree": None,
+                "_in_flight": None,
                 "_noworktree_base_head": None,
                 "_warned_parallel_no_worktree": False,
                 "_sandbox": True,
@@ -1869,24 +1875,66 @@ class ProxyRunner:
             bodies.append(body)
         return bodies
 
+    def _note_in_flight(self, facts: dict | None) -> None:
+        """Remember (or clear) the running turn's facts, refreshed from every session export.
+
+        Re-renders the fold trailer on a change so it is already current if the agent commits
+        mid-turn. The proxy needs this because — unlike the background daemon, which the
+        pre-commit hook nudges synchronously — it otherwise renders only as turns COMPLETE, and
+        a turn that has merely STARTED is exactly the case this attribution exists for."""
+        changed = getattr(self, "_in_flight", None) != facts
+        self._in_flight = facts
+        if changed:
+            self._render_manual_trailer()
+
+    def _in_flight_attribution(self) -> dict | None:
+        """The running turn's facts for the fold trailer, or None when nothing should be
+        attributed. Mirrors ``ManualCommitTracker.in_flight_attribution``: a turn must actually
+        be in progress AND the working tree must differ from the latent tip, so a commit with no
+        AI work in it still gets no trailer."""
+        facts = getattr(self, "_in_flight", None)
+        if not facts:
+            return None
+        try:
+            if not self._manual_tree_differs_from_tip(self.repo.snapshot_worktree_tree()):
+                return None
+        except Exception as error:
+            self._debug(f"in-flight snapshot failed: {error!r}")
+            return None
+        return facts
+
     def _render_manual_trailer(self) -> None:
         """(Re)render ``.agitrack/manual-pending-trailer`` from the durable latent ref, and
         the ``.agitrack/manual-ref`` name file the post-commit hook reads. When pending turns
         exist the trailer carries the ``commit_type: user`` block plus each turn's full
-        trace/metadata; with NO pending turns it is empty, so a purely human commit is untouched."""
+        trace/metadata; when none are pending but the agent is mid-turn with changes in the tree
+        it carries the in-flight attribution block instead (so an agent that commits its own work
+        before the turn ends is still tracked); otherwise it is empty and a purely human commit
+        is untouched."""
         if not self._latent_tracking:
             return
         try:
             agit_dir = self._manual_agit_dir()
             agit_dir.mkdir(parents=True, exist_ok=True)
             (agit_dir / "manual-ref").write_text(self._manual_ref() + "\n", encoding="utf-8")
-            trailer = build_manual_squash_trailer(
+            trailer = build_pending_trailer(
                 agitrack_session_id=self.state.session_id,
                 latent_bodies=self._manual_pending_bodies(),
+                in_flight=self._in_flight_attribution(),
             )
             (agit_dir / "manual-pending-trailer").write_text(trailer, encoding="utf-8")
         except Exception as error:
             self._debug(f"manual trailer render failed: {error!r}")
+
+    def _manual_tree_differs_from_tip(self, tree: str) -> bool:
+        """Whether *tree* differs from the latent tip's tree (or HEAD's when the chain is
+        empty) — i.e. whether there is uncommitted agent work to account for."""
+        tip = self.repo.ref_sha(self._manual_ref())
+        try:
+            base_tree = self.repo.rev_parse(f"{tip or 'HEAD'}^{{tree}}")
+        except Exception:
+            base_tree = None
+        return tree != base_tree
 
     def _manual_gate(self) -> bool:
         """Commit gate for a manual-mode turn: True when the working tree changed since the
@@ -1898,13 +1946,7 @@ class ProxyRunner:
             self._debug(f"manual snapshot failed: {error!r}")
             self._manual_pending_tree = None
             return False
-        tip = self.repo.ref_sha(self._manual_ref())
-        base_ref = tip or "HEAD"
-        try:
-            base_tree = self.repo.rev_parse(f"{base_ref}^{{tree}}")
-        except Exception:
-            base_tree = None
-        return self._manual_pending_tree != base_tree
+        return self._manual_tree_differs_from_tip(self._manual_pending_tree)
 
     def _manual_record(self, message: str) -> str | None:
         """Record a manual-mode turn as a hidden latent commit: snapshot the working tree,
@@ -9668,7 +9710,9 @@ class ProxyRunner:
                 head_ref = branch
             uncovered: list[str] = []
             for sha in self.repo.log_shas(anchor, head_ref):  # oldest first
-                if METADATA_HEADER in self.repo.commit_message(sha):
+                # A commit stamped only with an IN-FLIGHT block does not reset the list: it
+                # carries attribution but not the turn's trace/tokens, so it is still uncovered.
+                if is_fully_tracked_message(self.repo.commit_message(sha)):
                     uncovered = []
                 else:
                     uncovered.append(sha)
@@ -11218,6 +11262,7 @@ class ProxyRunner:
             # cancelled turn's leftover changes; the sync/exit finalize paths leave
             # them as-is rather than raising a modal during teardown.
             on_cancelled_fn=self._handle_cancelled_turn if integrate else None,
+            note_in_flight_fn=self._note_in_flight,
         )
         self._awaited_followups = new_awaited
         if committed is not None:

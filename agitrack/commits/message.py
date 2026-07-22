@@ -147,6 +147,22 @@ TRACE_ROLE_HEADING_LEVEL = 2
 # backend-made commits (issue #35) checks message bodies for this exact text,
 # so keep the builders and the detector on one definition.
 METADATA_HEADER = "# aGiTrack Metadata"
+# Marks a metadata block as the PARTIAL record of a turn that was still running when the
+# commit was made (see `build_in_flight_trailer`). Callers that ask "is this commit already
+# accounted for?" must answer NO for such a commit: it carries attribution but not the turn's
+# trace or tokens, so the completed turn still has to cover it.
+IN_FLIGHT_MARKER = "in_flight: true"
+
+
+def is_fully_tracked_message(body: str) -> bool:
+    """Whether *body* carries a COMPLETE aGiTrack record — metadata that accounts for a
+    finished turn. False for a message with no metadata at all, and false for one whose only
+    metadata is an in-flight block, because that turn's trace and token usage are still to
+    come and must land in a commit that covers this one."""
+    if METADATA_HEADER not in body:
+        return False
+    blocks = body.split(METADATA_HEADER)[1:]
+    return any(IN_FLIGHT_MARKER not in block for block in blocks)
 
 
 def build_agent_commit_message(
@@ -574,6 +590,79 @@ def build_manual_squash_trailer(*, agitrack_session_id: str, latent_bodies: list
         ]
     )
     return "\n\n".join([header, *turn_blocks]).rstrip() + "\n"
+
+
+def build_in_flight_trailer(
+    *,
+    agitrack_session_id: str,
+    backend: str,
+    backend_session_id: str | None,
+    model: str | None,
+    prompt: str | None = None,
+) -> str:
+    """The tracking text for a commit the AGENT makes ITSELF, in the middle of a turn.
+
+    A turn becomes a pending latent turn only once it COMPLETES, so an agent that runs
+    ``git commit`` while it is still working leaves
+    :func:`build_manual_squash_trailer` with nothing to fold — the commit lands with no
+    metadata at all and its lines are attributed to nobody. This block attributes it:
+    which agent, in which conversation, working on what.
+
+    Deliberately carries **no token counts**. The turn is still running; when it finishes it
+    is recorded as a normal latent turn and that commit carries the full interaction trace
+    and the usage. Counting tokens here too would double-count them, so ``in_flight: true``
+    marks the block as the partial record it is — the same turn's complete record follows in
+    a later commit.
+
+    The caller is responsible for only asking for this when the agent has actually changed
+    the working tree; a commit with no AI work in it still gets no trailer at all.
+    """
+    lines = [METADATA_HEADER, "commit_type: agent", IN_FLIGHT_MARKER, f"backend: {backend}"]
+    lines.append(f"model: {model or 'unknown'}")
+    lines.extend(
+        [
+            f"agitrack_session_id: {agitrack_session_id}",
+            f"backend_session_id: {backend_session_id or 'unknown'}",
+            f"system: {_system_info()}",
+            f"agitrack_version: {__version__}",
+        ]
+    )
+    note = _note_block(
+        _mask_secrets(
+            "The agent committed this itself while its turn was still running, so this records "
+            "who made the change; the turn's full interaction trace and token usage land in a "
+            "later commit."
+        )
+    )
+    body: list[str] = [*note, ""]
+    if prompt and prompt.strip():
+        # _trace_role_lines masks and heading-nests the prompt, exactly as a real trace does.
+        body.extend(["# Interaction Trace", "", *_trace_role_lines({"role": "user", "content": prompt})])
+    body.extend(lines)
+    return "\n".join(body).strip() + "\n"
+
+
+def build_pending_trailer(
+    *,
+    agitrack_session_id: str,
+    latent_bodies: list[str],
+    in_flight: dict | None = None,
+) -> str:
+    """The trailer the ``prepare-commit-msg`` hook folds into the commit being made — the one
+    entry point every mode renders through, so they all attribute a commit identically.
+
+    Completed turns win: they carry the full trace and the token usage. The in-flight fallback
+    applies only when NONE are pending, which is exactly the case that used to lose attribution
+    entirely — the agent ran ``git commit`` itself partway through a turn, and a turn does not
+    become a pending latent turn until it completes.
+
+    ``in_flight`` must be None whenever no agent turn is running OR the agent has not changed
+    the working tree, which preserves the promise that a purely human commit is left untouched.
+    """
+    trailer = build_manual_squash_trailer(agitrack_session_id=agitrack_session_id, latent_bodies=latent_bodies)
+    if trailer or not in_flight:
+        return trailer
+    return build_in_flight_trailer(agitrack_session_id=agitrack_session_id, **in_flight)
 
 
 def build_auto_fold_message(latent_bodies: list[str]) -> str:
