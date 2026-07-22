@@ -860,8 +860,19 @@ def main(argv: list[str] | None = None) -> int:
     # the extension couldn't yet see the session.)
     management_lock = RepoLock(repo.repo / ".agitrack" / "lock")
     if not management_lock.acquire():
-        print(already_running_message(management_lock.owner_pid()))
-        return 1
+        owner_pid = management_lock.owner_pid()
+        replaced = False
+        if background:
+            # `agitrack -b` over a live background tracker replaces it (like re-running
+            # `-d`/`--backtrace`): stop the old daemon cleanly and take over — so a rerun
+            # after an aGiTrack update always runs the new code. Anything else holding the
+            # lock (an interactive session) still refuses below.
+            from agitrack.proxy.background import replace_running_tracker
+
+            replaced = replace_running_tracker(repo, owner_pid=owner_pid) and management_lock.acquire()
+        if not replaced:
+            print(already_running_message(owner_pid))
+            return 1
 
     try:
         if background:

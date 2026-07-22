@@ -102,12 +102,31 @@ class SessionRef:
     id: str
     updated: float  # epoch seconds; newest wins
     label: str | None = None
+    # True when the conversation was driven by a program (the Agent SDK, `claude -p`)
+    # rather than typed by a human. Such transcripts are work an agent fanned out, not a
+    # conversation to track or resume — see `agitrack.transcripts.claude.list_sessions`.
+    programmatic: bool = False
 
 
 def turns_after(session: ExportedSession, last_message_id: str | None) -> list[SessionTurn]:
+    """The turns not yet covered by the ``last_message_id`` watermark.
+
+    A watermark matching a turn's ASSISTANT id marks that whole turn committed: return
+    what follows. A watermark matching only a turn's USER id is different: it is stored
+    when a turn was FORCE-committed before the agent replied (a backend crash, an exit
+    finalize, a tracker restart). If that turn NOW carries an assistant response, the
+    agent continued the very same turn after the commit — its final message and edits
+    exist nowhere in history — so the turn itself is returned too, letting it commit in
+    its completed form. (The continuation re-counts the turn's tokens; work never being
+    lost outweighs that inflation in this crash-recovery corner.) A user-id watermark on
+    a turn still without a reply behaves as before: nothing new to export."""
     if not last_message_id:
         return session.turns
     for index, turn in enumerate(session.turns):
-        if turn.assistant_message_id == last_message_id or turn.user_message_id == last_message_id:
+        if turn.assistant_message_id == last_message_id:
+            return session.turns[index + 1 :]
+        if turn.user_message_id == last_message_id:
+            if turn.assistant_message_id and turn.final_response:
+                return session.turns[index:]  # the turn continued past its force-commit
             return session.turns[index + 1 :]
     return session.turns

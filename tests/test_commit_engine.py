@@ -872,6 +872,99 @@ def test_finish_parse_defers_monitor_update_only_turns(tmp_path):
     assert state.backend_message_id_for("ses-mon") is None
 
 
+def test_prompt_only_turn_defers_until_the_agent_answers(tmp_path):
+    # Background auto mode, the eb85b0f bug: the user typed a prompt, the agent has
+    # not replied yet, and the tree is dirty (a pre-commit flush, leftover edits).
+    # The live loop must WAIT for the agent's final message, never commit a trace
+    # that is only the user's message.
+    session = Session.bare()
+    exported = ExportedSession(
+        "ses-prompt-only",
+        "m",
+        None,
+        [SessionTurn("u1", "", "expand the experiments", "", TokenUsage(), None, complete=False)],
+    )
+    engine, state, commits, commit_fn = _make_finish_helpers(tmp_path, session, exported)
+
+    result, _ = engine.finish_parse_if_ready(
+        session=session,
+        quiet=True,
+        prompt_untracked=False,
+        require_complete=True,
+        awaited_followups=[],
+        agent_is_active_fn=lambda: False,
+        debug_fn=lambda *a, **k: None,
+        note_session_change_fn=lambda sid: None,
+        mirror_fn=lambda sid: None,
+        commit_fn=commit_fn,
+    )
+    assert result is None
+    assert commits == []
+    assert state.backend_message_id_for("ses-prompt-only") is None
+
+
+def test_force_commit_trims_trailing_unanswered_turn(tmp_path):
+    # A flush/exit force commit (require_complete=False) arriving just after the user
+    # typed the NEXT prompt: the answered turn commits, but the unanswered trailing turn
+    # is trimmed — the trace never ends with a bare user message, the watermark stays
+    # before the unanswered turn, and that turn commits properly once the agent replies.
+    session = Session.bare()
+    exported = ExportedSession(
+        "ses-trim",
+        "m",
+        None,
+        [
+            SessionTurn("u1", "a1", "fix the tests", "Fixed them.", TokenUsage(total=5, output=5), None),
+            SessionTurn("u2", "", "now update the docs", "", TokenUsage(), None, complete=False),
+        ],
+    )
+    engine, state, commits, commit_fn = _make_finish_helpers(tmp_path, session, exported)
+
+    result, _ = engine.finish_parse_if_ready(
+        session=session,
+        quiet=True,
+        prompt_untracked=False,
+        require_complete=False,
+        awaited_followups=[],
+        agent_is_active_fn=lambda: False,
+        debug_fn=lambda *a, **k: None,
+        note_session_change_fn=lambda sid: None,
+        mirror_fn=lambda sid: None,
+        commit_fn=commit_fn,
+    )
+    assert result is True and len(commits) == 1
+    assert [t.user_message_id for t in commits[0]["turns"]] == ["u1"]
+    # Watermark = the answered turn, so the unanswered one re-exports next parse.
+    assert state.backend_message_id_for("ses-trim") == "a1"
+
+
+def test_sole_unanswered_turn_still_force_commits_on_exit(tmp_path):
+    # The exception: exit with ONLY an in-flight turn still captures it (nothing else
+    # would); turns_after re-exports it if the conversation later continues.
+    session = Session.bare()
+    exported = ExportedSession(
+        "ses-sole",
+        "m",
+        None,
+        [SessionTurn("u1", "", "long running task", "", TokenUsage(), None, complete=True)],
+    )
+    engine, state, commits, commit_fn = _make_finish_helpers(tmp_path, session, exported)
+
+    result, _ = engine.finish_parse_if_ready(
+        session=session,
+        quiet=True,
+        prompt_untracked=False,
+        require_complete=False,
+        awaited_followups=[],
+        agent_is_active_fn=lambda: False,
+        debug_fn=lambda *a, **k: None,
+        note_session_change_fn=lambda sid: None,
+        mirror_fn=lambda sid: None,
+        commit_fn=commit_fn,
+    )
+    assert result is True and len(commits) == 1
+
+
 def test_finish_parse_commits_substantive_monitor_turn_immediately(tmp_path):
     # The final report of a monitored job often arrives ON a monitor wake-up, so its turn
     # carries the update label. A NORMAL final message (substantive response, real output)

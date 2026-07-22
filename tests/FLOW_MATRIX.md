@@ -126,6 +126,12 @@ Conventions:
 | TRIVIAL monitor-update-only completed turns (short ack, little output) are DEFERRED (no commit, watermark untouched) while the live loop runs | `test_finish_parse_defers_monitor_update_only_turns` | mock |
 | A substantive turn commits the deferred ticks in the SAME commit; a monitor turn with a normal final message or heavy output commits immediately; exit finalize flushes tick-only sessions | `test_finish_parse_commits_monitor_updates_with_a_substantive_turn`, `test_finish_parse_commits_substantive_monitor_turn_immediately`, `test_finish_parse_commits_monitor_turn_with_heavy_output_despite_short_reply`, `test_finish_parse_exit_finalize_commits_monitor_update_only_turns` | mock |
 | Summarizer refusals ("I don't have any coding session turns...") are unusable, falling back to the prompt-led subject | `test_summarizer_raises_on_refusal_text`, `test_summary_first_person_content_is_still_usable` | mock |
+| A turn force-committed before the agent replied (crash/restart) re-exports when it CONTINUES, so its real final message and edits are committed rather than hidden behind the user-id watermark | `test_turns_after_re_exports_a_turn_that_continued_past_its_force_commit` | mock |
+| "No response requested." (Claude's crash filler) never counts as a final message; the restarted process's real reply becomes the turn's final | `test_no_response_requested_filler_is_not_a_final_message` | mock |
+| A dangling turn whose only reply is the crash filler stays in-flight (not complete-but-answerless) | `test_filler_only_turn_stays_incomplete` | mock |
+| A prompt-only dangling turn (no assistant row yet) is in-flight; the live loop defers it instead of committing a user-message-only trace | `test_prompt_only_dangling_turn_is_in_flight`, `test_prompt_only_turn_defers_until_the_agent_answers` | mock |
+| A bare "/compact" user row (recorded without the command-name artifact) opens no turn | `test_bare_compact_command_row_does_not_open_a_turn` | mock |
+| A commit's trace never ends with an unanswered user message: force commits trim trailing final-less turns (watermark stays before them), but a SOLE in-flight turn still force-commits on exit | `test_force_commit_trims_trailing_unanswered_turn`, `test_sole_unanswered_turn_still_force_commits_on_exit`, `test_finish_parse_forces_in_progress_commit_on_exit` | mock |
 
 ## 9a3. Live background tasks vs the user-commit dialog
 | Sequence | Test(s) | Kind |
@@ -137,7 +143,8 @@ Conventions:
 | Sequence | Test(s) | Kind |
 |---|---|---|
 | `-b` launcher spawns a DETACHED daemon and returns to the shell | `test_start_background_daemon_spawns_and_reports` | mock |
-| `-b` reuses a daemon already running (no duplicate) | `test_start_background_daemon_reuses_running` | mock |
+| `-b` RESTARTS a daemon already running (rerun picks up updated code, like `-d`/`--backtrace`); failure to stop the old one refuses to spawn | `test_start_background_daemon_restarts_running`, `test_start_background_daemon_fails_when_old_tracker_will_not_stop` | mock |
+| `-b` over the repo lock: a lock-holding BACKGROUND tracker is stopped and replaced; any other holder (interactive session) still refuses | `test_background_rerun_replaces_a_running_background_tracker`, `test_replace_running_tracker_only_replaces_a_background_tracker`, `test_background_refused_when_another_instance_holds_the_repo` | mock |
 | `-b` reports failure when the daemon child dies at startup | `test_start_background_daemon_reports_failure_when_child_dies` | mock |
 | `-b stop` / `-b status` target the daemon via its handshake | `test_background_status_*`, `test_background_stop_cleans_stale_handshake`, `test_background_run_writes_and_removes_handshake` | mock |
 | `-b` refused when another instance holds the repo lock | `test_background_refused_when_another_instance_holds_the_repo` | mock |

@@ -16,8 +16,11 @@ import subprocess
 import time
 from pathlib import Path
 
+import pytest
+
 from agitrack.backends.base import TokenUsage
-from agitrack.commits.message import build_agent_commit_message, build_manual_squash_trailer
+from agitrack.commits import ManualCommitTracker
+from agitrack.commits.message import build_agent_commit_message, build_manual_squash_trailer, build_pending_trailer
 from agitrack.config import AgitrackState
 from agitrack.config.settings import GlobalConfig
 from agitrack.git import GitRepo
@@ -186,6 +189,119 @@ def test_manual_trailer_with_no_pending_turns_is_empty_no_footprint():
     folded = "Just my edit\n\n" + trailer
     stat = _parse_commit("def4567", "me", "me@x", "1700000000", folded)
     assert stat.kind == "untracked"  # no aGiTrack metadata at all
+
+
+def test_pending_trailer_prefers_completed_turns_over_in_flight():
+    # A completed turn carries the full trace and token usage, so it always wins; the
+    # in-flight block is strictly a fallback for when there is nothing else.
+    in_flight = {"backend": "claude", "backend_session_id": "s1", "model": "m", "prompt": "do x"}
+    trailer = build_pending_trailer(
+        agitrack_session_id="sid", latent_bodies=[_agent_body("do x", 10)], in_flight=in_flight
+    )
+    assert "commit_type: user" in trailer  # the squash header
+    assert "in_flight: true" not in trailer
+
+
+def test_pending_trailer_attributes_an_agent_commit_made_mid_turn():
+    # THE regression: the agent runs `git commit` itself before its turn ends. A turn only
+    # becomes a pending latent turn once it COMPLETES, so there is nothing to fold — the
+    # commit used to land with no aGiTrack metadata at all and its lines were attributed to
+    # nobody. The in-flight block attributes it instead.
+    in_flight = {"backend": "claude", "backend_session_id": "s1", "model": "claude-opus-4-8", "prompt": "do x"}
+    trailer = build_pending_trailer(agitrack_session_id="sid", latent_bodies=[], in_flight=in_flight)
+
+    stat = _parse_commit("abc1234", "me", "me@x", "1700000000", "Agent's own commit\n\n" + trailer)
+    assert stat.kind == "agent"  # attributed, not "untracked"
+    assert stat.backend == "claude" and stat.model == "claude-opus-4-8"
+    assert stat.prompt == "do x"
+    # No token counts: the same turn's completed record carries them, and counting them in
+    # both places would double-count the turn.
+    assert not stat.tokens
+    assert "in_flight: true" in trailer
+
+
+def test_pending_trailer_is_empty_without_pending_or_in_flight_work():
+    assert build_pending_trailer(agitrack_session_id="sid", latent_bodies=[], in_flight=None) == ""
+
+
+def test_in_flight_attribution_requires_both_a_running_turn_and_tree_changes(tmp_path):
+    # Both conditions are load-bearing. A running turn that has not touched the tree means the
+    # commit holds no AI work, and stamping it would break the "no AI work ⇒ no footprint"
+    # promise that keeps a human's own commit clean.
+    repo = _init_repo(tmp_path)
+    state = AgitrackState(tmp_path, default_backend="claude")
+    facts = {"backend": "claude", "backend_session_id": "s1", "model": "m", "prompt": "do x"}
+    running: dict | None = dict(facts)
+    tracker = ManualCommitTracker(repo, repo, state, in_flight_fn=lambda: running)
+
+    assert tracker.in_flight_attribution() is None  # turn running, but the tree is clean
+
+    (tmp_path / "a.txt").write_text("one\nagent edit\n", encoding="utf-8")
+    assert tracker.in_flight_attribution() == facts  # running + real changes
+
+    running = None
+    assert tracker.in_flight_attribution() is None  # changes, but no turn running (human's own)
+
+    # No supplier at all (a driver that never reports in-flight state) stays inert.
+    assert ManualCommitTracker(repo, repo, state).in_flight_attribution() is None
+
+
+def _noworktree_proxy(tmp_path, *, manual: bool):
+    """An interactive proxy runner in no-worktree mode over a real repo — the mode that folds
+    via the prepare-commit-msg hook (manual OR auto; worktree mode covers instead)."""
+    from proxy_helpers import make_runner
+
+    repo = _init_repo(tmp_path)
+    state = AgitrackState(tmp_path, default_backend="claude")
+    runner = make_runner(
+        repo=repo, base_repo=repo, state=state, _use_worktrees=False, _manual_commits=manual, worktree=None
+    )
+    return runner, repo
+
+
+@pytest.mark.parametrize("manual", [True, False], ids=["manual-commits", "auto-commits"])
+def test_proxy_no_worktree_attributes_an_agent_commit_made_mid_turn(tmp_path, manual):
+    # Same regression as the daemon's, on the OTHER driver. The proxy has no flush path — the
+    # pre-commit hook deliberately skips nudging an interactive TUI — so it must render the
+    # trailer when it LEARNS a turn started, not only when one completes.
+    runner, repo = _noworktree_proxy(tmp_path, manual=manual)
+    assert git_hooks.install_manual_commit_hooks(repo.repo / ".git" / "hooks")
+    (tmp_path / "a.txt").write_text("one\nagent work\n", encoding="utf-8")
+
+    runner._note_in_flight({"backend": "claude", "backend_session_id": "s1", "model": "m", "prompt": "do x"})
+
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "Agent's own commit")
+    msg = _git(repo, "log", "-1", "--format=%B", "HEAD")
+    assert "commit_type: agent" in msg and "in_flight: true" in msg
+    assert "do x" in msg
+
+
+def test_proxy_no_worktree_leaves_a_human_commit_alone(tmp_path):
+    runner, repo = _noworktree_proxy(tmp_path, manual=True)
+    assert git_hooks.install_manual_commit_hooks(repo.repo / ".git" / "hooks")
+    (tmp_path / "a.txt").write_text("one\nmy own edit\n", encoding="utf-8")
+
+    runner._note_in_flight(None)  # no turn running
+
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "My hand-written change")
+    assert "# aGiTrack Metadata" not in _git(repo, "log", "-1", "--format=%B", "HEAD")
+
+
+def test_worktree_proxy_renders_no_trailer(tmp_path):
+    # Worktree mode is the one mode that does NOT fold via the hook: it commits per-branch and
+    # attributes an agent's own commits with a cover instead, so the trailer stays out of it.
+    from proxy_helpers import make_runner
+
+    repo = _init_repo(tmp_path)
+    state = AgitrackState(tmp_path, default_backend="claude")
+    runner = make_runner(repo=repo, base_repo=repo, state=state, _use_worktrees=True, worktree=tmp_path)
+    (tmp_path / "a.txt").write_text("one\nagent work\n", encoding="utf-8")
+
+    runner._note_in_flight({"backend": "claude", "backend_session_id": "s1", "model": "m", "prompt": "do x"})
+
+    assert not (repo.repo / ".agitrack" / "manual-pending-trailer").exists()
 
 
 # --- hooks ------------------------------------------------------------------

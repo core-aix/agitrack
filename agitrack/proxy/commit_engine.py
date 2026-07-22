@@ -598,6 +598,7 @@ class CommitEngine:
         mirror_fn: Callable[[str | None], None],
         commit_fn: Callable,
         on_cancelled_fn: Callable[[list[SessionTurn]], bool] | None = None,
+        note_in_flight_fn: Callable[[dict | None], None] | None = None,
     ) -> tuple[bool | None, list[str]]:
         """Consume a ready parse result and (conditionally) commit.
 
@@ -654,6 +655,27 @@ class CommitEngine:
 
         all_turns = turns_after(exported_session, last_message_id)
 
+        # Tell the driver whether the agent is MID-TURN right now, so a commit the agent makes
+        # ITSELF before its turn ends still gets attributed (see `build_in_flight_trailer`) —
+        # otherwise the fold hook has no pending turn to fold and the commit lands with no
+        # metadata at all. Computed here, the one place that already holds both the export and
+        # the watermark, so every mode gets the same answer from the same evidence.
+        if note_in_flight_fn is not None:
+            running = all_turns[-1] if all_turns and not all_turns[-1].complete else None
+            facts = None
+            if running is not None:
+                try:
+                    backend_name = self.state.backend
+                except Exception:
+                    backend_name = "unknown"  # no backend configured (tests / partial state)
+                facts = {
+                    "backend": backend_name,
+                    "backend_session_id": new_session_id,
+                    "model": exported_session.model or self.state.model,
+                    "prompt": running.user_prompt,
+                }
+            note_in_flight_fn(facts)
+
         # Awaited-followup logic: a prompt queued while the agent was busy
         # belongs in the same commit as the turn it triggered.
         awaited = list(awaited_followups)
@@ -673,6 +695,22 @@ class CommitEngine:
         if require_complete and all_turns and not all_turns[-1].complete:
             debug_fn(f"deferring agent commit: latest turn still in progress session_id={new_session_id}")
             return None, awaited
+
+        # ENFORCED: a commit's trace never ends with an unanswered user message. A
+        # trailing turn with no final response (the user's next prompt caught by a
+        # flush/force commit before the agent replied) is trimmed: its changes, if any,
+        # still land in this commit's snapshot, but its trace and the watermark wait for
+        # the reply, so it commits properly once answered — the same ordering interactive
+        # auto mode gets by committing the prior turn before forwarding a new prompt.
+        # Exception: a SOLE final-less turn under a force commit (require_complete=False,
+        # the exit finalize) is kept, so exit still captures in-flight work; turns_after
+        # re-exports it if the conversation later continues.
+        while len(all_turns) > 1 and not all_turns[-1].final_response:
+            dropped = all_turns.pop()
+            debug_fn(
+                f"trimming unanswered trailing turn from commit "
+                f"user_id={dropped.user_message_id} session_id={new_session_id}"
+            )
 
         complete_turns = [t for t in all_turns if t.final_response]
         # Intermediate background-monitor ticks: a Monitor streaming events from a

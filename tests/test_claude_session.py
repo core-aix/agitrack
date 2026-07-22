@@ -660,6 +660,101 @@ def test_parse_rows_background_task_work_opens_its_own_turn():
     assert turns_after(session, "m1") == session.turns[1:]
 
 
+def test_no_response_requested_filler_is_not_a_final_message():
+    # "No response requested." is Claude Code's synthetic filler for aborted/crashed
+    # requests. It must contribute NOTHING to the turn: not the final message and not
+    # completion (its stop_reason once made a crashed turn look complete-but-answerless,
+    # which was then committed with a trace ending in a bare user message). The real
+    # reply from the restarted process becomes the turn's final.
+    rows = [
+        _user("u1", "please continue"),
+        _assistant("crash1", "No response requested.", stop_reason="end_turn"),
+        _assistant("m1", "Everything is done and the paper builds cleanly.", stop_reason="end_turn"),
+    ]
+
+    session = parse_rows("sess-filler", rows)
+
+    assert len(session.turns) == 1
+    turn = session.turns[0]
+    assert turn.final_response == "Everything is done and the paper builds cleanly."
+    assert turn.assistant_message_id == "m1"
+    assert turn.agent_messages == ["Everything is done and the paper builds cleanly."]
+
+
+def test_prompt_only_dangling_turn_is_in_flight():
+    # The user just typed a prompt and the agent has not produced ANY assistant row
+    # yet (first response can lag by many seconds). The turn is in-flight, NOT
+    # complete: the background tracker polls inside that window, and a "complete"
+    # answerless turn would be committed as a trace holding only the user's message.
+    rows = [
+        _user("u1", "expand the coding experiments"),
+    ]
+
+    session = parse_rows("sess-prompt-only", rows)
+
+    assert len(session.turns) == 1
+    assert session.turns[0].complete is False
+    assert session.turns[0].final_response == ""
+
+
+def test_bare_compact_command_row_does_not_open_a_turn():
+    # Newer Claude Code records a typed /compact as a plain user row with the literal
+    # text "/compact" (no <command-name> artifact). It never gets a reply, so opening
+    # a turn for it would leave an unanswered "## User /compact" in commit traces.
+    rows = [
+        _user("u1", "summarize the design"),
+        _assistant("a1", "Here is the summary.", stop_reason="end_turn"),
+        _user("u2", "/compact"),
+        _user("u3", "now write the tests"),
+        _assistant("a2", "Tests written.", stop_reason="end_turn"),
+    ]
+
+    session = parse_rows("sess-compact", rows)
+
+    assert [t.user_prompt for t in session.turns] == [
+        "summarize the design",
+        "now write the tests",
+    ]
+
+
+def test_filler_only_turn_stays_incomplete():
+    # A crashed turn whose only "reply" is the filler is NOT complete: it stays
+    # in-progress (deferred by the live loop) until a real reply lands.
+    rows = [
+        _user("u1", "please continue"),
+        _assistant("crash1", "No response requested.", stop_reason="end_turn"),
+    ]
+
+    session = parse_rows("sess-filler2", rows)
+
+    assert len(session.turns) == 1
+    assert session.turns[0].complete is False
+    assert session.turns[0].final_response == ""
+
+
+def test_turns_after_re_exports_a_turn_that_continued_past_its_force_commit():
+    # A backend crash / tracker restart force-commits an in-flight turn BEFORE the agent
+    # replied; the watermark then stores the turn's USER id. When the restarted agent
+    # continues that very turn (its real final message and edits arrive after the
+    # commit), the turn must re-export so the completed form is committed — observed in a
+    # real repo where the paper's final build sat uncommitted forever.
+    from agitrack.backends.base import TokenUsage
+    from agitrack.transcripts.types import ExportedSession, SessionTurn, turns_after
+
+    continued = SessionTurn("u9", "msg_final", "continue please", "All done, 38 pages.", TokenUsage(output=10), None)
+    next_turn = SessionTurn("u10", "msg_next", "clean up the paper", "Cleaning.", TokenUsage(output=5), None)
+    session = ExportedSession("s", "m", None, [continued, next_turn])
+
+    # User-id watermark + the turn now has a reply: the turn itself re-exports.
+    assert turns_after(session, "u9") == [continued, next_turn]
+    # Assistant-id watermark: that turn is fully committed; only what follows exports.
+    assert turns_after(session, "msg_final") == [next_turn]
+    # User-id watermark on a turn STILL without a reply: nothing new, as before.
+    unanswered = SessionTurn("u9", "", "continue please", "", TokenUsage(), None)
+    session2 = ExportedSession("s", "m", None, [unanswered, next_turn])
+    assert turns_after(session2, "u9") == [next_turn]
+
+
 def test_parse_rows_tracks_live_background_tasks_from_the_notification_stream():
     # Liveness is judged from the notifications, not launches (a task finishing while the
     # agent is mid-turn never emits a terminal notification): a task whose monitor
@@ -1154,6 +1249,101 @@ def test_list_sessions_returns_refs_with_labels(tmp_path, monkeypatch):
     assert by_id["s1"].label == "first session prompt"
     assert by_id["s2"].updated > 0
     assert latest_session_id(repo) in {"s1", "s2"}
+
+
+def _sdk_user(uuid, text, **extra):
+    """A conversation-opening prompt as the Agent SDK / `claude -p` records it."""
+    return _user(uuid, text, entrypoint="sdk-cli", promptSource="sdk", isSidechain=False, **extra)
+
+
+def test_list_sessions_excludes_programmatic_sessions(tmp_path, monkeypatch):
+    # An agent that farms work out to `claude -p` workers writes one transcript per worker
+    # into the repo's own project dir. Those are work the agent did, not conversations to
+    # track — adopting them made background mode commit once per worker (issue: a
+    # SWE-bench harness produced 28 sessions and a commit for each).
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    project_dir = claude_session._project_dir(repo)
+    project_dir.mkdir(parents=True)
+    (project_dir / "human.jsonl").write_text(
+        json.dumps(_user("u1", "typed prompt", entrypoint="cli", promptSource="typed")) + "\n"
+    )
+    for index in range(3):
+        (project_dir / f"worker{index}.jsonl").write_text(json.dumps(_sdk_user(f"w{index}", "fix this bug")) + "\n")
+
+    assert [ref.id for ref in list_sessions(repo)] == ["human"]
+    # The refs themselves still carry the flag, so anything that wants the full picture can
+    # ask — `_refs_in_project_dir` (and therefore `sessions_under`/--backtrace) keeps them.
+    all_refs = {ref.id: ref for ref in claude_session._refs_in_project_dir(project_dir)}
+    assert set(all_refs) == {"human", "worker0", "worker1", "worker2"}
+    assert all_refs["human"].programmatic is False
+    assert all(all_refs[f"worker{i}"].programmatic for i in range(3))
+
+
+def test_latest_session_id_ignores_newer_programmatic_sessions(tmp_path, monkeypatch):
+    import os
+    import time
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    project_dir = claude_session._project_dir(repo)
+    project_dir.mkdir(parents=True)
+    human = project_dir / "human.jsonl"
+    human.write_text(json.dumps(_user("u1", "typed prompt", entrypoint="cli", promptSource="typed")) + "\n")
+    worker = project_dir / "worker.jsonl"
+    worker.write_text(json.dumps(_sdk_user("w1", "fix this bug")) + "\n")
+
+    now = time.time()
+    os.utime(human, (now - 100, now - 100))
+    os.utime(worker, (now, now))  # the SDK worker is newest by mtime, as it is while a run streams
+
+    assert latest_session_id(repo) == "human"
+    # With no human-driven conversation at all there is nothing to adopt — better to track
+    # nothing than to adopt a worker and commit its run as the user's turn.
+    human.unlink()
+    assert latest_session_id(repo) is None
+
+
+def test_programmatic_detection_needs_positive_evidence(tmp_path, monkeypatch):
+    # Older Claude Code builds stamp neither field. Absence must read as "human-driven", so
+    # this filter can never cost aGiTrack a session it used to track.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    project_dir = claude_session._project_dir(repo)
+    project_dir.mkdir(parents=True)
+    (project_dir / "legacy.jsonl").write_text(json.dumps(_user("u1", "no origin fields here")) + "\n")
+    # A sub-agent row inside a human conversation carries no origin fields either, and must
+    # not be mistaken for the conversation's own opening prompt.
+    (project_dir / "withsub.jsonl").write_text(
+        json.dumps(_user("u1", "typed prompt", entrypoint="cli", promptSource="typed"))
+        + "\n"
+        + json.dumps(_user("u2", "sub-agent task", isSidechain=True))
+        + "\n"
+    )
+
+    assert {ref.id for ref in list_sessions(repo)} == {"legacy", "withsub"}
+
+
+def test_scan_session_head_reads_label_and_origin_in_one_pass(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    transcript = tmp_path / "s.jsonl"
+    # A sidechain row precedes the real opening prompt: the label and the origin verdict must
+    # both come from the conversation's own first non-sidechain user row.
+    transcript.write_text(
+        json.dumps(_user("u0", "sub-agent task", isSidechain=True))
+        + "\n"
+        + json.dumps(_sdk_user("u1", "real prompt\nsecond line"))
+        + "\n"
+    )
+    label, programmatic = claude_session._scan_session_head(transcript)
+    assert label == "real prompt"  # sidechain rows are not the conversation's own prompt
+    assert programmatic is True
+    # A truncated head (opening row beyond the limit) falls back to "human-driven".
+    assert claude_session._scan_session_head(transcript, line_limit=1)[1] is False
+    assert claude_session._scan_session_head(tmp_path / "missing.jsonl") == (None, False)
 
 
 def test_latest_session_id_skips_empty_resumed_sessions(tmp_path, monkeypatch):

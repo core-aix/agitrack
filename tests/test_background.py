@@ -196,6 +196,247 @@ def test_background_follows_latest_session_and_counts_once(tmp_path):
     assert runner._manual.pending_count() == 2
 
 
+def _in_flight_turn(uid: str, aid: str, prompt: str) -> SessionTurn:
+    """A turn the agent is still working on: prompt received, no final response yet."""
+    return SessionTurn(uid, aid, prompt, "", TokenUsage(total=0, output=0), "claude-opus-4-8", complete=False)
+
+
+def test_agent_commit_mid_turn_is_attributed_by_the_fold_hook(tmp_path):
+    # THE regression, end to end with the real hooks: the agent runs `git commit` ITSELF
+    # partway through a turn. The turn is not complete, so there is no pending latent turn to
+    # fold, and the commit used to land with no aGiTrack metadata at all — permanently
+    # untracked, because the daemon's cover fallback also bails when the tree is dirty.
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    runner._manual.setup()  # installs prepare-commit-msg / post-commit
+    assert (repo.repo / ".git" / "hooks" / "prepare-commit-msg").exists()
+
+    # The agent is mid-turn and has edited the tree.
+    (tmp_path / "a.txt").write_text("one\nagent work\n", encoding="utf-8")
+    backend.set_session("s1", [_in_flight_turn("u1", "m1", "add the thing")])
+    assert runner._process_once() is False  # nothing to record: the turn has not finished
+    runner._manual.render_trailer()  # what the pre-commit flush does
+
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "Add the thing")
+
+    msg = _git(repo, "log", "-1", "--format=%B", "HEAD")
+    assert "Add the thing" in msg  # the agent's own subject survives
+    assert "# aGiTrack Metadata" in msg
+    assert "commit_type: agent" in msg
+    assert "in_flight: true" in msg  # marked partial: the full record follows later
+    assert "add the thing" in msg  # the prompt it was working on
+    assert "tokens_since_last_commit" not in msg  # counted once, on the completed turn
+
+
+def test_completed_turn_still_covers_the_commit_it_stamped_mid_flight(tmp_path):
+    # The hand-off. An in-flight block is attribution only — no trace, no tokens — so the
+    # commit carrying it must NOT read as already-accounted-for, or the completed turn would
+    # find nothing to attach to and its whole record (and token counts) would be lost.
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    runner._manual.setup()
+    runner._load_tracked_head()
+    (tmp_path / "a.txt").write_text("one\nagent work\n", encoding="utf-8")
+    backend.set_session("s1", [_in_flight_turn("u1", "m1", "add the thing")])
+    runner._process_once()
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "Agent's own commit")
+    agent_commit = repo.rev_parse("HEAD")
+    assert "in_flight: true" in _git(repo, "log", "-1", "--format=%B", agent_commit)
+    assert runner._is_agitrack_tracked(agent_commit) is False  # partial ⇒ still owed a record
+
+    # The turn finishes with the tree clean (the agent committed everything it did).
+    backend.set_session("s1", [_turn("u1", "m1", "add the thing", "done", 120)])
+    assert runner._process_once() is True
+
+    head = _git(repo, "log", "-1", "--format=%B", "HEAD")
+    assert "covered_commits:" in head and agent_commit[:7] in head  # its lines are attributed to AI
+    assert "tokens_since_last_commit_output: 120" in head  # the usage lands exactly once
+    assert runner._is_agitrack_tracked(repo.rev_parse("HEAD")) is True
+
+
+def test_no_trailer_for_a_human_commit_while_the_agent_is_idle(tmp_path):
+    # The in-flight fallback must not turn "aGiTrack is running" into "every commit is
+    # attributed to the AI". With no running turn there is no footprint at all.
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    runner._manual.setup()
+    backend.set_session("s1", [_turn("u1", "m1", "done earlier", "ok", 10)])
+    runner._process_once()  # records + clears: no turn is running now
+    _git(repo, "commit", "-qm", "fold the pending turn", "--allow-empty")
+
+    (tmp_path / "a.txt").write_text("one\nmy own edit\n", encoding="utf-8")
+    runner._manual.render_trailer()
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "My hand-written change")
+
+    msg = _git(repo, "log", "-1", "--format=%B", "HEAD")
+    assert "My hand-written change" in msg
+    assert "# aGiTrack Metadata" not in msg
+
+
+def test_in_flight_note_clears_once_the_turn_completes(tmp_path):
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    runner._manual.setup()
+    (tmp_path / "a.txt").write_text("one\nagent work\n", encoding="utf-8")
+
+    backend.set_session("s1", [_in_flight_turn("u1", "m1", "add the thing")])
+    runner._process_once()
+    assert runner._in_flight is not None
+    assert runner._in_flight["prompt"] == "add the thing"
+
+    # The same turn finishes: the completed record takes over and the fallback stands down.
+    backend.set_session("s1", [_turn("u1", "m1", "add the thing", "done", 12)])
+    runner._process_once()
+    assert runner._in_flight is None
+    assert runner._manual.in_flight_attribution() is None
+
+
+# --- parity with the interactive TUI's auto-commit rule ---------------------
+
+
+def test_fold_waits_for_the_worktree_to_settle_like_the_tui(tmp_path):
+    # `file_stable_seconds` is a documented setting the daemon used to ignore entirely: the TUI
+    # waits for the tree to go quiet before auto-committing, the daemon folded immediately.
+    import agitrack.proxy.background as B
+
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    runner._manual.setup()
+    runner.global_config.timings["file_stable_seconds"] = 8.0
+    runner.global_config.timings["summary_wait_seconds"] = 45.0
+
+    clock = [1000.0]
+    monkey = B.time.monotonic
+    B.time.monotonic = lambda: clock[0]  # type: ignore[assignment]
+    try:
+        (tmp_path / "a.txt").write_text("one\nagent edit\n", encoding="utf-8")
+        runner._sample_worktree()  # first observation: nothing to compare against yet
+        backend.set_session("s1", [_turn("u1", "m1", "do x", "done", 20)])
+        runner._process_once()
+
+        (tmp_path / "a.txt").write_text("one\nagent edit\nstill writing\n", encoding="utf-8")
+        runner._sample_worktree()  # a real change lands
+        head = repo.rev_parse("HEAD")
+        runner._auto_fold_pending()
+        assert repo.rev_parse("HEAD") == head  # deferred: the tree is still moving
+
+        clock[0] += 9.0  # quiet for longer than file_stable_seconds
+        runner._auto_fold_pending()
+        assert repo.rev_parse("HEAD") != head  # committed once things settled
+    finally:
+        B.time.monotonic = monkey  # type: ignore[assignment]
+
+
+def test_settle_wait_is_bounded_so_a_busy_repo_still_commits(tmp_path):
+    # The TUI's settle gate is unbounded, which is survivable with a human watching. A daemon
+    # commonly runs where something writes continuously (the log of a job the agent started), and
+    # there the tree NEVER goes quiet — an unbounded wait would stop committing while looking
+    # perfectly healthy. Past summary_wait_seconds on the same turn, fold anyway.
+    import agitrack.proxy.background as B
+
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    runner._manual.setup()
+    runner.global_config.timings["file_stable_seconds"] = 8.0
+    runner.global_config.timings["summary_wait_seconds"] = 45.0
+
+    clock = [1000.0]
+    monkey = B.time.monotonic
+    B.time.monotonic = lambda: clock[0]  # type: ignore[assignment]
+    try:
+        (tmp_path / "a.txt").write_text("one\nagent edit\n", encoding="utf-8")
+        runner._sample_worktree()
+        backend.set_session("s1", [_turn("u1", "m1", "do x", "done", 20)])
+        runner._process_once()
+        head = repo.rev_parse("HEAD")
+
+        # Something writes on every single cycle: the quiet period never elapses.
+        for tick in range(12):  # 12 * 5s spans the 45s cap
+            (tmp_path / "log.txt").write_text(f"line {tick}\n", encoding="utf-8")
+            runner._sample_worktree()
+            runner._auto_fold_pending()
+            clock[0] += 5.0
+        assert repo.rev_parse("HEAD") != head  # the cap fired instead of waiting forever
+    finally:
+        B.time.monotonic = monkey  # type: ignore[assignment]
+
+
+def test_live_background_task_suspends_the_settle_cap(tmp_path):
+    # A long task the agent started streams output for an hour, so the tree NEVER goes quiet.
+    # With the cap applying, that produced a commit every few minutes whose whole diff was the
+    # task's own log churn and whose turn was the agent saying "still running, nothing to
+    # report" — the reported flood of minor "(background task completed)" commits. While the
+    # task is live the wait is not capped, matching the TUI's unbounded gate, so the whole run
+    # collapses into ONE commit carrying every turn's trace.
+    import agitrack.proxy.background as B
+
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    runner._manual.setup()
+    runner.global_config.timings["file_stable_seconds"] = 8.0
+    runner.global_config.timings["summary_wait_seconds"] = 45.0
+
+    clock = [1000.0]
+    monkey = B.time.monotonic
+    B.time.monotonic = lambda: clock[0]  # type: ignore[assignment]
+    try:
+        (tmp_path / "a.txt").write_text("one\nagent edit\n", encoding="utf-8")
+        runner._sample_worktree()
+        backend.set_session("s1", [_turn("u1", "m1", "(background task completed)", "still running", 900)])
+        backend.sessions["s1"].live_background_task_ids = ["task-1"]  # the task is still streaming
+        runner._process_once()
+        assert runner._live_background_tasks == ["task-1"]  # carried off the export onto the runner
+        head = repo.rev_parse("HEAD")
+
+        for tick in range(12):  # far past the 45s cap
+            (tmp_path / "run.log").write_text(f"line {tick}\n", encoding="utf-8")
+            runner._sample_worktree()
+            runner._auto_fold_pending()
+            clock[0] += 5.0
+        assert repo.rev_parse("HEAD") == head  # no commit while the task churns the tree
+
+        # The task ends. The cap applies again, so the accumulated work commits once.
+        runner._live_background_tasks = []
+        runner._auto_fold_pending()
+        assert repo.rev_parse("HEAD") != head
+    finally:
+        B.time.monotonic = monkey  # type: ignore[assignment]
+
+
+def test_stop_finalize_captures_a_turn_that_never_finished(tmp_path):
+    # The TUI's exit finalize passes require_complete=False so work in progress is still
+    # recorded on the way out. The daemon's stop path used to keep require_complete=True, so
+    # `agitrack -b stop` mid-turn silently dropped that turn's record.
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    runner._manual.setup()
+    (tmp_path / "a.txt").write_text("one\nwork in progress\n", encoding="utf-8")
+    backend.set_session("s1", [_in_flight_turn("u1", "m1", "half-done work")])
+
+    assert runner._process_once() is False  # a normal poll leaves an unfinished turn alone
+    runner._teardown()
+
+    msg = _git(repo, "log", "-1", "--format=%B", "HEAD")
+    assert "half-done work" in msg and "# aGiTrack Metadata" in msg
+
+
+def test_background_skips_cycle_when_no_human_driven_session(tmp_path):
+    # The daemon must never fall back to a pinned id when the backend reports no
+    # human-driven conversation. `latest_session_id` excludes programmatic (SDK) sessions,
+    # so "None" here means the only transcripts in the repo dir are worker runs an agent
+    # fanned out — and a still-running one would otherwise keep feeding the daemon turns.
+    runner, repo, state, backend = _runner(tmp_path, manual=True)
+    runner._manual.setup()
+    (tmp_path / "a.txt").write_text("one\nfirst\n", encoding="utf-8")
+    backend.set_session("s1", [_turn("u1", "m1", "first", "done", 10)])
+    assert runner._process_once() is True
+    assert state.backend_session_id == "s1"
+
+    # A worker run appends turns to a session aGiTrack no longer considers adoptable.
+    backend.sessions["s1"] = ExportedSession(
+        "s1", "claude-opus-4-8", None, [_turn("u1", "m1", "first", "done", 10), _turn("u2", "m2", "worker", "done", 99)]
+    )
+    (tmp_path / "a.txt").write_text("one\nfirst\nworker\n", encoding="utf-8")
+    backend.latest = None
+    assert runner._process_once() is False
+    assert runner._manual.pending_count() == 1  # still just the human turn
+
+
 # --- regression: a completed turn with changes is always committed ----------
 
 
@@ -322,22 +563,84 @@ def test_background_run_writes_and_removes_handshake(tmp_path, monkeypatch):
     assert not background_handshake_path(repo).exists()
 
 
-def test_start_background_daemon_reuses_running(tmp_path, capsys, monkeypatch):
+def test_start_background_daemon_restarts_running(tmp_path, capsys, monkeypatch):
+    # Like `-d` and `--backtrace`: re-running `agitrack -b` replaces a live tracker so an
+    # updated aGiTrack takes effect, after the old one's clean SIGTERM shutdown.
     import json
-    import os
 
     from agitrack.proxy import background as bg
 
     repo = _init_repo(tmp_path)
     path = background_handshake_path(repo)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"pid": os.getpid(), "mode": "auto commits"}), encoding="utf-8")
-    spawned = []
-    monkeypatch.setattr(bg, "spawn_background_daemon", lambda *a, **k: spawned.append(k) or None)
+    path.write_text(json.dumps({"pid": 4241, "mode": "auto commits"}), encoding="utf-8")
+
+    alive = {4241, 4242}
+    terminated = []
+    monkeypatch.setattr(bg, "pid_alive", lambda pid: pid in alive)
+    monkeypatch.setattr(bg, "terminate_pid", lambda pid: (terminated.append(pid), alive.discard(pid)))
+
+    class _FakeProc:
+        pid = 4242
+
+    def fake_spawn(r, *, extra_args):
+        p = background_handshake_path(r)
+        p.write_text(json.dumps({"pid": 4242, "mode": "auto commits"}), encoding="utf-8")
+        return _FakeProc()
+
+    monkeypatch.setattr(bg, "spawn_background_daemon", fake_spawn)
 
     assert bg.start_background_daemon(repo, extra_args=[]) == 0
-    assert "already running" in capsys.readouterr().out
-    assert spawned == []  # never spawns a duplicate
+    out = capsys.readouterr().out
+    assert "Restarting the aGiTrack background tracker (was PID 4241" in out
+    assert terminated == [4241]  # the old tracker got its clean shutdown signal
+    assert "daemon live" in out and "4242" in out
+
+
+def test_start_background_daemon_fails_when_old_tracker_will_not_stop(tmp_path, capsys, monkeypatch):
+    import json
+
+    from agitrack.proxy import background as bg
+
+    repo = _init_repo(tmp_path)
+    path = background_handshake_path(repo)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"pid": 4241, "mode": "auto commits"}), encoding="utf-8")
+
+    monkeypatch.setattr(bg, "pid_alive", lambda pid: True)
+    monkeypatch.setattr(bg, "terminate_pid", lambda pid: None)
+    monkeypatch.setattr(bg.time, "sleep", lambda s: None)
+    monkeypatch.setattr(bg, "_terminate_and_wait", lambda pid, **k: False)
+    spawned = []
+    monkeypatch.setattr(bg, "spawn_background_daemon", lambda *a, **k: spawned.append(1) or None)
+
+    assert bg.start_background_daemon(repo, extra_args=[]) == 1
+    assert "did not stop in time" in capsys.readouterr().out
+    assert spawned == []  # never spawns beside a still-live tracker
+
+
+def test_replace_running_tracker_only_replaces_a_background_tracker(tmp_path, capsys, monkeypatch):
+    import json
+
+    from agitrack.proxy import background as bg
+
+    repo = _init_repo(tmp_path)
+    path = background_handshake_path(repo)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"pid": 4241, "mode": "auto commits"}), encoding="utf-8")
+
+    alive = {4241}
+    monkeypatch.setattr(bg, "pid_alive", lambda pid: pid in alive)
+    monkeypatch.setattr(bg, "terminate_pid", lambda pid: alive.discard(pid))
+
+    # The lock holder is NOT the tracker (an interactive session): refuse to replace.
+    assert bg.replace_running_tracker(repo, owner_pid=7777) is False
+    assert 4241 in alive  # nothing was terminated
+
+    # The lock holder IS the live tracker: stop it and allow the rerun to take over.
+    assert bg.replace_running_tracker(repo, owner_pid=4241) is True
+    assert 4241 not in alive
+    assert "Restarting the aGiTrack background tracker (was PID 4241)" in capsys.readouterr().out
 
 
 def test_start_background_daemon_spawns_and_reports(tmp_path, capsys, monkeypatch):

@@ -443,6 +443,65 @@ def test_background_refused_when_another_instance_holds_the_repo(monkeypatch):
     assert launched == []  # the tracker was never constructed
 
 
+def test_background_rerun_replaces_a_running_background_tracker(monkeypatch):
+    # Re-running `agitrack -b` while a background tracker holds the repo lock REPLACES it
+    # (like `-d`/`--backtrace`), so a rerun after an aGiTrack update always runs new code.
+    import pathlib
+    from types import SimpleNamespace
+
+    from agitrack.proxy import background as bg
+
+    monkeypatch.setattr(cli, "_discover_or_init", lambda p: SimpleNamespace(repo=pathlib.Path("/tmp/x")))
+    monkeypatch.setattr(cli, "_acknowledge_privacy_warning", lambda **k: True)
+    monkeypatch.setattr(cli, "BackgroundRunner", object())  # platform supports background mode
+    monkeypatch.setattr(cli, "_maybe_prompt_background_hook", lambda *a, **k: None)
+
+    class _HeldOnceLock:
+        calls = 0
+
+        def __init__(self, _path):
+            pass
+
+        def acquire(self):
+            type(self).calls += 1
+            return type(self).calls > 1  # held by the old daemon; free once it stops
+
+        def owner_pid(self):
+            return 999
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(cli, "RepoLock", _HeldOnceLock)
+    replaced: list = []
+    monkeypatch.setattr(bg, "replace_running_tracker", lambda repo, *, owner_pid: replaced.append(owner_pid) or True)
+    started: list = []
+    monkeypatch.setattr(bg, "start_background_daemon", lambda repo, *, extra_args: started.append(extra_args) or 0)
+
+    class Config:
+        check_for_updates = False
+        background = False
+
+        def has_default_backend(self):
+            return True
+
+        default_backend = "claude"
+
+        def load_repo_overlay(self, _root):
+            pass
+
+        def seed_defaults(self):
+            return False
+
+    monkeypatch.setattr(cli, "GlobalConfig", lambda: Config())
+
+    rc = cli.main(["--background", "--backend", "claude"])
+
+    assert rc == 0
+    assert replaced == [999]  # the old tracker was stopped, not refused
+    assert len(started) == 1  # and a fresh daemon was spawned
+
+
 def test_no_backend_configured_non_interactive_errors(monkeypatch, capsys):
     # No --backend and no configured default, run non-interactively: aGiTrack must
     # fail clearly rather than silently fall back to a hardcoded backend (the old
