@@ -1150,7 +1150,13 @@ def parse_rows(
                 current.setdefault("edits", []).extend(_edits_from_message(message, file_state))
                 pending_reads.update(_whole_file_reads(message))
             text = _assistant_text(message)
-            if text:
+            if text and text.strip() != "No response requested.":
+                # "No response requested." is Claude Code's synthetic filler (written when a
+                # request is aborted or a crash cuts the turn short), NOT the agent's final
+                # message. Taking it as a final made a crashed turn look answered, so it was
+                # committed with the filler as its response; the real reply then arrived on
+                # the restarted process and continued the same turn. Skipping it keeps the
+                # turn final-less until an actual agent message lands.
                 current["final"] = text
                 current["assistant_id"] = str(message.get("id") or "")
                 # Each assistant message with user-facing text is a separate reply

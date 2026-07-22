@@ -660,6 +660,49 @@ def test_parse_rows_background_task_work_opens_its_own_turn():
     assert turns_after(session, "m1") == session.turns[1:]
 
 
+def test_no_response_requested_filler_is_not_a_final_message():
+    # "No response requested." is Claude Code's synthetic filler for aborted/crashed
+    # requests. It must never count as the agent's final message: a crashed turn stays
+    # final-less (so it isn't committed as answered), and when the restarted process
+    # produces the REAL reply, that becomes the turn's final.
+    rows = [
+        _user("u1", "please continue"),
+        _assistant("crash1", "No response requested.", stop_reason="end_turn"),
+        _assistant("m1", "Everything is done and the paper builds cleanly.", stop_reason="end_turn"),
+    ]
+
+    session = parse_rows("sess-filler", rows)
+
+    assert len(session.turns) == 1
+    turn = session.turns[0]
+    assert turn.final_response == "Everything is done and the paper builds cleanly."
+    assert turn.assistant_message_id == "m1"
+    assert turn.agent_messages == ["Everything is done and the paper builds cleanly."]
+
+
+def test_turns_after_re_exports_a_turn_that_continued_past_its_force_commit():
+    # A backend crash / tracker restart force-commits an in-flight turn BEFORE the agent
+    # replied; the watermark then stores the turn's USER id. When the restarted agent
+    # continues that very turn (its real final message and edits arrive after the
+    # commit), the turn must re-export so the completed form is committed — observed in a
+    # real repo where the paper's final build sat uncommitted forever.
+    from agitrack.backends.base import TokenUsage
+    from agitrack.transcripts.types import ExportedSession, SessionTurn, turns_after
+
+    continued = SessionTurn("u9", "msg_final", "continue please", "All done, 38 pages.", TokenUsage(output=10), None)
+    next_turn = SessionTurn("u10", "msg_next", "clean up the paper", "Cleaning.", TokenUsage(output=5), None)
+    session = ExportedSession("s", "m", None, [continued, next_turn])
+
+    # User-id watermark + the turn now has a reply: the turn itself re-exports.
+    assert turns_after(session, "u9") == [continued, next_turn]
+    # Assistant-id watermark: that turn is fully committed; only what follows exports.
+    assert turns_after(session, "msg_final") == [next_turn]
+    # User-id watermark on a turn STILL without a reply: nothing new, as before.
+    unanswered = SessionTurn("u9", "", "continue please", "", TokenUsage(), None)
+    session2 = ExportedSession("s", "m", None, [unanswered, next_turn])
+    assert turns_after(session2, "u9") == [next_turn]
+
+
 def test_parse_rows_tracks_live_background_tasks_from_the_notification_stream():
     # Liveness is judged from the notifications, not launches (a task finishing while the
     # agent is mid-turn never emits a terminal notification): a task whose monitor
