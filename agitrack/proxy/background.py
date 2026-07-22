@@ -500,6 +500,9 @@ class BackgroundRunner:
         self._settle_since = 0.0
         self._settle_tree: str | None = None
         self._settle_changed_at = 0.0
+        # Tool-use ids of background tasks the agent started that are still running, refreshed
+        # from each export. While any is live the settle wait is not capped (see below).
+        self._live_background_tasks: list[str] = []
         # Summary worker threads keyed by the latent commit sha, so the fold can tell a summary
         # that's still computing from one that already FINISHED (and, if it produced no note, fold
         # now instead of waiting out the full summary_wait_seconds — e.g. the summarizer errored).
@@ -849,6 +852,10 @@ class BackgroundRunner:
             commit_fn=self._record_turns,
             note_in_flight_fn=self._note_in_flight,
         )
+        # The engine records the session's still-running background tasks onto the session it was
+        # given. That object is thrown away each cycle, so carry the answer onto the runner — the
+        # fold's settle rule needs it (see `_worktree_settled`).
+        self._live_background_tasks = list(getattr(session, "live_background_task_ids", None) or [])
         return bool(committed)
 
     def _note_in_flight(self, facts: dict | None) -> None:
@@ -1100,12 +1107,14 @@ class BackgroundRunner:
         auto-commit (``ProxyRunner._maybe_agent_commit``). The daemon used to ignore that setting
         entirely — a user who tuned it saw it honored in the TUI and silently dropped here.
 
-        BOUNDED, unlike the TUI's: the daemon commonly runs in repos where something writes
-        continuously (a long job the agent started, a log being appended), and such a repo has no
-        quiet moment at all — deferring forever would stop committing while looking perfectly
-        healthy. Once this same latent tip has been waited on for ``summary_wait_seconds`` we fold
-        regardless. The fold already tolerates exactly that much latency waiting for a summary, so
-        this adds no new worst case."""
+        The wait is capped so a repo with an unexplained continuous writer cannot stop committing
+        forever while looking perfectly healthy — the TUI's gate has no such bound. But the cap is
+        SUSPENDED while a background task the agent started is still running, because that is the
+        one case where a never-settling tree is expected rather than pathological, and it is
+        exactly the case the TUI's unbounded wait handles well: a task that streams progress for
+        an hour otherwise produces a commit every few minutes whose entire diff is the task's own
+        log/output churn and whose turn is the agent saying "still running, nothing to report".
+        Waiting collapses that whole run into ONE commit carrying every turn's trace."""
         now = time.monotonic()
         if tip != self._settle_tip:  # a new turn to fold — restart the cap clock
             self._settle_tip = tip
@@ -1116,6 +1125,8 @@ class BackgroundRunner:
             quiet = 8.0
         if now - self._settle_changed_at >= quiet:
             return True
+        if self._live_background_tasks:
+            return False  # its output is what keeps the tree moving — wait for it, like the TUI
         return now - self._settle_since >= self._summary_wait_seconds()
 
     def _fold_summary_ready(self, tip: str) -> bool:

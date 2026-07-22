@@ -358,6 +358,47 @@ def test_settle_wait_is_bounded_so_a_busy_repo_still_commits(tmp_path):
         B.time.monotonic = monkey  # type: ignore[assignment]
 
 
+def test_live_background_task_suspends_the_settle_cap(tmp_path):
+    # A long task the agent started streams output for an hour, so the tree NEVER goes quiet.
+    # With the cap applying, that produced a commit every few minutes whose whole diff was the
+    # task's own log churn and whose turn was the agent saying "still running, nothing to
+    # report" — the reported flood of minor "(background task completed)" commits. While the
+    # task is live the wait is not capped, matching the TUI's unbounded gate, so the whole run
+    # collapses into ONE commit carrying every turn's trace.
+    import agitrack.proxy.background as B
+
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    runner._manual.setup()
+    runner.global_config.timings["file_stable_seconds"] = 8.0
+    runner.global_config.timings["summary_wait_seconds"] = 45.0
+
+    clock = [1000.0]
+    monkey = B.time.monotonic
+    B.time.monotonic = lambda: clock[0]  # type: ignore[assignment]
+    try:
+        (tmp_path / "a.txt").write_text("one\nagent edit\n", encoding="utf-8")
+        runner._sample_worktree()
+        backend.set_session("s1", [_turn("u1", "m1", "(background task completed)", "still running", 900)])
+        backend.sessions["s1"].live_background_task_ids = ["task-1"]  # the task is still streaming
+        runner._process_once()
+        assert runner._live_background_tasks == ["task-1"]  # carried off the export onto the runner
+        head = repo.rev_parse("HEAD")
+
+        for tick in range(12):  # far past the 45s cap
+            (tmp_path / "run.log").write_text(f"line {tick}\n", encoding="utf-8")
+            runner._sample_worktree()
+            runner._auto_fold_pending()
+            clock[0] += 5.0
+        assert repo.rev_parse("HEAD") == head  # no commit while the task churns the tree
+
+        # The task ends. The cap applies again, so the accumulated work commits once.
+        runner._live_background_tasks = []
+        runner._auto_fold_pending()
+        assert repo.rev_parse("HEAD") != head
+    finally:
+        B.time.monotonic = monkey  # type: ignore[assignment]
+
+
 def test_stop_finalize_captures_a_turn_that_never_finished(tmp_path):
     # The TUI's exit finalize passes require_complete=False so work in progress is still
     # recorded on the way out. The daemon's stop path used to keep require_complete=True, so
