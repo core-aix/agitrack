@@ -31,6 +31,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from agitrack import __version__
 from agitrack.backends.proxy_agents import make_proxy_agent
 from agitrack.commits import ManualCommitTracker
 from agitrack.commits.message import build_auto_fold_message, is_fully_tracked_message, summary_metadata_lines
@@ -101,6 +102,19 @@ def stop_background(repo: GitRepo) -> int:
         return 1
     print("Stopped the aGiTrack background tracker.")
     return 0
+
+
+def _running_tracker_is_current(repo: GitRepo, *, owner_pid: int | None = None) -> bool:
+    """True when a LIVE background tracker on this repo is already running the current aGiTrack
+    version — so a rerun of ``agitrack -b`` has nothing new to load and should leave it in place
+    rather than SIGTERM-and-respawn it. Returns False when no background tracker is running, when
+    something else (an interactive TUI) holds the lock (``owner_pid`` mismatch), or when the
+    running version differs from ours (a genuine update — restart to pick it up)."""
+    pid = _live_background_pid(repo)
+    if pid is None or (owner_pid is not None and pid != owner_pid):
+        return False
+    info = _read_handshake(repo) or {}
+    return info.get("version") == __version__
 
 
 def replace_running_tracker(repo: GitRepo, *, owner_pid: int | None) -> bool:
@@ -353,8 +367,15 @@ def start_background_daemon(repo: GitRepo, *, extra_args: list[str], timeout: fl
     like ``-d`` and ``--backtrace``, re-running the command after an aGiTrack update must run
     the NEW code. The old tracker gets its clean SIGTERM shutdown first (it records any final
     turn and removes its hooks). The daemon keeps running after the terminal closes; stop it
-    with ``agitrack -b stop``."""
+    with ``agitrack -b stop``.
+
+    Exception: a daemon already running the CURRENT version is left untouched — restarting it
+    would only churn (stop+respawn) with no new code to load. That needless teardown is what made
+    the tracker appear to "quit" whenever aGiTrack was invoked again for an unrelated reason."""
     running = _live_background_pid(repo)
+    if running is not None and _running_tracker_is_current(repo, owner_pid=running):
+        print(f"\naGiTrack background tracker already running (PID {running}, current version) — left in place.")
+        return 0
     if running is not None:
         info = _read_handshake(repo) or {}
         if not _terminate_and_wait(running):
@@ -622,7 +643,17 @@ class BackgroundRunner:
             mode = "manual commits" if self._manual_commits else "auto commits"
             path.write_text(
                 json.dumps(
-                    {"pid": os.getpid(), "started_at": time.time(), "backend": self.state.backend, "mode": mode}
+                    {
+                        "pid": os.getpid(),
+                        "started_at": time.time(),
+                        "backend": self.state.backend,
+                        "mode": mode,
+                        # Stamp the running aGiTrack version so a later `agitrack -b` can tell an
+                        # already-current daemon (leave it alone) from a stale one (restart to load
+                        # new code). Without this, every rerun tore the daemon down and respawned it —
+                        # the churn that made the tracker appear to "quit" on unrelated invocations.
+                        "version": __version__,
+                    }
                 ),
                 encoding="utf-8",
             )
@@ -885,14 +916,26 @@ class BackgroundRunner:
         :meth:`_agent_committed_own_work`) — recording latently would find no delta and silently drop
         the turn. Instead we COVER those commit(s): ONE cover commit carrying the trace/metadata with
         ``covered_commits`` attributing their lines to AI, reusing the exact backend-commit cover path
-        the proxy uses (metadata lands in history exactly once)."""
+        the proxy uses (metadata lands in history exactly once).
+
+        A cover (or an in-flight ``covered_commits`` attribution) is made ONLY once the turn's final
+        message has been sent. The normal poll already guarantees this — :meth:`finish_parse_if_ready`
+        defers while the latest turn is in progress — but the STOP finalize (``require_complete=False``)
+        keeps a sole final-less turn to capture in-flight work, and covering THAT would attribute the
+        agent's own commit before its turn finished. So when the last turn is still running we take no
+        cover and don't advance the watermark: the agent's mid-turn commit keeps its in-flight
+        attribution, and the completed turn covers it on a later cycle (after a restart if need be)."""
 
         def on_commit_fn(sha, trace_text, _is_cover):
             self.events.emit("ai-change-detected", backend=backend, session=backend_session_id, model=model)
             self._start_commit_summary(sha, trace_text)
 
+        # "Final message sent" gate (see docstring): SessionTurn.complete is False only for a turn
+        # whose backend response has not finished. The trailing final-less turn survives to here only
+        # under the stop finalize; in every other path turns[-1] is already complete.
+        turn_complete = bool(turns) and bool(getattr(turns[-1], "complete", True))
         engine = CommitEngine(self.repo, self.state, debug_fn=self._debug)
-        covered = self._agent_committed_own_work()
+        covered = self._agent_committed_own_work() if turn_complete else []
         if covered:
             # The cover commit is created immediately and the daemon never amends HEAD, so — unlike
             # the async note flow for other commits — its message must LEAD with the summary already.
@@ -922,7 +965,14 @@ class BackgroundRunner:
             if result:
                 self._set_tracked_head(self.repo.rev_parse("HEAD"))  # everything up to the cover is accounted for
             return result
-        return engine.commit_turns(
+        # Latent path (the agent's edits are still uncommitted, so the tree is dirty). If the agent
+        # ALSO made a commit itself earlier this turn — one that carries only an in-flight block, or
+        # none — its lines are in this turn's token count, so the recorded body lists it in
+        # ``covered_commits``. In manual-record mode commit_turns never makes a cover; the SHAs only
+        # feed the body's metadata. Gated on the same "final message sent" rule as the cover above,
+        # so a stop-finalize of a still-running turn never attributes the agent's mid-turn commit.
+        in_flight_covered = self._uncovered_agent_commits() if turn_complete else []
+        result = engine.commit_turns(
             turns=turns,
             backend=backend,
             backend_session_id=backend_session_id,
@@ -931,7 +981,15 @@ class BackgroundRunner:
             on_commit_fn=on_commit_fn,
             manual_gate_fn=self._manual.gate,
             manual_record_fn=self._manual.record,
+            backend_commits=in_flight_covered,
         )
+        if result and in_flight_covered:
+            # The recorded body now attributes those agent-made commit(s); advance the watermark
+            # past them (HEAD sits at the agent's own commit — the latent record never moved it) so
+            # a later turn can't list the same hashes again and _agent_committed_own_work won't
+            # re-cover them.
+            self._set_tracked_head(self.repo.rev_parse("HEAD"))
+        return result
 
     # ------------------------------------------------------------------
     # Persistent coverage watermark (agent/user committed the turn's own work)
@@ -1013,6 +1071,28 @@ class BackgroundRunner:
             self._set_tracked_head(head)
             return []
         return untracked
+
+    def _uncovered_agent_commits(self) -> list[str]:
+        """Not-yet-tracked commit(s) on ``tracked_head..HEAD`` (oldest first): the agent's own
+        commits — typically one it ran mid-turn (``git commit``) before this now-complete turn
+        finished — whose lines this turn's token count accounts for, so the folded turn body
+        lists them in ``covered_commits``.
+
+        Unlike :meth:`_agent_committed_own_work` this does NOT require a clean tree: it runs on
+        the latent (dirty-tree) path, where the agent committed once mid-turn and then kept
+        editing, so its edits are still uncommitted while a prior self-made commit already sits in
+        history. Returns ``[]`` when nothing untracked lies between the watermark and HEAD."""
+        if self._tracked_head is None:
+            return []
+        try:
+            head = self.repo.rev_parse("HEAD")
+            if head == self._tracked_head:
+                return []
+            commits = self.repo.log_shas(self._tracked_head, head)  # tracked_head..HEAD, oldest first
+        except Exception as error:
+            self._debug(f"uncovered agent commit check failed: {error!r}")
+            return []
+        return [sha for sha in commits if not self._is_agitrack_tracked(sha)]
 
     # ------------------------------------------------------------------
     # Auto mode: fold the pending latent turns into a real commit ourselves
