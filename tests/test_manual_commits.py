@@ -220,6 +220,19 @@ def test_pending_trailer_attributes_an_agent_commit_made_mid_turn():
     assert "in_flight: true" in trailer
 
 
+def test_in_flight_note_sits_inside_the_interaction_trace_section():
+    # The explanatory note belongs INSIDE the "# Interaction Trace" section as a lead-in
+    # blockquote (like the session-event / covered-commits notes), not floating above the
+    # header. It leads the trace, above the running prompt, and stays above the metadata block.
+    in_flight = {"backend": "claude", "backend_session_id": "s1", "model": "m", "prompt": "do x"}
+    trailer = build_pending_trailer(agitrack_session_id="sid", latent_bodies=[], in_flight=in_flight)
+
+    note_at = trailer.index("The agent committed this itself")
+    assert trailer.index("# Interaction Trace") < note_at  # note is INSIDE the trace section
+    assert note_at < trailer.index("## User")  # ...leading it, above the running prompt
+    assert note_at < trailer.index("# aGiTrack Metadata")  # ...and above the metadata block
+
+
 def test_pending_trailer_is_empty_without_pending_or_in_flight_work():
     assert build_pending_trailer(agitrack_session_id="sid", latent_bodies=[], in_flight=None) == ""
 

@@ -663,10 +663,14 @@ def build_in_flight_trailer(
             "later commit."
         )
     )
-    body: list[str] = [*note, ""]
+    # The note leads the interaction trace as a blockquote — INSIDE the section, above the
+    # running prompt — the same placement as the session-event / covered-commits lead-in notes,
+    # not floating above the header. The section header is always present so the note has a home
+    # even when the running turn has no prompt text yet.
+    body: list[str] = ["# Interaction Trace", "", *note, ""]
     if prompt and prompt.strip():
         # _trace_role_lines masks and heading-nests the prompt, exactly as a real trace does.
-        body.extend(["# Interaction Trace", "", *_trace_role_lines({"role": "user", "content": prompt})])
+        body.extend(_trace_role_lines({"role": "user", "content": prompt}))
     body.extend(lines)
     return "\n".join(body).strip() + "\n"
 
