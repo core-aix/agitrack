@@ -335,6 +335,44 @@ def test_proxy_no_worktree_latent_turn_covers_a_mid_turn_agent_commit(tmp_path, 
     assert "This commit accounts" in body  # the explanatory note
 
 
+@pytest.mark.parametrize("backend_name", ["claude", "opencode"])
+def test_proxy_no_worktree_stop_finalize_does_not_cover_an_unfinished_turn(tmp_path, backend_name):
+    # The constraint, interactive side: the exit finalize (require_complete=False) keeps a
+    # still-running turn to capture in-flight work, but it must not attribute the agent's mid-turn
+    # commit before the turn's final message. So an unfinished turn leaves that commit OUT of
+    # covered_commits and leaves the cover anchor where it was — the completed turn covers it later.
+    runner, repo = _noworktree_proxy(tmp_path, manual=True)
+    runner.state.backend = backend_name
+    assert git_hooks.install_manual_commit_hooks(repo.repo / ".git" / "hooks")
+    base = repo.rev_parse("HEAD")
+    runner._noworktree_base_head = base
+    runner._start_commit_summary = lambda *a, **k: None
+    runner.untracked_before_turn = set()
+
+    # Mid-turn: the agent commits its own work (the hook folds an in-flight block).
+    (tmp_path / "a.txt").write_text("one\nmid-turn work\n", encoding="utf-8")
+    runner._note_in_flight({"backend": backend_name, "backend_session_id": "s1", "model": "m", "prompt": "do x"})
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "Agent's own mid-turn commit")
+    agent_commit = repo.rev_parse("HEAD")
+    runner._reset_stale_manual_ref()
+
+    # More uncommitted edits, and the turn is STILL unfinished at stop time (complete=False).
+    (tmp_path / "a.txt").write_text("one\nmid-turn work\nstill more\n", encoding="utf-8")
+    runner._create_agent_commit_from_turns_popup(
+        turns=[SessionTurn("u1", "a1", "do x", "", TokenUsage(total=0, output=0), "m", complete=False)],
+        backend=backend_name,
+        backend_session_id="s1",
+        model="m",
+        quiet=True,
+    )
+
+    assert repo.rev_parse("HEAD") == agent_commit  # no cover placed on top
+    assert runner._noworktree_base_head == base  # anchor NOT advanced past the unfinished turn
+    for body in runner._manual_pending_bodies():
+        assert agent_commit[:7] not in body  # the mid-turn commit is not yet attributed
+
+
 def test_proxy_no_worktree_leaves_a_human_commit_alone(tmp_path):
     runner, repo = _noworktree_proxy(tmp_path, manual=True)
     assert git_hooks.install_manual_commit_hooks(repo.repo / ".git" / "hooks")

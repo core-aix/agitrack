@@ -867,8 +867,16 @@ def main(argv: list[str] | None = None) -> int:
             # `-d`/`--backtrace`): stop the old daemon cleanly and take over — so a rerun
             # after an aGiTrack update always runs the new code. Anything else holding the
             # lock (an interactive session) still refuses below.
-            from agitrack.proxy.background import replace_running_tracker
+            from agitrack.proxy.background import _running_tracker_is_current, replace_running_tracker
 
+            # But if that tracker is ALREADY the current version, there is no new code to load —
+            # leave it running instead of tearing it down and respawning. This needless restart
+            # churn is what made the daemon appear to "quit" on every unrelated aGiTrack invocation.
+            if _running_tracker_is_current(repo, owner_pid=owner_pid):
+                print(
+                    f"aGiTrack background tracker already running (PID {owner_pid}, current version) — left in place."
+                )
+                return 0
             replaced = replace_running_tracker(repo, owner_pid=owner_pid) and management_lock.acquire()
         if not replaced:
             print(already_running_message(owner_pid))

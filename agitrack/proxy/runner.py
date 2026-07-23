@@ -9663,7 +9663,14 @@ class ProxyRunner:
         # with the explanatory note) in BOTH modes: worktree mode covers them with a merge-shaped
         # cover commit; no-worktree latent mode records them in the folded turn body. Previously
         # the latent path forced this empty, so a mid-turn agent commit was never attributed.
-        uncovered = self._uncovered_backend_commits()
+        #
+        # Gated on the turn's final message having been sent: the exit finalize passes
+        # ``require_complete=False`` to capture in-flight work, but covering a still-running turn's
+        # own commit would attribute it before the turn finished. When the last turn is incomplete
+        # we leave those commits uncovered — a later cycle (or a resumed session) covers them once
+        # the final response lands. Normal turns always arrive complete, so this is a no-op there.
+        turn_complete = bool(turns) and bool(getattr(turns[-1], "complete", True))
+        uncovered = self._uncovered_backend_commits() if turn_complete else []
         committed = CommitEngine(
             self.repo,
             self.state,

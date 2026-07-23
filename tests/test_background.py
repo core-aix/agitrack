@@ -300,6 +300,45 @@ def test_latent_turn_covers_a_mid_turn_commit_even_with_more_uncommitted_work(tm
     assert agent_commit[:7] not in second  # already accounted for by the first turn's body
 
 
+@pytest.mark.parametrize("backend_name", ["claude", "opencode"])
+def test_stop_finalize_never_covers_a_mid_turn_commit_before_the_final_message(tmp_path, backend_name):
+    # The constraint: a cover (which attributes the agent's own commit to AI) is made ONLY after the
+    # turn's final message. The stop finalize keeps a still-running turn so in-flight work is captured
+    # on the way out — but it must NOT cover the agent's mid-turn commit, or the turn would be
+    # attributed before it finished. Backend-agnostic: the completeness signal and cover path are the
+    # same for Claude and OpenCode.
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    backend.name = backend_name
+    state.backend = backend_name
+    runner._manual.setup()
+    runner._load_tracked_head()
+    base = repo.rev_parse("HEAD")
+
+    # The agent commits its own work mid-turn; the turn is STILL running (no final message yet).
+    (tmp_path / "a.txt").write_text("one\nagent work\n", encoding="utf-8")
+    backend.set_session("s1", [_in_flight_turn("u1", "m1", "add the thing")])
+    runner._process_once()  # in-flight noted, nothing recorded
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "Agent's own mid-turn commit")
+    agent_commit = repo.rev_parse("HEAD")
+    runner._manual.service()
+    assert runner._is_agitrack_tracked(agent_commit) is False  # in-flight only ⇒ still owed a record
+
+    # Stop finalize (require_complete=False) while the turn is unfinished: no cover, no attribution,
+    # and the watermark stays put so the completed turn still covers this commit later.
+    assert runner._process_once(require_complete=False) is False
+    assert repo.rev_parse("HEAD") == agent_commit  # no cover commit was placed on top
+    assert runner._is_agitrack_tracked(agent_commit) is False  # not prematurely attributed
+    assert runner._tracked_head == base  # watermark never advanced past the unfinished turn
+
+    # Once the final message lands the cover is made normally — attributing the commit exactly once.
+    backend.set_session("s1", [_turn("u1", "m1", "add the thing", "done", 120)])
+    assert runner._process_once() is True
+    head = _git(repo, "log", "-1", "--format=%B", "HEAD")
+    assert "covered_commits:" in head and agent_commit[:7] in head
+    assert "tokens_since_last_commit_output: 120" in head  # usage lands exactly once, on completion
+
+
 def test_no_trailer_for_a_human_commit_while_the_agent_is_idle(tmp_path):
     # The in-flight fallback must not turn "aGiTrack is running" into "every commit is
     # attributed to the AI". With no running turn there is no footprint at all.
@@ -641,6 +680,68 @@ def test_start_background_daemon_restarts_running(tmp_path, capsys, monkeypatch)
     assert "Restarting the aGiTrack background tracker (was PID 4241" in out
     assert terminated == [4241]  # the old tracker got its clean shutdown signal
     assert "daemon live" in out and "4242" in out
+
+
+def test_start_background_daemon_leaves_a_current_version_daemon_in_place(tmp_path, capsys, monkeypatch):
+    # Re-running `agitrack -b` over a daemon ALREADY on the current version must NOT tear it down
+    # and respawn it — that needless churn (stop→start on every unrelated invocation) is what made
+    # the tracker look like it "quit" whenever aGiTrack was touched. Only a stale daemon restarts.
+    import json
+
+    from agitrack import __version__
+    from agitrack.proxy import background as bg
+
+    repo = _init_repo(tmp_path)
+    path = background_handshake_path(repo)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"pid": 4241, "mode": "auto commits", "version": __version__}), encoding="utf-8")
+
+    monkeypatch.setattr(bg, "pid_alive", lambda pid: True)
+    terminated, spawned = [], []
+    monkeypatch.setattr(bg, "terminate_pid", lambda pid: terminated.append(pid))
+    monkeypatch.setattr(bg, "spawn_background_daemon", lambda *a, **k: spawned.append(1) or None)
+
+    assert bg.start_background_daemon(repo, extra_args=[]) == 0
+    assert terminated == []  # the live current-version daemon was left running
+    assert spawned == []  # nothing new was spawned
+    assert "left in place" in capsys.readouterr().out
+
+
+def test_running_tracker_is_current_matches_only_the_live_current_version_tracker(tmp_path, monkeypatch):
+    import json
+
+    from agitrack import __version__
+    from agitrack.proxy import background as bg
+
+    repo = _init_repo(tmp_path)
+    path = background_handshake_path(repo)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(bg, "pid_alive", lambda pid: True)
+
+    # A live daemon on the current version, with a matching lock owner ⇒ current (leave it).
+    path.write_text(json.dumps({"pid": 4241, "version": __version__}), encoding="utf-8")
+    assert bg._running_tracker_is_current(repo) is True
+    assert bg._running_tracker_is_current(repo, owner_pid=4241) is True
+    # A different lock owner (e.g. an interactive session) ⇒ not "the tracker", never skip.
+    assert bg._running_tracker_is_current(repo, owner_pid=9999) is False
+    # An older version ⇒ stale: restart is warranted to load the new code.
+    path.write_text(json.dumps({"pid": 4241, "version": "0.0.1"}), encoding="utf-8")
+    assert bg._running_tracker_is_current(repo) is False
+    # A pre-version handshake (daemon from before this stamp existed) reads as stale too.
+    path.write_text(json.dumps({"pid": 4241}), encoding="utf-8")
+    assert bg._running_tracker_is_current(repo) is False
+
+
+def test_handshake_records_the_running_version(tmp_path, monkeypatch):
+    import json
+
+    from agitrack import __version__
+
+    monkeypatch.setattr("agitrack.daemons.register", lambda *a, **k: None)  # don't touch the real registry
+    runner, repo, state, backend = _runner(tmp_path, manual=False)
+    runner._write_handshake()
+    info = json.loads(background_handshake_path(repo).read_text(encoding="utf-8"))
+    assert info["version"] == __version__  # so a later rerun can tell current from stale
 
 
 def test_start_background_daemon_fails_when_old_tracker_will_not_stop(tmp_path, capsys, monkeypatch):
