@@ -277,6 +277,51 @@ def test_proxy_no_worktree_attributes_an_agent_commit_made_mid_turn(tmp_path, ma
     assert "do x" in msg
 
 
+@pytest.mark.parametrize("backend_name", ["claude", "opencode"])
+@pytest.mark.parametrize("manual", [True, False], ids=["manual-commits", "auto-commits"])
+def test_proxy_no_worktree_latent_turn_covers_a_mid_turn_agent_commit(tmp_path, manual, backend_name):
+    # Parity with the daemon: when the agent commits mid-turn in a no-worktree interactive
+    # session and then keeps editing, the completed turn records LATENTLY (dirty tree) but its
+    # token count spans the mid-turn commit's work — so the recorded body must list that commit
+    # in covered_commits and carry the explanatory note. The latent path used to force
+    # backend_commits empty, so the mid-turn commit was attributed to nobody. Backend-agnostic:
+    # the metadata format and detection are shared, so it holds for Claude and OpenCode alike.
+    runner, repo = _noworktree_proxy(tmp_path, manual=manual)
+    runner.state.backend = backend_name
+    assert git_hooks.install_manual_commit_hooks(repo.repo / ".git" / "hooks")
+    runner._noworktree_base_head = repo.rev_parse("HEAD")  # anchor set at startup in the real flow
+    runner._start_commit_summary = lambda *a, **k: None  # never spawn a real summarizer
+    runner.untracked_before_turn = set()
+
+    # Mid-turn: the agent edits and commits its own work (the hook folds an in-flight block).
+    (tmp_path / "a.txt").write_text("one\nmid-turn work\n", encoding="utf-8")
+    runner._note_in_flight({"backend": backend_name, "backend_session_id": "s1", "model": "m", "prompt": "do x"})
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "Agent's own mid-turn commit")
+    agent_commit = repo.rev_parse("HEAD")
+    assert "in_flight: true" in _git(repo, "log", "-1", "--format=%B", agent_commit)
+    runner._reset_stale_manual_ref()  # what the post-commit hook / service does
+
+    # The agent keeps working (more uncommitted edits), then the turn completes.
+    (tmp_path / "a.txt").write_text("one\nmid-turn work\nstill more\n", encoding="utf-8")
+    runner._note_in_flight(None)  # the completed record takes over
+    committed = runner._create_agent_commit_from_turns_popup(
+        turns=[SessionTurn("u1", "a1", "do x", "done", TokenUsage(total=120, output=120), "m")],
+        backend=backend_name,
+        backend_session_id="s1",
+        model="m",
+        quiet=True,
+    )
+
+    assert committed is True
+    assert repo.rev_parse("HEAD") == agent_commit  # latent record never moved HEAD
+    assert runner._noworktree_base_head == agent_commit  # anchor advanced past the covered commit
+    body = runner._manual_pending_bodies()[-1]
+    assert "covered_commits:" in body and agent_commit[:7] in body
+    assert f"backend: {backend_name}" in body  # recorded for whichever backend is driving
+    assert "This commit accounts" in body  # the explanatory note
+
+
 def test_proxy_no_worktree_leaves_a_human_commit_alone(tmp_path):
     runner, repo = _noworktree_proxy(tmp_path, manual=True)
     assert git_hooks.install_manual_commit_hooks(repo.repo / ".git" / "hooks")

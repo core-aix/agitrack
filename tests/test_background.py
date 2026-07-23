@@ -8,6 +8,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from agitrack.backends.base import TokenUsage
 from agitrack.commits import ManualCommitTracker
 from agitrack.config import AgitrackState
@@ -252,6 +254,50 @@ def test_completed_turn_still_covers_the_commit_it_stamped_mid_flight(tmp_path):
     assert "covered_commits:" in head and agent_commit[:7] in head  # its lines are attributed to AI
     assert "tokens_since_last_commit_output: 120" in head  # the usage lands exactly once
     assert runner._is_agitrack_tracked(repo.rev_parse("HEAD")) is True
+
+
+@pytest.mark.parametrize("backend_name", ["claude", "opencode"])
+def test_latent_turn_covers_a_mid_turn_commit_even_with_more_uncommitted_work(tmp_path, backend_name):
+    # The dirty-tree hand-off. The agent commits ONCE mid-turn, then keeps editing, so when the
+    # turn finishes the tree is still dirty and the clean-tree cover path bails — the turn records
+    # LATENTLY. Its token count still spans the mid-turn commit's work, so the recorded body must
+    # list that commit in covered_commits (and lead with the explanatory note) rather than leave it
+    # attributed to nobody. Backend-agnostic: the metadata format and git-history detection are the
+    # same for Claude and OpenCode, so it must hold for both.
+    runner, repo, state, backend = _runner(tmp_path, manual=True)
+    backend.name = backend_name
+    state.backend = backend_name
+    runner._manual.setup()
+    runner._load_tracked_head()  # watermark starts at init (pre-existing history is never covered)
+
+    # Mid-turn: the agent edits and commits its own work.
+    (tmp_path / "a.txt").write_text("one\nmid-turn work\n", encoding="utf-8")
+    backend.set_session("s1", [_in_flight_turn("u1", "m1", "add the thing")])
+    runner._process_once()  # turn not complete: nothing recorded, in-flight noted
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "Agent's own mid-turn commit")
+    agent_commit = repo.rev_parse("HEAD")
+    runner._manual.service()  # react to the agent's commit (drop the stale latent chain)
+    assert runner._is_agitrack_tracked(agent_commit) is False  # in-flight only ⇒ still owed a record
+
+    # The agent keeps working — MORE uncommitted edits — then the turn finishes with a dirty tree.
+    (tmp_path / "a.txt").write_text("one\nmid-turn work\nstill more uncommitted\n", encoding="utf-8")
+    backend.set_session("s1", [_turn("u1", "m1", "add the thing", "done", 120)])
+    assert runner._process_once() is True  # records latently
+    assert repo.rev_parse("HEAD") == agent_commit  # the latent record never moved HEAD
+
+    body = runner._manual.pending_bodies()[-1]
+    assert "covered_commits:" in body and agent_commit[:7] in body  # its lines are attributed to AI
+    assert "tokens_since_last_commit_output: 120" in body  # the usage lands exactly once, here
+    assert "This commit accounts" in body  # the explanatory note leads the trace
+    assert f"backend: {backend_name}" in body  # recorded for whichever backend is driving
+
+    # Attributed EXACTLY once: a further turn (before this one folds) must not re-list the hash.
+    (tmp_path / "a.txt").write_text("one\nmid-turn work\nstill more uncommitted\neven more\n", encoding="utf-8")
+    backend.set_session("s1", [_turn("u2", "m2", "and more", "done", 5)])
+    assert runner._process_once() is True
+    second = runner._manual.pending_bodies()[-1]
+    assert agent_commit[:7] not in second  # already accounted for by the first turn's body
 
 
 def test_no_trailer_for_a_human_commit_while_the_agent_is_idle(tmp_path):

@@ -922,7 +922,13 @@ class BackgroundRunner:
             if result:
                 self._set_tracked_head(self.repo.rev_parse("HEAD"))  # everything up to the cover is accounted for
             return result
-        return engine.commit_turns(
+        # Latent path (the agent's edits are still uncommitted, so the tree is dirty). If the agent
+        # ALSO made a commit itself earlier this turn — one that carries only an in-flight block, or
+        # none — its lines are in this turn's token count, so the recorded body lists it in
+        # ``covered_commits``. In manual-record mode commit_turns never makes a cover; the SHAs only
+        # feed the body's metadata.
+        in_flight_covered = self._uncovered_agent_commits()
+        result = engine.commit_turns(
             turns=turns,
             backend=backend,
             backend_session_id=backend_session_id,
@@ -931,7 +937,15 @@ class BackgroundRunner:
             on_commit_fn=on_commit_fn,
             manual_gate_fn=self._manual.gate,
             manual_record_fn=self._manual.record,
+            backend_commits=in_flight_covered,
         )
+        if result and in_flight_covered:
+            # The recorded body now attributes those agent-made commit(s); advance the watermark
+            # past them (HEAD sits at the agent's own commit — the latent record never moved it) so
+            # a later turn can't list the same hashes again and _agent_committed_own_work won't
+            # re-cover them.
+            self._set_tracked_head(self.repo.rev_parse("HEAD"))
+        return result
 
     # ------------------------------------------------------------------
     # Persistent coverage watermark (agent/user committed the turn's own work)
@@ -1013,6 +1027,28 @@ class BackgroundRunner:
             self._set_tracked_head(head)
             return []
         return untracked
+
+    def _uncovered_agent_commits(self) -> list[str]:
+        """Not-yet-tracked commit(s) on ``tracked_head..HEAD`` (oldest first): the agent's own
+        commits — typically one it ran mid-turn (``git commit``) before this now-complete turn
+        finished — whose lines this turn's token count accounts for, so the folded turn body
+        lists them in ``covered_commits``.
+
+        Unlike :meth:`_agent_committed_own_work` this does NOT require a clean tree: it runs on
+        the latent (dirty-tree) path, where the agent committed once mid-turn and then kept
+        editing, so its edits are still uncommitted while a prior self-made commit already sits in
+        history. Returns ``[]`` when nothing untracked lies between the watermark and HEAD."""
+        if self._tracked_head is None:
+            return []
+        try:
+            head = self.repo.rev_parse("HEAD")
+            if head == self._tracked_head:
+                return []
+            commits = self.repo.log_shas(self._tracked_head, head)  # tracked_head..HEAD, oldest first
+        except Exception as error:
+            self._debug(f"uncovered agent commit check failed: {error!r}")
+            return []
+        return [sha for sha in commits if not self._is_agitrack_tracked(sha)]
 
     # ------------------------------------------------------------------
     # Auto mode: fold the pending latent turns into a real commit ourselves

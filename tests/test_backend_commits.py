@@ -84,6 +84,26 @@ def test_agent_commit_message_covered_commits_line():
     assert "covered_commits" not in without
 
 
+def test_covered_commits_message_carries_an_agent_made_note():
+    # A commit that accounts for the agent's OWN commit(s) must EXPLAIN the covered hashes: a
+    # reader of the covering commit should understand where they came from and why this commit's
+    # token counts span work already in history. A plain aGiTrack commit gets no such note.
+    kwargs = dict(
+        latest_prompt="do things",
+        trace=[],
+        backend="claude",
+        backend_session_id=None,
+        agitrack_session_id="agit-1",
+        model=None,
+    )
+    with_covers = build_agent_commit_message(**kwargs, covered_commits=["abc123"])
+    without = build_agent_commit_message(**kwargs)
+    assert "This commit accounts" in with_covers  # the explanatory note
+    assert "This commit accounts" not in without  # no covered commits ⇒ no note
+    # The note LEADS the interaction trace, above the metadata line that lists the hashes.
+    assert with_covers.index("This commit accounts") < with_covers.index("covered_commits:")
+
+
 # --- commit_turns cover path ---------------------------------------------------
 
 
@@ -111,6 +131,24 @@ def test_clean_tree_covers_backend_commits_without_rewriting_them(tmp_path):
     assert "# Interaction Trace" in head_message
     assert f"covered_commits: {repo.short_sha(first)} {repo.short_sha(last)}" in head_message
     assert state.pending_trace() == []  # trace consumed by the cover commit
+
+
+def test_cover_commit_notes_the_commits_were_agent_made(tmp_path):
+    # Parity with the no-worktree fold: when the backend agent makes a commit in worktree
+    # (interactive) mode, the cover commit that attaches the trace must also NOTE that the
+    # covered commits were the agent's own — the note used to appear only via the no-worktree
+    # in-flight trailer, so worktree cover commits explained nothing.
+    repo, _base = _repo_on_turn_branch(tmp_path)
+    state = AgitrackState(tmp_path)
+    first = _backend_commit(repo, "a.txt", "backend commit one")
+
+    assert _commit_turns(repo, state, [first]) is True
+
+    head_message = repo.commit_message("HEAD")
+    assert "This commit accounts" in head_message  # explains the covered hash
+    assert f"covered_commits: {repo.short_sha(first)}" in head_message
+    # The note leads the trace, above the metadata block.
+    assert head_message.index("This commit accounts") < head_message.index("# aGiTrack Metadata")
 
 
 def test_on_commit_fn_flags_cover_vs_plain(tmp_path):
