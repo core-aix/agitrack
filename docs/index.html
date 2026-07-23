@@ -227,10 +227,10 @@ footer .sha{font-size:12px}
 <div class="wrap">
   <header>
     <div class="brand reveal r1"><span class="a">a</span>GiTrack</div>
-    <p class="tagline reveal r2"><span class="tag">&lt;aGiTrack&gt;</span> every agent turn, committed with its story, with humans learning<span class="cursor"></span></p>
+    <p class="tagline reveal r2"><span class="tag">&lt;aGiTrack&gt;</span> every agent turn captured with its story, and humans learn<span class="cursor"></span></p>
     <p class="sub reveal r3">Use your <strong>coding agent</strong> exactly as before. Every finished turn becomes a
-    <strong>git commit</strong>: what you asked, what it did, what it cost. It even <a href="#learn"><strong>coaches you
-    back</strong></a> from your own sessions. <strong>Nothing leaves your machine</strong>: everything is plain git history in your own repo.</p>
+    <strong>git commit</strong>: prompts, code changes, cost. It even <a href="#learn"><strong>teaches you
+    back</strong></a> from your own sessions. <strong>Nothing tracked externally</strong>: everything is git history in your own repo.</p>
     <div class="hero-actions reveal r4">
       <a class="btn" href="#install">pip install agitrack</a>
       <a class="btn alt" href="docs.html">read the docs</a>
@@ -348,7 +348,7 @@ Added --version using the package metadata; prints and exits.
         <span class="sha">a1f8b28</span>
         <span class="subject"><span class="tag">&lt;aGiTrack&gt;</span> reconstruct history from past sessions</span>
       </div>
-      <h2>Didn't use it from day one? Show the history anyway.</h2>
+      <h2>Didn't use it from day one? See the history anyway.</h2>
       <p>Built your project with an agent before aGiTrack? <span class="p">agitrack --backtrace</span>
       <strong>reconstructs</strong> those sessions from the transcripts already on your machine, into the same
       dashboard. Nothing uploaded.</p>
@@ -375,7 +375,7 @@ Added --version using the package metadata; prints and exits.
         <li><span class="o">▸</span> <strong>Claude Code</strong> <span class="cmd">agitrack --backend claude</span></li>
         <li><span class="o">▸</span> <strong>OpenCode</strong> <span class="cmd">agitrack --backend opencode</span></li>
       </ul>
-      <p>More backends are planned. <a href="https://github.com/core-aix/agitrack/issues">Request one.</a></p>
+      <p>Want a different backend? <a href="https://github.com/core-aix/agitrack/issues">Request one.</a></p>
     </section>
 
     <section class="commit" id="modes">
@@ -389,7 +389,7 @@ Added --version using the package metadata; prints and exits.
       <div class="branches two">
         <div class="branch" data-ref="agitrack">
           <h3>Interactive · Auto <span class="tag">default</span></h3>
-          <p>The agent's real TUI; every finished turn is committed from an isolated <strong>worktree</strong>.
+          <p>The agent's real TUI; every finished turn is committed from an isolated <strong>worktree</strong>. Or use with <span class="p">--no-worktree</span>.
           Just work, get a clean traced history.</p>
         </div>
         <div class="branch" data-ref="agitrack -m">
