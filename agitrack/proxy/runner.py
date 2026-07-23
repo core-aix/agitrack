@@ -10751,6 +10751,20 @@ class ProxyRunner:
         simply wrong — most visibly under --no-worktree, where the agent edits this very tree."""
         if self._manual_commits or self.turn_awaiting_commit:
             return False
+        if self._noworktree_auto:
+            # A just-completed turn's changes may still sit UNCOMMITTED in the tree, recorded only
+            # as a latent commit: no-worktree auto folds them into a real commit on a throttled
+            # poll, and that fold is HELD while the turn's background summary is in flight (up to
+            # SUMMARY_WAIT_SECONDS — 45s). ``turn_awaiting_commit`` has already dropped by then (the
+            # latent commit was recorded, which clears it), so without this the check below would
+            # see the AGENT's uncommitted work and offer to commit it as the USER's own — the
+            # reported bug where submitting a new prompt while aGiTrack is still summarizing asks
+            # about the just-finished turn's files. Land the owed turn commit now (force past the
+            # summary wait; a late summary amends into the fold commit, see _folded_head_for) so the
+            # tree is clean and there is nothing to offer. A no-op when nothing is pending: it
+            # returns early on a clean tree / absent latent tip, so genuine user-only edits (no turn
+            # owed) still fall through to the offer below.
+            self._auto_fold_latent_pending(force=True)
         if not self.actions.has_pre_agent_user_changes():
             return False
         if getattr(self.active, "live_background_task_ids", None):
