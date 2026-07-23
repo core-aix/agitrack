@@ -368,6 +368,12 @@ def _trace_and_metadata_lines(
     # compactions in these turns) lead the trace as a note, so the conversation log
     # itself shows when the context — and the token counts riding on it — changed.
     lines.extend(_session_event_note_lines(compactions=compactions, origin_event=origin_event))
+    # When this commit accounts for commit(s) the agent made ITSELF (their hashes listed
+    # in ``covered_commits`` below), lead the trace with a note explaining the relationship,
+    # so a reader of the covering commit understands where those hashes came from and why
+    # this commit's token counts span work already in history — the human-readable
+    # counterpart to the ``covered_commits`` metadata line (issues #35/#58).
+    lines.extend(_covered_commits_note_lines(covered_commits))
     for item in _limit_trace_turns(trace, trace_turn_limit):
         # Nest each message's own headings under its "## User"/"## Agent" role heading (so a
         # message's "# Title" can't outrank the role) and skip empty entries (see _trace_role_lines).
@@ -437,6 +443,29 @@ def _session_event_note_lines(*, compactions: int, origin_event: dict | None) ->
         lines.extend(_note_block(_mask_secrets(note)))
         lines.append("")
     return lines
+
+
+def _covered_commits_note_lines(covered_commits: list[str] | None) -> list[str]:
+    """Lead-in note for a commit that COVERS commit(s) the agent made itself — the
+    human-readable counterpart to the ``covered_commits`` metadata line. Empty when the
+    commit covers nothing (an ordinary aGiTrack commit), so a normal commit is unchanged.
+
+    The note applies uniformly wherever a commit accounts for the agent's own commits: the
+    merge-shaped cover commit worktree mode places on top of them (#35), and the folded
+    turn body that attributes a commit the agent made mid-turn in a no-worktree mode. In
+    both cases the covered commits keep their own hashes (never rewritten, #58) and this
+    commit carries the trace and token usage for the work that produced them."""
+    if not covered_commits:
+        return []
+    plural = "s" if len(covered_commits) > 1 else ""
+    note = (
+        f"This commit accounts for {len(covered_commits)} commit{plural} the agent made "
+        "itself — their hashes are listed under `covered_commits` in the metadata below. "
+        "Those commits keep their own hashes and are never rewritten; the interaction "
+        "trace and the token usage for the work that produced them are recorded here, so "
+        "this commit's token counts span changes already present in history."
+    )
+    return [*_note_block(_mask_secrets(note)), ""]
 
 
 def _origin_event_sentence(origin_event: dict) -> str:

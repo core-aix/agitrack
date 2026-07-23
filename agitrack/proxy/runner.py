@@ -9656,7 +9656,15 @@ class ProxyRunner:
         if self._latent_tracking and turns:
             self._sessions_with_activity.add(self.state.session_id)
 
-        return CommitEngine(
+        # Commit(s) the backend agent made ITSELF that no aGiTrack commit accounts for yet —
+        # e.g. one it ran mid-turn (`git commit`) before this now-complete turn finished. Its
+        # lines are already in history under their own hash but this turn's token count spans the
+        # work that produced them, so this commit lists them in ``covered_commits`` (and leads
+        # with the explanatory note) in BOTH modes: worktree mode covers them with a merge-shaped
+        # cover commit; no-worktree latent mode records them in the folded turn body. Previously
+        # the latent path forced this empty, so a mid-turn agent commit was never attributed.
+        uncovered = self._uncovered_backend_commits()
+        committed = CommitEngine(
             self.repo,
             self.state,
             debug_fn=self._debug,
@@ -9675,11 +9683,23 @@ class ProxyRunner:
             # Every no-worktree mode (manual OR auto) diverts the per-turn write to a hidden
             # latent commit and never touches HEAD/the index; the trailer/hook fold it into the
             # user's or agent's own commit (no-worktree auto also folds it itself, see
-            # _auto_fold_latent_pending). Worktree mode is unaffected (both None, cover applies).
+            # _auto_fold_latent_pending). In manual-record mode commit_turns never makes a cover —
+            # ``backend_commits`` only feeds the recorded body's ``covered_commits`` metadata.
             manual_gate_fn=self._manual_gate if self._latent_tracking else None,
             manual_record_fn=self._manual_record if self._latent_tracking else None,
-            backend_commits=[] if self._latent_tracking else self._uncovered_backend_commits(),
+            backend_commits=uncovered,
         )
+        if committed and uncovered and self._latent_tracking:
+            # The folded turn body now attributes these agent-made commits via ``covered_commits``.
+            # Advance the no-worktree cover anchor past them so a LATER turn's body (recorded before
+            # this one folds) can't list the same hashes again — the daemon does the same with its
+            # ``tracked_head`` watermark. HEAD is unchanged by the latent record (it sits at the
+            # agent's own commit), so this pins the anchor there.
+            try:
+                self._noworktree_base_head = self.repo.rev_parse("HEAD")
+            except Exception as error:
+                self._debug(f"no-worktree cover anchor advance failed: {error!r}")
+        return committed
 
     def _uncovered_backend_commits(self) -> list[str]:
         """Commits the backend created itself that no aGiTrack commit accounts for

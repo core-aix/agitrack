@@ -41,6 +41,7 @@ from functools import cached_property
 from pathlib import Path
 
 from agitrack.commits import METADATA_HEADER
+from agitrack.commits.message import is_fully_tracked_message
 from agitrack.commits.message import mask_paths
 from agitrack.git import GitRepo
 
@@ -566,11 +567,18 @@ def collect_commit_stats(repo: GitRepo, ref: str = "HEAD") -> list[CommitStat]:
 
     _apply_numstat(repo, ref, {stat.sha: stat for stat in stats})
 
-    # Backend-made commits have no metadata of their own; they are AI work if
-    # some aGiTrack commit's covered_commits names them (#35/#58).
+    # A commit another commit's covered_commits names is AI work accounted for by that
+    # covering commit (#35/#58): reclassify it "covered" so its lines are counted once —
+    # via the covering commit — not a second time as its own bucket in group_by. This
+    # catches both a backend-made commit with no metadata (worktree cover) AND an in-flight
+    # commit the agent made mid-turn (commit_type: agent but NOT fully tracked — it carries
+    # attribution only, its trace and tokens land in the covering commit). A commit that is
+    # already fully tracked is left alone (it accounts for itself and is never covered).
     covered_prefixes = [short for stat in stats for short in stat.covered_commits]
     for stat in stats:
-        if stat.kind == "untracked" and any(stat.sha.startswith(prefix) for prefix in covered_prefixes):
+        if not is_fully_tracked_message(stat.message) and any(
+            stat.sha.startswith(prefix) for prefix in covered_prefixes
+        ):
             stat.kind = "covered"
 
     stats.reverse()  # oldest first

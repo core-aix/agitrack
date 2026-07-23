@@ -21,6 +21,7 @@ import urllib.request
 import agitrack.metrics as metrics
 from agitrack import cli
 from agitrack.commits import build_agent_commit_message, build_agent_merge_message, build_user_commit_message
+from agitrack.commits.message import build_in_flight_trailer
 from agitrack.git import GitRepo
 from agitrack.metrics import build_dashboard, build_server, dashboard_data, render_dashboard, render_html
 from agitrack.metrics.collect import CommitStat, resolve_committers
@@ -117,6 +118,35 @@ def test_agitrack_integration_merge_is_classified_as_ops_not_untracked(tmp_path)
     assert ops.kind in ("agent", "covered", "agent-merge", "user", "agitrack-ops")
     # It counts toward aGiTrack coverage, and is not lumped into non-tracked lines.
     assert dash.nontracked_lines == (0, 0)
+
+
+def test_in_flight_commit_referenced_by_covered_commits_counts_once(tmp_path):
+    # An in-flight commit (commit_type: agent, but in_flight: true — attribution only) that a
+    # later folded commit accounts for via covered_commits must be classified "covered", not
+    # "agent". Otherwise its lines count twice in the by-backend view: once as its own agent
+    # bucket, once added to the covering commit. Same rule as a backend-made cover commit —
+    # only a FULLY tracked commit accounts for itself.
+    repo = GitRepo.init(tmp_path)  # seed
+
+    # The agent commits its own work mid-turn; the hook folds an in-flight block onto it (6 lines).
+    _write_lines(repo, "mid.txt", 6)
+    trailer = build_in_flight_trailer(
+        agitrack_session_id="agit-1", backend="claude", backend_session_id="ses-1", model="claude-opus-4-8", prompt="x"
+    )
+    repo.commit("Agent's own mid-turn commit\n\n" + trailer)
+    in_flight_sha = repo.rev_parse("HEAD")
+
+    # The turn completes and aGiTrack folds it, listing the mid-turn commit in covered_commits (3 lines).
+    _write_lines(repo, "rest.txt", 3)
+    repo.commit(_agent_message("finish the work", tokens=_TOKENS, covered=[repo.short_sha(in_flight_sha)]))
+
+    dash = build_dashboard(repo)
+    in_flight = next(s for s in dash.stats if s.sha == in_flight_sha)
+    assert in_flight.kind == "covered"  # accounted for by the fold, not an independent agent commit
+    assert dash.count("covered") == 1 and dash.count("agent") == 1  # one covered, one covering
+    # Its 6 lines are counted exactly once as AI work — via the covering commit — never doubled.
+    assert dash.ai_lines == (6 + 3, 0)
+    assert dash.by_backend["claude"]["insertions"] == 6 + 3
 
 
 def test_dashboard_classifies_every_commit_kind(tmp_path):
