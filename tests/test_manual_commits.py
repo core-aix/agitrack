@@ -804,6 +804,56 @@ def test_noworktree_auto_force_fold_lands_even_with_summary_pending(tmp_path):
     assert runner._manual_pending_count() == 0
 
 
+@pytest.mark.parametrize("backend_name", ["claude", "opencode"])
+def test_noworktree_auto_new_prompt_while_summarizing_does_not_offer_user_commit(tmp_path, backend_name):
+    # Reported bug: submitting a NEW prompt while aGiTrack is still summarizing the just-finished
+    # turn (no-worktree auto) popped the "commit your uncommitted changes" modal — but those
+    # uncommitted files are the AGENT's just-finished turn, not the user's. ``turn_awaiting_commit``
+    # has already dropped (the latent commit was recorded, which clears it) and the throttled real
+    # fold is DEFERRED while the turn summary is in flight, so the tree is still dirty. The pre-agent
+    # offer must land that owed turn commit itself and NEVER prompt the user.
+    import types
+
+    from agitrack.commits.actions import AgitrackActions
+
+    runner, repo, state = _noworktree_auto_runner(tmp_path)
+    runner.actions = AgitrackActions(repo, state, interactive=False)
+    runner._setup_manual_commit_mode()
+    (tmp_path / "a.txt").write_text("one\nagent\n", encoding="utf-8")
+    runner._manual_gate()
+    runner._manual_record(
+        build_agent_commit_message(
+            latest_prompt="do x",
+            trace=[{"role": "user", "content": "do x"}, {"role": "agent", "content": "did x"}],
+            backend=backend_name,
+            backend_session_id="bs",
+            agitrack_session_id="sid",
+            model="opus",
+            token_usage={"output": 20, "input": 5},
+            session_name="s",
+        )
+    )
+    head_before = repo.rev_parse("HEAD")
+    # Post-record state: turn reconciled (flag cleared) but its summary is still running, so the
+    # normal fold defers and the agent's turn output sits uncommitted in the tree.
+    runner.turn_awaiting_commit = False
+    runner._summary_pending = {"sha": "deadbeef", "since": time.monotonic()}
+    runner._summary_thread = types.SimpleNamespace(is_alive=lambda: True)
+    assert runner.actions.has_pre_agent_user_changes() is True  # dirty with the agent's turn output
+
+    prompted: list[int] = []
+    runner._create_user_commit_popup = lambda *a, **k: prompted.append(1) or True
+
+    warn = runner._offer_pre_agent_user_commit()
+
+    assert prompted == []  # never asked the user about the agent's just-finished files
+    assert warn is False
+    assert repo.rev_parse("HEAD") != head_before  # the owed turn commit was LANDED instead
+    assert "do x" in _git(repo, "log", "-1", "--format=%B", "HEAD")
+    assert runner._manual_pending_count() == 0
+    assert runner.actions.has_pre_agent_user_changes() is False  # tree clean after the fold
+
+
 def test_noworktree_auto_exit_finalize_folds_pending_latent(tmp_path):
     # The reported bug: a turn recorded latently right before quitting was never folded on exit
     # (the poll that folds doesn't run during teardown), so its changes never reached HEAD.
