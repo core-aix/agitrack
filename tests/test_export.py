@@ -88,6 +88,10 @@ def test_export_disables_filters_and_cans_learn_actions(tmp_path, monkeypatch):
     assert '"../"' in index and "homelink" in index
     assert '"../../"' in learn and "homelink" in learn
     assert 'back.href = "../"' in learn
+    # The banner links back to the main page's install section instead of spelling
+    # out install commands.
+    assert 'href="../#install"' in index
+    assert 'href="../../#install"' in learn
 
 
 def test_export_learn_state_falls_back_to_the_single_store_profile(tmp_path, monkeypatch):

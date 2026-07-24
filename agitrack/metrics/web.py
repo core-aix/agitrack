@@ -765,6 +765,8 @@ body.booting .wrap>*:not(header):not(.booting){display:none}
 .backtracebanner{position:sticky;top:0;z-index:25;margin:0;padding:10px 18px;background:var(--panel);
   border-bottom:2px solid var(--amber-dim);color:var(--amber);font-size:12.5px;line-height:1.5;
   text-align:center;box-shadow:0 4px 16px rgba(0,0,0,.55)}
+/* Same treatment as the learn banner's code chip, so a command reads identically on every page. */
+.backtracebanner code{color:var(--fg);background:var(--ink);padding:0 5px}
 @keyframes rise{from{transform:translateY(-100%)}to{transform:none}}
 
 header{padding:26px 0 18px}
@@ -787,10 +789,10 @@ header{padding:26px 0 18px}
 .meta select.branchsel:disabled{cursor:default;opacity:1;border-color:transparent;padding:2px 0;background-image:none}
 
 /* ---- filter bar ---- */
-/* Stays a single row while sticky: never wrap, so the frozen panel is one row
-   tall. (No overflow clipping — the custom-range popup hangs below the bar.) */
+/* One row on a wide window; on anything narrower the fields wrap instead of forcing a
+   horizontal page scroll. (No overflow clipping — the custom-range popup hangs below.) */
 .controls{position:sticky;top:0;z-index:20;margin:22px 0 30px;padding:14px 16px;background:var(--panel);
-  border:1px solid var(--line);border-bottom-width:3px;display:flex;flex-wrap:nowrap;gap:16px;align-items:flex-end}
+  border:1px solid var(--line);border-bottom-width:3px;display:flex;flex-wrap:wrap;gap:16px;align-items:flex-end}
 .controls .prompt{color:var(--phosphor);font-weight:600;align-self:center;white-space:nowrap}
 /* "loading…" badge shown while a filter change re-fetches the data. */
 .loading{margin-left:auto;align-self:center;display:inline-flex;align-items:center;gap:8px;
@@ -824,6 +826,17 @@ input[type=date]::-webkit-calendar-picker-indicator{filter:invert(.7) sepia(1) h
 .reset{cursor:pointer;border:1px solid var(--amber);color:var(--amber);background:transparent;
   font-family:var(--mono);font-size:12.5px;padding:7px 12px;align-self:flex-end;margin-left:auto;white-space:nowrap}
 .reset:hover{background:var(--amber);color:var(--ink)}
+/* Phone-width: a wrapped sticky bar would cover half the screen, so the filters become a
+   two-column grid that scrolls with the page. */
+@media (max-width:760px){
+  .controls{position:static;gap:10px 12px}
+  .controls .prompt{width:100%}
+  .field{flex:1 1 42%;min-width:0}
+  .field select{min-width:0;width:100%}
+  .daterange{left:0;right:auto}
+  .reset{flex:1 1 42%;margin-left:0}
+  .loading{margin-left:0}
+}
 
 h2.section{font-family:var(--display);font-size:27px;font-weight:400;color:var(--phosphor);letter-spacing:1px;
   margin:38px 0 14px;text-shadow:0 0 16px rgba(61,255,160,.3)}
