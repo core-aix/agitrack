@@ -106,10 +106,20 @@ def format_html(
     # contain the literal placeholder strings (backtrace transcripts of aGiTrack's own source
     # mention ``__UPDATE_BANNER__``/``__REPO__``), so replacing them after the JSON is in place
     # would corrupt it.
+    return _render_template(repo_name=repo_name, repo_path=dash.repo, banner_html=banner_html, payload=payload)
+
+
+def _render_template(*, repo_name: str, repo_path: str, banner_html: str, payload: str) -> str:
+    """Fill the page template. ``__DATA__`` goes LAST: the embedded JSON can itself contain the
+    literal placeholder strings (a backtrace of aGiTrack's own source quotes ``__REPO__`` and
+    friends), so substituting chrome after it would corrupt the payload."""
     return (
         _TEMPLATE.replace("__REPO_NAME__", _escape(repo_name))
-        .replace("__REPO__", _escape(dash.repo))
+        .replace("__REPO__", _escape(repo_path))
         .replace("__UPDATE_BANNER__", banner_html)
+        .replace("__PREBOOT_CSS__", PREBOOT_CSS)
+        .replace("__PREBOOT_HTML__", PREBOOT_HTML)
+        .replace("__FONT_LINKS__", FONT_LINKS)
         .replace("__DATA__", payload)
     )
 
@@ -127,12 +137,8 @@ def shell_html(repo: GitRepo) -> str:
     repo_path = _display_repo(str(repo.repo))
     payload = _embed_json({"page_size": PAGE_SIZE, "shared_sessions": shared_sessions_for(repo)})
     repo_name = repo_path.rstrip("/").rsplit("/", 1)[-1] or repo_path
-    # ``__DATA__`` last (see ``format_html``): the payload may contain the chrome tokens verbatim.
-    return (
-        _TEMPLATE.replace("__REPO_NAME__", _escape(repo_name))
-        .replace("__REPO__", _escape(repo_path))
-        .replace("__UPDATE_BANNER__", _update_banner_html(repo))
-        .replace("__DATA__", payload)
+    return _render_template(
+        repo_name=repo_name, repo_path=repo_path, banner_html=_update_banner_html(repo), payload=payload
     )
 
 
@@ -612,6 +618,52 @@ def _embed_json(data: object) -> str:
 
 
 # ---------------------------------------------------------------------------
+# First paint. Until the whole document has arrived and its script has run, the
+# browser has nothing of ours to show — and the default canvas is WHITE, so a
+# dashboard opened over a remote/forwarded connection looked like a blank page
+# rather than one that was loading. These two snippets fix that at the source and
+# are shared with the learn page (learn.py), which has the same head.
+# ---------------------------------------------------------------------------
+
+# Placed FIRST in <head>, before the favicon, the fonts and the ~28 KB main stylesheet, and
+# deliberately tiny (~700 bytes) so it lands in the first packet: the page is dark and says
+# what it is doing from the moment anything is painted at all. Self-contained — no CSS
+# variables, no web font, no script — because none of that has arrived yet.
+PREBOOT_CSS = """<style>
+html{background:#070b09}
+#preboot{position:fixed;inset:0;z-index:200;display:flex;flex-direction:column;align-items:center;
+  justify-content:center;gap:15px;background:#070b09;color:#3dffa0;text-align:center;padding:24px;
+  font:400 19px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:1px}
+#preboot .pbspin{width:40px;height:40px;border:3px solid #1f7a52;border-top-color:#3dffa0;
+  border-radius:50%;animation:pbspin 1s linear infinite}
+#preboot .pbsub{font-size:13px;color:#7e998a;letter-spacing:0;max-width:44ch}
+@keyframes pbspin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){#preboot .pbspin{animation:none}}
+</style>"""
+
+# The overlay itself, first thing in <body>. Needs no JavaScript to appear (it is plain markup
+# under the style above), so it is up even while the rest of the document is still in flight;
+# the app removes it once the chrome is on screen.
+PREBOOT_HTML = """<div id="preboot">
+  <span class="pbspin"></span>
+  <div>loading the aGiTrack dashboard…</div>
+  <div class="pbsub">this can take a moment over a remote or forwarded connection</div>
+</div>"""
+
+# Google Fonts is a CROSS-ORIGIN stylesheet, and a pending stylesheet blocks first paint: the
+# browser would show nothing at all until that request completed — seconds on a slow link, and
+# potentially a timeout on a host that can't reach fonts.googleapis.com. The media="print" trick
+# makes it non-blocking (it is not "for this medium", so it never delays paint) and the onload
+# flips it back to all, so the fonts still apply the instant they arrive. The design already
+# names local monospace fallbacks, so the brief swap is a non-issue; <noscript> keeps the fonts
+# for script-less browsers, where nothing is dynamic anyway.
+FONT_LINKS = """<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=VT323&family=IBM+Plex+Mono:ital,wght@0,400;0,500;0,600;1,400&display=swap" rel="stylesheet" media="print" onload="this.media='all'">
+<noscript><link href="https://fonts.googleapis.com/css2?family=VT323&family=IBM+Plex+Mono:ital,wght@0,400;0,500;0,600;1,400&display=swap" rel="stylesheet"></noscript>"""
+
+
+# ---------------------------------------------------------------------------
 # The page. Brace-heavy CSS/JS lives verbatim in the template (no f-strings);
 # only the __PLACEHOLDER__ tokens are substituted.
 # ---------------------------------------------------------------------------
@@ -622,11 +674,10 @@ _TEMPLATE = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>aGiTrack - Dashboard · __REPO_NAME__</title>
+__PREBOOT_CSS__
 <!-- Inline SVG favicon (the aGiTrack wordmark mark) — the server only serves /, /data, /log, /diff, so it can't host a file. -->
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2064%2064'%3E%3Crect%20width='64'%20height='64'%20rx='13'%20fill='%23070b09'/%3E%3Ctext%20x='32'%20y='45'%20text-anchor='middle'%20font-family='ui-monospace,monospace'%20font-weight='700'%20font-size='42'%20letter-spacing='-1'%3E%3Ctspan%20fill='%23ffb454'%3Ea%3C/tspan%3E%3Ctspan%20fill='%233dffa0'%3EG%3C/tspan%3E%3C/text%3E%3C/svg%3E">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=VT323&family=IBM+Plex+Mono:ital,wght@0,400;0,500;0,600;1,400&display=swap" rel="stylesheet">
+__FONT_LINKS__
 <style>
 :root{
   --ink:#070b09; --panel:#0c120e; --panel-2:#101813; --line:#1d2a21;
@@ -975,10 +1026,14 @@ h2.section::before{content:"# ";color:var(--amber)}
 .logsection-head{margin:38px 0 14px}
 .logsection-head h2.section{margin:0 0 12px}
 .logtabs{display:flex;gap:8px;justify-content:flex-start}
-.logtab{font-family:var(--mono);font-size:13px;background:transparent;border:1px solid var(--line);
-  color:var(--fg-dim);padding:5px 16px;cursor:pointer;letter-spacing:.5px}
-.logtab.active{color:var(--phosphor);border-color:var(--phosphor-dim);background:rgba(61,255,160,.06)}
-.logtab:hover{color:var(--fg)}
+/* BOTH tabs are amber (like the reset button), never grey: a dim grey unselected tab read as
+   "disabled" rather than "clickable". The selected one is told apart by a lit-up background,
+   not by being the only one with colour. */
+.logtab{font-family:var(--mono);font-size:13px;background:transparent;border:1px solid var(--amber);
+  color:var(--amber);padding:5px 16px;cursor:pointer;letter-spacing:.5px}
+.logtab.active{color:var(--ink);background:var(--amber);box-shadow:0 0 12px rgba(255,180,84,.35)}
+/* Hover on the unselected tab: a tint, so it never impersonates the filled selected state. */
+.logtab:not(.active):hover{background:rgba(255,180,84,.22)}
 .logpane[hidden]{display:none}
 .panehead{display:flex;justify-content:flex-end;align-items:center;margin:0 0 10px}
 
@@ -1032,6 +1087,7 @@ footer .flink:hover{text-decoration:underline}
 </style>
 </head>
 <body>
+__PREBOOT_HTML__
 <div id="neterror" class="neterror" hidden>⚠ Can't reach the aGiTrack dashboard server — it may have been stopped (Ctrl-C in the terminal). Showing the last loaded data; retrying…</div>
 __UPDATE_BANNER__
 <div class="wrap">
@@ -1163,6 +1219,10 @@ const INIT = JSON.parse(document.getElementById("agitrack-data").textContent);
 // or a small repo's first paint), the page renders fully right away.
 const HAVE_DATA = !!INIT.agg;
 if(!HAVE_DATA) document.body.classList.add("booting");  // show the loader at once
+// The document is here and the real chrome is styled, so drop the pre-boot overlay that
+// covered the transfer. Handoff, not a gap: in shell mode the .booting loader above is
+// already up behind it and keeps reporting progress while /data and /log are fetched.
+{ const pb = document.getElementById("preboot"); if(pb) pb.remove(); }
 const PAGE_SIZE = INIT.page_size || 50;
 let HEAD = INIT.head||"", AGG = INIT.agg||null, LOGPAGE = INIT.log||null, OPTIONS = INIT.options||null, GENERATED = INIT.generated_at||"";
 let TS = INIT.timeseries || {t:[]};  // per-period series for the activity-over-time plot

@@ -57,6 +57,24 @@ PORT_SCAN_SPAN = 32
 _ServerT = TypeVar("_ServerT", bound=http.server.HTTPServer)
 
 
+# Below this, compressing costs more than the bytes it saves on any link worth the name.
+_GZIP_MIN_BYTES = 1024
+
+
+def maybe_gzip(body: bytes, accept_encoding: str) -> tuple[bytes, str]:
+    """``(body, content_encoding)`` — gzipped when the client accepts it and it is worth doing.
+
+    The page and its JSON are highly compressible text (the ~90 KB shell shrinks about 5×), and
+    over a remote or SSH-forwarded connection that transfer time is exactly the blank-screen wait
+    the user sees before the dashboard appears. Level 6 is the usual size/CPU balance; the work
+    happens on a background daemon, not in the TUI."""
+    if len(body) < _GZIP_MIN_BYTES or "gzip" not in accept_encoding.lower():
+        return body, ""
+    import gzip
+
+    return gzip.compress(body, 6), "gzip"
+
+
 def _str(query: dict[str, list[str]], key: str) -> str:
     values = query.get(key)
     return values[0] if values else ""
@@ -259,8 +277,11 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
         return hit
 
     def _respond(self, content_type: str, body: bytes, *, cache_control: str = "no-store") -> None:
+        body, encoding = maybe_gzip(body, self.headers.get("Accept-Encoding", ""))
         self.send_response(200)
         self.send_header("Content-Type", content_type)
+        if encoding:
+            self.send_header("Content-Encoding", encoding)
         self.send_header("Content-Length", str(len(body)))
         # Data endpoints are always recomputed; never let the browser cache them. HTML
         # pages pass "no-cache" instead: still revalidated on a normal load, but eligible

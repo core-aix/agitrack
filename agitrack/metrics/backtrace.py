@@ -662,8 +662,15 @@ def _make_handler(view: BacktraceView) -> type[http.server.BaseHTTPRequestHandle
                 pass
 
         def _respond(self, content_type: str, body: bytes, *, cache_control: str = "no-store") -> None:
+            from agitrack.metrics.server import maybe_gzip
+
+            # Same compression as the live server: the backtrace page is the same ~90 KB of
+            # text, and it is usually being read over the connection that made it slow.
+            body, encoding = maybe_gzip(body, self.headers.get("Accept-Encoding", ""))
             self.send_response(200)
             self.send_header("Content-Type", content_type)
+            if encoding:
+                self.send_header("Content-Encoding", encoding)
             self.send_header("Content-Length", str(len(body)))
             # HTML pages use "no-cache" so the browser's back/forward cache can restore
             # them instantly (see the live server's _respond); data stays "no-store".
