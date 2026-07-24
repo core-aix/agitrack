@@ -135,6 +135,10 @@ header{padding:72px 0 40px;position:relative}
 @keyframes blink{50%{opacity:0}}
 .sub{margin-top:14px;color:var(--fg-dim);max-width:62ch}
 .sub strong{color:var(--fg);font-weight:600}
+/* The hook: two questions the visitor recognizes, then the answer. */
+.hook{margin-top:20px;font-size:clamp(15px,2.3vw,18.5px);color:var(--fg);max-width:60ch;line-height:1.65}
+.hook strong{color:var(--phosphor);font-weight:600}
+.hook .yes{color:var(--amber);font-weight:600}
 .hero-actions{margin-top:26px;display:flex;gap:14px;flex-wrap:wrap}
 .btn{
   display:inline-block;padding:10px 18px;border:1px solid var(--phosphor);
@@ -214,9 +218,12 @@ footer .sha{font-size:12px}
   <header>
     <div class="brand reveal r1"><span class="a">a</span>GiTrack</div>
     <p class="tagline reveal r2"><span class="tag">&lt;aGiTrack&gt;</span> every agent turn captured with its story, and humans learn<span class="cursor"></span></p>
-    <p class="sub reveal r3">Every agent turn becomes a <strong>git commit</strong>: prompt, reply, model, cost.
+    <p class="hook reveal r3">Wondering <strong>what prompt</strong> changed a line of code, weeks later?
+    Want to <strong>drive coding agents more efficiently</strong>?
+    <span class="yes">aGiTrack is what you need.</span></p>
+    <p class="sub reveal r4">Every agent turn becomes a <strong>git commit</strong>: prompt, reply, model, cost.
     It even <strong>teaches you back</strong>. All in your own repo, nothing tracked externally.</p>
-    <div class="hero-actions reveal r4">
+    <div class="hero-actions reveal r5">
       <a class="btn" href="dashboard/">try the dashboard demo</a>
       <a class="btn" href="dashboard/learn/">meet your coach</a>
       <a class="btn" href="#install">pip install agitrack</a>
