@@ -265,6 +265,8 @@ agitrack -d text            # one-shot plain-text report instead (pipe it, paste
 
 Re-running `agitrack -d` while a dashboard is already up **restarts** it — the old daemon is stopped and a fresh one started on the same port, so the URL is unchanged. That is the quick way to pick up a new build after an aGiTrack update without hunting down `-d stop` first.
 
+**On a remote machine.** When you run `agitrack -d` (or `--backtrace`) in an SSH session, `localhost` would only be reachable from the remote box — not from where your browser is. So aGiTrack listens on all interfaces instead and prints the remote's own address; open it directly if your firewall allows that port, and if it doesn't, the same message gives you the exact `ssh -L` command to copy-paste on your own machine plus the `http://localhost:…` URL it creates. Ports are handed out consecutively (8765, 8766, 8767, …), so a second dashboard or backtrace lands on a predictable neighbouring URL. Prefer to keep it off the network? `AGITRACK_DASHBOARD_HOST=127.0.0.1` pins it to loopback (the SSH-forwarding instructions are then the only route, and are printed as such); the variable also accepts a specific interface address.
+
 ![The aGiTrack dashboard](https://raw.githubusercontent.com/core-aix/agitrack/main/docs/images/dashboard-v6.png)
 
 - **aGiTrack-tracked AI vs non-tracked lines** — what the agents wrote (tracked by aGiTrack) versus everything else; it never claims a human wrote what the model did.
