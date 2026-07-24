@@ -722,6 +722,17 @@ def test_learn_html_contains_the_page(tmp_path):
     assert "—" not in html  # no em-dashes on a shipped page
 
 
+def test_flash_notices_are_a_fixed_toast(tmp_path):
+    # An unavailable-feature or error notice must be visible wherever the reader is on
+    # the page (deep in a lesson, mid-exercise), so #flash floats as a fixed toast
+    # instead of rendering at the top of the document. Click dismisses it.
+    repo = _init_repo(tmp_path)
+    html = learn.learn_html(repo.repo)
+    assert "#flash{position:fixed" in html
+    assert "f.onclick = clearFlash" in html
+    assert "click to dismiss" in html
+
+
 def test_dashboard_serves_learn_routes(tmp_path, monkeypatch, fixed_identity):
     # End-to-end over HTTP: the live dashboard server exposes the page, the state
     # endpoint, and the POST endpoints (here: a progress write for an unknown lesson,

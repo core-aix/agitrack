@@ -189,7 +189,7 @@ def main(argv: list[str] | None = None) -> int:
         "--dashboard",
         nargs="?",
         const="html",
-        choices=["text", "html", "stop", "status"],
+        choices=["text", "html", "stop", "status", "export"],
         default=None,
         help="show repository metrics computed from aGiTrack commit metadata "
         "(coverage, AI / human / non-tracked line changes, tokens, per-backend/"
@@ -197,7 +197,14 @@ def main(argv: list[str] | None = None) -> int:
         "it starts a filterable, auto-refreshing dashboard as a background daemon on localhost, "
         "opens it in the browser, and returns to the shell; the daemon stops when "
         "this terminal closes or via `-d stop`. `status` reports it; `text` prints a "
-        "one-shot report and exits",
+        "one-shot report and exits; `export` writes a server-free static demo copy of the "
+        "dashboard (see --export-dir) that any static web host can serve",
+    )
+    parser.add_argument(
+        "--export-dir",
+        default=None,
+        help="where `-d export` writes the static demo site (default: .agitrack/demo-site "
+        "inside the repo). The directory is replaced.",
     )
     parser.add_argument(
         "--backtrace",
@@ -613,6 +620,18 @@ def main(argv: list[str] | None = None) -> int:
             from agitrack.metrics import dashboard_daemon_status
 
             return dashboard_daemon_status(dashboard_repo)
+        if args.dashboard == "export":
+            from agitrack.metrics.export import export_static_demo
+
+            out_dir = (
+                Path(args.export_dir).expanduser()
+                if args.export_dir
+                else dashboard_repo.repo / ".agitrack" / "demo-site"
+            )
+            export_static_demo(dashboard_repo, out_dir)
+            print(f"Static demo dashboard written to {out_dir}")
+            print("Serve the directory with any static web host (or open index.html directly).")
+            return 0
         # Bare `-d` / `-d html`: start the live dashboard as a background daemon owned
         # by the launching shell, so the terminal is freed and the daemon dies when
         # that shell/terminal closes (#110).
