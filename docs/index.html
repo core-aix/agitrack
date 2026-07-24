@@ -232,10 +232,10 @@ footer .sha{font-size:12px}
     <strong>git commit</strong>: prompts, code changes, cost. It even <a href="#learn"><strong>teaches you
     back</strong></a> from your own sessions. <strong>Nothing tracked externally</strong>: everything is git history in your own repo.</p>
     <div class="hero-actions reveal r4">
+      <a class="btn" href="dashboard/">try the live demo</a>
       <a class="btn" href="#install">pip install agitrack</a>
       <a class="btn alt" href="docs.html">read the docs</a>
       <a class="btn alt" href="https://github.com/core-aix/agitrack">github.com/core-aix/agitrack</a>
-      <a class="btn alt" href="#dashboard">see the dashboard</a>
     </div>
   </header>
 
@@ -304,11 +304,15 @@ Added --version using the package metadata; prints and exits.
       </div>
       <h2>A live dashboard of what the agents did.</h2>
       <p><span class="p">agitrack -d</span> opens a live dashboard on <strong>localhost</strong>. Every number comes
-      from commit metadata alone: identical on every clone, no database, no server.</p>
+      from commit metadata alone: identical on every clone, no database, no server.
+      <a href="dashboard/"><strong>Explore the demo</strong></a>: this dashboard, on aGiTrack's own repo.</p>
       <div class="term">
         <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="title">agitrack -d · localhost</span></div>
-        <a href="images/dashboard-v6.png" target="_blank"><img class="shot" src="images/dashboard-v6.png" loading="lazy"
-          alt="The aGiTrack dashboard: coverage, tracked AI vs non-tracked lines, token totals, and per-backend / model / committer breakdowns, in a CRT terminal theme."></a>
+        <a href="dashboard/"><img class="shot" src="images/dashboard-v6.png" loading="lazy"
+          alt="The aGiTrack dashboard: coverage, tracked AI vs non-tracked lines, token totals, and per-backend / model / committer breakdowns, in a CRT terminal theme. Click for the interactive demo."></a>
+      </div>
+      <div class="hero-actions" style="margin-top:18px">
+        <a class="btn" href="dashboard/">explore the live demo</a>
       </div>
     </section>
 
@@ -335,11 +339,12 @@ Added --version using the package metadata; prints and exits.
       <h2>It teaches you back.</h2>
       <p>Tell the <strong>learn</strong> page how much time you have. Your own agent reads your traces, spots
       your gaps, and writes short lessons on driving agents and on your own codebase, each with a quick check
-      and an exercise it reviews.</p>
+      and an exercise it reviews. <a href="dashboard/learn/"><strong>See real lessons</strong></a> the coach
+      wrote for this repo's maintainer.</p>
       <div class="term">
         <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="title">agitrack -d · learn</span></div>
-        <a href="images/learn-page-v2.png" target="_blank"><img class="shot" src="images/learn-page-v2.png" loading="lazy"
-          alt="The learn page: a check-in card asking how much time you have and how you feel, the coach's assessment of the learner, and four suggested lessons, each with an evidence-based reason and an estimated size."></a>
+        <a href="dashboard/learn/"><img class="shot" src="images/learn-page-v2.png" loading="lazy"
+          alt="The learn page: a check-in card asking how much time you have and how you feel, the coach's assessment of the learner, and four suggested lessons, each with an evidence-based reason and an estimated size. Click for the interactive demo."></a>
       </div>
     </section>
 

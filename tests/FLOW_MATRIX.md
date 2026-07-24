@@ -242,6 +242,18 @@ directory that is not a git repo still gets the full page, with progress sync re
 | Backtrace mode: learn works without a git repo (repo=None; sync reported unavailable), shared POST dispatcher routes and 404s | `test_learn_works_without_a_git_repo`, `test_handle_learn_post_dispatches_and_404s` | real-git + plain-dir |
 | Backtrace server end-to-end: /data efficiency insights over reconstructed turns; /learn carries the frozen "based on backtracing" warning strip; state (no branches, sync unavailable); suggestions personalized from the reconstruction | `test_backtrace_server_serves_learn_with_banner_and_insights` | plain-dir + HTTP |
 | Re-running `--backtrace` restarts a running daemon on the same port (like `-d`); a cold start pins no port | `test_backtrace_start_restarts_a_running_daemon_on_the_same_port`, `test_backtrace_cold_start_does_not_request_a_port` | mock |
+| Backtrace log opens with an explainer of what its entries are (reconstructed turns, unhidden only under the BACKTRACE flag); log subject lines truncate at word ends, never mid-word | `test_backtrace_log_explains_what_the_entries_are`, `test_subject_truncation_cuts_at_word_ends` | real-git |
+
+## 12c. Static demo export (`agitrack -d export`, `tests/test_export.py`)
+A server-free copy of the dashboard + learn page for static hosts (powers the public demo at
+agitrack.core-aix.org/dashboard/, rebuilt by `.github/workflows/pages.yml` on each push to main).
+| Sequence | Test(s) | Kind |
+|---|---|---|
+| Export is complete: every /data granularity, every /log page for every sort, every commit's /diff, the whole file browser (filelog + per-change filediff) baked as files | `test_export_writes_a_complete_static_site` | real-git |
+| The fetch shim is installed before any page script runs | `test_export_shim_installs_before_the_page_script` | real-git |
+| Honest degradation: demo banner + install hint on both pages, filter controls disabled, agent-driven learn POSTs answered with the install hint | `test_export_writes_a_complete_static_site`, `test_export_disables_filters_and_cans_learn_actions` | real-git |
+| Learn profile fallback: the store's single non-empty profile ships when the exporting identity has none (how CI exports the checked-in fixture) | `test_export_learn_state_falls_back_to_the_single_store_profile` | real-git |
+| CLI: `-d export --export-dir` writes the site and reports the path | `test_cli_export_writes_the_site` | real-git |
 
 ## 13. Self-update
 | Sequence | Test(s) | Kind |
