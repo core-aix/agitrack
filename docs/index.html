@@ -227,24 +227,7 @@ footer .sha{font-size:12px}
 
   <main class="log">
 
-    <section class="commit agent reveal r5">
-      <div class="commit-head">
-        <span class="sha">f3a9c2e</span>
-        <span class="subject"><span class="tag">&lt;aGiTrack&gt;</span> show, don't tell</span>
-      </div>
-      <div class="term" id="demo">
-        <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="title">agitrack · claude · session-1 → main</span></div>
-        <div class="term-body"><pre><span class="d">$</span> <span class="p">agitrack</span>
-<span class="w">&gt; add a --version flag to the cli</span>
-<span class="d">  · editing agitrack/cli.py …</span>
-<span class="o">✓ Created &lt;aGiTrack&gt; commit 4b2f31a.</span>            <span class="d">aGiTrack · Ctrl-G</span>
-<span class="d">$</span> <span class="p">git log --oneline -1</span>
-<span class="o">4b2f31a</span> <span class="w">&lt;aGiTrack&gt; add a --version flag to the cli</span>  <span class="d">← trace + model + cost inside</span></pre>
-        </div>
-      </div>
-    </section>
-
-    <section class="commit" id="features">
+    <section class="commit reveal r5" id="features">
       <div class="commit-head">
         <span class="sha">f34tur3</span>
         <span class="subject">what you get</span>
@@ -252,7 +235,7 @@ footer .sha{font-size:12px}
       <div class="branches">
         <div class="branch" data-ref="git log">
           <h3>Turns become commits</h3>
-          <p>Prompt, reply, model, and token cost in every commit message.</p>
+          <p>The user-agent conversation, model, and token cost live in each commit message.</p>
         </div>
         <div class="branch" data-ref="agitrack -d">
           <h3>Live dashboard</h3>
