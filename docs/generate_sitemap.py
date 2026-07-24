@@ -34,7 +34,7 @@ EXCLUDED_MESSAGE_PATTERNS = (SITEMAP_MARKER, "^Release v")
 # (file under docs/, URL path, sitemap priority). Order defines sitemap order.
 PAGES: list[tuple[str, str, str]] = [
     ("index.html", "/", "1.0"),
-    ("about.html", "/about.html", "0.9"),
+    ("readmore.html", "/readmore.html", "0.9"),
     ("docs.html", "/docs.html", "0.8"),
 ]
 
