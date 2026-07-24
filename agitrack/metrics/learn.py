@@ -1655,6 +1655,13 @@ textarea{width:100%;min-height:74px;resize:vertical}
 .plist .pldel.armed{opacity:1;color:var(--bad);border:1px solid var(--bad)}
 .error{border:1px solid var(--bad);color:var(--bad);padding:10px 14px;font-size:13px;margin:10px 0;border-radius:6px}
 .notice{border:1px solid var(--warn);color:var(--warn);padding:10px 14px;font-size:13px;margin:10px 0;border-radius:6px}
+/* Flash notices float as a fixed toast so an unavailable-feature or error message is seen
+   from anywhere on the page, not only when scrolled to the top. Click dismisses. */
+#flash{position:fixed;left:50%;transform:translateX(-50%);bottom:18px;z-index:80;
+  width:min(680px,calc(100vw - 32px));pointer-events:none}
+#flash .notice,#flash .error{pointer-events:auto;cursor:pointer;background:var(--panel);
+  box-shadow:0 14px 44px rgba(0,0,0,.65);margin:6px 0}
+#flash .notice::after,#flash .error::after{content:" · click to dismiss";opacity:.6;font-size:11px}
 .engine{margin-top:26px;border:1px solid var(--line);background:var(--panel);border-radius:8px}
 .engine summary{cursor:pointer;padding:10px 16px;color:var(--fg-dim);font-size:12.5px;list-style:none}
 .engine summary::before{content:"\2699\FE0F  "}
@@ -1852,7 +1859,7 @@ async function post(path, body) {
   return r.json();
 }
 
-function flash(html) { $("flash").innerHTML = html; }
+function flash(html) { var f = $("flash"); f.innerHTML = html; f.onclick = clearFlash; }
 function clearFlash() { flash(""); }
 
 // ------- friendly waiting states (an agent call takes a little while) -------

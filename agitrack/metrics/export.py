@@ -125,7 +125,7 @@ def _learn_state(dash: Dashboard, repo: GitRepo) -> dict:
     }
 
 
-def _shim(*, base: str, files_index: dict[str, int], learn: bool) -> str:
+def _shim(*, base: str, files_index: dict[str, int], learn: bool, site_root: str) -> str:
     """The <script> block injected into an exported page: reroutes the page's relative
     fetches to the pre-rendered files and disables what has no static equivalent.
 
@@ -190,6 +190,25 @@ def _shim(*, base: str, files_index: dict[str, int], learn: bool) -> str:
       var el = document.getElementById(id);
       if (el) {{ el.disabled = true; el.title = "Filters are off in this static demo. " + NOTE; }}
     }});
+    // The learn page's "back to dashboard" link is written for the live server, where
+    // the page lives at /learn and "./" is the dashboard. In the demo the page is a
+    // directory (/dashboard/learn/), so point the link one level up explicitly.
+    if (LEARN) {{
+      var back = document.getElementById("backlink");
+      if (back) back.href = "../";
+    }}
+    // On the demo site the big aGiTrack logo always leads back to the main webpage.
+    var brand = document.querySelector(".brand");
+    if (brand) {{
+      document.head.insertAdjacentHTML("beforeend",
+        "<style>a.homelink,a.homelink:hover{{border-bottom:none;background:none;color:inherit}}</style>");
+      var home = document.createElement("a");
+      home.className = "homelink";
+      home.href = {json.dumps(site_root)};
+      home.title = "aGiTrack home";
+      brand.parentNode.insertBefore(home, brand);
+      home.appendChild(brand);
+    }}
   }});
 }})();
 </script>"""
@@ -253,12 +272,14 @@ def export_static_demo(repo: GitRepo, out_dir: Path) -> Path:
         dash, shared_sessions=shared, banner_html=_banner_html(generated, "backtracebanner"), insights=insights
     )
     (out_dir / "index.html").write_text(
-        _inject_shim(page, _shim(base="demo/", files_index=files_index, learn=False)), encoding="utf-8"
+        _inject_shim(page, _shim(base="demo/", files_index=files_index, learn=False, site_root="../")),
+        encoding="utf-8",
     )
     learn_html = learn_page.learn_html(repo.repo, banner_html=_banner_html(generated, "btbanner"))
     learn_dir = out_dir / "learn"
     learn_dir.mkdir()
     (learn_dir / "index.html").write_text(
-        _inject_shim(learn_html, _shim(base="../demo/", files_index={}, learn=True)), encoding="utf-8"
+        _inject_shim(learn_html, _shim(base="../demo/", files_index={}, learn=True, site_root="../../")),
+        encoding="utf-8",
     )
     return out_dir
