@@ -515,8 +515,9 @@ def main(argv: list[str] | None = None) -> int:
         return run_backtrace_daemon(
             Path(args.repo).expanduser().resolve(),
             owner_pid=args.dashboard_owner_pid,
-            # A restart passes the previous port so the URL survives (see start_backtrace_daemon).
-            port=args.dashboard_port if args.dashboard_port is not None else 8765,
+            # A restart passes the previous port so the URL survives (see start_backtrace_daemon);
+            # None means "start from the default and scan upward for the first free one".
+            port=args.dashboard_port,
         )
 
     if args.backtrace:
