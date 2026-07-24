@@ -728,14 +728,9 @@ def _read_handshake(directory: Path) -> dict | None:
 
 
 def _write_handshake(directory: Path, record: dict) -> None:
-    path = _handshake_path(directory)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    with tmp.open("w", encoding="utf-8") as handle:
-        json.dump(record, handle)
-    import os
+    from agitrack.fileio import atomic_write_text
 
-    os.replace(tmp, path)
+    atomic_write_text(_handshake_path(directory), json.dumps(record))
 
 
 def _clear_handshake(directory: Path) -> None:
@@ -751,15 +746,15 @@ def _progress_path(directory: Path) -> Path:
 
 def _write_progress(directory: Path, done: int, total: int, phase: str) -> None:
     """The building child records its progress here; the launching parent polls it to draw a bar."""
-    import os
     import time
 
     try:
-        path = _progress_path(directory)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(json.dumps({"done": done, "total": total, "phase": phase, "t": int(time.time())}))
-        os.replace(tmp, path)
+        from agitrack.fileio import atomic_write_text
+
+        atomic_write_text(
+            _progress_path(directory),
+            json.dumps({"done": done, "total": total, "phase": phase, "t": int(time.time())}),
+        )
     except OSError:
         pass
 
@@ -804,14 +799,11 @@ def _load_cache(directory: Path) -> dict:
 
 
 def _save_cache(directory: Path, cache: dict) -> None:
-    import os
 
     try:
-        path = _cache_path(directory)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(json.dumps(cache), encoding="utf-8")
-        os.replace(tmp, path)
+        from agitrack.fileio import atomic_write_text
+
+        atomic_write_text(_cache_path(directory), json.dumps(cache))
     except OSError:
         pass
 

@@ -62,10 +62,12 @@ _DEMO_NOTE = (
 )
 
 
-def _banner_html(generated: str, css_class: str) -> str:
+def _banner_html(generated: str, css_class: str, site_root: str) -> str:
     """The frozen top strip both exported pages carry. ``css_class`` is the page's own
     sticky-banner class (the dashboard styles ``backtracebanner``, the learn page
-    ``btbanner``), so the demo notice inherits the exact banner treatment of its page."""
+    ``btbanner``), so the demo notice inherits the exact banner treatment of its page.
+    ``site_root`` is the relative path back to the main webpage, whose install section
+    the banner links to."""
     text = (
         "STATIC DEMO: the real aGiTrack dashboard, generated from the aGiTrack repository's "
         f"own git history ({generated}). Filters and the live coach are off in this snapshot. "
@@ -73,8 +75,7 @@ def _banner_html(generated: str, css_class: str) -> str:
     return (
         f'<div class="{css_class}">🧪 '
         + _esc(text)
-        + f"Get it for your repo: <code>{_esc(INSTALL_HINT)}</code> · "
-        + f'<a href="{_REPO_URL}">github.com/core-aix/agitrack</a></div>'
+        + f'<a href="{site_root}#install">Get it for your own repo &rarr;</a></div>'
     )
 
 
@@ -269,13 +270,16 @@ def export_static_demo(repo: GitRepo, out_dir: Path) -> Path:
     _write_json(demo / "state.json", _learn_state(dash, repo))
 
     page = format_html(
-        dash, shared_sessions=shared, banner_html=_banner_html(generated, "backtracebanner"), insights=insights
+        dash,
+        shared_sessions=shared,
+        banner_html=_banner_html(generated, "backtracebanner", "../"),
+        insights=insights,
     )
     (out_dir / "index.html").write_text(
         _inject_shim(page, _shim(base="demo/", files_index=files_index, learn=False, site_root="../")),
         encoding="utf-8",
     )
-    learn_html = learn_page.learn_html(repo.repo, banner_html=_banner_html(generated, "btbanner"))
+    learn_html = learn_page.learn_html(repo.repo, banner_html=_banner_html(generated, "btbanner", "../../"))
     learn_dir = out_dir / "learn"
     learn_dir.mkdir()
     (learn_dir / "index.html").write_text(

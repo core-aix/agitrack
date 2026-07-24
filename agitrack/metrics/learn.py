@@ -34,7 +34,6 @@ coding conversation) and work identically on Claude and OpenCode.
 from __future__ import annotations
 
 import json
-import os
 import re
 import threading
 import time
@@ -267,11 +266,9 @@ class LearnStore:
             AgitrackState(self.root).ensure_local_ignore()
         except Exception:
             pass
-        tmp = self.path.with_name(self.path.name + ".tmp")
-        with tmp.open("w", encoding="utf-8") as handle:
-            json.dump(data, handle, indent=2, sort_keys=True)
-            handle.write("\n")
-        os.replace(tmp, self.path)
+        from agitrack.fileio import atomic_write_text
+
+        atomic_write_text(self.path, json.dumps(data, indent=2, sort_keys=True) + "\n")
 
     @staticmethod
     def profile(data: dict[str, Any], gid: str) -> dict[str, Any]:

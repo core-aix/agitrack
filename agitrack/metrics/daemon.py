@@ -85,12 +85,10 @@ def clear_handshake(repo: GitRepo) -> None:
 
 
 def _write_handshake(repo: GitRepo, record: dict[str, Any]) -> None:
-    path = handshake_path(repo)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    with tmp.open("w", encoding="utf-8") as handle:
-        json.dump(record, handle)
-    os.replace(tmp, path)  # atomic: the launcher never sees a half-written record
+    from agitrack.fileio import atomic_write_text
+
+    # Atomic: the launcher never sees a half-written record.
+    atomic_write_text(handshake_path(repo), json.dumps(record))
 
 
 def running_handshake(repo: GitRepo) -> dict[str, Any] | None:

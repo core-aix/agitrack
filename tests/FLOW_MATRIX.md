@@ -38,6 +38,7 @@ Conventions:
 | Dirty worktree → reconcile transcript, then user-commit | `test_pre_agent_commit_*` (test_proxy), `test_turn_copy_offer_defers_user_commit_prompt` | mock |
 | Base-repo user edits committed + merged before the agent | `test_base_user_edit_declined_then_restaged_is_not_stranded`, `test_base_user_untracked_file_counts_as_pending` | real-git |
 | Submit while agent active → prompt held as follow-up | `test_await_followup_appends_normalized`, `test_await_followup_skips_empty/slash_commands` | mock |
+| State/marker/handshake saves survive CONCURRENT aGiTrack processes on one repo (unique tmp per write; the old fixed `<file>.tmp` crashed the interactive session mid-prompt when an export/daemon saved simultaneously) | `test_fileio.py::test_concurrent_writers_do_not_crash_or_corrupt`, `_creates_parents_and_replaces` | subprocess |
 
 ## 3. Agent turn lifecycle (commit + attribution)
 | Sequence | Test(s) | Kind |
