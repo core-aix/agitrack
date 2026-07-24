@@ -124,6 +124,20 @@ def test_backtrace_log_explains_what_the_entries_are(tmp_path):
     assert html.index("if(!BACKTRACE) return;") < unhide  # backtrace-only, hidden on the live page
 
 
+def test_dashboard_is_usable_at_phone_width(tmp_path):
+    # The filter bar was a never-wrap sticky row whose five selects forced a ~1040px
+    # document, so on a phone the WHOLE page scrolled sideways. It must wrap when the
+    # window is narrow, drop stickiness on phones (a wrapped sticky bar covers half the
+    # screen), and the demo banner's <code> chip must render the same on every page.
+    from agitrack.metrics.web import shell_html
+
+    html = shell_html(_seeded(tmp_path))
+    assert "flex-wrap:wrap" in html.split(".controls{", 1)[1].split("}", 1)[0]
+    assert "@media (max-width:760px)" in html
+    assert ".controls{position:static" in html
+    assert ".backtracebanner code{color:var(--fg)" in html
+
+
 def test_subject_truncation_cuts_at_word_ends(tmp_path):
     # A long subject must not be chopped mid-word: the cut backs up to the last space inside
     # the cap (hard cut only when a single word fills more than half the line), then "…".
@@ -1041,10 +1055,12 @@ def test_web_dashboard_embeds_token_hierarchy_and_cache_note(tmp_path):
     assert "#tokens .row + .hint{border-top:1px solid var(--line)" in html
 
 
-def test_filter_bar_is_single_row_with_a_custom_range_popup(tmp_path):
+def test_filter_bar_wraps_with_a_custom_range_popup(tmp_path):
     html = render_html(_demo_repo(tmp_path))
-    # The sticky filter bar stays a single row (never wraps) when frozen.
-    assert "flex-wrap:nowrap" in html
+    # One row on a wide window, but the bar WRAPS on narrower ones instead of forcing a
+    # horizontal page scroll (the old never-wrap row made phones scroll the whole page
+    # sideways; see test_dashboard_is_usable_at_phone_width).
+    assert "flex-wrap:nowrap" not in html
     # The redundant "scope" readout (it just echoed the committer filter) is gone.
     assert 'id="scope"' not in html
     # from/to are no longer standalone fields — they live in a custom-range popup
