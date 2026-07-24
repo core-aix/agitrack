@@ -28,11 +28,12 @@ def marker_path(repo_root: Path) -> Path:
 def write_update_marker(repo_root: Path, *, current: str, latest: str, message: str) -> None:
     """Record that ``latest`` is available (best-effort; never raises)."""
     try:
-        path = marker_path(repo_root)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(json.dumps({"current": current, "latest": latest, "message": message}), encoding="utf-8")
-        tmp.replace(path)  # atomic: a reader never sees a half-written record
+        from agitrack.fileio import atomic_write_text
+
+        # Atomic: a reader never sees a half-written record.
+        atomic_write_text(
+            marker_path(repo_root), json.dumps({"current": current, "latest": latest, "message": message})
+        )
     except OSError:
         pass
 

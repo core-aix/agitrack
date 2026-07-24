@@ -96,10 +96,9 @@ def register(kind: str, repo: str | os.PathLike[str], *, url: str = "", cmd: lis
             "cmd": cmd or _daemon_command(),
             "started": int(time.time()),
         }
-        path = _entry_path(os.getpid())
-        tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(json.dumps(record), encoding="utf-8")
-        os.replace(tmp, path)
+        from agitrack.fileio import atomic_write_text
+
+        atomic_write_text(_entry_path(os.getpid()), json.dumps(record))
     except OSError:
         pass
 
