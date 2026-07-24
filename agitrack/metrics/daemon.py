@@ -36,11 +36,13 @@ from typing import Any
 
 from agitrack.git import GitRepo
 from agitrack.metrics.server import (
-    DEFAULT_HOST,
     DEFAULT_PORT,
     build_server,
+    dashboard_url,
+    default_bind_host,
+    exposure_note,
     open_dashboard_in_browser,
-    remote_browser_hint,
+    remote_access_help,
 )
 from agitrack.proc import detach_kwargs, pid_alive, terminate_pid
 
@@ -219,7 +221,8 @@ def start_dashboard_daemon(
     url = str(record.get("url", ""))
     print(
         f"aGiTrack dashboard daemon live at {url} (pid {record.get('pid')}).\n"
-        "Runs in the background; stops when this terminal closes or `agitrack -d stop`."
+        + exposure_note(str(record.get("host", "")))
+        + "Runs in the background; stops when this terminal closes or `agitrack -d stop`."
     )
     _maybe_open(url, record, open_browser)
     return 0
@@ -264,14 +267,20 @@ def _maybe_open(url: str, record: dict[str, Any], open_browser: bool) -> None:
         return
     if not open_dashboard_in_browser(url):
         port = record.get("port", DEFAULT_PORT)
-        print(remote_browser_hint(url, int(port) if isinstance(port, int) else DEFAULT_PORT))
+        print(
+            remote_access_help(
+                url,
+                int(port) if isinstance(port, int) else DEFAULT_PORT,
+                bind_host=str(record.get("host", "")),
+            )
+        )
 
 
 def run_dashboard_daemon(
     repo: GitRepo,
     *,
     owner_pid: int | None = None,
-    host: str = DEFAULT_HOST,
+    host: str | None = None,
     port: int = DEFAULT_PORT,
     email_logins: dict[str, str] | None = None,
 ) -> int:
@@ -281,12 +290,15 @@ def run_dashboard_daemon(
     Shuts down on SIGTERM/SIGINT (an explicit stop) or when the owner-pid watchdog
     sees the launcher disappear.
     """
-    server = build_server(repo, host=host, port=port, email_logins=email_logins)
-    bound_port = server.server_address[1]
-    url = f"http://{host}:{bound_port}/"
+    bind_host = default_bind_host() if host is None else host
+    server = build_server(repo, host=bind_host, port=port, email_logins=email_logins)
+    bound_port = int(server.server_address[1])
+    # The handshake carries the URL the *launcher* prints, so it must be the reachable
+    # one, not the wildcard bind address (see dashboard_url).
+    url = dashboard_url(bind_host, bound_port)
     _write_handshake(
         repo,
-        {"pid": os.getpid(), "host": host, "port": bound_port, "url": url, "started": int(time.time())},
+        {"pid": os.getpid(), "host": bind_host, "port": bound_port, "url": url, "started": int(time.time())},
     )
     from agitrack import daemons
 

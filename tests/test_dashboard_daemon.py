@@ -15,6 +15,19 @@ def _repo(tmp_path):
     return types.SimpleNamespace(repo=tmp_path)
 
 
+def _local_session(monkeypatch):
+    """Make the bind host deterministic: no SSH vars and no override, so the daemon treats
+    this as a local shell and binds loopback (the suite itself may well be running over SSH)."""
+    for var in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY", "AGITRACK_DASHBOARD_HOST"):
+        monkeypatch.delenv(var, raising=False)
+
+
+def _remote_session(monkeypatch, server_ip="10.1.2.3"):
+    """Make the process look like a shell on a remote host the user SSH'd into at ``server_ip``."""
+    monkeypatch.delenv("AGITRACK_DASHBOARD_HOST", raising=False)
+    monkeypatch.setenv("SSH_CONNECTION", f"192.168.0.9 51000 {server_ip} 22")
+
+
 @pytest.mark.skipif(
     sys.platform == "win32", reason="Windows keeps process handles open after wait(); PID appears alive"
 )
@@ -233,6 +246,7 @@ def test_run_dashboard_daemon_shuts_down_when_owner_dies(tmp_path, monkeypatch):
 
 def test_run_dashboard_daemon_publishes_handshake_then_serves(tmp_path, monkeypatch):
     repo = _repo(tmp_path)
+    _local_session(monkeypatch)  # a non-remote shell → loopback bind, so the URL is deterministic
     seen: dict[str, object] = {}
 
     class _CapturingServer(_FakeServer):
@@ -256,3 +270,63 @@ def test_run_dashboard_daemon_publishes_handshake_then_serves(tmp_path, monkeypa
     assert record is not None
     assert record["url"] == "http://127.0.0.1:12345/"
     assert record["port"] == 12345
+
+
+def test_run_dashboard_daemon_binds_all_interfaces_and_advertises_remote_ip(tmp_path, monkeypatch):
+    # In a remote shell, loopback would only be reachable from the remote box itself — where the
+    # user's browser isn't. Bind every interface and advertise the address their SSH client already
+    # reached us on, so the printed URL is one they can actually open.
+    repo = _repo(tmp_path)
+    _remote_session(monkeypatch, server_ip="10.1.2.3")
+    seen: dict[str, object] = {}
+
+    class _CapturingServer(_FakeServer):
+        def serve_forever(self):
+            seen["handshake"] = daemon.read_handshake(repo)
+            super().serve_forever()
+
+    capturing = _CapturingServer()
+
+    def _build(repo_arg, **kwargs):
+        seen["kw"] = kwargs
+        return capturing
+
+    monkeypatch.setattr(daemon, "build_server", _build)
+    monkeypatch.setattr(daemon.signal, "signal", lambda *a, **k: None)
+    monkeypatch.setattr(daemon, "_OWNER_POLL_SECONDS", 0.02)
+    monkeypatch.setattr(daemon, "pid_alive", lambda pid: False)
+
+    thread = threading.Thread(target=lambda: daemon.run_dashboard_daemon(repo, owner_pid=999999))
+    thread.start()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert seen["kw"]["host"] == "0.0.0.0"  # listening everywhere...
+    record = seen["handshake"]
+    assert record is not None
+    assert record["host"] == "0.0.0.0"
+    assert record["url"] == "http://10.1.2.3:12345/"  # ...but advertised as a reachable address
+
+
+def test_run_dashboard_daemon_host_env_overrides_remote_bind(tmp_path, monkeypatch):
+    # The escape hatch: a user who does not want the dashboard on the network keeps it on
+    # loopback even over SSH (and then reaches it via the printed `ssh -L` command).
+    repo = _repo(tmp_path)
+    _remote_session(monkeypatch)
+    monkeypatch.setenv("AGITRACK_DASHBOARD_HOST", "127.0.0.1")
+    seen: dict[str, object] = {}
+
+    def _build(repo_arg, **kwargs):
+        seen["kw"] = kwargs
+        return _FakeServer()
+
+    monkeypatch.setattr(daemon, "build_server", _build)
+    monkeypatch.setattr(daemon.signal, "signal", lambda *a, **k: None)
+    monkeypatch.setattr(daemon, "_OWNER_POLL_SECONDS", 0.02)
+    monkeypatch.setattr(daemon, "pid_alive", lambda pid: False)
+
+    thread = threading.Thread(target=lambda: daemon.run_dashboard_daemon(repo, owner_pid=999999))
+    thread.start()
+    thread.join(timeout=5)
+
+    assert seen["kw"]["host"] == "127.0.0.1"

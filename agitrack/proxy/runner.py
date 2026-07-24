@@ -968,6 +968,9 @@ class ProxyRunner:
         # watchdog). None until first started.
         self._dashboard_proc: "subprocess.Popen[bytes] | None" = None
         self._dashboard_url: str | None = None
+        # The port the dashboard child actually bound, so the remote-access hint can name it
+        # in a copy-pasteable `ssh -L` command even when we're only reusing a running daemon.
+        self._dashboard_port: int = 0
         # Set once the interactive exit flow has committed to quitting (worktree
         # removed). The reactor loop checks this after running a menu command so an
         # "exit"/"quit" command breaks the loop instead of falling through to the
@@ -1269,6 +1272,7 @@ class ProxyRunner:
                 "_switch_offer_parse_started": False,
                 "_dashboard_proc": None,
                 "_dashboard_url": None,
+                "_dashboard_port": 0,
                 "_exit_requested": False,
                 # Self-update fields (production sets these in __init__).
                 "_updater": None,
@@ -9117,7 +9121,7 @@ class ProxyRunner:
             self._set_message(
                 f"Dashboard already running at {url}."
                 if opened
-                else f"Dashboard running. {remote_browser_hint(url, 0)}"
+                else f"Dashboard running. {remote_browser_hint(url, self._dashboard_port)}"
             )
             self._render()
             return
@@ -9131,6 +9135,7 @@ class ProxyRunner:
             url = str(running.get("url", ""))
             self._dashboard_url = url
             port = running.get("port", 0)
+            self._dashboard_port = int(port) if isinstance(port, int) else 0
             opened = open_dashboard_in_browser(url)
             self._set_message(
                 f"Dashboard already running at {url} — opening in your browser."
@@ -9157,6 +9162,7 @@ class ProxyRunner:
             port = int(record.get("port", 0))
             self._dashboard_proc = proc
             self._dashboard_url = url
+            self._dashboard_port = port
             # Only open a browser when it would land on THIS machine; on a remote/SSH/
             # Mosh host, tell the user how to reach the forwarded URL from their own
             # machine instead of opening a (headless) browser on the remote.
@@ -9193,6 +9199,7 @@ class ProxyRunner:
             return
         self._dashboard_proc = None
         self._dashboard_url = None
+        self._dashboard_port = 0
         try:
             if proc.poll() is None:
                 proc.terminate()

@@ -104,6 +104,75 @@ def test_dashboard_links_to_website_and_github(tmp_path):
     assert 'href="https://github.com/core-aix/agitrack"' in html
 
 
+def _seeded(tmp_path):
+    repo = GitRepo.init(tmp_path)
+    repo._run(["git", "commit", "--allow-empty", "-m", "seed"])
+    return repo
+
+
+def test_page_shows_a_loading_screen_before_the_whole_document_arrives(tmp_path):
+    # The dashboard used to be a blank WHITE page until the last of ~90 KB had landed and its
+    # script had run — worst over a remote/forwarded connection, where it just looked broken.
+    # A pre-boot overlay must be paintable from the markup alone: no script, no web font, no
+    # dependence on the main stylesheet, and early enough in the document to arrive first.
+    from agitrack.metrics.web import shell_html
+
+    html = shell_html(_seeded(tmp_path))
+    assert "__PREBOOT_CSS__" not in html and "__PREBOOT_HTML__" not in html  # tokens substituted
+    css_at, overlay_at = html.index("#preboot{"), html.index('id="preboot"')
+    assert css_at < html.index("<style>\n:root")  # styled before the ~28 KB main stylesheet
+    assert overlay_at < html.index('id="neterror"')  # and first thing in the body
+    # Visible without running anything: the message is plain text under a plain stylesheet.
+    assert "loading the aGiTrack dashboard" in html
+    assert "remote or forwarded connection" in html
+    # Removed once the real chrome is up, so it can't linger over the loaded page.
+    assert 'document.getElementById("preboot")' in html and "pb.remove()" in html
+
+
+def test_web_fonts_never_block_the_first_paint(tmp_path):
+    # A cross-origin <link rel=stylesheet> holds up rendering until it responds — seconds on a
+    # slow link, and a hang on a host that can't reach fonts.googleapis.com at all. media="print"
+    # takes it off the critical path; the onload puts the fonts back the moment they arrive.
+    from agitrack.metrics.web import shell_html
+
+    html = shell_html(_seeded(tmp_path))
+    blocking = [
+        line
+        for line in html.splitlines()
+        if "fonts.googleapis.com/css2" in line and 'media="print"' not in line and "<noscript>" not in line
+    ]
+    assert blocking == []  # no render-blocking font stylesheet left
+    assert "this.media='all'" in html  # ...and the fonts still apply once fetched
+    assert '<noscript><link href="https://fonts.googleapis.com' in html  # script-less fallback
+
+
+def test_learn_page_gets_the_same_loading_screen(tmp_path):
+    from agitrack.metrics.learn import learn_html
+
+    html = learn_html(tmp_path)
+    assert "__PREBOOT_CSS__" not in html and "__FONT_LINKS__" not in html
+    assert "loading the learn page" in html  # worded for the page it is on
+    assert 'media="print"' in html
+    assert "pb.remove()" in html
+
+
+def test_log_tabs_are_amber_in_both_states_with_the_selected_one_filled(tmp_path):
+    # The unselected commits/files tab used to be dim grey, which reads as DISABLED rather than
+    # clickable. Both tabs now carry the same amber as the reset button, and the selected one is
+    # distinguished by a lit-up background — never by being the only coloured one.
+    from agitrack.metrics.web import shell_html
+
+    repo = GitRepo.init(tmp_path)
+    repo._run(["git", "commit", "--allow-empty", "-m", "seed"])
+    css = shell_html(repo)
+    base = next(line for line in css.splitlines() if line.startswith(".logtab{"))
+    active = next(line for line in css.splitlines() if line.startswith(".logtab.active{"))
+    assert "var(--amber)" in base and "var(--fg-dim)" not in base  # unselected: amber, not grey
+    assert "background:transparent" in base  # ...and unfilled, so the selected one stands out
+    assert "background:var(--amber)" in active  # selected: the lit-up background
+    assert "color:var(--ink)" in active  # dark text on it, so the label stays legible
+
+
 def test_agitrack_integration_merge_is_classified_as_ops_not_untracked(tmp_path):
     repo = GitRepo.init(tmp_path)
     # aGiTrack's own auto-merge bringing base into a session turn branch.
@@ -1420,6 +1489,56 @@ def test_dashboard_server_404s_unknown_paths(tmp_path):
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def test_server_gzips_for_clients_that_accept_it(tmp_path):
+    # The page and its JSON are several tens of KB of highly compressible text, and that
+    # transfer IS the blank-screen wait when the dashboard is read over a remote or
+    # SSH-forwarded connection. Compress it — and hand back byte-identical content.
+    import gzip as gziplib
+
+    repo = _demo_repo(tmp_path)
+    server, thread, base = _serve(repo)
+    try:
+        request = urllib.request.Request(base + "/", headers={"Accept-Encoding": "gzip"})
+        with urllib.request.urlopen(request, timeout=5) as response:
+            assert response.headers.get("Content-Encoding") == "gzip"
+            compressed = response.read()
+        plain = _get(base + "/").encode("utf-8")
+        assert gziplib.decompress(compressed) == plain  # same page, fewer bytes
+        assert len(compressed) < len(plain) / 2
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_server_sends_plain_bytes_to_clients_that_do_not_accept_gzip(tmp_path):
+    # curl, a script, an old browser: no Accept-Encoding: gzip means an uncompressed body,
+    # never a gzip stream the client can't read.
+    repo = _demo_repo(tmp_path)
+    server, thread, base = _serve(repo)
+    try:
+        request = urllib.request.Request(base + "/", headers={"Accept-Encoding": "identity"})
+        with urllib.request.urlopen(request, timeout=5) as response:
+            assert response.headers.get("Content-Encoding") is None
+            body = response.read()
+        assert body.startswith(b"<!DOCTYPE html>")
+        assert int(response.headers["Content-Length"]) == len(body)  # length matches what was sent
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_tiny_responses_are_not_compressed(tmp_path):
+    # Below ~1 KB the gzip header costs more than it saves; don't burn CPU per poll.
+    from agitrack.metrics.server import maybe_gzip
+
+    assert maybe_gzip(b"{}", "gzip") == (b"{}", "")
+    big = b'{"x":"' + b"a" * 4000 + b'"}'
+    body, encoding = maybe_gzip(big, "gzip, deflate, br")
+    assert encoding == "gzip" and len(body) < len(big)
 
 
 def test_dashboard_server_is_threaded_and_swallows_client_disconnects(tmp_path, capsys):

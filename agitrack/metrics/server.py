@@ -1,10 +1,17 @@
-"""Localhost server for the live aGiTrack dashboard (#54).
+"""HTTP server for the live aGiTrack dashboard (#54).
 
-`agitrack --dashboard` serves the HTML dashboard on localhost and opens it in the
-browser. The page polls ``/data`` on an interval and re-renders, so the
-dashboard reflects new commits as they land — useful for watching an agent
-work. Everything is recomputed from ``git log`` on each request: read-only, no
-state, identical on every clone.
+`agitrack --dashboard` serves the HTML dashboard and opens it in the browser.
+The page polls ``/data`` on an interval and re-renders, so the dashboard
+reflects new commits as they land — useful for watching an agent work.
+Everything is recomputed from ``git log`` on each request: read-only, no state,
+identical on every clone.
+
+Where it binds depends on where aGiTrack is running. On your own machine it
+stays on loopback; in a **remote shell** (SSH/Mosh) loopback would be reachable
+only from the remote box itself, so it binds all interfaces instead and
+advertises the remote's own IP — open it directly if the firewall allows, or
+copy-paste the printed `ssh -L` command if it doesn't. Set
+``AGITRACK_DASHBOARD_HOST`` to pin a bind address (``127.0.0.1`` opts back out).
 """
 
 from __future__ import annotations
@@ -12,10 +19,11 @@ from __future__ import annotations
 import http.server
 import json
 import os
+import socket
 import sys
 import urllib.parse
 import webbrowser
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 from agitrack.git import GitRepo
 from agitrack.metrics import learn as learn_page
@@ -33,7 +41,38 @@ from agitrack.metrics.web import (
 )
 
 DEFAULT_HOST = "127.0.0.1"
+# Bind address used when aGiTrack runs in a remote shell: loopback there is reachable
+# only from the remote box, which is never where the user's browser is.
+ALL_INTERFACES = "0.0.0.0"
+# Overrides the automatic choice, e.g. AGITRACK_DASHBOARD_HOST=127.0.0.1 to keep the
+# dashboard off the network even over SSH, or a single NIC address to narrow it.
+BIND_HOST_ENV = "AGITRACK_DASHBOARD_HOST"
+
 DEFAULT_PORT = 8765
+# Ports are handed out CONSECUTIVELY from the preferred one (8765, 8766, 8767, …) rather
+# than falling straight to an OS-assigned ephemeral port: with several dashboards/backtraces
+# up at once the URLs stay predictable and adjacent, so one `ssh -L` block covers them.
+PORT_SCAN_SPAN = 32
+
+_ServerT = TypeVar("_ServerT", bound=http.server.HTTPServer)
+
+
+# Below this, compressing costs more than the bytes it saves on any link worth the name.
+_GZIP_MIN_BYTES = 1024
+
+
+def maybe_gzip(body: bytes, accept_encoding: str) -> tuple[bytes, str]:
+    """``(body, content_encoding)`` — gzipped when the client accepts it and it is worth doing.
+
+    The page and its JSON are highly compressible text (the ~90 KB shell shrinks about 5×), and
+    over a remote or SSH-forwarded connection that transfer time is exactly the blank-screen wait
+    the user sees before the dashboard appears. Level 6 is the usual size/CPU balance; the work
+    happens on a background daemon, not in the TUI."""
+    if len(body) < _GZIP_MIN_BYTES or "gzip" not in accept_encoding.lower():
+        return body, ""
+    import gzip
+
+    return gzip.compress(body, 6), "gzip"
 
 
 def _str(query: dict[str, list[str]], key: str) -> str:
@@ -238,8 +277,11 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
         return hit
 
     def _respond(self, content_type: str, body: bytes, *, cache_control: str = "no-store") -> None:
+        body, encoding = maybe_gzip(body, self.headers.get("Accept-Encoding", ""))
         self.send_response(200)
         self.send_header("Content-Type", content_type)
+        if encoding:
+            self.send_header("Content-Encoding", encoding)
         self.send_header("Content-Length", str(len(body)))
         # Data endpoints are always recomputed; never let the browser cache them. HTML
         # pages pass "no-cache" instead: still revalidated on a normal load, but eligible
@@ -265,15 +307,104 @@ class _DashboardServer(http.server.ThreadingHTTPServer):
             super().handle_error(request, client_address)
 
 
+def is_remote_session() -> bool:
+    """Whether aGiTrack is running in a shell on a *remote* machine (SSH/Mosh).
+
+    Only the SSH environment is trusted here: it is set by sshd itself for the login
+    session and inherited by everything started from it, so it means "the terminal the
+    user typed into lives elsewhere". A headless local box is deliberately NOT treated
+    as remote — that would put the dashboard on the network for someone sitting at a
+    console, which they never asked for."""
+    return bool(os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_CLIENT") or os.environ.get("SSH_TTY"))
+
+
+def default_bind_host() -> str:
+    """The address the dashboard should listen on.
+
+    Loopback locally; all interfaces in a remote shell, so the user can reach it from
+    their own machine at the remote's IP (subject to firewall rules — see
+    :func:`remote_access_help` for the SSH-forwarding fallback). ``AGITRACK_DASHBOARD_HOST``
+    overrides both."""
+    override = os.environ.get(BIND_HOST_ENV, "").strip()
+    if override:
+        return override
+    return ALL_INTERFACES if is_remote_session() else DEFAULT_HOST
+
+
+def _ssh_server_ip() -> str:
+    """The address of THIS machine that the SSH client connected to.
+
+    ``SSH_CONNECTION`` is ``<client-ip> <client-port> <server-ip> <server-port>``, so its
+    third field is the one address we know is routable from the user's machine — better
+    than guessing among several NICs."""
+    parts = os.environ.get("SSH_CONNECTION", "").split()
+    return parts[2] if len(parts) >= 4 else ""
+
+
+def _primary_ip() -> str:
+    """This host's IP on the interface that reaches the default route. The UDP socket is
+    never connected to anything (no packet leaves the machine); it just asks the kernel
+    which local address routing would pick."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.settimeout(0.2)
+            probe.connect(("198.51.100.1", 9))  # TEST-NET-3: reserved, never routed anywhere
+            return str(probe.getsockname()[0])
+    except OSError:
+        return ""
+
+
+def advertised_host(bind_host: str) -> str:
+    """A host component someone can actually type, given what the server bound to.
+
+    A wildcard bind ("listening everywhere") is not an address — printing
+    ``http://0.0.0.0:8765/`` gives the user nothing to click. Resolve it to the IP the
+    SSH client already used, else this host's primary IP, else the hostname."""
+    if bind_host and bind_host not in ("0.0.0.0", "::", "*"):
+        return bind_host
+    for candidate in (_ssh_server_ip(), _primary_ip()):
+        if candidate:
+            return candidate
+    try:
+        return socket.gethostname() or DEFAULT_HOST
+    except OSError:
+        return DEFAULT_HOST
+
+
+def dashboard_url(bind_host: str, port: int) -> str:
+    """The URL to show the user for a server bound to ``bind_host:port``."""
+    return f"http://{advertised_host(bind_host)}:{port}/"
+
+
+def bind_scanning(
+    factory: Callable[[tuple[str, int]], _ServerT], host: str, port: int, *, span: int = PORT_SCAN_SPAN
+) -> _ServerT:
+    """Bind ``factory`` to the first free port at or after ``port``.
+
+    Consecutive allocation is the point: a second dashboard/backtrace on the same box
+    lands on 8766, a third on 8767, instead of a random ephemeral port that the user has
+    to look up every time (and that no pre-arranged SSH forward can cover). ``port=0``
+    keeps its usual meaning — let the OS pick — and an exhausted span falls back to that
+    rather than failing to serve at all."""
+    if port <= 0:
+        return factory((host, 0))
+    for candidate in range(port, min(port + max(span, 1), 65536)):
+        try:
+            return factory((host, candidate))
+        except OSError:
+            continue
+    return factory((host, 0))
+
+
 def build_server(
     repo: GitRepo,
     *,
-    host: str = DEFAULT_HOST,
+    host: str | None = None,
     port: int = DEFAULT_PORT,
     email_logins: dict[str, str] | None = None,
 ) -> http.server.HTTPServer:
-    """An HTTP server bound to ``host:port`` serving the dashboard for ``repo``.
-    Falls back to an OS-assigned free port if the preferred one is taken.
+    """An HTTP server serving the dashboard for ``repo``, bound to ``host`` (defaulting to
+    :func:`default_bind_host`) on the first free port at or after ``port``.
 
     ``email_logins`` (lowercased author email → GitHub login) supplements ``gh`` for
     commits not yet on the remote — e.g. fresh session commits — so the current user's
@@ -288,10 +419,8 @@ def build_server(
             "_browser_cache": {},
         },
     )
-    try:
-        return _DashboardServer((host, port), handler)
-    except OSError:
-        return _DashboardServer((host, 0), handler)
+    bind_host = default_bind_host() if host is None else host
+    return bind_scanning(lambda address: _DashboardServer(address, handler), bind_host, port)
 
 
 def browser_is_local() -> bool:
@@ -329,29 +458,93 @@ def open_dashboard_in_browser(url: str) -> bool:
         return False
 
 
-def remote_browser_hint(url: str, port: int) -> str:
-    """A one-line hint for opening the dashboard from the user's own machine when
-    aGiTrack runs on a remote host."""
-    return (
-        f"Open {url} from your own machine. If aGiTrack is on a remote host, your editor's "
-        f"automatic port forwarding should make the link work; over plain SSH, forward the "
-        f"port first, e.g. `ssh -L {port}:127.0.0.1:{port} <host>`."
+def ssh_target() -> str:
+    """``user@host`` for SSH-ing back into this machine, for a copy-pasteable command.
+
+    The login name is this process's user (whoever is running aGiTrack is who the user
+    would log in as again) and the host is the address their SSH client already reached
+    us on, so the command works verbatim with nothing to fill in."""
+    try:
+        import getpass
+
+        user = getpass.getuser()
+    except Exception:  # no password entry / no USER: fall back to a placeholder
+        user = os.environ.get("USER") or os.environ.get("LOGNAME") or "<user>"
+    host = _ssh_server_ip() or _primary_ip() or socket.gethostname() or "<remote-host>"
+    return f"{user}@{host}"
+
+
+def ssh_forward_command(port: int, *, target: str = "") -> str:
+    """The exact ``ssh`` command to run **on the user's own machine** to forward ``port``.
+
+    ``-N`` (no remote command) keeps it a pure tunnel the user can Ctrl-C when done."""
+    return f"ssh -N -L {port}:localhost:{port} {target or ssh_target()}"
+
+
+def _is_loopback(host: str) -> bool:
+    return host in ("localhost", "::1") or host.startswith("127.")
+
+
+def remote_access_help(url: str, port: int, *, bind_host: str = "") -> str:
+    """The copy-paste block printed when the dashboard can't be opened here — i.e. aGiTrack
+    is on a remote host and the browser is on the user's machine.
+
+    Every route is spelled out in full so nothing has to be understood or adapted. Which
+    routes exist depends on what the server bound: a network bind can be opened directly
+    when the firewall allows it, with SSH forwarding as the fallback, whereas a loopback
+    bind is reachable ONLY through the tunnel — offering the direct URL there would send
+    the user to a page that cannot load. ``bind_host`` defaults to reading the URL, which
+    is right for both (an advertised loopback URL means a loopback bind)."""
+    tunnel = (
+        f"Run this ON YOUR OWN MACHINE (in a new terminal; leave it running):\n"
+        f"    {ssh_forward_command(port)}\n"
+        f"then open:\n"
+        f"    http://localhost:{port}/"
     )
+    host = bind_host or urllib.parse.urlparse(url).hostname or ""
+    if _is_loopback(host):
+        return f"The dashboard is bound to this machine's loopback, so reach it over an SSH tunnel.\n{tunnel}"
+    return (
+        f"Open this from your own machine (works if the firewall allows port {port}):\n"
+        f"    {url}\n"
+        f"If that does not load, forward the port instead. {tunnel}"
+    )
+
+
+def exposure_note(bind_host: str) -> str:
+    """A line (blank when irrelevant) saying the dashboard is reachable beyond this machine.
+
+    Binding all interfaces is what makes a remote dashboard usable at all, but it also
+    means anyone who can route to this host and past its firewall can read the repo's
+    commits and diffs — so say so, and say how to undo it."""
+    if bind_host not in ("0.0.0.0", "::", "*"):
+        return ""
+    return (
+        "Listening on all network interfaces so you can reach it from your own machine; "
+        f"anyone able to reach this host on that port can view it. Set {BIND_HOST_ENV}=127.0.0.1 "
+        "to keep it loopback-only.\n"
+    )
+
+
+def remote_browser_hint(url: str, port: int) -> str:
+    """A compact one-line variant of :func:`remote_access_help`, for the TUI status popup."""
+    return f"Open {url} from your own machine, or forward the port: `{ssh_forward_command(port)}`"
 
 
 def serve_dashboard(
     repo: GitRepo,
     *,
-    host: str = DEFAULT_HOST,
+    host: str | None = None,
     port: int = DEFAULT_PORT,
     open_browser: bool = True,
 ) -> int:
-    server = build_server(repo, host=host, port=port)
-    bound_port = server.server_address[1]
-    url = f"http://{host}:{bound_port}/"
+    bind_host = default_bind_host() if host is None else host
+    server = build_server(repo, host=bind_host, port=port)
+    bound_port = int(server.server_address[1])
+    url = dashboard_url(bind_host, bound_port)
     print(f"aGiTrack dashboard live at {url}\nRecomputed from commit metadata; auto-refreshes. Press Ctrl-C to stop.")
     if open_browser and not open_dashboard_in_browser(url):
-        print(remote_browser_hint(url, bound_port))
+        print(remote_access_help(url, bound_port, bind_host=bind_host))
     try:
         server.serve_forever()
     except KeyboardInterrupt:
