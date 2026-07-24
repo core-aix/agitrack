@@ -184,6 +184,9 @@ pre{font-family:var(--mono);white-space:pre;line-height:1.55}
 .branch h3{font-family:var(--display);font-size:24px;font-weight:400;color:var(--phosphor);margin-bottom:8px;letter-spacing:.5px}
 .branch p{font-size:13.5px;color:var(--fg-dim)}
 .branch .go{display:inline-block;margin-top:9px;font-size:13px;font-weight:600}
+/* Every "read more" is amber, wherever it appears; demo links stay phosphor. */
+a.more{color:var(--amber);border-bottom-color:var(--amber-dim)}
+a.more:hover{background:var(--amber);color:var(--ink);border-bottom-color:var(--amber)}
 
 /* ---- install steps ---- */
 .steps{counter-reset:step;display:flex;flex-direction:column;gap:14px}
@@ -260,12 +263,12 @@ footer .sha{font-size:12px}
         <div class="branch" data-ref="agitrack --backtrace">
           <h3>Backtrace old sessions</h3>
           <p>Reconstruct the history you didn't track from day one.</p>
-          <a class="go" href="readmore.html#backtrace">read more &rarr;</a>
+          <a class="go more" href="readmore.html#backtrace">read more &rarr;</a>
         </div>
         <div class="branch" data-ref="agitrack [-b] [-m]">
           <h3>Four modes</h3>
           <p>TUI or background, auto or manual commits. Switch freely.</p>
-          <a class="go" href="readmore.html#modes">read more &rarr;</a>
+          <a class="go more" href="readmore.html#modes">read more &rarr;</a>
         </div>
         <div class="branch" data-ref="--backend">
           <h3>Your agent, your choice</h3>
@@ -280,7 +283,7 @@ footer .sha{font-size:12px}
           <p>One-click VS Code extension, same experience.</p>
         </div>
       </div>
-      <p style="margin-top:18px">Prefer the full story? <a href="readmore.html"><strong>Read more</strong></a> ·
+      <p style="margin-top:18px">Prefer the full story? <a class="more" href="readmore.html"><strong>Read more</strong></a> ·
       deep details in the <a href="docs.html">docs</a>.</p>
     </section>
 
@@ -313,7 +316,7 @@ footer .sha{font-size:12px}
       </div>
       <h2>Put your agents on the record.</h2>
       <div class="hero-actions">
-        <a class="btn" href="readmore.html">read more</a>
+        <a class="btn alt" href="readmore.html">read more</a>
         <a class="btn alt" href="https://github.com/core-aix/agitrack">github.com/core-aix/agitrack</a>
       </div>
     </section>
@@ -322,7 +325,7 @@ footer .sha{font-size:12px}
 
   <footer>
     <span><span class="sha">aGiTrack</span> · agent + git tracking + humans learning · Apache-2.0 · updated <time datetime="2026-07-24">2026-07-24</time></span>
-    <span><a href="readmore.html">read more</a> · <a href="https://github.com/core-aix/agitrack" rel="me">GitHub</a> · <a href="docs.html">docs</a> · <a href="https://pypi.org/project/agitrack/">PyPI</a></span>
+    <span><a class="more" href="readmore.html">read more</a> · <a href="https://github.com/core-aix/agitrack" rel="me">GitHub</a> · <a href="docs.html">docs</a> · <a href="https://pypi.org/project/agitrack/">PyPI</a></span>
   </footer>
 </div>
 
