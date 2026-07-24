@@ -662,8 +662,15 @@ def _make_handler(view: BacktraceView) -> type[http.server.BaseHTTPRequestHandle
                 pass
 
         def _respond(self, content_type: str, body: bytes, *, cache_control: str = "no-store") -> None:
+            from agitrack.metrics.server import maybe_gzip
+
+            # Same compression as the live server: the backtrace page is the same ~90 KB of
+            # text, and it is usually being read over the connection that made it slow.
+            body, encoding = maybe_gzip(body, self.headers.get("Accept-Encoding", ""))
             self.send_response(200)
             self.send_header("Content-Type", content_type)
+            if encoding:
+                self.send_header("Content-Encoding", encoding)
             self.send_header("Content-Length", str(len(body)))
             # HTML pages use "no-cache" so the browser's back/forward cache can restore
             # them instantly (see the live server's _respond); data stays "no-store".
@@ -1096,11 +1103,15 @@ def start_backtrace_daemon(directory: Path, *, owner_pid: int, open_browser: boo
         _clear_handshake(directory)
         print(_empty_message(directory))
         return 0
+    from agitrack.metrics.server import exposure_note
+
     url = str(record.get("url", ""))
     print(
         f"aGiTrack backtrace daemon live at {url} (pid {record.get('pid')}).\n"
         + record.get("banner", "")
-        + "\nRuns in the background; stops when this terminal closes or `agitrack --backtrace stop`."
+        + "\n"
+        + exposure_note(str(record.get("host", "")))
+        + "Runs in the background; stops when this terminal closes or `agitrack --backtrace stop`."
     )
     _maybe_open(url, record, open_browser)
     return 0
@@ -1195,7 +1206,7 @@ def backtrace_daemon_status(directory: Path) -> int:
 
 
 def run_backtrace_daemon(
-    directory: Path, *, owner_pid: int | None = None, host: str = "127.0.0.1", port: int = 8765
+    directory: Path, *, owner_pid: int | None = None, host: str | None = None, port: int | None = None
 ) -> int:
     """The detached child: build the reconstruction once, then serve it until told to stop
     (SIGTERM/SIGINT) or until the owner pid disappears. Publishes a handshake so the launcher
@@ -1206,7 +1217,16 @@ def run_backtrace_daemon(
     import time
 
     from agitrack.metrics.daemon import _watch_owner
-    from agitrack.metrics.server import _DashboardServer
+    from agitrack.metrics.server import (
+        DEFAULT_PORT,
+        _DashboardServer,
+        bind_scanning,
+        dashboard_url,
+        default_bind_host,
+    )
+
+    bind_host = default_bind_host() if host is None else host
+    preferred_port = DEFAULT_PORT if port is None else port
 
     # Report build progress to a file the launching parent polls to draw a progress bar; clear it
     # once the (potentially slow) reconstruction is done.
@@ -1219,17 +1239,16 @@ def run_backtrace_daemon(
         return 0
 
     handler = _make_handler(view)
-    try:
-        server = _DashboardServer((host, port), handler)
-    except OSError:
-        server = _DashboardServer((host, 0), handler)
-    bound_port = server.server_address[1]
-    url = f"http://{host}:{bound_port}/"
+    # Consecutive ports (8765, 8766, …) so a backtrace started alongside a dashboard — or a
+    # second backtrace — gets a predictable neighbouring URL instead of a random one.
+    server = bind_scanning(lambda address: _DashboardServer(address, handler), bind_host, preferred_port)
+    bound_port = int(server.server_address[1])
+    url = dashboard_url(bind_host, bound_port)
     _write_handshake(
         directory,
         {
             "pid": os.getpid(),
-            "host": host,
+            "host": bind_host,
             "port": bound_port,
             "url": url,
             "banner": view.banner_text(),
@@ -1278,13 +1297,19 @@ def _open_log(directory: Path):
 
 
 def _maybe_open(url: str, record: dict, open_browser: bool) -> None:
-    from agitrack.metrics.server import open_dashboard_in_browser, remote_browser_hint
+    from agitrack.metrics.server import DEFAULT_PORT, open_dashboard_in_browser, remote_access_help
 
     if not (open_browser and url):
         return
     if not open_dashboard_in_browser(url):
-        port = record.get("port", 8765)
-        print(remote_browser_hint(url, int(port) if isinstance(port, int) else 8765))
+        port = record.get("port", DEFAULT_PORT)
+        print(
+            remote_access_help(
+                url,
+                int(port) if isinstance(port, int) else DEFAULT_PORT,
+                bind_host=str(record.get("host", "")),
+            )
+        )
 
 
 def render_backtrace_text(directory: Path) -> str:
