@@ -37,7 +37,7 @@
   "url": "https://agitrack.core-aix.org/",
   "applicationCategory": "DeveloperApplication",
   "operatingSystem": "macOS, Linux, Windows",
-  "dateModified": "2026-07-23",
+  "dateModified": "2026-07-24",
   "codeRepository": "https://github.com/core-aix/agitrack",
   "downloadUrl": "https://pypi.org/project/agitrack/",
   "installUrl": "https://pypi.org/project/agitrack/",
@@ -69,6 +69,9 @@
   --fg:#cfe7d8;
   --fg-dim:#7e998a;
   --red:#ff6b6b;
+  --cyan:#5ad7e6;
+  --yellow:#ffe9a8;
+  --lightblue:#c9ecff;
   --mono:"IBM Plex Mono",ui-monospace,monospace;
   --display:"VT323",var(--mono);
 }
@@ -104,7 +107,7 @@ a:hover{color:var(--ink);background:var(--phosphor);border-bottom-color:var(--ph
   content:"";position:absolute;left:18px;top:0;bottom:0;width:2px;
   background:linear-gradient(var(--phosphor-dim),var(--line) 85%,transparent);
 }
-.commit{position:relative;margin:0 0 72px}
+.commit{position:relative;margin:0 0 64px}
 .commit::before{
   content:"";position:absolute;left:-44px;top:10px;width:12px;height:12px;
   border-radius:50%;background:var(--ink);border:2px solid var(--phosphor);
@@ -129,12 +132,17 @@ header{padding:72px 0 40px;position:relative}
   letter-spacing:2px;
 }
 .brand .a{color:var(--amber);text-shadow:0 0 14px rgba(255,180,84,.5),0 0 60px rgba(255,180,84,.2)}
+.brandlink,.brandlink:hover{display:inline-block;border-bottom:none;background:none;color:inherit}
 .tagline{margin-top:18px;font-size:clamp(16px,2.6vw,21px);color:var(--fg)}
 .tagline .tag{color:var(--amber)}
 .cursor{display:inline-block;width:.55em;height:1.05em;background:var(--phosphor);vertical-align:text-bottom;margin-left:4px;animation:blink 1.1s steps(1) infinite}
 @keyframes blink{50%{opacity:0}}
 .sub{margin-top:14px;color:var(--fg-dim);max-width:62ch}
 .sub strong{color:var(--fg);font-weight:600}
+/* The hook: two questions the visitor recognizes, then the answer. */
+.hook{margin-top:20px;font-size:clamp(15px,2.3vw,18.5px);color:var(--fg);max-width:60ch;line-height:1.65}
+.hook strong{color:var(--phosphor);font-weight:600}
+.hook .yes{color:var(--amber);font-weight:600}
 .hero-actions{margin-top:26px;display:flex;gap:14px;flex-wrap:wrap}
 .btn{
   display:inline-block;padding:10px 18px;border:1px solid var(--phosphor);
@@ -166,30 +174,25 @@ header{padding:72px 0 40px;position:relative}
 .dot.r{background:#3d2626}.dot.y{background:#3d3526}.dot.g{background:#263d2e}
 .term-bar .title{margin-left:8px}
 .term-body{padding:18px 20px;font-size:14px;overflow-x:auto}
-.shot{display:block;width:100%;height:auto;border-top:1px solid var(--line)}
-a:has(.shot){border-bottom:none;display:block}
-a:has(.shot):hover{background:none}
 pre{font-family:var(--mono);white-space:pre;line-height:1.55}
 .p{color:var(--phosphor)} .o{color:var(--amber)} .d{color:var(--fg-dim)} .w{color:var(--fg)} .e{color:var(--red)}
 
-/* ---- feature grid as a 3-way branch ---- */
+/* ---- feature grid ---- */
 .branches{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:16px;margin-top:8px}
-/* exactly four items read as a 2×2 matrix, not 3-in-a-row + 1 orphan */
-.branches.two{grid-template-columns:repeat(2,minmax(0,1fr))}
-@media(max-width:560px){.branches.two{grid-template-columns:1fr}}
 .branch{
   background:var(--panel);border:1px solid var(--line);padding:18px;
   position:relative;transition:border-color .15s ease,transform .15s ease;
 }
 .branch:hover{border-color:var(--phosphor-dim);transform:translateY(-3px)}
 .branch::before{content:attr(data-ref);display:block;font-size:12px;color:var(--amber);margin-bottom:10px;letter-spacing:.4px}
-.branch h3{font-family:var(--display);font-size:24px;font-weight:400;color:var(--phosphor);margin-bottom:8px;letter-spacing:.5px}
+/* Corner labels that are runnable agitrack commands read in phosphor, unlike plain labels. */
+.branch.cmd::before{color:var(--phosphor)}
+.branch h3{font-family:var(--display);font-size:24px;font-weight:400;color:var(--lightblue);margin-bottom:8px;letter-spacing:.5px;text-shadow:0 0 14px color-mix(in srgb,var(--lightblue) 45%,transparent)}
 .branch p{font-size:13.5px;color:var(--fg-dim)}
-
-/* ---- commit-message specimen ---- */
-.specimen{font-size:13.5px}
-.specimen .h{color:var(--amber);font-weight:600}
-.specimen .k{color:var(--phosphor)}
+.branch .go{display:inline-block;margin-top:9px;font-size:13px;font-weight:600}
+/* Every "read more" is amber, wherever it appears; demo links stay phosphor. */
+a.more{color:var(--amber);border-bottom-color:var(--amber-dim)}
+a.more:hover{background:var(--amber);color:var(--ink);border-bottom-color:var(--amber)}
 
 /* ---- install steps ---- */
 .steps{counter-reset:step;display:flex;flex-direction:column;gap:14px}
@@ -204,10 +207,6 @@ pre{font-family:var(--mono);white-space:pre;line-height:1.55}
   padding:9px 13px;font-size:13.5px;color:var(--phosphor);
 }
 .step .note{font-size:12.5px;color:var(--fg-dim);margin-top:5px}
-.backends-list{list-style:none;margin:4px 0 12px;display:flex;flex-direction:column;gap:8px}
-.backends-list li{color:var(--fg);font-size:14.5px}
-.backends-list strong{color:var(--phosphor);font-weight:600}
-.backends-list .cmd{color:var(--fg-dim);font-size:13px}
 
 footer{
   padding:34px 0 60px;color:var(--fg-dim);font-size:13px;
@@ -226,188 +225,72 @@ footer .sha{font-size:12px}
 
 <div class="wrap">
   <header>
-    <div class="brand reveal r1"><span class="a">a</span>GiTrack</div>
+    <a class="brandlink" href="./" title="aGiTrack home"><div class="brand reveal r1"><span class="a">a</span>GiTrack</div></a>
     <p class="tagline reveal r2"><span class="tag">&lt;aGiTrack&gt;</span> every agent turn captured with its story, and humans learn<span class="cursor"></span></p>
-    <p class="sub reveal r3">Use your <strong>coding agent</strong> exactly as before. Every finished turn becomes a
-    <strong>git commit</strong>: prompts, code changes, cost. It even <a href="#learn"><strong>teaches you
-    back</strong></a> from your own sessions. <strong>Nothing tracked externally</strong>: everything is git history in your own repo.</p>
+    <p class="hook reveal r3">Wondering <strong>what prompt</strong> changed a line of code, weeks later?<br>
+    Want to <strong>drive coding agents more efficiently</strong>?<br>
+    <span class="yes">aGiTrack is what you need.</span></p>
     <div class="hero-actions reveal r4">
+      <a class="btn" href="dashboard/">try the dashboard demo</a>
+      <a class="btn" href="dashboard/learn/">meet your coach</a>
       <a class="btn" href="#install">pip install agitrack</a>
-      <a class="btn alt" href="docs.html">read the docs</a>
-      <a class="btn alt" href="https://github.com/core-aix/agitrack">github.com/core-aix/agitrack</a>
-      <a class="btn alt" href="#dashboard">see the dashboard</a>
+      <a class="btn alt" href="readmore.html">read more</a>
+      <a class="btn alt" href="https://github.com/core-aix/agitrack">GitHub</a>
     </div>
   </header>
 
   <main class="log">
 
-    <section class="commit agent reveal r5">
+    <section class="commit reveal r5" id="features">
       <div class="commit-head">
-        <span class="sha">f3a9c2e</span>
-        <span class="subject"><span class="tag">&lt;aGiTrack&gt;</span> show, don't tell</span>
+        <span class="sha">f34tur3</span>
+        <span class="subject">what you get</span>
       </div>
-      <div class="term" id="demo">
-        <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="title">agitrack · claude · session-1 → main</span></div>
-        <div class="term-body"><pre><span class="d">$</span> <span class="p">agitrack</span>
-<span class="d">┌ claude · session-1 ──────────────────────────────────┐</span>
-<span class="w">&gt; add a --version flag to the cli</span>
-<span class="d">  · editing agitrack/cli.py …</span>
-<span class="d">  · added --version using importlib.metadata</span>
-<span class="d">└──────────────────────────────────────────────────────┘</span>
-<span class="o">✓ Created &lt;aGiTrack&gt; commit 4b2f31a.</span>            <span class="d">aGiTrack · Ctrl-G</span>
-<span class="d">$</span> <span class="p">git log --oneline -2</span>
-<span class="o">4b2f31a</span> <span class="w">&lt;aGiTrack&gt; add a --version flag to the cli</span>
-<span class="d">a91c07e</span> <span class="w">Initial commit</span>
-<span class="d">$</span> <span class="p">git show 4b2f31a --stat</span>
-<span class="o">&lt;aGiTrack&gt;</span> <span class="w">add a --version flag to the cli</span>
-<span class="d"> agitrack/cli.py | 6 ++++++</span>  <span class="d">trace + model + token cost in the body ↓</span></pre>
+      <div class="branches">
+        <div class="branch" data-ref="git log">
+          <h3>Turns become commits</h3>
+          <p>The user-agent conversation, model, and token cost live in each commit message.</p>
+        </div>
+        <div class="branch cmd" data-ref="agitrack -d">
+          <h3>Live dashboard</h3>
+          <p>Who and what wrote the code, from commit metadata alone.</p>
+          <a class="go" href="dashboard/">demo &rarr;</a>
+        </div>
+        <div class="branch" data-ref="agent efficiency">
+          <h3>Efficiency insights</h3>
+          <p>Correction loops, rework hotspots, trends: how well you drive it.</p>
+          <a class="go" href="dashboard/#insights-head">demo &rarr;</a>
+        </div>
+        <div class="branch" data-ref="learn">
+          <h3>A coach that teaches you back</h3>
+          <p>Short lessons from your own sessions, quiz and exercise included.</p>
+          <a class="go" href="dashboard/learn/">demo &rarr;</a>
+        </div>
+        <div class="branch cmd" data-ref="agitrack --backtrace">
+          <h3>Backtrace old sessions</h3>
+          <p>Reconstruct the history you didn't track from day one.</p>
+          <a class="go more" href="readmore.html#backtrace">read more &rarr;</a>
+        </div>
+        <div class="branch cmd" data-ref="agitrack [-b] [-m]">
+          <h3>Four modes</h3>
+          <p>TUI or background, auto or manual commits. Switch freely.</p>
+          <a class="go more" href="readmore.html#modes">read more &rarr;</a>
+        </div>
+        <div class="branch cmd" data-ref="agitrack --backend">
+          <h3>Your agent, your choice</h3>
+          <p>Claude Code and OpenCode today. More on request.</p>
+        </div>
+        <div class="branch" data-ref="your repo only">
+          <h3>Private by design</h3>
+          <p>Nothing externally tracked: it is all git history in your own repo.</p>
+        </div>
+        <div class="branch" data-ref="VS Code">
+          <h3>Editor friendly</h3>
+          <p>One-click VS Code extension, same experience.</p>
         </div>
       </div>
-    </section>
-
-    <section class="commit">
-      <div class="commit-head">
-        <span class="sha">9d04e17</span>
-        <span class="subject">why this exists</span>
-      </div>
-      <h2>Agent code without provenance is unreviewable.</h2>
-      <p>An agent edits twelve files while you get coffee; a week later nobody knows which prompt produced
-      which change. <strong>aGiTrack makes each agent turn a commit</strong>, so review, blame, bisect, and
-      revert just work.</p>
-      <div class="term specimen">
-        <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="title">git show: an aGiTrack commit message</span></div>
-        <div class="term-body"><pre><span class="o">&lt;aGiTrack&gt;</span> <span class="w">add a --version flag to the cli</span>
-
-<span class="h"># Interaction Trace</span>
-
-<span class="h">## User</span>
-add a --version flag to the cli
-
-<span class="h">## Agent</span>
-Added --version using the package metadata; prints and exits.
-
-<span class="h"># aGiTrack Metadata</span>
-<span class="k">commit_type:</span> agent
-<span class="k">backend:</span> claude
-<span class="k">model:</span> claude-opus-4-8
-<span class="k">session_name:</span> session-1
-<span class="k">context_tokens:</span> 18204
-<span class="k">tokens_since_last_commit_input:</span> 411
-<span class="k">tokens_since_last_commit_output:</span> 2390</pre></div>
-      </div>
-    </section>
-
-        <section class="commit agent" id="dashboard">
-      <div class="commit-head">
-        <span class="sha">b7e1d09</span>
-        <span class="subject"><span class="tag">&lt;aGiTrack&gt;</span> see the whole repo at a glance</span>
-      </div>
-      <h2>A live dashboard of what the agents did.</h2>
-      <p><span class="p">agitrack -d</span> opens a live dashboard on <strong>localhost</strong>. Every number comes
-      from commit metadata alone: identical on every clone, no database, no server.</p>
-      <div class="term">
-        <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="title">agitrack -d · localhost</span></div>
-        <a href="images/dashboard-v6.png" target="_blank"><img class="shot" src="images/dashboard-v6.png" loading="lazy"
-          alt="The aGiTrack dashboard: coverage, tracked AI vs non-tracked lines, token totals, and per-backend / model / committer breakdowns, in a CRT terminal theme."></a>
-      </div>
-    </section>
-
-    <section class="commit agent" id="efficiency">
-      <div class="commit-head">
-        <span class="sha">4c0ba91</span>
-        <span class="subject"><span class="tag">&lt;aGiTrack&gt;</span> surface how the agents are being driven</span>
-      </div>
-      <h2>Not how much it wrote. How well you drove it.</h2>
-      <p>It spots the habits that quietly cost time and tokens, correction loops, rework hotspots, ballooning
-      context, and flags each one improving or getting worse, backed by the numbers.</p>
-      <div class="term">
-        <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="title">agitrack -d · agent efficiency</span></div>
-        <a href="images/efficiency-insights-v2.png" target="_blank"><img class="shot" src="images/efficiency-insights-v2.png" loading="lazy"
-          alt="The agent efficiency panel with the Learn from these traces call-to-action, a MEDIUM Correction loops card trending worse than the earlier half, and a green Fragmented sessions: improved card, each backed by numbers and a suggested change."></a>
-      </div>
-    </section>
-
-    <section class="commit agent" id="learn">
-      <div class="commit-head">
-        <span class="sha">7e3d052</span>
-        <span class="subject"><span class="tag">&lt;aGiTrack&gt;</span> coach the human from their own traces</span>
-      </div>
-      <h2>It teaches you back.</h2>
-      <p>Tell the <strong>learn</strong> page how much time you have. Your own agent reads your traces, spots
-      your gaps, and writes short lessons on driving agents and on your own codebase, each with a quick check
-      and an exercise it reviews.</p>
-      <div class="term">
-        <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="title">agitrack -d · learn</span></div>
-        <a href="images/learn-page-v2.png" target="_blank"><img class="shot" src="images/learn-page-v2.png" loading="lazy"
-          alt="The learn page: a check-in card asking how much time you have and how you feel, the coach's assessment of the learner, and four suggested lessons, each with an evidence-based reason and an estimated size."></a>
-      </div>
-    </section>
-
-    <section class="commit agent" id="backtrace">
-      <div class="commit-head">
-        <span class="sha">a1f8b28</span>
-        <span class="subject"><span class="tag">&lt;aGiTrack&gt;</span> reconstruct history from past sessions</span>
-      </div>
-      <h2>Didn't use it from day one? See the history anyway.</h2>
-      <p>Built your project with an agent before aGiTrack? <span class="p">agitrack --backtrace</span>
-      <strong>reconstructs</strong> those sessions from the transcripts already on your machine, into the same
-      dashboard.</p>
-      <div class="steps" style="margin-top:22px">
-        <div class="step"><div>
-          <code>agitrack --backtrace</code>
-          <div class="note">serves the dashboard from local transcripts, even outside a git repo</div>
-        </div></div>
-        <div class="step"><div>
-          <code>agitrack --backtrace commit</code>
-          <div class="note">bakes the reconstruction into real commits on a new branch</div>
-        </div></div>
-      </div>
-    </section>
-
-    <section class="commit" id="backends">
-      <div class="commit-head">
-        <span class="sha">b4ck3nd</span>
-        <span class="subject">supported backends</span>
-      </div>
-      <h2>Bring your own coding agent.</h2>
-      <p>aGiTrack wraps the coding agent you already use. Supported today:</p>
-      <ul class="backends-list">
-        <li><span class="o">▸</span> <strong>Claude Code</strong> <span class="cmd">agitrack --backend claude</span></li>
-        <li><span class="o">▸</span> <strong>OpenCode</strong> <span class="cmd">agitrack --backend opencode</span></li>
-      </ul>
-      <p>Want a different backend? <a href="https://github.com/core-aix/agitrack/issues">Request one.</a></p>
-    </section>
-
-    <section class="commit" id="modes">
-      <div class="commit-head">
-        <span class="sha">a11m0de</span>
-        <span class="subject">pick your workflow</span>
-      </div>
-      <h2>Four ways to run it, your call.</h2>
-      <p><strong>TUI or background</strong>, <strong>auto or manual commits</strong>: four modes, the same
-      per-turn trace, switch freely.</p>
-      <div class="branches two">
-        <div class="branch" data-ref="agitrack">
-          <h3>Interactive · Auto <span class="tag">default</span></h3>
-          <p>The agent's real TUI; every finished turn is committed from an isolated <strong>worktree</strong>. Or use with <span class="p">--no-worktree</span>.
-          Just work, get a clean traced history.</p>
-        </div>
-        <div class="branch" data-ref="agitrack -m">
-          <h3>Interactive · Manual</h3>
-          <p>Feels like plain git: <strong>you</strong> commit when ready, and pending turns fold in with the
-          full AI trace.</p>
-        </div>
-        <div class="branch" data-ref="agitrack -b">
-          <h3>Background · Auto</h3>
-          <p>Drive the agent from <em>any</em> UI, desktop app, IDE, or chat window; aGiTrack tracks it
-          <strong>headlessly</strong> and commits each turn.</p>
-        </div>
-        <div class="branch" data-ref="agitrack -b -m">
-          <h3>Background · Manual</h3>
-          <p>Headless tracking, commits on your terms. It can even start itself on
-          <span class="p">git commit</span>.</p>
-        </div>
-      </div>
+      <p style="margin-top:18px">Prefer the full story? <a class="more" href="readmore.html"><strong>Read more</strong></a> ·
+      deep details in the <a href="docs.html">docs</a>.</p>
     </section>
 
     <section class="commit" id="install">
@@ -423,35 +306,27 @@ Added --version using the package metadata; prints and exits.
         </div></div>
         <div class="step"><div>
           <code>cd your-repo && agitrack</code>
-          <div class="note">launches your <a href="#backends">coding agent</a>'s TUI under aGiTrack's watch</div>
+          <div class="note">launches your coding agent's TUI under aGiTrack's watch</div>
         </div></div>
         <div class="step"><div>
           <code>Ctrl-G</code>
           <div class="note">opens the aGiTrack menu</div>
         </div></div>
       </div>
-      <p style="margin-top:18px">Prompt as usual. When the turn settles, the commit is already there. Also a
-      <a href="docs.html#vs-code-extension">VS Code extension</a>, one click, same experience.</p>
     </section>
 
     <section class="commit agent">
-      <div class="commit-head">
-        <span class="sha">HEAD</span>
-        <span class="subject"><span class="tag">&lt;aGiTrack&gt;</span> your move</span>
-      </div>
-      <h2>Put your agents on the record.</h2>
-      <p>Apache-2.0. Issues, ideas, and first contributions welcome.</p>
-      <div class="hero-actions">
-        <a class="btn" href="https://github.com/core-aix/agitrack">github.com/core-aix/agitrack</a>
-        <a class="btn alt" href="docs.html">read the docs</a>
+      <div class="hero-actions" style="margin-top:0">
+        <a class="btn alt" href="readmore.html">read more</a>
+        <a class="btn alt" href="https://github.com/core-aix/agitrack">github.com/core-aix/agitrack</a>
       </div>
     </section>
 
   </main>
 
   <footer>
-    <span><span class="sha">aGiTrack</span> · agent + git tracking + humans learning · Apache-2.0 · updated <time datetime="2026-07-23">2026-07-23</time></span>
-    <span><a href="https://github.com/core-aix/agitrack" rel="me">github.com/core-aix/agitrack</a> · <a href="docs.html">docs</a> · <a href="https://pypi.org/project/agitrack/">PyPI</a></span>
+    <span><span class="sha">aGiTrack</span> · agent + git tracking + humans learning · Apache-2.0 · updated <time datetime="2026-07-24">2026-07-24</time></span>
+    <span><a class="more" href="readmore.html">read more</a> · <a href="https://github.com/core-aix/agitrack" rel="me">GitHub</a> · <a href="docs.html">docs</a> · <a href="https://pypi.org/project/agitrack/">PyPI</a></span>
   </footer>
 </div>
 

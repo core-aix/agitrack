@@ -110,6 +110,32 @@ def _seeded(tmp_path):
     return repo
 
 
+def test_backtrace_log_explains_what_the_entries_are(tmp_path):
+    # The backtrace log LOOKS like a commit log but holds reconstructed turns, so the page
+    # must say so at the top of the section. The explainer ships hidden in the shared
+    # template and is unhidden only under the BACKTRACE flag (hideFabricatedChrome).
+    from agitrack.metrics.web import shell_html
+
+    html = shell_html(_seeded(tmp_path))
+    assert 'id="logintro" hidden' in html
+    assert "reconstructed agent turn" in html
+    assert "--backtrace commit</code> bakes the rest" in html
+    unhide = html.index('$("logintro"); if(li) li.hidden = false')
+    assert html.index("if(!BACKTRACE) return;") < unhide  # backtrace-only, hidden on the live page
+
+
+def test_subject_truncation_cuts_at_word_ends(tmp_path):
+    # A long subject must not be chopped mid-word: the cut backs up to the last space inside
+    # the cap (hard cut only when a single word fills more than half the line), then "…".
+    from agitrack.metrics.web import shell_html
+
+    html = shell_html(_seeded(tmp_path))
+    trunc = html[html.index("const truncSubject") : html.index("function setOffline")]
+    assert 'lastIndexOf(" ")' in trunc
+    assert "SUBJECT_MAX/2" in trunc
+    assert 'cut.trimEnd()+"…"' in trunc
+
+
 def test_page_shows_a_loading_screen_before_the_whole_document_arrives(tmp_path):
     # The dashboard used to be a blank WHITE page until the last of ~90 KB had landed and its
     # script had run — worst over a remote/forwarded connection, where it just looked broken.
