@@ -1421,14 +1421,19 @@ def learn_html(root: Path, *, banner_html: str = "") -> str:
     backtrace banner). Empty on the live server. Substituted FIRST so page content could
     never smuggle the placeholder in."""
     from agitrack.metrics.collect import _display_repo
-    from agitrack.metrics.web import _escape
+    from agitrack.metrics.web import FONT_LINKS, PREBOOT_CSS, PREBOOT_HTML, _escape
 
     repo_path = _display_repo(str(root))
     repo_name = repo_path.rstrip("/").rsplit("/", 1)[-1] or repo_path
+    # Same first-paint treatment as the dashboard (see web.PREBOOT_CSS): a dark page saying
+    # it is loading instead of a white one, and web fonts that never block the paint.
     return (
         _LEARN_TEMPLATE.replace("__BACKTRACE_BANNER__", banner_html)
         .replace("__REPO_NAME__", _escape(repo_name))
         .replace("__REPO__", _escape(repo_path))
+        .replace("__PREBOOT_CSS__", PREBOOT_CSS)
+        .replace("__PREBOOT_HTML__", PREBOOT_HTML.replace("the aGiTrack dashboard", "the learn page"))
+        .replace("__FONT_LINKS__", FONT_LINKS)
     )
 
 
@@ -1454,10 +1459,9 @@ _LEARN_TEMPLATE = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
 <title>learn · __REPO_NAME__ · aGiTrack</title>
+__PREBOOT_CSS__
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🎓</text></svg>">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=VT323&family=IBM+Plex+Mono:ital,wght@0,400;0,500;0,600;1,400&display=swap" rel="stylesheet">
+__FONT_LINKS__
 <style>
 :root{--ink:#070b09;--panel:#0c120e;--panel2:#101813;--line:#1d2a21;--fg:#cfe7d8;--fg-dim:#7e998a;
   --phosphor:#3dffa0;--phosphor-dim:#1f7a52;--accent:#67b8d6;--warn:#ffb454;--bad:#ff6b6b;
@@ -1673,6 +1677,7 @@ footer code{color:var(--fg)}
 </style>
 </head>
 <body>
+__PREBOOT_HTML__
 __BACKTRACE_BANNER__
 <div class="ambient"></div>
 <div class="wrap">
@@ -1824,6 +1829,9 @@ __BACKTRACE_BANNER__
 
 <script>
 "use strict";
+// The document is here and styled: drop the pre-boot overlay that covered its transfer
+// (see web.PREBOOT_CSS). The page's own skeleton takes over from here.
+{ const pb = document.getElementById("preboot"); if (pb) pb.remove(); }
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
