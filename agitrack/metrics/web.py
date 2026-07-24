@@ -838,6 +838,11 @@ h2.section::before{content:"# ";color:var(--amber)}
   background-image:linear-gradient(45deg,transparent 50%,var(--phosphor-dim) 50%),linear-gradient(135deg,var(--phosphor-dim) 50%,transparent 50%);
   background-position:calc(100% - 14px) 50%,calc(100% - 9px) 50%;background-size:5px 5px,5px 5px;background-repeat:no-repeat}
 .logsort select:focus{outline:none;border-color:var(--phosphor)}
+/* Backtrace only: explains what the log's entries actually are (reconstructed turns, not commits). */
+.logintro{margin:0 0 12px;padding:10px 14px;background:var(--panel);border:1px solid var(--line);
+  border-left:3px solid var(--amber);color:var(--fg-dim);font-size:12.5px;line-height:1.6}
+.logintro b{color:var(--fg)}
+.logintro code{color:var(--fg);background:var(--ink);padding:0 5px}
 
 /* ---- stat cards ---- */
 .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px}
@@ -1184,6 +1189,11 @@ __UPDATE_BANNER__
     </div>
   </div>
   <div class="logpane" id="pane-commits">
+    <div class="logintro" id="logintro" hidden>Each entry below is one <b>reconstructed agent turn</b> from your
+    local session transcripts: what was asked, the agent's reply, and the file changes it recovered, shown like a
+    commit. Nothing here has been written to git; a turn with a <b>committed</b> badge is already in your history
+    with aGiTrack metadata, and <code>agitrack --backtrace commit</code> bakes the rest into real commits on a new
+    branch.</div>
     <div class="panehead"><div class="logsort"><label for="f-sort">sort</label><select id="f-sort" title="Sort the filtered commits">
       <option value="date">newest first</option>
       <option value="lines">most lines changed</option>
@@ -1269,7 +1279,16 @@ const kfmt = n => { n=n||0; return n>=1000 ? (n/1000).toFixed(n>=10000?0:1)+"k" 
 // ellipsis (the full subject stays available via the row's hover title and the expanded
 // commit message). The ellipsis counts toward the cap, so the result never exceeds 120.
 const SUBJECT_MAX = 120;
-const truncSubject = s => { s = s||""; return s.length > SUBJECT_MAX ? s.slice(0, SUBJECT_MAX-1).trimEnd()+"…" : s; };
+// Cut at the end of a word, never mid-word: back up to the last space inside the cap. Only
+// when that space sits in the first half (one enormous "word") does the hard cut remain.
+const truncSubject = s => {
+  s = s||"";
+  if(s.length <= SUBJECT_MAX) return s;
+  let cut = s.slice(0, SUBJECT_MAX-1);
+  const sp = cut.lastIndexOf(" ");
+  if(sp > SUBJECT_MAX/2) cut = cut.slice(0, sp);
+  return cut.trimEnd()+"…";
+};
 function setOffline(on){ const el=$("neterror"); if(el) el.hidden = !on; }
 // Show the "loading…" spinner while a user-initiated filter change re-fetches the data
 // (not during the background refresh poll, which would make it flicker constantly).
@@ -2084,6 +2103,8 @@ function hideFabricatedChrome(){
   // don't apply. The committer (no committer behind a turn), the branch picker (there is no
   // branch), and shared sessions (a live-repo feature) would all be misleading here.
   if(!BACKTRACE) return;
+  // And say what the log's entries ARE: reconstructed turns shown commit-like, not git commits.
+  const li = $("logintro"); if(li) li.hidden = false;
   const fa = $("f-author"); if(fa && fa.closest(".field")) fa.closest(".field").style.display = "none";
   const bc = $("by-committer");
   if(bc){ bc.style.display = "none"; if(bc.previousElementSibling) bc.previousElementSibling.style.display = "none"; }

@@ -1,0 +1,396 @@
+{
+ "profiles": {
+  "maintainer": {
+   "assessment": "You are a sharp bug spotter. Your prompts describe real symptoms with great detail, you point the agent at live repos to check, and you even ask it to verify across both agent backends. Your overloaded turns already dropped by 48%, which shows you are learning fast and putting it to work.",
+   "gaps": [
+    {
+     "detail": "Bugs you thought were fixed reappear because no regression test pins the fix in place. A regression test is a small test that fails if the old bug ever returns.",
+     "evidence": "You wrote 'I thought this is fixed, but it's not' about the no-worktree prompt bug, and the commit-lag bug needed at least four correction turns. 17% of follow-ups re-do the previous turn.",
+     "id": "fixes-dont-stick",
+     "kind": "coding",
+     "status": "open",
+     "title": "Fixes come back broken"
+    },
+    {
+     "detail": "Some turns run over 30 minutes with no early stop to review direction, so a wrong guess costs the whole run.",
+     "evidence": "11% of turns run longer than 30 minutes, and the commit-timing saga shows several long turns that ended in 'it's still not committing as desired'.",
+     "id": "long-unchecked-runs",
+     "kind": "coding",
+     "status": "open",
+     "title": "Long runs without a checkpoint"
+    },
+    {
+     "detail": "The daemon keeps running old code until restarted, and quits when its files change under it. Knowing where that lifecycle lives lets you answer these surprises yourself.",
+     "evidence": "You asked 'why does the background daemon automatically quit whenever I make updates?' and later tested a fix against a repo 'running aGiTrack before you made the latest edits'.",
+     "id": "stale-daemon-confusion",
+     "kind": "codebase",
+     "status": "open",
+     "title": "How the background daemon lives and dies"
+    },
+    {
+     "detail": "The auto-commit rules for interactive and background mode can drift apart if they are not shared code. Knowing where each rule lives lets you spot drift before it bites.",
+     "evidence": "You repeatedly asked to 'make the background mode behave the same' as the TUI, and runner.py is the top rework hotspot with 171 changes.",
+     "id": "mode-parity-blindspot",
+     "kind": "codebase",
+     "status": "open",
+     "title": "TUI and background commit rules live apart"
+    },
+    {
+     "detail": "You find breakage by using the app later, not by running the test suite right after a change. Running one test file takes seconds and catches regressions before you move on.",
+     "evidence": "Prompts like 'The skip for now button for mentor review seems to have no real effect' show issues discovered manually, and 17% of follow-up turns re-do the previous turn.",
+     "id": "verify-agent-claims",
+     "kind": "coding",
+     "status": "addressed",
+     "title": "Verifying the agent's work with tests"
+    },
+    {
+     "detail": "Your prompts describe symptoms ('the x to disappear', 'picked for you list') but rarely name the file involved. A quick text search lets you point the agent at the right spot, which cuts correction loops.",
+     "evidence": "The efficiency insight explicitly suggests naming files in the first prompt, and none of the recent UI prompts mention a file path even though most target agitrack/metrics/web.py.",
+     "id": "pinpoint-code-locations",
+     "kind": "codebase",
+     "status": "addressed",
+     "title": "Naming the exact file in your prompt"
+    },
+    {
+     "detail": "Screenshot requests describe what is wrong with the last attempt instead of what the final image must contain, so each screenshot takes several rounds.",
+     "evidence": "A chain of retakes: 'Stop the cropping', 'It could be much shorter', 'The learn screenshot on the webpage is not good now. It should show the suggested lessons part as well'.",
+     "id": "visual-acceptance-criteria",
+     "kind": "coding",
+     "status": "open",
+     "title": "Spelling out what a good screenshot looks like"
+    },
+    {
+     "detail": "Some prompts got sent twice or arrived garbled mid-edit, which forces the agent to guess and burns turns. Drafting tricky prompts before sending fixes this cheaply.",
+     "evidence": "Duplicated and mangled prompts in the trace, e.g. 'the progress list splits into pagesmultiple , with only the current page being loaded, to avpages' and the same dashboard-screenshot request sent twice.",
+     "id": "prompt-hygiene",
+     "kind": "coding",
+     "status": "addressed",
+     "title": "One clean message per request"
+    },
+    {
+     "detail": "When a turn goes wrong, you ask the agent to redo it rather than rolling back yourself. Since aGiTrack commits every turn, one git command can erase a bad turn cleanly.",
+     "evidence": "17% of follow-up turns re-do the previous turn, and prompts like 'Stop the cropping. Finish the rest that remain.' show you steering the agent back instead of reverting.",
+     "id": "undo-with-git-not-prompts",
+     "kind": "coding",
+     "status": "addressed",
+     "title": "Undoing agent work via git instead of more prompts"
+    },
+    {
+     "detail": "Doc screenshots get stale and each update takes several back-and-forth prompts about size, crop, and content. A repeatable script or checklist would make this one step.",
+     "evidence": "At least five recent prompts are about retaking or fixing screenshots: 'retake dashboard screenshot', 'agent efficiency screenshot... could be much shorter', 'The learn screenshot... is not good now', 'Stop the cropping.'",
+     "id": "manual-screenshot-churn",
+     "kind": "codebase",
+     "status": "open",
+     "title": "Screenshot updates are a repeated manual chore"
+    },
+    {
+     "detail": "You report surprising behavior in the learning feature (done sessions still showing, duplicates, no reset) but do not yet know which code builds that list, so every fix is a guess routed through the agent.",
+     "evidence": "Multiple prompts about the same feature: 'sessions marked as done should disappear from the picked for you list', 'consider what lessons have been done already... so there is no duplicate', 'an option to reset the suggested learning content'.",
+     "id": "learn-feature-data-flow",
+     "kind": "codebase",
+     "status": "open",
+     "title": "Where the 'picked for you' logic actually lives"
+    },
+    {
+     "detail": "You know which test file matches which feature, but requirements like pagination are still stated only in prose. Writing one small assertion yourself would lock the behavior in so the agent cannot regress it.",
+     "evidence": "The pagination requirement was prompted three times in slightly different words, and tests/test_proxy.py is a rework hotspot with lines written one turn and removed the next.",
+     "id": "tests-as-requirements",
+     "kind": "coding",
+     "status": "open",
+     "title": "Turning a requirement into a test, not just a prompt"
+    }
+   ],
+   "suggestions": [
+    {
+     "gap_id": "fixes-dont-stick",
+     "id": "pin-fix-with-regression-test",
+     "kind": "coding",
+     "minutes": 5,
+     "teaser": "You will know how to ask the agent for a failing test in tests/test_proxy.py before any fix, so a fixed bug stays fixed.",
+     "title": "Pin a fix with a regression test",
+     "why": "The no-worktree prompt bug came back after you thought it was fixed, and the commit-lag bug took several rounds. A test that reproduces the bug first would have caught the relapse instantly."
+    },
+    {
+     "gap_id": "long-unchecked-runs",
+     "id": "first-slice-checkpoint",
+     "kind": "coding",
+     "minutes": 4,
+     "teaser": "You will end your next big prompt with 'implement only step 1, then stop and show me', turning hour-long gambles into 5-minute check-ins.",
+     "title": "Ask for the first slice, then steer",
+     "why": "11% of your turns run past 30 minutes, and the commit-timing work burned several of them going the wrong way. Building on your plan-first habit, this adds a stop point you can redirect at."
+    },
+    {
+     "gap_id": "stale-daemon-confusion",
+     "id": "meet-the-daemon-lifecycle",
+     "kind": "codebase",
+     "minutes": 5,
+     "teaser": "You will find where -d starts and stops the daemon, and always restart it after an edit so you test the code you just changed.",
+     "title": "Meet the daemon: why it quits on updates",
+     "why": "You asked why the daemon quits when you update aGiTrack, and once tested a fix against a repo still running the old code. Five minutes in cli.py explains both mysteries."
+    },
+    {
+     "gap_id": "mode-parity-blindspot",
+     "id": "find-both-commit-rules",
+     "kind": "codebase",
+     "minutes": 5,
+     "teaser": "You will locate the TUI and background commit triggers in runner.py and check with your own eyes whether they share one rule, before the next surprise commit.",
+     "title": "One rule, two modes: find both commit triggers",
+     "why": "You had to ask three times for background mode to match the TUI's commit rules, and runner.py churned through 171 changes during that work. Seeing where each mode decides to commit shows why they drifted."
+    }
+   ],
+   "suggest_context": {
+    "branch": "dev",
+    "days": 30,
+    "minutes": 5,
+    "mood": "fresh",
+    "note": "",
+    "source": ""
+   },
+   "suggested_at": 1784891144,
+   "lessons": [
+    {
+     "chat": [
+      {
+       "role": "user",
+       "text": "Doesn't the agent run the tests automatically already?"
+      },
+      {
+       "role": "mentor",
+       "text": "Sometimes, yes. But not reliably, and that gap is exactly what your traces show.\n\nAgents decide on their own whether running tests is \"worth it\" for a given change. For a small edit, the agent often skips tests to save time, says \"done\", and moves on. Your history shows how that plays out: `runner.py` gets rewritten within the hour, and 17% of your follow-ups are corrections. If the agent were consistently testing, most of those correction turns would not exist.\n\nThere are three failure modes even when the agent does test:\n\n1. **It skips testing entirely** because the change \"looked simple\".\n2. **It runs the wrong tests**, like a quick syntax check instead of `tests/test_proxy.py`.\n3. **It claims tests pass without running them.** This happens. That is why the lesson says ask for the pasted output, not the promise.\n\nThink of the one-line habit as removing the agent's discretion. You are not teaching it something new, you are making a sometimes-behavior into an always-behavior. \"Run `pytest tests/test_proxy.py` and paste the last 10 lines\" costs you one line and turns \"probably tested\" into \"provably tested\".\n\nQuick way to see this yourself: next session, watch whether the agent runs tests when you don't ask. Then compare with a session where you do ask. Your correction rate on those turns should tell the story."
+      },
+      {
+       "role": "user",
+       "text": "Can I ask the agent to write in memory that it should also run tests? Also, are tests really necessary even for very simple changes?"
+      },
+      {
+       "role": "mentor",
+       "text": "Yes, and that is actually the best version of this habit. Instead of typing the proof line in every prompt, put it in the agent's memory file (for Claude Code, that is `CLAUDE.md` in your repo root). Something like:\n\n```text\nDefinition of done: run pytest tests/test_proxy.py and tests/test_cli.py,\npaste the last 10 lines of output. Never report done without test output.\n```\n\nThe agent reads that file at the start of every session, so the rule applies automatically. One caution: memory is a strong nudge, not a guarantee. Agents sometimes drift from instructions in long sessions. So keep the habit of glancing at the output it pastes. If a \"done\" message arrives with no test output, that is your signal it skipped the rule.\n\nOn your second question: yes, run tests even for tiny changes, and here is why. \"Simple\" is a guess made before the change, but bugs show up after. A one-line edit to `runner.py` can break an import, a default value, or something a caller depends on. Your own history is the evidence: those rewrites within the same hour were mostly \"simple\" changes that turned out not to be.\n\nThe math also favors testing. Running `tests/test_proxy.py` costs a few seconds inside the same turn. A correction turn costs you a full round trip: reading the bad result, writing a new prompt, waiting again. Since 17% of your follow-ups are corrections, the seconds spent testing are much cheaper than the turns spent fixing. If a test run is genuinely slow, the fix is to make the test faster, not to skip it."
+      },
+      {
+       "role": "user",
+       "text": "I think it may be too overwhelming to run tests for every fix"
+      },
+      {
+       "role": "mentor",
+       "text": "That is a fair worry, but notice who does the work here: the agent runs the tests, not you. Your time cost is one line in `CLAUDE.md`. The agent's cost is a few seconds of compute. Compare that to your current cost, where 17% of your prompts are correction turns. One skipped test run that lets a bug through costs you far more time than a hundred test runs that pass.\n\nThat said, you do not need to run everything every time. Scope it:\n\n- **Match tests to the change.** Touched `runner.py`? Run only `tests/test_proxy.py`. Touched the CLI? Only `tests/test_cli.py`. A line like this in memory works: \"Run the test file that covers the code you changed.\"\n- **Use fast flags.** `pytest tests/test_proxy.py -x` stops at the first failure, so a broken run ends quickly.\n- **Save the full suite for the end.** One complete run before you wrap up the session, not after every small edit.\n\nOne more thing: \"very simple changes\" are exactly where agents get burned. A one-line edit that \"obviously works\" is the change nobody checks, and your `runner.py` churn suggests some of those simple fixes were not so simple. The test run is cheapest precisely when the change is small, because it finishes fast and passes quietly.\n\nSo the habit is not \"run everything always\". It is \"the agent proves the part it touched, every time\". That version is light enough to keep forever."
+      }
+     ],
+     "completed_at": 1784374313,
+     "content_md": "### Why this is costing you time\nYour traces show a pattern: `agitrack/proxy/runner.py` gets rewritten within the same hour, and 17% of your follow-up prompts are corrections of the previous turn. That means the agent says \"done\", you check, it is not done, and you spend another turn fixing it. The good news: your repo already has the fix sitting there. `tests/test_proxy.py` exists and covers exactly the file that keeps churning.\n\n### The one-line habit\nEnd every prompt with a proof request. One line is enough:\n\n```text\nBefore you say done, run tests/test_proxy.py and paste the result.\nIf anything fails, fix it and run again.\n```\n\nThis flips the burden. Instead of you checking the agent's work in a follow-up turn, the agent checks its own work inside the same turn. A verified turn rarely needs a correction turn.\n\n### Ask for proof, not promises\nThere is a subtle trap: agents will happily say \"tests pass\" without running them. So ask for the *output*, not the claim. Compare:\n\n```text\nWeak:   Make sure the tests pass.\nStrong: Run pytest tests/test_proxy.py -x and show me the last\n        10 lines of output before reporting done.\n```\n\nThe strong version forces a real run. If the output shows `3 passed`, you can trust it. If the agent cannot paste output, it did not run anything.\n\n### Try this next time\nNext session, when you touch `runner.py` or the CLI, add this closing line to your first prompt:\n\n```text\nDone means: pytest tests/test_proxy.py and tests/test_cli.py\npass, and you have pasted the output.\n```\n\nSince you often say \"I'll be away, so help me decide\", this line matters even more: it is the check that runs while you are gone, instead of a surprise waiting when you return.",
+     "created_at": 1784373804,
+     "exercise": {
+      "attempts": [],
+      "hint": "Keep the original request, then add a closing line naming the exact test file to run (tests/test_proxy.py) and require the agent to paste the run's output, fixing and rerunning until it passes.",
+      "status": "skipped",
+      "task": "Here is a prompt you might send in your next session:\n\n```text\nFix the bug where OpenCode summary text appears near the\nuser typing box after summarizing. The relevant code is in\nagitrack/proxy/runner.py.\n```\n\nRewrite the prompt so the agent must prove the fix before reporting done. Type your improved version, keeping it to a few lines."
+     },
+     "gap_id": "verify-before-done",
+     "id": "done-means-verified-1784373804",
+     "kind": "coding",
+     "links": [
+      {
+       "note": "Anthropic's own guide, including giving the agent a way to verify its work.",
+       "title": "Claude Code best practices",
+       "url": "https://www.anthropic.com/engineering/claude-code-best-practices"
+      },
+      {
+       "note": "Handy flags like -x (stop at first failure) to keep verification runs short.",
+       "title": "pytest documentation",
+       "url": "https://docs.pytest.org/en/stable/"
+      }
+     ],
+     "minutes": 3,
+     "quiz": [
+      {
+       "answer": 1,
+       "choices": [
+        "Pasted output makes the response longer and more detailed",
+        "Output is proof the tests actually ran; a claim can be made without running anything",
+        "It saves tokens",
+        "It makes the agent write more tests"
+       ],
+       "explain": "Agents can claim success without running anything, so the pasted output is the only real evidence.",
+       "question": "Why ask the agent to paste test output instead of just saying \"make sure tests pass\"?"
+      },
+      {
+       "answer": 1,
+       "choices": [
+        "The agent uses too many tokens",
+        "Extra correction turns that redo the previous turn's work",
+        "Tests get deleted",
+        "Commits become too large"
+       ],
+       "explain": "17% of follow-up turns redo the previous turn, which is time spent fixing work the agent already called done.",
+       "question": "What does the trace data suggest is the main cost of unverified \"done\" reports?"
+      }
+     ],
+     "quiz_correct": 2,
+     "quiz_total": 2,
+     "seconds_spent": 430,
+     "status": "completed",
+     "steps": [
+      {
+       "content_md": "Your traces show a pattern: `agitrack/proxy/runner.py` gets rewritten within the same hour, and 17% of your follow-up prompts are corrections of the previous turn. That means the agent says \"done\", you check, it is not done, and you spend another turn fixing it. The good news: your repo already has the fix sitting there. `tests/test_proxy.py` exists and covers exactly the file that keeps churning.",
+       "title": "Why this is costing you time"
+      },
+      {
+       "content_md": "End every prompt with a proof request. One line is enough:\n\n```text\nBefore you say done, run tests/test_proxy.py and paste the result.\nIf anything fails, fix it and run again.\n```\n\nThis flips the burden. Instead of you checking the agent's work in a follow-up turn, the agent checks its own work inside the same turn. A verified turn rarely needs a correction turn.",
+       "title": "The one-line habit"
+      },
+      {
+       "content_md": "There is a subtle trap: agents will happily say \"tests pass\" without running them. So ask for the *output*, not the claim. Compare:\n\n```text\nWeak:   Make sure the tests pass.\nStrong: Run pytest tests/test_proxy.py -x and show me the last\n        10 lines of output before reporting done.\n```\n\nThe strong version forces a real run. If the output shows `3 passed`, you can trust it. If the agent cannot paste output, it did not run anything.",
+       "title": "Ask for proof, not promises"
+      },
+      {
+       "content_md": "Next session, when you touch `runner.py` or the CLI, add this closing line to your first prompt:\n\n```text\nDone means: pytest tests/test_proxy.py and tests/test_cli.py\npass, and you have pasted the output.\n```\n\nSince you often say \"I'll be away, so help me decide\", this line matters even more: it is the check that runs while you are gone, instead of a surprise waiting when you return.",
+       "title": "Try this next time"
+      }
+     ],
+     "title": "Make 'done' mean 'tested'"
+    },
+    {
+     "chat": [],
+     "content_md": "### Why runner.py, why now\nYou have edited `agitrack/proxy/runner.py` 160 times this month, more than any other file. And your recent question, \"the turn had a final response, so not sure why it wasn't committed,\" lives right in its commit logic. Five minutes of mapping this file means next time a commit goes missing, you can name the suspect function instead of asking the agent to hunt blind.\n\n### The turn lifecycle\nEvery turn in aGiTrack follows the same shape. Simplified:\n\n```python\ndef run_turn(prompt):\n    agent.send(prompt)          # 1. hand the prompt to the agent\n    agent.wait_for_finish()     # 2. let it work\n    changed = detect_changes()  # 3. ask git what moved\n    maybe_commit(changed)       # 4. commit only if something moved\n```\n\nOne key fact: steps 2 and 4 are independent. The agent finishing is not what triggers a commit.\n\n### A response is not a commit\nThe commit decision looks at the worktree (the separate folder where the agent is allowed to write), not at the agent's chat output. Roughly:\n\n```python\ndef maybe_commit(changed):\n    if not changed:\n        return  # nothing to commit, turn ends quietly\n    git.commit(message=build_message(), files=changed)\n```\n\nSo an agent can write a long final message, yet if git sees zero changed files in the worktree, the turn ends with no commit. That is exactly the case you hit.\n\n### The silent exits\nMissing commits almost always come from a guard clause, a small `if ... return` that bails out early. The usual ones in this flow:\n\n- no changed files detected\n- files written outside the worktree, so the diff is empty\n- an error during the agent run marked the turn as failed\n\nGuards are fine, but silent guards are debugging pain. A one line log with the skip reason turns a mystery into a grep.\n\n### Try this next time\nNext time a turn is not committed, do not ask \"why wasn't this committed?\" Instead prompt your agent with a target:\n\n```\nIn agitrack/proxy/runner.py, trace the commit path for the last turn.\nList every guard clause that can skip the commit, tell me which one\nfired, and add a log line with the skip reason.\n```\n\nNaming the file and the guards cuts the correction loops your traces show, since the agent starts in the right place.",
+     "created_at": 1784374366,
+     "exercise": {
+      "attempts": [],
+      "hint": "changed_files() only looks inside the worktree. Writes outside it produce an empty list. For part 2, think about what a silent return could say out loud.",
+      "status": "open",
+      "task": "Here is a simplified version of the commit path in runner.py:\n\n```python\ndef finish_turn(self, turn):\n    response = self.agent.final_message()\n    changed = self.worktree.changed_files()\n    if not response:\n        return TurnResult(committed=False)\n    if not changed:\n        return TurnResult(committed=False)\n    self.git.commit(turn, changed)\n    return TurnResult(committed=True)\n```\n\nScenario: the agent edited a file, but it wrote to a path in the base repo instead of the worktree. It then sent a normal final message. Type your answer to two things: 1) which line stops the commit, and 2) one small change that would make this failure easy to diagnose next time."
+     },
+     "gap_id": "proxy-runner-map",
+     "id": "runner-py-speed-tour-1784374366",
+     "kind": "codebase",
+     "links": [
+      {
+       "note": "How git decides a file is changed, which is exactly what the commit guard checks.",
+       "title": "Git Basics: Recording Changes",
+       "url": "https://git-scm.com/book/en/v2/Git-Basics-Recording-Changes-to-the-Repository"
+      },
+      {
+       "note": "The command behind change detection, including the porcelain format tools parse.",
+       "title": "git status documentation",
+       "url": "https://git-scm.com/docs/git-status"
+      }
+     ],
+     "minutes": 5,
+     "quiz": [
+      {
+       "answer": 1,
+       "choices": [
+        "The agent's message was too long to store",
+        "Git saw no changed files in the worktree, so a guard clause skipped the commit",
+        "Commits only happen once per session",
+        "The token count was too high"
+       ],
+       "explain": "The commit decision checks the worktree diff, not the chat output, so no changed files means no commit.",
+       "question": "The agent wrote a long final message but no commit appeared. What is the most likely reason?"
+      },
+      {
+       "answer": 2,
+       "choices": [
+        "A test that runs before every commit",
+        "A git hook that blocks bad commits",
+        "A small early check like 'if not changed: return' that exits a function before the main work",
+        "A lock that prevents two agents writing at once"
+       ],
+       "explain": "A guard clause is an early if-return that bails out before the main logic runs.",
+       "question": "What is a guard clause?"
+      }
+     ],
+     "quiz_correct": null,
+     "quiz_total": null,
+     "seconds_spent": 54,
+     "status": "started",
+     "steps": [
+      {
+       "content_md": "You have edited `agitrack/proxy/runner.py` 160 times this month, more than any other file. And your recent question, \"the turn had a final response, so not sure why it wasn't committed,\" lives right in its commit logic. Five minutes of mapping this file means next time a commit goes missing, you can name the suspect function instead of asking the agent to hunt blind.",
+       "title": "Why runner.py, why now"
+      },
+      {
+       "content_md": "Every turn in aGiTrack follows the same shape. Simplified:\n\n```python\ndef run_turn(prompt):\n    agent.send(prompt)          # 1. hand the prompt to the agent\n    agent.wait_for_finish()     # 2. let it work\n    changed = detect_changes()  # 3. ask git what moved\n    maybe_commit(changed)       # 4. commit only if something moved\n```\n\nOne key fact: steps 2 and 4 are independent. The agent finishing is not what triggers a commit.",
+       "title": "The turn lifecycle"
+      },
+      {
+       "content_md": "The commit decision looks at the worktree (the separate folder where the agent is allowed to write), not at the agent's chat output. Roughly:\n\n```python\ndef maybe_commit(changed):\n    if not changed:\n        return  # nothing to commit, turn ends quietly\n    git.commit(message=build_message(), files=changed)\n```\n\nSo an agent can write a long final message, yet if git sees zero changed files in the worktree, the turn ends with no commit. That is exactly the case you hit.",
+       "title": "A response is not a commit"
+      },
+      {
+       "content_md": "Missing commits almost always come from a guard clause, a small `if ... return` that bails out early. The usual ones in this flow:\n\n- no changed files detected\n- files written outside the worktree, so the diff is empty\n- an error during the agent run marked the turn as failed\n\nGuards are fine, but silent guards are debugging pain. A one line log with the skip reason turns a mystery into a grep.",
+       "title": "The silent exits"
+      },
+      {
+       "content_md": "Next time a turn is not committed, do not ask \"why wasn't this committed?\" Instead prompt your agent with a target:\n\n```\nIn agitrack/proxy/runner.py, trace the commit path for the last turn.\nList every guard clause that can skip the commit, tell me which one\nfired, and add a log line with the skip reason.\n```\n\nNaming the file and the guards cuts the correction loops your traces show, since the agent starts in the right place.",
+       "title": "Try this next time"
+      }
+     ],
+     "title": "5-minute tour of runner.py"
+    },
+    {
+     "chat": [],
+     "content_md": "### What happened in your sessions\n\nYour recent edits to `docs/index.html` arrived as a stream of small corrections: remove the \"See supported backends\" link, shorten the hero text, shrink the backends section, then move it above the installation instructions, then drop the em-dashes. Each tweak was reasonable, but each one cost a full agent turn, and 17% of your follow-up turns re-did the previous turn. That is the in-place churn your traces flag.\n\n### The fix: one prompt with acceptance criteria\n\nBefore hitting enter, spend 60 seconds writing the *whole* requirement plus a way to check it. A good one-shot prompt has three parts:\n\n1. **Scope**: which file and section (`docs/index.html`, supported backends section).\n2. **Acceptance criteria**: a short checklist the result must satisfy.\n3. **Verification**: how the agent should prove it is done before reporting back.\n\nHere is what your backends edits could have looked like as one prompt:\n\n```\nIn docs/index.html, rework the supported backends section:\n- Replace the long descriptions with a simple bullet list of backend names\n- Move the section above the installation instructions\n- Remove the \"See supported backends\" jump link from the top\n- Shorten the two hero taglines to one sentence each\n- No em-dashes anywhere on the page\nWhen done, grep the file for em-dashes and confirm the section\norder is backends, then installation. Report the check output.\n```\n\nOne turn, one verified result, nothing to redo.\n\n### Why the verification line matters\n\nWithout it, the agent reports done based on its own edit. With it, the agent runs a concrete check (a grep, a test, opening the page) and catches misses before you do. In your repo, `tests/test_dashboard.py` and a quick `grep` are cheap checks the agent can run itself.\n\n### Try this next time\n\nBefore your next webpage or README prompt, write the bullet checklist first, even in a scratch buffer. If you find yourself typing \"Also...\" mid-thought, that bullet belongs in the same prompt, not the next turn.",
+     "created_at": 1784371904,
+     "exercise": {
+      "attempts": [],
+      "hint": "If you struggle with criteria, describe the end state, not the edits: 'the backends list appears before installation' beats 'move the section up'.",
+      "status": "open",
+      "task": "Pick one small change you want in docs/index.html or README.md. Before opening the agent, write a one-shot prompt in a scratch file with three labeled parts: Scope, Acceptance criteria (3 or more bullets), and Verification (a grep or test command the agent must run and report). Then send it as a single prompt. Success: the agent completes the change and shows the check output, and you send zero correction turns."
+     },
+     "gap_id": "one-shot-requirements",
+     "id": "acceptance-criteria-template-1784371904",
+     "kind": "coding",
+     "links": [
+      {
+       "note": "Anthropic's own guidance on giving agents complete, verifiable instructions up front.",
+       "title": "Claude Code best practices",
+       "url": "https://www.anthropic.com/engineering/claude-code-best-practices"
+      },
+      {
+       "note": "The canonical reference for being clear, direct, and specific in prompts.",
+       "title": "Prompt engineering overview (Anthropic docs)",
+       "url": "https://docs.anthropic.com/en/docs/build-with-claude/prompt-engineering/overview"
+      }
+     ],
+     "minutes": 5,
+     "quiz": [
+      {
+       "answer": 0,
+       "choices": [
+        "Scope, acceptance criteria, verification",
+        "Greeting, request, thanks",
+        "File name, deadline, token budget"
+       ],
+       "explain": "Naming the scope, the checklist of criteria, and how to verify lets the agent finish and check the work in one turn.",
+       "question": "What are the three parts of a good one-shot prompt?"
+      },
+      {
+       "answer": 1,
+       "choices": [
+        "It makes the response longer",
+        "It catches misses in the same turn, avoiding a correction turn",
+        "It reduces token usage"
+       ],
+       "explain": "A verified turn rarely needs a follow-up correction, which is exactly the 17% loop your traces show.",
+       "question": "Why ask the agent to run a check like grep or a test before reporting done?"
+      },
+      {
+       "answer": 2,
+       "choices": [
+        "Send it quickly before the agent finishes",
+        "Save it for a separate session",
+        "That thought belonged as a bullet in the original prompt"
+       ],
+       "explain": "Mid-thought additions are a sign the first prompt was incomplete; fold them into one checklist next time.",
+       "question": "You notice yourself typing \"Also, one more thing...\" as a new message. What does this lesson suggest?"
+      }
+     ],
+     "quiz_correct": null,
+     "quiz_total": null,
+     "seconds_spent": 50,
+     "status": "started",
+     "title": "Write a one-shot prompt for the backends section"
+    }
+   ]
+  }
+ }
+}

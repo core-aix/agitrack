@@ -257,10 +257,13 @@ aGiTrack tracks one session per repository and stays pinned to the session it la
 
 `agitrack --dashboard` (or `-d`) opens a **live, auto-refreshing web dashboard** of your repository — who and what wrote the code — served on `localhost` and opened in your browser. Every number is computed from commit metadata alone, so it's identical on every clone; nothing is sent anywhere.
 
+**Try it without installing:** [agitrack.core-aix.org/dashboard](https://agitrack.core-aix.org/dashboard/) is this dashboard running on aGiTrack's own repository — a static demo regenerated from the real history on every release.
+
 ```bash
 agitrack --dashboard        # start a background daemon on localhost, open the browser, and return to your shell
 agitrack -d stop            # stop that daemon (it also stops when the launching terminal closes)
 agitrack -d text            # one-shot plain-text report instead (pipe it, paste it into an issue)
+agitrack -d export          # write a server-free static copy of the dashboard (see --export-dir) for any static web host
 ```
 
 Re-running `agitrack -d` while a dashboard is already up **restarts** it — the old daemon is stopped and a fresh one started on the same port, so the URL is unchanged. That is the quick way to pick up a new build after an aGiTrack update without hunting down `-d stop` first.
