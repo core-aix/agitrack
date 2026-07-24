@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import time
 import uuid
 from pathlib import Path
 from typing import Any
 
+from agitrack.fileio import atomic_write_text
 from agitrack.proc import console_isolation_kwargs
 
 # The git-resolved .git/info/exclude path per repo root — invariant for a run, so resolve it once
@@ -105,16 +105,13 @@ class AgitrackState:
         return default
 
     def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         self._ensure_repo_local_ignore()
-        # Atomic write: save() runs on every property setter, so an in-place
-        # rewrite interrupted by a crash/SIGKILL/full disk would leave exactly
-        # the truncated file that bricks the next startup.
-        tmp = self.path.with_name(self.path.name + ".tmp")
-        with tmp.open("w", encoding="utf-8") as handle:
-            json.dump(self.data, handle, indent=2, sort_keys=True)
-            handle.write("\n")
-        os.replace(tmp, self.path)
+        # Atomic write (unique tmp, see fileio): save() runs on every property setter, so
+        # an in-place rewrite interrupted by a crash/SIGKILL/full disk would leave exactly
+        # the truncated file that bricks the next startup — and a FIXED tmp name crashed
+        # whenever a second aGiTrack process (dashboard, export, tracker) saved this same
+        # repo's state concurrently.
+        atomic_write_text(self.path, json.dumps(self.data, indent=2, sort_keys=True) + "\n")
 
     def ensure_local_ignore(self) -> None:
         """Make sure ``.agitrack/`` is git-ignored for this repo (idempotent). Call this before
@@ -621,12 +618,7 @@ class AgitrackState:
         self._save_config()
 
     def _save_config(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.config_path.with_name(self.config_path.name + ".tmp")
-        with tmp.open("w", encoding="utf-8") as handle:
-            json.dump(self.config, handle, indent=2, sort_keys=True)
-            handle.write("\n")
-        os.replace(tmp, self.config_path)
+        atomic_write_text(self.config_path, json.dumps(self.config, indent=2, sort_keys=True) + "\n")
 
     def append_trace(self, role: str, content: str) -> None:
         trace = self.pending_trace()
