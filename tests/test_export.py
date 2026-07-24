@@ -83,6 +83,11 @@ def test_export_disables_filters_and_cans_learn_actions(tmp_path, monkeypatch):
     # Agent-driven POSTs answer with the install hint; suggest re-serves the profile.
     assert "static demo" in learn
     assert "learn/suggest" in learn
+    # Demo navigation: the logo leads to the main webpage from both pages, and the learn
+    # page's dashboard link points one level up (it is a directory in the demo).
+    assert '"../"' in index and "homelink" in index
+    assert '"../../"' in learn and "homelink" in learn
+    assert 'back.href = "../"' in learn
 
 
 def test_export_learn_state_falls_back_to_the_single_store_profile(tmp_path, monkeypatch):
