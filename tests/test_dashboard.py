@@ -118,6 +118,7 @@ def test_backtrace_log_explains_what_the_entries_are(tmp_path):
     html = shell_html(_seeded(tmp_path))
     assert 'id="logintro" hidden' in html
     assert "reconstructed agent turn" in html
+    assert "subject line of each entry is the user prompt</b> that started that turn" in html
     assert "--backtrace commit</code> bakes the rest" in html
     unhide = html.index('$("logintro"); if(li) li.hidden = false')
     assert html.index("if(!BACKTRACE) return;") < unhide  # backtrace-only, hidden on the live page

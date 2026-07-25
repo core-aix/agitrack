@@ -1227,9 +1227,10 @@ __UPDATE_BANNER__
   <div class="logpane" id="pane-commits">
     <div class="logintro" id="logintro" hidden>Each entry below is one <b>reconstructed agent turn</b> from your
     local session transcripts: what was asked, the agent's reply, and the file changes it recovered, shown like a
-    commit. Nothing here has been written to git; a turn with a <b>committed</b> badge is already in your history
-    with aGiTrack metadata, and <code>agitrack --backtrace commit</code> bakes the rest into real commits on a new
-    branch.</div>
+    commit. The <b>subject line of each entry is the user prompt</b> that started that turn of the conversation
+    with the agent. Nothing here has been written to git; a turn with a <b>committed</b> badge is already in your
+    history with aGiTrack metadata, and <code>agitrack --backtrace commit</code> bakes the rest into real commits
+    on a new branch.</div>
     <div class="panehead"><div class="logsort"><label for="f-sort">sort</label><select id="f-sort" title="Sort the filtered commits">
       <option value="date">newest first</option>
       <option value="lines">most lines changed</option>
