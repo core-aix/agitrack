@@ -163,6 +163,10 @@ def test_dashboard_is_usable_at_phone_width(tmp_path):
     html = shell_html(_seeded(tmp_path))
     phone = html.split("@media (max-width:760px)", 1)[1]
     assert ".controls{position:relative;flex-wrap:wrap" in phone
+    # The inline top offset stackStickyBanner() sets for the sticky desktop bar must be
+    # neutralized here: on the relative phone bar it shoved the bar down, leaving a
+    # banner-sized blank gap at the top of narrow backtrace pages.
+    assert "top:auto !important" in phone.split("}", 2)[0] + phone.split("}", 2)[1]
     assert ".backtracebanner code{color:var(--fg)" in html
 
 
