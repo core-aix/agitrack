@@ -358,9 +358,20 @@ _TOKEN_KEYS = (
 def _tokens_dict(turn: SessionTurn) -> dict[str, int]:
     """The turn's token usage as the dashboard's ``tokens`` dict — the same per-bucket keys a
     real aGiTrack commit records (input/output/reasoning/cache_read/cache_write and their
-    subagent_* counterparts), dropping zeros and the derived ``total``/``context`` fields."""
+    subagent_* counterparts), dropping zeros and the derived ``total``/``context`` fields.
+
+    The issue-#14 input convention applies here exactly as in commit metadata
+    (commits/message.py): cache-creation tokens ARE fresh input, processed once and written
+    to the cache, so ``input`` counts uncached + cache_write. Raw API buckets made a
+    cached-heavy turn show an impossible handful of input tokens (fewer than the prompt's
+    words) and put cache_write above input, which the convention forbids."""
     data = turn.tokens.to_dict()
-    return {key: value for key in _TOKEN_KEYS if isinstance((value := data.get(key)), int) and value > 0}
+    tokens = {key: value for key in _TOKEN_KEYS if isinstance((value := data.get(key)), int) and value > 0}
+    if tokens.get("cache_write"):
+        tokens["input"] = tokens.get("input", 0) + tokens["cache_write"]
+    if tokens.get("subagent_cache_write"):
+        tokens["subagent_input"] = tokens.get("subagent_input", 0) + tokens["subagent_cache_write"]
+    return tokens
 
 
 def _message(source: _Source, session_id: str, turn: SessionTurn) -> str:

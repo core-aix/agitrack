@@ -1769,3 +1769,15 @@ def test_dashboard_masks_paths_in_historical_commit_messages(tmp_path):
     assert stat.kind == "agent"
     assert stat.backend == "claude" and stat.model == "m1"
     assert stat.tokens.get("input") == 10
+
+
+def test_parse_tokens_heals_legacy_raw_input_blocks():
+    # Pre-issue-#14 commits recorded input as the RAW uncached count (input < cache_write,
+    # impossible under the convention); the collector restores input = uncached +
+    # cache_write at read time. Modern blocks (input >= cache_write) are untouched.
+    from agitrack.metrics.collect import _parse_tokens
+
+    legacy = _parse_tokens({"tokens_since_last_commit_input": "5", "tokens_since_last_commit_cache_write": "100"})
+    assert legacy["input"] == 105 and legacy["cache_write"] == 100
+    modern = _parse_tokens({"tokens_since_last_commit_input": "105", "tokens_since_last_commit_cache_write": "100"})
+    assert modern["input"] == 105

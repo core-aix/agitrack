@@ -53,6 +53,8 @@ Conventions:
 | Failed attempt does not double-count tokens | `test_agent_commit_failed_attempt_does_not_double_count_tokens` | mock |
 | Backend-made commits → cover commit (hashes preserved) | `test_clean_tree_covers_backend_commits_without_rewriting_them`, `test_cover_commit_*` | real-git |
 | Token usage / reasoning effort / compactions recorded | `test_commit_turns_records_latest_reasoning_effort`, `test_commit_turns_surfaces_compactions_and_clears_origin_event` | mock |
+| A force-captured turn re-committed after finishing counts its tokens EXACTLY ONCE (partial recorded, re-commit adds the delta; floors at zero) — restarts mid-turn no longer inflate recorded tokens | `test_partial_turn_recommit_adds_only_the_token_delta`, `test_partial_turn_delta_never_goes_negative` | mock |
+| Input-includes-cache-write convention (issue #14) holds on EVERY surface: backtrace turn stats apply it, and the collector heals pre-#14 legacy blocks at read time (input can never show below cache_write) | `test_turn_tokens_apply_the_input_includes_cache_write_convention`, `test_parse_tokens_heals_legacy_raw_input_blocks` | mock |
 
 ## 4. Interruption & follow-ups (timing)
 | Sequence | Test(s) | Kind |

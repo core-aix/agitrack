@@ -320,7 +320,7 @@ class CommitEngine:
                         self.state.append_trace("user", followup)
                 for message in self._agent_messages_for(turn):
                     self.state.append_trace("agent", message)
-                self.state.add_token_usage(turn.tokens)
+                self._add_turn_usage(turn)
             prompts = [p for turn in turns for p in ([turn.user_prompt, *turn.queued_followups]) if p]
             subject_text = " / ".join(prompts) if prompts else f"{backend} changes"
         else:
@@ -427,7 +427,7 @@ class CommitEngine:
 
             # Accumulate tokens only once we know the commit (or cover) will happen.
             for turn in turns:
-                self.state.add_token_usage(turn.tokens)
+                self._add_turn_usage(turn)
 
             subject_text = " / ".join(subject_prompts) if subject_prompts else f"{backend} changes"
 
@@ -788,6 +788,14 @@ class CommitEngine:
             mark_id = watermark.assistant_message_id or watermark.user_message_id if watermark else None
             if mark_id:
                 self.state.set_backend_message_id(self.state.backend_session_id, mark_id)
+            if watermark is not None and not watermark.assistant_message_id and watermark.user_message_id:
+                # Force-captured mid-turn: the next parse re-exports this turn INCLUSIVELY
+                # once it finishes. Remember the usage counted SO FAR (cumulative, so a
+                # second force-capture of the same still-running turn updates it) and
+                # _add_turn_usage adds only the delta on the re-commit.
+                self.state.set_partial_turn_usage(
+                    self.state.backend_session_id, watermark.user_message_id, watermark.tokens.to_dict()
+                )
             debug_fn(
                 f"agent commit created session_id={self.state.backend_session_id} "
                 f"assistant_id={self.state.last_backend_message_id}"
@@ -894,6 +902,39 @@ class CommitEngine:
     # ------------------------------------------------------------------
     # Simple state helpers
     # ------------------------------------------------------------------
+
+    def _add_turn_usage(self, turn) -> None:
+        """Accumulate a turn's tokens EXACTLY ONCE across commits.
+
+        A turn can legitimately appear in TWO commits: force-captured while still
+        running (exit/teardown with ``require_complete=False`` — the watermark then
+        falls back to its user id), and again once finished, because ``turns_after``
+        re-exports the watermark turn INCLUSIVELY when it has since gained a final
+        response (the crash-recovery continuation). Adding ``turn.tokens`` blindly on
+        the re-commit counted the whole — by then much larger — turn a second time;
+        with several restarts inside one long turn this inflated the recorded tokens
+        13-26x (2026-07-25). The first commit records what it counted
+        (``partial_turn_tokens``); the re-commit adds only the delta."""
+        from agitrack.backends.base import TokenUsage
+
+        usage = turn.tokens
+        recorded = self.state.partial_turn_usage()
+        if (
+            recorded
+            and recorded.get("user_id") == turn.user_message_id
+            and recorded.get("session_id") == self.state.backend_session_id
+        ):
+            prior = recorded.get("usage") or {}
+            delta = TokenUsage(
+                **{
+                    field: max(0, getattr(usage, field) - int(prior.get(field) or 0))
+                    for field in TokenUsage._SUM_FIELDS
+                }
+            )
+            delta.context = usage.context
+            usage = delta
+            self.state.clear_partial_turn_usage()
+        self.state.add_token_usage(usage)
 
     def record_user_prompt(self, prompt_text: str) -> None:
         """Append a user prompt to the pending trace (no-op if empty or a bare

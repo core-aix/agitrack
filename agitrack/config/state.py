@@ -631,6 +631,25 @@ class AgitrackState:
         self.data["pending_token_usage"] = self._default()["pending_token_usage"]
         self.save()
 
+    # --- partial-turn token accounting (see CommitEngine._add_turn_usage) -----------
+    # A turn force-captured while still running is re-exported INCLUSIVELY once it
+    # finishes (the watermark sat on its user id). This records what its first commit
+    # already counted, so the re-commit adds only the delta instead of the whole,
+    # now-larger turn again — the mechanism behind the 13-26x token inflation seen on
+    # days with restarts mid-turn (2026-07-25).
+
+    def partial_turn_usage(self) -> dict | None:
+        record = self.data.get("partial_turn_tokens")
+        return record if isinstance(record, dict) else None
+
+    def set_partial_turn_usage(self, session_id: str | None, user_id: str, usage: dict) -> None:
+        self.data["partial_turn_tokens"] = {"session_id": session_id, "user_id": user_id, "usage": usage}
+        self.save()
+
+    def clear_partial_turn_usage(self) -> None:
+        if self.data.pop("partial_turn_tokens", None) is not None:
+            self.save()
+
     def pending_token_usage(self) -> dict[str, int | None]:
         usage = dict(self._default()["pending_token_usage"])
         usage.update(self.data.get("pending_token_usage") or {})

@@ -1070,3 +1070,13 @@ def test_backtrace_cold_start_does_not_request_a_port(monkeypatch, tmp_path):
 
     assert bt.start_backtrace_daemon(tmp_path, owner_pid=999, open_browser=False) == 0
     assert "--dashboard-port" not in spawned_cmd
+
+
+def test_turn_tokens_apply_the_input_includes_cache_write_convention():
+    # Same convention as commit metadata (issue #14): cache-creation tokens ARE fresh
+    # input. Raw API buckets made a cached-heavy turn show fewer input tokens than its
+    # prompt had words, with cache_write impossibly above input.
+    turn = _turn("p", tokens=TokenUsage(input=5, output=7, cache_write=100, cache_read=1000))
+    tokens = bt._tokens_dict(turn)
+    assert tokens["input"] == 105  # uncached + cache_write
+    assert tokens["cache_write"] == 100 and tokens["cache_read"] == 1000 and tokens["output"] == 7
