@@ -848,6 +848,15 @@ def _parse_tokens(metadata: dict[str, str]) -> dict[str, int]:
             tokens[key.removeprefix(_TOKEN_KEY_PREFIX)] = int(value)
         elif key in ("summary_tokens_input", "summary_tokens_output") and value.isdigit():
             tokens["summary_" + key.removeprefix("summary_tokens_")] = int(value)
+    # Heal pre-issue-#14 metadata at read time: commits from before 2026-06-12 recorded
+    # ``input`` as the RAW uncached count, so input < cache_write there — impossible under
+    # the convention (input counts uncached + cache_write) and enough fossil blocks exist
+    # to flip the whole dashboard's aggregate. A legacy block is exactly one where input
+    # < cache_write (a modern block always has input >= cache_write), so restore the
+    # convention by adding cache_write in; modern blocks are never touched.
+    for input_key, cache_key in (("input", "cache_write"), ("subagent_input", "subagent_cache_write")):
+        if tokens.get(cache_key, 0) > tokens.get(input_key, 0):
+            tokens[input_key] = tokens.get(input_key, 0) + tokens[cache_key]
     return tokens
 
 
