@@ -400,6 +400,23 @@ def test_opencode_parse_exported_session_collects_edits():
 # --------------------------------------------------------------------------- collector helpers
 
 
+def test_subject_truncates_at_word_ends_with_ellipsis():
+    # The reconstructed log's subject must never cut a word in half without a marker:
+    # cut at the last word end inside the cap and append an ellipsis (a hard cut only
+    # when one enormous word fills more than half the line). Short prompts pass whole.
+    long = "please rework the dashboard filter bar so that narrow windows compress the selects instead of wrapping the reset button"
+    subject = bt._subject(_turn(long))
+    assert subject.endswith("…")
+    assert len(subject) <= bt._SUBJECT_MAX
+    body = subject[:-1].rstrip()
+    assert long.startswith(body) and long[len(body)] == " "  # the cut landed on a word end
+
+    assert bt._subject(_turn("short prompt stays whole")) == "short prompt stays whole"
+    unbroken = "x" * 200
+    hard = bt._subject(_turn(unbroken))
+    assert hard.endswith("…") and len(hard) == bt._SUBJECT_MAX  # spaceless: hard cut, still marked
+
+
 def _turn(
     prompt: str,
     *,
