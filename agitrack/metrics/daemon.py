@@ -7,15 +7,11 @@ dashboard keeps serving. Recomputing metrics from ``git log`` on every poll is
 real CPU/IO, so hosting it out-of-process also keeps that work (and its energy
 use) off whatever launched it.
 
-The daemon is **bound to whatever launched it** and dies with it — it is never
-left orphaned:
-
-* it watches an *owner* pid (the launching shell for ``agitrack -d``, the TUI
-  process for the Ctrl-G dashboard) and shuts down once that pid goes away —
-  e.g. you close the terminal, or aGiTrack is SIGKILLed with no chance to stop
-  us first; and
-* callers that own it can also stop it explicitly — ``agitrack -d stop`` for the
-  CLI daemon; the Ctrl-G dashboard is terminal-owned and outlives the TUI.
+The daemon is **free-standing**: it survives the launching terminal (and the TUI,
+for the Ctrl-G dashboard) and keeps serving until stopped explicitly with
+``agitrack -d stop`` — or until it restarts itself after an aGiTrack update
+(spawn-and-verify handoff in ``run_dashboard_daemon``). An optional *owner* pid
+watchdog remains for callers that want a bound daemon (``_watch_owner``).
 
 The child publishes a small handshake file (``<repo>/.agitrack/dashboard.json``)
 recording the port it actually bound, so the launcher can show the URL and open a
@@ -349,13 +345,10 @@ def run_dashboard_daemon(
                 name="agitrack-dashboard-owner-watch",
             ).start()
 
-        restart_cmd: list[str] | None = None
+        restart_wanted = threading.Event()
 
-        def _restart_for_update(
-            _version: str, *, _stop: threading.Event = stop, _server: Any = server, _port: int = bound_port
-        ) -> None:
-            nonlocal restart_cmd
-            restart_cmd = update_restart.restart_command(["--dashboard-port", str(_port)])
+        def _restart_for_update(_version: str, *, _stop: threading.Event = stop, _server: Any = server) -> None:
+            restart_wanted.set()
             _stop.set()
             threading.Thread(target=_server.shutdown, daemon=True).start()
 
@@ -367,11 +360,23 @@ def run_dashboard_daemon(
             server.server_close()
             clear_handshake(repo)
             daemons.deregister()
-        if explicit_stop.is_set() or restart_cmd is None:
+        if explicit_stop.is_set() or not restart_wanted.is_set():
             return 0
-        update_restart.exec_replacement(restart_cmd)
-        # Only reached when the exec FAILED: serve again on the current code (same
-        # port), stay stoppable and visible, and retry on the next detection.
+        # Restart by SPAWN-AND-VERIFY, not exec: a replacement running a broken update
+        # could crash on startup, and an exec'd-over process has nothing left to retry
+        # with. Here the old daemon only exits once the replacement has provably bound
+        # (its own handshake, correlated on its pid); otherwise it reaps the corpse and
+        # serves on, retrying on the next detection — until the user stops it.
+        try:
+            child = spawn_dashboard_daemon(repo, port=bound_port, email_logins=email_logins)
+            record = wait_for_handshake(repo, pid=child.pid, timeout=20.0)
+        except Exception:
+            child, record = None, None
+        if record is not None:
+            print(f"restarted onto the updated aGiTrack (pid {record.get('pid')}).", flush=True)
+            return 0
+        if child is not None and child.poll() is None:
+            child.terminate()
         print("update restart failed; still serving on the current version and retrying.", flush=True)
         bind_port = bound_port
 
