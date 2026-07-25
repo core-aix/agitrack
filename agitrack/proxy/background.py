@@ -611,24 +611,40 @@ class BackgroundRunner:
         )
         # aGiTrack updated on disk: leave the loop, tear down WITHOUT force-capturing an
         # in-flight turn (the replacement resumes tracking it via the persisted watermark),
-        # then replace this process with the new code.
+        # then replace this process with the new code. When the exec FAILS, the loop below
+        # goes back to tracking on the current version — handshake restored, stop commands
+        # still honored — and retries on the next detection, until the restart succeeds or
+        # the user stops the tracker.
         from agitrack.update import restart as update_restart
 
         self._restart_cmd: list[str] | None = None
+        self._explicit_stop = False
 
         def _restart_for_update(_version: str) -> None:
             self._restart_cmd = update_restart.restart_command()
             self._stop.set()
 
-        update_restart.watch_for_update(self._stop, _restart_for_update)
-
-        try:
-            self._loop()
-        finally:
-            self._teardown(restarting=self._restart_cmd is not None)
-        if self._restart_cmd:
+        while True:
+            update_restart.watch_for_update(self._stop, _restart_for_update)
+            try:
+                self._loop()
+            finally:
+                self._teardown(restarting=self._restart_cmd is not None and not self._explicit_stop)
+            if self._restart_cmd is None or self._explicit_stop:
+                return 0
             update_restart.exec_replacement(self._restart_cmd, log=self._print)
-        return 0
+            # Only reached when the exec FAILED: resume tracking on the current code.
+            self._print(
+                "update restart failed; continuing to track on the current version and "
+                "retrying. Stop with `agitrack -b stop`."
+            )
+            self._restart_cmd = None
+            self._stop.clear()
+            # Undo the teardown: visibility (handshake + --daemons registry, both via
+            # _write_handshake) and the commit hooks come back before tracking resumes.
+            self._write_handshake()
+            self._manual.setup()
+            self._install_autotrack_hook()
 
     def _teardown(self, *, restarting: bool = False) -> None:
         # Record any final turn (and, in auto mode, fold it) before stopping. `require_complete
@@ -766,6 +782,9 @@ class BackgroundRunner:
 
     def _install_signal_handlers(self) -> None:
         def handler(_signum, _frame):
+            # An EXPLICIT stop (agitrack -b stop / owner teardown): the retry loop in
+            # run() must exit even when an update restart is pending or has failed.
+            self._explicit_stop = True
             self._stop.set()
 
         for sig in (signal.SIGINT, signal.SIGTERM):

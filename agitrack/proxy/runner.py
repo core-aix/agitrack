@@ -964,8 +964,9 @@ class ProxyRunner:
         # The metrics dashboard, when started from the Ctrl-G menu, runs as a separate
         # background process (read-only HTTP server) rather than in-process, so its git
         # log work and energy use are charged to that child, not the TUI (#110). It is
-        # killed when aGiTrack exits (_stop_dashboard, plus the child's own parent-death
-        # watchdog). None until first started.
+        # a detached daemon (like `agitrack -d`), so it keeps running after aGiTrack
+        # quits — and after the terminal closes — until `agitrack -d stop`.
+        # None until first started; the handle only powers the "already running" fast path.
         self._dashboard_proc: "subprocess.Popen[bytes] | None" = None
         self._dashboard_url: str | None = None
         # The port the dashboard child actually bound, so the remote-access hint can name it
@@ -1473,7 +1474,8 @@ class ProxyRunner:
                 signal.signal(signum, handler)
             self._stop_git_worker()  # join before tearing the worktree/PTY down
             self._stop_file_watcher()
-            self._stop_dashboard()
+            # Deliberately NOT stopping a Ctrl-G dashboard here: it is terminal-owned and
+            # keeps serving after aGiTrack quits (stops with the terminal or `-d stop`).
             self._remove_base_commit_guard()  # uninstall the pre-commit guard + restore any chained hook
             self._teardown_manual_commit_mode()  # uninstall the manual-commit hooks + restore any chained
             self._cleanup_child()
@@ -9103,8 +9105,9 @@ class ProxyRunner:
         """Ctrl-G → "dashboard": serve aGiTrack's metrics dashboard for this repo and
         open it in the browser. The dashboard is read-only and runs as a separate
         background process (#110) — keeping its git-log work and energy use off the TUI
-        process — owned by this aGiTrack so it is reused if already up and killed on exit
-        (here and via the child's own owner-death watchdog)."""
+        process — a detached daemon exactly like `agitrack -d`: it keeps running after
+        aGiTrack quits (and after the terminal closes) until `agitrack -d stop`. A popup
+        says so the first time it starts."""
         from agitrack.metrics import (
             clear_handshake,
             log_path,
@@ -9146,9 +9149,9 @@ class ProxyRunner:
             return
         try:
             clear_handshake(self.base_repo)  # drop any record from a dead earlier daemon
-            proc = spawn_dashboard_daemon(
-                self.base_repo, owner_pid=os.getpid(), email_logins=self._dashboard_email_logins()
-            )
+            # No owner pid: the dashboard is a free-standing daemon (exactly like
+            # `agitrack -d`) that keeps serving after aGiTrack quits, until stopped.
+            proc = spawn_dashboard_daemon(self.base_repo, email_logins=self._dashboard_email_logins())
             record = wait_for_handshake(self.base_repo, pid=proc.pid, timeout=5.0)
             if record is None:
                 # The child died before binding, or never published. Reap it and point
@@ -9166,10 +9169,21 @@ class ProxyRunner:
             # Only open a browser when it would land on THIS machine; on a remote/SSH/
             # Mosh host, tell the user how to reach the forwarded URL from their own
             # machine instead of opening a (headless) browser on the remote.
-            if open_dashboard_in_browser(url):
-                self._set_message(f"Dashboard live at {url} — opening in your browser.")
-            else:
-                self._set_message(f"Dashboard live. {remote_browser_hint(url, port)}")
+            opened = open_dashboard_in_browser(url)
+            self._select_popup(
+                f"Dashboard live at {url}",
+                ["ok"],
+                detail=[
+                    "The dashboard runs as its own daemon: it KEEPS RUNNING after you quit aGiTrack",
+                    "(even after this terminal closes). Stop it any time with: agitrack -d stop",
+                ]
+                + ([] if opened else [remote_browser_hint(url, port)]),
+            )
+            self._set_message(
+                f"Dashboard live at {url} — opening in your browser."
+                if opened
+                else f"Dashboard live. {remote_browser_hint(url, port)}"
+            )
         except Exception as error:
             self._set_message(f"Could not start the dashboard: {error}")
         self._render()
@@ -9187,34 +9201,6 @@ class ProxyRunner:
         except Exception:
             pass
         return {}
-
-    def _stop_dashboard(self) -> None:
-        """Kill the dashboard process if it was started this session.
-
-        Called on the TUI's teardown path so the dashboard never outlives aGiTrack.
-        (The child also self-terminates via its owner-death watchdog, which covers a
-        SIGKILL of the TUI where this never runs.)"""
-        proc = self._dashboard_proc
-        if proc is None:
-            return
-        self._dashboard_proc = None
-        self._dashboard_url = None
-        self._dashboard_port = 0
-        try:
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-        except Exception:
-            pass
-        try:
-            from agitrack.metrics import clear_handshake
-
-            clear_handshake(self.base_repo)
-        except Exception:
-            pass
 
     def _popup_read_input(self) -> bytes:
         # Read the user's next keypress for a modal popup WITHOUT suspending the

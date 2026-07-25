@@ -10,7 +10,6 @@ commit (#58), and an agent-merge.
 from pathlib import Path
 
 import json
-import os
 import re
 import sys
 import threading
@@ -1658,9 +1657,9 @@ def test_cli_dashboard_html_is_default_and_starts_daemon(tmp_path, monkeypatch):
 
     assert rc == 0
     assert started["repo"].repo == GitRepo.discover(tmp_path).repo
-    # The daemon is owned by the launching shell (this process's parent) so it dies
-    # when that terminal closes.
-    assert started["owner_pid"] == os.getppid()
+    # Free-standing: no owner pid, so the daemon survives the launching terminal and
+    # runs until `agitrack -d stop` (or an update self-restart).
+    assert started["owner_pid"] is None
 
 
 def test_cli_dashboard_shorthand_d_starts_daemon_like_dashboard(tmp_path, monkeypatch):

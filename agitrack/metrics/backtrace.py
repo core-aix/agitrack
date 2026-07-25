@@ -1020,10 +1020,12 @@ def _running_handshake(directory: Path) -> dict | None:
     return None
 
 
-def start_backtrace_daemon(directory: Path, *, owner_pid: int, open_browser: bool = True, timeout: float = 90.0) -> int:
+def start_backtrace_daemon(
+    directory: Path, *, owner_pid: int | None = None, open_browser: bool = True, timeout: float = 90.0
+) -> int:
     """`agitrack --backtrace` (html): start the background backtrace daemon for ``directory``,
-    then return to the shell. The daemon dies when the launching terminal closes (owner-pid
-    watchdog) or via `agitrack --backtrace stop`.
+    then return to the shell. The daemon is NOT bound to the launching terminal: it keeps
+    serving until `agitrack --backtrace stop` (and restarts itself after aGiTrack updates).
 
     Like ``agitrack -d``, re-running while a daemon is already up RESTARTS it — the old one is
     stopped and a fresh one started on the same port, so the URL is unchanged and a re-run
@@ -1060,9 +1062,9 @@ def start_backtrace_daemon(directory: Path, *, owner_pid: int, open_browser: boo
         "--repo",
         str(directory),
         "--backtrace-serve",
-        "--dashboard-owner-pid",
-        str(owner_pid),
     ]
+    if owner_pid is not None:
+        cmd += ["--dashboard-owner-pid", str(owner_pid)]
     if reuse_port is not None:
         cmd += ["--dashboard-port", str(reuse_port)]
     # The child must load the INSTALLED aGiTrack, never a stray ``agitrack/`` package in the
@@ -1103,7 +1105,7 @@ def start_backtrace_daemon(directory: Path, *, owner_pid: int, open_browser: boo
         + record.get("banner", "")
         + "\n"
         + exposure_note(str(record.get("host", "")))
-        + "Runs in the background; stops when this terminal closes or `agitrack --backtrace stop`."
+        + "Runs in the background (surviving this terminal) until `agitrack --backtrace stop`."
     )
     _maybe_open(url, record, open_browser)
     return 0
@@ -1231,66 +1233,84 @@ def run_backtrace_daemon(
         return 0
 
     handler = _make_handler(view)
-    # Consecutive ports (8765, 8766, …) so a backtrace started alongside a dashboard — or a
-    # second backtrace — gets a predictable neighbouring URL instead of a random one.
-    server = bind_scanning(lambda address: _DashboardServer(address, handler), bind_host, preferred_port)
-    bound_port = int(server.server_address[1])
-    url = dashboard_url(bind_host, bound_port)
-    _write_handshake(
-        directory,
-        {
-            "pid": os.getpid(),
-            "host": bind_host,
-            "port": bound_port,
-            "url": url,
-            "banner": view.banner_text(),
-            "started": int(time.time()),
-        },
-    )
-    from agitrack import daemons
+    from agitrack.update import restart as update_restart
 
-    daemons.register("backtrace", directory, url=url)
-
-    stop = threading.Event()
+    # Mutable view of the CURRENT serve cycle for the signal handlers (installed once):
+    # an explicit stop must always work, including between a failed update-restart and
+    # the next cycle's bind (see the retry loop below).
+    current: dict = {"server": None, "stop": None}
+    explicit_stop = threading.Event()
 
     def _request_shutdown(*_: object) -> None:
-        stop.set()
-        threading.Thread(target=server.shutdown, daemon=True).start()
+        explicit_stop.set()
+        stop = current.get("stop")
+        server = current.get("server")
+        if stop is not None:
+            stop.set()
+        if server is not None:
+            threading.Thread(target=server.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGTERM, _request_shutdown)
     signal.signal(signal.SIGINT, _request_shutdown)
-    if owner_pid:
-        threading.Thread(
-            target=_watch_owner,
-            args=(owner_pid, stop, _request_shutdown),
-            daemon=True,
-            name="agitrack-backtrace-owner-watch",
-        ).start()
 
-    # aGiTrack updated on disk: restart onto the new code (after normal cleanup below),
-    # pinning the bound port so the URL the user has open survives the swap.
-    from agitrack.update import restart as update_restart
-
-    restart_cmd: list[str] | None = None
-
-    def _restart_for_update(_version: str) -> None:
-        nonlocal restart_cmd
-        restart_cmd = update_restart.restart_command(["--dashboard-port", str(bound_port)])
-        _request_shutdown()
-
-    update_restart.watch_for_update(stop, _restart_for_update)
-
-    try:
-        server.serve_forever()
-    finally:
-        server.server_close()
-        _clear_handshake(directory)
+    while True:
+        # Consecutive ports (8765, 8766, …) so a backtrace started alongside a dashboard — or a
+        # second backtrace — gets a predictable neighbouring URL instead of a random one.
+        server = bind_scanning(lambda address: _DashboardServer(address, handler), bind_host, preferred_port)
+        bound_port = int(server.server_address[1])
+        url = dashboard_url(bind_host, bound_port)
+        _write_handshake(
+            directory,
+            {
+                "pid": os.getpid(),
+                "host": bind_host,
+                "port": bound_port,
+                "url": url,
+                "banner": view.banner_text(),
+                "started": int(time.time()),
+            },
+        )
         from agitrack import daemons
 
-        daemons.deregister()
-    if restart_cmd:
+        daemons.register("backtrace", directory, url=url)
+
+        stop = threading.Event()
+        current.update(server=server, stop=stop)
+        if explicit_stop.is_set():  # a stop landed while we were between cycles
+            stop.set()
+            threading.Thread(target=server.shutdown, daemon=True).start()
+
+        if owner_pid:
+            threading.Thread(
+                target=_watch_owner,
+                args=(owner_pid, stop, _request_shutdown),
+                daemon=True,
+                name="agitrack-backtrace-owner-watch",
+            ).start()
+
+        restart_cmd: list[str] | None = None
+
+        def _restart_for_update(_version: str, *, _stop=stop, _server=server, _port: int = bound_port) -> None:
+            nonlocal restart_cmd
+            restart_cmd = update_restart.restart_command(["--dashboard-port", str(_port)])
+            _stop.set()
+            threading.Thread(target=_server.shutdown, daemon=True).start()
+
+        update_restart.watch_for_update(stop, _restart_for_update)
+
+        try:
+            server.serve_forever()
+        finally:
+            server.server_close()
+            _clear_handshake(directory)
+            daemons.deregister()
+        if explicit_stop.is_set() or restart_cmd is None:
+            return 0
         update_restart.exec_replacement(restart_cmd)
-    return 0
+        # Only reached when the exec FAILED: serve again on the current code (same
+        # port), stay stoppable and visible in --daemons, retry on the next detection.
+        print("update restart failed; still serving on the current version and retrying.", flush=True)
+        preferred_port = bound_port
 
 
 def _open_log(directory: Path):

@@ -15,7 +15,7 @@ left orphaned:
   e.g. you close the terminal, or aGiTrack is SIGKILLed with no chance to stop
   us first; and
 * callers that own it can also stop it explicitly — ``agitrack -d stop`` for the
-  CLI daemon, ``_stop_dashboard`` on the TUI's teardown path.
+  CLI daemon; the Ctrl-G dashboard is terminal-owned and outlives the TUI.
 
 The child publishes a small handshake file (``<repo>/.agitrack/dashboard.json``)
 recording the port it actually bound, so the launcher can show the URL and open a
@@ -127,16 +127,18 @@ def wait_for_handshake(repo: GitRepo, *, pid: int, timeout: float) -> dict[str, 
 def spawn_dashboard_daemon(
     repo: GitRepo,
     *,
-    owner_pid: int,
+    owner_pid: int | None = None,
     email_logins: dict[str, str] | None = None,
     port: int | None = None,
 ) -> subprocess.Popen[bytes]:
     """Launch the detached dashboard child and return its Popen handle.
 
     The child is started in its own session (``start_new_session``) so it survives
-    the launcher returning and is not hit by Ctrl-C in the launcher's terminal; the
-    owner-pid watchdog is what ends it. stdout/stderr go to a log file so a startup
-    failure is recoverable. Shared by the CLI (``agitrack -d``) and the TUI.
+    the launcher returning and is not hit by Ctrl-C in the launcher's terminal. It
+    keeps running until stopped explicitly (``agitrack -d stop``) or it restarts
+    itself after an aGiTrack update; ``owner_pid`` optionally binds it to a watcher
+    pid instead. stdout/stderr go to a log file so a startup failure is recoverable.
+    Shared by the CLI (``agitrack -d``) and the TUI.
 
     ``port`` requests a specific port (used when restarting to keep the previous URL);
     the child still falls back to an OS-assigned port if it is taken.
@@ -148,9 +150,9 @@ def spawn_dashboard_daemon(
         "--repo",
         str(repo.repo),
         "--dashboard-serve",
-        "--dashboard-owner-pid",
-        str(owner_pid),
     ]
+    if owner_pid is not None:
+        cmd += ["--dashboard-owner-pid", str(owner_pid)]
     if port is not None:
         cmd += ["--dashboard-port", str(port)]
     env = dict(os.environ)
@@ -187,7 +189,7 @@ def _open_log(repo: GitRepo) -> Any:
 def start_dashboard_daemon(
     repo: GitRepo,
     *,
-    owner_pid: int,
+    owner_pid: int | None = None,
     open_browser: bool = True,
     timeout: float = 8.0,
 ) -> int:
@@ -195,8 +197,9 @@ def start_dashboard_daemon(
 
     Restarts a daemon already running for this repo rather than leaving the old one in
     place — so re-running ``agitrack -d`` (e.g. after an aGiTrack update) picks up the new
-    code, reusing the previous port so the URL is unchanged. The launching shell's pid is
-    the owner, so the daemon dies when that terminal closes.
+    code, reusing the previous port so the URL is unchanged. The daemon is NOT bound to
+    the launching terminal: it keeps serving until ``agitrack -d stop`` (and restarts
+    itself after aGiTrack updates).
     """
     running = running_handshake(repo)
     reuse_port: int | None = None
@@ -220,7 +223,7 @@ def start_dashboard_daemon(
     print(
         f"aGiTrack dashboard daemon live at {url} (pid {record.get('pid')}).\n"
         + exposure_note(str(record.get("host", "")))
-        + "Runs in the background; stops when this terminal closes or `agitrack -d stop`."
+        + "Runs in the background (surviving this terminal) until `agitrack -d stop`."
     )
     _maybe_open(url, record, open_browser)
     return 0
@@ -287,64 +290,90 @@ def run_dashboard_daemon(
     Binds the server, publishes the handshake, then blocks in ``serve_forever``.
     Shuts down on SIGTERM/SIGINT (an explicit stop) or when the owner-pid watchdog
     sees the launcher disappear.
-    """
+
+    Once aGiTrack is UPDATED on disk, the daemon restarts itself onto the new code
+    (pinning the bound port so an open URL survives). Each serve pass is one cycle of
+    the loop below: if the exec fails, the daemon binds and serves AGAIN on the current
+    code — handshake re-published, ``--daemons`` registry re-entered, stop commands
+    honored throughout — and retries on the next update detection, until it either
+    restarts successfully or the user stops it (``agitrack -d stop``)."""
+    from agitrack.update import restart as update_restart
+
     bind_host = default_bind_host() if host is None else host
-    server = build_server(repo, host=bind_host, port=port, email_logins=email_logins)
-    bound_port = int(server.server_address[1])
-    # The handshake carries the URL the *launcher* prints, so it must be the reachable
-    # one, not the wildcard bind address (see dashboard_url).
-    url = dashboard_url(bind_host, bound_port)
-    _write_handshake(
-        repo,
-        {"pid": os.getpid(), "host": bind_host, "port": bound_port, "url": url, "started": int(time.time())},
-    )
-    from agitrack import daemons
-
-    daemons.register("dashboard", repo.repo, url=url)
-
-    stop = threading.Event()
+    # Mutable view of the CURRENT cycle for the signal handlers (installed once): an
+    # explicit stop must always work, including in the window between a failed restart
+    # and the next cycle's bind.
+    current: dict[str, Any] = {"server": None, "stop": None}
+    explicit_stop = threading.Event()
 
     def _request_shutdown(*_: Any) -> None:
         # serve_forever() can't be stopped from within its own thread, so shutdown()
         # must run on another one; the Event also stops the watchdog loop.
-        stop.set()
-        threading.Thread(target=server.shutdown, daemon=True).start()
+        explicit_stop.set()
+        stop = current.get("stop")
+        server = current.get("server")
+        if stop is not None:
+            stop.set()
+        if server is not None:
+            threading.Thread(target=server.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGTERM, _request_shutdown)
     signal.signal(signal.SIGINT, _request_shutdown)
 
-    if owner_pid:
-        threading.Thread(
-            target=_watch_owner,
-            args=(owner_pid, stop, _request_shutdown),
-            daemon=True,
-            name="agitrack-dashboard-owner-watch",
-        ).start()
-
-    # aGiTrack updated on disk: restart onto the new code (after normal cleanup below),
-    # pinning the bound port so the URL the user has open survives the swap.
-    from agitrack.update import restart as update_restart
-
-    restart_cmd: list[str] | None = None
-
-    def _restart_for_update(_version: str) -> None:
-        nonlocal restart_cmd
-        restart_cmd = update_restart.restart_command(["--dashboard-port", str(bound_port)])
-        _request_shutdown()
-
-    update_restart.watch_for_update(stop, _restart_for_update)
-
-    try:
-        server.serve_forever()
-    finally:
-        server.server_close()
-        clear_handshake(repo)
+    bind_port = port
+    while True:
+        server = build_server(repo, host=bind_host, port=bind_port, email_logins=email_logins)
+        bound_port = int(server.server_address[1])
+        # The handshake carries the URL the *launcher* prints, so it must be the reachable
+        # one, not the wildcard bind address (see dashboard_url).
+        url = dashboard_url(bind_host, bound_port)
+        _write_handshake(
+            repo,
+            {"pid": os.getpid(), "host": bind_host, "port": bound_port, "url": url, "started": int(time.time())},
+        )
         from agitrack import daemons
 
-        daemons.deregister()
-    if restart_cmd:
+        daemons.register("dashboard", repo.repo, url=url)
+
+        stop = threading.Event()
+        current.update(server=server, stop=stop)
+        if explicit_stop.is_set():  # a stop landed while we were between cycles
+            stop.set()
+            threading.Thread(target=server.shutdown, daemon=True).start()
+
+        if owner_pid:
+            threading.Thread(
+                target=_watch_owner,
+                args=(owner_pid, stop, _request_shutdown),
+                daemon=True,
+                name="agitrack-dashboard-owner-watch",
+            ).start()
+
+        restart_cmd: list[str] | None = None
+
+        def _restart_for_update(
+            _version: str, *, _stop: threading.Event = stop, _server: Any = server, _port: int = bound_port
+        ) -> None:
+            nonlocal restart_cmd
+            restart_cmd = update_restart.restart_command(["--dashboard-port", str(_port)])
+            _stop.set()
+            threading.Thread(target=_server.shutdown, daemon=True).start()
+
+        update_restart.watch_for_update(stop, _restart_for_update)
+
+        try:
+            server.serve_forever()
+        finally:
+            server.server_close()
+            clear_handshake(repo)
+            daemons.deregister()
+        if explicit_stop.is_set() or restart_cmd is None:
+            return 0
         update_restart.exec_replacement(restart_cmd)
-    return 0
+        # Only reached when the exec FAILED: serve again on the current code (same
+        # port), stay stoppable and visible, and retry on the next detection.
+        print("update restart failed; still serving on the current version and retrying.", flush=True)
+        bind_port = bound_port
 
 
 def _watch_owner(owner_pid: int, stop: threading.Event, request_shutdown: Any) -> None:
