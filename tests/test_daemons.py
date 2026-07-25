@@ -116,8 +116,9 @@ def test_list_running_finds_unregistered_daemon_via_ps(monkeypatch, tmp_path):
     class _R:
         stdout = "  501 /usr/bin/python3 -m agitrack --repo /r/one --dashboard-serve --dashboard-owner-pid 1\n"
 
-    # This test exercises the REAL scan (parsing a mocked `_process_command_lines`), so it must not
-    # stub _scan_daemon_processes.
+    # This test exercises the REAL scan (parsing a mocked `_process_command_lines`), so restore it
+    # over the conftest guard that stubs it out for every other test.
+    monkeypatch.setattr(daemons, "_scan_daemon_processes", _real_scan)
     monkeypatch.setattr(daemons, "_process_command_lines", lambda: _R().stdout.splitlines())
     infos = daemons.list_running()
     assert any(i.pid == 501 and i.kind == "dashboard" and i.repo == "/r/one" for i in infos)
