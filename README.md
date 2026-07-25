@@ -202,7 +202,7 @@ agitrack --status         # or -s: is aGiTrack running for this repo, and in whi
 
 > **Great for GUI users.** This is especially useful if you'd rather keep working in a **GUI instead of a terminal** — the **Claude desktop app**, an IDE extension, or any other front-end. Start `agitrack -b` once and keep using your preferred interface; aGiTrack tracks the session and commits your AI work in the background, no terminal UI required.
 
-**It runs as a detached daemon, exactly like the dashboard (`agitrack -d`).** `agitrack -b` starts the tracker in the background and **returns to your shell immediately** — the terminal isn't tied up. Unlike the dashboard daemon it deliberately has **no owner-terminal watchdog**: a tracker keeps running after you close the terminal (that's the point — it should keep tracking), so you stop it explicitly with `agitrack -b stop`. `agitrack -b status` reports whether one is running (and any available update). Re-running `agitrack -b` while a tracker is already running **restarts** it (the old daemon gets a clean shutdown first) — handy after installing an aGiTrack update, since the fresh daemon runs the new code. The daemon logs its startup and per-turn activity to `<repo>/.agitrack/background.log`.
+**It runs as a detached daemon, exactly like the dashboard (`agitrack -d`).** `agitrack -b` starts the tracker in the background and **returns to your shell immediately** — the terminal isn't tied up. Like every aGiTrack daemon it keeps running after you close the terminal, until you stop it explicitly with `agitrack -b stop`. `agitrack -b status` reports whether one is running (and any available update). Re-running `agitrack -b` while a tracker is already running **restarts** it (the old daemon gets a clean shutdown first) — handy after installing an aGiTrack update, since the fresh daemon runs the new code. The daemon logs its startup and per-turn activity to `<repo>/.agitrack/background.log`.
 
 Background mode **always runs without a worktree** (it implies `--no-worktree`), and supports either commit style:
 
@@ -225,7 +225,7 @@ To turn it off at any time, run `agitrack --remove-hooks` — it removes every a
 
 A background daemon periodically checks whether a newer aGiTrack is available (it **never** auto-installs — installing may need pip/pipx/brew/an MSI). When one is found it records it and reminds you where you'll actually see it: in `agitrack -b status`, in the `git commit` output (via the pre-commit hook), and as a banner on the [dashboard](#dashboard). Turn the checks off with `"check_for_updates": false`.
 
-Once you **have** installed an update (through pip/pipx/brew, the MSI, or aGiTrack's own update prompt), every running daemon — the background tracker, the dashboard, and a backtrace — notices the new version on disk within about a minute and **restarts itself onto it**, keeping its port so an open dashboard URL stays valid. No manual rerun needed for daemons; only an interactive TUI session still needs a quit and relaunch to pick up new code.
+Once an update has **fully completed** (through pip/pipx/brew, the MSI, aGiTrack's own update prompt, or a `git pull` on a source install), every running daemon — the background tracker, the dashboard, and a backtrace — notices within a minute or two and **restarts itself onto the new code**, keeping its port so an open dashboard URL stays valid. Half-applied updates never trigger a restart: on a source install the daemons wait for the new commit to have landed, on a pip install for the new version's metadata to be in place. And if a restart attempt fails, the daemon simply keeps running on the current version and retries — it stays visible in `agitrack --daemons` and still honors `agitrack -d stop` / `--backtrace stop` / `-b stop` throughout. Only an interactive TUI session still needs a quit and relaunch to pick up new code.
 
 ### First run and the command menu
 
@@ -238,7 +238,7 @@ sessions                  switch / start (own worktree) / stop a live session
 agent-backend             switch backend (opencode|claude); shows a picker
 git-unstaged              show intentionally unstaged files
 git-commit                commit your changes (folds in pending agent turns in --manual-commits mode)
-dashboard                 serve the metrics dashboard and open it in the browser
+dashboard                 serve the metrics dashboard in the browser (keeps running after aGiTrack quits, until `agitrack -d stop`)
 settings                  view/change all config options (repo-local or global)
 update                    check for / install an aGiTrack self-update
 exit aGiTrack             quit aGiTrack (with confirmation); Esc just closes the menu
@@ -263,7 +263,7 @@ aGiTrack tracks one session per repository and stays pinned to the session it la
 
 ```bash
 agitrack --dashboard        # start a background daemon on localhost, open the browser, and return to your shell
-agitrack -d stop            # stop that daemon (it also stops when the launching terminal closes)
+agitrack -d stop            # stop that daemon (it keeps running otherwise, surviving the terminal)
 agitrack -d text            # one-shot plain-text report instead (pipe it, paste it into an issue)
 agitrack -d export          # write a server-free static copy of the dashboard (see --export-dir) for any static web host
 ```
@@ -315,7 +315,7 @@ agitrack --backtrace stop            # stop the background backtrace daemon
 agitrack --backtrace commit --backtrace-branch tracked-history   # write the reconstruction into real git commits
 ```
 
-- **`--backtrace` (view).** Reads every local session that ran in this directory (or a subdirectory), recovers each turn's file edits from the tool calls, and shows the **same dashboard** — tokens, models, lines changed, the full file browser, and the complete user↔agent trace behind each change — clearly labeled with a frozen banner as a **historical reconstruction, not live repo status**. It runs as a lifecycle-bound background daemon just like `-d` (stops when the terminal closes or via `--backtrace stop`), and like `-d`, re-running `--backtrace` **restarts** a daemon that is already up on the same port, so the URL is unchanged and new sessions are picked up.
+- **`--backtrace` (view).** Reads every local session that ran in this directory (or a subdirectory), recovers each turn's file edits from the tool calls, and shows the **same dashboard** — tokens, models, lines changed, the full file browser, and the complete user↔agent trace behind each change — clearly labeled with a frozen banner as a **historical reconstruction, not live repo status**. It runs as a background daemon just like `-d` (it keeps running, surviving the terminal, until `--backtrace stop`), and like `-d`, re-running `--backtrace` **restarts** a daemon that is already up on the same port, so the URL is unchanged and new sessions are picked up.
 
 - **`--backtrace commit` (bake it in).** Replays your existing git history onto a **new branch** (`--backtrace-branch <name>`), and for each commit whose files an agent turn produced, appends the reconstructed `# Interaction Trace` and `# aGiTrack Metadata` (backend, model, tokens, timings) — so a project built without aGiTrack ends up with a fully tracked history the dashboard understands. Commits with no AI correspondence are kept **verbatim**; trees, authors and dates are preserved exactly.
   - It **rewrites history** (every commit gets a new hash), so it only runs on a new branch, requires a **clean working tree** (commit or `.gitignore` your pending files first), and never touches your current branch. Because the new branch is a rewrite it is **not a fast-forward** of the old one — aGiTrack prints the exact steps to review it and, if you choose, force-replace the old branch. A progress bar shows during the replay.
