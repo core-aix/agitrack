@@ -137,3 +137,14 @@ def test_daemons_cli_empty(monkeypatch, tmp_path, capsys):
 
     assert main(["--daemons"]) == 0
     assert "No aGiTrack daemons are currently running." in capsys.readouterr().out
+
+
+def test_registry_dir_honors_config_dir_isolation(monkeypatch, tmp_path):
+    # The registry must follow AGITRACK_CONFIG_DIR like all other global state: the test
+    # suite isolates that env var, and a registry that ignored it let update-restart
+    # tests run restart_all() against the DEVELOPER'S real registry — killing their
+    # live daemons on every full test run.
+    from agitrack import daemons
+
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path))
+    assert daemons._registry_dir() == tmp_path / "daemons"

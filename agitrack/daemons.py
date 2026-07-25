@@ -46,7 +46,16 @@ _SERVE_FLAGS = (
 
 
 def _registry_dir() -> Path:
-    return Path.home() / ".agitrack" / "daemons"
+    # Honors AGITRACK_CONFIG_DIR like every other global-state path (settings, learn,
+    # summarizer). CRITICAL for the test suite, whose conftest isolates that env var:
+    # the registry previously ignored it, so tests exercising the update-restart path
+    # ran daemons.restart_all() against the DEVELOPER'S real registry — silently
+    # SIGTERM-ing their live dashboards on every full test run.
+    from agitrack.env import getenv_compat
+
+    config_dir = getenv_compat("CONFIG_DIR")
+    base = Path(config_dir).expanduser() if config_dir else Path.home() / ".agitrack"
+    return base / "daemons"
 
 
 def _entry_path(pid: int) -> Path:
