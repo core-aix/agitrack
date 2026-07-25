@@ -161,9 +161,8 @@ def test_dashboard_is_usable_at_phone_width(tmp_path):
     from agitrack.metrics.web import shell_html
 
     html = shell_html(_seeded(tmp_path))
-    assert "flex-wrap:wrap" in html.split(".controls{", 1)[1].split("}", 1)[0]
-    assert "@media (max-width:760px)" in html
-    assert ".controls{position:static" in html
+    phone = html.split("@media (max-width:760px)", 1)[1]
+    assert ".controls{position:relative;flex-wrap:wrap" in phone
     assert ".backtracebanner code{color:var(--fg)" in html
 
 
@@ -1084,12 +1083,17 @@ def test_web_dashboard_embeds_token_hierarchy_and_cache_note(tmp_path):
     assert "#tokens .row + .hint{border-top:1px solid var(--line)" in html
 
 
-def test_filter_bar_wraps_with_a_custom_range_popup(tmp_path):
+def test_filter_bar_keeps_one_row_by_shrinking_fields(tmp_path):
     html = render_html(_demo_repo(tmp_path))
-    # One row on a wide window, but the bar WRAPS on narrower ones instead of forcing a
-    # horizontal page scroll (the old never-wrap row made phones scroll the whole page
-    # sideways; see test_dashboard_is_usable_at_phone_width).
-    assert "flex-wrap:nowrap" not in html
+    # The bar stays a single row on any desktop window: the FIELDS are shrinkable
+    # (min-width:0, no fixed select width), so a narrower window compresses the selects
+    # instead of dropping the reset button to a second line or forcing a horizontal
+    # page scroll. Only the phone layout wraps (test_dashboard_is_usable_at_phone_width).
+    assert "flex:0 1 165px;min-width:0" in html
+    assert "min-width:150px" not in html
+    # The loading badge floats below the bar (absolute against it): showing and hiding
+    # it must never move the reset button.
+    assert ".loading{position:absolute;top:calc(100% + 8px)" in html
     # The redundant "scope" readout (it just echoed the committer filter) is gone.
     assert 'id="scope"' not in html
     # from/to are no longer standalone fields — they live in a custom-range popup

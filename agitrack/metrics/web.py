@@ -798,22 +798,32 @@ header{padding:26px 0 18px}
 .meta select.branchsel:disabled{cursor:default;opacity:1;border-color:transparent;padding:2px 0;background-image:none}
 
 /* ---- filter bar ---- */
-/* One row on a wide window; on anything narrower the fields wrap instead of forcing a
-   horizontal page scroll. (No overflow clipping — the custom-range popup hangs below.) */
+/* One row while sticky: the FIELDS shrink (min-width:0 below) rather than the row
+   wrapping, so a narrower window compresses the selects instead of dropping the reset
+   button to a second line — and never forces a horizontal page scroll. The phone layout
+   (max-width:760px below) is where the bar finally wraps into a grid. (No overflow
+   clipping — the custom-range popup hangs below the bar.) */
 .controls{position:sticky;top:0;z-index:20;margin:22px 0 30px;padding:14px 16px;background:var(--panel);
-  border:1px solid var(--line);border-bottom-width:3px;display:flex;flex-wrap:wrap;gap:16px;align-items:flex-end}
+  border:1px solid var(--line);border-bottom-width:3px;display:flex;flex-wrap:nowrap;gap:16px;align-items:flex-end}
 .controls .prompt{color:var(--phosphor);font-weight:600;align-self:center;white-space:nowrap}
-/* "loading…" badge shown while a filter change re-fetches the data. */
-.loading{margin-left:auto;align-self:center;display:inline-flex;align-items:center;gap:8px;
-  color:var(--phosphor);font-size:13px;white-space:nowrap}
+/* "loading…" badge shown while a filter change re-fetches the data. It FLOATS just below
+   the bar's right corner (absolute against the sticky bar), so appearing and disappearing
+   never moves the reset button or anything else in the row. */
+.loading{position:absolute;top:calc(100% + 8px);right:12px;z-index:30;display:inline-flex;
+  align-items:center;gap:8px;color:var(--phosphor);font-size:13px;white-space:nowrap;
+  background:var(--panel);border:1px solid var(--phosphor-dim);padding:6px 12px;
+  box-shadow:0 10px 26px rgba(0,0,0,.55)}
 .loading[hidden]{display:none}
 .loading .spin{width:13px;height:13px;border:2px solid var(--phosphor-dim);border-top-color:var(--phosphor);
   border-radius:50%;animation:spin .7s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
-.field{display:flex;flex-direction:column;gap:4px}
+/* Fields SHRINK (flex-basis with no fixed min-width) so the bar keeps everything on one
+   line on a desktop window instead of wrapping just the reset button to a second row;
+   below 760px the phone grid takes over. */
+.field{display:flex;flex-direction:column;gap:4px;flex:0 1 165px;min-width:0}
 .field label{font-size:11px;color:var(--amber);letter-spacing:.6px;text-transform:uppercase;white-space:nowrap}
 .field select{appearance:none;background:var(--ink);color:var(--fg);border:1px solid var(--line);
-  font-family:var(--mono);font-size:13.5px;padding:7px 30px 7px 11px;cursor:pointer;min-width:150px;
+  font-family:var(--mono);font-size:13.5px;padding:7px 30px 7px 11px;cursor:pointer;min-width:0;width:100%;
   background-image:linear-gradient(45deg,transparent 50%,var(--phosphor-dim) 50%),linear-gradient(135deg,var(--phosphor-dim) 50%,transparent 50%);
   background-position:calc(100% - 16px) 50%,calc(100% - 11px) 50%;background-size:5px 5px,5px 5px;background-repeat:no-repeat}
 .field select:focus{outline:none;border-color:var(--phosphor)}
@@ -838,13 +848,13 @@ input[type=date]::-webkit-calendar-picker-indicator{filter:invert(.7) sepia(1) h
 /* Phone-width: a wrapped sticky bar would cover half the screen, so the filters become a
    two-column grid that scrolls with the page. */
 @media (max-width:760px){
-  .controls{position:static;gap:10px 12px}
+  /* relative, not static: no stickiness, but still the anchor for the floating badge */
+  .controls{position:relative;flex-wrap:wrap;gap:10px 12px}
   .controls .prompt{width:100%}
   .field{flex:1 1 42%;min-width:0}
   .field select{min-width:0;width:100%}
   .daterange{left:0;right:auto}
   .reset{flex:1 1 42%;margin-left:0}
-  .loading{margin-left:0}
 }
 
 h2.section{font-family:var(--display);font-size:27px;font-weight:400;color:var(--phosphor);letter-spacing:1px;
