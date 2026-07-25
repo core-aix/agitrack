@@ -326,12 +326,25 @@ def _virtual_sha(backend: str, session_id: str, index: int, assistant_id: str) -
     return hashlib.sha1(raw).hexdigest()
 
 
+_SUBJECT_MAX = 100
+
+
 def _subject(turn: SessionTurn) -> str:
-    """A one-line label for the turn: the first non-empty line of its prompt, trimmed."""
+    """A one-line label for the turn: the first non-empty line of its prompt, trimmed.
+    A long line is cut at a WORD end and marked with an ellipsis — never mid-word
+    (mirroring the dashboard's client-side truncSubject; a hard cut remains only when
+    a single word fills more than half the cap)."""
     for line in turn.user_prompt.splitlines():
         line = line.strip()
-        if line:
-            return line[:100]
+        if not line:
+            continue
+        if len(line) <= _SUBJECT_MAX:
+            return line
+        cut = line[: _SUBJECT_MAX - 1]
+        space = cut.rfind(" ")
+        if space > _SUBJECT_MAX / 2:
+            cut = cut[:space]
+        return cut.rstrip() + "…"
     return "(agent turn)"
 
 
