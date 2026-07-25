@@ -124,6 +124,20 @@ def test_backtrace_log_explains_what_the_entries_are(tmp_path):
     assert html.index("if(!BACKTRACE) return;") < unhide  # backtrace-only, hidden on the live page
 
 
+def test_first_paint_never_fetches_the_shared_ref(tmp_path, monkeypatch):
+    # The "/" response must not wait on the network: a slow shared-sessions fetch kept the
+    # browser on a blank tab for seconds, before any loading screen could even arrive.
+    # The recurring /data polls still fetch, so teammates' shares appear moments later.
+    from agitrack.metrics.web import shell_html
+    from agitrack.sessions import SharedSessionStore
+
+    def boom(self):
+        raise AssertionError("shell_html must not fetch the shared ref")
+
+    monkeypatch.setattr(SharedSessionStore, "fetch_throttled", boom)
+    assert "loading the aGiTrack dashboard" in shell_html(_seeded(tmp_path))
+
+
 def test_dashboard_is_usable_at_phone_width(tmp_path):
     # The filter bar was a never-wrap sticky row whose five selects forced a ~1040px
     # document, so on a phone the WHOLE page scrolled sideways. It must wrap when the

@@ -245,6 +245,7 @@ directory that is not a git repo still gets the full page, with progress sync re
 | Backtrace server end-to-end: /data efficiency insights over reconstructed turns; /learn carries the frozen "based on backtracing" warning strip; state (no branches, sync unavailable); suggestions personalized from the reconstruction | `test_backtrace_server_serves_learn_with_banner_and_insights` | plain-dir + HTTP |
 | Re-running `--backtrace` restarts a running daemon on the same port (like `-d`); a cold start pins no port | `test_backtrace_start_restarts_a_running_daemon_on_the_same_port`, `test_backtrace_cold_start_does_not_request_a_port` | mock |
 | Backtrace log opens with an explainer of what its entries are (reconstructed turns, unhidden only under the BACKTRACE flag); log subject lines truncate at word ends, never mid-word | `test_backtrace_log_explains_what_the_entries_are`, `test_subject_truncation_cuts_at_word_ends` | real-git |
+| Dashboard first paint never waits on the network (no shared-ref fetch in the "/" response; polls fetch instead), so the loading screen, not a blank tab, covers slow starts | `test_first_paint_never_fetches_the_shared_ref` | real-git |
 
 ## 12c. Static demo export (`agitrack -d export`, `tests/test_export.py`)
 A server-free copy of the dashboard + learn page for static hosts (powers the public demo at

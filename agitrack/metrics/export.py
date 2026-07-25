@@ -198,6 +198,31 @@ def _shim(*, base: str, files_index: dict[str, int], learn: bool, site_root: str
       var back = document.getElementById("backlink");
       if (back) back.href = "../";
     }}
+    // Deep link from the main page's "Turns become commits" card: #trace opens the
+    // newest aGiTrack commit in the log and scrolls to its Interaction Trace heading.
+    // The log arrives asynchronously, so poll: first click the entry open (its detail
+    // renders a frame later), then scroll once the trace heading exists — offset so the
+    // sticky banner and filter bar don't cover it.
+    if (!LEARN && location.hash === "#trace") {{
+      var deadline = Date.now() + 15000;
+      var tick = setInterval(function(){{
+        if (Date.now() > deadline) {{ clearInterval(tick); return; }}
+        var entry = document.querySelector("#commitlog .entry.ai");
+        if (!entry) return;
+        var detail = entry.querySelector(".detail");
+        if (detail && detail.hidden) {{ entry.click(); return; }}
+        var target = null;
+        (detail ? detail.querySelectorAll(".md-h") : []).forEach(function(h){{
+          if (!target && /interaction trace/i.test(h.textContent)) target = h;
+        }});
+        if (target) {{
+          clearInterval(tick);
+          var strip = document.querySelector(".backtracebanner"), bar = document.querySelector(".controls");
+          target.style.scrollMarginTop = ((strip ? strip.offsetHeight : 0) + (bar ? bar.offsetHeight : 0) + 14) + "px";
+          target.scrollIntoView({{block: "start"}});
+        }}
+      }}, 150);
+    }}
     // On the demo site the big aGiTrack logo always leads back to the main webpage.
     var brand = document.querySelector(".brand");
     if (brand) {{
