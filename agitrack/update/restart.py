@@ -22,11 +22,15 @@ On top of that, the SAME new fingerprint must be seen on two consecutive checks 
 minute apart) before acting, so even a mid-copy state that happens to parse can never
 trigger an exec into a half-written tree.
 
-The restart replaces the process with its own re-launch command
-(:func:`agitrack.daemons._daemon_command`, which also handles frozen builds): on POSIX
-via ``os.execv`` — the pid is preserved, and Python's file descriptors are close-on-exec
-so sockets and the repo lock release at the boundary — and on Windows by spawning a
-detached replacement and exiting (exec semantics there would not release handles).
+How the swap happens differs by daemon. The dashboard and backtrace daemons do a
+SPAWN-AND-VERIFY handoff in their own serve loops: spawn the replacement, wait for its
+handshake, and only exit once it provably serves — a replacement that crashes on a
+broken update fails verification and the old daemon keeps serving and retries. The
+background tracker replaces its process with its own re-launch command via
+:func:`exec_replacement` (:func:`agitrack.daemons._daemon_command`, which also handles
+frozen builds): on POSIX ``os.execv`` — pid preserved, and file descriptors are
+close-on-exec so the repo lock releases at the boundary (a spawn-verify handoff would
+deadlock on that lock) — and on Windows a detached spawn + exit.
 """
 
 from __future__ import annotations

@@ -112,6 +112,9 @@ def _daemon_thread(target):
 
 
 def test_dashboard_daemon_restarts_itself_after_an_update(tmp_path, monkeypatch):
+    # Restart = SPAWN-AND-VERIFY: the old daemon exits only once the replacement has
+    # provably bound (handshake correlated on the child pid) — never a blind exec that
+    # a broken update could crash out of.
     from agitrack.metrics import daemon
 
     repo = _repo(tmp_path)
@@ -127,22 +130,20 @@ def test_dashboard_daemon_restarts_itself_after_an_update(tmp_path, monkeypatch)
     def fake_watch(stop, on_update, **kw):
         threading.Thread(target=lambda: (time.sleep(0.05), on_update("commit:bbb")), daemon=True).start()
 
-    executed: list[list[str]] = []
-
-    def fake_exec(cmd, log=print):
-        executed.append(cmd)
-        raise _Execed()  # the real exec never returns
-
+    spawned: list[dict] = []
+    child = type("Child", (), {"pid": 4243, "poll": lambda self: 0, "terminate": lambda self: None})()
     monkeypatch.setattr(update_restart, "watch_for_update", fake_watch)
-    monkeypatch.setattr(update_restart, "exec_replacement", fake_exec)
+    monkeypatch.setattr(daemon, "spawn_dashboard_daemon", lambda r, **kw: spawned.append(kw) or child)
+    verified: list[int] = []
+    monkeypatch.setattr(daemon, "wait_for_handshake", lambda r, *, pid, timeout: verified.append(pid) or {"pid": pid})
 
-    assert _daemon_thread(lambda: daemon.run_dashboard_daemon(repo)) == "execed"
-    # Cleanup ran first (socket closed, handshake cleared), THEN the exec — with the
-    # bound port pinned so the user's open URL survives the swap.
+    assert _daemon_thread(lambda: daemon.run_dashboard_daemon(repo)) == 0
+    # Cleanup ran (socket closed, handshake cleared), the replacement was spawned with
+    # the bound port pinned, and its handshake was verified before the old daemon left.
     assert fakes[0].shutdown_called and fakes[0].closed
     assert daemon.read_handshake(repo) is None
-    assert len(executed) == 1
-    assert "--dashboard-port" in executed[0]
+    assert spawned == [{"port": 12345, "email_logins": None}]
+    assert verified == [4243]
 
 
 def test_dashboard_daemon_retries_after_a_failed_restart(tmp_path, monkeypatch):
@@ -168,19 +169,19 @@ def test_dashboard_daemon_retries_after_a_failed_restart(tmp_path, monkeypatch):
     def fake_watch(stop, on_update, **kw):
         threading.Thread(target=lambda: (time.sleep(0.05), on_update("commit:bbb")), daemon=True).start()
 
-    executed: list[list[str]] = []
-
-    def fake_exec(cmd, log=print):
-        executed.append(cmd)
-        if len(executed) == 1:
-            return  # first attempt FAILS (exec_replacement returns on failure)
-        raise _Execed()  # second attempt succeeds
-
+    spawned: list[dict] = []
+    child = type("Child", (), {"pid": 4243, "poll": lambda self: None, "terminate": lambda self: None})()
     monkeypatch.setattr(update_restart, "watch_for_update", fake_watch)
-    monkeypatch.setattr(update_restart, "exec_replacement", fake_exec)
+    monkeypatch.setattr(daemon, "spawn_dashboard_daemon", lambda r, **kw: spawned.append(kw) or child)
+    # First replacement never handshakes (it crashed on the broken update); second works.
+    monkeypatch.setattr(
+        daemon,
+        "wait_for_handshake",
+        lambda r, *, pid, timeout: {"pid": pid} if len(spawned) > 1 else None,
+    )
 
-    assert _daemon_thread(lambda: daemon.run_dashboard_daemon(repo)) == "execed"
-    assert len(executed) == 2  # failed once, retried
+    assert _daemon_thread(lambda: daemon.run_dashboard_daemon(repo)) == 0
+    assert len(spawned) == 2  # failed verification once, retried
     assert len(fakes) == 2  # served a full second cycle between the attempts
     assert registered.count("dashboard") == 2  # visible in --daemons throughout
 
@@ -208,9 +209,11 @@ def test_dashboard_explicit_stop_wins_over_retry(tmp_path, monkeypatch):
         if len(armed) == 1:  # only the FIRST cycle sees an update
             threading.Thread(target=lambda: (time.sleep(0.05), on_update("commit:bbb")), daemon=True).start()
 
-    executed: list[list[str]] = []
+    spawned: list[dict] = []
+    child = type("Child", (), {"pid": 4243, "poll": lambda self: None, "terminate": lambda self: None})()
     monkeypatch.setattr(update_restart, "watch_for_update", fake_watch)
-    monkeypatch.setattr(update_restart, "exec_replacement", lambda cmd, log=print: executed.append(cmd))
+    monkeypatch.setattr(daemon, "spawn_dashboard_daemon", lambda r, **kw: spawned.append(kw) or child)
+    monkeypatch.setattr(daemon, "wait_for_handshake", lambda r, *, pid, timeout: None)  # verification fails
 
     box: dict[str, object] = {}
     thread = threading.Thread(target=lambda: box.update(rc=daemon.run_dashboard_daemon(repo)))
@@ -224,7 +227,7 @@ def test_dashboard_explicit_stop_wins_over_retry(tmp_path, monkeypatch):
     thread.join(timeout=10)
 
     assert not thread.is_alive() and box.get("rc") == 0
-    assert len(executed) == 1  # the failed attempt; no further restart after the stop
+    assert len(spawned) == 1  # the failed attempt; no further restart after the stop
     assert daemon.read_handshake(repo) is None  # clean shutdown
 
 

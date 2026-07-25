@@ -1033,6 +1033,45 @@ def _running_handshake(directory: Path) -> dict | None:
     return None
 
 
+def _spawn_backtrace_child(directory: Path, *, owner_pid: int | None = None, port: int | None = None):
+    """Launch the detached backtrace child (shared by the CLI start and the update-restart
+    handoff). The child must load the INSTALLED aGiTrack, never a stray ``agitrack/``
+    package in the target directory: the backtraced directory can itself be the aGiTrack
+    source checkout, and ``python -m agitrack`` would otherwise import that (older) copy
+    from cwd — so it runs from a neutral state dir with PYTHONSAFEPATH keeping cwd off
+    ``sys.path``."""
+    import os
+    import subprocess
+    import sys
+
+    from agitrack.proc import detach_kwargs
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "agitrack",
+        "--repo",
+        str(directory),
+        "--backtrace-serve",
+    ]
+    if owner_pid is not None:
+        cmd += ["--dashboard-owner-pid", str(owner_pid)]
+    if port is not None:
+        cmd += ["--dashboard-port", str(port)]
+    state_dir = _state_dir()
+    state_dir.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ)
+    env["PYTHONSAFEPATH"] = "1"
+    log = _open_log(directory)
+    try:
+        return subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log, cwd=str(state_dir), env=env, **detach_kwargs()
+        )
+    finally:
+        if log is not subprocess.DEVNULL:
+            log.close()
+
+
 def start_backtrace_daemon(
     directory: Path, *, owner_pid: int | None = None, open_browser: bool = True, timeout: float = 90.0
 ) -> int:
@@ -1048,12 +1087,8 @@ def start_backtrace_daemon(
     every local session (OpenCode shells out per session) and can take minutes, so a progress bar
     is shown and the wait continues as long as progress is being made, giving up only if the child
     makes none for ``timeout`` seconds."""
-    import subprocess
-    import sys
-    import os
 
     from agitrack.metrics.daemon import _terminate_and_wait
-    from agitrack.proc import detach_kwargs
 
     running = _running_handshake(directory)
     reuse_port: int | None = None
@@ -1068,35 +1103,8 @@ def start_backtrace_daemon(
         _clear_handshake(directory)
         print(f"Restarting the backtrace daemon (was pid {old_pid}).")
 
-    cmd = [
-        sys.executable,
-        "-m",
-        "agitrack",
-        "--repo",
-        str(directory),
-        "--backtrace-serve",
-    ]
-    if owner_pid is not None:
-        cmd += ["--dashboard-owner-pid", str(owner_pid)]
-    if reuse_port is not None:
-        cmd += ["--dashboard-port", str(reuse_port)]
-    # The child must load the INSTALLED aGiTrack, never a stray ``agitrack/`` package in the
-    # target directory: the backtraced directory can itself be the aGiTrack source checkout, and
-    # ``python -m agitrack`` would otherwise import that (older) copy from cwd. So run the child
-    # from a neutral state dir and set PYTHONSAFEPATH to keep cwd off ``sys.path``.
-    state_dir = _state_dir()
-    state_dir.mkdir(parents=True, exist_ok=True)
-    env = dict(os.environ)
-    env["PYTHONSAFEPATH"] = "1"
-    log = _open_log(directory)
     print(f"Scanning local coding-agent transcripts for {_abbreviate_home(str(directory))} … (this can take a moment)")
-    try:
-        proc = subprocess.Popen(
-            cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log, cwd=str(state_dir), env=env, **detach_kwargs()
-        )
-    finally:
-        if log is not subprocess.DEVNULL:
-            log.close()
+    proc = _spawn_backtrace_child(directory, owner_pid=owner_pid, port=reuse_port)
 
     # Wait for the child to finish reconstructing (it publishes the handshake when ready), showing
     # a live progress bar. The wait is STALL-based, not a fixed deadline: a big directory can take
@@ -1301,11 +1309,10 @@ def run_backtrace_daemon(
                 name="agitrack-backtrace-owner-watch",
             ).start()
 
-        restart_cmd: list[str] | None = None
+        restart_wanted = threading.Event()
 
-        def _restart_for_update(_version: str, *, _stop=stop, _server=server, _port: int = bound_port) -> None:
-            nonlocal restart_cmd
-            restart_cmd = update_restart.restart_command(["--dashboard-port", str(_port)])
+        def _restart_for_update(_version: str, *, _stop=stop, _server=server) -> None:
+            restart_wanted.set()
             _stop.set()
             threading.Thread(target=_server.shutdown, daemon=True).start()
 
@@ -1317,11 +1324,23 @@ def run_backtrace_daemon(
             server.server_close()
             _clear_handshake(directory)
             daemons.deregister()
-        if explicit_stop.is_set() or restart_cmd is None:
+        if explicit_stop.is_set() or not restart_wanted.is_set():
             return 0
-        update_restart.exec_replacement(restart_cmd)
-        # Only reached when the exec FAILED: serve again on the current code (same
-        # port), stay stoppable and visible in --daemons, retry on the next detection.
+        # Restart by SPAWN-AND-VERIFY, not exec: a replacement running a broken update
+        # could crash on startup, and an exec'd-over process has nothing left to retry
+        # with. The old daemon only exits once the replacement provably serves (its own
+        # handshake, correlated on its pid); otherwise it reaps the corpse and serves
+        # on, retrying on the next detection — until the user stops it.
+        try:
+            child = _spawn_backtrace_child(directory, port=bound_port)
+            record = _wait_for_backtrace(directory, child, stall_seconds=90.0)
+        except Exception:
+            child, record = None, None
+        if record is not None:
+            print(f"restarted onto the updated aGiTrack (pid {record.get('pid')}).", flush=True)
+            return 0
+        if child is not None and child.poll() is None:
+            child.terminate()
         print("update restart failed; still serving on the current version and retrying.", flush=True)
         preferred_port = bound_port
 
