@@ -704,18 +704,21 @@ a:hover{color:var(--ink);background:var(--phosphor)}
 .wrap{max-width:1080px;margin:0 auto;padding:0 24px 80px}
 /* Initial-load animation. On a large repo the server sends the page chrome with no
    aggregates/log embedded; this loader shows while the browser fetches /data and /log,
-   and `body.booting` hides the (still-empty) data sections so they don't flash. */
-.booting{display:none;flex-direction:column;align-items:center;justify-content:center;
+   and `body.booting` hides the (still-empty) data sections so they don't flash.
+   The loader rules are scoped to the ELEMENT id: the state class on <body> is also
+   "booting", and a bare `.booting{display:none}` matched the body itself — hiding the
+   whole page, loader included, for the entire /data crunch (a black tab, no message). */
+#booting{display:none;flex-direction:column;align-items:center;justify-content:center;
   gap:18px;padding:110px 0 130px;text-align:center}
-body.booting .booting{display:flex}
-body.booting .wrap>*:not(header):not(.booting){display:none}
-.booting .spin{width:48px;height:48px;border:3px solid var(--phosphor-dim);border-top-color:var(--phosphor);
+body.booting #booting{display:flex}
+body.booting .wrap>*:not(header):not(#booting){display:none}
+#booting .spin{width:48px;height:48px;border:3px solid var(--phosphor-dim);border-top-color:var(--phosphor);
   border-radius:50%;animation:spin .8s linear infinite;box-shadow:0 0 18px rgba(61,255,160,.25)}
-.booting .bmsg{font-family:var(--display);font-size:32px;color:var(--phosphor);letter-spacing:1px;
+#booting .bmsg{font-family:var(--display);font-size:32px;color:var(--phosphor);letter-spacing:1px;
   text-shadow:0 0 18px rgba(61,255,160,.35)}
-.booting .bdots::after{content:"";animation:bdots 1.4s steps(4,end) infinite}
+#booting .bdots::after{content:"";animation:bdots 1.4s steps(4,end) infinite}
 @keyframes bdots{0%{content:""}25%{content:"."}50%{content:".."}75%{content:"..."}}
-.booting .bsub{font-size:13px;color:var(--fg-dim)}
+#booting .bsub{font-size:13px;color:var(--fg-dim)}
 .neterror{position:fixed;top:0;left:0;right:0;z-index:40;background:#3a0f0f;color:#ffd5d5;
   border-bottom:2px solid var(--red);padding:10px 18px;font-size:13px;text-align:center;
   box-shadow:0 6px 20px rgba(0,0,0,.55);animation:rise .25s ease}
@@ -1123,7 +1126,7 @@ __UPDATE_BANNER__
   <div class="booting" id="booting">
     <span class="spin"></span>
     <div class="bmsg">reading commit history<span class="bdots"></span></div>
-    <div class="bsub">crunching the git log — a large repo can take a few seconds</div>
+    <div class="bsub">crunching the git log: a large repo can take a few seconds</div>
   </div>
 
   <div class="controls">

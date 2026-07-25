@@ -124,6 +124,21 @@ def test_backtrace_log_explains_what_the_entries_are(tmp_path):
     assert html.index("if(!BACKTRACE) return;") < unhide  # backtrace-only, hidden on the live page
 
 
+def test_boot_loader_is_not_hidden_by_the_body_state_class(tmp_path):
+    # The loader ELEMENT and the <body> STATE flag both use "booting". A bare
+    # `.booting{display:none}` rule therefore matched the body itself the moment the
+    # script added the class — hiding the entire page, loader included, for the whole
+    # /data crunch (a black tab with no message). Loader rules must be scoped to the
+    # element id so the body can never match them.
+    from agitrack.metrics.web import shell_html
+
+    html = shell_html(_seeded(tmp_path))
+    assert "\n.booting{" not in html  # a bare class RULE would match body.booting again
+    assert "#booting{display:none" in html
+    assert "body.booting #booting{display:flex}" in html
+    assert "reading commit history" in html
+
+
 def test_first_paint_never_fetches_the_shared_ref(tmp_path, monkeypatch):
     # The "/" response must not wait on the network: a slow shared-sessions fetch kept the
     # browser on a blank tab for seconds, before any loading screen could even arrive.
