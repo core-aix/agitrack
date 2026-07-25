@@ -949,7 +949,7 @@ def test_backtrace_tags_already_committed_turns(monkeypatch, tmp_path):
         "backend: claude\nbackend_session_id: sess-aaa\nconversation_anchor: a2\n",
     )
 
-    view = bt.build_backtrace(repo, use_cache=False)
+    view = bt.build_backtrace(repo)
     by_turn = {s.subject: s.tracked for s in view.dashboard.stats}
     assert by_turn["turn 1"] is True and by_turn["turn 2"] is True  # covered by the anchor
     assert by_turn["turn 3"] is False  # after the last committed anchor

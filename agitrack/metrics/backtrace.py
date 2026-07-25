@@ -32,7 +32,7 @@ from agitrack.git import GitRepo
 from agitrack.metrics.collect import CommitStat, Dashboard, _abbreviate_home, _display_repo
 from agitrack.transcripts import claude, opencode
 from agitrack.transcripts.edits import combine_patches, merge_edits_by_path, total_lines
-from agitrack.transcripts.types import ExportedSession, FileEdit, SessionRef, SessionTurn, turns_after
+from agitrack.transcripts.types import ExportedSession, FileEdit, SessionRef, SessionTurn
 
 # Cap on how many sessions a single backtrace reconstructs, newest first. Exporting a
 # session is real work (OpenCode shells out per session), so an unbounded scan of a machine
@@ -137,18 +137,18 @@ def _discover(directory: Path) -> list[_Source]:
     return sources
 
 
-def build_backtrace(
-    directory: Path, *, max_sessions: int = MAX_SESSIONS, progress=None, use_cache: bool = True
-) -> BacktraceView:
+def build_backtrace(directory: Path, *, max_sessions: int = MAX_SESSIONS, progress=None) -> BacktraceView:
     """Reconstruct the backtrace dashboard for ``directory`` from local transcripts.
 
     ``progress`` (optional) is called ``progress(done, total, phase)`` as work proceeds — during
     discovery (``total`` still 0) and before each session is exported — so a caller can show a
     progress bar. Exporting is the slow part (OpenCode shells out to its CLI per session).
 
-    ``use_cache`` (default on) persists each session's PROCESSED result and reuses it next time when
-    the transcript hasn't changed, so only new/changed sessions are re-exported — a repeat run on a
-    directory with many sessions is near-instant instead of rebuilding everything."""
+    Every build reprocesses every session from the transcripts. There is deliberately NO
+    persisted cache of processed results: one silently served stale output after a
+    processing fix (subjects kept an old mid-word truncation), and correctness beats the
+    seconds a warm rebuild saves. The build is a one-off per daemon start, behind the
+    progress bar."""
     directory = directory.resolve()
     if progress:
         progress(0, 0, "discovering")
@@ -157,7 +157,6 @@ def build_backtrace(
     sources = sources[:max_sessions]
     total = len(sources)
 
-    cached_sessions = _load_cache(directory)["sessions"] if use_cache else {}
     fresh_sessions: dict[str, dict] = {}
     stats: list[CommitStat] = []
     diffs: dict[str, str] = {}
@@ -176,14 +175,7 @@ def build_backtrace(
         if progress:
             progress(index, total, "exporting")
         key = f"{source.backend}:{source.ref_id}"
-        cached = cached_sessions.get(key)
-        # Reuse the cached processed result when the transcript hasn't changed since (its recorded
-        # last-updated time didn't advance); otherwise re-export and re-process this one session.
-        if isinstance(cached, dict) and float(cached.get("updated", -1)) >= source.updated:
-            entry = cached
-        else:
-            # Changed (or new): re-export, but reuse the cached prefix and process only new turns.
-            entry = _process_source(directory, source, cached=cached if isinstance(cached, dict) else None)
+        entry = _process_source(directory, source)
         fresh_sessions[key] = entry
         if not entry.get("stats"):
             continue
@@ -215,8 +207,6 @@ def build_backtrace(
             edited_sessions += 1
     if progress:
         progress(total, total, "done")
-    if use_cache:
-        _save_cache(directory, {"version": _CACHE_VERSION, "sessions": fresh_sessions})
 
     # Tag turns already committed to git with aGiTrack metadata, so the log shows what is tracked
     # vs. what `--backtrace commit` would still add. (No-op when the directory isn't a git repo.)
@@ -787,40 +777,6 @@ def _clear_progress(directory: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Incremental cache: the processed per-session result is saved so a later run only re-exports the
-# transcripts that actually changed (OpenCode exports are slow), instead of rebuilding everything.
-# ---------------------------------------------------------------------------
-
-# Bump whenever the per-session processing changes shape/logic so a stale cache is ignored.
-# v2: edits are merged per file per turn, paths outside the directory are dropped, worktree paths
-# collapse onto repo paths, and a Read seeds a file's baseline — a v1 cache holds the old counts.
-_CACHE_VERSION = 2
-
-
-def _cache_path(directory: Path) -> Path:
-    return _state_dir() / f"{_dir_key(directory)}.cache.json"
-
-
-def _load_cache(directory: Path) -> dict:
-    try:
-        data = json.loads(_cache_path(directory).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        data = None
-    if isinstance(data, dict) and data.get("version") == _CACHE_VERSION and isinstance(data.get("sessions"), dict):
-        return data
-    return {"version": _CACHE_VERSION, "sessions": {}}
-
-
-def _save_cache(directory: Path, cache: dict) -> None:
-
-    try:
-        from agitrack.fileio import atomic_write_text
-
-        atomic_write_text(_cache_path(directory), json.dumps(cache))
-    except OSError:
-        pass
-
-
 def _empty_entry(source: _Source) -> dict:
     return {
         "updated": source.updated,
@@ -835,14 +791,11 @@ def _empty_entry(source: _Source) -> dict:
     }
 
 
-def _process_source(directory: Path, source: _Source, cached: dict | None = None) -> dict:
-    """Export and process ONE session into a JSON-serializable cache entry (its stats, diffs, and
-    per-file edits). This is the slow step the cache lets a repeat run skip.
-
-    When ``cached`` (a prior entry for this SAME session that has since grown) is given and its
-    watermark is still present in the transcript, only the turns AFTER the watermark are processed
-    and the cached prefix is reused — so a large, actively-growing session isn't re-synthesized from
-    turn 1 each run (intra-session incremental)."""
+def _process_source(directory: Path, source: _Source) -> dict:
+    """Export and process ONE session into a JSON-serializable entry (its stats, diffs,
+    and per-file edits) — the slow step of a build. Always processes the WHOLE session:
+    the persisted cache (and its intra-session incremental resume) was removed after it
+    served stale processed output across a processing fix."""
     try:
         exported = source.export()
     except Exception:
@@ -852,33 +805,16 @@ def _process_source(directory: Path, source: _Source, cached: dict | None = None
     bases = _relativize_bases(directory, source.base_dir)
     all_turns = exported.turns
 
-    reuse: dict | None = None
-    turns = all_turns
-    start_index = 0
-    if isinstance(cached, dict) and cached.get("last_message_id") and cached.get("stats") is not None:
-        after = turns_after(exported, str(cached["last_message_id"]))
-        if len(after) < len(all_turns):  # watermark found — resume just after it
-            reuse = cached
-            turns = after
-            start_index = len(all_turns) - len(after)
-
     stats, diffs, file_edits, changed, turn_refs, last_id = _session_to_stats(
         source,
         exported.session_id,
-        turns,
-        start_index=start_index,
+        all_turns,
+        start_index=0,
         updated=float(exported.updated or source.updated),
         bases=bases,
     )
     stat_dicts = [_stat_to_dict(stat) for stat in stats]
     fedit_dicts = {sha: [_edit_to_dict(edit) for edit in edits] for sha, edits in file_edits.items()}
-    if reuse is not None:  # prepend the reused prefix (already serialized)
-        stat_dicts = list(reuse.get("stats") or []) + stat_dicts
-        diffs = {**(reuse.get("diffs") or {}), **diffs}
-        fedit_dicts = {**(reuse.get("file_edits") or {}), **fedit_dicts}
-        turn_refs = list(reuse.get("turn_refs") or []) + turn_refs
-        changed = changed or bool(reuse.get("edited"))
-        last_id = last_id or str(reuse.get("last_message_id") or "")
     return {
         "updated": source.updated,
         "backend": source.backend,
