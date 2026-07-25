@@ -9,6 +9,7 @@ import sys
 import time
 
 from agitrack import daemons
+from agitrack.daemons import _scan_daemon_processes as _real_scan  # bound pre-guard (conftest stubs the attr)
 
 
 def test_register_list_deregister(monkeypatch, tmp_path):
@@ -100,7 +101,7 @@ def test_scan_daemon_processes_parses_ps(monkeypatch):
         stdout = canned
 
     monkeypatch.setattr(daemons.subprocess, "run", lambda *a, **k: _R())
-    by_kind = {i.kind: i for i in daemons._scan_daemon_processes()}
+    by_kind = {i.kind: i for i in _real_scan()}
     assert set(by_kind) == {"dashboard", "backtrace", "background"}  # the no-serve-flag lines are ignored
     assert by_kind["dashboard"].pid == 501 and by_kind["dashboard"].repo == "/home/me/proj"
     assert by_kind["backtrace"].repo == "/home/me/other"
