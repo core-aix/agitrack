@@ -270,6 +270,9 @@ agitrack.core-aix.org/dashboard/, rebuilt by `.github/workflows/pages.yml` on ea
 | Restart command shape (frozen exe vs `python -m agitrack`) — self-update **and** settings "restart now" | `test_updater.py::test_restart_command_*` | unit |
 | Background daemon records an available update to the shared marker (never auto-installs); clears when current | `test_daemon_update_check_writes_marker_and_clears` | real-git |
 | Update surfaced on every surface: `-b status`, commit-time (pre-commit hook), dashboard banner | `test_background_status_shows_available_update`, `test_precommit_sync_reminds_about_update_on_every_commit`, `test_update_marker.py::*` | real-git + unit |
+| Daemons RESTART themselves once aGiTrack is updated ON DISK (never installs; detects `_resolve_version()` drift, debounced to two consecutive sightings of the same new version) | `test_update_restart.py::test_updated_disk_version_only_reports_a_real_change`, `_requires_two_consecutive_sightings`, `_stops_with_the_daemon` | unit |
+| Dashboard/backtrace restart pins the bound port (open URLs survive); cleanup runs before the exec | `test_dashboard_daemon_restarts_itself_after_an_update`, `test_restart_command_appends_the_port_flag_only_when_missing` | mock |
+| Background tracker restart leaves an in-flight turn for the replacement (no force-capture at the swap); a real stop still captures it | `test_background_restart_leaves_in_flight_turns_for_the_replacement`, `test_background_run_execs_replacement_after_update` | mock |
 
 ## 14. Windows-specific (#118)
 | Sequence | Test(s) | Kind |

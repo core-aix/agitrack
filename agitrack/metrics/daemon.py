@@ -321,6 +321,19 @@ def run_dashboard_daemon(
             name="agitrack-dashboard-owner-watch",
         ).start()
 
+    # aGiTrack updated on disk: restart onto the new code (after normal cleanup below),
+    # pinning the bound port so the URL the user has open survives the swap.
+    from agitrack.update import restart as update_restart
+
+    restart_cmd: list[str] | None = None
+
+    def _restart_for_update(_version: str) -> None:
+        nonlocal restart_cmd
+        restart_cmd = update_restart.restart_command(["--dashboard-port", str(bound_port)])
+        _request_shutdown()
+
+    update_restart.watch_for_update(stop, _restart_for_update)
+
     try:
         server.serve_forever()
     finally:
@@ -329,6 +342,8 @@ def run_dashboard_daemon(
         from agitrack import daemons
 
         daemons.deregister()
+    if restart_cmd:
+        update_restart.exec_replacement(restart_cmd)
     return 0
 
 
