@@ -848,8 +848,12 @@ input[type=date]::-webkit-calendar-picker-indicator{filter:invert(.7) sepia(1) h
 /* Phone-width: a wrapped sticky bar would cover half the screen, so the filters become a
    two-column grid that scrolls with the page. */
 @media (max-width:760px){
-  /* relative, not static: no stickiness, but still the anchor for the floating badge */
-  .controls{position:relative;flex-wrap:wrap;gap:10px 12px}
+  /* relative, not static: no stickiness, but still the anchor for the floating badge.
+     top:auto !important overrides the inline top stackStickyBanner() sets for the
+     sticky desktop layout — on a relative bar that offset just shoves the bar down,
+     leaving a banner-sized blank gap at the top (worst on backtrace, whose long
+     banner wraps tall at phone widths). */
+  .controls{position:relative;flex-wrap:wrap;gap:10px 12px;top:auto !important}
   .controls .prompt{width:100%}
   .field{flex:1 1 42%;min-width:0}
   .field select{min-width:0;width:100%}
