@@ -49,10 +49,15 @@ def render_html(repo: GitRepo, ref: str = "HEAD") -> str:
     return format_html(dash, shared_sessions=shared_sessions_for(repo), insights=insights)
 
 
-def shared_sessions_for(repo: GitRepo) -> list[dict]:
+def shared_sessions_for(repo: GitRepo, *, fetch: bool = True) -> list[dict]:
     """Sessions shared into this repo (issue #55), for the dashboard. Reads the
     local shared ref plus a throttled remote fetch so teammates' newly-shared
-    sessions appear; never raises (sharing may be unconfigured/offline)."""
+    sessions appear; never raises (sharing may be unconfigured/offline).
+
+    ``fetch=False`` skips the remote fetch and reads the local ref only: the first
+    page paint must never wait on the network (the fetch can take seconds on a slow
+    link, and until ``/`` responds the browser shows a blank tab that no loading
+    screen can cover). The recurring ``/data`` polls fetch, so shares still appear."""
     try:
         from agitrack.sessions import SharedSessionStore
 
@@ -64,10 +69,11 @@ def shared_sessions_for(repo: GitRepo) -> list[dict]:
     # mirror refs, NOT the canonical local ref, so a remote that's momentarily behind can
     # never rewind your own just-shared session — entries() then takes the newest copy of
     # each session, so its "shared" time reflects the latest share, not a stale one.
-    try:
-        store.fetch_throttled()
-    except Exception:
-        pass
+    if fetch:
+        try:
+            store.fetch_throttled()
+        except Exception:
+            pass
     try:
         return [
             {
@@ -135,7 +141,7 @@ def shell_html(repo: GitRepo) -> str:
     from agitrack.metrics.collect import _display_repo
 
     repo_path = _display_repo(str(repo.repo))
-    payload = _embed_json({"page_size": PAGE_SIZE, "shared_sessions": shared_sessions_for(repo)})
+    payload = _embed_json({"page_size": PAGE_SIZE, "shared_sessions": shared_sessions_for(repo, fetch=False)})
     repo_name = repo_path.rstrip("/").rsplit("/", 1)[-1] or repo_path
     return _render_template(
         repo_name=repo_name, repo_path=repo_path, banner_html=_update_banner_html(repo), payload=payload
