@@ -225,6 +225,8 @@ To turn it off at any time, run `agitrack --remove-hooks` — it removes every a
 
 A background daemon periodically checks whether a newer aGiTrack is available (it **never** auto-installs — installing may need pip/pipx/brew/an MSI). When one is found it records it and reminds you where you'll actually see it: in `agitrack -b status`, in the `git commit` output (via the pre-commit hook), and as a banner on the [dashboard](#dashboard). Turn the checks off with `"check_for_updates": false`.
 
+Once you **have** installed an update (through pip/pipx/brew, the MSI, or aGiTrack's own update prompt), every running daemon — the background tracker, the dashboard, and a backtrace — notices the new version on disk within about a minute and **restarts itself onto it**, keeping its port so an open dashboard URL stays valid. No manual rerun needed for daemons; only an interactive TUI session still needs a quit and relaunch to pick up new code.
+
 ### First run and the command menu
 
 On the first run, aGiTrack asks which backend should be the default (listed alphabetically, with each backend's install status). If the chosen backend's CLI is not installed, aGiTrack shows install instructions and lets you install it or pick a different one. The choice is saved in `~/.agitrack/config.json` (`default_backend`) and reused for future runs. You can also switch backends mid-session with the `agent-backend` command below.

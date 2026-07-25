@@ -609,30 +609,50 @@ class BackgroundRunner:
             f"background tracker running for {self.state.backend} in {self.repo.repo} "
             f"({mode}, no worktree). Drive the agent from any UI; stop it with `agitrack -b stop`."
         )
+        # aGiTrack updated on disk: leave the loop, tear down WITHOUT force-capturing an
+        # in-flight turn (the replacement resumes tracking it via the persisted watermark),
+        # then replace this process with the new code.
+        from agitrack.update import restart as update_restart
+
+        self._restart_cmd: list[str] | None = None
+
+        def _restart_for_update(_version: str) -> None:
+            self._restart_cmd = update_restart.restart_command()
+            self._stop.set()
+
+        update_restart.watch_for_update(self._stop, _restart_for_update)
+
         try:
             self._loop()
         finally:
-            self._teardown()
+            self._teardown(restarting=self._restart_cmd is not None)
+        if self._restart_cmd:
+            update_restart.exec_replacement(self._restart_cmd, log=self._print)
         return 0
 
-    def _teardown(self) -> None:
+    def _teardown(self, *, restarting: bool = False) -> None:
         # Record any final turn (and, in auto mode, fold it) before stopping. `require_complete
         # =False` and `force=True` mirror the proxy's exit finalize: a turn still running when
         # the daemon stops is captured rather than dropped, and the fold does not sit out the
-        # summary/settle waits during teardown.
-        try:
-            self._process_once(require_complete=False)
-            if not self._manual_commits:
-                self._auto_fold_pending(force=True)
-        except Exception as error:
-            self._debug(f"final process failed: {error!r}")
+        # summary/settle waits during teardown. NOT on an update restart: the replacement
+        # process keeps tracking, so an in-flight turn must wait for its real completion
+        # instead of being force-committed half-done at the swap.
+        if not restarting:
+            try:
+                self._process_once(require_complete=False)
+                if not self._manual_commits:
+                    self._auto_fold_pending(force=True)
+            except Exception as error:
+                self._debug(f"final process failed: {error!r}")
         self._manual.teardown()
         self._remove_handshake()
         from agitrack import daemons
 
         daemons.deregister()
         self.events.emit("daemon-stop", backend=self.state.backend)
-        self._print("background tracker stopped.")
+        self._print(
+            "background tracker restarting on the updated aGiTrack." if restarting else "background tracker stopped."
+        )
 
     def _write_handshake(self) -> None:
         # Record our pid so `agitrack -b stop`/`status` can target THIS background tracker
