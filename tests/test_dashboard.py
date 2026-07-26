@@ -139,6 +139,21 @@ def test_boot_loader_is_not_hidden_by_the_body_state_class(tmp_path):
     assert "reading commit history" in html
 
 
+def test_log_pager_has_numbered_pages_first_last_and_a_goto_box(tmp_path):
+    # One-click-per-page newer/older made deep jumps tedious. The pager renders numbered
+    # page buttons (windowed with … gaps on big logs), first/last jump buttons, and a
+    # go-to-page box. Jumps compute offset as (page-1)*limit — always an exact PAGE_SIZE
+    # multiple, which the static demo's pre-baked log-<sort>-<offset>.json files rely on.
+    from agitrack.metrics.web import shell_html
+
+    html = shell_html(_seeded(tmp_path))
+    for control in ('id="log-first"', 'id="log-prev"', 'id="log-next"', 'id="log-last"', 'id="log-goto"'):
+        assert control in html
+    assert "pnum" in html and 'class="pgap"' in html
+    assert "(p-1)*limit" in html  # offsets stay PAGE_SIZE multiples for the demo
+    assert ".pager button.current[disabled]" in html  # current page stays lit, not greyed
+
+
 def test_first_paint_never_fetches_the_shared_ref(tmp_path, monkeypatch):
     # The "/" response must not wait on the network: a slow shared-sessions fetch kept the
     # browser on a blank tab for seconds, before any loading screen could even arrive.

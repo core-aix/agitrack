@@ -1058,12 +1058,21 @@ h2.section::before{content:"# ";color:var(--amber)}
 .part .phead{padding:0 10px}
 .part .part{margin:5px 10px}
 .more{padding:12px 0;color:var(--fg-dim);font-size:12.5px}
-.pager{display:flex;align-items:center;gap:16px;padding:14px 0 2px;color:var(--fg-dim);font-size:12.5px}
-.pager span{min-width:160px}
+.pager{display:flex;align-items:center;flex-wrap:wrap;gap:10px 16px;padding:14px 0 2px;color:var(--fg-dim);font-size:12.5px}
+.pager .pcount{min-width:160px}
+.pager .pnav{display:flex;align-items:center;gap:4px;flex-wrap:wrap}
 .pager button{cursor:pointer;background:transparent;border:1px solid var(--phosphor-dim);color:var(--phosphor);
-  font-family:var(--mono);font-size:12.5px;padding:5px 12px}
+  font-family:var(--mono);font-size:12.5px;padding:5px 9px;min-width:31px}
 .pager button:hover:not([disabled]){background:var(--phosphor);color:var(--ink)}
 .pager button[disabled]{opacity:.35;cursor:default;border-color:var(--line);color:var(--fg-dim)}
+/* The current page stays fully lit even though it's disabled (it's a marker, not a dead control). */
+.pager button.current[disabled]{opacity:1;background:var(--phosphor);color:var(--ink);border-color:var(--phosphor)}
+.pager .pgap{padding:0 2px}
+.pager .pgoto{display:flex;align-items:center;gap:7px}
+.pager .pgoto input{width:58px;background:transparent;border:1px solid var(--line);color:var(--fg);
+  font-family:var(--mono);font-size:12.5px;padding:4px 7px;-moz-appearance:textfield}
+.pager .pgoto input:focus{outline:none;border-color:var(--phosphor-dim)}
+.pager .pgoto input::-webkit-outer-spin-button,.pager .pgoto input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
 
 /* ---- log tabs (commits / files) — title on its own line, tabs left below it ---- */
 .logsection-head{margin:38px 0 14px}
@@ -1805,14 +1814,40 @@ function renderLog(){
       `<div class="detail" id="detail-${i}" hidden></div></div>`;
   }).join("");
   const from = total ? offset+1 : 0, to = offset+entries.length;
-  const prevDis = offset<=0 ? "disabled" : "", nextDis = (offset+limit>=total) ? "disabled" : "";
-  const pager = `<div class="pager"><button id="log-prev" ${prevDis}>‹ newer</button>`+
-    `<span>${fmt(from)}–${fmt(to)} of ${fmt(total)} commits</span>`+
-    `<button id="log-next" ${nextDis}>older ›</button></div>`;
+  const pages = Math.max(1, Math.ceil(total/limit)), cur = Math.min(pages, Math.floor(offset/limit)+1);
+  // Numbered page buttons: all of them when few, otherwise first + a window around
+  // the current page + last, with … gaps (0 marks a gap).
+  let nums = [];
+  if(pages<=9){ for(let p=1;p<=pages;p++) nums.push(p); }
+  else {
+    const lo = Math.max(2, cur-2), hi = Math.min(pages-1, cur+2);
+    nums.push(1);
+    if(lo>2) nums.push(0);
+    for(let p=lo;p<=hi;p++) nums.push(p);
+    if(hi<pages-1) nums.push(0);
+    nums.push(pages);
+  }
+  const numBtns = nums.map(p => p===0 ? `<span class="pgap">…</span>` :
+    `<button class="pnum${p===cur?' current':''}" data-p="${p}" ${p===cur?'disabled':''}>${fmt(p)}</button>`).join("");
+  const prevDis = cur<=1 ? "disabled" : "", nextDis = cur>=pages ? "disabled" : "";
+  const gotoBox = pages>1 ? `<span class="pgoto">go to <input id="log-goto" type="number" inputmode="numeric" `+
+    `min="1" max="${pages}" placeholder="${cur}"> / ${fmt(pages)}</span>` : "";
+  const pager = `<div class="pager"><span class="pcount">${fmt(from)}–${fmt(to)} of ${fmt(total)} commits</span>`+
+    `<span class="pnav"><button id="log-first" title="first page" ${prevDis}>«</button>`+
+    `<button id="log-prev" title="previous page" ${prevDis}>‹</button>${numBtns}`+
+    `<button id="log-next" title="next page" ${nextDis}>›</button>`+
+    `<button id="log-last" title="last page" ${nextDis}>»</button></span>${gotoBox}</div>`;
   $("commitlog").innerHTML = (rows || `<div class="empty">no commits</div>`) + pager;
-  const prev = $("log-prev"), next = $("log-next");
-  if(prev) prev.onclick = async () => { if(await loadLog(Math.max(0, offset-limit))) renderLog(); };
-  if(next) next.onclick = async () => { if(offset+limit<total && await loadLog(offset+limit)) renderLog(); };
+  const goPage = async p => {
+    p = Math.min(pages, Math.max(1, p));
+    if(p!==cur && await loadLog((p-1)*limit)) renderLog();
+  };
+  for(const [id, p] of [["log-first",1],["log-prev",cur-1],["log-next",cur+1],["log-last",pages]]){
+    const b = $(id); if(b && !b.disabled) b.onclick = () => goPage(p);
+  }
+  document.querySelectorAll("#commitlog .pnum:not([disabled])").forEach(b => { b.onclick = () => goPage(+b.dataset.p); });
+  const gi = $("log-goto");
+  if(gi) gi.onkeydown = e => { if(e.key==="Enter" && gi.value!=="") goPage(+gi.value||cur); };
 }
 
 function partsHtml(parts){

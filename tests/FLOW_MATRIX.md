@@ -252,6 +252,7 @@ directory that is not a git repo still gets the full page, with progress sync re
 | Backtrace log opens with an explainer of what its entries are (reconstructed turns, unhidden only under the BACKTRACE flag); log subject lines truncate at word ends with an ellipsis, never bare mid-word — both the client-side cap AND the reconstruction's server-side subject builder | `test_backtrace_log_explains_what_the_entries_are`, `test_subject_truncation_cuts_at_word_ends`, `test_backtrace.py::test_subject_truncates_at_word_ends_with_ellipsis` | real-git |
 | Dashboard first paint never waits on the network (no shared-ref fetch in the "/" response; polls fetch instead), so the loading screen, not a blank tab, covers slow starts | `test_first_paint_never_fetches_the_shared_ref` | real-git |
 | The shell-mode boot loader stays visible through the /data crunch: its rules are id-scoped so the body's own "booting" state class can never match them and hide the whole page | `test_boot_loader_is_not_hidden_by_the_body_state_class` | real-git |
+| Log pager pages by number: windowed page buttons with … gaps, first/last jumps, and a go-to-page box; every jump lands on a (page−1)×PAGE_SIZE offset so the static demo's pre-baked log pages resolve | `test_log_pager_has_numbered_pages_first_last_and_a_goto_box` | real-git |
 
 ## 12c. Static demo export (`agitrack -d export`, `tests/test_export.py`)
 A server-free copy of the dashboard + learn page for static hosts (powers the public demo at
