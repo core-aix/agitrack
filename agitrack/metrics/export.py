@@ -76,9 +76,8 @@ def _banner_html(generated: str, css_class: str, site_root: str) -> str:
     ``site_root`` is the relative path back to the main webpage, whose install section
     the banner links to."""
     text = (
-        "STATIC DEMO: a static snapshot of the real aGiTrack dashboard, "
-        f"showing aGiTrack's own git history in the 30 days before {generated}. "
-        "Some features are off in this snapshot. "
+        "STATIC DEMO: snapshot of the real aGiTrack dashboard with "
+        f"aGiTrack's own history in the 30 days before {generated}."
     )
     return (
         f'<div class="{css_class}">🧪 '
