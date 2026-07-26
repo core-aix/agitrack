@@ -1596,3 +1596,53 @@ def test_partial_turn_delta_never_goes_negative(tmp_path):
     pending = state.pending_token_usage()
     assert (pending["input"], pending["output"]) == (0, 0)
     assert state.partial_turn_usage() is None
+
+
+def test_lost_watermark_never_reexports_the_whole_session(tmp_path):
+    # A context compaction can reshape turn boundaries so the stored watermark id no
+    # longer matches any turn boundary. The old fallback exported EVERYTHING — which
+    # re-committed a 20-day conversation as one 31M-token commit (2026-07-25). With the
+    # mark's timestamp recorded, only turns that began after it are new; without even a
+    # timestamp (legacy state), just the newest turn re-anchors tracking.
+    from agitrack.transcripts.types import turns_after
+
+    old = SessionTurn("u1", "a1", "ancient", "done", TokenUsage(output=1_000_000), None, started_at=100, ended_at=200)
+    newer = SessionTurn("u2", "a2", "recent", "done", TokenUsage(output=10), None, started_at=900, ended_at=950)
+    exported = ExportedSession("ses-lost", "m", None, [old, newer])
+
+    with_time = turns_after(exported, "msg_vanished", marked_at=500)
+    assert with_time == [newer]  # the ancient, already-committed turn is never re-exported
+
+    legacy = turns_after(exported, "msg_vanished")
+    assert legacy == [newer]  # last turn only — bounded, re-anchors on its id
+
+    # A turn with NO timestamps is unknowable and errs toward export (synthetic
+    # transcripts; real ones always stamp times) — it must not read as "ancient".
+    untimed = SessionTurn("u3", "a3", "untimed", "done", TokenUsage(output=1), None)
+    exported_untimed = ExportedSession("ses-lost2", "m", None, [old, untimed])
+    assert turns_after(exported_untimed, "msg_vanished", marked_at=500) == [untimed]
+
+
+def test_watermark_advance_records_the_mark_timestamp(tmp_path):
+    # Every watermark advance stores WHEN the mark landed, so a later boundary reshuffle
+    # falls back to time instead of the full-history export.
+    session = Session.bare()
+    turn = SessionTurn("u1", "a1", "p", "done", TokenUsage(output=5), None, started_at=1000, ended_at=1010)
+    exported = ExportedSession("ses-mark", "m", None, [turn])
+    engine, state, commits, commit_fn = _make_finish_helpers(tmp_path, session, exported)
+    state.data["backend_session_id"] = "ses-mark"
+
+    result, _ = engine.finish_parse_if_ready(
+        session=session,
+        quiet=True,
+        prompt_untracked=False,
+        require_complete=True,
+        awaited_followups=[],
+        agent_is_active_fn=lambda: False,
+        debug_fn=lambda *a, **k: None,
+        note_session_change_fn=lambda sid: None,
+        mirror_fn=lambda sid: None,
+        commit_fn=commit_fn,
+    )
+    assert result is True
+    assert state.backend_message_marked_at_for("ses-mark") == 1010

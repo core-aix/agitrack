@@ -368,19 +368,33 @@ class AgitrackState:
         value = (self.data.get("backend_message_ids") or {}).get(str(session_id))
         return str(value) if value else None
 
-    def set_backend_message_id(self, session_id: str | None, message_id: str | None) -> None:
+    def set_backend_message_id(
+        self, session_id: str | None, message_id: str | None, *, marked_at: float | None = None
+    ) -> None:
         """Advance the committed watermark for *session_id*: the primary single value (so all
         existing readers/resetters keep working) and the per-conversation map entry, together
-        in one save."""
+        in one save. ``marked_at`` (the watermark turn's end time) backs turns_after's
+        safe fallback when a compaction later reshapes turn boundaries and the id stops
+        matching — without it, a lost mark once re-exported a whole 20-day session."""
         self.data["last_backend_message_id"] = message_id
         ids = dict(self.data.get("backend_message_ids") or {})
+        marks = dict(self.data.get("backend_message_marked_at") or {})
         if session_id:
             if message_id:
                 ids[str(session_id)] = message_id
+                if marked_at:
+                    marks[str(session_id)] = marked_at
             else:
                 ids.pop(str(session_id), None)
+                marks.pop(str(session_id), None)
         self.data["backend_message_ids"] = ids
+        self.data["backend_message_marked_at"] = marks
         self.save()
+
+    def backend_message_marked_at_for(self, session_id: str | None) -> float | None:
+        marks = self.data.get("backend_message_marked_at") or {}
+        value = marks.get(str(session_id)) if session_id else None
+        return float(value) if isinstance(value, (int, float)) else None
 
     def declined_untracked(self) -> list[str]:
         return list(self.data.get("declined_untracked_files") or [])

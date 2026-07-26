@@ -108,7 +108,9 @@ class SessionRef:
     programmatic: bool = False
 
 
-def turns_after(session: ExportedSession, last_message_id: str | None) -> list[SessionTurn]:
+def turns_after(
+    session: ExportedSession, last_message_id: str | None, *, marked_at: float | None = None
+) -> list[SessionTurn]:
     """The turns not yet covered by the ``last_message_id`` watermark.
 
     A watermark matching a turn's ASSISTANT id marks that whole turn committed: return
@@ -117,9 +119,19 @@ def turns_after(session: ExportedSession, last_message_id: str | None) -> list[S
     finalize, a tracker restart). If that turn NOW carries an assistant response, the
     agent continued the very same turn after the commit — its final message and edits
     exist nowhere in history — so the turn itself is returned too, letting it commit in
-    its completed form. (The continuation re-counts the turn's tokens; work never being
-    lost outweighs that inflation in this crash-recovery corner.) A user-id watermark on
-    a turn still without a reply behaves as before: nothing new to export."""
+    its completed form (the engine's partial-turn record keeps its tokens counted once).
+    A user-id watermark on a turn still without a reply behaves as before: nothing new
+    to export.
+
+    A watermark that is SET but matches no turn boundary must never mean "export
+    everything": a context compaction can reshape turn boundaries so the marked id ends
+    up inside a merged turn, and the full-export fallback then re-committed a 20-day
+    conversation as one 31M-token commit (2026-07-25). Instead fall back to the time the
+    mark was recorded (``marked_at``): only turns that BEGAN after it are new. A turn
+    carrying NO timestamps is unknowable and errs toward export (real transcripts always
+    stamp times; only synthetic ones don't). Without even a recorded timestamp (legacy
+    state), return just the newest turn — worst case one turn re-commits, and tracking
+    re-anchors on its id."""
     if not last_message_id:
         return session.turns
     for index, turn in enumerate(session.turns):
@@ -129,4 +141,10 @@ def turns_after(session: ExportedSession, last_message_id: str | None) -> list[S
             if turn.assistant_message_id and turn.final_response:
                 return session.turns[index:]  # the turn continued past its force-commit
             return session.turns[index + 1 :]
-    return session.turns
+    if marked_at:
+        return [
+            turn
+            for turn in session.turns
+            if (turn.started_at or turn.ended_at) is None or (turn.started_at or turn.ended_at or 0) > marked_at
+        ]
+    return session.turns[-1:]

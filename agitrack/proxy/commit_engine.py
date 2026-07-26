@@ -653,7 +653,11 @@ class CommitEngine:
         except AttributeError:
             pass
 
-        all_turns = turns_after(exported_session, last_message_id)
+        all_turns = turns_after(
+            exported_session,
+            last_message_id,
+            marked_at=self.state.backend_message_marked_at_for(self.state.backend_session_id),
+        )
 
         # Tell the driver whether the agent is MID-TURN right now, so a commit the agent makes
         # ITSELF before its turn ends still gets attributed (see `build_in_flight_trailer`) —
@@ -786,8 +790,12 @@ class CommitEngine:
             # finished turn (its assistant id is empty, so the user id anchors the watermark).
             watermark = complete_turns[-1] if complete_turns else last_turn
             mark_id = watermark.assistant_message_id or watermark.user_message_id if watermark else None
-            if mark_id:
-                self.state.set_backend_message_id(self.state.backend_session_id, mark_id)
+            if watermark is not None and mark_id:
+                self.state.set_backend_message_id(
+                    self.state.backend_session_id,
+                    mark_id,
+                    marked_at=(watermark.ended_at or watermark.started_at or time.time()),
+                )
             if watermark is not None and not watermark.assistant_message_id and watermark.user_message_id:
                 # Force-captured mid-turn: the next parse re-exports this turn INCLUSIVELY
                 # once it finishes. Remember the usage counted SO FAR (cumulative, so a
