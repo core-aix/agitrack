@@ -63,9 +63,7 @@ _DEMO_WINDOW_DAYS = 30
 
 # What the shims answer for anything the snapshot cannot serve (an unbaked diff, a learn
 # action that needs the live coach). Rendered in place by the page's normal error paths.
-_DEMO_NOTE = (
-    "This static demo doesn't support this action. Install and run aGiTrack on your own repo to see the live dashboard and the learn page's agent-driven features."
-)
+_DEMO_NOTE = "This static demo doesn't support this action. Install and run aGiTrack on your own repo to see the live dashboard and the learn page's agent-driven features."
 
 
 def _banner_html(generated: str, css_class: str, site_root: str) -> str:

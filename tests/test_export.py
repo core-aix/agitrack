@@ -32,9 +32,11 @@ def test_export_writes_a_complete_static_site(tmp_path, monkeypatch):
 
     index = (out / "index.html").read_text(encoding="utf-8")
     learn = (out / "learn" / "index.html").read_text(encoding="utf-8")
+    from agitrack.metrics.export import _DEMO_NOTE
+
     for page in (index, learn):
         assert "STATIC DEMO" in page
-        assert "pip install agitrack" in page
+        assert _DEMO_NOTE in page  # the unsupported-action note is wired into both shims
         assert "window.fetch = function" in page  # the shim is installed
 
     # Every granularity the chart selector offers has a baked /data response.
