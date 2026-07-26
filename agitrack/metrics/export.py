@@ -253,6 +253,17 @@ def _shim(*, base: str, files_index: dict[str, int], learn: bool, site_root: str
       var back = document.getElementById("backlink");
       if (back) back.href = "../";
     }}
+    // The learn page surfaces the demo note through its ERROR path (agent actions return
+    // {{error: NOTE}}), which flashes red — but the dashboard shows the same note as an
+    // amber notice. Restyle demo-note flashes as notices so the two pages match; real
+    // errors keep the red treatment.
+    if (LEARN && typeof window.flash === "function") {{
+      var pageFlash = window.flash;
+      window.flash = function(html){{
+        if (typeof html === "string" && html.indexOf(NOTE) >= 0) html = html.replace('class="error"', 'class="notice"');
+        return pageFlash(html);
+      }};
+    }}
     // Deep link from the main page's "Turns become commits" card: #trace opens the
     // newest aGiTrack commit in the log and scrolls to its Interaction Trace heading.
     // The log arrives asynchronously, so poll: first click the entry open (its detail
