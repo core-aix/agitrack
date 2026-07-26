@@ -111,6 +111,12 @@ def test_export_disables_filters_and_cans_learn_actions(tmp_path, monkeypatch):
     assert "demoflash" in index
     assert 'el.style.pointerEvents = "none"' in index
     assert "stopImmediatePropagation" in index  # reset intercepted ahead of the page handler
+    # The #trace deep link maximizes the expanded commit: the window pins the ENTRY under
+    # the sticky chrome (kept pinned while late layout settles) and the message box
+    # scrolls internally so the Interaction Trace starts at its top.
+    assert 'location.hash === "#trace"' in index
+    assert "box.scrollTop +=" in index
+    assert "entry.getBoundingClientRect().top - want" in index
     # The learn page shows the same note in the same amber notice style: its error-path
     # flashes carrying the demo note are restyled to notices (real errors stay red).
     learn = (out / "learn" / "index.html").read_text(encoding="utf-8")

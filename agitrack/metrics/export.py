@@ -279,8 +279,10 @@ def _shim(*, base: str, files_index: dict[str, int], learn: bool, site_root: str
     // Deep link from the main page's "Turns become commits" card: #trace opens the
     // newest aGiTrack commit in the log and scrolls to its Interaction Trace heading.
     // The log arrives asynchronously, so poll: first click the entry open (its detail
-    // renders a frame later), then scroll once the trace heading exists — offset so the
-    // sticky banner and filter bar don't cover it.
+    // renders a frame later). Then PIN the heading just below the sticky chrome and keep
+    // correcting while late layout (the chart canvas, web fonts, other entries) shifts the
+    // page — a single blind scroll left the heading stranded mid-viewport with earlier
+    // commits still showing above it, instead of the expanded commit filling the view.
     if (!LEARN && location.hash === "#trace") {{
       var deadline = Date.now() + 15000;
       var tick = setInterval(function(){{
@@ -295,9 +297,22 @@ def _shim(*, base: str, files_index: dict[str, int], learn: bool, site_root: str
         }});
         if (target) {{
           clearInterval(tick);
-          var strip = document.querySelector(".backtracebanner"), bar = document.querySelector(".controls");
-          target.style.scrollMarginTop = ((strip ? strip.offsetHeight : 0) + (bar ? bar.offsetHeight : 0) + 14) + "px";
-          target.scrollIntoView({{block: "start"}});
+          // Two scrolls, not one: the commit message lives in its own scrollable box
+          // (.dmsg, max-height-capped), so the WINDOW pins the expanded ENTRY right
+          // below the sticky chrome (the commit fills the view, no earlier entries
+          // showing) while the BOX scrolls internally so the trace starts at its top.
+          var box = target.closest ? target.closest(".dmsg") : null;
+          var settled = 0, corrections = 0;
+          var pin = setInterval(function(){{
+            var strip = document.querySelector(".backtracebanner"), bar = document.querySelector(".controls");
+            var want = (strip ? strip.offsetHeight : 0) + (bar ? bar.offsetHeight : 0) + 10;
+            if (box) box.scrollTop += Math.round(target.getBoundingClientRect().top - box.getBoundingClientRect().top);
+            var drift = entry.getBoundingClientRect().top - want;
+            if (Math.abs(drift) <= 2) {{ if (++settled >= 4) clearInterval(pin); return; }}
+            settled = 0;
+            if (++corrections > 50) {{ clearInterval(pin); return; }}
+            window.scrollBy(0, drift);
+          }}, 100);
         }}
       }}, 150);
     }}
