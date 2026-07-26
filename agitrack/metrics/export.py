@@ -263,6 +263,19 @@ def _shim(*, base: str, files_index: dict[str, int], learn: bool, site_root: str
         return pageFlash(html);
       }};
     }}
+    // Controls whose handlers would show the demo note INLINE (engine save / sync toggle
+    // write to their status spans) or swallow it silently (start-over only reacts to a
+    // success payload): intercept ahead of the page handler and use the same fixed toast
+    // as everything else, so every unavailable feature announces itself one way.
+    if (LEARN) {{
+      ["e-save", "sync-toggle", "reset-suggest"].forEach(function(id){{
+        var el = document.getElementById(id);
+        if (el) el.addEventListener("click", function(e){{
+          e.preventDefault(); e.stopImmediatePropagation();
+          if (typeof window.flash === "function") window.flash('<div class="notice">' + NOTE + '</div>');
+        }}, true);
+      }});
+    }}
     // Deep link from the main page's "Turns become commits" card: #trace opens the
     // newest aGiTrack commit in the log and scrolls to its Interaction Trace heading.
     // The log arrives asynchronously, so poll: first click the entry open (its detail
