@@ -195,10 +195,51 @@ def _shim(*, base: str, files_index: dict[str, int], learn: bool, site_root: str
     return real(input, init);
   }};
   document.addEventListener("DOMContentLoaded", function(){{
+    // Tapping an unsupported control answers with the same fixed toast the learn page
+    // uses for unavailable features — visible from anywhere (the top banner is short and
+    // may be scrolled away, especially on a phone). Click dismisses.
+    var flashBox = null;
+    if (!LEARN) {{
+      document.head.insertAdjacentHTML("beforeend", "<style>" +
+        "#demoflash{{position:fixed;left:50%;transform:translateX(-50%);bottom:18px;z-index:80;" +
+          "width:min(680px,calc(100vw - 32px));pointer-events:none}}" +
+        "#demoflash .notice{{pointer-events:auto;cursor:pointer;background:var(--panel);" +
+          "border:1px solid var(--amber);color:var(--amber);padding:10px 14px;font-size:13px;" +
+          "border-radius:6px;margin:6px 0;box-shadow:0 14px 44px rgba(0,0,0,.65)}}" +
+        "#demoflash .notice::after{{content:\\" · click to dismiss\\";opacity:.6;font-size:11px}}" +
+        "</style>");
+      flashBox = document.createElement("div");
+      flashBox.id = "demoflash";
+      document.body.appendChild(flashBox);
+      flashBox.onclick = function(){{ flashBox.innerHTML = ""; }};
+    }}
+    var showNote = function(){{
+      if (!flashBox) return;
+      var note = document.createElement("div");
+      note.className = "notice";
+      note.textContent = NOTE;
+      flashBox.innerHTML = "";
+      flashBox.appendChild(note);
+    }};
     {lock_ids}.forEach(function(id){{
       var el = document.getElementById(id);
-      if (el) {{ el.disabled = true; el.title = "Filters are off in this static demo. " + NOTE; }}
+      if (!el) return;
+      el.disabled = true;
+      el.title = "Filters are off in this static demo. " + NOTE;
+      // A disabled control swallows clicks, so let them fall through to the wrapper,
+      // which explains why the control is off.
+      el.style.pointerEvents = "none";
+      var wrap = el.parentElement;
+      if (wrap) {{ wrap.style.cursor = "not-allowed"; wrap.addEventListener("click", showNote); }}
     }});
+    // The reset button stays enabled-looking but resetting filters is meaningless here —
+    // intercept it (capture phase beats the page's own handler) and explain instead.
+    if (!LEARN) {{
+      var reset = document.getElementById("reset");
+      if (reset) reset.addEventListener("click", function(e){{
+        e.preventDefault(); e.stopImmediatePropagation(); showNote();
+      }}, true);
+    }}
     // The baked data is scoped to the last 30 days — make the (disabled) range
     // dropdown say so instead of claiming "all time".
     if (!LEARN) {{
