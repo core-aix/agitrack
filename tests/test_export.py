@@ -115,6 +115,9 @@ def test_export_disables_filters_and_cans_learn_actions(tmp_path, monkeypatch):
     # flashes carrying the demo note are restyled to notices (real errors stay red).
     learn = (out / "learn" / "index.html").read_text(encoding="utf-8")
     assert "html.replace('class=\"error\"', 'class=\"notice\"')" in learn
+    # Controls that would show the note inline (engine save, sync toggle) or swallow it
+    # silently (start over) are intercepted to the same toast instead.
+    assert '["e-save", "sync-toggle", "reset-suggest"]' in learn
     learn = (out / "learn" / "index.html").read_text(encoding="utf-8")
     # Agent-driven POSTs answer with the install hint; suggest re-serves the profile.
     assert "static demo" in learn
