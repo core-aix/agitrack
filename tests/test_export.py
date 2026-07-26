@@ -89,7 +89,7 @@ def test_export_scopes_the_demo_to_the_last_30_days(tmp_path, monkeypatch):
     assert not (out / "demo" / "diff" / f"{ancient_sha}.json").exists()  # only in-scope diffs baked
 
     index = (out / "index.html").read_text(encoding="utf-8")
-    assert "showing the last 30 days" in index
+    assert "in the 30 days before" in index  # the banner names the scope
     assert 'period.value = "30"' in index  # the disabled range dropdown shows the real scope
 
 
@@ -106,6 +106,11 @@ def test_export_disables_filters_and_cans_learn_actions(tmp_path, monkeypatch):
     for control in ("f-author", "f-backend", "f-model", "f-period", "f-branch"):
         assert control in index
     assert "el.disabled = true" in index
+    # Tapping a disabled filter (clicks fall through to its wrapper) or the reset button
+    # answers with the learn page's demo note as a fixed toast, not silence.
+    assert "demoflash" in index
+    assert 'el.style.pointerEvents = "none"' in index
+    assert "stopImmediatePropagation" in index  # reset intercepted ahead of the page handler
     learn = (out / "learn" / "index.html").read_text(encoding="utf-8")
     # Agent-driven POSTs answer with the install hint; suggest re-serves the profile.
     assert "static demo" in learn
