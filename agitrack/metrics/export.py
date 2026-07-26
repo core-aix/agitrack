@@ -56,7 +56,6 @@ from agitrack.metrics.web import (
     shared_sessions_for,
 )
 
-INSTALL_HINT = "pip install agitrack, then run: agitrack -d"
 _REPO_URL = "https://github.com/core-aix/agitrack"
 
 # How much history the demo ships: the dashboard's "last 30 days" range, not all time.
@@ -64,9 +63,7 @@ _DEMO_WINDOW_DAYS = 30
 
 # What the shims answer for anything the snapshot cannot serve (an unbaked diff, a learn
 # action that needs the live coach). Rendered in place by the page's normal error paths.
-_DEMO_NOTE = (
-    "This is a static demo, so this action needs a live install. Run aGiTrack on your own repo: " + INSTALL_HINT
-)
+_DEMO_NOTE = "This static demo doesn't support this action. Install and run aGiTrack on your own repo to see the live dashboard and the learn page's agent-driven features."
 
 
 def _banner_html(generated: str, css_class: str, site_root: str) -> str:
@@ -76,9 +73,8 @@ def _banner_html(generated: str, css_class: str, site_root: str) -> str:
     ``site_root`` is the relative path back to the main webpage, whose install section
     the banner links to."""
     text = (
-        "STATIC DEMO: the real aGiTrack dashboard, generated from the aGiTrack repository's "
-        f"own git history ({generated}), showing the last 30 days. "
-        "Filters and the live coach are off in this snapshot. "
+        "STATIC DEMO: snapshot of the real aGiTrack dashboard, with "
+        f"aGiTrack's own history in the 30 days before {generated}. "
     )
     return (
         f'<div class="{css_class}">🧪 '
@@ -195,10 +191,51 @@ def _shim(*, base: str, files_index: dict[str, int], learn: bool, site_root: str
     return real(input, init);
   }};
   document.addEventListener("DOMContentLoaded", function(){{
+    // Tapping an unsupported control answers with the same fixed toast the learn page
+    // uses for unavailable features — visible from anywhere (the top banner is short and
+    // may be scrolled away, especially on a phone). Click dismisses.
+    var flashBox = null;
+    if (!LEARN) {{
+      document.head.insertAdjacentHTML("beforeend", "<style>" +
+        "#demoflash{{position:fixed;left:50%;transform:translateX(-50%);bottom:18px;z-index:80;" +
+          "width:min(680px,calc(100vw - 32px));pointer-events:none}}" +
+        "#demoflash .notice{{pointer-events:auto;cursor:pointer;background:var(--panel);" +
+          "border:1px solid var(--amber);color:var(--amber);padding:10px 14px;font-size:13px;" +
+          "border-radius:6px;margin:6px 0;box-shadow:0 14px 44px rgba(0,0,0,.65)}}" +
+        "#demoflash .notice::after{{content:\\" · click to dismiss\\";opacity:.6;font-size:11px}}" +
+        "</style>");
+      flashBox = document.createElement("div");
+      flashBox.id = "demoflash";
+      document.body.appendChild(flashBox);
+      flashBox.onclick = function(){{ flashBox.innerHTML = ""; }};
+    }}
+    var showNote = function(){{
+      if (!flashBox) return;
+      var note = document.createElement("div");
+      note.className = "notice";
+      note.textContent = NOTE;
+      flashBox.innerHTML = "";
+      flashBox.appendChild(note);
+    }};
     {lock_ids}.forEach(function(id){{
       var el = document.getElementById(id);
-      if (el) {{ el.disabled = true; el.title = "Filters are off in this static demo. " + NOTE; }}
+      if (!el) return;
+      el.disabled = true;
+      el.title = "Filters are off in this static demo. " + NOTE;
+      // A disabled control swallows clicks, so let them fall through to the wrapper,
+      // which explains why the control is off.
+      el.style.pointerEvents = "none";
+      var wrap = el.parentElement;
+      if (wrap) {{ wrap.style.cursor = "not-allowed"; wrap.addEventListener("click", showNote); }}
     }});
+    // The reset button stays enabled-looking but resetting filters is meaningless here —
+    // intercept it (capture phase beats the page's own handler) and explain instead.
+    if (!LEARN) {{
+      var reset = document.getElementById("reset");
+      if (reset) reset.addEventListener("click", function(e){{
+        e.preventDefault(); e.stopImmediatePropagation(); showNote();
+      }}, true);
+    }}
     // The baked data is scoped to the last 30 days — make the (disabled) range
     // dropdown say so instead of claiming "all time".
     if (!LEARN) {{
@@ -212,11 +249,37 @@ def _shim(*, base: str, files_index: dict[str, int], learn: bool, site_root: str
       var back = document.getElementById("backlink");
       if (back) back.href = "../";
     }}
+    // The learn page surfaces the demo note through its ERROR path (agent actions return
+    // {{error: NOTE}}), which flashes red — but the dashboard shows the same note as an
+    // amber notice. Restyle demo-note flashes as notices so the two pages match; real
+    // errors keep the red treatment.
+    if (LEARN && typeof window.flash === "function") {{
+      var pageFlash = window.flash;
+      window.flash = function(html){{
+        if (typeof html === "string" && html.indexOf(NOTE) >= 0) html = html.replace('class="error"', 'class="notice"');
+        return pageFlash(html);
+      }};
+    }}
+    // Controls whose handlers would show the demo note INLINE (engine save / sync toggle
+    // write to their status spans) or swallow it silently (start-over only reacts to a
+    // success payload): intercept ahead of the page handler and use the same fixed toast
+    // as everything else, so every unavailable feature announces itself one way.
+    if (LEARN) {{
+      ["e-save", "sync-toggle", "reset-suggest"].forEach(function(id){{
+        var el = document.getElementById(id);
+        if (el) el.addEventListener("click", function(e){{
+          e.preventDefault(); e.stopImmediatePropagation();
+          if (typeof window.flash === "function") window.flash('<div class="notice">' + NOTE + '</div>');
+        }}, true);
+      }});
+    }}
     // Deep link from the main page's "Turns become commits" card: #trace opens the
     // newest aGiTrack commit in the log and scrolls to its Interaction Trace heading.
     // The log arrives asynchronously, so poll: first click the entry open (its detail
-    // renders a frame later), then scroll once the trace heading exists — offset so the
-    // sticky banner and filter bar don't cover it.
+    // renders a frame later). Then PIN the heading just below the sticky chrome and keep
+    // correcting while late layout (the chart canvas, web fonts, other entries) shifts the
+    // page — a single blind scroll left the heading stranded mid-viewport with earlier
+    // commits still showing above it, instead of the expanded commit filling the view.
     if (!LEARN && location.hash === "#trace") {{
       var deadline = Date.now() + 15000;
       var tick = setInterval(function(){{
@@ -231,9 +294,22 @@ def _shim(*, base: str, files_index: dict[str, int], learn: bool, site_root: str
         }});
         if (target) {{
           clearInterval(tick);
-          var strip = document.querySelector(".backtracebanner"), bar = document.querySelector(".controls");
-          target.style.scrollMarginTop = ((strip ? strip.offsetHeight : 0) + (bar ? bar.offsetHeight : 0) + 14) + "px";
-          target.scrollIntoView({{block: "start"}});
+          // Two scrolls, not one: the commit message lives in its own scrollable box
+          // (.dmsg, max-height-capped), so the WINDOW pins the expanded ENTRY right
+          // below the sticky chrome (the commit fills the view, no earlier entries
+          // showing) while the BOX scrolls internally so the trace starts at its top.
+          var box = target.closest ? target.closest(".dmsg") : null;
+          var settled = 0, corrections = 0;
+          var pin = setInterval(function(){{
+            var strip = document.querySelector(".backtracebanner"), bar = document.querySelector(".controls");
+            var want = (strip ? strip.offsetHeight : 0) + (bar ? bar.offsetHeight : 0) + 10;
+            if (box) box.scrollTop += Math.round(target.getBoundingClientRect().top - box.getBoundingClientRect().top);
+            var drift = entry.getBoundingClientRect().top - want;
+            if (Math.abs(drift) <= 2) {{ if (++settled >= 4) clearInterval(pin); return; }}
+            settled = 0;
+            if (++corrections > 50) {{ clearInterval(pin); return; }}
+            window.scrollBy(0, drift);
+          }}, 100);
         }}
       }}, 150);
     }}
@@ -272,7 +348,7 @@ def export_static_demo(repo: GitRepo, out_dir: Path) -> Path:
     files, sha_paths = context_from_browser(browser, dash.stats)
     insights = build_insights(dash.stats, files, sha_paths)
     shared = shared_sessions_for(repo)
-    generated = "updated " + (aggregates_payload(dash)["generated_at"])
+    generated = aggregates_payload(dash)["generated_at"]
     # The demo's scope: the last 30 days, anchored to the newest commit rather than the
     # export clock so a rebuild from a briefly quiet repo never bakes an empty demo.
     newest = max((stat.timestamp for stat in dash.stats if stat.timestamp), default=0)
