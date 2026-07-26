@@ -781,6 +781,11 @@ body.booting .wrap>*:not(header):not(#booting){display:none}
   text-align:center;box-shadow:0 4px 16px rgba(0,0,0,.55)}
 /* Same treatment as the learn banner's code chip, so a command reads identically on every page. */
 .backtracebanner code{color:var(--fg);background:var(--ink);padding:0 5px}
+/* Banner links match the banner's amber (identical rule on the learn page's .btbanner):
+   the page-global anchor colors differ between the two pages, so left unstyled the same
+   demo-banner link rendered green here and cyan there. */
+.backtracebanner a{color:var(--amber);border-bottom:1px solid var(--amber-dim)}
+.backtracebanner a:hover{color:var(--ink);background:var(--amber)}
 @keyframes rise{from{transform:translateY(-100%)}to{transform:none}}
 
 header{padding:26px 0 18px}

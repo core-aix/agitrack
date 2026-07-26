@@ -263,7 +263,7 @@ agitrack.core-aix.org/dashboard/, rebuilt by `.github/workflows/pages.yml` on ea
 | Export is complete: every /data granularity, every /log page for every sort, every in-scope commit's /diff, the whole file browser (filelog + per-change filediff) baked as files | `test_export_writes_a_complete_static_site` | real-git |
 | The demo ships the last 30 days (anchored to the newest commit, never empty), not all time: log pages, embedded first paint, and baked diffs are scoped; the banner and the disabled range dropdown say "last 30 days" | `test_export_scopes_the_demo_to_the_last_30_days` | real-git |
 | The fetch shim is installed before any page script runs | `test_export_shim_installs_before_the_page_script` | real-git |
-| Honest degradation: demo banner + install hint on both pages, filter controls disabled, agent-driven learn POSTs answered with the install hint | `test_export_writes_a_complete_static_site`, `test_export_disables_filters_and_cans_learn_actions` | real-git |
+| Honest degradation: demo banner + install hint on both pages, filter controls disabled, agent-driven learn POSTs answered with the install hint; tapping a disabled filter or the reset button flashes the same demo note as a fixed toast (learn-page style, click to dismiss) | `test_export_writes_a_complete_static_site`, `test_export_disables_filters_and_cans_learn_actions` | real-git |
 | Learn profile fallback: the store's single non-empty profile ships when the exporting identity has none (how CI exports the checked-in fixture) | `test_export_learn_state_falls_back_to_the_single_store_profile` | real-git |
 | CLI: `-d export --export-dir` writes the site and reports the path | `test_cli_export_writes_the_site` | real-git |
 

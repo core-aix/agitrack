@@ -32,9 +32,11 @@ def test_export_writes_a_complete_static_site(tmp_path, monkeypatch):
 
     index = (out / "index.html").read_text(encoding="utf-8")
     learn = (out / "learn" / "index.html").read_text(encoding="utf-8")
+    from agitrack.metrics.export import _DEMO_NOTE
+
     for page in (index, learn):
         assert "STATIC DEMO" in page
-        assert "pip install agitrack" in page
+        assert _DEMO_NOTE in page  # the unsupported-action note is wired into both shims
         assert "window.fetch = function" in page  # the shim is installed
 
     # Every granularity the chart selector offers has a baked /data response.
@@ -89,7 +91,7 @@ def test_export_scopes_the_demo_to_the_last_30_days(tmp_path, monkeypatch):
     assert not (out / "demo" / "diff" / f"{ancient_sha}.json").exists()  # only in-scope diffs baked
 
     index = (out / "index.html").read_text(encoding="utf-8")
-    assert "showing the last 30 days" in index
+    assert "in the 30 days before" in index  # the banner names the scope
     assert 'period.value = "30"' in index  # the disabled range dropdown shows the real scope
 
 
@@ -106,6 +108,24 @@ def test_export_disables_filters_and_cans_learn_actions(tmp_path, monkeypatch):
     for control in ("f-author", "f-backend", "f-model", "f-period", "f-branch"):
         assert control in index
     assert "el.disabled = true" in index
+    # Tapping a disabled filter (clicks fall through to its wrapper) or the reset button
+    # answers with the learn page's demo note as a fixed toast, not silence.
+    assert "demoflash" in index
+    assert 'el.style.pointerEvents = "none"' in index
+    assert "stopImmediatePropagation" in index  # reset intercepted ahead of the page handler
+    # The #trace deep link maximizes the expanded commit: the window pins the ENTRY under
+    # the sticky chrome (kept pinned while late layout settles) and the message box
+    # scrolls internally so the Interaction Trace starts at its top.
+    assert 'location.hash === "#trace"' in index
+    assert "box.scrollTop +=" in index
+    assert "entry.getBoundingClientRect().top - want" in index
+    # The learn page shows the same note in the same amber notice style: its error-path
+    # flashes carrying the demo note are restyled to notices (real errors stay red).
+    learn = (out / "learn" / "index.html").read_text(encoding="utf-8")
+    assert "html.replace('class=\"error\"', 'class=\"notice\"')" in learn
+    # Controls that would show the note inline (engine save, sync toggle) or swallow it
+    # silently (start over) are intercepted to the same toast instead.
+    assert '["e-save", "sync-toggle", "reset-suggest"]' in learn
     learn = (out / "learn" / "index.html").read_text(encoding="utf-8")
     # Agent-driven POSTs answer with the install hint; suggest re-serves the profile.
     assert "static demo" in learn
@@ -119,6 +139,11 @@ def test_export_disables_filters_and_cans_learn_actions(tmp_path, monkeypatch):
     # out install commands.
     assert 'href="../#install"' in index
     assert 'href="../../#install"' in learn
+    # …and the link renders in the SAME amber on both pages (the pages' global anchor
+    # colors differ — green vs cyan — so each banner styles its links explicitly;
+    # --warn and --amber are the same #ffb454).
+    assert ".backtracebanner a{color:var(--amber)" in index
+    assert ".btbanner a{color:var(--warn)" in learn
 
 
 def test_export_learn_state_falls_back_to_the_single_store_profile(tmp_path, monkeypatch):
