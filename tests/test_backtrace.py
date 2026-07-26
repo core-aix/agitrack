@@ -400,6 +400,23 @@ def test_opencode_parse_exported_session_collects_edits():
 # --------------------------------------------------------------------------- collector helpers
 
 
+def test_subject_truncates_at_word_ends_with_ellipsis():
+    # The reconstructed log's subject must never cut a word in half without a marker:
+    # cut at the last word end inside the cap and append an ellipsis (a hard cut only
+    # when one enormous word fills more than half the line). Short prompts pass whole.
+    long = "please rework the dashboard filter bar so that narrow windows compress the selects instead of wrapping the reset button"
+    subject = bt._subject(_turn(long))
+    assert subject.endswith("…")
+    assert len(subject) <= bt._SUBJECT_MAX
+    body = subject[:-1].rstrip()
+    assert long.startswith(body) and long[len(body)] == " "  # the cut landed on a word end
+
+    assert bt._subject(_turn("short prompt stays whole")) == "short prompt stays whole"
+    unbroken = "x" * 200
+    hard = bt._subject(_turn(unbroken))
+    assert hard.endswith("…") and len(hard) == bt._SUBJECT_MAX  # spaceless: hard cut, still marked
+
+
 def _turn(
     prompt: str,
     *,
@@ -932,7 +949,7 @@ def test_backtrace_tags_already_committed_turns(monkeypatch, tmp_path):
         "backend: claude\nbackend_session_id: sess-aaa\nconversation_anchor: a2\n",
     )
 
-    view = bt.build_backtrace(repo, use_cache=False)
+    view = bt.build_backtrace(repo)
     by_turn = {s.subject: s.tracked for s in view.dashboard.stats}
     assert by_turn["turn 1"] is True and by_turn["turn 2"] is True  # covered by the anchor
     assert by_turn["turn 3"] is False  # after the last committed anchor
@@ -1053,3 +1070,13 @@ def test_backtrace_cold_start_does_not_request_a_port(monkeypatch, tmp_path):
 
     assert bt.start_backtrace_daemon(tmp_path, owner_pid=999, open_browser=False) == 0
     assert "--dashboard-port" not in spawned_cmd
+
+
+def test_turn_tokens_apply_the_input_includes_cache_write_convention():
+    # Same convention as commit metadata (issue #14): cache-creation tokens ARE fresh
+    # input. Raw API buckets made a cached-heavy turn show fewer input tokens than its
+    # prompt had words, with cache_write impossibly above input.
+    turn = _turn("p", tokens=TokenUsage(input=5, output=7, cache_write=100, cache_read=1000))
+    tokens = bt._tokens_dict(turn)
+    assert tokens["input"] == 105  # uncached + cache_write
+    assert tokens["cache_write"] == 100 and tokens["cache_read"] == 1000 and tokens["output"] == 7

@@ -139,7 +139,7 @@ def test_start_spawns_waits_and_reports(tmp_path, monkeypatch, capsys):
     assert spawned["owner_pid"] == 555
     out = capsys.readouterr().out
     assert "daemon live at http://127.0.0.1:8765/" in out
-    assert "stops when this terminal closes" in out
+    assert "surviving this terminal" in out
     assert opened == ["http://127.0.0.1:8765/"]
 
 

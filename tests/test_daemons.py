@@ -9,6 +9,7 @@ import sys
 import time
 
 from agitrack import daemons
+from agitrack.daemons import _scan_daemon_processes as _real_scan  # bound pre-guard (conftest stubs the attr)
 
 
 def test_register_list_deregister(monkeypatch, tmp_path):
@@ -100,7 +101,7 @@ def test_scan_daemon_processes_parses_ps(monkeypatch):
         stdout = canned
 
     monkeypatch.setattr(daemons.subprocess, "run", lambda *a, **k: _R())
-    by_kind = {i.kind: i for i in daemons._scan_daemon_processes()}
+    by_kind = {i.kind: i for i in _real_scan()}
     assert set(by_kind) == {"dashboard", "backtrace", "background"}  # the no-serve-flag lines are ignored
     assert by_kind["dashboard"].pid == 501 and by_kind["dashboard"].repo == "/home/me/proj"
     assert by_kind["backtrace"].repo == "/home/me/other"
@@ -115,8 +116,9 @@ def test_list_running_finds_unregistered_daemon_via_ps(monkeypatch, tmp_path):
     class _R:
         stdout = "  501 /usr/bin/python3 -m agitrack --repo /r/one --dashboard-serve --dashboard-owner-pid 1\n"
 
-    # This test exercises the REAL scan (parsing a mocked `_process_command_lines`), so it must not
-    # stub _scan_daemon_processes.
+    # This test exercises the REAL scan (parsing a mocked `_process_command_lines`), so restore it
+    # over the conftest guard that stubs it out for every other test.
+    monkeypatch.setattr(daemons, "_scan_daemon_processes", _real_scan)
     monkeypatch.setattr(daemons, "_process_command_lines", lambda: _R().stdout.splitlines())
     infos = daemons.list_running()
     assert any(i.pid == 501 and i.kind == "dashboard" and i.repo == "/r/one" for i in infos)
@@ -137,3 +139,14 @@ def test_daemons_cli_empty(monkeypatch, tmp_path, capsys):
 
     assert main(["--daemons"]) == 0
     assert "No aGiTrack daemons are currently running." in capsys.readouterr().out
+
+
+def test_registry_dir_honors_config_dir_isolation(monkeypatch, tmp_path):
+    # The registry must follow AGITRACK_CONFIG_DIR like all other global state: the test
+    # suite isolates that env var, and a registry that ignored it let update-restart
+    # tests run restart_all() against the DEVELOPER'S real registry — killing their
+    # live daemons on every full test run.
+    from agitrack import daemons
+
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path))
+    assert daemons._registry_dir() == tmp_path / "daemons"

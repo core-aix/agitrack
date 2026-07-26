@@ -10,8 +10,8 @@ Layout of the exported directory::
     index.html            the dashboard, full payload embedded + the demo fetch shim
     learn/index.html      the learn page + its shim
     demo/                 the pre-rendered responses the shims serve:
-      data-<granularity>.json     /data for hour/day/week/month (default filter)
-      log-<sort>-<offset>.json    every /log page for every sort order
+      data-<granularity>.json     /data for hour/day/week/month (last-30-days scope)
+      log-<sort>-<offset>.json    every /log page for every sort order (same scope)
       diff/<sha>.json             every commit's /diff
       files.json                  /files
       filelog/<n>.json            /filelog per file (n = index in files.json order)
@@ -19,10 +19,14 @@ Layout of the exported directory::
       state.json                  /learn/state (profile, committers, engine info)
 
 A ``fetch`` shim injected into both pages maps the endpoints the live page calls to those
-files. What can't be static degrades explicitly: the filter dropdowns are disabled with an
-explanatory tooltip, and the learn page's agent-driven actions (new lessons, chat, exercise
-review) return a notice pointing at a real install. A frozen top banner on both pages says
-what this is and how to run the real thing.
+files. The demo ships the LAST 30 DAYS of history (anchored to the newest commit, so a
+rebuild from a quiet repo never exports an empty page) rather than all time: recent
+activity is what sells the dashboard, and it keeps the baked diff set small. What can't be
+static degrades explicitly: the filter dropdowns are disabled with an explanatory tooltip
+(the range dropdown showing the "last 30 days" it actually serves), and the learn page's
+agent-driven actions (new lessons, chat, exercise review) return a notice pointing at a
+real install. A frozen top banner on both pages says what this is and how to run the real
+thing.
 
 The learn profile comes from the repo's learning store (``.agitrack/learning.json``): the
 exporting user's profile, or the store's single profile when the exporting identity has
@@ -55,6 +59,9 @@ from agitrack.metrics.web import (
 INSTALL_HINT = "pip install agitrack, then run: agitrack -d"
 _REPO_URL = "https://github.com/core-aix/agitrack"
 
+# How much history the demo ships: the dashboard's "last 30 days" range, not all time.
+_DEMO_WINDOW_DAYS = 30
+
 # What the shims answer for anything the snapshot cannot serve (an unbaked diff, a learn
 # action that needs the live coach). Rendered in place by the page's normal error paths.
 _DEMO_NOTE = (
@@ -70,7 +77,8 @@ def _banner_html(generated: str, css_class: str, site_root: str) -> str:
     the banner links to."""
     text = (
         "STATIC DEMO: the real aGiTrack dashboard, generated from the aGiTrack repository's "
-        f"own git history ({generated}). Filters and the live coach are off in this snapshot. "
+        f"own git history ({generated}), showing the last 30 days. "
+        "Filters and the live coach are off in this snapshot. "
     )
     return (
         f'<div class="{css_class}">🧪 '
@@ -191,6 +199,12 @@ def _shim(*, base: str, files_index: dict[str, int], learn: bool, site_root: str
       var el = document.getElementById(id);
       if (el) {{ el.disabled = true; el.title = "Filters are off in this static demo. " + NOTE; }}
     }});
+    // The baked data is scoped to the last 30 days — make the (disabled) range
+    // dropdown say so instead of claiming "all time".
+    if (!LEARN) {{
+      var period = document.getElementById("f-period");
+      if (period) period.value = "{_DEMO_WINDOW_DAYS}";
+    }}
     // The learn page's "back to dashboard" link is written for the live server, where
     // the page lives at /learn and "./" is the dashboard. In the demo the page is a
     // directory (/dashboard/learn/), so point the link one level up explicitly.
@@ -259,27 +273,35 @@ def export_static_demo(repo: GitRepo, out_dir: Path) -> Path:
     insights = build_insights(dash.stats, files, sha_paths)
     shared = shared_sessions_for(repo)
     generated = "updated " + (aggregates_payload(dash)["generated_at"])
+    # The demo's scope: the last 30 days, anchored to the newest commit rather than the
+    # export clock so a rebuild from a briefly quiet repo never bakes an empty demo.
+    newest = max((stat.timestamp for stat in dash.stats if stat.timestamp), default=0)
+    frm = max(0, newest - _DEMO_WINDOW_DAYS * 86400)
+    demo_stats = [stat for stat in dash.stats if stat.timestamp and stat.timestamp >= frm]
 
     if out_dir.exists():
         shutil.rmtree(out_dir)
     demo = out_dir / "demo"
     demo.mkdir(parents=True)
 
-    # /data for each chart granularity (default filter — the only filter the demo serves).
+    # /data for each chart granularity (last-30-days scope — the only filter the demo serves).
     for granularity in GRANULARITIES:
-        payload = aggregates_payload(dash, granularity=granularity)
+        payload = aggregates_payload(dash, frm=frm, granularity=granularity)
         payload["shared_sessions"] = shared
         payload["insights"] = insights
         _write_json(demo / f"data-{granularity}.json", payload)
 
     # Every /log page for every sort order, so paging and re-sorting work in the demo.
-    total = len(dash.stats)
+    total = len(demo_stats)
     for sort in LOG_SORTS:
         for offset in range(0, max(total, 1), PAGE_SIZE):
-            _write_json(demo / f"log-{sort}-{offset}.json", log_page(dash, repo=repo, offset=offset, sort=sort))
+            _write_json(
+                demo / f"log-{sort}-{offset}.json", log_page(dash, repo=repo, frm=frm, offset=offset, sort=sort)
+            )
 
-    # Every commit's diff, and the whole file browser with each change's file diff.
-    for stat in dash.stats:
+    # Every in-scope commit's diff (only they appear in the log), and the whole file
+    # browser with each change's file diff (file history deliberately stays full-depth).
+    for stat in demo_stats:
         _write_json(demo / "diff" / f"{stat.sha}.json", commit_diff(repo, stat.sha))
     files_payload = browser.files_payload()
     _write_json(demo / "files.json", {"files": files_payload})
@@ -299,6 +321,7 @@ def export_static_demo(repo: GitRepo, out_dir: Path) -> Path:
         shared_sessions=shared,
         banner_html=_banner_html(generated, "backtracebanner", "../"),
         insights=insights,
+        frm=frm,
     )
     (out_dir / "index.html").write_text(
         _inject_shim(page, _shim(base="demo/", files_index=files_index, learn=False, site_root="../")),

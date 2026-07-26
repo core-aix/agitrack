@@ -10,7 +10,6 @@ commit (#58), and an agent-merge.
 from pathlib import Path
 
 import json
-import os
 import re
 import sys
 import threading
@@ -119,6 +118,7 @@ def test_backtrace_log_explains_what_the_entries_are(tmp_path):
     html = shell_html(_seeded(tmp_path))
     assert 'id="logintro" hidden' in html
     assert "reconstructed agent turn" in html
+    assert "subject line of each entry is the user prompt</b> that started that turn" in html
     assert "--backtrace commit</code> bakes the rest" in html
     unhide = html.index('$("logintro"); if(li) li.hidden = false')
     assert html.index("if(!BACKTRACE) return;") < unhide  # backtrace-only, hidden on the live page
@@ -137,6 +137,40 @@ def test_boot_loader_is_not_hidden_by_the_body_state_class(tmp_path):
     assert "#booting{display:none" in html
     assert "body.booting #booting{display:flex}" in html
     assert "reading commit history" in html
+
+
+def test_log_pager_has_numbered_pages_first_last_and_a_goto_box(tmp_path):
+    # One-click-per-page newer/older made deep jumps tedious. The pager renders numbered
+    # page buttons (windowed with … gaps on big logs), first/last jump buttons, and a
+    # go-to-page box. Jumps compute offset as (page-1)*limit — always an exact PAGE_SIZE
+    # multiple, which the static demo's pre-baked log-<sort>-<offset>.json files rely on.
+    from agitrack.metrics.web import shell_html
+
+    html = shell_html(_seeded(tmp_path))
+    for control in ('id="log-first"', 'id="log-prev"', 'id="log-next"', 'id="log-last"', 'id="log-goto"'):
+        assert control in html
+    assert "pnum" in html and 'class="pgap"' in html
+    assert "(p-1)*limit" in html  # offsets stay PAGE_SIZE multiples for the demo
+    assert ".pager button.current[disabled]" in html  # current page stays lit, not greyed
+    # A page fetch can take seconds — a floating spinner (same look as the filter badge)
+    # appears under the page selector while the new page loads.
+    assert 'id="pgloading"' in html
+    assert html.index('id="pgloading"') > html.index('id="log-last"')  # anchored in the selector
+    assert ".pgload{right:auto;left:0" in html  # floats below-left, not at the filter bar spot
+
+
+def test_backtrace_lines_card_admits_undercount_and_drops_nontracked(tmp_path):
+    # Backtrace line counts are reconstructed from the transcript's edit tool calls only, so
+    # they can miss changes made other ways (shell commands, formatters). The tracked-lines
+    # card says so in backtrace mode, and the non-tracked card/bar — always zero there, since
+    # every reconstructed turn is agent work — is dropped instead of shown as a dead zero.
+    from agitrack.metrics.web import shell_html
+
+    html = shell_html(_seeded(tmp_path))
+    assert "may miss some edits" in html
+    assert "ways a transcript does not record as edits" in html
+    assert 'BACKTRACE ? "" : card("non-tracked lines"' in html
+    assert '(BACKTRACE ? "" : lineRow("Non-tracked"' in html
 
 
 def test_first_paint_never_fetches_the_shared_ref(tmp_path, monkeypatch):
@@ -161,9 +195,12 @@ def test_dashboard_is_usable_at_phone_width(tmp_path):
     from agitrack.metrics.web import shell_html
 
     html = shell_html(_seeded(tmp_path))
-    assert "flex-wrap:wrap" in html.split(".controls{", 1)[1].split("}", 1)[0]
-    assert "@media (max-width:760px)" in html
-    assert ".controls{position:static" in html
+    phone = html.split("@media (max-width:760px)", 1)[1]
+    assert ".controls{position:relative;flex-wrap:wrap" in phone
+    # The inline top offset stackStickyBanner() sets for the sticky desktop bar must be
+    # neutralized here: on the relative phone bar it shoved the bar down, leaving a
+    # banner-sized blank gap at the top of narrow backtrace pages.
+    assert "top:auto !important" in phone.split("}", 2)[0] + phone.split("}", 2)[1]
     assert ".backtracebanner code{color:var(--fg)" in html
 
 
@@ -1084,12 +1121,17 @@ def test_web_dashboard_embeds_token_hierarchy_and_cache_note(tmp_path):
     assert "#tokens .row + .hint{border-top:1px solid var(--line)" in html
 
 
-def test_filter_bar_wraps_with_a_custom_range_popup(tmp_path):
+def test_filter_bar_keeps_one_row_by_shrinking_fields(tmp_path):
     html = render_html(_demo_repo(tmp_path))
-    # One row on a wide window, but the bar WRAPS on narrower ones instead of forcing a
-    # horizontal page scroll (the old never-wrap row made phones scroll the whole page
-    # sideways; see test_dashboard_is_usable_at_phone_width).
-    assert "flex-wrap:nowrap" not in html
+    # The bar stays a single row on any desktop window: the FIELDS are shrinkable
+    # (min-width:0, no fixed select width), so a narrower window compresses the selects
+    # instead of dropping the reset button to a second line or forcing a horizontal
+    # page scroll. Only the phone layout wraps (test_dashboard_is_usable_at_phone_width).
+    assert "flex:0 1 165px;min-width:0" in html
+    assert "min-width:150px" not in html
+    # The loading badge floats below the bar (absolute against it): showing and hiding
+    # it must never move the reset button.
+    assert ".loading{position:absolute;top:calc(100% + 8px)" in html
     # The redundant "scope" readout (it just echoed the committer filter) is gone.
     assert 'id="scope"' not in html
     # from/to are no longer standalone fields — they live in a custom-range popup
@@ -1650,9 +1692,9 @@ def test_cli_dashboard_html_is_default_and_starts_daemon(tmp_path, monkeypatch):
 
     assert rc == 0
     assert started["repo"].repo == GitRepo.discover(tmp_path).repo
-    # The daemon is owned by the launching shell (this process's parent) so it dies
-    # when that terminal closes.
-    assert started["owner_pid"] == os.getppid()
+    # Free-standing: no owner pid, so the daemon survives the launching terminal and
+    # runs until `agitrack -d stop` (or an update self-restart).
+    assert started["owner_pid"] is None
 
 
 def test_cli_dashboard_shorthand_d_starts_daemon_like_dashboard(tmp_path, monkeypatch):
@@ -1761,3 +1803,62 @@ def test_dashboard_masks_paths_in_historical_commit_messages(tmp_path):
     assert stat.kind == "agent"
     assert stat.backend == "claude" and stat.model == "m1"
     assert stat.tokens.get("input") == 10
+
+
+def test_parse_tokens_heals_legacy_raw_input_blocks():
+    # Pre-issue-#14 commits recorded input as the RAW uncached count (input < cache_write,
+    # impossible under the convention); the collector restores input = uncached +
+    # cache_write at read time. Modern blocks (input >= cache_write) are untouched.
+    from agitrack.metrics.collect import _parse_tokens
+
+    legacy = _parse_tokens({"tokens_since_last_commit_input": "5", "tokens_since_last_commit_cache_write": "100"})
+    assert legacy["input"] == 105 and legacy["cache_write"] == 100
+    modern = _parse_tokens({"tokens_since_last_commit_input": "105", "tokens_since_last_commit_cache_write": "100"})
+    assert modern["input"] == 105
+
+
+def test_token_anomaly_commits_are_excluded_from_totals():
+    # A lost watermark (pre-fix aGiTrack) re-exported an entire conversation into single
+    # commits (3M+ tokens spanning weeks). Those are permanent history — and older
+    # installs can still write new ones — so the collector excludes their tokens at read
+    # time: a commit whose conversation STARTED >24h before its session's committed
+    # frontier is flagged, its tokens dropped, lines kept. Honest overlap (a force-
+    # captured turn finishing hours later) is untouched, and an anomalous span must not
+    # drag the frontier forward and swallow later honest commits.
+    from agitrack.metrics.collect import CommitStat, _flag_token_anomalies
+
+    def stat(sha, started, ended, out, session="s1"):
+        return CommitStat(
+            sha=sha,
+            author="a",
+            email="e",
+            subject="s",
+            kind="agent",
+            started_at=started,
+            ended_at=ended,
+            tokens={"output": out},
+            metadata_block=f"backend_session_id: {session}",
+        )
+
+    honest1 = stat("c1", "2026-07-24T10:00:00Z", "2026-07-24T12:00:00Z", 100)
+    giant = stat("c2", "2026-07-05T08:00:00Z", "2026-07-24T13:00:00Z", 3_000_000)  # weeks back
+    reexport = stat("c3", "2026-07-24T11:30:00Z", "2026-07-24T14:00:00Z", 50)  # legit force-capture continuation
+    other = stat("c4", "2026-07-01T00:00:00Z", "2026-07-01T01:00:00Z", 10, session="s2")
+    honest2 = stat("c5", "2026-07-24T15:00:00Z", "2026-07-24T16:00:00Z", 70)
+
+    stats = [honest1, giant, reexport, other, honest2]
+    _flag_token_anomalies(stats)
+
+    assert giant.token_anomaly and giant.tokens == {}
+    assert not honest1.token_anomaly and honest1.tokens == {"output": 100}
+    assert not reexport.token_anomaly and reexport.tokens == {"output": 50}
+    assert not other.token_anomaly  # a different session has its own frontier
+    assert not honest2.token_anomaly  # the giant's weeks-wide end never became the frontier
+
+
+def test_token_anomaly_badge_reaches_the_log(tmp_path):
+    from agitrack.metrics.web import shell_html
+
+    html = shell_html(_seeded(tmp_path))
+    assert '"token_anomaly"' not in html  # payload key travels via /log JSON, not the shell
+    assert "badge anomaly" in html and "tokens excluded" in html

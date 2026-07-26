@@ -368,19 +368,33 @@ class AgitrackState:
         value = (self.data.get("backend_message_ids") or {}).get(str(session_id))
         return str(value) if value else None
 
-    def set_backend_message_id(self, session_id: str | None, message_id: str | None) -> None:
+    def set_backend_message_id(
+        self, session_id: str | None, message_id: str | None, *, marked_at: float | None = None
+    ) -> None:
         """Advance the committed watermark for *session_id*: the primary single value (so all
         existing readers/resetters keep working) and the per-conversation map entry, together
-        in one save."""
+        in one save. ``marked_at`` (the watermark turn's end time) backs turns_after's
+        safe fallback when a compaction later reshapes turn boundaries and the id stops
+        matching — without it, a lost mark once re-exported a whole 20-day session."""
         self.data["last_backend_message_id"] = message_id
         ids = dict(self.data.get("backend_message_ids") or {})
+        marks = dict(self.data.get("backend_message_marked_at") or {})
         if session_id:
             if message_id:
                 ids[str(session_id)] = message_id
+                if marked_at:
+                    marks[str(session_id)] = marked_at
             else:
                 ids.pop(str(session_id), None)
+                marks.pop(str(session_id), None)
         self.data["backend_message_ids"] = ids
+        self.data["backend_message_marked_at"] = marks
         self.save()
+
+    def backend_message_marked_at_for(self, session_id: str | None) -> float | None:
+        marks = self.data.get("backend_message_marked_at") or {}
+        value = marks.get(str(session_id)) if session_id else None
+        return float(value) if isinstance(value, (int, float)) else None
 
     def declined_untracked(self) -> list[str]:
         return list(self.data.get("declined_untracked_files") or [])
@@ -630,6 +644,25 @@ class AgitrackState:
         self.data["pending_trace"] = []
         self.data["pending_token_usage"] = self._default()["pending_token_usage"]
         self.save()
+
+    # --- partial-turn token accounting (see CommitEngine._add_turn_usage) -----------
+    # A turn force-captured while still running is re-exported INCLUSIVELY once it
+    # finishes (the watermark sat on its user id). This records what its first commit
+    # already counted, so the re-commit adds only the delta instead of the whole,
+    # now-larger turn again — the mechanism behind the 13-26x token inflation seen on
+    # days with restarts mid-turn (2026-07-25).
+
+    def partial_turn_usage(self) -> dict | None:
+        record = self.data.get("partial_turn_tokens")
+        return record if isinstance(record, dict) else None
+
+    def set_partial_turn_usage(self, session_id: str | None, user_id: str, usage: dict) -> None:
+        self.data["partial_turn_tokens"] = {"session_id": session_id, "user_id": user_id, "usage": usage}
+        self.save()
+
+    def clear_partial_turn_usage(self) -> None:
+        if self.data.pop("partial_turn_tokens", None) is not None:
+            self.save()
 
     def pending_token_usage(self) -> dict[str, int | None]:
         usage = dict(self._default()["pending_token_usage"])
