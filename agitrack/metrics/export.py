@@ -76,8 +76,8 @@ def _banner_html(generated: str, css_class: str, site_root: str) -> str:
     ``site_root`` is the relative path back to the main webpage, whose install section
     the banner links to."""
     text = (
-        "STATIC DEMO: a static copy of the real aGiTrack dashboard, "
-        f"own git history ({generated}), showing the last 30 days. "
+        "STATIC DEMO: a static snapshot of the real aGiTrack dashboard, "
+        f"showing aGiTrack's own git history in the 30 days before {generated}. "
         "Some features are off in this snapshot. "
     )
     return (
@@ -272,7 +272,7 @@ def export_static_demo(repo: GitRepo, out_dir: Path) -> Path:
     files, sha_paths = context_from_browser(browser, dash.stats)
     insights = build_insights(dash.stats, files, sha_paths)
     shared = shared_sessions_for(repo)
-    generated = "updated " + (aggregates_payload(dash)["generated_at"])
+    generated = aggregates_payload(dash)["generated_at"]
     # The demo's scope: the last 30 days, anchored to the newest commit rather than the
     # export clock so a rebuild from a briefly quiet repo never bakes an empty demo.
     newest = max((stat.timestamp for stat in dash.stats if stat.timestamp), default=0)
