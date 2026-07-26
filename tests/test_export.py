@@ -137,6 +137,11 @@ def test_export_disables_filters_and_cans_learn_actions(tmp_path, monkeypatch):
     # out install commands.
     assert 'href="../#install"' in index
     assert 'href="../../#install"' in learn
+    # …and the link renders in the SAME amber on both pages (the pages' global anchor
+    # colors differ — green vs cyan — so each banner styles its links explicitly;
+    # --warn and --amber are the same #ffb454).
+    assert ".backtracebanner a{color:var(--amber)" in index
+    assert ".btbanner a{color:var(--warn)" in learn
 
 
 def test_export_learn_state_falls_back_to_the_single_store_profile(tmp_path, monkeypatch):
