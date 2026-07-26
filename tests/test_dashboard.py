@@ -152,6 +152,11 @@ def test_log_pager_has_numbered_pages_first_last_and_a_goto_box(tmp_path):
     assert "pnum" in html and 'class="pgap"' in html
     assert "(p-1)*limit" in html  # offsets stay PAGE_SIZE multiples for the demo
     assert ".pager button.current[disabled]" in html  # current page stays lit, not greyed
+    # A page fetch can take seconds — a floating spinner (same look as the filter badge)
+    # appears under the page selector while the new page loads.
+    assert 'id="pgloading"' in html
+    assert html.index('id="pgloading"') > html.index('id="log-last"')  # anchored in the selector
+    assert ".pgload{right:auto;left:0" in html  # floats below-left, not at the filter bar spot
 
 
 def test_first_paint_never_fetches_the_shared_ref(tmp_path, monkeypatch):

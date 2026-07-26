@@ -99,9 +99,10 @@ def format_html(
     banner_html: str = "",
     backtrace: bool = False,
     insights: list[dict] | None = None,
+    frm: int = 0,
 ) -> str:
     payload = _embed_json(
-        initial_payload(dash, shared_sessions=shared_sessions, backtrace=backtrace, insights=insights)
+        initial_payload(dash, shared_sessions=shared_sessions, backtrace=backtrace, insights=insights, frm=frm)
     )
     repo_name = dash.repo.rstrip("/").rsplit("/", 1)[-1] or dash.repo
     # The branch is rendered client-side into the meta-line picker (from the
@@ -590,6 +591,7 @@ def initial_payload(
     shared_sessions: list[dict] | None = None,
     backtrace: bool = False,
     insights: list[dict] | None = None,
+    frm: int = 0,
 ) -> dict:
     """What the page embeds for an instant first paint: unfiltered aggregates,
     the first log page, repo metadata, the page size, and any shared sessions.
@@ -597,15 +599,17 @@ def initial_payload(
     ``backtrace`` marks the payload as a historical reconstruction (``--backtrace``)
     rather than live repo status, for any client-side affordance that keys off it.
     ``insights`` (whole-history efficiency insights, never filter-scoped) render as
-    the "agent efficiency" section when non-empty."""
+    the "agent efficiency" section when non-empty. ``frm`` scopes the embedded
+    aggregates and first log page to commits at/after that timestamp — the static
+    demo export uses it to ship a last-30-days view instead of all time."""
     return {
         "repo": dash.repo,
         "branch": dash.branch,
         "page_size": PAGE_SIZE,
         "backtrace": backtrace,
         "insights": insights or [],
-        **aggregates_payload(dash),
-        "log": log_page(dash),
+        **aggregates_payload(dash, frm=frm),
+        "log": log_page(dash, frm=frm),
         "shared_sessions": shared_sessions or [],
     }
 
@@ -1060,7 +1064,10 @@ h2.section::before{content:"# ";color:var(--amber)}
 .more{padding:12px 0;color:var(--fg-dim);font-size:12.5px}
 .pager{display:flex;align-items:center;flex-wrap:wrap;gap:10px 16px;padding:14px 0 2px;color:var(--fg-dim);font-size:12.5px}
 .pager .pcount{min-width:160px}
-.pager .pnav{display:flex;align-items:center;gap:4px;flex-wrap:wrap}
+.pager .pnav{position:relative;display:flex;align-items:center;gap:4px;flex-wrap:wrap}
+/* Floating "loading…" badge for a log page switch: same look as the filter badge, but
+   anchored just below the page selector — feedback appears where the user clicked. */
+.pgload{right:auto;left:0;top:calc(100% + 6px)}
 .pager button{cursor:pointer;background:transparent;border:1px solid var(--phosphor-dim);color:var(--phosphor);
   font-family:var(--mono);font-size:12.5px;padding:5px 9px;min-width:31px}
 .pager button:hover:not([disabled]){background:var(--phosphor);color:var(--ink)}
@@ -1836,11 +1843,18 @@ function renderLog(){
     `<span class="pnav"><button id="log-first" title="first page" ${prevDis}>«</button>`+
     `<button id="log-prev" title="previous page" ${prevDis}>‹</button>${numBtns}`+
     `<button id="log-next" title="next page" ${nextDis}>›</button>`+
-    `<button id="log-last" title="last page" ${nextDis}>»</button></span>${gotoBox}</div>`;
+    `<button id="log-last" title="last page" ${nextDis}>»</button>`+
+    `<span class="loading pgload" id="pgloading" hidden aria-live="polite"><span class="spin"></span>loading…</span></span>${gotoBox}</div>`;
   $("commitlog").innerHTML = (rows || `<div class="empty">no commits</div>`) + pager;
   const goPage = async p => {
     p = Math.min(pages, Math.max(1, p));
-    if(p!==cur && await loadLog((p-1)*limit)) renderLog();
+    if(p===cur) return;
+    // Fetching a page can take seconds on a big repo — float a spinner under the page
+    // selector. renderLog replaces the whole log (badge included) on success; only a
+    // failed fetch leaves this pager standing, so re-hide it then.
+    const busy = $("pgloading"); if(busy) busy.hidden = false;
+    if(await loadLog((p-1)*limit)) renderLog();
+    else if(busy) busy.hidden = true;
   };
   for(const [id, p] of [["log-first",1],["log-prev",cur-1],["log-next",cur+1],["log-last",pages]]){
     const b = $(id); if(b && !b.disabled) b.onclick = () => goPage(p);

@@ -12,7 +12,7 @@ from agitrack import cli
 from agitrack.metrics.export import export_static_demo
 from agitrack.metrics.web import GRANULARITIES, LOG_SORTS, PAGE_SIZE
 
-from tests.test_dashboard import _demo_repo
+from tests.test_dashboard import _demo_repo, _write_lines
 
 
 def _no_network_identity(monkeypatch):
@@ -42,7 +42,7 @@ def test_export_writes_a_complete_static_site(tmp_path, monkeypatch):
         data = json.loads((out / "demo" / f"data-{granularity}.json").read_text(encoding="utf-8"))
         assert "agg" in data and "insights" in data and "timeseries" in data
 
-    # Every log page for every sort order, covering the full history.
+    # Every log page for every sort order, covering the demo's last-30-days window.
     first = json.loads((out / "demo" / "log-date-0.json").read_text(encoding="utf-8"))
     total = first["total"]
     assert total > 0
@@ -64,6 +64,33 @@ def test_export_writes_a_complete_static_site(tmp_path, monkeypatch):
             sha = str(change.get("sha") or "")
             if sha:
                 assert (out / "demo" / "filediff" / f"{i}-{sha[:12]}.json").exists()
+
+
+def test_export_scopes_the_demo_to_the_last_30_days(tmp_path, monkeypatch):
+    """The demo ships a last-30-days view (anchored to the newest commit), not all time:
+    an ancient commit stays out of the log pages, the embedded first paint, and the baked
+    diffs — and the page says so (banner text + the disabled range dropdown's value)."""
+    _no_network_identity(monkeypatch)
+    repo = _demo_repo(tmp_path / "repo")
+    _write_lines(repo, "ancient.txt", 3)
+    old = "2001-02-03T04:05:06"
+    repo._run(["git", "add", "-A"])
+    repo._run(
+        ["git", "commit", "-m", "ancient work"],
+        env={"GIT_AUTHOR_DATE": old, "GIT_COMMITTER_DATE": old},
+    )
+    ancient_sha = repo.rev_parse("HEAD")
+    out = tmp_path / "site"
+    export_static_demo(repo, out)
+
+    first = json.loads((out / "demo" / "log-date-0.json").read_text(encoding="utf-8"))
+    assert first["total"] == len(first["entries"])  # one in-window page, ancient not counted
+    assert "ancient work" not in [entry["subject"] for entry in first["entries"]]
+    assert not (out / "demo" / "diff" / f"{ancient_sha}.json").exists()  # only in-scope diffs baked
+
+    index = (out / "index.html").read_text(encoding="utf-8")
+    assert "showing the last 30 days" in index
+    assert 'period.value = "30"' in index  # the disabled range dropdown shows the real scope
 
 
 def test_export_shim_installs_before_the_page_script(tmp_path, monkeypatch):
