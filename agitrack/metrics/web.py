@@ -513,6 +513,7 @@ def _log_entry(dash: Dashboard, stat: CommitStat, covers: dict[str, CommitStat])
         "subject": stat.subject,
         "kind": stat.kind,
         "pending": stat.pending,
+        "token_anomaly": stat.token_anomaly,  # tokens excluded: re-exported history (lost watermark)
         "tracked": stat.tracked,  # backtrace: already committed with aGiTrack metadata
         "eff_backend": eff_backend,
         "eff_model": eff_model,
@@ -993,6 +994,7 @@ h2.section::before{content:"# ";color:var(--amber)}
 .entry .badge.nontracked{color:var(--amber);border-color:var(--amber-dim)}
 .entry .badge.pending{color:var(--amber);border-color:var(--amber-dim);border-style:dashed}
 .entry .badge.tracked{color:var(--phosphor);border-color:var(--phosphor-dim);background:rgba(61,255,160,.08)}
+.entry .badge.anomaly{color:var(--red);border-color:var(--red)}
 .entry.pending{opacity:.82}
 .entry .lc{font-size:12px;color:var(--fg-dim)}
 .entry .lc .add{color:var(--phosphor)} .entry .lc .rem{color:var(--red)}
@@ -1791,13 +1793,14 @@ function renderLog(){
     // Backtrace: mark turns already committed to git with aGiTrack metadata, so the user sees what
     // is already tracked vs. what `--backtrace commit` would still add.
     const trk = (BACKTRACE && c.tracked)?`<span class="badge tracked" title="already committed to git with aGiTrack metadata">committed</span>`:"";
+    const anom = c.token_anomaly?`<span class="badge anomaly" title="This commit re-exported conversation history that earlier commits already accounted for (a lost watermark on an older aGiTrack), so its token counts are excluded from every total.">tokens excluded</span>`:"";
     const squash = (c.parts&&c.parts.length)?`<span class="squash">⧉ ${c.parts.length} squashed</span>`:"";
     const lc = (c.ins||c.del)?`<span class="lc"><span class="add">+${fmt(c.ins)}</span> <span class="rem">−${fmt(c.del)}</span></span>`:"";
     const m = c.eff_model?`<span class="lc">${esc(c.eff_model)}</span>`:"";
     const subj = c.subject||"", shown = truncSubject(subj);
     const subjTitle = shown!==subj ? ` title="${esc(subj)}"` : "";  // full subject on hover when cut
     const shaTag = BACKTRACE ? "" : `<span class="sha">${esc(c.short)}</span>`;
-    return `<div class="entry ${cls}${c.pending?' pending':''}" data-i="${i}">${shaTag}${badge}${pend}${trk}${squash}`+
+    return `<div class="entry ${cls}${c.pending?' pending':''}" data-i="${i}">${shaTag}${badge}${pend}${trk}${anom}${squash}`+
       `<span class="ksub"${subjTitle}>${esc(shown)}</span>${lc}${tokenBrief(c.tokens)}${m}`+
       `<div class="detail" id="detail-${i}" hidden></div></div>`;
   }).join("");

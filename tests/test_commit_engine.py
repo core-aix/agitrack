@@ -1646,3 +1646,21 @@ def test_watermark_advance_records_the_mark_timestamp(tmp_path):
     )
     assert result is True
     assert state.backend_message_marked_at_for("ses-mark") == 1010
+
+
+def test_turns_ended_before_the_frontier_are_never_recounted(tmp_path):
+    # Belt to the turns_after fix: even if some path re-exports history, a turn that
+    # ENDED at or before the watermark's recorded time adds NOTHING — only the
+    # partial-delta continuation (which ends after the frontier) may reach back.
+    state = AgitrackState(tmp_path)
+    state.data["backend_session_id"] = "s1"
+    state.set_backend_message_id("s1", "a5", marked_at=5000)
+    engine = CommitEngine(_Repo(staged=True), state)
+
+    ancient = SessionTurn("u1", "a1", "old", "done", TokenUsage(output=1_000_000), None, started_at=100, ended_at=200)
+    engine._add_turn_usage(ancient)
+    assert state.pending_token_usage()["output"] == 0  # skipped entirely
+
+    fresh = SessionTurn("u9", "a9", "new", "done", TokenUsage(output=30), None, started_at=5100, ended_at=5200)
+    engine._add_turn_usage(fresh)
+    assert state.pending_token_usage()["output"] == 30

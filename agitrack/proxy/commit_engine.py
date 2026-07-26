@@ -927,11 +927,22 @@ class CommitEngine:
 
         usage = turn.tokens
         recorded = self.state.partial_turn_usage()
-        if (
+        is_partial_continuation = (
             recorded
             and recorded.get("user_id") == turn.user_message_id
             and recorded.get("session_id") == self.state.backend_session_id
-        ):
+        )
+        # Second, independent guard against re-counting: a turn that ENDED at or before
+        # the committed frontier (the watermark's recorded time) was already accounted
+        # for — whatever export path resurfaced it. The one legitimate back-reach, a
+        # force-captured turn finishing later, ends AFTER the frontier and is handled
+        # by the partial-delta below.
+        if not is_partial_continuation:
+            marked_at = self.state.backend_message_marked_at_for(self.state.backend_session_id)
+            turn_end = turn.ended_at or turn.started_at
+            if marked_at and turn_end and turn_end <= marked_at:
+                return
+        if recorded is not None and is_partial_continuation:
             prior = recorded.get("usage") or {}
             delta = TokenUsage(
                 **{

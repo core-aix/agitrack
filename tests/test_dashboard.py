@@ -1781,3 +1781,50 @@ def test_parse_tokens_heals_legacy_raw_input_blocks():
     assert legacy["input"] == 105 and legacy["cache_write"] == 100
     modern = _parse_tokens({"tokens_since_last_commit_input": "105", "tokens_since_last_commit_cache_write": "100"})
     assert modern["input"] == 105
+
+
+def test_token_anomaly_commits_are_excluded_from_totals():
+    # A lost watermark (pre-fix aGiTrack) re-exported an entire conversation into single
+    # commits (3M+ tokens spanning weeks). Those are permanent history — and older
+    # installs can still write new ones — so the collector excludes their tokens at read
+    # time: a commit whose conversation STARTED >24h before its session's committed
+    # frontier is flagged, its tokens dropped, lines kept. Honest overlap (a force-
+    # captured turn finishing hours later) is untouched, and an anomalous span must not
+    # drag the frontier forward and swallow later honest commits.
+    from agitrack.metrics.collect import CommitStat, _flag_token_anomalies
+
+    def stat(sha, started, ended, out, session="s1"):
+        return CommitStat(
+            sha=sha,
+            author="a",
+            email="e",
+            subject="s",
+            kind="agent",
+            started_at=started,
+            ended_at=ended,
+            tokens={"output": out},
+            metadata_block=f"backend_session_id: {session}",
+        )
+
+    honest1 = stat("c1", "2026-07-24T10:00:00Z", "2026-07-24T12:00:00Z", 100)
+    giant = stat("c2", "2026-07-05T08:00:00Z", "2026-07-24T13:00:00Z", 3_000_000)  # weeks back
+    reexport = stat("c3", "2026-07-24T11:30:00Z", "2026-07-24T14:00:00Z", 50)  # legit force-capture continuation
+    other = stat("c4", "2026-07-01T00:00:00Z", "2026-07-01T01:00:00Z", 10, session="s2")
+    honest2 = stat("c5", "2026-07-24T15:00:00Z", "2026-07-24T16:00:00Z", 70)
+
+    stats = [honest1, giant, reexport, other, honest2]
+    _flag_token_anomalies(stats)
+
+    assert giant.token_anomaly and giant.tokens == {}
+    assert not honest1.token_anomaly and honest1.tokens == {"output": 100}
+    assert not reexport.token_anomaly and reexport.tokens == {"output": 50}
+    assert not other.token_anomaly  # a different session has its own frontier
+    assert not honest2.token_anomaly  # the giant's weeks-wide end never became the frontier
+
+
+def test_token_anomaly_badge_reaches_the_log(tmp_path):
+    from agitrack.metrics.web import shell_html
+
+    html = shell_html(_seeded(tmp_path))
+    assert '"token_anomaly"' not in html  # payload key travels via /log JSON, not the shell
+    assert "badge anomaly" in html and "tokens excluded" in html
