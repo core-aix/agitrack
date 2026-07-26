@@ -32,7 +32,7 @@ from agitrack.git import GitRepo
 from agitrack.metrics.collect import CommitStat, Dashboard, _abbreviate_home, _display_repo
 from agitrack.transcripts import claude, opencode
 from agitrack.transcripts.edits import combine_patches, merge_edits_by_path, total_lines
-from agitrack.transcripts.types import ExportedSession, FileEdit, SessionRef, SessionTurn, turns_after
+from agitrack.transcripts.types import ExportedSession, FileEdit, SessionRef, SessionTurn
 
 # Cap on how many sessions a single backtrace reconstructs, newest first. Exporting a
 # session is real work (OpenCode shells out per session), so an unbounded scan of a machine
@@ -137,18 +137,18 @@ def _discover(directory: Path) -> list[_Source]:
     return sources
 
 
-def build_backtrace(
-    directory: Path, *, max_sessions: int = MAX_SESSIONS, progress=None, use_cache: bool = True
-) -> BacktraceView:
+def build_backtrace(directory: Path, *, max_sessions: int = MAX_SESSIONS, progress=None) -> BacktraceView:
     """Reconstruct the backtrace dashboard for ``directory`` from local transcripts.
 
     ``progress`` (optional) is called ``progress(done, total, phase)`` as work proceeds — during
     discovery (``total`` still 0) and before each session is exported — so a caller can show a
     progress bar. Exporting is the slow part (OpenCode shells out to its CLI per session).
 
-    ``use_cache`` (default on) persists each session's PROCESSED result and reuses it next time when
-    the transcript hasn't changed, so only new/changed sessions are re-exported — a repeat run on a
-    directory with many sessions is near-instant instead of rebuilding everything."""
+    Every build reprocesses every session from the transcripts. There is deliberately NO
+    persisted cache of processed results: one silently served stale output after a
+    processing fix (subjects kept an old mid-word truncation), and correctness beats the
+    seconds a warm rebuild saves. The build is a one-off per daemon start, behind the
+    progress bar."""
     directory = directory.resolve()
     if progress:
         progress(0, 0, "discovering")
@@ -157,7 +157,6 @@ def build_backtrace(
     sources = sources[:max_sessions]
     total = len(sources)
 
-    cached_sessions = _load_cache(directory)["sessions"] if use_cache else {}
     fresh_sessions: dict[str, dict] = {}
     stats: list[CommitStat] = []
     diffs: dict[str, str] = {}
@@ -176,14 +175,7 @@ def build_backtrace(
         if progress:
             progress(index, total, "exporting")
         key = f"{source.backend}:{source.ref_id}"
-        cached = cached_sessions.get(key)
-        # Reuse the cached processed result when the transcript hasn't changed since (its recorded
-        # last-updated time didn't advance); otherwise re-export and re-process this one session.
-        if isinstance(cached, dict) and float(cached.get("updated", -1)) >= source.updated:
-            entry = cached
-        else:
-            # Changed (or new): re-export, but reuse the cached prefix and process only new turns.
-            entry = _process_source(directory, source, cached=cached if isinstance(cached, dict) else None)
+        entry = _process_source(directory, source)
         fresh_sessions[key] = entry
         if not entry.get("stats"):
             continue
@@ -215,8 +207,6 @@ def build_backtrace(
             edited_sessions += 1
     if progress:
         progress(total, total, "done")
-    if use_cache:
-        _save_cache(directory, {"version": _CACHE_VERSION, "sessions": fresh_sessions})
 
     # Tag turns already committed to git with aGiTrack metadata, so the log shows what is tracked
     # vs. what `--backtrace commit` would still add. (No-op when the directory isn't a git repo.)
@@ -326,12 +316,25 @@ def _virtual_sha(backend: str, session_id: str, index: int, assistant_id: str) -
     return hashlib.sha1(raw).hexdigest()
 
 
+_SUBJECT_MAX = 100
+
+
 def _subject(turn: SessionTurn) -> str:
-    """A one-line label for the turn: the first non-empty line of its prompt, trimmed."""
+    """A one-line label for the turn: the first non-empty line of its prompt, trimmed.
+    A long line is cut at a WORD end and marked with an ellipsis — never mid-word
+    (mirroring the dashboard's client-side truncSubject; a hard cut remains only when
+    a single word fills more than half the cap)."""
     for line in turn.user_prompt.splitlines():
         line = line.strip()
-        if line:
-            return line[:100]
+        if not line:
+            continue
+        if len(line) <= _SUBJECT_MAX:
+            return line
+        cut = line[: _SUBJECT_MAX - 1]
+        space = cut.rfind(" ")
+        if space > _SUBJECT_MAX / 2:
+            cut = cut[:space]
+        return cut.rstrip() + "…"
     return "(agent turn)"
 
 
@@ -355,9 +358,20 @@ _TOKEN_KEYS = (
 def _tokens_dict(turn: SessionTurn) -> dict[str, int]:
     """The turn's token usage as the dashboard's ``tokens`` dict — the same per-bucket keys a
     real aGiTrack commit records (input/output/reasoning/cache_read/cache_write and their
-    subagent_* counterparts), dropping zeros and the derived ``total``/``context`` fields."""
+    subagent_* counterparts), dropping zeros and the derived ``total``/``context`` fields.
+
+    The issue-#14 input convention applies here exactly as in commit metadata
+    (commits/message.py): cache-creation tokens ARE fresh input, processed once and written
+    to the cache, so ``input`` counts uncached + cache_write. Raw API buckets made a
+    cached-heavy turn show an impossible handful of input tokens (fewer than the prompt's
+    words) and put cache_write above input, which the convention forbids."""
     data = turn.tokens.to_dict()
-    return {key: value for key in _TOKEN_KEYS if isinstance((value := data.get(key)), int) and value > 0}
+    tokens = {key: value for key in _TOKEN_KEYS if isinstance((value := data.get(key)), int) and value > 0}
+    if tokens.get("cache_write"):
+        tokens["input"] = tokens.get("input", 0) + tokens["cache_write"]
+    if tokens.get("subagent_cache_write"):
+        tokens["subagent_input"] = tokens.get("subagent_input", 0) + tokens["subagent_cache_write"]
+    return tokens
 
 
 def _message(source: _Source, session_id: str, turn: SessionTurn) -> str:
@@ -774,40 +788,6 @@ def _clear_progress(directory: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Incremental cache: the processed per-session result is saved so a later run only re-exports the
-# transcripts that actually changed (OpenCode exports are slow), instead of rebuilding everything.
-# ---------------------------------------------------------------------------
-
-# Bump whenever the per-session processing changes shape/logic so a stale cache is ignored.
-# v2: edits are merged per file per turn, paths outside the directory are dropped, worktree paths
-# collapse onto repo paths, and a Read seeds a file's baseline — a v1 cache holds the old counts.
-_CACHE_VERSION = 2
-
-
-def _cache_path(directory: Path) -> Path:
-    return _state_dir() / f"{_dir_key(directory)}.cache.json"
-
-
-def _load_cache(directory: Path) -> dict:
-    try:
-        data = json.loads(_cache_path(directory).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        data = None
-    if isinstance(data, dict) and data.get("version") == _CACHE_VERSION and isinstance(data.get("sessions"), dict):
-        return data
-    return {"version": _CACHE_VERSION, "sessions": {}}
-
-
-def _save_cache(directory: Path, cache: dict) -> None:
-
-    try:
-        from agitrack.fileio import atomic_write_text
-
-        atomic_write_text(_cache_path(directory), json.dumps(cache))
-    except OSError:
-        pass
-
-
 def _empty_entry(source: _Source) -> dict:
     return {
         "updated": source.updated,
@@ -822,14 +802,11 @@ def _empty_entry(source: _Source) -> dict:
     }
 
 
-def _process_source(directory: Path, source: _Source, cached: dict | None = None) -> dict:
-    """Export and process ONE session into a JSON-serializable cache entry (its stats, diffs, and
-    per-file edits). This is the slow step the cache lets a repeat run skip.
-
-    When ``cached`` (a prior entry for this SAME session that has since grown) is given and its
-    watermark is still present in the transcript, only the turns AFTER the watermark are processed
-    and the cached prefix is reused — so a large, actively-growing session isn't re-synthesized from
-    turn 1 each run (intra-session incremental)."""
+def _process_source(directory: Path, source: _Source) -> dict:
+    """Export and process ONE session into a JSON-serializable entry (its stats, diffs,
+    and per-file edits) — the slow step of a build. Always processes the WHOLE session:
+    the persisted cache (and its intra-session incremental resume) was removed after it
+    served stale processed output across a processing fix."""
     try:
         exported = source.export()
     except Exception:
@@ -839,33 +816,16 @@ def _process_source(directory: Path, source: _Source, cached: dict | None = None
     bases = _relativize_bases(directory, source.base_dir)
     all_turns = exported.turns
 
-    reuse: dict | None = None
-    turns = all_turns
-    start_index = 0
-    if isinstance(cached, dict) and cached.get("last_message_id") and cached.get("stats") is not None:
-        after = turns_after(exported, str(cached["last_message_id"]))
-        if len(after) < len(all_turns):  # watermark found — resume just after it
-            reuse = cached
-            turns = after
-            start_index = len(all_turns) - len(after)
-
     stats, diffs, file_edits, changed, turn_refs, last_id = _session_to_stats(
         source,
         exported.session_id,
-        turns,
-        start_index=start_index,
+        all_turns,
+        start_index=0,
         updated=float(exported.updated or source.updated),
         bases=bases,
     )
     stat_dicts = [_stat_to_dict(stat) for stat in stats]
     fedit_dicts = {sha: [_edit_to_dict(edit) for edit in edits] for sha, edits in file_edits.items()}
-    if reuse is not None:  # prepend the reused prefix (already serialized)
-        stat_dicts = list(reuse.get("stats") or []) + stat_dicts
-        diffs = {**(reuse.get("diffs") or {}), **diffs}
-        fedit_dicts = {**(reuse.get("file_edits") or {}), **fedit_dicts}
-        turn_refs = list(reuse.get("turn_refs") or []) + turn_refs
-        changed = changed or bool(reuse.get("edited"))
-        last_id = last_id or str(reuse.get("last_message_id") or "")
     return {
         "updated": source.updated,
         "backend": source.backend,
@@ -1020,10 +980,51 @@ def _running_handshake(directory: Path) -> dict | None:
     return None
 
 
-def start_backtrace_daemon(directory: Path, *, owner_pid: int, open_browser: bool = True, timeout: float = 90.0) -> int:
+def _spawn_backtrace_child(directory: Path, *, owner_pid: int | None = None, port: int | None = None):
+    """Launch the detached backtrace child (shared by the CLI start and the update-restart
+    handoff). The child must load the INSTALLED aGiTrack, never a stray ``agitrack/``
+    package in the target directory: the backtraced directory can itself be the aGiTrack
+    source checkout, and ``python -m agitrack`` would otherwise import that (older) copy
+    from cwd — so it runs from a neutral state dir with PYTHONSAFEPATH keeping cwd off
+    ``sys.path``."""
+    import os
+    import subprocess
+    import sys
+
+    from agitrack.proc import detach_kwargs
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "agitrack",
+        "--repo",
+        str(directory),
+        "--backtrace-serve",
+    ]
+    if owner_pid is not None:
+        cmd += ["--dashboard-owner-pid", str(owner_pid)]
+    if port is not None:
+        cmd += ["--dashboard-port", str(port)]
+    state_dir = _state_dir()
+    state_dir.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ)
+    env["PYTHONSAFEPATH"] = "1"
+    log = _open_log(directory)
+    try:
+        return subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log, cwd=str(state_dir), env=env, **detach_kwargs()
+        )
+    finally:
+        if log is not subprocess.DEVNULL:
+            log.close()
+
+
+def start_backtrace_daemon(
+    directory: Path, *, owner_pid: int | None = None, open_browser: bool = True, timeout: float = 90.0
+) -> int:
     """`agitrack --backtrace` (html): start the background backtrace daemon for ``directory``,
-    then return to the shell. The daemon dies when the launching terminal closes (owner-pid
-    watchdog) or via `agitrack --backtrace stop`.
+    then return to the shell. The daemon is NOT bound to the launching terminal: it keeps
+    serving until `agitrack --backtrace stop` (and restarts itself after aGiTrack updates).
 
     Like ``agitrack -d``, re-running while a daemon is already up RESTARTS it — the old one is
     stopped and a fresh one started on the same port, so the URL is unchanged and a re-run
@@ -1033,12 +1034,8 @@ def start_backtrace_daemon(directory: Path, *, owner_pid: int, open_browser: boo
     every local session (OpenCode shells out per session) and can take minutes, so a progress bar
     is shown and the wait continues as long as progress is being made, giving up only if the child
     makes none for ``timeout`` seconds."""
-    import subprocess
-    import sys
-    import os
 
     from agitrack.metrics.daemon import _terminate_and_wait
-    from agitrack.proc import detach_kwargs
 
     running = _running_handshake(directory)
     reuse_port: int | None = None
@@ -1053,35 +1050,8 @@ def start_backtrace_daemon(directory: Path, *, owner_pid: int, open_browser: boo
         _clear_handshake(directory)
         print(f"Restarting the backtrace daemon (was pid {old_pid}).")
 
-    cmd = [
-        sys.executable,
-        "-m",
-        "agitrack",
-        "--repo",
-        str(directory),
-        "--backtrace-serve",
-        "--dashboard-owner-pid",
-        str(owner_pid),
-    ]
-    if reuse_port is not None:
-        cmd += ["--dashboard-port", str(reuse_port)]
-    # The child must load the INSTALLED aGiTrack, never a stray ``agitrack/`` package in the
-    # target directory: the backtraced directory can itself be the aGiTrack source checkout, and
-    # ``python -m agitrack`` would otherwise import that (older) copy from cwd. So run the child
-    # from a neutral state dir and set PYTHONSAFEPATH to keep cwd off ``sys.path``.
-    state_dir = _state_dir()
-    state_dir.mkdir(parents=True, exist_ok=True)
-    env = dict(os.environ)
-    env["PYTHONSAFEPATH"] = "1"
-    log = _open_log(directory)
     print(f"Scanning local coding-agent transcripts for {_abbreviate_home(str(directory))} … (this can take a moment)")
-    try:
-        proc = subprocess.Popen(
-            cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log, cwd=str(state_dir), env=env, **detach_kwargs()
-        )
-    finally:
-        if log is not subprocess.DEVNULL:
-            log.close()
+    proc = _spawn_backtrace_child(directory, owner_pid=owner_pid, port=reuse_port)
 
     # Wait for the child to finish reconstructing (it publishes the handshake when ready), showing
     # a live progress bar. The wait is STALL-based, not a fixed deadline: a big directory can take
@@ -1103,7 +1073,7 @@ def start_backtrace_daemon(directory: Path, *, owner_pid: int, open_browser: boo
         + record.get("banner", "")
         + "\n"
         + exposure_note(str(record.get("host", "")))
-        + "Runs in the background; stops when this terminal closes or `agitrack --backtrace stop`."
+        + "Runs in the background (surviving this terminal) until `agitrack --backtrace stop`."
     )
     _maybe_open(url, record, open_browser)
     return 0
@@ -1231,50 +1201,95 @@ def run_backtrace_daemon(
         return 0
 
     handler = _make_handler(view)
-    # Consecutive ports (8765, 8766, …) so a backtrace started alongside a dashboard — or a
-    # second backtrace — gets a predictable neighbouring URL instead of a random one.
-    server = bind_scanning(lambda address: _DashboardServer(address, handler), bind_host, preferred_port)
-    bound_port = int(server.server_address[1])
-    url = dashboard_url(bind_host, bound_port)
-    _write_handshake(
-        directory,
-        {
-            "pid": os.getpid(),
-            "host": bind_host,
-            "port": bound_port,
-            "url": url,
-            "banner": view.banner_text(),
-            "started": int(time.time()),
-        },
-    )
-    from agitrack import daemons
+    from agitrack.update import restart as update_restart
 
-    daemons.register("backtrace", directory, url=url)
-
-    stop = threading.Event()
+    # Mutable view of the CURRENT serve cycle for the signal handlers (installed once):
+    # an explicit stop must always work, including between a failed update-restart and
+    # the next cycle's bind (see the retry loop below).
+    current: dict = {"server": None, "stop": None}
+    explicit_stop = threading.Event()
 
     def _request_shutdown(*_: object) -> None:
-        stop.set()
-        threading.Thread(target=server.shutdown, daemon=True).start()
+        explicit_stop.set()
+        stop = current.get("stop")
+        server = current.get("server")
+        if stop is not None:
+            stop.set()
+        if server is not None:
+            threading.Thread(target=server.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGTERM, _request_shutdown)
     signal.signal(signal.SIGINT, _request_shutdown)
-    if owner_pid:
-        threading.Thread(
-            target=_watch_owner,
-            args=(owner_pid, stop, _request_shutdown),
-            daemon=True,
-            name="agitrack-backtrace-owner-watch",
-        ).start()
-    try:
-        server.serve_forever()
-    finally:
-        server.server_close()
-        _clear_handshake(directory)
+
+    while True:
+        # Consecutive ports (8765, 8766, …) so a backtrace started alongside a dashboard — or a
+        # second backtrace — gets a predictable neighbouring URL instead of a random one.
+        server = bind_scanning(lambda address: _DashboardServer(address, handler), bind_host, preferred_port)
+        bound_port = int(server.server_address[1])
+        url = dashboard_url(bind_host, bound_port)
+        _write_handshake(
+            directory,
+            {
+                "pid": os.getpid(),
+                "host": bind_host,
+                "port": bound_port,
+                "url": url,
+                "banner": view.banner_text(),
+                "started": int(time.time()),
+            },
+        )
         from agitrack import daemons
 
-        daemons.deregister()
-    return 0
+        daemons.register("backtrace", directory, url=url)
+
+        stop = threading.Event()
+        current.update(server=server, stop=stop)
+        if explicit_stop.is_set():  # a stop landed while we were between cycles
+            stop.set()
+            threading.Thread(target=server.shutdown, daemon=True).start()
+
+        if owner_pid:
+            threading.Thread(
+                target=_watch_owner,
+                args=(owner_pid, stop, _request_shutdown),
+                daemon=True,
+                name="agitrack-backtrace-owner-watch",
+            ).start()
+
+        restart_wanted = threading.Event()
+
+        def _restart_for_update(_version: str, *, _stop=stop, _server=server) -> None:
+            restart_wanted.set()
+            _stop.set()
+            threading.Thread(target=_server.shutdown, daemon=True).start()
+
+        update_restart.watch_for_update(stop, _restart_for_update)
+
+        try:
+            server.serve_forever()
+        finally:
+            server.server_close()
+            _clear_handshake(directory)
+            daemons.deregister()
+        if explicit_stop.is_set() or not restart_wanted.is_set():
+            return 0
+        # Restart by SPAWN-AND-VERIFY, not exec: a replacement running a broken update
+        # could crash on startup, and an exec'd-over process has nothing left to retry
+        # with. The old daemon only exits once the replacement provably serves (its own
+        # handshake, correlated on its pid); otherwise it reaps the corpse and serves
+        # on, retrying on the next detection — until the user stops it.
+        try:
+            child = _spawn_backtrace_child(directory, port=bound_port)
+            record = _wait_for_backtrace(directory, child, stall_seconds=90.0)
+        except Exception:
+            child, record = None, None
+        if record is not None:
+            print(f"restarted onto the updated aGiTrack (pid {record.get('pid')}).", flush=True)
+            return 0
+        if child is not None and child.poll() is None:
+            child.terminate()
+        print("update restart failed; still serving on the current version and retrying.", flush=True)
+        preferred_port = bound_port
 
 
 def _open_log(directory: Path):

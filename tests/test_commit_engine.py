@@ -1518,3 +1518,149 @@ def test_initialize_session_baseline_clears_when_not_continue(tmp_path):
     )
     assert state.backend_session_id is None
     assert state.last_backend_message_id is None
+
+
+def test_partial_turn_recommit_adds_only_the_token_delta(tmp_path):
+    # A turn force-captured mid-flight (exit/restart) is re-exported INCLUSIVELY once it
+    # finishes. Its tokens must be counted EXACTLY ONCE across the two commits: the first
+    # commit records the usage counted so far, the re-commit adds only the delta. Adding
+    # the whole turn again on every restart inflated recorded tokens 13-26x on long-turn
+    # days (2026-07-25) — while per-turn parsing (and the backtrace built on it) was right.
+    session = Session.bare()
+    running = SessionTurn(
+        "u1", "", "huge refactor", "", TokenUsage(input=100, output=10, cache_write=40), None, complete=True
+    )
+    exported = ExportedSession("ses-part", "m", None, [running])
+    engine, state, commits, commit_fn = _make_finish_helpers(tmp_path, session, exported)
+
+    def accumulating_commit_fn(**kwargs):
+        for turn in kwargs["turns"]:
+            engine._add_turn_usage(turn)  # what the real commit_turns does per turn
+        commits.append(kwargs)
+        return True
+
+    kwargs = dict(
+        session=session,
+        quiet=True,
+        prompt_untracked=False,
+        awaited_followups=[],
+        agent_is_active_fn=lambda: False,
+        debug_fn=lambda *a, **k: None,
+        note_session_change_fn=lambda sid: None,
+        mirror_fn=lambda sid: None,
+        commit_fn=accumulating_commit_fn,
+    )
+    # Commit 1: exit force-capture of the still-running turn.
+    result, _ = engine.finish_parse_if_ready(require_complete=False, **kwargs)
+    assert result is True and len(commits) == 1
+    first = state.pending_token_usage()
+    assert (first["input"], first["output"]) == (100, 10)
+    partial = state.partial_turn_usage()
+    assert partial and partial["user_id"] == "u1" and partial["usage"]["input"] == 100
+
+    # The commit happened: its pending usage is flushed exactly as commit_turns does.
+    state.clear_trace()
+
+    # Commit 2: the conversation continued; the SAME turn finished, much larger.
+    finished = SessionTurn(
+        "u1",
+        "a1",
+        "huge refactor",
+        "done at last",
+        TokenUsage(input=300, output=50, cache_write=90),
+        None,
+        complete=True,
+    )
+    session.agent_parse_result = (exported.session_id, ExportedSession("ses-part", "m", None, [finished]), None, state)
+    result, _ = engine.finish_parse_if_ready(require_complete=True, **kwargs)
+    assert result is True and len(commits) == 2
+
+    second = state.pending_token_usage()
+    # Only the DELTA was added: 300-100 input, 50-10 output, 90-40 cache_write.
+    assert (second["input"], second["output"], second["cache_write"]) == (200, 40, 50)
+    assert state.partial_turn_usage() is None  # consumed; a third pass would start clean
+    # Across both commits the turn's true totals were recorded exactly once.
+    assert first["input"] + second["input"] == 300
+    assert first["output"] + second["output"] == 50
+
+
+def test_partial_turn_delta_never_goes_negative(tmp_path):
+    # Defensive: if a re-exported turn somehow reports LESS usage than already recorded
+    # (clock skew, truncated transcript), the delta floors at zero instead of corrupting
+    # the pending counters.
+    state = AgitrackState(tmp_path)
+    engine = CommitEngine(_Repo(staged=True), state)
+    state.set_partial_turn_usage(None, "u1", {"input": 500, "output": 100})
+    shrunken = SessionTurn("u1", "a1", "p", "r", TokenUsage(input=200, output=40), None, complete=True)
+    engine._add_turn_usage(shrunken)
+    pending = state.pending_token_usage()
+    assert (pending["input"], pending["output"]) == (0, 0)
+    assert state.partial_turn_usage() is None
+
+
+def test_lost_watermark_never_reexports_the_whole_session(tmp_path):
+    # A context compaction can reshape turn boundaries so the stored watermark id no
+    # longer matches any turn boundary. The old fallback exported EVERYTHING — which
+    # re-committed a 20-day conversation as one 31M-token commit (2026-07-25). With the
+    # mark's timestamp recorded, only turns that began after it are new; without even a
+    # timestamp (legacy state), just the newest turn re-anchors tracking.
+    from agitrack.transcripts.types import turns_after
+
+    old = SessionTurn("u1", "a1", "ancient", "done", TokenUsage(output=1_000_000), None, started_at=100, ended_at=200)
+    newer = SessionTurn("u2", "a2", "recent", "done", TokenUsage(output=10), None, started_at=900, ended_at=950)
+    exported = ExportedSession("ses-lost", "m", None, [old, newer])
+
+    with_time = turns_after(exported, "msg_vanished", marked_at=500)
+    assert with_time == [newer]  # the ancient, already-committed turn is never re-exported
+
+    legacy = turns_after(exported, "msg_vanished")
+    assert legacy == [newer]  # last turn only — bounded, re-anchors on its id
+
+    # A turn with NO timestamps is unknowable and errs toward export (synthetic
+    # transcripts; real ones always stamp times) — it must not read as "ancient".
+    untimed = SessionTurn("u3", "a3", "untimed", "done", TokenUsage(output=1), None)
+    exported_untimed = ExportedSession("ses-lost2", "m", None, [old, untimed])
+    assert turns_after(exported_untimed, "msg_vanished", marked_at=500) == [untimed]
+
+
+def test_watermark_advance_records_the_mark_timestamp(tmp_path):
+    # Every watermark advance stores WHEN the mark landed, so a later boundary reshuffle
+    # falls back to time instead of the full-history export.
+    session = Session.bare()
+    turn = SessionTurn("u1", "a1", "p", "done", TokenUsage(output=5), None, started_at=1000, ended_at=1010)
+    exported = ExportedSession("ses-mark", "m", None, [turn])
+    engine, state, commits, commit_fn = _make_finish_helpers(tmp_path, session, exported)
+    state.data["backend_session_id"] = "ses-mark"
+
+    result, _ = engine.finish_parse_if_ready(
+        session=session,
+        quiet=True,
+        prompt_untracked=False,
+        require_complete=True,
+        awaited_followups=[],
+        agent_is_active_fn=lambda: False,
+        debug_fn=lambda *a, **k: None,
+        note_session_change_fn=lambda sid: None,
+        mirror_fn=lambda sid: None,
+        commit_fn=commit_fn,
+    )
+    assert result is True
+    assert state.backend_message_marked_at_for("ses-mark") == 1010
+
+
+def test_turns_ended_before_the_frontier_are_never_recounted(tmp_path):
+    # Belt to the turns_after fix: even if some path re-exports history, a turn that
+    # ENDED at or before the watermark's recorded time adds NOTHING — only the
+    # partial-delta continuation (which ends after the frontier) may reach back.
+    state = AgitrackState(tmp_path)
+    state.data["backend_session_id"] = "s1"
+    state.set_backend_message_id("s1", "a5", marked_at=5000)
+    engine = CommitEngine(_Repo(staged=True), state)
+
+    ancient = SessionTurn("u1", "a1", "old", "done", TokenUsage(output=1_000_000), None, started_at=100, ended_at=200)
+    engine._add_turn_usage(ancient)
+    assert state.pending_token_usage()["output"] == 0  # skipped entirely
+
+    fresh = SessionTurn("u9", "a9", "new", "done", TokenUsage(output=30), None, started_at=5100, ended_at=5200)
+    engine._add_turn_usage(fresh)
+    assert state.pending_token_usage()["output"] == 30

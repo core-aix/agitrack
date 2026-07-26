@@ -99,9 +99,10 @@ def format_html(
     banner_html: str = "",
     backtrace: bool = False,
     insights: list[dict] | None = None,
+    frm: int = 0,
 ) -> str:
     payload = _embed_json(
-        initial_payload(dash, shared_sessions=shared_sessions, backtrace=backtrace, insights=insights)
+        initial_payload(dash, shared_sessions=shared_sessions, backtrace=backtrace, insights=insights, frm=frm)
     )
     repo_name = dash.repo.rstrip("/").rsplit("/", 1)[-1] or dash.repo
     # The branch is rendered client-side into the meta-line picker (from the
@@ -513,6 +514,7 @@ def _log_entry(dash: Dashboard, stat: CommitStat, covers: dict[str, CommitStat])
         "subject": stat.subject,
         "kind": stat.kind,
         "pending": stat.pending,
+        "token_anomaly": stat.token_anomaly,  # tokens excluded: re-exported history (lost watermark)
         "tracked": stat.tracked,  # backtrace: already committed with aGiTrack metadata
         "eff_backend": eff_backend,
         "eff_model": eff_model,
@@ -589,6 +591,7 @@ def initial_payload(
     shared_sessions: list[dict] | None = None,
     backtrace: bool = False,
     insights: list[dict] | None = None,
+    frm: int = 0,
 ) -> dict:
     """What the page embeds for an instant first paint: unfiltered aggregates,
     the first log page, repo metadata, the page size, and any shared sessions.
@@ -596,15 +599,17 @@ def initial_payload(
     ``backtrace`` marks the payload as a historical reconstruction (``--backtrace``)
     rather than live repo status, for any client-side affordance that keys off it.
     ``insights`` (whole-history efficiency insights, never filter-scoped) render as
-    the "agent efficiency" section when non-empty."""
+    the "agent efficiency" section when non-empty. ``frm`` scopes the embedded
+    aggregates and first log page to commits at/after that timestamp — the static
+    demo export uses it to ship a last-30-days view instead of all time."""
     return {
         "repo": dash.repo,
         "branch": dash.branch,
         "page_size": PAGE_SIZE,
         "backtrace": backtrace,
         "insights": insights or [],
-        **aggregates_payload(dash),
-        "log": log_page(dash),
+        **aggregates_payload(dash, frm=frm),
+        "log": log_page(dash, frm=frm),
         "shared_sessions": shared_sessions or [],
     }
 
@@ -798,22 +803,32 @@ header{padding:26px 0 18px}
 .meta select.branchsel:disabled{cursor:default;opacity:1;border-color:transparent;padding:2px 0;background-image:none}
 
 /* ---- filter bar ---- */
-/* One row on a wide window; on anything narrower the fields wrap instead of forcing a
-   horizontal page scroll. (No overflow clipping — the custom-range popup hangs below.) */
+/* One row while sticky: the FIELDS shrink (min-width:0 below) rather than the row
+   wrapping, so a narrower window compresses the selects instead of dropping the reset
+   button to a second line — and never forces a horizontal page scroll. The phone layout
+   (max-width:760px below) is where the bar finally wraps into a grid. (No overflow
+   clipping — the custom-range popup hangs below the bar.) */
 .controls{position:sticky;top:0;z-index:20;margin:22px 0 30px;padding:14px 16px;background:var(--panel);
-  border:1px solid var(--line);border-bottom-width:3px;display:flex;flex-wrap:wrap;gap:16px;align-items:flex-end}
+  border:1px solid var(--line);border-bottom-width:3px;display:flex;flex-wrap:nowrap;gap:16px;align-items:flex-end}
 .controls .prompt{color:var(--phosphor);font-weight:600;align-self:center;white-space:nowrap}
-/* "loading…" badge shown while a filter change re-fetches the data. */
-.loading{margin-left:auto;align-self:center;display:inline-flex;align-items:center;gap:8px;
-  color:var(--phosphor);font-size:13px;white-space:nowrap}
+/* "loading…" badge shown while a filter change re-fetches the data. It FLOATS just below
+   the bar's right corner (absolute against the sticky bar), so appearing and disappearing
+   never moves the reset button or anything else in the row. */
+.loading{position:absolute;top:calc(100% + 8px);right:12px;z-index:30;display:inline-flex;
+  align-items:center;gap:8px;color:var(--phosphor);font-size:13px;white-space:nowrap;
+  background:var(--panel);border:1px solid var(--phosphor-dim);padding:6px 12px;
+  box-shadow:0 10px 26px rgba(0,0,0,.55)}
 .loading[hidden]{display:none}
 .loading .spin{width:13px;height:13px;border:2px solid var(--phosphor-dim);border-top-color:var(--phosphor);
   border-radius:50%;animation:spin .7s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
-.field{display:flex;flex-direction:column;gap:4px}
+/* Fields SHRINK (flex-basis with no fixed min-width) so the bar keeps everything on one
+   line on a desktop window instead of wrapping just the reset button to a second row;
+   below 760px the phone grid takes over. */
+.field{display:flex;flex-direction:column;gap:4px;flex:0 1 165px;min-width:0}
 .field label{font-size:11px;color:var(--amber);letter-spacing:.6px;text-transform:uppercase;white-space:nowrap}
 .field select{appearance:none;background:var(--ink);color:var(--fg);border:1px solid var(--line);
-  font-family:var(--mono);font-size:13.5px;padding:7px 30px 7px 11px;cursor:pointer;min-width:150px;
+  font-family:var(--mono);font-size:13.5px;padding:7px 30px 7px 11px;cursor:pointer;min-width:0;width:100%;
   background-image:linear-gradient(45deg,transparent 50%,var(--phosphor-dim) 50%),linear-gradient(135deg,var(--phosphor-dim) 50%,transparent 50%);
   background-position:calc(100% - 16px) 50%,calc(100% - 11px) 50%;background-size:5px 5px,5px 5px;background-repeat:no-repeat}
 .field select:focus{outline:none;border-color:var(--phosphor)}
@@ -838,13 +853,17 @@ input[type=date]::-webkit-calendar-picker-indicator{filter:invert(.7) sepia(1) h
 /* Phone-width: a wrapped sticky bar would cover half the screen, so the filters become a
    two-column grid that scrolls with the page. */
 @media (max-width:760px){
-  .controls{position:static;gap:10px 12px}
+  /* relative, not static: no stickiness, but still the anchor for the floating badge.
+     top:auto !important overrides the inline top stackStickyBanner() sets for the
+     sticky desktop layout — on a relative bar that offset just shoves the bar down,
+     leaving a banner-sized blank gap at the top (worst on backtrace, whose long
+     banner wraps tall at phone widths). */
+  .controls{position:relative;flex-wrap:wrap;gap:10px 12px;top:auto !important}
   .controls .prompt{width:100%}
   .field{flex:1 1 42%;min-width:0}
   .field select{min-width:0;width:100%}
   .daterange{left:0;right:auto}
   .reset{flex:1 1 42%;margin-left:0}
-  .loading{margin-left:0}
 }
 
 h2.section{font-family:var(--display);font-size:27px;font-weight:400;color:var(--phosphor);letter-spacing:1px;
@@ -979,6 +998,7 @@ h2.section::before{content:"# ";color:var(--amber)}
 .entry .badge.nontracked{color:var(--amber);border-color:var(--amber-dim)}
 .entry .badge.pending{color:var(--amber);border-color:var(--amber-dim);border-style:dashed}
 .entry .badge.tracked{color:var(--phosphor);border-color:var(--phosphor-dim);background:rgba(61,255,160,.08)}
+.entry .badge.anomaly{color:var(--red);border-color:var(--red)}
 .entry.pending{opacity:.82}
 .entry .lc{font-size:12px;color:var(--fg-dim)}
 .entry .lc .add{color:var(--phosphor)} .entry .lc .rem{color:var(--red)}
@@ -1042,12 +1062,24 @@ h2.section::before{content:"# ";color:var(--amber)}
 .part .phead{padding:0 10px}
 .part .part{margin:5px 10px}
 .more{padding:12px 0;color:var(--fg-dim);font-size:12.5px}
-.pager{display:flex;align-items:center;gap:16px;padding:14px 0 2px;color:var(--fg-dim);font-size:12.5px}
-.pager span{min-width:160px}
+.pager{display:flex;align-items:center;flex-wrap:wrap;gap:10px 16px;padding:14px 0 2px;color:var(--fg-dim);font-size:12.5px}
+.pager .pcount{min-width:160px}
+.pager .pnav{position:relative;display:flex;align-items:center;gap:4px;flex-wrap:wrap}
+/* Floating "loading…" badge for a log page switch: same look as the filter badge, but
+   anchored just below the page selector — feedback appears where the user clicked. */
+.pgload{right:auto;left:0;top:calc(100% + 6px)}
 .pager button{cursor:pointer;background:transparent;border:1px solid var(--phosphor-dim);color:var(--phosphor);
-  font-family:var(--mono);font-size:12.5px;padding:5px 12px}
+  font-family:var(--mono);font-size:12.5px;padding:5px 9px;min-width:31px}
 .pager button:hover:not([disabled]){background:var(--phosphor);color:var(--ink)}
 .pager button[disabled]{opacity:.35;cursor:default;border-color:var(--line);color:var(--fg-dim)}
+/* The current page stays fully lit even though it's disabled (it's a marker, not a dead control). */
+.pager button.current[disabled]{opacity:1;background:var(--phosphor);color:var(--ink);border-color:var(--phosphor)}
+.pager .pgap{padding:0 2px}
+.pager .pgoto{display:flex;align-items:center;gap:7px}
+.pager .pgoto input{width:58px;background:transparent;border:1px solid var(--line);color:var(--fg);
+  font-family:var(--mono);font-size:12.5px;padding:4px 7px;-moz-appearance:textfield}
+.pager .pgoto input:focus{outline:none;border-color:var(--phosphor-dim)}
+.pager .pgoto input::-webkit-outer-spin-button,.pager .pgoto input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
 
 /* ---- log tabs (commits / files) — title on its own line, tabs left below it ---- */
 .logsection-head{margin:38px 0 14px}
@@ -1183,10 +1215,8 @@ __UPDATE_BANNER__
   <a class="learncta" href="learn" title="Open the learn page">
     <span class="lc-icon">&#127891;</span>
     <span class="lc-text"><b>Learn from these traces.</b>
-    Your coding agent reads how you drive it, spots the knowledge gaps it can actually evidence, and writes
-    small lessons sized to the time and energy you have right now: coding skills that make you work with
-    agents more effectively, plus knowledge of this codebase. Quizzes, hands-on exercises, and your progress
-    tracked automatically.</span>
+    Your agent reads how you drive it and writes small lessons on agent skills and this
+    codebase &mdash; quizzes, exercises, progress tracked.</span>
     <span class="lc-btn">open learn &rarr;</span>
   </a>
   <div id="insights"></div>
@@ -1213,9 +1243,10 @@ __UPDATE_BANNER__
   <div class="logpane" id="pane-commits">
     <div class="logintro" id="logintro" hidden>Each entry below is one <b>reconstructed agent turn</b> from your
     local session transcripts: what was asked, the agent's reply, and the file changes it recovered, shown like a
-    commit. Nothing here has been written to git; a turn with a <b>committed</b> badge is already in your history
-    with aGiTrack metadata, and <code>agitrack --backtrace commit</code> bakes the rest into real commits on a new
-    branch.</div>
+    commit. The <b>subject line of each entry is the user prompt</b> that started that turn of the conversation
+    with the agent. Nothing here has been written to git; a turn with a <b>committed</b> badge is already in your
+    history with aGiTrack metadata, and <code>agitrack --backtrace commit</code> bakes the rest into real commits
+    on a new branch.</div>
     <div class="panehead"><div class="logsort"><label for="f-sort">sort</label><select id="f-sort" title="Sort the filtered commits">
       <option value="date">newest first</option>
       <option value="lines">most lines changed</option>
@@ -1408,8 +1439,8 @@ function subBarRow(name, value, max, numHtml, min){
     `<div class="bar"><span class="logtag">log</span><i class="log" style="width:${w}%"></i></div>`+
     `<div class="num">${numHtml}</div></div>`;
 }
-function card(label, value, note, amber){
-  return `<div class="card"><div class="label">${esc(label)}</div>`+
+function card(label, value, note, amber, tip){
+  return `<div class="card"${tip?` title="${esc(tip)}"`:""}><div class="label">${esc(label)}</div>`+
     `<div class="value ${amber?"amber":""}">${bigValue(value)}</div><div class="note">${esc(note||"")}</div></div>`;
 }
 // Keep the big display font, but when a plain integer is too long to fit the card (e.g. 100M+
@@ -1502,8 +1533,18 @@ function renderAgg(){
     // coverage" ratio (of turns, not commits — and always near 100%) would both mislead here.
     BACKTRACE ? "" : card("commits", fmt(total), `${fmt(tracked)} via aGiTrack`),
     BACKTRACE ? "" : card("aGiTrack coverage", pct(tracked,total), `${fmt(total-tracked)} non-tracked`, true),
-    card("Tracked AI lines", "+"+fmt(ai.ins), `−${fmt(ai.del)} · ${pct(ai.total, allLines)} of changes`),
-    card("non-tracked lines", "+"+fmt(nt.ins), `−${fmt(nt.del)} · not tracked as AI`, true),
+    // Backtrace line counts come from the transcript's Edit/Write tool calls only — an agent
+    // can also change code in ways a transcript doesn't record as edits (shell commands,
+    // formatters), so the reconstruction is a lower bound. Say so instead of "% of changes"
+    // (meaningless here: every reconstructed line is AI). The non-tracked card is dropped
+    // outright — backtrace turns are all agent work, so it would always read zero.
+    BACKTRACE
+      ? card("Tracked AI lines", "+"+fmt(ai.ins), `−${fmt(ai.del)} · may miss some edits`, false,
+          "Reconstructed from the agent's file-editing tool calls in the transcript. Agents can also "+
+          "change code in ways a transcript does not record as edits (shell commands, formatters, "+
+          "generated files), so not all changed lines are necessarily counted here.")
+      : card("Tracked AI lines", "+"+fmt(ai.ins), `−${fmt(ai.del)} · ${pct(ai.total, allLines)} of changes`),
+    BACKTRACE ? "" : card("non-tracked lines", "+"+fmt(nt.ins), `−${fmt(nt.del)} · not tracked as AI`, true),
     card("output tokens", fmt((tok.output||0)+(tok.subagent_output||0)), `${fmt((tok.input||0)+(tok.subagent_input||0))} input`),
     card("line yield", eff===null?"—":eff.toFixed(1), "AI lines / 1k output tok", true),
   ].join("");
@@ -1513,9 +1554,11 @@ function renderAgg(){
       `<div class="bar"><i class="${amber?"amber":""}" style="width:${allLines?v.total/allLines*100:0}%"></i></div>`+
       `<div class="num"><b>+${fmt(v.ins)}</b> / −${fmt(v.del)}</div></div>`;
   const kc = (label, key, tip) => `<span class="kc" title="${tip}">${label} <b>${kinds(key)}</b></span>`;
+  // Backtrace shows only reconstructed agent turns, so the non-tracked bar (like its
+  // card above) would always sit at zero — drop it there.
   $("lines").innerHTML =
     lineRow("Tracked AI", "agent + covered", ai, false) +
-    lineRow("Non-tracked", "user + plain commits", nt, true) +
+    (BACKTRACE ? "" : lineRow("Non-tracked", "user + plain commits", nt, true)) +
     `<div class="kindcounts"><span class="klabel">commits by kind:</span> `+
       kc("agent", "agent", "Commits aGiTrack made from the agent's work") + " · " +
       kc("covered", "covered", "Backend-made commits an aGiTrack cover commit accounts for") + " · " +
@@ -1776,25 +1819,59 @@ function renderLog(){
     // Backtrace: mark turns already committed to git with aGiTrack metadata, so the user sees what
     // is already tracked vs. what `--backtrace commit` would still add.
     const trk = (BACKTRACE && c.tracked)?`<span class="badge tracked" title="already committed to git with aGiTrack metadata">committed</span>`:"";
+    const anom = c.token_anomaly?`<span class="badge anomaly" title="This commit re-exported conversation history that earlier commits already accounted for (a lost watermark on an older aGiTrack), so its token counts are excluded from every total.">tokens excluded</span>`:"";
     const squash = (c.parts&&c.parts.length)?`<span class="squash">⧉ ${c.parts.length} squashed</span>`:"";
     const lc = (c.ins||c.del)?`<span class="lc"><span class="add">+${fmt(c.ins)}</span> <span class="rem">−${fmt(c.del)}</span></span>`:"";
     const m = c.eff_model?`<span class="lc">${esc(c.eff_model)}</span>`:"";
     const subj = c.subject||"", shown = truncSubject(subj);
     const subjTitle = shown!==subj ? ` title="${esc(subj)}"` : "";  // full subject on hover when cut
     const shaTag = BACKTRACE ? "" : `<span class="sha">${esc(c.short)}</span>`;
-    return `<div class="entry ${cls}${c.pending?' pending':''}" data-i="${i}">${shaTag}${badge}${pend}${trk}${squash}`+
+    return `<div class="entry ${cls}${c.pending?' pending':''}" data-i="${i}">${shaTag}${badge}${pend}${trk}${anom}${squash}`+
       `<span class="ksub"${subjTitle}>${esc(shown)}</span>${lc}${tokenBrief(c.tokens)}${m}`+
       `<div class="detail" id="detail-${i}" hidden></div></div>`;
   }).join("");
   const from = total ? offset+1 : 0, to = offset+entries.length;
-  const prevDis = offset<=0 ? "disabled" : "", nextDis = (offset+limit>=total) ? "disabled" : "";
-  const pager = `<div class="pager"><button id="log-prev" ${prevDis}>‹ newer</button>`+
-    `<span>${fmt(from)}–${fmt(to)} of ${fmt(total)} commits</span>`+
-    `<button id="log-next" ${nextDis}>older ›</button></div>`;
+  const pages = Math.max(1, Math.ceil(total/limit)), cur = Math.min(pages, Math.floor(offset/limit)+1);
+  // Numbered page buttons: all of them when few, otherwise first + a window around
+  // the current page + last, with … gaps (0 marks a gap).
+  let nums = [];
+  if(pages<=9){ for(let p=1;p<=pages;p++) nums.push(p); }
+  else {
+    const lo = Math.max(2, cur-2), hi = Math.min(pages-1, cur+2);
+    nums.push(1);
+    if(lo>2) nums.push(0);
+    for(let p=lo;p<=hi;p++) nums.push(p);
+    if(hi<pages-1) nums.push(0);
+    nums.push(pages);
+  }
+  const numBtns = nums.map(p => p===0 ? `<span class="pgap">…</span>` :
+    `<button class="pnum${p===cur?' current':''}" data-p="${p}" ${p===cur?'disabled':''}>${fmt(p)}</button>`).join("");
+  const prevDis = cur<=1 ? "disabled" : "", nextDis = cur>=pages ? "disabled" : "";
+  const gotoBox = pages>1 ? `<span class="pgoto">go to <input id="log-goto" type="number" inputmode="numeric" `+
+    `min="1" max="${pages}" placeholder="${cur}"> / ${fmt(pages)}</span>` : "";
+  const pager = `<div class="pager"><span class="pcount">${fmt(from)}–${fmt(to)} of ${fmt(total)} commits</span>`+
+    `<span class="pnav"><button id="log-first" title="first page" ${prevDis}>«</button>`+
+    `<button id="log-prev" title="previous page" ${prevDis}>‹</button>${numBtns}`+
+    `<button id="log-next" title="next page" ${nextDis}>›</button>`+
+    `<button id="log-last" title="last page" ${nextDis}>»</button>`+
+    `<span class="loading pgload" id="pgloading" hidden aria-live="polite"><span class="spin"></span>loading…</span></span>${gotoBox}</div>`;
   $("commitlog").innerHTML = (rows || `<div class="empty">no commits</div>`) + pager;
-  const prev = $("log-prev"), next = $("log-next");
-  if(prev) prev.onclick = async () => { if(await loadLog(Math.max(0, offset-limit))) renderLog(); };
-  if(next) next.onclick = async () => { if(offset+limit<total && await loadLog(offset+limit)) renderLog(); };
+  const goPage = async p => {
+    p = Math.min(pages, Math.max(1, p));
+    if(p===cur) return;
+    // Fetching a page can take seconds on a big repo — float a spinner under the page
+    // selector. renderLog replaces the whole log (badge included) on success; only a
+    // failed fetch leaves this pager standing, so re-hide it then.
+    const busy = $("pgloading"); if(busy) busy.hidden = false;
+    if(await loadLog((p-1)*limit)) renderLog();
+    else if(busy) busy.hidden = true;
+  };
+  for(const [id, p] of [["log-first",1],["log-prev",cur-1],["log-next",cur+1],["log-last",pages]]){
+    const b = $(id); if(b && !b.disabled) b.onclick = () => goPage(p);
+  }
+  document.querySelectorAll("#commitlog .pnum:not([disabled])").forEach(b => { b.onclick = () => goPage(+b.dataset.p); });
+  const gi = $("log-goto");
+  if(gi) gi.onkeydown = e => { if(e.key==="Enter" && gi.value!=="") goPage(+gi.value||cur); };
 }
 
 function partsHtml(parts){

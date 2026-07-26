@@ -667,8 +667,12 @@ def test_apply_update_success_finalizes_then_restarts():
 
 
 def _capture_restart(monkeypatch, argv):
+    from agitrack import daemons
     from agitrack.update import updater as updater_mod
 
+    # These tests cover the re-exec ARGV handling only; restarting real daemons is
+    # daemons.restart_all's own tested concern (and must never leave the unit).
+    monkeypatch.setattr(daemons, "restart_all", lambda **kw: 0)
     monkeypatch.setattr(updater_mod.sys, "argv", argv)
     captured: list = []
     monkeypatch.setattr(updater_mod.os, "execv", lambda exe, args: captured.append(args))

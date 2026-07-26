@@ -1,5 +1,3 @@
-import os
-
 from agitrack.metrics.server import browser_is_local, open_dashboard_in_browser
 from agitrack.proxy.runner import ProxyInput
 from tests.proxy_helpers import make_runner
@@ -51,14 +49,20 @@ def test_dashboard_command_spawns_process_and_opens_browser(monkeypatch):
     runner = make_runner(base_repo=object())
     monkeypatch.setattr(runner, "_render", lambda: None)
     monkeypatch.setattr(runner, "_dashboard_email_logins", lambda: {})
+    popups: list[tuple] = []
+    monkeypatch.setattr(runner, "_select_popup", lambda title, options, **kw: popups.append((title, kw)) or "ok")
 
     runner._handle_dashboard_command()
 
     assert runner._dashboard_proc is proc
     assert runner._dashboard_url == "http://127.0.0.1:12345/"
     assert opened == ["http://127.0.0.1:12345/"]
-    # The child is owned by THIS aGiTrack process, so it dies when the TUI exits.
-    assert spawned and spawned[0]["owner_pid"] == os.getpid()
+    # A free-standing daemon, like `agitrack -d`: no owner pid, so the dashboard keeps
+    # running after aGiTrack quits (and after the terminal closes) until `-d stop`.
+    assert spawned and "owner_pid" not in spawned[0]
+    # A popup tells the user the daemon outlives aGiTrack and how to stop it.
+    assert popups and "KEEPS RUNNING" in " ".join(popups[0][1]["detail"])
+    assert "agitrack -d stop" in " ".join(popups[0][1]["detail"])
 
     # A second invocation reuses the running process (never respawns), just reopens it.
     monkeypatch.setattr(
@@ -68,12 +72,7 @@ def test_dashboard_command_spawns_process_and_opens_browser(monkeypatch):
     runner._handle_dashboard_command()
     assert runner._dashboard_proc is proc  # unchanged
     assert opened == ["http://127.0.0.1:12345/", "http://127.0.0.1:12345/"]
-
-    # Exit kills the dashboard process.
-    monkeypatch.setattr("agitrack.metrics.clear_handshake", lambda repo: None)
-    runner._stop_dashboard()
-    assert proc.terminated
-    assert runner._dashboard_proc is None
+    assert len(popups) == 1  # the persistence popup shows only on a fresh start
 
 
 def test_dashboard_command_reports_when_daemon_fails_to_start(monkeypatch):
@@ -120,15 +119,15 @@ def test_dashboard_command_reuses_an_externally_running_daemon(monkeypatch):
 
     assert opened == ["http://127.0.0.1:9999/"]
     assert runner._dashboard_url == "http://127.0.0.1:9999/"
-    # We don't own it, so we don't track it as our proc and won't stop it on exit.
+    # We don't own it, so we don't track it as our proc.
     assert runner._dashboard_proc is None
-    runner._stop_dashboard()  # must not raise, must not kill the reused daemon
 
 
-def test_stop_dashboard_is_a_noop_when_none_running():
+def test_dashboard_is_never_stopped_by_agitrack_exit():
+    # The Ctrl-G dashboard is terminal-owned: aGiTrack's teardown must not kill it
+    # (the old _stop_dashboard exit hook is gone entirely).
     runner = make_runner(base_repo=object())
-    runner._stop_dashboard()  # must not raise
-    assert runner._dashboard_proc is None
+    assert not hasattr(runner, "_stop_dashboard")
 
 
 # --- browser routing: open locally, never on a remote/headless host -------------

@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter, defaultdict
+from datetime import datetime
 from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
@@ -147,6 +148,11 @@ class CommitStat:
     # folded into a real branch commit. Shown in the dashboard as an in-progress turn so
     # the user sees the session's work before they commit (#manual-commits).
     pending: bool = False
+    # This commit's recorded conversation span reaches back over history that EARLIER
+    # commits of the same backend session already accounted for (a lost watermark on a
+    # pre-fix aGiTrack re-exported whole conversations, 3M+ tokens in one commit). Its
+    # token counts are excluded from every aggregate; the log flags it (#token-anomaly).
+    token_anomaly: bool = False
     # Backtrace only: this reconstructed turn is ALREADY committed to git with aGiTrack metadata
     # (matched to a real aGiTrack commit's covered range), so the log can distinguish what is
     # already tracked from what a `--backtrace commit` would still add. Always False elsewhere.
@@ -540,6 +546,55 @@ def _first_name(names: Counter[str], login: str) -> str | None:
     return first
 
 
+_SESSION_ID_RE = re.compile(r"backend_session_id:\s*(\S+)")
+# A legitimate span overlap (a force-captured turn re-committed once it finished) never
+# exceeds one turn; a re-exported conversation reaches back days. 24h cleanly separates them.
+_ANOMALY_OVERLAP_SECONDS = 24 * 3600.0
+
+
+def _iso_epoch(value: str) -> float | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _flag_token_anomalies(stats: list[CommitStat]) -> None:
+    """Exclude token counts of commits that RE-COVER already-committed conversation history.
+
+    A lost watermark (a compaction reshuffling turn boundaries on an aGiTrack from before
+    the turns_after fallback fix) exported an entire conversation into one commit: 3M+
+    output tokens spanning weeks, dwarfing every honest number on the dashboard. Those
+    commits are permanent history, and installs running older code can still write new
+    ones — so the dashboard defends itself at read time: walking each backend session's
+    commits oldest-first, a commit whose conversation STARTED more than 24h before that
+    session's already-committed frontier is abnormal. Its tokens are EXCLUDED (not
+    guessed — the true new-work share is unknowable), its lines/commit still count, and
+    the log marks it. Honest commits are never touched: their spans only move forward,
+    and the one legitimate back-reach (a force-captured turn finishing) is minutes to
+    hours, not days."""
+    frontier: dict[str, float] = {}
+    for stat in stats:
+        for target in (stat, *stat.constituents):
+            match = _SESSION_ID_RE.search(target.metadata_block or "")
+            started = _iso_epoch(target.started_at)
+            ended = _iso_epoch(target.ended_at)
+            if not match or started is None:
+                continue
+            session = match.group(1)
+            prev = frontier.get(session)
+            if prev is not None and started < prev - _ANOMALY_OVERLAP_SECONDS:
+                target.tokens = {}
+                target.token_anomaly = True
+            else:
+                # Anomalous spans do not advance the frontier: their (weeks-wide) end
+                # would swallow every later honest commit into the same flag.
+                if ended is not None and ended > frontier.get(session, 0.0):
+                    frontier[session] = ended
+
+
 def collect_commit_stats(repo: GitRepo, ref: str = "HEAD") -> list[CommitStat]:
     """Parse ``git log`` into :class:`CommitStat` records, oldest first."""
     # %x00/%x01 are git's own escapes: a literal NUL is not representable in
@@ -583,6 +638,7 @@ def collect_commit_stats(repo: GitRepo, ref: str = "HEAD") -> list[CommitStat]:
 
     stats.reverse()  # oldest first
     _dedupe_squash_constituents(stats)
+    _flag_token_anomalies(stats)
     return stats
 
 
@@ -848,6 +904,15 @@ def _parse_tokens(metadata: dict[str, str]) -> dict[str, int]:
             tokens[key.removeprefix(_TOKEN_KEY_PREFIX)] = int(value)
         elif key in ("summary_tokens_input", "summary_tokens_output") and value.isdigit():
             tokens["summary_" + key.removeprefix("summary_tokens_")] = int(value)
+    # Heal pre-issue-#14 metadata at read time: commits from before 2026-06-12 recorded
+    # ``input`` as the RAW uncached count, so input < cache_write there — impossible under
+    # the convention (input counts uncached + cache_write) and enough fossil blocks exist
+    # to flip the whole dashboard's aggregate. A legacy block is exactly one where input
+    # < cache_write (a modern block always has input >= cache_write), so restore the
+    # convention by adding cache_write in; modern blocks are never touched.
+    for input_key, cache_key in (("input", "cache_write"), ("subagent_input", "subagent_cache_write")):
+        if tokens.get(cache_key, 0) > tokens.get(input_key, 0):
+            tokens[input_key] = tokens.get(input_key, 0) + tokens[cache_key]
     return tokens
 
 

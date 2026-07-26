@@ -25,6 +25,20 @@ def _isolate_global_config(tmp_path_factory, monkeypatch):
     monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path_factory.mktemp("agitrack-config")))
 
 
+@pytest.fixture(autouse=True)
+def _never_touch_real_daemons(monkeypatch):
+    """No test may see (or signal!) the developer's real daemons.
+
+    ``daemons.list_running`` combines the registry (isolated via AGITRACK_CONFIG_DIR
+    above) with an OS PROCESS-TABLE SCAN — so a test that reaches ``restart_all()``
+    (e.g. through ``restart_agitrack``) would SIGTERM the developer's live dashboards
+    on every run, exactly as it silently did before this guard. Tests of the scan
+    itself bind the real function at import time (see test_daemons.py)."""
+    from agitrack import daemons
+
+    monkeypatch.setattr(daemons, "_scan_daemon_processes", lambda: [])
+
+
 @pytest.fixture
 def runner_factory():
     """Pytest fixture providing the make_runner factory."""

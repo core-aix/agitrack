@@ -195,8 +195,8 @@ def main(argv: list[str] | None = None) -> int:
         "(coverage, AI / human / non-tracked line changes, tokens, per-backend/"
         "model/committer breakdowns, loop detection). Bare `-d` (no argument) means `-d html`: "
         "it starts a filterable, auto-refreshing dashboard as a background daemon on localhost, "
-        "opens it in the browser, and returns to the shell; the daemon stops when "
-        "this terminal closes or via `-d stop`. `status` reports it; `text` prints a "
+        "opens it in the browser, and returns to the shell; the daemon keeps running "
+        "(surviving this terminal) until `-d stop`. `status` reports it; `text` prints a "
         "one-shot report and exits; `export` writes a server-free static demo copy of the "
         "dashboard (see --export-dir) that any static web host can serve",
     )
@@ -219,7 +219,7 @@ def main(argv: list[str] | None = None) -> int:
         "models, lines changed, and the full user↔agent trace behind each change) marked clearly as "
         "a historical backtrace, not live repo status. Bare `--backtrace` (or `--backtrace html`) "
         "starts it as a background daemon on localhost, opens the browser, and returns to the shell "
-        "(it stops when this terminal closes or via `--backtrace stop`); `status` reports it; "
+        "(it keeps running, surviving this terminal, until `--backtrace stop`); `status` reports it; "
         "`text` prints a one-shot report. `commit` REWRITES history onto a NEW branch (`--backtrace-branch`), "
         "annotating the commits that made AI changes with aGiTrack metadata — so a project built "
         "without aGiTrack still gets a tracked history (requires a clean working tree).",
@@ -558,7 +558,7 @@ def main(argv: list[str] | None = None) -> int:
             return backtrace_commit(directory, args.backtrace_branch or "")
         from agitrack.metrics.backtrace import start_backtrace_daemon
 
-        return start_backtrace_daemon(directory, owner_pid=os.getppid())
+        return start_backtrace_daemon(directory)
 
     # aGiTrack can't do anything without git (every path below discovers/commits to a repo).
     # Check once, up front, so a missing git gives a clear, actionable message instead of a
@@ -632,12 +632,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Static demo dashboard written to {out_dir}")
             print("Serve the directory with any static web host (or open index.html directly).")
             return 0
-        # Bare `-d` / `-d html`: start the live dashboard as a background daemon owned
-        # by the launching shell, so the terminal is freed and the daemon dies when
-        # that shell/terminal closes (#110).
+        # Bare `-d` / `-d html`: start the live dashboard as a detached background
+        # daemon (#110). It is NOT bound to this terminal: it keeps serving until
+        # `agitrack -d stop`, and restarts itself after aGiTrack updates.
         from agitrack.metrics import start_dashboard_daemon
 
-        return start_dashboard_daemon(dashboard_repo, owner_pid=os.getppid())
+        return start_dashboard_daemon(dashboard_repo)
 
     if args.background in ("stop", "status"):
         # `agitrack -b stop` / `-b status`: signal or report the background tracker running on

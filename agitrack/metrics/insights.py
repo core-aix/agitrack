@@ -318,9 +318,7 @@ def _correction_loops(ctx: Context) -> Finding | None:
     finding.summary = f"{fraction:.0%} of follow-up turns re-do the previous turn."
     finding.evidence = evidence
     finding.suggestion = (
-        "Front-load the first prompt: name the files involved, the acceptance criteria, and how "
-        "the result will be checked. Ask the agent to verify (run the tests / drive the feature) "
-        "before reporting done — a verified turn rarely needs a correction turn."
+        "Front-load the prompt (files, acceptance criteria) and have the agent verify before reporting done."
     )
     return finding
 
@@ -384,10 +382,7 @@ def _file_rework(ctx: Context) -> Finding | None:
         for quick, ratio, count, path in hotspots[:3]
     ]
     finding.suggestion = (
-        "These files churn in place — lines written one turn, removed the next. For such areas, "
-        "state the full requirement in one prompt (or ask for a plan first), and insist on a test "
-        "or a verification run before the agent reports done — so the next turn builds on the last "
-        "instead of redoing it. (A file simply edited often for DIFFERENT features isn't flagged.)"
+        "State the full requirement in one prompt and insist on a verifying test before the agent reports done."
     )
     return finding
 
@@ -440,9 +435,7 @@ def _context_growth(ctx: Context) -> Finding | None:
         f"({_fmt(late_read)} of {_fmt(total_read)} tokens).",
     ]
     finding.suggestion = (
-        "Start a fresh session per task instead of continuing one long conversation — each turn "
-        "re-reads everything said before it. For work that only needs exploration (find the code, "
-        "read the logs), have the agent delegate to sub-agents so the findings, not the search, "
+        "Start a fresh session per task, and delegate exploration to sub-agents so only findings "
         "enter the main context."
     )
     return finding
@@ -476,9 +469,7 @@ def _session_fragmentation(ctx: Context) -> Finding | None:
         "is rebuilt from cold for most requests instead of being reused.",
     ]
     finding.suggestion = (
-        "Resume the previous session for related follow-ups (aGiTrack resumes it by default) — a "
-        "warm session already knows the code you just discussed. Save fresh sessions for genuinely "
-        "new tasks."
+        "Resume the previous session for related follow-ups; save fresh sessions for genuinely new tasks."
     )
     return finding
 
@@ -511,9 +502,8 @@ def _repeated_prompts(ctx: Context) -> Finding | None:
     finding.summary = f"{len(repeats)} request(s) keep being typed from scratch."
     finding.evidence = [f'Asked {count} times: "{original[:100]}"' for count, original in repeats[:3]]
     finding.suggestion = (
-        "A request typed three or more times is a standing task: capture it as a skill or a "
-        "CLAUDE.md instruction (or a script the agent can run) so one short command replaces "
-        "re-explaining it — and the agent stops re-deriving the steps each time."
+        "Capture a repeatedly typed request as a skill, script, or CLAUDE.md instruction — one "
+        "short command instead of re-explaining."
     )
     return finding
 
@@ -547,9 +537,8 @@ def _low_yield_turns(ctx: Context) -> Finding | None:
     finding.summary = f"{fraction:.0%} of turns burn significant tokens without touching the repo."
     finding.evidence = evidence
     finding.suggestion = (
-        "If these are research/exploration turns, run them through sub-agents or a separate "
-        "session so only the conclusions enter the main conversation. If they are analyses you "
-        "asked for, ask for the short answer first and the detail on demand."
+        "Run exploration through sub-agents or a separate session, or ask for the short answer "
+        "first and detail on demand."
     )
     return finding
 
@@ -596,9 +585,7 @@ def _verification_gap(ctx: Context) -> Finding | None:
     if examples:
         finding.evidence.append(f'For example: "{examples[0]}"')
     finding.suggestion = (
-        "Ask for the test in the same turn as the change, not the turn after — 'add a failing test "
-        "first, then make it pass' costs one turn and removes the correction turn that usually "
-        "follows. It is also what stops the same file being reworked days later."
+        "Ask for the test in the same turn as the change: 'add a failing test first, then make it pass'."
     )
     return finding
 
@@ -633,9 +620,7 @@ def _wide_turns(ctx: Context) -> Finding | None:
         "or reverted as one decision.",
     ]
     finding.suggestion = (
-        "Split the ask: one prompt per behaviour change, letting each land as its own commit. "
-        "Where a change genuinely is repo-wide (a rename, a lint fix), say so explicitly so the "
-        "sweep is separated from the thinking."
+        "Split the ask — one prompt per behaviour change; say explicitly when a repo-wide sweep is intended."
     )
     return finding
 
@@ -681,10 +666,8 @@ def _slow_turns(ctx: Context) -> Finding | None:
             "are fine, so this counts only turns you could have steered."
         )
     finding.suggestion = (
-        "Ask for a plan, or a first slice, before a long autonomous run — a checkpoint you can "
-        "redirect at is cheaper than an hour spent in the wrong direction. Long sweeps are better "
-        "delegated to sub-agents that report back. (Turns spent waiting on a background task are "
-        "already excluded here — a long wait for a build or test run is not the problem.)"
+        "Ask for a plan or a first slice before a long autonomous run; delegate long sweeps to "
+        "sub-agents that report back."
     )
     return finding
 
