@@ -77,7 +77,7 @@ def _banner_html(generated: str, css_class: str, site_root: str) -> str:
     the banner links to."""
     text = (
         "STATIC DEMO: snapshot of the real aGiTrack dashboard with "
-        f"aGiTrack's own history in the 30 days before {generated}."
+        f"aGiTrack's own history in the 30 days before {generated}. "
     )
     return (
         f'<div class="{css_class}">🧪 '
