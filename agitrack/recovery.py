@@ -175,7 +175,11 @@ class RecoveryService:
             return False
         if not exported:
             return False
-        turns = turns_after(exported, state.last_backend_message_id)
+        turns = turns_after(
+            exported,
+            state.last_backend_message_id,
+            marked_at=state.backend_message_marked_at_for(session_id),
+        )
         # The policy gate: a turn that is still in flight (or was interrupted) is
         # NOT committed. `complete` is False for an in-flight turn; a turn with no
         # final response (a bare abort) is excluded too.
