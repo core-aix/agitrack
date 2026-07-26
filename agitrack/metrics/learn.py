@@ -1676,6 +1676,10 @@ footer{margin-top:46px;padding-top:18px;border-top:1px dashed var(--line);color:
   border-bottom:2px solid var(--amber-dim);color:var(--warn);font-size:12.5px;line-height:1.5;
   text-align:center;box-shadow:0 4px 16px rgba(0,0,0,.55)}
 .btbanner code{color:var(--fg);background:var(--panel2);padding:0 5px;border-radius:3px}
+/* Banner links match the banner's amber (identical rule on the dashboard's
+   .backtracebanner) so the demo banner's link reads the same on both pages. */
+.btbanner a{color:var(--warn);text-decoration:none;border-bottom:1px solid var(--amber-dim)}
+.btbanner a:hover{color:var(--ink);background:var(--warn);text-decoration:none}
 footer code{color:var(--fg)}
 [hidden]{display:none !important}
 @media (max-width:600px){.cards{grid-template-columns:1fr}.bubble{max-width:100%}}
