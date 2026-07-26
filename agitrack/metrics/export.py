@@ -56,7 +56,6 @@ from agitrack.metrics.web import (
     shared_sessions_for,
 )
 
-INSTALL_HINT = "pip install agitrack, then run: agitrack -d"
 _REPO_URL = "https://github.com/core-aix/agitrack"
 
 # How much history the demo ships: the dashboard's "last 30 days" range, not all time.
@@ -65,7 +64,7 @@ _DEMO_WINDOW_DAYS = 30
 # What the shims answer for anything the snapshot cannot serve (an unbaked diff, a learn
 # action that needs the live coach). Rendered in place by the page's normal error paths.
 _DEMO_NOTE = (
-    "This is a static demo, so this action needs a live install. Run aGiTrack on your own repo: " + INSTALL_HINT
+    "This static demo doesn't support this action. Install and run aGiTrack on your own repo to see the live dashboard and the learn page's agent-driven features."
 )
 
 
