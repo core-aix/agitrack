@@ -159,6 +159,20 @@ def test_log_pager_has_numbered_pages_first_last_and_a_goto_box(tmp_path):
     assert ".pgload{right:auto;left:0" in html  # floats below-left, not at the filter bar spot
 
 
+def test_backtrace_lines_card_admits_undercount_and_drops_nontracked(tmp_path):
+    # Backtrace line counts are reconstructed from the transcript's edit tool calls only, so
+    # they can miss changes made other ways (shell commands, formatters). The tracked-lines
+    # card says so in backtrace mode, and the non-tracked card/bar — always zero there, since
+    # every reconstructed turn is agent work — is dropped instead of shown as a dead zero.
+    from agitrack.metrics.web import shell_html
+
+    html = shell_html(_seeded(tmp_path))
+    assert "may miss some edits" in html
+    assert "ways a transcript does not record as edits" in html
+    assert 'BACKTRACE ? "" : card("non-tracked lines"' in html
+    assert '(BACKTRACE ? "" : lineRow("Non-tracked"' in html
+
+
 def test_first_paint_never_fetches_the_shared_ref(tmp_path, monkeypatch):
     # The "/" response must not wait on the network: a slow shared-sessions fetch kept the
     # browser on a blank tab for seconds, before any loading screen could even arrive.

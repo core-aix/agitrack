@@ -1215,10 +1215,8 @@ __UPDATE_BANNER__
   <a class="learncta" href="learn" title="Open the learn page">
     <span class="lc-icon">&#127891;</span>
     <span class="lc-text"><b>Learn from these traces.</b>
-    Your coding agent reads how you drive it, spots the knowledge gaps it can actually evidence, and writes
-    small lessons sized to the time and energy you have right now: coding skills that make you work with
-    agents more effectively, plus knowledge of this codebase. Quizzes, hands-on exercises, and your progress
-    tracked automatically.</span>
+    Your agent reads how you drive it and writes small lessons on agent skills and this
+    codebase &mdash; quizzes, exercises, progress tracked.</span>
     <span class="lc-btn">open learn &rarr;</span>
   </a>
   <div id="insights"></div>
@@ -1441,8 +1439,8 @@ function subBarRow(name, value, max, numHtml, min){
     `<div class="bar"><span class="logtag">log</span><i class="log" style="width:${w}%"></i></div>`+
     `<div class="num">${numHtml}</div></div>`;
 }
-function card(label, value, note, amber){
-  return `<div class="card"><div class="label">${esc(label)}</div>`+
+function card(label, value, note, amber, tip){
+  return `<div class="card"${tip?` title="${esc(tip)}"`:""}><div class="label">${esc(label)}</div>`+
     `<div class="value ${amber?"amber":""}">${bigValue(value)}</div><div class="note">${esc(note||"")}</div></div>`;
 }
 // Keep the big display font, but when a plain integer is too long to fit the card (e.g. 100M+
@@ -1535,8 +1533,18 @@ function renderAgg(){
     // coverage" ratio (of turns, not commits — and always near 100%) would both mislead here.
     BACKTRACE ? "" : card("commits", fmt(total), `${fmt(tracked)} via aGiTrack`),
     BACKTRACE ? "" : card("aGiTrack coverage", pct(tracked,total), `${fmt(total-tracked)} non-tracked`, true),
-    card("Tracked AI lines", "+"+fmt(ai.ins), `−${fmt(ai.del)} · ${pct(ai.total, allLines)} of changes`),
-    card("non-tracked lines", "+"+fmt(nt.ins), `−${fmt(nt.del)} · not tracked as AI`, true),
+    // Backtrace line counts come from the transcript's Edit/Write tool calls only — an agent
+    // can also change code in ways a transcript doesn't record as edits (shell commands,
+    // formatters), so the reconstruction is a lower bound. Say so instead of "% of changes"
+    // (meaningless here: every reconstructed line is AI). The non-tracked card is dropped
+    // outright — backtrace turns are all agent work, so it would always read zero.
+    BACKTRACE
+      ? card("Tracked AI lines", "+"+fmt(ai.ins), `−${fmt(ai.del)} · may miss some edits`, false,
+          "Reconstructed from the agent's file-editing tool calls in the transcript. Agents can also "+
+          "change code in ways a transcript does not record as edits (shell commands, formatters, "+
+          "generated files), so not all changed lines are necessarily counted here.")
+      : card("Tracked AI lines", "+"+fmt(ai.ins), `−${fmt(ai.del)} · ${pct(ai.total, allLines)} of changes`),
+    BACKTRACE ? "" : card("non-tracked lines", "+"+fmt(nt.ins), `−${fmt(nt.del)} · not tracked as AI`, true),
     card("output tokens", fmt((tok.output||0)+(tok.subagent_output||0)), `${fmt((tok.input||0)+(tok.subagent_input||0))} input`),
     card("line yield", eff===null?"—":eff.toFixed(1), "AI lines / 1k output tok", true),
   ].join("");
@@ -1546,9 +1554,11 @@ function renderAgg(){
       `<div class="bar"><i class="${amber?"amber":""}" style="width:${allLines?v.total/allLines*100:0}%"></i></div>`+
       `<div class="num"><b>+${fmt(v.ins)}</b> / −${fmt(v.del)}</div></div>`;
   const kc = (label, key, tip) => `<span class="kc" title="${tip}">${label} <b>${kinds(key)}</b></span>`;
+  // Backtrace shows only reconstructed agent turns, so the non-tracked bar (like its
+  // card above) would always sit at zero — drop it there.
   $("lines").innerHTML =
     lineRow("Tracked AI", "agent + covered", ai, false) +
-    lineRow("Non-tracked", "user + plain commits", nt, true) +
+    (BACKTRACE ? "" : lineRow("Non-tracked", "user + plain commits", nt, true)) +
     `<div class="kindcounts"><span class="klabel">commits by kind:</span> `+
       kc("agent", "agent", "Commits aGiTrack made from the agent's work") + " · " +
       kc("covered", "covered", "Backend-made commits an aGiTrack cover commit accounts for") + " · " +
