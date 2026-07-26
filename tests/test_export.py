@@ -111,6 +111,10 @@ def test_export_disables_filters_and_cans_learn_actions(tmp_path, monkeypatch):
     assert "demoflash" in index
     assert 'el.style.pointerEvents = "none"' in index
     assert "stopImmediatePropagation" in index  # reset intercepted ahead of the page handler
+    # The learn page shows the same note in the same amber notice style: its error-path
+    # flashes carrying the demo note are restyled to notices (real errors stay red).
+    learn = (out / "learn" / "index.html").read_text(encoding="utf-8")
+    assert "html.replace('class=\"error\"', 'class=\"notice\"')" in learn
     learn = (out / "learn" / "index.html").read_text(encoding="utf-8")
     # Agent-driven POSTs answer with the install hint; suggest re-serves the profile.
     assert "static demo" in learn
