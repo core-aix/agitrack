@@ -73,7 +73,7 @@ from agitrack.update import Updater, UpdateStatus, restart_agitrack
 
 # Modal state-machines (P6 Stage 2): PromptModal and SelectModal encode the
 # byte-handling logic for free-text and selection popups.
-from agitrack.proxy.modal import PromptModal, SelectModal, _escape_sequence_complete
+from agitrack.proxy.modal import PASTE_END, PASTE_START, PromptModal, SelectModal, _escape_sequence_complete
 
 _SGR_MOUSE_RE = re.compile(rb"\x1b\[<\d+;\d+;\d+[Mm]")
 _SGR_MOUSE_EVENT_RE = re.compile(rb"\x1b\[<(\d+);(\d+);(\d+)([Mm])")
@@ -131,7 +131,9 @@ _KITTY_ESC_KEY_RE = re.compile(rb"\x1b\[27(?:;1)?u")
 # backend instead of opening aGiTrack's exit/menu. modifier 5 = Ctrl (1 + 4).
 _MODIFY_OTHER_KEYS_RE = re.compile(rb"\x1b\[27;(\d+);(\d+)~")
 # A bracketed paste (CSI 200~ ... CSI 201~, possibly split across reads, hence
-# the `|$`): newlines inside it are pasted CONTENT, not prompt submissions.
+# the `|$`): newlines inside it are pasted CONTENT, not prompt submissions. The same
+# delimiters keep pasted text from answering aGiTrack's own popups — see
+# ProxyRunner._track_bracketed_paste and the modal module's docstring.
 _BRACKETED_PASTE_RE = re.compile(rb"\x1b\[200~.*?(?:\x1b\[201~|$)", re.S)
 
 # String-level escape stripper for captured subprocess output (e.g. a backend updater's
@@ -348,10 +350,45 @@ class ProxyInput:
         # Buffer for accumulating partial matches of multi-byte menu key sequences.
         # Only used when menu_key is longer than 1 byte.
         self.menu_key_buffer = bytearray()
+        # Bracketed-paste state. Pasted bytes are content, never keys: with the palette
+        # open a pasted newline would RUN the highlighted command, and a pasted \x03 would
+        # start the exit flow. Set by the CSI 200~/201~ markers in the stream.
+        self.in_paste = False
+        self._paste_marker: bytearray | None = None
+        # Set when the user pressed Ctrl-Z: the runner suspends the whole aGiTrack session
+        # to the shell rather than forwarding the byte (see ProxyRunner._suspend_to_shell).
+        self.suspend_requested = False
         # Context-dependent commands shown ABOVE the fixed COMMANDS (the runner refreshes
         # this when the palette opens). Used to surface "merge" at the top when there are
         # unmerged worktrees the user should rescue.
         self.extra_commands: list[str] = []
+
+    def _observe_paste_marker(self, char: bytes) -> bool:
+        """Track CSI 200~/201~ across bytes; return True while *char* is part of a marker.
+
+        Purely observational — the caller still routes the byte normally, so the markers
+        reach the backend untouched. A partial match that turns out to be some other escape
+        sequence simply resets, and that byte follows the ordinary path.
+        """
+        if self._paste_marker is None:
+            if char != b"\x1b":
+                return False
+            self._paste_marker = bytearray(char)
+            return False  # ESC may equally start a real key sequence: let it flow on
+        candidate = bytes(self._paste_marker) + char
+        if candidate in (PASTE_START, PASTE_END):
+            self.in_paste = candidate == PASTE_START
+            self._paste_marker = None
+            # While capturing, the palette's own escape reader was accumulating these same
+            # bytes; the final "~" never reaches it (this observer consumes it), so clear
+            # the half-built sequence or it would swallow the next real keypress.
+            self.escape_buffer = None
+            return True
+        if PASTE_START.startswith(candidate) or PASTE_END.startswith(candidate):
+            self._paste_marker.extend(char)
+            return self.in_paste  # mid-marker: only swallow when already inside a paste
+        self._paste_marker = None
+        return False
 
     def feed(self, data: bytes) -> tuple[list[bytes], bytes, str | None, bool]:
         forwarded: list[bytes] = []
@@ -359,6 +396,42 @@ class ProxyInput:
         should_exit = False
         for byte in data:
             char = bytes([byte])
+            # Watch for the bracketed-paste delimiters wherever they appear, so `in_paste`
+            # is already right for the bytes that follow them in this very chunk. This is
+            # OBSERVATION only: the marker bytes keep flowing through the normal paths
+            # below, so passthrough to the backend is byte-for-byte unchanged.
+            marker = self._observe_paste_marker(char)
+            if marker or self.in_paste:
+                # Inside a paste every byte is content the user copied, never a key. With the
+                # palette open, printable characters type into it (visible and editable) but a
+                # newline does NOT run the highlighted command and \x03 does not start the exit
+                # flow; with the palette closed this is ordinary passthrough to the agent, the
+                # delimiters included, so the backend still sees the paste exactly as sent.
+                if not self.capturing:
+                    forwarded.append(char)
+                elif marker:
+                    pass  # the delimiters themselves are never typed into the palette
+                elif byte >= 32:
+                    self.buffer.extend(char)
+                    self.selected_index = 0
+                elif char in {b"\r", b"\n"} and self.buffer and not self.buffer.endswith(b" "):
+                    self.buffer.extend(b" ")  # a line break in a one-line field reads as a space
+                self.selected_index = 0 if not marker else self.selected_index
+                continue
+            if char == b"\x1c":
+                # Ctrl-\\ (SIGQUIT). Never forwarded: on a cooked pty it would kill the
+                # backend outright, losing the conversation, and it means nothing to a TUI.
+                continue
+            if char == b"\x1a" and self.capturing:
+                continue  # Ctrl-Z is not text: never type a control byte into the palette
+            if char == b"\x1a":
+                # Ctrl-Z. Raw mode means the kernel does not turn this into SIGTSTP, so it
+                # would otherwise be forwarded to the backend as a plain byte — and Claude
+                # answers it by tearing down its UI and waiting for a resume that can never
+                # arrive on a pty it does not control, leaving a blank, dead screen. aGiTrack
+                # owns the terminal, so aGiTrack does the suspending.
+                self.suspend_requested = True
+                continue
             if char == b"\x03":
                 if self.capturing:
                     # Inside aGiTrack's own command palette, Ctrl-C cancels it
@@ -485,6 +558,11 @@ class ProxyRunner:
     # Per-session flag (a Session.FIELDS entry, delegated like the others); declared here
     # so mypy can resolve its type at the read sites above its dynamic attachment.
     _pending_merge_prompt: bool
+
+    # Bracketed-paste tracking (_track_bracketed_paste). Class-level defaults so instances
+    # built by for_testing(), which bypasses __init__, carry them too.
+    _in_bracketed_paste: bool = False
+    _paste_scan_tail: bytes = b""
 
     # Defaults for the tunable timings; overridden per-instance from the global
     # config in __init__ (see GlobalConfig.timings). Kept as class constants so
@@ -750,6 +828,11 @@ class ProxyRunner:
         self.last_parse_finish = 0.0
         self.passthrough_prompt = bytearray()
         self.passthrough_escape: bytearray | None = None
+        # Whether the terminal is mid bracketed-paste right now, tracked over every stdin
+        # read so a popup opened DURING a paste knows the bytes it is about to see are
+        # pasted content rather than the user answering it (_track_bracketed_paste).
+        self._in_bracketed_paste = False
+        self._paste_scan_tail = b""
         self.pending_forwarded: list[bytes] | None = None
         self.pending_prompt_text = ""
         # Session ids that existed before aGiTrack launched a fresh backend session,
@@ -2677,11 +2760,22 @@ class ProxyRunner:
         if self._update_check_at and now - self._update_check_at < self.UPDATE_CHECK_SECONDS:
             return
         self._update_check_at = now
-        updater = self._updater
 
         def worker() -> None:
             try:
-                self._update_worker_result = updater.check()
+                # Self-update rather than nag: keeping the INSTALLATION current is not a
+                # decision worth interrupting someone for. The session keeps running on the
+                # code it loaded — restarting mid-conversation would be the interruption —
+                # so this only installs, and the reminder below asks for a restart.
+                # attempt_self_update holds the cross-process lock, so several aGiTrack
+                # instances never upgrade the same install at once; on_status hands us the
+                # check it already ran so we don't pay for a second one.
+                from agitrack.update.selfupdate import attempt_self_update
+
+                def _status(status) -> None:
+                    self._update_worker_result = status
+
+                self._self_update_record = attempt_self_update(debug=self._debug, on_status=_status)
             except Exception as error:  # never let a check crash the worker
                 self._debug(f"update check failed: {error!r}")
                 self._update_worker_result = None
@@ -2713,18 +2807,50 @@ class ProxyRunner:
                 clear_update_marker(self.base_repo.repo)
         except Exception as error:
             self._debug(f"update marker write failed: {error!r}")
+        record = getattr(self, "_self_update_record", None)
+        if record is not None and record.needs_user and not self._update_offered:
+            # aGiTrack could not install this one itself (Homebrew, an MSI, a Windows pip
+            # install): say so once, with the command that does it.
+            self._update_offered = True
+            detail = f" {record.instructions}" if record.instructions else ""
+            self._set_message(
+                f"aGiTrack {record.latest} is available but this installation has to be updated by you.{detail}",
+                seconds=15.0,
+            )
+            self._render()
+            return
+        if self._running_code_is_stale() and not self._update_offered:
+            # A self-update (ours or another instance's) landed newer code on disk while
+            # this session kept running on the old one. Remind, never restart.
+            self._update_offered = True
+            self._set_message(
+                "aGiTrack updated itself in the background. Restart aGiTrack when convenient to load "
+                f"the new version — {self._menu_label()} → 'update' restarts it once your sessions finish.",
+                seconds=15.0,
+            )
+            self._render()
+            return
         if result.available and not self._update_offered and not self._manual_update_pending():
-            # First time we have seen this update: prompt the user (a status-bar
-            # notice pointing at the `update` command, so we don't seize the
-            # screen mid-keystroke). Suppressed when a manual update is already
-            # pending (a prior automatic attempt failed) — that user is reminded
-            # once at startup instead of being nagged here every check.
+            # Still worth a pointer when an update exists that we have not installed yet
+            # (e.g. the lock was held by another instance this round).
             self._update_offered = True
             self._set_message(
                 f"{result.message}\n{self._menu_label()} → 'update' to install it when your sessions finish.",
                 seconds=12.0,
             )
             self._render()
+
+    def _running_code_is_stale(self) -> bool:
+        """Whether the code on disk has moved past what this process loaded — i.e. an
+        update landed underneath a running session (see selfupdate: daemons restart
+        themselves, sessions are only reminded)."""
+        try:
+            from agitrack.update.restart import RUNNING_FINGERPRINT, disk_fingerprint
+
+            current = disk_fingerprint()
+            return bool(current) and bool(RUNNING_FINGERPRINT) and current != RUNNING_FINGERPRINT
+        except Exception:
+            return False
 
     def _ready_for_update(self) -> bool:
         # "All sessions finished and commits are in": nothing is mid-turn,
@@ -7822,6 +7948,10 @@ class ProxyRunner:
         prev_palette = (bytes(self.input.buffer), self.input.selected_index) if was_capturing else None
         forwarded, local_echo, command, should_exit = self.input.feed(data)
         self._debug(f"feed result: forwarded={forwarded!r} command={command!r} capturing={self.input.capturing}")
+        if getattr(self.input, "suspend_requested", False):
+            self.input.suspend_requested = False
+            self._suspend_to_shell()
+            return "continue"
         if self.input.capturing and not was_capturing:
             # The Ctrl-G palette just opened: surface a top-level "merge" command when
             # there is unmerged worktree work, so the user is reminded to rescue it
@@ -9304,6 +9434,26 @@ class ProxyRunner:
                 self._render_pending = True  # repaint the restored palette over the closed dialog
 
     def _run_modal_loop(self, modal: "PromptModal | SelectModal") -> "str | None":
+        # A paste already under way when this popup opened sent its CSI 200~ to the backend,
+        # so the popup would see only unmarked content; carry the state in (the modal clears
+        # it on the closing marker).
+        if self._in_bracketed_paste:
+            modal.in_paste = True
+        try:
+            return self._run_modal_body(modal)
+        finally:
+            # Text the user pasted while the popup was up was meant for the agent, not for
+            # the popup — hand it over now rather than dropping it. The bytes are replayed
+            # exactly as they arrived (markers included), so together with the opening marker
+            # the backend already received, it reads one coherent paste.
+            pasted = bytes(getattr(modal, "pasted", b""))
+            if pasted and self.active is not None:
+                try:
+                    self.active.process.write(pasted)
+                except Exception:
+                    pass  # a dead/replaced backend must never break closing a dialog
+
+    def _run_modal_body(self, modal: "PromptModal | SelectModal") -> "str | None":
         needs_render = True
         while True:
             if self._exit_menu_requested:
@@ -9322,7 +9472,7 @@ class ProxyRunner:
                 needs_render = False
             data = self._popup_read_input()
             menu_key = getattr(self.input, "menu_key", b"\x07")
-            if menu_key and menu_key in data:
+            if menu_key and menu_key in data and not getattr(modal, "in_paste", False):
                 # The menu key while a popup is open closes the WHOLE menu (a toggle), matching
                 # the palette. Treat it as a cancel, but flag the full-close so the unwind above
                 # doesn't stop one level up.
@@ -9552,28 +9702,27 @@ class ProxyRunner:
         candidates = untracked if include_declined else [path for path in untracked if path not in declined]
         if not candidates:
             return "No untracked files to review."
-        # Cap the listed files to the terminal height so the question and the input
-        # line (which the modal draws LAST) are never pushed off the popup. The
-        # decision is all-or-none, so a preview plus "…and N more" is enough.
-        limit = max(5, self.rows - 10)
-        preview = candidates[:limit]
-        listing = "\n".join(preview)
-        if len(candidates) > len(preview):
-            listing += f"\n…and {len(candidates) - len(preview)} more"
-        answer = self._prompt_popup(
+        # The file list goes in the modal's detail pane, which windows it to the terminal
+        # height and scrolls with PgUp/PgDn — so every file stays reachable.
+        listing = "\n".join(candidates)
+        # A CHOICE, not typed text: the answer decides whether files enter the commit, and a
+        # typed "[y/N]" box accepts anything — a stray keystroke, or an answer to a question
+        # the user misread, silently took the default. Up/Down + Enter can only ever return
+        # one of the offered options (Esc still cancels).
+        stage_label = f"Stage all {len(candidates)} file(s)"
+        answer = self._select_popup(
             "Untracked Files",
-            f"Stage all {len(candidates)} new file(s)? [y/N]\n{listing}",
+            [stage_label, "Leave them unstaged"],
+            detail=listing.splitlines(),
         )
         if answer is None:
             return "Cancelled."
-        answer = answer.strip().lower()
-        if answer in {"y", "yes"}:
+        if answer == stage_label:
             repo.stage_paths(candidates)
             state.remove_declined(candidates)
             return f"Staged {len(candidates)} untracked file(s)."
-        else:
-            state.add_declined(candidates)
-            return f"Left {len(candidates)} untracked file(s) unstaged."
+        state.add_declined(candidates)
+        return f"Left {len(candidates)} untracked file(s) unstaged."
 
     def _create_agent_commit_from_turns_popup(
         self,
@@ -9734,6 +9883,11 @@ class ProxyRunner:
                 # carries attribution but not the turn's trace/tokens, so it is still uncovered.
                 if is_fully_tracked_message(self.repo.commit_message(sha)):
                     uncovered = []
+                elif self.repo.arrived_from_elsewhere(sha):
+                    # Merged/pulled in rather than written here (a `git merge main`, a PR
+                    # merged on GitHub): not the agent's work, so never claim it — and it
+                    # accounts for nothing, so it must not reset the list either.
+                    continue
                 else:
                     uncovered.append(sha)
             return uncovered
@@ -12044,6 +12198,43 @@ class ProxyRunner:
     # Host-terminal operations route through the platform host object (POSIX termios /
     # Windows Win32 console) once run() created it; before that (unit tests construct a
     # runner without run()), they fall back to the POSIX TerminalHost mixin directly.
+    def _suspend_to_shell(self) -> None:
+        """Ctrl-Z: stop aGiTrack like any other foreground job, and come back intact.
+
+        The terminal is handed back the way exiting hands it back, then this process stops
+        itself; the shell reports "Stopped" and takes over. ``fg`` continues execution right
+        here, so the inverse — alternate screen, raw mode, mouse reporting — is re-asserted
+        and the screen repainted from aGiTrack's own model. The backend keeps running
+        throughout and never learns any of this happened, which is the point: it is not
+        asked to suspend itself on a pty where nothing could resume it.
+
+        Windows has no job control, so there Ctrl-Z stays a byte for the backend.
+        """
+        if sys.platform == "win32":
+            return
+        import signal as _signal
+
+        try:
+            if self._host is not None:
+                self._host.suspend_host()
+            else:
+                TerminalHost.suspend_host(self)
+        except Exception as error:
+            self._debug(f"suspend: restoring the terminal failed: {error!r}")
+        try:
+            os.kill(os.getpid(), _signal.SIGSTOP)  # returns when the shell resumes us
+        except Exception as error:
+            self._debug(f"suspend: stopping failed: {error!r}")
+        try:
+            if self._host is not None:
+                self._host.resume_host()
+            else:
+                TerminalHost.resume_host(self)
+        except Exception as error:
+            self._debug(f"resume: retaking the terminal failed: {error!r}")
+        self._render_pending = True
+        self._render()
+
     def _pause_child_ui(self) -> None:
         if self._host is not None:
             self._host.pause_child_ui()
@@ -12128,7 +12319,29 @@ class ProxyRunner:
         # hard-kill (needed when a leak has broken Ctrl-C and graceful exit isn't possible).
         if data:
             self._raw_capture(">", data)
+            self._track_bracketed_paste(data)
         return data
+
+    def _track_bracketed_paste(self, data: bytes) -> None:
+        """Follow the terminal's bracketed-paste state across reads.
+
+        Every popup this runner opens consumes keystrokes, so it must be able to tell a
+        paste from typing: the newlines inside a paste are content, and answering a dialog
+        with them silently picked its default while the user was only pasting a prompt at
+        the agent. The modals recognise the markers in their own input, but a paste already
+        in flight when a popup opens delivers CSI 200~ to the BACKEND and the popup sees
+        only the tail — hence this state, which seeds each modal (see _run_modal_loop).
+
+        Reads are 32 bytes at a time, so a marker can straddle two of them: the last few
+        bytes of each read are carried over and re-scanned with the next.
+        """
+        scan = self._paste_scan_tail + data
+        start, end = scan.rfind(PASTE_START), scan.rfind(PASTE_END)
+        if start > end:
+            self._in_bracketed_paste = True
+        elif end > start:
+            self._in_bracketed_paste = False
+        self._paste_scan_tail = scan[-(len(PASTE_START) - 1) :]
 
 
 # ---------------------------------------------------------------------------

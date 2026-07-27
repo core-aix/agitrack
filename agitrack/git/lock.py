@@ -109,7 +109,20 @@ class RepoLock:
         try:
             os.ftruncate(fd, 0)
             os.lseek(fd, 0, os.SEEK_SET)  # the lock may have left the fd seeked elsewhere (Windows)
-            os.write(fd, json.dumps({"pid": os.getpid(), "started_at": time.time()}).encode())
+            # The fingerprint of the CODE this holder is running (source commit or wheel
+            # version). A self-update installs newer code underneath a live session on
+            # purpose — restarting it would interrupt the conversation — so the dashboard
+            # compares this against what is on disk to tell the user their session is
+            # stale. Best-effort: an unavailable fingerprint just omits the field.
+            record: dict[str, object] = {"pid": os.getpid(), "started_at": time.time()}
+            try:
+                from agitrack.update.restart import RUNNING_FINGERPRINT
+
+                if RUNNING_FINGERPRINT:
+                    record["fingerprint"] = RUNNING_FINGERPRINT
+            except Exception:
+                pass
+            os.write(fd, json.dumps(record).encode())
         except OSError:
             pass  # informational only; the lock is what guards, not the file content
         self._fd = fd

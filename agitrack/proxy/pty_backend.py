@@ -278,6 +278,31 @@ else:
             self.close_master()
             self.child_pid = None
 
+    def _harden_child_tty() -> None:
+        """Stop the pty's line discipline from turning FORWARDED BYTES into signals.
+
+        A fresh pty starts cooked: ISIG on, IXON on. Any byte aGiTrack passes through would
+        then be interpreted by the kernel before the backend ever sees it — 0x03/0x1c/0x1a
+        raising SIGINT/SIGQUIT/SIGTSTP on the backend's process group, 0x13 (XOFF) freezing
+        its output with no way to send the XON that would release it. On a pty aGiTrack
+        owns, and whose foreground job the user cannot reach from a shell, any of those
+        leaves a session that cannot be recovered.
+
+        The backend is a full-screen TUI that reads keys itself and puts its own tty in raw
+        mode anyway; this only closes the window before it does so (and after it restores
+        the tty, e.g. while it shells out). aGiTrack never forwards Ctrl-C or Ctrl-Z in the
+        first place — they drive its own exit and suspend — so nothing is lost here.
+        """
+        try:
+            import termios
+
+            attrs = termios.tcgetattr(0)
+            attrs[0] &= ~(termios.IXON | termios.IXOFF | termios.IXANY)  # iflag: no flow-control stalls
+            attrs[3] &= ~termios.ISIG  # lflag: no signals raised from input bytes
+            termios.tcsetattr(0, termios.TCSANOW, attrs)
+        except Exception:
+            pass  # a backend that cannot be hardened still runs; this is defence in depth
+
     def spawn_pty(
         command: list[str],
         cwd: str,
@@ -289,6 +314,7 @@ else:
         pid, fd = _pty.fork()
         if pid == 0:
             try:
+                _harden_child_tty()
                 os.chdir(cwd)
                 if extra_env:
                     os.environ.update(extra_env)
