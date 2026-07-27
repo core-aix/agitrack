@@ -18,9 +18,32 @@ Action tuples returned by ``feed()``:
 ``_escape_sequence_complete`` lives HERE as the single source of truth;
 runner.py imports it from this module (modal.py must not import runner —
 runner imports the modal classes, so the dependency points this way).
+
+Bracketed paste
+---------------
+A terminal with DECSET 2004 on (every backend enables it for its own input box)
+wraps pasted text in ``CSI 200~`` … ``CSI 201~``. The newlines inside are pasted
+CONTENT, not keypresses — but a modal that reads them as Enter answers itself, so
+pasting a multi-line prompt at the agent while a popup happened to be open silently
+picked the popup's default. Both modals therefore track the markers and never let
+pasted bytes act as keys:
+
+* ``SelectModal`` — a paste can never be a menu choice, so the raw bytes are
+  collected in ``pasted`` for the caller to replay to the backend (the paste was
+  meant for the agent), and nothing is selected, confirmed or cancelled.
+* ``PromptModal`` — the user IS being asked to type, so pasted text lands in the
+  field (newlines become spaces, since the field is one line) but never submits it.
+
+``in_paste`` can be seeded True at construction: a paste already in flight when the
+popup opens delivers its opening marker to the backend, so the modal only ever sees
+the tail. The runner tracks that state at its single stdin read point.
 """
 
 from __future__ import annotations
+
+# CSI 200~ / CSI 201~ — the terminal's bracketed-paste delimiters.
+PASTE_START = b"\x1b[200~"
+PASTE_END = b"\x1b[201~"
 
 
 def _escape_sequence_complete(sequence: bytes) -> bool:
@@ -66,6 +89,7 @@ class PromptModal:
         default: str = "",
         detail: list[str] | None = None,
         viewport_rows: int | None = None,
+        in_paste: bool = False,
     ) -> None:
         self.title = title
         self.prompt = prompt
@@ -76,6 +100,10 @@ class PromptModal:
         self.viewport_rows = viewport_rows
         self.detail_scroll = 0
         self._escape_buffer: bytearray | None = None
+        # Bracketed-paste state (see the module docstring). Pasted text is typed into the
+        # field, never submitted; `pasted` stays empty here because the content is consumed.
+        self.in_paste = in_paste
+        self.pasted = bytearray()
 
     def _detail_window(self) -> int:
         """How many detail lines fit at once, leaving room for the title, prompt, input line,
@@ -133,7 +161,13 @@ class PromptModal:
             if self._escape_buffer is not None:
                 self._escape_buffer.extend(char)
                 sequence = bytes(self._escape_buffer)
-                if sequence == b"\x1b[5~":  # PageUp — scroll the detail list up
+                if sequence == PASTE_START:  # pasted text starts: it is content, not keys
+                    self.in_paste = True
+                    self._escape_buffer = None
+                elif sequence == PASTE_END:
+                    self.in_paste = False
+                    self._escape_buffer = None
+                elif sequence == b"\x1b[5~":  # PageUp — scroll the detail list up
                     self.detail_scroll = max(0, self.detail_scroll - max(1, self._detail_window() - 1))
                     self._escape_buffer = None
                     changed = True
@@ -145,12 +179,26 @@ class PromptModal:
                     self._escape_buffer = None
                 continue
 
-            if char == b"\x03":
-                return ("exit", None)
-
             if char == b"\x1b":
                 self._escape_buffer = bytearray(char)
                 continue
+
+            # Inside a paste every byte is text the user copied, so it is typed into the
+            # field and NOTHING acts as a key: a pasted newline must not submit the answer
+            # (it becomes a space — the field is a single line) and a pasted \x03 must not
+            # start the exit flow.
+            if self.in_paste:
+                if char in {b"\r", b"\n"}:
+                    if not self.value.endswith(" "):
+                        self.value += " "
+                        changed = True
+                elif byte >= 32:
+                    self.value += char.decode(errors="ignore")
+                    changed = True
+                continue
+
+            if char == b"\x03":
+                return ("exit", None)
 
             if char in {b"\r", b"\n"}:
                 return ("done", self.value)
@@ -193,6 +241,7 @@ class SelectModal:
         *,
         detail: list[str] | None = None,
         viewport_rows: int | None = None,
+        in_paste: bool = False,
     ) -> None:
         self.title = title
         self.options = options
@@ -206,6 +255,10 @@ class SelectModal:
         if self.options and self._is_separator(self.options[self.selected]):
             self._advance(1)
         self._escape_buffer: bytearray | None = None
+        # Bracketed-paste state (see the module docstring). A paste is never a menu choice,
+        # so its raw bytes are collected here for the caller to replay to the backend.
+        self.in_paste = in_paste
+        self.pasted = bytearray()
 
     @staticmethod
     def _is_separator(option: str) -> bool:
@@ -300,7 +353,20 @@ class SelectModal:
             if self._escape_buffer is not None:
                 self._escape_buffer.extend(char)
                 sequence = bytes(self._escape_buffer)
-                if sequence == b"\x1b[A":
+                if sequence == PASTE_START:  # pasted text starts: it is content, not keys
+                    self.in_paste = True
+                    self.pasted.extend(sequence)
+                    self._escape_buffer = None
+                elif sequence == PASTE_END:
+                    self.in_paste = False
+                    self.pasted.extend(sequence)
+                    self._escape_buffer = None
+                elif self.in_paste:
+                    # An escape sequence inside the paste is pasted content too.
+                    if _escape_sequence_complete(sequence):
+                        self.pasted.extend(sequence)
+                        self._escape_buffer = None
+                elif sequence == b"\x1b[A":
                     self._advance(-1)
                     self._escape_buffer = None
                     changed = True
@@ -320,12 +386,19 @@ class SelectModal:
                     self._escape_buffer = None
                 continue
 
-            if char == b"\x03":
-                return ("exit", None)
-
             if char == b"\x1b":
                 self._escape_buffer = bytearray(char)
                 continue
+
+            # Inside a paste nothing acts as a key — a pasted newline must not answer the
+            # menu, and a pasted \x03 must not start the exit flow. The bytes are kept so
+            # the caller can hand the paste to the backend, which is where it was headed.
+            if self.in_paste:
+                self.pasted.extend(char)
+                continue
+
+            if char == b"\x03":
+                return ("exit", None)
 
             if char in {b"\r", b"\n"}:
                 return ("done", self.options[self.selected])

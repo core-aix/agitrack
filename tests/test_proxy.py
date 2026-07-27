@@ -10127,3 +10127,100 @@ def test_a_storm_of_reads_never_marks_the_worktree_dirty():
     # ...and one genuine write still gets through immediately afterwards.
     handler.on_any_event(_Event("modified", "/repo/paper/main.tex"))
     assert changed.is_set() is True
+
+
+def test_pasted_newlines_never_answer_a_popup():
+    """Pasting multi-line text at the agent must not answer aGiTrack's own dialogs.
+
+    A terminal wraps a paste in CSI 200~ … CSI 201~. Without honouring that, the first
+    newline inside the paste read as Enter and the popup confirmed itself (picking its
+    default) while the user was only pasting a prompt for the backend.
+    """
+    import types
+
+    from agitrack.proxy.modal import PASTE_END, PASTE_START, SelectModal
+
+    modal = SelectModal("commit these changes?", ["yes", "no"], viewport_rows=10)
+    action, value = modal.feed(PASTE_START + b"first line\nsecond line\n" + PASTE_END)
+    assert (action, value) == ("noop", None)  # nothing selected, nothing confirmed
+    # The paste is preserved for the caller to hand to the backend, byte for byte.
+    assert bytes(modal.pasted) == PASTE_START + b"first line\nsecond line\n" + PASTE_END
+    # A real Enter after the paste still answers normally.
+    assert modal.feed(b"\r") == ("done", "yes")
+
+    # A pasted \x03 must not start the exit flow either.
+    modal2 = SelectModal("pick", ["a", "b"], viewport_rows=10)
+    assert modal2.feed(PASTE_START + b"x\x03y" + PASTE_END)[0] == "noop"
+    assert modal2.feed(b"\x03") == ("exit", None)  # a real Ctrl-C still does
+
+    # A text prompt is different: the user IS being asked to type, so pasted text lands in
+    # the field (one line, so newlines become spaces) but still never submits it.
+    from agitrack.proxy.modal import PromptModal
+
+    prompt = PromptModal("name?", "session name", viewport_rows=10)
+    assert prompt.feed(PASTE_START + b"alpha\nbeta" + PASTE_END)[0] == "redraw"
+    assert prompt.value == "alpha beta"
+    assert prompt.feed(b"\r") == ("done", "alpha beta")
+
+    # The race: the paste was already in flight when the popup opened, so its opening
+    # marker went to the backend and the popup only ever sees the tail. The runner tracks
+    # that at its stdin read point and seeds the modal, so the tail is still not keys.
+    runner = make_runner()
+    runner.input = types.SimpleNamespace(menu_key=b"\x07")
+    runner._set_message = lambda *a, **k: None
+    runner._clear_message = lambda: None
+    runner._render = lambda: None
+    written: list[bytes] = []
+    runner.active.process = types.SimpleNamespace(write=written.append)
+    runner._track_bracketed_paste(PASTE_START + b"already typing")
+    assert runner._in_bracketed_paste is True
+    reads = iter([b"tail of the paste\n", PASTE_END, b"\r"])
+    runner._popup_read_input = lambda: next(reads)
+    assert runner._run_modal_inline(SelectModal("commit?", ["yes", "no"], viewport_rows=10)) == "yes"
+    # …and what was pasted mid-dialog is handed to the backend rather than dropped.
+    assert b"".join(written) == b"tail of the paste\n" + PASTE_END
+
+
+def test_bracketed_paste_state_survives_a_split_read():
+    """The markers are 6 bytes and stdin is read in 32-byte chunks, so a marker can
+    straddle two reads; the tail of each read is re-scanned with the next."""
+    from agitrack.proxy.modal import PASTE_END, PASTE_START
+
+    runner = make_runner()
+    runner._track_bracketed_paste(b"typing" + PASTE_START[:3])
+    assert runner._in_bracketed_paste is False  # incomplete marker: not a paste yet
+    runner._track_bracketed_paste(PASTE_START[3:] + b"pasted text")
+    assert runner._in_bracketed_paste is True
+    runner._track_bracketed_paste(PASTE_END[:2])
+    assert runner._in_bracketed_paste is True
+    runner._track_bracketed_paste(PASTE_END[2:])
+    assert runner._in_bracketed_paste is False
+
+
+def test_pasted_newlines_never_run_a_palette_command():
+    """Same hazard in the Ctrl-G palette: a pasted newline would RUN the highlighted
+    command. Pasted text types into the palette (visible and editable) but never submits,
+    and with the palette closed the paste passes through to the backend untouched."""
+    from agitrack.proxy.modal import PASTE_END, PASTE_START
+
+    palette = ProxyInput()
+    palette.feed(b"\x07")  # Ctrl-G opens it
+    _, _, command, should_exit = palette.feed(PASTE_START + b"first line\nsecond\n" + PASTE_END)
+    assert command is None and should_exit is False
+    assert bytes(palette.buffer) == b"first line second "  # typed in, newlines as spaces
+    assert palette.in_paste is False  # the closing marker cleared the state
+    assert palette.feed(b"\r")[2] is not None  # a real Enter still runs the selection
+
+    # Palette closed: every byte (delimiters included) reaches the backend verbatim, and a
+    # \x03 inside the pasted text does not start the exit flow.
+    passthrough = ProxyInput()
+    paste = PASTE_START + b"text\x03more\n" + PASTE_END
+    forwarded, _, _, should_exit = passthrough.feed(paste)
+    assert b"".join(forwarded) == paste
+    assert should_exit is False
+    assert passthrough.feed(b"\x03")[3] is True  # a real Ctrl-C still exits
+
+    # A real arrow key is untouched by the marker watcher.
+    arrows = ProxyInput()
+    assert b"".join(arrows.feed(b"\x1b[A")[0]) == b"\x1b[A"
+    assert arrows.in_paste is False
