@@ -733,10 +733,21 @@ class BackgroundRunner:
     def _run_update_check(self) -> None:
         try:
             from agitrack.update.marker import clear_update_marker, write_update_marker
-            from agitrack.update.updater import Updater
+            from agitrack.update.selfupdate import attempt_self_update
 
-            status = Updater().check()
-            if not status.ok:
+            # A daemon has no conversation to interrupt, so it INSTALLS rather than just
+            # recording that an update exists — behind the cross-process lock, so it never
+            # races the TUI or another daemon doing the same. Whatever it installs is picked
+            # up by this daemon's own restart watcher (update/restart.py). The marker below
+            # still records anything left for the user, which is what the dashboards read.
+            status = None
+
+            def _status(value) -> None:
+                nonlocal status
+                status = value
+
+            attempt_self_update(debug=self._debug, on_status=_status)
+            if status is None or not status.ok:
                 return
             if status.available:
                 write_update_marker(

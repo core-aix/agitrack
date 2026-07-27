@@ -38,6 +38,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -122,20 +123,47 @@ def updated_fingerprint() -> str | None:
     return None
 
 
+# How often a daemon looks for a newer aGiTrack to install. Far slower than the
+# fingerprint poll below (that one only reads a file): this one may hit the network.
+SELF_UPDATE_SECONDS = 1800.0
+
+
 def watch_for_update(
     stop: threading.Event,
     on_update: Callable[[str], None],
     *,
     interval: float = CHECK_SECONDS,
     read_version: Callable[[], str | None] = updated_fingerprint,
+    self_update: bool = True,
+    self_update_interval: float = SELF_UPDATE_SECONDS,
 ) -> threading.Thread:
     """Start the watcher thread: calls ``on_update(new_fingerprint)`` ONCE, after the
     same new on-disk fingerprint has been seen on two consecutive checks (see module
-    docstring). ``stop`` ends the watch (shared with the daemon's own shutdown event)."""
+    docstring). ``stop`` ends the watch (shared with the daemon's own shutdown event).
+
+    The same thread also periodically SELF-UPDATES (``self_update``). Watching alone would
+    only react to someone else installing a new version, so a machine where the only
+    aGiTrack running is a dashboard or backtrace daemon would never update at all. The
+    attempt is lock-guarded, so when a TUI or another daemon is already updating this one
+    simply skips the round.
+    """
 
     def _loop() -> None:
         candidate: str | None = None
+        last_self_update = 0.0
         while not stop.wait(interval):
+            if self_update:
+                now = time.monotonic()
+                # First pass runs immediately: a daemon started on a stale install should
+                # not wait half an hour to catch up.
+                if last_self_update == 0.0 or now - last_self_update >= self_update_interval:
+                    last_self_update = now
+                    try:
+                        from agitrack.update.selfupdate import attempt_self_update
+
+                        attempt_self_update()
+                    except Exception:
+                        pass  # a daemon must keep serving whatever an update attempt does
             fresh = read_version()
             if fresh is None:
                 candidate = None
