@@ -256,7 +256,12 @@ def _shim(*, base: str, files_index: dict[str, int], learn: bool, site_root: str
     if (LEARN && typeof window.flash === "function") {{
       var pageFlash = window.flash;
       window.flash = function(html){{
-        if (typeof html === "string" && html.indexOf(NOTE) >= 0) html = html.replace('class="error"', 'class="notice"');
+        // EVERY flash here is amber. In a frozen snapshot there is no actionable failure —
+        // whatever the page was about to report in red means the same thing, "this needs a
+        // live install" — so the bottom note must not alternate between red and amber.
+        // (Matching the note's TEXT is not enough: the page HTML-escapes it, so "doesn't"
+        // becomes "doesn&#39;t" and the raw note never matches.)
+        if (typeof html === "string") html = html.replace(/class="error"/g, 'class="notice"');
         return pageFlash(html);
       }};
     }}
