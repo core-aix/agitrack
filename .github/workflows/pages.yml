@@ -2,8 +2,12 @@
 # a freshly generated static demo dashboard (`agitrack -d export`) under /dashboard/, so the
 # demo is the repository's real, current history on every push to main.
 #
-# Requires the repository's Pages settings to use the "GitHub Actions" source (not the
-# legacy main:/docs branch build); actions/configure-pages switches it on first run.
+# Requires the repository's Pages settings to use the "GitHub Actions" source. If they are
+# ever switched to the legacy main:/docs branch build, THAT builder publishes docs/ alone and
+# silently drops the generated /dashboard/ demo (it has happened) - and because it shares this
+# workflow's "pages" concurrency group it can even deploy last and overwrite this run. The
+# "Enforce the workflow build source" step below therefore re-asserts it on every deploy;
+# actions/configure-pages only enables Pages, it does not flip an existing legacy source.
 name: pages
 
 on:
@@ -45,6 +49,27 @@ jobs:
           agitrack -d export --export-dir "$RUNNER_TEMP/site/dashboard"
       - name: Assemble the site (docs + demo dashboard)
         run: cp -R docs/. "$RUNNER_TEMP/site/"
+      # Fail here rather than deploying a site whose demo silently vanished (a failed or
+      # partial export would otherwise publish the landing pages with dead demo links).
+      - name: Verify the demo is in the site
+        run: |
+          test -f "$RUNNER_TEMP/site/dashboard/index.html"
+          test -f "$RUNNER_TEMP/site/dashboard/learn/index.html"
+          test -f "$RUNNER_TEMP/site/index.html"
+      - name: Enforce the workflow build source
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          current=$(gh api "repos/${{ github.repository }}/pages" --jq .build_type 2>/dev/null || echo "")
+          if [ "$current" = "workflow" ]; then
+            echo "Pages already builds from this workflow."
+          else
+            echo "::warning::Pages build_type is '${current:-unset}' (the legacy branch build \
+          publishes docs/ only and drops /dashboard/); switching it to 'workflow'."
+            gh api -X PUT "repos/${{ github.repository }}/pages" -f build_type=workflow \
+              || echo "::error::could not switch the Pages source to 'workflow' - set it by hand \
+          under Settings > Pages > Build and deployment > Source: GitHub Actions."
+          fi
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
