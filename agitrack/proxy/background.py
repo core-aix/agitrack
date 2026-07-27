@@ -1103,7 +1103,11 @@ class BackgroundRunner:
         except Exception as error:
             self._debug(f"committed-away detection failed: {error!r}")
             return []
-        untracked = [sha for sha in commits if not self._is_agitrack_tracked(sha)]
+        # Commits that arrived from another branch (a merge/pull/PR) are not the agent's,
+        # however they came to sit between the watermark and HEAD.
+        untracked = [
+            sha for sha in commits if not self._is_agitrack_tracked(sha) and not self.repo.arrived_from_elsewhere(sha)
+        ]
         if not untracked or untracked[-1] != head:
             # Nothing new to cover, or a tracked commit sits at HEAD (can't cover onto it) — just
             # advance the watermark so we don't reconsider these commits every cycle.
@@ -1131,7 +1135,9 @@ class BackgroundRunner:
         except Exception as error:
             self._debug(f"uncovered agent commit check failed: {error!r}")
             return []
-        return [sha for sha in commits if not self._is_agitrack_tracked(sha)]
+        return [
+            sha for sha in commits if not self._is_agitrack_tracked(sha) and not self.repo.arrived_from_elsewhere(sha)
+        ]
 
     # ------------------------------------------------------------------
     # Auto mode: fold the pending latent turns into a real commit ourselves
