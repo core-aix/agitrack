@@ -96,6 +96,10 @@ class _Source:
     updated: float
     base_dir: str  # the directory the session recorded (for making edit paths relative)
     export: Callable[[], ExportedSession | None]
+    # The transcript on disk (a file for Claude, a directory for OpenCode). Statting these
+    # is how the daemon notices new turns without reading or parsing anything — see
+    # _watch_signature.
+    watch: tuple[Path, ...] = ()
 
 
 def _discover(directory: Path) -> list[_Source]:
@@ -120,7 +124,7 @@ def _discover(directory: Path) -> list[_Source]:
         for _size, ref, path in best.values():
             base = claude._first_cwd(path) or str(directory)
             export: Callable[[], ExportedSession | None] = partial(claude.export_session_at, path, collect_edits=True)
-            sources.append(_Source("claude", ref.id, ref.updated, base, export))
+            sources.append(_Source("claude", ref.id, ref.updated, base, export, watch=(path,)))
     except Exception:
         pass
     try:
@@ -130,29 +134,103 @@ def _discover(directory: Path) -> list[_Source]:
                 continue
             seen_opencode.add(ref.id)
             export = partial(opencode.export_session, Path(sdir), ref.id, collect_edits=True)
-            sources.append(_Source("opencode", ref.id, ref.updated, sdir, export))
+            sources.append(_Source("opencode", ref.id, ref.updated, sdir, export, watch=(Path(sdir),)))
     except Exception:
         pass
     sources.sort(key=lambda s: s.updated, reverse=True)
     return sources
 
 
-def build_backtrace(directory: Path, *, max_sessions: int = MAX_SESSIONS, progress=None) -> BacktraceView:
+# How the served view keeps up with new agent work, without burning CPU to do it.
+#
+# Rebuilding is expensive (discovery alone reads the head of every transcript; processing a
+# long session parses megabytes), so nothing is rebuilt speculatively. Instead three tiers
+# guard the work, cheapest first:
+#
+# 1. A stat-only signature of the transcripts (mtime+size of each session, mtime of the
+#    directories that would hold a NEW one). Taken every _WATCH_POLL_SECONDS; when it is
+#    unchanged — the overwhelmingly common case — the poll costs a handful of stat() calls
+#    and nothing else happens.
+# 2. Only when a DIRECTORY changed can a session have appeared or vanished, so only then is
+#    discovery re-run. A signature change confined to known files skips it entirely.
+# 3. The rebuild reuses the processed result of every session whose file is byte-identical
+#    to the last pass, so an active conversation re-processes exactly one session.
+#
+# _WATCH_MIN_REBUILD_SECONDS then floors how often a rebuild may happen at all: while an
+# agent is working its transcript changes every few seconds, and a reconstruction that is
+# a minute behind is perfectly useful.
+#
+# The reuse memo lives in this process only, keyed by the file's identity. It is NOT the
+# persisted cache that was removed: that one survived aGiTrack upgrades and served output
+# built by superseded code (a subject truncation fix never reached the page). This memo
+# dies with the daemon, and the daemon restarts itself whenever aGiTrack is updated, so no
+# entry can outlive the code that produced it.
+_WATCH_POLL_SECONDS = 15.0
+_WATCH_MIN_REBUILD_SECONDS = 60.0
+
+
+def _stat_signature(path: Path) -> tuple[int, int] | None:
+    try:
+        info = path.stat()
+    except OSError:
+        return None
+    return (info.st_mtime_ns, info.st_size)
+
+
+def _watch_signature(sources: list[_Source]) -> tuple[dict[str, tuple], dict[str, tuple]]:
+    """``(files, dirs)`` stat signatures for everything that could change the view.
+
+    ``files`` covers the known transcripts: a change means an existing session gained turns.
+    ``dirs`` covers the directories holding them (and the backends' roots): a change there
+    means a session may have been added or removed, which is the only case that needs a
+    fresh discovery pass."""
+    files: dict[str, tuple] = {}
+    dirs: dict[str, tuple] = {}
+    watched_dirs: set[Path] = set()
+    try:
+        watched_dirs.add(claude._projects_root())
+    except Exception:
+        pass
+    for source in sources:
+        for path in source.watch:
+            signature = _stat_signature(path)
+            if signature is not None:
+                files[str(path)] = signature
+            watched_dirs.add(path.parent)
+    for directory in watched_dirs:
+        signature = _stat_signature(directory)
+        if signature is not None:
+            dirs[str(directory)] = signature
+    return files, dirs
+
+
+def build_backtrace(
+    directory: Path,
+    *,
+    max_sessions: int = MAX_SESSIONS,
+    progress=None,
+    sources: list[_Source] | None = None,
+    memo: dict[str, tuple[tuple, dict]] | None = None,
+) -> BacktraceView:
     """Reconstruct the backtrace dashboard for ``directory`` from local transcripts.
 
     ``progress`` (optional) is called ``progress(done, total, phase)`` as work proceeds — during
     discovery (``total`` still 0) and before each session is exported — so a caller can show a
     progress bar. Exporting is the slow part (OpenCode shells out to its CLI per session).
 
-    Every build reprocesses every session from the transcripts. There is deliberately NO
-    persisted cache of processed results: one silently served stale output after a
-    processing fix (subjects kept an old mid-word truncation), and correctness beats the
-    seconds a warm rebuild saves. The build is a one-off per daemon start, behind the
-    progress bar."""
+    ``sources`` skips discovery when the caller already has an up-to-date list (the daemon's
+    watcher re-discovers only when a directory changed). ``memo``, when given, carries
+    processed sessions between rebuilds keyed by the transcript's stat identity, so a rebuild
+    re-reads only what actually changed; see the watch notes above for why this in-process
+    memo is not the persisted cache that was removed.
+
+    Nothing is cached across processes: a fresh build always reprocesses every session from
+    the transcripts, so a processing fix can never be masked by an older result."""
     directory = directory.resolve()
     if progress:
         progress(0, 0, "discovering")
-    sources = _discover(directory)
+    if sources is None:
+        sources = _discover(directory)
     dropped = max(0, len(sources) - max_sessions)
     sources = sources[:max_sessions]
     total = len(sources)
@@ -175,7 +253,18 @@ def build_backtrace(directory: Path, *, max_sessions: int = MAX_SESSIONS, progre
         if progress:
             progress(index, total, "exporting")
         key = f"{source.backend}:{source.ref_id}"
-        entry = _process_source(directory, source)
+        identity = tuple(_stat_signature(path) for path in source.watch)
+        entry = None
+        if memo is not None:
+            remembered = memo.get(key)
+            # Reuse only when the transcript is byte-for-byte what was processed before;
+            # any append (a new turn) changes mtime+size and forces a re-read.
+            if remembered is not None and remembered[0] == identity and all(identity):
+                entry = remembered[1]
+        if entry is None:
+            entry = _process_source(directory, source)
+            if memo is not None and all(identity):
+                memo[key] = (identity, entry)
         fresh_sessions[key] = entry
         if not entry.get("stats"):
             continue
@@ -517,21 +606,72 @@ def _str(query: dict[str, list[str]], key: str) -> str:
     return (query.get(key) or [""])[0]
 
 
-def _make_handler(view: BacktraceView) -> type[http.server.BaseHTTPRequestHandler]:
+def _make_handler(view_source) -> type[http.server.BaseHTTPRequestHandler]:
+    """Serve a backtrace view. ``view_source`` is either a fixed :class:`BacktraceView` or a
+    zero-argument callable returning the CURRENT one, which is how the daemon serves a
+    reconstruction that keeps up with new sessions.
+
+    Everything a request needs beyond the view itself — the rendered page, the file browser,
+    the insight cache — is derived once per view and rebuilt lazily the first time a request
+    sees a newer one. So the watcher thread only does transcript work; rendering happens on
+    demand, and a rebuild nobody looks at costs nothing extra."""
+    import threading as _threading
+
     from agitrack.metrics import learn as learn_page
     from agitrack.metrics.files import backtrace_browser
     from agitrack.metrics.insights import build_insights, context_from_browser
     from agitrack.metrics.web import _filter_stats, aggregates_payload, format_html, log_page
 
-    banner = _banner_html(view)
-    browser = backtrace_browser(view.dashboard.stats, view.file_edits, directory=view.root)
-    insight_cache: dict[tuple, list[dict]] = {}
+    get_view = view_source if callable(view_source) else (lambda: view_source)
+
+    class _Serving:
+        """The derived artefacts for one built view."""
+
+        def __init__(self, view: BacktraceView) -> None:
+            self.view = view
+            self.browser = backtrace_browser(view.dashboard.stats, view.file_edits, directory=view.root)
+            self.insight_cache: dict[tuple, list[dict]] = {}
+            self.page = format_html(
+                view.dashboard,
+                banner_html=_banner_html(view),
+                backtrace=True,
+                insights=self.insights_for("", "", "", 0, 0),
+            ).encode("utf-8")
+
+        def insights_for(self, author: str, backend: str, model: str, frm: int, to: int) -> list[dict]:
+            # Scoped to the current filter, exactly as the live dashboard does, so narrowing the
+            # time range re-asks the question for that slice. A built view never changes, so each
+            # distinct filter is computed once and memoized (bounded).
+            key = (author, backend, model, frm, to)
+            hit = self.insight_cache.get(key)
+            if hit is None:
+                stats = _filter_stats(self.view.dashboard, author=author, backend=backend, model=model, frm=frm, to=to)
+                files, sha_paths = context_from_browser(self.browser, stats)
+                hit = build_insights(stats, files, sha_paths)
+                if len(self.insight_cache) >= 16:
+                    self.insight_cache.pop(next(iter(self.insight_cache)))
+                self.insight_cache[key] = hit
+            return hit
+
+    state: dict = {"view": None, "serving": None}
+    build_lock = _threading.Lock()
+
+    def serving() -> "_Serving":
+        current = get_view()
+        cached = state["serving"]
+        if cached is not None and state["view"] is current:
+            return cached
+        with build_lock:
+            if state["serving"] is None or state["view"] is not current:
+                state["view"] = current
+                state["serving"] = _Serving(current)
+            return state["serving"]
 
     # The learning page works over the reconstruction too: same traces, same coach. The
     # served directory may not be a git repo at all — learn then runs with repo=None
     # (identity falls back to the gh login, progress sync reports unavailable, everything
     # else works; the progress log lives in <dir>/.agitrack/learning.json either way).
-    learn_root = view.root or Path.cwd()
+    learn_root = get_view().root or Path.cwd()
     try:
         learn_repo: GitRepo | None = GitRepo.discover(learn_root)
     except Exception:
@@ -539,33 +679,18 @@ def _make_handler(view: BacktraceView) -> type[http.server.BaseHTTPRequestHandle
 
     def learn_view(source: str, frm: int, to: int, branch: str) -> tuple[list, list[dict], list[dict]]:
         # ``branch`` is ignored: the reconstruction has no git refs to switch between.
-        stats = _filter_stats(view.dashboard, author=source, backend="", model="", frm=frm, to=to)
-        return stats, insights_for(source, "", "", frm, to), browser.files_payload()
-
-    def insights_for(author: str, backend: str, model: str, frm: int, to: int) -> list[dict]:
-        # Scoped to the current filter, exactly as the live dashboard does, so narrowing the time
-        # range re-asks the question for that slice. The reconstruction itself never changes, so
-        # each distinct filter is computed once and memoized (bounded).
-        key = (author, backend, model, frm, to)
-        hit = insight_cache.get(key)
-        if hit is None:
-            stats = _filter_stats(view.dashboard, author=author, backend=backend, model=model, frm=frm, to=to)
-            files, sha_paths = context_from_browser(browser, stats)
-            hit = build_insights(stats, files, sha_paths)
-            if len(insight_cache) >= 16:
-                insight_cache.pop(next(iter(insight_cache)))
-            insight_cache[key] = hit
-        return hit
-
-    page = format_html(
-        view.dashboard, banner_html=banner, backtrace=True, insights=insights_for("", "", "", 0, 0)
-    ).encode("utf-8")
+        active = serving()
+        stats = _filter_stats(active.view.dashboard, author=source, backend="", model="", frm=frm, to=to)
+        return stats, active.insights_for(source, "", "", frm, to), active.browser.files_payload()
 
     class _BacktraceHandler(http.server.BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802 (http.server API)
             try:
                 parsed = urllib.parse.urlparse(self.path)
                 query = urllib.parse.parse_qs(parsed.query)
+                active = serving()  # the newest built view, rendered on first sight
+                view, browser, page = active.view, active.browser, active.page
+                insights_for = active.insights_for
                 if parsed.path in ("/", "/index.html"):
                     self._respond("text/html; charset=utf-8", page, cache_control="no-cache")
                 elif parsed.path == "/data":
@@ -1117,6 +1242,52 @@ def _wait_for_backtrace(directory: Path, proc, *, stall_seconds: float) -> dict 
             sys.stdout.flush()
 
 
+def _watch_transcripts(directory: Path, live: dict, memo: dict, stop) -> None:
+    """Keep ``live["view"]`` current as agent sessions come and go.
+
+    Runs the three-tier guard described above the constants: a stat-only signature every
+    poll, discovery only when a directory changed, and a memoized rebuild that re-reads
+    only the transcripts that actually moved. Rebuilds are floored at
+    ``_WATCH_MIN_REBUILD_SECONDS`` so a conversation in progress — whose transcript grows
+    every few seconds — cannot spin this thread.
+
+    Never raises: the daemon must keep serving the view it already has, whatever a
+    transcript does.
+    """
+    import time as _time
+
+    files, dirs = _watch_signature(live["sources"])
+    last_rebuild = _time.monotonic()
+    while not stop.wait(_WATCH_POLL_SECONDS):
+        try:
+            sources = live["sources"]
+            new_files, new_dirs = _watch_signature(sources)
+            if new_files == files and new_dirs == dirs:
+                continue  # nothing on disk moved: the poll cost a few stat() calls
+            if _time.monotonic() - last_rebuild < _WATCH_MIN_REBUILD_SECONDS:
+                continue  # changed, but too soon to spend a rebuild on it; caught next poll
+            rediscover = new_dirs != dirs  # a session may have appeared or been removed
+            files, dirs = new_files, new_dirs
+            if rediscover:
+                sources = _discover(directory)
+            view = build_backtrace(directory, sources=sources, memo=memo)
+            if view.is_empty:
+                continue  # keep serving what we have rather than an empty page
+            live["sources"] = sources
+            live["view"] = view
+            last_rebuild = _time.monotonic()
+            # Re-signature AFTER the rebuild: processing takes seconds during which the
+            # transcript may have grown again, and that growth belongs to the next pass.
+            files, dirs = _watch_signature(sources)
+            # Drop memo entries for sessions that are gone, so a long-lived daemon cannot
+            # accumulate the processed output of transcripts that no longer exist.
+            keys = {f"{source.backend}:{source.ref_id}" for source in sources}
+            for stale in [key for key in memo if key not in keys]:
+                memo.pop(stale, None)
+        except Exception:
+            continue
+
+
 def _render_progress(prog: dict | None) -> None:
     """Draw the reconstruction progress on one rewritten terminal line."""
     import sys
@@ -1192,15 +1363,26 @@ def run_backtrace_daemon(
 
     # Report build progress to a file the launching parent polls to draw a progress bar; clear it
     # once the (potentially slow) reconstruction is done.
+    sources = _discover(directory)
+    memo: dict[str, tuple[tuple, dict]] = {}
     view = build_backtrace(
-        directory, progress=lambda done, total, phase: _write_progress(directory, done, total, phase)
+        directory,
+        sources=sources,
+        memo=memo,
+        progress=lambda done, total, phase: _write_progress(directory, done, total, phase),
     )
     _clear_progress(directory)
     if view.is_empty:
         _write_handshake(directory, {"pid": os.getpid(), "empty": True})
         return 0
 
-    handler = _make_handler(view)
+    # The served view is swapped in place as new agent work lands, so the page's own 30s
+    # refresh shows turns and tokens from sessions that ran after the daemon started.
+    live: dict = {"view": view, "sources": sources}
+    watch_stop = threading.Event()
+    threading.Thread(target=_watch_transcripts, args=(directory, live, memo, watch_stop), daemon=True).start()
+
+    handler = _make_handler(lambda: live["view"])
     from agitrack.update import restart as update_restart
 
     # Mutable view of the CURRENT serve cycle for the signal handlers (installed once):
