@@ -1080,3 +1080,123 @@ def test_turn_tokens_apply_the_input_includes_cache_write_convention():
     tokens = bt._tokens_dict(turn)
     assert tokens["input"] == 105  # uncached + cache_write
     assert tokens["cache_write"] == 100 and tokens["cache_read"] == 1000 and tokens["output"] == 7
+
+
+# --------------------------------------------------------- auto-update (watching transcripts)
+
+
+def test_watch_signature_separates_files_from_directories(tmp_path):
+    """The daemon's cheap poll: a stat-only signature. Files answer "did a session gain
+    turns", directories answer "could a session have appeared" — only the latter is worth
+    a fresh (expensive) discovery pass."""
+    transcript = tmp_path / "sess.jsonl"
+    transcript.write_text("one\n", encoding="utf-8")
+    source = bt._Source("claude", "s1", 1.0, str(tmp_path), lambda: None, watch=(transcript,))
+
+    files, dirs = bt._watch_signature([source])
+    assert str(transcript) in files
+    assert str(tmp_path) in dirs
+
+    transcript.write_text("one\ntwo\n", encoding="utf-8")  # the session gained a turn
+    grown_files, grown_dirs = bt._watch_signature([source])
+    assert grown_files != files
+    assert grown_dirs == dirs  # …which is NOT a reason to re-discover
+
+    (tmp_path / "another.jsonl").write_text("x\n", encoding="utf-8")  # a NEW session appeared
+    _, new_dirs = bt._watch_signature([source])
+    assert new_dirs != grown_dirs  # …which IS
+
+
+def test_rebuild_reprocesses_only_the_sessions_that_changed(monkeypatch, tmp_path):
+    """The memo makes a rebuild proportional to what moved, not to the history's size: a
+    session whose transcript is byte-identical is not read again."""
+    first = tmp_path / "a.jsonl"
+    second = tmp_path / "b.jsonl"
+    first.write_text("a\n", encoding="utf-8")
+    second.write_text("b\n", encoding="utf-8")
+    exports = {
+        "a": ExportedSession(session_id="a", model="m", updated=1000, turns=[_turn("first work", assistant_id="m-a")]),
+        "b": ExportedSession(session_id="b", model="m", updated=2000, turns=[_turn("second work", assistant_id="m-b")]),
+    }
+    read: list[str] = []
+
+    def _export(path, collect_edits=False):
+        read.append(Path(path).stem)
+        return exports[Path(path).stem]
+
+    monkeypatch.setattr(
+        claude,
+        "sessions_under",
+        lambda d: [(SessionRef(id=p.stem, updated=float(i)), p) for i, p in enumerate((first, second))],
+    )
+    monkeypatch.setattr(claude, "_first_cwd", lambda p: str(tmp_path))
+    monkeypatch.setattr(claude, "export_session_at", _export)
+    monkeypatch.setattr(opencode, "sessions_under", lambda d: [])
+
+    memo: dict = {}
+    sources = bt._discover(tmp_path)
+    assert bt.build_backtrace(tmp_path, sources=sources, memo=memo).dashboard.total_commits == 2
+    assert sorted(read) == ["a", "b"]
+
+    read.clear()
+    assert bt.build_backtrace(tmp_path, sources=sources, memo=memo).dashboard.total_commits == 2
+    assert read == []  # nothing changed on disk: nothing re-read
+
+    read.clear()
+    second.write_text("b\nmore\n", encoding="utf-8")  # only this session grew
+    exports["b"] = ExportedSession(
+        session_id="b",
+        model="m",
+        updated=3000,
+        turns=[_turn("second work", assistant_id="m-b"), _turn("third work", assistant_id="m-c")],
+    )
+    view = bt.build_backtrace(tmp_path, sources=bt._discover(tmp_path), memo=memo)
+    assert read == ["b"]  # the untouched session is served from the memo
+    assert view.dashboard.total_commits == 3  # …and the new turn is in the view
+
+
+def test_served_view_follows_the_rebuilt_one(monkeypatch, tmp_path):
+    """The handler holds no view of its own: it renders whatever the watcher last built, so
+    a rebuild reaches the page without restarting the server."""
+    import http.client
+    import http.server
+    import json as _json
+    import threading
+
+    _patch_discovery(
+        monkeypatch,
+        claude_sessions={
+            "s1": ExportedSession(session_id="s1", model="m", updated=1, turns=[_turn("early work", assistant_id="m1")])
+        },
+    )
+    live = {"view": bt.build_backtrace(tmp_path)}
+    assert live["view"].dashboard.total_commits == 1
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), bt._make_handler(lambda: live["view"]))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+
+        def turns_on_page() -> int:
+            conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=5)
+            conn.request("GET", "/log?limit=50")
+            body = _json.loads(conn.getresponse().read().decode("utf-8"))
+            conn.close()
+            return int(body["total"])
+
+        assert turns_on_page() == 1
+        _patch_discovery(
+            monkeypatch,
+            claude_sessions={
+                "s1": ExportedSession(
+                    session_id="s1",
+                    model="m",
+                    updated=2,
+                    turns=[_turn("early work", assistant_id="m1"), _turn("later work", assistant_id="m2")],
+                )
+            },
+        )
+        live["view"] = bt.build_backtrace(tmp_path)  # what the watcher thread does
+        assert turns_on_page() == 2
+    finally:
+        server.shutdown()
+        server.server_close()
