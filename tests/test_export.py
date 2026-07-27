@@ -91,7 +91,8 @@ def test_export_scopes_the_demo_to_the_last_30_days(tmp_path, monkeypatch):
     assert not (out / "demo" / "diff" / f"{ancient_sha}.json").exists()  # only in-scope diffs baked
 
     index = (out / "index.html").read_text(encoding="utf-8")
-    assert "in the 30 days before" in index  # the banner names the scope
+    assert "30-day period" in index  # the banner names the scope (dateless: no build stamp)
+    assert "UTC" not in index.split("</div>", 1)[0]  # …and carries no timestamp
     assert 'period.value = "30"' in index  # the disabled range dropdown shows the real scope
 
 
@@ -146,11 +147,11 @@ def test_export_disables_filters_and_cans_learn_actions(tmp_path, monkeypatch):
     # out install commands.
     assert 'href="../#install"' in index
     assert 'href="../../#install"' in learn
-    # …and the link renders in the SAME amber on both pages (the pages' global anchor
-    # colors differ — green vs cyan — so each banner styles its links explicitly;
-    # --warn and --amber are the same #ffb454).
-    assert ".backtracebanner a{color:var(--amber)" in index
-    assert ".btbanner a{color:var(--warn)" in learn
+    # …and the link renders GREEN on BOTH pages, standing out from the amber banner text.
+    # Each banner styles its links explicitly because the two pages' global anchor colors
+    # differ, which is what made the same banner render differently on each.
+    assert ".backtracebanner a{color:var(--phosphor)" in index
+    assert ".btbanner a{color:var(--phosphor)" in learn
 
 
 def test_export_learn_state_falls_back_to_the_single_store_profile(tmp_path, monkeypatch):
