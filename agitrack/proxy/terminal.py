@@ -180,6 +180,32 @@ class TerminalHost:
         self.set_cooked()
         os.write(sys.stdout.fileno(), b"\x1b[0m\r\n")
 
+    def suspend_host(self: TerminalHostState) -> None:
+        """Hand the terminal back to the shell for a Ctrl-Z suspend.
+
+        The same restoration as exiting — mouse/paste/focus reporting off, cooked mode,
+        off the alternate screen — because from the shell's point of view aGiTrack is gone
+        until it is resumed. Kept separate from restore_terminal() so resume_host() can
+        state the exact inverse.
+        """
+        self.disable_host_terminal_modes()
+        self.set_cooked()
+        os.write(sys.stdout.fileno(), b"\x1b[2J\x1b[H\x1b[?1049l\x1b[0m\r\n")
+
+    def resume_host(self: TerminalHostState) -> None:
+        """Re-take the terminal after the shell resumes us (`fg`).
+
+        The shell left the terminal cooked and on the main screen, so the alternate
+        screen, raw mode and mouse reporting all have to be re-asserted; the caller
+        repaints from its own screen model afterwards, since the backend has no idea any
+        of this happened and will not redraw on its own.
+        """
+        self.set_raw()
+        # The same sequence enter_host_screen() writes, inlined: this runs against the
+        # structural host type, which only guarantees the primitives used here.
+        os.write(sys.stdout.fileno(), b"\x1b[?1049h\x1b[2J\x1b[H")
+        self.enable_host_mouse()
+
     def resume_child_ui(self: TerminalHostState, render_fn) -> None:
         self.set_raw()
         render_fn()

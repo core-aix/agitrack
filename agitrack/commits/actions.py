@@ -43,6 +43,15 @@ class AgitrackActions:
         # exposing select/multiselect/text/confirm/info; None keeps terminal I/O.
         self.ui = ui
 
+    def _staged_paths(self) -> list[str]:
+        """The staged files this commit would contain, for showing before the message
+        prompt. Best-effort: a listing failure must never block committing."""
+        try:
+            output = self.repo._run(["git", "diff", "--cached", "--name-only"], check=False).stdout
+        except Exception:
+            return []
+        return [line.strip() for line in output.splitlines() if line.strip()]
+
     def create_user_commit(self) -> bool:
         self.repo.add_tracked()
         self.review_untracked(include_declined=False)
@@ -50,11 +59,22 @@ class AgitrackActions:
             if self.verbose:
                 print("No staged user changes to commit.")
             return False
+        # Show WHAT is about to be committed before asking for a message: the answer is a
+        # decision about these files, and at startup they may be edits the user forgot they
+        # had (or made in another window) — naming a commit blind is how unintended content
+        # gets in. The TUI popup already lists them; this is the console path.
+        staged = self._staged_paths()
+        listing = "\n".join(f"  {path}" for path in staged)
         if self.ui is not None:
             message = ""
             while not message.strip():
                 # Cancelling (Esc) returns None — continue without committing.
-                entered = self.ui.text("User commit message (Esc to continue without committing):")
+                # Folded into the message rather than passed as a separate field: a UI
+                # implementation only has to render text() to show the file list.
+                question = "User commit message (Esc to continue without committing):"
+                if staged:
+                    question = f"Committing {len(staged)} file(s):\n{listing}\n\n{question}"
+                entered = self.ui.text(question)
                 if entered is None:
                     self.ui.info("Continuing without committing.", level="warn")
                     return False
@@ -63,6 +83,9 @@ class AgitrackActions:
                     self.ui.info("User commit message is required.", level="warn")
         else:
             message = "" if self.interactive else "Save user changes"
+            if self.interactive and staged:
+                print(f"Committing {len(staged)} file(s) to {self.repo.repo}:")
+                print(listing)
             while not message.strip():
                 message = input("User commit message: ")
                 if not message.strip():

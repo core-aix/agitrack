@@ -100,6 +100,10 @@ class PromptModal:
         self.viewport_rows = viewport_rows
         self.detail_scroll = 0
         self._escape_buffer: bytearray | None = None
+        # Where the next character lands, as an index into `value`. Left/Right (and
+        # Home/End) move it, so a typo near the start is fixed in place instead of
+        # retyping the rest of the line. Starts at the end of any default.
+        self.cursor = len(self.value)
         # Bracketed-paste state (see the module docstring). Pasted text is typed into the
         # field, never submitted; `pasted` stays empty here because the content is consumed.
         self.in_paste = in_paste
@@ -116,6 +120,12 @@ class PromptModal:
         prompt_lines = self.prompt.count("\n") + 1
         overhead = title_lines + prompt_lines + 4  # input line, hint line, 2 scroll hints
         return max(3, self.viewport_rows - 4 - overhead)
+
+    def _insert(self, text: str) -> None:
+        """Insert *text* at the cursor and leave the cursor after it."""
+        at = max(0, min(self.cursor, len(self.value)))
+        self.value = self.value[:at] + text + self.value[at:]
+        self.cursor = at + len(text)
 
     def render_message(self) -> str:
         """Return the message string that should be shown in the popup area."""
@@ -134,7 +144,10 @@ class PromptModal:
             if total > window:
                 lines.append("(PgUp/PgDn scroll the file list)")
         lines.append(self.prompt)
-        lines.append(f"> {self.value}{self.CARET}")
+        # The caret marks the insertion point: the character it sits on is drawn after it,
+        # so text to the right of the cursor stays visible while editing mid-line.
+        at = max(0, min(self.cursor, len(self.value)))
+        lines.append(f"> {self.value[:at]}{self.CARET}{self.value[at:]}")
         return "\n".join(lines)
 
     def feed(self, data: bytes) -> tuple[str, str | None]:
@@ -175,6 +188,27 @@ class PromptModal:
                     self.detail_scroll += max(1, self._detail_window() - 1)
                     self._escape_buffer = None
                     changed = True
+                elif sequence == b"\x1b[D":  # Left — move the insertion point
+                    self.cursor = max(0, self.cursor - 1)
+                    self._escape_buffer = None
+                    changed = True
+                elif sequence == b"\x1b[C":  # Right
+                    self.cursor = min(len(self.value), self.cursor + 1)
+                    self._escape_buffer = None
+                    changed = True
+                elif sequence in (b"\x1b[H", b"\x1b[1~", b"\x1bOH"):  # Home
+                    self.cursor = 0
+                    self._escape_buffer = None
+                    changed = True
+                elif sequence in (b"\x1b[F", b"\x1b[4~", b"\x1bOF"):  # End
+                    self.cursor = len(self.value)
+                    self._escape_buffer = None
+                    changed = True
+                elif sequence == b"\x1b[3~":  # Delete — remove the character to the RIGHT
+                    if self.cursor < len(self.value):
+                        self.value = self.value[: self.cursor] + self.value[self.cursor + 1 :]
+                        changed = True
+                    self._escape_buffer = None
                 elif _escape_sequence_complete(sequence):
                     self._escape_buffer = None
                 continue
@@ -189,11 +223,11 @@ class PromptModal:
             # start the exit flow.
             if self.in_paste:
                 if char in {b"\r", b"\n"}:
-                    if not self.value.endswith(" "):
-                        self.value += " "
+                    if not self.value[: self.cursor].endswith(" "):
+                        self._insert(" ")
                         changed = True
                 elif byte >= 32:
-                    self.value += char.decode(errors="ignore")
+                    self._insert(char.decode(errors="ignore"))
                     changed = True
                 continue
 
@@ -204,10 +238,18 @@ class PromptModal:
                 return ("done", self.value)
 
             if char in {b"\x7f", b"\b"}:
-                self.value = self.value[:-1]
+                if self.cursor > 0:  # backspace deletes to the LEFT of the cursor
+                    self.value = self.value[: self.cursor - 1] + self.value[self.cursor :]
+                    self.cursor -= 1
+                    changed = True
+            elif char == b"\x01":  # Ctrl-A — start of line (readline habit)
+                self.cursor = 0
+                changed = True
+            elif char == b"\x05":  # Ctrl-E — end of line
+                self.cursor = len(self.value)
                 changed = True
             elif byte >= 32:
-                self.value += char.decode(errors="ignore")
+                self._insert(char.decode(errors="ignore"))
                 changed = True
 
         return ("redraw", None) if changed else ("noop", None)

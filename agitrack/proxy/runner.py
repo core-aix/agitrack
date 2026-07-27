@@ -355,6 +355,9 @@ class ProxyInput:
         # start the exit flow. Set by the CSI 200~/201~ markers in the stream.
         self.in_paste = False
         self._paste_marker: bytearray | None = None
+        # Set when the user pressed Ctrl-Z: the runner suspends the whole aGiTrack session
+        # to the shell rather than forwarding the byte (see ProxyRunner._suspend_to_shell).
+        self.suspend_requested = False
         # Context-dependent commands shown ABOVE the fixed COMMANDS (the runner refreshes
         # this when the palette opens). Used to surface "merge" at the top when there are
         # unmerged worktrees the user should rescue.
@@ -414,6 +417,20 @@ class ProxyInput:
                 elif char in {b"\r", b"\n"} and self.buffer and not self.buffer.endswith(b" "):
                     self.buffer.extend(b" ")  # a line break in a one-line field reads as a space
                 self.selected_index = 0 if not marker else self.selected_index
+                continue
+            if char == b"\x1c":
+                # Ctrl-\\ (SIGQUIT). Never forwarded: on a cooked pty it would kill the
+                # backend outright, losing the conversation, and it means nothing to a TUI.
+                continue
+            if char == b"\x1a" and self.capturing:
+                continue  # Ctrl-Z is not text: never type a control byte into the palette
+            if char == b"\x1a":
+                # Ctrl-Z. Raw mode means the kernel does not turn this into SIGTSTP, so it
+                # would otherwise be forwarded to the backend as a plain byte — and Claude
+                # answers it by tearing down its UI and waiting for a resume that can never
+                # arrive on a pty it does not control, leaving a blank, dead screen. aGiTrack
+                # owns the terminal, so aGiTrack does the suspending.
+                self.suspend_requested = True
                 continue
             if char == b"\x03":
                 if self.capturing:
@@ -7888,6 +7905,10 @@ class ProxyRunner:
         prev_palette = (bytes(self.input.buffer), self.input.selected_index) if was_capturing else None
         forwarded, local_echo, command, should_exit = self.input.feed(data)
         self._debug(f"feed result: forwarded={forwarded!r} command={command!r} capturing={self.input.capturing}")
+        if getattr(self.input, "suspend_requested", False):
+            self.input.suspend_requested = False
+            self._suspend_to_shell()
+            return "continue"
         if self.input.capturing and not was_capturing:
             # The Ctrl-G palette just opened: surface a top-level "merge" command when
             # there is unmerged worktree work, so the user is reminded to rescue it
@@ -9638,28 +9659,27 @@ class ProxyRunner:
         candidates = untracked if include_declined else [path for path in untracked if path not in declined]
         if not candidates:
             return "No untracked files to review."
-        # Cap the listed files to the terminal height so the question and the input
-        # line (which the modal draws LAST) are never pushed off the popup. The
-        # decision is all-or-none, so a preview plus "…and N more" is enough.
-        limit = max(5, self.rows - 10)
-        preview = candidates[:limit]
-        listing = "\n".join(preview)
-        if len(candidates) > len(preview):
-            listing += f"\n…and {len(candidates) - len(preview)} more"
-        answer = self._prompt_popup(
+        # The file list goes in the modal's detail pane, which windows it to the terminal
+        # height and scrolls with PgUp/PgDn — so every file stays reachable.
+        listing = "\n".join(candidates)
+        # A CHOICE, not typed text: the answer decides whether files enter the commit, and a
+        # typed "[y/N]" box accepts anything — a stray keystroke, or an answer to a question
+        # the user misread, silently took the default. Up/Down + Enter can only ever return
+        # one of the offered options (Esc still cancels).
+        stage_label = f"Stage all {len(candidates)} file(s)"
+        answer = self._select_popup(
             "Untracked Files",
-            f"Stage all {len(candidates)} new file(s)? [y/N]\n{listing}",
+            [stage_label, "Leave them unstaged"],
+            detail=listing.splitlines(),
         )
         if answer is None:
             return "Cancelled."
-        answer = answer.strip().lower()
-        if answer in {"y", "yes"}:
+        if answer == stage_label:
             repo.stage_paths(candidates)
             state.remove_declined(candidates)
             return f"Staged {len(candidates)} untracked file(s)."
-        else:
-            state.add_declined(candidates)
-            return f"Left {len(candidates)} untracked file(s) unstaged."
+        state.add_declined(candidates)
+        return f"Left {len(candidates)} untracked file(s) unstaged."
 
     def _create_agent_commit_from_turns_popup(
         self,
@@ -12135,6 +12155,43 @@ class ProxyRunner:
     # Host-terminal operations route through the platform host object (POSIX termios /
     # Windows Win32 console) once run() created it; before that (unit tests construct a
     # runner without run()), they fall back to the POSIX TerminalHost mixin directly.
+    def _suspend_to_shell(self) -> None:
+        """Ctrl-Z: stop aGiTrack like any other foreground job, and come back intact.
+
+        The terminal is handed back the way exiting hands it back, then this process stops
+        itself; the shell reports "Stopped" and takes over. ``fg`` continues execution right
+        here, so the inverse — alternate screen, raw mode, mouse reporting — is re-asserted
+        and the screen repainted from aGiTrack's own model. The backend keeps running
+        throughout and never learns any of this happened, which is the point: it is not
+        asked to suspend itself on a pty where nothing could resume it.
+
+        Windows has no job control, so there Ctrl-Z stays a byte for the backend.
+        """
+        if sys.platform == "win32":
+            return
+        import signal as _signal
+
+        try:
+            if self._host is not None:
+                self._host.suspend_host()
+            else:
+                TerminalHost.suspend_host(self)
+        except Exception as error:
+            self._debug(f"suspend: restoring the terminal failed: {error!r}")
+        try:
+            os.kill(os.getpid(), _signal.SIGSTOP)  # returns when the shell resumes us
+        except Exception as error:
+            self._debug(f"suspend: stopping failed: {error!r}")
+        try:
+            if self._host is not None:
+                self._host.resume_host()
+            else:
+                TerminalHost.resume_host(self)
+        except Exception as error:
+            self._debug(f"resume: retaking the terminal failed: {error!r}")
+        self._render_pending = True
+        self._render()
+
     def _pause_child_ui(self) -> None:
         if self._host is not None:
             self._host.pause_child_ui()
