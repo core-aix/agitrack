@@ -147,11 +147,13 @@ def watch_for_update(
     daemons therefore opt in. The attempt is lock-guarded, so when a TUI or another daemon
     is already updating this one simply skips the round.
 
-    It is OPT-IN, not the default, because installing an update is a real side effect —
-    on a source install it fetches and merges the checkout aGiTrack runs from. A caller
-    that just wants the restart watch (tests, tooling) must not trigger that by omission:
-    it once did, and a test's watcher fast-forwarded CI's own checkout mid-run, which
-    changed pyproject.toml underneath the already-imported version and failed the build.
+    This flag is about CALLERS, not about the user: both daemons pass ``self_update=True``,
+    so self-updating is on for everyone unless they turn off the global ``self_update``
+    setting (which :func:`~agitrack.update.selfupdate.attempt_self_update` honours). The
+    parameter defaults off only so that a caller wanting the restart watch alone — tests,
+    tooling — cannot start installing updates by omission: it once did, and a test's
+    watcher fast-forwarded CI's own checkout mid-run, changing pyproject.toml underneath
+    the already-imported version and failing the build.
     """
 
     def _loop() -> None:
