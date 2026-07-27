@@ -1532,3 +1532,71 @@ def test_parse_rows_superseded_tool_use_turn_is_complete():
 
     assert session.turns[0].complete is True  # superseded: finished for good
     assert session.turns[1].complete is False  # dangling tool_use: still mid-flight
+
+
+def test_parse_rows_drops_a_prompt_the_user_rewound_and_rewrote():
+    """Editing a prompt before the agent answers leaves the ABANDONED draft in the file.
+
+    Claude Code does not rewrite the row: it branches, hanging the revised text off the
+    same parent and continuing from that one. Replaying the file linearly put both in the
+    interaction trace — the user's message appearing twice, once as a draft they had
+    already discarded (seen in a real commit: the short version and the same text plus one
+    more sentence, two minutes apart, same parentUuid, nothing descending from the first).
+    """
+    rows = [
+        _assistant("m0", "Anything else?"),
+        _user("draft", "Add a lock so instances don't clash.", parentUuid="p0"),
+        # …the user edits and re-sends before the agent acts: a sibling off the SAME parent.
+        _user("final", "Add a lock so instances don't clash. Also handle MSI installs.", parentUuid="p0"),
+        _assistant("m1", "Done.", usage={"input_tokens": 10, "output_tokens": 5}),
+    ]
+
+    session = parse_rows("s-rewind", rows)
+
+    prompts = [turn.user_prompt for turn in session.turns]
+    assert prompts == ["Add a lock so instances don't clash. Also handle MSI installs."]
+    assert not any("Also handle MSI installs" not in (p or "") for p in prompts)  # the draft is gone
+
+
+def test_parse_rows_keeps_prompts_that_only_look_like_siblings():
+    """The rewind filter must be narrow: only a LATER user row off the same parent
+    supersedes an earlier one."""
+    # Consecutive prompts in a normal conversation each hang off their own parent, so
+    # neither is dropped even when the agent never answered the first.
+    rows = [
+        _user("u1", "First ask.", parentUuid="a0"),
+        _assistant("m1", "ok", usage={"input_tokens": 5, "output_tokens": 1}),
+        _user("u2", "Second ask.", parentUuid="a1"),
+        _assistant("m2", "ok", usage={"input_tokens": 5, "output_tokens": 1}),
+    ]
+    assert [t.user_prompt for t in parse_rows("s-normal", rows).turns] == ["First ask.", "Second ask."]
+
+    # Rows with NO parent (every conversation start) are never treated as siblings of
+    # each other, or a resumed session would lose its opening prompt.
+    rows = [
+        _user("u1", "Opening ask."),
+        _assistant("m1", "ok", usage={"input_tokens": 5, "output_tokens": 1}),
+        _user("u2", "Later ask."),
+        _assistant("m2", "ok", usage={"input_tokens": 5, "output_tokens": 1}),
+    ]
+    assert [t.user_prompt for t in parse_rows("s-noparent", rows).turns] == ["Opening ask.", "Later ask."]
+
+
+def test_parse_rows_still_keeps_a_genuine_mid_turn_followup_after_a_rewind():
+    """A follow-up sent WHILE the agent works is threaded in as an attachment, not as a
+    sibling user row — so dropping rewound drafts must leave it untouched."""
+    rows = [
+        _assistant("m0", "Ready."),
+        _user("draft", "Do the thing.", parentUuid="p0"),
+        _user("final", "Do the thing, carefully.", parentUuid="p0"),
+        _assistant(
+            "m1", "", content=[{"type": "tool_use", "id": "t1", "name": "Edit", "input": {}}], stop_reason="tool_use"
+        ),
+        _queued("Also update the docs."),
+        _assistant("m2", "Done.", usage={"input_tokens": 10, "output_tokens": 5}),
+    ]
+
+    session = parse_rows("s-both", rows)
+
+    assert [t.user_prompt for t in session.turns] == ["Do the thing, carefully."]
+    assert session.turns[0].queued_followups == ["Also update the docs."]

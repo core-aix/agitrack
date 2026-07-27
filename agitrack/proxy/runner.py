@@ -8963,6 +8963,11 @@ class ProxyRunner:
                 "label": "Auto-start tracking on commit when aGiTrack isn't running (auto/off; `agitrack --remove-hooks` also turns it off)",
                 "kind": "text",
             },
+            {
+                "key": "self_update",
+                "label": "Keep aGiTrack up to date automatically (off: only tell me an update exists)",
+                "kind": "bool",
+            },
             # --- agent behavior ---
             {
                 "key": "commit_guidance",

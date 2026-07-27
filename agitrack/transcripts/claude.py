@@ -975,6 +975,38 @@ def _queued_human_prompt(row: dict) -> str | None:
     return text
 
 
+def _superseded_prompt_ids(rows: list[dict]) -> set[str]:
+    """Ids of ``user`` rows the user REWOUND past — edited and re-sent before the agent
+    acted on them.
+
+    Editing a prompt does not rewrite its row: Claude Code branches, recording the revised
+    text as a NEW user row hanging off the SAME ``parentUuid`` and continuing the
+    conversation from that one. The abandoned row stays in the transcript with nothing
+    descending from it, so replaying the file linearly showed the discarded draft in the
+    interaction trace next to the real prompt — the same message twice, once as the user
+    first wrote it.
+
+    Siblings are the signal: among ``user`` rows sharing a parent, only the last is live.
+    A genuine mid-turn follow-up is NOT a sibling (Claude threads those into the running
+    turn as ``attachment`` rows), so this cannot swallow one. Rows with no parent are left
+    alone — every conversation start shares "no parent" without being a rewind.
+    """
+    seen: dict[str, str] = {}
+    superseded: set[str] = set()
+    for row in rows:
+        if row.get("type") != "user" or row.get("isSidechain"):
+            continue
+        parent = str(row.get("parentUuid") or "")
+        uuid = str(row.get("uuid") or "")
+        if not parent or not uuid:
+            continue
+        previous = seen.get(parent)
+        if previous is not None:
+            superseded.add(previous)  # an earlier draft off the same parent: abandoned
+        seen[parent] = uuid
+    return superseded
+
+
 def parse_rows(
     session_id: str,
     rows: list[dict],
@@ -993,6 +1025,9 @@ def parse_rows(
     # watermark can trim, instead of being re-attributed onto each new turn every re-parse.
     turns: list[SessionTurn] = []
     tool_ids_per_turn: list[set[str]] = []
+    # Prompts the user edited before the agent answered: their rows are still in the file
+    # but nothing descends from them (see _superseded_prompt_ids).
+    superseded = _superseded_prompt_ids(rows)
     current: dict | None = None
     model: str | None = None
     updated: int | None = None
@@ -1046,6 +1081,10 @@ def parse_rows(
             updated = stamp if updated is None else max(updated, stamp)
         row_type = row.get("type")
         if row_type == "user":
+            if str(row.get("uuid") or "") in superseded:
+                # A draft the user edited before the agent saw it: nothing in the
+                # conversation descends from this row, so it is not part of the history.
+                continue
             if collect_edits and pending_reads:
                 # A Read's result: seed the file's pre-existing content before any later Write.
                 _seed_reads_from_result(_as_dict(row.get("message")), pending_reads, file_state)

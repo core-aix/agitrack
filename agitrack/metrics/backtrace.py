@@ -20,7 +20,7 @@ import hashlib
 import http.server
 import json
 import urllib.parse
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
@@ -322,6 +322,25 @@ def build_backtrace(
     )
 
 
+def _has_usage(tokens) -> bool:
+    """Whether a turn actually consumed anything. A prompt that was interrupted before the
+    agent replied reports zeros across the board (``context`` is a window size, not usage)."""
+    fields = (
+        "total",
+        "input",
+        "output",
+        "reasoning",
+        "cache_read",
+        "cache_write",
+        "subagent_input",
+        "subagent_output",
+        "subagent_reasoning",
+        "subagent_cache_read",
+        "subagent_cache_write",
+    )
+    return any(int(getattr(tokens, name, 0) or 0) for name in fields)
+
+
 def _session_to_stats(
     source: _Source,
     session_id: str,
@@ -342,6 +361,13 @@ def _session_to_stats(
     session_changed = False
     turn_refs: list[dict] = []
     last_message_id = ""
+    # Prompts the agent never answered are not agent turns. An interrupted message (the user
+    # changed their mind, then re-asked) leaves a turn with a prompt and nothing else — no
+    # reply, no edits, no tokens — and the reconstruction was listing it as its own entry, so
+    # one exchange read as two. Such a prompt is carried FORWARD and shown with the turn that
+    # did answer, exactly as a commit joins the prompts it covers. A trailing one (the turn
+    # currently in flight) has nothing to join yet and is left out until it does.
+    carried: list[str] = []
     for offset, turn in enumerate(turns):
         index = start_index + offset
         # The resume watermark: the last message id we processed, even for an empty turn, so next
@@ -355,6 +381,16 @@ def _session_to_stats(
         has_content = bool(turn.user_prompt.strip() or turn.final_response.strip() or turn.agent_messages or edits)
         if not has_content:
             continue
+        answered = bool(turn.final_response.strip() or turn.agent_messages or edits or _has_usage(turn.tokens))
+        if not answered:
+            # Nothing came back for this prompt: hold it for the turn that does answer.
+            if turn.user_prompt.strip():
+                carried.append(turn.user_prompt.strip())
+            continue
+        if carried:
+            # The unanswered prompts belong to this turn's exchange, oldest first.
+            turn = replace(turn, user_prompt="\n\n".join([*carried, turn.user_prompt.strip()]).strip())
+            carried = []
         sha = _virtual_sha(source.backend, session_id, index, turn.assistant_message_id)
         insertions, deletions = total_lines(edits)
         if edits:
@@ -1449,7 +1485,7 @@ def run_backtrace_daemon(
             _stop.set()
             threading.Thread(target=_server.shutdown, daemon=True).start()
 
-        update_restart.watch_for_update(stop, _restart_for_update)
+        update_restart.watch_for_update(stop, _restart_for_update, self_update=True)
 
         try:
             server.serve_forever()

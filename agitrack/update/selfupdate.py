@@ -2,7 +2,11 @@
 
 Updating the installation is not a decision the user should have to make over and over,
 so any aGiTrack process — the interactive TUI or one of the daemons — may install a newer
-version on its own. Three rules shape how that is done safely:
+version on its own. It is ON by default; the global ``self_update`` setting turns it off
+for a machine that must stay pinned, and aGiTrack then only REPORTS that a newer version
+exists (the dashboards' "install it yourself" notice) instead of installing it.
+
+Three rules shape how updating is done safely:
 
 **One updater at a time.** Several aGiTrack processes usually run at once (a TUI, a
 dashboard daemon, a backtrace daemon, background trackers in other repos). Two of them
@@ -174,6 +178,12 @@ def attempt_self_update(*, debug=None, timeout: int | None = None, on_status=Non
             except Exception:
                 pass
 
+    if not self_update_enabled():
+        # The user pinned this machine to the installed version. Still CHECK, so the
+        # dashboards and the TUI can say an update exists — they just won't install it.
+        _log("self-update: disabled by config (self_update = false); reporting only")
+        return _report_only(on_status=on_status, log=_log)
+
     from agitrack.git.lock import RepoLock
 
     lock = RepoLock(lock_path())
@@ -235,6 +245,53 @@ def attempt_self_update(*, debug=None, timeout: int | None = None, on_status=Non
         return read_state()
     finally:
         lock.release()
+
+
+def self_update_enabled() -> bool:
+    """Whether aGiTrack may install updates for itself — the global ``self_update``
+    setting, on unless the user turned it off. Read fresh each attempt so flipping it
+    takes effect without restarting anything."""
+    try:
+        from agitrack.config.settings import GlobalConfig
+
+        return bool(GlobalConfig().self_update)
+    except Exception:
+        return True  # a broken/absent config must not silently stop updates
+
+
+def _report_only(*, on_status, log) -> SelfUpdateRecord:
+    """Check without installing (self-update turned off): record what the user would have
+    to install themselves, so the dashboards' "install it yourself" notice still appears."""
+    try:
+        from agitrack.update.updater import Updater
+
+        updater = Updater()
+        status = updater.check()
+        if on_status is not None:
+            try:
+                on_status(status)
+            except Exception:
+                pass
+        if not status.ok:
+            return read_state()
+        if not status.available:
+            record = SelfUpdateRecord(state=STATE_OK, current=status.current, at=time.time())
+            write_state(record)
+            return record
+        record = SelfUpdateRecord(
+            state=STATE_MANUAL,
+            current=status.current,
+            latest=status.latest,
+            method=_method_label(updater),
+            error="automatic updates are turned off for this machine",
+            instructions=_instructions(updater),
+            at=time.time(),
+        )
+        write_state(record)
+        return record
+    except Exception as error:
+        log(f"self-update: report-only check failed: {error!r}")
+        return read_state()
 
 
 def _method_label(updater) -> str:
