@@ -125,10 +125,11 @@ def test_export_disables_filters_and_cans_learn_actions(tmp_path, monkeypatch):
     # behavior each correction measured a mid-animation position and visibly overshot.
     assert 'pos !== "sticky" && pos !== "fixed"' in index
     assert 'root.style.scrollBehavior = "auto"' in index
-    # The learn page shows the same note in the same amber notice style: its error-path
-    # flashes carrying the demo note are restyled to notices (real errors stay red).
+    # EVERY flash on the demo learn page is the same amber notice: a snapshot has no
+    # actionable failure, and matching the note's text would miss the page's escaped
+    # rendering of it ("doesn't" -> "doesn&#39;t"), leaving some notes red and some amber.
     learn = (out / "learn" / "index.html").read_text(encoding="utf-8")
-    assert "html.replace('class=\"error\"', 'class=\"notice\"')" in learn
+    assert 'html.replace(/class="error"/g, \'class="notice"\')' in learn
     # Controls that would show the note inline (engine save, sync toggle) or swallow it
     # silently (start over) are intercepted to the same toast instead.
     assert '["e-save", "sync-toggle", "reset-suggest"]' in learn
