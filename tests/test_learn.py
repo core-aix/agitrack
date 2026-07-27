@@ -745,6 +745,22 @@ def test_flash_notices_are_a_fixed_toast(tmp_path):
     assert "click to dismiss" in html
 
 
+def test_learn_page_fits_a_phone_width_exactly(tmp_path):
+    # The page must never scroll sideways on a phone. Two things pushed past the viewport:
+    # a progress row whose title could not shrink beside non-shrinking badges, and the stat
+    # tooltip — a fixed-width absolutely positioned bubble that still contributes scrollable
+    # overflow while invisible, so the rightmost stat's bubble hung off the page edge.
+    repo = _init_repo(tmp_path)
+    html = learn.learn_html(repo.repo)
+    assert ".plist .pl{display:flex;flex-wrap:wrap" in html  # badges drop to their own line
+    assert ".plist .plt{flex:1 1 55%;min-width:0" in html  # the title may shrink
+    # The tooltip anchors to the stats ROW (its positioned ancestor) and is capped at the
+    # row width, so it can never extend past the page no matter which stat is hovered.
+    assert "flex-wrap:wrap;margin-bottom:10px;position:relative}" in html
+    assert ".pstat{cursor:help}" in html
+    assert "width:min(240px,100%)" in html
+
+
 def test_dashboard_serves_learn_routes(tmp_path, monkeypatch, fixed_identity):
     # End-to-end over HTTP: the live dashboard server exposes the page, the state
     # endpoint, and the POST endpoints (here: a progress write for an unknown lesson,

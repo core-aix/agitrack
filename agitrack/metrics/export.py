@@ -294,20 +294,41 @@ def _shim(*, base: str, files_index: dict[str, int], learn: bool, site_root: str
         }});
         if (target) {{
           clearInterval(tick);
+          // Only chrome that is ACTUALLY pinned to the top can cover the entry. The filter
+          // bar is sticky on a desktop but scrolls away on a phone, where reserving its
+          // (tall, wrapped) height parked the entry a screenful too low — with earlier
+          // commits filling the gap. So measure the stuck elements' bottom edge rather
+          // than blindly summing heights.
+          var inset = function(){{
+            var bottom = 0;
+            [".backtracebanner", ".controls"].forEach(function(sel){{
+              var el = document.querySelector(sel);
+              if (!el) return;
+              var pos = getComputedStyle(el).position;
+              if (pos !== "sticky" && pos !== "fixed") return;
+              bottom = Math.max(bottom, el.getBoundingClientRect().bottom);
+            }});
+            return bottom + 10;
+          }};
           // Two scrolls, not one: the commit message lives in its own scrollable box
           // (.dmsg, max-height-capped), so the WINDOW pins the expanded ENTRY right
           // below the sticky chrome (the commit fills the view, no earlier entries
           // showing) while the BOX scrolls internally so the trace starts at its top.
           var box = target.closest ? target.closest(".dmsg") : null;
+          // The page scrolls smoothly by default (html{{scroll-behavior:smooth}}), which
+          // makes every correction animate — each next one then measures a position
+          // mid-flight and overshoots, so the view visibly ran down past the commit and
+          // crept back up. Corrections must be instant; restore the page default after.
+          var root = document.documentElement, priorBehavior = root.style.scrollBehavior;
+          root.style.scrollBehavior = "auto";
+          var done = function(){{ clearInterval(pin); root.style.scrollBehavior = priorBehavior; }};
           var settled = 0, corrections = 0;
           var pin = setInterval(function(){{
-            var strip = document.querySelector(".backtracebanner"), bar = document.querySelector(".controls");
-            var want = (strip ? strip.offsetHeight : 0) + (bar ? bar.offsetHeight : 0) + 10;
             if (box) box.scrollTop += Math.round(target.getBoundingClientRect().top - box.getBoundingClientRect().top);
-            var drift = entry.getBoundingClientRect().top - want;
-            if (Math.abs(drift) <= 2) {{ if (++settled >= 4) clearInterval(pin); return; }}
+            var drift = entry.getBoundingClientRect().top - inset();
+            if (Math.abs(drift) <= 2) {{ if (++settled >= 4) done(); return; }}
             settled = 0;
-            if (++corrections > 50) {{ clearInterval(pin); return; }}
+            if (++corrections > 60) {{ done(); return; }}
             window.scrollBy(0, drift);
           }}, 100);
         }}
