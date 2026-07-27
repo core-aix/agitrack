@@ -173,6 +173,40 @@ def test_backtrace_lines_card_admits_undercount_and_drops_nontracked(tmp_path):
     assert '(BACKTRACE ? "" : lineRow("Non-tracked"' in html
 
 
+def test_commit_message_paragraphs_reflow_when_the_column_is_narrower(tmp_path):
+    # Commit messages are hard-wrapped by the writer (~72 chars). Rendered in a column
+    # narrower than that, every source line wrapped AGAIN and the text read as ragged
+    # fragments. Consecutive lines are now ONE paragraph whose source breaks are <br>s,
+    # and a paragraph the layout wraps further hides them (the space before each <br> is
+    # what joins the words). A blank line still starts a new paragraph, and the metadata
+    # block keeps its breaks always — they are structure, not prose.
+    from agitrack.metrics.web import shell_html
+
+    html = _seeded(tmp_path) and shell_html(_seeded(tmp_path))
+    assert 'join(" <br>")' in html  # lines of one paragraph, breaks kept as <br>
+    assert '<p class="mdp${inMeta?" keep":""}">' in html  # metadata paragraphs opt out
+    assert "/agitrack\\s+metadata/i.test(h[2])" in html  # …detected from the heading
+    assert ".dmsg.md p.mdp.reflow br{display:none}" in html
+    assert "function reflowParagraphs(root)" in html
+    assert "tops.length > breaks + 1" in html  # more line boxes than source lines => wrapped
+    assert "reflowParagraphs(document), 150" in html  # re-decided on resize
+
+
+def test_phone_layout_uses_the_full_width(tmp_path):
+    # A 24px gutter each side costs ~12% of a phone's width; on phones the page, log rows
+    # and panels shave their horizontal padding to the minimum so the content owns the screen.
+    from agitrack.metrics.web import shell_html
+
+    html = shell_html(_seeded(tmp_path))
+    assert ".wrap{padding-left:6px;padding-right:6px}" in html
+    assert ".log{padding-left:18px}" in html  # the timeline rail narrows with it
+    assert ".entry::before{left:-17.5px}" in html  # …dots stay centred on the rail
+    # A subject with no spaces (a shell command, a long flag) must break rather than push
+    # the row past the screen — that gave the whole page a horizontal scrollbar.
+    assert "overflow-wrap:anywhere}" in html.split(".entry .ksub{", 1)[1][:120]
+    assert ".entry .ksub{min-width:0;flex-basis:100%}" in html
+
+
 def test_first_paint_never_fetches_the_shared_ref(tmp_path, monkeypatch):
     # The "/" response must not wait on the network: a slow shared-sessions fetch kept the
     # browser on a blank tab for seconds, before any loading screen could even arrive.

@@ -781,11 +781,12 @@ body.booting .wrap>*:not(header):not(#booting){display:none}
   text-align:center;box-shadow:0 4px 16px rgba(0,0,0,.55)}
 /* Same treatment as the learn banner's code chip, so a command reads identically on every page. */
 .backtracebanner code{color:var(--fg);background:var(--ink);padding:0 5px}
-/* Banner links match the banner's amber (identical rule on the learn page's .btbanner):
-   the page-global anchor colors differ between the two pages, so left unstyled the same
-   demo-banner link rendered green here and cyan there. */
-.backtracebanner a{color:var(--amber);border-bottom:1px solid var(--amber-dim)}
-.backtracebanner a:hover{color:var(--ink);background:var(--amber)}
+/* The banner's call-to-action link is GREEN against the amber notice text, so the one
+   thing to click stands apart from the explanation. Styled explicitly (identical rule on
+   the learn page's .btbanner) because the two pages' global anchor colors differ, which
+   is what made the same demo banner render a different colour on each. */
+.backtracebanner a{color:var(--phosphor);border-bottom:1px solid var(--phosphor-dim)}
+.backtracebanner a:hover{color:var(--ink);background:var(--phosphor)}
 @keyframes rise{from{transform:translateY(-100%)}to{transform:none}}
 
 header{padding:26px 0 18px}
@@ -996,7 +997,10 @@ h2.section::before{content:"# ";color:var(--amber)}
 .entry.ops::before{border-color:var(--ops);box-shadow:0 0 8px rgba(103,184,214,.4)}
 .entry.nontracked::before{border-color:var(--amber)}
 .entry .sha{color:var(--amber);font-size:12.5px}
-.entry .ksub{flex:1;min-width:200px;color:var(--fg)}
+/* overflow-wrap:anywhere so a subject with no spaces (a shell command, a long flag,
+   a URL) breaks instead of pushing the row past the screen and giving the whole page
+   a horizontal scrollbar. */
+.entry .ksub{flex:1;min-width:200px;color:var(--fg);overflow-wrap:anywhere}
 .entry .badge{font-size:10.5px;letter-spacing:.5px;padding:1px 7px;border:1px solid var(--line);color:var(--fg-dim)}
 .entry .badge.ai{color:var(--phosphor);border-color:var(--phosphor-dim)}
 .entry .badge.ops{color:var(--ops);border-color:var(--ops)}
@@ -1037,6 +1041,10 @@ h2.section::before{content:"# ";color:var(--amber)}
   border-radius:50%;animation:spin .7s linear infinite}
 /* rendered Markdown inside the expanded message */
 .dmsg.md p{margin:7px 0}
+/* Reflow mode (set by reflowParagraphs on paragraphs the layout wraps anyway):
+   the source line breaks stop rendering and the paragraph flows as prose. The
+   space preceding each <br> in the markup keeps the words apart. */
+.dmsg.md p.mdp.reflow br{display:none}
 .dmsg.md .md-h{font-family:var(--mono);color:var(--amber);margin:11px 0 5px;font-size:13px;font-weight:600}
 /* Heading depth reads at a glance: structural sections (# …) brightest/largest,
    the ## User/## Agent role one step down, and a message's own nested headings
@@ -1148,6 +1156,21 @@ footer{margin-top:46px;padding-top:22px;border-top:1px dashed var(--line);color:
   display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap}
 footer .flink{color:var(--accent,#6be);text-decoration:none}
 footer .flink:hover{text-decoration:underline}
+
+/* ---- phone layout: give the content the whole screen ----------------------------------
+   A 24px gutter each side plus a 34px commit-log rail costs ~25% of a phone's width. These
+   rules live at the END of the sheet on purpose: a media query adds no specificity, so an
+   override must come AFTER the base rule it targets (the earlier phone block above only
+   works because the filter-bar rules it overrides are declared before it). */
+@media (max-width:760px){
+  .wrap{padding-left:6px;padding-right:6px}
+  .panel,.card{padding-left:12px;padding-right:12px}
+  /* Rail line and entry dots stay concentric at the narrower offset. */
+  .log{padding-left:18px}
+  .log::before{left:6px}
+  .entry::before{left:-17.5px}
+  .entry .ksub{min-width:0;flex-basis:100%}
+}
 </style>
 </head>
 <body>
@@ -1392,25 +1415,67 @@ function md(src){
     .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
     .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>")
     .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
-  let html="", inCode=false, code=[], inList=false;
+  let html="", inCode=false, code=[], inList=false, inMeta=false, para=[];
   const closeList = () => { if(inList){ html+="</ul>"; inList=false; } };
+  // Consecutive non-blank lines are ONE paragraph, their source breaks kept as <br>. A
+  // blank line still starts a new paragraph. The " " before each <br> is what remains when
+  // reflowParagraphs() hides the break on a narrow screen, so the lines join as prose.
+  // Metadata lines (key: value, after the "aGiTrack Metadata" heading) are marked "keep":
+  // their breaks are structure, never re-flowed.
+  const flushPara = () => {
+    if(!para.length) return;
+    html += `<p class="mdp${inMeta?" keep":""}">` + para.map(inline).join(" <br>") + "</p>";
+    para = [];
+  };
   for(const raw of lines){
     if(raw.trimStart().startsWith("```")){
+      flushPara();
       if(inCode){ html+="<pre class=\"md-code\">"+esc(code.join("\n"))+"</pre>"; code=[]; inCode=false; }
       else { closeList(); inCode=true; }
       continue;
     }
     if(inCode){ code.push(raw); continue; }
     const h = raw.match(/^(#{1,6})\s+(.*)$/);
-    if(h){ closeList(); const lvl=Math.min(6,h[1].length+2); html+=`<h${lvl} class="md-h">${inline(h[2])}</h${lvl}>`; continue; }
+    if(h){
+      flushPara(); closeList();
+      if(/agitrack\s+metadata/i.test(h[2])) inMeta = true;
+      const lvl=Math.min(6,h[1].length+2); html+=`<h${lvl} class="md-h">${inline(h[2])}</h${lvl}>`; continue;
+    }
     const li = raw.match(/^\s*[-*+]\s+(.*)$/);
-    if(li){ if(!inList){ html+="<ul>"; inList=true; } html+="<li>"+inline(li[1])+"</li>"; continue; }
-    if(raw.trim()===""){ closeList(); continue; }
-    html += "<p>"+inline(raw)+"</p>";
+    if(li){ flushPara(); if(!inList){ html+="<ul>"; inList=true; } html+="<li>"+inline(li[1])+"</li>"; continue; }
+    if(raw.trim()===""){ flushPara(); closeList(); continue; }
+    para.push(raw);
   }
+  flushPara();
   if(inCode){ html+="<pre class=\"md-code\">"+esc(code.join("\n"))+"</pre>"; }
   closeList();
   return html;
+}
+
+// Commit messages are hard-wrapped by the writer (~72 chars). When the rendering column is
+// narrower than that, every source line wraps AGAIN and the text reads as ragged fragments.
+// So a paragraph the layout wraps further drops its single line breaks and flows as prose;
+// one that fits keeps every break exactly as written. Blank-line paragraph breaks always
+// stay, as does the metadata block. Measured on the un-joined text, so the decision is
+// about the ORIGINAL lines; re-run on resize.
+function reflowParagraphs(root){
+  if(!root || !root.querySelectorAll) return;
+  for(const p of root.querySelectorAll("p.mdp:not(.keep)")){
+    p.classList.remove("reflow");
+    const breaks = p.getElementsByTagName("br").length;
+    if(!breaks) continue;
+    const lh = parseFloat(getComputedStyle(p).lineHeight) || 16;
+    const range = document.createRange();
+    range.selectNodeContents(p);
+    // One rect per line box — but inline <code> sits a couple of pixels off its line, so
+    // cluster by line height instead of counting distinct tops.
+    const tops = [];
+    for(const r of range.getClientRects()){
+      if(!r.height) continue;
+      if(!tops.some(t => Math.abs(t - r.top) < lh * 0.6)) tops.push(r.top);
+    }
+    if(tops.length > breaks + 1) p.classList.add("reflow");
+  }
 }
 
 // `min` (default 0) is the low end of the scale: the width maps [min, max] → [0, 100],
@@ -1920,6 +1985,7 @@ function toggleDetail(i){
     detail.innerHTML = `<div class="dhead">${head}</div>${who}${span}`+
       `<div class="dmsg md" id="dbody-${i}" data-mode="msg">${md(c.message||"(no message recorded)")}</div>`+
       partsHtml(c.parts);
+    reflowParagraphs(detail);   // covers the squashed constituents' messages too
   });
 }
 
@@ -1944,6 +2010,7 @@ async function toggleDiff(i){
   if(body.dataset.mode === "diff"){                       // diff → back to the commit message
     body.dataset.mode = "msg"; body.className = "dmsg md";
     body.innerHTML = md(c.message||"(no message recorded)");
+    reflowParagraphs(body);
     if(btn) btn.textContent = "show file diff";
     return;
   }
@@ -2165,6 +2232,7 @@ function toggleFileChange(head){
     if(box.hidden) return;
     box.innerHTML = `<button class="fdifftoggle" data-i="${i}">show file diff</button>`+
       `<div class="dmsg md" id="fbody-${i}" data-mode="msg">${md(c.message || "(no conversation recorded)")}</div>`;
+    reflowParagraphs(box);
   });
 }
 const _fdiffCache = {};
@@ -2174,6 +2242,7 @@ async function toggleFileBody(btn){
   if(body.dataset.mode === "diff"){                     // diff → back to the conversation
     body.dataset.mode = "msg"; body.className = "dmsg md";
     body.innerHTML = md(c.message || "(no conversation recorded)");
+    reflowParagraphs(body);
     btn.textContent = "show file diff";
     return;
   }
@@ -2304,6 +2373,9 @@ async function init(){
   cv.addEventListener("dblclick", () => { resetZoom(); renderChart(); });
   // The canvas backing store is sized in px, so it must be repainted on resize.
   let rz; window.addEventListener("resize", () => { clearTimeout(rz); rz = setTimeout(renderChart, 120); });
+  // Whether a commit message keeps its source line breaks depends on the column width, so
+  // every open message is re-measured when the window changes size.
+  let rf; window.addEventListener("resize", () => { clearTimeout(rf); rf = setTimeout(() => reflowParagraphs(document), 150); });
   if(ready){ renderAgg(); renderLog(); }
   // The file browser is independent of the commit-log filters, so it loads once here.
   wireFileBrowser();

@@ -91,7 +91,8 @@ def test_export_scopes_the_demo_to_the_last_30_days(tmp_path, monkeypatch):
     assert not (out / "demo" / "diff" / f"{ancient_sha}.json").exists()  # only in-scope diffs baked
 
     index = (out / "index.html").read_text(encoding="utf-8")
-    assert "in the 30 days before" in index  # the banner names the scope
+    assert "30-day period" in index  # the banner names the scope (dateless: no build stamp)
+    assert "UTC" not in index.split("</div>", 1)[0]  # …and carries no timestamp
     assert 'period.value = "30"' in index  # the disabled range dropdown shows the real scope
 
 
@@ -125,10 +126,11 @@ def test_export_disables_filters_and_cans_learn_actions(tmp_path, monkeypatch):
     # behavior each correction measured a mid-animation position and visibly overshot.
     assert 'pos !== "sticky" && pos !== "fixed"' in index
     assert 'root.style.scrollBehavior = "auto"' in index
-    # The learn page shows the same note in the same amber notice style: its error-path
-    # flashes carrying the demo note are restyled to notices (real errors stay red).
+    # EVERY flash on the demo learn page is the same amber notice: a snapshot has no
+    # actionable failure, and matching the note's text would miss the page's escaped
+    # rendering of it ("doesn't" -> "doesn&#39;t"), leaving some notes red and some amber.
     learn = (out / "learn" / "index.html").read_text(encoding="utf-8")
-    assert "html.replace('class=\"error\"', 'class=\"notice\"')" in learn
+    assert 'html.replace(/class="error"/g, \'class="notice"\')' in learn
     # Controls that would show the note inline (engine save, sync toggle) or swallow it
     # silently (start over) are intercepted to the same toast instead.
     assert '["e-save", "sync-toggle", "reset-suggest"]' in learn
@@ -145,11 +147,11 @@ def test_export_disables_filters_and_cans_learn_actions(tmp_path, monkeypatch):
     # out install commands.
     assert 'href="../#install"' in index
     assert 'href="../../#install"' in learn
-    # …and the link renders in the SAME amber on both pages (the pages' global anchor
-    # colors differ — green vs cyan — so each banner styles its links explicitly;
-    # --warn and --amber are the same #ffb454).
-    assert ".backtracebanner a{color:var(--amber)" in index
-    assert ".btbanner a{color:var(--warn)" in learn
+    # …and the link renders GREEN on BOTH pages, standing out from the amber banner text.
+    # Each banner styles its links explicitly because the two pages' global anchor colors
+    # differ, which is what made the same banner render differently on each.
+    assert ".backtracebanner a{color:var(--phosphor)" in index
+    assert ".btbanner a{color:var(--phosphor)" in learn
 
 
 def test_export_learn_state_falls_back_to_the_single_store_profile(tmp_path, monkeypatch):
