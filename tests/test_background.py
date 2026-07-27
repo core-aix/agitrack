@@ -1303,8 +1303,11 @@ def test_background_mode_persist_roundtrip(tmp_path):
 
 
 def test_daemon_update_check_writes_marker_and_clears(tmp_path, monkeypatch):
-    # The daemon's periodic check RECORDS an available update (it never auto-installs), and clears
-    # a stale marker once up to date. It also emits an event-log line.
+    # The daemon's periodic pass now SELF-UPDATES (behind the cross-process lock) and still
+    # records what is left for the user, clearing a stale marker once up to date. The
+    # attempt is stubbed here — no test may run a real update, which fetches and merges the
+    # checkout aGiTrack runs from (see the conftest guard); what is asserted is what the
+    # daemon does with the status the attempt reports.
     from agitrack.events import EventLog
     from agitrack.update.marker import read_update_marker
 
@@ -1319,9 +1322,17 @@ def test_daemon_update_check_writes_marker_and_clears(tmp_path, monkeypatch):
         latest = "0.2.0"
         message = "aGiTrack update available: 0.1.16 → 0.2.0."
 
-    monkeypatch.setattr(
-        "agitrack.update.updater.Updater", lambda *a, **k: type("U", (), {"check": lambda self: _Status()})()
-    )
+    def _attempt(status_cls):
+        def _run(*, debug=None, timeout=None, on_status=None):
+            if on_status is not None:
+                on_status(status_cls())
+            from agitrack.update.selfupdate import SelfUpdateRecord
+
+            return SelfUpdateRecord()
+
+        return _run
+
+    monkeypatch.setattr("agitrack.update.selfupdate.attempt_self_update", _attempt(_Status))
     runner._run_update_check()
     info = read_update_marker(repo.repo)
     assert info and info["latest"] == "0.2.0"
@@ -1331,9 +1342,7 @@ def test_daemon_update_check_writes_marker_and_clears(tmp_path, monkeypatch):
     class _None(_Status):
         available = False
 
-    monkeypatch.setattr(
-        "agitrack.update.updater.Updater", lambda *a, **k: type("U", (), {"check": lambda self: _None()})()
-    )
+    monkeypatch.setattr("agitrack.update.selfupdate.attempt_self_update", _attempt(_None))
     runner._run_update_check()
     assert read_update_marker(repo.repo) is None
 

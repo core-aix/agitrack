@@ -114,6 +114,7 @@ DEFAULT_TIMINGS: dict[str, float] = {
     "base_drift_check_seconds": 2.0,  # how often to check the base repo's checked-out branch
     "summary_wait_seconds": 45.0,  # how long integration waits for a background commit summary (#8)
     "update_check_seconds": 300.0,  # how often to re-check for an aGiTrack self-update (every 5 min)
+    "self_update": True,  # install a newer aGiTrack automatically (off ⇒ only tell the user)
     "idle_after_seconds": 30.0,  # no input/output AND no running session for this long ⇒ enter low-power idle
     "idle_poll_seconds": 30.0,  # background-sweep interval while idle (the loop still wakes instantly on input)
 }
@@ -356,6 +357,22 @@ class GlobalConfig:
     @background.setter
     def background(self, value: bool) -> None:
         self.data["background"] = bool(value)
+        self.save()
+
+    @property
+    def self_update(self) -> bool:
+        # Whether aGiTrack may install a newer version of ITSELF (the TUI and the daemons
+        # both do it, behind a cross-process lock; see agitrack/update/selfupdate.py).
+        # On by default: keeping the installation current is not a decision worth asking
+        # about every time, and nothing restarts a running session over it. Turn it off to
+        # pin this machine to the installed version — aGiTrack then only tells you an
+        # update exists and leaves installing it to you.
+        value = self._raw("self_update")
+        return True if value is None else bool(value)
+
+    @self_update.setter
+    def self_update(self, value: bool) -> None:
+        self.data["self_update"] = bool(value)
         self.save()
 
     @property

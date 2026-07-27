@@ -1200,3 +1200,64 @@ def test_served_view_follows_the_rebuilt_one(monkeypatch, tmp_path):
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_a_prompt_the_agent_never_answered_joins_the_turn_that_did(monkeypatch, tmp_path):
+    """The reconstruction lists AGENT turns, so a prompt with no reply is not one of its own.
+
+    Interrupting a message (changing your mind, then re-asking) leaves a turn carrying only
+    a prompt — no reply, no edits, no tokens — and it was listed as its own entry, so one
+    exchange read as two ("…what do you mean…" with zero tokens, then "Please continue."
+    with all the work). The unanswered prompt now leads the turn that answered.
+    """
+    interrupted = _turn("What do you mean by that?", agent="", assistant_id="")
+    interrupted.final_response = ""
+    interrupted.tokens = TokenUsage()
+    answered = _turn("Please continue.", agent="Here is the answer.", assistant_id="m2")
+    _patch_discovery(
+        monkeypatch,
+        claude_sessions={"s1": ExportedSession(session_id="s1", model="m", updated=1, turns=[interrupted, answered])},
+    )
+
+    view = bt.build_backtrace(tmp_path)
+
+    assert view.dashboard.total_commits == 1  # one exchange, one entry
+    only = view.dashboard.stats[0]
+    assert "What do you mean by that?" in only.message and "Please continue." in only.message
+    assert "Here is the answer." in only.message
+
+
+def test_an_unanswered_prompt_with_nothing_after_it_is_not_listed_yet(monkeypatch, tmp_path):
+    """The turn currently in flight has no answer to join, so it waits rather than showing
+    as a user-only entry — it appears as soon as the agent responds."""
+    pending = _turn("Start working on this.", agent="", assistant_id="")
+    pending.final_response = ""
+    pending.tokens = TokenUsage()
+    _patch_discovery(
+        monkeypatch,
+        claude_sessions={"s1": ExportedSession(session_id="s1", model="m", updated=1, turns=[pending])},
+    )
+    assert bt.build_backtrace(tmp_path).dashboard.total_commits == 0
+
+
+def test_an_interrupted_turn_that_did_work_is_still_its_own_entry(monkeypatch, tmp_path):
+    """Only prompts that produced NOTHING fold. A turn the agent had started answering —
+    tokens spent, files changed — is real history and keeps its own entry."""
+    partial = _turn(
+        "Do the thing.",
+        agent="",
+        assistant_id="m1",
+        edits=[make_edit("/repo/a.py", "", "x\n", status="added")],
+        tokens=TokenUsage(input=100, output=20),
+    )
+    partial.final_response = ""
+    later = _turn("Carry on.", agent="Finished.", assistant_id="m2", started=2000, ended=2005)
+    _patch_discovery(
+        monkeypatch,
+        claude_sessions={"s1": ExportedSession(session_id="s1", model="m", updated=1, turns=[partial, later])},
+    )
+
+    view = bt.build_backtrace(tmp_path)
+
+    assert view.dashboard.total_commits == 2
+    assert [s.subject for s in view.dashboard.stats] == ["Do the thing.", "Carry on."]
