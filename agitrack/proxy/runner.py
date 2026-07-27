@@ -2760,11 +2760,22 @@ class ProxyRunner:
         if self._update_check_at and now - self._update_check_at < self.UPDATE_CHECK_SECONDS:
             return
         self._update_check_at = now
-        updater = self._updater
 
         def worker() -> None:
             try:
-                self._update_worker_result = updater.check()
+                # Self-update rather than nag: keeping the INSTALLATION current is not a
+                # decision worth interrupting someone for. The session keeps running on the
+                # code it loaded — restarting mid-conversation would be the interruption —
+                # so this only installs, and the reminder below asks for a restart.
+                # attempt_self_update holds the cross-process lock, so several aGiTrack
+                # instances never upgrade the same install at once; on_status hands us the
+                # check it already ran so we don't pay for a second one.
+                from agitrack.update.selfupdate import attempt_self_update
+
+                def _status(status) -> None:
+                    self._update_worker_result = status
+
+                self._self_update_record = attempt_self_update(debug=self._debug, on_status=_status)
             except Exception as error:  # never let a check crash the worker
                 self._debug(f"update check failed: {error!r}")
                 self._update_worker_result = None
@@ -2796,18 +2807,50 @@ class ProxyRunner:
                 clear_update_marker(self.base_repo.repo)
         except Exception as error:
             self._debug(f"update marker write failed: {error!r}")
+        record = getattr(self, "_self_update_record", None)
+        if record is not None and record.needs_user and not self._update_offered:
+            # aGiTrack could not install this one itself (Homebrew, an MSI, a Windows pip
+            # install): say so once, with the command that does it.
+            self._update_offered = True
+            detail = f" {record.instructions}" if record.instructions else ""
+            self._set_message(
+                f"aGiTrack {record.latest} is available but this installation has to be updated by you.{detail}",
+                seconds=15.0,
+            )
+            self._render()
+            return
+        if self._running_code_is_stale() and not self._update_offered:
+            # A self-update (ours or another instance's) landed newer code on disk while
+            # this session kept running on the old one. Remind, never restart.
+            self._update_offered = True
+            self._set_message(
+                "aGiTrack updated itself in the background. Restart aGiTrack when convenient to load "
+                f"the new version — {self._menu_label()} → 'update' restarts it once your sessions finish.",
+                seconds=15.0,
+            )
+            self._render()
+            return
         if result.available and not self._update_offered and not self._manual_update_pending():
-            # First time we have seen this update: prompt the user (a status-bar
-            # notice pointing at the `update` command, so we don't seize the
-            # screen mid-keystroke). Suppressed when a manual update is already
-            # pending (a prior automatic attempt failed) — that user is reminded
-            # once at startup instead of being nagged here every check.
+            # Still worth a pointer when an update exists that we have not installed yet
+            # (e.g. the lock was held by another instance this round).
             self._update_offered = True
             self._set_message(
                 f"{result.message}\n{self._menu_label()} → 'update' to install it when your sessions finish.",
                 seconds=12.0,
             )
             self._render()
+
+    def _running_code_is_stale(self) -> bool:
+        """Whether the code on disk has moved past what this process loaded — i.e. an
+        update landed underneath a running session (see selfupdate: daemons restart
+        themselves, sessions are only reminded)."""
+        try:
+            from agitrack.update.restart import RUNNING_FINGERPRINT, disk_fingerprint
+
+            current = disk_fingerprint()
+            return bool(current) and bool(RUNNING_FINGERPRINT) and current != RUNNING_FINGERPRINT
+        except Exception:
+            return False
 
     def _ready_for_update(self) -> bool:
         # "All sessions finished and commits are in": nothing is mid-turn,

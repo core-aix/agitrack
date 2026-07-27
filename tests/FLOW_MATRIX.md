@@ -283,6 +283,11 @@ back to it the public demo 404s.
 ## 13. Self-update
 | Sequence | Test(s) | Kind |
 |---|---|---|
+| aGiTrack SELF-UPDATES without asking: the TUI and every daemon install a newer version on their own; only ONE instance may do it at a time (OS file lock in the global config dir, kernel-released if the holder dies) | `test_only_one_instance_may_self_update_at_a_time` | mock |
+| Install modes are never mixed: source and POSIX pip/pipx self-update; MSI (needs elevation), Homebrew (not ours) and Windows pip (locked exe) are recorded as "needs you" and never half-attempted | `test_only_install_modes_that_can_finish_unattended_are_attempted`, `test_windows_package_installs_are_left_to_the_post_exit_helper`, `test_a_mode_that_cannot_self_update_is_recorded_without_attempting` | mock |
+| A failed or impossible self-update is recorded globally and clears itself on success | `test_a_failed_self_update_is_recorded_for_the_dashboards`, `test_a_successful_self_update_clears_the_reminder` | mock |
+| Dashboards show the two notices SEPARATELY: "install it yourself" (global, on every dashboard incl. backtrace) vs "restart your session" (this repo only, from the fingerprint the session recorded in its repo lock) — the session is never restarted from under the user | `test_dashboards_show_the_two_notices_separately`, `test_a_session_running_older_code_is_detectable` | mock |
+| A lone dashboard or backtrace daemon still keeps the install current: the same watcher thread that restarts it also drives the self-update | `test_daemon_watcher_also_installs_updates` | mock |
 | Source: detect/apply (clean / diverged / conflict / offline) | `test_source_check_*`, `test_source_apply_*` | real-git |
 | Startup prompt (apply / default-enter / explicit-no / pending reminder) | `test_startup_prompt_*`, `test_startup_reminds_without_reprompting_when_pending` | mock |
 | Apply failure records pending and keeps running | `test_startup_apply_failure_records_pending_and_keeps_running` | mock |

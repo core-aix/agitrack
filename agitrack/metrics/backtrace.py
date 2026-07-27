@@ -824,11 +824,15 @@ def _make_handler(view_source) -> type[http.server.BaseHTTPRequestHandler]:
 
 
 def _banner_html(view: BacktraceView) -> str:
-    from agitrack.metrics.web import _escape
+    from agitrack.metrics.web import _escape, _update_banner_html
 
     # `backtracebanner` (not `updatebanner`) so it renders as a frozen top strip — the CSS pins
     # it like the filter bar, and the JS offsets the filters below it (see the template).
-    return f'<div class="backtracebanner">⏪ {_escape(view.banner_text())}</div>'
+    banner = f'<div class="backtracebanner">⏪ {_escape(view.banner_text())}</div>'
+    # An installation that could not update itself is the user's to fix, and this may be the
+    # only aGiTrack page they have open — so the notice belongs here too. No repo is passed:
+    # the "restart your session" half is repo-specific and meaningless for a reconstruction.
+    return _update_banner_html() + banner
 
 
 # ---------------------------------------------------------------------------
