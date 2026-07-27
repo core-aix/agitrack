@@ -256,3 +256,45 @@ def test_daemon_watcher_also_installs_updates(monkeypatch):
     stop2.set()
     thread2.join(timeout=2)
     assert attempts == [], "self-update must be opt-in, never a side effect of watching"
+
+
+def test_self_update_is_on_by_default_but_can_be_turned_off(tmp_path, monkeypatch):
+    """Self-updating is the default — the user is not asked, ever. A machine that must stay
+    pinned turns off the global ``self_update`` setting, and aGiTrack then only REPORTS the
+    newer version instead of installing it, so the dashboards still say what to do."""
+    monkeypatch.setenv("AGITRACK_CONFIG_DIR", str(tmp_path))
+    from agitrack.config.settings import GlobalConfig
+
+    assert GlobalConfig().self_update is True  # on unless the user says otherwise
+    applied: list[str] = []
+
+    class _Updater:
+        kind = KIND_SOURCE
+
+        def _install_method(self):
+            return METHOD_PIP
+
+        def check(self, **kwargs):
+            return types.SimpleNamespace(ok=True, available=True, current="1.0.0", latest="1.1.0", error="")
+
+        def apply(self):
+            applied.append("applied")
+            return types.SimpleNamespace(ok=True, error="", message="Updated.")
+
+        def manual_update_instructions(self):
+            return "Run: pip install --upgrade agitrack"
+
+    monkeypatch.setattr("agitrack.update.updater.Updater", _Updater)
+
+    assert _attempt_self_update().state == selfupdate.STATE_OK
+    assert applied == ["applied"]  # default: installs it
+
+    applied.clear()
+    config = GlobalConfig()
+    config.self_update = False
+    record = _attempt_self_update()
+    assert applied == []  # turned off: never installs
+    # …but the user is still told, with the command that does it.
+    assert record.state == selfupdate.STATE_MANUAL and record.needs_user is True
+    assert record.latest == "1.1.0" and "turned off" in record.error
+    assert "pip install --upgrade agitrack" in record.instructions
