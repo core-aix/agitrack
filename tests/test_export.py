@@ -118,7 +118,13 @@ def test_export_disables_filters_and_cans_learn_actions(tmp_path, monkeypatch):
     # scrolls internally so the Interaction Trace starts at its top.
     assert 'location.hash === "#trace"' in index
     assert "box.scrollTop +=" in index
-    assert "entry.getBoundingClientRect().top - want" in index
+    assert "entry.getBoundingClientRect().top - inset()" in index
+    # The inset counts only chrome that is ACTUALLY stuck: the filter bar is sticky on a
+    # desktop but scrolls away on a phone, where reserving its height parked the entry a
+    # screenful too low. And corrections scroll INSTANTLY — with the page's default smooth
+    # behavior each correction measured a mid-animation position and visibly overshot.
+    assert 'pos !== "sticky" && pos !== "fixed"' in index
+    assert 'root.style.scrollBehavior = "auto"' in index
     # The learn page shows the same note in the same amber notice style: its error-path
     # flashes carrying the demo note are restyled to notices (real errors stay red).
     learn = (out / "learn" / "index.html").read_text(encoding="utf-8")

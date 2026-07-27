@@ -116,7 +116,23 @@ jobs:
       - name: Publish to PyPI
         env:
           UV_PUBLISH_TOKEN: ${{ secrets.PYPI_TOKEN }}
-        run: uv publish
+        # By this point the version bump has ALREADY merged to main, so a transient
+        # upload failure here leaves a half-finished release (main claims a version that
+        # was never published). Retry with backoff, and pass --check-url so an upload
+        # that actually landed before the client gave up is skipped on the retry instead
+        # of failing it as a duplicate file. If every attempt fails, recover by pushing
+        # the tag: release-tag.yml checks out main, finds the version files already in
+        # sync, and completes the publish/release/extension/MSI steps.
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if uv publish --check-url https://pypi.org/simple/agitrack/; then
+              exit 0
+            fi
+            echo "publish attempt ${attempt} failed; retrying in $((attempt * 20))s..."
+            sleep $((attempt * 20))
+          done
+          echo "::error::could not publish to PyPI after 5 attempts"
+          exit 1
 
       # Summarize the key changes since the previous release with the OpenAI API
       # (shared composite action). The change range ends at this tag. AI-only:
