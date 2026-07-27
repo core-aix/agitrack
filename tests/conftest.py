@@ -39,6 +39,25 @@ def _never_touch_real_daemons(monkeypatch):
     monkeypatch.setattr(daemons, "_scan_daemon_processes", lambda: [])
 
 
+@pytest.fixture(autouse=True)
+def _never_really_self_update(monkeypatch):
+    """No test may install an aGiTrack update for real.
+
+    ``attempt_self_update`` is a genuine side effect: on a source install it fetches and
+    MERGES the checkout aGiTrack is running from. A test that started the daemon's watcher
+    thread did exactly that in CI — the merge pulled the release commit into the job's own
+    checkout mid-run, so ``pyproject.toml`` said 0.5.18 while the already-imported
+    ``agitrack.__version__`` still said 0.5.17, and the version test failed. The watcher
+    now opts in rather than defaulting on; this is the second line of defence, so no future
+    caller can reach the real updater from a test. Tests of the self-updater itself stub
+    ``Updater`` and call the module directly."""
+    from agitrack.update import selfupdate
+
+    monkeypatch.setattr(
+        selfupdate, "attempt_self_update", lambda **kwargs: selfupdate.SelfUpdateRecord(), raising=False
+    )
+
+
 @pytest.fixture
 def runner_factory():
     """Pytest fixture providing the make_runner factory."""

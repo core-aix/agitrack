@@ -13,6 +13,12 @@ import types
 from agitrack.update import selfupdate
 from agitrack.update.updater import KIND_PACKAGE, KIND_SOURCE, METHOD_HOMEBREW, METHOD_MSI, METHOD_PIP
 
+# The suite-wide guard in conftest stubs attempt_self_update so no test can ever install a
+# real update (it fetches and merges the checkout aGiTrack runs from). These tests ARE the
+# updater's tests, so they bind the real function here at import time and drive it against
+# a stubbed Updater — the same pattern test_daemons.py uses for the process scan.
+_attempt_self_update = selfupdate.attempt_self_update
+
 
 def _updater(kind, method=METHOD_PIP):
     return types.SimpleNamespace(kind=kind, _install_method=lambda: method)
@@ -62,12 +68,12 @@ def test_only_one_instance_may_self_update_at_a_time(tmp_path, monkeypatch):
     held = RepoLock(selfupdate.lock_path())
     assert held.acquire() is True
     try:
-        selfupdate.attempt_self_update()  # another instance is mid-update
+        _attempt_self_update()  # another instance is mid-update
         assert checks == []  # …so this one does not even check, let alone install
     finally:
         held.release()
 
-    selfupdate.attempt_self_update()  # lock free again
+    _attempt_self_update()  # lock free again
     assert checks == ["checked"]
 
 
@@ -91,7 +97,7 @@ def test_a_failed_self_update_is_recorded_for_the_dashboards(tmp_path, monkeypat
 
     monkeypatch.setattr("agitrack.update.updater.Updater", _Updater)
 
-    record = selfupdate.attempt_self_update()
+    record = _attempt_self_update()
     assert record.state == selfupdate.STATE_FAILED
     assert record.needs_user is True and record.latest == "1.1.0"
     assert "local changes" in record.error
@@ -122,7 +128,7 @@ def test_a_mode_that_cannot_self_update_is_recorded_without_attempting(tmp_path,
 
     monkeypatch.setattr("agitrack.update.updater.Updater", _Updater)
 
-    record = selfupdate.attempt_self_update()
+    record = _attempt_self_update()
     assert applied == []  # brew's install is not ours to touch
     assert record.state == selfupdate.STATE_MANUAL and record.method == METHOD_HOMEBREW
     assert "brew upgrade" in record.instructions
@@ -149,7 +155,7 @@ def test_a_successful_self_update_clears_the_reminder(tmp_path, monkeypatch):
 
     monkeypatch.setattr("agitrack.update.updater.Updater", _Updater)
 
-    record = selfupdate.attempt_self_update()
+    record = _attempt_self_update()
     assert record.state == selfupdate.STATE_OK and record.needs_user is False
     assert selfupdate.read_state().needs_user is False
 
@@ -218,7 +224,11 @@ def test_dashboards_show_the_two_notices_separately(tmp_path, monkeypatch):
 def test_daemon_watcher_also_installs_updates(monkeypatch):
     """Watching alone only reacts to someone ELSE updating, so a machine whose only
     aGiTrack is a dashboard (or backtrace) daemon would never update. The watcher thread
-    that restarts the daemon also drives the self-update."""
+    that restarts the daemon also drives the self-update — when asked to.
+
+    Installing is OPT-IN (``self_update=True``, which both daemons pass) rather than the
+    default: it fetches and merges the checkout aGiTrack runs from, and defaulting it on
+    meant an unrelated watcher test did that to CI's own checkout mid-run."""
     import threading
 
     from agitrack.update import restart as update_restart
@@ -228,7 +238,7 @@ def test_daemon_watcher_also_installs_updates(monkeypatch):
     stop = threading.Event()
     seen: list[str] = []
     thread = update_restart.watch_for_update(
-        stop, seen.append, interval=0.01, read_version=lambda: None, self_update_interval=999.0
+        stop, seen.append, interval=0.01, read_version=lambda: None, self_update=True, self_update_interval=999.0
     )
     for _ in range(200):
         if attempts:
@@ -237,3 +247,12 @@ def test_daemon_watcher_also_installs_updates(monkeypatch):
     stop.set()
     thread.join(timeout=2)
     assert attempts, "a watching daemon must also install updates"
+
+    # …and a watcher that did NOT ask for it never touches the updater.
+    attempts.clear()
+    stop2 = threading.Event()
+    thread2 = update_restart.watch_for_update(stop2, seen.append, interval=0.01, read_version=lambda: None)
+    threading.Event().wait(0.2)
+    stop2.set()
+    thread2.join(timeout=2)
+    assert attempts == [], "self-update must be opt-in, never a side effect of watching"
