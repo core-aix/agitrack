@@ -149,20 +149,57 @@ def shell_html(repo: GitRepo) -> str:
     )
 
 
-def _update_banner_html(repo: GitRepo) -> str:
-    """A small banner shown when an aGiTrack update is available (fed by the background tracker or
-    the interactive proxy via the shared marker). Empty when there is no update. Installing can't
-    be automated, so it only informs."""
-    try:
-        from agitrack.update.marker import read_update_marker
+def _update_banner_html(repo: "GitRepo | None" = None) -> str:
+    """The update notices shown at the top of a dashboard. Empty when there is nothing to say.
 
-        info = read_update_marker(repo.repo)
+    aGiTrack updates ITSELF now, so these are only the two cases the user still has to act on,
+    and they call for different actions — one line covering both told people to do the wrong thing:
+
+    1. **Install it yourself.** Self-update could not: an MSI needing elevation, a Homebrew
+       install, a Windows pip upgrade, or an attempt that failed — and a newer version exists.
+       Read from the GLOBAL self-update record, since the installation is global, so every
+       dashboard shows it, backtrace included.
+    2. **Restart your session.** The installation is current, but a session on this repo is still
+       running the code it loaded before the update (sessions are deliberately never restarted
+       from under the user). Repo-specific, so only that repo's live dashboard shows it.
+    """
+    parts: list[str] = []
+    try:
+        from agitrack.update.selfupdate import read_state
+
+        record = read_state()
+        if record.needs_user:
+            detail = f" {record.instructions}" if record.instructions else ""
+            reason = f" ({record.error})" if record.error else ""
+            parts.append(f"aGiTrack {record.latest} is available and has to be installed by you{reason}.{detail}")
     except Exception:
-        info = None
-    if not info:
-        return ""
-    text = f"aGiTrack update available: {info.get('current', '?')} → {info.get('latest', '?')} — run `agitrack` and choose ‘update’, or update via pip/pipx."
-    return f'<div class="updatebanner">⬆ {_escape(text)}</div>'
+        pass
+    if repo is not None:
+        try:
+            from agitrack.update.selfupdate import running_session_is_stale
+
+            if running_session_is_stale(repo.repo):
+                parts.append(
+                    "aGiTrack updated itself, but the session running on this repo is still on the old "
+                    "version — restart aGiTrack when convenient to load the new one."
+                )
+        except Exception:
+            pass
+    if not parts and repo is not None:
+        # Nothing from the self-updater: fall back to the shared per-repo marker, which an
+        # install predating self-update (or a check that ran before any attempt) may carry.
+        try:
+            from agitrack.update.marker import read_update_marker
+
+            info = read_update_marker(repo.repo)
+        except Exception:
+            info = None
+        if info:
+            parts.append(
+                f"aGiTrack update available: {info.get('current', '?')} \u2192 {info.get('latest', '?')} — "
+                "run `agitrack` and choose 'update', or update via pip/pipx."
+            )
+    return "".join(f'<div class="updatebanner">\u2b06 {_escape(text)}</div>' for text in parts)
 
 
 def dashboard_data(dash: Dashboard) -> dict:

@@ -733,10 +733,21 @@ class BackgroundRunner:
     def _run_update_check(self) -> None:
         try:
             from agitrack.update.marker import clear_update_marker, write_update_marker
-            from agitrack.update.updater import Updater
+            from agitrack.update.selfupdate import attempt_self_update
 
-            status = Updater().check()
-            if not status.ok:
+            # A daemon has no conversation to interrupt, so it INSTALLS rather than just
+            # recording that an update exists — behind the cross-process lock, so it never
+            # races the TUI or another daemon doing the same. Whatever it installs is picked
+            # up by this daemon's own restart watcher (update/restart.py). The marker below
+            # still records anything left for the user, which is what the dashboards read.
+            status = None
+
+            def _status(value) -> None:
+                nonlocal status
+                status = value
+
+            attempt_self_update(debug=self._debug, on_status=_status)
+            if status is None or not status.ok:
                 return
             if status.available:
                 write_update_marker(
@@ -1103,7 +1114,11 @@ class BackgroundRunner:
         except Exception as error:
             self._debug(f"committed-away detection failed: {error!r}")
             return []
-        untracked = [sha for sha in commits if not self._is_agitrack_tracked(sha)]
+        # Commits that arrived from another branch (a merge/pull/PR) are not the agent's,
+        # however they came to sit between the watermark and HEAD.
+        untracked = [
+            sha for sha in commits if not self._is_agitrack_tracked(sha) and not self.repo.arrived_from_elsewhere(sha)
+        ]
         if not untracked or untracked[-1] != head:
             # Nothing new to cover, or a tracked commit sits at HEAD (can't cover onto it) — just
             # advance the watermark so we don't reconsider these commits every cycle.
@@ -1131,7 +1146,9 @@ class BackgroundRunner:
         except Exception as error:
             self._debug(f"uncovered agent commit check failed: {error!r}")
             return []
-        return [sha for sha in commits if not self._is_agitrack_tracked(sha)]
+        return [
+            sha for sha in commits if not self._is_agitrack_tracked(sha) and not self.repo.arrived_from_elsewhere(sha)
+        ]
 
     # ------------------------------------------------------------------
     # Auto mode: fold the pending latent turns into a real commit ourselves

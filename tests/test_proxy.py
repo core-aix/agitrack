@@ -1277,6 +1277,7 @@ def test_agent_commit_never_prompts_and_stages_only_what_the_turn_created(monkey
 
     runner._review_untracked_popup = lambda **k: pytest.fail("must not prompt for staging")
     runner._prompt_popup = lambda *a, **k: pytest.fail("must not prompt for staging")
+    runner._select_popup = lambda *a, **k: pytest.fail("must not prompt for staging")
 
     fake = FakeCommitRepo(untracked=["user_scratch.txt", "agent_new.py", "agent_other.py"])
     stage = _stage_untracked_fn(runner, fake, monkeypatch)
@@ -7402,7 +7403,17 @@ def _base_edit_runner(tmp_path, answers):
         runner.prompts.append((title, body))
         return scripted.pop(0) if scripted else None
 
+    def select(title, options, **kwargs):
+        # Option questions are selections; a scripted "y" picks the affirmative option
+        # (always first), anything else picks the second.
+        runner.prompts.append((title, options))
+        answer = scripted.pop(0) if scripted else None
+        if answer is None:
+            return None
+        return options[0] if str(answer).strip().lower() in {"y", "yes"} else options[1]
+
     runner._prompt_popup = prompt
+    runner._select_popup = select
     return runner, base, worktree, wt_path
 
 
@@ -7429,8 +7440,9 @@ def test_pre_agent_commit_detects_and_syncs_base_user_edits(tmp_path):
 def test_pre_agent_commit_stages_commits_and_syncs_a_new_base_file(tmp_path):
     # The field scenario: the user drops a NEW (untracked, unstaged) file into the base
     # repo — e.g. a screenshot. Before the prompt goes out, aGiTrack offers to stage it
-    # ([y/N]); on "y" it commits the file to the base branch and merges that commit into
-    # the session worktree, so both the repo and the agent get it.
+    # (a selection, not a typed answer); choosing to stage commits the file to the base
+    # branch and merges that commit into the session worktree, so both the repo and the
+    # agent get it.
     runner, base, worktree, wt_path = _base_edit_runner(tmp_path, answers=["y", "add screenshot"])
     runner.pre_agent_reconciled_status = ""
     runner._finish_agent_parse_if_ready = lambda quiet: False
@@ -10127,3 +10139,266 @@ def test_a_storm_of_reads_never_marks_the_worktree_dirty():
     # ...and one genuine write still gets through immediately afterwards.
     handler.on_any_event(_Event("modified", "/repo/paper/main.tex"))
     assert changed.is_set() is True
+
+
+def test_pasted_newlines_never_answer_a_popup():
+    """Pasting multi-line text at the agent must not answer aGiTrack's own dialogs.
+
+    A terminal wraps a paste in CSI 200~ … CSI 201~. Without honouring that, the first
+    newline inside the paste read as Enter and the popup confirmed itself (picking its
+    default) while the user was only pasting a prompt for the backend.
+    """
+    import types
+
+    from agitrack.proxy.modal import PASTE_END, PASTE_START, SelectModal
+
+    modal = SelectModal("commit these changes?", ["yes", "no"], viewport_rows=10)
+    action, value = modal.feed(PASTE_START + b"first line\nsecond line\n" + PASTE_END)
+    assert (action, value) == ("noop", None)  # nothing selected, nothing confirmed
+    # The paste is preserved for the caller to hand to the backend, byte for byte.
+    assert bytes(modal.pasted) == PASTE_START + b"first line\nsecond line\n" + PASTE_END
+    # A real Enter after the paste still answers normally.
+    assert modal.feed(b"\r") == ("done", "yes")
+
+    # A pasted \x03 must not start the exit flow either.
+    modal2 = SelectModal("pick", ["a", "b"], viewport_rows=10)
+    assert modal2.feed(PASTE_START + b"x\x03y" + PASTE_END)[0] == "noop"
+    assert modal2.feed(b"\x03") == ("exit", None)  # a real Ctrl-C still does
+
+    # A text prompt is different: the user IS being asked to type, so pasted text lands in
+    # the field (one line, so newlines become spaces) but still never submits it.
+    from agitrack.proxy.modal import PromptModal
+
+    prompt = PromptModal("name?", "session name", viewport_rows=10)
+    assert prompt.feed(PASTE_START + b"alpha\nbeta" + PASTE_END)[0] == "redraw"
+    assert prompt.value == "alpha beta"
+    assert prompt.feed(b"\r") == ("done", "alpha beta")
+
+    # The race: the paste was already in flight when the popup opened, so its opening
+    # marker went to the backend and the popup only ever sees the tail. The runner tracks
+    # that at its stdin read point and seeds the modal, so the tail is still not keys.
+    runner = make_runner()
+    runner.input = types.SimpleNamespace(menu_key=b"\x07")
+    runner._set_message = lambda *a, **k: None
+    runner._clear_message = lambda: None
+    runner._render = lambda: None
+    written: list[bytes] = []
+    runner.active.process = types.SimpleNamespace(write=written.append)
+    runner._track_bracketed_paste(PASTE_START + b"already typing")
+    assert runner._in_bracketed_paste is True
+    reads = iter([b"tail of the paste\n", PASTE_END, b"\r"])
+    runner._popup_read_input = lambda: next(reads)
+    assert runner._run_modal_inline(SelectModal("commit?", ["yes", "no"], viewport_rows=10)) == "yes"
+    # …and what was pasted mid-dialog is handed to the backend rather than dropped.
+    assert b"".join(written) == b"tail of the paste\n" + PASTE_END
+
+
+def test_bracketed_paste_state_survives_a_split_read():
+    """The markers are 6 bytes and stdin is read in 32-byte chunks, so a marker can
+    straddle two reads; the tail of each read is re-scanned with the next."""
+    from agitrack.proxy.modal import PASTE_END, PASTE_START
+
+    runner = make_runner()
+    runner._track_bracketed_paste(b"typing" + PASTE_START[:3])
+    assert runner._in_bracketed_paste is False  # incomplete marker: not a paste yet
+    runner._track_bracketed_paste(PASTE_START[3:] + b"pasted text")
+    assert runner._in_bracketed_paste is True
+    runner._track_bracketed_paste(PASTE_END[:2])
+    assert runner._in_bracketed_paste is True
+    runner._track_bracketed_paste(PASTE_END[2:])
+    assert runner._in_bracketed_paste is False
+
+
+def test_pasted_newlines_never_run_a_palette_command():
+    """Same hazard in the Ctrl-G palette: a pasted newline would RUN the highlighted
+    command. Pasted text types into the palette (visible and editable) but never submits,
+    and with the palette closed the paste passes through to the backend untouched."""
+    from agitrack.proxy.modal import PASTE_END, PASTE_START
+
+    palette = ProxyInput()
+    palette.feed(b"\x07")  # Ctrl-G opens it
+    _, _, command, should_exit = palette.feed(PASTE_START + b"first line\nsecond\n" + PASTE_END)
+    assert command is None and should_exit is False
+    assert bytes(palette.buffer) == b"first line second "  # typed in, newlines as spaces
+    assert palette.in_paste is False  # the closing marker cleared the state
+    assert palette.feed(b"\r")[2] is not None  # a real Enter still runs the selection
+
+    # Palette closed: every byte (delimiters included) reaches the backend verbatim, and a
+    # \x03 inside the pasted text does not start the exit flow.
+    passthrough = ProxyInput()
+    paste = PASTE_START + b"text\x03more\n" + PASTE_END
+    forwarded, _, _, should_exit = passthrough.feed(paste)
+    assert b"".join(forwarded) == paste
+    assert should_exit is False
+    assert passthrough.feed(b"\x03")[3] is True  # a real Ctrl-C still exits
+
+    # A real arrow key is untouched by the marker watcher.
+    arrows = ProxyInput()
+    assert b"".join(arrows.feed(b"\x1b[A")[0]) == b"\x1b[A"
+    assert arrows.in_paste is False
+
+
+def test_signal_control_bytes_never_reach_the_backend():
+    """Ctrl-Z and Ctrl-\\ must not be forwarded.
+
+    In raw mode the kernel makes no signal of them, so they used to travel to the backend as
+    plain bytes: Claude answers Ctrl-Z by tearing its UI down and waiting for a resume that
+    cannot arrive on a pty it does not control (a blank, dead session), and Ctrl-\\ on a
+    still-cooked pty is SIGQUIT — the backend dies mid-conversation. aGiTrack owns the
+    terminal, so aGiTrack handles both.
+    """
+    suspend = ProxyInput()
+    forwarded, _, _, should_exit = suspend.feed(b"\x1a")
+    assert b"".join(forwarded) == b""  # nothing reaches the backend
+    assert suspend.suspend_requested is True and should_exit is False
+
+    quit_key = ProxyInput()
+    forwarded, _, _, _ = quit_key.feed(b"\x1c")
+    assert b"".join(forwarded) == b""
+
+    # Ordinary control keys still pass through untouched, and Ctrl-C still drives the exit
+    # flow rather than being forwarded.
+    passthrough = ProxyInput()
+    assert b"".join(passthrough.feed(b"\x13\x11a")[0]) == b"\x13\x11a"
+    assert ProxyInput().feed(b"\x03")[3] is True
+
+    # A Ctrl-Z BYTE inside pasted text is data, not a suspend request.
+    from agitrack.proxy.modal import PASTE_END, PASTE_START
+
+    pasted = ProxyInput()
+    paste = PASTE_START + b"a\x1ab" + PASTE_END
+    assert b"".join(pasted.feed(paste)[0]) == paste
+    assert pasted.suspend_requested is False
+
+    # …and with the palette open Ctrl-Z is ignored rather than typed into the command box.
+    palette = ProxyInput()
+    palette.feed(b"\x07")
+    palette.feed(b"\x1a")
+    assert bytes(palette.buffer) == b"" and palette.capturing is True
+
+
+def test_backend_pty_cannot_be_wedged_by_forwarded_bytes():
+    """The backend's pty starts cooked, so its line discipline would turn forwarded bytes
+    into signals (SIGINT/SIGQUIT/SIGTSTP) or freeze its output (XOFF) before the backend
+    ever saw them — unrecoverable on a pty the user cannot reach from a shell. The child
+    hardens its tty before exec.
+
+    Asserted from INSIDE the pty (the child reports its own settings): on BSD/macOS the
+    master fd does not mirror the slave's termios, so reading it here would prove nothing.
+    """
+    import os
+    import select
+    import sys
+    import time
+
+    if sys.platform == "win32":
+        pytest.skip("POSIX termios only")
+
+    from agitrack.proxy import pty_backend
+
+    handle = pty_backend.spawn_pty(["sh", "-c", "stty -a"], cwd=".", rows=24, cols=80)
+    output = b""
+    deadline = time.monotonic() + 5
+    try:
+        while time.monotonic() < deadline:
+            readable, _, _ = select.select([handle.master_fd], [], [], 0.2)
+            if not readable:
+                continue
+            try:
+                chunk = os.read(handle.master_fd, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            output += chunk
+    finally:
+        handle.close_master()
+
+    settings = output.decode(errors="replace")
+    assert "-isig" in settings  # a forwarded byte can raise no signal on the backend
+    assert "-ixon" in settings  # …and cannot stall its output
+
+
+def test_untracked_files_prompt_is_a_selection():
+    """An option question must not be a free-text box: "[y/N]" accepted anything, so a
+    stray keystroke — or an answer to a question the user had misread — silently took the
+    default. Up/Down + Enter can only return one of the offered options."""
+    import types
+
+    runner = make_runner()
+    asked: dict = {}
+
+    def _select(title, options, *, detail=None):
+        asked.update(title=title, options=options, detail=detail)
+        return options[1]  # "Leave them unstaged"
+
+    runner._select_popup = _select
+    runner._prompt_popup = lambda *a, **k: pytest.fail("an option question must not be typed")
+    staged: list = []
+    declined: list = []
+    runner.repo = types.SimpleNamespace(untracked_entries=lambda: ["a.txt", "b.txt"], stage_paths=staged.extend)
+    runner.state = types.SimpleNamespace(
+        declined_untracked=lambda: [], add_declined=declined.extend, remove_declined=lambda paths: None
+    )
+    runner._prune_declined_untracked = lambda repo, state: None
+
+    result = runner._review_untracked_popup(include_declined=False, repo=runner.repo, state=runner.state)
+
+    assert "Stage all 2 file(s)" in asked["options"] and "Leave them unstaged" in asked["options"]
+    assert asked["detail"] == ["a.txt", "b.txt"]  # the file list scrolls in the detail pane
+    assert staged == [] and declined == ["a.txt", "b.txt"]
+    assert "unstaged" in result
+
+
+def test_text_prompt_supports_cursor_editing():
+    """A typed answer must be editable in place: Left/Right (plus Home/End, Ctrl-A/E and
+    Delete) move an insertion point, so fixing a typo near the start no longer means
+    retyping the rest of the line."""
+    from agitrack.proxy.modal import PromptModal
+
+    modal = PromptModal("Rename", "New name:", default="helo world")
+    for _ in range(6):
+        modal.feed(b"\x1b[D")  # Left ×6, onto the typo
+    modal.feed(b"l")
+    assert modal.value == "helol world" and modal.cursor == 5
+    # The caret renders AT the cursor, so the text after it stays visible.
+    assert modal.render_message().splitlines()[-1] == "> helol" + PromptModal.CARET + " world"
+
+    modal.feed(b"\x1b[F")  # End
+    modal.feed(b"!")
+    assert modal.value == "helol world!"
+    modal.feed(b"\x7f")  # Backspace deletes to the LEFT of the cursor
+    assert modal.value == "helol world"
+    modal.feed(b"\x01")  # Ctrl-A → start
+    modal.feed(b"\x1b[3~")  # Delete removes to the RIGHT
+    assert modal.value == "elol world" and modal.cursor == 0
+    assert modal.feed(b"\r") == ("done", "elol world")
+
+
+def test_console_user_commit_prompt_lists_the_files(tmp_path, monkeypatch, capsys):
+    """Naming a commit blind is how unintended content gets in — especially at startup,
+    where the staged edits may be ones the user forgot they had. The console prompt shows
+    what is about to be committed, like the TUI popup already does."""
+    import builtins
+
+    from agitrack.commits.actions import AgitrackActions
+    from agitrack.config import AgitrackState
+    from agitrack.git import GitRepo
+
+    repo = GitRepo.init(tmp_path)
+    (tmp_path / "one.txt").write_text("a\n", encoding="utf-8")
+    repo.stage_paths(["one.txt"])
+    repo.commit("seed")
+    (tmp_path / "one.txt").write_text("edited\n", encoding="utf-8")
+    (tmp_path / "two.txt").write_text("also edited\n", encoding="utf-8")
+    repo.stage_paths(["one.txt", "two.txt"])
+
+    actions = AgitrackActions(repo=repo, state=AgitrackState(tmp_path), interactive=True, verbose=False)
+    actions.review_untracked = lambda **kwargs: None
+    monkeypatch.setattr(builtins, "input", lambda prompt="": "my message")
+
+    assert actions.create_user_commit() is True
+
+    printed = capsys.readouterr().out
+    assert "Committing 2 file(s)" in printed
+    assert "one.txt" in printed and "two.txt" in printed

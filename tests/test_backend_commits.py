@@ -421,3 +421,40 @@ def test_attach_gives_up_after_deadline():
     assert runner._attach_trace_to_backend_commits(100.0) is False
     # Well past the 3x parse-cooldown deadline: integrate as-is, don't stall.
     assert runner._attach_trace_to_backend_commits(200.0) is True
+
+
+def test_commits_merged_in_from_another_branch_are_never_covered(tmp_path):
+    """Only work the agent made HERE may be claimed as covered.
+
+    A `git merge main` (or a pull, or a PR merged on GitHub) drops commits between the
+    cover anchor and HEAD that the agent never wrote. They were being listed in
+    `covered_commits` — a release PR and a teammate's PR ended up attributed to an agent
+    turn. Provenance comes from the reflog, which records HOW the ref moved: a commit
+    created here has a `commit:` entry, one that arrived shows only under `merge`/`pull`.
+    """
+    repo = GitRepo.init(tmp_path)
+    main = repo.current_branch()
+    (repo.repo / "seed.txt").write_text("seed\n", encoding="utf-8")
+    repo.stage_paths(["seed.txt"])
+    repo.commit("seed")
+
+    # Work done on another branch, exactly as a PR would land it…
+    repo.switch("other", create=True)
+    foreign_one = _backend_commit(repo, "their_a.txt", "someone else's work")
+    foreign_two = _backend_commit(repo, "their_b.txt", "release v9.9.9 (#206)")
+    repo.switch(main)
+    repo._run(["git", "merge", "--ff-only", "other"])  # …and arrives here by a fast-forward
+    assert repo.rev_parse("HEAD") == foreign_two
+
+    # …while a commit the agent itself makes here is still recognised as ours.
+    ours = _backend_commit(repo, "agent.txt", "the agent's own commit")
+
+    assert repo.arrived_from_elsewhere(foreign_one) is True
+    assert repo.arrived_from_elsewhere(foreign_two) is True
+    assert repo.arrived_from_elsewhere(ours) is False
+
+    # The runner's cover scan therefore offers only the agent's own commit.
+    runner = make_runner(repo=repo, state=AgitrackState(tmp_path))
+    runner._use_worktrees = False
+    runner._noworktree_base_head = repo.rev_parse(f"{foreign_one}~1")
+    assert runner._uncovered_backend_commits() == [ours]
