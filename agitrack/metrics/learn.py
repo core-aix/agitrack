@@ -1626,26 +1626,34 @@ textarea{width:100%;min-height:74px;resize:vertical}
 .bubble.typing .tdot:nth-child(2){animation-delay:.2s}
 .bubble.typing .tdot:nth-child(3){animation-delay:.4s}
 @keyframes tblink{0%,60%,100%{opacity:.25;transform:translateY(0)}30%{opacity:1;transform:translateY(-3px)}}
-.progress .pstats{display:flex;gap:22px;flex-wrap:wrap;margin-bottom:10px}
+/* Positioned so the stat tooltips below anchor to the ROW, not to an individual stat:
+   a fixed-width bubble hanging off the last stat stuck out past the viewport and gave the
+   whole page a horizontal scrollbar on a phone, even while invisible, since an absolutely
+   positioned box still contributes scrollable overflow. */
+.progress .pstats{display:flex;gap:22px;flex-wrap:wrap;margin-bottom:10px;position:relative}
 /* Stat tooltips are drawn by CSS (::after on hover): reliable and instant, unlike the
    native title bubble, which proved flaky over these elements. */
-.pstat{cursor:help;position:relative}
+.pstat{cursor:help}
 .pstat b{color:var(--phosphor);font-size:17px}
 .pstat span{color:var(--fg-dim);font-size:12px;display:block;border-bottom:1px dotted var(--line)}
 .pstat::after{content:attr(data-tip);position:absolute;left:0;top:100%;margin-top:8px;z-index:20;
-  width:240px;background:var(--panel2);border:1px solid var(--phosphor-dim);border-radius:6px;
+  width:min(240px,100%);background:var(--panel2);border:1px solid var(--phosphor-dim);border-radius:6px;
   padding:8px 11px;font-size:11.5px;color:var(--fg);line-height:1.5;
   opacity:0;visibility:hidden;pointer-events:none;transition:opacity .15s;
   box-shadow:0 8px 24px rgba(0,0,0,.45)}
 .pstat:hover::after{opacity:1;visibility:visible}
 .ppager{display:flex;align-items:center;justify-content:center;gap:14px;padding:10px 0 2px;
   border-top:1px solid var(--line)}
-.plist .pl{display:flex;align-items:baseline;gap:10px;padding:7px 4px;border-top:1px solid var(--line);
-  font-size:13px;cursor:pointer}
+/* The row WRAPS and its title SHRINKS (min-width:0, since a flex item will not go below
+   its content width otherwise): a long lesson title next to non-shrinking badges pushed
+   the row past the viewport, which put a horizontal scrollbar on the whole page. */
+.plist .pl{display:flex;flex-wrap:wrap;align-items:baseline;gap:10px;padding:7px 4px;
+  border-top:1px solid var(--line);font-size:13px;cursor:pointer}
 .plist .pl:hover .plt{color:var(--accent)}
 .plist .st{flex:none;width:16px}
-.plist .plt{flex:1}
-.plist .pmeta{color:var(--fg-dim);font-size:11.5px;flex:none;display:flex;gap:6px;align-items:baseline}
+.plist .plt{flex:1 1 55%;min-width:0;overflow-wrap:anywhere}
+.plist .pmeta{color:var(--fg-dim);font-size:11.5px;flex:none;display:flex;flex-wrap:wrap;gap:6px;
+  align-items:baseline;max-width:100%}
 .plist .pldel{flex:none;background:none;border:none;color:var(--fg-dim);font:inherit;font-size:12px;
   cursor:pointer;padding:2px 6px;border-radius:4px;opacity:0;visibility:hidden;transition:color .15s}
 .plist .pl:hover .pldel,.plist .pldel:focus-visible{opacity:1;visibility:visible}

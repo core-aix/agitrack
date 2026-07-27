@@ -161,7 +161,7 @@ def _update_banner_html(repo: GitRepo) -> str:
         info = None
     if not info:
         return ""
-    text = f"aGiTrack update available: {info.get('current', '?')} → {info.get('latest', '?')} — run `agitrack` and choose ‘update’, or update via pip/pipx/brew."
+    text = f"aGiTrack update available: {info.get('current', '?')} → {info.get('latest', '?')} — run `agitrack` and choose ‘update’, or update via pip/pipx."
     return f'<div class="updatebanner">⬆ {_escape(text)}</div>'
 
 

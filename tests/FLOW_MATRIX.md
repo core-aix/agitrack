@@ -229,6 +229,7 @@ directory that is not a git repo still gets the full page, with progress sync re
 
 | Sequence | Test(s) | Kind |
 |---|---|---|
+| The page fits a phone exactly (no horizontal scrollbar): progress rows wrap and their titles shrink, and the stat tooltip anchors to the stats ROW capped at its width — an absolutely positioned bubble adds scrollable overflow even while invisible | `test_learn_page_fits_a_phone_width_exactly` | real-git |
 | Engine resolution: config keys > latest session backend/model; cross-backend model dropped; none → clear error | `test_resolve_prefers_config_over_latest_session`, `_falls_back_to_latest_session`, `_config_model_wins`, `_without_any_backend_raises` | real-git |
 | Engine picker persists to / clears from the repo config overlay; unknown backend refused | `test_set_learning_config_roundtrip`, `_rejects_unknown_backend` | real-git |
 | Check-in → suggestions: digest covers prompts/insights/files/README/progress; capped; persisted per GitHub user; agent failure and empty window surface as in-page errors; one agent call at a time | `test_digest_*`, `test_suggest_persists_profile_per_user`, `_reports_agent_failure_as_error`, `_with_no_turns_explains_instead_of_calling_agent`, `test_agent_lock_reports_busy` | real-git |
@@ -264,6 +265,7 @@ agitrack.core-aix.org/dashboard/, rebuilt by `.github/workflows/pages.yml` on ea
 | The demo ships the last 30 days (anchored to the newest commit, never empty), not all time: log pages, embedded first paint, and baked diffs are scoped; the banner and the disabled range dropdown say "last 30 days" | `test_export_scopes_the_demo_to_the_last_30_days` | real-git |
 | The fetch shim is installed before any page script runs | `test_export_shim_installs_before_the_page_script` | real-git |
 | Honest degradation: demo banner + install hint on both pages, filter controls disabled, agent-driven learn POSTs answered with the install hint; tapping a disabled filter or the reset button flashes the same demo note as a fixed toast (learn-page style, click to dismiss) | `test_export_writes_a_complete_static_site`, `test_export_disables_filters_and_cans_learn_actions` | real-git |
+| The `#trace` deep link maximizes the expanded commit: the window parks the ENTRY under the chrome that is ACTUALLY stuck (the filter bar is sticky on desktop but scrolls away on a phone) and the message box scrolls internally to its Interaction Trace; corrections scroll instantly, so the view never overshoots and creeps back | `test_export_disables_filters_and_cans_learn_actions` | real-git |
 | Learn profile fallback: the store's single non-empty profile ships when the exporting identity has none (how CI exports the checked-in fixture) | `test_export_learn_state_falls_back_to_the_single_store_profile` | real-git |
 | CLI: `-d export --export-dir` writes the site and reports the path | `test_cli_export_writes_the_site` | real-git |
 

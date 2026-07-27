@@ -62,4 +62,6 @@ def update_reminder_line(repo_root: Path) -> str | None:
     if not info:
         return None
     current, latest = info.get("current", "?"), info.get("latest", "?")
-    return f"aGiTrack update available: {current} → {latest} (run `agitrack` and choose 'update', or update via pip/pipx/brew)."
+    return (
+        f"aGiTrack update available: {current} → {latest} (run `agitrack` and choose 'update', or update via pip/pipx)."
+    )
