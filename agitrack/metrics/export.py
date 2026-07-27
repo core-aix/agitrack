@@ -66,16 +66,14 @@ _DEMO_WINDOW_DAYS = 30
 _DEMO_NOTE = "This static demo doesn't support this action. Install and run aGiTrack on your own repo to see the live dashboard and the learn page's agent-driven features."
 
 
-def _banner_html(generated: str, css_class: str, site_root: str) -> str:
+def _banner_html(css_class: str, site_root: str) -> str:
     """The frozen top strip both exported pages carry. ``css_class`` is the page's own
     sticky-banner class (the dashboard styles ``backtracebanner``, the learn page
     ``btbanner``), so the demo notice inherits the exact banner treatment of its page.
     ``site_root`` is the relative path back to the main webpage, whose install section
-    the banner links to."""
-    text = (
-        "STATIC DEMO: snapshot of the real aGiTrack dashboard, with "
-        f"aGiTrack's own history in the 30 days before {generated}. "
-    )
+    the banner links to. Deliberately dateless: the strip is read on every visit and a
+    build timestamp only crowds it (the page's own "updated" line still carries one)."""
+    text = "STATIC DEMO: snapshot of the real aGiTrack dashboard, with aGiTrack's own history over a 30-day period. "
     return (
         f'<div class="{css_class}">🧪 '
         + _esc(text)
@@ -256,7 +254,12 @@ def _shim(*, base: str, files_index: dict[str, int], learn: bool, site_root: str
     if (LEARN && typeof window.flash === "function") {{
       var pageFlash = window.flash;
       window.flash = function(html){{
-        if (typeof html === "string" && html.indexOf(NOTE) >= 0) html = html.replace('class="error"', 'class="notice"');
+        // EVERY flash here is amber. In a frozen snapshot there is no actionable failure —
+        // whatever the page was about to report in red means the same thing, "this needs a
+        // live install" — so the bottom note must not alternate between red and amber.
+        // (Matching the note's TEXT is not enough: the page HTML-escapes it, so "doesn't"
+        // becomes "doesn&#39;t" and the raw note never matches.)
+        if (typeof html === "string") html = html.replace(/class="error"/g, 'class="notice"');
         return pageFlash(html);
       }};
     }}
@@ -369,7 +372,6 @@ def export_static_demo(repo: GitRepo, out_dir: Path) -> Path:
     files, sha_paths = context_from_browser(browser, dash.stats)
     insights = build_insights(dash.stats, files, sha_paths)
     shared = shared_sessions_for(repo)
-    generated = aggregates_payload(dash)["generated_at"]
     # The demo's scope: the last 30 days, anchored to the newest commit rather than the
     # export clock so a rebuild from a briefly quiet repo never bakes an empty demo.
     newest = max((stat.timestamp for stat in dash.stats if stat.timestamp), default=0)
@@ -416,7 +418,7 @@ def export_static_demo(repo: GitRepo, out_dir: Path) -> Path:
     page = format_html(
         dash,
         shared_sessions=shared,
-        banner_html=_banner_html(generated, "backtracebanner", "../"),
+        banner_html=_banner_html("backtracebanner", "../"),
         insights=insights,
         frm=frm,
     )
@@ -424,7 +426,7 @@ def export_static_demo(repo: GitRepo, out_dir: Path) -> Path:
         _inject_shim(page, _shim(base="demo/", files_index=files_index, learn=False, site_root="../")),
         encoding="utf-8",
     )
-    learn_html = learn_page.learn_html(repo.repo, banner_html=_banner_html(generated, "btbanner", "../../"))
+    learn_html = learn_page.learn_html(repo.repo, banner_html=_banner_html("btbanner", "../../"))
     learn_dir = out_dir / "learn"
     learn_dir.mkdir()
     (learn_dir / "index.html").write_text(
