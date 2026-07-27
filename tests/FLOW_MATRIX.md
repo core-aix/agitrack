@@ -38,6 +38,7 @@ Conventions:
 | Dirty worktree → reconcile transcript, then user-commit | `test_pre_agent_commit_*` (test_proxy), `test_turn_copy_offer_defers_user_commit_prompt` | mock |
 | Base-repo user edits committed + merged before the agent | `test_base_user_edit_declined_then_restaged_is_not_stranded`, `test_base_user_untracked_file_counts_as_pending` | real-git |
 | Submit while agent active → prompt held as follow-up | `test_await_followup_appends_normalized`, `test_await_followup_skips_empty/slash_commands` | mock |
+| A multi-line PASTE never answers aGiTrack's own UI: inside CSI 200~/201~ no byte acts as a key — a popup is not confirmed (its text is handed to the backend afterwards), a text prompt takes the paste as content without submitting, the palette types it without running a command, and a pasted \x03 starts no exit flow; state is seeded for a paste already in flight when the popup opened and survives markers split across reads | `test_pasted_newlines_never_answer_a_popup`, `test_bracketed_paste_state_survives_a_split_read`, `test_pasted_newlines_never_run_a_palette_command` | mock |
 | State/marker/handshake saves survive CONCURRENT aGiTrack processes on one repo (unique tmp per write; the old fixed `<file>.tmp` crashed the interactive session mid-prompt when an export/daemon saved simultaneously) | `test_fileio.py::test_concurrent_writers_do_not_crash_or_corrupt`, `_creates_parents_and_replaces` | subprocess |
 
 ## 3. Agent turn lifecycle (commit + attribution)

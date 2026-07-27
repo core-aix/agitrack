@@ -73,7 +73,7 @@ from agitrack.update import Updater, UpdateStatus, restart_agitrack
 
 # Modal state-machines (P6 Stage 2): PromptModal and SelectModal encode the
 # byte-handling logic for free-text and selection popups.
-from agitrack.proxy.modal import PromptModal, SelectModal, _escape_sequence_complete
+from agitrack.proxy.modal import PASTE_END, PASTE_START, PromptModal, SelectModal, _escape_sequence_complete
 
 _SGR_MOUSE_RE = re.compile(rb"\x1b\[<\d+;\d+;\d+[Mm]")
 _SGR_MOUSE_EVENT_RE = re.compile(rb"\x1b\[<(\d+);(\d+);(\d+)([Mm])")
@@ -131,7 +131,9 @@ _KITTY_ESC_KEY_RE = re.compile(rb"\x1b\[27(?:;1)?u")
 # backend instead of opening aGiTrack's exit/menu. modifier 5 = Ctrl (1 + 4).
 _MODIFY_OTHER_KEYS_RE = re.compile(rb"\x1b\[27;(\d+);(\d+)~")
 # A bracketed paste (CSI 200~ ... CSI 201~, possibly split across reads, hence
-# the `|$`): newlines inside it are pasted CONTENT, not prompt submissions.
+# the `|$`): newlines inside it are pasted CONTENT, not prompt submissions. The same
+# delimiters keep pasted text from answering aGiTrack's own popups — see
+# ProxyRunner._track_bracketed_paste and the modal module's docstring.
 _BRACKETED_PASTE_RE = re.compile(rb"\x1b\[200~.*?(?:\x1b\[201~|$)", re.S)
 
 # String-level escape stripper for captured subprocess output (e.g. a backend updater's
@@ -348,10 +350,42 @@ class ProxyInput:
         # Buffer for accumulating partial matches of multi-byte menu key sequences.
         # Only used when menu_key is longer than 1 byte.
         self.menu_key_buffer = bytearray()
+        # Bracketed-paste state. Pasted bytes are content, never keys: with the palette
+        # open a pasted newline would RUN the highlighted command, and a pasted \x03 would
+        # start the exit flow. Set by the CSI 200~/201~ markers in the stream.
+        self.in_paste = False
+        self._paste_marker: bytearray | None = None
         # Context-dependent commands shown ABOVE the fixed COMMANDS (the runner refreshes
         # this when the palette opens). Used to surface "merge" at the top when there are
         # unmerged worktrees the user should rescue.
         self.extra_commands: list[str] = []
+
+    def _observe_paste_marker(self, char: bytes) -> bool:
+        """Track CSI 200~/201~ across bytes; return True while *char* is part of a marker.
+
+        Purely observational — the caller still routes the byte normally, so the markers
+        reach the backend untouched. A partial match that turns out to be some other escape
+        sequence simply resets, and that byte follows the ordinary path.
+        """
+        if self._paste_marker is None:
+            if char != b"\x1b":
+                return False
+            self._paste_marker = bytearray(char)
+            return False  # ESC may equally start a real key sequence: let it flow on
+        candidate = bytes(self._paste_marker) + char
+        if candidate in (PASTE_START, PASTE_END):
+            self.in_paste = candidate == PASTE_START
+            self._paste_marker = None
+            # While capturing, the palette's own escape reader was accumulating these same
+            # bytes; the final "~" never reaches it (this observer consumes it), so clear
+            # the half-built sequence or it would swallow the next real keypress.
+            self.escape_buffer = None
+            return True
+        if PASTE_START.startswith(candidate) or PASTE_END.startswith(candidate):
+            self._paste_marker.extend(char)
+            return self.in_paste  # mid-marker: only swallow when already inside a paste
+        self._paste_marker = None
+        return False
 
     def feed(self, data: bytes) -> tuple[list[bytes], bytes, str | None, bool]:
         forwarded: list[bytes] = []
@@ -359,6 +393,28 @@ class ProxyInput:
         should_exit = False
         for byte in data:
             char = bytes([byte])
+            # Watch for the bracketed-paste delimiters wherever they appear, so `in_paste`
+            # is already right for the bytes that follow them in this very chunk. This is
+            # OBSERVATION only: the marker bytes keep flowing through the normal paths
+            # below, so passthrough to the backend is byte-for-byte unchanged.
+            marker = self._observe_paste_marker(char)
+            if marker or self.in_paste:
+                # Inside a paste every byte is content the user copied, never a key. With the
+                # palette open, printable characters type into it (visible and editable) but a
+                # newline does NOT run the highlighted command and \x03 does not start the exit
+                # flow; with the palette closed this is ordinary passthrough to the agent, the
+                # delimiters included, so the backend still sees the paste exactly as sent.
+                if not self.capturing:
+                    forwarded.append(char)
+                elif marker:
+                    pass  # the delimiters themselves are never typed into the palette
+                elif byte >= 32:
+                    self.buffer.extend(char)
+                    self.selected_index = 0
+                elif char in {b"\r", b"\n"} and self.buffer and not self.buffer.endswith(b" "):
+                    self.buffer.extend(b" ")  # a line break in a one-line field reads as a space
+                self.selected_index = 0 if not marker else self.selected_index
+                continue
             if char == b"\x03":
                 if self.capturing:
                     # Inside aGiTrack's own command palette, Ctrl-C cancels it
@@ -485,6 +541,11 @@ class ProxyRunner:
     # Per-session flag (a Session.FIELDS entry, delegated like the others); declared here
     # so mypy can resolve its type at the read sites above its dynamic attachment.
     _pending_merge_prompt: bool
+
+    # Bracketed-paste tracking (_track_bracketed_paste). Class-level defaults so instances
+    # built by for_testing(), which bypasses __init__, carry them too.
+    _in_bracketed_paste: bool = False
+    _paste_scan_tail: bytes = b""
 
     # Defaults for the tunable timings; overridden per-instance from the global
     # config in __init__ (see GlobalConfig.timings). Kept as class constants so
@@ -750,6 +811,11 @@ class ProxyRunner:
         self.last_parse_finish = 0.0
         self.passthrough_prompt = bytearray()
         self.passthrough_escape: bytearray | None = None
+        # Whether the terminal is mid bracketed-paste right now, tracked over every stdin
+        # read so a popup opened DURING a paste knows the bytes it is about to see are
+        # pasted content rather than the user answering it (_track_bracketed_paste).
+        self._in_bracketed_paste = False
+        self._paste_scan_tail = b""
         self.pending_forwarded: list[bytes] | None = None
         self.pending_prompt_text = ""
         # Session ids that existed before aGiTrack launched a fresh backend session,
@@ -9304,6 +9370,26 @@ class ProxyRunner:
                 self._render_pending = True  # repaint the restored palette over the closed dialog
 
     def _run_modal_loop(self, modal: "PromptModal | SelectModal") -> "str | None":
+        # A paste already under way when this popup opened sent its CSI 200~ to the backend,
+        # so the popup would see only unmarked content; carry the state in (the modal clears
+        # it on the closing marker).
+        if self._in_bracketed_paste:
+            modal.in_paste = True
+        try:
+            return self._run_modal_body(modal)
+        finally:
+            # Text the user pasted while the popup was up was meant for the agent, not for
+            # the popup — hand it over now rather than dropping it. The bytes are replayed
+            # exactly as they arrived (markers included), so together with the opening marker
+            # the backend already received, it reads one coherent paste.
+            pasted = bytes(getattr(modal, "pasted", b""))
+            if pasted and self.active is not None:
+                try:
+                    self.active.process.write(pasted)
+                except Exception:
+                    pass  # a dead/replaced backend must never break closing a dialog
+
+    def _run_modal_body(self, modal: "PromptModal | SelectModal") -> "str | None":
         needs_render = True
         while True:
             if self._exit_menu_requested:
@@ -9322,7 +9408,7 @@ class ProxyRunner:
                 needs_render = False
             data = self._popup_read_input()
             menu_key = getattr(self.input, "menu_key", b"\x07")
-            if menu_key and menu_key in data:
+            if menu_key and menu_key in data and not getattr(modal, "in_paste", False):
                 # The menu key while a popup is open closes the WHOLE menu (a toggle), matching
                 # the palette. Treat it as a cancel, but flag the full-close so the unwind above
                 # doesn't stop one level up.
@@ -12128,7 +12214,29 @@ class ProxyRunner:
         # hard-kill (needed when a leak has broken Ctrl-C and graceful exit isn't possible).
         if data:
             self._raw_capture(">", data)
+            self._track_bracketed_paste(data)
         return data
+
+    def _track_bracketed_paste(self, data: bytes) -> None:
+        """Follow the terminal's bracketed-paste state across reads.
+
+        Every popup this runner opens consumes keystrokes, so it must be able to tell a
+        paste from typing: the newlines inside a paste are content, and answering a dialog
+        with them silently picked its default while the user was only pasting a prompt at
+        the agent. The modals recognise the markers in their own input, but a paste already
+        in flight when a popup opens delivers CSI 200~ to the BACKEND and the popup sees
+        only the tail — hence this state, which seeds each modal (see _run_modal_loop).
+
+        Reads are 32 bytes at a time, so a marker can straddle two of them: the last few
+        bytes of each read are carried over and re-scanned with the next.
+        """
+        scan = self._paste_scan_tail + data
+        start, end = scan.rfind(PASTE_START), scan.rfind(PASTE_END)
+        if start > end:
+            self._in_bracketed_paste = True
+        elif end > start:
+            self._in_bracketed_paste = False
+        self._paste_scan_tail = scan[-(len(PASTE_START) - 1) :]
 
 
 # ---------------------------------------------------------------------------
