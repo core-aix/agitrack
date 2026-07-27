@@ -258,7 +258,10 @@ directory that is not a git repo still gets the full page, with progress sync re
 
 ## 12c. Static demo export (`agitrack -d export`, `tests/test_export.py`)
 A server-free copy of the dashboard + learn page for static hosts (powers the public demo at
-agitrack.core-aix.org/dashboard/, rebuilt by `.github/workflows/pages.yml` on each push to main).
+agitrack.core-aix.org/dashboard/, rebuilt by `.github/workflows/pages.yml` on each push to main). That
+workflow re-asserts the "GitHub Actions" Pages source on every run and refuses to deploy a site without
+`dashboard/index.html`: the legacy `main:/docs` branch build publishes docs/ alone, so if the source drifts
+back to it the public demo 404s.
 | Sequence | Test(s) | Kind |
 |---|---|---|
 | Export is complete: every /data granularity, every /log page for every sort, every in-scope commit's /diff, the whole file browser (filelog + per-change filediff) baked as files | `test_export_writes_a_complete_static_site` | real-git |
