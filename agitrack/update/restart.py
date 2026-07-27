@@ -134,18 +134,24 @@ def watch_for_update(
     *,
     interval: float = CHECK_SECONDS,
     read_version: Callable[[], str | None] = updated_fingerprint,
-    self_update: bool = True,
+    self_update: bool = False,
     self_update_interval: float = SELF_UPDATE_SECONDS,
 ) -> threading.Thread:
     """Start the watcher thread: calls ``on_update(new_fingerprint)`` ONCE, after the
     same new on-disk fingerprint has been seen on two consecutive checks (see module
     docstring). ``stop`` ends the watch (shared with the daemon's own shutdown event).
 
-    The same thread also periodically SELF-UPDATES (``self_update``). Watching alone would
-    only react to someone else installing a new version, so a machine where the only
-    aGiTrack running is a dashboard or backtrace daemon would never update at all. The
-    attempt is lock-guarded, so when a TUI or another daemon is already updating this one
-    simply skips the round.
+    The same thread also periodically SELF-UPDATES when ``self_update`` is set. Watching
+    alone would only react to someone else installing a new version, so a machine where the
+    only aGiTrack running is a dashboard or backtrace daemon would never update at all; the
+    daemons therefore opt in. The attempt is lock-guarded, so when a TUI or another daemon
+    is already updating this one simply skips the round.
+
+    It is OPT-IN, not the default, because installing an update is a real side effect —
+    on a source install it fetches and merges the checkout aGiTrack runs from. A caller
+    that just wants the restart watch (tests, tooling) must not trigger that by omission:
+    it once did, and a test's watcher fast-forwarded CI's own checkout mid-run, which
+    changed pyproject.toml underneath the already-imported version and failed the build.
     """
 
     def _loop() -> None:

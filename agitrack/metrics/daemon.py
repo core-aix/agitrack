@@ -352,7 +352,7 @@ def run_dashboard_daemon(
             _stop.set()
             threading.Thread(target=_server.shutdown, daemon=True).start()
 
-        update_restart.watch_for_update(stop, _restart_for_update)
+        update_restart.watch_for_update(stop, _restart_for_update, self_update=True)
 
         try:
             server.serve_forever()
