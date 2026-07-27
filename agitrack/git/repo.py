@@ -509,6 +509,61 @@ class GitRepo:
         output = self._run(["git", "log", "--format=%H", "--reverse", f"{base}..{head}"], check=False).stdout
         return [line for line in output.split() if line]
 
+    def arrived_from_elsewhere(self, sha: str) -> bool:
+        """Whether *sha* reached this branch from somewhere else rather than being
+        committed here.
+
+        Used to decide what an aGiTrack turn may claim as the agent's own work. A
+        ``git merge main`` fast-forward, a pull, or a PR merged on GitHub drops commits
+        between the cover anchor and HEAD that the agent never made; covering those
+        misattributes other people's work (a release PR once landed in covered_commits).
+
+        The reflog answers this exactly: it records HOW the ref moved, so a commit
+        created here has a ``commit:`` entry naming it, while one that arrived shows up
+        only under ``merge``/``pull``/``reset``. When no reflog is available (a fresh
+        clone, an expired entry) fall back to the committer identity — GitHub, a CI bot
+        or a teammate cannot be the agent running in this repository.
+        """
+        try:
+            created = self._reflog_created_here()
+            if created is not None:
+                return sha not in created
+            committer = self._run(["git", "log", "-1", "--format=%cn <%ce>", sha], check=False).stdout.strip()
+            name = self._run(["git", "config", "user.name"], check=False).stdout.strip()
+            email = self._run(["git", "config", "user.email"], check=False).stdout.strip()
+            if committer and name and email:
+                return committer != f"{name} <{email}>"
+        except Exception:
+            return False  # never block covering on a failed probe
+        return False
+
+    def _reflog_created_here(self) -> set[str] | None:
+        """SHAs the CURRENT BRANCH's reflog records as created by a commit on it, or None
+        when there is no reflog to read.
+
+        Deliberately the branch's reflog and not HEAD's: HEAD's spans branch switches, so a
+        commit made on some other local branch and later merged in would read as "created
+        here" and be claimed as the agent's. A branch reflog only ever shows moves of that
+        branch, and it is shared with linked worktrees, so it still sees what an agent
+        committed in its own worktree.
+        """
+        ref = self.current_branch() or "HEAD"  # detached: HEAD's log is all there is
+        result = self._run(["git", "reflog", "show", "--format=%H %gs", ref], check=False)
+        if result.returncode != 0:
+            return None
+        created: set[str] = set()
+        seen_any = False
+        for line in result.stdout.splitlines():
+            sha, _, subject = line.partition(" ")
+            if not sha:
+                continue
+            seen_any = True
+            # "commit:", "commit (amend):", "commit (initial):" — anything else moved the
+            # branch to a commit that already existed (merge, pull, reset, checkout).
+            if subject.startswith("commit"):
+                created.add(sha)
+        return created if seen_any else None
+
     def notes_add(self, commit: str, message: str, *, namespace: str = "agitrack") -> None:
         self._run(["git", "notes", "--ref", namespace, "add", "-f", "-m", message, commit])
 

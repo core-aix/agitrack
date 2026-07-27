@@ -9820,6 +9820,11 @@ class ProxyRunner:
                 # carries attribution but not the turn's trace/tokens, so it is still uncovered.
                 if is_fully_tracked_message(self.repo.commit_message(sha)):
                     uncovered = []
+                elif self.repo.arrived_from_elsewhere(sha):
+                    # Merged/pulled in rather than written here (a `git merge main`, a PR
+                    # merged on GitHub): not the agent's work, so never claim it — and it
+                    # accounts for nothing, so it must not reset the list either.
+                    continue
                 else:
                     uncovered.append(sha)
             return uncovered
