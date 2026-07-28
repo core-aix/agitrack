@@ -85,7 +85,7 @@ def test_export_ships_the_storyline_page(tmp_path, monkeypatch):
 
     assert 'if (name === "story/state") return file("story.json"' in _shim_of(story)
     # Every control that would start (or undo) a build answers with the shared demo toast.
-    assert '["write", "extend", "earlier", "rewrite", "forget", "build-cancel"]' in story
+    assert '["write", "extend", "earlier", "earlier2", "rewrite", "forget", "build-cancel", "e-save"]' in story
     assert "demoflash" in story  # ...as the same fixed bottom toast the dashboard uses
     # Cross-links: on the live server each page is a sibling path, in the demo a directory.
     assert 'relink("backlink", "../"); relink("learnlink", "../learn/")' in story
@@ -117,10 +117,10 @@ def test_export_bakes_the_diffs_a_shipped_story_points_at(tmp_path, monkeypatch)
         "main",
         {
             "title": "A told story",
-            "chapters": [
+            "moments": [
                 {
                     "id": "c1",
-                    "title": "The ancient chapter",
+                    "title": "The ancient moment",
                     "summary": "s",
                     "shas": [ancient],
                     "commits": [{"sha": ancient, "short": ancient[:7], "subject": "ancient work"}],

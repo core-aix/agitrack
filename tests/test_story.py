@@ -1,4 +1,4 @@
-"""The storyline page (`agitrack/metrics/story.py`): the repo's history told as chapters.
+"""The storyline page (`agitrack/metrics/story.py`): the repo's history told as moments.
 
 Real temp git repos throughout, so segmentation, the store, the incremental extend and both
 servers' endpoints run for real. The only thing faked is the backend agent (a queue of
@@ -87,8 +87,8 @@ def _stat(sha_char: str, prompt: str, ts: int, *, kind: str = "agent", subject: 
     )
 
 
-def _chapter_reply(chapters) -> str:
-    return json.dumps({"chapters": chapters})
+def _moment_reply(moments) -> str:
+    return json.dumps({"moments": moments})
 
 
 _ARC = json.dumps(
@@ -182,30 +182,30 @@ def test_the_outline_needs_no_agent_at_all():
 
 
 def test_eras_are_split_by_us_not_by_the_model():
-    """Letting the agent choose the groupings AND name them put 26 of 44 chapters in the last
+    """Letting the agent choose the groupings AND name them put 26 of 44 moments in the last
     act, titled after its first three ("Windows Finally Gets Invited In" for a month that was
     mostly other things). Boundaries are ours; naming is all the agent is asked for."""
-    chapters = [
+    moments = [
         {"id": f"c{i}", "when": "2026-06-%02d" % (i + 1), "from": 1_000 + i * 100, "to": 1_000 + i * 100 + 50}
         for i in range(44)
     ]
-    slices = story.act_slices(chapters)
+    slices = story.act_slices(moments)
     assert len(slices) == 5
-    assert slices[0][0] == 0 and slices[-1][1] == len(chapters) - 1  # every chapter is in an era
+    assert slices[0][0] == 0 and slices[-1][1] == len(moments) - 1  # every moment is in an era
     for (start, end), (next_start, _) in zip(slices, slices[1:]):
         assert next_start == end + 1  # contiguous, no gaps and no overlaps
     sizes = [end - start + 1 for start, end in slices]
     assert max(sizes) - min(sizes) <= 5  # and no era swallows the story
-    assert story.act_slices(chapters[:3]) == [(0, 2)]  # a tiny story is one era
+    assert story.act_slices(moments[:3]) == [(0, 2)]  # a tiny story is one era
     assert story.act_slices([]) == []
 
 
 def test_an_era_boundary_prefers_a_real_pause_in_the_work():
-    chapters = []
+    moments = []
     for i in range(12):
-        start = 1_000 + i * 100 + (5_000 if i >= 7 else 0)  # a long gap before chapter 7
-        chapters.append({"id": f"c{i}", "when": "d", "from": start, "to": start + 50})
-    slices = story.act_slices(chapters, target=2)
+        start = 1_000 + i * 100 + (5_000 if i >= 7 else 0)  # a long gap before moment 7
+        moments.append({"id": f"c{i}", "when": "d", "from": start, "to": start + 50})
+    slices = story.act_slices(moments, target=2)
     assert slices[1][0] == 7  # the era starts where the work actually restarted
 
 
@@ -217,9 +217,9 @@ def test_the_agent_only_names_the_eras(tmp_path, monkeypatch):
     _fake_agent(
         monkeypatch,
         [
-            _chapter_reply(
+            _moment_reply(
                 [
-                    {"id": f"c{i}", "title": f"Chapter {i}", "summary": "s", "shas": [sha]}
+                    {"id": f"c{i}", "title": f"Moment {i}", "summary": "s", "shas": [sha]}
                     for i, sha in enumerate(ordered)
                 ]
             ),
@@ -251,14 +251,14 @@ def test_the_agent_only_names_the_eras(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------- building
 
 
-def test_build_writes_chapters_with_real_commits_and_quoted_asks(tmp_path, monkeypatch):
+def test_build_writes_moments_with_real_commits_and_quoted_asks(tmp_path, monkeypatch):
     repo = _repo_with_history(tmp_path, prompts=["make the parser stream", "now make it fast"])
     stats, sha_paths = _view_of(repo)
     shas = [stat.short for stat in story.story_stats(stats)]
     fake = _fake_agent(
         monkeypatch,
         [
-            _chapter_reply(
+            _moment_reply(
                 [
                     {
                         "id": "streaming",
@@ -281,19 +281,19 @@ def test_build_writes_chapters_with_real_commits_and_quoted_asks(tmp_path, monke
 
     assert built["title"] == "How the parser learned to read"
     assert built["tagline"] and built["arc"]
-    chapter = built["chapters"][0]
-    assert chapter["title"] == "The parser learns to stream"
-    assert chapter["kicker"] == "turning point"
-    assert [row["short"] for row in chapter["commits"]] == shas  # oldest first inside a chapter
-    assert chapter["stats"]["commits"] == len(shas) and chapter["stats"]["turns"] == 2
-    assert chapter["stats"]["files"]  # which files the chapter touched
+    moment = built["moments"][0]
+    assert moment["title"] == "The parser learns to stream"
+    assert moment["kicker"] == "turning point"
+    assert [row["short"] for row in moment["commits"]] == shas  # oldest first inside a moment
+    assert moment["stats"]["commits"] == len(shas) and moment["stats"]["turns"] == 2
+    assert moment["stats"]["files"]  # which files the moment touched
     # The quoted ask is the developer's OWN prompt, read back from the commit; only
     # the note comes from the model.
-    assert chapter["thoughts"][0]["quote"] == "make the parser stream"
-    assert chapter["thoughts"][0]["note"].startswith("They wanted it")
+    assert moment["thoughts"][0]["quote"] == "make the parser stream"
+    assert moment["thoughts"][0]["note"].startswith("They wanted it")
     # ...and it is persisted, so re-opening the page costs nothing.
-    assert story.StoryStore(tmp_path).get("main")["chapters"][0]["id"] == "streaming"
-    assert len(fake.prompts) == 2  # one chapter call, one arc call
+    assert story.StoryStore(tmp_path).get("main")["moments"][0]["id"] == "streaming"
+    assert len(fake.prompts) == 2  # one moment call, one arc call
     assert "asked: " in fake.prompts[0]  # the digest carries the prompts, not just subjects
 
 
@@ -304,10 +304,10 @@ def test_a_commit_id_the_model_invents_is_dropped(tmp_path, monkeypatch):
     _fake_agent(
         monkeypatch,
         [
-            _chapter_reply(
+            _moment_reply(
                 [
                     {
-                        "title": "A chapter",
+                        "title": "A moment",
                         "summary": "s",
                         "shas": [real[0], "deadbee", "0" * 40],
                         "thoughts": [{"sha": "deadbee", "note": "invented"}],
@@ -318,12 +318,12 @@ def test_a_commit_id_the_model_invents_is_dropped(tmp_path, monkeypatch):
         ],
     )
     built = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
-    chapter = built["chapters"][0]
+    moment = built["moments"][0]
     # The invented ids are gone; the second real commit is still in the story (folded in
-    # below), and the fabricated "thought" fell back to a real prompt of this chapter.
-    assert set(row["short"] for row in chapter["commits"]) == set(real)
-    assert chapter["thoughts"][0]["quote"] in ("do the thing", "do the other thing")
-    assert chapter["thoughts"][0]["sha"] in [stat.sha for stat in stats]
+    # below), and the fabricated "thought" fell back to a real prompt of this moment.
+    assert set(row["short"] for row in moment["commits"]) == set(real)
+    assert moment["thoughts"][0]["quote"] in ("do the thing", "do the other thing")
+    assert moment["thoughts"][0]["sha"] in [stat.sha for stat in stats]
 
 
 def test_no_commit_of_a_batch_falls_out_of_the_story(tmp_path, monkeypatch):
@@ -332,12 +332,12 @@ def test_no_commit_of_a_batch_falls_out_of_the_story(tmp_path, monkeypatch):
     real = [stat.short for stat in story.story_stats(stats)]
     _fake_agent(
         monkeypatch,
-        [_chapter_reply([{"title": "Only about the first", "summary": "s", "shas": [real[0]]}]), _ARC],
+        [_moment_reply([{"title": "Only about the first", "summary": "s", "shas": [real[0]]}]), _ARC],
     )
     built = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
-    told = {sha for chapter in built["chapters"] for sha in chapter["shas"]}
+    told = {sha for moment in built["moments"] for sha in moment["shas"]}
     assert told == set(story.story_stats(stats)[i].sha for i in range(len(real)))  # the ones the model
-    assert built["covered"] == len(real)  # forgot were folded into the nearest chapter
+    assert built["covered"] == len(real)  # forgot were folded into the nearest moment
 
 
 def test_extending_tells_only_what_is_new(tmp_path, monkeypatch):
@@ -346,7 +346,7 @@ def test_extending_tells_only_what_is_new(tmp_path, monkeypatch):
     first = [stat.short for stat in story.story_stats(stats)]
     _fake_agent(
         monkeypatch,
-        [_chapter_reply([{"id": "one", "title": "The first push", "summary": "s", "shas": first}]), _ARC],
+        [_moment_reply([{"id": "one", "title": "The first push", "summary": "s", "shas": first}]), _ARC],
     )
     story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
 
@@ -371,16 +371,16 @@ def test_extending_tells_only_what_is_new(tmp_path, monkeypatch):
     newest = story.story_stats(stats2)[-1].short
     fake = _fake_agent(
         monkeypatch,
-        [_chapter_reply([{"id": "two", "title": "The new thing", "summary": "s", "shas": [newest]}]), _ARC],
+        [_moment_reply([{"id": "two", "title": "The new thing", "summary": "s", "shas": [newest]}]), _ARC],
     )
     built = story.build_story(tmp_path, stats2, sha_paths2, branch="main", mode="extend")
 
-    assert [c["id"] for c in built["chapters"]] == ["one", "two"]  # kept, then continued
-    assert newest not in [s for c in built["chapters"][:1] for s in c["shas"]]
+    assert [c["id"] for c in built["moments"]] == ["one", "two"]  # kept, then continued
+    assert newest not in [s for c in built["moments"][:1] for s in c["shas"]]
     # The already-told commits are never sent to the agent a second time.
     assert first[0] not in fake.prompts[0]
     assert newest in fake.prompts[0]
-    # ...and the earlier chapters ride along as context so the telling continues.
+    # ...and the earlier moments ride along as context so the telling continues.
     assert "The first push" in fake.prompts[0]
 
 
@@ -388,7 +388,7 @@ def test_extending_with_nothing_new_says_so(tmp_path, monkeypatch):
     repo = _repo_with_history(tmp_path, prompts=["only thing"])
     stats, sha_paths = _view_of(repo)
     shas = [stat.short for stat in story.story_stats(stats)]
-    _fake_agent(monkeypatch, [_chapter_reply([{"title": "All of it", "summary": "s", "shas": shas}]), _ARC])
+    _fake_agent(monkeypatch, [_moment_reply([{"title": "All of it", "summary": "s", "shas": shas}]), _ARC])
     story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
     with pytest.raises(story.StoryError, match="nothing new"):
         story.build_story(tmp_path, stats, sha_paths, branch="main", mode="extend")
@@ -407,11 +407,11 @@ def test_an_unusable_reply_is_retried_then_told_plainly(tmp_path, monkeypatch):
 
     built = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
 
-    auto = [chapter for chapter in built["chapters"] if chapter.get("auto")]
+    auto = [moment for moment in built["moments"] if moment.get("auto")]
     assert auto and auto[0]["shas"]  # told from the commits themselves
     assert "storyteller could not be reached" in auto[0]["summary"]
     assert _RETRY_NUDGE_MARK in fake.prompts[1]  # ...after being told exactly what went wrong
-    told = {sha for chapter in built["chapters"] for sha in chapter["shas"]}
+    told = {sha for moment in built["moments"] for sha in moment["shas"]}
     assert told == {stat.sha for stat in story.story_stats(stats)}  # no hole in the timeline
 
 
@@ -420,17 +420,17 @@ _RETRY_NUDGE_MARK = "your previous answer could not be used"
 
 def test_a_backend_that_keeps_failing_stops_but_keeps_what_landed(tmp_path, monkeypatch):
     """A build covers the newest stretch; reaching further back is a separate build. When that
-    one cannot run, the chapters already told have to survive it."""
+    one cannot run, the moments already told have to survive it."""
     repo = _repo_with_history(tmp_path, prompts=[f"step {i}" for i in range(14)], gap_days=1)
     stats, sha_paths = _view_of(repo)
     ordered = [stat.short for stat in story.story_stats(stats)]
     monkeypatch.setattr(story, "_BATCH_EPISODES", 4)
     _fake_agent(
         monkeypatch,
-        [_chapter_reply([{"id": "newest", "title": "The newest stretch", "summary": "s", "shas": ordered[-4:]}]), _ARC],
+        [_moment_reply([{"id": "newest", "title": "The newest stretch", "summary": "s", "shas": ordered[-4:]}]), _ARC],
     )
     first = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
-    assert [c["id"] for c in first["chapters"]] == ["newest"]
+    assert [c["id"] for c in first["moments"]] == ["newest"]
     assert first["more_earlier"] is True  # there is older history, not yet told
 
     _fake_agent(
@@ -443,11 +443,11 @@ def test_a_backend_that_keeps_failing_stops_but_keeps_what_landed(tmp_path, monk
     with pytest.raises(story.StoryError, match="exited with code 1"):
         story.build_story(tmp_path, stats, sha_paths, branch="main", mode="earlier")
     stored = story.StoryStore(tmp_path).get("main")
-    assert [c["id"] for c in stored["chapters"]] == ["newest"]  # the told stretch is untouched
+    assert [c["id"] for c in stored["moments"]] == ["newest"]  # the told stretch is untouched
 
 
 def test_a_build_covers_the_newest_stretch_not_the_whole_history(tmp_path, monkeypatch):
-    """Forty-five chapters in one go is a long wait and more than anyone reads at once. A
+    """Forty-five moments in one go is a long wait and more than anyone reads at once. A
     build tells the most recent stretch and says there is more behind it."""
     repo = _repo_with_history(tmp_path, prompts=[f"step {i}" for i in range(14)], gap_days=1)
     stats, sha_paths = _view_of(repo)
@@ -455,14 +455,14 @@ def test_a_build_covers_the_newest_stretch_not_the_whole_history(tmp_path, monke
     monkeypatch.setattr(story, "_BATCH_EPISODES", 4)
     fake = _fake_agent(
         monkeypatch,
-        [_chapter_reply([{"id": "newest", "title": "Lately", "summary": "s", "shas": ordered[-4:]}]), _ARC],
+        [_moment_reply([{"id": "newest", "title": "Lately", "summary": "s", "shas": ordered[-4:]}]), _ARC],
     )
     built = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
 
     assert len(fake.prompts) == 2  # ONE outline call plus the whole-history overview
     assert built["more_earlier"] is True
     assert built["covered"] < len(ordered)
-    # ...and the coarse story still spans everything, including what has no chapters yet.
+    # ...and the coarse story still spans everything, including what has no moments yet.
     assert sum(era["commits"] for era in built["eras"]) == len(ordered)
 
 
@@ -473,7 +473,7 @@ def test_a_build_runs_in_the_background_and_reports_progress(tmp_path, monkeypat
     repo = _repo_with_history(tmp_path, prompts=["one", "two"])
     stats, sha_paths = _view_of(repo)
     shas = [stat.short for stat in story.story_stats(stats)]
-    _fake_agent(monkeypatch, [_chapter_reply([{"title": "It", "summary": "s", "shas": shas}]), _ARC])
+    _fake_agent(monkeypatch, [_moment_reply([{"title": "It", "summary": "s", "shas": shas}]), _ARC])
 
     started = story.start_build(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
     assert started["building"] is True
@@ -485,7 +485,7 @@ def test_a_build_runs_in_the_background_and_reports_progress(tmp_path, monkeypat
         time.sleep(0.05)
     progress = story.build_progress(tmp_path, "main")
     assert progress and progress["running"] is False and not progress["error"]
-    assert story.StoryStore(tmp_path).get("main")["chapters"]
+    assert story.StoryStore(tmp_path).get("main")["moments"]
 
 
 def test_only_one_story_is_written_at_a_time(tmp_path, monkeypatch):
@@ -498,7 +498,7 @@ def test_only_one_story_is_written_at_a_time(tmp_path, monkeypatch):
             release.wait(5)
             return super().run(prompt, **kwargs)
 
-    blocking = _Blocking([_chapter_reply([{"title": "x", "summary": "s", "shas": ["deadbee"]}]), _ARC])
+    blocking = _Blocking([_moment_reply([{"title": "x", "summary": "s", "shas": ["deadbee"]}]), _ARC])
     monkeypatch.setattr(learn.LearningBackendChoice, "build", lambda self: blocking)
     monkeypatch.setattr(
         learn,
@@ -529,18 +529,18 @@ def test_state_offers_the_outline_and_says_what_is_uncovered(tmp_path, monkeypat
     assert state["meta"]["turns"] == 2  # ...of which two are agent turns
 
     shas = [stat.short for stat in story.story_stats(stats)]
-    _fake_agent(monkeypatch, [_chapter_reply([{"title": "It", "summary": "s", "shas": shas}]), _ARC])
+    _fake_agent(monkeypatch, [_moment_reply([{"title": "It", "summary": "s", "shas": shas}]), _ARC])
     story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
     state = story.story_state(tmp_path, stats, sha_paths, branch="main", branches=["main"], repo_name="demo")
     assert state["meta"]["uncovered"] == 0
-    assert state["story"]["chapters"]
+    assert state["story"]["moments"]
 
 
 def test_forgetting_a_story_leaves_the_commits_alone(tmp_path, monkeypatch):
     repo = _repo_with_history(tmp_path, prompts=["one"])
     stats, sha_paths = _view_of(repo)
     shas = [stat.short for stat in story.story_stats(stats)]
-    _fake_agent(monkeypatch, [_chapter_reply([{"title": "It", "summary": "s", "shas": shas}]), _ARC])
+    _fake_agent(monkeypatch, [_moment_reply([{"title": "It", "summary": "s", "shas": shas}]), _ARC])
     story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
 
     answer = story.handle_story_post(
@@ -565,13 +565,13 @@ def test_the_page_paints_without_any_story(tmp_path):
     # Phone support, like the dashboard's: a narrow-screen block that tightens the timeline
     # rail and stops the outline's numbers from being pushed off the side of the screen.
     assert "@media (max-width:640px)" in html
-    # The numbers are drawn, not described: a bar for what a chapter moved, a dot per commit,
+    # The numbers are drawn, not described: a bar for what a moment moved, a dot per commit,
     # a sparkline per era, and a waiting state whenever content is not there yet.
     assert "function shapeHtml" in html and "function sparkHtml" in html
     assert 'id="loading"' in html and 'id="skeleton"' in html
-    # The coarse story (every era, always complete) and only a handful of chapters at once.
+    # The coarse story (every era, always complete) and only a handful of moments at once.
     assert 'id="eras"' in html and "function renderEras" in html
-    assert "const PAGE_CHAPTERS = 8" in html and 'id="more-chapters"' in html
+    assert "const PAGE_MOMENTS = 8" in html and 'id="more-moments"' in html
     # Cards appear as they are reached; they used to all animate at once on load.
     assert "IntersectionObserver" in html and "rootMargin" in html
     assert ".outline .num{flex-basis:100%}" in html
@@ -718,7 +718,7 @@ def test_the_page_script_runs(tmp_path):
     """The whole page is one inline script: anything that throws at its top level takes the
     entire page with it, and the result looks exactly like a server that never answered. A
     `const` declared below the object that reads it did precisely that (the state object read
-    PAGE_CHAPTERS, which was declared 200 lines further down: ReferenceError, blank page)."""
+    PAGE_MOMENTS, which was declared 200 lines further down: ReferenceError, blank page)."""
     source = re.findall(r"<script>(.*?)</script>", story.story_html(tmp_path), re.S)[-1]
     script = tmp_path / "page.js"
     script.write_text("const SOURCE = " + json.dumps(source) + ";\n" + _DOM_STUB, encoding="utf-8")
