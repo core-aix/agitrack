@@ -178,6 +178,71 @@ def test_the_outline_needs_no_agent_at_all():
     assert rows[0]["commits"] == 1
 
 
+def test_eras_are_split_by_us_not_by_the_model():
+    """Letting the agent choose the groupings AND name them put 26 of 44 chapters in the last
+    act, titled after its first three ("Windows Finally Gets Invited In" for a month that was
+    mostly other things). Boundaries are ours; naming is all the agent is asked for."""
+    chapters = [
+        {"id": f"c{i}", "when": "2026-06-%02d" % (i + 1), "from": 1_000 + i * 100, "to": 1_000 + i * 100 + 50}
+        for i in range(44)
+    ]
+    slices = story.act_slices(chapters)
+    assert len(slices) == 5
+    assert slices[0][0] == 0 and slices[-1][1] == len(chapters) - 1  # every chapter is in an era
+    for (start, end), (next_start, _) in zip(slices, slices[1:]):
+        assert next_start == end + 1  # contiguous, no gaps and no overlaps
+    sizes = [end - start + 1 for start, end in slices]
+    assert max(sizes) - min(sizes) <= 5  # and no era swallows the story
+    assert story.act_slices(chapters[:3]) == [(0, 2)]  # a tiny story is one era
+    assert story.act_slices([]) == []
+
+
+def test_an_era_boundary_prefers_a_real_pause_in_the_work():
+    chapters = []
+    for i in range(12):
+        start = 1_000 + i * 100 + (5_000 if i >= 7 else 0)  # a long gap before chapter 7
+        chapters.append({"id": f"c{i}", "when": "d", "from": start, "to": start + 50})
+    slices = story.act_slices(chapters, target=2)
+    assert slices[1][0] == 7  # the era starts where the work actually restarted
+
+
+def test_the_agent_only_names_the_eras(tmp_path, monkeypatch):
+    repo = _repo_with_history(tmp_path, prompts=[f"step {i}" for i in range(8)])
+    stats, sha_paths = _view_of(repo)
+    ordered = [stat.short for stat in story.story_stats(stats)]
+    _fake_agent(
+        monkeypatch,
+        [
+            _chapter_reply(
+                [
+                    {"id": f"c{i}", "title": f"Chapter {i}", "summary": "s", "shas": [sha]}
+                    for i, sha in enumerate(ordered)
+                ]
+            ),
+            json.dumps(
+                {
+                    "title": "A title",
+                    "tagline": "A tagline",
+                    "arc": "It happened.",
+                    # named by number; the model never says where an era starts
+                    "eras": [
+                        {"n": 1, "title": "The beginning", "blurb": "b"},
+                        {"n": 2, "title": "The rest", "blurb": "b"},
+                    ],
+                }
+            ),
+        ],
+    )
+    built = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
+    acts = built["acts"]
+    assert [act["title"] for act in acts] == ["The beginning", "The rest"]
+    assert acts[0]["start_id"] == built["chapters"][0]["id"]  # the story always opens in act one
+    assert acts[-1]["end_id"] == built["chapters"][-1]["id"]  # ...and the last era runs to the end
+    assert sum(act["chapters"] for act in acts) == len(built["chapters"])  # every chapter is covered
+    # An era the model forgot to name still gets a label rather than an empty heading.
+    assert all(act["title"] for act in acts)
+
+
 # --------------------------------------------------------------------------- building
 
 
@@ -557,6 +622,12 @@ def test_the_page_paints_without_any_story(tmp_path):
     # Phone support, like the dashboard's: a narrow-screen block that tightens the timeline
     # rail and stops the outline's numbers from being pushed off the side of the screen.
     assert "@media (max-width:640px)" in html
+    # The numbers are drawn, not described: a bar for what a chapter moved, a dot per commit,
+    # a sparkline per era, and a waiting state whenever content is not there yet.
+    assert "function shapeHtml" in html and "function actMetaHtml" in html
+    assert 'id="loading"' in html and 'id="skeleton"' in html
+    # Cards appear as they are reached; they used to all animate at once on load.
+    assert "IntersectionObserver" in html and "rootMargin" in html
     assert ".outline .num{flex-basis:100%}" in html
     # Nothing on the page may push the document wider than the screen.
     assert "overflow-x:hidden" in html

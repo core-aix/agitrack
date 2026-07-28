@@ -394,7 +394,7 @@ For each chapter:
 - "title": the thing that actually happened, named. Specific enough that it could only belong to this chapter. Never a category like "Improvements", "Bug fixes" or "Dashboard work".
 - "kicker": one of {", ".join(KICKERS)}.
 - "emoji": a single emoji that fits the chapter.
-- "summary": ONE sentence with a hook: what was wrong, what got decided, or what surprised them. A reader skimming only the summaries should still get the story.
+- "summary": ONE short sentence (under 20 words) with a hook: what was wrong, what got decided, or what surprised them. A reader skimming only the summaries should still get the story.
 - "shas": every commit id belonging to this chapter, copied exactly.
 
 Do NOT write the body of the chapter here. Headlines only.
@@ -428,7 +428,7 @@ SUMMARY ALREADY SHOWN TO THE READER: {chapter.get("summary", "")}
 {voice}
 
 Reply with ONE JSON object:
-{{"detail": "2 to 4 SHORT sentences, one paragraph, no headings and no lists. Lead with the problem or the want (the prompts show it), then what changed, naming a real file or feature, then what it made possible. Prefer the surprising detail over the general one. Never repeat the summary.",
+{{"detail": "2 or 3 SHORT sentences, one paragraph, no headings and no lists. The numbers are already on the page, so spend the words on WHY: the problem or the want (the prompts show it), what changed, naming a real file or feature. Never repeat the summary, and never list what the reader can see.",
  "thoughts": [{{"sha": "<a commit id from the material below>", "note": "one short sentence on what the developer was working out at that moment"}}]}}
 
 Give 1 or 2 thoughts, picking the commits whose prompts show the thinking best. Never invent a quote: only the commit id and your note.
@@ -439,27 +439,52 @@ MATERIAL:
 {material}"""
 
 
+def act_slices(chapters: list[dict], target: int = 5) -> list[tuple[int, int]]:
+    """Split the chapters into contiguous eras, as ``(start, end)`` index pairs.
+
+    The BOUNDARIES are decided here, not by the agent. Asking a model to both group and name
+    left the last act covering 26 of 44 chapters and titled after the first three of them
+    ("Windows Finally Gets Invited In" for a month that was mostly about other things). Even
+    spans, nudged onto the biggest pause between chapters so an era starts where the work
+    actually did, are always defensible; naming is all the agent is asked for."""
+    total = len(chapters)
+    if total < 4:
+        return [(0, total - 1)] if total else []
+    count = max(2, min(target, total // 4))
+    step = total / count
+    cuts: list[int] = []
+    for index in range(1, count):
+        ideal = round(index * step)
+        # Nudge onto the largest time gap within a couple of chapters of the even split.
+        window = [pos for pos in range(max(1, ideal - 2), min(total - 1, ideal + 3))]
+        best = max(window, key=lambda pos: chapters[pos].get("from", 0) - chapters[pos - 1].get("to", 0))
+        if not cuts or best > cuts[-1]:
+            cuts.append(best)
+    bounds = [0, *cuts, total]
+    return [(bounds[i], bounds[i + 1] - 1) for i in range(len(bounds) - 1)]
+
+
 def _arc_prompt(chapters: list[dict], tone: str, repo_name: str) -> str:
-    lines = [
-        f"{index + 1}. [{chapter.get('when', '')}] {chapter.get('title', '')} ({chapter.get('kicker', '')}): "
-        f"{chapter.get('summary', '')}"
-        for index, chapter in enumerate(chapters)
-    ]
-    listing = "\n".join(lines)[:6000]
     voice = STORY_TONES.get(tone, STORY_TONES[DEFAULT_TONE])
-    return f"""These are the chapters of the story of a repository called "{repo_name}", in order.
+    blocks = []
+    for number, (start, end) in enumerate(act_slices(chapters), start=1):
+        titles = "; ".join(chapter.get("title", "") for chapter in chapters[start : end + 1])
+        span = f"{chapters[start].get('when', '')} to {chapters[end].get('when', '')}"
+        blocks.append(f"ERA {number} ({span}, {end - start + 1} chapters): {titles}"[:1400])
+    listing = "\n\n".join(blocks)[:7000]
+    return f"""Below are the eras of a repository called "{repo_name}", in order, each listed with the chapters it contains.
 
 {voice}
 
-Give the whole story a shape:
+Name them:
 - "title": a title for the project's story so far. Short, specific to THIS project, memorable; the kind of title someone would click. Not a slogan, not "The Story of X".
 - "tagline": one sentence under the title that makes someone want to read on.
-- "arc": 2 or 3 short sentences on the overall journey: where it started, what changed along the way, where it stands now.
-- "acts": 2 to 5 acts grouping CONSECUTIVE chapters. Each act is {{"title": "...", "blurb": "one sentence", "start": <the number of its first chapter>}}. The first act must start at 1.
+- "arc": TWO short sentences on the overall journey: where it started and where it stands now.
+- "eras": one entry per era above, each {{"n": <its number>, "title": "a few words naming what that era was about", "blurb": "one short sentence"}}. The name must fit EVERYTHING in that era, not just its first chapter.
 
 Reply with ONE JSON object with exactly those four keys.
 
-CHAPTERS:
+ERAS:
 {listing}"""
 
 
@@ -601,9 +626,9 @@ def _normalize_chapters(
             "title": title,
             "kicker": kicker if kicker in KICKERS else "chapter",
             "emoji": _emoji(item.get("emoji")),
-            "summary": _text(item.get("summary"), 300),
+            "summary": _text(item.get("summary"), 200),
             # A chapter is a paragraph, not an essay: the commits under it carry the detail.
-            "detail": _shorten(str(item.get("detail") or item.get("detail_md") or ""), 900),
+            "detail": _shorten(str(item.get("detail") or item.get("detail_md") or ""), 600),
             "shas": shas,
             # Resolved once the chapter's final commit list is known (below), so a fallback
             # quote can come from a commit that was folded in afterwards.
@@ -932,32 +957,41 @@ def _apply_arc(story: dict[str, Any], arc: dict, existing: dict | None) -> None:
     tagline = _text(arc.get("tagline"), 240)
     if tagline:
         story["tagline"] = tagline
-    arc_text = _text(arc.get("arc"), 1200)
+    arc_text = _text(arc.get("arc"), 400)
     if arc_text:
         story["arc"] = arc_text
-    acts = []
-    used: set[str] = set()
-    raw_acts = arc.get("acts")
-    for index, item in enumerate(raw_acts if isinstance(raw_acts, list) else []):
+    # The boundaries are ours (act_slices); the agent only names each era, so a title can
+    # never drift onto chapters it does not cover.
+    slices = act_slices(chapters)
+    named: dict[int, dict] = {}
+    raw_eras = arc.get("eras") if isinstance(arc.get("eras"), list) else arc.get("acts")
+    for item in raw_eras if isinstance(raw_eras, list) else []:
         if not isinstance(item, dict):
             continue
-        act_title = _text(item.get("title"), 90)
         try:
-            start = int(item.get("start") or 0)
+            number = int(item.get("n") or item.get("era") or 0)
         except (TypeError, ValueError):
             continue
-        if not act_title or not 1 <= start <= len(chapters):
-            continue
+        if 1 <= number <= len(slices):
+            named[number] = item
+    acts = []
+    used: set[str] = set()
+    for number, (start, end) in enumerate(slices, start=1):
+        item = named.get(number, {})
+        title = _text(item.get("title"), 90) or f"{chapters[start].get('when', '')} onward"
         acts.append(
             {
-                "id": _unique_id(_slug(act_title, f"act-{index}"), used),
-                "title": act_title,
-                "blurb": _text(item.get("blurb"), 300),
-                "start_id": chapters[start - 1].get("id", ""),
+                "id": _unique_id(_slug(title, f"act-{number}"), used),
+                "title": title,
+                "blurb": _text(item.get("blurb"), 220),
+                "start_id": chapters[start].get("id", ""),
+                "end_id": chapters[end].get("id", ""),
+                "chapters": end - start + 1,
+                "from": chapters[start].get("from", 0),
+                "to": chapters[end].get("to", 0),
             }
         )
     if acts:
-        acts[0]["start_id"] = chapters[0].get("id", "")  # the story always opens in act one
         story["acts"] = acts
     elif existing and existing.get("acts"):
         story["acts"] = existing["acts"]
@@ -996,7 +1030,7 @@ def expand_chapter(
     raw = _ask(
         choice, _expand_prompt(chapter, own, sha_paths, story.get("tone") or DEFAULT_TONE), _EXPAND_TIMEOUT_SECONDS
     )
-    detail = _shorten(str((raw or {}).get("detail") or ""), 900)
+    detail = _shorten(str((raw or {}).get("detail") or ""), 600)
     if not detail:
         return {"error": "The backend could not write this chapter; try opening it again."}
     thoughts = _thoughts((raw or {}).get("thoughts"), {**by_sha, **{s.short: s for s in own}}, [s.sha for s in own])
@@ -1286,6 +1320,7 @@ select,input[type=text]{background:var(--panel2);border:1px solid var(--line);co
 @media (prefers-reduced-motion: reduce){
   html{scroll-behavior:auto}
   .rise,.ambient,.spin,.ch,.dot,.confetti span{animation:none !important}
+  .bar i,.spark i,.dots i{transition:none !important}
 }
 
 /* ---------------------------------------------------------------- the hero */
@@ -1402,9 +1437,41 @@ h2.section{font-size:13px;letter-spacing:1.5px;text-transform:uppercase;color:va
 .th .q::before{content:"\201C"} .th .q::after{content:"\201D"}
 .th .note{color:var(--fg-dim);font-size:12.5px;margin-top:5px}
 .th .thmeta{color:var(--phosphor-dim);font-size:11px;margin-top:4px;letter-spacing:.5px}
-.caret{display:inline-block;width:7px;background:var(--amber);animation:blink 1s steps(2) infinite;
-  margin-left:1px;vertical-align:-1px;height:14px}
-@keyframes blink{50%{opacity:0}}
+
+/* ------------------------------------------------------------------ graphics
+   The numbers carry more of the story than a sentence about them would, so they are drawn:
+   a bar for what a chapter added and removed, a dot per commit, a sparkline per era. */
+.shape{display:flex;align-items:center;gap:10px;margin:9px 0 0;flex-wrap:wrap}
+.bar{display:flex;height:6px;border-radius:3px;overflow:hidden;background:var(--panel2);
+  flex:1;min-width:120px;max-width:280px}
+.bar i{display:block;height:100%;width:0;transition:width .7s cubic-bezier(.2,.8,.2,1)}
+.bar .add{background:var(--phosphor)} .bar .rem{background:var(--bad)}
+.in .bar i{width:var(--w)}
+.dots{display:flex;gap:3px;align-items:center}
+.dots i{width:5px;height:5px;border-radius:50%;background:var(--phosphor-dim);opacity:0;
+  transform:scale(.4);transition:opacity .3s,transform .3s}
+.in .dots i{opacity:.85;transform:none}
+.dots i.big{background:var(--phosphor)}
+.dots span{font-size:11px;color:var(--fg-dim);margin-left:2px}
+.spark{display:flex;align-items:flex-end;gap:2px;height:28px}
+.spark i{width:6px;background:linear-gradient(180deg,var(--phosphor),var(--phosphor-dim));
+  border-radius:1px;height:2px;transition:height .6s cubic-bezier(.2,.8,.2,1)}
+.in .spark i{height:var(--h)}
+.actmeta{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-top:8px;
+  color:var(--fg-dim);font-size:11.5px}
+
+/* Reveal on scroll, once, and only when motion is welcome. */
+.ch,.act{opacity:1}
+body.anim .ch,body.anim .act{opacity:0;transform:translateY(14px);
+  transition:opacity .45s ease,transform .45s cubic-bezier(.2,.8,.2,1)}
+body.anim .ch.in,body.anim .act.in{opacity:1;transform:none}
+
+/* Waiting states: never an empty page with no explanation. */
+.skel{display:grid;gap:12px;margin-top:12px}
+.skel div{height:74px;border-radius:10px;background:linear-gradient(90deg,var(--panel) 25%,var(--panel2) 37%,var(--panel) 63%);
+  background-size:400% 100%;animation:shimmer 1.4s linear infinite}
+@keyframes shimmer{from{background-position:100% 0}to{background-position:0 0}}
+.loading{display:flex;align-items:center;gap:10px;color:var(--phosphor);font-size:13px;margin:18px 0}
 
 .facts{display:flex;gap:8px;flex-wrap:wrap;margin:14px 0 0}
 .fact{background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:4px 10px;font-size:11.5px;
@@ -1540,6 +1607,8 @@ __BACKTRACE_BANNER__
     <span class="kbd nocinema"><b>j</b>/<b>k</b> move &nbsp; <b>enter</b> open &nbsp; <b>esc</b> close</span>
   </div>
 
+  <div id="loading" class="loading"><span class="spin"></span><span>reading the story…</span></div>
+  <div id="skeleton" class="skel" hidden><div></div><div></div><div></div></div>
   <div id="timeline"></div>
 
   <div class="outline" id="outlinewrap" hidden>
@@ -1631,6 +1700,8 @@ async function load(){
 
 function render(){
   const d = state.data; if (!d) return;
+  $("loading").hidden = true;
+  $("skeleton").hidden = true;
   renderBranches();
   renderHero();
   renderStudio();
@@ -1734,26 +1805,85 @@ function renderTimeline(){
   let html = "";
   groups.slice().reverse().forEach(group => {
     if (group.act) {
-      html += '<div class="act"><div class="actno">act ' + group.act.n + '</div><h2>' + esc(group.act.title) + "</h2>" +
-              (group.act.blurb ? "<p>" + esc(group.act.blurb) + "</p>" : "") + "</div>";
+      html += '<div class="act"><div class="actno">act ' + group.act.n + "</div><h2>" + esc(group.act.title) + "</h2>" +
+              (group.act.blurb ? "<p>" + esc(group.act.blurb) + "</p>" : "") +
+              actMetaHtml(group) + "</div>";
     }
     html += '<div class="timeline">';
     group.chapters.slice().reverse().forEach((entry, position) => { html += chapterHtml(entry.c, position); });
     html += "</div>";
   });
   host.innerHTML = html;
+  revealOnScroll(host);
   for (const id of state.open) {
     const el = document.getElementById("ch-" + id);
     if (el) { el.classList.add("open"); fillChapter(el, false); }
   }
 }
 
+// Cards appear as they are reached, not all at once on load (which fired for a hundred
+// chapters at the same moment, most of them off screen, and looked like a stutter).
+let _revealer = null;
+function revealOnScroll(host){
+  if (REDUCED) { document.body.classList.remove("anim"); return; }
+  document.body.classList.add("anim");
+  if (!("IntersectionObserver" in window)) {
+    host.querySelectorAll(".ch,.act").forEach(el => el.classList.add("in"));
+    return;
+  }
+  if (_revealer) _revealer.disconnect();
+  _revealer = new IntersectionObserver(entries => {
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue;
+      entry.target.classList.add("in");
+      _revealer.unobserve(entry.target);   // one-shot: nothing re-animates on the way back
+    }
+  }, {rootMargin: "80px 0px"});
+  host.querySelectorAll(".ch,.act").forEach(el => _revealer.observe(el));
+}
+
+// A chapter's size, drawn: the split of what it added and removed, one dot per commit, and
+// the token count. Three glanceable facts instead of a sentence nobody reads.
+function shapeHtml(st){
+  const ins = Number(st.ins || 0), del = Number(st.del || 0), total = ins + del;
+  const parts = [];
+  if (total) {
+    const pct = Math.round(100 * ins / total);
+    parts.push('<span class="bar" title="' + ins + ' added, ' + del + ' removed">' +
+      '<i class="add" style="--w:' + pct + '%"></i><i class="rem" style="--w:' + (100 - pct) + '%"></i></span>');
+  }
+  const commits = Math.max(0, Number(st.commits || 0));
+  if (commits) {
+    const shown = Math.min(commits, 12);
+    let dots = "";
+    for (let d = 0; d < shown; d++) dots += '<i style="transition-delay:' + (d * 25) + 'ms"></i>';
+    parts.push('<span class="dots" title="' + commits + ' commits">' + dots +
+      (commits > shown ? "<span>+" + (commits - shown) + "</span>" : "") + "</span>");
+  }
+  if (st.tokens) parts.push('<span class="fact">' + num(st.tokens) + " tokens</span>");
+  return parts.length ? '<div class="shape">' + parts.join("") + "</div>" : "";
+}
+
+// An era at a glance: when it ran, how big it was, and the shape of the work inside it.
+function actMetaHtml(group){
+  const chapters = group.chapters.map(entry => entry.c);
+  const sizes = chapters.map(c => Math.max(1, ((c.stats || {}).ins || 0) + ((c.stats || {}).del || 0)));
+  // Square-root scale: one 17,000-line chapter beside a dozen 300-line ones flattens a
+  // linear sparkline into a dashed line. This keeps the big one biggest and the rest visible.
+  const peak = Math.sqrt(Math.max.apply(null, sizes));
+  const bars = sizes.map((size, i) =>
+    '<i style="--h:' + Math.max(4, Math.round(28 * Math.sqrt(size) / peak)) + "px;transition-delay:" + (i * 30) + 'ms"></i>').join("");
+  const commits = chapters.reduce((sum, c) => sum + (((c.stats || {}).commits) || 0), 0);
+  const first = chapters[0] || {}, last = chapters[chapters.length - 1] || {};
+  const span = first.when === last.when ? esc(first.when || "") : esc(first.when || "") + " &rarr; " + esc(last.when || "");
+  return '<div class="actmeta"><span class="spark" title="how big each chapter of this era was">' + bars + "</span>" +
+         "<span>" + span + "</span><span>" + chapters.length + " chapters &nbsp;·&nbsp; " + commits + " commits</span></div>";
+}
+
 function chapterHtml(c, i){
   const st = c.stats || {};
   const bits = [];
   if (st.commits) bits.push(st.commits + " commit" + (st.commits === 1 ? "" : "s"));
-  if (st.ins || st.del) bits.push('<span class="add">+' + num(st.ins) + '</span>/<span class="rem">-' + num(st.del) + "</span>");
-  if (st.tokens) bits.push(num(st.tokens) + " tokens");
   return '<article class="ch" id="ch-' + esc(c.id) + '" data-id="' + esc(c.id) + '" data-i="' + i + '"' +
       ' style="animation-delay:' + Math.min(i * 40, 400) + 'ms">' +
     '<div class="dot">' + esc(c.emoji || "✦") + "</div>" +
@@ -1763,6 +1893,7 @@ function chapterHtml(c, i){
         '<span>' + bits.join(" &nbsp;·&nbsp; ") + "</span></div>" +
       "<h3>" + esc(c.title) + "</h3>" +
       '<p class="sum">' + esc(c.summary || "") + "</p>" +
+      shapeHtml(st) +
       '<div class="more" hidden></div>' +
       '<div class="open-hint">read the chapter &darr;</div>' +
     "</div></article>";
@@ -1785,7 +1916,7 @@ function fillChapter(el, animate){
   if (c.thoughts && c.thoughts.length) {
     html += '<div class="thoughts"><h4>&#128172; what they asked for</h4>' + c.thoughts.map((t, i) =>
       '<div class="th" data-i="' + i + '">' +
-        '<div class="q" data-full="' + esc(t.quote || "") + '">' + esc(t.quote || "") + "</div>" +
+        '<div class="q">' + esc(t.quote || "") + "</div>" +
         (t.note ? '<div class="note">' + esc(t.note) + "</div>" : "") +
         '<div class="thmeta">' + esc(t.short || "") + (t.at ? " &nbsp;·&nbsp; " + esc(day(t.at)) : "") + "</div>" +
       "</div>").join("") + "</div>";
@@ -1809,7 +1940,6 @@ function fillChapter(el, animate){
       "</div>").join("") + "</div>";
   }
   box.innerHTML = html;
-  if (animate && !REDUCED) typeThoughts(box);
 }
 
 // Ask the agent to write this chapter out, then render it. Costs one call, once ever:
@@ -1833,21 +1963,6 @@ async function writeChapter(el, c, box){
     box.dataset.writing = "";
     box.innerHTML = '<div class="notice">' + esc(e.message) + "</div>";
   }
-}
-
-// The developer's own words, typed out. Only on the first open of a chapter, and only for
-// the first quote: this is a flourish, not a wait.
-function typeThoughts(box){
-  const q = box.querySelector(".th .q"); if (!q) return;
-  const full = q.dataset.full || ""; if (full.length > 400) return;
-  q.textContent = "";
-  const caret = document.createElement("span"); caret.className = "caret";
-  q.parentNode.insertBefore(caret, q.nextSibling);
-  let i = 0;
-  const tick = setInterval(() => {
-    q.textContent = full.slice(0, i += Math.max(1, Math.round(full.length / 90)));
-    if (i >= full.length) { clearInterval(tick); q.textContent = full; caret.remove(); }
-  }, 16);
 }
 
 function chapterById(id){
@@ -1987,6 +2102,7 @@ async function build(mode){
   if (state.building) return;
   flash("");
   state.building = true; renderStudio();
+  if (!(state.story && (state.story.chapters || []).length)) $("skeleton").hidden = false;
   try {
     const r = await post("story/build", {branch: state.branch, tone: state.tone, mode: mode});
     if (r.error || r.busy) { state.building = false; fail(r.error || "busy"); renderStudio(); return; }
@@ -2009,7 +2125,7 @@ function startPolling(){
         const el = last && document.getElementById("ch-" + last.id);
         if (el && !state.cinema) el.scrollIntoView({block: "center", behavior: REDUCED ? "auto" : "smooth"});
       }
-      if (!p || !p.running) { stopPolling(); if (after) celebrate(); }
+      if (!p || !p.running) { stopPolling(); $("skeleton").hidden = true; if (after) celebrate(); }
     } catch (e) { /* a poll that fails is retried by the next one */ }
   }, 2500);
 }
@@ -2074,7 +2190,16 @@ function cineStep(delta){
   const pos = $("cine-pos");
   if (pos) pos.textContent = (state.cursor + 1) + " / " + els.length;
   clearTimeout(state.cineTimer);
-  state.cineTimer = setTimeout(() => cineStep(1), 11000);
+  const dwell = () => {
+    const el = chapterEls()[state.cursor];
+    const box = el && el.querySelector(".more");
+    if (box && box.dataset.writing === "1") {  // still being written: wait for it
+      state.cineTimer = setTimeout(dwell, 1000);
+      return;
+    }
+    state.cineTimer = setTimeout(() => cineStep(1), 9000);
+  };
+  dwell();
 }
 
 function stopCinema(){
@@ -2128,7 +2253,18 @@ $("build-cancel").addEventListener("click", async () => {
   try { await post("story/cancel", {branch: state.branch}); } catch (e) {}
 });
 $("play").addEventListener("click", playStory);
-$("expand-all").addEventListener("click", () => { for (const el of chapterEls()) toggleChapter(el, true); });
+$("expand-all").addEventListener("click", () => {
+  // Only the chapters that are already written: with lazy writing, opening all of them
+  // would queue one agent call per chapter, which is not what "expand all" means.
+  let skipped = 0;
+  for (const el of chapterEls()) {
+    const c = chapterById(el.dataset.id);
+    if (c && c.detail) toggleChapter(el, true);
+    else skipped++;
+  }
+  if (skipped) notice(skipped + " chapter" + (skipped === 1 ? " is" : "s are") +
+    " not written yet; open one and your agent writes it (a few seconds each).");
+});
 $("collapse-all").addEventListener("click", () => { for (const el of chapterEls()) toggleChapter(el, false); });
 $("f-branch").addEventListener("change", () => {
   state.branch = $("f-branch").value; state.open.clear();
@@ -2153,7 +2289,7 @@ document.addEventListener("keydown", e => {
 });
 window.addEventListener("hashchange", openFromHash);
 
-load().catch(e => fail("could not load the story: " + e.message));
+load().catch(e => { $("loading").hidden = true; fail("could not load the story: " + e.message); });
 // A build started from another tab (or still running from before this page loaded) keeps
 // the page live without anyone pressing anything.
 setTimeout(() => { if (state.data && state.data.building && state.data.building.running) startPolling(); }, 100);
