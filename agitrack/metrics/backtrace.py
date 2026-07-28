@@ -774,9 +774,12 @@ def _make_handler(view_source) -> type[http.server.BaseHTTPRequestHandler]:
                     self._respond("application/json", json.dumps(page_data).encode("utf-8"))
                 elif parsed.path == "/diff":
                     sha = _str(query, "sha")
+                    # The message rides along for the storyline, which shows it before the
+                    # file changes (see web.commit_diff). Here it is the reconstructed turn.
+                    message = next((stat.message for stat in view.dashboard.stats if stat.sha == sha), "")
                     self._respond(
                         "application/json",
-                        json.dumps({"sha": sha, "diff": view.diffs.get(sha, "")}).encode("utf-8"),
+                        json.dumps({"sha": sha, "diff": view.diffs.get(sha, ""), "message": message}).encode("utf-8"),
                     )
                 elif parsed.path == "/files":
                     self._respond("application/json", json.dumps({"files": browser.files_payload()}).encode("utf-8"))
