@@ -1320,6 +1320,13 @@ __UPDATE_BANNER__
   <h2 class="section">shared sessions</h2>
   <div class="panel" id="shared"></div>
 
+  <div class="logsection-head">
+    <h2 class="section">log</h2>
+    <div class="logtabs">
+      <button class="logtab active" data-tab="commits">commits</button>
+      <button class="logtab" data-tab="files" id="tab-files-btn">files</button>
+    </div>
+  </div>
   <a class="learncta storycta" id="storycta" href="story" title="Open the storyline">
     <span class="lc-icon">&#128214;</span>
     <span class="lc-text"><b>Read it as a story.</b>
@@ -1328,13 +1335,6 @@ __UPDATE_BANNER__
     <span class="lc-btn">open story &rarr;</span>
   </a>
 
-  <div class="logsection-head">
-    <h2 class="section">log</h2>
-    <div class="logtabs">
-      <button class="logtab active" data-tab="commits">commits</button>
-      <button class="logtab" data-tab="files" id="tab-files-btn">files</button>
-    </div>
-  </div>
   <div class="logpane" id="pane-commits">
     <div class="logintro" id="logintro" hidden>Each entry below is one <b>reconstructed agent turn</b> from your
     local session transcripts: what was asked, the agent's reply, and the file changes it recovered, shown like a

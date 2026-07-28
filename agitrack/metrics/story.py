@@ -9,10 +9,10 @@ Four levels of detail, so a reader can stop wherever they like:
 
 1. the arc (a title, a tagline, acts),
 2. a chapter card (when, what, one line of why),
-3. the chapter opened: the full telling plus the developer's CHAIN OF THOUGHT, and
+3. the chapter opened: the full telling plus WHAT THEY ASKED FOR at the turning points, and
 4. the commits behind it, each expandable into its real diff.
 
-The chain of thought is never invented. The quotes are the developer's own prompts, read
+Those asks are never invented. The quotes are the developer's own prompts, read
 straight from the ``# Interaction Trace`` blocks in the commit messages; the agent only
 picks WHICH moments were pivotal and writes a sentence about each. A quote the agent
 cannot be matched to a real commit is dropped rather than shown.
@@ -55,15 +55,24 @@ _EPISODE_GAP_SECONDS = 6 * 3600
 _EPISODE_MAX_COMMITS = 12
 
 # --- agent budget ----------------------------------------------------------------
-# Episodes per agent call, and the character budget for the digest that call sees.
-_BATCH_EPISODES = 6
-_BATCH_CHARS = 7600
-# The hard ceiling on agent calls per build (plus one for the arc). A history bigger than
+# Generation is LAZY, in two stages, because waiting twenty minutes for a story nobody has
+# read yet is the wrong trade:
+#
+#   1. the OUTLINE pass writes every chapter's headline (title, kind, one-sentence summary)
+#      from a compact digest, so a whole history is covered in a couple of calls, and
+#   2. a chapter is WRITTEN OUT the first time someone opens it: one call, over the full
+#      material of just that chapter, cached in the store forever after.
+#
+# So the first build is about a minute, and depth is paid for only where a reader goes.
+_BATCH_EPISODES = 30
+_BATCH_CHARS = 9000
+# The hard ceiling on outline calls per build (plus one for the arc). A history bigger than
 # this is covered newest-first and the story records that older commits are not covered
 # yet, so the reader is never told a partial story is the whole one.
-_MAX_BATCHES = 12
-# Per-call bounds. Chapters are a bigger completion than a summary but smaller than a lesson.
+_MAX_BATCHES = 6
+# Per-call bounds. The outline call reads a lot and writes little; a chapter is the reverse.
 _CHAPTER_TIMEOUT_SECONDS = 300
+_EXPAND_TIMEOUT_SECONDS = 240
 _ARC_TIMEOUT_SECONDS = 180
 # How long a build may wait for the learn page's agent lock before giving up (the two pages
 # share it so a laptop never runs two backend CLIs at once).
@@ -76,12 +85,14 @@ KICKERS = ("turning point", "feature", "fix", "refactor", "milestone", "experime
 # same tone is reproducible and the page can show which one produced what you are reading.
 STORY_TONES: dict[str, str] = {
     "plain": (
-        "Tell it plainly and warmly, like a good engineering write-up: concrete, specific, no hype and no drama."
+        "Tell it plainly and warmly, like the best kind of engineering write-up: concrete, "
+        "specific, no hype. Interesting because of what actually happened, not because you "
+        "dressed it up."
     ),
     "playful": (
         "Tell it with light humour and personality, like a developer telling a friend over "
-        "coffee what happened. Still accurate and specific; funny because the details are, "
-        "never because you exaggerated them."
+        "coffee what happened. Funny because the details are, never because you exaggerated "
+        "them."
     ),
     "epic": (
         "Tell it like a chronicle of a small expedition: a little grand, a little cinematic, "
@@ -279,7 +290,10 @@ def _batches(episodes: list[Episode]) -> list[list[Episode]]:
     current: list[Episode] = []
     size = 0
     for episode in episodes:
-        cost = len(_episode_digest(episode))
+        # Measured against the OUTLINE line, which is what the call actually sends: sizing
+        # batches by the full per-commit digest made them six episodes wide and left most of
+        # the history uncovered.
+        cost = len(_episode_headline(episode))
         if current and (len(current) >= _BATCH_EPISODES or size + cost > _BATCH_CHARS):
             out.append(current)
             current, size = [], 0
@@ -302,7 +316,7 @@ def _shorten(text: str, limit: int) -> str:
     is one in range, else at a word end. Never mid-word, and never mid-sentence when a
     sentence boundary is available.
 
-    This matters most for the chain of thought, which quotes what the developer actually
+    This matters most for the quoted asks, which show what the developer actually
     typed: a quote that stops at "please check why and avoi" reads like the tool broke."""
     text = (text or "").strip()
     if len(text) <= limit:
@@ -352,29 +366,77 @@ def _episode_digest(episode: Episode) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _episode_headline(episode: Episode) -> str:
+    """One episode in ONE line, for the outline pass: enough to recognise what happened,
+    small enough that a whole history fits in a couple of calls."""
+    ask = (_prompts_of(episode.stats[0], limit=1, chars=110) or [""])[0]
+    subject = max(episode.stats, key=lambda stat: (stat.lines, stat.timestamp)).subject[:80]
+    ids = " ".join(stat.short for stat in episode.stats)
+    return (
+        f"EP{episode.index} [{_day(episode.start)}] {len(episode.stats)}c "
+        f'+{episode.insertions}/-{episode.deletions} | {subject} | asked: "{ask}" | {ids}\n'
+    )
+
+
 def _batch_prompt(batch: list[Episode], tone: str, context: str) -> str:
-    digest = "".join(_episode_digest(episode) for episode in batch)
+    digest = "".join(_episode_headline(episode) for episode in batch)
     voice = STORY_TONES.get(tone, STORY_TONES[DEFAULT_TONE])
     prior = f"\nEARLIER IN THE STORY (do not retell these, continue from them):\n{context}\n" if context else ""
-    return f"""Below are consecutive episodes from one repository's history, oldest first. Each episode is a sitting of work: its commits, the lines they moved, and the prompts the developer typed to their coding agent.
+    return f"""Below are consecutive episodes from one repository's history, oldest first. One line each: date, how many commits, lines moved, the biggest commit subject, what the developer asked for, and the commit ids.
 
-Turn them into 1 to {len(batch)} STORY CHAPTERS, in chronological order. A chapter usually covers one episode, but merge neighbouring episodes when they are clearly the same push, and split one episode in two when it obviously contains two different stories. Every commit listed must belong to exactly one chapter.
+Turn them into STORY CHAPTER HEADLINES, in chronological order. Merge neighbouring episodes that are clearly the same push into one chapter (aim for roughly one chapter per two or three episodes, fewer when they belong together). Every commit id listed must belong to exactly one chapter.
 
 {voice}
 
+Write it so someone who has never seen this repo WANTS to read the next chapter. What makes it interesting is always a specific fact: the thing that broke, the assumption that turned out wrong, the small decision everything else followed from. Never filler ("various improvements", "several fixes", "this commit"), never a category where a fact would do.
+
 For each chapter:
-- "title": short and specific, about what actually happened. No generic titles like "Improvements" or "Updates".
+- "title": the thing that actually happened, named. Specific enough that it could only belong to this chapter. Never a category like "Improvements", "Bug fixes" or "Dashboard work".
 - "kicker": one of {", ".join(KICKERS)}.
 - "emoji": a single emoji that fits the chapter.
-- "summary": ONE sentence a reader can skim.
-- "detail": 2 to 4 SHORT sentences, one paragraph, no headings and no lists. Say what changed and why it was needed, naming a concrete file or feature. Stop there: the reader can open the commits themselves. Never repeat the summary.
-- "thoughts": 1 or 2 pivotal moments, each {{"sha": "<a commit id from this material>", "note": "one short sentence on what the developer was working out at that moment"}}. Pick the commits whose prompts show the thinking best. Never invent a quote: only the commit id and your note.
-- "shas": every commit id belonging to this chapter.
+- "summary": ONE sentence with a hook: what was wrong, what got decided, or what surprised them. A reader skimming only the summaries should still get the story.
+- "shas": every commit id belonging to this chapter, copied exactly.
+
+Do NOT write the body of the chapter here. Headlines only.
 {prior}
 Reply with ONE JSON object: {{"chapters": [ ... ]}}
 
 MATERIAL:
 {digest}"""
+
+
+def _expand_prompt(chapter: dict, stats: list[CommitStat], sha_paths: dict[str, set[str]], tone: str) -> str:
+    """Write out ONE chapter, given everything that happened in it. This is the call a reader
+    pays for by opening the chapter, so it sees the full material: every commit subject, the
+    prompts behind them, and the files they touched."""
+    voice = STORY_TONES.get(tone, STORY_TONES[DEFAULT_TONE])
+    lines = []
+    paths: dict[str, int] = {}
+    for stat in stats:
+        lines.append(f"{stat.short} [{stat.kind}] {stat.subject[:120]} (+{stat.insertions}/-{stat.deletions})")
+        for prompt in _prompts_of(stat, limit=2, chars=260):
+            lines.append(f'    asked: "{prompt}"')
+        for path in sha_paths.get(stat.sha, ()) or ():
+            paths[path] = paths.get(path, 0) + 1
+    material = "\n".join(lines)[:9000]
+    top = ", ".join(path for path, _ in sorted(paths.items(), key=lambda kv: (-kv[1], kv[0]))[:10])
+    return f"""Write out one chapter of a repository's story. Its headline is already written; do not change it.
+
+CHAPTER: "{chapter.get("title", "")}" ({chapter.get("kicker", "chapter")}, {chapter.get("when", "")})
+SUMMARY ALREADY SHOWN TO THE READER: {chapter.get("summary", "")}
+
+{voice}
+
+Reply with ONE JSON object:
+{{"detail": "2 to 4 SHORT sentences, one paragraph, no headings and no lists. Lead with the problem or the want (the prompts show it), then what changed, naming a real file or feature, then what it made possible. Prefer the surprising detail over the general one. Never repeat the summary.",
+ "thoughts": [{{"sha": "<a commit id from the material below>", "note": "one short sentence on what the developer was working out at that moment"}}]}}
+
+Give 1 or 2 thoughts, picking the commits whose prompts show the thinking best. Never invent a quote: only the commit id and your note.
+
+FILES TOUCHED: {top}
+
+MATERIAL:
+{material}"""
 
 
 def _arc_prompt(chapters: list[dict], tone: str, repo_name: str) -> str:
@@ -390,8 +452,8 @@ def _arc_prompt(chapters: list[dict], tone: str, repo_name: str) -> str:
 {voice}
 
 Give the whole story a shape:
-- "title": a title for the project's story so far. Short, specific to THIS project, not a slogan.
-- "tagline": one sentence under the title.
+- "title": a title for the project's story so far. Short, specific to THIS project, memorable; the kind of title someone would click. Not a slogan, not "The Story of X".
+- "tagline": one sentence under the title that makes someone want to read on.
 - "arc": 2 or 3 short sentences on the overall journey: where it started, what changed along the way, where it stands now.
 - "acts": 2 to 5 acts grouping CONSECUTIVE chapters. Each act is {{"title": "...", "blurb": "one sentence", "start": <the number of its first chapter>}}. The first act must start at 1.
 
@@ -436,7 +498,7 @@ def _resolve_shas(raw: object, by_sha: dict[str, CommitStat]) -> list[str]:
 
 
 def _thoughts(raw: object, by_sha: dict[str, CommitStat], claimed: list[str]) -> list[dict]:
-    """The chain of thought: the developer's REAL prompt for each pivotal commit, paired
+    """What the developer asked for: their REAL prompt at each pivotal commit, paired
     with the agent's one-line reading of it.
 
     The quote is never taken from the model. It is read back from the commit the model
@@ -614,7 +676,10 @@ def _absorb_unclaimed(chapters: list[dict], batch_shas: list[str], by_sha: dict[
 
 
 def _finalize_chapter(chapter: dict, by_sha: dict[str, CommitStat], sha_paths: dict[str, set[str]]) -> None:
-    chapter["thoughts"] = _thoughts(chapter.pop("_thoughts", None), by_sha, chapter["shas"])
+    # The outline pass leaves these empty: a chapter is written out the first time it is
+    # opened (expand_chapter), so nobody waits for prose nobody has asked to read.
+    raw_thoughts = chapter.pop("_thoughts", None)
+    chapter["thoughts"] = _thoughts(raw_thoughts, by_sha, chapter["shas"]) if raw_thoughts else []
     times = [by_sha[sha].timestamp for sha in chapter["shas"] if sha in by_sha]
     chapter["from"] = min(times) if times else 0
     chapter["to"] = max(times) if times else 0
@@ -899,6 +964,60 @@ def _apply_arc(story: dict[str, Any], arc: dict, existing: dict | None) -> None:
     story["partial"] = False
 
 
+def expand_chapter(
+    root: Path,
+    stats: list[CommitStat],
+    sha_paths: dict[str, set[str]],
+    *,
+    branch: str = "",
+    chapter_id: str = "",
+) -> dict[str, Any]:
+    """Write out one chapter: the detail paragraph and the quoted asks behind it.
+
+    This is the second half of lazy generation. It runs when a reader OPENS a chapter, costs
+    one agent call over that chapter's own material, and is stored, so it is paid once. A
+    chapter that already has a body is returned as it stands."""
+    store = StoryStore(root)
+    story_key = branch or "HEAD"
+    story = store.get(story_key)
+    if not story:
+        return {"error": "There is no story on this branch yet."}
+    chapter = next((item for item in story.get("chapters") or [] if item.get("id") == chapter_id), None)
+    if chapter is None:
+        return {"error": "That chapter is no longer part of the story; reload the page."}
+    if chapter.get("detail"):
+        return {"chapter": chapter}
+
+    by_sha = {stat.sha: stat for stat in story_stats(stats)}
+    own = [by_sha[sha] for sha in chapter.get("shas") or [] if sha in by_sha]
+    if not own:
+        return {"error": "The commits behind this chapter are not on this branch any more."}
+    choice = learn_page.resolve_learning_backend(Path(root))
+    raw = _ask(
+        choice, _expand_prompt(chapter, own, sha_paths, story.get("tone") or DEFAULT_TONE), _EXPAND_TIMEOUT_SECONDS
+    )
+    detail = _shorten(str((raw or {}).get("detail") or ""), 900)
+    if not detail:
+        return {"error": "The backend could not write this chapter; try opening it again."}
+    thoughts = _thoughts((raw or {}).get("thoughts"), {**by_sha, **{s.short: s for s in own}}, [s.sha for s in own])
+
+    def apply(current: dict[str, Any]) -> None:
+        for item in current.get("chapters") or []:
+            if item.get("id") == chapter_id:
+                item["detail"] = detail
+                item["thoughts"] = thoughts
+                item["expanded_at"] = int(time.time())
+
+    with _STORE_LOCK:
+        data = store.load()
+        stored = data.get("stories", {}).get(story_key)
+        if isinstance(stored, dict):
+            apply(stored)
+            store.save(data)
+    chapter = dict(chapter, detail=detail, thoughts=thoughts)
+    return {"chapter": chapter}
+
+
 # --------------------------------------------------------------------------- the worker
 
 
@@ -1063,6 +1182,9 @@ def handle_story_post(
                 mode=mode,
                 repo_name=repo_name,
             )
+        if path == "/story/chapter":
+            stats, sha_paths = view(branch)
+            return expand_chapter(root, stats, sha_paths, branch=branch, chapter_id=str(body.get("id") or ""))
         if path == "/story/cancel":
             return cancel_build(root, branch)
         if path == "/story/forget":
@@ -1124,7 +1246,7 @@ _STORY_TEMPLATE = r"""<!DOCTYPE html>
 <meta name="robots" content="noindex">
 <title>story · __REPO_NAME__ · aGiTrack</title>
 __PREBOOT_CSS__
-<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📖</text></svg>">
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2064%2064'%3E%3Crect%20width='64'%20height='64'%20rx='13'%20fill='%23070b09'/%3E%3Ctext%20x='32'%20y='45'%20text-anchor='middle'%20font-family='ui-monospace,monospace'%20font-weight='700'%20font-size='42'%20letter-spacing='-1'%3E%3Ctspan%20fill='%23ffb454'%3Ea%3C/tspan%3E%3Ctspan%20fill='%233dffa0'%3EG%3C/tspan%3E%3C/text%3E%3C/svg%3E">
 __FONT_LINKS__
 <style>
 :root{--ink:#070b09;--panel:#0c120e;--panel2:#101813;--line:#1d2a21;--fg:#cfe7d8;--fg-dim:#7e998a;
@@ -1268,7 +1390,10 @@ h2.section{font-size:13px;letter-spacing:1.5px;text-transform:uppercase;color:va
 .md pre{background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:10px;overflow-x:auto}
 .md pre code{border:none;background:none;padding:0}
 
-/* the chain of thought: the developer's own words, quoted from the trace */
+/* what they asked for: the developer's own words, quoted from the trace */
+.writing{display:flex;align-items:center;gap:10px;color:var(--phosphor);font-size:12.5px;padding:4px 0}
+.more .notice{border:1px solid var(--amber);color:var(--amber);background:var(--panel2);padding:9px 12px;
+  border-radius:6px;font-size:12.5px}
 .thoughts{margin:16px 0 0}
 .thoughts h4{font-size:11.5px;letter-spacing:1.5px;text-transform:uppercase;color:var(--amber);
   margin:0 0 9px;font-weight:600}
@@ -1300,6 +1425,11 @@ h2.section{font-size:13px;letter-spacing:1.5px;text-transform:uppercase;color:va
 .cmt .num{color:var(--fg-dim);font-size:11.5px}
 .cmt .add{color:var(--phosphor)} .cmt .rem{color:var(--bad)}
 .cmt .cbody{border-top:1px solid var(--line);padding:9px 11px}
+.cmt .cbar{margin:0 0 8px}
+.cmt .cview{font-size:12.5px;line-height:1.55;color:var(--fg-dim);word-break:break-word}
+.cmt .cview.md{color:var(--fg)}
+.cmt .cview.md h3,.cmt .cview.md h4{font-size:12.5px;color:var(--phosphor);margin:12px 0 5px}
+.cmt .cview.md p{margin:0 0 8px}
 .diffbox{margin:0;font-size:11.5px;line-height:1.45;overflow-x:auto;white-space:pre}
 .diffbox .dl{display:block}
 .dfile{color:var(--accent)} .dhunk{color:var(--warn)} .dmeta2{color:var(--fg-dim)}
@@ -1571,11 +1701,12 @@ function renderStudio(){
   if (engineBroken)
     hint = "No coding agent backend is configured here, so nobody can write the story yet. Run an aGiTrack session in this repo, or set learning_backend in .agitrack/config.json. The outline below is built from the commits themselves and needs no agent.";
   else if (!has)
-    hint = "Your coding agent reads the commits and the prompts behind them, then writes the story of this " +
-           (d.backtrace ? "reconstructed history" : "branch") + ": chapters you can open, with the moments that turned it. " +
-           "It takes a few minutes and a handful of agent calls, and the result is stored in .agitrack/story.json, so you only pay for it once.";
+    hint = "Your coding agent reads the commits and the prompts behind them, then lays out the story of this " +
+           (d.backtrace ? "reconstructed history" : "branch") + " as chapters. That takes a couple of minutes; " +
+           "each chapter is then written out the first time you open it, so you only pay for what you read. " +
+           "Everything is stored in .agitrack/story.json.";
   else
-    hint = "Chapters are stored in .agitrack/story.json and kept as new commits land. " +
+    hint = "Open a chapter and your agent writes it out (once, then it is stored). " +
            (m.uncovered ? m.uncovered + " commit" + (m.uncovered === 1 ? " has" : "s have") + " landed since this story was written." : "The story covers everything on this branch.");
   $("studiohint").textContent = hint;
 }
@@ -1645,11 +1776,14 @@ function fillChapter(el, animate){
   box.hidden = false;
   el.querySelector(".open-hint").innerHTML = "close &uarr;";
   if (box.dataset.filled === "1") return;
+  // A chapter's body is written the first time someone opens it (one agent call), not up
+  // front for a hundred chapters nobody may read. Headline now, prose on demand.
+  if (!c.detail) { writeChapter(el, c, box); return; }
   box.dataset.filled = "1";
   const st = c.stats || {};
   let html = '<div class="detail md">' + md(c.detail || c.summary || "") + "</div>";
   if (c.thoughts && c.thoughts.length) {
-    html += '<div class="thoughts"><h4>&#129504; chain of thought</h4>' + c.thoughts.map((t, i) =>
+    html += '<div class="thoughts"><h4>&#128172; what they asked for</h4>' + c.thoughts.map((t, i) =>
       '<div class="th" data-i="' + i + '">' +
         '<div class="q" data-full="' + esc(t.quote || "") + '">' + esc(t.quote || "") + "</div>" +
         (t.note ? '<div class="note">' + esc(t.note) + "</div>" : "") +
@@ -1676,6 +1810,29 @@ function fillChapter(el, animate){
   }
   box.innerHTML = html;
   if (animate && !REDUCED) typeThoughts(box);
+}
+
+// Ask the agent to write this chapter out, then render it. Costs one call, once ever:
+// the result is stored with the story, so every later open is instant.
+async function writeChapter(el, c, box){
+  if (box.dataset.writing === "1") return;
+  box.dataset.writing = "1";
+  box.innerHTML = '<div class="writing"><span class="spin"></span>' +
+    '<span>writing this chapter from its commits and what you asked for…</span></div>';
+  try {
+    const r = await post("story/chapter", {branch: state.branch, id: c.id});
+    box.dataset.writing = "";
+    if (r.error || !r.chapter) {
+      box.innerHTML = '<div class="notice">' + esc(r.error || "this chapter could not be written") + "</div>";
+      return;
+    }
+    Object.assign(c, r.chapter);       // keep it in the loaded story, so re-opening is instant
+    box.dataset.filled = "";
+    fillChapter(el, true);
+  } catch (e) {
+    box.dataset.writing = "";
+    box.innerHTML = '<div class="notice">' + esc(e.message) + "</div>";
+  }
 }
 
 // The developer's own words, typed out. Only on the first open of a chapter, and only for
@@ -1788,11 +1945,13 @@ function diffHtml(text, truncated){
 function renderOutline(){
   const d = state.data, rows = d.outline || [];
   const has = !!(state.story && state.story.chapters && state.story.chapters.length);
-  $("outlinewrap").hidden = !rows.length;
-  $("outlinehead").textContent = has ? "the raw material" : "the shape of it, before anyone tells it";
-  $("outlinehint").textContent = has
-    ? "Every sitting of work on this branch, grouped by when it happened. This is what the storyteller reads."
-    : "aGiTrack grouped the commits into sittings of work. Press the button above and your agent turns these into chapters, with the moments that turned them.";
+  // Only before there is a story: once chapters exist, every commit is reachable through
+  // the chapter it belongs to, and a second flat list of the same commits is just noise.
+  $("outlinewrap").hidden = has || !rows.length;
+  if (has) return;
+  $("outlinehead").textContent = "the shape of it, before anyone tells it";
+  $("outlinehint").textContent =
+    "aGiTrack grouped the commits into sittings of work. Press the button above and your agent turns these into chapters, with the moments that turned them.";
   $("outlinelist").innerHTML = rows.map(r =>
     '<div class="row2"><span class="when">' + esc(r.when) + "</span>" +
       '<span class="what">' + esc(r.title) + "</span>" +
@@ -1938,8 +2097,14 @@ function openFromHash(){
 
 // ------------------------------------------------------------------ wiring
 $("timeline").addEventListener("click", e => {
+  const flip = e.target.closest(".cflip");
+  if (flip) {
+    const row = flip.closest(".cmt"), view = row.querySelector(".cview");
+    showCommitView(row, view && view.dataset.mode === "diff" ? "message" : "diff");
+    return;
+  }
   const head = e.target.closest(".cmt .chead");
-  if (head) { toggleDiff(head.parentElement); return; }
+  if (head) { toggleCommit(head.parentElement); return; }
   if (e.target.closest(".more") && !e.target.closest(".open-hint")) return;  // reading, not toggling
   const ch = e.target.closest(".ch");
   if (!ch) return;

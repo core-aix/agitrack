@@ -181,7 +181,7 @@ def test_the_outline_needs_no_agent_at_all():
 # --------------------------------------------------------------------------- building
 
 
-def test_build_writes_chapters_with_real_commits_and_a_chain_of_thought(tmp_path, monkeypatch):
+def test_build_writes_chapters_with_real_commits_and_quoted_asks(tmp_path, monkeypatch):
     repo = _repo_with_history(tmp_path, prompts=["make the parser stream", "now make it fast"])
     stats, sha_paths = _view_of(repo)
     shas = [stat.short for stat in story.story_stats(stats)]
@@ -217,7 +217,7 @@ def test_build_writes_chapters_with_real_commits_and_a_chain_of_thought(tmp_path
     assert [row["short"] for row in chapter["commits"]] == shas  # oldest first inside a chapter
     assert chapter["stats"]["commits"] == len(shas) and chapter["stats"]["turns"] == 2
     assert chapter["stats"]["files"]  # which files the chapter touched
-    # The chain of thought is the developer's OWN prompt, read back from the commit; only
+    # The quoted ask is the developer's OWN prompt, read back from the commit; only
     # the note comes from the model.
     assert chapter["thoughts"][0]["quote"] == "make the parser stream"
     assert chapter["thoughts"][0]["note"].startswith("They wanted it")
@@ -394,6 +394,70 @@ def test_the_arc_call_failing_never_loses_the_chapters(tmp_path, monkeypatch):
     assert "title" not in built or built["title"]  # no title is fine; a broken one is not
 
 
+def test_the_first_build_writes_headlines_only_and_a_chapter_is_written_when_opened(tmp_path, monkeypatch):
+    """Generation is lazy: covering a whole history must not cost a body for every chapter
+    nobody has read yet. The outline pass writes headlines; opening a chapter writes it out,
+    once, and stores it."""
+    repo = _repo_with_history(tmp_path, prompts=["teach it to stream", "now make it fast"])
+    stats, sha_paths = _view_of(repo)
+    shas = [stat.short for stat in story.story_stats(stats)]
+    outline_fake = _fake_agent(
+        monkeypatch,
+        [_chapter_reply([{"id": "streaming", "title": "It learns to stream", "summary": "s", "shas": shas}]), _ARC],
+    )
+    built = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
+
+    chapter = built["chapters"][0]
+    assert chapter["title"] and chapter["summary"]  # the headline is there...
+    assert chapter["detail"] == "" and chapter["thoughts"] == []  # ...and nothing was paid for below it
+    assert len(outline_fake.prompts) == 2  # one outline call for the whole history, one arc call
+    assert "Headlines only." in outline_fake.prompts[0]
+
+    expand_fake = _fake_agent(
+        monkeypatch,
+        [
+            json.dumps(
+                {
+                    "detail": "Reading the whole file was the problem.",
+                    "thoughts": [{"sha": shas[1], "note": "They wanted it incremental."}],
+                }
+            )
+        ],
+    )
+    answer = story.expand_chapter(tmp_path, stats, sha_paths, branch="main", chapter_id="streaming")
+    assert answer["chapter"]["detail"].startswith("Reading the whole file")
+    assert answer["chapter"]["thoughts"][0]["quote"] == "teach it to stream"  # the real prompt, again
+    assert len(expand_fake.prompts) == 1
+    assert "It learns to stream" in expand_fake.prompts[0]  # the headline rides along, unchanged
+
+    # Persisted, so re-opening it later costs nothing at all.
+    stored = story.StoryStore(tmp_path).get("main")["chapters"][0]
+    assert stored["detail"] and stored["thoughts"]
+    again = story.expand_chapter(tmp_path, stats, sha_paths, branch="main", chapter_id="streaming")
+    assert again["chapter"]["detail"] == stored["detail"]
+    assert len(expand_fake.prompts) == 1  # no second call
+
+
+def test_opening_a_chapter_that_is_no_longer_in_the_story_says_so(tmp_path, monkeypatch):
+    repo = _repo_with_history(tmp_path, prompts=["only thing"])
+    stats, sha_paths = _view_of(repo)
+    assert "no story" in story.expand_chapter(tmp_path, stats, sha_paths, branch="main", chapter_id="x")["error"]
+    shas = [stat.short for stat in story.story_stats(stats)]
+    _fake_agent(monkeypatch, [_chapter_reply([{"id": "c1", "title": "It", "summary": "s", "shas": shas}]), _ARC])
+    story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
+    answer = story.expand_chapter(tmp_path, stats, sha_paths, branch="main", chapter_id="gone")
+    assert "no longer part of the story" in answer["error"]
+
+
+def test_the_chapter_route_is_wired(tmp_path, monkeypatch):
+    repo = _repo_with_history(tmp_path, prompts=["one"])
+    stats, sha_paths = _view_of(repo)
+    answer = story.handle_story_post(
+        "/story/chapter", {"branch": "main", "id": "nope"}, root=tmp_path, view=lambda b: (stats, sha_paths)
+    )
+    assert answer and "error" in answer
+
+
 # --------------------------------------------------------------------------- background
 
 
@@ -489,7 +553,7 @@ def test_the_page_paints_without_any_story(tmp_path):
     assert "storyline" in html or "story" in html
     assert "story/state" in html  # it fetches its data after paint
     assert "__REPO__" not in html and "__PREBOOT_CSS__" not in html
-    assert "chain of thought" in html
+    assert "what they asked for" in html
     # Phone support, like the dashboard's: a narrow-screen block that tightens the timeline
     # rail and stops the outline's numbers from being pushed off the side of the screen.
     assert "@media (max-width:640px)" in html
