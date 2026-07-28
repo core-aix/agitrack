@@ -46,6 +46,11 @@ class _TurnRec:
     queued_followups: list[str] = field(default_factory=list)
     session_id: str = ""
     reasoning_effort: str | None = None
+    # The turn's true identity, from the backend API. Resuming or rewinding a conversation
+    # FORKS it into a new session that replays the earlier turns, so the same turn is read
+    # several times; this is what tells those copies apart from genuinely distinct work.
+    assistant_id: str = ""
+    turn_index: int = 0  # position within its session, for the committed-anchor cutoff
 
 
 def backtrace_commit(directory: Path, new_branch: str, *, _input=input) -> int:
@@ -174,11 +179,72 @@ def _commit_message(repo, sha: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _gather_turns(root: Path) -> list[_TurnRec]:
-    """Every agent turn recorded for the repository, with its edited files relativized to the
-    repo root (so they compare directly to git's repo-relative paths)."""
-    out: list[_TurnRec] = []
+def _already_committed_turns(root: Path) -> tuple[dict[str, int], set[str]]:
+    """What git already accounts for: ``({session_id: last committed turn index}, {turn ids})``.
+
+    aGiTrack commits record ``backend_session_id`` plus ``conversation_anchor`` — the last
+    message id that commit covered — so within a session every turn up to the newest anchor
+    is already committed, with its trace and its tokens. Both forms are returned because a
+    fork records the same turn under a different session id: the anchor cutoff catches it in
+    the session that was committed, the id set catches it in every other copy.
+    """
+    anchors = bt._committed_anchors(root)
+    if not anchors:
+        return {}, set()
+    cutoffs: dict[str, int] = {}
+    ids: set[str] = set()
     for source in bt._discover(root):
+        session_anchors = anchors.get(source.ref_id)
+        if not session_anchors:
+            continue
+        try:
+            exported = source.export()
+        except Exception:
+            continue
+        if exported is None:
+            continue
+        committed = [i for i, turn in enumerate(exported.turns) if (turn.assistant_message_id or "") in session_anchors]
+        if not committed:
+            continue
+        cutoff = max(committed)
+        cutoffs[source.ref_id] = max(cutoffs.get(source.ref_id, -1), cutoff)
+        for turn in exported.turns[: cutoff + 1]:
+            identity = bt._turn_key(source.backend, turn.assistant_message_id or "")
+            if identity:
+                ids.add(identity)
+    return cutoffs, ids
+
+
+def _is_tracked(tracked: tuple[dict[str, int], set[str]], session_id: str, turn_index: int, identity: str) -> bool:
+    cutoffs, ids = tracked
+    if identity and identity in ids:
+        return True
+    cutoff = cutoffs.get(session_id)
+    return cutoff is not None and turn_index <= cutoff
+
+
+def _gather_turns(root: Path) -> list[_TurnRec]:
+    """Every agent turn recorded for the repository that is NOT already accounted for in git,
+    with its edited files relativized to the repo root (so they compare directly to git's
+    repo-relative paths). Each turn appears at most once.
+
+    Two things would otherwise be counted twice in a repo that used aGiTrack for part of its
+    life — which is exactly the repo this command is for:
+
+    * **Forked conversations.** Resuming or rewinding replays the earlier turns into a NEW
+      session id, so the same turn is read from several transcripts. Keyed by the assistant
+      message id (the backend's own identity for the turn), the newest copy wins — the same
+      rule the dashboard reconstruction uses. Without it one turn's trace would be appended
+      several times over and its tokens summed once per copy.
+    * **Turns aGiTrack already committed.** Those commits carry the turn's trace and its
+      token counts already. Re-attributing them here — file overlap alone can easily land
+      them on a LATER untracked commit — would count the same tokens a second time and print
+      the same conversation twice in one history.
+    """
+    tracked = _already_committed_turns(root)
+    seen: set[str] = set()
+    out: list[_TurnRec] = []
+    for source in bt._discover(root):  # newest session first
         try:
             exported = source.export()
         except Exception:
@@ -186,7 +252,14 @@ def _gather_turns(root: Path) -> list[_TurnRec]:
         if exported is None:
             continue
         bases = bt._relativize_bases(root, source.base_dir)
-        for turn in exported.turns:
+        for turn_index, turn in enumerate(exported.turns):
+            identity = bt._turn_key(source.backend, turn.assistant_message_id or "")
+            if identity:
+                if identity in seen:
+                    continue  # an older fork of a turn already taken from a newer session
+                seen.add(identity)
+            if _is_tracked(tracked, exported.session_id, turn_index, identity):
+                continue  # aGiTrack already committed this turn, with its tokens and trace
             # Edits outside the repo (scratch files, plans) never map to a commit's paths.
             edits = [rel for rel in (bt._relativize(edit, bases) for edit in turn.edits) if rel is not None]
             files = {edit.path for edit in edits if edit.path}
@@ -194,6 +267,8 @@ def _gather_turns(root: Path) -> list[_TurnRec]:
                 continue
             out.append(
                 _TurnRec(
+                    assistant_id=turn.assistant_message_id or "",
+                    turn_index=turn_index,
                     ended_at=int(turn.ended_at or turn.started_at or exported.updated or 0),
                     started_at=turn.started_at,
                     files=files,

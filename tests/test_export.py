@@ -114,12 +114,12 @@ def test_export_disables_filters_and_cans_learn_actions(tmp_path, monkeypatch):
     assert "demoflash" in index
     assert 'el.style.pointerEvents = "none"' in index
     assert "stopImmediatePropagation" in index  # reset intercepted ahead of the page handler
-    # The #trace deep link maximizes the expanded commit: the window pins the ENTRY under
-    # the sticky chrome (kept pinned while late layout settles) and the message box
-    # scrolls internally so the Interaction Trace starts at its top.
+    # The #trace deep link parks the Interaction Trace HEADING under the sticky chrome. It
+    # used to scroll two things — the window to the entry, and the message's own max-height
+    # box to the heading; the message now flows with the page, so one scroll does it.
     assert 'location.hash === "#trace"' in index
-    assert "box.scrollTop +=" in index
-    assert "entry.getBoundingClientRect().top - inset()" in index
+    assert "box.scrollTop" not in index  # no inner scroll region left to chase
+    assert "target.getBoundingClientRect().top - inset()" in index
     # The inset counts only chrome that is ACTUALLY stuck: the filter bar is sticky on a
     # desktop but scrolls away on a phone, where reserving its height parked the entry a
     # screenful too low. And corrections scroll INSTANTLY — with the page's default smooth

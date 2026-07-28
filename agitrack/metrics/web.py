@@ -1052,14 +1052,18 @@ h2.section::before{content:"# ";color:var(--amber)}
 .entry .tok.out{color:var(--phosphor);border-color:var(--phosphor-dim)}
 .entry .tok.dim{opacity:.7}
 .entry .squash{font-size:10.5px;color:var(--ops);border:1px solid var(--ops);padding:1px 6px;letter-spacing:.4px}
-.entry .detail{flex-basis:100%;width:100%;margin:8px 0 4px;border-left:2px solid var(--phosphor-dim);padding-left:14px;cursor:default}
+/* No rule of its own down the left: the log already draws the timeline rail beside every
+   entry, so a second vertical line for the expanded one was one stripe too many (and cost
+   width where a phone has least). The indent stays, so the detail still reads as belonging
+   to its row. */
+.entry .detail{flex-basis:100%;width:100%;margin:8px 0 4px;padding-left:14px;cursor:default}
 .entry .detail .dhead{color:var(--amber);font-size:12.5px;margin-bottom:4px}
 .entry .detail .dmeta{color:var(--ops);font-size:12px;margin-bottom:6px}
-.entry .detail .dmsg{font-size:12.5px;color:var(--fg-dim);background:var(--ink);border:1px solid var(--line);
-  padding:4px 12px;max-height:440px;overflow:auto;word-break:break-word}
-/* local (off-GitHub) per-commit file diff — the button flips this one box to the diff, so in diff
-   mode the box drops its own frame and the .diffbox (with its own border/scroll) becomes the pane */
-.entry .detail .dmsg.diff{padding:0;border:none;background:none;max-height:none;overflow:visible}
+/* The expanded commit message. No frame of its own: a bordered, inset box inside the
+   already-indented detail wasted horizontal space and read as a nested panel on a phone.
+   Scoped to nothing in particular ON PURPOSE — the files view renders the same element and
+   used to match none of this, so its messages came out in the page's much larger body font. */
+.dmsg{font-size:12.5px;line-height:1.55;color:var(--fg-dim);word-break:break-word}
 .entry .detail .diffbtn{margin-right:10px;font-family:inherit;font-size:11.5px;color:var(--phosphor);
   background:transparent;border:1px solid var(--phosphor-dim);padding:1px 8px;cursor:pointer;letter-spacing:.3px}
 .entry .detail .diffbtn:hover{background:var(--phosphor);color:var(--ink)}
@@ -1071,7 +1075,8 @@ h2.section::before{content:"# ";color:var(--amber)}
 .diffbox .dmeta2{color:var(--fg-dim)}
 .diffbox .dadd{color:var(--phosphor);background:rgba(61,255,160,.08)}
 .diffbox .ddel{color:var(--red);background:rgba(255,107,107,.08)}
-.dmsg .diffempty{color:var(--fg-dim);font-size:12px;font-style:italic;padding:8px 12px}
+.dmsg .diffempty{color:var(--fg-dim);font-size:12px;font-style:italic;padding:8px 12px;line-height:1.55}
+.dmsg .diffempty b{color:var(--phosphor);font-style:normal}
 /* loading spinner shown while a detail / diff / file history is being fetched */
 .loadbox{display:flex;align-items:center;gap:10px;padding:14px 12px;color:var(--phosphor);font-size:12.5px}
 .loadbox .spin{width:15px;height:15px;border:2px solid var(--phosphor-dim);border-top-color:var(--phosphor);
@@ -1325,7 +1330,7 @@ __UPDATE_BANNER__
   </div>
 
   <footer>
-    <span>aGiTrack · agent + git tracking · metrics from commit metadata &nbsp;·&nbsp;
+    <span>aGiTrack &nbsp;·&nbsp;
       <a class="flink" href="http://agitrack.core-aix.org/" target="_blank" rel="noopener noreferrer">website</a> &nbsp;·&nbsp;
       <a class="flink" href="https://github.com/core-aix/agitrack" target="_blank" rel="noopener noreferrer">GitHub</a></span>
     <span id="count"></span>
@@ -2033,9 +2038,24 @@ function toggleDetail(i){
 // helper that turns a raw unified diff into HTML — a binary file (no text diff) or an empty
 // diff shows a clear hint instead of a blank pane.
 const SPIN = '<div class="loadbox"><span class="spin"></span> loading…</div>';
+// An empty diff means something different in a reconstruction than on the live dashboard.
+// There, no diff means the commit changed nothing. Here it usually means the change was
+// made in a way the transcript never recorded as an edit — a shell command, a formatter, a
+// generated file — because a reconstruction can only see the agent's file-editing tool
+// calls. Saying "no changes" would be a plain untruth, so this says what it can and cannot
+// know, and points at the fix.
+const BACKTRACE_NO_DIFF =
+  '<div class="diffempty">No file changes were recovered for this turn.<br><br>' +
+  'A backtrace is reconstructed from your agent\'s local transcript, which records the ' +
+  'file-editing tool calls but not every way code can change — edits applied through shell ' +
+  'commands, formatters, or generated files leave no edit to read, so their diffs cannot be ' +
+  'recovered after the fact.<br><br>' +
+  'Run your agent through <b>aGiTrack</b> from now on and this stops being guesswork: each ' +
+  'turn is committed as it happens, with its real diff, tokens and the conversation that ' +
+  'produced it.</div>';
 function diffHtml(text, truncated){
   const t = (text||"").trim();
-  if(!t) return '<div class="diffempty">no changes to show for this file</div>';
+  if(!t) return BACKTRACE ? BACKTRACE_NO_DIFF : '<div class="diffempty">no changes to show for this file</div>';
   if(/Binary files .* differ/.test(t) && !/^@@/m.test(t)) return '<div class="diffempty">binary file — no text diff to show</div>';
   return renderDiff(text) + (truncated?'<div class="diffempty">…diff truncated (very large diff)</div>':"");
 }
