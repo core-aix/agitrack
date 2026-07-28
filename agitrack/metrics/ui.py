@@ -144,6 +144,14 @@ COMMIT_CSS = """.dmsg{font-size:12.5px;line-height:1.55;color:var(--fg-dim);word
 .dmsg.md .md-code{white-space:pre-wrap;background:var(--panel2);border:1px solid var(--line);
   padding:8px 10px;margin:7px 0;color:var(--fg-dim);font-size:12px}
 .dmsg.md a{color:var(--phosphor)}
+/* The button that flips a commit between its message and its file changes. It appears in
+   three places under three names (the dashboard's log detail, its file browser, and a story
+   moment's commits) and must look the same in all of them: the log's one carried NO rule at
+   all and rendered as the browser's default grey chrome on a black terminal page. */
+.diffbtn,.fdifftoggle,.cflip{font:inherit;font-size:11.5px;color:var(--phosphor);
+  background:transparent;border:1px solid var(--phosphor-dim);border-radius:4px;
+  padding:1px 8px;cursor:pointer;letter-spacing:.3px;transition:background .15s,color .15s}
+.diffbtn:hover,.fdifftoggle:hover,.cflip:hover{background:var(--phosphor);color:var(--ink)}
 /* No frame and no scroller: the diff flows with the page exactly like the message it toggles
    with, and a long line WRAPS rather than widening the column it sits in. */
 .diffbox{margin:0;font-size:12px;line-height:1.55;white-space:pre-wrap;overflow-wrap:anywhere;

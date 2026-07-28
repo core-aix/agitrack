@@ -82,6 +82,23 @@ def test_a_commit_renders_identically_wherever_it_is_opened(pages):
     assert "max-height" not in ui.COMMIT_CSS
 
 
+def test_the_button_that_flips_a_commit_looks_the_same_in_all_three_places(pages):
+    """The dashboard's log detail, its file browser and a story moment each have a button that
+    swaps a commit's message for its file changes. They are one control under three names, and
+    the log's one carried no rule at all: it rendered as the browser's default grey chrome in
+    the middle of a black terminal page."""
+    for name in ("dashboard", "story"):
+        assert ".diffbtn,.fdifftoggle,.cflip{" in pages[name], f"{name} does not use the shared toggle"
+    assert ".diffbtn:hover,.fdifftoggle:hover,.cflip:hover" in ui.COMMIT_CSS
+    # Every name the pages actually render is covered by that one selector.
+    for name, rendered in (
+        ("dashboard", 'class="diffbtn"'),
+        ("dashboard", 'class="fdifftoggle"'),
+        ("story", 'class="cflip"'),
+    ):
+        assert rendered in pages[name], f"{name} no longer renders {rendered}"
+
+
 def test_a_page_says_what_went_wrong_in_one_place(pages):
     """Notices and errors float as ONE fixed toast at the bottom. The story page used to
     render its errors inline in the middle of the document while the learn page showed the
