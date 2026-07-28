@@ -312,8 +312,8 @@ The dashboard's **story** page (the 📖 **story** link in the header, the **Rea
 
 It is built for digging in as far as you like:
 
-1. **The arc.** A title, a tagline, and acts, plus counters for chapters, commits, agent turns and days.
-2. **A chapter card.** When it happened, what kind of moment it was (turning point, feature, fix, refactor, milestone, experiment), how big it was, and one line of what happened.
+1. **The arc.** A title, a tagline, and eras (each with its span, size and a sparkline of the chapters inside it), plus counters for chapters, commits, agent turns and days.
+2. **A chapter card.** When it happened, what kind of moment it was (turning point, feature, fix, refactor, milestone, experiment), one line of what happened, and its size drawn rather than described: a bar for the lines it moved, a dot per commit, its token cost.
 3. **Open it.** The full telling, then **what you asked for**: the actual prompts you typed at the pivotal moments, each with a sentence on what you were working out. Those quotes are never written by the agent; they are read straight out of the `# Interaction Trace` in your commits, and a commit the model cannot point to is dropped.
 4. **The commits behind it**, each opening on its commit message (the conversation that produced it) with a button to flip to the file changes.
 

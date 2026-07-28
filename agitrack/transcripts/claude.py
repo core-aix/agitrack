@@ -792,6 +792,16 @@ def export_session(repo: Path, session_id: str, *, collect_edits: bool = False) 
     return export_session_at(_session_path(repo, session_id), collect_edits=collect_edits)
 
 
+# The last export, keyed by the file's identity. A long session's transcript is large (this
+# repo's own is ~150 MB) and re-reading it costs a fifth of a second EVERY time, which the
+# user waits out with their prompt held ("checking existing git changes..."). An append-only
+# JSONL that has not grown or been touched since the last read cannot have changed, so the
+# previous result stands. One entry only, and dropped after a couple of minutes: this exists
+# to serve the same file twice in a row, not to hold a 150 MB session in memory all day.
+_LAST_EXPORT: tuple[tuple, "ExportedSession | None", float] | None = None
+_EXPORT_MEMO_SECONDS = 120.0
+
+
 def export_session_at(path: Path, *, collect_edits: bool = False) -> ExportedSession | None:
     """Export the session recorded in the transcript file at ``path`` (the session id is
     its filename stem). Reads a specific file rather than encoding a repo path, so the
@@ -799,9 +809,23 @@ def export_session_at(path: Path, *, collect_edits: bool = False) -> ExportedSes
     including ones whose recorded cwd is a subdirectory or a deleted worktree.
 
     ``collect_edits`` also recovers each turn's file edits from the tool-call inputs (see
-    :func:`_edits_from_message`); it is off for ordinary exports."""
+    :func:`_edits_from_message`); it is off for ordinary exports.
+
+    Repeated calls for an UNCHANGED file (same size and mtime) reuse the previous result."""
+    global _LAST_EXPORT
     if not path.is_file():
         return None
+    try:
+        stamp = path.stat()
+        key = (str(path), stamp.st_size, stamp.st_mtime_ns, collect_edits)
+    except OSError:
+        key = None
+    if _LAST_EXPORT is not None:
+        cached_key, cached, stored_at = _LAST_EXPORT
+        if time.monotonic() - stored_at > _EXPORT_MEMO_SECONDS:
+            _LAST_EXPORT = None  # let a big session go rather than hold it for a caller who left
+        elif key is not None and cached_key == key:
+            return cached
     rows: list[dict] = []
     try:
         with path.open("r", encoding="utf-8") as handle:
@@ -815,13 +839,16 @@ def export_session_at(path: Path, *, collect_edits: bool = False) -> ExportedSes
                     continue
     except OSError:
         return None
-    return parse_rows(
+    exported = parse_rows(
         path.stem,
         rows,
         subagent_tokens=_subagent_token_map(path),
         unmatched_subagent_time=_subagent_unmatched_mtime(path),
         collect_edits=collect_edits,
     )
+    if key is not None:
+        _LAST_EXPORT = (key, exported, time.monotonic())
+    return exported
 
 
 def _subagent_token_map(session_path: Path) -> dict[str | None, TokenUsage]:

@@ -2689,6 +2689,41 @@ def test_a_terminal_that_went_away_does_not_take_the_session_down(monkeypatch):
     assert calls  # it did try
 
 
+def test_a_repaint_that_fails_drops_the_frame_instead_of_the_session(monkeypatch):
+    """A repaint is display only. Whatever goes wrong inside one, ending the session over it
+    is the difference between a flicker and the user losing their terminal (and their place
+    in the conversation)."""
+    runner = _paint_runner()
+    logged = []
+    monkeypatch.setattr(runner, "_debug", lambda message: logged.append(message))
+    monkeypatch.setattr(runner, "_render_frame", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    runner._render()  # must not raise
+
+    assert any("render failed" in line for line in logged)
+    assert runner._rendering is False  # and the guard is released for the next frame
+
+
+def test_a_repaint_entered_from_a_signal_does_not_interleave_with_the_one_in_flight(monkeypatch):
+    """SIGWINCH repaints (_resize_child), and a signal lands on any bytecode boundary. Two
+    frames going out at once over the same fd means interleaved escape sequences, which is
+    how a terminal ends up in a mode the user cannot get out of."""
+    runner = _paint_runner()
+    frames = []
+
+    def frame_that_gets_interrupted():
+        frames.append("outer")
+        runner._render()  # exactly what the signal handler would do, mid-frame
+        frames.append("outer-end")
+
+    monkeypatch.setattr(runner, "_render_frame", frame_that_gets_interrupted)
+    runner._render_pending = False
+    runner._render()
+
+    assert frames == ["outer", "outer-end"]  # the inner one did NOT paint...
+    assert runner._render_pending is True  # ...it asked the main loop to repaint instead
+
+
 def test_render_wraps_frame_in_synchronized_update(monkeypatch):
     runner = _paint_runner()
     writes = []
@@ -10482,3 +10517,105 @@ def test_console_user_commit_prompt_lists_the_files(tmp_path, monkeypatch, capsy
     printed = capsys.readouterr().out
     assert "Committing 2 file(s)" in printed
     assert "one.txt" in printed and "two.txt" in printed
+
+
+# --- crash reports --------------------------------------------------------------
+
+
+def test_a_reactor_crash_is_written_down_where_the_user_can_find_it(tmp_path):
+    """When the reactor dies the terminal is being torn down in the same breath, so the
+    traceback goes with it. It has to land in a file instead, or every recurrence costs
+    another round of guesswork (this is exactly what happened to a scroll-related death)."""
+    from agitrack.proxy.crash import crash_message, write_crash_report
+
+    caught: RuntimeError
+    try:
+        raise RuntimeError("deque mutated during iteration")
+    except RuntimeError as raised:
+        caught = raised  # `except ... as` unbinds at the end of the block
+        path = write_crash_report(tmp_path, raised, context={"terminal": "40x120", "scrollback": 300})
+
+    assert path is not None and path.parent.name == ".agitrack"
+    text = path.read_text(encoding="utf-8")
+    assert "deque mutated during iteration" in text
+    assert "Traceback" in text  # the whole stack, not just the message
+    assert "terminal: 40x120" in text and "scrollback: 300" in text
+    message = crash_message(path, caught)
+    assert str(path) in message and "commits each turn" in message  # and it says work is safe
+
+
+def test_crash_reports_do_not_pile_up_forever(tmp_path):
+    from agitrack.proxy.crash import _KEEP_REPORTS, write_crash_report
+
+    error = RuntimeError("x")
+    for i in range(_KEEP_REPORTS + 4):
+        (tmp_path / ".agitrack").mkdir(exist_ok=True)
+        (tmp_path / ".agitrack" / f"crash-2026010{i}-000000.log").write_text("old", encoding="utf-8")
+    write_crash_report(tmp_path, error)
+    assert len(list((tmp_path / ".agitrack").glob("crash-*.log"))) == _KEEP_REPORTS
+
+
+def test_a_crash_report_that_cannot_be_written_is_not_a_second_crash(tmp_path):
+    from agitrack.proxy.crash import crash_message, write_crash_report
+
+    blocked = tmp_path / "nope"
+    blocked.write_text("a file where the directory should be", encoding="utf-8")
+    assert write_crash_report(blocked, RuntimeError("x")) is None
+    assert "stopped unexpectedly" in crash_message(None, RuntimeError("x"))
+
+
+def test_the_reactor_is_woken_when_the_pre_prompt_parse_finishes(tmp_path, monkeypatch):
+    """The prompt the user just pressed Enter on is HELD while this parse runs. Without a
+    wake it was released only on the next poll tick, so a parse that finished in 80 ms still
+    sat behind "checking existing git changes..." for up to a full second."""
+    from agitrack.proxy.commit_engine import CommitEngine
+
+    runner = make_runner()
+    engine = CommitEngine(runner.repo, runner.state, debug_fn=lambda m: None)
+    woken = threading.Event()
+
+    class _Backend:
+        def latest_session_id(self, root):
+            return "s1"
+
+        def export_session(self, root, session_id):
+            return None
+
+    session = runner.active
+    session.backend = _Backend()
+    session.worktree = tmp_path
+    session.agent_parse_active = False
+    session.agent_parse_thread = None
+    session.agent_parse_result = None
+
+    assert engine.start_parse(
+        session=session,
+        discover_session_id_fn=lambda: "s1",
+        debug_fn=lambda m: None,
+        on_finish=woken.set,
+    )
+    assert woken.wait(5), "the parse finished without waking the reactor"
+    session.agent_parse_thread.join(timeout=5)
+
+
+def test_a_dying_thread_is_recorded_not_painted_over_the_session(tmp_path, monkeypatch):
+    """stderr IS the alternate screen while the TUI is up: Python's default thread hook
+    would print a traceback straight over the user's session, leaving the display out of
+    step with the model (and looking exactly like aGiTrack breaking)."""
+    from agitrack.git import GitRepo
+
+    runner = make_runner(repo=GitRepo.init(tmp_path))
+    logged = []
+    monkeypatch.setattr(runner, "_debug", lambda message: logged.append(message))
+
+    class _Args:
+        thread = threading.current_thread()
+        exc_type = RuntimeError
+        exc_value = RuntimeError("worker exploded")
+        exc_traceback = None
+
+    runner._thread_excepthook(_Args())
+
+    assert any("died" in line and "worker exploded" in line for line in logged)
+    reports = list((tmp_path / ".agitrack").glob("crash-*.log"))
+    assert reports and "worker exploded" in reports[0].read_text(encoding="utf-8")

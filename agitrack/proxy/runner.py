@@ -1528,6 +1528,13 @@ class ProxyRunner:
             # SIGWINCH/SIGHUP don't exist on native Windows — there the host terminal's
             # resize watcher feeds _resize_child via consume_resize_pending() in the select
             # phase, and console-close is handled by the platform console-control handler.
+            # While the TUI owns the screen, a background thread that dies must not print its
+            # traceback: stderr IS the alternate screen, so an unhandled worker exception
+            # scribbles over the session and leaves the display out of step with what
+            # aGiTrack thinks is on it. Record it instead; the local guards handle the known
+            # workers, this catches every other thread, now and later.
+            self._prev_thread_excepthook = threading.excepthook
+            threading.excepthook = self._thread_excepthook
             if sys.platform != "win32":
                 self.original_sigwinch = signal.getsignal(signal.SIGWINCH)
                 self.original_signal_handlers = {
@@ -1550,7 +1557,29 @@ class ProxyRunner:
             self._install_base_commit_guard()  # hard-stop agent commits to base when no OS sandbox
             self._setup_manual_commit_mode()  # --manual-commits: latent-commit hooks + trailer files
             exit_code = self._loop()  # the timers phase auto-applies a sandbox-blocked backend update
+        except Exception as error:
+            # The reactor died. The teardown below is about to switch the terminal back out
+            # of the alternate screen, taking the traceback with it, so capture it to a file
+            # FIRST and tell the user where it is once they have their terminal back.
+            from agitrack.proxy.crash import crash_message, write_crash_report
+
+            exit_code = 1
+            path = write_crash_report(
+                self.repo.repo,
+                error,
+                context={
+                    "terminal": f"{self.rows}x{self.cols}",
+                    "backend": getattr(self.backend, "name", "?"),
+                    "session": self._session_label(),
+                    "scrollback": self.scroll_back,
+                    "history": self._history_len(),
+                },
+            )
+            self._crash_notice = crash_message(path, error)
         finally:
+            if self._prev_thread_excepthook is not None:
+                threading.excepthook = self._prev_thread_excepthook
+                self._prev_thread_excepthook = None
             if self.original_sigwinch is not None and hasattr(signal, "SIGWINCH"):
                 signal.signal(signal.SIGWINCH, self.original_sigwinch)
             for signum, handler in self.original_signal_handlers.items():
@@ -1598,6 +1627,10 @@ class ProxyRunner:
             print(self._backend_exit_notice)
         # A self-update was applied; re-exec aGiTrack in place now that the terminal
         # is restored and the management lock is released. Does not return.
+        if self._crash_notice:
+            # The terminal is the user's again (the finally above restored it), so this is
+            # the first thing they can actually read.
+            print(self._crash_notice, file=sys.stderr)
         if self._pending_restart:
             # Finalize may have removed the worktree this process was launched in; the
             # re-exec'd aGiTrack would then start with a deleted CWD and crash before it
@@ -5892,10 +5925,13 @@ class ProxyRunner:
         outcome: dict = {}
 
         def push() -> None:
-            login = self._cached_or_resolve_login()
-            owner, name, contributors = self._share_identity(sid, login)
-            ctx.update(login=login, owner=owner, name=name, contributors=contributors)
-            outcome["result"] = self._auto_share_worker(ctx)
+            try:
+                login = self._cached_or_resolve_login()
+                owner, name, contributors = self._share_identity(sid, login)
+                ctx.update(login=login, owner=owner, name=name, contributors=contributors)
+                outcome["result"] = self._auto_share_worker(ctx)
+            except Exception as error:  # a failed share is a warning, never a traceback on screen
+                self._debug(f"exit share failed: {error!r}")
 
         thread = threading.Thread(target=push, daemon=True, name="agit-exit-share")
         thread.start()
@@ -8402,6 +8438,32 @@ class ProxyRunner:
     def _cursor_sequence(self) -> str:
         return ScreenRenderer.cursor_sequence(self, self.rows, self.cols, self.scroll_back)
 
+    # The interpreter-wide hook we displaced while the TUI owns the screen (restored on exit).
+    _prev_thread_excepthook: "Callable[[threading.ExceptHookArgs], object] | None" = None
+
+    def _thread_excepthook(self, args: "threading.ExceptHookArgs") -> None:
+        """Where a background thread's unhandled exception goes while the TUI is up.
+
+        Python's default prints it to stderr, which is the terminal aGiTrack is drawing on:
+        the traceback lands on top of the session and the display no longer matches the
+        model. Log it, keep a crash report so it is diagnosable, and let the session live."""
+        try:
+            name = getattr(args.thread, "name", "?")
+            self._debug(f"thread {name} died: {args.exc_type.__name__}: {args.exc_value!r}")
+            if args.exc_value is not None:
+                from agitrack.proxy.crash import write_crash_report
+
+                write_crash_report(self.repo.repo, args.exc_value, context={"thread": name, "fatal": False})
+        except Exception:
+            pass
+
+    # Set while a frame is being written. A SIGWINCH handler repaints (see _resize_child),
+    # and a signal can land on ANY bytecode boundary: without this, that repaint would
+    # interleave its escape sequences with the frame already going out, which is how a
+    # terminal ends up in a mode the user cannot get out of.
+    _rendering = False
+    _crash_notice = ""
+
     def _render(self) -> None:
         if self.screen is None:
             return
@@ -8412,6 +8474,21 @@ class ProxyRunner:
             self._render_pending = True
             self._wake_main_loop()
             return
+        if self._rendering:  # re-entered from a signal handler: let the frame in flight finish
+            self._render_pending = True
+            return
+        self._rendering = True
+        try:
+            self._render_frame()
+        except Exception as error:
+            # A repaint is display only. Dropping a frame costs nothing (the next event
+            # paints again); raising here would end the session, which is the difference
+            # between a flicker and losing the terminal.
+            self._debug(f"render failed: {error!r}")
+        finally:
+            self._rendering = False
+
+    def _render_frame(self) -> None:
         capturing = self.input.capturing
         ScreenRenderer.render(
             self,
@@ -11439,6 +11516,9 @@ class ProxyRunner:
             session=self.active,
             discover_session_id_fn=self._discover_spawned_session,
             debug_fn=self._debug,
+            # The prompt the user just pressed Enter on is HELD until this parse finishes;
+            # wake the reactor the moment it does instead of letting it wait out the poll.
+            on_finish=self._wake_main_loop,
         )
 
     def _finish_agent_parse_if_ready(
@@ -12314,8 +12394,11 @@ class ProxyRunner:
             # PTY ioctl delegated to the session-owned BackendProcess.
             self.active.process.resize(max(self.rows - 1, 1), self.cols)
             self._render()
-        except OSError:
-            pass
+        except Exception as error:
+            # This runs INSIDE the SIGWINCH handler, so an exception here does not fail a
+            # resize: it propagates into whatever the main thread happened to be executing.
+            # A resize is never worth ending a session for.
+            self._debug(f"resize failed: {error!r}")
 
     def _terminal_size(self) -> tuple[int, int]:
         if self._host is not None:

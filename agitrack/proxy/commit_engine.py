@@ -820,6 +820,7 @@ class CommitEngine:
         session,  # agitrack.proxy.session.Session
         discover_session_id_fn: Callable[[], str | None],
         debug_fn: _DebugFn,
+        on_finish: Callable[[], None] | None = None,
     ) -> bool:
         """Launch the background session-export worker for *session*.
 
@@ -841,6 +842,12 @@ class CommitEngine:
             spawned backend session (``runner._discover_spawned_session``).
         debug_fn:
             Logging sink.
+        on_finish:
+            Called (from the worker thread) the moment the result is stored. The reactor
+            passes its self-wake here: a submitted prompt is HELD while this worker runs,
+            and without the wake it was released only on the next poll tick, so a parse
+            that finished in 80 ms still sat behind "checking existing git changes..." for
+            up to a full ACTIVE_POLL_SECONDS before reaching the backend.
         """
         parse_lock = session.agent_parse_lock
         if parse_lock is None:
@@ -894,12 +901,22 @@ class CommitEngine:
                     f"finals={final_count} watermark={last_message_id}"
                 )
                 result = (session_id, exported, last_message_id, state)
+            except Exception as error:
+                # Unhandled, this printed a traceback to STDERR - which, while the TUI owns
+                # the screen, is painted straight over the user's session. The prompt this
+                # parse is holding is released by the caller either way.
+                debug_fn(f"agent parse worker failed: {error!r}")
             finally:
                 with parse_lock:
                     owner.last_parse_finish = time.monotonic()
                     if result is not None:
                         owner.agent_parse_result = result
                     owner.agent_parse_active = False
+                if on_finish is not None:
+                    try:
+                        on_finish()  # wake the reactor: a held prompt is waiting on this
+                    except Exception:
+                        pass
 
         session.last_parse_start = time.monotonic()
         debug_fn("agent parse started")

@@ -1,5 +1,7 @@
 import json
 import sys
+import time
+from pathlib import Path
 
 import pytest
 
@@ -1600,3 +1602,81 @@ def test_parse_rows_still_keeps_a_genuine_mid_turn_followup_after_a_rewind():
 
     assert [t.user_prompt for t in session.turns] == ["Do the thing, carefully."]
     assert session.turns[0].queued_followups == ["Also update the docs."]
+
+
+def _write_rows(path: Path, rows: list[dict]) -> None:
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+
+def test_an_unchanged_transcript_is_not_re_read(tmp_path, monkeypatch):
+    """A long session's transcript is large (this repo's own is ~150 MB) and the pre-prompt
+    check re-reads it on every Enter, with the user's prompt held meanwhile. An append-only
+    file that has not grown or been touched cannot have changed, so the last result stands."""
+    from agitrack.transcripts import claude
+
+    path = tmp_path / "sess.jsonl"
+    _write_rows(
+        path,
+        [
+            {"type": "user", "uuid": "u1", "parentUuid": None, "message": {"role": "user", "content": "hello"}},
+            {
+                "type": "assistant",
+                "uuid": "a1",
+                "parentUuid": "u1",
+                "message": {
+                    "role": "assistant",
+                    "id": "m1",
+                    "model": "claude-opus-5",
+                    "content": [{"type": "text", "text": "hi"}],
+                },
+            },
+        ],
+    )
+    claude._LAST_EXPORT = None
+    parses = []
+    real_parse = claude.parse_rows
+    monkeypatch.setattr(claude, "parse_rows", lambda *a, **k: (parses.append(1), real_parse(*a, **k))[1])
+
+    first = claude.export_session_at(path)
+    again = claude.export_session_at(path)
+    assert again is first  # the very same object: nothing was re-parsed
+    assert len(parses) == 1
+
+    # A transcript that grew is read again, of course.
+    _write_rows(
+        path,
+        [
+            {"type": "user", "uuid": "u1", "parentUuid": None, "message": {"role": "user", "content": "hello"}},
+            {
+                "type": "assistant",
+                "uuid": "a1",
+                "parentUuid": "u1",
+                "message": {
+                    "role": "assistant",
+                    "id": "m1",
+                    "model": "claude-opus-5",
+                    "content": [{"type": "text", "text": "hi"}],
+                },
+            },
+            {"type": "user", "uuid": "u2", "parentUuid": "a1", "message": {"role": "user", "content": "more"}},
+        ],
+    )
+    third = claude.export_session_at(path)
+    assert third is not first
+    assert len(parses) == 2
+
+
+def test_the_export_memo_lets_a_big_session_go_when_nobody_comes_back(tmp_path):
+    """One entry, and only for a couple of minutes: this is here to serve the same file twice
+    in a row, not to keep a 150 MB session resident for the rest of the day."""
+    from agitrack.transcripts import claude
+
+    path = tmp_path / "sess.jsonl"
+    _write_rows(path, [{"type": "user", "uuid": "u1", "parentUuid": None, "message": {"role": "user", "content": "x"}}])
+    claude._LAST_EXPORT = None
+    claude.export_session_at(path)
+    assert claude._LAST_EXPORT is not None
+    stored_key, stored, _at = claude._LAST_EXPORT
+    claude._LAST_EXPORT = (stored_key, stored, time.monotonic() - claude._EXPORT_MEMO_SECONDS - 1)
+    claude.export_session_at(path)  # expired: re-read, and the stale entry replaced
+    assert claude._LAST_EXPORT[2] > time.monotonic() - 5
