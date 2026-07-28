@@ -120,7 +120,9 @@ def _render_template(*, repo_name: str, repo_path: str, banner_html: str, payloa
     """Fill the page template. ``__DATA__`` goes LAST: the embedded JSON can itself contain the
     literal placeholder strings (a backtrace of aGiTrack's own source quotes ``__REPO__`` and
     friends), so substituting chrome after it would corrupt the payload."""
-    return (
+    from agitrack.metrics import ui
+
+    return ui.render(
         _TEMPLATE.replace("__REPO_NAME__", _escape(repo_name))
         .replace("__REPO__", _escape(repo_path))
         .replace("__UPDATE_BANNER__", banner_html)
@@ -735,15 +737,11 @@ __PREBOOT_CSS__
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2064%2064'%3E%3Crect%20width='64'%20height='64'%20rx='13'%20fill='%23070b09'/%3E%3Ctext%20x='32'%20y='45'%20text-anchor='middle'%20font-family='ui-monospace,monospace'%20font-weight='700'%20font-size='42'%20letter-spacing='-1'%3E%3Ctspan%20fill='%23ffb454'%3Ea%3C/tspan%3E%3Ctspan%20fill='%233dffa0'%3EG%3C/tspan%3E%3C/text%3E%3C/svg%3E">
 __FONT_LINKS__
 <style>
-:root{
-  --ink:#070b09; --panel:#0c120e; --panel-2:#101813; --line:#1d2a21;
-  --phosphor:#3dffa0; --phosphor-dim:#1f7a52; --amber:#ffb454; --amber-dim:#8a5e2a;
-  --fg:#cfe7d8; --fg-dim:#7e998a; --red:#ff6b6b; --ops:#67b8d6;
-  --mono:"IBM Plex Mono",ui-monospace,monospace; --display:"VT323",var(--mono);
-}
+__UI_TOKENS__
 *{box-sizing:border-box;margin:0;padding:0}
+__UI_BASE_CSS__
 html{scroll-behavior:smooth}
-body{background:var(--ink);color:var(--fg);font-family:var(--mono);font-size:15px;line-height:1.6;overflow-x:hidden}
+body{background:var(--ink);color:var(--fg);font-family:var(--mono);font-size:15px;line-height:1.6}
 body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:30;
   background:repeating-linear-gradient(0deg,rgba(0,0,0,.22) 0 1px,transparent 1px 3px);opacity:.35}
 body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:31;
@@ -825,22 +823,10 @@ body.booting .wrap>*:not(header):not(#booting){display:none}
 .insightmore{margin-top:4px}
 .insightmore summary{cursor:pointer;color:var(--fg-dim);font-size:12px;padding:6px 0}
 .insightmore summary:hover{color:var(--phosphor)}
-.updatebanner{margin:0 0 14px;padding:9px 16px;border:1px solid var(--accent,#6be);border-radius:8px;
-  background:rgba(90,150,230,.12);color:var(--accent,#9cf);font-size:13px;text-align:center}
 /* The backtrace notice is a frozen top strip — always visible, like the sticky filter bar.
    Opaque so page content scrolls cleanly beneath it; the filter bar's top offset is set to this
    strip's height in JS so the two stack instead of overlapping. */
-.backtracebanner{position:sticky;top:0;z-index:25;margin:0;padding:10px 18px;background:var(--panel);
-  border-bottom:2px solid var(--amber-dim);color:var(--amber);font-size:12.5px;line-height:1.5;
-  text-align:center;box-shadow:0 4px 16px rgba(0,0,0,.55)}
-/* Same treatment as the learn banner's code chip, so a command reads identically on every page. */
-.backtracebanner code{color:var(--fg);background:var(--ink);padding:0 5px}
-/* The banner's call-to-action link is GREEN against the amber notice text, so the one
-   thing to click stands apart from the explanation. Styled explicitly (identical rule on
-   the learn page's .btbanner) because the two pages' global anchor colors differ, which
-   is what made the same demo banner render a different colour on each. */
-.backtracebanner a{color:var(--phosphor);border-bottom:1px solid var(--phosphor-dim)}
-.backtracebanner a:hover{color:var(--ink);background:var(--phosphor)}
+__UI_BANNER_CSS__
 @keyframes rise{from{transform:translateY(-100%)}to{transform:none}}
 
 header{padding:26px 0 18px}
@@ -878,7 +864,6 @@ header{padding:26px 0 18px}
   align-items:center;gap:8px;color:var(--phosphor);font-size:13px;white-space:nowrap;
   background:var(--panel);border:1px solid var(--phosphor-dim);padding:6px 12px;
   box-shadow:0 10px 26px rgba(0,0,0,.55)}
-.loading[hidden]{display:none}
 .loading .spin{width:13px;height:13px;border:2px solid var(--phosphor-dim);border-top-color:var(--phosphor);
   border-radius:50%;animation:spin .7s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
@@ -901,7 +886,6 @@ input[type=date]::-webkit-calendar-picker-indicator{filter:invert(.7) sepia(1) h
 .daterange{position:absolute;top:100%;right:0;z-index:30;margin-top:8px;background:var(--panel);
   border:1px solid var(--phosphor-dim);padding:12px 14px;display:flex;gap:12px;align-items:flex-end;
   box-shadow:0 10px 28px rgba(0,0,0,.6)}
-.daterange[hidden]{display:none}
 .dr-field{display:flex;flex-direction:column;gap:4px}
 .dr-field label{font-size:11px;color:var(--amber);letter-spacing:.6px;text-transform:uppercase}
 .dr-done{cursor:pointer;border:1px solid var(--phosphor);color:var(--phosphor);background:transparent;
@@ -1080,19 +1064,7 @@ h2.section::before{content:"# ";color:var(--amber)}
    already-indented detail wasted horizontal space and read as a nested panel on a phone.
    Scoped to nothing in particular ON PURPOSE — the files view renders the same element and
    used to match none of this, so its messages came out in the page's much larger body font. */
-.dmsg{font-size:12.5px;line-height:1.55;color:var(--fg-dim);word-break:break-word}
-.entry .detail .diffbtn{margin-right:10px;font-family:inherit;font-size:11.5px;color:var(--phosphor);
-  background:transparent;border:1px solid var(--phosphor-dim);padding:1px 8px;cursor:pointer;letter-spacing:.3px}
-.entry .detail .diffbtn:hover{background:var(--phosphor);color:var(--ink)}
-/* No frame, no scroller: the diff flows with the page exactly like the commit message it
-   toggles with. Long lines wrap rather than opening a second scroll region. */
-.diffbox{margin:0;font-size:12px;line-height:1.55;white-space:pre-wrap;overflow-wrap:anywhere}
-.diffbox .dl{display:block}
-.diffbox .dfile{color:var(--amber);background:rgba(255,180,84,.06)}
-.diffbox .dhunk{color:var(--ops);background:rgba(103,184,214,.09)}
-.diffbox .dmeta2{color:var(--fg-dim)}
-.diffbox .dadd{color:var(--phosphor);background:rgba(61,255,160,.08)}
-.diffbox .ddel{color:var(--red);background:rgba(255,107,107,.08)}
+__UI_COMMIT_CSS__
 .dmsg .diffempty{color:var(--fg-dim);font-size:12px;font-style:italic;padding:8px 12px;line-height:1.55}
 .dmsg .diffempty b{color:var(--phosphor);font-style:normal}
 /* loading spinner shown while a detail / diff / file history is being fetched */
@@ -1167,12 +1139,13 @@ h2.section::before{content:"# ";color:var(--amber)}
 .logtab.active{color:var(--ink);background:var(--amber);box-shadow:0 0 12px rgba(255,180,84,.35)}
 /* Hover on the unselected tab: a tint, so it never impersonates the filled selected state. */
 .logtab:not(.active):hover{background:rgba(255,180,84,.22)}
-.logpane[hidden]{display:none}
 .panehead{display:flex;justify-content:flex-end;align-items:center;margin:0}
 /* Tabs and the pane's control (sort / file filter) sit on ONE line, with room above them so
    they read as the start of the log rather than part of the story card above. */
 .panebar{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;
   margin:22px 0 12px}
+/* An author `display` beats the `hidden` attribute, so every hidden flex/grid box on this
+   page needs this to actually hide (the files filter showed in the commits view without it). */
 #head-files{margin:0 0 12px}
 
 /* ---- file browser (folder tree) — names flush-left, folders collapsible ---- */
@@ -1213,7 +1186,6 @@ h2.section::before{content:"# ";color:var(--amber)}
 .fchange .fmeta{color:var(--ops);font-size:12px;margin-bottom:3px}
 .fchange .fsub{color:var(--fg);font-size:12.5px;overflow-wrap:anywhere}
 .fchange .fdetailc{margin-top:8px}
-.fchange .fdetailc[hidden]{display:none}
 .fchange .fdifftoggle{font-family:inherit;font-size:11.5px;color:var(--phosphor);background:transparent;
   border:1px solid var(--phosphor-dim);padding:1px 8px;cursor:pointer;letter-spacing:.3px;margin-bottom:8px}
 .fchange .fdifftoggle:hover{background:var(--phosphor);color:var(--ink)}
@@ -1427,11 +1399,9 @@ const LIVE = location.protocol.indexOf("http") === 0;
 // commit and no committer behind a row, so the fabricated commit-hash and committer chrome
 // are hidden (see hideFabricatedChrome). Everything shown is real transcript data.
 const BACKTRACE = !!INIT.backtrace;
-const $ = id => document.getElementById(id);
-const fmt = n => (n||0).toLocaleString("en-US");
+__UI_DOM_JS__
+const _pageEsc = null;
 const pct = (a,b) => b ? (a/b*100).toFixed(1)+"%" : "0%";
-const esc = s => (s||"").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
-const kfmt = n => { n=n||0; return n>=1000 ? (n/1000).toFixed(n>=10000?0:1)+"k" : ""+n; };
 // Commit-log subjects can be very long; cap the displayed line at 120 chars with an
 // ellipsis (the full subject stays available via the row's hover title and the expanded
 // commit message). The ellipsis counts toward the cap, so the result never exceeds 120.
@@ -1515,75 +1485,8 @@ async function loadLog(offset){
 }
 
 // --- minimal Markdown for the expanded commit message ---
-function md(src){
-  const lines = (src||"").replace(/\r\n/g,"\n").split("\n");
-  const inline = t => esc(t)
-    .replace(/`([^`]+)`/g, "<code>$1</code>")
-    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-    .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>")
-    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
-  let html="", inCode=false, code=[], inList=false, inMeta=false, para=[];
-  const closeList = () => { if(inList){ html+="</ul>"; inList=false; } };
-  // Consecutive non-blank lines are ONE paragraph, their source breaks kept as <br>. A
-  // blank line still starts a new paragraph. The " " before each <br> is what remains when
-  // reflowParagraphs() hides the break on a narrow screen, so the lines join as prose.
-  // Metadata lines (key: value, after the "aGiTrack Metadata" heading) are marked "keep":
-  // their breaks are structure, never re-flowed.
-  const flushPara = () => {
-    if(!para.length) return;
-    html += `<p class="mdp${inMeta?" keep":""}">` + para.map(inline).join(" <br>") + "</p>";
-    para = [];
-  };
-  for(const raw of lines){
-    if(raw.trimStart().startsWith("```")){
-      flushPara();
-      if(inCode){ html+="<pre class=\"md-code\">"+esc(code.join("\n"))+"</pre>"; code=[]; inCode=false; }
-      else { closeList(); inCode=true; }
-      continue;
-    }
-    if(inCode){ code.push(raw); continue; }
-    const h = raw.match(/^(#{1,6})\s+(.*)$/);
-    if(h){
-      flushPara(); closeList();
-      if(/agitrack\s+metadata/i.test(h[2])) inMeta = true;
-      const lvl=Math.min(6,h[1].length+2); html+=`<h${lvl} class="md-h">${inline(h[2])}</h${lvl}>`; continue;
-    }
-    const li = raw.match(/^\s*[-*+]\s+(.*)$/);
-    if(li){ flushPara(); if(!inList){ html+="<ul>"; inList=true; } html+="<li>"+inline(li[1])+"</li>"; continue; }
-    if(raw.trim()===""){ flushPara(); closeList(); continue; }
-    para.push(raw);
-  }
-  flushPara();
-  if(inCode){ html+="<pre class=\"md-code\">"+esc(code.join("\n"))+"</pre>"; }
-  closeList();
-  return html;
-}
-
-// Commit messages are hard-wrapped by the writer (~72 chars). When the rendering column is
-// narrower than that, every source line wraps AGAIN and the text reads as ragged fragments.
-// So a paragraph the layout wraps further drops its single line breaks and flows as prose;
-// one that fits keeps every break exactly as written. Blank-line paragraph breaks always
-// stay, as does the metadata block. Measured on the un-joined text, so the decision is
-// about the ORIGINAL lines; re-run on resize.
-function reflowParagraphs(root){
-  if(!root || !root.querySelectorAll) return;
-  for(const p of root.querySelectorAll("p.mdp:not(.keep)")){
-    p.classList.remove("reflow");
-    const breaks = p.getElementsByTagName("br").length;
-    if(!breaks) continue;
-    const lh = parseFloat(getComputedStyle(p).lineHeight) || 16;
-    const range = document.createRange();
-    range.selectNodeContents(p);
-    // One rect per line box — but inline <code> sits a couple of pixels off its line, so
-    // cluster by line height instead of counting distinct tops.
-    const tops = [];
-    for(const r of range.getClientRects()){
-      if(!r.height) continue;
-      if(!tops.some(t => Math.abs(t - r.top) < lh * 0.6)) tops.push(r.top);
-    }
-    if(tops.length > breaks + 1) p.classList.add("reflow");
-  }
-}
+__UI_COMMIT_JS__
+const md = commitMd;
 
 // `min` (default 0) is the low end of the scale: the width maps [min, max] → [0, 100],
 // so passing the smallest value in the set as `min` spreads the bars across the full
@@ -2148,19 +2051,6 @@ async function toggleDiff(i){
     _diffCache[c.sha] = html;
     apply(html);  // apply() no-ops if the user flipped back to the message mid-fetch
   }catch(e){ apply('<div class="diffempty">couldn\'t load the diff (server unreachable)</div>'); }
-}
-// Color a unified diff (diffstat + patch) line-by-line: file headers, hunk headers, +adds, −dels.
-function renderDiff(text){
-  const rows = (text||"").replace(/\r\n/g,"\n").replace(/\n+$/,"").split("\n").map(raw => {
-    let cls = "dl";
-    if(/^(diff --git |index |new file|deleted file|similarity |rename |old mode|new mode)/.test(raw)) cls="dl dfile";
-    else if(raw.startsWith("@@")) cls="dl dhunk";
-    else if(raw.startsWith("+++")||raw.startsWith("---")) cls="dl dmeta2";
-    else if(raw.startsWith("+")) cls="dl dadd";
-    else if(raw.startsWith("-")) cls="dl ddel";
-    return '<span class="'+cls+'">'+(esc(raw)||"&nbsp;")+'</span>';
-  });
-  return '<pre class="diffbox">'+rows.join("")+'</pre>';
 }
 
 function fillSelect(id, values, allLabel, keep){

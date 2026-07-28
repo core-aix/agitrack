@@ -216,11 +216,10 @@ def test_export_disables_filters_and_cans_learn_actions(tmp_path, monkeypatch):
     # out install commands.
     assert 'href="../#install"' in index
     assert 'href="../../#install"' in learn
-    # …and the link renders GREEN on BOTH pages, standing out from the amber banner text.
-    # Each banner styles its links explicitly because the two pages' global anchor colors
-    # differ, which is what made the same banner render differently on each.
-    assert ".backtracebanner a{color:var(--phosphor)" in index
-    assert ".btbanner a{color:var(--phosphor)" in learn
+    # …and the link renders GREEN on every page, standing out from the amber banner text.
+    # One rule, in agitrack/metrics/ui.py, so the strip cannot drift apart again.
+    shared = ".backtracebanner a,.btbanner a,.updatebanner a{color:var(--phosphor)"
+    assert shared in index and shared in learn
 
 
 def test_export_learn_state_falls_back_to_the_single_store_profile(tmp_path, monkeypatch):

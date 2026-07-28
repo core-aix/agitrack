@@ -280,7 +280,9 @@ def test_dashboard_is_usable_at_phone_width(tmp_path):
     # neutralized here: on the relative phone bar it shoved the bar down, leaving a
     # banner-sized blank gap at the top of narrow backtrace pages.
     assert "top:auto !important" in phone.split("}", 2)[0] + phone.split("}", 2)[1]
-    assert ".backtracebanner code{color:var(--fg)" in html
+    # The banner's <code> chip is styled once for all three pages (agitrack/metrics/ui.py),
+    # so this asserts the SHARED rule reached the rendered page.
+    assert ".backtracebanner code,.btbanner code,.updatebanner code{color:var(--fg)" in html
 
 
 def test_subject_truncation_cuts_at_word_ends(tmp_path):
@@ -1970,3 +1972,30 @@ def test_the_dashboard_is_not_rebuilt_while_nothing_moved(tmp_path, monkeypatch)
     finally:
         handler._dash_cache.clear()
         server.server_close()
+
+
+def _rendered_dashboard() -> str:
+    """The page as a browser sees it: the shared UI blocks (agitrack/metrics/ui.py) are
+    substituted at render time, so asserting against the raw template would miss them."""
+    from agitrack.metrics import ui
+    from agitrack.metrics.web import _TEMPLATE
+
+    return ui.render(_TEMPLATE)
+
+
+def test_the_file_filter_is_hidden_outside_the_files_view():
+    """It does nothing in the commits view. `hidden` alone was not enough: the box is a flex
+    container, and any author `display` outranks the attribute's UA rule, so it stayed on
+    screen until the page grew a [hidden] rule of its own."""
+    html = _rendered_dashboard()
+
+    assert '<div class="panehead" id="head-files" hidden>' in html
+    assert 'if(hf) hf.hidden = tab !== "files";' in html  # ...and follows the tab
+    assert "[hidden]{display:none !important}" in html  # ...and hiding actually hides
+
+
+def test_a_long_diff_line_wraps_instead_of_widening_the_page():
+    html = _rendered_dashboard()
+
+    assert "white-space:pre-wrap;overflow-wrap:anywhere" in html
+    assert "max-height:460px" not in html  # no scroll box either
