@@ -796,3 +796,82 @@ def test_the_readers_own_instructions_reach_the_storyteller(tmp_path, monkeypatc
     expand = _fake_agent(monkeypatch, [json.dumps({"detail": "Short.", "thoughts": []})])
     story.expand_moment(tmp_path, stats, sha_paths, branch="main", moment_id=built["moments"][0]["id"])
     assert "focus on the tests, and be dry" in expand.prompts[0]
+
+
+def test_a_part_is_told_across_its_whole_range_not_from_one_end(tmp_path, monkeypatch):
+    """A part's moments have to cover its date range. Taking the first stretch of sittings and
+    stopping left the middle and end of your own history untold, with a pager as the only way
+    to reach it."""
+    repo = _repo_with_history(tmp_path, prompts=[f"step {i}" for i in range(24)], gap_days=1)
+    stats, sha_paths = _view_of(repo)
+    ordered = story.story_stats(stats)
+    monkeypatch.setattr(story, "_BATCH_EPISODES", 3)  # the first telling reaches the newest stretch only
+    _fake_agent(
+        monkeypatch,
+        [
+            _moment_reply(
+                [{"id": "newest", "title": "Lately", "summary": "s", "shas": [stat.short for stat in ordered[-3:]]}]
+            ),
+            _ARC,
+        ],
+    )
+    built = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
+    era = built["eras"][0]  # the OLDEST part: nothing in it has been told
+    assert not [m for m in built["moments"] if era["from"] <= m["from"] <= era["to"]]
+
+    monkeypatch.setattr(story, "_BATCH_EPISODES", 40)
+    monkeypatch.setattr(story, "_MOMENTS_COARSE", 4)
+    fake = _fake_agent(monkeypatch, [_moment_reply([]), _moment_reply([]), _ARC])  # unusable: told plainly instead
+    after = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="part", part_id=era["id"])
+
+    told = [m for m in after["moments"] if era["from"] <= m["from"] <= era["to"]]
+    assert len(told) > 1, "a part is told as several moments, not one lump"
+    # They SPAN the era rather than clustering at its start.
+    assert min(m["from"] for m in told) <= era["from"]
+    assert max(m["to"] for m in told) >= era["to"]
+    # ...and the material offered to the agent reached the far end of the era, not just its
+    # opening sittings.
+    newest_in_era = max((stat for stat in ordered if stat.timestamp <= era["to"]), key=lambda s: s.timestamp)
+    assert newest_in_era.short in fake.prompts[0]
+
+
+def test_looking_closer_retells_the_same_span_at_finer_grain(tmp_path, monkeypatch):
+    repo = _repo_with_history(tmp_path, prompts=[f"step {i}" for i in range(16)], gap_days=1)
+    stats, sha_paths = _view_of(repo)
+    ordered = story.story_stats(stats)
+    monkeypatch.setattr(story, "_BATCH_EPISODES", 40)
+    _fake_agent(
+        monkeypatch,
+        [
+            _moment_reply([{"id": "coarse", "title": "Broadly", "summary": "s", "shas": [s.short for s in ordered]}]),
+            _ARC,
+        ],
+    )
+    built = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
+    era = built["eras"][-1]
+
+    _fake_agent(monkeypatch, [_moment_reply([]), _ARC])
+    closer = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="part", part_id=era["id"], level=2)
+    fine = [m for m in closer["moments"] if int(m.get("level") or 1) >= 2]
+    assert fine, "a closer telling exists"
+    # The coarse telling is still there: this is a zoom, not a replacement.
+    assert any(int(m.get("level") or 1) == 1 for m in closer["moments"])
+    # Coverage still describes the COARSE telling, or "what is left" would be meaningless.
+    coarse_shas = {sha for m in closer["moments"] if int(m.get("level") or 1) == 1 for sha in m["shas"]}
+    assert set(closer["covered_shas"]) == coarse_shas
+
+
+def test_the_number_of_parts_follows_the_history():
+    """A fortnight is not five acts and two years is not five either."""
+
+    def episodes(days, count):
+        step = days * DAY / max(count - 1, 1)
+        return [
+            story.Episode(index=i, stats=[_stat(chr(97 + i % 26), "p", int(1_750_000_000 + i * step))])
+            for i in range(count)
+        ]
+
+    assert story.part_target(episodes(7, 8)) == 2  # a week of work is not five acts
+    assert story.part_target(episodes(55, 93)) == 5  # this repo, as it stands
+    assert story.part_target(episodes(365, 400)) == 8  # and a long one is capped, not endless
+    assert story.part_target(episodes(1, 2)) == 2

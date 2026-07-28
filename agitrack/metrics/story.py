@@ -32,6 +32,7 @@ with generation disabled.
 from __future__ import annotations
 
 import json
+import math
 import re
 import threading
 import time
@@ -72,6 +73,10 @@ _BATCH_CHARS = 4000
 # moments in one go is both a long wait and more than anyone reads at once; "go further
 # back" fetches the next stretch when it is actually wanted.
 _MAX_BATCHES = 1
+# Moments per part at each zoom. The first telling of a part is a handful spread across its
+# whole span; looking closer re-tells the same span at finer grain.
+_MOMENTS_COARSE = 6
+_MOMENTS_FINE = 15
 # Per-call bounds. The outline call reads a lot and writes little; a moment is the reverse.
 _MOMENT_TIMEOUT_SECONDS = 300
 _EXPAND_TIMEOUT_SECONDS = 240
@@ -299,6 +304,36 @@ def segment_episodes(stats: list[CommitStat], sha_paths: dict[str, set[str]] | N
     return episodes
 
 
+def merge_episodes(group: list[Episode], index: int) -> Episode:
+    """Fold several sittings of work into one, so a single telling can cover a wide span
+    without reading every sitting in it."""
+    merged = Episode(index=index)
+    for episode in group:
+        merged.stats.extend(episode.stats)
+    seen: dict[str, int] = {}
+    for episode in group:
+        for path in episode.paths:
+            seen[path] = seen.get(path, 0) + 1
+    merged.paths = [path for path, _ in sorted(seen.items(), key=lambda kv: (-kv[1], kv[0]))[:8]]
+    return merged
+
+
+def spread(episodes: list[Episode], count: int) -> list[Episode]:
+    """``count`` evenly spread groups covering ALL of ``episodes``, oldest first.
+
+    This is what makes a telling cover its whole date range instead of the first stretch of
+    it: rather than taking the first N sittings and stopping, every sitting belongs to one of
+    N groups, and each group becomes one moment."""
+    if not episodes:
+        return []
+    count = max(1, min(count, len(episodes)))
+    items = [{"from": episode.start, "to": episode.end} for episode in episodes]
+    return [
+        merge_episodes(episodes[start : end + 1], number)
+        for number, (start, end) in enumerate(act_slices(items, count))
+    ]
+
+
 def _batches(episodes: list[Episode]) -> list[list[Episode]]:
     """Episodes grouped into agent calls: a few episodes each, inside the digest budget."""
     out: list[list[Episode]] = []
@@ -474,7 +509,7 @@ def act_slices(items: list[dict], target: int = 5) -> list[tuple[int, int]]:
     total = len(items)
     if total < 4:
         return [(0, total - 1)] if total else []
-    count = max(2, min(target, total // 4))
+    count = max(2, min(target, max(2, total // 2)))
     step = total / count
     cuts: list[int] = []
     for index in range(1, count):
@@ -487,13 +522,29 @@ def act_slices(items: list[dict], target: int = 5) -> list[tuple[int, int]]:
     return [(bounds[i], bounds[i + 1] - 1) for i in range(len(bounds) - 1)]
 
 
+def part_target(episodes: list[Episode]) -> int:
+    """How many parts this history deserves.
+
+    A fortnight of work is not five acts, and a two-year project is not five either. Roughly
+    one part per three weeks of elapsed time, cross-checked against how much actually
+    happened (a quiet year is still a small story), bounded at 2 and 8."""
+    if len(episodes) < 4:
+        return max(1, len(episodes))
+    days = max(1, (episodes[-1].end - episodes[0].start) / 86400)
+    by_time = days / 21  # about a part per three weeks of elapsed time...
+    by_volume = len(episodes) / 12  # ...and about one per twelve sittings of work
+    # Neither alone: a dense two months has more to tell than a sleepy two years, and a long
+    # quiet stretch is not five acts. The middle of the two, bounded at 2 and 8.
+    return max(2, min(8, round(math.sqrt(max(by_time, 0.1) * max(by_volume, 0.1)))))
+
+
 def _era_rows(episodes: list[Episode]) -> list[dict]:
     """The coarse story's skeleton: the whole history split into eras, with the numbers that
     describe each one. Computed from the episodes themselves, so it exists (and is complete)
     however few moments have been written."""
     items = [{"from": episode.start, "to": episode.end} for episode in episodes]
     rows = []
-    for start, end in act_slices(items):
+    for start, end in act_slices(items, part_target(episodes)):
         span = episodes[start : end + 1]
         rows.append(
             {
@@ -842,7 +893,7 @@ def _ask(choice, prompt: str, timeout: int) -> dict | None:
 
 
 def _material(
-    stats: list[CommitStat], story: dict | None, mode: str, part_id: str = ""
+    stats: list[CommitStat], story: dict | None, mode: str, part_id: str = "", level: int = 1
 ) -> tuple[list[CommitStat], str]:
     """Which commits this build tells, and where their moments go.
 
@@ -863,10 +914,12 @@ def _material(
         era = next((row for row in story.get("eras") or [] if row.get("id") == part_id), None)
         if era is None:
             return [], "append"
+        # Looking CLOSER re-tells the same span at finer grain, so coverage does not exclude
+        # it: the same commits legitimately appear at both zooms, once each.
         window = [
             stat
             for stat in kept
-            if stat.sha not in covered and era.get("from", 0) <= stat.timestamp <= era.get("to", 0)
+            if era.get("from", 0) <= stat.timestamp <= era.get("to", 0) and (level >= 2 or stat.sha not in covered)
         ]
         return window, "merge"
     fresh = [stat for stat in kept if stat.sha not in covered]
@@ -898,6 +951,7 @@ def build_story(
     repo_name: str = "",
     note: str = "",
     part_id: str = "",
+    level: int = 1,
     key: str = "",
     stop: threading.Event | None = None,
 ) -> dict[str, Any]:
@@ -912,20 +966,21 @@ def build_story(
     for stat in story_stats(stats):
         by_sha[stat.sha] = stat
         by_sha[stat.short] = stat
-    material, placement = _material(stats, existing, mode, part_id)
+    material, placement = _material(stats, existing, mode, part_id, level)
     if not material:
         raise StoryError("There is nothing new to tell: the story already covers this branch.")
     # Segment the material itself, not the whole history: an episode is a sitting of work
     # among the commits this build is actually telling.
     selected = segment_episodes(material, sha_paths)
 
-    # One build spends a bounded number of agent calls. Which end of the material it spends
-    # them on depends on what it is doing: continuing forward takes the OLDEST of the new
-    # work (the story stays chronological), while a first telling or a reach further back
-    # takes the material CLOSEST to what the reader already has.
+    # A telling COVERS its material rather than starting at one end of it: the sittings are
+    # spread into as many groups as this zoom level asks for, and each group becomes a
+    # moment. Taking the first N sittings instead left the rest of a part untold and made
+    # "show earlier moments" the only way to see the middle of your own history.
+    wanted = _MOMENTS_FINE if level >= 2 else _MOMENTS_COARSE
+    if placement == "merge":
+        selected = spread(selected, wanted)
     all_batches = _batches(selected)
-    # A part-scoped build works forward through that part; everything else takes the end
-    # nearest what the reader already has.
     batches = all_batches[:_MAX_BATCHES] if placement in ("append", "merge") else all_batches[-_MAX_BATCHES:]
     left_behind = len(all_batches) - len(batches)
     choice = learn_page.resolve_learning_backend(Path(root))
@@ -957,6 +1012,10 @@ def build_story(
             # Two unusable answers about this stretch. Tell it plainly from the commits and
             # keep going: one bad reply must not cost the whole build.
             moments = _fallback_moments(batch, by_sha, sha_paths, used_ids)
+        for moment in moments:  # which part, and at which zoom, this telling belongs to
+            moment["level"] = level
+            if part_id:
+                moment["part"] = part_id
         produced.extend(moments)
         context = "\n".join(f"- {moment['title']}: {moment['summary']}" for moment in produced[-4:])
         if key:
@@ -1009,7 +1068,11 @@ def _assemble(
     else:
         moments = list(produced)
     moments.sort(key=lambda moment: (moment.get("from", 0), moment.get("to", 0)))
-    covered_shas = sorted({sha for moment in moments for sha in moment.get("shas", [])})
+    # Coverage tracks the COARSE telling only: a finer one revisits the same commits by
+    # design, and counting them would make "what is left to tell" meaningless.
+    covered_shas = sorted(
+        {sha for moment in moments if int(moment.get("level") or 1) <= 1 for sha in moment.get("shas", [])}
+    )
     story: dict[str, Any] = {
         "branch": story_key,
         "tone": tone,
@@ -1154,6 +1217,7 @@ def start_build(
     repo_name: str = "",
     note: str = "",
     part_id: str = "",
+    level: int = 1,
 ) -> dict[str, Any]:
     """Kick off a build on a background thread and return immediately.
 
@@ -1164,7 +1228,7 @@ def start_build(
     # Answer "there is nothing to tell" immediately instead of spawning a thread that fails a
     # moment later: the page would otherwise show a spinner and then an error for a button
     # press that could never have worked.
-    material, _placement = _material(stats, StoryStore(root).get(branch or "HEAD"), mode, part_id)
+    material, _placement = _material(stats, StoryStore(root).get(branch or "HEAD"), mode, part_id, level)
     if not material:
         return {
             "error": (
@@ -1207,6 +1271,7 @@ def start_build(
                     repo_name=repo_name,
                     note=note,
                     part_id=part_id,
+                    level=level,
                     key=key,
                     stop=stop,
                 )
@@ -1341,6 +1406,7 @@ def handle_story_post(
                 repo_name=repo_name,
                 note=str(body.get("note") or ""),
                 part_id=str(body.get("part") or ""),
+                level=2 if body.get("closer") else 1,
             )
         if path == "/story/moment":
             stats, sha_paths = view(branch)
@@ -1829,8 +1895,9 @@ __BACKTRACE_BANNER__
   <div class="zoombar" id="toolbar" hidden>
     <span class="zlabel">zoom</span>
     <div class="zoom" id="zoom">
-      <button class="zstop" data-z="2"><b>&#9679;</b><span>the five parts</span></button>
-      <button class="zstop sel" data-z="3"><b>&#9679;&#9679;&#9679;</b><span>moment by moment</span></button>
+      <button class="zstop" data-z="2"><b>&#9679;</b><span id="zlabel2">the parts</span></button>
+      <button class="zstop sel" data-z="3"><b>&#9679;&#9679;</b><span>the moments</span></button>
+      <button class="zstop" data-z="4"><b>&#9679;&#9679;&#9679;</b><span>closer</span></button>
     </div>
     <span class="grow"></span>
     <button class="btn small nocinema" id="play">&#9654; play it</button>
@@ -1892,7 +1959,7 @@ const PAGE_MOMENTS = 8;
 const state = {
   data: null, story: null, tone: "playful", branch: "", open: new Set(), told: new Set(),
   poll: null, cinema: false, cineTimer: null, cursor: -1, building: false, shown: PAGE_MOMENTS,
-  zoom: 3, part: null
+  zoom: 3, part: null, pendingZoom: 0
 };
 
 // ------------------------------------------------------------------ helpers
@@ -2081,11 +2148,17 @@ function renderStudio(){
 // moment is the last step in, to the commits themselves. Zooming into a PART narrows
 // everything below it to that part.
 function setZoom(level, part){
-  state.zoom = Math.max(2, Math.min(3, level || 3));  // two stops: the parts, and inside them
+  state.zoom = Math.max(2, Math.min(4, level || 3));  // parts, moments, closer
   if (part !== undefined) state.part = part;
   if (state.zoom < 3) state.shown = PAGE_MOMENTS;
-  for (const stop of $("zoom").querySelectorAll(".zstop"))
-    stop.classList.toggle("sel", Number(stop.dataset.z) === state.zoom);
+  for (const stop of $("zoom").querySelectorAll(".zstop")) {
+    const z = Number(stop.dataset.z);
+    stop.classList.toggle("sel", z === state.zoom);
+    // "Closer" is a per-part zoom: outside a part there is nothing finer to show.
+    stop.hidden = z === 4 && !currentPart();
+  }
+  const eras = ((state.story && state.story.eras) || []).length;
+  if (eras) $("zlabel2").textContent = eras === 1 ? "the whole thing" : "the " + eras + " parts";
   renderZoomContext();
   renderZoomContext();
   renderEras();
@@ -2113,11 +2186,22 @@ function renderZoomContext(){
 }
 
 // Everything the current zoom (and part) is looking at.
+// Everything the current zoom (and part) is looking at. Level 1 is the handful spread
+// across a part; level 2 is the same span told closer.
 function momentsInView(){
   const all = (state.story && state.story.moments) || [];
   const part = currentPart();
-  if (!part) return all;
-  return all.filter(m => m.from >= part.from && m.to <= part.to);
+  const want = state.zoom >= 4 ? 2 : 1;
+  const scoped = part ? all.filter(m => m.from >= part.from && m.to <= part.to) : all;
+  const atLevel = scoped.filter(m => (Number(m.level) || 1) === want);
+  // Nothing at this zoom yet: show the coarser telling rather than an empty page.
+  return atLevel.length ? atLevel : scoped.filter(m => (Number(m.level) || 1) === 1);
+}
+function hasCloser(){
+  const part = currentPart();
+  const all = (state.story && state.story.moments) || [];
+  const scoped = part ? all.filter(m => m.from >= part.from && m.to <= part.to) : all;
+  return scoped.some(m => (Number(m.level) || 1) >= 2);
 }
 
 // The whole project, coarse: one row per era, newest first, each with its span, size and the
@@ -2172,18 +2256,18 @@ function renderTimeline(){
   }
   if (!all.length) return;
   const newestFirst = all.slice().reverse();
-  const shown = newestFirst.slice(0, state.shown || PAGE_MOMENTS);
+  const shown = newestFirst;  // a telling is already bounded: no paging
   const part = currentPart();
   let html = '<h2 class="section">' + (part ? "inside " + esc(part.title.toLowerCase()) : "moment by moment") +
              "</h2><div class=\"timeline\">";
   shown.forEach((c, position) => { html += momentHtml(c, position); });
   html += "</div>";
   host.innerHTML = html;
-  const rest = newestFirst.length - shown.length;
-  $("morewrap").hidden = !rest && !(state.story && state.story.more_earlier);
-  $("more-moments").hidden = !rest;
-  if (rest) $("more-moments").textContent = "show " + Math.min(rest, PAGE_MOMENTS) + " earlier moment" +
-    (Math.min(rest, PAGE_MOMENTS) === 1 ? "" : "s") + " (" + rest + " more)";
+  // No pager: a telling spans its whole range, so what is on screen IS the range. Seeing
+  // more means looking closer, which is a zoom.
+  $("morewrap").hidden = !part;
+  $("more-moments").hidden = !part || hasCloser();
+  if (part) $("more-moments").textContent = "\u2728 tell this part closer (" + newestFirst.length + " moments now)";
   for (const id of state.open) {
     const el = document.getElementById("ch-" + id);
     if (el) { el.classList.add("open"); fillMoment(el, false); }
@@ -2609,14 +2693,15 @@ function renderBuild(p){
   renderStudio();
 }
 
-async function build(mode){
+async function build(mode, options){
   if (state.building) return;
   flash("");
   state.building = true; renderStudio();
   if (!(state.story && (state.story.moments || []).length)) $("skeleton").hidden = false;
   try {
     const r = await post("story/build", {branch: state.branch, tone: state.tone, mode: mode,
-                                        note: $("f-note").value.trim(), part: state.part || ""});
+                                        note: $("f-note").value.trim(), part: state.part || "",
+                                        closer: !!(options && options.closer)});
     if (r.error || r.busy) { state.building = false; fail(r.error || "busy"); renderStudio(); return; }
     renderBuild(r.progress);
     startPolling();
@@ -2649,6 +2734,7 @@ function startPolling(){
       if (!data.building || !data.building.running) {
         stopPolling();
         $("skeleton").hidden = true;
+        if (state.pendingZoom) { setZoom(state.pendingZoom); state.pendingZoom = 0; }
         render();                          // one final, complete paint
         if (after) celebrate();
       }
@@ -2807,10 +2893,7 @@ $("build-cancel").addEventListener("click", async () => {
   $("build-cancel").disabled = true;
   try { await post("story/cancel", {branch: state.branch}); } catch (e) {}
 });
-$("more-moments").addEventListener("click", () => {
-  state.shown = (state.shown || PAGE_MOMENTS) + PAGE_MOMENTS;
-  renderTimeline();
-});
+$("more-moments").addEventListener("click", () => { state.pendingZoom = 4; build("part", {closer: true}); });
 $("earlier2").addEventListener("click", () => build("earlier"));
 $("e-backend").addEventListener("change", () => { $("e-backend").dataset.touched = "1"; loadModels(null); });
 $("e-save").addEventListener("click", saveEngine);
