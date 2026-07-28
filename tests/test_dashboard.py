@@ -1941,3 +1941,32 @@ def test_token_anomaly_badge_reaches_the_log(tmp_path):
     html = shell_html(_seeded(tmp_path))
     assert '"token_anomaly"' not in html  # payload key travels via /log JSON, not the shell
     assert "badge anomaly" in html and "tokens excluded" in html
+
+
+def test_the_dashboard_is_not_rebuilt_while_nothing_moved(tmp_path, monkeypatch):
+    """Reading the whole history is the expensive thing this server does, and it used to
+    happen on EVERY request: each poll, each log page, and each return from the story or
+    learn page. It only changes when a ref moves."""
+    import agitrack.metrics.server as server_mod
+
+    repo = _demo_repo(tmp_path)
+    server = build_server(repo, port=0)
+    handler = server.RequestHandlerClass
+    builds = []
+    real_build = server_mod.build_dashboard
+    monkeypatch.setattr(server_mod, "build_dashboard", lambda *a, **k: (builds.append(1), real_build(*a, **k))[1])
+    try:
+        # A handler instance without the request cycle: BaseHTTPRequestHandler.__init__ IS
+        # the request, so it is skipped and only the class attributes (repo, caches) are used.
+        probe = type("Probe", (handler,), {"__init__": lambda self: None})()
+        first = probe._dashboard()
+        again = probe._dashboard()
+        assert again is first and len(builds) == 1  # the second request reused it
+
+        _write_lines(repo, "later.txt", 3)
+        repo.commit("something new")
+        after = probe._dashboard()
+        assert after is not first and len(builds) == 2  # ...and a new commit rebuilds it
+    finally:
+        handler._dash_cache.clear()
+        server.server_close()

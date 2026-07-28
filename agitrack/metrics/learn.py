@@ -2624,16 +2624,6 @@ $("reset-suggest").addEventListener("click", async () => {
     }
   } catch (e) {}
 });
-// Going back to the dashboard via history restores it instantly from the browser's
-// back/forward cache instead of a full reload (and its commit-history crunch).
-$("backlink").addEventListener("click", e => {
-  try {
-    if (document.referrer && new URL(document.referrer).origin === location.origin && history.length > 1) {
-      e.preventDefault();
-      history.back();
-    }
-  } catch (err) {}
-});
 $("f-source").addEventListener("change", () => { state.source = $("f-source").value; });
 $("f-branch").addEventListener("change", () => {
   state.branch = $("f-branch").value;

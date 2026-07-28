@@ -3,8 +3,10 @@
 `agitrack --dashboard` serves the HTML dashboard and opens it in the browser.
 The page polls ``/data`` on an interval and re-renders, so the dashboard
 reflects new commits as they land — useful for watching an agent work.
-Everything is recomputed from ``git log`` on each request: read-only, no state,
-identical on every clone.
+Everything derives from ``git log``: read-only, no state, identical on every clone. The
+built view is cached per REF STATE (branch tip plus the latent manual refs), so a poll, a
+log page or a return from /story or /learn reuses it instead of walking the history again;
+a moved ref rebuilds it.
 
 Where it binds depends on where aGiTrack is running. On your own machine it
 stays on loopback; in a **remote shell** (SSH/Mosh) loopback would be reachable
@@ -96,6 +98,8 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
     # the question for that slice), hence keyed by the filter too — not just the branch tip.
     # Bounded: cleared whenever the tip moves, and capped while a tip is current.
     _insights_cache: dict[tuple, list[dict]] = {}
+    # The built Dashboard itself, keyed by the refs it was built from (see _dashboard).
+    _dash_cache: dict[tuple, Dashboard] = {}
 
     def do_GET(self) -> None:  # noqa: N802 (http.server API)
         try:
@@ -274,7 +278,35 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
         # logins appear on a later poll. {} when gh is absent. The initial / paint warms
         # this cache so the IDs are usually ready by the first /data poll.
         logins = cached_logins(self.repo)
-        return build_dashboard(self.repo, ref, sha_logins=logins, email_logins=self.email_logins)
+        # Reading the whole history is THE expensive thing this server does, and every
+        # request used to do it again: a poll, a log page, the story page, and every return
+        # from /learn or /story. It only changes when a ref moves, so key it on the tips we
+        # actually read (the branch, and the manual-mode latent refs the pending rows come
+        # from) plus how many identities are resolved so far.
+        key = (ref, self._ref_state(ref), len(logins), len(self.email_logins))
+        cache = type(self)._dash_cache
+        hit = cache.get(key)
+        if hit is not None:
+            return hit
+        dash = build_dashboard(self.repo, ref, sha_logins=logins, email_logins=self.email_logins)
+        cache.clear()  # only the current state is worth keeping
+        cache[key] = dash
+        return dash
+
+    def _ref_state(self, ref: str) -> str:
+        """A cheap fingerprint of everything the dashboard reads: the branch tip and the
+        latent (manual-mode) refs. Two git plumbing calls instead of a full history walk."""
+        try:
+            head = self.repo.rev_parse(ref)
+        except Exception:
+            return ""  # unreadable: fall through to a rebuild rather than serve a guess
+        try:
+            latent = self.repo._run(
+                ["git", "for-each-ref", "--format=%(objectname)", "refs/agitrack/manual"], check=False
+            ).stdout
+        except Exception:
+            latent = ""
+        return head + "|" + latent.strip()
 
     def _browser(self, ref: str = "HEAD") -> FileBrowser:
         # Build (and cache) the file browser for this ref. Keyed by the branch tip so a poll
@@ -453,8 +485,9 @@ def build_server(
         {
             "repo": repo,
             "email_logins": {k.lower(): v for k, v in (email_logins or {}).items()},
-            # A fresh per-server cache so two servers (different repos) never share a browser.
+            # Fresh per-server caches so two servers (different repos) never share either.
             "_browser_cache": {},
+            "_dash_cache": {},
         },
     )
     bind_host = default_bind_host() if host is None else host
