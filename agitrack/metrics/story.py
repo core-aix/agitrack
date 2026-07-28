@@ -58,18 +58,20 @@ _EPISODE_MAX_COMMITS = 12
 # Generation is LAZY, in two stages, because waiting twenty minutes for a story nobody has
 # read yet is the wrong trade:
 #
-#   1. the OUTLINE pass writes every chapter's headline (title, kind, one-sentence summary)
-#      from a compact digest, so a whole history is covered in a couple of calls, and
-#   2. a chapter is WRITTEN OUT the first time someone opens it: one call, over the full
+#   1. an OVERVIEW pass reads the WHOLE history once, cheaply, and names the eras: that is
+#      the coarse story, always complete, however long the project is;
+#   2. an OUTLINE pass writes chapter headlines for the most RECENT stretch only, because
+#      that is what a reader opens the page for (older stretches on request); and
+#   3. a chapter is WRITTEN OUT the first time someone opens it: one call, over the full
 #      material of just that chapter, cached in the store forever after.
 #
-# So the first build is about a minute, and depth is paid for only where a reader goes.
-_BATCH_EPISODES = 30
-_BATCH_CHARS = 9000
-# The hard ceiling on outline calls per build (plus one for the arc). A history bigger than
-# this is covered newest-first and the story records that older commits are not covered
-# yet, so the reader is never told a partial story is the whole one.
-_MAX_BATCHES = 6
+# So a build is two calls and under a minute, and depth is paid for only where a reader goes.
+_BATCH_EPISODES = 10
+_BATCH_CHARS = 4000
+# Outline calls per build. ONE: a build covers the newest stretch and stops. Forty-five
+# chapters in one go is both a long wait and more than anyone reads at once; "go further
+# back" fetches the next stretch when it is actually wanted.
+_MAX_BATCHES = 1
 # Per-call bounds. The outline call reads a lot and writes little; a chapter is the reverse.
 _CHAPTER_TIMEOUT_SECONDS = 300
 _EXPAND_TIMEOUT_SECONDS = 240
@@ -439,15 +441,14 @@ MATERIAL:
 {material}"""
 
 
-def act_slices(chapters: list[dict], target: int = 5) -> list[tuple[int, int]]:
-    """Split the chapters into contiguous eras, as ``(start, end)`` index pairs.
+def act_slices(items: list[dict], target: int = 5) -> list[tuple[int, int]]:
+    """Split dated items into contiguous eras, as ``(start, end)`` index pairs.
 
     The BOUNDARIES are decided here, not by the agent. Asking a model to both group and name
-    left the last act covering 26 of 44 chapters and titled after the first three of them
-    ("Windows Finally Gets Invited In" for a month that was mostly about other things). Even
-    spans, nudged onto the biggest pause between chapters so an era starts where the work
+    left one act covering 26 of 44 chapters and titled after the first three of them. Even
+    spans, nudged onto the biggest pause between items so an era starts where the work
     actually did, are always defensible; naming is all the agent is asked for."""
-    total = len(chapters)
+    total = len(items)
     if total < 4:
         return [(0, total - 1)] if total else []
     count = max(2, min(target, total // 4))
@@ -455,24 +456,52 @@ def act_slices(chapters: list[dict], target: int = 5) -> list[tuple[int, int]]:
     cuts: list[int] = []
     for index in range(1, count):
         ideal = round(index * step)
-        # Nudge onto the largest time gap within a couple of chapters of the even split.
         window = [pos for pos in range(max(1, ideal - 2), min(total - 1, ideal + 3))]
-        best = max(window, key=lambda pos: chapters[pos].get("from", 0) - chapters[pos - 1].get("to", 0))
+        best = max(window, key=lambda pos: items[pos].get("from", 0) - items[pos - 1].get("to", 0))
         if not cuts or best > cuts[-1]:
             cuts.append(best)
     bounds = [0, *cuts, total]
     return [(bounds[i], bounds[i + 1] - 1) for i in range(len(bounds) - 1)]
 
 
-def _arc_prompt(chapters: list[dict], tone: str, repo_name: str) -> str:
+def _era_rows(episodes: list[Episode]) -> list[dict]:
+    """The coarse story's skeleton: the whole history split into eras, with the numbers that
+    describe each one. Computed from the episodes themselves, so it exists (and is complete)
+    however few chapters have been written."""
+    items = [{"from": episode.start, "to": episode.end} for episode in episodes]
+    rows = []
+    for start, end in act_slices(items):
+        span = episodes[start : end + 1]
+        rows.append(
+            {
+                "from": span[0].start,
+                "to": span[-1].end,
+                "when": _day(span[0].start),
+                "until": _day(span[-1].end),
+                "commits": sum(len(episode.stats) for episode in span),
+                "ins": sum(episode.insertions for episode in span),
+                "del": sum(episode.deletions for episode in span),
+                "turns": sum(episode.ai_turns for episode in span),
+                # One bar per episode: the shape of the work inside the era.
+                "spark": [episode.insertions + episode.deletions for episode in span],
+                "subjects": [
+                    max(episode.stats, key=lambda stat: (stat.lines, stat.timestamp)).subject[:70] for episode in span
+                ],
+            }
+        )
+    return rows
+
+
+def _overview_prompt(eras: list[dict], tone: str, repo_name: str) -> str:
+    """Name the whole timeline in ONE call. It reads only headline subjects per era, so its
+    cost does not grow with how much of the story has been written out."""
     voice = STORY_TONES.get(tone, STORY_TONES[DEFAULT_TONE])
     blocks = []
-    for number, (start, end) in enumerate(act_slices(chapters), start=1):
-        titles = "; ".join(chapter.get("title", "") for chapter in chapters[start : end + 1])
-        span = f"{chapters[start].get('when', '')} to {chapters[end].get('when', '')}"
-        blocks.append(f"ERA {number} ({span}, {end - start + 1} chapters): {titles}"[:1400])
+    for number, era in enumerate(eras, start=1):
+        subjects = "; ".join(era["subjects"])[:1200]
+        blocks.append(f"ERA {number} ({era['when']} to {era['until']}, {era['commits']} commits): {subjects}")
     listing = "\n\n".join(blocks)[:7000]
-    return f"""Below are the eras of a repository called "{repo_name}", in order, each listed with the chapters it contains.
+    return f"""Below is the whole history of a repository called "{repo_name}", split into eras, each listed with the headline of every sitting of work inside it.
 
 {voice}
 
@@ -480,7 +509,7 @@ Name them:
 - "title": a title for the project's story so far. Short, specific to THIS project, memorable; the kind of title someone would click. Not a slogan, not "The Story of X".
 - "tagline": one sentence under the title that makes someone want to read on.
 - "arc": TWO short sentences on the overall journey: where it started and where it stands now.
-- "eras": one entry per era above, each {{"n": <its number>, "title": "a few words naming what that era was about", "blurb": "one short sentence"}}. The name must fit EVERYTHING in that era, not just its first chapter.
+- "eras": one entry per era above, each {{"n": <its number>, "title": "a few words naming what that era was about", "blurb": "one short sentence"}}. The name must fit EVERYTHING in that era, not just its first entry.
 
 Reply with ONE JSON object with exactly those four keys.
 
@@ -894,13 +923,17 @@ def build_story(
         store.put(story_key, story)
 
     if key:
-        _set_progress(key, phase="finding the shape of it", done=len(batches))
+        _set_progress(key, phase="taking in the whole timeline", done=len(batches))
     story = _assemble(kept, produced, placement, story_key, tone, existing, by_sha, choice, left_behind, partial=False)
+    # The coarse story: the WHOLE history in eras, named in one call. Independent of how much
+    # has been written out, so the reader always sees where the project has been, even on a
+    # first build that only detailed the last week.
+    eras = _era_rows(segment_episodes(stats, sha_paths))
     try:
-        arc = _ask(choice, _arc_prompt(story["chapters"], tone, repo_name or story_key), _ARC_TIMEOUT_SECONDS) or {}
+        overview = _ask(choice, _overview_prompt(eras, tone, repo_name or story_key), _ARC_TIMEOUT_SECONDS) or {}
     except StoryError:
-        arc = {}  # the chapters are the story; a missing arc must never lose them
-    _apply_arc(story, arc, existing)
+        overview = {}  # the chapters are the story; a missing overview must never lose them
+    _apply_overview(story, eras, overview, existing)
     store.put(story_key, story)
     if key:
         _set_progress(key, phase="done", done=len(batches) + 1, chapters=len(story["chapters"]))
@@ -943,28 +976,27 @@ def _assemble(
             bool(left_behind) if placement != "append" else bool(existing and existing.get("more_earlier"))
         ),
     }
-    for field_name in ("title", "tagline", "arc", "acts"):
+    for field_name in ("title", "tagline", "arc", "eras"):
         if existing and existing.get(field_name):
             story[field_name] = existing[field_name]
     return story
 
 
-def _apply_arc(story: dict[str, Any], arc: dict, existing: dict | None) -> None:
-    chapters = story["chapters"]
-    title = _text(arc.get("title"), 120)
+def _apply_overview(story: dict[str, Any], eras: list[dict], overview: dict, existing: dict | None) -> None:
+    """Fold the overview call's answer into the story: the whole-project title and arc, and a
+    NAME for each era whose boundaries and numbers we computed."""
+    title = _text(overview.get("title"), 120)
     if title:
         story["title"] = title
-    tagline = _text(arc.get("tagline"), 240)
+    tagline = _text(overview.get("tagline"), 240)
     if tagline:
         story["tagline"] = tagline
-    arc_text = _text(arc.get("arc"), 400)
+    arc_text = _text(overview.get("arc"), 400)
     if arc_text:
         story["arc"] = arc_text
-    # The boundaries are ours (act_slices); the agent only names each era, so a title can
-    # never drift onto chapters it does not cover.
-    slices = act_slices(chapters)
+
     named: dict[int, dict] = {}
-    raw_eras = arc.get("eras") if isinstance(arc.get("eras"), list) else arc.get("acts")
+    raw_eras = overview.get("eras") if isinstance(overview.get("eras"), list) else overview.get("acts")
     for item in raw_eras if isinstance(raw_eras, list) else []:
         if not isinstance(item, dict):
             continue
@@ -972,29 +1004,27 @@ def _apply_arc(story: dict[str, Any], arc: dict, existing: dict | None) -> None:
             number = int(item.get("n") or item.get("era") or 0)
         except (TypeError, ValueError):
             continue
-        if 1 <= number <= len(slices):
+        if 1 <= number <= len(eras):
             named[number] = item
-    acts = []
     used: set[str] = set()
-    for number, (start, end) in enumerate(slices, start=1):
+    rows = []
+    for number, era in enumerate(eras, start=1):
         item = named.get(number, {})
-        title = _text(item.get("title"), 90) or f"{chapters[start].get('when', '')} onward"
-        acts.append(
+        label = _text(item.get("title"), 90) or f"{era['when']} to {era['until']}"
+        rows.append(
             {
-                "id": _unique_id(_slug(title, f"act-{number}"), used),
-                "title": title,
+                "id": _unique_id(_slug(label, f"era-{number}"), used),
+                "n": number,
+                "title": label,
                 "blurb": _text(item.get("blurb"), 220),
-                "start_id": chapters[start].get("id", ""),
-                "end_id": chapters[end].get("id", ""),
-                "chapters": end - start + 1,
-                "from": chapters[start].get("from", 0),
-                "to": chapters[end].get("to", 0),
+                **{key: era[key] for key in ("from", "to", "when", "until", "commits", "ins", "del", "turns", "spark")},
             }
         )
-    if acts:
-        story["acts"] = acts
-    elif existing and existing.get("acts"):
-        story["acts"] = existing["acts"]
+    if rows:
+        story["eras"] = rows
+    elif existing and existing.get("eras"):
+        story["eras"] = existing["eras"]
+    story.pop("acts", None)  # superseded by eras, which cover the whole history
     story["partial"] = False
 
 
@@ -1444,27 +1474,31 @@ h2.section{font-size:13px;letter-spacing:1.5px;text-transform:uppercase;color:va
 .shape{display:flex;align-items:center;gap:10px;margin:9px 0 0;flex-wrap:wrap}
 .bar{display:flex;height:6px;border-radius:3px;overflow:hidden;background:var(--panel2);
   flex:1;min-width:120px;max-width:280px}
-.bar i{display:block;height:100%;width:0;transition:width .7s cubic-bezier(.2,.8,.2,1)}
+.bar i{display:block;height:100%;width:var(--w);transition:width .7s cubic-bezier(.2,.8,.2,1)}
 .bar .add{background:var(--phosphor)} .bar .rem{background:var(--bad)}
-.in .bar i{width:var(--w)}
 .dots{display:flex;gap:3px;align-items:center}
-.dots i{width:5px;height:5px;border-radius:50%;background:var(--phosphor-dim);opacity:0;
-  transform:scale(.4);transition:opacity .3s,transform .3s}
-.in .dots i{opacity:.85;transform:none}
+.dots i{width:5px;height:5px;border-radius:50%;background:var(--phosphor-dim);opacity:.85}
 .dots i.big{background:var(--phosphor)}
 .dots span{font-size:11px;color:var(--fg-dim);margin-left:2px}
 .spark{display:flex;align-items:flex-end;gap:2px;height:28px}
 .spark i{width:6px;background:linear-gradient(180deg,var(--phosphor),var(--phosphor-dim));
-  border-radius:1px;height:2px;transition:height .6s cubic-bezier(.2,.8,.2,1)}
-.in .spark i{height:var(--h)}
+  border-radius:1px;height:var(--h);transition:height .6s cubic-bezier(.2,.8,.2,1)}
+.era{display:flex;gap:14px;align-items:flex-start;padding:12px 0;border-bottom:1px dashed var(--line)}
+.era .eran{font-family:var(--display);font-size:26px;line-height:1;color:var(--amber-dim);min-width:24px}
+.era.has .eran{color:var(--amber)}
+.era .erabody{flex:1;min-width:0}
+.era h3{margin:0 0 3px;font-size:16px;color:var(--fg)}
+.era .sum{margin:0}
+.era .lit{color:var(--phosphor-dim)}
+.morewrap{display:flex;gap:10px;flex-wrap:wrap;margin:16px 0 0}
 .actmeta{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-top:8px;
   color:var(--fg-dim);font-size:11.5px}
 
 /* Reveal on scroll, once, and only when motion is welcome. */
-.ch,.act{opacity:1}
-body.anim .ch,body.anim .act{opacity:0;transform:translateY(14px);
+.ch,.era{opacity:1}
+body.anim .ch,body.anim .era{opacity:0;transform:translateY(14px);
   transition:opacity .45s ease,transform .45s cubic-bezier(.2,.8,.2,1)}
-body.anim .ch.in,body.anim .act.in{opacity:1;transform:none}
+body.anim .ch.in,body.anim .era.in{opacity:1;transform:none}
 
 /* Waiting states: never an empty page with no explanation. */
 .skel{display:grid;gap:12px;margin-top:12px}
@@ -1581,7 +1615,7 @@ __BACKTRACE_BANNER__
     <div class="row" id="actions">
       <button class="gobtn" id="write">&#10024; write the story</button>
       <button class="btn" id="extend" hidden>&#10133; add the new chapters</button>
-      <button class="btn" id="earlier" hidden>&#8617; go further back</button>
+      <button class="btn" id="earlier" hidden>&#8617; write earlier chapters</button>
       <button class="btn" id="rewrite" hidden>&#8635; tell it again</button>
       <button class="btn small" id="forget" hidden>forget this story</button>
     </div>
@@ -1609,7 +1643,12 @@ __BACKTRACE_BANNER__
 
   <div id="loading" class="loading"><span class="spin"></span><span>reading the story…</span></div>
   <div id="skeleton" class="skel" hidden><div></div><div></div><div></div></div>
+  <div id="eras" hidden></div>
   <div id="timeline"></div>
+  <div id="morewrap" class="morewrap" hidden>
+    <button class="btn" id="more-chapters">show earlier chapters</button>
+    <button class="btn" id="earlier2">&#8617; write the chapters before these</button>
+  </div>
 
   <div class="outline" id="outlinewrap" hidden>
     <h2 class="section" id="outlinehead">the shape of it</h2>
@@ -1628,9 +1667,14 @@ const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const REDUCED = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
+// How many chapters are on screen at once. A page that opens with forty-five of them is a
+// wall, not a story; the rest are one click away. Declared HERE, above `state`, which reads
+// it: a `const` is not hoisted, so declaring it further down killed the whole script.
+const PAGE_CHAPTERS = 8;
+
 const state = {
   data: null, story: null, tone: "playful", branch: "", open: new Set(), told: new Set(),
-  poll: null, cinema: false, cineTimer: null, cursor: -1, building: false
+  poll: null, cinema: false, cineTimer: null, cursor: -1, building: false, shown: PAGE_CHAPTERS
 };
 
 // ------------------------------------------------------------------ helpers
@@ -1705,7 +1749,9 @@ function render(){
   renderBranches();
   renderHero();
   renderStudio();
+  renderEras();
   renderTimeline();
+  revealAll();
   renderOutline();
   renderEngine();
   renderBuild(d.building);
@@ -1759,6 +1805,7 @@ function renderHero(){
 
 function renderStudio(){
   const d = state.data, s = state.story, m = d.meta || {};
+  void s;
   const has = !!(s && s.chapters && s.chapters.length);
   const engineBroken = !!(d.engine && d.engine.error);
   $("write").hidden = has;
@@ -1772,48 +1819,69 @@ function renderStudio(){
   if (engineBroken)
     hint = "No coding agent backend is configured here, so nobody can write the story yet. Run an aGiTrack session in this repo, or set learning_backend in .agitrack/config.json. The outline below is built from the commits themselves and needs no agent.";
   else if (!has)
-    hint = "Your coding agent reads the commits and the prompts behind them, then lays out the story of this " +
-           (d.backtrace ? "reconstructed history" : "branch") + " as chapters. That takes a couple of minutes; " +
-           "each chapter is then written out the first time you open it, so you only pay for what you read. " +
-           "Everything is stored in .agitrack/story.json.";
+    hint = "Your agent reads this " + (d.backtrace ? "reconstructed history" : "branch") + " twice: once over the " +
+           "whole timeline for the five parts above, and once over the most recent stretch for chapters you can open. " +
+           "About half a minute. Each chapter is then written out the first time you open it, and everything is " +
+           "stored in .agitrack/story.json, so you only ever pay for what you read.";
   else
     hint = "Open a chapter and your agent writes it out (once, then it is stored). " +
-           (m.uncovered ? m.uncovered + " commit" + (m.uncovered === 1 ? " has" : "s have") + " landed since this story was written." : "The story covers everything on this branch.");
+           (m.uncovered ? m.uncovered + " commit" + (m.uncovered === 1 ? " has" : "s have") + " landed since this story was written. " : "") +
+           (s && s.more_earlier ? "Earlier chapters are written on request: the five parts above already cover the whole project." : "");
   $("studiohint").textContent = hint;
 }
 
-function actMap(){
-  const s = state.story, map = {};
-  ((s && s.acts) || []).forEach((a, i) => { if (a.start_id) map[a.start_id] = Object.assign({n: i + 1}, a); });
-  return map;
+// The whole project, coarse: one row per era, newest first, each with its span, size and the
+// shape of the work inside it. This is complete even when only the last week has chapters.
+function renderEras(){
+  const s = state.story, host = $("eras");
+  const eras = (s && s.eras) || [];
+  host.hidden = !eras.length;
+  if (!eras.length) return;
+  const told = new Set(((s && s.chapters) || []).map(c => c.id));
+  host.innerHTML = '<h2 class="section">the whole story, in five parts</h2>' +
+    eras.slice().reverse().map(era => {
+      const covered = ((s.chapters || []).filter(c => c.from >= era.from && c.to <= era.to)).length;
+      return '<div class="era' + (covered ? " has" : "") + '">' +
+        '<div class="eran">' + era.n + "</div>" +
+        '<div class="erabody"><h3>' + esc(era.title) + "</h3>" +
+        (era.blurb ? '<p class="sum">' + esc(era.blurb) + "</p>" : "") +
+        '<div class="actmeta">' + sparkHtml(era.spark) +
+          "<span>" + esc(era.when) + " &rarr; " + esc(era.until) + "</span>" +
+          "<span>" + era.commits + " commits</span>" +
+          (covered ? '<span class="lit">' + covered + " chapter" + (covered === 1 ? "" : "s") + " written</span>" : "") +
+        "</div></div></div>";
+    }).join("");
+  void told;
+}
+
+function sparkHtml(sizes){
+  const values = (sizes || []).map(v => Math.max(1, Number(v) || 0));
+  if (!values.length) return "";
+  // Square-root scale: one 17,000-line stretch beside a dozen 300-line ones flattens a
+  // linear sparkline into a dashed line.
+  const peak = Math.sqrt(Math.max.apply(null, values));
+  const bars = values.slice(-28).map((size, i) =>
+    '<i style="--h:' + Math.max(4, Math.round(28 * Math.sqrt(size) / peak)) + "px;transition-delay:" + (i * 20) + 'ms"></i>').join("");
+  return '<span class="spark">' + bars + "</span>";
 }
 
 // The story is stored oldest-first (that is the order it was written in) and read
 // NEWEST-FIRST, like the dashboard's log: what happened lately is what people came for.
-// Acts are reversed as whole groups, so an act still introduces its own chapters.
 function renderTimeline(){
   const s = state.story, host = $("timeline");
-  if (!s || !s.chapters || !s.chapters.length) { host.innerHTML = ""; $("toolbar").hidden = true; return; }
+  const all = (s && s.chapters) || [];
+  if (!all.length) { host.innerHTML = ""; $("toolbar").hidden = true; $("morewrap").hidden = true; return; }
   $("toolbar").hidden = false;
-  const acts = actMap();
-  const groups = [];
-  s.chapters.forEach((c, i) => {
-    const act = acts[c.id];
-    if (act || !groups.length) groups.push({act: act || null, chapters: []});
-    groups[groups.length - 1].chapters.push({c: c, i: i});
-  });
-  let html = "";
-  groups.slice().reverse().forEach(group => {
-    if (group.act) {
-      html += '<div class="act"><div class="actno">act ' + group.act.n + "</div><h2>" + esc(group.act.title) + "</h2>" +
-              (group.act.blurb ? "<p>" + esc(group.act.blurb) + "</p>" : "") +
-              actMetaHtml(group) + "</div>";
-    }
-    html += '<div class="timeline">';
-    group.chapters.slice().reverse().forEach((entry, position) => { html += chapterHtml(entry.c, position); });
-    html += "</div>";
-  });
+  const newestFirst = all.slice().reverse();
+  const shown = newestFirst.slice(0, state.shown || PAGE_CHAPTERS);
+  let html = '<h2 class="section">chapter by chapter</h2><div class="timeline">';
+  shown.forEach((c, position) => { html += chapterHtml(c, position); });
+  html += "</div>";
   host.innerHTML = html;
+  const rest = newestFirst.length - shown.length;
+  $("morewrap").hidden = !rest;
+  if (rest) $("more-chapters").textContent = "show " + Math.min(rest, PAGE_CHAPTERS) + " earlier chapter" +
+    (Math.min(rest, PAGE_CHAPTERS) === 1 ? "" : "s") + " (" + rest + " more)";
   revealOnScroll(host);
   for (const id of state.open) {
     const el = document.getElementById("ch-" + id);
@@ -1824,11 +1892,17 @@ function renderTimeline(){
 // Cards appear as they are reached, not all at once on load (which fired for a hundred
 // chapters at the same moment, most of them off screen, and looked like a stutter).
 let _revealer = null;
+function revealAll(){
+  // Both sections, one observer: calling it per host disconnected the other's.
+  if (_revealer) _revealer.disconnect();
+  _revealer = null;
+  revealOnScroll(document.body);
+}
 function revealOnScroll(host){
   if (REDUCED) { document.body.classList.remove("anim"); return; }
   document.body.classList.add("anim");
   if (!("IntersectionObserver" in window)) {
-    host.querySelectorAll(".ch,.act").forEach(el => el.classList.add("in"));
+    host.querySelectorAll(".ch,.era").forEach(el => el.classList.add("in"));
     return;
   }
   if (_revealer) _revealer.disconnect();
@@ -1839,7 +1913,7 @@ function revealOnScroll(host){
       _revealer.unobserve(entry.target);   // one-shot: nothing re-animates on the way back
     }
   }, {rootMargin: "80px 0px"});
-  host.querySelectorAll(".ch,.act").forEach(el => _revealer.observe(el));
+  host.querySelectorAll(".ch,.era").forEach(el => _revealer.observe(el));
 }
 
 // A chapter's size, drawn: the split of what it added and removed, one dot per commit, and
@@ -1862,22 +1936,6 @@ function shapeHtml(st){
   }
   if (st.tokens) parts.push('<span class="fact">' + num(st.tokens) + " tokens</span>");
   return parts.length ? '<div class="shape">' + parts.join("") + "</div>" : "";
-}
-
-// An era at a glance: when it ran, how big it was, and the shape of the work inside it.
-function actMetaHtml(group){
-  const chapters = group.chapters.map(entry => entry.c);
-  const sizes = chapters.map(c => Math.max(1, ((c.stats || {}).ins || 0) + ((c.stats || {}).del || 0)));
-  // Square-root scale: one 17,000-line chapter beside a dozen 300-line ones flattens a
-  // linear sparkline into a dashed line. This keeps the big one biggest and the rest visible.
-  const peak = Math.sqrt(Math.max.apply(null, sizes));
-  const bars = sizes.map((size, i) =>
-    '<i style="--h:' + Math.max(4, Math.round(28 * Math.sqrt(size) / peak)) + "px;transition-delay:" + (i * 30) + 'ms"></i>').join("");
-  const commits = chapters.reduce((sum, c) => sum + (((c.stats || {}).commits) || 0), 0);
-  const first = chapters[0] || {}, last = chapters[chapters.length - 1] || {};
-  const span = first.when === last.when ? esc(first.when || "") : esc(first.when || "") + " &rarr; " + esc(last.when || "");
-  return '<div class="actmeta"><span class="spark" title="how big each chapter of this era was">' + bars + "</span>" +
-         "<span>" + span + "</span><span>" + chapters.length + " chapters &nbsp;·&nbsp; " + commits + " commits</span></div>";
 }
 
 function chapterHtml(c, i){
@@ -2092,6 +2150,7 @@ function renderBuild(p){
   if (p && p.error && !running) fail(p.error === "cancelled" ? "Stopped. The chapters already written are kept." : p.error);
   if (!running) { renderStudio(); return; }
   $("build-phase").textContent = p.phase || "working";
+  $("build-cancel").disabled = false;
   const pct = p.total ? Math.round(100 * Math.min(1, p.done / p.total)) : 5;
   $("build-bar").style.width = Math.max(5, pct) + "%";
   $("build-sub").textContent = (p.chapters || 0) + " chapter" + (p.chapters === 1 ? "" : "s") + " so far";
@@ -2111,21 +2170,35 @@ async function build(mode){
   } catch (e) { state.building = false; fail(e.message); renderStudio(); }
 }
 
+// While a build runs, only the things that CHANGED are touched. The poll used to re-render
+// the entire page every 2.5 seconds - hero, eras, every card - which flashed the whole
+// screen, threw away scroll position, restarted the reveal animations, and made the stop
+// button hard to hit.
 function startPolling(){
   stopPolling();
   state.poll = setInterval(async () => {
     try {
       const before = state.story ? (state.story.chapters || []).length : 0;
-      await load();
+      const url = "story/state" + (state.branch ? "?branch=" + encodeURIComponent(state.branch) : "");
+      const r = await fetch(url, {cache: "no-store"});
+      if (!r.ok) return;
+      const data = await r.json();
+      state.data = data;
+      state.story = data.story;
       const after = state.story ? (state.story.chapters || []).length : 0;
-      const p = state.data.building;
-      if (after > before && after) {
-        // A chapter landed while we watched: bring it into view, gently.
-        const last = state.story.chapters[after - 1];
-        const el = last && document.getElementById("ch-" + last.id);
-        if (el && !state.cinema) el.scrollIntoView({block: "center", behavior: REDUCED ? "auto" : "smooth"});
+      renderBuild(data.building);          // the bar, the phase, the counter: cheap, no reflow
+      if (after !== before) {              // ...and the timeline only when there is new story
+        $("skeleton").hidden = true;
+        renderHero();
+        renderEras();
+        renderTimeline();
       }
-      if (!p || !p.running) { stopPolling(); $("skeleton").hidden = true; if (after) celebrate(); }
+      if (!data.building || !data.building.running) {
+        stopPolling();
+        $("skeleton").hidden = true;
+        render();                          // one final, complete paint
+        if (after) celebrate();
+      }
     } catch (e) { /* a poll that fails is retried by the next one */ }
   }, 2500);
 }
@@ -2250,8 +2323,17 @@ $("forget").addEventListener("click", async () => {
   catch (e) { fail(e.message); }
 });
 $("build-cancel").addEventListener("click", async () => {
+  // Say so at once: the call in flight still has to come back, and a button that looks
+  // like it did nothing invites a second, third, fourth click.
+  $("build-phase").textContent = "stopping after the chapter being written…";
+  $("build-cancel").disabled = true;
   try { await post("story/cancel", {branch: state.branch}); } catch (e) {}
 });
+$("more-chapters").addEventListener("click", () => {
+  state.shown = (state.shown || PAGE_CHAPTERS) + PAGE_CHAPTERS;
+  renderTimeline();
+});
+$("earlier2").addEventListener("click", () => build("earlier"));
 $("play").addEventListener("click", playStory);
 $("expand-all").addEventListener("click", () => {
   // Only the chapters that are already written: with lazy writing, opening all of them

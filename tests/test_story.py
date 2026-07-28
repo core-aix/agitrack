@@ -10,6 +10,9 @@ of a batch may fall out of the story.
 from __future__ import annotations
 
 import json
+import re
+import shutil
+import subprocess
 import threading
 import time
 import urllib.error
@@ -208,6 +211,7 @@ def test_an_era_boundary_prefers_a_real_pause_in_the_work():
 
 def test_the_agent_only_names_the_eras(tmp_path, monkeypatch):
     repo = _repo_with_history(tmp_path, prompts=[f"step {i}" for i in range(8)])
+    monkeypatch.setattr(story, "_BATCH_EPISODES", 30)  # one batch covers this whole toy history
     stats, sha_paths = _view_of(repo)
     ordered = [stat.short for stat in story.story_stats(stats)]
     _fake_agent(
@@ -234,13 +238,14 @@ def test_the_agent_only_names_the_eras(tmp_path, monkeypatch):
         ],
     )
     built = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
-    acts = built["acts"]
-    assert [act["title"] for act in acts] == ["The beginning", "The rest"]
-    assert acts[0]["start_id"] == built["chapters"][0]["id"]  # the story always opens in act one
-    assert acts[-1]["end_id"] == built["chapters"][-1]["id"]  # ...and the last era runs to the end
-    assert sum(act["chapters"] for act in acts) == len(built["chapters"])  # every chapter is covered
+    eras = built["eras"]
+    assert [era["title"] for era in eras] == ["The beginning", "The rest"]
+    # The eras span the WHOLE history, whatever was written out: they are the coarse story.
+    assert eras[0]["from"] <= min(stat.timestamp for stat in story.story_stats(stats))
+    assert eras[-1]["to"] >= max(stat.timestamp for stat in story.story_stats(stats))
+    assert sum(era["commits"] for era in eras) == len(story.story_stats(stats))
     # An era the model forgot to name still gets a label rather than an empty heading.
-    assert all(act["title"] for act in acts)
+    assert all(era["title"] and era["spark"] for era in eras)
 
 
 # --------------------------------------------------------------------------- building
@@ -394,29 +399,18 @@ def test_extending_with_nothing_new_says_so(tmp_path, monkeypatch):
 
 
 def test_an_unusable_reply_is_retried_then_told_plainly(tmp_path, monkeypatch):
-    # Two batches: the first lands, the second comes back as prose twice. A stretch the model
-    # cannot tell must not cost the chapters around it, nor leave a hole in the timeline.
-    prompts = [f"step {i}" for i in range(14)]
-    repo = _repo_with_history(tmp_path, prompts=prompts, gap_days=1)
+    """A stretch the model cannot tell must not leave a hole in the timeline, and must not
+    cost the build."""
+    repo = _repo_with_history(tmp_path, prompts=[f"step {i}" for i in range(6)])
     stats, sha_paths = _view_of(repo)
-    ordered = [stat.short for stat in story.story_stats(stats)]
-    monkeypatch.setattr(story, "_BATCH_EPISODES", 8)
-    fake = _fake_agent(
-        monkeypatch,
-        [
-            _chapter_reply([{"id": "part-one", "title": "Part one", "summary": "s", "shas": ordered[:8]}]),
-            "here is a nice essay instead",
-            "still an essay",
-            _ARC,
-        ],
-    )
+    fake = _fake_agent(monkeypatch, ["here is a nice essay instead", "still an essay", _ARC])
+
     built = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
 
-    assert built["chapters"][0]["id"] == "part-one"
     auto = [chapter for chapter in built["chapters"] if chapter.get("auto")]
-    assert auto and auto[0]["shas"]  # the rest is told from the commits themselves
+    assert auto and auto[0]["shas"]  # told from the commits themselves
     assert "storyteller could not be reached" in auto[0]["summary"]
-    assert _RETRY_NUDGE_MARK in fake.prompts[2]  # ...after being told exactly what went wrong
+    assert _RETRY_NUDGE_MARK in fake.prompts[1]  # ...after being told exactly what went wrong
     told = {sha for chapter in built["chapters"] for sha in chapter["shas"]}
     assert told == {stat.sha for stat in story.story_stats(stats)}  # no hole in the timeline
 
@@ -425,102 +419,51 @@ _RETRY_NUDGE_MARK = "your previous answer could not be used"
 
 
 def test_a_backend_that_keeps_failing_stops_but_keeps_what_landed(tmp_path, monkeypatch):
-    prompts = [f"step {i}" for i in range(14)]
-    repo = _repo_with_history(tmp_path, prompts=prompts, gap_days=1)
+    """A build covers the newest stretch; reaching further back is a separate build. When that
+    one cannot run, the chapters already told have to survive it."""
+    repo = _repo_with_history(tmp_path, prompts=[f"step {i}" for i in range(14)], gap_days=1)
     stats, sha_paths = _view_of(repo)
     ordered = [stat.short for stat in story.story_stats(stats)]
-    monkeypatch.setattr(story, "_BATCH_EPISODES", 8)
+    monkeypatch.setattr(story, "_BATCH_EPISODES", 4)
+    _fake_agent(
+        monkeypatch,
+        [_chapter_reply([{"id": "newest", "title": "The newest stretch", "summary": "s", "shas": ordered[-4:]}]), _ARC],
+    )
+    first = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
+    assert [c["id"] for c in first["chapters"]] == ["newest"]
+    assert first["more_earlier"] is True  # there is older history, not yet told
+
     _fake_agent(
         monkeypatch,
         [
-            _chapter_reply([{"id": "part-one", "title": "Part one", "summary": "s", "shas": ordered[:8]}]),
             learn.LearnAgentError("the claude backend exited with code 1"),
             learn.LearnAgentError("the claude backend exited with code 1"),
         ],
     )
     with pytest.raises(story.StoryError, match="exited with code 1"):
-        story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
+        story.build_story(tmp_path, stats, sha_paths, branch="main", mode="earlier")
     stored = story.StoryStore(tmp_path).get("main")
-    assert [c["id"] for c in stored["chapters"]] == ["part-one"]
-    assert stored["partial"] is True  # and the page can say the telling is unfinished
+    assert [c["id"] for c in stored["chapters"]] == ["newest"]  # the told stretch is untouched
 
 
-def test_the_arc_call_failing_never_loses_the_chapters(tmp_path, monkeypatch):
-    repo = _repo_with_history(tmp_path, prompts=["a thing"])
+def test_a_build_covers_the_newest_stretch_not_the_whole_history(tmp_path, monkeypatch):
+    """Forty-five chapters in one go is a long wait and more than anyone reads at once. A
+    build tells the most recent stretch and says there is more behind it."""
+    repo = _repo_with_history(tmp_path, prompts=[f"step {i}" for i in range(14)], gap_days=1)
     stats, sha_paths = _view_of(repo)
-    shas = [stat.short for stat in story.story_stats(stats)]
-    _fake_agent(
+    ordered = [stat.short for stat in story.story_stats(stats)]
+    monkeypatch.setattr(story, "_BATCH_EPISODES", 4)
+    fake = _fake_agent(
         monkeypatch,
-        [_chapter_reply([{"id": "c1", "title": "A thing happened", "summary": "s", "shas": shas}]), "nonsense"],
-    )
-    built = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
-    assert [c["id"] for c in built["chapters"]] == ["c1"]
-    assert built["partial"] is False
-    assert "title" not in built or built["title"]  # no title is fine; a broken one is not
-
-
-def test_the_first_build_writes_headlines_only_and_a_chapter_is_written_when_opened(tmp_path, monkeypatch):
-    """Generation is lazy: covering a whole history must not cost a body for every chapter
-    nobody has read yet. The outline pass writes headlines; opening a chapter writes it out,
-    once, and stores it."""
-    repo = _repo_with_history(tmp_path, prompts=["teach it to stream", "now make it fast"])
-    stats, sha_paths = _view_of(repo)
-    shas = [stat.short for stat in story.story_stats(stats)]
-    outline_fake = _fake_agent(
-        monkeypatch,
-        [_chapter_reply([{"id": "streaming", "title": "It learns to stream", "summary": "s", "shas": shas}]), _ARC],
+        [_chapter_reply([{"id": "newest", "title": "Lately", "summary": "s", "shas": ordered[-4:]}]), _ARC],
     )
     built = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
 
-    chapter = built["chapters"][0]
-    assert chapter["title"] and chapter["summary"]  # the headline is there...
-    assert chapter["detail"] == "" and chapter["thoughts"] == []  # ...and nothing was paid for below it
-    assert len(outline_fake.prompts) == 2  # one outline call for the whole history, one arc call
-    assert "Headlines only." in outline_fake.prompts[0]
-
-    expand_fake = _fake_agent(
-        monkeypatch,
-        [
-            json.dumps(
-                {
-                    "detail": "Reading the whole file was the problem.",
-                    "thoughts": [{"sha": shas[1], "note": "They wanted it incremental."}],
-                }
-            )
-        ],
-    )
-    answer = story.expand_chapter(tmp_path, stats, sha_paths, branch="main", chapter_id="streaming")
-    assert answer["chapter"]["detail"].startswith("Reading the whole file")
-    assert answer["chapter"]["thoughts"][0]["quote"] == "teach it to stream"  # the real prompt, again
-    assert len(expand_fake.prompts) == 1
-    assert "It learns to stream" in expand_fake.prompts[0]  # the headline rides along, unchanged
-
-    # Persisted, so re-opening it later costs nothing at all.
-    stored = story.StoryStore(tmp_path).get("main")["chapters"][0]
-    assert stored["detail"] and stored["thoughts"]
-    again = story.expand_chapter(tmp_path, stats, sha_paths, branch="main", chapter_id="streaming")
-    assert again["chapter"]["detail"] == stored["detail"]
-    assert len(expand_fake.prompts) == 1  # no second call
-
-
-def test_opening_a_chapter_that_is_no_longer_in_the_story_says_so(tmp_path, monkeypatch):
-    repo = _repo_with_history(tmp_path, prompts=["only thing"])
-    stats, sha_paths = _view_of(repo)
-    assert "no story" in story.expand_chapter(tmp_path, stats, sha_paths, branch="main", chapter_id="x")["error"]
-    shas = [stat.short for stat in story.story_stats(stats)]
-    _fake_agent(monkeypatch, [_chapter_reply([{"id": "c1", "title": "It", "summary": "s", "shas": shas}]), _ARC])
-    story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
-    answer = story.expand_chapter(tmp_path, stats, sha_paths, branch="main", chapter_id="gone")
-    assert "no longer part of the story" in answer["error"]
-
-
-def test_the_chapter_route_is_wired(tmp_path, monkeypatch):
-    repo = _repo_with_history(tmp_path, prompts=["one"])
-    stats, sha_paths = _view_of(repo)
-    answer = story.handle_story_post(
-        "/story/chapter", {"branch": "main", "id": "nope"}, root=tmp_path, view=lambda b: (stats, sha_paths)
-    )
-    assert answer and "error" in answer
+    assert len(fake.prompts) == 2  # ONE outline call plus the whole-history overview
+    assert built["more_earlier"] is True
+    assert built["covered"] < len(ordered)
+    # ...and the coarse story still spans everything, including what has no chapters yet.
+    assert sum(era["commits"] for era in built["eras"]) == len(ordered)
 
 
 # --------------------------------------------------------------------------- background
@@ -624,8 +567,11 @@ def test_the_page_paints_without_any_story(tmp_path):
     assert "@media (max-width:640px)" in html
     # The numbers are drawn, not described: a bar for what a chapter moved, a dot per commit,
     # a sparkline per era, and a waiting state whenever content is not there yet.
-    assert "function shapeHtml" in html and "function actMetaHtml" in html
+    assert "function shapeHtml" in html and "function sparkHtml" in html
     assert 'id="loading"' in html and 'id="skeleton"' in html
+    # The coarse story (every era, always complete) and only a handful of chapters at once.
+    assert 'id="eras"' in html and "function renderEras" in html
+    assert "const PAGE_CHAPTERS = 8" in html and 'id="more-chapters"' in html
     # Cards appear as they are reached; they used to all animate at once on load.
     assert "IntersectionObserver" in html and "rootMargin" in html
     assert ".outline .num{flex-basis:100%}" in html
@@ -728,3 +674,53 @@ def test_the_backtrace_dashboard_serves_its_own_storyline(monkeypatch, tmp_path)
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+# --------------------------------------------------------------------------- the script
+
+
+_DOM_STUB = """
+const noop = () => {};
+function stubEl() {
+  return {
+    addEventListener: noop, removeEventListener: noop, remove: noop, appendChild: noop,
+    insertBefore: noop, querySelector: () => stubEl(), querySelectorAll: () => [],
+    classList: {add: noop, remove: noop, toggle: noop, contains: () => false},
+    style: {}, dataset: {}, textContent: "", innerHTML: "", hidden: false, value: "",
+    options: [], children: [], parentNode: {insertBefore: noop}, scrollIntoView: noop,
+    getBoundingClientRect: () => ({top: 0, bottom: 0, right: 0, width: 0}),
+    animate: () => ({cancel: noop}), closest: () => null, focus: noop, click: noop, disabled: false,
+  };
+}
+global.document = {
+  getElementById: () => stubEl(), querySelector: () => stubEl(), querySelectorAll: () => [],
+  createElement: () => stubEl(), addEventListener: noop, body: stubEl(),
+  documentElement: stubEl(), head: Object.assign(stubEl(), {insertAdjacentHTML: noop}),
+};
+global.window = {
+  matchMedia: () => ({matches: false}), addEventListener: noop,
+  location: {hash: "", origin: "x"},
+  IntersectionObserver: function () { this.observe = noop; this.disconnect = noop; this.unobserve = noop; },
+};
+global.IntersectionObserver = global.window.IntersectionObserver;
+global.fetch = () => new Promise(() => {});
+global.history = {replaceState: noop, length: 1};
+global.performance = {now: () => 0};
+global.requestAnimationFrame = noop;
+global.setInterval = () => 0; global.clearInterval = noop;
+global.setTimeout = () => 0; global.clearTimeout = noop;
+try { new Function(SOURCE)(); } catch (e) { console.log(e.constructor.name + ": " + e.message); process.exit(1); }
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs node to evaluate the page script")
+def test_the_page_script_runs(tmp_path):
+    """The whole page is one inline script: anything that throws at its top level takes the
+    entire page with it, and the result looks exactly like a server that never answered. A
+    `const` declared below the object that reads it did precisely that (the state object read
+    PAGE_CHAPTERS, which was declared 200 lines further down: ReferenceError, blank page)."""
+    source = re.findall(r"<script>(.*?)</script>", story.story_html(tmp_path), re.S)[-1]
+    script = tmp_path / "page.js"
+    script.write_text("const SOURCE = " + json.dumps(source) + ";\n" + _DOM_STUB, encoding="utf-8")
+    result = subprocess.run([shutil.which("node"), str(script)], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, f"the story page script threw: {result.stdout.strip() or result.stderr.strip()}"
