@@ -8470,39 +8470,49 @@ class ProxyRunner:
         # PageUp/PageDown also scroll. Consumed events are stripped from input.
         if self.child_mouse:
             return data
+        # Every scroll event in this chunk moves the view; the SCREEN is painted once at the
+        # end. A trackpad flick arrives as one read holding hundreds of wheel reports, and
+        # painting each of them was the whole cost (see ScreenRenderer.scroll).
+        delta = 0
         page = max(self.rows - 2, 1)
         for match in _PAGE_KEY_RE.finditer(data):
-            self._scroll(page if match.group(1) == b"5" else -page)
+            delta += page if match.group(1) == b"5" else -page
         data = _PAGE_KEY_RE.sub(b"", data)
         if b"\x1b[<" in data:
             for match in _SGR_MOUSE_EVENT_RE.finditer(data):
-                self._handle_mouse(int(match.group(1)), int(match.group(2)), int(match.group(3)), match.group(4))
+                delta += self._mouse_scroll_delta(int(match.group(1)))
             data = _SGR_MOUSE_RE.sub(b"", data)
         if b"\x1b[M" in data:
             # Legacy X10 reports (terminals that ignored ?1006). The three bytes are button,
             # column, row each offset by 32; the offset button matches the SGR button numbers
-            # _handle_mouse expects (wheel = 64/65), so the wheel still scrolls. Strip them so
-            # the raw coordinate bytes don't leak into the backend's input.
+            # (wheel = 64/65), so the wheel still scrolls. Strip them so the raw coordinate
+            # bytes don't leak into the backend's input.
             for match in _X10_MOUSE_RE.finditer(data):
-                report = match.group()
-                self._handle_mouse(report[3] - 32, report[4] - 32, report[5] - 32, b"M")
+                delta += self._mouse_scroll_delta(match.group()[3] - 32)
             data = _X10_MOUSE_RE.sub(b"", data)
+        if delta:
+            self._scroll(delta)
         return data
 
-    def _handle_mouse(self, button: int, col: int, row: int, kind: bytes) -> None:
-        # Only the wheel is aGiTrack's to act on (history scrollback for a backend that
-        # doesn't drive the mouse itself, e.g. Claude). Left-button press/drag/release are
-        # deliberately left alone so the TERMINAL owns text selection.
-        #
-        # aGiTrack used to drag-select-and-copy here, but that path only ever ran in
-        # terminals that forward a plain drag to the application (mouse mode 1000) — and
-        # there it both SUPPRESSED the terminal's native selection and popped an unwanted
-        # "Copied N char(s) to clipboard" message (#112). Terminals that select natively
-        # never forward the drag, so they never hit this code and are unaffected; dropping
-        # it removes only the harmful case. The mouse bytes are still stripped from the
-        # input forwarded to the backend by _intercept_scroll.
-        if button & 64:  # wheel
-            self._scroll(-3 if button & 1 else 3)
+    @staticmethod
+    def _mouse_scroll_delta(button: int) -> int:
+        """How far this mouse report scrolls the view: 3 lines per wheel notch, 0 for
+        anything else.
+
+        Only the wheel is aGiTrack's to act on (history scrollback for a backend that doesn't
+        drive the mouse itself, e.g. Claude). Left-button press/drag/release are deliberately
+        left alone so the TERMINAL owns text selection.
+
+        aGiTrack used to drag-select-and-copy here, but that path only ever ran in terminals
+        that forward a plain drag to the application (mouse mode 1000), and there it both
+        SUPPRESSED the terminal's native selection and popped an unwanted "Copied N char(s)
+        to clipboard" message (#112). Terminals that select natively never forward the drag,
+        so they never hit this code and are unaffected; dropping it removes only the harmful
+        case. The mouse bytes are still stripped from the input forwarded to the backend by
+        _intercept_scroll."""
+        if not button & 64:  # not the wheel
+            return 0
+        return -3 if button & 1 else 3
 
     def _selection_ranges(self) -> dict[int, tuple[int, int]]:
         return ScreenRenderer.selection_ranges(self, self.cols)
@@ -8531,7 +8541,12 @@ class ProxyRunner:
         return ScreenRenderer.history_len(self)
 
     def _scroll(self, delta: int) -> None:
-        ScreenRenderer.scroll(self, delta, self._render)
+        # Scrolling paints at most one frame per RENDER_MIN_INTERVAL, exactly like backend
+        # output. When a frame is skipped the repaint is owed, so flag it and wake the loop:
+        # the last event of a flick must still land on screen, not wait for the next keypress.
+        if ScreenRenderer.scroll(self, delta, self._render, min_interval=self.RENDER_MIN_INTERVAL):
+            self._render_pending = True
+            self._wake_main_loop()
 
     def _visible_lines(self) -> list:
         return ScreenRenderer.visible_lines(self, self.rows)
@@ -8559,8 +8574,8 @@ class ProxyRunner:
     def history_len(self) -> int:
         return ScreenRenderer.history_len(self)
 
-    def scroll(self, delta: int, render_fn) -> None:
-        ScreenRenderer.scroll(self, delta, render_fn)
+    def scroll(self, delta: int, render_fn, *, min_interval: float = 0.0) -> bool:
+        return ScreenRenderer.scroll(self, delta, render_fn, min_interval=min_interval)
 
     def visible_lines(self, rows: int) -> list:
         return ScreenRenderer.visible_lines(self, rows)

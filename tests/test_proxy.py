@@ -1,3 +1,4 @@
+import errno
 import os
 import sys
 import threading
@@ -2549,6 +2550,48 @@ def test_wheel_scrolls_history_and_strips_mouse_when_backend_has_no_mouse():
     assert runner.scroll_back == 3
 
 
+def test_a_scroll_burst_paints_one_frame_not_one_per_event():
+    """A trackpad flick arrives as ONE read holding hundreds of wheel reports. Painting each
+    of them meant hundreds of full-screen frames and megabytes pushed at the terminal through
+    a blocking write, which stalls the reactor and looks exactly like aGiTrack hanging
+    ("dies when scrolling extensively"). The whole chunk must move the view once."""
+    runner = _history_runner()
+    frames = []
+    runner._render = lambda: frames.append(runner.scroll_back)
+
+    assert runner._intercept_scroll(b"\x1b[<64;5;5M" * 60) == b""  # consumed, nothing forwarded
+    assert len(frames) == 1  # one frame for the whole flick...
+    assert frames[0] == runner.scroll_back  # ...painted AFTER the full movement
+    assert runner.scroll_back == runner._history_len()  # 60 notches, clamped at the top
+    # Mixed directions inside one chunk cancel out the way the user's fingers meant them to:
+    # 10 down (-30) and 4 up (+12) is a net 18 lines back toward the live view.
+    frames.clear()
+    runner.scroll_back = 20
+    runner._last_render = 0.0  # a frame is due again
+    runner._intercept_scroll(b"\x1b[<65;5;5M" * 10 + b"\x1b[<64;5;5M" * 4)
+    assert len(frames) == 1 and runner.scroll_back == 2
+
+
+def test_a_sustained_scroll_is_held_to_the_frame_budget():
+    """Chunk after chunk (a long continuous scroll) must not paint faster than backend output
+    does. A skipped frame is still OWED: it is flagged for the main loop, so the last event of
+    a flick always lands on screen."""
+    runner = _history_runner()
+    frames = []
+    runner._render = lambda: frames.append(1)
+    runner._last_render = time.monotonic()  # a frame just went out
+    runner._render_pending = False
+
+    runner._intercept_scroll(b"\x1b[<64;5;5M")
+    assert frames == []  # too soon: not painted...
+    assert runner._render_pending is True  # ...but scheduled, and the view already moved
+    assert runner.scroll_back == 3
+
+    runner._last_render = time.monotonic() - 1  # a frame's worth of time passes
+    runner._intercept_scroll(b"\x1b[<64;5;5M")
+    assert len(frames) == 1 and runner._render_pending is False
+
+
 def test_x10_mouse_reports_are_stripped_and_wheel_scrolls():
     # Terminals that ignore SGR mouse mode (?1006) — some tmux configs, the native Windows
     # console — send legacy X10 reports (ESC [ M + three offset bytes) even though aGiTrack
@@ -2607,6 +2650,43 @@ def _paint_runner():
     runner.input = types.SimpleNamespace(capturing=False)
     runner._status_line = lambda: "STATUS".ljust(8)
     return runner
+
+
+def test_a_frame_the_terminal_only_half_accepts_is_written_out_in_full(monkeypatch):
+    """A tty may accept only part of a write (its buffer fills, or a signal lands), and half
+    a frame is half an ESCAPE SEQUENCE: the terminal is then stuck in whatever mode the cut
+    sequence implied. Under a repaint storm that is how the screen becomes unrecoverable."""
+    runner = _paint_runner()
+    chunks = []
+
+    def stingy_write(fd, data):
+        chunks.append(data)
+        return min(len(data), 16)  # the terminal takes 16 bytes at a time
+
+    monkeypatch.setattr(os, "write", stingy_write)
+    runner.stream.feed(b"\x1b[Hr0\r\nr1\r\nr2")
+    runner._render()
+
+    assert len(chunks) > 1  # it kept going instead of dropping the tail
+    out = b"".join(chunk[:16] for chunk in chunks).decode()
+    assert out.startswith("\x1b[?2026h") and out.endswith("\x1b[?2026l")  # the frame is whole
+
+
+def test_a_terminal_that_went_away_does_not_take_the_session_down(monkeypatch):
+    """Closed window, dropped SSH: the frame write fails. Dropping the frame is right; a
+    traceback out of the middle of a redraw is not (the reactor notices the pty and exits
+    the normal way)."""
+    runner = _paint_runner()
+    calls = []
+
+    def dead_write(fd, data):
+        calls.append(data)
+        raise OSError(errno.EIO, "Input/output error")
+
+    monkeypatch.setattr(os, "write", dead_write)
+    runner.stream.feed(b"hello")
+    runner._render()  # must not raise
+    assert calls  # it did try
 
 
 def test_render_wraps_frame_in_synchronized_update(monkeypatch):

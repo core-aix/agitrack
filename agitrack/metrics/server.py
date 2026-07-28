@@ -27,6 +27,7 @@ from typing import Any, Callable, TypeVar
 
 from agitrack.git import GitRepo
 from agitrack.metrics import learn as learn_page
+from agitrack.metrics import story as story_page
 from agitrack.metrics.collect import Dashboard, build_dashboard
 from agitrack.metrics.files import FileBrowser, git_browser
 from agitrack.metrics.insights import build_insights, context_from_browser
@@ -237,6 +238,15 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
             self._respond("application/json", self._json(payload))
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             pass
+
+    def _story_view(self, branch: str) -> tuple[list, dict]:
+        """The commits (and which files each touched) the storyline is told from: this
+        branch's whole history, unfiltered. The story is about the project, not about a
+        dashboard filter, so no author/period narrowing applies here."""
+        ref = self._ref(branch)
+        dash = self._dashboard(ref)
+        _files, sha_paths = context_from_browser(self._browser(ref), dash.stats)
+        return dash.stats, sha_paths
 
     def _learn_view(self, author: str, frm: int, to: int, branch: str) -> tuple[list, list[dict], list[dict]]:
         """The filtered stats + insights + file rows the learning agent's digest is built
