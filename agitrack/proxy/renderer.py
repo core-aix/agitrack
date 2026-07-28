@@ -31,6 +31,36 @@ _DCS_RE = re.compile(rb"\x1bP.*?\x1b\\", re.DOTALL)
 _BOLD_MARKUP_RE = re.compile(r"\*\*(.+?)\*\*")
 
 
+def write_frame(payload: bytes) -> None:
+    """Write one rendered frame to the terminal, whole.
+
+    ``os.write`` on a tty is allowed to write SHORT (the driver's buffer fills, or a signal
+    lands mid-write), and a frame cut in half is a cut ESCAPE SEQUENCE: the terminal is then
+    left in whatever mode the truncated sequence implied, which is how a repaint storm ends
+    in a screen nobody can get back. So loop until it is all out.
+
+    A terminal that has gone away (closed window, dropped SSH) surfaces as EPIPE/EIO here.
+    That is not an error worth a traceback in the middle of a redraw: drop the frame and let
+    the reactor notice the pty is gone and shut down the normal way."""
+    # Sliced as bytes rather than through a memoryview: the whole frame goes out in one
+    # write on any healthy terminal, so the copy only happens in the rare short-write case,
+    # and callers (and test stubs) always see plain bytes.
+    while payload:
+        try:
+            written = os.write(sys.stdout.fileno(), payload)
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        except OSError as error:  # the controlling terminal is gone
+            import errno
+
+            if error.errno in (errno.EIO, errno.EBADF, errno.ENXIO):
+                return
+            raise
+        if not written:
+            return
+        payload = payload[written:]
+
+
 def _markup_words(line: str) -> list[tuple[str, bool]]:
     """Split *line* into ``(word, bold)`` tokens, dropping the ``**`` markers. Bold
     runs are assumed to fall on whole-word boundaries (true for aGiTrack's notices)."""
@@ -575,15 +605,30 @@ class ScreenRenderer:
         history = getattr(self.screen, "history", None)
         return len(history.top) if history is not None else 0
 
-    def scroll(self: RendererHost, delta: int, render_fn) -> None:
+    def scroll(self: RendererHost, delta: int, render_fn, *, min_interval: float = 0.0) -> bool:
+        """Move the view ``delta`` lines through history. Returns whether a repaint is still
+        owed (the caller then flags ``_render_pending`` and lets the main loop paint it).
+
+        ``min_interval`` puts scrolling on the SAME frame budget as backend output. Without
+        it every wheel event painted the whole screen immediately: a single trackpad flick
+        (hundreds of events) meant hundreds of full frames and megabytes written to the
+        terminal through a BLOCKING ``os.write``, which stalls the reactor, backs up the
+        backend's pty, and looks exactly like aGiTrack hanging."""
         new_back = max(0, min(self.scroll_back + delta, self.history_len()))
-        if new_back != self.scroll_back:
-            self.scroll_back = new_back
-            # Selection coordinates refer to the displayed view, which just
-            # shifted; drop any in-progress selection.
-            self.sel_active = False
-            self.sel_anchor = self.sel_point = None
-            render_fn()
+        if new_back == self.scroll_back:
+            return False
+        self.scroll_back = new_back
+        # Selection coordinates refer to the displayed view, which just
+        # shifted; drop any in-progress selection.
+        self.sel_active = False
+        self.sel_anchor = self.sel_point = None
+        now = time.monotonic()
+        if min_interval and now - self._last_render < min_interval:
+            return True  # too soon for another frame; the caller schedules it
+        self._last_render = now
+        self._render_pending = False
+        render_fn()
+        return False
 
     def visible_lines(self: RendererHost, rows: int) -> list:
         """The (rows-1) lines to draw. Splices in history when scrolled back."""
@@ -981,4 +1026,4 @@ class ScreenRenderer:
             self._message_max_scroll = 0  # no message shown → nothing to scroll
         parts.append(self.cursor_sequence(rows, cols, scroll_back))
         parts.append("\x1b[?2026l")
-        os.write(sys.stdout.fileno(), "".join(parts).encode())
+        write_frame("".join(parts).encode())

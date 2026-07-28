@@ -259,7 +259,7 @@ aGiTrack tracks one session per repository and stays pinned to the session it la
 
 `agitrack --dashboard` (or `-d`) opens a **live, auto-refreshing web dashboard** of your repository — who and what wrote the code — served on `localhost` and opened in your browser. Every number is computed from commit metadata alone, so it's identical on every clone; nothing is sent anywhere.
 
-**Try it without installing:** [agitrack.core-aix.org/dashboard](https://agitrack.core-aix.org/dashboard/) is this dashboard running on aGiTrack's own repository — a static demo regenerated from the real history on every release.
+**Try it without installing:** [agitrack.core-aix.org/dashboard](https://agitrack.core-aix.org/dashboard/) is this dashboard running on aGiTrack's own repository — a static demo regenerated from the real history on every release. Its [storyline](https://agitrack.core-aix.org/dashboard/story/) and [learn page](https://agitrack.core-aix.org/dashboard/learn/) are there too.
 
 ```bash
 agitrack --dashboard        # start a background daemon on localhost, open the browser, and return to your shell
@@ -278,6 +278,8 @@ Re-running `agitrack -d` while a dashboard is already up **restarts** it — the
 - **Filter live** — narrow the whole dashboard to one committer (merged to their GitHub ID), a backend, a model, or a time range.
 - **Agent efficiency** — an [efficiency insights](#agent-efficiency-insights) panel that mines the **filtered** history for *how* the agents are being driven (correction loops, rework hotspots, unverified turns, context cost …), shows whether each habit is **improving or worsening**, and suggests what to change.
 - **Tokens, efficiency, and loop detection**, plus a **Log** section with two tabs: **commits** (click any commit to read its full message and show its file diff) and **files** (a collapsible folder tree — pick a file to see its whole change history and the conversation/tokens behind each change). All diffs are served from your local clone — no GitHub needed.
+
+The dashboard is also the way in to the other two pages: 📖 [**story**](#storyline-your-repos-history-told-as-a-story), which tells this history as chapters you can read, and 🎓 [**learn**](#learn-let-the-agent-coach-you-from-your-own-sessions), which coaches you from it.
 
 See [Repository dashboard](#repository-dashboard) below for the full breakdown.
 
@@ -302,6 +304,22 @@ The dashboard's **learn** page (the big **Learn from these traces** card in the 
 The learn page is also served in [backtrace](#backtrace--show-and-commit-a-history-you-didnt-track-from-day-one) mode, so you can be coached from reconstructed sessions too (in a directory that isn't a git repo, progress stays local and the sync toggle reports itself unavailable). The efficiency insights panel is likewise available in both the live and backtrace dashboards.
 
 Like the summarizer, all coach calls are one-shot bare backend runs from a scratch directory outside your repo: they never touch your coding sessions, and nothing is uploaded anywhere (the agent backend you already use is the only thing called).
+
+
+## Storyline: your repo's history, told as a story
+
+The dashboard's **story** page (the 📖 **story** link in the header, the **Read it as a story** card above the commit log, or `http://localhost:8765/story`) turns the same commits into something you can actually read: an arc with a title, **chapters** you open one at a time, and under each one the developer's own thinking and the code that came out of it.
+
+It is built for digging in as far as you like:
+
+1. **The arc.** A title, a tagline, and acts, plus counters for chapters, commits, agent turns and days.
+2. **A chapter card.** When it happened, what kind of moment it was (turning point, feature, fix, refactor, milestone, experiment), how big it was, and one line of what happened.
+3. **Open it.** The full telling, then the **chain of thought**: the actual prompts you typed at the pivotal moments, each with a sentence on what you were working out. Those quotes are never written by the agent; they are read straight out of the `# Interaction Trace` in your commits, and a commit the model cannot point to is dropped.
+4. **The commits behind it**, each expanding into its real diff.
+
+Press **write the story** and your backend agent reads the commits and the prompts behind them and writes it. aGiTrack groups the history into sittings of work first, so the agent answers a handful of small questions instead of one impossible one, and a build is capped at a dozen calls. Chapters are saved as they land (you watch the timeline fill in), stored per branch in `.agitrack/story.json`, and the page then costs nothing to reopen. When new commits arrive, **add the N new commits** continues the story instead of retelling it; **go further back** reaches deeper into old history. Tell it `plainly`, `playfully` or `epically`, and read it with **play the story**, `j`/`k`, or by linking straight to a chapter (`#ch-...`).
+
+Before anything is generated (or if no backend is configured) the page still shows **the shape of it**: every sitting of work, grouped, with the prompt that started it. That part needs no agent at all. The storyline is served in [backtrace](#backtrace--show-and-commit-a-history-you-didnt-track-from-day-one) mode too, where it tells the story of the reconstruction instead of a branch.
 
 
 ## Backtrace — show and commit a history you didn't track from day one

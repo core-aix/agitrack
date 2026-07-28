@@ -39,7 +39,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from agitrack.git import GitRepo
 from agitrack.metrics import learn as learn_page
 from agitrack.metrics.collect import CommitStat
 
@@ -77,8 +76,7 @@ KICKERS = ("turning point", "feature", "fix", "refactor", "milestone", "experime
 # same tone is reproducible and the page can show which one produced what you are reading.
 STORY_TONES: dict[str, str] = {
     "plain": (
-        "Tell it plainly and warmly, like a good engineering write-up: concrete, specific, "
-        "no hype and no drama."
+        "Tell it plainly and warmly, like a good engineering write-up: concrete, specific, no hype and no drama."
     ),
     "playful": (
         "Tell it with light humour and personality, like a developer telling a friend over "
@@ -92,6 +90,14 @@ STORY_TONES: dict[str, str] = {
 }
 DEFAULT_TONE = "playful"
 
+# Appended when a reply came back unusable: a model that drifted into prose or invented ids
+# usually gets it right when told exactly what went wrong.
+_RETRY_NUDGE = (
+    "\n\nIMPORTANT: your previous answer could not be used. Reply with ONE JSON object only, "
+    'shaped {"chapters": [...]}, and put in each chapter\'s "shas" ONLY commit ids copied '
+    "exactly from the material above."
+)
+
 _STORY_SYSTEM = (
     "You are the storyteller built into aGiTrack, a tool that records how people build "
     "software with coding agents. You are given real commit metadata and the developer's own "
@@ -99,6 +105,11 @@ _STORY_SYSTEM = (
     "changed, why it mattered, and what the developer was clearly trying to do. Be concrete "
     "and specific, never generic. Use simple everyday words and short sentences. Never invent "
     "a fact that is not in the material: if something is unclear, say less rather than more. "
+    # The people in these commits are real, and the material never states anyone's pronouns.
+    # Guessing from a name or a writing style misgenders someone in a story about their own
+    # work, which the neutral form never does.
+    "The developers are real people whose pronouns you do not know: always write about them "
+    "as 'they', or by the name in the commit, and never as 'he' or 'she'. "
     "Do not use em-dashes anywhere in your output. "
     "You must reply with ONE JSON object and nothing else: no prose before or after it, no "
     "code fences."
@@ -284,6 +295,18 @@ def _batches(episodes: list[Episode]) -> list[list[Episode]]:
 
 def _day(ts: int) -> str:
     return time.strftime("%Y-%m-%d", time.localtime(ts)) if ts else "unknown date"
+
+
+def _shorten(text: str, limit: int) -> str:
+    """``text`` capped at ``limit``, cut at a word end with an ellipsis rather than mid-word."""
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    cut = text[: limit - 1]
+    space = cut.rfind(" ")
+    if space > limit // 2:
+        cut = cut[:space]
+    return cut.rstrip(" ,;:.") + "…"
 
 
 def _prompts_of(stat: CommitStat, limit: int = 2, chars: int = 220) -> list[str]:
@@ -511,8 +534,10 @@ def _normalize_chapters(
             "summary": _text(item.get("summary"), 400),
             "detail": _text(item.get("detail") or item.get("detail_md"), 6000),
             "shas": shas,
+            # Resolved once the chapter's final commit list is known (below), so a fallback
+            # quote can come from a commit that was folded in afterwards.
+            "_thoughts": item.get("thoughts"),
         }
-        chapter["thoughts"] = _thoughts(item.get("thoughts"), by_sha, shas)
         chapters.append(chapter)
     if not chapters:
         return []
@@ -521,6 +546,37 @@ def _normalize_chapters(
         chapter["shas"] = sorted(chapter["shas"], key=lambda sha: (by_sha[sha].timestamp, sha))
         _finalize_chapter(chapter, by_sha, sha_paths)
     chapters.sort(key=lambda chapter: (chapter["from"], chapter["to"]))
+    return chapters
+
+
+def _fallback_chapters(
+    batch: list[Episode], by_sha: dict[str, CommitStat], sha_paths: dict[str, set[str]], used_ids: set[str]
+) -> list[dict]:
+    """Plain chapters written from the commits alone, with no agent involved.
+
+    Used when a reply comes back unusable twice: one bad answer in the middle of a long
+    build must not throw away the chapters around it, and a gap in the timeline would be
+    worse than a plainly-told stretch. Marked ``auto`` so the page can say who wrote it."""
+    chapters = []
+    for episode in batch:
+        headline = max(episode.stats, key=lambda stat: (stat.lines, stat.timestamp))
+        subjects = [stat.subject for stat in episode.stats if stat.subject][:6]
+        chapter = {
+            "id": _unique_id(_slug(headline.subject, f"episode-{episode.index}"), used_ids),
+            "title": headline.subject[:110] or f"{len(episode.stats)} commits",
+            "kicker": "chapter",
+            "emoji": "✦",
+            "auto": True,
+            "summary": (
+                f"{len(episode.stats)} commits, +{episode.insertions}/-{episode.deletions} lines. "
+                "Told from the commits themselves: the storyteller could not be reached for this stretch."
+            ),
+            "detail": "\n".join(f"- {subject}" for subject in subjects),
+            "shas": list(episode.shas),
+            "_thoughts": None,
+        }
+        _finalize_chapter(chapter, by_sha, sha_paths)
+        chapters.append(chapter)
     return chapters
 
 
@@ -549,6 +605,7 @@ def _absorb_unclaimed(chapters: list[dict], batch_shas: list[str], by_sha: dict[
 
 
 def _finalize_chapter(chapter: dict, by_sha: dict[str, CommitStat], sha_paths: dict[str, set[str]]) -> None:
+    chapter["thoughts"] = _thoughts(chapter.pop("_thoughts", None), by_sha, chapter["shas"])
     times = [by_sha[sha].timestamp for sha in chapter["shas"] if sha in by_sha]
     chapter["from"] = min(times) if times else 0
     chapter["to"] = max(times) if times else 0
@@ -576,7 +633,7 @@ def outline(stats: list[CommitStat], sha_paths: dict[str, set[str]] | None = Non
                 "when": _day(episode.start),
                 "from": episode.start,
                 "to": episode.end,
-                "title": headline.subject[:110] or f"{len(episode.stats)} commits",
+                "title": _shorten(headline.subject, 110) or f"{len(episode.stats)} commits",
                 "commits": len(episode.stats),
                 "turns": episode.ai_turns,
                 "ins": episode.insertions,
@@ -610,37 +667,54 @@ def build_key(root: Path, branch: str) -> str:
     return f"{Path(root)}|{branch or 'HEAD'}"
 
 
-def _run_json(choice, prompt: str, timeout: int) -> dict:
-    """One agent call, serialized against the learn page's calls (a shared lock, so a
-    laptop never runs two backend CLIs at once) and against nothing else."""
+def _ask(choice, prompt: str, timeout: int) -> dict | None:
+    """One agent call, serialized against the learn page's calls (a shared lock, so a laptop
+    never runs two backend CLIs at once).
+
+    Returns the JSON object it replied with, or **None when the reply was not usable JSON**:
+    that is a bad roll, worth another try, not a broken backend. A backend that actually
+    fails (missing CLI, non-zero exit, timeout) raises :class:`StoryError` instead."""
     if not learn_page._AGENT_LOCK.acquire(timeout=_LOCK_WAIT_SECONDS):
         raise StoryError("The learning agent is busy; try again in a moment.")
     try:
-        return learn_page._run_agent_json(choice, _STORY_SYSTEM, prompt, timeout)
+        text = learn_page._run_agent(choice, _STORY_SYSTEM, prompt, timeout)
     except learn_page.LearnAgentError as exc:
         raise StoryError(str(exc)) from exc
     finally:
         learn_page._AGENT_LOCK.release()
+    return learn_page._extract_json(text)
 
 
-def _select_episodes(episodes: list[Episode], story: dict | None, mode: str) -> tuple[list[Episode], str]:
-    """Which episodes this build covers, and where their chapters go.
+def _material(stats: list[CommitStat], story: dict | None, mode: str) -> tuple[list[CommitStat], str]:
+    """Which commits this build tells, and where their chapters go.
 
-    * ``rewrite`` - the newest episodes, up to the call budget; the old story is replaced.
-    * ``extend`` - only what happened after the stored story's newest covered commit.
-    * ``earlier`` - the next slice of history BEFORE the stored story's oldest one.
+    Always a subset of the commits the story does NOT already cover, so no commit can end
+    up in two chapters and no tokens are ever spent telling the same thing twice.
+
+    * ``rewrite`` - everything (the newest of it, once the call budget bites); replaces.
+    * ``extend`` - what landed after the story's newest covered commit; appends.
+    * ``earlier`` - the history before its oldest one; prepends.
     """
+    kept = story_stats(stats)
     if story is None or mode == "rewrite":
-        return episodes[-(_MAX_BATCHES * _BATCH_EPISODES) :], "replace"
+        return kept, "replace"
     covered = set(story.get("covered_shas") or [])
+    fresh = [stat for stat in kept if stat.sha not in covered]
+    chapters = story.get("chapters") or []
     if mode == "earlier":
-        older = [ep for ep in episodes if not (set(ep.shas) & covered)]
-        oldest_covered = min((chapter.get("from", 0) for chapter in story.get("chapters") or []), default=0)
-        older = [ep for ep in older if ep.end <= oldest_covered or not oldest_covered]
-        return older[-(_MAX_BATCHES * _BATCH_EPISODES) :], "prepend"
-    fresh = [ep for ep in episodes if not set(ep.shas) <= covered]
-    fresh = [ep for ep in fresh if ep.end >= max((chapter.get("to", 0) for chapter in story.get("chapters") or []), default=0)]
-    return fresh[: _MAX_BATCHES * _BATCH_EPISODES], "append"
+        oldest = min((chapter.get("from", 0) for chapter in chapters), default=0)
+        return [stat for stat in fresh if not oldest or stat.timestamp <= oldest], "prepend"
+    newest = max((chapter.get("to", 0) for chapter in chapters), default=0)
+    return [stat for stat in fresh if not newest or stat.timestamp >= newest], "append"
+
+
+def uncovered_count(stats: list[CommitStat], story: dict | None) -> int:
+    """How many commits an ``extend`` would actually tell: what landed after the story's
+    newest covered commit. Not simply "commits the story does not cover", which would put a
+    number on a button that then had nothing to do."""
+    if not story:
+        return len(story_stats(stats))
+    return len(_material(stats, story, "extend")[0])
 
 
 def build_story(
@@ -662,18 +736,24 @@ def build_story(
     story_key = branch or "HEAD"
     existing = store.get(story_key)
     tone = tone if tone in STORY_TONES else DEFAULT_TONE
-    episodes = segment_episodes(stats, sha_paths)
     by_sha: dict[str, CommitStat] = {}
     for stat in story_stats(stats):
         by_sha[stat.sha] = stat
         by_sha[stat.short] = stat
-    selected, placement = _select_episodes(episodes, existing, mode)
-    if not selected:
+    material, placement = _material(stats, existing, mode)
+    if not material:
         raise StoryError("There is nothing new to tell: the story already covers this branch.")
+    # Segment the material itself, not the whole history: an episode is a sitting of work
+    # among the commits this build is actually telling.
+    selected = segment_episodes(material, sha_paths)
 
-    batches = _batches(selected)
-    truncated_batches = max(0, len(batches) - _MAX_BATCHES)
-    batches = batches[-_MAX_BATCHES :] if placement == "prepend" else batches[:_MAX_BATCHES]
+    # One build spends a bounded number of agent calls. Which end of the material it spends
+    # them on depends on what it is doing: continuing forward takes the OLDEST of the new
+    # work (the story stays chronological), while a first telling or a reach further back
+    # takes the material CLOSEST to what the reader already has.
+    all_batches = _batches(selected)
+    batches = all_batches[:_MAX_BATCHES] if placement == "append" else all_batches[-_MAX_BATCHES:]
+    left_behind = len(all_batches) - len(batches)
     choice = learn_page.resolve_learning_backend(Path(root))
     if key:
         _set_progress(key, phase="reading the commits", done=0, total=len(batches) + 1, chapters=0)
@@ -690,10 +770,19 @@ def build_story(
             raise StoryError("cancelled")
         if key:
             _set_progress(key, phase=f"writing chapters ({number} of {len(batches)})", done=number - 1)
-        raw = _run_json(choice, _batch_prompt(batch, tone, context), _CHAPTER_TIMEOUT_SECONDS)
-        chapters = _normalize_chapters(raw.get("chapters"), batch, by_sha, sha_paths, used_ids)
+        prompt = _batch_prompt(batch, tone, context)
+        chapters: list[dict] = []
+        for attempt in range(2):
+            if stop is not None and stop.is_set():
+                raise StoryError("cancelled")
+            raw = _ask(choice, prompt if attempt == 0 else prompt + _RETRY_NUDGE, _CHAPTER_TIMEOUT_SECONDS)
+            chapters = _normalize_chapters((raw or {}).get("chapters"), batch, by_sha, sha_paths, used_ids)
+            if chapters:
+                break
         if not chapters:
-            raise StoryError("The backend returned no usable chapters; try again.")
+            # Two unusable answers about this stretch. Tell it plainly from the commits and
+            # keep going: one bad reply must not cost the whole build.
+            chapters = _fallback_chapters(batch, by_sha, sha_paths, used_ids)
         produced.extend(chapters)
         context = "\n".join(f"- {chapter['title']}: {chapter['summary']}" for chapter in produced[-4:])
         if key:
@@ -701,17 +790,15 @@ def build_story(
         # Persist as we go: a build interrupted after batch 3 leaves 3 real chapters, not
         # nothing, and the page renders them the moment they exist.
         story = _assemble(
-            kept, produced, placement, story_key, tone, existing, by_sha, choice, truncated_batches, partial=True
+            kept, produced, placement, story_key, tone, existing, by_sha, choice, left_behind, partial=True
         )
         store.put(story_key, story)
 
     if key:
         _set_progress(key, phase="finding the shape of it", done=len(batches))
-    story = _assemble(
-        kept, produced, placement, story_key, tone, existing, by_sha, choice, truncated_batches, partial=False
-    )
+    story = _assemble(kept, produced, placement, story_key, tone, existing, by_sha, choice, left_behind, partial=False)
     try:
-        arc = _run_json(choice, _arc_prompt(story["chapters"], tone, repo_name or story_key), _ARC_TIMEOUT_SECONDS)
+        arc = _ask(choice, _arc_prompt(story["chapters"], tone, repo_name or story_key), _ARC_TIMEOUT_SECONDS) or {}
     except StoryError:
         arc = {}  # the chapters are the story; a missing arc must never lose them
     _apply_arc(story, arc, existing)
@@ -730,7 +817,7 @@ def _assemble(
     existing: dict | None,
     by_sha: dict[str, CommitStat],
     choice,
-    truncated_batches: int,
+    left_behind: int,
     *,
     partial: bool,
 ) -> dict[str, Any]:
@@ -753,7 +840,9 @@ def _assemble(
         "engine": {"backend": choice.backend_name, "model": choice.model or ""},
         # More history exists than one build may spend calls on: the page offers to keep
         # going backwards instead of pretending this is the whole story.
-        "more_earlier": bool(truncated_batches) if placement != "append" else bool(existing and existing.get("more_earlier")),
+        "more_earlier": (
+            bool(left_behind) if placement != "append" else bool(existing and existing.get("more_earlier"))
+        ),
     }
     for field_name in ("title", "tagline", "arc", "acts"):
         if existing and existing.get(field_name):
@@ -774,7 +863,8 @@ def _apply_arc(story: dict[str, Any], arc: dict, existing: dict | None) -> None:
         story["arc"] = arc_text
     acts = []
     used: set[str] = set()
-    for index, item in enumerate(arc.get("acts") if isinstance(arc.get("acts"), list) else []):
+    raw_acts = arc.get("acts")
+    for index, item in enumerate(raw_acts if isinstance(raw_acts, list) else []):
         if not isinstance(item, dict):
             continue
         act_title = _text(item.get("title"), 90)
@@ -819,6 +909,18 @@ def start_build(
     that is how you get a page that looks broken. The page polls ``/story/state`` instead,
     which reports progress and the chapters written so far."""
     key = build_key(root, branch)
+    # Answer "there is nothing to tell" immediately instead of spawning a thread that fails a
+    # moment later: the page would otherwise show a spinner and then an error for a button
+    # press that could never have worked.
+    material, _placement = _material(stats, StoryStore(root).get(branch or "HEAD"), mode)
+    if not material:
+        return {
+            "error": (
+                "There is nothing new to tell here. Use 'tell it again' to rewrite the story from scratch."
+                if mode == "extend"
+                else "The story already reaches as far back as this branch goes."
+            )
+        }
     with _BUILDS_LOCK:
         if any(record["thread"].is_alive() for record in _BUILDS.values()):
             return {"busy": True, "error": "A story is already being written; let that one finish first."}
@@ -903,7 +1005,6 @@ def story_state(
         _OUTLINE_CACHE.clear()  # only the current tip is worth keeping
         _OUTLINE_CACHE[cache_key] = rows
     story = StoryStore(root).get(branch or "HEAD")
-    covered = set(story.get("covered_shas") or []) if story else set()
     return {
         "story": story,
         "outline": rows,
@@ -916,7 +1017,7 @@ def story_state(
         "meta": {
             "commits": len(kept),
             "turns": sum(1 for stat in kept if stat.kind in _AI_KINDS),
-            "uncovered": sum(1 for stat in kept if stat.sha not in covered),
+            "uncovered": uncovered_count(kept, story),
             "first": kept[0].timestamp if kept else 0,
             "last": kept[-1].timestamp if kept else 0,
             "head": head,
@@ -956,6 +1057,8 @@ def handle_story_post(
         if path == "/story/cancel":
             return cancel_build(root, branch)
         if path == "/story/forget":
+            # Stop any build first, or it would write its story back over the deletion.
+            cancel_build(root, branch)
             StoryStore(root).drop(branch or "HEAD")
             return {"forgotten": True}
     except learn_page.LearnAgentError as exc:
@@ -1143,6 +1246,11 @@ h2.section{font-size:13px;letter-spacing:1.5px;text-transform:uppercase;color:va
 .ch .sum{margin:0;color:var(--fg-dim);font-size:13px;line-height:1.55}
 .ch .open-hint{margin-top:9px;font-size:11.5px;color:var(--phosphor-dim);letter-spacing:.5px}
 .ch.open .open-hint{color:var(--fg-dim)}
+/* A long chapter's "close" hint at the bottom is a scroll away, so an open chapter also
+   carries one in its header, where the reader's eye already is. */
+.closehint{display:none;order:9;margin-left:auto;color:var(--fg-dim);border:1px solid var(--line);
+  border-radius:999px;padding:1px 9px}
+.ch.open .closehint{display:inline}
 .more{margin-top:14px;border-top:1px dashed var(--line);padding-top:12px;cursor:default}
 .md{font-size:13px;line-height:1.65;color:var(--fg)}
 .md p{margin:0 0 10px} .md h3,.md h4{font-size:13px;color:var(--phosphor);margin:14px 0 6px}
@@ -1227,6 +1335,10 @@ footer code{color:var(--fg)}
   .timeline::before{left:9px}
   .ch .dot{left:-32px;width:22px;height:22px;font-size:11px}
   .counter{min-width:calc(50% - 5px);flex:1}
+  /* The outline's numbers have no room beside a wrapped title on a phone, and a flex item
+     with nothing left to take simply overflows: give them their own line. */
+  .outline .num{flex-basis:100%}
+  .toolbar .kbd{display:none}
 }
 </style>
 </head>
@@ -1500,7 +1612,7 @@ function chapterHtml(c, i){
       ' style="animation-delay:' + Math.min(i * 40, 400) + 'ms">' +
     '<div class="dot">' + esc(c.emoji || "✦") + "</div>" +
     '<div class="chbody">' +
-      '<div class="chhead"><span>' + esc(c.when || "") + "</span>" +
+      '<div class="chhead"><span class="closehint">close &uarr;</span><span>' + esc(c.when || "") + "</span>" +
         '<span class="kick k-' + esc(String(c.kicker || "chapter").replace(/\s+/g, "-")) + '">' + esc(c.kicker || "chapter") + "</span>" +
         '<span>' + bits.join(" &nbsp;·&nbsp; ") + "</span></div>" +
       "<h3>" + esc(c.title) + "</h3>" +
@@ -1842,4 +1954,3 @@ setTimeout(() => { if (state.data && state.data.building && state.data.building.
 </body>
 </html>
 """
-

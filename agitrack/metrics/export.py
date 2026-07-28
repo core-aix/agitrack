@@ -1,6 +1,7 @@
 """Static demo export of the metrics dashboard (``agitrack -d export``).
 
-Writes a self-contained, server-free copy of the dashboard (and the learn page) that any
+Writes a self-contained, server-free copy of the dashboard (plus the learn page and the
+storyline) that any
 static host can serve: GitHub Pages, Netlify, a plain file server. Every number in the
 dashboard derives from commit metadata alone, so a snapshot generated from a clone is the
 real dashboard, frozen at the exporting commit.
@@ -9,6 +10,7 @@ Layout of the exported directory::
 
     index.html            the dashboard, full payload embedded + the demo fetch shim
     learn/index.html      the learn page + its shim
+    story/index.html      the storyline + its shim
     demo/                 the pre-rendered responses the shims serve:
       data-<granularity>.json     /data for hour/day/week/month (last-30-days scope)
       log-<sort>-<offset>.json    every /log page for every sort order (same scope)
@@ -17,6 +19,7 @@ Layout of the exported directory::
       filelog/<n>.json            /filelog per file (n = index in files.json order)
       filediff/<n>-<sha12>.json   /filediff per (file, change)
       state.json                  /learn/state (profile, committers, engine info)
+      story.json                  /story/state (the stored story, chapters and outline)
 
 A ``fetch`` shim injected into both pages maps the endpoints the live page calls to those
 files. The demo ships the LAST 30 DAYS of history (anchored to the newest commit, so a
@@ -25,12 +28,15 @@ activity is what sells the dashboard, and it keeps the baked diff set small. Wha
 static degrades explicitly: the filter dropdowns are disabled with an explanatory tooltip
 (the range dropdown showing the "last 30 days" it actually serves), and the learn page's
 agent-driven actions (new lessons, chat, exercise review) return a notice pointing at a
-real install. A frozen top banner on both pages says what this is and how to run the real
-thing.
+real install; the storyline's generate/extend/forget buttons answer with the same fixed
+toast the disabled filters use. A frozen top banner on every page says what this is and how
+to run the real thing.
 
 The learn profile comes from the repo's learning store (``.agitrack/learning.json``): the
 exporting user's profile, or the store's single profile when the exporting identity has
-none (CI exports a checked-in fixture that way).
+none (CI exports a checked-in fixture that way). The storyline ships the same way from
+``.agitrack/story.json``, and the diffs its chapters point at are baked even when they fall
+outside the 30-day window, since a story is mostly about older history.
 """
 
 from __future__ import annotations
@@ -41,6 +47,7 @@ from pathlib import Path
 
 from agitrack.git import GitRepo
 from agitrack.metrics import learn as learn_page
+from agitrack.metrics import story as story_page
 from agitrack.metrics.collect import Dashboard, build_dashboard
 from agitrack.metrics.files import git_browser
 from agitrack.metrics.github import cached_logins
@@ -66,14 +73,19 @@ _DEMO_WINDOW_DAYS = 30
 _DEMO_NOTE = "This static demo doesn't support this action. Install and run aGiTrack on your own repo to see the live dashboard and the learn page's agent-driven features."
 
 
-def _banner_html(css_class: str, site_root: str) -> str:
+def _banner_html(css_class: str, site_root: str, text: str = "") -> str:
     """The frozen top strip both exported pages carry. ``css_class`` is the page's own
     sticky-banner class (the dashboard styles ``backtracebanner``, the learn page
     ``btbanner``), so the demo notice inherits the exact banner treatment of its page.
     ``site_root`` is the relative path back to the main webpage, whose install section
-    the banner links to. Deliberately dateless: the strip is read on every visit and a
-    build timestamp only crowds it (the page's own "updated" line still carries one)."""
-    text = "STATIC DEMO: snapshot of the real aGiTrack dashboard, with aGiTrack's own history over a 30-day period. "
+    the banner links to. ``text`` overrides the wording for a page whose scope differs (the
+    storyline ships the whole history, not the dashboard's 30-day slice). Deliberately
+    dateless: the strip is read on every visit and a build timestamp only crowds it (the
+    page's own "updated" line still carries one)."""
+    text = (
+        text
+        or "STATIC DEMO: snapshot of the real aGiTrack dashboard, with aGiTrack's own history over a 30-day period. "
+    )
     return (
         f'<div class="{css_class}">🧪 '
         + _esc(text)
@@ -128,23 +140,72 @@ def _learn_state(dash: Dashboard, repo: GitRepo) -> dict:
     }
 
 
-def _shim(*, base: str, files_index: dict[str, int], learn: bool, site_root: str) -> str:
+def _story_state(dash: Dashboard, repo: GitRepo, sha_paths: dict[str, set[str]]) -> dict:
+    """The /story/state payload for the demo: the stored story (or the store's only story,
+    the way the learn profile falls back, so CI can ship a checked-in fixture written on
+    another branch), the outline, and a fixed engine note. No agent runs here."""
+    state = story_page.story_state(
+        repo.repo,
+        dash.stats,
+        sha_paths,
+        branch=dash.branch,
+        branches=[],  # the demo serves one branch; the picker would lie
+        repo_name=str(repo.repo).rstrip("/").rsplit("/", 1)[-1],
+    )
+    if not state.get("story"):
+        state["story"] = story_page.StoryStore(repo.repo).any_story()
+    state["building"] = None
+    # The page renders chapters from their `commits` rows; the raw sha lists exist only so a
+    # build can tell what it has already covered, which a snapshot never does. Dropping them
+    # takes a sizeable bite out of what every visitor downloads.
+    story = state.get("story")
+    if isinstance(story, dict):
+        story.pop("covered_shas", None)
+        for chapter in story.get("chapters") or []:
+            chapter.pop("shas", None)
+    # A plausible engine note rather than resolving a backend on the export machine (CI has
+    # none): the demo never generates anything anyway.
+    state["engine"] = {"backend": "claude", "model": "", "backend_source": "session", "model_source": "auto"}
+    return state
+
+
+def _story_shas(state: dict) -> list[str]:
+    """Every commit the shipped story points at, so its diffs are baked even when they fall
+    outside the demo's 30-day window (a story is mostly about older history)."""
+    story = state.get("story") or {}
+    shas: list[str] = []
+    for chapter in story.get("chapters") or []:
+        for row in chapter.get("commits") or []:
+            sha = str(row.get("sha") or "")
+            if sha and sha not in shas:
+                shas.append(sha)
+    return shas
+
+
+def _shim(*, base: str, files_index: dict[str, int], page: str, site_root: str) -> str:
     """The <script> block injected into an exported page: reroutes the page's relative
     fetches to the pre-rendered files and disables what has no static equivalent.
 
     Placed before the page's main script so the override is installed first. ``base`` is
-    the demo/ directory relative to the page. GET endpoints map to files; a miss degrades
-    the way the live page already handles errors (a 503 keeps the last-loaded data, an
+    the demo/ directory relative to the page, and ``page`` which of the three pages this is
+    (``dash``, ``learn`` or ``story``). GET endpoints map to files; a miss degrades the way
+    the live page already handles errors (a 503 keeps the last-loaded data, an
     ``{"error": …}`` renders in place). Learn POSTs are canned: suggest re-serves the
     shipped profile so the check-in button works; agent actions return the demo notice."""
     manifest = json.dumps(files_index, separators=(",", ":")) if files_index else "{}"
-    lock_ids = "[]" if learn else '["f-author","f-backend","f-model","f-period","f-branch"]'
+    learn = page == "learn"
+    lock_ids = {
+        "dash": '["f-author","f-backend","f-model","f-period","f-branch"]',
+        "learn": "[]",
+        "story": '["f-branch"]',
+    }[page]
     return f"""<script>
 (function(){{
   var BASE = {json.dumps(base)};
   var FILES = {manifest};
   var NOTE = {json.dumps(_DEMO_NOTE)};
   var LEARN = {json.dumps(learn)};
+  var STORY = {json.dumps(page == "story")};
   var real = window.fetch.bind(window);
   var asJson = function(obj){{ return Promise.resolve(new Response(JSON.stringify(obj), {{headers: {{"Content-Type": "application/json"}}}})); }};
   var unavailable = function(){{ return Promise.resolve(new Response("", {{status: 503}})); }};
@@ -184,6 +245,7 @@ def _shim(*, base: str, files_index: dict[str, int], learn: bool, site_root: str
       if (fi === undefined) return asJson({{error: NOTE}});
       return file("filediff/" + fi + "-" + (p.get("sha") || "").slice(0, 12) + ".json", function(){{ return asJson({{error: NOTE}}); }});
     }}
+    if (name === "story/state") return file("story.json", unavailable);
     if (name === "learn/state") return file("state.json", unavailable);
     if (name === "learn/models") return asJson({{backend: p.get("backend") || "", models: []}});
     return real(input, init);
@@ -240,12 +302,36 @@ def _shim(*, base: str, files_index: dict[str, int], learn: bool, site_root: str
       var period = document.getElementById("f-period");
       if (period) period.value = "{_DEMO_WINDOW_DAYS}";
     }}
-    // The learn page's "back to dashboard" link is written for the live server, where
-    // the page lives at /learn and "./" is the dashboard. In the demo the page is a
-    // directory (/dashboard/learn/), so point the link one level up explicitly.
-    if (LEARN) {{
-      var back = document.getElementById("backlink");
-      if (back) back.href = "../";
+    // The learn and story pages' cross-links are written for the live server, where they
+    // live at /learn and /story and a sibling page is one relative hop away. In the demo
+    // each is a DIRECTORY (/dashboard/learn/, /dashboard/story/), so the same relative
+    // hrefs would resolve one level too deep: rewrite them explicitly.
+    var relink = function(id, href){{
+      var el = document.getElementById(id);
+      if (el) el.href = href;
+    }};
+    if (LEARN) {{ relink("backlink", "../"); relink("storylink", "../story/"); }}
+    if (STORY) {{ relink("backlink", "../"); relink("learnlink", "../learn/"); }}
+    // Writing a story needs a live agent; every control that would start (or undo) one
+    // answers with the same fixed toast as the dashboard's disabled filters.
+    if (STORY) {{
+      ["write", "extend", "earlier", "rewrite", "forget", "build-cancel"].forEach(function(id){{
+        var el = document.getElementById(id);
+        if (!el) return;
+        el.addEventListener("click", function(e){{
+          e.preventDefault(); e.stopImmediatePropagation(); showNote();
+        }}, true);
+      }});
+      // The page disables those buttons while it thinks a build is running or the engine is
+      // missing; here they must stay clickable so the toast can explain why nothing happens.
+      var keepLive = function(){{
+        ["write", "extend", "earlier", "rewrite"].forEach(function(id){{
+          var el = document.getElementById(id);
+          if (el) el.disabled = false;
+        }});
+      }};
+      keepLive();
+      setInterval(keepLive, 500);
     }}
     // The learn page surfaces the demo note through its ERROR path (agent actions return
     // {{error: NOTE}}), which flashes red — but the dashboard shows the same note as an
@@ -411,6 +497,16 @@ def export_static_demo(repo: GitRepo, out_dir: Path) -> Path:
 
     _write_json(demo / "state.json", _learn_state(dash, repo))
 
+    # The storyline, and the diffs its chapters point at: a story is mostly about older
+    # history, so those commits are usually outside the demo's 30-day window.
+    _files_all, sha_paths = context_from_browser(browser)
+    story_state = _story_state(dash, repo, sha_paths)
+    _write_json(demo / "story.json", story_state)
+    baked = {stat.sha for stat in demo_stats}
+    for sha in _story_shas(story_state):
+        if sha not in baked:
+            _write_json(demo / "diff" / f"{sha}.json", commit_diff(repo, sha))
+
     page = format_html(
         dash,
         shared_sessions=shared,
@@ -419,14 +515,28 @@ def export_static_demo(repo: GitRepo, out_dir: Path) -> Path:
         frm=frm,
     )
     (out_dir / "index.html").write_text(
-        _inject_shim(page, _shim(base="demo/", files_index=files_index, learn=False, site_root="../")),
+        _inject_shim(page, _shim(base="demo/", files_index=files_index, page="dash", site_root="../")),
         encoding="utf-8",
     )
     learn_html = learn_page.learn_html(repo.repo, banner_html=_banner_html("btbanner", "../../"))
     learn_dir = out_dir / "learn"
     learn_dir.mkdir()
     (learn_dir / "index.html").write_text(
-        _inject_shim(learn_html, _shim(base="../demo/", files_index={}, learn=True, site_root="../../")),
+        _inject_shim(learn_html, _shim(base="../demo/", files_index={}, page="learn", site_root="../../")),
+        encoding="utf-8",
+    )
+    story_html = story_page.story_html(
+        repo.repo,
+        banner_html=_banner_html(
+            "btbanner",
+            "../../",
+            "STATIC DEMO: aGiTrack's own history, told as a story by its coding agent. Writing a new one needs a live install. ",
+        ),
+    )
+    story_dir = out_dir / "story"
+    story_dir.mkdir()
+    (story_dir / "index.html").write_text(
+        _inject_shim(story_html, _shim(base="../demo/", files_index={}, page="story", site_root="../../")),
         encoding="utf-8",
     )
     return out_dir

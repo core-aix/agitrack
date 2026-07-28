@@ -654,6 +654,7 @@ def _make_handler(view_source) -> type[http.server.BaseHTTPRequestHandler]:
     import threading as _threading
 
     from agitrack.metrics import learn as learn_page
+    from agitrack.metrics import story as story_page
     from agitrack.metrics.files import backtrace_browser
     from agitrack.metrics.insights import build_insights, context_from_browser
     from agitrack.metrics.web import _filter_stats, aggregates_payload, format_html, log_page
@@ -719,6 +720,16 @@ def _make_handler(view_source) -> type[http.server.BaseHTTPRequestHandler]:
         stats = _filter_stats(active.view.dashboard, author=source, backend="", model="", frm=frm, to=to)
         return stats, active.insights_for(source, "", "", frm, to), active.browser.files_payload()
 
+    def story_view(branch: str) -> tuple[list, dict]:
+        """What the storyline is told from HERE: the reconstructed turns and the files each
+        one touched. Same shape the live server passes, so both dashboards tell their story
+        through identical code, each from its own data."""
+        from agitrack.metrics.insights import context_from_browser
+
+        active = serving()
+        _files, sha_paths = context_from_browser(active.browser, active.view.dashboard.stats)
+        return active.view.dashboard.stats, sha_paths
+
     class _BacktraceHandler(http.server.BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802 (http.server API)
             try:
@@ -778,6 +789,32 @@ def _make_handler(view_source) -> type[http.server.BaseHTTPRequestHandler]:
                         "application/json",
                         json.dumps(browser.file_diff(_str(query, "path"), _str(query, "sha"))).encode("utf-8"),
                     )
+                elif parsed.path == "/story":
+                    # The storyline over the reconstruction: same page, same code, told from
+                    # the backtraced turns instead of a branch's commits.
+                    self._respond(
+                        "text/html; charset=utf-8",
+                        story_page.story_html(
+                            learn_root, banner_html=story_page.story_backtrace_banner(view.directory)
+                        ).encode("utf-8"),
+                        cache_control="no-cache",
+                    )
+                elif parsed.path == "/story/state":
+                    stats, sha_paths = story_view("")
+                    self._respond(
+                        "application/json",
+                        json.dumps(
+                            story_page.story_state(
+                                learn_root,
+                                stats,
+                                sha_paths,
+                                branch="",
+                                branches=[],  # a reconstruction has no refs to switch between
+                                repo_name=Path(view.directory).name or view.directory,
+                                backtrace=True,
+                            )
+                        ).encode("utf-8"),
+                    )
                 elif parsed.path == "/learn":
                     self._respond(
                         "text/html; charset=utf-8",
@@ -826,9 +863,18 @@ def _make_handler(view_source) -> type[http.server.BaseHTTPRequestHandler]:
                     body = {}
                 if not isinstance(body, dict):
                     body = {}
-                payload = learn_page.handle_learn_post(
-                    parsed.path, body, root=learn_root, repo=learn_repo, view=learn_view
-                )
+                if parsed.path.startswith("/story/"):
+                    payload = story_page.handle_story_post(
+                        parsed.path,
+                        body,
+                        root=learn_root,
+                        view=story_view,
+                        repo_name=Path(get_view().directory).name or get_view().directory,
+                    )
+                else:
+                    payload = learn_page.handle_learn_post(
+                        parsed.path, body, root=learn_root, repo=learn_repo, view=learn_view
+                    )
                 if payload is None:
                     self.send_error(404, "not found")
                     return

@@ -1702,7 +1702,8 @@ __BACKTRACE_BANNER__
   <header class="rise">
     <div class="brand"><span class="a">a</span>GiTrack<span class="sub">&nbsp;learn</span></div>
     <div class="meta"><span>repo</span> <b>__REPO__</b> <span id="me-meta"></span></div>
-    <a class="backlink" id="backlink" href="./">&larr; dashboard</a>
+    <div class="backlink"><a id="backlink" href="./">&larr; dashboard</a> &nbsp;·&nbsp;
+      <a id="storylink" href="story" title="Read this repo's history as a story">&#128214; story</a></div>
   </header>
 
   <div class="panel checkin rise" id="checkin">

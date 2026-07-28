@@ -798,6 +798,15 @@ body.booting .wrap>*:not(header):not(#booting){display:none}
   border:1px solid var(--phosphor-dim);border-radius:4px;padding:8px 18px;white-space:nowrap}
 .learncta:hover .lc-btn{background:var(--phosphor);color:var(--ink);border-color:var(--phosphor)}
 @media (max-width:640px){.learncta{flex-wrap:wrap}.learncta .lc-btn{margin-left:50px}}
+/* The storyline call-to-action, above the log: the same shape as the learn card in amber,
+   so the two entries read as siblings without competing for the same green. */
+.storycta{border-color:var(--amber-dim);
+  background:linear-gradient(135deg,rgba(255,180,84,.10),rgba(255,180,84,.02) 55%,rgba(103,184,214,.06))}
+.storycta:hover{border-color:var(--amber);box-shadow:0 8px 28px rgba(255,180,84,.14);
+  background:linear-gradient(135deg,rgba(255,180,84,.16),rgba(255,180,84,.05) 55%,rgba(103,184,214,.10))}
+.storycta .lc-text b,.storycta .lc-btn{color:var(--amber)}
+.storycta .lc-btn{border-color:var(--amber-dim)}
+.storycta:hover .lc-btn{background:var(--amber);color:var(--ink);border-color:var(--amber)}
 .insight.good{border-left-color:var(--phosphor)}
 .insight.good .isev{color:var(--phosphor)}
 /* Trend chip: the same metric measured on the earlier vs the later half of the window,
@@ -1222,7 +1231,7 @@ __UPDATE_BANNER__
 <div class="wrap">
   <header>
     <div class="brand"><span class="a">a</span>GiTrack<span class="sub">&nbsp;dashboard</span></div>
-    <div class="meta"><span class="tag">repo</span> <b>__REPO__</b><span id="branchmeta"> &nbsp;·&nbsp; <span class="tag">branch</span> <select id="f-branch" class="branchsel" title="View statistics and the commit log for a single branch"></select></span> &nbsp;·&nbsp; <span id="genat"></span> &nbsp;·&nbsp; <a class="flink" id="learnlink" href="learn" title="Let the backend agent coach you from your own interaction traces">&#127891; learn</a></div>
+    <div class="meta"><span class="tag">repo</span> <b>__REPO__</b><span id="branchmeta"> &nbsp;·&nbsp; <span class="tag">branch</span> <select id="f-branch" class="branchsel" title="View statistics and the commit log for a single branch"></select></span> &nbsp;·&nbsp; <span id="genat"></span> &nbsp;·&nbsp; <a class="flink" id="storylink" href="story" title="Read this repo's history as a story, written by the backend agent from the commits and their traces">&#128214; story</a> &nbsp;·&nbsp; <a class="flink" id="learnlink" href="learn" title="Let the backend agent coach you from your own interaction traces">&#127891; learn</a></div>
   </header>
 
   <div class="booting" id="booting">
@@ -1302,6 +1311,14 @@ __UPDATE_BANNER__
 
   <h2 class="section">shared sessions</h2>
   <div class="panel" id="shared"></div>
+
+  <a class="learncta storycta" id="storycta" href="story" title="Open the storyline">
+    <span class="lc-icon">&#128214;</span>
+    <span class="lc-text"><b>Read it as a story.</b>
+    The same commits below, told as chapters: the turning points, what the developers were
+    working out at each one, and the diffs underneath.</span>
+    <span class="lc-btn">open story &rarr;</span>
+  </a>
 
   <div class="logsection-head">
     <h2 class="section">log</h2>
