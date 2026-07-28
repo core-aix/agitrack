@@ -1716,27 +1716,52 @@ function toggleChapter(el, force){
   }
 }
 
-// ------------------------------------------------------------------ diffs
-const _diffCache = {};
-async function toggleDiff(row){
+// ------------------------------------------------------ commits: message, then changes
+// One fetch answers both (the /diff endpoint carries the commit message too), so opening a
+// commit shows the conversation that produced it and flipping to the file changes is free.
+const _commitCache = {};
+
+async function toggleCommit(row){
   const sha = row.dataset.sha;
   const open = row.querySelector(".cbody");
-  const label = row.querySelector(".chead .num:last-child");
-  if (open) { open.remove(); if (label) label.innerHTML = "show diff &#9662;"; return; }
-  if (label) label.innerHTML = "hide diff &#9652;";
+  const label = row.querySelector(".chead .toggle");
+  if (open) { open.remove(); if (label) label.innerHTML = "open &#9662;"; return; }
+  if (label) label.innerHTML = "close &#9652;";
   const body = document.createElement("div");
   body.className = "cbody";
-  body.innerHTML = '<div class="diffempty">loading the diff…</div>';
+  body.innerHTML = '<div class="diffempty">loading…</div>';
   row.appendChild(body);
-  if (_diffCache[sha]) { body.innerHTML = _diffCache[sha]; return; }
-  try {
-    const r = await fetch("diff?sha=" + encodeURIComponent(sha), {cache:"no-store"});
-    const d = await r.json();
-    const html = d.error ? '<div class="diffempty">' + esc(d.error) + "</div>" : diffHtml(d.diff, d.truncated);
-    _diffCache[sha] = html;
-    body.innerHTML = html;
-  } catch (e) {
-    body.innerHTML = '<div class="diffempty">could not load this diff (server unreachable)</div>';
+  let data = _commitCache[sha];
+  if (!data) {
+    try {
+      const r = await fetch("diff?sha=" + encodeURIComponent(sha), {cache:"no-store"});
+      data = await r.json();
+    } catch (e) {
+      data = {error: "could not load this commit (server unreachable)"};
+    }
+    _commitCache[sha] = data;
+  }
+  if (!row.querySelector(".cbody")) return;  // closed again while we were fetching
+  body.innerHTML = '<div class="cbar"><button class="btn small cflip">show file changes</button></div>' +
+                   '<div class="cview"></div>';
+  showCommitView(row, "message");
+}
+
+function showCommitView(row, mode){
+  const data = _commitCache[row.dataset.sha] || {};
+  const view = row.querySelector(".cview"), flip = row.querySelector(".cflip");
+  if (!view) return;
+  view.dataset.mode = mode;
+  if (mode === "diff") {
+    view.className = "cview";
+    view.innerHTML = data.error ? '<div class="diffempty">' + esc(data.error) + "</div>"
+                                : diffHtml(data.diff, data.truncated);
+    if (flip) flip.textContent = "show commit message";
+  } else {
+    view.className = "cview md";
+    view.innerHTML = data.error ? '<div class="diffempty">' + esc(data.error) + "</div>"
+                                : md(data.message || "(no message recorded)");
+    if (flip) flip.textContent = "show file changes";
   }
 }
 function diffHtml(text, truncated){
