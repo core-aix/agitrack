@@ -1055,9 +1055,49 @@ def test_the_closer_view_says_what_it_did_differently():
     # It is rendered under the heading of the closer view, and only there.
     assert "if (state.zoom === 4) html += '<p class=\"zwhat\">' + esc(closerNote())" in html
     # The two ways in say which one costs an agent call and what it will produce.
-    assert '"\\u{1F50D} look closer: the same days as " + fine + " moments"' in html
+    assert 'look closer: the same days as " + countAt(2) + " moments' in html
     assert 'tell this part closer (these " + newestFirst.length + " moments, cut smaller)' in html
     assert "cuts them into more, shorter moments" in html
+
+
+def test_a_part_is_never_offered_a_telling_that_would_come_out_coarser():
+    """ "Closer" that returns FEWER moments is the button doing the opposite of its label. A
+    part is cut into at most one moment per sitting of work, so a part whose moments already
+    match its sittings has nothing finer in it - and one told under an older shape of the
+    parts can hold a "closer" set that is no longer finer than what sits above it."""
+    html = _page()
+    # The page knows the ceiling: one bar of the sparkline per sitting.
+    assert "function sittings(part){ return ((part && part.spark) || []).length; }" in html
+    assert "const room = sittings(part) > newestFirst.length;" in html
+    assert '$("more-moments").hidden = !told && !room;' in html
+    assert '$("asfine").hidden = told || room;' in html
+    assert "sittings of work, so there is nothing finer to tell here." in html
+    # The same rule at the closer depth itself, reached by an old link.
+    assert "There is nothing finer to tell here" in html
+    # ...and a stored telling that is not finer says so instead of claiming a zoom.
+    assert "This is not finer than the " in html
+
+
+def test_the_server_refuses_a_closer_telling_that_cannot_be_finer(tmp_path, monkeypatch):
+    """The page hides the button, but a stale tab (or the API) can still ask: the build has to
+    refuse rather than spend an agent call to return a shorter list."""
+    repo = _repo_with_history(tmp_path, prompts=[f"step {i}" for i in range(8)], gap_days=1)
+    stats, sha_paths = _view_of(repo)
+    _fake_agent(
+        monkeypatch,
+        [_moment_reply([{"n": i + 1, "title": f"Moment {i}", "summary": "s"} for i in range(6)]), _ARC],
+    )
+    built = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
+    era = built["eras"][-1]
+    told = [m for m in built["moments"] if era["from"] <= m["from"] <= era["to"]]
+    assert told, "the newest part is told"
+
+    # Every sitting in that part already has a moment of its own: there is nothing to cut.
+    _fake_agent(monkeypatch, [_moment_reply([{"n": 1, "title": "Finer", "summary": "s"}]), _ARC])
+    with pytest.raises(story.StoryError) as caught:
+        story.build_story(tmp_path, stats, sha_paths, branch="main", mode="part", part_id=era["id"], level=2)
+    assert "already told as finely as it can be" in str(caught.value)
+    assert "sitting" in str(caught.value)  # ...and it says what the limit actually is
 
 
 def test_a_depth_that_needs_a_part_always_has_one():

@@ -1186,9 +1186,8 @@ __UI_COMMIT_CSS__
 .fchange .fmeta{color:var(--ops);font-size:12px;margin-bottom:3px}
 .fchange .fsub{color:var(--fg);font-size:12.5px;overflow-wrap:anywhere}
 .fchange .fdetailc{margin-top:8px}
-.fchange .fdifftoggle{font-family:inherit;font-size:11.5px;color:var(--phosphor);background:transparent;
-  border:1px solid var(--phosphor-dim);padding:1px 8px;cursor:pointer;letter-spacing:.3px;margin-bottom:8px}
-.fchange .fdifftoggle:hover{background:var(--phosphor);color:var(--ink)}
+/* Look: shared (see ui.COMMIT_CSS). Only its spacing here belongs to this list. */
+.fchange .fdifftoggle{margin-bottom:8px}
 .fmore{padding:12px 16px;color:var(--fg-dim);font-size:12.5px}
 footer{margin-top:46px;padding-top:22px;border-top:1px dashed var(--line);color:var(--fg-dim);font-size:12.5px;
   display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap}

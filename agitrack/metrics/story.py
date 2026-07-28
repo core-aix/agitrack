@@ -1021,6 +1021,19 @@ def _material(
     return [stat for stat in kept if stat.sha not in covered and (not newest or stat.timestamp >= newest)], "append"
 
 
+def _moments_in_span(story: dict | None, start: int, end: int, level: int = 0) -> list[dict]:
+    """The story's moments lying inside ``start``..``end`` (optionally only at ``level``).
+    Spans, not part ids: parts are recomputed as history grows, so a moment written under an
+    older shape of the story still belongs to whatever now covers its days."""
+    return [
+        moment
+        for moment in (story or {}).get("moments") or []
+        if start <= moment.get("from", 0)
+        and moment.get("to", 0) <= end
+        and (not level or int(moment.get("level") or 1) == level)
+    ]
+
+
 def uncovered_count(stats: list[CommitStat], story: dict | None) -> int:
     """How many commits an ``extend`` would actually tell: what landed after the story's
     newest covered commit. Not simply "commits the story does not cover", which would put a
@@ -1070,6 +1083,19 @@ def build_story(
     # Spread ALWAYS: a telling covers its scope end to end, whichever mode asked for it.
     wanted = _MOMENTS_FINE if level >= 2 else _MOMENTS_COARSE
     selected = spread(selected, wanted)
+    if level >= 2:
+        # "Closer" has to be CLOSER. A part is cut into as many moments as it has sittings of
+        # work, capped at _MOMENTS_FINE, so a part with few sittings can produce FEWER moments
+        # than the coarse telling above it - and the reader clicks "look closer" and gets a
+        # shorter list, which reads as the button doing the opposite of what it says.
+        already = len(_moments_in_span(existing, material[0].timestamp, material[-1].timestamp, 1))
+        if already and len(selected) <= already:
+            raise StoryError(
+                f"This part is already told as finely as it can be. It holds {len(selected)} "
+                f"sitting{'' if len(selected) == 1 else 's'} of work (a sitting is a run of commits "
+                f"with no long pause in it), and the {already} moments you have already cover them, "
+                "so telling it closer would produce nothing new to read."
+            )
     all_batches = _batches(selected)
     batches = all_batches[:_MAX_BATCHES] if placement in ("append", "merge") else all_batches[-_MAX_BATCHES:]
     left_behind = len(all_batches) - len(batches)
@@ -1932,6 +1958,7 @@ __BACKTRACE_BANNER__
   <div id="morewrap" class="morewrap" hidden>
     <button class="btn" id="more-moments">show earlier moments</button>
     <button class="btn" id="earlier2">&#8617; go further back</button>
+    <span class="zwhat" id="asfine" hidden></span>
   </div>
 
   <div class="outline" id="outlinewrap" hidden>
@@ -2245,17 +2272,29 @@ function hasCloser(){
   return scopedMoments().some(m => (Number(m.level) || 1) >= 2);
 }
 
+function countAt(level){
+  return scopedMoments().filter(m => (Number(m.level) || 1) === (level === 1 ? 1 : Math.max(2, level))).length;
+}
+// How many moments a part COULD be cut into: one per sitting of work in it. The sparkline is
+// drawn one bar per sitting, so the page already has the number. A part with four sittings
+// cannot be told as ten moments, however much anyone zooms.
+function sittings(part){ return ((part && part.spark) || []).length; }
+
 // Told closer looks like "a different set of moments" unless the page says what changed:
 // it is the SAME stretch of history, cut into more pieces, so each moment covers less of it.
 function closerNote(){
   const part = currentPart();
   if (!part) return "";
-  const coarse = scopedMoments().filter(m => (Number(m.level) || 1) === 1).length;
-  const fine = scopedMoments().filter(m => (Number(m.level) || 1) >= 2).length;
+  const coarse = countAt(1), fine = countAt(2);
   if (!fine) return "";
   const days = Math.max(1, Math.round((part.to - part.from) / 86400));
-  return "The same " + part.commits + " commits over the same " + days + " day" + (days === 1 ? "" : "s") +
-    (coarse ? ", cut into " + fine + " moments instead of " + coarse : ", cut into " + fine + " moments") +
+  const same = "The same " + part.commits + " commits over the same " + days + " day" + (days === 1 ? "" : "s");
+  // A telling written when the parts had a different shape can end up NOT finer. Say that
+  // plainly rather than claiming a zoom that did not happen.
+  if (coarse && fine <= coarse)
+    return same + ", told again in " + fine + " moments. This is not finer than the " + coarse +
+      " above it: the parts have shifted since it was written, so tell it closer again to redo it.";
+  return same + (coarse ? ", cut into " + fine + " moments instead of " + coarse : ", cut into " + fine + " moments") +
     ". Nothing new happened here: each moment simply covers a shorter stretch of it, so smaller " +
     "things get named.";
 }
@@ -2303,11 +2342,17 @@ function renderTimeline(){
 
   if (state.zoom < 3) { host.innerHTML = ""; return; }        // the parts view owns the page
   if (state.zoom === 4 && part && !hasCloser()) {             // nothing finer here yet: offer it
+    const coarse = countAt(1);
     host.innerHTML = '<h2 class="section">closer, inside ' + esc(part.title.toLowerCase()) + "</h2>" +
-      '<div class="emptypart">This part has not been told closer yet. Your agent re-reads the same ' +
-      part.commits + " commits and cuts them into more, shorter moments, so smaller things get " +
-      "named; about half a minute. " +
-      '<button class="btn zcloser">&#10024; tell it closer</button></div>';
+      (sittings(part) > coarse
+        ? '<div class="emptypart">This part has not been told closer yet. Your agent re-reads the same ' +
+          part.commits + " commits and cuts them into more, shorter moments, so smaller things get " +
+          "named; about half a minute. " +
+          '<button class="btn zcloser">&#10024; tell it closer</button></div>'
+        // Asking anyway would spend an agent call to get the same list back, or a shorter one.
+        : '<div class="emptypart">There is nothing finer to tell here: the ' + coarse +
+          " moments above already cover each of this part's " + sittings(part) +
+          " sittings of work one by one.</div>");
     return;
   }
   if (!all.length) {                                          // an untold part explains itself
@@ -2334,13 +2379,18 @@ function renderTimeline(){
   // plainly whether it costs an agent call or just walks into what is already written.
   if (part && state.zoom === 3) {
     const told = hasCloser();
+    const room = sittings(part) > newestFirst.length;   // is there anything left to cut?
     $("morewrap").hidden = false;
-    $("more-moments").hidden = false;
+    $("more-moments").hidden = !told && !room;
     $("more-moments").dataset.told = told ? "1" : "";
-    const fine = scopedMoments().filter(m => (Number(m.level) || 1) >= 2).length;
     $("more-moments").textContent = told
-      ? "\u{1F50D} look closer: the same days as " + fine + " moments"
+      ? "\u{1F50D} look closer: the same days as " + countAt(2) + " moments"
       : "\u2728 tell this part closer (these " + newestFirst.length + " moments, cut smaller)";
+    // A part with no more sittings than moments cannot be cut finer, and a button that would
+    // spend an agent call to return the same list is worse than no button.
+    $("asfine").hidden = told || room;
+    $("asfine").textContent = "These " + newestFirst.length + " moments already cover every one of this part's " +
+      sittings(part) + " sittings of work, so there is nothing finer to tell here.";
   }
   for (const id of state.open) {
     const el = document.getElementById("ch-" + id);
@@ -2570,7 +2620,7 @@ async function toggleCommit(row){
     _commitCache[sha] = data;
   }
   if (!row.querySelector(".cbody")) return;  // closed again while we were fetching
-  body.innerHTML = '<div class="cbar"><button class="btn small cflip">show file changes</button></div>' +
+  body.innerHTML = '<div class="cbar"><button class="cflip">show file changes</button></div>' +
                    '<div class="cview dmsg"></div>';
   showCommitView(row, "message");
 }
