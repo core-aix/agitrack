@@ -219,9 +219,18 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
                 body = {}
             if not isinstance(body, dict):
                 body = {}
-            payload = learn_page.handle_learn_post(
-                parsed.path, body, root=self.repo.repo, repo=self.repo, view=self._learn_view
-            )
+            if parsed.path.startswith("/story/"):
+                payload = story_page.handle_story_post(
+                    parsed.path,
+                    body,
+                    root=self.repo.repo,
+                    view=self._story_view,
+                    repo_name=str(self.repo.repo).rstrip("/").rsplit("/", 1)[-1],
+                )
+            else:
+                payload = learn_page.handle_learn_post(
+                    parsed.path, body, root=self.repo.repo, repo=self.repo, view=self._learn_view
+                )
             if payload is None:
                 self.send_error(404, "not found")
                 return
