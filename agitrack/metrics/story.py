@@ -67,8 +67,12 @@ _EPISODE_MAX_COMMITS = 12
 #      material of just that moment, cached in the store forever after.
 #
 # So a build is two calls and under a minute, and depth is paid for only where a reader goes.
-_BATCH_EPISODES = 10
-_BATCH_CHARS = 4000
+# One telling is one call: spread() already bounds a build to _MOMENTS_FINE episodes, and
+# these only exist so a pathological history cannot build a prompt without a ceiling.
+# Splitting a telling across calls would leave the tail of a part untold, because only
+# _MAX_BATCHES of them are ever sent.
+_BATCH_EPISODES = 15
+_BATCH_CHARS = 24000
 # Outline calls per build. ONE: a build covers the newest stretch and stops. Forty-five
 # moments in one go is both a long wait and more than anyone reads at once; "go further
 # back" fetches the next stretch when it is actually wanted.
@@ -77,6 +81,10 @@ _MAX_BATCHES = 1
 # whole span; looking closer re-tells the same span at finer grain.
 _MOMENTS_COARSE = 6
 _MOMENTS_FINE = 15
+# How much of one episode the outline call reads: this many of its commits, spread across it
+# so the writer sees its beginning, middle and end, with an ask under the first few.
+_HEADLINE_COMMITS = 8
+_HEADLINE_ASKS = 3
 # Per-call bounds. The outline call reads a lot and writes little; a moment is the reverse.
 _MOMENT_TIMEOUT_SECONDS = 300
 _EXPAND_TIMEOUT_SECONDS = 240
@@ -371,6 +379,38 @@ def _day(ts: int) -> str:
     return time.strftime("%Y-%m-%d", time.localtime(ts)) if ts else "unknown date"
 
 
+def _stamp(ts: int) -> str:
+    """Date AND time. The writer cannot put things in the order they happened if all it is
+    given is the day: a moment came back titled "storyline lands, the TUI stops scrolling
+    wrong, and a release patch fails" with the release patch, which came first, told last."""
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else "unknown time"
+
+
+def _span(start: int, end: int) -> str:
+    """``start`` to ``end``, dropping the repeated date when both fall on one day."""
+    first, last = _stamp(start), _stamp(end)
+    if first == last:
+        return first
+    return f"{first} to {last[11:] if last[:10] == first[:10] else last}"
+
+
+def _sample(stats: list[CommitStat], limit: int) -> tuple[list[CommitStat], int]:
+    """At most ``limit`` commits, EVENLY spread over the run and always keeping the first and
+    the last, plus how many were left out.
+
+    A merged sitting can hold a hundred commits; showing its first ten would tell the writer
+    about its morning and nothing about its evening."""
+    if len(stats) <= limit:
+        return list(stats), 0
+    step = (len(stats) - 1) / (limit - 1)
+    picked: list[CommitStat] = []
+    for position in range(limit):
+        stat = stats[round(position * step)]
+        if not picked or picked[-1] is not stat:
+            picked.append(stat)
+    return picked, len(stats) - len(picked)
+
+
 def _shorten(text: str, limit: int) -> str:
     """``text`` capped at ``limit``, ending where a reader would: at a SENTENCE end if there
     is one in range, else at a word end. Never mid-word, and never mid-sentence when a
@@ -404,38 +444,33 @@ def _prompts_of(stat: CommitStat, limit: int = 2, chars: int = 220) -> list[str]
     return out
 
 
-def _episode_digest(episode: Episode) -> str:
-    """One episode rendered for the agent: when, how big, which files, and for each commit
-    its subject plus what the developer asked for."""
-    span = _day(episode.start)
-    if _day(episode.end) != span:
-        span += f" to {_day(episode.end)}"
-    head = (
-        f"EPISODE {episode.index} [{span}] {len(episode.stats)} commits, "
-        f"+{episode.insertions}/-{episode.deletions} lines"
-    )
-    if episode.tokens:
-        head += f", {episode.tokens} tokens"
-    lines = [head]
+def _episode_headline(episode: Episode, number: int = 0) -> str:
+    """One episode for the outline pass: its span, and the commits inside it IN THE ORDER
+    THEY HAPPENED, each stamped with date and time.
+
+    It used to be a single line carrying only the day and the episode's biggest subject, and
+    the writer had nothing to order the rest of it by - so a moment covering a long sitting
+    would name three things in whatever order they came to mind, with the earliest last.
+    Commit ids are deliberately absent: a moment is one episode now (see
+    :func:`_batch_prompt`), so which commits belong to it is not the writer's to guess."""
+    number = number or episode.index + 1
+    lines = [
+        f"EPISODE {number} [{_span(episode.start, episode.end)}] "
+        f"{len(episode.stats)} commits, +{episode.insertions}/-{episode.deletions} lines"
+    ]
     if episode.paths:
         lines.append("  files: " + ", ".join(episode.paths))
-    for stat in episode.stats[:_EPISODE_MAX_COMMITS]:
-        lines.append(f"  {stat.short} [{stat.kind}] {stat.subject[:120]}")
-        for prompt in _prompts_of(stat):
-            lines.append(f'    asked: "{prompt}"')
+    shown, dropped = _sample(episode.stats, _HEADLINE_COMMITS)
+    asks = 0
+    for stat in shown:
+        lines.append(f"  {_stamp(stat.timestamp)}  {stat.subject[:100]}")
+        if asks < _HEADLINE_ASKS:
+            for prompt in _prompts_of(stat, limit=1, chars=140):
+                lines.append(f'      asked: "{prompt}"')
+                asks += 1
+    if dropped:
+        lines.append(f"  (+{dropped} more commits spread through the same stretch)")
     return "\n".join(lines) + "\n"
-
-
-def _episode_headline(episode: Episode) -> str:
-    """One episode in ONE line, for the outline pass: enough to recognise what happened,
-    small enough that a whole history fits in a couple of calls."""
-    ask = (_prompts_of(episode.stats[0], limit=1, chars=110) or [""])[0]
-    subject = max(episode.stats, key=lambda stat: (stat.lines, stat.timestamp)).subject[:80]
-    ids = " ".join(stat.short for stat in episode.stats)
-    return (
-        f"EP{episode.index} [{_day(episode.start)}] {len(episode.stats)}c "
-        f'+{episode.insertions}/-{episode.deletions} | {subject} | asked: "{ask}" | {ids}\n'
-    )
 
 
 def _note_line(note: str) -> str:
@@ -446,24 +481,26 @@ def _note_line(note: str) -> str:
 
 
 def _batch_prompt(batch: list[Episode], tone: str, context: str, note: str = "") -> str:
-    digest = "".join(_episode_headline(episode) for episode in batch)
+    digest = "".join(_episode_headline(episode, number) for number, episode in enumerate(batch, start=1))
     voice = STORY_TONES.get(tone, STORY_TONES[DEFAULT_TONE])
     prior = f"\nEARLIER IN THE STORY (do not retell these, continue from them):\n{context}\n" if context else ""
     voice += _note_line(note)
-    return f"""Below are consecutive episodes from one repository's history, oldest first. One line each: date, how many commits, lines moved, the biggest commit subject, what the developer asked for, and the commit ids.
+    return f"""Below are {len(batch)} consecutive episodes from one repository's history, OLDEST FIRST. Each is a stretch of work with its span, and the commits inside it listed in the order they were made, every one stamped with its date and time.
 
-Turn them into MOMENTS of the story, in chronological order, one headline each. Merge neighbouring episodes that are clearly the same push into one moment (aim for roughly one moment per two or three episodes, fewer when they belong together). Every commit id listed must belong to exactly one moment.
+Write ONE moment of the story for EACH episode, in the same order: {len(batch)} moments, numbered as they are numbered here. The grouping is already done; do not merge episodes and do not split one.
+
+Everything inside an episode is in chronological order, and what you write must follow it. When a moment names more than one thing, name them in the order they happened: the timestamps tell you which came first. Getting this backwards is the one error a reader always catches, because they were there.
 
 {voice}
 
 Write it so someone who has never seen this repo WANTS to read the next moment. What makes it interesting is always a specific fact: the thing that broke, the assumption that turned out wrong, the small decision everything else followed from. Never filler ("various improvements", "several fixes", "this commit"), never a category where a fact would do.
 
 For each moment:
-- "title": the thing that actually happened, named. Specific enough that it could only belong to this moment. Never a category like "Improvements", "Bug fixes" or "Dashboard work".
+- "n": the number of the episode it tells, exactly as listed below.
+- "title": the thing that actually happened, named. Specific enough that it could only belong to this moment. Never a category like "Improvements", "Bug fixes" or "Dashboard work". When the episode holds several strands, lead with the one that mattered most and keep the rest in time order.
 - "kicker": one of {", ".join(KICKERS)}.
 - "emoji": a single emoji that fits the moment.
 - "summary": ONE short sentence (under 20 words) with a hook: what was wrong, what got decided, or what surprised them. A reader skimming only the summaries should still get the story.
-- "shas": every commit id belonging to this moment, copied exactly.
 
 Headlines only here: the body of a moment is written later, and only if someone zooms into it.
 {prior}
@@ -482,8 +519,11 @@ def _expand_prompt(
     voice = STORY_TONES.get(tone, STORY_TONES[DEFAULT_TONE]) + _note_line(note)
     lines = []
     paths: dict[str, int] = {}
-    for stat in stats:
-        lines.append(f"{stat.short} [{stat.kind}] {stat.subject[:120]} (+{stat.insertions}/-{stat.deletions})")
+    for stat in sorted(stats, key=lambda stat: (stat.timestamp, stat.sha)):
+        lines.append(
+            f"{_stamp(stat.timestamp)} {stat.short} [{stat.kind}] "
+            f"{stat.subject[:120]} (+{stat.insertions}/-{stat.deletions})"
+        )
         for prompt in _prompts_of(stat, limit=2, chars=260):
             lines.append(f'    asked: "{prompt}"')
         for path in sha_paths.get(stat.sha, ()) or ():
@@ -502,6 +542,8 @@ Reply with ONE JSON object:
  "thoughts": [{{"sha": "<a commit id from the material below>", "note": "one short sentence on what the developer was working out at that moment"}}]}}
 
 Give 1 or 2 thoughts, picking the commits whose prompts show the thinking best. Never invent a quote: only the commit id and your note.
+
+The material below is OLDEST FIRST, each commit stamped with its date and time. Tell it in that order: if you name two things, the earlier one comes first, and never say something led to what preceded it.
 
 FILES TOUCHED: {top}
 
@@ -568,8 +610,13 @@ def _era_rows(episodes: list[Episode]) -> list[dict]:
                 "turns": sum(episode.ai_turns for episode in span),
                 # One bar per episode: the shape of the work inside the era.
                 "spark": [episode.insertions + episode.deletions for episode in span],
+                # Oldest first, each dated: an era's name has to fit the whole of it, and
+                # naming it after the last thing read is how "it now runs on Windows" ends up
+                # over a stretch that was mostly about something else.
                 "subjects": [
-                    max(episode.stats, key=lambda stat: (stat.lines, stat.timestamp)).subject[:70] for episode in span
+                    f"{_day(episode.start)}: "
+                    + max(episode.stats, key=lambda stat: (stat.lines, stat.timestamp)).subject[:70]
+                    for episode in span
                 ],
             }
         )
@@ -624,6 +671,16 @@ def _emoji(value: object) -> str:
 
 def _text(value: object, limit: int) -> str:
     return str(value or "").strip()[:limit]
+
+
+def _number(value: object) -> int:
+    """An episode number as the reply gave it: 3, "3", "EPISODE 3" and 3.0 all mean three."""
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    digits = re.search(r"\d+", str(value or ""))
+    return int(digits.group()) if digits else 0
 
 
 def _resolve_shas(raw: object, by_sha: dict[str, CommitStat]) -> list[str]:
@@ -730,11 +787,21 @@ def _normalize_moments(
     than quietly vanishing from the story."""
     batch_shas = [sha for episode in batch for sha in episode.shas]
     allowed = {sha for sha in batch_shas}
+    # A moment is an episode (the prompt asks for one per episode, by number), so which
+    # commits it holds is decided here, from the segmentation, rather than copied back by
+    # the writer. An id it mistypes or invents cannot cost a commit its place in the story.
+    by_number = {number: episode for number, episode in enumerate(batch, start=1)}
     moments: list[dict] = []
     for index, item in enumerate(raw if isinstance(raw, list) else []):
         if not isinstance(item, dict):
             continue
-        shas = [sha for sha in _resolve_shas(item.get("shas"), by_sha) if sha in allowed]
+        episode = by_number.get(_number(item.get("n")))
+        shas = (
+            [sha for sha in episode.shas if sha in allowed]
+            if episode is not None
+            # Older replies (and older stored stories) name their commits instead.
+            else [sha for sha in _resolve_shas(item.get("shas"), by_sha) if sha in allowed]
+        )
         title = _text(item.get("title"), 110)
         if not shas or not title:
             continue
@@ -1595,20 +1662,11 @@ __UI_OVERLAY_CSS__
 #flash .error{border:1px solid var(--bad);color:var(--bad);background:var(--panel);padding:10px 13px;
   border-radius:6px;margin:10px 0;font-size:12.5px;cursor:pointer}
 
-/* ---------------------------------------------------------------- the toolbar */
-.zoombar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:24px 0 8px}
-.zoombar .grow{flex:1}
-.zlabel{font-size:11px;letter-spacing:1.5px;text-transform:uppercase;color:var(--fg-dim)}
-.zoom{display:flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
-.zstop{background:var(--panel);border:0;border-right:1px solid var(--line);color:var(--fg-dim);
-  font:inherit;cursor:pointer;padding:6px 14px;display:flex;flex-direction:column;align-items:flex-start;
-  gap:1px;transition:background .15s,color .15s}
-.zstop:last-child{border-right:0}
-.zstop b{font-family:var(--display);font-size:17px;line-height:1;font-weight:400}
-.zstop span{font-size:11px;letter-spacing:.3px}
-.zstop:hover{color:var(--fg);background:var(--panel2)}
-.zstop.sel{background:#0f2a1c;color:var(--phosphor)}
-.zoomctx{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:0 0 8px;font-size:12.5px;
+/* ------------------------------------------------------------- the way back out */
+/* There is no zoom control: the reader walks IN by clicking a part, and this one button
+   walks them back out a level. A row of zoom stops looked like it went somewhere precise
+   and did not - pressed from the parts view it landed in a part nobody had chosen. */
+.zoomctx{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:24px 0 8px;font-size:12.5px;
   color:var(--fg-dim)}
 .zoomctx .zin b{color:var(--phosphor)}
 .emptypart{color:var(--fg-dim);font-size:13px;border:1px dashed var(--line);border-radius:8px;
@@ -1810,7 +1868,6 @@ footer code{color:var(--fg)}
   /* The outline's numbers have no room beside a wrapped title on a phone, and a flex item
      with nothing left to take simply overflows: give them their own line. */
   .outline .num{flex-basis:100%}
-  .toolbar .kbd{display:none}
 }
 </style>
 </head>
@@ -1871,14 +1928,6 @@ __BACKTRACE_BANNER__
   </div>
   <div id="flash"></div>
 
-  <div class="zoombar" id="toolbar" hidden>
-    <span class="zlabel">zoom</span>
-    <div class="zoom" id="zoom">
-      <button class="zstop" data-z="2"><b>&#9679;</b><span id="zlabel2">the parts</span></button>
-      <button class="zstop sel" data-z="3"><b>&#9679;&#9679;</b><span>the moments</span></button>
-      <button class="zstop" data-z="4"><b>&#9679;&#9679;&#9679;</b><span>closer</span></button>
-    </div>
-  </div>
   <div class="zoomctx" id="zoomctx" hidden></div>
 
   <div id="loading" class="loading"><span class="spin"></span><span>finding the story…</span></div>
@@ -1929,7 +1978,9 @@ const REDUCED = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 const state = {
   data: null, story: null, tone: "playful", branch: "", open: new Set(), told: new Set(),
   poll: null, building: false,
-  zoom: 3, part: null, pendingZoom: 0
+  // Depth 2 is the top: the parts. You walk in from there; normalizeZoom() drops to the
+  // flat moment list for a story that has no parts.
+  zoom: 2, part: null, pendingZoom: 0
 };
 
 // ------------------------------------------------------------------ helpers
@@ -2025,6 +2076,7 @@ function render(){
   const d = state.data; if (!d) return;
   $("loading").hidden = true;
   $("skeleton").hidden = true;
+  normalizeZoom();
   renderBranches();
   renderHero();
   renderStudio();
@@ -2100,35 +2152,50 @@ function renderStudio(){
     hint = "There is no coding agent configured here, so nobody can tell it yet. Run an aGiTrack session in this repo, or pick one below under \"who tells it\". The outline further down is built from the commits alone and needs no agent at all.";
   else if (!has)
     hint = "Your agent reads this " + (d.backtrace ? "reconstructed history" : "branch") + " twice: once over the " +
-           "whole timeline for the five parts above, and once over the most recent stretch for moments you can open. " +
+           "whole timeline for the parts it breaks into, and once over the most recent stretch for moments you can open. " +
            "About half a minute. Each moment is then written out the first time you open it, and everything is " +
            "stored in .agitrack/story.json, so you only ever pay for what you read.";
   else
-    hint = "Zoom in and your agent writes that moment out, once, then keeps it. " +
+    hint = "Click a part to go inside it, and a moment to have your agent write it out, once, then keep it. " +
            (m.uncovered ? m.uncovered + " commit" + (m.uncovered === 1 ? " has" : "s have") + " landed since. " : "") +
-           (s && s.more_earlier ? "Further back is told on request; the five parts already cover the whole project." : "");
+           (s && s.more_earlier ? "Further back is told on request; the parts already cover the whole project." : "");
   $("studiohint").textContent = hint;
 }
 
-// One story, two magnifications: the five parts, and the moments inside them. Opening a
-// moment is the last step in, to the commits themselves. Zooming into a PART narrows
-// everything below it to that part.
-function setZoom(level, part){
-  state.zoom = Math.max(2, Math.min(4, level || 3));  // parts, moments, closer
-  // "Closer" is a per-part zoom. Asked for from outside one, it picks the part you were
-  // last reading (or the newest), rather than doing nothing.
-  if (state.zoom === 4 && part === undefined && !state.part) {
+// The story has three depths and you walk between them, one step at a time:
+//
+//   2  the parts          click a part to go in
+//   3  inside one part    its moments, told once
+//   4  closer inside it   the same span told finer
+//
+// There is deliberately no zoom control. A row of stops let someone jump to a depth that
+// only means something INSIDE a part, from a view where no part was chosen; it either did
+// nothing or landed somewhere they had not asked for. Going in is a click on the thing you
+// want; coming out is one button that says where it goes.
+function partsLevel(){
+  // A story told before parts existed has only its moments: that flat list is the top.
+  return ((state.story && state.story.eras) || []).length ? 2 : 3;
+}
+
+// Keep the depth and the part consistent with the story actually loaded. Called before
+// every paint, not only on a click: a story can arrive (or be forgotten, or rewritten with
+// different parts) under a page that is already sitting at some depth.
+function normalizeZoom(){
+  const top = partsLevel();
+  state.zoom = Math.max(top, Math.min(4, state.zoom || top));
+  if (state.zoom === 2) { state.part = null; return; }       // the parts view is nobody's part
+  // Depths 3 and 4 are per-part. Reached without one (an old link, a hash typed by hand),
+  // they open the newest part rather than a blank page.
+  if (!currentPart()) {
     const eras = (state.story && state.story.eras) || [];
-    if (eras.length) part = eras[eras.length - 1].id;
+    state.part = eras.length ? eras[eras.length - 1].id : null;
   }
+}
+
+function setZoom(level, part){
+  state.zoom = level || partsLevel();
   if (part !== undefined) state.part = part;
-  for (const stop of $("zoom").querySelectorAll(".zstop")) {
-    const z = Number(stop.dataset.z);
-    stop.classList.toggle("sel", z === state.zoom);
-  }
-  const eras = ((state.story && state.story.eras) || []).length;
-  if (eras) $("zlabel2").textContent = eras === 1 ? "the whole thing" : "the " + eras + " parts";
-  renderZoomContext();
+  normalizeZoom();
   renderZoomContext();
   renderEras();
   renderTimeline();
@@ -2141,30 +2208,38 @@ function currentPart(){
   return eras.find(era => era.id === state.part) || null;
 }
 
+function partsLabel(){
+  const n = ((state.story && state.story.eras) || []).length;
+  return n === 1 ? "the whole story" : "the " + n + " parts";
+}
+
+// One step back out, labelled with where it lands.
 function renderZoomContext(){
   const part = currentPart(), host = $("zoomctx");
-  host.hidden = !part;
-  if (!part) return;
-  const inside = momentsInView().length;
-  host.innerHTML = '<button class="btn small zback">&larr; back to the five parts</button>' +
-    '<span class="zin">inside <b>' + esc(part.title) + "</b> &nbsp;·&nbsp; " +
+  host.hidden = state.zoom <= partsLevel() || !part;
+  if (host.hidden) return;
+  const up = state.zoom === 4
+    ? '<button class="btn small zback">&larr; back to ' + esc(part.title.toLowerCase()) + "</button>"
+    : '<button class="btn small zback">&larr; back to ' + partsLabel() + "</button>";
+  host.innerHTML = up +
+    '<span class="zin">' + (state.zoom === 4 ? "closer inside " : "inside ") + "<b>" + esc(part.title) + "</b> &nbsp;·&nbsp; " +
     esc(part.when) + " &rarr; " + esc(part.until) + " &nbsp;·&nbsp; " + part.commits + " commits</span>" +
     // A part nobody has told yet is a dead end without this: the reader is looking straight
     // at it and there is nothing to read and no obvious way to get any.
-    (inside ? "" : '<button class="btn zpart">&#10024; tell this part</button>');
+    (state.zoom === 3 && !momentsInView().length ? '<button class="btn zpart">&#10024; tell this part</button>' : "");
 }
 
-// Everything the current zoom (and part) is looking at.
-// Everything the current zoom (and part) is looking at. Level 1 is the handful spread
+// Everything the current depth (and part) is looking at. Level 1 is the handful spread
 // across a part; level 2 is the same span told closer.
 function momentsInView(){
   const all = (state.story && state.story.moments) || [];
   const part = currentPart();
-  const want = state.zoom >= 4 ? 2 : 1;
   const scoped = part ? all.filter(m => m.from >= part.from && m.to <= part.to) : all;
-  const atLevel = scoped.filter(m => (Number(m.level) || 1) === want);
-  // Nothing at this zoom yet: show the coarser telling rather than an empty page.
-  return atLevel.length ? atLevel : scoped.filter(m => (Number(m.level) || 1) === 1);
+  // At the closer depth, level 1 is NOT a stand-in: showing it would repeat the view the
+  // reader just came from and read as a button that did nothing. Its absence is the cue to
+  // offer the closer telling, which renderTimeline does.
+  if (state.zoom >= 4) return scoped.filter(m => (Number(m.level) || 1) >= 2);
+  return scoped.filter(m => (Number(m.level) || 1) === 1);
 }
 function hasCloser(){
   const part = currentPart();
@@ -2178,9 +2253,9 @@ function hasCloser(){
 function renderEras(){
   const s = state.story, host = $("eras");
   const eras = (s && s.eras) || [];
-  host.hidden = !eras.length || state.zoom === 3;
+  host.hidden = !eras.length || state.zoom !== 2;   // inside a part, the part owns the page
   if (host.hidden) return;
-  host.innerHTML = '<h2 class="section">five parts</h2>' +
+  host.innerHTML = '<h2 class="section">' + (eras.length === 1 ? "the whole story" : eras.length + " parts") + "</h2>" +
     eras.slice().reverse().map(era => {
       const told = ((s.moments || []).filter(m => m.from >= era.from && m.to <= era.to)).length;
       return '<div class="era' + (told ? " has" : "") + '" data-part="' + esc(era.id) + '">' +
@@ -2191,7 +2266,7 @@ function renderEras(){
           "<span>" + esc(era.when) + " &rarr; " + esc(era.until) + "</span>" +
           "<span>" + era.commits + " commits</span>" +
           (told ? '<span class="lit">' + told + " moment" + (told === 1 ? "" : "s") + " written</span>" : "") +
-        '<span class="zoomin">zoom in &rarr;</span></div></div></div>';
+        '<span class="zoomin">go inside &rarr;</span></div></div></div>';
     }).join("");
 }
 
@@ -2212,7 +2287,6 @@ function renderTimeline(){
   const host = $("timeline");
   const part = currentPart();
   const all = momentsInView();
-  $("toolbar").hidden = !((state.story && state.story.moments) || []).length;  // the way back out
   $("morewrap").hidden = true;
 
   if (state.zoom < 3) { host.innerHTML = ""; return; }        // the parts view owns the page
@@ -2238,11 +2312,17 @@ function renderTimeline(){
   newestFirst.forEach((moment, position) => { html += momentHtml(moment, position); });
   host.innerHTML = html + "</div>";
 
-  // Seeing more of a part means looking closer, which is a zoom, not a pager.
+  // Seeing more of a part means looking closer, which is a step further in, not a pager.
+  // This is also the ONLY way to that depth now that the zoom stops are gone, so it says
+  // plainly whether it costs an agent call or just walks into what is already written.
   if (part && state.zoom === 3) {
+    const told = hasCloser();
     $("morewrap").hidden = false;
-    $("more-moments").hidden = hasCloser();
-    $("more-moments").textContent = "\u2728 tell this part closer (" + newestFirst.length + " moments now)";
+    $("more-moments").hidden = false;
+    $("more-moments").dataset.told = told ? "1" : "";
+    $("more-moments").textContent = told
+      ? "\u{1F50D} look closer at this part"
+      : "\u2728 tell this part closer (" + newestFirst.length + " moments now)";
   }
   for (const id of state.open) {
     const el = document.getElementById("ch-" + id);
@@ -2400,19 +2480,25 @@ async function writeMoment(el, c, box){
 
 // The blocking overlay, for the generations that rewrite the page under the reader (a
 // build, a part, a closer telling). Writing ONE moment loads inside its own card instead.
-function showOverlay(title, message){
+function showOverlay(title, message, canStop){
   $("overlay").hidden = false;
   $("ov-icon").textContent = "\u{1F4D6}";
   $("build-phase").textContent = title;
   $("build-sub").textContent = message || "";
+  showEngine();
+  $("build-bar").style.width = canStop ? "5%" : "45%";
+  $("build-cancel").hidden = !canStop;
+  $("build-cancel").disabled = false;
+}
+// Whose time and tokens this is spending, on every overlay that spends any.
+function showEngine(){
   const engine = engineLine();
   $("ov-engine").textContent = engine ? "written by " + engine : "";
-  $("build-bar").style.width = "45%";
-  $("build-cancel").hidden = true;
 }
 function hideOverlay(){
   $("overlay").hidden = true;
   $("build-cancel").hidden = false;
+  $("skeleton").hidden = true;   // it only ever stands in for a build that is now over
 }
 
 function momentById(id){
@@ -2578,26 +2664,40 @@ function renderBuild(p){
   if (p && p.error && !running) fail(p.error === "cancelled" ? "Stopped. The moments already written are kept." : p.error);
   if (!running) { renderStudio(); return; }
   $("build-phase").textContent = p.phase || "working";
+  $("build-cancel").hidden = false;
   $("build-cancel").disabled = false;
+  showEngine();          // also for a build this page did not start (another tab, a reload)
   const pct = p.total ? Math.round(100 * Math.min(1, p.done / p.total)) : 5;
   $("build-bar").style.width = Math.max(5, pct) + "%";
   $("build-sub").textContent = (p.moments || 0) + " moment" + (p.moments === 1 ? "" : "s") + " so far";
   renderStudio();
 }
 
+const BUILD_OPENING = {
+  rewrite: "reading your history…",
+  extend:  "reading the commits that landed since…",
+  earlier: "reading further back…",
+  part:    "reading this part…",
+};
+
 async function build(mode, options){
   if (state.building) return;
   flash("");
   state.building = true; renderStudio();
+  // At the click, not when the server answers. Starting a build is a POST that has to reach
+  // the daemon and hand the work to a thread; waiting for it left about a second in which
+  // the button had visibly done nothing and people pressed it again.
+  showOverlay((options && options.closer ? "reading this part again, closer…" : BUILD_OPENING[mode]) || "reading your history…",
+              "", true);
   if (!(state.story && (state.story.moments || []).length)) $("skeleton").hidden = false;
   try {
     const r = await post("story/build", {branch: state.branch, tone: state.tone, mode: mode,
                                         note: $("f-note").value.trim(), part: state.part || "",
                                         closer: !!(options && options.closer)});
-    if (r.error || r.busy) { state.building = false; fail(r.error || "busy"); renderStudio(); return; }
+    if (r.error || r.busy) { state.building = false; hideOverlay(); fail(r.error || "busy"); renderStudio(); return; }
     renderBuild(r.progress);
     startPolling();
-  } catch (e) { state.building = false; fail(e.message); renderStudio(); }
+  } catch (e) { state.building = false; hideOverlay(); fail(e.message); renderStudio(); }
 }
 
 // While a build runs, only the things that CHANGED are touched. The poll used to re-render
@@ -2722,20 +2822,21 @@ $("build-cancel").addEventListener("click", async () => {
   $("build-cancel").disabled = true;
   try { await post("story/cancel", {branch: state.branch}); } catch (e) {}
 });
-$("more-moments").addEventListener("click", () => { state.pendingZoom = 4; build("part", {closer: true}); });
+$("more-moments").addEventListener("click", () => {
+  // Already written: this is navigation, and must not spend another agent call on it.
+  if ($("more-moments").dataset.told) { setZoom(4); return; }
+  state.pendingZoom = 4; build("part", {closer: true});
+});
 $("earlier2").addEventListener("click", () => build("earlier"));
 $("e-backend").addEventListener("change", () => { $("e-backend").dataset.touched = "1"; loadModels(null); });
 $("e-save").addEventListener("click", saveEngine);
-$("zoom").addEventListener("click", e => {
-  const stop = e.target.closest(".zstop");
-  if (stop) setZoom(Number(stop.dataset.z));
-});
 $("eras").addEventListener("click", e => {
   const seg = e.target.closest("[data-part]");
   if (seg) setZoom(3, seg.dataset.part);
 });
 $("zoomctx").addEventListener("click", e => {
-  if (e.target.closest(".zback")) { state.part = null; setZoom(2); return; }
+  // One step out: closer -> this part's moments -> the parts.
+  if (e.target.closest(".zback")) { setZoom(state.zoom === 4 ? 3 : 2); return; }
   if (e.target.closest(".zpart")) build("part");
 });
 $("f-branch").addEventListener("change", () => {

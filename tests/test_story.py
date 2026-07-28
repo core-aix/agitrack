@@ -396,6 +396,92 @@ def test_build_writes_moments_with_real_commits_and_quoted_asks(tmp_path, monkey
     assert "asked: " in fake.prompts[0]  # the digest carries the prompts, not just subjects
 
 
+def test_the_writer_is_given_the_commits_in_order_with_the_time_of_each(tmp_path, monkeypatch):
+    """A moment came back titled "storyline lands, the TUI stops scrolling wrong, and a
+    release patch fails" - with the release patch, which happened first, told last. The
+    material only carried a DAY and one subject per sitting, so there was nothing to order
+    the rest of it by."""
+    repo = _repo_with_history(tmp_path, prompts=["first thing", "second thing", "third thing"])
+    stats, sha_paths = _view_of(repo)
+    ordered = story.story_stats(stats)[-3:]  # the sitting this build tells
+    fake = _fake_agent(monkeypatch, [_moment_reply([{"n": 1, "title": "It", "summary": "s"}]), _ARC])
+    story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
+
+    material = fake.prompts[0]
+    # Every commit is stamped to the minute...
+    for stat in ordered:
+        assert story._stamp(stat.timestamp) in material, f"{stat.subject} has no time on it"
+    # ...and they appear oldest first, in the order they were made.
+    positions = [material.index(stat.subject[:40]) for stat in ordered]
+    assert positions == sorted(positions), "the material is out of order"
+    # The instruction is explicit, because the reader was there and always catches this.
+    assert "OLDEST FIRST" in material
+    assert "name them in the order they happened" in material
+
+
+def test_one_moment_per_sitting_and_the_commits_are_not_the_writers_to_pick(tmp_path, monkeypatch):
+    """The sittings are already grouped (and spread across the part) before the call, so a
+    moment IS one of them. Asking the model to merge them again is what let one moment span
+    unrelated stretches; and naming its episode by number means no commit can be lost to a
+    mistyped id."""
+    repo = _repo_with_history(tmp_path, prompts=[f"step {i}" for i in range(24)], gap_days=1)
+    stats, sha_paths = _view_of(repo)
+    monkeypatch.setattr(story, "_MOMENTS_COARSE", 3)
+    fake = _fake_agent(
+        monkeypatch,
+        [
+            _moment_reply(
+                [  # no "shas" anywhere: the numbers are the whole contract
+                    {"n": 1, "title": "The first stretch", "summary": "s"},
+                    {"n": 2, "title": "The second", "summary": "s"},
+                    {"n": "EPISODE 3", "title": "The third", "summary": "s"},
+                ]
+            ),
+            _ARC,
+        ],
+    )
+    built = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
+
+    assert [m["title"] for m in built["moments"]] == ["The first stretch", "The second", "The third"]
+    told = [sha for m in built["moments"] for sha in m["shas"]]
+    assert len(told) == len(set(told)), "no commit is told twice"
+    material, _ = story._material(stats, None, "rewrite")
+    assert set(told) == {stat.sha for stat in material}, "every commit of the telling has a home"
+    # Each moment's commits are exactly its own sitting, in time order.
+    for moment in built["moments"]:
+        assert moment["from"] <= moment["to"]
+    assert "Write ONE moment of the story for EACH episode" in fake.prompts[0]
+    assert "do not merge episodes" in fake.prompts[0]
+
+
+def test_a_long_sitting_is_sampled_across_its_whole_span(tmp_path):
+    """A merged sitting can hold a hundred commits and only a few fit in the prompt: showing
+    its first ten would describe its morning and nothing about its evening."""
+    repo = _repo_with_history(tmp_path, prompts=[f"step {i}" for i in range(14)], gap_days=1)
+    stats, _ = _view_of(repo)
+    episode = story.merge_episodes(story.segment_episodes(story.story_stats(stats)), 0)
+    text = story._episode_headline(episode, 1)
+
+    ordered = episode.stats
+    assert story._stamp(ordered[0].timestamp) in text and story._stamp(ordered[-1].timestamp) in text
+    assert "more commits spread through the same stretch" in text  # and it says what it left out
+    shown = [stat for stat in ordered if story._stamp(stat.timestamp) in text]
+    assert len(shown) == story._HEADLINE_COMMITS
+    # Spread, not clustered: the middle of the run is represented too.
+    middle = ordered[len(ordered) // 2]
+    assert abs(ordered.index(shown[len(shown) // 2]) - ordered.index(middle)) <= 2
+
+
+def test_one_telling_is_always_one_call(tmp_path):
+    """Only _MAX_BATCHES batches are ever sent, so a telling split across two calls would
+    silently drop the tail of the part. The per-call ceiling has to fit a whole spread."""
+    repo = _repo_with_history(tmp_path, prompts=[f"step {i}" for i in range(30)], gap_days=1)
+    stats, sha_paths = _view_of(repo)
+    for wanted in (story._MOMENTS_COARSE, story._MOMENTS_FINE):
+        spread = story.spread(story.segment_episodes(story.story_stats(stats), sha_paths), wanted)
+        assert len(story._batches(spread)) == 1, f"a telling of {wanted} moments needs {len(spread)} calls"
+
+
 def test_a_commit_id_the_model_invents_is_dropped(tmp_path, monkeypatch):
     repo = _repo_with_history(tmp_path, prompts=["do the thing", "do the other thing"])
     stats, sha_paths = _view_of(repo)
@@ -475,9 +561,10 @@ def test_a_part_is_told_across_its_whole_range_not_from_one_end(tmp_path, monkey
     assert min(m["from"] for m in told) <= era["from"]
     assert max(m["to"] for m in told) >= era["to"]
     # ...and the material offered to the agent reached the far end of the era, not just its
-    # opening sittings.
+    # opening sittings. (Commits are named by subject and timestamp there, not by id: the
+    # writer no longer assigns them.)
     newest_in_era = max((stat for stat in ordered if stat.timestamp <= era["to"]), key=lambda s: s.timestamp)
-    assert newest_in_era.short in fake.prompts[0]
+    assert story._stamp(newest_in_era.timestamp) in fake.prompts[0]
 
 
 def test_a_build_covers_the_newest_stretch_not_the_whole_history(tmp_path, monkeypatch):
@@ -663,9 +750,11 @@ def test_extending_tells_only_what_is_new(tmp_path, monkeypatch):
 
     assert [c["id"] for c in built["moments"]] == ["one", "two"]  # kept, then continued
     assert newest not in [s for c in built["moments"][:1] for s in c["shas"]]
-    # The already-told commits are never sent to the agent a second time.
-    assert first[0] not in fake.prompts[0]
-    assert newest in fake.prompts[0]
+    # The already-told commits are never sent to the agent a second time. (The material names
+    # commits by subject and stamp; ids are not in it.)
+    by_sha = {stat.short: stat for stat in story.story_stats(stats2)}
+    assert by_sha[first[0]].subject not in fake.prompts[0]
+    assert "add the new thing" in fake.prompts[0]
     # ...and the earlier moments ride along as context so the telling continues.
     assert "The first push" in fake.prompts[0]
 
@@ -916,15 +1005,54 @@ def test_every_button_on_the_page_is_wired_to_something():
     assert not unwired, f"controls the script never touches: {unwired}"
 
 
-def test_the_zoom_control_has_a_stop_for_every_level_the_page_renders():
+def test_there_is_no_zoom_control_only_a_way_back_out():
+    """The row of zoom stops is gone. It offered depths that only mean something INSIDE a
+    part, from a view where no part was chosen: pressing "closer" from the parts either did
+    nothing or landed in a part nobody had picked. You go IN by clicking the thing you want,
+    and OUT with one button that says where it lands."""
     html = _page()
-    stops = re.findall(r'class="zstop[^"]*" data-z="(\d)"', html)
-    assert stops == ["2", "3", "4"], "the parts, the moments inside one, and closer"
-    # ...and each one is handled: the click handler maps a stop to setZoom.
-    assert "setZoom(Number(stop.dataset.z))" in html
-    # The closer zoom offers to generate when a part has nothing finer yet, from either place.
-    assert 'class="btn zcloser"' in html and 'e.target.closest(".zcloser")' in html
+    for gone in ["zstop", "zoombar", 'id="toolbar"', 'id="zoom"', "zlabel2"]:
+        assert gone not in html, f"the zoom control is still on the page ({gone})"
+    assert 'class="btn small zback"' in html and 'e.target.closest(".zback")' in html
+    # One step out, and it names the level it goes to rather than "back".
+    assert "setZoom(state.zoom === 4 ? 3 : 2)" in html
+    assert "&larr; back to ' + esc(part.title.toLowerCase())" in html
+    assert "&larr; back to ' + partsLabel()" in html
+
+
+def test_the_way_in_is_clicking_a_part_then_looking_closer():
+    """Every depth has to be reachable now that the stops are gone: a part row goes in, and
+    the one button under a part's moments goes deeper - generating that closer telling the
+    first time, and simply walking into it afterwards."""
+    html = _page()
+    assert "if (seg) setZoom(3, seg.dataset.part)" in html  # the parts list goes in
     assert '$("more-moments").addEventListener' in html
+    assert 'if ($("more-moments").dataset.told) { setZoom(4); return; }' in html
+    # ...and when there is nothing finer yet, both routes offer to write it.
+    assert 'class="btn zcloser"' in html and 'e.target.closest(".zcloser")' in html
+
+
+def test_the_closer_depth_never_silently_shows_the_coarser_telling():
+    """This is what made the "closer" stop look dead: with no level-2 moments the page fell
+    back to the level-1 list, so going closer redrew the view you were already on."""
+    html = _page()
+    body = html[html.index("function momentsInView()") : html.index("function hasCloser()")]
+    assert "if (state.zoom >= 4) return scoped.filter(m => (Number(m.level) || 1) >= 2);" in body
+    # The absence is the cue to offer the finer telling instead.
+    assert "state.zoom === 4 && part && !hasCloser()" in html
+
+
+def test_a_depth_that_needs_a_part_always_has_one():
+    """A hash typed by hand, a link from before, or a story rewritten with different parts can
+    all leave the page at depth 3 or 4 with no part selected: that used to paint nothing."""
+    html = _page()
+    normalize = html[html.index("function normalizeZoom()") : html.index("function setZoom(")]
+    assert "state.part = eras.length ? eras[eras.length - 1].id : null;" in normalize
+    assert "if (state.zoom === 2) { state.part = null; return; }" in normalize
+    # A story with no parts at all (an older store) has the flat moment list as its top.
+    assert "return ((state.story && state.story.eras) || []).length ? 2 : 3;" in html
+    # ...and it runs before every paint, not only on a click.
+    assert "  normalizeZoom();\n  renderBranches();" in html
 
 
 def test_the_page_no_longer_carries_the_features_that_did_not_work():
@@ -941,6 +1069,23 @@ def test_generation_waits_say_which_model_is_doing_it():
     assert "function engineLine()" in html
     assert '"written by " + engine' in html  # the blocking overlay
     assert 'engineLine() ? " (" + esc(engineLine())' in html  # the in-card one
+    # The overlay used to be raised only by renderBuild(), which never filled the engine
+    # line, so the one wait that actually costs a call was the one that said nothing.
+    assert "showEngine();          // also for a build" in html
+
+
+def test_the_spinner_is_up_before_the_server_answers():
+    """Starting a build is a POST that has to reach the daemon and hand the work to a thread.
+    Waiting for it left about a second in which "tell it again" had visibly done nothing, and
+    people pressed it again."""
+    html = _page()
+    builder = html[html.index("async function build(mode, options)") : html.index("function startPolling()")]
+    assert builder.index("showOverlay(") < builder.index("await post("), "the overlay waits for the server"
+    assert "BUILD_OPENING" in builder and "true);" in builder  # named for the mode, and stoppable
+    for mode in ("rewrite", "extend", "earlier", "part"):
+        assert f"  {mode}:" in html, f"a build started as {mode} has no opening line"
+    # ...and it comes back down if the build never starts.
+    assert builder.count("hideOverlay();") == 2
 
 
 def test_writing_one_moment_does_not_black_out_the_page():
