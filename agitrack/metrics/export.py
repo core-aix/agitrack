@@ -297,11 +297,9 @@ def _shim(*, base: str, files_index: dict[str, int], learn: bool, site_root: str
         }});
         if (target) {{
           clearInterval(tick);
-          // Only chrome that is ACTUALLY pinned to the top can cover the entry. The filter
+          // Only chrome that is ACTUALLY pinned to the top can cover the target. The filter
           // bar is sticky on a desktop but scrolls away on a phone, where reserving its
-          // (tall, wrapped) height parked the entry a screenful too low — with earlier
-          // commits filling the gap. So measure the stuck elements' bottom edge rather
-          // than blindly summing heights.
+          // (tall, wrapped) height parked the content a screenful too low.
           var inset = function(){{
             var bottom = 0;
             [".backtracebanner", ".controls"].forEach(function(sel){{
@@ -313,22 +311,20 @@ def _shim(*, base: str, files_index: dict[str, int], learn: bool, site_root: str
             }});
             return bottom + 10;
           }};
-          // Two scrolls, not one: the commit message lives in its own scrollable box
-          // (.dmsg, max-height-capped), so the WINDOW pins the expanded ENTRY right
-          // below the sticky chrome (the commit fills the view, no earlier entries
-          // showing) while the BOX scrolls internally so the trace starts at its top.
-          var box = target.closest ? target.closest(".dmsg") : null;
-          // The page scrolls smoothly by default (html{{scroll-behavior:smooth}}), which
-          // makes every correction animate — each next one then measures a position
-          // mid-flight and overshoots, so the view visibly ran down past the commit and
-          // crept back up. Corrections must be instant; restore the page default after.
+          // Park the Interaction Trace HEADING itself under the sticky chrome. The message
+          // used to sit in its own max-height box, so the heading could only be reached by
+          // scrolling that box and the window separately; now the message flows with the
+          // page, so one scroll puts the trace at the top with the rest of it below.
+          // The page scrolls smoothly by default (html{{scroll-behavior:smooth}}), which made
+          // every correction animate — each next one then measured a position mid-flight and
+          // overshot, so the view visibly ran past and crept back. Corrections are instant;
+          // the page default is restored after.
           var root = document.documentElement, priorBehavior = root.style.scrollBehavior;
           root.style.scrollBehavior = "auto";
           var done = function(){{ clearInterval(pin); root.style.scrollBehavior = priorBehavior; }};
           var settled = 0, corrections = 0;
           var pin = setInterval(function(){{
-            if (box) box.scrollTop += Math.round(target.getBoundingClientRect().top - box.getBoundingClientRect().top);
-            var drift = entry.getBoundingClientRect().top - inset();
+            var drift = target.getBoundingClientRect().top - inset();
             if (Math.abs(drift) <= 2) {{ if (++settled >= 4) done(); return; }}
             settled = 0;
             if (++corrections > 60) {{ done(); return; }}

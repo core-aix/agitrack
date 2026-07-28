@@ -208,3 +208,142 @@ def test_backtrace_commit_no_ai_history(tmp_path, monkeypatch, capsys):
     rc = backtrace_commit(repo, "newb", _input=lambda p: "y")
     assert rc == 0
     assert "No AI-made file changes" in capsys.readouterr().out
+
+
+def _agitrack_commit_message(subject: str, *, session_id: str, anchor: str, output: int) -> str:
+    """A commit message shaped like one aGiTrack itself wrote — trace plus the metadata that
+    records which session and which turn it covered."""
+    return (
+        f"<aGiTrack> {subject}\n\n"
+        "# Interaction Trace\n\n## User\n\nCreate calc.py\n\n## Agent\n\nDone.\n\n"
+        "# aGiTrack Metadata\n"
+        "commit_type: agent\n"
+        "backend: claude\n"
+        f"backend_session_id: {session_id}\n"
+        f"conversation_anchor: {anchor}\n"
+        f"tokens_since_last_commit_output: {output}\n"
+    )
+
+
+def test_turns_already_committed_by_agitrack_are_not_counted_again(tmp_path, monkeypatch, capsys):
+    """The repo this command exists for is one that used aGiTrack for PART of its life.
+
+    A turn aGiTrack already committed carries its trace and its token counts in that commit.
+    Re-attributing it here would print the same conversation twice in one history and count
+    the same tokens twice — and file overlap alone will happily land it on a later, untracked
+    commit, so "the tracked commit is skipped" is not enough on its own.
+    """
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home / ".claude"))
+    from agitrack.metrics import backtrace as bt
+
+    monkeypatch.setattr(bt.opencode, "sessions_under", lambda d: [])
+
+    repo = tmp_path / "proj"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    (repo / "README.md").write_text("# Proj\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "initial", date="2026-07-01T10:00:00+00:00")
+
+    # Turn 1 (m1) was committed BY aGiTrack; turn 2 (m2) touches the same file and was not.
+    rows = _write_edit_turn(
+        repo,
+        "Create calc.py",
+        "calc.py",
+        None,
+        "def add(a, b):\n    return a + b\n",
+        "2026-07-02T09:00:00",
+        uid=1,
+        mid="m1",
+    ) + _write_edit_turn(
+        repo,
+        "Add subtract",
+        "calc.py",
+        "def add(a, b):\n    return a + b\n",
+        "def add(a, b):\n    return a + b\n\n\ndef sub(a, b):\n    return a - b\n",
+        "2026-07-03T09:00:00",
+        uid=2,
+        mid="m2",
+    )
+    _plant_claude_session(home / ".claude", repo, "sess-aaa", rows)
+
+    (repo / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+    _git(repo, "add", "-A")
+    _git(
+        repo,
+        "commit",
+        "-m",
+        _agitrack_commit_message("add calc", session_id="sess-aaa", anchor="m1", output=40),
+        date="2026-07-02T10:00:00+00:00",
+    )
+    (repo / "calc.py").write_text("def add(a, b):\n    return a + b\n\n\ndef sub(a, b):\n    return a - b\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "add subtract", date="2026-07-03T10:00:00+00:00")
+
+    assert backtrace_commit(repo, "reconstructed", _input=lambda _p: "y") == 0
+
+    bodies = subprocess.run(
+        ["git", "log", "--format=%B%x00", "reconstructed"], cwd=repo, text=True, capture_output=True
+    ).stdout
+    annotated = subprocess.run(
+        ["git", "log", "-1", "--format=%B", "reconstructed"], cwd=repo, text=True, capture_output=True
+    ).stdout
+    # The untracked turn is annotated onto its own commit…
+    assert "## User\n\nAdd subtract" in annotated
+    # …and the turn aGiTrack already committed is NOT dragged along with it.
+    assert "Create calc.py" not in annotated
+    # Across the whole rewritten history each turn is traced exactly once: the aGiTrack
+    # commit keeps its own trace, the new annotation adds only the untracked one.
+    assert bodies.count("# Interaction Trace") == 2
+    assert bodies.count("## User") == 2
+    # And each turn's tokens are recorded once — the tracked commit's count is untouched.
+    assert bodies.count("tokens_since_last_commit_output:") == 2
+
+
+def test_a_forked_conversation_contributes_each_turn_once(tmp_path, monkeypatch):
+    """Resuming or rewinding replays the earlier turns into a NEW session id, so the same
+    turn is read from several transcripts. Keyed by the backend's own message id, only one
+    copy survives — otherwise a trace would be appended several times over and its tokens
+    summed once per copy."""
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home / ".claude"))
+    from agitrack.metrics import backtrace as bt
+
+    monkeypatch.setattr(bt.opencode, "sessions_under", lambda d: [])
+
+    repo = tmp_path / "proj"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    (repo / "README.md").write_text("# Proj\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "initial", date="2026-07-01T10:00:00+00:00")
+
+    shared = _write_edit_turn(
+        repo,
+        "Create calc.py",
+        "calc.py",
+        None,
+        "def add(a, b):\n    return a + b\n",
+        "2026-07-02T09:00:00",
+        uid=1,
+        mid="m1",
+    )
+    _plant_claude_session(home / ".claude", repo, "sess-old", shared)
+    _plant_claude_session(home / ".claude", repo, "sess-new", shared)  # the resumed fork replays it
+
+    (repo / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "add calc module", date="2026-07-02T10:00:00+00:00")
+
+    assert backtrace_commit(repo, "reconstructed", _input=lambda _p: "y") == 0
+
+    body = subprocess.run(
+        ["git", "log", "-1", "--format=%B", "reconstructed"], cwd=repo, text=True, capture_output=True
+    ).stdout
+    assert body.count("# Interaction Trace") == 1
+    assert body.count("## User") == 1  # one copy of the turn, not one per fork
+    assert body.count("tokens_since_last_commit_output:") == 1
+    assert "tokens_since_last_commit_output: 40" in body  # 40, not 80

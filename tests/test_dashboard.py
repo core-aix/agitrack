@@ -207,6 +207,51 @@ def test_phone_layout_uses_the_full_width(tmp_path):
     assert ".entry .ksub{min-width:0;flex-basis:100%}" in html
 
 
+def test_expanded_commit_message_has_no_box_and_reads_the_same_everywhere(tmp_path):
+    # The expanded message was drawn as a bordered, inset panel inside the already-indented
+    # detail — wasted width and read as a nested box on a phone. The rule is also no longer
+    # scoped to the commit log: the FILES view renders the same element and matched none of
+    # it, so its messages came out in the page's much larger body font.
+    from agitrack.metrics.web import shell_html
+
+    html = shell_html(_seeded(tmp_path))
+    assert ".dmsg{font-size:12.5px" in html  # one rule, both views
+    assert ".entry .detail .dmsg{" not in html  # …not scoped to the commit log any more
+    box = html.split(".dmsg{", 1)[1].split("}", 1)[0]
+    assert "border:" not in box and "background:" not in box  # no frame, no inset panel
+    # …and no scroll region of its own: a message that scrolled separately from the page
+    # read as a framed pane and left the #trace deep link with two things to scroll.
+    assert "max-height" not in box and "overflow" not in box
+    # …and the expanded detail draws no vertical rule of its own — the log's timeline rail
+    # already runs beside every entry, so a second stripe was redundant.
+    detail = html.split(".entry .detail{", 1)[1].split("}", 1)[0]
+    assert "border-left" not in detail and "padding-left:14px" in detail
+
+
+def test_footer_is_just_the_name_and_the_two_links(tmp_path):
+    from agitrack.metrics.web import shell_html
+
+    html = shell_html(_seeded(tmp_path))
+    footer = html.split("<footer>", 1)[1].split("</footer>", 1)[0]
+    assert "agent + git tracking" not in footer and "metrics from commit metadata" not in footer
+    assert "aGiTrack" in footer and ">website<" in footer and ">GitHub<" in footer
+
+
+def test_backtrace_explains_an_empty_diff_instead_of_claiming_no_changes(tmp_path):
+    # An empty diff means different things in the two views. On the live dashboard the
+    # commit really changed nothing. In a RECONSTRUCTION it usually means the change was
+    # made in a way the transcript never recorded as an edit — a shell command, a
+    # formatter, a generated file — since only the agent's file-editing tool calls are
+    # readable after the fact. "no changes to show" would simply be untrue there.
+    from agitrack.metrics.web import shell_html
+
+    html = shell_html(_seeded(tmp_path))
+    assert "BACKTRACE ? BACKTRACE_NO_DIFF :" in html  # the live wording is untouched
+    assert "No file changes were recovered for this turn." in html
+    assert "shell commands" in html and "formatters" in html  # …why it can be missing
+    assert "Run your agent through <b>aGiTrack</b> from now on" in html  # …and the fix
+
+
 def test_first_paint_never_fetches_the_shared_ref(tmp_path, monkeypatch):
     # The "/" response must not wait on the network: a slow shared-sessions fetch kept the
     # browser on a blank tab for seconds, before any loading screen could even arrive.
