@@ -155,6 +155,25 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
                     "application/json",
                     self._json(self._browser(ref).file_diff(_str(query, "path"), _str(query, "sha"))),
                 )
+            elif parsed.path == "/story":
+                # The storyline: the backend agent tells this branch's history as chapters
+                # (agitrack/metrics/story.py). Chrome only; the page fetches /story/state.
+                self._respond(
+                    "text/html; charset=utf-8",
+                    story_page.story_html(self.repo.repo).encode("utf-8"),
+                    cache_control="no-cache",
+                )
+            elif parsed.path == "/story/state":
+                stats, sha_paths = self._story_view(ref if ref != "HEAD" else "")
+                payload = story_page.story_state(
+                    self.repo.repo,
+                    stats,
+                    sha_paths,
+                    branch=ref if ref != "HEAD" else self.repo.current_branch(),
+                    branches=self._dashboard(ref).branches or self.repo.list_branches(),
+                    repo_name=str(self.repo.repo).rstrip("/").rsplit("/", 1)[-1],
+                )
+                self._respond("application/json", self._json(payload))
             elif parsed.path == "/learn":
                 # The learning page: the backend agent coaches the user from their own
                 # interaction traces (agitrack/metrics/learn.py). Chrome only; the page
