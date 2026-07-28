@@ -1042,6 +1042,24 @@ def test_the_closer_depth_never_silently_shows_the_coarser_telling():
     assert "state.zoom === 4 && part && !hasCloser()" in html
 
 
+def test_the_closer_view_says_what_it_did_differently():
+    """Told closer is just a different list of titles unless the page says why: it is the
+    SAME commits over the SAME days, cut into more pieces. Without that line the reader
+    cannot tell a finer telling from a second, unrelated one."""
+    html = _page()
+    assert "function closerNote()" in html
+    note = html[html.index("function closerNote()") : html.index("function renderEras()")]
+    assert '"The same " + part.commits + " commits over the same "' in note
+    assert "cut into " in note and "instead of " in note
+    assert "Nothing new happened here" in note
+    # It is rendered under the heading of the closer view, and only there.
+    assert "if (state.zoom === 4) html += '<p class=\"zwhat\">' + esc(closerNote())" in html
+    # The two ways in say which one costs an agent call and what it will produce.
+    assert '"\\u{1F50D} look closer: the same days as " + fine + " moments"' in html
+    assert 'tell this part closer (these " + newestFirst.length + " moments, cut smaller)' in html
+    assert "cuts them into more, shorter moments" in html
+
+
 def test_a_depth_that_needs_a_part_always_has_one():
     """A hash typed by hand, a link from before, or a story rewritten with different parts can
     all leave the page at depth 3 or 4 with no part selected: that used to paint nothing."""
