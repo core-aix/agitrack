@@ -19,7 +19,7 @@ Layout of the exported directory::
       filelog/<n>.json            /filelog per file (n = index in files.json order)
       filediff/<n>-<sha12>.json   /filediff per (file, change)
       state.json                  /learn/state (profile, committers, engine info)
-      story.json                  /story/state (the stored story, chapters and outline)
+      story.json                  /story/state (the stored story: eras, moments, outline)
 
 A ``fetch`` shim injected into both pages maps the endpoints the live page calls to those
 files. The demo ships the LAST 30 DAYS of history (anchored to the newest commit, so a
@@ -35,7 +35,7 @@ to run the real thing.
 The learn profile comes from the repo's learning store (``.agitrack/learning.json``): the
 exporting user's profile, or the store's single profile when the exporting identity has
 none (CI exports a checked-in fixture that way). The storyline ships the same way from
-``.agitrack/story.json``, and the diffs its chapters point at are baked even when they fall
+``.agitrack/story.json``, and the diffs its moments point at are baked even when they fall
 outside the 30-day window, since a story is mostly about older history.
 """
 
@@ -161,8 +161,8 @@ def _story_state(dash: Dashboard, repo: GitRepo, sha_paths: dict[str, set[str]])
     story = state.get("story")
     if isinstance(story, dict):
         story.pop("covered_shas", None)
-        for chapter in story.get("chapters") or []:
-            chapter.pop("shas", None)
+        for moment in story.get("moments") or []:
+            moment.pop("shas", None)
     # A plausible engine note rather than resolving a backend on the export machine (CI has
     # none): the demo never generates anything anyway.
     state["engine"] = {"backend": "claude", "model": "", "backend_source": "session", "model_source": "auto"}
@@ -174,8 +174,8 @@ def _story_shas(state: dict) -> list[str]:
     outside the demo's 30-day window (a story is mostly about older history)."""
     story = state.get("story") or {}
     shas: list[str] = []
-    for chapter in story.get("chapters") or []:
-        for row in chapter.get("commits") or []:
+    for moment in story.get("moments") or []:
+        for row in moment.get("commits") or []:
             sha = str(row.get("sha") or "")
             if sha and sha not in shas:
                 shas.append(sha)
@@ -315,7 +315,7 @@ def _shim(*, base: str, files_index: dict[str, int], page: str, site_root: str) 
     // Writing a story needs a live agent; every control that would start (or undo) one
     // answers with the same fixed toast as the dashboard's disabled filters.
     if (STORY) {{
-      ["write", "extend", "earlier", "rewrite", "forget", "build-cancel"].forEach(function(id){{
+      ["write", "extend", "earlier", "earlier2", "rewrite", "forget", "build-cancel", "e-save"].forEach(function(id){{
         var el = document.getElementById(id);
         if (!el) return;
         el.addEventListener("click", function(e){{

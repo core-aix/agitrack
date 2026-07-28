@@ -1156,6 +1156,7 @@ h2.section::before{content:"# ";color:var(--amber)}
 /* ---- log tabs (commits / files) — title on its own line, tabs left below it ---- */
 .logsection-head{margin:38px 0 14px}
 .logsection-head h2.section{margin:0 0 12px}
+.logsection-head .storycta{margin:0 0 14px}
 .logtabs{display:flex;gap:8px;justify-content:flex-start}
 /* BOTH tabs are amber (like the reset button), never grey: a dim grey unselected tab read as
    "disabled" rather than "clickable". The selected one is told apart by a lit-up background,
@@ -1166,7 +1167,11 @@ h2.section::before{content:"# ";color:var(--amber)}
 /* Hover on the unselected tab: a tint, so it never impersonates the filled selected state. */
 .logtab:not(.active):hover{background:rgba(255,180,84,.22)}
 .logpane[hidden]{display:none}
-.panehead{display:flex;justify-content:flex-end;align-items:center;margin:0 0 10px}
+.panehead{display:flex;justify-content:flex-end;align-items:center;margin:0}
+/* Tabs and the pane's control (sort / file filter) sit on ONE line, with room above them so
+   they read as the start of the log rather than part of the story card above. */
+.panebar{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;
+  margin:22px 0 12px}
 
 /* ---- file browser (folder tree) — names flush-left, folders collapsible ---- */
 .filesearch{background:var(--ink);color:var(--fg);border:1px solid var(--line);font-family:var(--mono);
@@ -1322,18 +1327,26 @@ __UPDATE_BANNER__
 
   <div class="logsection-head">
     <h2 class="section">log</h2>
+    <a class="learncta storycta" id="storycta" href="story" title="Open the storyline">
+      <span class="lc-icon">&#128214;</span>
+      <span class="lc-text"><b>Read it as a story.</b>
+      The same history below, zoomed out: what changed, why, and what the developers were
+      working out at each turn.</span>
+      <span class="lc-btn">open story &rarr;</span>
+    </a>
+  </div>
+  <div class="panebar">
     <div class="logtabs">
       <button class="logtab active" data-tab="commits">commits</button>
       <button class="logtab" data-tab="files" id="tab-files-btn">files</button>
     </div>
+    <div class="panehead" id="head-commits"><div class="logsort"><label for="f-sort">sort</label><select id="f-sort" title="Sort the filtered commits">
+      <option value="date">newest first</option>
+      <option value="lines">most lines changed</option>
+      <option value="tokens">most output tokens</option>
+    </select></div></div>
+    <div class="panehead" id="head-files" hidden><input id="file-search" class="filesearch" type="search" placeholder="filter files…" autocomplete="off"></div>
   </div>
-  <a class="learncta storycta" id="storycta" href="story" title="Open the storyline">
-    <span class="lc-icon">&#128214;</span>
-    <span class="lc-text"><b>Read it as a story.</b>
-    The same commits below, told as chapters: the turning points, what the developers were
-    working out at each one, and the diffs underneath.</span>
-    <span class="lc-btn">open story &rarr;</span>
-  </a>
 
   <div class="logpane" id="pane-commits">
     <div class="logintro" id="logintro" hidden>Each entry below is one <b>reconstructed agent turn</b> from your
@@ -1342,15 +1355,9 @@ __UPDATE_BANNER__
     with the agent. Nothing here has been written to git; a turn with a <b>committed</b> badge is already in your
     history with aGiTrack metadata, and <code>agitrack --backtrace commit</code> bakes the rest into real commits
     on a new branch.</div>
-    <div class="panehead"><div class="logsort"><label for="f-sort">sort</label><select id="f-sort" title="Sort the filtered commits">
-      <option value="date">newest first</option>
-      <option value="lines">most lines changed</option>
-      <option value="tokens">most output tokens</option>
-    </select></div></div>
     <div class="log" id="commitlog"></div>
   </div>
   <div class="logpane" id="pane-files" hidden>
-    <div class="panehead"><input id="file-search" class="filesearch" type="search" placeholder="filter files…" autocomplete="off"></div>
     <div class="filebrowse" id="filebrowse"></div>
   </div>
 
@@ -2269,6 +2276,11 @@ function showLogTab(tab){
   const pc = $("pane-commits"), pf = $("pane-files");
   if(pc) pc.hidden = tab !== "commits";
   if(pf) pf.hidden = tab !== "files";
+  // The tabs and the pane's own control (sort / file filter) share one row, so the control
+  // has to follow the tab.
+  const hc = $("head-commits"), hf = $("head-files");
+  if(hc) hc.hidden = tab !== "commits";
+  if(hf) hf.hidden = tab !== "files";
 }
 function fileChangeHtml(c, i){
   const when = c.ts ? new Date(c.ts*1000).toISOString().slice(0,16).replace("T"," ")+" UTC" : "";

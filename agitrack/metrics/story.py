@@ -3,13 +3,13 @@
 Where the dashboard shows WHAT changed and the learn page coaches the person behind it,
 the storyline answers "how did this project get here?". It reads the same commit metadata
 and interaction traces and hands them to the coding-agent BACKEND, which writes a timeline
-of CHAPTERS: turning points, features that landed, things that were torn out and rebuilt.
+of MOMENTS: turning points, features that landed, things that were torn out and rebuilt.
 
 Four levels of detail, so a reader can stop wherever they like:
 
 1. the arc (a title, a tagline, acts),
-2. a chapter card (when, what, one line of why),
-3. the chapter opened: the full telling plus WHAT THEY ASKED FOR at the turning points, and
+2. a moment card (when, what, one line of why),
+3. the moment opened: the full telling plus WHAT THEY ASKED FOR at the turning points, and
 4. the commits behind it, each expandable into its real diff.
 
 Those asks are never invented. The quotes are the developer's own prompts, read
@@ -60,28 +60,28 @@ _EPISODE_MAX_COMMITS = 12
 #
 #   1. an OVERVIEW pass reads the WHOLE history once, cheaply, and names the eras: that is
 #      the coarse story, always complete, however long the project is;
-#   2. an OUTLINE pass writes chapter headlines for the most RECENT stretch only, because
+#   2. an OUTLINE pass writes moment headlines for the most RECENT stretch only, because
 #      that is what a reader opens the page for (older stretches on request); and
-#   3. a chapter is WRITTEN OUT the first time someone opens it: one call, over the full
-#      material of just that chapter, cached in the store forever after.
+#   3. a moment is WRITTEN OUT the first time someone opens it: one call, over the full
+#      material of just that moment, cached in the store forever after.
 #
 # So a build is two calls and under a minute, and depth is paid for only where a reader goes.
 _BATCH_EPISODES = 10
 _BATCH_CHARS = 4000
 # Outline calls per build. ONE: a build covers the newest stretch and stops. Forty-five
-# chapters in one go is both a long wait and more than anyone reads at once; "go further
+# moments in one go is both a long wait and more than anyone reads at once; "go further
 # back" fetches the next stretch when it is actually wanted.
 _MAX_BATCHES = 1
-# Per-call bounds. The outline call reads a lot and writes little; a chapter is the reverse.
-_CHAPTER_TIMEOUT_SECONDS = 300
+# Per-call bounds. The outline call reads a lot and writes little; a moment is the reverse.
+_MOMENT_TIMEOUT_SECONDS = 300
 _EXPAND_TIMEOUT_SECONDS = 240
 _ARC_TIMEOUT_SECONDS = 180
 # How long a build may wait for the learn page's agent lock before giving up (the two pages
 # share it so a laptop never runs two backend CLIs at once).
 _LOCK_WAIT_SECONDS = 420
 
-# What a chapter can be about. The agent picks one; anything else falls back to "chapter".
-KICKERS = ("turning point", "feature", "fix", "refactor", "milestone", "experiment", "chapter")
+# What a moment can be about. The agent picks one; anything else falls back to "moment".
+KICKERS = ("turning point", "feature", "fix", "refactor", "milestone", "experiment", "moment")
 
 # How the story is told. Purely a prompt flavour, stored with the story so a rebuild in the
 # same tone is reproducible and the page can show which one produced what you are reading.
@@ -107,17 +107,26 @@ DEFAULT_TONE = "playful"
 # usually gets it right when told exactly what went wrong.
 _RETRY_NUDGE = (
     "\n\nIMPORTANT: your previous answer could not be used. Reply with ONE JSON object only, "
-    'shaped {"chapters": [...]}, and put in each chapter\'s "shas" ONLY commit ids copied '
+    'shaped {"moments": [...]}, and put in each moment\'s "shas" ONLY commit ids copied '
     "exactly from the material above."
 )
 
 _STORY_SYSTEM = (
-    "You are the storyteller built into aGiTrack, a tool that records how people build "
-    "software with coding agents. You are given real commit metadata and the developer's own "
-    "prompts to their coding agent, and you turn them into the story of the project: what "
-    "changed, why it mattered, and what the developer was clearly trying to do. Be concrete "
-    "and specific, never generic. Use simple everyday words and short sentences. Never invent "
-    "a fact that is not in the material: if something is unclear, say less rather than more. "
+    # The persona is the whole difference between a changelog and something someone reads to
+    # the end. It is a documentary narrator, not a release-notes generator: it has read every
+    # commit and every prompt, it knows what the people were trying to do, and it tells you
+    # the part you would have wanted to be told.
+    "You narrate the story of a software project the way a good documentary does: you have "
+    "read every commit and every message its developers typed to their coding agent, and you "
+    "tell the part a listener would actually want. You are curious about people, not "
+    "impressed by machinery. "
+    "How you write: short sentences. Everyday words. One concrete detail beats three general "
+    "ones. Name the thing that broke, the assumption that turned out wrong, the small "
+    "decision everything followed from. A number only when it lands ('twelve tries', '150 MB "
+    "of transcript'). Never a sentence that would fit any project ('various improvements', "
+    "'enhanced the system', 'this commit'), never a list of features, never marketing. "
+    "You may be wry. You may not exaggerate: everything you say has to be in the material, "
+    "and if something is unclear you say less rather than more. "
     # The people in these commits are real, and the material never states anyone's pronouns.
     # Guessing from a name or a writing style misgenders someone in a story about their own
     # work, which the neutral form never does.
@@ -179,7 +188,11 @@ class StoryStore:
 
     def get(self, key: str) -> dict[str, Any] | None:
         story = self.load().get("stories", {}).get(key or "HEAD")
-        return story if isinstance(story, dict) else None
+        if not isinstance(story, dict):
+            return None
+        if "moments" not in story and "chapters" in story:
+            story["moments"] = story.pop("chapters")  # written before the zoom levels were named
+        return story
 
     def put(self, key: str, story: dict[str, Any]) -> None:
         with _STORE_LOCK:
@@ -196,10 +209,10 @@ class StoryStore:
     def any_story(self) -> dict[str, Any] | None:
         """The one story to ship when the caller has no branch to ask for (the static
         export): the richest stored story, so a demo built on any branch shows content."""
-        stories = [s for s in self.load().get("stories", {}).values() if isinstance(s, dict) and s.get("chapters")]
+        stories = [s for s in self.load().get("stories", {}).values() if isinstance(s, dict) and s.get("moments")]
         if not stories:
             return None
-        return max(stories, key=lambda s: len(s.get("chapters") or []))
+        return max(stories, key=lambda s: len(s.get("moments") or []))
 
 
 # --------------------------------------------------------------------------- episodes
@@ -386,30 +399,30 @@ def _batch_prompt(batch: list[Episode], tone: str, context: str) -> str:
     prior = f"\nEARLIER IN THE STORY (do not retell these, continue from them):\n{context}\n" if context else ""
     return f"""Below are consecutive episodes from one repository's history, oldest first. One line each: date, how many commits, lines moved, the biggest commit subject, what the developer asked for, and the commit ids.
 
-Turn them into STORY CHAPTER HEADLINES, in chronological order. Merge neighbouring episodes that are clearly the same push into one chapter (aim for roughly one chapter per two or three episodes, fewer when they belong together). Every commit id listed must belong to exactly one chapter.
+Turn them into MOMENTS of the story, in chronological order, one headline each. Merge neighbouring episodes that are clearly the same push into one moment (aim for roughly one moment per two or three episodes, fewer when they belong together). Every commit id listed must belong to exactly one moment.
 
 {voice}
 
-Write it so someone who has never seen this repo WANTS to read the next chapter. What makes it interesting is always a specific fact: the thing that broke, the assumption that turned out wrong, the small decision everything else followed from. Never filler ("various improvements", "several fixes", "this commit"), never a category where a fact would do.
+Write it so someone who has never seen this repo WANTS to read the next moment. What makes it interesting is always a specific fact: the thing that broke, the assumption that turned out wrong, the small decision everything else followed from. Never filler ("various improvements", "several fixes", "this commit"), never a category where a fact would do.
 
-For each chapter:
-- "title": the thing that actually happened, named. Specific enough that it could only belong to this chapter. Never a category like "Improvements", "Bug fixes" or "Dashboard work".
+For each moment:
+- "title": the thing that actually happened, named. Specific enough that it could only belong to this moment. Never a category like "Improvements", "Bug fixes" or "Dashboard work".
 - "kicker": one of {", ".join(KICKERS)}.
-- "emoji": a single emoji that fits the chapter.
+- "emoji": a single emoji that fits the moment.
 - "summary": ONE short sentence (under 20 words) with a hook: what was wrong, what got decided, or what surprised them. A reader skimming only the summaries should still get the story.
-- "shas": every commit id belonging to this chapter, copied exactly.
+- "shas": every commit id belonging to this moment, copied exactly.
 
-Do NOT write the body of the chapter here. Headlines only.
+Headlines only here: the body of a moment is written later, and only if someone zooms into it.
 {prior}
-Reply with ONE JSON object: {{"chapters": [ ... ]}}
+Reply with ONE JSON object: {{"moments": [ ... ]}}
 
 MATERIAL:
 {digest}"""
 
 
-def _expand_prompt(chapter: dict, stats: list[CommitStat], sha_paths: dict[str, set[str]], tone: str) -> str:
-    """Write out ONE chapter, given everything that happened in it. This is the call a reader
-    pays for by opening the chapter, so it sees the full material: every commit subject, the
+def _expand_prompt(moment: dict, stats: list[CommitStat], sha_paths: dict[str, set[str]], tone: str) -> str:
+    """Write out ONE moment, given everything that happened in it. This is the call a reader
+    pays for by opening the moment, so it sees the full material: every commit subject, the
     prompts behind them, and the files they touched."""
     voice = STORY_TONES.get(tone, STORY_TONES[DEFAULT_TONE])
     lines = []
@@ -422,10 +435,10 @@ def _expand_prompt(chapter: dict, stats: list[CommitStat], sha_paths: dict[str, 
             paths[path] = paths.get(path, 0) + 1
     material = "\n".join(lines)[:9000]
     top = ", ".join(path for path, _ in sorted(paths.items(), key=lambda kv: (-kv[1], kv[0]))[:10])
-    return f"""Write out one chapter of a repository's story. Its headline is already written; do not change it.
+    return f"""Someone just zoomed into one moment of a repository's story. Its headline is already written; do not change it. Tell them what they came for.
 
-CHAPTER: "{chapter.get("title", "")}" ({chapter.get("kicker", "chapter")}, {chapter.get("when", "")})
-SUMMARY ALREADY SHOWN TO THE READER: {chapter.get("summary", "")}
+MOMENT: "{moment.get("title", "")}" ({moment.get("kicker", "moment")}, {moment.get("when", "")})
+SUMMARY ALREADY SHOWN TO THE READER: {moment.get("summary", "")}
 
 {voice}
 
@@ -445,7 +458,7 @@ def act_slices(items: list[dict], target: int = 5) -> list[tuple[int, int]]:
     """Split dated items into contiguous eras, as ``(start, end)`` index pairs.
 
     The BOUNDARIES are decided here, not by the agent. Asking a model to both group and name
-    left one act covering 26 of 44 chapters and titled after the first three of them. Even
+    left one act covering 26 of 44 moments and titled after the first three of them. Even
     spans, nudged onto the biggest pause between items so an era starts where the work
     actually did, are always defensible; naming is all the agent is asked for."""
     total = len(items)
@@ -467,7 +480,7 @@ def act_slices(items: list[dict], target: int = 5) -> list[tuple[int, int]]:
 def _era_rows(episodes: list[Episode]) -> list[dict]:
     """The coarse story's skeleton: the whole history split into eras, with the numbers that
     describe each one. Computed from the episodes themselves, so it exists (and is complete)
-    however few chapters have been written."""
+    however few moments have been written."""
     items = [{"from": episode.start, "to": episode.end} for episode in episodes]
     rows = []
     for start, end in act_slices(items):
@@ -581,7 +594,7 @@ def _thoughts(raw: object, by_sha: dict[str, CommitStat], claimed: list[str]) ->
     if out:
         return out
     # The model named nothing usable: fall back to the most prompt-heavy commit of the
-    # chapter, so a chapter still shows the developer's voice rather than an empty section.
+    # moment, so a moment still shows the developer's voice rather than an empty section.
     for sha in claimed:
         stat = by_sha.get(sha)
         quotes = _prompts_of(stat, limit=1, chars=600) if stat is not None else []
@@ -590,7 +603,7 @@ def _thoughts(raw: object, by_sha: dict[str, CommitStat], claimed: list[str]) ->
     return []
 
 
-def _chapter_stats(shas: list[str], by_sha: dict[str, CommitStat], sha_paths: dict[str, set[str]]) -> dict:
+def _moment_stats(shas: list[str], by_sha: dict[str, CommitStat], sha_paths: dict[str, set[str]]) -> dict:
     stats = [by_sha[sha] for sha in shas if sha in by_sha]
     paths: dict[str, int] = {}
     for stat in stats:
@@ -629,19 +642,19 @@ def _commit_rows(shas: list[str], by_sha: dict[str, CommitStat]) -> list[dict]:
     return rows
 
 
-def _normalize_chapters(
+def _normalize_moments(
     raw: object,
     batch: list[Episode],
     by_sha: dict[str, CommitStat],
     sha_paths: dict[str, set[str]],
     used_ids: set[str],
 ) -> list[dict]:
-    """Validate one agent reply into chapters, and make sure the batch's commits are all
-    accounted for: an unclaimed commit is folded into the nearest chapter in time rather
+    """Validate one agent reply into moments, and make sure the batch's commits are all
+    accounted for: an unclaimed commit is folded into the nearest moment in time rather
     than quietly vanishing from the story."""
     batch_shas = [sha for episode in batch for sha in episode.shas]
     allowed = {sha for sha in batch_shas}
-    chapters: list[dict] = []
+    moments: list[dict] = []
     for index, item in enumerate(raw if isinstance(raw, list) else []):
         if not isinstance(item, dict):
             continue
@@ -650,46 +663,46 @@ def _normalize_chapters(
         if not shas or not title:
             continue
         kicker = str(item.get("kicker") or "").strip().lower()
-        chapter = {
-            "id": _unique_id(_slug(item.get("id") or title, f"chapter-{index}"), used_ids),
+        moment = {
+            "id": _unique_id(_slug(item.get("id") or title, f"moment-{index}"), used_ids),
             "title": title,
-            "kicker": kicker if kicker in KICKERS else "chapter",
+            "kicker": kicker if kicker in KICKERS else "moment",
             "emoji": _emoji(item.get("emoji")),
             "summary": _text(item.get("summary"), 200),
-            # A chapter is a paragraph, not an essay: the commits under it carry the detail.
+            # A moment is a paragraph, not an essay: the commits under it carry the detail.
             "detail": _shorten(str(item.get("detail") or item.get("detail_md") or ""), 600),
             "shas": shas,
-            # Resolved once the chapter's final commit list is known (below), so a fallback
+            # Resolved once the moment's final commit list is known (below), so a fallback
             # quote can come from a commit that was folded in afterwards.
             "_thoughts": item.get("thoughts"),
         }
-        chapters.append(chapter)
-    if not chapters:
+        moments.append(moment)
+    if not moments:
         return []
-    _absorb_unclaimed(chapters, batch_shas, by_sha)
-    for chapter in chapters:
-        chapter["shas"] = sorted(chapter["shas"], key=lambda sha: (by_sha[sha].timestamp, sha))
-        _finalize_chapter(chapter, by_sha, sha_paths)
-    chapters.sort(key=lambda chapter: (chapter["from"], chapter["to"]))
-    return chapters
+    _absorb_unclaimed(moments, batch_shas, by_sha)
+    for moment in moments:
+        moment["shas"] = sorted(moment["shas"], key=lambda sha: (by_sha[sha].timestamp, sha))
+        _finalize_moment(moment, by_sha, sha_paths)
+    moments.sort(key=lambda moment: (moment["from"], moment["to"]))
+    return moments
 
 
-def _fallback_chapters(
+def _fallback_moments(
     batch: list[Episode], by_sha: dict[str, CommitStat], sha_paths: dict[str, set[str]], used_ids: set[str]
 ) -> list[dict]:
-    """Plain chapters written from the commits alone, with no agent involved.
+    """Plain moments written from the commits alone, with no agent involved.
 
     Used when a reply comes back unusable twice: one bad answer in the middle of a long
-    build must not throw away the chapters around it, and a gap in the timeline would be
+    build must not throw away the moments around it, and a gap in the timeline would be
     worse than a plainly-told stretch. Marked ``auto`` so the page can say who wrote it."""
-    chapters = []
+    moments = []
     for episode in batch:
         headline = max(episode.stats, key=lambda stat: (stat.lines, stat.timestamp))
         subjects = [stat.subject for stat in episode.stats if stat.subject][:6]
-        chapter = {
+        moment = {
             "id": _unique_id(_slug(headline.subject, f"episode-{episode.index}"), used_ids),
             "title": headline.subject[:110] or f"{len(episode.stats)} commits",
-            "kicker": "chapter",
+            "kicker": "moment",
             "emoji": "✦",
             "auto": True,
             "summary": (
@@ -700,9 +713,9 @@ def _fallback_chapters(
             "shas": list(episode.shas),
             "_thoughts": None,
         }
-        _finalize_chapter(chapter, by_sha, sha_paths)
-        chapters.append(chapter)
-    return chapters
+        _finalize_moment(moment, by_sha, sha_paths)
+        moments.append(moment)
+    return moments
 
 
 def _unique_id(base: str, used: set[str]) -> str:
@@ -714,32 +727,32 @@ def _unique_id(base: str, used: set[str]) -> str:
     return candidate
 
 
-def _absorb_unclaimed(chapters: list[dict], batch_shas: list[str], by_sha: dict[str, CommitStat]) -> None:
-    """Give every commit of the batch a home: unclaimed ones join the chapter closest in
-    time. Without this a chapter's "3 commits" could silently omit real work."""
-    claimed = {sha for chapter in chapters for sha in chapter["shas"]}
+def _absorb_unclaimed(moments: list[dict], batch_shas: list[str], by_sha: dict[str, CommitStat]) -> None:
+    """Give every commit of the batch a home: unclaimed ones join the moment closest in
+    time. Without this a moment's "3 commits" could silently omit real work."""
+    claimed = {sha for moment in moments for sha in moment["shas"]}
     for sha in batch_shas:
         if sha in claimed:
             continue
         when = by_sha[sha].timestamp
         nearest = min(
-            chapters,
-            key=lambda chapter: min(abs(when - by_sha[other].timestamp) for other in chapter["shas"]),
+            moments,
+            key=lambda moment: min(abs(when - by_sha[other].timestamp) for other in moment["shas"]),
         )
         nearest["shas"].append(sha)
 
 
-def _finalize_chapter(chapter: dict, by_sha: dict[str, CommitStat], sha_paths: dict[str, set[str]]) -> None:
-    # The outline pass leaves these empty: a chapter is written out the first time it is
-    # opened (expand_chapter), so nobody waits for prose nobody has asked to read.
-    raw_thoughts = chapter.pop("_thoughts", None)
-    chapter["thoughts"] = _thoughts(raw_thoughts, by_sha, chapter["shas"]) if raw_thoughts else []
-    times = [by_sha[sha].timestamp for sha in chapter["shas"] if sha in by_sha]
-    chapter["from"] = min(times) if times else 0
-    chapter["to"] = max(times) if times else 0
-    chapter["when"] = _day(chapter["from"])
-    chapter["stats"] = _chapter_stats(chapter["shas"], by_sha, sha_paths)
-    chapter["commits"] = _commit_rows(chapter["shas"], by_sha)
+def _finalize_moment(moment: dict, by_sha: dict[str, CommitStat], sha_paths: dict[str, set[str]]) -> None:
+    # The outline pass leaves these empty: a moment is written out the first time it is
+    # opened (expand_moment), so nobody waits for prose nobody has asked to read.
+    raw_thoughts = moment.pop("_thoughts", None)
+    moment["thoughts"] = _thoughts(raw_thoughts, by_sha, moment["shas"]) if raw_thoughts else []
+    times = [by_sha[sha].timestamp for sha in moment["shas"] if sha in by_sha]
+    moment["from"] = min(times) if times else 0
+    moment["to"] = max(times) if times else 0
+    moment["when"] = _day(moment["from"])
+    moment["stats"] = _moment_stats(moment["shas"], by_sha, sha_paths)
+    moment["commits"] = _commit_rows(moment["shas"], by_sha)
 
 
 # --------------------------------------------------------------------------- outline
@@ -814,10 +827,10 @@ def _ask(choice, prompt: str, timeout: int) -> dict | None:
 
 
 def _material(stats: list[CommitStat], story: dict | None, mode: str) -> tuple[list[CommitStat], str]:
-    """Which commits this build tells, and where their chapters go.
+    """Which commits this build tells, and where their moments go.
 
     Always a subset of the commits the story does NOT already cover, so no commit can end
-    up in two chapters and no tokens are ever spent telling the same thing twice.
+    up in two moments and no tokens are ever spent telling the same thing twice.
 
     * ``rewrite`` - everything (the newest of it, once the call budget bites); replaces.
     * ``extend`` - what landed after the story's newest covered commit; appends.
@@ -828,11 +841,11 @@ def _material(stats: list[CommitStat], story: dict | None, mode: str) -> tuple[l
         return kept, "replace"
     covered = set(story.get("covered_shas") or [])
     fresh = [stat for stat in kept if stat.sha not in covered]
-    chapters = story.get("chapters") or []
+    moments = story.get("moments") or []
     if mode == "earlier":
-        oldest = min((chapter.get("from", 0) for chapter in chapters), default=0)
+        oldest = min((moment.get("from", 0) for moment in moments), default=0)
         return [stat for stat in fresh if not oldest or stat.timestamp <= oldest], "prepend"
-    newest = max((chapter.get("to", 0) for chapter in chapters), default=0)
+    newest = max((moment.get("to", 0) for moment in moments), default=0)
     return [stat for stat in fresh if not newest or stat.timestamp >= newest], "append"
 
 
@@ -858,7 +871,7 @@ def build_story(
     stop: threading.Event | None = None,
 ) -> dict[str, Any]:
     """Generate (or extend) the story for ``branch`` and persist it. Blocking: this is what
-    the background worker runs. Chapters are saved as each batch lands, so the page shows
+    the background worker runs. Moments are saved as each batch lands, so the page shows
     the story appearing rather than a spinner that ends in everything at once."""
     store = StoryStore(root)
     story_key = branch or "HEAD"
@@ -884,38 +897,38 @@ def build_story(
     left_behind = len(all_batches) - len(batches)
     choice = learn_page.resolve_learning_backend(Path(root))
     if key:
-        _set_progress(key, phase="reading the commits", done=0, total=len(batches) + 1, chapters=0)
+        _set_progress(key, phase="reading the commits", done=0, total=len(batches) + 1, moments=0)
 
-    kept = list(existing.get("chapters") or []) if (existing and placement != "replace") else []
-    used_ids = {str(chapter.get("id") or "") for chapter in kept}
+    kept = list(existing.get("moments") or []) if (existing and placement != "replace") else []
+    used_ids = {str(moment.get("id") or "") for moment in kept}
     produced: list[dict] = []
     context = ""
     if placement == "append" and kept:
-        context = "\n".join(f"- {chapter.get('title', '')}: {chapter.get('summary', '')}" for chapter in kept[-4:])
+        context = "\n".join(f"- {moment.get('title', '')}: {moment.get('summary', '')}" for moment in kept[-4:])
 
     for number, batch in enumerate(batches, start=1):
         if stop is not None and stop.is_set():
             raise StoryError("cancelled")
         if key:
-            _set_progress(key, phase=f"writing chapters ({number} of {len(batches)})", done=number - 1)
+            _set_progress(key, phase=f"writing moments ({number} of {len(batches)})", done=number - 1)
         prompt = _batch_prompt(batch, tone, context)
-        chapters: list[dict] = []
+        moments: list[dict] = []
         for attempt in range(2):
             if stop is not None and stop.is_set():
                 raise StoryError("cancelled")
-            raw = _ask(choice, prompt if attempt == 0 else prompt + _RETRY_NUDGE, _CHAPTER_TIMEOUT_SECONDS)
-            chapters = _normalize_chapters((raw or {}).get("chapters"), batch, by_sha, sha_paths, used_ids)
-            if chapters:
+            raw = _ask(choice, prompt if attempt == 0 else prompt + _RETRY_NUDGE, _MOMENT_TIMEOUT_SECONDS)
+            moments = _normalize_moments((raw or {}).get("moments"), batch, by_sha, sha_paths, used_ids)
+            if moments:
                 break
-        if not chapters:
+        if not moments:
             # Two unusable answers about this stretch. Tell it plainly from the commits and
             # keep going: one bad reply must not cost the whole build.
-            chapters = _fallback_chapters(batch, by_sha, sha_paths, used_ids)
-        produced.extend(chapters)
-        context = "\n".join(f"- {chapter['title']}: {chapter['summary']}" for chapter in produced[-4:])
+            moments = _fallback_moments(batch, by_sha, sha_paths, used_ids)
+        produced.extend(moments)
+        context = "\n".join(f"- {moment['title']}: {moment['summary']}" for moment in produced[-4:])
         if key:
-            _set_progress(key, done=number, chapters=len(kept) + len(produced))
-        # Persist as we go: a build interrupted after batch 3 leaves 3 real chapters, not
+            _set_progress(key, done=number, moments=len(kept) + len(produced))
+        # Persist as we go: a build interrupted after batch 3 leaves 3 real moments, not
         # nothing, and the page renders them the moment they exist.
         story = _assemble(
             kept, produced, placement, story_key, tone, existing, by_sha, choice, left_behind, partial=True
@@ -932,11 +945,11 @@ def build_story(
     try:
         overview = _ask(choice, _overview_prompt(eras, tone, repo_name or story_key), _ARC_TIMEOUT_SECONDS) or {}
     except StoryError:
-        overview = {}  # the chapters are the story; a missing overview must never lose them
+        overview = {}  # the moments are the story; a missing overview must never lose them
     _apply_overview(story, eras, overview, existing)
     store.put(story_key, story)
     if key:
-        _set_progress(key, phase="done", done=len(batches) + 1, chapters=len(story["chapters"]))
+        _set_progress(key, phase="done", done=len(batches) + 1, moments=len(story["moments"]))
     return story
 
 
@@ -954,17 +967,17 @@ def _assemble(
     partial: bool,
 ) -> dict[str, Any]:
     if placement == "prepend":
-        chapters = [*produced, *kept]
+        moments = [*produced, *kept]
     elif placement == "append":
-        chapters = [*kept, *produced]
+        moments = [*kept, *produced]
     else:
-        chapters = list(produced)
-    chapters.sort(key=lambda chapter: (chapter.get("from", 0), chapter.get("to", 0)))
-    covered_shas = sorted({sha for chapter in chapters for sha in chapter.get("shas", [])})
+        moments = list(produced)
+    moments.sort(key=lambda moment: (moment.get("from", 0), moment.get("to", 0)))
+    covered_shas = sorted({sha for moment in moments for sha in moment.get("shas", [])})
     story: dict[str, Any] = {
         "branch": story_key,
         "tone": tone,
-        "chapters": chapters,
+        "moments": moments,
         "covered_shas": covered_shas,
         "covered": len(covered_shas),
         "built_at": int(time.time()),
@@ -1028,46 +1041,46 @@ def _apply_overview(story: dict[str, Any], eras: list[dict], overview: dict, exi
     story["partial"] = False
 
 
-def expand_chapter(
+def expand_moment(
     root: Path,
     stats: list[CommitStat],
     sha_paths: dict[str, set[str]],
     *,
     branch: str = "",
-    chapter_id: str = "",
+    moment_id: str = "",
 ) -> dict[str, Any]:
-    """Write out one chapter: the detail paragraph and the quoted asks behind it.
+    """Write out one moment: the detail paragraph and the quoted asks behind it.
 
-    This is the second half of lazy generation. It runs when a reader OPENS a chapter, costs
-    one agent call over that chapter's own material, and is stored, so it is paid once. A
-    chapter that already has a body is returned as it stands."""
+    This is the second half of lazy generation. It runs when a reader OPENS a moment, costs
+    one agent call over that moment's own material, and is stored, so it is paid once. A
+    moment that already has a body is returned as it stands."""
     store = StoryStore(root)
     story_key = branch or "HEAD"
     story = store.get(story_key)
     if not story:
         return {"error": "There is no story on this branch yet."}
-    chapter = next((item for item in story.get("chapters") or [] if item.get("id") == chapter_id), None)
-    if chapter is None:
-        return {"error": "That chapter is no longer part of the story; reload the page."}
-    if chapter.get("detail"):
-        return {"chapter": chapter}
+    moment = next((item for item in story.get("moments") or [] if item.get("id") == moment_id), None)
+    if moment is None:
+        return {"error": "That moment is no longer part of the story; reload the page."}
+    if moment.get("detail"):
+        return {"moment": moment}
 
     by_sha = {stat.sha: stat for stat in story_stats(stats)}
-    own = [by_sha[sha] for sha in chapter.get("shas") or [] if sha in by_sha]
+    own = [by_sha[sha] for sha in moment.get("shas") or [] if sha in by_sha]
     if not own:
-        return {"error": "The commits behind this chapter are not on this branch any more."}
+        return {"error": "The commits behind this moment are not on this branch any more."}
     choice = learn_page.resolve_learning_backend(Path(root))
     raw = _ask(
-        choice, _expand_prompt(chapter, own, sha_paths, story.get("tone") or DEFAULT_TONE), _EXPAND_TIMEOUT_SECONDS
+        choice, _expand_prompt(moment, own, sha_paths, story.get("tone") or DEFAULT_TONE), _EXPAND_TIMEOUT_SECONDS
     )
     detail = _shorten(str((raw or {}).get("detail") or ""), 600)
     if not detail:
-        return {"error": "The backend could not write this chapter; try opening it again."}
+        return {"error": "The backend could not write this moment; try opening it again."}
     thoughts = _thoughts((raw or {}).get("thoughts"), {**by_sha, **{s.short: s for s in own}}, [s.sha for s in own])
 
     def apply(current: dict[str, Any]) -> None:
-        for item in current.get("chapters") or []:
-            if item.get("id") == chapter_id:
+        for item in current.get("moments") or []:
+            if item.get("id") == moment_id:
                 item["detail"] = detail
                 item["thoughts"] = thoughts
                 item["expanded_at"] = int(time.time())
@@ -1078,8 +1091,8 @@ def expand_chapter(
         if isinstance(stored, dict):
             apply(stored)
             store.save(data)
-    chapter = dict(chapter, detail=detail, thoughts=thoughts)
-    return {"chapter": chapter}
+    moment = dict(moment, detail=detail, thoughts=thoughts)
+    return {"moment": moment}
 
 
 # --------------------------------------------------------------------------- the worker
@@ -1099,7 +1112,7 @@ def start_build(
 
     A story is several agent calls and minutes of work: holding an HTTP request open for
     that is how you get a page that looks broken. The page polls ``/story/state`` instead,
-    which reports progress and the chapters written so far."""
+    which reports progress and the moments written so far."""
     key = build_key(root, branch)
     # Answer "there is nothing to tell" immediately instead of spawning a thread that fails a
     # moment later: the page would otherwise show a spinner and then an error for a button
@@ -1121,7 +1134,7 @@ def start_build(
             "phase": "starting",
             "done": 0,
             "total": 1,
-            "chapters": 0,
+            "moments": 0,
             "started": int(time.time()),
             "branch": branch,
             "mode": mode,
@@ -1157,13 +1170,13 @@ def start_build(
 
 
 def cancel_build(root: Path, branch: str = "") -> dict[str, Any]:
-    """Ask the running build to stop after the call in flight. Chapters already written
+    """Ask the running build to stop after the call in flight. Moments already written
     stay: they are real story, and re-running continues from them."""
     with _BUILDS_LOCK:
         record = _BUILDS.get(build_key(root, branch))
         if record and record["thread"].is_alive():
             record["stop"].set()
-            record["progress"]["phase"] = "stopping after the current chapter"
+            record["progress"]["phase"] = "stopping after the current moment"
             return {"cancelling": True}
     return {"cancelling": False}
 
@@ -1246,9 +1259,9 @@ def handle_story_post(
                 mode=mode,
                 repo_name=repo_name,
             )
-        if path == "/story/chapter":
+        if path == "/story/moment":
             stats, sha_paths = view(branch)
-            return expand_chapter(root, stats, sha_paths, branch=branch, chapter_id=str(body.get("id") or ""))
+            return expand_moment(root, stats, sha_paths, branch=branch, moment_id=str(body.get("id") or ""))
         if path == "/story/cancel":
             return cancel_build(root, branch)
         if path == "/story/forget":
@@ -1298,7 +1311,7 @@ def story_backtrace_banner(directory: str) -> str:
         f"coding-agent sessions in {_escape(directory)}, not from aGiTrack's live repo tracking. "
         "Tip: run <code>agitrack --backtrace commit</code> to bake this history into your git commit "
         "messages, then launch your coding agent through <code>agitrack</code> and every future "
-        "chapter writes itself.</div>"
+        "moment writes itself.</div>"
     )
 
 
@@ -1404,8 +1417,35 @@ select,input[type=text]{background:var(--panel2);border:1px solid var(--line);co
   border-radius:6px;margin:10px 0;font-size:12.5px;cursor:pointer}
 
 /* ---------------------------------------------------------------- the toolbar */
-.toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:22px 0 6px}
-.toolbar .grow{flex:1}
+.zoombar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:24px 0 8px}
+.zoombar .grow{flex:1}
+.zlabel{font-size:11px;letter-spacing:1.5px;text-transform:uppercase;color:var(--fg-dim)}
+.zoom{display:flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.zstop{background:var(--panel);border:0;border-right:1px solid var(--line);color:var(--fg-dim);
+  font:inherit;cursor:pointer;padding:6px 14px;display:flex;flex-direction:column;align-items:flex-start;
+  gap:1px;transition:background .15s,color .15s}
+.zstop:last-child{border-right:0}
+.zstop b{font-family:var(--display);font-size:17px;line-height:1;font-weight:400}
+.zstop span{font-size:11px;letter-spacing:.3px}
+.zstop:hover{color:var(--fg);background:var(--panel2)}
+.zstop.sel{background:#0f2a1c;color:var(--phosphor)}
+.zoomctx{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:0 0 8px;font-size:12.5px;
+  color:var(--fg-dim)}
+.zoomctx .zin b{color:var(--phosphor)}
+/* Level 1: the whole project as one bar, each part sized by how much happened in it. */
+.strip{display:flex;gap:3px;height:74px;margin:10px 0 6px}
+.seg{flex:1;min-width:38px;background:linear-gradient(180deg,#12241b,var(--panel));cursor:pointer;
+  border:1px solid var(--line);border-radius:6px;color:var(--fg-dim);font:inherit;padding:8px 9px;
+  display:flex;flex-direction:column;justify-content:space-between;align-items:flex-start;overflow:hidden;
+  transition:border-color .15s,color .15s,transform .15s}
+.seg:hover{border-color:var(--phosphor);color:var(--fg);transform:translateY(-2px)}
+.segn{font-family:var(--display);font-size:20px;line-height:1;color:var(--amber)}
+.segt{font-size:11.5px;line-height:1.25;text-align:left}
+.stripfoot{font-size:11.5px;color:var(--fg-dim)}
+.arcbig{margin:14px 0 0;font-size:14px;line-height:1.65;color:var(--fg);max-width:70ch}
+.era{cursor:pointer}
+.era .zoomin{color:var(--phosphor-dim)}
+.era:hover .zoomin{color:var(--phosphor)}
 .kbd{font-size:11.5px;color:var(--fg-dim)}
 .kbd b{color:var(--fg);background:var(--panel2);border:1px solid var(--line);border-radius:3px;
   padding:1px 5px;font-weight:400}
@@ -1442,7 +1482,7 @@ h2.section{font-size:13px;letter-spacing:1.5px;text-transform:uppercase;color:va
 .ch .sum{margin:0;color:var(--fg-dim);font-size:13px;line-height:1.55}
 .ch .open-hint{margin-top:9px;font-size:11.5px;color:var(--phosphor-dim);letter-spacing:.5px}
 .ch.open .open-hint{color:var(--fg-dim)}
-/* A long chapter's "close" hint at the bottom is a scroll away, so an open chapter also
+/* A long moment's "close" hint at the bottom is a scroll away, so an open moment also
    carries one in its header, where the reader's eye already is. */
 .closehint{display:none;order:9;margin-left:auto;color:var(--fg-dim);border:1px solid var(--line);
   border-radius:999px;padding:1px 9px}
@@ -1470,7 +1510,7 @@ h2.section{font-size:13px;letter-spacing:1.5px;text-transform:uppercase;color:va
 
 /* ------------------------------------------------------------------ graphics
    The numbers carry more of the story than a sentence about them would, so they are drawn:
-   a bar for what a chapter added and removed, a dot per commit, a sparkline per era. */
+   a bar for what a moment added and removed, a dot per commit, a sparkline per era. */
 .shape{display:flex;align-items:center;gap:10px;margin:9px 0 0;flex-wrap:wrap}
 .bar{display:flex;height:6px;border-radius:3px;overflow:hidden;background:var(--panel2);
   flex:1;min-width:120px;max-width:280px}
@@ -1491,6 +1531,10 @@ h2.section{font-size:13px;letter-spacing:1.5px;text-transform:uppercase;color:va
 .era .sum{margin:0}
 .era .lit{color:var(--phosphor-dim)}
 .morewrap{display:flex;gap:10px;flex-wrap:wrap;margin:16px 0 0}
+.engine{margin:34px 0 0;border:1px solid var(--line);border-radius:8px;background:var(--panel)}
+.engine summary{cursor:pointer;padding:11px 15px;color:var(--fg-dim);font-size:12.5px}
+.engine summary:hover{color:var(--fg)}
+.engine .ebody{padding:0 15px 14px}
 .actmeta{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-top:8px;
   color:var(--fg-dim);font-size:11.5px}
 
@@ -1599,7 +1643,7 @@ __BACKTRACE_BANNER__
 
   <section class="hero rise" id="hero">
     <h1 id="story-title">the story of __REPO_NAME__</h1>
-    <p class="tagline" id="story-tagline">every commit is a sentence; this is the paragraph they make.</p>
+    <p class="tagline" id="story-tagline">the same commits you already have, zoomed out until they make sense.</p>
     <div class="counters" id="counters"></div>
     <p class="arc" id="story-arc" hidden></p>
   </section>
@@ -1613,9 +1657,9 @@ __BACKTRACE_BANNER__
       </div>
     </div>
     <div class="row" id="actions">
-      <button class="gobtn" id="write">&#10024; write the story</button>
-      <button class="btn" id="extend" hidden>&#10133; add the new chapters</button>
-      <button class="btn" id="earlier" hidden>&#8617; write earlier chapters</button>
+      <button class="gobtn" id="write">&#10024; tell me the story</button>
+      <button class="btn" id="extend" hidden>&#10133; catch up on what is new</button>
+      <button class="btn" id="earlier" hidden>&#8617; go further back</button>
       <button class="btn" id="rewrite" hidden>&#8635; tell it again</button>
       <button class="btn small" id="forget" hidden>forget this story</button>
     </div>
@@ -1633,21 +1677,26 @@ __BACKTRACE_BANNER__
   </div>
   <div id="flash"></div>
 
-  <div class="toolbar" id="toolbar" hidden>
-    <button class="btn" id="play">&#9654; play the story</button>
-    <button class="btn small nocinema" id="expand-all">expand all</button>
-    <button class="btn small nocinema" id="collapse-all">collapse all</button>
+  <div class="zoombar" id="toolbar" hidden>
+    <span class="zlabel">zoom</span>
+    <div class="zoom" id="zoom">
+      <button class="zstop" data-z="1"><b>1&times;</b><span>the whole thing</span></button>
+      <button class="zstop" data-z="2"><b>5&times;</b><span>five parts</span></button>
+      <button class="zstop sel" data-z="3"><b>20&times;</b><span>moment by moment</span></button>
+    </div>
     <span class="grow"></span>
-    <span class="kbd nocinema"><b>j</b>/<b>k</b> move &nbsp; <b>enter</b> open &nbsp; <b>esc</b> close</span>
+    <button class="btn small nocinema" id="play">&#9654; play it</button>
+    <span class="kbd nocinema"><b>+</b>/<b>-</b> zoom &nbsp; <b>j</b>/<b>k</b> move &nbsp; <b>enter</b> open</span>
   </div>
+  <div class="zoomctx" id="zoomctx" hidden></div>
 
-  <div id="loading" class="loading"><span class="spin"></span><span>reading the story…</span></div>
+  <div id="loading" class="loading"><span class="spin"></span><span>finding the story…</span></div>
   <div id="skeleton" class="skel" hidden><div></div><div></div><div></div></div>
   <div id="eras" hidden></div>
   <div id="timeline"></div>
   <div id="morewrap" class="morewrap" hidden>
-    <button class="btn" id="more-chapters">show earlier chapters</button>
-    <button class="btn" id="earlier2">&#8617; write the chapters before these</button>
+    <button class="btn" id="more-moments">show earlier moments</button>
+    <button class="btn" id="earlier2">&#8617; go further back</button>
   </div>
 
   <div class="outline" id="outlinewrap" hidden>
@@ -1655,6 +1704,26 @@ __BACKTRACE_BANNER__
     <div class="hint" id="outlinehint"></div>
     <div id="outlinelist"></div>
   </div>
+
+  <details class="engine" id="engine">
+    <summary>who tells it: backend &amp; model</summary>
+    <div class="ebody">
+      <div class="row"><label>backend</label>
+        <select id="e-backend">
+          <option value="">auto (latest session)</option>
+          <option value="claude">claude</option>
+          <option value="opencode">opencode</option>
+        </select>
+        <label style="min-width:auto">model</label>
+        <select id="e-model"><option value="">auto (latest session)</option></select>
+        <button class="btn" id="e-save">save</button>
+        <span class="hint" id="e-msg" style="margin-top:0"></span>
+      </div>
+      <div class="hint">Saved in this repo as <code>learning_backend</code> / <code>learning_model</code> in
+        <code>.agitrack/config.json</code>, the same pair the learn page uses, so one choice covers both.
+        A bigger model tells a better story; a smaller one is quicker and cheaper.</div>
+    </div>
+  </details>
 
   <footer id="enginenote"></footer>
 </div>
@@ -1667,14 +1736,15 @@ const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const REDUCED = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
-// How many chapters are on screen at once. A page that opens with forty-five of them is a
+// How many moments are on screen at once. A page that opens with forty-five of them is a
 // wall, not a story; the rest are one click away. Declared HERE, above `state`, which reads
 // it: a `const` is not hoisted, so declaring it further down killed the whole script.
-const PAGE_CHAPTERS = 8;
+const PAGE_MOMENTS = 8;
 
 const state = {
   data: null, story: null, tone: "playful", branch: "", open: new Set(), told: new Set(),
-  poll: null, cinema: false, cineTimer: null, cursor: -1, building: false, shown: PAGE_CHAPTERS
+  poll: null, cinema: false, cineTimer: null, cursor: -1, building: false, shown: PAGE_MOMENTS,
+  zoom: 3, part: null
 };
 
 // ------------------------------------------------------------------ helpers
@@ -1749,6 +1819,7 @@ function render(){
   renderBranches();
   renderHero();
   renderStudio();
+  renderZoomContext();
   renderEras();
   renderTimeline();
   revealAll();
@@ -1785,16 +1856,16 @@ function countUp(el, target){
 function renderHero(){
   const d = state.data, s = state.story, m = d.meta || {};
   $("story-title").textContent = (s && s.title) || ("the story of " + (d.repo_name || "this repo"));
-  const tag = (s && s.tagline) || (s ? "" : "every commit is a sentence; this is the paragraph they make.");
+  const tag = (s && s.tagline) || (s ? "" : "the same commits you already have, zoomed out until they make sense.");
   $("story-tagline").textContent = tag;
   $("story-tagline").hidden = !tag;
   const arc = s && s.arc;
   $("story-arc").textContent = arc || "";
   $("story-arc").hidden = !arc;
   const days = m.first && m.last ? Math.max(1, Math.round((m.last - m.first) / 86400)) : 0;
-  const chapters = s && s.chapters ? s.chapters.length : 0;
+  const moments = s && s.moments ? s.moments.length : 0;
   const cells = [
-    [chapters, chapters === 1 ? "chapter" : "chapters"],
+    [moments, moments === 1 ? "moment" : "moments"],
     [m.commits || 0, "commits"],
     [m.turns || 0, "agent turns"],
     [days, days === 1 ? "day" : "days"],
@@ -1806,7 +1877,7 @@ function renderHero(){
 function renderStudio(){
   const d = state.data, s = state.story, m = d.meta || {};
   void s;
-  const has = !!(s && s.chapters && s.chapters.length);
+  const has = !!(s && s.moments && s.moments.length);
   const engineBroken = !!(d.engine && d.engine.error);
   $("write").hidden = has;
   $("extend").hidden = !has || !m.uncovered;
@@ -1817,41 +1888,97 @@ function renderStudio(){
   for (const id of ["write","extend","earlier","rewrite"]) $(id).disabled = state.building || engineBroken;
   let hint;
   if (engineBroken)
-    hint = "No coding agent backend is configured here, so nobody can write the story yet. Run an aGiTrack session in this repo, or set learning_backend in .agitrack/config.json. The outline below is built from the commits themselves and needs no agent.";
+    hint = "There is no coding agent configured here, so nobody can tell it yet. Run an aGiTrack session in this repo, or pick one below under \"who tells it\". The outline further down is built from the commits alone and needs no agent at all.";
   else if (!has)
     hint = "Your agent reads this " + (d.backtrace ? "reconstructed history" : "branch") + " twice: once over the " +
-           "whole timeline for the five parts above, and once over the most recent stretch for chapters you can open. " +
-           "About half a minute. Each chapter is then written out the first time you open it, and everything is " +
+           "whole timeline for the five parts above, and once over the most recent stretch for moments you can open. " +
+           "About half a minute. Each moment is then written out the first time you open it, and everything is " +
            "stored in .agitrack/story.json, so you only ever pay for what you read.";
   else
-    hint = "Open a chapter and your agent writes it out (once, then it is stored). " +
-           (m.uncovered ? m.uncovered + " commit" + (m.uncovered === 1 ? " has" : "s have") + " landed since this story was written. " : "") +
-           (s && s.more_earlier ? "Earlier chapters are written on request: the five parts above already cover the whole project." : "");
+    hint = "Zoom in and your agent writes that moment out, once, then keeps it. " +
+           (m.uncovered ? m.uncovered + " commit" + (m.uncovered === 1 ? " has" : "s have") + " landed since. " : "") +
+           (s && s.more_earlier ? "Further back is told on request; the five parts already cover the whole project." : "");
   $("studiohint").textContent = hint;
 }
 
+// One story, three magnifications. Level 1 is the shape of the whole thing, level 2 its five
+// parts, level 3 the moments inside them; opening a moment is the last step in, to the
+// commits themselves. Zooming into a PART narrows every level below it to that part.
+function setZoom(level, part){
+  state.zoom = Math.max(1, Math.min(3, level || 3));
+  if (part !== undefined) state.part = part;
+  if (state.zoom < 3) state.shown = PAGE_MOMENTS;
+  for (const stop of $("zoom").querySelectorAll(".zstop"))
+    stop.classList.toggle("sel", Number(stop.dataset.z) === state.zoom);
+  renderZoomContext();
+  renderZoomContext();
+  renderEras();
+  renderTimeline();
+  revealAll();
+  if (history.replaceState) history.replaceState(null, "", "#z" + state.zoom + (state.part ? "." + state.part : ""));
+}
+
+function currentPart(){
+  const eras = (state.story && state.story.eras) || [];
+  return eras.find(era => era.id === state.part) || null;
+}
+
+function renderZoomContext(){
+  const part = currentPart(), host = $("zoomctx");
+  host.hidden = !part;
+  if (!part) return;
+  host.innerHTML = '<button class="btn small zback">&larr; back to all five parts</button>' +
+    '<span class="zin">zoomed into <b>' + esc(part.title) + "</b> &nbsp;·&nbsp; " +
+    esc(part.when) + " &rarr; " + esc(part.until) + "</span>";
+}
+
+// Everything the current zoom (and part) is looking at.
+function momentsInView(){
+  const all = (state.story && state.story.moments) || [];
+  const part = currentPart();
+  if (!part) return all;
+  return all.filter(m => m.from >= part.from && m.to <= part.to);
+}
+
+// The whole project on one line: every part, sized by how much happened in it.
+function stripHtml(){
+  const eras = (state.story && state.story.eras) || [];
+  if (!eras.length) return "";
+  const total = eras.reduce((sum, era) => sum + Math.max(1, era.commits), 0);
+  return '<div class="strip">' + eras.map(era =>
+    '<button class="seg" data-part="' + esc(era.id) + '" style="flex:' + Math.max(1, era.commits) + '"' +
+    ' title="' + esc(era.title) + " · " + era.commits + ' commits">' +
+      '<span class="segn">' + era.n + "</span>" +
+      '<span class="segt">' + esc(era.title) + "</span>" +
+    "</button>").join("") + "</div>" +
+    '<div class="stripfoot">' + eras[0].when + " &rarr; " + eras[eras.length - 1].until +
+    " &nbsp;·&nbsp; " + total + " commits &nbsp;·&nbsp; click a part to zoom in</div>";
+}
+
 // The whole project, coarse: one row per era, newest first, each with its span, size and the
-// shape of the work inside it. This is complete even when only the last week has chapters.
+// shape of the work inside it. This is complete even when only the last week has moments.
 function renderEras(){
   const s = state.story, host = $("eras");
   const eras = (s && s.eras) || [];
-  host.hidden = !eras.length;
-  if (!eras.length) return;
-  const told = new Set(((s && s.chapters) || []).map(c => c.id));
-  host.innerHTML = '<h2 class="section">the whole story, in five parts</h2>' +
+  host.hidden = !eras.length || state.zoom === 3;
+  if (host.hidden) return;
+  if (state.zoom === 1) {
+    host.innerHTML = '<h2 class="section">the whole thing</h2>' + stripHtml();
+    return;
+  }
+  host.innerHTML = '<h2 class="section">five parts</h2>' +
     eras.slice().reverse().map(era => {
-      const covered = ((s.chapters || []).filter(c => c.from >= era.from && c.to <= era.to)).length;
-      return '<div class="era' + (covered ? " has" : "") + '">' +
+      const told = ((s.moments || []).filter(m => m.from >= era.from && m.to <= era.to)).length;
+      return '<div class="era' + (told ? " has" : "") + '" data-part="' + esc(era.id) + '">' +
         '<div class="eran">' + era.n + "</div>" +
         '<div class="erabody"><h3>' + esc(era.title) + "</h3>" +
         (era.blurb ? '<p class="sum">' + esc(era.blurb) + "</p>" : "") +
         '<div class="actmeta">' + sparkHtml(era.spark) +
           "<span>" + esc(era.when) + " &rarr; " + esc(era.until) + "</span>" +
           "<span>" + era.commits + " commits</span>" +
-          (covered ? '<span class="lit">' + covered + " chapter" + (covered === 1 ? "" : "s") + " written</span>" : "") +
-        "</div></div></div>";
+          (told ? '<span class="lit">' + told + " moment" + (told === 1 ? "" : "s") + " written</span>" : "") +
+        '<span class="zoomin">zoom in &rarr;</span></div></div></div>';
     }).join("");
-  void told;
 }
 
 function sparkHtml(sizes){
@@ -1868,29 +1995,37 @@ function sparkHtml(sizes){
 // The story is stored oldest-first (that is the order it was written in) and read
 // NEWEST-FIRST, like the dashboard's log: what happened lately is what people came for.
 function renderTimeline(){
-  const s = state.story, host = $("timeline");
-  const all = (s && s.chapters) || [];
-  if (!all.length) { host.innerHTML = ""; $("toolbar").hidden = true; $("morewrap").hidden = true; return; }
-  $("toolbar").hidden = false;
+  const host = $("timeline");
+  const all = momentsInView();
+  const any = ((state.story && state.story.moments) || []).length;
+  $("toolbar").hidden = !any;  // the zoom control is how you get back out; never hide it
+  if (state.zoom !== 3 || !all.length) {
+    host.innerHTML = "";
+    $("morewrap").hidden = true;
+    if (state.zoom !== 3) return;
+  }
+  if (!all.length) return;
   const newestFirst = all.slice().reverse();
-  const shown = newestFirst.slice(0, state.shown || PAGE_CHAPTERS);
-  let html = '<h2 class="section">chapter by chapter</h2><div class="timeline">';
-  shown.forEach((c, position) => { html += chapterHtml(c, position); });
+  const shown = newestFirst.slice(0, state.shown || PAGE_MOMENTS);
+  const part = currentPart();
+  let html = '<h2 class="section">' + (part ? "inside " + esc(part.title.toLowerCase()) : "moment by moment") +
+             "</h2><div class=\"timeline\">";
+  shown.forEach((c, position) => { html += momentHtml(c, position); });
   html += "</div>";
   host.innerHTML = html;
   const rest = newestFirst.length - shown.length;
-  $("morewrap").hidden = !rest;
-  if (rest) $("more-chapters").textContent = "show " + Math.min(rest, PAGE_CHAPTERS) + " earlier chapter" +
-    (Math.min(rest, PAGE_CHAPTERS) === 1 ? "" : "s") + " (" + rest + " more)";
-  revealOnScroll(host);
+  $("morewrap").hidden = !rest && !(state.story && state.story.more_earlier);
+  $("more-moments").hidden = !rest;
+  if (rest) $("more-moments").textContent = "show " + Math.min(rest, PAGE_MOMENTS) + " earlier moment" +
+    (Math.min(rest, PAGE_MOMENTS) === 1 ? "" : "s") + " (" + rest + " more)";
   for (const id of state.open) {
     const el = document.getElementById("ch-" + id);
-    if (el) { el.classList.add("open"); fillChapter(el, false); }
+    if (el) { el.classList.add("open"); fillMoment(el, false); }
   }
 }
 
 // Cards appear as they are reached, not all at once on load (which fired for a hundred
-// chapters at the same moment, most of them off screen, and looked like a stutter).
+// moments at the same moment, most of them off screen, and looked like a stutter).
 let _revealer = null;
 function revealAll(){
   // Both sections, one observer: calling it per host disconnected the other's.
@@ -1916,7 +2051,7 @@ function revealOnScroll(host){
   host.querySelectorAll(".ch,.era").forEach(el => _revealer.observe(el));
 }
 
-// A chapter's size, drawn: the split of what it added and removed, one dot per commit, and
+// A moment's size, drawn: the split of what it added and removed, one dot per commit, and
 // the token count. Three glanceable facts instead of a sentence nobody reads.
 function shapeHtml(st){
   const ins = Number(st.ins || 0), del = Number(st.del || 0), total = ins + del;
@@ -1938,7 +2073,7 @@ function shapeHtml(st){
   return parts.length ? '<div class="shape">' + parts.join("") + "</div>" : "";
 }
 
-function chapterHtml(c, i){
+function momentHtml(c, i){
   const st = c.stats || {};
   const bits = [];
   if (st.commits) bits.push(st.commits + " commit" + (st.commits === 1 ? "" : "s"));
@@ -1947,32 +2082,32 @@ function chapterHtml(c, i){
     '<div class="dot">' + esc(c.emoji || "✦") + "</div>" +
     '<div class="chbody">' +
       '<div class="chhead"><span class="closehint">close &uarr;</span><span>' + esc(c.when || "") + "</span>" +
-        '<span class="kick k-' + esc(String(c.kicker || "chapter").replace(/\s+/g, "-")) + '">' + esc(c.kicker || "chapter") + "</span>" +
+        '<span class="kick k-' + esc(String(c.kicker || "moment").replace(/\s+/g, "-")) + '">' + esc(c.kicker || "moment") + "</span>" +
         '<span>' + bits.join(" &nbsp;·&nbsp; ") + "</span></div>" +
       "<h3>" + esc(c.title) + "</h3>" +
       '<p class="sum">' + esc(c.summary || "") + "</p>" +
       shapeHtml(st) +
       '<div class="more" hidden></div>' +
-      '<div class="open-hint">read the chapter &darr;</div>' +
+      '<div class="open-hint">go closer &darr;</div>' +
     "</div></article>";
 }
 
-// The chapter body is built on first open: several hundred chapters' worth of detail
+// The moment body is built on first open: several hundred moments' worth of detail
 // would otherwise be parsed into the DOM for a page most readers skim.
-function fillChapter(el, animate){
-  const c = chapterById(el.dataset.id); if (!c) return;
+function fillMoment(el, animate){
+  const c = momentById(el.dataset.id); if (!c) return;
   const box = el.querySelector(".more");
   box.hidden = false;
   el.querySelector(".open-hint").innerHTML = "close &uarr;";
   if (box.dataset.filled === "1") return;
-  // A chapter's body is written the first time someone opens it (one agent call), not up
-  // front for a hundred chapters nobody may read. Headline now, prose on demand.
-  if (!c.detail) { writeChapter(el, c, box); return; }
+  // A moment's body is written the first time someone opens it (one agent call), not up
+  // front for a hundred moments nobody may read. Headline now, prose on demand.
+  if (!c.detail) { writeMoment(el, c, box); return; }
   box.dataset.filled = "1";
   const st = c.stats || {};
   let html = '<div class="detail md">' + md(c.detail || c.summary || "") + "</div>";
   if (c.thoughts && c.thoughts.length) {
-    html += '<div class="thoughts"><h4>&#128172; what they asked for</h4>' + c.thoughts.map((t, i) =>
+    html += '<div class="thoughts"><h4>&#128172; in their own words</h4>' + c.thoughts.map((t, i) =>
       '<div class="th" data-i="' + i + '">' +
         '<div class="q">' + esc(t.quote || "") + "</div>" +
         (t.note ? '<div class="note">' + esc(t.note) + "</div>" : "") +
@@ -1989,7 +2124,7 @@ function fillChapter(el, animate){
   if (c.commits && c.commits.length) {
     // Newest first here too, and each row opens on its COMMIT MESSAGE (the conversation that
     // produced it) with a button to flip to the file changes, like the dashboard's log.
-    html += '<div class="commits"><h4>&#128220; the commits behind it</h4>' + c.commits.slice().reverse().map(r =>
+    html += '<div class="commits"><h4>&#128220; the commits themselves</h4>' + c.commits.slice().reverse().map(r =>
       '<div class="cmt" data-sha="' + esc(r.sha) + '">' +
         '<div class="chead"><span class="sha">' + esc(r.short) + "</span>" +
           '<span class="subj">' + esc(r.subject) + "</span>" +
@@ -2000,41 +2135,41 @@ function fillChapter(el, animate){
   box.innerHTML = html;
 }
 
-// Ask the agent to write this chapter out, then render it. Costs one call, once ever:
+// Ask the agent to write this moment out, then render it. Costs one call, once ever:
 // the result is stored with the story, so every later open is instant.
-async function writeChapter(el, c, box){
+async function writeMoment(el, c, box){
   if (box.dataset.writing === "1") return;
   box.dataset.writing = "1";
   box.innerHTML = '<div class="writing"><span class="spin"></span>' +
-    '<span>writing this chapter from its commits and what you asked for…</span></div>';
+    '<span>reading the commits and what you asked for…</span></div>';
   try {
-    const r = await post("story/chapter", {branch: state.branch, id: c.id});
+    const r = await post("story/moment", {branch: state.branch, id: c.id});
     box.dataset.writing = "";
-    if (r.error || !r.chapter) {
-      box.innerHTML = '<div class="notice">' + esc(r.error || "this chapter could not be written") + "</div>";
+    if (r.error || !r.moment) {
+      box.innerHTML = '<div class="notice">' + esc(r.error || "this moment could not be written") + "</div>";
       return;
     }
-    Object.assign(c, r.chapter);       // keep it in the loaded story, so re-opening is instant
+    Object.assign(c, r.moment);       // keep it in the loaded story, so re-opening is instant
     box.dataset.filled = "";
-    fillChapter(el, true);
+    fillMoment(el, true);
   } catch (e) {
     box.dataset.writing = "";
     box.innerHTML = '<div class="notice">' + esc(e.message) + "</div>";
   }
 }
 
-function chapterById(id){
+function momentById(id){
   const s = state.story;
-  return ((s && s.chapters) || []).find(c => c.id === id) || null;
+  return ((s && s.moments) || []).find(c => c.id === id) || null;
 }
 
-function toggleChapter(el, force){
+function toggleMoment(el, force){
   const id = el.dataset.id;
   const wantOpen = force === undefined ? !state.open.has(id) : force;
   if (wantOpen) {
     state.open.add(id);
     el.classList.add("open");
-    fillChapter(el, !state.told.has(id));
+    fillMoment(el, !state.told.has(id));
     state.told.add(id);
     if (history.replaceState) history.replaceState(null, "", "#ch-" + id);
   } else {
@@ -2042,7 +2177,7 @@ function toggleChapter(el, force){
     el.classList.remove("open");
     const box = el.querySelector(".more");
     if (box) box.hidden = true;
-    el.querySelector(".open-hint").innerHTML = "read the chapter &darr;";
+    el.querySelector(".open-hint").innerHTML = "go closer &darr;";
   }
 }
 
@@ -2117,14 +2252,14 @@ function diffHtml(text, truncated){
 // ------------------------------------------------------------------ the outline
 function renderOutline(){
   const d = state.data, rows = d.outline || [];
-  const has = !!(state.story && state.story.chapters && state.story.chapters.length);
-  // Only before there is a story: once chapters exist, every commit is reachable through
-  // the chapter it belongs to, and a second flat list of the same commits is just noise.
+  const has = !!(state.story && state.story.moments && state.story.moments.length);
+  // Only before there is a story: once moments exist, every commit is reachable through
+  // the moment it belongs to, and a second flat list of the same commits is just noise.
   $("outlinewrap").hidden = has || !rows.length;
   if (has) return;
-  $("outlinehead").textContent = "the shape of it, before anyone tells it";
+  $("outlinehead").textContent = "what there is to tell";
   $("outlinehint").textContent =
-    "aGiTrack grouped the commits into sittings of work. Press the button above and your agent turns these into chapters, with the moments that turned them.";
+    "aGiTrack has already grouped your commits into sittings of work. Press the button above and your agent turns these into something worth reading.";
   $("outlinelist").innerHTML = rows.map(r =>
     '<div class="row2"><span class="when">' + esc(r.when) + "</span>" +
       '<span class="what">' + esc(r.title) + "</span>" +
@@ -2134,11 +2269,47 @@ function renderOutline(){
     "</div>").join("");
 }
 
+// The storyteller runs on the same configured backend/model as the coach, so the panel
+// writes the same repo-scoped keys through the endpoint the learn page already exposes.
+async function loadModels(selected){
+  const backend = $("e-backend").value;
+  const sel = $("e-model");
+  sel.innerHTML = '<option value="">auto (latest session)</option>';
+  if (!backend) return;
+  try {
+    const r = await fetch("learn/models?backend=" + encodeURIComponent(backend), {cache: "no-store"});
+    const data = await r.json();
+    for (const model of (data.models || [])) {
+      const option = document.createElement("option");
+      option.value = model; option.textContent = model;
+      sel.appendChild(option);
+    }
+    if (selected) sel.value = selected;
+  } catch (e) { /* the select simply stays on "auto" */ }
+}
+
+async function saveEngine(){
+  $("e-msg").textContent = "saving…";
+  try {
+    const r = await post("learn/config", {backend: $("e-backend").value, model: $("e-model").value});
+    if (r.error) { $("e-msg").textContent = r.error; return; }
+    $("e-msg").textContent = "saved. the next telling uses it.";
+    await load();
+  } catch (e) { $("e-msg").textContent = e.message; }
+}
+
 function renderEngine(){
   const e = (state.data && state.data.engine) || {};
+  if ($("e-backend").dataset.touched !== "1") {
+    $("e-backend").value = e.backend_source === "config" ? (e.backend || "") : "";
+    if ($("e-model").dataset.filled !== "1") {
+      $("e-model").dataset.filled = "1";
+      loadModels(e.model_source === "config" ? e.model : "");
+    }
+  }
   $("enginenote").innerHTML = e.error
     ? esc(e.error)
-    : "chapters written by <code>" + esc(e.backend || "?") + "</code> · " + esc(e.model || "backend default model") +
+    : "moments written by <code>" + esc(e.backend || "?") + "</code> · " + esc(e.model || "backend default model") +
       " · stored in <code>.agitrack/story.json</code>";
 }
 
@@ -2147,13 +2318,13 @@ function renderBuild(p){
   const running = !!(p && p.running);
   state.building = running;
   $("buildbar").hidden = !running;
-  if (p && p.error && !running) fail(p.error === "cancelled" ? "Stopped. The chapters already written are kept." : p.error);
+  if (p && p.error && !running) fail(p.error === "cancelled" ? "Stopped. The moments already written are kept." : p.error);
   if (!running) { renderStudio(); return; }
   $("build-phase").textContent = p.phase || "working";
   $("build-cancel").disabled = false;
   const pct = p.total ? Math.round(100 * Math.min(1, p.done / p.total)) : 5;
   $("build-bar").style.width = Math.max(5, pct) + "%";
-  $("build-sub").textContent = (p.chapters || 0) + " chapter" + (p.chapters === 1 ? "" : "s") + " so far";
+  $("build-sub").textContent = (p.moments || 0) + " moment" + (p.moments === 1 ? "" : "s") + " so far";
   renderStudio();
 }
 
@@ -2161,7 +2332,7 @@ async function build(mode){
   if (state.building) return;
   flash("");
   state.building = true; renderStudio();
-  if (!(state.story && (state.story.chapters || []).length)) $("skeleton").hidden = false;
+  if (!(state.story && (state.story.moments || []).length)) $("skeleton").hidden = false;
   try {
     const r = await post("story/build", {branch: state.branch, tone: state.tone, mode: mode});
     if (r.error || r.busy) { state.building = false; fail(r.error || "busy"); renderStudio(); return; }
@@ -2178,14 +2349,14 @@ function startPolling(){
   stopPolling();
   state.poll = setInterval(async () => {
     try {
-      const before = state.story ? (state.story.chapters || []).length : 0;
+      const before = state.story ? (state.story.moments || []).length : 0;
       const url = "story/state" + (state.branch ? "?branch=" + encodeURIComponent(state.branch) : "");
       const r = await fetch(url, {cache: "no-store"});
       if (!r.ok) return;
       const data = await r.json();
       state.data = data;
       state.story = data.story;
-      const after = state.story ? (state.story.chapters || []).length : 0;
+      const after = state.story ? (state.story.moments || []).length : 0;
       renderBuild(data.building);          // the bar, the phase, the counter: cheap, no reflow
       if (after !== before) {              // ...and the timeline only when there is new story
         $("skeleton").hidden = true;
@@ -2222,13 +2393,13 @@ function celebrate(){
 }
 
 // ------------------------------------------------------------------ cinema mode
-function chapterEls(){ return Array.from(document.querySelectorAll(".ch")); }
+function momentEls(){ return Array.from(document.querySelectorAll(".ch")); }
 
 function goTo(i, {open = true} = {}){
-  const els = chapterEls(); if (!els.length) return;
+  const els = momentEls(); if (!els.length) return;
   state.cursor = Math.max(0, Math.min(els.length - 1, i));
   const el = els[state.cursor];
-  if (open) toggleChapter(el, true);
+  if (open) toggleMoment(el, true);
   el.classList.add("cue");
   setTimeout(() => el.classList.remove("cue"), 1200);
   el.scrollIntoView({block: "start", behavior: REDUCED ? "auto" : "smooth"});
@@ -2236,11 +2407,11 @@ function goTo(i, {open = true} = {}){
 
 function playStory(){
   if (state.cinema) return stopCinema();
-  const els = chapterEls(); if (!els.length) return;
+  const els = momentEls(); if (!els.length) return;
   state.cinema = true;
   document.body.classList.add("cinema");
   $("play").innerHTML = "&#9632; stop";
-  for (const el of els) toggleChapter(el, false);
+  for (const el of els) toggleMoment(el, false);
   const bar = document.createElement("div");
   bar.className = "cinebar";
   bar.id = "cinebar";
@@ -2255,16 +2426,16 @@ function playStory(){
 }
 
 function cineStep(delta){
-  const els = chapterEls();
+  const els = momentEls();
   const next = state.cursor + delta;
   if (next < 0 || next >= els.length) return stopCinema();
-  if (state.cursor >= 0 && els[state.cursor]) toggleChapter(els[state.cursor], false);
+  if (state.cursor >= 0 && els[state.cursor]) toggleMoment(els[state.cursor], false);
   goTo(next);
   const pos = $("cine-pos");
   if (pos) pos.textContent = (state.cursor + 1) + " / " + els.length;
   clearTimeout(state.cineTimer);
   const dwell = () => {
-    const el = chapterEls()[state.cursor];
+    const el = momentEls()[state.cursor];
     const box = el && el.querySelector(".more");
     if (box && box.dataset.writing === "1") {  // still being written: wait for it
       state.cineTimer = setTimeout(dwell, 1000);
@@ -2279,17 +2450,19 @@ function stopCinema(){
   state.cinema = false;
   clearTimeout(state.cineTimer);
   document.body.classList.remove("cinema");
-  $("play").innerHTML = "&#9654; play the story";
+  $("play").innerHTML = "&#9654; play it the story";
   const bar = $("cinebar"); if (bar) bar.remove();
 }
 
 function openFromHash(){
+  const z = /^#z(\d)(?:\.(.+))?$/.exec(location.hash || "");
+  if (z) { setZoom(Number(z[1]), z[2] || null); return; }
   const m = /^#ch-(.+)$/.exec(location.hash || "");
   if (!m) return;
   const el = document.getElementById("ch-" + m[1]);
   if (!el) return;
-  toggleChapter(el, true);
-  state.cursor = chapterEls().indexOf(el);
+  toggleMoment(el, true);
+  state.cursor = momentEls().indexOf(el);
   setTimeout(() => el.scrollIntoView({block: "start", behavior: "auto"}), 30);
 }
 
@@ -2306,8 +2479,8 @@ $("timeline").addEventListener("click", e => {
   if (e.target.closest(".more") && !e.target.closest(".open-hint")) return;  // reading, not toggling
   const ch = e.target.closest(".ch");
   if (!ch) return;
-  toggleChapter(ch);
-  state.cursor = chapterEls().indexOf(ch);
+  toggleMoment(ch);
+  state.cursor = momentEls().indexOf(ch);
 });
 $("tone-chips").addEventListener("click", e => {
   const chip = e.target.closest(".chip"); if (!chip) return;
@@ -2317,7 +2490,30 @@ $("tone-chips").addEventListener("click", e => {
 $("write").addEventListener("click", () => build("rewrite"));
 $("extend").addEventListener("click", () => build("extend"));
 $("earlier").addEventListener("click", () => build("earlier"));
-$("rewrite").addEventListener("click", () => build("rewrite"));
+$("rewrite").addEventListener("click", () => {
+  // It is destructive and it is not obvious: everything written so far goes, including the
+  // moments someone paid an agent call each to open. Say so, and make them mean it.
+  const s = state.story || {};
+  const told = (s.moments || []).length;
+  const written = (s.moments || []).filter(m => m.detail).length;
+  if (!$("rewrite").dataset.armed) {
+    $("rewrite").dataset.armed = "1";
+    $("rewrite").innerHTML = "&#9888; yes, throw it away and start over";
+    notice("Telling it again starts from scratch: the " + told + " moment" + (told === 1 ? "" : "s") +
+      " you have now" + (written ? " (" + written + " already written out)" : "") +
+      " are deleted, and your agent lays out the newest stretch again from the commits. " +
+      "Your commits are untouched. Press the button once more to confirm, or click this note to cancel.");
+    const flash = $("flash");
+    flash.onclick = () => { flash.innerHTML = ""; disarmRewrite(); };
+    return;
+  }
+  disarmRewrite();
+  build("rewrite");
+});
+function disarmRewrite(){
+  delete $("rewrite").dataset.armed;
+  $("rewrite").innerHTML = "&#8635; tell it again";
+}
 $("forget").addEventListener("click", async () => {
   try { await post("story/forget", {branch: state.branch}); state.open.clear(); await load(); notice("Forgotten. The commits are untouched; the telling is gone."); }
   catch (e) { fail(e.message); }
@@ -2325,29 +2521,29 @@ $("forget").addEventListener("click", async () => {
 $("build-cancel").addEventListener("click", async () => {
   // Say so at once: the call in flight still has to come back, and a button that looks
   // like it did nothing invites a second, third, fourth click.
-  $("build-phase").textContent = "stopping after the chapter being written…";
+  $("build-phase").textContent = "stopping after the moment being written…";
   $("build-cancel").disabled = true;
   try { await post("story/cancel", {branch: state.branch}); } catch (e) {}
 });
-$("more-chapters").addEventListener("click", () => {
-  state.shown = (state.shown || PAGE_CHAPTERS) + PAGE_CHAPTERS;
+$("more-moments").addEventListener("click", () => {
+  state.shown = (state.shown || PAGE_MOMENTS) + PAGE_MOMENTS;
   renderTimeline();
 });
 $("earlier2").addEventListener("click", () => build("earlier"));
+$("e-backend").addEventListener("change", () => { $("e-backend").dataset.touched = "1"; loadModels(null); });
+$("e-save").addEventListener("click", saveEngine);
 $("play").addEventListener("click", playStory);
-$("expand-all").addEventListener("click", () => {
-  // Only the chapters that are already written: with lazy writing, opening all of them
-  // would queue one agent call per chapter, which is not what "expand all" means.
-  let skipped = 0;
-  for (const el of chapterEls()) {
-    const c = chapterById(el.dataset.id);
-    if (c && c.detail) toggleChapter(el, true);
-    else skipped++;
-  }
-  if (skipped) notice(skipped + " chapter" + (skipped === 1 ? " is" : "s are") +
-    " not written yet; open one and your agent writes it (a few seconds each).");
+$("zoom").addEventListener("click", e => {
+  const stop = e.target.closest(".zstop");
+  if (stop) setZoom(Number(stop.dataset.z));
 });
-$("collapse-all").addEventListener("click", () => { for (const el of chapterEls()) toggleChapter(el, false); });
+$("eras").addEventListener("click", e => {
+  const seg = e.target.closest("[data-part]");
+  if (seg) setZoom(3, seg.dataset.part);
+});
+$("zoomctx").addEventListener("click", e => {
+  if (e.target.closest(".zback")) { state.part = null; setZoom(2); }
+});
 $("f-branch").addEventListener("change", () => {
   state.branch = $("f-branch").value; state.open.clear();
   load().catch(e => fail(e.message));
@@ -2363,10 +2559,12 @@ $("backlink").addEventListener("click", e => {
 });
 document.addEventListener("keydown", e => {
   if (e.target && /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) return;
-  if (e.key === "j" || e.key === "ArrowDown") { e.preventDefault(); goTo(state.cursor + 1, {open: false}); }
+  if (e.key === "+" || e.key === "=") { e.preventDefault(); setZoom(state.zoom + 1); }
+  else if (e.key === "-" || e.key === "_") { e.preventDefault(); setZoom(state.zoom - 1); }
+  else if (e.key === "j" || e.key === "ArrowDown") { e.preventDefault(); goTo(state.cursor + 1, {open: false}); }
   else if (e.key === "k" || e.key === "ArrowUp") { e.preventDefault(); goTo(Math.max(0, state.cursor - 1), {open: false}); }
-  else if (e.key === "Enter") { const el = chapterEls()[state.cursor]; if (el) { e.preventDefault(); toggleChapter(el); } }
-  else if (e.key === "Escape") { if (state.cinema) stopCinema(); else for (const el of chapterEls()) toggleChapter(el, false); }
+  else if (e.key === "Enter") { const el = momentEls()[state.cursor]; if (el) { e.preventDefault(); toggleMoment(el); } }
+  else if (e.key === "Escape") { if (state.cinema) stopCinema(); else for (const el of momentEls()) toggleMoment(el, false); }
   else if (e.key === " " && state.cinema) { e.preventDefault(); stopCinema(); }
 });
 window.addEventListener("hashchange", openFromHash);
