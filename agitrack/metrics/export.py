@@ -270,6 +270,13 @@ def _shim(*, base: str, files_index: dict[str, int], page: str, site_root: str) 
       flashBox.onclick = function(){{ flashBox.innerHTML = ""; }};
     }}
     var showNote = function(){{
+      // ONE note, in ONE place, for every unavailable feature on every page. Where the page
+      // has its own bottom toast (learn, story) that is the box used, so a demo note and a
+      // page notice can never stack at the bottom of the screen looking like two answers.
+      if (typeof window.flash === "function") {{
+        window.flash('<div class="notice">' + NOTE + "</div>");
+        return;
+      }}
       if (!flashBox) return;
       var note = document.createElement("div");
       note.className = "notice";
@@ -322,6 +329,16 @@ def _shim(*, base: str, files_index: dict[str, int], page: str, site_root: str) 
           e.preventDefault(); e.stopImmediatePropagation(); showNote();
         }}, true);
       }});
+      // ...and the ones the page draws as it goes (telling a part, telling it closer) are
+      // matched by SELECTOR on the document, because they do not exist yet at this point.
+      // Missing them meant "tell this part closer" ran into the blocked POST and reported a
+      // red failure in the middle of the page instead of the note everything else shows.
+      document.addEventListener("click", function(e){{
+        if (!e.target.closest) return;
+        if (!e.target.closest("#more-moments, .zcloser, .zpart")) return;
+        if (e.target.closest("#more-moments") && document.getElementById("more-moments").dataset.told) return;
+        e.preventDefault(); e.stopImmediatePropagation(); showNote();
+      }}, true);
       // The page disables those buttons while it thinks a build is running or the engine is
       // missing; here they must stay clickable so the toast can explain why nothing happens.
       var keepLive = function(){{
@@ -333,11 +350,12 @@ def _shim(*, base: str, files_index: dict[str, int], page: str, site_root: str) 
       keepLive();
       setInterval(keepLive, 500);
     }}
-    // The learn page surfaces the demo note through its ERROR path (agent actions return
-    // {{error: NOTE}}), which flashes red — but the dashboard shows the same note as an
-    // amber notice. Restyle demo-note flashes as notices so the two pages match; real
-    // errors keep the red treatment.
-    if (LEARN && typeof window.flash === "function") {{
+    // The learn and story pages surface the demo note through their ERROR path (agent
+    // actions return {{error: NOTE}}), which flashes red — but the dashboard shows the same
+    // note as an amber notice. Restyle every flash as a notice so all three pages match.
+    // This is the safety net UNDER the interceptions above: a control nobody listed still
+    // says the same thing, in the same box, in the same colour.
+    if ((LEARN || STORY) && typeof window.flash === "function") {{
       var pageFlash = window.flash;
       window.flash = function(html){{
         // EVERY flash here is amber. In a frozen snapshot there is no actionable failure —

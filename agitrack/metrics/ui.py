@@ -72,6 +72,35 @@ BANNER_CSS = """.backtracebanner,.btbanner,.updatebanner{position:sticky;top:0;z
 .backtracebanner a:hover,.btbanner a:hover,.updatebanner a:hover{color:var(--ink);
   background:var(--phosphor);text-decoration:none}"""
 
+# --------------------------------------------------------------------------- notices
+
+# What a page says when something is unavailable, refused or went wrong. It floats as ONE
+# fixed toast at the bottom, because a note rendered where the markup happens to sit is
+# missed whenever the reader has scrolled (and, on the story page, appeared as a red block
+# in the middle of the page while the same message on the learn page was a quiet toast).
+# Click dismisses. Real errors stay red; everything else is amber.
+FLASH_CSS = """.notice{border:1px solid var(--warn);color:var(--warn);padding:10px 14px;font-size:13px;
+  margin:10px 0;border-radius:6px}
+.error{border:1px solid var(--bad);color:var(--bad);padding:10px 14px;font-size:13px;
+  margin:10px 0;border-radius:6px}
+#flash{position:fixed;left:50%;transform:translateX(-50%);bottom:18px;z-index:80;
+  width:min(680px,calc(100vw - 32px));pointer-events:none}
+#flash .notice,#flash .error{pointer-events:auto;cursor:pointer;background:var(--panel);
+  box-shadow:0 14px 44px rgba(0,0,0,.65);margin:6px 0}
+#flash .notice::after,#flash .error::after{content:" · click to dismiss";opacity:.6;font-size:11px}"""
+
+# --------------------------------------------------------------------------- settings
+
+# The collapsed "who does the work" panel: the learn page's coach engine and the story
+# page's storyteller are the same setting (`learning_backend` / `learning_model`), so they
+# are the same panel, down to the gear on the summary.
+ENGINE_CSS = """.engine{margin-top:26px;border:1px solid var(--line);background:var(--panel);border-radius:8px}
+.engine summary{cursor:pointer;padding:10px 16px;color:var(--fg-dim);font-size:12.5px;list-style:none}
+.engine summary::before{content:"\\2699\\FE0F  "}
+.engine summary:hover{color:var(--fg)}
+.engine .ebody{padding:4px 16px 14px}
+.engine .esaved{color:var(--phosphor)}"""
+
 # --------------------------------------------------------------------------- overlay
 
 # Shown while the agent is generating: the page underneath is not usable, and pretending
@@ -229,6 +258,8 @@ def render(template: str, **extra: str) -> str:
         template.replace("__UI_TOKENS__", TOKENS)
         .replace("__UI_BASE_CSS__", BASE_CSS)
         .replace("__UI_BANNER_CSS__", BANNER_CSS)
+        .replace("__UI_FLASH_CSS__", FLASH_CSS)
+        .replace("__UI_ENGINE_CSS__", ENGINE_CSS)
         .replace("__UI_OVERLAY_CSS__", OVERLAY_CSS)
         .replace("__UI_COMMIT_CSS__", COMMIT_CSS)
         .replace("__UI_DOM_JS__", DOM_JS)

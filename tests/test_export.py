@@ -96,6 +96,25 @@ def test_export_ships_the_storyline_page(tmp_path, monkeypatch):
     assert 'id="storylink"' in index and 'id="storycta"' in index
 
 
+def test_the_demo_answers_every_unavailable_action_the_same_way(tmp_path, monkeypatch):
+    """One note, one box, one colour, on all three pages. "Tell this part closer" was drawn
+    by the page after load, so no listener covered it: the click reached the blocked POST and
+    the page reported a RED failure in the middle of the document, while every other
+    unavailable control showed a calm amber note at the bottom."""
+    out = _export(tmp_path, monkeypatch)
+    story = (out / "story" / "index.html").read_text(encoding="utf-8")
+
+    # The controls the page creates as it goes are matched by selector, not by id.
+    assert "#more-moments, .zcloser, .zpart" in story
+    # ...except when "look closer" is only NAVIGATION into a telling that already exists.
+    assert 'document.getElementById("more-moments").dataset.told' in story
+    # The note goes to the page's OWN toast where there is one, so two boxes never stack.
+    assert 'if (typeof window.flash === "function") {' in story
+    # And the safety net: whatever still reaches the page's error path is shown as a notice.
+    assert "if ((LEARN || STORY) && typeof window.flash === " in story
+    assert 'html.replace(/class="error"/g, \'class="notice"\')' in story
+
+
 def _shim_of(html: str) -> str:
     return html
 

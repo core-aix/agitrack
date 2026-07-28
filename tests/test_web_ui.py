@@ -82,6 +82,32 @@ def test_a_commit_renders_identically_wherever_it_is_opened(pages):
     assert "max-height" not in ui.COMMIT_CSS
 
 
+def test_a_page_says_what_went_wrong_in_one_place(pages):
+    """Notices and errors float as ONE fixed toast at the bottom. The story page used to
+    render its errors inline in the middle of the document while the learn page showed the
+    same message as a quiet toast, so the demo's "this needs a live install" note looked
+    like a failure on one page and an explanation on the other."""
+    for name in ("learn", "story"):
+        assert ui.FLASH_CSS in pages[name], f"{name} styles its notices itself"
+    assert "#flash{position:fixed" in ui.FLASH_CSS and "bottom:18px" in ui.FLASH_CSS
+    assert "click to dismiss" in ui.FLASH_CSS
+    # Amber for "this is how it is", red for "this broke" - one meaning per colour.
+    assert ".notice{border:1px solid var(--warn)" in ui.FLASH_CSS
+    assert ".error{border:1px solid var(--bad)" in ui.FLASH_CSS
+
+
+def test_the_pages_that_pick_a_model_have_the_same_settings_panel(pages):
+    """The coach engine and the storyteller are the same repo setting, so they are the same
+    panel: same box, same summary, same gear."""
+    for name in ("learn", "story"):
+        assert ui.ENGINE_CSS in pages[name], f"{name} styles its settings panel itself"
+        assert "<summary>" in pages[name]
+    assert '.engine summary::before{content:"\\2699\\FE0F  "}' in ui.ENGINE_CSS
+    # ...and neither page draws its own icon in the markup, which is how they came to differ.
+    for name in ("learn", "story"):
+        assert 'class="gear"' not in pages[name], f"{name} carries its own settings icon"
+
+
 def test_the_generation_overlay_is_shared_by_the_pages_that_generate(pages):
     for name in ("learn", "story"):
         assert ui.OVERLAY_CSS in pages[name], f"{name} styles the overlay itself"

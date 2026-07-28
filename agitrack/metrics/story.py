@@ -1657,10 +1657,7 @@ select,input[type=text]{background:var(--panel2);border:1px solid var(--line);co
 __UI_OVERLAY_CSS__
 .pbar{width:100%;height:4px;background:var(--panel2);border-radius:3px;overflow:hidden}
 .pbar span{display:block;height:100%;background:var(--phosphor);width:0;transition:width .4s ease}
-#flash .notice{border:1px solid var(--amber);color:var(--amber);background:var(--panel);padding:10px 13px;
-  border-radius:6px;margin:10px 0;font-size:12.5px;cursor:pointer}
-#flash .error{border:1px solid var(--bad);color:var(--bad);background:var(--panel);padding:10px 13px;
-  border-radius:6px;margin:10px 0;font-size:12.5px;cursor:pointer}
+__UI_FLASH_CSS__
 
 /* ------------------------------------------------------------- the way back out */
 /* There is no zoom control: the reader walks IN by clicking a part, and this one button
@@ -1671,6 +1668,8 @@ __UI_OVERLAY_CSS__
 .zoomctx .zin b{color:var(--phosphor)}
 .emptypart{color:var(--fg-dim);font-size:13px;border:1px dashed var(--line);border-radius:8px;
   padding:18px;margin:8px 0}
+/* What "closer" actually did, said in one line under the heading. */
+.zwhat{color:var(--fg-dim);font-size:12.5px;margin:-4px 0 14px;max-width:70ch}
 .era{cursor:pointer}
 .era .zoomin{color:var(--phosphor-dim)}
 .era:hover .zoomin{color:var(--phosphor)}
@@ -1758,11 +1757,7 @@ h2.section{font-size:13px;letter-spacing:1.5px;text-transform:uppercase;color:va
 .era .sum{margin:0}
 .era .lit{color:var(--phosphor-dim)}
 .morewrap{display:flex;gap:10px;flex-wrap:wrap;margin:16px 0 0}
-.engine{margin:34px 0 0;border:1px solid var(--line);border-radius:8px;background:var(--panel)}
-.engine summary{cursor:pointer;padding:11px 15px;color:var(--fg-dim);font-size:12.5px}
-.engine .gear{color:var(--accent);margin-right:4px}
-.engine summary:hover{color:var(--fg)}
-.engine .ebody{padding:0 15px 14px}
+__UI_ENGINE_CSS__
 .actmeta{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-top:8px;
   color:var(--fg-dim);font-size:11.5px}
 
@@ -1946,7 +1941,7 @@ __BACKTRACE_BANNER__
   </div>
 
   <details class="engine" id="engine">
-    <summary><span class="gear">&#9881;</span> settings: who tells it (backend &amp; model)</summary>
+    <summary>settings: who tells it (backend &amp; model)</summary>
     <div class="ebody">
       <div class="row"><label>backend</label>
         <select id="e-backend">
@@ -2241,11 +2236,28 @@ function momentsInView(){
   if (state.zoom >= 4) return scoped.filter(m => (Number(m.level) || 1) >= 2);
   return scoped.filter(m => (Number(m.level) || 1) === 1);
 }
-function hasCloser(){
-  const part = currentPart();
+function scopedMoments(){
   const all = (state.story && state.story.moments) || [];
-  const scoped = part ? all.filter(m => m.from >= part.from && m.to <= part.to) : all;
-  return scoped.some(m => (Number(m.level) || 1) >= 2);
+  const part = currentPart();
+  return part ? all.filter(m => m.from >= part.from && m.to <= part.to) : all;
+}
+function hasCloser(){
+  return scopedMoments().some(m => (Number(m.level) || 1) >= 2);
+}
+
+// Told closer looks like "a different set of moments" unless the page says what changed:
+// it is the SAME stretch of history, cut into more pieces, so each moment covers less of it.
+function closerNote(){
+  const part = currentPart();
+  if (!part) return "";
+  const coarse = scopedMoments().filter(m => (Number(m.level) || 1) === 1).length;
+  const fine = scopedMoments().filter(m => (Number(m.level) || 1) >= 2).length;
+  if (!fine) return "";
+  const days = Math.max(1, Math.round((part.to - part.from) / 86400));
+  return "The same " + part.commits + " commits over the same " + days + " day" + (days === 1 ? "" : "s") +
+    (coarse ? ", cut into " + fine + " moments instead of " + coarse : ", cut into " + fine + " moments") +
+    ". Nothing new happened here: each moment simply covers a shorter stretch of it, so smaller " +
+    "things get named.";
 }
 
 // The whole project, coarse: one row per era, newest first, each with its span, size and the
@@ -2292,8 +2304,9 @@ function renderTimeline(){
   if (state.zoom < 3) { host.innerHTML = ""; return; }        // the parts view owns the page
   if (state.zoom === 4 && part && !hasCloser()) {             // nothing finer here yet: offer it
     host.innerHTML = '<h2 class="section">closer, inside ' + esc(part.title.toLowerCase()) + "</h2>" +
-      '<div class="emptypart">This part has not been told closer yet. Your agent re-reads its ' +
-      part.commits + " commits and writes a finer set of moments; about half a minute. " +
+      '<div class="emptypart">This part has not been told closer yet. Your agent re-reads the same ' +
+      part.commits + " commits and cuts them into more, shorter moments, so smaller things get " +
+      "named; about half a minute. " +
       '<button class="btn zcloser">&#10024; tell it closer</button></div>';
     return;
   }
@@ -2308,7 +2321,11 @@ function renderTimeline(){
   const newestFirst = all.slice().reverse();                  // a telling is bounded: no paging
   let html = '<h2 class="section">' +
     (part ? (state.zoom === 4 ? "closer, inside " : "inside ") + esc(part.title.toLowerCase())
-          : "moment by moment") + '</h2><div class="timeline">';
+          : "moment by moment") + "</h2>";
+  // Without this, a closer telling is just a different list of titles and it is not obvious
+  // that it covers the very same days.
+  if (state.zoom === 4) html += '<p class="zwhat">' + esc(closerNote()) + "</p>";
+  html += '<div class="timeline">';
   newestFirst.forEach((moment, position) => { html += momentHtml(moment, position); });
   host.innerHTML = html + "</div>";
 
@@ -2320,9 +2337,10 @@ function renderTimeline(){
     $("morewrap").hidden = false;
     $("more-moments").hidden = false;
     $("more-moments").dataset.told = told ? "1" : "";
+    const fine = scopedMoments().filter(m => (Number(m.level) || 1) >= 2).length;
     $("more-moments").textContent = told
-      ? "\u{1F50D} look closer at this part"
-      : "\u2728 tell this part closer (" + newestFirst.length + " moments now)";
+      ? "\u{1F50D} look closer: the same days as " + fine + " moments"
+      : "\u2728 tell this part closer (these " + newestFirst.length + " moments, cut smaller)";
   }
   for (const id of state.open) {
     const el = document.getElementById("ch-" + id);
