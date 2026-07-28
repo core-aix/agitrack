@@ -240,6 +240,9 @@ def test_the_agent_only_names_the_eras(tmp_path, monkeypatch):
     built = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
     eras = built["eras"]
     assert [era["title"] for era in eras] == ["The beginning", "The rest"]
+    # Identity is the era's PLACE, not its name: the overview is re-run on every telling, so
+    # a renamed era must stay the same era (part links and "tell this part" depend on it).
+    assert [era["id"] for era in eras] == ["part-1", "part-2"]
     # The eras span the WHOLE history, whatever was written out: they are the coarse story.
     assert eras[0]["from"] <= min(stat.timestamp for stat in story.story_stats(stats))
     assert eras[-1]["to"] >= max(stat.timestamp for stat in story.story_stats(stats))
@@ -577,7 +580,11 @@ def test_the_page_paints_without_any_story(tmp_path):
     assert ".outline .num{flex-basis:100%}" in html
     # Nothing on the page may push the document wider than the screen.
     assert "overflow-x:hidden" in html
-    assert ".diffbox{margin:0;font-size:11.5px;line-height:1.45;overflow-x:auto" in html
+    # A commit reads EXACTLY as it does in the dashboard: the same renderer and the same
+    # rules, lifted rather than approximated, and flowing with the page (no second scroller).
+    assert "function commitMd(" in html and "function reflowParagraphs(" in html
+    assert ".diffbox{margin:0;font-size:12px;line-height:1.55;white-space:pre-wrap" in html
+    assert ".dmsg.md h3.md-h{font-size:15px;color:var(--amber)}" in html
 
 
 def test_the_storyteller_is_told_not_to_guess_anyone_s_gender():
@@ -724,3 +731,68 @@ def test_the_page_script_runs(tmp_path):
     script.write_text("const SOURCE = " + json.dumps(source) + ";\n" + _DOM_STUB, encoding="utf-8")
     result = subprocess.run([shutil.which("node"), str(script)], capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, f"the story page script threw: {result.stdout.strip() or result.stderr.strip()}"
+
+
+def test_a_part_can_be_told_on_its_own(tmp_path, monkeypatch):
+    """Zooming into a part nobody has told is a dead end unless that part can be asked for
+    directly: walking backwards to it from the newest stretch is not something a reader
+    should have to do."""
+    repo = _repo_with_history(tmp_path, prompts=[f"step {i}" for i in range(12)], gap_days=1)
+    stats, sha_paths = _view_of(repo)
+    ordered = story.story_stats(stats)
+    monkeypatch.setattr(story, "_BATCH_EPISODES", 3)
+    _fake_agent(
+        monkeypatch,
+        [
+            _moment_reply(
+                [{"id": "newest", "title": "Lately", "summary": "s", "shas": [s.short for s in ordered[-3:]]}]
+            ),
+            _ARC,
+        ],
+    )
+    built = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
+    eras = built["eras"]
+    empty = [era for era in eras if not [m for m in built["moments"] if era["from"] <= m["from"] <= era["to"]]]
+    assert empty, "this fixture is supposed to leave older parts untold"
+
+    target = empty[0]
+    fake = _fake_agent(
+        monkeypatch,
+        [
+            _moment_reply(
+                [
+                    {
+                        "id": "that-part",
+                        "title": "The part they asked for",
+                        "summary": "s",
+                        "shas": [s.short for s in ordered if target["from"] <= s.timestamp <= target["to"]][:3],
+                    }
+                ]
+            ),
+            _ARC,
+        ],
+    )
+    after = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="part", part_id=target["id"])
+
+    told = [m for m in after["moments"] if target["from"] <= m["from"] <= target["to"]]
+    assert told, "the part the reader asked for now has moments"
+    assert [m["id"] for m in after["moments"]].count("newest") == 1  # and the old ones are kept
+    # Only that part's commits were sent to the agent.
+    assert "step 11" not in fake.prompts[0]
+
+
+def test_the_readers_own_instructions_reach_the_storyteller(tmp_path, monkeypatch):
+    repo = _repo_with_history(tmp_path, prompts=["one", "two"])
+    stats, sha_paths = _view_of(repo)
+    shas = [stat.short for stat in story.story_stats(stats)]
+    fake = _fake_agent(monkeypatch, [_moment_reply([{"title": "It", "summary": "s", "shas": shas}]), _ARC])
+    built = story.build_story(
+        tmp_path, stats, sha_paths, branch="main", mode="rewrite", note="focus on the tests, and be dry"
+    )
+    assert all("focus on the tests, and be dry" in prompt for prompt in fake.prompts)
+    assert built["note"] == "focus on the tests, and be dry"  # kept, so later tellings match
+
+    # ...and it steers the moment bodies too, without having to be repeated.
+    expand = _fake_agent(monkeypatch, [json.dumps({"detail": "Short.", "thoughts": []})])
+    story.expand_moment(tmp_path, stats, sha_paths, branch="main", moment_id=built["moments"][0]["id"])
+    assert "focus on the tests, and be dry" in expand.prompts[0]

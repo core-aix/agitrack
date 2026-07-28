@@ -393,10 +393,18 @@ def _episode_headline(episode: Episode) -> str:
     )
 
 
-def _batch_prompt(batch: list[Episode], tone: str, context: str) -> str:
+def _note_line(note: str) -> str:
+    """The reader's own instructions, weighed heavily. They asked for this story; a request
+    for a focus or a style should beat the default voice."""
+    note = (note or "").strip()[:300]
+    return f'\n\nThe reader asked for this specifically: "{note}". Follow it closely.' if note else ""
+
+
+def _batch_prompt(batch: list[Episode], tone: str, context: str, note: str = "") -> str:
     digest = "".join(_episode_headline(episode) for episode in batch)
     voice = STORY_TONES.get(tone, STORY_TONES[DEFAULT_TONE])
     prior = f"\nEARLIER IN THE STORY (do not retell these, continue from them):\n{context}\n" if context else ""
+    voice += _note_line(note)
     return f"""Below are consecutive episodes from one repository's history, oldest first. One line each: date, how many commits, lines moved, the biggest commit subject, what the developer asked for, and the commit ids.
 
 Turn them into MOMENTS of the story, in chronological order, one headline each. Merge neighbouring episodes that are clearly the same push into one moment (aim for roughly one moment per two or three episodes, fewer when they belong together). Every commit id listed must belong to exactly one moment.
@@ -420,11 +428,13 @@ MATERIAL:
 {digest}"""
 
 
-def _expand_prompt(moment: dict, stats: list[CommitStat], sha_paths: dict[str, set[str]], tone: str) -> str:
+def _expand_prompt(
+    moment: dict, stats: list[CommitStat], sha_paths: dict[str, set[str]], tone: str, note: str = ""
+) -> str:
     """Write out ONE moment, given everything that happened in it. This is the call a reader
     pays for by opening the moment, so it sees the full material: every commit subject, the
     prompts behind them, and the files they touched."""
-    voice = STORY_TONES.get(tone, STORY_TONES[DEFAULT_TONE])
+    voice = STORY_TONES.get(tone, STORY_TONES[DEFAULT_TONE]) + _note_line(note)
     lines = []
     paths: dict[str, int] = {}
     for stat in stats:
@@ -505,10 +515,10 @@ def _era_rows(episodes: list[Episode]) -> list[dict]:
     return rows
 
 
-def _overview_prompt(eras: list[dict], tone: str, repo_name: str) -> str:
+def _overview_prompt(eras: list[dict], tone: str, repo_name: str, note: str = "") -> str:
     """Name the whole timeline in ONE call. It reads only headline subjects per era, so its
     cost does not grow with how much of the story has been written out."""
-    voice = STORY_TONES.get(tone, STORY_TONES[DEFAULT_TONE])
+    voice = STORY_TONES.get(tone, STORY_TONES[DEFAULT_TONE]) + _note_line(note)
     blocks = []
     for number, era in enumerate(eras, start=1):
         subjects = "; ".join(era["subjects"])[:1200]
@@ -522,7 +532,9 @@ Name them:
 - "title": a title for the project's story so far. Short, specific to THIS project, memorable; the kind of title someone would click. Not a slogan, not "The Story of X".
 - "tagline": one sentence under the title that makes someone want to read on.
 - "arc": TWO short sentences on the overall journey: where it started and where it stands now.
-- "eras": one entry per era above, each {{"n": <its number>, "title": "a few words naming what that era was about", "blurb": "one short sentence"}}. The name must fit EVERYTHING in that era, not just its first entry.
+- "eras": one entry per era above, each {{"n": <its number>, "title": "a few words naming what that era was about", "blurb": "one short sentence"}}.
+
+Name an era for what the project GAINED in it: the capabilities and features that arrived, the thing it could do afterwards that it could not do before. Housekeeping is not a headline: a rename, a version bump, a lint pass, a docs pass, a CI tweak or a refactor belongs in an era's name only if there was genuinely nothing else in it. The name must fit EVERYTHING in that era, not just its first or largest entry.
 
 Reply with ONE JSON object with exactly those four keys.
 
@@ -637,6 +649,9 @@ def _commit_rows(shas: list[str], by_sha: dict[str, CommitStat]) -> list[dict]:
                 "del": stat.deletions,
                 "backend": stat.backend or "",
                 "model": stat.model or "",
+                # Who and when, so a commit here reads exactly like one in the dashboard log.
+                "author": stat.author,
+                "tokens": dict(stat.tokens or {}),
             }
         )
     return rows
@@ -826,7 +841,9 @@ def _ask(choice, prompt: str, timeout: int) -> dict | None:
     return learn_page._extract_json(text)
 
 
-def _material(stats: list[CommitStat], story: dict | None, mode: str) -> tuple[list[CommitStat], str]:
+def _material(
+    stats: list[CommitStat], story: dict | None, mode: str, part_id: str = ""
+) -> tuple[list[CommitStat], str]:
     """Which commits this build tells, and where their moments go.
 
     Always a subset of the commits the story does NOT already cover, so no commit can end
@@ -835,11 +852,23 @@ def _material(stats: list[CommitStat], story: dict | None, mode: str) -> tuple[l
     * ``rewrite`` - everything (the newest of it, once the call budget bites); replaces.
     * ``extend`` - what landed after the story's newest covered commit; appends.
     * ``earlier`` - the history before its oldest one; prepends.
+    * ``part`` - only the commits inside one era, so a reader who zoomed into a part with
+      nothing in it can ask for exactly that part instead of walking backwards to it.
     """
     kept = story_stats(stats)
     if story is None or mode == "rewrite":
         return kept, "replace"
     covered = set(story.get("covered_shas") or [])
+    if mode == "part":
+        era = next((row for row in story.get("eras") or [] if row.get("id") == part_id), None)
+        if era is None:
+            return [], "append"
+        window = [
+            stat
+            for stat in kept
+            if stat.sha not in covered and era.get("from", 0) <= stat.timestamp <= era.get("to", 0)
+        ]
+        return window, "merge"
     fresh = [stat for stat in kept if stat.sha not in covered]
     moments = story.get("moments") or []
     if mode == "earlier":
@@ -867,6 +896,8 @@ def build_story(
     tone: str = DEFAULT_TONE,
     mode: str = "extend",
     repo_name: str = "",
+    note: str = "",
+    part_id: str = "",
     key: str = "",
     stop: threading.Event | None = None,
 ) -> dict[str, Any]:
@@ -881,7 +912,7 @@ def build_story(
     for stat in story_stats(stats):
         by_sha[stat.sha] = stat
         by_sha[stat.short] = stat
-    material, placement = _material(stats, existing, mode)
+    material, placement = _material(stats, existing, mode, part_id)
     if not material:
         raise StoryError("There is nothing new to tell: the story already covers this branch.")
     # Segment the material itself, not the whole history: an episode is a sitting of work
@@ -893,7 +924,9 @@ def build_story(
     # work (the story stays chronological), while a first telling or a reach further back
     # takes the material CLOSEST to what the reader already has.
     all_batches = _batches(selected)
-    batches = all_batches[:_MAX_BATCHES] if placement == "append" else all_batches[-_MAX_BATCHES:]
+    # A part-scoped build works forward through that part; everything else takes the end
+    # nearest what the reader already has.
+    batches = all_batches[:_MAX_BATCHES] if placement in ("append", "merge") else all_batches[-_MAX_BATCHES:]
     left_behind = len(all_batches) - len(batches)
     choice = learn_page.resolve_learning_backend(Path(root))
     if key:
@@ -911,7 +944,7 @@ def build_story(
             raise StoryError("cancelled")
         if key:
             _set_progress(key, phase=f"writing moments ({number} of {len(batches)})", done=number - 1)
-        prompt = _batch_prompt(batch, tone, context)
+        prompt = _batch_prompt(batch, tone, context, note)
         moments: list[dict] = []
         for attempt in range(2):
             if stop is not None and stop.is_set():
@@ -931,19 +964,21 @@ def build_story(
         # Persist as we go: a build interrupted after batch 3 leaves 3 real moments, not
         # nothing, and the page renders them the moment they exist.
         story = _assemble(
-            kept, produced, placement, story_key, tone, existing, by_sha, choice, left_behind, partial=True
+            kept, produced, placement, story_key, tone, note, existing, by_sha, choice, left_behind, partial=True
         )
         store.put(story_key, story)
 
     if key:
         _set_progress(key, phase="taking in the whole timeline", done=len(batches))
-    story = _assemble(kept, produced, placement, story_key, tone, existing, by_sha, choice, left_behind, partial=False)
+    story = _assemble(
+        kept, produced, placement, story_key, tone, note, existing, by_sha, choice, left_behind, partial=False
+    )
     # The coarse story: the WHOLE history in eras, named in one call. Independent of how much
     # has been written out, so the reader always sees where the project has been, even on a
     # first build that only detailed the last week.
     eras = _era_rows(segment_episodes(stats, sha_paths))
     try:
-        overview = _ask(choice, _overview_prompt(eras, tone, repo_name or story_key), _ARC_TIMEOUT_SECONDS) or {}
+        overview = _ask(choice, _overview_prompt(eras, tone, repo_name or story_key, note), _ARC_TIMEOUT_SECONDS) or {}
     except StoryError:
         overview = {}  # the moments are the story; a missing overview must never lose them
     _apply_overview(story, eras, overview, existing)
@@ -959,6 +994,7 @@ def _assemble(
     placement: str,
     story_key: str,
     tone: str,
+    note: str,
     existing: dict | None,
     by_sha: dict[str, CommitStat],
     choice,
@@ -966,8 +1002,8 @@ def _assemble(
     *,
     partial: bool,
 ) -> dict[str, Any]:
-    if placement == "prepend":
-        moments = [*produced, *kept]
+    if placement in ("prepend", "merge"):
+        moments = [*produced, *kept]  # order is fixed by the sort below
     elif placement == "append":
         moments = [*kept, *produced]
     else:
@@ -977,6 +1013,7 @@ def _assemble(
     story: dict[str, Any] = {
         "branch": story_key,
         "tone": tone,
+        "note": note,
         "moments": moments,
         "covered_shas": covered_shas,
         "covered": len(covered_shas),
@@ -986,7 +1023,9 @@ def _assemble(
         # More history exists than one build may spend calls on: the page offers to keep
         # going backwards instead of pretending this is the whole story.
         "more_earlier": (
-            bool(left_behind) if placement != "append" else bool(existing and existing.get("more_earlier"))
+            bool(left_behind)
+            if placement not in ("append", "merge")
+            else bool(existing and existing.get("more_earlier"))
         ),
     }
     for field_name in ("title", "tagline", "arc", "eras"):
@@ -1019,14 +1058,17 @@ def _apply_overview(story: dict[str, Any], eras: list[dict], overview: dict, exi
             continue
         if 1 <= number <= len(eras):
             named[number] = item
-    used: set[str] = set()
     rows = []
     for number, era in enumerate(eras, start=1):
         item = named.get(number, {})
         label = _text(item.get("title"), 90) or f"{era['when']} to {era['until']}"
         rows.append(
             {
-                "id": _unique_id(_slug(label, f"era-{number}"), used),
+                # Identity is the era's PLACE in the timeline, not its name. Slugging the
+                # title looked tidier and broke everything that refers to a part: the
+                # overview is re-run on every telling, so a renamed era became a different
+                # era, and "tell this part" answered "there is nothing new to tell".
+                "id": f"part-{number}",
                 "n": number,
                 "title": label,
                 "blurb": _text(item.get("blurb"), 220),
@@ -1048,6 +1090,7 @@ def expand_moment(
     *,
     branch: str = "",
     moment_id: str = "",
+    note: str = "",
 ) -> dict[str, Any]:
     """Write out one moment: the detail paragraph and the quoted asks behind it.
 
@@ -1071,7 +1114,9 @@ def expand_moment(
         return {"error": "The commits behind this moment are not on this branch any more."}
     choice = learn_page.resolve_learning_backend(Path(root))
     raw = _ask(
-        choice, _expand_prompt(moment, own, sha_paths, story.get("tone") or DEFAULT_TONE), _EXPAND_TIMEOUT_SECONDS
+        choice,
+        _expand_prompt(moment, own, sha_paths, story.get("tone") or DEFAULT_TONE, note or story.get("note") or ""),
+        _EXPAND_TIMEOUT_SECONDS,
     )
     detail = _shorten(str((raw or {}).get("detail") or ""), 600)
     if not detail:
@@ -1107,6 +1152,8 @@ def start_build(
     tone: str = DEFAULT_TONE,
     mode: str = "extend",
     repo_name: str = "",
+    note: str = "",
+    part_id: str = "",
 ) -> dict[str, Any]:
     """Kick off a build on a background thread and return immediately.
 
@@ -1117,13 +1164,17 @@ def start_build(
     # Answer "there is nothing to tell" immediately instead of spawning a thread that fails a
     # moment later: the page would otherwise show a spinner and then an error for a button
     # press that could never have worked.
-    material, _placement = _material(stats, StoryStore(root).get(branch or "HEAD"), mode)
+    material, _placement = _material(stats, StoryStore(root).get(branch or "HEAD"), mode, part_id)
     if not material:
         return {
             "error": (
                 "There is nothing new to tell here. Use 'tell it again' to rewrite the story from scratch."
                 if mode == "extend"
-                else "The story already reaches as far back as this branch goes."
+                else (
+                    "Every moment in this part is already told."
+                    if mode == "part"
+                    else "The story already reaches as far back as this branch goes."
+                )
             )
         }
     with _BUILDS_LOCK:
@@ -1154,6 +1205,8 @@ def start_build(
                     tone=tone,
                     mode=mode,
                     repo_name=repo_name,
+                    note=note,
+                    part_id=part_id,
                     key=key,
                     stop=stop,
                 )
@@ -1187,6 +1240,34 @@ def build_progress(root: Path, branch: str = "") -> dict[str, Any] | None:
 
 
 # --------------------------------------------------------------------------- page data
+
+
+def slim_for_demo(story: dict[str, Any]) -> dict[str, Any]:
+    """A story stripped to what a READER needs, for the checked-in demo fixture and the
+    static export.
+
+    A story cannot be generated in CI (that needs a coding-agent backend and credentials),
+    so the demo ships a real one from this repo, checked in like the learn page's profile.
+    That makes its size everyone's problem: the build state (which commits a further build
+    would still have to cover) and the per-commit fields the page never renders are dropped,
+    which is most of the weight."""
+    trimmed = {key: value for key, value in story.items() if key != "covered_shas"}
+    moments = []
+    for moment in story.get("moments") or []:
+        rows = []
+        for row in moment.get("commits") or []:
+            tokens = row.get("tokens") or {}
+            rows.append(
+                {
+                    key: value
+                    for key, value in row.items()
+                    if key not in ("backend", "model", "tokens")  # never rendered in a commit row
+                }
+                | ({"tokens": {"output": tokens["output"]}} if tokens.get("output") else {})
+            )
+        moments.append({key: value for key, value in moment.items() if key != "shas"} | {"commits": rows})
+    trimmed["moments"] = moments
+    return trimmed
 
 
 def story_state(
@@ -1248,7 +1329,7 @@ def handle_story_post(
         if path == "/story/build":
             stats, sha_paths = view(branch)
             mode = str(body.get("mode") or "extend")
-            if mode not in ("extend", "rewrite", "earlier"):
+            if mode not in ("extend", "rewrite", "earlier", "part"):
                 mode = "extend"
             return start_build(
                 root,
@@ -1258,10 +1339,19 @@ def handle_story_post(
                 tone=str(body.get("tone") or DEFAULT_TONE),
                 mode=mode,
                 repo_name=repo_name,
+                note=str(body.get("note") or ""),
+                part_id=str(body.get("part") or ""),
             )
         if path == "/story/moment":
             stats, sha_paths = view(branch)
-            return expand_moment(root, stats, sha_paths, branch=branch, moment_id=str(body.get("id") or ""))
+            return expand_moment(
+                root,
+                stats,
+                sha_paths,
+                branch=branch,
+                moment_id=str(body.get("id") or ""),
+                note=str(body.get("note") or ""),
+            )
         if path == "/story/cancel":
             return cancel_build(root, branch)
         if path == "/story/forget":
@@ -1346,7 +1436,7 @@ a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
   animation:drift 36s ease-in-out infinite alternate}
 @keyframes drift{from{transform:translate3d(0,0,0) scale(1)}to{transform:translate3d(-30px,20px,0) scale(1.06)}}
 
-.wrap{max-width:1000px;margin:0 auto;padding:22px 20px 80px}
+.wrap{max-width:1080px;margin:0 auto;padding:22px 20px 80px}
 header{display:flex;align-items:baseline;justify-content:space-between;gap:14px;flex-wrap:wrap;
   border-bottom:1px dashed var(--line);padding-bottom:14px;margin-bottom:18px}
 .brand{font-family:var(--display);font-weight:400;font-size:38px;line-height:.9;color:var(--phosphor);
@@ -1356,7 +1446,9 @@ header{display:flex;align-items:baseline;justify-content:space-between;gap:14px;
 .meta{color:var(--fg-dim);font-size:12.5px} .meta b{color:var(--fg)}
 .navlinks{font-size:12.5px;display:flex;gap:14px;flex-wrap:wrap}
 select,input[type=text]{background:var(--panel2);border:1px solid var(--line);color:var(--fg);
-  font:inherit;font-size:12.5px;padding:4px 7px;border-radius:4px}
+  font:inherit;font-size:12.5px;padding:5px 8px;border-radius:4px}
+#f-note{flex:1;min-width:220px}
+#f-note::placeholder{color:var(--fg-dim)}
 
 .rise{animation:rise .5s ease both}
 @keyframes rise{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
@@ -1401,11 +1493,23 @@ select,input[type=text]{background:var(--panel2);border:1px solid var(--line);co
 .gobtn[disabled]{opacity:.4;cursor:not-allowed}
 
 /* ---------------------------------------------------------------- build progress */
-.buildbar{position:sticky;top:0;z-index:30;background:var(--panel);border:1px solid var(--phosphor-dim);
-  border-radius:8px;padding:11px 14px;margin:14px 0;display:flex;align-items:center;gap:12px;flex-wrap:wrap;
-  box-shadow:0 10px 30px rgba(0,0,0,.5)}
-.buildbar .phase{color:var(--phosphor);font-size:13px;flex:1;min-width:200px}
-.buildbar .sub{color:var(--fg-dim);font-size:12px}
+/* While the agent writes, the page IS unusable: say so with the same full-screen card the
+   learn page uses, rather than a bar that leaves the content looking clickable. */
+.overlay{position:fixed;inset:0;z-index:80;display:flex;align-items:center;justify-content:center;
+  background:rgba(3,6,4,.74);backdrop-filter:blur(3px);animation:fadein .25s ease both}
+@keyframes fadein{from{opacity:0}to{opacity:1}}
+.ov-card{background:var(--panel);border:1px solid var(--phosphor-dim);border-radius:12px;
+  padding:30px 38px;max-width:460px;margin:0 20px;text-align:center;
+  box-shadow:0 18px 60px rgba(0,0,0,.55);animation:rise .3s ease both}
+.ovicon{font-size:42px;display:inline-block;animation:bob 3.2s ease-in-out infinite}
+@keyframes bob{0%,100%{transform:translateY(0) rotate(-3deg)}50%{transform:translateY(-4px) rotate(3deg)}}
+.ov-title{font-size:16px;color:var(--phosphor);margin:12px 0 4px}
+.ov-msg{font-size:13px;color:var(--fg-dim);min-height:20px}
+.ov-engine{font-size:12px;color:var(--accent);margin-top:2px;min-height:16px}
+.ov-bar{height:4px;border-radius:2px;background:var(--panel2);overflow:hidden;margin:16px 0 12px}
+.ov-bar span{display:block;height:100%;width:0;border-radius:2px;background:var(--phosphor);
+  transition:width .5s ease}
+.ov-hint{font-size:11.5px;color:var(--fg-dim);margin-bottom:14px}
 .spin{width:14px;height:14px;border:2px solid var(--phosphor-dim);border-top-color:var(--phosphor);
   border-radius:50%;animation:spin .8s linear infinite;flex:none}
 @keyframes spin{to{transform:rotate(360deg)}}
@@ -1432,17 +1536,8 @@ select,input[type=text]{background:var(--panel2);border:1px solid var(--line);co
 .zoomctx{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:0 0 8px;font-size:12.5px;
   color:var(--fg-dim)}
 .zoomctx .zin b{color:var(--phosphor)}
-/* Level 1: the whole project as one bar, each part sized by how much happened in it. */
-.strip{display:flex;gap:3px;height:74px;margin:10px 0 6px}
-.seg{flex:1;min-width:38px;background:linear-gradient(180deg,#12241b,var(--panel));cursor:pointer;
-  border:1px solid var(--line);border-radius:6px;color:var(--fg-dim);font:inherit;padding:8px 9px;
-  display:flex;flex-direction:column;justify-content:space-between;align-items:flex-start;overflow:hidden;
-  transition:border-color .15s,color .15s,transform .15s}
-.seg:hover{border-color:var(--phosphor);color:var(--fg);transform:translateY(-2px)}
-.segn{font-family:var(--display);font-size:20px;line-height:1;color:var(--amber)}
-.segt{font-size:11.5px;line-height:1.25;text-align:left}
-.stripfoot{font-size:11.5px;color:var(--fg-dim)}
-.arcbig{margin:14px 0 0;font-size:14px;line-height:1.65;color:var(--fg);max-width:70ch}
+.emptypart{color:var(--fg-dim);font-size:13px;border:1px dashed var(--line);border-radius:8px;
+  padding:18px;margin:8px 0}
 .era{cursor:pointer}
 .era .zoomin{color:var(--phosphor-dim)}
 .era:hover .zoomin{color:var(--phosphor)}
@@ -1511,15 +1606,17 @@ h2.section{font-size:13px;letter-spacing:1.5px;text-transform:uppercase;color:va
 /* ------------------------------------------------------------------ graphics
    The numbers carry more of the story than a sentence about them would, so they are drawn:
    a bar for what a moment added and removed, a dot per commit, a sparkline per era. */
-.shape{display:flex;align-items:center;gap:10px;margin:9px 0 0;flex-wrap:wrap}
+.shape{display:flex;align-items:center;gap:16px;margin:10px 0 0;flex-wrap:wrap}
 .bar{display:flex;height:6px;border-radius:3px;overflow:hidden;background:var(--panel2);
-  flex:1;min-width:120px;max-width:280px}
+  width:120px;flex:none}
 .bar i{display:block;height:100%;width:var(--w);transition:width .7s cubic-bezier(.2,.8,.2,1)}
 .bar .add{background:var(--phosphor)} .bar .rem{background:var(--bad)}
 .dots{display:flex;gap:3px;align-items:center}
 .dots i{width:5px;height:5px;border-radius:50%;background:var(--phosphor-dim);opacity:.85}
 .dots i.big{background:var(--phosphor)}
 .dots span{font-size:11px;color:var(--fg-dim);margin-left:2px}
+.metric{display:flex;align-items:center;gap:7px}
+.mlabel{font-size:11.5px;color:var(--fg-dim);white-space:nowrap}
 .spark{display:flex;align-items:flex-end;gap:2px;height:28px}
 .spark i{width:6px;background:linear-gradient(180deg,var(--phosphor),var(--phosphor-dim));
   border-radius:1px;height:var(--h);transition:height .6s cubic-bezier(.2,.8,.2,1)}
@@ -1533,6 +1630,7 @@ h2.section{font-size:13px;letter-spacing:1.5px;text-transform:uppercase;color:va
 .morewrap{display:flex;gap:10px;flex-wrap:wrap;margin:16px 0 0}
 .engine{margin:34px 0 0;border:1px solid var(--line);border-radius:8px;background:var(--panel)}
 .engine summary{cursor:pointer;padding:11px 15px;color:var(--fg-dim);font-size:12.5px}
+.engine .gear{color:var(--accent);margin-right:4px}
 .engine summary:hover{color:var(--fg)}
 .engine .ebody{padding:0 15px 14px}
 .actmeta{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-top:8px;
@@ -1562,23 +1660,65 @@ body.anim .ch.in,body.anim .era.in{opacity:1;transform:none}
 .commits{margin:16px 0 0}
 .commits h4{font-size:11.5px;letter-spacing:1.5px;text-transform:uppercase;color:var(--phosphor);
   margin:0 0 8px;font-weight:600}
+/* The same commit row as the dashboard's log: same badge colours, same line counts, plus
+   who committed it and when. */
 .cmt{border:1px solid var(--line);border-radius:6px;margin:0 0 7px;background:var(--panel2)}
-.cmt .chead{display:flex;align-items:baseline;gap:9px;flex-wrap:wrap;padding:7px 11px;cursor:pointer;font-size:12.5px}
+.cmt .chead{display:flex;align-items:baseline;gap:9px;flex-wrap:wrap;padding:8px 11px;cursor:pointer;font-size:12.5px}
 .cmt .chead:hover{background:#0f1a14}
-.cmt .sha{color:var(--phosphor);font-size:12px}
-.cmt .subj{flex:1;min-width:180px;color:var(--fg);word-break:break-word}
+.cmt .sha{color:var(--amber);font-size:12.5px}
+.cmt .badge{font-size:10.5px;letter-spacing:.5px;padding:1px 7px;border:1px solid var(--line);color:var(--fg-dim)}
+.cmt.ai .badge{color:var(--phosphor);border-color:var(--phosphor-dim)}
+.cmt.ops .badge{color:var(--accent);border-color:var(--accent)}
+.cmt.nontracked .badge{color:var(--amber);border-color:var(--amber-dim)}
+.cmt .ksub{flex:1;min-width:200px;color:var(--fg);overflow-wrap:anywhere}
+.cmt .lc{font-size:12px;color:var(--fg-dim)}
+.cmt .lc .add{color:var(--phosphor)} .cmt .lc .rem{color:var(--bad)}
+.cmt .tok{font-size:11px;border:1px solid var(--line);padding:0 5px;color:var(--fg-dim)}
+.cmt .tok.out{color:var(--phosphor);border-color:var(--phosphor-dim)}
+.cmt .who{font-size:11.5px;color:var(--fg-dim)}
 .cmt .num{color:var(--fg-dim);font-size:11.5px}
 .cmt .add{color:var(--phosphor)} .cmt .rem{color:var(--bad)}
 .cmt .cbody{border-top:1px solid var(--line);padding:9px 11px}
 .cmt .cbar{margin:0 0 8px}
-.cmt .cview{font-size:12.5px;line-height:1.55;color:var(--fg-dim);word-break:break-word}
-.cmt .cview.md{color:var(--fg)}
-.cmt .cview.md h3,.cmt .cview.md h4{font-size:12.5px;color:var(--phosphor);margin:12px 0 5px}
-.cmt .cview.md p{margin:0 0 8px}
-.diffbox{margin:0;font-size:11.5px;line-height:1.45;overflow-x:auto;white-space:pre}
+/* Lifted verbatim from the dashboard (agitrack/metrics/web.py) so an expanded commit reads
+   EXACTLY the same on both pages: same heading colours by depth, same code chips, same
+   metadata treatment. */
+.dmsg{font-size:12.5px;line-height:1.55;color:var(--fg-dim);word-break:break-word}
+  background:transparent;border:1px solid var(--phosphor-dim);padding:1px 8px;cursor:pointer;letter-spacing:.3px}
+/* No frame, no scroller: the diff flows with the page exactly like the commit message it
+   toggles with. Long lines wrap rather than opening a second scroll region. */
+.diffbox{margin:0;font-size:12px;line-height:1.55;white-space:pre-wrap;overflow-wrap:anywhere}
 .diffbox .dl{display:block}
-.dfile{color:var(--accent)} .dhunk{color:var(--warn)} .dmeta2{color:var(--fg-dim)}
-.dadd{color:var(--phosphor)} .ddel{color:var(--bad)}
+.diffbox .dfile{color:var(--amber);background:rgba(255,180,84,.06)}
+.diffbox .dhunk{color:var(--ops);background:rgba(103,184,214,.09)}
+.diffbox .dmeta2{color:var(--fg-dim)}
+.diffbox .dadd{color:var(--phosphor);background:rgba(61,255,160,.08)}
+.diffbox .ddel{color:var(--red);background:rgba(255,107,107,.08)}
+.dmsg .diffempty{color:var(--fg-dim);font-size:12px;font-style:italic;padding:8px 12px;line-height:1.55}
+.dmsg .diffempty b{color:var(--phosphor);font-style:normal}
+/* loading spinner shown while a detail / diff / file history is being fetched */
+  border-radius:50%;animation:spin .7s linear infinite}
+/* rendered Markdown inside the expanded message */
+.dmsg.md p{margin:7px 0}
+/* Reflow mode (set by reflowParagraphs on paragraphs the layout wraps anyway):
+   the source line breaks stop rendering and the paragraph flows as prose. The
+   space preceding each <br> in the markup keeps the words apart. */
+.dmsg.md p.mdp.reflow br{display:none}
+.dmsg.md .md-h{font-family:var(--mono);color:var(--amber);margin:11px 0 5px;font-size:13px;font-weight:600}
+/* Heading depth reads at a glance: structural sections (# …) brightest/largest,
+   the ## User/## Agent role one step down, and a message's own nested headings
+   smaller, dimmer and indented so they sit visibly under their role. md() maps a
+   source level L to <h(L+2)>, so these are # → h3, ## → h4, content → h5/h6. */
+.dmsg.md h3.md-h{font-size:15px;color:var(--amber)}
+.dmsg.md h4.md-h{font-size:13.5px;color:var(--phosphor)}
+.dmsg.md h5.md-h{font-size:12.5px;color:var(--ops);font-weight:500;padding-left:10px;border-left:2px solid var(--line)}
+.dmsg.md h6.md-h{font-size:12px;color:var(--fg-dim);font-weight:500;padding-left:20px;border-left:2px solid var(--line)}
+.dmsg.md ul{margin:6px 0 6px 18px} .dmsg.md li{margin:2px 0}
+.dmsg.md code{background:var(--panel2);border:1px solid var(--line);padding:0 4px;color:var(--phosphor);font-size:12px}
+.dmsg.md strong{color:var(--fg)} .dmsg.md em{color:var(--fg)}
+.dmsg.md .md-code{white-space:pre-wrap;background:var(--panel2);border:1px solid var(--line);
+  padding:8px 10px;margin:7px 0;color:var(--fg-dim);font-size:12px}
+.dmsg.md a{color:var(--phosphor)}
 .diffempty{color:var(--fg-dim);font-size:12.5px}
 
 /* ---------------------------------------------------------------- the outline */
@@ -1601,13 +1741,16 @@ body.cinema .studio,body.cinema .toolbar .nocinema{opacity:.25}
 @keyframes fall{to{transform:translateY(104vh) rotate(360deg);opacity:0}}
 
 /* The frozen top strips (backtrace notice, static-demo notice), matching the learn page. */
-.btbanner{position:sticky;top:0;z-index:60;background:#1a1206;border-bottom:1px solid var(--amber-dim);
-  color:var(--amber);font-size:12.5px;padding:8px 14px;line-height:1.5}
-.btbanner code{background:#241a09;border:1px solid var(--amber-dim);border-radius:3px;padding:0 5px;color:var(--amber)}
+/* Identical to the dashboard's .backtracebanner and the learn page's .btbanner: one strip,
+   one look, wherever the reader meets it. */
+.btbanner{position:sticky;top:0;z-index:60;margin:0;padding:10px 18px;background:var(--panel);
+  border-bottom:2px solid var(--amber-dim);color:var(--warn);font-size:12.5px;line-height:1.5;
+  text-align:center;box-shadow:0 4px 16px rgba(0,0,0,.55)}
+.btbanner code{color:var(--fg);background:var(--panel2);padding:0 5px;border-radius:3px}
 .btbanner a{color:var(--phosphor);text-decoration:none;border-bottom:1px solid var(--phosphor-dim)}
 .btbanner a:hover{color:var(--ink);background:var(--phosphor);text-decoration:none}
-.updatebanner{background:#1a1206;border-bottom:1px solid var(--amber-dim);color:var(--amber);
-  font-size:12.5px;padding:8px 14px}
+.updatebanner{background:var(--panel);border-bottom:2px solid var(--amber-dim);color:var(--warn);
+  font-size:12.5px;padding:10px 18px;text-align:center;box-shadow:0 4px 16px rgba(0,0,0,.55)}
 
 footer{margin-top:40px;padding-top:14px;border-top:1px dashed var(--line);color:var(--fg-dim);font-size:12px}
 footer code{color:var(--fg)}
@@ -1656,6 +1799,10 @@ __BACKTRACE_BANNER__
         <button class="chip" data-v="epic">&#127905; epically</button>
       </div>
     </div>
+    <div class="row"><label>anything to add</label>
+      <input type="text" id="f-note" maxlength="300"
+             placeholder="optional: a style, something to focus on, someone to credit…">
+    </div>
     <div class="row" id="actions">
       <button class="gobtn" id="write">&#10024; tell me the story</button>
       <button class="btn" id="extend" hidden>&#10133; catch up on what is new</button>
@@ -1666,23 +1813,24 @@ __BACKTRACE_BANNER__
     <div class="hint" id="studiohint"></div>
   </div>
 
-  <div class="buildbar" id="buildbar" hidden>
-    <span class="spin"></span>
-    <div style="flex:1;min-width:220px">
-      <div class="phase" id="build-phase"></div>
-      <div class="pbar"><span id="build-bar"></span></div>
+  <div class="overlay" id="overlay" hidden>
+    <div class="ov-card">
+      <span class="ovicon" id="ov-icon">&#128214;</span>
+      <div class="ov-title" id="build-phase">reading your history…</div>
+      <div class="ov-msg" id="build-sub"></div>
+      <div class="ov-engine" id="ov-engine"></div>
+      <div class="ov-bar"><span id="build-bar"></span></div>
+      <div class="ov-hint">your agent is reading the commits and the messages behind them; this usually takes under a minute</div>
+      <button class="btn small" id="build-cancel">stop</button>
     </div>
-    <span class="sub" id="build-sub"></span>
-    <button class="btn small" id="build-cancel">stop</button>
   </div>
   <div id="flash"></div>
 
   <div class="zoombar" id="toolbar" hidden>
     <span class="zlabel">zoom</span>
     <div class="zoom" id="zoom">
-      <button class="zstop" data-z="1"><b>1&times;</b><span>the whole thing</span></button>
-      <button class="zstop" data-z="2"><b>5&times;</b><span>five parts</span></button>
-      <button class="zstop sel" data-z="3"><b>20&times;</b><span>moment by moment</span></button>
+      <button class="zstop" data-z="2"><b>&#9679;</b><span>the five parts</span></button>
+      <button class="zstop sel" data-z="3"><b>&#9679;&#9679;&#9679;</b><span>moment by moment</span></button>
     </div>
     <span class="grow"></span>
     <button class="btn small nocinema" id="play">&#9654; play it</button>
@@ -1706,7 +1854,7 @@ __BACKTRACE_BANNER__
   </div>
 
   <details class="engine" id="engine">
-    <summary>who tells it: backend &amp; model</summary>
+    <summary><span class="gear">&#9881;</span> settings: who tells it (backend &amp; model)</summary>
     <div class="ebody">
       <div class="row"><label>backend</label>
         <select id="e-backend">
@@ -1756,6 +1904,9 @@ function num(n){ n = Number(n||0);
 }
 function day(ts){ if(!ts) return ""; const d = new Date(ts*1000);
   return d.toISOString().slice(0,10); }
+// The dashboard's stamp: date and time, so a commit here reads the same as one there.
+function stamp(ts){ return ts ? new Date(ts * 1000).toISOString().slice(0, 16).replace("T", " ") + " UTC" : ""; }
+const AI_KINDS = new Set(["agent", "covered", "agent-merge"]);
 function post(path, body){
   return fetch(path, {method:"POST", headers:{"Content-Type":"application/json"},
                       body: JSON.stringify(body||{}), cache:"no-store"})
@@ -1801,16 +1952,41 @@ function md(src){
 }
 
 // ------------------------------------------------------------------ loading
-async function load(){
+// The state fetch is retried rather than reported: a page restored from the back/forward
+// cache, or opened again while an earlier request was still in flight, would otherwise greet
+// the reader with "load failed" for a request that simply got cut short.
+async function load(attempt){
+  attempt = attempt || 0;
   const url = "story/state" + (state.branch ? "?branch=" + encodeURIComponent(state.branch) : "");
-  const r = await fetch(url, {cache:"no-store"});
-  if (!r.ok) throw new Error("server error " + r.status);
-  state.data = await r.json();
-  state.story = state.data.story;
-  if (!state.branch && state.data.branch) state.branch = state.data.branch;
-  if (state.story && state.story.tone) state.tone = state.story.tone;
-  render();
+  try {
+    const r = await fetch(url, {cache: "no-store"});
+    if (!r.ok) throw new Error("server error " + r.status);
+    state.data = await r.json();
+    state.story = state.data.story;
+    if (!state.branch && state.data.branch) state.branch = state.data.branch;
+      if (state.story && state.story.tone) state.tone = state.story.tone;
+    if (state.story && state.story.note && !$("f-note").value) $("f-note").value = state.story.note;
+    state.loadFailed = false;
+    render();
+  } catch (error) {
+    if (attempt < 3) {                        // a dropped fetch is normal; a broken page is not
+      await new Promise(done => setTimeout(done, 400 * (attempt + 1)));
+      return load(attempt + 1);
+    }
+    $("loading").hidden = true;
+    state.loadFailed = true;
+    // Keep whatever is already on screen; only say something when there is nothing to show.
+    if (!state.data) fail("could not reach aGiTrack for this story. It may have been stopped; this page retries by itself.");
+    throw error;
+  }
 }
+
+// Coming back to the page (bfcache restore, or the tab becoming visible again) reloads the
+// state instead of leaving a half-loaded page behind.
+window.addEventListener("pageshow", event => { if (event.persisted || state.loadFailed) load().catch(() => {}); });
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && (state.loadFailed || !state.data)) load().catch(() => {});
+});
 
 function render(){
   const d = state.data; if (!d) return;
@@ -1901,11 +2077,11 @@ function renderStudio(){
   $("studiohint").textContent = hint;
 }
 
-// One story, three magnifications. Level 1 is the shape of the whole thing, level 2 its five
-// parts, level 3 the moments inside them; opening a moment is the last step in, to the
-// commits themselves. Zooming into a PART narrows every level below it to that part.
+// One story, two magnifications: the five parts, and the moments inside them. Opening a
+// moment is the last step in, to the commits themselves. Zooming into a PART narrows
+// everything below it to that part.
 function setZoom(level, part){
-  state.zoom = Math.max(1, Math.min(3, level || 3));
+  state.zoom = Math.max(2, Math.min(3, level || 3));  // two stops: the parts, and inside them
   if (part !== undefined) state.part = part;
   if (state.zoom < 3) state.shown = PAGE_MOMENTS;
   for (const stop of $("zoom").querySelectorAll(".zstop"))
@@ -1927,9 +2103,13 @@ function renderZoomContext(){
   const part = currentPart(), host = $("zoomctx");
   host.hidden = !part;
   if (!part) return;
-  host.innerHTML = '<button class="btn small zback">&larr; back to all five parts</button>' +
-    '<span class="zin">zoomed into <b>' + esc(part.title) + "</b> &nbsp;·&nbsp; " +
-    esc(part.when) + " &rarr; " + esc(part.until) + "</span>";
+  const inside = momentsInView().length;
+  host.innerHTML = '<button class="btn small zback">&larr; back to the five parts</button>' +
+    '<span class="zin">inside <b>' + esc(part.title) + "</b> &nbsp;·&nbsp; " +
+    esc(part.when) + " &rarr; " + esc(part.until) + " &nbsp;·&nbsp; " + part.commits + " commits</span>" +
+    // A part nobody has told yet is a dead end without this: the reader is looking straight
+    // at it and there is nothing to read and no obvious way to get any.
+    (inside ? "" : '<button class="btn zpart">&#10024; tell this part</button>');
 }
 
 // Everything the current zoom (and part) is looking at.
@@ -1940,21 +2120,6 @@ function momentsInView(){
   return all.filter(m => m.from >= part.from && m.to <= part.to);
 }
 
-// The whole project on one line: every part, sized by how much happened in it.
-function stripHtml(){
-  const eras = (state.story && state.story.eras) || [];
-  if (!eras.length) return "";
-  const total = eras.reduce((sum, era) => sum + Math.max(1, era.commits), 0);
-  return '<div class="strip">' + eras.map(era =>
-    '<button class="seg" data-part="' + esc(era.id) + '" style="flex:' + Math.max(1, era.commits) + '"' +
-    ' title="' + esc(era.title) + " · " + era.commits + ' commits">' +
-      '<span class="segn">' + era.n + "</span>" +
-      '<span class="segt">' + esc(era.title) + "</span>" +
-    "</button>").join("") + "</div>" +
-    '<div class="stripfoot">' + eras[0].when + " &rarr; " + eras[eras.length - 1].until +
-    " &nbsp;·&nbsp; " + total + " commits &nbsp;·&nbsp; click a part to zoom in</div>";
-}
-
 // The whole project, coarse: one row per era, newest first, each with its span, size and the
 // shape of the work inside it. This is complete even when only the last week has moments.
 function renderEras(){
@@ -1962,10 +2127,6 @@ function renderEras(){
   const eras = (s && s.eras) || [];
   host.hidden = !eras.length || state.zoom === 3;
   if (host.hidden) return;
-  if (state.zoom === 1) {
-    host.innerHTML = '<h2 class="section">the whole thing</h2>' + stripHtml();
-    return;
-  }
   host.innerHTML = '<h2 class="section">five parts</h2>' +
     eras.slice().reverse().map(era => {
       const told = ((s.moments || []).filter(m => m.from >= era.from && m.to <= era.to)).length;
@@ -2000,7 +2161,12 @@ function renderTimeline(){
   const any = ((state.story && state.story.moments) || []).length;
   $("toolbar").hidden = !any;  // the zoom control is how you get back out; never hide it
   if (state.zoom !== 3 || !all.length) {
-    host.innerHTML = "";
+    // An empty part explains itself rather than showing a blank page (the context bar above
+    // carries the button that fills it).
+    host.innerHTML = state.zoom === 3 && currentPart()
+      ? '<div class="emptypart">Nothing from this part has been told yet. It covers ' +
+        currentPart().commits + " commits; writing it takes about half a minute.</div>"
+      : "";
     $("morewrap").hidden = true;
     if (state.zoom !== 3) return;
   }
@@ -2058,18 +2224,23 @@ function shapeHtml(st){
   const parts = [];
   if (total) {
     const pct = Math.round(100 * ins / total);
-    parts.push('<span class="bar" title="' + ins + ' added, ' + del + ' removed">' +
-      '<i class="add" style="--w:' + pct + '%"></i><i class="rem" style="--w:' + (100 - pct) + '%"></i></span>');
+    // Labelled, because a bare two-colour bar means nothing on its own.
+    parts.push('<span class="metric"><span class="bar" title="' + ins + ' lines added, ' + del + ' removed">' +
+      '<i class="add" style="--w:' + pct + '%"></i><i class="rem" style="--w:' + (100 - pct) + '%"></i></span>' +
+      '<span class="mlabel"><span class="add">+' + num(ins) + '</span> <span class="rem">-' + num(del) +
+      "</span> lines</span></span>");
   }
   const commits = Math.max(0, Number(st.commits || 0));
   if (commits) {
     const shown = Math.min(commits, 12);
     let dots = "";
     for (let d = 0; d < shown; d++) dots += '<i style="transition-delay:' + (d * 25) + 'ms"></i>';
-    parts.push('<span class="dots" title="' + commits + ' commits">' + dots +
-      (commits > shown ? "<span>+" + (commits - shown) + "</span>" : "") + "</span>");
+    parts.push('<span class="metric"><span class="dots" title="one dot per commit">' + dots + "</span>" +
+      '<span class="mlabel">' + commits + " commit" + (commits === 1 ? "" : "s") + "</span></span>");
   }
-  if (st.tokens) parts.push('<span class="fact">' + num(st.tokens) + " tokens</span>");
+  if (st.turns) parts.push('<span class="metric"><span class="mlabel">' + st.turns + " agent turn" +
+    (st.turns === 1 ? "" : "s") + "</span></span>");
+  if (st.tokens) parts.push('<span class="metric"><span class="mlabel">' + num(st.tokens) + " tokens</span></span>");
   return parts.length ? '<div class="shape">' + parts.join("") + "</div>" : "";
 }
 
@@ -2124,13 +2295,21 @@ function fillMoment(el, animate){
   if (c.commits && c.commits.length) {
     // Newest first here too, and each row opens on its COMMIT MESSAGE (the conversation that
     // produced it) with a button to flip to the file changes, like the dashboard's log.
-    html += '<div class="commits"><h4>&#128220; the commits themselves</h4>' + c.commits.slice().reverse().map(r =>
-      '<div class="cmt" data-sha="' + esc(r.sha) + '">' +
-        '<div class="chead"><span class="sha">' + esc(r.short) + "</span>" +
-          '<span class="subj">' + esc(r.subject) + "</span>" +
-          '<span class="num"><span class="add">+' + num(r.ins) + '</span>/<span class="rem">-' + num(r["del"]) + "</span></span>" +
-          '<span class="num toggle">open &#9662;</span></div>' +
-      "</div>").join("") + "</div>";
+    html += '<div class="commits"><h4>&#128220; the commits themselves</h4>' + c.commits.slice().reverse().map(r => {
+      const kind = AI_KINDS.has(r.kind) ? "ai" : (r.kind === "agitrack-ops" ? "ops" : "nontracked");
+      const out = (r.tokens && r.tokens.output) ? '<span class="tok out">' + num(r.tokens.output) + " out</span>" : "";
+      return '<div class="cmt entry ' + kind + '" data-sha="' + esc(r.sha) + '">' +
+        '<div class="chead">' +
+          '<span class="sha">' + esc(r.short) + "</span>" +
+          '<span class="badge ' + kind + '">' + esc(r.kind) + "</span>" +
+          '<span class="ksub">' + esc(r.subject) + "</span>" +
+          '<span class="lc"><span class="add">+' + num(r.ins) + '</span> <span class="rem">-' + num(r["del"]) + "</span></span>" +
+          out +
+          '<span class="who">' + esc(r.author || "") + (r.ts ? " &nbsp;·&nbsp; " + esc(stamp(r.ts)) : "") + "</span>" +
+          '<span class="num toggle">open &#9662;</span>' +
+        "</div>" +
+      "</div>";
+    }).join("") + "</div>";
   }
   box.innerHTML = html;
 }
@@ -2140,11 +2319,12 @@ function fillMoment(el, animate){
 async function writeMoment(el, c, box){
   if (box.dataset.writing === "1") return;
   box.dataset.writing = "1";
-  box.innerHTML = '<div class="writing"><span class="spin"></span>' +
-    '<span>reading the commits and what you asked for…</span></div>';
+  box.innerHTML = '<div class="writing"><span class="spin"></span><span>reading the commits…</span></div>';
+  showOverlay("writing this moment…", "reading its commits and what you asked for");
   try {
-    const r = await post("story/moment", {branch: state.branch, id: c.id});
+    const r = await post("story/moment", {branch: state.branch, id: c.id, note: $("f-note").value.trim()});
     box.dataset.writing = "";
+    hideOverlay();
     if (r.error || !r.moment) {
       box.innerHTML = '<div class="notice">' + esc(r.error || "this moment could not be written") + "</div>";
       return;
@@ -2154,8 +2334,24 @@ async function writeMoment(el, c, box){
     fillMoment(el, true);
   } catch (e) {
     box.dataset.writing = "";
+    hideOverlay();
     box.innerHTML = '<div class="notice">' + esc(e.message) + "</div>";
   }
+}
+
+// The overlay for a single moment: no progress to report, so the bar just breathes.
+function showOverlay(title, message){
+  $("overlay").hidden = false;
+  $("ov-icon").textContent = "\u{1F4D6}";
+  $("build-phase").textContent = title;
+  $("build-sub").textContent = message || "";
+  $("ov-engine").textContent = engineLine();
+  $("build-bar").style.width = "45%";
+  $("build-cancel").hidden = true;
+}
+function hideOverlay(){
+  $("overlay").hidden = true;
+  $("build-cancel").hidden = false;
 }
 
 function momentById(id){
@@ -2180,6 +2376,84 @@ function toggleMoment(el, force){
     el.querySelector(".open-hint").innerHTML = "go closer &darr;";
   }
 }
+
+function commitMd(src){
+  const lines = (src||"").replace(/\r\n/g,"\n").split("\n");
+  const inline = t => esc(t)
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>")
+    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  let html="", inCode=false, code=[], inList=false, inMeta=false, para=[];
+  const closeList = () => { if(inList){ html+="</ul>"; inList=false; } };
+  // Consecutive non-blank lines are ONE paragraph, their source breaks kept as <br>. A
+  // blank line still starts a new paragraph. The " " before each <br> is what remains when
+  // reflowParagraphs() hides the break on a narrow screen, so the lines join as prose.
+  // Metadata lines (key: value, after the "aGiTrack Metadata" heading) are marked "keep":
+  // their breaks are structure, never re-flowed.
+  const flushPara = () => {
+    if(!para.length) return;
+    html += `<p class="mdp${inMeta?" keep":""}">` + para.map(inline).join(" <br>") + "</p>";
+    para = [];
+  };
+  for(const raw of lines){
+    if(raw.trimStart().startsWith("```")){
+      flushPara();
+      if(inCode){ html+="<pre class=\"md-code\">"+esc(code.join("\n"))+"</pre>"; code=[]; inCode=false; }
+      else { closeList(); inCode=true; }
+      continue;
+    }
+    if(inCode){ code.push(raw); continue; }
+    const h = raw.match(/^(#{1,6})\s+(.*)$/);
+    if(h){
+      flushPara(); closeList();
+      if(/agitrack\s+metadata/i.test(h[2])) inMeta = true;
+      const lvl=Math.min(6,h[1].length+2); html+=`<h${lvl} class="md-h">${inline(h[2])}</h${lvl}>`; continue;
+    }
+    const li = raw.match(/^\s*[-*+]\s+(.*)$/);
+    if(li){ flushPara(); if(!inList){ html+="<ul>"; inList=true; } html+="<li>"+inline(li[1])+"</li>"; continue; }
+    if(raw.trim()===""){ flushPara(); closeList(); continue; }
+    para.push(raw);
+  }
+  flushPara();
+  if(inCode){ html+="<pre class=\"md-code\">"+esc(code.join("\n"))+"</pre>"; }
+  closeList();
+  return html;
+}
+
+// Commit messages are hard-wrapped by the writer (~72 chars). When the rendering column is
+// narrower than that, every source line wraps AGAIN and the text reads as ragged fragments.
+// So a paragraph the layout wraps further drops its single line breaks and flows as prose;
+// one that fits keeps every break exactly as written. Blank-line paragraph breaks always
+// stay, as does the metadata block. Measured on the un-joined text, so the decision is
+// about the ORIGINAL lines; re-run on resize.
+function reflowParagraphs(root){
+  if(!root || !root.querySelectorAll) return;
+  for(const p of root.querySelectorAll("p.mdp:not(.keep)")){
+    p.classList.remove("reflow");
+    const breaks = p.getElementsByTagName("br").length;
+    if(!breaks) continue;
+    const lh = parseFloat(getComputedStyle(p).lineHeight) || 16;
+    const range = document.createRange();
+    range.selectNodeContents(p);
+    // One rect per line box — but inline <code> sits a couple of pixels off its line, so
+    // cluster by line height instead of counting distinct tops.
+    const tops = [];
+    for(const r of range.getClientRects()){
+      if(!r.height) continue;
+      if(!tops.some(t => Math.abs(t - r.top) < lh * 0.6)) tops.push(r.top);
+    }
+    if(tops.length > breaks + 1) p.classList.add("reflow");
+  }
+}
+
+// `min` (default 0) is the low end of the scale: the width maps [min, max] → [0, 100],
+// so passing the smallest value in the set as `min` spreads the bars across the full
+// width instead of compressing them against a fixed 0 baseline. The smallest value then
+// shows the 2% floor (still visible) and the largest fills the bar.
+// `logScale` marks a bar whose width is log-scaled (the token bars): it gets a striped
+// fill and a small "log" tag so it reads differently from the linear (scalar) bars
+// elsewhere, whose widths are directly proportional to their value.
 
 // ------------------------------------------------------ commits: message, then changes
 // One fetch answers both (the /diff endpoint carries the commit message too), so opening a
@@ -2208,7 +2482,7 @@ async function toggleCommit(row){
   }
   if (!row.querySelector(".cbody")) return;  // closed again while we were fetching
   body.innerHTML = '<div class="cbar"><button class="btn small cflip">show file changes</button></div>' +
-                   '<div class="cview"></div>';
+                   '<div class="cview dmsg"></div>';
   showCommitView(row, "message");
 }
 
@@ -2218,14 +2492,15 @@ function showCommitView(row, mode){
   if (!view) return;
   view.dataset.mode = mode;
   if (mode === "diff") {
-    view.className = "cview";
+    view.className = "cview dmsg diff";
     view.innerHTML = data.error ? '<div class="diffempty">' + esc(data.error) + "</div>"
                                 : diffHtml(data.diff, data.truncated);
     if (flip) flip.textContent = "show commit message";
   } else {
-    view.className = "cview md";
+    view.className = "cview dmsg md";
     view.innerHTML = data.error ? '<div class="diffempty">' + esc(data.error) + "</div>"
-                                : md(data.message || "(no message recorded)");
+                                : commitMd(data.message || "(no message recorded)");
+    reflowParagraphs(view);  // the dashboard's prose-reflow, so wrapping matches there too
     if (flip) flip.textContent = "show file changes";
   }
 }
@@ -2314,10 +2589,16 @@ function renderEngine(){
 }
 
 // ------------------------------------------------------------------ building
+function engineLine(){
+  const e = (state.data && state.data.engine) || {};
+  if (!e.backend || e.error) return "";
+  return "told by " + e.backend + " \u00b7 " + (e.model || "its default model");
+}
+
 function renderBuild(p){
   const running = !!(p && p.running);
   state.building = running;
-  $("buildbar").hidden = !running;
+  $("overlay").hidden = !running;
   if (p && p.error && !running) fail(p.error === "cancelled" ? "Stopped. The moments already written are kept." : p.error);
   if (!running) { renderStudio(); return; }
   $("build-phase").textContent = p.phase || "working";
@@ -2334,7 +2615,8 @@ async function build(mode){
   state.building = true; renderStudio();
   if (!(state.story && (state.story.moments || []).length)) $("skeleton").hidden = false;
   try {
-    const r = await post("story/build", {branch: state.branch, tone: state.tone, mode: mode});
+    const r = await post("story/build", {branch: state.branch, tone: state.tone, mode: mode,
+                                        note: $("f-note").value.trim(), part: state.part || ""});
     if (r.error || r.busy) { state.building = false; fail(r.error || "busy"); renderStudio(); return; }
     renderBuild(r.progress);
     startPolling();
@@ -2542,20 +2824,12 @@ $("eras").addEventListener("click", e => {
   if (seg) setZoom(3, seg.dataset.part);
 });
 $("zoomctx").addEventListener("click", e => {
-  if (e.target.closest(".zback")) { state.part = null; setZoom(2); }
+  if (e.target.closest(".zback")) { state.part = null; setZoom(2); return; }
+  if (e.target.closest(".zpart")) build("part");
 });
 $("f-branch").addEventListener("change", () => {
   state.branch = $("f-branch").value; state.open.clear();
   load().catch(e => fail(e.message));
-});
-$("backlink").addEventListener("click", e => {
-  // Returning to the dashboard through history restores it from the back/forward cache
-  // instead of recomputing its whole commit history.
-  try {
-    if (document.referrer && new URL(document.referrer).origin === location.origin && history.length > 1) {
-      e.preventDefault(); history.back();
-    }
-  } catch (err) {}
 });
 document.addEventListener("keydown", e => {
   if (e.target && /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) return;
@@ -2569,7 +2843,7 @@ document.addEventListener("keydown", e => {
 });
 window.addEventListener("hashchange", openFromHash);
 
-load().catch(e => { $("loading").hidden = true; fail("could not load the story: " + e.message); });
+load().catch(() => {});   // load() reports for itself, after its retries
 // A build started from another tab (or still running from before this page loaded) keeps
 // the page live without anyone pressing anything.
 setTimeout(() => { if (state.data && state.data.building && state.data.building.running) startPolling(); }, 100);

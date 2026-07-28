@@ -1084,9 +1084,10 @@ h2.section::before{content:"# ";color:var(--amber)}
 .entry .detail .diffbtn{margin-right:10px;font-family:inherit;font-size:11.5px;color:var(--phosphor);
   background:transparent;border:1px solid var(--phosphor-dim);padding:1px 8px;cursor:pointer;letter-spacing:.3px}
 .entry .detail .diffbtn:hover{background:var(--phosphor);color:var(--ink)}
-.diffbox{border:1px solid var(--line);background:var(--ink);max-height:460px;overflow:auto;
-  font-size:12px;line-height:1.5;white-space:pre}
-.diffbox .dl{display:block;padding:0 10px}
+/* No frame, no scroller: the diff flows with the page exactly like the commit message it
+   toggles with. Long lines wrap rather than opening a second scroll region. */
+.diffbox{margin:0;font-size:12px;line-height:1.55;white-space:pre-wrap;overflow-wrap:anywhere}
+.diffbox .dl{display:block}
 .diffbox .dfile{color:var(--amber);background:rgba(255,180,84,.06)}
 .diffbox .dhunk{color:var(--ops);background:rgba(103,184,214,.09)}
 .diffbox .dmeta2{color:var(--fg-dim)}
@@ -1172,6 +1173,7 @@ h2.section::before{content:"# ";color:var(--amber)}
    they read as the start of the log rather than part of the story card above. */
 .panebar{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;
   margin:22px 0 12px}
+#head-files{margin:0 0 12px}
 
 /* ---- file browser (folder tree) — names flush-left, folders collapsible ---- */
 .filesearch{background:var(--ink);color:var(--fg);border:1px solid var(--line);font-family:var(--mono);
@@ -1340,13 +1342,13 @@ __UPDATE_BANNER__
       <button class="logtab active" data-tab="commits">commits</button>
       <button class="logtab" data-tab="files" id="tab-files-btn">files</button>
     </div>
-    <div class="panehead" id="head-commits"><div class="logsort"><label for="f-sort">sort</label><select id="f-sort" title="Sort the filtered commits">
+    <div class="logsort"><label for="f-sort">sort</label><select id="f-sort" title="Sort the filtered commits">
       <option value="date">newest first</option>
       <option value="lines">most lines changed</option>
       <option value="tokens">most output tokens</option>
-    </select></div></div>
-    <div class="panehead" id="head-files" hidden><input id="file-search" class="filesearch" type="search" placeholder="filter files…" autocomplete="off"></div>
+    </select></div>
   </div>
+  <div class="panehead" id="head-files" hidden><input id="file-search" class="filesearch" type="search" placeholder="filter files…" autocomplete="off"></div>
 
   <div class="logpane" id="pane-commits">
     <div class="logintro" id="logintro" hidden>Each entry below is one <b>reconstructed agent turn</b> from your
@@ -1462,6 +1464,37 @@ function qs(extra){
   for(const k in (extra||{})) p.set(k, extra[k]);
   return p.toString();
 }
+// Coming back from the story or learn page is a fresh page load, so the dashboard would
+// crunch the whole git log again behind the boot animation before showing anything. The
+// last view is kept for this session and painted IMMEDIATELY, then the real fetch replaces
+// it. A hard refresh (reload) skips the snapshot, which is what a refresh is for.
+const SNAP_KEY = "agitrack:dash:" + location.pathname;
+const SNAP_MAX = 2_000_000;   // never fill sessionStorage with a huge repo's payload
+function snapshotSave(){
+  try{
+    if(!AGG || !LOGPAGE) return;
+    const blob = JSON.stringify({head:HEAD, agg:AGG, options:OPTIONS, generated:GENERATED, ts:TS,
+                                 span:SPAN, shared:SHARED, insights:INSIGHTS, log:LOGPAGE,
+                                 branch:state.branch, at:Date.now()});
+    if(blob.length <= SNAP_MAX) sessionStorage.setItem(SNAP_KEY, blob);
+  }catch(e){}   // private mode, quota, anything: the snapshot is an optimisation only
+}
+function snapshotRestore(){
+  try{
+    const nav = performance.getEntriesByType && performance.getEntriesByType("navigation")[0];
+    if(nav && nav.type === "reload") return false;   // an explicit refresh means re-read
+    const blob = sessionStorage.getItem(SNAP_KEY);
+    if(!blob) return false;
+    const d = JSON.parse(blob);
+    if(!d || !d.agg || !d.log) return false;
+    HEAD=d.head; AGG=d.agg; OPTIONS=d.options; GENERATED=d.generated; TS=d.ts||{t:[]};
+    if(d.span) SPAN=d.span; if(d.shared) SHARED=d.shared;
+    if(d.insights !== undefined) INSIGHTS=d.insights;
+    LOGPAGE=d.log; if(d.branch) state.branch=d.branch;
+    return true;
+  }catch(e){ return false; }
+}
+
 async function loadAgg(){
   try{ const r = await fetch("data?"+qs(), {cache:"no-store"}); if(r.ok){
     const d = await r.json(); HEAD=d.head; AGG=d.agg; OPTIONS=d.options; GENERATED=d.generated_at;
@@ -1470,13 +1503,13 @@ async function loadAgg(){
     // The server reports which branch it actually served (e.g. it fell back to the
     // default if the requested one vanished); reflect that in the state + header.
     if(d.branch !== undefined){ state.branch = d.branch; setBranchLabel(d.branch); }
-    setOffline(false); return true; } }
+    setOffline(false); snapshotSave(); return true; } }
   catch(e){ if(LIVE) setOffline(true); }  // network failure ⇒ server unreachable
   return false;
 }
 async function loadLog(offset){
   try{ const r = await fetch("log?"+qs({offset:offset||0, limit:PAGE_SIZE, sort:state.sort}), {cache:"no-store"});
-    if(r.ok){ LOGPAGE = await r.json(); setOffline(false); return true; } }
+    if(r.ok){ LOGPAGE = await r.json(); setOffline(false); snapshotSave(); return true; } }
   catch(e){ if(LIVE) setOffline(true); }
   return false;
 }
@@ -2278,8 +2311,9 @@ function showLogTab(tab){
   if(pf) pf.hidden = tab !== "files";
   // The tabs and the pane's own control (sort / file filter) share one row, so the control
   // has to follow the tab.
-  const hc = $("head-commits"), hf = $("head-files");
-  if(hc) hc.hidden = tab !== "commits";
+  // The file filter does nothing in the commit view, so it is only there for the files tab,
+  // on its own line under the tabs (the sort control keeps the right-hand end of that row).
+  const hf = $("head-files");
   if(hf) hf.hidden = tab !== "files";
 }
 function fileChangeHtml(c, i){
@@ -2395,6 +2429,12 @@ async function init(){
   // real aggregates + first log page, then drop the loader and render. A big repo's
   // git-log crunch happens here, behind the animation, instead of blocking first paint.
   if(!HAVE_DATA){
+    // Paint the previous view first when there is one (returning from story/learn), so the
+    // page is immediately usable; the fetch below then quietly brings it up to date.
+    if(snapshotRestore()){
+      document.body.classList.remove("booting");
+      syncFilters(); renderAgg(); renderLog();
+    }
     await loadAgg(); await loadLog(0);
     document.body.classList.remove("booting");
   }
