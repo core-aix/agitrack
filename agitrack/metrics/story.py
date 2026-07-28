@@ -298,25 +298,33 @@ def _day(ts: int) -> str:
 
 
 def _shorten(text: str, limit: int) -> str:
-    """``text`` capped at ``limit``, cut at a word end with an ellipsis rather than mid-word."""
+    """``text`` capped at ``limit``, ending where a reader would: at a SENTENCE end if there
+    is one in range, else at a word end. Never mid-word, and never mid-sentence when a
+    sentence boundary is available.
+
+    This matters most for the chain of thought, which quotes what the developer actually
+    typed: a quote that stops at "please check why and avoi" reads like the tool broke."""
     text = (text or "").strip()
     if len(text) <= limit:
         return text
-    cut = text[: limit - 1]
-    space = cut.rfind(" ")
-    if space > limit // 2:
-        cut = cut[:space]
+    window = text[:limit]
+    end = max(window.rfind(mark) for mark in (". ", "? ", "! ", ".\n", "?\n", "!\n", "; "))
+    if end >= limit // 3:  # a real sentence ends in range: stop there, whole
+        return window[: end + 1].rstrip()
+    space = window.rfind(" ")
+    cut = window[:space] if space > limit // 2 else window
     return cut.rstrip(" ,;:.") + "…"
 
 
 def _prompts_of(stat: CommitStat, limit: int = 2, chars: int = 220) -> list[str]:
-    """The developer's own words behind this commit, cleaned and trimmed."""
+    """The developer's own words behind this commit, cleaned and trimmed at a sentence end
+    (see :func:`_shorten`) so a quote never breaks off mid-word."""
     out: list[str] = []
     for raw in [*(stat.user_prompts or []), stat.prompt or ""]:
         text = learn_page._clean_prompt(raw)
         if not text or text in out:
             continue
-        out.append(text[:chars])
+        out.append(_shorten(text, chars))
         if len(out) >= limit:
             break
     return out
@@ -359,8 +367,8 @@ For each chapter:
 - "kicker": one of {", ".join(KICKERS)}.
 - "emoji": a single emoji that fits the chapter.
 - "summary": ONE sentence a reader can skim.
-- "detail": 2 to 4 short paragraphs in markdown: what changed, why it was needed (use the prompts as evidence), and what it made possible. Mention concrete file or feature names.
-- "thoughts": 1 to 3 pivotal moments, each {{"sha": "<a commit id from this material>", "note": "one sentence on what the developer was working out at that moment"}}. Pick the commits whose prompts show the thinking best. Never invent a quote: only the commit id and your note.
+- "detail": 2 to 4 SHORT sentences, one paragraph, no headings and no lists. Say what changed and why it was needed, naming a concrete file or feature. Stop there: the reader can open the commits themselves. Never repeat the summary.
+- "thoughts": 1 or 2 pivotal moments, each {{"sha": "<a commit id from this material>", "note": "one short sentence on what the developer was working out at that moment"}}. Pick the commits whose prompts show the thinking best. Never invent a quote: only the commit id and your note.
 - "shas": every commit id belonging to this chapter.
 {prior}
 Reply with ONE JSON object: {{"chapters": [ ... ]}}
@@ -384,7 +392,7 @@ def _arc_prompt(chapters: list[dict], tone: str, repo_name: str) -> str:
 Give the whole story a shape:
 - "title": a title for the project's story so far. Short, specific to THIS project, not a slogan.
 - "tagline": one sentence under the title.
-- "arc": 2 to 4 sentences on the overall journey: where it started, what changed along the way, where it stands now.
+- "arc": 2 or 3 short sentences on the overall journey: where it started, what changed along the way, where it stands now.
 - "acts": 2 to 5 acts grouping CONSECUTIVE chapters. Each act is {{"title": "...", "blurb": "one sentence", "start": <the number of its first chapter>}}. The first act must start at 1.
 
 Reply with ONE JSON object with exactly those four keys.
@@ -531,8 +539,9 @@ def _normalize_chapters(
             "title": title,
             "kicker": kicker if kicker in KICKERS else "chapter",
             "emoji": _emoji(item.get("emoji")),
-            "summary": _text(item.get("summary"), 400),
-            "detail": _text(item.get("detail") or item.get("detail_md"), 6000),
+            "summary": _text(item.get("summary"), 300),
+            # A chapter is a paragraph, not an essay: the commits under it carry the detail.
+            "detail": _shorten(str(item.get("detail") or item.get("detail_md") or ""), 900),
             "shas": shas,
             # Resolved once the chapter's final commit list is known (below), so a fallback
             # quote can come from a commit that was folded in afterwards.
@@ -1577,24 +1586,30 @@ function actMap(){
   return map;
 }
 
+// The story is stored oldest-first (that is the order it was written in) and read
+// NEWEST-FIRST, like the dashboard's log: what happened lately is what people came for.
+// Acts are reversed as whole groups, so an act still introduces its own chapters.
 function renderTimeline(){
   const s = state.story, host = $("timeline");
   if (!s || !s.chapters || !s.chapters.length) { host.innerHTML = ""; $("toolbar").hidden = true; return; }
   $("toolbar").hidden = false;
   const acts = actMap();
-  let html = "";
-  let inTimeline = false;
+  const groups = [];
   s.chapters.forEach((c, i) => {
     const act = acts[c.id];
-    if (act) {
-      if (inTimeline) { html += "</div>"; inTimeline = false; }
-      html += '<div class="act"><div class="actno">act ' + act.n + '</div><h2>' + esc(act.title) + "</h2>" +
-              (act.blurb ? "<p>" + esc(act.blurb) + "</p>" : "") + "</div>";
-    }
-    if (!inTimeline) { html += '<div class="timeline">'; inTimeline = true; }
-    html += chapterHtml(c, i);
+    if (act || !groups.length) groups.push({act: act || null, chapters: []});
+    groups[groups.length - 1].chapters.push({c: c, i: i});
   });
-  if (inTimeline) html += "</div>";
+  let html = "";
+  groups.slice().reverse().forEach(group => {
+    if (group.act) {
+      html += '<div class="act"><div class="actno">act ' + group.act.n + '</div><h2>' + esc(group.act.title) + "</h2>" +
+              (group.act.blurb ? "<p>" + esc(group.act.blurb) + "</p>" : "") + "</div>";
+    }
+    html += '<div class="timeline">';
+    group.chapters.slice().reverse().forEach((entry, position) => { html += chapterHtml(entry.c, position); });
+    html += "</div>";
+  });
   host.innerHTML = html;
   for (const id of state.open) {
     const el = document.getElementById("ch-" + id);
@@ -1649,12 +1664,14 @@ function fillChapter(el, animate){
   if (st.files && st.files.length)
     html += '<div class="paths">' + st.files.map(p => "<span>" + esc(p) + "</span>").join("") + "</div>";
   if (c.commits && c.commits.length) {
-    html += '<div class="commits"><h4>&#128220; the commits behind it</h4>' + c.commits.map(r =>
+    // Newest first here too, and each row opens on its COMMIT MESSAGE (the conversation that
+    // produced it) with a button to flip to the file changes, like the dashboard's log.
+    html += '<div class="commits"><h4>&#128220; the commits behind it</h4>' + c.commits.slice().reverse().map(r =>
       '<div class="cmt" data-sha="' + esc(r.sha) + '">' +
         '<div class="chead"><span class="sha">' + esc(r.short) + "</span>" +
           '<span class="subj">' + esc(r.subject) + "</span>" +
           '<span class="num"><span class="add">+' + num(r.ins) + '</span>/<span class="rem">-' + num(r["del"]) + "</span></span>" +
-          '<span class="num">show diff &#9662;</span></div>' +
+          '<span class="num toggle">open &#9662;</span></div>' +
       "</div>").join("") + "</div>";
   }
   box.innerHTML = html;

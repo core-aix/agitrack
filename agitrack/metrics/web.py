@@ -610,16 +610,24 @@ _SHA_RE = re.compile(r"^[0-9a-fA-F]{4,64}$")
 
 
 def commit_diff(repo: GitRepo, sha: str) -> dict:
-    """The file diffs a single commit introduced (a diffstat + unified patch), for the
-    dashboard's local diff view — computed entirely from the local clone, so the dashboard
-    needs no GitHub. ``sha`` is validated as a hex object id before touching git."""
+    """One commit's message and the file diffs it introduced (a diffstat + unified patch),
+    computed entirely from the local clone so the dashboard needs no GitHub. ``sha`` is
+    validated as a hex object id before touching git.
+
+    The message rides along because the storyline shows it FIRST and only then offers the
+    file changes: one request answers both, and the static export's baked ``diff/<sha>.json``
+    covers both with no extra files."""
     if not _SHA_RE.match(sha or ""):
         return {"sha": sha, "diff": "", "error": "invalid commit id"}
     try:
         patch, truncated = repo.show_commit(sha)
     except Exception:
         return {"sha": sha, "diff": "", "error": "could not read this commit's diff"}
-    return {"sha": sha, "diff": patch, "truncated": truncated}
+    try:
+        message = repo.commit_message(sha)
+    except Exception:
+        message = ""
+    return {"sha": sha, "diff": patch, "truncated": truncated, "message": message}
 
 
 def initial_payload(
