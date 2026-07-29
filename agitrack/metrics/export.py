@@ -303,9 +303,11 @@ def _shim(*, base: str, files_index: dict[str, int], page: str, site_root: str) 
         e.preventDefault(); e.stopImmediatePropagation(); showNote();
       }}, true);
     }}
-    // The baked data is scoped to the last 30 days — make the (disabled) range
-    // dropdown say so instead of claiming "all time".
-    if (!LEARN) {{
+    // The DASHBOARD's baked data is scoped to the last 30 days — make its (disabled) range
+    // dropdown say so instead of claiming "all time". The story page has the same control
+    // for a different job (which days to TELL) and ships the whole history, so it keeps its
+    // own default: forcing 30 there left the dropdown saying one thing and the page another.
+    if (!LEARN && !STORY) {{
       var period = document.getElementById("f-period");
       if (period) period.value = "{_DEMO_WINDOW_DAYS}";
     }}
@@ -329,14 +331,12 @@ def _shim(*, base: str, files_index: dict[str, int], page: str, site_root: str) 
           e.preventDefault(); e.stopImmediatePropagation(); showNote();
         }}, true);
       }});
-      // ...and the ones the page draws as it goes (telling a part, telling it closer) are
-      // matched by SELECTOR on the document, because they do not exist yet at this point.
-      // Missing them meant "tell this part closer" ran into the blocked POST and reported a
-      // red failure in the middle of the page instead of the note everything else shows.
+      // ...and the ones the page draws as it goes (telling a part that has no moments yet)
+      // are matched by SELECTOR on the document, because they do not exist at this point.
+      // Missing that case meant such a button ran into the blocked POST and reported a red
+      // failure in the middle of the page instead of the note everything else shows.
       document.addEventListener("click", function(e){{
-        if (!e.target.closest) return;
-        if (!e.target.closest("#more-moments, .zcloser, .zpart")) return;
-        if (e.target.closest("#more-moments") && document.getElementById("more-moments").dataset.told) return;
+        if (!e.target.closest || !e.target.closest(".zpart")) return;
         e.preventDefault(); e.stopImmediatePropagation(); showNote();
       }}, true);
       // The page disables those buttons while it thinks a build is running or the engine is
