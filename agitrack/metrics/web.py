@@ -748,7 +748,11 @@ body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:31;
   background:radial-gradient(ellipse at 50% 12%,transparent 60%,rgba(0,0,0,.55) 100%)}
 ::selection{background:var(--phosphor);color:var(--ink)}
 a{color:var(--phosphor);text-decoration:none;border-bottom:1px solid var(--phosphor-dim)}
-a:hover{color:var(--ink);background:var(--phosphor)}
+/* This page answers a hovered link by INVERTING it — phosphor block, ink text — which is
+   affordance enough on its own. The shared rule's underline (for pages whose links are plain
+   text in a sentence) drew a line through the middle of that block as well, and the story and
+   learn entries in the header wear it most visibly. The footer opts back in for its own links. */
+a:hover{color:var(--ink);background:var(--phosphor);text-decoration:none}
 .wrap{max-width:1080px;margin:0 auto;padding:0 24px 80px}
 /* Initial-load animation. On a large repo the server sends the page chrome with no
    aggregates/log embedded; this loader shows while the browser fetches /data and /log,
