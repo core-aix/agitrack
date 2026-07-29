@@ -1084,7 +1084,7 @@ def test_there_is_no_zoom_control_only_a_way_back_out():
         assert gone not in html, f"the zoom control is still on the page ({gone})"
     assert 'class="btn small zback"' in html and 'e.target.closest(".zback")' in html
     # One step out, and it names where it lands rather than saying "back".
-    assert 'if (e.target.closest(".zback")) { setZoom(2); return; }' in html
+    assert 'if (e.target.closest(".zback")) setZoom(2);' in html
     assert "&larr; back to ' + partsLabel()" in html
 
 
@@ -1093,7 +1093,7 @@ def test_the_way_in_is_clicking_a_part():
     tells a part nobody has told yet."""
     html = _page()
     assert "if (seg) setZoom(3, seg.dataset.part)" in html  # the parts list goes in
-    assert 'class="btn zpart"' in html and 'e.target.closest(".zpart")' in html
+    assert 'class="gobtn zpart"' in html and 'e.target.closest(".zpart")' in html
 
 
 def test_the_closer_telling_is_gone_for_good():
@@ -1106,7 +1106,7 @@ def test_the_closer_telling_is_gone_for_good():
         assert gone not in html, f"{gone} is still on the page"
     # Two depths, and nothing can ask for a third.
     assert "state.zoom = Math.max(top, Math.min(3, state.zoom || top));" in html
-    assert 'if (e.target.closest(".zback")) { setZoom(2); return; }' in html
+    assert 'if (e.target.closest(".zback")) setZoom(2);' in html
 
 
 def test_a_stored_closer_telling_is_dropped_on_load(tmp_path):
@@ -1221,11 +1221,29 @@ def test_the_reader_is_told_that_parts_and_moments_open():
     assert "Tap or click any part to read the moments inside it." in html
     assert "Tap or click a moment to read it" in html
     assert 'class="howto"' in html and ".howto{color:var(--fg-dim)" in html
-    # ...and each card is a real control: labelled, focusable, and keyboard-operable.
-    assert 'role="button" tabindex="0" title="Open this part"' in html
-    assert 'role="button" tabindex="0" title="Open this moment' in html
+    # ...and each card is a real control: focusable, keyboard-operable, and reacting as a BOX
+    # (the same border-brightening a moment card does), not just in one corner of itself.
+    assert 'role="button" tabindex="0">' in html
     assert "open this part &rarr;" in html and "read this moment &darr;" in html
     assert ".era:focus-visible,.ch:focus-visible{outline:2px solid var(--phosphor)" in html
+    assert ".era:hover{border-color:var(--phosphor-dim)}" in html
+    assert ".chbody:hover{border-color:var(--phosphor-dim)}" in html
+    # No native tooltip floating a second copy of that text under the pointer.
+    assert 'title="Open this' not in html
+
+
+def test_an_untold_part_offers_itself_in_the_middle_of_the_page():
+    """A part nobody has told is a page with exactly one thing to do on it. The offer used to
+    be a small button at the right-hand end of the context bar ABOVE the empty page, where a
+    reader looking at the emptiness never found it."""
+    html = _page()
+    assert 'class="emptypart empty-part-cta"' in html
+    assert '<button class="gobtn zpart">' in html  # the page's primary-action look, not .btn
+    assert ".empty-part-cta{display:flex;flex-direction:column;align-items:center" in html
+    # It is handled where it now lives, ahead of the card handler that would read the click
+    # as "open a moment".
+    timeline = html[html.index('$("timeline").addEventListener("click"') :]
+    assert timeline.index('closest(".zpart")') < timeline.index('closest(".cflip")')
 
 
 def test_generation_waits_say_which_model_is_doing_it():

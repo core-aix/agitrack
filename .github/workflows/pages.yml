@@ -51,6 +51,27 @@ jobs:
           agitrack -d export --export-dir "$RUNNER_TEMP/site/dashboard"
       - name: Assemble the site (docs + demo dashboard)
         run: cp -R docs/. "$RUNNER_TEMP/site/"
+      # Stamp each page's structured-data `dateModified` with the last commit that actually
+      # touched THAT page, so search engines see when the page changed rather than whenever
+      # someone last remembered to edit a date by hand. Done on the COPY, so the checked-in
+      # file keeps a valid (if stale) date and stays correct opened on its own.
+      - name: Stamp the last-modified dates
+        run: |
+          cd docs
+          for page in $(grep -rl '"dateModified"' --include='*.html' .); do
+            changed=$(git log -1 --format=%cs -- "$page")
+            [ -n "$changed" ] || continue
+            python3 - "$RUNNER_TEMP/site/${page#./}" "$changed" <<'PY'
+          import re, sys
+          path, changed = sys.argv[1], sys.argv[2]
+          with open(path, encoding="utf-8") as handle:
+              html = handle.read()
+          html = re.sub(r'("dateModified"\s*:\s*")[^"]*(")', rf'\g<1>{changed}\g<2>', html)
+          with open(path, "w", encoding="utf-8") as handle:
+              handle.write(html)
+          print(f"{path}: dateModified={changed}")
+          PY
+          done
       # Fail here rather than deploying a site whose demo silently vanished (a failed or
       # partial export would otherwise publish the landing pages with dead demo links).
       - name: Verify the demo is in the site
