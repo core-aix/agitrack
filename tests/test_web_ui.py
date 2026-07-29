@@ -201,6 +201,19 @@ def test_every_page_links_to_the_others(pages):
         assert "history.back()" not in script, f"{name}'s dashboard link goes back instead of home"
 
 
+def test_a_page_with_its_own_hover_treatment_drops_the_shared_underline(pages):
+    """The shared rule underlines a hovered link, which is right for a link sitting in a
+    sentence. The dashboard instead INVERTS one — phosphor block, ink text — and the two
+    together drew a line through the middle of that block, most visibly on the story and
+    learn entries in its header. The page that defines its own affordance turns the other off;
+    the dashboard's footer links, which have no invert, opt back in."""
+    dashboard = pages["dashboard"]
+    assert "a:hover{color:var(--ink);background:var(--phosphor);text-decoration:none}" in dashboard
+    assert "footer .flink:hover{text-decoration:underline}" in dashboard
+    # The shared default is still what the other two pages get.
+    assert "a:hover{text-decoration:underline}" in ui.BASE_CSS
+
+
 def test_the_pages_agree_on_their_width(pages):
     widths = {name: re.search(r"\.wrap\{max-width:(\d+)px", html).group(1) for name, html in pages.items()}
     assert len(set(widths.values())) == 1, f"the pages disagree on their width: {widths}"
