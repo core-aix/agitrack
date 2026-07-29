@@ -118,6 +118,46 @@ def test_the_demo_answers_every_unavailable_action_the_same_way(tmp_path, monkey
     assert 'html.replace(/class="error"/g, \'class="notice"\')' in story
 
 
+def test_each_exported_page_can_be_posted_on_its_own(tmp_path, monkeypatch):
+    """Any one of the three may be linked somewhere else, so each carries its OWN card: a
+    title that says what the thing IS (the served page titles itself for the person looking at
+    THEIR repo), a description, and a preview image. Absolute URLs throughout — a crawler
+    fetching /dashboard/story/ cannot resolve a relative image, and a broken card is worse than
+    no card."""
+    out = _export(tmp_path, monkeypatch)
+    pages = {
+        "dash": (out / "index.html").read_text(encoding="utf-8"),
+        "learn": (out / "learn" / "index.html").read_text(encoding="utf-8"),
+        "story": (out / "story" / "index.html").read_text(encoding="utf-8"),
+    }
+    from agitrack.metrics.export import _SITE, _SOCIAL
+
+    seen_titles, seen_images = set(), set()
+    for name, html in pages.items():
+        card = _SOCIAL[name]
+        assert f"<title>{card['title']}</title>" in html, f"{name} keeps its in-repo title"
+        for tag in ("og:title", "og:description", "og:image", "og:url", "twitter:card", "twitter:image"):
+            assert tag in html, f"{name} is missing {tag}"
+        assert f'<meta name="description" content="{card["description"]}">' in html
+        assert f'<meta property="og:url" content="{_SITE}{card["path"]}">' in html
+        assert f'<link rel="canonical" href="{_SITE}{card["path"]}">' in html
+        assert card["image"].startswith("https://"), "a relative preview image cannot be crawled"
+        seen_titles.add(card["title"])
+        seen_images.add(card["image"])
+    # Three pages, three cards: posting the story must not show the dashboard's screenshot.
+    assert len(seen_titles) == 3 and len(seen_images) == 3
+
+
+def test_the_preview_images_the_cards_point_at_are_in_the_repo():
+    """A card naming an image the site does not serve is a broken card everywhere it is shared."""
+    from agitrack.metrics.export import _SITE, _SOCIAL
+
+    docs = Path(__file__).resolve().parent.parent / "docs"
+    for name, card in _SOCIAL.items():
+        relative = card["image"][len(_SITE) :].lstrip("/")
+        assert (docs / relative).is_file(), f"{name}'s preview image ({relative}) is not in docs/"
+
+
 def _shim_of(html: str) -> str:
     return html
 

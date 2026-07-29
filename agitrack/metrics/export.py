@@ -42,6 +42,7 @@ outside the 30-day window, since a story is mostly about older history.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from pathlib import Path
 
@@ -95,6 +96,84 @@ def _banner_html(css_class: str, site_root: str, text: str = "") -> str:
 
 def _esc(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+# --------------------------------------------------------------------------- social cards
+# Each demo page is postable ON ITS OWN, so each carries its own title, description and
+# preview image rather than inheriting the site's. Absolute URLs throughout: a crawler
+# fetching /dashboard/story/ has no way to resolve a relative image, and a card with a broken
+# image is worse than no card. Only the EXPORT gets these — a live dashboard is on localhost,
+# where there is nothing to share and nothing to crawl.
+_SITE = "https://agitrack.core-aix.org"
+
+_SOCIAL = {
+    "dash": {
+        "title": "aGiTrack dashboard: what your coding agents actually did",
+        "description": (
+            "A live demo, built from aGiTrack's own history: every agent turn as a traceable commit, "
+            "with the interaction trace, the model, the tokens it cost and the lines it moved. Browse the "
+            "log, open any commit's real diff, and see where the time and the tokens went."
+        ),
+        "image": f"{_SITE}/images/dashboard-v6.png",
+        "image_alt": "The aGiTrack dashboard: agent commits, token usage, and efficiency insights.",
+        "path": "/dashboard/",
+    },
+    "learn": {
+        "title": "aGiTrack learn: a coach that reads your own agent sessions",
+        "description": (
+            "A live demo of the learn page: it reads the transcripts of your own coding sessions and "
+            "teaches you, from them, how to drive an agent and your codebase better. Lessons, exercises "
+            "and a profile that gets more specific the more you work."
+        ),
+        "image": f"{_SITE}/images/learn-page-v2.png",
+        "image_alt": "The aGiTrack learn page: personalised lessons drawn from your own agent sessions.",
+        "path": "/dashboard/learn/",
+    },
+    "story": {
+        "title": "aGiTrack storyline: a repository's history, told as a story",
+        "description": (
+            "A live demo: aGiTrack's own history read back as a story by its coding agent. The project "
+            "in parts, the moments inside each one, and under every moment what the developer actually "
+            "asked for at the time and the commits it produced."
+        ),
+        "image": f"{_SITE}/images/story-page.png",
+        "image_alt": "The aGiTrack storyline: a repository's history told as parts and moments.",
+        "path": "/dashboard/story/",
+    },
+}
+
+
+def _social_head(page: str) -> str:
+    """The Open Graph / Twitter block for one exported page."""
+    card = _SOCIAL[page]
+    tags = [
+        f'<meta name="description" content="{_esc(card["description"])}">',
+        '<meta property="og:type" content="website">',
+        '<meta property="og:site_name" content="aGiTrack">',
+        f'<meta property="og:title" content="{_esc(card["title"])}">',
+        f'<meta property="og:description" content="{_esc(card["description"])}">',
+        f'<meta property="og:url" content="{_SITE}{card["path"]}">',
+        f'<meta property="og:image" content="{card["image"]}">',
+        f'<meta property="og:image:alt" content="{_esc(card["image_alt"])}">',
+        '<meta property="og:locale" content="en_US">',
+        '<meta name="twitter:card" content="summary_large_image">',
+        f'<meta name="twitter:title" content="{_esc(card["title"])}">',
+        f'<meta name="twitter:description" content="{_esc(card["description"])}">',
+        f'<meta name="twitter:image" content="{card["image"]}">',
+        f'<meta name="twitter:image:alt" content="{_esc(card["image_alt"])}">',
+        f'<link rel="canonical" href="{_SITE}{card["path"]}">',
+    ]
+    return "\n".join(tags)
+
+
+def _with_social(html: str, page: str) -> str:
+    """Give an exported page its own social card and a title that reads outside this repo.
+
+    The served pages title themselves for the person looking at THEIR repo ("story ·
+    myproject · aGiTrack"); a link posted somewhere else needs to say what the thing IS."""
+    card = _SOCIAL[page]
+    html = re.sub(r"<title>.*?</title>", f"<title>{_esc(card['title'])}</title>", html, count=1, flags=re.S)
+    return html.replace("</head>", _social_head(page) + "\n</head>", 1)
 
 
 def _write_json(path: Path, payload: dict) -> None:
@@ -540,14 +619,18 @@ def export_static_demo(repo: GitRepo, out_dir: Path) -> Path:
         frm=frm,
     )
     (out_dir / "index.html").write_text(
-        _inject_shim(page, _shim(base="demo/", files_index=files_index, page="dash", site_root="../")),
+        _with_social(
+            _inject_shim(page, _shim(base="demo/", files_index=files_index, page="dash", site_root="../")), "dash"
+        ),
         encoding="utf-8",
     )
     learn_html = learn_page.learn_html(repo.repo, banner_html=_banner_html("btbanner", "../../"))
     learn_dir = out_dir / "learn"
     learn_dir.mkdir()
     (learn_dir / "index.html").write_text(
-        _inject_shim(learn_html, _shim(base="../demo/", files_index={}, page="learn", site_root="../../")),
+        _with_social(
+            _inject_shim(learn_html, _shim(base="../demo/", files_index={}, page="learn", site_root="../../")), "learn"
+        ),
         encoding="utf-8",
     )
     story_html = story_page.story_html(
@@ -561,7 +644,9 @@ def export_static_demo(repo: GitRepo, out_dir: Path) -> Path:
     story_dir = out_dir / "story"
     story_dir.mkdir()
     (story_dir / "index.html").write_text(
-        _inject_shim(story_html, _shim(base="../demo/", files_index={}, page="story", site_root="../../")),
+        _with_social(
+            _inject_shim(story_html, _shim(base="../demo/", files_index={}, page="story", site_root="../../")), "story"
+        ),
         encoding="utf-8",
     )
     return out_dir
