@@ -1745,6 +1745,12 @@ __UI_FLASH_CSS__
 .zoomctx .zin b{color:var(--phosphor)}
 .emptypart{color:var(--fg-dim);font-size:13px;border:1px dashed var(--line);border-radius:8px;
   padding:18px;margin:8px 0}
+/* An untold part is a page with one thing to do on it, so that thing is IN THE MIDDLE of it
+   and looks like the offer it is. It used to be a small button at the right-hand end of the
+   context bar above, where a reader looking at an empty page never found it. */
+.empty-part-cta{display:flex;flex-direction:column;align-items:center;gap:14px;text-align:center;
+  padding:34px 20px}
+.empty-part-cta p{margin:0;max-width:56ch;line-height:1.6}
 .era{cursor:pointer}
 .era .zoomin{color:var(--phosphor-dim)}
 .era:hover .zoomin{color:var(--phosphor)}
@@ -1830,7 +1836,10 @@ h2.section{font-size:13px;letter-spacing:1.5px;text-transform:uppercase;color:va
 .spark{display:flex;align-items:flex-end;gap:2px;height:28px}
 .spark i{width:6px;background:linear-gradient(180deg,var(--phosphor),var(--phosphor-dim));
   border-radius:1px;height:var(--h);transition:height .6s cubic-bezier(.2,.8,.2,1)}
-.era{display:flex;gap:14px;align-items:flex-start;padding:12px 0;border-bottom:1px dashed var(--line)}
+.era{display:flex;gap:14px;align-items:flex-start;padding:13px 16px;margin:0 0 10px;
+  background:var(--panel);border:1px solid var(--line);border-radius:10px;
+  transition:border-color .18s,background .18s}
+.era:hover{border-color:var(--phosphor-dim)}
 .era .eran{font-family:var(--display);font-size:26px;line-height:1;color:var(--amber-dim);min-width:24px}
 .era.has .eran{color:var(--amber)}
 .era .erabody{flex:1;min-width:0}
@@ -2404,7 +2413,7 @@ function renderZoomContext(){
     esc(part.when) + " &rarr; " + esc(part.until) + " &nbsp;·&nbsp; " + part.commits + " commits</span>" +
     // A part nobody has told yet is a dead end without this: the reader is looking straight
     // at it and there is nothing to read and no obvious way to get any.
-    (momentsInView().length ? "" : '<button class="btn zpart">&#10024; tell this part</button>');
+    "";
 }
 
 // The moments of the part being read (all of them, in one telling), or the whole story when
@@ -2430,7 +2439,7 @@ function renderEras(){
     eras.slice().reverse().map(era => {
       const told = ((s.moments || []).filter(m => m.from >= era.from && m.to <= era.to)).length;
       return '<div class="era' + (told ? " has" : "") + '" data-part="' + esc(era.id) + '" ' +
-        'role="button" tabindex="0" title="Open this part">' +
+        'role="button" tabindex="0">' +
         '<div class="eran">' + era.n + "</div>" +
         '<div class="erabody"><h3>' + esc(era.title) + "</h3>" +
         (era.blurb ? '<p class="sum">' + esc(era.blurb) + "</p>" : "") +
@@ -2462,8 +2471,10 @@ function renderTimeline(){
   if (state.zoom < 3) { host.innerHTML = ""; return; }        // the parts view owns the page
   if (!all.length) {                                          // an untold part explains itself
     host.innerHTML = part
-      ? '<div class="emptypart">Nothing from this part has been told yet. It covers ' + part.commits +
-        " commits; writing it takes about half a minute.</div>"
+      ? '<div class="emptypart empty-part-cta">' +
+        "<p>Nothing from this part has been told yet. Your agent reads its " + part.commits +
+        " commits and writes the moments inside it; about half a minute.</p>" +
+        '<button class="gobtn zpart">&#10024; tell this part</button></div>'
       : "";
     return;
   }
@@ -2542,7 +2553,7 @@ function momentHtml(c, i){
   const bits = [];
   if (st.commits) bits.push(st.commits + " commit" + (st.commits === 1 ? "" : "s"));
   return '<article class="ch" id="ch-' + esc(c.id) + '" data-id="' + esc(c.id) + '" data-i="' + i + '"' +
-      ' role="button" tabindex="0" title="Open this moment: what happened, what was asked, and the commits"' +
+      ' role="button" tabindex="0"' +
       ' style="animation-delay:' + Math.min(i * 40, 400) + 'ms">' +
     '<div class="dot">' + esc(c.emoji || "✦") + "</div>" +
     '<div class="chbody">' +
@@ -2923,6 +2934,7 @@ function openFromHash(){
 
 // ------------------------------------------------------------------ wiring
 $("timeline").addEventListener("click", e => {
+  if (e.target.closest(".zpart")) { build("part"); return; }
   const flip = e.target.closest(".cflip");
   if (flip) {
     const row = flip.closest(".cmt"), view = row.querySelector(".cview");
@@ -3008,8 +3020,7 @@ function activateOnKey(host, act){
 activateOnKey($("eras"), el => setZoom(3, el.dataset.part));
 activateOnKey($("timeline"), el => toggleMoment(el));
 $("zoomctx").addEventListener("click", e => {
-  if (e.target.closest(".zback")) { setZoom(2); return; }
-  if (e.target.closest(".zpart")) build("part");
+  if (e.target.closest(".zback")) setZoom(2);
 });
 $("f-branch").addEventListener("change", () => {
   state.branch = $("f-branch").value; state.open.clear();
