@@ -57,10 +57,18 @@ jobs:
         #   uv run mypy | uv run mypy-baseline sync
         run: uv run mypy | uv run mypy-baseline filter
 
-      - name: Tests + coverage
-        run: |
-          uv run coverage run -m pytest -q
-          uv run coverage report
+      # TWO STEPS, deliberately. As one multi-line `run:` block these were fail-fast on
+      # Linux and macOS (GitHub runs those with `bash -e`) but NOT on Windows, whose default
+      # shell is PowerShell: the block runs to the end and the step exits with $LASTEXITCODE,
+      # the code of the LAST command. `coverage report` always succeeds, so a failing pytest
+      # was reported in the log and the job went green anyway - the Windows leg of the matrix
+      # had been passing with real test failures in it for a long time. A step per command
+      # has its exit code checked on every OS, whatever the shell.
+      - name: Tests
+        run: uv run coverage run -m pytest -q
+
+      - name: Coverage report
+        run: uv run coverage report
 
   # Native-Windows validation (#118): the package imports and runs natively on Windows
   # (ConPTY via pywinpty, Win32 console, msvcrt locking). Most of the suite is
