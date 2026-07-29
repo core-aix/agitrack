@@ -32,7 +32,6 @@ with generation disabled.
 from __future__ import annotations
 
 import json
-import math
 import re
 import threading
 import time
@@ -158,6 +157,14 @@ _STORY_SYSTEM = (
     # work, which the neutral form never does.
     "The developers are real people whose pronouns you do not know: always write about them "
     "as 'they', or by the name in the commit, and never as 'he' or 'she'. "
+    # What a reader wants from a project's story is what it was TRYING to do and how that
+    # changed, which the commits only show indirectly. Left to itself the model narrates the
+    # mechanism (the refactor, the flag, the cache) because that is what the diff is made of.
+    "What the project was TRYING TO DO, and how that changed, is the story. The mechanism is "
+    "only interesting when it shows the intent: a cache is not a moment, but 'they gave up on "
+    "reading it live and decided to precompute it' is. Ask of every moment what the people "
+    "wanted that they did not want before, or wanted more than they realised, and lead with "
+    "that; the implementation is the evidence, not the subject. "
     "Do not use em-dashes anywhere in your output. "
     "You must reply with ONE JSON object and nothing else: no prose before or after it, no "
     "code fences."
@@ -489,11 +496,25 @@ def _note_line(note: str) -> str:
     return f'\n\nThe reader asked for this specifically: "{note}". Follow it closely.' if note else ""
 
 
-def _batch_prompt(batch: list[Episode], tone: str, context: str, note: str = "") -> str:
+def _batch_prompt(
+    batch: list[Episode], tone: str, context: str, note: str = "", *, from_the_start: bool = False
+) -> str:
     digest = "".join(_episode_headline(episode, number) for number, episode in enumerate(batch, start=1))
     voice = STORY_TONES.get(tone, STORY_TONES[DEFAULT_TONE])
     prior = f"\nEARLIER IN THE STORY (do not retell these, continue from them):\n{context}\n" if context else ""
     voice += _note_line(note)
+    # A repo's FIRST moment is the one place the material can answer "what was this for?", and
+    # it is what a reader opening a story wants first. Episode 1 here is genuinely the start of
+    # the project only when this telling reaches the very first commit.
+    opening = (
+        "\nEpisode 1 is the BEGINNING OF THIS PROJECT: the first commits that exist. Its moment "
+        "must say what the project set out to do — what its author wanted that nothing they had "
+        "already did — reading it out of those first commits and the messages behind them. Say "
+        "so plainly; that is the frame every later moment is read against. If the material "
+        "genuinely does not show the intent, say what the first work was aimed at and no more.\n"
+        if from_the_start
+        else ""
+    )
     return f"""Below are {len(batch)} consecutive episodes from one repository's history, OLDEST FIRST. Each is a stretch of work with its span, and the commits inside it listed in the order they were made, every one stamped with its date and time.
 
 Write ONE moment of the story for EACH episode, in the same order: {len(batch)} moments, numbered as they are numbered here. The grouping is already done; do not merge episodes and do not split one.
@@ -504,6 +525,8 @@ Everything inside an episode is in chronological order, and what you write must 
 
 Write it so someone who has never seen this repo WANTS to read the next moment. What makes it interesting is always a specific fact: the thing that broke, the assumption that turned out wrong, the small decision everything else followed from. Never filler ("various improvements", "several fixes", "this commit"), never a category where a fact would do.
 
+Follow the GOALS, not the machinery. Each moment should answer "what were they trying to do here, and how had that changed since the last one?" — a feature that arrived because they wanted something they did not want before, a plan abandoned, a problem that turned out to be the real one. Name an implementation detail only when it IS the point (the decision that made the difference), never as the subject of the moment.
+{opening}
 For each moment:
 - "n": the number of the episode it tells, exactly as listed below.
 - "title": the thing that actually happened, named. Specific enough that it could only belong to this moment. Never a category like "Improvements", "Bug fixes" or "Dashboard work". When the episode holds several strands, lead with the one that mattered most and keep the rest in time order.
@@ -586,17 +609,24 @@ def act_slices(items: list[dict], target: int = 5) -> list[tuple[int, int]]:
 def part_target(episodes: list[Episode]) -> int:
     """How many parts this history deserves.
 
-    A fortnight of work is not five acts, and a two-year project is not five either. Roughly
-    one part per three weeks of elapsed time, cross-checked against how much actually
-    happened (a quiet year is still a small story), bounded at 2 and 8."""
+    A fortnight of work is not five acts, and a two-year project is not five either. Two
+    signals: elapsed time (about a part per three weeks) and how much actually happened
+    (about one per twelve sittings of work), combined and bounded at 2 and 8.
+
+    HOW MUCH THERE IS TO READ counts double the calendar. Both signals are needed - a quiet
+    year is still a small story, and a dense fortnight is not one part - but weighting them
+    equally made the SAME project read very differently depending on how much of it the
+    reader could see: a backtrace, which only reaches as far back as the local transcripts
+    do, covered 57% of this repo's days and 43% of its sittings yet came out with 2 parts
+    against the live dashboard's 5. Leaning on volume brings the two readings together (3
+    against 6 here) without flattening a long, slow history, which is what a volume-only
+    rule would do."""
     if len(episodes) < 4:
         return max(1, len(episodes))
     days = max(1, (episodes[-1].end - episodes[0].start) / 86400)
-    by_time = days / 21  # about a part per three weeks of elapsed time...
-    by_volume = len(episodes) / 12  # ...and about one per twelve sittings of work
-    # Neither alone: a dense two months has more to tell than a sleepy two years, and a long
-    # quiet stretch is not five acts. The middle of the two, bounded at 2 and 8.
-    return max(2, min(8, round(math.sqrt(max(by_time, 0.1) * max(by_volume, 0.1)))))
+    by_time = max(days / 21, 0.1)
+    by_volume = max(len(episodes) / 12, 0.1)
+    return max(2, min(8, round(by_time ** (1 / 3) * by_volume ** (2 / 3))))
 
 
 def _era_rows(episodes: list[Episode]) -> list[dict]:
@@ -956,6 +986,14 @@ def _set_progress(key: str, **fields: Any) -> None:
             record["progress"].update(fields)
 
 
+def _is_live(record: dict[str, Any]) -> bool:
+    """Whether a registered build is still one the reader is waiting for. An abandoned one
+    (Stop pressed, or the page that started it went away) is not, however long its last
+    backend call takes to return."""
+    thread = record.get("thread")
+    return bool(thread and thread.is_alive()) and not record.get("abandoned") and not record["stop"].is_set()
+
+
 def build_key(root: Path, branch: str) -> str:
     return f"{Path(root)}|{branch or 'HEAD'}"
 
@@ -1000,7 +1038,14 @@ def _material(
     if not kept:
         return [], "replace"
     covered = set(story.get("covered_shas") or []) if story else set()
-    eras = (story or {}).get("eras") or _era_rows(segment_episodes(kept))
+    # A REWRITE re-reads the history as it stands now, so its parts are computed fresh. The
+    # stored ones were drawn when the story was last told and their newest part ENDS at the
+    # then-newest commit, so everything committed since fell outside every part and a rewrite
+    # silently left it out. Telling one named part still uses the stored parts: that is the
+    # part the reader clicked on, and its identity has to keep meaning what it meant.
+    eras = _era_rows(segment_episodes(kept)) if mode == "rewrite" else ((story or {}).get("eras") or [])
+    if not eras:
+        eras = _era_rows(segment_episodes(kept))
 
     def inside(era: dict, *, fresh_only: bool) -> list[CommitStat]:
         return [
@@ -1093,6 +1138,11 @@ def build_story(
     # moment. Taking the first N sittings instead left the rest of a part untold and made
     # "show earlier moments" the only way to see the middle of your own history.
     selected = spread(selected, _MOMENTS_COARSE)
+    # Does this telling reach the repo's very first commit? Only then does its opening moment
+    # get to say what the project set out to do (see _batch_prompt), and only then is it true:
+    # a story of the newest part, or of a picked range of days, starts in the middle.
+    everything = story_stats(stats)
+    from_the_start = bool(everything) and material[0].sha == everything[0].sha
     all_batches = _batches(selected)
     batches = all_batches[:_MAX_BATCHES] if placement in ("append", "merge") else all_batches[-_MAX_BATCHES:]
     left_behind = len(all_batches) - len(batches)
@@ -1112,7 +1162,7 @@ def build_story(
             raise StoryError("cancelled")
         if key:
             _set_progress(key, phase=f"writing moments ({number} of {len(batches)})", done=number - 1)
-        prompt = _batch_prompt(batch, tone, context, note)
+        prompt = _batch_prompt(batch, tone, context, note, from_the_start=from_the_start and number == 1)
         moments: list[dict] = []
         for attempt in range(2):
             if stop is not None and stop.is_set():
@@ -1349,7 +1399,13 @@ def start_build(
             )
         }
     with _BUILDS_LOCK:
-        if any(record["thread"].is_alive() for record in _BUILDS.values()):
+        # Only a build the reader has NOT abandoned may refuse another. A stopped build's
+        # thread can stay alive for a while (it is inside a backend CLI call that cannot be
+        # interrupted), and whatever that call returns is discarded — so counting it as "a
+        # story is already being written" refused the reader the very thing Stop promised
+        # them. The doomed call still holds the shared agent lock, so the new build's first
+        # question waits for it inside the worker (see _ask) rather than in this request.
+        if any(_is_live(record) for record in _BUILDS.values()):
             return {"busy": True, "error": "A story is already being written; let that one finish first."}
         stop = threading.Event()
         progress = {
@@ -1385,7 +1441,8 @@ def start_build(
                 )
                 _set_progress(key, running=False, phase="done")
             except StoryError as exc:
-                _set_progress(key, running=False, phase="stopped", error=str(exc))
+                stopped_by_reader = str(exc) == "cancelled"
+                _set_progress(key, running=False, phase="stopped", error="" if stopped_by_reader else str(exc))
             except Exception as exc:  # never lose the reason in a background thread
                 _set_progress(key, running=False, phase="stopped", error=f"{type(exc).__name__}: {exc}")
 
@@ -1406,6 +1463,7 @@ def cancel_build(root: Path, branch: str = "") -> dict[str, Any]:
         record = _BUILDS.get(build_key(root, branch))
         if record and record["thread"].is_alive():
             record["stop"].set()
+            record["abandoned"] = True  # ...so it can never refuse the next build
             record["progress"].update(running=False, phase="stopped", error="")
             return {"cancelling": True, "stopped": True}
     return {"cancelling": False}
@@ -1710,9 +1768,21 @@ __UI_FLASH_CSS__
 .zoomctx .zin b{color:var(--phosphor)}
 .emptypart{color:var(--fg-dim);font-size:13px;border:1px dashed var(--line);border-radius:8px;
   padding:18px;margin:8px 0}
+/* An untold part is a page with one thing to do on it, so that thing is IN THE MIDDLE of it
+   and looks like the offer it is. It used to be a small button at the right-hand end of the
+   context bar above, where a reader looking at an empty page never found it. */
+.empty-part-cta{display:flex;flex-direction:column;align-items:center;gap:14px;text-align:center;
+  padding:34px 20px}
+.empty-part-cta p{margin:0;max-width:56ch;line-height:1.6}
 .era{cursor:pointer}
 .era .zoomin{color:var(--phosphor-dim)}
 .era:hover .zoomin{color:var(--phosphor)}
+/* What to DO with the rows below, said once above them. A hover-only affordance tells a
+   reader nothing until they happen to point at something, and nothing at all on a touch
+   screen, where there is no hover. */
+.howto{color:var(--fg-dim);font-size:12.5px;margin:-4px 0 14px;max-width:70ch}
+/* Both the parts and the moments are controls, so they answer the keyboard as well. */
+.era:focus-visible,.ch:focus-visible{outline:2px solid var(--phosphor);outline-offset:2px}
 
 /* ---------------------------------------------------------------- the timeline */
 h2.section{font-size:13px;letter-spacing:1.5px;text-transform:uppercase;color:var(--phosphor);
@@ -1764,7 +1834,7 @@ h2.section{font-size:13px;letter-spacing:1.5px;text-transform:uppercase;color:va
 .more .notice{border:1px solid var(--amber);color:var(--amber);background:var(--panel2);padding:9px 12px;
   border-radius:6px;font-size:12.5px}
 .thoughts{margin:16px 0 0}
-.thoughts h4{font-size:11.5px;letter-spacing:1.5px;text-transform:uppercase;color:var(--amber);
+.thoughts > h4{font-size:11.5px;letter-spacing:1.5px;text-transform:uppercase;color:var(--amber);
   margin:0 0 9px;font-weight:600}
 .th{border-left:2px solid var(--amber-dim);padding:2px 0 2px 12px;margin:0 0 12px}
 .th .q{color:var(--fg);font-size:13px;line-height:1.6;white-space:pre-wrap;word-break:break-word}
@@ -1789,7 +1859,10 @@ h2.section{font-size:13px;letter-spacing:1.5px;text-transform:uppercase;color:va
 .spark{display:flex;align-items:flex-end;gap:2px;height:28px}
 .spark i{width:6px;background:linear-gradient(180deg,var(--phosphor),var(--phosphor-dim));
   border-radius:1px;height:var(--h);transition:height .6s cubic-bezier(.2,.8,.2,1)}
-.era{display:flex;gap:14px;align-items:flex-start;padding:12px 0;border-bottom:1px dashed var(--line)}
+.era{display:flex;gap:14px;align-items:flex-start;padding:13px 16px;margin:0 0 10px;
+  background:var(--panel);border:1px solid var(--line);border-radius:10px;
+  transition:border-color .18s,background .18s}
+.era:hover{border-color:var(--phosphor-dim)}
 .era .eran{font-family:var(--display);font-size:26px;line-height:1;color:var(--amber-dim);min-width:24px}
 .era.has .eran{color:var(--amber)}
 .era .erabody{flex:1;min-width:0}
@@ -1822,7 +1895,10 @@ body.anim .ch.in,body.anim .era.in{opacity:1;transform:none}
   border-radius:4px;padding:2px 7px;word-break:break-all}
 
 .commits{margin:16px 0 0;min-width:0}
-.commits h4{font-size:11.5px;letter-spacing:1.5px;text-transform:uppercase;color:var(--phosphor);
+/* The section's OWN heading only ("the commits themselves"), never a heading inside one of
+   the commit messages below it: those are rendered by the shared commit renderer and must
+   look exactly as they do on the dashboard. */
+.commits > h4{font-size:11.5px;letter-spacing:1.5px;text-transform:uppercase;color:var(--phosphor);
   margin:0 0 8px;font-weight:600}
 /* The same commit row as the dashboard's log: same badge colours, same line counts, plus
    who committed it and when. */
@@ -1893,7 +1969,7 @@ footer{margin-top:40px;padding-top:14px;border-top:1px dashed var(--line);color:
 footer code{color:var(--fg)}
 
 @media (max-width:640px){
-  .wrap{padding:16px 14px 70px}
+  .wrap{padding-top:16px;padding-bottom:70px}
   .hero h1{font-size:34px}
   .timeline,.act{padding-left:32px}
   .timeline::before{left:9px}
@@ -2193,6 +2269,16 @@ window.addEventListener("pageshow", event => { if (event.persisted || state.load
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden && (state.loadFailed || !state.data)) load().catch(() => {});
 });
+// Leaving the page (a refresh, a link, closing the tab) ABANDONS a telling this page started.
+// It is spending an agent call and the reader has walked away from it, and coming back to a
+// build nobody is watching is how someone ended up unable to start a new one at all. Sent
+// with sendBeacon: a normal fetch is cancelled the moment the page goes.
+window.addEventListener("pagehide", () => {
+  if (!state.building) return;
+  const payload = JSON.stringify({branch: state.branch});
+  if (navigator.sendBeacon) navigator.sendBeacon("story/cancel", new Blob([payload], {type: "application/json"}));
+  else post("story/cancel", {branch: state.branch}).catch(() => {});
+});
 
 function render(){
   const d = state.data; if (!d) return;
@@ -2363,7 +2449,7 @@ function renderZoomContext(){
     esc(part.when) + " &rarr; " + esc(part.until) + " &nbsp;·&nbsp; " + part.commits + " commits</span>" +
     // A part nobody has told yet is a dead end without this: the reader is looking straight
     // at it and there is nothing to read and no obvious way to get any.
-    (momentsInView().length ? "" : '<button class="btn zpart">&#10024; tell this part</button>');
+    "";
 }
 
 // The moments of the part being read (all of them, in one telling), or the whole story when
@@ -2381,10 +2467,15 @@ function renderEras(){
   const eras = (s && s.eras) || [];
   host.hidden = !eras.length || state.zoom !== 2;   // inside a part, the part owns the page
   if (host.hidden) return;
+  // The rows are the way in, so the page says so once, above them: a card that responds only
+  // on hover tells a reader nothing until they happen to point at it, and on a touch screen
+  // there is no hover at all.
   host.innerHTML = '<h2 class="section">' + (eras.length === 1 ? "the whole story" : eras.length + " parts") + "</h2>" +
+    '<p class="howto">&#128072; Tap or click any part to read the moments inside it.</p>' +
     eras.slice().reverse().map(era => {
       const told = ((s.moments || []).filter(m => m.from >= era.from && m.to <= era.to)).length;
-      return '<div class="era' + (told ? " has" : "") + '" data-part="' + esc(era.id) + '">' +
+      return '<div class="era' + (told ? " has" : "") + '" data-part="' + esc(era.id) + '" ' +
+        'role="button" tabindex="0">' +
         '<div class="eran">' + era.n + "</div>" +
         '<div class="erabody"><h3>' + esc(era.title) + "</h3>" +
         (era.blurb ? '<p class="sum">' + esc(era.blurb) + "</p>" : "") +
@@ -2392,7 +2483,7 @@ function renderEras(){
           "<span>" + esc(era.when) + " &rarr; " + esc(era.until) + "</span>" +
           "<span>" + era.commits + " commits</span>" +
           (told ? '<span class="lit">' + told + " moment" + (told === 1 ? "" : "s") + " written</span>" : "") +
-        '<span class="zoomin">go inside &rarr;</span></div></div></div>';
+        '<span class="zoomin">open this part &rarr;</span></div></div></div>';
     }).join("");
 }
 
@@ -2416,15 +2507,20 @@ function renderTimeline(){
   if (state.zoom < 3) { host.innerHTML = ""; return; }        // the parts view owns the page
   if (!all.length) {                                          // an untold part explains itself
     host.innerHTML = part
-      ? '<div class="emptypart">Nothing from this part has been told yet. It covers ' + part.commits +
-        " commits; writing it takes about half a minute.</div>"
+      ? '<div class="emptypart empty-part-cta">' +
+        "<p>Nothing from this part has been told yet. Your agent reads its " + part.commits +
+        " commits and writes the moments inside it; about half a minute.</p>" +
+        '<button class="gobtn zpart">&#10024; tell this part</button></div>'
       : "";
     return;
   }
 
   const newestFirst = all.slice().reverse();                  // a telling is bounded: no paging
   let html = '<h2 class="section">' +
-    (part ? "inside " + esc(part.title.toLowerCase()) : "moment by moment") + '</h2><div class="timeline">';
+    (part ? "inside " + esc(part.title.toLowerCase()) : "moment by moment") + "</h2>" +
+    '<p class="howto">&#128072; Tap or click a moment to read it: what happened, what was asked ' +
+    "for at the time, and the commits it came out of.</p>" +
+    '<div class="timeline">';
   newestFirst.forEach((moment, position) => { html += momentHtml(moment, position); });
   host.innerHTML = html + "</div>";
 
@@ -2493,6 +2589,7 @@ function momentHtml(c, i){
   const bits = [];
   if (st.commits) bits.push(st.commits + " commit" + (st.commits === 1 ? "" : "s"));
   return '<article class="ch" id="ch-' + esc(c.id) + '" data-id="' + esc(c.id) + '" data-i="' + i + '"' +
+      ' role="button" tabindex="0"' +
       ' style="animation-delay:' + Math.min(i * 40, 400) + 'ms">' +
     '<div class="dot">' + esc(c.emoji || "✦") + "</div>" +
     '<div class="chbody">' +
@@ -2503,7 +2600,7 @@ function momentHtml(c, i){
       '<p class="sum">' + esc(c.summary || "") + "</p>" +
       shapeHtml(st) +
       '<div class="more" hidden></div>' +
-      '<div class="open-hint">go closer &darr;</div>' +
+      '<div class="open-hint">read this moment &darr;</div>' +
     "</div></article>";
 }
 
@@ -2624,7 +2721,7 @@ function toggleMoment(el, force){
     el.classList.remove("open");
     const box = el.querySelector(".more");
     if (box) box.hidden = true;
-    el.querySelector(".open-hint").innerHTML = "go closer &darr;";
+    el.querySelector(".open-hint").innerHTML = "read this moment &darr;";
   }
 }
 
@@ -2765,7 +2862,9 @@ function renderBuild(p){
   const running = !!(p && p.running);
   state.building = running;
   $("overlay").hidden = !running;
-  if (p && p.error && !running) fail(p.error === "cancelled" ? "Stopped. The moments already written are kept." : p.error);
+  // A stop is not an error and the server no longer reports it as one (the page says so
+  // itself, the moment the button is pressed), so anything left here is a real failure.
+  if (p && p.error && !running) fail(p.error);
   if (!running) { renderStudio(); return; }
   $("build-phase").textContent = p.phase || "working";
   $("build-cancel").hidden = false;
@@ -2873,6 +2972,7 @@ function openFromHash(){
 
 // ------------------------------------------------------------------ wiring
 $("timeline").addEventListener("click", e => {
+  if (e.target.closest(".zpart")) { build("part"); return; }
   const flip = e.target.closest(".cflip");
   if (flip) {
     const row = flip.closest(".cmt"), view = row.querySelector(".cview");
@@ -2930,11 +3030,18 @@ $("forget").addEventListener("click", async () => {
   catch (e) { fail(e.message); }
 });
 $("build-cancel").addEventListener("click", async () => {
-  // Say so at once: the call in flight still has to come back, and a button that looks
-  // like it did nothing invites a second, third, fourth click.
-  $("build-phase").textContent = "stopping after the moment being written…";
+  // Stopping IS immediate now: the build is marked stopped and abandoned the moment this is
+  // pressed, whatever its last backend call eventually returns is discarded, and it can no
+  // longer refuse the next telling. So the page closes and says what is kept, instead of the
+  // old promise to "stop after the moment being written" - which was true when a reader had
+  // to wait out that call, and became a page that sat there looking stuck.
   $("build-cancel").disabled = true;
+  state.building = false;
+  stopPolling();
+  hideOverlay();
+  notice("Stopped. The moments already written are kept.");
   try { await post("story/cancel", {branch: state.branch}); } catch (e) {}
+  load().catch(() => {});     // ...and show exactly what that is
 });
 // Which days to tell: the dashboard's control, wired the same way (see ui.RANGE_JS).
 bindRangeControl(() => { state.touchedRange = true; applyPeriod(); markStale(); });
@@ -2944,9 +3051,21 @@ $("eras").addEventListener("click", e => {
   const seg = e.target.closest("[data-part]");
   if (seg) setZoom(3, seg.dataset.part);
 });
+// A part and a moment are controls (role="button"), so Enter and Space must work them: the
+// card is a div, and a div does not get that for free the way a <button> would.
+function activateOnKey(host, act){
+  host.addEventListener("keydown", e => {
+    if (e.key !== "Enter" && e.key !== " ") return;
+    const target = e.target.closest("[data-part],.ch");
+    if (!target) return;
+    e.preventDefault();
+    act(target);
+  });
+}
+activateOnKey($("eras"), el => setZoom(3, el.dataset.part));
+activateOnKey($("timeline"), el => toggleMoment(el));
 $("zoomctx").addEventListener("click", e => {
-  if (e.target.closest(".zback")) { setZoom(2); return; }
-  if (e.target.closest(".zpart")) build("part");
+  if (e.target.closest(".zback")) setZoom(2);
 });
 $("f-branch").addEventListener("change", () => {
   state.branch = $("f-branch").value; state.open.clear();

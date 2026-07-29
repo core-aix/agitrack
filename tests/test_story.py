@@ -301,6 +301,29 @@ def test_the_number_of_parts_follows_the_history():
     assert story.part_target(episodes(55, 93)) == 5  # this repo, as it stands
     assert story.part_target(episodes(365, 400)) == 8  # and a long one is capped, not endless
     assert story.part_target(episodes(1, 2)) == 2
+    # A long, QUIET history is still shaped by its calendar: volume alone would tell two and a
+    # half years of occasional work as a couple of parts.
+    assert story.part_target(episodes(900, 40)) >= 4
+
+
+def test_seeing_less_of_a_project_does_not_change_its_shape_out_of_recognition():
+    """The same repo read two ways: the live dashboard sees every commit, a backtrace only
+    reaches as far back as the local transcripts do. The shorter view SHOULD have fewer parts
+    — it covers less — but it must still read as the same kind of story. Weighting elapsed
+    time equally with volume made this repo 5 parts live and 2 reconstructed, off a view that
+    held 57% of the days and 43% of the sittings."""
+
+    def episodes(days, count):
+        step = days * DAY / max(count - 1, 1)
+        return [
+            story.Episode(index=i, stats=[_stat(chr(97 + i % 26), "p", int(1_750_000_000 + i * step))])
+            for i in range(count)
+        ]
+
+    whole = story.part_target(episodes(56, 95))  # what the live dashboard sees
+    partial = story.part_target(episodes(32, 41))  # what a backtrace of the same repo sees
+    assert partial < whole, "a shorter view is a shorter story"
+    assert partial >= whole / 2, f"but not unrecognisably so ({partial} parts against {whole})"
 
 
 def test_the_agent_only_names_the_eras(tmp_path, monkeypatch):
@@ -726,6 +749,95 @@ def test_an_older_part_is_told_on_request(tmp_path, monkeypatch):
     ]
 
 
+def test_a_rewrite_picks_up_everything_committed_since(tmp_path, monkeypatch):
+    """A rewrite re-reads the history as it stands NOW. It used to reuse the parts stored with
+    the old story, whose newest part ends at the then-newest commit, so every commit made since
+    fell outside every part and the rewrite silently left it out."""
+    repo = _repo_with_history(tmp_path, prompts=[f"step {i}" for i in range(6)], gap_days=1)
+    stats, sha_paths = _view_of(repo)
+    _fake_agent(monkeypatch, [_moment_reply([{"n": 1, "title": "Before", "summary": "s"}]), _ARC])
+    story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
+    stored = story.StoryStore(tmp_path).get("main")
+    assert stored["eras"], "the story recorded its parts"
+
+    # Work lands after that story was told.
+    when = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(1_750_000_000 + 20 * DAY))
+    (tmp_path / "later.py").write_text("later\n", encoding="utf-8")
+    repo.stage_paths(["later.py"])
+    repo._run(
+        ["git", "commit", "-q", "-F", "-"],
+        input_text=build_agent_commit_message(
+            latest_prompt="the newest thing",
+            trace=[{"role": "user", "content": "the newest thing"}],
+            backend="claude",
+            backend_session_id="ses-2",
+            agitrack_session_id="agit-1",
+            model="claude-opus-5",
+            token_usage={"input": 10, "output": 5},
+        ),
+        env={"GIT_AUTHOR_DATE": when, "GIT_COMMITTER_DATE": when},
+    )
+    fresh_stats, fresh_paths = _view_of(repo)
+    newest = story.story_stats(fresh_stats)[-1]
+
+    material, _placement = story._material(fresh_stats, stored, "rewrite")
+    assert newest.sha in {stat.sha for stat in material}, "the rewrite reads the newest commit"
+
+    # ...and a range still bounds it: a rewrite of last week is not a rewrite of everything.
+    window = story.in_range(fresh_stats, newest.timestamp - DAY, 0)
+    ranged, _p = story._material(window, stored, "rewrite")
+    assert newest.sha in {stat.sha for stat in ranged}
+    assert len(ranged) < len(material)
+
+
+def test_a_stopped_telling_never_blocks_the_next_one(tmp_path, monkeypatch):
+    """Stop has to mean stop. The worker can stay alive for a while — it is inside a backend
+    CLI call that cannot be interrupted, and whatever that returns is discarded — but counting
+    it as "a story is already being written" refused the reader the one thing Stop promised."""
+    repo = _repo_with_history(tmp_path, prompts=["one", "two"])
+    stats, sha_paths = _view_of(repo)
+    started, release = threading.Event(), threading.Event()
+
+    class _Slow:
+        def run(self, prompt, **kwargs):
+            started.set()
+            release.wait(10)  # still inside the call when the reader gives up
+            raise AssertionError("this reply must never be used")
+
+    monkeypatch.setattr(learn.LearningBackendChoice, "build", lambda self: _Slow())
+    monkeypatch.setattr(
+        learn,
+        "resolve_learning_backend",
+        lambda root: learn.LearningBackendChoice(
+            backend_name="claude", model="m", backend_source="config", model_source="config"
+        ),
+    )
+    try:
+        assert story.start_build(tmp_path, stats, sha_paths, branch="main", mode="rewrite").get("building")
+        assert started.wait(5)
+        assert story.cancel_build(tmp_path, "main")["stopped"] is True
+
+        # The doomed worker is STILL running, and the next build must start anyway.
+        key = story.build_key(tmp_path, "main")
+        assert story._BUILDS[key]["thread"].is_alive()
+        _fake_agent(monkeypatch, [_moment_reply([{"n": 1, "title": "Again", "summary": "s"}]), _ARC])
+        answer = story.start_build(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
+        assert not answer.get("busy"), answer
+        assert answer.get("building") is True
+    finally:
+        release.set()
+
+
+def test_leaving_the_page_abandons_the_telling_it_started():
+    """A refresh or a click away spends someone's agent call on a story nobody is watching, and
+    coming back to it is how a reader ended up unable to start a new one at all."""
+    html = _page()
+    assert 'window.addEventListener("pagehide"' in html
+    assert "if (!state.building) return;" in html
+    # sendBeacon, because a normal fetch is cancelled the instant the page goes.
+    assert 'navigator.sendBeacon("story/cancel"' in html
+
+
 def test_extending_tells_only_what_is_new(tmp_path, monkeypatch):
     repo = _repo_with_history(tmp_path, prompts=["first push", "second push"])
     stats, sha_paths = _view_of(repo)
@@ -866,8 +978,29 @@ def test_stopping_a_build_releases_the_reader_at_once(tmp_path, monkeypatch):
         assert answer["stopped"] is True
         progress = story.build_progress(tmp_path, "main")
         assert progress["running"] is False and progress["phase"] == "stopped"  # at once, not later
+        assert progress["error"] == "", "a stop the reader asked for is not a failure"
     finally:
         release.set()
+    # ...and it stays that way once the abandoned worker notices and unwinds, so the page is
+    # not told the same news a second time, in red.
+    for _ in range(50):
+        if not story._BUILDS[story.build_key(tmp_path, "main")]["thread"].is_alive():
+            break
+        time.sleep(0.1)
+    assert story.build_progress(tmp_path, "main")["error"] == ""
+
+
+def test_the_page_does_not_promise_to_stop_later(tmp_path):
+    """Stopping IS immediate: the build is marked stopped and abandoned the moment the button
+    is pressed. The page used to say it would "stop after the moment being written", which was
+    true when a reader had to wait out that call and afterwards just looked stuck."""
+    html = _page()
+    assert "stopping after the moment being written" not in html
+    # It closes and says what was kept, right there in the handler.
+    cancel = html[html.index('$("build-cancel").addEventListener') :]
+    cancel = cancel[: cancel.index("});")]
+    for step in ("stopPolling();", "hideOverlay();", 'notice("Stopped. The moments already written are kept.")'):
+        assert step in cancel, step
         time.sleep(0.3)
 
 
@@ -968,6 +1101,40 @@ def test_the_storyteller_is_told_that_changes_are_not_the_whole_picture():
     assert "what worked from the start left no trace" in story._STORY_SYSTEM.replace("\n", " ")
 
 
+def test_the_storyteller_follows_the_goals_not_the_machinery():
+    """What a reader wants from a project's story is what it was trying to DO and how that
+    changed. Left alone the model narrates the mechanism, because that is what a diff is made
+    of: the cache, the flag, the refactor."""
+    assert "What the project was TRYING TO DO, and how that changed, is the story" in story._STORY_SYSTEM
+    assert "the implementation is the evidence, not the subject" in story._STORY_SYSTEM
+    episode = story.Episode(index=0, stats=[_stat("a", "do the thing", 1_750_000_000)])
+    assert "Follow the GOALS, not the machinery." in story._batch_prompt([episode], "plain", "")
+
+
+def test_the_first_moment_of_a_repo_says_what_it_set_out_to_do(tmp_path, monkeypatch):
+    """The first commits are the one place the material can answer "what was this for?", and
+    it is the frame every later moment is read against. A telling that starts in the middle —
+    the newest part, or a picked range of days — must NOT claim to."""
+    repo = _repo_with_history(tmp_path, prompts=[f"step {i}" for i in range(6)], gap_days=1)
+    stats, sha_paths = _view_of(repo)
+
+    fake = _fake_agent(monkeypatch, [_moment_reply([{"n": 1, "title": "It began", "summary": "s"}]), _ARC])
+    story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
+    # A rewrite tells the NEWEST part, which does not reach the first commit.
+    assert "BEGINNING OF THIS PROJECT" not in fake.prompts[0]
+
+    story.StoryStore(tmp_path).drop("main")
+    oldest = story.story_stats(stats)[0].timestamp
+    window = story.in_range(stats, oldest, oldest + 2 * DAY)
+    fake = _fake_agent(monkeypatch, [_moment_reply([{"n": 1, "title": "It began", "summary": "s"}]), _ARC])
+    story.build_story(tmp_path, window, sha_paths, branch="main", mode="rewrite", since=oldest)
+
+    opening = fake.prompts[0]
+    assert "Episode 1 is the BEGINNING OF THIS PROJECT" in opening
+    assert "what the project set out to do" in opening
+    assert "reading it out of those first commits" in opening
+
+
 # ============================================================================
 # THE PAGE: every control, and what it looks like
 # ============================================================================
@@ -1027,7 +1194,7 @@ def test_there_is_no_zoom_control_only_a_way_back_out():
         assert gone not in html, f"the zoom control is still on the page ({gone})"
     assert 'class="btn small zback"' in html and 'e.target.closest(".zback")' in html
     # One step out, and it names where it lands rather than saying "back".
-    assert 'if (e.target.closest(".zback")) { setZoom(2); return; }' in html
+    assert 'if (e.target.closest(".zback")) setZoom(2);' in html
     assert "&larr; back to ' + partsLabel()" in html
 
 
@@ -1036,7 +1203,7 @@ def test_the_way_in_is_clicking_a_part():
     tells a part nobody has told yet."""
     html = _page()
     assert "if (seg) setZoom(3, seg.dataset.part)" in html  # the parts list goes in
-    assert 'class="btn zpart"' in html and 'e.target.closest(".zpart")' in html
+    assert 'class="gobtn zpart"' in html and 'e.target.closest(".zpart")' in html
 
 
 def test_the_closer_telling_is_gone_for_good():
@@ -1049,7 +1216,7 @@ def test_the_closer_telling_is_gone_for_good():
         assert gone not in html, f"{gone} is still on the page"
     # Two depths, and nothing can ask for a third.
     assert "state.zoom = Math.max(top, Math.min(3, state.zoom || top));" in html
-    assert 'if (e.target.closest(".zback")) { setZoom(2); return; }' in html
+    assert 'if (e.target.closest(".zback")) setZoom(2);' in html
 
 
 def test_a_stored_closer_telling_is_dropped_on_load(tmp_path):
@@ -1146,10 +1313,47 @@ def test_going_further_back_is_gone():
 
 
 def test_the_page_no_longer_carries_the_features_that_did_not_work():
-    """Story mode and the keyboard shortcuts were removed: nothing may reference them."""
+    """Story mode and the j/k keyboard shortcuts were removed: nothing may reference them."""
     html = _page()
-    for gone in ["playStory", "cineStep", "cinebar", 'id="play"', "keydown", "PAGE_MOMENTS"]:
+    for gone in ["playStory", "cineStep", "cinebar", 'id="play"', "PAGE_MOMENTS"]:
         assert gone not in html, f"{gone} is still on the page"
+    # No document-level shortcut scheme either — that was the part nobody could discover. The
+    # only keys the page answers are Enter and Space on a card the reader has FOCUSED, which
+    # is simply what a role="button" owes the keyboard.
+    assert 'document.addEventListener("keydown"' not in html
+    assert 'if (e.key !== "Enter" && e.key !== " ") return;' in html
+
+
+def test_the_reader_is_told_that_parts_and_moments_open():
+    """A hover-only affordance says nothing until the pointer happens to land on something,
+    and nothing at all on a touch screen. Both lists say what they do, above them."""
+    html = _page()
+    assert "Tap or click any part to read the moments inside it." in html
+    assert "Tap or click a moment to read it" in html
+    assert 'class="howto"' in html and ".howto{color:var(--fg-dim)" in html
+    # ...and each card is a real control: focusable, keyboard-operable, and reacting as a BOX
+    # (the same border-brightening a moment card does), not just in one corner of itself.
+    assert 'role="button" tabindex="0">' in html
+    assert "open this part &rarr;" in html and "read this moment &darr;" in html
+    assert ".era:focus-visible,.ch:focus-visible{outline:2px solid var(--phosphor)" in html
+    assert ".era:hover{border-color:var(--phosphor-dim)}" in html
+    assert ".chbody:hover{border-color:var(--phosphor-dim)}" in html
+    # No native tooltip floating a second copy of that text under the pointer.
+    assert 'title="Open this' not in html
+
+
+def test_an_untold_part_offers_itself_in_the_middle_of_the_page():
+    """A part nobody has told is a page with exactly one thing to do on it. The offer used to
+    be a small button at the right-hand end of the context bar ABOVE the empty page, where a
+    reader looking at the emptiness never found it."""
+    html = _page()
+    assert 'class="emptypart empty-part-cta"' in html
+    assert '<button class="gobtn zpart">' in html  # the page's primary-action look, not .btn
+    assert ".empty-part-cta{display:flex;flex-direction:column;align-items:center" in html
+    # It is handled where it now lives, ahead of the card handler that would read the click
+    # as "open a moment".
+    timeline = html[html.index('$("timeline").addEventListener("click"') :]
+    assert timeline.index('closest(".zpart")') < timeline.index('closest(".cflip")')
 
 
 def test_generation_waits_say_which_model_is_doing_it():

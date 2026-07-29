@@ -274,12 +274,14 @@ def test_dashboard_is_usable_at_phone_width(tmp_path):
     from agitrack.metrics.web import shell_html
 
     html = shell_html(_seeded(tmp_path))
-    phone = html.split("@media (max-width:760px)", 1)[1]
-    assert ".controls{position:relative;flex-wrap:wrap" in phone
+    # The DASHBOARD's own narrow-screen block. There is more than one at this width now (the
+    # shared layer sets the side padding for all three pages), so this finds the block by what
+    # it contains rather than by being the first one in the file.
+    phone = html.split(".controls{position:relative;flex-wrap:wrap", 1)[1]
     # The inline top offset stackStickyBanner() sets for the sticky desktop bar must be
     # neutralized here: on the relative phone bar it shoved the bar down, leaving a
     # banner-sized blank gap at the top of narrow backtrace pages.
-    assert "top:auto !important" in phone.split("}", 2)[0] + phone.split("}", 2)[1]
+    assert "top:auto !important" in phone.split("}", 1)[0]
     # The banner's <code> chip is styled once for all three pages (agitrack/metrics/ui.py),
     # so this asserts the SHARED rule reached the rendered page.
     assert ".backtracebanner code,.btbanner code,.updatebanner code{color:var(--fg)" in html

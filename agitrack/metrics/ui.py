@@ -49,6 +49,11 @@ html,body{overflow-x:hidden}
 [hidden]{display:none !important}
 a{color:var(--accent);text-decoration:none}
 a:hover{text-decoration:underline}
+/* On a phone the page IS the column: side padding that reads as breathing room on a desktop
+   is a tenth of the screen on a 390px one, and every table, diff and moment card pays for it.
+   Written as `body .wrap` so it outranks each page's own `.wrap` padding whatever order the
+   two blocks end up in. */
+@media (max-width:760px){body .wrap{padding-left:6px;padding-right:6px}}
 /* The spinner every page uses while something is loading. */
 .spin{width:13px;height:13px;border:2px solid var(--phosphor-dim);border-top-color:var(--phosphor);
   border-radius:50%;animation:spin .7s linear infinite;display:inline-block;flex:none}
@@ -192,14 +197,24 @@ COMMIT_CSS = """.dmsg{font-size:12.5px;line-height:1.55;color:var(--fg-dim);word
 /* Reflow mode (set by reflowParagraphs on paragraphs the layout wraps anyway): the source
    line breaks stop rendering and the paragraph flows as prose. */
 .dmsg.md p.mdp.reflow br{display:none}
-.dmsg.md .md-h{font-family:var(--mono);color:var(--amber);margin:11px 0 5px;font-size:13px;font-weight:600}
+/* Every property a host page might have opinions about is set HERE, including the ones this
+   block would otherwise leave to inheritance. The story page styles its own section headings
+   (".commits h4") in small caps, and that rule reached into a commit message's "## User"
+   heading and rendered it in UPPERCASE - the same commit, two different looks, which is the
+   one thing the shared renderer exists to prevent. */
+.dmsg.md .md-h{font-family:var(--mono);color:var(--amber);margin:11px 0 5px;font-size:13px;font-weight:600;
+  text-transform:none;letter-spacing:normal;text-align:left;font-style:normal}
 /* Heading depth reads at a glance: structural sections (# …) brightest/largest, the
    ## User/## Agent role one step down, a message's own headings smaller and indented. */
 .dmsg.md h3.md-h{font-size:15px;color:var(--amber)}
 .dmsg.md h4.md-h{font-size:13.5px;color:var(--phosphor)}
 .dmsg.md h5.md-h{font-size:12.5px;color:var(--ops);font-weight:500;padding-left:10px;border-left:2px solid var(--line)}
 .dmsg.md h6.md-h{font-size:12px;color:var(--fg-dim);font-weight:500;padding-left:20px;border-left:2px solid var(--line)}
-.dmsg.md ul{margin:6px 0 6px 18px} .dmsg.md li{margin:2px 0}
+/* Lists pin their own indent for the same reason the headings do: the story page indents its
+   OWN markdown lists with a padding-left, and with only a margin set here that padding stacked
+   on top, so the same commit's bullets sat further in on one page than the other. */
+.dmsg.md ul,.dmsg.md ol{margin:6px 0 6px 18px;padding-left:0;list-style-position:outside}
+.dmsg.md li{margin:2px 0}
 .dmsg.md code{background:var(--panel2);border:1px solid var(--line);padding:0 4px;color:var(--phosphor);font-size:12px}
 .dmsg.md strong{color:var(--fg)} .dmsg.md em{color:var(--fg)}
 .dmsg.md .md-code{white-space:pre-wrap;background:var(--panel2);border:1px solid var(--line);

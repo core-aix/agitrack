@@ -26,7 +26,11 @@
 <meta name="twitter:title" content="aGiTrack: every AI coding-agent turn, committed with its story, with humans learning">
 <meta name="twitter:description" content="Wrap your coding agent backends with Git: every agent turn becomes a traceable commit with its full story, and a coach teaches you from your own sessions.">
 <meta name="twitter:image" content="https://agitrack.core-aix.org/images/dashboard-v6.png">
-<!-- Structured data: helps Google understand the project and show a last-updated date -->
+<!-- Structured data: helps Google understand the project and show a last-updated date.
+     dateModified is maintained by docs/generate_sitemap.py, which the release workflow runs:
+     it dates the page from the last commit that CHANGED it (release and sitemap-refresh
+     commits excluded) and writes the same date into sitemap.xml, so the two always agree.
+     Do not hand-edit it. -->
 <script type="application/ld+json">
 {
   "@context": "https://schema.org",
@@ -37,7 +41,7 @@
   "url": "https://agitrack.core-aix.org/",
   "applicationCategory": "DeveloperApplication",
   "operatingSystem": "macOS, Linux, Windows",
-  "dateModified": "2026-07-28",
+  "dateModified": "2026-07-29",
   "codeRepository": "https://github.com/core-aix/agitrack",
   "downloadUrl": "https://pypi.org/project/agitrack/",
   "installUrl": "https://pypi.org/project/agitrack/",
@@ -332,7 +336,10 @@ footer .sha{font-size:12px}
   </main>
 
   <footer>
-    <span><span class="sha">aGiTrack</span> · agent + git tracking + humans learning · Apache-2.0 · updated <time datetime="2026-07-28">2026-07-28</time></span>
+    <!-- No "updated" date here on purpose: a product page that stamps itself invites the
+         reader to judge the project by how fresh the page looks. The date search engines
+         want is still in the JSON-LD above (dateModified), which is where it belongs. -->
+    <span><span class="sha">aGiTrack</span> · agent + git tracking + humans learning · Apache-2.0</span>
     <span><a class="more" href="readmore.html">read more</a> · <a href="https://github.com/core-aix/agitrack" rel="me">GitHub</a> · <a href="docs.html">docs</a> · <a href="https://pypi.org/project/agitrack/">PyPI</a></span>
   </footer>
 </div>

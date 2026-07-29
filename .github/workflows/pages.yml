@@ -51,8 +51,6 @@ jobs:
           agitrack -d export --export-dir "$RUNNER_TEMP/site/dashboard"
       - name: Assemble the site (docs + demo dashboard)
         run: cp -R docs/. "$RUNNER_TEMP/site/"
-      # Fail here rather than deploying a site whose demo silently vanished (a failed or
-      # partial export would otherwise publish the landing pages with dead demo links).
       - name: Verify the demo is in the site
         run: |
           test -f "$RUNNER_TEMP/site/dashboard/index.html"

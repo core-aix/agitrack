@@ -211,6 +211,7 @@ footer .sha{font-size:12px}
     <div class="hero-actions reveal r4">
       <a class="btn alt" href="./">&larr; overview</a>
       <a class="btn" href="dashboard/">try the dashboard demo</a>
+      <a class="btn" href="dashboard/story/">read a repo's story</a>
       <a class="btn" href="dashboard/learn/">meet your coach</a>
       <a class="btn" href="#install">pip install agitrack</a>
       <a class="btn alt" href="docs.html">read the docs</a>
@@ -321,6 +322,25 @@ Added --version using the package metadata; prints and exits.
         <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="title">agitrack -d · learn</span></div>
         <a href="dashboard/learn/"><img class="shot" src="images/learn-page-v2.png" loading="lazy" width="2124" height="1442"
           alt="The learn page: a check-in card asking how much time you have and how you feel, the coach's assessment of the learner, and four suggested lessons, each with an evidence-based reason and an estimated size. Click for the interactive demo."></a>
+      </div>
+    </section>
+
+    <section class="commit agent" id="story">
+      <div class="commit-head">
+        <span class="sha">c5b7e34</span>
+        <span class="subject"><span class="tag">&lt;aGiTrack&gt;</span> tell the repo's history as a story</span>
+      </div>
+      <h2>Ask your repo how it got here.</h2>
+      <p>A commit log tells you what changed. The <strong>story</strong> page tells you what the project was
+      <em>trying to do</em>, and how that changed: your own agent reads the whole history and lays it out as a
+      handful of <strong>parts</strong>, then the <strong>moments</strong> inside each one. Open a moment and you
+      get the telling, the prompts someone actually typed at the time, and the commits that came out of it.
+      Written on demand, one part at a time, and kept in your repo.
+      <a href="dashboard/story/"><strong>Read this repo's own story</strong></a>, told by the agent that built it.</p>
+      <div class="term">
+        <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="title">agitrack -d · story</span></div>
+        <a href="dashboard/story/"><img class="shot" src="images/story-page.png" loading="lazy" width="2400" height="2360"
+          alt="The story page: a title and tagline the agent wrote for the project, counters for moments, commits, agent turns and days, a paragraph on the arc from the first commit to now, controls for the voice and which days to cover, and the history split into six parts, each with its date span, commit count and a sparkline of the work inside it. Click for the interactive demo."></a>
       </div>
     </section>
 
