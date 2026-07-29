@@ -1424,7 +1424,9 @@ def learn_html(root: Path, *, banner_html: str = "") -> str:
     repo_name = repo_path.rstrip("/").rsplit("/", 1)[-1] or repo_path
     # Same first-paint treatment as the dashboard (see web.PREBOOT_CSS): a dark page saying
     # it is loading instead of a white one, and web fonts that never block the paint.
-    return (
+    from agitrack.metrics import ui
+
+    return ui.render(
         _LEARN_TEMPLATE.replace("__BACKTRACE_BANNER__", banner_html)
         .replace("__REPO_NAME__", _escape(repo_name))
         .replace("__REPO__", _escape(repo_path))
@@ -1460,14 +1462,10 @@ __PREBOOT_CSS__
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🎓</text></svg>">
 __FONT_LINKS__
 <style>
-:root{--ink:#070b09;--panel:#0c120e;--panel2:#101813;--line:#1d2a21;--fg:#cfe7d8;--fg-dim:#7e998a;
-  --phosphor:#3dffa0;--phosphor-dim:#1f7a52;--accent:#67b8d6;--warn:#ffb454;--bad:#ff6b6b;
-  --chipbg:#101813;--amber:#ffb454;--amber-dim:#8a5e2a;
-  --mono:"IBM Plex Mono",ui-monospace,Menlo,Consolas,monospace;--display:"VT323",var(--mono)}
-*{box-sizing:border-box}
+__UI_TOKENS__
+__UI_BASE_CSS__
 html,body{margin:0;padding:0;background:var(--ink);color:var(--fg);
   font:14px/1.55 var(--mono)}
-a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
 
 /* A slow ambient glow drifting behind everything: calm, not busy. */
 .ambient{position:fixed;inset:0;z-index:-1;pointer-events:none;opacity:.5;
@@ -1528,23 +1526,7 @@ textarea{width:100%;min-height:74px;resize:vertical}
 .thinking .grow{font-size:18px;animation:bob 2.4s ease-in-out infinite}
 /* The full-screen processing overlay: while the agent writes suggestions or a lesson,
    the whole page dims and this card is unmissable, whatever was scrolled into view. */
-.overlay{position:fixed;inset:0;z-index:60;display:flex;align-items:center;justify-content:center;
-  background:rgba(3,6,4,.74);backdrop-filter:blur(3px);animation:fadein .25s ease both}
-@keyframes fadein{from{opacity:0}to{opacity:1}}
-.ov-card{background:var(--panel);border:1px solid var(--phosphor-dim);border-radius:12px;
-  padding:32px 40px;max-width:460px;margin:0 20px;text-align:center;
-  box-shadow:0 18px 60px rgba(0,0,0,.55);animation:rise .3s ease both}
-.ov-card .mascot{font-size:44px}
-.ov-title{font-size:16px;color:var(--phosphor);margin:12px 0 4px}
-.ov-msg{font-size:13px;color:var(--fg-dim);min-height:20px}
-.ov-bar{height:4px;border-radius:2px;background:var(--panel2);overflow:hidden;margin:16px 0 12px}
-.ov-bar span{display:block;height:100%;width:38%;border-radius:2px;background:var(--phosphor);
-  will-change:transform}
-.ov-hint{font-size:11.5px;color:var(--fg-dim)}
-.ov-engine{font-size:12px;color:var(--accent);margin-top:2px;min-height:16px}
-.spin{width:13px;height:13px;border:2px solid var(--phosphor-dim);border-top-color:var(--phosphor);
-  border-radius:50%;display:inline-block;animation:spin .8s linear infinite;flex:none}
-@keyframes spin{to{transform:rotate(360deg)}}
+__UI_OVERLAY_CSS__
 .assess{color:var(--fg);font-size:13.5px;border-left:3px solid var(--phosphor-dim);padding:8px 12px;
   margin:0 0 14px;background:var(--panel2);border-radius:0 6px 6px 0}
 .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:12px}
@@ -1659,38 +1641,16 @@ textarea{width:100%;min-height:74px;resize:vertical}
 .plist .pl:hover .pldel,.plist .pldel:focus-visible{opacity:1;visibility:visible}
 .plist .pldel:hover{color:var(--bad)}
 .plist .pldel.armed{opacity:1;color:var(--bad);border:1px solid var(--bad)}
-.error{border:1px solid var(--bad);color:var(--bad);padding:10px 14px;font-size:13px;margin:10px 0;border-radius:6px}
-.notice{border:1px solid var(--warn);color:var(--warn);padding:10px 14px;font-size:13px;margin:10px 0;border-radius:6px}
-/* Flash notices float as a fixed toast so an unavailable-feature or error message is seen
-   from anywhere on the page, not only when scrolled to the top. Click dismisses. */
-#flash{position:fixed;left:50%;transform:translateX(-50%);bottom:18px;z-index:80;
-  width:min(680px,calc(100vw - 32px));pointer-events:none}
-#flash .notice,#flash .error{pointer-events:auto;cursor:pointer;background:var(--panel);
-  box-shadow:0 14px 44px rgba(0,0,0,.65);margin:6px 0}
-#flash .notice::after,#flash .error::after{content:" · click to dismiss";opacity:.6;font-size:11px}
-.engine{margin-top:26px;border:1px solid var(--line);background:var(--panel);border-radius:8px}
-.engine summary{cursor:pointer;padding:10px 16px;color:var(--fg-dim);font-size:12.5px;list-style:none}
-.engine summary::before{content:"\2699\FE0F  "}
-.engine summary:hover{color:var(--fg)}
-.engine .ebody{padding:4px 16px 14px}
-.engine .esaved{color:var(--phosphor)}
+__UI_FLASH_CSS__
+__UI_ENGINE_CSS__
 /* Emoji confetti on a completed lesson: a brief, gentle celebration. */
 .confetti{position:fixed;inset:0;pointer-events:none;overflow:hidden;z-index:50}
 .confetti span{position:absolute;top:-30px;font-size:20px;animation:fall 2.6s ease-in forwards}
 @keyframes fall{to{transform:translateY(105vh) rotate(340deg);opacity:.1}}
 footer{margin-top:46px;padding-top:18px;border-top:1px dashed var(--line);color:var(--fg-dim);font-size:12px}
 /* The backtrace notice: a frozen top strip, amber like the dashboard's, always visible. */
-.btbanner{position:sticky;top:0;z-index:55;margin:0;padding:10px 18px;background:var(--panel);
-  border-bottom:2px solid var(--amber-dim);color:var(--warn);font-size:12.5px;line-height:1.5;
-  text-align:center;box-shadow:0 4px 16px rgba(0,0,0,.55)}
-.btbanner code{color:var(--fg);background:var(--panel2);padding:0 5px;border-radius:3px}
-/* The banner's call-to-action link is GREEN against the amber notice text (identical
-   rule on the dashboard's .backtracebanner) so the one thing to click stands apart from
-   the explanation, and reads the same on both pages. */
-.btbanner a{color:var(--phosphor);text-decoration:none;border-bottom:1px solid var(--phosphor-dim)}
-.btbanner a:hover{color:var(--ink);background:var(--phosphor);text-decoration:none}
+__UI_BANNER_CSS__
 footer code{color:var(--fg)}
-[hidden]{display:none !important}
 @media (max-width:600px){.cards{grid-template-columns:1fr}.bubble{max-width:100%}}
 </style>
 </head>
@@ -1702,7 +1662,8 @@ __BACKTRACE_BANNER__
   <header class="rise">
     <div class="brand"><span class="a">a</span>GiTrack<span class="sub">&nbsp;learn</span></div>
     <div class="meta"><span>repo</span> <b>__REPO__</b> <span id="me-meta"></span></div>
-    <a class="backlink" id="backlink" href="./">&larr; dashboard</a>
+    <div class="backlink"><a id="backlink" href="./">&larr; dashboard</a> &nbsp;·&nbsp;
+      <a id="storylink" href="story" title="Read this repo's history as a story">&#128214; story</a></div>
   </header>
 
   <div class="panel checkin rise" id="checkin">
@@ -1851,8 +1812,7 @@ __BACKTRACE_BANNER__
 // The document is here and styled: drop the pre-boot overlay that covered its transfer
 // (see web.PREBOOT_CSS). The page's own skeleton takes over from here.
 { const pb = document.getElementById("preboot"); if (pb) pb.remove(); }
-const $ = id => document.getElementById(id);
-const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+__UI_DOM_JS__
 
 const state = { me: "", source: "", branch: "", branches: [], minutes: 0, mood: "", profile: null, lesson: null,
                 sync: null, openedAt: 0, flushedS: 0, waitTimer: null,
@@ -1864,12 +1824,7 @@ function period() {
   return {from: Math.floor(Date.now()/1000) - Number(days)*86400, to: 0};
 }
 
-async function post(path, body) {
-  const r = await fetch(path, {method: "POST", headers: {"Content-Type": "application/json"},
-                               body: JSON.stringify(body), cache: "no-store"});
-  if (!r.ok) throw new Error("server error " + r.status);
-  return r.json();
-}
+const post = postJson;
 
 function flash(html) { var f = $("flash"); f.innerHTML = html; f.onclick = clearFlash; }
 function clearFlash() { flash(""); }
@@ -2622,16 +2577,6 @@ $("reset-suggest").addEventListener("click", async () => {
       flash('<div class="notice">fresh start! check in above and I\'ll pick again from the latest sessions.</div>');
     }
   } catch (e) {}
-});
-// Going back to the dashboard via history restores it instantly from the browser's
-// back/forward cache instead of a full reload (and its commit-history crunch).
-$("backlink").addEventListener("click", e => {
-  try {
-    if (document.referrer && new URL(document.referrer).origin === location.origin && history.length > 1) {
-      e.preventDefault();
-      history.back();
-    }
-  } catch (err) {}
 });
 $("f-source").addEventListener("change", () => { state.source = $("f-source").value; });
 $("f-branch").addEventListener("change", () => {

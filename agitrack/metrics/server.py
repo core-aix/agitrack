@@ -3,8 +3,10 @@
 `agitrack --dashboard` serves the HTML dashboard and opens it in the browser.
 The page polls ``/data`` on an interval and re-renders, so the dashboard
 reflects new commits as they land — useful for watching an agent work.
-Everything is recomputed from ``git log`` on each request: read-only, no state,
-identical on every clone.
+Everything derives from ``git log``: read-only, no state, identical on every clone. The
+built view is cached per REF STATE (branch tip plus the latent manual refs), so a poll, a
+log page or a return from /story or /learn reuses it instead of walking the history again;
+a moved ref rebuilds it.
 
 Where it binds depends on where aGiTrack is running. On your own machine it
 stays on loopback; in a **remote shell** (SSH/Mosh) loopback would be reachable
@@ -27,6 +29,7 @@ from typing import Any, Callable, TypeVar
 
 from agitrack.git import GitRepo
 from agitrack.metrics import learn as learn_page
+from agitrack.metrics import story as story_page
 from agitrack.metrics.collect import Dashboard, build_dashboard
 from agitrack.metrics.files import FileBrowser, git_browser
 from agitrack.metrics.insights import build_insights, context_from_browser
@@ -95,6 +98,8 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
     # the question for that slice), hence keyed by the filter too — not just the branch tip.
     # Bounded: cleared whenever the tip moves, and capped while a tip is current.
     _insights_cache: dict[tuple, list[dict]] = {}
+    # The built Dashboard itself, keyed by the refs it was built from (see _dashboard).
+    _dash_cache: dict[tuple, Dashboard] = {}
 
     def do_GET(self) -> None:  # noqa: N802 (http.server API)
         try:
@@ -155,6 +160,25 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
                     "application/json",
                     self._json(self._browser(ref).file_diff(_str(query, "path"), _str(query, "sha"))),
                 )
+            elif parsed.path == "/story":
+                # The storyline: the backend agent tells this branch's history as chapters
+                # (agitrack/metrics/story.py). Chrome only; the page fetches /story/state.
+                self._respond(
+                    "text/html; charset=utf-8",
+                    story_page.story_html(self.repo.repo).encode("utf-8"),
+                    cache_control="no-cache",
+                )
+            elif parsed.path == "/story/state":
+                stats, sha_paths = self._story_view(ref if ref != "HEAD" else "")
+                payload = story_page.story_state(
+                    self.repo.repo,
+                    stats,
+                    sha_paths,
+                    branch=ref if ref != "HEAD" else self.repo.current_branch(),
+                    branches=self._dashboard(ref).branches or self.repo.list_branches(),
+                    repo_name=str(self.repo.repo).rstrip("/").rsplit("/", 1)[-1],
+                )
+                self._respond("application/json", self._json(payload))
             elif parsed.path == "/learn":
                 # The learning page: the backend agent coaches the user from their own
                 # interaction traces (agitrack/metrics/learn.py). Chrome only; the page
@@ -200,15 +224,33 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
                 body = {}
             if not isinstance(body, dict):
                 body = {}
-            payload = learn_page.handle_learn_post(
-                parsed.path, body, root=self.repo.repo, repo=self.repo, view=self._learn_view
-            )
+            if parsed.path.startswith("/story/"):
+                payload = story_page.handle_story_post(
+                    parsed.path,
+                    body,
+                    root=self.repo.repo,
+                    view=self._story_view,
+                    repo_name=str(self.repo.repo).rstrip("/").rsplit("/", 1)[-1],
+                )
+            else:
+                payload = learn_page.handle_learn_post(
+                    parsed.path, body, root=self.repo.repo, repo=self.repo, view=self._learn_view
+                )
             if payload is None:
                 self.send_error(404, "not found")
                 return
             self._respond("application/json", self._json(payload))
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             pass
+
+    def _story_view(self, branch: str) -> tuple[list, dict]:
+        """The commits (and which files each touched) the storyline is told from: this
+        branch's whole history, unfiltered. The story is about the project, not about a
+        dashboard filter, so no author/period narrowing applies here."""
+        ref = self._ref(branch)
+        dash = self._dashboard(ref)
+        _files, sha_paths = context_from_browser(self._browser(ref), dash.stats)
+        return dash.stats, sha_paths
 
     def _learn_view(self, author: str, frm: int, to: int, branch: str) -> tuple[list, list[dict], list[dict]]:
         """The filtered stats + insights + file rows the learning agent's digest is built
@@ -236,7 +278,35 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
         # logins appear on a later poll. {} when gh is absent. The initial / paint warms
         # this cache so the IDs are usually ready by the first /data poll.
         logins = cached_logins(self.repo)
-        return build_dashboard(self.repo, ref, sha_logins=logins, email_logins=self.email_logins)
+        # Reading the whole history is THE expensive thing this server does, and every
+        # request used to do it again: a poll, a log page, the story page, and every return
+        # from /learn or /story. It only changes when a ref moves, so key it on the tips we
+        # actually read (the branch, and the manual-mode latent refs the pending rows come
+        # from) plus how many identities are resolved so far.
+        key = (ref, self._ref_state(ref), len(logins), len(self.email_logins))
+        cache = type(self)._dash_cache
+        hit = cache.get(key)
+        if hit is not None:
+            return hit
+        dash = build_dashboard(self.repo, ref, sha_logins=logins, email_logins=self.email_logins)
+        cache.clear()  # only the current state is worth keeping
+        cache[key] = dash
+        return dash
+
+    def _ref_state(self, ref: str) -> str:
+        """A cheap fingerprint of everything the dashboard reads: the branch tip and the
+        latent (manual-mode) refs. Two git plumbing calls instead of a full history walk."""
+        try:
+            head = self.repo.rev_parse(ref)
+        except Exception:
+            return ""  # unreadable: fall through to a rebuild rather than serve a guess
+        try:
+            latent = self.repo._run(
+                ["git", "for-each-ref", "--format=%(objectname)", "refs/agitrack/manual"], check=False
+            ).stdout
+        except Exception:
+            latent = ""
+        return head + "|" + latent.strip()
 
     def _browser(self, ref: str = "HEAD") -> FileBrowser:
         # Build (and cache) the file browser for this ref. Keyed by the branch tip so a poll
@@ -295,10 +365,35 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
         """Stay quiet: the dashboard is a foreground tool, not a web log."""
 
 
+def bind_exclusively(sock: socket.socket) -> None:
+    """Ask for a port NOBODY else is on, on either family of socket semantics.
+
+    ``SO_REUSEADDR`` means two different things. On POSIX it only lets a new listener take a
+    port left in TIME_WAIT, and a port a live listener holds is still refused. On Windows it
+    means "bind even if another socket is already bound here", so two dashboards would both
+    bind 8765, the port scan below would never step past a taken port, and requests would
+    land on whichever socket the OS felt like. Windows spells the POSIX intent
+    ``SO_EXCLUSIVEADDRUSE``, which additionally stops anyone stealing OUR port."""
+    if os.name != "nt":
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        return
+    exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+    if exclusive is not None:
+        sock.setsockopt(socket.SOL_SOCKET, exclusive, 1)
+
+
 class _DashboardServer(http.server.ThreadingHTTPServer):
     # Threaded so one slow request (e.g. the first gh lookup) never blocks the
     # page; daemon threads so Ctrl-C exits immediately without joining them.
     daemon_threads = True
+
+    # socketserver would set SO_REUSEADDR for us; on Windows that is the wrong request
+    # entirely (see bind_exclusively), so take the option over completely.
+    allow_reuse_address = False
+
+    def server_bind(self) -> None:
+        bind_exclusively(self.socket)
+        super().server_bind()
 
     # A client that vanished mid-write surfaces as BrokenPipeError here too;
     # swallow it so the server doesn't print a traceback per dropped poll.
@@ -415,8 +510,9 @@ def build_server(
         {
             "repo": repo,
             "email_logins": {k.lower(): v for k, v in (email_logins or {}).items()},
-            # A fresh per-server cache so two servers (different repos) never share a browser.
+            # Fresh per-server caches so two servers (different repos) never share either.
             "_browser_cache": {},
+            "_dash_cache": {},
         },
     )
     bind_host = default_bind_host() if host is None else host

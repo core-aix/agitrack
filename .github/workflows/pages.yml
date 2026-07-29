@@ -42,10 +42,12 @@ jobs:
         run: pip install .
       - name: Build the static demo dashboard
         run: |
-          # The learn page's demo profile: a curated fixture (real coach output for this
-          # repo, checked in) seeded into the store the export reads.
+          # The learn page's demo profile and the storyline's chapters: curated fixtures
+          # (real agent output for this repo, checked in) seeded into the stores the export
+          # reads. A missing fixture fails the build rather than deploying an empty page.
           mkdir -p .agitrack
           cp docs/demo/learning.json .agitrack/learning.json
+          cp docs/demo/story.json .agitrack/story.json
           agitrack -d export --export-dir "$RUNNER_TEMP/site/dashboard"
       - name: Assemble the site (docs + demo dashboard)
         run: cp -R docs/. "$RUNNER_TEMP/site/"
@@ -55,6 +57,8 @@ jobs:
         run: |
           test -f "$RUNNER_TEMP/site/dashboard/index.html"
           test -f "$RUNNER_TEMP/site/dashboard/learn/index.html"
+          test -f "$RUNNER_TEMP/site/dashboard/story/index.html"
+          test -s "$RUNNER_TEMP/site/dashboard/demo/story.json"
           test -f "$RUNNER_TEMP/site/index.html"
       - name: Enforce the workflow build source
         env:

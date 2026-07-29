@@ -32,9 +32,10 @@ def test_export_writes_a_complete_static_site(tmp_path, monkeypatch):
 
     index = (out / "index.html").read_text(encoding="utf-8")
     learn = (out / "learn" / "index.html").read_text(encoding="utf-8")
+    story = (out / "story" / "index.html").read_text(encoding="utf-8")
     from agitrack.metrics.export import _DEMO_NOTE
 
-    for page in (index, learn):
+    for page in (index, learn, story):
         assert "STATIC DEMO" in page
         assert _DEMO_NOTE in page  # the unsupported-action note is wired into both shims
         assert "window.fetch = function" in page  # the shim is installed
@@ -66,6 +67,96 @@ def test_export_writes_a_complete_static_site(tmp_path, monkeypatch):
             sha = str(change.get("sha") or "")
             if sha:
                 assert (out / "demo" / "filediff" / f"{i}-{sha[:12]}.json").exists()
+
+
+def test_export_ships_the_storyline_page(tmp_path, monkeypatch):
+    """The third page: its own directory, its state baked from the store, generation
+    disabled, and the cross-links rewritten for a directory layout."""
+    out = _export(tmp_path, monkeypatch)
+    story = (out / "story" / "index.html").read_text(encoding="utf-8")
+    state = json.loads((out / "demo" / "story.json").read_text(encoding="utf-8"))
+
+    # The state a live /story/state would return: the outline is always there (it needs no
+    # agent), and the engine note is fixed rather than resolved on the export machine.
+    assert state["outline"] and state["meta"]["commits"] > 0
+    assert state["building"] is None
+    assert state["engine"]["backend"] == "claude"
+    assert state["branches"] == []  # one branch is shipped; a picker would lie
+
+    assert 'if (name === "story/state") return file("story.json"' in _shim_of(story)
+    # The whole studio answers with the shared demo toast, not just its last button.
+    assert 'e.target.closest("#studio, .zpart, #e-save")' in story
+    assert "demoflash" in story  # ...as the same fixed bottom toast the dashboard uses
+    # Cross-links: on the live server each page is a sibling path, in the demo a directory.
+    assert 'relink("backlink", "../"); relink("learnlink", "../learn/")' in story
+    learn = (out / "learn" / "index.html").read_text(encoding="utf-8")
+    assert 'relink("storylink", "../story/")' in learn
+    # And the dashboard points at it in both places.
+    index = (out / "index.html").read_text(encoding="utf-8")
+    assert 'id="storylink"' in index and 'id="storycta"' in index
+
+
+def test_the_demo_answers_every_unavailable_action_the_same_way(tmp_path, monkeypatch):
+    """One note, one box, one colour, on all three pages. "Tell this part closer" was drawn
+    by the page after load, so no listener covered it: the click reached the blocked POST and
+    the page reported a RED failure in the middle of the document, while every other
+    unavailable control showed a calm amber note at the bottom."""
+    out = _export(tmp_path, monkeypatch)
+    story = (out / "story" / "index.html").read_text(encoding="utf-8")
+
+    # Style, days, the note box and every button: all of it, by selector, so controls the
+    # page draws later are covered too.
+    assert 'e.target.closest("#studio, .zpart, #e-save")' in story
+    # A select opens on mousedown, before any click lands...
+    assert 'document.addEventListener("mousedown"' in story
+    # ...and the note box would otherwise take a caret and typing.
+    assert "note.readOnly = true" in story
+    # The note goes to the page's OWN toast where there is one, so two boxes never stack.
+    assert 'if (typeof window.flash === "function") {' in story
+    # And the safety net: whatever still reaches the page's error path is shown as a notice.
+    assert "if ((LEARN || STORY) && typeof window.flash === " in story
+    assert 'html.replace(/class="error"/g, \'class="notice"\')' in story
+
+
+def _shim_of(html: str) -> str:
+    return html
+
+
+def test_export_bakes_the_diffs_a_shipped_story_points_at(tmp_path, monkeypatch):
+    """A story is mostly about older history, so its commits usually fall outside the demo's
+    30-day window: their diffs must be baked anyway or every "show diff" in the demo fails."""
+    from agitrack.metrics import story as story_page
+
+    _no_network_identity(monkeypatch)
+    repo = _demo_repo(tmp_path / "repo")
+    old = "2001-02-03T04:05:06"
+    _write_lines(repo, "ancient.txt", 3)
+    repo._run(["git", "add", "-A"])
+    repo._run(["git", "commit", "-m", "ancient work"], env={"GIT_AUTHOR_DATE": old, "GIT_COMMITTER_DATE": old})
+    ancient = repo.rev_parse("HEAD")
+    store = story_page.StoryStore(repo.repo)
+    store.put(
+        "main",
+        {
+            "title": "A told story",
+            "moments": [
+                {
+                    "id": "c1",
+                    "title": "The ancient moment",
+                    "summary": "s",
+                    "shas": [ancient],
+                    "commits": [{"sha": ancient, "short": ancient[:7], "subject": "ancient work"}],
+                }
+            ],
+            "covered_shas": [ancient],
+        },
+    )
+    out = tmp_path / "site"
+    export_static_demo(repo, out)
+
+    state = json.loads((out / "demo" / "story.json").read_text(encoding="utf-8"))
+    assert state["story"]["title"] == "A told story"  # shipped even though it names another branch
+    assert (out / "demo" / "diff" / f"{ancient}.json").exists()
 
 
 def test_export_scopes_the_demo_to_the_last_30_days(tmp_path, monkeypatch):
@@ -114,12 +205,12 @@ def test_export_disables_filters_and_cans_learn_actions(tmp_path, monkeypatch):
     assert "demoflash" in index
     assert 'el.style.pointerEvents = "none"' in index
     assert "stopImmediatePropagation" in index  # reset intercepted ahead of the page handler
-    # The #trace deep link maximizes the expanded commit: the window pins the ENTRY under
-    # the sticky chrome (kept pinned while late layout settles) and the message box
-    # scrolls internally so the Interaction Trace starts at its top.
+    # The #trace deep link parks the Interaction Trace HEADING under the sticky chrome. It
+    # used to scroll two things — the window to the entry, and the message's own max-height
+    # box to the heading; the message now flows with the page, so one scroll does it.
     assert 'location.hash === "#trace"' in index
-    assert "box.scrollTop +=" in index
-    assert "entry.getBoundingClientRect().top - inset()" in index
+    assert "box.scrollTop" not in index  # no inner scroll region left to chase
+    assert "target.getBoundingClientRect().top - inset()" in index
     # The inset counts only chrome that is ACTUALLY stuck: the filter bar is sticky on a
     # desktop but scrolls away on a phone, where reserving its height parked the entry a
     # screenful too low. And corrections scroll INSTANTLY — with the page's default smooth
@@ -142,16 +233,15 @@ def test_export_disables_filters_and_cans_learn_actions(tmp_path, monkeypatch):
     # page's dashboard link points one level up (it is a directory in the demo).
     assert '"../"' in index and "homelink" in index
     assert '"../../"' in learn and "homelink" in learn
-    assert 'back.href = "../"' in learn
+    assert 'relink("backlink", "../")' in learn
     # The banner links back to the main page's install section instead of spelling
     # out install commands.
     assert 'href="../#install"' in index
     assert 'href="../../#install"' in learn
-    # …and the link renders GREEN on BOTH pages, standing out from the amber banner text.
-    # Each banner styles its links explicitly because the two pages' global anchor colors
-    # differ, which is what made the same banner render differently on each.
-    assert ".backtracebanner a{color:var(--phosphor)" in index
-    assert ".btbanner a{color:var(--phosphor)" in learn
+    # …and the link renders GREEN on every page, standing out from the amber banner text.
+    # One rule, in agitrack/metrics/ui.py, so the strip cannot drift apart again.
+    shared = ".backtracebanner a,.btbanner a,.updatebanner a{color:var(--phosphor)"
+    assert shared in index and shared in learn
 
 
 def test_export_learn_state_falls_back_to_the_single_store_profile(tmp_path, monkeypatch):

@@ -1,3 +1,4 @@
+import errno
 import os
 import sys
 import threading
@@ -1560,6 +1561,27 @@ def test_offer_copy_unstaged_overwrite_confirmed(tmp_path):
     assert (base / "dup.txt").read_text() == "new\n"  # overwritten
 
 
+def test_two_files_that_differ_are_offered_even_with_the_same_size_and_mtime(tmp_path):
+    """The comparison behind the offer must read the CONTENT. It used to accept filecmp's
+    shallow verdict — a matching (size, mtime) — as proof the files were identical, which it
+    is not: two different files written in the same clock tick were then quietly dropped from
+    the offer and the user's work stayed stranded in the worktree. Windows, whose file
+    timestamps are coarser, hit this as a matter of course."""
+    runner, base, wt, _ = _copy_runner(tmp_path, "?? dup.txt\n")
+    (wt / "dup.txt").write_text("new\n")
+    (base / "dup.txt").write_text("old\n")
+    # Same size (they are), and now the same mtime to the nanosecond.
+    stamp = os.stat(base / "dup.txt").st_mtime_ns
+    os.utime(wt / "dup.txt", ns=(stamp, stamp))
+    assert os.stat(wt / "dup.txt").st_size == os.stat(base / "dup.txt").st_size
+
+    assert runner._differs_from_base(wt / "dup.txt", base / "dup.txt") is True
+    answers = iter(["Yes, copy to the base repo", "Yes, overwrite all"])
+    runner._select_popup = lambda *a, **k: next(answers)
+    runner._offer_copy_unstaged_to_base()
+    assert (base / "dup.txt").read_text() == "new\n"  # offered, and copied
+
+
 def test_offer_copy_unstaged_overwrite_all_prompts_once(tmp_path):
     # "Yes, overwrite all" is a SINGLE confirmation covering every conflict, not one
     # prompt per file.
@@ -2549,6 +2571,48 @@ def test_wheel_scrolls_history_and_strips_mouse_when_backend_has_no_mouse():
     assert runner.scroll_back == 3
 
 
+def test_a_scroll_burst_paints_one_frame_not_one_per_event():
+    """A trackpad flick arrives as ONE read holding hundreds of wheel reports. Painting each
+    of them meant hundreds of full-screen frames and megabytes pushed at the terminal through
+    a blocking write, which stalls the reactor and looks exactly like aGiTrack hanging
+    ("dies when scrolling extensively"). The whole chunk must move the view once."""
+    runner = _history_runner()
+    frames = []
+    runner._render = lambda: frames.append(runner.scroll_back)
+
+    assert runner._intercept_scroll(b"\x1b[<64;5;5M" * 60) == b""  # consumed, nothing forwarded
+    assert len(frames) == 1  # one frame for the whole flick...
+    assert frames[0] == runner.scroll_back  # ...painted AFTER the full movement
+    assert runner.scroll_back == runner._history_len()  # 60 notches, clamped at the top
+    # Mixed directions inside one chunk cancel out the way the user's fingers meant them to:
+    # 10 down (-30) and 4 up (+12) is a net 18 lines back toward the live view.
+    frames.clear()
+    runner.scroll_back = 20
+    runner._last_render = 0.0  # a frame is due again
+    runner._intercept_scroll(b"\x1b[<65;5;5M" * 10 + b"\x1b[<64;5;5M" * 4)
+    assert len(frames) == 1 and runner.scroll_back == 2
+
+
+def test_a_sustained_scroll_is_held_to_the_frame_budget():
+    """Chunk after chunk (a long continuous scroll) must not paint faster than backend output
+    does. A skipped frame is still OWED: it is flagged for the main loop, so the last event of
+    a flick always lands on screen."""
+    runner = _history_runner()
+    frames = []
+    runner._render = lambda: frames.append(1)
+    runner._last_render = time.monotonic()  # a frame just went out
+    runner._render_pending = False
+
+    runner._intercept_scroll(b"\x1b[<64;5;5M")
+    assert frames == []  # too soon: not painted...
+    assert runner._render_pending is True  # ...but scheduled, and the view already moved
+    assert runner.scroll_back == 3
+
+    runner._last_render = time.monotonic() - 1  # a frame's worth of time passes
+    runner._intercept_scroll(b"\x1b[<64;5;5M")
+    assert len(frames) == 1 and runner._render_pending is False
+
+
 def test_x10_mouse_reports_are_stripped_and_wheel_scrolls():
     # Terminals that ignore SGR mouse mode (?1006) — some tmux configs, the native Windows
     # console — send legacy X10 reports (ESC [ M + three offset bytes) even though aGiTrack
@@ -2607,6 +2671,78 @@ def _paint_runner():
     runner.input = types.SimpleNamespace(capturing=False)
     runner._status_line = lambda: "STATUS".ljust(8)
     return runner
+
+
+def test_a_frame_the_terminal_only_half_accepts_is_written_out_in_full(monkeypatch):
+    """A tty may accept only part of a write (its buffer fills, or a signal lands), and half
+    a frame is half an ESCAPE SEQUENCE: the terminal is then stuck in whatever mode the cut
+    sequence implied. Under a repaint storm that is how the screen becomes unrecoverable."""
+    runner = _paint_runner()
+    chunks = []
+
+    def stingy_write(fd, data):
+        chunks.append(data)
+        return min(len(data), 16)  # the terminal takes 16 bytes at a time
+
+    monkeypatch.setattr(os, "write", stingy_write)
+    runner.stream.feed(b"\x1b[Hr0\r\nr1\r\nr2")
+    runner._render()
+
+    assert len(chunks) > 1  # it kept going instead of dropping the tail
+    out = b"".join(chunk[:16] for chunk in chunks).decode()
+    assert out.startswith("\x1b[?2026h") and out.endswith("\x1b[?2026l")  # the frame is whole
+
+
+def test_a_terminal_that_went_away_does_not_take_the_session_down(monkeypatch):
+    """Closed window, dropped SSH: the frame write fails. Dropping the frame is right; a
+    traceback out of the middle of a redraw is not (the reactor notices the pty and exits
+    the normal way)."""
+    runner = _paint_runner()
+    calls = []
+
+    def dead_write(fd, data):
+        calls.append(data)
+        raise OSError(errno.EIO, "Input/output error")
+
+    monkeypatch.setattr(os, "write", dead_write)
+    runner.stream.feed(b"hello")
+    runner._render()  # must not raise
+    assert calls  # it did try
+
+
+def test_a_repaint_that_fails_drops_the_frame_instead_of_the_session(monkeypatch):
+    """A repaint is display only. Whatever goes wrong inside one, ending the session over it
+    is the difference between a flicker and the user losing their terminal (and their place
+    in the conversation)."""
+    runner = _paint_runner()
+    logged = []
+    monkeypatch.setattr(runner, "_debug", lambda message: logged.append(message))
+    monkeypatch.setattr(runner, "_render_frame", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    runner._render()  # must not raise
+
+    assert any("render failed" in line for line in logged)
+    assert runner._rendering is False  # and the guard is released for the next frame
+
+
+def test_a_repaint_entered_from_a_signal_does_not_interleave_with_the_one_in_flight(monkeypatch):
+    """SIGWINCH repaints (_resize_child), and a signal lands on any bytecode boundary. Two
+    frames going out at once over the same fd means interleaved escape sequences, which is
+    how a terminal ends up in a mode the user cannot get out of."""
+    runner = _paint_runner()
+    frames = []
+
+    def frame_that_gets_interrupted():
+        frames.append("outer")
+        runner._render()  # exactly what the signal handler would do, mid-frame
+        frames.append("outer-end")
+
+    monkeypatch.setattr(runner, "_render_frame", frame_that_gets_interrupted)
+    runner._render_pending = False
+    runner._render()
+
+    assert frames == ["outer", "outer-end"]  # the inner one did NOT paint...
+    assert runner._render_pending is True  # ...it asked the main loop to repaint instead
 
 
 def test_render_wraps_frame_in_synchronized_update(monkeypatch):
@@ -6545,7 +6681,10 @@ def test_exit_worktree_prompt_lists_paths_and_caches_decision(tmp_path):
     runner._select_popup = lambda title, opts, **k: seen.append((title, k.get("detail"))) or "Delete them"
 
     assert runner._should_delete_worktrees_on_exit() is True
-    assert str(tmp_path / "wt") in str(seen[0][1])  # the precise location is shown
+    # The precise location is shown. Checked against the detail LINES, not against the repr of
+    # the list holding them: repr escapes backslashes, so on Windows the real path is never a
+    # substring of it however right the prompt is.
+    assert any(str(tmp_path / "wt") in line for line in seen[0][1])
 
     seen.clear()
     assert runner._should_delete_worktrees_on_exit() is True  # cached
@@ -8756,8 +8895,12 @@ def test_screen_renderer_status_line_elides_long_cwd_from_left():
     assert visible.rstrip().endswith("session-1")
 
 
-def test_screen_renderer_status_line_notes_no_worktree(monkeypatch):
-    monkeypatch.setenv("HOME", "/Users/dev")
+def test_screen_renderer_status_line_notes_no_worktree():
+    # Built from the platform's OWN home rather than a monkeypatched $HOME: Windows resolves
+    # "~" from USERPROFILE and ignores HOME entirely, so setting HOME asserted nothing there
+    # while the point of this test — the "(no worktree)" note — applies on every platform.
+    home = os.path.expanduser("~")
+    cwd = os.path.join(home, "code", "repo")
     r = ScreenRenderer(5, 100, color_mode="truecolor")
     line = r.status_line(
         cols=100,
@@ -8769,10 +8912,10 @@ def test_screen_renderer_status_line_notes_no_worktree(monkeypatch):
         scroll_back=0,
         user_declined=[],
         short_session_fn=lambda s: "(none)",
-        cwd="/Users/dev/code/repo",
+        cwd=cwd,
     )
-    # The base path is shown, with the no-worktree mode noted right after it.
-    assert "~/code/repo (no worktree)" in line
+    # The base path is shown, home-abbreviated, with the no-worktree mode noted right after it.
+    assert f"~{os.sep}code{os.sep}repo (no worktree)" in line
 
 
 def test_status_line_shows_base_repo_directory_not_the_worktree(tmp_path):
@@ -10402,3 +10545,105 @@ def test_console_user_commit_prompt_lists_the_files(tmp_path, monkeypatch, capsy
     printed = capsys.readouterr().out
     assert "Committing 2 file(s)" in printed
     assert "one.txt" in printed and "two.txt" in printed
+
+
+# --- crash reports --------------------------------------------------------------
+
+
+def test_a_reactor_crash_is_written_down_where_the_user_can_find_it(tmp_path):
+    """When the reactor dies the terminal is being torn down in the same breath, so the
+    traceback goes with it. It has to land in a file instead, or every recurrence costs
+    another round of guesswork (this is exactly what happened to a scroll-related death)."""
+    from agitrack.proxy.crash import crash_message, write_crash_report
+
+    caught: RuntimeError
+    try:
+        raise RuntimeError("deque mutated during iteration")
+    except RuntimeError as raised:
+        caught = raised  # `except ... as` unbinds at the end of the block
+        path = write_crash_report(tmp_path, raised, context={"terminal": "40x120", "scrollback": 300})
+
+    assert path is not None and path.parent.name == ".agitrack"
+    text = path.read_text(encoding="utf-8")
+    assert "deque mutated during iteration" in text
+    assert "Traceback" in text  # the whole stack, not just the message
+    assert "terminal: 40x120" in text and "scrollback: 300" in text
+    message = crash_message(path, caught)
+    assert str(path) in message and "commits each turn" in message  # and it says work is safe
+
+
+def test_crash_reports_do_not_pile_up_forever(tmp_path):
+    from agitrack.proxy.crash import _KEEP_REPORTS, write_crash_report
+
+    error = RuntimeError("x")
+    for i in range(_KEEP_REPORTS + 4):
+        (tmp_path / ".agitrack").mkdir(exist_ok=True)
+        (tmp_path / ".agitrack" / f"crash-2026010{i}-000000.log").write_text("old", encoding="utf-8")
+    write_crash_report(tmp_path, error)
+    assert len(list((tmp_path / ".agitrack").glob("crash-*.log"))) == _KEEP_REPORTS
+
+
+def test_a_crash_report_that_cannot_be_written_is_not_a_second_crash(tmp_path):
+    from agitrack.proxy.crash import crash_message, write_crash_report
+
+    blocked = tmp_path / "nope"
+    blocked.write_text("a file where the directory should be", encoding="utf-8")
+    assert write_crash_report(blocked, RuntimeError("x")) is None
+    assert "stopped unexpectedly" in crash_message(None, RuntimeError("x"))
+
+
+def test_the_reactor_is_woken_when_the_pre_prompt_parse_finishes(tmp_path, monkeypatch):
+    """The prompt the user just pressed Enter on is HELD while this parse runs. Without a
+    wake it was released only on the next poll tick, so a parse that finished in 80 ms still
+    sat behind "checking existing git changes..." for up to a full second."""
+    from agitrack.proxy.commit_engine import CommitEngine
+
+    runner = make_runner()
+    engine = CommitEngine(runner.repo, runner.state, debug_fn=lambda m: None)
+    woken = threading.Event()
+
+    class _Backend:
+        def latest_session_id(self, root):
+            return "s1"
+
+        def export_session(self, root, session_id):
+            return None
+
+    session = runner.active
+    session.backend = _Backend()
+    session.worktree = tmp_path
+    session.agent_parse_active = False
+    session.agent_parse_thread = None
+    session.agent_parse_result = None
+
+    assert engine.start_parse(
+        session=session,
+        discover_session_id_fn=lambda: "s1",
+        debug_fn=lambda m: None,
+        on_finish=woken.set,
+    )
+    assert woken.wait(5), "the parse finished without waking the reactor"
+    session.agent_parse_thread.join(timeout=5)
+
+
+def test_a_dying_thread_is_recorded_not_painted_over_the_session(tmp_path, monkeypatch):
+    """stderr IS the alternate screen while the TUI is up: Python's default thread hook
+    would print a traceback straight over the user's session, leaving the display out of
+    step with the model (and looking exactly like aGiTrack breaking)."""
+    from agitrack.git import GitRepo
+
+    runner = make_runner(repo=GitRepo.init(tmp_path))
+    logged = []
+    monkeypatch.setattr(runner, "_debug", lambda message: logged.append(message))
+
+    class _Args:
+        thread = threading.current_thread()
+        exc_type = RuntimeError
+        exc_value = RuntimeError("worker exploded")
+        exc_traceback = None
+
+    runner._thread_excepthook(_Args())
+
+    assert any("died" in line and "worker exploded" in line for line in logged)
+    reports = list((tmp_path / ".agitrack").glob("crash-*.log"))
+    assert reports and "worker exploded" in reports[0].read_text(encoding="utf-8")

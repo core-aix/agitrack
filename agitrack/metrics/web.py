@@ -120,7 +120,9 @@ def _render_template(*, repo_name: str, repo_path: str, banner_html: str, payloa
     """Fill the page template. ``__DATA__`` goes LAST: the embedded JSON can itself contain the
     literal placeholder strings (a backtrace of aGiTrack's own source quotes ``__REPO__`` and
     friends), so substituting chrome after it would corrupt the payload."""
-    return (
+    from agitrack.metrics import ui
+
+    return ui.render(
         _TEMPLATE.replace("__REPO_NAME__", _escape(repo_name))
         .replace("__REPO__", _escape(repo_path))
         .replace("__UPDATE_BANNER__", banner_html)
@@ -610,16 +612,24 @@ _SHA_RE = re.compile(r"^[0-9a-fA-F]{4,64}$")
 
 
 def commit_diff(repo: GitRepo, sha: str) -> dict:
-    """The file diffs a single commit introduced (a diffstat + unified patch), for the
-    dashboard's local diff view — computed entirely from the local clone, so the dashboard
-    needs no GitHub. ``sha`` is validated as a hex object id before touching git."""
+    """One commit's message and the file diffs it introduced (a diffstat + unified patch),
+    computed entirely from the local clone so the dashboard needs no GitHub. ``sha`` is
+    validated as a hex object id before touching git.
+
+    The message rides along because the storyline shows it FIRST and only then offers the
+    file changes: one request answers both, and the static export's baked ``diff/<sha>.json``
+    covers both with no extra files."""
     if not _SHA_RE.match(sha or ""):
         return {"sha": sha, "diff": "", "error": "invalid commit id"}
     try:
         patch, truncated = repo.show_commit(sha)
     except Exception:
         return {"sha": sha, "diff": "", "error": "could not read this commit's diff"}
-    return {"sha": sha, "diff": patch, "truncated": truncated}
+    try:
+        message = repo.commit_message(sha)
+    except Exception:
+        message = ""
+    return {"sha": sha, "diff": patch, "truncated": truncated, "message": message}
 
 
 def initial_payload(
@@ -727,22 +737,22 @@ __PREBOOT_CSS__
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2064%2064'%3E%3Crect%20width='64'%20height='64'%20rx='13'%20fill='%23070b09'/%3E%3Ctext%20x='32'%20y='45'%20text-anchor='middle'%20font-family='ui-monospace,monospace'%20font-weight='700'%20font-size='42'%20letter-spacing='-1'%3E%3Ctspan%20fill='%23ffb454'%3Ea%3C/tspan%3E%3Ctspan%20fill='%233dffa0'%3EG%3C/tspan%3E%3C/text%3E%3C/svg%3E">
 __FONT_LINKS__
 <style>
-:root{
-  --ink:#070b09; --panel:#0c120e; --panel-2:#101813; --line:#1d2a21;
-  --phosphor:#3dffa0; --phosphor-dim:#1f7a52; --amber:#ffb454; --amber-dim:#8a5e2a;
-  --fg:#cfe7d8; --fg-dim:#7e998a; --red:#ff6b6b; --ops:#67b8d6;
-  --mono:"IBM Plex Mono",ui-monospace,monospace; --display:"VT323",var(--mono);
-}
+__UI_TOKENS__
 *{box-sizing:border-box;margin:0;padding:0}
+__UI_BASE_CSS__
 html{scroll-behavior:smooth}
-body{background:var(--ink);color:var(--fg);font-family:var(--mono);font-size:15px;line-height:1.6;overflow-x:hidden}
+body{background:var(--ink);color:var(--fg);font-family:var(--mono);font-size:15px;line-height:1.6}
 body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:30;
   background:repeating-linear-gradient(0deg,rgba(0,0,0,.22) 0 1px,transparent 1px 3px);opacity:.35}
 body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:31;
   background:radial-gradient(ellipse at 50% 12%,transparent 60%,rgba(0,0,0,.55) 100%)}
 ::selection{background:var(--phosphor);color:var(--ink)}
 a{color:var(--phosphor);text-decoration:none;border-bottom:1px solid var(--phosphor-dim)}
-a:hover{color:var(--ink);background:var(--phosphor)}
+/* This page answers a hovered link by INVERTING it — phosphor block, ink text — which is
+   affordance enough on its own. The shared rule's underline (for pages whose links are plain
+   text in a sentence) drew a line through the middle of that block as well, and the story and
+   learn entries in the header wear it most visibly. The footer opts back in for its own links. */
+a:hover{color:var(--ink);background:var(--phosphor);text-decoration:none}
 .wrap{max-width:1080px;margin:0 auto;padding:0 24px 80px}
 /* Initial-load animation. On a large repo the server sends the page chrome with no
    aggregates/log embedded; this loader shows while the browser fetches /data and /log,
@@ -798,6 +808,15 @@ body.booting .wrap>*:not(header):not(#booting){display:none}
   border:1px solid var(--phosphor-dim);border-radius:4px;padding:8px 18px;white-space:nowrap}
 .learncta:hover .lc-btn{background:var(--phosphor);color:var(--ink);border-color:var(--phosphor)}
 @media (max-width:640px){.learncta{flex-wrap:wrap}.learncta .lc-btn{margin-left:50px}}
+/* The storyline call-to-action, above the log: the same shape as the learn card in amber,
+   so the two entries read as siblings without competing for the same green. */
+.storycta{border-color:var(--amber-dim);
+  background:linear-gradient(135deg,rgba(255,180,84,.10),rgba(255,180,84,.02) 55%,rgba(103,184,214,.06))}
+.storycta:hover{border-color:var(--amber);box-shadow:0 8px 28px rgba(255,180,84,.14);
+  background:linear-gradient(135deg,rgba(255,180,84,.16),rgba(255,180,84,.05) 55%,rgba(103,184,214,.10))}
+.storycta .lc-text b,.storycta .lc-btn{color:var(--amber)}
+.storycta .lc-btn{border-color:var(--amber-dim)}
+.storycta:hover .lc-btn{background:var(--amber);color:var(--ink);border-color:var(--amber)}
 .insight.good{border-left-color:var(--phosphor)}
 .insight.good .isev{color:var(--phosphor)}
 /* Trend chip: the same metric measured on the earlier vs the later half of the window,
@@ -808,22 +827,10 @@ body.booting .wrap>*:not(header):not(#booting){display:none}
 .insightmore{margin-top:4px}
 .insightmore summary{cursor:pointer;color:var(--fg-dim);font-size:12px;padding:6px 0}
 .insightmore summary:hover{color:var(--phosphor)}
-.updatebanner{margin:0 0 14px;padding:9px 16px;border:1px solid var(--accent,#6be);border-radius:8px;
-  background:rgba(90,150,230,.12);color:var(--accent,#9cf);font-size:13px;text-align:center}
 /* The backtrace notice is a frozen top strip — always visible, like the sticky filter bar.
    Opaque so page content scrolls cleanly beneath it; the filter bar's top offset is set to this
    strip's height in JS so the two stack instead of overlapping. */
-.backtracebanner{position:sticky;top:0;z-index:25;margin:0;padding:10px 18px;background:var(--panel);
-  border-bottom:2px solid var(--amber-dim);color:var(--amber);font-size:12.5px;line-height:1.5;
-  text-align:center;box-shadow:0 4px 16px rgba(0,0,0,.55)}
-/* Same treatment as the learn banner's code chip, so a command reads identically on every page. */
-.backtracebanner code{color:var(--fg);background:var(--ink);padding:0 5px}
-/* The banner's call-to-action link is GREEN against the amber notice text, so the one
-   thing to click stands apart from the explanation. Styled explicitly (identical rule on
-   the learn page's .btbanner) because the two pages' global anchor colors differ, which
-   is what made the same demo banner render a different colour on each. */
-.backtracebanner a{color:var(--phosphor);border-bottom:1px solid var(--phosphor-dim)}
-.backtracebanner a:hover{color:var(--ink);background:var(--phosphor)}
+__UI_BANNER_CSS__
 @keyframes rise{from{transform:translateY(-100%)}to{transform:none}}
 
 header{padding:26px 0 18px}
@@ -861,7 +868,6 @@ header{padding:26px 0 18px}
   align-items:center;gap:8px;color:var(--phosphor);font-size:13px;white-space:nowrap;
   background:var(--panel);border:1px solid var(--phosphor-dim);padding:6px 12px;
   box-shadow:0 10px 26px rgba(0,0,0,.55)}
-.loading[hidden]{display:none}
 .loading .spin{width:13px;height:13px;border:2px solid var(--phosphor-dim);border-top-color:var(--phosphor);
   border-radius:50%;animation:spin .7s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
@@ -875,21 +881,7 @@ header{padding:26px 0 18px}
   background-image:linear-gradient(45deg,transparent 50%,var(--phosphor-dim) 50%),linear-gradient(135deg,var(--phosphor-dim) 50%,transparent 50%);
   background-position:calc(100% - 16px) 50%,calc(100% - 11px) 50%;background-size:5px 5px,5px 5px;background-repeat:no-repeat}
 .field select:focus{outline:none;border-color:var(--phosphor)}
-input[type=date]{background:var(--ink);color:var(--fg);border:1px solid var(--line);
-  font-family:var(--mono);font-size:13px;padding:6px 9px;cursor:pointer}
-input[type=date]:focus{outline:none;border-color:var(--phosphor)}
-input[type=date]::-webkit-calendar-picker-indicator{filter:invert(.7) sepia(1) hue-rotate(90deg)}
-/* custom date range: a popup anchored under the period select */
-.period-field{position:relative}
-.daterange{position:absolute;top:100%;right:0;z-index:30;margin-top:8px;background:var(--panel);
-  border:1px solid var(--phosphor-dim);padding:12px 14px;display:flex;gap:12px;align-items:flex-end;
-  box-shadow:0 10px 28px rgba(0,0,0,.6)}
-.daterange[hidden]{display:none}
-.dr-field{display:flex;flex-direction:column;gap:4px}
-.dr-field label{font-size:11px;color:var(--amber);letter-spacing:.6px;text-transform:uppercase}
-.dr-done{cursor:pointer;border:1px solid var(--phosphor);color:var(--phosphor);background:transparent;
-  font-family:var(--mono);font-size:12.5px;padding:6px 12px}
-.dr-done:hover{background:var(--phosphor);color:var(--ink)}
+__UI_RANGE_CSS__
 .reset{cursor:pointer;border:1px solid var(--amber);color:var(--amber);background:transparent;
   font-family:var(--mono);font-size:12.5px;padding:7px 12px;align-self:flex-end;margin-left:auto;white-space:nowrap}
 .reset:hover{background:var(--amber);color:var(--ink)}
@@ -1052,26 +1044,22 @@ h2.section::before{content:"# ";color:var(--amber)}
 .entry .tok.out{color:var(--phosphor);border-color:var(--phosphor-dim)}
 .entry .tok.dim{opacity:.7}
 .entry .squash{font-size:10.5px;color:var(--ops);border:1px solid var(--ops);padding:1px 6px;letter-spacing:.4px}
-.entry .detail{flex-basis:100%;width:100%;margin:8px 0 4px;border-left:2px solid var(--phosphor-dim);padding-left:14px;cursor:default}
-.entry .detail .dhead{color:var(--amber);font-size:12.5px;margin-bottom:4px}
+/* No rule of its own down the left: the log already draws the timeline rail beside every
+   entry, so a second vertical line for the expanded one was one stripe too many (and cost
+   width where a phone has least). The indent stays, so the detail still reads as belonging
+   to its row. */
+.entry .detail{flex-basis:100%;width:100%;margin:8px 0 4px;padding-left:14px;cursor:default}
+/* The diff toggle and the GitHub link sat flush against each other, reading as one control. */
+.entry .detail .dhead{color:var(--amber);font-size:12.5px;margin-bottom:4px;
+  display:flex;align-items:center;gap:14px;flex-wrap:wrap}
 .entry .detail .dmeta{color:var(--ops);font-size:12px;margin-bottom:6px}
-.entry .detail .dmsg{font-size:12.5px;color:var(--fg-dim);background:var(--ink);border:1px solid var(--line);
-  padding:4px 12px;max-height:440px;overflow:auto;word-break:break-word}
-/* local (off-GitHub) per-commit file diff — the button flips this one box to the diff, so in diff
-   mode the box drops its own frame and the .diffbox (with its own border/scroll) becomes the pane */
-.entry .detail .dmsg.diff{padding:0;border:none;background:none;max-height:none;overflow:visible}
-.entry .detail .diffbtn{margin-right:10px;font-family:inherit;font-size:11.5px;color:var(--phosphor);
-  background:transparent;border:1px solid var(--phosphor-dim);padding:1px 8px;cursor:pointer;letter-spacing:.3px}
-.entry .detail .diffbtn:hover{background:var(--phosphor);color:var(--ink)}
-.diffbox{border:1px solid var(--line);background:var(--ink);max-height:460px;overflow:auto;
-  font-size:12px;line-height:1.5;white-space:pre}
-.diffbox .dl{display:block;padding:0 10px}
-.diffbox .dfile{color:var(--amber);background:rgba(255,180,84,.06)}
-.diffbox .dhunk{color:var(--ops);background:rgba(103,184,214,.09)}
-.diffbox .dmeta2{color:var(--fg-dim)}
-.diffbox .dadd{color:var(--phosphor);background:rgba(61,255,160,.08)}
-.diffbox .ddel{color:var(--red);background:rgba(255,107,107,.08)}
-.dmsg .diffempty{color:var(--fg-dim);font-size:12px;font-style:italic;padding:8px 12px}
+/* The expanded commit message. No frame of its own: a bordered, inset box inside the
+   already-indented detail wasted horizontal space and read as a nested panel on a phone.
+   Scoped to nothing in particular ON PURPOSE — the files view renders the same element and
+   used to match none of this, so its messages came out in the page's much larger body font. */
+__UI_COMMIT_CSS__
+.dmsg .diffempty{color:var(--fg-dim);font-size:12px;font-style:italic;padding:8px 12px;line-height:1.55}
+.dmsg .diffempty b{color:var(--phosphor);font-style:normal}
 /* loading spinner shown while a detail / diff / file history is being fetched */
 .loadbox{display:flex;align-items:center;gap:10px;padding:14px 12px;color:var(--phosphor);font-size:12.5px}
 .loadbox .spin{width:15px;height:15px;border:2px solid var(--phosphor-dim);border-top-color:var(--phosphor);
@@ -1134,6 +1122,7 @@ h2.section::before{content:"# ";color:var(--amber)}
 /* ---- log tabs (commits / files) — title on its own line, tabs left below it ---- */
 .logsection-head{margin:38px 0 14px}
 .logsection-head h2.section{margin:0 0 12px}
+.logsection-head .storycta{margin:0 0 14px}
 .logtabs{display:flex;gap:8px;justify-content:flex-start}
 /* BOTH tabs are amber (like the reset button), never grey: a dim grey unselected tab read as
    "disabled" rather than "clickable". The selected one is told apart by a lit-up background,
@@ -1143,8 +1132,14 @@ h2.section::before{content:"# ";color:var(--amber)}
 .logtab.active{color:var(--ink);background:var(--amber);box-shadow:0 0 12px rgba(255,180,84,.35)}
 /* Hover on the unselected tab: a tint, so it never impersonates the filled selected state. */
 .logtab:not(.active):hover{background:rgba(255,180,84,.22)}
-.logpane[hidden]{display:none}
-.panehead{display:flex;justify-content:flex-end;align-items:center;margin:0 0 10px}
+.panehead{display:flex;justify-content:flex-end;align-items:center;margin:0}
+/* Tabs and the pane's control (sort / file filter) sit on ONE line, with room above them so
+   they read as the start of the log rather than part of the story card above. */
+.panebar{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;
+  margin:22px 0 12px}
+/* An author `display` beats the `hidden` attribute, so every hidden flex/grid box on this
+   page needs this to actually hide (the files filter showed in the commits view without it). */
+#head-files{margin:0 0 12px}
 
 /* ---- file browser (folder tree) — names flush-left, folders collapsible ---- */
 .filesearch{background:var(--ink);color:var(--fg);border:1px solid var(--line);font-family:var(--mono);
@@ -1184,10 +1179,8 @@ h2.section::before{content:"# ";color:var(--amber)}
 .fchange .fmeta{color:var(--ops);font-size:12px;margin-bottom:3px}
 .fchange .fsub{color:var(--fg);font-size:12.5px;overflow-wrap:anywhere}
 .fchange .fdetailc{margin-top:8px}
-.fchange .fdetailc[hidden]{display:none}
-.fchange .fdifftoggle{font-family:inherit;font-size:11.5px;color:var(--phosphor);background:transparent;
-  border:1px solid var(--phosphor-dim);padding:1px 8px;cursor:pointer;letter-spacing:.3px;margin-bottom:8px}
-.fchange .fdifftoggle:hover{background:var(--phosphor);color:var(--ink)}
+/* Look: shared (see ui.COMMIT_CSS). Only its spacing here belongs to this list. */
+.fchange .fdifftoggle{margin-bottom:8px}
 .fmore{padding:12px 16px;color:var(--fg-dim);font-size:12.5px}
 footer{margin-top:46px;padding-top:22px;border-top:1px dashed var(--line);color:var(--fg-dim);font-size:12.5px;
   display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap}
@@ -1217,7 +1210,7 @@ __UPDATE_BANNER__
 <div class="wrap">
   <header>
     <div class="brand"><span class="a">a</span>GiTrack<span class="sub">&nbsp;dashboard</span></div>
-    <div class="meta"><span class="tag">repo</span> <b>__REPO__</b><span id="branchmeta"> &nbsp;·&nbsp; <span class="tag">branch</span> <select id="f-branch" class="branchsel" title="View statistics and the commit log for a single branch"></select></span> &nbsp;·&nbsp; <span id="genat"></span> &nbsp;·&nbsp; <a class="flink" id="learnlink" href="learn" title="Let the backend agent coach you from your own interaction traces">&#127891; learn</a></div>
+    <div class="meta"><span class="tag">repo</span> <b>__REPO__</b><span id="branchmeta"> &nbsp;·&nbsp; <span class="tag">branch</span> <select id="f-branch" class="branchsel" title="View statistics and the commit log for a single branch"></select></span> &nbsp;·&nbsp; <span id="genat"></span> &nbsp;·&nbsp; <a class="flink" id="storylink" href="story" title="Read this repo's history as a story, written by the backend agent from the commits and their traces">&#128214; story</a> &nbsp;·&nbsp; <a class="flink" id="learnlink" href="learn" title="Let the backend agent coach you from your own interaction traces">&#127891; learn</a></div>
   </header>
 
   <div class="booting" id="booting">
@@ -1232,12 +1225,7 @@ __UPDATE_BANNER__
     <div class="field"><label for="f-backend">backend</label><select id="f-backend"></select></div>
     <div class="field"><label for="f-model">model</label><select id="f-model"></select></div>
     <div class="field period-field"><label for="f-period">range</label><select id="f-period">
-      <option value="">all time</option>
-      <option value="1">last 24 hours</option>
-      <option value="7">last 7 days</option>
-      <option value="30">last 30 days</option>
-      <option value="90">last 90 days</option>
-      <option value="custom">custom range…</option>
+      __UI_RANGE_OPTIONS__
     </select>
       <div class="daterange" id="daterange" hidden>
         <div class="dr-field"><label for="f-from">from</label><input type="date" id="f-from"></div>
@@ -1300,11 +1288,27 @@ __UPDATE_BANNER__
 
   <div class="logsection-head">
     <h2 class="section">log</h2>
+    <a class="learncta storycta" id="storycta" href="story" title="Open the storyline">
+      <span class="lc-icon">&#128214;</span>
+      <span class="lc-text"><b>Read it as a story.</b>
+      The same history below, zoomed out: what changed, why, and what the developers were
+      working out at each turn.</span>
+      <span class="lc-btn">open story &rarr;</span>
+    </a>
+  </div>
+  <div class="panebar">
     <div class="logtabs">
       <button class="logtab active" data-tab="commits">commits</button>
       <button class="logtab" data-tab="files" id="tab-files-btn">files</button>
     </div>
+    <div class="logsort"><label for="f-sort">sort</label><select id="f-sort" title="Sort the filtered commits">
+      <option value="date">newest first</option>
+      <option value="lines">most lines changed</option>
+      <option value="tokens">most output tokens</option>
+    </select></div>
   </div>
+  <div class="panehead" id="head-files" hidden><input id="file-search" class="filesearch" type="search" placeholder="filter files…" autocomplete="off"></div>
+
   <div class="logpane" id="pane-commits">
     <div class="logintro" id="logintro" hidden>Each entry below is one <b>reconstructed agent turn</b> from your
     local session transcripts: what was asked, the agent's reply, and the file changes it recovered, shown like a
@@ -1312,20 +1316,14 @@ __UPDATE_BANNER__
     with the agent. Nothing here has been written to git; a turn with a <b>committed</b> badge is already in your
     history with aGiTrack metadata, and <code>agitrack --backtrace commit</code> bakes the rest into real commits
     on a new branch.</div>
-    <div class="panehead"><div class="logsort"><label for="f-sort">sort</label><select id="f-sort" title="Sort the filtered commits">
-      <option value="date">newest first</option>
-      <option value="lines">most lines changed</option>
-      <option value="tokens">most output tokens</option>
-    </select></div></div>
     <div class="log" id="commitlog"></div>
   </div>
   <div class="logpane" id="pane-files" hidden>
-    <div class="panehead"><input id="file-search" class="filesearch" type="search" placeholder="filter files…" autocomplete="off"></div>
     <div class="filebrowse" id="filebrowse"></div>
   </div>
 
   <footer>
-    <span>aGiTrack · agent + git tracking · metrics from commit metadata &nbsp;·&nbsp;
+    <span>aGiTrack &nbsp;·&nbsp;
       <a class="flink" href="http://agitrack.core-aix.org/" target="_blank" rel="noopener noreferrer">website</a> &nbsp;·&nbsp;
       <a class="flink" href="https://github.com/core-aix/agitrack" target="_blank" rel="noopener noreferrer">GitHub</a></span>
     <span id="count"></span>
@@ -1388,11 +1386,9 @@ const LIVE = location.protocol.indexOf("http") === 0;
 // commit and no committer behind a row, so the fabricated commit-hash and committer chrome
 // are hidden (see hideFabricatedChrome). Everything shown is real transcript data.
 const BACKTRACE = !!INIT.backtrace;
-const $ = id => document.getElementById(id);
-const fmt = n => (n||0).toLocaleString("en-US");
+__UI_DOM_JS__
+const _pageEsc = null;
 const pct = (a,b) => b ? (a/b*100).toFixed(1)+"%" : "0%";
-const esc = s => (s||"").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
-const kfmt = n => { n=n||0; return n>=1000 ? (n/1000).toFixed(n>=10000?0:1)+"k" : ""+n; };
 // Commit-log subjects can be very long; cap the displayed line at 120 chars with an
 // ellipsis (the full subject stays available via the row's hover title and the expanded
 // commit message). The ellipsis counts toward the cap, so the result never exceeds 120.
@@ -1425,6 +1421,37 @@ function qs(extra){
   for(const k in (extra||{})) p.set(k, extra[k]);
   return p.toString();
 }
+// Coming back from the story or learn page is a fresh page load, so the dashboard would
+// crunch the whole git log again behind the boot animation before showing anything. The
+// last view is kept for this session and painted IMMEDIATELY, then the real fetch replaces
+// it. A hard refresh (reload) skips the snapshot, which is what a refresh is for.
+const SNAP_KEY = "agitrack:dash:" + location.pathname;
+const SNAP_MAX = 2_000_000;   // never fill sessionStorage with a huge repo's payload
+function snapshotSave(){
+  try{
+    if(!AGG || !LOGPAGE) return;
+    const blob = JSON.stringify({head:HEAD, agg:AGG, options:OPTIONS, generated:GENERATED, ts:TS,
+                                 span:SPAN, shared:SHARED, insights:INSIGHTS, log:LOGPAGE,
+                                 branch:state.branch, at:Date.now()});
+    if(blob.length <= SNAP_MAX) sessionStorage.setItem(SNAP_KEY, blob);
+  }catch(e){}   // private mode, quota, anything: the snapshot is an optimisation only
+}
+function snapshotRestore(){
+  try{
+    const nav = performance.getEntriesByType && performance.getEntriesByType("navigation")[0];
+    if(nav && nav.type === "reload") return false;   // an explicit refresh means re-read
+    const blob = sessionStorage.getItem(SNAP_KEY);
+    if(!blob) return false;
+    const d = JSON.parse(blob);
+    if(!d || !d.agg || !d.log) return false;
+    HEAD=d.head; AGG=d.agg; OPTIONS=d.options; GENERATED=d.generated; TS=d.ts||{t:[]};
+    if(d.span) SPAN=d.span; if(d.shared) SHARED=d.shared;
+    if(d.insights !== undefined) INSIGHTS=d.insights;
+    LOGPAGE=d.log; if(d.branch) state.branch=d.branch;
+    return true;
+  }catch(e){ return false; }
+}
+
 async function loadAgg(){
   try{ const r = await fetch("data?"+qs(), {cache:"no-store"}); if(r.ok){
     const d = await r.json(); HEAD=d.head; AGG=d.agg; OPTIONS=d.options; GENERATED=d.generated_at;
@@ -1433,87 +1460,20 @@ async function loadAgg(){
     // The server reports which branch it actually served (e.g. it fell back to the
     // default if the requested one vanished); reflect that in the state + header.
     if(d.branch !== undefined){ state.branch = d.branch; setBranchLabel(d.branch); }
-    setOffline(false); return true; } }
+    setOffline(false); snapshotSave(); return true; } }
   catch(e){ if(LIVE) setOffline(true); }  // network failure ⇒ server unreachable
   return false;
 }
 async function loadLog(offset){
   try{ const r = await fetch("log?"+qs({offset:offset||0, limit:PAGE_SIZE, sort:state.sort}), {cache:"no-store"});
-    if(r.ok){ LOGPAGE = await r.json(); setOffline(false); return true; } }
+    if(r.ok){ LOGPAGE = await r.json(); setOffline(false); snapshotSave(); return true; } }
   catch(e){ if(LIVE) setOffline(true); }
   return false;
 }
 
 // --- minimal Markdown for the expanded commit message ---
-function md(src){
-  const lines = (src||"").replace(/\r\n/g,"\n").split("\n");
-  const inline = t => esc(t)
-    .replace(/`([^`]+)`/g, "<code>$1</code>")
-    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-    .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>")
-    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
-  let html="", inCode=false, code=[], inList=false, inMeta=false, para=[];
-  const closeList = () => { if(inList){ html+="</ul>"; inList=false; } };
-  // Consecutive non-blank lines are ONE paragraph, their source breaks kept as <br>. A
-  // blank line still starts a new paragraph. The " " before each <br> is what remains when
-  // reflowParagraphs() hides the break on a narrow screen, so the lines join as prose.
-  // Metadata lines (key: value, after the "aGiTrack Metadata" heading) are marked "keep":
-  // their breaks are structure, never re-flowed.
-  const flushPara = () => {
-    if(!para.length) return;
-    html += `<p class="mdp${inMeta?" keep":""}">` + para.map(inline).join(" <br>") + "</p>";
-    para = [];
-  };
-  for(const raw of lines){
-    if(raw.trimStart().startsWith("```")){
-      flushPara();
-      if(inCode){ html+="<pre class=\"md-code\">"+esc(code.join("\n"))+"</pre>"; code=[]; inCode=false; }
-      else { closeList(); inCode=true; }
-      continue;
-    }
-    if(inCode){ code.push(raw); continue; }
-    const h = raw.match(/^(#{1,6})\s+(.*)$/);
-    if(h){
-      flushPara(); closeList();
-      if(/agitrack\s+metadata/i.test(h[2])) inMeta = true;
-      const lvl=Math.min(6,h[1].length+2); html+=`<h${lvl} class="md-h">${inline(h[2])}</h${lvl}>`; continue;
-    }
-    const li = raw.match(/^\s*[-*+]\s+(.*)$/);
-    if(li){ flushPara(); if(!inList){ html+="<ul>"; inList=true; } html+="<li>"+inline(li[1])+"</li>"; continue; }
-    if(raw.trim()===""){ flushPara(); closeList(); continue; }
-    para.push(raw);
-  }
-  flushPara();
-  if(inCode){ html+="<pre class=\"md-code\">"+esc(code.join("\n"))+"</pre>"; }
-  closeList();
-  return html;
-}
-
-// Commit messages are hard-wrapped by the writer (~72 chars). When the rendering column is
-// narrower than that, every source line wraps AGAIN and the text reads as ragged fragments.
-// So a paragraph the layout wraps further drops its single line breaks and flows as prose;
-// one that fits keeps every break exactly as written. Blank-line paragraph breaks always
-// stay, as does the metadata block. Measured on the un-joined text, so the decision is
-// about the ORIGINAL lines; re-run on resize.
-function reflowParagraphs(root){
-  if(!root || !root.querySelectorAll) return;
-  for(const p of root.querySelectorAll("p.mdp:not(.keep)")){
-    p.classList.remove("reflow");
-    const breaks = p.getElementsByTagName("br").length;
-    if(!breaks) continue;
-    const lh = parseFloat(getComputedStyle(p).lineHeight) || 16;
-    const range = document.createRange();
-    range.selectNodeContents(p);
-    // One rect per line box — but inline <code> sits a couple of pixels off its line, so
-    // cluster by line height instead of counting distinct tops.
-    const tops = [];
-    for(const r of range.getClientRects()){
-      if(!r.height) continue;
-      if(!tops.some(t => Math.abs(t - r.top) < lh * 0.6)) tops.push(r.top);
-    }
-    if(tops.length > breaks + 1) p.classList.add("reflow");
-  }
-}
+__UI_COMMIT_JS__
+const md = commitMd;
 
 // `min` (default 0) is the low end of the scale: the width maps [min, max] → [0, 100],
 // so passing the smallest value in the set as `min` spreads the bars across the full
@@ -2033,9 +1993,24 @@ function toggleDetail(i){
 // helper that turns a raw unified diff into HTML — a binary file (no text diff) or an empty
 // diff shows a clear hint instead of a blank pane.
 const SPIN = '<div class="loadbox"><span class="spin"></span> loading…</div>';
+// An empty diff means something different in a reconstruction than on the live dashboard.
+// There, no diff means the commit changed nothing. Here it usually means the change was
+// made in a way the transcript never recorded as an edit — a shell command, a formatter, a
+// generated file — because a reconstruction can only see the agent's file-editing tool
+// calls. Saying "no changes" would be a plain untruth, so this says what it can and cannot
+// know, and points at the fix.
+const BACKTRACE_NO_DIFF =
+  '<div class="diffempty">No file changes were recovered for this turn.<br><br>' +
+  'A backtrace is reconstructed from your agent\'s local transcript, which records the ' +
+  'file-editing tool calls but not every way code can change — edits applied through shell ' +
+  'commands, formatters, or generated files leave no edit to read, so their diffs cannot be ' +
+  'recovered after the fact.<br><br>' +
+  'Run your agent through <b>aGiTrack</b> from now on and this stops being guesswork: each ' +
+  'turn is committed as it happens, with its real diff, tokens and the conversation that ' +
+  'produced it.</div>';
 function diffHtml(text, truncated){
   const t = (text||"").trim();
-  if(!t) return '<div class="diffempty">no changes to show for this file</div>';
+  if(!t) return BACKTRACE ? BACKTRACE_NO_DIFF : '<div class="diffempty">no changes to show for this file</div>';
   if(/Binary files .* differ/.test(t) && !/^@@/m.test(t)) return '<div class="diffempty">binary file — no text diff to show</div>';
   return renderDiff(text) + (truncated?'<div class="diffempty">…diff truncated (very large diff)</div>':"");
 }
@@ -2063,19 +2038,6 @@ async function toggleDiff(i){
     _diffCache[c.sha] = html;
     apply(html);  // apply() no-ops if the user flipped back to the message mid-fetch
   }catch(e){ apply('<div class="diffempty">couldn\'t load the diff (server unreachable)</div>'); }
-}
-// Color a unified diff (diffstat + patch) line-by-line: file headers, hunk headers, +adds, −dels.
-function renderDiff(text){
-  const rows = (text||"").replace(/\r\n/g,"\n").replace(/\n+$/,"").split("\n").map(raw => {
-    let cls = "dl";
-    if(/^(diff --git |index |new file|deleted file|similarity |rename |old mode|new mode)/.test(raw)) cls="dl dfile";
-    else if(raw.startsWith("@@")) cls="dl dhunk";
-    else if(raw.startsWith("+++")||raw.startsWith("---")) cls="dl dmeta2";
-    else if(raw.startsWith("+")) cls="dl dadd";
-    else if(raw.startsWith("-")) cls="dl ddel";
-    return '<span class="'+cls+'">'+(esc(raw)||"&nbsp;")+'</span>';
-  });
-  return '<pre class="diffbox">'+rows.join("")+'</pre>';
 }
 
 function fillSelect(id, values, allLabel, keep){
@@ -2138,12 +2100,7 @@ async function refresh(){
 }
 
 // --- time range ---
-function dateToTs(value, endOfDay){
-  if(!value) return 0;
-  const ts = Date.parse(value + "T00:00:00Z")/1000;
-  return isNaN(ts) ? 0 : (endOfDay ? ts + DAY - 1 : ts);
-}
-const ymd = ts => ts ? new Date(ts*1000).toISOString().slice(0,10) : "";
+__UI_RANGE_JS__
 // Bound the native date pickers to the actual history span.
 function setDateBounds(){
   const lo = ymd(SPAN.from), hi = ymd(SPAN.to);
@@ -2224,6 +2181,12 @@ function showLogTab(tab){
   const pc = $("pane-commits"), pf = $("pane-files");
   if(pc) pc.hidden = tab !== "commits";
   if(pf) pf.hidden = tab !== "files";
+  // The tabs and the pane's own control (sort / file filter) share one row, so the control
+  // has to follow the tab.
+  // The file filter does nothing in the commit view, so it is only there for the files tab,
+  // on its own line under the tabs (the sort control keeps the right-hand end of that row).
+  const hf = $("head-files");
+  if(hf) hf.hidden = tab !== "files";
 }
 function fileChangeHtml(c, i){
   const when = c.ts ? new Date(c.ts*1000).toISOString().slice(0,16).replace("T"," ")+" UTC" : "";
@@ -2338,6 +2301,12 @@ async function init(){
   // real aggregates + first log page, then drop the loader and render. A big repo's
   // git-log crunch happens here, behind the animation, instead of blocking first paint.
   if(!HAVE_DATA){
+    // Paint the previous view first when there is one (returning from story/learn), so the
+    // page is immediately usable; the fetch below then quietly brings it up to date.
+    if(snapshotRestore()){
+      document.body.classList.remove("booting");
+      syncFilters(); renderAgg(); renderLog();
+    }
     await loadAgg(); await loadLog(0);
     document.body.classList.remove("booting");
   }
@@ -2360,18 +2329,12 @@ async function init(){
   $("f-sort").value = state.sort;
   $("f-sort").onchange = async e => { state.sort = e.target.value; showLoading(true);
     try{ if(await loadLog(0)) renderLog(); } finally { showLoading(false); } };
-  // "custom range…" reveals a date-range popup anchored under the select; the
-  // presets and "all time" hide it.
+  // "custom range…" reveals a date-range popup anchored under the select; the presets and
+  // "all time" hide it. Wired by the shared helper (ui.RANGE_JS), so the story page's copy
+  // of this control behaves identically - including re-opening the popup when "custom" is
+  // picked again, which fires no change event and so used to do nothing at all.
   const showDateRange = on => { $("daterange").hidden = !on; };
-  $("f-period").onchange = () => { showDateRange($("f-period").value === "custom"); applyPeriod(); applyFilters(); };
-  const onDate = () => { $("f-period").value = "custom"; applyPeriod(); applyFilters(); };
-  $("f-from").onchange = onDate;
-  $("f-to").onchange = onDate;
-  $("dr-done").onclick = () => showDateRange(false);
-  // Dismiss the popup on a click outside the period control.
-  document.addEventListener("click", e => {
-    if(!$("daterange").hidden && !e.target.closest(".period-field")) showDateRange(false);
-  });
+  bindRangeControl(() => { applyPeriod(); applyFilters(); });
   $("reset").onclick = () => {
     state.author=state.backend=state.model="";
     state.branch=DEFAULT_BRANCH;  // back to the branch the page loaded for

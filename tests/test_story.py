@@ -1,0 +1,1332 @@
+"""The storyline page (`agitrack/metrics/story.py`): the repo's history told as moments.
+
+Real temp git repos throughout, so the segmentation, the store, the incremental tellings and
+both servers' endpoints run for real. The only thing faked is the backend agent (a queue of
+canned JSON replies), which is also how these tests pin the honesty rules: a commit id the
+model invents is dropped, a quote is always read back from the real commit, and no commit it
+was given may fall out of the story.
+
+The file is laid out the way the feature works, so a gap is visible as a gap:
+
+* SHAPE OF THE HISTORY - sittings of work, parts, how many parts a history deserves
+* TELLING IT          - what a build covers, and what it may never do
+* ZOOMING             - parts, the moments inside one, which days to tell, going further back
+* WHEN IT GOES WRONG  - bad replies, dead backends, stopping
+* HOW IT IS WRITTEN   - the storyteller's instructions
+* THE PAGE            - every control, and what it looks like
+* THE SERVER          - state, routes, and both dashboards
+
+What is SHARED with the dashboard and the learn page (palette, banners, the commit renderer,
+phone rules) is not tested here: it is one contract, in tests/test_web_ui.py.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import shutil
+import subprocess
+import threading
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+import pytest
+
+from agitrack.backends.base import AgentResult, TokenUsage
+from agitrack.commits import build_agent_commit_message
+from agitrack.git import GitRepo
+from agitrack.metrics import build_server
+from agitrack.metrics import learn, story, ui
+from agitrack.metrics.collect import CommitStat, build_dashboard
+
+DAY = 86400
+
+
+# --------------------------------------------------------------------------- helpers
+
+
+class _QueuedBackend:
+    """Stands in for the real backend: hands out the next canned reply per call."""
+
+    def __init__(self, replies: list[str]) -> None:
+        self.replies = list(replies)
+        self.prompts: list[str] = []
+
+    def run(
+        self, prompt, *, model, session_id, bare=False, system_prompt=None, commit_guidance=True, timeout_seconds=None
+    ):
+        self.prompts.append(prompt)
+        reply = self.replies.pop(0) if self.replies else "{}"
+        if isinstance(reply, Exception):
+            raise reply
+        return AgentResult(
+            backend="claude",
+            session_id=None,
+            model=model,
+            final_response=reply,
+            exit_code=0,
+            tokens=TokenUsage(),
+        )
+
+
+def _fake_agent(monkeypatch, replies):
+    fake = _QueuedBackend(replies)
+    monkeypatch.setattr(learn.LearningBackendChoice, "build", lambda self: fake)
+    monkeypatch.setattr(
+        learn,
+        "resolve_learning_backend",
+        lambda root: learn.LearningBackendChoice(
+            backend_name="claude", model="claude-opus-5", backend_source="config", model_source="config"
+        ),
+    )
+    return fake
+
+
+def _stat(sha_char: str, prompt: str, ts: int, *, kind: str = "agent", subject: str = "") -> CommitStat:
+    return CommitStat(
+        sha=sha_char * 40,
+        author="tester",
+        email="t@t",
+        subject=subject or f"<aGiTrack> {prompt[:40]}",
+        kind=kind,
+        timestamp=ts,
+        prompt=prompt,
+        user_prompts=[prompt],
+        tokens={"input": 1000, "output": 200},
+        insertions=30,
+        deletions=5,
+    )
+
+
+def _moment_reply(moments) -> str:
+    return json.dumps({"moments": moments})
+
+
+_ARC = json.dumps(
+    {
+        "title": "How the parser learned to read",
+        "tagline": "one repo, several minds, a lot of retries",
+        "arc": "It started as a script and ended as a tool.",
+        "acts": [{"title": "the beginning", "blurb": "first light", "start": 1}],
+    }
+)
+
+
+def _repo_with_history(tmp_path: Path, *, prompts, gap_days=1, start=1_750_000_000) -> GitRepo:
+    """A real repo whose commits carry aGiTrack agent metadata and interaction traces,
+    spaced far enough apart that each becomes its own episode."""
+    repo = GitRepo.init(tmp_path)
+    # GitRepo.init's seed commit is stamped NOW, which would sit after this fabricated
+    # timeline and make "what landed since" meaningless; date it just before the story.
+    seed = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(start - DAY))
+    repo._run(
+        # --amend keeps the original author date, so GIT_AUTHOR_DATE alone would not move it.
+        ["git", "commit", "-q", "--amend", "--no-edit", "--allow-empty", "--date", seed],
+        env={"GIT_AUTHOR_DATE": seed, "GIT_COMMITTER_DATE": seed},
+    )
+    for i, prompt in enumerate(prompts):
+        (tmp_path / f"f{i}.py").write_text("\n".join(f"line {n}" for n in range(10 + i)), encoding="utf-8")
+        repo.stage_paths([f"f{i}.py"])
+        when = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(start + i * gap_days * DAY))
+        message = build_agent_commit_message(
+            latest_prompt=prompt,
+            trace=[{"role": "user", "content": prompt}, {"role": "agent", "content": "done"}],
+            backend="claude",
+            backend_session_id="ses-1",
+            agitrack_session_id="agit-1",
+            model="claude-opus-5",
+            token_usage={"input": 900, "output": 120},
+        )
+        repo._run(
+            ["git", "commit", "-q", "-F", "-"],
+            input_text=message,
+            env={"GIT_AUTHOR_DATE": when, "GIT_COMMITTER_DATE": when},
+        )
+    return repo
+
+
+def _view_of(repo: GitRepo):
+    from agitrack.metrics.files import git_browser
+    from agitrack.metrics.insights import context_from_browser
+
+    dash = build_dashboard(repo)
+    browser = git_browser(repo, dash.stats, "HEAD")
+    _files, sha_paths = context_from_browser(browser, dash.stats)
+    return dash.stats, sha_paths
+
+
+# --------------------------------------------------------------------------- segmentation
+
+
+_RETRY_NUDGE_MARK = "your previous answer could not be used"
+
+
+def _page(tmp_path: Path = Path(".")) -> str:
+    """The storyline page, rendered."""
+    return story.story_html(tmp_path)
+
+
+def _get(url: str) -> str:
+    with urllib.request.urlopen(url, timeout=5) as response:
+        return response.read().decode("utf-8")
+
+
+def _post(url: str, payload: dict) -> dict:
+    request = urllib.request.Request(
+        url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"}, method="POST"
+    )
+    with urllib.request.urlopen(request, timeout=5) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+_DOM_STUB = """
+const noop = () => {};
+function stubEl() {
+  return {
+    addEventListener: noop, removeEventListener: noop, remove: noop, appendChild: noop,
+    insertBefore: noop, querySelector: () => stubEl(), querySelectorAll: () => [],
+    classList: {add: noop, remove: noop, toggle: noop, contains: () => false},
+    style: {}, dataset: {}, textContent: "", innerHTML: "", hidden: false, value: "",
+    options: [], children: [], parentNode: {insertBefore: noop}, scrollIntoView: noop,
+    getBoundingClientRect: () => ({top: 0, bottom: 0, right: 0, width: 0}),
+    animate: () => ({cancel: noop}), closest: () => null, focus: noop, click: noop, disabled: false,
+  };
+}
+global.document = {
+  // The dashboard boots from a JSON payload embedded in the page; hand it an empty object
+  // rather than an empty string, which is not JSON.
+  getElementById: (id) => (id === "agitrack-data" ? Object.assign(stubEl(), {textContent: "{}"}) : stubEl()),
+  querySelector: () => stubEl(), querySelectorAll: () => [],
+  createElement: () => stubEl(), addEventListener: noop, body: stubEl(),
+  documentElement: stubEl(), head: Object.assign(stubEl(), {insertAdjacentHTML: noop}),
+};
+global.location = {hash: "", origin: "x", protocol: "http:", pathname: "/", href: "http://x/"};
+global.sessionStorage = {getItem: () => null, setItem: noop, removeItem: noop};
+global.window = {
+  matchMedia: () => ({matches: false}), addEventListener: noop,
+  location: global.location,
+  IntersectionObserver: function () { this.observe = noop; this.disconnect = noop; this.unobserve = noop; },
+};
+global.IntersectionObserver = global.window.IntersectionObserver;
+global.fetch = () => new Promise(() => {});
+global.history = {replaceState: noop, length: 1};
+global.performance = {now: () => 0};
+global.requestAnimationFrame = noop;
+global.setInterval = () => 0; global.clearInterval = noop;
+global.setTimeout = () => 0; global.clearTimeout = noop;
+try { new Function(SOURCE)(); } catch (e) { console.log(e.constructor.name + ": " + e.message); process.exit(1); }
+"""
+
+
+# ============================================================================
+# SHAPE OF THE HISTORY: sittings of work, parts, and how many there are
+# ============================================================================
+
+
+def test_episodes_break_where_the_work_actually_paused():
+    base = 1_750_000_000
+    stats = [
+        _stat("a", "start the parser", base),
+        _stat("b", "keep going", base + 600),  # same sitting
+        _stat("c", "next day's idea", base + 2 * DAY),  # a real pause
+    ]
+    episodes = story.segment_episodes(stats)
+    assert [len(e.stats) for e in episodes] == [2, 1]
+    assert episodes[0].insertions == 60 and episodes[0].tokens == 2400
+
+
+def test_one_marathon_sitting_still_becomes_several_beats():
+    base = 1_750_000_000
+    stats = [_stat(chr(ord("a") + i), f"step {i}", base + i * 60) for i in range(20)]
+    episodes = story.segment_episodes(stats)
+    assert len(episodes) == 2  # capped at _EPISODE_MAX_COMMITS, not one 20-commit blob
+    assert all(len(e.stats) <= story._EPISODE_MAX_COMMITS for e in episodes)
+
+
+def test_housekeeping_commits_are_not_story():
+    base = 1_750_000_000
+    stats = [_stat("a", "real work", base), _stat("b", "", base + 60, kind="agitrack-ops")]
+    assert [s.short for s in story.story_stats(stats)] == ["a" * 7]
+
+
+def test_the_outline_needs_no_agent_at_all():
+    base = 1_750_000_000
+    rows = story.outline([_stat("a", "first thing", base), _stat("b", "later thing", base + 3 * DAY)])
+    assert [r["title"] for r in rows][0].startswith("<aGiTrack> later thing")  # newest first
+    assert rows[0]["prompt"] == "later thing"  # the developer's own words, unedited
+    assert rows[0]["commits"] == 1
+
+
+def test_eras_are_split_by_us_not_by_the_model():
+    """Letting the agent choose the groupings AND name them put 26 of 44 moments in the last
+    act, titled after its first three ("Windows Finally Gets Invited In" for a month that was
+    mostly other things). Boundaries are ours; naming is all the agent is asked for."""
+    moments = [
+        {"id": f"c{i}", "when": "2026-06-%02d" % (i + 1), "from": 1_000 + i * 100, "to": 1_000 + i * 100 + 50}
+        for i in range(44)
+    ]
+    slices = story.act_slices(moments)
+    assert len(slices) == 5
+    assert slices[0][0] == 0 and slices[-1][1] == len(moments) - 1  # every moment is in an era
+    for (start, end), (next_start, _) in zip(slices, slices[1:]):
+        assert next_start == end + 1  # contiguous, no gaps and no overlaps
+    sizes = [end - start + 1 for start, end in slices]
+    assert max(sizes) - min(sizes) <= 5  # and no era swallows the story
+    assert story.act_slices(moments[:3]) == [(0, 2)]  # a tiny story is one era
+    assert story.act_slices([]) == []
+
+
+def test_an_era_boundary_prefers_a_real_pause_in_the_work():
+    moments = []
+    for i in range(12):
+        start = 1_000 + i * 100 + (5_000 if i >= 7 else 0)  # a long gap before moment 7
+        moments.append({"id": f"c{i}", "when": "d", "from": start, "to": start + 50})
+    slices = story.act_slices(moments, target=2)
+    assert slices[1][0] == 7  # the era starts where the work actually restarted
+
+
+def test_the_number_of_parts_follows_the_history():
+    """A fortnight is not five acts and two years is not five either."""
+
+    def episodes(days, count):
+        step = days * DAY / max(count - 1, 1)
+        return [
+            story.Episode(index=i, stats=[_stat(chr(97 + i % 26), "p", int(1_750_000_000 + i * step))])
+            for i in range(count)
+        ]
+
+    assert story.part_target(episodes(7, 8)) == 2  # a week of work is not five acts
+    assert story.part_target(episodes(55, 93)) == 5  # this repo, as it stands
+    assert story.part_target(episodes(365, 400)) == 8  # and a long one is capped, not endless
+    assert story.part_target(episodes(1, 2)) == 2
+
+
+def test_the_agent_only_names_the_eras(tmp_path, monkeypatch):
+    repo = _repo_with_history(tmp_path, prompts=[f"step {i}" for i in range(8)])
+    monkeypatch.setattr(story, "_BATCH_EPISODES", 30)  # one batch covers this whole toy history
+    stats, sha_paths = _view_of(repo)
+    ordered = [stat.short for stat in story.story_stats(stats)]
+    _fake_agent(
+        monkeypatch,
+        [
+            _moment_reply(
+                [
+                    {"id": f"c{i}", "title": f"Moment {i}", "summary": "s", "shas": [sha]}
+                    for i, sha in enumerate(ordered)
+                ]
+            ),
+            json.dumps(
+                {
+                    "title": "A title",
+                    "tagline": "A tagline",
+                    "arc": "It happened.",
+                    # named by number; the model never says where an era starts
+                    "eras": [
+                        {"n": 1, "title": "The beginning", "blurb": "b"},
+                        {"n": 2, "title": "The rest", "blurb": "b"},
+                    ],
+                }
+            ),
+        ],
+    )
+    built = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
+    eras = built["eras"]
+    assert [era["title"] for era in eras] == ["The beginning", "The rest"]
+    # Identity is the era's PLACE, not its name: the overview is re-run on every telling, so
+    # a renamed era must stay the same era (part links and "tell this part" depend on it).
+    assert [era["id"] for era in eras] == ["part-1", "part-2"]
+    # The eras span the WHOLE history, whatever was written out: they are the coarse story.
+    assert eras[0]["from"] <= min(stat.timestamp for stat in story.story_stats(stats))
+    assert eras[-1]["to"] >= max(stat.timestamp for stat in story.story_stats(stats))
+    assert sum(era["commits"] for era in eras) == len(story.story_stats(stats))
+    # An era the model forgot to name still gets a label rather than an empty heading.
+    assert all(era["title"] and era["spark"] for era in eras)
+
+
+# ============================================================================
+# TELLING IT: what a build covers, and what it may never do
+# ============================================================================
+
+
+def test_build_writes_moments_with_real_commits_and_quoted_asks(tmp_path, monkeypatch):
+    repo = _repo_with_history(tmp_path, prompts=["make the parser stream", "now make it fast"])
+    stats, sha_paths = _view_of(repo)
+    shas = [stat.short for stat in story.story_stats(stats)]
+    fake = _fake_agent(
+        monkeypatch,
+        [
+            _moment_reply(
+                [
+                    {
+                        "id": "streaming",
+                        "title": "The parser learns to stream",
+                        "kicker": "turning point",
+                        "emoji": "🌊",
+                        "summary": "Reading the file in one gulp had to go.",
+                        "detail": "It started with **memory**.\n\nThen it got fast.",
+                        # shas[0] is the repo's seed commit; the first real turn is shas[1].
+                        "thoughts": [{"sha": shas[1], "note": "They wanted it incremental from the start."}],
+                        "shas": shas,
+                    }
+                ]
+            ),
+            _ARC,
+        ],
+    )
+
+    built = story.build_story(tmp_path, stats, sha_paths, branch="main", tone="plain", mode="rewrite")
+
+    assert built["title"] == "How the parser learned to read"
+    assert built["tagline"] and built["arc"]
+    moment = built["moments"][0]
+    assert moment["title"] == "The parser learns to stream"
+    assert moment["kicker"] == "turning point"
+    assert [row["short"] for row in moment["commits"]] == shas  # oldest first inside a moment
+    assert moment["stats"]["commits"] == len(shas) and moment["stats"]["turns"] == 2
+    assert moment["stats"]["files"]  # which files the moment touched
+    # The quoted ask is the developer's OWN prompt, read back from the commit; only
+    # the note comes from the model.
+    assert moment["thoughts"][0]["quote"] == "make the parser stream"
+    assert moment["thoughts"][0]["note"].startswith("They wanted it")
+    # ...and it is persisted, so re-opening the page costs nothing.
+    assert story.StoryStore(tmp_path).get("main")["moments"][0]["id"] == "streaming"
+    assert len(fake.prompts) == 2  # one moment call, one arc call
+    assert "asked: " in fake.prompts[0]  # the digest carries the prompts, not just subjects
+
+
+def test_the_writer_is_given_the_commits_in_order_with_the_time_of_each(tmp_path, monkeypatch):
+    """A moment came back titled "storyline lands, the TUI stops scrolling wrong, and a
+    release patch fails" - with the release patch, which happened first, told last. The
+    material only carried a DAY and one subject per sitting, so there was nothing to order
+    the rest of it by."""
+    repo = _repo_with_history(tmp_path, prompts=["first thing", "second thing", "third thing"])
+    stats, sha_paths = _view_of(repo)
+    ordered = story.story_stats(stats)[-3:]  # the sitting this build tells
+    fake = _fake_agent(monkeypatch, [_moment_reply([{"n": 1, "title": "It", "summary": "s"}]), _ARC])
+    story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
+
+    material = fake.prompts[0]
+    # Every commit is stamped to the minute...
+    for stat in ordered:
+        assert story._stamp(stat.timestamp) in material, f"{stat.subject} has no time on it"
+    # ...and they appear oldest first, in the order they were made.
+    positions = [material.index(stat.subject[:40]) for stat in ordered]
+    assert positions == sorted(positions), "the material is out of order"
+    # The instruction is explicit, because the reader was there and always catches this.
+    assert "OLDEST FIRST" in material
+    assert "name them in the order they happened" in material
+
+
+def test_one_moment_per_sitting_and_the_commits_are_not_the_writers_to_pick(tmp_path, monkeypatch):
+    """The sittings are already grouped (and spread across the part) before the call, so a
+    moment IS one of them. Asking the model to merge them again is what let one moment span
+    unrelated stretches; and naming its episode by number means no commit can be lost to a
+    mistyped id."""
+    repo = _repo_with_history(tmp_path, prompts=[f"step {i}" for i in range(24)], gap_days=1)
+    stats, sha_paths = _view_of(repo)
+    monkeypatch.setattr(story, "_MOMENTS_COARSE", 3)
+    fake = _fake_agent(
+        monkeypatch,
+        [
+            _moment_reply(
+                [  # no "shas" anywhere: the numbers are the whole contract
+                    {"n": 1, "title": "The first stretch", "summary": "s"},
+                    {"n": 2, "title": "The second", "summary": "s"},
+                    {"n": "EPISODE 3", "title": "The third", "summary": "s"},
+                ]
+            ),
+            _ARC,
+        ],
+    )
+    built = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
+
+    assert [m["title"] for m in built["moments"]] == ["The first stretch", "The second", "The third"]
+    told = [sha for m in built["moments"] for sha in m["shas"]]
+    assert len(told) == len(set(told)), "no commit is told twice"
+    material, _ = story._material(stats, None, "rewrite")
+    assert set(told) == {stat.sha for stat in material}, "every commit of the telling has a home"
+    # Each moment's commits are exactly its own sitting, in time order.
+    for moment in built["moments"]:
+        assert moment["from"] <= moment["to"]
+    assert "Write ONE moment of the story for EACH episode" in fake.prompts[0]
+    assert "do not merge episodes" in fake.prompts[0]
+
+
+def test_a_long_sitting_is_sampled_across_its_whole_span(tmp_path):
+    """A merged sitting can hold a hundred commits and only a few fit in the prompt: showing
+    its first ten would describe its morning and nothing about its evening."""
+    repo = _repo_with_history(tmp_path, prompts=[f"step {i}" for i in range(14)], gap_days=1)
+    stats, _ = _view_of(repo)
+    episode = story.merge_episodes(story.segment_episodes(story.story_stats(stats)), 0)
+    text = story._episode_headline(episode, 1)
+
+    ordered = episode.stats
+    assert story._stamp(ordered[0].timestamp) in text and story._stamp(ordered[-1].timestamp) in text
+    assert "more commits spread through the same stretch" in text  # and it says what it left out
+    shown = [stat for stat in ordered if story._stamp(stat.timestamp) in text]
+    assert len(shown) == story._HEADLINE_COMMITS
+    # Spread, not clustered: the middle of the run is represented too.
+    middle = ordered[len(ordered) // 2]
+    assert abs(ordered.index(shown[len(shown) // 2]) - ordered.index(middle)) <= 2
+
+
+def test_one_telling_is_always_one_call(tmp_path):
+    """Only _MAX_BATCHES batches are ever sent, so a telling split across two calls would
+    silently drop the tail of the part. The per-call ceiling has to fit a whole spread."""
+    repo = _repo_with_history(tmp_path, prompts=[f"step {i}" for i in range(30)], gap_days=1)
+    stats, sha_paths = _view_of(repo)
+    spread = story.spread(story.segment_episodes(story.story_stats(stats), sha_paths), story._MOMENTS_COARSE)
+    assert len(story._batches(spread)) == 1, f"one telling needs {len(story._batches(spread))} calls"
+
+
+def test_a_commit_id_the_model_invents_is_dropped(tmp_path, monkeypatch):
+    repo = _repo_with_history(tmp_path, prompts=["do the thing", "do the other thing"])
+    stats, sha_paths = _view_of(repo)
+    real = [stat.short for stat in story.story_stats(stats)]
+    _fake_agent(
+        monkeypatch,
+        [
+            _moment_reply(
+                [
+                    {
+                        "title": "A moment",
+                        "summary": "s",
+                        "shas": [real[0], "deadbee", "0" * 40],
+                        "thoughts": [{"sha": "deadbee", "note": "invented"}],
+                    }
+                ]
+            ),
+            _ARC,
+        ],
+    )
+    built = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
+    moment = built["moments"][0]
+    # The invented ids are gone; the second real commit is still in the story (folded in
+    # below), and the fabricated "thought" fell back to a real prompt of this moment.
+    assert set(row["short"] for row in moment["commits"]) == set(real)
+    assert moment["thoughts"][0]["quote"] in ("do the thing", "do the other thing")
+    assert moment["thoughts"][0]["sha"] in [stat.sha for stat in stats]
+
+
+def test_no_commit_of_a_telling_falls_out_of_the_story(tmp_path, monkeypatch):
+    """Whatever the model names, every commit the telling was given has to end up in one of
+    its moments: a chapter's "3 commits" must be the truth, and no work may vanish."""
+    repo = _repo_with_history(tmp_path, prompts=["one", "two", "three"])
+    stats, sha_paths = _view_of(repo)
+    real = [stat.short for stat in story.story_stats(stats)]
+    _fake_agent(
+        monkeypatch,
+        [_moment_reply([{"title": "Only about the first", "summary": "s", "shas": [real[0]]}]), _ARC],
+    )
+    built = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
+
+    told = {sha for moment in built["moments"] for sha in moment["shas"]}
+    scope, _placement = story._material(stats, None, "rewrite")
+    assert told == {stat.sha for stat in scope}  # the ones the model forgot were folded in
+    assert built["covered"] == len(scope)
+
+
+def test_a_part_is_told_across_its_whole_range_not_from_one_end(tmp_path, monkeypatch):
+    """A part's moments have to cover its date range. Taking the first stretch of sittings and
+    stopping left the middle and end of your own history untold, with a pager as the only way
+    to reach it."""
+    repo = _repo_with_history(tmp_path, prompts=[f"step {i}" for i in range(24)], gap_days=1)
+    stats, sha_paths = _view_of(repo)
+    ordered = story.story_stats(stats)
+    monkeypatch.setattr(story, "_BATCH_EPISODES", 3)  # the first telling reaches the newest stretch only
+    _fake_agent(
+        monkeypatch,
+        [
+            _moment_reply(
+                [{"id": "newest", "title": "Lately", "summary": "s", "shas": [stat.short for stat in ordered[-3:]]}]
+            ),
+            _ARC,
+        ],
+    )
+    built = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
+    era = built["eras"][0]  # the OLDEST part: nothing in it has been told
+    assert not [m for m in built["moments"] if era["from"] <= m["from"] <= era["to"]]
+
+    monkeypatch.setattr(story, "_BATCH_EPISODES", 40)
+    monkeypatch.setattr(story, "_MOMENTS_COARSE", 4)
+    fake = _fake_agent(monkeypatch, [_moment_reply([]), _moment_reply([]), _ARC])  # unusable: told plainly instead
+    after = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="part", part_id=era["id"])
+
+    told = [m for m in after["moments"] if era["from"] <= m["from"] <= era["to"]]
+    assert len(told) > 1, "a part is told as several moments, not one lump"
+    # They SPAN the era rather than clustering at its start.
+    assert min(m["from"] for m in told) <= era["from"]
+    assert max(m["to"] for m in told) >= era["to"]
+    # ...and the material offered to the agent reached the far end of the era, not just its
+    # opening sittings. (Commits are named by subject and timestamp there, not by id: the
+    # writer no longer assigns them.)
+    newest_in_era = max((stat for stat in ordered if stat.timestamp <= era["to"]), key=lambda s: s.timestamp)
+    assert story._stamp(newest_in_era.timestamp) in fake.prompts[0]
+
+
+def test_a_build_covers_the_newest_stretch_not_the_whole_history(tmp_path, monkeypatch):
+    """Forty-five moments in one go is a long wait and more than anyone reads at once. A
+    build tells the most recent stretch and says there is more behind it."""
+    repo = _repo_with_history(tmp_path, prompts=[f"step {i}" for i in range(14)], gap_days=1)
+    stats, sha_paths = _view_of(repo)
+    ordered = [stat.short for stat in story.story_stats(stats)]
+    monkeypatch.setattr(story, "_BATCH_EPISODES", 4)
+    fake = _fake_agent(
+        monkeypatch,
+        [_moment_reply([{"id": "newest", "title": "Lately", "summary": "s", "shas": ordered[-4:]}]), _ARC],
+    )
+    built = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
+
+    assert len(fake.prompts) == 2  # ONE outline call plus the whole-history overview
+    assert built["covered"] < len(ordered)
+    # ...and the coarse story still spans everything, including what has no moments yet.
+    assert sum(era["commits"] for era in built["eras"]) == len(ordered)
+
+
+def test_forgetting_then_telling_again_still_spans_the_part(tmp_path, monkeypatch):
+    """Regression: after a forget, the first telling used to take "the newest sittings" and
+    bunch its moments at one end of the newest part."""
+    repo = _repo_with_history(tmp_path, prompts=[f"step {i}" for i in range(20)], gap_days=1)
+    stats, sha_paths = _view_of(repo)
+    _fake_agent(monkeypatch, [_moment_reply([]), _moment_reply([]), _ARC])
+    built = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
+    newest = built["eras"][-1]
+    told = [m for m in built["moments"] if newest["from"] <= m["from"] <= newest["to"]]
+    assert len(told) > 1
+    assert min(m["from"] for m in told) <= newest["from"]
+    assert max(m["to"] for m in told) >= newest["to"]
+
+    story.handle_story_post("/story/forget", {"branch": "main"}, root=tmp_path, view=lambda b: (stats, sha_paths))
+    _fake_agent(monkeypatch, [_moment_reply([]), _moment_reply([]), _ARC])
+    again = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
+    told = [m for m in again["moments"] if again["eras"][-1]["from"] <= m["from"] <= again["eras"][-1]["to"]]
+    assert min(m["from"] for m in told) <= again["eras"][-1]["from"]
+    assert max(m["to"] for m in told) >= again["eras"][-1]["to"]
+
+
+def test_an_outline_title_is_cut_at_a_word_end(tmp_path):
+    long_subject = "<aGiTrack> " + " ".join(["refactor"] * 40)
+    rows = story.outline([_stat("a", "do it", 1_750_000_000, subject=long_subject)])
+    assert rows[0]["title"].endswith("…") and len(rows[0]["title"]) <= 110
+    assert not rows[0]["title"].endswith("refac…")  # never mid-word
+
+
+# ============================================================================
+# ZOOMING: parts, the moments inside one, and which days a telling covers
+# ============================================================================
+
+
+def test_a_part_can_be_told_on_its_own(tmp_path, monkeypatch):
+    """Zooming into a part nobody has told is a dead end unless that part can be asked for
+    directly: walking backwards to it from the newest stretch is not something a reader
+    should have to do."""
+    repo = _repo_with_history(tmp_path, prompts=[f"step {i}" for i in range(12)], gap_days=1)
+    stats, sha_paths = _view_of(repo)
+    ordered = story.story_stats(stats)
+    monkeypatch.setattr(story, "_BATCH_EPISODES", 3)
+    _fake_agent(
+        monkeypatch,
+        [
+            _moment_reply(
+                [{"id": "newest", "title": "Lately", "summary": "s", "shas": [s.short for s in ordered[-3:]]}]
+            ),
+            _ARC,
+        ],
+    )
+    built = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
+    eras = built["eras"]
+    empty = [era for era in eras if not [m for m in built["moments"] if era["from"] <= m["from"] <= era["to"]]]
+    assert empty, "this fixture is supposed to leave older parts untold"
+
+    target = empty[0]
+    fake = _fake_agent(
+        monkeypatch,
+        [
+            _moment_reply(
+                [
+                    {
+                        "id": "that-part",
+                        "title": "The part they asked for",
+                        "summary": "s",
+                        "shas": [s.short for s in ordered if target["from"] <= s.timestamp <= target["to"]][:3],
+                    }
+                ]
+            ),
+            _ARC,
+        ],
+    )
+    after = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="part", part_id=target["id"])
+
+    told = [m for m in after["moments"] if target["from"] <= m["from"] <= target["to"]]
+    assert told, "the part the reader asked for now has moments"
+    assert [m["id"] for m in after["moments"]].count("newest") == 1  # and the old ones are kept
+    # Only that part's commits were sent to the agent.
+    assert "step 11" not in fake.prompts[0]
+
+
+def test_a_story_can_be_told_for_a_stretch_of_days(tmp_path, monkeypatch):
+    """The range control scopes the WHOLE telling: the commits read, the parts they are split
+    into, and what counts as covered. This is what replaced "look closer" - a narrower stretch
+    told at the same grain is genuinely a closer look, where re-telling the same commits was
+    not."""
+    repo = _repo_with_history(tmp_path, prompts=[f"step {i}" for i in range(20)], gap_days=1)
+    stats, sha_paths = _view_of(repo)
+    ordered = story.story_stats(stats)
+    window_from, window_to = ordered[6].timestamp, ordered[11].timestamp
+
+    inside = story.in_range(stats, window_from, window_to)
+    assert [stat.short for stat in inside] == [stat.short for stat in ordered[6:12]]
+    assert story.in_range(stats, 0, 0) == stats  # no bounds means the whole history
+
+    fake = _fake_agent(monkeypatch, [_moment_reply([{"n": 1, "title": "That week", "summary": "s"}]), _ARC])
+    built = story.build_story(
+        tmp_path, inside, sha_paths, branch="main", mode="rewrite", since=window_from, until=window_to
+    )
+    # Nothing outside the chosen days is told, and the story remembers what it was asked for.
+    assert built["range"] == {"from": window_from, "to": window_to}
+    told = {sha for moment in built["moments"] for sha in moment["shas"]}
+    assert told <= {stat.sha for stat in inside}
+    assert ordered[0].subject not in fake.prompts[0] and ordered[-1].subject not in fake.prompts[0]
+    # The parts are computed over the RANGE: they span it, not the whole history behind it.
+    assert built["eras"][0]["from"] >= window_from and built["eras"][-1]["to"] <= window_to
+
+
+def test_a_range_with_no_commits_in_it_is_refused_before_any_agent_call(tmp_path, monkeypatch):
+    repo = _repo_with_history(tmp_path, prompts=["one", "two"])
+    stats, sha_paths = _view_of(repo)
+    fake = _fake_agent(monkeypatch, [_moment_reply([{"n": 1, "title": "x", "summary": "s"}]), _ARC])
+    answer = story.handle_story_post(
+        "/story/build",
+        {"branch": "main", "mode": "rewrite", "from": 2_000_000_000, "to": 2_000_100_000},
+        root=tmp_path,
+        view=lambda branch: (stats, sha_paths),
+        repo_name="demo",
+    )
+    assert "no commits in those days" in answer["error"]
+    assert not fake.prompts, "nothing was asked of the agent"
+
+
+def test_an_older_part_is_told_on_request(tmp_path, monkeypatch):
+    """Reaching back is asking for a PART (or for a range of days), not a vague "further
+    back": a reader always gains a whole named era and knows which one before they press."""
+    repo = _repo_with_history(tmp_path, prompts=[f"step {i}" for i in range(20)], gap_days=1)
+    stats, sha_paths = _view_of(repo)
+    _fake_agent(monkeypatch, [_moment_reply([]), _moment_reply([]), _ARC])
+    built = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
+
+    older = built["eras"][-2]
+    _fake_agent(monkeypatch, [_moment_reply([]), _moment_reply([]), _ARC])
+    back = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="part", part_id=older["id"])
+    assert [m for m in back["moments"] if older["from"] <= m["from"] <= older["to"]]
+    # ...and the newest part's moments are untouched.
+    assert [m["id"] for m in built["moments"]] == [
+        m["id"] for m in back["moments"] if m["id"] in {x["id"] for x in built["moments"]}
+    ]
+
+
+def test_extending_tells_only_what_is_new(tmp_path, monkeypatch):
+    repo = _repo_with_history(tmp_path, prompts=["first push", "second push"])
+    stats, sha_paths = _view_of(repo)
+    first = [stat.short for stat in story.story_stats(stats)]
+    _fake_agent(
+        monkeypatch,
+        [_moment_reply([{"id": "one", "title": "The first push", "summary": "s", "shas": first}]), _ARC],
+    )
+    story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
+
+    # A new sitting of work lands days later.
+    when = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(1_750_000_000 + 9 * DAY))
+    (tmp_path / "new.py").write_text("fresh\n", encoding="utf-8")
+    repo.stage_paths(["new.py"])
+    repo._run(
+        ["git", "commit", "-q", "-F", "-"],
+        input_text=build_agent_commit_message(
+            latest_prompt="add the new thing",
+            trace=[{"role": "user", "content": "add the new thing"}],
+            backend="claude",
+            backend_session_id="ses-2",
+            agitrack_session_id="agit-1",
+            model="claude-opus-5",
+            token_usage={"input": 10, "output": 5},
+        ),
+        env={"GIT_AUTHOR_DATE": when, "GIT_COMMITTER_DATE": when},
+    )
+    stats2, sha_paths2 = _view_of(repo)
+    newest = story.story_stats(stats2)[-1].short
+    fake = _fake_agent(
+        monkeypatch,
+        [_moment_reply([{"id": "two", "title": "The new thing", "summary": "s", "shas": [newest]}]), _ARC],
+    )
+    built = story.build_story(tmp_path, stats2, sha_paths2, branch="main", mode="extend")
+
+    assert [c["id"] for c in built["moments"]] == ["one", "two"]  # kept, then continued
+    assert newest not in [s for c in built["moments"][:1] for s in c["shas"]]
+    # The already-told commits are never sent to the agent a second time. (The material names
+    # commits by subject and stamp; ids are not in it.)
+    by_sha = {stat.short: stat for stat in story.story_stats(stats2)}
+    assert by_sha[first[0]].subject not in fake.prompts[0]
+    assert "add the new thing" in fake.prompts[0]
+    # ...and the earlier moments ride along as context so the telling continues.
+    assert "The first push" in fake.prompts[0]
+
+
+def test_extending_with_nothing_new_says_so(tmp_path, monkeypatch):
+    repo = _repo_with_history(tmp_path, prompts=["only thing"])
+    stats, sha_paths = _view_of(repo)
+    shas = [stat.short for stat in story.story_stats(stats)]
+    _fake_agent(monkeypatch, [_moment_reply([{"title": "All of it", "summary": "s", "shas": shas}]), _ARC])
+    story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
+    with pytest.raises(story.StoryError, match="nothing new"):
+        story.build_story(tmp_path, stats, sha_paths, branch="main", mode="extend")
+    # ...and the page is told so straight away, instead of watching a spinner that fails.
+    answer = story.start_build(tmp_path, stats, sha_paths, branch="main", mode="extend")
+    assert "nothing new to tell" in answer["error"] and "building" not in answer
+    assert story.build_progress(tmp_path, "main") is None  # no thread was ever started
+
+
+# ============================================================================
+# WHEN IT GOES WRONG: bad replies, dead backends, and stopping
+# ============================================================================
+
+
+def test_an_unusable_reply_is_retried_then_told_plainly(tmp_path, monkeypatch):
+    """A stretch the model cannot tell must not leave a hole in the timeline, and must not
+    cost the build."""
+    repo = _repo_with_history(tmp_path, prompts=[f"step {i}" for i in range(6)])
+    stats, sha_paths = _view_of(repo)
+    fake = _fake_agent(monkeypatch, ["here is a nice essay instead", "still an essay", _ARC])
+
+    built = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
+
+    auto = [moment for moment in built["moments"] if moment.get("auto")]
+    assert auto and auto[0]["shas"]  # told from the commits themselves
+    assert "storyteller could not be reached" in auto[0]["summary"]
+    assert _RETRY_NUDGE_MARK in fake.prompts[1]  # ...after being told exactly what went wrong
+    told = {sha for moment in built["moments"] for sha in moment["shas"]}
+    scope, _placement = story._material(stats, None, "rewrite")
+    assert told == {stat.sha for stat in scope}  # no hole in what it was given
+
+
+def test_a_backend_that_keeps_failing_stops_but_keeps_what_landed(tmp_path, monkeypatch):
+    """A build covers the newest stretch; reaching further back is a separate build. When that
+    one cannot run, the moments already told have to survive it."""
+    repo = _repo_with_history(tmp_path, prompts=[f"step {i}" for i in range(14)], gap_days=1)
+    stats, sha_paths = _view_of(repo)
+    ordered = [stat.short for stat in story.story_stats(stats)]
+    monkeypatch.setattr(story, "_BATCH_EPISODES", 4)
+    _fake_agent(
+        monkeypatch,
+        [_moment_reply([{"id": "newest", "title": "The newest stretch", "summary": "s", "shas": ordered[-4:]}]), _ARC],
+    )
+    first = story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
+    assert [c["id"] for c in first["moments"]] == ["newest"]
+
+    _fake_agent(
+        monkeypatch,
+        [
+            learn.LearnAgentError("the claude backend exited with code 1"),
+            learn.LearnAgentError("the claude backend exited with code 1"),
+        ],
+    )
+    older = first["eras"][0]["id"]
+    with pytest.raises(story.StoryError, match="exited with code 1"):
+        story.build_story(tmp_path, stats, sha_paths, branch="main", mode="part", part_id=older)
+    stored = story.StoryStore(tmp_path).get("main")
+    assert [c["id"] for c in stored["moments"]] == ["newest"]  # the told stretch is untouched
+
+
+def test_stopping_a_build_releases_the_reader_at_once(tmp_path, monkeypatch):
+    """ "Stopping after the current moment" meant waiting out an agent call that could take
+    minutes, which reads as a stop button that does not work."""
+    repo = _repo_with_history(tmp_path, prompts=["one", "two"])
+    stats, sha_paths = _view_of(repo)
+    started, release = threading.Event(), threading.Event()
+
+    class _Slow(_QueuedBackend):
+        def run(self, prompt, **kwargs):
+            started.set()
+            release.wait(5)
+            return super().run(prompt, **kwargs)
+
+    slow = _Slow([_moment_reply([{"title": "x", "summary": "s", "shas": ["deadbee"]}]), _ARC])
+    monkeypatch.setattr(learn.LearningBackendChoice, "build", lambda self: slow)
+    monkeypatch.setattr(
+        learn,
+        "resolve_learning_backend",
+        lambda root: learn.LearningBackendChoice(
+            backend_name="claude", model="m", backend_source="config", model_source="config"
+        ),
+    )
+    try:
+        story.start_build(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
+        assert started.wait(5)
+        answer = story.cancel_build(tmp_path, "main")
+        assert answer["stopped"] is True
+        progress = story.build_progress(tmp_path, "main")
+        assert progress["running"] is False and progress["phase"] == "stopped"  # at once, not later
+    finally:
+        release.set()
+        time.sleep(0.3)
+
+
+def test_a_stopped_build_throws_away_the_answer_it_was_waiting_for(tmp_path, monkeypatch):
+    repo = _repo_with_history(tmp_path, prompts=["one", "two"])
+    stats, sha_paths = _view_of(repo)
+    shas = [stat.short for stat in story.story_stats(stats)]
+    _fake_agent(monkeypatch, [_moment_reply([{"id": "m", "title": "T", "summary": "s", "shas": shas}]), _ARC])
+    stop = threading.Event()
+    stop.set()
+    with pytest.raises(story.StoryError, match="cancelled"):
+        story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite", stop=stop)
+    assert story.StoryStore(tmp_path).get("main") is None  # nothing was written
+
+
+def test_only_one_story_is_written_at_a_time(tmp_path, monkeypatch):
+    repo = _repo_with_history(tmp_path, prompts=["one"])
+    stats, sha_paths = _view_of(repo)
+    release = threading.Event()
+
+    class _Blocking(_QueuedBackend):
+        def run(self, prompt, **kwargs):
+            release.wait(5)
+            return super().run(prompt, **kwargs)
+
+    blocking = _Blocking([_moment_reply([{"title": "x", "summary": "s", "shas": ["deadbee"]}]), _ARC])
+    monkeypatch.setattr(learn.LearningBackendChoice, "build", lambda self: blocking)
+    monkeypatch.setattr(
+        learn,
+        "resolve_learning_backend",
+        lambda root: learn.LearningBackendChoice(
+            backend_name="claude", model="m", backend_source="config", model_source="config"
+        ),
+    )
+    try:
+        story.start_build(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
+        second = story.start_build(tmp_path, stats, sha_paths, branch="other", mode="rewrite")
+        assert second["busy"] is True and second["error"]
+    finally:
+        release.set()
+        time.sleep(0.2)
+
+
+def test_a_build_runs_in_the_background_and_reports_progress(tmp_path, monkeypatch):
+    repo = _repo_with_history(tmp_path, prompts=["one", "two"])
+    stats, sha_paths = _view_of(repo)
+    shas = [stat.short for stat in story.story_stats(stats)]
+    _fake_agent(monkeypatch, [_moment_reply([{"title": "It", "summary": "s", "shas": shas}]), _ARC])
+
+    started = story.start_build(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
+    assert started["building"] is True
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        progress = story.build_progress(tmp_path, "main")
+        if progress and not progress["running"]:
+            break
+        time.sleep(0.05)
+    progress = story.build_progress(tmp_path, "main")
+    assert progress and progress["running"] is False and not progress["error"]
+    assert story.StoryStore(tmp_path).get("main")["moments"]
+
+
+# ============================================================================
+# HOW IT IS WRITTEN: the storyteller's instructions
+# ============================================================================
+
+
+def test_the_readers_own_instructions_reach_the_storyteller(tmp_path, monkeypatch):
+    repo = _repo_with_history(tmp_path, prompts=["one", "two"])
+    stats, sha_paths = _view_of(repo)
+    shas = [stat.short for stat in story.story_stats(stats)]
+    fake = _fake_agent(monkeypatch, [_moment_reply([{"title": "It", "summary": "s", "shas": shas}]), _ARC])
+    built = story.build_story(
+        tmp_path, stats, sha_paths, branch="main", mode="rewrite", note="focus on the tests, and be dry"
+    )
+    assert all("focus on the tests, and be dry" in prompt for prompt in fake.prompts)
+    assert built["note"] == "focus on the tests, and be dry"  # kept, so later tellings match
+
+    # ...and it steers the moment bodies too, without having to be repeated.
+    expand = _fake_agent(monkeypatch, [json.dumps({"detail": "Short.", "thoughts": []})])
+    story.expand_moment(tmp_path, stats, sha_paths, branch="main", moment_id=built["moments"][0]["id"])
+    assert "focus on the tests, and be dry" in expand.prompts[0]
+
+
+def test_the_storyteller_is_told_not_to_guess_anyone_s_gender():
+    """The people in these commits are real and the material never states their pronouns:
+    a story about someone's own work is the last place to guess (a first run did, and wrote
+    'the developer ... himself')."""
+    assert "never as 'he' or 'she'" in story._STORY_SYSTEM
+    assert "'they'" in story._STORY_SYSTEM
+
+
+def test_the_storyteller_is_told_that_changes_are_not_the_whole_picture():
+    """A commit log records what CHANGED, so a story written from it quietly implies the
+    changes are all there is: "it now runs on Windows" reads as "it only runs on Windows",
+    when Windows was merely the platform that took work."""
+    assert "never let an addition sound like the" in story._STORY_SYSTEM
+    assert "what worked from the start left no trace" in story._STORY_SYSTEM.replace("\n", " ")
+
+
+# ============================================================================
+# THE PAGE: every control, and what it looks like
+# ============================================================================
+
+
+def test_the_page_paints_without_any_story(tmp_path):
+    html = story.story_html(tmp_path)
+    assert "storyline" in html or "story" in html
+    assert "story/state" in html  # it fetches its data after paint
+    assert "__REPO__" not in html and "__PREBOOT_CSS__" not in html
+    assert "what they asked for" in html
+    # Phone support, like the dashboard's: a narrow-screen block that tightens the timeline
+    # rail and stops the outline's numbers from being pushed off the side of the screen.
+    assert "@media (max-width:640px)" in html
+    # The numbers are drawn, not described: a bar for what a moment moved, a dot per commit,
+    # a sparkline per era, and a waiting state whenever content is not there yet.
+    assert "function shapeHtml" in html and "function sparkHtml" in html
+    assert 'id="loading"' in html and 'id="skeleton"' in html
+    # The coarse story (every era, always complete) and only a handful of moments at once.
+    assert 'id="eras"' in html and "function renderEras" in html
+    # Cards appear as they are reached; they used to all animate at once on load.
+    assert "IntersectionObserver" in html and "rootMargin" in html
+    assert ".outline .num{flex-basis:100%}" in html
+    # Nothing on the page may push the document wider than the screen.
+    assert "overflow-x:hidden" in html
+    # A commit reads EXACTLY as it does in the dashboard: the same renderer and the same
+    # rules, lifted rather than approximated, and flowing with the page (no second scroller).
+    assert "function commitMd(" in html and "function reflowParagraphs(" in html
+    assert ".diffbox{margin:0;font-size:12px;line-height:1.55;white-space:pre-wrap" in html
+    assert ".dmsg.md h3.md-h{font-size:15px;color:var(--amber)}" in html
+
+
+def test_every_button_on_the_page_is_wired_to_something():
+    """A control that does nothing is worse than no control: the "closer" zoom shipped dead
+    once already. Every id the page defines has to be reachable from its own script."""
+    html = _page()
+    ids = set(re.findall(r'<(?:button|input|select)[^>]*\bid="([^"]+)"', html))
+    assert ids, "the page defines controls"
+    script = re.findall(r"<script>(.*?)</script>", html, re.S)[-1]
+    unwired = []
+    for control in sorted(ids):
+        used = re.search(r'\$\("%s"\)' % re.escape(control), script) or re.search(
+            r'id="%s"' % re.escape(control), script
+        )
+        if not used:
+            unwired.append(control)
+    assert not unwired, f"controls the script never touches: {unwired}"
+
+
+def test_there_is_no_zoom_control_only_a_way_back_out():
+    """The row of zoom stops is gone. It offered depths that only mean something INSIDE a
+    part, from a view where no part was chosen: pressing "closer" from the parts either did
+    nothing or landed in a part nobody had picked. You go IN by clicking the thing you want,
+    and OUT with one button that says where it lands."""
+    html = _page()
+    for gone in ["zstop", "zoombar", 'id="toolbar"', 'id="zoom"', "zlabel2"]:
+        assert gone not in html, f"the zoom control is still on the page ({gone})"
+    assert 'class="btn small zback"' in html and 'e.target.closest(".zback")' in html
+    # One step out, and it names where it lands rather than saying "back".
+    assert 'if (e.target.closest(".zback")) { setZoom(2); return; }' in html
+    assert "&larr; back to ' + partsLabel()" in html
+
+
+def test_the_way_in_is_clicking_a_part():
+    """One way in, one way out. A part row opens that part; the button in the context bar
+    tells a part nobody has told yet."""
+    html = _page()
+    assert "if (seg) setZoom(3, seg.dataset.part)" in html  # the parts list goes in
+    assert 'class="btn zpart"' in html and 'e.target.closest(".zpart")' in html
+
+
+def test_the_closer_telling_is_gone_for_good():
+    """ "Look closer" re-read commits the reader had already paid to have told, and because a
+    part holds no more moments than it has sittings of work it could come back with FEWER
+    moments than the view it was meant to magnify. It was removed in favour of choosing the
+    DAYS to tell, which narrows the material instead of re-cutting it."""
+    html = _page()
+    for gone in ["zcloser", "more-moments", "hasCloser", "closerNote", "asfine", "look closer", "_MOMENTS_FINE"]:
+        assert gone not in html, f"{gone} is still on the page"
+    # Two depths, and nothing can ask for a third.
+    assert "state.zoom = Math.max(top, Math.min(3, state.zoom || top));" in html
+    assert 'if (e.target.closest(".zback")) { setZoom(2); return; }' in html
+
+
+def test_a_stored_closer_telling_is_dropped_on_load(tmp_path):
+    store = story.StoryStore(tmp_path)
+    store.put(
+        "main",
+        {
+            "moments": [
+                {"id": "coarse", "title": "The week", "from": 10, "to": 90, "shas": ["a"]},
+                {"id": "fine-1", "title": "Tuesday", "level": 2, "from": 20, "to": 30, "shas": ["a"]},
+            ]
+        },
+    )
+    kept = store.get("main")["moments"]
+    assert [m["id"] for m in kept] == ["coarse"], "the finer re-telling is not shown beside the coarse one"
+
+
+def test_the_page_can_ask_for_a_stretch_of_days():
+    """The dashboard's range control, on the story page, scoping what gets WRITTEN. It is the
+    honest replacement for "look closer": fewer commits told at the same grain."""
+    html = _page()
+    assert 'id="f-period"' in html and 'id="daterange"' in html
+    assert 'id="f-from"' in html and 'id="f-to"' in html and 'id="dr-done"' in html
+    # The same presets as the dashboard, custom range included, from one definition.
+    assert ui.RANGE_OPTIONS in html
+    assert '<option value="custom">custom range' in ui.RANGE_OPTIONS
+    # The choice reaches the server with the build...
+    assert "from: state.fromTs || 0, to: state.toTs || 0" in html
+    # ...and the reader is told what they picked, in dates and in commits, before spending a call.
+    assert "function renderRangeHint()" in html and "function commitsInRange()" in html
+    assert "no commits in these days" in html
+    # A range reaching past what the page can count is reported by its dates alone.
+    assert "if (state.fromTs && state.fromTs < oldest) return -1;" in html
+    # The popup is wired by the shared helper, so picking "custom" a SECOND time reopens it
+    # (a select fires no change event when the value does not change).
+    assert "bindRangeControl(" in html
+    assert ui.RANGE_JS in html
+
+
+def test_a_depth_that_needs_a_part_always_has_one():
+    """A hash typed by hand, a link from before, or a story rewritten with different parts can
+    all leave the page at depth 3 or 4 with no part selected: that used to paint nothing."""
+    html = _page()
+    normalize = html[html.index("function normalizeZoom()") : html.index("function setZoom(")]
+    assert "state.part = eras.length ? eras[eras.length - 1].id : null;" in normalize
+    assert "if (state.zoom === 2) { state.part = null; return; }" in normalize
+    # A story with no parts at all (an older store) has the flat moment list as its top.
+    assert "return ((state.story && state.story.eras) || []).length ? 2 : 3;" in html
+    # ...and it runs before every paint, not only on a click.
+    assert "  normalizeZoom();\n  renderBranches();" in html
+
+
+def test_the_destructive_confirm_does_not_look_like_the_button_that_was_pressed():
+    """ "Tell it again" arms into "yes, throw it away and start over" - the same button, one
+    press later. If it still looks the same, a second click lands on it by muscle memory."""
+    html = _page()
+    assert ".btn.danger{border-color:var(--bad);color:var(--ink);background:var(--bad)" in html
+    assert '$("rewrite").classList.add("danger")' in html
+    assert '$("rewrite").classList.remove("danger")' in html  # ...and disarming puts it back
+    assert "@keyframes armed" in html and "prefers-reduced-motion" in html
+
+
+def test_changing_a_setting_shows_on_the_button_that_applies_it():
+    """A story is written with the settings of the moment it was told. Changing the voice, the
+    days or the extra instruction does nothing until it is told again, so the button that does
+    that says so and stands out."""
+    html = _page()
+    assert "function settingsKey()" in html and "function markStale()" in html
+    assert '[state.tone, state.fromTs || 0, state.toTs || 0, $("f-note").value.trim()].join' in html
+    assert 'button.classList.toggle("stale", stale)' in html
+    assert "tell it again with these settings" in html
+    assert ".btn.stale{border-color:var(--phosphor)" in html
+    # Every control that feeds the key marks it.
+    assert '$("f-note").addEventListener("input", markStale)' in html
+    assert "bindRangeControl(() => { state.touchedRange = true; applyPeriod(); markStale(); })" in html
+    # ...and a finished telling clears it, since the story now matches the controls.
+    assert 'state.told0 = state.story ? settingsKey() : "";' in html
+
+
+def test_a_finished_telling_lands_on_the_parts():
+    """A rewrite rewrites the PARTS too, so wherever the reader was standing may no longer
+    exist. One exception: a telling asked for one named part leaves them in that part."""
+    html = _page()
+    assert 'if (state.lastMode !== "part") setZoom(2);' in html
+    assert "state.lastMode = mode;" in html
+
+
+def test_going_further_back_is_gone():
+    """Nobody could tell what "go further back" would give them. Choosing the days says the
+    same thing precisely, so the button and the mode behind it were removed."""
+    html = _page()
+    for gone in ["earlier2", "go further back", "morewrap", "more_earlier"]:
+        assert gone not in html, f"{gone} is still on the page"
+
+
+def test_the_page_no_longer_carries_the_features_that_did_not_work():
+    """Story mode and the keyboard shortcuts were removed: nothing may reference them."""
+    html = _page()
+    for gone in ["playStory", "cineStep", "cinebar", 'id="play"', "keydown", "PAGE_MOMENTS"]:
+        assert gone not in html, f"{gone} is still on the page"
+
+
+def test_generation_waits_say_which_model_is_doing_it():
+    """It is the reader's time and tokens: the overlay names the engine, and so does the
+    in-card wait when a single moment is being written."""
+    html = _page()
+    assert "function engineLine()" in html
+    assert '"written by " + engine' in html  # the blocking overlay
+    assert 'engineLine() ? " (" + esc(engineLine())' in html  # the in-card one
+    # The overlay used to be raised only by renderBuild(), which never filled the engine
+    # line, so the one wait that actually costs a call was the one that said nothing.
+    assert "showEngine();          // also for a build" in html
+
+
+def test_the_spinner_is_up_before_the_server_answers():
+    """Starting a build is a POST that has to reach the daemon and hand the work to a thread.
+    Waiting for it left about a second in which "tell it again" had visibly done nothing, and
+    people pressed it again."""
+    html = _page()
+    builder = html[html.index("async function build(mode){") : html.index("function startPolling()")]
+    assert builder.index("showOverlay(") < builder.index("await post("), "the overlay waits for the server"
+    assert "BUILD_OPENING" in builder and "true);" in builder  # named for the mode, and stoppable
+    for mode in ("rewrite", "extend", "part"):
+        assert f"  {mode}:" in html, f"a build started as {mode} has no opening line"
+    # ...and it comes back down if the build never starts.
+    assert builder.count("hideOverlay();") == 2
+
+
+def test_writing_one_moment_does_not_black_out_the_page():
+    """Expanding a moment loads INSIDE the card. Only the multi-moment generations, which
+    genuinely rewrite the page under you, take the screen."""
+    html = _page()
+    writer = html[html.index("async function writeMoment(") : html.index("// The blocking overlay")]
+    assert "showOverlay(" not in writer and "hideOverlay(" not in writer
+    assert 'class="writing"' in writer  # a spinner in the card being opened, nothing more
+
+
+def test_a_long_diff_line_wraps_inside_the_moment(tmp_path):
+    """A commit's diff has to wrap to the column it is in: it used to run past the moment
+    card's width, exactly what the dashboard's diff view already avoids."""
+    html = story.story_html(tmp_path)
+    assert "white-space:pre-wrap;overflow-wrap:anywhere" in html
+    # ...and nothing in the chain from the card to the diff may stretch to fit it.
+    for rule in [".cmt{", ".commits{", ".more{"]:
+        block = html[html.index(rule) : html.index("}", html.index(rule))]
+        assert "min-width:0" in block, f"{rule} can still be widened by its content"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs node to evaluate the page script")
+def test_the_page_script_runs(tmp_path):
+    """The whole page is one inline script: anything that throws at its top level takes the
+    entire page with it, and the result looks exactly like a server that never answered. A
+    `const` declared below the object that reads it did precisely that (the state object read
+    PAGE_MOMENTS, which was declared 200 lines further down: ReferenceError, blank page)."""
+    source = re.findall(r"<script>(.*?)</script>", story.story_html(tmp_path), re.S)[-1]
+    script = tmp_path / "page.js"
+    script.write_text("const SOURCE = " + json.dumps(source) + ";\n" + _DOM_STUB, encoding="utf-8")
+    result = subprocess.run([shutil.which("node"), str(script)], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, f"the story page script threw: {result.stdout.strip() or result.stderr.strip()}"
+
+
+def test_the_backtrace_banner_says_it_is_a_reconstruction():
+    banner = story.story_backtrace_banner("/tmp/some/dir")
+    assert "BACKTRACE" in banner and "reconstruction" in banner
+    assert "agitrack --backtrace commit" in banner
+
+
+# ============================================================================
+# THE SERVER: state, routes, and both dashboards
+# ============================================================================
+
+
+def test_state_offers_the_outline_and_says_what_is_uncovered(tmp_path, monkeypatch):
+    repo = _repo_with_history(tmp_path, prompts=["one", "two"])
+    stats, sha_paths = _view_of(repo)
+    state = story.story_state(tmp_path, stats, sha_paths, branch="main", branches=["main"], repo_name="demo")
+    assert state["story"] is None
+    assert len(state["outline"]) == 3  # two agent turns plus the repo's seed commit
+    assert state["meta"]["commits"] == 3 and state["meta"]["uncovered"] == 3
+    assert state["meta"]["turns"] == 2  # ...of which two are agent turns
+
+    shas = [stat.short for stat in story.story_stats(stats)]
+    _fake_agent(monkeypatch, [_moment_reply([{"title": "It", "summary": "s", "shas": shas}]), _ARC])
+    story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
+    state = story.story_state(tmp_path, stats, sha_paths, branch="main", branches=["main"], repo_name="demo")
+    assert state["meta"]["uncovered"] == 0
+    assert state["story"]["moments"]
+
+
+def test_forgetting_a_story_leaves_the_commits_alone(tmp_path, monkeypatch):
+    repo = _repo_with_history(tmp_path, prompts=["one"])
+    stats, sha_paths = _view_of(repo)
+    shas = [stat.short for stat in story.story_stats(stats)]
+    _fake_agent(monkeypatch, [_moment_reply([{"title": "It", "summary": "s", "shas": shas}]), _ARC])
+    story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
+
+    answer = story.handle_story_post(
+        "/story/forget", {"branch": "main"}, root=tmp_path, view=lambda branch: (stats, sha_paths)
+    )
+
+    assert answer == {"forgotten": True}
+    assert story.StoryStore(tmp_path).get("main") is None
+    assert build_dashboard(repo).total_commits == 2  # history untouched (seed + the turn)
+
+
+def test_an_unknown_story_path_is_not_handled(tmp_path):
+    assert story.handle_story_post("/story/nope", {}, root=tmp_path, view=lambda b: ([], {})) is None
+
+
+def test_every_post_the_page_makes_is_answered_by_the_server(tmp_path):
+    """Whatever the buttons call has to exist: a typo here is a control that silently fails."""
+    html = _page()
+    posted = set(re.findall(r'post\("([^"]+)"', html))
+    assert posted, "the page posts something"
+    for path in sorted(posted):
+        answer = story.handle_story_post(
+            "/" + path, {"branch": "main", "id": "x"}, root=tmp_path, view=lambda b: ([], {})
+        )
+        if path.startswith("learn/"):
+            continue  # the learn endpoints are served by learn.handle_learn_post
+        assert answer is not None, f"the server does not answer /{path}"
+
+
+def test_the_live_dashboard_serves_the_storyline(tmp_path):
+    repo = _repo_with_history(tmp_path, prompts=["one", "two"])
+    server = build_server(repo, port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        page = _get(base + "/story")
+        assert "aGiTrack" in page and "story/state" in page
+        state = json.loads(_get(base + "/story/state"))
+        assert state["meta"]["commits"] == 3  # two agent turns plus the seed commit
+        assert len(state["outline"]) == 3
+        assert state["branches"]  # the live view can switch branches
+        assert state["backtrace"] is False
+        # And the dashboard itself points at it.
+        assert 'id="storylink"' in _get(base + "/")
+        assert _post(base + "/story/forget", {"branch": state["branch"]}) == {"forgotten": True}
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_the_backtrace_dashboard_serves_its_own_storyline(monkeypatch, tmp_path):
+    from tests.test_backtrace import _patch_discovery, _turn
+    from agitrack.transcripts.types import ExportedSession
+    from agitrack.transcripts.edits import make_edit
+    import agitrack.metrics.backtrace as bt
+
+    edit = make_edit("/repo/a.py", "", "x\ny\n", status="added")
+    session = ExportedSession(
+        session_id="c1",
+        model="claude-opus-5",
+        updated=2000,
+        turns=[_turn("build the thing", edits=[edit])],
+    )
+    _patch_discovery(monkeypatch, claude_sessions={"c1": session})
+    view = bt.build_backtrace(tmp_path)
+    handler = bt._make_handler(view)
+    import http.server
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        page = _get(base + "/story")
+        assert "BACKTRACE" in page  # the frozen "this is a reconstruction" strip
+        state = json.loads(_get(base + "/story/state"))
+        assert state["backtrace"] is True
+        assert state["branches"] == []  # no refs to switch between
+        assert state["meta"]["commits"] == 1
+        assert state["outline"][0]["prompt"] == "build the thing"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
