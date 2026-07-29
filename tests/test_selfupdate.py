@@ -8,6 +8,7 @@ left for the user to do reaches them on the dashboards.
 """
 
 import json
+import sys
 import types
 
 from agitrack.update import selfupdate
@@ -28,7 +29,14 @@ def test_only_install_modes_that_can_finish_unattended_are_attempted():
     # The modes differ in what "apply" even means; auto_update_plan is the single authority
     # so no caller can drive one mode's mechanism through another's path.
     assert selfupdate.auto_update_plan(_updater(KIND_SOURCE))[0] is True  # git fast-forward
-    assert selfupdate.auto_update_plan(_updater(KIND_PACKAGE, METHOD_PIP))[0] is True  # pip venv
+    # pip/pipx upgrades the venv in place and the next process start picks it up — except on
+    # Windows, which locks the running agitrack.exe, so that mode is deliberately refused
+    # there and left to a helper that runs after this process exits.
+    can, why = selfupdate.auto_update_plan(_updater(KIND_PACKAGE, METHOD_PIP))
+    if sys.platform == "win32":
+        assert can is False and "locks the running agitrack.exe" in why
+    else:
+        assert can is True
 
     can, why = selfupdate.auto_update_plan(_updater(KIND_PACKAGE, METHOD_MSI))
     assert can is False and "elevation" in why  # MSI replaces the running exe

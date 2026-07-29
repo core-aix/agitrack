@@ -17,6 +17,7 @@ from agitrack.metrics.server import (
     BIND_HOST_ENV,
     DEFAULT_HOST,
     advertised_host,
+    bind_exclusively,
     bind_scanning,
     dashboard_url,
     default_bind_host,
@@ -180,11 +181,16 @@ def test_exposure_note_only_warns_when_actually_exposed():
 
 
 class _Listener:
-    """A bare TCP listener standing in for the dashboard server."""
+    """A bare TCP listener standing in for the dashboard server.
+
+    It must ask for its port the way the real server does (``bind_exclusively``): plain
+    SO_REUSEADDR on Windows means "bind even if someone else already has this port", so a
+    listener set up that way is neither a real blocker nor a real occupant, and all three
+    scan tests below would be asserting against a socket layer that let everything through."""
 
     def __init__(self, address):
         self.sock = socket.socket()
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        bind_exclusively(self.sock)
         self.sock.bind(address)
         self.sock.listen(1)
         self.server_address = self.sock.getsockname()

@@ -26,6 +26,7 @@ from functools import partial
 from pathlib import Path
 from typing import Callable
 
+from agitrack import paths
 from agitrack.commits import METADATA_HEADER
 from agitrack.commits.message import _token_metadata_lines, render_interaction_trace
 from agitrack.git import GitRepo
@@ -581,9 +582,12 @@ def _strip_worktree_prefix(rel: str) -> str:
     """``.agitrack/worktrees/<name>/pkg/mod.py`` -> ``pkg/mod.py``. Work an agent did inside an
     aGiTrack worktree is work on the repo (the worktree is merged back), so it must collapse onto
     the same file the repo knows rather than showing up as a separate phantom path."""
-    parts = rel.split("/")
+    parts = paths.slash(rel).split("/")
     if len(parts) > 3 and parts[0] == ".agitrack" and parts[1] == "worktrees":
         return "/".join(parts[3:])
+    # Returned AS GIVEN: a path that is already relative is the caller's own string, and a
+    # backslash in it may be part of a filename (legal on POSIX) rather than a separator.
+    # Only the absolute branch below, which builds its tail from a base, normalises.
     return rel
 
 
@@ -609,19 +613,25 @@ def _relativize(edit: FileEdit, bases: list[str]) -> FileEdit | None:
 
 
 def _display_path(path: str, bases: list[str]) -> str | None:
-    """``path`` as a directory-relative display path, or None when it lies outside the directory."""
-    if not path.startswith("/") and not path.startswith("~"):
+    """``path`` as a directory-relative display path, or None when it lies outside the directory.
+
+    Every comparison here is on path SHAPE, not on the local OS (see :mod:`agitrack.paths`):
+    a transcript records whatever the machine that wrote it used, and asking only whether a
+    path starts with "/" answered "already relative" for every Windows path there is - which
+    is how a reconstruction came to show ``diff --git a/C:\\Users\\...\\hello.py``."""
+    if not paths.is_absolute(path):
         return _strip_worktree_prefix(path)  # already relative
     for base in bases:  # longest (most specific) base first
-        base = base.rstrip("/")
-        if base and (path == base or path.startswith(base + "/")):
-            return _strip_worktree_prefix(path[len(base) + 1 :] or path)
+        tail = paths.relative_to(path, base)
+        if tail is not None:
+            return _strip_worktree_prefix(tail or paths.slash(path))
     # A shared/sanitized session keeps a worktree-style absolute path (e.g.
     # /Users/user/Code/x/.agitrack/worktrees/foo/pkg/mod.py) that matches no base; show the
     # path after the worktree segment so it still reads as repo-relative.
     marker = "/worktrees/"
-    if marker in path:
-        tail = path.split(marker, 1)[1]
+    flat = paths.slash(path)
+    if marker in flat:
+        tail = flat.split(marker, 1)[1]
         parts = tail.split("/", 1)
         if len(parts) == 2 and parts[1]:
             return parts[1]

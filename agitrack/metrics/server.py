@@ -365,10 +365,35 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
         """Stay quiet: the dashboard is a foreground tool, not a web log."""
 
 
+def bind_exclusively(sock: socket.socket) -> None:
+    """Ask for a port NOBODY else is on, on either family of socket semantics.
+
+    ``SO_REUSEADDR`` means two different things. On POSIX it only lets a new listener take a
+    port left in TIME_WAIT, and a port a live listener holds is still refused. On Windows it
+    means "bind even if another socket is already bound here", so two dashboards would both
+    bind 8765, the port scan below would never step past a taken port, and requests would
+    land on whichever socket the OS felt like. Windows spells the POSIX intent
+    ``SO_EXCLUSIVEADDRUSE``, which additionally stops anyone stealing OUR port."""
+    if os.name != "nt":
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        return
+    exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+    if exclusive is not None:
+        sock.setsockopt(socket.SOL_SOCKET, exclusive, 1)
+
+
 class _DashboardServer(http.server.ThreadingHTTPServer):
     # Threaded so one slow request (e.g. the first gh lookup) never blocks the
     # page; daemon threads so Ctrl-C exits immediately without joining them.
     daemon_threads = True
+
+    # socketserver would set SO_REUSEADDR for us; on Windows that is the wrong request
+    # entirely (see bind_exclusively), so take the option over completely.
+    allow_reuse_address = False
+
+    def server_bind(self) -> None:
+        bind_exclusively(self.socket)
+        super().server_bind()
 
     # A client that vanished mid-write surfaces as BrokenPipeError here too;
     # swallow it so the server doesn't print a traceback per dropped poll.

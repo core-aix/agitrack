@@ -8,6 +8,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from agitrack import paths
 from agitrack.backends.base import TokenUsage
 from agitrack.sessions.share_cap import select_kept_indices
 from agitrack.transcripts.edits import content_from_read_output, seed_file_state, tracked_edit
@@ -535,15 +536,19 @@ def import_shared_session(
 
 def _rewrite_path_prefixes(value, prefixes: tuple[str, ...], new: str):
     """Recursively rewrite any string under ``value`` that IS one of ``prefixes`` or sits under
-    it (``prefix + "/..."``) so its prefix becomes ``new``. Used to repoint a resumed session's
-    absolute file paths — tool ``file_path`` args, command output, mentions in text — from the
-    old worktree it ran in to the launch dir, so the agent edits there and not the old worktree."""
+    it so its prefix becomes ``new``. Used to repoint a resumed session's absolute file paths —
+    tool ``file_path`` args, command output, mentions in text — from the old worktree it ran in
+    to the launch dir, so the agent edits there and not the old worktree.
+
+    Matching is by path SHAPE (:mod:`agitrack.paths`): a transcript mixes separators freely
+    (``C:\\repo\\.agitrack\\worktrees\\x/app.py`` is one real example), and comparing raw
+    strings simply left every such path pointing at the worktree."""
     if isinstance(value, str):
         for prefix in prefixes:
-            if value == prefix:
-                return new
-            if value.startswith(prefix + "/"):
-                return new + value[len(prefix) :]
+            tail = paths.relative_to(value, prefix)
+            if tail is None:
+                continue
+            return new + ("/" + tail if tail else "")
         return value
     if isinstance(value, list):
         return [_rewrite_path_prefixes(item, prefixes, new) for item in value]
@@ -660,7 +665,9 @@ def retarget_session_cwd(repo: Path, session_id: str, cwd: str, *, git_branch: s
     # old worktree it sees throughout its history (tool file_path args, command output, mentions).
     # Scoped to our own ``.agitrack/worktrees/`` dirs so an imported session's unrelated absolute
     # paths (which don't exist in this repo anyway) are left alone — only its cwd field is aligned.
-    worktree_prefixes = tuple(d for d in (_recorded_cwds(original) - {cwd}) if "/.agitrack/worktrees/" in d)
+    worktree_prefixes = tuple(
+        d for d in (_recorded_cwds(original) - {cwd}) if paths.contains_segments(d, "/.agitrack/worktrees/")
+    )
     retargeted = _retarget_rows(original, cwd=cwd, rewrite_prefixes=worktree_prefixes, git_branch=git_branch)
     if retargeted == original:
         return False  # already at this cwd — leave the (possibly hardlinked) file alone
