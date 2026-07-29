@@ -49,6 +49,11 @@ html,body{overflow-x:hidden}
 [hidden]{display:none !important}
 a{color:var(--accent);text-decoration:none}
 a:hover{text-decoration:underline}
+/* On a phone the page IS the column: side padding that reads as breathing room on a desktop
+   is a tenth of the screen on a 390px one, and every table, diff and moment card pays for it.
+   Written as `body .wrap` so it outranks each page's own `.wrap` padding whatever order the
+   two blocks end up in. */
+@media (max-width:760px){body .wrap{padding-left:6px;padding-right:6px}}
 /* The spinner every page uses while something is loading. */
 .spin{width:13px;height:13px;border:2px solid var(--phosphor-dim);border-top-color:var(--phosphor);
   border-radius:50%;animation:spin .7s linear infinite;display:inline-block;flex:none}

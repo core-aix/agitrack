@@ -301,6 +301,29 @@ def test_the_number_of_parts_follows_the_history():
     assert story.part_target(episodes(55, 93)) == 5  # this repo, as it stands
     assert story.part_target(episodes(365, 400)) == 8  # and a long one is capped, not endless
     assert story.part_target(episodes(1, 2)) == 2
+    # A long, QUIET history is still shaped by its calendar: volume alone would tell two and a
+    # half years of occasional work as a couple of parts.
+    assert story.part_target(episodes(900, 40)) >= 4
+
+
+def test_seeing_less_of_a_project_does_not_change_its_shape_out_of_recognition():
+    """The same repo read two ways: the live dashboard sees every commit, a backtrace only
+    reaches as far back as the local transcripts do. The shorter view SHOULD have fewer parts
+    — it covers less — but it must still read as the same kind of story. Weighting elapsed
+    time equally with volume made this repo 5 parts live and 2 reconstructed, off a view that
+    held 57% of the days and 43% of the sittings."""
+
+    def episodes(days, count):
+        step = days * DAY / max(count - 1, 1)
+        return [
+            story.Episode(index=i, stats=[_stat(chr(97 + i % 26), "p", int(1_750_000_000 + i * step))])
+            for i in range(count)
+        ]
+
+    whole = story.part_target(episodes(56, 95))  # what the live dashboard sees
+    partial = story.part_target(episodes(32, 41))  # what a backtrace of the same repo sees
+    assert partial < whole, "a shorter view is a shorter story"
+    assert partial >= whole / 2, f"but not unrecognisably so ({partial} parts against {whole})"
 
 
 def test_the_agent_only_names_the_eras(tmp_path, monkeypatch):
@@ -968,6 +991,40 @@ def test_the_storyteller_is_told_that_changes_are_not_the_whole_picture():
     assert "what worked from the start left no trace" in story._STORY_SYSTEM.replace("\n", " ")
 
 
+def test_the_storyteller_follows_the_goals_not_the_machinery():
+    """What a reader wants from a project's story is what it was trying to DO and how that
+    changed. Left alone the model narrates the mechanism, because that is what a diff is made
+    of: the cache, the flag, the refactor."""
+    assert "What the project was TRYING TO DO, and how that changed, is the story" in story._STORY_SYSTEM
+    assert "the implementation is the evidence, not the subject" in story._STORY_SYSTEM
+    episode = story.Episode(index=0, stats=[_stat("a", "do the thing", 1_750_000_000)])
+    assert "Follow the GOALS, not the machinery." in story._batch_prompt([episode], "plain", "")
+
+
+def test_the_first_moment_of_a_repo_says_what_it_set_out_to_do(tmp_path, monkeypatch):
+    """The first commits are the one place the material can answer "what was this for?", and
+    it is the frame every later moment is read against. A telling that starts in the middle —
+    the newest part, or a picked range of days — must NOT claim to."""
+    repo = _repo_with_history(tmp_path, prompts=[f"step {i}" for i in range(6)], gap_days=1)
+    stats, sha_paths = _view_of(repo)
+
+    fake = _fake_agent(monkeypatch, [_moment_reply([{"n": 1, "title": "It began", "summary": "s"}]), _ARC])
+    story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
+    # A rewrite tells the NEWEST part, which does not reach the first commit.
+    assert "BEGINNING OF THIS PROJECT" not in fake.prompts[0]
+
+    story.StoryStore(tmp_path).drop("main")
+    oldest = story.story_stats(stats)[0].timestamp
+    window = story.in_range(stats, oldest, oldest + 2 * DAY)
+    fake = _fake_agent(monkeypatch, [_moment_reply([{"n": 1, "title": "It began", "summary": "s"}]), _ARC])
+    story.build_story(tmp_path, window, sha_paths, branch="main", mode="rewrite", since=oldest)
+
+    opening = fake.prompts[0]
+    assert "Episode 1 is the BEGINNING OF THIS PROJECT" in opening
+    assert "what the project set out to do" in opening
+    assert "reading it out of those first commits" in opening
+
+
 # ============================================================================
 # THE PAGE: every control, and what it looks like
 # ============================================================================
@@ -1146,10 +1203,29 @@ def test_going_further_back_is_gone():
 
 
 def test_the_page_no_longer_carries_the_features_that_did_not_work():
-    """Story mode and the keyboard shortcuts were removed: nothing may reference them."""
+    """Story mode and the j/k keyboard shortcuts were removed: nothing may reference them."""
     html = _page()
-    for gone in ["playStory", "cineStep", "cinebar", 'id="play"', "keydown", "PAGE_MOMENTS"]:
+    for gone in ["playStory", "cineStep", "cinebar", 'id="play"', "PAGE_MOMENTS"]:
         assert gone not in html, f"{gone} is still on the page"
+    # No document-level shortcut scheme either — that was the part nobody could discover. The
+    # only keys the page answers are Enter and Space on a card the reader has FOCUSED, which
+    # is simply what a role="button" owes the keyboard.
+    assert 'document.addEventListener("keydown"' not in html
+    assert 'if (e.key !== "Enter" && e.key !== " ") return;' in html
+
+
+def test_the_reader_is_told_that_parts_and_moments_open():
+    """A hover-only affordance says nothing until the pointer happens to land on something,
+    and nothing at all on a touch screen. Both lists say what they do, above them."""
+    html = _page()
+    assert "Tap or click any part to read the moments inside it." in html
+    assert "Tap or click a moment to read it" in html
+    assert 'class="howto"' in html and ".howto{color:var(--fg-dim)" in html
+    # ...and each card is a real control: labelled, focusable, and keyboard-operable.
+    assert 'role="button" tabindex="0" title="Open this part"' in html
+    assert 'role="button" tabindex="0" title="Open this moment' in html
+    assert "open this part &rarr;" in html and "read this moment &darr;" in html
+    assert ".era:focus-visible,.ch:focus-visible{outline:2px solid var(--phosphor)" in html
 
 
 def test_generation_waits_say_which_model_is_doing_it():

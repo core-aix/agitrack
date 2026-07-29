@@ -190,6 +190,20 @@ def test_every_page_is_readable_on_a_phone(pages):
         assert "overflow-x:hidden" in html, name
 
 
+def test_every_page_uses_the_whole_screen_on_a_phone(pages):
+    """Side padding that reads as breathing room on a desktop is a tenth of a 390px screen, and
+    every table, diff and moment card pays for it. One rule for all three, written as
+    `body .wrap` so it outranks each page's own `.wrap` padding whatever order they land in —
+    and no page may quietly reintroduce its own."""
+    assert "@media (max-width:760px){body .wrap{padding-left:6px;padding-right:6px}}" in ui.BASE_CSS
+    for name, html in pages.items():
+        assert ui.BASE_CSS in html, name
+        narrow = "\n".join(re.findall(r"@media \(max-width:\s*\d+px\)\s*{(.*?)}\s*\n", html, re.S))
+        assert not re.search(r"(?<!body )\.wrap{[^}]*padding(-left|-right)?:", narrow), (
+            f"{name} sets its own side padding on a phone; the shared rule is the one place for it"
+        )
+
+
 def test_every_page_links_to_the_others(pages):
     """The three pages are one product: from any of them you can reach the other two."""
     assert 'id="storylink"' in pages["dashboard"] and 'id="learnlink"' in pages["dashboard"]

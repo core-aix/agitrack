@@ -1193,7 +1193,7 @@ footer .flink:hover{text-decoration:underline}
    override must come AFTER the base rule it targets (the earlier phone block above only
    works because the filter-bar rules it overrides are declared before it). */
 @media (max-width:760px){
-  .wrap{padding-left:6px;padding-right:6px}
+  /* .wrap's own side padding is shared (ui.BASE_CSS) so all three pages gain the width. */
   .panel,.card{padding-left:12px;padding-right:12px}
   /* Rail line and entry dots stay concentric at the narrower offset. */
   .log{padding-left:18px}
