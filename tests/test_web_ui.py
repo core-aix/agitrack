@@ -82,6 +82,27 @@ def test_a_commit_renders_identically_wherever_it_is_opened(pages):
     assert "max-height" not in ui.COMMIT_CSS
 
 
+def test_a_page_cannot_leak_its_own_styling_into_a_commit_message(pages):
+    """ "The same renderer" is not enough: the story page styles its OWN section headings in
+    small caps and indents its own markdown lists, and both rules reached into a commit message
+    rendered inside them — a "## User" heading came out UPPERCASE and its bullets sat further
+    in than the dashboard's. So the shared block pins the properties it would otherwise leave
+    to inheritance, and the page's own rules name the element they mean."""
+    # Pinned here, once, for every page that renders a commit.
+    start = ui.COMMIT_CSS.index(".dmsg.md .md-h{")
+    headings = ui.COMMIT_CSS[start : ui.COMMIT_CSS.index("}", start)]
+    for pinned in ("text-transform:none", "letter-spacing:normal", "text-align:left", "font-style:normal"):
+        assert pinned in headings, f"a host page can still change {pinned.split(':')[0]} on a commit heading"
+    assert ".dmsg.md ul,.dmsg.md ol{margin:6px 0 6px 18px;padding-left:0" in ui.COMMIT_CSS
+
+    # ...and the story page's own headings are scoped to themselves, not to every h4 that
+    # happens to sit inside the same box as a commit.
+    story_page = pages["story"]
+    assert ".commits > h4{" in story_page and ".thoughts > h4{" in story_page
+    for leaky in (".commits h4{", ".thoughts h4{"):
+        assert leaky not in story_page, f"{leaky} reaches into the commit messages below it"
+
+
 def test_the_button_that_flips_a_commit_looks_the_same_in_all_three_places(pages):
     """The dashboard's log detail, its file browser and a story moment each have a button that
     swaps a commit's message for its file changes. They are one control under three names, and

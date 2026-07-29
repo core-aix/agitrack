@@ -978,8 +978,29 @@ def test_stopping_a_build_releases_the_reader_at_once(tmp_path, monkeypatch):
         assert answer["stopped"] is True
         progress = story.build_progress(tmp_path, "main")
         assert progress["running"] is False and progress["phase"] == "stopped"  # at once, not later
+        assert progress["error"] == "", "a stop the reader asked for is not a failure"
     finally:
         release.set()
+    # ...and it stays that way once the abandoned worker notices and unwinds, so the page is
+    # not told the same news a second time, in red.
+    for _ in range(50):
+        if not story._BUILDS[story.build_key(tmp_path, "main")]["thread"].is_alive():
+            break
+        time.sleep(0.1)
+    assert story.build_progress(tmp_path, "main")["error"] == ""
+
+
+def test_the_page_does_not_promise_to_stop_later(tmp_path):
+    """Stopping IS immediate: the build is marked stopped and abandoned the moment the button
+    is pressed. The page used to say it would "stop after the moment being written", which was
+    true when a reader had to wait out that call and afterwards just looked stuck."""
+    html = _page()
+    assert "stopping after the moment being written" not in html
+    # It closes and says what was kept, right there in the handler.
+    cancel = html[html.index('$("build-cancel").addEventListener') :]
+    cancel = cancel[: cancel.index("});")]
+    for step in ("stopPolling();", "hideOverlay();", 'notice("Stopped. The moments already written are kept.")'):
+        assert step in cancel, step
         time.sleep(0.3)
 
 

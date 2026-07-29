@@ -1441,7 +1441,8 @@ def start_build(
                 )
                 _set_progress(key, running=False, phase="done")
             except StoryError as exc:
-                _set_progress(key, running=False, phase="stopped", error=str(exc))
+                stopped_by_reader = str(exc) == "cancelled"
+                _set_progress(key, running=False, phase="stopped", error="" if stopped_by_reader else str(exc))
             except Exception as exc:  # never lose the reason in a background thread
                 _set_progress(key, running=False, phase="stopped", error=f"{type(exc).__name__}: {exc}")
 
@@ -1833,7 +1834,7 @@ h2.section{font-size:13px;letter-spacing:1.5px;text-transform:uppercase;color:va
 .more .notice{border:1px solid var(--amber);color:var(--amber);background:var(--panel2);padding:9px 12px;
   border-radius:6px;font-size:12.5px}
 .thoughts{margin:16px 0 0}
-.thoughts h4{font-size:11.5px;letter-spacing:1.5px;text-transform:uppercase;color:var(--amber);
+.thoughts > h4{font-size:11.5px;letter-spacing:1.5px;text-transform:uppercase;color:var(--amber);
   margin:0 0 9px;font-weight:600}
 .th{border-left:2px solid var(--amber-dim);padding:2px 0 2px 12px;margin:0 0 12px}
 .th .q{color:var(--fg);font-size:13px;line-height:1.6;white-space:pre-wrap;word-break:break-word}
@@ -1894,7 +1895,10 @@ body.anim .ch.in,body.anim .era.in{opacity:1;transform:none}
   border-radius:4px;padding:2px 7px;word-break:break-all}
 
 .commits{margin:16px 0 0;min-width:0}
-.commits h4{font-size:11.5px;letter-spacing:1.5px;text-transform:uppercase;color:var(--phosphor);
+/* The section's OWN heading only ("the commits themselves"), never a heading inside one of
+   the commit messages below it: those are rendered by the shared commit renderer and must
+   look exactly as they do on the dashboard. */
+.commits > h4{font-size:11.5px;letter-spacing:1.5px;text-transform:uppercase;color:var(--phosphor);
   margin:0 0 8px;font-weight:600}
 /* The same commit row as the dashboard's log: same badge colours, same line counts, plus
    who committed it and when. */
@@ -2858,7 +2862,9 @@ function renderBuild(p){
   const running = !!(p && p.running);
   state.building = running;
   $("overlay").hidden = !running;
-  if (p && p.error && !running) fail(p.error === "cancelled" ? "Stopped. The moments already written are kept." : p.error);
+  // A stop is not an error and the server no longer reports it as one (the page says so
+  // itself, the moment the button is pressed), so anything left here is a real failure.
+  if (p && p.error && !running) fail(p.error);
   if (!running) { renderStudio(); return; }
   $("build-phase").textContent = p.phase || "working";
   $("build-cancel").hidden = false;
@@ -3024,11 +3030,18 @@ $("forget").addEventListener("click", async () => {
   catch (e) { fail(e.message); }
 });
 $("build-cancel").addEventListener("click", async () => {
-  // Say so at once: the call in flight still has to come back, and a button that looks
-  // like it did nothing invites a second, third, fourth click.
-  $("build-phase").textContent = "stopping after the moment being written…";
+  // Stopping IS immediate now: the build is marked stopped and abandoned the moment this is
+  // pressed, whatever its last backend call eventually returns is discarded, and it can no
+  // longer refuse the next telling. So the page closes and says what is kept, instead of the
+  // old promise to "stop after the moment being written" - which was true when a reader had
+  // to wait out that call, and became a page that sat there looking stuck.
   $("build-cancel").disabled = true;
+  state.building = false;
+  stopPolling();
+  hideOverlay();
+  notice("Stopped. The moments already written are kept.");
   try { await post("story/cancel", {branch: state.branch}); } catch (e) {}
+  load().catch(() => {});     // ...and show exactly what that is
 });
 // Which days to tell: the dashboard's control, wired the same way (see ui.RANGE_JS).
 bindRangeControl(() => { state.touchedRange = true; applyPeriod(); markStale(); });
