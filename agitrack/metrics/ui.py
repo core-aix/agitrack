@@ -110,7 +110,28 @@ function dateToTs(value, endOfDay){
   const ts = Date.parse(value + "T00:00:00Z") / 1000;
   return isNaN(ts) ? 0 : (endOfDay ? ts + DAY_SECONDS - 1 : ts);
 }
-const ymd = ts => ts ? new Date(ts * 1000).toISOString().slice(0, 10) : "";"""
+const ymd = ts => ts ? new Date(ts * 1000).toISOString().slice(0, 10) : "";
+
+// Wire the control: the preset list, the custom popup, and closing it. `apply` is the page's
+// own "the range changed" handler.
+//
+// The click listener on the select is not redundant with change. Picking "custom range…"
+// when it is ALREADY the choice fires no change event (the value did not change), so the
+// popup never reopened and there was no way to go from one custom range to another without
+// first selecting some other preset.
+function bindRangeControl(apply){
+  const period = $("f-period"), box = $("daterange");
+  const open = on => { box.hidden = !on; };
+  period.addEventListener("change", () => { open(period.value === "custom"); apply(); });
+  period.addEventListener("click", () => { if (period.value === "custom") open(true); });
+  const picked = () => { period.value = "custom"; apply(); };
+  $("f-from").addEventListener("change", picked);
+  $("f-to").addEventListener("change", picked);
+  $("dr-done").addEventListener("click", () => open(false));
+  document.addEventListener("click", event => {
+    if (!box.hidden && !event.target.closest(".period-field")) open(false);
+  });
+}"""
 
 # --------------------------------------------------------------------------- notices
 

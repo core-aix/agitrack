@@ -991,7 +991,10 @@ def _material(
     * ``rewrite`` - the newest part; replaces the story.
     * ``part`` - the named part.
     * ``extend`` - what landed after the story's newest covered commit; appends.
-    * ``earlier`` - the next part back from the oldest one told; prepends.
+
+    Reaching further BACK used to be a mode of its own, behind a "go further back" button.
+    It was removed: nobody could tell what it would give them, and choosing the days to tell
+    (the range control) says the same thing precisely.
     """
     kept = story_stats(stats)
     if not kept:
@@ -1014,16 +1017,6 @@ def _material(
         if era is None:
             return [], "append"
         return inside(era, fresh_only=True), "merge"
-    if mode == "earlier":
-        # The next part back that still has something untold, so "further back" walks parts
-        # rather than an arbitrary number of sittings.
-        for era in reversed(eras):
-            window = inside(era, fresh_only=True)
-            if window and window[0].timestamp <= min(
-                (moment.get("from", 0) for moment in (story.get("moments") or [])), default=0
-            ):
-                return window, "merge"
-        return [], "prepend"
     newest = max((moment.get("to", 0) for moment in story.get("moments") or []), default=0)
     return [stat for stat in kept if stat.sha not in covered and (not newest or stat.timestamp >= newest)], "append"
 
@@ -1203,16 +1196,6 @@ def _assemble(
         "built_at": int(time.time()),
         "partial": partial,
         "engine": {"backend": choice.backend_name, "model": choice.model or ""},
-        # Whether anything older is still untold. A telling covers one part, so this is
-        # simply "are there commits before the oldest moment that nobody has told".
-        "more_earlier": bool(
-            [
-                stat
-                for stat in by_sha.values()
-                if stat.sha not in covered_shas
-                and stat.timestamp < min((moment.get("from", 0) for moment in moments), default=0)
-            ]
-        ),
     }
     for field_name in ("title", "tagline", "arc", "eras"):
         if existing and existing.get(field_name):
@@ -1523,7 +1506,7 @@ def handle_story_post(
         if path == "/story/build":
             stats, sha_paths = view(branch)
             mode = str(body.get("mode") or "extend")
-            if mode not in ("extend", "rewrite", "earlier", "part"):
+            if mode not in ("extend", "rewrite", "part"):
                 mode = "extend"
             # The reader's chosen days scope the WHOLE build: the parts are computed over the
             # range too, so a story of one week is that week split into parts, not a week's
@@ -1683,6 +1666,18 @@ select,input[type=text]{background:var(--panel2);border:1px solid var(--line);co
 .btn.primary:hover{background:var(--phosphor);color:var(--ink)}
 .btn.small{padding:4px 10px;font-size:11.5px}
 .btn[disabled]{opacity:.45;cursor:not-allowed}
+/* An armed destructive button. It is the same button one press later, so it has to STOP
+   looking like the one that was pressed: red, filled, and pulsing until it is used or the
+   note beside it is dismissed. */
+.btn.danger{border-color:var(--bad);color:var(--ink);background:var(--bad);font-weight:600;
+  animation:armed 1.1s ease-in-out infinite}
+.btn.danger:hover{border-color:var(--bad);color:var(--ink);background:#ff8a8a}
+@keyframes armed{50%{box-shadow:0 0 0 4px rgba(255,107,107,.22)}}
+/* A setting changed with a story already on screen: the story is now out of date with the
+   controls above it, and nothing happens until this is pressed. */
+.btn.stale{border-color:var(--phosphor);color:var(--phosphor);background:#0f2a1c}
+.btn.stale:hover{background:var(--phosphor);color:var(--ink)}
+@media (prefers-reduced-motion: reduce){.btn.danger{animation:none}}
 .hint{color:var(--fg-dim);font-size:12px;margin-top:8px;line-height:1.5}
 .gobtn{font-family:var(--display);font-size:23px;letter-spacing:.5px;background:transparent;
   border:1px solid var(--phosphor);color:var(--phosphor);padding:6px 20px;border-radius:6px;cursor:pointer;
@@ -1801,7 +1796,6 @@ h2.section{font-size:13px;letter-spacing:1.5px;text-transform:uppercase;color:va
 .era h3{margin:0 0 3px;font-size:16px;color:var(--fg)}
 .era .sum{margin:0}
 .era .lit{color:var(--phosphor-dim)}
-.morewrap{display:flex;gap:10px;flex-wrap:wrap;margin:16px 0 0}
 __UI_ENGINE_CSS__
 .actmeta{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-top:8px;
   color:var(--fg-dim);font-size:11.5px}
@@ -1961,7 +1955,6 @@ __BACKTRACE_BANNER__
     <div class="row" id="actions">
       <button class="gobtn" id="write">&#10024; tell me the story</button>
       <button class="btn" id="extend" hidden>&#10133; catch up on what is new</button>
-      <button class="btn" id="earlier" hidden>&#8617; go further back</button>
       <button class="btn" id="rewrite" hidden>&#8635; tell it again</button>
       <button class="btn small" id="forget" hidden>forget this story</button>
     </div>
@@ -1987,10 +1980,6 @@ __BACKTRACE_BANNER__
   <div id="skeleton" class="skel" hidden><div></div><div></div><div></div></div>
   <div id="eras" hidden></div>
   <div id="timeline"></div>
-  <div id="morewrap" class="morewrap" hidden>
-    <button class="btn" id="earlier2">&#8617; go further back</button>
-  </div>
-
   <div class="outline" id="outlinewrap" hidden>
     <h2 class="section" id="outlinehead">the shape of it</h2>
     <div class="hint" id="outlinehint"></div>
@@ -2032,7 +2021,10 @@ const state = {
   poll: null, building: false,
   // Which days a telling covers. 0/0 is the whole history; anything else scopes the commits
   // the agent reads, which is how a reader asks for a closer look at a stretch of work.
-  fromTs: 0, toTs: 0,
+  fromTs: 0, toTs: 0, touchedRange: false,
+  // The settings the story on screen was told with, so a change to any of them can be shown
+  // on the button that applies it.
+  told0: "", lastMode: "",
   // Depth 2 is the top: the parts. You walk in from there; normalizeZoom() drops to the
   // flat moment list for a story that has no parts.
   zoom: 2, part: null
@@ -2105,6 +2097,17 @@ function rangeLabel(){
   const span = historySpan();
   return ymd(state.fromTs || span.from) + " → " + ymd(state.toTs || span.to || Math.floor(Date.now() / 1000));
 }
+// Put the control back to the range the stored story was told for.
+function adoptStoryRange(){
+  const range = (state.story && state.story.range) || {};
+  const from = Number(range.from || 0), to = Number(range.to || 0);
+  state.fromTs = from; state.toTs = to;
+  if (!from && !to) { $("f-period").value = ""; return; }
+  $("f-period").value = "custom";
+  $("f-from").value = ymd(from || (state.data && state.data.meta && state.data.meta.first) || 0);
+  $("f-to").value = ymd(to || (state.data && state.data.meta && state.data.meta.last) || 0);
+}
+
 function renderRangeHint(){
   if (!state.fromTs && !state.toTs) { $("rangehint").textContent = "the whole history"; return; }
   const n = commitsInRange();
@@ -2163,10 +2166,14 @@ async function load(attempt){
     state.data = await r.json();
     state.story = state.data.story;
     if (!state.branch && state.data.branch) state.branch = state.data.branch;
-      if (state.story && state.story.tone) state.tone = state.story.tone;
+    if (state.story && state.story.tone) state.tone = state.story.tone;
     if (state.story && state.story.note && !$("f-note").value) $("f-note").value = state.story.note;
+    // Show the controls the story on screen was actually told with, so "these settings" means
+    // something the reader can see, and a change to any of them is visibly a change.
+    if (!state.touchedRange) adoptStoryRange();
     state.loadFailed = false;
     render();
+    state.told0 = state.story ? settingsKey() : "";
   } catch (error) {
     if (attempt < 3) {                        // a dropped fetch is normal; a broken page is not
       await new Promise(done => setTimeout(done, 400 * (attempt + 1)));
@@ -2260,11 +2267,10 @@ function renderStudio(){
   const engineBroken = !!(d.engine && d.engine.error);
   $("write").hidden = has;
   $("extend").hidden = !has || !m.uncovered;
-  $("earlier").hidden = !(has && s.more_earlier);
   $("rewrite").hidden = !has;
   $("forget").hidden = !has;
   if (m.uncovered && has) $("extend").innerHTML = "&#10133; add the " + m.uncovered + " new commit" + (m.uncovered === 1 ? "" : "s");
-  for (const id of ["write","extend","earlier","rewrite"]) $(id).disabled = state.building || engineBroken;
+  for (const id of ["write","extend","rewrite"]) $(id).disabled = state.building || engineBroken;
   let hint;
   if (engineBroken)
     hint = "There is no coding agent configured here, so nobody can tell it yet. Run an aGiTrack session in this repo, or pick one below under \"who tells it\". The outline further down is built from the commits alone and needs no agent at all.";
@@ -2276,8 +2282,23 @@ function renderStudio(){
   else
     hint = "Click a part to go inside it, and a moment to have your agent write it out, once, then keep it. " +
            (m.uncovered ? m.uncovered + " commit" + (m.uncovered === 1 ? " has" : "s have") + " landed since. " : "") +
-           (s && s.more_earlier ? "Further back is told on request; the parts already cover the whole project." : "");
+           "To read a different stretch of history, pick the days above and tell it again.";
   $("studiohint").textContent = hint;
+  markStale();
+}
+
+// Changing a setting does nothing on its own: the story on screen was written with the OLD
+// ones and only a new telling applies the new ones. Say so on the button that does it, and
+// on the button itself rather than in a line of hint text nobody reads twice.
+function settingsKey(){
+  return [state.tone, state.fromTs || 0, state.toTs || 0, $("f-note").value.trim()].join("|");
+}
+function markStale(){
+  const button = $("rewrite");
+  if (button.hidden || button.dataset.armed) return;      // armed has its own, louder, look
+  const stale = !!state.told0 && settingsKey() !== state.told0;
+  button.classList.toggle("stale", stale);
+  button.innerHTML = stale ? "&#8635; tell it again with these settings" : "&#8635; tell it again";
 }
 
 // The story has two depths and you walk between them:
@@ -2392,8 +2413,6 @@ function renderTimeline(){
   const host = $("timeline");
   const part = currentPart();
   const all = momentsInView();
-  $("morewrap").hidden = true;
-
   if (state.zoom < 3) { host.innerHTML = ""; return; }        // the parts view owns the page
   if (!all.length) {                                          // an untold part explains itself
     host.innerHTML = part
@@ -2409,9 +2428,6 @@ function renderTimeline(){
   newestFirst.forEach((moment, position) => { html += momentHtml(moment, position); });
   host.innerHTML = html + "</div>";
 
-  // Reaching further back than the story currently goes is the one thing left to offer from
-  // inside a part; wanting a CLOSER look is answered by telling a narrower range of days.
-  if (part && (state.story || {}).more_earlier) $("morewrap").hidden = false;
   for (const id of state.open) {
     const el = document.getElementById("ch-" + id);
     if (el) { el.classList.add("open"); fillMoment(el, false); }
@@ -2764,13 +2780,13 @@ function renderBuild(p){
 const BUILD_OPENING = {
   rewrite: "reading your history…",
   extend:  "reading the commits that landed since…",
-  earlier: "reading further back…",
   part:    "reading this part…",
 };
 
 async function build(mode){
   if (state.building) return;
   flash("");
+  state.lastMode = mode;
   state.building = true; renderStudio();
   // At the click, not when the server answers. Starting a build is a POST that has to reach
   // the daemon and hand the work to a thread; waiting for it left about a second in which
@@ -2813,7 +2829,13 @@ function startPolling(){
       if (!data.building || !data.building.running) {
         stopPolling();
         $("skeleton").hidden = true;
+        // A telling that rewrote the story rewrote its PARTS too, so wherever the reader was
+        // standing may not exist any more. Land them on the parts, which is where a new story
+        // starts, unless they had asked for one named part - then stay in it and read it.
+        if (state.lastMode !== "part") setZoom(2);
         render();                          // one final, complete paint
+        state.told0 = state.story ? settingsKey() : "";
+        markStale();
         if (after) celebrate();
       }
     } catch (e) { /* a poll that fails is retried by the next one */ }
@@ -2868,10 +2890,11 @@ $("tone-chips").addEventListener("click", e => {
   const chip = e.target.closest(".chip"); if (!chip) return;
   state.tone = chip.dataset.v;
   for (const c of $("tone-chips").querySelectorAll(".chip")) c.classList.toggle("sel", c === chip);
+  markStale();
 });
+$("f-note").addEventListener("input", markStale);
 $("write").addEventListener("click", () => build("rewrite"));
 $("extend").addEventListener("click", () => build("extend"));
-$("earlier").addEventListener("click", () => build("earlier"));
 $("rewrite").addEventListener("click", () => {
   // It is destructive and it is not obvious: everything written so far goes, including the
   // moments someone paid an agent call each to open. Say so, and make them mean it.
@@ -2881,6 +2904,10 @@ $("rewrite").addEventListener("click", () => {
   if (!$("rewrite").dataset.armed) {
     $("rewrite").dataset.armed = "1";
     $("rewrite").innerHTML = "&#9888; yes, throw it away and start over";
+    // Red, filled and pulsing: the confirm must not look like the button just pressed, or a
+    // second click lands on it by muscle memory rather than by decision.
+    $("rewrite").classList.add("danger");
+    $("rewrite").classList.remove("stale");
     notice("Telling it again starts from scratch: the " + told + " moment" + (told === 1 ? "" : "s") +
       " you have now" + (written ? " (" + written + " already written out)" : "") +
       " are deleted, and your agent lays out the newest stretch again from the commits. " +
@@ -2894,7 +2921,9 @@ $("rewrite").addEventListener("click", () => {
 });
 function disarmRewrite(){
   delete $("rewrite").dataset.armed;
+  $("rewrite").classList.remove("danger");
   $("rewrite").innerHTML = "&#8635; tell it again";
+  markStale();
 }
 $("forget").addEventListener("click", async () => {
   try { await post("story/forget", {branch: state.branch}); state.open.clear(); await load(); notice("Forgotten. The commits are untouched; the telling is gone."); }
@@ -2907,18 +2936,8 @@ $("build-cancel").addEventListener("click", async () => {
   $("build-cancel").disabled = true;
   try { await post("story/cancel", {branch: state.branch}); } catch (e) {}
 });
-$("earlier2").addEventListener("click", () => build("earlier"));
-// Which days to tell. The custom popup opens from the preset list and closes on "done" or on
-// a click anywhere outside it, exactly as it does on the dashboard.
-const showDateRange = on => { $("daterange").hidden = !on; };
-$("f-period").addEventListener("change", () => { showDateRange($("f-period").value === "custom"); applyPeriod(); });
-const onDate = () => { $("f-period").value = "custom"; applyPeriod(); };
-$("f-from").addEventListener("change", onDate);
-$("f-to").addEventListener("change", onDate);
-$("dr-done").addEventListener("click", () => showDateRange(false));
-document.addEventListener("click", e => {
-  if (!$("daterange").hidden && !e.target.closest("#periodwrap")) showDateRange(false);
-});
+// Which days to tell: the dashboard's control, wired the same way (see ui.RANGE_JS).
+bindRangeControl(() => { state.touchedRange = true; applyPeriod(); markStale(); });
 $("e-backend").addEventListener("change", () => { $("e-backend").dataset.touched = "1"; loadModels(null); });
 $("e-save").addEventListener("click", saveEngine);
 $("eras").addEventListener("click", e => {

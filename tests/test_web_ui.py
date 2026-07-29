@@ -99,6 +99,24 @@ def test_the_button_that_flips_a_commit_looks_the_same_in_all_three_places(pages
         assert rendered in pages[name], f"{name} no longer renders {rendered}"
 
 
+def test_both_pages_pick_a_date_range_the_same_way(pages):
+    """The dashboard filters what it SHOWS with this control and the story page scopes what it
+    TELLS, but it is one control: same presets, same custom popup, same UTC dates, one wiring
+    helper. That helper also fixes what a plain `change` listener cannot - picking "custom
+    range…" when it is already the choice fires no event, so the popup never reopened and a
+    reader could not go from one custom range to another."""
+    for name in ("dashboard", "story"):
+        html = pages[name]
+        assert ui.RANGE_CSS in html, f"{name} styles the range control itself"
+        assert ui.RANGE_JS in html, f"{name} wires the range control itself"
+        assert ui.RANGE_OPTIONS in html, f"{name} offers its own presets"
+        assert "bindRangeControl(" in html, f"{name} does not use the shared wiring"
+        for control in ('id="f-period"', 'id="f-from"', 'id="f-to"', 'id="dr-done"', 'id="daterange"'):
+            assert control in html, f"{name} is missing {control}"
+    assert 'period.addEventListener("click", () => { if (period.value === "custom") open(true); });' in ui.RANGE_JS
+    assert 'Date.parse(value + "T00:00:00Z")' in ui.RANGE_JS  # one timezone, both pages
+
+
 def test_a_page_says_what_went_wrong_in_one_place(pages):
     """Notices and errors float as ONE fixed toast at the bottom. The story page used to
     render its errors inline in the middle of the document while the learn page showed the

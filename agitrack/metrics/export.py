@@ -321,28 +321,35 @@ def _shim(*, base: str, files_index: dict[str, int], page: str, site_root: str) 
     }};
     if (LEARN) {{ relink("backlink", "../"); relink("storylink", "../story/"); }}
     if (STORY) {{ relink("backlink", "../"); relink("learnlink", "../learn/"); }}
-    // Writing a story needs a live agent; every control that would start (or undo) one
-    // answers with the same fixed toast as the dashboard's disabled filters.
+    // Writing a story needs a live agent, so the WHOLE studio is off in a snapshot: the
+    // voice, the days, the extra instruction, and every button that would start or undo a
+    // telling. Half-live controls were worse than none - a reader could pick a style and a
+    // date range, watch them change nothing, and only find out why at the last button.
+    // Delegated on the document (capture) so it also covers what the page draws later.
     if (STORY) {{
-      ["write", "extend", "earlier", "earlier2", "rewrite", "forget", "build-cancel", "e-save"].forEach(function(id){{
-        var el = document.getElementById(id);
-        if (!el) return;
-        el.addEventListener("click", function(e){{
-          e.preventDefault(); e.stopImmediatePropagation(); showNote();
-        }}, true);
-      }});
-      // ...and the ones the page draws as it goes (telling a part that has no moments yet)
-      // are matched by SELECTOR on the document, because they do not exist at this point.
-      // Missing that case meant such a button ran into the blocked POST and reported a red
-      // failure in the middle of the page instead of the note everything else shows.
       document.addEventListener("click", function(e){{
-        if (!e.target.closest || !e.target.closest(".zpart")) return;
+        if (!e.target.closest) return;
+        if (!e.target.closest("#studio, .zpart, #e-save")) return;
         e.preventDefault(); e.stopImmediatePropagation(); showNote();
       }}, true);
-      // The page disables those buttons while it thinks a build is running or the engine is
+      // A select opens its menu on mousedown, before any click lands.
+      document.addEventListener("mousedown", function(e){{
+        if (!e.target.closest || !e.target.closest("#studio")) return;
+        e.preventDefault(); showNote();
+      }}, true);
+      // ...and the text box would still take a caret and typing.
+      var note = document.getElementById("f-note");
+      if (note) {{ note.readOnly = true; note.addEventListener("focus", function(){{ note.blur(); showNote(); }}); }}
+      // Say it before it is clicked, too: the whole panel reads as unavailable.
+      var studio = document.getElementById("studio");
+      if (studio) {{
+        studio.style.cursor = "not-allowed";
+        studio.title = "Telling a story needs a live install. " + NOTE;
+      }}
+      // The page disables its buttons while it thinks a build is running or the engine is
       // missing; here they must stay clickable so the toast can explain why nothing happens.
       var keepLive = function(){{
-        ["write", "extend", "earlier", "rewrite"].forEach(function(id){{
+        ["write", "extend", "rewrite"].forEach(function(id){{
           var el = document.getElementById(id);
           if (el) el.disabled = false;
         }});
