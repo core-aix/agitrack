@@ -10,6 +10,7 @@ from pathlib import Path
 
 from agitrack import cli
 from agitrack.metrics.export import export_static_demo
+from agitrack.metrics.collect import build_dashboard
 from agitrack.metrics.web import GRANULARITIES, LOG_SORTS, PAGE_SIZE
 
 from tests.test_dashboard import _demo_repo, _write_lines
@@ -116,6 +117,86 @@ def test_the_demo_answers_every_unavailable_action_the_same_way(tmp_path, monkey
     # And the safety net: whatever still reaches the page's error path is shown as a notice.
     assert "if ((LEARN || STORY) && typeof window.flash === " in story
     assert 'html.replace(/class="error"/g, \'class="notice"\')' in story
+
+
+def test_each_exported_page_can_be_posted_on_its_own(tmp_path, monkeypatch):
+    """Any one of the three may be linked somewhere else, so each carries its OWN card: a
+    title that says what the thing IS (the served page titles itself for the person looking at
+    THEIR repo), a description, and a preview image. Absolute URLs throughout — a crawler
+    fetching /dashboard/story/ cannot resolve a relative image, and a broken card is worse than
+    no card."""
+    out = _export(tmp_path, monkeypatch)
+    pages = {
+        "dash": (out / "index.html").read_text(encoding="utf-8"),
+        "learn": (out / "learn" / "index.html").read_text(encoding="utf-8"),
+        "story": (out / "story" / "index.html").read_text(encoding="utf-8"),
+    }
+    from agitrack.metrics.export import _SITE, _SOCIAL
+
+    seen_titles, seen_images = set(), set()
+    for name, html in pages.items():
+        card = _SOCIAL[name]
+        assert f"<title>{card['title']}</title>" in html, f"{name} keeps its in-repo title"
+        for tag in ("og:title", "og:description", "og:image", "og:url", "twitter:card", "twitter:image"):
+            assert tag in html, f"{name} is missing {tag}"
+        assert f'<meta name="description" content="{card["description"]}">' in html
+        assert f'<meta property="og:url" content="{_SITE}{card["path"]}">' in html
+        assert f'<link rel="canonical" href="{_SITE}{card["path"]}">' in html
+        assert card["image"].startswith("https://"), "a relative preview image cannot be crawled"
+        seen_titles.add(card["title"])
+        seen_images.add(card["image"])
+    # Three pages, three cards: posting the story must not show the dashboard's screenshot.
+    assert len(seen_titles) == 3 and len(seen_images) == 3
+
+
+def test_the_demo_never_offers_to_add_commits_it_cannot_add(tmp_path, monkeypatch):
+    """A frozen snapshot has nothing to add, so the page must not offer it. The button was also
+    claiming EVERY commit in the repo ("add the 789 new commits"): the shipped fixture is
+    written on ONE branch and CI exports whatever it checked out, so the per-branch lookup
+    misses and the story arrives through the fallback — by which point the meta had already
+    been computed for "no story at all"."""
+    from agitrack.metrics import story as story_page
+
+    _no_network_identity(monkeypatch)
+    repo = _demo_repo(tmp_path / "repo")
+    told = story_page.story_stats(build_dashboard(repo).stats)
+    story_page.StoryStore(repo.repo).put(
+        "some-other-branch",  # deliberately NOT the branch being exported
+        {
+            "title": "A told story",
+            "moments": [
+                {
+                    "id": "m1",
+                    "title": "It happened",
+                    "summary": "s",
+                    "from": told[0].timestamp,
+                    "to": told[-1].timestamp,
+                    "shas": [stat.sha for stat in told],
+                    "commits": [{"sha": stat.sha, "short": stat.short, "subject": stat.subject} for stat in told],
+                }
+            ],
+            "covered_shas": [stat.sha for stat in told],
+        },
+    )
+    out = tmp_path / "site"
+    export_static_demo(repo, out)
+
+    state = json.loads((out / "demo" / "story.json").read_text(encoding="utf-8"))
+    assert state["story"], "a story does ship"
+    assert state["meta"]["uncovered"] == 0
+    # The page hides the button on exactly that (renderStudio: !has || !m.uncovered).
+    story = (out / "story" / "index.html").read_text(encoding="utf-8")
+    assert '$("extend").hidden = !has || !m.uncovered;' in story
+
+
+def test_the_preview_images_the_cards_point_at_are_in_the_repo():
+    """A card naming an image the site does not serve is a broken card everywhere it is shared."""
+    from agitrack.metrics.export import _SITE, _SOCIAL
+
+    docs = Path(__file__).resolve().parent.parent / "docs"
+    for name, card in _SOCIAL.items():
+        relative = card["image"][len(_SITE) :].lstrip("/")
+        assert (docs / relative).is_file(), f"{name}'s preview image ({relative}) is not in docs/"
 
 
 def _shim_of(html: str) -> str:

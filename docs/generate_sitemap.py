@@ -87,16 +87,15 @@ def build_sitemap(dates: dict[str, str]) -> str:
 
 
 def _refresh_index_dates(index_date: str) -> bool:
-    """Keep the homepage's structured ``dateModified`` and its footer ``<time>`` in step with the
-    sitemap, so every place the update date appears agrees. Returns True if the file changed."""
+    """Keep the homepage's structured ``dateModified`` in step with the sitemap, so the date
+    search engines read is the date the page actually changed. Returns True if the file changed.
+
+    The page itself no longer SHOWS a date (a product page that stamps itself invites the reader
+    to judge the project by how fresh the page looks), so there is nothing else to keep in step:
+    this is the one place the date lives."""
     path = DOCS / "index.html"
     html = original = path.read_text(encoding="utf-8")
     html = re.sub(r'("dateModified":\s*)"[^"]*"', rf'\1"{index_date}"', html)
-    html = re.sub(
-        r'(<time datetime=")[^"]*(">)[^<]*(</time>)',
-        rf"\g<1>{index_date}\g<2>{index_date}\g<3>",
-        html,
-    )
     if html != original:
         path.write_text(html, encoding="utf-8")
         return True

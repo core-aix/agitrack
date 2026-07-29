@@ -82,6 +82,27 @@ def test_a_commit_renders_identically_wherever_it_is_opened(pages):
     assert "max-height" not in ui.COMMIT_CSS
 
 
+def test_a_page_cannot_leak_its_own_styling_into_a_commit_message(pages):
+    """ "The same renderer" is not enough: the story page styles its OWN section headings in
+    small caps and indents its own markdown lists, and both rules reached into a commit message
+    rendered inside them — a "## User" heading came out UPPERCASE and its bullets sat further
+    in than the dashboard's. So the shared block pins the properties it would otherwise leave
+    to inheritance, and the page's own rules name the element they mean."""
+    # Pinned here, once, for every page that renders a commit.
+    start = ui.COMMIT_CSS.index(".dmsg.md .md-h{")
+    headings = ui.COMMIT_CSS[start : ui.COMMIT_CSS.index("}", start)]
+    for pinned in ("text-transform:none", "letter-spacing:normal", "text-align:left", "font-style:normal"):
+        assert pinned in headings, f"a host page can still change {pinned.split(':')[0]} on a commit heading"
+    assert ".dmsg.md ul,.dmsg.md ol{margin:6px 0 6px 18px;padding-left:0" in ui.COMMIT_CSS
+
+    # ...and the story page's own headings are scoped to themselves, not to every h4 that
+    # happens to sit inside the same box as a commit.
+    story_page = pages["story"]
+    assert ".commits > h4{" in story_page and ".thoughts > h4{" in story_page
+    for leaky in (".commits h4{", ".thoughts h4{"):
+        assert leaky not in story_page, f"{leaky} reaches into the commit messages below it"
+
+
 def test_the_button_that_flips_a_commit_looks_the_same_in_all_three_places(pages):
     """The dashboard's log detail, its file browser and a story moment each have a button that
     swaps a commit's message for its file changes. They are one control under three names, and
@@ -188,6 +209,20 @@ def test_every_page_is_readable_on_a_phone(pages):
         assert '<meta name="viewport" content="width=device-width, initial-scale=1">' in html, name
         assert re.search(r"@media \(max-width:\s*\d+px\)", html), f"{name} has no narrow-screen rules"
         assert "overflow-x:hidden" in html, name
+
+
+def test_every_page_uses_the_whole_screen_on_a_phone(pages):
+    """Side padding that reads as breathing room on a desktop is a tenth of a 390px screen, and
+    every table, diff and moment card pays for it. One rule for all three, written as
+    `body .wrap` so it outranks each page's own `.wrap` padding whatever order they land in —
+    and no page may quietly reintroduce its own."""
+    assert "@media (max-width:760px){body .wrap{padding-left:6px;padding-right:6px}}" in ui.BASE_CSS
+    for name, html in pages.items():
+        assert ui.BASE_CSS in html, name
+        narrow = "\n".join(re.findall(r"@media \(max-width:\s*\d+px\)\s*{(.*?)}\s*\n", html, re.S))
+        assert not re.search(r"(?<!body )\.wrap{[^}]*padding(-left|-right)?:", narrow), (
+            f"{name} sets its own side padding on a phone; the shared rule is the one place for it"
+        )
 
 
 def test_every_page_links_to_the_others(pages):
