@@ -986,6 +986,14 @@ def _set_progress(key: str, **fields: Any) -> None:
             record["progress"].update(fields)
 
 
+def _is_live(record: dict[str, Any]) -> bool:
+    """Whether a registered build is still one the reader is waiting for. An abandoned one
+    (Stop pressed, or the page that started it went away) is not, however long its last
+    backend call takes to return."""
+    thread = record.get("thread")
+    return bool(thread and thread.is_alive()) and not record.get("abandoned") and not record["stop"].is_set()
+
+
 def build_key(root: Path, branch: str) -> str:
     return f"{Path(root)}|{branch or 'HEAD'}"
 
@@ -1030,7 +1038,14 @@ def _material(
     if not kept:
         return [], "replace"
     covered = set(story.get("covered_shas") or []) if story else set()
-    eras = (story or {}).get("eras") or _era_rows(segment_episodes(kept))
+    # A REWRITE re-reads the history as it stands now, so its parts are computed fresh. The
+    # stored ones were drawn when the story was last told and their newest part ENDS at the
+    # then-newest commit, so everything committed since fell outside every part and a rewrite
+    # silently left it out. Telling one named part still uses the stored parts: that is the
+    # part the reader clicked on, and its identity has to keep meaning what it meant.
+    eras = _era_rows(segment_episodes(kept)) if mode == "rewrite" else ((story or {}).get("eras") or [])
+    if not eras:
+        eras = _era_rows(segment_episodes(kept))
 
     def inside(era: dict, *, fresh_only: bool) -> list[CommitStat]:
         return [
@@ -1384,7 +1399,13 @@ def start_build(
             )
         }
     with _BUILDS_LOCK:
-        if any(record["thread"].is_alive() for record in _BUILDS.values()):
+        # Only a build the reader has NOT abandoned may refuse another. A stopped build's
+        # thread can stay alive for a while (it is inside a backend CLI call that cannot be
+        # interrupted), and whatever that call returns is discarded — so counting it as "a
+        # story is already being written" refused the reader the very thing Stop promised
+        # them. The doomed call still holds the shared agent lock, so the new build's first
+        # question waits for it inside the worker (see _ask) rather than in this request.
+        if any(_is_live(record) for record in _BUILDS.values()):
             return {"busy": True, "error": "A story is already being written; let that one finish first."}
         stop = threading.Event()
         progress = {
@@ -1441,6 +1462,7 @@ def cancel_build(root: Path, branch: str = "") -> dict[str, Any]:
         record = _BUILDS.get(build_key(root, branch))
         if record and record["thread"].is_alive():
             record["stop"].set()
+            record["abandoned"] = True  # ...so it can never refuse the next build
             record["progress"].update(running=False, phase="stopped", error="")
             return {"cancelling": True, "stopped": True}
     return {"cancelling": False}
@@ -2242,6 +2264,16 @@ async function load(attempt){
 window.addEventListener("pageshow", event => { if (event.persisted || state.loadFailed) load().catch(() => {}); });
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden && (state.loadFailed || !state.data)) load().catch(() => {});
+});
+// Leaving the page (a refresh, a link, closing the tab) ABANDONS a telling this page started.
+// It is spending an agent call and the reader has walked away from it, and coming back to a
+// build nobody is watching is how someone ended up unable to start a new one at all. Sent
+// with sendBeacon: a normal fetch is cancelled the moment the page goes.
+window.addEventListener("pagehide", () => {
+  if (!state.building) return;
+  const payload = JSON.stringify({branch: state.branch});
+  if (navigator.sendBeacon) navigator.sendBeacon("story/cancel", new Blob([payload], {type: "application/json"}));
+  else post("story/cancel", {branch: state.branch}).catch(() => {});
 });
 
 function render(){

@@ -232,8 +232,15 @@ def _story_state(dash: Dashboard, repo: GitRepo, sha_paths: dict[str, set[str]])
         repo_name=str(repo.repo).rstrip("/").rsplit("/", 1)[-1],
     )
     if not state.get("story"):
+        # The fixture is written on ONE branch and CI exports from whatever it checked out, so
+        # the branch lookup above usually misses and this is the story that actually ships.
         state["story"] = story_page.StoryStore(repo.repo).any_story()
     state["building"] = None
+    # Nothing can be added to a frozen snapshot, so the page must not offer to: "add the N new
+    # commits" is an action the demo answers with the install note, and the number it carried
+    # was every commit in the repo anyway (the meta above was computed before the fallback
+    # story was found, i.e. for "no story at all").
+    state["meta"]["uncovered"] = 0
     # The page renders chapters from their `commits` rows; the raw sha lists exist only so a
     # build can tell what it has already covered, which a snapshot never does. Dropping them
     # takes a sizeable bite out of what every visitor downloads.

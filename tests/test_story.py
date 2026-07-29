@@ -749,6 +749,95 @@ def test_an_older_part_is_told_on_request(tmp_path, monkeypatch):
     ]
 
 
+def test_a_rewrite_picks_up_everything_committed_since(tmp_path, monkeypatch):
+    """A rewrite re-reads the history as it stands NOW. It used to reuse the parts stored with
+    the old story, whose newest part ends at the then-newest commit, so every commit made since
+    fell outside every part and the rewrite silently left it out."""
+    repo = _repo_with_history(tmp_path, prompts=[f"step {i}" for i in range(6)], gap_days=1)
+    stats, sha_paths = _view_of(repo)
+    _fake_agent(monkeypatch, [_moment_reply([{"n": 1, "title": "Before", "summary": "s"}]), _ARC])
+    story.build_story(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
+    stored = story.StoryStore(tmp_path).get("main")
+    assert stored["eras"], "the story recorded its parts"
+
+    # Work lands after that story was told.
+    when = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(1_750_000_000 + 20 * DAY))
+    (tmp_path / "later.py").write_text("later\n", encoding="utf-8")
+    repo.stage_paths(["later.py"])
+    repo._run(
+        ["git", "commit", "-q", "-F", "-"],
+        input_text=build_agent_commit_message(
+            latest_prompt="the newest thing",
+            trace=[{"role": "user", "content": "the newest thing"}],
+            backend="claude",
+            backend_session_id="ses-2",
+            agitrack_session_id="agit-1",
+            model="claude-opus-5",
+            token_usage={"input": 10, "output": 5},
+        ),
+        env={"GIT_AUTHOR_DATE": when, "GIT_COMMITTER_DATE": when},
+    )
+    fresh_stats, fresh_paths = _view_of(repo)
+    newest = story.story_stats(fresh_stats)[-1]
+
+    material, _placement = story._material(fresh_stats, stored, "rewrite")
+    assert newest.sha in {stat.sha for stat in material}, "the rewrite reads the newest commit"
+
+    # ...and a range still bounds it: a rewrite of last week is not a rewrite of everything.
+    window = story.in_range(fresh_stats, newest.timestamp - DAY, 0)
+    ranged, _p = story._material(window, stored, "rewrite")
+    assert newest.sha in {stat.sha for stat in ranged}
+    assert len(ranged) < len(material)
+
+
+def test_a_stopped_telling_never_blocks_the_next_one(tmp_path, monkeypatch):
+    """Stop has to mean stop. The worker can stay alive for a while — it is inside a backend
+    CLI call that cannot be interrupted, and whatever that returns is discarded — but counting
+    it as "a story is already being written" refused the reader the one thing Stop promised."""
+    repo = _repo_with_history(tmp_path, prompts=["one", "two"])
+    stats, sha_paths = _view_of(repo)
+    started, release = threading.Event(), threading.Event()
+
+    class _Slow:
+        def run(self, prompt, **kwargs):
+            started.set()
+            release.wait(10)  # still inside the call when the reader gives up
+            raise AssertionError("this reply must never be used")
+
+    monkeypatch.setattr(learn.LearningBackendChoice, "build", lambda self: _Slow())
+    monkeypatch.setattr(
+        learn,
+        "resolve_learning_backend",
+        lambda root: learn.LearningBackendChoice(
+            backend_name="claude", model="m", backend_source="config", model_source="config"
+        ),
+    )
+    try:
+        assert story.start_build(tmp_path, stats, sha_paths, branch="main", mode="rewrite").get("building")
+        assert started.wait(5)
+        assert story.cancel_build(tmp_path, "main")["stopped"] is True
+
+        # The doomed worker is STILL running, and the next build must start anyway.
+        key = story.build_key(tmp_path, "main")
+        assert story._BUILDS[key]["thread"].is_alive()
+        _fake_agent(monkeypatch, [_moment_reply([{"n": 1, "title": "Again", "summary": "s"}]), _ARC])
+        answer = story.start_build(tmp_path, stats, sha_paths, branch="main", mode="rewrite")
+        assert not answer.get("busy"), answer
+        assert answer.get("building") is True
+    finally:
+        release.set()
+
+
+def test_leaving_the_page_abandons_the_telling_it_started():
+    """A refresh or a click away spends someone's agent call on a story nobody is watching, and
+    coming back to it is how a reader ended up unable to start a new one at all."""
+    html = _page()
+    assert 'window.addEventListener("pagehide"' in html
+    assert "if (!state.building) return;" in html
+    # sendBeacon, because a normal fetch is cancelled the instant the page goes.
+    assert 'navigator.sendBeacon("story/cancel"' in html
+
+
 def test_extending_tells_only_what_is_new(tmp_path, monkeypatch):
     repo = _repo_with_history(tmp_path, prompts=["first push", "second push"])
     stats, sha_paths = _view_of(repo)

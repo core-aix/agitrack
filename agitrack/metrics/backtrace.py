@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import http.server
 import json
+import os
 import urllib.parse
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -178,6 +179,25 @@ def _stat_signature(path: Path) -> tuple[int, int] | None:
     return (info.st_mtime_ns, info.st_size)
 
 
+def _dir_signature(path: Path) -> tuple[int, str] | None:
+    """What a DIRECTORY holds, in a form that changes when an entry appears or disappears.
+
+    NOT its stat: NTFS does not reliably bump a directory's write time when a file inside it
+    is created, and a directory's ``st_size`` is 0 there, so on Windows the two signatures
+    before and after a brand-new session appeared were byte-identical. The daemon therefore
+    never ran a fresh discovery pass and a reconstruction silently stopped keeping up with
+    the sessions being recorded next to it.
+
+    The entry NAMES are what the question is actually about, and reading them is one
+    directory read with no per-entry stat, which keeps this poll as cheap as it was."""
+    try:
+        names = sorted(entry.name for entry in os.scandir(path))
+    except OSError:
+        return None
+    digest = hashlib.blake2b("\x00".join(names).encode("utf-8", "surrogatepass"), digest_size=12)
+    return (len(names), digest.hexdigest())
+
+
 def _watch_signature(sources: list[_Source]) -> tuple[dict[str, tuple], dict[str, tuple]]:
     """``(files, dirs)`` stat signatures for everything that could change the view.
 
@@ -199,9 +219,9 @@ def _watch_signature(sources: list[_Source]) -> tuple[dict[str, tuple], dict[str
                 files[str(path)] = signature
             watched_dirs.add(path.parent)
     for directory in watched_dirs:
-        signature = _stat_signature(directory)
-        if signature is not None:
-            dirs[str(directory)] = signature
+        entries = _dir_signature(directory)
+        if entries is not None:
+            dirs[str(directory)] = entries
     return files, dirs
 
 

@@ -10,6 +10,7 @@ from pathlib import Path
 
 from agitrack import cli
 from agitrack.metrics.export import export_static_demo
+from agitrack.metrics.collect import build_dashboard
 from agitrack.metrics.web import GRANULARITIES, LOG_SORTS, PAGE_SIZE
 
 from tests.test_dashboard import _demo_repo, _write_lines
@@ -146,6 +147,46 @@ def test_each_exported_page_can_be_posted_on_its_own(tmp_path, monkeypatch):
         seen_images.add(card["image"])
     # Three pages, three cards: posting the story must not show the dashboard's screenshot.
     assert len(seen_titles) == 3 and len(seen_images) == 3
+
+
+def test_the_demo_never_offers_to_add_commits_it_cannot_add(tmp_path, monkeypatch):
+    """A frozen snapshot has nothing to add, so the page must not offer it. The button was also
+    claiming EVERY commit in the repo ("add the 789 new commits"): the shipped fixture is
+    written on ONE branch and CI exports whatever it checked out, so the per-branch lookup
+    misses and the story arrives through the fallback — by which point the meta had already
+    been computed for "no story at all"."""
+    from agitrack.metrics import story as story_page
+
+    _no_network_identity(monkeypatch)
+    repo = _demo_repo(tmp_path / "repo")
+    told = story_page.story_stats(build_dashboard(repo).stats)
+    story_page.StoryStore(repo.repo).put(
+        "some-other-branch",  # deliberately NOT the branch being exported
+        {
+            "title": "A told story",
+            "moments": [
+                {
+                    "id": "m1",
+                    "title": "It happened",
+                    "summary": "s",
+                    "from": told[0].timestamp,
+                    "to": told[-1].timestamp,
+                    "shas": [stat.sha for stat in told],
+                    "commits": [{"sha": stat.sha, "short": stat.short, "subject": stat.subject} for stat in told],
+                }
+            ],
+            "covered_shas": [stat.sha for stat in told],
+        },
+    )
+    out = tmp_path / "site"
+    export_static_demo(repo, out)
+
+    state = json.loads((out / "demo" / "story.json").read_text(encoding="utf-8"))
+    assert state["story"], "a story does ship"
+    assert state["meta"]["uncovered"] == 0
+    # The page hides the button on exactly that (renderStudio: !has || !m.uncovered).
+    story = (out / "story" / "index.html").read_text(encoding="utf-8")
+    assert '$("extend").hidden = !has || !m.uncovered;' in story
 
 
 def test_the_preview_images_the_cards_point_at_are_in_the_repo():
